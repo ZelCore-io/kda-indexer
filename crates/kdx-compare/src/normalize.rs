@@ -7,6 +7,9 @@
 //! - Arrays with a route sort key: inside each run of items with equal sort keys the items are
 //!   ordered by their canonical text, so ties compare as multisets. Order across different
 //!   sort keys is kept as returned (it is part of the API).
+//! - Module references `{"refName": .., "refSpec": [..]}` (in module-deploy and other event
+//!   params): the `refSpec` interface list is compared as a set. The node lists the interfaces
+//!   in its own internal order and the API keeps that order, so two correct sides can differ.
 
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
@@ -77,6 +80,7 @@ pub const FLOAT_KEYS: &[&str] = &["gasPrice"];
 
 pub fn normalize(route: &RouteKind, v: &mut Value) {
     sort_keys(v);
+    refspec_as_set(v);
     if route.float_gas_price() {
         canon_floats(v);
     }
@@ -102,6 +106,26 @@ fn sort_keys(v: &mut Value) {
             *m = out;
         }
         Value::Array(a) => a.iter_mut().for_each(sort_keys),
+        _ => {}
+    }
+}
+
+/// Sort the `refSpec` list of every module reference `{"refName", "refSpec"}` by canonical text
+/// (run after `sort_keys`), so the interface list compares as a set.
+fn refspec_as_set(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            let is_ref = m.len() == 2 && m.contains_key("refName");
+            for (k, val) in m.iter_mut() {
+                if is_ref && k == "refSpec" {
+                    if let Value::Array(a) = val {
+                        a.sort_by_cached_key(|x| x.to_string());
+                    }
+                }
+                refspec_as_set(val);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(refspec_as_set),
         _ => {}
     }
 }
@@ -239,4 +263,24 @@ pub fn iso_micros(us: u64) -> String {
     let f = us % 1_000_000;
     let s = crate::report::iso_secs(secs);
     format!("{}.{f:06}Z", s.trim_end_matches('Z'))
+}
+
+#[cfg(test)]
+mod refspec_tests {
+    use super::*;
+
+    #[test]
+    fn refspec_compares_as_set() {
+        let mut a: Value = serde_json::from_str(
+            r#"[{"refName":{"name":"coin","namespace":null},"refSpec":[{"name":"fungible-xchain-v1","namespace":null},{"name":"fungible-v2","namespace":null}]}]"#,
+        )
+        .unwrap();
+        let mut b: Value = serde_json::from_str(
+            r#"[{"refSpec":[{"namespace":null,"name":"fungible-v2"},{"namespace":null,"name":"fungible-xchain-v1"}],"refName":{"namespace":null,"name":"coin"}}]"#,
+        )
+        .unwrap();
+        normalize(&RouteKind::Tx, &mut a);
+        normalize(&RouteKind::Tx, &mut b);
+        assert_eq!(a.to_string(), b.to_string());
+    }
 }
