@@ -768,6 +768,11 @@ dependencies = [
 [[package]]
 name = "kdx-decode"
 version = "0.1.0"
+dependencies = [
+ "kdx-types",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "kdx-node"
