@@ -10,17 +10,24 @@ use url::Url;
 
 use crate::config::{CompareConfig, TargetKind};
 
-/// Token bucket with burst 1 and a fractional rate, shared by every target.
+/// Token bucket with burst 1 and a fractional rate, shared by every target, plus a cap on
+/// requests in flight (slow chainweb-data queries hold a database connection each; one at a
+/// time keeps the harness from stacking them).
 pub struct Limiter {
     interval: Duration,
     next: Mutex<tokio::time::Instant>,
+    in_flight: tokio::sync::Semaphore,
 }
+
+/// Requests in flight across all targets.
+pub const MAX_IN_FLIGHT: usize = 1;
 
 impl Limiter {
     pub fn new(rps: f64) -> Arc<Limiter> {
         Arc::new(Limiter {
             interval: Duration::from_secs_f64(1.0 / rps),
             next: Mutex::new(tokio::time::Instant::now()),
+            in_flight: tokio::sync::Semaphore::new(MAX_IN_FLIGHT),
         })
     }
 
@@ -83,6 +90,8 @@ impl Target {
         let http = reqwest::Client::builder()
             .user_agent(kdx_node::USER_AGENT)
             .timeout(timeout)
+            // chainweb-data (Warp) closes idle keep-alive connections; do not reuse old ones.
+            .pool_idle_timeout(Duration::from_secs(5))
             .build()
             .context("building http client")?;
         Ok(Target {
@@ -111,14 +120,33 @@ impl Target {
     /// `GET {url}{path_and_query}` under the shared limit. Non-2xx statuses are returned, not
     /// errors; transport failures and timeouts are errors.
     pub async fn get(&self, path_and_query: &str) -> anyhow::Result<HttpCapture> {
+        let _permit = self
+            .limiter
+            .in_flight
+            .acquire()
+            .await
+            .context("limiter closed")?;
         self.limiter.acquire().await;
         let t0 = Instant::now();
-        let resp = self
-            .http
-            .get(self.full_url(path_and_query))
-            .send()
-            .await
-            .with_context(|| format!("{} GET {path_and_query}", self.name))?;
+        let url = self.full_url(path_and_query);
+        let resp = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            // One retry for a failed send on a reused connection (GET is idempotent).
+            Err(e) if !e.is_timeout() => {
+                tracing::debug!(error = %e, "retrying once");
+                self.limiter.acquire().await;
+                self.http
+                    .get(&url)
+                    .send()
+                    .await
+                    .with_context(|| format!("{} GET {path_and_query}", self.name))?
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("{} GET {path_and_query}", self.name))
+                )
+            }
+        };
         let status = resp.status().as_u16();
         let mut headers = Vec::new();
         for k in ["content-type", "chainweb-next"] {

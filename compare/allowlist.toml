@@ -16,7 +16,7 @@ owner_note = "Accepted by the owner. Exact module/name event queries are not cov
 [[entry]]
 id = "orphan-rows-txs"
 route = "txs"
-json_path_glob = "/orphans/**"
+json_path_glob = "/orphans**"
 condition = "any"
 reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing."
 owner_note = "Builder call (spec section 4.5): orphans are not kept."
@@ -37,3 +37,29 @@ condition = "any"
 request_contains = "graphql"
 reason = "GraphQL pages larger than 100 items are capped in kda-indexer (decision Q10)."
 owner_note = "Accepted by the owner; only applies once the GraphQL adapter is compared."
+
+# --- From the first live runs (P1, chainweb-data vs node oracle) ---
+
+[[entry]]
+id = "genesis-txs-not-indexed"
+route = "*"
+json_path_glob = "/@genesis"
+condition = "b_extra"
+reason = "chainweb-data does not serve transactions of genesis blocks (height 0 on chains 0-9, 852054 on chains 10-19); /txs/tx answers 404 and /txs/txs []. The node has them."
+owner_note = "kda-indexer serves them; P3 will show the reverse difference against chainweb-data. Decide whether compat mode should hide them."
+
+[[entry]]
+id = "failed-tx-callstack"
+route = "*"
+json_path_glob = "/result/error/callStack**"
+condition = "any"
+reason = "For failed txs chainweb-data kept the Pact error as produced at execution time, with a callStack; the node serves the stored output without callStack."
+owner_note = "Seen on old failed txs (heights 1.5M-2.0M). The error message and type still compare."
+
+[[entry]]
+id = "failed-tx-error-info"
+route = "*"
+json_path_glob = "/result/error/info"
+condition = "changed"
+reason = "For failed txs chainweb-data's error info has the source position at execution time (\"<interactive>:0:11937\"); the node serves \"<toplevel>:0\"."
+owner_note = "Same txs as failed-tx-callstack."

@@ -13,8 +13,11 @@ use serde_json::Value;
 
 use super::{cmd_sender, enc_query, enc_segment, rng, Generator, OracleRef, Origin, Request, Tips};
 
-/// Draws per `next()` before giving up (most blocks are empty).
-const MAX_DRAWS: u32 = 60;
+/// Windows per `next()` before giving up (most blocks are empty).
+const MAX_DRAWS: u32 = 30;
+/// Heights per draw: one `header/branch` and one payload batch for the whole window, then one
+/// non-empty block of the window is picked uniformly.
+const WINDOW: u64 = 20;
 /// At most this many accounts and event kinds per sampled tx.
 const MAX_ACCOUNTS: usize = 3;
 const MAX_EVENTS: usize = 3;
@@ -219,24 +222,82 @@ impl RandomGen {
     }
 }
 
+impl RandomGen {
+    /// One window of canonical blocks on one chain; returns the non-empty ones.
+    async fn draw_window(
+        &mut self,
+        chain: u8,
+        lo: u64,
+        hi: u64,
+    ) -> anyhow::Result<Vec<(Value, DecodedBlock)>> {
+        let upper = self
+            .tips
+            .cut_hash(chain)
+            .with_context(|| format!("no cut hash for chain {chain}"))?;
+        let page = self
+            .node
+            .header_branch(chain, &[], &[upper], Some(lo), Some(hi))
+            .await?;
+        let headers = page.items;
+        let hashes: Vec<String> = headers
+            .iter()
+            .filter_map(|h| h.get("payloadHash")?.as_str().map(str::to_string))
+            .collect();
+        let payloads = self.node.payloads_with_outputs(chain, &hashes).await?;
+        let mut out = Vec::new();
+        for h in headers {
+            let Some(p) = h
+                .get("payloadHash")
+                .and_then(Value::as_str)
+                .and_then(|ph| payloads.get(ph))
+            else {
+                continue;
+            };
+            let b = kdx_decode::decode_block(&h, p)
+                .map_err(|e| anyhow::anyhow!("decode chain {chain}: {e}"))?;
+            self.drawn_blocks += 1;
+            if b.txs.is_empty() {
+                self.empty_blocks += 1;
+            } else {
+                out.push((h, b));
+            }
+        }
+        Ok(out)
+    }
+}
+
 impl Generator for RandomGen {
     async fn next(&mut self) -> anyhow::Result<Vec<Request>> {
         let top = self.tips.min_tip().saturating_sub(self.min_depth);
-        anyhow::ensure!(top > 0, "tips not known yet");
+        anyhow::ensure!(top > WINDOW, "tips not known yet");
         for _ in 0..MAX_DRAWS {
-            let h = self.rng.random_range(0..=top);
+            let h = self.rng.random_range(0..=top - WINDOW + 1);
             let chains = self.graph.chains_at(h);
             if chains.is_empty() {
                 continue;
             }
             let c = chains[self.rng.random_range(0..chains.len())];
-            self.drawn_blocks += 1;
-            match block_requests(&self.node, &self.tips, c, h, Origin::Random, &mut self.rng)
-                .await?
-            {
-                BlockDraw::Empty => self.empty_blocks += 1,
-                BlockDraw::Requests(r) => return Ok(r),
+            // Stay inside one chain graph (chains 10-19 start at the graph change).
+            let hi = (h + WINDOW - 1).min(top);
+            let full = self.draw_window(c, h, hi).await?;
+            if full.is_empty() {
+                continue;
             }
+            let (header, b) = &full[self.rng.random_range(0..full.len())];
+            let tx = &b.txs[self.rng.random_range(0..b.txs.len())];
+            let hash = header
+                .get("hash")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            return Ok(tx_requests(
+                tx,
+                c,
+                b.header.height,
+                &hash,
+                Origin::Random,
+                &mut self.rng,
+            ));
         }
         Ok(Vec::new())
     }

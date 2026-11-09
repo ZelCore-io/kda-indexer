@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use kdx_compare::allowlist::Allowlist;
 use kdx_compare::config::CompareConfig;
@@ -29,7 +29,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run continuously.
-    Run,
+    Run {
+        /// Stop after this many seconds (default: until SIGINT/SIGTERM).
+        #[arg(long, hide = true)]
+        duration_secs: Option<u64>,
+    },
     /// One request through the pipeline.
     Once {
         #[arg(long)]
@@ -89,16 +93,13 @@ async fn main() -> anyhow::Result<()> {
             if against_self {
                 return self_check(&cfg, t, &path, mutate.as_deref()).await;
             }
-            let cap = t.get(&path).await?;
-            println!(
-                "{} {} -> {} ({} bytes, {} ms, next={})",
-                t.name,
-                path,
-                cap.status,
-                cap.body.len(),
-                cap.ms,
-                cap.next_token().unwrap_or("-")
-            );
+            let _ = t;
+            for o in kdx_compare::run::once(cfg.clone(), &path).await? {
+                println!("class={}", o.class);
+                if let Some(r) = o.record {
+                    println!("{}", serde_json::to_string_pretty(&r)?);
+                }
+            }
             Ok(())
         }
         Cmd::ReplayImport { haproxy, out } => {
@@ -114,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
             print,
             source,
         } => gen_debug(&cfg, count, print, source.as_deref()).await,
-        Cmd::Run => bail!("not implemented yet"),
+        Cmd::Run { duration_secs } => kdx_compare::run::run(cfg, duration_secs).await,
     }
 }
 

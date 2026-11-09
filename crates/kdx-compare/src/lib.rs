@@ -7,5 +7,7 @@ pub mod diff;
 pub mod gen;
 pub mod metrics;
 pub mod normalize;
+pub mod oracle;
 pub mod report;
+pub mod run;
 pub mod target;

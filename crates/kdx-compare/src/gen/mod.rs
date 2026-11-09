@@ -114,7 +114,7 @@ impl Tips {
                     }
                 }
                 Ok(cap) => tracing::warn!(status = cap.status, "A /txs/recent for tip"),
-                Err(e) => tracing::warn!(error = %e, "A /txs/recent for tip"),
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "A /txs/recent for tip"),
             }
         }
         Ok(())
