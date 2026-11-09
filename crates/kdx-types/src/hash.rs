@@ -4,7 +4,7 @@ use std::fmt;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use blake2::{Blake2b256, Digest};
+use blake2::{Blake2b128, Blake2b256, Digest};
 
 use crate::{Error, Result};
 
@@ -58,6 +58,14 @@ pub fn blake2b_256(data: &[u8]) -> Hash32 {
     let mut a = [0u8; 32];
     a.copy_from_slice(&d);
     Hash32(a)
+}
+
+/// blake2b-128 of `data` (CodeHash of an `exec` code body, spec §3.2).
+pub fn blake2b_128(data: &[u8]) -> [u8; 16] {
+    let d = Blake2b128::digest(data);
+    let mut a = [0u8; 16];
+    a.copy_from_slice(&d);
+    a
 }
 
 /// Unpadded base64url decode (strict), for fields that are not 32-byte hashes.

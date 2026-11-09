@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::payload::{exact_u64, DecodedBlock};
 use crate::render::{render_miner_bytes, render_output_bytes, render_tx_bytes};
+use crate::verify::VerifyReport;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BuildError {
@@ -240,8 +241,12 @@ fn finish_extra(r: &mut TxRecord, extra: Map<String, Value>, dict: &dyn Dict) {
 /// Build the block record and the tx records (coinbase first). Every record renders its
 /// Merkle leaf bytes exactly: typed fields where they reproduce the node's bytes, the raw
 /// `raw_*` slots where they do not (see `record.rs`).
+///
+/// `report` comes from `verify_block`: user txs listed in `cmd_hash_mismatch` get the
+/// `cmd_reencoded` bit.
 pub fn build_records(
     b: &DecodedBlock,
+    report: &VerifyReport,
     dict: &mut impl DictMut,
 ) -> Result<(BlockRecord, Vec<TxRecord>), BuildError> {
     // 1. Intern everything the block references, in first-seen order.
@@ -318,6 +323,7 @@ pub fn build_records(
             request_key: Some(t.hash),
             cmd: Some(t.cmd.as_bytes().to_vec()),
             cmd_unparsed: t.flags.cmd_unparsed,
+            cmd_reencoded: report.cmd_hash_mismatch.contains(&(pos as usize)),
             ..TxRecord::default()
         };
         let mut extra = Map::new();

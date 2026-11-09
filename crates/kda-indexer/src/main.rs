@@ -52,6 +52,10 @@ enum Command {
         /// Also write the summary as JSON.
         #[arg(long)]
         summary_out: Option<PathBuf>,
+        /// Run index extraction (postings, defpacts, code hashes) and the adjacent-ref
+        /// encoding round trip; print per-family posting counts.
+        #[arg(long)]
+        index: bool,
     },
     /// Measure record and compression sizes.
     Measure {
@@ -108,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
             json,
             records_out,
             summary_out,
+            index,
         } => {
             kda_indexer::cmd::dump::run(
                 &cfg,
@@ -118,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
                     json,
                     records_out,
                     summary_out,
+                    index,
                 },
             )
             .await

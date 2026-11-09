@@ -18,13 +18,14 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use kdx_decode::json::parse_untrusted;
 use kdx_decode::{
-    build_records, compare_json, decode_block, render_cmd, render_header, render_miner,
+    build_records, compare_json, decode_block, extract, render_cmd, render_header, render_miner,
     render_miner_bytes, render_output, render_output_bytes, render_tx, render_tx_bytes,
     verify_block, verify_linkage, Header,
 };
 use kdx_node::{ChainGraph, NodeClient};
 use kdx_types::record::{
-    decode_block as decode_block_rec, decode_tx, encode_block, encode_tx, Sig, TxRecord,
+    decode_block as decode_block_rec, decode_block_with, decode_tx, encode_block,
+    encode_block_with, encode_tx, BlockRecord, Sig, TxRecord,
 };
 use kdx_types::{Dict, DictKind, MemDict};
 use serde::Serialize;
@@ -43,6 +44,26 @@ pub struct DumpArgs {
     pub json: bool,
     pub records_out: Option<PathBuf>,
     pub summary_out: Option<PathBuf>,
+    pub index: bool,
+}
+
+/// `--index` counters (Task 2 of P2).
+#[derive(Default, Serialize)]
+struct IndexSum {
+    /// Postings per family name.
+    postings: BTreeMap<String, u64>,
+    txs_with_pact_id: u64,
+    txs_with_code_hash: u64,
+    /// User txs whose record carries `cmd_reencoded`.
+    cmd_reencoded: u64,
+    /// Adjacent hashes equal to the hash of (adjacent chain, height - 1) / (adjacent chain,
+    /// height) among blocks of this run; `adj_unknown` = neither block was fetched.
+    adj_eq_h_minus_1: u64,
+    adj_eq_h: u64,
+    adj_unknown: u64,
+    adj_mismatch: u64,
+    /// Block records encoded with adjacent refs that did not decode back identically.
+    adj_ref_round_trip_failures: u64,
 }
 
 #[derive(Default, Serialize)]
@@ -102,6 +123,8 @@ struct Summary {
     /// `chain -> band start height -> counts`.
     legacy_by_chain_band: BTreeMap<String, BTreeMap<String, Band>>,
     requests: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index: Option<IndexSum>,
 }
 
 struct Ctx {
@@ -110,6 +133,10 @@ struct Ctx {
     prev: BTreeMap<u8, Header>,
     json: bool,
     out: Option<BufWriter<File>>,
+    /// Block hashes seen in this run, for `--index` adjacent checks.
+    hashes: BTreeMap<(u8, u64), kdx_types::Hash32>,
+    /// Block records of the current slab awaiting the adjacent checks.
+    pending_adj: Vec<BlockRecord>,
 }
 
 impl Ctx {
@@ -224,8 +251,11 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         sum: Summary {
             from,
             to,
+            index: args.index.then(IndexSum::default),
             ..Default::default()
         },
+        hashes: BTreeMap::new(),
+        pending_adj: Vec::new(),
         dict: MemDict::new(),
         prev: BTreeMap::new(),
         json: args.json,
@@ -271,6 +301,9 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         for ((h, c), (hdr, payload)) in per_height {
             handle_block(&mut cx, c, h, &hdr, &payload)?;
         }
+        if cx.sum.index.is_some() {
+            check_adjacents(&mut cx, lo, hi);
+        }
         lo = hi + 1;
     }
 
@@ -306,6 +339,10 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         }
         std::fs::write(p, serde_json::to_vec_pretty(&sum)?)?;
     }
+    if let Some(ix) = &sum.index {
+        sum.round_trip_failures += ix.adj_ref_round_trip_failures;
+        eprintln!("index: {}", serde_json::to_string_pretty(ix)?);
+    }
     let failures = sum.round_trip_failures
         + sum.byte_mismatches
         + sum.verify_failures
@@ -315,6 +352,46 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         bail!("{failures} failure(s)");
     }
     Ok(())
+}
+
+/// `--index`: which height adjacent parents point at, and the adjacent-ref encoding round trip
+/// (refs resolve against the blocks fetched in this run).
+fn check_adjacents(cx: &mut Ctx, lo: u64, _hi: u64) {
+    let blocks = std::mem::take(&mut cx.pending_adj);
+    let hashes = &cx.hashes;
+    let s = cx.sum.index.as_mut().expect("checked by caller");
+    for br in &blocks {
+        let h = br.height;
+        for (c, ah) in &br.adjacents {
+            let below = h.checked_sub(1).and_then(|p| hashes.get(&(*c, p)));
+            let same = hashes.get(&(*c, h));
+            if below == Some(ah) {
+                s.adj_eq_h_minus_1 += 1;
+            } else if same == Some(ah) {
+                s.adj_eq_h += 1;
+            } else if below.is_none() {
+                s.adj_unknown += 1;
+            } else {
+                s.adj_mismatch += 1;
+            }
+        }
+        let mut buf = Vec::new();
+        encode_block_with(br, &mut buf, &|c, ah| {
+            h.checked_sub(1).and_then(|p| hashes.get(&(c, p))) == Some(ah)
+        });
+        let back = decode_block_with(&buf, &|c, p| hashes.get(&(c, p)).copied());
+        if back.as_ref() != Ok(br) {
+            s.adj_ref_round_trip_failures += 1;
+            eprintln!(
+                "ROUND-TRIP FAIL chain {} height {h}: adjacent-ref block record ({:?})",
+                br.chain,
+                back.err()
+            );
+        }
+    }
+    // Keep only what the next slab can reference (height lo-1 and up).
+    let keep_from = lo.saturating_sub(1);
+    cx.hashes.retain(|(_, hh), _| *hh + 1 >= keep_from);
 }
 
 fn handle_block(
@@ -367,7 +444,7 @@ fn handle_block(
         u.cmd_unparsed += t.flags.cmd_unparsed as u64;
     }
 
-    let (br, trs) = match build_records(&b, &mut cx.dict) {
+    let (br, trs) = match build_records(&b, &report, &mut cx.dict) {
         Ok(x) => x,
         Err(e) => {
             cx.sum.decode_failures += 1;
@@ -377,6 +454,19 @@ fn handle_block(
     };
     cx.sum.blocks += 1;
     cx.sum.raw_slots.miner += br.raw_miner.is_some() as u64;
+    if let Some(s) = cx.sum.index.as_mut() {
+        cx.hashes.insert((chain, height), br.hash);
+        let idx = extract(&b, &trs, &mut cx.dict);
+        for (r, x) in trs.iter().zip(&idx) {
+            s.cmd_reencoded += r.cmd_reencoded as u64;
+            s.txs_with_pact_id += x.pact_id.is_some() as u64;
+            s.txs_with_code_hash += x.code_hash.is_some() as u64;
+            for (f, _) in &x.postings {
+                *s.postings.entry(f.name().to_owned()).or_default() += 1;
+            }
+        }
+        cx.pending_adj.push(br.clone());
+    }
 
     // Block record round trip.
     let mut buf = Vec::new();

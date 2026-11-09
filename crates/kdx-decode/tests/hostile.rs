@@ -51,7 +51,7 @@ fn roundtrip(header: &Value, payload: &Value, tx: &[u8], out: &[u8]) -> DecodedB
     let b = decode_block(header, payload).expect("block must decode");
     verify_block(&b, &b.header.payload_hash).expect("consistency checks");
     let mut dict = MemDict::new();
-    let (br, trs) = build_records(&b, &mut dict).expect("records");
+    let (br, trs) = build_records(&b, &kdx_decode::VerifyReport::default(), &mut dict).expect("records");
     let mut buf = Vec::new();
     encode_block(&br, &mut buf);
     let br2 = dec_block_rec(&buf).unwrap();
@@ -84,7 +84,7 @@ fn ordinary_block_needs_no_raw_slot() {
     let b = roundtrip(&hd, &p, &tx, &out);
     assert_eq!(b.txs[0].flags, Default::default());
     let mut dict = MemDict::new();
-    let (br, trs) = build_records(&b, &mut dict).unwrap();
+    let (br, trs) = build_records(&b, &kdx_decode::VerifyReport::default(), &mut dict).unwrap();
     assert!(br.raw_miner.is_none());
     assert!(trs
         .iter()
@@ -138,7 +138,7 @@ fn escape_forms_and_odd_miner_are_byte_exact() {
     let (hd, p, tx, out) = block("1", r#""a\u0008b\/c""#, r#"{"account":"\u006b:m"}"#);
     let b = roundtrip(&hd, &p, &tx, &out);
     let mut dict = MemDict::new();
-    let (br, trs) = build_records(&b, &mut dict).unwrap();
+    let (br, trs) = build_records(&b, &kdx_decode::VerifyReport::default(), &mut dict).unwrap();
     assert!(
         br.raw_miner.is_some(),
         "{:?}",
