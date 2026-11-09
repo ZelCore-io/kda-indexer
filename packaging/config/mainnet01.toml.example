@@ -1,0 +1,52 @@
+network = "mainnet01"
+data_dir = "/var/lib/kda-indexer/mainnet01"
+
+[node]
+url = "http://127.0.0.1:31351"          # service API on the same host
+# p2p_url = "https://127.0.0.1:31350"   # fallback, self-signed
+# p2p_cert_sha256 = "..."               # pin
+timeout_ms = 30000
+max_body_bytes = 67108864               # per response, after decompression
+max_sse_event_bytes = 1048576           # one /header/updates event
+
+[ingest]
+finality_depth = 1000
+batch_size = 50
+node_concurrency = 8
+max_rps = 200
+
+[backfill]
+ranges_in_flight = 2
+range_heights = 100000
+step_heights = 10000
+min_free_gb = 60
+
+[tail]
+commit_ms = 1000
+commit_blocks = 40
+cut_poll_secs = 10
+
+[api]
+native = "<private-lan-ip>:31361"   # internal only
+compat = "0.0.0.0:31362"
+graphql = "0.0.0.0:31363"
+admin = "127.0.0.1:31369"
+trusted_proxies = ["<proxy-private-ip>"]
+rate_per_ip = 20
+
+[search]
+min_len = 4
+max_results = 100
+max_candidates = 10000
+max_scan_heights = 20000
+timeout_ms = 2000
+
+[balances]
+local_rps = 50
+
+[metrics]
+textfile = "/var/lib/node_exporter/textfile_collector/kda_indexer.prom"   # optional
+
+[log]
+format = "text"    # or "json"
+level = "info"

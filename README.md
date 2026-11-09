@@ -16,6 +16,15 @@ Status: early development. Nothing here is ready for production yet.
 - Fast initial sync: chains are ingested in parallel and history is written as immutable, compressed segments.
 - Runs as a native service next to chainweb-node: a single binary installed as a Debian package with a systemd unit.
 
+## Building
+
+```sh
+cargo build --release
+./target/release/kda-indexer --config packaging/config/mainnet01.toml.example config check
+```
+
+The pinned toolchain in `rust-toolchain.toml` is installed automatically by `rustup`. Copy `packaging/config/mainnet01.toml.example` and adjust the node URL and listen addresses for your host.
+
 ## License
 
 Licensed under either of
