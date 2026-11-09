@@ -23,7 +23,14 @@ enum Command {
         action: ConfigAction,
     },
     /// Probe node routes and limits (B1, B2, B11).
-    Probe,
+    Probe {
+        /// Call each client method once and print sizes (client smoke check).
+        #[arg(long)]
+        smoke: bool,
+        /// Report path (default test-runs/probe-<network>.json).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Fetch, decode and round-trip a bounded height range.
     Dump,
     /// Measure record and compression sizes.
@@ -58,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
             print!("{}", toml::to_string_pretty(&cfg).context("serialising config")?);
             Ok(())
         }
-        Command::Probe => kda_indexer::cmd::probe::run(&cfg).await,
+        Command::Probe { smoke, out } => kda_indexer::cmd::probe::run(&cfg, smoke, out).await,
         Command::Dump => anyhow::bail!("dump: not implemented yet"),
         Command::Measure => anyhow::bail!("measure: not implemented yet"),
         Command::RkBench => anyhow::bail!("rk-bench: not implemented yet"),
