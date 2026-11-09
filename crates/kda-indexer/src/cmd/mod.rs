@@ -10,8 +10,10 @@ use crate::config::Config;
 pub mod dump;
 pub mod frames;
 pub mod hot;
+pub mod inspect;
 pub mod measure;
 pub mod probe;
+pub mod segments;
 
 /// Build the node client from config; `max_rps` and `node_concurrency` come from `[ingest]`.
 pub fn node_client(cfg: &Config) -> anyhow::Result<NodeClient> {

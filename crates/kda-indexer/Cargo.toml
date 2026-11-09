@@ -29,6 +29,7 @@ kdx-types.workspace = true
 kdx-node.workspace = true
 kdx-decode.workspace = true
 kdx-hot.workspace = true
+kdx-segment.workspace = true
 base64.workspace = true
 rand.workspace = true
 rayon.workspace = true
