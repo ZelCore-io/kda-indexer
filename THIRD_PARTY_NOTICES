@@ -10,7 +10,10 @@ ptr_hash 2.1.3 (vendor/ptr_hash)
   Copyright (c) Ragnar Groot Koerkamp. MIT licence, see vendor/ptr_hash/LICENSE-MIT.
   Source: https://github.com/RagnarGrootKoerkamp/ptrhash
   Modified: the `colored` dependency (MPL-2.0) and its one use (bold log output in
-  src/util.rs) are removed; examples and dev-dependencies are dropped.
+  src/util.rs) are removed; examples and dev-dependencies are dropped. Added
+  `PtrHash::from_saved_parts`, `saved_parts` and `saved_sizes` (persisting and
+  validating an index). The pilot search in src/build.rs uses a fixed per-part
+  seed, so builds are reproducible.
 
 reth storage crates (reth-libmdbx, reth-mdbx-sys, reth-nippy-jar, reth-fs-util)
   Copyright (c) the reth contributors. reth is MIT OR Apache-2.0; reth-libmdbx and

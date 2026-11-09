@@ -534,6 +534,14 @@ impl<
         ptr_hash
     }
 
+    /// kda-indexer addition: the pilot count and remap length that [`PtrHash::from_saved_parts`]
+    /// needs for `(n, params)`. Lookups index both without bounds checks, so a loader must
+    /// reject saved parts of any other size.
+    pub fn saved_sizes(n: usize, params: PtrHashParams<BF>) -> (usize, usize) {
+        let p = Self::init(n, params);
+        (p.buckets_total, p.slots_total.saturating_sub(p.n))
+    }
+
     /// kda-indexer addition: `(n, seed, pilots, remap)` for [`PtrHash::from_saved_parts`].
     pub fn saved_parts(&self) -> (usize, u64, &[u8], &F) {
         (self.n, self.seed, &self.pilots, &self.remap)

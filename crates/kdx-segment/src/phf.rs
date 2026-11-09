@@ -181,31 +181,46 @@ impl Index {
         let n = rd_u64(&map, 6)? as usize;
         match map[5] {
             0 => {
-                let alpha = f64::from_le_bytes(map[14..22].try_into()?);
-                let lambda = f64::from_le_bytes(map[22..30].try_into()?);
+                // Every size and offset is checked: a corrupt file must fail here, never
+                // reach the vendored lookups (they index pilots and remap unchecked).
+                let bad =
+                    |what: &str| anyhow::anyhow!("{}: corrupt index ({what})", path.display());
+                let alpha =
+                    f64::from_le_bytes(map.get(14..22).ok_or_else(|| bad("header"))?.try_into()?);
+                let lambda =
+                    f64::from_le_bytes(map.get(22..30).ok_or_else(|| bad("header"))?.try_into()?);
+                if !(0.5..=1.0).contains(&alpha) || !(1.0..=16.0).contains(&lambda) {
+                    return Err(bad("alpha/lambda out of range"));
+                }
                 let seed = rd_u64(&map, 30)?;
-                let pl = rd_u64(&map, 38)? as usize;
-                let pilots = map.get(46..46 + pl).context("short pilots")?.to_vec();
-                let rl = rd_u64(&map, 46 + pl)? as usize;
-                let ra = 54 + pl;
-                let rb = map.get(ra..ra + 4 * rl).context("short remap")?;
+                let pl = usize::try_from(rd_u64(&map, 38)?)?;
+                let pe = 46usize.checked_add(pl).ok_or_else(|| bad("pilot length"))?;
+                let pilots = map.get(46..pe).ok_or_else(|| bad("short pilots"))?.to_vec();
+                let rl = usize::try_from(rd_u64(&map, pe)?)?;
+                let ra = pe.checked_add(8).ok_or_else(|| bad("remap offset"))?;
+                let end = rl
+                    .checked_mul(4)
+                    .and_then(|x| x.checked_add(ra))
+                    .ok_or_else(|| bad("remap length"))?;
+                let rb = map.get(ra..end).ok_or_else(|| bad("short remap"))?;
                 let remap: Vec<u32> = rb
                     .chunks_exact(4)
                     .map(|c| u32::from_le_bytes(c.try_into().expect("4")))
                     .collect();
-                let end = ra + 4 * rl;
                 let slots_at = end + (4 - end % 4) % 4;
-                if map.len() != slots_at + 8 * n {
-                    bail!(
-                        "{}: size {} != {}",
-                        path.display(),
-                        map.len(),
-                        slots_at + 8 * n
-                    );
+                let want = n
+                    .checked_mul(8)
+                    .and_then(|x| x.checked_add(slots_at))
+                    .ok_or_else(|| bad("key count"))?;
+                if map.len() != want {
+                    bail!("{}: size {} != {want}", path.display(), map.len());
                 }
                 let mut params = PtrHashParams::default_fast();
                 params.alpha = alpha;
                 params.lambda = lambda;
+                if n > 0 && Phf::saved_sizes(n, params) != (pilots.len(), remap.len()) {
+                    return Err(bad("pilot or remap count does not match the key count"));
+                }
                 let phf = Phf::from_saved_parts(n, params, seed, pilots, remap);
                 Ok(Index::PtrHash(Box::new(PtrHashIndex {
                     phf,
@@ -343,6 +358,51 @@ mod tests {
         for (i, k) in keys.iter().enumerate() {
             assert_eq!(idx.get(k), Some(i as u32));
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Corrupt PtrHash files fail `open` with an error (review M5): pilot/remap counts that
+    /// do not match the key count, huge lengths, bad alpha/lambda.
+    #[test]
+    fn corrupt_ptrhash_file_is_rejected() {
+        let keys: Vec<IndexKey> = (0..5000u32)
+            .map(|i| IndexKey::new(&kdx_types::blake2b_256(&i.to_le_bytes()), i))
+            .collect();
+        let dir = std::env::temp_dir().join(format!("kdx-phf-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ok.idx");
+        assert_eq!(write_index(&p, keys, false).unwrap(), IndexKind::PtrHash);
+        let good = std::fs::read(&p).unwrap();
+        assert!(Index::open(&p).is_ok());
+        let pl = u64::from_le_bytes(good[38..46].try_into().unwrap()) as usize;
+        let try_bytes = |name: &str, b: &[u8]| {
+            let q = dir.join(name);
+            std::fs::write(&q, b).unwrap();
+            Index::open(&q).err().map(|e| e.to_string())
+        };
+        // Pilots one shorter and the remap one longer: the total size still matches.
+        let mut b = good.clone();
+        b[38..46].copy_from_slice(&((pl - 4) as u64).to_le_bytes());
+        b.drain(46 + pl - 4..46 + pl);
+        let rl = u64::from_le_bytes(b[46 + pl - 4..54 + pl - 4].try_into().unwrap());
+        b[46 + pl - 4..54 + pl - 4].copy_from_slice(&(rl + 1).to_le_bytes());
+        b.splice(54 + pl - 4..54 + pl - 4, [0u8; 4]);
+        assert!(try_bytes("counts.idx", &b)
+            .unwrap()
+            .contains("count does not match"));
+        // Pilot length near usize::MAX.
+        let mut b = good.clone();
+        b[38..46].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+        assert!(try_bytes("huge.idx", &b).is_some());
+        // alpha NaN, lambda 0.
+        let mut b = good.clone();
+        b[14..22].copy_from_slice(&f64::NAN.to_le_bytes());
+        assert!(try_bytes("alpha.idx", &b).is_some());
+        let mut b = good.clone();
+        b[22..30].copy_from_slice(&0f64.to_le_bytes());
+        assert!(try_bytes("lambda.idx", &b).is_some());
+        // Truncated.
+        assert!(try_bytes("short.idx", &good[..good.len() - 3]).is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
