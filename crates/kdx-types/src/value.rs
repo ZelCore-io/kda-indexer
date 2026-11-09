@@ -19,6 +19,10 @@ use crate::dict::{Dict, DictKind};
 use crate::varint;
 use crate::{Error, Result};
 
+/// Deepest container nesting `decode` accepts. Ingest parses JSON with serde_json, whose
+/// recursion limit (128) bounds every stored value; anything deeper is a corrupt record.
+pub const MAX_DEPTH: usize = 128;
+
 pub const EXT_NUMBER: i8 = 1;
 pub const EXT_ACCOUNT: i8 = 2;
 
@@ -85,6 +89,10 @@ fn be_u32(buf: &mut &[u8]) -> Result<usize> {
 }
 
 pub fn decode(buf: &mut &[u8], dict: &dyn Dict) -> Result<Value> {
+    decode_at(buf, dict, 0)
+}
+
+fn decode_at(buf: &mut &[u8], dict: &dyn Dict, depth: usize) -> Result<Value> {
     use rmp::Marker as M;
     let m = M::from_u8(varint::get_u8(buf)?);
     Ok(match m {
@@ -104,23 +112,23 @@ pub fn decode(buf: &mut &[u8], dict: &dyn Dict) -> Result<Value> {
             let n = be_u32(buf)?;
             Value::String(str_of(buf, n)?)
         }
-        M::FixArray(n) => array(buf, n as usize, dict)?,
+        M::FixArray(n) => array(buf, n as usize, dict, depth)?,
         M::Array16 => {
             let n = be_u16(buf)?;
-            array(buf, n, dict)?
+            array(buf, n, dict, depth)?
         }
         M::Array32 => {
             let n = be_u32(buf)?;
-            array(buf, n, dict)?
+            array(buf, n, dict, depth)?
         }
-        M::FixMap(n) => map(buf, n as usize, dict)?,
+        M::FixMap(n) => map(buf, n as usize, dict, depth)?,
         M::Map16 => {
             let n = be_u16(buf)?;
-            map(buf, n, dict)?
+            map(buf, n, dict, depth)?
         }
         M::Map32 => {
             let n = be_u32(buf)?;
-            map(buf, n, dict)?
+            map(buf, n, dict, depth)?
         }
         M::FixExt1 => ext(buf, 1, dict)?,
         M::FixExt2 => ext(buf, 2, dict)?,
@@ -148,22 +156,33 @@ fn str_of(buf: &mut &[u8], n: usize) -> Result<String> {
     String::from_utf8(b.to_vec()).map_err(|_| Error::Codec("invalid utf-8 in str".into()))
 }
 
-fn array(buf: &mut &[u8], n: usize, dict: &dyn Dict) -> Result<Value> {
+fn deeper(depth: usize) -> Result<usize> {
+    if depth >= MAX_DEPTH {
+        return Err(Error::Codec(format!(
+            "value nested deeper than {MAX_DEPTH}"
+        )));
+    }
+    Ok(depth + 1)
+}
+
+fn array(buf: &mut &[u8], n: usize, dict: &dyn Dict, depth: usize) -> Result<Value> {
+    let depth = deeper(depth)?;
     let mut a = Vec::with_capacity(n.min(buf.len()));
     for _ in 0..n {
-        a.push(decode(buf, dict)?);
+        a.push(decode_at(buf, dict, depth)?);
     }
     Ok(Value::Array(a))
 }
 
-fn map(buf: &mut &[u8], n: usize, dict: &dyn Dict) -> Result<Value> {
+fn map(buf: &mut &[u8], n: usize, dict: &dyn Dict, depth: usize) -> Result<Value> {
+    let depth = deeper(depth)?;
     let mut m = Map::with_capacity(n.min(buf.len()));
     for _ in 0..n {
-        let k = match decode(buf, dict)? {
+        let k = match decode_at(buf, dict, depth)? {
             Value::String(s) => s,
             other => return Err(Error::Codec(format!("non-string map key {other}"))),
         };
-        let v = decode(buf, dict)?;
+        let v = decode_at(buf, dict, depth)?;
         if m.insert(k, v).is_some() {
             return Err(Error::Codec("duplicate map key".into()));
         }
@@ -227,5 +246,31 @@ mod tests {
             serde_json::to_string(&v).unwrap()
         );
         assert_eq!(serde_json::to_string(&back).unwrap(), src);
+    }
+
+    #[test]
+    fn depth_limit_matches_serde_json() {
+        let dict = MemDict::new();
+        // The deepest nesting serde_json accepts must decode; one more level must not.
+        let mut deepest = 0;
+        for d in 1..=200 {
+            let src = format!("{}{}", "[".repeat(d), "]".repeat(d));
+            if serde_json::from_str::<Value>(&src).is_err() {
+                break;
+            }
+            deepest = d;
+        }
+        assert!(
+            (100..=MAX_DEPTH).contains(&deepest),
+            "serde depth {deepest}"
+        );
+        let v: Value =
+            serde_json::from_str(&format!("{}{}", "[".repeat(deepest), "]".repeat(deepest)))
+                .unwrap();
+        assert!(from_slice(&to_vec(&v, &dict), &dict).is_ok());
+        // MAX_DEPTH + 1 nested fixarray(1), then nil.
+        let mut too_deep = vec![0x91u8; MAX_DEPTH + 1];
+        too_deep.push(0xc0);
+        assert!(from_slice(&too_deep, &dict).is_err());
     }
 }

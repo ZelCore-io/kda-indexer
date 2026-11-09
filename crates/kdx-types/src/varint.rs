@@ -21,6 +21,10 @@ pub fn get_u64(buf: &mut &[u8]) -> Result<u64> {
         }
         v |= ((b & 0x7f) as u64) << shift;
         if b & 0x80 == 0 {
+            // Canonical form only: a zero final byte after the first is a padded encoding.
+            if b == 0 && shift > 0 {
+                return Err(Error::Codec("non-canonical varint".into()));
+            }
             return Ok(v);
         }
         shift += 7;
@@ -64,4 +68,20 @@ pub fn take_array<const N: usize>(buf: &mut &[u8]) -> Result<[u8; N]> {
 
 pub fn get_u8(buf: &mut &[u8]) -> Result<u8> {
     Ok(take(buf, 1)?[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn varint_canonical_only() {
+        for v in [0u64, 1, 127, 128, 300, u32::MAX as u64, u64::MAX] {
+            let mut b = Vec::new();
+            put_u64(&mut b, v);
+            assert_eq!(get_u64(&mut b.as_slice()), Ok(v));
+        }
+        assert!(get_u64(&mut [0x80u8, 0x00].as_slice()).is_err());
+        assert!(get_u64(&mut [0xffu8, 0x80, 0x00].as_slice()).is_err());
+    }
 }

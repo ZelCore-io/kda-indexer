@@ -47,9 +47,11 @@ impl ReplayGen {
         }
         anyhow::ensure!(!entries.is_empty(), "{}: no GET entries", path.display());
         let mut cum = Vec::with_capacity(entries.len());
-        let mut acc = 0;
+        let mut acc: u64 = 0;
         for (c, _) in &entries {
-            acc += c;
+            acc = acc
+                .checked_add(*c)
+                .with_context(|| format!("{}: total count overflows u64", path.display()))?;
             cum.push(acc);
         }
         Ok(ReplayGen {

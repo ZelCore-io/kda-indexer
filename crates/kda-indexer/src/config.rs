@@ -177,6 +177,24 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        cfg.validate()
+            .with_context(|| format!("checking config {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// Value ranges serde cannot express.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // The node silently answers at most 1000 entries per payload batch.
+        anyhow::ensure!(
+            (1..=MAX_BATCH_SIZE).contains(&self.ingest.batch_size),
+            "ingest.batch_size must be in 1..={MAX_BATCH_SIZE} (got {})",
+            self.ingest.batch_size
+        );
+        Ok(())
     }
 }
+
+/// The node's own cap on `payload/outputs/batch` entries.
+pub const MAX_BATCH_SIZE: u32 = 1000;
