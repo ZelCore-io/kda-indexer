@@ -1,5 +1,7 @@
 //! CLI subcommand implementations.
 
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -39,4 +41,26 @@ pub fn node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
         max_sse_event_bytes: cfg.node.max_sse_event_bytes,
     };
     Ok(NodeClient::new(&ncfg)?)
+}
+
+/// Take the exclusive lock on `<data_dir>/LOCK` for a writing command (`run`, `tail`,
+/// `backfill`, `unwind`). Held until the returned file is dropped; the OS releases it when
+/// the process exits. Read-only commands do not take it.
+pub fn lock_data_dir(data_dir: &Path) -> anyhow::Result<File> {
+    std::fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+    let p = data_dir.join("LOCK");
+    let f = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&p)
+        .with_context(|| format!("open {}", p.display()))?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(TryLockError::WouldBlock) => anyhow::bail!(
+            "{} is in use by another kda-indexer process (run, tail, backfill or unwind); stop it first",
+            data_dir.display()
+        ),
+        Err(TryLockError::Error(e)) => Err(e).with_context(|| format!("lock {}", p.display())),
+    }
 }

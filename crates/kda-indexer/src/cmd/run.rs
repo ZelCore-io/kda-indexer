@@ -54,6 +54,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&a.data_dir)
         .with_context(|| format!("create {}", a.data_dir.display()))?;
     let data_dir = std::fs::canonicalize(&a.data_dir)?;
+    let _lock = super::lock_data_dir(&data_dir)?;
     let free_gb = kdx_ingest::disk::free_bytes(&data_dir)? >> 30;
     tracing::info!(data_dir = %data_dir.display(), free_gb, min_free_gb = cfg.backfill.min_free_gb, "run: data dir");
     kdx_ingest::disk::ensure_free(&data_dir, cfg.backfill.min_free_gb)?;

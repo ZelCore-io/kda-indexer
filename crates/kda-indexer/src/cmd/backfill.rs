@@ -39,6 +39,7 @@ pub async fn run(
     to: &str,
     mode: HeaderMode,
 ) -> anyhow::Result<()> {
+    let _lock = super::lock_data_dir(data_dir)?;
     // Backfill's own request budget (`backfill.max_rps`, else `ingest.max_rps`).
     let mut ncfg = cfg.clone();
     ncfg.ingest.max_rps = cfg.backfill_max_rps();
