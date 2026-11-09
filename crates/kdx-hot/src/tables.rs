@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `Meta` | name (utf-8) | bytes (see `env.rs` for the keys) |
 //! | `StageCheckpoint` | stage u8, chain u8 | height u32, hash [32] |
-//! | `DictFwd{kind}` | name bytes | id u32 |
+//! | `DictFwd{kind}` | name bytes, or 0xFF ‖ blake2b-256(name) over 480 bytes | id u32 |
 //! | `DictRev{kind}` | id u32 | name bytes |
 //! | `Headers` | chain u8, height u32 | `encode_block` bytes (plain form) |
 //! | `HeaderByHash` | hash [32] | chain u8, height u32 |

@@ -12,3 +12,6 @@ serde_json.workspace = true
 reth-libmdbx.workspace = true
 kdx-types.workspace = true
 kdx-decode.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

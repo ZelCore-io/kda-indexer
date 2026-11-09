@@ -2,6 +2,7 @@
 //! open; new names are queued and written by `persist` in the same write txn as the data that
 //! uses them. Backfill persists only when a range commits; the tail per batch.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use anyhow::{ensure, Context, Result};
@@ -62,11 +63,28 @@ impl HotDict {
         for &(k, id) in &self.pending {
             let name = self.mem.name(k, id).expect("pending id was interned");
             let idb = id.to_be_bytes();
-            txn.put(Table::DictFwd(k), name.as_bytes(), &idb)?;
+            txn.put(Table::DictFwd(k), &fwd_key(name.as_bytes()), &idb)?;
             txn.put(Table::DictRev(k), &idb, name.as_bytes())?;
         }
         self.pending.clear();
         Ok(())
+    }
+}
+
+/// Names longer than this are keyed in `DictFwd` by their hash, so no key reaches the MDBX
+/// key-size limit (about 2 KB at a 4 KB page).
+pub const FWD_KEY_MAX: usize = 480;
+
+/// `DictFwd` key of `name`: the name bytes, or `0xFF ‖ blake2b-256(name)` when the name is
+/// longer than `FWD_KEY_MAX` (0xFF never starts UTF-8, so the two forms cannot collide).
+pub fn fwd_key(name: &[u8]) -> Cow<'_, [u8]> {
+    if name.len() <= FWD_KEY_MAX {
+        Cow::Borrowed(name)
+    } else {
+        let mut k = Vec::with_capacity(33);
+        k.push(0xFF);
+        k.extend_from_slice(&kdx_types::blake2b_256(name).0);
+        Cow::Owned(k)
     }
 }
 
@@ -96,7 +114,7 @@ pub fn truncate(txn: &mut RwTxn<'_>, lens: &[u32]) -> Result<u64> {
     for (i, &k) in DictKind::ALL.iter().enumerate() {
         let from = lens[i].to_be_bytes();
         for (id, name) in txn.scan(Table::DictRev(k), &from, |_| true)? {
-            txn.del(Table::DictFwd(k), &name)?;
+            txn.del(Table::DictFwd(k), &fwd_key(&name))?;
             txn.del(Table::DictRev(k), &id)?;
             n += 1;
         }

@@ -1301,6 +1301,7 @@ dependencies = [
  "kdx-types",
  "reth-libmdbx",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
