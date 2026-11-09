@@ -202,7 +202,10 @@ async fn init_partial(ctx: &Ctx, cut: &kdx_node::Cut, h: u32) -> anyhow::Result<
             .node
             .header_branch_all(c, &e.hash, u64::from(h - 1), u64::from(h - 1))
             .await?;
-        let hash = kdx_ingest::reorg::header_hash(&hs[0], "hash")?;
+        let first = hs
+            .first()
+            .with_context(|| format!("chain {c}: the node returned no header at {}", h - 1))?;
+        let hash = kdx_ingest::reorg::header_hash(first, "hash")?;
         cps.push((c, hash));
     }
     let d = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());

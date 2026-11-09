@@ -127,7 +127,11 @@ pub fn reconcile(ctx: &Ctx) -> Result<()> {
         let mut txn = ctx.hot.rw()?;
         let n = drop_hot_below(&mut txn, m.frontier)?;
         txn.set_next_txnum(m.next_txnum)?;
-        txn.set_meta(&dict::lens_key(m.frontier), &dict::encode_lens(&_d))?;
+        // Only when absent: the current sizes may include names interned after the
+        // interrupted freeze (review L3).
+        if txn.meta(&dict::lens_key(m.frontier))?.is_none() {
+            txn.set_meta(&dict::lens_key(m.frontier), &dict::encode_lens(&_d))?;
+        }
         txn.commit()?;
         tracing::warn!(from = hot_f, to = m.frontier, blocks = n, "freezer: finished an interrupted freeze (hot rows below the manifest frontier deleted)");
     } else if m.frontier < hot_f {

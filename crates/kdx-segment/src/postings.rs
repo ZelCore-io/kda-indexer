@@ -18,7 +18,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use kdx_decode::Family;
 use kdx_types::varint::{get_u64, put_u64};
 use memmap2::Mmap;
@@ -81,12 +81,18 @@ pub fn decode_list(mut b: &[u8]) -> Result<Vec<u32>> {
     match enc {
         ENC_DELTA => {
             let buf = &mut b;
-            let n = get_u64(buf)? as usize;
+            let n = usize::try_from(get_u64(buf)?)?;
+            // Every value takes at least one byte: never trust `n` beyond the buffer.
+            ensure!(n <= buf.len(), "delta list length {n} exceeds its bytes");
             let mut v = Vec::with_capacity(n);
             let mut acc = 0u64;
             for i in 0..n {
                 let d = get_u64(buf)?;
-                acc = if i == 0 { d } else { acc + d };
+                acc = if i == 0 {
+                    d
+                } else {
+                    acc.checked_add(d).context("delta list overflows")?
+                };
                 v.push(u32::try_from(acc)?);
             }
             Ok(v)
@@ -285,5 +291,37 @@ impl Postings {
             vals,
             base: self.first_txnum,
         })
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    /// Round trip at the delta/EF boundary (16/17) and the EF/Roaring threshold.
+    #[test]
+    fn list_encodings_round_trip() {
+        let range_txs = 32 * 40;
+        for (len, enc) in [
+            (1, ENC_DELTA),
+            (16, ENC_DELTA),
+            (17, ENC_EF),
+            (40, ENC_EF),
+            (41, ENC_ROARING),
+        ] {
+            let vals: Vec<u32> = (0..len as u32)
+                .map(|i| i * 31 % range_txs as u32 + i)
+                .collect();
+            let mut vals = vals;
+            vals.sort_unstable();
+            vals.dedup();
+            let mut out = Vec::new();
+            encode_list(&vals, range_txs, &mut out).unwrap();
+            assert_eq!(out[0], encoding_for(vals.len(), range_txs), "len {len}");
+            assert_eq!(encoding_for(len, range_txs), enc);
+            assert_eq!(decode_list(&out).unwrap(), vals);
+        }
+        // A delta list that claims more values than it has bytes is rejected.
+        assert!(decode_list(&[ENC_DELTA, 0x7f, 1]).is_err());
     }
 }
