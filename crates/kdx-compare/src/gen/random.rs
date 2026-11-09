@@ -52,13 +52,21 @@ pub async fn canonical_header(
     let upper = tips
         .cut_hash(chain)
         .with_context(|| format!("no cut hash for chain {chain}"))?;
-    let page = node
-        .header_branch(chain, &[], &[upper], Some(height), Some(height))
+    let headers = node
+        .header_branch_all(chain, &upper, height, height)
         .await?;
-    Ok(page
-        .items
-        .into_iter()
-        .find(|h| h.get("height").and_then(Value::as_u64) == Some(height)))
+    Ok(headers.into_iter().next())
+}
+
+/// Decode a block and run the payload consistency checks (`verify_block`: the payload's
+/// claimed payloadHash matches the header, user tx hash == reqKey). The oracle side must not
+/// project data from a payload that does not even agree with its header.
+pub fn decode_checked(header: &Value, payload: &Value) -> anyhow::Result<DecodedBlock> {
+    let b =
+        kdx_decode::decode_block(header, payload).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    kdx_decode::verify_block(&b, &b.header.payload_hash)
+        .map_err(|e| anyhow::anyhow!("verify: {e}"))?;
+    Ok(b)
 }
 
 /// Canonical header plus decoded payload at `(chain, height)`.
@@ -77,8 +85,7 @@ pub async fn fetch_block(
         .context("header without payloadHash")?
         .to_string();
     let payload = node.payload_with_outputs(chain, &ph).await?;
-    let b = kdx_decode::decode_block(&header, &payload)
-        .map_err(|e| anyhow::anyhow!("decode {chain}/{height}: {e}"))?;
+    let b = decode_checked(&header, &payload).with_context(|| format!("block {chain}/{height}"))?;
     Ok(Some((header, b)))
 }
 
@@ -138,7 +145,7 @@ pub fn tx_requests(
     ];
     // Accounts: sender, then fungible TRANSFER from/to (token = the event's module).
     let mut accounts: Vec<(String, String)> = Vec::new();
-    if let Some(s) = cmd_sender(&tx.cmd_parsed) {
+    if let Some(s) = tx.cmd_parsed.as_ref().and_then(cmd_sender) {
         accounts.push((s.to_string(), "coin".to_string()));
     }
     let mut events: Vec<(String, String)> = Vec::new();
@@ -195,7 +202,8 @@ pub fn tx_requests(
     // Defpact id: a `cont` tx's pactId, or the continuation this tx started.
     let pact_id = tx
         .cmd_parsed
-        .pointer("/payload/cont/pactId")
+        .as_ref()
+        .and_then(|c| c.pointer("/payload/cont/pactId"))
         .or_else(|| tx.output.pointer("/continuation/pactId"))
         .and_then(Value::as_str);
     if let Some(p) = pact_id {
@@ -234,11 +242,7 @@ impl RandomGen {
             .tips
             .cut_hash(chain)
             .with_context(|| format!("no cut hash for chain {chain}"))?;
-        let page = self
-            .node
-            .header_branch(chain, &[], &[upper], Some(lo), Some(hi))
-            .await?;
-        let headers = page.items;
+        let headers = self.node.header_branch_all(chain, &upper, lo, hi).await?;
         let hashes: Vec<String> = headers
             .iter()
             .filter_map(|h| h.get("payloadHash")?.as_str().map(str::to_string))
@@ -253,8 +257,7 @@ impl RandomGen {
             else {
                 continue;
             };
-            let b = kdx_decode::decode_block(&h, p)
-                .map_err(|e| anyhow::anyhow!("decode chain {chain}: {e}"))?;
+            let b = decode_checked(&h, p).with_context(|| format!("chain {chain}"))?;
             self.drawn_blocks += 1;
             if b.txs.is_empty() {
                 self.empty_blocks += 1;

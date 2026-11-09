@@ -11,7 +11,6 @@ pub mod dump;
 pub mod frames;
 pub mod measure;
 pub mod probe;
-pub mod rk_bench;
 
 /// Build the node client from config; `max_rps` and `node_concurrency` come from `[ingest]`.
 pub fn node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
@@ -30,6 +29,8 @@ pub fn node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
         concurrency: cfg.ingest.node_concurrency,
         p2p_url: cfg.node.p2p_url.clone(),
         p2p_cert_sha256,
+        max_body_bytes: cfg.node.max_body_bytes,
+        max_sse_event_bytes: cfg.node.max_sse_event_bytes,
     };
     Ok(NodeClient::new(&ncfg)?)
 }

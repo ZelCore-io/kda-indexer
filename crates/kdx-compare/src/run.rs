@@ -517,10 +517,13 @@ impl Ctx {
                 Some("node /poll does not know this request key".into()),
             );
         };
-        let height = entry
+        // No height in the poll answer: nothing to anchor the oracle to (never default to 0).
+        let Some(height) = entry
             .pointer("/metaData/blockHeight")
             .and_then(Value::as_u64)
-            .unwrap_or(0);
+        else {
+            return Self::simple("no-oracle");
+        };
         if height > self.tips.min_tip() {
             return Self::simple("out-of-range");
         }
@@ -532,6 +535,33 @@ impl Ctx {
             }
             Err(e) => return self.b_error(req, ta, "node", Some(pa), &format!("{e:#}"), curl_b),
         };
+        // /poll reports the block the node saw the tx in; if that is not the canonical header
+        // at the height any more, the tx was reorged.
+        let poll_hash = entry.pointer("/metaData/blockHash").and_then(Value::as_str);
+        let canon_hash = header.get("hash").and_then(Value::as_str);
+        if poll_hash.is_some() && poll_hash != canon_hash {
+            let rec = self.record(
+                req,
+                ta,
+                "node",
+                Some(pa),
+                Some(200),
+                header.to_string(),
+                Vec::new(),
+                "reorg",
+                &[],
+                curl_b,
+                Some(format!(
+                    "poll blockHash {} is not the canonical block {} at height {height}",
+                    poll_hash.unwrap_or_default(),
+                    canon_hash.unwrap_or_default()
+                )),
+            );
+            return Outcome {
+                class: "reorg".into(),
+                record: Some(rec),
+            };
+        }
         let tx = match self.payload_tx(chain, &header, rk).await {
             Ok(t) => t,
             Err(e) => return self.b_error(req, ta, "node", Some(pa), &format!("{e:#}"), curl_b),
@@ -628,8 +658,7 @@ impl Ctx {
             .and_then(Value::as_str)
             .context("header without payloadHash")?;
         let payload = self.node.payload_with_outputs(chain, ph).await?;
-        let b = kdx_decode::decode_block(header, &payload)
-            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        let b = crate::gen::random::decode_checked(header, &payload)?;
         Ok(b.txs.into_iter().find(|t| t.hash.to_b64url() == rk))
     }
 

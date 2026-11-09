@@ -1,5 +1,10 @@
-//! `dump` command: fetch a bounded height range, decode, verify, build records with one shared
-//! `MemDict`, encode, decode back and check the round trip (Task 5 definition).
+//! `dump` command: fetch a bounded height range, decode, run the consistency checks, build
+//! records with one shared `MemDict`, encode, decode back and check the round trip: values
+//! (Task 5 definition) and the exact Merkle leaf bytes the node served (tx objects, outputs,
+//! coinbase, minerData). Payload contents are not Merkle-verified here (P5).
+//!
+//! Heights stay `ingest.finality_depth` below the lowest cut height, so no block that can
+//! still be reorged is read.
 //!
 //! Heights are processed in slabs of `SLAB` heights: every chain of the slab is fetched
 //! concurrently (headers, then payloads in batches), then the blocks are handled in
@@ -11,12 +16,13 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
+use kdx_decode::json::parse_untrusted;
 use kdx_decode::{
     build_records, compare_json, decode_block, render_cmd, render_header, render_miner,
-    render_output, render_tx, verify_block, verify_linkage, Header,
+    render_miner_bytes, render_output, render_output_bytes, render_tx, render_tx_bytes,
+    verify_block, verify_linkage, Header,
 };
 use kdx_node::{ChainGraph, NodeClient};
-use kdx_types::hash::b64url_decode;
 use kdx_types::record::{
     decode_block as decode_block_rec, decode_tx, encode_block, encode_tx, Sig, TxRecord,
 };
@@ -46,6 +52,23 @@ struct Band {
 }
 
 #[derive(Default, Serialize)]
+struct RawSlots {
+    tx: u64,
+    output: u64,
+    coinbase: u64,
+    miner: u64,
+}
+
+#[derive(Default, Serialize)]
+struct Unrepr {
+    tx_object: u64,
+    output: u64,
+    coinbase: u64,
+    miner: u64,
+    cmd_unparsed: u64,
+}
+
+#[derive(Default, Serialize)]
 struct Summary {
     from: u64,
     to: u64,
@@ -58,7 +81,17 @@ struct Summary {
     other_sigs: u64,
     records_with_extra: u64,
     round_trip_failures: u64,
+    /// Rendered leaf bytes != the base64-decoded bytes the node served (after raw slots).
+    byte_mismatches: u64,
+    /// Leaves whose typed fields did not reproduce the node's bytes, so the record keeps
+    /// the raw bytes (`raw_tx`, `raw_output`, `raw_miner`): the pre-fallback byte mismatches.
+    raw_slots: RawSlots,
+    /// Best-effort parse fallbacks (C1/H1): content serde_json cannot represent.
+    unrepresentable: Unrepr,
+    /// Payload consistency check failures (claimed payloadHash, hash == reqKey) and linkage.
     verify_failures: u64,
+    /// User txs whose `hash == reqKey` could not be checked (unparseable output).
+    req_key_unchecked: u64,
     decode_failures: u64,
     fetch_failures: u64,
     legacy_cmd_hash_mismatch: u64,
@@ -83,6 +116,10 @@ impl Ctx {
     fn fail_rt(&mut self, chain: u8, height: u64, pos: usize, msg: &str) {
         self.sum.round_trip_failures += 1;
         eprintln!("ROUND-TRIP FAIL chain {chain} height {height} pos {pos}: {msg}");
+    }
+    fn fail_bytes(&mut self, chain: u8, height: u64, pos: usize, what: &str) {
+        self.sum.byte_mismatches += 1;
+        eprintln!("BYTE MISMATCH chain {chain} height {height} pos {pos}: {what}");
     }
 }
 
@@ -110,8 +147,8 @@ fn parse_height(s: &str, tip: Option<u64>) -> anyhow::Result<u64> {
 
 type Fetched = Vec<(Value, Value)>;
 
-/// Headers come from `header/branch` with the current cut's hash as `upper`, so only the
-/// canonical branch is returned (`header?minheight&maxheight` also returns orphaned siblings).
+/// Headers come from the canonical branch below the current cut (`header_branch_all`, which
+/// pages and checks one header per height); the plain header range also returns orphans.
 async fn fetch_chain(
     nc: &NodeClient,
     chain: u8,
@@ -119,21 +156,7 @@ async fn fetch_chain(
     lo: u64,
     hi: u64,
 ) -> anyhow::Result<Fetched> {
-    let page = nc
-        .header_branch(chain, &[], &[cut_hash.to_owned()], Some(lo), Some(hi))
-        .await?;
-    if page.next.is_some() {
-        bail!("chain {chain} {lo}..{hi}: header/branch page is not complete (reduce SLAB)");
-    }
-    let mut headers = page.items;
-    headers.sort_by_key(|h| h.get("height").and_then(Value::as_u64).unwrap_or(0));
-    let want = (hi - lo + 1) as usize;
-    if headers.len() != want {
-        bail!(
-            "chain {chain} {lo}..{hi}: node returned {} headers, expected {want}",
-            headers.len()
-        );
-    }
+    let headers = nc.header_branch_all(chain, cut_hash, lo, hi).await?;
     let hashes: Vec<String> = headers
         .iter()
         .map(|h| {
@@ -167,13 +190,24 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
     }
     let graph = ChainGraph::from_info(&info);
     let cut = nc.cut().await?;
-    let tip = cut.hashes.values().map(|e| e.height).min();
+    let cut_min = cut.hashes.values().map(|e| e.height).min();
+    // Stay `finality_depth` below the lowest cut height: nothing read can still be reorged.
+    let tip = cut_min.map(|h| h.saturating_sub(cfg.ingest.finality_depth));
     let from = parse_height(&args.from, tip)?;
     let to = parse_height(&args.to, tip)?;
     if from > to {
         bail!("--from {from} > --to {to}");
     }
-    eprintln!("dump: heights {from}..={to} (tip {tip:?})");
+    if let Some(t) = tip {
+        if to > t {
+            bail!(
+                "--to {to} is above the final tip {t} (lowest cut height {} - finality_depth {})",
+                cut_min.unwrap_or(0),
+                cfg.ingest.finality_depth
+            );
+        }
+    }
+    eprintln!("dump: heights {from}..={to} (final tip {tip:?})");
 
     let out = match &args.records_out {
         Some(p) => {
@@ -272,8 +306,11 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         }
         std::fs::write(p, serde_json::to_vec_pretty(&sum)?)?;
     }
-    let failures =
-        sum.round_trip_failures + sum.verify_failures + sum.decode_failures + sum.fetch_failures;
+    let failures = sum.round_trip_failures
+        + sum.byte_mismatches
+        + sum.verify_failures
+        + sum.decode_failures
+        + sum.fetch_failures;
     if failures > 0 {
         bail!("{failures} failure(s)");
     }
@@ -304,6 +341,7 @@ fn handle_block(
         );
         return Ok(());
     }
+    // Consistency only (the payload's claimed payloadHash and reqKeys); not a content check.
     let report = match verify_block(&b, &b.header.payload_hash) {
         Ok(r) => r,
         Err(e) => {
@@ -319,9 +357,26 @@ fn handle_block(
         }
     }
     cx.prev.insert(chain, b.header.clone());
+    cx.sum.req_key_unchecked += report.req_key_unchecked.len() as u64;
+    let u = &mut cx.sum.unrepresentable;
+    u.miner += b.miner_unrepresentable as u64;
+    u.coinbase += b.coinbase_unrepresentable as u64;
+    for t in &b.txs {
+        u.tx_object += t.flags.tx_unrepresentable as u64;
+        u.output += t.flags.output_unrepresentable as u64;
+        u.cmd_unparsed += t.flags.cmd_unparsed as u64;
+    }
 
-    let (br, trs) = build_records(&b, &mut cx.dict);
+    let (br, trs) = match build_records(&b, &mut cx.dict) {
+        Ok(x) => x,
+        Err(e) => {
+            cx.sum.decode_failures += 1;
+            eprintln!("DECODE FAIL chain {chain} height {height}: {e}");
+            return Ok(());
+        }
+    };
     cx.sum.blocks += 1;
+    cx.sum.raw_slots.miner += br.raw_miner.is_some() as u64;
 
     // Block record round trip.
     let mut buf = Vec::new();
@@ -335,10 +390,16 @@ fn handle_block(
             if let Some(d) = compare_json(hdr, &render_header(&br2)) {
                 cx.fail_rt(chain, height, 0, &format!("header: {d}"));
             }
-            match render_miner(&br2, &cx.dict) {
-                Ok(m) if same_text(&m, &b.miner) => {}
-                Ok(_) => cx.fail_rt(chain, height, 0, "minerData differs"),
-                Err(e) => cx.fail_rt(chain, height, 0, &format!("minerData render: {e}")),
+            if !b.miner_unrepresentable {
+                match render_miner(&br2, &cx.dict) {
+                    Ok(m) if same_text(&m, &b.miner) => {}
+                    Ok(_) => cx.fail_rt(chain, height, 0, "minerData differs"),
+                    Err(e) => cx.fail_rt(chain, height, 0, &format!("minerData render: {e}")),
+                }
+            }
+            match render_miner_bytes(&br2, &cx.dict) {
+                Ok(m) if m == b.miner_bytes => {}
+                _ => cx.fail_bytes(chain, height, 0, "minerData"),
             }
         }
         Err(e) => cx.fail_rt(chain, height, 0, &format!("block record decode: {e}")),
@@ -358,10 +419,13 @@ fn handle_block(
             (_, true) => KIND_USER_LEGACY,
         };
         if i == 0 {
+            cx.sum.raw_slots.coinbase += r.raw_output.is_some() as u64;
             cx.sum.coinbase_records += 1;
             cx.sum.coinbase_record_bytes += buf.len() as u64;
         } else {
             cx.sum.user_txs += 1;
+            cx.sum.raw_slots.tx += r.raw_tx.is_some() as u64;
+            cx.sum.raw_slots.output += r.raw_output.is_some() as u64;
             cx.sum.user_record_bytes += buf.len() as u64;
             let e = cx
                 .sum
@@ -376,7 +440,7 @@ fn handle_block(
                 cx.sum.legacy_cmd_hash_mismatch += 1;
             }
         }
-        check_tx(cx, &b, payload, chain, height, i, r, &buf);
+        check_tx(cx, &b, chain, height, i, r, &buf);
         if cx.json {
             println!(
                 "{}",
@@ -407,7 +471,6 @@ fn handle_block(
 fn check_tx(
     cx: &mut Ctx,
     b: &kdx_decode::DecodedBlock,
-    payload: &Value,
     chain: u8,
     height: u64,
     i: usize,
@@ -429,35 +492,48 @@ fn check_tx(
     if r2.extra.is_some() {
         cx.sum.records_with_extra += 1;
     }
-    let orig_out = if i == 0 {
-        &b.coinbase
+    let (orig_out, orig_out_bytes, out_unrepr) = if i == 0 {
+        (&b.coinbase, &b.coinbase_bytes, b.coinbase_unrepresentable)
     } else {
-        &b.txs[i - 1].output
+        let t = &b.txs[i - 1];
+        (&t.output, &t.output_bytes, t.flags.output_unrepresentable)
     };
-    match render_output(&r2, &cx.dict) {
-        Ok(ro) => {
-            if let Some(d) = compare_json(orig_out, &ro) {
-                cx.fail_rt(chain, height, i, &format!("output: {d}"));
+    if !out_unrepr {
+        match render_output(&r2, &cx.dict) {
+            Ok(ro) => {
+                if let Some(d) = compare_json(orig_out, &ro) {
+                    cx.fail_rt(chain, height, i, &format!("output: {d}"));
+                }
             }
+            Err(e) => cx.fail_rt(chain, height, i, &format!("output render: {e}")),
         }
-        Err(e) => cx.fail_rt(chain, height, i, &format!("output render: {e}")),
+    }
+    match render_output_bytes(&r2, &cx.dict) {
+        Ok(ob) if ob == *orig_out_bytes => {}
+        _ => cx.fail_bytes(chain, height, i, "output"),
     }
     if i == 0 {
         return;
     }
     let t = &b.txs[i - 1];
-    if t.cmd_parsed.pointer("/payload/cont").is_some() {
+    match render_tx_bytes(&r2, &cx.dict) {
+        Ok(Some(tb)) if tb == t.tx_bytes => {}
+        _ => cx.fail_bytes(chain, height, i, "tx object"),
+    }
+    if t.cmd_parsed
+        .as_ref()
+        .is_some_and(|c| c.pointer("/payload/cont").is_some())
+    {
         cx.sum.cont_txs += 1;
         cx.sum.max_cont_cmd_bytes = cx.sum.max_cont_cmd_bytes.max(t.cmd.len());
     }
     if render_cmd(&r2) != Some(t.cmd.as_bytes()) {
         cx.fail_rt(chain, height, i, "cmd bytes differ");
     }
-    let orig_tx = payload
-        .pointer(&format!("/transactions/{}/0", i - 1))
-        .and_then(Value::as_str)
-        .and_then(|s| b64url_decode(s).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if t.flags.tx_unrepresentable {
+        return;
+    }
+    let orig_tx = parse_untrusted(&t.tx_bytes).ok();
     match (orig_tx, render_tx(&r2, &cx.dict)) {
         (Some(o), Ok(Some(rt))) => {
             if let Some(d) = compare_json(&o, &rt) {
@@ -510,7 +586,21 @@ fn print_summary(s: &Summary, to_stderr: bool) {
             }
         }
     }
+    let r = &s.raw_slots;
+    let _ = writeln!(
+        o,
+        "raw slots (typed render != node bytes): tx {} output {} coinbase {} miner {}",
+        r.tx, r.output, r.coinbase, r.miner
+    );
+    let u = &s.unrepresentable;
+    let _ = writeln!(
+        o,
+        "unrepresentable: tx {} output {} coinbase {} miner {} cmd-unparsed {}",
+        u.tx_object, u.output, u.coinbase, u.miner, u.cmd_unparsed
+    );
+    let _ = writeln!(o, "reqKey unchecked    {}", s.req_key_unchecked);
     let _ = writeln!(o, "round-trip failures {}", s.round_trip_failures);
+    let _ = writeln!(o, "byte mismatches     {}", s.byte_mismatches);
     let _ = writeln!(o, "verify failures     {}", s.verify_failures);
     let _ = writeln!(o, "decode failures     {}", s.decode_failures);
     let _ = writeln!(o, "fetch failures      {}", s.fetch_failures);
