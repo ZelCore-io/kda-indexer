@@ -13,6 +13,27 @@ use kdx_types::{value, Dict, DictKind, DictMut, Hash32, TxKey};
 use serde_json::{Map, Value};
 
 use crate::payload::{exact_u64, DecodedBlock};
+use crate::render::{render_miner_bytes, render_output_bytes, render_tx_bytes};
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BuildError {
+    #[error("height {0} does not fit a TxKey (u32)")]
+    Height(u64),
+    #[error("block at height {height} has {txs} txs; TxKey positions are u16")]
+    Position { height: u64, txs: usize },
+}
+
+/// Keep the original leaf bytes when the typed fields do not render them exactly.
+fn pin_raw(r: &mut TxRecord, tx_bytes: Option<&[u8]>, output_bytes: &[u8], dict: &dyn Dict) {
+    if let Some(orig) = tx_bytes {
+        if render_tx_bytes(r, dict).ok().flatten().as_deref() != Some(orig) {
+            r.raw_tx = Some(orig.to_vec());
+        }
+    }
+    if render_output_bytes(r, dict).ok().as_deref() != Some(output_bytes) {
+        r.raw_output = Some(output_bytes.to_vec());
+    }
+}
 
 /// Key in `extra` holding the original `sigs` array when an entry is not `{"sig": <string>}`.
 pub const EXTRA_TX_SIGS: &str = "tx.sigs";
@@ -216,13 +237,23 @@ fn finish_extra(r: &mut TxRecord, extra: Map<String, Value>, dict: &dyn Dict) {
     }
 }
 
-pub fn build_records(b: &DecodedBlock, dict: &mut impl DictMut) -> (BlockRecord, Vec<TxRecord>) {
+/// Build the block record and the tx records (coinbase first). Every record renders its
+/// Merkle leaf bytes exactly: typed fields where they reproduce the node's bytes, the raw
+/// `raw_*` slots where they do not (see `record.rs`).
+pub fn build_records(
+    b: &DecodedBlock,
+    dict: &mut impl DictMut,
+) -> Result<(BlockRecord, Vec<TxRecord>), BuildError> {
     // 1. Intern everything the block references, in first-seen order.
     let miner_acct = b.miner.get("account").and_then(Value::as_str);
     let miner_account = miner_acct.map_or(NO_ACCOUNT, |a| dict.intern(DictKind::Account, a));
     intern_output(&b.coinbase, dict);
     for t in &b.txs {
-        if let Some(s) = t.cmd_parsed.pointer("/meta/sender").and_then(Value::as_str) {
+        let sender = t
+            .cmd_parsed
+            .as_ref()
+            .and_then(|c| c.pointer("/meta/sender"));
+        if let Some(s) = sender.and_then(Value::as_str) {
             if !s.is_empty() {
                 dict.intern(DictKind::Account, s);
             }
@@ -233,8 +264,14 @@ pub fn build_records(b: &DecodedBlock, dict: &mut impl DictMut) -> (BlockRecord,
 
     // 2. Encode.
     let h = &b.header;
-    let height = u32::try_from(h.height).unwrap_or(u32::MAX);
-    let block = BlockRecord {
+    let height = u32::try_from(h.height).map_err(|_| BuildError::Height(h.height))?;
+    if b.txs.len() >= u16::MAX as usize {
+        return Err(BuildError::Position {
+            height: h.height,
+            txs: b.txs.len(),
+        });
+    }
+    let mut block = BlockRecord {
         hash: h.hash,
         parent: h.parent,
         adjacents: h
@@ -256,7 +293,12 @@ pub fn build_records(b: &DecodedBlock, dict: &mut impl DictMut) -> (BlockRecord,
         chainweb_version: h.chainweb_version.clone(),
         miner_account,
         miner_data: value::to_vec(&b.miner, dict),
+        raw_miner: None,
+        merkle_verified: false,
     };
+    if render_miner_bytes(&block, dict).ok().as_deref() != Some(b.miner_bytes.as_slice()) {
+        block.raw_miner = Some(b.miner_bytes.clone());
+    }
 
     let mut txs = Vec::with_capacity(b.txs.len() + 1);
     let mut cb = TxRecord {
@@ -266,14 +308,16 @@ pub fn build_records(b: &DecodedBlock, dict: &mut impl DictMut) -> (BlockRecord,
     let mut extra = Map::new();
     fill_output(&mut cb, &b.coinbase, None, dict, &mut extra);
     finish_extra(&mut cb, extra, dict);
+    pin_raw(&mut cb, None, &b.coinbase_bytes, dict);
     txs.push(cb);
 
     for (i, t) in b.txs.iter().enumerate() {
-        let pos = u16::try_from(i + 1).unwrap_or(u16::MAX);
+        let pos = (i + 1) as u16; // bounded by the check above
         let mut r = TxRecord {
             key: TxKey::new(height, h.chain_id, pos),
             request_key: Some(t.hash),
             cmd: Some(t.cmd.as_bytes().to_vec()),
+            cmd_unparsed: t.flags.cmd_unparsed,
             ..TxRecord::default()
         };
         let mut extra = Map::new();
@@ -293,7 +337,8 @@ pub fn build_records(b: &DecodedBlock, dict: &mut impl DictMut) -> (BlockRecord,
         }
         fill_output(&mut r, &t.output, Some(t.hash), dict, &mut extra);
         finish_extra(&mut r, extra, dict);
+        pin_raw(&mut r, Some(&t.tx_bytes), &t.output_bytes, dict);
         txs.push(r);
     }
-    (block, txs)
+    Ok((block, txs))
 }

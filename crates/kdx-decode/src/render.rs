@@ -6,6 +6,7 @@ use kdx_types::{value, Dict, DictKind};
 use serde_json::{Map, Number, Value};
 
 use crate::build::EXTRA_TX_SIGS;
+use crate::json::parse_untrusted;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
@@ -15,6 +16,17 @@ pub enum RenderError {
     Dict { kind: DictKind, id: u32 },
     #[error("record shape: {0}")]
     Shape(String),
+    /// The stored raw bytes have no faithful `Value` form; use the `*_bytes` renderers.
+    #[error("stored raw bytes are not representable as a JSON value: {0}")]
+    Unrepresentable(String),
+}
+
+fn raw_value(b: &[u8]) -> Result<Value> {
+    parse_untrusted(b).map_err(|e| RenderError::Unrepresentable(e.to_string()))
+}
+
+fn to_bytes(v: &Value) -> Vec<u8> {
+    serde_json::to_vec(v).expect("Value serialisation cannot fail")
 }
 
 type Result<T> = std::result::Result<T, RenderError>;
@@ -40,8 +52,24 @@ fn opt_value(b: &Option<Vec<u8>>, dict: &dyn Dict) -> Result<Value> {
     })
 }
 
-/// The CommandResult JSON (envelope keys in node order).
+/// The CommandResult JSON (from `raw_output` when stored, else envelope keys in node order).
 pub fn render_output(r: &TxRecord, dict: &dyn Dict) -> Result<Value> {
+    match &r.raw_output {
+        Some(b) => raw_value(b),
+        None => render_output_typed(r, dict),
+    }
+}
+
+/// The exact CommandResult bytes (the Merkle leaf of `outputsHash`).
+pub fn render_output_bytes(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<u8>> {
+    match &r.raw_output {
+        Some(b) => Ok(b.clone()),
+        None => Ok(to_bytes(&render_output_typed(r, dict)?)),
+    }
+}
+
+/// The CommandResult rendered from the typed fields only (ignores `raw_output`).
+pub fn render_output_typed(r: &TxRecord, dict: &dyn Dict) -> Result<Value> {
     let mut extra = extra_map(r, dict)?;
     let mut o = Map::new();
     for (i, k) in ENVELOPE_KEYS.iter().enumerate() {
@@ -129,6 +157,22 @@ pub fn render_cmd(r: &TxRecord) -> Option<&[u8]> {
 
 /// The transaction object `{"hash", "sigs", "cmd"}` (None for coinbase).
 pub fn render_tx(r: &TxRecord, dict: &dyn Dict) -> Result<Option<Value>> {
+    match &r.raw_tx {
+        Some(b) => raw_value(b).map(Some),
+        None => render_tx_typed(r, dict),
+    }
+}
+
+/// The exact tx object bytes (the Merkle leaf of `transactionsHash`; None for coinbase).
+pub fn render_tx_bytes(r: &TxRecord, dict: &dyn Dict) -> Result<Option<Vec<u8>>> {
+    match &r.raw_tx {
+        Some(b) => Ok(Some(b.clone())),
+        None => Ok(render_tx_typed(r, dict)?.map(|v| to_bytes(&v))),
+    }
+}
+
+/// The tx object rendered from the typed fields only (ignores `raw_tx`).
+pub fn render_tx_typed(r: &TxRecord, dict: &dyn Dict) -> Result<Option<Value>> {
     let (Some(h), Some(cmd)) = (&r.request_key, &r.cmd) else {
         return Ok(None);
     };
@@ -186,7 +230,18 @@ pub fn render_header(r: &BlockRecord) -> Value {
 
 /// The block's `minerData` object.
 pub fn render_miner(r: &BlockRecord, dict: &dyn Dict) -> Result<Value> {
-    Ok(value::from_slice(&r.miner_data, dict)?)
+    match &r.raw_miner {
+        Some(b) => raw_value(b),
+        None => Ok(value::from_slice(&r.miner_data, dict)?),
+    }
+}
+
+/// The exact minerData bytes (a payload Merkle input).
+pub fn render_miner_bytes(r: &BlockRecord, dict: &dyn Dict) -> Result<Vec<u8>> {
+    match &r.raw_miner {
+        Some(b) => Ok(b.clone()),
+        None => Ok(to_bytes(&value::from_slice(&r.miner_data, dict)?)),
+    }
 }
 
 /// Round-trip comparison (Task 5 definition): top-level object keys compared

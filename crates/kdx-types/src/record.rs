@@ -11,7 +11,8 @@
 //! u8      version = 1
 //! u8      flags   b0 request_key  b1 cmd  b2 logs  b3 pact_tx_id
 //!                 b4 metadata     b5 continuation  b6 extra  b7 cb_req_key
-//! u8      bits    b0 status_ok (b1..b7 zero)
+//! u8      bits    b0 status_ok  b1 raw_tx  b2 raw_output  b3 cmd_unparsed
+//!                 (b4..b7 zero)
 //! u8      present output-envelope keys present in the CommandResult, bit i
 //!                 = ENVELOPE_KEYS[i]: gas result reqKey logs events metaData
 //!                 continuation txId (0xff = all present)
@@ -31,7 +32,15 @@
 //!         (EventNameId), varint module_hash (ModuleHash id), bytes params value
 //! varint  n_transfers, then varint event position each
 //! bytes   extra value (a map)                if flags.b6
+//! bytes   raw_tx      original tx object bytes   if bits.b1
+//! bytes   raw_output  original output bytes      if bits.b2
 //! ```
+//!
+//! `raw_tx` / `raw_output` hold the exact base64-decoded Merkle leaf bytes the node served,
+//! set only when rendering the typed fields does not reproduce them byte for byte (escape
+//! forms, key order, or content serde_json cannot represent). Render returns them verbatim.
+//! `cmd_unparsed` marks a user tx whose `cmd` is not representable JSON (the `cmd` bytes are
+//! still stored verbatim; only derived fields such as the sender are missing).
 //!
 //! `extra` keeps the record lossless when a field does not fit its typed slot:
 //! envelope keys (`gas`, `result`, `reqKey`, `logs`, `events`, `metaData`,
@@ -43,6 +52,7 @@
 //!
 //! ```text
 //! u8      version = 1
+//! u8      flags   b0 merkle_verified  b1 raw_miner  (b2..b7 zero)
 //! [32]    hash, [32] parent
 //! u8      chain
 //! varint  height
@@ -53,8 +63,12 @@
 //! varint  n_adjacents, then per entry: u8 chain, [32] hash (wire order kept)
 //! bytes   chainweb_version (utf-8)
 //! varint  miner_account (AccountId; u32::MAX = minerData has no account string)
-//! bytes   miner_data value (the whole minerData object)
+//! bytes   miner_data value (the whole minerData object; null when only raw_miner holds it)
+//! bytes   raw_miner  original minerData bytes  if flags.b1
 //! ```
+//!
+//! `merkle_verified` is set once the payload Merkle roots have been recomputed from the leaves
+//! (P5). Until then it is false: the payload contents are NOT verified, only consistent.
 
 use crate::hash::Hash32;
 use crate::ids::TxKey;
@@ -197,6 +211,12 @@ pub struct TxRecord {
     pub present: u8,
     /// Value-codec map of fields that did not fit their typed slot.
     pub extra: Option<Vec<u8>>,
+    /// Original tx object bytes, when the typed fields do not render them exactly.
+    pub raw_tx: Option<Vec<u8>>,
+    /// Original output (CommandResult) bytes, when the typed fields do not render them exactly.
+    pub raw_output: Option<Vec<u8>>,
+    /// `cmd` could not be parsed as representable JSON (derived fields missing).
+    pub cmd_unparsed: bool,
 }
 
 impl Default for TxRecord {
@@ -218,6 +238,9 @@ impl Default for TxRecord {
             transfers: Vec::new(),
             present: PRESENT_ALL,
             extra: None,
+            raw_tx: None,
+            raw_output: None,
+            cmd_unparsed: false,
         }
     }
 }
@@ -242,6 +265,10 @@ pub struct BlockRecord {
     pub chainweb_version: String,
     pub miner_account: u32,
     pub miner_data: Vec<u8>,
+    /// Original minerData bytes, when `miner_data` does not render them exactly.
+    pub raw_miner: Option<Vec<u8>>,
+    /// Payload Merkle roots recomputed from the leaves and matched (P5). False until then.
+    pub merkle_verified: bool,
 }
 
 fn version(buf: &mut &[u8]) -> Result<()> {
@@ -276,9 +303,13 @@ pub fn encode_tx(r: &TxRecord, out: &mut Vec<u8>) {
     set(&mut flags, 5, r.continuation.is_some());
     set(&mut flags, 6, r.extra.is_some());
     set(&mut flags, 7, r.cb_req_key.is_some());
+    let bits = r.status_ok as u8
+        | (r.raw_tx.is_some() as u8) << 1
+        | (r.raw_output.is_some() as u8) << 2
+        | (r.cmd_unparsed as u8) << 3;
     out.push(FORMAT_VERSION);
     out.push(flags);
-    out.push(r.status_ok as u8);
+    out.push(bits);
     out.push(r.present);
     out.extend_from_slice(&r.key.to_be_bytes());
     if let Some(h) = &r.request_key {
@@ -348,6 +379,12 @@ pub fn encode_tx(r: &TxRecord, out: &mut Vec<u8>) {
     if let Some(x) = &r.extra {
         put_bytes(out, x);
     }
+    if let Some(x) = &r.raw_tx {
+        put_bytes(out, x);
+    }
+    if let Some(x) = &r.raw_output {
+        put_bytes(out, x);
+    }
 }
 
 pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
@@ -355,7 +392,7 @@ pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
     version(buf)?;
     let flags = get_u8(buf)?;
     let bits = get_u8(buf)?;
-    if bits & !1 != 0 {
+    if bits & !0x0f != 0 {
         return Err(Error::Codec(format!("reserved tx bits set: {bits:#x}")));
     }
     let present = get_u8(buf)?;
@@ -422,6 +459,16 @@ pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
     } else {
         None
     };
+    let raw_tx = if bits & 2 != 0 {
+        Some(get_bytes(buf)?.to_vec())
+    } else {
+        None
+    };
+    let raw_output = if bits & 4 != 0 {
+        Some(get_bytes(buf)?.to_vec())
+    } else {
+        None
+    };
     if !buf.is_empty() {
         return Err(Error::Codec(format!(
             "{} trailing bytes after tx record",
@@ -445,11 +492,15 @@ pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
         transfers,
         present,
         extra,
+        raw_tx,
+        raw_output,
+        cmd_unparsed: bits & 8 != 0,
     })
 }
 
 pub fn encode_block(r: &BlockRecord, out: &mut Vec<u8>) {
     out.push(FORMAT_VERSION);
+    out.push(r.merkle_verified as u8 | (r.raw_miner.is_some() as u8) << 1);
     out.extend_from_slice(&r.hash.0);
     out.extend_from_slice(&r.parent.0);
     out.push(r.chain);
@@ -471,11 +522,20 @@ pub fn encode_block(r: &BlockRecord, out: &mut Vec<u8>) {
     put_bytes(out, r.chainweb_version.as_bytes());
     put_u64(out, r.miner_account as u64);
     put_bytes(out, &r.miner_data);
+    if let Some(x) = &r.raw_miner {
+        put_bytes(out, x);
+    }
 }
 
 pub fn decode_block(mut b: &[u8]) -> Result<BlockRecord> {
     let buf = &mut b;
     version(buf)?;
+    let bflags = get_u8(buf)?;
+    if bflags & !0x03 != 0 {
+        return Err(Error::Codec(format!(
+            "reserved block flags set: {bflags:#x}"
+        )));
+    }
     let hash_ = hash(buf)?;
     let parent = hash(buf)?;
     let chain = get_u8(buf)?;
@@ -497,6 +557,11 @@ pub fn decode_block(mut b: &[u8]) -> Result<BlockRecord> {
     let chainweb_version = utf8(get_bytes(buf)?)?;
     let miner_account = get_u32(buf)?;
     let miner_data = get_bytes(buf)?.to_vec();
+    let raw_miner = if bflags & 2 != 0 {
+        Some(get_bytes(buf)?.to_vec())
+    } else {
+        None
+    };
     if !buf.is_empty() {
         return Err(Error::Codec(format!(
             "{} trailing bytes after block record",
@@ -521,5 +586,7 @@ pub fn decode_block(mut b: &[u8]) -> Result<BlockRecord> {
         chainweb_version,
         miner_account,
         miner_data,
+        raw_miner,
+        merkle_verified: bflags & 1 != 0,
     })
 }

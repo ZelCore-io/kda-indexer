@@ -1,11 +1,19 @@
 //! Decode a header (object encoding) and a payload-with-outputs into typed
 //! parts. Unknown top-level keys are an error (spec §9.3: loud on new shapes).
+//!
+//! Every Merkle leaf (tx object, output, coinbase, minerData) keeps its original
+//! base64-decoded bytes. Parsing a leaf into a `Value` is best-effort: user-controlled
+//! content that serde_json cannot represent faithfully (see `json.rs`) leaves the parsed
+//! form empty and sets a flag; the block still decodes and the bytes stay authoritative.
 
 use std::collections::BTreeMap;
 
 use kdx_types::hash::b64url_decode;
 use kdx_types::Hash32;
+use serde::Deserialize;
 use serde_json::{Map, Value};
+
+use crate::json::{parse_untrusted, Unrepresentable};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
@@ -48,21 +56,49 @@ pub struct Header {
     pub chainweb_version: String,
 }
 
+/// Per-tx best-effort parse results (all false for an ordinary tx).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxFlags {
+    /// The tx object could not be represented as a `Value`; `hash` and `cmd` were taken
+    /// from a loose parse and `sigs` is empty. `tx_bytes` is authoritative.
+    pub tx_unrepresentable: bool,
+    /// The output could not be represented; `output` is `Null`, `output_bytes` is authoritative.
+    pub output_unrepresentable: bool,
+    /// `cmd` is not representable JSON; `cmd_parsed` is None (the `cmd` string is kept verbatim).
+    pub cmd_unparsed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedTx {
     pub hash: Hash32,
+    /// Empty when `flags.tx_unrepresentable`.
     pub sigs: Vec<Value>,
     /// The exact signed string.
     pub cmd: String,
-    pub cmd_parsed: Value,
+    /// Best-effort parse of `cmd` (only used for `meta.sender`, `payload.cont`, ...).
+    pub cmd_parsed: Option<Value>,
+    /// The CommandResult; `Null` when `flags.output_unrepresentable`.
     pub output: Value,
+    /// `reqKey` of the output (also recovered by a loose parse when the output is unrepresentable).
+    pub out_req_key: Option<String>,
+    /// Original base64-decoded tx object bytes (Merkle leaf of `transactionsHash`).
+    pub tx_bytes: Vec<u8>,
+    /// Original base64-decoded output bytes (Merkle leaf of `outputsHash`).
+    pub output_bytes: Vec<u8>,
+    pub flags: TxFlags,
 }
 
 #[derive(Debug, Clone)]
 pub struct DecodedBlock {
     pub header: Header,
+    /// `Null` when `miner_unrepresentable`.
     pub miner: Value,
+    pub miner_bytes: Vec<u8>,
+    pub miner_unrepresentable: bool,
+    /// `Null` when `coinbase_unrepresentable`.
     pub coinbase: Value,
+    pub coinbase_bytes: Vec<u8>,
+    pub coinbase_unrepresentable: bool,
     pub txs: Vec<DecodedTx>,
     pub payload_hash: Hash32,
     pub transactions_hash: Hash32,
@@ -183,15 +219,98 @@ pub fn decode_header(h: &Value) -> Result<Header> {
     })
 }
 
-fn b64_json(s: &Value, path: &str) -> Result<Value> {
+/// Base64url-decode a leaf (malformed base64 from the node is a hard error) and parse it
+/// best-effort.
+fn leaf(s: &Value, path: &str) -> Result<(Vec<u8>, std::result::Result<Value, Unrepresentable>)> {
     let s = s.as_str().ok_or_else(|| bad(path, "not a string"))?;
     let bytes = b64url_decode(s).map_err(|e| bad(path, e))?;
-    serde_json::from_slice(&bytes).map_err(|e| bad(path, e))
+    let parsed = parse_untrusted(&bytes);
+    Ok((bytes, parsed))
 }
 
 fn decode_output(v: Value, path: &str) -> Result<Value> {
     check_keys(obj(&v, path)?, &OUTPUT_KEYS, path)?;
     Ok(v)
+}
+
+/// Output leaf: `(bytes, value or Null, unrepresentable)`.
+fn output_leaf(s: &Value, path: &str) -> Result<(Vec<u8>, Value, bool)> {
+    let (bytes, parsed) = leaf(s, path)?;
+    Ok(match parsed {
+        Ok(v) => (bytes, decode_output(v, path)?, false),
+        Err(_) => (bytes, Value::Null, true),
+    })
+}
+
+#[derive(Deserialize)]
+struct TxLoose {
+    hash: String,
+    cmd: String,
+}
+
+#[derive(Deserialize)]
+struct OutLoose {
+    #[serde(rename = "reqKey")]
+    req_key: Option<String>,
+}
+
+fn decode_tx(pair: &[Value], i: usize) -> Result<DecodedTx> {
+    let pos = i + 1;
+    let tp = format!("tx[{pos}]");
+    let op = format!("{tp}.output");
+    let (tx_bytes, tx_parsed) = leaf(&pair[0], &tp)?;
+    let (output_bytes, output, output_unrepresentable) = output_leaf(&pair[1], &op)?;
+    let mut flags = TxFlags {
+        output_unrepresentable,
+        ..TxFlags::default()
+    };
+    let (hash, sigs, cmd) = match tx_parsed {
+        Ok(tx) => {
+            let tm = obj(&tx, &tp)?;
+            check_keys(tm, &TX_KEYS, &tp)?;
+            let sigs = field(tm, "sigs", &tp)?
+                .as_array()
+                .ok_or_else(|| bad(format!("{tp}.sigs"), "not an array"))?
+                .clone();
+            (
+                hash_field(tm, "hash", &tp)?,
+                sigs,
+                str_field(tm, "cmd", &tp)?.to_owned(),
+            )
+        }
+        Err(why) => {
+            // The node serves `{"hash", "sigs", "cmd"}` with plain strings; only `sigs` could
+            // hold something odd. Recover hash and cmd, keep the bytes.
+            let l: TxLoose = serde_json::from_slice(&tx_bytes)
+                .map_err(|e| bad(&tp, format!("{why}; loose parse: {e}")))?;
+            flags.tx_unrepresentable = true;
+            let hash = Hash32::from_b64url(&l.hash).map_err(|e| bad(format!("{tp}.hash"), e))?;
+            (hash, Vec::new(), l.cmd)
+        }
+    };
+    let cmd_parsed = parse_untrusted(cmd.as_bytes()).ok();
+    flags.cmd_unparsed = cmd_parsed.is_none();
+    let out_req_key = if output_unrepresentable {
+        serde_json::from_slice::<OutLoose>(&output_bytes)
+            .ok()
+            .and_then(|l| l.req_key)
+    } else {
+        output
+            .get("reqKey")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    Ok(DecodedTx {
+        hash,
+        sigs,
+        cmd,
+        cmd_parsed,
+        output,
+        out_req_key,
+        tx_bytes,
+        output_bytes,
+        flags,
+    })
 }
 
 pub fn decode_block(
@@ -202,51 +321,32 @@ pub fn decode_block(
     let p = "payload";
     let m = obj(payload, p)?;
     check_keys(m, &PAYLOAD_KEYS, p)?;
-    let miner = b64_json(field(m, "minerData", p)?, "payload.minerData")?;
-    let coinbase = decode_output(
-        b64_json(field(m, "coinbase", p)?, "payload.coinbase")?,
-        "coinbase",
-    )?;
+    let (miner_bytes, miner) = leaf(field(m, "minerData", p)?, "payload.minerData")?;
+    let miner_unrepresentable = miner.is_err();
+    let miner = miner.unwrap_or(Value::Null);
+    let (coinbase_bytes, coinbase, coinbase_unrepresentable) =
+        output_leaf(field(m, "coinbase", p)?, "coinbase")?;
     let list = field(m, "transactions", p)?
         .as_array()
         .ok_or_else(|| bad("payload.transactions", "not an array"))?;
     let mut txs = Vec::with_capacity(list.len());
     for (i, pair) in list.iter().enumerate() {
-        let pos = i + 1;
-        let tp = format!("tx[{pos}]");
         let pair =
             pair.as_array()
                 .filter(|a| a.len() == 2)
                 .ok_or_else(|| DecodeError::UnknownShape {
                     path: format!("payload.transactions[{i}]"),
                 })?;
-        let tx = b64_json(&pair[0], &tp)?;
-        let output = decode_output(
-            b64_json(&pair[1], &format!("{tp}.output"))?,
-            &format!("{tp}.output"),
-        )?;
-        let tm = obj(&tx, &tp)?;
-        check_keys(tm, &TX_KEYS, &tp)?;
-        let hash = hash_field(tm, "hash", &tp)?;
-        let sigs = field(tm, "sigs", &tp)?
-            .as_array()
-            .ok_or_else(|| bad(format!("{tp}.sigs"), "not an array"))?
-            .clone();
-        let cmd = str_field(tm, "cmd", &tp)?.to_owned();
-        let cmd_parsed: Value =
-            serde_json::from_str(&cmd).map_err(|e| bad(format!("{tp}.cmd"), e))?;
-        txs.push(DecodedTx {
-            hash,
-            sigs,
-            cmd,
-            cmd_parsed,
-            output,
-        });
+        txs.push(decode_tx(pair, i)?);
     }
     Ok(DecodedBlock {
         header,
         miner,
+        miner_bytes,
+        miner_unrepresentable,
         coinbase,
+        coinbase_bytes,
+        coinbase_unrepresentable,
         txs,
         payload_hash: hash_field(m, "payloadHash", p)?,
         transactions_hash: hash_field(m, "transactionsHash", p)?,

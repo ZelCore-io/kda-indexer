@@ -155,7 +155,9 @@ pub fn from_poll(poll: &Value, header: &Value, tx: Option<&DecodedTx>) -> Value 
         .unwrap_or_default();
     m.insert("events".into(), Value::Array(events));
     if let Some(tx) = tx {
-        let c = &tx.cmd_parsed;
+        // An unparseable cmd (see `TxFlags::cmd_unparsed`) projects as nulls.
+        let null = Value::Null;
+        let c = tx.cmd_parsed.as_ref().unwrap_or(&null);
         let meta = c.get("meta").cloned().unwrap_or(Value::Null);
         let exec = c.pointer("/payload/exec");
         let cont = c.pointer("/payload/cont");
@@ -219,8 +221,11 @@ pub fn cmd_hashes(tx: &DecodedTx) -> bool {
 /// cmd as the key-order template, and reports whether that text hashes to the request key.
 /// Returns `(rebuilt_hashes, template_reserialises_to_served_text)`.
 pub fn rehash_from_a(tx: &DecodedTx, cw: &Value) -> (bool, bool) {
-    let template_ok = serde_json::to_string(&tx.cmd_parsed).ok().as_deref() == Some(&tx.cmd);
-    let mut c = tx.cmd_parsed.clone();
+    let Some(parsed) = &tx.cmd_parsed else {
+        return (false, false);
+    };
+    let template_ok = serde_json::to_string(parsed).ok().as_deref() == Some(&tx.cmd);
+    let mut c = parsed.clone();
     let set = |c: &mut Value, ptr: &str, v: Option<Value>| {
         if let (Some(slot), Some(v)) = (c.pointer_mut(ptr), v) {
             *slot = v;
