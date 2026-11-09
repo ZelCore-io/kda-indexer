@@ -604,6 +604,7 @@ fn build_and_commit(
         );
     }
     let t = Instant::now();
+    let mut unindexed = 0u64;
     let mut w = RangeWriter::create(
         &ctx.segdir,
         &ctx.etl,
@@ -653,6 +654,7 @@ fn build_and_commit(
                 }
             }
             let ib = pipeline::index(p, &mut *dict)?;
+            unindexed += u64::from(ib.unindexed_accounts);
             w.push(&ib)?;
             prev.insert(c, (h, hd.hash));
         }
@@ -672,6 +674,17 @@ fn build_and_commit(
     let t = Instant::now();
     let mut txn = ctx.hot.rw()?;
     dict.persist(&mut txn)?;
+    if unindexed > 0 {
+        tracing::warn!(
+            range = u.start,
+            unindexed,
+            "backfill: account strings over the length cap left unindexed"
+        );
+        txn.add_counter(
+            kdx_hot::tail::counters::UNINDEXED_ACCOUNTS,
+            unindexed as i64,
+        )?;
+    }
     for (&c, &(h, hash)) in &prev {
         if h == last {
             set_checkpoint(&mut txn, Stage::Headers, c, h, hash)?;

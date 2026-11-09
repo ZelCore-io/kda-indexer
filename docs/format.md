@@ -28,6 +28,13 @@ Integers are little-endian unless stated otherwise. `varint` is unsigned LEB128.
 | AccountId, ModuleId, EventNameId, PubKeyId, ModuleHash id | u32, dense from 0, in first-seen order; never reused or deleted. |
 | CodeHash | blake2b-128 of an `exec` code body. |
 
+Every name is interned when a block is indexed, before its records are encoded. An account
+string is interned only when it is 1..=256 bytes (`coin` allows at most 256 characters);
+longer strings are not accounts and get no id or posting. The `unindexed_accounts` counter
+in the hot store's `Counters` counts them. In the hot store, `DictFwd` is keyed by the name,
+or by `0xFF ‖ blake2b-256(name)` when the name is longer than 480 bytes, so no key reaches
+the MDBX key-size limit.
+
 Before the chain-graph change (height 852,054 on mainnet01) only 10 chains exist, so slots
 of the missing chains are empty. Empty slots are allowed anywhere.
 
@@ -335,10 +342,18 @@ One file per family per range. Families and their entity keys:
 | family byte | file | entity |
 |---|---|---|
 | 0 | `xfer` | `AccountId << 32 | ModuleId`: txs where the account sends or receives a fungible TRANSFER of that module |
-| 1 | `acct` | AccountId: txs where the account appears at all |
+| 1 | `acct` | AccountId: txs whose sender, signer `addr` or coinbase miner is the account, or one of whose events names it (see below) |
 | 2 | `pk` | PubKeyId: txs signed by the key |
 | 3 | `evt` | EventNameId, or `1 << 32 | ModuleId` for "any event of the module" |
 | 4 | `code` | first 8 bytes of the CodeHash, big-endian (verify the full hash on read) |
+
+An event names an account when the account is a side of a fungible `TRANSFER (from, to,
+amount)`, a poly-fungible `TRANSFER (id, from, to, amount)` or a `TRANSFER_XCHAIN` /
+`TRANSFER_XCHAIN_RECD (from, to, amount, chain)`, or when it is a syntactically valid Pact
+principal (`k:`, `w:`, `r:`, `u:`, `m:`, `p:`, `c:`) anywhere in the event's params. All of
+these are interned before encoding, so the `acct` posting set is a pure function of the
+block: backfill, tail, replay and rebuild give the same set. A non-principal ("vanity")
+account name that appears only in the params of other events gets no posting.
 
 ```
 [4]  "KDXP"   u8 version = 1   u8 family   u64 range_txs

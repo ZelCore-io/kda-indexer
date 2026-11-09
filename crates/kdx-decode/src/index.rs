@@ -2,10 +2,13 @@
 //! Shared by backfill and the live tail; called right after `build_records` with the same
 //! dictionary, so interning stays in first-seen order.
 //!
-//! Acct sources: meta sender, both sides of a fungible `TRANSFER`, event params (at any depth)
-//! that equal an account name already known to the dictionary, signer `addr` when it is a
-//! known account, and the coinbase miner (on the coinbase tx). Builder call: signer `addr` and
-//! event params are matched with `find` and never interned (no second pass, spec §3.6).
+//! Acct sources: meta sender, signer `addr`, the coinbase miner (on the coinbase tx) and each
+//! event's account strings (`build::event_accounts`: TRANSFER / poly-fungible TRANSFER /
+//! TRANSFER_XCHAIN sides and every Pact principal in the params, at any depth). All of them
+//! are interned by `build::intern_block` before encoding, so the postings are a pure function
+//! of the block: identical across backfill, tail, replay and rebuild, whatever the dictionary
+//! held before. Non-principal names that appear only in other event params get no posting.
+//! Strings longer than `MAX_ACCOUNT_LEN` are never accounts.
 //! Pk: signer `pubKey` (interned here). Code: blake2b-128 of `exec.code`.
 //! Txs with `cmd_unparsed` get only output-derived postings (events, transfers, defpact).
 
@@ -13,7 +16,10 @@ use kdx_types::record::{BlockRecord, TxRecord};
 use kdx_types::{blake2b_128, DictKind, DictMut, Hash32, TxKey};
 use serde_json::Value;
 
-use crate::build::{build_records, parse_event, transfer_accounts, BuildError};
+use crate::build::{
+    account_ok, encode_records, event_accounts, intern_block, parse_event, transfer_accounts,
+    BuildError,
+};
 use crate::payload::DecodedBlock;
 use crate::verify::VerifyReport;
 
@@ -88,6 +94,8 @@ pub struct IndexedBlock {
     pub idx: Vec<TxIndex>,
     /// User txs with `cmd_reencoded` set.
     pub cmd_reencoded: u32,
+    /// Account strings longer than `MAX_ACCOUNT_LEN` (not indexed).
+    pub unindexed_accounts: u32,
 }
 
 /// `build_records` + `extract` with one dictionary: the whole per-block decode step.
@@ -96,7 +104,8 @@ pub fn index_block(
     report: &VerifyReport,
     dict: &mut impl DictMut,
 ) -> Result<IndexedBlock, BuildError> {
-    let (block, txs) = build_records(b, report, dict)?;
+    let unindexed_accounts = intern_block(b, dict);
+    let (block, txs) = encode_records(b, report, &*dict)?;
     let idx = extract(b, &txs, dict);
     let cmd_reencoded = txs.iter().filter(|t| t.cmd_reencoded).count() as u32;
     Ok(IndexedBlock {
@@ -104,6 +113,7 @@ pub fn index_block(
         txs,
         idx,
         cmd_reencoded,
+        unindexed_accounts,
     })
 }
 
@@ -112,8 +122,8 @@ fn pact_id_of(v: Option<&Value>) -> Option<Hash32> {
         .and_then(|s| Hash32::from_b64url(s).ok())
 }
 
-/// Postings from a CommandResult: events (Evt, module wildcard), fungible transfers (Xfer,
-/// Acct) and event params that are known accounts (Acct).
+/// Postings from a CommandResult: events (Evt, module wildcard), fungible transfers (Xfer)
+/// and every event's account strings (Acct).
 fn output_postings(out: &Value, dict: &mut impl DictMut, p: &mut Vec<(Family, u64)>) {
     let Some(evs) = out.get("events").and_then(Value::as_array) else {
         return;
@@ -126,30 +136,25 @@ fn output_postings(out: &Value, dict: &mut impl DictMut, p: &mut Vec<(Family, u6
             p.push((Family::Evt, evt_module_entity(module)));
             if let Some((from, to)) = transfer_accounts(&ev) {
                 for a in [from, to] {
-                    if !a.is_empty() {
+                    if account_ok(a) {
                         let id = dict.intern(DictKind::Account, a);
                         p.push((Family::Xfer, xfer_entity(id, module)));
-                        p.push((Family::Acct, id as u64));
                     }
                 }
             }
         }
-        if let Some(params) = e.get("params") {
-            known_accounts(params, dict, p);
+        let mut acc = Vec::new();
+        event_accounts(e, &mut acc);
+        for a in acc {
+            account_posting(a, dict, p);
         }
     }
 }
 
-fn known_accounts(v: &Value, dict: &mut impl DictMut, p: &mut Vec<(Family, u64)>) {
-    match v {
-        Value::String(s) => {
-            if let Some(id) = dict.find(DictKind::Account, s) {
-                p.push((Family::Acct, id as u64));
-            }
-        }
-        Value::Array(a) => a.iter().for_each(|x| known_accounts(x, dict, p)),
-        Value::Object(m) => m.values().for_each(|x| known_accounts(x, dict, p)),
-        _ => {}
+/// Acct posting for `a` (already interned by `intern_block` when `account_ok`).
+fn account_posting(a: &str, dict: &mut impl DictMut, p: &mut Vec<(Family, u64)>) {
+    if account_ok(a) {
+        p.push((Family::Acct, dict.intern(DictKind::Account, a) as u64));
     }
 }
 
@@ -163,9 +168,7 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
         let mut code_hash = None;
         if pos == 0 {
             if let Some(a) = b.miner.get("account").and_then(Value::as_str) {
-                if let Some(id) = dict.find(DictKind::Account, a) {
-                    p.push((Family::Acct, id as u64));
-                }
+                account_posting(a, dict, &mut p);
             }
             output_postings(&b.coinbase, dict, &mut p);
         } else if let Some(t) = b.txs.get(pos - 1) {
@@ -173,9 +176,7 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
             let out_pact = t.output.get("continuation").and_then(|c| c.get("pactId"));
             if let (Some(c), false) = (&t.cmd_parsed, r.cmd_unparsed) {
                 if let Some(s) = c.pointer("/meta/sender").and_then(Value::as_str) {
-                    if let Some(id) = dict.find(DictKind::Account, s) {
-                        p.push((Family::Acct, id as u64));
-                    }
+                    account_posting(s, dict, &mut p);
                 }
                 for s in c
                     .get("signers")
@@ -188,9 +189,7 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
                         p.push((Family::Pk, id as u64));
                     }
                     if let Some(a) = s.get("addr").and_then(Value::as_str) {
-                        if let Some(id) = dict.find(DictKind::Account, a) {
-                            p.push((Family::Acct, id as u64));
-                        }
+                        account_posting(a, dict, &mut p);
                     }
                 }
                 if let Some(code) = c.pointer("/payload/exec/code").and_then(Value::as_str) {

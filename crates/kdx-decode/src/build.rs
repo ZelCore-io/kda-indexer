@@ -1,10 +1,11 @@
 //! Build v1 records from a decoded block (spec §3.4 "Record encoding").
 //!
-//! Names are interned for the whole block first (first-seen order: miner
-//! account, then coinbase, then user txs in payload order; per output: meta
-//! sender, then events' module, event name, module hash and fungible TRANSFER
-//! accounts), and only then are values encoded, so every account string in the
-//! block is stored as an account ref.
+//! Names are interned for the whole block first (`intern_block`; first-seen order: miner
+//! account, then coinbase, then user txs in payload order; per tx: meta sender, signer
+//! `addr`s, then per output the events' module, event name and module hash, then each
+//! event's account strings, see `event_accounts`), and only then are values encoded, so every
+//! account string in the block is stored as an account ref. Account strings longer than
+//! `MAX_ACCOUNT_LEN` are never interned.
 
 use kdx_types::record::{
     BlockRecord, CbReqKey, EventRec, Sig, TxRecord, ENVELOPE_KEYS, NO_ACCOUNT,
@@ -116,20 +117,145 @@ fn parse_events(o: &Map<String, Value>) -> Option<Vec<EventParts<'_>>> {
         .collect()
 }
 
-fn intern_output(o: &Value, dict: &mut impl DictMut) {
+/// Longest string interned as an account: `coin`'s limit (3..=256 characters). Longer strings
+/// are not accounts: no AccountId, no posting; records keep them as plain strings.
+pub const MAX_ACCOUNT_LEN: usize = 256;
+
+fn b64url_hash(s: &str) -> bool {
+    s.len() == 43
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// A non-empty Pact name (keyset name, module or function name): printable ASCII, no spaces.
+fn pact_name(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_graphic())
+}
+
+/// A syntactically valid Pact principal (Pact `principal` grammar):
+/// `k:<64 lowercase hex>`, `w:<hash>:<predicate>`, `r:<keyset>`, `u:<function>:<hash>`,
+/// `m:<module>`, `p:<pact id>:<function>`, `c:<hash>` (hash = 43 base64url chars).
+pub fn is_principal(s: &str) -> bool {
+    if s.len() > MAX_ACCOUNT_LEN || s.len() < 3 || s.as_bytes()[1] != b':' {
+        return false;
+    }
+    let rest = &s[2..];
+    match s.as_bytes()[0] {
+        b'k' => rest.len() == 64 && rest.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+        b'w' => rest
+            .split_once(':')
+            .is_some_and(|(h, p)| b64url_hash(h) && pact_name(p)),
+        b'p' => rest
+            .split_once(':')
+            .is_some_and(|(h, f)| b64url_hash(h) && pact_name(f)),
+        b'u' => rest
+            .rsplit_once(':')
+            .is_some_and(|(f, h)| pact_name(f) && b64url_hash(h)),
+        b'r' | b'm' => pact_name(rest) && !rest.contains(':'),
+        b'c' => b64url_hash(rest),
+        _ => false,
+    }
+}
+
+fn principals<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    match v {
+        Value::String(s) if is_principal(s) => out.push(s),
+        Value::Array(a) => a.iter().for_each(|x| principals(x, out)),
+        Value::Object(m) => m.values().for_each(|x| principals(x, out)),
+        _ => {}
+    }
+}
+
+/// Account strings an event names, in a fixed order (spec §3.6, Acct sources): both sides of
+/// a fungible `TRANSFER (from, to, amount)`, of a poly-fungible `TRANSFER (id, from, to,
+/// amount)` and of `TRANSFER_XCHAIN`/`TRANSFER_XCHAIN_RECD (from, to, amount, chain)`, then
+/// every param string at any depth that is a Pact principal. Empty and over-long strings are
+/// included; `account_ok` filters them. The result depends only on the event.
+pub fn event_accounts<'a>(e: &'a Value, out: &mut Vec<&'a str>) {
+    let Some(params) = e.get("params") else {
+        return;
+    };
+    if let (Some(ev), Some(p)) = (parse_event(e), params.as_array()) {
+        if let Some((from, to)) = transfer_accounts(&ev) {
+            out.extend([from, to]);
+        } else if p.len() == 4 && matches!(p[3], Value::Number(_) | Value::Object(_)) {
+            let sides = match ev.name {
+                "TRANSFER" if p[0].is_string() => Some((&p[1], &p[2])),
+                "TRANSFER_XCHAIN" | "TRANSFER_XCHAIN_RECD" => Some((&p[0], &p[1])),
+                _ => None,
+            };
+            if let Some((Some(a), Some(b))) = sides.map(|(a, b)| (a.as_str(), b.as_str())) {
+                out.extend([a, b]);
+            }
+        }
+    }
+    principals(params, out);
+}
+
+/// Whether `s` is interned as an account: non-empty and at most `MAX_ACCOUNT_LEN` bytes.
+pub fn account_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_ACCOUNT_LEN
+}
+
+/// Intern `s` as an account if `account_ok`; count an over-long one in `unindexed`.
+fn intern_account(dict: &mut impl DictMut, s: &str, unindexed: &mut u32) -> Option<u32> {
+    if s.len() > MAX_ACCOUNT_LEN {
+        *unindexed += 1;
+    }
+    account_ok(s).then(|| dict.intern(DictKind::Account, s))
+}
+
+fn intern_output(o: &Value, dict: &mut impl DictMut, unindexed: &mut u32) {
     let Some(o) = o.as_object() else { return };
     for ev in parse_events(o).unwrap_or_default() {
         dict.intern(DictKind::Module, &ev.module);
         dict.intern(DictKind::EventName, &ev.event_name);
         dict.intern(DictKind::ModuleHash, ev.module_hash);
-        if let Some((from, to)) = transfer_accounts(&ev) {
-            for a in [from, to] {
-                if !a.is_empty() {
-                    dict.intern(DictKind::Account, a);
+    }
+    let mut acc = Vec::new();
+    for e in o
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        acc.clear();
+        event_accounts(e, &mut acc);
+        for a in &acc {
+            intern_account(dict, a, unindexed);
+        }
+    }
+}
+
+/// Step 1 of `build_records`: intern every name the block references, in first-seen order
+/// (miner account; coinbase output; per user tx: meta sender, signer `addr`s, output). Every
+/// account string `extract` posts is interned here, so postings depend only on the block.
+/// Returns the number of account strings longer than `MAX_ACCOUNT_LEN` (not interned).
+pub fn intern_block(b: &DecodedBlock, dict: &mut impl DictMut) -> u32 {
+    let mut unindexed = 0;
+    if let Some(a) = b.miner.get("account").and_then(Value::as_str) {
+        intern_account(dict, a, &mut unindexed);
+    }
+    intern_output(&b.coinbase, dict, &mut unindexed);
+    for t in &b.txs {
+        if let Some(c) = &t.cmd_parsed {
+            if let Some(s) = c.pointer("/meta/sender").and_then(Value::as_str) {
+                intern_account(dict, s, &mut unindexed);
+            }
+            for s in c
+                .get("signers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(a) = s.get("addr").and_then(Value::as_str) {
+                    intern_account(dict, a, &mut unindexed);
                 }
             }
         }
+        intern_output(&t.output, dict, &mut unindexed);
     }
+    unindexed
 }
 
 /// Fill the output (CommandResult) part of `r`. `user_hash` is the tx hash for
@@ -250,24 +376,24 @@ pub fn build_records(
     dict: &mut impl DictMut,
 ) -> Result<(BlockRecord, Vec<TxRecord>), BuildError> {
     // 1. Intern everything the block references, in first-seen order.
-    let miner_acct = b.miner.get("account").and_then(Value::as_str);
-    let miner_account = miner_acct.map_or(NO_ACCOUNT, |a| dict.intern(DictKind::Account, a));
-    intern_output(&b.coinbase, dict);
-    for t in &b.txs {
-        let sender = t
-            .cmd_parsed
-            .as_ref()
-            .and_then(|c| c.pointer("/meta/sender"));
-        if let Some(s) = sender.and_then(Value::as_str) {
-            if !s.is_empty() {
-                dict.intern(DictKind::Account, s);
-            }
-        }
-        intern_output(&t.output, dict);
-    }
-    let dict: &dyn Dict = &*dict;
-
+    intern_block(b, dict);
     // 2. Encode.
+    encode_records(b, report, &*dict)
+}
+
+/// Step 2 of `build_records`: encode with a dictionary that already holds every name
+/// (`intern_block`).
+pub fn encode_records(
+    b: &DecodedBlock,
+    report: &VerifyReport,
+    dict: &dyn Dict,
+) -> Result<(BlockRecord, Vec<TxRecord>), BuildError> {
+    let miner_account = b
+        .miner
+        .get("account")
+        .and_then(Value::as_str)
+        .and_then(|a| dict.find(DictKind::Account, a))
+        .unwrap_or(NO_ACCOUNT);
     let h = &b.header;
     let height = u32::try_from(h.height).map_err(|_| BuildError::Height(h.height))?;
     if b.txs.len() >= u16::MAX as usize {

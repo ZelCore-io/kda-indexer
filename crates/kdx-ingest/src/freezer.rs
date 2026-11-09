@@ -170,6 +170,7 @@ fn hot_step_blocks(ctx: &Ctx, start: u32, end: u32) -> Result<Vec<IndexedBlock>>
                 txs: t,
                 idx,
                 cmd_reencoded,
+                unindexed_accounts: 0,
             });
         }
     }
@@ -331,6 +332,7 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
                 txs,
                 idx,
                 cmd_reencoded,
+                unindexed_accounts: 0,
             })?;
         }
     }

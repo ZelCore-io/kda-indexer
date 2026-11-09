@@ -18,6 +18,8 @@ pub mod counters {
     pub const TXS: &str = "txs";
     pub const USER_TXS: &str = "user_txs";
     pub const CMD_REENCODED: &str = "cmd_reencoded";
+    /// Account strings longer than `MAX_ACCOUNT_LEN`, left unindexed.
+    pub const UNINDEXED_ACCOUNTS: &str = "unindexed_accounts";
     /// Per-chain tx records: `txs.cNN`.
     pub fn txs_chain(chain: u8) -> String {
         format!("txs.c{chain:02}")
@@ -102,6 +104,10 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         (counters::TXS.to_owned(), n),
         (counters::USER_TXS.to_owned(), n - 1),
         (counters::CMD_REENCODED.to_owned(), b.cmd_reencoded as i64),
+        (
+            counters::UNINDEXED_ACCOUNTS.to_owned(),
+            b.unindexed_accounts as i64,
+        ),
         (counters::txs_chain(chain), n),
     ] {
         if delta != 0 {
