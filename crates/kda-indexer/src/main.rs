@@ -33,10 +33,11 @@ enum Command {
     },
     /// Fetch, decode and round-trip a bounded height range.
     Dump {
-        /// First height (number or `tip-N`).
+        /// First height (number or `tip-N`). `tip` is the final tip: the lowest cut height
+        /// minus `ingest.finality_depth`; heights above it are refused.
         #[arg(long)]
         from: String,
-        /// Last height, inclusive (number or `tip-N`).
+        /// Last height, inclusive (number or `tip-N`, at most the final tip).
         #[arg(long)]
         to: String,
         /// Restrict to these chains (default: every chain that exists at each height).
@@ -60,18 +61,6 @@ enum Command {
         /// Second records file (historical era) for the cross-era dictionary check (B7).
         #[arg(long)]
         records_b: Option<PathBuf>,
-        /// JSON report path.
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Benchmark request-key index layouts (B6).
-    RkBench {
-        /// Records file(s) from `dump`; their real request keys are used (repeatable).
-        #[arg(long, required = true)]
-        records: Vec<PathBuf>,
-        /// Total key count: real keys padded with blake2b-256(counter).
-        #[arg(long, default_value_t = 3_000_000)]
-        synthetic: usize,
         /// JSON report path.
         #[arg(long)]
         out: PathBuf,
@@ -140,15 +129,6 @@ async fn main() -> anyhow::Result<()> {
         } => kda_indexer::cmd::measure::run(kda_indexer::cmd::measure::MeasureArgs {
             records,
             records_b,
-            out,
-        }),
-        Command::RkBench {
-            records,
-            synthetic,
-            out,
-        } => kda_indexer::cmd::rk_bench::run(kda_indexer::cmd::rk_bench::RkBenchArgs {
-            records,
-            synthetic,
             out,
         }),
     }

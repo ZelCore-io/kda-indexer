@@ -1,4 +1,4 @@
-//! `rk-bench` command (B6): PtrHash MPHF + slot table versus a sorted prefix array for the
+//! `kda-rk-bench` (B6, formerly `kda-indexer rk-bench`): PtrHash MPHF + slot table versus a sorted prefix array for the
 //! request-key index (spec §3.7).
 //!
 //! Keys: the real user-tx request keys of the records files, padded with
@@ -22,14 +22,29 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde_json::{json, Value};
 
-use super::frames::{read_frames, KIND_USER, KIND_USER_LEGACY};
+use clap::Parser;
+use kda_indexer::cmd::frames::{read_frames, KIND_USER, KIND_USER_LEGACY};
 
 const QUERIES: usize = 1_000_000;
 
-pub struct RkBenchArgs {
-    pub records: Vec<PathBuf>,
-    pub synthetic: usize,
-    pub out: PathBuf,
+/// Request-key index benchmark (B6). A separate binary so the release `kda-indexer` does not
+/// link `ptr_hash`'s non-optional MPL-2.0 dependency (`colored`); not a default workspace member.
+#[derive(Parser)]
+#[command(name = "kda-rk-bench")]
+struct RkBenchArgs {
+    /// Records file(s) from `kda-indexer dump`; their real request keys are used (repeatable).
+    #[arg(long, required = true)]
+    records: Vec<PathBuf>,
+    /// Total key count: real keys padded with blake2b-256(counter).
+    #[arg(long, default_value_t = 3_000_000)]
+    synthetic: usize,
+    /// JSON report path.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+fn main() -> anyhow::Result<()> {
+    run(RkBenchArgs::parse())
 }
 
 type Key = [u8; 32];
@@ -187,7 +202,7 @@ fn report(
     })
 }
 
-pub fn run(args: RkBenchArgs) -> anyhow::Result<()> {
+fn run(args: RkBenchArgs) -> anyhow::Result<()> {
     // Real keys.
     let mut real: Vec<Key> = Vec::new();
     for p in &args.records {

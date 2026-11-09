@@ -1,0 +1,22 @@
+[package]
+name = "kdx-rk-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Not a default workspace member: `ptr_hash` pulls `colored` (MPL-2.0) unconditionally, and the
+# release binary/.deb must stay MIT/Apache/BSD/zlib only. Build with `-p kdx-rk-bench`.
+
+[[bin]]
+name = "kda-rk-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+ptr_hash.workspace = true
+kdx-types.workspace = true
+kda-indexer = { path = "../kda-indexer" }

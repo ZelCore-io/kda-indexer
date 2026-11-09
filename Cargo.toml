@@ -6,6 +6,15 @@ members = [
     "crates/kdx-decode",
     "crates/kda-indexer",
     "crates/kdx-compare",
+    "crates/kdx-rk-bench",
+]
+# kdx-rk-bench links an MPL-2.0 crate (via ptr_hash); keep it out of default builds.
+default-members = [
+    "crates/kdx-types",
+    "crates/kdx-node",
+    "crates/kdx-decode",
+    "crates/kda-indexer",
+    "crates/kdx-compare",
 ]
 
 [workspace.package]

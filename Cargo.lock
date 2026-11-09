@@ -1125,7 +1125,6 @@ dependencies = [
  "kdx-decode",
  "kdx-node",
  "kdx-types",
- "ptr_hash",
  "rand",
  "rayon",
  "serde",
@@ -1167,6 +1166,7 @@ name = "kdx-decode"
 version = "0.1.0"
 dependencies = [
  "kdx-types",
+ "serde",
  "serde_json",
  "thiserror",
 ]
@@ -1187,6 +1187,19 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "kdx-rk-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kda-indexer",
+ "kdx-types",
+ "ptr_hash",
+ "rand",
+ "serde_json",
 ]
 
 [[package]]
