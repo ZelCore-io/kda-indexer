@@ -1,0 +1,73 @@
+# This repository is public. Only source code, build/packaging files and
+# user-facing documentation (README, build/install/API docs) are committed.
+# Everything below stays local.
+
+# --- Secrets and local configuration -------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.secret
+*.secrets
+secrets/
+credentials*
+*.local.toml
+*.local.yaml
+*.local.yml
+*.local.json
+config.local.*
+/etc-local/
+
+# --- Internal planning, specs and agent notes ----------------------------
+/docs/specs/
+/docs/plans/
+/docs/internal/
+/docs/superpowers/
+/docs/decisions/
+/planning/
+/.planning/
+/.superpowers/
+/notes/
+/scratch/
+CLAUDE.md
+AGENTS.md
+/.claude/
+/.codex/
+
+# --- Test runs, data and benchmarks --------------------------------------
+/data/
+/test-runs/
+/runs/
+/bench-results/
+/snapshots/
+/fixtures-local/
+*.mdbx
+*.mdbx-lck
+*.log
+/tmp/
+/coverage/
+*.profraw
+*.profdata
+proptest-regressions/
+
+# --- Build output ---------------------------------------------------------
+/target/
+/build/
+/dist/
+*.deb
+*.rpm
+*.tar.gz
+**/*.rs.bk
+*.pdb
+
+# --- Editors and OS -------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
