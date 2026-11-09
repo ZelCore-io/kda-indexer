@@ -28,3 +28,5 @@ hex.workspace = true
 kdx-types.workspace = true
 kdx-node.workspace = true
 kdx-decode.workspace = true
+base64.workspace = true
+rand.workspace = true

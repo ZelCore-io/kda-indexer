@@ -356,7 +356,9 @@ impl NodeClient {
     pub async fn block(&self, chain: u8, min: u64, max: u64) -> Result<Option<Page<Value>>> {
         let url = self.chain_url(chain, "block");
         let q = [("minheight", min.to_string()), ("maxheight", max.to_string())];
-        let (status, body) = self.send("block", |h| h.get(url.clone()).query(&q).header("Accept", HEADER_ACCEPT)).await?;
+        // The block route answers 406 to the blockheader-encoding Accept parameter; it already
+        // returns object-encoded headers, so ask for plain JSON.
+        let (status, body) = self.send("block", |h| h.get(url.clone()).query(&q).header("Accept", "application/json")).await?;
         match status {
             404 => Ok(None),
             200..=299 => Ok(Some(parse_page(decode(&body)?)?)),
