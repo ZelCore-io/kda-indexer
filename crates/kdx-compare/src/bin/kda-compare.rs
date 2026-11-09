@@ -1,10 +1,15 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use kdx_compare::allowlist::Allowlist;
 use kdx_compare::config::CompareConfig;
 use kdx_compare::diff::{diff_route, follow_pages};
+use kdx_compare::gen::random::RandomGen;
+use kdx_compare::gen::replay::{self, ReplayGen};
+use kdx_compare::gen::seeds::SeedGen;
+use kdx_compare::gen::{Generator, Mixer, Tips};
 use kdx_compare::normalize::{normalize, RouteKind};
 use kdx_compare::target::Target;
 use serde_json::Value;
@@ -45,6 +50,17 @@ enum Cmd {
     },
     /// Parse and validate the config, then print it.
     CheckConfig,
+    /// Debug: generate requests and print them.
+    #[command(hide = true)]
+    Gen {
+        #[arg(long, default_value_t = 50)]
+        count: usize,
+        #[arg(long)]
+        print: bool,
+        /// Only this source: random, seeds or replay (default: the configured mix).
+        #[arg(long)]
+        source: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -85,7 +101,20 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Cmd::Run | Cmd::ReplayImport { .. } => bail!("not implemented yet"),
+        Cmd::ReplayImport { haproxy, out } => {
+            let (lines, kept, distinct) = replay::import(&haproxy, &out)?;
+            println!(
+                "read {lines} lines, kept {kept} GET requests on compat routes, {distinct} distinct paths -> {}",
+                out.display()
+            );
+            Ok(())
+        }
+        Cmd::Gen {
+            count,
+            print,
+            source,
+        } => gen_debug(&cfg, count, print, source.as_deref()).await,
+        Cmd::Run => bail!("not implemented yet"),
     }
 }
 
@@ -150,4 +179,62 @@ fn mutate_first(v: &mut Value, key: &str) -> bool {
         Value::Array(a) => a.iter_mut().any(|x| mutate_first(x, key)),
         _ => false,
     }
+}
+
+async fn gen_debug(
+    cfg: &CompareConfig,
+    count: usize,
+    print: bool,
+    source: Option<&str>,
+) -> anyhow::Result<()> {
+    let node = cfg.node_client()?;
+    let targets = Target::all(cfg)?;
+    let a = cfg
+        .primary_target()
+        .and_then(|n| targets.iter().find(|t| t.name == n));
+    let tips = Arc::new(Tips::default());
+    tips.refresh(&node, a).await?;
+    let graph = node.chain_graph().await?;
+    let want = |s: &str| source.is_none_or(|x| x == s);
+    let random = want("random")
+        .then(|| RandomGen::new(node.clone(), graph.clone(), tips.clone(), cfg.min_depth));
+    let seeds = match (&cfg.seeds, want("seeds")) {
+        (Some(p), true) => Some(SeedGen::load(p)?.with_node(node.clone(), tips.clone())),
+        _ => None,
+    };
+    let replay = match (&cfg.replay, want("replay")) {
+        (Some(p), true) => Some(ReplayGen::load(p)?),
+        _ => None,
+    };
+    let mut mixer = Mixer::new(random, seeds, replay, cfg.mix.clone());
+    let mut out = Vec::new();
+    while out.len() < count {
+        out.extend(mixer.next().await?);
+    }
+    out.truncate(count);
+    let mut by_route = std::collections::BTreeMap::<&str, usize>::new();
+    for r in &out {
+        *by_route.entry(r.route.as_str()).or_default() += 1;
+        if print {
+            println!(
+                "{:<7} {:<8} {} oracle={}",
+                r.origin.as_str(),
+                r.route.as_str(),
+                r.path_and_query,
+                r.oracle
+                    .as_ref()
+                    .map(|o| serde_json::to_string(o).unwrap_or_default())
+                    .unwrap_or_else(|| "-".into())
+            );
+        }
+    }
+    println!(
+        "{} requests by route {:?}; empty blocks skipped {}; min tip {} (A tip {})",
+        out.len(),
+        by_route,
+        mixer.empty_blocks(),
+        tips.min_tip(),
+        tips.a_tip()
+    );
+    Ok(())
 }

@@ -4,6 +4,7 @@
 pub mod allowlist;
 pub mod config;
 pub mod diff;
+pub mod gen;
 pub mod metrics;
 pub mod normalize;
 pub mod report;

@@ -1,0 +1,120 @@
+# Edge seeds for mainnet01 (spec section 7.2 item 3). Public chain data only.
+# kind = "height" | "request_key" | "account" | "pact_id"; chain is optional for
+# request_key (taken from side A's answer when absent). Values starting with "TODO" are
+# placeholders for the owner and are skipped by the generator.
+
+# --- Genesis and the chain-graph change (10 -> 20 chains at 852054) ---
+[[seed]]
+kind = "height"
+chain = 0
+value = 0
+note = "genesis, chain 0 (genesis transactions)"
+
+[[seed]]
+kind = "height"
+chain = 10
+value = 852054
+note = "first height of chain 10 (chain-graph change)"
+
+[[seed]]
+kind = "height"
+chain = 0
+value = 852054
+note = "chain-graph change height on chain 0"
+
+# --- Legacy history: the node serves a re-encoded cmd that does not hash to the request key ---
+[[seed]]
+kind = "request_key"
+chain = 0
+value = "lTjYomhACHE1zjaDYonuzTbftEuLzvHLMMA9w24HV9I"
+note = "legacy re-encoded cmd, height 1000001"
+
+[[seed]]
+kind = "request_key"
+chain = 0
+value = "52Y42c5uOZc32EKgh6UEqKNMDtI_P4tnpjoqyWl2cRA"
+note = "legacy re-encoded cmd, height 1000005"
+
+[[seed]]
+kind = "request_key"
+chain = 0
+value = "tITUSRmKHkXq7DxlaDhpWqUCqchiso4SJiFpkbkk31c"
+note = "legacy re-encoded cmd, height 1500014"
+
+[[seed]]
+kind = "request_key"
+chain = 0
+value = "4mz0_JINJqCgRGhVBEzNxQoxGmHl0hG0G3-sUrTvJeU"
+note = "legacy re-encoded cmd, height 1500016"
+
+[[seed]]
+kind = "request_key"
+chain = 0
+value = "cAcCSEBaJiGrx0iSj9-8JWt2T48JOQJruVdDBEaLLmM"
+note = "legacy re-encoded cmd, height 2000000"
+
+[[seed]]
+kind = "request_key"
+chain = 0
+value = "r7WdpnF2MFZgoEzNhj8GYSKB-F80wLb4t-TPGBL3uMc"
+note = "legacy re-encoded cmd and a failed tx (insufficient funds), height 2000001"
+
+[[seed]]
+kind = "request_key"
+chain = 0
+value = "5Hf_On_lbHM7P5VwTDN1j1QalB5BUQx-J5-ctNFOeII"
+note = "control: cmd hashes to the request key, height 1500022"
+
+[[seed]]
+kind = "request_key"
+chain = 0
+value = "kQa99P3tZ-VWpXX5_V3Dns_zK3hILOzG8FSXOTa-vqA"
+note = "control: cmd hashes to the request key, height 2000009"
+
+# --- Accounts ---
+[[seed]]
+kind = "account"
+value = "k:e7f7130f359fb1f8c87873bf858a0e9cbc3c1059f62ae715ec72e760b055e9f3"
+note = "miner account with a very large history (coinbase receiver in 2026-11)"
+
+[[seed]]
+kind = "request_key"
+chain = 1
+value = "DCEgqMWp5Na89YoCVZDPnUNJDyK6MsDUGuW6h8yOU4I"
+note = "recent tx with 13 events"
+
+# --- Placeholders for the owner ---
+[[seed]]
+kind = "height"
+value = "TODO-owner"
+note = "first block with events (B3)"
+
+[[seed]]
+kind = "request_key"
+value = "TODO-owner"
+note = "cross-chain transfer pair: the exec half"
+
+[[seed]]
+kind = "request_key"
+value = "TODO-owner"
+note = "cross-chain transfer pair: the cont half"
+
+[[seed]]
+kind = "request_key"
+value = "TODO-owner"
+note = "tx with the largest event count (70)"
+
+[[seed]]
+kind = "account"
+value = "TODO-owner"
+note = "bridge account with a huge history"
+
+[[seed]]
+kind = "pact_id"
+value = "TODO-owner"
+note = "defpact with a rollback"
+
+[[seed]]
+kind = "height"
+value = "TODO-owner"
+note = "reorged block seen in the tail"
