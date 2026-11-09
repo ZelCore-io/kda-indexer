@@ -497,6 +497,38 @@ impl NodeClient {
         Ok(out)
     }
 
+    /// Headers on the branch ending in `upper` that are not ancestors of any `lower` hash, up
+    /// to `max` height, following `next` tokens, sorted ascending by height. With `lower` =
+    /// a stored tip this is the new branch above the fork point (tail follow, spec §4.3).
+    pub async fn header_branch_since(
+        &self,
+        chain: u8,
+        lower: &[String],
+        upper: &str,
+        max: Option<u64>,
+    ) -> Result<Vec<Value>> {
+        let upper = [upper.to_owned()];
+        let mut out = Vec::new();
+        let mut next: Option<String> = None;
+        loop {
+            let page = self
+                .header_branch_page(chain, lower, &upper, None, max, next.as_deref())
+                .await?;
+            out.extend(page.items);
+            match page.next {
+                Some(n) if Some(&n) != next.as_ref() => next = Some(n),
+                Some(_) => {
+                    return Err(NodeError::Decode(
+                        "header/branch: next token did not advance".into(),
+                    ))
+                }
+                None => break,
+            }
+        }
+        out.sort_by_key(|h| h.get("height").and_then(Value::as_u64).unwrap_or(u64::MAX));
+        Ok(out)
+    }
+
     async fn header_branch_page(
         &self,
         chain: u8,

@@ -12,7 +12,7 @@
 //! u8      flags   b0 request_key  b1 cmd  b2 logs  b3 pact_tx_id
 //!                 b4 metadata     b5 continuation  b6 extra  b7 cb_req_key
 //! u8      bits    b0 status_ok  b1 raw_tx  b2 raw_output  b3 cmd_unparsed
-//!                 (b4..b7 zero)
+//!                 b4 cmd_reencoded  (b5..b7 zero)
 //! u8      present output-envelope keys present in the CommandResult, bit i
 //!                 = ENVELOPE_KEYS[i]: gas result reqKey logs events metaData
 //!                 continuation txId (0xff = all present)
@@ -41,6 +41,9 @@
 //! forms, key order, or content serde_json cannot represent). Render returns them verbatim.
 //! `cmd_unparsed` marks a user tx whose `cmd` is not representable JSON (the `cmd` bytes are
 //! still stored verbatim; only derived fields such as the sender are missing).
+//! `cmd_reencoded` marks a user tx whose served `cmd` does not hash to its request key: the
+//! node serves a re-encoded `cmd` for many legacy txs (below about height 2.4M on mainnet01).
+//! The served bytes are stored as is; the original bytes are not available from the node.
 //!
 //! `extra` keeps the record lossless when a field does not fit its typed slot:
 //! envelope keys (`gas`, `result`, `reqKey`, `logs`, `events`, `metaData`,
@@ -52,7 +55,7 @@
 //!
 //! ```text
 //! u8      version = 1
-//! u8      flags   b0 merkle_verified  b1 raw_miner  (b2..b7 zero)
+//! u8      flags   b0 merkle_verified  b1 raw_miner  b2 adj_refs  (b3..b7 zero)
 //! [32]    hash, [32] parent
 //! u8      chain
 //! varint  height
@@ -60,12 +63,20 @@
 //! [8]     nonce, big-endian u64
 //! varint  creation_time, epoch_start, feature_flags
 //! [32]    payload_hash, [32] transactions_hash, [32] outputs_hash
-//! varint  n_adjacents, then per entry: u8 chain, [32] hash (wire order kept)
+//! varint  n_adjacents, then per entry: u8 chain, then
+//!         [32] hash                          if not flags.b2 (wire order kept)
+//!         u8 form, [32] hash if form 0       if flags.b2: form 0 = raw hash, form 1 = ref,
+//!                                            the hash equals the stored hash of block
+//!                                            (chain, height - 1) (adjacent parents sit one
+//!                                            height below the block, like its own parent)
 //! bytes   chainweb_version (utf-8)
 //! varint  miner_account (AccountId; u32::MAX = minerData has no account string)
 //! bytes   miner_data value (the whole minerData object; null when only raw_miner holds it)
 //! bytes   raw_miner  original minerData bytes  if flags.b1
 //! ```
+//!
+//! `adj_refs` (flags.b2) is a segment encoding only (`encode_block_with`/`decode_block_with`);
+//! the hot store uses the plain form (`encode_block`/`decode_block`) where b2 is never set.
 //!
 //! `merkle_verified` is set once the payload Merkle roots have been recomputed from the leaves
 //! (P5). Until then it is false: the payload contents are NOT verified, only consistent.
@@ -217,6 +228,8 @@ pub struct TxRecord {
     pub raw_output: Option<Vec<u8>>,
     /// `cmd` could not be parsed as representable JSON (derived fields missing).
     pub cmd_unparsed: bool,
+    /// The served `cmd` does not hash to the request key (legacy re-encoded `cmd`).
+    pub cmd_reencoded: bool,
 }
 
 impl Default for TxRecord {
@@ -241,6 +254,7 @@ impl Default for TxRecord {
             raw_tx: None,
             raw_output: None,
             cmd_unparsed: false,
+            cmd_reencoded: false,
         }
     }
 }
@@ -306,7 +320,8 @@ pub fn encode_tx(r: &TxRecord, out: &mut Vec<u8>) {
     let bits = r.status_ok as u8
         | (r.raw_tx.is_some() as u8) << 1
         | (r.raw_output.is_some() as u8) << 2
-        | (r.cmd_unparsed as u8) << 3;
+        | (r.cmd_unparsed as u8) << 3
+        | (r.cmd_reencoded as u8) << 4;
     out.push(FORMAT_VERSION);
     out.push(flags);
     out.push(bits);
@@ -392,7 +407,7 @@ pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
     version(buf)?;
     let flags = get_u8(buf)?;
     let bits = get_u8(buf)?;
-    if bits & !0x0f != 0 {
+    if bits & !0x1f != 0 {
         return Err(Error::Codec(format!("reserved tx bits set: {bits:#x}")));
     }
     let present = get_u8(buf)?;
@@ -495,12 +510,35 @@ pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
         raw_tx,
         raw_output,
         cmd_unparsed: bits & 8 != 0,
+        cmd_reencoded: bits & 0x10 != 0,
     })
 }
 
+/// Plain block encoding (hot store): adjacent hashes stored raw.
 pub fn encode_block(r: &BlockRecord, out: &mut Vec<u8>) {
+    encode_block_impl(r, out, None)
+}
+
+/// Segment block encoding: `adj_is_ref(chain, hash)` says whether `hash` equals the stored hash
+/// of block (chain, height - 1); such adjacents are written as a 1-byte ref (flags.b2).
+pub fn encode_block_with(
+    r: &BlockRecord,
+    out: &mut Vec<u8>,
+    adj_is_ref: &dyn Fn(u8, &Hash32) -> bool,
+) {
+    encode_block_impl(r, out, Some(adj_is_ref))
+}
+
+/// `adj_is_ref(chain, hash)` predicate of `encode_block_with`.
+pub type AdjIsRef<'a> = &'a dyn Fn(u8, &Hash32) -> bool;
+
+fn encode_block_impl(r: &BlockRecord, out: &mut Vec<u8>, adj_is_ref: Option<AdjIsRef<'_>>) {
     out.push(FORMAT_VERSION);
-    out.push(r.merkle_verified as u8 | (r.raw_miner.is_some() as u8) << 1);
+    out.push(
+        r.merkle_verified as u8
+            | (r.raw_miner.is_some() as u8) << 1
+            | (adj_is_ref.is_some() as u8) << 2,
+    );
     out.extend_from_slice(&r.hash.0);
     out.extend_from_slice(&r.parent.0);
     out.push(r.chain);
@@ -517,7 +555,14 @@ pub fn encode_block(r: &BlockRecord, out: &mut Vec<u8>) {
     put_u64(out, r.adjacents.len() as u64);
     for (c, h) in &r.adjacents {
         out.push(*c);
-        out.extend_from_slice(&h.0);
+        match adj_is_ref {
+            Some(f) if r.height > 0 && f(*c, h) => out.push(1),
+            Some(_) => {
+                out.push(0);
+                out.extend_from_slice(&h.0);
+            }
+            None => out.extend_from_slice(&h.0),
+        }
     }
     put_bytes(out, r.chainweb_version.as_bytes());
     put_u64(out, r.miner_account as u64);
@@ -527,11 +572,21 @@ pub fn encode_block(r: &BlockRecord, out: &mut Vec<u8>) {
     }
 }
 
-pub fn decode_block(mut b: &[u8]) -> Result<BlockRecord> {
+/// Decode a block record. A record with adjacent refs (flags.b2) decodes only when every
+/// adjacent is in raw form; use `decode_block_with` to resolve refs.
+pub fn decode_block(b: &[u8]) -> Result<BlockRecord> {
+    decode_block_with(b, &|_, _| None)
+}
+
+/// Decode a block record, resolving adjacent refs with `resolve(chain, height - 1)`.
+pub fn decode_block_with(
+    mut b: &[u8],
+    resolve: &dyn Fn(u8, u64) -> Option<Hash32>,
+) -> Result<BlockRecord> {
     let buf = &mut b;
     version(buf)?;
     let bflags = get_u8(buf)?;
-    if bflags & !0x03 != 0 {
+    if bflags & !0x07 != 0 {
         return Err(Error::Codec(format!(
             "reserved block flags set: {bflags:#x}"
         )));
@@ -552,7 +607,24 @@ pub fn decode_block(mut b: &[u8]) -> Result<BlockRecord> {
     let n = get_u64(buf)? as usize;
     let mut adjacents = Vec::with_capacity(n.min(buf.len()));
     for _ in 0..n {
-        adjacents.push((get_u8(buf)?, hash(buf)?));
+        let c = get_u8(buf)?;
+        let h = if bflags & 4 == 0 {
+            hash(buf)?
+        } else {
+            match get_u8(buf)? {
+                0 => hash(buf)?,
+                1 => height
+                    .checked_sub(1)
+                    .and_then(|p| resolve(c, p))
+                    .ok_or_else(|| {
+                        Error::Codec(format!(
+                            "unresolved adjacent ref: chain {c} height {height} - 1"
+                        ))
+                    })?,
+                f => return Err(Error::Codec(format!("unknown adjacent form {f}"))),
+            }
+        };
+        adjacents.push((c, h));
     }
     let chainweb_version = utf8(get_bytes(buf)?)?;
     let miner_account = get_u32(buf)?;

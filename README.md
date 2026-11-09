@@ -25,6 +25,8 @@ cargo build --release
 
 The pinned toolchain in `rust-toolchain.toml` is installed automatically by `rustup`. Copy `packaging/config/mainnet01.toml.example` and adjust the node URL and listen addresses for your host.
 
+Operating notes (the data-dir lock, recovering a halted chain): [docs/operations.md](docs/operations.md).
+
 ## License
 
 Licensed under either of

@@ -1,0 +1,25 @@
+[package]
+name = "kdx-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+rayon.workspace = true
+reth-nippy-jar.workspace = true
+kdx-types.workspace = true
+kdx-node.workspace = true
+kdx-decode.workspace = true
+kdx-hot.workspace = true
+kdx-segment.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zstd.workspace = true
+libc.workspace = true

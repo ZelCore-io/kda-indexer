@@ -52,6 +52,84 @@ enum Command {
         /// Also write the summary as JSON.
         #[arg(long)]
         summary_out: Option<PathBuf>,
+        /// Run index extraction (postings, defpacts, code hashes) and the adjacent-ref
+        /// encoding round trip; print per-family posting counts.
+        #[arg(long)]
+        index: bool,
+    },
+    /// Fetch canonical blocks into frozen segments (resumes at the manifest frontier).
+    Backfill {
+        /// First height (number or `tip-N`); ignored when segments exist (resume).
+        #[arg(long)]
+        from: String,
+        /// Last height, inclusive (number or `tip-N`); clamped to the final tip and to whole
+        /// steps.
+        #[arg(long)]
+        to: String,
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Canonical header walk: auto (cut, switching to anchors when slow), cut or anchor.
+        #[arg(long, default_value = "auto", hide = true)]
+        header_mode: kdx_ingest::HeaderMode,
+    },
+    /// Index the network: backfill what is final, then follow the tip and freeze (until
+    /// SIGTERM/SIGINT).
+    Run {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Dev: start an empty store at this height (number or `tip-N`, N below the lowest
+        /// cut height; aligned down to a step) instead of backfilling history.
+        #[arg(long, hide = true)]
+        start_height: Option<String>,
+        /// Dev: stop each chain at this height and exit when all are there.
+        #[arg(long, hide = true)]
+        until: Option<u32>,
+        #[arg(long, default_value = "auto", hide = true)]
+        header_mode: kdx_ingest::HeaderMode,
+    },
+    /// Dev: `run` without the freezer.
+    #[command(hide = true)]
+    Tail {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        start_height: Option<String>,
+        #[arg(long)]
+        until: Option<u32>,
+    },
+    /// Undo one chain's hot blocks above a height (indexer stopped; the tail re-applies them).
+    Unwind {
+        #[arg(long)]
+        chain: u8,
+        /// Undo the chain's hot blocks above this height.
+        #[arg(long)]
+        to: Option<u32>,
+        /// Clear the chain's halted state (after a reorg deeper than the finality depth).
+        #[arg(long)]
+        clear_halt: bool,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Hot store maintenance (hidden; P2 development aid).
+    #[command(hide = true)]
+    Hot {
+        #[command(subcommand)]
+        action: HotAction,
+    },
+    /// Frozen segments: list the manifest, check files and indexes.
+    Segments {
+        #[command(subcommand)]
+        action: SegmentsAction,
+    },
+    /// Read stored records back (hot store first, then frozen segments).
+    Inspect {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long, global = true)]
+        data_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        what: InspectWhat,
     },
     /// Measure record and compression sizes.
     Measure {
@@ -64,6 +142,69 @@ enum Command {
         /// JSON report path.
         #[arg(long)]
         out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum HotAction {
+    /// Open (or initialise) the hot store; print Meta, table counts, dict sizes, geometry.
+    Stats {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Also print a blake3 digest per table (replay checks).
+        #[arg(long)]
+        digest: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SegmentsAction {
+    /// Manifest entries with counts, sizes, index kinds, frontier and next TxNum.
+    List {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check manifest, blake3 of every file and TxNum density; exit 1 on any error.
+    Check {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Also decode every record and resolve every rk, bh and posting list.
+        #[arg(long)]
+        deep: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum InspectWhat {
+    /// A tx by request key (base64url).
+    Tx { reqkey: String },
+    /// A block by chain and height.
+    Block { chain: u8, height: u32 },
+    /// A block by hash (base64url).
+    BlockHash { hash: String },
+    /// Posting list of an entity, newest first: family acct|xfer|pk|evt|code; name is an
+    /// account, public key, qualified event name (`coin.TRANSFER`, or `coin.*` for the
+    /// module), or code-hash hex.
+    Postings {
+        family: String,
+        name: String,
+        /// Token module for `xfer` (e.g. `coin`).
+        #[arg(long)]
+        module: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Random frozen and hot txs; with --compare-node, refetch each block and require
+    /// byte-identical rendered tx, output, miner data and an equal header.
+    Sample {
+        #[arg(long, default_value_t = 20)]
+        count: usize,
+        #[arg(long)]
+        compare_node: bool,
     },
 }
 
@@ -108,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
             json,
             records_out,
             summary_out,
+            index,
         } => {
             kda_indexer::cmd::dump::run(
                 &cfg,
@@ -118,9 +260,105 @@ async fn main() -> anyhow::Result<()> {
                     json,
                     records_out,
                     summary_out,
+                    index,
                 },
             )
             .await
+        }
+        Command::Backfill {
+            from,
+            to,
+            data_dir,
+            header_mode,
+        } => {
+            kda_indexer::cmd::backfill::run(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                &from,
+                &to,
+                header_mode,
+            )
+            .await
+        }
+        Command::Hot {
+            action: HotAction::Stats { data_dir, digest },
+        } => {
+            kda_indexer::cmd::hot::stats(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir), digest)
+        }
+        Command::Run {
+            data_dir,
+            start_height,
+            until,
+            header_mode,
+        } => {
+            kda_indexer::cmd::run::run(
+                &cfg,
+                kda_indexer::cmd::run::RunArgs {
+                    data_dir: data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+                    start_height,
+                    until,
+                    freeze: true,
+                    header_mode,
+                },
+            )
+            .await
+        }
+        Command::Tail {
+            data_dir,
+            start_height,
+            until,
+        } => {
+            kda_indexer::cmd::run::run(
+                &cfg,
+                kda_indexer::cmd::run::RunArgs {
+                    data_dir: data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+                    start_height,
+                    until,
+                    freeze: false,
+                    header_mode: kdx_ingest::HeaderMode::Auto,
+                },
+            )
+            .await
+        }
+        Command::Unwind {
+            chain,
+            to,
+            clear_halt,
+            data_dir,
+        } => kda_indexer::cmd::unwind::run(
+            &cfg,
+            data_dir.as_deref().unwrap_or(&cfg.data_dir),
+            chain,
+            to,
+            clear_halt,
+        ),
+        Command::Segments { action } => match action {
+            SegmentsAction::List { data_dir, json } => {
+                kda_indexer::cmd::segments::list(data_dir.as_deref().unwrap_or(&cfg.data_dir), json)
+            }
+            SegmentsAction::Check { data_dir, deep } => kda_indexer::cmd::segments::check(
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                deep,
+            ),
+        },
+        Command::Inspect { data_dir, what } => {
+            use kda_indexer::cmd::inspect;
+            let s = inspect::Store::open(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir))?;
+            match what {
+                InspectWhat::Tx { reqkey } => inspect::tx(&s, &reqkey),
+                InspectWhat::Block { chain, height } => inspect::block(&s, chain, height),
+                InspectWhat::BlockHash { hash } => inspect::block_hash(&s, &hash),
+                InspectWhat::Postings {
+                    family,
+                    name,
+                    module,
+                    limit,
+                } => inspect::postings(&s, &family, &name, module.as_deref(), limit),
+                InspectWhat::Sample {
+                    count,
+                    compare_node,
+                } => inspect::sample(&cfg, &s, count, compare_node).await,
+            }
         }
         Command::Measure {
             records,

@@ -9,7 +9,7 @@ pub mod value;
 pub mod varint;
 
 pub use dict::{Dict, DictKind, DictMut, MemDict};
-pub use hash::{blake2b_256, Hash32};
+pub use hash::{blake2b_128, blake2b_256, Hash32};
 pub use ids::TxKey;
 
 /// Errors from the codecs in this crate.

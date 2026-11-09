@@ -1,0 +1,105 @@
+//! Internal utilities that are only exposed for testing/benchmarking purposes.
+//! Do not use externally.
+use super::*;
+use log::{trace, warn};
+use rand::{RngExt, rng};
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
+use rdst::RadixSort;
+
+pub(crate) fn mul_high(a: u64, b: u64) -> u64 {
+    ((a as u128 * b as u128) >> 64) as u64
+}
+
+thread_local! {
+    /// TODO: Use trace! instead.
+    static LOG: std::cell::Cell<bool> = std::cell::Cell::new(true);
+}
+
+/// Wrapper around `std::time::Instant` that is only enabled when tracing is enabled.
+#[derive(Clone, Copy)]
+pub(crate) struct Timer(Option<Instant>);
+
+impl Timer {
+    pub(crate) fn start() -> Self {
+        if log::log_enabled!(log::Level::Trace)
+            && !cfg!(all(target_arch = "wasm32", target_os = "unknown"))
+        {
+            Timer(Some(Instant::now()))
+        } else {
+            Timer(None)
+        }
+    }
+}
+
+pub(crate) fn log_duration(name: &str, start: Timer) -> Timer {
+    let Some(instant) = start.0 else {
+        return start;
+    };
+    if !LOG.with(|log| log.get()) {
+        return start;
+    }
+    trace!(
+        "{}",
+        format!("{name:>12}: {:>13.2?}s", instant.elapsed().as_secs_f32())
+    );
+    Timer::start()
+}
+
+pub fn generate_keys(n: usize) -> Vec<u64> {
+    // TODO: Deterministic key generation.
+    let start = Timer::start();
+    let keys = loop {
+        let start = Timer::start();
+        #[cfg(feature = "rayon")]
+        let keys: Vec<_> = (0..n)
+            .into_par_iter()
+            .map_init(rng, |rng, _| rng.random())
+            .collect();
+        #[cfg(not(feature = "rayon"))]
+        let keys: Vec<_> = {
+            let mut rng = rng();
+            (0..n).map(|_| rng.random()).collect()
+        };
+        let start = log_duration("┌   gen keys", start);
+        #[cfg(feature = "rayon")]
+        let mut keys2: Vec<_> = keys.par_iter().copied().collect();
+        #[cfg(not(feature = "rayon"))]
+        let mut keys2 = keys.clone();
+        let start = log_duration("├      clone", start);
+        keys2.radix_sort_unstable();
+        let start = log_duration("├       sort", start);
+        #[cfg(feature = "rayon")]
+        let distinct = keys2.par_windows(2).all(|w| w[0] < w[1]);
+        #[cfg(not(feature = "rayon"))]
+        let distinct = keys2.windows(2).all(|w| w[0] < w[1]);
+        log_duration("├ duplicates", start);
+        if distinct {
+            break keys;
+        }
+        warn!("DUPLICATE KEYS GENERATED");
+    };
+    log_duration("generatekeys", start);
+    keys
+}
+
+pub fn generate_string_keys(n: usize) -> Vec<Vec<u8>> {
+    let start = Timer::start();
+    // let start = Timer::start();
+    let key = |rng: &mut rand::rngs::ThreadRng| {
+        let len = rng.random_range(10..=50);
+        (0..len).map(|_| rng.random_range(1..=255)).collect()
+    };
+    #[cfg(feature = "rayon")]
+    let keys: Vec<_> = (0..n)
+        .into_par_iter()
+        .map_init(rng, |rng, _| key(rng))
+        .collect();
+    #[cfg(not(feature = "rayon"))]
+    let keys: Vec<_> = {
+        let mut rng = rng();
+        (0..n).map(|_| key(&mut rng)).collect()
+    };
+    log_duration("generatekeys", start);
+    keys
+}

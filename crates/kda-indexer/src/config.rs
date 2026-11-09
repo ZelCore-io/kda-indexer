@@ -17,7 +17,11 @@ pub struct Config {
     #[serde(default)]
     pub ingest: IngestConfig,
     #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
     pub backfill: BackfillConfig,
+    #[serde(default)]
+    pub freezer: FreezerConfig,
     #[serde(default)]
     pub tail: TailConfig,
     #[serde(default)]
@@ -59,6 +63,17 @@ pub struct BackfillConfig {
     pub range_heights: u64,
     pub step_heights: u64,
     pub min_free_gb: u64,
+    /// Node request budget during backfill; falls back to `ingest.max_rps` (spec section 4.2).
+    pub max_rps: Option<u32>,
+    /// zstd level for range files.
+    pub zstd_level: i32,
+    /// Records sampled per file kind to train a range dictionary.
+    pub dict_samples: u32,
+    /// Raw spool (ETL) bytes buffered per range before a sorted run is spilled to `etl/`.
+    pub etl_mem_mb: u64,
+    /// Memory cap for the backfill: (ranges fetching + the one building) × spool buffer +
+    /// the range writer's estimate; `ranges_in_flight` is lowered to fit.
+    pub mem_cap_mb: u64,
 }
 
 impl Default for BackfillConfig {
@@ -68,7 +83,45 @@ impl Default for BackfillConfig {
             range_heights: 100_000,
             step_heights: 10_000,
             min_free_gb: 60,
+            max_rps: None,
+            zstd_level: 19,
+            dict_samples: 20_000,
+            etl_mem_mb: 1024,
+            mem_cap_mb: 6144,
         }
+    }
+}
+
+/// `[storage]`: MDBX hot store geometry (spec section 3.3, B9).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StorageConfig {
+    /// Upper bound of the MDBX map.
+    pub mdbx_max_gb: u64,
+    /// MDBX growth step.
+    pub mdbx_growth_mb: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            mdbx_max_gb: 64,
+            mdbx_growth_mb: 256,
+        }
+    }
+}
+
+/// `[freezer]`: step files written from the hot tail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FreezerConfig {
+    /// zstd level for step files (re-compressed at the range level on merge).
+    pub zstd_level: i32,
+}
+
+impl Default for FreezerConfig {
+    fn default() -> Self {
+        Self { zstd_level: 9 }
     }
 }
 
@@ -192,7 +245,41 @@ impl Config {
             "ingest.batch_size must be in 1..={MAX_BATCH_SIZE} (got {})",
             self.ingest.batch_size
         );
+        let b = &self.backfill;
+        anyhow::ensure!(
+            b.step_heights >= 10,
+            "backfill.step_heights must be at least 10 (got {})",
+            b.step_heights
+        );
+        anyhow::ensure!(
+            b.range_heights.is_multiple_of(b.step_heights),
+            "backfill.range_heights ({}) must be a multiple of backfill.step_heights ({})",
+            b.range_heights,
+            b.step_heights
+        );
+        anyhow::ensure!(
+            (1..=22).contains(&b.zstd_level) && (1..=22).contains(&self.freezer.zstd_level),
+            "zstd levels must be in 1..=22"
+        );
+        anyhow::ensure!(
+            b.etl_mem_mb >= 16 && b.mem_cap_mb >= 512,
+            "backfill.etl_mem_mb must be >= 16 and backfill.mem_cap_mb >= 512"
+        );
+        anyhow::ensure!(b.dict_samples > 0, "backfill.dict_samples must be > 0");
+        anyhow::ensure!(
+            self.storage.mdbx_max_gb > 0 && self.storage.mdbx_growth_mb > 0,
+            "storage.mdbx_max_gb and storage.mdbx_growth_mb must be > 0"
+        );
+        anyhow::ensure!(
+            b.max_rps != Some(0),
+            "backfill.max_rps must be > 0 when set"
+        );
         Ok(())
+    }
+
+    /// Node request budget for backfill: `backfill.max_rps`, else `ingest.max_rps`.
+    pub fn backfill_max_rps(&self) -> u32 {
+        self.backfill.max_rps.unwrap_or(self.ingest.max_rps)
     }
 }
 
