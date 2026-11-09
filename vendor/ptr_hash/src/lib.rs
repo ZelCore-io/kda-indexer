@@ -516,6 +516,28 @@ impl<
         ptr_hash.compute_pilots(key_iter(keys))?;
         Some(ptr_hash)
     }
+
+    /// kda-indexer addition: rebuild a PtrHash from the state saved with
+    /// [`PtrHash::saved_parts`]. `init(n, params)` is deterministic, so only the key count,
+    /// the parameters, the global seed, the pilots and the remap table need to be stored.
+    pub fn from_saved_parts(
+        n: usize,
+        params: PtrHashParams<BF>,
+        seed: u64,
+        pilots: Vec<u8>,
+        remap: F,
+    ) -> Self {
+        let mut ptr_hash = Self::init(n, params);
+        ptr_hash.seed = seed;
+        ptr_hash.pilots = pilots;
+        ptr_hash.remap = remap;
+        ptr_hash
+    }
+
+    /// kda-indexer addition: `(n, seed, pilots, remap)` for [`PtrHash::from_saved_parts`].
+    pub fn saved_parts(&self) -> (usize, u64, &[u8], &F) {
+        (self.n, self.seed, &self.pilots, &self.remap)
+    }
 }
 
 /// Construction (helper) methods working with unsized keys.

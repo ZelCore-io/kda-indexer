@@ -45,6 +45,7 @@ sucds = "0.8"
 roaring = "0.11"
 blake3 = "1"
 tempfile = "3"
+memmap2 = "0.9"
 # reth storage crates, pinned to the v2.10.1 release commit. reth-etl is not used: it needs
 # reth-db-api (the whole reth/alloy tree); kdx-ingest has its own small ETL collector.
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", rev = "58ebce14ae63dab040beae301e1578cd0dc55e8a" }
