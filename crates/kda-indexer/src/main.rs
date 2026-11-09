@@ -65,7 +65,17 @@ enum Command {
         out: PathBuf,
     },
     /// Benchmark request-key index layouts (B6).
-    RkBench,
+    RkBench {
+        /// Records file(s) from `dump`; their real request keys are used (repeatable).
+        #[arg(long, required = true)]
+        records: Vec<PathBuf>,
+        /// Total key count: real keys padded with blake2b-256(counter).
+        #[arg(long, default_value_t = 3_000_000)]
+        synthetic: usize,
+        /// JSON report path.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -132,6 +142,14 @@ async fn main() -> anyhow::Result<()> {
             records_b,
             out,
         }),
-        Command::RkBench => anyhow::bail!("rk-bench: not implemented yet"),
+        Command::RkBench {
+            records,
+            synthetic,
+            out,
+        } => kda_indexer::cmd::rk_bench::run(kda_indexer::cmd::rk_bench::RkBenchArgs {
+            records,
+            synthetic,
+            out,
+        }),
     }
 }

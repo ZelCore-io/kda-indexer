@@ -11,6 +11,7 @@ pub mod dump;
 pub mod frames;
 pub mod measure;
 pub mod probe;
+pub mod rk_bench;
 
 /// Build the node client from config; `max_rps` and `node_concurrency` come from `[ingest]`.
 pub fn node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
