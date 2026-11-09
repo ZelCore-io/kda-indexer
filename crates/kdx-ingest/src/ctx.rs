@@ -29,6 +29,13 @@ pub struct IngestOpts {
     pub etl_mem_mb: u64,
     /// Cap for (ranges fetching + the range being built) × spool buffer + writer estimate.
     pub mem_cap_mb: u64,
+    /// Tail writer: commit after this many ms or this many blocks, whichever comes first.
+    pub commit_ms: u64,
+    pub commit_blocks: u32,
+    /// `/cut` poll interval of the tail (catches gaps and SSE loss).
+    pub cut_poll_secs: u64,
+    /// Dev: followers stop at this height (bounded tail runs and replay checks).
+    pub until: Option<u32>,
 }
 
 pub struct Ctx {

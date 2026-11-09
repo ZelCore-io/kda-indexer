@@ -22,7 +22,7 @@ pub fn geometry(cfg: &Config) -> Geometry {
     }
 }
 
-pub fn stats(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {
+pub fn stats(cfg: &Config, data_dir: &Path, digest: bool) -> anyhow::Result<()> {
     let dir = hot_dir(data_dir);
     println!("hot store          {}", dir.display());
     let hs = HotStore::open(&dir, geometry(cfg))?;
@@ -51,7 +51,24 @@ pub fn stats(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {
     }
     println!("tables");
     for t in Table::all() {
-        println!("  {:<20} {}", t.name(), txn.count(t)?);
+        if digest && t != Table::Meta {
+            // blake3 over every (key, value) row: replay checks compare two states.
+            let mut h = blake3::Hasher::new();
+            for (k, v) in txn.scan(t, &[], |_| true)? {
+                h.update(&(k.len() as u32).to_be_bytes());
+                h.update(&k);
+                h.update(&(v.len() as u32).to_be_bytes());
+                h.update(&v);
+            }
+            println!(
+                "  {:<20} {:<10} {}",
+                t.name(),
+                txn.count(t)?,
+                &h.finalize().to_hex()[..16]
+            );
+        } else {
+            println!("  {:<20} {}", t.name(), txn.count(t)?);
+        }
     }
     let dict = HotDict::load(&txn)?;
     let sizes: Vec<String> = DictKind::ALL

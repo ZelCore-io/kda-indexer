@@ -25,6 +25,10 @@ pub fn opts(cfg: &Config, data_dir: &Path) -> IngestOpts {
         dict_samples: b.dict_samples,
         etl_mem_mb: b.etl_mem_mb,
         mem_cap_mb: b.mem_cap_mb,
+        commit_ms: cfg.tail.commit_ms,
+        commit_blocks: cfg.tail.commit_blocks,
+        cut_poll_secs: cfg.tail.cut_poll_secs,
+        until: None,
     }
 }
 

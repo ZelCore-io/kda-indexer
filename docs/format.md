@@ -107,6 +107,34 @@ The manifest is the source of truth. On start, backfill:
   rebuilt with the same ids and the same bytes;
 - continues at `manifest.frontier`.
 
+### Tail and freezer commit order
+
+The live tail never writes segments. Its single writer commits one MDBX txn per
+`tail.commit_ms` / `tail.commit_blocks`: names interned in block-apply order, the block rows
+(`Headers`, `HeaderByHash`, `TailTxs`, `TailRk`, `TailPostings`, `Defpacts`, counters), one
+`Undo` row per block and the chain's `Tail` checkpoint. A reorg unwinds to the fork point
+and applies the new branch in the same txn.
+
+The freezer moves the step `frontier..frontier+step_heights` once every chain's stored tip
+is at least `finality_depth` above its end:
+
+1. The step is written from the hot rows (`RangeWriter`, steps 1–3 above, `freezer.zstd_level`).
+2. `manifest.json` is replaced (step 4 above).
+3. One MDBX txn deletes the step's `Headers`, `HeaderByHash`, `TailTxs`, `TailRk` (rows
+   owned by those txs), `TailPostings` and `Undo` rows, and sets `frozen_frontier`,
+   `next_txnum`, the `Headers` checkpoints (hashes at `end − 1`) and `dict_lens@{end}`.
+
+On start, files the manifest does not list are deleted, and if the manifest frontier is
+above the hot `frozen_frontier` (a crash between 2 and 3) step 3 is redone. TxNums are
+assigned at freeze time in (height, chain, pos) order, so a tx has exactly one TxNum and is
+never both hot and frozen after step 3.
+
+A merge rewrites ten consecutive steps that cover one aligned `range_heights` span as one
+range (`backfill.zstd_level`, new dictionaries; records, TxNums and postings unchanged),
+replaces the ten entries in `manifest.json`, then deletes the step files. A crash before
+the manifest leaves an unlisted range (deleted on start); after it, unlisted steps (deleted
+on start).
+
 Raw spool: `etl/raw-{start}/raw-NNNNN.run`, sorted runs of `(height u32 BE, chain u8)` →
 `[header, payload]` JSON, zstd level 1, k-way merged in (height, chain) order.
 
@@ -295,6 +323,10 @@ hashes to the slot. Keys are reduced to their first 8 bytes (big-endian u64, the
 The sorted form is the fallback: it is written when two keys of the range share a prefix,
 when PtrHash construction fails, or when forced for testing (`KDX_DEBUG_RK_FALLBACK=1`).
 `range.toml` records which form each index uses.
+
+PtrHash construction is deterministic: the global seed sequence is fixed upstream and the
+pilot search uses a fixed per-part seed (a change in the vendored `ptr_hash`), so two builds
+of the same keys give byte-identical files.
 
 ## Posting files (`.pst`)
 

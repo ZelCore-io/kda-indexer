@@ -101,25 +101,16 @@ pub struct ResumeInfo {
     pub dict_names_removed: u64,
 }
 
-/// Reconcile the stores before a backfill: clear `etl/`, delete what the manifest does not
-/// list, reset the hot frontier to the manifest's, re-derive `Headers` checkpoints.
-pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
+/// Delete every file or dir in `segments/` the manifest does not list (temp dirs, files of a
+/// range or step that never reached the manifest, files of merged-away steps).
+pub fn remove_unlisted(ctx: &Ctx, m: &Manifest) -> Result<Vec<String>> {
     let net = &ctx.opts.network;
-    etl::clear_dir(&ctx.etl)?;
-    let m = Manifest::load(&ctx.segdir)?.unwrap_or_else(|| Manifest::new(net));
-    if &m.network != net {
-        bail!("segments hold network {:?}, config says {net:?}", m.network);
-    }
     let mut keep: BTreeSet<String> = BTreeSet::new();
     keep.insert(MANIFEST.to_string());
     for e in &m.entries {
         keep.extend(range_file_names(net, e.start, e.end));
     }
-    let mut info = ResumeInfo {
-        frontier: m.frontier,
-        next_txnum: m.next_txnum,
-        ..Default::default()
-    };
+    let mut removed = Vec::new();
     for ent in fs::read_dir(&ctx.segdir)? {
         let ent = ent?;
         let name = ent.file_name().to_string_lossy().into_owned();
@@ -133,11 +124,29 @@ pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
             fs::remove_file(&p)
         }
         .with_context(|| format!("remove {}", p.display()))?;
-        info.removed_files.push(name);
+        removed.push(name);
     }
-    if !info.removed_files.is_empty() {
+    if !removed.is_empty() {
         kdx_segment::files::fsync_dir(&ctx.segdir)?;
     }
+    Ok(removed)
+}
+
+/// Reconcile the stores before a backfill: clear `etl/`, delete what the manifest does not
+/// list, reset the hot frontier to the manifest's, re-derive `Headers` checkpoints.
+pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
+    let net = &ctx.opts.network;
+    etl::clear_dir(&ctx.etl)?;
+    let m = Manifest::load(&ctx.segdir)?.unwrap_or_else(|| Manifest::new(net));
+    if &m.network != net {
+        bail!("segments hold network {:?}, config says {net:?}", m.network);
+    }
+    let mut info = ResumeInfo {
+        frontier: m.frontier,
+        next_txnum: m.next_txnum,
+        removed_files: remove_unlisted(ctx, &m)?,
+        ..Default::default()
+    };
 
     // Linkage anchors from the last committed range.
     let mut prev = Prev::new();

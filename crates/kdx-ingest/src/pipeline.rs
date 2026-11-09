@@ -29,7 +29,17 @@ pub fn parse_spool_key(k: &[u8]) -> Result<(u32, u8)> {
 pub fn prepare(chain: u8, height: u32, raw: &[u8]) -> Result<(DecodedBlock, VerifyReport)> {
     let (hdr, payload): (Value, Value) = serde_json::from_slice(raw)
         .with_context(|| format!("chain {chain} height {height}: spooled JSON"))?;
-    let b = decode_block(&hdr, &payload)
+    prepare_value(chain, height, &hdr, &payload)
+}
+
+/// [`prepare`] from already parsed `(header, payload with outputs)` JSON (tail).
+pub fn prepare_value(
+    chain: u8,
+    height: u32,
+    hdr: &Value,
+    payload: &Value,
+) -> Result<(DecodedBlock, VerifyReport)> {
+    let b = decode_block(hdr, payload)
         .map_err(|e| anyhow::anyhow!("chain {chain} height {height}: decode: {e}"))?;
     if b.header.chain_id != chain || b.header.height != u64::from(height) {
         bail!(

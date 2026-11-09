@@ -73,6 +73,41 @@ enum Command {
         #[arg(long, default_value = "auto", hide = true)]
         header_mode: kdx_ingest::HeaderMode,
     },
+    /// Index the network: backfill what is final, then follow the tip and freeze (until
+    /// SIGTERM/SIGINT).
+    Run {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Dev: start an empty store at this height (number or `tip-N`, N below the lowest
+        /// cut height; aligned down to a step) instead of backfilling history.
+        #[arg(long, hide = true)]
+        start_height: Option<String>,
+        /// Dev: stop each chain at this height and exit when all are there.
+        #[arg(long, hide = true)]
+        until: Option<u32>,
+        #[arg(long, default_value = "auto", hide = true)]
+        header_mode: kdx_ingest::HeaderMode,
+    },
+    /// Dev: `run` without the freezer.
+    #[command(hide = true)]
+    Tail {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        start_height: Option<String>,
+        #[arg(long)]
+        until: Option<u32>,
+    },
+    /// Undo one chain's hot blocks above a height (indexer stopped; the tail re-applies them).
+    Unwind {
+        #[arg(long)]
+        chain: u8,
+        #[arg(long)]
+        to: u32,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Hot store maintenance (hidden; P2 development aid).
     #[command(hide = true)]
     Hot {
@@ -113,6 +148,9 @@ enum HotAction {
         /// Data directory (default: `data_dir` from the config).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Also print a blake3 digest per table (replay checks).
+        #[arg(long)]
+        digest: bool,
     },
 }
 
@@ -239,8 +277,55 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Hot {
-            action: HotAction::Stats { data_dir },
-        } => kda_indexer::cmd::hot::stats(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir)),
+            action: HotAction::Stats { data_dir, digest },
+        } => {
+            kda_indexer::cmd::hot::stats(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir), digest)
+        }
+        Command::Run {
+            data_dir,
+            start_height,
+            until,
+            header_mode,
+        } => {
+            kda_indexer::cmd::run::run(
+                &cfg,
+                kda_indexer::cmd::run::RunArgs {
+                    data_dir: data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+                    start_height,
+                    until,
+                    freeze: true,
+                    header_mode,
+                },
+            )
+            .await
+        }
+        Command::Tail {
+            data_dir,
+            start_height,
+            until,
+        } => {
+            kda_indexer::cmd::run::run(
+                &cfg,
+                kda_indexer::cmd::run::RunArgs {
+                    data_dir: data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+                    start_height,
+                    until,
+                    freeze: false,
+                    header_mode: kdx_ingest::HeaderMode::Auto,
+                },
+            )
+            .await
+        }
+        Command::Unwind {
+            chain,
+            to,
+            data_dir,
+        } => kda_indexer::cmd::unwind::run(
+            &cfg,
+            data_dir.as_deref().unwrap_or(&cfg.data_dir),
+            chain,
+            to,
+        ),
         Command::Segments { action } => match action {
             SegmentsAction::List { data_dir, json } => {
                 kda_indexer::cmd::segments::list(data_dir.as_deref().unwrap_or(&cfg.data_dir), json)
