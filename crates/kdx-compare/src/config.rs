@@ -47,6 +47,9 @@ pub struct CompareConfig {
     pub metrics_bind: Option<String>,
     #[serde(default)]
     pub mix: Mix,
+    /// Largest accepted (decompressed) target response body; a bigger one fails that request.
+    #[serde(default = "d_max_body_bytes")]
+    pub max_body_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +103,10 @@ fn d_node_max_rps() -> u32 {
 fn d_allowlist() -> PathBuf {
     PathBuf::from("compare/allowlist.toml")
 }
+fn d_max_body_bytes() -> usize {
+    8 << 20
+}
+
 fn d_out_dir() -> PathBuf {
     PathBuf::from("test-runs/compare")
 }
@@ -166,6 +173,8 @@ impl CompareConfig {
             concurrency: 8,
             p2p_url: self.node.p2p_url.clone(),
             p2p_cert_sha256,
+            max_body_bytes: self.node.max_body_bytes,
+            max_sse_event_bytes: self.node.max_sse_event_bytes,
         };
         Ok(kdx_node::NodeClient::new(&ncfg)?)
     }

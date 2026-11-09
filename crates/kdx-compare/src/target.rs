@@ -77,6 +77,7 @@ pub struct Target {
     pub kind: TargetKind,
     http: reqwest::Client,
     limiter: Arc<Limiter>,
+    max_body_bytes: usize,
 }
 
 impl Target {
@@ -86,6 +87,7 @@ impl Target {
         kind: TargetKind,
         timeout: Duration,
         limiter: Arc<Limiter>,
+        max_body_bytes: usize,
     ) -> anyhow::Result<Target> {
         let http = reqwest::Client::builder()
             .user_agent(kdx_node::USER_AGENT)
@@ -100,6 +102,7 @@ impl Target {
             kind,
             http,
             limiter,
+            max_body_bytes,
         })
     }
 
@@ -108,7 +111,16 @@ impl Target {
         let limiter = Limiter::new(cfg.rate_rps);
         cfg.targets
             .iter()
-            .map(|(n, t)| Target::new(n, t.url.clone(), t.kind, cfg.timeout(), limiter.clone()))
+            .map(|(n, t)| {
+                Target::new(
+                    n,
+                    t.url.clone(),
+                    t.kind,
+                    cfg.timeout(),
+                    limiter.clone(),
+                    cfg.max_body_bytes,
+                )
+            })
             .collect()
     }
 
@@ -159,10 +171,30 @@ impl Target {
                 headers.push((name.to_string(), v.to_string()));
             }
         }
-        let body = resp
-            .bytes()
+        // Bodies are untrusted (replayed heavy routes, a misbehaving target): read with a cap.
+        let limit = self.max_body_bytes;
+        if resp.content_length().is_some_and(|n| n > limit as u64) {
+            anyhow::bail!(
+                "{} GET {path_and_query}: body exceeds {limit} bytes",
+                self.name
+            );
+        }
+        let mut resp = resp;
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .with_context(|| format!("{} GET {path_and_query} body", self.name))?;
+            .with_context(|| format!("{} GET {path_and_query} body", self.name))?
+        {
+            if buf.len() + chunk.len() > limit {
+                anyhow::bail!(
+                    "{} GET {path_and_query}: body exceeds {limit} bytes",
+                    self.name
+                );
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let body = Bytes::from(buf);
         Ok(HttpCapture {
             status,
             headers,

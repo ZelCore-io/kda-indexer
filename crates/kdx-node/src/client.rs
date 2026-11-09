@@ -32,6 +32,10 @@ pub struct NodeClientConfig {
     pub concurrency: usize,
     pub p2p_url: Option<Url>,
     pub p2p_cert_sha256: Option<[u8; 32]>,
+    /// Largest accepted (decompressed) response body.
+    pub max_body_bytes: usize,
+    /// Largest accepted server-sent event.
+    pub max_sse_event_bytes: usize,
 }
 
 struct Route {
@@ -47,6 +51,8 @@ struct Shared {
     sem: Semaphore,
     stats: Mutex<HashMap<(String, u16), (u64, f64)>>,
     batch_limit: AtomicU32,
+    max_body_bytes: usize,
+    max_sse_event_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -85,6 +91,29 @@ fn build_route(base: Url, timeout: Duration, tls: Option<rustls::ClientConfig>) 
 
 fn body_prefix(body: &[u8]) -> String {
     String::from_utf8_lossy(&body[..body.len().min(300)]).into_owned()
+}
+
+/// Read a (decompressed) body chunk by chunk, failing once it exceeds `limit` bytes.
+async fn read_capped(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> std::result::Result<Bytes, ReadError> {
+    if resp.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(ReadError::TooLarge);
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(ReadError::Http)? {
+        if buf.len() + chunk.len() > limit {
+            return Err(ReadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
+}
+
+enum ReadError {
+    TooLarge,
+    Http(reqwest::Error),
 }
 
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T> {
@@ -135,6 +164,8 @@ impl NodeClient {
                 sem: Semaphore::new(cfg.concurrency.max(1)),
                 stats: Mutex::new(HashMap::new()),
                 batch_limit: AtomicU32::new(DEFAULT_BATCH_LIMIT),
+                max_body_bytes: cfg.max_body_bytes.max(1),
+                max_sse_event_bytes: cfg.max_sse_event_bytes.max(1),
             }),
             p2p,
         })
@@ -240,9 +271,15 @@ impl NodeClient {
                 }
             };
             let status = resp.status().as_u16();
-            let body = match resp.bytes().await {
+            let body = match read_capped(resp, self.shared.max_body_bytes).await {
                 Ok(b) => b,
-                Err(e) => {
+                Err(ReadError::TooLarge) => {
+                    self.record(endpoint, status, t0.elapsed().as_secs_f64());
+                    return Err(NodeError::TooLarge {
+                        limit: self.shared.max_body_bytes,
+                    });
+                }
+                Err(ReadError::Http(e)) => {
                     self.record(endpoint, 0, t0.elapsed().as_secs_f64());
                     last = Some(if e.is_timeout() {
                         NodeError::Timeout
@@ -387,6 +424,10 @@ impl NodeClient {
     }
 
     /// All headers in `min..=max`, following `next` tokens.
+    ///
+    /// **Includes orphans**: the plain header range returns every block the node knows at
+    /// those heights, canonical or not. Probe use only; height walks of the chain must use
+    /// [`NodeClient::header_branch_all`].
     pub async fn headers_all(&self, chain: u8, min: u64, max: u64) -> Result<Vec<Value>> {
         let mut out = Vec::new();
         let mut next: Option<String> = None;
@@ -400,7 +441,7 @@ impl NodeClient {
         }
     }
 
-    /// `POST /chain/{c}/header/branch`.
+    /// `POST /chain/{c}/header/branch` (one page).
     pub async fn header_branch(
         &self,
         chain: u8,
@@ -409,6 +450,62 @@ impl NodeClient {
         min: Option<u64>,
         max: Option<u64>,
     ) -> Result<Page<Value>> {
+        self.header_branch_page(chain, lower, upper, min, max, None)
+            .await
+    }
+
+    /// The canonical headers of `chain` at `min..=max`: the branch ending in `upper` (a block
+    /// hash, e.g. the cut's), following `next` tokens. Errors unless there is exactly one
+    /// header per height, sorted ascending.
+    pub async fn header_branch_all(
+        &self,
+        chain: u8,
+        upper: &str,
+        min: u64,
+        max: u64,
+    ) -> Result<Vec<Value>> {
+        let upper = [upper.to_owned()];
+        let mut out = Vec::new();
+        let mut next: Option<String> = None;
+        loop {
+            let page = self
+                .header_branch_page(chain, &[], &upper, Some(min), Some(max), next.as_deref())
+                .await?;
+            out.extend(page.items);
+            match page.next {
+                Some(n) if Some(&n) != next.as_ref() => next = Some(n),
+                Some(_) => {
+                    return Err(NodeError::Decode(
+                        "header/branch: next token did not advance".into(),
+                    ))
+                }
+                None => break,
+            }
+        }
+        out.sort_by_key(|h| h.get("height").and_then(Value::as_u64).unwrap_or(u64::MAX));
+        let heights: Vec<Option<u64>> = out
+            .iter()
+            .map(|h| h.get("height").and_then(Value::as_u64))
+            .collect();
+        let want: Vec<Option<u64>> = (min..=max).map(Some).collect();
+        if heights != want {
+            return Err(NodeError::Decode(format!(
+                "header/branch chain {chain} {min}..={max}: got {} headers, expected one per height",
+                out.len()
+            )));
+        }
+        Ok(out)
+    }
+
+    async fn header_branch_page(
+        &self,
+        chain: u8,
+        lower: &[String],
+        upper: &[String],
+        min: Option<u64>,
+        max: Option<u64>,
+        next: Option<&str>,
+    ) -> Result<Page<Value>> {
         let url = self.chain_url(chain, "header/branch");
         let mut q: Vec<(&str, String)> = Vec::new();
         if let Some(m) = min {
@@ -416,6 +513,9 @@ impl NodeClient {
         }
         if let Some(m) = max {
             q.push(("maxheight", m.to_string()));
+        }
+        if let Some(n) = next {
+            q.push(("next", n.to_string()));
         }
         let body = json!({ "lower": lower, "upper": upper });
         let v = self
@@ -565,6 +665,9 @@ impl NodeClient {
                 body_prefix: body_prefix(&b),
             });
         }
-        Ok(header_events(Box::pin(resp.bytes_stream())))
+        Ok(header_events(
+            Box::pin(resp.bytes_stream()),
+            self.shared.max_sse_event_bytes,
+        ))
     }
 }

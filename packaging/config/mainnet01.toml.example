@@ -6,6 +6,8 @@ url = "http://127.0.0.1:31351"          # service API on the same host
 # p2p_url = "https://127.0.0.1:31350"   # fallback, self-signed
 # p2p_cert_sha256 = "..."               # pin
 timeout_ms = 30000
+max_body_bytes = 67108864               # per response, after decompression
+max_sse_event_bytes = 1048576           # one /header/updates event
 
 [ingest]
 finality_depth = 1000

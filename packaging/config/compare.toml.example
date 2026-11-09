@@ -10,12 +10,15 @@ seeds = "compare/seeds/mainnet01.toml"
 # replay = "test-runs/replay-2026-11-08.tsv"   # from `kda-compare replay-import`
 out_dir = "test-runs/compare"
 metrics_bind = "127.0.0.1:31369"
+max_body_bytes = 8388608   # per target response, after decompression
 # (A, B): B is a target name or "node" (the node oracle).
 pairs = [["cwd", "node"]]
 
 [node]
 url = "http://127.0.0.1:31351"
 timeout_ms = 30000
+max_body_bytes = 67108864       # per node response, after decompression
+max_sse_event_bytes = 1048576   # one /header/updates event
 
 [targets.cwd]
 url = "http://127.0.0.1:31352"

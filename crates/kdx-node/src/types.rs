@@ -20,6 +20,8 @@ pub enum NodeError {
     Missing { hash: String },
     #[error("client config error: {0}")]
     Config(String),
+    #[error("response body exceeds {limit} bytes")]
+    TooLarge { limit: usize },
 }
 
 /// `GET /info`.
@@ -78,8 +80,25 @@ pub struct NodeConfig {
     pub p2p_cert_sha256: Option<String>,
     #[serde(default = "d_timeout_ms")]
     pub timeout_ms: u64,
+    /// Largest accepted response body after decompression; a bigger one fails the request.
+    #[serde(default = "d_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Largest accepted server-sent event (the SSE buffer cap); a bigger one ends the stream.
+    #[serde(default = "d_max_sse_event_bytes")]
+    pub max_sse_event_bytes: usize,
 }
 
 fn d_timeout_ms() -> u64 {
     30_000
+}
+
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
+pub const DEFAULT_MAX_SSE_EVENT_BYTES: usize = 1 << 20;
+
+fn d_max_body_bytes() -> usize {
+    DEFAULT_MAX_BODY_BYTES
+}
+
+fn d_max_sse_event_bytes() -> usize {
+    DEFAULT_MAX_SSE_EVENT_BYTES
 }
