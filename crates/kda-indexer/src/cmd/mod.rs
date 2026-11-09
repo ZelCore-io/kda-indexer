@@ -9,6 +9,7 @@ use crate::config::Config;
 
 pub mod dump;
 pub mod frames;
+pub mod measure;
 pub mod probe;
 
 /// Build the node client from config; `max_rps` and `node_concurrency` come from `[ingest]`.

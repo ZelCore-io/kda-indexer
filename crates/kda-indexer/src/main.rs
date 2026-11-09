@@ -53,7 +53,17 @@ enum Command {
         summary_out: Option<PathBuf>,
     },
     /// Measure record and compression sizes.
-    Measure,
+    Measure {
+        /// Records file from `dump` (recent era).
+        #[arg(long)]
+        records: PathBuf,
+        /// Second records file (historical era) for the cross-era dictionary check (B7).
+        #[arg(long)]
+        records_b: Option<PathBuf>,
+        /// JSON report path.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Benchmark request-key index layouts (B6).
     RkBench,
 }
@@ -113,7 +123,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Measure => anyhow::bail!("measure: not implemented yet"),
+        Command::Measure {
+            records,
+            records_b,
+            out,
+        } => kda_indexer::cmd::measure::run(kda_indexer::cmd::measure::MeasureArgs {
+            records,
+            records_b,
+            out,
+        }),
         Command::RkBench => anyhow::bail!("rk-bench: not implemented yet"),
     }
 }

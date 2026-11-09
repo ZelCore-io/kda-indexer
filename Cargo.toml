@@ -38,6 +38,7 @@ url = { version = "2", features = ["serde"] }
 base64 = "0.22"
 hex = "0.4"
 bytes = "1"
+rayon = "1"
 
 kdx-types = { path = "crates/kdx-types" }
 kdx-node = { path = "crates/kdx-node" }
