@@ -5,8 +5,7 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Not a default workspace member: `ptr_hash` pulls `colored` (MPL-2.0) unconditionally, and the
-# release binary/.deb must stay MIT/Apache/BSD/zlib only. Build with `-p kdx-rk-bench`.
+# Uses the vendored `ptr_hash` (MPL-2.0 `colored` removed), so it is a default member again.
 
 [[bin]]
 name = "kda-rk-bench"

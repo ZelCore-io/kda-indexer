@@ -7,15 +7,12 @@ members = [
     "crates/kda-indexer",
     "crates/kdx-compare",
     "crates/kdx-rk-bench",
+    "crates/kdx-hot",
+    "crates/kdx-segment",
+    "crates/kdx-ingest",
 ]
-# kdx-rk-bench links an MPL-2.0 crate (via ptr_hash); keep it out of default builds.
-default-members = [
-    "crates/kdx-types",
-    "crates/kdx-node",
-    "crates/kdx-decode",
-    "crates/kda-indexer",
-    "crates/kdx-compare",
-]
+# Vendored third-party code builds as a path dependency, not as a workspace member (no lints).
+exclude = ["vendor/ptr_hash"]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,7 +39,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 toml = "1"
 axum = "0.8"
 prometheus-client = "0.25"
-ptr_hash = "2"
+# Vendored ptr_hash 2.1.3 (MIT) with the MPL-2.0 `colored` dependency removed (see vendor/ptr_hash).
+ptr_hash = { path = "vendor/ptr_hash" }
+sucds = "0.8"
+roaring = "0.11"
+blake3 = "1"
+tempfile = "3"
+# reth storage crates, pinned to the v2.10.1 release commit. reth-etl is not used: it needs
+# reth-db-api (the whole reth/alloy tree); kdx-ingest has its own small ETL collector.
+reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", rev = "58ebce14ae63dab040beae301e1578cd0dc55e8a" }
+reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", rev = "58ebce14ae63dab040beae301e1578cd0dc55e8a" }
 rand = "0.10"
 url = { version = "2", features = ["serde"] }
 base64 = "0.22"
@@ -53,6 +59,9 @@ rayon = "1"
 kdx-types = { path = "crates/kdx-types" }
 kdx-node = { path = "crates/kdx-node" }
 kdx-decode = { path = "crates/kdx-decode" }
+kdx-hot = { path = "crates/kdx-hot" }
+kdx-segment = { path = "crates/kdx-segment" }
+kdx-ingest = { path = "crates/kdx-ingest" }
 
 [profile.release]
 lto = "thin"

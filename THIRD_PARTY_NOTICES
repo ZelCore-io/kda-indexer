@@ -1,0 +1,23 @@
+Third-party code in kda-indexer
+===============================
+
+All dependencies of the default build are under MIT, Apache-2.0, BSD, zlib, ISC,
+BSL-1.0, Unicode-3.0 or CDLA-Permissive-2.0 terms (or dual-licensed with one of
+them). The notices below cover code that is vendored or statically linked with
+terms that ask for attribution beyond the crate metadata.
+
+ptr_hash 2.1.3 (vendor/ptr_hash)
+  Copyright (c) Ragnar Groot Koerkamp. MIT licence, see vendor/ptr_hash/LICENSE-MIT.
+  Source: https://github.com/RagnarGrootKoerkamp/ptrhash
+  Modified: the `colored` dependency (MPL-2.0) and its one use (bold log output in
+  src/util.rs) are removed; examples and dev-dependencies are dropped.
+
+reth storage crates (reth-libmdbx, reth-mdbx-sys, reth-nippy-jar, reth-fs-util)
+  Copyright (c) the reth contributors. reth is MIT OR Apache-2.0; reth-libmdbx and
+  reth-mdbx-sys are Apache-2.0. Source: https://github.com/paradigmxyz/reth
+  (release v2.10.1, commit 58ebce14ae63dab040beae301e1578cd0dc55e8a).
+
+libmdbx (bundled by reth-mdbx-sys, statically linked)
+  Copyright 2015-2026 Leonid Yuriev <leo@yuriev.ru>. Apache-2.0.
+  libmdbx ships a NOTICE file with its source; it is reproduced in packages that
+  contain the binary. Source: https://libmdbx.dqdkfa.ru
