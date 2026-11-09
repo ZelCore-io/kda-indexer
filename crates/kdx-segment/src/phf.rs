@@ -304,3 +304,45 @@ impl KeyIndex for SortedIndex {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two builds of the same keys give byte-identical files, and every key resolves.
+    #[test]
+    fn ptrhash_build_is_reproducible() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let keys: Vec<Hash32> = (0..200_000)
+            .map(|_| {
+                let mut h = [0u8; 32];
+                for c in h.chunks_mut(8) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    c.copy_from_slice(&x.to_le_bytes());
+                }
+                Hash32(h)
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!("kdx-phf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str| {
+            let p = dir.join(name);
+            let ik = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| IndexKey::new(k, i as u32))
+                .collect();
+            assert_eq!(write_index(&p, ik, false).unwrap(), IndexKind::PtrHash);
+            p
+        };
+        let (a, b) = (mk("a.idx"), mk("b.idx"));
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        let idx = Index::open(&a).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(idx.get(k), Some(i as u32));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

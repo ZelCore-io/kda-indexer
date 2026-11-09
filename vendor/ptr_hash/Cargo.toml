@@ -2,6 +2,7 @@
 # the `colored` dependency (MPL-2.0) and its single `.bold()` call in src/util.rs are removed,
 # examples and dev-dependencies dropped. See LICENSE-MIT and the repo's THIRD_PARTY_NOTICES.
 # Added: PtrHash::from_saved_parts / saved_parts (persisting an index without epserde).
+# Changed: the pilot search rng in src/build.rs uses a fixed per-part seed (reproducible builds).
 [package]
 edition = "2024"
 name = "ptr_hash"

@@ -136,7 +136,9 @@ impl<
         let mut recent = [BucketIdx::NONE; 16];
         let mut total_evictions = 0;
 
-        let mut rng = fastrand::Rng::new();
+        // kda-indexer: fixed per-part seed so the same keys always give the same pilots
+        // (byte-identical index files across rebuilds). Upstream seeds from entropy.
+        let mut rng = fastrand::Rng::with_seed(0x6b64_785f_7068_6631 ^ part as u64);
 
         // let mut eviction_counts: Vec<usize> = vec![];
 
