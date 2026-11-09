@@ -10,4 +10,4 @@ pub mod types;
 pub use client::{NodeClient, NodeClientConfig, USER_AGENT};
 pub use graph::ChainGraph;
 pub use tls::parse_sha256_hex;
-pub use types::{Cut, CutEntry, NodeError, NodeInfo, Page, Result, StatRow};
+pub use types::{Cut, CutEntry, NodeConfig, NodeError, NodeInfo, Page, Result, StatRow};

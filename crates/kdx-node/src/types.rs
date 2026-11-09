@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 pub type Result<T> = std::result::Result<T, NodeError>;
 
@@ -62,4 +64,22 @@ pub struct StatRow {
     pub status: u16,
     pub count: u64,
     pub total_secs: f64,
+}
+
+/// `[node]` config section (spec section 6.5), shared by kda-indexer and kdx-compare.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeConfig {
+    pub url: Url,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_url: Option<Url>,
+    /// Hex SHA-256 of the node's self-signed leaf certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_cert_sha256: Option<String>,
+    #[serde(default = "d_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn d_timeout_ms() -> u64 {
+    30_000
 }

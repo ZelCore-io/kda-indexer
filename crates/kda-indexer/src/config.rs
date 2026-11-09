@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use url::Url;
+
+/// `[node]` section; shared with kdx-compare.
+pub use kdx_node::NodeConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,19 +30,6 @@ pub struct Config {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub log: LogConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NodeConfig {
-    pub url: Url,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub p2p_url: Option<Url>,
-    /// Hex SHA-256 of the node's self-signed leaf certificate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub p2p_cert_sha256: Option<String>,
-    #[serde(default = "d_timeout_ms")]
-    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,10 +171,6 @@ impl Default for LogConfig {
             level: "info".into(),
         }
     }
-}
-
-fn d_timeout_ms() -> u64 {
-    30_000
 }
 
 impl Config {

@@ -1,0 +1,145 @@
+//! HTTP targets (chainweb-data, kda-indexer compat, kda-txs) behind one shared rate limit.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use bytes::Bytes;
+use tokio::sync::Mutex;
+use url::Url;
+
+use crate::config::{CompareConfig, TargetKind};
+
+/// Token bucket with burst 1 and a fractional rate, shared by every target.
+pub struct Limiter {
+    interval: Duration,
+    next: Mutex<tokio::time::Instant>,
+}
+
+impl Limiter {
+    pub fn new(rps: f64) -> Arc<Limiter> {
+        Arc::new(Limiter {
+            interval: Duration::from_secs_f64(1.0 / rps),
+            next: Mutex::new(tokio::time::Instant::now()),
+        })
+    }
+
+    pub async fn acquire(&self) {
+        let mut next = self.next.lock().await;
+        let now = tokio::time::Instant::now();
+        if *next > now {
+            tokio::time::sleep_until(*next).await;
+            *next += self.interval;
+        } else {
+            *next = now + self.interval;
+        }
+    }
+}
+
+/// One captured HTTP exchange.
+#[derive(Debug, Clone)]
+pub struct HttpCapture {
+    pub status: u16,
+    /// Only `content-type` and `Chainweb-Next`.
+    pub headers: Vec<(String, String)>,
+    pub body: Bytes,
+    pub ms: u64,
+}
+
+impl HttpCapture {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn next_token(&self) -> Option<&str> {
+        self.header("Chainweb-Next")
+    }
+
+    pub fn json(&self) -> Option<serde_json::Value> {
+        serde_json::from_slice(&self.body).ok()
+    }
+}
+
+#[derive(Clone)]
+pub struct Target {
+    pub name: String,
+    pub url: Url,
+    pub kind: TargetKind,
+    http: reqwest::Client,
+    limiter: Arc<Limiter>,
+}
+
+impl Target {
+    pub fn new(
+        name: &str,
+        url: Url,
+        kind: TargetKind,
+        timeout: Duration,
+        limiter: Arc<Limiter>,
+    ) -> anyhow::Result<Target> {
+        let http = reqwest::Client::builder()
+            .user_agent(kdx_node::USER_AGENT)
+            .timeout(timeout)
+            .build()
+            .context("building http client")?;
+        Ok(Target {
+            name: name.to_string(),
+            url,
+            kind,
+            http,
+            limiter,
+        })
+    }
+
+    /// All configured targets, sharing one limiter at `rate_rps`.
+    pub fn all(cfg: &CompareConfig) -> anyhow::Result<Vec<Target>> {
+        let limiter = Limiter::new(cfg.rate_rps);
+        cfg.targets
+            .iter()
+            .map(|(n, t)| Target::new(n, t.url.clone(), t.kind, cfg.timeout(), limiter.clone()))
+            .collect()
+    }
+
+    fn full_url(&self, path_and_query: &str) -> String {
+        let base = self.url.as_str().trim_end_matches('/');
+        format!("{base}{path_and_query}")
+    }
+
+    /// `GET {url}{path_and_query}` under the shared limit. Non-2xx statuses are returned, not
+    /// errors; transport failures and timeouts are errors.
+    pub async fn get(&self, path_and_query: &str) -> anyhow::Result<HttpCapture> {
+        self.limiter.acquire().await;
+        let t0 = Instant::now();
+        let resp = self
+            .http
+            .get(self.full_url(path_and_query))
+            .send()
+            .await
+            .with_context(|| format!("{} GET {path_and_query}", self.name))?;
+        let status = resp.status().as_u16();
+        let mut headers = Vec::new();
+        for k in ["content-type", "chainweb-next"] {
+            if let Some(v) = resp.headers().get(k).and_then(|v| v.to_str().ok()) {
+                let name = if k == "chainweb-next" {
+                    "Chainweb-Next"
+                } else {
+                    k
+                };
+                headers.push((name.to_string(), v.to_string()));
+            }
+        }
+        let body = resp
+            .bytes()
+            .await
+            .with_context(|| format!("{} GET {path_and_query} body", self.name))?;
+        Ok(HttpCapture {
+            status,
+            headers,
+            body,
+            ms: t0.elapsed().as_millis() as u64,
+        })
+    }
+}

@@ -5,6 +5,7 @@ members = [
     "crates/kdx-node",
     "crates/kdx-decode",
     "crates/kda-indexer",
+    "crates/kdx-compare",
 ]
 
 [workspace.package]
@@ -16,7 +17,7 @@ publish = false
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs", "net"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
