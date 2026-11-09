@@ -56,6 +56,18 @@ pub struct DiffRecord {
     pub note: Option<String>,
 }
 
+/// POSIX shell single-quoting: the result is one literal word whatever `s` holds (quotes,
+/// `$(...)`, backticks, newlines). Used for the copy-paste curl lines in the diff log, whose
+/// paths can come from untrusted replay logs.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `"$VAR"'<quoted suffix>'`: the base URL variable expands, the rest stays literal.
+pub fn sh_url(var: &str, suffix: &str) -> String {
+    format!("\"${var}\"{}", sh_quote(suffix))
+}
+
 pub fn trim_body(b: &[u8]) -> String {
     let s = String::from_utf8_lossy(&b[..b.len().min(BODY_TRIM)]);
     s.into_owned()
@@ -233,4 +245,31 @@ pub fn generic_path(p: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sh_quote, sh_url};
+
+    #[test]
+    fn sh_quote_hostile_path() {
+        let hostile = "/txs/tx?requestkey=x\"; rm -rf ~; echo $(id) `id` 'q' \n$HOME";
+        let q = sh_quote(hostile);
+        assert_eq!(
+            q,
+            "'/txs/tx?requestkey=x\"; rm -rf ~; echo $(id) `id` '\\''q'\\'' \n$HOME'"
+        );
+        // Every single quote in the output is either a delimiter or part of the '\'' escape.
+        assert!(q.starts_with('\'') && q.ends_with('\''));
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
+        assert_eq!(sh_url("A", "/x?a=1&b=2"), "\"$A\"'/x?a=1&b=2'");
+        // Round-trip through a real shell when one is available.
+        if let Ok(out) = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf %s {q}"))
+            .output()
+        {
+            assert_eq!(String::from_utf8_lossy(&out.stdout), hostile);
+        }
+    }
 }

@@ -12,7 +12,9 @@ use anyhow::Context;
 use rand::rngs::StdRng;
 use rand::RngExt;
 
-use super::{rng, Generator, OracleRef, Origin, Request, CHAIN_FROM_A};
+use super::{
+    is_clean_path, is_request_key, rng, Generator, OracleRef, Origin, Request, CHAIN_FROM_A,
+};
 use crate::normalize::RouteKind;
 
 pub struct ReplayGen {
@@ -38,7 +40,7 @@ impl ReplayGen {
             let count: u64 = c
                 .parse()
                 .with_context(|| format!("{}:{}: bad count", path.display(), i + 1))?;
-            if m != "GET" || !p.starts_with('/') || count == 0 {
+            if m != "GET" || !is_clean_path(p) || count == 0 {
                 continue;
             }
             entries.push((count, p.to_string()));
@@ -71,6 +73,7 @@ fn request_key(path: &str) -> Option<String> {
     let q = path.split_once('?')?.1;
     q.split('&')
         .find_map(|kv| kv.strip_prefix("requestkey="))
+        .filter(|rk| is_request_key(rk))
         .map(str::to_string)
 }
 
@@ -112,6 +115,10 @@ pub fn extract(line: &str) -> Option<String> {
         .or_else(|| uri.strip_prefix("https://"))
     {
         uri = &rest[rest.find('/')?..];
+    }
+    // Untrusted input: no whitespace or control characters anywhere in the path.
+    if !is_clean_path(uri) {
+        return None;
     }
     let path = uri.split('?').next()?;
     let keep = RouteKind::from_path(uri) != RouteKind::Other || EXTRA_ROUTES.contains(&path);

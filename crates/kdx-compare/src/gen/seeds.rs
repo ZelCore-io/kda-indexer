@@ -112,6 +112,10 @@ impl SeedGen {
             }
             SeedKind::RequestKey => {
                 let rk = s.text();
+                if !super::is_request_key(&rk) {
+                    tracing::warn!(%rk, "seed request key is not 43-char base64url; skipped");
+                    return Ok(Vec::new());
+                }
                 let oracle = Some(OracleRef::Poll {
                     chain: s.chain.unwrap_or(super::CHAIN_FROM_A),
                     request_key: rk.clone(),

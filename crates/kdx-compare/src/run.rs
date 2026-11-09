@@ -19,7 +19,9 @@ use crate::gen::{Generator, Mixer, OracleRef, Request, Tips, CHAIN_FROM_A};
 use crate::metrics::Metrics;
 use crate::normalize::{normalize, RouteKind};
 use crate::oracle;
-use crate::report::{iso_secs, now_secs, trim_body, DailySummary, DiffLog, DiffRecord};
+use crate::report::{
+    iso_secs, now_secs, sh_quote, sh_url, trim_body, DailySummary, DiffLog, DiffRecord,
+};
 use crate::target::Target;
 
 /// Workers sending requests concurrently (the shared limiter caps the rate). Kept low:
@@ -228,7 +230,7 @@ impl Ctx {
             diff,
             class: class.to_string(),
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
-            curl: format!("curl -s \"$A{}\" ; {}", req.path_and_query, b_curl),
+            curl: format!("curl -s {} ; {}", sh_url("A", &req.path_and_query), b_curl),
             note,
         }
     }
@@ -264,7 +266,7 @@ impl Ctx {
                 },
             );
         }
-        let curl_b = format!("curl -s \"$B{}\"", req.path_and_query);
+        let curl_b = format!("curl -s {}", sh_url("B", &req.path_and_query));
         let b_body = trim_body(&pb.pages[0].body);
         self.finish(
             req,
@@ -439,10 +441,19 @@ impl Ctx {
         }
     }
 
+    /// `rk` is validated as base64url by the caller; everything is shell-quoted anyway.
     fn node_curl_poll(&self, chain: u8, rk: &str) -> String {
+        let body = serde_json::json!({ "requestKeys": [rk] }).to_string();
         format!(
-            "curl -s -X POST -H 'content-type: application/json' -d '{{\"requestKeys\":[\"{rk}\"]}}' \"$B/chainweb/0.0/{}/chain/{chain}/pact/api/v1/poll\"",
-            self.cfg.network
+            "curl -s -X POST -H 'content-type: application/json' -d {} {}",
+            sh_quote(&body),
+            sh_url(
+                "B",
+                &format!(
+                    "/chainweb/0.0/{}/chain/{chain}/pact/api/v1/poll",
+                    self.cfg.network
+                )
+            )
         )
     }
 
@@ -460,6 +471,9 @@ impl Ctx {
             Value::Object(_) => Some(a_body.clone()),
             _ => None,
         };
+        if !crate::gen::is_request_key(rk) {
+            return Self::simple("bad-request-key");
+        }
         let chain = if chain == CHAIN_FROM_A {
             match a_first
                 .as_ref()
@@ -631,9 +645,17 @@ impl Ctx {
         if height > self.tips.min_tip() {
             return Self::simple("out-of-range");
         }
+        let body = format!("{{\"lower\":[],\"upper\":[\"<cut hash of chain {chain}>\"]}}");
         let curl_b = format!(
-            "curl -s -X POST -H 'accept: application/json;blockheader-encoding=object' -H 'content-type: application/json' -d '{{\"lower\":[],\"upper\":[\"<cut hash of chain {chain}>\"]}}' \"$B/chainweb/0.0/{}/chain/{chain}/header/branch?minheight={height}&maxheight={height}\"",
-            self.cfg.network
+            "curl -s -X POST -H 'accept: application/json;blockheader-encoding=object' -H 'content-type: application/json' -d {} {}",
+            sh_quote(&body),
+            sh_url(
+                "B",
+                &format!(
+                    "/chainweb/0.0/{}/chain/{chain}/header/branch?minheight={height}&maxheight={height}",
+                    self.cfg.network
+                )
+            )
         );
         self.count_request(req.route.as_str(), "node", 1);
         let header = match canonical_header(&self.node, &self.tips, chain, height).await {

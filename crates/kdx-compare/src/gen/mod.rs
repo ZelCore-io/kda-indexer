@@ -245,6 +245,18 @@ impl Generator for Mixer {
     }
 }
 
+/// A request key as it appears on the wire: 43 unpadded base64url characters.
+pub fn is_request_key(s: &str) -> bool {
+    s.len() == 43
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Path-and-query safe to replay: starts with `/`, no whitespace or control characters.
+pub fn is_clean_path(p: &str) -> bool {
+    p.starts_with('/') && !p.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// `meta.sender` of a parsed cmd.
 pub fn cmd_sender(cmd: &Value) -> Option<&str> {
     cmd.get("meta")?.get("sender")?.as_str()
