@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use kdx_decode::{DecodedBlock, VerifyReport};
-use kdx_hot::{RwTxn, Txn};
+use kdx_hot::{HotDict, RwTxn, Txn};
 
 use crate::ctx::Ctx;
 use crate::pipeline;
@@ -62,12 +62,21 @@ fn bump_max(txn: &mut RwTxn<'_>, name: &str, v: i64) -> Result<()> {
     Ok(())
 }
 
-/// Apply `batches` in order in one txn and commit it.
+/// Apply `batches` in order in one txn and commit it. On any error the in-memory dictionary
+/// is reloaded from MDBX, so names whose txn did not commit are forgotten.
 pub fn commit(ctx: &Ctx, batches: &[Batch]) -> Result<CommitStats> {
-    let t0 = Instant::now();
-    let mut st = CommitStats::default();
     // Lock order everywhere: dictionary, then the MDBX writer.
     let mut dict = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());
+    let r = commit_locked(ctx, batches, &mut dict);
+    if r.is_err() {
+        ctx.reload_dict(&mut dict);
+    }
+    r
+}
+
+fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<CommitStats> {
+    let t0 = Instant::now();
+    let mut st = CommitStats::default();
     let mut txn = ctx.hot.rw()?;
     for b in batches {
         if b.halted {
@@ -92,7 +101,7 @@ pub fn commit(ctx: &Ctx, batches: &[Batch]) -> Result<CommitStats> {
         }
         for p in &b.blocks {
             let ib = pipeline::index(p, &mut *dict)?;
-            kdx_hot::tail::apply(&mut txn, &ib, &mut dict).with_context(|| {
+            kdx_hot::tail::apply(&mut txn, &ib, dict).with_context(|| {
                 format!("apply chain {} height {}", ib.block.chain, ib.block.height)
             })?;
             st.blocks += 1;

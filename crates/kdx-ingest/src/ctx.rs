@@ -114,4 +114,14 @@ impl Ctx {
             graph,
         })
     }
+
+    /// Replace the in-memory dictionary with the persisted one. Called after a write txn that
+    /// may have run `HotDict::persist` failed: the names it drained from `pending` never
+    /// reached MDBX, so ids must not be handed out from memory (review M3).
+    pub fn reload_dict(&self, dict: &mut HotDict) {
+        match self.hot.ro().and_then(|t| HotDict::load(&t)) {
+            Ok(d) => *dict = d,
+            Err(e) => tracing::error!(error = %e, "reloading the dictionary failed"),
+        }
+    }
 }

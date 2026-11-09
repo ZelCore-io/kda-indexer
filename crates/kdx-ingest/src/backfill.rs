@@ -488,7 +488,13 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
         let spool_mb = fetched.coll.spilled_bytes() as f64 / (1 << 20) as f64;
         let m = manifest.clone();
         let (entry, p, timing) = tokio::task::spawn_blocking(move || {
-            build_and_commit(&c, u, fetched.coll, p, first_txnum, wopts, link_free, m)
+            let r = build_and_commit(&c, u, fetched.coll, p, first_txnum, wopts, link_free, m);
+            if r.is_err() {
+                // Names interned for the failed range never reached MDBX (review M3).
+                let mut d = c.dict.lock().unwrap_or_else(|e| e.into_inner());
+                c.reload_dict(&mut d);
+            }
+            r
         })
         .await??;
         prev = p;
