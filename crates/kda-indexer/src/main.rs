@@ -32,7 +32,26 @@ enum Command {
         out: Option<PathBuf>,
     },
     /// Fetch, decode and round-trip a bounded height range.
-    Dump,
+    Dump {
+        /// First height (number or `tip-N`).
+        #[arg(long)]
+        from: String,
+        /// Last height, inclusive (number or `tip-N`).
+        #[arg(long)]
+        to: String,
+        /// Restrict to these chains (default: every chain that exists at each height).
+        #[arg(long, value_delimiter = ',')]
+        chains: Option<Vec<u8>>,
+        /// Print one JSON line per tx instead of only the summary.
+        #[arg(long)]
+        json: bool,
+        /// Write (kind, len, record) frames plus a `.dict.json` side file.
+        #[arg(long)]
+        records_out: Option<PathBuf>,
+        /// Also write the summary as JSON.
+        #[arg(long)]
+        summary_out: Option<PathBuf>,
+    },
     /// Measure record and compression sizes.
     Measure,
     /// Benchmark request-key index layouts (B6).
@@ -73,7 +92,27 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Probe { smoke, out } => kda_indexer::cmd::probe::run(&cfg, smoke, out).await,
-        Command::Dump => anyhow::bail!("dump: not implemented yet"),
+        Command::Dump {
+            from,
+            to,
+            chains,
+            json,
+            records_out,
+            summary_out,
+        } => {
+            kda_indexer::cmd::dump::run(
+                &cfg,
+                kda_indexer::cmd::dump::DumpArgs {
+                    from,
+                    to,
+                    chains,
+                    json,
+                    records_out,
+                    summary_out,
+                },
+            )
+            .await
+        }
         Command::Measure => anyhow::bail!("measure: not implemented yet"),
         Command::RkBench => anyhow::bail!("rk-bench: not implemented yet"),
     }
