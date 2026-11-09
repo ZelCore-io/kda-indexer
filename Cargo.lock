@@ -1239,6 +1239,7 @@ dependencies = [
  "futures",
  "hex",
  "kdx-decode",
+ "kdx-hot",
  "kdx-node",
  "kdx-types",
  "rand",

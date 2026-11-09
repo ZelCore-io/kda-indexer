@@ -9,6 +9,7 @@ use crate::config::Config;
 
 pub mod dump;
 pub mod frames;
+pub mod hot;
 pub mod measure;
 pub mod probe;
 

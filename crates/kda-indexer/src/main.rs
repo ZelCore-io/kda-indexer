@@ -57,6 +57,12 @@ enum Command {
         #[arg(long)]
         index: bool,
     },
+    /// Hot store maintenance (hidden; P2 development aid).
+    #[command(hide = true)]
+    Hot {
+        #[command(subcommand)]
+        action: HotAction,
+    },
     /// Measure record and compression sizes.
     Measure {
         /// Records file from `dump` (recent era).
@@ -68,6 +74,16 @@ enum Command {
         /// JSON report path.
         #[arg(long)]
         out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum HotAction {
+    /// Open (or initialise) the hot store; print Meta, table counts, dict sizes, geometry.
+    Stats {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -128,6 +144,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Hot {
+            action: HotAction::Stats { data_dir },
+        } => kda_indexer::cmd::hot::stats(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir)),
         Command::Measure {
             records,
             records_b,

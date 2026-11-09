@@ -51,7 +51,8 @@ fn roundtrip(header: &Value, payload: &Value, tx: &[u8], out: &[u8]) -> DecodedB
     let b = decode_block(header, payload).expect("block must decode");
     verify_block(&b, &b.header.payload_hash).expect("consistency checks");
     let mut dict = MemDict::new();
-    let (br, trs) = build_records(&b, &kdx_decode::VerifyReport::default(), &mut dict).expect("records");
+    let (br, trs) =
+        build_records(&b, &kdx_decode::VerifyReport::default(), &mut dict).expect("records");
     let mut buf = Vec::new();
     encode_block(&br, &mut buf);
     let br2 = dec_block_rec(&buf).unwrap();
