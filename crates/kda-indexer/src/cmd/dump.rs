@@ -45,7 +45,6 @@ pub struct DumpArgs {
     pub records_out: Option<PathBuf>,
     pub summary_out: Option<PathBuf>,
     pub index: bool,
-    pub segments_out: Option<std::path::PathBuf>,
 }
 
 /// `--index` counters (Task 2 of P2).
@@ -138,8 +137,6 @@ struct Ctx {
     hashes: BTreeMap<(u8, u64), kdx_types::Hash32>,
     /// Block records of the current slab awaiting the adjacent checks.
     pending_adj: Vec<BlockRecord>,
-    /// `--segments-out`: one range over the dumped heights (development aid).
-    seg: Option<kdx_segment::RangeWriter>,
 }
 
 impl Ctx {
@@ -159,7 +156,7 @@ fn same_text(a: &Value, b: &Value) -> bool {
     x == y
 }
 
-fn parse_height(s: &str, tip: Option<u64>) -> anyhow::Result<u64> {
+pub(crate) fn parse_height(s: &str, tip: Option<u64>) -> anyhow::Result<u64> {
     if let Some(rest) = s.strip_prefix("tip") {
         let tip = tip.context("no tip available")?;
         if rest.is_empty() {
@@ -263,19 +260,6 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         prev: BTreeMap::new(),
         json: args.json,
         out,
-        seg: match &args.segments_out {
-            Some(d) => Some(kdx_segment::RangeWriter::create(
-                &d.join("segments"),
-                &d.join("etl"),
-                &cfg.network,
-                kdx_segment::RangeKind::Range,
-                u32::try_from(from)?,
-                u32::try_from(to + 1)?,
-                0,
-                kdx_segment::WriteOpts::new(cfg.backfill.zstd_level, cfg.backfill.dict_samples),
-            )?),
-            None => None,
-        },
     };
 
     let mut lo = from;
@@ -324,15 +308,8 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
     }
 
     let Ctx {
-        mut sum,
-        dict,
-        out,
-        seg,
-        ..
+        mut sum, dict, out, ..
     } = cx;
-    if let (Some(w), Some(d)) = (seg, &args.segments_out) {
-        write_dev_segments(cfg, w, &dict, d)?;
-    }
     if let Some(mut w) = out {
         w.flush()?;
     }
@@ -374,45 +351,6 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
     if failures > 0 {
         bail!("{failures} failure(s)");
     }
-    Ok(())
-}
-
-/// `--segments-out DIR`: finish the range into `DIR/segments`, commit a manifest holding only
-/// it, and store the run's dictionary in `DIR/hot` so `inspect` can render the records.
-fn write_dev_segments(
-    cfg: &Config,
-    w: kdx_segment::RangeWriter,
-    dict: &MemDict,
-    dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    let sdir = dir.join("segments");
-    let e = w.finish()?;
-    let mut m = kdx_segment::Manifest::new(&cfg.network);
-    m.push(e.clone())?;
-    m.commit(&sdir)?;
-    let hs = kdx_hot::HotStore::open(&super::hot::hot_dir(dir), super::hot::geometry(cfg))?;
-    let mut txn = hs.rw()?;
-    let mut hd = kdx_hot::HotDict::load(&txn)?;
-    for k in DictKind::ALL {
-        for id in 0..dict.len(k) as u32 {
-            let n = dict.name(k, id).context("dict id")?;
-            if kdx_types::DictMut::intern(&mut hd, k, n) != id {
-                bail!("{} already holds a different dictionary", dir.display());
-            }
-        }
-    }
-    hd.persist(&mut txn)?;
-    txn.set_frozen_frontier(e.end)?;
-    txn.set_next_txnum(e.end_txnum())?;
-    txn.commit()?;
-    eprintln!(
-        "segments: {}..{} txs {} blocks {} -> {}",
-        e.start,
-        e.end,
-        e.tx_count,
-        e.block_count,
-        sdir.display()
-    );
     Ok(())
 }
 
@@ -528,15 +466,6 @@ fn handle_block(
             }
         }
         cx.pending_adj.push(br.clone());
-        if let Some(w) = cx.seg.as_mut() {
-            let cmd_reencoded = trs.iter().filter(|t| t.cmd_reencoded).count() as u32;
-            w.push(&kdx_decode::IndexedBlock {
-                block: br.clone(),
-                txs: trs.clone(),
-                idx: idx.clone(),
-                cmd_reencoded,
-            })?;
-        }
     }
 
     // Block record round trip.

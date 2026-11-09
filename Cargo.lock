@@ -1240,6 +1240,7 @@ dependencies = [
  "hex",
  "kdx-decode",
  "kdx-hot",
+ "kdx-ingest",
  "kdx-node",
  "kdx-segment",
  "kdx-types",
@@ -1312,11 +1313,15 @@ dependencies = [
  "kdx-node",
  "kdx-segment",
  "kdx-types",
+ "libc",
  "rayon",
  "reth-nippy-jar",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

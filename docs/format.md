@@ -85,6 +85,31 @@ No file is modified after its rename. A crash before step 4 leaves files that th
 does not list; `segments check` reports them as orphans and the next build of that range
 replaces them.
 
+### Backfill commit order and resume
+
+A backfill range commits in this order:
+
+1. `RangeWriter::finish`: steps 1–3 above (files renamed into `segments/`, directory fsynced).
+2. One MDBX write txn in the hot store: the dictionary names first interned by this range,
+   the `Headers` stage checkpoint per chain (last height and hash of the range),
+   `next_txnum`, `frozen_frontier`, and `Meta dict_lens@{end}` (dictionary size per kind
+   after the range).
+3. Step 4 above: `manifest.json` replaced.
+
+The manifest is the source of truth. On start, backfill:
+
+- deletes everything under `etl/` (raw spools and posting runs are never reused);
+- deletes every file and temp directory in `segments/` that the manifest does not list;
+- when the hot store's `frozen_frontier`/`next_txnum` or `Headers` checkpoints differ from
+  the manifest, resets them to the manifest frontier (checkpoints re-derived from the last
+  range's block hashes); if the hot store was ahead (a crash between steps 2 and 3) and
+  holds no tail data, the names above `dict_lens@{frontier}` are dropped, so the range is
+  rebuilt with the same ids and the same bytes;
+- continues at `manifest.frontier`.
+
+Raw spool: `etl/raw-{start}/raw-NNNNN.run`, sorted runs of `(height u32 BE, chain u8)` →
+`[header, payload]` JSON, zstd level 1, k-way merged in (height, chain) order.
+
 ## `range.toml`
 
 ```toml

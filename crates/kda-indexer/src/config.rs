@@ -69,6 +69,11 @@ pub struct BackfillConfig {
     pub zstd_level: i32,
     /// Records sampled per file kind to train a range dictionary.
     pub dict_samples: u32,
+    /// Raw spool (ETL) bytes buffered per range before a sorted run is spilled to `etl/`.
+    pub etl_mem_mb: u64,
+    /// Memory cap for the backfill: (ranges fetching + the one building) × spool buffer +
+    /// the range writer's estimate; `ranges_in_flight` is lowered to fit.
+    pub mem_cap_mb: u64,
 }
 
 impl Default for BackfillConfig {
@@ -81,6 +86,8 @@ impl Default for BackfillConfig {
             max_rps: None,
             zstd_level: 19,
             dict_samples: 20_000,
+            etl_mem_mb: 1024,
+            mem_cap_mb: 6144,
         }
     }
 }
@@ -253,6 +260,10 @@ impl Config {
         anyhow::ensure!(
             (1..=22).contains(&b.zstd_level) && (1..=22).contains(&self.freezer.zstd_level),
             "zstd levels must be in 1..=22"
+        );
+        anyhow::ensure!(
+            b.etl_mem_mb >= 16 && b.mem_cap_mb >= 512,
+            "backfill.etl_mem_mb must be >= 16 and backfill.mem_cap_mb >= 512"
         );
         anyhow::ensure!(b.dict_samples > 0, "backfill.dict_samples must be > 0");
         anyhow::ensure!(

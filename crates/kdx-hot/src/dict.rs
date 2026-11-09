@@ -70,6 +70,40 @@ impl HotDict {
     }
 }
 
+/// Meta key holding the dictionary sizes at a frozen frontier (backfill range commits).
+pub fn lens_key(frontier: u32) -> String {
+    format!("dict_lens@{frontier}")
+}
+
+/// Sizes per kind (`DictKind::ALL` order) as 5 × u32 BE.
+pub fn encode_lens(d: &HotDict) -> Vec<u8> {
+    DictKind::ALL
+        .iter()
+        .flat_map(|&k| (d.len(k) as u32).to_be_bytes())
+        .collect()
+}
+
+pub fn decode_lens(v: &[u8]) -> Result<Vec<u32>> {
+    ensure!(v.len() == 4 * DictKind::ALL.len(), "bad dict_lens value");
+    Ok(v.chunks(4).map(|c| be_u32(c).unwrap_or(0)).collect())
+}
+
+/// Delete every name whose id is at or above `lens` (per kind, `DictKind::ALL` order).
+/// Only for names no committed data can reference: backfill resume, when a range reached
+/// MDBX but not the manifest and there is no tail. Returns the names removed.
+pub fn truncate(txn: &mut RwTxn<'_>, lens: &[u32]) -> Result<u64> {
+    let mut n = 0;
+    for (i, &k) in DictKind::ALL.iter().enumerate() {
+        let from = lens[i].to_be_bytes();
+        for (id, name) in txn.scan(Table::DictRev(k), &from, |_| true)? {
+            txn.del(Table::DictFwd(k), &name)?;
+            txn.del(Table::DictRev(k), &id)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 impl Dict for HotDict {
     fn find(&self, k: DictKind, s: &str) -> Option<u32> {
         self.mem.find(k, s)

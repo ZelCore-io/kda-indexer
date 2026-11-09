@@ -27,8 +27,8 @@ use crate::postings::PostingsWriter;
 
 /// BlockOrd slots per height (`BlockOrd = height × 20 + chain`, spec §3.2).
 pub const SLOT_WIDTH: u32 = 20;
-/// Posting entries kept in memory per family before a sorted run is spilled.
-const ETL_MEM_ENTRIES: usize = 8 << 20;
+/// Default posting entries kept in memory per family before a sorted run is spilled.
+pub const ETL_MEM_ENTRIES: usize = 8 << 20;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteOpts {
@@ -43,6 +43,9 @@ pub struct WriteOpts {
     /// Force the sorted-array rk/bh index (Review Focus 4 check; also env
     /// `KDX_DEBUG_RK_FALLBACK=1`).
     pub force_sorted_index: bool,
+    /// Posting entries (16 B each) kept in memory per family before a sorted run is spilled
+    /// (5 families; default [`ETL_MEM_ENTRIES`]). Backfill lowers it under its memory cap.
+    pub postings_mem_entries: usize,
 }
 
 impl WriteOpts {
@@ -53,6 +56,7 @@ impl WriteOpts {
             dict_bytes: 65536,
             dict_samples,
             force_sorted_index: false,
+            postings_mem_entries: ETL_MEM_ENTRIES,
         }
     }
 }
@@ -271,7 +275,7 @@ impl RangeWriter {
             blocks: Spool::create(etl.join("blocks.spool"))?,
             postings: Family::ALL
                 .iter()
-                .map(|f| SortedU128::new(&etl, f.name(), ETL_MEM_ENTRIES))
+                .map(|f| SortedU128::new(&etl, f.name(), opts.postings_mem_entries))
                 .collect(),
             etl,
             network: network.to_string(),

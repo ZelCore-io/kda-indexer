@@ -56,11 +56,22 @@ enum Command {
         /// encoding round trip; print per-family posting counts.
         #[arg(long)]
         index: bool,
-        /// Development aid (hidden): also write the window as one segment range into
-        /// `DIR/segments` (manifest included) and its dictionary into `DIR/hot`. Implies
-        /// `--index`. `KDX_DEBUG_RK_FALLBACK=1` forces the sorted rk/bh index.
-        #[arg(long, hide = true)]
-        segments_out: Option<PathBuf>,
+    },
+    /// Fetch canonical blocks into frozen segments (resumes at the manifest frontier).
+    Backfill {
+        /// First height (number or `tip-N`); ignored when segments exist (resume).
+        #[arg(long)]
+        from: String,
+        /// Last height, inclusive (number or `tip-N`); clamped to the final tip and to whole
+        /// steps.
+        #[arg(long)]
+        to: String,
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Canonical header walk: auto (cut, switching to anchors when slow), cut or anchor.
+        #[arg(long, default_value = "auto", hide = true)]
+        header_mode: kdx_ingest::HeaderMode,
     },
     /// Hot store maintenance (hidden; P2 development aid).
     #[command(hide = true)]
@@ -197,7 +208,6 @@ async fn main() -> anyhow::Result<()> {
             records_out,
             summary_out,
             index,
-            segments_out,
         } => {
             kda_indexer::cmd::dump::run(
                 &cfg,
@@ -208,9 +218,23 @@ async fn main() -> anyhow::Result<()> {
                     json,
                     records_out,
                     summary_out,
-                    index: index || segments_out.is_some(),
-                    segments_out,
+                    index,
                 },
+            )
+            .await
+        }
+        Command::Backfill {
+            from,
+            to,
+            data_dir,
+            header_mode,
+        } => {
+            kda_indexer::cmd::backfill::run(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                &from,
+                &to,
+                header_mode,
             )
             .await
         }
