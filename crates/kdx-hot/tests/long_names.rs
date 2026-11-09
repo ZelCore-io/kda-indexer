@@ -1,5 +1,6 @@
 //! A chain-data name past the MDBX key limit must not stop ingest (review H2): a 5 KB
-//! TRANSFER side and a 5 KB module name go through `index_block` and `tail::apply`.
+//! TRANSFER side and a 5 KB module name go through `index_block` and `tail::apply`. Also:
+//! `apply` then `unwind_to` leaves every table as before (review L1).
 
 use kdx_decode::{decode_block, index_block, VerifyReport};
 use kdx_hot::dict::HotDict;
@@ -12,12 +13,8 @@ fn h(n: u8) -> String {
     b64url_encode(&[n; 32])
 }
 
-#[test]
-fn over_long_names_do_not_halt_the_tail() {
-    let long_acct = "a".repeat(5000);
-    let long_mod = "m".repeat(5000);
-    let ev = json!({"params": [long_acct, "k:ok", 1.0], "name": "TRANSFER",
-        "module": {"namespace": null, "name": long_mod}, "moduleHash": h(11)});
+/// One block at height 5 of chain 0 with a user tx emitting `ev`.
+fn block(ev: serde_json::Value) -> kdx_decode::DecodedBlock {
     let cmd =
         r#"{"payload":{"exec":{"data":null,"code":"1"}},"meta":{"sender":"k:s"},"nonce":"n"}"#;
     let rk = blake2b_256(cmd.as_bytes()).to_b64url();
@@ -45,7 +42,17 @@ fn over_long_names_do_not_halt_the_tail() {
         "transactionsHash": h(7), "outputsHash": h(8), "payloadHash": h(4),
         "coinbase": b64url_encode(&cb),
     });
-    let b = decode_block(&header, &payload).unwrap();
+    decode_block(&header, &payload).unwrap()
+}
+
+#[test]
+fn over_long_names_do_not_halt_the_tail() {
+    let long_acct = "a".repeat(5000);
+    let long_mod = "m".repeat(5000);
+    let b = block(
+        json!({"params": [long_acct, "k:ok", 1.0], "name": "TRANSFER",
+        "module": {"namespace": null, "name": long_mod}, "moduleHash": h(11)}),
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let store = HotStore::open(
@@ -72,4 +79,50 @@ fn over_long_names_do_not_halt_the_tail() {
             .unwrap(),
         1
     );
+}
+
+/// Every non-dictionary row (Counters at 0 count as absent).
+fn rows(store: &HotStore) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+    let ro = store.ro().unwrap();
+    let mut out = Vec::new();
+    for t in kdx_hot::Table::all() {
+        if t.name().starts_with("Dict") {
+            continue;
+        }
+        for (k, v) in ro.scan(t, &[], |_| true).unwrap() {
+            if t == kdx_hot::Table::Counters && v.iter().all(|&x| x == 0) {
+                continue;
+            }
+            out.push((t.name(), k, v));
+        }
+    }
+    out
+}
+
+#[test]
+fn apply_then_unwind_restores_every_table() {
+    let b = block(
+        json!({"params": ["k:from", "k:to", 1.0], "name": "TRANSFER",
+        "module": {"namespace": null, "name": "coin"}, "moduleHash": h(11)}),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let store = HotStore::open(
+        dir.path(),
+        Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        },
+    )
+    .unwrap();
+    let before = rows(&store);
+    let mut dict = HotDict::load(&store.ro().unwrap()).unwrap();
+    let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+    let mut txn = store.rw().unwrap();
+    kdx_hot::tail::apply(&mut txn, &ib, &mut dict).unwrap();
+    txn.commit().unwrap();
+    assert_ne!(rows(&store), before);
+    let mut txn = store.rw().unwrap();
+    assert_eq!(kdx_hot::tail::unwind_to(&mut txn, 0, 4).unwrap(), 1);
+    txn.commit().unwrap();
+    assert_eq!(rows(&store), before);
 }

@@ -207,3 +207,50 @@ pub async fn handle(ctx: &Ctx, view: &ChainView, upper: &str, max: Option<u64>) 
     let outcome = view.classify(h0, &p0, frontier, f)?;
     Ok(Branch { outcome, headers })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(n: u32) -> Hash32 {
+        Hash32([n as u8; 32])
+    }
+
+    /// Stored chain 100..=110 (hash at height x is `h(x)`), F = 5, frontier 100.
+    #[test]
+    fn classify_cases() {
+        let v = ChainView {
+            chain: 0,
+            tip: (110, h(110)),
+            recent: (100..=110).map(|x| (x, h(x))).collect(),
+        };
+        let c = |h0: u32, p0: Hash32, f: u32| v.classify(h0, &p0, 100, f);
+        assert_eq!(c(111, h(110), 5).unwrap(), ReorgOutcome::Extend);
+        let fork = |height, depth| ReorgOutcome::Reorg(Fork { height, depth });
+        assert_eq!(c(110, h(109), 5).unwrap(), fork(109, 1));
+        assert_eq!(c(106, h(105), 5).unwrap(), fork(105, 5));
+        let halt = |fork_height, depth| ReorgOutcome::ChainHalted { fork_height, depth };
+        assert_eq!(c(105, h(104), 5).unwrap(), halt(104, 6));
+        // Fork at frontier − 1 is allowed; below it halts.
+        assert_eq!(c(100, h(99), 20).unwrap(), halt(99, 11));
+        assert_eq!(c(99, h(98), 20).unwrap(), halt(98, 12));
+        // Unknown stored hash at the fork halts; a different stored hash is an error.
+        let w = ChainView {
+            recent: (105..=110).map(|x| (x, h(x))).collect(),
+            ..v.clone_view()
+        };
+        assert_eq!(w.classify(104, &h(103), 100, 20).unwrap(), halt(103, 7));
+        assert!(c(110, h(7), 5).is_err());
+        assert!(c(112, h(111), 5).is_err());
+    }
+
+    impl ChainView {
+        fn clone_view(&self) -> ChainView {
+            ChainView {
+                chain: self.chain,
+                tip: self.tip,
+                recent: self.recent.clone(),
+            }
+        }
+    }
+}
