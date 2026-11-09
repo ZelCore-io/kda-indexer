@@ -1,0 +1,39 @@
+# Accepted differences between side A and side B (spec section 7.3).
+# Each entry: id, route (tx, txs, account, events, recent, stats, search, coins, v1txs,
+# other or "*"), json_path_glob (JSON pointer; `*` = one segment, `**` = any depth),
+# condition (a_extra = only in A, b_extra = only in B, changed, any), optional
+# request_contains, reason and owner_note. Everything not matched is a reported diff.
+
+[[entry]]
+id = "event-search-window"
+route = "events"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "search="
+reason = "Event text search only covers a bounded recent window in kda-indexer (decision Q2); chainweb-data scans further back, so older matches differ."
+owner_note = "Accepted by the owner. Exact module/name event queries are not covered by this entry."
+
+[[entry]]
+id = "orphan-rows-txs"
+route = "txs"
+json_path_glob = "/orphans/**"
+condition = "any"
+reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing."
+owner_note = "Builder call (spec section 4.5): orphans are not kept."
+
+[[entry]]
+id = "stats-estimate"
+route = "stats"
+json_path_glob = "/transactionCount~estimate"
+condition = "changed"
+reason = "chainweb-data returns a Postgres row estimate for transactionCount; counts within 1% are accepted. Larger differences are reported at /transactionCount."
+owner_note = "Tolerance from spec section 7.3."
+
+[[entry]]
+id = "graphql-page-size"
+route = "other"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "graphql"
+reason = "GraphQL pages larger than 100 items are capped in kda-indexer (decision Q10)."
+owner_note = "Accepted by the owner; only applies once the GraphQL adapter is compared."
