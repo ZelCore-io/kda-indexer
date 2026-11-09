@@ -50,28 +50,45 @@ fn min_tail_tip(txn: &impl Txn, ctx: &Ctx, h: u32) -> Result<Option<u32>> {
     Ok(m)
 }
 
+/// Rows per chunk when walking `TailTxs` / `TailPostings` (bounds the freezer's memory).
+const CHUNK: usize = 4096;
+
 /// Delete the hot rows of every block below `end` and move the frontier there, in `txn`.
-/// Returns the hashes at `end − 1` per chain (the new `Headers` checkpoints).
+/// Sets the `Headers` checkpoints at `end − 1`; returns the number of blocks deleted. Walks
+/// the tables in bounded chunks (review M4).
 fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
     let mut n = 0u64;
-    // Txs (and the request keys they own) by TxKey order: height-major.
+    // Txs (and the request keys they own) by TxKey order: height-major. Every row of a chunk
+    // is deleted, so the next chunk starts at the table's first row again.
     let end_key = TxKey::new(end, 0, 0).to_be_bytes();
-    let txs = txn.scan(Table::TailTxs, &[], |k| k < &end_key[..])?;
-    for (k, v) in &txs {
-        let r = decode_tx(v).context("hot tx")?;
-        if let Some(rk) = &r.request_key {
-            if txn.get(Table::TailRk, &rk.0)?.as_deref() == Some(&k[..]) {
-                txn.del(Table::TailRk, &rk.0)?;
+    loop {
+        let txs = txn.scan_limit(Table::TailTxs, &[], CHUNK, |k| k < &end_key[..])?;
+        for (k, v) in &txs {
+            let r = decode_tx(v).context("hot tx")?;
+            if let Some(rk) = &r.request_key {
+                if txn.get(Table::TailRk, &rk.0)?.as_deref() == Some(&k[..]) {
+                    txn.del(Table::TailRk, &rk.0)?;
+                }
+            }
+            txn.del(Table::TailTxs, k)?;
+        }
+        if txs.len() < CHUNK {
+            break;
+        }
+    }
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let posts = txn.scan_chunk(Table::TailPostings, after.as_deref(), CHUNK, |_| true)?;
+        for (k, _) in &posts {
+            let key = parse_txkey(&k[9..]).context("posting key")?;
+            if key.height() < end {
+                txn.del(Table::TailPostings, k)?;
             }
         }
-        txn.del(Table::TailTxs, k)?;
-    }
-    let posts = txn.scan(Table::TailPostings, &[], |_| true)?;
-    for (k, _) in &posts {
-        let key = parse_txkey(&k[9..]).context("posting key")?;
-        if key.height() < end {
-            txn.del(Table::TailPostings, k)?;
+        if posts.len() < CHUNK {
+            break;
         }
+        after = posts.last().map(|r| r.0.clone());
     }
     for c in 0..kdx_segment::SLOT_WIDTH as u8 {
         let rows = txn.scan(Table::Headers, &block_key(c, 0), |k| {
@@ -122,35 +139,42 @@ pub fn reconcile(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The step's blocks from the hot store, in (height, chain) order.
-fn hot_step_blocks(ctx: &Ctx, start: u32, end: u32) -> Result<Vec<IndexedBlock>> {
+/// Push the step's blocks from the hot store to `w`, in (height, chain) order, one block at
+/// a time (review M4: only the step's posting keys are held in memory). Returns the number
+/// of blocks.
+fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Result<u64> {
     let txn = ctx.hot.ro()?;
-    let lo = TxKey::new(start, 0, 0).to_be_bytes();
-    let hi = TxKey::new(end, 0, 0).to_be_bytes();
     let mut posts: BTreeMap<TxKey, Vec<(Family, u64)>> = BTreeMap::new();
-    for (k, _) in txn.scan(Table::TailPostings, &[], |_| true)? {
-        let key = parse_txkey(&k[9..]).context("posting key")?;
-        if key.height() >= start && key.height() < end {
-            let f = Family::from_u8(k[0]).context("posting family")?;
-            let e = u64::from_be_bytes(k[1..9].try_into()?);
-            posts.entry(key).or_default().push((f, e));
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let rows = txn.scan_chunk(Table::TailPostings, after.as_deref(), CHUNK, |_| true)?;
+        for (k, _) in &rows {
+            let key = parse_txkey(&k[9..]).context("posting key")?;
+            if key.height() >= start && key.height() < end {
+                let f = Family::from_u8(k[0]).context("posting family")?;
+                let e = u64::from_be_bytes(k[1..9].try_into()?);
+                posts.entry(key).or_default().push((f, e));
+            }
         }
+        if rows.len() < CHUNK {
+            break;
+        }
+        after = rows.last().map(|r| r.0.clone());
     }
-    let mut txs: BTreeMap<(u32, u8), Vec<kdx_types::record::TxRecord>> = BTreeMap::new();
-    for (_, v) in txn.scan(Table::TailTxs, &lo, |k| k < &hi[..])? {
-        let r = decode_tx(&v).context("hot tx")?;
-        txs.entry((r.key.height(), r.key.chain()))
-            .or_default()
-            .push(r);
-    }
-    let mut out = Vec::new();
+    let (mut blocks, mut ntx) = (0u64, 0u64);
     for h in start..end {
         for &c in ctx.graph.chains_at(u64::from(h)) {
             let v = txn
                 .get(Table::Headers, &block_key(c, h))?
                 .with_context(|| format!("freezer: hot block chain {c} height {h} missing"))?;
             let block = decode_block(&v)?;
-            let t = txs.remove(&(h, c)).unwrap_or_default();
+            let lo = TxKey::new(h, c, 0).to_be_bytes();
+            let hi = TxKey::new(h, c + 1, 0).to_be_bytes();
+            let t: Vec<kdx_types::record::TxRecord> = txn
+                .scan(Table::TailTxs, &lo, |k| k < &hi[..])?
+                .iter()
+                .map(|(_, v)| decode_tx(v).context("hot tx"))
+                .collect::<Result<_>>()?;
             let idx = t
                 .iter()
                 .map(|r| {
@@ -164,21 +188,39 @@ fn hot_step_blocks(ctx: &Ctx, start: u32, end: u32) -> Result<Vec<IndexedBlock>>
                     }
                 })
                 .collect();
+            ntx += t.len() as u64;
             let cmd_reencoded = t.iter().filter(|r| r.cmd_reencoded).count() as u32;
-            out.push(IndexedBlock {
+            w.push(&IndexedBlock {
                 block,
                 txs: t,
                 idx,
                 cmd_reencoded,
                 unindexed_accounts: 0,
-            });
+            })?;
+            blocks += 1;
         }
     }
+    // Every hot tx of the step belongs to a stored block.
+    let lo = TxKey::new(start, 0, 0).to_be_bytes();
+    let hi = TxKey::new(end, 0, 0).to_be_bytes();
+    let mut all = 0u64;
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let rows = match &after {
+            None => txn.scan_limit(Table::TailTxs, &lo, CHUNK, |k| k < &hi[..])?,
+            Some(a) => txn.scan_chunk(Table::TailTxs, Some(a), CHUNK, |k| k < &hi[..])?,
+        };
+        all += rows.len() as u64;
+        if rows.len() < CHUNK {
+            break;
+        }
+        after = rows.last().map(|r| r.0.clone());
+    }
     ensure!(
-        txs.is_empty(),
-        "freezer: hot txs without a block in {start}..{end}"
+        all == ntx && posts.is_empty(),
+        "freezer: hot txs or postings without a block in {start}..{end}"
     );
-    Ok(out)
+    Ok(blocks)
 }
 
 /// One freezer step: freeze the next step if it is final, else merge if ten aligned steps
@@ -215,7 +257,6 @@ fn freeze_step(ctx: &Ctx) -> Result<Option<RangeEntry>> {
     );
     disk::ensure_free(&ctx.segdir, o.min_free_gb)?;
     let t0 = std::time::Instant::now();
-    let blocks = hot_step_blocks(ctx, start, end)?;
     let mut w = RangeWriter::create(
         &ctx.segdir,
         &ctx.etl,
@@ -226,9 +267,7 @@ fn freeze_step(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         first_txnum,
         WriteOpts::new(o.step_level, o.dict_samples),
     )?;
-    for b in &blocks {
-        w.push(b)?;
-    }
+    let blocks = write_hot_step(ctx, start, end, &mut w)?;
     let entry = w.finish()?;
     m.push(entry.clone())?;
     m.commit(&ctx.segdir)?;
@@ -238,9 +277,8 @@ fn freeze_step(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         let mut txn = ctx.hot.rw()?;
         let n = drop_hot_below(&mut txn, end)?;
         ensure!(
-            n == blocks.len() as u64,
-            "freezer: deleted {n} hot blocks, froze {}",
-            blocks.len()
+            n == blocks,
+            "freezer: deleted {n} hot blocks, froze {blocks}"
         );
         txn.set_next_txnum(entry.end_txnum())?;
         txn.set_meta(&dict::lens_key(end), &dict::encode_lens(&d))?;

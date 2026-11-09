@@ -191,6 +191,39 @@ pub trait Txn {
         Ok(out)
     }
 
+    /// Like `scan`, but at most `limit` rows, starting strictly after `after` (`None` = from
+    /// the first row). Lets callers walk a large table in bounded chunks.
+    fn scan_chunk(
+        &self,
+        t: Table,
+        after: Option<&[u8]>,
+        limit: usize,
+        keep: impl FnMut(&[u8]) -> bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(a) = after else {
+            return self.scan_limit(t, &[], limit, keep);
+        };
+        // The smallest key above `a` is `a ‖ 0x00`.
+        let mut from = a.to_vec();
+        from.push(0);
+        self.scan_limit(t, &from, limit, keep)
+    }
+
+    /// `scan` capped at `limit` rows.
+    fn scan_limit(
+        &self,
+        t: Table,
+        from: &[u8],
+        limit: usize,
+        mut keep: impl FnMut(&[u8]) -> bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut n = 0usize;
+        self.scan(t, from, |k| {
+            n += 1;
+            n <= limit && keep(k)
+        })
+    }
+
     /// Number of rows in a table.
     fn count(&self, t: Table) -> Result<usize> {
         Ok(self.raw().db_stat_with_dbi(self.tables().dbi(t))?.entries())
