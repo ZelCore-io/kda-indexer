@@ -54,7 +54,12 @@ pub struct IngestConfig {
 
 impl Default for IngestConfig {
     fn default() -> Self {
-        Self { finality_depth: 1000, batch_size: 50, node_concurrency: 8, max_rps: 200 }
+        Self {
+            finality_depth: 1000,
+            batch_size: 50,
+            node_concurrency: 8,
+            max_rps: 200,
+        }
     }
 }
 
@@ -69,7 +74,12 @@ pub struct BackfillConfig {
 
 impl Default for BackfillConfig {
     fn default() -> Self {
-        Self { ranges_in_flight: 2, range_heights: 100_000, step_heights: 10_000, min_free_gb: 60 }
+        Self {
+            ranges_in_flight: 2,
+            range_heights: 100_000,
+            step_heights: 10_000,
+            min_free_gb: 60,
+        }
     }
 }
 
@@ -83,7 +93,11 @@ pub struct TailConfig {
 
 impl Default for TailConfig {
     fn default() -> Self {
-        Self { commit_ms: 1000, commit_blocks: 40, cut_poll_secs: 10 }
+        Self {
+            commit_ms: 1000,
+            commit_blocks: 40,
+            cut_poll_secs: 10,
+        }
     }
 }
 
@@ -124,7 +138,13 @@ pub struct SearchConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { min_len: 4, max_results: 100, max_candidates: 10_000, max_scan_heights: 20_000, timeout_ms: 2000 }
+        Self {
+            min_len: 4,
+            max_results: 100,
+            max_candidates: 10_000,
+            max_scan_heights: 20_000,
+            timeout_ms: 2000,
+        }
     }
 }
 
@@ -157,7 +177,10 @@ pub struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { format: "text".into(), level: "info".into() }
+        Self {
+            format: "text".into(),
+            level: "info".into(),
+        }
     }
 }
 
@@ -167,7 +190,8 @@ fn d_timeout_ms() -> u64 {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading config {}", path.display()))?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
     }
 }

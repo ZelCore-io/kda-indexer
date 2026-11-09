@@ -11,7 +11,13 @@ pub mod probe;
 
 /// Build the node client from config; `max_rps` and `node_concurrency` come from `[ingest]`.
 pub fn node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
-    let p2p_cert_sha256 = cfg.node.p2p_cert_sha256.as_deref().map(kdx_node::parse_sha256_hex).transpose().context("node.p2p_cert_sha256")?;
+    let p2p_cert_sha256 = cfg
+        .node
+        .p2p_cert_sha256
+        .as_deref()
+        .map(kdx_node::parse_sha256_hex)
+        .transpose()
+        .context("node.p2p_cert_sha256")?;
     let ncfg = NodeClientConfig {
         base: cfg.node.url.clone(),
         network: cfg.network.clone(),

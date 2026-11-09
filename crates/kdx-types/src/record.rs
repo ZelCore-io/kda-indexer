@@ -64,8 +64,16 @@ use crate::{Error, Result};
 pub const FORMAT_VERSION: u8 = 1;
 
 /// CommandResult envelope keys in the order the node emits them.
-pub const ENVELOPE_KEYS: [&str; 8] =
-    ["gas", "result", "reqKey", "logs", "events", "metaData", "continuation", "txId"];
+pub const ENVELOPE_KEYS: [&str; 8] = [
+    "gas",
+    "result",
+    "reqKey",
+    "logs",
+    "events",
+    "metaData",
+    "continuation",
+    "txId",
+];
 pub const PRESENT_ALL: u8 = 0xff;
 
 /// `miner_account` when minerData carries no account string.
@@ -81,7 +89,10 @@ pub enum Sig {
 
 impl Sig {
     pub fn from_wire(s: &str) -> Sig {
-        if s.len() == 128 && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+        if s.len() == 128
+            && s.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
             let mut a = [0u8; 64];
             if hex::decode_to_slice(s, &mut a).is_ok() && hex::encode(a) == s {
                 return Sig::Ed25519(a);
@@ -236,7 +247,9 @@ pub struct BlockRecord {
 fn version(buf: &mut &[u8]) -> Result<()> {
     match get_u8(buf)? {
         FORMAT_VERSION => Ok(()),
-        v => Err(Error::Codec(format!("unsupported record format version {v}"))),
+        v => Err(Error::Codec(format!(
+            "unsupported record format version {v}"
+        ))),
     }
 }
 
@@ -360,7 +373,11 @@ pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
     } else {
         None
     };
-    let cmd = if f(1) { Some(get_bytes(buf)?.to_vec()) } else { None };
+    let cmd = if f(1) {
+        Some(get_bytes(buf)?.to_vec())
+    } else {
+        None
+    };
     let n = get_u64(buf)? as usize;
     let mut sigs = Vec::with_capacity(n.min(buf.len()));
     for _ in 0..n {
@@ -374,8 +391,16 @@ pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
     let gas = get_u64(buf)?;
     let logs = if f(2) { Some(hash(buf)?) } else { None };
     let pact_tx_id = if f(3) { Some(get_u64(buf)?) } else { None };
-    let metadata = if f(4) { Some(get_bytes(buf)?.to_vec()) } else { None };
-    let continuation = if f(5) { Some(get_bytes(buf)?.to_vec()) } else { None };
+    let metadata = if f(4) {
+        Some(get_bytes(buf)?.to_vec())
+    } else {
+        None
+    };
+    let continuation = if f(5) {
+        Some(get_bytes(buf)?.to_vec())
+    } else {
+        None
+    };
     let n = get_u64(buf)? as usize;
     let mut events = Vec::with_capacity(n.min(buf.len()));
     for _ in 0..n {
@@ -392,9 +417,16 @@ pub fn decode_tx(mut b: &[u8]) -> Result<TxRecord> {
         let t = get_u64(buf)?;
         transfers.push(u16::try_from(t).map_err(|_| Error::Codec(format!("transfer pos {t}")))?);
     }
-    let extra = if f(6) { Some(get_bytes(buf)?.to_vec()) } else { None };
+    let extra = if f(6) {
+        Some(get_bytes(buf)?.to_vec())
+    } else {
+        None
+    };
     if !buf.is_empty() {
-        return Err(Error::Codec(format!("{} trailing bytes after tx record", buf.len())));
+        return Err(Error::Codec(format!(
+            "{} trailing bytes after tx record",
+            buf.len()
+        )));
     }
     Ok(TxRecord {
         key,
@@ -466,7 +498,10 @@ pub fn decode_block(mut b: &[u8]) -> Result<BlockRecord> {
     let miner_account = get_u32(buf)?;
     let miner_data = get_bytes(buf)?.to_vec();
     if !buf.is_empty() {
-        return Err(Error::Codec(format!("{} trailing bytes after block record", buf.len())));
+        return Err(Error::Codec(format!(
+            "{} trailing bytes after block record",
+            buf.len()
+        )));
     }
     Ok(BlockRecord {
         hash: hash_,
@@ -488,4 +523,3 @@ pub fn decode_block(mut b: &[u8]) -> Result<BlockRecord> {
         miner_data,
     })
 }
-

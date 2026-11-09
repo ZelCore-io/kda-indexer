@@ -18,7 +18,10 @@ pub enum DecodeError {
 }
 
 fn bad(path: impl Into<String>, reason: impl ToString) -> DecodeError {
-    DecodeError::Bad { path: path.into(), reason: reason.to_string() }
+    DecodeError::Bad {
+        path: path.into(),
+        reason: reason.to_string(),
+    }
 }
 
 pub type Result<T> = std::result::Result<T, DecodeError>;
@@ -93,24 +96,32 @@ const TX_KEYS: [&str; 3] = ["hash", "sigs", "cmd"];
 const OUTPUT_KEYS: [&str; 8] = kdx_types::record::ENVELOPE_KEYS;
 
 fn obj<'a>(v: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
-    v.as_object().ok_or_else(|| DecodeError::UnknownShape { path: path.to_owned() })
+    v.as_object().ok_or_else(|| DecodeError::UnknownShape {
+        path: path.to_owned(),
+    })
 }
 
 fn check_keys(m: &Map<String, Value>, allowed: &[&str], path: &str) -> Result<()> {
     for k in m.keys() {
         if !allowed.contains(&k.as_str()) {
-            return Err(DecodeError::UnknownShape { path: format!("{path}.{k}") });
+            return Err(DecodeError::UnknownShape {
+                path: format!("{path}.{k}"),
+            });
         }
     }
     Ok(())
 }
 
 fn field<'a>(m: &'a Map<String, Value>, k: &str, path: &str) -> Result<&'a Value> {
-    m.get(k).ok_or_else(|| DecodeError::Missing { path: format!("{path}.{k}") })
+    m.get(k).ok_or_else(|| DecodeError::Missing {
+        path: format!("{path}.{k}"),
+    })
 }
 
 fn str_field<'a>(m: &'a Map<String, Value>, k: &str, path: &str) -> Result<&'a str> {
-    field(m, k, path)?.as_str().ok_or_else(|| bad(format!("{path}.{k}"), "not a string"))
+    field(m, k, path)?
+        .as_str()
+        .ok_or_else(|| bad(format!("{path}.{k}"), "not a string"))
 }
 
 fn hash_field(m: &Map<String, Value>, k: &str, path: &str) -> Result<Hash32> {
@@ -183,13 +194,19 @@ fn decode_output(v: Value, path: &str) -> Result<Value> {
     Ok(v)
 }
 
-pub fn decode_block(header: &Value, payload: &Value) -> std::result::Result<DecodedBlock, DecodeError> {
+pub fn decode_block(
+    header: &Value,
+    payload: &Value,
+) -> std::result::Result<DecodedBlock, DecodeError> {
     let header = decode_header(header)?;
     let p = "payload";
     let m = obj(payload, p)?;
     check_keys(m, &PAYLOAD_KEYS, p)?;
     let miner = b64_json(field(m, "minerData", p)?, "payload.minerData")?;
-    let coinbase = decode_output(b64_json(field(m, "coinbase", p)?, "payload.coinbase")?, "coinbase")?;
+    let coinbase = decode_output(
+        b64_json(field(m, "coinbase", p)?, "payload.coinbase")?,
+        "coinbase",
+    )?;
     let list = field(m, "transactions", p)?
         .as_array()
         .ok_or_else(|| bad("payload.transactions", "not an array"))?;
@@ -197,11 +214,17 @@ pub fn decode_block(header: &Value, payload: &Value) -> std::result::Result<Deco
     for (i, pair) in list.iter().enumerate() {
         let pos = i + 1;
         let tp = format!("tx[{pos}]");
-        let pair = pair.as_array().filter(|a| a.len() == 2).ok_or_else(|| DecodeError::UnknownShape {
-            path: format!("payload.transactions[{i}]"),
-        })?;
+        let pair =
+            pair.as_array()
+                .filter(|a| a.len() == 2)
+                .ok_or_else(|| DecodeError::UnknownShape {
+                    path: format!("payload.transactions[{i}]"),
+                })?;
         let tx = b64_json(&pair[0], &tp)?;
-        let output = decode_output(b64_json(&pair[1], &format!("{tp}.output"))?, &format!("{tp}.output"))?;
+        let output = decode_output(
+            b64_json(&pair[1], &format!("{tp}.output"))?,
+            &format!("{tp}.output"),
+        )?;
         let tm = obj(&tx, &tp)?;
         check_keys(tm, &TX_KEYS, &tp)?;
         let hash = hash_field(tm, "hash", &tp)?;
@@ -212,7 +235,13 @@ pub fn decode_block(header: &Value, payload: &Value) -> std::result::Result<Deco
         let cmd = str_field(tm, "cmd", &tp)?.to_owned();
         let cmd_parsed: Value =
             serde_json::from_str(&cmd).map_err(|e| bad(format!("{tp}.cmd"), e))?;
-        txs.push(DecodedTx { hash, sigs, cmd, cmd_parsed, output });
+        txs.push(DecodedTx {
+            hash,
+            sigs,
+            cmd,
+            cmd_parsed,
+            output,
+        });
     }
     Ok(DecodedBlock {
         header,

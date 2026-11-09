@@ -13,11 +13,16 @@ impl RateLimiter {
     /// `rps == 0` disables limiting.
     pub fn new(rps: u32) -> Self {
         let interval = (rps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(rps)));
-        Self { interval, next: Mutex::new(Instant::now()) }
+        Self {
+            interval,
+            next: Mutex::new(Instant::now()),
+        }
     }
 
     pub async fn acquire(&self) {
-        let Some(interval) = self.interval else { return };
+        let Some(interval) = self.interval else {
+            return;
+        };
         let mut next = self.next.lock().await;
         let now = Instant::now();
         if *next > now {

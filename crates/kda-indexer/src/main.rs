@@ -47,7 +47,9 @@ enum ConfigAction {
 
 fn init_logging(log: &LogConfig) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log.level));
-    let b = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    let b = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     if log.format == "json" {
         b.json().init();
     } else {
@@ -61,8 +63,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::load(&cli.config)?;
     init_logging(&cfg.log);
     match cli.command {
-        Command::Config { action: ConfigAction::Check } => {
-            print!("{}", toml::to_string_pretty(&cfg).context("serialising config")?);
+        Command::Config {
+            action: ConfigAction::Check,
+        } => {
+            print!(
+                "{}",
+                toml::to_string_pretty(&cfg).context("serialising config")?
+            );
             Ok(())
         }
         Command::Probe { smoke, out } => kda_indexer::cmd::probe::run(&cfg, smoke, out).await,

@@ -69,7 +69,9 @@ pub fn render_output(r: &TxRecord, dict: &dyn Dict) -> Result<Value> {
             "reqKey" => match (&r.request_key, &r.cb_req_key) {
                 (Some(h), _) => Value::String(h.to_b64url()),
                 (None, Some(c)) => Value::String(c.to_wire()),
-                (None, None) => return Err(RenderError::Shape("reqKey present but not stored".into())),
+                (None, None) => {
+                    return Err(RenderError::Shape("reqKey present but not stored".into()))
+                }
             },
             "logs" => r.logs.map_or(Value::Null, |h| Value::String(h.to_b64url())),
             "events" => {
@@ -80,7 +82,9 @@ pub fn render_output(r: &TxRecord, dict: &dyn Dict) -> Result<Value> {
                     let ev_name = full
                         .strip_prefix(module)
                         .and_then(|s| s.strip_prefix('.'))
-                        .ok_or_else(|| RenderError::Shape(format!("event name {full:?} not under {module:?}")))?;
+                        .ok_or_else(|| {
+                            RenderError::Shape(format!("event name {full:?} not under {module:?}"))
+                        })?;
                     let (ns, mname) = match module.split_once('.') {
                         Some((ns, n)) => (Value::String(ns.to_owned()), n),
                         None => (Value::Null, module),
@@ -92,14 +96,19 @@ pub fn render_output(r: &TxRecord, dict: &dyn Dict) -> Result<Value> {
                     m.insert("params".into(), value::from_slice(&e.params, dict)?);
                     m.insert("name".into(), ev_name.into());
                     m.insert("module".into(), Value::Object(md));
-                    m.insert("moduleHash".into(), name(dict, DictKind::ModuleHash, e.module_hash)?.into());
+                    m.insert(
+                        "moduleHash".into(),
+                        name(dict, DictKind::ModuleHash, e.module_hash)?.into(),
+                    );
                     a.push(Value::Object(m));
                 }
                 Value::Array(a)
             }
             "metaData" => opt_value(&r.metadata, dict)?,
             "continuation" => opt_value(&r.continuation, dict)?,
-            "txId" => r.pact_tx_id.map_or(Value::Null, |t| Value::Number(Number::from(t))),
+            "txId" => r
+                .pact_tx_id
+                .map_or(Value::Null, |t| Value::Number(Number::from(t))),
             _ => unreachable!("ENVELOPE_KEYS"),
         };
         o.insert((*k).to_owned(), v);
@@ -120,8 +129,11 @@ pub fn render_cmd(r: &TxRecord) -> Option<&[u8]> {
 
 /// The transaction object `{"hash", "sigs", "cmd"}` (None for coinbase).
 pub fn render_tx(r: &TxRecord, dict: &dyn Dict) -> Result<Option<Value>> {
-    let (Some(h), Some(cmd)) = (&r.request_key, &r.cmd) else { return Ok(None) };
-    let cmd = std::str::from_utf8(cmd).map_err(|_| RenderError::Shape("cmd is not utf-8".into()))?;
+    let (Some(h), Some(cmd)) = (&r.request_key, &r.cmd) else {
+        return Ok(None);
+    };
+    let cmd =
+        std::str::from_utf8(cmd).map_err(|_| RenderError::Shape("cmd is not utf-8".into()))?;
     let sigs = match extra_map(r, dict)?.shift_remove(EXTRA_TX_SIGS) {
         Some(v) => v,
         None => Value::Array(
@@ -155,11 +167,17 @@ pub fn render_header(r: &BlockRecord) -> Value {
     m.insert("parent".into(), Value::String(r.parent.to_b64url()));
     m.insert("adjacents".into(), Value::Object(adj));
     m.insert("target".into(), Value::String(b64url_encode(&r.target)));
-    m.insert("payloadHash".into(), Value::String(r.payload_hash.to_b64url()));
+    m.insert(
+        "payloadHash".into(),
+        Value::String(r.payload_hash.to_b64url()),
+    );
     m.insert("chainId".into(), n(r.chain as u64));
     m.insert("weight".into(), Value::String(b64url_encode(&r.weight)));
     m.insert("height".into(), n(r.height));
-    m.insert("chainwebVersion".into(), Value::String(r.chainweb_version.clone()));
+    m.insert(
+        "chainwebVersion".into(),
+        Value::String(r.chainweb_version.clone()),
+    );
     m.insert("epochStart".into(), n(r.epoch_start));
     m.insert("featureFlags".into(), n(r.feature_flags));
     m.insert("hash".into(), Value::String(r.hash.to_b64url()));
@@ -185,7 +203,9 @@ pub fn compare_json(original: &Value, rendered: &Value) -> Option<String> {
                     _ => {}
                 }
             }
-            b.keys().find(|k| !a.contains_key(*k)).map(|k| format!("$.{k} (unexpected)"))
+            b.keys()
+                .find(|k| !a.contains_key(*k))
+                .map(|k| format!("$.{k} (unexpected)"))
         }
         _ => (s(original) != s(rendered)).then(|| "$".to_owned()),
     }

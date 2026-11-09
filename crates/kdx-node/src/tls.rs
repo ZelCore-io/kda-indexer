@@ -29,15 +29,27 @@ impl ServerCertVerifier for PinVerifier {
         if got.as_slice() == self.pin {
             Ok(ServerCertVerified::assertion())
         } else {
-            Err(Error::General("certificate fingerprint does not match the pin".into()))
+            Err(Error::General(
+                "certificate fingerprint does not match the pin".into(),
+            ))
         }
     }
 
-    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, Error> {
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, Error> {
         verify_tls12_signature(message, cert, dss, &self.algs)
     }
 
-    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, Error> {
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, Error> {
         verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
@@ -63,6 +75,7 @@ pub fn pinned_client_config(pin: [u8; 32]) -> Result<ClientConfig> {
 pub fn parse_sha256_hex(s: &str) -> Result<[u8; 32]> {
     let clean: String = s.chars().filter(|c| !matches!(c, ':' | ' ')).collect();
     let mut out = [0u8; 32];
-    hex::decode_to_slice(&clean, &mut out).map_err(|e| NodeError::Config(format!("p2p_cert_sha256: {e}")))?;
+    hex::decode_to_slice(&clean, &mut out)
+        .map_err(|e| NodeError::Config(format!("p2p_cert_sha256: {e}")))?;
     Ok(out)
 }

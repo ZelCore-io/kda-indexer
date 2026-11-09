@@ -15,7 +15,10 @@ impl Hash32 {
     /// Strict: unpadded base64url, exactly 43 chars, canonical trailing bits.
     pub fn from_b64url(s: &str) -> Result<Hash32> {
         if s.len() != 43 {
-            return Err(Error::Length { expected: 43, got: s.len() });
+            return Err(Error::Length {
+                expected: 43,
+                got: s.len(),
+            });
         }
         let v = URL_SAFE_NO_PAD
             .decode(s)
@@ -23,9 +26,10 @@ impl Hash32 {
         Hash32::from_slice(&v)
     }
     pub fn from_slice(b: &[u8]) -> Result<Hash32> {
-        let a: [u8; 32] = b
-            .try_into()
-            .map_err(|_| Error::Length { expected: 32, got: b.len() })?;
+        let a: [u8; 32] = b.try_into().map_err(|_| Error::Length {
+            expected: 32,
+            got: b.len(),
+        })?;
         Ok(Hash32(a))
     }
     pub fn to_b64url(&self) -> String {
@@ -66,4 +70,3 @@ pub fn b64url_decode(s: &str) -> Result<Vec<u8>> {
 pub fn b64url_encode(b: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(b)
 }
-

@@ -33,7 +33,12 @@ impl TxKey {
 
 impl fmt::Debug for TxKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TxKey({}/{}/{})", self.height(), self.chain(), self.pos())
+        write!(
+            f,
+            "TxKey({}/{}/{})",
+            self.height(),
+            self.chain(),
+            self.pos()
+        )
     }
 }
-

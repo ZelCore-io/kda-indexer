@@ -56,7 +56,13 @@ pub fn parse_event(e: &Value) -> Option<EventParts<'_>> {
         _ => return None,
     };
     let event_name = format!("{module}.{name}");
-    Some(EventParts { module, event_name, module_hash, params, name })
+    Some(EventParts {
+        module,
+        event_name,
+        module_hash,
+        params,
+        name,
+    })
 }
 
 /// Fungible `TRANSFER`: `[from: str, to: str, amount: number | {"decimal"|"int": ..}]`.
@@ -81,7 +87,11 @@ pub fn transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> 
 
 /// All events canonical, or None (then the events go to `extra`).
 fn parse_events(o: &Map<String, Value>) -> Option<Vec<EventParts<'_>>> {
-    o.get("events")?.as_array()?.iter().map(parse_event).collect()
+    o.get("events")?
+        .as_array()?
+        .iter()
+        .map(parse_event)
+        .collect()
 }
 
 fn intern_output(o: &Value, dict: &mut impl DictMut) {
@@ -102,7 +112,13 @@ fn intern_output(o: &Value, dict: &mut impl DictMut) {
 
 /// Fill the output (CommandResult) part of `r`. `user_hash` is the tx hash for
 /// user txs (whose reqKey must equal it) and None for the coinbase.
-fn fill_output(r: &mut TxRecord, out: &Value, user_hash: Option<Hash32>, dict: &dyn Dict, extra: &mut Map<String, Value>) {
+fn fill_output(
+    r: &mut TxRecord,
+    out: &Value,
+    user_hash: Option<Hash32>,
+    dict: &dyn Dict,
+    extra: &mut Map<String, Value>,
+) {
     let empty = Map::new();
     // decode_block guarantees an object; anything else renders as `{}` plus extra.
     let o = out.as_object().unwrap_or(&empty);
@@ -138,8 +154,12 @@ fn fill_output(r: &mut TxRecord, out: &Value, user_hash: Option<Hash32>, dict: &
                         }
                         r.events.push(EventRec {
                             module: dict.find(DictKind::Module, &ev.module).unwrap_or(u32::MAX),
-                            name: dict.find(DictKind::EventName, &ev.event_name).unwrap_or(u32::MAX),
-                            module_hash: dict.find(DictKind::ModuleHash, ev.module_hash).unwrap_or(u32::MAX),
+                            name: dict
+                                .find(DictKind::EventName, &ev.event_name)
+                                .unwrap_or(u32::MAX),
+                            module_hash: dict
+                                .find(DictKind::ModuleHash, ev.module_hash)
+                                .unwrap_or(u32::MAX),
                             params: value::to_vec(ev.params, dict),
                         });
                     }
@@ -217,7 +237,11 @@ pub fn build_records(b: &DecodedBlock, dict: &mut impl DictMut) -> (BlockRecord,
     let block = BlockRecord {
         hash: h.hash,
         parent: h.parent,
-        adjacents: h.adjacents_order.iter().map(|c| (*c, h.adjacents[c])).collect(),
+        adjacents: h
+            .adjacents_order
+            .iter()
+            .map(|c| (*c, h.adjacents[c]))
+            .collect(),
         chain: h.chain_id,
         height: h.height,
         weight: h.weight,
@@ -235,7 +259,10 @@ pub fn build_records(b: &DecodedBlock, dict: &mut impl DictMut) -> (BlockRecord,
     };
 
     let mut txs = Vec::with_capacity(b.txs.len() + 1);
-    let mut cb = TxRecord { key: TxKey::new(height, h.chain_id, 0), ..TxRecord::default() };
+    let mut cb = TxRecord {
+        key: TxKey::new(height, h.chain_id, 0),
+        ..TxRecord::default()
+    };
     let mut extra = Map::new();
     fill_output(&mut cb, &b.coinbase, None, dict, &mut extra);
     finish_extra(&mut cb, extra, dict);

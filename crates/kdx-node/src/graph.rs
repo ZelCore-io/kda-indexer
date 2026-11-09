@@ -19,7 +19,11 @@ impl ChainGraph {
         let idx = self.history.partition_point(|(h, _)| *h <= height);
         match idx.checked_sub(1) {
             Some(i) => &self.history[i].1,
-            None => self.history.first().map(|(_, c)| c.as_slice()).unwrap_or(&[]),
+            None => self
+                .history
+                .first()
+                .map(|(_, c)| c.as_slice())
+                .unwrap_or(&[]),
         }
     }
 

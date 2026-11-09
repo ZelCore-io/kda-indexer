@@ -65,4 +65,3 @@ pub fn take_array<const N: usize>(buf: &mut &[u8]) -> Result<[u8; N]> {
 pub fn get_u8(buf: &mut &[u8]) -> Result<u8> {
     Ok(take(buf, 1)?[0])
 }
-

@@ -40,7 +40,10 @@ pub trait DictMut: Dict {
 /// One table per kind: ids dense from 0 in first-seen order. Serializes as
 /// `{"Account": [names in id order], ...}`; deserializing rebuilds the reverse maps.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(from = "BTreeMap<DictKind, Vec<String>>", into = "BTreeMap<DictKind, Vec<String>>")]
+#[serde(
+    from = "BTreeMap<DictKind, Vec<String>>",
+    into = "BTreeMap<DictKind, Vec<String>>"
+)]
 pub struct MemDict {
     /// `names[kind as usize][id]`.
     names: [Vec<String>; 5],

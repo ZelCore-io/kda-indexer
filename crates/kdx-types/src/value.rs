@@ -69,7 +69,10 @@ pub fn to_vec(v: &Value, dict: &dyn Dict) -> Vec<u8> {
 pub fn from_slice(mut b: &[u8], dict: &dyn Dict) -> Result<Value> {
     let v = decode(&mut b, dict)?;
     if !b.is_empty() {
-        return Err(Error::Codec(format!("{} trailing bytes after value", b.len())));
+        return Err(Error::Codec(format!(
+            "{} trailing bytes after value",
+            b.len()
+        )));
     }
     Ok(v)
 }
@@ -178,7 +181,9 @@ fn ext(buf: &mut &[u8], n: usize, dict: &dyn Dict) -> Result<Value> {
             let num: Number = serde_json::from_str(t)
                 .map_err(|e| Error::Codec(format!("bad number text {t:?}: {e}")))?;
             if num.to_string() != t {
-                return Err(Error::Codec(format!("number text {t:?} does not round-trip")));
+                return Err(Error::Codec(format!(
+                    "number text {t:?} does not round-trip"
+                )));
             }
             Ok(Value::Number(num))
         }
@@ -189,7 +194,10 @@ fn ext(buf: &mut &[u8], n: usize, dict: &dyn Dict) -> Result<Value> {
             }
             dict.name(DictKind::Account, id)
                 .map(|s| Value::String(s.to_owned()))
-                .ok_or(Error::UnknownDictId { kind: DictKind::Account, id })
+                .ok_or(Error::UnknownDictId {
+                    kind: DictKind::Account,
+                    id,
+                })
         }
         t => Err(Error::Codec(format!("unknown ext type {t}"))),
     }
@@ -209,9 +217,15 @@ mod tests {
         let buf = to_vec(&v, &dict);
         // "acct" stored as ext 2: fixext1 marker 0xd4, type 2, varint id.
         let needle = [b'a', b'c', b'c', b't', 0xd4, EXT_ACCOUNT as u8, id as u8];
-        assert!(buf.windows(needle.len()).any(|w| w == needle), "acct not stored as ext 2");
+        assert!(
+            buf.windows(needle.len()).any(|w| w == needle),
+            "acct not stored as ext 2"
+        );
         let back = from_slice(&buf, &dict).unwrap();
-        assert_eq!(serde_json::to_string(&back).unwrap(), serde_json::to_string(&v).unwrap());
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&v).unwrap()
+        );
         assert_eq!(serde_json::to_string(&back).unwrap(), src);
     }
 }

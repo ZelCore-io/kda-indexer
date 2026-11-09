@@ -81,7 +81,10 @@ pub async fn run(cfg: &Config, smoke: bool, out: Option<PathBuf>) -> anyhow::Res
     let info = client.info().await.context("info")?;
     let matches = info.chainweb_version == cfg.network;
     if !matches {
-        eprintln!("network mismatch: config says {:?}, node /info says {:?}", cfg.network, info.chainweb_version);
+        eprintln!(
+            "network mismatch: config says {:?}, node /info says {:?}",
+            cfg.network, info.chainweb_version
+        );
         std::process::exit(2);
     }
     let graph = kdx_node::ChainGraph::from_info(&info);
@@ -94,7 +97,10 @@ pub async fn run(cfg: &Config, smoke: bool, out: Option<PathBuf>) -> anyhow::Res
     // Sample: the most recent 2000 headers of chain 0, ending just below the tip.
     let hi = tip.saturating_sub(1);
     let lo = hi.saturating_sub(SAMPLE_HEADERS - 1);
-    let headers = client.headers_all(0, lo, hi).await.context("sample headers")?;
+    let headers = client
+        .headers_all(0, lo, hi)
+        .await
+        .context("sample headers")?;
     let mut hashes: Vec<String> = Vec::new();
     for h in &headers {
         if let Some(p) = h.get("payloadHash").and_then(Value::as_str) {
@@ -113,15 +119,24 @@ pub async fn run(cfg: &Config, smoke: bool, out: Option<PathBuf>) -> anyhow::Res
     } else {
         notes.push("no p2p_url configured: P2P fallback not probed".to_string());
     }
-    let block_route = routes.iter().any(|r| r.route == "block" && r.base == "service" && r.ok);
+    let block_route = routes
+        .iter()
+        .any(|r| r.route == "block" && r.base == "service" && r.ok);
 
     // header/branch: expect 10 items between tip-10 (lower) and tip (upper).
-    let seg = client.headers_all(0, tip - 10, tip).await.context("branch sample")?;
+    let seg = client
+        .headers_all(0, tip - 10, tip)
+        .await
+        .context("branch sample")?;
     let branch_items = match (seg.first(), seg.last()) {
         (Some(l), Some(u)) => {
             let lower = vec![l["hash"].as_str().unwrap_or_default().to_string()];
             let upper = vec![u["hash"].as_str().unwrap_or_default().to_string()];
-            client.header_branch(0, &lower, &upper, None, None).await.map(|p| p.items.len()).unwrap_or(0)
+            client
+                .header_branch(0, &lower, &upper, None, None)
+                .await
+                .map(|p| p.items.len())
+                .unwrap_or(0)
         }
         _ => 0,
     };
@@ -138,7 +153,16 @@ pub async fn run(cfg: &Config, smoke: bool, out: Option<PathBuf>) -> anyhow::Res
         config_network_matches: matches,
         node_version: info.node_version.clone(),
         chains_at_tip: graph.chains_at(cut.height).len(),
-        chains_below_graph_change: graph.chains_at(graph.change_heights().get(1).copied().unwrap_or(1).saturating_sub(1)).len(),
+        chains_below_graph_change: graph
+            .chains_at(
+                graph
+                    .change_heights()
+                    .get(1)
+                    .copied()
+                    .unwrap_or(1)
+                    .saturating_sub(1),
+            )
+            .len(),
         routes,
         block_route,
         branch_items,
@@ -147,7 +171,8 @@ pub async fn run(cfg: &Config, smoke: bool, out: Option<PathBuf>) -> anyhow::Res
         batch,
         notes,
     };
-    let path = out.unwrap_or_else(|| PathBuf::from(format!("test-runs/probe-{}.json", cfg.network)));
+    let path =
+        out.unwrap_or_else(|| PathBuf::from(format!("test-runs/probe-{}.json", cfg.network)));
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -165,7 +190,13 @@ fn status_of<T>(r: &Result<T, NodeError>) -> u16 {
 }
 
 fn route(name: &str, base: &str, status: u16, ok: bool, t0: Instant) -> RouteProbe {
-    RouteProbe { route: name.to_string(), base: base.to_string(), status, ok, ms: t0.elapsed().as_millis() as u64 }
+    RouteProbe {
+        route: name.to_string(),
+        base: base.to_string(),
+        status,
+        ok,
+        ms: t0.elapsed().as_millis() as u64,
+    }
 }
 
 /// Request key of the first transaction in a payload-with-outputs value.
@@ -173,7 +204,10 @@ fn first_request_key(payload: &Value) -> Option<String> {
     let txs = payload.get("transactions")?.as_array()?;
     for pair in txs {
         let out_b64 = pair.as_array()?.get(1)?.as_str()?;
-        let bytes = URL_SAFE_NO_PAD.decode(out_b64).or_else(|_| URL_SAFE.decode(out_b64)).ok()?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(out_b64)
+            .or_else(|_| URL_SAFE.decode(out_b64))
+            .ok()?;
         let v: Value = serde_json::from_slice(&bytes).ok()?;
         if let Some(k) = v.get("reqKey").and_then(Value::as_str) {
             return Some(k.to_string());
@@ -182,7 +216,13 @@ fn first_request_key(payload: &Value) -> Option<String> {
     None
 }
 
-async fn probe_routes(c: &NodeClient, base: &str, tip: u64, hashes: &[String], notes: &mut Vec<String>) -> Vec<RouteProbe> {
+async fn probe_routes(
+    c: &NodeClient,
+    base: &str,
+    tip: u64,
+    hashes: &[String],
+    notes: &mut Vec<String>,
+) -> Vec<RouteProbe> {
     let mut out = Vec::new();
     let t = Instant::now();
     let r = c.info().await;
@@ -205,13 +245,27 @@ async fn probe_routes(c: &NodeClient, base: &str, tip: u64, hashes: &[String], n
     let sample: Vec<String> = hashes.iter().take(5).cloned().collect();
     let t = Instant::now();
     let batch = c.payload_batch_raw(0, &sample).await;
-    out.push(route("payload/outputs/batch", base, status_of(&batch), batch.is_ok(), t));
+    out.push(route(
+        "payload/outputs/batch",
+        base,
+        status_of(&batch),
+        batch.is_ok(),
+        t,
+    ));
     let t = Instant::now();
     let single = match sample.first() {
         Some(h) => c.payload_with_outputs(0, h).await,
-        None => Err(NodeError::Missing { hash: String::new() }),
+        None => Err(NodeError::Missing {
+            hash: String::new(),
+        }),
     };
-    out.push(route("payload/{hash}/outputs", base, status_of(&single), single.is_ok(), t));
+    out.push(route(
+        "payload/{hash}/outputs",
+        base,
+        status_of(&single),
+        single.is_ok(),
+        t,
+    ));
     let t = Instant::now();
     let blk = c.block(0, tip - 5, tip - 4).await;
     let (st, ok) = match &blk {
@@ -243,12 +297,22 @@ async fn probe_routes(c: &NodeClient, base: &str, tip: u64, hashes: &[String], n
             let r = c.poll(0, std::slice::from_ref(&k)).await;
             let found = r.as_ref().map(|m| m.contains_key(&k)).unwrap_or(false);
             if r.is_ok() && !found {
-                notes.push(format!("{base}: poll answered 2xx but did not return the known request key"));
+                notes.push(format!(
+                    "{base}: poll answered 2xx but did not return the known request key"
+                ));
             }
-            out.push(route("pact/api/v1/poll", base, status_of(&r), r.is_ok() && found, t));
+            out.push(route(
+                "pact/api/v1/poll",
+                base,
+                status_of(&r),
+                r.is_ok() && found,
+                t,
+            ));
         }
         None => {
-            notes.push(format!("{base}: no transaction found in the sample payloads, poll not probed"));
+            notes.push(format!(
+                "{base}: no transaction found in the sample payloads, poll not probed"
+            ));
             out.push(route("pact/api/v1/poll", base, 0, false, t));
         }
     }
@@ -257,12 +321,22 @@ async fn probe_routes(c: &NodeClient, base: &str, tip: u64, hashes: &[String], n
 
 fn clone_err(e: &NodeError) -> NodeError {
     match e {
-        NodeError::Http { status, body_prefix } => NodeError::Http { status: *status, body_prefix: body_prefix.clone() },
+        NodeError::Http {
+            status,
+            body_prefix,
+        } => NodeError::Http {
+            status: *status,
+            body_prefix: body_prefix.clone(),
+        },
         other => NodeError::Transport(other.to_string()),
     }
 }
 
-async fn probe_batch(c: &NodeClient, hashes: &[String], notes: &mut Vec<String>) -> anyhow::Result<BatchProbe> {
+async fn probe_batch(
+    c: &NodeClient,
+    hashes: &[String],
+    notes: &mut Vec<String>,
+) -> anyhow::Result<BatchProbe> {
     let mut b = BatchProbe::default();
     if hashes.len() < 3 {
         bail!("need at least 3 distinct payload hashes for the batch probe");
@@ -270,9 +344,15 @@ async fn probe_batch(c: &NodeClient, hashes: &[String], notes: &mut Vec<String>)
     let (h1, h2) = (hashes[0].clone(), hashes[1].clone());
 
     // duplicates: [h1, h1, h2]
-    let r = c.payload_batch_raw(0, &[h1.clone(), h1.clone(), h2.clone()]).await.context("duplicate-hash batch")?;
+    let r = c
+        .payload_batch_raw(0, &[h1.clone(), h1.clone(), h2.clone()])
+        .await
+        .context("duplicate-hash batch")?;
     b.dup_entries_returned = r.len();
-    let h1_count = r.iter().filter(|e| e.get("payloadHash").and_then(Value::as_str) == Some(h1.as_str())).count();
+    let h1_count = r
+        .iter()
+        .filter(|e| e.get("payloadHash").and_then(Value::as_str) == Some(h1.as_str()))
+        .count();
     b.dup_hashes_returned_once = h1_count == 1;
 
     // missing: a valid-format random 32-byte hash
@@ -288,21 +368,40 @@ async fn probe_batch(c: &NodeClient, hashes: &[String], notes: &mut Vec<String>)
         Err(e) => format!("error: {e}"),
     };
     // position behaviour: [h1, missing, h2]
-    if let Ok(v) = c.payload_batch_raw(0, &[h1.clone(), missing.clone(), h2.clone()]).await {
-        b.mixed_order_returned = v.iter().map(|e| e.get("payloadHash").and_then(Value::as_str).map(str::to_owned)).collect();
+    if let Ok(v) = c
+        .payload_batch_raw(0, &[h1.clone(), missing.clone(), h2.clone()])
+        .await
+    {
+        b.mixed_order_returned = v
+            .iter()
+            .map(|e| {
+                e.get("payloadHash")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
     }
 
     // size ladder; one request per size, stop at the first non-2xx
     for &n in BATCH_SIZES.iter() {
         if n > hashes.len() {
-            notes.push(format!("batch ladder stopped at {} (only {} distinct hashes in sample)", n, hashes.len()));
+            notes.push(format!(
+                "batch ladder stopped at {} (only {} distinct hashes in sample)",
+                n,
+                hashes.len()
+            ));
             break;
         }
         let t = Instant::now();
         let r = c.payload_batch_raw(0, &hashes[..n]).await;
         let status = status_of(&r);
         let returned = r.as_ref().map(Vec::len).unwrap_or(0);
-        b.attempts.push(BatchAttempt { n, status, returned, ms: t.elapsed().as_millis() as u64 });
+        b.attempts.push(BatchAttempt {
+            n,
+            status,
+            returned,
+            ms: t.elapsed().as_millis() as u64,
+        });
         match r {
             Ok(_) if returned == n => b.max_ok_batch = n as u32,
             Ok(_) => {
@@ -324,15 +423,31 @@ async fn probe_batch(c: &NodeClient, hashes: &[String], notes: &mut Vec<String>)
 }
 
 fn print_summary(r: &ProbeReport, path: &std::path::Path) {
-    println!("network: {} (config match: {})  node {}", r.network_from_info, r.config_network_matches, r.node_version);
-    println!("chains: {} at tip, {} below the graph change", r.chains_at_tip, r.chains_below_graph_change);
+    println!(
+        "network: {} (config match: {})  node {}",
+        r.network_from_info, r.config_network_matches, r.node_version
+    );
+    println!(
+        "chains: {} at tip, {} below the graph change",
+        r.chains_at_tip, r.chains_below_graph_change
+    );
     println!("routes:");
     for x in &r.routes {
-        println!("  {:<8} {:<26} status {:<3} {} ({} ms)", x.base, x.route, x.status, if x.ok { "ok" } else { "FAIL" }, x.ms);
+        println!(
+            "  {:<8} {:<26} status {:<3} {} ({} ms)",
+            x.base,
+            x.route,
+            x.status,
+            if x.ok { "ok" } else { "FAIL" },
+            x.ms
+        );
     }
     println!("block route (B1): {}", r.block_route);
     println!("header/branch items (expect 10): {}", r.branch_items);
-    println!("block page over 1000 heights: {} items, next token: {}", r.block_page_items, r.block_page_has_next);
+    println!(
+        "block page over 1000 heights: {} items, next token: {}",
+        r.block_page_items, r.block_page_has_next
+    );
     let b = &r.batch;
     println!(
         "batch (B11): dup returned once={} ({} entries for [h1,h1,h2]); missing hash: {}; mixed order present flags: {:?}",
@@ -342,9 +457,15 @@ fn print_summary(r: &ProbeReport, path: &std::path::Path) {
         b.mixed_order_returned.iter().map(|o| o.is_some()).collect::<Vec<_>>()
     );
     for a in &b.attempts {
-        println!("  batch {:>5}: status {} returned {} ({} ms)", a.n, a.status, a.returned, a.ms);
+        println!(
+            "  batch {:>5}: status {} returned {} ({} ms)",
+            a.n, a.status, a.returned, a.ms
+        );
     }
-    println!("max ok batch: {}  first fail: {:?} (status {:?}, silent cap {:?})", b.max_ok_batch, b.first_fail_batch, b.fail_status, b.silent_cap_entries);
+    println!(
+        "max ok batch: {}  first fail: {:?} (status {:?}, silent cap {:?})",
+        b.max_ok_batch, b.first_fail_batch, b.fail_status, b.silent_cap_entries
+    );
     for n in &r.notes {
         println!("note: {n}");
     }
@@ -355,15 +476,42 @@ fn print_summary(r: &ProbeReport, path: &std::path::Path) {
 async fn smoke_run(cfg: &Config) -> anyhow::Result<()> {
     let client = super::node_client(cfg)?;
     let info = client.info().await.context("info")?;
-    println!("node version: {} (network {})", info.node_version, info.chainweb_version);
+    println!(
+        "node version: {} (network {})",
+        info.node_version, info.chainweb_version
+    );
     let cut = client.cut().await.context("cut")?;
     let graph = kdx_node::ChainGraph::from_info(&info);
     let tip = cut.hashes.get(&0).context("cut has no chain 0")?.height;
-    println!("chains at tip: {} (cut lists {}), chain 0 tip {}", graph.chains_at(cut.height).len(), cut.hashes.len(), tip);
-    let page = client.headers(0, tip - 20, tip - 10, Some(10), None).await.context("headers")?;
-    println!("header page: {} items, limit {}, next {}", page.items.len(), page.limit, page.next.is_some());
-    let hashes: Vec<String> = page.items.iter().filter_map(|h| h.get("payloadHash").and_then(Value::as_str).map(str::to_owned)).collect();
-    let got = client.payloads_with_outputs(0, &hashes).await.context("payloads")?;
+    println!(
+        "chains at tip: {} (cut lists {}), chain 0 tip {}",
+        graph.chains_at(cut.height).len(),
+        cut.hashes.len(),
+        tip
+    );
+    let page = client
+        .headers(0, tip - 20, tip - 10, Some(10), None)
+        .await
+        .context("headers")?;
+    println!(
+        "header page: {} items, limit {}, next {}",
+        page.items.len(),
+        page.limit,
+        page.next.is_some()
+    );
+    let hashes: Vec<String> = page
+        .items
+        .iter()
+        .filter_map(|h| {
+            h.get("payloadHash")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let got = client
+        .payloads_with_outputs(0, &hashes)
+        .await
+        .context("payloads")?;
     println!("batch: {} requested, {} returned", hashes.len(), got.len());
     println!("SSE: waiting up to 60 s for one BlockHeader event");
     let mut stream = client.header_updates().await.context("header_updates")?;
@@ -371,7 +519,11 @@ async fn smoke_run(cfg: &Config) -> anyhow::Result<()> {
         Ok(Some(ev)) => {
             let ev = ev.context("sse event")?;
             let h = ev.get("header").unwrap_or(&ev);
-            println!("SSE event: chain {} height {}", h.get("chainId").unwrap_or(&Value::Null), h.get("height").unwrap_or(&Value::Null));
+            println!(
+                "SSE event: chain {} height {}",
+                h.get("chainId").unwrap_or(&Value::Null),
+                h.get("height").unwrap_or(&Value::Null)
+            );
         }
         Ok(None) => bail!("SSE stream ended before an event"),
         Err(_) => bail!("no SSE event within 60 s"),

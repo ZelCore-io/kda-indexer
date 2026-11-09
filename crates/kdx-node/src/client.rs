@@ -56,8 +56,15 @@ pub struct NodeClient {
     p2p: Option<Arc<Route>>,
 }
 
-fn build_http(timeout: Option<Duration>, connect_timeout: Duration, tls: Option<rustls::ClientConfig>) -> Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder().user_agent(USER_AGENT).gzip(true).connect_timeout(connect_timeout);
+fn build_http(
+    timeout: Option<Duration>,
+    connect_timeout: Duration,
+    tls: Option<rustls::ClientConfig>,
+) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .gzip(true)
+        .connect_timeout(connect_timeout);
     if let Some(t) = timeout {
         b = b.timeout(t);
     }
@@ -69,7 +76,11 @@ fn build_http(timeout: Option<Duration>, connect_timeout: Duration, tls: Option<
 
 fn build_route(base: Url, timeout: Duration, tls: Option<rustls::ClientConfig>) -> Result<Route> {
     let ct = timeout.min(Duration::from_secs(10));
-    Ok(Route { base, http: build_http(Some(timeout), ct, tls.clone())?, stream_http: build_http(None, ct, tls)? })
+    Ok(Route {
+        base,
+        http: build_http(Some(timeout), ct, tls.clone())?,
+        stream_http: build_http(None, ct, tls)?,
+    })
 }
 
 fn body_prefix(body: &[u8]) -> String {
@@ -77,13 +88,19 @@ fn body_prefix(body: &[u8]) -> String {
 }
 
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T> {
-    serde_json::from_slice(body).map_err(|e| NodeError::Decode(format!("{e}; body starts: {}", body_prefix(body))))
+    serde_json::from_slice(body)
+        .map_err(|e| NodeError::Decode(format!("{e}; body starts: {}", body_prefix(body))))
 }
 
 fn parse_page(v: Value) -> Result<Page<Value>> {
     let mut m = match v {
         Value::Object(m) => m,
-        other => return Err(NodeError::Decode(format!("page is not an object: {}", body_prefix(other.to_string().as_bytes())))),
+        other => {
+            return Err(NodeError::Decode(format!(
+                "page is not an object: {}",
+                body_prefix(other.to_string().as_bytes())
+            )))
+        }
     };
     let items = match m.remove("items") {
         Some(Value::Array(a)) => a,
@@ -98,8 +115,16 @@ impl NodeClient {
     pub fn new(cfg: &NodeClientConfig) -> Result<NodeClient> {
         let route = build_route(cfg.base.clone(), cfg.timeout, None)?;
         let p2p = match (&cfg.p2p_url, &cfg.p2p_cert_sha256) {
-            (Some(url), Some(pin)) => Some(Arc::new(build_route(url.clone(), cfg.timeout, Some(pinned_client_config(*pin)?))?)),
-            (Some(_), None) => return Err(NodeError::Config("p2p_url is set but p2p_cert_sha256 is not".into())),
+            (Some(url), Some(pin)) => Some(Arc::new(build_route(
+                url.clone(),
+                cfg.timeout,
+                Some(pinned_client_config(*pin)?),
+            )?)),
+            (Some(_), None) => {
+                return Err(NodeError::Config(
+                    "p2p_url is set but p2p_cert_sha256 is not".into(),
+                ))
+            }
             _ => None,
         };
         Ok(NodeClient {
@@ -118,7 +143,11 @@ impl NodeClient {
     /// A sibling client that talks to the pinned P2P endpoint. Shares the rate limit,
     /// concurrency, stats and batch limit with `self`. `None` when no P2P endpoint is configured.
     pub fn p2p_client(&self) -> Option<NodeClient> {
-        self.p2p.as_ref().map(|r| NodeClient { route: r.clone(), shared: self.shared.clone(), p2p: None })
+        self.p2p.as_ref().map(|r| NodeClient {
+            route: r.clone(),
+            shared: self.shared.clone(),
+            p2p: None,
+        })
     }
 
     pub fn base(&self) -> &Url {
@@ -140,7 +169,15 @@ impl NodeClient {
     /// Request counters per endpoint and status.
     pub fn stats(&self) -> Vec<StatRow> {
         let g = self.shared.stats.lock().unwrap();
-        let mut v: Vec<StatRow> = g.iter().map(|((e, s), (c, t))| StatRow { endpoint: e.clone(), status: *s, count: *c, total_secs: *t }).collect();
+        let mut v: Vec<StatRow> = g
+            .iter()
+            .map(|((e, s), (c, t))| StatRow {
+                endpoint: e.clone(),
+                status: *s,
+                count: *c,
+                total_secs: *t,
+            })
+            .collect();
         v.sort_by(|a, b| (&a.endpoint, a.status).cmp(&(&b.endpoint, b.status)));
         v
     }
@@ -166,13 +203,22 @@ impl NodeClient {
 
     /// Send with rate limit, concurrency cap and retries (3 attempts, 0.5/1/2 s backoff on
     /// timeout, connect error and 5xx; never on 4xx). Returns status and body for any HTTP status.
-    async fn send(&self, endpoint: &'static str, build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
+    async fn send(
+        &self,
+        endpoint: &'static str,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<(u16, Bytes)> {
         let mut last: Option<NodeError> = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 << (attempt - 1))).await;
             }
-            let _permit = self.shared.sem.acquire().await.map_err(|_| NodeError::Transport("semaphore closed".into()))?;
+            let _permit = self
+                .shared
+                .sem
+                .acquire()
+                .await
+                .map_err(|_| NodeError::Transport("semaphore closed".into()))?;
             self.shared.limiter.acquire().await;
             let t0 = Instant::now();
             let res = build(&self.route.http).send().await;
@@ -180,7 +226,11 @@ impl NodeClient {
                 Ok(r) => r,
                 Err(e) => {
                     self.record(endpoint, 0, t0.elapsed().as_secs_f64());
-                    let err = if e.is_timeout() { NodeError::Timeout } else { NodeError::Transport(e.to_string()) };
+                    let err = if e.is_timeout() {
+                        NodeError::Timeout
+                    } else {
+                        NodeError::Transport(e.to_string())
+                    };
                     if e.is_timeout() || e.is_connect() || e.is_request() {
                         tracing::debug!(endpoint, attempt, error = %err, "node request failed, retrying");
                         last = Some(err);
@@ -194,13 +244,20 @@ impl NodeClient {
                 Ok(b) => b,
                 Err(e) => {
                     self.record(endpoint, 0, t0.elapsed().as_secs_f64());
-                    last = Some(if e.is_timeout() { NodeError::Timeout } else { NodeError::Transport(e.to_string()) });
+                    last = Some(if e.is_timeout() {
+                        NodeError::Timeout
+                    } else {
+                        NodeError::Transport(e.to_string())
+                    });
                     continue;
                 }
             };
             self.record(endpoint, status, t0.elapsed().as_secs_f64());
             if status >= 500 && attempt < 2 {
-                last = Some(NodeError::Http { status, body_prefix: body_prefix(&body) });
+                last = Some(NodeError::Http {
+                    status,
+                    body_prefix: body_prefix(&body),
+                });
                 continue;
             }
             return Ok((status, body));
@@ -209,10 +266,17 @@ impl NodeClient {
     }
 
     /// `send` + 2xx check + JSON decode.
-    async fn json(&self, endpoint: &'static str, build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder) -> Result<Value> {
+    async fn json(
+        &self,
+        endpoint: &'static str,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Value> {
         let (status, body) = self.send(endpoint, build).await?;
         if !(200..300).contains(&status) {
-            return Err(NodeError::Http { status, body_prefix: body_prefix(&body) });
+            return Err(NodeError::Http {
+                status,
+                body_prefix: body_prefix(&body),
+            });
         }
         decode(&body)
     }
@@ -222,7 +286,8 @@ impl NodeClient {
         let url = self.root_url("info");
         let raw = self.json("info", |h| h.get(url.clone())).await?;
         let s = |k: &str| raw.get(k).and_then(Value::as_str).map(str::to_owned);
-        let chainweb_version = s("nodeVersion").ok_or_else(|| NodeError::Decode("info: no nodeVersion".into()))?;
+        let chainweb_version =
+            s("nodeVersion").ok_or_else(|| NodeError::Decode("info: no nodeVersion".into()))?;
         let node_version = s("nodePackageVersion").unwrap_or_default();
         // [[startHeight, [[chain, [adjacents]], ...]], ...] (the node lists newest first)
         let hist = raw
@@ -236,12 +301,20 @@ impl NodeClient {
                 .as_array()
                 .and_then(|a| Some((a.first()?.as_u64()?, a.get(1)?.as_array()?)))
                 .ok_or_else(|| NodeError::Decode("info: bad graph history entry".into()))?;
-            let mut ids: Vec<u8> = chains.iter().filter_map(|c| c.as_array()?.first()?.as_u64().map(|n| n as u8)).collect();
+            let mut ids: Vec<u8> = chains
+                .iter()
+                .filter_map(|c| c.as_array()?.first()?.as_u64().map(|n| n as u8))
+                .collect();
             ids.sort_unstable();
             graph_history.push((h, ids));
         }
         graph_history.sort_by_key(|(h, _)| *h);
-        Ok(NodeInfo { node_version, chainweb_version, graph_history, raw })
+        Ok(NodeInfo {
+            node_version,
+            chainweb_version,
+            graph_history,
+            raw,
+        })
     }
 
     pub async fn chain_graph(&self) -> Result<ChainGraph> {
@@ -252,30 +325,64 @@ impl NodeClient {
     pub async fn cut(&self) -> Result<Cut> {
         let url = self.net_url("cut");
         let v = self.json("cut", |h| h.get(url.clone())).await?;
-        let hashes_v = v.get("hashes").and_then(Value::as_object).ok_or_else(|| NodeError::Decode("cut: no hashes".into()))?;
+        let hashes_v = v
+            .get("hashes")
+            .and_then(Value::as_object)
+            .ok_or_else(|| NodeError::Decode("cut: no hashes".into()))?;
         let mut hashes = BTreeMap::new();
         for (k, e) in hashes_v {
-            let chain: u8 = k.parse().map_err(|_| NodeError::Decode(format!("cut: bad chain id {k}")))?;
-            let height = e.get("height").and_then(Value::as_u64).ok_or_else(|| NodeError::Decode("cut: bad height".into()))?;
-            let hash = e.get("hash").and_then(Value::as_str).ok_or_else(|| NodeError::Decode("cut: bad hash".into()))?.to_string();
+            let chain: u8 = k
+                .parse()
+                .map_err(|_| NodeError::Decode(format!("cut: bad chain id {k}")))?;
+            let height = e
+                .get("height")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| NodeError::Decode("cut: bad height".into()))?;
+            let hash = e
+                .get("hash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| NodeError::Decode("cut: bad hash".into()))?
+                .to_string();
             hashes.insert(chain, CutEntry { height, hash });
         }
         let height = v.get("height").and_then(Value::as_u64).unwrap_or(0);
-        let weight = v.get("weight").and_then(Value::as_str).unwrap_or_default().to_string();
-        Ok(Cut { hashes, height, weight })
+        let weight = v
+            .get("weight")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(Cut {
+            hashes,
+            height,
+            weight,
+        })
     }
 
     /// `GET /chain/{c}/header?minheight&maxheight&limit&next` (object encoding).
-    pub async fn headers(&self, chain: u8, min: u64, max: u64, limit: Option<u32>, next: Option<&str>) -> Result<Page<Value>> {
+    pub async fn headers(
+        &self,
+        chain: u8,
+        min: u64,
+        max: u64,
+        limit: Option<u32>,
+        next: Option<&str>,
+    ) -> Result<Page<Value>> {
         let url = self.chain_url(chain, "header");
-        let mut q: Vec<(&str, String)> = vec![("minheight", min.to_string()), ("maxheight", max.to_string())];
+        let mut q: Vec<(&str, String)> = vec![
+            ("minheight", min.to_string()),
+            ("maxheight", max.to_string()),
+        ];
         if let Some(l) = limit {
             q.push(("limit", l.to_string()));
         }
         if let Some(n) = next {
             q.push(("next", n.to_string()));
         }
-        let v = self.json("header", |h| h.get(url.clone()).query(&q).header("Accept", HEADER_ACCEPT)).await?;
+        let v = self
+            .json("header", |h| {
+                h.get(url.clone()).query(&q).header("Accept", HEADER_ACCEPT)
+            })
+            .await?;
         parse_page(v)
     }
 
@@ -294,7 +401,14 @@ impl NodeClient {
     }
 
     /// `POST /chain/{c}/header/branch`.
-    pub async fn header_branch(&self, chain: u8, lower: &[String], upper: &[String], min: Option<u64>, max: Option<u64>) -> Result<Page<Value>> {
+    pub async fn header_branch(
+        &self,
+        chain: u8,
+        lower: &[String],
+        upper: &[String],
+        min: Option<u64>,
+        max: Option<u64>,
+    ) -> Result<Page<Value>> {
         let url = self.chain_url(chain, "header/branch");
         let mut q: Vec<(&str, String)> = Vec::new();
         if let Some(m) = min {
@@ -304,7 +418,14 @@ impl NodeClient {
             q.push(("maxheight", m.to_string()));
         }
         let body = json!({ "lower": lower, "upper": upper });
-        let v = self.json("header_branch", |h| h.post(url.clone()).query(&q).header("Accept", HEADER_ACCEPT).json(&body)).await?;
+        let v = self
+            .json("header_branch", |h| {
+                h.post(url.clone())
+                    .query(&q)
+                    .header("Accept", HEADER_ACCEPT)
+                    .json(&body)
+            })
+            .await?;
         parse_page(v)
     }
 
@@ -312,7 +433,9 @@ impl NodeClient {
     /// fewer than requested; callers map by `payloadHash`.
     pub async fn payload_batch_raw(&self, chain: u8, hashes: &[String]) -> Result<Vec<Value>> {
         let url = self.chain_url(chain, "payload/outputs/batch");
-        let v = self.json("payload_batch", |h| h.post(url.clone()).json(&hashes)).await?;
+        let v = self
+            .json("payload_batch", |h| h.post(url.clone()).json(&hashes))
+            .await?;
         match v {
             Value::Array(a) => Ok(a),
             _ => Err(NodeError::Decode("payload batch: not an array".into())),
@@ -327,9 +450,17 @@ impl NodeClient {
 
     /// Payloads with outputs for `hashes`, keyed by `payloadHash`. Input is deduplicated and
     /// chunked by `batch_limit`; hashes absent from a batch response are refetched singly.
-    pub async fn payloads_with_outputs(&self, chain: u8, hashes: &[String]) -> Result<HashMap<String, Value>> {
+    pub async fn payloads_with_outputs(
+        &self,
+        chain: u8,
+        hashes: &[String],
+    ) -> Result<HashMap<String, Value>> {
         let mut seen = HashSet::new();
-        let uniq: Vec<String> = hashes.iter().filter(|h| seen.insert(h.as_str())).cloned().collect();
+        let uniq: Vec<String> = hashes
+            .iter()
+            .filter(|h| seen.insert(h.as_str()))
+            .cloned()
+            .collect();
         let mut out: HashMap<String, Value> = HashMap::with_capacity(uniq.len());
         for chunk in uniq.chunks(self.batch_limit() as usize) {
             for entry in self.payload_batch_raw(chain, chunk).await? {
@@ -355,14 +486,26 @@ impl NodeClient {
     /// `GET /chain/{c}/block?minheight&maxheight` (header and payload in one call). `None` on 404.
     pub async fn block(&self, chain: u8, min: u64, max: u64) -> Result<Option<Page<Value>>> {
         let url = self.chain_url(chain, "block");
-        let q = [("minheight", min.to_string()), ("maxheight", max.to_string())];
+        let q = [
+            ("minheight", min.to_string()),
+            ("maxheight", max.to_string()),
+        ];
         // The block route answers 406 to the blockheader-encoding Accept parameter; it already
         // returns object-encoded headers, so ask for plain JSON.
-        let (status, body) = self.send("block", |h| h.get(url.clone()).query(&q).header("Accept", "application/json")).await?;
+        let (status, body) = self
+            .send("block", |h| {
+                h.get(url.clone())
+                    .query(&q)
+                    .header("Accept", "application/json")
+            })
+            .await?;
         match status {
             404 => Ok(None),
             200..=299 => Ok(Some(parse_page(decode(&body)?)?)),
-            _ => Err(NodeError::Http { status, body_prefix: body_prefix(&body) }),
+            _ => Err(NodeError::Http {
+                status,
+                body_prefix: body_prefix(&body),
+            }),
         }
     }
 
@@ -370,7 +513,10 @@ impl NodeClient {
     pub async fn poll(&self, chain: u8, request_keys: &[String]) -> Result<Map<String, Value>> {
         let url = self.chain_url(chain, "pact/api/v1/poll");
         let body = json!({ "requestKeys": request_keys });
-        match self.json("poll", |h| h.post(url.clone()).json(&body)).await? {
+        match self
+            .json("poll", |h| h.post(url.clone()).json(&body))
+            .await?
+        {
             Value::Object(m) => Ok(m),
             _ => Err(NodeError::Decode("poll: not an object".into())),
         }
@@ -384,9 +530,16 @@ impl NodeClient {
 
     /// `GET /header/updates` (SSE). Yields the JSON payload of each `BlockHeader` event and
     /// ends when the connection drops; the caller reconnects.
-    pub async fn header_updates(&self) -> Result<Pin<Box<dyn Stream<Item = Result<Value>> + Send>>> {
+    pub async fn header_updates(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Value>> + Send>>> {
         let url = self.net_url("header/updates");
-        let _p = self.shared.sem.acquire().await.map_err(|_| NodeError::Transport("semaphore closed".into()))?;
+        let _p = self
+            .shared
+            .sem
+            .acquire()
+            .await
+            .map_err(|_| NodeError::Transport("semaphore closed".into()))?;
         self.shared.limiter.acquire().await;
         let t0 = Instant::now();
         let resp = self
@@ -396,12 +549,21 @@ impl NodeClient {
             .header("Accept", "text/event-stream")
             .send()
             .await
-            .map_err(|e| if e.is_timeout() { NodeError::Timeout } else { NodeError::Transport(e.to_string()) })?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    NodeError::Timeout
+                } else {
+                    NodeError::Transport(e.to_string())
+                }
+            })?;
         let status = resp.status().as_u16();
         self.record("header_updates", status, t0.elapsed().as_secs_f64());
         if !resp.status().is_success() {
             let b = resp.bytes().await.unwrap_or_default();
-            return Err(NodeError::Http { status, body_prefix: body_prefix(&b) });
+            return Err(NodeError::Http {
+                status,
+                body_prefix: body_prefix(&b),
+            });
         }
         Ok(header_events(Box::pin(resp.bytes_stream())))
     }

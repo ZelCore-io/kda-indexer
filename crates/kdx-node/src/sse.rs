@@ -63,7 +63,12 @@ pub fn header_events(body: ByteStream) -> Pin<Box<dyn Stream<Item = Result<Value
         pending: std::collections::VecDeque<Result<Value>>,
         done: bool,
     }
-    let st = State { body, parser: SseParser::default(), pending: Default::default(), done: false };
+    let st = State {
+        body,
+        parser: SseParser::default(),
+        pending: Default::default(),
+        done: false,
+    };
     Box::pin(stream::unfold(st, |mut st| async move {
         loop {
             if let Some(item) = st.pending.pop_front() {
@@ -81,7 +86,10 @@ pub fn header_events(body: ByteStream) -> Pin<Box<dyn Stream<Item = Result<Value
                 Some(Ok(chunk)) => {
                     for (event, data) in st.parser.push(&chunk) {
                         if event == "BlockHeader" {
-                            st.pending.push_back(serde_json::from_str(&data).map_err(|e| NodeError::Decode(e.to_string())));
+                            st.pending.push_back(
+                                serde_json::from_str(&data)
+                                    .map_err(|e| NodeError::Decode(e.to_string())),
+                            );
                         }
                     }
                 }
