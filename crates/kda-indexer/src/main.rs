@@ -103,8 +103,12 @@ enum Command {
     Unwind {
         #[arg(long)]
         chain: u8,
+        /// Undo the chain's hot blocks above this height.
         #[arg(long)]
-        to: u32,
+        to: Option<u32>,
+        /// Clear the chain's halted state (after a reorg deeper than the finality depth).
+        #[arg(long)]
+        clear_halt: bool,
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
@@ -319,12 +323,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Unwind {
             chain,
             to,
+            clear_halt,
             data_dir,
         } => kda_indexer::cmd::unwind::run(
             &cfg,
             data_dir.as_deref().unwrap_or(&cfg.data_dir),
             chain,
             to,
+            clear_halt,
         ),
         Command::Segments { action } => match action {
             SegmentsAction::List { data_dir, json } => {
