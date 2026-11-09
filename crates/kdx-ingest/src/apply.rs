@@ -45,6 +45,27 @@ pub struct Batch {
     pub halted: bool,
 }
 
+/// A block that cannot be indexed (decode/build failure). The writer halts only its chain
+/// (review M6); every other commit error stops the tail.
+#[derive(Debug)]
+pub struct PoisonBlock {
+    pub chain: u8,
+    pub height: u64,
+    pub msg: String,
+}
+
+impl std::fmt::Display for PoisonBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "chain {} height {}: {}",
+            self.chain, self.height, self.msg
+        )
+    }
+}
+
+impl std::error::Error for PoisonBlock {}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CommitStats {
     pub blocks: u64,
@@ -60,6 +81,11 @@ fn bump_max(txn: &mut RwTxn<'_>, name: &str, v: i64) -> Result<()> {
         txn.add_counter(name, v - cur)?;
     }
     Ok(())
+}
+
+/// Dev check of the poison-block path: `KDX_DEBUG_POISON=chain:height` fails that block.
+fn debug_poison(chain: u8, height: u64) -> bool {
+    std::env::var("KDX_DEBUG_POISON").is_ok_and(|v| v == format!("{chain}:{height}"))
 }
 
 /// Apply `batches` in order in one txn and commit it. On any error the in-memory dictionary
@@ -100,7 +126,19 @@ fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<Com
             st.undone += n;
         }
         for p in &b.blocks {
-            let ib = pipeline::index(p, &mut *dict)?;
+            if debug_poison(b.chain, p.0.header.height) {
+                return Err(PoisonBlock {
+                    chain: b.chain,
+                    height: p.0.header.height,
+                    msg: "KDX_DEBUG_POISON".into(),
+                }
+                .into());
+            }
+            let ib = pipeline::index(p, &mut *dict).map_err(|e| PoisonBlock {
+                chain: b.chain,
+                height: p.0.header.height,
+                msg: format!("{e:#}"),
+            })?;
             kdx_hot::tail::apply(&mut txn, &ib, dict).with_context(|| {
                 format!("apply chain {} height {}", ib.block.chain, ib.block.height)
             })?;

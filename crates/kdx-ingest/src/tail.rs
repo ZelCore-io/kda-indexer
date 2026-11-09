@@ -4,7 +4,7 @@
 //! `CATCHUP_HEIGHTS` per round), decodes it and sends it to the single writer, which commits
 //! one MDBX txn per `commit_ms` / `commit_blocks`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -263,7 +263,18 @@ async fn follower(
 
 /// The single writer: buffers batches, commits per `commit_ms` / `commit_blocks`, drains the
 /// queue on shutdown.
-async fn writer(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Batch>) -> Result<()> {
+///
+/// A block that cannot be indexed (`apply::PoisonBlock`) halts only its chain: the follower is
+/// stopped, `halted.<chain>` is counted and the other chains' batches are committed again.
+/// Any other error cancels `shutdown` (followers, feeders and the caller's freezer stop) and
+/// is returned.
+async fn writer(
+    ctx: Arc<Ctx>,
+    mut rx: mpsc::Receiver<Batch>,
+    shutdown: CancellationToken,
+    stops: BTreeMap<u8, CancellationToken>,
+) -> Result<()> {
+    let mut poisoned: BTreeSet<u8> = BTreeSet::new();
     let max_wait = Duration::from_millis(ctx.opts.commit_ms.max(1));
     let max_blocks = ctx.opts.commit_blocks.max(1) as usize;
     let mut buf: Vec<Batch> = Vec::new();
@@ -282,6 +293,7 @@ async fn writer(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Batch>) -> Result<()> {
             Some(rx.recv().await)
         };
         match got {
+            Some(Some(b)) if poisoned.contains(&b.chain) => continue,
             Some(Some(b)) => {
                 nblocks += b.blocks.len();
                 first_at.get_or_insert_with(Instant::now);
@@ -296,9 +308,34 @@ async fn writer(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Batch>) -> Result<()> {
         if buf.is_empty() {
             continue;
         }
-        let batches = std::mem::take(&mut buf);
+        let mut batches = std::mem::take(&mut buf);
         let c = ctx.clone();
-        let st = tokio::task::block_in_place(|| apply::commit(&c, &batches))?;
+        let st = loop {
+            let err = match tokio::task::block_in_place(|| apply::commit(&c, &batches)) {
+                Ok(st) => break st,
+                Err(e) => e,
+            };
+            let Some(p) = err
+                .downcast_ref::<apply::PoisonBlock>()
+                .filter(|p| !poisoned.contains(&p.chain))
+            else {
+                shutdown.cancel();
+                return Err(err.context("tail writer"));
+            };
+            let chain = p.chain;
+            tracing::error!(chain, height = p.height, error = %err, "tail: block cannot be indexed; halting this chain (Counters halted.{chain})");
+            poisoned.insert(chain);
+            if let Some(t) = stops.get(&chain) {
+                t.cancel();
+            }
+            batches.retain(|b| b.chain != chain);
+            batches.push(Batch {
+                chain,
+                fork: None,
+                blocks: Vec::new(),
+                halted: true,
+            });
+        };
         nblocks = 0;
         first_at = None;
         tot_blocks += st.blocks;
@@ -395,8 +432,12 @@ pub async fn run(ctx: Arc<Ctx>, shutdown: CancellationToken) -> Result<()> {
     let sse = tokio::spawn(sse_task(ctx.clone(), senders.clone(), feeders.clone()));
     let poll = tokio::spawn(cut_task(ctx.clone(), senders, feeders.clone()));
 
+    let stops: BTreeMap<u8, CancellationToken> = views
+        .iter()
+        .map(|v| (v.chain, shutdown.child_token()))
+        .collect();
     let (btx, brx) = mpsc::channel(QUEUE);
-    let w = tokio::spawn(writer(ctx.clone(), brx));
+    let w = tokio::spawn(writer(ctx.clone(), brx, shutdown.clone(), stops.clone()));
     // Dev forced-reorg check: `KDX_DEBUG_FEED=chain:height:hash` makes that chain's first
     // round follow the given (orphan) header; the next round meets the canonical branch and
     // goes through the normal reorg path.
@@ -417,12 +458,13 @@ pub async fn run(ctx: Arc<Ctx>, shutdown: CancellationToken) -> Result<()> {
             .as_ref()
             .filter(|f| f.0 == v.chain)
             .map(|f| (f.1, f.2.clone()));
+        let stop = stops[&v.chain].clone();
         fs.push(tokio::spawn(follower(
             ctx.clone(),
             v,
             rx,
             btx.clone(),
-            shutdown.clone(),
+            stop,
             fd,
         )));
     }
@@ -438,7 +480,8 @@ pub async fn run(ctx: Arc<Ctx>, shutdown: CancellationToken) -> Result<()> {
     feeders.cancel();
     let _ = sse.await;
     let _ = poll.await;
-    // All senders are gone: the writer drains and commits what it holds.
+    // All senders are gone: the writer drains and commits what it holds. Its error comes
+    // first: a follower's send error is only a consequence of it.
     w.await??;
     match err {
         Some(e) => Err(e),
