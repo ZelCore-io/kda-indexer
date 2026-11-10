@@ -132,34 +132,104 @@ fn bucket_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Overflow key: the /24 of an IPv4 address, the /48 of an IPv6 address (a typical site
+/// allocation), so a client can drain only its own prefix's overflow share.
+fn overflow_key(ip: IpAddr) -> IpAddr {
+    match bucket_key(ip) {
+        IpAddr::V4(v4) => IpAddr::V4(Ipv4Addr::from(mask4(v4, 24))),
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(mask6(v6, 48))),
+    }
+}
+
+/// A capped table of token buckets.
 struct Buckets {
     /// key -> (tokens, last refill, insertion sequence)
     map: HashMap<IpAddr, (f64, Instant, u64)>,
-    /// Keys in insertion order with their sequence; stale pairs (key evicted and re-added)
-    /// are skipped on eviction.
+    /// Keys in insertion order with their sequence; pairs whose key was evicted and
+    /// re-added are skipped on eviction.
     order: VecDeque<(IpAddr, u64)>,
     seq: u64,
-    /// Shared bucket charged for keys created by evicting a non-full bucket.
-    overflow: Option<(f64, Instant)>,
+    cap: usize,
 }
 
 /// Queue entries looked at per insert for a refilled bucket to evict.
 const EVICT_SCAN: usize = 16;
 
-/// Per-IP token bucket: `rate` tokens per second, at most `burst`. At most `cap` buckets;
-/// a new key over the cap evicts a refilled (full) bucket among the oldest few, else the
-/// oldest one. Evicting a full bucket loses nothing; when a non-full one had to go, the new
-/// key starts empty and its first token comes from a shared overflow bucket, so cycling
-/// keys through the table never refills a drained key. O(1) per insert, no full scan.
+impl Buckets {
+    fn new(cap: usize) -> Buckets {
+        Buckets {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            seq: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    /// Evict one bucket: a refilled one among the first `EVICT_SCAN` queue entries (others
+    /// rotate to the back), else the oldest. True when a non-full bucket was evicted.
+    fn make_room(&mut self, now: Instant, rate: f64, burst: f64) -> bool {
+        for _ in 0..EVICT_SCAN {
+            let Some((k, seq)) = self.order.pop_front() else {
+                break;
+            };
+            let Some(&(t, at, s)) = self.map.get(&k) else {
+                continue;
+            };
+            if s != seq {
+                continue;
+            }
+            if t + now.saturating_duration_since(at).as_secs_f64() * rate >= burst {
+                self.map.remove(&k);
+                return false;
+            }
+            self.order.push_back((k, seq));
+        }
+        while let Some((k, seq)) = self.order.pop_front() {
+            if self.map.get(&k).is_some_and(|e| e.2 == seq) {
+                self.map.remove(&k);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The refilled bucket of `key`, created when absent. A bucket created by evicting a
+    /// non-full one starts empty (`true` returned): eviction never refills a drained key.
+    fn bucket(&mut self, key: IpAddr, now: Instant, rate: f64, burst: f64) -> (&mut f64, bool) {
+        let mut pressured = false;
+        if !self.map.contains_key(&key) {
+            if self.map.len() >= self.cap {
+                pressured = self.make_room(now, rate, burst);
+            }
+            self.seq += 1;
+            let start = if pressured { 0.0 } else { burst };
+            self.map.insert(key, (start, now, self.seq));
+            self.order.push_back((key, self.seq));
+        }
+        let (tokens, at, _) = self.map.get_mut(&key).expect("inserted above");
+        *tokens = (*tokens + now.saturating_duration_since(*at).as_secs_f64() * rate).min(burst);
+        *at = now;
+        (tokens, pressured)
+    }
+}
+
+/// Per-IP token bucket: `rate` tokens per second, at most `burst`, keyed by
+/// [`bucket_key`]. At most `cap` buckets; a new key over the cap evicts a refilled (full)
+/// bucket among the oldest few, else the oldest one. Evicting a full bucket loses nothing;
+/// when a non-full one had to go, the new key starts empty and its first token comes from
+/// the overflow bucket of its prefix ([`overflow_key`], own capped table, same rule), so
+/// cycling keys never refills a drained key and draining overflow hurts only that prefix.
+/// O(1) per request, no full scan.
 pub struct RateLimiter {
     rate: f64,
     burst: f64,
-    cap: usize,
-    buckets: Mutex<Buckets>,
+    tables: Mutex<(Buckets, Buckets)>,
 }
 
-/// Buckets kept before the oldest are evicted.
+/// Buckets kept before eviction.
 const MAX_BUCKETS: usize = 65_536;
+/// Overflow (prefix) buckets kept before eviction.
+const MAX_OVERFLOW: usize = 4_096;
 
 impl RateLimiter {
     pub fn new(rate: u32, burst: u32) -> RateLimiter {
@@ -170,21 +240,19 @@ impl RateLimiter {
         RateLimiter {
             rate: rate.max(1) as f64,
             burst: burst.max(1) as f64,
-            cap: cap.max(1),
-            buckets: Mutex::new(Buckets {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-                seq: 0,
-                overflow: None,
-            }),
+            tables: Mutex::new((
+                Buckets::new(cap),
+                Buckets::new(MAX_OVERFLOW.min(cap.max(16))),
+            )),
         }
     }
 
-    /// Buckets held.
+    /// Buckets held (not counting overflow buckets).
     pub fn len(&self) -> usize {
-        self.buckets
+        self.tables
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .0
             .map
             .len()
     }
@@ -193,68 +261,21 @@ impl RateLimiter {
         self.len() == 0
     }
 
-    /// Evict one bucket: a refilled one among the first `EVICT_SCAN` queue entries (others
-    /// rotate to the back), else the oldest. True when a non-full bucket was evicted.
-    fn make_room(&self, b: &mut Buckets, now: Instant) -> bool {
-        for _ in 0..EVICT_SCAN {
-            let Some((k, seq)) = b.order.pop_front() else {
-                break;
-            };
-            let Some(&(t, at, s)) = b.map.get(&k) else {
-                continue;
-            };
-            if s != seq {
-                continue;
-            }
-            if t + now.saturating_duration_since(at).as_secs_f64() * self.rate >= self.burst {
-                b.map.remove(&k);
-                return false;
-            }
-            b.order.push_back((k, seq));
-        }
-        while let Some((k, seq)) = b.order.pop_front() {
-            if b.map.get(&k).is_some_and(|e| e.2 == seq) {
-                b.map.remove(&k);
-                return true;
-            }
-        }
-        false
-    }
-
     /// Take one token for `ip`; false when the bucket is empty.
     pub fn allow(&self, ip: IpAddr) -> bool {
         self.allow_at(ip, Instant::now())
     }
 
     fn allow_at(&self, ip: IpAddr, now: Instant) -> bool {
-        let key = bucket_key(ip);
-        let mut g = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        let b = &mut *g;
-        let mut pressured = false;
-        if !b.map.contains_key(&key) {
-            if b.map.len() >= self.cap {
-                pressured = self.make_room(b, now);
-            }
-            b.seq += 1;
-            let start = if pressured { 0.0 } else { self.burst };
-            b.map.insert(key, (start, now, b.seq));
-            b.order.push_back((key, b.seq));
-        }
-        let (tokens, at, _) = b.map.get_mut(&key).expect("inserted above");
-        *tokens = (*tokens + now.saturating_duration_since(*at).as_secs_f64() * self.rate)
-            .min(self.burst);
-        *at = now;
-        if pressured {
-            let (t, at) = b.overflow.get_or_insert((self.burst, now));
-            *t =
-                (*t + now.saturating_duration_since(*at).as_secs_f64() * self.rate).min(self.burst);
-            *at = now;
-            if *t >= 1.0 {
-                *t -= 1.0;
-                return true;
-            }
-            return false;
-        }
+        let (rate, burst) = (self.rate, self.burst);
+        let mut g = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let (main, over) = &mut *g;
+        let (tokens, pressured) = main.bucket(bucket_key(ip), now, rate, burst);
+        let tokens = if pressured {
+            over.bucket(overflow_key(ip), now, rate, burst).0
+        } else {
+            tokens
+        };
         if *tokens >= 1.0 {
             *tokens -= 1.0;
             true
@@ -412,6 +433,31 @@ mod tests {
         assert!(!r.allow_at(ip(1), t0), "1 came back empty");
         assert!(!r.allow_at(ip(4), t0), "overflow drained");
         assert!(!r.allow_at(ip(2), t0));
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn overflow_is_per_prefix() {
+        let r = RateLimiter::with_cap(1, 2, 2);
+        let t0 = Instant::now();
+        let v6 = |s: &str| s.parse::<IpAddr>().unwrap();
+        // The attacker fills the table with drained /64s of 2001:db8:aaaa::/48.
+        for k in ["2001:db8:aaaa:1::1", "2001:db8:aaaa:2::1"] {
+            while r.allow_at(v6(k), t0) {}
+        }
+        // Rotating /64s inside one /48 gets at most that /48's overflow burst.
+        let served = (0..100u16)
+            .filter(|n| {
+                r.allow_at(
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xaaaa, 0x100 + n, 0, 0, 0, 1)),
+                    t0,
+                )
+            })
+            .count();
+        assert_eq!(served, 2);
+        // A client from another /48 is still served under the same pressure.
+        assert!(r.allow_at(v6("2001:db8:cccc:1::1"), t0));
+        assert!(r.allow_at(v6("2001:db8:dddd:1::1"), t0));
         assert_eq!(r.len(), 2);
     }
 
