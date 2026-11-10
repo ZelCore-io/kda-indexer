@@ -34,6 +34,9 @@ const WORKERS: usize = 3;
 const KDA_TXS_LIMIT_MS: u64 = 29_000;
 /// At most this many A-only account rows are checked against chainweb-data's /txs/tx.
 const GAP_CHECKS: usize = 5;
+/// At most this many oracle rows per compare are checked as orphans against the node (seen
+/// live: 13 chainweb-data orphan rows in one 3-page account answer).
+const ORPHAN_CHECKS: usize = 50;
 /// JSON path of the visible allowlist hit for rows missing from chainweb-data's transfers.
 const CWD_TRANSFERS_GAP_PATH: &str = "/~cwd-transfers-gap";
 
@@ -45,16 +48,19 @@ const ORACLE_LAG_PATH: &str = "/~oracle-lag";
 const ORACLE_UNSTABLE_PATH: &str = "/~oracle-unstable";
 /// JSON path of the visible allowlist hit for the oldest height cut at a `/v1/txs` limit.
 const LIMIT_EDGE_PATH: &str = "/~limit-edge";
-/// Heights below a chainweb-data tip (max height on its `/txs/recent`) that still count as
-/// possibly not indexed there: chains run a few heights apart.
-const ORACLE_TIP_MARGIN: u64 = 3;
+/// Heights below A's tip that the oracles (chainweb-data, kda-txs) may not have filled yet:
+/// seen live, chainweb-data at its tip still missed rows 1-4 h old (filled later), so rows of
+/// the last 12 h (1440 heights) are not compared against them.
+const ORACLE_HORIZON: u64 = 1440;
+/// JSON path of the visible allowlist hit for a chainweb-data page that ended on a coinbase row.
+const CWD_CURSOR_SKIP_PATH: &str = "/~cwd-cursor-skip";
 /// How long a chainweb-data tip reading is reused.
 const ORACLE_TIP_TTL: Duration = Duration::from_secs(60);
 /// Upper bound of the supply minted per height on all chains together (coinbase rewards; live
 /// about 31 KDA per height in 2026-11), used when chainweb-data's tip lags A's.
 const SUPPLY_PER_HEIGHT: f64 = 60.0;
 /// Pause before the one retry of a `/v1/txs` diff against kda-txs.
-const KDA_TXS_RETRY: Duration = Duration::from_secs(5);
+const KDA_TXS_RETRY: Duration = Duration::from_secs(30);
 
 /// For each pair of tx objects at the same place (the object itself, or the same index of
 /// two arrays) whose `events` hold the same items in another order, sorts both `events`
@@ -69,11 +75,13 @@ fn events_as_multiset(a: &mut Value, b: &mut Value) -> u32 {
         if ex == ey || ex.len() != ey.len() {
             return 0;
         }
+        // Sort by text with numbers as f64 (the sides can write the same decimal in other
+        // forms, e.g. 0.2463053640037912 with more digits); equal means no diff entries.
         let mut sx = ex.clone();
         let mut sy = ey.clone();
-        sx.sort_by_cached_key(|v| v.to_string());
-        sy.sort_by_cached_key(|v| v.to_string());
-        if sx != sy {
+        sx.sort_by_cached_key(num_canon_text);
+        sy.sort_by_cached_key(num_canon_text);
+        if !crate::diff::diff(&Value::Array(sx.clone()), &Value::Array(sy.clone())).is_empty() {
             return 0;
         }
         *ex = sx;
@@ -118,6 +126,21 @@ const SUMMARY_FLUSH: Duration = Duration::from_secs(60);
 const BACKOFF_AFTER: u32 = 3;
 const BACKOFF_FIRST: Duration = Duration::from_secs(120);
 const BACKOFF_MAX: Duration = Duration::from_secs(900);
+
+/// Canonical text of a value with every number written as its f64.
+fn num_canon_text(v: &Value) -> String {
+    fn walk(v: &Value) -> Value {
+        match v {
+            Value::Number(n) => json!(n.as_f64().map(|f| f.to_string())),
+            Value::Array(x) => Value::Array(x.iter().map(walk).collect()),
+            Value::Object(m) => {
+                Value::Object(m.iter().map(|(k, x)| (k.clone(), walk(x))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    walk(v).to_string()
+}
 
 fn len_of(v: &Value) -> usize {
     v.as_array().map_or(0, Vec::len)
@@ -451,29 +474,74 @@ impl Ctx {
         let (mut va, mut vb) = (pa.items.clone(), pb.items.clone());
         let page_cut = req.route.paginated()
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
-        // Ruling R3E-11: chainweb-data's tip can lag A's by an hour. Account and event rows
-        // are compared only at heights the oracle can hold; when that drops rows, both sides
-        // are then cut to the heights they still cover completely.
-        let mut lag_rows = 0usize;
-        if matches!(req.route, RouteKind::Account | RouteKind::Events)
+        // chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain:
+        // after a page that ends on a coinbase row it skips the coinbase rows of the other
+        // chains at that height (seen live: /txs/events coin.TRANSFER at 3293927, 10 of 20
+        // coinbase rows). That height is dropped on both sides.
+        let mut cursor_skip = 0usize;
+        if req.route.paginated()
             && tb.kind == crate::config::TargetKind::ChainwebData
             && sa == 200
             && sb == 200
         {
-            if let Some(tip) = self.oracle_tip(tb).await {
-                let clamp = tip.saturating_sub(ORACLE_TIP_MARGIN);
-                let limit = query_limit(&req.path_and_query);
-                let full = |n: usize, t: bool| t || limit.is_none_or(|l| n >= l);
-                let (na, nb) = (len_of(&va), len_of(&vb));
-                let (fa, fb) = (
-                    full(na, pa.truncated || page_cut),
-                    full(nb, pb.truncated || page_cut),
-                );
-                let dropped = drop_above(&mut va, clamp) + drop_above(&mut vb, clamp);
-                if dropped > 0 {
-                    cut_to_common_depth(&mut va, fa, &mut vb, fb);
-                    lag_rows = (na + nb) - (len_of(&va) + len_of(&vb));
+            let n = pb.pages.len();
+            let hs: Vec<u64> = pb.pages[..n.saturating_sub(1)]
+                .iter()
+                .filter_map(|c| {
+                    let v = c.json()?;
+                    let last = v.as_array()?.last()?.clone();
+                    (last.get("requestKey").and_then(Value::as_str) == Some("<coinbase>"))
+                        .then(|| row_height(&last))
+                        .flatten()
+                })
+                .collect();
+            if !hs.is_empty() {
+                let before = len_of(&va) + len_of(&vb);
+                for v in [&mut va, &mut vb] {
+                    if let Value::Array(x) = v {
+                        x.retain(|r| row_height(r).is_none_or(|h| !hs.contains(&h)));
+                    }
                 }
+                cursor_skip = before - (len_of(&va) + len_of(&vb));
+            }
+        }
+        // Ruling R3E-11: the oracles lag A and fill recent heights late. Account, event and
+        // /v1/txs rows are compared only below A's tip minus ORACLE_HORIZON; when that drops
+        // rows, a side that held its full limit (or was cut at a page) is cut at its lowest
+        // height on both sides.
+        let mut lag_rows = 0usize;
+        let a_tip = self.tips.a_tip();
+        if matches!(
+            req.route,
+            RouteKind::Account | RouteKind::Events | RouteKind::V1Txs
+        ) && sa == 200
+            && sb == 200
+            && a_tip > ORACLE_HORIZON
+        {
+            let clamp = a_tip - ORACLE_HORIZON;
+            let limit = if req.route == RouteKind::V1Txs {
+                crate::via_cwd::parse(&req.path_and_query)
+                    .limit
+                    .ok()
+                    .map(|l| l as usize)
+            } else {
+                query_limit(&req.path_and_query)
+            };
+            let full = |n: usize, t: bool| t || limit.is_none_or(|l| n >= l);
+            let (na, nb) = (len_of(&va), len_of(&vb));
+            let fa = full(na, pa.truncated || page_cut);
+            let fb = full(nb, pb.truncated || page_cut);
+            let dropped = drop_above(&mut va, clamp) + drop_above(&mut vb, clamp);
+            if dropped > 0 {
+                let cut = [(fa, min_height(&va)), (fb, min_height(&vb))]
+                    .into_iter()
+                    .filter_map(|(f, h)| if f { h } else { None })
+                    .max();
+                if let Some(cut) = cut {
+                    drop_at_or_below(&mut va, cut);
+                    drop_at_or_below(&mut vb, cut);
+                }
+                lag_rows = (na + nb) - (len_of(&va) + len_of(&vb));
             }
         }
         // kda-txs can stop one row short of the limit (seen live: limit 250, 250 rows on A,
@@ -630,6 +698,26 @@ impl Ctx {
         } else {
             (diff_route(&req.route, &va, &vb), false)
         };
+        // /txs/recent against chainweb-data: a continuation whose first step sits in a height
+        // chainweb-data has not filled yet shows `initialCode`/`previousSteps` null there (seen
+        // live on fresh cross-chain txs; filled later). Reported under the oracle-lag hit.
+        if req.route == RouteKind::Recent && tb.kind == crate::config::TargetKind::ChainwebData {
+            for e in d.iter_mut() {
+                if (e.path.ends_with("/initialCode") || e.path.ends_with("/previousSteps"))
+                    && e.b.as_ref().is_none_or(Value::is_null)
+                {
+                    e.path = format!("{ORACLE_LAG_PATH}{}", e.path);
+                }
+            }
+        }
+        if cursor_skip > 0 {
+            d.push(DiffEntry {
+                path: CWD_CURSOR_SKIP_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!(cursor_skip)),
+                b: None,
+            });
+        }
         if lag_rows > 0 {
             d.push(DiffEntry {
                 path: ORACLE_LAG_PATH.into(),
@@ -1205,7 +1293,7 @@ impl Ctx {
         let mut canon: HashMap<(u8, u64), bool> = HashMap::new();
         let mut moved = Vec::new();
         let mut i = 0;
-        while i < xb.len() && moved.len() < GAP_CHECKS {
+        while i < xb.len() && moved.len() < ORPHAN_CHECKS {
             let r = &xb[i];
             let at = (
                 r.get("chain").and_then(Value::as_u64).map(|c| c as u8),

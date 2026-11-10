@@ -173,9 +173,11 @@ pub fn from_poll(poll: &Value, header: &Value, tx: Option<&DecodedTx>) -> Value 
         m.insert("gasLimit".into(), get(&meta, "gasLimit"));
         m.insert("gasPrice".into(), get(&meta, "gasPrice"));
         m.insert("ttl".into(), get(&meta, "ttl"));
+        // A fractional `meta.creationTime` (seen live: 1692638383.532) is rounded to whole
+        // seconds, as chainweb-data shows it.
         let ct = meta
             .get("creationTime")
-            .and_then(Value::as_u64)
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.round() as u64)))
             .map(|s| Value::String(iso_secs(s)))
             .unwrap_or(Value::Null);
         m.insert("creationTime".into(), ct);
@@ -196,6 +198,10 @@ fn signers_with_clist(mut signers: Value) -> Value {
             if let Value::Object(m) = s {
                 if !m.contains_key("clist") {
                     m.insert("clist".into(), Value::Array(Vec::new()));
+                }
+                // An explicit `"addr": null` in the cmd is not shown by chainweb-data or compat.
+                if m.get("addr").is_some_and(Value::is_null) {
+                    m.remove("addr");
                 }
             }
         }
