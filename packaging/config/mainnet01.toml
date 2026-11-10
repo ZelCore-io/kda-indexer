@@ -1,8 +1,9 @@
-# kda-indexer, network mainnet01. Installed by the package as /etc/kda-indexer/mainnet01.toml
+# kda-indexer, network mainnet01. Installed by the package as
+# /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml
 # (a conffile: your edits survive upgrades). Every listener binds loopback; the full list of
 # keys with their defaults is in /usr/share/doc/kda-indexer/examples/mainnet01.toml.example.
 network = "mainnet01"
-data_dir = "/var/lib/kda-indexer/mainnet01"
+data_dir = "/opt/coins/data/kadena/kda-indexer/mainnet01"
 
 [node]
 url = "http://127.0.0.1:31351"          # chainweb-node service API on the same host

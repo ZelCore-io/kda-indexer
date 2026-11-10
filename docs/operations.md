@@ -4,7 +4,7 @@
 
 `run`, `backfill` and `unwind` (and the hidden `tail`) write to the data directory. Each one
 takes an exclusive lock on `<data_dir>/LOCK` and exits at once with an error if another
-kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer@<network>`) before running
+kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer-<network>`) before running
 `backfill` or `unwind` by hand. Read-only commands (`inspect`, `segments`, `hot stats`) do
 not take the lock and can run next to the service.
 
@@ -25,7 +25,7 @@ To recover:
 3. If the stored branch must go, unwind it and clear the halt in one step:
 
    ```sh
-   kda-indexer -c /etc/kda-indexer/config.toml unwind --chain 3 --to 7390500 --clear-halt
+   kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml unwind --chain 3 --to 7390500 --clear-halt
    ```
 
    `--to` must be at or above `frozen_frontier − 1`; frozen heights are never unwound. To
@@ -33,7 +33,7 @@ To recover:
    out `--to`:
 
    ```sh
-   kda-indexer -c /etc/kda-indexer/config.toml unwind --chain 3 --clear-halt
+   kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml unwind --chain 3 --clear-halt
    ```
 
    `--clear-halt` deletes `halted.<chain>` only. It refuses when the chain's hot state is
@@ -45,13 +45,14 @@ To recover:
 
 ## Running under systemd
 
-The package installs `kda-indexer@.service`; the instance name is the network and selects
-`/etc/kda-indexer/<instance>.toml` (see [install.md](install.md)).
+The package installs `kda-indexer-mainnet01.service`, one unit per network (Blockbook
+layout): binary and config under `/opt/coins/kda-indexer/<network>/` (`bin/`, `config/`),
+data under `/opt/coins/data/kadena/kda-indexer/<network>/` (see [install.md](install.md)).
 
 ```sh
-systemctl start|stop|restart kda-indexer@mainnet01
-systemctl status kda-indexer@mainnet01         # STATUS: "backfill r/n" or "tail lag N"
-journalctl -u kda-indexer@mainnet01 -f
+systemctl start|stop|restart kda-indexer-mainnet01
+systemctl status kda-indexer-mainnet01         # STATUS: "backfill r/n" or "tail lag N"
+journalctl -u kda-indexer-mainnet01 -f
 ```
 
 - **Readiness.** The unit is `Type=notify`. The service sends `READY=1` as soon as the store is
@@ -72,23 +73,23 @@ journalctl -u kda-indexer@mainnet01 -f
 - **Priority and memory.** The seccomp filter blocks changing priority from inside the
   process, so use drop-ins: `examples/backfill.conf` (idle IO, nice 10) while backfilling,
   `examples/memory.conf` for per-host limits.
-- **Not enabled by default.** The package never enables or starts the unit. Use
-  `systemctl enable kda-indexer@mainnet01` when you want it at boot.
+- **Enabled at boot, not started.** A fresh install enables the unit but does not start it;
+  start it once the config checks out. An upgrade restarts it only if it was running.
 
-## Moving an existing data dir into an instance dir
+## Moving an existing data dir into a network dir
 
-The unit writes to `/var/lib/kda-indexer/<instance>`. A store built by hand, for example by
-`kda-indexer run` at the top of a volume mounted at `/var/lib/kda-indexer`, has `hot/`,
+The unit writes to `/opt/coins/data/kadena/kda-indexer/<network>`. A store built by hand, for example by
+`kda-indexer run` at the top of a volume mounted at `/opt/coins/data/kadena/kda-indexer`, has `hot/`,
 `segments/` and so on directly in that directory. To make it match the unit, move it one level
 down. This is a rename on the same filesystem, so it takes seconds; it still needs the service
 stopped and the lock released.
 
-1. Stop whatever writes the store (`systemctl stop kda-indexer@<instance>` or the process
+1. Stop whatever writes the store (`systemctl stop kda-indexer-<network>` or the process
    started by hand) and wait for it to exit. Nothing may hold `<data_dir>/LOCK`.
 2. Create the target and move every top-level entry of the store into it:
 
    ```sh
-   cd /var/lib/kda-indexer
+   cd /opt/coins/data/kadena/kda-indexer
    sudo mkdir -p mainnet01
    sudo sh -c 'for f in .[!.]* *; do [ "$f" = mainnet01 ] || [ ! -e "$f" ] || mv "$f" mainnet01/; done'
    ```
@@ -98,17 +99,17 @@ stopped and the lock released.
 3. Give the service ownership of the store:
 
    ```sh
-   sudo chown -R kda-indexer:kda-indexer /var/lib/kda-indexer/mainnet01
+   sudo chown -R kda-indexer:kda-indexer /opt/coins/data/kadena/kda-indexer/mainnet01
    ```
 
-4. Check `data_dir = "/var/lib/kda-indexer/mainnet01"` in `/etc/kda-indexer/mainnet01.toml`,
-   then `systemctl start kda-indexer@mainnet01`. The log shows the resume point (manifest
+4. Check `data_dir = "/opt/coins/data/kadena/kda-indexer/mainnet01"` in `/opt/coins/kda-indexer/mainnet01/config/mainnet01.toml`,
+   then `systemctl start kda-indexer-mainnet01`. The log shows the resume point (manifest
    frontier and the tail's stored tips).
 5. Read the `run: plan` line in `journalctl`: it must show the old `frontier` and
    `backfill=false` (a store that was found empty would show `frontier=0` and `backfill=true`;
    stop at once if you see that and check the path).
 
-**Alternative, no move.** Keep the store where it is: set `data_dir = "/var/lib/kda-indexer"`
+**Alternative, no move.** Keep the store where it is: set `data_dir = "/opt/coins/data/kadena/kda-indexer"`
 and install the drop-in `examples/datadir-volume-root.conf`. It replaces the unit's
 `ReadWritePaths` so the sandbox opens that directory. Ownership still has to be
 `kda-indexer`.
@@ -119,7 +120,7 @@ and install the drop-in `examples/datadir-volume-root.conf`. It replaces the uni
 or a look at a live store). It opens MDBX read-only, takes no lock and does no ingest.
 
 ```sh
-kda-indexer --config /etc/kda-indexer/mainnet01.toml serve [--data-dir DIR]
+kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml serve [--data-dir DIR]
 ```
 
 - Give it its own listeners (`api.*` in a separate config) so it does not clash with the

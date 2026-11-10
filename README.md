@@ -27,7 +27,7 @@ The pinned toolchain in `rust-toolchain.toml` is installed automatically by `rus
 
 ## Installing
 
-Build a Debian package on the host and install it: [docs/install.md](docs/install.md). The package ships a hardened systemd unit (`kda-indexer@<network>`), a config with loopback listeners and the licence notices.
+Build a Debian package on the host and install it: [docs/install.md](docs/install.md). The package ships a hardened systemd unit (`kda-indexer-<network>`, binary and config under `/opt/coins/kda-indexer/<network>/`, data under `/opt/coins/data/kadena/kda-indexer/<network>/`), a config with loopback listeners and the licence notices.
 
 Operating notes (systemd, the data-dir lock, moving a data dir, read-only `serve`, metrics and alerts, recovering a halted chain): [docs/operations.md](docs/operations.md).
 

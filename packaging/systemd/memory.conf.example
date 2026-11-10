@@ -1,7 +1,7 @@
 # Per-host memory limits. The unit ships MemoryHigh=12G / MemoryMax=16G, sized for a 23 GiB
 # host. Memory-mapped segment pages are page cache and are reclaimable, so they do not count
 # toward the hard limit the way heap does. Set both to fit your host, then
-#   sudo systemctl edit kda-indexer@mainnet01     and paste the section below.
+#   sudo systemctl edit kda-indexer-mainnet01     and paste the section below.
 [Service]
 MemoryHigh=8G
 MemoryMax=12G

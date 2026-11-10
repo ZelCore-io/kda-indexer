@@ -1,9 +1,10 @@
-# kda-indexer, testnet instance (kda-indexer@testnet). Ports differ from mainnet01 so both can
+# kda-indexer, testnet instance (unit kda-indexer-testnet.service). Ports differ from mainnet01 so both can
 # run on one host. Every <placeholder> must be replaced; `config check` refuses it otherwise.
 # The testnet network id is not settled yet (open question B2/Q6); fill in the real one.
-# The instance name (kda-indexer@testnet) selects /etc/kda-indexer/testnet.toml.
+# Install as /opt/coins/kda-indexer/testnet/config/testnet.toml with a copy of the unit
+# (kda-indexer-testnet.service) pointing at it; see install.md.
 network = "<testnet-network-id>"
-data_dir = "/var/lib/kda-indexer/testnet"
+data_dir = "/opt/coins/data/kadena/kda-indexer/testnet"
 
 [node]
 url = "http://<testnet-node-host>:31351"   # service API of a testnet chainweb-node

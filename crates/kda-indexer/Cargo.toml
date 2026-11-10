@@ -58,15 +58,15 @@ extended-description = """\
 Indexer for the Kadena chainweb blockchain. Indexes all 20 chains from a chainweb-node \
 into compact immutable segments plus a small hot store, and serves them through a native \
 HTTP API, a chainweb-data compatible REST API and metrics. Runs as a systemd service \
-(kda-indexer@<network>); the package installs it stopped and disabled."""
+(kda-indexer-<network>); the package enables it at boot and leaves it stopped."""
 maintainer-scripts = "../../packaging/debian"
-conf-files = ["/etc/kda-indexer/mainnet01.toml"]
+conf-files = ["/opt/coins/kda-indexer/mainnet01/config/mainnet01.toml"]
 assets = [
-    ["target/release/kda-indexer", "usr/bin/", "755"],
+    ["target/release/kda-indexer", "opt/coins/kda-indexer/mainnet01/bin/", "755"],
     ["target/release/kda-compare", "usr/bin/", "755"],
-    ["../../packaging/systemd/kda-indexer@.service", "lib/systemd/system/", "644"],
+    ["../../packaging/systemd/kda-indexer-mainnet01.service", "lib/systemd/system/", "644"],
     ["../../packaging/systemd/kda-compare@.service", "lib/systemd/system/", "644"],
-    ["../../packaging/config/mainnet01.toml", "etc/kda-indexer/", "640"],
+    ["../../packaging/config/mainnet01.toml", "opt/coins/kda-indexer/mainnet01/config/", "640"],
     ["../../compare/allowlist.toml", "usr/share/kda-indexer/compare/", "644"],
     ["../../compare/seeds/mainnet01.toml", "usr/share/kda-indexer/compare/seeds/", "644"],
     ["../../README.md", "usr/share/doc/kda-indexer/", "644"],

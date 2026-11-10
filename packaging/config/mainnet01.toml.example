@@ -1,5 +1,5 @@
 network = "mainnet01"
-data_dir = "/var/lib/kda-indexer/mainnet01"
+data_dir = "/opt/coins/data/kadena/kda-indexer/mainnet01"
 
 [node]
 url = "http://127.0.0.1:31351"          # service API on the same host

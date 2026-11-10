@@ -1,5 +1,8 @@
+# One unit per network (Blockbook layout): binary and config under
+# /opt/coins/kda-indexer/<network>/, data under /opt/coins/data/kadena/kda-indexer/<network>/.
+# For another network copy this file as kda-indexer-<network>.service and replace mainnet01.
 [Unit]
-Description=kda-indexer (%i)
+Description=kda-indexer (mainnet01)
 Documentation=file:///usr/share/doc/kda-indexer/install.md
 After=network-online.target docker.service
 Wants=network-online.target
@@ -8,7 +11,7 @@ Wants=network-online.target
 Type=notify
 User=kda-indexer
 Group=kda-indexer
-ExecStart=/usr/bin/kda-indexer run --config /etc/kda-indexer/%i.toml
+ExecStart=/opt/coins/kda-indexer/mainnet01/bin/kda-indexer run --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=120
@@ -24,7 +27,7 @@ MemoryMax=16G
 # Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/kda-indexer/%i
+ReadWritePaths=/opt/coins/data/kadena/kda-indexer/mainnet01
 # optional textfile metrics; the leading '-' ignores a missing dir
 ReadWritePaths=-/var/lib/node_exporter/textfile_collector
 ProtectHome=yes

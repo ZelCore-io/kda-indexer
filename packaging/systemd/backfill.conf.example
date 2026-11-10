@@ -1,7 +1,7 @@
 # Drop-in for a first sync on a host that also serves other things (spec 4.2):
-#   sudo systemctl edit kda-indexer@mainnet01     (paste the lines below, save)
-# or install as /etc/systemd/system/kda-indexer@mainnet01.service.d/backfill.conf, then
-#   sudo systemctl daemon-reload && sudo systemctl restart kda-indexer@mainnet01
+#   sudo systemctl edit kda-indexer-mainnet01     (paste the lines below, save)
+# or install as /etc/systemd/system/kda-indexer-mainnet01.service.d/backfill.conf, then
+#   sudo systemctl daemon-reload && sudo systemctl restart kda-indexer-mainnet01
 #
 # The unit's seccomp filter blocks ioprio_set/setpriority, so the process cannot lower its own
 # priority; systemd sets it before the process starts. Remove the drop-in once the backfill

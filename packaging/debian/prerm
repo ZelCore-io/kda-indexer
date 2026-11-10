@@ -1,12 +1,13 @@
 #!/bin/sh
-# prerm for kda-indexer: stop every instance before the files go away. An upgrade does not
+# prerm for kda-indexer: stop the service (and any compare instance) before the files go away. An upgrade does not
 # stop anything here (postinst restarts the running instances after the new files are in).
 set -e
 
 case "$1" in
 remove | deconfigure)
     if [ -d /run/systemd/system ]; then
-        systemctl stop 'kda-indexer@*.service' 'kda-compare@*.service' || true
+        systemctl stop kda-indexer-mainnet01.service 'kda-compare@*.service' || true
+        systemctl disable kda-indexer-mainnet01.service || true
     fi
     ;;
 upgrade | failed-upgrade) ;;
