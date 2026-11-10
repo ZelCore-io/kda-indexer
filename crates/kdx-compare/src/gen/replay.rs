@@ -3,6 +3,10 @@
 //! Input TSV: `count\tMETHOD\tpath?query`, GET only. `import` builds it from HAProxy HTTP log
 //! lines, keeping only the request line of chainweb-data routes (spec section 5.2): client
 //! addresses, headers and timings are never written.
+//!
+//! A line `# mode: sweep` anywhere in the file switches to sweep mode: every entry is sent
+//! once in a shuffled order (counts ignored), then the order is reshuffled. Used for built
+//! sample lists (for example thousands of accounts) where every entry must be compared.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -10,6 +14,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::RngExt;
 
 use super::{
@@ -22,14 +27,21 @@ pub struct ReplayGen {
     /// Cumulative counts, for weighted sampling.
     cum: Vec<u64>,
     rng: StdRng,
+    /// Sweep mode: a shuffled permutation of the entries and the next position in it.
+    sweep: Option<(Vec<usize>, usize)>,
 }
 
 impl ReplayGen {
     pub fn load(path: &Path) -> anyhow::Result<ReplayGen> {
         let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut entries = Vec::new();
+        let mut sweep = false;
         for (i, line) in BufReader::new(f).lines().enumerate() {
             let line = line?;
+            if line.trim() == "# mode: sweep" {
+                sweep = true;
+                continue;
+            }
             if line.trim().is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -54,10 +66,12 @@ impl ReplayGen {
                 .with_context(|| format!("{}: total count overflows u64", path.display()))?;
             cum.push(acc);
         }
+        let sweep = sweep.then(|| (Vec::new(), 0));
         Ok(ReplayGen {
             entries,
             cum,
             rng: rng(),
+            sweep,
         })
     }
 
@@ -81,9 +95,22 @@ fn request_key(path: &str) -> Option<String> {
 
 impl Generator for ReplayGen {
     async fn next(&mut self) -> anyhow::Result<Vec<Request>> {
-        let total = *self.cum.last().expect("non-empty");
-        let x = self.rng.random_range(0..total);
-        let i = self.cum.partition_point(|&c| c <= x);
+        let i = match &mut self.sweep {
+            Some((order, pos)) => {
+                if *pos >= order.len() {
+                    *order = (0..self.entries.len()).collect();
+                    order.shuffle(&mut self.rng);
+                    *pos = 0;
+                }
+                *pos += 1;
+                order[*pos - 1]
+            }
+            None => {
+                let total = *self.cum.last().expect("non-empty");
+                let x = self.rng.random_range(0..total);
+                self.cum.partition_point(|&c| c <= x)
+            }
+        };
         let path = self.entries[i].1.clone();
         let oracle = match RouteKind::from_path(&path) {
             RouteKind::Tx | RouteKind::Txs => request_key(&path).map(|rk| OracleRef::Poll {
