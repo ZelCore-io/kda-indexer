@@ -37,6 +37,44 @@ const GAP_CHECKS: usize = 5;
 /// JSON path of the visible allowlist hit for rows missing from chainweb-data's transfers.
 const CWD_TRANSFERS_GAP_PATH: &str = "/~cwd-transfers-gap";
 
+/// JSON path of the visible allowlist hit for [`events_as_multiset`].
+const EVENT_ORDER_PATH: &str = "/~event-order";
+
+/// For each pair of tx objects at the same place (the object itself, or the same index of
+/// two arrays) whose `events` hold the same items in another order, sorts both `events`
+/// arrays by canonical text. Returns how many txs that was.
+fn events_as_multiset(a: &mut Value, b: &mut Value) -> u32 {
+    fn one(x: &mut Value, y: &mut Value) -> u32 {
+        let (Some(Value::Array(ex)), Some(Value::Array(ey))) =
+            (x.get_mut("events"), y.get_mut("events"))
+        else {
+            return 0;
+        };
+        if ex == ey || ex.len() != ey.len() {
+            return 0;
+        }
+        let mut sx = ex.clone();
+        let mut sy = ey.clone();
+        sx.sort_by_cached_key(|v| v.to_string());
+        sy.sort_by_cached_key(|v| v.to_string());
+        if sx != sy {
+            return 0;
+        }
+        *ex = sx;
+        *ey = sy;
+        1
+    }
+    match (a, b) {
+        (Value::Array(xa), Value::Array(xb)) => xa
+            .iter_mut()
+            .zip(xb.iter_mut())
+            .map(|(x, y)| one(x, y))
+            .sum(),
+        (x @ Value::Object(_), y @ Value::Object(_)) => one(x, y),
+        _ => 0,
+    }
+}
+
 /// Items of array `a` that `b` does not hold (as a multiset; non-arrays hold nothing).
 fn only_in_first(a: &Value, b: &Value) -> Vec<Value> {
     let (Value::Array(xa), Value::Array(xb)) = (a, b) else {
@@ -328,6 +366,16 @@ impl Ctx {
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
+        // chainweb-data and kda-txs list a tx's events in their own order (seen live on
+        // cross-chain txs: node and compat [TRANSFER, TRANSFER_XCHAIN, TRANSFER, X_YIELD],
+        // both oracles [TRANSFER, TRANSFER, TRANSFER_XCHAIN, X_YIELD]). The node pair checks
+        // the order; here a tx's events compare as a multiset, as the visible hit /~event-order.
+        let event_order = if matches!(req.route, RouteKind::Tx | RouteKind::Txs | RouteKind::V1Txs)
+        {
+            events_as_multiset(&mut va, &mut vb)
+        } else {
+            0
+        };
         // Oracle rows of orphaned blocks: chainweb-data (account, events) and kda-txs
         // (/v1/txs) can list a tx in a block the node no longer has as canonical, beside or
         // instead of the canonical one. Rows confirmed against the node go under /orphans.
@@ -423,6 +471,14 @@ impl Ctx {
         } else {
             (diff_route(&req.route, &va, &vb), false)
         };
+        if event_order > 0 {
+            d.push(DiffEntry {
+                path: EVENT_ORDER_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!(event_order)),
+                b: Some(json!(event_order)),
+            });
+        }
         if !gap_rows.is_empty() {
             d.push(DiffEntry {
                 path: CWD_TRANSFERS_GAP_PATH.into(),

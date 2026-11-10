@@ -115,3 +115,19 @@ json_path_glob = "/~cwd-transfers-gap"
 condition = "any"
 reason = "chainweb-data's transfers table misses some rows whose TRANSFER event it holds in its events table (seen live: erkng6rS... at 1595413, TI1Kfck... at 1687775 and Sd2fLvTg... at 1685777, all chain 0: events present, transfers rows absent, so /txs/account leaves them out). The harness moves an A-only row here only when B lists no row of its own and chainweb-data's own /txs/tx for that request key, in the same block, carries the matching {token}.TRANSFER event."
 owner_note = "PROPOSED in run 3E-b (P3 Task 8), controller/owner to accept: chainweb-data data gap, kda-indexer derives transfers from the events it indexes."
+
+[[entry]]
+id = "oracle-event-order"
+route = "*"
+json_path_glob = "/~event-order"
+condition = "changed"
+reason = "chainweb-data (/txs/tx, /txs/txs) and kda-txs (/v1/txs) list some txs' events in another order than the node's output (seen live: 5xNbYLRE... and vjUp8NVn..., chain 2; node and kda-indexer [coin.TRANSFER, coin.TRANSFER_XCHAIN, coin.TRANSFER, pact.X_YIELD], both oracles [coin.TRANSFER, coin.TRANSFER, coin.TRANSFER_XCHAIN, pact.X_YIELD]). Against these oracles a tx's events compare as a multiset and this visible hit is reported; the node pair still checks the order."
+owner_note = "PROPOSED in run 3E-b (P3 Task 8), controller/owner to accept. kda-indexer keeps the node's order."
+
+[[entry]]
+id = "oracle-orphan-rows"
+route = "*"
+json_path_glob = "/orphans**"
+condition = "any"
+reason = "chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height."
+owner_note = "PROPOSED in run 3E-b (P3 Task 8); extends the accepted orphan-rows-txs (spec section 4.5: orphans are not kept)."
