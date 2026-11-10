@@ -57,8 +57,10 @@ journalctl -u kda-indexer-mainnet01 -f
 
 - **Readiness.** The unit is `Type=notify`. The service sends `READY=1` as soon as the store is
   open and the API is bound, before backfill, so a long first sync never trips the start
-  timeout. Use `/readyz` (admin port) to know when it has caught up: 503 while backfilling or
-  while any chain that is not halted lags more than `api.ready_max_lag` blocks.
+  timeout. Use `/readyz` (admin port) to know when it has caught up: 503 while backfilling,
+  while any chain is halted, or while any chain lags more than `api.ready_max_lag` blocks.
+  Lag is judged against the last node tips for up to 10 minutes after the node stops
+  answering, so a node restart does not take the indexer out of the pool.
 - **Watchdog.** `WatchdogSec=120`. A dedicated thread pings systemd only while ingest and the
   API runtime are making progress: backfill and the range writer beat per block and per
   postings file, the tail writer on every commit and every 5 s when idle, the freezer per

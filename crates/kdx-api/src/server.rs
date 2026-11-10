@@ -67,6 +67,10 @@ pub struct NodeTips {
 /// Node tips older than this count as unknown.
 pub const TIPS_STALE: Duration = Duration::from_secs(60);
 
+/// How long `/readyz` keeps judging lag against the last node tips once they go stale
+/// (a node restart must not take the indexer out of the pool, R10).
+pub const TIPS_READY_GRACE: Duration = Duration::from_secs(600);
+
 impl TipWatch {
     pub fn set(&self, heights: BTreeMap<u8, u64>) {
         self.0.tips.store(Some(Arc::new(NodeTips {
@@ -80,6 +84,12 @@ impl TipWatch {
             .tips
             .load_full()
             .filter(|t| t.at.elapsed().is_ok_and(|e| e < TIPS_STALE))
+    }
+    /// The last tips seen, with their age, whether stale or not.
+    pub fn last(&self) -> Option<(Arc<NodeTips>, Duration)> {
+        let t = self.0.tips.load_full()?;
+        let age = t.at.elapsed().unwrap_or_default();
+        Some((t, age))
     }
     pub fn set_backfill(&self, on: bool) {
         self.0.backfill.store(on, Ordering::Release);
