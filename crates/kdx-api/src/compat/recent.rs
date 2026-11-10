@@ -54,7 +54,7 @@ fn recent(view: &View) -> ApiResult<Vec<Value>> {
         let mut txs = Vec::new();
         for c in 0..kdx_segment::SLOT_WIDTH as u8 {
             for r in view.block_txs(c, h)? {
-                if !r.key.is_coinbase() && !hidden(r.key) {
+                if !r.key.is_coinbase() && !hidden(view, r.key) {
                     txs.push(r);
                 }
             }

@@ -620,12 +620,10 @@ fn continuation_history(view: &View, pact: &Hash32) -> ApiResult<(Option<String>
     let mut cur = Some(*pact);
     for _ in 0..8 {
         let Some(rk) = cur.take() else { break };
-        let Some((k, r)) = view.tx_by_rk(&rk)? else {
+        // Genesis txs count: chainweb-data's join sees them (G1).
+        let Some((_, r)) = view.tx_by_rk(&rk)? else {
             break;
         };
-        if super::hidden(k) {
-            break;
-        }
         steps.push(rk.to_b64url());
         let cmd = cmd_value(&r);
         if code.is_none() {

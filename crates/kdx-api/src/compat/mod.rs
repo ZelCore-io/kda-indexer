@@ -34,20 +34,15 @@ use crate::server::{ApiState, CHAINWEB_NEXT};
 use crate::store::View;
 use crate::{ApiError, ApiResult};
 
-/// Genesis-block txs are not served by compat routes (chainweb-data does not index them;
-/// owner question Q1, default). The native API serves them.
+/// Genesis-block txs are not served by the compat list routes (`/txs/account`,
+/// `/txs/events`, `/txs/recent`, `/v1/txs`). `/txs/tx` and `/txs/txs` serve them, as
+/// chainweb-data does (ruling R3E-1, G1). The native API serves them everywhere.
 pub const COMPAT_HIDE_GENESIS: bool = true;
 
-/// Height of the genesis blocks of chains 10–19 (the chain-graph change on mainnet01).
-const GENESIS_20: u32 = 852_054;
-
-/// True for a tx compat routes must not show.
-pub fn hidden(k: TxKey) -> bool {
-    COMPAT_HIDE_GENESIS
-        && match k.chain() {
-            0..=9 => k.height() == 0,
-            _ => k.height() == GENESIS_20,
-        }
+/// True for a tx the compat list routes must not show. Genesis heights come from the
+/// store's chain graph, not mainnet constants (R9).
+pub fn hidden(view: &View, k: TxKey) -> bool {
+    COMPAT_HIDE_GENESIS && view.genesis.is_genesis(k)
 }
 
 /// Page caps (spec §5.2).
@@ -466,7 +461,7 @@ pub fn collect_page(
                 keys.dedup();
                 let mut txs = Vec::with_capacity(keys.len());
                 for k in keys {
-                    if hidden(k) {
+                    if hidden(view, k) {
                         continue;
                     }
                     if let Some(r) = view.tx(k)? {
@@ -494,7 +489,7 @@ pub fn collect_page(
                 let mut txs = Vec::new();
                 for c in 0..kdx_segment::SLOT_WIDTH as u8 {
                     for r in view.block_txs(c, h)? {
-                        if !hidden(r.key) {
+                        if !hidden(view, r.key) {
                             txs.push(r);
                         }
                     }
@@ -594,9 +589,22 @@ mod tests {
 
     #[test]
     fn genesis() {
-        assert!(hidden(TxKey::new(0, 3, 1)));
-        assert!(hidden(TxKey::new(852_054, 12, 1)));
-        assert!(!hidden(TxKey::new(852_054, 2, 1)));
-        assert!(!hidden(TxKey::new(1, 0, 1)));
+        let g = crate::store::Genesis::from_meta(
+            Some(b"mainnet01"),
+            Some(b"[[852054,[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]],[0,[0,1,2,3,4,5,6,7,8,9]]]"),
+        );
+        assert!(g.is_genesis(TxKey::new(0, 3, 1)));
+        assert!(g.is_genesis(TxKey::new(852_054, 12, 1)));
+        assert!(!g.is_genesis(TxKey::new(852_054, 2, 1)));
+        assert!(!g.is_genesis(TxKey::new(1, 0, 1)));
+        // Another network's graph change height (R9).
+        let t = crate::store::Genesis::from_meta(
+            Some(b"testnet04"),
+            Some(b"[[0,[0,1,2,3,4,5,6,7,8,9]],[332604,[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]]]"),
+        );
+        assert!(t.is_genesis(TxKey::new(332_604, 12, 1)));
+        assert!(!t.is_genesis(TxKey::new(852_054, 12, 1)));
+        assert!(!crate::store::Genesis::default().is_genesis(TxKey::new(0, 0, 1)));
+        assert_eq!(t.chains().count(), 20);
     }
 }

@@ -7,7 +7,7 @@
 //! keeping the first, miner-reward rows count toward `limit` and produce no entry.
 //!
 //! Rows are read from the same `xfer` postings as `/txs/account`; entries are built with
-//! the `/txs/txs` builder. Genesis txs follow the compat rule (hidden).
+//! the `/txs/txs` builder. Genesis txs follow the compat list-route rule (hidden).
 
 use std::collections::HashSet;
 use std::sync::Arc;

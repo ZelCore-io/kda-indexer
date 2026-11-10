@@ -75,6 +75,66 @@ pub struct Store {
     seg_id: Mutex<Option<ManifestId>>,
     dict: ArcSwap<DictSnap>,
     dict_reloading: AtomicBool,
+    /// Network and genesis heights from `Meta` (empty until ingest writes the chain graph).
+    genesis: ArcSwap<Genesis>,
+}
+
+/// Network id and the genesis height of every chain, from the hot store's `network` and
+/// `chain_graph` meta (R9: no mainnet constants in the API).
+#[derive(Debug, Clone, Default)]
+pub struct Genesis {
+    pub network: String,
+    /// Indexed by chain id.
+    heights: Vec<Option<u32>>,
+}
+
+impl Genesis {
+    /// From the meta values; `graph` is the JSON `[[height, [chain, ...]], ...]` ingest stores.
+    pub fn from_meta(network: Option<&[u8]>, graph: Option<&[u8]>) -> Genesis {
+        let network = network
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .unwrap_or_default();
+        let mut hist: Vec<(u64, Vec<u8>)> = graph
+            .and_then(|g| serde_json::from_slice(g).ok())
+            .unwrap_or_default();
+        hist.sort_by_key(|(h, _)| *h);
+        let mut heights: Vec<Option<u32>> = Vec::new();
+        for (h, chains) in hist {
+            for c in chains {
+                let c = usize::from(c);
+                if heights.len() <= c {
+                    heights.resize(c + 1, None);
+                }
+                if heights[c].is_none() {
+                    heights[c] = u32::try_from(h).ok();
+                }
+            }
+        }
+        Genesis { network, heights }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.heights.is_empty()
+    }
+
+    /// True for a tx of a chain's genesis block.
+    pub fn is_genesis(&self, k: TxKey) -> bool {
+        self.heights.get(usize::from(k.chain())).copied().flatten() == Some(k.height())
+    }
+
+    /// `(chain, genesis height)` of every known chain.
+    pub fn chains(&self) -> impl Iterator<Item = (u8, u32)> + '_ {
+        self.heights
+            .iter()
+            .enumerate()
+            .filter_map(|(c, h)| Some((u8::try_from(c).ok()?, (*h)?)))
+    }
+}
+
+fn load_genesis(txn: &RoTxn) -> anyhow::Result<Genesis> {
+    let n = txn.meta(kdx_hot::env::meta::NETWORK)?;
+    let g = txn.meta(kdx_hot::env::meta::CHAIN_GRAPH)?;
+    Ok(Genesis::from_meta(n.as_deref(), g.as_deref()))
 }
 
 impl Store {
@@ -85,6 +145,7 @@ impl Store {
         let mem = Arc::new(load_names(&hot, None)?);
         let id = manifest_id(&segdir)?;
         let seg = Segments::open(&segdir, mem.clone())?;
+        let genesis = load_genesis(&hot.ro()?)?;
         Ok(Store {
             hot,
             segdir,
@@ -95,6 +156,7 @@ impl Store {
                 at: Instant::now(),
             }),
             dict_reloading: AtomicBool::new(false),
+            genesis: ArcSwap::from_pointee(genesis),
         })
     }
 
@@ -161,8 +223,16 @@ impl Store {
                 continue;
             }
             self.maybe_reload_dict(&txn);
+            if self.genesis.load().is_empty() {
+                // A fresh store: ingest writes the chain graph after the API opened.
+                let g = load_genesis(&txn).map_err(ApiError::Internal)?;
+                if !g.is_empty() {
+                    self.genesis.store(Arc::new(g));
+                }
+            }
             kdx_metrics::get().read_view("open", opened.elapsed().as_secs_f64());
             return Ok(View {
+                genesis: self.genesis.load_full(),
                 txn,
                 seg,
                 hot_frontier,
@@ -262,6 +332,8 @@ pub struct View {
     /// The manifest frontier of `seg`.
     pub seg_frontier: u32,
     pub deadline: Instant,
+    /// Network and genesis heights.
+    pub genesis: Arc<Genesis>,
     dict: Arc<MemDict>,
     born: Instant,
 }

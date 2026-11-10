@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use kdx_types::Hash32;
 use serde_json::Value;
 
-use super::{aeson, hidden, shapes, text, Params};
+use super::{aeson, shapes, text, Params};
 use crate::server::ApiState;
 use crate::store::View;
 use crate::ApiResult;
@@ -24,7 +24,8 @@ fn lookup(view: &View, rk: &str) -> ApiResult<Vec<Value>> {
     let Some((k, r)) = view.tx_by_rk(&h)? else {
         return Ok(Vec::new());
     };
-    if hidden(k) || k.is_coinbase() {
+    // Genesis txs are served here, as chainweb-data does (G1).
+    if k.is_coinbase() {
         return Ok(Vec::new());
     }
     let Some(b) = view.block(k.chain(), k.height())? else {
