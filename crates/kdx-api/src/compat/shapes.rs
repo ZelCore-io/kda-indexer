@@ -163,7 +163,8 @@ pub fn utc_secs(secs: i64) -> String {
 
 /// A Pact `ParsedInteger` (meta `creationTime`, `ttl`, `gasLimit`, cont `step`): a JSON
 /// number, a string holding a number (`"600"`), or `{"int": ...}`. Pact accepts all three
-/// in a command, so stored commands carry all three. Fraction dropped.
+/// in a command, so stored commands carry all three. A fraction rounds like Haskell
+/// `round` (F2: chainweb-data and kda-txs show 1692638383.532 as ...:44).
 fn parsed_integer(v: &Value) -> Option<i64> {
     let s = match v {
         Value::Number(n) => n.to_string(),
@@ -182,20 +183,37 @@ fn parsed_integer(v: &Value) -> Option<i64> {
     } else {
         digits
     };
-    let int: String = if exp >= 0 {
+    let (int, frac): (String, &str) = if exp >= 0 {
         let mut d = digits.clone();
         d.extend(std::iter::repeat_n('0', exp.min(30) as usize));
-        d
+        (d, "")
     } else {
         let cut = digits.len() as i64 + exp;
         if cut <= 0 {
-            "0".into()
+            // value = 0.000ddd: below one half unless the zero padding is empty.
+            let pad = (-cut) as usize;
+            ("0".into(), if pad == 0 { digits.as_str() } else { "0" })
         } else {
-            digits[..cut as usize].to_owned()
+            (digits[..cut as usize].to_owned(), &digits[cut as usize..])
         }
     };
-    let n: i64 = int.parse().ok()?;
+    let mut n: i64 = int.parse().ok()?;
+    if round_up_half_even(frac, n) {
+        n = n.checked_add(1)?;
+    }
     Some(if neg { -n } else { n })
+}
+
+/// Haskell `round` (what Pact's `ParsedInteger` applies to a JSON number, and what
+/// chainweb-data shows for a fractional `creationTime`): nearest, ties to even. `frac` is
+/// the fraction digits after the point, `int` the integer part's magnitude.
+fn round_up_half_even(frac: &str, int: i64) -> bool {
+    let mut b = frac.bytes();
+    match b.next() {
+        Some(d) if d > b'5' => true,
+        Some(b'5') => b.any(|d| d != b'0') || int % 2 == 1,
+        _ => false,
+    }
 }
 
 /// A Pact `ParsedDecimal` (meta `gasPrice`) as number text: a JSON number, a string
@@ -806,6 +824,16 @@ mod tests {
         assert_eq!(parsed_integer(&json!({"int": "600"})), Some(600));
         assert_eq!(parsed_integer(&json!(600.0)), Some(600));
         assert_eq!(parsed_integer(&json!("x")), None);
+        // F2: rounded like Haskell `round`, not floored.
+        assert_eq!(parsed_integer(&json!(1692638383.532)), Some(1692638384));
+        assert_eq!(parsed_integer(&json!(1692638383.4)), Some(1692638383));
+        assert_eq!(parsed_integer(&json!(2.5)), Some(2));
+        assert_eq!(parsed_integer(&json!(3.5)), Some(4));
+        assert_eq!(parsed_integer(&json!(2.51)), Some(3));
+        assert_eq!(parsed_integer(&json!(0.5)), Some(0));
+        assert_eq!(parsed_integer(&json!(0.7)), Some(1));
+        assert_eq!(parsed_integer(&json!(0.07)), Some(0));
+        assert_eq!(parsed_integer(&json!(-1.7)), Some(-2));
         assert_eq!(parsed_integer(&json!(null)), None);
         assert_eq!(int_of(Some(&json!("600"))), json!(600));
         assert_eq!(parsed_decimal_text(&json!("1.0e-8")).as_deref(), Some("1.0e-8"));
