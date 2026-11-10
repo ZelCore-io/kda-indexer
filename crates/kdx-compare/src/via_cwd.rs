@@ -38,7 +38,7 @@ pub struct Params {
     pub limit: Result<u64, BadLimit>,
 }
 
-fn pct_decode(s: &str) -> String {
+pub(crate) fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

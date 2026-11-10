@@ -56,6 +56,13 @@ const ORACLE_HORIZON: u64 = 1440;
 const CWD_CURSOR_SKIP_PATH: &str = "/~cwd-cursor-skip";
 /// JSON path of the visible allowlist hit for /v1/txs rows kda-txs leaves out.
 const KDATXS_GAP_PATH: &str = "/~kdatxs-gap";
+/// JSON paths of the visible allowlist hits for A-only rows the node confirms (ruling R3E-14).
+const CWD_MISSING_NODE_PATH: &str = "/~cwd-missing-node";
+const KDATXS_MISSING_NODE_PATH: &str = "/~kdatxs-missing-node";
+/// At most this many A-only rows per compare are polled on the node for that rule.
+const NODE_GAP_CHECKS: usize = 300;
+/// Request keys per node `/poll` call of that rule.
+const NODE_POLL_CHUNK: usize = 25;
 /// How long a chainweb-data tip reading is reused.
 const ORACLE_TIP_TTL: Duration = Duration::from_secs(60);
 /// Upper bound of the supply minted per height on all chains together (coinbase rewards; live
@@ -193,6 +200,17 @@ fn num_value(v: &Value) -> Option<f64> {
 }
 
 /// The `limit` query value, if any.
+/// The account a `/txs/account/{account}` or `/v1/txs/{account}/...` request names.
+fn query_account(req: &Request) -> String {
+    if req.route == RouteKind::V1Txs {
+        return crate::via_cwd::parse(&req.path_and_query).account;
+    }
+    let path = req.path_and_query.split('?').next().unwrap_or("");
+    path.strip_prefix("/txs/account/")
+        .map(crate::via_cwd::pct_decode)
+        .unwrap_or_default()
+}
+
 fn query_limit(path_and_query: &str) -> Option<usize> {
     let q = path_and_query.split_once('?')?.1;
     url::form_urlencoded::parse(q.as_bytes())
@@ -525,6 +543,18 @@ impl Ctx {
         // /v1/txs rows are compared only below A's tip minus ORACLE_HORIZON; when that drops
         // rows, a side that held its full limit (or was cut at a page) is cut at its lowest
         // height on both sides.
+        // Whether each side held its full limit (or was cut at a page), read before any rule
+        // drops rows; used by the node-confirmed rule below.
+        let row_limit = if req.route == RouteKind::V1Txs {
+            crate::via_cwd::parse(&req.path_and_query)
+                .limit
+                .ok()
+                .map(|l| l as usize)
+        } else {
+            query_limit(&req.path_and_query)
+        };
+        let full_a0 = pa.truncated || page_cut || row_limit.is_none_or(|l| len_of(&va) >= l);
+        let full_b0 = pb.truncated || page_cut || row_limit.is_none_or(|l| len_of(&vb) >= l);
         let mut lag_rows = 0usize;
         let a_tip = self.tips.a_tip();
         if matches!(
@@ -699,6 +729,52 @@ impl Ctx {
                 }
             }
         }
+        // Ruling R3E-14 (owner): where the node agrees with A, an oracle that differs is at
+        // fault. Seen live: chainweb-data answers short account pages without a Chainweb-Next
+        // (7590fd61... chain 0: 7 rows of 50; 6d87fd6e... heights 1151496-1153496: no rows, A
+        // 35 rows in node block 6tpjetrL), and kda-txs answers a varying subset of /v1/txs
+        // (acc28032.../coin/250: 63, then 54, 404, 47 rows; A 125). When both sides held their
+        // full limit they are first cut at the higher of their lowest heights (rows below it
+        // cannot be compared). Then, with no row only B lists, every row only A lists is polled
+        // on the node: when each is in A's block and has an event naming the account, those
+        // rows move to the visible hit /~cwd-missing-node or /~kdatxs-missing-node.
+        let mut node_gap: Vec<Value> = Vec::new();
+        let mut window_cut = 0usize;
+        let node_gap_pair = matches!(
+            (req.route, tb.kind),
+            (RouteKind::Account, crate::config::TargetKind::ChainwebData)
+                | (RouteKind::V1Txs, crate::config::TargetKind::KdaTxs)
+        );
+        if node_gap_pair && sa == 200 && sb == 200 && gap_rows.is_empty() && kt_gap.is_empty() {
+            let (mut ca, mut cb) = (va.clone(), vb.clone());
+            if full_a0 && full_b0 {
+                if let (Some(x), Some(y)) = (min_height(&ca), min_height(&cb)) {
+                    drop_at_or_below(&mut ca, x.max(y));
+                    drop_at_or_below(&mut cb, x.max(y));
+                }
+            }
+            let only_a = only_in_first(&ca, &cb);
+            if !only_a.is_empty()
+                && only_a.len() <= NODE_GAP_CHECKS
+                && only_in_first(&cb, &ca).is_empty()
+            {
+                let account = query_account(req);
+                if !account.is_empty() && self.node_confirms(req, &only_a, &account).await {
+                    if let Value::Array(xa) = &mut ca {
+                        for r in &only_a {
+                            if let Some(i) = xa.iter().position(|x| x == r) {
+                                xa.remove(i);
+                            }
+                        }
+                    }
+                    window_cut = (len_of(&va) + len_of(&vb))
+                        .saturating_sub(len_of(&ca) + len_of(&cb) + only_a.len());
+                    va = ca;
+                    vb = cb;
+                    node_gap = only_a;
+                }
+            }
+        }
         // chainweb-data keeps rows of orphaned blocks: on /txs/txs it lists them beside the
         // canonical row, and its /txs/tx answers 404 when a request key has several rows.
         // A's row must be one of B's (the node pair checks that A's block is canonical); B's
@@ -777,6 +853,24 @@ impl Ctx {
                     e.path = format!("{ORACLE_LAG_PATH}{}", e.path);
                 }
             }
+        }
+        if !node_gap.is_empty() {
+            let keys: Vec<Value> = node_gap
+                .iter()
+                .take(10)
+                .map(|r| json!([r.get("chain"), r.get("height"), r.get("requestKey")]))
+                .collect();
+            let path = if tb.kind == crate::config::TargetKind::KdaTxs {
+                KDATXS_MISSING_NODE_PATH
+            } else {
+                CWD_MISSING_NODE_PATH
+            };
+            d.push(DiffEntry {
+                path: path.into(),
+                kind: DiffKind::Extra,
+                a: Some(json!({"rows": node_gap.len(), "window_cut": window_cut, "first": keys})),
+                b: None,
+            });
         }
         if !kt_gap.is_empty() {
             d.push(DiffEntry {
@@ -1309,6 +1403,59 @@ impl Ctx {
             })
     }
 
+    /// Whether the node's `/poll` puts every row's request key in the row's block, with an
+    /// event whose params name `account` (ruling R3E-14). Coinbase rows are not confirmed.
+    async fn node_confirms(&self, req: &Request, rows: &[Value], account: &str) -> bool {
+        let mut by_chain: HashMap<u8, Vec<(String, String)>> = HashMap::new();
+        for r in rows {
+            let s = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+            let (Some(rk), Some(bh), Some(c)) = (
+                s("requestKey"),
+                s("blockHash"),
+                r.get("chain").and_then(Value::as_u64),
+            ) else {
+                return false;
+            };
+            if rk == "<coinbase>" {
+                return false;
+            }
+            let Ok(c) = u8::try_from(c) else {
+                return false;
+            };
+            by_chain.entry(c).or_default().push((rk, bh));
+        }
+        for (c, keys) in by_chain {
+            for chunk in keys.chunks(NODE_POLL_CHUNK) {
+                let rks: Vec<String> = chunk.iter().map(|(rk, _)| rk.clone()).collect();
+                self.count_request(req.route.as_str(), "node", 1);
+                let Ok(res) = self.node.poll(c, &rks).await else {
+                    return false;
+                };
+                for (rk, bh) in chunk {
+                    let Some(v) = res.get(rk) else {
+                        return false;
+                    };
+                    let in_block = v.pointer("/metaData/blockHash").and_then(Value::as_str)
+                        == Some(bh.as_str());
+                    let names = v
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .is_some_and(|evs| {
+                            evs.iter().any(|e| {
+                                e.get("params")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|p| p.iter().any(|x| x.as_str() == Some(account)))
+                            })
+                        });
+                    if !(in_block && names) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     async fn cwd_has_transfer(&self, req: &Request, tb: &Target, row: &Value) -> bool {
         if tb.kind != crate::config::TargetKind::ChainwebData {
             return false;
@@ -1770,6 +1917,17 @@ pub async fn once(cfg: CompareConfig, path: &str) -> anyhow::Result<Vec<Outcome>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_account_reads_both_routes() {
+        let r = |p: &str| Request::new(p.to_string(), crate::gen::Origin::Replay, None);
+        assert_eq!(
+            query_account(&r("/txs/account/k%3Aab12?chain=0&limit=50")),
+            "k:ab12"
+        );
+        assert_eq!(query_account(&r("/v1/txs/k:ab12/coin/10")), "k:ab12");
+        assert_eq!(query_account(&r("/txs/recent")), "");
+    }
 
     #[test]
     fn lag_and_limit_helpers() {

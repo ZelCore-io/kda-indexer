@@ -196,3 +196,19 @@ json_path_glob = "/*/creationTime"
 condition = "changed"
 reason = "Same as known-f2-creation-time on /v1/txs: kda-txs rounds a fractional meta.creationTime (seen live: k:e3840440.../coin/50, compat 02:17:27, kda-txs 02:17:28)."
 owner_note = "PROPOSED in run 3E-c: known F2 for the fix round; allowlisted meanwhile like G1."
+
+[[entry]]
+id = "cwd-missing-node"
+route = "account"
+json_path_glob = "/~cwd-missing-node"
+condition = "any"
+reason = "chainweb-data leaves out account rows the node holds (seen live: 7590fd61...?chain=0&limit=50, 7 rows and no Chainweb-Next on every refetch, kda-indexer 50; 6d87fd6e...?minheight=1151496&maxheight=1153496, no rows, kda-indexer 35 in node block 6tpjetrL at chain 0 height 1152748; k:5adb1666... rows at heights 7306102-7306103 on several chains). When both sides held their full limit they are first cut at the higher of their lowest heights. With no row only chainweb-data lists, every row only kda-indexer lists must be in the same block on the node's /poll, with an event naming the account; those rows move here."
+owner_note = "ACCEPTED (owner ruling R3E-14, run 3E-d): node agrees with kda-indexer, so chainweb-data's missing rows and short pages without a next-page token are chainweb-data defects."
+
+[[entry]]
+id = "kdatxs-missing-node"
+route = "v1txs"
+json_path_glob = "/~kdatxs-missing-node"
+condition = "any"
+reason = "kda-txs answers a varying subset of an account's /v1/txs rows (seen live: acc28032.../coin/250, 63, 54, 404 and 47 rows on four fetches, every row also on kda-indexer, which lists 125; 40a8967d.../coin/10, kda-txs never lists JxrH9wub... at chain 0 height 3697206, node block Cr4YV2QE). Same check as cwd-missing-node: both full -> cut at the higher lowest height; no kda-txs-only row; every kda-indexer-only row in the same block on the node's /poll with an event naming the account."
+owner_note = "PROPOSED in run 3E-d (P3 Task 8), controller/owner to accept: kda-txs data gap / unstable subset, confirmed per row on the node."
