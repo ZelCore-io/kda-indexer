@@ -244,6 +244,24 @@ pub trait Txn {
         Ok(out)
     }
 
+    /// Keys with `from <= key`, in key order, while `f(key)` holds (`from = &[]` = all).
+    /// Values are never copied and nothing is collected: for counting walks.
+    fn walk_keys(&self, t: Table, from: &[u8], mut f: impl FnMut(&[u8]) -> bool) -> Result<()> {
+        let mut c = self.raw().cursor(self.tables().dbi(t))?;
+        let mut cur = if from.is_empty() {
+            c.first::<Vec<u8>, ()>()?
+        } else {
+            c.set_range::<Vec<u8>, ()>(from)?
+        };
+        while let Some((k, ())) = cur {
+            if !f(&k) {
+                break;
+            }
+            cur = c.next::<Vec<u8>, ()>()?;
+        }
+        Ok(())
+    }
+
     /// Like `scan`, but at most `limit` rows, starting strictly after `after` (`None` = from
     /// the first row). Lets callers walk a large table in bounded chunks.
     fn scan_chunk(

@@ -20,7 +20,7 @@ use crate::server::ApiState;
 use crate::store::View;
 use crate::ApiResult;
 
-/// A counted answer is reused this long (the hot scan reads the whole tail window).
+/// A counted answer is reused this long (the count walks every hot tx key).
 const CACHE_FOR: Duration = Duration::from_secs(5);
 
 /// Height of the genesis blocks of chains 10–19.
@@ -52,30 +52,60 @@ pub fn user_tx_count(view: &View) -> ApiResult<u64> {
         .sum();
     let lo = TxKey::new(view.hot_floor(), 0, 0).to_be_bytes();
     let mut hot = 0u64;
-    view.txn.scan(Table::TailTxs, &lo, |k| {
-        if let Ok(b) = <[u8; 8]>::try_from(k) {
-            if !TxKey::from_be_bytes(b).is_coinbase() {
-                hot += 1;
+    let mut seen = 0u64;
+    let mut late = view.check_deadline().is_err();
+    if !late {
+        // Keys only: the hot window can hold hundreds of thousands of txs.
+        view.txn.walk_keys(Table::TailTxs, &lo, |k| {
+            seen += 1;
+            if seen.is_multiple_of(4096) && view.check_deadline().is_err() {
+                late = true;
+                return false;
             }
-        }
-        true
-    })?;
+            if let Ok(b) = <[u8; 8]>::try_from(k) {
+                if !TxKey::from_be_bytes(b).is_coinbase() {
+                    hot += 1;
+                }
+            }
+            true
+        })?;
+    }
+    if late {
+        return Err(crate::ApiError::Deadline);
+    }
     Ok((frozen + hot).saturating_sub(genesis_user_txs(view)?))
 }
 
 static CACHE: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+/// Held while one request counts: concurrent misses do not each walk the window.
+static COUNTING: Mutex<()> = Mutex::new(());
 
-/// `user_tx_count`, reused for `CACHE_FOR`.
+fn cache_get(fresh_only: bool) -> Option<u64> {
+    let c = (*CACHE.lock().unwrap_or_else(|e| e.into_inner()))?;
+    (!fresh_only || c.0.elapsed() < CACHE_FOR).then_some(c.1)
+}
+
+/// `user_tx_count`, reused for `CACHE_FOR`. Single-flight: on a miss one request counts;
+/// the others answer the previous value, or wait for the count when there is none yet.
 fn cached_count(view: &View) -> ApiResult<u64> {
-    if let Some((at, n)) = CACHE.lock().ok().and_then(|c| *c) {
-        if at.elapsed() < CACHE_FOR {
-            return Ok(n);
+    if let Some(n) = cache_get(true) {
+        return Ok(n);
+    }
+    let _g = match COUNTING.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            if let Some(n) = cache_get(false) {
+                return Ok(n);
+            }
+            COUNTING.lock().unwrap_or_else(|e| e.into_inner())
         }
+    };
+    if let Some(n) = cache_get(true) {
+        return Ok(n);
     }
     let n = user_tx_count(view)?;
-    if let Ok(mut c) = CACHE.lock() {
-        *c = Some((Instant::now(), n));
-    }
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), n));
     Ok(n)
 }
 
@@ -104,5 +134,18 @@ pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
         }
         Ok(None) => text(StatusCode::NOT_FOUND, "Server database is empty"),
         Err(e) => e.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn count_checks_the_deadline() {
+        let (_d, store) = crate::testutil::store();
+        let view = store.view(Instant::now() - Duration::from_secs(1)).unwrap();
+        assert!(matches!(user_tx_count(&view), Err(crate::ApiError::Deadline)));
     }
 }
