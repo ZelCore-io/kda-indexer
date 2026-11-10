@@ -63,3 +63,13 @@ json_path_glob = "/result/error/info"
 condition = "changed"
 reason = "For failed txs chainweb-data's error info has the source position at execution time (\"<interactive>:0:11937\"); the node serves \"<toplevel>:0\"."
 owner_note = "Same txs as failed-tx-callstack."
+
+# --- Harness tolerances reported as visible hits (P3, Task 7) ---
+
+[[entry]]
+id = "stats-supply-tolerance"
+route = "stats"
+json_path_glob = "/coinsInCirculation~tolerance"
+condition = "changed"
+reason = "Both sides compute the circulating supply at their own tip height and time; values within a relative 1e-6 are accepted. Larger differences are reported at /coinsInCirculation."
+owner_note = "Tolerance from the P3 plan (Task 7)."

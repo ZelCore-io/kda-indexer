@@ -1,5 +1,6 @@
 # Edge seeds for mainnet01 (spec section 7.2 item 3). Public chain data only.
-# kind = "height" | "request_key" | "account" | "pact_id"; chain is optional for
+# kind = "height" | "request_key" | "account" | "pact_id"; an account may carry `token` (one
+# non-coin module, also asked on /txs/account and /v1/txs); chain is optional for
 # request_key (taken from side A's answer when absent). Values starting with "TODO" are
 # placeholders for the owner and are skipped by the generator.
 
@@ -75,7 +76,37 @@ note = "control: cmd hashes to the request key, height 2000009"
 [[seed]]
 kind = "account"
 value = "k:e7f7130f359fb1f8c87873bf858a0e9cbc3c1059f62ae715ec72e760b055e9f3"
-note = "miner account with a very large history (coinbase receiver in 2026-11)"
+note = "miner account with a very large history (coinbase receiver in 2026-11); chainweb-data answers it slowly"
+
+# Busy accounts for /v1/txs (coin, plus one token where the account has one). Picked from
+# recent mainnet traffic; the roles are what the transfers show, not a registry.
+[[seed]]
+kind = "account"
+value = "k:5fd26d2399244e1c476984d4db059f0c46558b7d8677243dbd8fd35722fa3c15"
+note = "miner account (coinbase receiver on several chains in 2026-11)"
+
+[[seed]]
+kind = "account"
+value = "k:203bfdbfc16818600cf1387998ed295c1d121811bc25ed2f947ad9bbb7a5d0ff"
+token = "free.crankk01"
+note = "holder with coin and free.crankk01 transfers, cross-chain legs included"
+
+[[seed]]
+kind = "account"
+value = "xfS-eHFuzE72619KflxCn0FKSa5BhvvhyR9THumhdOE"
+note = "hash-named account with a long coin history"
+
+[[seed]]
+kind = "account"
+value = "c:wExopLZdoPoxYjhjFPnnnnKlFqZWzj9bXCp-oD2vckA"
+token = "n_b742b4e9c600892af545afb408326e82a6c0c6ed.zUSD"
+note = "capability-guard account on multi-leg zUSD swap transfers (DEX style)"
+
+[[seed]]
+kind = "account"
+value = "c:jDTPscjEcdDjRMIPinQfgpwBBBlKaDoNd-f90xvqUB8"
+token = "n_b742b4e9c600892af545afb408326e82a6c0c6ed.zUSD"
+note = "second zUSD swap-leg account (DEX style)"
 
 [[seed]]
 kind = "request_key"

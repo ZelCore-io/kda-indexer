@@ -169,6 +169,32 @@ pub struct DailySummary {
     pub allowlist_hits: BTreeMap<String, u64>,
     /// Unexplained diff paths (normalised: array indexes replaced by `*`) -> count.
     pub unexplained_paths: BTreeMap<String, u64>,
+    /// Ten-minute buckets (key: the bucket start, `YYYY-MM-DDTHH:MM:SSZ`) for `kda-compare
+    /// summary --since`.
+    #[serde(default)]
+    pub windows: BTreeMap<String, Window>,
+}
+
+/// Seconds per `DailySummary.windows` bucket.
+pub const WINDOW_SECS: u64 = 600;
+
+/// What one ten-minute bucket counted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Window {
+    /// `route|a|b` -> outcome class -> count (one count per request through the pair).
+    pub pairs: BTreeMap<String, BTreeMap<String, u64>>,
+    /// `route|target` -> latency histogram (see `lat_bucket`) -> HTTP exchanges.
+    pub lat: BTreeMap<String, BTreeMap<u16, u64>>,
+}
+
+/// Latency histogram bucket: log scale, ratio 1.2 (percentiles are good to about 20%).
+pub fn lat_bucket(ms: u64) -> u16 {
+    ((ms.max(1) as f64).ln() / 1.2f64.ln()).floor() as u16
+}
+
+/// Upper edge of a `lat_bucket`, in ms.
+pub fn lat_upper_ms(b: u16) -> f64 {
+    1.2f64.powi(i32::from(b) + 1)
 }
 
 impl DailySummary {
@@ -179,6 +205,20 @@ impl DailySummary {
             started: iso_secs(now),
             updated: iso_secs(now),
             ..Default::default()
+        }
+    }
+
+    /// Today's summary file when there is one (a restarted process keeps counting into it, so
+    /// `kda-compare summary --since` sees the whole day), else a fresh summary.
+    pub fn load_or_new(out_dir: &Path) -> DailySummary {
+        let today = date_of(now_secs());
+        let old = std::fs::read_to_string(Self::path(out_dir, &today))
+            .ok()
+            .and_then(|t| serde_json::from_str::<DailySummary>(&t).ok())
+            .filter(|s| s.date == today);
+        match old {
+            Some(s) => s,
+            None => DailySummary::new(),
         }
     }
 
@@ -197,6 +237,34 @@ impl DailySummary {
             .entry(route.to_string())
             .or_default()
             .entry(class.to_string())
+            .or_default() += 1;
+    }
+
+    fn window(&mut self) -> &mut Window {
+        let now = now_secs();
+        let key = iso_secs(now - now % WINDOW_SECS);
+        self.windows.entry(key).or_default()
+    }
+
+    /// One request through the pair `(a, b)` ended in `class`.
+    pub fn pair(&mut self, route: &str, a: &str, b: &str, class: &str) {
+        *self
+            .window()
+            .pairs
+            .entry(format!("{route}|{a}|{b}"))
+            .or_default()
+            .entry(class.to_string())
+            .or_default() += 1;
+    }
+
+    /// One HTTP exchange with `target` on `route` took `ms`.
+    pub fn latency(&mut self, route: &str, target: &str, ms: u64) {
+        *self
+            .window()
+            .lat
+            .entry(format!("{route}|{target}"))
+            .or_default()
+            .entry(lat_bucket(ms))
             .or_default() += 1;
     }
 

@@ -11,6 +11,10 @@ pub const MAX_ENTRIES: usize = 50;
 const FLOAT_REL_EPS: f64 = 1e-12;
 /// `/stats.transactionCount` is a Postgres estimate in chainweb-data.
 const STATS_COUNT_TOLERANCE: f64 = 0.01;
+/// `/stats.coinsInCirculation`: both sides compute the supply at their own height and time.
+const STATS_SUPPLY_TOLERANCE: f64 = 1e-6;
+/// Path used to report a `/stats` supply difference that is inside the tolerance.
+pub const STATS_SUPPLY_PATH: &str = "/coinsInCirculation~tolerance";
 /// Path used to report a `/stats` count difference that is inside the tolerance (allowlisted
 /// as `stats-estimate`, so the hit is visible in the summary).
 pub const STATS_ESTIMATE_PATH: &str = "/transactionCount~estimate";
@@ -22,36 +26,123 @@ pub fn diff(a: &Value, b: &Value) -> Vec<DiffEntry> {
     out
 }
 
-/// `diff` plus route rules that need both sides (the `/stats` count tolerance).
+/// `diff` plus route rules that need both sides (the `/stats` tolerances).
 pub fn diff_route(route: &RouteKind, a: &Value, b: &Value) -> Vec<DiffEntry> {
     if *route == RouteKind::Stats {
         let (mut a2, mut b2) = (a.clone(), b.clone());
-        let ca = a.get("transactionCount").and_then(number_f64);
-        let cb = b.get("transactionCount").and_then(number_f64);
-        let mut extra = None;
-        if let (Some(x), Some(y)) = (ca, cb) {
-            if x != y && (x - y).abs() <= STATS_COUNT_TOLERANCE * x.abs().max(y.abs()) {
-                for v in [&mut a2, &mut b2] {
-                    if let Some(m) = v.as_object_mut() {
-                        m.remove("transactionCount");
+        let mut extra = Vec::new();
+        for (key, tol, path) in [
+            (
+                "transactionCount",
+                STATS_COUNT_TOLERANCE,
+                STATS_ESTIMATE_PATH,
+            ),
+            (
+                "coinsInCirculation",
+                STATS_SUPPLY_TOLERANCE,
+                STATS_SUPPLY_PATH,
+            ),
+        ] {
+            let x = a.get(key).and_then(num_or_text_f64);
+            let y = b.get(key).and_then(num_or_text_f64);
+            if let (Some(x), Some(y)) = (x, y) {
+                if x != y && (x - y).abs() <= tol * x.abs().max(y.abs()) {
+                    for v in [&mut a2, &mut b2] {
+                        if let Some(m) = v.as_object_mut() {
+                            m.remove(key);
+                        }
                     }
+                    extra.push(DiffEntry {
+                        path: path.into(),
+                        kind: DiffKind::Changed,
+                        a: a.get(key).cloned(),
+                        b: b.get(key).cloned(),
+                    });
                 }
-                extra = Some(DiffEntry {
-                    path: STATS_ESTIMATE_PATH.into(),
-                    kind: DiffKind::Changed,
-                    a: a.get("transactionCount").cloned(),
-                    b: b.get("transactionCount").cloned(),
-                });
             }
         }
         let mut d = diff(&a2, &b2);
-        if let Some(e) = extra {
-            d.insert(0, e);
+        if !extra.is_empty() {
+            d.splice(0..0, extra);
             d.truncate(MAX_ENTRIES);
         }
         return d;
     }
     diff(a, b)
+}
+
+fn num_or_text_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::String(s) => s.parse().ok(),
+        _ => number_f64(v),
+    }
+}
+
+/// Items `/txs/recent` returns on each side.
+pub const RECENT_ITEMS: usize = 10;
+
+/// `/txs/recent` (both sides normalised): each side has exactly 10 items and is height
+/// descending; items present on both sides (by `requestKey`) are diffed. Items on one side
+/// only are skew (the two sides read slightly different tips), reported as the second value
+/// rather than as diffs.
+pub fn recent_diff(a: &Value, b: &Value) -> (Vec<DiffEntry>, bool) {
+    let (Some(xa), Some(xb)) = (a.as_array(), b.as_array()) else {
+        return (diff(a, b), false);
+    };
+    let mut out = Vec::new();
+    for (side, xs) in [("a", xa), ("b", xb)] {
+        if xs.len() != RECENT_ITEMS {
+            push(
+                &mut out,
+                &format!("/@count-{side}"),
+                DiffKind::Changed,
+                Some(&Value::from(xs.len())),
+                Some(&Value::from(RECENT_ITEMS)),
+            );
+        }
+        let heights: Vec<Option<u64>> = xs
+            .iter()
+            .map(|x| x.get("height").and_then(Value::as_u64))
+            .collect();
+        let ordered =
+            heights.iter().all(Option::is_some) && heights.windows(2).all(|w| w[0] >= w[1]);
+        if !ordered {
+            push(
+                &mut out,
+                &format!("/@order-{side}"),
+                DiffKind::Changed,
+                xs.first(),
+                None,
+            );
+        }
+    }
+    let key = |v: &Value| {
+        v.get("requestKey")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let by_b: std::collections::HashMap<String, &Value> =
+        xb.iter().filter_map(|v| Some((key(v)?, v))).collect();
+    let mut overlap = 0;
+    let mut skew = false;
+    for va in xa {
+        match key(va).and_then(|k| by_b.get(&k).map(|vb| (k, *vb))) {
+            Some((k, vb)) => {
+                overlap += 1;
+                for mut e in diff(va, vb) {
+                    e.path = format!("/{k}{}", if e.path == "/" { "" } else { &e.path });
+                    if out.len() < MAX_ENTRIES {
+                        out.push(e);
+                    }
+                }
+            }
+            None => skew = true,
+        }
+    }
+    if overlap < xb.len() {
+        skew = true;
+    }
+    (out, skew)
 }
 
 fn escape(k: &str) -> String {
@@ -212,4 +303,71 @@ pub async fn follow_pages(target: &Target, path: &str, depth: u32) -> anyhow::Re
         pages.push(cap);
     }
     Ok(Paged { pages, items })
+}
+
+#[cfg(test)]
+mod harness_rule_tests {
+    use super::*;
+    use crate::normalize::normalize;
+    use serde_json::json;
+
+    /// Items `k{n}` for `n` in `ids`, height `200 - n` (so a lower id is newer... higher).
+    fn recent(ids: std::ops::Range<i64>) -> Value {
+        Value::Array(
+            ids.rev()
+                .map(|n| json!({"height": 200 + n, "requestKey": format!("k{n}"), "sender": "a"}))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn recent_overlap_and_skew() {
+        let a = recent(0..10);
+        // B is one tip ahead: it has one new item, A's oldest item fell off.
+        let b = recent(1..11);
+        let (d, skew) = recent_diff(&a, &b);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(skew);
+        // identical -> no skew
+        let (d, skew) = recent_diff(&a, &a.clone());
+        assert!(d.is_empty() && !skew);
+        // a changed field on an overlapping item is a diff
+        let mut c = b.clone();
+        c[2]["sender"] = json!("zzz");
+        let (d, _) = recent_diff(&a, &c);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].path.ends_with("/sender"), "{}", d[0].path);
+        // wrong count and order are diffs
+        let short = Value::Array(a.as_array().unwrap()[..9].to_vec());
+        assert_eq!(recent_diff(&a, &short).0[0].path, "/@count-b");
+        let mut unordered = a.clone();
+        unordered.as_array_mut().unwrap().swap(0, 9);
+        assert_eq!(recent_diff(&a, &unordered).0[0].path, "/@order-b");
+    }
+
+    #[test]
+    fn stats_tolerances() {
+        let a = json!({"transactionCount": 1000, "coinsInCirculation": 379605351.59648});
+        let b =
+            json!({"transactionCount": 1005, "coinsInCirculation": 379605351.59648 * (1.0 + 5e-7)});
+        let d = diff_route(&RouteKind::Stats, &a, &b);
+        let paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec![STATS_ESTIMATE_PATH, STATS_SUPPLY_PATH]);
+        // outside the tolerance the real field is reported
+        let c =
+            json!({"transactionCount": 1000, "coinsInCirculation": 379605351.59648 * (1.0 + 5e-6)});
+        let d = diff_route(&RouteKind::Stats, &a, &c);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path, "/coinsInCirculation");
+    }
+
+    #[test]
+    fn v1txs_set_semantics() {
+        let mut a =
+            json!([{"requestKey": "b", "_id": "x", "gasPrice": 1.0e-8}, {"requestKey": "a"}]);
+        let mut b = json!([{"requestKey": "a"}, {"requestKey": "b", "gasPrice": 1.0e-8}]);
+        normalize(&RouteKind::V1Txs, &mut a);
+        normalize(&RouteKind::V1Txs, &mut b);
+        assert!(diff_route(&RouteKind::V1Txs, &a, &b).is_empty());
+    }
 }

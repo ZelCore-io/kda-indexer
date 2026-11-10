@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::allowlist::Allowlist;
 use crate::config::CompareConfig;
-use crate::diff::{diff_route, follow_pages, DiffEntry, DiffKind, Paged};
+use crate::diff::{diff_route, follow_pages, recent_diff, DiffEntry, DiffKind, Paged};
 use crate::gen::random::{canonical_header, RandomGen};
 use crate::gen::replay::ReplayGen;
 use crate::gen::seeds::SeedGen;
@@ -76,7 +76,7 @@ impl Ctx {
             tips: Arc::new(Tips::default()),
             allow,
             log,
-            summary: Mutex::new(DailySummary::new()),
+            summary: Mutex::new(DailySummary::load_or_new(&cfg.out_dir)),
             metrics: Metrics::new(),
             stopping: std::sync::atomic::AtomicBool::new(false),
             a_errors_in_row: std::sync::atomic::AtomicU32::new(0),
@@ -158,14 +158,28 @@ impl Ctx {
             let Some(ta) = self.targets.get(a) else {
                 continue;
             };
+            // A pair only compares a request both sides serve (the node serves no /v1/txs).
+            if !ta.kind.serves(req.route) {
+                continue;
+            }
             let o = if b == "node" {
+                if req.route == RouteKind::V1Txs {
+                    continue;
+                }
                 self.vs_node(req, ta).await
             } else if let Some(tb) = self.targets.get(b) {
+                if !tb.kind.serves(req.route) {
+                    continue;
+                }
                 self.vs_target(req, ta, tb).await
             } else {
                 continue;
             };
             let route = req.route.as_str();
+            self.summary
+                .lock()
+                .expect("summary")
+                .pair(route, a, b, &o.class);
             self.note_a_result(&o.class);
             self.count_class(route, &o.class);
             if let Some(rec) = &o.record {
@@ -198,6 +212,12 @@ impl Ctx {
         let p = follow_pages(t, &req.path_and_query, depth).await;
         let n = p.as_ref().map(|p| p.pages.len()).unwrap_or(1);
         self.count_request(req.route.as_str(), &t.name, n);
+        if let Ok(p) = &p {
+            let mut s = self.summary.lock().expect("summary");
+            for c in &p.pages {
+                s.latency(req.route.as_str(), &t.name, c.ms);
+            }
+        }
         p
     }
 
@@ -241,9 +261,16 @@ impl Ctx {
         let pb = self.fetch_a(req, tb).await;
         let (pa, pb) = match (pa, pb) {
             (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) => return self.a_error(req, ta, &tb.name, None, &e.to_string()),
+            (Err(e), _) => return self.a_error(req, ta, &tb.name, None, &format!("{e:#}")),
             (Ok(a), Err(e)) => {
-                return self.b_error(req, ta, &tb.name, Some(&a), &e.to_string(), String::new())
+                return self.b_error(
+                    req,
+                    ta,
+                    &tb.name,
+                    Some(&a),
+                    &format!("{e:#}"),
+                    String::new(),
+                )
             }
         };
         let sa = pa.pages[0].status;
@@ -254,7 +281,11 @@ impl Ctx {
         let (mut va, mut vb) = (pa.items.clone(), pb.items.clone());
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
-        let mut d = diff_route(&req.route, &va, &vb);
+        let (mut d, skew) = if req.route == RouteKind::Recent {
+            recent_diff(&va, &vb)
+        } else {
+            (diff_route(&req.route, &va, &vb), false)
+        };
         if sa != sb {
             d.insert(
                 0,
@@ -268,7 +299,7 @@ impl Ctx {
         }
         let curl_b = format!("curl -s {}", sh_url("B", &req.path_and_query));
         let b_body = trim_body(&pb.pages[0].body);
-        self.finish(
+        let mut o = self.finish(
             req,
             ta,
             &tb.name,
@@ -279,7 +310,12 @@ impl Ctx {
             false,
             curl_b,
             None,
-        )
+        );
+        // Items on one side only (the sides read slightly different tips) are not a diff.
+        if skew && o.class == "match" {
+            o.class = "skew".into();
+        }
+        o
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -491,7 +527,7 @@ impl Ctx {
         self.count_request(route, "node", 1);
         let poll = match self.node.poll(chain, &[rk.to_string()]).await {
             Ok(m) => m,
-            Err(e) => return self.b_error(req, ta, "node", Some(pa), &e.to_string(), curl_b),
+            Err(e) => return self.b_error(req, ta, "node", Some(pa), &format!("{e:#}"), curl_b),
         };
         let a_found = pa.pages[0].status == 200 && a_first.is_some();
         let Some(entry) = poll.get(rk).cloned() else {

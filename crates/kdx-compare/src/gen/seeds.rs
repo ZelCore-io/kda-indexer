@@ -8,7 +8,7 @@ use kdx_node::NodeClient;
 use rand::rngs::StdRng;
 use serde::Deserialize;
 
-use super::random::{block_requests, BlockDraw};
+use super::random::{block_requests, v1txs_request, BlockDraw};
 use super::{enc_query, enc_segment, rng, Generator, OracleRef, Origin, Request, Tips};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -34,6 +34,9 @@ pub struct Seed {
     #[serde(default)]
     pub chain: Option<u8>,
     pub value: SeedValue,
+    /// Account seeds: one non-`coin` token module to ask about besides `coin`.
+    #[serde(default)]
+    pub token: Option<String>,
     #[serde(default)]
     pub note: String,
 }
@@ -130,11 +133,24 @@ impl SeedGen {
                 if let Some(c) = s.chain {
                     q.push_str(&format!("&chain={c}"));
                 }
-                vec![Request::new(
-                    format!("/txs/account/{}?{q}", enc_segment(&s.text())),
-                    o,
-                    None,
-                )]
+                let acct = s.text();
+                let mut reqs = vec![
+                    Request::new(format!("/txs/account/{}?{q}", enc_segment(&acct)), o, None),
+                    v1txs_request(&acct, "coin", 50, o),
+                ];
+                if let Some(t) = &s.token {
+                    reqs.push(Request::new(
+                        format!(
+                            "/txs/account/{}?{q}&token={}",
+                            enc_segment(&acct),
+                            enc_query(t)
+                        ),
+                        o,
+                        None,
+                    ));
+                    reqs.push(v1txs_request(&acct, t, 50, o));
+                }
+                reqs
             }
             SeedKind::PactId => vec![Request::new(
                 format!("/txs/search?pactid={}", enc_query(&s.text())),

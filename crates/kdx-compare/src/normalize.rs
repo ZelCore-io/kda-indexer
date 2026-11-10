@@ -71,7 +71,10 @@ impl RouteKind {
 
     /// Routes whose chainweb-data payload has a float `gasPrice`.
     fn float_gas_price(self) -> bool {
-        matches!(self, RouteKind::Tx | RouteKind::Txs | RouteKind::Other)
+        matches!(
+            self,
+            RouteKind::Tx | RouteKind::Txs | RouteKind::V1Txs | RouteKind::Other
+        )
     }
 }
 
@@ -88,9 +91,29 @@ pub fn normalize(route: &RouteKind, v: &mut Value) {
         match route {
             RouteKind::Account => tie_groups(items, account_key),
             RouteKind::Events => tie_groups(items, events_key),
+            RouteKind::V1Txs => v1txs_as_set(items),
             _ => {}
         }
     }
+}
+
+/// `/v1/txs` answers are sets keyed by `requestKey` (the order is not meaningful and the live
+/// service adds a cache `_id` to some entries).
+fn v1txs_as_set(items: &mut [Value]) {
+    for it in items.iter_mut() {
+        if let Some(m) = it.as_object_mut() {
+            m.remove("_id");
+        }
+    }
+    items.sort_by_cached_key(|v| {
+        (
+            v.get("requestKey")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            v.to_string(),
+        )
+    });
 }
 
 fn sort_keys(v: &mut Value) {
