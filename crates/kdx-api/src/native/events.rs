@@ -115,7 +115,7 @@ pub async fn list(st: St, q: Result<Query<Q>, axum::extract::rejection::QueryRej
                     m.insert(k.clone(), v.clone());
                 }
                 m.append(&mut row);
-                rows.push((e.pos as u16, Value::Object(m)));
+                rows.push((crate::compat::row_sub(e.pos, 0, 0)?, Value::Object(m)));
             }
             Ok(rows)
         })?;

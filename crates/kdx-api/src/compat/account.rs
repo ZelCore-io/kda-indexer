@@ -75,12 +75,11 @@ impl RowSource for Src {
         let mut out = Vec::new();
         for t in trs.iter().filter(|t| t.token == token) {
             let idx = shapes::ev_idx(r.key, t.pos);
-            let pos = (t.pos as u16) << 1;
             if t.from == acct {
-                out.push((pos, idx));
+                out.push((super::row_sub(t.pos, 1, 0)?, idx));
             }
             if t.to == acct {
-                out.push((pos | 1, idx));
+                out.push((super::row_sub(t.pos, 1, 1)?, idx));
             }
         }
         Ok(out)

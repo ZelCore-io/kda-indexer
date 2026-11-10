@@ -91,11 +91,10 @@ impl RowSource for Src {
     fn rows(&mut self, view: &View, r: &TxRecord) -> ApiResult<Vec<(u16, i64)>> {
         self.load(view, r)?;
         let evs = &self.cache[&r.key];
-        Ok(evs
-            .iter()
+        evs.iter()
             .filter(|e| self.f.matches(e))
-            .map(|e| (e.pos as u16, shapes::ev_idx(r.key, e.pos)))
-            .collect())
+            .map(|e| Ok((super::row_sub(e.pos, 0, 0)?, shapes::ev_idx(r.key, e.pos))))
+            .collect()
     }
 
     fn idx_of_sub(&self, k: TxKey, sub: u16) -> i64 {

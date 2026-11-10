@@ -364,6 +364,18 @@ impl RowRef {
 /// Cursor `sub` marking "every row of this height was consumed" (a bounded scan cut).
 pub const SUB_HEIGHT_DONE: u16 = u16::MAX;
 
+/// Row sub-position `pos << shift | side` as a cursor `sub`. Positions that do not fit,
+/// or that would encode `SUB_HEIGHT_DONE`, are an error instead of a wrapped value that
+/// collides with another row or reads as "height done" (R8).
+pub fn row_sub(pos: usize, shift: u32, side: u16) -> ApiResult<u16> {
+    let v = u16::try_from(pos)
+        .ok()
+        .and_then(|p| p.checked_shl(shift).filter(|s| (s >> shift) == p))
+        .map(|p| p | side)
+        .filter(|&v| v != SUB_HEIGHT_DONE);
+    v.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("row position {pos} exceeds the cursor range")))
+}
+
 /// A route's view of one tx: its rows (sub, idx), and how to render one.
 pub trait RowSource {
     /// Rows of `r` (already loaded), as `(sub, idx)`.
@@ -585,6 +597,18 @@ mod tests {
         assert!(!Like::new("a\\%b").matches("xaZby"));
         assert!(Like::new("_").matches("é"));
         assert!(!Like::new("_").matches(""));
+    }
+
+    #[test]
+    fn row_sub_range() {
+        assert_eq!(row_sub(5, 0, 0).unwrap(), 5);
+        assert_eq!(row_sub(5, 1, 1).unwrap(), 11);
+        assert_eq!(row_sub(32_766, 1, 1).unwrap(), 65_533);
+        // 32,767 to-side would encode SUB_HEIGHT_DONE; 32,768 wraps.
+        assert!(row_sub(32_767, 1, 1).is_err());
+        assert!(row_sub(32_768, 1, 0).is_err());
+        assert!(row_sub(65_535, 0, 0).is_err());
+        assert!(row_sub(70_000, 0, 0).is_err());
     }
 
     #[test]

@@ -58,7 +58,7 @@ pub async fn transfers(st: St, path: PathS, q: QueryQ) -> Response {
                 for (k, v) in &ctx {
                     row.entry(k.clone()).or_insert_with(|| v.clone());
                 }
-                rows.push((t.pos as u16, Value::Object(row)));
+                rows.push((crate::compat::row_sub(t.pos, 0, 0)?, Value::Object(row)));
             }
             Ok(rows)
         })?;
