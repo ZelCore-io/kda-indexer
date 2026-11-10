@@ -30,6 +30,31 @@ use crate::target::Target;
 /// Workers sending requests concurrently (the shared limiter caps the rate). Kept low:
 /// slow chainweb-data queries (account/events pages) can take 30 s each.
 const WORKERS: usize = 3;
+/// At most this many A-only account rows are checked against chainweb-data's /txs/tx.
+const GAP_CHECKS: usize = 5;
+/// JSON path of the visible allowlist hit for rows missing from chainweb-data's transfers.
+const CWD_TRANSFERS_GAP_PATH: &str = "/~cwd-transfers-gap";
+
+/// Items of array `a` that `b` does not hold (as a multiset; non-arrays hold nothing).
+fn only_in_first(a: &Value, b: &Value) -> Vec<Value> {
+    let (Value::Array(xa), Value::Array(xb)) = (a, b) else {
+        return Vec::new();
+    };
+    let mut left: HashMap<String, usize> = HashMap::new();
+    for x in xb {
+        *left.entry(x.to_string()).or_default() += 1;
+    }
+    xa.iter()
+        .filter(|x| match left.get_mut(&x.to_string()) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect()
+}
 const TIP_REFRESH: Duration = Duration::from_secs(60);
 const SUMMARY_FLUSH: Duration = Duration::from_secs(60);
 /// Consecutive A errors (timeouts, 5xx) that pause all A traffic: a slow chainweb-data keeps
@@ -286,6 +311,36 @@ impl Ctx {
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
+        // chainweb-data's transfers table misses some rows whose TRANSFER event it does hold
+        // (seen live on chain 0 around heights 1.59M-1.69M). Rows only A lists, when B lists
+        // no row of its own, are checked against B's own /txs/tx (at most GAP_CHECKS calls);
+        // confirmed ones leave the diff as the visible hit /~cwd-transfers-gap.
+        let mut gap_rows: Vec<Value> = Vec::new();
+        if req.route == RouteKind::Account && sa == 200 && sb == 200 {
+            let only_a = only_in_first(&va, &vb);
+            if !only_a.is_empty()
+                && only_a.len() <= GAP_CHECKS
+                && only_in_first(&vb, &va).is_empty()
+            {
+                let mut all = true;
+                for r in &only_a {
+                    if !self.cwd_has_transfer(req, tb, r).await {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    if let Value::Array(xa) = &mut va {
+                        for r in &only_a {
+                            if let Some(i) = xa.iter().position(|x| x == r) {
+                                xa.remove(i);
+                            }
+                        }
+                    }
+                    gap_rows = only_a;
+                }
+            }
+        }
         // chainweb-data keeps rows of orphaned blocks: on /txs/txs it lists them beside the
         // canonical row, and its /txs/tx answers 404 when a request key has several rows.
         // A's row must be one of B's (the node pair checks that A's block is canonical); B's
@@ -340,6 +395,14 @@ impl Ctx {
         } else {
             (diff_route(&req.route, &va, &vb), false)
         };
+        if !gap_rows.is_empty() {
+            d.push(DiffEntry {
+                path: CWD_TRANSFERS_GAP_PATH.into(),
+                kind: DiffKind::Extra,
+                a: Some(Value::Array(gap_rows)),
+                b: None,
+            });
+        }
         if !orphans.is_empty() {
             d.push(DiffEntry {
                 path: "/orphans".into(),
@@ -774,6 +837,48 @@ impl Ctx {
         let payload = self.node.payload_with_outputs(chain, ph).await?;
         let b = crate::gen::random::decode_checked(header, &payload)?;
         Ok(b.txs.into_iter().find(|t| t.hash.to_b64url() == rk))
+    }
+
+    /// Whether chainweb-data's own `/txs/tx` for the row's request key, in the row's block,
+    /// carries the row's `{token}.TRANSFER` event from `fromAccount` to `toAccount`.
+    async fn cwd_has_transfer(&self, req: &Request, tb: &Target, row: &Value) -> bool {
+        if tb.kind != crate::config::TargetKind::ChainwebData {
+            return false;
+        }
+        let s = |k: &str| row.get(k).and_then(Value::as_str);
+        let (Some(rk), Some(token)) = (s("requestKey"), s("token")) else {
+            return false;
+        };
+        if rk == "<coinbase>" {
+            return false;
+        }
+        self.count_request(req.route.as_str(), &tb.name, 1);
+        let Ok(page) = tb.get(&format!("/txs/tx?requestkey={rk}")).await else {
+            return false;
+        };
+        let Some(tx) = page.json().filter(|_| page.status == 200) else {
+            return false;
+        };
+        if tx.get("blockHash") != row.get("blockHash") {
+            return false;
+        }
+        let name = format!("{token}.TRANSFER");
+        let accts = |v: Option<&Value>| match v {
+            Some(Value::String(a)) => a.clone(),
+            _ => String::new(),
+        };
+        tx.get("events")
+            .and_then(Value::as_array)
+            .is_some_and(|evs| {
+                evs.iter().any(|e| {
+                    let p = e.get("params").and_then(Value::as_array);
+                    e.get("name").and_then(Value::as_str) == Some(name.as_str())
+                        && p.is_some_and(|p| {
+                            accts(p.first()) == accts(row.get("fromAccount"))
+                                && accts(p.get(1)) == accts(row.get("toAccount"))
+                        })
+                })
+            })
     }
 
     /// A row of a genesis block: height 0, or the first height of a chain added later.

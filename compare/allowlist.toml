@@ -107,3 +107,11 @@ json_path_glob = "/**"
 condition = "any"
 reason = "/txs/search (pactid and search) is a should route built in P6; until then compat answers 404 and chainweb-data 200."
 owner_note = "Out of scope for P3/P4 (plan header); not a must route, so it never gates. Remove in P6."
+
+[[entry]]
+id = "cwd-transfers-gap"
+route = "account"
+json_path_glob = "/~cwd-transfers-gap"
+condition = "any"
+reason = "chainweb-data's transfers table misses some rows whose TRANSFER event it holds in its events table (seen live: erkng6rS... at 1595413, TI1Kfck... at 1687775 and Sd2fLvTg... at 1685777, all chain 0: events present, transfers rows absent, so /txs/account leaves them out). The harness moves an A-only row here only when B lists no row of its own and chainweb-data's own /txs/tx for that request key, in the same block, carries the matching {token}.TRANSFER event."
+owner_note = "PROPOSED in run 3E-b (P3 Task 8), controller/owner to accept: chainweb-data data gap, kda-indexer derives transfers from the events it indexes."
