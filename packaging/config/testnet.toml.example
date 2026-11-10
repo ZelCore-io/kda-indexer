@@ -60,7 +60,7 @@ ready_max_lag = 20        # /readyz: max blocks a non-halted chain may lag the n
 max_event_lists = 256     # event-name lists one event query may expand to
 
 [search]
-min_len = 4
+min_len = 4               # literal chars name/param need without modulename (search has no minimum)
 max_results = 100
 max_candidates = 10000
 max_scan_heights = 20000

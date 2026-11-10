@@ -287,13 +287,11 @@ fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
             return Err(format!("{k} may contain at most {MAX_PATTERN_WILDCARDS} '%' wildcards"));
         }
     }
-    if let Some(v) = p.get("search") {
-        if v.chars().count() < s.min_len {
-            return Err(format!("search must be at least {} characters", s.min_len));
-        }
-    }
+    // `search` has no minimum length: chainweb-data answers `search=T` (G2). A short
+    // search matches often, so it fills a page fast; the scan stays bounded by
+    // `max_scan_heights` and `timeout_ms` either way.
     // Without modulename a selective name/param can take the bounded scan of every block:
-    // require as many literal characters as `search` does.
+    // require `min_len` literal characters.
     if p.get("modulename").is_none() {
         for k in ["name", "param"] {
             let Some(v) = p.get(k) else { continue };
@@ -348,6 +346,16 @@ pub async fn handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G2: a one-character `search` is accepted, as chainweb-data does.
+    #[test]
+    fn short_search_accepted() {
+        let st = SearchSettings::default();
+        let p = Params::new(vec![("search".into(), "T".into())]);
+        assert!(check_patterns(&p, &st).is_ok());
+        let p = Params::new(vec![("param".into(), "%a%".into())]);
+        assert!(check_patterns(&p, &st).is_err());
+    }
 
     fn params(q: &[(&str, &str)]) -> Params {
         Params::new(q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
