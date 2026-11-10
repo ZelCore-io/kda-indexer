@@ -187,25 +187,18 @@ fn field(v: &Value, k: &str) -> String {
     v.get(k).map(|x| x.to_string()).unwrap_or_default()
 }
 
-/// `(height desc, blockTime, requestKey, idx)`; order is taken as returned, so only equality
-/// of the key matters here. Coinbase rows of several chains at one height share
-/// `(height, "<coinbase>", idx)` and chainweb-data returns them in Postgres physical order
-/// (allowlist `coinbase-tie-order`), so their key leaves out `blockTime`.
+/// Rows of one height (`height desc`): chainweb-data returns the rows of one height, across
+/// chains and within a block, in Postgres physical order (seen live: coinbase rows of chains
+/// 8,6,1,7,0,2,... at one height), so a height compares as a multiset (allowlist
+/// `same-height-tie-order`, which extends the accepted `coinbase-tie-order`). Missing or extra
+/// rows still show; only their order inside one height is ignored.
 fn account_key(v: &Value) -> SortKey {
-    let coinbase = v.get("requestKey").and_then(Value::as_str) == Some("<coinbase>");
-    ["height", "blockTime", "requestKey", "idx"]
-        .iter()
-        .filter(|k| !(coinbase && **k == "blockTime"))
-        .map(|k| field(v, k))
-        .collect()
+    vec![field(v, "height")]
 }
 
-/// `(height desc, requestKey, idx)`.
+/// Same as [`account_key`].
 fn events_key(v: &Value) -> SortKey {
-    ["height", "requestKey", "idx"]
-        .iter()
-        .map(|k| field(v, k))
-        .collect()
+    vec![field(v, "height")]
 }
 
 fn tie_groups(items: &mut [Value], key: fn(&Value) -> SortKey) {

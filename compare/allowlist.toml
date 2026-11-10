@@ -11,14 +11,14 @@ json_path_glob = "/**"
 condition = "any"
 request_contains = "search="
 reason = "Event text search only covers a bounded recent window in kda-indexer (decision Q2); chainweb-data scans further back, so older matches differ."
-owner_note = "Accepted by the owner. Exact module/name event queries are not covered by this entry."
+owner_note = "Accepted by the owner. Exact module/name event queries are not covered by this entry. Also covers the minimum search length (kda-indexer 400, chainweb-data 200 on short strings): known G2, compat is to match chainweb-data in the fix round (run 3E ruling R3E-6)."
 
 [[entry]]
 id = "orphan-rows-txs"
-route = "txs"
+route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
-reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing."
+reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing. Against chainweb-data (no oracle) the rows of blocks other than A's go under /orphans (the node pair checks that A's block is canonical), and chainweb-data's /txs/tx answers 404 for such a request key (seen live: YbvRG1..., chain 2, canonical block QCOhs8... and orphan du_5-bB... at one height); the harness then confirms with one /txs/txs call and reports /orphans."
 owner_note = "Builder call (spec section 4.5): orphans are not kept."
 
 [[entry]]
@@ -46,7 +46,7 @@ route = "*"
 json_path_glob = "/@genesis"
 condition = "b_extra"
 reason = "chainweb-data does not serve transactions of genesis blocks (height 0 on chains 0-9, 852054 on chains 10-19); /txs/tx answers 404 and /txs/txs []. The node has them."
-owner_note = "kda-indexer serves them; P3 will show the reverse difference against chainweb-data. Decide whether compat mode should hide them."
+owner_note = "Known G1 (run 3E ruling R3E-1): chainweb-data's /txs/txs does list genesis txs (6 per chain, stored at height 0 on all 20 chains) while its /txs/tx answers 404; compat hides them until the fix round makes it match chainweb-data. Against chainweb-data the harness reports compat's 404 there as /@genesis."
 
 [[entry]]
 id = "failed-tx-callstack"
@@ -90,7 +90,7 @@ route = "stats"
 json_path_glob = "/transactionCount"
 condition = "changed"
 reason = "chainweb-data's transactionCount is pg_class.reltuples of a transactions table that is never analyzed, so the value is frozen (200,841,520 on 2026-11-10 while the table holds 233,094,876 rows). Its rows also include txs of orphaned blocks and miss blocks it never fetched. kda-indexer counts canonical user txs exactly (229.9M); per-height windows match chainweb-data where it holds no orphans or gaps."
-owner_note = "PROPOSED in run 3E (P3 Task 8), owner to accept. Without it /stats can never be within 1%: the reference value is stale, not an estimate."
+owner_note = "Accepted (run 3E ruling R3E-4). Without it /stats can never be within 1%: the reference value is stale, not an estimate."
 
 [[entry]]
 id = "cwd-page-boundary-dup"
@@ -98,4 +98,12 @@ route = "*"
 json_path_glob = "/~page-dup"
 condition = "changed"
 reason = "chainweb-data can start a Chainweb-Next page with the last row of the previous page (seen live on /txs/account with throttled pages: the same transfer, same chain and idx, twice in a row). The harness drops the repeated row (never a transfer to oneself, which chainweb-data lists twice on purpose) and reports this visible hit; kda-indexer pages never repeat a row."
-owner_note = "PROPOSED in run 3E (P3 Task 8): chainweb-data paging bug, owner to accept."
+owner_note = "Accepted (run 3E ruling R3E-5): chainweb-data paging bug."
+
+[[entry]]
+id = "search-route-p6"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+reason = "/txs/search (pactid and search) is a should route built in P6; until then compat answers 404 and chainweb-data 200."
+owner_note = "Out of scope for P3/P4 (plan header); not a must route, so it never gates. Remove in P6."

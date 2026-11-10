@@ -286,11 +286,68 @@ impl Ctx {
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
-        let (mut d, skew) = if req.route == RouteKind::Recent {
+        // chainweb-data keeps rows of orphaned blocks: on /txs/txs it lists them beside the
+        // canonical row, and its /txs/tx answers 404 when a request key has several rows.
+        // A's row must be one of B's (the node pair checks that A's block is canonical); B's
+        // other rows go under /orphans (allowlist `orphan-rows-txs`).
+        let mut orphans: Vec<Value> = Vec::new();
+        if req.route == RouteKind::Txs && sa == 200 && sb == 200 {
+            if let (Value::Array(xa), Value::Array(xb)) = (&va, &mut vb) {
+                let hashes: Vec<&Value> = xa.iter().filter_map(|r| r.get("blockHash")).collect();
+                if !xa.is_empty() && xb.len() > xa.len() {
+                    let (keep, other): (Vec<Value>, Vec<Value>) = xb
+                        .drain(..)
+                        .partition(|r| r.get("blockHash").is_some_and(|h| hashes.contains(&h)));
+                    *xb = keep;
+                    orphans = other;
+                }
+            }
+        }
+        let orphan_tx = if req.route == RouteKind::Tx && sa == 200 && sb == 404 {
+            self.cwd_orphan_rows(req, tb, &va).await
+        } else {
+            None
+        };
+        // Genesis txs: chainweb-data lists them on /txs/txs, compat hides them (G1).
+        let genesis = matches!(req.route, RouteKind::Tx | RouteKind::Txs)
+            && sa == 404
+            && sb == 200
+            && matches!(&vb, Value::Array(rows) if !rows.is_empty() && rows.iter().all(|r| self.is_genesis_row(r)));
+        // The status difference is part of those two explained cases.
+        let status_explained = genesis || orphan_tx.is_some();
+        let (mut d, skew) = if genesis {
+            (
+                vec![DiffEntry {
+                    path: "/@genesis".into(),
+                    kind: DiffKind::Missing,
+                    a: None,
+                    b: Some(vb.clone()),
+                }],
+                false,
+            )
+        } else if let Some(rows) = orphan_tx {
+            (
+                vec![DiffEntry {
+                    path: "/orphans".into(),
+                    kind: DiffKind::Missing,
+                    a: None,
+                    b: Some(Value::Array(rows)),
+                }],
+                false,
+            )
+        } else if req.route == RouteKind::Recent {
             recent_diff(&va, &vb)
         } else {
             (diff_route(&req.route, &va, &vb), false)
         };
+        if !orphans.is_empty() {
+            d.push(DiffEntry {
+                path: "/orphans".into(),
+                kind: DiffKind::Missing,
+                a: None,
+                b: Some(Value::Array(orphans)),
+            });
+        }
         if pa.boundary_dups + pb.boundary_dups > 0 {
             d.push(DiffEntry {
                 path: PAGE_DUP_PATH.into(),
@@ -307,7 +364,7 @@ impl Ctx {
                 b: Some(json!(pb.pages.len())),
             });
         }
-        if sa != sb {
+        if sa != sb && !status_explained {
             d.insert(
                 0,
                 DiffEntry {
@@ -719,6 +776,43 @@ impl Ctx {
         Ok(b.txs.into_iter().find(|t| t.hash.to_b64url() == rk))
     }
 
+    /// A row of a genesis block: height 0, or the first height of a chain added later.
+    fn is_genesis_row(&self, r: &Value) -> bool {
+        let h = r.get("height").and_then(Value::as_u64);
+        let c = r.get("chain").and_then(Value::as_u64);
+        match (h, c) {
+            (Some(0), Some(_)) => true,
+            (Some(h), Some(c)) => {
+                u8::try_from(c).is_ok_and(|c| !self.graph.chains_at(h - 1).contains(&c))
+            }
+            _ => false,
+        }
+    }
+
+    /// chainweb-data's `/txs/tx` answers 404 when it holds several rows for a request key
+    /// (orphaned blocks). One extra `/txs/txs` call on B: when it lists A's block plus other
+    /// blocks, those other rows are returned (they go under `/orphans`).
+    async fn cwd_orphan_rows(&self, req: &Request, tb: &Target, va: &Value) -> Option<Vec<Value>> {
+        if tb.kind != crate::config::TargetKind::ChainwebData {
+            return None;
+        }
+        let a_hash = va.get("blockHash")?.clone();
+        let (_, q) = req.path_and_query.split_once('?')?;
+        let rk = q.split('&').find_map(|p| p.strip_prefix("requestkey="))?;
+        self.count_request(req.route.as_str(), &tb.name, 1);
+        let page = tb.get(&format!("/txs/txs?requestkey={rk}")).await.ok()?;
+        let Some(Value::Array(rows)) = page.json() else {
+            return None;
+        };
+        if page.status != 200 || rows.len() < 2 {
+            return None;
+        }
+        let (mine, other): (Vec<Value>, Vec<Value>) = rows
+            .into_iter()
+            .partition(|r| r.get("blockHash") == Some(&a_hash));
+        (!mine.is_empty() && !other.is_empty()).then_some(other)
+    }
+
     async fn header_compare(
         &self,
         req: &Request,
@@ -796,7 +890,18 @@ impl Ctx {
         };
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
-        let d = diff_route(&req.route, &va, &vb);
+        let genesis = height == 0 || !self.graph.chains_at(height - 1).contains(&chain);
+        let d = if va.is_null() && genesis {
+            // Seed requests anchored at a genesis block: A hides genesis txs (G1).
+            vec![DiffEntry {
+                path: "/@genesis".into(),
+                kind: DiffKind::Missing,
+                a: None,
+                b: Some(vb.clone()),
+            }]
+        } else {
+            diff_route(&req.route, &va, &vb)
+        };
         self.finish(
             req,
             ta,

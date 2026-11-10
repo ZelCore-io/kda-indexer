@@ -29,9 +29,10 @@ const ACCOUNT_WINDOW: u64 = 1000;
 /// Each one costs the `kda_txs_via_cwd` oracle up to `2 * limit + 2` chainweb-data calls.
 const V1TXS_SHARE: f64 = 0.6;
 const V1TXS_LIMITS: [u32; 5] = [50, 50, 50, 10, 250];
-/// Per sampled tx, the chance of also asking `/txs/recent` and `/stats` (no sampling needed).
-const RECENT_SHARE: f64 = 0.06;
-const STATS_SHARE: f64 = 0.04;
+/// Per sampled tx, the chance of also asking `/txs/recent` and `/stats` (no sampling needed;
+/// both are cheap on every side, and the gate needs 50 of each).
+const RECENT_SHARE: f64 = 0.15;
+const STATS_SHARE: f64 = 0.12;
 
 /// Percent-encodes only what breaks a path (`/ ? # %`, space, control and non-ASCII bytes);
 /// the wallet puts account names and modules into `/v1/txs/...` unencoded.

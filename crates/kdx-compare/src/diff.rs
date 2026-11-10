@@ -280,31 +280,26 @@ pub const PAGE_CUT_PATH: &str = "/~page-cut";
 
 /// chainweb-data serves pages shorter than `limit` that still carry a next token (its page
 /// size is `limit` times a throttling factor). After following the same number of pages one
-/// side then holds fewer rows only because it was cut, not because rows are missing. When the
-/// shorter side is `truncated`, both item arrays are cut to the rows strictly above the last
-/// height the shorter side reached completely (a height can continue on the next page).
-/// Returns true when it cut anything.
+/// side then holds fewer rows only because it was cut, not because rows are missing. A
+/// `truncated` side reached its last height only partly (a height can continue on the next
+/// page, and the rows of one height come in no fixed order on chainweb-data), so both item
+/// arrays are cut to the rows strictly above the highest such last height. Returns true when
+/// it cut anything.
 pub fn cut_to_common_depth(a: &mut Value, a_trunc: bool, b: &mut Value, b_trunc: bool) -> bool {
     let (Value::Array(xa), Value::Array(xb)) = (&mut *a, &mut *b) else {
         return false;
     };
-    let (short, short_trunc) = if xa.len() <= xb.len() {
-        (&*xa, a_trunc)
-    } else {
-        (&*xb, b_trunc)
-    };
-    if !short_trunc || xa.len() == xb.len() {
-        return false;
-    }
     let height = |v: &Value| v.get("height").and_then(Value::as_u64);
-    let Some(last) = short.last().and_then(height) else {
+    let last = |x: &[Value], t: bool| if t { x.last().and_then(height) } else { None };
+    let Some(cut) = last(xa, a_trunc).max(last(xb, b_trunc)) else {
         return false;
     };
-    // Rows are height-descending: keep those above the last (possibly partial) height.
-    let keep = |v: &Value| height(v).is_some_and(|h| h > last);
+    // Rows are height-descending: keep those above the cut height.
+    let keep = |v: &Value| height(v).is_some_and(|h| h > cut);
+    let before = xa.len() + xb.len();
     xa.retain(keep);
     xb.retain(keep);
-    true
+    xa.len() + xb.len() != before
 }
 
 /// `path` with `offset` and `next` removed and `next=<token>` appended.
@@ -430,5 +425,24 @@ mod harness_rule_tests {
         normalize(&RouteKind::V1Txs, &mut a);
         normalize(&RouteKind::V1Txs, &mut b);
         assert!(diff_route(&RouteKind::V1Txs, &a, &b).is_empty());
+    }
+
+    #[test]
+    fn cut_drops_partial_last_height_and_ties_compare_as_multiset() {
+        let row =
+            |h: u64, c: u64| json!({"height": h, "chain": c, "requestKey": "<coinbase>", "idx": 0});
+        // Same length, both truncated inside height 5 with different chains of it.
+        let mut a = json!([row(7, 1), row(6, 0), row(6, 3), row(5, 0)]);
+        let mut b = json!([row(7, 1), row(6, 3), row(6, 0), row(5, 9)]);
+        assert!(cut_to_common_depth(&mut a, true, &mut b, true));
+        normalize(&RouteKind::Events, &mut a);
+        normalize(&RouteKind::Events, &mut b);
+        assert_eq!(a.as_array().unwrap().len(), 3);
+        assert!(diff_route(&RouteKind::Events, &a, &b).is_empty());
+        // Neither side truncated: nothing is cut, a missing row still shows.
+        let mut a = json!([row(7, 1), row(6, 0)]);
+        let mut b = json!([row(7, 1)]);
+        assert!(!cut_to_common_depth(&mut a, false, &mut b, false));
+        assert!(!diff_route(&RouteKind::Events, &a, &b).is_empty());
     }
 }
