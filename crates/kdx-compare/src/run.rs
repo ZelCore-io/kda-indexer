@@ -39,6 +39,22 @@ const CWD_TRANSFERS_GAP_PATH: &str = "/~cwd-transfers-gap";
 
 /// JSON path of the visible allowlist hit for [`events_as_multiset`].
 const EVENT_ORDER_PATH: &str = "/~event-order";
+/// JSON path of the visible allowlist hit for rows above a lagging oracle's tip (ruling R3E-11).
+const ORACLE_LAG_PATH: &str = "/~oracle-lag";
+/// JSON path of the visible allowlist hit for a kda-txs answer that changed on a retry.
+const ORACLE_UNSTABLE_PATH: &str = "/~oracle-unstable";
+/// JSON path of the visible allowlist hit for the oldest height cut at a `/v1/txs` limit.
+const LIMIT_EDGE_PATH: &str = "/~limit-edge";
+/// Heights below a chainweb-data tip (max height on its `/txs/recent`) that still count as
+/// possibly not indexed there: chains run a few heights apart.
+const ORACLE_TIP_MARGIN: u64 = 3;
+/// How long a chainweb-data tip reading is reused.
+const ORACLE_TIP_TTL: Duration = Duration::from_secs(60);
+/// Upper bound of the supply minted per height on all chains together (coinbase rewards; live
+/// about 31 KDA per height in 2026-11), used when chainweb-data's tip lags A's.
+const SUPPLY_PER_HEIGHT: f64 = 60.0;
+/// Pause before the one retry of a `/v1/txs` diff against kda-txs.
+const KDA_TXS_RETRY: Duration = Duration::from_secs(5);
 
 /// For each pair of tx objects at the same place (the object itself, or the same index of
 /// two arrays) whose `events` hold the same items in another order, sorts both `events`
@@ -103,6 +119,48 @@ const BACKOFF_AFTER: u32 = 3;
 const BACKOFF_FIRST: Duration = Duration::from_secs(120);
 const BACKOFF_MAX: Duration = Duration::from_secs(900);
 
+fn len_of(v: &Value) -> usize {
+    v.as_array().map_or(0, Vec::len)
+}
+
+fn row_height(r: &Value) -> Option<u64> {
+    r.get("height").and_then(Value::as_u64)
+}
+
+/// Drops rows above `h`; returns how many.
+fn drop_above(v: &mut Value, h: u64) -> usize {
+    let Value::Array(x) = v else { return 0 };
+    let n = x.len();
+    x.retain(|r| row_height(r).is_none_or(|rh| rh <= h));
+    n - x.len()
+}
+
+fn drop_at_or_below(v: &mut Value, h: u64) {
+    if let Value::Array(x) = v {
+        x.retain(|r| row_height(r).is_none_or(|rh| rh > h));
+    }
+}
+
+fn min_height(v: &Value) -> Option<u64> {
+    v.as_array()?.iter().filter_map(row_height).min()
+}
+
+fn num_value(v: &Value) -> Option<f64> {
+    match v {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
+}
+
+/// The `limit` query value, if any.
+fn query_limit(path_and_query: &str) -> Option<usize> {
+    let q = path_and_query.split_once('?')?.1;
+    url::form_urlencoded::parse(q.as_bytes())
+        .find(|(k, _)| k == "limit")
+        .and_then(|(_, v)| v.parse().ok())
+}
+
 pub struct Ctx {
     pub cfg: CompareConfig,
     pub targets: HashMap<String, Target>,
@@ -118,6 +176,8 @@ pub struct Ctx {
     /// Circuit breaker on A: consecutive errors and the current pause.
     a_errors_in_row: std::sync::atomic::AtomicU32,
     backoff: Mutex<(Option<tokio::time::Instant>, Duration)>,
+    /// chainweb-data tip per target name (time read, max height on `/txs/recent`).
+    oracle_tips: Mutex<HashMap<String, (std::time::Instant, u64)>>,
 }
 
 /// What one compare produced.
@@ -149,6 +209,7 @@ impl Ctx {
             stopping: std::sync::atomic::AtomicBool::new(false),
             a_errors_in_row: std::sync::atomic::AtomicU32::new(0),
             backoff: Mutex::new((None, BACKOFF_FIRST)),
+            oracle_tips: Mutex::new(HashMap::new()),
             cfg,
         };
         ctx.refresh_tips().await?;
@@ -239,7 +300,27 @@ impl Ctx {
                 if !tb.kind.serves(req.route) {
                     continue;
                 }
-                self.vs_target(req, ta, tb).await
+                let mut o = self.vs_target(req, ta, tb, None).await;
+                // kda-txs is fed by its own indexer and can answer differently a moment later
+                // (seen live: set shifts that were gone when re-fetched). One retry; when it
+                // agrees, the visible hit /~oracle-unstable replaces the diff.
+                if o.class == "diff"
+                    && req.route == RouteKind::V1Txs
+                    && tb.kind == crate::config::TargetKind::KdaTxs
+                {
+                    tokio::time::sleep(KDA_TXS_RETRY).await;
+                    let unstable = DiffEntry {
+                        path: ORACLE_UNSTABLE_PATH.into(),
+                        kind: DiffKind::Changed,
+                        a: None,
+                        b: None,
+                    };
+                    let o2 = self.vs_target(req, ta, tb, Some(unstable)).await;
+                    if o2.class != "diff" {
+                        o = o2;
+                    }
+                }
+                o
             } else {
                 continue;
             };
@@ -324,7 +405,13 @@ impl Ctx {
     }
 
     /// A against another target: same path on both sides.
-    async fn vs_target(&self, req: &Request, ta: &Target, tb: &Target) -> Outcome {
+    async fn vs_target(
+        &self,
+        req: &Request,
+        ta: &Target,
+        tb: &Target,
+        extra: Option<DiffEntry>,
+    ) -> Outcome {
         let pa = self.fetch_a(req, ta).await;
         let pb = self.fetch_a(req, tb).await;
         let (pa, pb) = match (pa, pb) {
@@ -364,6 +451,78 @@ impl Ctx {
         let (mut va, mut vb) = (pa.items.clone(), pb.items.clone());
         let page_cut = req.route.paginated()
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
+        // Ruling R3E-11: chainweb-data's tip can lag A's by an hour. Account and event rows
+        // are compared only at heights the oracle can hold; when that drops rows, both sides
+        // are then cut to the heights they still cover completely.
+        let mut lag_rows = 0usize;
+        if matches!(req.route, RouteKind::Account | RouteKind::Events)
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && sa == 200
+            && sb == 200
+        {
+            if let Some(tip) = self.oracle_tip(tb).await {
+                let clamp = tip.saturating_sub(ORACLE_TIP_MARGIN);
+                let limit = query_limit(&req.path_and_query);
+                let full = |n: usize, t: bool| t || limit.is_none_or(|l| n >= l);
+                let (na, nb) = (len_of(&va), len_of(&vb));
+                let (fa, fb) = (
+                    full(na, pa.truncated || page_cut),
+                    full(nb, pb.truncated || page_cut),
+                );
+                let dropped = drop_above(&mut va, clamp) + drop_above(&mut vb, clamp);
+                if dropped > 0 {
+                    cut_to_common_depth(&mut va, fa, &mut vb, fb);
+                    lag_rows = (na + nb) - (len_of(&va) + len_of(&vb));
+                }
+            }
+        }
+        // kda-txs can stop one row short of the limit (seen live: limit 250, 250 rows on A,
+        // 249 on kda-txs, A's extra row the oldest). When one side holds `limit` rows and the
+        // counts differ, both sides keep the rows above the higher of the two lowest heights.
+        let mut limit_edge = 0usize;
+        if req.route == RouteKind::V1Txs && sa == 200 && sb == 200 {
+            if let Ok(l) = crate::via_cwd::parse(&req.path_and_query).limit {
+                let (na, nb) = (len_of(&va), len_of(&vb));
+                if na != nb && na.max(nb) as u64 == l {
+                    let cut = min_height(&va).max(min_height(&vb));
+                    if let Some(cut) = cut {
+                        drop_at_or_below(&mut va, cut);
+                        drop_at_or_below(&mut vb, cut);
+                        limit_edge = (na + nb) - (len_of(&va) + len_of(&vb));
+                    }
+                }
+            }
+        }
+        // /stats against a lagging chainweb-data: the supply differs by what was minted in
+        // the heights between the two tips (R3E-11).
+        let mut supply_lag: Option<(Value, Value)> = None;
+        if req.route == RouteKind::Stats
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && sa == 200
+            && sb == 200
+        {
+            let a_tip = self.tips.a_tip();
+            if let Some(b_tip) = self.oracle_tip(tb).await {
+                let x = va.get("coinsInCirculation").and_then(num_value);
+                let y = vb.get("coinsInCirculation").and_then(num_value);
+                if let (Some(x), Some(y)) = (x, y) {
+                    let d = a_tip.saturating_sub(b_tip) as f64;
+                    let tol = 1e-6 * x.abs().max(y.abs());
+                    if x > y && d > 0.0 && x - y > tol && x - y <= d * SUPPLY_PER_HEIGHT + tol {
+                        let pair = (
+                            va.get("coinsInCirculation").cloned().unwrap_or(Value::Null),
+                            vb.get("coinsInCirculation").cloned().unwrap_or(Value::Null),
+                        );
+                        for v in [&mut va, &mut vb] {
+                            if let Some(m) = v.as_object_mut() {
+                                m.remove("coinsInCirculation");
+                            }
+                        }
+                        supply_lag = Some(pair);
+                    }
+                }
+            }
+        }
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
         // chainweb-data and kda-txs list a tx's events in their own order (seen live on
@@ -471,6 +630,33 @@ impl Ctx {
         } else {
             (diff_route(&req.route, &va, &vb), false)
         };
+        if lag_rows > 0 {
+            d.push(DiffEntry {
+                path: ORACLE_LAG_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!(lag_rows)),
+                b: None,
+            });
+        }
+        if let Some((x, y)) = supply_lag {
+            d.push(DiffEntry {
+                path: format!("{ORACLE_LAG_PATH}/coinsInCirculation"),
+                kind: DiffKind::Changed,
+                a: Some(x),
+                b: Some(y),
+            });
+        }
+        if limit_edge > 0 {
+            d.push(DiffEntry {
+                path: LIMIT_EDGE_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!(limit_edge)),
+                b: None,
+            });
+        }
+        if let Some(e) = extra {
+            d.push(e);
+        }
         if event_order > 0 {
             d.push(DiffEntry {
                 path: EVENT_ORDER_PATH.into(),
@@ -969,12 +1155,40 @@ impl Ctx {
     /// node confirms A's block as canonical at that chain and height; an A row left without
     /// a B counterpart by that (B lists only the orphan copy) leaves `va` as well. Returns
     /// the moved B rows.
+    /// chainweb-data's tip: the max height on its `/txs/recent`, read at most once a minute.
+    async fn oracle_tip(&self, tb: &Target) -> Option<u64> {
+        if let Some((t, h)) = self.oracle_tips.lock().expect("tips").get(&tb.name) {
+            if t.elapsed() < ORACLE_TIP_TTL {
+                return Some(*h);
+            }
+        }
+        self.count_request("oracle-tip", &tb.name, 1);
+        let cap = tb.get("/txs/recent").await.ok()?;
+        if cap.status != 200 {
+            return None;
+        }
+        let h = cap
+            .json()?
+            .as_array()?
+            .iter()
+            .filter_map(row_height)
+            .max()?;
+        self.oracle_tips
+            .lock()
+            .expect("tips")
+            .insert(tb.name.clone(), (std::time::Instant::now(), h));
+        Some(h)
+    }
+
     async fn oracle_orphans(&self, va: &mut Value, vb: &mut Value) -> Vec<Value> {
         let (Value::Array(xa), Value::Array(xb)) = (&mut *va, &mut *vb) else {
             return Vec::new();
         };
         let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
         let mut a_block: HashMap<String, (String, u8, u64)> = HashMap::new();
+        // A's block per (chain, height): oracle rows at an A height in another block (coinbase
+        // rows carry no request key to match) are orphan candidates too.
+        let mut a_at: HashMap<(u8, u64), String> = HashMap::new();
         for r in xa.iter() {
             if let (Some(rk), Some(bh), Some(c), Some(h)) = (
                 s(r, "requestKey"),
@@ -982,6 +1196,7 @@ impl Ctx {
                 r.get("chain").and_then(Value::as_u64),
                 r.get("height").and_then(Value::as_u64),
             ) {
+                a_at.insert((c as u8, h), bh.clone());
                 if rk != "<coinbase>" {
                     a_block.insert(rk, (bh, c as u8, h));
                 }
@@ -992,8 +1207,22 @@ impl Ctx {
         let mut i = 0;
         while i < xb.len() && moved.len() < GAP_CHECKS {
             let r = &xb[i];
+            let at = (
+                r.get("chain").and_then(Value::as_u64).map(|c| c as u8),
+                r.get("height").and_then(Value::as_u64),
+            );
             let hit = match (s(r, "requestKey"), s(r, "blockHash")) {
-                (Some(rk), Some(bh)) => a_block.get(&rk).filter(|(abh, _, _)| *abh != bh).cloned(),
+                (Some(rk), Some(bh)) => a_block
+                    .get(&rk)
+                    .filter(|(abh, _, _)| *abh != bh)
+                    .cloned()
+                    .or_else(|| match at {
+                        (Some(c), Some(h)) => a_at
+                            .get(&(c, h))
+                            .filter(|abh| **abh != bh)
+                            .map(|abh| (abh.clone(), c, h)),
+                        _ => None,
+                    }),
                 _ => None,
             };
             let Some((abh, c, h)) = hit else {
@@ -1023,6 +1252,9 @@ impl Ctx {
         // A rows whose only B copy was an orphan.
         for o in &moved {
             let rk = s(o, "requestKey");
+            if rk.as_deref() == Some("<coinbase>") {
+                continue;
+            }
             let still = xb.iter().any(|r| s(r, "requestKey") == rk);
             if !still {
                 xa.retain(|r| s(r, "requestKey") != rk);
@@ -1335,4 +1567,24 @@ pub async fn once(cfg: CompareConfig, path: &str) -> anyhow::Result<Vec<Outcome>
     let out = ctx.process(&req).await;
     ctx.flush_summary();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lag_and_limit_helpers() {
+        let mut v = json!([{"height": 9}, {"height": 7}, {"height": 5}, {"height": 5}]);
+        assert_eq!(drop_above(&mut v, 7), 1);
+        assert_eq!(min_height(&v), Some(5));
+        drop_at_or_below(&mut v, 5);
+        assert_eq!(len_of(&v), 1);
+        assert_eq!(
+            query_limit("/txs/account/k:a?token=coin&limit=10"),
+            Some(10)
+        );
+        assert_eq!(query_limit("/txs/account/k:a"), None);
+        assert_eq!(num_value(&json!("1.5")), Some(1.5));
+    }
 }
