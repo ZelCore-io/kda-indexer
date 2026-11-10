@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+homepage = "https://github.com/ZelCore-io/kda-indexer"
+description = "Kadena chainweb indexer with native and chainweb-data compatible APIs"
 
 [lib]
 name = "kda_indexer"
@@ -39,3 +41,49 @@ base64.workspace = true
 rand.workspace = true
 rayon.workspace = true
 zstd.workspace = true
+
+# `make deb` (cargo-deb, built on the node, spec 6.2/6.3). Asset sources are relative to this
+# crate; the binaries come from the workspace target dir.
+[package.metadata.deb]
+name = "kda-indexer"
+# PENDING OWNER CONFIRMATION (plan open question 4): a role name, no personal name. Debian
+# needs an email-shaped value; the `.invalid` address is a reserved placeholder until the
+# owner names a public contact. The repository issue tracker is the contact until then.
+maintainer = "kda-indexer maintainers <maintainers@kda-indexer.invalid>"
+license-file = ["../../packaging/debian/copyright", "0"]
+section = "net"
+priority = "optional"
+depends = "$auto, adduser, systemd"
+extended-description = """\
+Indexer for the Kadena chainweb blockchain. Indexes all 20 chains from a chainweb-node \
+into compact immutable segments plus a small hot store, and serves them through a native \
+HTTP API, a chainweb-data compatible REST API and metrics. Runs as a systemd service \
+(kda-indexer@<network>); the package installs it stopped and disabled."""
+maintainer-scripts = "../../packaging/debian"
+conf-files = ["/etc/kda-indexer/mainnet01.toml"]
+assets = [
+    ["target/release/kda-indexer", "usr/bin/", "755"],
+    ["target/release/kda-compare", "usr/bin/", "755"],
+    ["../../packaging/systemd/kda-indexer@.service", "lib/systemd/system/", "644"],
+    ["../../packaging/systemd/kda-compare@.service", "lib/systemd/system/", "644"],
+    ["../../packaging/config/mainnet01.toml", "etc/kda-indexer/", "640"],
+    ["../../compare/allowlist.toml", "usr/share/kda-indexer/compare/", "644"],
+    ["../../compare/seeds/mainnet01.toml", "usr/share/kda-indexer/compare/seeds/", "644"],
+    ["../../README.md", "usr/share/doc/kda-indexer/", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/kda-indexer/", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/kda-indexer/", "644"],
+    ["../../THIRD_PARTY_NOTICES", "usr/share/doc/kda-indexer/", "644"],
+    ["../../packaging/debian/libmdbx-NOTICE", "usr/share/doc/kda-indexer/NOTICE.libmdbx", "644"],
+    ["../../vendor/ptr_hash/LICENSE-MIT", "usr/share/doc/kda-indexer/ptr_hash-LICENSE-MIT", "644"],
+    ["../../docs/install.md", "usr/share/doc/kda-indexer/", "644"],
+    ["../../docs/operations.md", "usr/share/doc/kda-indexer/", "644"],
+    ["../../docs/api.md", "usr/share/doc/kda-indexer/", "644"],
+    ["../../docs/openapi.json", "usr/share/doc/kda-indexer/", "644"],
+    ["../../docs/format.md", "usr/share/doc/kda-indexer/", "644"],
+    ["../../packaging/config/mainnet01.toml.example", "usr/share/doc/kda-indexer/examples/", "644"],
+    ["../../packaging/config/testnet.toml.example", "usr/share/doc/kda-indexer/examples/", "644"],
+    ["../../packaging/config/compare.toml.example", "usr/share/doc/kda-indexer/examples/", "644"],
+    ["../../packaging/systemd/backfill.conf.example", "usr/share/doc/kda-indexer/examples/backfill.conf", "644"],
+    ["../../packaging/systemd/memory.conf.example", "usr/share/doc/kda-indexer/examples/memory.conf", "644"],
+    ["../../packaging/systemd/datadir-volume-root.conf.example", "usr/share/doc/kda-indexer/examples/datadir-volume-root.conf", "644"],
+]

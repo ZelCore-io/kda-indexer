@@ -25,7 +25,11 @@ cargo build --release
 
 The pinned toolchain in `rust-toolchain.toml` is installed automatically by `rustup`. Copy `packaging/config/mainnet01.toml.example` and adjust the node URL and listen addresses for your host.
 
-Operating notes (the data-dir lock, recovering a halted chain): [docs/operations.md](docs/operations.md).
+## Installing
+
+Build a Debian package on the host and install it: [docs/install.md](docs/install.md). The package ships a hardened systemd unit (`kda-indexer@<network>`), a config with loopback listeners and the licence notices.
+
+Operating notes (systemd, the data-dir lock, moving a data dir, read-only `serve`, metrics and alerts, recovering a halted chain): [docs/operations.md](docs/operations.md).
 
 ## License
 

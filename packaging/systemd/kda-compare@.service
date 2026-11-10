@@ -1,0 +1,52 @@
+[Unit]
+Description=kda-compare harness (%i)
+Documentation=file:///usr/share/doc/kda-indexer/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kda-indexer
+Group=kda-indexer
+# The working directory must exist (create it once, see install.md). The harness keeps its
+# reports below it (out_dir in compare-%i.toml).
+WorkingDirectory=/var/lib/kda-indexer/compare-%i
+ExecStart=/usr/bin/kda-compare --config /etc/kda-indexer/compare-%i.toml run
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryHigh=1G
+MemoryMax=2G
+# Hardening (same set as kda-indexer@)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kda-indexer/compare-%i
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+# Not enabled by the package: `systemctl enable --now kda-compare@mainnet01` once
+# /etc/kda-indexer/compare-mainnet01.toml exists.
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,60 @@
+#!/bin/sh
+# postinst for kda-indexer (spec 6.3). Creates the service user and directories, reloads
+# systemd, and (on upgrade) restarts instances that are already running. It never enables
+# or starts anything on a fresh install, and never changes ownership of an existing tree.
+set -e
+
+USER_NAME=kda-indexer
+STATE_DIR=/var/lib/kda-indexer
+CONF_DIR=/etc/kda-indexer
+
+case "$1" in
+configure)
+    if ! getent group "$USER_NAME" >/dev/null; then
+        addgroup --system "$USER_NAME"
+    fi
+    if ! getent passwd "$USER_NAME" >/dev/null; then
+        adduser --system --ingroup "$USER_NAME" --no-create-home \
+            --home /nonexistent --shell /usr/sbin/nologin \
+            --gecos "kda-indexer service" "$USER_NAME"
+    fi
+
+    # Config directory and the packaged conffile: readable by the service, not by others.
+    chown root:"$USER_NAME" "$CONF_DIR"
+    chmod 0750 "$CONF_DIR"
+    if [ -f "$CONF_DIR/mainnet01.toml" ]; then
+        chgrp "$USER_NAME" "$CONF_DIR/mainnet01.toml"
+        chmod 0640 "$CONF_DIR/mainnet01.toml"
+    fi
+
+    # State: create only what is missing. An existing /var/lib/kda-indexer (a mount point, or
+    # a store somebody moved in) is left exactly as it is, no recursive chown.
+    if [ ! -d "$STATE_DIR" ]; then
+        install -d -m 0755 -o root -g root "$STATE_DIR"
+    fi
+    if [ ! -d "$STATE_DIR/mainnet01" ]; then
+        install -d -m 0750 -o "$USER_NAME" -g "$USER_NAME" "$STATE_DIR/mainnet01"
+    fi
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        # Upgrade only: restart the instances that are running. Nothing is started or enabled
+        # by an install, and a stopped instance stays stopped.
+        if [ -n "$2" ]; then
+            systemctl try-restart 'kda-indexer@*.service' || true
+        fi
+    fi
+
+    if [ -z "$2" ]; then
+        echo "kda-indexer: installed, not started. Check /etc/kda-indexer/mainnet01.toml, then:" >&2
+        echo "  systemctl enable --now kda-indexer@mainnet01   (see /usr/share/doc/kda-indexer/install.md)" >&2
+    fi
+    ;;
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+*)
+    echo "postinst called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

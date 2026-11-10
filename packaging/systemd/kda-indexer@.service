@@ -1,0 +1,53 @@
+[Unit]
+Description=kda-indexer (%i)
+Documentation=file:///usr/share/doc/kda-indexer/install.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=kda-indexer
+Group=kda-indexer
+ExecStart=/usr/bin/kda-indexer run --config /etc/kda-indexer/%i.toml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+WatchdogSec=120
+LimitNOFILE=1048576
+# Share the host fairly with chainweb-node. MemoryHigh/MemoryMax are defaults for a 23 GiB
+# host; set yours in a drop-in (examples/memory.conf).
+Nice=5
+CPUWeight=50
+IOWeight=50
+MemoryHigh=12G
+MemoryMax=16G
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kda-indexer/%i
+# optional textfile metrics; the leading '-' ignores a missing dir
+ReadWritePaths=-/var/lib/node_exporter/textfile_collector
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

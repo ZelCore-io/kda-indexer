@@ -1,0 +1,43 @@
+# kda-indexer, network mainnet01. Installed by the package as /etc/kda-indexer/mainnet01.toml
+# (a conffile: your edits survive upgrades). Every listener binds loopback; the full list of
+# keys with their defaults is in /usr/share/doc/kda-indexer/examples/mainnet01.toml.example.
+network = "mainnet01"
+data_dir = "/var/lib/kda-indexer/mainnet01"
+
+[node]
+url = "http://127.0.0.1:31351"          # chainweb-node service API on the same host
+timeout_ms = 30000
+
+[ingest]
+finality_depth = 1000
+batch_size = 50
+node_concurrency = 8
+max_rps = 200
+
+[backfill]
+ranges_in_flight = 2
+range_heights = 100000
+step_heights = 10000
+min_free_gb = 60
+
+[tail]
+commit_ms = 1000
+commit_blocks = 40
+cut_poll_secs = 10
+
+[api]
+native = "127.0.0.1:31361"     # internal only: loopback or a private address
+compat = "127.0.0.1:31362"
+graphql = "127.0.0.1:31363"    # reserved, not bound yet
+admin = "127.0.0.1:31369"      # /healthz /readyz /status /metrics; loopback or private only
+trusted_proxies = []           # proxy IPs or CIDRs whose X-Forwarded-For is trusted
+rate_per_ip = 20
+
+# Optional: also write the metrics for node_exporter's textfile collector (see
+# /usr/share/doc/kda-indexer/install.md; the directory must be writable by kda-indexer).
+# [metrics]
+# textfile = "/var/lib/node_exporter/textfile_collector/kda_indexer.prom"
+
+[log]
+format = "text"    # or "json"
+level = "info"

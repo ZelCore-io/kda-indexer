@@ -74,6 +74,8 @@ kdx-ingest = { path = "crates/kdx-ingest" }
 kdx-api = { path = "crates/kdx-api" }
 kdx-metrics = { path = "crates/kdx-metrics" }
 
+# Spec 6.2. target-cpu stays generic so a package built on one node installs on the others.
+# If codegen-units = 1 makes the node build exceed ~20 minutes, say so in the run report.
 [profile.release]
 lto = "thin"
-codegen-units = 4
+codegen-units = 1

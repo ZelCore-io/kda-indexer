@@ -1,0 +1,76 @@
+# kda-indexer, testnet instance (kda-indexer@testnet). Ports differ from mainnet01 so both can
+# run on one host. Every <placeholder> must be replaced; `config check` refuses it otherwise.
+# The testnet network id is not settled yet (open question B2/Q6); fill in the real one.
+# The instance name (kda-indexer@testnet) selects /etc/kda-indexer/testnet.toml.
+network = "<testnet-network-id>"
+data_dir = "/var/lib/kda-indexer/testnet"
+
+[node]
+url = "http://<testnet-node-host>:31351"   # service API of a testnet chainweb-node
+# p2p_url = "https://127.0.0.1:31350"   # fallback, self-signed
+# p2p_cert_sha256 = "..."               # pin
+timeout_ms = 30000
+max_body_bytes = 67108864               # per response, after decompression
+max_sse_event_bytes = 1048576           # one /header/updates event
+
+[ingest]
+finality_depth = 1000
+batch_size = 50
+node_concurrency = 8
+max_rps = 200
+
+[storage]
+mdbx_max_gb = 64                        # MDBX map upper bound
+mdbx_growth_mb = 256                    # MDBX growth step
+
+[backfill]
+ranges_in_flight = 2
+range_heights = 100000
+step_heights = 10000                    # range_heights must be a multiple; dev configs use 1000/100
+min_free_gb = 60
+# max_rps = 200                         # defaults to ingest.max_rps
+zstd_level = 19
+dict_samples = 20000
+etl_mem_mb = 1024                       # raw spool buffer per range before spilling to etl/
+mem_cap_mb = 6144                       # (ranges_in_flight + 1) x etl_mem_mb + writer estimate; in-flight lowered to fit
+
+[freezer]
+zstd_level = 9
+
+[tail]
+commit_ms = 1000
+commit_blocks = 40
+cut_poll_secs = 10
+
+[api]
+native = "<private-lan-ip>:31371"   # internal only: loopback or private (RFC 1918/4193)
+compat = "127.0.0.1:31372"          # loopback until P8 (public behind the proxy then)
+graphql = "127.0.0.1:31373"         # parsed, not bound before P7
+admin = "127.0.0.1:31379"           # loopback or private only
+trusted_proxies = ["<proxy-private-ip>"]   # IP or CIDR; X-Forwarded-For only from these
+rate_per_ip = 20          # requests/s per client IP (429 past it)
+rate_burst = 40
+deadline_ms = 5000        # per request (504 past it)
+max_in_flight = 512       # over all listeners (503 past it)
+max_body_mb = 8           # response cap (503 "narrow the query" past it)
+v1txs_max_body_mb = 32    # response cap of /v1/txs
+read_threads = 4          # concurrent store reads
+ready_max_lag = 20        # /readyz: max blocks a non-halted chain may lag the node
+max_event_lists = 256     # event-name lists one event query may expand to
+
+[search]
+min_len = 4
+max_results = 100
+max_candidates = 10000
+max_scan_heights = 20000
+timeout_ms = 2000
+
+[balances]
+local_rps = 50
+
+[metrics]
+textfile = "/var/lib/node_exporter/textfile_collector/kda_indexer_testnet.prom"   # optional
+
+[log]
+format = "text"    # or "json"
+level = "info"

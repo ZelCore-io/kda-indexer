@@ -23,7 +23,8 @@ reth storage crates (reth-libmdbx, reth-mdbx-sys, reth-nippy-jar, reth-fs-util)
 libmdbx (bundled by reth-mdbx-sys, statically linked)
   Copyright 2015-2026 Leonid Yuriev <leo@yuriev.ru>. Apache-2.0.
   libmdbx ships a NOTICE file with its source; it is reproduced in packages that
-  contain the binary. Source: https://libmdbx.dqdkfa.ru
+  contain the binary (packaging/debian/libmdbx-NOTICE; installed as
+  /usr/share/doc/kda-indexer/NOTICE.libmdbx). Source: https://libmdbx.dqdkfa.ru
 
 chainweb-data (crates/kdx-api/data/{miner_rewards.csv,token_payments.csv}, src/supply.rs)
   The two CSV files are copied from kda-community/chainweb-data (haskell-src/data), and
