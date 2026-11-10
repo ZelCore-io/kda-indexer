@@ -197,6 +197,16 @@ impl Metrics {
         }
     }
 
+    /// Largest chain lag last sampled (None before the first sample with known node tips).
+    pub fn max_chain_lag(&self) -> Option<i64> {
+        (0..20u8)
+            .filter_map(|c| {
+                let l: Labels = vec![("chain", c.to_string())];
+                self.chain_lag_blocks.get(&l).map(|g| g.get())
+            })
+            .max()
+    }
+
     pub fn segment_kind_bytes(&self, kind: &str, bytes: u64) {
         self.segment_bytes.get_or_create(&vec![("kind", kind.to_string())]).set(i64::try_from(bytes).unwrap_or(i64::MAX));
     }

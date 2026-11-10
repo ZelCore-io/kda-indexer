@@ -11,6 +11,7 @@ use kdx_hot::checkpoint::set_checkpoint;
 use kdx_hot::{dict, Stage, Table, Txn};
 use kdx_ingest::freezer::{self, META_PARTIAL_FROM};
 use kdx_ingest::{Ctx, HeaderMode};
+use kdx_types::heartbeat::{self, Component, Source};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -35,6 +36,7 @@ fn signals(token: CancellationToken) -> anyhow::Result<()> {
             _ = term.recv() => tracing::warn!("SIGTERM: finishing the current commit, then exiting"),
             _ = int.recv() => tracing::warn!("SIGINT: finishing the current commit, then exiting"),
         }
+        super::notify::stopping();
         token.cancel();
     });
     Ok(())
@@ -60,6 +62,9 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     kdx_ingest::disk::ensure_free(&data_dir, cfg.backfill.min_free_gb)?;
     let token = CancellationToken::new();
     signals(token.clone())?;
+    super::notify::spawn_watchdog(&[Component::Ingest, Component::Api]);
+    super::notify::spawn_api_heartbeat(token.clone());
+    heartbeat::beat(Component::Ingest);
 
     let node = super::node_client(cfg)?;
     node.set_batch_limit(cfg.ingest.batch_size);
@@ -75,11 +80,14 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     let tips = kdx_api::TipWatch::default();
     let api = {
         let store = Arc::new(kdx_api::Store::open(hot.clone(), &data_dir)?);
-        let api = super::serve::api(cfg, store, tips.clone())?;
+        let api = super::serve::api(cfg, store, tips.clone())?
+            .on_bound(|| super::notify::ready("api bound, starting"));
         let binds = cfg.api.binds()?;
         let stop = token.clone();
         super::serve::spawn_tip_poll(cfg, tips.clone(), token.clone());
         super::serve::spawn_textfile(cfg, token.clone());
+        let (t, range) = (tips.clone(), cfg.backfill.range_heights.max(1));
+        super::notify::spawn_status(token.clone(), move || status_text(&t, range));
         tokio::spawn(async move {
             let r = api.serve(binds, stop.clone()).await;
             if let Err(e) = &r {
@@ -219,6 +227,25 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     stop_api(api, token, r).await
 }
 
+/// `STATUS=` text: backfill progress as range r of n, else the tail's largest lag.
+fn status_text(tips: &kdx_api::TipWatch, range_heights: u64) -> String {
+    let m = kdx_metrics::get();
+    if tips.backfill() {
+        let next = m.backfill_next_height.get().max(0) as u64;
+        let end = m.backfill_end_height.get().max(0) as u64;
+        format!(
+            "backfill r{}/{}",
+            (next / range_heights + 1).min(end.div_ceil(range_heights).max(1)),
+            end.div_ceil(range_heights).max(1)
+        )
+    } else {
+        match m.max_chain_lag() {
+            Some(l) => format!("tail lag {l}"),
+            None => "tail".into(),
+        }
+    }
+}
+
 /// Stop the API with the process; an API failure (bind) is reported after ingest's result.
 async fn stop_api(
     api: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -270,6 +297,9 @@ async fn follow(ctx: Arc<Ctx>, token: CancellationToken, freeze: bool) -> anyhow
         let c = ctx.clone();
         tokio::task::spawn_blocking(move || freezer::reconcile(&c)).await??;
     }
+    // From here the tail (and the freezer) are the ingest sources the watchdog watches.
+    heartbeat::beat_source(Source::Tail);
+    heartbeat::retire(Source::Run);
     let tail_stop = token.child_token();
     let mut tail = tokio::spawn(kdx_ingest::tail::run(ctx.clone(), tail_stop.clone()));
     let fz_stop = token.child_token();
@@ -278,9 +308,14 @@ async fn follow(ctx: Arc<Ctx>, token: CancellationToken, freeze: bool) -> anyhow
         let stop = fz_stop.clone();
         tokio::spawn(async move {
             while !stop.is_cancelled() {
+                heartbeat::beat_source(Source::Freezer);
                 let c = ctx.clone();
                 // One step or merge at a time; a running one always finishes.
-                match tokio::task::spawn_blocking(move || freezer::tick(&c)).await? {
+                match tokio::task::spawn_blocking(move || {
+                    heartbeat::as_source(Source::Freezer, || freezer::tick(&c))
+                })
+                .await?
+                {
                     Ok(Some(_)) => continue,
                     Ok(None) => {}
                     Err(e) => return Err(e),

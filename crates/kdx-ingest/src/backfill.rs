@@ -300,6 +300,7 @@ async fn fetch_unit(
                 batch.push((spool_key(h, c).to_vec(), serde_json::to_vec(&it)?));
             }
             let n = batch.len() as u64;
+            crate::heartbeat::beat(crate::heartbeat::Component::Ingest);
             tx.send(batch)
                 .await
                 .map_err(|_| anyhow::anyhow!("spool closed"))?;
@@ -638,7 +639,10 @@ fn build_and_commit(
         wopts,
     )?;
     let mut dict = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());
-    let mut it = coll.into_sorted()?;
+    let mut it = {
+        let _alive = crate::heartbeat::KeepAlive::new(crate::heartbeat::Component::Ingest);
+        coll.into_sorted()?
+    };
     let mut batch: Vec<(u32, u8, Vec<u8>)> = Vec::with_capacity(DECODE_BATCH);
     loop {
         batch.clear();

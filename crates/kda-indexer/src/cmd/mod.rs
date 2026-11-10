@@ -15,6 +15,7 @@ pub mod frames;
 pub mod hot;
 pub mod inspect;
 pub mod measure;
+pub mod notify;
 pub mod probe;
 pub mod run;
 pub mod segments;

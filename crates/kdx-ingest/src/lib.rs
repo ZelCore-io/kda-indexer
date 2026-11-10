@@ -8,6 +8,7 @@ pub mod disk;
 pub mod etl;
 pub mod fetch;
 pub mod freezer;
+pub mod heartbeat;
 pub mod pipeline;
 pub mod reorg;
 pub mod tail;

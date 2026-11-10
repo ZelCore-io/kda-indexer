@@ -144,7 +144,7 @@ async fn follower(
         let Some((th, thash)) = t else {
             tokio::select! {
                 _ = stop.cancelled() => return Ok(()),
-                r = target.changed() => { r?; continue; }
+                r = target.changed() => { if r.is_err() && stop.is_cancelled() { return Ok(()); } r?; continue; }
             }
         };
         // Only a header at or above the stored tip height moves the chain (a lower one is an
@@ -152,7 +152,7 @@ async fn follower(
         if th < u64::from(view.tip.0) || thash == view.tip.1.to_b64url() {
             tokio::select! {
                 _ = stop.cancelled() => return Ok(()),
-                r = target.changed() => { r?; continue; }
+                r = target.changed() => { if r.is_err() && stop.is_cancelled() { return Ok(()); } r?; continue; }
             }
         }
         let mut max = u64::from(view.tip.0) + u64::from(CATCHUP_HEIGHTS);
@@ -198,7 +198,7 @@ async fn follower(
                 // The target is an ancestor of (or equal to) the stored tip.
                 tokio::select! {
                     _ = stop.cancelled() => return Ok(()),
-                    r = target.changed() => { r?; }
+                    r = target.changed() => { if r.is_err() && stop.is_cancelled() { return Ok(()); } r?; }
                 }
             }
             Ok(Some((ReorgOutcome::ChainHalted { fork_height, depth }, _, _))) => {
@@ -290,7 +290,10 @@ async fn writer(
         } else if let Some(d) = deadline {
             tokio::time::timeout_at(d.into(), rx.recv()).await.ok()
         } else {
-            Some(rx.recv().await)
+            // Idle tick: a quiet chain is not a hang. A writer stuck in a commit does not
+            // reach this line, so the beats stop and the watchdog sees it.
+            crate::heartbeat::beat_source(crate::heartbeat::Source::Tail);
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.ok()
         };
         match got {
             Some(Some(b)) if poisoned.contains(&b.chain) => continue,

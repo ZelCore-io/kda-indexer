@@ -87,6 +87,8 @@ pub fn debug_fallback_env() -> bool {
 
 /// Build and write an index; returns the kind written.
 pub fn write_index(path: &Path, mut keys: Vec<IndexKey>, force_sorted: bool) -> Result<IndexKind> {
+    // Sorting and building the perfect hash of a big range is one long call.
+    let _alive = kdx_types::heartbeat::KeepAlive::new(kdx_types::heartbeat::Component::Ingest);
     keys.sort_unstable_by_key(|k| (k.prefix, k.offset));
     let dup = keys.windows(2).any(|w| w[0].prefix == w[1].prefix);
     let phf = if force_sorted || dup || keys.is_empty() {

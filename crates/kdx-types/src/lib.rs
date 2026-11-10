@@ -3,6 +3,7 @@
 
 pub mod dict;
 pub mod hash;
+pub mod heartbeat;
 pub mod ids;
 pub mod record;
 pub mod value;

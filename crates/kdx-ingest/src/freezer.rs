@@ -78,6 +78,7 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
     // is deleted, so the next chunk starts at the table's first row again.
     let end_key = TxKey::new(end, 0, 0).to_be_bytes();
     loop {
+        crate::heartbeat::beat(crate::heartbeat::Component::Ingest);
         let txs = txn.scan_limit(Table::TailTxs, &[], CHUNK, |k| k < &end_key[..])?;
         for (k, v) in &txs {
             let r = decode_tx(v).context("hot tx")?;
@@ -94,6 +95,7 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
     }
     let mut after: Option<Vec<u8>> = None;
     loop {
+        crate::heartbeat::beat(crate::heartbeat::Component::Ingest);
         let posts = txn.scan_chunk(Table::TailPostings, after.as_deref(), CHUNK, |_| true)?;
         for (k, _) in &posts {
             let key = parse_txkey(&k[9..]).context("posting key")?;

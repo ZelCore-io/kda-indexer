@@ -153,6 +153,9 @@ impl PostingsWriter {
         self.entities.push(entity);
         self.offsets.push(self.pos);
         self.entries += vals.len() as u64;
+        if self.entities.len().is_multiple_of(4096) {
+            kdx_types::heartbeat::beat(kdx_types::heartbeat::Component::Ingest);
+        }
         Ok(())
     }
 
@@ -173,6 +176,7 @@ impl PostingsWriter {
         self.f.write_all(&self.pos.to_le_bytes())?;
         self.f.write_all(&(efb.len() as u64).to_le_bytes())?;
         self.f.finish()?;
+        kdx_types::heartbeat::beat(kdx_types::heartbeat::Component::Ingest);
         Ok((n, self.entries))
     }
 }

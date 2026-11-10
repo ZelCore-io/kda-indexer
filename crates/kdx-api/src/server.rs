@@ -224,6 +224,7 @@ pub struct Api {
     state: Arc<ApiState>,
     native: Router<Arc<ApiState>>,
     compat: Router<Arc<ApiState>>,
+    on_bound: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Api {
@@ -240,7 +241,14 @@ impl Api {
             state,
             native: Router::new().route("/status", axum::routing::get(status::handler)),
             compat: Router::new(),
+            on_bound: None,
         }
+    }
+
+    /// Run `f` once every listener is bound (before serving; `run` sends `READY=1` here).
+    pub fn on_bound(mut self, f: impl FnOnce() + Send + 'static) -> Api {
+        self.on_bound = Some(Box::new(f));
+        self
     }
 
     pub fn state(&self) -> Arc<ApiState> {
@@ -262,6 +270,7 @@ impl Api {
     /// Bind every listener (all or nothing), then serve until `shutdown` (graceful).
     pub async fn serve(self, binds: Binds, shutdown: CancellationToken) -> anyhow::Result<()> {
         let st = self.state;
+        let on_bound = self.on_bound;
         for (name, a) in [("native", binds.native), ("admin", binds.admin)] {
             if let Some(a) = a {
                 anyhow::ensure!(
@@ -309,6 +318,9 @@ impl Api {
                 .await
                 .with_context(|| format!("api: {name} listener"))
             }));
+        }
+        if let Some(f) = on_bound {
+            f();
         }
         for t in tasks {
             t.await??;

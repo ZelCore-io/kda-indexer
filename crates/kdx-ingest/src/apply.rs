@@ -151,6 +151,7 @@ fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<Com
     dict.persist(&mut txn)?;
     let tc = Instant::now();
     txn.commit()?;
+    crate::heartbeat::beat_source(crate::heartbeat::Source::Tail);
     st.secs = t0.elapsed().as_secs_f64();
     let m = kdx_metrics::get();
     m.mdbx_commit_seconds.observe(tc.elapsed().as_secs_f64());
