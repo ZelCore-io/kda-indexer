@@ -71,8 +71,9 @@ pub struct BackfillConfig {
     pub dict_samples: u32,
     /// Raw spool (ETL) bytes buffered per range before a sorted run is spilled to `etl/`.
     pub etl_mem_mb: u64,
-    /// Memory cap for the backfill: (ranges fetching + the one building) × spool buffer +
-    /// the range writer's estimate; `ranges_in_flight` is lowered to fit.
+    /// Byte budget (MiB) of backfill's anonymous memory: `(ranges_in_flight + 1) × etl_mem_mb`
+    /// plus the range writer, whose posting buffers get what the spools leave. Backfill logs
+    /// a WARN and fetches one range at a time while `RssAnon` is above it.
     pub mem_cap_mb: u64,
 }
 

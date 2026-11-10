@@ -28,7 +28,7 @@ min_free_gb = 60
 zstd_level = 19
 dict_samples = 20000
 etl_mem_mb = 1024                       # raw spool buffer per range before spilling to etl/
-mem_cap_mb = 6144                       # (ranges_in_flight + 1) x etl_mem_mb + writer estimate; in-flight lowered to fit
+mem_cap_mb = 6144                       # byte budget: (ranges_in_flight + 1) x etl_mem_mb + writer; WARN above it
 
 [freezer]
 zstd_level = 9

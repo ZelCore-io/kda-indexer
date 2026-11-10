@@ -49,6 +49,20 @@ pub fn peak_rss_mb() -> u64 {
     }
 }
 
+/// Anonymous resident memory in MiB (Linux `RssAnon` of `/proc/self/status`; `None`
+/// elsewhere). File-backed pages (MDBX and segment mmaps) are left out: the kernel drops
+/// those under pressure, so they are not what `mem_cap_mb` bounds.
+pub fn rss_anon_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_rss_anon_kb(&s).map(|kb| kb >> 10)
+}
+
+fn parse_rss_anon_kb(status: &str) -> Option<u64> {
+    let l = status.lines().find(|l| l.starts_with("RssAnon:"))?;
+    l.split_whitespace().nth(1)?.parse().ok()
+}
+
+
 /// Current resident set size in MiB (Linux `/proc/self/statm`; `None` elsewhere).
 pub fn rss_mb() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/statm").ok()?;
@@ -56,4 +70,14 @@ pub fn rss_mb() -> Option<u64> {
     // SAFETY: sysconf has no preconditions.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     Some((pages * u64::try_from(page).ok()?) >> 20)
+}
+
+#[cfg(test)]
+mod rss_tests {
+    #[test]
+    fn rss_anon_line() {
+        let s = "VmRSS:\t 13000000 kB\nRssAnon:\t12582912 kB\nRssFile:\t 1000 kB\n";
+        assert_eq!(super::parse_rss_anon_kb(s), Some(12_582_912));
+        assert_eq!(super::parse_rss_anon_kb("VmRSS: 1 kB"), None);
+    }
 }
