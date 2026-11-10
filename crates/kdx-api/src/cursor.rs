@@ -31,6 +31,26 @@ impl Cursor {
         Ok(Cursor { key, sub, fp })
     }
 
+    /// A token for "every row at heights >= `done` consumed" (a bounded scan cut, `sub` is
+    /// the route's height-done marker). It fingerprints the block of the first chain that
+    /// has one at `done` and names that chain in the key, so a lagging or halted chain 0
+    /// does not make the token dead on arrival (R6). The key's pos carries `skip`, the
+    /// rows of `offset` still owed (R7). With no block at `done` on any chain, fp is 0 and
+    /// `check` accepts it while that is still so.
+    pub fn height_done(view: &View, done: u32, sub: u16, skip: u16) -> ApiResult<Cursor> {
+        for c in 0..kdx_segment::SLOT_WIDTH as u8 {
+            let key = TxKey::new(done, c, skip);
+            if let Some(fp) = fingerprint(view, key)? {
+                return Ok(Cursor { key, sub, fp });
+            }
+        }
+        Ok(Cursor {
+            key: TxKey::new(done, 0, skip),
+            sub,
+            fp: 0,
+        })
+    }
+
     /// base64url of `version 1 | key | sub | fp` (big-endian).
     pub fn encode(&self) -> String {
         let mut b = [0u8; LEN];
@@ -63,6 +83,9 @@ impl Cursor {
     pub fn check(&self, view: &View) -> ApiResult<()> {
         match fingerprint(view, self.key)? {
             Some(fp) if fp == self.fp => Ok(()),
+            // A height-done token minted where no chain had a block (see `height_done`).
+            // Row cursors always point into a stored block, so they never mint fp 0.
+            None if self.fp == 0 => Ok(()),
             _ => Err(ApiError::BadRequest(REORGED.into())),
         }
     }
@@ -89,5 +112,40 @@ mod tests {
         for bad in ["", "x", "AAAA", "!!!!", &"A".repeat(3000), &c.encode()[1..]] {
             assert!(matches!(Cursor::decode(bad), Err(ApiError::BadRequest(_))), "{bad}");
         }
+    }
+
+    /// R6/R7: a cut token fingerprints a chain that has a block at `done` (chain 0 lags
+    /// here) and carries the owed offset.
+    #[test]
+    fn height_done_uses_a_present_chain() {
+        use kdx_hot::tables::block_key;
+        use kdx_types::record::{encode_block, BlockRecord};
+        let (_d, store) = crate::testutil::store();
+        let b = BlockRecord {
+            hash: kdx_types::Hash32([0xab; 32]),
+            chain: 3,
+            height: 100,
+            ..Default::default()
+        };
+        let mut v = Vec::new();
+        encode_block(&b, &mut v);
+        let mut w = store.hot_for_tests().rw().unwrap();
+        w.put(kdx_hot::Table::Headers, &block_key(3, 100), &v).unwrap();
+        w.commit().unwrap();
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let view = store.view(far).unwrap();
+        let c = Cursor::height_done(&view, 100, u16::MAX, 7).unwrap();
+        assert_eq!(c.key.chain(), 3);
+        assert_eq!(c.key.pos(), 7);
+        assert_eq!(c.fp, 0xabab_abab);
+        let c = Cursor::decode(&c.encode()).unwrap();
+        c.check(&view).unwrap();
+        // No block at all at that height: fp 0, still accepted.
+        let e = Cursor::height_done(&view, 200, u16::MAX, 0).unwrap();
+        assert_eq!(e.fp, 0);
+        e.check(&view).unwrap();
+        // A row cursor whose block is gone stays refused.
+        let gone = Cursor { key: TxKey::new(101, 3, 1), sub: 0, fp: 5 };
+        assert!(gone.check(&view).is_err());
     }
 }

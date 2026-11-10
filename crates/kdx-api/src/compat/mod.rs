@@ -428,7 +428,10 @@ pub fn collect_page(
     let mut skip = pg.offset;
     let mut after: Option<RowRef> = None;
     if let Some(c) = pg.next {
-        if c.sub != SUB_HEIGHT_DONE {
+        if c.sub == SUB_HEIGHT_DONE {
+            // Rows of `offset` a cut scan still owed (R7).
+            skip = u64::from(c.key.pos());
+        } else {
             let r = view
                 .tx(c.key)?
                 .ok_or_else(|| ApiError::BadRequest(crate::cursor::REORGED.into()))?;
@@ -488,7 +491,8 @@ pub fn collect_page(
                     if scanned >= l.max_heights || Instant::now() >= l.until {
                         // Cut: resume below the last whole height.
                         let done = h + 1;
-                        let next = Cursor::new(view, TxKey::new(done, 0, 0), SUB_HEIGHT_DONE)?;
+                        let owed = u16::try_from(skip).unwrap_or(u16::MAX);
+                        let next = Cursor::height_done(view, done, SUB_HEIGHT_DONE, owed)?;
                         return Ok(Page {
                             rows: out,
                             next: Some(next),

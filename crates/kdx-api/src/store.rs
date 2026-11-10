@@ -160,6 +160,12 @@ impl Store {
         })
     }
 
+    /// The hot store (tests write fixtures through it).
+    #[cfg(test)]
+    pub fn hot_for_tests(&self) -> &HotStore {
+        &self.hot
+    }
+
     /// Names in the current dictionary snapshot (all kinds).
     pub fn dict_names(&self) -> usize {
         let snap = self.dict.load();
