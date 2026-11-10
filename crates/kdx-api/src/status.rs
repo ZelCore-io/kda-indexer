@@ -116,6 +116,12 @@ impl Status {
     }
 }
 
+/// Network, per-chain node and indexed tips, lag, halted chains, frozen frontier.
+#[utoipa::path(
+    get,
+    path = "/api/v1/status",
+    responses((status = 200, description = "Indexer status"))
+)]
 pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
     match Status::load(&st).await {
         Ok(s) => json(&s.to_json(&st.settings.network, st.settings.ready_max_lag)),

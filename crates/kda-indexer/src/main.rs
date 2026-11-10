@@ -95,6 +95,9 @@ enum Command {
         data_dir: Option<PathBuf>,
     },
     /// Dev: `run` without the freezer.
+    /// Print the OpenAPI document of the native API (no config needed).
+    #[command(hide = true)]
+    Openapi,
     #[command(hide = true)]
     Tail {
         #[arg(long)]
@@ -241,6 +244,10 @@ fn init_logging(log: &LogConfig) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Openapi) {
+        println!("{}", kdx_api::openapi::json());
+        return Ok(());
+    }
     let cfg = Config::load(&cli.config)?;
     init_logging(&cfg.log);
     kdx_metrics::init(&cfg.network, env!("CARGO_PKG_VERSION"), env!("KDX_GIT_SHA"));
@@ -254,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Openapi => Ok(()),
         Command::Probe { smoke, out } => kda_indexer::cmd::probe::run(&cfg, smoke, out).await,
         Command::Dump {
             from,

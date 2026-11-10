@@ -68,6 +68,7 @@ pub fn api(cfg: &Config, store: Arc<Store>, tips: TipWatch) -> anyhow::Result<Ap
         timeout_ms: cfg.search.timeout_ms,
     };
     Ok(Api::new(store, cfg.api.settings(&cfg.network)?, tips)
+        .native_routes(kdx_api::native::router())
         .compat_routes(kdx_api::compat::router(search)))
 }
 

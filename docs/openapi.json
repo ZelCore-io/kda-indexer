@@ -1,0 +1,710 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "kda-indexer native API",
+    "description": "Internal and unstable until a public hostname is decided. JSON in snake_case. List routes take limit (1..=100, default 20), an opaque cursor, order (desc default, asc), minheight, maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can be shorter than limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away answers 400 'cursor invalidated by reorg'. Routes reserved for P6 answer 501 {\"error\": \"not implemented until P6\"}: /txs/{requestKey}/defpact, /accounts/{account}/balances, /keys/{pubkey}/accounts, /tokens, /tokens/{module}, /search/code, /search/events, /nft/accounts/{account}.",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "1"
+  },
+  "paths": {
+    "/api/v1/accounts/{account}/transfers": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Transfers of `token` (default `coin`) with the account on either side, newest first;\na cross-chain pair is resolved from the same tx's events.",
+        "operationId": "transfers",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Account name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 20).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque token of the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "`desc` (default, newest first) or `asc`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0..19).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "description": "Token module, default `coin`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of transfers, `next_cursor`, `as_of`"
+          }
+        }
+      }
+    },
+    "/api/v1/accounts/{account}/txs": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Txs touching the account (`role=any`, default) or sent by it (`role=sender`).",
+        "operationId": "txs",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Account name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 20).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque token of the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "`desc` (default, newest first) or `asc`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0..19).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "`any` (default) or `sender` (meta sender)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of tx summaries, `next_cursor`, `as_of`"
+          }
+        }
+      }
+    },
+    "/api/v1/blocks": {
+      "get": {
+        "tags": [
+          "blocks"
+        ],
+        "summary": "Blocks by height window, newest first, ordered by (height, chain). `chains=0,3` limits the\nchains; `minheight`/`maxheight` bound the window (default: the newest heights).",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 20).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque token of the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "`desc` (default, newest first) or `asc`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0..19).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chains",
+            "in": "query",
+            "description": "Comma-separated chain ids",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of blocks (no coinbase), `next_cursor`, `as_of`"
+          }
+        }
+      }
+    },
+    "/api/v1/blocks/{hash}": {
+      "get": {
+        "tags": [
+          "blocks"
+        ],
+        "summary": "Block by hash: header, miner, coinbase, tx count, confirmations.",
+        "operationId": "by_hash",
+        "parameters": [
+          {
+            "name": "hash",
+            "in": "path",
+            "description": "Block hash (43-char base64url)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Block"
+          },
+          "404": {
+            "description": "Unknown block"
+          }
+        }
+      }
+    },
+    "/api/v1/blocks/{hash}/txs": {
+      "get": {
+        "tags": [
+          "blocks"
+        ],
+        "summary": "User txs of a block in payload order (`order=desc` reverses). The cursor is the tx position.",
+        "operationId": "txs",
+        "parameters": [
+          {
+            "name": "hash",
+            "in": "path",
+            "description": "Block hash",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 20).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque token of the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "`desc` (default, newest first) or `asc`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0..19).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of tx summaries, `next_cursor`, `as_of`"
+          }
+        }
+      }
+    },
+    "/api/v1/chains/{chain}/blocks/{height}": {
+      "get": {
+        "tags": [
+          "blocks"
+        ],
+        "summary": "Block at a height of a chain (the canonical one).",
+        "operationId": "by_height",
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "path",
+            "description": "Chain 0..19",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "height",
+            "in": "path",
+            "description": "Height",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Block"
+          },
+          "404": {
+            "description": "No such block"
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Events by module and name (a qualified `name` such as `coin.TRANSFER` is split at its last dot\nwhen `module` is absent). At least one of `module`, `name`, `param{N}` is required.",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 20).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque token of the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "`desc` (default, newest first) or `asc`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0..19).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "module",
+            "in": "query",
+            "description": "Exact module, e.g. `coin` or `free.token`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Exact event name, e.g. `TRANSFER`; needs `module`, or write it qualified (`coin.TRANSFER`)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "param0",
+            "in": "query",
+            "description": "Exact string value of event parameter 0 (param0..param9)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of events with their tx context, `next_cursor`, `as_of`"
+          }
+        }
+      }
+    },
+    "/api/v1/keys/{pubkey}/txs": {
+      "get": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Txs signed by a public key.",
+        "operationId": "key_txs",
+        "parameters": [
+          {
+            "name": "pubkey",
+            "in": "path",
+            "description": "Public key as signed",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 20).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque token of the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "`desc` (default, newest first) or `asc`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0..19).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of tx summaries, `next_cursor`, `as_of`"
+          }
+        }
+      }
+    },
+    "/api/v1/stats": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Exact user-tx and block counts, per-chain frozen counts and the indexed tips.",
+        "operationId": "stats",
+        "responses": {
+          "200": {
+            "description": "Counts and per-chain frozen counts"
+          }
+        }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "tags": [
+          "crate::status"
+        ],
+        "summary": "Network, per-chain node and indexed tips, lag, halted chains, frozen frontier.",
+        "operationId": "handler",
+        "responses": {
+          "200": {
+            "description": "Indexer status"
+          }
+        }
+      }
+    },
+    "/api/v1/txs/{request_key}": {
+      "get": {
+        "tags": [
+          "txs"
+        ],
+        "summary": "Full tx by request key, with its block.",
+        "operationId": "get_tx",
+        "parameters": [
+          {
+            "name": "request_key",
+            "in": "path",
+            "description": "Request key (43-char base64url)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include",
+            "in": "query",
+            "description": "`proof` adds the SPV proof of a continuation tx (it can be large).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tx: command, signers with capabilities, sigs, result, events, transfers, continuation, block info"
+          },
+          "400": {
+            "description": "Not a request key"
+          },
+          "404": {
+            "description": "Unknown request key"
+          }
+        }
+      }
+    }
+  },
+  "components": {}
+}
