@@ -11,7 +11,10 @@ use tokio::sync::mpsc;
 
 use crate::allowlist::Allowlist;
 use crate::config::CompareConfig;
-use crate::diff::{diff_route, follow_pages, recent_diff, DiffEntry, DiffKind, Paged};
+use crate::diff::{
+    cut_to_common_depth, diff_route, follow_pages, recent_diff, DiffEntry, DiffKind, Paged,
+    PAGE_CUT_PATH,
+};
 use crate::gen::random::{canonical_header, RandomGen};
 use crate::gen::replay::ReplayGen;
 use crate::gen::seeds::SeedGen;
@@ -279,6 +282,8 @@ impl Ctx {
             return self.a_error(req, ta, &tb.name, Some(&pa), "5xx");
         }
         let (mut va, mut vb) = (pa.items.clone(), pb.items.clone());
+        let page_cut = req.route.paginated()
+            && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
         let (mut d, skew) = if req.route == RouteKind::Recent {
@@ -286,6 +291,14 @@ impl Ctx {
         } else {
             (diff_route(&req.route, &va, &vb), false)
         };
+        if page_cut {
+            d.push(DiffEntry {
+                path: PAGE_CUT_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!(pa.pages.len())),
+                b: Some(json!(pb.pages.len())),
+            });
+        }
         if sa != sb {
             d.insert(
                 0,

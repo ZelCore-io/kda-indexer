@@ -188,10 +188,14 @@ fn field(v: &Value, k: &str) -> String {
 }
 
 /// `(height desc, blockTime, requestKey, idx)`; order is taken as returned, so only equality
-/// of the key matters here.
+/// of the key matters here. Coinbase rows of several chains at one height share
+/// `(height, "<coinbase>", idx)` and chainweb-data returns them in Postgres physical order
+/// (allowlist `coinbase-tie-order`), so their key leaves out `blockTime`.
 fn account_key(v: &Value) -> SortKey {
+    let coinbase = v.get("requestKey").and_then(Value::as_str) == Some("<coinbase>");
     ["height", "blockTime", "requestKey", "idx"]
         .iter()
+        .filter(|k| !(coinbase && **k == "blockTime"))
         .map(|k| field(v, k))
         .collect()
 }

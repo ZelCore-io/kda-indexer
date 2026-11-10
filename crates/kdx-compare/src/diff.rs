@@ -254,6 +254,40 @@ pub struct Paged {
     pub pages: Vec<HttpCapture>,
     /// Concatenated items (the first body as is if it is not an array).
     pub items: Value,
+    /// Stopped at the follow depth while a `Chainweb-Next` token was still pending.
+    pub truncated: bool,
+}
+
+/// JSON path of the visible allowlist hit for [`cut_to_common_depth`].
+pub const PAGE_CUT_PATH: &str = "/~page-cut";
+
+/// chainweb-data serves pages shorter than `limit` that still carry a next token (its page
+/// size is `limit` times a throttling factor). After following the same number of pages one
+/// side then holds fewer rows only because it was cut, not because rows are missing. When the
+/// shorter side is `truncated`, both item arrays are cut to the rows strictly above the last
+/// height the shorter side reached completely (a height can continue on the next page).
+/// Returns true when it cut anything.
+pub fn cut_to_common_depth(a: &mut Value, a_trunc: bool, b: &mut Value, b_trunc: bool) -> bool {
+    let (Value::Array(xa), Value::Array(xb)) = (&mut *a, &mut *b) else {
+        return false;
+    };
+    let (short, short_trunc) = if xa.len() <= xb.len() {
+        (&*xa, a_trunc)
+    } else {
+        (&*xb, b_trunc)
+    };
+    if !short_trunc || xa.len() == xb.len() {
+        return false;
+    }
+    let height = |v: &Value| v.get("height").and_then(Value::as_u64);
+    let Some(last) = short.last().and_then(height) else {
+        return false;
+    };
+    // Rows are height-descending: keep those above the last (possibly partial) height.
+    let keep = |v: &Value| height(v).is_some_and(|h| h > last);
+    xa.retain(keep);
+    xb.retain(keep);
+    true
 }
 
 /// `path` with `offset` and `next` removed and `next=<token>` appended.
@@ -286,8 +320,10 @@ pub async fn follow_pages(target: &Target, path: &str, depth: u32) -> anyhow::Re
     };
     let mut pages = vec![first];
     let mut followed = 0;
+    let mut truncated = false;
     while let Some(tok) = next.take() {
         if followed >= depth {
+            truncated = true;
             break;
         }
         followed += 1;
@@ -302,7 +338,11 @@ pub async fn follow_pages(target: &Target, path: &str, depth: u32) -> anyhow::Re
         next = cap.next_token().map(str::to_string);
         pages.push(cap);
     }
-    Ok(Paged { pages, items })
+    Ok(Paged {
+        pages,
+        items,
+        truncated,
+    })
 }
 
 #[cfg(test)]

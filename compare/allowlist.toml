@@ -73,3 +73,21 @@ json_path_glob = "/coinsInCirculation~tolerance"
 condition = "changed"
 reason = "Both sides compute the circulating supply at their own tip height and time; values within a relative 1e-6 are accepted. Larger differences are reported at /coinsInCirculation."
 owner_note = "Tolerance from the P3 plan (Task 7)."
+
+# --- From the live comparison on the full store (P3, Task 8 / run 3E) ---
+
+[[entry]]
+id = "cwd-throttled-page"
+route = "*"
+json_path_glob = "/~page-cut"
+condition = "changed"
+reason = "chainweb-data pages hold limit x a throttling factor rows and still carry a Chainweb-Next token, so after the same number of followed pages it has fewer rows. The harness cuts both sides to the heights the shorter side covered completely and reports this visible hit; rows above the cut are compared as usual."
+owner_note = "Accepted in the P3 controller rulings (run 3C finding)."
+
+[[entry]]
+id = "cwd-txcount-not-canonical"
+route = "stats"
+json_path_glob = "/transactionCount"
+condition = "changed"
+reason = "chainweb-data's transactionCount is pg_class.reltuples of a transactions table that is never analyzed, so the value is frozen (200,841,520 on 2026-11-10 while the table holds 233,094,876 rows). Its rows also include txs of orphaned blocks and miss blocks it never fetched. kda-indexer counts canonical user txs exactly (229.9M); per-height windows match chainweb-data where it holds no orphans or gaps."
+owner_note = "PROPOSED in run 3E (P3 Task 8), owner to accept. Without it /stats can never be within 1%: the reference value is stale, not an estimate."
