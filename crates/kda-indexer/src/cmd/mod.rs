@@ -18,6 +18,7 @@ pub mod measure;
 pub mod probe;
 pub mod run;
 pub mod segments;
+pub mod serve;
 pub mod unwind;
 pub mod viewcheck;
 

@@ -89,6 +89,11 @@ enum Command {
         #[arg(long, default_value = "auto", hide = true)]
         header_mode: kdx_ingest::HeaderMode,
     },
+    /// Serve the APIs read-only over a data dir another process writes (no ingest, no lock).
+    Serve {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Dev: `run` without the freezer.
     #[command(hide = true)]
     Tail {
@@ -309,6 +314,9 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await
+        }
+        Command::Serve { data_dir } => {
+            kda_indexer::cmd::serve::run(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir)).await
         }
         Command::Tail {
             data_dir,

@@ -70,6 +70,25 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         o.geometry,
     )?);
     let ctx = Arc::new(Ctx::open_with(o, node, hot.clone()).await?);
+    // The API binds before backfill: admin and status answer while it runs, data routes
+    // serve what is committed. It stops with the process (token).
+    let tips = kdx_api::TipWatch::default();
+    let api = {
+        let store = Arc::new(kdx_api::Store::open(hot.clone(), &data_dir)?);
+        let api = super::serve::api(cfg, store, tips.clone())?;
+        let binds = cfg.api.binds()?;
+        let stop = token.clone();
+        super::serve::spawn_tip_poll(cfg, tips.clone(), token.clone());
+        tokio::spawn(async move {
+            let r = api.serve(binds, stop.clone()).await;
+            if let Err(e) = &r {
+                // An API that cannot bind stops the process (fail fast under systemd).
+                tracing::error!(error = format!("{e:#}"), "run: API failed, stopping");
+                stop.cancel();
+            }
+            r
+        })
+    };
     let cut = ctx.node.cut().await?;
     let cut_min = cut
         .hashes
@@ -177,6 +196,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         let bctx = Arc::new(Ctx::open_with(opts(cfg, &data_dir, a.until), bnode, hot.clone()).await?);
         let to = u32::try_from(final_tip)?;
         let bf = kdx_ingest::backfill::run(bctx, u32::try_from(bf_from)?, to, a.header_mode);
+        tips.set_backfill(true);
         tokio::select! {
             r = bf => {
                 let s = r?;
@@ -187,13 +207,26 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-
+        tips.set_backfill(false);
         let node = super::node_client(cfg)?;
         node.set_batch_limit(cfg.ingest.batch_size);
         let ctx = Arc::new(Ctx::open_with(opts(cfg, &data_dir, a.until), node, hot).await?);
-        return follow(ctx, token, a.freeze).await;
+        let r = follow(ctx, token.clone(), a.freeze).await;
+        return stop_api(api, token, r).await;
     }
-    follow(ctx, token, a.freeze).await
+    let r = follow(ctx, token.clone(), a.freeze).await;
+    stop_api(api, token, r).await
+}
+
+/// Stop the API with the process; an API failure (bind) is reported after ingest's result.
+async fn stop_api(
+    api: tokio::task::JoinHandle<anyhow::Result<()>>,
+    token: CancellationToken,
+    r: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    token.cancel();
+    let a = api.await.map_err(anyhow::Error::from).and_then(|x| x);
+    r.and(a.context("api"))
 }
 
 /// Dev `--start-height`: the empty store starts at `h` (frontier, `Headers` checkpoints at

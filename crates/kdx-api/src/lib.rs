@@ -1,12 +1,17 @@
 //! kdx-api: the read layer over the hot store and the frozen segments (spec §4.4–§4.5, §5),
 //! cursor tokens and (from P3 Task 2) the HTTP server, limits and admin endpoints.
 
+pub mod admin;
 pub mod cursor;
 pub mod dict;
+pub mod limits;
+pub mod server;
+pub mod status;
 pub mod store;
 
 pub use cursor::Cursor;
 pub use dict::ViewDict;
+pub use server::{Api, ApiSettings, ApiState, Binds, TipWatch};
 pub use store::{PostingQuery, Store, View};
 
 /// Errors a read can answer with. The HTTP layer maps them to status codes.

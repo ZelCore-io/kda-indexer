@@ -143,16 +143,34 @@ impl Default for TailConfig {
     }
 }
 
-/// Listen addresses are plain strings so example configs can carry placeholders.
+/// Listen addresses are plain strings so example configs can carry placeholders (a
+/// `<placeholder>` left in is refused by `validate`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ApiConfig {
     pub native: String,
     pub compat: String,
+    /// Parsed, not bound before P7.
     pub graphql: String,
     pub admin: String,
+    /// Peers (IP or CIDR) whose `X-Forwarded-For` is trusted for the client IP.
     pub trusted_proxies: Vec<String>,
     pub rate_per_ip: u32,
+    pub rate_burst: u32,
+    /// Per-request deadline (504 past it).
+    pub deadline_ms: u64,
+    /// Requests in flight over all listeners (503 past it).
+    pub max_in_flight: usize,
+    /// Response body cap (503 "narrow the query" past it).
+    pub max_body_mb: u64,
+    /// Response body cap of `/v1/txs`.
+    pub v1txs_max_body_mb: u64,
+    /// Concurrent store reads (blocking threads).
+    pub read_threads: usize,
+    /// `/readyz` fails when a non-halted chain lags the node by more blocks than this.
+    pub ready_max_lag: u32,
+    /// Most event-name lists one event query expands to.
+    pub max_event_lists: usize,
 }
 
 impl Default for ApiConfig {
@@ -164,7 +182,68 @@ impl Default for ApiConfig {
             admin: "127.0.0.1:31369".into(),
             trusted_proxies: Vec::new(),
             rate_per_ip: 20,
+            rate_burst: 40,
+            deadline_ms: 5000,
+            max_in_flight: 512,
+            max_body_mb: 8,
+            v1txs_max_body_mb: 32,
+            read_threads: 4,
+            ready_max_lag: 20,
+            max_event_lists: 256,
         }
+    }
+}
+
+impl ApiConfig {
+    /// Parsed listen addresses. Native and admin must be loopback or private (decision Q4);
+    /// compat may be any address (it binds loopback until P8 by configuration).
+    pub fn binds(&self) -> anyhow::Result<kdx_api::server::Binds> {
+        let parse = |key: &str, v: &str| -> anyhow::Result<std::net::SocketAddr> {
+            anyhow::ensure!(
+                !v.contains('<') && !v.contains('>'),
+                "api.{key} still holds a placeholder ({v:?})"
+            );
+            v.parse()
+                .with_context(|| format!("api.{key} is not an address:port ({v:?})"))
+        };
+        let native = parse("native", &self.native)?;
+        let compat = parse("compat", &self.compat)?;
+        let _graphql = parse("graphql", &self.graphql)?;
+        let admin = parse("admin", &self.admin)?;
+        for (key, a) in [("native", native), ("admin", admin)] {
+            anyhow::ensure!(
+                kdx_api::limits::is_internal(a.ip()),
+                "api.{key} must bind a loopback or private address (got {a})"
+            );
+        }
+        Ok(kdx_api::server::Binds {
+            native: Some(native),
+            compat: Some(compat),
+            admin: Some(admin),
+        })
+    }
+
+    pub fn settings(&self, network: &str) -> anyhow::Result<kdx_api::server::ApiSettings> {
+        let mut trusted = Vec::new();
+        for p in &self.trusted_proxies {
+            trusted.push(
+                kdx_api::limits::IpNet::parse(p)
+                    .with_context(|| format!("api.trusted_proxies: {p:?} is not an IP or CIDR"))?,
+            );
+        }
+        Ok(kdx_api::server::ApiSettings {
+            network: network.to_owned(),
+            deadline: std::time::Duration::from_millis(self.deadline_ms),
+            max_in_flight: self.max_in_flight,
+            max_body_bytes: (self.max_body_mb as usize) << 20,
+            v1txs_max_body_bytes: (self.v1txs_max_body_mb as usize) << 20,
+            rate_per_ip: self.rate_per_ip,
+            rate_burst: self.rate_burst,
+            trusted_proxies: trusted,
+            read_threads: self.read_threads,
+            ready_max_lag: self.ready_max_lag,
+            max_event_lists: self.max_event_lists,
+        })
     }
 }
 
@@ -273,6 +352,20 @@ impl Config {
         anyhow::ensure!(
             b.max_rps != Some(0),
             "backfill.max_rps must be > 0 when set"
+        );
+        let a = &self.api;
+        a.binds()?;
+        a.settings(&self.network)?;
+        anyhow::ensure!(
+            a.deadline_ms >= 100
+                && a.max_in_flight > 0
+                && a.read_threads > 0
+                && a.rate_per_ip > 0
+                && a.rate_burst > 0
+                && a.max_body_mb > 0
+                && a.v1txs_max_body_mb > 0
+                && a.max_event_lists > 0,
+            "api: deadline_ms must be >= 100 and the other limits > 0"
         );
         Ok(())
     }
