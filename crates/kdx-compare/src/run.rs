@@ -590,7 +590,9 @@ impl Ctx {
                 let x = va.get("coinsInCirculation").and_then(num_value);
                 let y = vb.get("coinsInCirculation").and_then(num_value);
                 if let (Some(x), Some(y)) = (x, y) {
-                    let d = a_tip.saturating_sub(b_tip) as f64;
+                    // chainweb-data also fills recent heights late (seen live: 5153 KDA lower
+                    // with its /txs/recent near the tip), so at least 240 heights (2 h) count.
+                    let d = a_tip.saturating_sub(b_tip).max(240) as f64;
                     let tol = 1e-6 * x.abs().max(y.abs());
                     if x > y && d > 0.0 && x - y > tol && x - y <= d * SUPPLY_PER_HEIGHT + tol {
                         let pair = (
@@ -609,12 +611,6 @@ impl Ctx {
         }
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
-        // kda-txs writes decimals as JSON doubles (seen live: kdswap-gas-payer event amounts
-        // whose exact decimal has more digits than an f64 holds); compare at f64 precision.
-        if tb.kind == crate::config::TargetKind::KdaTxs {
-            numbers_as_f64(&mut va);
-            numbers_as_f64(&mut vb);
-        }
         // chainweb-data and kda-txs list a tx's events in their own order (seen live on
         // cross-chain txs: node and compat [TRANSFER, TRANSFER_XCHAIN, TRANSFER, X_YIELD],
         // both oracles [TRANSFER, TRANSFER, TRANSFER_XCHAIN, X_YIELD]). The node pair checks
@@ -738,6 +734,13 @@ impl Ctx {
             };
         // The status difference is part of those two explained cases.
         let status_explained = genesis || orphan_tx.is_some();
+        // kda-txs writes decimals as JSON doubles (seen live: kdswap-gas-payer event amounts
+        // whose exact decimal has more digits than an f64 holds); compare at f64 precision
+        // (only here: the row rules above read heights and chains as integers).
+        if tb.kind == crate::config::TargetKind::KdaTxs {
+            numbers_as_f64(&mut va);
+            numbers_as_f64(&mut vb);
+        }
         let (mut d, skew) = if genesis {
             (
                 vec![DiffEntry {
