@@ -167,7 +167,13 @@ pub fn from_poll(poll: &Value, header: &Value, tx: Option<&DecodedTx>) -> Value 
             "code".into(),
             exec.map(|x| get(x, "code")).unwrap_or(Value::Null),
         );
-        m.insert("data".into(), p("data"));
+        // A cont cmd without data: chainweb-data and compat show `{}` (seen live:
+        // ihLeKStMj9c6... chain 1 height 3264261, 6ROrw0-_pSbA... chain 3 height 3320508).
+        let data = match p("data") {
+            Value::Null if exec.is_none() && cont.is_some() => json!({}),
+            d => d,
+        };
+        m.insert("data".into(), data);
         m.insert("nonce".into(), get(c, "nonce"));
         m.insert("sender".into(), get(&meta, "sender"));
         m.insert("gasLimit".into(), get(&meta, "gasLimit"));

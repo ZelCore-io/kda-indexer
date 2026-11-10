@@ -200,6 +200,31 @@ fn num_value(v: &Value) -> Option<f64> {
 }
 
 /// The `limit` query value, if any.
+/// Rows of `a` whose (requestKey, blockHash, idx) is not in `b` (counted as a multiset).
+fn only_keys_in_first(a: &Value, b: &Value) -> Vec<Value> {
+    let key = |r: &Value| {
+        let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let idx = r.get("idx").and_then(Value::as_f64).map(|f| f.to_string());
+        (s("requestKey"), s("blockHash"), idx)
+    };
+    let mut have: HashMap<(String, String, Option<String>), usize> = HashMap::new();
+    if let Value::Array(xb) = b {
+        for r in xb {
+            *have.entry(key(r)).or_default() += 1;
+        }
+    }
+    let mut out = Vec::new();
+    if let Value::Array(xa) = a {
+        for r in xa {
+            match have.get_mut(&key(r)) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => out.push(r.clone()),
+            }
+        }
+    }
+    out
+}
+
 /// The account a `/txs/account/{account}` or `/v1/txs/{account}/...` request names.
 fn query_account(req: &Request) -> String {
     if req.route == RouteKind::V1Txs {
@@ -753,13 +778,19 @@ impl Ctx {
                     drop_at_or_below(&mut cb, x.max(y));
                 }
             }
-            let only_a = only_in_first(&ca, &cb);
-            if !only_a.is_empty()
+            // Rows match by (requestKey, blockHash, idx): value diffs of a shared row (F1, F2,
+            // ...) stay diffs of their own and do not block this rule.
+            let only_a = only_keys_in_first(&ca, &cb);
+            let only_b = only_keys_in_first(&cb, &ca);
+            let cut_rows = (len_of(&va) + len_of(&vb)) - (len_of(&ca) + len_of(&cb));
+            if only_b.is_empty()
                 && only_a.len() <= NODE_GAP_CHECKS
-                && only_in_first(&cb, &ca).is_empty()
+                && (cut_rows > 0 || !only_a.is_empty())
             {
                 let account = query_account(req);
-                if !account.is_empty() && self.node_confirms(req, &only_a, &account).await {
+                let ok = only_a.is_empty()
+                    || (!account.is_empty() && self.node_confirms(req, &only_a, &account).await);
+                if ok {
                     if let Value::Array(xa) = &mut ca {
                         for r in &only_a {
                             if let Some(i) = xa.iter().position(|x| x == r) {
@@ -767,8 +798,7 @@ impl Ctx {
                             }
                         }
                     }
-                    window_cut = (len_of(&va) + len_of(&vb))
-                        .saturating_sub(len_of(&ca) + len_of(&cb) + only_a.len());
+                    window_cut = cut_rows;
                     va = ca;
                     vb = cb;
                     node_gap = only_a;
@@ -854,7 +884,7 @@ impl Ctx {
                 }
             }
         }
-        if !node_gap.is_empty() {
+        if !node_gap.is_empty() || window_cut > 0 {
             let keys: Vec<Value> = node_gap
                 .iter()
                 .take(10)
@@ -1917,6 +1947,17 @@ pub async fn once(cfg: CompareConfig, path: &str) -> anyhow::Result<Vec<Outcome>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_keys_ignores_value_diffs() {
+        let a = json!([{"requestKey": "x", "blockHash": "h", "gasLimit": null},
+                       {"requestKey": "y", "blockHash": "h"}]);
+        let b = json!([{"requestKey": "x", "blockHash": "h", "gasLimit": 600},
+                       {"requestKey": "y", "blockHash": "o"}]);
+        let o = only_keys_in_first(&a, &b);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0]["requestKey"], "y");
+    }
 
     #[test]
     fn query_account_reads_both_routes() {
