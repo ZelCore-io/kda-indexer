@@ -27,10 +27,15 @@ fn parse_decimal(s: &str) -> Option<(bool, String, i64)> {
         Some(r) => (true, r),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
     };
+    // Exponents beyond ±10^15 are refused (callers fall back to the raw text), so the
+    // digit-count arithmetic below and in the formatters cannot overflow (R12).
     let (mant, exp) = match s.find(['e', 'E']) {
         Some(i) => (&s[..i], s[i + 1..].parse::<i64>().ok()?),
         None => (s, 0),
     };
+    if exp.unsigned_abs() > MAX_EXP {
+        return None;
+    }
     let (int, frac) = match mant.split_once('.') {
         Some((a, b)) => (a, b),
         None => (mant, ""),
@@ -43,8 +48,12 @@ fn parse_decimal(s: &str) -> Option<(bool, String, i64)> {
     }
     let digits: String = int.chars().chain(frac.chars()).collect();
     let digits = digits.trim_start_matches('0').to_owned();
-    Some((neg, digits, exp - frac.len() as i64))
+    let exp = exp.checked_sub(i64::try_from(frac.len()).ok()?)?;
+    Some((neg, digits, exp))
 }
+
+/// Largest decimal exponent magnitude `parse_decimal` accepts.
+const MAX_EXP: u64 = 1_000_000_000_000_000;
 
 /// `formatScientific Generic` (the form of Haskell `show` for `Scientific`, and of aeson
 /// for a non-integral number): fixed notation when the decimal exponent is in 0..=7,
@@ -847,6 +856,11 @@ mod tests {
         assert_eq!(aeson_number("0.00000334"), "3.34e-6");
         assert_eq!(aeson_number("0.90404266"), "0.90404266");
         assert_eq!(aeson_number("1.0"), "1.0");
+        // R12: huge exponents fall back to the raw text instead of overflowing.
+        assert_eq!(aeson_number("1.5e-9223372036854775808"), "1.5e-9223372036854775808");
+        assert_eq!(aeson_number("1.5e9223372036854775807"), "1.5e9223372036854775807");
+        assert_eq!(show_scientific("1.5e-9223372036854775808"), None);
+        assert_eq!(parsed_integer(&serde_json::json!("1e-9223372036854775808")), None);
         assert_eq!(aeson_number("100"), "100");
         assert_eq!(aeson_number("1e2"), "100");
         assert_eq!(aeson_number("100.0"), "100.0");
