@@ -237,6 +237,47 @@ fn page(
     )
 }
 
+/// Longest `name`/`param`/`search` accepted (characters).
+pub const MAX_PATTERN_CHARS: usize = 256;
+/// Most unescaped `%` wildcards in one pattern (bounds the matcher's backtracking).
+pub const MAX_PATTERN_WILDCARDS: usize = 8;
+
+/// Unescaped `%` in a LIKE pattern.
+fn wildcards(s: &str) -> usize {
+    let mut n = 0;
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                it.next();
+            }
+            '%' => n += 1,
+            _ => {}
+        }
+    }
+    n
+}
+
+/// Refuse patterns that would make a request expensive: too long, too many wildcards.
+/// `Err` is the 400 text.
+fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
+    for k in ["name", "param", "search"] {
+        let Some(v) = p.get(k) else { continue };
+        if v.chars().count() > MAX_PATTERN_CHARS {
+            return Err(format!("{k} must be at most {MAX_PATTERN_CHARS} characters"));
+        }
+        if wildcards(v) > MAX_PATTERN_WILDCARDS {
+            return Err(format!("{k} may contain at most {MAX_PATTERN_WILDCARDS} '%' wildcards"));
+        }
+    }
+    if let Some(v) = p.get("search") {
+        if v.chars().count() < s.min_len {
+            return Err(format!("search must be at least {} characters", s.min_len));
+        }
+    }
+    Ok(())
+}
+
 pub async fn handler(
     State(st): State<Arc<ApiState>>,
     Extension(search): Extension<SearchSettings>,
@@ -251,13 +292,8 @@ pub async fn handler(
     if let Err(r) = check_strategy(&headers) {
         return r;
     }
-    if let Some(s) = p.get("search") {
-        if s.chars().count() < search.min_len {
-            return text(
-                StatusCode::BAD_REQUEST,
-                format!("search must be at least {} characters", search.min_len),
-            );
-        }
+    if let Err(t) = check_patterns(&p, &search) {
+        return text(StatusCode::BAD_REQUEST, t);
     }
     let f = Filter {
         search: p.get("search").map(Like::new),
@@ -270,5 +306,31 @@ pub async fn handler(
     match st.read(move |v| page(v, f, &pg, search, cap)).await {
         Ok(p) => page_response(p),
         Err(e) => e.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(q: &[(&str, &str)]) -> Params {
+        Params::new(q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    }
+
+    #[test]
+    fn pattern_length_and_wildcards_capped() {
+        let s = SearchSettings::default();
+        let long = "a".repeat(MAX_PATTERN_CHARS + 1);
+        let many = "%a".repeat(MAX_PATTERN_WILDCARDS + 1);
+        for k in ["name", "param", "search"] {
+            assert!(check_patterns(&params(&[("modulename", "coin"), (k, &long)]), &s).is_err(), "{k} long");
+            assert!(check_patterns(&params(&[("modulename", "coin"), (k, &many)]), &s).is_err(), "{k} %");
+        }
+        let ok = "a".repeat(MAX_PATTERN_CHARS);
+        assert!(check_patterns(&params(&[("modulename", "coin"), ("param", &ok)]), &s).is_ok());
+        assert!(check_patterns(&params(&[("modulename", "coin"), ("name", "TRANSFER")]), &s).is_ok());
+        // An escaped `%` is a literal, not a wildcard.
+        let lit = "\\%a".repeat(MAX_PATTERN_WILDCARDS + 1);
+        assert!(check_patterns(&params(&[("modulename", "coin"), ("param", &lit)]), &s).is_ok());
     }
 }

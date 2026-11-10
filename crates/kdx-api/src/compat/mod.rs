@@ -504,6 +504,10 @@ pub fn collect_page(
         };
         let mut rows: Vec<(RowRef, usize)> = Vec::new();
         for (i, r) in txs.iter().enumerate() {
+            // One height can hold many txs: keep the deadline inside it too.
+            if i % 64 == 63 {
+                view.check_deadline()?;
+            }
             for (sub, idx) in src.rows(view, r)? {
                 rows.push((
                     RowRef {
