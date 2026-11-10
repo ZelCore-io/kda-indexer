@@ -24,13 +24,37 @@ use crate::server::ApiState;
 use crate::store::{PostingQuery, View};
 use crate::ApiResult;
 
-struct Src {
+pub struct Src {
     account: String,
     token: String,
     cache: HashMap<TxKey, (Vec<Ev>, Vec<Transfer>)>,
+    /// Keys-only mode (`/v1/txs`): rows are not rendered, the tx of each is recorded.
+    keys: Option<Vec<TxKey>>,
 }
 
 impl Src {
+    fn new(account: &str, token: &str) -> Src {
+        Src {
+            account: account.to_owned(),
+            token: token.to_owned(),
+            cache: HashMap::new(),
+            keys: None,
+        }
+    }
+
+    /// A source whose rows are not rendered; `take_keys` returns the tx key of each row
+    /// in order.
+    pub fn keys_only(account: &str, token: &str) -> Src {
+        Src {
+            keys: Some(Vec::new()),
+            ..Src::new(account, token)
+        }
+    }
+
+    pub fn take_keys(&mut self) -> Vec<TxKey> {
+        self.keys.take().unwrap_or_default()
+    }
+
     fn load(&mut self, view: &View, r: &TxRecord) -> ApiResult<&(Vec<Ev>, Vec<Transfer>)> {
         if !self.cache.contains_key(&r.key) {
             if self.cache.len() > 4096 {
@@ -67,6 +91,10 @@ impl RowSource for Src {
     }
 
     fn render(&mut self, view: &View, r: &TxRecord, b: &BlockRecord, sub: u16) -> ApiResult<Value> {
+        if let Some(keys) = &mut self.keys {
+            keys.push(r.key);
+            return Ok(Value::Null);
+        }
         let pos = (sub >> 1) as usize;
         let (evs, trs) = self.load(view, r)?;
         let t = trs
@@ -108,11 +136,7 @@ fn page(
     let it = view
         .postings(Family::Xfer, xfer_entity(a, m), q)?
         .peekable();
-    let mut src = Src {
-        account: account.to_owned(),
-        token: token.to_owned(),
-        cache: HashMap::new(),
-    };
+    let mut src = Src::new(account, token);
     collect_page(view, Candidates::Keys(it), &mut src, pg, None)
 }
 

@@ -10,7 +10,9 @@
 
 pub mod account;
 pub mod events;
+pub mod recent;
 pub mod shapes;
+pub mod stats;
 pub mod tx;
 
 use std::cmp::Ordering;
@@ -81,6 +83,9 @@ pub fn router(search: SearchSettings) -> Router<Arc<ApiState>> {
         .route("/txs/txs", get(tx::txs_handler))
         .route("/txs/account/{account}", get(account::handler))
         .route("/txs/events", get(events::handler))
+        .route("/txs/recent", get(recent::handler))
+        .route("/stats", get(stats::handler))
+        .merge(crate::v1txs::router())
         .layer(Extension(search))
 }
 
@@ -104,7 +109,7 @@ pub fn aeson(v: &Value) -> Response {
     json_bytes(b)
 }
 
-fn json_bytes(b: Vec<u8>) -> Response {
+pub fn json_bytes(b: Vec<u8>) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json;charset=utf-8")],
