@@ -55,7 +55,13 @@ pub fn spawn_tip_poll(cfg: &Config, tips: TipWatch, stop: CancellationToken) {
 
 /// Build the API over a store (shared by `serve` and `run`).
 pub fn api(cfg: &Config, store: Arc<Store>, tips: TipWatch) -> anyhow::Result<Api> {
-    Ok(Api::new(store, cfg.api.settings(&cfg.network)?, tips))
+    let search = kdx_api::compat::SearchSettings {
+        min_len: cfg.search.min_len as usize,
+        max_scan_heights: cfg.search.max_scan_heights,
+        timeout_ms: cfg.search.timeout_ms,
+    };
+    Ok(Api::new(store, cfg.api.settings(&cfg.network)?, tips)
+        .compat_routes(kdx_api::compat::router(search)))
 }
 
 pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {

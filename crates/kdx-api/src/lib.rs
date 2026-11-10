@@ -2,6 +2,7 @@
 //! cursor tokens and (from P3 Task 2) the HTTP server, limits and admin endpoints.
 
 pub mod admin;
+pub mod compat;
 pub mod cursor;
 pub mod dict;
 pub mod limits;
