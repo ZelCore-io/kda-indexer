@@ -29,8 +29,15 @@ pub struct Src {
     token: String,
     cache: HashMap<TxKey, (Vec<Ev>, Vec<Transfer>)>,
     /// Keys-only mode (`/v1/txs`): rows are not rendered, the tx of each is recorded.
-    keys: Option<Vec<TxKey>>,
+    keys: Option<Vec<KeyRow>>,
+    /// Keys-only mode: rendered outputs kept for the caller, so it does not render them
+    /// a second time (R4).
+    outs: HashMap<TxKey, Value>,
 }
+
+/// A row of a keys-only page: the tx key and, for its first row, the record and its
+/// rendered output.
+pub type KeyRow = (TxKey, Option<(TxRecord, Value)>);
 
 impl Src {
     fn new(account: &str, token: &str) -> Src {
@@ -39,6 +46,7 @@ impl Src {
             token: token.to_owned(),
             cache: HashMap::new(),
             keys: None,
+            outs: HashMap::new(),
         }
     }
 
@@ -51,7 +59,7 @@ impl Src {
         }
     }
 
-    pub fn take_keys(&mut self) -> Vec<TxKey> {
+    pub fn take_keys(&mut self) -> Vec<KeyRow> {
         self.keys.take().unwrap_or_default()
     }
 
@@ -60,8 +68,15 @@ impl Src {
             if self.cache.len() > 4096 {
                 self.cache.clear();
             }
-            let evs = shapes::events(&shapes::output(view, r)?);
+            let out = shapes::output(view, r)?;
+            let evs = shapes::events(&out);
             let trs = shapes::transfers(&evs);
+            if self.keys.is_some() {
+                if self.outs.len() > 4096 {
+                    self.outs.clear();
+                }
+                self.outs.insert(r.key, out);
+            }
             self.cache.insert(r.key, (evs, trs));
         }
         Ok(&self.cache[&r.key])
@@ -89,9 +104,14 @@ impl RowSource for Src {
         shapes::ev_idx(k, (sub >> 1) as usize)
     }
 
+    fn needs_block(&self) -> bool {
+        self.keys.is_none()
+    }
+
     fn render(&mut self, view: &View, r: &TxRecord, b: &BlockRecord, sub: u16) -> ApiResult<Value> {
         if let Some(keys) = &mut self.keys {
-            keys.push(r.key);
+            let full = self.outs.remove(&r.key).map(|o| (r.clone(), o));
+            keys.push((r.key, full));
             return Ok(Value::Null);
         }
         let pos = (sub >> 1) as usize;

@@ -384,6 +384,11 @@ pub trait RowSource {
     fn idx_of_sub(&self, k: TxKey, sub: u16) -> i64;
     /// Render row `sub` of `r`.
     fn render(&mut self, view: &View, r: &TxRecord, b: &BlockRecord, sub: u16) -> ApiResult<Value>;
+    /// False when `render` ignores the block (keys-only sources): the walk then skips
+    /// loading it (R4).
+    fn needs_block(&self) -> bool {
+        true
+    }
 }
 
 /// Where the candidate txs of a height come from.
@@ -451,6 +456,7 @@ pub fn collect_page(
         });
     }
     let mut scanned = 0u32;
+    let no_block = BlockRecord::default();
     let mut blocks: BTreeMap<(u8, u32), BlockRecord> = BTreeMap::new();
     loop {
         view.check_deadline()?;
@@ -543,14 +549,18 @@ pub fn collect_page(
                 continue;
             }
             let r = &txs[i];
-            let bk = (r.key.chain(), r.key.height());
-            if let std::collections::btree_map::Entry::Vacant(e) = blocks.entry(bk) {
-                let b = view.block(bk.0, bk.1)?.ok_or_else(|| {
-                    ApiError::Internal(anyhow::anyhow!("block of {:?} missing", r.key))
-                })?;
-                e.insert(b);
+            if !src.needs_block() {
+                out.push(src.render(view, r, &no_block, row.sub)?);
+            } else {
+                let bk = (r.key.chain(), r.key.height());
+                if let std::collections::btree_map::Entry::Vacant(e) = blocks.entry(bk) {
+                    let b = view.block(bk.0, bk.1)?.ok_or_else(|| {
+                        ApiError::Internal(anyhow::anyhow!("block of {:?} missing", r.key))
+                    })?;
+                    e.insert(b);
+                }
+                out.push(src.render(view, r, &blocks[&bk], row.sub)?);
             }
-            out.push(src.render(view, r, &blocks[&bk], row.sub)?);
             if out.len() == pg.limit {
                 return Ok(Page {
                     rows: out,

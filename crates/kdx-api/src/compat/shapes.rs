@@ -665,10 +665,22 @@ fn signer(s: &Value) -> Option<Value> {
 /// `TxDetail` of a user tx, or None when its cmd cannot be read (chainweb-data would not
 /// have stored it).
 pub fn tx_detail(view: &View, r: &TxRecord, b: &BlockRecord) -> ApiResult<Option<Value>> {
+    if r.request_key.is_none() {
+        return Ok(None);
+    }
+    tx_detail_with(view, r, b, output(view, r)?)
+}
+
+/// `tx_detail` with the tx's output already rendered.
+pub fn tx_detail_with(
+    view: &View,
+    r: &TxRecord,
+    b: &BlockRecord,
+    out: Value,
+) -> ApiResult<Option<Value>> {
     let (Some(rk), Some(cmd)) = (r.request_key, cmd_value(r)) else {
         return Ok(None);
     };
-    let out = output(view, r)?;
     let meta = cmd.get("meta").cloned().unwrap_or(Value::Null);
     let cont = cmd.pointer("/payload/cont");
     let exec = cmd.pointer("/payload/exec");

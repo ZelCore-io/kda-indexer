@@ -19,7 +19,6 @@ use axum::routing::get;
 use axum::Router;
 use kdx_decode::index::xfer_entity;
 use kdx_decode::Family;
-use kdx_types::TxKey;
 
 use crate::compat::account::Src;
 use crate::compat::shapes::{self, write_aeson};
@@ -173,7 +172,12 @@ fn params(path: &str, query: &[(String, String)]) -> Option<Params> {
 }
 
 /// Tx keys of the newest `limit` transfer rows of `token` for `account`.
-fn token_rows(view: &View, account: &str, token: &str, limit: usize) -> ApiResult<Vec<TxKey>> {
+fn token_rows(
+    view: &View,
+    account: &str,
+    token: &str,
+    limit: usize,
+) -> ApiResult<Vec<crate::compat::account::KeyRow>> {
     let d = view.dict();
     let (Some(a), Some(m)) = (d.account_id(account), d.module_id(token)) else {
         return Ok(Vec::new());
@@ -207,19 +211,24 @@ fn entries(
     let mut seen = HashSet::new();
     let mut body = vec![b'['];
     let mut first = true;
-    for k in keys {
+    for (k, full) in keys {
         // A tx with several matching rows counts once; miner rewards have no entry.
         if k.is_coinbase() || !seen.insert(k) {
             continue;
         }
         view.check_deadline()?;
-        let Some(r) = view.tx(k)? else { continue };
         let Some(b) = view.block(k.chain(), k.height())? else {
             continue;
         };
-        let Some(d) = shapes::tx_detail(view, &r, &b)? else {
-            continue;
+        // The walk already loaded the tx and rendered its output (R4); reuse both.
+        let d = match full {
+            Some((r, out)) => shapes::tx_detail_with(view, &r, &b, out)?,
+            None => match view.tx(k)? {
+                Some(r) => shapes::tx_detail(view, &r, &b)?,
+                None => continue,
+            },
         };
+        let Some(d) = d else { continue };
         if !first {
             body.push(b',');
         }
