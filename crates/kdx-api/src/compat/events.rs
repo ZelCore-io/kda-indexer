@@ -258,6 +258,23 @@ fn wildcards(s: &str) -> usize {
     n
 }
 
+/// Characters of a LIKE pattern other than `%` and `_` (an escaped one counts).
+fn literal_chars(s: &str) -> usize {
+    let mut n = 0;
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                it.next();
+                n += 1;
+            }
+            '%' | '_' => {}
+            _ => n += 1,
+        }
+    }
+    n
+}
+
 /// Refuse patterns that would make a request expensive: too long, too many wildcards.
 /// `Err` is the 400 text.
 fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
@@ -273,6 +290,19 @@ fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
     if let Some(v) = p.get("search") {
         if v.chars().count() < s.min_len {
             return Err(format!("search must be at least {} characters", s.min_len));
+        }
+    }
+    // Without modulename a selective name/param can take the bounded scan of every block:
+    // require as many literal characters as `search` does.
+    if p.get("modulename").is_none() {
+        for k in ["name", "param"] {
+            let Some(v) = p.get(k) else { continue };
+            if literal_chars(v) < s.min_len {
+                return Err(format!(
+                    "{k} must have at least {} characters other than wildcards unless modulename is given",
+                    s.min_len
+                ));
+            }
         }
     }
     Ok(())
@@ -303,7 +333,13 @@ pub async fn handler(
         module: p.get("modulename").map(str::to_owned),
     };
     let cap = st.settings.max_event_lists;
-    match st.read(move |v| page(v, f, &pg, search, cap)).await {
+    // Without modulename the request may take the scan path: an expensive class.
+    let res = if f.module.is_none() {
+        st.read_heavy(move |v| page(v, f, &pg, search, cap)).await
+    } else {
+        st.read(move |v| page(v, f, &pg, search, cap)).await
+    };
+    match res {
         Ok(p) => page_response(p),
         Err(e) => e.into_response(),
     }
@@ -329,6 +365,11 @@ mod tests {
         let ok = "a".repeat(MAX_PATTERN_CHARS);
         assert!(check_patterns(&params(&[("modulename", "coin"), ("param", &ok)]), &s).is_ok());
         assert!(check_patterns(&params(&[("modulename", "coin"), ("name", "TRANSFER")]), &s).is_ok());
+        // Without modulename, short name/param would take the bounded scan of every block.
+        assert!(check_patterns(&params(&[("name", "ab")]), &s).is_err());
+        assert!(check_patterns(&params(&[("param", "%ab%")]), &s).is_err());
+        assert!(check_patterns(&params(&[("name", "TRANSFER"), ("param", "k:ab")]), &s).is_ok());
+        assert!(check_patterns(&params(&[("modulename", "coin"), ("param", "ab")]), &s).is_ok());
         // An escaped `%` is a literal, not a wildcard.
         let lit = "\\%a".repeat(MAX_PATTERN_WILDCARDS + 1);
         assert!(check_patterns(&params(&[("modulename", "coin"), ("param", &lit)]), &s).is_ok());

@@ -95,6 +95,12 @@ pub struct ApiState {
     pub settings: ApiSettings,
     pub tips: TipWatch,
     reads: Arc<Semaphore>,
+    /// Status and readiness reads (`/readyz`, `/status`, the sampler): their own slots, so
+    /// a busy pool never fails health checks.
+    status_reads: Arc<Semaphore>,
+    /// Expensive request classes (events scan, `/v1/txs`) take one of these before a read
+    /// slot: at most half the pool, so they cannot hold every slot.
+    heavy: Arc<Semaphore>,
     in_flight: Arc<Semaphore>,
     limiter: RateLimiter,
 }
@@ -107,14 +113,57 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
+        self.read_on(None, &self.reads, f).await
+    }
+
+    /// `read` for an expensive request class: a `heavy` slot first, then a read slot.
+    pub async fn read_heavy<T, F>(self: &Arc<Self>, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        self.read_on(Some(&self.heavy), &self.reads, f).await
+    }
+
+    /// `read` on the reserved status slots (cheap tip reads only).
+    pub async fn read_status<T, F>(self: &Arc<Self>, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        self.read_on(None, &self.status_reads, f).await
+    }
+
+    async fn read_on<T, F>(
+        self: &Arc<Self>,
+        first: Option<&Arc<Semaphore>>,
+        pool: &Arc<Semaphore>,
+        f: F,
+    ) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
         let deadline = Instant::now() + self.settings.deadline;
-        let permit = tokio::time::timeout_at(deadline.into(), self.reads.clone().acquire_owned())
+        let acquire = |s: &Arc<Semaphore>| {
+            tokio::time::timeout_at(deadline.into(), s.clone().acquire_owned())
+        };
+        let gate = match first {
+            Some(s) => Some(
+                acquire(s)
+                    .await
+                    .map_err(|_| ApiError::Deadline)?
+                    .map_err(|e| ApiError::Internal(e.into()))?,
+            ),
+            None => None,
+        };
+        let permit = acquire(pool)
             .await
             .map_err(|_| ApiError::Deadline)?
             .map_err(|e| ApiError::Internal(e.into()))?;
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
-            let _p = permit;
+            let _p = (permit, gate);
             let view = store.view(deadline)?;
             view.check_deadline()?;
             f(&view)
@@ -139,6 +188,9 @@ impl IntoResponse for ApiError {
         (code, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
     }
 }
+
+/// Reserved read slots for status and readiness.
+const STATUS_READS: usize = 2;
 
 /// Header carrying the compat next-page token.
 pub const CHAINWEB_NEXT: HeaderName = HeaderName::from_static("chainweb-next");
@@ -231,6 +283,8 @@ impl Api {
     pub fn new(store: Arc<Store>, settings: ApiSettings, tips: TipWatch) -> Api {
         let state = Arc::new(ApiState {
             reads: Arc::new(Semaphore::new(settings.read_threads.max(1))),
+            status_reads: Arc::new(Semaphore::new(STATUS_READS)),
+            heavy: Arc::new(Semaphore::new((settings.read_threads / 2).max(1))),
             in_flight: Arc::new(Semaphore::new(settings.max_in_flight.max(1))),
             limiter: RateLimiter::new(settings.rate_per_ip, settings.rate_burst),
             store,
@@ -338,4 +392,44 @@ pub fn json(v: &serde_json::Value) -> Response {
         Body::from(body),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(crate) fn settings(read_threads: usize) -> ApiSettings {
+        ApiSettings {
+            network: "testnet04".into(),
+            deadline: Duration::from_millis(500),
+            max_in_flight: 16,
+            max_body_bytes: 1 << 20,
+            v1txs_max_body_bytes: 1 << 20,
+            rate_per_ip: 20,
+            rate_burst: 40,
+            trusted_proxies: Vec::new(),
+            read_threads,
+            ready_max_lag: 10,
+            max_event_lists: 64,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_answers_while_every_read_slot_is_busy() {
+        let (_d, store) = crate::testutil::store();
+        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let _all = st.reads.clone().acquire_many_owned(4).await.unwrap();
+        assert!(status::Status::load(&st).await.is_ok());
+        // A plain read waits for a slot until its deadline.
+        assert!(matches!(st.read(|_| Ok(())).await, Err(ApiError::Deadline)));
+    }
+
+    #[tokio::test]
+    async fn heavy_reads_leave_slots_for_the_rest() {
+        let (_d, store) = crate::testutil::store();
+        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let _heavy = st.heavy.clone().acquire_many_owned(2).await.unwrap();
+        assert!(matches!(st.read_heavy(|_| Ok(())).await, Err(ApiError::Deadline)));
+        assert!(st.read(|_| Ok(())).await.is_ok());
+    }
 }

@@ -44,7 +44,7 @@ impl Status {
         let backfill = st.tips.backfill();
         let read_only = st.store.hot.is_read_only();
         let node_known = tips.is_some();
-        st.read(move |v| {
+        st.read_status(move |v| {
             let mut chains = Vec::new();
             for (c, h, hash) in v.chain_tips()? {
                 let node_height = tips.as_ref().and_then(|t| t.heights.get(&c).copied());

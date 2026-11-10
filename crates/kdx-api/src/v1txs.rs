@@ -253,7 +253,7 @@ async fn handler(
     };
     let cap = st.settings.v1txs_max_body_bytes;
     match st
-        .read(move |v| entries(v, &p.account, &p.namespace, limit as usize, cap))
+        .read_heavy(move |v| entries(v, &p.account, &p.namespace, limit as usize, cap))
         .await
     {
         Ok(body) => json_bytes(body),
