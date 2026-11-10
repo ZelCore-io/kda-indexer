@@ -54,6 +54,8 @@ const LIMIT_EDGE_PATH: &str = "/~limit-edge";
 const ORACLE_HORIZON: u64 = 1440;
 /// JSON path of the visible allowlist hit for a chainweb-data page that ended on a coinbase row.
 const CWD_CURSOR_SKIP_PATH: &str = "/~cwd-cursor-skip";
+/// JSON path of the visible allowlist hit for /v1/txs rows kda-txs leaves out.
+const KDATXS_GAP_PATH: &str = "/~kdatxs-gap";
 /// How long a chainweb-data tip reading is reused.
 const ORACLE_TIP_TTL: Duration = Duration::from_secs(60);
 /// Upper bound of the supply minted per height on all chains together (coinbase rewards; live
@@ -140,6 +142,20 @@ fn num_canon_text(v: &Value) -> String {
         }
     }
     walk(v).to_string()
+}
+
+/// Rewrites every JSON number as its nearest f64.
+fn numbers_as_f64(v: &mut Value) {
+    match v {
+        Value::Number(n) => {
+            if let Some(x) = n.as_f64().and_then(serde_json::Number::from_f64) {
+                *n = x;
+            }
+        }
+        Value::Array(x) => x.iter_mut().for_each(numbers_as_f64),
+        Value::Object(m) => m.values_mut().for_each(numbers_as_f64),
+        _ => {}
+    }
 }
 
 fn len_of(v: &Value) -> usize {
@@ -593,6 +609,12 @@ impl Ctx {
         }
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
+        // kda-txs writes decimals as JSON doubles (seen live: kdswap-gas-payer event amounts
+        // whose exact decimal has more digits than an f64 holds); compare at f64 precision.
+        if tb.kind == crate::config::TargetKind::KdaTxs {
+            numbers_as_f64(&mut va);
+            numbers_as_f64(&mut vb);
+        }
         // chainweb-data and kda-txs list a tx's events in their own order (seen live on
         // cross-chain txs: node and compat [TRANSFER, TRANSFER_XCHAIN, TRANSFER, X_YIELD],
         // both oracles [TRANSFER, TRANSFER, TRANSFER_XCHAIN, X_YIELD]). The node pair checks
@@ -645,6 +667,42 @@ impl Ctx {
                 }
             }
         }
+        // kda-txs leaves out some rows of an account (seen live: 28481ce2... chain 0 height
+        // 1288814, xwallet-xchain-gas chain 5 height 7386167, canonical blocks). /v1/txs rows
+        // only A lists, when kda-txs lists no row of its own, are checked against
+        // chainweb-data's /txs/tx: same block and an event naming the account. Confirmed rows
+        // leave the diff as the visible hit /~kdatxs-gap.
+        let mut kt_gap: Vec<Value> = Vec::new();
+        if req.route == RouteKind::V1Txs
+            && tb.kind == crate::config::TargetKind::KdaTxs
+            && sa == 200
+            && sb == 200
+        {
+            let only_a = only_in_first(&va, &vb);
+            if !only_a.is_empty()
+                && only_a.len() <= GAP_CHECKS
+                && only_in_first(&vb, &va).is_empty()
+            {
+                let account = crate::via_cwd::parse(&req.path_and_query).account;
+                let mut all = true;
+                for r in &only_a {
+                    if !self.cwd_names_account(req, r, &account).await {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    if let Value::Array(xa) = &mut va {
+                        for r in &only_a {
+                            if let Some(i) = xa.iter().position(|x| x == r) {
+                                xa.remove(i);
+                            }
+                        }
+                    }
+                    kt_gap = only_a;
+                }
+            }
+        }
         // chainweb-data keeps rows of orphaned blocks: on /txs/txs it lists them beside the
         // canonical row, and its /txs/tx answers 404 when a request key has several rows.
         // A's row must be one of B's (the node pair checks that A's block is canonical); B's
@@ -670,7 +728,14 @@ impl Ctx {
         let genesis = matches!(req.route, RouteKind::Tx | RouteKind::Txs)
             && sa == 404
             && sb == 200
-            && matches!(&vb, Value::Array(rows) if !rows.is_empty() && rows.iter().all(|r| self.is_genesis_row(r)));
+            && match &vb {
+                Value::Array(rows) => {
+                    !rows.is_empty() && rows.iter().all(|r| self.is_genesis_row(r))
+                }
+                // chainweb-data's /txs/tx answers some genesis txs too (seen live: 3I6F2eeG...).
+                o @ Value::Object(_) => self.is_genesis_row(o),
+                _ => false,
+            };
         // The status difference is part of those two explained cases.
         let status_explained = genesis || orphan_tx.is_some();
         let (mut d, skew) = if genesis {
@@ -709,6 +774,14 @@ impl Ctx {
                     e.path = format!("{ORACLE_LAG_PATH}{}", e.path);
                 }
             }
+        }
+        if !kt_gap.is_empty() {
+            d.push(DiffEntry {
+                path: KDATXS_GAP_PATH.into(),
+                kind: DiffKind::Extra,
+                a: Some(Value::Array(kt_gap)),
+                b: None,
+            });
         }
         if cursor_skip > 0 {
             d.push(DiffEntry {
@@ -1199,6 +1272,40 @@ impl Ctx {
 
     /// Whether chainweb-data's own `/txs/tx` for the row's request key, in the row's block,
     /// carries the row's `{token}.TRANSFER` event from `fromAccount` to `toAccount`.
+    /// chainweb-data's `/txs/tx` for `row`'s request key is in the same block and has an
+    /// event whose params name `account`.
+    async fn cwd_names_account(&self, req: &Request, row: &Value, account: &str) -> bool {
+        let Some(cwd) = self
+            .targets
+            .values()
+            .find(|t| t.kind == crate::config::TargetKind::ChainwebData)
+        else {
+            return false;
+        };
+        let Some(rk) = row.get("requestKey").and_then(Value::as_str) else {
+            return false;
+        };
+        self.count_request(req.route.as_str(), &cwd.name, 1);
+        let Ok(page) = cwd.get(&format!("/txs/tx?requestkey={rk}")).await else {
+            return false;
+        };
+        let Some(tx) = page.json().filter(|_| page.status == 200) else {
+            return false;
+        };
+        if tx.get("blockHash") != row.get("blockHash") {
+            return false;
+        }
+        tx.get("events")
+            .and_then(Value::as_array)
+            .is_some_and(|evs| {
+                evs.iter().any(|e| {
+                    e.get("params")
+                        .and_then(Value::as_array)
+                        .is_some_and(|p| p.iter().any(|x| x.as_str() == Some(account)))
+                })
+            })
+    }
+
     async fn cwd_has_transfer(&self, req: &Request, tb: &Target, row: &Value) -> bool {
         if tb.kind != crate::config::TargetKind::ChainwebData {
             return false;

@@ -172,3 +172,19 @@ condition = "changed"
 request_contains = "/txs/tx"
 reason = "A cmd's meta.creationTime can be fractional (seen live: 3X2ut23V... chain 1 height 4006748, 1692638383.532). Compat shows 17:19:43 (floor), chainweb-data 17:19:44 (rounded); the node pair projects it rounded, like chainweb-data."
 owner_note = "PROPOSED in run 3E-c: known F2 for the fix round (compat to round like chainweb-data); allowlisted meanwhile like G1."
+
+[[entry]]
+id = "kdatxs-gap"
+route = "v1txs"
+json_path_glob = "/~kdatxs-gap"
+condition = "any"
+reason = "kda-txs leaves out some /v1/txs rows in canonical blocks (seen live: 28481ce2... chain 0 height 1288814, 1 row on kda-indexer, none on kda-txs; xwallet-xchain-gas chain 5 height 7386167). An A-only row, when kda-txs lists no row of its own, moves here only when chainweb-data's /txs/tx for that request key is in the same block and has an event naming the account."
+owner_note = "PROPOSED in run 3E-c (P3 Task 8), controller/owner to accept: kda-txs data gap."
+
+[[entry]]
+id = "known-f1-gas-limit"
+route = "v1txs"
+json_path_glob = "/*/gasLimit"
+condition = "any"
+reason = "Compat /v1/txs answers gasLimit null on some rows where kda-txs has the cmd's value (seen live: d250a569... /coin/50 and /coin/250, several rows, kda-txs 600)."
+owner_note = "Known F1 (ruling R3E-10), real finding for the fix round; allowlisted meanwhile like G1 so the window can gate the rest (run 3E-c ruling)."
