@@ -256,6 +256,23 @@ pub struct Paged {
     pub items: Value,
     /// Stopped at the follow depth while a `Chainweb-Next` token was still pending.
     pub truncated: bool,
+    /// Rows dropped because a page started with the previous page's last row.
+    pub boundary_dups: u32,
+}
+
+/// JSON path of the visible allowlist hit for rows repeated across a page boundary.
+pub const PAGE_DUP_PATH: &str = "/~page-dup";
+
+/// chainweb-data can start a `Chainweb-Next` page with the last row of the previous page.
+/// Such a row is dropped (counted in `boundary_dups`) unless it is a transfer to oneself,
+/// which chainweb-data legitimately lists twice.
+fn repeats_boundary(all: &[Value], first: Option<&Value>) -> bool {
+    let (Some(last), Some(first)) = (all.last(), first) else {
+        return false;
+    };
+    let self_transfer =
+        first.get("fromAccount").is_some() && first.get("fromAccount") == first.get("toAccount");
+    last == first && !self_transfer
 }
 
 /// JSON path of the visible allowlist hit for [`cut_to_common_depth`].
@@ -321,6 +338,7 @@ pub async fn follow_pages(target: &Target, path: &str, depth: u32) -> anyhow::Re
     let mut pages = vec![first];
     let mut followed = 0;
     let mut truncated = false;
+    let mut boundary_dups = 0;
     while let Some(tok) = next.take() {
         if followed >= depth {
             truncated = true;
@@ -333,7 +351,9 @@ pub async fn follow_pages(target: &Target, path: &str, depth: u32) -> anyhow::Re
             break;
         }
         if let (Some(Value::Array(more)), Value::Array(all)) = (cap.json(), &mut items) {
-            all.extend(more);
+            let skip = usize::from(repeats_boundary(all, more.first()));
+            boundary_dups += skip as u32;
+            all.extend(more.into_iter().skip(skip));
         }
         next = cap.next_token().map(str::to_string);
         pages.push(cap);
@@ -342,6 +362,7 @@ pub async fn follow_pages(target: &Target, path: &str, depth: u32) -> anyhow::Re
         pages,
         items,
         truncated,
+        boundary_dups,
     })
 }
 

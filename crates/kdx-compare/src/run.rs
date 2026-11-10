@@ -13,7 +13,7 @@ use crate::allowlist::Allowlist;
 use crate::config::CompareConfig;
 use crate::diff::{
     cut_to_common_depth, diff_route, follow_pages, recent_diff, DiffEntry, DiffKind, Paged,
-    PAGE_CUT_PATH,
+    PAGE_CUT_PATH, PAGE_DUP_PATH,
 };
 use crate::gen::random::{canonical_header, RandomGen};
 use crate::gen::replay::ReplayGen;
@@ -291,6 +291,14 @@ impl Ctx {
         } else {
             (diff_route(&req.route, &va, &vb), false)
         };
+        if pa.boundary_dups + pb.boundary_dups > 0 {
+            d.push(DiffEntry {
+                path: PAGE_DUP_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!(pa.boundary_dups)),
+                b: Some(json!(pb.boundary_dups)),
+            });
+        }
         if page_cut {
             d.push(DiffEntry {
                 path: PAGE_CUT_PATH.into(),

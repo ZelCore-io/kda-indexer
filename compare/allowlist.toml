@@ -91,3 +91,11 @@ json_path_glob = "/transactionCount"
 condition = "changed"
 reason = "chainweb-data's transactionCount is pg_class.reltuples of a transactions table that is never analyzed, so the value is frozen (200,841,520 on 2026-11-10 while the table holds 233,094,876 rows). Its rows also include txs of orphaned blocks and miss blocks it never fetched. kda-indexer counts canonical user txs exactly (229.9M); per-height windows match chainweb-data where it holds no orphans or gaps."
 owner_note = "PROPOSED in run 3E (P3 Task 8), owner to accept. Without it /stats can never be within 1%: the reference value is stale, not an estimate."
+
+[[entry]]
+id = "cwd-page-boundary-dup"
+route = "*"
+json_path_glob = "/~page-dup"
+condition = "changed"
+reason = "chainweb-data can start a Chainweb-Next page with the last row of the previous page (seen live on /txs/account with throttled pages: the same transfer, same chain and idx, twice in a row). The harness drops the repeated row (never a transfer to oneself, which chainweb-data lists twice on purpose) and reports this visible hit; kda-indexer pages never repeat a row."
+owner_note = "PROPOSED in run 3E (P3 Task 8): chainweb-data paging bug, owner to accept."
