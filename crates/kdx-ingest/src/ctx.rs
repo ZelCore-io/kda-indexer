@@ -41,7 +41,8 @@ pub struct IngestOpts {
 pub struct Ctx {
     pub opts: IngestOpts,
     pub node: NodeClient,
-    pub hot: HotStore,
+    /// One MDBX environment per process: shared with the API and every other `Ctx`.
+    pub hot: Arc<HotStore>,
     pub dict: Arc<Mutex<HotDict>>,
     pub segdir: PathBuf,
     pub etl: PathBuf,
@@ -63,6 +64,13 @@ impl Ctx {
     /// Open the stores and check the node's network and chain graph against `Meta`
     /// (written on first open, refused on mismatch).
     pub async fn open(opts: IngestOpts, node: NodeClient) -> Result<Ctx> {
+        let hot = Arc::new(HotStore::open(&hot_dir(&opts.data_dir), opts.geometry)?);
+        Ctx::open_with(opts, node, hot).await
+    }
+
+    /// Like [`Ctx::open`] over an already opened hot store (`run` opens it once and shares it
+    /// between backfill, tail and API: opening one MDBX env twice in a process is not allowed).
+    pub async fn open_with(opts: IngestOpts, node: NodeClient, hot: Arc<HotStore>) -> Result<Ctx> {
         let info = node.info().await.context("node /info")?;
         if info.chainweb_version != opts.network {
             bail!(
@@ -80,7 +88,6 @@ impl Ctx {
         let etl = etl_dir(&opts.data_dir);
         std::fs::create_dir_all(&segdir)?;
         std::fs::create_dir_all(&etl)?;
-        let hot = HotStore::open(&hot_dir(&opts.data_dir), opts.geometry)?;
         {
             let mut txn = hot.rw()?;
             match txn.meta(meta::NETWORK)? {

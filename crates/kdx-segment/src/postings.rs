@@ -188,26 +188,70 @@ pub struct Postings {
     offsets: EliasFano,
 }
 
-/// TxNums of one list, newest (largest) first.
+/// TxNums of one list, newest (largest) first. Delta and Elias-Fano lists are decoded up to
+/// the bound; a Roaring list is iterated lazily from the back.
 pub struct PostingIter {
-    vals: Vec<u32>,
+    inner: Inner,
     base: u64,
+    len: usize,
+}
+
+enum Inner {
+    Vec(Vec<u32>),
+    Roaring(roaring::bitmap::IntoIter),
 }
 
 impl Iterator for PostingIter {
     type Item = u64;
     fn next(&mut self) -> Option<u64> {
-        self.vals.pop().map(|v| self.base + v as u64)
+        let v = match &mut self.inner {
+            Inner::Vec(v) => v.pop(),
+            Inner::Roaring(it) => it.next_back(),
+        }?;
+        self.len = self.len.saturating_sub(1);
+        Some(self.base + v as u64)
     }
 }
 
 impl PostingIter {
+    /// Entries left.
     pub fn len(&self) -> usize {
-        self.vals.len()
+        self.len
     }
     pub fn is_empty(&self) -> bool {
-        self.vals.is_empty()
+        self.len == 0
     }
+}
+
+/// Decode the list in `b`, keeping values `<= max` (None = all).
+fn list_le(b: &[u8], max: Option<u32>, base: u64) -> Result<PostingIter> {
+    let enc = *b.first().context("empty list")?;
+    if enc == ENC_ROARING {
+        let r = RoaringBitmap::deserialize_from(&b[1..])?;
+        let len = match max {
+            Some(m) => r.rank(m) as usize,
+            None => r.len() as usize,
+        };
+        let mut it = r.into_iter();
+        if let Some(m) = max {
+            it.advance_back_to(m);
+        }
+        return Ok(PostingIter {
+            inner: Inner::Roaring(it),
+            base,
+            len,
+        });
+    }
+    let mut v = decode_list(b)?;
+    if let Some(m) = max {
+        let n = v.partition_point(|&x| x <= m);
+        v.truncate(n);
+    }
+    Ok(PostingIter {
+        len: v.len(),
+        inner: Inner::Vec(v),
+        base,
+    })
 }
 
 impl Postings {
@@ -278,19 +322,28 @@ impl Postings {
 
     /// Relative values of the list at directory position `i`.
     pub fn list_at(&self, i: usize) -> Result<Vec<u32>> {
-        let a = self.offsets.select(i).context("offset")?;
-        let b = self.offsets.select(i + 1).context("offset")?;
-        decode_list(&self.map[HEAD + a..HEAD + b])
+        decode_list(self.list_bytes(i)?)
     }
 
     /// TxNums of `entity`, descending; None when absent (or undecodable).
     pub fn list(&self, entity: u64) -> Option<PostingIter> {
-        let i = self.find(entity)?;
-        let vals = self.list_at(i).ok()?;
-        Some(PostingIter {
-            vals,
-            base: self.first_txnum,
-        })
+        self.list_le(entity, None).ok().flatten()
+    }
+
+    fn list_bytes(&self, i: usize) -> Result<&[u8]> {
+        let a = self.offsets.select(i).context("offset")?;
+        let b = self.offsets.select(i + 1).context("offset")?;
+        ensure!(HEAD + b <= self.ent_at && a <= b, "posting list offsets out of bounds");
+        Ok(&self.map[HEAD + a..HEAD + b])
+    }
+
+    /// TxNums of `entity` whose relative value is `<= max_rel` (None = all), descending.
+    /// `Ok(None)` when the entity has no list; `Err` when the list does not decode.
+    pub fn list_le(&self, entity: u64, max_rel: Option<u32>) -> Result<Option<PostingIter>> {
+        let Some(i) = self.find(entity) else {
+            return Ok(None);
+        };
+        Ok(Some(list_le(self.list_bytes(i)?, max_rel, self.first_txnum)?))
     }
 }
 
@@ -323,5 +376,22 @@ mod list_tests {
         }
         // A delta list that claims more values than it has bytes is rejected.
         assert!(decode_list(&[ENC_DELTA, 0x7f, 1]).is_err());
+        // Bounded reverse iteration agrees with the decoded list for every encoding.
+        for len in [5usize, 30, 200] {
+            let vals: Vec<u32> = (0..len as u32).map(|i| i * 3).collect();
+            let mut out = Vec::new();
+            encode_list(&vals, range_txs, &mut out).unwrap();
+            for max in [None, Some(0), Some(1), Some(44), Some(45), Some(10_000)] {
+                let want: Vec<u64> = vals
+                    .iter()
+                    .rev()
+                    .filter(|&&v| max.is_none_or(|m| v <= m))
+                    .map(|&v| 7 + v as u64)
+                    .collect();
+                let it = list_le(&out, max, 7).unwrap();
+                assert_eq!(it.len(), want.len(), "len {len} max {max:?}");
+                assert_eq!(it.collect::<Vec<_>>(), want, "len {len} max {max:?}");
+            }
+        }
     }
 }

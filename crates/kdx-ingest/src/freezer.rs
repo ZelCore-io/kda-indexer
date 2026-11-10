@@ -32,6 +32,22 @@ fn crash_at(point: &str) {
         eprintln!("KDX_CRASH_AT={point}: aborting");
         std::process::abort();
     }
+    sleep_at(point);
+}
+
+/// Debug hook `KDX_DEBUG_SLEEP_AT=<point>:<secs>`: sleep at a commit point (readers racing
+/// the freezer, Review Focus 1). Same points as `KDX_CRASH_AT`.
+fn sleep_at(point: &str) {
+    let Ok(v) = std::env::var("KDX_DEBUG_SLEEP_AT") else {
+        return;
+    };
+    if let Some((p, secs)) = v.split_once(':') {
+        if p == point {
+            let secs: u64 = secs.parse().unwrap_or(5);
+            tracing::warn!(point, secs, "KDX_DEBUG_SLEEP_AT: sleeping");
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+        }
+    }
 }
 
 fn load_manifest(ctx: &Ctx) -> Result<Manifest> {

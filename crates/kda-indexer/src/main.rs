@@ -198,6 +198,13 @@ enum InspectWhat {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Dev: loop read views (postings walk, request-key lookups, cursors) for N seconds
+    /// beside a running indexer; reports duplicates, order breaks, lookup misses, errors.
+    #[command(hide = true)]
+    ViewCheck {
+        #[arg(long, default_value_t = 600)]
+        seconds: u64,
+    },
     /// Random frozen and hot txs; with --compare-node, refetch each block and require
     /// byte-identical rendered tx, output, miner data and an equal header.
     Sample {
@@ -343,6 +350,12 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Inspect { data_dir, what } => {
             use kda_indexer::cmd::inspect;
+            if let InspectWhat::ViewCheck { seconds } = what {
+                return kda_indexer::cmd::viewcheck::run(
+                    data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                    seconds,
+                );
+            }
             let s = inspect::Store::open(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir))?;
             match what {
                 InspectWhat::Tx { reqkey } => inspect::tx(&s, &reqkey),
@@ -358,6 +371,7 @@ async fn main() -> anyhow::Result<()> {
                     count,
                     compare_node,
                 } => inspect::sample(&cfg, &s, count, compare_node).await,
+                InspectWhat::ViewCheck { .. } => unreachable!("handled above"),
             }
         }
         Command::Measure {

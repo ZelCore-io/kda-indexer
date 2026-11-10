@@ -9,7 +9,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{bail, Context, Result};
 use reth_libmdbx::{
-    DatabaseFlags, Environment, PageSize, Transaction, TransactionKind, WriteFlags, RO, RW,
+    Cursor, DatabaseFlags, Environment, EnvironmentFlags, Mode, PageSize, Transaction,
+    TransactionKind, WriteFlags, RO, RW,
 };
 
 use crate::tables::{Table, Tables};
@@ -54,6 +55,7 @@ pub struct HotStore {
     tables: Tables,
     writer: Mutex<()>,
     geometry: Geometry,
+    read_only: bool,
 }
 
 impl HotStore {
@@ -114,7 +116,55 @@ impl HotStore {
             tables,
             writer: Mutex::new(()),
             geometry: g,
+            read_only: false,
         })
+    }
+
+    /// Open an existing hot store read-only (`serve`, `inspect`, `hot stats`): MDBX read-only
+    /// mode, no geometry set, no write txn, no table created. Refuses a missing store, a
+    /// missing table or another `format_version`. `rw()` on it errors. The geometry reported
+    /// is the default (the real one is in `Meta geometry`).
+    pub fn open_ro(dir: &Path) -> Result<HotStore> {
+        if !dir.join("mdbx.dat").is_file() {
+            bail!("no hot store in {}", dir.display());
+        }
+        let env = Environment::builder()
+            .set_max_dbs(32)
+            .set_flags(EnvironmentFlags {
+                mode: Mode::ReadOnly,
+                ..Default::default()
+            })
+            .open(dir)
+            .with_context(|| format!("opening MDBX env read-only in {}", dir.display()))?;
+        let mut dbis = Vec::new();
+        {
+            let txn = env.begin_ro_txn()?;
+            for t in Table::all() {
+                let db = txn
+                    .open_db(Some(&t.name()))
+                    .with_context(|| format!("hot store table {} missing", t.name()))?;
+                dbis.push((t, db.dbi()));
+            }
+            let tables = Tables::new(dbis.clone());
+            let v = txn
+                .get::<Vec<u8>>(tables.dbi(Table::Meta), meta::FORMAT_VERSION.as_bytes())?
+                .context("hot store has no format_version")?;
+            let v = be_u64(&v).context("Meta format_version")?;
+            if v != FORMAT_VERSION {
+                bail!("hot store format version {v}, this build reads {FORMAT_VERSION}");
+            }
+        }
+        Ok(HotStore {
+            env,
+            tables: Tables::new(dbis),
+            writer: Mutex::new(()),
+            geometry: Geometry::default(),
+            read_only: true,
+        })
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -139,6 +189,9 @@ impl HotStore {
 
     /// The write transaction. One writer at a time: blocks while another `RwTxn` is alive.
     pub fn rw(&self) -> Result<RwTxn<'_>> {
+        if self.read_only {
+            bail!("hot store opened read-only: no write transaction");
+        }
         let guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         Ok(RwTxn {
             txn: self.env.begin_rw_txn()?,
@@ -224,6 +277,19 @@ pub trait Txn {
         })
     }
 
+    /// Rows whose key starts with `prefix` and is below `upper`, newest (largest key) first,
+    /// streamed from a cursor (nothing is collected). `upper = &[]` means no upper bound.
+    fn scan_rev_prefix(&self, t: Table, prefix: &[u8], upper: &[u8]) -> Result<RevScan<Self::Kind>> {
+        let c = self.raw().cursor(self.tables().dbi(t))?;
+        Ok(RevScan {
+            c,
+            prefix: prefix.to_vec(),
+            upper: upper.to_vec(),
+            started: false,
+            done: false,
+        })
+    }
+
     /// Number of rows in a table.
     fn count(&self, t: Table) -> Result<usize> {
         Ok(self.raw().db_stat_with_dbi(self.tables().dbi(t))?.entries())
@@ -250,6 +316,76 @@ pub trait Txn {
             .and_then(|v| be_u64(&v))
             .unwrap_or(0))
     }
+}
+
+/// Streaming reverse prefix scan (see [`Txn::scan_rev_prefix`]).
+pub struct RevScan<K: TransactionKind> {
+    c: Cursor<K>,
+    prefix: Vec<u8>,
+    upper: Vec<u8>,
+    started: bool,
+    done: bool,
+}
+
+impl<K: TransactionKind> RevScan<K> {
+    fn step(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let row = if self.started {
+            self.c.prev::<Vec<u8>, Vec<u8>>()?
+        } else {
+            self.started = true;
+            // Start at the first key >= the bound (the upper bound, or the prefix's successor),
+            // then step back once; past the end, start at the last row.
+            let succ = prefix_successor(&self.prefix);
+            let bound = match (self.upper.is_empty(), succ) {
+                (true, s) => s,
+                (false, Some(s)) if s < self.upper => Some(s),
+                (false, _) => Some(self.upper.clone()),
+            };
+            let at = match bound {
+                Some(b) => self.c.set_range::<Vec<u8>, Vec<u8>>(&b)?,
+                None => None,
+            };
+            match at {
+                Some(_) => self.c.prev::<Vec<u8>, Vec<u8>>()?,
+                None => self.c.last::<Vec<u8>, Vec<u8>>()?,
+            }
+        };
+        Ok(row.filter(|(k, _)| {
+            k.starts_with(&self.prefix) && (self.upper.is_empty() || k[..] < self.upper[..])
+        }))
+    }
+}
+
+impl<K: TransactionKind> Iterator for RevScan<K> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.step() {
+            Ok(Some(r)) => Some(Ok(r)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+/// Smallest byte string greater than every string starting with `p` (None: no such bound).
+fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
+    let mut v = p.to_vec();
+    while let Some(last) = v.pop() {
+        if last < 0xFF {
+            v.push(last + 1);
+            return Some(v);
+        }
+    }
+    None
 }
 
 pub struct RoTxn {
@@ -335,5 +471,42 @@ impl RwTxn<'_> {
     pub fn commit(self) -> Result<()> {
         self.txn.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rev_tests {
+    use super::*;
+
+    #[test]
+    fn rev_prefix_scan_and_read_only_open() {
+        let d = tempfile::tempdir().unwrap();
+        let hs = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hs.rw().unwrap();
+        for a in [1u8, 2, 3] {
+            for b in [0u8, 5, 9, 0xFF] {
+                txn.put(Table::Counters, &[a, b], &[b]).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        let ro = hs.ro().unwrap();
+        let keys = |prefix: &[u8], upper: &[u8]| -> Vec<Vec<u8>> {
+            ro.scan_rev_prefix(Table::Counters, prefix, upper)
+                .unwrap()
+                .map(|r| r.unwrap().0)
+                .collect()
+        };
+        assert_eq!(keys(&[2], &[]), vec![vec![2, 0xFF], vec![2, 9], vec![2, 5], vec![2, 0]]);
+        assert_eq!(keys(&[2], &[2, 9]), vec![vec![2, 5], vec![2, 0]]);
+        assert_eq!(keys(&[2], &[7]), keys(&[2], &[]));
+        assert_eq!(keys(&[3], &[]).len(), 4);
+        assert!(keys(&[4], &[]).is_empty());
+        assert!(keys(&[2], &[1]).is_empty());
+        drop(ro);
+        drop(hs);
+        let r = HotStore::open_ro(d.path()).unwrap();
+        assert!(r.rw().is_err());
+        assert_eq!(r.ro().unwrap().count(Table::Counters).unwrap(), 12);
+        assert!(HotStore::open_ro(&d.path().join("missing")).is_err());
     }
 }

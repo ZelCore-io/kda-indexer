@@ -63,7 +63,13 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
 
     let node = super::node_client(cfg)?;
     node.set_batch_limit(cfg.ingest.batch_size);
-    let ctx = Arc::new(Ctx::open(opts(cfg, &data_dir, a.until), node).await?);
+    // One MDBX environment for the whole process (backfill, tail, freezer, API).
+    let o = opts(cfg, &data_dir, a.until);
+    let hot = Arc::new(kdx_hot::HotStore::open(
+        &kdx_ingest::ctx::hot_dir(&data_dir),
+        o.geometry,
+    )?);
+    let ctx = Arc::new(Ctx::open_with(o, node, hot.clone()).await?);
     let cut = ctx.node.cut().await?;
     let cut_min = cut
         .hashes
@@ -168,7 +174,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         bcfg.ingest.max_rps = cfg.backfill_max_rps();
         let bnode = super::node_client(&bcfg)?;
         bnode.set_batch_limit(cfg.ingest.batch_size);
-        let bctx = Arc::new(Ctx::open(opts(cfg, &data_dir, a.until), bnode).await?);
+        let bctx = Arc::new(Ctx::open_with(opts(cfg, &data_dir, a.until), bnode, hot.clone()).await?);
         let to = u32::try_from(final_tip)?;
         let bf = kdx_ingest::backfill::run(bctx, u32::try_from(bf_from)?, to, a.header_mode);
         tokio::select! {
@@ -181,9 +187,10 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+
         let node = super::node_client(cfg)?;
         node.set_batch_limit(cfg.ingest.batch_size);
-        let ctx = Arc::new(Ctx::open(opts(cfg, &data_dir, a.until), node).await?);
+        let ctx = Arc::new(Ctx::open_with(opts(cfg, &data_dir, a.until), node, hot).await?);
         return follow(ctx, token, a.freeze).await;
     }
     follow(ctx, token, a.freeze).await

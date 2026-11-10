@@ -10,6 +10,7 @@ members = [
     "crates/kdx-hot",
     "crates/kdx-segment",
     "crates/kdx-ingest",
+    "crates/kdx-api",
 ]
 # Vendored third-party code builds as a path dependency, not as a workspace member (no lints).
 exclude = ["vendor/ptr_hash"]
@@ -58,6 +59,9 @@ hex = "0.4"
 bytes = "1"
 rayon = "1"
 libc = "0.2"
+arc-swap = "1"
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
+tower-http = { version = "0.6", features = ["cors", "limit"] }
 
 kdx-types = { path = "crates/kdx-types" }
 kdx-node = { path = "crates/kdx-node" }
@@ -65,6 +69,7 @@ kdx-decode = { path = "crates/kdx-decode" }
 kdx-hot = { path = "crates/kdx-hot" }
 kdx-segment = { path = "crates/kdx-segment" }
 kdx-ingest = { path = "crates/kdx-ingest" }
+kdx-api = { path = "crates/kdx-api" }
 
 [profile.release]
 lto = "thin"

@@ -19,7 +19,7 @@ use kdx_types::{Dict, DictKind, Hash32, MemDict, TxKey};
 use rand::RngExt;
 use serde_json::{json, Value};
 
-use super::hot::{geometry, hot_dir};
+use super::hot::hot_dir;
 use super::segments::segments_dir;
 use crate::config::Config;
 
@@ -32,7 +32,8 @@ pub struct Store {
 
 impl Store {
     pub fn open(cfg: &Config, data_dir: &Path) -> anyhow::Result<Store> {
-        let hs = HotStore::open(&hot_dir(data_dir), geometry(cfg))?;
+        let _ = cfg;
+        let hs = HotStore::open_ro(&hot_dir(data_dir))?;
         let txn = hs.ro()?;
         let dict = Arc::new(HotDict::load(&txn)?.mem().clone());
         let seg = Segments::open(&segments_dir(data_dir), dict.clone())?;
