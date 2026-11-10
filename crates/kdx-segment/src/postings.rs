@@ -192,8 +192,9 @@ pub struct Postings {
     offsets: EliasFano,
 }
 
-/// TxNums of one list, newest (largest) first. Delta and Elias-Fano lists are decoded up to
-/// the bound; a Roaring list is iterated lazily from the back.
+/// TxNums of one list, newest (largest) first. A Delta list is decoded up to the bound (it
+/// is small by construction); Elias-Fano and Roaring lists are walked lazily from the back,
+/// so a page of 10 from a list of a million entries touches about 10 of them (R4).
 pub struct PostingIter {
     inner: Inner,
     base: u64,
@@ -202,6 +203,8 @@ pub struct PostingIter {
 
 enum Inner {
     Vec(Vec<u32>),
+    /// The list and the count of values not yet returned (values `[0, k)` remain).
+    Ef(EliasFano, usize),
     Roaring(roaring::bitmap::IntoIter),
 }
 
@@ -210,6 +213,10 @@ impl Iterator for PostingIter {
     fn next(&mut self) -> Option<u64> {
         let v = match &mut self.inner {
             Inner::Vec(v) => v.pop(),
+            Inner::Ef(ef, k) => {
+                *k = k.checked_sub(1)?;
+                ef.select(*k).map(|x| x as u32)
+            }
             Inner::Roaring(it) => it.next_back(),
         }?;
         self.len = self.len.saturating_sub(1);
@@ -244,6 +251,35 @@ fn list_le(b: &[u8], max: Option<u32>, base: u64) -> Result<PostingIter> {
             inner: Inner::Roaring(it),
             base,
             len,
+        });
+    }
+    if enc == ENC_EF {
+        let mut buf = &b[1..];
+        let n = get_u64(&mut buf)? as usize;
+        let ef = EliasFano::deserialize_from(buf)?;
+        if ef.len() != n {
+            bail!("EF list length {} != {n}", ef.len());
+        }
+        // Count of values <= m by binary search over select (no rank index needed).
+        let k = match max {
+            None => n,
+            Some(m) => {
+                let (mut lo, mut hi) = (0usize, n);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if ef.select(mid).is_some_and(|x| x <= m as usize) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            }
+        };
+        return Ok(PostingIter {
+            inner: Inner::Ef(ef, k),
+            base,
+            len: k,
         });
     }
     let mut v = decode_list(b)?;
@@ -354,6 +390,54 @@ impl Postings {
 #[cfg(test)]
 mod list_tests {
     use super::*;
+
+    /// R4: the lazy walk of `list_le` matches a full decode, for every encoding and bound.
+    #[test]
+    fn list_le_matches_full_decode() {
+        let range_txs = 1u64 << 20;
+        for len in [1usize, 16, 17, 500, 40_000] {
+            let vals: Vec<u32> = (0..len as u32).map(|i| i * 13 + (i % 7)).collect();
+            let mut b = Vec::new();
+            encode_list(&vals, range_txs, &mut b).unwrap();
+            let last = *vals.last().unwrap();
+            for max in [None, Some(0), Some(5), Some(last / 2), Some(last), Some(last + 9)] {
+                let mut want: Vec<u64> = vals
+                    .iter()
+                    .filter(|&&v| max.is_none_or(|m| v <= m))
+                    .map(|&v| 1000 + v as u64)
+                    .collect();
+                want.reverse();
+                let it = list_le(&b, max, 1000).unwrap();
+                assert_eq!(it.len(), want.len(), "len {len} max {max:?}");
+                assert_eq!(it.collect::<Vec<_>>(), want, "len {len} max {max:?}");
+            }
+        }
+    }
+
+    /// Timing: a page of 10 from a large EF list must not cost a full decode. Run with
+    /// `cargo test -p kdx-segment --release -- --ignored --nocapture ef_page_timing`.
+    #[test]
+    #[ignore]
+    fn ef_page_timing() {
+        let range_txs = 1u64 << 26;
+        let vals: Vec<u32> = (0..(range_txs / 32) as u32).map(|i| i * 31).collect();
+        let mut b = Vec::new();
+        encode_list(&vals, range_txs, &mut b).unwrap();
+        assert_eq!(b[0], ENC_EF);
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = decode_list(&b).unwrap();
+        }
+        let full = t.elapsed() / 100;
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            let p: Vec<u64> = list_le(&b, Some(vals[vals.len() / 2]), 0).unwrap().take(10).collect();
+            assert_eq!(p.len(), 10);
+        }
+        let page = t.elapsed() / 100;
+        println!("{} entries: full decode {full:?}, page of 10 {page:?}", vals.len());
+        assert!(page < full);
+    }
 
     /// Round trip at the delta/EF boundary (16/17) and the EF/Roaring threshold.
     #[test]
