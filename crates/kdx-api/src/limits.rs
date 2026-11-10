@@ -139,10 +139,18 @@ struct Buckets {
     /// are skipped on eviction.
     order: VecDeque<(IpAddr, u64)>,
     seq: u64,
+    /// Shared bucket charged for keys created by evicting a non-full bucket.
+    overflow: Option<(f64, Instant)>,
 }
 
+/// Queue entries looked at per insert for a refilled bucket to evict.
+const EVICT_SCAN: usize = 16;
+
 /// Per-IP token bucket: `rate` tokens per second, at most `burst`. At most `cap` buckets;
-/// a new key over the cap evicts the oldest-created one (O(1) amortized, no full scan).
+/// a new key over the cap evicts a refilled (full) bucket among the oldest few, else the
+/// oldest one. Evicting a full bucket loses nothing; when a non-full one had to go, the new
+/// key starts empty and its first token comes from a shared overflow bucket, so cycling
+/// keys through the table never refills a drained key. O(1) per insert, no full scan.
 pub struct RateLimiter {
     rate: f64,
     burst: f64,
@@ -167,6 +175,7 @@ impl RateLimiter {
                 map: HashMap::new(),
                 order: VecDeque::new(),
                 seq: 0,
+                overflow: None,
             }),
         }
     }
@@ -184,28 +193,68 @@ impl RateLimiter {
         self.len() == 0
     }
 
+    /// Evict one bucket: a refilled one among the first `EVICT_SCAN` queue entries (others
+    /// rotate to the back), else the oldest. True when a non-full bucket was evicted.
+    fn make_room(&self, b: &mut Buckets, now: Instant) -> bool {
+        for _ in 0..EVICT_SCAN {
+            let Some((k, seq)) = b.order.pop_front() else {
+                break;
+            };
+            let Some(&(t, at, s)) = b.map.get(&k) else {
+                continue;
+            };
+            if s != seq {
+                continue;
+            }
+            if t + now.saturating_duration_since(at).as_secs_f64() * self.rate >= self.burst {
+                b.map.remove(&k);
+                return false;
+            }
+            b.order.push_back((k, seq));
+        }
+        while let Some((k, seq)) = b.order.pop_front() {
+            if b.map.get(&k).is_some_and(|e| e.2 == seq) {
+                b.map.remove(&k);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Take one token for `ip`; false when the bucket is empty.
     pub fn allow(&self, ip: IpAddr) -> bool {
+        self.allow_at(ip, Instant::now())
+    }
+
+    fn allow_at(&self, ip: IpAddr, now: Instant) -> bool {
         let key = bucket_key(ip);
-        let now = Instant::now();
         let mut g = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         let b = &mut *g;
+        let mut pressured = false;
         if !b.map.contains_key(&key) {
-            while b.map.len() >= self.cap {
-                let Some((old, seq)) = b.order.pop_front() else {
-                    break;
-                };
-                if b.map.get(&old).is_some_and(|e| e.2 == seq) {
-                    b.map.remove(&old);
-                }
+            if b.map.len() >= self.cap {
+                pressured = self.make_room(b, now);
             }
             b.seq += 1;
-            b.map.insert(key, (self.burst, now, b.seq));
+            let start = if pressured { 0.0 } else { self.burst };
+            b.map.insert(key, (start, now, b.seq));
             b.order.push_back((key, b.seq));
         }
         let (tokens, at, _) = b.map.get_mut(&key).expect("inserted above");
-        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * self.rate).min(self.burst);
+        *tokens = (*tokens + now.saturating_duration_since(*at).as_secs_f64() * self.rate)
+            .min(self.burst);
         *at = now;
+        if pressured {
+            let (t, at) = b.overflow.get_or_insert((self.burst, now));
+            *t =
+                (*t + now.saturating_duration_since(*at).as_secs_f64() * self.rate).min(self.burst);
+            *at = now;
+            if *t >= 1.0 {
+                *t -= 1.0;
+                return true;
+            }
+            return false;
+        }
         if *tokens >= 1.0 {
             *tokens -= 1.0;
             true
@@ -322,12 +371,48 @@ mod tests {
         assert_eq!(r.len(), 3);
         assert!(!r.allow(ip(2)));
         assert!(!r.allow(ip(3)));
-        assert!(r.allow(ip(1)), "evicted bucket starts full");
+        assert!(!r.allow(ip(1)), "a drained, evicted key comes back empty");
         assert_eq!(r.len(), 3);
         for n in 10..200 {
             r.allow(ip(n));
         }
         assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn eviction_prefers_refilled_buckets() {
+        let r = RateLimiter::with_cap(1, 2, 2);
+        let t0 = Instant::now();
+        let t5 = t0 + std::time::Duration::from_secs(5);
+        let ip = |n: u8| IpAddr::from([1, 1, 1, n]);
+        assert!(r.allow_at(ip(2), t0));
+        assert!(r.allow_at(ip(1), t0) && r.allow_at(ip(1), t0));
+        assert!(r.allow_at(ip(2), t5) && r.allow_at(ip(2), t5));
+        // 2 is oldest but drained at t5; 1 refilled by t5: 1 goes, 2 stays drained.
+        assert!(
+            r.allow_at(ip(3), t5) && r.allow_at(ip(3), t5),
+            "a free slot starts full"
+        );
+        assert!(!r.allow_at(ip(2), t5));
+    }
+
+    #[test]
+    fn eviction_never_grants_a_drained_key_a_full_burst() {
+        let r = RateLimiter::with_cap(1, 2, 2);
+        let t0 = Instant::now();
+        let ip = |n: u8| IpAddr::from([1, 1, 1, n]);
+        for n in [1, 2] {
+            assert!(r.allow_at(ip(n), t0) && r.allow_at(ip(n), t0));
+            assert!(!r.allow_at(ip(n), t0));
+        }
+        // Table full of drained buckets: new keys start empty and draw on the shared
+        // overflow bucket (burst 2), so cycling keys gains nothing.
+        assert!(r.allow_at(ip(3), t0), "overflow token 1");
+        assert!(r.allow_at(ip(1), t0), "overflow token 2 (1 was evicted)");
+        assert!(!r.allow_at(ip(1), t0), "1 came back empty");
+        assert!(!r.allow_at(ip(4), t0), "overflow drained");
+        assert!(!r.allow_at(ip(2), t0));
+        assert_eq!(r.len(), 2);
     }
 
     #[test]
