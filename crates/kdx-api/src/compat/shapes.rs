@@ -161,10 +161,19 @@ pub fn utc_secs(secs: i64) -> String {
     )
 }
 
-/// POSIX seconds of a meta `creationTime` number text (fraction dropped).
-fn meta_secs(v: &Value) -> Option<i64> {
+/// A Pact `ParsedInteger` (meta `creationTime`, `ttl`, `gasLimit`, cont `step`): a JSON
+/// number, a string holding a number (`"600"`), or `{"int": ...}`. Pact accepts all three
+/// in a command, so stored commands carry all three. Fraction dropped.
+fn parsed_integer(v: &Value) -> Option<i64> {
     let s = match v {
         Value::Number(n) => n.to_string(),
+        Value::String(s) => s.trim().to_owned(),
+        Value::Object(o) => {
+            return match o.get("int") {
+                Some(i @ (Value::Number(_) | Value::String(_))) => parsed_integer(i),
+                _ => None,
+            }
+        }
         _ => return None,
     };
     let (neg, digits, exp) = parse_decimal(&s)?;
@@ -187,6 +196,20 @@ fn meta_secs(v: &Value) -> Option<i64> {
     };
     let n: i64 = int.parse().ok()?;
     Some(if neg { -n } else { n })
+}
+
+/// A Pact `ParsedDecimal` (meta `gasPrice`) as number text: a JSON number, a string
+/// holding a number, or `{"decimal": ...}`.
+fn parsed_decimal_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => parse_decimal(s.trim()).map(|_| s.trim().to_owned()),
+        Value::Object(o) => match o.get("decimal") {
+            Some(d @ (Value::Number(_) | Value::String(_))) => parsed_decimal_text(d),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -541,8 +564,7 @@ pub fn cmd_value(r: &TxRecord) -> Option<Value> {
 
 fn int_of(v: Option<&Value>) -> Value {
     match v
-        .and_then(|v| v.as_number())
-        .and_then(|n| meta_secs(&Value::Number(n.clone())))
+        .and_then(parsed_integer)
     {
         Some(i) => i.into(),
         None => Value::Null,
@@ -670,8 +692,8 @@ pub fn tx_detail(view: &View, r: &TxRecord, b: &BlockRecord) -> ApiResult<Option
 
     let gas_price = meta
         .get("gasPrice")
-        .and_then(|v| v.as_number())
-        .and_then(|n| n.to_string().parse::<f64>().ok())
+        .and_then(parsed_decimal_text)
+        .and_then(|n| n.parse::<f64>().ok())
         .map_or(Value::Null, aeson_double);
     let txid = match out.get("txId") {
         Some(Value::Number(n)) => Value::Number(n.clone()),
@@ -728,7 +750,7 @@ pub fn tx_detail(view: &View, r: &TxRecord, b: &BlockRecord) -> ApiResult<Option
     m.insert(
         "creationTime".into(),
         meta.get("creationTime")
-            .and_then(meta_secs)
+            .and_then(parsed_integer)
             .map_or(Value::Null, |s| utc_secs(s).into()),
     );
     m.insert("requestKey".into(), rk.to_b64url().into());
@@ -773,6 +795,23 @@ pub fn tx_detail(view: &View, r: &TxRecord, b: &BlockRecord) -> ApiResult<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// F1: Pact accepts `gasLimit`/`ttl` as a number, a numeric string or `{"int": n}`.
+    #[test]
+    fn parsed_integer_forms() {
+        assert_eq!(parsed_integer(&json!(600)), Some(600));
+        assert_eq!(parsed_integer(&json!("600")), Some(600));
+        assert_eq!(parsed_integer(&json!({"int": 600})), Some(600));
+        assert_eq!(parsed_integer(&json!({"int": "600"})), Some(600));
+        assert_eq!(parsed_integer(&json!(600.0)), Some(600));
+        assert_eq!(parsed_integer(&json!("x")), None);
+        assert_eq!(parsed_integer(&json!(null)), None);
+        assert_eq!(int_of(Some(&json!("600"))), json!(600));
+        assert_eq!(parsed_decimal_text(&json!("1.0e-8")).as_deref(), Some("1.0e-8"));
+        assert_eq!(parsed_decimal_text(&json!({"decimal": "0.00001"})).as_deref(), Some("0.00001"));
+        assert_eq!(parsed_decimal_text(&json!(1e-8)).as_deref(), Some("1e-8"));
+    }
 
     #[test]
     fn numbers() {
