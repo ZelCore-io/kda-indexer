@@ -22,6 +22,7 @@ kdx-decode.workspace = true
 kdx-hot.workspace = true
 kdx-segment.workspace = true
 axum.workspace = true
+http-body.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tower.workspace = true

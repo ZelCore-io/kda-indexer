@@ -41,6 +41,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 toml = "1"
 axum = "0.8"
+http-body = "1"
 prometheus-client = "0.25"
 utoipa = { version = "5", features = ["preserve_order"] }
 # Vendored ptr_hash 2.1.3 (MIT) with the MPL-2.0 `colored` dependency removed (see vendor/ptr_hash).

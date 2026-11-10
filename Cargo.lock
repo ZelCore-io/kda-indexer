@@ -1279,6 +1279,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "base64 0.22.1",
+ "http-body",
  "kdx-decode",
  "kdx-hot",
  "kdx-metrics",

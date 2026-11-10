@@ -197,7 +197,7 @@ pub const CHAINWEB_NEXT: HeaderName = HeaderName::from_static("chainweb-next");
 
 /// Limits of a data listener: in-flight cap, per-IP rate, deadline, body cap.
 async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
-    let Ok(_slot) = st.in_flight.clone().try_acquire_owned() else {
+    let Ok(slot) = st.in_flight.clone().try_acquire_owned() else {
         return ApiError::Unavailable("too many requests in flight".into()).into_response();
     };
     if let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
@@ -235,7 +235,34 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
         ))
         .into_response();
     }
-    resp
+    // The in-flight slot lives in the body: released when the body is sent or dropped.
+    resp.map(|b| Body::new(HoldSlot { inner: b, _slot: slot }))
+}
+
+/// A response body holding its request's in-flight slot.
+struct HoldSlot {
+    inner: Body,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl HttpBody for HoldSlot {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Debug hook `KDX_DEBUG_API_DELAY_MS`: hold every data request this long inside the
@@ -412,6 +439,25 @@ mod tests {
             ready_max_lag: 10,
             max_event_lists: 64,
         }
+    }
+
+    #[tokio::test]
+    async fn in_flight_slot_is_held_until_the_body_is_gone() {
+        use tower::ServiceExt;
+        let (_d, store) = crate::testutil::store();
+        let mut cfg = settings(4);
+        cfg.max_in_flight = 1;
+        let st = Api::new(store, cfg, TipWatch::default()).state();
+        let app = Router::new()
+            .route("/x", axum::routing::get(|| async { "hello" }))
+            .layer(middleware::from_fn_with_state(st.clone(), guard))
+            .with_state(st.clone());
+        let req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.in_flight.available_permits(), 0, "body not sent yet");
+        drop(resp);
+        assert_eq!(st.in_flight.available_permits(), 1);
     }
 
     #[tokio::test]
