@@ -503,6 +503,23 @@ impl View {
         Ok(tips.or_else(|| self.seg_frontier.checked_sub(1)))
     }
 
+    /// Highest height whose txs are committed: the tail checkpoints, else the segment
+    /// frontier. During backfill the `Headers` checkpoint runs far above the data, so walks
+    /// that start from `max_indexed_height` spend their budget on empty heights (R13).
+    pub fn max_data_height(&self) -> ApiResult<Option<u32>> {
+        let mut tail: Option<u32> = None;
+        for c in 0..kdx_segment::SLOT_WIDTH as u8 {
+            if let Some((h, _)) = kdx_hot::checkpoint(&self.txn, Stage::Tail, c)? {
+                tail = Some(tail.map_or(h, |t| t.max(h)));
+            }
+        }
+        let seg = self.seg_frontier.checked_sub(1);
+        Ok(match (tail, seg) {
+            (Some(t), Some(s)) => Some(t.max(s)),
+            (t, s) => t.or(s),
+        })
+    }
+
     /// TxKeys of `(f, entity)`, newest first: the hot part, then the frozen part, with the
     /// query's filters. The deadline is checked every 64 items.
     pub fn postings(
@@ -592,5 +609,31 @@ impl View {
             }
             Some(r)
         })))
+    }
+}
+
+#[cfg(test)]
+mod data_height_tests {
+    use std::time::{Duration, Instant};
+
+    use kdx_hot::Stage;
+    use kdx_types::Hash32;
+
+    /// R13: a Headers checkpoint far above the data does not move the data tip.
+    #[test]
+    fn headers_checkpoint_is_not_data() {
+        let (_d, store) = crate::testutil::store();
+        let mut w = store.hot_for_tests().rw().unwrap();
+        kdx_hot::set_checkpoint(&mut w, Stage::Headers, 0, 5_000, Hash32([1; 32])).unwrap();
+        w.commit().unwrap();
+        let view = store.view(Instant::now() + Duration::from_secs(60)).unwrap();
+        assert_eq!(view.max_indexed_height().unwrap(), Some(5_000));
+        assert_eq!(view.max_data_height().unwrap(), None);
+        drop(view);
+        let mut w = store.hot_for_tests().rw().unwrap();
+        kdx_hot::set_checkpoint(&mut w, Stage::Tail, 1, 4_000, Hash32([2; 32])).unwrap();
+        w.commit().unwrap();
+        let view = store.view(Instant::now() + Duration::from_secs(60)).unwrap();
+        assert_eq!(view.max_data_height().unwrap(), Some(4_000));
     }
 }

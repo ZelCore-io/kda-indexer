@@ -45,7 +45,7 @@ fn summary(d: &Value) -> Value {
 
 fn recent(view: &View) -> ApiResult<Vec<Value>> {
     let mut out = Vec::new();
-    let Some(mut h) = view.max_indexed_height()? else {
+    let Some(mut h) = view.max_data_height()? else {
         return Ok(out);
     };
     let floor = store_floor(view);

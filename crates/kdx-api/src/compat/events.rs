@@ -212,7 +212,7 @@ fn page(
     }
     // Bounded scan of every block, newest first.
     let floor = store_floor(view).max(pg.min_height.unwrap_or(0));
-    let top = match (view.max_indexed_height()?, max_h) {
+    let top = match (view.max_data_height()?, max_h) {
         (None, _) => return Ok(empty),
         (Some(t), Some(m)) => t.min(m),
         (Some(t), None) => t,
