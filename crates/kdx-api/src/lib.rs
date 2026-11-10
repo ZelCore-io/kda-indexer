@@ -47,3 +47,22 @@ impl From<kdx_types::Error> for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::sync::Arc;
+
+    use crate::store::Store;
+
+    /// An empty store in a temp dir (keep the dir alive while the store is used).
+    pub fn store() -> (tempfile::TempDir, Arc<Store>) {
+        let d = tempfile::tempdir().expect("tempdir");
+        let g = kdx_hot::Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).expect("hot store"));
+        let s = Arc::new(Store::open(hot, d.path()).expect("store"));
+        (d, s)
+    }
+}

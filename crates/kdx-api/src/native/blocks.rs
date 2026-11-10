@@ -206,89 +206,109 @@ pub async fn list(st: St, q: QueryQ) -> Response {
         Ok(q) => q,
         Err(e) => return e.into_response(),
     };
-    run(st.0, move |view| {
-        let lp = list_params(&q)?;
-        let mut chains: Vec<u8> = Vec::new();
-        match (&q.chains, lp.chain) {
-            (Some(s), _) => {
-                for p in s.split(',') {
-                    let c: u8 = p.trim().parse().map_err(|_| ApiError::BadRequest("invalid chains".into()))?;
-                    if u32::from(c) >= kdx_segment::SLOT_WIDTH {
-                        return Err(ApiError::BadRequest("chain out of range".into()));
-                    }
-                    chains.push(c);
+    run(st.0, move |view| list_in(view, &q)).await
+}
+
+/// `list` over one view: walk (height, chain) positions from the cursor.
+fn list_in(view: &View, q: &Q) -> ApiResult<Response> {
+    let lp = list_params(q)?;
+    let mut chains: Vec<u8> = Vec::new();
+    match (&q.chains, lp.chain) {
+        (Some(s), _) => {
+            for p in s.split(',') {
+                let c: u8 = p.trim().parse().map_err(|_| ApiError::BadRequest("invalid chains".into()))?;
+                if u32::from(c) >= kdx_segment::SLOT_WIDTH {
+                    return Err(ApiError::BadRequest("chain out of range".into()));
                 }
-                chains.sort_unstable();
-                chains.dedup();
+                chains.push(c);
             }
-            (None, Some(c)) => chains.push(c),
-            (None, None) => chains.extend(0..kdx_segment::SLOT_WIDTH as u8),
+            chains.sort_unstable();
+            chains.dedup();
         }
-        let tips = view.chain_tips()?;
-        let top = view.max_indexed_height()?.unwrap_or(0);
-        let hi = lp.max_height.unwrap_or(top).min(top);
-        let lo = lp.min_height.unwrap_or(0);
-        if let Some(cur) = &lp.cursor {
-            cur.check(view)?;
+        (None, Some(c)) => chains.push(c),
+        (None, None) => chains.extend(0..kdx_segment::SLOT_WIDTH as u8),
+    }
+    let tips = view.chain_tips()?;
+    let top = view.max_indexed_height()?.unwrap_or(0);
+    let hi = lp.max_height.unwrap_or(top).min(top);
+    let lo = lp.min_height.unwrap_or(0);
+    if let Some(cur) = &lp.cursor {
+        cur.check(view)?;
+    }
+    // Walk (height, chain) positions in order, from the cursor.
+    let desc = lp.order == Order::Desc;
+    let start = match (&lp.cursor, desc) {
+        (Some(c), true) => (c.key.height(), i32::from(c.key.chain()) - 1),
+        (Some(c), false) => (c.key.height(), i32::from(c.key.chain()) + 1),
+        (None, true) => (hi, i32::from(kdx_segment::SLOT_WIDTH as u8)),
+        (None, false) => (lo, -1),
+    };
+    let mut items = Vec::new();
+    let mut next = None;
+    let (mut h, mut ci) = start;
+    let mut walked = 0u32;
+    let mut last: Option<(u32, u8)> = None;
+    'walk: loop {
+        view.check_deadline()?;
+        if (desc && h < lo) || (!desc && h > hi) {
+            break;
         }
-        // Walk (height, chain) positions in order, from the cursor.
-        let desc = lp.order == Order::Desc;
-        let start = match (&lp.cursor, desc) {
-            (Some(c), true) => (c.key.height(), i32::from(c.key.chain()) - 1),
-            (Some(c), false) => (c.key.height(), i32::from(c.key.chain()) + 1),
-            (None, true) => (hi, i32::from(kdx_segment::SLOT_WIDTH as u8)),
-            (None, false) => (lo, -1),
+        let cs: Box<dyn Iterator<Item = u8>> = if desc {
+            Box::new(chains.iter().rev().copied())
+        } else {
+            Box::new(chains.iter().copied())
         };
-        let mut items = Vec::new();
-        let mut next = None;
-        let (mut h, mut ci) = start;
-        let mut walked = 0u32;
-        let mut last: Option<(u32, u8)> = None;
-        'walk: loop {
-            if (desc && h < lo) || (!desc && h > hi) {
-                break;
+        for c in cs {
+            let ok = if desc { i32::from(c) < ci } else { i32::from(c) > ci };
+            if !ok {
+                continue;
             }
-            let cs: Box<dyn Iterator<Item = u8>> = if desc {
-                Box::new(chains.iter().rev().copied())
-            } else {
-                Box::new(chains.iter().copied())
-            };
-            for c in cs {
-                let ok = if desc { i32::from(c) < ci } else { i32::from(c) > ci };
-                if !ok {
-                    continue;
-                }
-                let Some(b) = view.block(c, h)? else { continue };
-                if items.len() == lp.limit {
-                    next = last.map(|(h, c)| Cursor::new(view, TxKey::new(h, c, 0), 0).map(|c| c.encode())).transpose()?;
-                    break 'walk;
-                }
-                items.push(block_json(view, &b, &tips)?);
-                last = Some((h, c));
+            let Some(b) = view.block(c, h)? else { continue };
+            if items.len() == lp.limit {
+                next = last.map(|(h, c)| Cursor::new(view, TxKey::new(h, c, 0), 0).map(|c| c.encode())).transpose()?;
+                break 'walk;
             }
-            walked += 1;
-            if walked >= HEIGHT_WALK_CAP {
-                if next.is_none() {
-                    // Continue where the walk stopped (a sparse filter).
-                    let key = TxKey::new(h, if desc { 0 } else { kdx_segment::SLOT_WIDTH as u8 - 1 }, 0);
-                    next = Some(Cursor::new(view, key, 0)?.encode());
-                    if desc && h == lo || !desc && h == hi {
-                        next = None;
-                    }
-                }
-                break;
-            }
-            ci = if desc { i32::from(kdx_segment::SLOT_WIDTH as u8) } else { -1 };
-            if desc {
-                if h == 0 {
-                    break;
-                }
-                h -= 1;
-            } else {
-                h += 1;
-            }
+            items.push(block_json(view, &b, &tips)?);
+            last = Some((h, c));
         }
-        list_response(view, items, next)
-    })
-    .await
+        walked += 1;
+        if walked >= HEIGHT_WALK_CAP {
+            if next.is_none() {
+                // Continue where the walk stopped (a sparse filter).
+                let key = TxKey::new(h, if desc { 0 } else { kdx_segment::SLOT_WIDTH as u8 - 1 }, 0);
+                next = Some(Cursor::new(view, key, 0)?.encode());
+                if desc && h == lo || !desc && h == hi {
+                    next = None;
+                }
+            }
+            break;
+        }
+        ci = if desc { i32::from(kdx_segment::SLOT_WIDTH as u8) } else { -1 };
+        if desc {
+            if h == 0 {
+                break;
+            }
+            h -= 1;
+        } else {
+            h += 1;
+        }
+    }
+    list_response(view, items, next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn list_walk_checks_the_deadline() {
+        let (_d, store) = crate::testutil::store();
+        let view = store.view(Instant::now() - Duration::from_secs(1)).unwrap();
+        let q = Q {
+            order: Some("asc".into()),
+            ..Q::default()
+        };
+        assert!(matches!(list_in(&view, &q), Err(ApiError::Deadline)));
+    }
 }
