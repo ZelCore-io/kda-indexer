@@ -65,7 +65,10 @@ impl Dict for ViewDict<'_> {
         if let Some(id) = self.snap.find(k, s) {
             return Some(id);
         }
-        let v = self.txn.get(Table::DictFwd(k), &fwd_key(s.as_bytes())).ok()??;
+        let v = self
+            .txn
+            .get(Table::DictFwd(k), &fwd_key(s.as_bytes()))
+            .ok()??;
         let id = u32::from_be_bytes(v.as_slice().try_into().ok()?);
         // A hashed (over-long) key could in principle collide: confirm the name.
         (self.name(k, id) == Some(s)).then_some(id)

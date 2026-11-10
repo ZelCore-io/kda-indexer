@@ -195,7 +195,12 @@ impl IntoResponse for ApiError {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
         };
-        (code, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+        (
+            code,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            text,
+        )
+            .into_response()
     }
 }
 
@@ -246,7 +251,12 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
         .into_response();
     }
     // The in-flight slot lives in the body: released when the body is sent or dropped.
-    resp.map(|b| Body::new(HoldSlot { inner: b, _slot: slot }))
+    resp.map(|b| {
+        Body::new(HoldSlot {
+            inner: b,
+            _slot: slot,
+        })
+    })
 }
 
 /// A response body holding its request's in-flight slot.
@@ -297,7 +307,12 @@ async fn track(State(api): State<&'static str>, req: Request, next: Next) -> Res
         .get::<MatchedPath>()
         .map_or_else(|| "unmatched".to_string(), |m| m.as_str().to_string());
     let resp = next.run(req).await;
-    kdx_metrics::get().http(api, &route, resp.status().as_u16(), t0.elapsed().as_secs_f64());
+    kdx_metrics::get().http(
+        api,
+        &route,
+        resp.status().as_u16(),
+        t0.elapsed().as_secs_f64(),
+    );
     resp
 }
 
@@ -401,13 +416,10 @@ impl Api {
             tracing::info!(listener = name, %addr, "api: listening");
             let stop = shutdown.clone();
             tasks.push(tokio::spawn(async move {
-                axum::serve(
-                    l,
-                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .with_graceful_shutdown(stop.cancelled_owned())
-                .await
-                .with_context(|| format!("api: {name} listener"))
+                axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>())
+                    .with_graceful_shutdown(stop.cancelled_owned())
+                    .await
+                    .with_context(|| format!("api: {name} listener"))
             }));
         }
         if let Some(f) = on_bound {
@@ -485,7 +497,10 @@ mod tests {
         let (_d, store) = crate::testutil::store();
         let st = Api::new(store, settings(4), TipWatch::default()).state();
         let _heavy = st.heavy.clone().acquire_many_owned(2).await.unwrap();
-        assert!(matches!(st.read_heavy(|_| Ok(())).await, Err(ApiError::Deadline)));
+        assert!(matches!(
+            st.read_heavy(|_| Ok(())).await,
+            Err(ApiError::Deadline)
+        ));
         assert!(st.read(|_| Ok(())).await.is_ok());
     }
 }

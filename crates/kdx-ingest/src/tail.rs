@@ -293,7 +293,9 @@ async fn writer(
             // Idle tick: a quiet chain is not a hang. A writer stuck in a commit does not
             // reach this line, so the beats stop and the watchdog sees it.
             crate::heartbeat::beat_source(crate::heartbeat::Source::Tail);
-            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.ok()
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .ok()
         };
         match got {
             Some(Some(b)) if poisoned.contains(&b.chain) => continue,

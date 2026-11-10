@@ -34,7 +34,8 @@ pub async fn run(st: Arc<ApiState>, shutdown: CancellationToken) {
 
 async fn sample_tips(st: &Arc<ApiState>) {
     let m = kdx_metrics::get();
-    m.dict_snapshot_names.set(i64::try_from(st.store.dict_names()).unwrap_or(i64::MAX));
+    m.dict_snapshot_names
+        .set(i64::try_from(st.store.dict_names()).unwrap_or(i64::MAX));
     match Status::load(st).await {
         Ok(s) => {
             m.frozen_frontier_height.set(i64::from(s.seg_frontier));
@@ -51,7 +52,8 @@ pub fn sample_storage(segdir: &Path) {
     let m = kdx_metrics::get();
     let data_dir = segdir.parent().unwrap_or(segdir);
     if let Ok(md) = std::fs::metadata(data_dir.join("hot").join("mdbx.dat")) {
-        m.hot_store_bytes.set(i64::try_from(md.len()).unwrap_or(i64::MAX));
+        m.hot_store_bytes
+            .set(i64::try_from(md.len()).unwrap_or(i64::MAX));
     }
     let mut by_kind = [0u64; FileKind::ALL.len() + 1];
     if let Ok(rd) = std::fs::read_dir(segdir) {
@@ -75,7 +77,8 @@ pub fn sample_storage(segdir: &Path) {
         m.segment_kind_bytes(name, *b);
     }
     if let Some(free) = free_bytes(data_dir) {
-        m.disk_free_bytes.set(i64::try_from(free).unwrap_or(i64::MAX));
+        m.disk_free_bytes
+            .set(i64::try_from(free).unwrap_or(i64::MAX));
     }
 }
 

@@ -78,8 +78,15 @@ fn signer_json(s: &Value) -> Option<Value> {
 
 fn status_and_result(out: &Value) -> (&'static str, Value) {
     let ok = out.pointer("/result/status").and_then(Value::as_str) == Some("success");
-    let v = if ok { out.pointer("/result/data") } else { out.pointer("/result/error") };
-    (if ok { "success" } else { "failure" }, v.cloned().unwrap_or(Value::Null))
+    let v = if ok {
+        out.pointer("/result/data")
+    } else {
+        out.pointer("/result/error")
+    };
+    (
+        if ok { "success" } else { "failure" },
+        v.cloned().unwrap_or(Value::Null),
+    )
 }
 
 /// Short, list-sized view of a tx.
@@ -129,14 +136,32 @@ pub fn detail(view: &View, r: &TxRecord, b: &BlockRecord, proof: bool) -> ApiRes
     m.insert("status".into(), status.into());
     m.insert("result".into(), result);
     m.insert("gas".into(), out.get("gas").cloned().unwrap_or(Value::Null));
-    m.insert("pact_tx_id".into(), out.get("txId").cloned().unwrap_or(Value::Null));
-    m.insert("logs".into(), out.get("logs").cloned().unwrap_or(Value::Null));
-    m.insert("metadata".into(), out.get("metaData").cloned().unwrap_or(Value::Null));
-    m.insert("continuation".into(), out.get("continuation").cloned().unwrap_or(Value::Null));
-    m.insert("events".into(), evs.iter().map(event_json).collect::<Vec<_>>().into());
+    m.insert(
+        "pact_tx_id".into(),
+        out.get("txId").cloned().unwrap_or(Value::Null),
+    );
+    m.insert(
+        "logs".into(),
+        out.get("logs").cloned().unwrap_or(Value::Null),
+    );
+    m.insert(
+        "metadata".into(),
+        out.get("metaData").cloned().unwrap_or(Value::Null),
+    );
+    m.insert(
+        "continuation".into(),
+        out.get("continuation").cloned().unwrap_or(Value::Null),
+    );
+    m.insert(
+        "events".into(),
+        evs.iter().map(event_json).collect::<Vec<_>>().into(),
+    );
     m.insert(
         "transfers".into(),
-        trs.iter().map(|t| transfer_json(r, b, &evs, t)).collect::<Vec<_>>().into(),
+        trs.iter()
+            .map(|t| transfer_json(r, b, &evs, t))
+            .collect::<Vec<_>>()
+            .into(),
     );
     if r.key.is_coinbase() {
         m.insert("kind".into(), "coinbase".into());
@@ -145,33 +170,104 @@ pub fn detail(view: &View, r: &TxRecord, b: &BlockRecord, proof: bool) -> ApiRes
         return Ok(Value::Object(m));
     }
     let cmd = shapes::cmd_value(r);
-    let meta = cmd.as_ref().and_then(|c| c.get("meta")).cloned().unwrap_or(Value::Null);
-    let payload = cmd.as_ref().and_then(|c| c.get("payload")).cloned().unwrap_or(Value::Null);
+    let meta = cmd
+        .as_ref()
+        .and_then(|c| c.get("meta"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let payload = cmd
+        .as_ref()
+        .and_then(|c| c.get("payload"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut c = Map::new();
     if let Some(cont) = payload.get("cont") {
         m.insert("kind".into(), "cont".into());
-        c.insert("pact_id".into(), cont.get("pactId").cloned().unwrap_or(Value::Null));
-        c.insert("step".into(), cont.get("step").cloned().unwrap_or(Value::Null));
-        c.insert("rollback".into(), cont.get("rollback").cloned().unwrap_or(Value::Null));
-        c.insert("data".into(), cont.get("data").cloned().unwrap_or(Value::Null));
+        c.insert(
+            "pact_id".into(),
+            cont.get("pactId").cloned().unwrap_or(Value::Null),
+        );
+        c.insert(
+            "step".into(),
+            cont.get("step").cloned().unwrap_or(Value::Null),
+        );
+        c.insert(
+            "rollback".into(),
+            cont.get("rollback").cloned().unwrap_or(Value::Null),
+        );
+        c.insert(
+            "data".into(),
+            cont.get("data").cloned().unwrap_or(Value::Null),
+        );
         if proof {
-            c.insert("proof".into(), cont.get("proof").cloned().unwrap_or(Value::Null));
+            c.insert(
+                "proof".into(),
+                cont.get("proof").cloned().unwrap_or(Value::Null),
+            );
         } else {
-            c.insert("has_proof".into(), cont.get("proof").is_some_and(|p| !p.is_null()).into());
+            c.insert(
+                "has_proof".into(),
+                cont.get("proof").is_some_and(|p| !p.is_null()).into(),
+            );
         }
     } else {
-        m.insert("kind".into(), (if payload.get("exec").is_some() { "exec" } else { "unknown" }).into());
+        m.insert(
+            "kind".into(),
+            (if payload.get("exec").is_some() {
+                "exec"
+            } else {
+                "unknown"
+            })
+            .into(),
+        );
         let e = payload.get("exec");
-        c.insert("code".into(), e.and_then(|e| e.get("code")).cloned().unwrap_or(Value::Null));
-        c.insert("data".into(), e.and_then(|e| e.get("data")).cloned().unwrap_or(Value::Null));
+        c.insert(
+            "code".into(),
+            e.and_then(|e| e.get("code"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        c.insert(
+            "data".into(),
+            e.and_then(|e| e.get("data"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
     }
-    c.insert("nonce".into(), cmd.as_ref().and_then(|c| c.get("nonce")).cloned().unwrap_or(Value::Null));
-    c.insert("network_id".into(), cmd.as_ref().and_then(|c| c.get("networkId")).cloned().unwrap_or(Value::Null));
-    c.insert("sender".into(), meta.get("sender").cloned().unwrap_or(Value::Null));
-    c.insert("gas_limit".into(), meta.get("gasLimit").cloned().unwrap_or(Value::Null));
-    c.insert("gas_price".into(), meta.get("gasPrice").cloned().unwrap_or(Value::Null));
-    c.insert("ttl".into(), meta.get("ttl").cloned().unwrap_or(Value::Null));
-    c.insert("creation_time".into(), meta.get("creationTime").cloned().unwrap_or(Value::Null));
+    c.insert(
+        "nonce".into(),
+        cmd.as_ref()
+            .and_then(|c| c.get("nonce"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    c.insert(
+        "network_id".into(),
+        cmd.as_ref()
+            .and_then(|c| c.get("networkId"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    c.insert(
+        "sender".into(),
+        meta.get("sender").cloned().unwrap_or(Value::Null),
+    );
+    c.insert(
+        "gas_limit".into(),
+        meta.get("gasLimit").cloned().unwrap_or(Value::Null),
+    );
+    c.insert(
+        "gas_price".into(),
+        meta.get("gasPrice").cloned().unwrap_or(Value::Null),
+    );
+    c.insert(
+        "ttl".into(),
+        meta.get("ttl").cloned().unwrap_or(Value::Null),
+    );
+    c.insert(
+        "creation_time".into(),
+        meta.get("creationTime").cloned().unwrap_or(Value::Null),
+    );
     c.insert(
         "signers".into(),
         cmd.as_ref()

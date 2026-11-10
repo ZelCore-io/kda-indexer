@@ -373,7 +373,10 @@ impl Postings {
     fn list_bytes(&self, i: usize) -> Result<&[u8]> {
         let a = self.offsets.select(i).context("offset")?;
         let b = self.offsets.select(i + 1).context("offset")?;
-        ensure!(HEAD + b <= self.ent_at && a <= b, "posting list offsets out of bounds");
+        ensure!(
+            HEAD + b <= self.ent_at && a <= b,
+            "posting list offsets out of bounds"
+        );
         Ok(&self.map[HEAD + a..HEAD + b])
     }
 
@@ -383,7 +386,11 @@ impl Postings {
         let Some(i) = self.find(entity) else {
             return Ok(None);
         };
-        Ok(Some(list_le(self.list_bytes(i)?, max_rel, self.first_txnum)?))
+        Ok(Some(list_le(
+            self.list_bytes(i)?,
+            max_rel,
+            self.first_txnum,
+        )?))
     }
 }
 
@@ -400,7 +407,14 @@ mod list_tests {
             let mut b = Vec::new();
             encode_list(&vals, range_txs, &mut b).unwrap();
             let last = *vals.last().unwrap();
-            for max in [None, Some(0), Some(5), Some(last / 2), Some(last), Some(last + 9)] {
+            for max in [
+                None,
+                Some(0),
+                Some(5),
+                Some(last / 2),
+                Some(last),
+                Some(last + 9),
+            ] {
                 let mut want: Vec<u64> = vals
                     .iter()
                     .filter(|&&v| max.is_none_or(|m| v <= m))
@@ -431,11 +445,17 @@ mod list_tests {
         let full = t.elapsed() / 100;
         let t = std::time::Instant::now();
         for _ in 0..100 {
-            let p: Vec<u64> = list_le(&b, Some(vals[vals.len() / 2]), 0).unwrap().take(10).collect();
+            let p: Vec<u64> = list_le(&b, Some(vals[vals.len() / 2]), 0)
+                .unwrap()
+                .take(10)
+                .collect();
             assert_eq!(p.len(), 10);
         }
         let page = t.elapsed() / 100;
-        println!("{} entries: full decode {full:?}, page of 10 {page:?}", vals.len());
+        println!(
+            "{} entries: full decode {full:?}, page of 10 {page:?}",
+            vals.len()
+        );
         assert!(page < full);
     }
 

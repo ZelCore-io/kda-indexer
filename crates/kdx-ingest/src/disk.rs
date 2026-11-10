@@ -62,7 +62,6 @@ fn parse_rss_anon_kb(status: &str) -> Option<u64> {
     l.split_whitespace().nth(1)?.parse().ok()
 }
 
-
 /// Current resident set size in MiB (Linux `/proc/self/statm`; `None` elsewhere).
 pub fn rss_mb() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/statm").ok()?;

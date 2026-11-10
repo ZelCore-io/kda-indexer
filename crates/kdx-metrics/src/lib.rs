@@ -82,33 +82,137 @@ impl Metrics {
                 m
             }};
         }
-        let build_info = reg!("kdx_build_info", "Build: version, git sha, network (value 1)", Gau::default());
-        let node_tip_height = reg!("kdx_node_tip_height", "Node cut height per chain", Gau::default());
-        let indexed_tip_height = reg!("kdx_indexed_tip_height", "Indexed tail height per chain", Gau::default());
-        let chain_lag_blocks = reg!("kdx_chain_lag_blocks", "Node tip minus indexed tip per chain", Gau::default());
-        let chain_halted = reg!("kdx_chain_halted", "1 when ingest halted the chain", Gau::default());
-        let frozen_frontier_height = reg!("kdx_frozen_frontier_height", "First height not yet frozen into segments", Gauge::default());
-        let ingest_blocks = reg!("kdx_ingest_blocks", "Blocks indexed (mode backfill|tail)", Count::default());
-        let ingest_txs = reg!("kdx_ingest_txs", "Txs indexed (mode backfill|tail)", Count::default());
-        let stage_duration = reg!("kdx_stage_duration_seconds", "Ingest stage durations", hist(seconds));
-        let backfill_blocks_per_second = reg!("kdx_backfill_blocks_per_second", "Blocks per second of the last committed backfill range", FGauge::default());
-        let backfill_next_height = reg!("kdx_backfill_next_height", "Backfill: first height not yet committed", Gauge::default());
-        let backfill_end_height = reg!("kdx_backfill_end_height", "Backfill: target end height (exclusive); 0 when no backfill ran", Gauge::default());
+        let build_info = reg!(
+            "kdx_build_info",
+            "Build: version, git sha, network (value 1)",
+            Gau::default()
+        );
+        let node_tip_height = reg!(
+            "kdx_node_tip_height",
+            "Node cut height per chain",
+            Gau::default()
+        );
+        let indexed_tip_height = reg!(
+            "kdx_indexed_tip_height",
+            "Indexed tail height per chain",
+            Gau::default()
+        );
+        let chain_lag_blocks = reg!(
+            "kdx_chain_lag_blocks",
+            "Node tip minus indexed tip per chain",
+            Gau::default()
+        );
+        let chain_halted = reg!(
+            "kdx_chain_halted",
+            "1 when ingest halted the chain",
+            Gau::default()
+        );
+        let frozen_frontier_height = reg!(
+            "kdx_frozen_frontier_height",
+            "First height not yet frozen into segments",
+            Gauge::default()
+        );
+        let ingest_blocks = reg!(
+            "kdx_ingest_blocks",
+            "Blocks indexed (mode backfill|tail)",
+            Count::default()
+        );
+        let ingest_txs = reg!(
+            "kdx_ingest_txs",
+            "Txs indexed (mode backfill|tail)",
+            Count::default()
+        );
+        let stage_duration = reg!(
+            "kdx_stage_duration_seconds",
+            "Ingest stage durations",
+            hist(seconds)
+        );
+        let backfill_blocks_per_second = reg!(
+            "kdx_backfill_blocks_per_second",
+            "Blocks per second of the last committed backfill range",
+            FGauge::default()
+        );
+        let backfill_next_height = reg!(
+            "kdx_backfill_next_height",
+            "Backfill: first height not yet committed",
+            Gauge::default()
+        );
+        let backfill_end_height = reg!(
+            "kdx_backfill_end_height",
+            "Backfill: target end height (exclusive); 0 when no backfill ran",
+            Gauge::default()
+        );
         let reorgs = reg!("kdx_reorgs", "Reorgs applied per chain", Count::default());
-        let reorg_depth = reg!("kdx_reorg_depth", "Reorg depth in blocks per chain", hist(depths));
-        let node_requests = reg!("kdx_node_requests", "Node requests per endpoint and status (0 = transport error)", Count::default());
-        let node_request_seconds = reg!("kdx_node_request_seconds", "Node request duration per endpoint and status", hist(seconds));
-        let hot_store_bytes = reg!("kdx_hot_store_bytes", "Size of the hot store data file", Gauge::default());
-        let segment_bytes = reg!("kdx_segment_bytes", "Segment bytes per file kind", Gau::default());
-        let disk_free_bytes = reg!("kdx_disk_free_bytes", "Free bytes on the data volume", Gauge::default());
-        let mdbx_commit_seconds = reg!("kdx_mdbx_commit_seconds", "Duration of a hot-store write commit", Histogram::new(exponential_buckets(0.001, 2.0, 17)));
-        let http_requests = reg!("kdx_http_requests", "HTTP requests per api, route template and status", Count::default());
-        let http_request_seconds = reg!("kdx_http_request_seconds", "HTTP request duration per api, route template and status", hist(seconds));
-        let search_rejected = reg!("kdx_search_rejected", "Event text searches rejected (too_short|busy|timeout|cap)", Count::default());
-        let freezer_runs = reg!("kdx_freezer_runs", "Freezer operations (op freeze|merge)", Count::default());
-        let freezer_seconds = reg!("kdx_freezer_seconds", "Freezer operation duration (op freeze|merge)", hist(seconds));
-        let read_view_seconds = reg!("kdx_read_view_seconds", "Read view timings (phase open|held)", hist(seconds));
-        let dict_snapshot_names = reg!("kdx_dict_snapshot_names", "Names in the API dictionary snapshot", Gauge::default());
+        let reorg_depth = reg!(
+            "kdx_reorg_depth",
+            "Reorg depth in blocks per chain",
+            hist(depths)
+        );
+        let node_requests = reg!(
+            "kdx_node_requests",
+            "Node requests per endpoint and status (0 = transport error)",
+            Count::default()
+        );
+        let node_request_seconds = reg!(
+            "kdx_node_request_seconds",
+            "Node request duration per endpoint and status",
+            hist(seconds)
+        );
+        let hot_store_bytes = reg!(
+            "kdx_hot_store_bytes",
+            "Size of the hot store data file",
+            Gauge::default()
+        );
+        let segment_bytes = reg!(
+            "kdx_segment_bytes",
+            "Segment bytes per file kind",
+            Gau::default()
+        );
+        let disk_free_bytes = reg!(
+            "kdx_disk_free_bytes",
+            "Free bytes on the data volume",
+            Gauge::default()
+        );
+        let mdbx_commit_seconds = reg!(
+            "kdx_mdbx_commit_seconds",
+            "Duration of a hot-store write commit",
+            Histogram::new(exponential_buckets(0.001, 2.0, 17))
+        );
+        let http_requests = reg!(
+            "kdx_http_requests",
+            "HTTP requests per api, route template and status",
+            Count::default()
+        );
+        let http_request_seconds = reg!(
+            "kdx_http_request_seconds",
+            "HTTP request duration per api, route template and status",
+            hist(seconds)
+        );
+        let search_rejected = reg!(
+            "kdx_search_rejected",
+            "Event text searches rejected (too_short|busy|timeout|cap)",
+            Count::default()
+        );
+        let freezer_runs = reg!(
+            "kdx_freezer_runs",
+            "Freezer operations (op freeze|merge)",
+            Count::default()
+        );
+        let freezer_seconds = reg!(
+            "kdx_freezer_seconds",
+            "Freezer operation duration (op freeze|merge)",
+            hist(seconds)
+        );
+        let read_view_seconds = reg!(
+            "kdx_read_view_seconds",
+            "Read view timings (phase open|held)",
+            hist(seconds)
+        );
+        let dict_snapshot_names = reg!(
+            "kdx_dict_snapshot_names",
+            "Names in the API dictionary snapshot",
+            Gauge::default()
+        );
         Metrics {
             registry: r,
             build_info,
@@ -144,19 +248,28 @@ impl Metrics {
     // Recording helpers: one place that fixes label names.
 
     pub fn http(&self, api: &'static str, route: &str, status: u16, secs: f64) {
-        let l: Labels = vec![("api", api.into()), ("route", route.into()), ("status", status.to_string())];
+        let l: Labels = vec![
+            ("api", api.into()),
+            ("route", route.into()),
+            ("status", status.to_string()),
+        ];
         self.http_requests.get_or_create(&l).inc();
         self.http_request_seconds.get_or_create(&l).observe(secs);
     }
 
     pub fn node_request(&self, endpoint: &str, status: u16, secs: f64) {
-        let l: Labels = vec![("endpoint", endpoint.into()), ("status", status.to_string())];
+        let l: Labels = vec![
+            ("endpoint", endpoint.into()),
+            ("status", status.to_string()),
+        ];
         self.node_requests.get_or_create(&l).inc();
         self.node_request_seconds.get_or_create(&l).observe(secs);
     }
 
     pub fn stage(&self, stage: &'static str, secs: f64) {
-        self.stage_duration.get_or_create(&vec![("stage", stage.into())]).observe(secs);
+        self.stage_duration
+            .get_or_create(&vec![("stage", stage.into())])
+            .observe(secs);
     }
 
     pub fn ingested(&self, mode: &'static str, blocks: u64, txs: u64) {
@@ -178,22 +291,32 @@ impl Metrics {
     }
 
     pub fn read_view(&self, phase: &'static str, secs: f64) {
-        self.read_view_seconds.get_or_create(&vec![("phase", phase.into())]).observe(secs);
+        self.read_view_seconds
+            .get_or_create(&vec![("phase", phase.into())])
+            .observe(secs);
     }
 
     pub fn search_rejected(&self, reason: &'static str) {
-        self.search_rejected.get_or_create(&vec![("reason", reason.into())]).inc();
+        self.search_rejected
+            .get_or_create(&vec![("reason", reason.into())])
+            .inc();
     }
 
     /// Per-chain tip gauges. `node` is None while the node tips are unknown (the node and lag
     /// series are then left as they were).
     pub fn chain(&self, chain: u8, node: Option<u64>, indexed: u64, halted: bool) {
         let l: Labels = vec![("chain", chain.to_string())];
-        self.indexed_tip_height.get_or_create(&l).set(i64::try_from(indexed).unwrap_or(i64::MAX));
+        self.indexed_tip_height
+            .get_or_create(&l)
+            .set(i64::try_from(indexed).unwrap_or(i64::MAX));
         self.chain_halted.get_or_create(&l).set(i64::from(halted));
         if let Some(n) = node {
-            self.node_tip_height.get_or_create(&l).set(i64::try_from(n).unwrap_or(i64::MAX));
-            self.chain_lag_blocks.get_or_create(&l).set(i64::try_from(n.saturating_sub(indexed)).unwrap_or(i64::MAX));
+            self.node_tip_height
+                .get_or_create(&l)
+                .set(i64::try_from(n).unwrap_or(i64::MAX));
+            self.chain_lag_blocks
+                .get_or_create(&l)
+                .set(i64::try_from(n.saturating_sub(indexed)).unwrap_or(i64::MAX));
         }
     }
 
@@ -208,7 +331,9 @@ impl Metrics {
     }
 
     pub fn segment_kind_bytes(&self, kind: &str, bytes: u64) {
-        self.segment_bytes.get_or_create(&vec![("kind", kind.to_string())]).set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        self.segment_bytes
+            .get_or_create(&vec![("kind", kind.to_string())])
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
     }
 
     pub fn encode(&self) -> String {

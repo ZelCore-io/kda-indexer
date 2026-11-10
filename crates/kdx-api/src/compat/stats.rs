@@ -135,6 +135,9 @@ mod tests {
     fn count_checks_the_deadline() {
         let (_d, store) = crate::testutil::store();
         let view = store.view(Instant::now() - Duration::from_secs(1)).unwrap();
-        assert!(matches!(user_tx_count(&view), Err(crate::ApiError::Deadline)));
+        assert!(matches!(
+            user_tx_count(&view),
+            Err(crate::ApiError::Deadline)
+        ));
     }
 }

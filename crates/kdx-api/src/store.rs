@@ -200,7 +200,9 @@ impl Store {
                 Err(e) => last = Some(e),
             }
         }
-        Err(last.expect("three attempts").context("reloading the segments"))
+        Err(last
+            .expect("three attempts")
+            .context("reloading the segments"))
     }
 
     /// One consistent snapshot for one request. See the module docs for the order.
@@ -274,7 +276,10 @@ impl Store {
             let t = Instant::now();
             match load_names(&me.hot, base.as_deref()) {
                 Ok(m) => {
-                    tracing::debug!(ms = t.elapsed().as_millis() as u64, "api: dictionary snapshot reloaded");
+                    tracing::debug!(
+                        ms = t.elapsed().as_millis() as u64,
+                        "api: dictionary snapshot reloaded"
+                    );
                     me.dict.store(Arc::new(DictSnap {
                         mem: Arc::new(m),
                         at: Instant::now(),
@@ -542,55 +547,58 @@ impl View {
 
         // Hot part: keys >= hot_floor.
         let floor = self.hot_floor();
-        let hot: Box<dyn Iterator<Item = ApiResult<TxKey>> + '_> =
-            if upper.is_some_and(|u| u.height() < floor) {
-                Box::new(std::iter::empty())
-            } else {
-                let prefix = posting_key(f as u8, entity, TxKey::new(0, 0, 0));
-                let up = upper.map(|u| posting_key(f as u8, entity, u).to_vec()).unwrap_or_default();
-                let scan = self.txn.scan_rev_prefix(Table::TailPostings, &prefix[..9], &up)?;
-                Box::new(
-                    scan.map(|r| -> ApiResult<TxKey> {
-                        let (k, _) = r?;
-                        Ok(parse_txkey(&k[9..]).context("posting key")?)
-                    })
-                    .take_while(move |r| r.as_ref().map_or(true, |k| k.height() >= floor.max(min_h)))
-                    .filter(move |r| r.as_ref().map_or(true, keep)),
-                )
-            };
-
-        // Frozen part: TxNums below the bound, mapped to keys.
-        let seg = &self.seg;
-        let frozen: Box<dyn Iterator<Item = ApiResult<TxKey>> + '_> = if self.seg_frontier == 0
-            || self.seg_frontier <= min_h
+        let hot: Box<dyn Iterator<Item = ApiResult<TxKey>> + '_> = if upper
+            .is_some_and(|u| u.height() < floor)
         {
             Box::new(std::iter::empty())
         } else {
-            let max_txnum = match upper {
-                Some(u) if u.height() < self.seg_frontier => match seg.txnum_of(u) {
-                    Some(t) => t.checked_sub(1),
-                    // Not a stored key: bound by its height, the key filter below is exact.
-                    None => seg.last_txnum_below_height(u.height().saturating_add(1)),
-                },
-                _ => seg.last_txnum_below_height(self.seg_frontier),
-            };
-            match max_txnum {
-                None => Box::new(std::iter::empty()),
-                Some(m) => Box::new(
-                    seg.postings_from(f, entity, Some(m))
-                        .map(move |r| -> ApiResult<TxKey> {
-                            let t = r?;
-                            Ok(seg.txkey(t).context("posting TxNum without a key")?)
-                        })
-                        .take_while(move |r| r.as_ref().map_or(true, |k| k.height() >= min_h))
-                        .filter(move |r| {
-                            r.as_ref().map_or(true, |k| {
-                                keep(k) && upper.is_none_or(|u| *k < u)
-                            })
-                        }),
-                ),
-            }
+            let prefix = posting_key(f as u8, entity, TxKey::new(0, 0, 0));
+            let up = upper
+                .map(|u| posting_key(f as u8, entity, u).to_vec())
+                .unwrap_or_default();
+            let scan = self
+                .txn
+                .scan_rev_prefix(Table::TailPostings, &prefix[..9], &up)?;
+            Box::new(
+                scan.map(|r| -> ApiResult<TxKey> {
+                    let (k, _) = r?;
+                    Ok(parse_txkey(&k[9..]).context("posting key")?)
+                })
+                .take_while(move |r| r.as_ref().map_or(true, |k| k.height() >= floor.max(min_h)))
+                .filter(move |r| r.as_ref().map_or(true, keep)),
+            )
         };
+
+        // Frozen part: TxNums below the bound, mapped to keys.
+        let seg = &self.seg;
+        let frozen: Box<dyn Iterator<Item = ApiResult<TxKey>> + '_> =
+            if self.seg_frontier == 0 || self.seg_frontier <= min_h {
+                Box::new(std::iter::empty())
+            } else {
+                let max_txnum = match upper {
+                    Some(u) if u.height() < self.seg_frontier => match seg.txnum_of(u) {
+                        Some(t) => t.checked_sub(1),
+                        // Not a stored key: bound by its height, the key filter below is exact.
+                        None => seg.last_txnum_below_height(u.height().saturating_add(1)),
+                    },
+                    _ => seg.last_txnum_below_height(self.seg_frontier),
+                };
+                match max_txnum {
+                    None => Box::new(std::iter::empty()),
+                    Some(m) => Box::new(
+                        seg.postings_from(f, entity, Some(m))
+                            .map(move |r| -> ApiResult<TxKey> {
+                                let t = r?;
+                                Ok(seg.txkey(t).context("posting TxNum without a key")?)
+                            })
+                            .take_while(move |r| r.as_ref().map_or(true, |k| k.height() >= min_h))
+                            .filter(move |r| {
+                                r.as_ref()
+                                    .map_or(true, |k| keep(k) && upper.is_none_or(|u| *k < u))
+                            }),
+                    ),
+                }
+            };
 
         let mut n = 0u32;
         let deadline = self.deadline;
@@ -626,14 +634,18 @@ mod data_height_tests {
         let mut w = store.hot_for_tests().rw().unwrap();
         kdx_hot::set_checkpoint(&mut w, Stage::Headers, 0, 5_000, Hash32([1; 32])).unwrap();
         w.commit().unwrap();
-        let view = store.view(Instant::now() + Duration::from_secs(60)).unwrap();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
         assert_eq!(view.max_indexed_height().unwrap(), Some(5_000));
         assert_eq!(view.max_data_height().unwrap(), None);
         drop(view);
         let mut w = store.hot_for_tests().rw().unwrap();
         kdx_hot::set_checkpoint(&mut w, Stage::Tail, 1, 4_000, Hash32([2; 32])).unwrap();
         w.commit().unwrap();
-        let view = store.view(Instant::now() + Duration::from_secs(60)).unwrap();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
         assert_eq!(view.max_data_height().unwrap(), Some(4_000));
     }
 }

@@ -590,9 +590,7 @@ pub fn cmd_value(r: &TxRecord) -> Option<Value> {
 }
 
 fn int_of(v: Option<&Value>) -> Value {
-    match v
-        .and_then(parsed_integer)
-    {
+    match v.and_then(parsed_integer) {
         Some(i) => i.into(),
         None => Value::Null,
     }
@@ -855,8 +853,14 @@ mod tests {
         assert_eq!(parsed_integer(&json!(-1.7)), Some(-2));
         assert_eq!(parsed_integer(&json!(null)), None);
         assert_eq!(int_of(Some(&json!("600"))), json!(600));
-        assert_eq!(parsed_decimal_text(&json!("1.0e-8")).as_deref(), Some("1.0e-8"));
-        assert_eq!(parsed_decimal_text(&json!({"decimal": "0.00001"})).as_deref(), Some("0.00001"));
+        assert_eq!(
+            parsed_decimal_text(&json!("1.0e-8")).as_deref(),
+            Some("1.0e-8")
+        );
+        assert_eq!(
+            parsed_decimal_text(&json!({"decimal": "0.00001"})).as_deref(),
+            Some("0.00001")
+        );
         assert_eq!(parsed_decimal_text(&json!(1e-8)).as_deref(), Some("1e-8"));
     }
 
@@ -867,10 +871,19 @@ mod tests {
         assert_eq!(aeson_number("0.90404266"), "0.90404266");
         assert_eq!(aeson_number("1.0"), "1.0");
         // R12: huge exponents fall back to the raw text instead of overflowing.
-        assert_eq!(aeson_number("1.5e-9223372036854775808"), "1.5e-9223372036854775808");
-        assert_eq!(aeson_number("1.5e9223372036854775807"), "1.5e9223372036854775807");
+        assert_eq!(
+            aeson_number("1.5e-9223372036854775808"),
+            "1.5e-9223372036854775808"
+        );
+        assert_eq!(
+            aeson_number("1.5e9223372036854775807"),
+            "1.5e9223372036854775807"
+        );
         assert_eq!(show_scientific("1.5e-9223372036854775808"), None);
-        assert_eq!(parsed_integer(&serde_json::json!("1e-9223372036854775808")), None);
+        assert_eq!(
+            parsed_integer(&serde_json::json!("1e-9223372036854775808")),
+            None
+        );
         assert_eq!(aeson_number("100"), "100");
         assert_eq!(aeson_number("1e2"), "100");
         assert_eq!(aeson_number("100.0"), "100.0");

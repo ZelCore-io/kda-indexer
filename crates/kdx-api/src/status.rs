@@ -107,9 +107,16 @@ impl Status {
             .chains
             .iter()
             .filter(|c| c.lag.is_none_or(|l| l > u64::from(max_lag)))
-            .map(|c| format!("{}:{}", c.chain, c.lag.map_or("?".into(), |l| l.to_string())))
+            .map(|c| {
+                format!(
+                    "{}:{}",
+                    c.chain,
+                    c.lag.map_or("?".into(), |l| l.to_string())
+                )
+            })
             .collect();
-        (!lagging.is_empty()).then(|| format!("chains lag more than {max_lag}: {}", lagging.join(",")))
+        (!lagging.is_empty())
+            .then(|| format!("chains lag more than {max_lag}: {}", lagging.join(",")))
     }
 
     pub fn to_json(&self, network: &str, max_lag: u32) -> Value {
@@ -181,8 +188,14 @@ mod tests {
     fn readiness() {
         assert_eq!(st(Some(5), false, 0).not_ready(20), None);
         assert_eq!(st(Some(300), false, 0).not_ready(20), None);
-        assert_eq!(st(None, false, 0).not_ready(20).as_deref(), Some("node tip unknown"));
-        assert_eq!(st(Some(5), true, 0).not_ready(20).as_deref(), Some("chains halted: 3"));
+        assert_eq!(
+            st(None, false, 0).not_ready(20).as_deref(),
+            Some("node tip unknown")
+        );
+        assert_eq!(
+            st(Some(5), true, 0).not_ready(20).as_deref(),
+            Some("chains halted: 3")
+        );
         assert!(st(Some(5), false, 50).not_ready(20).is_some());
     }
 }

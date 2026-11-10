@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::txs::{summary, transfer_json};
 use super::{
     account_name, candidates, list_params, list_response, page_rows, parse_path, parse_query, run,
-    tx_context, ListParams, Q, St,
+    tx_context, ListParams, St, Q,
 };
 use crate::compat::shapes;
 use crate::{ApiError, ApiResult};
@@ -53,8 +53,13 @@ pub async fn transfers(st: St, path: PathS, q: QueryQ) -> Response {
             };
             let ctx = tx_context(r, b);
             let mut rows = Vec::new();
-            for t in trs.iter().filter(|t| t.token == token && (t.from == account || t.to == account)) {
-                let Value::Object(mut row) = transfer_json(r, b, &evs, t) else { continue };
+            for t in trs
+                .iter()
+                .filter(|t| t.token == token && (t.from == account || t.to == account))
+            {
+                let Value::Object(mut row) = transfer_json(r, b, &evs, t) else {
+                    continue;
+                };
                 for (k, v) in &ctx {
                     row.entry(k.clone()).or_insert_with(|| v.clone());
                 }
@@ -86,7 +91,9 @@ pub async fn txs(st: St, path: PathS, q: QueryQ) -> Response {
     let sender_only = match q.role.as_deref() {
         None | Some("any") => false,
         Some("sender") => true,
-        Some(_) => return ApiError::BadRequest("role must be any or sender".into()).into_response(),
+        Some(_) => {
+            return ApiError::BadRequest("role must be any or sender".into()).into_response()
+        }
     };
     run(st.0, move |view| {
         let lp = list_params(&q)?;
@@ -100,7 +107,11 @@ pub async fn txs(st: St, path: PathS, q: QueryQ) -> Response {
                 return true;
             }
             shapes::cmd_value(r)
-                .and_then(|c| c.pointer("/meta/sender").and_then(Value::as_str).map(|s| s == account))
+                .and_then(|c| {
+                    c.pointer("/meta/sender")
+                        .and_then(Value::as_str)
+                        .map(|s| s == account)
+                })
                 .unwrap_or(false)
         })?;
         list_response(view, items, next)
@@ -123,7 +134,9 @@ pub async fn key_txs(st: St, path: PathS, q: QueryQ) -> Response {
     run(st.0, move |view| {
         let lp = list_params(&q)?;
         if pk.is_empty() || pk.len() > 512 {
-            return Err(ApiError::BadRequest("public key must be 1..=512 bytes".into()));
+            return Err(ApiError::BadRequest(
+                "public key must be 1..=512 bytes".into(),
+            ));
         }
         let Some(id) = view.dict().find(DictKind::PubKey, &pk) else {
             return list_response(view, vec![], None);

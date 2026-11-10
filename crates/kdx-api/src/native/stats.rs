@@ -64,11 +64,20 @@ fn frozen_per_chain(seg: &Arc<Segments>) -> Option<PerChain> {
             std::thread::spawn(move || {
                 for r in &seg.ranges {
                     let k = key_of(r);
-                    if cache().done.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&k) {
+                    if cache()
+                        .done
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains_key(&k)
+                    {
                         continue;
                     }
                     let v = count_range(r);
-                    cache().done.lock().unwrap_or_else(|e| e.into_inner()).insert(k, v);
+                    cache()
+                        .done
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(k, v);
                 }
                 cache().running.store(false, Ordering::Release);
             });

@@ -280,10 +280,14 @@ fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
     for k in ["name", "param", "search"] {
         let Some(v) = p.get(k) else { continue };
         if v.chars().count() > MAX_PATTERN_CHARS {
-            return Err(format!("{k} must be at most {MAX_PATTERN_CHARS} characters"));
+            return Err(format!(
+                "{k} must be at most {MAX_PATTERN_CHARS} characters"
+            ));
         }
         if wildcards(v) > MAX_PATTERN_WILDCARDS {
-            return Err(format!("{k} may contain at most {MAX_PATTERN_WILDCARDS} '%' wildcards"));
+            return Err(format!(
+                "{k} may contain at most {MAX_PATTERN_WILDCARDS} '%' wildcards"
+            ));
         }
     }
     // `search` has no minimum length: chainweb-data answers `search=T` (G2). A short
@@ -357,7 +361,11 @@ mod tests {
     }
 
     fn params(q: &[(&str, &str)]) -> Params {
-        Params::new(q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+        Params::new(
+            q.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
     }
 
     #[test]
@@ -366,12 +374,20 @@ mod tests {
         let long = "a".repeat(MAX_PATTERN_CHARS + 1);
         let many = "%a".repeat(MAX_PATTERN_WILDCARDS + 1);
         for k in ["name", "param", "search"] {
-            assert!(check_patterns(&params(&[("modulename", "coin"), (k, &long)]), &s).is_err(), "{k} long");
-            assert!(check_patterns(&params(&[("modulename", "coin"), (k, &many)]), &s).is_err(), "{k} %");
+            assert!(
+                check_patterns(&params(&[("modulename", "coin"), (k, &long)]), &s).is_err(),
+                "{k} long"
+            );
+            assert!(
+                check_patterns(&params(&[("modulename", "coin"), (k, &many)]), &s).is_err(),
+                "{k} %"
+            );
         }
         let ok = "a".repeat(MAX_PATTERN_CHARS);
         assert!(check_patterns(&params(&[("modulename", "coin"), ("param", &ok)]), &s).is_ok());
-        assert!(check_patterns(&params(&[("modulename", "coin"), ("name", "TRANSFER")]), &s).is_ok());
+        assert!(
+            check_patterns(&params(&[("modulename", "coin"), ("name", "TRANSFER")]), &s).is_ok()
+        );
         // Without modulename, short name/param would take the bounded scan of every block.
         assert!(check_patterns(&params(&[("name", "ab")]), &s).is_err());
         assert!(check_patterns(&params(&[("param", "%ab%")]), &s).is_err());

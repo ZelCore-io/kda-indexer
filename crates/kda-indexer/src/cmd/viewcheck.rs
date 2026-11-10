@@ -151,7 +151,8 @@ pub fn run(data_dir: &Path, seconds: u64) -> anyhow::Result<()> {
         }
     }
     println!("{}", serde_json::to_string_pretty(&t).context("summary")?);
-    let bad = t.duplicates + t.order_breaks + t.tx_misses + t.rk_misses + t.cursor_mismatches + t.errors;
+    let bad =
+        t.duplicates + t.order_breaks + t.tx_misses + t.rk_misses + t.cursor_mismatches + t.errors;
     if bad > 0 {
         anyhow::bail!("view-check found {bad} problems");
     }

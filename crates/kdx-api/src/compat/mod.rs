@@ -373,7 +373,11 @@ pub fn row_sub(pos: usize, shift: u32, side: u16) -> ApiResult<u16> {
         .and_then(|p| p.checked_shl(shift).filter(|s| (s >> shift) == p))
         .map(|p| p | side)
         .filter(|&v| v != SUB_HEIGHT_DONE);
-    v.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("row position {pos} exceeds the cursor range")))
+    v.ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!(
+            "row position {pos} exceeds the cursor range"
+        ))
+    })
 }
 
 /// A route's view of one tx: its rows (sub, idx), and how to render one.

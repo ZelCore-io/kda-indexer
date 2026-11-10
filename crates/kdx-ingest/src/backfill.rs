@@ -239,9 +239,9 @@ pub fn mem_plan(ranges_in_flight: u32, etl_mem_mb: u64, cap_mb: u64) -> MemPlan 
     let writer_est_mb = cap_mb
         .saturating_sub((u64::from(in_flight) + 1) * spool_mb)
         .max(min_writer);
-    let postings_mem_entries = (((writer_est_mb - WRITER_BASE_MB) << 20)
-        / (POSTING_FAMILIES * POSTING_ENTRY_BYTES))
-        .clamp(1 << 16, kdx_segment::writer::ETL_MEM_ENTRIES as u64) as usize;
+    let postings_mem_entries =
+        (((writer_est_mb - WRITER_BASE_MB) << 20) / (POSTING_FAMILIES * POSTING_ENTRY_BYTES))
+            .clamp(1 << 16, kdx_segment::writer::ETL_MEM_ENTRIES as u64) as usize;
     MemPlan {
         in_flight,
         spool_mb,
@@ -256,13 +256,17 @@ pub fn mem_plan(ranges_in_flight: u32, etl_mem_mb: u64, cap_mb: u64) -> MemPlan 
 fn rss_over_cap(cap_mb: u64, at: &str) -> bool {
     match disk::rss_anon_mb() {
         Some(rss) if rss > cap_mb => {
-            tracing::warn!(rss_anon_mb = rss, cap_mb, at, "backfill: memory above mem_cap_mb");
+            tracing::warn!(
+                rss_anon_mb = rss,
+                cap_mb,
+                at,
+                "backfill: memory above mem_cap_mb"
+            );
             true
         }
         _ => false,
     }
 }
-
 
 struct Fetched {
     coll: Collector,
@@ -758,7 +762,9 @@ fn build_and_commit(
     txn.set_meta(&dict::lens_key(entry.end), &dict::encode_lens(&dict))?;
     let tc = Instant::now();
     txn.commit()?;
-    kdx_metrics::get().mdbx_commit_seconds.observe(tc.elapsed().as_secs_f64());
+    kdx_metrics::get()
+        .mdbx_commit_seconds
+        .observe(tc.elapsed().as_secs_f64());
     debug_abort("hot", u.start);
     manifest.push(entry.clone())?;
     manifest.commit(&ctx.segdir)?;
@@ -775,12 +781,22 @@ mod mem_tests {
     /// shrink with the writer's share.
     #[test]
     fn plan_fits_cap() {
-        for (inf, spool, cap) in [(2, 1024, 6144), (4, 1024, 6144), (2, 4096, 6144), (1, 16, 512), (8, 512, 16384)] {
+        for (inf, spool, cap) in [
+            (2, 1024, 6144),
+            (4, 1024, 6144),
+            (2, 4096, 6144),
+            (1, 16, 512),
+            (8, 512, 16384),
+        ] {
             let m = mem_plan(inf, spool, cap);
             let used = (u64::from(m.in_flight) + 1) * m.spool_mb + m.writer_est_mb;
             assert!(m.in_flight >= 1);
-            assert!(used <= cap.max(WRITER_BASE_MB + 256 + 32), "{inf} {spool} {cap}: {m:?}");
-            let post_mb = (m.postings_mem_entries as u64 * POSTING_FAMILIES * POSTING_ENTRY_BYTES) >> 20;
+            assert!(
+                used <= cap.max(WRITER_BASE_MB + 256 + 32),
+                "{inf} {spool} {cap}: {m:?}"
+            );
+            let post_mb =
+                (m.postings_mem_entries as u64 * POSTING_FAMILIES * POSTING_ENTRY_BYTES) >> 20;
             assert!(post_mb <= m.writer_est_mb, "{m:?}");
         }
         let small = mem_plan(2, 1024, 3072);

@@ -67,7 +67,9 @@ impl Cursor {
         if s.len() > 64 {
             return Err(bad());
         }
-        let b = URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).map_err(|_| bad())?;
+        let b = URL_SAFE_NO_PAD
+            .decode(s.trim_end_matches('='))
+            .map_err(|_| bad())?;
         if b.len() != LEN || b[0] != VERSION {
             return Err(bad());
         }
@@ -110,7 +112,10 @@ mod tests {
         };
         assert_eq!(Cursor::decode(&c.encode()).unwrap(), c);
         for bad in ["", "x", "AAAA", "!!!!", &"A".repeat(3000), &c.encode()[1..]] {
-            assert!(matches!(Cursor::decode(bad), Err(ApiError::BadRequest(_))), "{bad}");
+            assert!(
+                matches!(Cursor::decode(bad), Err(ApiError::BadRequest(_))),
+                "{bad}"
+            );
         }
     }
 
@@ -130,7 +135,8 @@ mod tests {
         let mut v = Vec::new();
         encode_block(&b, &mut v);
         let mut w = store.hot_for_tests().rw().unwrap();
-        w.put(kdx_hot::Table::Headers, &block_key(3, 100), &v).unwrap();
+        w.put(kdx_hot::Table::Headers, &block_key(3, 100), &v)
+            .unwrap();
         w.commit().unwrap();
         let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let view = store.view(far).unwrap();
@@ -145,7 +151,11 @@ mod tests {
         assert_eq!(e.fp, 0);
         e.check(&view).unwrap();
         // A row cursor whose block is gone stays refused.
-        let gone = Cursor { key: TxKey::new(101, 3, 1), sub: 0, fp: 5 };
+        let gone = Cursor {
+            key: TxKey::new(101, 3, 1),
+            sub: 0,
+            fp: 5,
+        };
         assert!(gone.check(&view).is_err());
     }
 }

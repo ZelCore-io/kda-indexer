@@ -10,18 +10,21 @@ use serde_json::{Map, Value};
 
 use super::txs::event_json;
 use super::{
-    candidates, list_params, list_response, page_rows, parse_query, run, tx_context, ListParams, Q,
-    St,
+    candidates, list_params, list_response, page_rows, parse_query, run, tx_context, ListParams,
+    St, Q,
 };
 use crate::compat::shapes;
 use crate::ApiError;
 
 fn params_of(q: &Q) -> Vec<(usize, &str)> {
-    [&q.param0, &q.param1, &q.param2, &q.param3, &q.param4, &q.param5, &q.param6, &q.param7, &q.param8, &q.param9]
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| p.as_deref().map(|s| (i, s)))
-        .collect()
+    [
+        &q.param0, &q.param1, &q.param2, &q.param3, &q.param4, &q.param5, &q.param6, &q.param7,
+        &q.param8, &q.param9,
+    ]
+    .iter()
+    .enumerate()
+    .filter_map(|(i, p)| p.as_deref().map(|s| (i, s)))
+    .collect()
 }
 
 /// Events by module and name (a qualified `name` such as `coin.TRANSFER` is split at its last dot
@@ -37,7 +40,10 @@ fn params_of(q: &Q) -> Vec<(usize, &str)> {
     ),
     responses((status = 200, description = "`items` of events with their tx context, `next_cursor`, `as_of`"))
 )]
-pub async fn list(st: St, q: Result<Query<Q>, axum::extract::rejection::QueryRejection>) -> Response {
+pub async fn list(
+    st: St,
+    q: Result<Query<Q>, axum::extract::rejection::QueryRejection>,
+) -> Response {
     let q = match parse_query(q) {
         Ok(q) => q,
         Err(e) => return e.into_response(),
@@ -81,7 +87,9 @@ pub async fn list(st: St, q: Result<Query<Q>, axum::extract::rejection::QueryRej
                 None => return list_response(view, vec![], None),
             }
         } else {
-            return Err(ApiError::BadRequest("module or name is needed with param filters on their own".into()));
+            return Err(ApiError::BadRequest(
+                "module or name is needed with param filters on their own".into(),
+            ));
         };
         let keys = candidates(view, fam, entity, &lp)?;
         let (items, next) = page_rows(view, keys, &lp, |view, r, blocks| {
@@ -104,12 +112,15 @@ pub async fn list(st: St, q: Result<Query<Q>, axum::extract::rejection::QueryRej
                     continue;
                 }
                 let p = e.params.as_array();
-                if !params.iter().all(|(i, v)| {
-                    p.and_then(|a| a.get(*i)).and_then(Value::as_str) == Some(*v)
-                }) {
+                if !params
+                    .iter()
+                    .all(|(i, v)| p.and_then(|a| a.get(*i)).and_then(Value::as_str) == Some(*v))
+                {
                     continue;
                 }
-                let Value::Object(mut row) = event_json(e) else { continue };
+                let Value::Object(mut row) = event_json(e) else {
+                    continue;
+                };
                 let mut m = Map::new();
                 for (k, v) in &ctx {
                     m.insert(k.clone(), v.clone());

@@ -297,7 +297,12 @@ pub trait Txn {
 
     /// Rows whose key starts with `prefix` and is below `upper`, newest (largest key) first,
     /// streamed from a cursor (nothing is collected). `upper = &[]` means no upper bound.
-    fn scan_rev_prefix(&self, t: Table, prefix: &[u8], upper: &[u8]) -> Result<RevScan<Self::Kind>> {
+    fn scan_rev_prefix(
+        &self,
+        t: Table,
+        prefix: &[u8],
+        upper: &[u8],
+    ) -> Result<RevScan<Self::Kind>> {
         let c = self.raw().cursor(self.tables().dbi(t))?;
         Ok(RevScan {
             c,
@@ -514,7 +519,10 @@ mod rev_tests {
                 .map(|r| r.unwrap().0)
                 .collect()
         };
-        assert_eq!(keys(&[2], &[]), vec![vec![2, 0xFF], vec![2, 9], vec![2, 5], vec![2, 0]]);
+        assert_eq!(
+            keys(&[2], &[]),
+            vec![vec![2, 0xFF], vec![2, 9], vec![2, 5], vec![2, 0]]
+        );
         assert_eq!(keys(&[2], &[2, 9]), vec![vec![2, 5], vec![2, 0]]);
         assert_eq!(keys(&[2], &[7]), keys(&[2], &[]));
         assert_eq!(keys(&[3], &[]).len(), 4);

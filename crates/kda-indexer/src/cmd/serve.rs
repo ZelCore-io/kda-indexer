@@ -57,7 +57,11 @@ pub fn spawn_tip_poll(cfg: &Config, tips: TipWatch, stop: CancellationToken) {
 /// Write the metrics to `metrics.textfile` every 15 s when it is configured.
 pub fn spawn_textfile(cfg: &Config, stop: CancellationToken) {
     if let Some(path) = cfg.metrics.textfile.clone() {
-        tokio::spawn(kdx_metrics::textfile_loop(path, Duration::from_secs(15), stop));
+        tokio::spawn(kdx_metrics::textfile_loop(
+            path,
+            Duration::from_secs(15),
+            stop,
+        ));
     }
 }
 

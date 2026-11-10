@@ -107,7 +107,9 @@ pub struct Lp {
 pub fn list_params(q: &Q) -> ApiResult<Lp> {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 || limit > MAX_LIMIT {
-        return Err(ApiError::BadRequest(format!("limit must be 1..={MAX_LIMIT}")));
+        return Err(ApiError::BadRequest(format!(
+            "limit must be 1..={MAX_LIMIT}"
+        )));
     }
     let order = match q.order.as_deref() {
         None | Some("desc") => Order::Desc,
@@ -220,7 +222,9 @@ where
     }
 }
 
-pub fn parse_query<T>(r: Result<Query<T>, axum::extract::rejection::QueryRejection>) -> ApiResult<T> {
+pub fn parse_query<T>(
+    r: Result<Query<T>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<T> {
     r.map(|q| q.0)
         .map_err(|e| ApiError::BadRequest(format!("invalid query: {e}")))
 }
@@ -276,7 +280,10 @@ pub fn candidates<'v>(
     match lp.order {
         Order::Desc => {
             // Keys up to and including the cursor's tx (it may have rows left).
-            q.before = lp.cursor.as_ref().map(|c| TxKey(c.key.0.saturating_add(0x100)));
+            q.before = lp
+                .cursor
+                .as_ref()
+                .map(|c| TxKey(c.key.0.saturating_add(0x100)));
             view.postings(f, entity, q)
         }
         Order::Asc => {
@@ -320,7 +327,11 @@ pub fn page_rows(
         last_scanned = Some(k);
         let Some(r) = view.tx(k)? else { continue };
         for (sub, row) in rows(view, &r, &mut blocks)? {
-            if lp.cursor.as_ref().is_some_and(|c| c.key == k && sub < c.sub) {
+            if lp
+                .cursor
+                .as_ref()
+                .is_some_and(|c| c.key == k && sub < c.sub)
+            {
                 continue;
             }
             if items.len() == lp.limit {
