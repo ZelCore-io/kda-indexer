@@ -219,7 +219,12 @@ fn walk(a: &Value, b: &Value, path: &mut String, key: Option<&str>, out: &mut Ve
             }
         }
         (Value::Number(na), Value::Number(nb)) => {
-            if na.to_string() == nb.to_string() {
+            // Same decimal value in another text form (a signed cmd can carry
+            // `9.990000000000` where chainweb-data and compat print `9.99`).
+            if na.to_string() == nb.to_string()
+                || decimal_canon(&na.to_string())
+                    .is_some_and(|c| Some(c) == decimal_canon(&nb.to_string()))
+            {
                 return;
             }
             if key.is_some_and(|k| FLOAT_KEYS.contains(&k)) {
@@ -273,6 +278,32 @@ fn repeats_boundary(all: &[Value], first: Option<&Value>) -> bool {
     let self_transfer =
         first.get("fromAccount").is_some() && first.get("fromAccount") == first.get("toAccount");
     last == first && !self_transfer
+}
+
+/// A JSON number's exact decimal value as `(negative, significant digits, exponent)`, so
+/// `9.99`, `9.990` and `999e-2` compare equal. `None` for anything that is not a number.
+pub fn decimal_canon(t: &str) -> Option<(bool, String, i64)> {
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t),
+    };
+    let (mant, exp) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], t[i + 1..].parse::<i64>().ok()?),
+        None => (t, 0),
+    };
+    let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
+    if int.is_empty() || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let all = format!("{int}{frac}");
+    let mut exp = exp - frac.len() as i64;
+    let digits = all.trim_start_matches('0');
+    let trimmed = digits.trim_end_matches('0');
+    exp += (digits.len() - trimmed.len()) as i64;
+    if trimmed.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    Some((neg, trimmed.to_string(), exp))
 }
 
 /// JSON path of the visible allowlist hit for [`cut_to_common_depth`].
@@ -444,5 +475,17 @@ mod harness_rule_tests {
         let mut b = json!([row(7, 1)]);
         assert!(!cut_to_common_depth(&mut a, false, &mut b, false));
         assert!(!diff_route(&RouteKind::Events, &a, &b).is_empty());
+    }
+
+    #[test]
+    fn numbers_compare_by_decimal_value() {
+        assert_eq!(decimal_canon("9.99"), decimal_canon("9.990000000000"));
+        assert_eq!(decimal_canon("999e-2"), decimal_canon("9.99"));
+        assert_eq!(decimal_canon("0"), decimal_canon("-0.0"));
+        assert_ne!(decimal_canon("9.99"), decimal_canon("9.991"));
+        assert_ne!(decimal_canon("100"), decimal_canon("10"));
+        let a: Value = serde_json::from_str("[9.99]").unwrap();
+        let b: Value = serde_json::from_str("[9.990000000000]").unwrap();
+        assert!(diff_route(&RouteKind::Tx, &a, &b).is_empty());
     }
 }

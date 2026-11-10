@@ -18,9 +18,11 @@ const MAX_DRAWS: u32 = 30;
 /// Heights per draw: one `header/branch` and one payload batch for the whole window, then one
 /// non-empty block of the window is picked uniformly.
 const WINDOW: u64 = 20;
-/// At most this many accounts and event kinds per sampled tx.
-const MAX_ACCOUNTS: usize = 3;
-const MAX_EVENTS: usize = 3;
+/// At most this many accounts and event kinds per sampled tx. One each: chainweb-data answers
+/// account and event pages in up to 90 s, and one sample must not hold the single in-flight
+/// slot for minutes (run 3E-b throughput).
+const MAX_ACCOUNTS: usize = 1;
+const MAX_EVENTS: usize = 1;
 /// `/txs/events` requests are bounded to `height +- EVENTS_WINDOW` so chainweb-data does not
 /// scan its whole events table.
 const EVENTS_WINDOW: u64 = 100;

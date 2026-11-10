@@ -30,6 +30,8 @@ use crate::target::Target;
 /// Workers sending requests concurrently (the shared limiter caps the rate). Kept low:
 /// slow chainweb-data queries (account/events pages) can take 30 s each.
 const WORKERS: usize = 3;
+/// kda-txs's own query limit; a 404 that took this long is its timeout.
+const KDA_TXS_LIMIT_MS: u64 = 29_000;
 /// At most this many A-only account rows are checked against chainweb-data's /txs/tx.
 const GAP_CHECKS: usize = 5;
 /// JSON path of the visible allowlist hit for rows missing from chainweb-data's transfers.
@@ -306,11 +308,38 @@ impl Ctx {
         if sa >= 500 {
             return self.a_error(req, ta, &tb.name, Some(&pa), "5xx");
         }
+        // kda-txs answers 404 "Not Found" when its own 30 s query limit runs out (seen live on
+        // busy accounts): an oracle failure, not an answer.
+        if tb.kind == crate::config::TargetKind::KdaTxs
+            && sb == 404
+            && pb.pages[0].ms >= KDA_TXS_LIMIT_MS
+        {
+            return self.b_error(
+                req,
+                ta,
+                &tb.name,
+                Some(&pa),
+                "kda-txs answered 404 at its 30 s query limit",
+                String::new(),
+            );
+        }
         let (mut va, mut vb) = (pa.items.clone(), pb.items.clone());
         let page_cut = req.route.paginated()
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
+        // Oracle rows of orphaned blocks: chainweb-data (account, events) and kda-txs
+        // (/v1/txs) can list a tx in a block the node no longer has as canonical, beside or
+        // instead of the canonical one. Rows confirmed against the node go under /orphans.
+        let mut orphans: Vec<Value> = Vec::new();
+        if matches!(
+            req.route,
+            RouteKind::Account | RouteKind::Events | RouteKind::V1Txs
+        ) && sa == 200
+            && sb == 200
+        {
+            orphans = self.oracle_orphans(&mut va, &mut vb).await;
+        }
         // chainweb-data's transfers table misses some rows whose TRANSFER event it does hold
         // (seen live on chain 0 around heights 1.59M-1.69M). Rows only A lists, when B lists
         // no row of its own, are checked against B's own /txs/tx (at most GAP_CHECKS calls);
@@ -345,7 +374,6 @@ impl Ctx {
         // canonical row, and its /txs/tx answers 404 when a request key has several rows.
         // A's row must be one of B's (the node pair checks that A's block is canonical); B's
         // other rows go under /orphans (allowlist `orphan-rows-txs`).
-        let mut orphans: Vec<Value> = Vec::new();
         if req.route == RouteKind::Txs && sa == 200 && sb == 200 {
             if let (Value::Array(xa), Value::Array(xb)) = (&va, &mut vb) {
                 let hashes: Vec<&Value> = xa.iter().filter_map(|r| r.get("blockHash")).collect();
@@ -879,6 +907,72 @@ impl Ctx {
                         })
                 })
             })
+    }
+
+    /// Moves B rows that list one of A's request keys in another block out of `vb` when the
+    /// node confirms A's block as canonical at that chain and height; an A row left without
+    /// a B counterpart by that (B lists only the orphan copy) leaves `va` as well. Returns
+    /// the moved B rows.
+    async fn oracle_orphans(&self, va: &mut Value, vb: &mut Value) -> Vec<Value> {
+        let (Value::Array(xa), Value::Array(xb)) = (&mut *va, &mut *vb) else {
+            return Vec::new();
+        };
+        let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+        let mut a_block: HashMap<String, (String, u8, u64)> = HashMap::new();
+        for r in xa.iter() {
+            if let (Some(rk), Some(bh), Some(c), Some(h)) = (
+                s(r, "requestKey"),
+                s(r, "blockHash"),
+                r.get("chain").and_then(Value::as_u64),
+                r.get("height").and_then(Value::as_u64),
+            ) {
+                if rk != "<coinbase>" {
+                    a_block.insert(rk, (bh, c as u8, h));
+                }
+            }
+        }
+        let mut canon: HashMap<(u8, u64), bool> = HashMap::new();
+        let mut moved = Vec::new();
+        let mut i = 0;
+        while i < xb.len() && moved.len() < GAP_CHECKS {
+            let r = &xb[i];
+            let hit = match (s(r, "requestKey"), s(r, "blockHash")) {
+                (Some(rk), Some(bh)) => a_block.get(&rk).filter(|(abh, _, _)| *abh != bh).cloned(),
+                _ => None,
+            };
+            let Some((abh, c, h)) = hit else {
+                i += 1;
+                continue;
+            };
+            let ok = match canon.get(&(c, h)) {
+                Some(v) => *v,
+                None => {
+                    self.count_request("orphan-check", "node", 1);
+                    let v = canonical_header(&self.node, &self.tips, c, h)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string))
+                        == Some(abh);
+                    canon.insert((c, h), v);
+                    v
+                }
+            };
+            if ok {
+                moved.push(xb.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        // A rows whose only B copy was an orphan.
+        for o in &moved {
+            let rk = s(o, "requestKey");
+            let still = xb.iter().any(|r| s(r, "requestKey") == rk);
+            if !still {
+                xa.retain(|r| s(r, "requestKey") != rk);
+            }
+        }
+        moved
     }
 
     /// A row of a genesis block: height 0, or the first height of a chain added later.
