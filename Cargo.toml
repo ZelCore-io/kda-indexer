@@ -11,6 +11,7 @@ members = [
     "crates/kdx-segment",
     "crates/kdx-ingest",
     "crates/kdx-api",
+    "crates/kdx-metrics",
 ]
 # Vendored third-party code builds as a path dependency, not as a workspace member (no lints).
 exclude = ["vendor/ptr_hash"]
@@ -70,6 +71,7 @@ kdx-hot = { path = "crates/kdx-hot" }
 kdx-segment = { path = "crates/kdx-segment" }
 kdx-ingest = { path = "crates/kdx-ingest" }
 kdx-api = { path = "crates/kdx-api" }
+kdx-metrics = { path = "crates/kdx-metrics" }
 
 [profile.release]
 lto = "thin"

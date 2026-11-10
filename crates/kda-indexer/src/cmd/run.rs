@@ -79,6 +79,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         let binds = cfg.api.binds()?;
         let stop = token.clone();
         super::serve::spawn_tip_poll(cfg, tips.clone(), token.clone());
+        super::serve::spawn_textfile(cfg, token.clone());
         tokio::spawn(async move {
             let r = api.serve(binds, stop.clone()).await;
             if let Err(e) = &r {

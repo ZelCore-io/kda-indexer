@@ -98,6 +98,12 @@ impl Store {
         })
     }
 
+    /// Names in the current dictionary snapshot (all kinds).
+    pub fn dict_names(&self) -> usize {
+        let snap = self.dict.load();
+        DictKind::ALL.iter().map(|&k| snap.mem.len(k)).sum()
+    }
+
     /// Current segments snapshot (may lag the manifest until the next `view`).
     pub fn segments(&self) -> Arc<Segments> {
         self.seg.load_full()
@@ -131,6 +137,7 @@ impl Store {
 
     /// One consistent snapshot for one request. See the module docs for the order.
     pub fn view(self: &Arc<Self>, deadline: Instant) -> ApiResult<View> {
+        let opened = Instant::now();
         let mut attempt = 0;
         loop {
             let txn = self.hot.ro().map_err(ApiError::Internal)?;
@@ -154,6 +161,7 @@ impl Store {
                 continue;
             }
             self.maybe_reload_dict(&txn);
+            kdx_metrics::get().read_view("open", opened.elapsed().as_secs_f64());
             return Ok(View {
                 txn,
                 seg,
@@ -161,6 +169,7 @@ impl Store {
                 seg_frontier,
                 deadline,
                 dict: self.dict.load().mem.clone(),
+                born: Instant::now(),
             });
         }
     }
@@ -254,6 +263,13 @@ pub struct View {
     pub seg_frontier: u32,
     pub deadline: Instant,
     dict: Arc<MemDict>,
+    born: Instant,
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        kdx_metrics::get().read_view("held", self.born.elapsed().as_secs_f64());
+    }
 }
 
 impl View {

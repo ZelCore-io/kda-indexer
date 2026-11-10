@@ -53,6 +53,13 @@ pub fn spawn_tip_poll(cfg: &Config, tips: TipWatch, stop: CancellationToken) {
     });
 }
 
+/// Write the metrics to `metrics.textfile` every 15 s when it is configured.
+pub fn spawn_textfile(cfg: &Config, stop: CancellationToken) {
+    if let Some(path) = cfg.metrics.textfile.clone() {
+        tokio::spawn(kdx_metrics::textfile_loop(path, Duration::from_secs(15), stop));
+    }
+}
+
 /// Build the API over a store (shared by `serve` and `run`).
 pub fn api(cfg: &Config, store: Arc<Store>, tips: TipWatch) -> anyhow::Result<Api> {
     let search = kdx_api::compat::SearchSettings {
@@ -73,6 +80,7 @@ pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {
     signals(token.clone())?;
     let tips = TipWatch::default();
     spawn_tip_poll(cfg, tips.clone(), token.clone());
+    spawn_textfile(cfg, token.clone());
     tracing::info!(data_dir = %data_dir.display(), "serve: read-only API");
     api(cfg, store, tips)?.serve(cfg.api.binds()?, token).await
 }

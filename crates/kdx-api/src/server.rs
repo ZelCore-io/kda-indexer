@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context;
 use arc_swap::ArcSwapOption;
 use axum::body::{Body, HttpBody};
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::{header, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -199,6 +199,19 @@ fn debug_delay() -> Duration {
     })
 }
 
+/// `kdx_http_*` per listener and route template (`/txs/account/{account}`); a request no
+/// route matched is `unmatched`, so raw paths never become label values.
+async fn track(State(api): State<&'static str>, req: Request, next: Next) -> Response {
+    let t0 = Instant::now();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "unmatched".to_string(), |m| m.as_str().to_string());
+    let resp = next.run(req).await;
+    kdx_metrics::get().http(api, &route, resp.status().as_u16(), t0.elapsed().as_secs_f64());
+    resp
+}
+
 /// Admin listener: deadline only (health must answer under load).
 async fn admin_guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
     match tokio::time::timeout(st.settings.deadline, next.run(req)).await {
@@ -257,12 +270,13 @@ impl Api {
                 );
             }
         }
-        let data = |r: Router<Arc<ApiState>>| {
+        let data = |r: Router<Arc<ApiState>>, api: &'static str| {
             r.layer(middleware::from_fn_with_state(st.clone(), guard))
+                .layer(middleware::from_fn_with_state(api, track))
                 .with_state(st.clone())
         };
-        let native = data(self.native);
-        let compat = data(self.compat).layer(
+        let native = data(self.native, "native");
+        let compat = data(self.compat, "compat").layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
@@ -271,7 +285,9 @@ impl Api {
         );
         let admin = admin::router()
             .layer(middleware::from_fn_with_state(st.clone(), admin_guard))
+            .layer(middleware::from_fn_with_state("admin", track))
             .with_state(st.clone());
+        tokio::spawn(crate::sampler::run(st.clone(), shutdown.clone()));
         let mut tasks = Vec::new();
         for (name, addr, app) in [
             ("native", binds.native, native),

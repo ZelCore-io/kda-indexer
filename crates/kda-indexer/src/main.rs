@@ -243,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(&cli.config)?;
     init_logging(&cfg.log);
+    kdx_metrics::init(&cfg.network, env!("CARGO_PKG_VERSION"), env!("KDX_GIT_SHA"));
     match cli.command {
         Command::Config {
             action: ConfigAction::Check,

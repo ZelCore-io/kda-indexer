@@ -304,6 +304,7 @@ fn freeze_step(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         txn.set_meta(&dict::lens_key(end), &dict::encode_lens(&d))?;
         txn.commit()?;
     }
+    kdx_metrics::get().freezer("freeze", t0.elapsed().as_secs_f64());
     tracing::info!(
         start,
         end,
@@ -407,6 +408,7 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         }
     }
     fsync_dir(&ctx.segdir)?;
+    kdx_metrics::get().freezer("merge", t0.elapsed().as_secs_f64());
     tracing::info!(
         start,
         end,

@@ -6,6 +6,7 @@ pub mod compat;
 pub mod cursor;
 pub mod dict;
 pub mod limits;
+pub mod sampler;
 pub mod server;
 pub mod status;
 pub mod store;

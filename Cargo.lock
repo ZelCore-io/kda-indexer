@@ -1252,6 +1252,7 @@ dependencies = [
  "kdx-decode",
  "kdx-hot",
  "kdx-ingest",
+ "kdx-metrics",
  "kdx-node",
  "kdx-segment",
  "kdx-types",
@@ -1278,8 +1279,10 @@ dependencies = [
  "base64 0.22.1",
  "kdx-decode",
  "kdx-hot",
+ "kdx-metrics",
  "kdx-segment",
  "kdx-types",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -1346,6 +1349,7 @@ dependencies = [
  "futures",
  "kdx-decode",
  "kdx-hot",
+ "kdx-metrics",
  "kdx-node",
  "kdx-segment",
  "kdx-types",
@@ -1362,12 +1366,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kdx-metrics"
+version = "0.1.0"
+dependencies = [
+ "prometheus-client",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "kdx-node"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
  "hex",
+ "kdx-metrics",
  "reqwest",
  "rustls",
  "serde",

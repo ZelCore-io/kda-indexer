@@ -12,6 +12,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 tracing.workspace = true
+kdx-metrics.workspace = true
 rayon.workspace = true
 reth-nippy-jar.workspace = true
 kdx-types.workspace = true

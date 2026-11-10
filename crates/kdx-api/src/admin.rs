@@ -1,4 +1,4 @@
-//! Admin listener: `/healthz`, `/readyz`, `/status` (`/metrics` comes with Task 3).
+//! Admin listener: `/healthz`, `/readyz`, `/status`, `/metrics`.
 
 use std::sync::Arc;
 
@@ -17,6 +17,18 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/status", get(status::handler))
+        .route("/metrics", get(metrics))
+}
+
+async fn metrics() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        kdx_metrics::encode(),
+    )
+        .into_response()
 }
 
 async fn readyz(State(st): State<Arc<ApiState>>) -> Response {

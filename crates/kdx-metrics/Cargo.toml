@@ -1,0 +1,13 @@
+[package]
+name = "kdx-metrics"
+description = "Prometheus registry shared by the node client, ingest and the API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+prometheus-client.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true

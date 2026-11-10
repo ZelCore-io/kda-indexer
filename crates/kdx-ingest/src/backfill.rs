@@ -449,6 +449,12 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
         writer_est_mb = mem.writer_est_mb,
         "backfill: plan"
     );
+    {
+        let m = kdx_metrics::get();
+        m.backfill_next_height.set(i64::from(start));
+        m.backfill_end_height
+            .set(i64::from(units.last().map(|u| u.end).unwrap_or(start)));
+    }
 
     let walker = Arc::new(Walker::new(mode, cut));
     let spool_bytes = (mem.spool_mb << 20) as usize;
@@ -547,6 +553,16 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
         };
         tot_blocks += entry.block_count;
         tot_txs += entry.tx_count;
+        {
+            let m = kdx_metrics::get();
+            m.ingested("backfill", entry.block_count, entry.tx_count);
+            m.stage("backfill_fetch", st.fetch_secs);
+            m.stage("backfill_decode_index", st.decode_index_secs);
+            m.stage("backfill_finish", st.finish_secs);
+            m.stage("backfill_commit", st.commit_secs);
+            m.backfill_blocks_per_second.set(st.blocks_per_s);
+            m.backfill_next_height.set(i64::from(u.end));
+        }
         tracing::info!(
             range = format!("{}..{}", u.start, u.end),
             kind = st.kind,
@@ -699,7 +715,9 @@ fn build_and_commit(
     txn.set_next_txnum(entry.end_txnum())?;
     txn.set_frozen_frontier(entry.end)?;
     txn.set_meta(&dict::lens_key(entry.end), &dict::encode_lens(&dict))?;
+    let tc = Instant::now();
     txn.commit()?;
+    kdx_metrics::get().mdbx_commit_seconds.observe(tc.elapsed().as_secs_f64());
     debug_abort("hot", u.start);
     manifest.push(entry.clone())?;
     manifest.commit(&ctx.segdir)?;
