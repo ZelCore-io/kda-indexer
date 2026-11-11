@@ -61,9 +61,14 @@ enum Cmd {
         /// that start at or after it).
         #[arg(long)]
         since: String,
-        /// `must` (the gated routes, default) or `all`.
+        /// `must` (default), `should` (search, coins, balances) or `all`: the routes the
+        /// verdict covers.
         #[arg(long, default_value = "must")]
         routes: String,
+        /// `small` (R3E-13: every phase gate, default) or `full` (500/200/50, the final
+        /// validation only).
+        #[arg(long, default_value = "small")]
+        gate: String,
     },
     /// Debug: generate requests and print them.
     #[command(hide = true)]
@@ -93,8 +98,12 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())
         }
-        Cmd::Summary { since, routes } => {
-            if !kdx_compare::summary::run(&cfg.out_dir, &since, &routes)? {
+        Cmd::Summary {
+            since,
+            routes,
+            gate,
+        } => {
+            if !kdx_compare::summary::run(&cfg.out_dir, &since, &routes, &gate)? {
                 std::process::exit(1);
             }
             Ok(())

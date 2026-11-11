@@ -175,3 +175,28 @@ impl Generator for SeedGen {
         Ok(Vec::new())
     }
 }
+
+#[cfg(test)]
+mod p5_seed_tests {
+    use super::*;
+
+    /// The shipped seed file holds the P5 seeds: five WIZ_TRANSFER accounts asked with
+    /// `token=free.wiz-arena` and five cross-chain pact ids.
+    #[test]
+    fn mainnet_seed_file_has_the_p5_seeds() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/seeds/mainnet01.toml");
+        let g = SeedGen::load(&p).unwrap();
+        let wiz = g
+            .seeds
+            .iter()
+            .filter(|s| s.kind == SeedKind::Account && s.token.as_deref() == Some("free.wiz-arena"))
+            .count();
+        let pacts = g
+            .seeds
+            .iter()
+            .filter(|s| s.kind == SeedKind::PactId)
+            .count();
+        assert_eq!(wiz, 5);
+        assert_eq!(pacts, 5);
+    }
+}

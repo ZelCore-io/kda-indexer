@@ -18,6 +18,10 @@ max_body_bytes = 8388608   # per target response, after decompression
 pairs = [["cwd", "node"]]
 # With the compat API running (target "compat" below):
 # pairs = [["compat", "cwd"], ["compat", "kdatxs"], ["compat", "node"]]
+# With a replica (a second kda-indexer over a snapshot, target "replica" below): the pair of
+# two kda-indexer targets has no allowlist at all, so every difference is unexplained; tip
+# skew is handled as for /txs/recent and the oracle horizon.
+# pairs = [["compat", "cwd"], ["compat", "node"], ["compat", "replica"]]
 
 [node]
 url = "http://127.0.0.1:31351"
@@ -31,6 +35,10 @@ kind = "chainweb_data"
 
 # [targets.compat]
 # url = "http://127.0.0.1:31362"
+# kind = "kda_indexer_compat"
+
+# [targets.replica]
+# url = "http://127.0.0.1:31462"
 # kind = "kda_indexer_compat"
 
 # /v1/txs oracle: kda-txs behaviour composed from chainweb-data calls (no live kda-txs

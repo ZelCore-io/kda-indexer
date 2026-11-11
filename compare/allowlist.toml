@@ -106,7 +106,7 @@ route = "search"
 json_path_glob = "/**"
 condition = "any"
 reason = "/txs/search (pactid and search) is a should route built in P6; until then compat answers 404 and chainweb-data 200."
-owner_note = "Out of scope for P3/P4 (plan header); not a must route, so it never gates. Remove in P6."
+owner_note = "Out of scope for P3/P4 (plan header); not a must route, so it never gates. Remove in P6. P5 adds five pact_id seeds and the `search` should slot (50 compared at the gate), both inert until P6 fills the route."
 
 [[entry]]
 id = "cwd-transfers-gap"

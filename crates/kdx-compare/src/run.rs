@@ -610,15 +610,27 @@ impl Ctx {
         let full_a0 = pa.truncated || page_cut || row_limit.is_none_or(|l| len_of(&va) >= l);
         let full_b0 = pb.truncated || page_cut || row_limit.is_none_or(|l| len_of(&vb) >= l);
         let mut lag_rows = 0usize;
-        let a_tip = self.tips.a_tip();
+        // Replica pair (two kda-indexer targets): rows above the lower of the two tips are
+        // dropped (the sides read slightly different tips), with no allowlist hit.
+        let replica = ta.kind == crate::config::TargetKind::KdaIndexerCompat
+            && tb.kind == crate::config::TargetKind::KdaIndexerCompat;
+        let clamp_to = if replica {
+            match (self.oracle_tip(ta).await, self.oracle_tip(tb).await) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                _ => None,
+            }
+        } else {
+            let t = self.tips.a_tip();
+            (t > ORACLE_HORIZON).then(|| t - ORACLE_HORIZON)
+        };
         if matches!(
             req.route,
             RouteKind::Account | RouteKind::Events | RouteKind::V1Txs
         ) && sa == 200
             && sb == 200
-            && a_tip > ORACLE_HORIZON
+            && clamp_to.is_some()
         {
-            let clamp = a_tip - ORACLE_HORIZON;
+            let clamp = clamp_to.unwrap_or(0);
             let limit = if req.route == RouteKind::V1Txs {
                 crate::via_cwd::parse(&req.path_and_query)
                     .limit
@@ -965,7 +977,7 @@ impl Ctx {
                 b: None,
             });
         }
-        if lag_rows > 0 {
+        if lag_rows > 0 && !replica {
             d.push(DiffEntry {
                 path: ORACLE_LAG_PATH.into(),
                 kind: DiffKind::Changed,
@@ -1024,7 +1036,7 @@ impl Ctx {
                 b: Some(json!(pb.boundary_dups)),
             });
         }
-        if page_cut {
+        if page_cut && !replica {
             d.push(DiffEntry {
                 path: PAGE_CUT_PATH.into(),
                 kind: DiffKind::Changed,
@@ -1078,9 +1090,18 @@ impl Ctx {
         curl_b: String,
         note: Option<String>,
     ) -> Outcome {
-        let (unexplained, ids) = self
-            .allow
-            .classify_request(&req.route, &req.path_and_query, &d);
+        // A pair of two kda-indexer targets (primary and replica) has no allowlist: the
+        // entries explain differences from chainweb-data, the node or kda-txs, never between
+        // two copies of this indexer, so every diff on it is unexplained.
+        let replica_pair = ta.kind == crate::config::TargetKind::KdaIndexerCompat
+            && self.targets.get(b_name).map(|t| t.kind)
+                == Some(crate::config::TargetKind::KdaIndexerCompat);
+        let (unexplained, ids) = if replica_pair {
+            (d, Vec::new())
+        } else {
+            self.allow
+                .classify_request(&req.route, &req.path_and_query, &d)
+        };
         let (legacy_entries, other): (Vec<_>, Vec<_>) = if legacy {
             unexplained
                 .into_iter()

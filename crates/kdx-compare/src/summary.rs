@@ -1,4 +1,5 @@
-//! `kda-compare summary --since <iso> [--routes must|all]`: the P3 exit gate. Reads the
+//! `kda-compare summary --since <iso> [--routes must|should|all] [--gate small|full]`: the
+//! P3 exit gate (and its P5 small and full forms). Reads the
 //! ten-minute buckets the `run` loop writes into `summary-<date>.json` (flushed every minute
 //! and on shutdown), merges the buckets that start at or after `--since`, and prints one row
 //! per route and pair. Exit status 0 iff every must route is green.
@@ -12,7 +13,8 @@ use anyhow::Context;
 use crate::normalize::parse_iso;
 use crate::report::{date_of, lat_upper_ms, DailySummary, Window};
 
-/// Must routes and the number of compared requests each needs (plan Task 7).
+/// Must routes and the number of compared requests each needs at the full gate (the final
+/// validation: 500/200/50).
 pub const MUST: &[(&str, u64)] = &[
     ("account", 500),
     ("events", 500),
@@ -22,6 +24,70 @@ pub const MUST: &[(&str, u64)] = &[
     ("recent", 50),
     ("stats", 50),
 ];
+
+/// Must routes at the small gate (R3E-13): what a phase gate asks for.
+pub const MUST_SMALL: &[(&str, u64)] = &[
+    ("account", 100),
+    ("events", 100),
+    ("tx", 100),
+    ("txs", 100),
+    ("v1txs", 50),
+    ("recent", 20),
+    ("stats", 20),
+];
+
+/// Should routes and their minimums (registered at P5; P6 fills the routes). Same for both
+/// gate sizes.
+pub const SHOULD: &[(&str, u64)] = &[("search", 50), ("coins", 20), ("balances", 200)];
+
+/// Gate size: `small` (R3E-13, every phase) or `full` (the final validation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateSize {
+    Small,
+    Full,
+}
+
+impl GateSize {
+    pub fn parse(s: &str) -> anyhow::Result<GateSize> {
+        match s {
+            "small" => Ok(GateSize::Small),
+            "full" => Ok(GateSize::Full),
+            _ => anyhow::bail!("--gate must be `small` or `full`"),
+        }
+    }
+}
+
+/// Which routes the verdict covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteSet {
+    Must,
+    Should,
+    All,
+}
+
+impl RouteSet {
+    pub fn parse(s: &str) -> anyhow::Result<RouteSet> {
+        match s {
+            "must" => Ok(RouteSet::Must),
+            "should" => Ok(RouteSet::Should),
+            "all" => Ok(RouteSet::All),
+            _ => anyhow::bail!("--routes must be `must`, `should` or `all`"),
+        }
+    }
+
+    /// The (route, minimum compared) list the verdict requires.
+    pub fn required(self, size: GateSize) -> Vec<(&'static str, u64)> {
+        let must = match size {
+            GateSize::Small => MUST_SMALL,
+            GateSize::Full => MUST,
+        };
+        match self {
+            RouteSet::Must => must.to_vec(),
+            RouteSet::Should => SHOULD.to_vec(),
+            RouteSet::All => must.iter().chain(SHOULD).copied().collect(),
+        }
+    }
+}
 
 /// Classes that count as a request compared (the two sides answered and were diffed).
 const COMPARED: &[&str] = &["match", "diff", "allowlisted", "legacy-cmd", "skew"];
@@ -150,11 +216,11 @@ pub fn rows(w: &Window) -> Vec<Row> {
     out
 }
 
-/// The gate: every must route has at least its minimum compared (best pair) and no unexplained
-/// diff in any pair. Returns the verdict and one line per failing route.
-pub fn gate(rows: &[Row]) -> (bool, Vec<String>) {
+/// The gate: every required route has at least its minimum compared (best pair) and no
+/// unexplained diff in any pair. Returns the verdict and one line per failing route.
+pub fn gate(rows: &[Row], required: &[(&str, u64)]) -> (bool, Vec<String>) {
     let mut why = Vec::new();
-    for (route, min) in MUST {
+    for (route, min) in required {
         let of_route = rows.iter().filter(|r| r.route == *route);
         let compared = of_route.clone().map(|r| r.compared).max().unwrap_or(0);
         let diffs: u64 = of_route.map(|r| r.unexplained).sum();
@@ -172,9 +238,9 @@ fn ms(v: Option<f64>) -> String {
     v.map_or_else(|| "-".into(), |x| format!("{x:.0}"))
 }
 
-/// The table (`all_routes`: also routes that are not must routes) and the verdict.
-pub fn render(rows: &[Row], all_routes: bool) -> (String, bool) {
-    let is_must = |r: &str| MUST.iter().any(|(m, _)| *m == r);
+/// The table (the required routes only, or every route with `all_rows`) and the verdict.
+pub fn render(rows: &[Row], required: &[(&str, u64)], all_rows: bool) -> (String, bool) {
+    let is_must = |r: &str| required.iter().any(|(m, _)| *m == r);
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -190,7 +256,7 @@ pub fn render(rows: &[Row], all_routes: bool) -> (String, bool) {
         "A p50/p99 ms",
         "B p50/p99 ms"
     );
-    for r in rows.iter().filter(|r| all_routes || is_must(&r.route)) {
+    for r in rows.iter().filter(|r| all_rows || is_must(&r.route)) {
         let _ = writeln!(
             s,
             "{:<8} {:<22} {:>9} {:>6} {:>6} {:>5} {:>6} {:>6} {:>17} {:>17}",
@@ -206,11 +272,11 @@ pub fn render(rows: &[Row], all_routes: bool) -> (String, bool) {
             format!("{}/{}", ms(r.p50_b), ms(r.p99_b)),
         );
     }
-    let (green, why) = gate(rows);
+    let (green, why) = gate(rows, required);
     if green {
         let _ = writeln!(
             s,
-            "GREEN: every must route is at its minimum with 0 unexplained diffs"
+            "GREEN: every required route is at its minimum with 0 unexplained diffs"
         );
     } else {
         let _ = writeln!(s, "NOT GREEN:");
@@ -222,14 +288,12 @@ pub fn render(rows: &[Row], all_routes: bool) -> (String, bool) {
 }
 
 /// `summary` command: prints the table; returns whether the gate is green.
-pub fn run(out_dir: &Path, since: &str, routes: &str) -> anyhow::Result<bool> {
-    anyhow::ensure!(
-        matches!(routes, "must" | "all"),
-        "--routes must be `must` or `all`"
-    );
+pub fn run(out_dir: &Path, since: &str, routes: &str, gate: &str) -> anyhow::Result<bool> {
+    let set = RouteSet::parse(routes)?;
+    let size = GateSize::parse(gate)?;
     let since_secs = parse_since(since)?;
     let w = load(out_dir, since_secs)?;
-    let (text, green) = render(&rows(&w), routes == "all");
+    let (text, green) = render(&rows(&w), &set.required(size), routes == "all");
     print!("{text}");
     Ok(green)
 }
@@ -261,24 +325,24 @@ mod tests {
                 p.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
             window(&refs)
         };
-        let (g, why) = gate(&rows(&w(&pairs)));
+        let (g, why) = gate(&rows(&w(&pairs)), MUST);
         assert!(g, "{why:?}");
         // one under its minimum
         pairs[4].1 = vec![("match", 199)];
-        let (g, why) = gate(&rows(&w(&pairs)));
+        let (g, why) = gate(&rows(&w(&pairs)), MUST);
         assert!(!g);
         assert_eq!(why, vec!["v1txs: 199 compared, needs 200".to_string()]);
         // an unexplained diff, even with plenty compared
         pairs[4].1 = vec![("match", 300), ("diff", 1)];
-        let (g, why) = gate(&rows(&w(&pairs)));
+        let (g, why) = gate(&rows(&w(&pairs)), MUST);
         assert!(!g);
         assert_eq!(why, vec!["v1txs: 1 unexplained diffs".to_string()]);
         // a missing route
         pairs.remove(0);
-        let (g, _) = gate(&rows(&w(&pairs)));
+        let (g, _) = gate(&rows(&w(&pairs)), MUST);
         assert!(!g);
         // an empty window is never green
-        assert!(!gate(&[]).0);
+        assert!(!gate(&[], MUST).0);
     }
 
     #[test]
@@ -315,5 +379,51 @@ mod tests {
         assert_eq!(parse_since("1970-01-02").unwrap(), 86_400);
         assert_eq!(parse_since("1970-01-01T01:00:00Z").unwrap(), 3600);
         assert!(parse_since("yesterday").is_err());
+    }
+
+    #[test]
+    fn small_full_and_should_sets() {
+        let mk = |req: &[(&str, u64)], delta: i64| -> Vec<Row> {
+            req.iter()
+                .map(|(r, min)| Row {
+                    route: (*r).into(),
+                    a: "compat".into(),
+                    b: "cwd".into(),
+                    compared: (*min as i64 + delta) as u64,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let small = RouteSet::Must.required(GateSize::Small);
+        let full = RouteSet::Must.required(GateSize::Full);
+        assert_eq!(small[0], ("account", 100));
+        assert_eq!(full[0], ("account", 500));
+        // A window that meets the small minimums is green at small, not at full.
+        let w = mk(&small, 0);
+        assert!(gate(&w, &small).0);
+        let (g, why) = gate(&w, &full);
+        assert!(!g);
+        assert!(
+            why.contains(&"account: 100 compared, needs 500".to_string()),
+            "{why:?}"
+        );
+        // Should routes are a separate set: must rows say nothing about them.
+        let should = RouteSet::Should.required(GateSize::Small);
+        assert_eq!(
+            should,
+            vec![("search", 50), ("coins", 20), ("balances", 200)]
+        );
+        assert!(gate(&w, &should).1.len() == 3);
+        assert!(gate(&mk(&should, 0), &should).0);
+        let all = RouteSet::All.required(GateSize::Small);
+        assert_eq!(all.len(), small.len() + should.len());
+        // A diff on a should route fails the should set but not the must set.
+        let mut rows = mk(&small, 0);
+        rows.extend(mk(&should, 0));
+        rows.last_mut().unwrap().unexplained = 1;
+        assert!(gate(&rows, &small).0);
+        assert!(!gate(&rows, &should).0);
+        assert!(!gate(&rows, &all).0);
+        assert!(RouteSet::parse("x").is_err() && GateSize::parse("x").is_err());
     }
 }
