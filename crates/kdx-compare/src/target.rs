@@ -47,7 +47,7 @@ impl Limiter {
 #[derive(Debug, Clone)]
 pub struct HttpCapture {
     pub status: u16,
-    /// Only `content-type` and `Chainweb-Next`.
+    /// Only `content-type`, `Chainweb-Next` and `x-search-truncated`.
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
     pub ms: u64,
@@ -199,7 +199,7 @@ impl Target {
         };
         let status = resp.status().as_u16();
         let mut headers = Vec::new();
-        for k in ["content-type", "chainweb-next"] {
+        for k in ["content-type", "chainweb-next", "x-search-truncated"] {
             if let Some(v) = resp.headers().get(k).and_then(|v| v.to_str().ok()) {
                 let name = if k == "chainweb-next" {
                     "Chainweb-Next"

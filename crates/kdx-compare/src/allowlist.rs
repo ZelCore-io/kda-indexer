@@ -43,6 +43,10 @@ pub struct Entry {
     /// Optional: the request (path and query) must contain this text.
     #[serde(default)]
     pub request_contains: Option<String>,
+    /// Optional: kda-indexer's answer (A, any page) must carry this response header
+    /// (name, any case), e.g. `x-search-truncated` for a cut search.
+    #[serde(default)]
+    pub a_header: Option<String>,
     pub reason: String,
     pub owner_note: String,
 }
@@ -78,13 +82,15 @@ impl Allowlist {
         route: &RouteKind,
         diffs: &[DiffEntry],
     ) -> (Vec<DiffEntry>, Vec<String>) {
-        self.classify_request(route, "", diffs)
+        self.classify_request(route, "", &[], diffs)
     }
 
+    /// `a_headers`: the response headers of A's pages.
     pub fn classify_request(
         &self,
         route: &RouteKind,
         request: &str,
+        a_headers: &[(String, String)],
         diffs: &[DiffEntry],
     ) -> (Vec<DiffEntry>, Vec<String>) {
         let mut unexplained = Vec::new();
@@ -96,6 +102,9 @@ impl Allowlist {
                     && e.request_contains
                         .as_deref()
                         .is_none_or(|s| request.contains(s))
+                    && e.a_header
+                        .as_deref()
+                        .is_none_or(|h| a_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h)))
                     && glob(&e.json_path_glob, &d.path)
             });
             match hit {
@@ -125,4 +134,52 @@ pub fn glob(pat: &str, s: &str) -> bool {
         }
     }
     m(pat.as_bytes(), s.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Allowlist;
+    use crate::diff::diff_route;
+    use crate::normalize::RouteKind;
+
+    fn shipped() -> Allowlist {
+        let p =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+        Allowlist::load(&p).unwrap()
+    }
+
+    /// I-4: a `search=` diff is excused only when kda-indexer said it cut the answer.
+    #[test]
+    fn search_window_needs_a_truncated_answer() {
+        let al = shipped();
+        let a = serde_json::json!([{"requestKey": "x", "height": 10}]);
+        let b = serde_json::json!([{"requestKey": "y", "height": 10}]);
+        let d = diff_route(&RouteKind::Search, &a, &b);
+        assert!(!d.is_empty());
+        let req = "/txs/search?search=coin.transfer&minheight=1&maxheight=99&limit=50";
+        let (left, ids) = al.classify_request(&RouteKind::Search, req, &[], &d);
+        assert_eq!(left.len(), d.len(), "a plain search diff is unexplained");
+        assert!(ids.is_empty());
+        let cut = [("x-search-truncated".to_string(), "true".to_string())];
+        let (left, ids) = al.classify_request(&RouteKind::Search, req, &cut, &d);
+        assert!(left.is_empty());
+        assert_eq!(ids, vec!["search-window".to_string()]);
+    }
+
+    /// R-P5P9-10 #3: /coins within 1e-6 relative is a visible allowlist hit; beyond it, a diff.
+    #[test]
+    fn coins_tolerance_is_numeric() {
+        let al = shipped();
+        let a: serde_json::Value = serde_json::from_str("379699987.13176").unwrap();
+        let near: serde_json::Value = serde_json::from_str("379699932.889").unwrap();
+        let far: serde_json::Value = serde_json::from_str("379690000.0").unwrap();
+        let d = diff_route(&RouteKind::Coins, &a, &near);
+        let (left, ids) = al.classify_request(&RouteKind::Coins, "/coins", &[], &d);
+        assert!(left.is_empty() && ids == vec!["coins-supply-tolerance".to_string()]);
+        let d = diff_route(&RouteKind::Coins, &a, &far);
+        let (left, ids) = al.classify_request(&RouteKind::Coins, "/coins", &[], &d);
+        assert_eq!(left.len(), 1);
+        assert!(ids.is_empty());
+        assert!(diff_route(&RouteKind::Coins, &a, &a).is_empty());
+    }
 }

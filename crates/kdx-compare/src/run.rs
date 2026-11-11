@@ -1289,8 +1289,10 @@ impl Ctx {
             replica_skew = skew;
             (rest, Vec::new())
         } else {
+            let a_headers: Vec<(String, String)> =
+                pa.pages.iter().flat_map(|c| c.headers.clone()).collect();
             self.allow
-                .classify_request(&req.route, &req.path_and_query, &d)
+                .classify_request(&req.route, &req.path_and_query, &a_headers, &d)
         };
         let (legacy_entries, other): (Vec<_>, Vec<_>) = if legacy {
             unexplained
@@ -1459,50 +1461,11 @@ impl Ctx {
                     && r.get("chain").and_then(Value::as_u64) == Some(u64::from(chain))
             });
             let b = local.details(chain, token, &account).await;
-            let (mut diff, mut uncertain) = (Vec::new(), false);
-            let mut push = |path: &str, a: Option<Value>, b: Option<Value>| {
-                diff.push(DiffEntry {
-                    path: path.into(),
-                    kind: DiffKind::Changed,
-                    a,
-                    b,
-                });
-            };
             let b_text = match &b {
                 Ok(kdx_node::Local::Found { value, height }) => {
-                    match row {
-                        None => {
-                            push("/row", None, Some(Value::String(value.balance.clone())));
-                            uncertain = true;
-                        }
-                        Some(r) => {
-                            let bal = r.get("balance").and_then(Value::as_str).unwrap_or("");
-                            if !same_decimal(bal, &value.balance) {
-                                push(
-                                    "/balance",
-                                    Some(Value::String(bal.into())),
-                                    Some(Value::String(value.balance.clone())),
-                                );
-                                let as_of =
-                                    r.get("as_of_height").and_then(Value::as_u64).unwrap_or(0);
-                                uncertain = r.get("stale").and_then(Value::as_bool) == Some(true)
-                                    || as_of + 2 < *height;
-                            }
-                            if r.get("guard") != Some(&value.guard) {
-                                push("/guard", r.get("guard").cloned(), Some(value.guard.clone()));
-                                uncertain = true;
-                            }
-                        }
-                    }
                     format!("{{\"balance\":{:?},\"height\":{height}}}", value.balance)
                 }
-                Ok(kdx_node::Local::Absent) => {
-                    if let Some(r) = row {
-                        push("/row", r.get("balance").cloned(), None);
-                        uncertain = true;
-                    }
-                    "absent".to_string()
-                }
+                Ok(kdx_node::Local::Absent) => "absent".to_string(),
                 // Pact failures and node errors give no answer to compare (a token module
                 // without `details`): not a diff.
                 Err(e) => {
@@ -1515,6 +1478,10 @@ impl Ctx {
                         String::new(),
                     )
                 }
+            };
+            let (diff, uncertain) = match &b {
+                Ok(l) => balance_diff(row, l),
+                Err(_) => (Vec::new(), false),
             };
             if diff.is_empty() {
                 return Self::simple("match");
@@ -2665,6 +2632,56 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Equal as decimals: `1`, `1.0` and `1.00` are the same balance.
+/// The balances pair's compare of kda-indexer's row for (token, chain) with the node's
+/// `details` answer: the diff entries and whether they may be a race (a missing or extra row,
+/// a guard change, or a balance on a `stale` row or one read 3+ heights below the node's).
+fn balance_diff(
+    row: Option<&Value>,
+    b: &kdx_node::Local<kdx_node::Details>,
+) -> (Vec<DiffEntry>, bool) {
+    let (mut diff, mut uncertain) = (Vec::new(), false);
+    let mut push = |path: &str, a: Option<Value>, b: Option<Value>| {
+        diff.push(DiffEntry {
+            path: path.into(),
+            kind: DiffKind::Changed,
+            a,
+            b,
+        });
+    };
+    match b {
+        kdx_node::Local::Found { value, height } => match row {
+            None => {
+                push("/row", None, Some(Value::String(value.balance.clone())));
+                uncertain = true;
+            }
+            Some(r) => {
+                let bal = r.get("balance").and_then(Value::as_str).unwrap_or("");
+                if !same_decimal(bal, &value.balance) {
+                    push(
+                        "/balance",
+                        Some(Value::String(bal.into())),
+                        Some(Value::String(value.balance.clone())),
+                    );
+                    let as_of = r.get("as_of_height").and_then(Value::as_u64).unwrap_or(0);
+                    uncertain = r.get("stale").and_then(Value::as_bool) == Some(true)
+                        || as_of + 2 < *height;
+                }
+                if r.get("guard") != Some(&value.guard) {
+                    push("/guard", r.get("guard").cloned(), Some(value.guard.clone()));
+                    uncertain = true;
+                }
+            }
+        },
+        kdx_node::Local::Absent => {
+            if let Some(r) = row {
+                push("/row", r.get("balance").cloned(), None);
+                uncertain = true;
+            }
+        }
+    }
+    (diff, uncertain)
+}
+
 fn same_decimal(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> String {
         let s = s.trim();
@@ -2682,6 +2699,52 @@ fn same_decimal(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-P5P9-10 #1: the balances pair's compare.
+    #[test]
+    fn balances_pair_compare() {
+        use kdx_node::{Details, Local};
+        let guard = serde_json::json!({"keys": ["ab"], "pred": "keys-all"});
+        let found = |bal: &str, height| Local::Found {
+            value: Details {
+                balance: bal.into(),
+                guard: guard.clone(),
+            },
+            height,
+        };
+        let row = |bal: &str, as_of: u64, stale: bool| {
+            serde_json::json!({"module": "coin", "chain": 1, "balance": bal,
+                "guard": guard, "as_of_height": as_of, "stale": stale})
+        };
+        // Same decimal in another spelling: a match.
+        let r = row("1.50", 100, false);
+        assert_eq!(
+            super::balance_diff(Some(&r), &found("1.5", 101)),
+            (vec![], false)
+        );
+        // A fresh row with another balance: a sure diff.
+        let (d, unsure) = super::balance_diff(Some(&r), &found("2.0", 101));
+        assert_eq!(
+            (d.len(), d[0].path.as_str(), unsure),
+            (1, "/balance", false)
+        );
+        // A stale row, or one read 3 heights below the node: maybe a race.
+        assert!(super::balance_diff(Some(&row("1.5", 100, true)), &found("2.0", 101)).1);
+        assert!(super::balance_diff(Some(&r), &found("2.0", 103)).1);
+        // Guard change, missing row, extra row.
+        let other = serde_json::json!({"module": "coin", "chain": 1, "balance": "1.5",
+            "guard": {"keys": ["cd"], "pred": "keys-all"}, "as_of_height": 100});
+        let (d, unsure) = super::balance_diff(Some(&other), &found("1.5", 101));
+        assert_eq!((d[0].path.as_str(), unsure), ("/guard", true));
+        let (d, unsure) = super::balance_diff(None, &found("1.5", 101));
+        assert_eq!((d[0].path.as_str(), unsure), ("/row", true));
+        let (d, unsure) = super::balance_diff(Some(&r), &Local::Absent);
+        assert_eq!(
+            (d[0].path.as_str(), d[0].b.is_none(), unsure),
+            ("/row", true, true)
+        );
+        assert_eq!(super::balance_diff(None, &Local::Absent), (vec![], false));
+    }
 
     #[test]
     fn only_keys_ignores_value_diffs() {

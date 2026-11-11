@@ -15,6 +15,11 @@ const STATS_COUNT_TOLERANCE: f64 = 0.01;
 const STATS_SUPPLY_TOLERANCE: f64 = 1e-6;
 /// Path used to report a `/stats` supply difference that is inside the tolerance.
 pub const STATS_SUPPLY_PATH: &str = "/coinsInCirculation~tolerance";
+/// `/coins`: a text decimal that both sides compute at their own tip (same tolerance).
+const COINS_SUPPLY_TOLERANCE: f64 = 1e-6;
+/// Path used to report a `/coins` difference inside the tolerance (allowlisted as
+/// `coins-supply-tolerance`, so the hit is visible); a bigger one stays a root diff.
+pub const COINS_SUPPLY_PATH: &str = "/~coins-supply-tolerance";
 /// Path used to report a `/stats` count difference that is inside the tolerance (allowlisted
 /// as `stats-estimate`, so the hit is visible in the summary).
 pub const STATS_ESTIMATE_PATH: &str = "/transactionCount~estimate";
@@ -28,6 +33,18 @@ pub fn diff(a: &Value, b: &Value) -> Vec<DiffEntry> {
 
 /// `diff` plus route rules that need both sides (the `/stats` tolerances).
 pub fn diff_route(route: &RouteKind, a: &Value, b: &Value) -> Vec<DiffEntry> {
+    if *route == RouteKind::Coins {
+        if let (Some(x), Some(y)) = (num_or_text_f64(a), num_or_text_f64(b)) {
+            if x != y && (x - y).abs() <= COINS_SUPPLY_TOLERANCE * x.abs().max(y.abs()) {
+                return vec![DiffEntry {
+                    path: COINS_SUPPLY_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: Some(a.clone()),
+                    b: Some(b.clone()),
+                }];
+            }
+        }
+    }
     if *route == RouteKind::Stats {
         let (mut a2, mut b2) = (a.clone(), b.clone());
         let mut extra = Vec::new();

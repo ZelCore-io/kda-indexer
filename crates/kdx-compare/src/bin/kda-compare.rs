@@ -171,7 +171,7 @@ async fn self_check(
     normalize(&route, &mut b);
     let d = diff_route(&route, &a, &b);
     let allow = Allowlist::load(&cfg.allowlist)?;
-    let (unexplained, ids) = allow.classify_request(&route, path, &d);
+    let (unexplained, ids) = allow.classify_request(&route, path, &[], &d);
     println!(
         "route={} entries={} unexplained={} allowlisted={:?}",
         route.as_str(),

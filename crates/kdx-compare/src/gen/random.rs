@@ -155,6 +155,28 @@ pub async fn block_requests(
 /// Share of txs that get a `search=` request, and its height window.
 const SEARCH_SHARE: f64 = 0.3;
 const SEARCH_WINDOW: u64 = 50;
+/// A `search=` request for `code`: a 12-24 char literal slice (no LIKE wildcard) within
+/// `height` ± `SEARCH_WINDOW`, for `SEARCH_SHARE` of the draws.
+pub fn search_request(code: &str, height: u64, rng: &mut StdRng) -> Option<String> {
+    let chars: Vec<char> = code.chars().collect();
+    let want = rng.random_range(12..=24usize);
+    if chars.len() < want {
+        return None;
+    }
+    let at = rng.random_range(0..=chars.len() - want);
+    let frag: String = chars[at..at + want].iter().collect();
+    // `%` and `_` are LIKE wildcards on both sides: keep the slice literal.
+    if frag.contains(['%', '_']) || !rng.random_bool(SEARCH_SHARE) {
+        return None;
+    }
+    Some(format!(
+        "/txs/search?search={}&minheight={}&maxheight={}&limit=50",
+        enc_query(&frag),
+        height.saturating_sub(SEARCH_WINDOW),
+        height + SEARCH_WINDOW
+    ))
+}
+
 /// Share of draws that add a `/coins` request.
 const COINS_SHARE: f64 = 0.02;
 
@@ -263,24 +285,8 @@ pub fn tx_requests(
         .and_then(|c| c.pointer("/payload/exec/code"))
         .and_then(Value::as_str)
     {
-        let chars: Vec<char> = code.chars().collect();
-        let want = rng.random_range(12..=24usize);
-        if chars.len() >= want {
-            let at = rng.random_range(0..=chars.len() - want);
-            let frag: String = chars[at..at + want].iter().collect();
-            // `%` and `_` are LIKE wildcards on both sides: keep the slice literal.
-            if !frag.contains(['%', '_']) && rng.random_bool(SEARCH_SHARE) {
-                out.push(Request::new(
-                    format!(
-                        "/txs/search?search={}&minheight={}&maxheight={}&limit=50",
-                        enc_query(&frag),
-                        height.saturating_sub(SEARCH_WINDOW),
-                        height + SEARCH_WINDOW
-                    ),
-                    origin,
-                    None,
-                ));
-            }
+        if let Some(path) = search_request(code, height, rng) {
+            out.push(Request::new(path, origin, None));
         }
     }
     if rng.random_bool(COINS_SHARE) {
@@ -405,5 +411,38 @@ impl Generator for RandomGen {
             return Ok(reqs);
         }
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+
+    use super::{search_request, SEARCH_WINDOW};
+
+    /// R-P5P9-10 #1: `search=` requests are literal 12-24 char slices of the code in a
+    /// ±50-height window.
+    #[test]
+    fn search_requests_are_literal_slices_in_a_window() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let code = "(coin.transfer \"k:alice\" \"k:bob\" 1.0)";
+        let mut n = 0;
+        for _ in 0..200 {
+            let Some(p) = search_request(code, 1_000, &mut rng) else {
+                continue;
+            };
+            n += 1;
+            let u = url::Url::parse(&format!("http://h{p}")).unwrap();
+            let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+            let frag = &q["search"];
+            assert!((12..=24).contains(&frag.chars().count()) && code.contains(frag.as_str()));
+            assert!(!frag.contains(['%', '_']));
+            assert_eq!(q["minheight"], (1_000 - SEARCH_WINDOW).to_string());
+            assert_eq!(q["maxheight"], (1_000 + SEARCH_WINDOW).to_string());
+        }
+        assert!(n > 20, "{n} search requests of 200 draws");
+        // Too short for a slice; a wildcard-only slice is never sent.
+        assert!(search_request("(short)", 5, &mut rng).is_none());
+        assert!((0..50).all(|_| search_request(&"_".repeat(40), 5, &mut rng).is_none()));
     }
 }
