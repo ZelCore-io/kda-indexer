@@ -146,7 +146,7 @@ route = "v1txs"
 json_path_glob = "/~oracle-unstable"
 condition = "any"
 reason = "kda-txs is fed by its own indexer and can answer the same /v1/txs request differently moments apart (seen live: set shifts at /0 that were gone when both sides were fetched again). A /v1/txs diff against kda-txs is retried once after 30 s (seen live: a partial answer, 20 of 41 rows, that was whole minutes later); when the retry agrees, this visible hit replaces the diff."
-owner_note = "PROPOSED in run 3E-c (P3 Task 8), controller/owner to accept (handoff item 7a)."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c)."
 
 [[entry]]
 id = "oracle-limit-edge"
@@ -154,7 +154,7 @@ route = "v1txs"
 json_path_glob = "/~limit-edge"
 condition = "any"
 reason = "kda-txs can return one row fewer than the limit (seen live: xwallet-xchain-gas/coin/250, 250 rows on kda-indexer, 249 on kda-txs, the extra row the oldest at 7385234). When one side holds exactly `limit` rows and the counts differ, both keep only the rows above the higher of the two lowest heights; this visible hit is reported."
-owner_note = "PROPOSED in run 3E-c (P3 Task 8), controller/owner to accept (handoff item 7b)."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c)."
 
 [[entry]]
 id = "cwd-cursor-coinbase-skip"
@@ -162,16 +162,7 @@ route = "*"
 json_path_glob = "/~cwd-cursor-skip"
 condition = "any"
 reason = "chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain, so a page that ends on a coinbase row makes the next page skip the coinbase rows of the other chains at that height (seen live: /txs/events?modulename=coin&name=TRANSFER&minheight=3293727&maxheight=3293927, cursor ((3293927,\"cb\",0),0), chainweb-data 13 rows at 3293927 over three pages, kda-indexer all 23). The harness drops that height on both sides and reports this visible hit."
-owner_note = "PROPOSED in run 3E-c (P3 Task 8), controller/owner to accept: chainweb-data pagination defect; compat lists every row."
-
-[[entry]]
-id = "known-f2-creation-time"
-route = "*"
-json_path_glob = "/**creationTime"
-condition = "changed"
-request_contains = "/txs/tx"
-reason = "A cmd's meta.creationTime can be fractional (seen live: 3X2ut23V... chain 1 height 4006748, 1692638383.532). Compat shows 17:19:43 (floor), chainweb-data 17:19:44 (rounded); the node pair projects it rounded, like chainweb-data."
-owner_note = "PROPOSED in run 3E-c: known F2 for the fix round (compat to round like chainweb-data); allowlisted meanwhile like G1."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c): chainweb-data pagination defect; compat lists every row."
 
 [[entry]]
 id = "kdatxs-gap"
@@ -179,23 +170,7 @@ route = "v1txs"
 json_path_glob = "/~kdatxs-gap"
 condition = "any"
 reason = "kda-txs leaves out some /v1/txs rows in canonical blocks (seen live: 28481ce2... chain 0 height 1288814, 1 row on kda-indexer, none on kda-txs; xwallet-xchain-gas chain 5 height 7386167). An A-only row, when kda-txs lists no row of its own, moves here only when chainweb-data's /txs/tx for that request key is in the same block and has an event naming the account."
-owner_note = "PROPOSED in run 3E-c (P3 Task 8), controller/owner to accept: kda-txs data gap."
-
-[[entry]]
-id = "known-f1-gas-limit"
-route = "v1txs"
-json_path_glob = "/*/gasLimit"
-condition = "any"
-reason = "Compat /v1/txs answers gasLimit null on some rows where kda-txs has the cmd's value (seen live: d250a569... /coin/50 and /coin/250, several rows, kda-txs 600)."
-owner_note = "Known F1 (ruling R3E-10), real finding for the fix round; allowlisted meanwhile like G1 so the window can gate the rest (run 3E-c ruling)."
-
-[[entry]]
-id = "known-f2-creation-time-v1txs"
-route = "v1txs"
-json_path_glob = "/*/creationTime"
-condition = "changed"
-reason = "Same as known-f2-creation-time on /v1/txs: kda-txs rounds a fractional meta.creationTime (seen live: k:e3840440.../coin/50, compat 02:17:27, kda-txs 02:17:28)."
-owner_note = "PROPOSED in run 3E-c: known F2 for the fix round; allowlisted meanwhile like G1."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c): kda-txs data gap."
 
 [[entry]]
 id = "cwd-missing-node"
@@ -211,12 +186,4 @@ route = "v1txs"
 json_path_glob = "/~kdatxs-missing-node"
 condition = "any"
 reason = "kda-txs answers a varying subset of an account's /v1/txs rows (seen live: acc28032.../coin/250, 63, 54, 404 and 47 rows on four fetches, every row also on kda-indexer, which lists 125; 40a8967d.../coin/10, kda-txs never lists JxrH9wub... at chain 0 height 3697206, node block Cr4YV2QE). Same check as cwd-missing-node: both full -> cut at the higher lowest height; no kda-txs-only row; every kda-indexer-only row in the same block on the node's /poll with an event naming the account."
-owner_note = "PROPOSED in run 3E-d (P3 Task 8), controller/owner to accept: kda-txs data gap / unstable subset, confirmed per row on the node."
-
-[[entry]]
-id = "known-f3-gas-price"
-route = "*"
-json_path_glob = "/**gasPrice"
-condition = "any"
-reason = "Compat answers gasPrice null when the cmd writes meta.gasPrice as a string (seen live: Gmzfd0_xs4nj..., cmd \"0.00000001\"; chainweb-data 1e-08, node projection \"0.00000001\"; r:n_582fed11...bot/coin/250, every row null on compat, kda-txs 1e-08). Real finding F3 (probably the same root cause as F1, gasLimit null)."
-owner_note = "Known F3 for the fix round (run 3E-d); allowlisted meanwhile like F1/G1 so the window can gate the rest."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-d): kda-txs data gap / unstable subset, confirmed per row on the node."
