@@ -12,7 +12,13 @@ The data directory of one network looks like this:
   hot/            MDBX environment: dictionaries, live tail, undo, checkpoints (mutable)
   segments/       immutable range and step files + manifest.json
   etl/            temporary spool files while a range is being built (deleted afterwards)
+  LOCK            held by the writing process
+  merkle-unverified.jsonl   backfill blocks whose payload Merkle roots did not verify
 ```
+
+A snapshot directory (`kda-indexer snapshot --out DIR`) holds `hot/`, `segments/` and
+`SNAPSHOT.json` (format versions, network, frontiers, tail checkpoints, manifest blake3;
+no paths).
 
 Segments refer to names (accounts, modules, event names, public keys, module hashes) by
 the dense integer ids stored in the `hot/` dictionaries. A `segments/` directory is only
@@ -109,7 +115,7 @@ files of unlisted ranges are leftovers and are deleted or rebuilt.
 | `keys` | `.ef` | first TxNum of every slot |
 | `rk` | `.idx` | request key → tx |
 | `bh` | `.idx` | block hash → slot |
-| `acct`, `xfer`, `pk`, `evt`, `code` | `.pst` | posting lists |
+| `acct`, `xfer`, `pk`, `evt`, `code`, `pact` | `.pst` | posting lists |
 | `range` | `.toml` | range header with blake3 of every other file |
 
 ## Write ordering
@@ -537,8 +543,6 @@ recomputes the payload roots and sorts blocks into `ok` (verified, bit set),
 `bad_legacy` and `bad_other` (mismatch, bit clear). A record that does not render counts
 under `errors`. It exits 1 on anything but `ok`: every era must verify, legacy included, and
 `ok_unflagged` points to a bit-setting or render bug (a v2 store sets the bit on every block
-that verifies). It opens the store
-read-only and takes a fresh read txn per 1,000 heights (or 1,000 samples), then reloads the
-segments if the manifest changed, so blocks frozen during the walk are still checked. The
-default is a
-sample of 1,000 random blocks.
+that verifies). It opens the store read-only and takes a fresh read txn per 1,000 heights
+(or 1,000 samples), then reloads the segments if the manifest changed, so blocks frozen
+during the walk are still checked. The default is a sample of 1,000 random blocks.
