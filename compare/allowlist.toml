@@ -195,3 +195,11 @@ json_path_glob = "/~kdatxs-events-node"
 condition = "any"
 reason = "kda-txs answers a row's events differently from one fetch to the next (seen live: k:d763d377.../coin/50 and k:e4f0a329.../coin/50, the gas TRANSFER and the main TRANSFER with from/to and amounts that disagreed, gone on a refetch). Rows both sides list (by requestKey, blockHash, idx) whose events differ are polled on the node (at most 25 per compare); only when the node has every such tx in kda-indexer's block with kda-indexer's events (as a multiset) are kda-txs's events replaced by kda-indexer's, and this visible hit is reported."
 owner_note = "Oracle defect class under ruling R3E-15 (node agrees with kda-indexer, kda-txs differs); added in run 3E-g."
+
+[[entry]]
+id = "cwd-events-missing-node"
+route = "events"
+json_path_glob = "/~cwd-events-missing-node"
+condition = "any"
+reason = "chainweb-data lacks the events of whole height ranges (seen live 2026-11-11: no coin.TRANSFER event at heights 7392632-7392963, about 2.8 h of 2026-11-10, while its tip was at 7395650, so its /txs/events pages skip those heights). kda-indexer rows at a height above chainweb-data's lowest listed height where chainweb-data lists no row at all move here only when the node confirms every one: a user tx in the same block on /poll with an event of the same name and params, a coinbase row in the node's canonical block at its (chain, height). With both pages full, both sides are then cut at the higher of their lowest heights."
+owner_note = "Oracle defect class under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); added in run 3E-g. Triage sample: 22/22 user rows confirmed on /poll, 99/100 coinbase rows with the node's only header equal to kda-indexer's block (the 100th at a forked height, kda-indexer's block among the two)."
