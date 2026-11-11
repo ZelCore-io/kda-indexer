@@ -486,8 +486,9 @@ that is a transfer (above; a suffix name such as `WIZ_TRANSFER` does not count h
 poly-fungible `TRANSFER (id, from, to, amount)` or of a `TRANSFER_XCHAIN` /
 `TRANSFER_XCHAIN_RECD (from, to, amount, chain)`, or when it is a syntactically valid Pact
 principal (`k:`, `w:`, `r:`, `u:`, `m:`, `p:`, `c:`) anywhere in the event's params. All of
-these are interned before encoding, so the `acct` posting set is a pure function of the
-block: backfill, tail, replay and rebuild give the same set. A non-principal ("vanity")
+these, and the `xfer` sides of every transfer (including a suffix name's), are interned
+before encoding, so the `acct` and `xfer` posting sets and the record bytes are a pure
+function of the block and the ids: backfill, tail, replay and rebuild give the same sets. A non-principal ("vanity")
 account name that appears only in the params of other events gets no posting.
 
 ```

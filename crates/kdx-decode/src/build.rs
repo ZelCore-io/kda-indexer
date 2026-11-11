@@ -275,6 +275,19 @@ fn intern_output(o: &Value, dict: &mut impl DictMut, unindexed: &mut u32) {
     {
         acc.clear();
         event_accounts(e, &mut acc);
+        // The `xfer` sides (`transfer_accounts`, wider than the `acct` rule): a side that is
+        // neither an `acct` side nor a principal (a suffix-TRANSFER's id, a non-principal
+        // name of an `X_TRANSFER`) is posted by `extract` under `xfer` only. It is interned
+        // here too, after the event's `acct` strings, so `encode_records` already sees it.
+        if let Some(ev) = parse_event(e) {
+            if let Some((from, to)) = transfer_accounts(&ev) {
+                for s in [from, to] {
+                    if !acc.contains(&s) {
+                        acc.push(s);
+                    }
+                }
+            }
+        }
         for a in &acc {
             intern_account(dict, a, unindexed);
         }
@@ -282,8 +295,10 @@ fn intern_output(o: &Value, dict: &mut impl DictMut, unindexed: &mut u32) {
 }
 
 /// Step 1 of `build_records`: intern every name the block references, in first-seen order
-/// (miner account; coinbase output; per user tx: meta sender, signer `addr`s, output). Every
-/// account string `extract` posts is interned here, so postings depend only on the block.
+/// (miner account; coinbase output; per user tx: meta sender, signer `addr`s, output; per
+/// event of an output: its `event_accounts`, then its `xfer` sides not among them). Every
+/// account string `extract` posts (`acct` and `xfer`) is interned here, before the records
+/// are encoded, so record bytes and postings depend only on the block and the ids.
 /// Returns the number of account strings longer than `MAX_ACCOUNT_LEN` (not interned).
 pub fn intern_block(b: &DecodedBlock, dict: &mut impl DictMut) -> u32 {
     let mut unindexed = 0;

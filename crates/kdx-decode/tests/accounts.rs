@@ -126,3 +126,65 @@ fn principal_grammar() {
     assert!(is_principal(&format!("p:{}:free.m.f", "a".repeat(43))));
     assert!(!is_principal("alice") && !is_principal("r:") && !is_principal("x:y"));
 }
+
+/// Review M1: the `xfer`-only sides (a suffix-TRANSFER's `(id, from, rational)` params, the
+/// non-principal names of an `X_TRANSFER`) are interned by `intern_block`, in the documented
+/// order, before the records are encoded: `extract` interns nothing new.
+#[test]
+fn xfer_only_sides_are_interned_before_encoding() {
+    let to = format!("k:{}", "c".repeat(64));
+    let evs = json!([
+        event("wiz", "WIZ_TRANSFER", json!(["nft-17", to, 1.5])),
+        event("tok", "X_TRANSFER", json!(["alice", "bob", 1.0])),
+    ]);
+    let b = block(evs);
+    let mut dict = MemDict::new();
+    kdx_decode::build::intern_block(&b, &mut dict);
+    let sender = format!("k:{}", "5".repeat(64));
+    // Miner, sender, then per event: `event_accounts` (principals), then the xfer-only sides.
+    assert_eq!(
+        dict.names(DictKind::Account),
+        &["k:m", &sender, &to, "nft-17", "alice", "bob"]
+    );
+    let before: Vec<usize> = DictKind::ALL.iter().map(|&k| dict.len(k)).collect();
+    let ib = index_block(&b, &VerifyReport::default(), &mut dict).expect("indexes");
+    let after: Vec<usize> = DictKind::ALL.iter().map(|&k| dict.len(k)).collect();
+    assert_eq!(before, after, "extract interned a name intern_block missed");
+    let xfer = ib.idx[1]
+        .postings
+        .iter()
+        .filter(|(f, _)| *f == Family::Xfer)
+        .count();
+    assert_eq!(xfer, 4);
+}
+
+/// Review M1: record bytes and postings of a block are the same whether the block is the
+/// first to mention its xfer-only names (backfill) or is applied again with those names
+/// already interned (the tail after a reorg undo keeps its names; the freezer and merge copy
+/// the tail's record bytes as they are).
+#[test]
+fn record_bytes_do_not_depend_on_prior_interning() {
+    let evs = json!([
+        event("wiz", "WIZ_TRANSFER", json!(["nft-17", "k:ok", 1.5])),
+        event("tok", "X_TRANSFER", json!(["alice", "bob", 1.0])),
+    ]);
+    let b = block(evs);
+    let bytes = |dict: &mut MemDict| {
+        let ib = index_block(&b, &VerifyReport::default(), dict).expect("indexes");
+        let mut txs = Vec::new();
+        for t in &ib.txs {
+            kdx_types::record::encode_tx(t, &mut txs);
+        }
+        let mut blk = Vec::new();
+        kdx_types::record::encode_block(&ib.block, &mut blk);
+        (blk, txs, ib.idx)
+    };
+    // Backfill: a fresh dictionary, the block is the first mention.
+    let backfill = bytes(&mut MemDict::new());
+    // Tail: the block applied, undone by a reorg (names stay), then applied again.
+    let mut tail = MemDict::new();
+    let first = bytes(&mut tail);
+    let again = bytes(&mut tail);
+    assert_eq!(first, backfill);
+    assert_eq!(again, backfill);
+}
