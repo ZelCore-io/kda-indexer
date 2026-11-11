@@ -104,6 +104,27 @@ struct Ctx {
 }
 
 impl Ctx {
+    /// Reload the segments when the manifest changed. Called after each chunk's read txn
+    /// began: a step frozen since the walk started is then either still in that txn's hot
+    /// rows (its hot delete came later) or in the reloaded segments (its manifest commit came
+    /// before that delete). Retries: a merge can delete step files during the reload.
+    fn refresh_segments(&mut self) -> anyhow::Result<()> {
+        let mut last = None;
+        for _ in 0..3 {
+            match self.seg.refresh() {
+                Ok(Some(s)) => {
+                    self.seg = s;
+                    return Ok(());
+                }
+                Ok(None) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last
+            .expect("three attempts")
+            .context("reloading the segments"))
+    }
+
     fn reload_dict(&mut self) -> anyhow::Result<()> {
         let txn = self.hs.ro()?;
         self.dict = Arc::new(HotDict::load(&txn)?.mem().clone());
@@ -265,6 +286,7 @@ pub fn merkle(args: MerkleArgs) -> anyhow::Result<()> {
         loop {
             let b = a.saturating_add(CHUNK_HEIGHTS - 1).min(to);
             let txn = cx.hs.ro()?;
+            cx.refresh_segments()?;
             for h in a..=b {
                 for i in 0..cx.chains.len() {
                     let c = cx.chains[i];
@@ -292,6 +314,7 @@ pub fn merkle(args: MerkleArgs) -> anyhow::Result<()> {
         picks.sort_unstable();
         for chunk in picks.chunks(CHUNK_SAMPLES) {
             let txn = cx.hs.ro()?;
+            cx.refresh_segments()?;
             for &(h, c) in chunk {
                 check_one(&mut cx, &txn, &mut t, c, h);
             }
@@ -300,9 +323,11 @@ pub fn merkle(args: MerkleArgs) -> anyhow::Result<()> {
     report(&t, args.json)?;
     if t.failed() {
         anyhow::bail!(
-            "verify merkle: {} bad_flagged, {} bad_other, {} errors",
+            "verify merkle: {} bad_flagged, {} bad_legacy, {} bad_other, {} ok_unflagged, {} errors",
             t.bad_flagged,
+            t.bad_legacy,
             t.bad_other,
+            t.ok_unflagged,
             t.errors
         );
     }

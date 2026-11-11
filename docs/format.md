@@ -535,5 +535,7 @@ recomputes the payload roots and sorts blocks into `ok` (verified, bit set),
 under `errors`. It exits 1 on anything but `ok`: every era must verify, legacy included, and
 `ok_unflagged` points to a bit-setting or render bug (a v2 store sets the bit on every block
 that verifies). It opens the store
-read-only and takes a fresh read txn per 1,000 heights (or 1,000 samples). The default is a
+read-only and takes a fresh read txn per 1,000 heights (or 1,000 samples), then reloads the
+segments if the manifest changed, so blocks frozen during the walk are still checked. The
+default is a
 sample of 1,000 random blocks.
