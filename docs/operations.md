@@ -353,7 +353,7 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-
 ### NFTs
 
 The same stage keeps `NftBalances` (spec §3.9). Once per store (`Meta nft_filled`), before the
-balance seed, it walks the `evt` postings of every ledger event name (modules named `ledger`,
+balance seed, it walks the `evt` postings of every event name of a trusted ledger (`[nft] ledgers`, default `marmalade.ledger` and `marmalade-v2.ledger`;
 hot tail first, then the segments) and applies each tx's events: a v2-shaped `RECONCILE` sets
 both parties' balance, other ledger events mark `NftDirty`. The fill makes no node calls and
 takes seconds. After that the tail applies the same rules to every block, a reorg's undo marks

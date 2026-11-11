@@ -31,6 +31,8 @@ pub struct Config {
     #[serde(default)]
     pub balances: BalancesConfig,
     #[serde(default)]
+    pub nft: NftConfig,
+    #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub log: LogConfig,
@@ -315,6 +317,26 @@ impl Default for BalancesConfig {
             enabled: true,
             local_rps: 50,
             local_concurrency: 8,
+        }
+    }
+}
+
+/// `[nft]`: which ledger modules the NFT tables trust.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NftConfig {
+    /// Qualified names of the ledger modules whose events update `NftBalances`. Anyone can
+    /// deploy a module named `ledger`, so none is trusted by its name alone.
+    pub ledgers: Vec<String>,
+}
+
+impl Default for NftConfig {
+    fn default() -> Self {
+        Self {
+            ledgers: kdx_hot::nft::DEFAULT_LEDGERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         }
     }
 }

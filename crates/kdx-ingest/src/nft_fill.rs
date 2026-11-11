@@ -1,9 +1,8 @@
 //! NFT history fill and `NftDirty` reconcile (ruling N-1, plan Task 11).
 //!
 //! - **Fill** ([`run`], once per store, in `run` before the balance seed; `Meta nft_filled`):
-//!   an ascending walk of the `evt` postings of every ledger event name (a module whose last
-//!   name segment is `ledger`: `marmalade-v2.ledger.RECONCILE`, the v1 `marmalade.ledger.*`
-//!   events, copies under a principal namespace). The hot `TailPostings` come first, then the
+//!   an ascending walk of the `evt` postings of every ledger event name (a module on the trusted
+//!   ledger allowlist, `kdx_hot::nft::is_ledger`: `marmalade-v2.ledger`, `marmalade.ledger`). The hot `TailPostings` come first, then the
 //!   segments (a block frozen meanwhile is seen in one of the two, or in both: replaying an
 //!   event is idempotent, see `kdx_hot::nft`). Each tx's events go through
 //!   `kdx_hot::nft::classify`: v2 `RECONCILE` parties are upserted (source 1), other ledger
@@ -60,7 +59,7 @@ fn ledger_names(dict: &MemDict) -> Vec<u32> {
         .filter(|&id| {
             dict.name(DictKind::EventName, id)
                 .and_then(|n| n.rsplit_once('.'))
-                .is_some_and(|(m, _)| m.rsplit('.').next() == Some("ledger"))
+                .is_some_and(|(m, _)| nft::is_ledger(m))
         })
         .collect()
 }
@@ -186,7 +185,7 @@ impl StepStats {
 }
 
 struct Item {
-    key: [u8; 21],
+    key: [u8; 25],
     chain: u8,
     mark: NftMark,
     account: Option<String>,
@@ -282,9 +281,9 @@ pub async fn step(
             }
         }
         for (k, v) in rows {
-            let (Ok(key), Some((account, _, chain)), Some(mark)) = (
-                <[u8; 21]>::try_from(k.as_slice()),
-                nft::parse_nft_key(&k),
+            let (Ok(key), Some((account, chain)), Some(mark)) = (
+                <[u8; 25]>::try_from(k.as_slice()),
+                nft::parse_nft_key(&k).map(|(a, _, _, c)| (a, c)),
                 NftMark::decode(&v),
             ) else {
                 continue;

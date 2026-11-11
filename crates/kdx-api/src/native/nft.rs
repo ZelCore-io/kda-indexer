@@ -17,21 +17,24 @@ use crate::{ApiError, ApiResult};
 type PathS = Result<Path<String>, axum::extract::rejection::PathRejection>;
 type QueryQ = Result<Query<Q>, axum::extract::rejection::QueryRejection>;
 
-/// Cursor: 34 hex digits, the token hash and chain of the last row listed.
-fn parse_cursor(c: &str) -> ApiResult<([u8; 16], u8)> {
+/// Cursor: 42 hex digits, the key tail (ledger, token hash, chain) of the last row listed.
+fn parse_cursor(c: &str) -> ApiResult<(u32, [u8; 16], u8)> {
     let bad = || ApiError::BadRequest("invalid cursor".into());
-    if c.len() != 34 || !c.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if c.len() != 42 || !c.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(bad());
     }
+    let byte = |i: usize| u8::from_str_radix(&c[i * 2..i * 2 + 2], 16).map_err(|_| bad());
+    let ledger = u32::from_str_radix(&c[..8], 16).map_err(|_| bad())?;
     let mut t = [0u8; 16];
     for (i, b) in t.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&c[i * 2..i * 2 + 2], 16).map_err(|_| bad())?;
+        *b = byte(4 + i)?;
     }
-    Ok((t, u8::from_str_radix(&c[32..34], 16).map_err(|_| bad())?))
+    Ok((ledger, t, byte(20)?))
 }
 
-fn cursor_text(t: &[u8; 16], chain: u8) -> String {
-    let mut s: String = t.iter().map(|b| format!("{b:02x}")).collect();
+fn cursor_text(ledger: u32, t: &[u8; 16], chain: u8) -> String {
+    let mut s = format!("{ledger:08x}");
+    s.extend(t.iter().map(|b| format!("{b:02x}")));
     s.push_str(&format!("{chain:02x}"));
     s
 }
@@ -75,8 +78,8 @@ pub async fn account(st: St, path: PathS, q: QueryQ) -> Response {
         let prefix = a.to_be_bytes();
         let from = match after {
             // The smallest key above the cursor row.
-            Some((t, c)) => {
-                let mut k = nft_key(a, &t, c).to_vec();
+            Some((l, t, c)) => {
+                let mut k = nft_key(a, l, &t, c).to_vec();
                 k.push(0);
                 k
             }
@@ -94,7 +97,7 @@ pub async fn account(st: St, path: PathS, q: QueryQ) -> Response {
             let n = rows.len();
             for (k, v) in &rows {
                 view.check_deadline()?;
-                let (Some((_, th, c)), Some(r)) = (parse_nft_key(k), NftRow::decode(v)) else {
+                let (Some((_, lg, th, c)), Some(r)) = (parse_nft_key(k), NftRow::decode(v)) else {
                     continue;
                 };
                 if !r.positive() || q.chain.is_some_and(|x| x != c) {
@@ -104,7 +107,7 @@ pub async fn account(st: St, path: PathS, q: QueryQ) -> Response {
                     more = true;
                     break 'pages;
                 }
-                last = Some(cursor_text(&th, c));
+                last = Some(cursor_text(lg, &th, c));
                 items.push(json!({
                     "token_id": r.token_id,
                     "ledger": d.name(DictKind::Module, r.ledger).unwrap_or_default(),
@@ -112,7 +115,7 @@ pub async fn account(st: St, path: PathS, q: QueryQ) -> Response {
                     "balance": r.balance,
                     "as_of_height": r.as_of,
                     "source": if r.source == SOURCE_EVENT { "event" } else { "local" },
-                    "stale": nft::is_dirty(&view.txn, a, &r.token_id, c)?,
+                    "stale": nft::is_dirty(&view.txn, a, lg, &r.token_id, c)?,
                 }));
             }
             match rows.last() {

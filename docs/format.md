@@ -608,14 +608,14 @@ reorg marks the affected balance rows dirty instead.
 | `Guards` | guard hash [16] = blake2b-128 of the guard JSON as returned; a resolved keyset reference under blake2b-128 of `keysetref:{chain}:{name}` | guard (or keyset) JSON bytes |
 | `KeyAccounts` | blake2b-128 of the public key [16], AccountId u32 | empty |
 | `Tokens` | ModuleId u32 | first_height u32, holders u64, kind u8 (0 = fungible) |
-| `NftBalances` | AccountId u32, blake2b-128(token id) [16], chain u8 | source u8 (1 = ledger event, 2 = `/local`), ledger ModuleId u32, as_of u32, token-id length u16, token id, balance text |
+| `NftBalances` | AccountId u32, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 | source u8 (1 = ledger event, 2 = `/local`), ledger ModuleId u32, as_of u32, token-id length u16, token id, balance text |
 | `NftDirty` | same | marked_height u32, ledger ModuleId u32, token id |
 
 `Meta` keys of the balance seed: `balances_seeded` (u32: the highest tail height when the seed
 finished), `balances_seed_cursor` (13 bytes while a seed runs: range start u32, range end u32,
 family u8, entity index u32) and `balances_reconcile_stats` (JSON heartbeat of the reconciler).
 
-NFT rows (`nft.rs`): a tail block's ledger events update `NftBalances` in the block's own txn.
+NFT rows (`nft.rs`): only events of trusted ledger modules (`[nft] ledgers`, default `marmalade.ledger` and `marmalade-v2.ledger`; a module merely named `ledger` is not trusted) count, and the ledger is part of the key. A tail block's ledger events update `NftBalances` in the block's own txn.
 A v2-shaped `RECONCILE [token-id, amount, sender, receiver]` (both `marmalade-v2.ledger` and
 `marmalade.ledger` emit it) upserts both parties' `current` balance; other ledger events of a
 module that emitted no `RECONCILE` in the tx mark the accounts they name `NftDirty`. An event

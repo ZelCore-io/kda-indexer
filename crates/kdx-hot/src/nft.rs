@@ -3,12 +3,14 @@
 //!
 //! | Table | Key | Value |
 //! |---|---|---|
-//! | `NftBalances` | AccountId u32, blake2b-128(token id) [16], chain u8 | source u8 (1 = ledger event, 2 = `/local`), ledger ModuleId u32, as_of u32, token-id length u16, token id, balance text |
+//! | `NftBalances` | AccountId u32, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 | source u8 (1 = ledger event, 2 = `/local`), ledger ModuleId u32, as_of u32, token-id length u16, token id, balance text |
 //! | `NftDirty` | same | marked_height u32, ledger ModuleId u32, token id |
 //!
-//! - A *ledger* is a module whose last name segment is `ledger` (`marmalade-v2.ledger`,
-//!   `marmalade.ledger`, and the copies deployed under a principal namespace). Only events whose
-//!   first parameter is a token id (`t:…`) count.
+//! - A *ledger* is a module on the allowlist ([`DEFAULT_LEDGERS`], or `[nft] ledgers`): anyone can
+//!   deploy a module named `ledger` and emit marmalade-shaped events for a real token id, so a
+//!   name suffix proves nothing. The ledger's ModuleId is part of the row key, so one ledger can
+//!   never overwrite another's row for the same token id. Only events whose first parameter is
+//!   a token id (`t:…`) count.
 //! - A v2 `RECONCILE [token-id, amount, sender {account, previous, current}, receiver {…}]`
 //!   carries the balances after the change: both parties' `current` are upserted (source 1; the
 //!   empty account of a mint or burn is skipped). Any other ledger event of a module that
@@ -24,6 +26,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use kdx_types::record::{decode_tx, EventRec};
@@ -47,20 +50,44 @@ pub const SOURCE_LOCAL: u8 = 2;
 /// Longest token id and account name the tables keep and `/local` is asked about.
 pub const MAX_TOKEN_LEN: usize = 256;
 
-/// `(AccountId, token hash, chain)` key of `NftBalances` and `NftDirty`.
-pub fn nft_key(account: u32, token: &[u8; 16], chain: u8) -> [u8; 21] {
-    let mut k = [0u8; 21];
+/// The marmalade ledgers on mainnet.
+pub const DEFAULT_LEDGERS: &[&str] = &["marmalade.ledger", "marmalade-v2.ledger"];
+
+static LEDGERS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Set the trusted ledger modules once at startup (`[nft] ledgers`); a second call is ignored.
+pub fn set_ledgers(l: Vec<String>) {
+    let _ = LEDGERS.set(l);
+}
+
+/// Whether `module` (qualified name) is a trusted ledger.
+pub fn is_ledger(module: &str) -> bool {
+    match LEDGERS.get() {
+        Some(l) => l.iter().any(|m| m == module),
+        None => DEFAULT_LEDGERS.contains(&module),
+    }
+}
+
+/// `(AccountId, ledger ModuleId, token hash, chain)` key of `NftBalances` and `NftDirty`.
+pub fn nft_key(account: u32, ledger: u32, token: &[u8; 16], chain: u8) -> [u8; 25] {
+    let mut k = [0u8; 25];
     k[..4].copy_from_slice(&account.to_be_bytes());
-    k[4..20].copy_from_slice(token);
-    k[20] = chain;
+    k[4..8].copy_from_slice(&ledger.to_be_bytes());
+    k[8..24].copy_from_slice(token);
+    k[24] = chain;
     k
 }
 
-pub fn parse_nft_key(k: &[u8]) -> Option<(u32, [u8; 16], u8)> {
-    if k.len() != 21 {
+pub fn parse_nft_key(k: &[u8]) -> Option<(u32, u32, [u8; 16], u8)> {
+    if k.len() != 25 {
         return None;
     }
-    Some((be_u32(&k[..4])?, k[4..20].try_into().ok()?, k[20]))
+    Some((
+        be_u32(&k[..4])?,
+        be_u32(&k[4..8])?,
+        k[8..24].try_into().ok()?,
+        k[24],
+    ))
 }
 
 pub fn token_hash(token_id: &str) -> [u8; 16] {
@@ -148,7 +175,7 @@ pub fn mark_dirty(
     ledger: u32,
     height: u32,
 ) -> Result<()> {
-    let k = nft_key(account, &token_hash(token_id), chain);
+    let k = nft_key(account, ledger, &token_hash(token_id), chain);
     if let Some(m) = txn
         .get(Table::NftDirty, &k)?
         .and_then(|v| NftMark::decode(&v))
@@ -176,11 +203,16 @@ pub fn upsert_event(
     height: u32,
     balance: &str,
 ) -> Result<bool> {
-    let k = nft_key(account, &token_hash(token_id), chain);
+    let k = nft_key(account, ledger, &token_hash(token_id), chain);
     if let Some(old) = txn
         .get(Table::NftBalances, &k)?
         .and_then(|v| NftRow::decode(&v))
     {
+        // The key holds the ledger; a row stored under it by another ledger (a corrupt
+        // store) is never replaced.
+        if old.ledger != ledger {
+            return Ok(false);
+        }
         if old.as_of > height || (old.as_of == height && old.source != SOURCE_EVENT) {
             return Ok(false);
         }
@@ -201,15 +233,21 @@ pub fn account_rows(txn: &impl Txn, account: u32) -> Result<Vec<([u8; 16], u8, N
     let p = account.to_be_bytes();
     let mut out = Vec::new();
     for (k, v) in txn.scan(Table::NftBalances, &p, |k| k.starts_with(&p))? {
-        if let (Some((_, t, c)), Some(r)) = (parse_nft_key(&k), NftRow::decode(&v)) {
+        if let (Some((_, _, t, c)), Some(r)) = (parse_nft_key(&k), NftRow::decode(&v)) {
             out.push((t, c, r));
         }
     }
     Ok(out)
 }
 
-pub fn is_dirty(txn: &impl Txn, account: u32, token_id: &str, chain: u8) -> Result<bool> {
-    let k = nft_key(account, &token_hash(token_id), chain);
+pub fn is_dirty(
+    txn: &impl Txn,
+    account: u32,
+    ledger: u32,
+    token_id: &str,
+    chain: u8,
+) -> Result<bool> {
+    let k = nft_key(account, ledger, &token_hash(token_id), chain);
     Ok(txn.get(Table::NftDirty, &k)?.is_some())
 }
 
@@ -247,10 +285,6 @@ fn num_text(v: &Value) -> Option<String> {
         Value::Object(o) => o.get("decimal").or_else(|| o.get("int")).and_then(num_text),
         _ => None,
     }
-}
-
-fn is_ledger(module: &str) -> bool {
-    module.rsplit('.').next() == Some("ledger")
 }
 
 fn account_name_ok(s: &str) -> bool {
@@ -596,8 +630,8 @@ mod tests {
             token_id: "t:x".into(),
         };
         assert_eq!(NftMark::decode(&m.encode()), Some(m));
-        let k = nft_key(3, &token_hash("t:abc"), 9);
-        assert_eq!(parse_nft_key(&k), Some((3, token_hash("t:abc"), 9)));
+        let k = nft_key(3, 4, &token_hash("t:abc"), 9);
+        assert_eq!(parse_nft_key(&k), Some((3, 4, token_hash("t:abc"), 9)));
     }
 
     #[test]
@@ -669,7 +703,7 @@ mod tests {
         // Same height, event source: a later event of the block replaces.
         assert!(upsert_event(&mut txn, 1, "t:a", 0, 5, 100, "0.0").unwrap());
         // A /local row at the same height wins.
-        let k = nft_key(1, &token_hash("t:a"), 0);
+        let k = nft_key(1, 5, &token_hash("t:a"), 0);
         let local = NftRow {
             source: SOURCE_LOCAL,
             ledger: 5,
@@ -693,10 +727,10 @@ mod tests {
         let mut txn = hot.rw().unwrap();
         mark_dirty(&mut txn, 1, "t:a", 0, 5, 50).unwrap();
         mark_dirty(&mut txn, 1, "t:a", 0, 5, 40).unwrap();
-        let k = nft_key(1, &token_hash("t:a"), 0);
+        let k = nft_key(1, 5, &token_hash("t:a"), 0);
         let m = NftMark::decode(&txn.get(Table::NftDirty, &k).unwrap().unwrap()).unwrap();
         assert_eq!(m.height, 50);
-        assert!(is_dirty(&txn, 1, "t:a", 0).unwrap());
+        assert!(is_dirty(&txn, 1, 5, "t:a", 0).unwrap());
         txn.commit().unwrap();
     }
 
@@ -753,16 +787,67 @@ mod tests {
             (2, 300, "1")
         );
         assert_eq!(rows[0].2.source, SOURCE_EVENT);
-        assert!(!is_dirty(&txn, alice, "t:tok", 2).unwrap());
+        assert!(!is_dirty(&txn, alice, ledger, "t:tok", 2).unwrap());
         assert_eq!(crate::tail::unwind_to(&mut txn, 2, 299).unwrap(), 1);
-        assert!(is_dirty(&txn, alice, "t:tok", 2).unwrap());
+        assert!(is_dirty(&txn, alice, ledger, "t:tok", 2).unwrap());
         let m = NftMark::decode(
-            &txn.get(Table::NftDirty, &nft_key(alice, &token_hash("t:tok"), 2))
-                .unwrap()
-                .unwrap(),
+            &txn.get(
+                Table::NftDirty,
+                &nft_key(alice, ledger, &token_hash("t:tok"), 2),
+            )
+            .unwrap()
+            .unwrap(),
         )
         .unwrap();
         assert_eq!((m.height, m.ledger), (300, ledger));
+        txn.commit().unwrap();
+    }
+
+    /// An event from a `*.ledger` module that is not on the allowlist changes nothing.
+    #[test]
+    fn spoofed_ledger_is_ignored() {
+        let mut d = MemDict::new();
+        d.intern(DictKind::Account, "k:alice");
+        let spoof = ev(
+            &mut d,
+            "free.x.ledger",
+            "RECONCILE",
+            json!(["t:tok", 1, {"account": "", "current": 0, "previous": 0},
+                   {"account": "k:alice", "current": 1, "previous": 0}]),
+        );
+        let spoof_t = ev(
+            &mut d,
+            "free.x.ledger",
+            "TRANSFER",
+            json!(["t:tok", "k:alice", "k:alice", 1]),
+        );
+        assert!(classify(&d, &[spoof, spoof_t]).is_empty());
+    }
+
+    /// Two trusted ledgers with the same token id keep separate rows.
+    #[test]
+    fn ledgers_keep_separate_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = crate::HotStore::open(dir.path(), crate::Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        assert!(upsert_event(&mut txn, 1, "t:a", 0, 5, 100, "1.0").unwrap());
+        assert!(upsert_event(&mut txn, 1, "t:a", 0, 6, 90, "7.0").unwrap());
+        mark_dirty(&mut txn, 1, "t:a", 0, 6, 91).unwrap();
+        let rows = account_rows(&txn, 1).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(is_dirty(&txn, 1, 6, "t:a", 0).unwrap());
+        assert!(!is_dirty(&txn, 1, 5, "t:a", 0).unwrap());
+        // A row under ledger 5's key that claims another ledger is left alone.
+        let k = nft_key(1, 5, &token_hash("t:a"), 0);
+        let bad = NftRow {
+            source: 1,
+            ledger: 6,
+            as_of: 1,
+            token_id: "t:a".into(),
+            balance: "9".into(),
+        };
+        txn.put(Table::NftBalances, &k, &bad.encode()).unwrap();
+        assert!(!upsert_event(&mut txn, 1, "t:a", 0, 5, 200, "2.0").unwrap());
         txn.commit().unwrap();
     }
 }

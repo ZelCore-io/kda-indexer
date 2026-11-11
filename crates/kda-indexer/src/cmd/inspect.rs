@@ -434,7 +434,7 @@ pub async fn nft_check(
     };
     let (mut checked, mut mismatches, mut skew) = (0u64, 0u64, 0u64);
     let mut out = Vec::new();
-    for (((account, _, chain), row), n) in picks.iter().map(|p| (&p.0, &p.1)).zip(1..) {
+    for (((account, _, _, chain), row), n) in picks.iter().map(|p| (&p.0, &p.1)).zip(1..) {
         let acct = s.dict.name(DictKind::Account, *account).map(str::to_owned);
         let ledger = s.dict.name(DictKind::Module, row.ledger).map(str::to_owned);
         let (Some(acct), Some(ledger)) = (acct, ledger) else {
@@ -444,7 +444,12 @@ pub async fn nft_check(
             .txn
             .get(
                 Table::NftDirty,
-                &nft_key(*account, &kdx_hot::nft::token_hash(&row.token_id), *chain),
+                &nft_key(
+                    *account,
+                    row.ledger,
+                    &kdx_hot::nft::token_hash(&row.token_id),
+                    *chain,
+                ),
             )?
             .is_some();
         let mut item = json!({
