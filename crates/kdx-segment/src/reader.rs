@@ -14,7 +14,7 @@ use crate::files::{file_name, FileKind};
 use crate::keys::Keys;
 use crate::manifest::{Manifest, RangeEntry, RangeKind};
 use crate::phf::{Index, KeyIndex};
-use crate::postings::{PostingIter, Postings};
+use crate::postings::{ListMemo, PostingIter, Postings};
 use crate::writer::{RangeInfo, SLOT_WIDTH};
 
 /// One opened range or step.
@@ -223,6 +223,19 @@ impl RangeReader {
         self.postings[f as usize].list_le(entity, max_rel)
     }
 
+    /// `postings_le` through a per-request memo; `range` is this reader's index in its
+    /// `Segments`.
+    pub fn postings_le_memo(
+        &self,
+        f: Family,
+        entity: u64,
+        max_rel: Option<u32>,
+        memo: &ListMemo,
+        range: u32,
+    ) -> Result<Option<PostingIter>> {
+        self.postings[f as usize].list_le_memo(entity, max_rel, Some((memo, range)))
+    }
+
     fn key(&self) -> (RangeKind, u32, u32, u64) {
         (
             self.info.kind,
@@ -317,24 +330,38 @@ impl Segments {
         entity: u64,
         max_txnum: Option<u64>,
     ) -> impl Iterator<Item = Result<u64>> + '_ {
+        self.postings_from_memo(f, entity, max_txnum, None)
+    }
+
+    /// `postings_from` with a per-request memo of parsed Roaring directories.
+    pub fn postings_from_memo<'a>(
+        &'a self,
+        f: Family,
+        entity: u64,
+        max_txnum: Option<u64>,
+        memo: Option<&'a ListMemo>,
+    ) -> impl Iterator<Item = Result<u64>> + 'a {
         self.ranges
             .iter()
+            .enumerate()
             .rev()
-            .filter(move |r| max_txnum.is_none_or(|m| r.info.first_txnum <= m))
-            .flat_map(move |r| {
+            .filter(move |(_, r)| max_txnum.is_none_or(|m| r.info.first_txnum <= m))
+            .flat_map(move |(ri, r)| {
                 let max_rel = max_txnum.and_then(|m| {
                     let rel = m - r.info.first_txnum;
                     (rel < r.info.tx_count).then(|| u32::try_from(rel).unwrap_or(u32::MAX))
                 });
-                let res: Box<dyn Iterator<Item = Result<u64>>> =
-                    match r.postings_le(f, entity, max_rel) {
-                        Ok(Some(it)) => Box::new(it.map(Ok)),
-                        Ok(None) => Box::new(std::iter::empty()),
-                        Err(e) => Box::new(std::iter::once(Err(e.context(format!(
-                            "postings of range {}..{}",
-                            r.info.start, r.info.end
-                        ))))),
-                    };
+                let res: Box<dyn Iterator<Item = Result<u64>>> = match match memo {
+                    Some(m) => r.postings_le_memo(f, entity, max_rel, m, ri as u32),
+                    None => r.postings_le(f, entity, max_rel),
+                } {
+                    Ok(Some(it)) => Box::new(it.map(Ok)),
+                    Ok(None) => Box::new(std::iter::empty()),
+                    Err(e) => Box::new(std::iter::once(Err(e.context(format!(
+                        "postings of range {}..{}",
+                        r.info.start, r.info.end
+                    ))))),
+                };
                 res
             })
     }
