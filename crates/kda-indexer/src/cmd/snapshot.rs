@@ -1,26 +1,32 @@
 //! `snapshot --out DIR`: a consistent copy of a data dir that can run beside a live `run`.
 //!
-//! Order (plan R-8): open the hot store read-only and begin a read txn T, then read
-//! `segments/manifest.json`, then link (or copy) every file it references, then copy the
-//! manifest bytes, then `copy_compact(T)` the hot store. T is older than the manifest, so
-//! the manifest frontier is at or above the frozen frontier T sees and the hot copy can
-//! only hold duplicate rows below the frontier, which freezer recovery resolves at `run`.
-//! When a merge deletes a step file between the manifest read and the link, the manifest is
-//! read again and the missing links are redone against it.
+//! Order (plan R-8): begin a fresh read txn T on the hot store, then read
+//! `segments/manifest.json`, then check that T sees every dictionary name the manifest's
+//! segments refer to (frontier at or below T's frozen frontier, or `dict_lens@<frontier>` in
+//! T, the check `Store::view` makes), then `copy_compact(T)` the hot store and drop T, then
+//! link (or copy) every file the manifest references with no txn held, then write the
+//! manifest bytes. T is older than the manifest, so the manifest frontier is at or above the
+//! frozen frontier T sees and the hot copy can only hold duplicate rows below the frontier,
+//! which freezer recovery resolves at `run`. When the name check fails (a backfill range or a
+//! freeze committed between T and the manifest read), T and the manifest are taken again after
+//! a short pause. When a merge deletes a step file before it is linked, T, the manifest and
+//! the hot copy are taken again; files linked earlier stay valid (immutable, named by range).
+//! T is never reused across manifest reads.
 //!
 //! Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`, anything else outside
 //! `segments/` and `hot/`. The snapshot is a data dir (`serve --data-dir DIR`, `run`).
+//! On a refusal nothing is created; on a later failure what this run created is removed.
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use kdx_hot::env::meta;
-use kdx_hot::{HotStore, Stage, Table, Txn};
+use kdx_hot::{dict, HotStore, RoTxn, Stage, Table, Txn};
 use kdx_segment::files::{fsync_dir, replace_file};
 use kdx_segment::Manifest;
 use serde_json::json;
@@ -30,6 +36,11 @@ use super::segments::segments_dir;
 
 /// Manifest re-reads when a merge removes files under the snapshot.
 const MAX_ATTEMPTS: usize = 5;
+/// Manifest re-reads while T cannot see the names of the manifest's newest segments (the
+/// freezer's hot txn follows its manifest commit; a backfill commits names first).
+const MAX_NAME_WAITS: usize = 30;
+/// Pause before such a re-read.
+const NAME_WAIT_PAUSE: Duration = Duration::from_secs(1);
 
 pub struct SnapshotArgs {
     pub data_dir: PathBuf,
@@ -46,6 +57,15 @@ pub struct SnapshotReport {
     pub linked: bool,
     pub attempts: usize,
     pub secs: f64,
+}
+
+/// Where `snapshot_with` calls its hook (argument two: the manifest read's number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Point {
+    /// T has begun; the manifest is not read yet.
+    Txn,
+    /// The manifest was read; nothing of this read is copied or linked yet.
+    Manifest,
 }
 
 pub fn run(a: SnapshotArgs) -> anyhow::Result<()> {
@@ -72,37 +92,167 @@ pub fn snapshot(a: &SnapshotArgs) -> anyhow::Result<SnapshotReport> {
             let (p, n) = v.split_once(':')?;
             (p == "snapshot-after-manifest").then(|| n.parse::<u64>().ok())?
         })
-        .map(std::time::Duration::from_secs);
-    snapshot_with(a, &mut |_| {
-        if let Some(d) = sleep {
+        .map(Duration::from_secs);
+    let hs = HotStore::open_ro(&hot_dir(&a.data_dir))?;
+    snapshot_with(a, &hs, NAME_WAIT_PAUSE, &mut |p, _| {
+        if let (Point::Manifest, Some(d)) = (p, sleep) {
             std::thread::sleep(d);
         }
     })
 }
 
-/// `snapshot` with a hook called after each manifest read (argument: the read's number),
-/// before its files are linked.
+/// `snapshot` of the hot store `hs` (opened on the data dir's `hot/`), with a hook at each
+/// [`Point`] and the pause before a re-read for missing names.
 fn snapshot_with(
     a: &SnapshotArgs,
-    after_manifest_read: &mut dyn FnMut(usize),
+    hs: &HotStore,
+    pause: Duration,
+    hook: &mut dyn FnMut(Point, usize),
 ) -> anyhow::Result<SnapshotReport> {
-    let t0 = Instant::now();
-    let src_seg = segments_dir(&a.data_dir);
-    let src_hot = hot_dir(&a.data_dir);
-    match fs::read_dir(&a.out) {
-        Ok(mut d) => {
-            if d.next().is_some() {
-                bail!("{} is not empty", a.out.display());
-            }
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("read {}", a.out.display())),
+    let created = prepare_out(&a.out, &a.data_dir)?;
+    let r = snapshot_into(a, hs, pause, hook);
+    if r.is_err() {
+        remove_created(&a.out, created.as_deref());
     }
-    fs::create_dir_all(&a.out).with_context(|| format!("create {}", a.out.display()))?;
-    let (out_abs, data_abs) = (fs::canonicalize(&a.out)?, fs::canonicalize(&a.data_dir)?);
+    r
+}
+
+/// Refuses an `--out` inside the data dir or not empty before creating anything, then creates
+/// it. Returns the topmost directory this created (None: `--out` existed, empty).
+fn prepare_out(out: &Path, data_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let data_abs =
+        fs::canonicalize(data_dir).with_context(|| format!("resolve {}", data_dir.display()))?;
+    let out_abs = resolve(out)?;
     if out_abs.starts_with(&data_abs) {
         bail!("--out must not be inside the data dir");
     }
+    match fs::read_dir(out) {
+        Ok(mut d) => {
+            if d.next().is_some() {
+                bail!("{} is not empty", out.display());
+            }
+            return Ok(None);
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("read {}", out.display())),
+    }
+    // The missing directories, topmost first.
+    let mut missing = Vec::new();
+    let mut p = out_abs.as_path();
+    while fs::symlink_metadata(p).is_err() {
+        missing.push(p.to_path_buf());
+        p = p.parent().context("--out has no existing ancestor")?;
+    }
+    missing.reverse();
+    fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
+    for d in &missing {
+        if let Some(parent) = d.parent() {
+            fsync_dir(parent)?;
+        }
+    }
+    Ok(missing.into_iter().next())
+}
+
+/// Absolute form of `p` with symlinks of its existing part resolved (the rest may not exist).
+fn resolve(p: &Path) -> anyhow::Result<PathBuf> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(p)
+    };
+    let mut rest = Vec::new();
+    let mut base = abs.as_path();
+    while fs::symlink_metadata(base).is_err() {
+        match base.components().next_back() {
+            Some(Component::Normal(n)) => rest.push(n.to_os_string()),
+            _ => bail!("cannot resolve {}", p.display()),
+        }
+        base = base
+            .parent()
+            .with_context(|| format!("cannot resolve {}", p.display()))?;
+    }
+    let mut r = fs::canonicalize(base).with_context(|| format!("resolve {}", base.display()))?;
+    r.extend(rest.iter().rev());
+    Ok(r)
+}
+
+/// After a failure: removes the directories this run created, or (an `--out` that existed
+/// empty) everything inside it. Best effort; the original error is what the caller sees.
+fn remove_created(out: &Path, created: Option<&Path>) {
+    let r = match created {
+        Some(top) => fs::remove_dir_all(top),
+        None => fs::read_dir(out).and_then(|d| {
+            for e in d {
+                let p = e?.path();
+                if p.is_dir() {
+                    fs::remove_dir_all(&p)?;
+                } else {
+                    fs::remove_file(&p)?;
+                }
+            }
+            Ok(())
+        }),
+    };
+    if let Err(e) = r {
+        tracing::warn!(out = %out.display(), "snapshot: cleanup after a failure: {e}");
+    }
+}
+
+/// Whether T sees every dictionary name that segments up to `frontier` refer to: the frozen
+/// frontier T sees covers it (a backfill commits names and frontier before the manifest; the
+/// tail interned the names of every block the freezer later froze), or `dict_lens@frontier`
+/// is in T (written in the MDBX commit that holds those names).
+fn names_visible(txn: &RoTxn, frontier: u32) -> anyhow::Result<bool> {
+    Ok(frontier <= txn.frozen_frontier()? || txn.meta(&dict::lens_key(frontier))?.is_some())
+}
+
+/// What `SNAPSHOT.json` records from T.
+struct HotInfo {
+    network: Option<String>,
+    frozen_frontier: Option<u32>,
+    next_txnum: Option<u64>,
+    tail: serde_json::Map<String, serde_json::Value>,
+}
+
+fn hot_info(txn: &RoTxn) -> anyhow::Result<HotInfo> {
+    let u32_of = |k: &str| -> Option<u32> {
+        let v = txn.get(Table::Meta, k.as_bytes()).ok()??;
+        Some(u32::from_be_bytes(v.as_slice().try_into().ok()?))
+    };
+    let u64_of = |k: &str| -> Option<u64> {
+        let v = txn.get(Table::Meta, k.as_bytes()).ok()??;
+        Some(u64::from_be_bytes(v.as_slice().try_into().ok()?))
+    };
+    let network = txn
+        .get(Table::Meta, meta::NETWORK.as_bytes())?
+        .map(|v| String::from_utf8_lossy(&v).into_owned());
+    let mut tail = serde_json::Map::new();
+    for (k, v) in txn.scan(Table::StageCheckpoint, &[Stage::Tail as u8], |k| {
+        k.first() == Some(&(Stage::Tail as u8))
+    })? {
+        if let (Some(c), Some(h)) = (k.get(1), v.get(..4)) {
+            tail.insert(
+                c.to_string(),
+                json!(u32::from_be_bytes(h.try_into().unwrap_or_default())),
+            );
+        }
+    }
+    Ok(HotInfo {
+        network,
+        frozen_frontier: u32_of(meta::FROZEN_FRONTIER),
+        next_txnum: u64_of(meta::NEXT_TXNUM),
+        tail,
+    })
+}
+
+fn snapshot_into(
+    a: &SnapshotArgs,
+    hs: &HotStore,
+    pause: Duration,
+    hook: &mut dyn FnMut(Point, usize),
+) -> anyhow::Result<SnapshotReport> {
+    let t0 = Instant::now();
+    let src_seg = segments_dir(&a.data_dir);
     let out_seg = a.out.join("segments");
     let out_hot = a.out.join("hot");
     fs::create_dir_all(&out_seg)?;
@@ -114,23 +264,48 @@ fn snapshot_with(
         );
     }
 
-    // T first, then the manifest.
-    let hs = HotStore::open_ro(&src_hot)?;
-    let txn = hs.ro()?;
     let mut rep = SnapshotReport {
         linked: !a.copy,
         ..Default::default()
     };
     let mut have: HashSet<PathBuf> = HashSet::new();
-    let (manifest_bytes, manifest) = loop {
+    let (mut merge_reads, mut name_waits) = (0usize, 0usize);
+    let (manifest_bytes, manifest, info) = loop {
         rep.attempts += 1;
+        // A fresh T before every manifest read.
+        let txn = hs.ro()?;
+        hook(Point::Txn, rep.attempts);
         let bytes = match fs::read(src_seg.join("manifest.json")) {
             Ok(b) => Some(b),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e).context("read manifest.json"),
         };
         let m = bytes.as_deref().map(Manifest::parse).transpose()?;
-        after_manifest_read(rep.attempts);
+        hook(Point::Manifest, rep.attempts);
+        if let Some(m) = &m {
+            if !names_visible(&txn, m.frontier)? {
+                drop(txn);
+                name_waits += 1;
+                if name_waits >= MAX_NAME_WAITS {
+                    bail!(
+                        "the manifest (frontier {}) kept listing segments whose dictionary names \
+                         the hot store had not committed ({MAX_NAME_WAITS} reads): a backfill \
+                         or a freeze is committing, try again",
+                        m.frontier
+                    );
+                }
+                std::thread::sleep(pause);
+                continue;
+            }
+        }
+        // The hot copy from T, then T is dropped: the segment files are placed with no txn
+        // held (a `--copy` of every file can take a long time).
+        if out_hot.exists() {
+            fs::remove_dir_all(&out_hot)?;
+        }
+        hs.copy_compact(&txn, &out_hot)?;
+        let info = hot_info(&txn)?;
+        drop(txn);
         let mut missing = false;
         if let Some(m) = &m {
             for f in m.files() {
@@ -148,9 +323,10 @@ fn snapshot_with(
             }
         }
         if !missing {
-            break (bytes, m);
+            break (bytes, m, info);
         }
-        if rep.attempts >= MAX_ATTEMPTS {
+        merge_reads += 1;
+        if merge_reads >= MAX_ATTEMPTS {
             bail!("segment files kept changing under the snapshot ({MAX_ATTEMPTS} manifest reads)");
         }
     };
@@ -164,49 +340,26 @@ fn snapshot_with(
         replace_file(&out_seg.join("manifest.json"), b)?;
     }
     fsync_dir(&out_seg)?;
-
-    hs.copy_compact(&txn, &out_hot)?;
     rep.hot_bytes = fs::metadata(out_hot.join("mdbx.dat"))?.len();
     fsync_dir(&out_hot)?;
 
-    let u32_of = |k: &str| -> Option<u32> {
-        let v = txn.get(Table::Meta, k.as_bytes()).ok()??;
-        Some(u32::from_be_bytes(v.as_slice().try_into().ok()?))
-    };
-    let u64_of = |k: &str| -> Option<u64> {
-        let v = txn.get(Table::Meta, k.as_bytes()).ok()??;
-        Some(u64::from_be_bytes(v.as_slice().try_into().ok()?))
-    };
-    let network = txn
-        .get(Table::Meta, meta::NETWORK.as_bytes())?
-        .map(|v| String::from_utf8_lossy(&v).into_owned())
+    let network = info
+        .network
         .or_else(|| manifest.as_ref().map(|m| m.network.clone()));
-    let mut tail = serde_json::Map::new();
-    for (k, v) in txn.scan(Table::StageCheckpoint, &[Stage::Tail as u8], |k| {
-        k.first() == Some(&(Stage::Tail as u8))
-    })? {
-        if let (Some(c), Some(h)) = (k.get(1), v.get(..4)) {
-            tail.insert(
-                c.to_string(),
-                json!(u32::from_be_bytes(h.try_into().unwrap_or_default())),
-            );
-        }
-    }
-    let info = json!({
+    let snap = json!({
         "format": {"hot": kdx_hot::FORMAT_VERSION, "segments": kdx_segment::manifest::FORMAT_VERSION},
         "network": network,
         "frozen_frontier": manifest.as_ref().map_or(0, |m| m.frontier),
-        "hot_frozen_frontier": u32_of(meta::FROZEN_FRONTIER),
-        "next_txnum": u64_of(meta::NEXT_TXNUM),
-        "tail_checkpoints": tail,
+        "hot_frozen_frontier": info.frozen_frontier,
+        "next_txnum": info.next_txnum,
+        "tail_checkpoints": info.tail,
         "manifest_blake3": manifest_bytes.as_deref().map(|b| blake3::hash(b).to_hex().to_string()),
         "binary_version": env!("CARGO_PKG_VERSION"),
         "created_at": utc_iso(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
     });
-    drop(txn);
     replace_file(
         &a.out.join("SNAPSHOT.json"),
-        serde_json::to_string_pretty(&info)?.as_bytes(),
+        serde_json::to_string_pretty(&snap)?.as_bytes(),
     )?;
     fsync_dir(&a.out)?;
     rep.secs = t0.elapsed().as_secs_f64();
@@ -252,12 +405,14 @@ fn utc_iso(secs: u64) -> String {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::time::Duration;
 
-    use kdx_hot::{Geometry, HotStore};
+    use kdx_hot::{dict, HotStore, Txn};
+    use kdx_hot::{Geometry, Table};
     use kdx_segment::manifest::{RangeEntry, RangeKind};
     use kdx_segment::Manifest;
 
-    use super::{snapshot_with, utc_iso, SnapshotArgs};
+    use super::{snapshot_with, utc_iso, Point, SnapshotArgs, MAX_NAME_WAITS};
 
     fn entry(start: u32, end: u32, first_txnum: u64) -> RangeEntry {
         RangeEntry {
@@ -276,6 +431,22 @@ mod tests {
         }
     }
 
+    /// One MDBX commit as a backfill range makes it: a name, the frozen frontier and
+    /// `dict_lens@frontier`. Runs on its own thread (the caller may hold a read txn).
+    fn commit_names(hs: &HotStore, frontier: u32, name: &[u8]) {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut t = hs.rw().unwrap();
+                t.set_meta("test_name", name).unwrap();
+                t.set_frozen_frontier(frontier).unwrap();
+                t.set_meta(&dict::lens_key(frontier), &[0u8; 20]).unwrap();
+                t.commit().unwrap();
+            })
+            .join()
+            .unwrap();
+        });
+    }
+
     /// A merge replaces step files between the manifest read and the links: the snapshot
     /// reads the manifest again, links the merged range, drops the files of the old read and
     /// writes the new manifest bytes.
@@ -286,7 +457,7 @@ mod tests {
         let seg = data.join("segments");
         fs::create_dir_all(&seg).unwrap();
         let hs = HotStore::open(&data.join("hot"), Geometry::default()).unwrap();
-        drop(hs);
+        commit_names(&hs, 40, b"a");
         let (a, b, c) = (entry(0, 20, 0), entry(20, 40, 10), entry(0, 40, 0));
         let c = RangeEntry {
             tx_count: 20,
@@ -308,7 +479,10 @@ mod tests {
             copy: false,
         };
         let mut reads = 0;
-        let rep = snapshot_with(&args, &mut |n| {
+        let rep = snapshot_with(&args, &hs, Duration::ZERO, &mut |p, n| {
+            if p != Point::Manifest {
+                return;
+            }
             reads = n;
             if n == 1 {
                 // The merge: new range files, new manifest, then the step files go away
@@ -336,8 +510,114 @@ mod tests {
         assert_eq!(have, want);
         assert!(out.join("hot/mdbx.dat").is_file());
         assert!(out.join("SNAPSHOT.json").is_file());
-        // A second snapshot into the non-empty dir is refused.
-        assert!(snapshot_with(&args, &mut |_| {}).is_err());
+        // A second snapshot into the non-empty dir is refused and leaves it as it was.
+        assert!(snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {}).is_err());
+        assert!(out.join("SNAPSHOT.json").is_file());
+    }
+
+    /// I2: a backfill range commits its names after T began and its manifest before the
+    /// manifest read. That read is refused (T cannot see the names), nothing is copied from
+    /// T, and T plus the manifest are taken again; the hot copy then holds the names.
+    #[test]
+    fn manifest_newer_than_names_in_txn_is_reread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let seg = data.join("segments");
+        fs::create_dir_all(&seg).unwrap();
+        let hs = HotStore::open(&data.join("hot"), Geometry::default()).unwrap();
+        commit_names(&hs, 20, b"old");
+        let (a, b) = (entry(0, 20, 0), entry(20, 40, 10));
+        let mut m1 = Manifest::new("net");
+        m1.push(a.clone()).unwrap();
+        m1.commit(&seg).unwrap();
+        put(&seg, &a);
+        let mut m2 = m1.clone();
+        m2.push(b.clone()).unwrap();
+        let out = tmp.path().join("out");
+        let args = SnapshotArgs {
+            data_dir: data.clone(),
+            out: out.clone(),
+            copy: false,
+        };
+        let mut seen = Vec::new();
+        let rep = snapshot_with(&args, &hs, Duration::ZERO, &mut |p, n| {
+            seen.push((p, n, out.join("hot/mdbx.dat").exists()));
+            if (p, n) == (Point::Txn, 1) {
+                // The backfill: MDBX (names, frontier 40, dict_lens@40), files, manifest.
+                commit_names(&hs, 40, b"new");
+                put(&seg, &b);
+                m2.commit(&seg).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(rep.attempts, 2);
+        // No hot copy was taken from the first T.
+        assert_eq!(
+            seen,
+            vec![
+                (Point::Txn, 1, false),
+                (Point::Manifest, 1, false),
+                (Point::Txn, 2, false),
+                (Point::Manifest, 2, false),
+            ]
+        );
+        assert_eq!(Manifest::load(&out.join("segments")).unwrap().unwrap(), m2);
+        let copy = HotStore::open_ro(&out.join("hot")).unwrap();
+        let t = copy.ro().unwrap();
+        assert_eq!(t.frozen_frontier().unwrap(), 40);
+        assert_eq!(
+            t.get(Table::Meta, b"test_name").unwrap().as_deref(),
+            Some(&b"new"[..])
+        );
+    }
+
+    /// I2 and M5: a manifest whose names never reach the hot store is refused after
+    /// `MAX_NAME_WAITS` reads; the snapshot leaves nothing behind (a directory it created is
+    /// removed, an existing empty one is emptied). An `--out` inside the data dir is refused
+    /// before anything is created.
+    #[test]
+    fn refusals_leave_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let seg = data.join("segments");
+        fs::create_dir_all(&seg).unwrap();
+        let hs = HotStore::open(&data.join("hot"), Geometry::default()).unwrap();
+        let a = entry(0, 20, 0);
+        let mut m = Manifest::new("net");
+        m.push(a.clone()).unwrap();
+        m.commit(&seg).unwrap();
+        put(&seg, &a);
+        let run = |out: &Path| {
+            let args = SnapshotArgs {
+                data_dir: data.clone(),
+                out: out.to_path_buf(),
+                copy: false,
+            };
+            let mut reads = 0;
+            let e = snapshot_with(&args, &hs, Duration::ZERO, &mut |p, _| {
+                reads += usize::from(p == Point::Manifest);
+            })
+            .unwrap_err();
+            (e.to_string(), reads)
+        };
+        let out = tmp.path().join("new/out");
+        let (e, reads) = run(&out);
+        assert!(e.contains("dictionary names"), "{e}");
+        assert_eq!(reads, MAX_NAME_WAITS);
+        assert!(!tmp.path().join("new").exists());
+        let empty = tmp.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        run(&empty);
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+        let inside = seg.join("x");
+        let args = SnapshotArgs {
+            data_dir: data.clone(),
+            out: inside.clone(),
+            copy: false,
+        };
+        let e = snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {}).unwrap_err();
+        assert!(e.to_string().contains("inside the data dir"), "{e}");
+        assert!(!inside.exists());
     }
 
     #[test]

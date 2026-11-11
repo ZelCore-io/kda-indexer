@@ -235,18 +235,26 @@ kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
   `--copy` it must be on the same filesystem as the source: the segment files are
   **hard-linked** (they are immutable), so the snapshot costs almost no extra space until a
   merge replaces files in the source. With `--copy` they are copied and `fsync`ed.
-- Order: the command begins a read transaction on the hot store, reads `segments/manifest.json`,
-  links every file it names, writes the manifest bytes, then writes a **compacted** copy of
-  the hot store from that same transaction into `DIR/hot`. If a merge removes a step file
-  before it is linked, the manifest is read again and the missing links are redone (up to
-  five reads). Files of an earlier read that the final manifest no longer names are removed.
+- Order: the command begins a fresh read transaction on the hot store, reads
+  `segments/manifest.json`, checks that the transaction sees every dictionary name the
+  manifest's segments refer to, writes a **compacted** copy of the hot store from that
+  transaction into `DIR/hot` and closes the transaction, then links every file the manifest
+  names and writes the manifest bytes. If the name check fails (a backfill range or a freeze
+  committed between the two reads), the transaction and the manifest are taken again after a
+  one-second pause (up to 30 reads, then the command fails and asks to retry). If a merge
+  removes a step file before it is linked, the transaction, the manifest and the hot copy are
+  taken again and the missing links are redone (up to five reads). Files of an earlier read
+  that the final manifest no longer names are removed.
+- A refused `--out` (inside the data dir, not empty) creates nothing; after any later failure
+  the command removes what it created, so the same `--out` can be used again.
 - Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`.
 - `DIR/SNAPSHOT.json` records the format versions, network, frozen frontier, `next_txnum`, the
   tail checkpoint per chain, the manifest's blake3, the binary version and the creation time
   (no paths).
-- The read transaction stays open for the whole hot copy (minutes on a large store), so the
-  source writer cannot recycle the pages that transaction still sees. Do not start a snapshot
-  when the volume is short of free space; run the checks of "Before any big write" first.
+- The read transaction stays open for the hot copy only (minutes on a large store), not for
+  the segment links or copies, so the source writer cannot recycle the pages that transaction
+  still sees for that long. Do not start a snapshot when the volume is short of free space;
+  run the checks of "Before any big write" first.
 
 A local replica:
 
