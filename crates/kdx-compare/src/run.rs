@@ -641,7 +641,10 @@ impl Ctx {
             && sb == 200
         {
             let a_tip = self.tips.a_tip();
-            if let Some(b_tip) = self.oracle_tip(tb).await {
+            // chainweb-data's /txs/recent can time out (seen live 01:32Z, supply 2730 KDA
+            // lower): the tip is then taken as A's and the 240-height floor applies.
+            {
+                let b_tip = self.oracle_tip(tb).await.unwrap_or(a_tip);
                 let x = va.get("coinsInCirculation").and_then(num_value);
                 let y = vb.get("coinsInCirculation").and_then(num_value);
                 if let (Some(x), Some(y)) = (x, y) {

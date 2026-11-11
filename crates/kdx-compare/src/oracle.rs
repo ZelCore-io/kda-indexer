@@ -159,21 +159,17 @@ pub fn from_poll(poll: &Value, header: &Value, tx: Option<&DecodedTx>) -> Value 
         let null = Value::Null;
         let c = tx.cmd_parsed.as_ref().unwrap_or(&null);
         let meta = c.get("meta").cloned().unwrap_or(Value::Null);
-        let exec = c.pointer("/payload/exec");
-        let cont = c.pointer("/payload/cont");
+        // A cmd can write the unused payload kind as an explicit null (seen live: cont cmds
+        // with `"exec": null`, ihLeKStMj9c6... chain 1 height 3264261, cont data `{}`).
+        let exec = c.pointer("/payload/exec").filter(|v| !v.is_null());
+        let cont = c.pointer("/payload/cont").filter(|v| !v.is_null());
         let p = |k: &str| exec.or(cont).map(|x| get(x, k)).unwrap_or(Value::Null);
         let cp = |k: &str| cont.map(|x| get(x, k)).unwrap_or(Value::Null);
         m.insert(
             "code".into(),
             exec.map(|x| get(x, "code")).unwrap_or(Value::Null),
         );
-        // A cont cmd without data: chainweb-data and compat show `{}` (seen live:
-        // ihLeKStMj9c6... chain 1 height 3264261, 6ROrw0-_pSbA... chain 3 height 3320508).
-        let data = match p("data") {
-            Value::Null if exec.is_none() && cont.is_some() => json!({}),
-            d => d,
-        };
-        m.insert("data".into(), data);
+        m.insert("data".into(), p("data"));
         m.insert("nonce".into(), get(c, "nonce"));
         m.insert("sender".into(), get(&meta, "sender"));
         m.insert("gasLimit".into(), get(&meta, "gasLimit"));
