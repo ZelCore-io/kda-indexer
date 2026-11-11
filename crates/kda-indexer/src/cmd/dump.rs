@@ -413,7 +413,8 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
     }
     let mut merkle_failures = 0;
     if let Some(m) = &sum.merkle {
-        merkle_failures = m.total.mismatch + m.records_disagree;
+        // Every era must verify, legacy included.
+        merkle_failures = m.total.mismatch + m.total.mismatch_legacy + m.records_disagree;
         eprintln!(
             "merkle: {} blocks, {} verified, {} mismatch_legacy, {} mismatch (non-legacy), {} records_disagree",
             m.total.blocks, m.total.verified, m.total.mismatch_legacy, m.total.mismatch, m.records_disagree

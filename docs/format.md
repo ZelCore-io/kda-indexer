@@ -532,6 +532,8 @@ re-renders each block's leaves from its stored records (hot store first, then se
 recomputes the payload roots and sorts blocks into `ok` (verified, bit set),
 `ok_unflagged` (verified, bit clear), `bad_flagged` (mismatch with the bit set: corruption),
 `bad_legacy` and `bad_other` (mismatch, bit clear). A record that does not render counts
-under `errors`. It exits 1 on any `bad_flagged`, `bad_other` or error. It opens the store
+under `errors`. It exits 1 on anything but `ok`: every era must verify, legacy included, and
+`ok_unflagged` points to a bit-setting or render bug (a v2 store sets the bit on every block
+that verifies). It opens the store
 read-only and takes a fresh read txn per 1,000 heights (or 1,000 samples). The default is a
 sample of 1,000 random blocks.

@@ -65,7 +65,7 @@ struct Tally {
     absent: u64,
     hot: u64,
     frozen: u64,
-    /// First `LIST_MAX` blocks of the bad classes and errors.
+    /// First `LIST_MAX` blocks of the bad classes, `ok_unflagged` and errors.
     bad: Vec<Bad>,
 }
 
@@ -78,8 +78,10 @@ struct Bad {
 }
 
 impl Tally {
+    /// Every era must verify (legacy included): any mismatch, any verified block whose bit
+    /// is clear (a bit-setting or render bug in a v2 store) and any error fails.
     fn failed(&self) -> bool {
-        self.bad_flagged + self.bad_other + self.errors > 0
+        self.ok_unflagged + self.bad_flagged + self.bad_legacy + self.bad_other + self.errors > 0
     }
 
     fn note(&mut self, chain: u8, height: u32, class: &'static str, detail: String) {
@@ -169,7 +171,15 @@ fn check_one(cx: &mut Ctx, txn: &RoTxn, t: &mut Tally, chain: u8, height: u32) {
     let flagged = b.merkle_verified;
     match r {
         Ok(MerkleResult::Verified) if flagged => t.ok += 1,
-        Ok(MerkleResult::Verified) => t.ok_unflagged += 1,
+        Ok(MerkleResult::Verified) => {
+            t.ok_unflagged += 1;
+            t.note(
+                chain,
+                height,
+                "ok_unflagged",
+                format!("verifies, bit clear ({src}, hash {})", b.hash),
+            );
+        }
         Ok(MerkleResult::Mismatch { which, legacy }) => {
             let class = if flagged {
                 t.bad_flagged += 1;

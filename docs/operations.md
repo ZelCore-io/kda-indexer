@@ -211,8 +211,8 @@ Alerts to set up in your own alerting:
 
 - chain lag above 20 blocks for 5 minutes on any chain (`kdx_chain_lag_blocks`);
 - any `kdx_chain_halted` equal to 1 (see "Halted chains" above);
-- any increase of `kdx_merkle_blocks_total{result="mismatch"}` (a modern payload that does
-  not verify);
+- any increase of `kdx_merkle_blocks_total` with `result` other than `verified`
+  (`mismatch_legacy` or `mismatch`: every era must verify);
 - `kdx_disk_free_bytes` below 15% of the volume;
 - a reorg deeper than 50 (`kdx_reorg_depth`);
 - the comparison harness reporting unexplained differences over an hour;
