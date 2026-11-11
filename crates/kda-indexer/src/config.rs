@@ -344,6 +344,33 @@ impl Default for BalancesConfig {
     }
 }
 
+/// Most `/local` calls per second (B-1, H-1).
+pub const MAX_LOCAL_RPS: u32 = 50;
+
+impl BalancesConfig {
+    /// Value ranges (M-6): `local_rps` 0 would turn both `/local` rate limiters off.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=MAX_LOCAL_RPS).contains(&self.local_rps),
+            "balances.local_rps must be in 1..={MAX_LOCAL_RPS} (got {})",
+            self.local_rps
+        );
+        anyhow::ensure!(
+            (1..=64).contains(&self.local_concurrency),
+            "balances.local_concurrency must be in 1..=64 (got {})",
+            self.local_concurrency
+        );
+        anyhow::ensure!(
+            self.module_share >= 1
+                && self.module_rows >= 1
+                && self.account_rows >= 1
+                && self.recheck_hours >= 1,
+            "balances.module_share, module_rows, account_rows and recheck_hours must be >= 1"
+        );
+        Ok(())
+    }
+}
+
 /// `[nft]`: which ledger modules the NFT tables trust.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -428,6 +455,7 @@ impl Config {
             "backfill.etl_mem_mb must be >= 16 and backfill.mem_cap_mb >= 512"
         );
         anyhow::ensure!(b.dict_samples > 0, "backfill.dict_samples must be > 0");
+        self.balances.validate()?;
         let s = &self.search;
         s.mode_sel()?;
         anyhow::ensure!(
@@ -468,3 +496,35 @@ impl Config {
 
 /// The node's own cap on `payload/outputs/batch` entries.
 pub const MAX_BATCH_SIZE: u32 = 1000;
+
+#[cfg(test)]
+mod balances_tests {
+    use super::*;
+
+    /// M-6: `local_rps` 0 (no limit) or above the B-1 budget, and zero concurrency, are refused.
+    #[test]
+    fn balances_values_are_validated() {
+        let ok = BalancesConfig::default();
+        assert!(ok.validate().is_ok());
+        for bad in [
+            BalancesConfig {
+                local_rps: 0,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                local_rps: MAX_LOCAL_RPS + 1,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                local_concurrency: 0,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                account_rows: 0,
+                ..ok.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+}

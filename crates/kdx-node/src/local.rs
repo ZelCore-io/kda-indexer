@@ -38,7 +38,8 @@ pub const MAX_NAME_LEN: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LocalOpts {
-    /// Calls started per second (`balances.local_rps`); 0 = no limit of its own.
+    /// Calls started per second (`balances.local_rps`, 1..=50 in the config); 0 = no limit of
+    /// its own (tests only).
     pub rps: u32,
     /// Calls in flight (`balances.local_concurrency`).
     pub concurrency: usize,
@@ -121,11 +122,36 @@ pub fn command(network: &str, chain: u8, code: &str, data: &Value, now_secs: u64
     json!({"hash": hash, "sigs": [], "cmd": cmd})
 }
 
+/// Longest decimal text accepted from a node answer (bytes).
+pub const MAX_DECIMAL_LEN: usize = 128;
+
+/// A decimal text (M-7): optional `-`, digits, optional `.` and digits, optional exponent; at
+/// most [`MAX_DECIMAL_LEN`] bytes.
+pub fn is_decimal(s: &str) -> bool {
+    if s.is_empty() || s.len() > MAX_DECIMAL_LEN {
+        return false;
+    }
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let (mant, exp) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let (int, frac) = match mant.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (mant, None),
+    };
+    digits(int)
+        && frac.is_none_or(digits)
+        && exp.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)))
+}
+
 /// A decimal as the node printed it: a JSON number's text, `{"decimal": …}` or `{"int": …}`.
+/// A string must be a decimal text ([`is_decimal`]); anything else is no decimal.
 pub fn decimal_text(v: &Value) -> Option<String> {
     match v {
         Value::Number(n) => Some(n.to_string()),
-        Value::String(s) => Some(s.clone()),
+        Value::String(s) => is_decimal(s).then(|| s.clone()),
         Value::Object(o) => o
             .get("decimal")
             .or_else(|| o.get("int"))
@@ -395,6 +421,26 @@ mod tests {
             b["hash"].as_str().unwrap(),
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h)
         );
+    }
+
+    /// M-7: a hostile `details` answer cannot store arbitrary text as a balance.
+    #[test]
+    fn balance_text_must_be_a_decimal() {
+        for ok in ["0", "12.5", "-3.0", "1e-8", "1.5E+3", "000.000"] {
+            assert_eq!(decimal_text(&json!(ok)).as_deref(), Some(ok), "{ok}");
+            assert!(decimal_text(&json!({ "decimal": ok })).is_some());
+        }
+        let long = "9".repeat(MAX_DECIMAL_LEN + 1);
+        for bad in [
+            "", "-", ".5", "1.", "1e", "abc", "1.0 ", "<script>", "1..2", &long,
+        ] {
+            assert_eq!(decimal_text(&json!(bad)), None, "{bad}");
+        }
+        assert!(details_of(Local::Found {
+            value: json!({"balance": "lots", "guard": null}),
+            height: 1,
+        })
+        .is_err());
     }
 
     #[test]
