@@ -141,32 +141,38 @@ impl NftRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NftMark {
     pub height: u32,
+    /// Id of the write txn that last wrote the mark (see `balances::Mark`): a reconcile
+    /// deletes only the exact mark it read (SR-1, I-5, M-3).
+    pub seq: u64,
     pub ledger: u32,
     pub token_id: String,
 }
 
 impl NftMark {
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(8 + self.token_id.len());
+        let mut v = Vec::with_capacity(16 + self.token_id.len());
         v.extend_from_slice(&self.height.to_be_bytes());
+        v.extend_from_slice(&self.seq.to_be_bytes());
         v.extend_from_slice(&self.ledger.to_be_bytes());
         v.extend_from_slice(self.token_id.as_bytes());
         v
     }
 
     pub fn decode(v: &[u8]) -> Option<NftMark> {
-        if v.len() < 8 {
+        if v.len() < 16 {
             return None;
         }
         Some(NftMark {
             height: be_u32(&v[..4])?,
-            ledger: be_u32(&v[4..8])?,
-            token_id: std::str::from_utf8(&v[8..]).ok()?.to_owned(),
+            seq: u64::from_be_bytes(v[4..12].try_into().ok()?),
+            ledger: be_u32(&v[12..16])?,
+            token_id: std::str::from_utf8(&v[16..]).ok()?.to_owned(),
         })
     }
 }
 
-/// Mark a row dirty at `height`; an existing mark keeps the higher height.
+/// Mark a row dirty at `height`; an existing mark keeps the higher height, and every write takes
+/// this txn's id (a mark rewritten after a reconcile read it never equals what it read).
 pub fn mark_dirty(
     txn: &mut RwTxn<'_>,
     account: u32,
@@ -176,16 +182,13 @@ pub fn mark_dirty(
     height: u32,
 ) -> Result<()> {
     let k = nft_key(account, ledger, &token_hash(token_id), chain);
-    if let Some(m) = txn
+    let old = txn
         .get(Table::NftDirty, &k)?
         .and_then(|v| NftMark::decode(&v))
-    {
-        if m.height >= height {
-            return Ok(());
-        }
-    }
+        .map_or(0, |m| m.height);
     let mark = NftMark {
-        height,
+        height: old.max(height),
+        seq: txn.txn_id()?,
         ledger,
         token_id: token_id.to_owned(),
     };
@@ -626,6 +629,7 @@ mod tests {
         assert!(r.positive());
         let m = NftMark {
             height: 5,
+            seq: 77,
             ledger: 1,
             token_id: "t:x".into(),
         };

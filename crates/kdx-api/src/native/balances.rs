@@ -5,7 +5,8 @@
 //! - `as_of_height` is the node tip of the row's last `/local` read (for
 //!   an absent row, the chain's tail height at the call).
 //! - `stale: true` when the row is also in `BalanceDirty` (B-3): a block changed it after that
-//!   read, or a reorg unwound one.
+//!   read, or a reorg unwound one; or when the row is `unverified` (its re-read after a change
+//!   failed or was parked, I-5).
 //! - Rows the node reported absent are left out.
 
 use axum::extract::{Path, Query};
@@ -47,7 +48,7 @@ fn row_json(
         "balance": r.balance,
         "guard": guard_json(view, &r.guard)?,
         "as_of_height": r.as_of,
-        "stale": balances::is_dirty(&view.txn, account, m, c)?,
+        "stale": r.unverified || balances::is_dirty(&view.txn, account, m, c)?,
     }))
 }
 
@@ -171,7 +172,7 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
                     "chain": c,
                     "balance": r.balance,
                     "as_of_height": r.as_of,
-                    "stale": balances::is_dirty(&view.txn, a, m, c)?,
+                    "stale": r.unverified || balances::is_dirty(&view.txn, a, m, c)?,
                 }));
             }
             items.push(json!({

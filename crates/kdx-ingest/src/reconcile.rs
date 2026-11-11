@@ -7,8 +7,11 @@
 //!   `{module}.details` for each through [`LocalClient`] (its own token bucket and concurrency
 //!   cap); resolve keyset references with `describe-keyset`; write `Balances`, `Guards`,
 //!   `KeyAccounts` and `Tokens.holders` in one write txn per batch.
-//! - A dirty key is deleted only when its mark (read in the write txn) is not above the
-//!   answer's `as_of`. A success's `as_of` is the tip it read (`metaData.blockHeight − 1`); an
+//! - A dirty key is deleted only when its mark, read again in the write txn, is still the exact
+//!   [`Mark`] (height and write sequence) read at refill, and its height is not above the
+//!   answer's `as_of` (SR-1, M-3): a mark raised or rewritten meanwhile (a new block, a reorg's
+//!   undo or re-apply) survives. Every arm that drops a mark (skipped, error, parked) follows
+//!   the same rule (I-5). A success's `as_of` is the tip it read (`metaData.blockHeight − 1`); an
 //!   absent answer carries
 //!   no height, so its `as_of` is the chain's tail height read before the call (the node is at
 //!   or past it).
@@ -17,13 +20,16 @@
 //!   - `skipped`: B-1 refused the call (module name, name length); the key is dropped.
 //!   - `error`, Pact failure or unusable answer (the node evaluated the code and it failed,
 //!     e.g. a module with no `details`; or the answer is not JSON, over the body cap, or has no
-//!     decimal balance or `metaData`): the key is dropped and an existing row is left as it
-//!     was. The next tail mark retries it. No back-off.
+//!     decimal balance or `metaData`): the key is dropped, and an existing row keeps its
+//!     balance flagged `unverified` (served `stale: true`, I-5). The next tail mark retries
+//!     it. No back-off.
 //!   - `error`, node error (transport or HTTP): the key stays dirty and its mark moves up to
 //!     the chain's tail height (back of the queue). The loop backs off exponentially up to
 //!     [`BACKOFF_MAX`] only when node errors are at least half of a batch's calls
-//!     ([`backs_off`]). A key with [`MAX_KEY_RETRIES`] node errors in a row is parked
-//!     (`parked`: mark dropped until the next tail mark). Never read as a zero balance.
+//!     ([`backs_off`]). A key with [`MAX_KEY_RETRIES`] node errors in a row in batches that
+//!     did not back off is parked (`parked`: mark dropped until the next tail mark, row
+//!     flagged `unverified`). A backed-off batch counts nothing and resets the counts (SR-2):
+//!     a node outage parks no key. Never read as a zero balance.
 //! - Heartbeat: `Meta balances_reconcile_stats` (JSON: unix time, rows done, rate, dirty) per
 //!   batch; not part of the systemd watchdog.
 
@@ -34,10 +40,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use kdx_hot::balances::{
-    self, dirty_height, guard_hash, guard_keys, key_account_key, key_hash, ref_hash,
-    stored_guard_keys, BalanceRow, GuardKeys,
+    self, clear_mark, guard_hash, guard_keys, key_account_key, key_hash, ref_hash, set_unverified,
+    stored_guard_keys, BalanceRow, GuardKeys, Mark,
 };
-use kdx_hot::{checkpoint, RwTxn, Stage, Table, Txn};
+use kdx_hot::{checkpoint, HotStore, RwTxn, Stage, Table, Txn};
 use kdx_node::local::{Details, Local, LocalClient, LocalError, LocalOpts};
 use kdx_node::NodeClient;
 use kdx_types::DictKind;
@@ -70,22 +76,23 @@ pub struct ReconcileOpts {
 }
 
 /// The oldest `REFILL` dirty keys, oldest first. Fresh read txn per chunk.
-pub fn refill(hot: &kdx_hot::HotStore, n: usize) -> Result<VecDeque<([u8; 9], u32)>> {
-    let mut heap: BinaryHeap<(u32, [u8; 9])> = BinaryHeap::new();
+pub fn refill(hot: &HotStore, n: usize) -> Result<VecDeque<([u8; 9], Mark)>> {
+    let mut heap: BinaryHeap<(u32, [u8; 9], u64)> = BinaryHeap::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
         let rows =
             hot.ro()?
                 .scan_chunk(Table::BalanceDirty, after.as_deref(), SCAN_CHUNK, |_| true)?;
         for (k, v) in &rows {
-            let (Ok(key), Some(h)) = (<[u8; 9]>::try_from(k.as_slice()), dirty_height(v)) else {
+            let (Ok(key), Some(m)) = (<[u8; 9]>::try_from(k.as_slice()), Mark::decode(v)) else {
                 continue;
             };
+            let e = (m.height, key, m.seq);
             if heap.len() < n {
-                heap.push((h, key));
-            } else if heap.peek().is_some_and(|top| (h, key) < *top) {
+                heap.push(e);
+            } else if heap.peek().is_some_and(|top| e < *top) {
                 heap.pop();
-                heap.push((h, key));
+                heap.push(e);
             }
         }
         match rows.last() {
@@ -96,13 +103,15 @@ pub fn refill(hot: &kdx_hot::HotStore, n: usize) -> Result<VecDeque<([u8; 9], u3
     Ok(heap
         .into_sorted_vec()
         .into_iter()
-        .map(|(h, k)| (k, h))
+        .map(|(height, k, seq)| (k, Mark { height, seq }))
         .collect())
 }
 
 /// One dirty key with what the call needs.
 struct Item {
     key: [u8; 9],
+    /// The mark as read at refill: only this exact mark is ever deleted.
+    mark: Mark,
     account: u32,
     module: u32,
     chain: u8,
@@ -245,16 +254,20 @@ fn write_row(txn: &mut RwTxn<'_>, it: &Item, new: BalanceRow) -> Result<()> {
     Ok(())
 }
 
-/// Delete the dirty key when its mark is not above `as_of`.
-fn clear_if_covered(txn: &mut RwTxn<'_>, key: &[u8; 9], as_of: u32) -> Result<()> {
-    if let Some(h) = txn
-        .get(Table::BalanceDirty, key)?
-        .as_deref()
-        .and_then(dirty_height)
-    {
-        if h <= as_of {
-            txn.del(Table::BalanceDirty, key)?;
-        }
+/// Delete the dirty key when it still holds the mark read at refill and that mark is not above
+/// `as_of` (SR-1, M-3).
+fn clear_if_covered(txn: &mut RwTxn<'_>, it: &Item, as_of: u32) -> Result<()> {
+    if it.mark.height <= as_of {
+        clear_mark(txn, Table::BalanceDirty, &it.key, it.mark)?;
+    }
+    Ok(())
+}
+
+/// Drop the mark of a call that gave no usable answer, only when it is still the mark read at
+/// refill (I-5); an existing row is flagged unverified so the route serves it stale.
+fn drop_mark(txn: &mut RwTxn<'_>, it: &Item) -> Result<()> {
+    if clear_mark(txn, Table::BalanceDirty, &it.key, it.mark)? {
+        set_unverified(txn, &it.key)?;
     }
     Ok(())
 }
@@ -266,8 +279,9 @@ pub struct BatchStats {
     pub skipped: u64,
     pub failures: u64,
     pub node_errors: u64,
-    /// Keys whose call hit a node (transport or HTTP) error; still dirty.
-    pub node_error_keys: Vec<[u8; 9]>,
+    /// Keys whose call hit a node (transport or HTTP) error, with the mark the batch wrote
+    /// for them (moved up to the tail height); still dirty.
+    pub node_error_keys: Vec<([u8; 9], Mark)>,
 }
 
 impl BatchStats {
@@ -288,13 +302,13 @@ pub fn backs_off(st: &BatchStats) -> bool {
 pub async fn reconcile_batch(
     ctx: &Ctx,
     local: &LocalClient,
-    keys: &[([u8; 9], u32)],
+    keys: &[([u8; 9], Mark)],
 ) -> Result<BatchStats> {
     let items: Vec<Item> = {
         let txn = ctx.hot.ro()?;
         let mut tails = HashMap::new();
         let mut v = Vec::with_capacity(keys.len());
-        for (key, _) in keys {
+        for (key, mark) in keys {
             let (account, module, chain) =
                 balances::parse_bal_key(key).context("bad BalanceDirty key")?;
             let tail = match tails.get(&chain) {
@@ -307,6 +321,7 @@ pub async fn reconcile_batch(
             };
             v.push(Item {
                 key: *key,
+                mark: *mark,
                 account,
                 module,
                 chain,
@@ -344,9 +359,10 @@ pub async fn reconcile_batch(
                     guard: gh,
                     as_of,
                     reconciled_at: now,
+                    unverified: false,
                 };
                 write_row(&mut txn, it, row)?;
-                clear_if_covered(&mut txn, &it.key, as_of)?;
+                clear_if_covered(&mut txn, it, as_of)?;
                 st.ok += 1;
             }
             Outcome::Absent(as_of) => {
@@ -356,24 +372,25 @@ pub async fn reconcile_batch(
                     guard: [0; 16],
                     as_of,
                     reconciled_at: now,
+                    unverified: false,
                 };
                 write_row(&mut txn, it, row)?;
-                clear_if_covered(&mut txn, &it.key, as_of)?;
+                clear_if_covered(&mut txn, it, as_of)?;
                 st.absent += 1;
             }
             Outcome::Skipped => {
-                txn.del(Table::BalanceDirty, &it.key)?;
+                drop_mark(&mut txn, it)?;
                 st.skipped += 1;
             }
             Outcome::Failure => {
-                txn.del(Table::BalanceDirty, &it.key)?;
+                drop_mark(&mut txn, it)?;
                 st.failures += 1;
             }
             Outcome::NodeError => {
                 // To the back of the queue: the mark moves up to the tail height (never down).
-                balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                let m = balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
                 st.node_errors += 1;
-                st.node_error_keys.push(it.key);
+                st.node_error_keys.push((it.key, m));
             }
         }
     }
@@ -428,7 +445,7 @@ pub async fn run(
     }
     let local = LocalClient::new(node, o.local);
     let mut nft_cursor: Option<Vec<u8>> = None;
-    let mut queue: VecDeque<([u8; 9], u32)> = VecDeque::new();
+    let mut queue: VecDeque<([u8; 9], Mark)> = VecDeque::new();
     let mut backoff: Option<Duration> = None;
     let mut retries: HashMap<[u8; 9], u32> = HashMap::new();
     let mut done = 0u64;
@@ -479,9 +496,9 @@ pub async fn run(
             );
             last_log = Instant::now();
         }
-        let parked = count_retries(&mut retries, &batch, &st.node_error_keys);
+        let parked = parked_after(&mut retries, &batch, &st);
         if !parked.is_empty() {
-            park(&ctx, &parked)?;
+            park(&ctx.hot, &parked)?;
         }
         if backs_off(&st) {
             let d = backoff.map_or(Duration::from_secs(1), |d| (d * 2).min(BACKOFF_MAX));
@@ -503,14 +520,29 @@ pub async fn run(
     }
 }
 
+/// The keys to park after a batch (SR-2): none when the batch backs off (the node itself is
+/// failing; the counts start again), else [`count_retries`].
+pub fn parked_after(
+    retries: &mut HashMap<[u8; 9], u32>,
+    batch: &[([u8; 9], Mark)],
+    st: &BatchStats,
+) -> Vec<([u8; 9], Mark)> {
+    if backs_off(st) {
+        retries.clear();
+        return Vec::new();
+    }
+    count_retries(retries, batch, &st.node_error_keys)
+}
+
 /// Count consecutive node errors per key of a batch: keys that answered are forgotten; the
-/// keys that reached [`MAX_KEY_RETRIES`] are returned (and forgotten) for parking.
+/// keys that reached [`MAX_KEY_RETRIES`] are returned (and forgotten) for parking, with the
+/// mark the batch wrote for them.
 pub fn count_retries(
     retries: &mut HashMap<[u8; 9], u32>,
-    batch: &[([u8; 9], u32)],
-    errored: &[[u8; 9]],
-) -> Vec<[u8; 9]> {
-    let failed: HashSet<&[u8; 9]> = errored.iter().collect();
+    batch: &[([u8; 9], Mark)],
+    errored: &[([u8; 9], Mark)],
+) -> Vec<([u8; 9], Mark)> {
+    let failed: HashSet<&[u8; 9]> = errored.iter().map(|(k, _)| k).collect();
     for (k, _) in batch {
         if !failed.contains(k) {
             retries.remove(k);
@@ -520,23 +552,27 @@ pub fn count_retries(
         retries.clear();
     }
     let mut out = Vec::new();
-    for k in errored {
+    for (k, m) in errored {
         let n = retries.entry(*k).or_insert(0);
         *n += 1;
         if *n >= MAX_KEY_RETRIES {
             retries.remove(k);
-            out.push(*k);
+            out.push((*k, *m));
         }
     }
     out
 }
 
-/// Drop the dirty marks of keys that kept failing at the node (`result="parked"`).
-fn park(ctx: &Ctx, keys: &[[u8; 9]]) -> Result<()> {
-    let mut txn = ctx.hot.rw()?;
-    for k in keys {
-        txn.del(Table::BalanceDirty, k)?;
-        kdx_metrics::get().balance_reconcile("parked", 0.0);
+/// Drop the dirty marks of keys that kept failing at the node (`result="parked"`), each only
+/// when it is still the mark the failing batch wrote (SR-1): a tail mark written since
+/// survives. A parked key's row is flagged unverified (I-5).
+pub fn park(hot: &HotStore, keys: &[([u8; 9], Mark)]) -> Result<()> {
+    let mut txn = hot.rw()?;
+    for (k, m) in keys {
+        if clear_mark(&mut txn, Table::BalanceDirty, k, *m)? {
+            set_unverified(&mut txn, k)?;
+            kdx_metrics::get().balance_reconcile("parked", 0.0);
+        }
     }
     txn.commit()?;
     tracing::warn!(
@@ -669,26 +705,25 @@ mod tests {
         }
     }
 
-    /// One key whose answer is unusable is dropped as a failure; the other keys of the batch
-    /// reconcile, and the batch does not back off.
-    #[tokio::test]
-    async fn one_invalid_answer_does_not_stall_the_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let hot = Arc::new(HotStore::open(&dir.path().join("hot"), Geometry::default()).unwrap());
-        {
-            let mut txn = hot.rw().unwrap();
-            let mut dict = HotDict::load(&txn).unwrap();
-            let coin = dict.intern(DictKind::Module, "coin");
-            let ids: Vec<u32> = ["alice", "bad", "carol"]
-                .iter()
-                .map(|a| dict.intern(DictKind::Account, a))
-                .collect();
-            dict.persist(&mut txn).unwrap();
-            for a in ids {
-                balances::mark_dirty(&mut txn, a, coin, 0, 10).unwrap();
-            }
-            txn.commit().unwrap();
+    /// A store with `coin` and `accounts`, each marked dirty for coin on chain 0 at height 10.
+    fn setup(dir: &std::path::Path, accounts: &[&str]) -> (Arc<HotStore>, u32, Vec<u32>) {
+        let hot = Arc::new(HotStore::open(&dir.join("hot"), Geometry::default()).unwrap());
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let coin = dict.intern(DictKind::Module, "coin");
+        let ids: Vec<u32> = accounts
+            .iter()
+            .map(|a| dict.intern(DictKind::Account, a))
+            .collect();
+        dict.persist(&mut txn).unwrap();
+        for &a in &ids {
+            balances::mark_dirty(&mut txn, a, coin, 0, 10).unwrap();
         }
+        txn.commit().unwrap();
+        (hot, coin, ids)
+    }
+
+    fn client(dir: &std::path::Path, hot: &Arc<HotStore>) -> (Ctx, LocalClient) {
         let node = NodeClient::new(&NodeClientConfig {
             base: fake_node().parse().unwrap(),
             network: "mainnet01".into(),
@@ -708,12 +743,12 @@ mod tests {
             raw: Value::Null,
         };
         let ctx = Ctx {
-            opts: opts(dir.path()),
+            opts: opts(dir),
             node: node.clone(),
             hot: hot.clone(),
             dict: Arc::new(Mutex::new(HotDict::load(&hot.ro().unwrap()).unwrap())),
-            segdir: dir.path().join("segments"),
-            etl: dir.path().join("etl"),
+            segdir: dir.join("segments"),
+            etl: dir.join("etl"),
             graph: ChainGraph::from_info(&info),
         };
         let local = LocalClient::new(
@@ -723,6 +758,25 @@ mod tests {
                 concurrency: 4,
             },
         );
+        (ctx, local)
+    }
+
+    fn mark_of(hot: &HotStore, k: &[u8; 9]) -> Option<Mark> {
+        hot.ro()
+            .unwrap()
+            .get(Table::BalanceDirty, k)
+            .unwrap()
+            .as_deref()
+            .and_then(Mark::decode)
+    }
+
+    /// One key whose answer is unusable is dropped as a failure; the other keys of the batch
+    /// reconcile, and the batch does not back off.
+    #[tokio::test]
+    async fn one_invalid_answer_does_not_stall_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["alice", "bad", "carol"]);
+        let (ctx, local) = client(dir.path(), &hot);
         let keys: Vec<_> = refill(&hot, REFILL).unwrap().into_iter().collect();
         assert_eq!(keys.len(), 3);
         let st = reconcile_batch(&ctx, &local, &keys).await.unwrap();
@@ -738,6 +792,132 @@ mod tests {
         assert_eq!(rows[0].2.as_of, 10);
     }
 
+    /// SR-1, I-5: a tail mark written between the batch's read and the drop (error, skipped)
+    /// or the park survives; the exact mark read is dropped and flags an existing row.
+    #[tokio::test]
+    async fn a_mark_raised_after_the_read_survives_drop_skip_and_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["bad", "parked"]);
+        let (bad, parked) = (ids[0], ids[1]);
+        let skip = balances::bal_key(bad, 999, 0); // module id with no name: skipped
+        let old_row = BalanceRow {
+            absent: false,
+            balance: "3.0".into(),
+            guard: [0; 16],
+            as_of: 5,
+            reconciled_at: 1,
+            unverified: false,
+        };
+        {
+            let mut txn = hot.rw().unwrap();
+            balances::mark_dirty(&mut txn, bad, 999, 0, 10).unwrap();
+            txn.put(
+                Table::Balances,
+                &balances::bal_key(bad, coin, 0),
+                &old_row.encode(),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        let keys: Vec<_> = refill(&hot, REFILL).unwrap().into_iter().collect();
+        assert_eq!(keys.len(), 3);
+        // The tail marks all three keys again after the read (a real transfer at 12).
+        {
+            let mut txn = hot.rw().unwrap();
+            balances::mark_dirty(&mut txn, bad, coin, 0, 12).unwrap();
+            balances::mark_dirty(&mut txn, parked, coin, 0, 12).unwrap();
+            balances::mark_dirty(&mut txn, bad, 999, 0, 12).unwrap();
+            txn.commit().unwrap();
+        }
+        let (ctx, local) = client(dir.path(), &hot);
+        let pk = balances::bal_key(parked, coin, 0);
+        let rest: Vec<_> = keys.iter().filter(|(k, _)| *k != pk).copied().collect();
+        let st = reconcile_batch(&ctx, &local, &rest).await.unwrap();
+        assert_eq!((st.failures, st.skipped), (1, 1));
+        let stale = *keys.iter().find(|(k, _)| *k == pk).unwrap();
+        park(&hot, &[stale]).unwrap();
+        for k in [balances::bal_key(bad, coin, 0), pk, skip] {
+            assert_eq!(mark_of(&hot, &k).map(|m| m.height), Some(12), "{k:?}");
+        }
+        let row = |h: &HotStore| {
+            BalanceRow::decode(
+                &h.ro()
+                    .unwrap()
+                    .get(Table::Balances, &balances::bal_key(bad, coin, 0))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(!row(&hot).unverified);
+        // Read again: the current marks are dropped, and the existing row is flagged.
+        let keys: Vec<_> = refill(&hot, REFILL).unwrap().into_iter().collect();
+        let rest: Vec<_> = keys.iter().filter(|(k, _)| *k != pk).copied().collect();
+        reconcile_batch(&ctx, &local, &rest).await.unwrap();
+        park(&hot, &[*keys.iter().find(|(k, _)| *k == pk).unwrap()]).unwrap();
+        assert_eq!(hot.ro().unwrap().count(Table::BalanceDirty).unwrap(), 0);
+        assert!(row(&hot).unverified);
+    }
+
+    /// M-3: a reorg between the read and the clear re-marks the key at the same height; the
+    /// answer still covers that height, but the newer mark is kept for the next read.
+    #[tokio::test]
+    async fn a_reorg_between_read_and_clear_keeps_the_newer_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        let k = balances::bal_key(ids[0], coin, 0);
+        let keys: Vec<_> = refill(&hot, REFILL).unwrap().into_iter().collect();
+        {
+            // Undo (mark at 10) and re-apply of a lower block (9): the height stays 10.
+            let mut txn = hot.rw().unwrap();
+            balances::mark_dirty(&mut txn, ids[0], coin, 0, 10).unwrap();
+            balances::mark_dirty(&mut txn, ids[0], coin, 0, 9).unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(mark_of(&hot, &k).map(|m| m.height), Some(10));
+        assert_ne!(mark_of(&hot, &k), Some(keys[0].1));
+        let (ctx, local) = client(dir.path(), &hot);
+        let st = reconcile_batch(&ctx, &local, &keys).await.unwrap();
+        assert_eq!(st.ok, 1);
+        assert!(mark_of(&hot, &k).is_some(), "the reorg's mark must survive");
+        let keys: Vec<_> = refill(&hot, REFILL).unwrap().into_iter().collect();
+        reconcile_batch(&ctx, &local, &keys).await.unwrap();
+        assert!(mark_of(&hot, &k).is_none());
+    }
+
+    /// SR-2: a node outage (every call a node error) parks nothing, however long it lasts; a
+    /// key failing alone among answering keys is parked after MAX_KEY_RETRIES batches.
+    #[test]
+    fn a_node_outage_parks_nothing() {
+        let mut m = HashMap::new();
+        let mk = Mark { height: 1, seq: 1 };
+        let batch: Vec<_> = (0..4u8).map(|i| ([i; 9], mk)).collect();
+        let outage = BatchStats {
+            node_errors: 4,
+            node_error_keys: batch.clone(),
+            ..Default::default()
+        };
+        let one = BatchStats {
+            ok: 3,
+            node_errors: 1,
+            node_error_keys: vec![batch[0]],
+            ..Default::default()
+        };
+        for _ in 0..MAX_KEY_RETRIES * 3 {
+            assert!(parked_after(&mut m, &batch, &outage).is_empty());
+        }
+        assert!(m.is_empty());
+        // Counts started before an outage start again after it.
+        for _ in 1..MAX_KEY_RETRIES {
+            assert!(parked_after(&mut m, &batch, &one).is_empty());
+        }
+        assert!(parked_after(&mut m, &batch, &outage).is_empty());
+        for _ in 1..MAX_KEY_RETRIES {
+            assert!(parked_after(&mut m, &batch, &one).is_empty());
+        }
+        assert_eq!(parked_after(&mut m, &batch, &one), vec![batch[0]]);
+    }
+
     #[test]
     fn back_off_needs_a_node_error_majority_and_failing_keys_park() {
         let mut st = BatchStats {
@@ -750,11 +930,12 @@ mod tests {
         assert!(backs_off(&st));
         let mut m = HashMap::new();
         let k = [1u8; 9];
-        let batch = vec![(k, 0u32), ([2u8; 9], 0)];
+        let mk = Mark { height: 0, seq: 1 };
+        let batch = vec![(k, mk), ([2u8; 9], mk)];
         for _ in 1..MAX_KEY_RETRIES {
-            assert!(count_retries(&mut m, &batch, &[k]).is_empty());
+            assert!(count_retries(&mut m, &batch, &[(k, mk)]).is_empty());
         }
-        assert_eq!(count_retries(&mut m, &batch, &[k]), vec![k]);
+        assert_eq!(count_retries(&mut m, &batch, &[(k, mk)]), vec![(k, mk)]);
         assert!(m.is_empty());
     }
 }

@@ -76,8 +76,13 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
                     hs.ro()?
                         .scan_chunk(Table::Balances, after.as_deref(), ALL_CHUNK, |_| true)?;
                 let mut txn = hs.rw()?;
+                let mark = kdx_hot::balances::Mark {
+                    height: 0,
+                    seq: txn.txn_id()?,
+                }
+                .encode();
                 for (k, _) in &rows {
-                    if txn.insert(Table::BalanceDirty, k, &0u32.to_be_bytes())? {
+                    if txn.insert(Table::BalanceDirty, k, &mark)? {
                         marked += 1;
                     }
                 }

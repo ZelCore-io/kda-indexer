@@ -101,8 +101,13 @@ impl Pending {
         rep: &mut SeedReport,
     ) -> Result<()> {
         let mut txn = hot.rw()?;
+        let mark = balances::Mark {
+            height: 0,
+            seq: txn.txn_id()?,
+        }
+        .encode();
         for k in self.rows.drain(..) {
-            if txn.insert(Table::BalanceDirty, &k, &0u32.to_be_bytes())? {
+            if txn.insert(Table::BalanceDirty, &k, &mark)? {
                 rep.dirty_inserted += 1;
             }
         }

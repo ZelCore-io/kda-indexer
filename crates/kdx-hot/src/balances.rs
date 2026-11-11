@@ -3,8 +3,8 @@
 //!
 //! | Table | Key | Value |
 //! |---|---|---|
-//! | `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node), balance text as the node printed it, guard hash [16], as_of u32, reconciled_at u32 |
-//! | `BalanceDirty` | same | marked_height u32 |
+//! | `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node, b1: unverified), balance text as the node printed it, guard hash [16], as_of u32, reconciled_at u32 |
+//! | `BalanceDirty` | same | [`Mark`]: marked_height u32, seq u64 |
 //! | `Guards` | guard hash [16] | guard JSON bytes as the node returned them |
 //! | `KeyAccounts` | blake2b-128(public key) [16], AccountId u32 | empty |
 //! | `Tokens` | ModuleId u32 | first_height u32, holders u64, kind u8 |
@@ -15,8 +15,10 @@
 //!   reports the pending block's height); `reconciled_at` is unix seconds.
 //! - Dirty marks (B-3): tail apply and tail undo mark every `xfer` posting's `(account, module,
 //!   chain)` and every `acct` posting's `(account, coin, chain)` in the same txn as the block.
-//!   A mark keeps the highest height; the reconciler deletes it only when the mark is not above
-//!   the answer's `as_of`.
+//!   A mark keeps the highest height and takes the writing txn's id as its `seq`; the
+//!   reconciler deletes it only when it is still the exact mark it read and not above the
+//!   answer's `as_of` (SR-1, I-5, M-3).
+//! - `unverified`: the row's last re-read failed or was parked; the route serves it `stale`.
 //! - `holders` counts rows with a balance above zero; it is approximate (reorgs, rows not yet
 //!   reconciled).
 
@@ -67,12 +69,14 @@ pub struct BalanceRow {
     pub guard: [u8; 16],
     pub as_of: u32,
     pub reconciled_at: u32,
+    /// The last re-read after a change failed (I-5): the balance may be outdated.
+    pub unverified: bool,
 }
 
 impl BalanceRow {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(1 + self.balance.len() + 24);
-        v.push(u8::from(self.absent));
+        v.push(u8::from(self.absent) | (u8::from(self.unverified) << 1));
         v.extend_from_slice(self.balance.as_bytes());
         v.extend_from_slice(&self.guard);
         v.extend_from_slice(&self.as_of.to_be_bytes());
@@ -92,6 +96,7 @@ impl BalanceRow {
             guard: v[n..n + 16].try_into().ok()?,
             as_of: be_u32(&v[n + 16..n + 20])?,
             reconciled_at: be_u32(&v[n + 20..n + 24])?,
+            unverified: v[0] & 2 == 2,
         })
     }
 
@@ -112,26 +117,88 @@ pub fn decimal_positive(s: &str) -> bool {
     mant.bytes().any(|b| (b'1'..=b'9').contains(&b))
 }
 
-/// `BalanceDirty` value.
-pub fn dirty_height(v: &[u8]) -> Option<u32> {
-    be_u32(v)
+/// A dirty mark: the highest height that marked the row, and the id of the write txn that last
+/// wrote it. MDBX write txn ids grow, so any later write of the mark (a higher block, a reorg's
+/// undo or re-apply at any height, a requeue) changes it, and a reconciler that read a mark
+/// deletes only that exact mark (SR-1, I-5, M-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Mark {
+    pub height: u32,
+    pub seq: u64,
 }
 
-/// Mark a row dirty at `height`; an existing mark keeps the higher height (B-3).
+impl Mark {
+    pub fn encode(&self) -> [u8; 12] {
+        let mut v = [0u8; 12];
+        v[..4].copy_from_slice(&self.height.to_be_bytes());
+        v[4..].copy_from_slice(&self.seq.to_be_bytes());
+        v
+    }
+
+    /// 12 bytes; a bare 4-byte height decodes with `seq` 0.
+    pub fn decode(v: &[u8]) -> Option<Mark> {
+        let height = u32::from_be_bytes(v.get(..4)?.try_into().ok()?);
+        let seq = match v.len() {
+            4 => 0,
+            12 => u64::from_be_bytes(v[4..].try_into().ok()?),
+            _ => return None,
+        };
+        Some(Mark { height, seq })
+    }
+}
+
+/// Height of a `BalanceDirty` value.
+pub fn dirty_height(v: &[u8]) -> Option<u32> {
+    Mark::decode(v).map(|m| m.height)
+}
+
+/// Mark a row dirty at `height` (B-3): the mark keeps the higher height and always takes this
+/// txn's id, so a mark written after a reconciler read it never equals what it read. Returns
+/// the mark written.
 pub fn mark_dirty(
     txn: &mut RwTxn<'_>,
     account: u32,
     module: u32,
     chain: u8,
     height: u32,
-) -> Result<()> {
+) -> Result<Mark> {
     let k = bal_key(account, module, chain);
-    if let Some(v) = txn.get(Table::BalanceDirty, &k)? {
-        if dirty_height(&v).is_some_and(|h| h >= height) {
-            return Ok(());
+    let old = txn
+        .get(Table::BalanceDirty, &k)?
+        .as_deref()
+        .and_then(dirty_height)
+        .unwrap_or(0);
+    let m = Mark {
+        height: old.max(height),
+        seq: txn.txn_id()?,
+    };
+    txn.put(Table::BalanceDirty, &k, &m.encode())?;
+    Ok(m)
+}
+
+/// Delete the mark of `key` in `table` only when it is still exactly `read` (SR-1): a mark
+/// raised or rewritten since the read survives. Returns whether it was deleted.
+pub fn clear_mark(txn: &mut RwTxn<'_>, table: Table, key: &[u8], read: Mark) -> Result<bool> {
+    match txn.get(table, key)?.as_deref().and_then(Mark::decode) {
+        Some(m) if m == read => txn.del(table, key),
+        _ => Ok(false),
+    }
+}
+
+/// Flag an existing `Balances` row as unverified (I-5): its re-read after a change failed, so
+/// the route serves it `stale` until a later read succeeds.
+pub fn set_unverified(txn: &mut RwTxn<'_>, key: &[u8; 9]) -> Result<()> {
+    if let Some(mut r) = txn
+        .get(Table::Balances, key)?
+        .as_deref()
+        .and_then(BalanceRow::decode)
+    {
+        if !r.unverified {
+            r.unverified = true;
+            txn.put(Table::Balances, key, &r.encode())?;
         }
     }
-    txn.put(Table::BalanceDirty, &k, &height.to_be_bytes())
+    Ok(())
 }
 
 /// The ModuleId of `coin`, when the dictionary holds it.
@@ -352,6 +419,7 @@ mod tests {
             guard: [9; 16],
             as_of: 7,
             reconciled_at: 1_700_000_000,
+            unverified: true,
         };
         assert_eq!(BalanceRow::decode(&r.encode()), Some(r.clone()));
         assert!(r.positive());

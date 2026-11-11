@@ -249,14 +249,16 @@ fn write_local(txn: &mut RwTxn<'_>, it: &Item, balance: String, as_of: u32) -> R
     txn.put(Table::NftBalances, &it.key, &row.encode())
 }
 
-fn clear_if_covered(txn: &mut RwTxn<'_>, it: &Item, as_of: u32) -> Result<()> {
-    if let Some(m) = txn
+/// Delete the dirty mark only when it is still the exact mark read for the call and, with an
+/// answer, not above its `as_of` (SR-1, I-5, M-3): a mark raised or rewritten meanwhile (a new
+/// event, a reorg) survives.
+fn clear_if_covered(txn: &mut RwTxn<'_>, it: &Item, as_of: Option<u32>) -> Result<()> {
+    let same = txn
         .get(Table::NftDirty, &it.key)?
         .and_then(|v| NftMark::decode(&v))
-    {
-        if m.height <= as_of {
-            txn.del(Table::NftDirty, &it.key)?;
-        }
+        .is_some_and(|m| m == it.mark);
+    if same && as_of.is_none_or(|h| it.mark.height <= h) {
+        txn.del(Table::NftDirty, &it.key)?;
     }
     Ok(())
 }
@@ -308,16 +310,16 @@ pub async fn step(
         match out {
             Outcome::Found(balance, as_of) => {
                 write_local(&mut txn, it, balance, as_of)?;
-                clear_if_covered(&mut txn, it, as_of)?;
+                clear_if_covered(&mut txn, it, Some(as_of))?;
                 st.ok += 1;
             }
             Outcome::Absent => {
                 write_local(&mut txn, it, "0.0".into(), it.tail)?;
-                clear_if_covered(&mut txn, it, it.tail)?;
+                clear_if_covered(&mut txn, it, Some(it.tail))?;
                 st.absent += 1;
             }
             Outcome::Dropped => {
-                txn.del(Table::NftDirty, &it.key)?;
+                clear_if_covered(&mut txn, it, None)?;
                 st.dropped += 1;
             }
             Outcome::NodeError => st.node_errors += 1,
@@ -325,4 +327,56 @@ pub async fn step(
     }
     txn.commit()?;
     Ok(st)
+}
+
+#[cfg(test)]
+mod tests {
+    use kdx_hot::{Geometry, HotStore};
+
+    use super::*;
+
+    /// SR-1, I-5, M-3: a dropped (or answered) NFT row keeps a mark rewritten after the read,
+    /// even at the same height (a reorg); the exact mark read is deleted.
+    #[test]
+    fn a_rewritten_nft_mark_survives_drop_and_clear() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let key = nft::nft_key(1, 5, &nft::token_hash("t:a"), 0);
+        let read = |hot: &HotStore| {
+            hot.ro()
+                .unwrap()
+                .get(Table::NftDirty, &key)
+                .unwrap()
+                .and_then(|v| NftMark::decode(&v))
+        };
+        let mark = |hot: &HotStore, h: u32| {
+            let mut txn = hot.rw().unwrap();
+            nft::mark_dirty(&mut txn, 1, "t:a", 0, 5, h).unwrap();
+            txn.commit().unwrap();
+        };
+        mark(&hot, 50);
+        let it = Item {
+            key,
+            chain: 0,
+            mark: read(&hot).unwrap(),
+            account: None,
+            ledger: None,
+            tail: 60,
+        };
+        mark(&hot, 50); // undo and re-apply at the same height
+        for as_of in [None, Some(60)] {
+            let mut txn = hot.rw().unwrap();
+            clear_if_covered(&mut txn, &it, as_of).unwrap();
+            txn.commit().unwrap();
+            assert!(read(&hot).is_some());
+        }
+        let it = Item {
+            mark: read(&hot).unwrap(),
+            ..it
+        };
+        let mut txn = hot.rw().unwrap();
+        clear_if_covered(&mut txn, &it, None).unwrap();
+        txn.commit().unwrap();
+        assert!(read(&hot).is_none());
+    }
 }

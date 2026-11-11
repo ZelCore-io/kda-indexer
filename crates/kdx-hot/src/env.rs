@@ -565,6 +565,11 @@ impl RwTxn<'_> {
         Ok(n)
     }
 
+    /// This write txn's MDBX id: above the id of every write txn committed before it.
+    pub fn txn_id(&self) -> Result<u64> {
+        Ok(self.txn.id()?)
+    }
+
     pub fn commit(self) -> Result<()> {
         self.txn.commit()?;
         Ok(())
