@@ -31,8 +31,11 @@ cannot be upgraded in place; rebuild it (`docs/operations.md`, "Format upgrade")
   and the amount is a number, a string with a leading rational, or an object whose
   `decimal` or `int` member is one of those. Version 1 took only events named exactly
   `TRANSFER` with a number or a one-key `{"decimal"|"int"}` amount. The rule drives the
-  record's `transfers` list, the `xfer` postings (keyed by the event's module) and the
-  transfer sides in `acct`. Coinbase TRANSFER events count, as before.
+  record's `transfers` list and the `xfer` postings (keyed by the event's module). The
+  transfer sides in `acct` keep the version 1 rule: only an event named exactly `TRANSFER`
+  (and passing the amount check above) gives its `from` and `to` an `acct` posting, so a
+  `WIZ_TRANSFER (id, from, to)` event never makes the NFT id or the receiver string an
+  account. Coinbase TRANSFER events count, as before.
 - **`pact` posting family** (family byte 5, file `pact.pst`, `TailPostings` family 5): the
   defpact history. Entity = the first 8 bytes of the pactId, big-endian. A tx is posted when
   it has a pactId: an exec whose output `continuation.pactId` is set (it starts a pact) and
@@ -478,7 +481,8 @@ A transfer is an event whose qualified name ends in `TRANSFER` with exactly thre
 (optional sign, digits, optional `.digits`, optional exponent; the rest is ignored), or an
 object whose `decimal` or `int` member is one of those (chainweb-data's `mkTransferRows`).
 
-An event names an account when the account is a side of a transfer (above), of a
+An event names an account when the account is a side of an event named exactly `TRANSFER`
+that is a transfer (above; a suffix name such as `WIZ_TRANSFER` does not count here), of a
 poly-fungible `TRANSFER (id, from, to, amount)` or of a `TRANSFER_XCHAIN` /
 `TRANSFER_XCHAIN_RECD (from, to, amount, chain)`, or when it is a syntactically valid Pact
 principal (`k:`, `w:`, `r:`, `u:`, `m:`, `p:`, `c:`) anywhere in the event's params. All of

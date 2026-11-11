@@ -139,8 +139,8 @@ pub fn transfer_amount_ok(v: &Value) -> bool {
 
 /// A transfer row of chainweb-data (`mkTransferRows`): the qualified event name ends in
 /// `TRANSFER`, there are exactly three params, `from` and `to` are strings and the amount
-/// passes `transfer_amount_ok`. Drives the record's `transfers` list, the `xfer` postings
-/// (keyed by the event's module) and the `acct` sides.
+/// passes `transfer_amount_ok`. Drives the record's `transfers` list and the `xfer` postings
+/// (keyed by the event's module). The `acct` sides use the narrower `acct_transfer_accounts`.
 pub fn transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> {
     if !ev.event_name.ends_with("TRANSFER") {
         return None;
@@ -150,6 +150,16 @@ pub fn transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> 
         return None;
     }
     Some((p[0].as_str()?, p[1].as_str()?))
+}
+
+/// The transfer sides that give `acct` postings: only an event named exactly `TRANSFER` (the
+/// v1 rule) whose params pass `transfer_accounts`. Suffix names such as `WIZ_TRANSFER` carry
+/// `(id, from, to)` params; their "sides" are an NFT id and a receiver, not two accounts.
+pub fn acct_transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> {
+    if ev.name != "TRANSFER" {
+        return None;
+    }
+    transfer_accounts(ev)
 }
 
 /// All events canonical, or None (then the events go to `extra`).
@@ -220,7 +230,7 @@ pub fn event_accounts<'a>(e: &'a Value, out: &mut Vec<&'a str>) {
         return;
     };
     if let (Some(ev), Some(p)) = (parse_event(e), params.as_array()) {
-        if let Some((from, to)) = transfer_accounts(&ev) {
+        if let Some((from, to)) = acct_transfer_accounts(&ev) {
             out.extend([from, to]);
         } else if p.len() == 4 && matches!(p[3], Value::Number(_) | Value::Object(_)) {
             let sides = match ev.name {
@@ -523,7 +533,10 @@ pub fn encode_records(
 mod transfer_rule_tests {
     use serde_json::json;
 
-    use super::{parse_event, rational_prefix_len, transfer_accounts, transfer_amount_ok};
+    use super::{
+        acct_transfer_accounts, event_accounts, parse_event, rational_prefix_len,
+        transfer_accounts, transfer_amount_ok,
+    };
 
     #[test]
     fn rational_prefix() {
@@ -586,5 +599,36 @@ mod transfer_rule_tests {
         assert_eq!(transfer_accounts(&parse_event(&e).unwrap()), None);
         let e = ev("TRANSFER", json!(["a", 5, 1.0]));
         assert_eq!(transfer_accounts(&parse_event(&e).unwrap()), None);
+    }
+
+    #[test]
+    fn acct_keeps_transfer_only_rule() {
+        let ev = |name: &str, params| {
+            json!({"params": params, "name": name,
+                   "module": {"namespace": "free", "name": "wiz-arena"}, "moduleHash": "h"})
+        };
+        let sender = format!("k:{}", "ab".repeat(32));
+        let receiver = "12abc0ffee";
+        // WIZ_TRANSFER (id, from, to): chainweb-data's rule reads params[2] as the amount and
+        // "12abc..." has a leading rational, so the xfer / compat row exists with from "83".
+        let w = ev("WIZ_TRANSFER", json!(["83", sender, receiver]));
+        let parsed = parse_event(&w).unwrap();
+        assert_eq!(transfer_accounts(&parsed), Some(("83", sender.as_str())));
+        assert_eq!(acct_transfer_accounts(&parsed), None);
+        let mut acc = Vec::new();
+        event_accounts(&w, &mut acc);
+        assert!(!acc.contains(&"83"), "{acc:?}");
+        assert!(!acc.contains(&receiver), "{acc:?}");
+        assert!(
+            acc.contains(&sender.as_str()),
+            "principal still listed: {acc:?}"
+        );
+        // A plain coin TRANSFER gives both sides an acct posting.
+        let t = ev("TRANSFER", json!(["alice", "bob", {"decimal": "1.5"}]));
+        let parsed = parse_event(&t).unwrap();
+        assert_eq!(acct_transfer_accounts(&parsed), Some(("alice", "bob")));
+        let mut acc = Vec::new();
+        event_accounts(&t, &mut acc);
+        assert_eq!(acc[..2], ["alice", "bob"]);
     }
 }
