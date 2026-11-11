@@ -801,6 +801,36 @@ pub fn recheck_not_fungible(hot: &HotStore, now: u32, recheck_secs: u32) -> Resu
     Ok(due.len())
 }
 
+/// Pause before a failed NFT history fill is tried again (M-8).
+const NFT_FILL_RETRY: Duration = Duration::from_secs(3600);
+
+/// The NFT history fill for the trusted ledgers not walked yet on this store (all of them on a
+/// new store; a ledger added to `[nft] ledgers` since, M-9). Returns false when stopped.
+async fn nft_fill_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
+    let pending = crate::nft_fill::pending_ledgers(&ctx.hot.ro()?)?;
+    if pending.is_empty() {
+        return Ok(true);
+    }
+    tracing::info!(ledgers = ?pending, "nft: history fill (N-1, M-9)");
+    let (c, s) = (ctx.clone(), stop.clone());
+    let rep = tokio::task::spawn_blocking(move || {
+        crate::nft_fill::run(&c.hot, &c.segdir, Some(&pending), &|| s.is_cancelled())
+    })
+    .await??;
+    tracing::info!(report = %serde_json::to_string(&rep)?, "nft: fill pass ended");
+    Ok(!rep.stopped)
+}
+
+/// M-8: NFT rows are a "should"; a failed fill is logged and retried after
+/// [`NFT_FILL_RETRY`], while the balance seed and reconcile ("must") go on.
+fn nft_failed(e: &anyhow::Error) {
+    tracing::error!(
+        error = format!("{e:#}"),
+        retry_secs = NFT_FILL_RETRY.as_secs(),
+        "nft: history fill failed; balances go on, the fill is retried later"
+    );
+}
+
 /// Write the heartbeat and the dirty gauge.
 fn heartbeat(ctx: &Ctx, done: u64, rate: f64) -> Result<usize> {
     let dirty = balances::dirty_count(&ctx.hot.ro()?)?;
@@ -821,16 +851,15 @@ pub async fn run(
     o: ReconcileOpts,
     stop: CancellationToken,
 ) -> Result<()> {
-    if o.seed && !crate::nft_fill::filled(&ctx.hot.ro()?)? {
-        tracing::info!("nft: no history fill yet, filling (N-1)");
-        let (c, s) = (ctx.clone(), stop.clone());
-        let rep = tokio::task::spawn_blocking(move || {
-            crate::nft_fill::run(&c.hot, &c.segdir, &|| s.is_cancelled())
-        })
-        .await??;
-        tracing::info!(report = %serde_json::to_string(&rep)?, "nft: fill pass ended");
-        if rep.stopped {
-            return Ok(());
+    let mut nft_retry: Option<Instant> = None;
+    if o.seed {
+        match nft_fill_pass(&ctx, &stop).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(e) => {
+                nft_failed(&e);
+                nft_retry = Some(Instant::now());
+            }
         }
     }
     let seeded = crate::seed::seeded(&ctx.hot.ro()?)?;
@@ -858,6 +887,16 @@ pub async fn run(
     loop {
         if stop.is_cancelled() {
             return Ok(());
+        }
+        if nft_retry.is_some_and(|t| t.elapsed() >= NFT_FILL_RETRY) {
+            match nft_fill_pass(&ctx, &stop).await {
+                Ok(true) => nft_retry = None,
+                Ok(false) => return Ok(()),
+                Err(e) => {
+                    nft_failed(&e);
+                    nft_retry = Some(Instant::now());
+                }
+            }
         }
         if last_recheck.is_none_or(|t| t.elapsed() >= RECHECK_SCAN) {
             let n = recheck_not_fungible(&ctx.hot, now_unix(), o.caps.recheck_secs)?;

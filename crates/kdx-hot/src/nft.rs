@@ -40,6 +40,8 @@ use crate::tables::Table;
 pub mod meta {
     /// u32: the highest tail height when the fill finished.
     pub const NFT_FILLED: &str = "nft_filled";
+    /// The trusted ledgers the fill has walked, sorted, one per line (M-9).
+    pub const NFT_FILLED_LEDGERS: &str = "nft_filled_ledgers";
     /// u32: end height of the last segment range the fill finished.
     pub const NFT_FILL_CURSOR: &str = "nft_fill_cursor";
 }
@@ -58,6 +60,17 @@ static LEDGERS: OnceLock<Vec<String>> = OnceLock::new();
 /// Set the trusted ledger modules once at startup (`[nft] ledgers`); a second call is ignored.
 pub fn set_ledgers(l: Vec<String>) {
     let _ = LEDGERS.set(l);
+}
+
+/// The trusted ledgers (`[nft] ledgers`, else [`DEFAULT_LEDGERS`]), sorted.
+pub fn ledgers() -> Vec<String> {
+    let mut v: Vec<String> = match LEDGERS.get() {
+        Some(l) => l.clone(),
+        None => DEFAULT_LEDGERS.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Whether `module` (qualified name) is a trusted ledger.

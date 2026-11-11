@@ -1,6 +1,8 @@
 //! NFT history fill and `NftDirty` reconcile (ruling N-1, plan Task 11).
 //!
-//! - **Fill** ([`run`], once per store, in `run` before the balance seed; `Meta nft_filled`):
+//! - **Fill** ([`run`], once per store and per trusted ledger, in `run` before the balance seed;
+//!   `Meta nft_filled` and `nft_filled_ledgers`; a ledger added to `[nft] ledgers` later is
+//!   walked on the next start, M-9; a failed fill never holds up the balances, M-8):
 //!   an ascending walk of the `evt` postings of every ledger event name (a module on the trusted
 //!   ledger allowlist, `kdx_hot::nft::is_ledger`: `marmalade-v2.ledger`, `marmalade.ledger`). The hot `TailPostings` come first, then the
 //!   segments (a block frozen meanwhile is seen in one of the two, or in both: replaying an
@@ -48,18 +50,56 @@ pub struct FillReport {
     pub secs: f64,
 }
 
-/// Whether the fill has finished on this store.
-pub fn filled(txn: &impl Txn) -> Result<bool> {
-    Ok(txn.meta(meta::NFT_FILLED)?.is_some())
+/// Trusted ledgers whose history the fill has not walked on this store (M-9): all of
+/// `configured` before the first fill, afterwards the ones added since. A store filled before
+/// the walked set was stored counts as filled for [`nft::DEFAULT_LEDGERS`].
+pub fn pending_for(txn: &impl Txn, configured: &[String]) -> Result<Vec<String>> {
+    if txn.meta(meta::NFT_FILLED)?.is_none() {
+        return Ok(configured.to_vec());
+    }
+    let done: Vec<String> = match txn.meta(meta::NFT_FILLED_LEDGERS)? {
+        Some(v) => String::from_utf8_lossy(&v)
+            .split('\n')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        None => nft::DEFAULT_LEDGERS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+    };
+    Ok(configured
+        .iter()
+        .filter(|l| !done.contains(l))
+        .cloned()
+        .collect())
 }
 
-/// EventName ids of ledger modules.
-fn ledger_names(dict: &MemDict) -> Vec<u32> {
+/// [`pending_for`] the configured ledgers.
+pub fn pending_ledgers(txn: &impl Txn) -> Result<Vec<String>> {
+    pending_for(txn, &nft::ledgers())
+}
+
+/// Whether the fill has walked every configured ledger on this store.
+pub fn filled(txn: &impl Txn) -> Result<bool> {
+    Ok(pending_ledgers(txn)?.is_empty())
+}
+
+/// Record a finished fill: its height and the ledger set now walked.
+fn mark_filled(txn: &mut RwTxn<'_>, top: u32, ledgers: &[String]) -> Result<()> {
+    txn.set_meta(meta::NFT_FILLED, &top.to_be_bytes())?;
+    txn.set_meta(meta::NFT_FILLED_LEDGERS, ledgers.join("\n").as_bytes())
+}
+
+/// EventName ids of ledger modules (only those in `only`, when given).
+fn ledger_names(dict: &MemDict, only: Option<&[String]>) -> Vec<u32> {
     (0..dict.len(DictKind::EventName) as u32)
         .filter(|&id| {
             dict.name(DictKind::EventName, id)
                 .and_then(|n| n.rsplit_once('.'))
-                .is_some_and(|(m, _)| nft::is_ledger(m))
+                .is_some_and(|(m, _)| {
+                    nft::is_ledger(m) && only.is_none_or(|o| o.iter().any(|x| x == m))
+                })
         })
         .collect()
 }
@@ -86,12 +126,19 @@ fn apply_batch(
     txn.commit()
 }
 
-/// Run the fill. `stop` is polled between batches.
-pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<FillReport> {
+/// Run the fill for every trusted ledger, or only the ledgers in `only` (a ledger added to
+/// `[nft] ledgers` after an earlier fill, M-9: its own events only). `stop` is polled between
+/// batches.
+pub fn run(
+    hot: &HotStore,
+    segdir: &Path,
+    only: Option<&[String]>,
+    stop: &dyn Fn() -> bool,
+) -> Result<FillReport> {
     let t0 = Instant::now();
     let mut rep = FillReport::default();
     let dict: Arc<MemDict> = Arc::new(HotDict::load(&hot.ro()?)?.mem().clone());
-    let names = ledger_names(&dict);
+    let names = ledger_names(&dict, only);
     rep.event_names = names.len() as u64;
 
     // Hot pass: tail txs, ascending.
@@ -159,7 +206,7 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<Fil
             top = top.max(h);
         }
     }
-    txn.set_meta(meta::NFT_FILLED, &top.to_be_bytes())?;
+    mark_filled(&mut txn, top, &nft::ledgers())?;
     txn.commit()?;
     rep.filled_height = Some(top);
     rep.secs = t0.elapsed().as_secs_f64();
@@ -334,6 +381,33 @@ mod tests {
     use kdx_hot::{Geometry, HotStore};
 
     use super::*;
+
+    /// M-9: a ledger added to the configured set after the fill is pending (its history gets
+    /// walked); a store filled before the set was stored counts the default ledgers as done.
+    #[test]
+    fn a_ledger_added_after_the_fill_is_pending() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let conf: Vec<String> = nft::DEFAULT_LEDGERS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(pending_for(&hot.ro().unwrap(), &conf).unwrap(), conf);
+        let mut txn = hot.rw().unwrap();
+        txn.set_meta(meta::NFT_FILLED, &5u32.to_be_bytes()).unwrap();
+        txn.commit().unwrap();
+        assert!(pending_for(&hot.ro().unwrap(), &conf).unwrap().is_empty());
+        let mut more = conf.clone();
+        more.push("n_x.ledger".into());
+        assert_eq!(
+            pending_for(&hot.ro().unwrap(), &more).unwrap(),
+            vec!["n_x.ledger".to_owned()]
+        );
+        let mut txn = hot.rw().unwrap();
+        mark_filled(&mut txn, 9, &more).unwrap();
+        txn.commit().unwrap();
+        assert!(pending_for(&hot.ro().unwrap(), &more).unwrap().is_empty());
+    }
 
     /// SR-1, I-5, M-3: a dropped (or answered) NFT row keeps a mark rewritten after the read,
     /// even at the same height (a reorg); the exact mark read is deleted.

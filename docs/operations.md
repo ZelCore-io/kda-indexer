@@ -374,6 +374,16 @@ the rows of the unwound txs dirty, and the reconciler reads `NftDirty` rows with
 `({ledger}.get-balance (read-msg "t") (read-msg "a"))` (same `/local` budget and safety rules
 as balances) between its balance batches. `kda-indexer inspect nft-check --count 20
 --compare-node` samples stored rows and compares them with the node.
+
+- The fill records the ledger set it walked (`Meta nft_filled_ledgers`). A ledger added to
+  `[nft] ledgers` later is walked on the next `run` start: only that ledger's events, from its
+  postings (hot tail and segments), with no node calls. `reconcile-balances --nft-fill` walks
+  every trusted ledger again.
+- A failed fill (for example one undecodable record) is logged (`nft: history fill failed`)
+  and retried an hour later; the balance seed and reconciler run meanwhile.
+- `n_4e470a97222514a8662dd1219000a0431451b0ee.ledger` (a v2-shaped ledger in a principal
+  namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
+  deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
 - Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).

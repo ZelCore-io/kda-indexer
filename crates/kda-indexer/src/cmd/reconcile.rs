@@ -42,7 +42,7 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
             let _lock = super::lock_data_dir(data_dir)?;
             let hs = HotStore::open(&hot_dir, super::hot::geometry(cfg))?;
             let segdir = kdx_ingest::ctx::segments_dir(data_dir);
-            let rep = kdx_ingest::nft_fill::run(&hs, &segdir, &|| false)?;
+            let rep = kdx_ingest::nft_fill::run(&hs, &segdir, None, &|| false)?;
             println!("{}", serde_json::to_string_pretty(&rep)?);
             // Then drain the marks it made with `get-balance` (the service does this itself).
             let local = kdx_node::LocalClient::new(
