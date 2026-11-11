@@ -33,6 +33,7 @@ pub fn list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
                     "block_count": e.block_count, "bytes": b, "level": i.level,
                     "rk_index": i.rk_index, "bh_index": i.bh_index,
                     "cmd_reencoded": i.cmd_reencoded, "postings": i.postings,
+                    "format_version": i.format_version, "files": i.files,
                 })
             })
             .collect();

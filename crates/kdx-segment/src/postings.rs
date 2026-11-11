@@ -1,4 +1,5 @@
-//! Posting files `acct.pst`, `xfer.pst`, `pk.pst`, `evt.pst`, `code.pst` (spec §3.6).
+//! Posting files `acct.pst`, `xfer.pst`, `pk.pst`, `evt.pst`, `code.pst`, `pact.pst` (spec §3.6;
+//! `pact` since store format v2).
 //!
 //! File (all integers little-endian unless noted):
 //! ```text

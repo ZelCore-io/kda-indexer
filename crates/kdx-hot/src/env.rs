@@ -15,8 +15,20 @@ use reth_libmdbx::{
 
 use crate::tables::{Table, Tables};
 
-/// Hot store format version (Meta `format_version`).
-pub const FORMAT_VERSION: u64 = 1;
+/// Hot store format version (Meta `format_version`). Version 2 goes with segment format 2
+/// (`pact` postings, chainweb-data's transfer rule) and opens with `MAX_DBS` 64.
+pub const FORMAT_VERSION: u64 = 2;
+
+/// MDBX named-database slots (20 tables in use; room for the additive P6/P7 tables).
+pub const MAX_DBS: usize = 64;
+
+/// The error for a hot store in another format version.
+pub fn format_refusal(found: u64) -> String {
+    format!(
+        "store format v{found}, this build reads v{FORMAT_VERSION}: rebuild it \
+         (docs/operations.md#format-upgrade)"
+    )
+}
 
 /// MDBX page size (B9: 4 KB pages on Ceph RBD, matching the block device and ext4).
 pub const PAGE_SIZE: usize = 4096;
@@ -59,7 +71,7 @@ pub struct HotStore {
 }
 
 impl HotStore {
-    /// Open (or create) the hot store in `dir`. A new store gets `format_version` 1,
+    /// Open (or create) the hot store in `dir`. A new store gets `format_version` 2,
     /// `frozen_frontier` 0, `next_txnum` 0 and its geometry in `Meta`; an existing store with
     /// another format version is refused.
     pub fn open(dir: &Path, g: Geometry) -> Result<HotStore> {
@@ -73,7 +85,7 @@ impl HotStore {
             .and_then(|x| x.checked_mul(MIB))
             .context("storage.mdbx_growth_mb too large")?;
         let env = Environment::builder()
-            .set_max_dbs(32)
+            .set_max_dbs(MAX_DBS)
             .set_geometry(reth_libmdbx::Geometry {
                 size: Some(0..max),
                 growth_step: Some(growth as isize),
@@ -100,7 +112,7 @@ impl HotStore {
             Some(v) => {
                 let v = be_u64(&v).context("Meta format_version")?;
                 if v != FORMAT_VERSION {
-                    bail!("hot store format version {v}, this build reads {FORMAT_VERSION}");
+                    bail!(format_refusal(v));
                 }
             }
         }
@@ -129,7 +141,7 @@ impl HotStore {
             bail!("no hot store in {}", dir.display());
         }
         let env = Environment::builder()
-            .set_max_dbs(32)
+            .set_max_dbs(MAX_DBS)
             .set_flags(EnvironmentFlags {
                 mode: Mode::ReadOnly,
                 ..Default::default()
@@ -151,7 +163,7 @@ impl HotStore {
                 .context("hot store has no format_version")?;
             let v = be_u64(&v).context("Meta format_version")?;
             if v != FORMAT_VERSION {
-                bail!("hot store format version {v}, this build reads {FORMAT_VERSION}");
+                bail!(format_refusal(v));
             }
         }
         Ok(HotStore {

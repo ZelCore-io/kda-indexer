@@ -1,7 +1,10 @@
-# kda-indexer on-disk format, version 1
+# kda-indexer on-disk format, version 2
 
 This document describes the files kda-indexer writes for frozen history: segment files,
-their indexes and the record encoding inside them. Everything here is format version 1.
+their indexes and the record encoding inside them. Everything here is format version 2
+(hot store `format_version` 2, segment `format_version` 2); the record codec version byte
+stays 1. A build refuses a store in another version with
+`store format v1, this build reads v2: rebuild it (docs/operations.md#format-upgrade)`.
 The data directory of one network looks like this:
 
 ```
@@ -17,6 +20,29 @@ readable together with the `hot/` store it was written with; copy both together.
 
 Integers are little-endian unless stated otherwise. `varint` is unsigned LEB128.
 `bytes` is a varint length followed by that many raw bytes.
+
+## Changes from version 1
+
+Version 2 is one reindex that bundles every stored-bytes change pending after P4. A v1 store
+cannot be upgraded in place; rebuild it (`docs/operations.md`, "Format upgrade").
+
+- **Transfer rule.** A transfer is chainweb-data's `mkTransferRows` row: the qualified event
+  name ends in `TRANSFER`, the event has exactly three params, `from` and `to` are strings,
+  and the amount is a number, a string with a leading rational, or an object whose
+  `decimal` or `int` member is one of those. Version 1 took only events named exactly
+  `TRANSFER` with a number or a one-key `{"decimal"|"int"}` amount. The rule drives the
+  record's `transfers` list, the `xfer` postings (keyed by the event's module) and the
+  transfer sides in `acct`. Coinbase TRANSFER events count, as before.
+- **`pact` posting family** (family byte 5, file `pact.pst`, `TailPostings` family 5): the
+  defpact history. Entity = the first 8 bytes of the pactId, big-endian. A tx is posted when
+  it has a pactId: an exec whose output `continuation.pactId` is set (it starts a pact) and
+  every `cont` step (`payload.cont.pactId` of the cmd, else the output's). Readers verify
+  the full pactId on the record. The hot `Defpacts` table is still written by the tail but
+  has no reader.
+- **Versions.** Hot `Meta format_version` 2; `manifest.json` and every `range.toml`
+  `format_version` 2. Posting files keep their own version byte 1 and records keep 1.
+- **MDBX** opens with 64 named-database slots (`max_dbs`; 32 before), room for later
+  additive tables.
 
 ## Identifiers
 
@@ -49,7 +75,7 @@ same files; `range.toml` says which kind it is.
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "network": "mainnet01",
   "entries": [
     { "kind": "range", "start": 0, "end": 100000,
@@ -195,7 +221,7 @@ a missing table or another `format_version`.
 ## `range.toml`
 
 ```toml
-format_version = 1
+format_version = 2
 network = "mainnet01"
 kind = "range"            # or "step"
 start = 7300000
@@ -291,7 +317,7 @@ bytes   metadata value                     if flags.b4 (absent = JSON null)
 bytes   continuation value                 if flags.b5 (absent = JSON null)
 varint  n_events, then per event: varint ModuleId, varint EventNameId,
         varint ModuleHash id, bytes params value
-varint  n_transfers, then varint event position each (fungible TRANSFER events)
+varint  n_transfers, then varint event position each (transfer events, see "Posting files")
 bytes   extra value (a map)                if flags.b6
 bytes   raw_tx      original tx object bytes   if bits.b1
 bytes   raw_output  original output bytes      if bits.b2
@@ -388,14 +414,20 @@ One file per family per range. Families and their entity keys:
 
 | family byte | file | entity |
 |---|---|---|
-| 0 | `xfer` | `AccountId << 32 | ModuleId`: txs where the account sends or receives a fungible TRANSFER of that module |
+| 0 | `xfer` | `AccountId << 32 | ModuleId`: txs where the account is `from` or `to` of a transfer (chainweb-data's rule, see below) emitted by that module |
 | 1 | `acct` | AccountId: txs whose sender, signer `addr` or coinbase miner is the account, or one of whose events names it (see below) |
 | 2 | `pk` | PubKeyId: txs signed by the key |
 | 3 | `evt` | EventNameId, or `1 << 32 | ModuleId` for "any event of the module" |
 | 4 | `code` | first 8 bytes of the CodeHash, big-endian (verify the full hash on read) |
+| 5 | `pact` | first 8 bytes of the pactId, big-endian: the exec that starts the defpact and every `cont` step (verify the full pactId on read) |
 
-An event names an account when the account is a side of a fungible `TRANSFER (from, to,
-amount)`, a poly-fungible `TRANSFER (id, from, to, amount)` or a `TRANSFER_XCHAIN` /
+A transfer is an event whose qualified name ends in `TRANSFER` with exactly three params:
+`from` and `to` strings, and an amount that is a number, a string starting with a rational
+(optional sign, digits, optional `.digits`, optional exponent; the rest is ignored), or an
+object whose `decimal` or `int` member is one of those (chainweb-data's `mkTransferRows`).
+
+An event names an account when the account is a side of a transfer (above), of a
+poly-fungible `TRANSFER (id, from, to, amount)` or of a `TRANSFER_XCHAIN` /
 `TRANSFER_XCHAIN_RECD (from, to, amount, chain)`, or when it is a syntactically valid Pact
 principal (`k:`, `w:`, `r:`, `u:`, `m:`, `p:`, `c:`) anywhere in the event's params. All of
 these are interned before encoding, so the `acct` posting set is a pure function of the

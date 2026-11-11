@@ -437,40 +437,10 @@ pub struct Transfer {
 }
 
 /// Leading rational of a text (`Data.Text.Read.rational`): sign, digits, optional
-/// fraction and exponent; trailing text is ignored.
+/// fraction and exponent; trailing text is ignored. Same rule as the index's
+/// `transfer_amount_ok`, so every `xfer` posting renders a row.
 fn text_rational(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
-        i += 1;
-    }
-    let ds = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == ds {
-        return None;
-    }
-    if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'-' || b[j] == b'+') {
-            j += 1;
-        }
-        let es = j;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j > es {
-            i = j;
-        }
-    }
-    Some(s[..i].to_owned())
+    kdx_decode::build::rational_prefix_len(s).map(|i| s[..i].to_owned())
 }
 
 fn amount_of(v: &Value) -> Option<String> {

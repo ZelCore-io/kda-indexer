@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use kdx_decode::index::{code_entity, evt_module_entity, xfer_entity};
+use kdx_decode::index::{code_entity, evt_module_entity, pact_entity, xfer_entity};
 use kdx_decode::{
     compare_json, render_header, render_miner, render_miner_bytes, render_output,
     render_output_bytes, render_tx, render_tx_bytes, Family,
@@ -195,7 +195,20 @@ pub fn entity(
             a[..8].copy_from_slice(&b[..8]);
             code_entity(&a)
         }
+        Family::Pact => pact_entity(&Hash32::from_b64url(name).context("pactId (base64url)")?),
     })
+}
+
+/// Request key text of a posting's tx (`<coinbase>` for coinbase, `?` when the record is
+/// missing).
+fn rk_of(r: Option<TxRecord>) -> String {
+    match r {
+        Some(r) => match r.request_key {
+            Some(h) if !r.key.is_coinbase() => h.to_b64url(),
+            _ => "<coinbase>".into(),
+        },
+        None => "?".into(),
+    }
 }
 
 pub fn postings(
@@ -208,7 +221,7 @@ pub fn postings(
     let fam = Family::ALL
         .into_iter()
         .find(|f| f.name() == family)
-        .with_context(|| format!("family {family:?} (acct|xfer|pk|evt|code)"))?;
+        .with_context(|| format!("family {family:?} (acct|xfer|pk|evt|code|pact)"))?;
     let ent = entity(s.dict.as_ref(), fam, name, module)?;
     let mut prefix = vec![fam as u8];
     prefix.extend_from_slice(&ent.to_be_bytes());
@@ -221,14 +234,19 @@ pub fn postings(
             break;
         }
         let tk = parse_txkey(&k[9..]).context("posting key")?;
-        out.push(json!({"source": "hot", "txkey": tk.0, "chain": tk.chain(), "height": tk.height(), "pos": tk.pos()}));
+        let r = match s.txn.get(Table::TailTxs, &tk.to_be_bytes())? {
+            Some(v) => Some(decode_tx(&v)?),
+            None => None,
+        };
+        out.push(json!({"source": "hot", "txkey": tk.0, "chain": tk.chain(), "height": tk.height(), "pos": tk.pos(), "rk": rk_of(r)}));
     }
     for t in s.seg.postings(fam, ent) {
         if out.len() >= limit {
             break;
         }
         let tk = s.seg.txkey(t).context("txkey of posting")?;
-        out.push(json!({"source": "frozen", "txnum": t, "txkey": tk.0, "chain": tk.chain(), "height": tk.height(), "pos": tk.pos()}));
+        let rk = rk_of(s.seg.tx(t)?);
+        out.push(json!({"source": "frozen", "txnum": t, "txkey": tk.0, "chain": tk.chain(), "height": tk.height(), "pos": tk.pos(), "rk": rk}));
     }
     println!(
         "{}",

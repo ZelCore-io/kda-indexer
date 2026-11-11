@@ -1,4 +1,4 @@
-//! Build v1 records from a decoded block (spec §3.4 "Record encoding").
+//! Build records (record codec version 1, store format v2) from a decoded block (spec §3.4 "Record encoding").
 //!
 //! Names are interned for the whole block first (`intern_block`; first-seen order: miner
 //! account, then coinbase, then user txs in payload order; per tx: meta sender, signer
@@ -88,21 +88,65 @@ pub fn parse_event(e: &Value) -> Option<EventParts<'_>> {
     })
 }
 
-/// Fungible `TRANSFER`: `[from: str, to: str, amount: number | {"decimal"|"int": ..}]`.
+/// Length of the leading rational of `s` as `Data.Text.Read.rational` reads it: an optional
+/// `+`/`-`, at least one ASCII digit, an optional `.` followed by at least one digit, and an
+/// optional `e`/`E` exponent with an optional sign and at least one digit. A `.` or exponent
+/// marker without digits after it ends the number; trailing text is ignored. `None` when `s`
+/// does not start with a number.
+pub fn rational_prefix_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let digits = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        i
+    };
+    let mut i = usize::from(matches!(b.first(), Some(b'-' | b'+')));
+    let ds = i;
+    i = digits(i);
+    if i == ds {
+        return None;
+    }
+    if b.get(i) == Some(&b'.') && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+        i = digits(i + 1);
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        let es = i + 1 + usize::from(matches!(b.get(i + 1), Some(b'-' | b'+')));
+        let j = digits(es);
+        if j > es {
+            i = j;
+        }
+    }
+    Some(i)
+}
+
+/// chainweb-data's `getAmount` succeeds on the amount param: a number, a string with a
+/// leading rational, or an object whose `decimal` or `int` member is one of those (other
+/// members are ignored).
+pub fn transfer_amount_ok(v: &Value) -> bool {
+    let plain = |x: &Value| match x {
+        Value::Number(_) => true,
+        Value::String(s) => rational_prefix_len(s).is_some(),
+        _ => false,
+    };
+    match v {
+        Value::Object(o) => ["decimal", "int"]
+            .iter()
+            .any(|k| o.get(*k).is_some_and(plain)),
+        _ => plain(v),
+    }
+}
+
+/// A transfer row of chainweb-data (`mkTransferRows`): the qualified event name ends in
+/// `TRANSFER`, there are exactly three params, `from` and `to` are strings and the amount
+/// passes `transfer_amount_ok`. Drives the record's `transfers` list, the `xfer` postings
+/// (keyed by the event's module) and the `acct` sides.
 pub fn transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> {
-    if ev.name != "TRANSFER" {
+    if !ev.event_name.ends_with("TRANSFER") {
         return None;
     }
     let p = ev.params.as_array()?;
-    if p.len() != 3 {
-        return None;
-    }
-    let amount_ok = match &p[2] {
-        Value::Number(_) => true,
-        Value::Object(o) => o.len() == 1 && (o.contains_key("decimal") || o.contains_key("int")),
-        _ => false,
-    };
-    if !amount_ok {
+    if p.len() != 3 || !transfer_amount_ok(&p[2]) {
         return None;
     }
     Some((p[0].as_str()?, p[1].as_str()?))
@@ -473,4 +517,74 @@ pub fn encode_records(
         txs.push(r);
     }
     Ok((block, txs))
+}
+
+#[cfg(test)]
+mod transfer_rule_tests {
+    use serde_json::json;
+
+    use super::{parse_event, rational_prefix_len, transfer_accounts, transfer_amount_ok};
+
+    #[test]
+    fn rational_prefix() {
+        for (s, n) in [
+            ("1", Some(1)),
+            ("-1.5", Some(4)),
+            ("+2e-3x", Some(5)),
+            ("5.", Some(1)),
+            ("5.e3", Some(1)),
+            ("7e", Some(1)),
+            ("0.25E+2", Some(7)),
+            (".5", None),
+            ("-", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            assert_eq!(rational_prefix_len(s), n, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn amount_forms() {
+        for v in [
+            json!(1.5),
+            json!({"decimal": 1.5}),
+            json!({"decimal": "1.5"}),
+            json!({"int": 3}),
+            json!({"int": "3"}),
+            json!("12.5 KDA"),
+            json!({"decimal": "x", "int": 2}),
+            json!({"other": 1, "decimal": 2}),
+        ] {
+            assert!(transfer_amount_ok(&v), "{v}");
+        }
+        for v in [
+            json!("x"),
+            json!({"decimal": "x"}),
+            json!({"other": 1}),
+            json!(null),
+            json!([1]),
+        ] {
+            assert!(!transfer_amount_ok(&v), "{v}");
+        }
+    }
+
+    #[test]
+    fn suffix_rule() {
+        let ev = |name: &str, params| {
+            json!({"params": params, "name": name,
+                   "module": {"namespace": "free", "name": "wiz-arena"}, "moduleHash": "h"})
+        };
+        let e = ev("WIZ_TRANSFER", json!(["a", "b", "1.0"]));
+        assert_eq!(
+            transfer_accounts(&parse_event(&e).unwrap()),
+            Some(("a", "b"))
+        );
+        let e = ev("TRANSFER_XCHAIN", json!(["a", "b", 1.0]));
+        assert_eq!(transfer_accounts(&parse_event(&e).unwrap()), None);
+        let e = ev("TRANSFER", json!(["id", "a", "b", 1.0]));
+        assert_eq!(transfer_accounts(&parse_event(&e).unwrap()), None);
+        let e = ev("TRANSFER", json!(["a", 5, 1.0]));
+        assert_eq!(transfer_accounts(&parse_event(&e).unwrap()), None);
+    }
 }

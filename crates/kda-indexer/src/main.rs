@@ -194,9 +194,9 @@ enum InspectWhat {
     Block { chain: u8, height: u32 },
     /// A block by hash (base64url).
     BlockHash { hash: String },
-    /// Posting list of an entity, newest first: family acct|xfer|pk|evt|code; name is an
-    /// account, public key, qualified event name (`coin.TRANSFER`, or `coin.*` for the
-    /// module), or code-hash hex.
+    /// Posting list of an entity, newest first: family acct|xfer|pk|evt|code|pact; name is
+    /// an account, public key, qualified event name (`coin.TRANSFER`, or `coin.*` for the
+    /// module), code-hash hex or pactId (base64url).
     Postings {
         family: String,
         name: String,

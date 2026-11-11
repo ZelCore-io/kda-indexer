@@ -52,8 +52,8 @@ const DECODE_BATCH: usize = 1024;
 const WRITER_BASE_MB: u64 = 1024;
 /// Bytes per buffered posting entry: 16 B of key plus Vec growth headroom.
 const POSTING_ENTRY_BYTES: u64 = 32;
-/// Posting families buffered by the writer.
-const POSTING_FAMILIES: u64 = 5;
+/// Posting families buffered by the writer (one buffer each; `pact` since format v2).
+const POSTING_FAMILIES: u64 = kdx_decode::Family::ALL.len() as u64;
 /// How often the RSS guard samples while backfill runs.
 const RSS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 

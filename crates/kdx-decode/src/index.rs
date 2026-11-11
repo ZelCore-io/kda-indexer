@@ -10,6 +10,8 @@
 //! held before. Non-principal names that appear only in other event params get no posting.
 //! Strings longer than `MAX_ACCOUNT_LEN` are never accounts.
 //! Pk: signer `pubKey` (interned here). Code: blake2b-128 of `exec.code`.
+//! Pact (format v2): `pact_entity` of the tx's defpact id, so an exec that starts a pact and
+//! every `cont` step of it share one posting list.
 //! Txs with `cmd_unparsed` get only output-derived postings (events, transfers, defpact).
 
 use kdx_types::record::{BlockRecord, TxRecord};
@@ -32,15 +34,18 @@ pub enum Family {
     Pk = 2,
     Evt = 3,
     Code = 4,
+    /// Defpact history (store format v2): the pact's starting exec and every `cont` step.
+    Pact = 5,
 }
 
 impl Family {
-    pub const ALL: [Family; 5] = [
+    pub const ALL: [Family; 6] = [
         Family::Xfer,
         Family::Acct,
         Family::Pk,
         Family::Evt,
         Family::Code,
+        Family::Pact,
     ];
     pub fn from_u8(b: u8) -> Option<Family> {
         Family::ALL.get(b as usize).copied()
@@ -52,6 +57,7 @@ impl Family {
             Family::Pk => "pk",
             Family::Evt => "evt",
             Family::Code => "code",
+            Family::Pact => "pact",
         }
     }
 }
@@ -70,6 +76,15 @@ pub fn evt_module_entity(module: u32) -> u64 {
 pub fn code_entity(code_hash: &[u8; 16]) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&code_hash[..8]);
+    u64::from_be_bytes(a)
+}
+
+/// Entity of the `pact` family: the first 8 bytes of the pactId, big-endian. Readers verify
+/// the full pactId on the record (`cont.pactId` of the cmd or `continuation.pactId` of the
+/// output).
+pub fn pact_entity(pact_id: &Hash32) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&pact_id.0[..8]);
     u64::from_be_bytes(a)
 }
 
@@ -203,6 +218,9 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
             } else {
                 pact_id = pact_id_of(out_pact);
             }
+        }
+        if let Some(id) = &pact_id {
+            p.push((Family::Pact, pact_entity(id)));
         }
         p.sort_unstable();
         p.dedup();

@@ -10,8 +10,8 @@
 //! | `HeaderByHash` | hash [32] | chain u8, height u32 |
 //! | `TailTxs` | TxKey u64 | `encode_tx` bytes |
 //! | `TailRk` | request key [32] | TxKey u64 |
-//! | `TailPostings` | family u8, entity u64, TxKey u64 | empty |
-//! | `Defpacts` | pactId [32] | TxKey u64 × n, ascending |
+//! | `TailPostings` | family u8 (0..=5, `kdx_decode::Family`), entity u64, TxKey u64 | empty |
+//! | `Defpacts` | pactId [32] | TxKey u64 × n, ascending (tail only; superseded by the `pact` postings, no reader) |
 //! | `Undo` | chain u8, height u32 | encoded `Vec<UndoOp>` (`undo.rs`) |
 //! | `Counters` | name (utf-8) | u64 |
 //!

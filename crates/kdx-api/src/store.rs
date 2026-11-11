@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use kdx_decode::index::pact_entity;
 use kdx_decode::Family;
 use kdx_hot::tables::{block_key, parse_block_key, parse_txkey, posting_key};
 use kdx_hot::{dict as hdict, HotStore, RoTxn, Stage, Table, Txn};
@@ -578,6 +579,26 @@ impl View {
         })
     }
 
+    /// Every stored tx of the defpact `pact`, ascending by TxKey (hot and frozen): the exec
+    /// that started it and each `cont` step. Candidates come from the `pact` postings (an
+    /// 8-byte entity); each record is checked to hold this exact pactId, as the cmd's
+    /// `payload.cont.pactId` or the output's `continuation.pactId`.
+    pub fn pact_txs(&self, pact: &Hash32) -> ApiResult<Vec<TxKey>> {
+        let mut out = Vec::new();
+        for k in self.postings(Family::Pact, pact_entity(pact), PostingQuery::default())? {
+            let k = k?;
+            if let Some(r) = self.tx(k)? {
+                if cmd_pact_id(&r) == Some(*pact)
+                    || record_pact_id(&r, &self.dict())? == Some(*pact)
+                {
+                    out.push(k);
+                }
+            }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
     /// TxKeys of `(f, entity)`, newest first: the hot part, then the frozen part, with the
     /// query's filters. The deadline is checked every 64 items.
     pub fn postings(
@@ -671,6 +692,29 @@ impl View {
             Some(r)
         })))
     }
+}
+
+/// `payload.cont.pactId` of a user tx's cmd.
+fn cmd_pact_id(r: &TxRecord) -> Option<Hash32> {
+    if r.cmd_unparsed {
+        return None;
+    }
+    let cmd = kdx_decode::json::parse_untrusted(r.cmd.as_deref()?).ok()?;
+    cmd.pointer("/payload/cont/pactId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| Hash32::from_b64url(s).ok())
+}
+
+/// `continuation.pactId` of a tx's output.
+fn record_pact_id(r: &TxRecord, dict: &dyn kdx_types::Dict) -> ApiResult<Option<Hash32>> {
+    if r.raw_output.is_none() && r.continuation.is_none() {
+        return Ok(None);
+    }
+    let out = kdx_decode::render_output(r, dict).map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(out
+        .pointer("/continuation/pactId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| Hash32::from_b64url(s).ok()))
 }
 
 #[cfg(test)]

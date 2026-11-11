@@ -116,6 +116,35 @@ and install the drop-in `examples/datadir-volume-root.conf`. It replaces the uni
 `ReadWritePaths` so the sandbox opens that directory. Ownership still has to be
 `kda-indexer`.
 
+## Format upgrade
+
+A release that changes the store format (see the version and "Changes from version 1" at
+the top of [format.md](format.md)) cannot read the old store. It refuses to start with:
+
+```
+store format v1, this build reads v2: rebuild it (docs/operations.md#format-upgrade)
+```
+
+There is no in-place migration: the new store is a full backfill (about 9–10 hours on
+mainnet01). Do the "Before any big write" check first.
+
+1. Stop the unit: `systemctl stop kda-indexer-mainnet01`. Record what you want to keep
+   from the old store (`hot stats`, `segments list --json`, sizes).
+2. Keep or delete the old data dir. In a fleet where other hosts serve traffic, keeping it
+   (renamed, for example `mainnet01.v1`) allows a rollback to the old package; on a single
+   host whose store nothing consumes yet, delete it so the volume does not hold both:
+
+   ```sh
+   sudo rm -rf /opt/coins/data/kadena/kda-indexer/mainnet01
+   sudo install -d -o kda-indexer -g kda-indexer /opt/coins/data/kadena/kda-indexer/mainnet01
+   ```
+
+3. On thin-provisioned or Ceph-backed volumes, return the freed blocks:
+   `sudo fstrim -v /opt/coins/data/kadena/kda-indexer`.
+4. Install the new package (`dpkg -i`), which keeps the conffile.
+5. Start the unit: `systemctl start kda-indexer-mainnet01`. On the empty data dir it runs a
+   full backfill, then tails; `systemctl status` shows `backfill r/n` while it runs.
+
 ## Read-only `serve`
 
 `kda-indexer serve` runs the APIs over a data dir that another process writes (a read replica,
