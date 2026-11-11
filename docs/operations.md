@@ -247,7 +247,11 @@ kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
   that the final manifest no longer names are removed.
 - A refused `--out` (inside the data dir, not empty) creates nothing; after any later failure
   the command removes what it created, so the same `--out` can be used again.
-- Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`.
+- `search/` (when the source has one) comes last: its `manifest.json` and tantivy's
+  `meta.json` are read once and the files of the segments `meta.json` lists are linked (or
+  copied); a file a commit or merge removed first restarts this step (up to five reads).
+  The copy's tail stage re-reads from the copied `built_through_height`.
+- Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`, `search.new/`, `search.lock`.
 - `DIR/SNAPSHOT.json` records the format versions, network, frozen frontier, `next_txnum`, the
   tail checkpoint per chain, the manifest's blake3, the binary version and the creation time
   (no paths).
@@ -272,6 +276,35 @@ the hard links that exist inside the copy). See "A second host from a snapshot" 
 follows the node block by block and resolves duplicate hot rows below the frozen frontier at
 start, as after a crash during a freeze. A snapshot that is older than the node's history is
 not a problem; one that is older than the tail can follow quickly is just slower to catch up.
+
+## Code search index
+
+`run` keeps `search/` (spec §3.8) itself: when `search/manifest.json` is missing and backfill
+is done it builds the index in the background (status line `search rebuild d/n`), then its
+tail stage adds the body of every new exec tx it has not indexed yet, committing every
+`[search] commit_secs`. `serve` only reads it. Search failures are logged and retried after
+a minute; they never stop ingest.
+
+```sh
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search rebuild --dry-run
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search rebuild [--mode full|fallback]
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search query 'coin.transfer'
+```
+
+- `--dry-run` measures the exact number of distinct bodies (census), samples 1% of them per
+  range (average length, module share), builds a trial index of the first 1,000,000 bodies
+  (`--trial-docs`) in `search.dryrun/` (removed afterwards) and prints the projected size and
+  the S-1 decision: `full` when the projection is at most 40 GB, else `fallback` with the
+  smallest `fallback_min_len` whose projection is at most 30 GB. Set `[search] mode` and
+  `fallback_min_len` from it.
+- `search rebuild` is read-only on `hot/` and `segments/`, so it can run beside the service
+  (as the service user, `nice -n 19 ionice -c3` on a busy host). It writes `search.new/`, then
+  swaps it in; the running `run` notices the new `built_at` and reopens. One rebuild at a
+  time (`search.lock`). It is a big write: run "Before any big write" first.
+- `[search] build_threads` and `heap_mb` set the rebuild's threads and tantivy writer heap;
+  the tail stage uses one thread and 64 MB.
+- Deleting `search/` and restarting the service rebuilds it in the background; nothing else
+  depends on it.
 
 ## Before any big write
 

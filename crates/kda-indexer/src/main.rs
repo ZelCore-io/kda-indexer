@@ -149,6 +149,11 @@ enum Command {
         #[arg(long)]
         copy: bool,
     },
+    /// Code search index (`search/`): rebuild it, or query it (dev aid).
+    Search {
+        #[command(subcommand)]
+        action: SearchAction,
+    },
     /// Frozen segments: list the manifest, check files and indexes.
     Segments {
         #[command(subcommand)]
@@ -186,6 +191,38 @@ enum HotAction {
         /// Also print a blake3 digest per table (replay checks).
         #[arg(long)]
         digest: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SearchAction {
+    /// Build the code index from the hot store and segments into `search.new/`, then swap it
+    /// in for `search/`. Read-only on the store; can run beside `run`.
+    Rebuild {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Census and S-1 projection only (distinct bodies, projected size, mode decision).
+        /// Nothing durable is written; the trial index in `search.dryrun/` is removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Index mode: auto, full or fallback (default: `[search] mode`).
+        #[arg(long)]
+        mode: Option<String>,
+        /// Docs of the projection's trial index.
+        #[arg(long, default_value_t = 1_000_000)]
+        trial_docs: u64,
+    },
+    /// Print the candidate code bodies of a LIKE pattern (dev aid).
+    Query {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Postgres LIKE pattern, matched as `%pattern%`.
+        pattern: String,
+        /// Matches to print.
+        #[arg(long, default_value_t = 20)]
+        show: usize,
     },
 }
 
@@ -441,6 +478,32 @@ async fn main() -> anyhow::Result<()> {
             out,
             copy,
         }),
+        Command::Search { action } => match action {
+            SearchAction::Rebuild {
+                data_dir,
+                dry_run,
+                mode,
+                trial_docs,
+            } => kda_indexer::cmd::search::rebuild(
+                &cfg,
+                kda_indexer::cmd::search::RebuildArgs {
+                    data_dir: data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+                    dry_run,
+                    mode,
+                    trial_docs,
+                },
+            ),
+            SearchAction::Query {
+                data_dir,
+                pattern,
+                show,
+            } => kda_indexer::cmd::search::query(
+                &cfg,
+                data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+                &pattern,
+                show,
+            ),
+        },
         Command::Segments { action } => match action {
             SegmentsAction::List { data_dir, json } => {
                 kda_indexer::cmd::segments::list(data_dir.as_deref().unwrap_or(&cfg.data_dir), json)

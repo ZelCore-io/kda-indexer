@@ -12,6 +12,7 @@ members = [
     "crates/kdx-ingest",
     "crates/kdx-api",
     "crates/kdx-metrics",
+    "crates/kdx-search",
 ]
 # Vendored third-party code builds as a path dependency, not as a workspace member (no lints).
 exclude = ["vendor/ptr_hash"]
@@ -65,6 +66,8 @@ libc = "0.2"
 arc-swap = "1"
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 tower-http = { version = "0.6", features = ["cors", "limit"] }
+# Code search (P6, spec 3.8). Pinned exactly; only mmap and the zstd doc store.
+tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "zstd-compression"] }
 
 kdx-types = { path = "crates/kdx-types" }
 kdx-node = { path = "crates/kdx-node" }
@@ -74,6 +77,7 @@ kdx-segment = { path = "crates/kdx-segment" }
 kdx-ingest = { path = "crates/kdx-ingest" }
 kdx-api = { path = "crates/kdx-api" }
 kdx-metrics = { path = "crates/kdx-metrics" }
+kdx-search = { path = "crates/kdx-search" }
 
 # Spec 6.2. target-cpu stays generic so a package built on one node installs on the others.
 # If codegen-units = 1 makes the node build exceed ~20 minutes, say so in the run report.

@@ -1,0 +1,87 @@
+//! `search/manifest.json` (plan Task 8): what the index holds and how far it is built.
+
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::Mode;
+
+/// Version of the `search/` layout (manifest fields, schema, tokenizer).
+pub const FORMAT: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchManifest {
+    pub format: u32,
+    /// tantivy version that wrote the index.
+    pub tantivy: String,
+    /// `full` or `fallback`.
+    pub mode: String,
+    /// Fallback threshold in bytes of code (0 in full mode).
+    pub fallback_min_len: u32,
+    /// Every exec tx at or below this height (on every chain) has its body in the index.
+    /// Bodies of later txs may be in it too (the tail stage adds them; docs are never
+    /// deleted). The tail stage moves it forward after each commit.
+    pub built_through_height: u32,
+    pub docs: u64,
+    /// Index bytes on disk (at the last rebuild or tail commit).
+    pub bytes: u64,
+    /// Unix seconds of the rebuild that created this index (a reader that sees it change
+    /// reopens: the directory was swapped).
+    pub built_at: u64,
+}
+
+impl SearchManifest {
+    pub fn load(dir: &Path) -> Result<Option<SearchManifest>> {
+        let p = dir.join("manifest.json");
+        let b = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
+        };
+        let m: SearchManifest =
+            serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
+        if m.format != FORMAT {
+            bail!(
+                "{}: search format {} (this binary reads {FORMAT}); run `search rebuild`",
+                p.display(),
+                m.format
+            );
+        }
+        Ok(Some(m))
+    }
+
+    /// Atomic replace (write, fsync, rename, fsync dir).
+    pub fn commit(&self, dir: &Path) -> Result<()> {
+        let b = serde_json::to_vec_pretty(self)?;
+        kdx_segment::files::replace_file(&dir.join("manifest.json"), &b)
+    }
+
+    pub fn mode(&self) -> Mode {
+        match self.mode.as_str() {
+            "fallback" => Mode::Fallback {
+                min_len: self.fallback_min_len,
+            },
+            _ => Mode::Full,
+        }
+    }
+}
+
+/// Bytes of the regular files directly in `dir`.
+pub fn dir_bytes(dir: &Path) -> Result<u64> {
+    let mut n = 0;
+    for e in std::fs::read_dir(dir)? {
+        let m = e?.metadata()?;
+        if m.is_file() {
+            n += m.len();
+        }
+    }
+    Ok(n)
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

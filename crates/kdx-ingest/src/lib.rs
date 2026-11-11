@@ -11,6 +11,7 @@ pub mod freezer;
 pub mod heartbeat;
 pub mod pipeline;
 pub mod reorg;
+pub mod search_stage;
 pub mod tail;
 
 pub use canon::{HeaderMode, Walker};

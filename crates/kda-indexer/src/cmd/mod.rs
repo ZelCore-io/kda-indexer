@@ -18,6 +18,7 @@ pub mod measure;
 pub mod notify;
 pub mod probe;
 pub mod run;
+pub mod search;
 pub mod segments;
 pub mod serve;
 pub mod snapshot;

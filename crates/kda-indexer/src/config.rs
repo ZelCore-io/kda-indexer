@@ -256,6 +256,27 @@ pub struct SearchConfig {
     pub max_candidates: u32,
     pub max_scan_heights: u32,
     pub timeout_ms: u64,
+    /// Code index mode (S-1): `auto` (decided by the projection at rebuild), `full`, `fallback`.
+    pub mode: String,
+    /// Fallback mode: bodies shorter than this many bytes (and not a module or interface) are
+    /// not indexed. 0 = derive it from the projection.
+    pub fallback_min_len: u32,
+    /// Tail stage commit period.
+    pub commit_secs: u64,
+    /// Concurrent searches (all search routes together); more answer 503.
+    pub concurrency: u32,
+    /// Concurrent searches per client; more answer 429.
+    pub per_client: u32,
+    /// `search rebuild` threads (decode and tantivy writer).
+    pub build_threads: u32,
+    /// `search rebuild` tantivy writer heap, MiB.
+    pub heap_mb: u32,
+}
+
+impl SearchConfig {
+    pub fn mode_sel(&self) -> anyhow::Result<kdx_search::ModeSel> {
+        kdx_search::ModeSel::parse(&self.mode, self.fallback_min_len)
+    }
 }
 
 impl Default for SearchConfig {
@@ -266,6 +287,13 @@ impl Default for SearchConfig {
             max_candidates: 10_000,
             max_scan_heights: 20_000,
             timeout_ms: 2000,
+            mode: "auto".into(),
+            fallback_min_len: 0,
+            commit_secs: 60,
+            concurrency: 4,
+            per_client: 1,
+            build_threads: 2,
+            heap_mb: 512,
         }
     }
 }
@@ -346,6 +374,13 @@ impl Config {
             "backfill.etl_mem_mb must be >= 16 and backfill.mem_cap_mb >= 512"
         );
         anyhow::ensure!(b.dict_samples > 0, "backfill.dict_samples must be > 0");
+        let s = &self.search;
+        s.mode_sel()?;
+        anyhow::ensure!(
+            s.commit_secs > 0 && s.concurrency > 0 && s.per_client > 0 && s.build_threads > 0,
+            "search.commit_secs, concurrency, per_client and build_threads must be > 0"
+        );
+        anyhow::ensure!(s.heap_mb >= 16, "search.heap_mb must be at least 16");
         anyhow::ensure!(
             self.storage.mdbx_max_gb > 0 && self.storage.mdbx_growth_mb > 0,
             "storage.mdbx_max_gb and storage.mdbx_growth_mb must be > 0"

@@ -221,15 +221,39 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         let node = super::node_client(cfg)?;
         node.set_batch_limit(cfg.ingest.batch_size);
         let ctx = Arc::new(Ctx::open_with(opts(cfg, &data_dir, a.until), node, hot).await?);
-        let r = follow(ctx, token.clone(), a.freeze).await;
+        let r = follow(ctx, token.clone(), a.freeze, search_opts(cfg, &data_dir)?).await;
         return stop_api(api, token, r).await;
     }
-    let r = follow(ctx, token.clone(), a.freeze).await;
+    let r = follow(ctx, token.clone(), a.freeze, search_opts(cfg, &data_dir)?).await;
     stop_api(api, token, r).await
 }
 
-/// `STATUS=` text: backfill progress as range r of n, else the tail's largest lag.
+/// Tail stage 7 settings from `[search]`.
+fn search_opts(
+    cfg: &Config,
+    data_dir: &Path,
+) -> anyhow::Result<kdx_ingest::search_stage::SearchStageOpts> {
+    let s = &cfg.search;
+    Ok(kdx_ingest::search_stage::SearchStageOpts {
+        data_dir: data_dir.to_path_buf(),
+        mode: s.mode_sel()?,
+        commit_secs: s.commit_secs,
+        build_threads: s.build_threads as usize,
+        heap_mb: s.heap_mb as usize,
+    })
+}
+
+/// `STATUS=` text: backfill progress as range r of n, else the tail's largest lag; a search
+/// rebuild running in this process adds its ranges done.
 fn status_text(tips: &kdx_api::TipWatch, range_heights: u64) -> String {
+    let base = ingest_status(tips, range_heights);
+    match kdx_search::progress() {
+        Some((d, t)) => format!("{base}; search rebuild {d}/{t}"),
+        None => base,
+    }
+}
+
+fn ingest_status(tips: &kdx_api::TipWatch, range_heights: u64) -> String {
     let m = kdx_metrics::get();
     if tips.backfill() {
         let next = m.backfill_next_height.get().max(0) as u64;
@@ -293,7 +317,12 @@ async fn init_partial(ctx: &Ctx, cut: &kdx_node::Cut, h: u32) -> anyhow::Result<
     Ok(())
 }
 
-async fn follow(ctx: Arc<Ctx>, token: CancellationToken, freeze: bool) -> anyhow::Result<()> {
+async fn follow(
+    ctx: Arc<Ctx>,
+    token: CancellationToken,
+    freeze: bool,
+    search: kdx_ingest::search_stage::SearchStageOpts,
+) -> anyhow::Result<()> {
     {
         let c = ctx.clone();
         tokio::task::spawn_blocking(move || freezer::reconcile(&c)).await??;
@@ -303,6 +332,14 @@ async fn follow(ctx: Arc<Ctx>, token: CancellationToken, freeze: bool) -> anyhow
     heartbeat::retire(Source::Run);
     let tail_stop = token.child_token();
     let mut tail = tokio::spawn(kdx_ingest::tail::run(ctx.clone(), tail_stop.clone()));
+    // Tail stage 7: code search docs (rebuilds the index first when there is none). Its
+    // failures are logged and retried inside; it stops with the process.
+    let search_stop = token.child_token();
+    let search = tokio::spawn(kdx_ingest::search_stage::run(
+        ctx.clone(),
+        search,
+        search_stop.clone(),
+    ));
     let fz_stop = token.child_token();
     let fz = freeze.then(|| {
         let ctx = ctx.clone();
@@ -352,6 +389,10 @@ async fn follow(ctx: Arc<Ctx>, token: CancellationToken, freeze: bool) -> anyhow
         }
         None => tail.await?,
     };
+    search_stop.cancel();
+    if let Err(e) = search.await.map_err(anyhow::Error::from).and_then(|x| x) {
+        tracing::error!(error = format!("{e:#}"), "search stage");
+    }
     let txn = ctx.hot.ro()?;
     tracing::info!(
         frontier = txn.frozen_frontier()?,

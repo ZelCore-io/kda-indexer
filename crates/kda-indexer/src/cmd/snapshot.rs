@@ -13,8 +13,15 @@
 //! the hot copy are taken again; files linked earlier stay valid (immutable, named by range).
 //! T is never reused across manifest reads.
 //!
-//! Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`, anything else outside
-//! `segments/` and `hot/`. The snapshot is a data dir (`serve --data-dir DIR`, `run`).
+//! Then `search/` (P6): its `manifest.json` and tantivy's `meta.json` are read once and the
+//! files of the segments `meta.json` lists are linked (or copied); a file a tantivy commit or
+//! merge removed first makes the step start over. The search manifest is read before the
+//! index, so its `built_through_height` never runs ahead of the docs (the copy's tail stage
+//! re-reads from there; bodies already present are skipped).
+//!
+//! Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`, `search.new/`, anything else
+//! outside `segments/`, `hot/` and `search/`. The snapshot is a data dir (`serve --data-dir
+//! DIR`, `run`).
 //! On a refusal nothing is created; on a later failure what this run created is removed.
 
 use std::collections::HashSet;
@@ -56,6 +63,8 @@ pub struct SnapshotReport {
     pub hot_bytes: u64,
     pub linked: bool,
     pub attempts: usize,
+    pub search_files: usize,
+    pub search_bytes: u64,
     pub secs: f64,
 }
 
@@ -71,12 +80,14 @@ enum Point {
 pub fn run(a: SnapshotArgs) -> anyhow::Result<()> {
     let r = snapshot(&a)?;
     println!(
-        "snapshot {}: {} segment files {} ({} B), hot {} B, {} manifest read(s), {:.1} s",
+        "snapshot {}: {} segment files {} ({} B), hot {} B, search {} files ({} B), {} manifest read(s), {:.1} s",
         a.out.display(),
         r.files,
         if r.linked { "linked" } else { "copied" },
         r.segment_bytes,
         r.hot_bytes,
+        r.search_files,
+        r.search_bytes,
         r.attempts,
         r.secs
     );
@@ -342,6 +353,14 @@ fn snapshot_into(
     fsync_dir(&out_seg)?;
     rep.hot_bytes = fs::metadata(out_hot.join("mdbx.dat"))?.len();
     fsync_dir(&out_hot)?;
+    let search = snapshot_search(
+        &kdx_search::search_dir(&a.data_dir),
+        &kdx_search::search_dir(&a.out),
+        a.copy,
+    )?;
+    if let Some((n, b, _)) = &search {
+        (rep.search_files, rep.search_bytes) = (*n, *b);
+    }
 
     let network = info
         .network
@@ -354,6 +373,7 @@ fn snapshot_into(
         "next_txnum": info.next_txnum,
         "tail_checkpoints": info.tail,
         "manifest_blake3": manifest_bytes.as_deref().map(|b| blake3::hash(b).to_hex().to_string()),
+        "search_built_through_height": search.as_ref().map(|s| s.2),
         "binary_version": env!("CARGO_PKG_VERSION"),
         "created_at": utc_iso(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),
     });
@@ -364,6 +384,47 @@ fn snapshot_into(
     fsync_dir(&a.out)?;
     rep.secs = t0.elapsed().as_secs_f64();
     Ok(rep)
+}
+
+/// `search/` into `out` (see the module doc): `(files, bytes, built_through_height)`, None
+/// when the source has no built index.
+fn snapshot_search(
+    src: &Path,
+    out: &Path,
+    copy: bool,
+) -> anyhow::Result<Option<(usize, u64, u32)>> {
+    for _ in 0..MAX_ATTEMPTS {
+        let Some(sf) = kdx_search::snapshot::live_files(src)? else {
+            return Ok(None);
+        };
+        let m: kdx_search::SearchManifest =
+            serde_json::from_slice(&sf.manifest).context("parse search/manifest.json")?;
+        if out.exists() {
+            fs::remove_dir_all(out)?;
+        }
+        fs::create_dir_all(out)?;
+        let mut bytes = 0u64;
+        let mut missing = false;
+        for f in &sf.files {
+            match place(&src.join(f), &out.join(f), copy) {
+                Ok(n) => bytes += n,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    missing = true;
+                    break;
+                }
+                Err(e) => return Err(e).with_context(|| format!("place search/{f}")),
+            }
+        }
+        if missing {
+            continue;
+        }
+        replace_file(&out.join("meta.json"), &sf.meta)?;
+        replace_file(&out.join(".managed.json"), &serde_json::to_vec(&sf.files)?)?;
+        replace_file(&out.join("manifest.json"), &sf.manifest)?;
+        fsync_dir(out)?;
+        return Ok(Some((sf.files.len(), bytes, m.built_through_height)));
+    }
+    bail!("search/ kept changing under the snapshot ({MAX_ATTEMPTS} reads)")
 }
 
 /// Hard-link `src` to `dst`, or copy it durably; returns its size.

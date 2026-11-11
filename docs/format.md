@@ -12,12 +12,15 @@ The data directory of one network looks like this:
   hot/            MDBX environment: dictionaries, live tail, undo, checkpoints (mutable)
   segments/       immutable range and step files + manifest.json
   etl/            temporary spool files while a range is being built (deleted afterwards)
+  search/         code search index (tantivy) + manifest.json; derived, rebuildable
+  search.new/     a `search rebuild` in progress (swapped in for search/ at the end)
   LOCK            held by the writing process
+  search.lock     held by a `search rebuild` (and briefly by the tail stage's manifest writes)
   merkle-unverified.jsonl   backfill blocks whose payload Merkle roots did not verify
 ```
 
-A snapshot directory (`kda-indexer snapshot --out DIR`) holds `hot/`, `segments/` and
-`SNAPSHOT.json` (format versions, network, frontiers, tail checkpoints, manifest blake3;
+A snapshot directory (`kda-indexer snapshot --out DIR`) holds `hot/`, `segments/`, `search/`
+(when the source has one) and `SNAPSHOT.json` (format versions, network, frontiers, tail checkpoints, manifest blake3;
 no paths).
 
 Segments refer to names (accounts, modules, event names, public keys, module hashes) by
@@ -527,6 +530,66 @@ Readers page newest first: ranges from newest to oldest, each list from its last
 - **Block (chain, height) → record**: the range by height, the slot, the `present` bit and
   its rank give the `blocks.seg` record; adjacent refs resolve through the same range.
 - **Block hash → block**: the hot tail first, then `bh.idx` of each range, newest first.
+
+## Search index (`search/`)
+
+`search/` is derived data: `search rebuild` recreates it from `hot/` and `segments/`, and
+neither of those refers to it. Its own layout version is the `format` field of
+`search/manifest.json` (1); a build that reads another version asks for a rebuild. It never
+changes the store format.
+
+```
+search/
+  manifest.json   {format, tantivy, mode, fallback_min_len, built_through_height, docs, bytes, built_at}
+  meta.json       tantivy's segment list (with .managed.json, tantivy's own files)
+  <segment uuid>.{idx,term,store,fast,fieldnorm,...}   tantivy segment files (immutable)
+```
+
+One tantivy document per distinct `exec` code body (CodeHash = blake2b-128 of `exec.code`,
+the `code` posting family's key; spec §3.8, B5). tantivy 0.27.0, doc store zstd, no field
+norms.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `hash` | bytes: indexed (raw), stored, fast | the full 16-byte CodeHash |
+| `code` | text, tokenizer `ngram3` (all 3-character n-grams, by Unicode scalar, no lowercasing), doc ids only; stored | the body |
+| `first_h` | u64 fast | height of the body's first tx |
+| `last_h` | u64 fast | the last height of the body's last range when the doc was written (tail docs: the tx's height) |
+| `module` | u64 fast | 1 when the body contains `(module ` or `(interface ` |
+
+Docs are never updated or deleted, so `last_h` is a lower bound of where the body's txs are:
+an expansion from a hash to txs reads the `code` postings in `first_h..=last_h` and above
+`built_through_height`. A body seen only in a reorged block stays (its expansion finds no
+tx).
+
+Modes (S-1): `full` indexes every body; `fallback` indexes bodies of at least
+`fallback_min_len` bytes plus every module or interface deployment, and leaves the rest to
+the bounded scan. `manifest.json` records the mode the index was built with.
+
+`built_through_height`: every exec tx at or below it on every chain has its body in the
+index (bodies of later txs may be there too). A rebuild sets it to the lowest tail
+checkpoint it saw (or the segment frontier − 1 when the freezer moved blocks during the
+rebuild); the tail stage moves it to the lowest height it has read on every chain after each
+commit. `built_at` (unix seconds) changes only with a rebuild; a process that sees it change
+reopens `search/`.
+
+**Rebuild.** Pass 0 (census) merges the entity directories of every range's `code.pst` and
+the hot `TailPostings` family 4 into the sorted list of distinct 8-byte prefixes with the
+first and last range of each (12 bytes per prefix in memory). Pass 1 decodes, per range, the
+first tx of each prefix whose first range it is, in TxNum order; the hot store is read last,
+every exec tx checked by full hash. Two bodies that share an 8-byte prefix and first appear
+in the same range give one doc (expected about n²/2⁶⁵ times for n bodies). The new index is
+written to `search.new/` and renamed over `search/` (the old one is moved aside and removed).
+A crash between the renames leaves no `search/manifest.json`; `run` then rebuilds.
+
+**Query.** A LIKE pattern's literal runs (`%`, `_` split runs; `\` escapes) of at least 3
+characters give the 3-grams the prefilter ANDs (at most 64). Every string the pattern
+matches contains every run, so the prefilter never drops a match. Each prefilter hit's
+stored code is checked with the LIKE matcher. A pattern without such a run has no index path
+(`no_index_path`).
+
+**Snapshot.** `snapshot` reads `search/manifest.json`, then `meta.json`, links the files of
+the segments `meta.json` lists, and writes both plus `.managed.json` (the linked names).
 
 ## Checking
 

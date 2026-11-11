@@ -65,6 +65,13 @@ max_results = 100
 max_candidates = 10000
 max_scan_heights = 20000
 timeout_ms = 2000
+mode = "auto"              # code index (S-1): auto (decided by the projection), full, fallback
+fallback_min_len = 0       # fallback: index bodies of at least this many bytes plus modules; 0 = from the projection
+commit_secs = 60           # tail stage commit period
+concurrency = 4            # concurrent searches (all search routes); more answer 503
+per_client = 1             # concurrent searches per client; more answer 429
+build_threads = 2          # search rebuild threads
+heap_mb = 512              # search rebuild writer heap
 
 [balances]
 local_rps = 50

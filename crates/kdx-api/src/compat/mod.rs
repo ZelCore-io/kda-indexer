@@ -266,77 +266,7 @@ pub fn paging(p: &Params) -> Result<Paging, Response> {
 // ---------------------------------------------------------------------------------------
 // LIKE
 
-/// Postgres `LIKE '%' || needle || '%'`: `%` any run, `_` one character, `\` escapes.
-pub struct Like {
-    plain: Option<String>,
-    pat: Vec<Tok>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Tok {
-    Any,
-    One,
-    Ch(char),
-}
-
-impl Like {
-    pub fn new(needle: &str) -> Like {
-        if !needle.contains(['%', '_', '\\']) {
-            return Like {
-                plain: Some(needle.to_owned()),
-                pat: Vec::new(),
-            };
-        }
-        let mut pat = vec![Tok::Any];
-        let mut it = needle.chars();
-        while let Some(c) = it.next() {
-            pat.push(match c {
-                '%' => Tok::Any,
-                '_' => Tok::One,
-                '\\' => Tok::Ch(it.next().unwrap_or('\\')),
-                c => Tok::Ch(c),
-            });
-        }
-        pat.push(Tok::Any);
-        pat.dedup_by(|a, b| *a == Tok::Any && *b == Tok::Any);
-        Like { plain: None, pat }
-    }
-
-    pub fn matches(&self, s: &str) -> bool {
-        if let Some(p) = &self.plain {
-            return s.contains(p.as_str());
-        }
-        // Greedy match with backtracking to the last `%` (linear in practice).
-        let t: Vec<char> = s.chars().collect();
-        let (mut i, mut j) = (0usize, 0usize);
-        let mut star: Option<(usize, usize)> = None;
-        while i < t.len() {
-            match self.pat.get(j) {
-                Some(Tok::Any) => {
-                    star = Some((j, i));
-                    j += 1;
-                }
-                Some(Tok::One) => {
-                    i += 1;
-                    j += 1;
-                }
-                Some(Tok::Ch(c)) if *c == t[i] => {
-                    i += 1;
-                    j += 1;
-                }
-                _ => match star {
-                    Some((sj, si)) => {
-                        star = Some((sj, si + 1));
-                        j = sj + 1;
-                        i = si + 1;
-                    }
-                    None => return false,
-                },
-            }
-        }
-        self.pat[j..].iter().all(|t| *t == Tok::Any)
-    }
-}
+pub use kdx_types::like::Like;
 
 // ---------------------------------------------------------------------------------------
 // Row engine
