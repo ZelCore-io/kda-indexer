@@ -219,6 +219,17 @@ fn row_key(r: &Value) -> RowKey {
     (s("requestKey"), s("blockHash"), idx)
 }
 
+/// A row's chain id, written as an integer or (after [`numbers_as_f64`], kda-txs pair) as a
+/// float.
+fn row_chain(r: &Value) -> Option<u8> {
+    let c = r.get("chain")?;
+    if let Some(n) = c.as_u64() {
+        return u8::try_from(n).ok();
+    }
+    let f = c.as_f64()?;
+    (f.fract() == 0.0 && (0.0..=255.0).contains(&f)).then_some(f as u8)
+}
+
 /// Two event lists with the same items, in any order (numbers compared as written).
 fn same_events(a: &Value, b: &Value) -> bool {
     let (Value::Array(x), Value::Array(y)) = (a, b) else {
@@ -1833,12 +1844,7 @@ impl Ctx {
         let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
         let mut by_chain: HashMap<u8, Vec<String>> = HashMap::new();
         for (_, ra) in &cand {
-            let (Some(rk), Some(c)) = (
-                s(ra, "requestKey"),
-                ra.get("chain")
-                    .and_then(Value::as_u64)
-                    .and_then(|c| u8::try_from(c).ok()),
-            ) else {
+            let (Some(rk), Some(c)) = (s(ra, "requestKey"), row_chain(ra)) else {
                 return Vec::new();
             };
             by_chain.entry(c).or_default().push(rk);
@@ -2252,6 +2258,12 @@ mod tests {
         let y = json!([{"name": "coin.TRANSFER", "params": ["a", "m", 0.1]},
                        {"name": "coin.TRANSFER", "params": ["a", "b", 1.5]}]);
         assert!(same_events(&x, &y));
+        // The tie-break runs after numbers_as_f64 (seen live: chain 2.0 made it give up).
+        let mut f = json!({"chain": 7, "height": 5});
+        numbers_as_f64(&mut f);
+        assert_eq!(row_chain(&f), Some(7));
+        assert_eq!(row_chain(&json!({"chain": 19})), Some(19));
+        assert_eq!(row_chain(&json!({"chain": 1.5})), None);
         let z = json!([{"name": "coin.TRANSFER", "params": ["a", "m", 1.5]},
                        {"name": "coin.TRANSFER", "params": ["a", "b", 0.1]}]);
         assert!(!same_events(&x, &z));
