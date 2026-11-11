@@ -13,7 +13,7 @@ use crate::allowlist::Allowlist;
 use crate::config::CompareConfig;
 use crate::diff::{
     cut_to_common_depth, diff_route, follow_pages, recent_diff, DiffEntry, DiffKind, Paged,
-    PAGE_CUT_PATH, PAGE_DUP_PATH,
+    PAGE_CUT_PATH, PAGE_DUP_PATH, STATS_ESTIMATE_PATH, STATS_SUPPLY_PATH,
 };
 use crate::gen::random::{canonical_header, RandomGen};
 use crate::gen::replay::ReplayGen;
@@ -72,6 +72,11 @@ const KDATXS_MISSING_NODE_PATH: &str = "/~kdatxs-missing-node";
 const NODE_GAP_CHECKS: usize = 300;
 /// Request keys per node `/poll` call of that rule.
 const NODE_POLL_CHUNK: usize = 25;
+/// Replica pair: list rows are compared only up to the lower of the two tips minus this
+/// many heights. A tip is the highest row height on `/txs/recent`; a chain can sit below
+/// it by up to the braid's diameter (3 on the 20-chain graph) plus whatever the tail of
+/// that side lags on that one chain, so the top heights are not final on both sides yet.
+const REPLICA_TIP_MARGIN: u64 = 5;
 /// How long a chainweb-data tip reading is reused.
 const ORACLE_TIP_TTL: Duration = Duration::from_secs(60);
 /// Upper bound of the supply minted per height on all chains together (coinbase rewards; live
@@ -198,6 +203,27 @@ fn drop_at_or_below(v: &mut Value, h: u64) {
 
 fn min_height(v: &Value) -> Option<u64> {
     v.as_array()?.iter().filter_map(row_height).min()
+}
+
+/// Height up to which a replica pair compares list rows: the lower of the two tips minus
+/// `REPLICA_TIP_MARGIN`.
+fn replica_clamp(tip_a: u64, tip_b: u64) -> u64 {
+    tip_a.min(tip_b).saturating_sub(REPLICA_TIP_MARGIN)
+}
+
+/// Replica pair: splits off the route-intrinsic tolerance entries (`/stats` count and
+/// supply inside their tolerance, which move on every block, so two independently tailing
+/// stores differ there whenever they read different tips). Returns the other entries and
+/// whether any tolerance entry was dropped (the outcome is then `skew`, not `match`).
+/// Every oracle-defect allowlist entry stays out of a replica pair.
+fn split_replica_skew(d: Vec<DiffEntry>) -> (Vec<DiffEntry>, bool) {
+    let n = d.len();
+    let rest: Vec<DiffEntry> = d
+        .into_iter()
+        .filter(|e| e.path != STATS_ESTIMATE_PATH && e.path != STATS_SUPPLY_PATH)
+        .collect();
+    let skew = rest.len() != n;
+    (rest, skew)
 }
 
 fn num_value(v: &Value) -> Option<f64> {
@@ -610,13 +636,14 @@ impl Ctx {
         let full_a0 = pa.truncated || page_cut || row_limit.is_none_or(|l| len_of(&va) >= l);
         let full_b0 = pb.truncated || page_cut || row_limit.is_none_or(|l| len_of(&vb) >= l);
         let mut lag_rows = 0usize;
-        // Replica pair (two kda-indexer targets): rows above the lower of the two tips are
-        // dropped (the sides read slightly different tips), with no allowlist hit.
+        // Replica pair (two kda-indexer targets): rows above the lower of the two tips minus
+        // a margin are dropped (the sides read different tips and a chain can trail its
+        // side's tip), with no allowlist hit.
         let replica = ta.kind == crate::config::TargetKind::KdaIndexerCompat
             && tb.kind == crate::config::TargetKind::KdaIndexerCompat;
         let clamp_to = if replica {
             match (self.oracle_tip(ta).await, self.oracle_tip(tb).await) {
-                (Some(x), Some(y)) => Some(x.min(y)),
+                (Some(x), Some(y)) => Some(replica_clamp(x, y)),
                 _ => None,
             }
         } else {
@@ -1092,12 +1119,16 @@ impl Ctx {
     ) -> Outcome {
         // A pair of two kda-indexer targets (primary and replica) has no allowlist: the
         // entries explain differences from chainweb-data, the node or kda-txs, never between
-        // two copies of this indexer, so every diff on it is unexplained.
+        // two copies of this indexer. Only the route-intrinsic `/stats` tolerances apply
+        // (the sides read different tips); they make the outcome `skew`.
         let replica_pair = ta.kind == crate::config::TargetKind::KdaIndexerCompat
             && self.targets.get(b_name).map(|t| t.kind)
                 == Some(crate::config::TargetKind::KdaIndexerCompat);
+        let mut replica_skew = false;
         let (unexplained, ids) = if replica_pair {
-            (d, Vec::new())
+            let (rest, skew) = split_replica_skew(d);
+            replica_skew = skew;
+            (rest, Vec::new())
         } else {
             self.allow
                 .classify_request(&req.route, &req.path_and_query, &d)
@@ -1117,6 +1148,8 @@ impl Ctx {
             "legacy-cmd"
         } else if !ids.is_empty() {
             "allowlisted"
+        } else if replica_skew {
+            "skew"
         } else {
             "match"
         };
@@ -2255,6 +2288,63 @@ mod tests {
         );
         assert_eq!(query_limit("/txs/account/k:a"), None);
         assert_eq!(num_value(&json!("1.5")), Some(1.5));
+    }
+
+    /// I1: a replica pair keeps the `/stats` tolerances (as `skew`) and nothing else, and its
+    /// list clamp leaves a margin below the lower tip, so a chain trailing its side's tip
+    /// does not show as missing top rows.
+    #[test]
+    fn replica_pair_tolerances_and_clamp() {
+        // Two stores a few blocks apart: count and supply move inside the tolerances.
+        let a = json!({"transactionCount": 1_000_000, "coinsInCirculation": 300_000_000.0});
+        let b = json!({"transactionCount": 1_000_040, "coinsInCirculation": 300_000_093.0});
+        let (rest, skew) = split_replica_skew(diff_route(&RouteKind::Stats, &a, &b));
+        assert!(rest.is_empty(), "{rest:?}");
+        assert!(skew);
+        // Outside the tolerance it stays an unexplained diff.
+        let c = json!({"transactionCount": 1_000_000, "coinsInCirculation": 300_500_000.0});
+        let (rest, skew) = split_replica_skew(diff_route(&RouteKind::Stats, &a, &c));
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].path, "/coinsInCirculation");
+        assert!(!skew);
+        // Equal sides: a match, not skew.
+        let (rest, skew) = split_replica_skew(diff_route(&RouteKind::Stats, &a, &a));
+        assert!(rest.is_empty() && !skew);
+        // Any other path is kept (no oracle allowlist entry applies to the pair).
+        let (rest, skew) = split_replica_skew(vec![DiffEntry {
+            path: ORACLE_LAG_PATH.into(),
+            kind: DiffKind::Changed,
+            a: None,
+            b: None,
+        }]);
+        assert_eq!(rest.len(), 1);
+        assert!(!skew);
+
+        // List clamp: A's tip 100 on chain 0; B's tip 100 on chain 0, but B's chain 1 is
+        // still at 97. Rows at 98..=100 on chain 1 exist on A only.
+        let rows = |c1_top: u64| {
+            let mut v = Vec::new();
+            for h in (90..=100).rev() {
+                v.push(json!({"chain": 0, "height": h}));
+                if h <= c1_top {
+                    v.push(json!({"chain": 1, "height": h}));
+                }
+            }
+            Value::Array(v)
+        };
+        let (mut va, mut vb) = (rows(100), rows(97));
+        // Both tips read 100 (B's chain 0 is at its tip), so the old clamp was 100.
+        let naive = 100u64;
+        let (mut na, mut nb) = (va.clone(), vb.clone());
+        drop_above(&mut na, naive);
+        drop_above(&mut nb, naive);
+        assert_ne!(na, nb, "the old clamp at min(tipA, tipB) leaves a gap");
+        let clamp = replica_clamp(100, 100);
+        assert_eq!(clamp, 95);
+        drop_above(&mut va, clamp);
+        drop_above(&mut vb, clamp);
+        assert_eq!(va, vb);
+        assert_eq!(replica_clamp(3, 9), 0);
     }
 
     /// Event tie-break helpers: rows match by (requestKey, blockHash, idx); event lists
