@@ -407,8 +407,11 @@ Policy on a mismatch:
 
 - **Backfill:** the bit stays false, `kdx_merkle_blocks_total{result}` counts it
   (`mismatch_legacy` or `mismatch`), a line `{chain, height, hash, which, legacy}` is
-  appended to `<data_dir>/merkle-unverified.jsonl` after the range commits, and the range
-  goes on. `which` is the first root that differed: `tx_root`, `out_root` or
+  appended to `<data_dir>/merkle-unverified.jsonl` and fsynced after the range commits, and
+  the range goes on. While the range is built the lines wait in `etl/merkle-<start>.jsonl`;
+  after a crash between the commit and the append the next backfill start appends them. A
+  failed append is a warning (the bit is the durable result; `verify merkle` lists the
+  blocks). `which` is the first root that differed: `tx_root`, `out_root` or
   `payload_root`.
 - **Tail:** the payload is fetched once more. If it still does not verify, the blocks before
   it are committed and the chain halts with reason `merkle` (see `operations.md`, "Halted

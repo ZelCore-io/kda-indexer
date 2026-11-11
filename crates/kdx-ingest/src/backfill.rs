@@ -143,6 +143,7 @@ pub fn remove_unlisted(ctx: &Ctx, m: &Manifest) -> Result<Vec<String>> {
 /// list, reset the hot frontier to the manifest's, re-derive `Headers` checkpoints.
 pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
     let net = &ctx.opts.network;
+    recover_merkle_spools(ctx);
     etl::clear_dir(&ctx.etl)?;
     let m = Manifest::load(&ctx.segdir)?.unwrap_or_else(|| Manifest::new(net));
     if &m.network != net {
@@ -685,7 +686,7 @@ fn build_and_commit(
         coll.into_sorted()?
     };
     let mut batch: Vec<(u32, u8, Vec<u8>)> = Vec::with_capacity(DECODE_BATCH);
-    let mut merkle = MerkleTally::default();
+    let mut merkle = MerkleTally::new(&ctx.etl, u.start);
     loop {
         batch.clear();
         for r in it.by_ref() {
@@ -701,7 +702,7 @@ fn build_and_commit(
         }
         let mut prepared = pipeline::prepare_batch(&batch)?;
         prepared.iter_mut().for_each(pipeline::debug_corrupt_merkle);
-        merkle.add(&prepared);
+        merkle.add(&prepared)?;
         for p in &prepared {
             let hd = &p.0.header;
             let (c, h) = (hd.chain_id, hd.height as u32);
@@ -772,7 +773,7 @@ fn build_and_commit(
     manifest.push(entry.clone())?;
     manifest.commit(&ctx.segdir)?;
     // After the commit, so a range that is built again does not list its blocks twice.
-    merkle.commit(&ctx.opts.data_dir, u.start)?;
+    merkle.commit(&ctx.opts.data_dir, u.start);
     let commit_secs = t.elapsed().as_secs_f64();
     drop(dict);
     Ok((entry, prev, (decode_secs, finish_secs, commit_secs)))
@@ -781,19 +782,40 @@ fn build_and_commit(
 /// Ruling R-5, backfill side (soft): a payload Merkle mismatch leaves the record's
 /// `merkle_verified` false and the range goes on. Per committed range the blocks are counted
 /// in `kdx_merkle_blocks_total{result}` and each mismatch is appended to
-/// `<data_dir>/merkle-unverified.jsonl` as `{chain, height, hash, which, legacy}`.
-#[derive(Default)]
+/// `<data_dir>/merkle-unverified.jsonl` as `{chain, height, hash, which, legacy}`. While the
+/// range is built the lines go to `etl/merkle-<start>.jsonl` (no memory growth when an era
+/// mismatches wholesale); they are appended and fsynced after the manifest commit. A failure
+/// there is a warning, not an error: the range is committed and the record bit is the
+/// durable result (`verify merkle` lists the blocks again).
 struct MerkleTally {
     verified: u64,
     mismatch_legacy: u64,
     mismatch: u64,
-    lines: Vec<String>,
+    spool_path: std::path::PathBuf,
+    spool: Option<std::io::BufWriter<fs::File>>,
 }
 
 pub const MERKLE_UNVERIFIED: &str = "merkle-unverified.jsonl";
 
+fn merkle_spool_name(start: u32) -> String {
+    format!("merkle-{start:09}.jsonl")
+}
+
 impl MerkleTally {
-    fn add(&mut self, prepared: &[(kdx_decode::DecodedBlock, kdx_decode::VerifyReport)]) {
+    fn new(etl: &std::path::Path, start: u32) -> Self {
+        MerkleTally {
+            verified: 0,
+            mismatch_legacy: 0,
+            mismatch: 0,
+            spool_path: etl.join(merkle_spool_name(start)),
+            spool: None,
+        }
+    }
+
+    fn add(
+        &mut self,
+        prepared: &[(kdx_decode::DecodedBlock, kdx_decode::VerifyReport)],
+    ) -> Result<()> {
         for p in prepared {
             let r = pipeline::merkle_of(p);
             match r.label() {
@@ -802,12 +824,21 @@ impl MerkleTally {
                 _ => self.mismatch += 1,
             }
             if let Some(l) = pipeline::merkle_line(&p.0, &r) {
-                self.lines.push(l);
+                if self.spool.is_none() {
+                    let f = fs::File::create(&self.spool_path)
+                        .with_context(|| format!("creating {}", self.spool_path.display()))?;
+                    self.spool = Some(std::io::BufWriter::new(f));
+                }
+                if let Some(w) = self.spool.as_mut() {
+                    writeln!(w, "{l}")?;
+                }
             }
         }
+        Ok(())
     }
 
-    fn commit(self, data_dir: &std::path::Path, range: u32) -> Result<()> {
+    /// After the manifest commit.
+    fn commit(self, data_dir: &std::path::Path, range: u32) {
         let m = kdx_metrics::get();
         for (label, n) in [
             ("verified", self.verified),
@@ -820,25 +851,72 @@ impl MerkleTally {
                     .inc_by(n);
             }
         }
-        if self.lines.is_empty() {
-            return Ok(());
-        }
+        let Some(w) = self.spool else {
+            return;
+        };
         tracing::warn!(
             range,
             mismatch_legacy = self.mismatch_legacy,
             mismatch = self.mismatch,
             "backfill: payload Merkle mismatches (merkle_verified=false), listed in {MERKLE_UNVERIFIED}"
         );
-        let path = data_dir.join(MERKLE_UNVERIFIED);
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        for l in &self.lines {
-            writeln!(f, "{l}")?;
+        let r = w
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("flushing the spool: {}", e.error()))
+            .and_then(|_| append_merkle_spool(&self.spool_path, data_dir));
+        if let Err(e) = r {
+            tracing::warn!(
+                range,
+                "backfill: could not append the Merkle mismatch list to {MERKLE_UNVERIFIED} \
+                 (the records keep merkle_verified=false; verify merkle lists them): {e:#}"
+            );
         }
-        Ok(())
+    }
+}
+
+/// Append a range's spooled mismatch lines to `<data_dir>/merkle-unverified.jsonl`, fsync
+/// it, then remove the spool.
+fn append_merkle_spool(spool: &std::path::Path, data_dir: &std::path::Path) -> Result<()> {
+    let path = data_dir.join(MERKLE_UNVERIFIED);
+    let mut src = fs::File::open(spool).with_context(|| format!("opening {}", spool.display()))?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    std::io::copy(&mut src, &mut f).with_context(|| format!("appending to {}", path.display()))?;
+    f.sync_all()?;
+    fs::remove_file(spool)?;
+    Ok(())
+}
+
+/// Before `etl/` is cleared: spools of ranges the manifest lists (a crash came between the
+/// manifest commit and the append) are appended; the others are dropped with `etl/` (their
+/// ranges are built again).
+fn recover_merkle_spools(ctx: &Ctx) {
+    let Ok(Some(m)) = Manifest::load(&ctx.segdir) else {
+        return;
+    };
+    let Ok(dir) = fs::read_dir(&ctx.etl) else {
+        return;
+    };
+    for e in dir.flatten() {
+        let name = e.file_name();
+        let Some(start) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("merkle-")?.strip_suffix(".jsonl"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if m.entries.iter().any(|x| x.start == start) {
+            if let Err(e) = append_merkle_spool(&e.path(), &ctx.opts.data_dir) {
+                tracing::warn!(
+                    range = start,
+                    "backfill: Merkle mismatch list not recovered: {e:#}"
+                );
+            }
+        }
     }
 }
 
