@@ -424,6 +424,18 @@ fn hot_pass(
     })
 }
 
+/// `rebuilt_through_height` of a rebuild over census `c`: the last height below the census's
+/// frozen frontier. Every segment below it was read by the census, so a doc's `last_h` is
+/// exact up to there. Hot heights are not: pass 1 runs for hours after the census's hot walk,
+/// a body can recur in a hot block meanwhile, and neither the hot pass nor the tail stage
+/// adds a doc for a body the index already holds. Readers keep those heights in their upper
+/// window, also after a later freeze moves them into a segment. (The first P6 cut used
+/// `built_through_height` here, the lowest tail checkpoint at the hot pass: recurrences
+/// between the census and the hot pass were lost after the next freeze.)
+pub fn rebuilt_through(c: &Census) -> u32 {
+    c.frontier.saturating_sub(1)
+}
+
 /// Census, projection (`auto`, or `fallback` with no threshold), pass 1, hot pass, then
 /// `search.new/` replaces `search/`. `hot` is the caller's environment (`run` shares its own).
 pub fn rebuild(o: &BuildOpts, hot: &HotStore) -> Result<RebuildReport> {
@@ -466,7 +478,7 @@ pub fn rebuild(o: &BuildOpts, hot: &HotStore) -> Result<RebuildReport> {
         mode: mode.name().into(),
         fallback_min_len: mode.min_len(),
         built_through_height: built_through,
-        rebuilt_through_height: Some(built_through),
+        rebuilt_through_height: Some(rebuilt_through(&c)),
         docs,
         bytes: dir_bytes(&new)?,
         built_at: now_secs(),
@@ -558,4 +570,148 @@ pub fn dry_run(o: &BuildOpts, hot: &HotStore) -> Result<Estimate> {
     let seg = open_segments(&o.data_dir)?;
     let c = distinct_code_keys(&seg, hot)?;
     estimate(&o.data_dir, &seg, &c, o)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use kdx_decode::{Family, IndexedBlock, TxIndex};
+    use kdx_hot::{Geometry, HotDict, HotStore};
+    use kdx_types::like::Like;
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{blake2b_128, Hash32, TxKey};
+
+    use super::{build_into, open_segments, rebuilt_through, BuildOpts};
+    use crate::census::distinct_code_keys;
+    use crate::manifest::{SearchManifest, FORMAT};
+    use crate::{Mode, ModeSel, Searcher};
+
+    pub(crate) fn exec_block(chain: u8, height: u32, codes: &[&str]) -> IndexedBlock {
+        let txs: Vec<TxRecord> = codes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| TxRecord {
+                key: TxKey::new(height, chain, i as u16 + 1),
+                request_key: Some(Hash32([(height % 251) as u8 + i as u8; 32])),
+                cmd: Some(
+                    serde_json::to_vec(&serde_json::json!({"payload": {"exec": {"code": c}}}))
+                        .unwrap(),
+                ),
+                ..TxRecord::default()
+            })
+            .collect();
+        let idx = txs
+            .iter()
+            .zip(codes)
+            .map(|(r, c)| {
+                let h = blake2b_128(c.as_bytes());
+                TxIndex {
+                    key: r.key,
+                    postings: vec![(Family::Code, kdx_decode::index::code_entity(&h))],
+                    pact_id: None,
+                    code_hash: Some(h),
+                }
+            })
+            .collect();
+        IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32([height as u8; 32]),
+                chain,
+                height: u64::from(height),
+                ..BlockRecord::default()
+            },
+            txs,
+            idx,
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        }
+    }
+
+    pub(crate) fn apply(hot: &HotStore, blocks: &[IndexedBlock]) {
+        let mut w = hot.rw().unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        for b in blocks {
+            kdx_hot::tail::apply(&mut w, b, &mut dict).unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    pub(crate) fn hot_store(dir: &std::path::Path) -> HotStore {
+        let g = Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        HotStore::open(&dir.join("hot"), g).unwrap()
+    }
+
+    /// I-1: a body that recurs in a hot block between the census and the hot pass keeps the
+    /// doc's census `last_h`. `rebuilt_through_height` stays below the recurrence, so the
+    /// readers' upper window (`min(rebuilt_through + 1, hot floor)`) still covers it after the
+    /// next freeze moves the hot floor above it; the hot pass's checkpoint would not.
+    #[test]
+    fn recurrence_after_the_census_stays_in_the_upper_window() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = hot_store(d.path());
+        let body = "(free.recurring.body \"x\")";
+        apply(
+            &hot,
+            &[
+                exec_block(0, 10, &[body]),
+                exec_block(0, 11, &["(other.one)"]),
+                exec_block(0, 12, &["(other.two)"]),
+            ],
+        );
+        let seg = open_segments(d.path()).unwrap();
+        let c = distinct_code_keys(&seg, &hot).unwrap();
+        // Pass 1 runs; meanwhile the body recurs at 15.
+        apply(
+            &hot,
+            &(13..=16)
+                .map(|h| exec_block(0, h, &[if h == 15 { body } else { "(other.three)" }]))
+                .collect::<Vec<_>>(),
+        );
+        let o = BuildOpts {
+            data_dir: d.path().to_path_buf(),
+            mode: ModeSel::Full,
+            threads: 1,
+            heap_mb: 32,
+            trial_docs: 0,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let new = d.path().join("search.new");
+        let (built_through, _) = build_into(&o, &hot, &seg, &c, Mode::Full, &new).unwrap();
+        let rt = rebuilt_through(&c);
+        SearchManifest {
+            format: FORMAT,
+            tantivy: crate::TANTIVY_VERSION.into(),
+            mode: "full".into(),
+            fallback_min_len: 0,
+            built_through_height: built_through,
+            rebuilt_through_height: Some(rt),
+            docs: 0,
+            bytes: 0,
+            built_at: 1,
+        }
+        .commit(&new)
+        .unwrap();
+        let s = Searcher::open(&new, 100).unwrap().unwrap();
+        let far = Instant::now() + Duration::from_secs(10);
+        let hits = s
+            .candidates(&Like::new("recurring.body"), far)
+            .unwrap()
+            .hashes;
+        assert_eq!(hits.len(), 1);
+        let (_, first_h, last_h) = hits[0];
+        // The doc knows heights 10..=12 only.
+        assert_eq!((first_h, last_h), (10, 12));
+        // The hot pass's checkpoint covers 15: as the upper bound of the exact part it would
+        // drop 15 from both windows once a freeze lifts the hot floor above 16.
+        assert!(built_through >= 15);
+        let hot_floor_after_freeze = 17;
+        let upper_from = (rt + 1).min(hot_floor_after_freeze);
+        assert!(upper_from <= 15, "upper window from {upper_from} misses 15");
+    }
 }
