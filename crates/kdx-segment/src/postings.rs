@@ -372,6 +372,37 @@ impl Postings {
         Ok(&self.map[HEAD + a..HEAD + b])
     }
 
+    /// `segments check --deep`: for a Roaring list, the lazy walk (`list_le`, the read path)
+    /// from three bounds (none, the edge below the last container, a value derived from
+    /// `seed`) equals `full`, the list's full decode (relative values, ascending). Other
+    /// encodings: `Ok(true)`.
+    pub fn lazy_walk_matches(&self, i: usize, full: &[u32], seed: u64) -> Result<bool> {
+        if self.list_bytes(i)?.first() != Some(&ENC_ROARING) {
+            return Ok(true);
+        }
+        let Some(&last) = full.last() else {
+            return Ok(true);
+        };
+        let entity = self.entity_at(i);
+        let edge = ((last >> 16) << 16).saturating_sub(1);
+        let pick = (seed % (u64::from(last) + 2)) as u32;
+        for max in [None, Some(edge), Some(pick)] {
+            let want: Vec<u64> = full
+                .iter()
+                .rev()
+                .filter(|&&v| max.is_none_or(|m| v <= m))
+                .map(|&v| self.first_txnum + u64::from(v))
+                .collect();
+            let Some(it) = self.list_le(entity, max)? else {
+                return Ok(false);
+            };
+            if it.len() != want.len() || !it.eq(want.iter().copied()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// TxNums of `entity` whose relative value is `<= max_rel` (None = all), descending.
     /// `Ok(None)` when the entity has no list; `Err` when the list does not decode.
     pub fn list_le(&self, entity: u64, max_rel: Option<u32>) -> Result<Option<PostingIter>> {
@@ -1061,6 +1092,32 @@ mod list_tests {
             vals.len()
         );
         assert!(page < full);
+    }
+
+    /// `segments check --deep`: the lazy Roaring walk of a written file equals the full
+    /// decode; a full decode that disagrees with the file is reported.
+    #[test]
+    fn lazy_walk_matches_written_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("x.pst");
+        let range_txs = 300_000u64;
+        let mut w = PostingsWriter::create(&path, Family::Acct, range_txs).unwrap();
+        let big: Vec<u32> = (0..200_000u32).filter(|v| v % 7 < 3).collect();
+        let small: Vec<u32> = vec![1, 5, 9];
+        w.push(3, &small).unwrap();
+        w.push(8, &big).unwrap();
+        w.finish().unwrap();
+        let p = Postings::open(&path, 100).unwrap();
+        assert_eq!(p.list_bytes(1).unwrap()[0], ENC_ROARING);
+        for i in 0..p.entities() {
+            let full = p.list_at(i).unwrap();
+            for seed in [0u64, 1, 65_536, 123_456_789] {
+                assert!(p.lazy_walk_matches(i, &full, seed).unwrap());
+            }
+        }
+        let mut wrong = p.list_at(1).unwrap();
+        wrong.pop();
+        assert!(!p.lazy_walk_matches(1, &wrong, 0).unwrap());
     }
 
     /// Round trip at the delta/EF boundary (16/17) and the EF/Roaring threshold.

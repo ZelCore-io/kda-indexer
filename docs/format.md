@@ -534,7 +534,8 @@ Readers page newest first: ranges from newest to oldest, each list from its last
 size and blake3 of every file listed in each `range.toml`, and reports orphan files.
 `--deep` also decodes every record, checks every tx's TxKey against `keys.ef`, resolves
 every request key and block hash through the indexes, decodes every adjacent ref and every
-posting list.
+posting list, and walks each Roaring list the way reads do (lazily, by container) from three
+bounds, requiring the same values as its full decode.
 
 `kda-indexer verify merkle [--from H] [--to H] [--chains …] [--sample N | --all] [--json]`
 re-renders each block's leaves from its stored records (hot store first, then segments),
