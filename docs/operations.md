@@ -346,6 +346,21 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-
   service.
 - `--seed`: runs (or resumes) the seed walk now; the next `run` reconciles what it marked.
 - `--all`: marks every stored balance row dirty, so the next `run` re-reads them all.
+- `--nft-fill` (service stopped): runs the NFT history fill again (below), then drains the
+  marks it made with `get-balance`. `--status` also prints `nft_rows`, `nft_dirty_rows` and
+  `nft_filled_height`.
+
+### NFTs
+
+The same stage keeps `NftBalances` (spec §3.9). Once per store (`Meta nft_filled`), before the
+balance seed, it walks the `evt` postings of every ledger event name (modules named `ledger`,
+hot tail first, then the segments) and applies each tx's events: a v2-shaped `RECONCILE` sets
+both parties' balance, other ledger events mark `NftDirty`. The fill makes no node calls and
+takes seconds. After that the tail applies the same rules to every block, a reorg's undo marks
+the rows of the unwound txs dirty, and the reconciler reads `NftDirty` rows with
+`({ledger}.get-balance (read-msg "t") (read-msg "a"))` (same `/local` budget and safety rules
+as balances) between its balance batches. `kda-indexer inspect nft-check --count 20
+--compare-node` samples stored rows and compares them with the node.
 - Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).

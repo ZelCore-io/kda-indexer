@@ -9,6 +9,7 @@ use crate::balances;
 use crate::checkpoint::{clear_checkpoint, set_checkpoint, Stage};
 use crate::dict::HotDict;
 use crate::env::{RwTxn, Txn};
+use crate::nft;
 use crate::tables::{block_key, parse_block_key, posting_key, Table};
 use crate::undo::{self, UndoOp};
 
@@ -39,7 +40,7 @@ fn defpact_bytes(keys: &[TxKey]) -> Vec<u8> {
 
 /// Write one block (header, txs, request keys, postings, defpact steps, counters), its undo
 /// record, the queued dictionary names, the balance dirty marks of its `xfer`/`acct` postings
-/// (B-3) and the `Tail` checkpoint, all in `txn`.
+/// (B-3), the NFT ledger-event effects (`nft.rs`) and the `Tail` checkpoint, all in `txn`.
 /// The block must not already be stored at (chain, height).
 pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Result<()> {
     let br = &b.block;
@@ -86,6 +87,13 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
             }
             // B-3: balances this block may change are re-read from the node.
             balances::mark_posting(txn, f as u8, e, r.key, coin, true)?;
+        }
+        if !r.events.is_empty() {
+            // Plan Task 11: NFT ledger events update `NftBalances` / mark `NftDirty`.
+            let evs = nft::classify(&*dict, &r.events);
+            if !evs.is_empty() {
+                nft::apply_events(txn, &*dict, &evs, chain, height)?;
+            }
         }
         if let Some(p) = &x.pact_id {
             let mut keys = txn
@@ -138,6 +146,8 @@ fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
             txn.del(Table::HeaderByHash, &hash.0)?;
         }
         UndoOp::Tx(k) => {
+            // Plan Task 11: rows this tx's NFT events touched are re-read from the node.
+            nft::mark_tx_dirty(txn, *k)?;
             txn.del(Table::TailTxs, &k.to_be_bytes())?;
         }
         UndoOp::Rk(h) => {

@@ -401,6 +401,18 @@ pub async fn run(
     o: ReconcileOpts,
     stop: CancellationToken,
 ) -> Result<()> {
+    if o.seed && !crate::nft_fill::filled(&ctx.hot.ro()?)? {
+        tracing::info!("nft: no history fill yet, filling (N-1)");
+        let (c, s) = (ctx.clone(), stop.clone());
+        let rep = tokio::task::spawn_blocking(move || {
+            crate::nft_fill::run(&c.hot, &c.segdir, &|| s.is_cancelled())
+        })
+        .await??;
+        tracing::info!(report = %serde_json::to_string(&rep)?, "nft: fill pass ended");
+        if rep.stopped {
+            return Ok(());
+        }
+    }
     let seeded = crate::seed::seeded(&ctx.hot.ro()?)?;
     if o.seed && !seeded {
         tracing::info!("balances: no seed yet, seeding (B-2)");
@@ -415,6 +427,7 @@ pub async fn run(
         }
     }
     let local = LocalClient::new(node, o.local);
+    let mut nft_cursor: Option<Vec<u8>> = None;
     let mut queue: VecDeque<([u8; 9], u32)> = VecDeque::new();
     let mut backoff: Option<Duration> = None;
     let mut retries: HashMap<[u8; 9], u32> = HashMap::new();
@@ -425,6 +438,12 @@ pub async fn run(
         if stop.is_cancelled() {
             return Ok(());
         }
+        // NFT rows (plan Task 11) share the `/local` budget; the table is small, so one step
+        // per loop keeps them current even behind a long balance backlog.
+        let nft = crate::nft_fill::step(&ctx.hot, &local, &mut nft_cursor).await?;
+        if nft.rows() > 0 {
+            tracing::debug!(?nft, "nft: dirty rows reconciled");
+        }
         if queue.is_empty() {
             let h = ctx.hot.clone();
             queue = tokio::task::spawn_blocking(move || refill(&h, REFILL)).await??;
@@ -433,6 +452,9 @@ pub async fn run(
                 .set(ctx.hot.ro()?.count(Table::BalanceDirty)? as i64);
         }
         if queue.is_empty() {
+            if nft.rows() > nft.node_errors {
+                continue;
+            }
             tokio::select! {
                 _ = stop.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(IDLE) => continue,

@@ -3,7 +3,7 @@
 
 use utoipa::OpenApi;
 
-use crate::native::{accounts, balances, blocks, events, search, stats, tokens, txs};
+use crate::native::{accounts, balances, blocks, events, nft, search, stats, tokens, txs};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -17,8 +17,8 @@ limit while next_cursor is set: follow it until it is null. A cursor whose block
 answers 400 'cursor invalidated by reorg'. Balances and tokens come from /local reconciles: every \
 balance row carries as_of_height and stale. Search routes run under a shared gate (503 when \
 search.concurrency searches run, 429 when the client already runs search.per_client) and answer \
-truncated: true when their deadline or a cap cut them. A route reserved for later answers 501 \
-{\"error\": \"not implemented until P6\"}: /nft/accounts/{account}."
+truncated: true when their deadline or a cap cut them. NFT holdings come from marmalade ledger events and /local \
+(source event or local)."
     ),
     paths(
         crate::status::handler,
@@ -36,6 +36,7 @@ truncated: true when their deadline or a cap cut them. A route reserved for late
         balances::key_accounts,
         tokens::list,
         tokens::get,
+        nft::account,
         events::list,
         search::code,
         search::events,

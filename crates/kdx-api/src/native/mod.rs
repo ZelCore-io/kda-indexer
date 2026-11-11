@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -31,6 +30,7 @@ pub mod accounts;
 pub mod balances;
 pub mod blocks;
 pub mod events;
+pub mod nft;
 pub mod search;
 pub mod stats;
 pub mod tokens;
@@ -179,18 +179,6 @@ pub fn list_response(view: &View, items: Vec<Value>, next: Option<String>) -> Ap
     })))
 }
 
-pub fn not_implemented() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        axum::Json(json!({"error": "not implemented until P6"})),
-    )
-        .into_response()
-}
-
-async fn nope() -> Response {
-    not_implemented()
-}
-
 /// The native router. `search` is shared with the compat router: one gate covers every
 /// search route (S-5).
 pub fn router(search: Arc<crate::search::SearchCtx>) -> Router<Arc<ApiState>> {
@@ -217,7 +205,7 @@ pub fn router(search: Arc<crate::search::SearchCtx>) -> Router<Arc<ApiState>> {
         .route("/tokens/{module}", get(tokens::get))
         .route("/search/code", get(search::code))
         .route("/search/events", get(search::events))
-        .route("/nft/accounts/{account}", get(nope))
+        .route("/nft/accounts/{account}", get(nft::account))
         .layer(axum::Extension(search));
     Router::new().nest("/api/v1", v1)
 }

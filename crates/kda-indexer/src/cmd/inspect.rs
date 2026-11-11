@@ -376,3 +376,125 @@ pub async fn sample(
     }
     Ok(())
 }
+
+/// Equal as decimals: `1`, `1.0` and `1.00` are the same balance.
+fn same_decimal(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.trim();
+        match s.split_once('.') {
+            Some((i, f)) => {
+                let f = f.trim_end_matches('0');
+                if f.is_empty() {
+                    i.to_owned()
+                } else {
+                    format!("{i}.{f}")
+                }
+            }
+            None => s.to_owned(),
+        }
+    }
+    norm(a) == norm(b)
+}
+
+/// `inspect nft-check`: `count` random `NftBalances` rows (positive balances first); with
+/// `compare_node`, `get-balance` is called for each through the `/local` client at
+/// `[balances] local_rps`, and the decimal balance must equal the stored one. A difference
+/// on a row that is also in `NftDirty`, or whose `as_of` is below the node answer's height
+/// while the chain moved on, is counted as `skew`, not as a mismatch.
+pub async fn nft_check(
+    cfg: &Config,
+    s: &Store,
+    count: usize,
+    compare_node: bool,
+) -> anyhow::Result<()> {
+    use kdx_hot::nft::{nft_key, parse_nft_key, NftRow};
+    let rows = s.txn.scan(Table::NftBalances, &[], |_| true)?;
+    let mut pos: Vec<_> = rows
+        .iter()
+        .filter_map(|(k, v)| Some((parse_nft_key(k)?, NftRow::decode(v)?)))
+        .filter(|(_, r)| r.positive())
+        .collect();
+    let total = rows.len();
+    let mut rng = rand::rng();
+    let mut picks = Vec::new();
+    while picks.len() < count && !pos.is_empty() {
+        picks.push(pos.swap_remove(rng.random_range(0..pos.len())));
+    }
+    eprintln!("nft-check: {total} rows, {} sampled", picks.len());
+    let local = if compare_node {
+        Some(kdx_node::LocalClient::new(
+            super::local_node_client(cfg)?,
+            kdx_node::LocalOpts {
+                rps: cfg.balances.local_rps.min(10),
+                concurrency: 2,
+            },
+        ))
+    } else {
+        None
+    };
+    let (mut checked, mut mismatches, mut skew) = (0u64, 0u64, 0u64);
+    let mut out = Vec::new();
+    for (((account, _, chain), row), n) in picks.iter().map(|p| (&p.0, &p.1)).zip(1..) {
+        let acct = s.dict.name(DictKind::Account, *account).map(str::to_owned);
+        let ledger = s.dict.name(DictKind::Module, row.ledger).map(str::to_owned);
+        let (Some(acct), Some(ledger)) = (acct, ledger) else {
+            continue;
+        };
+        let dirty = s
+            .txn
+            .get(
+                Table::NftDirty,
+                &nft_key(*account, &kdx_hot::nft::token_hash(&row.token_id), *chain),
+            )?
+            .is_some();
+        let mut item = json!({
+            "n": n, "account": acct, "ledger": ledger, "token_id": row.token_id,
+            "chain": chain, "balance": row.balance, "as_of": row.as_of,
+            "source": row.source, "dirty": dirty,
+        });
+        if let Some(local) = &local {
+            checked += 1;
+            match local
+                .get_balance(*chain, &ledger, &row.token_id, &acct)
+                .await
+            {
+                Ok(kdx_node::Local::Found { value, height }) => {
+                    let eq = same_decimal(&value, &row.balance);
+                    item["node_balance"] = json!(value);
+                    item["node_height"] = json!(height);
+                    if !eq {
+                        if dirty || u64::from(row.as_of) < height {
+                            skew += 1;
+                            item["result"] = json!("skew");
+                        } else {
+                            mismatches += 1;
+                            item["result"] = json!("MISMATCH");
+                        }
+                    } else {
+                        item["result"] = json!("ok");
+                    }
+                }
+                Ok(kdx_node::Local::Absent) => {
+                    mismatches += 1;
+                    item["result"] = json!("MISMATCH (node: absent)");
+                }
+                Err(e) => {
+                    mismatches += 1;
+                    item["result"] = json!(format!("MISMATCH (call failed: {e})"));
+                }
+            }
+        }
+        out.push(item);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "rows": total, "sampled": picks.len(), "checked": checked,
+            "mismatches": mismatches, "skew": skew, "items": out,
+        }))?
+    );
+    if mismatches > 0 {
+        anyhow::bail!("{mismatches} mismatch(es)");
+    }
+    Ok(())
+}

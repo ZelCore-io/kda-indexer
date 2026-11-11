@@ -17,6 +17,8 @@ pub enum Mode {
     Seed,
     /// Mark every `Balances` row dirty (height 0; a tail mark is kept).
     All,
+    /// Run the NFT history fill again (plan Task 11).
+    NftFill,
     /// Dirty rows, rate, ETA, seed state.
     Status,
 }
@@ -24,7 +26,7 @@ pub enum Mode {
 /// Rows per write txn of `--all`.
 const ALL_CHUNK: usize = 100_000;
 
-pub fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()> {
+pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()> {
     let hot_dir = super::hot::hot_dir(data_dir);
     match mode {
         Mode::Status => status(&HotStore::open_ro(&hot_dir)?),
@@ -34,6 +36,34 @@ pub fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()> {
             let segdir = kdx_ingest::ctx::segments_dir(data_dir);
             let rep = kdx_ingest::seed::run(&hs, &segdir, &|| false)?;
             println!("{}", serde_json::to_string_pretty(&rep)?);
+            Ok(())
+        }
+        Mode::NftFill => {
+            let _lock = super::lock_data_dir(data_dir)?;
+            let hs = HotStore::open(&hot_dir, super::hot::geometry(cfg))?;
+            let segdir = kdx_ingest::ctx::segments_dir(data_dir);
+            let rep = kdx_ingest::nft_fill::run(&hs, &segdir, &|| false)?;
+            println!("{}", serde_json::to_string_pretty(&rep)?);
+            // Then drain the marks it made with `get-balance` (the service does this itself).
+            let local = kdx_node::LocalClient::new(
+                super::local_node_client(cfg)?,
+                kdx_node::LocalOpts {
+                    rps: cfg.balances.local_rps,
+                    concurrency: cfg.balances.local_concurrency.max(1) as usize,
+                },
+            );
+            let (mut cursor, mut total) = (None, kdx_ingest::nft_fill::StepStats::default());
+            for _ in 0..10_000 {
+                let st = kdx_ingest::nft_fill::step(&hs, &local, &mut cursor).await?;
+                if st.rows() == 0 {
+                    break;
+                }
+                total.ok += st.ok;
+                total.absent += st.absent;
+                total.dropped += st.dropped;
+                total.node_errors += st.node_errors;
+            }
+            println!("{}", json!({ "dirty_reconciled": format!("{total:?}") }));
             Ok(())
         }
         Mode::All => {
@@ -103,6 +133,11 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
         "guards": txn.count(Table::Guards)?,
         "key_accounts": txn.count(Table::KeyAccounts)?,
         "tokens": txn.count(Table::Tokens)?,
+        "nft_rows": txn.count(Table::NftBalances)?,
+        "nft_dirty_rows": txn.count(Table::NftDirty)?,
+        "nft_filled_height": txn
+            .meta(kdx_hot::nft::meta::NFT_FILLED)?
+            .and_then(|v| v.try_into().ok().map(u32::from_be_bytes)),
         "seeded_height": seeded,
         "seed_in_progress": txn.meta(meta::BALANCES_SEED_CURSOR)?.is_some(),
         "rate_per_s": rate,

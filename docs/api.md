@@ -36,10 +36,7 @@ All routes are `GET` under `/api/v1`. JSON field names are snake_case. Errors ar
 | `GET /keys/{pubkey}/accounts?cursor&limit` | Accounts whose guard holds the key (inline keysets, and keyset references resolved with `describe-keyset`; user, capability and module guards give none): `items` of `{account, modules: [{module, chain, balance, as_of_height, stale}]}`, paged by account. |
 | `GET /tokens` | Fungible tokens (modules seen emitting `TRANSFER`): `items` of `{module, first_height, holders, holders_approx: true}`. `holders` counts reconciled rows above zero. |
 | `GET /tokens/{module}` | One token, same fields; `404` for a module never seen in a `TRANSFER`. |
-
-### Reserved for P6
-
-`/txs/{requestKey}/defpact`, `/search/code`, `/search/events` and `/nft/accounts/{account}` answer `501 {"error":"not implemented until P6"}`.
+| `GET /nft/accounts/{account}?chain&cursor&limit` | NFTs the account holds, balances above zero: `items` of `{token_id, ledger, chain, balance, as_of_height, source, stale}`, paged by token and chain. A *ledger* is a module named `ledger` (`marmalade-v2.ledger`, `marmalade.ledger`, and copies under a principal namespace). `source` is `event` (the balance after a ledger `RECONCILE` event) or `local` (read with `get-balance`, used for rows a reorg touched and for ledgers that emit no `RECONCILE`); `stale: true` means a re-read is queued. Accounts that are not in the account dictionary (non-principal names never seen as a sender or a `TRANSFER` party) are not listed. |
 
 A store written before the balance tables existed (served read-only) answers the balance, key and token routes with empty lists (format rule A-1 in `format.md`).
 

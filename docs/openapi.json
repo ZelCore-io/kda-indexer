@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "kda-indexer native API",
-    "description": "Internal and unstable until a public hostname is decided. JSON in snake_case. List routes take limit (1..=100, default 20), an opaque cursor, order (desc default, asc), minheight, maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can be shorter than limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away answers 400 'cursor invalidated by reorg'. Balances and tokens come from /local reconciles: every balance row carries as_of_height and stale. Search routes run under a shared gate (503 when search.concurrency searches run, 429 when the client already runs search.per_client) and answer truncated: true when their deadline or a cap cut them. A route reserved for later answers 501 {\"error\": \"not implemented until P6\"}: /nft/accounts/{account}.",
+    "description": "Internal and unstable until a public hostname is decided. JSON in snake_case. List routes take limit (1..=100, default 20), an opaque cursor, order (desc default, asc), minheight, maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can be shorter than limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away answers 400 'cursor invalidated by reorg'. Balances and tokens come from /local reconciles: every balance row carries as_of_height and stale. Search routes run under a shared gate (503 when search.concurrency searches run, 429 when the client already runs search.per_client) and answer truncated: true when their deadline or a cap cut them. NFT holdings come from marmalade ledger events and /local (source event or local).",
     "license": {
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
@@ -723,6 +723,62 @@
         "responses": {
           "200": {
             "description": "`items` of tx summaries, `next_cursor`, `as_of`"
+          }
+        }
+      }
+    },
+    "/api/v1/nft/accounts/{account}": {
+      "get": {
+        "tags": [
+          "nft"
+        ],
+        "summary": "NFTs held by an account, per token and chain.",
+        "operationId": "account",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Account name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Chain id",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1..=100, default 20",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque page cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of {token_id, ledger, chain, balance, as_of_height, source, stale}, `next_cursor`, `as_of`"
           }
         }
       }

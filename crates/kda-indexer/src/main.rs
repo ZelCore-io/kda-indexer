@@ -157,13 +157,17 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Run (or resume) the seed walk: mark every known (account, module, chain) dirty.
-        #[arg(long, conflicts_with_all = ["all", "status"])]
+        #[arg(long, conflicts_with_all = ["all", "status", "nft_fill"])]
         seed: bool,
+        /// Run the NFT history fill again (ledger events; plan Task 11). The dirty rows it
+        /// marks are read by the next `run`.
+        #[arg(long, conflicts_with_all = ["seed", "all", "status"])]
+        nft_fill: bool,
         /// Mark every `Balances` row dirty (the next `run` re-reads them all).
-        #[arg(long, conflicts_with_all = ["seed", "status"])]
+        #[arg(long, conflicts_with_all = ["seed", "status", "nft_fill"])]
         all: bool,
         /// Dirty rows, rate, ETA and seed state.
-        #[arg(long, conflicts_with_all = ["seed", "all"])]
+        #[arg(long, conflicts_with_all = ["seed", "all", "nft_fill"])]
         status: bool,
     },
     /// Code search index (`search/`): rebuild it, or query it (dev aid).
@@ -320,6 +324,16 @@ enum InspectWhat {
     ViewCheck {
         #[arg(long, default_value_t = 600)]
         seconds: u64,
+    },
+    /// Dev: random `NftBalances` rows; with --compare-node, each is re-read with
+    /// `get-balance` from the node (rows older than the node's tip by a changed balance are
+    /// reported as `skew`, not as mismatches, when the row is stale or its chain moved on).
+    #[command(hide = true)]
+    NftCheck {
+        #[arg(long, default_value_t = 20)]
+        count: usize,
+        #[arg(long)]
+        compare_node: bool,
     },
     /// Random frozen and hot txs; with --compare-node, refetch each block and require
     /// byte-identical rendered tx, output, miner data and an equal header.
@@ -498,21 +512,26 @@ async fn main() -> anyhow::Result<()> {
         Command::ReconcileBalances {
             data_dir,
             seed,
+            nft_fill,
             all,
             status,
         } => {
             use kda_indexer::cmd::reconcile::Mode;
-            let mode = match (seed, all, status) {
-                (true, _, _) => Mode::Seed,
-                (_, true, _) => Mode::All,
-                (_, _, true) => Mode::Status,
-                _ => anyhow::bail!("reconcile-balances needs --seed, --all or --status"),
+            let mode = match (seed, all, status, nft_fill) {
+                (true, _, _, _) => Mode::Seed,
+                (_, true, _, _) => Mode::All,
+                (_, _, true, _) => Mode::Status,
+                (_, _, _, true) => Mode::NftFill,
+                _ => {
+                    anyhow::bail!("reconcile-balances needs --seed, --all, --status or --nft-fill")
+                }
             };
             kda_indexer::cmd::reconcile::run(
                 &cfg,
                 data_dir.as_deref().unwrap_or(&cfg.data_dir),
                 mode,
             )
+            .await
         }
         Command::Search { action } => match action {
             SearchAction::Rebuild {
@@ -572,6 +591,10 @@ async fn main() -> anyhow::Result<()> {
                     count,
                     compare_node,
                 } => inspect::sample(&cfg, &s, count, compare_node).await,
+                InspectWhat::NftCheck {
+                    count,
+                    compare_node,
+                } => inspect::nft_check(&cfg, &s, count, compare_node).await,
                 InspectWhat::ViewCheck { .. } => unreachable!("handled above"),
             }
         }
