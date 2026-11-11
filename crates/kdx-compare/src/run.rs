@@ -1627,10 +1627,13 @@ impl Ctx {
                 i += 1;
             }
         }
-        // B coinbase rows at a (chain, height) where A lists no row: an orphan when the node's
-        // canonical block there is another one (seen live: 99cb7008...?chain=1, chainweb-data
-        // coinbase row in T6y_F81b at chain 1 height 7392440, canonical 3J36InYO, whose
-        // coinbase went to another miner).
+        // B rows (coinbase or not) at a (chain, height) where A lists no row: an orphan when
+        // the node's canonical block there is another one (seen live: 99cb7008...?chain=1,
+        // chainweb-data coinbase row in T6y_F81b at chain 1 height 7392440, canonical
+        // 3J36InYO, whose coinbase went to another miner; k:b649fd12...?token=coin, a failed
+        // tx's gas TRANSFER in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M, request
+        // key unknown to the node's /poll on every chain).
+        let mut canon_at: HashMap<(u8, u64), Option<String>> = HashMap::new();
         let mut j = 0;
         while j < xb.len() && moved.len() < ORPHAN_CHECKS {
             let r = &xb[j];
@@ -1642,16 +1645,23 @@ impl Ctx {
                 j += 1;
                 continue;
             };
-            if s(r, "requestKey").as_deref() != Some("<coinbase>") || a_at.contains_key(&(c, h)) {
+            if a_at.contains_key(&(c, h)) {
                 j += 1;
                 continue;
             }
-            self.count_request("orphan-check", "node", 1);
-            let canon_hash = canonical_header(&self.node, &self.tips, c, h)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string));
+            let canon_hash = match canon_at.get(&(c, h)) {
+                Some(v) => v.clone(),
+                None => {
+                    self.count_request("orphan-check", "node", 1);
+                    let v = canonical_header(&self.node, &self.tips, c, h)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string));
+                    canon_at.insert((c, h), v.clone());
+                    v
+                }
+            };
             if canon_hash.is_some_and(|ch| ch != bh) {
                 moved.push(xb.remove(j));
             } else {

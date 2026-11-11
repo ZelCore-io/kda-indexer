@@ -129,7 +129,7 @@ id = "oracle-orphan-rows"
 route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
-reason = "chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height."
+reason = "chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height, or, where kda-indexer lists no row at that chain and height, after the node's canonical block there is another one (seen live: k:b649fd12...?token=coin, chainweb-data row in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M)."
 owner_note = "Accepted (run 3E ruling R3E-9); extends orphan-rows-txs (spec section 4.5: orphans are not kept). Also covers chainweb-data coinbase rows at an A height in another block (no request key to match), node-confirmed the same way."
 
 [[entry]]
