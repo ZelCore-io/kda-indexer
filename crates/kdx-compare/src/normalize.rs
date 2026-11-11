@@ -92,6 +92,7 @@ pub fn normalize(route: &RouteKind, v: &mut Value) {
             RouteKind::Account => tie_groups(items, account_key),
             RouteKind::Events => tie_groups(items, events_key),
             RouteKind::V1Txs => v1txs_as_set(items),
+            RouteKind::Txs => txs_as_set(items),
             _ => {}
         }
     }
@@ -108,6 +109,22 @@ fn v1txs_as_set(items: &mut [Value]) {
     items.sort_by_cached_key(|v| {
         (
             v.get("requestKey")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            v.to_string(),
+        )
+    });
+}
+
+/// `/txs/txs` answers are sets: chainweb-data's query has no order, and a genesis request key
+/// has one row per chain (F4). Sorted by chain, height and block.
+fn txs_as_set(items: &mut [Value]) {
+    items.sort_by_cached_key(|v| {
+        (
+            v.get("chain").and_then(Value::as_u64),
+            v.get("height").and_then(Value::as_u64),
+            v.get("blockHash")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
@@ -287,6 +304,8 @@ pub fn iso_micros(us: u64) -> String {
 
 #[cfg(test)]
 mod refspec_tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -302,5 +321,21 @@ mod refspec_tests {
         normalize(&RouteKind::Tx, &mut a);
         normalize(&RouteKind::Tx, &mut b);
         assert_eq!(a.to_string(), b.to_string());
+    }
+
+    /// F4: /txs/txs rows compare as a set (chainweb-data's query has no order).
+    #[test]
+    fn txs_rows_as_set() {
+        let mut a = json!([
+            {"chain": 10, "height": 852054, "blockHash": "y"},
+            {"chain": 0, "height": 0, "blockHash": "x"}
+        ]);
+        let mut b = json!([
+            {"chain": 0, "height": 0, "blockHash": "x"},
+            {"chain": 10, "height": 852054, "blockHash": "y"}
+        ]);
+        normalize(&RouteKind::Txs, &mut a);
+        normalize(&RouteKind::Txs, &mut b);
+        assert_eq!(a, b);
     }
 }

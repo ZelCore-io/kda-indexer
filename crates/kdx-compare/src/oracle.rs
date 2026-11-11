@@ -99,6 +99,31 @@ pub fn project_tx_detail(cw: &Value) -> Value {
     Value::Object(m)
 }
 
+/// Events of a node `/poll` entry in the `/v1/txs` shape: `{name: "<module>.<NAME>", params}`.
+pub fn v1txs_events(poll: &Value) -> Value {
+    let evs = poll
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    let mut m = Map::new();
+                    m.insert("name".into(), qualified_event_name(e));
+                    m.insert(
+                        "params".into(),
+                        match e.get("params") {
+                            Some(p @ Value::Array(_)) => p.clone(),
+                            _ => Value::Array(Vec::new()),
+                        },
+                    );
+                    Value::Object(m)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(evs)
+}
+
 fn qualified_event_name(e: &Value) -> Value {
     let name = e.get("name").and_then(Value::as_str).unwrap_or("");
     let module = e.get("module");

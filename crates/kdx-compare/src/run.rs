@@ -34,9 +34,18 @@ const WORKERS: usize = 3;
 const KDA_TXS_LIMIT_MS: u64 = 29_000;
 /// At most this many A-only account rows are checked against chainweb-data's /txs/tx.
 const GAP_CHECKS: usize = 5;
-/// At most this many oracle rows per compare are checked as orphans against the node (seen
-/// live: 13 chainweb-data orphan rows in one 3-page account answer).
-const ORPHAN_CHECKS: usize = 50;
+/// At most this many canonical-header lookups on the node per compare for the orphan rules
+/// (rows at a (chain, height) already looked up are free). Seen live: 13 chainweb-data orphan
+/// rows in one 3-page account answer, and more than 50 kda-txs orphan rows in one
+/// `/v1/txs/k:7fb0d75f.../coin/250` answer; a 250-row page needs at most 250 lookups.
+const ORPHAN_CHECKS: usize = 300;
+/// JSON path of the visible allowlist hit for a genesis request key that A answers 404 on
+/// `/txs/tx` because it is stored on several chains (F4, chainweb-data does the same).
+const GENESIS_MULTI_PATH: &str = "/~genesis-multi-chain";
+/// JSON path of the visible allowlist hit for kda-txs event lists the node contradicts.
+const KDATXS_EVENTS_NODE_PATH: &str = "/~kdatxs-events-node";
+/// At most this many rows per compare go to the node for the event tie-break.
+const EVENT_NODE_CHECKS: usize = 25;
 /// JSON path of the visible allowlist hit for rows missing from chainweb-data's transfers.
 const CWD_TRANSFERS_GAP_PATH: &str = "/~cwd-transfers-gap";
 
@@ -201,13 +210,33 @@ fn num_value(v: &Value) -> Option<f64> {
 
 /// The `limit` query value, if any.
 /// Rows of `a` whose (requestKey, blockHash, idx) is not in `b` (counted as a multiset).
-fn only_keys_in_first(a: &Value, b: &Value) -> Vec<Value> {
-    let key = |r: &Value| {
-        let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        let idx = r.get("idx").and_then(Value::as_f64).map(|f| f.to_string());
-        (s("requestKey"), s("blockHash"), idx)
+/// (requestKey, blockHash, idx) of a row: the identity both list rules match rows by.
+type RowKey = (String, String, Option<String>);
+
+fn row_key(r: &Value) -> RowKey {
+    let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let idx = r.get("idx").and_then(Value::as_f64).map(|f| f.to_string());
+    (s("requestKey"), s("blockHash"), idx)
+}
+
+/// Two event lists with the same items, in any order (numbers compared as written).
+fn same_events(a: &Value, b: &Value) -> bool {
+    let (Value::Array(x), Value::Array(y)) = (a, b) else {
+        return a == b;
     };
-    let mut have: HashMap<(String, String, Option<String>), usize> = HashMap::new();
+    if x.len() != y.len() {
+        return false;
+    }
+    let mut sx = x.clone();
+    let mut sy = y.clone();
+    sx.sort_by_cached_key(num_canon_text);
+    sy.sort_by_cached_key(num_canon_text);
+    crate::diff::diff(&Value::Array(sx), &Value::Array(sy)).is_empty()
+}
+
+fn only_keys_in_first(a: &Value, b: &Value) -> Vec<Value> {
+    let key = row_key;
+    let mut have: HashMap<RowKey, usize> = HashMap::new();
     if let Value::Array(xb) = b {
         for r in xb {
             *have.entry(key(r)).or_default() += 1;
@@ -812,15 +841,29 @@ impl Ctx {
         // canonical row, and its /txs/tx answers 404 when a request key has several rows.
         // A's row must be one of B's (the node pair checks that A's block is canonical); B's
         // other rows go under /orphans (allowlist `orphan-rows-txs`).
+        // A B row in the node's canonical block is no orphan: it stays a row A lacks (F4, seen
+        // live: genesis request keys on every chain, chainweb-data listing all 20 rows and
+        // compat one).
         if req.route == RouteKind::Txs && sa == 200 && sb == 200 {
+            let mut other = Vec::new();
             if let (Value::Array(xa), Value::Array(xb)) = (&va, &mut vb) {
                 let hashes: Vec<&Value> = xa.iter().filter_map(|r| r.get("blockHash")).collect();
                 if !xa.is_empty() && xb.len() > xa.len() {
-                    let (keep, other): (Vec<Value>, Vec<Value>) = xb
+                    let (keep, o): (Vec<Value>, Vec<Value>) = xb
                         .drain(..)
                         .partition(|r| r.get("blockHash").is_some_and(|h| hashes.contains(&h)));
                     *xb = keep;
-                    orphans = other;
+                    other = o;
+                }
+            }
+            if !other.is_empty() {
+                let (orph, canon) = self.split_by_node(other).await;
+                orphans = orph;
+                if !canon.is_empty() {
+                    if let Value::Array(xb) = &mut vb {
+                        xb.extend(canon);
+                    }
+                    normalize(&req.route, &mut vb);
                 }
             }
         }
@@ -829,20 +872,10 @@ impl Ctx {
         } else {
             None
         };
-        // Genesis txs: chainweb-data lists them on /txs/txs, compat hides them (G1).
-        let genesis = matches!(req.route, RouteKind::Tx | RouteKind::Txs)
-            && sa == 404
-            && sb == 200
-            && match &vb {
-                Value::Array(rows) => {
-                    !rows.is_empty() && rows.iter().all(|r| self.is_genesis_row(r))
-                }
-                // chainweb-data's /txs/tx answers some genesis txs too (seen live: 3I6F2eeG...).
-                o @ Value::Object(_) => self.is_genesis_row(o),
-                _ => false,
-            };
-        // The status difference is part of those two explained cases.
-        let status_explained = genesis || orphan_tx.is_some();
+        // Genesis txs: compat serves them on /txs/tx and /txs/txs as chainweb-data does (G1,
+        // F4), so a status difference there is a diff like any other.
+        // The status difference is part of the explained orphan case.
+        let status_explained = orphan_tx.is_some();
         // kda-txs writes decimals as JSON doubles (seen live: kdswap-gas-payer event amounts
         // whose exact decimal has more digits than an f64 holds); compare at f64 precision
         // (only here: the row rules above read heights and chains as integers).
@@ -850,17 +883,20 @@ impl Ctx {
             numbers_as_f64(&mut va);
             numbers_as_f64(&mut vb);
         }
-        let (mut d, skew) = if genesis {
-            (
-                vec![DiffEntry {
-                    path: "/@genesis".into(),
-                    kind: DiffKind::Missing,
-                    a: None,
-                    b: Some(vb.clone()),
-                }],
-                false,
-            )
-        } else if let Some(rows) = orphan_tx {
+        // kda-txs answers a row's events differently from one fetch to the next (seen live:
+        // d763d377.../coin/50, e4f0a329.../coin/50, the gas and main TRANSFER from/to and
+        // amounts, gone on a refetch). Rows both sides list whose events differ are polled
+        // on the node: when the node's events in A's block equal A's for every such row,
+        // B's events are replaced by A's under the visible hit /~kdatxs-events-node (R3E-15).
+        let mut ev_node: Vec<Value> = Vec::new();
+        if req.route == RouteKind::V1Txs
+            && tb.kind == crate::config::TargetKind::KdaTxs
+            && sa == 200
+            && sb == 200
+        {
+            ev_node = self.events_node_tiebreak(req, &va, &mut vb).await;
+        }
+        let (mut d, skew) = if let Some(rows) = orphan_tx {
             (
                 vec![DiffEntry {
                     path: "/orphans".into(),
@@ -902,6 +938,14 @@ impl Ctx {
                 path: path.into(),
                 kind: DiffKind::Extra,
                 a: Some(json!({"rows": node_gap.len(), "window_cut": window_cut, "first": keys})),
+                b: None,
+            });
+        }
+        if !ev_node.is_empty() {
+            d.push(DiffEntry {
+                path: KDATXS_EVENTS_NODE_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({"rows": ev_node.len(), "first": &ev_node[..ev_node.len().min(10)]})),
                 b: None,
             });
         }
@@ -1306,11 +1350,13 @@ impl Ctx {
         };
         let mut vb = oracle::from_poll(&entry, &header, tx.as_ref());
         let block_hash = vb.get("blockHash").cloned().unwrap_or(Value::Null);
-        // A side: the canonical row (for /txs/txs, other rows go under /orphans).
+        // A side: the canonical row (for /txs/txs, other rows go under /orphans; copies of a
+        // genesis tx in other chains' genesis blocks are not orphans, F4).
         let mut va = match (&req.route, a_body) {
             (RouteKind::Txs, Value::Array(rows)) => {
                 let (canon, orphans): (Vec<&Value>, Vec<&Value>) = rows
                     .iter()
+                    .filter(|r| !self.genesis_copy(r, chain))
                     .partition(|r| r.get("blockHash") == Some(&block_hash));
                 let mut v = canon
                     .first()
@@ -1334,12 +1380,16 @@ impl Ctx {
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
         let d = if va.is_null() {
-            // A does not have the tx (or only orphan rows). Genesis-block txs get their own
-            // path so the allowlist can name them.
+            // A does not have the tx (or only orphan rows). A genesis tx whose request key A
+            // stores on several chains is a 404 on /txs/tx, as in chainweb-data (F4): checked
+            // on A's /txs/txs, it gets its own path so the allowlist can name it.
             let genesis = height == 0 || !self.graph.chains_at(height - 1).contains(&chain);
+            let multi = genesis
+                && req.route == RouteKind::Tx
+                && self.a_genesis_multi(req, ta, rk, chain, &block_hash).await;
             vec![DiffEntry {
-                path: if genesis {
-                    "/@genesis".into()
+                path: if multi {
+                    GENESIS_MULTI_PATH.into()
                 } else {
                     "/".into()
                 },
@@ -1580,10 +1630,13 @@ impl Ctx {
                 }
             }
         }
-        let mut canon: HashMap<(u8, u64), bool> = HashMap::new();
+        // Canonical hash per (chain, height), shared by both rules; at most ORPHAN_CHECKS
+        // lookups per compare.
+        let mut canon_at: HashMap<(u8, u64), Option<String>> = HashMap::new();
+        let mut checks = 0usize;
         let mut moved = Vec::new();
         let mut i = 0;
-        while i < xb.len() && moved.len() < ORPHAN_CHECKS {
+        while i < xb.len() {
             let r = &xb[i];
             let at = (
                 r.get("chain").and_then(Value::as_u64).map(|c| c as u8),
@@ -1607,20 +1660,10 @@ impl Ctx {
                 i += 1;
                 continue;
             };
-            let ok = match canon.get(&(c, h)) {
-                Some(v) => *v,
-                None => {
-                    self.count_request("orphan-check", "node", 1);
-                    let v = canonical_header(&self.node, &self.tips, c, h)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string))
-                        == Some(abh);
-                    canon.insert((c, h), v);
-                    v
-                }
-            };
+            let ok = self
+                .canon_cached(&mut canon_at, &mut checks, c, h)
+                .await
+                .is_some_and(|ch| ch == Some(abh));
             if ok {
                 moved.push(xb.remove(i));
             } else {
@@ -1633,9 +1676,8 @@ impl Ctx {
         // 3J36InYO, whose coinbase went to another miner; k:b649fd12...?token=coin, a failed
         // tx's gas TRANSFER in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M, request
         // key unknown to the node's /poll on every chain).
-        let mut canon_at: HashMap<(u8, u64), Option<String>> = HashMap::new();
         let mut j = 0;
-        while j < xb.len() && moved.len() < ORPHAN_CHECKS {
+        while j < xb.len() {
             let r = &xb[j];
             let (Some(c), Some(h), Some(bh)) = (
                 r.get("chain").and_then(Value::as_u64).map(|c| c as u8),
@@ -1649,19 +1691,10 @@ impl Ctx {
                 j += 1;
                 continue;
             }
-            let canon_hash = match canon_at.get(&(c, h)) {
-                Some(v) => v.clone(),
-                None => {
-                    self.count_request("orphan-check", "node", 1);
-                    let v = canonical_header(&self.node, &self.tips, c, h)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string));
-                    canon_at.insert((c, h), v.clone());
-                    v
-                }
-            };
+            let canon_hash = self
+                .canon_cached(&mut canon_at, &mut checks, c, h)
+                .await
+                .flatten();
             if canon_hash.is_some_and(|ch| ch != bh) {
                 moved.push(xb.remove(j));
             } else {
@@ -1680,6 +1713,183 @@ impl Ctx {
             }
         }
         moved
+    }
+
+    /// The node's canonical block hash at `(c, h)`, from `cache` or one lookup while fewer
+    /// than ORPHAN_CHECKS were made; `None` when the budget is spent.
+    async fn canon_cached(
+        &self,
+        cache: &mut HashMap<(u8, u64), Option<String>>,
+        checks: &mut usize,
+        c: u8,
+        h: u64,
+    ) -> Option<Option<String>> {
+        if let Some(v) = cache.get(&(c, h)) {
+            return Some(v.clone());
+        }
+        if *checks >= ORPHAN_CHECKS {
+            return None;
+        }
+        *checks += 1;
+        self.count_request("orphan-check", "node", 1);
+        let v = canonical_header(&self.node, &self.tips, c, h)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string));
+        cache.insert((c, h), v.clone());
+        Some(v)
+    }
+
+    /// Splits oracle rows into (orphans, canonical): a row is canonical when the node's
+    /// canonical block at its (chain, height) is the row's block. Rows the node cannot
+    /// confirm either way stay orphans.
+    async fn split_by_node(&self, rows: Vec<Value>) -> (Vec<Value>, Vec<Value>) {
+        let mut cache = HashMap::new();
+        let mut checks = 0usize;
+        let (mut orph, mut canon) = (Vec::new(), Vec::new());
+        for r in rows {
+            let at = (
+                r.get("chain")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| u8::try_from(c).ok()),
+                r.get("height").and_then(Value::as_u64),
+                r.get("blockHash").and_then(Value::as_str),
+            );
+            let is_canon = match at {
+                (Some(c), Some(h), Some(bh)) => self
+                    .canon_cached(&mut cache, &mut checks, c, h)
+                    .await
+                    .flatten()
+                    .is_some_and(|ch| ch == bh),
+                _ => false,
+            };
+            if is_canon {
+                canon.push(r);
+            } else {
+                orph.push(r);
+            }
+        }
+        (orph, canon)
+    }
+
+    /// A row of another chain's genesis block: a copy of a genesis tx whose request key
+    /// repeats across chains (F4), not an orphan of `chain`.
+    fn genesis_copy(&self, r: &Value, chain: u8) -> bool {
+        r.get("chain").and_then(Value::as_u64) != Some(u64::from(chain)) && self.is_genesis_row(r)
+    }
+
+    /// A's `/txs/txs` lists `rk` in the canonical genesis block of `chain` and in at least
+    /// one other chain's genesis block (F4: then its `/txs/tx` answers 404, as
+    /// chainweb-data's does for a request key with several rows).
+    async fn a_genesis_multi(
+        &self,
+        req: &Request,
+        ta: &Target,
+        rk: &str,
+        chain: u8,
+        block_hash: &Value,
+    ) -> bool {
+        self.count_request(req.route.as_str(), &ta.name, 1);
+        let Ok(page) = ta.get(&format!("/txs/txs?requestkey={rk}")).await else {
+            return false;
+        };
+        let Some(Value::Array(rows)) = page.json() else {
+            return false;
+        };
+        page.status == 200
+            && rows.len() >= 2
+            && rows.iter().all(|r| self.is_genesis_row(r))
+            && rows.iter().any(|r| {
+                r.get("chain").and_then(Value::as_u64) == Some(u64::from(chain))
+                    && r.get("blockHash") == Some(block_hash)
+            })
+    }
+
+    /// Node tie-break of per-row events against kda-txs (R3E-15). Rows both sides list (by
+    /// request key, block and idx) whose `events` differ are polled on the node (at most
+    /// EVENT_NODE_CHECKS rows). When for every such row the node has the tx in A's block
+    /// with A's events, B's events are set to A's and `[chain, height, requestKey]` of each
+    /// row is returned; otherwise nothing changes.
+    async fn events_node_tiebreak(&self, req: &Request, va: &Value, vb: &mut Value) -> Vec<Value> {
+        let (Value::Array(xa), Value::Array(xb)) = (va, &mut *vb) else {
+            return Vec::new();
+        };
+        let mut a_by: HashMap<RowKey, &Value> = HashMap::new();
+        for r in xa {
+            a_by.entry(row_key(r)).or_insert(r);
+        }
+        let mut cand: Vec<(usize, &Value)> = Vec::new();
+        for (i, rb) in xb.iter().enumerate() {
+            if let Some(ra) = a_by.get(&row_key(rb)) {
+                if ra.get("events") != rb.get("events") {
+                    cand.push((i, ra));
+                }
+            }
+        }
+        if cand.is_empty() || cand.len() > EVENT_NODE_CHECKS {
+            return Vec::new();
+        }
+        let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+        let mut by_chain: HashMap<u8, Vec<String>> = HashMap::new();
+        for (_, ra) in &cand {
+            let (Some(rk), Some(c)) = (
+                s(ra, "requestKey"),
+                ra.get("chain")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| u8::try_from(c).ok()),
+            ) else {
+                return Vec::new();
+            };
+            by_chain.entry(c).or_default().push(rk);
+        }
+        let mut node: HashMap<String, Value> = HashMap::new();
+        for (c, rks) in by_chain {
+            for chunk in rks.chunks(NODE_POLL_CHUNK) {
+                self.count_request(req.route.as_str(), "node", 1);
+                let Ok(res) = self.node.poll(c, chunk).await else {
+                    return Vec::new();
+                };
+                for rk in chunk {
+                    let Some(v) = res.get(rk) else {
+                        return Vec::new();
+                    };
+                    node.insert(rk.clone(), v.clone());
+                }
+            }
+        }
+        for (_, ra) in &cand {
+            let rk = s(ra, "requestKey").unwrap_or_default();
+            let Some(n) = node.get(&rk) else {
+                return Vec::new();
+            };
+            let in_block = n.pointer("/metaData/blockHash").and_then(Value::as_str)
+                == s(ra, "blockHash").as_deref();
+            let mut ne = oracle::v1txs_events(n);
+            numbers_as_f64(&mut ne);
+            let mut ae = ra.get("events").cloned().unwrap_or(Value::Null);
+            numbers_as_f64(&mut ae);
+            if !in_block || !same_events(&ae, &ne) {
+                return Vec::new();
+            }
+        }
+        let mut out = Vec::new();
+        let fixes: Vec<(usize, Value)> = cand
+            .iter()
+            .map(|(i, ra)| (*i, ra.get("events").cloned().unwrap_or(Value::Null)))
+            .collect();
+        for (i, ev) in fixes {
+            let r = &mut xb[i];
+            out.push(json!([
+                r.get("chain"),
+                r.get("height"),
+                r.get("requestKey")
+            ]));
+            if let Some(m) = r.as_object_mut() {
+                m.insert("events".into(), ev);
+            }
+        }
+        out
     }
 
     /// A row of a genesis block: height 0, or the first height of a chain added later.
@@ -1716,7 +1926,12 @@ impl Ctx {
         let (mine, other): (Vec<Value>, Vec<Value>) = rows
             .into_iter()
             .partition(|r| r.get("blockHash") == Some(&a_hash));
-        (!mine.is_empty() && !other.is_empty()).then_some(other)
+        if mine.is_empty() || other.is_empty() {
+            return None;
+        }
+        // A row in the node's canonical block is no orphan: A should list it too (F4).
+        let (orph, canon) = self.split_by_node(other).await;
+        canon.is_empty().then_some(orph)
     }
 
     async fn header_compare(
@@ -1774,8 +1989,10 @@ impl Ctx {
         let bh = vb.get("blockHash").cloned();
         let mut va = match &pa.items {
             Value::Array(rows) => {
-                let (canon, orphans): (Vec<&Value>, Vec<&Value>) =
-                    rows.iter().partition(|r| r.get("blockHash") == bh.as_ref());
+                let (canon, orphans): (Vec<&Value>, Vec<&Value>) = rows
+                    .iter()
+                    .filter(|r| !self.genesis_copy(r, chain))
+                    .partition(|r| r.get("blockHash") == bh.as_ref());
                 let mut v = canon
                     .first()
                     .map(|r| oracle::project_block(r))
@@ -1796,18 +2013,8 @@ impl Ctx {
         };
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
-        let genesis = height == 0 || !self.graph.chains_at(height - 1).contains(&chain);
-        let d = if va.is_null() && genesis {
-            // Seed requests anchored at a genesis block: A hides genesis txs (G1).
-            vec![DiffEntry {
-                path: "/@genesis".into(),
-                kind: DiffKind::Missing,
-                a: None,
-                b: Some(vb.clone()),
-            }]
-        } else {
-            diff_route(&req.route, &va, &vb)
-        };
+        // Genesis blocks included: compat serves their txs on /txs/txs (G1).
+        let d = diff_route(&req.route, &va, &vb);
         self.finish(
             req,
             ta,
@@ -2027,5 +2234,36 @@ mod tests {
         );
         assert_eq!(query_limit("/txs/account/k:a"), None);
         assert_eq!(num_value(&json!("1.5")), Some(1.5));
+    }
+
+    /// Event tie-break helpers: rows match by (requestKey, blockHash, idx); event lists
+    /// compare as multisets at f64 precision; the node projection is the /v1/txs shape.
+    #[test]
+    fn event_tiebreak_helpers() {
+        let a = json!({"requestKey": "r", "blockHash": "b", "events": []});
+        let b = json!({"requestKey": "r", "blockHash": "b", "events": [1]});
+        assert_eq!(row_key(&a), row_key(&b));
+        assert_ne!(
+            row_key(&a),
+            row_key(&json!({"requestKey": "r", "blockHash": "c"}))
+        );
+        let x = json!([{"name": "coin.TRANSFER", "params": ["a", "b", 1.5]},
+                       {"name": "coin.TRANSFER", "params": ["a", "m", 0.1]}]);
+        let y = json!([{"name": "coin.TRANSFER", "params": ["a", "m", 0.1]},
+                       {"name": "coin.TRANSFER", "params": ["a", "b", 1.5]}]);
+        assert!(same_events(&x, &y));
+        let z = json!([{"name": "coin.TRANSFER", "params": ["a", "m", 1.5]},
+                       {"name": "coin.TRANSFER", "params": ["a", "b", 0.1]}]);
+        assert!(!same_events(&x, &z));
+        let poll = json!({"events": [
+            {"name": "TRANSFER", "module": {"namespace": null, "name": "coin"},
+             "moduleHash": "h", "params": ["a", "b", 1.5]},
+            {"name": "X", "module": {"namespace": "n", "name": "m"}, "moduleHash": "h"}
+        ]});
+        assert_eq!(
+            crate::oracle::v1txs_events(&poll),
+            json!([{"name": "coin.TRANSFER", "params": ["a", "b", 1.5]},
+                   {"name": "n.m.X", "params": []}])
+        );
     }
 }
