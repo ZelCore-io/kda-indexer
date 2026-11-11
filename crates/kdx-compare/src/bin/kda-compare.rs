@@ -65,9 +65,10 @@ enum Cmd {
         /// verdict covers.
         #[arg(long, default_value = "must")]
         routes: String,
-        /// `small` (R3E-13: every phase gate, default) or `full` (500/200/50, the final
-        /// validation only).
-        #[arg(long, default_value = "small")]
+        /// `small` (R3E-13: every phase gate) or `full` (500/200/50, the final validation).
+        /// Required: the default changed from full to small in P5, so a command line
+        /// without it must not pass a weaker gate silently.
+        #[arg(long)]
         gate: String,
     },
     /// Debug: generate requests and print them.

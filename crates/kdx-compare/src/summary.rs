@@ -1,4 +1,4 @@
-//! `kda-compare summary --since <iso> [--routes must|should|all] [--gate small|full]`: the
+//! `kda-compare summary --since <iso> [--routes must|should|all] --gate small|full`: the
 //! P3 exit gate (and its P5 small and full forms). Reads the
 //! ten-minute buckets the `run` loop writes into `summary-<date>.json` (flushed every minute
 //! and on shutdown), merges the buckets that start at or after `--since`, and prints one row
@@ -238,8 +238,14 @@ fn ms(v: Option<f64>) -> String {
     v.map_or_else(|| "-".into(), |x| format!("{x:.0}"))
 }
 
-/// The table (the required routes only, or every route with `all_rows`) and the verdict.
-pub fn render(rows: &[Row], required: &[(&str, u64)], all_rows: bool) -> (String, bool) {
+/// The table (the required routes only, or every route with `all_rows`) and the verdict;
+/// `label` names the gate size and route set on the verdict line.
+pub fn render(
+    rows: &[Row],
+    required: &[(&str, u64)],
+    all_rows: bool,
+    label: &str,
+) -> (String, bool) {
     let is_must = |r: &str| required.iter().any(|(m, _)| *m == r);
     let mut s = String::new();
     let _ = writeln!(
@@ -276,14 +282,18 @@ pub fn render(rows: &[Row], required: &[(&str, u64)], all_rows: bool) -> (String
     if green {
         let _ = writeln!(
             s,
-            "GREEN: every required route is at its minimum with 0 unexplained diffs"
+            "GREEN ({label}): every required route is at its minimum with 0 unexplained diffs"
         );
     } else {
-        let _ = writeln!(s, "NOT GREEN:");
+        let _ = writeln!(s, "NOT GREEN ({label}):");
         for w in why {
             let _ = writeln!(s, "  {w}");
         }
     }
+    let _ = writeln!(
+        s,
+        "not covered by this verdict: reorg-probe failures and lag (separate gate steps)"
+    );
     (s, green)
 }
 
@@ -293,7 +303,8 @@ pub fn run(out_dir: &Path, since: &str, routes: &str, gate: &str) -> anyhow::Res
     let size = GateSize::parse(gate)?;
     let since_secs = parse_since(since)?;
     let w = load(out_dir, since_secs)?;
-    let (text, green) = render(&rows(&w), &set.required(size), routes == "all");
+    let label = format!("gate {gate}, routes {routes}");
+    let (text, green) = render(&rows(&w), &set.required(size), routes == "all", &label);
     print!("{text}");
     Ok(green)
 }
