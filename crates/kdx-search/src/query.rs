@@ -10,7 +10,7 @@ use std::time::Instant;
 use kdx_types::like::Like;
 use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, TermQuery};
 use tantivy::schema::{IndexRecordOption, Value};
-use tantivy::{DocSet, Index, IndexReader, ReloadPolicy, TantivyDocument, Term, TERMINATED};
+use tantivy::{DocSet, IndexReader, ReloadPolicy, TantivyDocument, Term, TERMINATED};
 
 use crate::manifest::SearchManifest;
 use crate::schema::{open, Fields};
@@ -78,8 +78,6 @@ pub fn grams(p: &Like) -> Option<Vec<String>> {
 
 /// Read side of `search/` (reloads on the writer's commits).
 pub struct Searcher {
-    #[allow(dead_code)]
-    index: Index,
     reader: IndexReader,
     fields: Fields,
     pub manifest: SearchManifest,
@@ -98,7 +96,6 @@ impl Searcher {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
         Ok(Some(Searcher {
-            index,
             reader,
             fields,
             manifest,
@@ -162,9 +159,6 @@ impl Searcher {
                 }
                 doc = sc.advance();
             }
-        }
-        if Instant::now() >= deadline {
-            return Err(SearchError::Timeout);
         }
         Ok(out)
     }

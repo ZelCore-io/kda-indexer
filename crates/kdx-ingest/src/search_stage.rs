@@ -50,29 +50,41 @@ const RING: usize = 256;
 /// pass; existing bodies are skipped by hash).
 const STARTUP_REWIND: u32 = 128;
 const POLL: Duration = Duration::from_secs(1);
+/// First retry delay after a failure; doubles per consecutive failure up to `RETRY_MAX` (a
+/// rebuild that keeps failing must not re-run its census every minute).
 const RETRY: Duration = Duration::from_secs(60);
+const RETRY_MAX: Duration = Duration::from_secs(3600);
 /// The stage's writer heap (one thread).
 const STAGE_HEAP_MB: usize = 64;
 
 /// Runs until `stop`; failures are logged and retried (search never stops ingest).
 pub async fn run(ctx: Arc<Ctx>, o: SearchStageOpts, stop: CancellationToken) -> Result<()> {
+    let mut delay = RETRY;
     loop {
         let (c, o2, s) = (ctx.clone(), o.clone(), stop.clone());
+        let t0 = Instant::now();
         let r = tokio::task::spawn_blocking(move || run_blocking(&c, &o2, &s)).await;
+        // A stage that ran for a while before failing starts the back-off again.
+        if t0.elapsed() > RETRY_MAX {
+            delay = RETRY;
+        }
+        let secs = delay.as_secs();
         match r {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(e)) => {
                 tracing::error!(
                     error = format!("{e:#}"),
-                    "search stage failed; retrying in 60 s"
+                    retry_secs = secs,
+                    "search stage failed"
                 )
             }
-            Err(e) => tracing::error!(error = %e, "search stage panicked; retrying in 60 s"),
+            Err(e) => tracing::error!(error = %e, retry_secs = secs, "search stage panicked"),
         }
         tokio::select! {
             _ = stop.cancelled() => return Ok(()),
-            _ = tokio::time::sleep(RETRY) => {}
+            _ = tokio::time::sleep(delay) => {}
         }
+        delay = (delay * 2).min(RETRY_MAX);
     }
 }
 
