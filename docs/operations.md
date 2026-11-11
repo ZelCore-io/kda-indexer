@@ -303,6 +303,15 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search que
   time (`search.lock`). It is a big write: run "Before any big write" first.
 - `[search] build_threads` and `heap_mb` set the rebuild's threads and tantivy writer heap;
   the tail stage uses one thread and 64 MB.
+- Periodic rebuild: `run` rebuilds the index in-process when it is `rebuild_days` old or when
+  readers' upper expansion window (tip − `rebuilt_through_height` in `search/manifest.json`)
+  reaches `rebuild_window_heights`, whichever comes first (defaults 7 days, 30,000 heights;
+  checked every 10 minutes, at most one attempt an hour). It keeps the live index's mode
+  (or an explicit `mode = "full"` / `fallback` with `fallback_min_len`) and the configured
+  threads and heap, so plan for the rebuild's memory beside the service. The tail stage keeps
+  serving the live index meanwhile; the swap and every stage commit take
+  `search.swap.lock`, so they never interleave. `periodic_rebuild = false` turns it off
+  (then run `search rebuild` by hand when hits get slow).
 - Deleting `search/` and restarting the service rebuilds it in the background; nothing else
   depends on it.
 

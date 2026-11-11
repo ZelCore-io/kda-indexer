@@ -72,6 +72,9 @@ concurrency = 4            # concurrent searches (all search routes); more answe
 per_client = 1             # concurrent searches per client; more answer 429
 build_threads = 2          # search rebuild threads
 heap_mb = 512              # search rebuild writer heap
+periodic_rebuild = true    # in-process rebuild that keeps the expansion window short; false = off
+rebuild_days = 7           # rebuild when the index is this old (0 = never by age)
+rebuild_window_heights = 30000   # or when tip - rebuilt_through_height reaches this (0 = never)
 
 [balances]
 enabled = true             # seed and /local reconciler inside run (B-5)

@@ -10,6 +10,11 @@
 //! - A reorg is noticed by the hash of the last blocks read (a ring per chain): the chain is
 //!   re-read from the first block that changed. Docs are never deleted; a body of a reorged
 //!   block is harmless (expansion finds no tx).
+//! - Periodic rebuild (`rebuild_every_secs`, `rebuild_window_heights`; R-P5P9-9 #5): a full
+//!   rebuild into `search.new/` on its own thread while the stage keeps tailing the live
+//!   index, in the live index's mode (or the configured explicit one), with the configured
+//!   writer heap. Its swap takes the swap lock, so it never lands inside a stage commit, and
+//!   the stage's next commit or `built_at` check reopens on the new index.
 //! - Docs are buffered; every `commit_secs` (or at `COMMIT_BYTES` of buffered code) they are
 //!   written and committed, merges run, then `built_through_height` goes into the manifest,
 //!   all under the swap lock and only while `search/` still holds this stage's index (same
@@ -43,6 +48,10 @@ pub struct SearchStageOpts {
     pub commit_secs: u64,
     pub build_threads: usize,
     pub heap_mb: usize,
+    /// Periodic rebuild: seconds since the index was built (0 = off).
+    pub rebuild_every_secs: u64,
+    /// Periodic rebuild: upper expansion window in heights (0 = off).
+    pub rebuild_window_heights: u32,
 }
 
 /// Blocks per chain per step (one hot read txn each).
@@ -61,6 +70,85 @@ const RETRY_MAX: Duration = Duration::from_secs(3600);
 const STAGE_HEAP_MB: usize = 64;
 /// Buffered code bytes that force a commit before `commit_secs`.
 const COMMIT_BYTES: usize = 32 << 20;
+/// How often the stage checks whether a periodic rebuild is due (and the least time between
+/// two attempts).
+const REBUILD_CHECK: Duration = Duration::from_secs(600);
+const REBUILD_RETRY: Duration = Duration::from_secs(3600);
+
+/// A periodic rebuild running on its own thread.
+struct Periodic {
+    flag: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Result<kdx_search::RebuildReport>>,
+}
+
+impl Periodic {
+    fn finish(self) {
+        match self.handle.join() {
+            Ok(Ok(rep)) => match serde_json::to_string(&rep) {
+                Ok(r) => tracing::info!(report = %r, "search: periodic rebuild done"),
+                Err(_) => tracing::info!("search: periodic rebuild done"),
+            },
+            Ok(Err(e)) => tracing::warn!(
+                error = format!("{e:#}"),
+                "search: periodic rebuild failed (retried later)"
+            ),
+            Err(_) => tracing::error!("search: periodic rebuild panicked"),
+        }
+    }
+}
+
+/// The rebuild's mode: an explicit `full` or `fallback` with a threshold from the config, else
+/// the live index's (no projection run).
+fn periodic_mode(cfg: ModeSel, live: Mode) -> ModeSel {
+    match (cfg, live) {
+        (ModeSel::Full, _) => ModeSel::Full,
+        (ModeSel::Fallback(l), _) if l > 0 => ModeSel::Fallback(l),
+        (_, Mode::Full) => ModeSel::Full,
+        (_, Mode::Fallback { min_len }) => ModeSel::Fallback(min_len.max(1)),
+    }
+}
+
+/// Start a periodic rebuild when one is due and none ran in the last `REBUILD_RETRY`.
+fn maybe_start_periodic(
+    ctx: &Arc<Ctx>,
+    o: &SearchStageOpts,
+    m: &SearchManifest,
+    last_try: &mut Option<Instant>,
+) -> Result<Option<Periodic>> {
+    if o.rebuild_every_secs == 0 && o.rebuild_window_heights == 0 {
+        return Ok(None);
+    }
+    if last_try.is_some_and(|t| t.elapsed() < REBUILD_RETRY) {
+        return Ok(None);
+    }
+    let tip = kdx_search::census::hot_tip(&ctx.hot)?;
+    let now = kdx_search::manifest::now_secs();
+    if !kdx_search::build::rebuild_due(m, now, tip, o.rebuild_every_secs, o.rebuild_window_heights)
+    {
+        return Ok(None);
+    }
+    *last_try = Some(Instant::now());
+    let flag = Arc::new(AtomicBool::new(false));
+    let bo = BuildOpts {
+        data_dir: o.data_dir.clone(),
+        mode: periodic_mode(o.mode, m.mode()),
+        threads: o.build_threads,
+        heap_mb: o.heap_mb,
+        trial_docs: 1_000_000,
+        stop: flag.clone(),
+    };
+    tracing::info!(
+        built_at = m.built_at,
+        rebuilt_through = m.rebuilt_through_height,
+        tip,
+        "search: periodic rebuild starting"
+    );
+    let c = ctx.clone();
+    let handle = std::thread::Builder::new()
+        .name("kdx-search-rebuild".into())
+        .spawn(move || kdx_search::rebuild(&bo, &c.hot))?;
+    Ok(Some(Periodic { flag, handle }))
+}
 
 /// Runs until `stop`; failures are logged and retried (search never stops ingest).
 pub async fn run(ctx: Arc<Ctx>, o: SearchStageOpts, stop: CancellationToken) -> Result<()> {
@@ -93,7 +181,7 @@ pub async fn run(ctx: Arc<Ctx>, o: SearchStageOpts, stop: CancellationToken) -> 
     }
 }
 
-fn run_blocking(ctx: &Ctx, o: &SearchStageOpts, stop: &CancellationToken) -> Result<()> {
+fn run_blocking(ctx: &Arc<Ctx>, o: &SearchStageOpts, stop: &CancellationToken) -> Result<()> {
     let dir = search_dir(&o.data_dir);
     if SearchManifest::load(&dir)?.is_none() {
         let flag = Arc::new(AtomicBool::new(false));
@@ -124,6 +212,24 @@ fn run_blocking(ctx: &Ctx, o: &SearchStageOpts, stop: &CancellationToken) -> Res
         let rep = r?;
         tracing::info!(report = %serde_json::to_string(&rep)?, "search: rebuild done");
     }
+    let mut periodic: Option<Periodic> = None;
+    let mut last_try: Option<Instant> = None;
+    let r = tail_loop(ctx, o, stop, &mut periodic, &mut last_try);
+    if let Some(p) = periodic.take() {
+        p.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        p.finish();
+    }
+    r
+}
+
+fn tail_loop(
+    ctx: &Arc<Ctx>,
+    o: &SearchStageOpts,
+    stop: &CancellationToken,
+    periodic: &mut Option<Periodic>,
+    last_try: &mut Option<Instant>,
+) -> Result<()> {
+    let mut checked = Instant::now();
     loop {
         let mut st = StageState::open(ctx, o)?;
         tracing::info!(
@@ -136,6 +242,15 @@ fn run_blocking(ctx: &Ctx, o: &SearchStageOpts, stop: &CancellationToken) -> Res
             if stop.is_cancelled() {
                 st.commit()?;
                 return Ok(());
+            }
+            if periodic.as_ref().is_some_and(|p| p.handle.is_finished()) {
+                if let Some(p) = periodic.take() {
+                    p.finish();
+                }
+            }
+            if periodic.is_none() && checked.elapsed() >= REBUILD_CHECK {
+                checked = Instant::now();
+                *periodic = maybe_start_periodic(ctx, o, &st.m, last_try)?;
             }
             if st.swapped()? {
                 tracing::info!("search stage: index rebuilt elsewhere, reopening");

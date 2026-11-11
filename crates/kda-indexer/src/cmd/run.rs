@@ -274,6 +274,16 @@ fn search_opts(
         commit_secs: s.commit_secs,
         build_threads: s.build_threads as usize,
         heap_mb: s.heap_mb as usize,
+        rebuild_every_secs: if s.periodic_rebuild {
+            u64::from(s.rebuild_days) * 86_400
+        } else {
+            0
+        },
+        rebuild_window_heights: if s.periodic_rebuild {
+            s.rebuild_window_heights
+        } else {
+            0
+        },
     })
 }
 

@@ -468,6 +468,25 @@ pub fn rebuilt_through(c: &Census) -> u32 {
     c.frontier.saturating_sub(1)
 }
 
+/// Whether a periodic rebuild is due (R-P5P9-9 #5): `every_secs` since the index's
+/// `built_at`, or readers' upper expansion window (`tip − rebuilt_through_height`, the
+/// heights every hit walks) at `window_heights` or more. 0 turns either rule off. A manifest
+/// without `rebuilt_through_height` expands from `first_h`: its window counts from 0.
+pub fn rebuild_due(
+    m: &SearchManifest,
+    now: u64,
+    tip: Option<u32>,
+    every_secs: u64,
+    window_heights: u32,
+) -> bool {
+    let age = every_secs > 0 && now.saturating_sub(m.built_at) >= every_secs;
+    let window = window_heights > 0
+        && tip.is_some_and(|t| {
+            t.saturating_sub(m.rebuilt_through_height.unwrap_or(0)) >= window_heights
+        });
+    age || window
+}
+
 /// Census, projection (`auto`, or `fallback` with no threshold), pass 1, hot pass, then
 /// `search.new/` replaces `search/`. `hot` is the caller's environment (`run` shares its own).
 pub fn rebuild(o: &BuildOpts, hot: &HotStore) -> Result<RebuildReport> {
@@ -619,7 +638,8 @@ mod tests {
     use kdx_types::{blake2b_128, Hash32, TxKey};
 
     use super::{
-        build_into, open_segments, rebuilt_through, swap_in, swap_lock, with_current, BuildOpts,
+        build_into, open_segments, rebuild_due, rebuilt_through, swap_in, swap_lock, with_current,
+        BuildOpts,
     };
     use crate::census::distinct_code_keys;
     use crate::manifest::{SearchManifest, FORMAT};
@@ -836,5 +856,40 @@ mod tests {
         }
         assert_eq!(count(&data, "(b."), 15);
         assert_eq!(w.num_docs(), 15);
+    }
+
+    #[test]
+    fn periodic_rebuild_is_due_by_age_or_window() {
+        let m = SearchManifest {
+            format: FORMAT,
+            tantivy: crate::TANTIVY_VERSION.into(),
+            mode: "full".into(),
+            fallback_min_len: 0,
+            built_through_height: 1_200,
+            rebuilt_through_height: Some(1_000),
+            docs: 0,
+            bytes: 0,
+            built_at: 10_000,
+        };
+        let week = 7 * 86_400;
+        assert!(!rebuild_due(
+            &m,
+            10_000 + week - 1,
+            Some(1_500),
+            week,
+            30_000
+        ));
+        assert!(rebuild_due(&m, 10_000 + week, Some(1_500), week, 30_000));
+        assert!(rebuild_due(&m, 10_001, Some(31_000), week, 30_000));
+        assert!(!rebuild_due(&m, 10_001, Some(30_999), week, 30_000));
+        // Off switches.
+        assert!(!rebuild_due(&m, u64::MAX, Some(u32::MAX), 0, 0));
+        assert!(!rebuild_due(&m, 10_000 + week, None, 0, 30_000));
+        // No field: the window counts from 0.
+        let old = SearchManifest {
+            rebuilt_through_height: None,
+            ..m
+        };
+        assert!(rebuild_due(&old, 10_001, Some(30_000), week, 30_000));
     }
 }

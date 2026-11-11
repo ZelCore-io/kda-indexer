@@ -271,8 +271,16 @@ pub struct SearchConfig {
     pub per_client: u32,
     /// `search rebuild` threads (decode and tantivy writer).
     pub build_threads: u32,
-    /// `search rebuild` tantivy writer heap, MiB.
+    /// `search rebuild` tantivy writer heap, MiB (also the periodic rebuild's).
     pub heap_mb: u32,
+    /// Periodic in-process rebuild (keeps readers' upper expansion window short); false turns
+    /// it off.
+    pub periodic_rebuild: bool,
+    /// Rebuild when the index is this many days old (0: never by age).
+    pub rebuild_days: u32,
+    /// Rebuild when the upper expansion window (tip − `rebuilt_through_height`) reaches this
+    /// many heights (0: never by window).
+    pub rebuild_window_heights: u32,
 }
 
 impl SearchConfig {
@@ -296,6 +304,9 @@ impl Default for SearchConfig {
             per_client: 1,
             build_threads: 2,
             heap_mb: 512,
+            periodic_rebuild: true,
+            rebuild_days: 7,
+            rebuild_window_heights: 30_000,
         }
     }
 }
