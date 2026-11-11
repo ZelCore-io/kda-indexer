@@ -382,11 +382,14 @@ fn account_has_key(
     Ok(false)
 }
 
-/// Whether a new row may be written (I-7): always for `coin` and for a key that has a row;
-/// otherwise only below the module's and the account's row caps. A module at its cap is
-/// flagged so the tail stops marking new keys of it.
+/// Whether a new row may be written (I-7). Always for a trusted row (`coin`, or a module
+/// confirmed `fungible-v2` on this chain) and for a key that has a row. An untrusted module
+/// stops at [`Caps::module_rows`] (and is flagged, so the tail stops marking new keys of it),
+/// and an account takes at most [`Caps::account_rows`] untrusted rows: absent rows, rows of
+/// not-fungible modules and trusted rows do not count, so dust from spam modules cannot fill
+/// an account's cap and keep a real token's row out (security review ruling).
 fn admit(txn: &mut RwTxn<'_>, it: &Item, coin: Option<u32>, caps: &Caps) -> Result<bool> {
-    if Some(it.module) == coin || txn.get(Table::Balances, &it.d.key)?.is_some() {
+    if it.trusted || Some(it.module) == coin || txn.get(Table::Balances, &it.d.key)?.is_some() {
         return Ok(true);
     }
     let t = balances::token_row(txn, it.module)?.unwrap_or_default();
@@ -403,10 +406,44 @@ fn admit(txn: &mut RwTxn<'_>, it: &Item, coin: Option<u32>, caps: &Caps) -> Resu
     }
     let p = it.account.to_be_bytes();
     let cap = caps.account_rows as usize;
-    Ok(txn
-        .scan_limit(Table::Balances, &p, cap, |k| k.starts_with(&p))?
-        .len()
-        < cap)
+    let mut counted = 0usize;
+    let mut tokens: HashMap<u32, Option<TokenRow>> = HashMap::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        // The first read starts at the account's prefix, the next ones after the last key.
+        let rows = match &after {
+            None => txn.scan_limit(Table::Balances, &p, 1024, |k| k.starts_with(&p))?,
+            Some(a) => txn.scan_chunk(Table::Balances, Some(a), 1024, |k| k.starts_with(&p))?,
+        };
+        for (k, v) in &rows {
+            let (Some((_, m, c)), Some(r)) = (balances::parse_bal_key(k), BalanceRow::decode(v))
+            else {
+                continue;
+            };
+            if r.absent || Some(m) == coin {
+                continue;
+            }
+            let t = match tokens.get(&m) {
+                Some(t) => *t,
+                None => {
+                    let t = balances::token_row(txn, m)?;
+                    tokens.insert(m, t);
+                    t
+                }
+            };
+            if t.is_some_and(|t| t.kind == KIND_NOT_FUNGIBLE || t.fungible_on(c)) {
+                continue;
+            }
+            counted += 1;
+            if counted >= cap {
+                return Ok(false);
+            }
+        }
+        match rows.last() {
+            Some((k, _)) if rows.len() == 1024 => after = Some(k.clone()),
+            _ => return Ok(true),
+        }
+    }
 }
 
 /// Write one answer: row, guard keys (trusted modules only, I-6), holders, row count.
@@ -1467,13 +1504,18 @@ mod tests {
         assert_eq!(kind(&hot), KIND_FUNGIBLE);
     }
 
-    /// I-7: past a module's row cap new keys are dropped and the module is flagged; past an
-    /// account's row cap a new non-coin row is dropped.
+    /// I-7: past an untrusted module's row cap new keys are dropped and the module is flagged.
+    /// The account cap counts only untrusted rows (security review ruling): an account with
+    /// cap-many spam rows still gets its coin and confirmed fungible-v2 rows.
     #[tokio::test]
     async fn row_caps_drop_new_keys() {
         let dir = tempfile::tempdir().unwrap();
         let (hot, _, ids) = setup(dir.path(), &["alice"]);
-        let mods = intern(&hot, DictKind::Module, &["free.tok", "free.two"]);
+        let mods = intern(
+            &hot,
+            DictKind::Module,
+            &["free.spam", "free.two", "free.tok", "free.three"],
+        );
         let accts = intern(&hot, DictKind::Account, &["a1", "a2"]);
         mark(&hot, accts[0], mods[0], 0, 10);
         mark(&hot, accts[1], mods[0], 0, 10);
@@ -1489,17 +1531,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(t.capped() && t.rows == 1);
-        // alice has her coin row; with a cap of one row per account, a new token row is dropped.
-        mark(&hot, ids[0], mods[1], 0, 10);
+        // Account cap 1: alice's coin row does not count; one spam row fills the cap.
         let caps = Caps {
             account_rows: 1,
             ..Caps::default()
         };
+        mark(&hot, ids[0], mods[1], 0, 10);
         let keys = refill(&hot, 64, 32).unwrap();
         let st = reconcile_batch(&ctx, &local, &keys, &caps).await.unwrap();
-        assert_eq!((st.ok, st.dropped), (0, 1));
+        assert_eq!((st.ok, st.dropped), (1, 0));
+        // At the cap: a confirmed fungible-v2 token is still admitted, more spam is not.
+        mark(&hot, ids[0], mods[2], 0, 10);
+        mark(&hot, ids[0], mods[3], 0, 10);
+        let keys = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &caps).await.unwrap();
+        assert_eq!((st.ok, st.dropped), (1, 1));
         let txn = hot.ro().unwrap();
-        assert_eq!(txn.count(Table::Balances).unwrap(), 2);
+        assert!(txn
+            .get(Table::Balances, &balances::bal_key(ids[0], mods[2], 0))
+            .unwrap()
+            .is_some());
+        assert!(txn
+            .get(Table::Balances, &balances::bal_key(ids[0], mods[3], 0))
+            .unwrap()
+            .is_none());
+        assert_eq!(txn.count(Table::Balances).unwrap(), 4);
         assert_eq!(balances::dirty_count(&txn).unwrap(), 0);
     }
 
