@@ -32,7 +32,7 @@ pub const MAX_PATTERN_CHARS: usize = 256;
 /// Most unescaped `%` wildcards in one pattern (bounds the matcher's backtracking).
 pub const MAX_PATTERN_WILDCARDS: usize = 8;
 
-/// Count a refusal or a cut answer (`too_short|busy|client_busy|timeout|cap`).
+/// Count a refusal or a cut answer (`too_short|busy|client_busy|timeout|cap|lag`).
 pub fn rejected(reason: &'static str) {
     kdx_metrics::get().search_rejected(reason);
 }
@@ -222,12 +222,29 @@ pub fn check_pattern(name: &str, v: &str) -> Result<(), String> {
 /// `built_through_height`).
 const RECHECK: Duration = Duration::from_secs(5);
 
+/// Heights the index's `built_through_height` may trail the data tip before the routes stop
+/// trusting it alone (the stage commits every `commit_secs`; blocks come every ~30 s per
+/// chain). Past it, compat `/txs/search` runs the bounded scan (exact) and native
+/// `/search/code` answers `partial: true` (M-1).
+pub const LAG_MARGIN: u32 = 20;
+
+/// The index trails the data tip by more than [`LAG_MARGIN`]: bodies first seen above
+/// `built_through` may have no doc yet (a failing or backed-off tail stage).
+pub fn lagging(tip: Option<u32>, built_through: Option<u32>) -> bool {
+    match (tip, built_through) {
+        (Some(t), Some(b)) => t.saturating_sub(b) > LAG_MARGIN,
+        _ => false,
+    }
+}
+
 /// The code index the API serves, reopened when a rebuild swapped it in (`built_at`).
 pub struct SearchIndex {
     dir: Option<PathBuf>,
     max_candidates: usize,
     cur: ArcSwapOption<Searcher>,
     checked: Mutex<Option<Instant>>,
+    /// `built_through_height` of the manifest last read (`u64::MAX`: none).
+    built_through: std::sync::atomic::AtomicU64,
 }
 
 impl SearchIndex {
@@ -237,7 +254,18 @@ impl SearchIndex {
             max_candidates: max_candidates.max(1),
             cur: ArcSwapOption::empty(),
             checked: Mutex::new(None),
+            built_through: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// `built_through_height` of the manifest last read (the searcher's own copy is the one
+    /// it was opened with; the tail stage moves it on every commit).
+    pub fn built_through(&self) -> Option<u32> {
+        u32::try_from(
+            self.built_through
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .ok()
     }
 
     /// The current searcher, None when no index is built. Blocking (file reads): call it on
@@ -255,6 +283,10 @@ impl SearchIndex {
         if due {
             match SearchManifest::load(dir) {
                 Ok(Some(m)) => {
+                    self.built_through.store(
+                        u64::from(m.built_through_height),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     let metrics = kdx_metrics::get();
                     metrics.search_docs.set(m.docs as i64);
                     metrics
@@ -303,6 +335,17 @@ pub fn index_covers(m: &SearchManifest, raw: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M-1: an index trailing the tip by more than the margin is not trusted alone.
+    #[test]
+    fn lagging_index() {
+        use super::{lagging, LAG_MARGIN};
+        assert!(!lagging(Some(1_000), Some(1_000 - LAG_MARGIN)));
+        assert!(lagging(Some(1_000), Some(1_000 - LAG_MARGIN - 1)));
+        assert!(!lagging(None, Some(5)));
+        assert!(!lagging(Some(5), None));
+        assert!(!lagging(Some(5), Some(9)));
+    }
 
     #[test]
     fn gate_per_client_then_global() {

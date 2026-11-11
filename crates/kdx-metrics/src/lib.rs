@@ -203,7 +203,7 @@ impl Metrics {
         );
         let search_rejected = reg!(
             "kdx_search_rejected",
-            "Searches refused or cut short (too_short|busy|client_busy|timeout|cap)",
+            "Searches refused or cut short (too_short|busy|client_busy|timeout|cap|lag)",
             Count::default()
         );
         let search_docs = reg!(

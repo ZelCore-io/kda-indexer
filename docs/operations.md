@@ -312,6 +312,10 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search que
   serving the live index meanwhile; the swap and every stage commit take
   `search.swap.lock`, so they never interleave. `periodic_rebuild = false` turns it off
   (then run `search rebuild` by hand when hits get slow).
+- Alert when `kdx_search_built_through_height` trails the tip by more than 20 heights for 15
+  minutes (a failing or backed-off tail stage; its errors are in the log). Meanwhile compat
+  `/txs/search?search=` runs the bounded scan and native `/search/code` answers
+  `partial: true` (`kdx_search_rejected_total{reason="lag"}` counts it).
 - Deleting `search/` and restarting the service rebuilds it in the background; nothing else
   depends on it.
 

@@ -11,7 +11,9 @@
 //! `/search/code` reads the code index only: `q` needs a run of 3 or more characters without
 //! wildcards (`400` otherwise), and a store with no index answers `503`. Items are tx
 //! summaries as `/accounts/{a}/txs` answers them. In fallback mode (spec §3.8, S-1) short
-//! bodies are not indexed: `partial: true` says the pattern could match some of them.
+//! bodies are not indexed: `partial: true` says the pattern could match some of them. It
+//! also says the index trails the data tip (a lagging tail stage): newer bodies may be
+//! missing.
 //!
 //! `/search/events` is the compat bounded event scan (`/txs/events?search=`) in the native
 //! shape: events whose qualified name or parameter text contains `q`.
@@ -122,13 +124,14 @@ pub async fn code(
                 (m, b) => m.or(b.map(|b| b.height())),
             };
             let window = (lp.min_height, max_h);
-            let (hits, rebuilt_through, capped) =
+            let (hits, rebuilt_through, capped, lagging) =
                 match index_path(view, &ctx, &pat, window, until, false) {
                     IndexPath::Hits {
                         hits,
                         rebuilt_through,
                         capped,
-                    } => (hits, rebuilt_through, capped),
+                        lagging,
+                    } => (hits, rebuilt_through, capped, lagging),
                     IndexPath::Timeout => {
                         return Ok(json(&json!({
                             "items": [], "next_cursor": null, "truncated": true,
@@ -139,10 +142,11 @@ pub async fn code(
                         return Err(ApiError::Unavailable("no code index is built".into()))
                     }
                 };
-            let partial = ctx
-                .index
-                .get()
-                .is_some_and(|s| !index_covers(&s.manifest, &pat));
+            let partial = lagging
+                || ctx
+                    .index
+                    .get()
+                    .is_some_and(|s| !index_covers(&s.manifest, &pat));
             if let Some(c) = &lp.cursor {
                 c.check(view)?;
             }

@@ -34,7 +34,7 @@ use super::{
     resume_exhausted, resume_max, shapes, store_floor, text, Candidates, Like, Page, Paging,
     Params, RowSource, ScanLimits,
 };
-use crate::search::{check_pattern, index_covers, rejected, ClientIp, SearchCtx};
+use crate::search::{check_pattern, index_covers, lagging, rejected, ClientIp, SearchCtx};
 use crate::server::ApiState;
 use crate::store::{CodeHit, PostingQuery, View};
 use crate::ApiResult;
@@ -152,6 +152,8 @@ pub enum IndexPath {
         hits: Vec<CodeHit>,
         rebuilt_through: Option<u32>,
         capped: bool,
+        /// The index trails the tip (only when not `complete`; see `search::lagging`).
+        lagging: bool,
     },
     /// The candidate query ran out of time.
     Timeout,
@@ -173,6 +175,16 @@ pub fn index_path(
         return IndexPath::None;
     };
     if complete && !index_covers(&s.manifest, raw) {
+        return IndexPath::None;
+    }
+    let tip = view.max_data_height().ok().flatten();
+    let built_through = ctx
+        .index
+        .built_through()
+        .or(Some(s.manifest.built_through_height));
+    let lagging = lagging(tip, built_through);
+    if complete && lagging {
+        rejected("lag");
         return IndexPath::None;
     }
     let w = kdx_search::Window {
@@ -198,6 +210,7 @@ pub fn index_path(
                     .collect(),
                 rebuilt_through: s.manifest.rebuilt_through_height,
                 capped: c.truncated,
+                lagging,
             }
         }
         Err(kdx_search::SearchError::Timeout) => {
@@ -245,6 +258,7 @@ fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiResul
             hits,
             rebuilt_through,
             capped,
+            ..
         } => {
             let q = PostingQuery {
                 min_height: pg.min_height,
