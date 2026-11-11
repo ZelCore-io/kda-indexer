@@ -212,3 +212,11 @@ json_path_glob = "/~kdatxs-missing-node"
 condition = "any"
 reason = "kda-txs answers a varying subset of an account's /v1/txs rows (seen live: acc28032.../coin/250, 63, 54, 404 and 47 rows on four fetches, every row also on kda-indexer, which lists 125; 40a8967d.../coin/10, kda-txs never lists JxrH9wub... at chain 0 height 3697206, node block Cr4YV2QE). Same check as cwd-missing-node: both full -> cut at the higher lowest height; no kda-txs-only row; every kda-indexer-only row in the same block on the node's /poll with an event naming the account."
 owner_note = "PROPOSED in run 3E-d (P3 Task 8), controller/owner to accept: kda-txs data gap / unstable subset, confirmed per row on the node."
+
+[[entry]]
+id = "known-f3-gas-price"
+route = "*"
+json_path_glob = "/**gasPrice"
+condition = "any"
+reason = "Compat answers gasPrice null when the cmd writes meta.gasPrice as a string (seen live: Gmzfd0_xs4nj..., cmd \"0.00000001\"; chainweb-data 1e-08, node projection \"0.00000001\"; r:n_582fed11...bot/coin/250, every row null on compat, kda-txs 1e-08). Real finding F3 (probably the same root cause as F1, gasLimit null)."
+owner_note = "Known F3 for the fix round (run 3E-d); allowlisted meanwhile like F1/G1 so the window can gate the rest."
