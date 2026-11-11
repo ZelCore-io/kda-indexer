@@ -13,10 +13,11 @@
 //!
 //! A `View` lives for one request at most: it pins MDBX pages while the tail writes.
 
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -86,6 +87,10 @@ pub struct Genesis {
     pub network: String,
     /// Indexed by chain id.
     heights: Vec<Option<u32>>,
+    /// Request keys that occur in more than one genesis block, with every location (F4: the
+    /// request-key index keeps one location per key, but genesis txs repeat their request
+    /// key across chains). Built on first use once every genesis block is stored.
+    shared_rks: OnceLock<HashMap<Hash32, Vec<TxKey>>>,
 }
 
 impl Genesis {
@@ -110,7 +115,11 @@ impl Genesis {
                 }
             }
         }
-        Genesis { network, heights }
+        Genesis {
+            network,
+            heights,
+            shared_rks: OnceLock::new(),
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -398,6 +407,50 @@ impl View {
         }
     }
 
+    /// Every stored location of a request key, in key order. The request-key index holds one
+    /// location per key; only genesis txs share a request key across chains (F4: chainweb-data
+    /// lists each copy on `/txs/txs`), so their other copies come from the genesis blocks.
+    pub fn txs_by_rk(&self, rk: &Hash32) -> ApiResult<Vec<(TxKey, TxRecord)>> {
+        let mut out: Vec<(TxKey, TxRecord)> = self.tx_by_rk(rk)?.into_iter().collect();
+        for k in self.genesis_copies(rk)? {
+            if out.iter().any(|(x, _)| *x == k) {
+                continue;
+            }
+            if let Some(r) = self.tx(k)? {
+                out.push((k, r));
+            }
+        }
+        out.sort_by_key(|(k, _)| *k);
+        Ok(out)
+    }
+
+    /// Genesis-block locations of `rk` when it occurs in more than one genesis block.
+    fn genesis_copies(&self, rk: &Hash32) -> ApiResult<Vec<TxKey>> {
+        if let Some(m) = self.genesis.shared_rks.get() {
+            return Ok(m.get(rk).cloned().unwrap_or_default());
+        }
+        let mut all: HashMap<Hash32, Vec<TxKey>> = HashMap::new();
+        let mut complete = true;
+        for (c, h) in self.genesis.chains() {
+            if self.block_hash(c, h)?.is_none() {
+                complete = false;
+                continue;
+            }
+            for r in self.block_txs(c, h)? {
+                if let Some(x) = r.request_key {
+                    all.entry(x).or_default().push(r.key);
+                }
+            }
+        }
+        all.retain(|_, ks| ks.len() > 1);
+        let found = all.get(rk).cloned().unwrap_or_default();
+        // A store still ingesting its genesis blocks is scanned again on the next lookup.
+        if complete && !self.genesis.is_empty() {
+            let _ = self.genesis.shared_rks.set(all);
+        }
+        Ok(found)
+    }
+
     /// Tx by request key: the hot store first (newest), then the segments.
     pub fn tx_by_rk(&self, rk: &Hash32) -> ApiResult<Option<(TxKey, TxRecord)>> {
         if let Some(v) = self.txn.get(Table::TailRk, &rk.0)? {
@@ -647,5 +700,101 @@ mod data_height_tests {
             .view(Instant::now() + Duration::from_secs(60))
             .unwrap();
         assert_eq!(view.max_data_height().unwrap(), Some(4_000));
+    }
+}
+
+#[cfg(test)]
+mod genesis_rk_tests {
+    use std::time::{Duration, Instant};
+
+    use kdx_decode::{IndexedBlock, TxIndex};
+    use kdx_hot::HotDict;
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{Hash32, TxKey};
+
+    fn block(chain: u8, height: u32, rks: &[u8]) -> IndexedBlock {
+        let txs: Vec<TxRecord> = rks
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| TxRecord {
+                key: TxKey::new(height, chain, i as u16 + 1),
+                request_key: Some(Hash32([x; 32])),
+                ..TxRecord::default()
+            })
+            .collect();
+        let idx = txs
+            .iter()
+            .map(|r| TxIndex {
+                key: r.key,
+                postings: Vec::new(),
+                pact_id: None,
+                code_hash: None,
+            })
+            .collect();
+        IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32([100 + chain; 32]),
+                chain,
+                height: u64::from(height),
+                ..BlockRecord::default()
+            },
+            txs,
+            idx,
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        }
+    }
+
+    /// F4: a genesis request key stored on several chains yields every location; the
+    /// request-key index alone holds one.
+    #[test]
+    fn genesis_request_key_on_several_chains() {
+        let (_d, store) = crate::testutil::store();
+        let hot = store.hot_for_tests();
+        let mut w = hot.rw().unwrap();
+        w.set_meta(kdx_hot::env::meta::NETWORK, b"testnet").unwrap();
+        w.set_meta(kdx_hot::env::meta::CHAIN_GRAPH, b"[[0,[0,1]],[5,[0,1,2]]]")
+            .unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        // Key 1 in every genesis block (chains 0 and 1 at 0, chain 2 at 5); key 2 only on
+        // chain 1; key 3 in a later, non-genesis block.
+        for b in [
+            block(0, 0, &[1]),
+            block(1, 0, &[2, 1]),
+            block(2, 5, &[1]),
+            block(0, 6, &[3]),
+        ] {
+            kdx_hot::tail::apply(&mut w, &b, &mut dict).unwrap();
+        }
+        w.commit().unwrap();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        // The index keeps one location for key 1 (the first block stored).
+        let (k, _) = view.tx_by_rk(&Hash32([1; 32])).unwrap().unwrap();
+        assert_eq!(k, TxKey::new(0, 0, 1));
+        let keys = |x: u8| -> Vec<TxKey> {
+            view.txs_by_rk(&Hash32([x; 32]))
+                .unwrap()
+                .into_iter()
+                .map(|(k, r)| {
+                    assert_eq!(r.key, k);
+                    k
+                })
+                .collect()
+        };
+        assert_eq!(
+            keys(1),
+            vec![
+                TxKey::new(0, 0, 1),
+                TxKey::new(0, 1, 2),
+                TxKey::new(5, 2, 1)
+            ]
+        );
+        assert_eq!(keys(2), vec![TxKey::new(0, 1, 1)]);
+        assert_eq!(keys(3), vec![TxKey::new(6, 0, 1)]);
+        assert!(keys(4).is_empty());
+        // Cached after the first complete scan.
+        assert!(view.genesis.shared_rks.get().is_some());
     }
 }
