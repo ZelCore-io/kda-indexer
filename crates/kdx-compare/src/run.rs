@@ -44,6 +44,8 @@ const ORPHAN_CHECKS: usize = 300;
 const GENESIS_MULTI_PATH: &str = "/~genesis-multi-chain";
 /// JSON path of the visible allowlist hit for kda-txs event lists the node contradicts.
 const KDATXS_EVENTS_NODE_PATH: &str = "/~kdatxs-events-node";
+/// JSON path of the visible allowlist hit for event rows chainweb-data lacks at whole heights.
+const CWD_EVENTS_GAP_PATH: &str = "/~cwd-events-missing-node";
 /// At most this many rows per compare go to the node for the event tie-break.
 const EVENT_NODE_CHECKS: usize = 25;
 /// JSON path of the visible allowlist hit for rows missing from chainweb-data's transfers.
@@ -797,6 +799,51 @@ impl Ctx {
                 }
             }
         }
+        // chainweb-data lacks the events of whole height ranges (seen live: no coin.TRANSFER
+        // at 7392632-7392963 with its tip at 7395650, so its pages skip them). A rows at a
+        // height above B's lowest where B lists no row at all are checked on the node: a user
+        // tx in A's block with the row's event (/poll), a coinbase row in the node's canonical
+        // block. When all agree they leave the diff as the visible hit /~cwd-events-missing-node
+        // and, both pages full, both sides are cut at the higher of their lowest heights (R3E-14).
+        let mut ev_gap: Vec<Value> = Vec::new();
+        if req.route == RouteKind::Events
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && sa == 200
+            && sb == 200
+        {
+            let b_heights: std::collections::HashSet<u64> = match &vb {
+                Value::Array(xb) => xb.iter().filter_map(row_height).collect(),
+                _ => Default::default(),
+            };
+            let b_min = min_height(&vb);
+            let gap: Vec<Value> = match &va {
+                Value::Array(xa) => xa
+                    .iter()
+                    .filter(|r| {
+                        row_height(r)
+                            .is_some_and(|h| b_min.is_none_or(|m| h > m) && !b_heights.contains(&h))
+                    })
+                    .cloned()
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !gap.is_empty()
+                && gap.len() <= NODE_GAP_CHECKS
+                && self.node_confirms_events(req, &gap).await
+            {
+                let a_min0 = min_height(&va);
+                if let Value::Array(xa) = &mut va {
+                    xa.retain(|r| !gap.contains(r));
+                }
+                if full_a0 && full_b0 {
+                    if let Some(cut) = a_min0.max(b_min) {
+                        drop_at_or_below(&mut va, cut);
+                        drop_at_or_below(&mut vb, cut);
+                    }
+                }
+                ev_gap = gap;
+            }
+        }
         // Ruling R3E-14 (owner): where the node agrees with A, an oracle that differs is at
         // fault. Seen live: chainweb-data answers short account pages without a Chainweb-Next
         // (7590fd61... chain 0: 7 rows of 50; 6d87fd6e... heights 1151496-1153496: no rows, A
@@ -949,6 +996,19 @@ impl Ctx {
                 path: path.into(),
                 kind: DiffKind::Extra,
                 a: Some(json!({"rows": node_gap.len(), "window_cut": window_cut, "first": keys})),
+                b: None,
+            });
+        }
+        if !ev_gap.is_empty() {
+            let first: Vec<Value> = ev_gap
+                .iter()
+                .take(10)
+                .map(|r| json!([r.get("chain"), r.get("height"), r.get("requestKey")]))
+                .collect();
+            d.push(DiffEntry {
+                path: CWD_EVENTS_GAP_PATH.into(),
+                kind: DiffKind::Extra,
+                a: Some(json!({"rows": ev_gap.len(), "first": first})),
                 b: None,
             });
         }
@@ -1896,6 +1956,66 @@ impl Ctx {
             }
         }
         out
+    }
+
+    /// Event rows (`/txs/events` shape) confirmed on the node: a user tx is in the row's
+    /// block on `/poll` with an event of the row's name and params; a coinbase row's block is
+    /// the node's canonical block at its (chain, height).
+    async fn node_confirms_events(&self, req: &Request, rows: &[Value]) -> bool {
+        let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+        let mut by_chain: HashMap<u8, Vec<&Value>> = HashMap::new();
+        let mut cache = HashMap::new();
+        let mut checks = 0usize;
+        for r in rows {
+            let (Some(rk), Some(bh), Some(c), Some(h)) = (
+                s(r, "requestKey"),
+                s(r, "blockHash"),
+                row_chain(r),
+                row_height(r),
+            ) else {
+                return false;
+            };
+            if rk == "<coinbase>" {
+                let canon = self.canon_cached(&mut cache, &mut checks, c, h).await;
+                if canon.flatten().as_deref() != Some(bh.as_str()) {
+                    return false;
+                }
+            } else {
+                by_chain.entry(c).or_default().push(r);
+            }
+        }
+        for (c, rs) in by_chain {
+            let mut rks: Vec<String> = rs.iter().filter_map(|r| s(r, "requestKey")).collect();
+            rks.sort();
+            rks.dedup();
+            let mut res = serde_json::Map::new();
+            for chunk in rks.chunks(NODE_POLL_CHUNK) {
+                self.count_request(req.route.as_str(), "node", 1);
+                let Ok(m) = self.node.poll(c, chunk).await else {
+                    return false;
+                };
+                res.extend(m);
+            }
+            for r in rs {
+                let rk = s(r, "requestKey").unwrap_or_default();
+                let Some(v) = res.get(&rk) else {
+                    return false;
+                };
+                if v.pointer("/metaData/blockHash").and_then(Value::as_str)
+                    != s(r, "blockHash").as_deref()
+                {
+                    return false;
+                }
+                let mut want = json!({"name": r.get("name"), "params": r.get("params")});
+                numbers_as_f64(&mut want);
+                let mut evs = oracle::v1txs_events(v);
+                numbers_as_f64(&mut evs);
+                if !evs.as_array().is_some_and(|a| a.contains(&want)) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// A row of a genesis block: height 0, or the first height of a chain added later.
