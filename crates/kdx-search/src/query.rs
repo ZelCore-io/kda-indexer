@@ -215,6 +215,7 @@ mod tests {
             mode: "full".into(),
             fallback_min_len: 0,
             built_through_height: 300,
+            rebuilt_through_height: Some(300),
             docs: 4,
             bytes: 0,
             built_at: 1,

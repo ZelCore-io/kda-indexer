@@ -50,6 +50,11 @@ const CWD_EVENTS_GAP_PATH: &str = "/~cwd-events-missing-node";
 const EVENT_NODE_CHECKS: usize = 25;
 /// JSON path of the visible allowlist hit for rows missing from chainweb-data's transfers.
 const CWD_TRANSFERS_GAP_PATH: &str = "/~cwd-transfers-gap";
+/// Visible hit of `/txs/search?search=` rows chainweb-data matched through a `cont` tx's
+/// initial code (S-3).
+const SEARCH_CONT_HISTORY_PATH: &str = "/~search-cont-history";
+/// Visible hit of `/txs/search?pactid=` rows compared with ties sorted by request key.
+const PACTID_TIE_ORDER_PATH: &str = "/~pactid-tie-order";
 
 /// JSON path of the visible allowlist hit for [`events_as_multiset`].
 const EVENT_ORDER_PATH: &str = "/~event-order";
@@ -1017,6 +1022,71 @@ impl Ctx {
             )
         } else if req.route == RouteKind::Recent {
             recent_diff(&va, &vb)
+        } else if req.route == RouteKind::Search
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && req.path_and_query.contains("pactid=")
+        {
+            // chainweb-data orders pactid rows by (success, height) only; Postgres leaves ties
+            // in any order (seen both ways live). Compare ties by request key on both sides.
+            let key = |r: &Value| {
+                (
+                    r.get("result").and_then(Value::as_str) != Some("TxSucceeded"),
+                    std::cmp::Reverse(r.get("height").and_then(Value::as_u64)),
+                    r.get("requestKey")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )
+            };
+            let mut reordered = false;
+            for v in [&mut va, &mut vb] {
+                if let Value::Array(x) = v {
+                    let before = x.clone();
+                    x.sort_by_key(key);
+                    reordered |= *x != before;
+                }
+            }
+            let mut d = diff_route(&req.route, &va, &vb);
+            if reordered {
+                d.push(DiffEntry {
+                    path: PACTID_TIE_ORDER_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: None,
+                    b: None,
+                });
+            }
+            (d, false)
+        } else if req.route == RouteKind::Search
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && req.path_and_query.contains("search=")
+        {
+            // S-3: chainweb-data also matches `cont` txs through their initial tx's code
+            // (`code` null, `initialCode` set there); kda-indexer matches a tx's own exec code only. Drop those
+            // rows, cut our page to the rows left, and report the visible hit.
+            let mut dropped = 0usize;
+            if let Value::Array(xb) = &mut vb {
+                let before = xb.len();
+                xb.retain(|r| {
+                    !(r.get("code").is_some_and(Value::is_null)
+                        && r.get("initialCode").is_some_and(|c| !c.is_null()))
+                });
+                dropped = before - xb.len();
+                let n = xb.len();
+                if dropped > 0 {
+                    if let Value::Array(xa) = &mut va {
+                        xa.truncate(n);
+                    }
+                }
+            }
+            let mut d = diff_route(&req.route, &va, &vb);
+            if dropped > 0 {
+                d.push(DiffEntry {
+                    path: SEARCH_CONT_HISTORY_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: None,
+                    b: Some(json!(dropped)),
+                });
+            }
+            (d, false)
         } else {
             (diff_route(&req.route, &va, &vb), false)
         };

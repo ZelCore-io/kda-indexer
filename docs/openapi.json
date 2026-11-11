@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "kda-indexer native API",
-    "description": "Internal and unstable until a public hostname is decided. JSON in snake_case. List routes take limit (1..=100, default 20), an opaque cursor, order (desc default, asc), minheight, maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can be shorter than limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away answers 400 'cursor invalidated by reorg'. Balances and tokens come from /local reconciles: every balance row carries as_of_height and stale. Routes reserved for P6 answer 501 {\"error\": \"not implemented until P6\"}: /txs/{requestKey}/defpact, /search/code, /search/events, /nft/accounts/{account}.",
+    "description": "Internal and unstable until a public hostname is decided. JSON in snake_case. List routes take limit (1..=100, default 20), an opaque cursor, order (desc default, asc), minheight, maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can be shorter than limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away answers 400 'cursor invalidated by reorg'. Balances and tokens come from /local reconciles: every balance row carries as_of_height and stale. Search routes run under a shared gate (503 when search.concurrency searches run, 429 when the client already runs search.per_client) and answer truncated: true when their deadline or a cap cut them. A route reserved for later answers 501 {\"error\": \"not implemented until P6\"}: /nft/accounts/{account}.",
     "license": {
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
@@ -727,6 +727,198 @@
         }
       }
     },
+    "/api/v1/search/code": {
+      "get": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Code search: txs whose exec code contains `q`.",
+        "operationId": "code",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "LIKE pattern matched anywhere in the exec code; needs search.min_len characters other than wildcards and a run of 3 without wildcards",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 20).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque token of the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "`desc` (default, newest first) or `asc`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0..19).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of tx summaries, `next_cursor`, `truncated`, `partial`, `as_of`"
+          },
+          "400": {
+            "description": "q missing, too short, too long or without a 3-character run"
+          },
+          "429": {
+            "description": "This client already runs a search"
+          },
+          "503": {
+            "description": "Too many searches in flight, or no code index built"
+          }
+        }
+      }
+    },
+    "/api/v1/search/events": {
+      "get": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Event search: events whose qualified name or parameter text contains `q` (bounded scan).",
+        "operationId": "events",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "LIKE pattern matched anywhere in the qualified event name or the parameter text; needs search.min_len characters other than wildcards",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1..=100 (default 20).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque token of the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "`desc` (default, newest first) or `asc`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0..19).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of events with their tx context, `next_cursor`, `truncated`, `as_of`"
+          },
+          "400": {
+            "description": "q missing, too short or too long"
+          },
+          "429": {
+            "description": "This client already runs a search"
+          },
+          "503": {
+            "description": "Too many searches in flight"
+          }
+        }
+      }
+    },
     "/api/v1/stats": {
       "get": {
         "tags": [
@@ -826,13 +1018,44 @@
         ],
         "responses": {
           "200": {
-            "description": "Tx: command, signers with capabilities, sigs, result, events, transfers, continuation, block info"
+            "description": "Tx: command, signers with capabilities, sigs, result, events, transfers, continuation, block info. A request key stored in several genesis blocks answers every copy as {items, next_cursor: null, as_of}"
           },
           "400": {
             "description": "Not a request key"
           },
           "404": {
             "description": "Unknown request key"
+          }
+        }
+      }
+    },
+    "/api/v1/txs/{request_key}/defpact": {
+      "get": {
+        "tags": [
+          "txs"
+        ],
+        "summary": "Every stored step of the defpact a tx starts or continues, ascending: the starting exec\n(step 0) and each `cont` (its `payload.cont.step` and `rollback`), with its outcome.",
+        "operationId": "defpact",
+        "parameters": [
+          {
+            "name": "request_key",
+            "in": "path",
+            "description": "Request key of the starting exec or of any of its continuations",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{pact_id, items: [{request_key, chain, height, step, rollback, success}] ascending, truncated, as_of}"
+          },
+          "400": {
+            "description": "Not a request key"
+          },
+          "404": {
+            "description": "Unknown request key, or the tx neither starts nor continues a defpact"
           }
         }
       }

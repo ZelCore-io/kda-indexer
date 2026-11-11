@@ -31,6 +31,7 @@ pub mod accounts;
 pub mod balances;
 pub mod blocks;
 pub mod events;
+pub mod search;
 pub mod stats;
 pub mod tokens;
 pub mod txs;
@@ -47,6 +48,8 @@ pub const MAX_ACCOUNT_LEN: usize = 256;
 /// Superset of every list route's query parameters (each route reads what it documents).
 #[derive(Debug, Default, Deserialize)]
 pub struct Q {
+    /// Search pattern (`/search/code`, `/search/events`).
+    pub q: Option<String>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
     pub order: Option<String>,
@@ -188,7 +191,9 @@ async fn nope() -> Response {
     not_implemented()
 }
 
-pub fn router() -> Router<Arc<ApiState>> {
+/// The native router. `search` is shared with the compat router: one gate covers every
+/// search route (S-5).
+pub fn router(search: Arc<crate::search::SearchCtx>) -> Router<Arc<ApiState>> {
     let v1 = Router::new()
         .route("/status", get(crate::status::handler))
         .route("/stats", get(stats::stats))
@@ -202,7 +207,7 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/keys/{pubkey}/txs", get(accounts::key_txs))
         .route("/events", get(events::list))
         // P6.
-        .route("/txs/{request_key}/defpact", get(nope))
+        .route("/txs/{request_key}/defpact", get(txs::defpact))
         .route(
             "/accounts/{account}/balances",
             get(balances::account_balances),
@@ -210,9 +215,10 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/keys/{pubkey}/accounts", get(balances::key_accounts))
         .route("/tokens", get(tokens::list))
         .route("/tokens/{module}", get(tokens::get))
-        .route("/search/code", get(nope))
-        .route("/search/events", get(nope))
-        .route("/nft/accounts/{account}", get(nope));
+        .route("/search/code", get(search::code))
+        .route("/search/events", get(search::events))
+        .route("/nft/accounts/{account}", get(nope))
+        .layer(axum::Extension(search));
     Router::new().nest("/api/v1", v1)
 }
 

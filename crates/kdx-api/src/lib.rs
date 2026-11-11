@@ -9,6 +9,7 @@ pub mod limits;
 pub mod native;
 pub mod openapi;
 pub mod sampler;
+pub mod search;
 pub mod server;
 pub mod status;
 pub mod store;

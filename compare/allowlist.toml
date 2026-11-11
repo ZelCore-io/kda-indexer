@@ -101,12 +101,20 @@ reason = "chainweb-data can start a Chainweb-Next page with the last row of the 
 owner_note = "Accepted (run 3E ruling R3E-5): chainweb-data paging bug."
 
 [[entry]]
-id = "search-route-p6"
+id = "search-cont-history"
 route = "search"
-json_path_glob = "/**"
+json_path_glob = "/~search-cont-history"
+condition = "changed"
+reason = "/txs/search?search= matches a tx's own exec code. chainweb-data also returns cont txs through the code of their initial tx (coalesce(tx.code, contHist.code)); the harness drops those rows (code null, initialCode set), cuts our page to the rows left and reports this visible hit."
+owner_note = "Ruling S-3 (P5/P6 plan): about 10 requests a day on the whole route; an exact expansion needs a cont->code side index (a `contcode` file in search/, no reindex) if ever wanted."
+
+[[entry]]
+id = "pactid-tie-order"
+route = "search"
+json_path_glob = "/~pactid-tie-order"
 condition = "any"
-reason = "/txs/search (pactid and search) is a should route built in P6; until then compat answers 404 and chainweb-data 200."
-owner_note = "Out of scope for P3/P4 (plan header); not a must route, so it never gates. Remove in P6. P5 adds five pact_id seeds and the `search` should slot (50 compared at the gate), both inert until P6 fills the route."
+reason = "/txs/search?pactid= orders by success then height only; chainweb-data leaves ties to Postgres, which answered them in both request-key orders live (2026-11-11). The harness sorts ties by request key on both sides and reports this visible hit."
+owner_note = "Run 6B finding; kda-indexer answers ties request key ascending."
 
 [[entry]]
 id = "cwd-transfers-gap"

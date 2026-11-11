@@ -45,6 +45,10 @@ pub struct Metrics {
     pub chain_lag_blocks: Gau,
     pub chain_halted: Gau,
     pub frozen_frontier_height: Gauge,
+    /// Docs of the code index the API serves (spec §6.7 search metrics).
+    pub search_docs: Gauge,
+    /// `built_through_height` of the code index the API serves.
+    pub search_built_through_height: Gauge,
     pub ingest_blocks: Count,
     pub ingest_txs: Count,
     pub stage_duration: Hist,
@@ -199,8 +203,18 @@ impl Metrics {
         );
         let search_rejected = reg!(
             "kdx_search_rejected",
-            "Event text searches rejected (too_short|busy|timeout|cap)",
+            "Searches refused or cut short (too_short|busy|client_busy|timeout|cap)",
             Count::default()
+        );
+        let search_docs = reg!(
+            "kdx_search_docs",
+            "Docs (distinct code bodies) of the code index the API serves",
+            Gauge::default()
+        );
+        let search_built_through_height = reg!(
+            "kdx_search_built_through_height",
+            "Every exec tx at or below this height has its code body in the index",
+            Gauge::default()
         );
         let merkle_blocks = reg!(
             "kdx_merkle_blocks",
@@ -250,6 +264,8 @@ impl Metrics {
             chain_lag_blocks,
             chain_halted,
             frozen_frontier_height,
+            search_docs,
+            search_built_through_height,
             ingest_blocks,
             ingest_txs,
             stage_duration,

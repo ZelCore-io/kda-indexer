@@ -23,6 +23,12 @@ pub struct SearchManifest {
     /// Bodies of later txs may be in it too (the tail stage adds them; docs are never
     /// deleted). The tail stage moves it forward after each commit.
     pub built_through_height: u32,
+    /// `built_through_height` as the last rebuild wrote it; the tail stage never moves it.
+    /// Docs are never updated, so a body's `last_h` is only exact up to this height: readers
+    /// expand a hit through its `code` postings within `first_h..=last_h` plus every height
+    /// above this one (absent in a manifest from before this field: expand from `first_h`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuilt_through_height: Option<u32>,
     pub docs: u64,
     /// Index bytes on disk (at the last rebuild or tail commit).
     pub bytes: u64,

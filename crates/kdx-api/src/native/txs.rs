@@ -1,4 +1,5 @@
-//! `GET /api/v1/txs/{request_key}` and the tx renderings shared by the list routes.
+//! `GET /api/v1/txs/{request_key}`, `GET /api/v1/txs/{request_key}/defpact` and the tx
+//! renderings shared by the list routes.
 
 use axum::extract::{Path, Query};
 use axum::response::{IntoResponse, Response};
@@ -7,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use utoipa::IntoParams;
 
-use super::{parse_hash, parse_path, parse_query, resource, run, tx_context, St};
+use super::{list_response, parse_hash, parse_path, parse_query, resource, run, tx_context, St};
 use crate::compat::shapes::{self, Ev};
 use crate::store::View;
 use crate::{ApiError, ApiResult};
@@ -296,7 +297,7 @@ pub fn detail(view: &View, r: &TxRecord, b: &BlockRecord, proof: bool) -> ApiRes
     path = "/api/v1/txs/{request_key}",
     params(("request_key" = String, Path, description = "Request key (43-char base64url)"), TxQuery),
     responses(
-        (status = 200, description = "Tx: command, signers with capabilities, sigs, result, events, transfers, continuation, block info"),
+        (status = 200, description = "Tx: command, signers with capabilities, sigs, result, events, transfers, continuation, block info. A request key stored in several genesis blocks answers every copy as {items, next_cursor: null, as_of}"),
         (status = 400, description = "Not a request key"),
         (status = 404, description = "Unknown request key"),
     )
@@ -317,14 +318,106 @@ pub async fn get_tx(
     };
     run(st.0, move |view| {
         let rk = parse_hash(&rk, "request key")?;
-        let (k, r) = view
-            .tx_by_rk(&rk)?
-            .ok_or_else(|| ApiError::NotFound("unknown request key".into()))?;
-        let b = view
-            .block(k.chain(), k.height())?
-            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("tx without its block")))?;
-        let d = detail(view, &r, &b, proof)?;
-        resource(view, d)
+        // Genesis txs can share a request key across chains: list every copy (R-P5P9-5).
+        let all = view.txs_by_rk(&rk)?;
+        let mut items = Vec::with_capacity(all.len());
+        for (k, r) in &all {
+            let b = view
+                .block(k.chain(), k.height())?
+                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("tx without its block")))?;
+            items.push(detail(view, r, &b, proof)?);
+        }
+        match items.len() {
+            0 => Err(ApiError::NotFound("unknown request key".into())),
+            1 => resource(view, items.pop().unwrap_or_default()),
+            _ => list_response(view, items, None),
+        }
     })
     .await
+}
+
+/// Txs of one defpact read at most (R-P5P9-3): the newest ones; `truncated` says so.
+pub const DEFPACT_CAP: usize = 1_000;
+
+/// Every stored step of the defpact a tx starts or continues, ascending: the starting exec
+/// (step 0) and each `cont` (its `payload.cont.step` and `rollback`), with its outcome.
+#[utoipa::path(
+    get,
+    path = "/api/v1/txs/{request_key}/defpact",
+    params(("request_key" = String, Path, description = "Request key of the starting exec or of any of its continuations")),
+    responses(
+        (status = 200, description = "{pact_id, items: [{request_key, chain, height, step, rollback, success}] ascending, truncated, as_of}"),
+        (status = 400, description = "Not a request key"),
+        (status = 404, description = "Unknown request key, or the tx neither starts nor continues a defpact"),
+    )
+)]
+pub async fn defpact(
+    st: St,
+    path: Result<Path<String>, axum::extract::rejection::PathRejection>,
+) -> Response {
+    let rk = match parse_path(path) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    run(st.0, move |view| {
+        let rk = parse_hash(&rk, "request key")?;
+        let (_, r) = view
+            .tx_by_rk(&rk)?
+            .ok_or_else(|| ApiError::NotFound("unknown request key".into()))?;
+        let pact = match shapes::cmd_value(&r).as_ref().and_then(shapes::pact_id) {
+            Some(p) => Some(p),
+            None => output_pact(&shapes::output(view, &r)?).0,
+        }
+        .ok_or_else(|| {
+            ApiError::NotFound("the tx neither starts nor continues a defpact".into())
+        })?;
+        let (keys, truncated) = view.pact_txs(&pact, DEFPACT_CAP)?;
+        let mut items = Vec::with_capacity(keys.len());
+        for (i, (k, cont)) in keys.into_iter().enumerate() {
+            if i % 64 == 63 {
+                view.check_deadline()?;
+            }
+            let Some(r) = view.tx(k)? else { continue };
+            let out = shapes::output(view, &r)?;
+            let (step, rollback) = if cont {
+                let c = shapes::cmd_value(&r);
+                let c = c.as_ref().and_then(|c| c.pointer("/payload/cont"));
+                (
+                    c.and_then(|c| c.get("step"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    c.and_then(|c| c.get("rollback"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+            } else {
+                (output_pact(&out).1.unwrap_or_else(|| 0.into()), false)
+            };
+            let (status, _) = status_and_result(&out);
+            items.push(json!({
+                "request_key": r.request_key.map(|h| h.to_b64url()),
+                "chain": k.chain(),
+                "height": k.height(),
+                "step": step,
+                "rollback": rollback,
+                "success": status == "success",
+            }));
+        }
+        resource(
+            view,
+            json!({"pact_id": pact.to_b64url(), "items": items, "truncated": truncated}),
+        )
+    })
+    .await
+}
+
+/// `continuation.pactId` and `continuation.step` of a tx output.
+fn output_pact(out: &Value) -> (Option<kdx_types::Hash32>, Option<Value>) {
+    let c = out.get("continuation");
+    (
+        c.and_then(|c| c.get("pactId"))
+            .and_then(Value::as_str)
+            .and_then(|s| kdx_types::Hash32::from_b64url(s).ok()),
+        c.and_then(|c| c.get("step")).cloned(),
+    )
 }

@@ -122,7 +122,7 @@ pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted: &[IpNet]) -> Ip
 
 /// Bucket key: an IPv4 address (v4-mapped v6 included), or the /64 of an IPv6 address
 /// (one host usually holds a whole /64, so per-address keys would let it rotate freely).
-fn bucket_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn bucket_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

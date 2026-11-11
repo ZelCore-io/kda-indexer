@@ -62,3 +62,15 @@ A store written before the balance tables existed (served read-only) answers the
 ## Consistency
 
 Every request reads one snapshot of the hot store and the segment set, so a tx is never listed twice nor torn across a freeze or a merge (see `docs/format.md`, "Readers"). A tx may briefly be missing while a block is being applied.
+
+## Search, `/coins` and defpact (P6)
+
+Every search route runs under one gate: at most `search.concurrency` (4) searches at once (`503` beyond) and `search.per_client` (1) per client, keyed like the rate limiter (`429` beyond). Patterns are SQL `LIKE` patterns matched anywhere in the text (`%`, `_`, `\` escapes), at most 256 characters and 8 `%`. Refusals and cut answers count in `kdx_search_rejected_total{reason}` (`too_short`, `busy`, `client_busy`, `timeout`, `cap`); `kdx_search_docs` and `kdx_search_built_through_height` describe the code index served.
+
+- Compat `GET /txs/search?search=…` (chainweb-data `searchTxs`): `[TxSummary]` of txs whose own exec code contains the pattern, height desc then request key desc, `limit` 10 (max 250), `offset` up to 10,000 or `next`, `Chainweb-Next`. A pattern with a literal run of 3 characters uses the code index (when it holds every body the pattern can match); otherwise a bounded newest-first scan (`search.max_scan_heights`, `search.timeout_ms`). A cut answer carries `X-Search-Truncated: true` and, when there is more, `Chainweb-Next`. chainweb-data also matches `cont` txs through their initial code; kda-indexer does not.
+- Compat `GET /txs/search?pactid=…`: the `cont` txs of the defpact, successful first, then height desc (ties request key ascending), at most 50, from the newest 1,000 txs of the pact. Neither parameter answers `404 You must specify a search string`, both `400`.
+- Compat `GET /coins`: circulating KDA at the highest stored height, as chainweb-data prints it (`text/plain`); `404 Server database is empty` outside mainnet01.
+- Native `GET /api/v1/search/code?q=…`: txs whose exec code contains `q` (needs `search.min_len` non-wildcard characters and a 3-character run), from the code index only (`503` when none is built); `{items, next_cursor, truncated, partial, as_of}`. `partial: true` means fallback mode may hold bodies too short for this pattern.
+- Native `GET /api/v1/search/events?q=…`: events whose qualified name or parameter text contains `q`, the compat bounded scan in the native shape; `{items, next_cursor, truncated, as_of}`.
+- Native `GET /api/v1/txs/{request_key}/defpact`: `{pact_id, items: [{request_key, chain, height, step, rollback, success}], truncated, as_of}`, ascending, for the pact the tx starts or continues (at most 1,000 txs, the newest).
+- Native `GET /api/v1/txs/{request_key}`: a request key stored in several genesis blocks answers every copy as `{items, next_cursor: null, as_of}`.

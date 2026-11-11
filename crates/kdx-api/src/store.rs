@@ -585,24 +585,98 @@ impl View {
         })
     }
 
-    /// Every stored tx of the defpact `pact`, ascending by TxKey (hot and frozen): the exec
-    /// that started it and each `cont` step. Candidates come from the `pact` postings (an
-    /// 8-byte entity); each record is checked to hold this exact pactId, as the cmd's
-    /// `payload.cont.pactId` or the output's `continuation.pactId`.
-    pub fn pact_txs(&self, pact: &Hash32) -> ApiResult<Vec<TxKey>> {
+    /// Stored txs of the defpact `pact`, ascending by TxKey (hot and frozen): the exec that
+    /// started it (`cont` false) and each `cont` step (`cont` true). Candidates come from the
+    /// `pact` postings (an 8-byte entity); each record is checked to hold this exact pactId,
+    /// as the cmd's `payload.cont.pactId` or the output's `continuation.pactId`. At most `max`
+    /// txs, the newest ones; the flag is true when the walk stopped there (R-P5P9-3).
+    pub fn pact_txs(&self, pact: &Hash32, max: usize) -> ApiResult<(Vec<(TxKey, bool)>, bool)> {
         let mut out = Vec::new();
+        let mut capped = false;
         for k in self.postings(Family::Pact, pact_entity(pact), PostingQuery::default())? {
             let k = k?;
             if let Some(r) = self.tx(k)? {
-                if cmd_pact_id(&r) == Some(*pact)
-                    || record_pact_id(&r, &self.dict())? == Some(*pact)
-                {
-                    out.push(k);
+                let cont = cmd_pact_id(&r) == Some(*pact);
+                if cont || record_pact_id(&r, &self.dict())? == Some(*pact) {
+                    if out.len() == max {
+                        capped = true;
+                        break;
+                    }
+                    out.push((k, cont));
                 }
             }
         }
         out.reverse();
-        Ok(out)
+        Ok((out, capped))
+    }
+
+    /// TxKeys of the exec txs whose code is one of `hits` (code search, plan Task 10), newest
+    /// first, deduplicated, with the query's filters. Per hit, only the `code` postings in
+    /// `first_h..=last_h`, plus every height above `rebuilt_through` (the last rebuild's
+    /// `built_through_height`: docs are never updated, so `last_h` is exact only up to there;
+    /// `None` expands from `first_h`), plus the hot part. Each record's blake2b-128 of its
+    /// exec code must equal a hit's full hash (the posting entity is an 8-byte prefix). The
+    /// deadline is checked every 64 items.
+    pub fn code_txs(
+        &self,
+        hits: &[CodeHit],
+        rebuilt_through: Option<u32>,
+        q: PostingQuery,
+    ) -> ApiResult<Box<dyn Iterator<Item = ApiResult<TxKey>> + '_>> {
+        // Hits sharing an entity walk its postings once.
+        let mut by_entity: std::collections::BTreeMap<u64, (u32, u32, Vec<[u8; 16]>)> =
+            std::collections::BTreeMap::new();
+        for h in hits {
+            let e = by_entity
+                .entry(kdx_decode::index::code_entity(&h.hash))
+                .or_insert((h.first_h, h.last_h, Vec::new()));
+            e.0 = e.0.min(h.first_h);
+            e.1 = e.1.max(h.last_h);
+            e.2.push(h.hash);
+        }
+        let upper_from = rebuilt_through
+            .map_or(0, |b| b.saturating_add(1))
+            .min(self.hot_floor());
+        let q_min = q.min_height.unwrap_or(0);
+        let q_max = q.max_height.unwrap_or(u32::MAX);
+        let mut its: Vec<Box<dyn Iterator<Item = ApiResult<TxKey>> + '_>> = Vec::new();
+        for (entity, (first_h, last_h, hashes)) in by_entity {
+            let mut windows = Vec::with_capacity(2);
+            if first_h >= upper_from {
+                windows.push((first_h.max(q_min), q_max));
+            } else {
+                windows.push((upper_from.max(q_min), q_max));
+                windows.push((first_h.max(q_min), last_h.min(upper_from - 1).min(q_max)));
+            }
+            let mut walks: Vec<Box<dyn Iterator<Item = ApiResult<TxKey>> + '_>> = Vec::new();
+            for (lo, hi) in windows {
+                if lo > hi {
+                    continue;
+                }
+                let wq = PostingQuery {
+                    min_height: Some(lo),
+                    max_height: Some(hi),
+                    ..q
+                };
+                walks.push(self.postings(Family::Code, entity, wq)?);
+            }
+            // Windows are disjoint and the first is the higher one: chained, still newest first.
+            let walk = walks.into_iter().flatten();
+            its.push(Box::new(walk.filter_map(move |r| {
+                match r {
+                    Err(e) => Some(Err(e)),
+                    Ok(k) => match self.tx(k) {
+                        Err(e) => Some(Err(e)),
+                        Ok(None) => None,
+                        Ok(Some(rec)) => kdx_search::exec_code(&rec)
+                            .map(|c| kdx_types::blake2b_128(c.as_bytes()))
+                            .filter(|h| hashes.contains(h))
+                            .map(|_| Ok(k)),
+                    },
+                }
+            })));
+        }
+        Ok(Box::new(MergeDesc::new(its, self.deadline)))
     }
 
     /// TxKeys of `(f, entity)`, newest first: the hot part, then the frozen part, with the
@@ -698,6 +772,96 @@ impl View {
             }
             Some(r)
         })))
+    }
+}
+
+/// A verified code-search body: its CodeHash and the heights its txs are known to lie in
+/// (`first_h`/`last_h` of the search doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeHit {
+    pub hash: [u8; 16],
+    pub first_h: u32,
+    pub last_h: u32,
+}
+
+/// Newest-first merge of newest-first TxKey streams, duplicates dropped (a binary heap, so
+/// thousands of streams stay cheap). The first error ends it; the deadline is checked every
+/// 64 items.
+pub struct MergeDesc<'v> {
+    its: Vec<Box<dyn Iterator<Item = ApiResult<TxKey>> + 'v>>,
+    heap: std::collections::BinaryHeap<(TxKey, usize)>,
+    started: bool,
+    last: Option<TxKey>,
+    deadline: Instant,
+    n: u32,
+    done: bool,
+}
+
+impl<'v> MergeDesc<'v> {
+    pub fn new(
+        its: Vec<Box<dyn Iterator<Item = ApiResult<TxKey>> + 'v>>,
+        deadline: Instant,
+    ) -> Self {
+        MergeDesc {
+            heap: std::collections::BinaryHeap::with_capacity(its.len()),
+            its,
+            started: false,
+            last: None,
+            deadline,
+            n: 0,
+            done: false,
+        }
+    }
+
+    /// Pull the next key of stream `i` into the heap.
+    fn refill(&mut self, i: usize) -> ApiResult<()> {
+        match self.its[i].next() {
+            Some(Ok(k)) => {
+                self.heap.push((k, i));
+                Ok(())
+            }
+            Some(Err(e)) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Iterator for MergeDesc<'_> {
+    type Item = ApiResult<TxKey>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if !self.started {
+            self.started = true;
+            for i in 0..self.its.len() {
+                if i % 64 == 63 && Instant::now() >= self.deadline {
+                    self.done = true;
+                    return Some(Err(ApiError::Deadline));
+                }
+                if let Err(e) = self.refill(i) {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        loop {
+            self.n += 1;
+            if self.n.is_multiple_of(CHECK_EVERY) && Instant::now() >= self.deadline {
+                self.done = true;
+                return Some(Err(ApiError::Deadline));
+            }
+            let (k, i) = self.heap.pop()?;
+            if let Err(e) = self.refill(i) {
+                self.done = true;
+                return Some(Err(e));
+            }
+            if self.last == Some(k) {
+                continue;
+            }
+            self.last = Some(k);
+            return Some(Ok(k));
+        }
     }
 }
 

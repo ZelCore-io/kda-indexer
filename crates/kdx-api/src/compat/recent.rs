@@ -19,7 +19,7 @@ const RECENT: usize = 10;
 const MAX_HEIGHTS: u32 = 20_000;
 
 /// `TxSummary` fields of a `TxDetail`.
-fn summary(d: &Value) -> Value {
+pub fn summary(d: &Value) -> Value {
     let mut m = Map::new();
     for k in [
         "blockHash",

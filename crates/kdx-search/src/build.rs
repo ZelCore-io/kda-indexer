@@ -466,6 +466,7 @@ pub fn rebuild(o: &BuildOpts, hot: &HotStore) -> Result<RebuildReport> {
         mode: mode.name().into(),
         fallback_min_len: mode.min_len(),
         built_through_height: built_through,
+        rebuilt_through_height: Some(built_through),
         docs,
         bytes: dir_bytes(&new)?,
         built_at: now_secs(),

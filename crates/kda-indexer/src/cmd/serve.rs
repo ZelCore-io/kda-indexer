@@ -65,15 +65,26 @@ pub fn spawn_textfile(cfg: &Config, stop: CancellationToken) {
     }
 }
 
-/// Build the API over a store (shared by `serve` and `run`).
-pub fn api(cfg: &Config, store: Arc<Store>, tips: TipWatch) -> anyhow::Result<Api> {
-    let search = kdx_api::compat::SearchSettings {
+/// Build the API over a store (shared by `serve` and `run`). The search routes read the code
+/// index in `data_dir/search/` and share one search gate (S-5).
+pub fn api(
+    cfg: &Config,
+    store: Arc<Store>,
+    tips: TipWatch,
+    data_dir: &Path,
+) -> anyhow::Result<Api> {
+    let settings = kdx_api::compat::SearchSettings {
         min_len: cfg.search.min_len as usize,
         max_scan_heights: cfg.search.max_scan_heights,
         timeout_ms: cfg.search.timeout_ms,
+        concurrency: cfg.search.concurrency as usize,
+        per_client: cfg.search.per_client as usize,
+        max_candidates: cfg.search.max_candidates as usize,
+        max_results: cfg.search.max_results as usize,
     };
+    let search = kdx_api::search::SearchCtx::new(settings, Some(kdx_search::search_dir(data_dir)));
     Ok(Api::new(store, cfg.api.settings(&cfg.network)?, tips)
-        .native_routes(kdx_api::native::router())
+        .native_routes(kdx_api::native::router(search.clone()))
         .compat_routes(kdx_api::compat::router(search)))
 }
 
@@ -92,7 +103,7 @@ pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {
     super::notify::spawn_api_heartbeat(token.clone());
     super::notify::spawn_status(token.clone(), || "serving (read-only)".into());
     tracing::info!(data_dir = %data_dir.display(), "serve: read-only API");
-    api(cfg, store, tips)?
+    api(cfg, store, tips, &data_dir)?
         .on_bound(|| super::notify::ready("serving (read-only)"))
         .serve(cfg.api.binds()?, token)
         .await
