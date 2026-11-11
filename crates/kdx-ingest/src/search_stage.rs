@@ -10,8 +10,11 @@
 //! - A reorg is noticed by the hash of the last blocks read (a ring per chain): the chain is
 //!   re-read from the first block that changed. Docs are never deleted; a body of a reorged
 //!   block is harmless (expansion finds no tx).
-//! - Commit every `commit_secs` (docs, then `built_through_height` in the manifest, under the
-//!   rebuild lock). A rebuild that swapped `search/` (new `built_at`) makes the stage reopen.
+//! - Docs are buffered; every `commit_secs` (or at `COMMIT_BYTES` of buffered code) they are
+//!   written and committed, merges run, then `built_through_height` goes into the manifest,
+//!   all under the swap lock and only while `search/` still holds this stage's index (same
+//!   `built_at`). A rebuild that swapped `search/` makes the stage drop its buffer and reopen:
+//!   tantivy writes by path, so a commit after the swap would land in the new index.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -56,6 +59,8 @@ const RETRY: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(3600);
 /// The stage's writer heap (one thread).
 const STAGE_HEAP_MB: usize = 64;
+/// Buffered code bytes that force a commit before `commit_secs`.
+const COMMIT_BYTES: usize = 32 << 20;
 
 /// Runs until `stop`; failures are logged and retried (search never stops ingest).
 pub async fn run(ctx: Arc<Ctx>, o: SearchStageOpts, stop: CancellationToken) -> Result<()> {
@@ -137,7 +142,10 @@ fn run_blocking(ctx: &Ctx, o: &SearchStageOpts, stop: &CancellationToken) -> Res
                 break;
             }
             let n = st.step(ctx)?;
-            st.maybe_commit()?;
+            if !st.maybe_commit()? {
+                tracing::info!("search stage: index rebuilt meanwhile, reopening");
+                break;
+            }
             if n == 0 {
                 std::thread::sleep(POLL);
             }
@@ -329,39 +337,41 @@ impl StageState {
         Ok(n)
     }
 
-    fn maybe_commit(&mut self) -> Result<()> {
-        if self.last_commit.elapsed() >= self.commit_every {
-            self.commit()?;
+    /// False when a rebuild swapped `search/` (see `commit`).
+    fn maybe_commit(&mut self) -> Result<bool> {
+        if self.last_commit.elapsed() >= self.commit_every || self.w.pending_bytes() >= COMMIT_BYTES
+        {
+            return self.commit();
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Docs first, then (under the rebuild lock, unless a rebuild holds it) the manifest's
-    /// `built_through_height`: the lowest height every chain has been read through.
-    fn commit(&mut self) -> Result<()> {
+    /// Under the swap lock and only while `search/` holds this stage's index: the buffered
+    /// docs, then the manifest's `built_through_height` (the lowest height every chain has
+    /// been read through). False, with nothing written, when a rebuild swapped `search/`.
+    fn commit(&mut self) -> Result<bool> {
         self.last_commit = Instant::now();
-        if self.dirty {
-            self.w.commit()?;
-            self.dirty = false;
-        }
         let through = self
             .chains
             .iter()
             .map(|c| c.next.saturating_sub(1))
             .min()
             .unwrap_or(0);
-        if through <= self.m.built_through_height && self.m.docs == self.w.num_docs() {
-            return Ok(());
+        if !self.dirty && through <= self.m.built_through_height && self.m.docs == self.w.num_docs()
+        {
+            return Ok(true);
         }
-        let Ok(_lock) = kdx_search::build::lock(&self.data_dir) else {
-            return Ok(());
-        };
-        if self.swapped()? {
-            return Ok(());
-        }
-        self.m.built_through_height = self.m.built_through_height.max(through);
-        self.m.docs = self.w.num_docs();
-        self.m.bytes = dir_bytes(&self.dir)?;
-        self.m.commit(&self.dir)
+        let (data_dir, built_at) = (self.data_dir.clone(), self.m.built_at);
+        let done = kdx_search::build::with_current(&data_dir, built_at, || {
+            if self.dirty {
+                self.w.commit()?;
+                self.dirty = false;
+            }
+            self.m.built_through_height = self.m.built_through_height.max(through);
+            self.m.docs = self.w.num_docs();
+            self.m.bytes = dir_bytes(&self.dir)?;
+            self.m.commit(&self.dir)
+        })?;
+        Ok(done.is_some())
     }
 }

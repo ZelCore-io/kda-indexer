@@ -337,8 +337,8 @@ pub fn estimate(data_dir: &Path, seg: &Segments, c: &Census, o: &BuildOpts) -> R
     })
 }
 
-/// Lock against a second rebuild of the same data dir (`run`'s and the CLI's). The tail
-/// stage takes it around its `manifest.json` writes so it never writes into a swapped-in dir.
+/// Lock against a second rebuild of the same data dir (`run`'s and the CLI's), held for the
+/// whole rebuild.
 pub fn lock(data_dir: &Path) -> Result<File> {
     let p = data_dir.join("search.lock");
     let f = OpenOptions::new()
@@ -353,6 +353,38 @@ pub fn lock(data_dir: &Path) -> Result<File> {
             bail!("another search rebuild of this data dir is running")
         }
         Err(TryLockError::Error(e)) => Err(e).with_context(|| format!("lock {}", p.display())),
+    }
+}
+
+/// The swap lock (`search.swap.lock`, blocking): held by [`swap_in`] around its renames, by
+/// the tail stage around every write into `search/` ([`with_current`]) and by `snapshot`
+/// while it reads and links the live files. Every holder is short (one stage commit, two
+/// renames, one set of links).
+pub fn swap_lock(data_dir: &Path) -> Result<File> {
+    let p = data_dir.join("search.swap.lock");
+    let f = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&p)
+        .with_context(|| format!("open {}", p.display()))?;
+    f.lock().with_context(|| format!("lock {}", p.display()))?;
+    Ok(f)
+}
+
+/// `f` under the swap lock, only while `search/` holds the index built at `built_at`; None
+/// (and `f` not run) once a rebuild swapped in another one. A tantivy writer opened before a
+/// swap still writes by path, so without this check its files, `meta.json` and
+/// `.managed.json` would land in the new index.
+pub fn with_current<T>(
+    data_dir: &Path,
+    built_at: u64,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    let _g = swap_lock(data_dir)?;
+    match SearchManifest::load(&search_dir(data_dir))? {
+        Some(m) if m.built_at == built_at => f().map(Some),
+        _ => Ok(None),
     }
 }
 
@@ -544,8 +576,10 @@ fn build_into(
 }
 
 /// `search.new/` becomes `search/` (the old index is removed). A crash between the renames
-/// leaves no `search/manifest.json`, so the next `run` rebuilds.
-fn swap_in(data_dir: &Path) -> Result<()> {
+/// leaves no `search/manifest.json`, so the next `run` rebuilds. Under the swap lock: no
+/// stage commit and no snapshot read runs across the renames.
+pub(crate) fn swap_in(data_dir: &Path) -> Result<()> {
+    let _g = swap_lock(data_dir)?;
     let (live, new, old) = (
         search_dir(data_dir),
         new_dir(data_dir),
@@ -584,10 +618,13 @@ mod tests {
     use kdx_types::record::{BlockRecord, TxRecord};
     use kdx_types::{blake2b_128, Hash32, TxKey};
 
-    use super::{build_into, open_segments, rebuilt_through, BuildOpts};
+    use super::{
+        build_into, open_segments, rebuilt_through, swap_in, swap_lock, with_current, BuildOpts,
+    };
     use crate::census::distinct_code_keys;
     use crate::manifest::{SearchManifest, FORMAT};
-    use crate::{Mode, ModeSel, Searcher};
+    use crate::schema::{create, to_doc, writer, Doc, SearchWriter};
+    use crate::{new_dir, search_dir, Mode, ModeSel, Searcher};
 
     pub(crate) fn exec_block(chain: u8, height: u32, codes: &[&str]) -> IndexedBlock {
         let txs: Vec<TxRecord> = codes
@@ -713,5 +750,91 @@ mod tests {
         let hot_floor_after_freeze = 17;
         let upper_from = (rt + 1).min(hot_floor_after_freeze);
         assert!(upper_from <= 15, "upper window from {upper_from} misses 15");
+    }
+
+    fn doc(code: &str) -> Doc {
+        Doc {
+            hash: blake2b_128(code.as_bytes()),
+            code: code.into(),
+            first_h: 1,
+            last_h: 1,
+        }
+    }
+
+    /// An index of `codes` with its manifest in `dir`.
+    fn build_index(dir: &std::path::Path, codes: &[&str], built_at: u64) {
+        let (index, f) = create(dir).unwrap();
+        let mut w = writer(&index, 1, 16).unwrap();
+        for c in codes {
+            w.add_document(to_doc(&f, &doc(c))).unwrap();
+        }
+        w.commit().unwrap();
+        w.wait_merging_threads().unwrap();
+        SearchManifest {
+            format: FORMAT,
+            tantivy: crate::TANTIVY_VERSION.into(),
+            mode: "full".into(),
+            fallback_min_len: 0,
+            built_through_height: 1,
+            rebuilt_through_height: Some(1),
+            docs: codes.len() as u64,
+            bytes: 0,
+            built_at,
+        }
+        .commit(dir)
+        .unwrap();
+    }
+
+    fn count(data: &std::path::Path, pat: &str) -> usize {
+        let s = Searcher::open(&search_dir(data), 100).unwrap().unwrap();
+        let far = Instant::now() + Duration::from_secs(10);
+        s.candidates(&Like::new(pat), far).unwrap().hashes.len()
+    }
+
+    /// I-2: a rebuild that swaps `search/` while the stage holds docs never gets the stage's
+    /// writes. A swap requested during a stage commit waits for it; a stage commit after the
+    /// swap writes nothing.
+    #[test]
+    fn a_swap_and_a_stage_commit_never_interleave() {
+        let d = tempfile::tempdir().unwrap();
+        let data = d.path().to_path_buf();
+        build_index(&search_dir(&data), &["(a.one)"], 1);
+        let mut w = SearchWriter::open(&search_dir(&data), 16).unwrap();
+        assert!(w.add(&doc("(a.two)")).unwrap());
+        build_index(&new_dir(&data), &["(b.one)", "(b.two)", "(b.three)"], 2);
+        // The stage is in a commit: the swap waits for it.
+        let g = swap_lock(&data).unwrap();
+        let data2 = data.clone();
+        let t = std::thread::spawn(move || swap_in(&data2).unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        let live = SearchManifest::load(&search_dir(&data)).unwrap().unwrap();
+        assert_eq!(live.built_at, 1, "swapped during the stage commit");
+        w.commit().unwrap();
+        drop(g);
+        t.join().unwrap();
+        // The next stage commit sees the new index and writes nothing into it.
+        assert!(w.add(&doc("(a.three)")).unwrap());
+        let meta = std::fs::read(search_dir(&data).join("meta.json")).unwrap();
+        let managed = std::fs::read(search_dir(&data).join(".managed.json")).ok();
+        assert!(with_current(&data, 1, || w.commit()).unwrap().is_none());
+        drop(w);
+        assert_eq!(
+            meta,
+            std::fs::read(search_dir(&data).join("meta.json")).unwrap()
+        );
+        assert_eq!(
+            managed,
+            std::fs::read(search_dir(&data).join(".managed.json")).ok()
+        );
+        assert_eq!(count(&data, "(b."), 3);
+        assert_eq!(count(&data, "(a."), 0);
+        // A writer on the new index commits through `with_current`, merges included.
+        let mut w = SearchWriter::open(&search_dir(&data), 16).unwrap();
+        for i in 0..12 {
+            assert!(w.add(&doc(&format!("(b.tail-{i})"))).unwrap());
+            assert!(with_current(&data, 2, || w.commit()).unwrap().is_some());
+        }
+        assert_eq!(count(&data, "(b."), 15);
+        assert_eq!(w.num_docs(), 15);
     }
 }

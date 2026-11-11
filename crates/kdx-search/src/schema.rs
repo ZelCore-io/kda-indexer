@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use tantivy::merge_policy::{LogMergePolicy, MergePolicy, NoMergePolicy};
 use tantivy::schema::{
     BytesOptions, Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing, TextOptions,
 };
@@ -140,18 +141,30 @@ pub fn writer(index: &Index, threads: usize, heap_mb: usize) -> Result<IndexWrit
 
 /// The tail stage's writer on the live `search/`: adds a doc only for a hash the index (or
 /// this writer since its last commit) does not hold.
+/// Segments of at most this many docs are merged by the tail writer (bigger ones, a
+/// rebuild's, are left alone so a merge under the swap lock stays short).
+const MERGE_MAX_DOCS: usize = 200_000;
+
+/// The tail stage's writer. Docs are buffered in memory and reach the index only in
+/// [`SearchWriter::commit`], with merges run there synchronously (`NoMergePolicy` in the
+/// background): every write into the directory happens inside `commit`, so a caller that
+/// holds the swap lock and checked `built_at` owns all of them. tantivy writes by path, and
+/// a rebuild renames a new index into the same path.
 pub struct SearchWriter {
     pub index: Index,
     pub fields: Fields,
     writer: IndexWriter,
     reader: IndexReader,
     pending: HashSet<[u8; 16]>,
+    docs: Vec<Doc>,
+    bytes: usize,
 }
 
 impl SearchWriter {
     pub fn open(dir: &Path, heap_mb: usize) -> Result<SearchWriter> {
         let (index, fields) = open(dir)?;
         let writer = writer(&index, 1, heap_mb)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -162,6 +175,8 @@ impl SearchWriter {
             writer,
             reader,
             pending: HashSet::new(),
+            docs: Vec::new(),
+            bytes: 0,
         })
     }
 
@@ -173,13 +188,14 @@ impl SearchWriter {
         Ok(self.reader.searcher().doc_freq(&t)? > 0)
     }
 
-    /// Adds `d` unless its hash is present; true when added.
+    /// Buffers `d` unless the index or the buffer holds its hash.
     pub fn add(&mut self, d: &Doc) -> Result<bool> {
         if self.contains(&d.hash)? {
             return Ok(false);
         }
-        self.writer.add_document(to_doc(&self.fields, d))?;
         self.pending.insert(d.hash);
+        self.bytes += d.code.len();
+        self.docs.push(d.clone());
         Ok(true)
     }
 
@@ -187,11 +203,25 @@ impl SearchWriter {
         self.pending.len()
     }
 
-    /// Commit, then make the committed docs visible to `contains`.
+    /// Code bytes buffered.
+    pub fn pending_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The buffered docs into the index, commit, then merge small segments and wait.
     pub fn commit(&mut self) -> Result<()> {
+        for d in self.docs.drain(..) {
+            self.writer.add_document(to_doc(&self.fields, &d))?;
+        }
         self.writer.commit()?;
+        let mut p = LogMergePolicy::default();
+        p.set_max_docs_before_merge(MERGE_MAX_DOCS);
+        for c in p.compute_merge_candidates(&self.index.searchable_segment_metas()?) {
+            self.writer.merge(&c.0).wait()?;
+        }
         self.reader.reload()?;
         self.pending.clear();
+        self.bytes = 0;
         Ok(())
     }
 

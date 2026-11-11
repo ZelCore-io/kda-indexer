@@ -15,7 +15,8 @@
 //!
 //! Then `search/` (P6): its `manifest.json` and tantivy's `meta.json` are read once and the
 //! files of the segments `meta.json` lists are linked (or copied); a file a tantivy commit or
-//! merge removed first makes the step start over. The search manifest is read before the
+//! merge removed first makes the step start over (the step holds the search swap lock, so no
+//! rebuild swap, stage commit or merge runs meanwhile). The search manifest is read before the
 //! index, so its `built_through_height` never runs ahead of the docs (the copy's tail stage
 //! re-reads from there; bodies already present are skipped).
 //!
@@ -393,9 +394,16 @@ fn snapshot_search(
     out: &Path,
     copy: bool,
 ) -> anyhow::Result<Option<(usize, u64, u32)>> {
+    // No rebuild swap, stage commit or merge runs while the files are read and linked (a
+    // source we cannot lock still gets the re-read checks of `live`).
+    let _swap = src
+        .parent()
+        .and_then(|d| kdx_search::build::swap_lock(d).ok());
     for _ in 0..MAX_ATTEMPTS {
-        let Some(sf) = kdx_search::snapshot::live_files(src)? else {
-            return Ok(None);
+        let sf = match kdx_search::snapshot::live(src)? {
+            kdx_search::snapshot::Live::None => return Ok(None),
+            kdx_search::snapshot::Live::Changed => continue,
+            kdx_search::snapshot::Live::Files(f) => f,
         };
         let m: kdx_search::SearchManifest =
             serde_json::from_slice(&sf.manifest).context("parse search/manifest.json")?;
