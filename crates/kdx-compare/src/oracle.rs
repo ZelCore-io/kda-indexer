@@ -124,6 +124,21 @@ pub fn v1txs_events(poll: &Value) -> Value {
     Value::Array(evs)
 }
 
+/// A numeric string in `meta` as Pact parses it, a number (seen live: `"gasPrice":
+/// "0.00000001"` in -rSHnkpP..., which chainweb-data and compat show as 1e-08).
+pub(crate) fn meta_num(v: Value) -> Value {
+    if let Value::String(s) = &v {
+        let t = s.trim();
+        if let Ok(i) = t.parse::<u64>() {
+            return Value::from(i);
+        }
+        if let Some(n) = t.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+            return Value::Number(n);
+        }
+    }
+    v
+}
+
 fn qualified_event_name(e: &Value) -> Value {
     let name = e.get("name").and_then(Value::as_str).unwrap_or("");
     let module = e.get("module");
@@ -197,9 +212,9 @@ pub fn from_poll(poll: &Value, header: &Value, tx: Option<&DecodedTx>) -> Value 
         m.insert("data".into(), p("data"));
         m.insert("nonce".into(), get(c, "nonce"));
         m.insert("sender".into(), get(&meta, "sender"));
-        m.insert("gasLimit".into(), get(&meta, "gasLimit"));
-        m.insert("gasPrice".into(), get(&meta, "gasPrice"));
-        m.insert("ttl".into(), get(&meta, "ttl"));
+        m.insert("gasLimit".into(), meta_num(get(&meta, "gasLimit")));
+        m.insert("gasPrice".into(), meta_num(get(&meta, "gasPrice")));
+        m.insert("ttl".into(), meta_num(get(&meta, "ttl")));
         // A fractional `meta.creationTime` (seen live: 1692638383.532) is rounded to whole
         // seconds, as chainweb-data shows it.
         let ct = meta

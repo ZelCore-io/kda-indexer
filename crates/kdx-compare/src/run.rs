@@ -2384,6 +2384,11 @@ mod tests {
         assert_eq!(row_chain(&f), Some(7));
         assert_eq!(row_chain(&json!({"chain": 19})), Some(19));
         assert_eq!(row_chain(&json!({"chain": 1.5})), None);
+        // Numeric meta strings project as numbers (F3 tx -rSHnkpP...).
+        assert_eq!(crate::oracle::meta_num(json!("0.00000001")), json!(1e-8));
+        assert_eq!(crate::oracle::meta_num(json!("600")), json!(600));
+        assert_eq!(crate::oracle::meta_num(json!(1e-8)), json!(1e-8));
+        assert_eq!(crate::oracle::meta_num(json!("abc")), json!("abc"));
         let z = json!([{"name": "coin.TRANSFER", "params": ["a", "m", 1.5]},
                        {"name": "coin.TRANSFER", "params": ["a", "b", 0.1]}]);
         assert!(!same_events(&x, &z));
