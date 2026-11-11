@@ -152,6 +152,12 @@ pub async fn block_requests(
     )))
 }
 
+/// Share of txs that get a `search=` request, and its height window.
+const SEARCH_SHARE: f64 = 0.3;
+const SEARCH_WINDOW: u64 = 50;
+/// Share of draws that add a `/coins` request.
+const COINS_SHARE: f64 = 0.02;
+
 pub fn tx_requests(
     tx: &kdx_decode::DecodedTx,
     chain: u8,
@@ -199,6 +205,7 @@ pub fn tx_requests(
     }
     let mut seen = std::collections::HashSet::new();
     accounts.retain(|(a, t)| !a.is_empty() && seen.insert((a.clone(), t.clone())));
+    let balance_keys: Vec<(String, String)> = accounts.iter().take(2).cloned().collect();
     accounts.truncate(MAX_ACCOUNTS);
     // `/v1/txs` for one of the transfer accounts (token = the transfer's module), like the
     // wallet: path unencoded, limit mostly 50.
@@ -247,6 +254,52 @@ pub fn tx_requests(
             origin,
             None,
         ));
+    }
+    // `search=`: a 12-24 char literal slice of the tx's exec code, inside its height +-50
+    // (chainweb-data is asked with the Bounded strategy; compared as sets).
+    if let Some(code) = tx
+        .cmd_parsed
+        .as_ref()
+        .and_then(|c| c.pointer("/payload/exec/code"))
+        .and_then(Value::as_str)
+    {
+        let chars: Vec<char> = code.chars().collect();
+        let want = rng.random_range(12..=24usize);
+        if chars.len() >= want {
+            let at = rng.random_range(0..=chars.len() - want);
+            let frag: String = chars[at..at + want].iter().collect();
+            // `%` and `_` are LIKE wildcards on both sides: keep the slice literal.
+            if !frag.contains(['%', '_']) && rng.random_bool(SEARCH_SHARE) {
+                out.push(Request::new(
+                    format!(
+                        "/txs/search?search={}&minheight={}&maxheight={}&limit=50",
+                        enc_query(&frag),
+                        height.saturating_sub(SEARCH_WINDOW),
+                        height + SEARCH_WINDOW
+                    ),
+                    origin,
+                    None,
+                ));
+            }
+        }
+    }
+    if rng.random_bool(COINS_SHARE) {
+        out.push(Request::new("/coins".into(), origin, None));
+    }
+    // Balances pair (H-1): a fungible TRANSFER party and its module on this chain; `coin`
+    // weight 3, any other token weight 1.
+    for (acct, token) in &balance_keys {
+        if token == "coin" || rng.random_range(0..3) == 0 {
+            out.push(Request::new(
+                format!(
+                    "/api/v1/accounts/{}/balances?token={}&chain={chain}",
+                    enc_segment(acct),
+                    enc_query(token)
+                ),
+                origin,
+                None,
+            ));
+        }
     }
     // Defpact id: a `cont` tx's pactId, or the continuation this tx started.
     let pact_id = tx

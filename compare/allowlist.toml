@@ -211,3 +211,20 @@ json_path_glob = "/~cwd-events-missing-node"
 condition = "any"
 reason = "chainweb-data lacks the events of whole height ranges (seen live 2026-11-11: no coin.TRANSFER event at heights 7392632-7392963, about 2.8 h of 2026-11-10, while its tip was at 7395650, so its /txs/events pages skip those heights). kda-indexer rows at a height above chainweb-data's lowest listed height where chainweb-data lists no row at all move here only when the node confirms every one: a user tx in the same block on /poll with an event of the same name and params, a coinbase row in the node's canonical block at its (chain, height). With both pages full, both sides are then cut at the higher of their lowest heights."
 owner_note = "Oracle defect class under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); added in run 3E-g. Triage sample: 22/22 user rows confirmed on /poll, 99/100 coinbase rows with the node's only header equal to kda-indexer's block (the 100th at a forked height, kda-indexer's block among the two)."
+
+[[entry]]
+id = "search-window"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "search="
+reason = "A `search=` with no literal run of 3 characters, or a window past search.max_scan_heights, runs the bounded newest-first scan in kda-indexer (S-4) and is cut at its height limit; chainweb-data scans the whole window, so rows below the cut differ. Requests the harness generates carry minheight/maxheight within 50 heights, so this is for hand-written and replayed requests."
+owner_note = "Plan Task 12 (S-4), like event-search-window."
+
+[[entry]]
+id = "coins-supply-tolerance"
+route = "coins"
+json_path_glob = "/**"
+condition = "changed"
+reason = "Both sides compute the circulating supply at their own tip height; /coins is a text decimal that grows with every block, so values within the supply tolerance of the stats route (relative 1e-6) are accepted. Reported as a visible hit."
+owner_note = "Plan Task 12; same tolerance as stats-supply-tolerance."

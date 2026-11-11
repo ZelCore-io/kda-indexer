@@ -168,14 +168,25 @@ impl Target {
         self.limiter.acquire().await;
         let t0 = Instant::now();
         let url = self.full_url(path_and_query);
-        let resp = match self.http.get(&url).send().await {
+        // chainweb-data scans without a bound unless asked (plan Task 12): `search=` goes out
+        // with `Chainweb-Execution-Strategy: Bounded`, inside the request's height window.
+        let bounded = self.kind == TargetKind::ChainwebData
+            && path_and_query.starts_with("/txs/search?search=");
+        let build = |h: &reqwest::Client| {
+            let r = h.get(&url);
+            if bounded {
+                r.header("Chainweb-Execution-Strategy", "Bounded")
+            } else {
+                r
+            }
+        };
+        let resp = match build(&self.http).send().await {
             Ok(r) => r,
             // One retry for a failed send on a reused connection (GET is idempotent).
             Err(e) if !e.is_timeout() => {
                 tracing::debug!(error = %e, "retrying once");
                 self.limiter.acquire().await;
-                self.http
-                    .get(&url)
+                build(&self.http)
                     .send()
                     .await
                     .with_context(|| format!("{} GET {path_and_query}", self.name))?

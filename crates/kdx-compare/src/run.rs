@@ -446,11 +446,17 @@ impl Ctx {
             if !ta.kind.serves(req.route) {
                 continue;
             }
-            let o = if b == "node" {
+            let o = if b == "node" || b == "node_local" {
                 if req.route == RouteKind::V1Txs {
                     continue;
                 }
-                self.vs_node(req, ta).await
+                if req.route == RouteKind::Balances {
+                    self.balances_vs_local(req, ta).await
+                } else if b == "node_local" {
+                    continue;
+                } else {
+                    self.vs_node(req, ta).await
+                }
             } else if let Some(tb) = self.targets.get(b) {
                 if !tb.kind.serves(req.route) {
                     continue;
@@ -1399,6 +1405,155 @@ impl Ctx {
         Outcome {
             class: class.into(),
             record: None,
+        }
+    }
+
+    /// The balances pair (plan Task 12, H-1): A is `/api/v1/accounts/{a}/balances?token&chain`
+    /// on kda-indexer native, B is `({token}.details (read-msg "a"))` on the node's `/local`
+    /// (the same read `kdx_node::local` makes). Balances compare as decimal values, guards as
+    /// JSON. A difference on a row that is `stale`, or whose `as_of_height` is more than 2 below
+    /// the node's read height, is retried once after 60 s and then reported as `skew`.
+    async fn balances_vs_local(&self, req: &Request, ta: &Target) -> Outcome {
+        let Ok(u) = url::Url::parse(&format!("http://h{}", req.path_and_query)) else {
+            return Self::simple("bad-request");
+        };
+        let account = u
+            .path_segments()
+            .and_then(|mut s| s.nth(3).map(str::to_owned))
+            .map(|a| percent_decode(&a))
+            .unwrap_or_default();
+        let q: std::collections::HashMap<String, String> = u
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let (Some(token), Some(Ok(chain))) =
+            (q.get("token"), q.get("chain").map(|c| c.parse::<u8>()))
+        else {
+            return Self::simple("bad-request");
+        };
+        let local = kdx_node::LocalClient::new(
+            self.node.clone(),
+            kdx_node::LocalOpts {
+                rps: self.cfg.node_max_rps.max(1),
+                concurrency: 1,
+            },
+        );
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let pa = match self.fetch_a(req, ta).await {
+                Ok(p) => p,
+                Err(e) => return self.a_error(req, ta, "node_local", None, &format!("{e:#}")),
+            };
+            if pa.pages[0].status >= 500 {
+                return self.a_error(req, ta, "node_local", Some(&pa), "5xx");
+            }
+            let rows = pa
+                .items
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let row = rows.iter().find(|r| {
+                r.get("module").and_then(Value::as_str) == Some(token.as_str())
+                    && r.get("chain").and_then(Value::as_u64) == Some(u64::from(chain))
+            });
+            let b = local.details(chain, token, &account).await;
+            let (mut diff, mut uncertain) = (Vec::new(), false);
+            let mut push = |path: &str, a: Option<Value>, b: Option<Value>| {
+                diff.push(DiffEntry {
+                    path: path.into(),
+                    kind: DiffKind::Changed,
+                    a,
+                    b,
+                });
+            };
+            let b_text = match &b {
+                Ok(kdx_node::Local::Found { value, height }) => {
+                    match row {
+                        None => {
+                            push("/row", None, Some(Value::String(value.balance.clone())));
+                            uncertain = true;
+                        }
+                        Some(r) => {
+                            let bal = r.get("balance").and_then(Value::as_str).unwrap_or("");
+                            if !same_decimal(bal, &value.balance) {
+                                push(
+                                    "/balance",
+                                    Some(Value::String(bal.into())),
+                                    Some(Value::String(value.balance.clone())),
+                                );
+                                let as_of =
+                                    r.get("as_of_height").and_then(Value::as_u64).unwrap_or(0);
+                                uncertain = r.get("stale").and_then(Value::as_bool) == Some(true)
+                                    || as_of + 2 < *height;
+                            }
+                            if r.get("guard") != Some(&value.guard) {
+                                push("/guard", r.get("guard").cloned(), Some(value.guard.clone()));
+                                uncertain = true;
+                            }
+                        }
+                    }
+                    format!("{{\"balance\":{:?},\"height\":{height}}}", value.balance)
+                }
+                Ok(kdx_node::Local::Absent) => {
+                    if let Some(r) = row {
+                        push("/row", r.get("balance").cloned(), None);
+                        uncertain = true;
+                    }
+                    "absent".to_string()
+                }
+                // Pact failures and node errors give no answer to compare (a token module
+                // without `details`): not a diff.
+                Err(e) => {
+                    return self.b_error(
+                        req,
+                        ta,
+                        "node_local",
+                        Some(&pa),
+                        &format!("{e}"),
+                        String::new(),
+                    )
+                }
+            };
+            if diff.is_empty() {
+                return Self::simple("match");
+            }
+            if uncertain && attempt == 1 {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+            if uncertain {
+                let rec = self.record(
+                    req,
+                    ta,
+                    "node_local",
+                    Some(&pa),
+                    None,
+                    b_text,
+                    diff,
+                    "skew",
+                    &[],
+                    String::new(),
+                    Some("balance differs from /local past the skew allowance".into()),
+                );
+                return Outcome {
+                    class: "skew".into(),
+                    record: Some(rec),
+                };
+            }
+            return self.finish(
+                req,
+                ta,
+                "node_local",
+                &pa,
+                None,
+                b_text,
+                diff,
+                false,
+                String::new(),
+                None,
+            );
         }
     }
 
@@ -2493,6 +2648,35 @@ pub async fn once(cfg: CompareConfig, path: &str) -> anyhow::Result<Vec<Outcome>
     let out = ctx.process(&req).await;
     ctx.flush_summary();
     Ok(out)
+}
+
+/// Percent-decoded path segment.
+fn percent_decode(s: &str) -> String {
+    url::form_urlencoded::parse(s.replace('+', "%2B").as_bytes())
+        .next()
+        .map(|(k, v)| {
+            if v.is_empty() {
+                k.into_owned()
+            } else {
+                format!("{k}={v}")
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Equal as decimals: `1`, `1.0` and `1.00` are the same balance.
+fn same_decimal(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.trim();
+        match s.split_once('.') {
+            Some((i, f)) => match f.trim_end_matches('0') {
+                "" => i.to_owned(),
+                f => format!("{i}.{f}"),
+            },
+            None => s.to_owned(),
+        }
+    }
+    norm(a) == norm(b)
 }
 
 #[cfg(test)]
