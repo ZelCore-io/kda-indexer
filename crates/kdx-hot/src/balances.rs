@@ -38,6 +38,35 @@ pub mod meta {
     pub const BALANCES_SEEDED: &str = "balances_seeded";
     /// Resume cursor of a running seed (see `kdx_ingest::seed`).
     pub const BALANCES_SEED_CURSOR: &str = "balances_seed_cursor";
+    /// Prefix of the per-chain mark watermark `balances_marked_through/{chain}`: u32, the
+    /// height of the last block the tail applied with dirty marks (M-11).
+    pub const MARKED_THROUGH: &str = "balances_marked_through";
+    /// u32: the tail applied a block above a chain's watermark + 1, so blocks in between got
+    /// no marks (`[balances] enabled = false`, or an older binary). The reconciler re-runs the
+    /// seed and clears it.
+    pub const MARK_GAP: &str = "balances_mark_gap";
+}
+
+static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the tail writes balance dirty marks: `[balances] enabled` (M-11), set at startup.
+pub fn set_marking(on: bool) {
+    MARKING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn marking() -> bool {
+    MARKING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Move a chain's mark watermark to `height` (M-11); a jump past watermark + 1 flags a gap.
+pub fn note_marked(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<()> {
+    let k = format!("{}/{chain}", meta::MARKED_THROUGH);
+    if let Some(w) = txn.meta(&k)?.as_deref().and_then(be_u32) {
+        if height > w.saturating_add(1) {
+            txn.set_meta(meta::MARK_GAP, &height.to_be_bytes())?;
+        }
+    }
+    txn.set_meta(&k, &height.to_be_bytes())
 }
 
 /// `Tokens.kind`: a module seen as the module of a `TRANSFER` event (an `xfer` posting).

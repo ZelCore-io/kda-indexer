@@ -53,6 +53,11 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     let mut ops = Vec::new();
     dict.persist(txn)?;
     let coin = balances::coin_module(txn)?;
+    // M-11: marks only while balances are on; the watermark shows blocks applied without.
+    let marking = balances::marking();
+    if marking {
+        balances::note_marked(txn, chain, height)?;
+    }
 
     let mut buf = Vec::new();
     encode_block(br, &mut buf);
@@ -86,7 +91,9 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
                 });
             }
             // B-3: balances this block may change are re-read from the node.
-            balances::mark_posting(txn, f as u8, e, r.key, coin, true)?;
+            if marking {
+                balances::mark_posting(txn, f as u8, e, r.key, coin, true)?;
+            }
         }
         if !r.events.is_empty() {
             // Plan Task 11: NFT ledger events update `NftBalances` / mark `NftDirty`.
@@ -160,7 +167,9 @@ fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
         } => {
             txn.del(Table::TailPostings, &posting_key(*family, *entity, *key))?;
             // B-3: no balance undo ops; the row is marked dirty and re-read.
-            balances::mark_posting(txn, *family, *entity, *key, coin, false)?;
+            if balances::marking() {
+                balances::mark_posting(txn, *family, *entity, *key, coin, false)?;
+            }
         }
         UndoOp::DefpactStep { pact, key } => {
             if let Some(v) = txn.get(Table::Defpacts, &pact.0)? {

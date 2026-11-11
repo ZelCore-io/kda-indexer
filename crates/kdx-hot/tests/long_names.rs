@@ -92,6 +92,13 @@ fn rows(store: &HotStore) -> Vec<(String, Vec<u8>, Vec<u8>)> {
             continue;
         }
         for (k, v) in ro.scan(t, &[], |_| true).unwrap() {
+            // The balance mark watermark (M-11) records blocks applied with marks; an unwind
+            // leaves it, like the additive tables' marks.
+            if t == kdx_hot::Table::Meta
+                && k.starts_with(kdx_hot::balances::meta::MARKED_THROUGH.as_bytes())
+            {
+                continue;
+            }
             if t == kdx_hot::Table::Counters && v.iter().all(|&x| x == 0) {
                 continue;
             }

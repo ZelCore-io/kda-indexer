@@ -219,6 +219,11 @@ Alerts to set up in your own alerting:
 - the unit restarting (`NRestarts` or a `systemd` failed-unit alert): the watchdog restarts a
   hung process and logs which component was silent.
 
+- A `serve` fixes its table list when it opens the store: one started before a P6 `run`
+  created the additive tables (balances, keys, tokens, NFTs) keeps answering them as empty.
+  Restart `serve` (on replicas too) once after the first P6 `run` start, and after any release
+  that adds a table (M-12).
+
 ## Snapshots and replicas
 
 `kda-indexer snapshot --out DIR` writes a consistent copy of a data dir. It only reads, takes
@@ -331,7 +336,9 @@ with `[balances] enabled = false`.
   event (`acct` postings) for `coin` on each chain it touches. It walks the hot tail, then the
   segments, and writes 100,000 rows per commit with a resume cursor, so a restart continues
   where it stopped. Mainnet: roughly 1–2M rows.
-- **Reconcile**: up to 256 dirty rows per batch, oldest mark first, through a node client of its
+- **Reconcile**: up to 256 dirty rows per batch, chosen fresh for every batch: tail marks first
+  (`coin` first, then at most `[balances] module_share` keys per other module, round-robin),
+  the seed backlog (`BalanceSeed`, `coin` first) only behind them; through a node client of its
   own at `[balances] local_rps` calls per second (default 50) with `local_concurrency` in
   flight (default 8). Each call is `({module}.details (read-msg "a"))` with the account in the
   request data, gas limit 150,000; keyset references are resolved with `describe-keyset`.
@@ -344,8 +351,26 @@ with `[balances] enabled = false`.
   least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,
   mark dropped until its next tail mark). It never becomes a zero balance. A Pact failure (for
   example a token module without a `details` function) or an unusable answer (not JSON, too
-  large, no decimal balance) drops the mark and leaves any stored row as it was, with no
-  back-off. A module name that fails the safety check is skipped without a call.
+  large, no decimal balance) drops the mark it read (a newer mark survives) and keeps any stored row, flagged
+  unverified (served `stale: true`), with no back-off. A module name that fails the safety
+  check is skipped without a call. A node outage parks nothing: retry counts only run in
+  batches that do not back off.
+- **Trust**: a guard adds the account to `/keys/{pk}/accounts` only for `coin` and for a module
+  whose `describe-module` lists `fungible-v2` on that chain (checked once per module and chain
+  through `/local`, re-checked every `[balances] recheck_hours`, default 24). Any other module's
+  balances are stored and served, but its guard indexes no key, and its keyset references are
+  not resolved.
+- **Not fungible**: a module whose `details` calls all fail in 3 batches in a row is marked
+  not fungible: the tail stops marking it, its dirty rows are dropped without a call
+  (`result="not_fungible"`) and `/tokens` hides it until the re-check `recheck_hours` later.
+- **Caps**: an untrusted module gets at most `[balances] module_rows` rows (default 1,000,000;
+  then the tail marks no new key of it) and an account at most `account_rows` untrusted rows
+  (default 1,000); `coin` and confirmed `fungible-v2` rows are always kept
+  (`result="capped"`).
+- **Marks off**: with `[balances] enabled = false` the tail writes no marks. Each chain keeps a
+  watermark of the last block applied with marks; when the tail applies a block past it
+  (balances were off, or an older binary ran on the store) the reconciler re-runs the seed, so
+  rows changed meanwhile are re-read (a full pass behind the tail marks).
 
 ```sh
 kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --status
@@ -384,7 +409,7 @@ as balances) between its balance batches. `kda-indexer inspect nft-check --count
 - `n_4e470a97222514a8662dd1219000a0431451b0ee.ledger` (a v2-shaped ledger in a principal
   namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
   deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
-- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked"}`
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 

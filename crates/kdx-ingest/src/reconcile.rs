@@ -801,6 +801,45 @@ pub fn recheck_not_fungible(hot: &HotStore, now: u32, recheck_secs: u32) -> Resu
     Ok(due.len())
 }
 
+/// Run (or resume) the balance seed (B-2). Returns false when stopped.
+async fn seed_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
+    tracing::info!("balances: no seed yet, seeding (B-2)");
+    let (c, s) = (ctx.clone(), stop.clone());
+    let rep = tokio::task::spawn_blocking(move || {
+        crate::seed::run(&c.hot, &c.segdir, &|| s.is_cancelled())
+    })
+    .await??;
+    tracing::info!(report = %serde_json::to_string(&rep)?, "balances: seed pass ended");
+    Ok(!rep.stopped)
+}
+
+/// M-11: the tail applied blocks without dirty marks (`[balances] enabled = false`, or an
+/// older binary on this store). Clears the gap flag and the seed's done flag and cursor, so the
+/// seed marks every known row again (behind the tail marks). Returns whether there was a gap.
+pub fn take_mark_gap(hot: &HotStore) -> Result<bool> {
+    use kdx_hot::balances::meta;
+    if hot.ro()?.meta(meta::MARK_GAP)?.is_none() {
+        return Ok(false);
+    }
+    let mut txn = hot.rw()?;
+    for k in [
+        meta::MARK_GAP,
+        meta::BALANCES_SEEDED,
+        meta::BALANCES_SEED_CURSOR,
+    ] {
+        txn.del(Table::Meta, k.as_bytes())?;
+    }
+    txn.commit()?;
+    Ok(true)
+}
+
+fn gap_warn() {
+    tracing::warn!(
+        "balances: blocks were applied without dirty marks (balances off, or an older \
+         binary); re-running the seed (M-11)"
+    );
+}
+
 /// Pause before a failed NFT history fill is tried again (M-8).
 const NFT_FILL_RETRY: Duration = Duration::from_secs(3600);
 
@@ -862,18 +901,11 @@ pub async fn run(
             }
         }
     }
-    let seeded = crate::seed::seeded(&ctx.hot.ro()?)?;
-    if o.seed && !seeded {
-        tracing::info!("balances: no seed yet, seeding (B-2)");
-        let (c, s) = (ctx.clone(), stop.clone());
-        let rep = tokio::task::spawn_blocking(move || {
-            crate::seed::run(&c.hot, &c.segdir, &|| s.is_cancelled())
-        })
-        .await??;
-        tracing::info!(report = %serde_json::to_string(&rep)?, "balances: seed pass ended");
-        if rep.stopped {
-            return Ok(());
-        }
+    if o.seed && take_mark_gap(&ctx.hot)? {
+        gap_warn();
+    }
+    if o.seed && !crate::seed::seeded(&ctx.hot.ro()?)? && !seed_pass(&ctx, &stop).await? {
+        return Ok(());
     }
     let local = LocalClient::new(node, o.local);
     let mut nft_cursor: Option<Vec<u8>> = None;
@@ -887,6 +919,12 @@ pub async fn run(
     loop {
         if stop.is_cancelled() {
             return Ok(());
+        }
+        if o.seed && take_mark_gap(&ctx.hot)? {
+            gap_warn();
+            if !seed_pass(&ctx, &stop).await? {
+                return Ok(());
+            }
         }
         if nft_retry.is_some_and(|t| t.elapsed() >= NFT_FILL_RETRY) {
             match nft_fill_pass(&ctx, &stop).await {
@@ -1596,6 +1634,30 @@ mod tests {
             .is_none());
         assert_eq!(txn.count(Table::Balances).unwrap(), 4);
         assert_eq!(balances::dirty_count(&txn).unwrap(), 0);
+    }
+
+    /// M-11: a block applied above a chain's mark watermark + 1 (blocks applied without marks)
+    /// makes the reconciler re-run the seed; contiguous blocks and a chain's first block do not.
+    #[test]
+    fn a_mark_gap_reruns_the_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &[]);
+        let note = |chain: u8, h: u32| {
+            let mut txn = hot.rw().unwrap();
+            balances::note_marked(&mut txn, chain, h).unwrap();
+            txn.set_meta(balances::meta::BALANCES_SEEDED, &7u32.to_be_bytes())
+                .unwrap();
+            txn.commit().unwrap();
+        };
+        note(0, 10);
+        note(0, 11);
+        note(0, 11); // a reorg re-applies a height
+        note(1, 3);
+        assert!(!take_mark_gap(&hot).unwrap());
+        note(0, 15); // 12..=14 applied without marks
+        assert!(take_mark_gap(&hot).unwrap());
+        assert!(!crate::seed::seeded(&hot.ro().unwrap()).unwrap());
+        assert!(!take_mark_gap(&hot).unwrap());
     }
 
     #[test]
