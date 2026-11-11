@@ -326,10 +326,13 @@ with `[balances] enabled = false`.
 - **Marks**: every tail block marks the balances it may change (`TRANSFER` sides, every account
   of its events for `coin`), and a reorg's undo marks the unwound blocks' rows again. A row
   that is dirty is served with `stale: true` until it is re-read.
-- **Errors**: a node error (timeout, HTTP, decode) keeps the row dirty, moves it to the back of
-  the queue and backs off up to 60 s; it never becomes a zero balance. A Pact failure (for
-  example a token module without a `details` function) drops the mark and leaves any stored row
-  as it was. A module name that fails the safety check is skipped without a call.
+- **Errors**: a node error (timeout, connection, HTTP status) keeps the row dirty and moves it
+  to the back of the queue; the reconciler backs off (up to 60 s) only when node errors are at
+  least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,
+  mark dropped until its next tail mark). It never becomes a zero balance. A Pact failure (for
+  example a token module without a `details` function) or an unusable answer (not JSON, too
+  large, no decimal balance) drops the mark and leaves any stored row as it was, with no
+  back-off. A module name that fails the safety check is skipped without a call.
 
 ```sh
 kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --status
@@ -343,7 +346,7 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-
   service.
 - `--seed`: runs (or resumes) the seed walk now; the next `run` reconciles what it marked.
 - `--all`: marks every stored balance row dirty, so the next `run` re-reads them all.
-- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped"}`
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 

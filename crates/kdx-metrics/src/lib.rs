@@ -73,7 +73,7 @@ pub struct Metrics {
     pub dict_snapshot_names: Gauge,
     /// Rows in `BalanceDirty` (spec §3.9, plan Task 9).
     pub balance_dirty_rows: Gauge,
-    /// `/local` reconcile outcomes: `result` = ok | absent | error | skipped.
+    /// `/local` reconcile outcomes: `result` = ok | absent | error | skipped | parked.
     pub balance_reconcile: Count,
     /// Duration of one `/local` reconcile call (`result` as above).
     pub balance_reconcile_seconds: Hist,
@@ -234,7 +234,7 @@ impl Metrics {
         );
         let balance_reconcile = reg!(
             "kdx_balance_reconcile",
-            "Balance reconcile calls (result ok|absent|error|skipped)",
+            "Balance reconcile outcomes (result ok|absent|error|skipped|parked)",
             Count::default()
         );
         let balance_reconcile_seconds = reg!(
@@ -335,7 +335,7 @@ impl Metrics {
             .inc();
     }
 
-    /// One balance reconcile outcome (`ok|absent|error|skipped`) and its duration.
+    /// One balance reconcile outcome (`ok|absent|error|skipped|parked`) and its duration.
     pub fn balance_reconcile(&self, result: &'static str, secs: f64) {
         let l: Labels = vec![("result", result.into())];
         self.balance_reconcile.get_or_create(&l).inc();

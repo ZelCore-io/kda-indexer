@@ -15,8 +15,9 @@
 //! Answers: a success gives the value and the tip height it was read at
 //! (`metaData.blockHeight − 1`). A failure whose message says
 //! the row or keyset does not exist is [`Local::Absent`] (the node sends no `metaData` then).
-//! Any other Pact failure is [`LocalError::Failure`]; transport, HTTP and decode errors are
-//! [`LocalError::Node`]. Neither is ever read as a zero balance.
+//! Any other Pact failure, and any delivered answer that cannot be used, is
+//! [`LocalError::Failure`]; only transport and HTTP errors are [`LocalError::Node`]. Neither is
+//! ever read as a zero balance.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -64,10 +65,12 @@ pub enum LocalError {
     /// B-1 refused the call (bad module name, over-long name): nothing was sent.
     #[error("skipped: {0}")]
     Skipped(String),
-    /// The node evaluated the code and it failed for another reason than a missing row.
+    /// The node evaluated the code and it failed for another reason than a missing row, or
+    /// its answer arrived but is unusable (not JSON, over the body cap, no `result`, no
+    /// `metaData.blockHeight`, no decimal balance). A property of this call.
     #[error("pact failure: {0}")]
     Failure(String),
-    /// Transport, HTTP, decode error or an answer without `metaData.blockHeight`: retry later.
+    /// Transport or HTTP error (timeout, connection, non-2xx status): retry later.
     #[error("node: {0}")]
     Node(#[from] NodeError),
 }
@@ -137,6 +140,13 @@ pub struct LocalClient {
     sem: Semaphore,
 }
 
+/// A delivered answer that cannot be used: a per-call [`LocalError::Failure`], never a node
+/// error (one odd answer must not make the caller back off for every key).
+fn invalid(what: &str) -> LocalError {
+    let cut: String = what.chars().take(200).collect();
+    LocalError::Failure(format!("invalid answer: {cut}"))
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -196,10 +206,16 @@ impl LocalClient {
 
     async fn exchange(&self, chain: u8, code: &str, data: Value) -> LocalResult<Value> {
         let body = command(self.node.network(), chain, code, &data, now_secs());
-        let r = self.node.local(chain, &body).await?;
-        let result = r
-            .get("result")
-            .ok_or_else(|| NodeError::Decode("local: no result".into()))?;
+        let r = match self.node.local(chain, &body).await {
+            Ok(r) => r,
+            // An answer arrived but is not usable (not JSON, over the body cap): a property of
+            // this call, not of the node's health.
+            Err(e @ (NodeError::Decode(_) | NodeError::TooLarge { .. })) => {
+                return Err(invalid(&e.to_string()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let result = r.get("result").ok_or_else(|| invalid("no result"))?;
         match result.get("status").and_then(Value::as_str) {
             Some("success") => {
                 // `metaData.blockHeight` is the height of the block the node would build
@@ -208,7 +224,7 @@ impl LocalClient {
                     .pointer("/metaData/blockHeight")
                     .and_then(Value::as_u64)
                     .and_then(|h| h.checked_sub(1))
-                    .ok_or_else(|| NodeError::Decode("local: no metaData.blockHeight".into()))?;
+                    .ok_or_else(|| invalid("no metaData.blockHeight"))?;
                 let value = result.get("data").cloned().unwrap_or(Value::Null);
                 Ok(Local::Found { value, height })
             }
@@ -224,7 +240,7 @@ impl LocalClient {
                     Err(LocalError::Failure(cut))
                 }
             }
-            _ => Err(NodeError::Decode("local: result has no status".into()).into()),
+            _ => Err(invalid("result has no status")),
         }
     }
 
@@ -257,7 +273,7 @@ fn details_of(r: Local<Value>) -> LocalResult<Details> {
                 let balance = value
                     .get("balance")
                     .and_then(decimal_text)
-                    .ok_or_else(|| NodeError::Decode("details: no balance".into()))?;
+                    .ok_or_else(|| invalid("details: no decimal balance"))?;
                 let guard = value.get("guard").cloned().unwrap_or(Value::Null);
                 Ok(Local::Found {
                     value: Details { balance, guard },
@@ -299,8 +315,7 @@ impl LocalClient {
         {
             Local::Absent => Ok(Local::Absent),
             Local::Found { value, height } => Ok(Local::Found {
-                value: decimal_text(&value)
-                    .ok_or_else(|| NodeError::Decode("get-balance: not a decimal".into()))?,
+                value: decimal_text(&value).ok_or_else(|| invalid("get-balance: not a decimal"))?,
                 height,
             }),
         }

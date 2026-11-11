@@ -15,12 +15,15 @@
 //! - Outcomes (`kdx_balance_reconcile_total{result}`):
 //!   - `ok`, `absent`: row written.
 //!   - `skipped`: B-1 refused the call (module name, name length); the key is dropped.
-//!   - `error`, Pact failure (the node evaluated the code and it failed, e.g. a module with no
-//!     `details`): the key is dropped and an existing row is left as it was. The next tail mark
-//!     retries it.
-//!   - `error`, node error (transport, HTTP, decode, no `metaData`): the key stays dirty, its
-//!     mark moves up to the chain's tail height (so it goes to the back of the queue), and the
-//!     loop backs off exponentially up to [`BACKOFF_MAX`]. Never read as a zero balance.
+//!   - `error`, Pact failure or unusable answer (the node evaluated the code and it failed,
+//!     e.g. a module with no `details`; or the answer is not JSON, over the body cap, or has no
+//!     decimal balance or `metaData`): the key is dropped and an existing row is left as it
+//!     was. The next tail mark retries it. No back-off.
+//!   - `error`, node error (transport or HTTP): the key stays dirty and its mark moves up to
+//!     the chain's tail height (back of the queue). The loop backs off exponentially up to
+//!     [`BACKOFF_MAX`] only when node errors are at least half of a batch's calls
+//!     ([`backs_off`]). A key with [`MAX_KEY_RETRIES`] node errors in a row is parked
+//!     (`parked`: mark dropped until the next tail mark). Never read as a zero balance.
 //! - Heartbeat: `Meta balances_reconcile_stats` (JSON: unix time, rows done, rate, dirty) per
 //!   batch; not part of the systemd watchdog.
 
@@ -43,6 +46,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Ctx;
 
+/// Consecutive node errors after which a key is parked: its dirty mark is dropped (counted as
+/// `result="parked"`) until the next tail mark of the row.
+pub const MAX_KEY_RETRIES: u32 = 5;
+/// Keys whose node errors are counted at once (the map is cleared beyond this).
+const MAX_TRACKED: usize = 100_000;
 /// Dirty keys kept per refill (oldest marks first).
 pub const REFILL: usize = 4096;
 /// `BalanceDirty` rows per read txn during a refill.
@@ -251,13 +259,29 @@ fn clear_if_covered(txn: &mut RwTxn<'_>, key: &[u8; 9], as_of: u32) -> Result<()
     Ok(())
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct BatchStats {
     pub ok: u64,
     pub absent: u64,
     pub skipped: u64,
     pub failures: u64,
     pub node_errors: u64,
+    /// Keys whose call hit a node (transport or HTTP) error; still dirty.
+    pub node_error_keys: Vec<[u8; 9]>,
+}
+
+impl BatchStats {
+    /// Calls the node answered or failed (B-1 refusals make none).
+    pub fn calls(&self) -> u64 {
+        self.ok + self.absent + self.failures + self.node_errors
+    }
+}
+
+/// Back off only when node errors are at least half of the batch's calls: the node itself is
+/// failing. A minority of failing keys is a property of those keys (they go to the back of the
+/// queue, and [`MAX_KEY_RETRIES`] parks them), and must not slow every other key.
+pub fn backs_off(st: &BatchStats) -> bool {
+    st.node_errors > 0 && st.node_errors * 2 >= st.calls()
 }
 
 /// Reconcile one batch of dirty keys.
@@ -349,6 +373,7 @@ pub async fn reconcile_batch(
                 // To the back of the queue: the mark moves up to the tail height (never down).
                 balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
                 st.node_errors += 1;
+                st.node_error_keys.push(it.key);
             }
         }
     }
@@ -392,6 +417,7 @@ pub async fn run(
     let local = LocalClient::new(node, o.local);
     let mut queue: VecDeque<([u8; 9], u32)> = VecDeque::new();
     let mut backoff: Option<Duration> = None;
+    let mut retries: HashMap<[u8; 9], u32> = HashMap::new();
     let mut done = 0u64;
     let mut rate = 0.0f64;
     let mut last_log = Instant::now();
@@ -431,7 +457,11 @@ pub async fn run(
             );
             last_log = Instant::now();
         }
-        if st.node_errors > 0 {
+        let parked = count_retries(&mut retries, &batch, &st.node_error_keys);
+        if !parked.is_empty() {
+            park(&ctx, &parked)?;
+        }
+        if backs_off(&st) {
             let d = backoff.map_or(Duration::from_secs(1), |d| (d * 2).min(BACKOFF_MAX));
             backoff = Some(d);
             tracing::warn!(
@@ -449,6 +479,50 @@ pub async fn run(
             backoff = None;
         }
     }
+}
+
+/// Count consecutive node errors per key of a batch: keys that answered are forgotten; the
+/// keys that reached [`MAX_KEY_RETRIES`] are returned (and forgotten) for parking.
+pub fn count_retries(
+    retries: &mut HashMap<[u8; 9], u32>,
+    batch: &[([u8; 9], u32)],
+    errored: &[[u8; 9]],
+) -> Vec<[u8; 9]> {
+    let failed: HashSet<&[u8; 9]> = errored.iter().collect();
+    for (k, _) in batch {
+        if !failed.contains(k) {
+            retries.remove(k);
+        }
+    }
+    if retries.len() > MAX_TRACKED {
+        retries.clear();
+    }
+    let mut out = Vec::new();
+    for k in errored {
+        let n = retries.entry(*k).or_insert(0);
+        *n += 1;
+        if *n >= MAX_KEY_RETRIES {
+            retries.remove(k);
+            out.push(*k);
+        }
+    }
+    out
+}
+
+/// Drop the dirty marks of keys that kept failing at the node (`result="parked"`).
+fn park(ctx: &Ctx, keys: &[[u8; 9]]) -> Result<()> {
+    let mut txn = ctx.hot.rw()?;
+    for k in keys {
+        txn.del(Table::BalanceDirty, k)?;
+        kdx_metrics::get().balance_reconcile("parked", 0.0);
+    }
+    txn.commit()?;
+    tracing::warn!(
+        keys = keys.len(),
+        retries = MAX_KEY_RETRIES,
+        "balances: parked keys that kept failing at the node until their next tail mark"
+    );
+    Ok(())
 }
 
 /// [`run`] with restarts: a failed reconciler (a store error) is logged and started again
@@ -472,5 +546,193 @@ pub async fn supervise(
             _ = stop.cancelled() => return Ok(()),
             _ = tokio::time::sleep(BACKOFF_MAX) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+
+    use kdx_hot::{Geometry, HotDict, HotStore};
+    use kdx_node::{ChainGraph, NodeClientConfig, NodeInfo};
+    use kdx_types::DictMut;
+
+    use super::*;
+    use crate::IngestOpts;
+
+    /// A fake node: `/local` answers a success for every account except `bad`, whose answer
+    /// arrives but has no balance. One connection at a time (`Connection: close`).
+    fn fake_node() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let (head_end, len) = loop {
+                    let n = s.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break (0, 0);
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (i + 4, len);
+                    }
+                };
+                while head_end > 0 && buf.len() < head_end + len {
+                    let n = s.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let req: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                let cmd: Value = req
+                    .get("cmd")
+                    .and_then(Value::as_str)
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or(Value::Null);
+                let acct = cmd
+                    .pointer("/payload/exec/data/a")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let body = if acct == "bad" {
+                    json!({"result": {"status": "success", "data": {"guard": null}},
+                           "metaData": {"blockHeight": 11}})
+                } else {
+                    json!({"result": {"status": "success", "data": {"account": acct,
+                           "balance": 1.5, "guard": {"keys": ["k1"], "pred": "keys-all"}}},
+                           "metaData": {"blockHeight": 11}})
+                }
+                .to_string();
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn opts(dir: &std::path::Path) -> IngestOpts {
+        IngestOpts {
+            network: "mainnet01".into(),
+            data_dir: dir.to_path_buf(),
+            geometry: Geometry::default(),
+            finality_depth: 100,
+            batch_size: 50,
+            ranges_in_flight: 1,
+            range_heights: 300,
+            step_heights: 100,
+            min_free_gb: 0,
+            range_level: 3,
+            step_level: 3,
+            dict_samples: 0,
+            etl_mem_mb: 16,
+            mem_cap_mb: 256,
+            commit_ms: 1000,
+            commit_blocks: 10,
+            cut_poll_secs: 10,
+            until: None,
+        }
+    }
+
+    /// One key whose answer is unusable is dropped as a failure; the other keys of the batch
+    /// reconcile, and the batch does not back off.
+    #[tokio::test]
+    async fn one_invalid_answer_does_not_stall_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotStore::open(&dir.path().join("hot"), Geometry::default()).unwrap());
+        {
+            let mut txn = hot.rw().unwrap();
+            let mut dict = HotDict::load(&txn).unwrap();
+            let coin = dict.intern(DictKind::Module, "coin");
+            let ids: Vec<u32> = ["alice", "bad", "carol"]
+                .iter()
+                .map(|a| dict.intern(DictKind::Account, a))
+                .collect();
+            dict.persist(&mut txn).unwrap();
+            for a in ids {
+                balances::mark_dirty(&mut txn, a, coin, 0, 10).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let node = NodeClient::new(&NodeClientConfig {
+            base: fake_node().parse().unwrap(),
+            network: "mainnet01".into(),
+            timeout: Duration::from_secs(5),
+            max_rps: 0,
+            concurrency: 4,
+            p2p_url: None,
+            p2p_cert_sha256: None,
+            max_body_bytes: 1 << 20,
+            max_sse_event_bytes: 1 << 20,
+        })
+        .unwrap();
+        let info = NodeInfo {
+            node_version: String::new(),
+            chainweb_version: "mainnet01".into(),
+            graph_history: vec![(0, vec![0])],
+            raw: Value::Null,
+        };
+        let ctx = Ctx {
+            opts: opts(dir.path()),
+            node: node.clone(),
+            hot: hot.clone(),
+            dict: Arc::new(Mutex::new(HotDict::load(&hot.ro().unwrap()).unwrap())),
+            segdir: dir.path().join("segments"),
+            etl: dir.path().join("etl"),
+            graph: ChainGraph::from_info(&info),
+        };
+        let local = LocalClient::new(
+            node,
+            LocalOpts {
+                rps: 0,
+                concurrency: 4,
+            },
+        );
+        let keys: Vec<_> = refill(&hot, REFILL).unwrap().into_iter().collect();
+        assert_eq!(keys.len(), 3);
+        let st = reconcile_batch(&ctx, &local, &keys).await.unwrap();
+        assert_eq!((st.ok, st.failures, st.node_errors), (2, 1, 0));
+        assert!(!backs_off(&st));
+        let txn = hot.ro().unwrap();
+        // as_of = blockHeight 11 − 1 covers the marks at 10; the bad key's mark is dropped.
+        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 0);
+        assert_eq!(txn.count(Table::Balances).unwrap(), 2);
+        assert_eq!(txn.count(Table::KeyAccounts).unwrap(), 2);
+        let rows = balances::account_rows(&txn, 0).unwrap();
+        assert_eq!(rows[0].2.balance, "1.5");
+        assert_eq!(rows[0].2.as_of, 10);
+    }
+
+    #[test]
+    fn back_off_needs_a_node_error_majority_and_failing_keys_park() {
+        let mut st = BatchStats {
+            ok: 9,
+            node_errors: 1,
+            ..Default::default()
+        };
+        assert!(!backs_off(&st));
+        st.node_errors = 9;
+        assert!(backs_off(&st));
+        let mut m = HashMap::new();
+        let k = [1u8; 9];
+        let batch = vec![(k, 0u32), ([2u8; 9], 0)];
+        for _ in 1..MAX_KEY_RETRIES {
+            assert!(count_retries(&mut m, &batch, &[k]).is_empty());
+        }
+        assert_eq!(count_retries(&mut m, &batch, &[k]), vec![k]);
+        assert!(m.is_empty());
     }
 }
