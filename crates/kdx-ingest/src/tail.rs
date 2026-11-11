@@ -168,7 +168,7 @@ async fn follower(
                 return Ok::<_, anyhow::Error>(None);
             }
             if let ReorgOutcome::ChainHalted { .. } = br.outcome {
-                return Ok(Some((br.outcome, Vec::new(), Vec::new(), None)));
+                return Ok(Some((br.outcome, Vec::new(), Vec::new(), None, Vec::new())));
             }
             let hs: Vec<(u32, Hash32)> = br
                 .headers
@@ -188,8 +188,9 @@ async fn follower(
                     .collect::<Result<Vec<_>>>()
             })
             .await??;
-            let (prepared, merkle_bad) = merkle_strict(&ctx, chain, &headers, prepared).await?;
-            Ok(Some((br.outcome, hs, prepared, merkle_bad)))
+            let (prepared, merkle_bad, merkle_seen) =
+                merkle_strict(&ctx, chain, &headers, prepared).await?;
+            Ok(Some((br.outcome, hs, prepared, merkle_bad, merkle_seen)))
         };
         let res = tokio::select! {
             _ = stop.cancelled() => return Ok(()),
@@ -203,7 +204,7 @@ async fn follower(
                     r = target.changed() => { if r.is_err() && stop.is_cancelled() { return Ok(()); } r?; }
                 }
             }
-            Ok(Some((ReorgOutcome::ChainHalted { fork_height, depth }, _, _, _))) => {
+            Ok(Some((ReorgOutcome::ChainHalted { fork_height, depth }, _, _, _, _))) => {
                 tracing::error!(
                     chain,
                     fork_height,
@@ -222,12 +223,14 @@ async fn follower(
                 .ok();
                 return Ok(());
             }
-            Ok(Some((outcome, mut hs, prepared, merkle_bad))) => {
+            Ok(Some((outcome, mut hs, prepared, merkle_bad, merkle_seen))) => {
                 backoff = 1;
                 // R-5 strict: commit the blocks before the bad one, then halt the chain.
                 hs.truncate(prepared.len());
                 if merkle_bad.is_some() && prepared.is_empty() {
-                    out.send(merkle_halt(chain)).await.ok();
+                    if out.send(merkle_halt(chain)).await.is_ok() {
+                        count_merkle(&merkle_seen);
+                    }
                     return Ok(());
                 }
                 let fork = match outcome {
@@ -258,6 +261,7 @@ async fn follower(
                 {
                     return Ok(()); // writer gone (shutdown or error)
                 }
+                count_merkle(&merkle_seen);
                 if merkle_bad.is_some() {
                     out.send(merkle_halt(chain)).await.ok();
                     return Ok(());
@@ -275,6 +279,15 @@ async fn follower(
     }
 }
 
+/// `kdx_merkle_blocks_total` for a round's outcomes, once its batch reached the writer (a
+/// round that fails before that is retried and counts its blocks then).
+fn count_merkle(labels: &[&'static str]) {
+    let m = kdx_metrics::get();
+    for l in labels {
+        m.merkle(l);
+    }
+}
+
 fn merkle_halt(chain: u8) -> Batch {
     Batch {
         chain,
@@ -285,7 +298,8 @@ fn merkle_halt(chain: u8) -> Batch {
     }
 }
 
-/// Ruling R-5, tail side (strict). Every block's Merkle outcome is counted. The first block
+/// Ruling R-5, tail side (strict). Every block's Merkle outcome is returned for counting
+/// (the caller counts after its batch reaches the writer). The first block
 /// whose payload does not verify is fetched again once (single payload); if it still does not
 /// verify, the blocks before it are returned with its height, and the caller commits them and
 /// halts the chain (reason `merkle`; `unwind --clear-halt` resumes it).
@@ -297,13 +311,14 @@ async fn merkle_strict(
 ) -> Result<(
     Vec<(kdx_decode::DecodedBlock, kdx_decode::VerifyReport)>,
     Option<u64>,
+    Vec<&'static str>,
 )> {
-    let m = kdx_metrics::get();
+    let mut seen = Vec::with_capacity(prepared.len());
     for i in 0..prepared.len() {
         pipeline::debug_corrupt_merkle(&mut prepared[i]);
         let r = pipeline::merkle_of(&prepared[i]);
         if r.is_verified() {
-            m.merkle(r.label());
+            seen.push(r.label());
             continue;
         }
         let (height, ph) = {
@@ -326,7 +341,7 @@ async fn merkle_strict(
         .await??;
         pipeline::debug_corrupt_merkle(&mut again);
         let r = pipeline::merkle_of(&again);
-        m.merkle(r.label());
+        seen.push(r.label());
         if r.is_verified() {
             tracing::info!(chain, height, "tail: refetched payload verifies");
             prepared[i] = again;
@@ -341,9 +356,9 @@ async fn merkle_strict(
             "tail: payload Merkle mismatch after one refetch; halting this chain (Counters halted.{chain}, halted.{chain}.merkle; resume with unwind --clear-halt)"
         );
         prepared.truncate(i);
-        return Ok((prepared, Some(height)));
+        return Ok((prepared, Some(height), seen));
     }
-    Ok((prepared, None))
+    Ok((prepared, None, seen))
 }
 
 /// The single writer: buffers batches, commits per `commit_ms` / `commit_blocks`, drains the
@@ -483,9 +498,24 @@ pub async fn run(ctx: Arc<Ctx>, shutdown: CancellationToken) -> Result<()> {
             .collect();
         for &c in &chains {
             if halted.contains(&c) {
+                let reasons: Vec<&str> = apply::counters::HALT_REASONS
+                    .iter()
+                    .copied()
+                    .filter(|r| {
+                        txn.counter(&apply::counters::halted_reason(c, r))
+                            .unwrap_or(0)
+                            > 0
+                    })
+                    .collect();
+                let reason = if reasons.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    reasons.join(",")
+                };
                 tracing::error!(
                     chain = c,
-                    "tail: chain is halted (Counters halted.{c}); not following it"
+                    reason,
+                    "tail: chain is halted (Counters halted.{c}, reason {reason}); not following it; see operations.md \"Halted chains\""
                 );
                 continue;
             }
