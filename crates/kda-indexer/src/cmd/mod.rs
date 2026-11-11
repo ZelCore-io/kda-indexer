@@ -20,6 +20,7 @@ pub mod probe;
 pub mod run;
 pub mod segments;
 pub mod serve;
+pub mod snapshot;
 pub mod unwind;
 pub mod verify;
 pub mod viewcheck;

@@ -42,6 +42,9 @@ rand.workspace = true
 rayon.workspace = true
 zstd.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 # `make deb` (cargo-deb, built on the node, spec 6.2/6.3). Asset sources are relative to this
 # crate; the binaries come from the workspace target dir.
 [package.metadata.deb]

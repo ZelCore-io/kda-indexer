@@ -199,6 +199,37 @@ impl HotStore {
         })
     }
 
+    /// Copy the MVCC snapshot of `txn` (taken from this store) into a new hot store in the
+    /// directory `dest` (created; it must hold no `mdbx.dat`), compacted: free pages omitted and
+    /// pages renumbered. The copy is durable when this returns. The result opens like any hot
+    /// store. Holds `txn` for the whole copy: minutes on a large store.
+    pub fn copy_compact(&self, txn: &RoTxn, dest: &Path) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let file = dest.join("mdbx.dat");
+        if file.exists() {
+            bail!("{} already holds a hot store", dest.display());
+        }
+        std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+        let c = std::ffi::CString::new(file.as_os_str().as_bytes()).context("dest path")?;
+        let rc = txn
+            .raw()
+            .txn_execute(|t| unsafe {
+                reth_libmdbx::ffi::mdbx_txn_copy2pathname(
+                    t,
+                    c.as_ptr(),
+                    reth_libmdbx::ffi::MDBX_CP_COMPACT,
+                )
+            })
+            .map_err(|e| anyhow::anyhow!("copy txn: {e}"))?;
+        if rc != 0 {
+            bail!(
+                "mdbx_txn_copy2pathname {} failed: code {rc}",
+                dest.display()
+            );
+        }
+        Ok(())
+    }
+
     /// The write transaction. One writer at a time: blocks while another `RwTxn` is alive.
     pub fn rw(&self) -> Result<RwTxn<'_>> {
         if self.read_only {

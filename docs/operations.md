@@ -219,6 +219,50 @@ Alerts to set up in your own alerting:
 - the unit restarting (`NRestarts` or a `systemd` failed-unit alert): the watchdog restarts a
   hung process and logs which component was silent.
 
+## Snapshots and replicas
+
+`kda-indexer snapshot --out DIR` writes a consistent copy of a data dir. It only reads, takes
+no lock and can run beside the live `run` (and beside the freezer and merges). The copy is a
+data dir: `serve --data-dir DIR` answers on it, and `run` on it resumes the tail from the
+checkpoints it holds.
+
+```sh
+kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
+    snapshot --out /opt/coins/data/kadena/kda-indexer/mainnet01.replica [--copy]
+```
+
+- `DIR` must not exist or be empty, and must not lie inside the source data dir. Without
+  `--copy` it must be on the same filesystem as the source: the segment files are
+  **hard-linked** (they are immutable), so the snapshot costs almost no extra space until a
+  merge replaces files in the source. With `--copy` they are copied and `fsync`ed.
+- Order: the command begins a read transaction on the hot store, reads `segments/manifest.json`,
+  links every file it names, writes the manifest bytes, then writes a **compacted** copy of
+  the hot store from that same transaction into `DIR/hot`. If a merge removes a step file
+  before it is linked, the manifest is read again and the missing links are redone (up to
+  five reads). Files of an earlier read that the final manifest no longer names are removed.
+- Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`.
+- `DIR/SNAPSHOT.json` records the format versions, network, frozen frontier, `next_txnum`, the
+  tail checkpoint per chain, the manifest's blake3, the binary version and the creation time
+  (no paths).
+- The read transaction stays open for the whole hot copy (minutes on a large store), so the
+  source writer cannot recycle the pages that transaction still sees. Do not start a snapshot
+  when the volume is short of free space; run the checks of "Before any big write" first.
+
+A local replica:
+
+```sh
+kda-indexer --config .../mainnet01.toml snapshot --out /opt/coins/data/kadena/kda-indexer/replica
+kda-indexer --config .../replica.toml serve        # replica.toml: data_dir of the snapshot, own api.* ports
+```
+
+To seed another host, snapshot with `--copy` (or hard-link locally, then copy), then
+`rsync -aH SNAPSHOT_DIR/ other-host:/opt/coins/data/kadena/kda-indexer/mainnet01/` (`-H` keeps
+the hard links that exist inside the copy). See "A second host from a snapshot" in
+[install.md](install.md). A `run` on the copy catches up from the snapshot's checkpoints: it
+follows the node block by block and resolves duplicate hot rows below the frozen frontier at
+start, as after a crash during a freeze. A snapshot that is older than the node's history is
+not a problem; one that is older than the tail can follow quickly is just slower to catch up.
+
 ## Before any big write
 
 Before a backfill, a merge of many ranges, a rebuild or a replica copy on a host with shared

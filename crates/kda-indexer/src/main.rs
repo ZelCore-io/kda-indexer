@@ -136,6 +136,19 @@ enum Command {
         #[command(subcommand)]
         what: VerifyWhat,
     },
+    /// Write a consistent copy of the data dir (hard-linked segments, compacted hot store).
+    /// Reads only; can run beside a live `run`. The result is a data dir for `serve` and `run`.
+    Snapshot {
+        /// New directory (must not exist or be empty).
+        #[arg(long)]
+        out: PathBuf,
+        /// Source data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Copy the segment files instead of hard-linking (another filesystem).
+        #[arg(long)]
+        copy: bool,
+    },
     /// Frozen segments: list the manifest, check files and indexes.
     Segments {
         #[command(subcommand)]
@@ -418,6 +431,15 @@ async fn main() -> anyhow::Result<()> {
             sample,
             all,
             json,
+        }),
+        Command::Snapshot {
+            out,
+            data_dir,
+            copy,
+        } => kda_indexer::cmd::snapshot::run(kda_indexer::cmd::snapshot::SnapshotArgs {
+            data_dir: data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+            out,
+            copy,
         }),
         Command::Segments { action } => match action {
             SegmentsAction::List { data_dir, json } => {

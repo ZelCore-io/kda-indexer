@@ -189,6 +189,32 @@ sudoedit /etc/kda-indexer/compare-mainnet01.toml
 sudo systemctl start kda-compare@mainnet01
 ```
 
+## A second host from a snapshot
+
+A second host (a read replica, or a standby) starts from a snapshot of a running one
+instead of a full backfill. On the source host (the unit keeps running):
+
+```sh
+sudo -u kda-indexer kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
+    snapshot --out /opt/coins/data/kadena/kda-indexer/snapshot-copy --copy
+```
+
+On the new host, install the package as above, but leave the data dir empty, stop the unit,
+and copy the snapshot in (the directory must end up owned by `kda-indexer`):
+
+```sh
+rsync -aH --delete source-host:/opt/coins/data/kadena/kda-indexer/snapshot-copy/ \
+    /opt/coins/data/kadena/kda-indexer/mainnet01/
+sudo chown -R kda-indexer:kda-indexer /opt/coins/data/kadena/kda-indexer/mainnet01
+sudo systemctl start kda-indexer-mainnet01
+```
+
+The service resumes the tail from the checkpoints in the snapshot and reaches lag 0 in
+minutes to hours depending on the snapshot's age. Use `serve` instead of `run` for a replica
+that must not ingest. Delete `snapshot-copy` on the source host when the copy is done. The
+node, config and ports of the new host are its own. See "Snapshots and replicas" in
+[operations.md](operations.md).
+
 ## Upgrade
 
 Build the new package and `dpkg -i` it. The config and your drop-ins stay. Instances that were

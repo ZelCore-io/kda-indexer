@@ -88,13 +88,29 @@ impl Manifest {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
         };
-        let m: Manifest =
-            serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
+        Manifest::parse(&b)
+            .with_context(|| format!("parse {}", p.display()))
+            .map(Some)
+    }
+
+    /// Parse and validate `manifest.json` bytes (refuses another `format_version`).
+    pub fn parse(b: &[u8]) -> Result<Manifest> {
+        let m: Manifest = serde_json::from_slice(b).context("manifest json")?;
         if m.format_version != FORMAT_VERSION {
             bail!(format_refusal(u64::from(m.format_version)));
         }
         m.validate()?;
-        Ok(Some(m))
+        Ok(m)
+    }
+
+    /// Every file the manifest references (all kinds of every range or step, side files of
+    /// the nippy-jar containers included), without the manifest itself.
+    pub fn files(&self) -> Vec<std::path::PathBuf> {
+        self.entries
+            .iter()
+            .flat_map(|e| crate::files::range_file_names(&self.network, e.start, e.end))
+            .map(std::path::PathBuf::from)
+            .collect()
     }
 
     /// Entries contiguous in heights and TxNums; frontier and next_txnum match the last entry.
