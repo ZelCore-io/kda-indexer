@@ -21,7 +21,7 @@ pub mod snapshot;
 pub use build::{dry_run, estimate, progress, rebuild, BuildOpts, Estimate, RebuildReport};
 pub use census::{distinct_code_keys, Census};
 pub use manifest::SearchManifest;
-pub use query::{grams, Candidates, SearchError, Searcher};
+pub use query::{grams, Candidates, SearchError, Searcher, Window};
 pub use schema::{Doc, Fields, SearchWriter};
 
 /// tantivy version the index is written with (pinned exactly in the workspace).

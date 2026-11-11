@@ -17,6 +17,7 @@
 //! (max 50, the newest 1,000 txs of the pact considered, R-P5P9-3); height and paging
 //! parameters are ignored and no `Chainweb-Next` is sent, as chainweb-data does.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -95,9 +96,11 @@ pub async fn handler(
 }
 
 /// One `TxSummary` row per user tx; with `like`, only txs whose own exec code matches it
-/// (the scan path; index candidates are verified already).
+/// (the scan path); with `hashes`, only txs whose exec code hashes to one of them (the index
+/// path: posting entities are 8-byte prefixes).
 struct Summaries {
     like: Option<Like>,
+    hashes: Option<HashSet<[u8; 16]>>,
 }
 
 impl RowSource for Summaries {
@@ -109,6 +112,13 @@ impl RowSource for Summaries {
             return Ok(Vec::new());
         };
         if self.like.as_ref().is_some_and(|l| !l.matches(&code)) {
+            return Ok(Vec::new());
+        }
+        if self
+            .hashes
+            .as_ref()
+            .is_some_and(|h| !h.contains(&kdx_types::blake2b_128(code.as_bytes())))
+        {
             return Ok(Vec::new());
         }
         Ok(vec![(0, 0)])
@@ -149,16 +159,28 @@ pub enum IndexPath {
     None,
 }
 
-/// Ask the code index for `raw` (`complete`: refuse a fallback-mode index that may miss
-/// short bodies).
-pub fn index_path(ctx: &SearchCtx, raw: &str, until: Instant, complete: bool) -> IndexPath {
+/// Ask the code index for `raw` with heights `min..=max` (`complete`: refuse a fallback-mode
+/// index that may miss short bodies).
+pub fn index_path(
+    view: &View,
+    ctx: &SearchCtx,
+    raw: &str,
+    (min, max): (Option<u32>, Option<u32>),
+    until: Instant,
+    complete: bool,
+) -> IndexPath {
     let Some(s) = ctx.index.get() else {
         return IndexPath::None;
     };
     if complete && !index_covers(&s.manifest, raw) {
         return IndexPath::None;
     }
-    match s.candidates(&Like::new(raw), until) {
+    let w = kdx_search::Window {
+        lo: u64::from(min.unwrap_or(0)),
+        hi: max.map_or(u64::MAX, u64::from),
+        upper_from: u64::from(view.code_upper_from(s.manifest.rebuilt_through_height)),
+    };
+    match s.candidates(&Like::new(raw), w, until) {
         Ok(c) => {
             if c.truncated {
                 rejected("cap");
@@ -193,6 +215,12 @@ pub fn index_path(ctx: &SearchCtx, raw: &str, until: Instant, complete: bool) ->
     }
 }
 
+/// Now plus half of the time left to the request deadline.
+pub fn half_left(view: &View) -> Instant {
+    let now = Instant::now();
+    now + view.deadline.saturating_duration_since(now) / 2
+}
+
 fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiResult<Page> {
     let empty = |truncated| Page {
         rows: Vec::new(),
@@ -212,7 +240,7 @@ fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiResul
         max_heights: set.max_scan_heights.max(1),
         until,
     };
-    match index_path(ctx, raw, until, true) {
+    match index_path(view, ctx, raw, (pg.min_height, max_h), until, true) {
         IndexPath::Hits {
             hits,
             rebuilt_through,
@@ -224,19 +252,28 @@ fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiResul
                 chain: None,
                 before: None,
             };
-            let keys = view.code_txs(&hits, rebuilt_through, q)?;
-            let mut src = Summaries { like: None };
+            // Starting the walks and reading rows each get half of what is left of the
+            // request deadline (at least the search budget).
+            let (keys, cut) = view.code_txs(&hits, rebuilt_through, q, half_left(view))?;
+            let mut src = Summaries {
+                like: None,
+                hashes: Some(hits.iter().map(|h| h.hash).collect()),
+            };
+            let rows = ScanLimits {
+                until: until.max(half_left(view)),
+                ..limits
+            };
             let mut page = collect_page(
                 view,
                 Candidates::Keys(keys.peekable()),
                 &mut src,
                 pg,
-                Some(limits),
+                Some(rows),
             )?;
-            if page.truncated {
+            if page.truncated || cut {
                 rejected("timeout");
             }
-            page.truncated |= capped;
+            page.truncated |= capped || cut;
             Ok(page)
         }
         // Nothing found in time: no token (it would repeat the same query).
@@ -253,6 +290,7 @@ fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiResul
             }
             let mut src = Summaries {
                 like: Some(Like::new(raw)),
+                hashes: None,
             };
             let page = collect_page(
                 view,

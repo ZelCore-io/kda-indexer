@@ -17,6 +17,7 @@
 //! shape: events whose qualified name or parameter text contains `q`.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,12 +31,12 @@ use serde_json::json;
 use super::{
     as_of, list_params, page_rows, parse_query, txs::summary, ListParams, Lp, Order, St, Q,
 };
-use crate::compat::search::{index_path, IndexPath};
+use crate::compat::search::{half_left, index_path, IndexPath};
 use crate::compat::Paging;
 use crate::cursor::Cursor;
 use crate::search::{check_pattern, index_covers, literal_chars, rejected, ClientIp, SearchCtx};
 use crate::server::json;
-use crate::store::PostingQuery;
+use crate::store::{code_hit, PostingQuery};
 use crate::{ApiError, ApiResult};
 
 type QueryQ = Result<Query<Q>, axum::extract::rejection::QueryRejection>;
@@ -111,22 +112,33 @@ pub async fn code(
             let _permit = permit;
             let until = (Instant::now() + Duration::from_millis(ctx.settings.timeout_ms))
                 .min(view.deadline);
-            let (hits, rebuilt_through, capped) = match index_path(&ctx, &pat, until, false) {
-                IndexPath::Hits {
-                    hits,
-                    rebuilt_through,
-                    capped,
-                } => (hits, rebuilt_through, capped),
-                IndexPath::Timeout => {
-                    return Ok(json(&json!({
-                        "items": [], "next_cursor": null, "truncated": true,
-                        "partial": false, "as_of": as_of(view)?,
-                    })))
-                }
-                IndexPath::None => {
-                    return Err(ApiError::Unavailable("no code index is built".into()))
-                }
+            // Keys up to and including the cursor's tx (it may have rows left).
+            let before = lp
+                .cursor
+                .as_ref()
+                .map(|c| TxKey(c.key.0.saturating_add(0x100)));
+            let max_h = match (lp.max_height, before) {
+                (Some(m), Some(b)) => Some(m.min(b.height())),
+                (m, b) => m.or(b.map(|b| b.height())),
             };
+            let window = (lp.min_height, max_h);
+            let (hits, rebuilt_through, capped) =
+                match index_path(view, &ctx, &pat, window, until, false) {
+                    IndexPath::Hits {
+                        hits,
+                        rebuilt_through,
+                        capped,
+                    } => (hits, rebuilt_through, capped),
+                    IndexPath::Timeout => {
+                        return Ok(json(&json!({
+                            "items": [], "next_cursor": null, "truncated": true,
+                            "partial": false, "as_of": as_of(view)?,
+                        })))
+                    }
+                    IndexPath::None => {
+                        return Err(ApiError::Unavailable("no code index is built".into()))
+                    }
+                };
             let partial = ctx
                 .index
                 .get()
@@ -138,13 +150,13 @@ pub async fn code(
                 min_height: lp.min_height,
                 max_height: lp.max_height,
                 chain: lp.chain,
-                // Keys up to and including the cursor's tx (it may have rows left).
-                before: lp
-                    .cursor
-                    .as_ref()
-                    .map(|c| TxKey(c.key.0.saturating_add(0x100))),
+                before,
             };
-            let keys = view.code_txs(&hits, rebuilt_through, pq)?;
+            // Starting the walks and reading rows each get half of what is left of the
+            // request deadline (at least the search budget).
+            let (keys, cut_walks) = view.code_txs(&hits, rebuilt_through, pq, half_left(view))?;
+            let until = until.max(half_left(view));
+            let hashes: HashSet<[u8; 16]> = hits.iter().map(|h| h.hash).collect();
             // Stop pulling keys at the search deadline; resume after the last one read.
             let last: Cell<Option<TxKey>> = Cell::new(None);
             let cut: Cell<Option<TxKey>> = Cell::new(None);
@@ -159,12 +171,18 @@ pub async fn code(
                 Some(r)
             });
             let (items, mut next) = page_rows(view, timed, &lp, |view, r, blocks| {
+                if !code_hit(r, &hashes) {
+                    return Ok(vec![]);
+                }
                 let Some(b) = blocks.get(view, r.key.chain(), r.key.height())? else {
                     return Ok(vec![]);
                 };
                 Ok(vec![(0, summary(view, r, b)?)])
             })?;
-            let mut truncated = capped;
+            if cut_walks {
+                rejected("timeout");
+            }
+            let mut truncated = capped || cut_walks;
             if next.is_none() {
                 if let Some(k) = cut.get() {
                     rejected("timeout");

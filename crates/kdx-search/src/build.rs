@@ -757,7 +757,7 @@ mod tests {
         let s = Searcher::open(&new, 100).unwrap().unwrap();
         let far = Instant::now() + Duration::from_secs(10);
         let hits = s
-            .candidates(&Like::new("recurring.body"), far)
+            .candidates(&Like::new("recurring.body"), crate::Window::ALL, far)
             .unwrap()
             .hashes;
         assert_eq!(hits.len(), 1);
@@ -808,7 +808,10 @@ mod tests {
     fn count(data: &std::path::Path, pat: &str) -> usize {
         let s = Searcher::open(&search_dir(data), 100).unwrap().unwrap();
         let far = Instant::now() + Duration::from_secs(10);
-        s.candidates(&Like::new(pat), far).unwrap().hashes.len()
+        s.candidates(&Like::new(pat), crate::Window::ALL, far)
+            .unwrap()
+            .hashes
+            .len()
     }
 
     /// I-2: a rebuild that swaps `search/` while the stage holds docs never gets the stage's

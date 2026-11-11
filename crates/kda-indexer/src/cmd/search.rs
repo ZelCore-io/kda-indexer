@@ -87,7 +87,11 @@ pub fn query(cfg: &Config, data_dir: PathBuf, pattern: &str, show: usize) -> any
         .with_context(|| format!("{} has no index: run `search rebuild`", dir.display()))?;
     let like = Like::new(pattern);
     let t0 = Instant::now();
-    match se.candidates(&like, t0 + Duration::from_millis(s.timeout_ms)) {
+    match se.candidates(
+        &like,
+        kdx_search::Window::ALL,
+        t0 + Duration::from_millis(s.timeout_ms),
+    ) {
         Ok(c) => {
             for (h, f, l) in c.hashes.iter().take(show) {
                 println!(
