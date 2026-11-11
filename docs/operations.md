@@ -21,7 +21,7 @@ skipped, with an ERROR line.
 To recover:
 
 1. Stop the indexer.
-2. Find the chain and the fork height in the ERROR line (`hot stats` shows the counters).
+2. Find the chain and the fork height in the ERROR line (`hot stats` prints every counter with its value, one `counter <name> <n>` line each).
 3. If the stored branch must go, unwind it and clear the halt in one step:
 
    ```sh
