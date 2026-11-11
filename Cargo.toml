@@ -10,6 +10,8 @@ members = [
     "crates/kdx-hot",
     "crates/kdx-segment",
     "crates/kdx-ingest",
+    "crates/kdx-api",
+    "crates/kdx-metrics",
 ]
 # Vendored third-party code builds as a path dependency, not as a workspace member (no lints).
 exclude = ["vendor/ptr_hash"]
@@ -39,7 +41,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 toml = "1"
 axum = "0.8"
+http-body = "1"
 prometheus-client = "0.25"
+utoipa = { version = "5", features = ["preserve_order"] }
 # Vendored ptr_hash 2.1.3 (MIT) with the MPL-2.0 `colored` dependency removed (see vendor/ptr_hash).
 ptr_hash = { path = "vendor/ptr_hash" }
 sucds = "0.8"
@@ -58,6 +62,9 @@ hex = "0.4"
 bytes = "1"
 rayon = "1"
 libc = "0.2"
+arc-swap = "1"
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
+tower-http = { version = "0.6", features = ["cors", "limit"] }
 
 kdx-types = { path = "crates/kdx-types" }
 kdx-node = { path = "crates/kdx-node" }
@@ -65,7 +72,11 @@ kdx-decode = { path = "crates/kdx-decode" }
 kdx-hot = { path = "crates/kdx-hot" }
 kdx-segment = { path = "crates/kdx-segment" }
 kdx-ingest = { path = "crates/kdx-ingest" }
+kdx-api = { path = "crates/kdx-api" }
+kdx-metrics = { path = "crates/kdx-metrics" }
 
+# Spec 6.2. target-cpu stays generic so a package built on one node installs on the others.
+# If codegen-units = 1 makes the node build exceed ~20 minutes, say so in the run report.
 [profile.release]
 lto = "thin"
-codegen-units = 4
+codegen-units = 1

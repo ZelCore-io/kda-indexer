@@ -339,6 +339,7 @@ impl RangeWriter {
         self.block_samples.offer(&self.buf);
         self.bh.push(IndexKey::new(&b.block.hash, slot as u32));
         self.blocks_n += 1;
+        kdx_types::heartbeat::beat(kdx_types::heartbeat::Component::Ingest);
 
         for (tx, ix) in b.txs.iter().zip(&b.idx) {
             if tx.key.height() as u64 != h || tx.key.chain() != c || ix.key != tx.key {
@@ -394,10 +395,14 @@ impl RangeWriter {
         fs::create_dir_all(&tmp)?;
         let fname = |k: FileKind| file_name(&network, k, start, end);
 
-        let (txs_dict, blocks_dict) = rayon::join(
-            || tx_samples.train(opts.dict_bytes),
-            || block_samples.train(opts.dict_bytes),
-        );
+        let (txs_dict, blocks_dict) = {
+            let _alive =
+                kdx_types::heartbeat::KeepAlive::new(kdx_types::heartbeat::Component::Ingest);
+            rayon::join(
+                || tx_samples.train(opts.dict_bytes),
+                || block_samples.train(opts.dict_bytes),
+            )
+        };
         drop((tx_samples, block_samples));
         let (txs_dict_id, blocks_dict_id) = (dict_id(&txs_dict), dict_id(&blocks_dict));
         let (txs_dict_bytes, blocks_dict_bytes) = (txs_dict.len() as u64, blocks_dict.len() as u64);
@@ -447,7 +452,12 @@ impl RangeWriter {
             )?;
             let mut cur: Option<u64> = None;
             let mut vals: Vec<u32> = Vec::new();
-            for v in col.into_sorted()? {
+            let sorted = {
+                let _alive =
+                    kdx_types::heartbeat::KeepAlive::new(kdx_types::heartbeat::Component::Ingest);
+                col.into_sorted()?
+            };
+            for v in sorted {
                 let v = v?;
                 let ent = (v >> 64) as u64;
                 let rel = v as u64 as u32;

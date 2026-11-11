@@ -1,0 +1,28 @@
+#!/bin/sh
+# postrm for kda-indexer. Removal and purge never delete /opt/coins/data/kadena/kda-indexer
+# (the store is precious; deleting it is an explicit operator step) and never delete the
+# service user.
+set -e
+
+case "$1" in
+remove | purge)
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    if [ "$1" = purge ]; then
+        # dpkg has removed the conffile; drop the directory only if nothing else is in it
+        # (operator-made compare-*.toml files and drop-ins stay).
+        rmdir --ignore-fail-on-non-empty /opt/coins/kda-indexer/mainnet01/config \
+            /opt/coins/kda-indexer/mainnet01/bin /opt/coins/kda-indexer/mainnet01 \
+            /opt/coins/kda-indexer 2>/dev/null || true
+        echo "kda-indexer: /opt/coins/data/kadena/kda-indexer and the kda-indexer user are kept; remove them by hand if you are sure." >&2
+    fi
+    ;;
+upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+*)
+    echo "postrm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

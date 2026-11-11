@@ -1,0 +1,68 @@
+#!/bin/sh
+# postinst for kda-indexer (spec 6.3; layout per the owner's Blockbook-style ruling).
+# Creates the service user and directories, reloads systemd, enables the unit at boot on a
+# fresh install and (on upgrade) restarts it when it is running. It does not start the
+# service on a fresh install, and never changes ownership of an existing data tree.
+set -e
+
+USER_NAME=kda-indexer
+NETWORK=mainnet01
+UNIT=kda-indexer-$NETWORK.service
+APP_DIR=/opt/coins/kda-indexer/$NETWORK
+CONF_DIR=$APP_DIR/config
+DATA_ROOT=/opt/coins/data/kadena/kda-indexer
+
+case "$1" in
+configure)
+    if ! getent group "$USER_NAME" >/dev/null; then
+        addgroup --system "$USER_NAME"
+    fi
+    if ! getent passwd "$USER_NAME" >/dev/null; then
+        adduser --system --ingroup "$USER_NAME" --no-create-home \
+            --home /nonexistent --shell /usr/sbin/nologin \
+            --gecos "kda-indexer service" "$USER_NAME"
+    fi
+
+    # Config directory and the packaged conffile: readable by the service, not by others.
+    chown root:"$USER_NAME" "$CONF_DIR"
+    chmod 0750 "$CONF_DIR"
+    if [ -f "$CONF_DIR/$NETWORK.toml" ]; then
+        chgrp "$USER_NAME" "$CONF_DIR/$NETWORK.toml"
+        chmod 0640 "$CONF_DIR/$NETWORK.toml"
+    fi
+
+    # Data: create only what is missing. An existing tree (a mount point, or a store
+    # somebody moved in) is left exactly as it is, no recursive chown.
+    for d in /opt/coins/data /opt/coins/data/kadena "$DATA_ROOT"; do
+        if [ ! -d "$d" ]; then
+            install -d -m 0755 -o root -g root "$d"
+        fi
+    done
+    if [ ! -d "$DATA_ROOT/$NETWORK" ]; then
+        install -d -m 0750 -o "$USER_NAME" -g "$USER_NAME" "$DATA_ROOT/$NETWORK"
+    fi
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        if [ -z "$2" ]; then
+            # Fresh install: start at boot, but do not start now (check the config first).
+            systemctl enable "$UNIT" || true
+        else
+            # Upgrade: restart the service if it is running; a stopped one stays stopped.
+            systemctl try-restart "$UNIT" || true
+        fi
+    fi
+
+    if [ -z "$2" ]; then
+        echo "kda-indexer: installed and enabled at boot, not started. Check $CONF_DIR/$NETWORK.toml, then:" >&2
+        echo "  systemctl start $UNIT   (see /usr/share/doc/kda-indexer/install.md)" >&2
+    fi
+    ;;
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+*)
+    echo "postinst called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

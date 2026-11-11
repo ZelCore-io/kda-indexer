@@ -11,14 +11,14 @@ json_path_glob = "/**"
 condition = "any"
 request_contains = "search="
 reason = "Event text search only covers a bounded recent window in kda-indexer (decision Q2); chainweb-data scans further back, so older matches differ."
-owner_note = "Accepted by the owner. Exact module/name event queries are not covered by this entry."
+owner_note = "Accepted by the owner. Exact module/name event queries are not covered by this entry. Also covers the minimum search length (kda-indexer 400, chainweb-data 200 on short strings): known G2, compat is to match chainweb-data in the fix round (run 3E ruling R3E-6)."
 
 [[entry]]
 id = "orphan-rows-txs"
-route = "txs"
+route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
-reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing."
+reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing. Against chainweb-data (no oracle) the rows of blocks other than A's go under /orphans (the node pair checks that A's block is canonical), and chainweb-data's /txs/tx answers 404 for such a request key (seen live: YbvRG1..., chain 2, canonical block QCOhs8... and orphan du_5-bB... at one height); the harness then confirms with one /txs/txs call and reports /orphans."
 owner_note = "Builder call (spec section 4.5): orphans are not kept."
 
 [[entry]]
@@ -41,12 +41,12 @@ owner_note = "Accepted by the owner; only applies once the GraphQL adapter is co
 # --- From the first live runs (P1, chainweb-data vs node oracle) ---
 
 [[entry]]
-id = "genesis-txs-not-indexed"
-route = "*"
-json_path_glob = "/@genesis"
+id = "genesis-multi-chain-tx"
+route = "tx"
+json_path_glob = "/~genesis-multi-chain"
 condition = "b_extra"
-reason = "chainweb-data does not serve transactions of genesis blocks (height 0 on chains 0-9, 852054 on chains 10-19); /txs/tx answers 404 and /txs/txs []. The node has them."
-owner_note = "kda-indexer serves them; P3 will show the reverse difference against chainweb-data. Decide whether compat mode should hide them."
+reason = "Some genesis txs repeat their request key across chains (seen live: 48T0LjAn... in the genesis blocks of all 20 chains, xJHaykvaH... on chains 10-19). chainweb-data's /txs/txs lists every row and its /txs/tx answers 404 for a request key with several rows; compat does the same (F4). Against the node's /poll on one chain, compat's /txs/tx 404 moves here only when compat's /txs/txs lists the request key in that chain's canonical genesis block and in at least one other genesis block."
+owner_note = "Compat behaviour by design (F4 fix, run 3E-g): matches chainweb-data. Replaces genesis-txs-not-indexed (G1 fixed: compat serves genesis txs on /txs/tx and /txs/txs, so a genesis 404 against chainweb-data is a diff again)."
 
 [[entry]]
 id = "failed-tx-callstack"
@@ -63,3 +63,143 @@ json_path_glob = "/result/error/info"
 condition = "changed"
 reason = "For failed txs chainweb-data's error info has the source position at execution time (\"<interactive>:0:11937\"); the node serves \"<toplevel>:0\"."
 owner_note = "Same txs as failed-tx-callstack."
+
+# --- Harness tolerances reported as visible hits (P3, Task 7) ---
+
+[[entry]]
+id = "stats-supply-tolerance"
+route = "stats"
+json_path_glob = "/coinsInCirculation~tolerance"
+condition = "changed"
+reason = "Both sides compute the circulating supply at their own tip height and time; values within a relative 1e-6 are accepted. Larger differences are reported at /coinsInCirculation."
+owner_note = "Tolerance from the P3 plan (Task 7)."
+
+# --- From the live comparison on the full store (P3, Task 8 / run 3E) ---
+
+[[entry]]
+id = "cwd-throttled-page"
+route = "*"
+json_path_glob = "/~page-cut"
+condition = "changed"
+reason = "chainweb-data pages hold limit x a throttling factor rows and still carry a Chainweb-Next token, so after the same number of followed pages it has fewer rows. The harness cuts both sides to the heights the shorter side covered completely and reports this visible hit; rows above the cut are compared as usual."
+owner_note = "Accepted in the P3 controller rulings (run 3C finding)."
+
+[[entry]]
+id = "cwd-txcount-not-canonical"
+route = "stats"
+json_path_glob = "/transactionCount"
+condition = "changed"
+reason = "chainweb-data's transactionCount is pg_class.reltuples of a transactions table that is never analyzed, so the value is frozen (200,841,520 on 2026-11-10 while the table holds 233,094,876 rows). Its rows also include txs of orphaned blocks and miss blocks it never fetched. kda-indexer counts canonical user txs exactly (229.9M); per-height windows match chainweb-data where it holds no orphans or gaps."
+owner_note = "Accepted (run 3E ruling R3E-4). Without it /stats can never be within 1%: the reference value is stale, not an estimate."
+
+[[entry]]
+id = "cwd-page-boundary-dup"
+route = "*"
+json_path_glob = "/~page-dup"
+condition = "changed"
+reason = "chainweb-data can start a Chainweb-Next page with the last row of the previous page (seen live on /txs/account with throttled pages: the same transfer, same chain and idx, twice in a row). The harness drops the repeated row (never a transfer to oneself, which chainweb-data lists twice on purpose) and reports this visible hit; kda-indexer pages never repeat a row."
+owner_note = "Accepted (run 3E ruling R3E-5): chainweb-data paging bug."
+
+[[entry]]
+id = "search-route-p6"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+reason = "/txs/search (pactid and search) is a should route built in P6; until then compat answers 404 and chainweb-data 200."
+owner_note = "Out of scope for P3/P4 (plan header); not a must route, so it never gates. Remove in P6."
+
+[[entry]]
+id = "cwd-transfers-gap"
+route = "account"
+json_path_glob = "/~cwd-transfers-gap"
+condition = "any"
+reason = "chainweb-data's transfers table misses some rows whose TRANSFER event it holds in its events table (seen live: erkng6rS... at 1595413, TI1Kfck... at 1687775 and Sd2fLvTg... at 1685777, all chain 0: events present, transfers rows absent, so /txs/account leaves them out). The harness moves an A-only row here only when B lists no row of its own and chainweb-data's own /txs/tx for that request key, in the same block, carries the matching {token}.TRANSFER event."
+owner_note = "Accepted (run 3E ruling R3E-9): chainweb-data data gap, kda-indexer derives transfers from the events it indexes."
+
+[[entry]]
+id = "oracle-event-order"
+route = "*"
+json_path_glob = "/~event-order"
+condition = "changed"
+reason = "chainweb-data (/txs/tx, /txs/txs) and kda-txs (/v1/txs) list some txs' events in another order than the node's output (seen live: 5xNbYLRE... and vjUp8NVn..., chain 2; node and kda-indexer [coin.TRANSFER, coin.TRANSFER_XCHAIN, coin.TRANSFER, pact.X_YIELD], both oracles [coin.TRANSFER, coin.TRANSFER, coin.TRANSFER_XCHAIN, pact.X_YIELD]). Against these oracles a tx's events compare as a multiset and this visible hit is reported; the node pair still checks the order."
+owner_note = "Accepted (run 3E ruling R3E-9): kda-indexer keeps the node's order."
+
+[[entry]]
+id = "oracle-orphan-rows"
+route = "*"
+json_path_glob = "/orphans**"
+condition = "any"
+reason = "chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height, or, where kda-indexer lists no row at that chain and height, after the node's canonical block there is another one (seen live: k:b649fd12...?token=coin, chainweb-data row in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M)."
+owner_note = "Accepted (run 3E ruling R3E-9); extends orphan-rows-txs (spec section 4.5: orphans are not kept). Also covers chainweb-data coinbase rows at an A height in another block (no request key to match), node-confirmed the same way."
+
+[[entry]]
+id = "oracle-tip-lag"
+route = "*"
+json_path_glob = "/~oracle-lag**"
+condition = "any"
+reason = "chainweb-data lags kda-indexer and fills recent heights late (seen live 2026-11-10: its /txs/recent at the tip while /txs/account still missed rows 1-4 h old, e.g. xwallet-xchain-gas at 7392405 and 7392384; kda-txs likewise). Account, event and /v1/txs rows of the last 1440 heights (12 h) below A's tip are dropped on both sides, then a side that held its full limit is cut at its lowest height on both sides; on /stats a supply higher on A by at most 60 KDA per height of tip difference (at least 240 heights) is not compared; on /txs/recent a continuation whose initialCode/previousSteps chainweb-data still shows null is reported here. All leave this visible hit."
+owner_note = "Accepted (run 3E ruling R3E-11): oracle lag, not a kda-indexer diff."
+
+[[entry]]
+id = "oracle-unstable"
+route = "v1txs"
+json_path_glob = "/~oracle-unstable"
+condition = "any"
+reason = "kda-txs is fed by its own indexer and can answer the same /v1/txs request differently moments apart (seen live: set shifts at /0 that were gone when both sides were fetched again). A /v1/txs diff against kda-txs is retried once after 30 s (seen live: a partial answer, 20 of 41 rows, that was whole minutes later); when the retry agrees, this visible hit replaces the diff."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c)."
+
+[[entry]]
+id = "oracle-limit-edge"
+route = "v1txs"
+json_path_glob = "/~limit-edge"
+condition = "any"
+reason = "kda-txs can return one row fewer than the limit (seen live: xwallet-xchain-gas/coin/250, 250 rows on kda-indexer, 249 on kda-txs, the extra row the oldest at 7385234). When one side holds exactly `limit` rows and the counts differ, both keep only the rows above the higher of the two lowest heights; this visible hit is reported."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c)."
+
+[[entry]]
+id = "cwd-cursor-coinbase-skip"
+route = "*"
+json_path_glob = "/~cwd-cursor-skip"
+condition = "any"
+reason = "chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain, so a page that ends on a coinbase row makes the next page skip the coinbase rows of the other chains at that height (seen live: /txs/events?modulename=coin&name=TRANSFER&minheight=3293727&maxheight=3293927, cursor ((3293927,\"cb\",0),0), chainweb-data 13 rows at 3293927 over three pages, kda-indexer all 23). The harness drops that height on both sides and reports this visible hit."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c): chainweb-data pagination defect; compat lists every row."
+
+[[entry]]
+id = "kdatxs-gap"
+route = "v1txs"
+json_path_glob = "/~kdatxs-gap"
+condition = "any"
+reason = "kda-txs leaves out some /v1/txs rows in canonical blocks (seen live: 28481ce2... chain 0 height 1288814, 1 row on kda-indexer, none on kda-txs; xwallet-xchain-gas chain 5 height 7386167). An A-only row, when kda-txs lists no row of its own, moves here only when chainweb-data's /txs/tx for that request key is in the same block and has an event naming the account."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c): kda-txs data gap."
+
+[[entry]]
+id = "cwd-missing-node"
+route = "account"
+json_path_glob = "/~cwd-missing-node"
+condition = "any"
+reason = "chainweb-data leaves out account rows the node holds (seen live: 7590fd61...?chain=0&limit=50, 7 rows and no Chainweb-Next on every refetch, kda-indexer 50; 6d87fd6e...?minheight=1151496&maxheight=1153496, no rows, kda-indexer 35 in node block 6tpjetrL at chain 0 height 1152748; k:5adb1666... rows at heights 7306102-7306103 on several chains). When both sides held their full limit they are first cut at the higher of their lowest heights. With no row only chainweb-data lists, every row only kda-indexer lists must be in the same block on the node's /poll, with an event naming the account; those rows move here. Rows match by (requestKey, blockHash, idx), so value diffs of shared rows stay diffs. A cut that alone leaves no row on either side only is reported here too (rows 0; seen live: 99cb7008...?minheight=6040728&maxheight=6042728, both pages full at one height, ordered differently within it)."
+owner_note = "ACCEPTED (owner ruling R3E-14, run 3E-d): node agrees with kda-indexer, so chainweb-data's missing rows and short pages without a next-page token are chainweb-data defects."
+
+[[entry]]
+id = "kdatxs-missing-node"
+route = "v1txs"
+json_path_glob = "/~kdatxs-missing-node"
+condition = "any"
+reason = "kda-txs answers a varying subset of an account's /v1/txs rows (seen live: acc28032.../coin/250, 63, 54, 404 and 47 rows on four fetches, every row also on kda-indexer, which lists 125; 40a8967d.../coin/10, kda-txs never lists JxrH9wub... at chain 0 height 3697206, node block Cr4YV2QE). Same check as cwd-missing-node: both full -> cut at the higher lowest height; no kda-txs-only row; every kda-indexer-only row in the same block on the node's /poll with an event naming the account."
+owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-d): kda-txs data gap / unstable subset, confirmed per row on the node."
+
+[[entry]]
+id = "kdatxs-events-node"
+route = "v1txs"
+json_path_glob = "/~kdatxs-events-node"
+condition = "any"
+reason = "kda-txs answers a row's events differently from one fetch to the next (seen live: k:d763d377.../coin/50 and k:e4f0a329.../coin/50, the gas TRANSFER and the main TRANSFER with from/to and amounts that disagreed, gone on a refetch). Rows both sides list (by requestKey, blockHash, idx) whose events differ are polled on the node (at most 25 per compare); only when the node has every such tx in kda-indexer's block with kda-indexer's events (as a multiset) are kda-txs's events replaced by kda-indexer's, and this visible hit is reported."
+owner_note = "Oracle defect class under ruling R3E-15 (node agrees with kda-indexer, kda-txs differs); added in run 3E-g."
+
+[[entry]]
+id = "cwd-events-missing-node"
+route = "events"
+json_path_glob = "/~cwd-events-missing-node"
+condition = "any"
+reason = "chainweb-data lacks the events of whole height ranges (seen live 2026-11-11: no coin.TRANSFER event at heights 7392632-7392963, about 2.8 h of 2026-11-10, while its tip was at 7395650, so its /txs/events pages skip those heights). kda-indexer rows at a height above chainweb-data's lowest listed height where chainweb-data lists no row at all move here only when the node confirms every one: a user tx in the same block on /poll with an event of the same name and params, a coinbase row in the node's canonical block at its (chain, height). With both pages full, both sides are then cut at the higher of their lowest heights."
+owner_note = "Oracle defect class under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); added in run 3E-g. Triage sample: 22/22 user rows confirmed on /poll, 99/100 coinbase rows with the node's only header equal to kda-indexer's block (the 100th at a forked height, kda-indexer's block among the two)."

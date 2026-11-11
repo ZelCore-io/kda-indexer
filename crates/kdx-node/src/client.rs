@@ -214,6 +214,7 @@ impl NodeClient {
     }
 
     fn record(&self, endpoint: &str, status: u16, secs: f64) {
+        kdx_metrics::get().node_request(endpoint, status, secs);
         let mut g = self.shared.stats.lock().unwrap();
         let e = g.entry((endpoint.to_string(), status)).or_insert((0, 0.0));
         e.0 += 1;

@@ -89,7 +89,15 @@ enum Command {
         #[arg(long, default_value = "auto", hide = true)]
         header_mode: kdx_ingest::HeaderMode,
     },
+    /// Serve the APIs read-only over a data dir another process writes (no ingest, no lock).
+    Serve {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Dev: `run` without the freezer.
+    /// Print the OpenAPI document of the native API (no config needed).
+    #[command(hide = true)]
+    Openapi,
     #[command(hide = true)]
     Tail {
         #[arg(long)]
@@ -198,6 +206,13 @@ enum InspectWhat {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Dev: loop read views (postings walk, request-key lookups, cursors) for N seconds
+    /// beside a running indexer; reports duplicates, order breaks, lookup misses, errors.
+    #[command(hide = true)]
+    ViewCheck {
+        #[arg(long, default_value_t = 600)]
+        seconds: u64,
+    },
     /// Random frozen and hot txs; with --compare-node, refetch each block and require
     /// byte-identical rendered tx, output, miner data and an equal header.
     Sample {
@@ -229,8 +244,13 @@ fn init_logging(log: &LogConfig) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Openapi) {
+        println!("{}", kdx_api::openapi::json());
+        return Ok(());
+    }
     let cfg = Config::load(&cli.config)?;
     init_logging(&cfg.log);
+    kdx_metrics::init(&cfg.network, env!("CARGO_PKG_VERSION"), env!("KDX_GIT_SHA"));
     match cli.command {
         Command::Config {
             action: ConfigAction::Check,
@@ -241,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Openapi => Ok(()),
         Command::Probe { smoke, out } => kda_indexer::cmd::probe::run(&cfg, smoke, out).await,
         Command::Dump {
             from,
@@ -303,6 +324,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Serve { data_dir } => {
+            kda_indexer::cmd::serve::run(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir)).await
+        }
         Command::Tail {
             data_dir,
             start_height,
@@ -343,6 +367,12 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Inspect { data_dir, what } => {
             use kda_indexer::cmd::inspect;
+            if let InspectWhat::ViewCheck { seconds } = what {
+                return kda_indexer::cmd::viewcheck::run(
+                    data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                    seconds,
+                );
+            }
             let s = inspect::Store::open(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir))?;
             match what {
                 InspectWhat::Tx { reqkey } => inspect::tx(&s, &reqkey),
@@ -358,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
                     count,
                     compare_node,
                 } => inspect::sample(&cfg, &s, count, compare_node).await,
+                InspectWhat::ViewCheck { .. } => unreachable!("handled above"),
             }
         }
         Command::Measure {

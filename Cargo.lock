@@ -92,6 +92,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ad8689a486416c401ea15715a4694de30054248ec627edbf31f49cb64ee4086"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1159,6 +1168,8 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1239,9 +1250,11 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "kdx-api",
  "kdx-decode",
  "kdx-hot",
  "kdx-ingest",
+ "kdx-metrics",
  "kdx-node",
  "kdx-segment",
  "kdx-types",
@@ -1256,6 +1269,33 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zstd",
+]
+
+[[package]]
+name = "kdx-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "axum",
+ "base64 0.22.1",
+ "http-body",
+ "kdx-decode",
+ "kdx-hot",
+ "kdx-metrics",
+ "kdx-segment",
+ "kdx-types",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]
@@ -1313,6 +1353,7 @@ dependencies = [
  "futures",
  "kdx-decode",
  "kdx-hot",
+ "kdx-metrics",
  "kdx-node",
  "kdx-segment",
  "kdx-types",
@@ -1329,12 +1370,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kdx-metrics"
+version = "0.1.0"
+dependencies = [
+ "prometheus-client",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "kdx-node"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
  "hex",
+ "kdx-metrics",
  "reqwest",
  "rustls",
  "serde",
@@ -2585,6 +2637,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -2769,6 +2822,29 @@ name = "utf_types"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
+
+[[package]]
+name = "utoipa"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bde15df68e80b16c7d16b9616e80770ad158988daa56a27dccd1e55558b0160"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "utoipa-gen",
+]
+
+[[package]]
+name = "utoipa-gen"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "valuable"

@@ -145,6 +145,53 @@ on start).
 Raw spool: `etl/raw-{start}/raw-NNNNN.run`, sorted runs of `(height u32 BE, chain u8)` →
 `[header, payload]` JSON, zstd level 1, k-way merged in (height, chain) order.
 
+## Readers
+
+The API reads through `kdx_api::store::View`: one MDBX read txn plus one `Segments`
+snapshot, built in this order:
+
+1. open the read txn;
+2. `stat` `manifest.json` (dev, inode, mtime, size); when it changed since the last look,
+   reload it and open only the ranges that are new (readers of unchanged entries are shared);
+3. take the current `Segments` snapshot and read `frozen_frontier` (the hot frontier) in the
+   txn.
+
+Split rule: heights below the manifest frontier (`seg_frontier`) come from the segments;
+heights at or above `max(hot_frontier, seg_frontier)` come from hot rows; hot rows below
+`seg_frontier` are skipped.
+
+Why every tx is seen once or briefly not at all, never twice:
+
+- **Freeze.** The freezer commits the manifest before the MDBX txn that deletes the step's
+  hot rows. A read txn that no longer sees the rows was opened after that delete, so after the
+  manifest commit, and the stat in step 2 sees the new manifest. A txn that still sees the
+  rows may pair with either manifest; with the new one the rows are below `seg_frontier` and
+  skipped.
+- **Backfill.** A range commits MDBX (its names, `frozen_frontier`, `dict_lens@end`) before
+  the manifest and writes no hot rows, so heights between the two frontiers are briefly in
+  neither. A txn opened before that MDBX commit whose stat sees the new manifest would hold
+  segments with names it cannot resolve: when `seg_frontier > hot_frontier` and the txn has
+  no `dict_lens@{seg_frontier}`, the view reopens its txn (at most twice; after a freeze the
+  key is also absent until the hot delete, where the names came with the tail anyway).
+- **Merge.** The merged range replaces its steps in the manifest before the step files are
+  deleted. A snapshot that still lists the steps keeps their files mapped; deleted files stay
+  readable through those mmaps until the last view holding them is dropped. A manifest
+  reload that races the deletion retries.
+
+A view lives for one request (its deadline): a long read txn pins pages while the tail
+writes. Dictionary names come from a shared in-memory snapshot plus the view's txn for ids
+past it; the snapshot reloads in the background, in short read txns, when MDBX holds
+10,000 more names, after 60 s with any new name, or when MDBX holds fewer names than it (a
+backfill resume dropped names of an uncommitted range).
+
+Page cursors are a TxKey (stable when its step is frozen and merged), a sub-position and the
+first 4 bytes of the hash of the block `(chain, height)` the key points into; a cursor whose
+block hash changed or is gone answers `400 cursor invalidated by reorg`.
+
+The read-only open (`HotStore::open_ro`, used by `serve`, `inspect`, `hot stats`) is MDBX
+read-only mode: no geometry set, no write txn, no table created; it refuses a missing store,
+a missing table or another `format_version`.
+
 ## `range.toml`
 
 ```toml

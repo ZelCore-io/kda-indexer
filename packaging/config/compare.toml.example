@@ -1,18 +1,23 @@
-# kda-compare configuration (spec section 7). Copy to compare.local.toml (gitignored).
+# kda-compare configuration (spec section 7). Install as /etc/kda-indexer/compare-mainnet01.toml
+# for kda-compare@mainnet01 (create /var/lib/kda-indexer/compare-mainnet01 first, see install.md).
 network = "mainnet01"
 rate_rps = 5.0          # total across all targets
 timeout_ms = 30000
 follow_depth = 3        # pages followed via Chainweb-Next
 min_depth = 10          # sample heights at min(tip) - 10
 node_max_rps = 50       # node oracle and generator requests (own limit)
-allowlist = "compare/allowlist.toml"
-seeds = "compare/seeds/mainnet01.toml"
-# replay = "test-runs/replay-2026-11-08.tsv"   # from `kda-compare replay-import`
-out_dir = "test-runs/compare"
-metrics_bind = "127.0.0.1:31369"
+allowlist = "/usr/share/kda-indexer/compare/allowlist.toml"
+seeds = "/usr/share/kda-indexer/compare/seeds/mainnet01.toml"
+# replay = "/var/lib/kda-indexer/compare-mainnet01/replay.tsv"   # from `kda-compare replay-import`
+out_dir = "/var/lib/kda-indexer/compare-mainnet01/out"
+metrics_bind = "127.0.0.1:31368"   # 31369 is the indexer's admin port
 max_body_bytes = 8388608   # per target response, after decompression
-# (A, B): B is a target name or "node" (the node oracle).
+# (A, B): B is a target name or "node" (the node oracle). A pair compares only the requests
+# both sides serve: chainweb_data serves every compat route but /v1/txs, kda_txs and
+# kda_txs_via_cwd only /v1/txs, kda_indexer_compat all of them.
 pairs = [["cwd", "node"]]
+# With the compat API running (target "compat" below):
+# pairs = [["compat", "cwd"], ["compat", "kdatxs"], ["compat", "node"]]
 
 [node]
 url = "http://127.0.0.1:31351"
@@ -27,6 +32,13 @@ kind = "chainweb_data"
 # [targets.compat]
 # url = "http://127.0.0.1:31362"
 # kind = "kda_indexer_compat"
+
+# /v1/txs oracle: kda-txs behaviour composed from chainweb-data calls (no live kda-txs
+# needed). The url is a chainweb-data instance; every call shares the rate limit above, and a
+# request costs up to 2 * limit + 2 calls. A live kda-txs would be kind = "kda_txs".
+# [targets.kdatxs]
+# url = "http://127.0.0.1:31352"
+# kind = "kda_txs_via_cwd"
 
 [mix]
 replay = 0.5

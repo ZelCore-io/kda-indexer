@@ -18,13 +18,50 @@ const MAX_DRAWS: u32 = 30;
 /// Heights per draw: one `header/branch` and one payload batch for the whole window, then one
 /// non-empty block of the window is picked uniformly.
 const WINDOW: u64 = 20;
-/// At most this many accounts and event kinds per sampled tx.
-const MAX_ACCOUNTS: usize = 3;
-const MAX_EVENTS: usize = 3;
+/// At most this many accounts and event kinds per sampled tx. One each: chainweb-data answers
+/// account and event pages in up to 90 s, and one sample must not hold the single in-flight
+/// slot for minutes (run 3E-b throughput).
+const MAX_ACCOUNTS: usize = 1;
+const MAX_EVENTS: usize = 1;
 /// `/txs/events` requests are bounded to `height +- EVENTS_WINDOW` so chainweb-data does not
 /// scan its whole events table.
 const EVENTS_WINDOW: u64 = 100;
 const ACCOUNT_WINDOW: u64 = 1000;
+/// Share of sampled txs that also yield a `/v1/txs` request, and its limits (50 has weight 3).
+/// Each one costs the `kda_txs_via_cwd` oracle up to `2 * limit + 2` chainweb-data calls.
+const V1TXS_SHARE: f64 = 0.6;
+const V1TXS_LIMITS: [u32; 5] = [50, 50, 50, 10, 250];
+/// Per sampled tx, the chance of also asking `/txs/recent` and `/stats` (no sampling needed;
+/// both are cheap on every side, and the gate needs 50 of each).
+const RECENT_SHARE: f64 = 0.15;
+const STATS_SHARE: f64 = 0.12;
+
+/// Percent-encodes only what breaks a path (`/ ? # %`, space, control and non-ASCII bytes);
+/// the wallet puts account names and modules into `/v1/txs/...` unencoded.
+pub fn enc_path_loose(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_graphic() && !b"/?#%\\".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// `GET /v1/txs/{account}/{token}/{limit}`.
+pub fn v1txs_request(account: &str, token: &str, limit: u32, origin: Origin) -> Request {
+    Request::new(
+        format!(
+            "/v1/txs/{}/{}/{limit}",
+            enc_path_loose(account),
+            enc_path_loose(token)
+        ),
+        origin,
+        None,
+    )
+}
 
 pub struct RandomGen {
     node: NodeClient,
@@ -162,7 +199,19 @@ pub fn tx_requests(
     }
     let mut seen = std::collections::HashSet::new();
     accounts.retain(|(a, t)| !a.is_empty() && seen.insert((a.clone(), t.clone())));
-    for (acct, token) in accounts.into_iter().take(MAX_ACCOUNTS) {
+    accounts.truncate(MAX_ACCOUNTS);
+    // `/v1/txs` for one of the transfer accounts (token = the transfer's module), like the
+    // wallet: path unencoded, limit mostly 50.
+    if !accounts.is_empty() && rng.random_bool(V1TXS_SHARE) {
+        let (acct, token) = &accounts[rng.random_range(0..accounts.len())];
+        out.push(v1txs_request(
+            acct,
+            token,
+            V1TXS_LIMITS[rng.random_range(0..V1TXS_LIMITS.len())],
+            origin,
+        ));
+    }
+    for (acct, token) in accounts.into_iter() {
         let mut q = Vec::new();
         if token != "coin" || rng.random_bool(0.5) {
             q.push(format!("token={}", enc_query(&token)));
@@ -293,14 +342,14 @@ impl Generator for RandomGen {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            return Ok(tx_requests(
-                tx,
-                c,
-                b.header.height,
-                &hash,
-                Origin::Random,
-                &mut self.rng,
-            ));
+            let mut reqs =
+                tx_requests(tx, c, b.header.height, &hash, Origin::Random, &mut self.rng);
+            for (path, share) in [("/txs/recent", RECENT_SHARE), ("/stats", STATS_SHARE)] {
+                if self.rng.random_bool(share) {
+                    reqs.push(Request::new(path.into(), Origin::Random, None));
+                }
+            }
+            return Ok(reqs);
         }
         Ok(Vec::new())
     }

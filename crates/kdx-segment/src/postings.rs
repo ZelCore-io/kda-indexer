@@ -153,6 +153,9 @@ impl PostingsWriter {
         self.entities.push(entity);
         self.offsets.push(self.pos);
         self.entries += vals.len() as u64;
+        if self.entities.len().is_multiple_of(4096) {
+            kdx_types::heartbeat::beat(kdx_types::heartbeat::Component::Ingest);
+        }
         Ok(())
     }
 
@@ -173,6 +176,7 @@ impl PostingsWriter {
         self.f.write_all(&self.pos.to_le_bytes())?;
         self.f.write_all(&(efb.len() as u64).to_le_bytes())?;
         self.f.finish()?;
+        kdx_types::heartbeat::beat(kdx_types::heartbeat::Component::Ingest);
         Ok((n, self.entries))
     }
 }
@@ -188,26 +192,106 @@ pub struct Postings {
     offsets: EliasFano,
 }
 
-/// TxNums of one list, newest (largest) first.
+/// TxNums of one list, newest (largest) first. A Delta list is decoded up to the bound (it
+/// is small by construction); Elias-Fano and Roaring lists are walked lazily from the back,
+/// so a page of 10 from a list of a million entries touches about 10 of them (R4).
 pub struct PostingIter {
-    vals: Vec<u32>,
+    inner: Inner,
     base: u64,
+    len: usize,
+}
+
+enum Inner {
+    Vec(Vec<u32>),
+    /// The list and the count of values not yet returned (values `[0, k)` remain).
+    Ef(EliasFano, usize),
+    Roaring(roaring::bitmap::IntoIter),
 }
 
 impl Iterator for PostingIter {
     type Item = u64;
     fn next(&mut self) -> Option<u64> {
-        self.vals.pop().map(|v| self.base + v as u64)
+        let v = match &mut self.inner {
+            Inner::Vec(v) => v.pop(),
+            Inner::Ef(ef, k) => {
+                *k = k.checked_sub(1)?;
+                ef.select(*k).map(|x| x as u32)
+            }
+            Inner::Roaring(it) => it.next_back(),
+        }?;
+        self.len = self.len.saturating_sub(1);
+        Some(self.base + v as u64)
     }
 }
 
 impl PostingIter {
+    /// Entries left.
     pub fn len(&self) -> usize {
-        self.vals.len()
+        self.len
     }
     pub fn is_empty(&self) -> bool {
-        self.vals.is_empty()
+        self.len == 0
     }
+}
+
+/// Decode the list in `b`, keeping values `<= max` (None = all).
+fn list_le(b: &[u8], max: Option<u32>, base: u64) -> Result<PostingIter> {
+    let enc = *b.first().context("empty list")?;
+    if enc == ENC_ROARING {
+        let r = RoaringBitmap::deserialize_from(&b[1..])?;
+        let len = match max {
+            Some(m) => r.rank(m) as usize,
+            None => r.len() as usize,
+        };
+        let mut it = r.into_iter();
+        if let Some(m) = max {
+            it.advance_back_to(m);
+        }
+        return Ok(PostingIter {
+            inner: Inner::Roaring(it),
+            base,
+            len,
+        });
+    }
+    if enc == ENC_EF {
+        let mut buf = &b[1..];
+        let n = get_u64(&mut buf)? as usize;
+        let ef = EliasFano::deserialize_from(buf)?;
+        if ef.len() != n {
+            bail!("EF list length {} != {n}", ef.len());
+        }
+        // Count of values <= m by binary search over select (no rank index needed).
+        let k = match max {
+            None => n,
+            Some(m) => {
+                let (mut lo, mut hi) = (0usize, n);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if ef.select(mid).is_some_and(|x| x <= m as usize) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            }
+        };
+        return Ok(PostingIter {
+            inner: Inner::Ef(ef, k),
+            base,
+            len: k,
+        });
+    }
+    let mut v = decode_list(b)?;
+    if let Some(m) = max {
+        let n = v.partition_point(|&x| x <= m);
+        v.truncate(n);
+    }
+    Ok(PostingIter {
+        len: v.len(),
+        inner: Inner::Vec(v),
+        base,
+    })
 }
 
 impl Postings {
@@ -278,25 +362,102 @@ impl Postings {
 
     /// Relative values of the list at directory position `i`.
     pub fn list_at(&self, i: usize) -> Result<Vec<u32>> {
-        let a = self.offsets.select(i).context("offset")?;
-        let b = self.offsets.select(i + 1).context("offset")?;
-        decode_list(&self.map[HEAD + a..HEAD + b])
+        decode_list(self.list_bytes(i)?)
     }
 
     /// TxNums of `entity`, descending; None when absent (or undecodable).
     pub fn list(&self, entity: u64) -> Option<PostingIter> {
-        let i = self.find(entity)?;
-        let vals = self.list_at(i).ok()?;
-        Some(PostingIter {
-            vals,
-            base: self.first_txnum,
-        })
+        self.list_le(entity, None).ok().flatten()
+    }
+
+    fn list_bytes(&self, i: usize) -> Result<&[u8]> {
+        let a = self.offsets.select(i).context("offset")?;
+        let b = self.offsets.select(i + 1).context("offset")?;
+        ensure!(
+            HEAD + b <= self.ent_at && a <= b,
+            "posting list offsets out of bounds"
+        );
+        Ok(&self.map[HEAD + a..HEAD + b])
+    }
+
+    /// TxNums of `entity` whose relative value is `<= max_rel` (None = all), descending.
+    /// `Ok(None)` when the entity has no list; `Err` when the list does not decode.
+    pub fn list_le(&self, entity: u64, max_rel: Option<u32>) -> Result<Option<PostingIter>> {
+        let Some(i) = self.find(entity) else {
+            return Ok(None);
+        };
+        Ok(Some(list_le(
+            self.list_bytes(i)?,
+            max_rel,
+            self.first_txnum,
+        )?))
     }
 }
 
 #[cfg(test)]
 mod list_tests {
     use super::*;
+
+    /// R4: the lazy walk of `list_le` matches a full decode, for every encoding and bound.
+    #[test]
+    fn list_le_matches_full_decode() {
+        let range_txs = 1u64 << 20;
+        for len in [1usize, 16, 17, 500, 40_000] {
+            let vals: Vec<u32> = (0..len as u32).map(|i| i * 13 + (i % 7)).collect();
+            let mut b = Vec::new();
+            encode_list(&vals, range_txs, &mut b).unwrap();
+            let last = *vals.last().unwrap();
+            for max in [
+                None,
+                Some(0),
+                Some(5),
+                Some(last / 2),
+                Some(last),
+                Some(last + 9),
+            ] {
+                let mut want: Vec<u64> = vals
+                    .iter()
+                    .filter(|&&v| max.is_none_or(|m| v <= m))
+                    .map(|&v| 1000 + v as u64)
+                    .collect();
+                want.reverse();
+                let it = list_le(&b, max, 1000).unwrap();
+                assert_eq!(it.len(), want.len(), "len {len} max {max:?}");
+                assert_eq!(it.collect::<Vec<_>>(), want, "len {len} max {max:?}");
+            }
+        }
+    }
+
+    /// Timing: a page of 10 from a large EF list must not cost a full decode. Run with
+    /// `cargo test -p kdx-segment --release -- --ignored --nocapture ef_page_timing`.
+    #[test]
+    #[ignore]
+    fn ef_page_timing() {
+        let range_txs = 1u64 << 26;
+        let vals: Vec<u32> = (0..(range_txs / 32) as u32).map(|i| i * 31).collect();
+        let mut b = Vec::new();
+        encode_list(&vals, range_txs, &mut b).unwrap();
+        assert_eq!(b[0], ENC_EF);
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = decode_list(&b).unwrap();
+        }
+        let full = t.elapsed() / 100;
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            let p: Vec<u64> = list_le(&b, Some(vals[vals.len() / 2]), 0)
+                .unwrap()
+                .take(10)
+                .collect();
+            assert_eq!(p.len(), 10);
+        }
+        let page = t.elapsed() / 100;
+        println!(
+            "{} entries: full decode {full:?}, page of 10 {page:?}",
+            vals.len()
+        );
+        assert!(page < full);
+    }
 
     /// Round trip at the delta/EF boundary (16/17) and the EF/Roaring threshold.
     #[test]
@@ -323,5 +484,22 @@ mod list_tests {
         }
         // A delta list that claims more values than it has bytes is rejected.
         assert!(decode_list(&[ENC_DELTA, 0x7f, 1]).is_err());
+        // Bounded reverse iteration agrees with the decoded list for every encoding.
+        for len in [5usize, 30, 200] {
+            let vals: Vec<u32> = (0..len as u32).map(|i| i * 3).collect();
+            let mut out = Vec::new();
+            encode_list(&vals, range_txs, &mut out).unwrap();
+            for max in [None, Some(0), Some(1), Some(44), Some(45), Some(10_000)] {
+                let want: Vec<u64> = vals
+                    .iter()
+                    .rev()
+                    .filter(|&&v| max.is_none_or(|m| v <= m))
+                    .map(|&v| 7 + v as u64)
+                    .collect();
+                let it = list_le(&out, max, 7).unwrap();
+                assert_eq!(it.len(), want.len(), "len {len} max {max:?}");
+                assert_eq!(it.collect::<Vec<_>>(), want, "len {len} max {max:?}");
+            }
+        }
     }
 }

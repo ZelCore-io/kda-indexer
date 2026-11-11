@@ -71,7 +71,10 @@ impl RouteKind {
 
     /// Routes whose chainweb-data payload has a float `gasPrice`.
     fn float_gas_price(self) -> bool {
-        matches!(self, RouteKind::Tx | RouteKind::Txs | RouteKind::Other)
+        matches!(
+            self,
+            RouteKind::Tx | RouteKind::Txs | RouteKind::V1Txs | RouteKind::Other
+        )
     }
 }
 
@@ -88,9 +91,46 @@ pub fn normalize(route: &RouteKind, v: &mut Value) {
         match route {
             RouteKind::Account => tie_groups(items, account_key),
             RouteKind::Events => tie_groups(items, events_key),
+            RouteKind::V1Txs => v1txs_as_set(items),
+            RouteKind::Txs => txs_as_set(items),
             _ => {}
         }
     }
+}
+
+/// `/v1/txs` answers are sets keyed by `requestKey` (the order is not meaningful and the live
+/// service adds a cache `_id` to some entries).
+fn v1txs_as_set(items: &mut [Value]) {
+    for it in items.iter_mut() {
+        if let Some(m) = it.as_object_mut() {
+            m.remove("_id");
+        }
+    }
+    items.sort_by_cached_key(|v| {
+        (
+            v.get("requestKey")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            v.to_string(),
+        )
+    });
+}
+
+/// `/txs/txs` answers are sets: chainweb-data's query has no order, and a genesis request key
+/// has one row per chain (F4). Sorted by chain, height and block.
+fn txs_as_set(items: &mut [Value]) {
+    items.sort_by_cached_key(|v| {
+        (
+            v.get("chain").and_then(Value::as_u64),
+            v.get("height").and_then(Value::as_u64),
+            v.get("blockHash")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            v.to_string(),
+        )
+    });
 }
 
 fn sort_keys(v: &mut Value) {
@@ -164,21 +204,18 @@ fn field(v: &Value, k: &str) -> String {
     v.get(k).map(|x| x.to_string()).unwrap_or_default()
 }
 
-/// `(height desc, blockTime, requestKey, idx)`; order is taken as returned, so only equality
-/// of the key matters here.
+/// Rows of one height (`height desc`): chainweb-data returns the rows of one height, across
+/// chains and within a block, in Postgres physical order (seen live: coinbase rows of chains
+/// 8,6,1,7,0,2,... at one height), so a height compares as a multiset (allowlist
+/// `same-height-tie-order`, which extends the accepted `coinbase-tie-order`). Missing or extra
+/// rows still show; only their order inside one height is ignored.
 fn account_key(v: &Value) -> SortKey {
-    ["height", "blockTime", "requestKey", "idx"]
-        .iter()
-        .map(|k| field(v, k))
-        .collect()
+    vec![field(v, "height")]
 }
 
-/// `(height desc, requestKey, idx)`.
+/// Same as [`account_key`].
 fn events_key(v: &Value) -> SortKey {
-    ["height", "requestKey", "idx"]
-        .iter()
-        .map(|k| field(v, k))
-        .collect()
+    vec![field(v, "height")]
 }
 
 fn tie_groups(items: &mut [Value], key: fn(&Value) -> SortKey) {
@@ -267,6 +304,8 @@ pub fn iso_micros(us: u64) -> String {
 
 #[cfg(test)]
 mod refspec_tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -282,5 +321,21 @@ mod refspec_tests {
         normalize(&RouteKind::Tx, &mut a);
         normalize(&RouteKind::Tx, &mut b);
         assert_eq!(a.to_string(), b.to_string());
+    }
+
+    /// F4: /txs/txs rows compare as a set (chainweb-data's query has no order).
+    #[test]
+    fn txs_rows_as_set() {
+        let mut a = json!([
+            {"chain": 10, "height": 852054, "blockHash": "y"},
+            {"chain": 0, "height": 0, "blockHash": "x"}
+        ]);
+        let mut b = json!([
+            {"chain": 0, "height": 0, "blockHash": "x"},
+            {"chain": 10, "height": 852054, "blockHash": "y"}
+        ]);
+        normalize(&RouteKind::Txs, &mut a);
+        normalize(&RouteKind::Txs, &mut b);
+        assert_eq!(a, b);
     }
 }

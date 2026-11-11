@@ -65,6 +65,22 @@ pub enum TargetKind {
     ChainwebData,
     KdaIndexerCompat,
     KdaTxs,
+    /// Answers `/v1/txs` by composing chainweb-data calls (the `url` is a chainweb-data
+    /// instance); used when no live kda-txs is reachable.
+    KdaTxsViaCwd,
+}
+
+impl TargetKind {
+    /// Whether a target of this kind answers `route`: chainweb-data every compat route but
+    /// `/v1/txs`, the kda-txs kinds only `/v1/txs`, kda-indexer compat all of them.
+    pub fn serves(self, route: crate::normalize::RouteKind) -> bool {
+        use crate::normalize::RouteKind;
+        match self {
+            TargetKind::ChainwebData => route != RouteKind::V1Txs,
+            TargetKind::KdaTxs | TargetKind::KdaTxsViaCwd => route == RouteKind::V1Txs,
+            TargetKind::KdaIndexerCompat => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

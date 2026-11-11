@@ -12,7 +12,7 @@ use crate::adj::record_block_hash;
 use crate::blockfile::BlockFile;
 use crate::files::{file_name, FileKind};
 use crate::keys::Keys;
-use crate::manifest::{Manifest, RangeEntry};
+use crate::manifest::{Manifest, RangeEntry, RangeKind};
 use crate::phf::{Index, KeyIndex};
 use crate::postings::{PostingIter, Postings};
 use crate::writer::{RangeInfo, SLOT_WIDTH};
@@ -212,13 +212,34 @@ impl RangeReader {
     pub fn postings(&self, f: Family, entity: u64) -> Option<PostingIter> {
         self.postings[f as usize].list(entity)
     }
+
+    /// Postings of `(f, entity)` with relative TxNum `<= max_rel` (None = all), newest first.
+    pub fn postings_le(
+        &self,
+        f: Family,
+        entity: u64,
+        max_rel: Option<u32>,
+    ) -> Result<Option<PostingIter>> {
+        self.postings[f as usize].list_le(entity, max_rel)
+    }
+
+    fn key(&self) -> (RangeKind, u32, u32, u64) {
+        (
+            self.info.kind,
+            self.info.start,
+            self.info.end,
+            self.info.first_txnum,
+        )
+    }
 }
 
 /// All frozen ranges of a segments dir.
 pub struct Segments {
     pub dir: PathBuf,
     pub manifest: Manifest,
-    pub ranges: Vec<RangeReader>,
+    /// Shared so a refreshed `Segments` reuses unchanged readers (and an old one keeps its
+    /// mmaps alive while a reader still holds it, even after a merge deleted the files).
+    pub ranges: Vec<Arc<RangeReader>>,
     /// Dictionary the records' ids refer to (rendering is the caller's job).
     pub dict: Arc<dyn Dict + Send + Sync>,
 }
@@ -229,10 +250,10 @@ impl Segments {
         let manifest = Manifest::load(dir)?.unwrap_or_else(|| Manifest::new(""));
         let mut ranges = Vec::new();
         for e in &manifest.entries {
-            ranges.push(
+            ranges.push(Arc::new(
                 RangeReader::open(dir, e, &manifest.network)
                     .with_context(|| format!("open range {}..{}", e.start, e.end))?,
-            );
+            ));
         }
         Ok(Segments {
             dir: dir.to_path_buf(),
@@ -242,12 +263,88 @@ impl Segments {
         })
     }
 
+    /// Reload `manifest.json`; `None` when it is unchanged. Readers whose
+    /// `(kind, start, end, first_txnum)` is unchanged are reused, new ones are opened.
+    pub fn refresh(&self) -> Result<Option<Segments>> {
+        let manifest = Manifest::load(&self.dir)?.unwrap_or_else(|| Manifest::new(""));
+        if manifest == self.manifest {
+            return Ok(None);
+        }
+        let mut ranges = Vec::with_capacity(manifest.entries.len());
+        for e in &manifest.entries {
+            let k = (e.kind, e.start, e.end, e.first_txnum);
+            match self.ranges.iter().find(|r| r.key() == k) {
+                Some(r) => ranges.push(r.clone()),
+                None => ranges.push(Arc::new(
+                    RangeReader::open(&self.dir, e, &manifest.network)
+                        .with_context(|| format!("open range {}..{}", e.start, e.end))?,
+                )),
+            }
+        }
+        Ok(Some(Segments {
+            dir: self.dir.clone(),
+            manifest,
+            ranges,
+            dict: self.dict.clone(),
+        }))
+    }
+
+    /// Height below which every block is frozen.
+    pub fn frontier(&self) -> u32 {
+        self.manifest.frontier
+    }
+
+    /// Largest TxNum at a height below `h` (None when there is none in the segments).
+    pub fn last_txnum_below_height(&self, h: u32) -> Option<u64> {
+        let first = self.manifest.entries.first()?;
+        if h <= first.start {
+            return None;
+        }
+        let end = if h >= self.manifest.frontier {
+            self.manifest.next_txnum
+        } else {
+            let r = self.range_of_height(h)?;
+            r.info.first_txnum + r.keys.first(r.slot(0, h)?)?
+        };
+        end.checked_sub(1).filter(|&t| t >= first.first_txnum)
+    }
+
+    /// TxNums of `(f, entity)` that are `<= max_txnum` (None = all), newest first across
+    /// ranges. Stops with an error item when a list does not decode.
+    pub fn postings_from(
+        &self,
+        f: Family,
+        entity: u64,
+        max_txnum: Option<u64>,
+    ) -> impl Iterator<Item = Result<u64>> + '_ {
+        self.ranges
+            .iter()
+            .rev()
+            .filter(move |r| max_txnum.is_none_or(|m| r.info.first_txnum <= m))
+            .flat_map(move |r| {
+                let max_rel = max_txnum.and_then(|m| {
+                    let rel = m - r.info.first_txnum;
+                    (rel < r.info.tx_count).then(|| u32::try_from(rel).unwrap_or(u32::MAX))
+                });
+                let res: Box<dyn Iterator<Item = Result<u64>>> =
+                    match r.postings_le(f, entity, max_rel) {
+                        Ok(Some(it)) => Box::new(it.map(Ok)),
+                        Ok(None) => Box::new(std::iter::empty()),
+                        Err(e) => Box::new(std::iter::once(Err(e.context(format!(
+                            "postings of range {}..{}",
+                            r.info.start, r.info.end
+                        ))))),
+                    };
+                res
+            })
+    }
+
     fn range_of_txnum(&self, t: u64) -> Option<&RangeReader> {
-        self.manifest.entry_of_txnum(t).map(|i| &self.ranges[i])
+        self.manifest.entry_of_txnum(t).map(|i| &*self.ranges[i])
     }
 
     fn range_of_height(&self, h: u32) -> Option<&RangeReader> {
-        self.manifest.entry_of_height(h).map(|i| &self.ranges[i])
+        self.manifest.entry_of_height(h).map(|i| &*self.ranges[i])
     }
 
     pub fn tx(&self, txnum: u64) -> Result<Option<TxRecord>> {
@@ -273,6 +370,25 @@ impl Segments {
         };
         match r.slot(chain, height) {
             Some(s) => r.block_at(s),
+            None => Ok(None),
+        }
+    }
+
+    /// TxNums of the txs of block (chain, height), in position order.
+    pub fn block_txnums(&self, chain: u8, height: u32) -> Option<std::ops::Range<u64>> {
+        let r = self.range_of_height(height)?;
+        let s = r.slot(chain, height)?;
+        let a = r.keys.first(s)?;
+        Some(r.info.first_txnum + a..r.info.first_txnum + a + r.keys.count(s))
+    }
+
+    /// Stored hash of block (chain, height).
+    pub fn block_hash(&self, chain: u8, height: u32) -> Result<Option<Hash32>> {
+        let Some(r) = self.range_of_height(height) else {
+            return Ok(None);
+        };
+        match r.slot(chain, height) {
+            Some(s) => r.block_hash(s),
             None => Ok(None),
         }
     }

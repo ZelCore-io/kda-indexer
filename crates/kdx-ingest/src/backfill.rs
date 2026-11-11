@@ -47,8 +47,15 @@ const SLAB: u64 = 1000;
 const SLAB_TASKS: usize = 16;
 /// Blocks decoded per rayon batch.
 const DECODE_BATCH: usize = 1024;
-/// Estimated writer memory for a busy 100,000-height range (run B: 1–1.5 GB).
-const WRITER_MB_PER_100K: u64 = 1536;
+/// Range writer memory other than its posting buffers: per-tx index keys, samples, decode
+/// batches, list building at finish (M1).
+const WRITER_BASE_MB: u64 = 1024;
+/// Bytes per buffered posting entry: 16 B of key plus Vec growth headroom.
+const POSTING_ENTRY_BYTES: u64 = 32;
+/// Posting families buffered by the writer.
+const POSTING_FAMILIES: u64 = 5;
+/// How often the RSS guard samples while backfill runs.
+const RSS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One work unit: a range, or a step at the tail end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,33 +222,49 @@ pub struct MemPlan {
     pub cap_mb: u64,
 }
 
-/// `(in_flight + 1) × spool + writer ≤ cap`: `in_flight` ranges fetching while one builds.
-pub fn mem_plan(
-    ranges_in_flight: u32,
-    range_heights: u64,
-    etl_mem_mb: u64,
-    cap_mb: u64,
-) -> MemPlan {
-    let writer_est_mb = (WRITER_MB_PER_100K * range_heights / 100_000).max(128);
+/// A byte budget (M1): `(in_flight + 1) × spool + writer ≤ cap`, `in_flight` ranges fetching
+/// while one builds. The writer gets what the spools leave, and its posting buffers are
+/// sized from that in bytes, so a dense range spills its postings sooner instead of growing
+/// past the cap (the old plan scaled a per-100k-heights constant and ignored tx density).
+pub fn mem_plan(ranges_in_flight: u32, etl_mem_mb: u64, cap_mb: u64) -> MemPlan {
+    let min_writer = WRITER_BASE_MB + 256;
     let mut spool_mb = etl_mem_mb.max(16);
-    let budget = cap_mb.saturating_sub(writer_est_mb);
     let mut in_flight = ranges_in_flight.max(1);
-    while in_flight > 1 && (u64::from(in_flight) + 1) * spool_mb > budget {
+    while in_flight > 1 && (u64::from(in_flight) + 1) * spool_mb + min_writer > cap_mb {
         in_flight -= 1;
     }
-    if 2 * spool_mb > budget {
-        spool_mb = (budget / 2).max(16);
+    if 2 * spool_mb + min_writer > cap_mb {
+        spool_mb = (cap_mb.saturating_sub(min_writer) / 2).max(16);
     }
-    // Postings are about half of the writer estimate: 5 families × 16 B per entry.
-    let postings_mem_entries = ((writer_est_mb << 20) / 2 / (5 * 16))
-        .clamp(1 << 16, kdx_segment::writer::ETL_MEM_ENTRIES as u64)
-        as usize;
+    let writer_est_mb = cap_mb
+        .saturating_sub((u64::from(in_flight) + 1) * spool_mb)
+        .max(min_writer);
+    let postings_mem_entries =
+        (((writer_est_mb - WRITER_BASE_MB) << 20) / (POSTING_FAMILIES * POSTING_ENTRY_BYTES))
+            .clamp(1 << 16, kdx_segment::writer::ETL_MEM_ENTRIES as u64) as usize;
     MemPlan {
         in_flight,
         spool_mb,
         writer_est_mb,
         postings_mem_entries,
         cap_mb,
+    }
+}
+
+/// True (and a WARN) when anonymous RSS is above the cap. Backfill then fetches one range
+/// at a time until it is back under.
+fn rss_over_cap(cap_mb: u64, at: &str) -> bool {
+    match disk::rss_anon_mb() {
+        Some(rss) if rss > cap_mb => {
+            tracing::warn!(
+                rss_anon_mb = rss,
+                cap_mb,
+                at,
+                "backfill: memory above mem_cap_mb"
+            );
+            true
+        }
+        _ => false,
     }
 }
 
@@ -300,6 +323,7 @@ async fn fetch_unit(
                 batch.push((spool_key(h, c).to_vec(), serde_json::to_vec(&it)?));
             }
             let n = batch.len() as u64;
+            crate::heartbeat::beat(crate::heartbeat::Component::Ingest);
             tx.send(batch)
                 .await
                 .map_err(|_| anyhow::anyhow!("spool closed"))?;
@@ -431,12 +455,24 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
         .flat_map(|u| u.start..u.end)
         .map(|h| ctx.graph.chains_at(u64::from(h)).len() as u64)
         .sum();
-    let mem = mem_plan(
-        o.ranges_in_flight,
-        o.range_heights,
-        o.etl_mem_mb,
-        o.mem_cap_mb,
-    );
+    let mem = mem_plan(o.ranges_in_flight, o.etl_mem_mb, o.mem_cap_mb);
+    // RSS guard: WARN while anonymous RSS is above the cap, even mid-build.
+    let guard = {
+        let cap = mem.cap_mb;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RSS_CHECK_EVERY).await;
+                rss_over_cap(cap, "periodic");
+            }
+        })
+    };
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _guard = AbortOnDrop(guard);
     tracing::info!(
         data_dir = %o.data_dir.display(),
         start,
@@ -449,6 +485,12 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
         writer_est_mb = mem.writer_est_mb,
         "backfill: plan"
     );
+    {
+        let m = kdx_metrics::get();
+        m.backfill_next_height.set(i64::from(start));
+        m.backfill_end_height
+            .set(i64::from(units.last().map(|u| u.end).unwrap_or(start)));
+    }
 
     let walker = Arc::new(Walker::new(mode, cut));
     let spool_bytes = (mem.spool_mb << 20) as usize;
@@ -460,14 +502,20 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
     let (mut tot_blocks, mut tot_txs) = (0u64, 0u64);
 
     for _ in 0..units.len() {
-        while pending.len() < mem.in_flight as usize && next < units.len() {
+        // Over the cap: let the fetched spools drain before fetching more.
+        let in_flight = if rss_over_cap(mem.cap_mb, "before fetch") {
+            1
+        } else {
+            mem.in_flight as usize
+        };
+        while pending.len() < in_flight && next < units.len() {
             pending.push_back((units[next], spawn(units[next])));
             next += 1;
         }
         let (u, h) = pending.pop_front().expect("pending unit");
         let fetched = h.await??;
         // Keep `in_flight` ranges fetching while this one builds.
-        if next < units.len() {
+        if next < units.len() && pending.len() < in_flight {
             pending.push_back((units[next], spawn(units[next])));
             next += 1;
         }
@@ -547,6 +595,16 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
         };
         tot_blocks += entry.block_count;
         tot_txs += entry.tx_count;
+        {
+            let m = kdx_metrics::get();
+            m.ingested("backfill", entry.block_count, entry.tx_count);
+            m.stage("backfill_fetch", st.fetch_secs);
+            m.stage("backfill_decode_index", st.decode_index_secs);
+            m.stage("backfill_finish", st.finish_secs);
+            m.stage("backfill_commit", st.commit_secs);
+            m.backfill_blocks_per_second.set(st.blocks_per_s);
+            m.backfill_next_height.set(i64::from(u.end));
+        }
         tracing::info!(
             range = format!("{}..{}", u.start, u.end),
             kind = st.kind,
@@ -622,7 +680,10 @@ fn build_and_commit(
         wopts,
     )?;
     let mut dict = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());
-    let mut it = coll.into_sorted()?;
+    let mut it = {
+        let _alive = crate::heartbeat::KeepAlive::new(crate::heartbeat::Component::Ingest);
+        coll.into_sorted()?
+    };
     let mut batch: Vec<(u32, u8, Vec<u8>)> = Vec::with_capacity(DECODE_BATCH);
     loop {
         batch.clear();
@@ -699,11 +760,47 @@ fn build_and_commit(
     txn.set_next_txnum(entry.end_txnum())?;
     txn.set_frozen_frontier(entry.end)?;
     txn.set_meta(&dict::lens_key(entry.end), &dict::encode_lens(&dict))?;
+    let tc = Instant::now();
     txn.commit()?;
+    kdx_metrics::get()
+        .mdbx_commit_seconds
+        .observe(tc.elapsed().as_secs_f64());
     debug_abort("hot", u.start);
     manifest.push(entry.clone())?;
     manifest.commit(&ctx.segdir)?;
     let commit_secs = t.elapsed().as_secs_f64();
     drop(dict);
     Ok((entry, prev, (decode_secs, finish_secs, commit_secs)))
+}
+
+#[cfg(test)]
+mod mem_tests {
+    use super::*;
+
+    /// M1: the plan fits the cap in bytes for any spool size, and the posting buffers
+    /// shrink with the writer's share.
+    #[test]
+    fn plan_fits_cap() {
+        for (inf, spool, cap) in [
+            (2, 1024, 6144),
+            (4, 1024, 6144),
+            (2, 4096, 6144),
+            (1, 16, 512),
+            (8, 512, 16384),
+        ] {
+            let m = mem_plan(inf, spool, cap);
+            let used = (u64::from(m.in_flight) + 1) * m.spool_mb + m.writer_est_mb;
+            assert!(m.in_flight >= 1);
+            assert!(
+                used <= cap.max(WRITER_BASE_MB + 256 + 32),
+                "{inf} {spool} {cap}: {m:?}"
+            );
+            let post_mb =
+                (m.postings_mem_entries as u64 * POSTING_FAMILIES * POSTING_ENTRY_BYTES) >> 20;
+            assert!(post_mb <= m.writer_est_mb, "{m:?}");
+        }
+        let small = mem_plan(2, 1024, 3072);
+        let big = mem_plan(2, 1024, 16384);
+        assert!(small.postings_mem_entries < big.postings_mem_entries);
+    }
 }

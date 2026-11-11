@@ -103,6 +103,7 @@ pub fn commit(ctx: &Ctx, batches: &[Batch]) -> Result<CommitStats> {
 fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<CommitStats> {
     let t0 = Instant::now();
     let mut st = CommitStats::default();
+    let mut forks: Vec<(u8, u32)> = Vec::new();
     let mut txn = ctx.hot.rw()?;
     for b in batches {
         if b.halted {
@@ -124,6 +125,7 @@ fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<Com
             bump_max(&mut txn, counters::REORG_DEPTH_MAX, i64::from(f.depth))?;
             st.reorgs += 1;
             st.undone += n;
+            forks.push((b.chain, f.depth));
         }
         for p in &b.blocks {
             if debug_poison(b.chain, p.0.header.height) {
@@ -147,7 +149,16 @@ fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<Com
         }
     }
     dict.persist(&mut txn)?;
+    let tc = Instant::now();
     txn.commit()?;
+    crate::heartbeat::beat_source(crate::heartbeat::Source::Tail);
     st.secs = t0.elapsed().as_secs_f64();
+    let m = kdx_metrics::get();
+    m.mdbx_commit_seconds.observe(tc.elapsed().as_secs_f64());
+    m.stage("tail_commit", st.secs);
+    m.ingested("tail", st.blocks, st.txs);
+    for (chain, depth) in forks {
+        m.reorg(chain, depth);
+    }
     Ok(st)
 }

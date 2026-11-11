@@ -32,6 +32,22 @@ fn crash_at(point: &str) {
         eprintln!("KDX_CRASH_AT={point}: aborting");
         std::process::abort();
     }
+    sleep_at(point);
+}
+
+/// Debug hook `KDX_DEBUG_SLEEP_AT=<point>:<secs>`: sleep at a commit point (readers racing
+/// the freezer, Review Focus 1). Same points as `KDX_CRASH_AT`.
+fn sleep_at(point: &str) {
+    let Ok(v) = std::env::var("KDX_DEBUG_SLEEP_AT") else {
+        return;
+    };
+    if let Some((p, secs)) = v.split_once(':') {
+        if p == point {
+            let secs: u64 = secs.parse().unwrap_or(5);
+            tracing::warn!(point, secs, "KDX_DEBUG_SLEEP_AT: sleeping");
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+        }
+    }
 }
 
 fn load_manifest(ctx: &Ctx) -> Result<Manifest> {
@@ -62,6 +78,7 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
     // is deleted, so the next chunk starts at the table's first row again.
     let end_key = TxKey::new(end, 0, 0).to_be_bytes();
     loop {
+        crate::heartbeat::beat(crate::heartbeat::Component::Ingest);
         let txs = txn.scan_limit(Table::TailTxs, &[], CHUNK, |k| k < &end_key[..])?;
         for (k, v) in &txs {
             let r = decode_tx(v).context("hot tx")?;
@@ -78,6 +95,7 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
     }
     let mut after: Option<Vec<u8>> = None;
     loop {
+        crate::heartbeat::beat(crate::heartbeat::Component::Ingest);
         let posts = txn.scan_chunk(Table::TailPostings, after.as_deref(), CHUNK, |_| true)?;
         for (k, _) in &posts {
             let key = parse_txkey(&k[9..]).context("posting key")?;
@@ -288,6 +306,7 @@ fn freeze_step(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         txn.set_meta(&dict::lens_key(end), &dict::encode_lens(&d))?;
         txn.commit()?;
     }
+    kdx_metrics::get().freezer("freeze", t0.elapsed().as_secs_f64());
     tracing::info!(
         start,
         end,
@@ -391,6 +410,7 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         }
     }
     fsync_dir(&ctx.segdir)?;
+    kdx_metrics::get().freezer("merge", t0.elapsed().as_secs_f64());
     tracing::info!(
         start,
         end,

@@ -99,6 +99,46 @@ pub fn project_tx_detail(cw: &Value) -> Value {
     Value::Object(m)
 }
 
+/// Events of a node `/poll` entry in the `/v1/txs` shape: `{name: "<module>.<NAME>", params}`.
+pub fn v1txs_events(poll: &Value) -> Value {
+    let evs = poll
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    let mut m = Map::new();
+                    m.insert("name".into(), qualified_event_name(e));
+                    m.insert(
+                        "params".into(),
+                        match e.get("params") {
+                            Some(p @ Value::Array(_)) => p.clone(),
+                            _ => Value::Array(Vec::new()),
+                        },
+                    );
+                    Value::Object(m)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(evs)
+}
+
+/// A numeric string in `meta` as Pact parses it, a number (seen live: `"gasPrice":
+/// "0.00000001"` in -rSHnkpP..., which chainweb-data and compat show as 1e-08).
+pub(crate) fn meta_num(v: Value) -> Value {
+    if let Value::String(s) = &v {
+        let t = s.trim();
+        if let Ok(i) = t.parse::<u64>() {
+            return Value::from(i);
+        }
+        if let Some(n) = t.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+            return Value::Number(n);
+        }
+    }
+    v
+}
+
 fn qualified_event_name(e: &Value) -> Value {
     let name = e.get("name").and_then(Value::as_str).unwrap_or("");
     let module = e.get("module");
@@ -159,8 +199,10 @@ pub fn from_poll(poll: &Value, header: &Value, tx: Option<&DecodedTx>) -> Value 
         let null = Value::Null;
         let c = tx.cmd_parsed.as_ref().unwrap_or(&null);
         let meta = c.get("meta").cloned().unwrap_or(Value::Null);
-        let exec = c.pointer("/payload/exec");
-        let cont = c.pointer("/payload/cont");
+        // A cmd can write the unused payload kind as an explicit null (seen live: cont cmds
+        // with `"exec": null`, ihLeKStMj9c6... chain 1 height 3264261, cont data `{}`).
+        let exec = c.pointer("/payload/exec").filter(|v| !v.is_null());
+        let cont = c.pointer("/payload/cont").filter(|v| !v.is_null());
         let p = |k: &str| exec.or(cont).map(|x| get(x, k)).unwrap_or(Value::Null);
         let cp = |k: &str| cont.map(|x| get(x, k)).unwrap_or(Value::Null);
         m.insert(
@@ -170,12 +212,14 @@ pub fn from_poll(poll: &Value, header: &Value, tx: Option<&DecodedTx>) -> Value 
         m.insert("data".into(), p("data"));
         m.insert("nonce".into(), get(c, "nonce"));
         m.insert("sender".into(), get(&meta, "sender"));
-        m.insert("gasLimit".into(), get(&meta, "gasLimit"));
-        m.insert("gasPrice".into(), get(&meta, "gasPrice"));
-        m.insert("ttl".into(), get(&meta, "ttl"));
+        m.insert("gasLimit".into(), meta_num(get(&meta, "gasLimit")));
+        m.insert("gasPrice".into(), meta_num(get(&meta, "gasPrice")));
+        m.insert("ttl".into(), meta_num(get(&meta, "ttl")));
+        // A fractional `meta.creationTime` (seen live: 1692638383.532) is rounded to whole
+        // seconds, as chainweb-data shows it.
         let ct = meta
             .get("creationTime")
-            .and_then(Value::as_u64)
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.round() as u64)))
             .map(|s| Value::String(iso_secs(s)))
             .unwrap_or(Value::Null);
         m.insert("creationTime".into(), ct);
@@ -196,6 +240,15 @@ fn signers_with_clist(mut signers: Value) -> Value {
             if let Value::Object(m) = s {
                 if !m.contains_key("clist") {
                     m.insert("clist".into(), Value::Array(Vec::new()));
+                }
+                // An explicit `"addr": null` in the cmd is not shown by chainweb-data or compat.
+                if m.get("addr").is_some_and(Value::is_null) {
+                    m.remove("addr");
+                }
+                // Same for an explicit `"scheme": null` (seen live: 6F015oXp... chain 2 height
+                // 6900522, rOdMCBKS...; chainweb-data and compat list clist and pubKey only).
+                if m.get("scheme").is_some_and(Value::is_null) {
+                    m.remove("scheme");
                 }
             }
         }

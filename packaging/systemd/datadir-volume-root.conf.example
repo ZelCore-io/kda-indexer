@@ -1,0 +1,14 @@
+# Fallback for a store that lives at the root of its own volume mounted at
+# /opt/coins/data/kadena/kda-indexer, instead of in .../kda-indexer/<network>/.
+#
+# 1. In /opt/coins/kda-indexer/<network>/config/<network>.toml set
+#        data_dir = "/opt/coins/data/kadena/kda-indexer"
+# 2. Install this drop-in (sudo systemctl edit kda-indexer-<network>), so the sandbox lets
+#    the service write there; the packaged unit only opens .../kda-indexer/<network>.
+#
+# The empty assignment clears the packaged list first, so the network directory does not
+# have to exist.
+[Service]
+ReadWritePaths=
+ReadWritePaths=/opt/coins/data/kadena/kda-indexer
+ReadWritePaths=-/var/lib/node_exporter/textfile_collector

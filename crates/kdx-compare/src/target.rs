@@ -129,9 +129,36 @@ impl Target {
         format!("{base}{path_and_query}")
     }
 
-    /// `GET {url}{path_and_query}` under the shared limit. Non-2xx statuses are returned, not
-    /// errors; transport failures and timeouts are errors.
+    /// `GET {url}{path_and_query}`. A `kda_txs_via_cwd` target answers `/v1/txs/...` by
+    /// composing chainweb-data calls (each under the shared limit); everything else is one
+    /// request. Non-2xx statuses are returned, not errors; transport failures and timeouts
+    /// are errors.
     pub async fn get(&self, path_and_query: &str) -> anyhow::Result<HttpCapture> {
+        if self.kind == TargetKind::KdaTxsViaCwd {
+            let cap = if path_and_query.starts_with("/v1/txs") {
+                crate::via_cwd::fetch(self, path_and_query).await?
+            } else {
+                HttpCapture {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: Bytes::from_static(b"Not Found"),
+                    ms: 0,
+                }
+            };
+            if cap.body.len() > self.max_body_bytes {
+                anyhow::bail!(
+                    "{} GET {path_and_query}: composed body exceeds {} bytes",
+                    self.name,
+                    self.max_body_bytes
+                );
+            }
+            return Ok(cap);
+        }
+        self.get_direct(path_and_query).await
+    }
+
+    /// One `GET {url}{path_and_query}` under the shared limit.
+    pub async fn get_direct(&self, path_and_query: &str) -> anyhow::Result<HttpCapture> {
         let _permit = self
             .limiter
             .in_flight

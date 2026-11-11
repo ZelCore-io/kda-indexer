@@ -172,6 +172,7 @@ impl BlockFileWriter {
             self.w
                 .append_column(Some(Ok::<_, Box<dyn std::error::Error + Send + Sync>>(&z)))?;
         }
+        kdx_types::heartbeat::beat(kdx_types::heartbeat::Component::Ingest);
         Ok(())
     }
 

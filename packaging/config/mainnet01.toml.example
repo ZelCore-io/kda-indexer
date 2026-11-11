@@ -1,5 +1,5 @@
 network = "mainnet01"
-data_dir = "/var/lib/kda-indexer/mainnet01"
+data_dir = "/opt/coins/data/kadena/kda-indexer/mainnet01"
 
 [node]
 url = "http://127.0.0.1:31351"          # service API on the same host
@@ -28,7 +28,7 @@ min_free_gb = 60
 zstd_level = 19
 dict_samples = 20000
 etl_mem_mb = 1024                       # raw spool buffer per range before spilling to etl/
-mem_cap_mb = 6144                       # (ranges_in_flight + 1) x etl_mem_mb + writer estimate; in-flight lowered to fit
+mem_cap_mb = 6144                       # byte budget: (ranges_in_flight + 1) x etl_mem_mb + writer; WARN above it
 
 [freezer]
 zstd_level = 9
@@ -39,15 +39,23 @@ commit_blocks = 40
 cut_poll_secs = 10
 
 [api]
-native = "<private-lan-ip>:31361"   # internal only
-compat = "0.0.0.0:31362"
-graphql = "0.0.0.0:31363"
-admin = "127.0.0.1:31369"
-trusted_proxies = ["<proxy-private-ip>"]
-rate_per_ip = 20
+native = "<private-lan-ip>:31361"   # internal only: loopback or private (RFC 1918/4193)
+compat = "127.0.0.1:31362"          # loopback until P8 (public behind the proxy then)
+graphql = "127.0.0.1:31363"         # parsed, not bound before P7
+admin = "127.0.0.1:31369"           # loopback or private only
+trusted_proxies = ["<proxy-private-ip>"]   # IP or CIDR; X-Forwarded-For only from these
+rate_per_ip = 20          # requests/s per client IP (429 past it)
+rate_burst = 40
+deadline_ms = 5000        # per request (504 past it)
+max_in_flight = 512       # over all listeners (503 past it)
+max_body_mb = 8           # response cap (503 "narrow the query" past it)
+v1txs_max_body_mb = 32    # response cap of /v1/txs
+read_threads = 4          # concurrent store reads
+ready_max_lag = 20        # /readyz: max blocks a chain may lag the node (a halted chain is never ready)
+max_event_lists = 256     # event-name lists one event query may expand to
 
 [search]
-min_len = 4
+min_len = 4               # literal chars name/param need without modulename (search has no minimum)
 max_results = 100
 max_candidates = 10000
 max_scan_heights = 20000

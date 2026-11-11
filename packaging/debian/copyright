@@ -1,0 +1,34 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: kda-indexer
+Source: https://github.com/ZelCore-io/kda-indexer
+Comment:
+ Full licence texts: /usr/share/doc/kda-indexer/LICENSE-MIT and LICENSE-APACHE (and
+ /usr/share/common-licenses/Apache-2.0). Attribution notices for code that is vendored or
+ statically linked: /usr/share/doc/kda-indexer/THIRD_PARTY_NOTICES, NOTICE.libmdbx and
+ ptr_hash-LICENSE-MIT.
+ .
+ The binary statically links libmdbx (Copyright 2015-2026 Leonid Yuriev, Apache-2.0, through
+ reth-libmdbx and reth-mdbx-sys; its NOTICE is shipped as NOTICE.libmdbx) and the Rust
+ dependencies of the default build, all under MIT, Apache-2.0, BSD, zlib, ISC, BSL-1.0 or
+ Unicode-3.0 terms (or dual-licensed with one of them).
+
+Files: *
+Copyright: the kda-indexer contributors
+License: MIT or Apache-2.0
+ Licensed under either of the Apache License, Version 2.0 or the MIT licence, at your
+ option. On Debian systems the Apache-2.0 text is in /usr/share/common-licenses/Apache-2.0;
+ the MIT text is in /usr/share/doc/kda-indexer/LICENSE-MIT.
+
+Files: vendor/ptr_hash/*
+Copyright: Ragnar Groot Koerkamp
+License: MIT
+ See /usr/share/doc/kda-indexer/ptr_hash-LICENSE-MIT. The vendored copy drops the MPL-2.0
+ `colored` dependency and adds functions to save and load an index (THIRD_PARTY_NOTICES).
+
+Files: crates/kdx-api/data/miner_rewards.csv crates/kdx-api/data/token_payments.csv
+       crates/kdx-api/src/supply.rs
+Copyright: the chainweb-data authors
+License: BSD-3-clause
+ Data files copied from kda-community/chainweb-data and the circulating-supply formula of
+ its Chainweb.Coins module. The licence text is in
+ /usr/share/doc/kda-indexer/THIRD_PARTY_NOTICES.

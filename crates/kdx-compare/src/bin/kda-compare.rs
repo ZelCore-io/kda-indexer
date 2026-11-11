@@ -54,6 +54,17 @@ enum Cmd {
     },
     /// Parse and validate the config, then print it.
     CheckConfig,
+    /// P3 gate: per route and pair, requests compared, unexplained diffs, allowlisted hits,
+    /// errors and p50/p99 per side over the summary files in `out_dir`. Exit 0 iff green.
+    Summary {
+        /// Start of the window, `YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DD` (ten-minute buckets
+        /// that start at or after it).
+        #[arg(long)]
+        since: String,
+        /// `must` (the gated routes, default) or `all`.
+        #[arg(long, default_value = "must")]
+        routes: String,
+    },
     /// Debug: generate requests and print them.
     #[command(hide = true)]
     Gen {
@@ -80,6 +91,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::CheckConfig => {
             println!("{}", toml::to_string_pretty(&cfg)?);
+            Ok(())
+        }
+        Cmd::Summary { since, routes } => {
+            if !kdx_compare::summary::run(&cfg.out_dir, &since, &routes)? {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Cmd::Once {

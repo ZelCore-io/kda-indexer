@@ -1,4 +1,4 @@
-//! Hidden `hot stats`: open (or initialise) the hot store and print `Meta`, table row counts,
+//! Hidden `hot stats`: open the hot store read-only and print `Meta`, table row counts,
 //! dictionary sizes, counters and the MDBX geometry.
 
 use std::path::Path;
@@ -25,16 +25,18 @@ pub fn geometry(cfg: &Config) -> Geometry {
 pub fn stats(cfg: &Config, data_dir: &Path, digest: bool) -> anyhow::Result<()> {
     let dir = hot_dir(data_dir);
     println!("hot store          {}", dir.display());
-    let hs = HotStore::open(&dir, geometry(cfg))?;
-    let g = hs.geometry();
+    // Read-only: no write txn, so it can run next to the service (docs/operations.md).
+    let hs = HotStore::open_ro(&dir)?;
     let st = hs.env().stat().context("env stat")?;
     let info = hs.env().info().context("env info")?;
     println!(
-        "geometry           page {} B, growth {} MB, upper {} GB, current map {} B",
+        "geometry           page {} B, current map {} B, readers {}/{} (configured: growth {} MB, upper {} GB; recorded in Meta geometry)",
         st.page_size(),
-        g.growth_mb,
-        g.max_gb,
-        info.map_size()
+        info.map_size(),
+        info.num_readers(),
+        info.max_readers(),
+        cfg.storage.mdbx_growth_mb,
+        cfg.storage.mdbx_max_gb,
     );
     let txn = hs.ro()?;
     println!("meta");

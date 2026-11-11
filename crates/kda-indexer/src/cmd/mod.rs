@@ -15,10 +15,13 @@ pub mod frames;
 pub mod hot;
 pub mod inspect;
 pub mod measure;
+pub mod notify;
 pub mod probe;
 pub mod run;
 pub mod segments;
+pub mod serve;
 pub mod unwind;
+pub mod viewcheck;
 
 /// Build the node client from config; `max_rps` and `node_concurrency` come from `[ingest]`.
 pub fn node_client(cfg: &Config) -> anyhow::Result<NodeClient> {

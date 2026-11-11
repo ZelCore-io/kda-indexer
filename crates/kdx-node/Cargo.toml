@@ -17,4 +17,5 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+kdx-metrics.workspace = true
 url.workspace = true
