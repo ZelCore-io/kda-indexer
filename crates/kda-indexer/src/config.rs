@@ -320,6 +320,14 @@ pub struct BalancesConfig {
     pub local_rps: u32,
     /// `/local` calls in flight.
     pub local_concurrency: u32,
+    /// Most dirty keys of one non-coin module per reconcile batch (I-7).
+    pub module_share: u32,
+    /// Most `Balances` rows of one non-coin module (I-7).
+    pub module_rows: u32,
+    /// Most `Balances` rows of one account (I-7; `coin` rows are always kept).
+    pub account_rows: u32,
+    /// Hours after which a module's fungible check and a not-fungible verdict are re-done.
+    pub recheck_hours: u32,
 }
 
 impl Default for BalancesConfig {
@@ -328,6 +336,10 @@ impl Default for BalancesConfig {
             enabled: true,
             local_rps: 50,
             local_concurrency: 8,
+            module_share: 32,
+            module_rows: 1_000_000,
+            account_rows: 1_000,
+            recheck_hours: 24,
         }
     }
 }

@@ -7,11 +7,20 @@
 //! - `stale: true` when the row is also in `BalanceDirty` (B-3): a block changed it after that
 //!   read, or a reorg unwound one; or when the row is `unverified` (its re-read after a change
 //!   failed or was parked, I-5).
-//! - Rows the node reported absent are left out.
+//! - Rows the node reported absent are left out unless dirty. A dirty key with no row yet
+//!   (the seed backlog, a new account; M-4) is listed with `balance`, `guard` and
+//!   `as_of_height` null and `stale: true`.
+//! - Rows of a module marked not fungible (R-P5P9-8 #2) are left out.
+//! - `/accounts/{a}/balances` is paged by (module id, chain): `limit` 1..=100 (default 100),
+//!   `cursor` = `next_cursor`; a page may hold fewer items than `limit` (filtered keys).
+//! - `/keys/{pk}/accounts` lists only rows of `coin` and of modules confirmed `fungible-v2`
+//!   on the row's chain (I-6): another module's guard is the module's word, not the chain's.
+
+use std::collections::{BTreeMap, HashMap};
 
 use axum::extract::{Path, Query};
 use axum::response::{IntoResponse, Response};
-use kdx_hot::balances::{self, key_account_key, key_hash, BalanceRow};
+use kdx_hot::balances::{self, bal_key, key_account_key, key_hash, BalanceRow, KIND_NOT_FUNGIBLE};
 use kdx_hot::{Table, Txn};
 use kdx_types::{Dict, DictKind};
 use serde_json::{json, Value};
@@ -52,6 +61,29 @@ fn row_json(
     }))
 }
 
+/// A dirty key with no usable row (M-4).
+fn pending_json(module: &str, c: u8, r: Option<&BalanceRow>) -> Value {
+    json!({
+        "module": module,
+        "chain": c,
+        "balance": Value::Null,
+        "guard": Value::Null,
+        "as_of_height": r.map(|r| r.as_of),
+        "stale": true,
+    })
+}
+
+/// `(module, chain)` of an `/accounts/{a}/balances` cursor: 10 hex digits.
+fn parse_bal_cursor(c: &str) -> ApiResult<(u32, u8)> {
+    let bad = || ApiError::BadRequest("invalid cursor".into());
+    if c.len() != 10 {
+        return Err(bad());
+    }
+    let m = u32::from_str_radix(&c[..8], 16).map_err(|_| bad())?;
+    let ch = u8::from_str_radix(&c[8..], 16).map_err(|_| bad())?;
+    Ok((m, ch))
+}
+
 /// Current balances of an account per token and chain.
 #[utoipa::path(
     get,
@@ -60,8 +92,10 @@ fn row_json(
         ("account" = String, Path, description = "Account name"),
         ("token" = Option<String>, Query, description = "Token module (default: every token)"),
         ("chain" = Option<u8>, Query, description = "Chain id"),
+        ("limit" = Option<u32>, Query, description = "1..=100, default 100"),
+        ("cursor" = Option<String>, Query, description = "Opaque page cursor"),
     ),
-    responses((status = 200, description = "`items` of {module, chain, balance, guard, as_of_height, stale}, `as_of`"))
+    responses((status = 200, description = "`items` of {module, chain, balance, guard, as_of_height, stale}, `next_cursor`, `as_of`"))
 )]
 pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
     let (account, q) = match (parse_path(path), parse_query(q)) {
@@ -75,26 +109,84 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
         {
             return Err(ApiError::BadRequest("chain out of range".into()));
         }
+        let limit = q.limit.unwrap_or(super::MAX_LIMIT);
+        if limit == 0 || limit > super::MAX_LIMIT {
+            return Err(ApiError::BadRequest(format!(
+                "limit must be 1..={}",
+                super::MAX_LIMIT
+            )));
+        }
+        let after = q.cursor.as_deref().map(parse_bal_cursor).transpose()?;
         let d = view.dict();
         let Some(a) = d.account_id(account) else {
             return list_response(view, vec![], None);
         };
-        let token = match q.token.as_deref() {
-            None => None,
-            Some(t) => match d.module_id(t) {
-                Some(m) => Some(m),
+        let mut prefix = a.to_be_bytes().to_vec();
+        if let Some(t) = q.token.as_deref() {
+            match d.module_id(t) {
+                Some(m) => prefix.extend_from_slice(&m.to_be_bytes()),
                 None => return list_response(view, vec![], None),
-            },
+            }
+        }
+        let from = match after {
+            // The smallest key above the cursor's (all keys are 9 bytes).
+            Some((m, c)) => [&bal_key(a, m, c)[..], &[0]].concat(),
+            None => prefix.clone(),
         };
+        // The first `limit + 1` keys of each table: their union holds the first `limit + 1`
+        // keys of the account in rows and marks together.
+        let n = limit as usize + 1;
+        let mut keys: BTreeMap<Vec<u8>, (Option<BalanceRow>, bool)> = BTreeMap::new();
+        for (k, v) in view
+            .txn
+            .scan_limit(Table::Balances, &from, n, |k| k.starts_with(&prefix))?
+        {
+            keys.entry(k).or_default().0 = BalanceRow::decode(&v);
+        }
+        for t in [Table::BalanceDirty, Table::BalanceSeed] {
+            for (k, _) in view
+                .txn
+                .scan_limit(t, &from, n, |k| k.starts_with(&prefix))?
+            {
+                keys.entry(k).or_default().1 = true;
+            }
+        }
+        let mut hidden: HashMap<u32, bool> = HashMap::new();
         let mut items = Vec::new();
-        for (m, c, r) in balances::account_rows(&view.txn, a)? {
-            if r.absent || token.is_some_and(|t| t != m) || q.chain.is_some_and(|x| x != c) {
+        let mut last = None;
+        for (k, (row, dirty)) in keys.iter().take(limit as usize) {
+            view.check_deadline()?;
+            let Some((_, m, c)) = balances::parse_bal_key(k) else {
+                continue;
+            };
+            last = Some((m, c));
+            if q.chain.is_some_and(|x| x != c) {
+                continue;
+            }
+            let hide = match hidden.get(&m) {
+                Some(&h) => h,
+                None => {
+                    let h = balances::token_row(&view.txn, m)?
+                        .is_some_and(|t| t.kind == KIND_NOT_FUNGIBLE);
+                    hidden.insert(m, h);
+                    h
+                }
+            };
+            if hide {
                 continue;
             }
             let module = d.name(DictKind::Module, m).unwrap_or_default().to_owned();
-            items.push(row_json(view, &module, a, m, c, &r)?);
+            match row {
+                Some(r) if !r.absent => items.push(row_json(view, &module, a, m, c, r)?),
+                r if *dirty => items.push(pending_json(&module, c, r.as_ref())),
+                _ => {}
+            }
         }
-        list_response(view, items, None)
+        let next = (keys.len() > limit as usize)
+            .then_some(last)
+            .flatten()
+            .map(|(m, c)| format!("{m:08x}{c:02x}"));
+        list_response(view, items, next)
     })
     .await
 }
@@ -152,6 +244,7 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
                 k.starts_with(&kh)
             })?;
         let d = view.dict();
+        let coin = balances::coin_module(&view.txn)?;
         let mut items = Vec::new();
         let mut last = None;
         for (k, _) in rows.iter().take(limit as usize) {
@@ -164,7 +257,10 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
             last = Some(a);
             let mut modules = Vec::new();
             for (m, c, r) in balances::account_rows(&view.txn, a)? {
-                if r.absent || !balances::stored_guard_keys(&view.txn, &r.guard, c)?.contains(&pk) {
+                if r.absent
+                    || !balances::trusted(&view.txn, m, c, coin)?
+                    || !balances::stored_guard_keys(&view.txn, &r.guard, c)?.contains(&pk)
+                {
                     continue;
                 }
                 modules.push(json!({

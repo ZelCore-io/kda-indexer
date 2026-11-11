@@ -82,7 +82,10 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
                 }
                 .encode();
                 for (k, _) in &rows {
-                    if txn.insert(Table::BalanceDirty, k, &mark)? {
+                    let Ok(k) = <[u8; 9]>::try_from(k.as_slice()) else {
+                        continue;
+                    };
+                    if kdx_hot::balances::seed_mark(&mut txn, &k, &mark)? {
                         marked += 1;
                     }
                 }
@@ -100,7 +103,7 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
 
 fn status(hs: &HotStore) -> anyhow::Result<()> {
     let txn = hs.ro()?;
-    let dirty = txn.count(Table::BalanceDirty)?;
+    let dirty = kdx_hot::balances::dirty_count(&txn)?;
     let stats: Value = txn
         .meta(kdx_ingest::reconcile::META_STATS)?
         .and_then(|v| serde_json::from_slice(&v).ok())

@@ -16,7 +16,7 @@
 //! | `Counters` | name (utf-8) | u64 |
 //!
 //! Additive tables (rule A-1, P6; layouts in `balances.rs`): `Balances`, `BalanceDirty`,
-//! `Guards`, `KeyAccounts`, `Tokens`, `NftBalances`, `NftDirty`. `HotStore::open` creates them;
+//! `BalanceSeed`, `Guards`, `KeyAccounts`, `Tokens`, `NftBalances`, `NftDirty`. `HotStore::open` creates them;
 //! `open_ro` opens them when present, and a missing one reads as empty. They change no stored
 //! byte of the base tables or the segments, so they need no format version.
 //!
@@ -42,6 +42,7 @@ pub enum Table {
     // Additive (A-1).
     Balances,
     BalanceDirty,
+    BalanceSeed,
     Guards,
     KeyAccounts,
     Tokens,
@@ -82,10 +83,11 @@ impl Table {
 
     /// Tables added after format v2 without a version bump (rule A-1): optional on a
     /// read-only open, empty when missing.
-    pub fn additive() -> [Table; 7] {
+    pub fn additive() -> [Table; 8] {
         [
             Table::Balances,
             Table::BalanceDirty,
+            Table::BalanceSeed,
             Table::Guards,
             Table::KeyAccounts,
             Table::Tokens,
@@ -114,6 +116,7 @@ impl Table {
             Table::Counters => "Counters".into(),
             Table::Balances => "Balances".into(),
             Table::BalanceDirty => "BalanceDirty".into(),
+            Table::BalanceSeed => "BalanceSeed".into(),
             Table::Guards => "Guards".into(),
             Table::KeyAccounts => "KeyAccounts".into(),
             Table::Tokens => "Tokens".into(),

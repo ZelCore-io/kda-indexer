@@ -4,10 +4,11 @@
 //! | Table | Key | Value |
 //! |---|---|---|
 //! | `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node, b1: unverified), balance text as the node printed it, guard hash [16], as_of u32, reconciled_at u32 |
-//! | `BalanceDirty` | same | [`Mark`]: marked_height u32, seq u64 |
+//! | `BalanceDirty` | same | [`Mark`]: marked_height u32, seq u64 (tail marks) |
+//! | `BalanceSeed` | same | [`Mark`] with height 0 (the seed backlog, B-2) |
 //! | `Guards` | guard hash [16] | guard JSON bytes as the node returned them |
 //! | `KeyAccounts` | blake2b-128(public key) [16], AccountId u32 | empty |
-//! | `Tokens` | ModuleId u32 | first_height u32, holders u64, kind u8 |
+//! | `Tokens` | ModuleId u32 | [`TokenRow`]: first_height u32, holders u64, kind u8, flags u8, rows u32, fungible_chains u32, checked_chains u32, checked_at u32 |
 //!
 //! - The guard hash is blake2b-128 of the guard JSON. A keyset reference resolved with
 //!   `describe-keyset` is cached under [`ref_hash`] of its chain and name.
@@ -41,6 +42,12 @@ pub mod meta {
 
 /// `Tokens.kind`: a module seen as the module of a `TRANSFER` event (an `xfer` posting).
 pub const KIND_FUNGIBLE: u8 = 0;
+/// `Tokens.kind`: its `details` calls kept failing (R-P5P9-8 #2). The tail does not mark it,
+/// the reconciler drops its dirty keys without a call, `/tokens` hides it; the reconciler
+/// makes it [`KIND_FUNGIBLE`] again after its re-check interval.
+pub const KIND_NOT_FUNGIBLE: u8 = 1;
+/// `Tokens.flags`: the module reached its row cap (I-7); the tail marks no new key of it.
+pub const TOKEN_CAPPED: u8 = 1;
 
 /// `(AccountId, ModuleId, chain)` key of `Balances` and `BalanceDirty`.
 pub fn bal_key(account: u32, module: u32, chain: u8) -> [u8; 9] {
@@ -173,7 +180,23 @@ pub fn mark_dirty(
         seq: txn.txn_id()?,
     };
     txn.put(Table::BalanceDirty, &k, &m.encode())?;
+    // A tail mark takes the key out of the seed backlog (R-P5P9-8 #1).
+    txn.del(Table::BalanceSeed, &k)?;
     Ok(m)
+}
+
+/// Add a seed mark (B-2) unless the key already has a tail mark or a seed mark; returns
+/// whether it was added.
+pub fn seed_mark(txn: &mut RwTxn<'_>, k: &[u8; 9], mark: &[u8; 12]) -> Result<bool> {
+    if txn.get(Table::BalanceDirty, k)?.is_some() {
+        return Ok(false);
+    }
+    txn.insert(Table::BalanceSeed, k, mark)
+}
+
+/// Dirty keys: tail marks plus the seed backlog.
+pub fn dirty_count(txn: &impl Txn) -> Result<usize> {
+    Ok(txn.count(Table::BalanceDirty)? + txn.count(Table::BalanceSeed)?)
 }
 
 /// Delete the mark of `key` in `table` only when it is still exactly `read` (SR-1): a mark
@@ -223,6 +246,20 @@ pub fn mark_posting(
     let (chain, height) = (key.chain(), key.height());
     if family == Family::Xfer as u8 {
         let (account, module) = ((entity >> 32) as u32, entity as u32);
+        if Some(module) != coin {
+            if let Some(t) = token_row(txn, module)? {
+                // R-P5P9-8 #2 and I-7: no marks for a not-fungible module, nor for a new key
+                // of a module at its row cap.
+                if t.kind == KIND_NOT_FUNGIBLE
+                    || (t.capped()
+                        && txn
+                            .get(Table::Balances, &bal_key(account, module, chain))?
+                            .is_none())
+                {
+                    return Ok(());
+                }
+            }
+        }
         mark_dirty(txn, account, module, chain, height)?;
         if note_tokens {
             note_token(txn, module, height)?;
@@ -236,72 +273,109 @@ pub fn mark_posting(
 }
 
 /// One `Tokens` value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenRow {
     pub first_height: u32,
     pub holders: u64,
     pub kind: u8,
+    /// b0 [`TOKEN_CAPPED`].
+    pub flags: u8,
+    /// `Balances` rows of the module (I-7 cap).
+    pub rows: u32,
+    /// Chains where `describe-module` lists `fungible-v2` (I-6): rows of the module on these
+    /// chains feed `KeyAccounts`.
+    pub fungible_chains: u32,
+    /// Chains whose fungible check is done since `checked_at`.
+    pub checked_chains: u32,
+    /// Unix seconds: start of the current check round, or of the not-fungible verdict.
+    pub checked_at: u32,
 }
 
 impl TokenRow {
-    pub fn encode(&self) -> [u8; 13] {
-        let mut v = [0u8; 13];
+    pub fn encode(&self) -> [u8; 30] {
+        let mut v = [0u8; 30];
         v[..4].copy_from_slice(&self.first_height.to_be_bytes());
         v[4..12].copy_from_slice(&self.holders.to_be_bytes());
         v[12] = self.kind;
+        v[13] = self.flags;
+        v[14..18].copy_from_slice(&self.rows.to_be_bytes());
+        v[18..22].copy_from_slice(&self.fungible_chains.to_be_bytes());
+        v[22..26].copy_from_slice(&self.checked_chains.to_be_bytes());
+        v[26..30].copy_from_slice(&self.checked_at.to_be_bytes());
         v
     }
+    /// 30 bytes; the 13-byte form written before the checks decodes with them zero.
     pub fn decode(v: &[u8]) -> Option<TokenRow> {
-        if v.len() != 13 {
+        if v.len() != 13 && v.len() != 30 {
             return None;
         }
-        Some(TokenRow {
+        let mut t = TokenRow {
             first_height: be_u32(&v[..4])?,
             holders: u64::from_be_bytes(v[4..12].try_into().ok()?),
             kind: v[12],
-        })
+            ..TokenRow::default()
+        };
+        if v.len() == 30 {
+            t.flags = v[13];
+            t.rows = be_u32(&v[14..18])?;
+            t.fungible_chains = be_u32(&v[18..22])?;
+            t.checked_chains = be_u32(&v[22..26])?;
+            t.checked_at = be_u32(&v[26..30])?;
+        }
+        Some(t)
     }
+    pub fn capped(&self) -> bool {
+        self.flags & TOKEN_CAPPED != 0
+    }
+    /// The module's guards on `chain` are trusted (I-6).
+    pub fn fungible_on(&self, chain: u8) -> bool {
+        chain < 32 && self.fungible_chains & (1 << chain) != 0
+    }
+}
+
+/// The `Tokens` row of a module.
+pub fn token_row(txn: &impl Txn, module: u32) -> Result<Option<TokenRow>> {
+    match txn.get(Table::Tokens, &module.to_be_bytes())? {
+        Some(v) => Ok(Some(TokenRow::decode(&v).context("bad Tokens row")?)),
+        None => Ok(None),
+    }
+}
+
+/// Change a token row in place; a module with no row gets one with `first_height` u32::MAX
+/// until a posting lowers it.
+pub fn update_token(txn: &mut RwTxn<'_>, module: u32, f: impl FnOnce(&mut TokenRow)) -> Result<()> {
+    let mut r = token_row(txn, module)?.unwrap_or(TokenRow {
+        first_height: u32::MAX,
+        ..TokenRow::default()
+    });
+    let before = r;
+    f(&mut r);
+    if r != before || txn.get(Table::Tokens, &module.to_be_bytes())?.is_none() {
+        txn.put(Table::Tokens, &module.to_be_bytes(), &r.encode())?;
+    }
+    Ok(())
+}
+
+/// Whether the guards of `module`'s rows on `chain` feed `KeyAccounts` (I-6): `coin`, or a
+/// module whose `describe-module` lists `fungible-v2` on that chain.
+pub fn trusted(txn: &impl Txn, module: u32, chain: u8, coin: Option<u32>) -> Result<bool> {
+    Ok(Some(module) == coin || token_row(txn, module)?.is_some_and(|t| t.fungible_on(chain)))
 }
 
 /// Create the token row or lower its `first_height` to `height`.
 pub fn note_token(txn: &mut RwTxn<'_>, module: u32, height: u32) -> Result<()> {
-    let k = module.to_be_bytes();
-    let row = match txn.get(Table::Tokens, &k)? {
-        Some(v) => {
-            let mut r = TokenRow::decode(&v).context("bad Tokens row")?;
-            if r.first_height <= height {
-                return Ok(());
-            }
-            r.first_height = height;
-            r
-        }
-        None => TokenRow {
-            first_height: height,
-            holders: 0,
-            kind: KIND_FUNGIBLE,
-        },
-    };
-    txn.put(Table::Tokens, &k, &row.encode())
+    update_token(txn, module, |r| r.first_height = r.first_height.min(height))
 }
 
-/// Add `delta` to a token's holder count (saturating at 0). A module with no row gets one
-/// with `first_height` u32::MAX until a posting lowers it.
+/// Add `delta` to a token's holder count (saturating at 0).
 pub fn adjust_holders(txn: &mut RwTxn<'_>, module: u32, delta: i64) -> Result<()> {
-    let k = module.to_be_bytes();
-    let mut r = match txn.get(Table::Tokens, &k)? {
-        Some(v) => TokenRow::decode(&v).context("bad Tokens row")?,
-        None => TokenRow {
-            first_height: u32::MAX,
-            holders: 0,
-            kind: KIND_FUNGIBLE,
-        },
-    };
-    r.holders = if delta >= 0 {
-        r.holders.saturating_add(delta as u64)
-    } else {
-        r.holders.saturating_sub(delta.unsigned_abs())
-    };
-    txn.put(Table::Tokens, &k, &r.encode())
+    update_token(txn, module, |r| {
+        r.holders = if delta >= 0 {
+            r.holders.saturating_add(delta as u64)
+        } else {
+            r.holders.saturating_sub(delta.unsigned_abs())
+        }
+    })
 }
 
 /// Guard hash of the guard JSON bytes.
@@ -399,11 +473,10 @@ pub fn account_rows(txn: &impl Txn, account: u32) -> Result<Vec<(u32, u8, Balanc
     Ok(out)
 }
 
-/// Whether `(account, module, chain)` waits for a reconcile.
+/// Whether `(account, module, chain)` waits for a reconcile (a tail or a seed mark).
 pub fn is_dirty(txn: &impl Txn, account: u32, module: u32, chain: u8) -> Result<bool> {
-    Ok(txn
-        .get(Table::BalanceDirty, &bal_key(account, module, chain))?
-        .is_some())
+    let k = bal_key(account, module, chain);
+    Ok(txn.get(Table::BalanceDirty, &k)?.is_some() || txn.get(Table::BalanceSeed, &k)?.is_some())
 }
 
 #[cfg(test)]
@@ -429,9 +502,18 @@ mod tests {
         let t = TokenRow {
             first_height: 5,
             holders: 3,
-            kind: KIND_FUNGIBLE,
+            kind: KIND_NOT_FUNGIBLE,
+            flags: TOKEN_CAPPED,
+            rows: 9,
+            fungible_chains: 1 << 19,
+            checked_chains: 3,
+            checked_at: 77,
         };
         assert_eq!(TokenRow::decode(&t.encode()), Some(t));
+        assert!(t.capped() && t.fungible_on(19) && !t.fungible_on(0));
+        let mut old = [0u8; 13];
+        old[..4].copy_from_slice(&5u32.to_be_bytes());
+        assert_eq!(TokenRow::decode(&old).map(|t| t.first_height), Some(5));
 
         let d = tempfile::tempdir().unwrap();
         let hs = HotStore::open(d.path(), Geometry::default()).unwrap();

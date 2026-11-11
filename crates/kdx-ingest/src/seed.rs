@@ -107,7 +107,7 @@ impl Pending {
         }
         .encode();
         for k in self.rows.drain(..) {
-            if txn.insert(Table::BalanceDirty, &k, &mark)? {
+            if balances::seed_mark(&mut txn, &k, &mark)? {
                 rep.dirty_inserted += 1;
             }
         }

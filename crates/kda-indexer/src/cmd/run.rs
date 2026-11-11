@@ -258,6 +258,12 @@ fn balances_opts(
         },
         batch: 256,
         seed: true,
+        caps: kdx_ingest::reconcile::Caps {
+            module_share: b.module_share as usize,
+            module_rows: b.module_rows,
+            account_rows: b.account_rows,
+            recheck_secs: b.recheck_hours.saturating_mul(3600),
+        },
     };
     Ok(Some((super::local_node_client(cfg)?, o)))
 }

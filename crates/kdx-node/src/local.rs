@@ -2,9 +2,10 @@
 //! Task 9, rulings B-1 and H-1).
 //!
 //! Safety (B-1):
-//! - Only three code forms are ever sent, each a fixed text with names passed in `data`:
-//!   `({m}.details (read-msg "a"))`, `(describe-keyset (read-msg "k"))` and
-//!   `({m}.get-balance (read-msg "t") (read-msg "a"))`. Account, keyset and token names come
+//! - Only four code forms are ever sent, each a fixed text with names passed in `data`:
+//!   `({m}.details (read-msg "a"))`, `(describe-keyset (read-msg "k"))`,
+//!   `({m}.get-balance (read-msg "t") (read-msg "a"))` and the fungible check
+//!   `(contains "fungible-v2" (at 'interfaces (describe-module (read-msg "m"))))`. Account, keyset and token names come
 //!   from chain data and may be hostile; they never enter code.
 //! - `m` must match `^[A-Za-z_][A-Za-z0-9_\-]*(\.[A-Za-z_][A-Za-z0-9_\-]*)?$`, otherwise the
 //!   call is not made ([`LocalError::Skipped`]).
@@ -285,6 +286,27 @@ fn details_of(r: Local<Value>) -> LocalResult<Details> {
 }
 
 impl LocalClient {
+    /// Whether `module` lists `fungible-v2` among its interfaces on `chain` (I-6):
+    /// `(contains "fungible-v2" (at 'interfaces (describe-module (read-msg "m"))))` with
+    /// `data {"m": module}`. A non-boolean answer is a failure.
+    pub async fn implements_fungible(&self, chain: u8, module: &str) -> LocalResult<bool> {
+        check_module(module)?;
+        match self
+            .call(
+                chain,
+                "(contains \"fungible-v2\" (at 'interfaces (describe-module (read-msg \"m\"))))",
+                json!({ "m": module }),
+            )
+            .await?
+        {
+            Local::Found { value, height } => match value.as_bool() {
+                Some(b) => Ok(Local::Found { value: b, height }),
+                None => Err(invalid("describe-module: not a boolean")),
+            },
+            Local::Absent => Ok(Local::Absent),
+        }
+    }
+
     /// `(describe-keyset (read-msg "k"))` with `data {"k": name}`: the keyset JSON.
     pub async fn describe_keyset(&self, chain: u8, name: &str) -> LocalResult<Value> {
         check_name("keyset", name)?;
