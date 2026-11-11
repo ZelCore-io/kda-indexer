@@ -209,6 +209,11 @@ fn signers_with_clist(mut signers: Value) -> Value {
                 if m.get("addr").is_some_and(Value::is_null) {
                     m.remove("addr");
                 }
+                // Same for an explicit `"scheme": null` (seen live: 6F015oXp... chain 2 height
+                // 6900522, rOdMCBKS...; chainweb-data and compat list clist and pubKey only).
+                if m.get("scheme").is_some_and(Value::is_null) {
+                    m.remove("scheme");
+                }
             }
         }
     }
