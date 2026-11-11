@@ -192,11 +192,17 @@ sudo systemctl start kda-compare@mainnet01
 ## A second host from a snapshot
 
 A second host (a read replica, or a standby) starts from a snapshot of a running one
-instead of a full backfill. On the source host (the unit keeps running):
+instead of a full backfill. On the source host (the unit keeps running), snapshot onto the
+**same volume** as the data dir, without `--copy`: the segment files are hard-linked, so the
+snapshot takes almost no space there and `rsync` reads from it. Do not use `--copy` on the
+same volume; it writes a second full copy of every segment file to the source volume (on
+shared storage that is the allocation risk "Before any big write" in
+[operations.md](operations.md) warns about). Use `--copy` only to write the snapshot to
+another local filesystem.
 
 ```sh
 sudo -u kda-indexer kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
-    snapshot --out /opt/coins/data/kadena/kda-indexer/snapshot-copy --copy
+    snapshot --out /opt/coins/data/kadena/kda-indexer/snapshot-copy
 ```
 
 On the new host, install the package as above, but leave the data dir empty, stop the unit,

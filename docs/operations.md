@@ -263,7 +263,9 @@ kda-indexer --config .../mainnet01.toml snapshot --out /opt/coins/data/kadena/kd
 kda-indexer --config .../replica.toml serve        # replica.toml: data_dir of the snapshot, own api.* ports
 ```
 
-To seed another host, snapshot with `--copy` (or hard-link locally, then copy), then
+To seed another host, take a hard-linked snapshot on the source volume (no `--copy`: on the
+same volume `--copy` writes a second full copy of every segment file there; keep it for
+another local filesystem), then
 `rsync -aH SNAPSHOT_DIR/ other-host:/opt/coins/data/kadena/kda-indexer/mainnet01/` (`-H` keeps
 the hard links that exist inside the copy). See "A second host from a snapshot" in
 [install.md](install.md). A `run` on the copy catches up from the snapshot's checkpoints: it
