@@ -1627,6 +1627,37 @@ impl Ctx {
                 i += 1;
             }
         }
+        // B coinbase rows at a (chain, height) where A lists no row: an orphan when the node's
+        // canonical block there is another one (seen live: 99cb7008...?chain=1, chainweb-data
+        // coinbase row in T6y_F81b at chain 1 height 7392440, canonical 3J36InYO, whose
+        // coinbase went to another miner).
+        let mut j = 0;
+        while j < xb.len() && moved.len() < ORPHAN_CHECKS {
+            let r = &xb[j];
+            let (Some(c), Some(h), Some(bh)) = (
+                r.get("chain").and_then(Value::as_u64).map(|c| c as u8),
+                r.get("height").and_then(Value::as_u64),
+                s(r, "blockHash"),
+            ) else {
+                j += 1;
+                continue;
+            };
+            if s(r, "requestKey").as_deref() != Some("<coinbase>") || a_at.contains_key(&(c, h)) {
+                j += 1;
+                continue;
+            }
+            self.count_request("orphan-check", "node", 1);
+            let canon_hash = canonical_header(&self.node, &self.tips, c, h)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string));
+            if canon_hash.is_some_and(|ch| ch != bh) {
+                moved.push(xb.remove(j));
+            } else {
+                j += 1;
+            }
+        }
         // A rows whose only B copy was an orphan.
         for o in &moved {
             let rk = s(o, "requestKey");
