@@ -733,6 +733,18 @@ impl Ctx {
         {
             orphans = self.oracle_orphans(&mut va, &mut vb).await;
         }
+        // chainweb-data's /txs/recent can list a tx in an orphaned block (seen live:
+        // qTm3DYap... chain 14 height 7395953, chainweb-data block G33Rgc_P beside the canonical
+        // rt2smpaG it also holds; the node and compat rt2smpaG). A row both sides list by
+        // request key in another block goes under /orphans, A's row in its place, when the
+        // node's canonical block there is A's.
+        if req.route == RouteKind::Recent
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && sa == 200
+            && sb == 200
+        {
+            orphans.extend(self.recent_orphans(&va, &mut vb).await);
+        }
         // chainweb-data's transfers table misses some rows whose TRANSFER event it does hold
         // (seen live on chain 0 around heights 1.59M-1.69M). Rows only A lists, when B lists
         // no row of its own, are checked against B's own /txs/tx (at most GAP_CHECKS calls);
@@ -2016,6 +2028,44 @@ impl Ctx {
             }
         }
         true
+    }
+
+    /// `/txs/recent` rows of B whose request key A lists in another block, when the node's
+    /// canonical block at A's (chain, height) is A's: each is replaced by A's row and returned.
+    async fn recent_orphans(&self, va: &Value, vb: &mut Value) -> Vec<Value> {
+        let (Value::Array(xa), Value::Array(xb)) = (va, &mut *vb) else {
+            return Vec::new();
+        };
+        let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+        let mut cache = HashMap::new();
+        let mut checks = 0usize;
+        let mut moved = Vec::new();
+        for rb in xb.iter_mut() {
+            let Some(ra) = xa.iter().find(|ra| {
+                s(ra, "requestKey").is_some() && s(ra, "requestKey") == s(rb, "requestKey")
+            }) else {
+                continue;
+            };
+            let (Some(abh), Some(bbh), Some(c), Some(h)) = (
+                s(ra, "blockHash"),
+                s(rb, "blockHash"),
+                row_chain(ra),
+                row_height(ra),
+            ) else {
+                continue;
+            };
+            if abh == bbh {
+                continue;
+            }
+            let canon = self
+                .canon_cached(&mut cache, &mut checks, c, h)
+                .await
+                .flatten();
+            if canon.as_deref() == Some(abh.as_str()) {
+                moved.push(std::mem::replace(rb, ra.clone()));
+            }
+        }
+        moved
     }
 
     /// A row of a genesis block: height 0, or the first height of a chain added later.
