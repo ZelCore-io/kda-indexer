@@ -5,6 +5,7 @@ use kdx_decode::IndexedBlock;
 use kdx_types::record::{decode_block, encode_block, encode_tx};
 use kdx_types::TxKey;
 
+use crate::balances;
 use crate::checkpoint::{clear_checkpoint, set_checkpoint, Stage};
 use crate::dict::HotDict;
 use crate::env::{RwTxn, Txn};
@@ -37,7 +38,8 @@ fn defpact_bytes(keys: &[TxKey]) -> Vec<u8> {
 }
 
 /// Write one block (header, txs, request keys, postings, defpact steps, counters), its undo
-/// record, the queued dictionary names and the `Tail` checkpoint, all in `txn`.
+/// record, the queued dictionary names, the balance dirty marks of its `xfer`/`acct` postings
+/// (B-3) and the `Tail` checkpoint, all in `txn`.
 /// The block must not already be stored at (chain, height).
 pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Result<()> {
     let br = &b.block;
@@ -49,6 +51,7 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     }
     let mut ops = Vec::new();
     dict.persist(txn)?;
+    let coin = balances::coin_module(txn)?;
 
     let mut buf = Vec::new();
     encode_block(br, &mut buf);
@@ -81,6 +84,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
                     key: r.key,
                 });
             }
+            // B-3: balances this block may change are re-read from the node.
+            balances::mark_posting(txn, f as u8, e, r.key, coin, true)?;
         }
         if let Some(p) = &x.pact_id {
             let mut keys = txn
@@ -121,7 +126,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     Ok(())
 }
 
-fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp) -> Result<()> {
+/// `coin`: the `coin` ModuleId for the balance dirty marks of undone `acct` postings (B-3).
+fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
     match op {
         UndoOp::Header {
             chain,
@@ -143,6 +149,8 @@ fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp) -> Result<()> {
             key,
         } => {
             txn.del(Table::TailPostings, &posting_key(*family, *entity, *key))?;
+            // B-3: no balance undo ops; the row is marked dirty and re-read.
+            balances::mark_posting(txn, *family, *entity, *key, coin, false)?;
         }
         UndoOp::DefpactStep { pact, key } => {
             if let Some(v) = txn.get(Table::Defpacts, &pact.0)? {
@@ -171,12 +179,13 @@ pub fn unwind_to(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
         None => return Ok(0),
     };
     let rows = txn.scan(Table::Undo, &from, |k| k.first() == Some(&chain))?;
+    let coin = balances::coin_module(txn)?;
     let mut n = 0u32;
     for (k, v) in rows.iter().rev() {
         let (_, h) = parse_block_key(k).context("bad Undo key")?;
         let ops = undo::decode(v).with_context(|| format!("Undo chain {chain} height {h}"))?;
         for op in ops.iter().rev() {
-            undo_op(txn, op)?;
+            undo_op(txn, op, coin)?;
         }
         txn.del(Table::Undo, k)?;
         n += 1;
@@ -243,6 +252,73 @@ mod pact_family_tests {
         assert_eq!(super::unwind_to(&mut txn, 3, 99).unwrap(), 1);
         assert!(txn.get(Table::TailPostings, &pk).unwrap().is_none());
         assert!(txn.get(Table::Defpacts, &pact.0).unwrap().is_none());
+        txn.commit().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod balance_mark_tests {
+    use kdx_decode::index::xfer_entity;
+    use kdx_decode::{Family, IndexedBlock, TxIndex};
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{DictKind, DictMut, Hash32, TxKey};
+
+    use crate::balances::{bal_key, dirty_height, TokenRow};
+    use crate::{Geometry, HotDict, HotStore, Table, Txn};
+
+    /// B-3: apply marks `xfer` and `acct` postings dirty; undo marks them again.
+    #[test]
+    fn apply_and_undo_mark_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let coin = dict.intern(DictKind::Module, "coin");
+        let tok = dict.intern(DictKind::Module, "free.tok");
+        let alice = dict.intern(DictKind::Account, "alice");
+        let key = TxKey::new(200, 4, 1);
+        let ib = IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32([2u8; 32]),
+                chain: 4,
+                height: 200,
+                ..Default::default()
+            },
+            txs: vec![TxRecord {
+                key,
+                ..Default::default()
+            }],
+            idx: vec![TxIndex {
+                key,
+                postings: vec![
+                    (Family::Xfer, xfer_entity(alice, tok)),
+                    (Family::Acct, alice as u64),
+                ],
+                pact_id: None,
+                code_hash: None,
+            }],
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        };
+        super::apply(&mut txn, &ib, &mut dict).unwrap();
+        for m in [tok, coin] {
+            let v = txn.get(Table::BalanceDirty, &bal_key(alice, m, 4)).unwrap();
+            assert_eq!(v.as_deref().and_then(dirty_height), Some(200));
+        }
+        let t = txn.get(Table::Tokens, &tok.to_be_bytes()).unwrap();
+        assert_eq!(
+            t.as_deref()
+                .and_then(TokenRow::decode)
+                .map(|t| t.first_height),
+            Some(200)
+        );
+        // The reconciler cleared the marks; an undo marks the rows again.
+        txn.del(Table::BalanceDirty, &bal_key(alice, tok, 4))
+            .unwrap();
+        txn.del(Table::BalanceDirty, &bal_key(alice, coin, 4))
+            .unwrap();
+        assert_eq!(super::unwind_to(&mut txn, 4, 199).unwrap(), 1);
+        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 2);
         txn.commit().unwrap();
     }
 }

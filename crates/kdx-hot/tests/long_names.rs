@@ -86,7 +86,9 @@ fn rows(store: &HotStore) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     let ro = store.ro().unwrap();
     let mut out = Vec::new();
     for t in kdx_hot::Table::all() {
-        if t.name().starts_with("Dict") {
+        // Balance dirty marks and token rows survive an undo by design (B-3: no balance undo
+        // ops; the reconciler re-reads the rows).
+        if t.name().starts_with("Dict") || t.is_additive() {
             continue;
         }
         for (k, v) in ro.scan(t, &[], |_| true).unwrap() {

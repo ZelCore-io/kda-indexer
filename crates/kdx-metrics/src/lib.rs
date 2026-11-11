@@ -71,6 +71,12 @@ pub struct Metrics {
     /// Read views: `phase` = open (taking the txn and segment snapshot) | held (open to drop).
     pub read_view_seconds: Hist,
     pub dict_snapshot_names: Gauge,
+    /// Rows in `BalanceDirty` (spec §3.9, plan Task 9).
+    pub balance_dirty_rows: Gauge,
+    /// `/local` reconcile outcomes: `result` = ok | absent | error | skipped.
+    pub balance_reconcile: Count,
+    /// Duration of one `/local` reconcile call (`result` as above).
+    pub balance_reconcile_seconds: Hist,
 }
 
 impl Metrics {
@@ -221,6 +227,21 @@ impl Metrics {
             "Names in the API dictionary snapshot",
             Gauge::default()
         );
+        let balance_dirty_rows = reg!(
+            "kdx_balance_dirty_rows",
+            "Balance rows waiting for a /local reconcile",
+            Gauge::default()
+        );
+        let balance_reconcile = reg!(
+            "kdx_balance_reconcile",
+            "Balance reconcile calls (result ok|absent|error|skipped)",
+            Count::default()
+        );
+        let balance_reconcile_seconds = reg!(
+            "kdx_balance_reconcile_seconds",
+            "Balance reconcile call duration (result ok|absent|error|skipped)",
+            hist(seconds)
+        );
         Metrics {
             registry: r,
             build_info,
@@ -251,6 +272,9 @@ impl Metrics {
             freezer_seconds,
             read_view_seconds,
             dict_snapshot_names,
+            balance_dirty_rows,
+            balance_reconcile,
+            balance_reconcile_seconds,
         }
     }
 
@@ -309,6 +333,15 @@ impl Metrics {
         self.merkle_blocks
             .get_or_create(&vec![("result", result.into())])
             .inc();
+    }
+
+    /// One balance reconcile outcome (`ok|absent|error|skipped`) and its duration.
+    pub fn balance_reconcile(&self, result: &'static str, secs: f64) {
+        let l: Labels = vec![("result", result.into())];
+        self.balance_reconcile.get_or_create(&l).inc();
+        self.balance_reconcile_seconds
+            .get_or_create(&l)
+            .observe(secs);
     }
 
     pub fn search_rejected(&self, reason: &'static str) {

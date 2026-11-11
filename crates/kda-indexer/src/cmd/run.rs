@@ -221,11 +221,45 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         let node = super::node_client(cfg)?;
         node.set_batch_limit(cfg.ingest.batch_size);
         let ctx = Arc::new(Ctx::open_with(opts(cfg, &data_dir, a.until), node, hot).await?);
-        let r = follow(ctx, token.clone(), a.freeze, search_opts(cfg, &data_dir)?).await;
+        let r = follow(
+            ctx,
+            token.clone(),
+            a.freeze,
+            search_opts(cfg, &data_dir)?,
+            balances_opts(cfg)?,
+        )
+        .await;
         return stop_api(api, token, r).await;
     }
-    let r = follow(ctx, token.clone(), a.freeze, search_opts(cfg, &data_dir)?).await;
+    let r = follow(
+        ctx,
+        token.clone(),
+        a.freeze,
+        search_opts(cfg, &data_dir)?,
+        balances_opts(cfg)?,
+    )
+    .await;
     stop_api(api, token, r).await
+}
+
+/// Stage 8 (balances, B-5) from `[balances]`: its own node client and options, or None when
+/// disabled.
+fn balances_opts(
+    cfg: &Config,
+) -> anyhow::Result<Option<(kdx_node::NodeClient, kdx_ingest::reconcile::ReconcileOpts)>> {
+    let b = &cfg.balances;
+    if !b.enabled {
+        return Ok(None);
+    }
+    let o = kdx_ingest::reconcile::ReconcileOpts {
+        local: kdx_node::LocalOpts {
+            rps: b.local_rps,
+            concurrency: b.local_concurrency.max(1) as usize,
+        },
+        batch: 256,
+        seed: true,
+    };
+    Ok(Some((super::local_node_client(cfg)?, o)))
 }
 
 /// Tail stage 7 settings from `[search]`.
@@ -322,6 +356,7 @@ async fn follow(
     token: CancellationToken,
     freeze: bool,
     search: kdx_ingest::search_stage::SearchStageOpts,
+    balances: Option<(kdx_node::NodeClient, kdx_ingest::reconcile::ReconcileOpts)>,
 ) -> anyhow::Result<()> {
     {
         let c = ctx.clone();
@@ -340,6 +375,17 @@ async fn follow(
         search,
         search_stop.clone(),
     ));
+    // Stage 8: balance seed (when absent) and `/local` reconciler (B-5). Its errors are
+    // logged; ingest goes on without it.
+    let bal_stop = token.child_token();
+    let bal = balances.map(|(node, o)| {
+        tokio::spawn(kdx_ingest::reconcile::supervise(
+            ctx.clone(),
+            node,
+            o,
+            bal_stop.clone(),
+        ))
+    });
     let fz_stop = token.child_token();
     let fz = freeze.then(|| {
         let ctx = ctx.clone();
@@ -392,6 +438,12 @@ async fn follow(
     search_stop.cancel();
     if let Err(e) = search.await.map_err(anyhow::Error::from).and_then(|x| x) {
         tracing::error!(error = format!("{e:#}"), "search stage");
+    }
+    bal_stop.cancel();
+    if let Some(b) = bal {
+        if let Err(e) = b.await.map_err(anyhow::Error::from).and_then(|x| x) {
+            tracing::error!(error = format!("{e:#}"), "balances reconciler");
+        }
     }
     let txn = ctx.hot.ro()?;
     tracing::info!(

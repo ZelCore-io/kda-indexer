@@ -10,8 +10,10 @@ pub mod fetch;
 pub mod freezer;
 pub mod heartbeat;
 pub mod pipeline;
+pub mod reconcile;
 pub mod reorg;
 pub mod search_stage;
+pub mod seed;
 pub mod tail;
 
 pub use canon::{HeaderMode, Walker};

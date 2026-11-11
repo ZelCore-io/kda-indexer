@@ -149,6 +149,23 @@ enum Command {
         #[arg(long)]
         copy: bool,
     },
+    /// Balances (B-2…B-5): rerun the seed, mark every row dirty, or print the reconcile
+    /// status. `run` seeds and reconciles by itself; `--seed` and `--all` take the data dir
+    /// lock (service stopped), `--status` only reads.
+    ReconcileBalances {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Run (or resume) the seed walk: mark every known (account, module, chain) dirty.
+        #[arg(long, conflicts_with_all = ["all", "status"])]
+        seed: bool,
+        /// Mark every `Balances` row dirty (the next `run` re-reads them all).
+        #[arg(long, conflicts_with_all = ["seed", "status"])]
+        all: bool,
+        /// Dirty rows, rate, ETA and seed state.
+        #[arg(long, conflicts_with_all = ["seed", "all"])]
+        status: bool,
+    },
     /// Code search index (`search/`): rebuild it, or query it (dev aid).
     Search {
         #[command(subcommand)]
@@ -478,6 +495,25 @@ async fn main() -> anyhow::Result<()> {
             out,
             copy,
         }),
+        Command::ReconcileBalances {
+            data_dir,
+            seed,
+            all,
+            status,
+        } => {
+            use kda_indexer::cmd::reconcile::Mode;
+            let mode = match (seed, all, status) {
+                (true, _, _) => Mode::Seed,
+                (_, true, _) => Mode::All,
+                (_, _, true) => Mode::Status,
+                _ => anyhow::bail!("reconcile-balances needs --seed, --all or --status"),
+            };
+            kda_indexer::cmd::reconcile::run(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                mode,
+            )
+        }
         Command::Search { action } => match action {
             SearchAction::Rebuild {
                 data_dir,

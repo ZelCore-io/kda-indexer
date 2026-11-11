@@ -1,10 +1,12 @@
 //! kdx-hot: the MDBX hot store (spec §3.3): dictionaries, tail blocks and txs, tail postings,
-//! defpacts, undo records, stage checkpoints and counters.
+//! defpacts, undo records, stage checkpoints and counters; and the additive balance tables
+//! (rule A-1, `balances.rs`).
 //!
 //! Values are the v1 record codec bytes (`encode_tx`/`encode_block`, plain form) or small
 //! big-endian layouts documented in `tables.rs`. Keys are big-endian so MDBX order is numeric
 //! order. No `rkyv` in P2.
 
+pub mod balances;
 pub mod checkpoint;
 pub mod dict;
 pub mod env;

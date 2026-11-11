@@ -17,6 +17,7 @@ pub mod inspect;
 pub mod measure;
 pub mod notify;
 pub mod probe;
+pub mod reconcile;
 pub mod run;
 pub mod search;
 pub mod segments;
@@ -47,6 +48,15 @@ pub fn node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
         max_sse_event_bytes: cfg.node.max_sse_event_bytes,
     };
     Ok(NodeClient::new(&ncfg)?)
+}
+
+/// The node client of the balance reconciler: `[balances] local_rps` and
+/// `local_concurrency` instead of the `[ingest]` budget (B-1).
+pub fn local_node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
+    let mut c = cfg.clone();
+    c.ingest.max_rps = cfg.balances.local_rps;
+    c.ingest.node_concurrency = cfg.balances.local_concurrency.max(1) as usize;
+    node_client(&c)
 }
 
 /// Take the exclusive lock on `<data_dir>/LOCK` for a writing command (`run`, `tail`,

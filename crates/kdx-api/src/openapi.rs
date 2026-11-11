@@ -3,7 +3,7 @@
 
 use utoipa::OpenApi;
 
-use crate::native::{accounts, blocks, events, stats, txs};
+use crate::native::{accounts, balances, blocks, events, stats, tokens, txs};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -14,9 +14,9 @@ use crate::native::{accounts, blocks, events, stats, txs};
 List routes take limit (1..=100, default 20), an opaque cursor, order (desc default, asc), minheight, \
 maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can be shorter than \
 limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away \
-answers 400 'cursor invalidated by reorg'. Routes reserved for P6 answer 501 {\"error\": \"not implemented until P6\"}: \
-/txs/{requestKey}/defpact, /accounts/{account}/balances, /keys/{pubkey}/accounts, /tokens, /tokens/{module}, \
-/search/code, /search/events, /nft/accounts/{account}."
+answers 400 'cursor invalidated by reorg'. Balances and tokens come from /local reconciles: every \
+balance row carries as_of_height and stale. Routes reserved for P6 answer 501 {\"error\": \"not implemented until P6\"}: \
+/txs/{requestKey}/defpact, /search/code, /search/events, /nft/accounts/{account}."
     ),
     paths(
         crate::status::handler,
@@ -29,6 +29,10 @@ answers 400 'cursor invalidated by reorg'. Routes reserved for P6 answer 501 {\"
         accounts::transfers,
         accounts::txs,
         accounts::key_txs,
+        balances::account_balances,
+        balances::key_accounts,
+        tokens::list,
+        tokens::get,
         events::list,
     )
 )]

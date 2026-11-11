@@ -306,6 +306,47 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search que
 - Deleting `search/` and restarting the service rebuilds it in the background; nothing else
   depends on it.
 
+## Balances
+
+`run` keeps the balance tables itself (spec §3.9, stage 8): when `Meta balances_seeded` is
+absent and backfill is done it runs the seed, then a reconciler reads every dirty row from the
+node's `/local` and writes the balance, guard and key rows. `serve` only reads them. Turn it off
+with `[balances] enabled = false`.
+
+- **Seed** (no node calls): marks every known `(account, module, chain)` dirty: both sides of
+  every `TRANSFER` (`xfer` postings) on each chain they touch, and every account seen in any
+  event (`acct` postings) for `coin` on each chain it touches. It walks the hot tail, then the
+  segments, and writes 100,000 rows per commit with a resume cursor, so a restart continues
+  where it stopped. Mainnet: roughly 1–2M rows.
+- **Reconcile**: up to 256 dirty rows per batch, oldest mark first, through a node client of its
+  own at `[balances] local_rps` calls per second (default 50) with `local_concurrency` in
+  flight (default 8). Each call is `({module}.details (read-msg "a"))` with the account in the
+  request data, gas limit 150,000; keyset references are resolved with `describe-keyset`.
+  Mainnet first pass: about 6–12 h at 50/s; everything else runs meanwhile.
+- **Marks**: every tail block marks the balances it may change (`TRANSFER` sides, every account
+  of its events for `coin`), and a reorg's undo marks the unwound blocks' rows again. A row
+  that is dirty is served with `stale: true` until it is re-read.
+- **Errors**: a node error (timeout, HTTP, decode) keeps the row dirty, moves it to the back of
+  the queue and backs off up to 60 s; it never becomes a zero balance. A Pact failure (for
+  example a token module without a `details` function) drops the mark and leaves any stored row
+  as it was. A module name that fails the safety check is skipped without a call.
+
+```sh
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --status
+# service stopped (both take the data dir lock):
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --seed
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --all
+```
+
+- `--status`: dirty rows, balance/absent/guard/key/token counts, seed state (`seeded_height`,
+  `seed_in_progress`), the reconciler's rate, ETA and heartbeat age. Read-only; runs beside the
+  service.
+- `--seed`: runs (or resumes) the seed walk now; the next `run` reconciles what it marked.
+- `--all`: marks every stored balance row dirty, so the next `run` re-reads them all.
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped"}`
+  and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
+  means the node is refusing `/local` calls (see the log line `balances: node errors`).
+
 ## Before any big write
 
 Before a backfill, a merge of many ranges, a rebuild or a replica copy on a host with shared

@@ -591,6 +591,33 @@ stored code is checked with the LIKE matcher. A pattern without such a run has n
 **Snapshot.** `snapshot` reads `search/manifest.json`, then `meta.json`, links the files of
 the segments `meta.json` lists, and writes both plus `.managed.json` (the linked names).
 
+## Additive tables
+
+The hot store can gain tables without a format version change (rule A-1). Such a table changes no
+stored byte of the base tables or the segments, and its rows are derived state that a rerun
+rebuilds. `HotStore::open` (read-write) creates every table, so `run` adds them on its first
+start. `open_ro` (`serve`, `inspect`, `hot stats`) opens the base tables strictly and the
+additive ones only when present; a missing additive table reads as empty, so the routes over it
+answer empty lists. Snapshots copy them like any table. They are not undone by tail undo: a
+reorg marks the affected balance rows dirty instead.
+
+| Table | Key | Value |
+|---|---|---|
+| `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node), balance text as the node printed it, guard hash [16], as_of u32 (the node tip the `/local` answer read: `metaData.blockHeight − 1`, since the node reports the pending block's height; for an absent row, the chain's tail height at the call), reconciled_at u32 (unix s) |
+| `BalanceDirty` | same | marked_height u32 (highest block height that marked it; 0 from the seed) |
+| `Guards` | guard hash [16] = blake2b-128 of the guard JSON as returned; a resolved keyset reference under blake2b-128 of `keysetref:{chain}:{name}` | guard (or keyset) JSON bytes |
+| `KeyAccounts` | blake2b-128 of the public key [16], AccountId u32 | empty |
+| `Tokens` | ModuleId u32 | first_height u32, holders u64, kind u8 (0 = fungible) |
+| `NftBalances`, `NftDirty` | AccountId u32, token-id hash [16], chain u8 | marmalade state (P6 NFT task) |
+
+`Meta` keys of the balance seed: `balances_seeded` (u32: the highest tail height when the seed
+finished), `balances_seed_cursor` (13 bytes while a seed runs: range start u32, range end u32,
+family u8, entity index u32) and `balances_reconcile_stats` (JSON heartbeat of the reconciler).
+
+`KeyAccounts` is keyed by a hash of the key text, not by a `PubKey` dictionary id: the
+dictionary stays a pure function of the blocks (`hot stats --digest` replay checks), and keys
+that never signed a transaction are covered.
+
 ## Checking
 
 `kda-indexer segments check` verifies the manifest (contiguous heights and TxNums), the

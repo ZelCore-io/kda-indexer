@@ -19,7 +19,7 @@ use crate::tables::{Table, Tables};
 /// (`pact` postings, chainweb-data's transfer rule) and opens with `MAX_DBS` 64.
 pub const FORMAT_VERSION: u64 = 2;
 
-/// MDBX named-database slots (20 tables in use; room for the additive P6/P7 tables).
+/// MDBX named-database slots (27 tables in use with the additive P6 tables; room for P7).
 pub const MAX_DBS: usize = 64;
 
 /// The error for a hot store in another format version.
@@ -134,7 +134,8 @@ impl HotStore {
 
     /// Open an existing hot store read-only (`serve`, `inspect`, `hot stats`): MDBX read-only
     /// mode, no geometry set, no write txn, no table created. Refuses a missing store, a
-    /// missing table or another `format_version`. `rw()` on it errors. The geometry reported
+    /// missing base table or another `format_version`; a missing additive table (A-1) reads
+    /// as empty. `rw()` on it errors. The geometry reported
     /// is the default (the real one is in `Meta geometry`).
     pub fn open_ro(dir: &Path) -> Result<HotStore> {
         if !dir.join("mdbx.dat").is_file() {
@@ -152,10 +153,15 @@ impl HotStore {
         {
             let txn = env.begin_ro_txn()?;
             for t in Table::all() {
-                let db = txn
-                    .open_db(Some(&t.name()))
-                    .with_context(|| format!("hot store table {} missing", t.name()))?;
-                dbis.push((t, db.dbi()));
+                match txn.open_db(Some(&t.name())) {
+                    Ok(db) => dbis.push((t, db.dbi())),
+                    // A-1: a store written before an additive table existed reads it as empty.
+                    Err(reth_libmdbx::Error::NotFound) if t.is_additive() => {}
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("hot store table {} missing", t.name())))
+                    }
+                }
             }
             let tables = Tables::new(dbis.clone());
             let v = txn
@@ -259,7 +265,16 @@ pub trait Txn {
     fn tables(&self) -> &Tables;
 
     fn get(&self, t: Table, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.raw().get::<Vec<u8>>(self.tables().dbi(t), key)?)
+        let Some(dbi) = self.tables().dbi_opt(t) else {
+            return Ok(None);
+        };
+        Ok(self.raw().get::<Vec<u8>>(dbi, key)?)
+    }
+
+    /// Whether the table exists in this store (false only for an additive table on a store
+    /// opened read-only that predates it).
+    fn has_table(&self, t: Table) -> bool {
+        self.tables().dbi_opt(t).is_some()
     }
 
     /// Rows with `from <= key`, in key order, while `keep(key)` holds (`from = &[]` = all).
@@ -269,8 +284,11 @@ pub trait Txn {
         from: &[u8],
         mut keep: impl FnMut(&[u8]) -> bool,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut c = self.raw().cursor(self.tables().dbi(t))?;
         let mut out = Vec::new();
+        let Some(dbi) = self.tables().dbi_opt(t) else {
+            return Ok(out);
+        };
+        let mut c = self.raw().cursor(dbi)?;
         let first = if from.is_empty() {
             c.first::<Vec<u8>, Vec<u8>>()?
         } else {
@@ -290,7 +308,10 @@ pub trait Txn {
     /// Keys with `from <= key`, in key order, while `f(key)` holds (`from = &[]` = all).
     /// Values are never copied and nothing is collected: for counting walks.
     fn walk_keys(&self, t: Table, from: &[u8], mut f: impl FnMut(&[u8]) -> bool) -> Result<()> {
-        let mut c = self.raw().cursor(self.tables().dbi(t))?;
+        let Some(dbi) = self.tables().dbi_opt(t) else {
+            return Ok(());
+        };
+        let mut c = self.raw().cursor(dbi)?;
         let mut cur = if from.is_empty() {
             c.first::<Vec<u8>, ()>()?
         } else {
@@ -346,19 +367,25 @@ pub trait Txn {
         prefix: &[u8],
         upper: &[u8],
     ) -> Result<RevScan<Self::Kind>> {
-        let c = self.raw().cursor(self.tables().dbi(t))?;
+        let c = match self.tables().dbi_opt(t) {
+            Some(dbi) => Some(self.raw().cursor(dbi)?),
+            None => None,
+        };
         Ok(RevScan {
+            done: c.is_none(),
             c,
             prefix: prefix.to_vec(),
             upper: upper.to_vec(),
             started: false,
-            done: false,
         })
     }
 
     /// Number of rows in a table.
     fn count(&self, t: Table) -> Result<usize> {
-        Ok(self.raw().db_stat_with_dbi(self.tables().dbi(t))?.entries())
+        let Some(dbi) = self.tables().dbi_opt(t) else {
+            return Ok(0);
+        };
+        Ok(self.raw().db_stat_with_dbi(dbi)?.entries())
     }
 
     fn meta(&self, name: &str) -> Result<Option<Vec<u8>>> {
@@ -386,7 +413,8 @@ pub trait Txn {
 
 /// Streaming reverse prefix scan (see [`Txn::scan_rev_prefix`]).
 pub struct RevScan<K: TransactionKind> {
-    c: Cursor<K>,
+    /// None: the table is a missing additive table (`done` from the start).
+    c: Option<Cursor<K>>,
     prefix: Vec<u8>,
     upper: Vec<u8>,
     started: bool,
@@ -395,8 +423,11 @@ pub struct RevScan<K: TransactionKind> {
 
 impl<K: TransactionKind> RevScan<K> {
     fn step(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let Some(c) = self.c.as_mut() else {
+            return Ok(None);
+        };
         let row = if self.started {
-            self.c.prev::<Vec<u8>, Vec<u8>>()?
+            c.prev::<Vec<u8>, Vec<u8>>()?
         } else {
             self.started = true;
             // Start at the first key >= the bound (the upper bound, or the prefix's successor),
@@ -408,12 +439,12 @@ impl<K: TransactionKind> RevScan<K> {
                 (false, _) => Some(self.upper.clone()),
             };
             let at = match bound {
-                Some(b) => self.c.set_range::<Vec<u8>, Vec<u8>>(&b)?,
+                Some(b) => c.set_range::<Vec<u8>, Vec<u8>>(&b)?,
                 None => None,
             };
             match at {
-                Some(_) => self.c.prev::<Vec<u8>, Vec<u8>>()?,
-                None => self.c.last::<Vec<u8>, Vec<u8>>()?,
+                Some(_) => c.prev::<Vec<u8>, Vec<u8>>()?,
+                None => c.last::<Vec<u8>, Vec<u8>>()?,
             }
         };
         Ok(row.filter(|(k, _)| {

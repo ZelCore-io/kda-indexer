@@ -301,12 +301,21 @@ impl Default for SearchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BalancesConfig {
+    /// Run the balance seed and the `/local` reconciler inside `run` (B-5).
+    pub enabled: bool,
+    /// `/local` calls started per second (B-1; also the reconciler node client's rate).
     pub local_rps: u32,
+    /// `/local` calls in flight.
+    pub local_concurrency: u32,
 }
 
 impl Default for BalancesConfig {
     fn default() -> Self {
-        Self { local_rps: 50 }
+        Self {
+            enabled: true,
+            local_rps: 50,
+            local_concurrency: 8,
+        }
     }
 }
 

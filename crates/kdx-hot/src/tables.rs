@@ -15,9 +15,13 @@
 //! | `Undo` | chain u8, height u32 | encoded `Vec<UndoOp>` (`undo.rs`) |
 //! | `Counters` | name (utf-8) | u64 |
 //!
+//! Additive tables (rule A-1, P6; layouts in `balances.rs`): `Balances`, `BalanceDirty`,
+//! `Guards`, `KeyAccounts`, `Tokens`, `NftBalances`, `NftDirty`. `HotStore::open` creates them;
+//! `open_ro` opens them when present, and a missing one reads as empty. They change no stored
+//! byte of the base tables or the segments, so they need no format version.
+//!
 //! `TailPostings` uses a composite key with an empty value instead of a dup-sorted table:
 //! same order and prefix scans, one row per posting, exact deletes by key.
-//! `Balances`, `Guards`, `KeyAccounts`, `NftBalances` are P6 and not created.
 
 use kdx_types::{DictKind, Hash32, TxKey};
 
@@ -35,6 +39,14 @@ pub enum Table {
     Defpacts,
     Undo,
     Counters,
+    // Additive (A-1).
+    Balances,
+    BalanceDirty,
+    Guards,
+    KeyAccounts,
+    Tokens,
+    NftBalances,
+    NftDirty,
 }
 
 fn kind_name(k: DictKind) -> &'static str {
@@ -64,7 +76,26 @@ impl Table {
             Table::Undo,
             Table::Counters,
         ]);
+        v.extend(Table::additive());
         v
+    }
+
+    /// Tables added after format v2 without a version bump (rule A-1): optional on a
+    /// read-only open, empty when missing.
+    pub fn additive() -> [Table; 7] {
+        [
+            Table::Balances,
+            Table::BalanceDirty,
+            Table::Guards,
+            Table::KeyAccounts,
+            Table::Tokens,
+            Table::NftBalances,
+            Table::NftDirty,
+        ]
+    }
+
+    pub fn is_additive(self) -> bool {
+        Table::additive().contains(&self)
     }
 
     pub fn name(self) -> String {
@@ -81,6 +112,13 @@ impl Table {
             Table::Defpacts => "Defpacts".into(),
             Table::Undo => "Undo".into(),
             Table::Counters => "Counters".into(),
+            Table::Balances => "Balances".into(),
+            Table::BalanceDirty => "BalanceDirty".into(),
+            Table::Guards => "Guards".into(),
+            Table::KeyAccounts => "KeyAccounts".into(),
+            Table::Tokens => "Tokens".into(),
+            Table::NftBalances => "NftBalances".into(),
+            Table::NftDirty => "NftDirty".into(),
         }
     }
 }
@@ -95,12 +133,15 @@ impl Tables {
     pub(crate) fn new(dbis: Vec<(Table, u32)>) -> Tables {
         Tables { dbis }
     }
+    /// The handle of a table. Every base table is open; an additive table may be missing on
+    /// a read-only store (use [`Tables::dbi_opt`] for those).
     pub fn dbi(&self, t: Table) -> u32 {
-        self.dbis
-            .iter()
-            .find(|(x, _)| *x == t)
-            .map(|(_, d)| *d)
-            .expect("every table is opened at HotStore::open")
+        self.dbi_opt(t)
+            .expect("every base table is opened at HotStore::open")
+    }
+    /// `None` only for an additive table absent from a store opened read-only (A-1).
+    pub fn dbi_opt(&self, t: Table) -> Option<u32> {
+        self.dbis.iter().find(|(x, _)| *x == t).map(|(_, d)| *d)
     }
     pub fn iter(&self) -> impl Iterator<Item = (Table, u32)> + '_ {
         self.dbis.iter().copied()

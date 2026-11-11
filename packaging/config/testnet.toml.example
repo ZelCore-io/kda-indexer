@@ -74,7 +74,9 @@ build_threads = 2          # search rebuild threads
 heap_mb = 512              # search rebuild writer heap
 
 [balances]
-local_rps = 50
+enabled = true             # seed and /local reconciler inside run (B-5)
+local_rps = 50             # /local calls per second
+local_concurrency = 8      # /local calls in flight
 
 [metrics]
 textfile = "/var/lib/node_exporter/textfile_collector/kda_indexer_testnet.prom"   # optional

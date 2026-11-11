@@ -28,9 +28,11 @@ use crate::store::{PostingQuery, View};
 use crate::{ApiError, ApiResult};
 
 pub mod accounts;
+pub mod balances;
 pub mod blocks;
 pub mod events;
 pub mod stats;
+pub mod tokens;
 pub mod txs;
 
 pub const DEFAULT_LIMIT: u32 = 20;
@@ -201,10 +203,13 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/events", get(events::list))
         // P6.
         .route("/txs/{request_key}/defpact", get(nope))
-        .route("/accounts/{account}/balances", get(nope))
-        .route("/keys/{pubkey}/accounts", get(nope))
-        .route("/tokens", get(nope))
-        .route("/tokens/{module}", get(nope))
+        .route(
+            "/accounts/{account}/balances",
+            get(balances::account_balances),
+        )
+        .route("/keys/{pubkey}/accounts", get(balances::key_accounts))
+        .route("/tokens", get(tokens::list))
+        .route("/tokens/{module}", get(tokens::get))
         .route("/search/code", get(nope))
         .route("/search/events", get(nope))
         .route("/nft/accounts/{account}", get(nope));

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "kda-indexer native API",
-    "description": "Internal and unstable until a public hostname is decided. JSON in snake_case. List routes take limit (1..=100, default 20), an opaque cursor, order (desc default, asc), minheight, maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can be shorter than limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away answers 400 'cursor invalidated by reorg'. Routes reserved for P6 answer 501 {\"error\": \"not implemented until P6\"}: /txs/{requestKey}/defpact, /accounts/{account}/balances, /keys/{pubkey}/accounts, /tokens, /tokens/{module}, /search/code, /search/events, /nft/accounts/{account}.",
+    "description": "Internal and unstable until a public hostname is decided. JSON in snake_case. List routes take limit (1..=100, default 20), an opaque cursor, order (desc default, asc), minheight, maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can be shorter than limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away answers 400 'cursor invalidated by reorg'. Balances and tokens come from /local reconciles: every balance row carries as_of_height and stale. Routes reserved for P6 answer 501 {\"error\": \"not implemented until P6\"}: /txs/{requestKey}/defpact, /search/code, /search/events, /nft/accounts/{account}.",
     "license": {
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
@@ -10,6 +10,51 @@
     "version": "1"
   },
   "paths": {
+    "/api/v1/accounts/{account}/balances": {
+      "get": {
+        "tags": [
+          "balances"
+        ],
+        "summary": "Current balances of an account per token and chain.",
+        "operationId": "account_balances",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Account name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "description": "Token module (default: every token)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Chain id",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of {module, chain, balance, guard, as_of_height, stale}, `as_of`"
+          }
+        }
+      }
+    },
     "/api/v1/accounts/{account}/transfers": {
       "get": {
         "tags": [
@@ -550,6 +595,51 @@
         }
       }
     },
+    "/api/v1/keys/{pubkey}/accounts": {
+      "get": {
+        "tags": [
+          "balances"
+        ],
+        "summary": "Accounts whose guard holds the key (inline keysets and resolved keyset references, B-4),\nwith the balances whose guard holds it. Paged by account: `cursor` is the `next_cursor`.",
+        "operationId": "key_accounts",
+        "parameters": [
+          {
+            "name": "pubkey",
+            "in": "path",
+            "description": "Public key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1..=100, default 20",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque page cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`items` of {account, modules: [{module, chain, balance, as_of_height, stale}]}, `next_cursor`, `as_of`"
+          }
+        }
+      }
+    },
     "/api/v1/keys/{pubkey}/txs": {
       "get": {
         "tags": [
@@ -661,6 +751,48 @@
         "responses": {
           "200": {
             "description": "Indexer status"
+          }
+        }
+      }
+    },
+    "/api/v1/tokens": {
+      "get": {
+        "tags": [
+          "tokens"
+        ],
+        "summary": "Every fungible token, by module name.",
+        "operationId": "list",
+        "responses": {
+          "200": {
+            "description": "`items` of {module, first_height, holders, holders_approx}, `as_of`"
+          }
+        }
+      }
+    },
+    "/api/v1/tokens/{module}": {
+      "get": {
+        "tags": [
+          "tokens"
+        ],
+        "summary": "One fungible token.",
+        "operationId": "get",
+        "parameters": [
+          {
+            "name": "module",
+            "in": "path",
+            "description": "Token module, e.g. `coin`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{module, first_height, holders, holders_approx, as_of}"
+          },
+          "404": {
+            "description": "Not a known token"
           }
         }
       }

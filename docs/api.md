@@ -32,10 +32,16 @@ All routes are `GET` under `/api/v1`. JSON field names are snake_case. Errors ar
 | `GET /accounts/{account}/txs?role=any\|sender` | Tx summaries touching the account (any appearance, including coinbase rewards), or sent by it (meta sender). |
 | `GET /keys/{pubkey}/txs` | Tx summaries signed by the key. |
 | `GET /events?module&name&chain&param0..param9` | Events with exact module and name, and exact string match of parameter N. `name` needs `module`, or is written qualified (`coin.TRANSFER`). At least one of `module`, `name`, `param0..9` is required; a `param` filter alone needs `module` or `name`. |
+| `GET /accounts/{account}/balances?token&chain` | Current balances from `/local` reconciles: `items` of `{module, chain, balance, guard, as_of_height, stale}`. `balance` is the decimal text the node printed; `as_of_height` is the node's tip height that read saw; `stale: true` means a later block (or a reorg) touched the row and a re-read is queued. Accounts the node reports absent on a chain are left out. |
+| `GET /keys/{pubkey}/accounts?cursor&limit` | Accounts whose guard holds the key (inline keysets, and keyset references resolved with `describe-keyset`; user, capability and module guards give none): `items` of `{account, modules: [{module, chain, balance, as_of_height, stale}]}`, paged by account. |
+| `GET /tokens` | Fungible tokens (modules seen emitting `TRANSFER`): `items` of `{module, first_height, holders, holders_approx: true}`. `holders` counts reconciled rows above zero. |
+| `GET /tokens/{module}` | One token, same fields; `404` for a module never seen in a `TRANSFER`. |
 
 ### Reserved for P6
 
-`/txs/{requestKey}/defpact`, `/accounts/{account}/balances`, `/keys/{pubkey}/accounts`, `/tokens`, `/tokens/{module}`, `/search/code`, `/search/events` and `/nft/accounts/{account}` answer `501 {"error":"not implemented until P6"}`.
+`/txs/{requestKey}/defpact`, `/search/code`, `/search/events` and `/nft/accounts/{account}` answer `501 {"error":"not implemented until P6"}`.
+
+A store written before the balance tables existed (served read-only) answers the balance, key and token routes with empty lists (format rule A-1 in `format.md`).
 
 ## Objects
 
