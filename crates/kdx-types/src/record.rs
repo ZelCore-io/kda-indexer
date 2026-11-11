@@ -78,8 +78,10 @@
 //! `adj_refs` (flags.b2) is a segment encoding only (`encode_block_with`/`decode_block_with`);
 //! the hot store uses the plain form (`encode_block`/`decode_block`) where b2 is never set.
 //!
-//! `merkle_verified` is set once the payload Merkle roots have been recomputed from the leaves
-//! (P5). Until then it is false: the payload contents are NOT verified, only consistent.
+//! `merkle_verified` is set when the payload Merkle roots recomputed from the served leaves
+//! matched the payload's `transactionsHash`/`outputsHash` and the header's `payloadHash` at
+//! ingest (store v2, `kdx_decode::merkle`). False = not verified: a backfill mismatch (listed
+//! in `merkle-unverified.jsonl`) or a v1-era record.
 
 use crate::hash::Hash32;
 use crate::ids::TxKey;
@@ -281,7 +283,7 @@ pub struct BlockRecord {
     pub miner_data: Vec<u8>,
     /// Original minerData bytes, when `miner_data` does not render them exactly.
     pub raw_miner: Option<Vec<u8>>,
-    /// Payload Merkle roots recomputed from the leaves and matched (P5). False until then.
+    /// Payload Merkle roots recomputed from the leaves matched at ingest (store v2).
     pub merkle_verified: bool,
 }
 

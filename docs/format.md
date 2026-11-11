@@ -43,6 +43,10 @@ cannot be upgraded in place; rebuild it (`docs/operations.md`, "Format upgrade")
   `format_version` 2. Posting files keep their own version byte 1 and records keep 1.
 - **MDBX** opens with 64 named-database slots (`max_dbs`; 32 before), room for later
   additive tables.
+- **Merkle bit.** Ingest recomputes the payload Merkle roots from the leaves the node served
+  (see "Payload Merkle verification") and sets the block record's `merkle_verified` when all
+  three match. Version 1 never set it. The bit's position is unchanged; only its value is
+  new.
 
 ## Identifiers
 
@@ -360,8 +364,56 @@ the **same range**; form 0 is a raw hash. The first height of a range is always 
 raw form, so a range decodes without its neighbours. The hot store writes the plain form
 (b2 clear).
 
-`merkle_verified` stays false until the payload Merkle roots have been recomputed from the
-leaves; until then the payload is consistent with its header but not proven.
+`merkle_verified` is set when the payload Merkle roots recomputed from the leaves at ingest
+matched (see "Payload Merkle verification"). False means not proven: the payload is
+consistent with its header, but its contents were not tied to `payloadHash`.
+
+### Payload Merkle verification
+
+Chainweb commits to a block's payload with three Merkle roots. The header carries
+`payloadHash`; the payload carries `transactionsHash` and `outputsHash`. Ingest recomputes
+all three from the exact base64-decoded bytes the node served and compares them. The block
+header hash itself is not recomputed; headers come from the local node and parent linkage
+is checked separately.
+
+- **Hash.** SHA-512/256, as defined in FIPS 180-4 (its own initial values; not SHA-512 cut
+  to 32 bytes).
+- **Leaves.** Each input is prefixed with a two-byte big-endian type tag. The leaf hash is
+  `H(0x00 ‖ tag ‖ bytes)`. Tags: transaction `0x0013`, transaction output `0x0014`,
+  minerData `0x0017`, coinbase output `0x0018`.
+- **Inner nodes.** `H(0x01 ‖ left ‖ right)`.
+- **Child roots.** When a tree's entry is itself a root (the payload tree), it enters as
+  the 32-byte hash, with no leaf hashing and no tag.
+- **Shape.** Entries are taken left to right onto a stack, each at height 0. While the top
+  two stack entries have the same height, they are replaced by their inner node, one level
+  higher (the lower stack entry is the left child). When the entries run out, the remaining
+  stack entries are combined the same way from the top down, whatever their heights. One
+  entry is its own root; zero entries give `H("")` (never used here, every tree has a
+  header entry).
+- **Trees.**
+  - `transactionsHash` = tree(minerData, tx₁, …, txₙ), the tx objects in payload order.
+  - `outputsHash` = tree(coinbase output, out₁, …, outₙ).
+  - `payloadHash` = tree(`transactionsHash`, `outputsHash`) = `H(0x01 ‖ tx root ‖ out root)`.
+
+The leaves are the tx objects (`{"hash","sigs","cmd"}` bytes), not the `cmd` strings, so a
+tx whose served `cmd` does not hash to its request key (`cmd_reencoded`, below about height
+2.4M) still verifies when the payload bytes are the committed ones. Such a block is called
+**legacy**; a mismatch on a legacy block is reported apart from other mismatches.
+
+Policy on a mismatch:
+
+- **Backfill:** the bit stays false, `kdx_merkle_blocks_total{result}` counts it
+  (`mismatch_legacy` or `mismatch`), a line `{chain, height, hash, which, legacy}` is
+  appended to `<data_dir>/merkle-unverified.jsonl` after the range commits, and the range
+  goes on. `which` is the first root that differed: `tx_root`, `out_root` or
+  `payload_root`.
+- **Tail:** the payload is fetched once more. If it still does not verify, the blocks before
+  it are committed and the chain halts with reason `merkle` (see `operations.md`, "Halted
+  chains").
+
+`kda-indexer verify merkle` recomputes the roots from stored records. The leaves are
+rendered back from the records, so it checks the storage round trip as well as the
+contents. See "Checking".
 
 ### Value codec
 
@@ -469,3 +521,12 @@ size and blake3 of every file listed in each `range.toml`, and reports orphan fi
 `--deep` also decodes every record, checks every tx's TxKey against `keys.ef`, resolves
 every request key and block hash through the indexes, decodes every adjacent ref and every
 posting list.
+
+`kda-indexer verify merkle [--from H] [--to H] [--chains …] [--sample N | --all] [--json]`
+re-renders each block's leaves from its stored records (hot store first, then segments),
+recomputes the payload roots and sorts blocks into `ok` (verified, bit set),
+`ok_unflagged` (verified, bit clear), `bad_flagged` (mismatch with the bit set: corruption),
+`bad_legacy` and `bad_other` (mismatch, bit clear). A record that does not render counts
+under `errors`. It exits 1 on any `bad_flagged`, `bad_other` or error. It opens the store
+read-only and takes a fresh read txn per 1,000 heights (or 1,000 samples). The default is a
+sample of 1,000 random blocks.

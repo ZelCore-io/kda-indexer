@@ -56,6 +56,11 @@ enum Command {
         /// encoding round trip; print per-family posting counts.
         #[arg(long)]
         index: bool,
+        /// Recompute the payload Merkle roots (B8) per block from the served leaves and
+        /// from the built records; print verified / mismatch per block and write a summary
+        /// JSON (default `test-runs/dump-merkle-<network>-<from>-<to>.json`).
+        #[arg(long)]
+        merkle: bool,
     },
     /// Fetch canonical blocks into frozen segments (resumes at the manifest frontier).
     Backfill {
@@ -126,6 +131,11 @@ enum Command {
         #[command(subcommand)]
         action: HotAction,
     },
+    /// Read-only checks of stored data.
+    Verify {
+        #[command(subcommand)]
+        what: VerifyWhat,
+    },
     /// Frozen segments: list the manifest, check files and indexes.
     Segments {
         #[command(subcommand)]
@@ -163,6 +173,37 @@ enum HotAction {
         /// Also print a blake3 digest per table (replay checks).
         #[arg(long)]
         digest: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum VerifyWhat {
+    /// Recompute payload Merkle roots from stored records (leaves re-rendered) and compare
+    /// them with the stored roots and the `merkle_verified` bit (B8). Read-only; a fresh read
+    /// txn per chunk. Classes ok / ok_unflagged / bad_flagged / bad_legacy / bad_other;
+    /// exit 1 on any bad_flagged, bad_other or render error.
+    Merkle {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// First height (default: the lowest stored height).
+        #[arg(long)]
+        from: Option<u32>,
+        /// Last height, inclusive (default: the highest stored height).
+        #[arg(long)]
+        to: Option<u32>,
+        /// Restrict to these chains (default: all).
+        #[arg(long, value_delimiter = ',')]
+        chains: Option<Vec<u8>>,
+        /// Check N random (height, chain) blocks (default 1000 when --all is not given).
+        #[arg(long, conflicts_with = "all")]
+        sample: Option<u64>,
+        /// Check every stored block in the range.
+        #[arg(long)]
+        all: bool,
+        /// JSON output.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -271,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
             records_out,
             summary_out,
             index,
+            merkle,
         } => {
             kda_indexer::cmd::dump::run(
                 &cfg,
@@ -282,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
                     records_out,
                     summary_out,
                     index,
+                    merkle,
                 },
             )
             .await
@@ -356,6 +399,26 @@ async fn main() -> anyhow::Result<()> {
             to,
             clear_halt,
         ),
+        Command::Verify {
+            what:
+                VerifyWhat::Merkle {
+                    data_dir,
+                    from,
+                    to,
+                    chains,
+                    sample,
+                    all,
+                    json,
+                },
+        } => kda_indexer::cmd::verify::merkle(kda_indexer::cmd::verify::MerkleArgs {
+            data_dir: data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+            from,
+            to,
+            chains,
+            sample,
+            all,
+            json,
+        }),
         Command::Segments { action } => match action {
             SegmentsAction::List { data_dir, json } => {
                 kda_indexer::cmd::segments::list(data_dir.as_deref().unwrap_or(&cfg.data_dir), json)

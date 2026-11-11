@@ -84,6 +84,13 @@ pub fn run(
         let name = kdx_ingest::apply::counters::halted(chain);
         let old = txn.counter(&name)?;
         txn.del(Table::Counters, name.as_bytes())?;
+        for r in kdx_ingest::apply::counters::HALT_REASONS {
+            let k = kdx_ingest::apply::counters::halted_reason(chain, r);
+            if txn.counter(&k)? > 0 {
+                println!("chain {chain}: halt reason {r} cleared");
+                txn.del(Table::Counters, k.as_bytes())?;
+            }
+        }
         tracing::warn!(chain, old_counter = old, "unwind: halted state cleared");
         println!("chain {chain}: halted counter {name} cleared (was {old})");
     }

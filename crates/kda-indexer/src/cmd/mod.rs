@@ -21,6 +21,7 @@ pub mod run;
 pub mod segments;
 pub mod serve;
 pub mod unwind;
+pub mod verify;
 pub mod viewcheck;
 
 /// Build the node client from config; `max_rps` and `node_concurrency` come from `[ingest]`.

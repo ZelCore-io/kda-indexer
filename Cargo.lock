@@ -1329,6 +1329,7 @@ dependencies = [
  "kdx-types",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

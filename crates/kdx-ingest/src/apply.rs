@@ -24,6 +24,11 @@ pub mod counters {
     pub fn halted(chain: u8) -> String {
         format!("halted.{chain}")
     }
+    /// Why a chain halted (set next to `halted.<chain>`; `unwind --clear-halt` clears both).
+    pub const HALT_REASONS: [&str; 3] = ["reorg", "poison", "merkle"];
+    pub fn halted_reason(chain: u8, reason: &str) -> String {
+        format!("halted.{chain}.{reason}")
+    }
 }
 
 /// Where a reorg batch forks: unwind `chain` to `height` (kept), then apply the batch.
@@ -41,8 +46,11 @@ pub struct Batch {
     /// Consecutive blocks of `chain`, ascending, the first one's parent is the fork point (or
     /// the stored tip).
     pub blocks: Vec<(DecodedBlock, VerifyReport)>,
-    /// The follower stopped this chain (reorg deeper than allowed); counted, nothing applied.
+    /// The follower stopped this chain; counted, nothing applied.
     pub halted: bool,
+    /// One of `counters::HALT_REASONS` when `halted`: `reorg` (deeper than allowed), `poison`
+    /// (block cannot be indexed) or `merkle` (payload Merkle mismatch after one refetch, R-5).
+    pub halt_reason: &'static str,
 }
 
 /// A block that cannot be indexed (decode/build failure). The writer halts only its chain
@@ -108,6 +116,9 @@ fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<Com
     for b in batches {
         if b.halted {
             txn.add_counter(&counters::halted(b.chain), 1)?;
+            if !b.halt_reason.is_empty() {
+                txn.add_counter(&counters::halted_reason(b.chain, b.halt_reason), 1)?;
+            }
             continue;
         }
         if let Some(f) = b.fork {

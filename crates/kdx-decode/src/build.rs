@@ -413,7 +413,7 @@ fn finish_extra(r: &mut TxRecord, extra: Map<String, Value>, dict: &dyn Dict) {
 /// `raw_*` slots where they do not (see `record.rs`).
 ///
 /// `report` comes from `verify_block`: user txs listed in `cmd_hash_mismatch` get the
-/// `cmd_reencoded` bit.
+/// `cmd_reencoded` bit, and `report.merkle == Some(Verified)` sets `merkle_verified`.
 pub fn build_records(
     b: &DecodedBlock,
     report: &VerifyReport,
@@ -469,7 +469,7 @@ pub fn encode_records(
         miner_account,
         miner_data: value::to_vec(&b.miner, dict),
         raw_miner: None,
-        merkle_verified: false,
+        merkle_verified: report.merkle_verified(),
     };
     if render_miner_bytes(&block, dict).ok().as_deref() != Some(b.miner_bytes.as_slice()) {
         block.raw_miner = Some(b.miner_bytes.clone());

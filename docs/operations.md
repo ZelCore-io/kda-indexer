@@ -36,7 +36,7 @@ To recover:
    kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml unwind --chain 3 --clear-halt
    ```
 
-   `--clear-halt` deletes `halted.<chain>` only. It refuses when the chain's hot state is
+   `--clear-halt` deletes `halted.<chain>` and its reason counter. It refuses when the chain's hot state is
    inconsistent: the `Tail` checkpoint has no stored header or a different hash, the tip has
    no undo record, or headers are stored above the checkpoint.
 4. Start the indexer. The tail resumes the chain from its stored tip (or from the `Headers`
@@ -162,6 +162,27 @@ kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml serv
 - A reader never holds an MDBX read transaction longer than one request, so it does not stop
   the writer from reusing pages.
 
+### Merkle halts
+
+The tail also halts a chain when a block's payload does not verify against its Merkle roots
+after one refetch (spec §2.2 check 3; `format.md`, "Payload Merkle verification"). The ERROR
+line has `reason=merkle` and the computed and claimed roots. The counters are
+`halted.<chain>` and `halted.<chain>.merkle` (the other reasons are `reorg` and `poison`).
+The blocks before the bad one are committed; the bad one is not.
+
+A mismatch on a modern block means the node served bytes that do not match what it
+committed to, or that the indexer's decode is wrong. Do not just clear it:
+
+1. Check the node first: fetch `payload/<payloadHash>/outputs` for that chain again and run
+   `kda-indexer dump --from H --to H --chains C --merkle` on the height. It is read-only.
+2. If the block now verifies, clear the halt (`unwind --chain C --clear-halt`) and start.
+   The tail refetches from the stored tip.
+3. If it still fails, keep the chain halted and report it with the dump output.
+
+Backfill does not halt. A mismatch there leaves the block's `merkle_verified` bit clear and
+adds a line to `<data_dir>/merkle-unverified.jsonl`. `kda-indexer verify merkle --sample N`
+(or `--all`) re-checks stored blocks at any time, read-only, beside a running indexer.
+
 ## Metrics and alerts
 
 `/metrics` on the admin port (OpenMetrics text); the same families are written to the
@@ -184,11 +205,14 @@ node_exporter textfile when `metrics.textfile` is set (see [install.md](install.
 | `kdx_http_requests_total`, `kdx_http_request_seconds` | api, route, status |
 | `kdx_freezer_runs_total`, `kdx_freezer_seconds` | op (freeze, merge) |
 | `kdx_read_view_seconds` | phase (open, held) |
+| `kdx_merkle_blocks_total` | result (verified, mismatch_legacy, mismatch) |
 
 Alerts to set up in your own alerting:
 
 - chain lag above 20 blocks for 5 minutes on any chain (`kdx_chain_lag_blocks`);
 - any `kdx_chain_halted` equal to 1 (see "Halted chains" above);
+- any increase of `kdx_merkle_blocks_total{result="mismatch"}` (a modern payload that does
+  not verify);
 - `kdx_disk_free_bytes` below 15% of the volume;
 - a reorg deeper than 50 (`kdx_reorg_depth`);
 - the comparison harness reporting unexplained differences over an hour;

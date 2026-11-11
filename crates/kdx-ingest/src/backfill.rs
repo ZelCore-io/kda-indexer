@@ -685,6 +685,7 @@ fn build_and_commit(
         coll.into_sorted()?
     };
     let mut batch: Vec<(u32, u8, Vec<u8>)> = Vec::with_capacity(DECODE_BATCH);
+    let mut merkle = MerkleTally::default();
     loop {
         batch.clear();
         for r in it.by_ref() {
@@ -698,7 +699,9 @@ fn build_and_commit(
         if batch.is_empty() {
             break;
         }
-        let prepared = pipeline::prepare_batch(&batch)?;
+        let mut prepared = pipeline::prepare_batch(&batch)?;
+        prepared.iter_mut().for_each(pipeline::debug_corrupt_merkle);
+        merkle.add(&prepared);
         for p in &prepared {
             let hd = &p.0.header;
             let (c, h) = (hd.chain_id, hd.height as u32);
@@ -768,9 +771,75 @@ fn build_and_commit(
     debug_abort("hot", u.start);
     manifest.push(entry.clone())?;
     manifest.commit(&ctx.segdir)?;
+    // After the commit, so a range that is built again does not list its blocks twice.
+    merkle.commit(&ctx.opts.data_dir, u.start)?;
     let commit_secs = t.elapsed().as_secs_f64();
     drop(dict);
     Ok((entry, prev, (decode_secs, finish_secs, commit_secs)))
+}
+
+/// Ruling R-5, backfill side (soft): a payload Merkle mismatch leaves the record's
+/// `merkle_verified` false and the range goes on. Per committed range the blocks are counted
+/// in `kdx_merkle_blocks_total{result}` and each mismatch is appended to
+/// `<data_dir>/merkle-unverified.jsonl` as `{chain, height, hash, which, legacy}`.
+#[derive(Default)]
+struct MerkleTally {
+    verified: u64,
+    mismatch_legacy: u64,
+    mismatch: u64,
+    lines: Vec<String>,
+}
+
+pub const MERKLE_UNVERIFIED: &str = "merkle-unverified.jsonl";
+
+impl MerkleTally {
+    fn add(&mut self, prepared: &[(kdx_decode::DecodedBlock, kdx_decode::VerifyReport)]) {
+        for p in prepared {
+            let r = pipeline::merkle_of(p);
+            match r.label() {
+                "verified" => self.verified += 1,
+                "mismatch_legacy" => self.mismatch_legacy += 1,
+                _ => self.mismatch += 1,
+            }
+            if let Some(l) = pipeline::merkle_line(&p.0, &r) {
+                self.lines.push(l);
+            }
+        }
+    }
+
+    fn commit(self, data_dir: &std::path::Path, range: u32) -> Result<()> {
+        let m = kdx_metrics::get();
+        for (label, n) in [
+            ("verified", self.verified),
+            ("mismatch_legacy", self.mismatch_legacy),
+            ("mismatch", self.mismatch),
+        ] {
+            if n > 0 {
+                m.merkle_blocks
+                    .get_or_create(&vec![("result", label.into())])
+                    .inc_by(n);
+            }
+        }
+        if self.lines.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(
+            range,
+            mismatch_legacy = self.mismatch_legacy,
+            mismatch = self.mismatch,
+            "backfill: payload Merkle mismatches (merkle_verified=false), listed in {MERKLE_UNVERIFIED}"
+        );
+        let path = data_dir.join(MERKLE_UNVERIFIED);
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        for l in &self.lines {
+            writeln!(f, "{l}")?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
