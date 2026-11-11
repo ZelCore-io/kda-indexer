@@ -438,7 +438,9 @@ pub struct Transfer {
 
 /// Leading rational of a text (`Data.Text.Read.rational`): sign, digits, optional
 /// fraction and exponent; trailing text is ignored. Same rule as the index's
-/// `transfer_amount_ok`, so every `xfer` posting renders a row.
+/// `transfer_amount_ok`, so an `xfer` posting renders a row unless `show_scientific` cannot
+/// render the amount (an exponent beyond its bound, such as `1e9999999999999999`, which
+/// chainweb-data cannot store either): that transfer has its posting but no compat row.
 fn text_rational(s: &str) -> Option<String> {
     kdx_decode::build::rational_prefix_len(s).map(|i| s[..i].to_owned())
 }
