@@ -150,7 +150,13 @@ struct Walk<'a> {
     counts: u64,
     /// Introspection cost of the current operation.
     intro_cost: u64,
+    /// `crossChainTransfer` fields on the current path (M-5).
+    xchain: usize,
 }
+
+/// A `crossChainTransfer` inside another one (M-5): priced as the per-item store read it
+/// would be if not answered from the pair already loaded.
+pub const NESTED_XCHAIN_COST: u64 = 10;
 
 /// The directive cap of one field, fragment or spread (C-1: counted here, inside the
 /// bounded walk, instead of async-graphql's `limit_directives`, whose walk expands every
@@ -293,6 +299,7 @@ impl<'a> Walk<'a> {
                         _ if intro => 1,
                         "edges" if wrap == Wrap::Conn => 0,
                         "node" if wrap == Wrap::Edges => 0,
+                        "crossChainTransfer" if self.xchain > 0 => NESTED_XCHAIN_COST,
                         "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
                             self.s.default_page.min(self.s.max_page) as u64
                         }
@@ -330,7 +337,10 @@ impl<'a> Walk<'a> {
                     } else {
                         self.outer = self.outer.saturating_mul(mult.max(1));
                     }
+                    let xc = usize::from(name == "crossChainTransfer");
+                    self.xchain += xc;
                     let child = self.set(&f.selection_set.node, d, intro, fty, inner);
+                    self.xchain -= xc;
                     (self.outer, self.conn_mult) = (saved, saved_cm);
                     if list.is_some() {
                         self.intro_lists.pop();
@@ -516,6 +526,7 @@ pub fn analyze(
         outer: 1,
         conn_mult: 1,
         counts: 0,
+        xchain: 0,
     };
     let ops: Vec<_> = match &doc.operations {
         DocumentOperations::Single(op) => vec![op],
@@ -671,6 +682,38 @@ mod tests {
             c("subscription { newBlocks(quantity: 100) { hash } }").ok(),
             Some(51)
         );
+    }
+
+    /// M-5: a `crossChainTransfer` inside another one is priced at the per-item read cost;
+    /// the first level keeps its price.
+    #[test]
+    fn nested_cross_chain_transfer_is_priced_per_read() {
+        let s = GraphqlSettings::default();
+        let c = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            analyze(&doc, &Variables::default(), &s).map(|c| c.complexity)
+        };
+        let page = |inner: &str| {
+            format!("{{ transfers(accountName: \"a\", first: 10) {{ edges {{ node {{ {inner} }} }} }} }}")
+        };
+        let one = c(&page("crossChainTransfer { amount }")).unwrap();
+        let two = c(&page(
+            "crossChainTransfer { crossChainTransfer { amount } }",
+        ))
+        .unwrap();
+        let three = c(&page(
+            "crossChainTransfer { crossChainTransfer { crossChainTransfer { amount } } }",
+        ))
+        .unwrap();
+        assert_eq!(one, 1 + 10 * 2, "{one}");
+        assert_eq!(two - one, 10 * NESTED_XCHAIN_COST, "{two}");
+        assert_eq!(three - two, 10 * NESTED_XCHAIN_COST, "{three}");
+        // Siblings are not nested.
+        let side = c(&page(
+            "crossChainTransfer { amount } a: crossChainTransfer { amount }",
+        ))
+        .unwrap();
+        assert_eq!(side, 1 + 10 * 4, "{side}");
     }
 
     /// M8: every cheap count names a connection that has a `totalCount` field.
