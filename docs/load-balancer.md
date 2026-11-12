@@ -74,7 +74,12 @@ a balancer every TCP peer is the balancer, so:
   walks the list from the right and takes the first address that is not a trusted proxy. A
   header from any other peer is ignored, and an unparsable entry falls back to the peer;
 - list only the balancer's private address (`/32`), never a whole subnet that clients can
-  reach.
+  reach. List the address the balancer connects **from** (check with `ip route get
+  <indexer-1-private-ip>`; a `source` directive or a second interface changes it);
+- if a CDN or another proxy sits in front of the balancer, the balancer's own peer is that
+  proxy, not the client. Then the addresses to trust, and the header the balancer should
+  take the client from, are different. Settle this before the first step: a wrong list puts
+  every client in one rate-limit bucket (429 for everyone).
 
 ## 2. The backend
 
@@ -88,7 +93,7 @@ backend kdx_compat
     option httpchk GET /readyz
     http-check expect status 200
     timeout server 15s
-    default-server check port 31369 inter 5s fall 3 rise 2 observe layer4 error-limit 3 on-error mark-down
+    default-server check port 31369 inter 5s fall 3 rise 6 observe layer4 error-limit 3 on-error mark-down
     server kdx1 <indexer-1-private-ip>:31362
 ```
 
@@ -96,7 +101,10 @@ backend kdx_compat
   chain, not a server, so a client can page across instances. Check this on your own pair of
   instances before adding the second server (section 6).
 - The health check goes to the admin port (`check port 31369`), the traffic to the compat
-  port.
+  port. It only proves the process and the chain position are fine; a wedged compat listener
+  with a live admin port stays "up" until connection errors mark it down.
+- `rise 6` (30 s of passing checks) keeps a lag that hovers around `api.ready_max_lag` from
+  flapping the routes in and out every few seconds; each flip breaks paging tokens.
 - `timeout server 15s`: the indexer's own deadline is 5 s (504 past it), so 15 s only catches
   a hung connection.
 - `observe layer4 … on-error mark-down` takes a server out after connection errors without
@@ -118,13 +126,16 @@ serves these routes today. The first step also adds the shared method ACL:
   **before** the existing `use_backend` lines that send `/txs`, `/stats`, `/coins` or `/v1` to
   the old backends, and before `default_backend`.
 - **Exact paths.** `path` matches the whole path (without the query string), so `/txs/tx`
-  does not match `/txs/txs` or `/txs/tx/`. Use `path_beg` only where a route has a path
-  parameter, and then with the trailing slash (`/txs/account/`).
+  does not match `/txs/txs` or `/txs/tx/`. Use `path_beg` only where the whole subtree is served by the indexer
+  (`/v1/txs/…`). A route with exactly one path parameter uses `path_reg` with its shape
+  (`^/txs/account/[^/]+$`), so `/txs/account/<a>/` stays on the old backend, as the indexer
+  would answer it with a 404.
 - **Methods.** Only GET, HEAD and OPTIONS (CORS preflight) move. Anything else keeps going to
   the old backend.
 - **Fallback.** `{ nbsrv(kdx_compat) gt 0 }` is true only while at least one indexer passes
   its health check. With none healthy the rule does not match, and the request falls through
-  to the existing chainweb-data rule. No manual action is needed for that; the step stays in
+  to the existing rule for that path: the chainweb-data backend for `/txs*`, `/stats` and
+  `/coins`, the old `/v1` backend for `/v1/txs*`. No manual action is needed for that; the step stays in
   place and resumes when an indexer is healthy again.
 
 The steps, in order. Each one runs a 24 h canary before the next:
@@ -132,7 +143,7 @@ The steps, in order. Each one runs a 24 h canary before the next:
 | Step | Routes | ACL line(s) |
 |---|---|---|
 | 1 | `/txs/tx`, `/txs/txs` | `acl kdx_step1 path /txs/tx /txs/txs` |
-| 2 | `/txs/account/{account}` | `acl kdx_step2 path_beg /txs/account/` |
+| 2 | `/txs/account/{account}` | `acl kdx_step2 path_reg ^/txs/account/[^/]+$` |
 | 3 | `/v1/txs/…` | `acl kdx_step3 path /v1/txs` and `acl kdx_step3 path_beg /v1/txs/` |
 | 4 | `/txs/recent`, `/stats`, `/coins` | `acl kdx_step4 path /txs/recent /stats /coins` |
 | 5 | `/txs/events`, `/txs/search` | `acl kdx_step5 path /txs/events /txs/search` |
@@ -152,13 +163,23 @@ any server line in the old `/v1` backend that has nothing listening behind it.
 
 ```sh
 cp -a /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.before-kdx-stepN
-# edit: add the step's lines
-haproxy -c -f /etc/haproxy/haproxy.cfg
-systemctl reload haproxy        # hitless: old workers finish their requests
+cp /etc/haproxy/haproxy.cfg /tmp/haproxy.cand
+# edit /tmp/haproxy.cand: add the step's lines
+haproxy -c -f /tmp/haproxy.cand
+install -m 644 /tmp/haproxy.cand /etc/haproxy/haproxy.cfg
+systemctl reload haproxy
 echo "show servers state kdx_compat" | socat stdio /run/haproxy/admin.sock
 ```
 
 The stats socket path is whatever your `global` section's `stats socket` line says.
+
+A reload is hitless (old workers finish their requests) only when HAProxy runs in
+master-worker mode (`-Ws`, the default of the packaged systemd unit since 1.8; check with
+`systemctl cat haproxy | grep -- -Ws`). A reload also resets server state: a server that was
+down starts as up until its first checks. If that matters, keep it with `server-state-file`
+and `load-server-state-from-file global`, saving the state
+(`echo "show servers state" | socat stdio /run/haproxy/admin.sock > /var/lib/haproxy/state`)
+before each reload.
 
 **Check** at 15 minutes, 1 hour and 24 hours after the reload:
 
@@ -177,8 +198,10 @@ haproxy -c -f /etc/haproxy/haproxy.cfg && systemctl reload haproxy
 ```
 
 The routes go back to chainweb-data at once. No data is migrated in either direction.
-Rolling back step 1 can also remove the `kdx_compat` backend and the `kdx_read` ACL; leaving
-them is harmless.
+Rolling back step 1 can also remove the `kdx_compat` backend and the `kdx_read` ACL, but only
+when no later step is applied (their `use_backend` lines use both); leaving them is harmless.
+To undo everything, delete the kdx lines rather than restoring an old copy of the file, so
+that unrelated edits made in between are not lost.
 
 **Known transients.** A client that is paging with a `next` token when its route moves (or
 falls back) gets an error for that token from the other implementation ("Invalid next token" from
@@ -253,7 +276,7 @@ frontend public
     # kda-indexer cutover: steps 1 to 5, above the existing rules
     acl kdx_read method GET HEAD OPTIONS
     acl kdx_step1 path /txs/tx /txs/txs
-    acl kdx_step2 path_beg /txs/account/
+    acl kdx_step2 path_reg ^/txs/account/[^/]+$
     acl kdx_step3 path /v1/txs
     acl kdx_step3 path_beg /v1/txs/
     acl kdx_step4 path /txs/recent /stats /coins
@@ -284,7 +307,7 @@ backend kdx_compat
     option httpchk GET /readyz
     http-check expect status 200
     timeout server 15s
-    default-server check port 31369 inter 5s fall 3 rise 2 observe layer4 error-limit 3 on-error mark-down
+    default-server check port 31369 inter 5s fall 3 rise 6 observe layer4 error-limit 3 on-error mark-down
     server kdx1 <indexer-1-private-ip>:31362
 ```
 
