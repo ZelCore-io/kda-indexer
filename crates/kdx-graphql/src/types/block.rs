@@ -412,6 +412,8 @@ pub async fn block_page(
         return Err(bad_input("invalid cursor"));
     }
     let p = page.clone();
+    // The blocks are read only when the edges or page info are selected.
+    let reads = crate::txlist::selects_direct(ctx, &["edges", "pageInfo"]);
     let (rows, total) = g
         .state()?
         .read(move |view| {
@@ -426,7 +428,12 @@ pub async fn block_page(
                 .iter()
                 .map(|&(_, lo, hi)| (hi + 1).saturating_sub(lo.max(floor)))
                 .sum();
-            Ok((walk_blocks(view, &set, &p)?, total))
+            let rows = if reads {
+                walk_blocks(view, &set, &p)?
+            } else {
+                Vec::new()
+            };
+            Ok((rows, total))
         })
         .await
         .map_err(from_api)?;

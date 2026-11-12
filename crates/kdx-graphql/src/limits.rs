@@ -9,8 +9,10 @@
 //! fragments get around depth or complexity. Every operation of a document is checked (not
 //! only the one that runs). The walk itself is bounded by [`MAX_VISITS`].
 //!
-//! Cost model: each field costs 1 (`__typename` and the Relay wrappers `edges` and `node`
-//! 0). A field that returns a page
+//! Cost model (field types from the schema, keyed on field names, never aliases): each field
+//! costs 1 (`__typename` 0, and a connection's `edges` and their `node` 0). A
+//! deferred `totalCount` (a list's count walk) costs `max_page`, and an operation may run at
+//! most [`MAX_COUNTS`] of them, outer multipliers included. A connection or list field that returns a page
 //! (`first`/`last` or a connection field without them) multiplies the cost of its
 //! selection (of a connection, its `edges` only: `totalCount` and `pageInfo` are answered
 //! once per connection) by the page size it will return (clamped like the resolver: `max_page`, or
@@ -23,8 +25,10 @@ use async_graphql::extensions::{
     Extension, ExtensionContext, ExtensionFactory, NextParseQuery, NextValidation,
 };
 use async_graphql::parser::types::{
-    DocumentOperations, ExecutableDocument, Field, FragmentDefinition, Selection, SelectionSet,
+    DocumentOperations, ExecutableDocument, Field, FragmentDefinition, OperationType, Selection,
+    SelectionSet,
 };
+use async_graphql::registry::Registry;
 use async_graphql::{Name, ServerError, ServerResult, ValidationResult, Value, Variables};
 
 use crate::error::limit;
@@ -53,6 +57,52 @@ const PAGED: &[&str] = &[
     "balance",
 ];
 
+/// Deferred `totalCount`s (count walks) one operation may run, outer multipliers included.
+pub const MAX_COUNTS: u64 = 2;
+
+/// Connections whose `totalCount` is a count walk (the tx-keyed lists over postings or
+/// heights); the others are known with their page (a block's or a tx's rows, block ranges).
+const DEFERRED_COUNTS: &[&str] = &[
+    "QueryTransactionsConnection",
+    "QueryEventsConnection",
+    "QueryTransfersConnection",
+    "QueryTransactionsByPublicKeyConnection",
+    "FungibleAccountTransactionsConnection",
+    "FungibleChainAccountTransactionsConnection",
+    "NonFungibleAccountTransactionsConnection",
+    "NonFungibleChainAccountTransactionsConnection",
+];
+
+fn deferred_count(ty: &str) -> bool {
+    DEFERRED_COUNTS.contains(&ty)
+}
+
+/// Whose selection a set is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrap {
+    None,
+    /// A connection's.
+    Conn,
+    /// A connection's `edges`.
+    Edges,
+}
+
+/// `[Foo!]!` → `Foo`.
+fn base_type(t: &str) -> &str {
+    t.trim_matches(|c| matches!(c, '[' | ']' | '!'))
+}
+
+/// The schema's output types (built once; the same types the served schema registers).
+pub fn type_registry() -> &'static Registry {
+    static REG: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    REG.get_or_init(|| {
+        let mut r = Registry::default();
+        <crate::schema::Query as async_graphql::OutputType>::create_type_info(&mut r);
+        <crate::types::subscription::Subscription as async_graphql::SubscriptionType>::create_type_info(&mut r);
+        r
+    })
+}
+
 /// What a document needs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Cost {
@@ -72,6 +122,14 @@ struct Walk<'a> {
     defaults: std::collections::HashMap<Name, Option<Value>>,
     /// Introspection list fields on the current path (SR7-2: none may repeat).
     intro_lists: Vec<&'a str>,
+    /// Output types, to tell connections from lists (R7I-8).
+    reg: &'a Registry,
+    /// Product of the page multipliers above the current field (how often it runs).
+    outer: u64,
+    /// The page multiplier of the connection whose selection is being walked.
+    conn_mult: u64,
+    /// Deferred `totalCount`s the current operation runs (times their outer multipliers).
+    counts: u64,
     /// Introspection cost of the current operation.
     intro_cost: u64,
 }
@@ -112,16 +170,19 @@ const INTRO_LISTS: &[(&str, u64)] = &[
 pub const MAX_INTROSPECTION_COST: u64 = 100_000;
 
 impl<'a> Walk<'a> {
+    /// The cost of a selection set on type `ty` (`None`: unknown), and the part of it its
+    /// direct `edges` fields cost; `wrap` says whose selection it is (a connection's, or a
+    /// connection's `edges`), so only those Relay wrappers are free (R7I-8).
     fn set(
         &mut self,
         set: &'a SelectionSet,
         depth: usize,
         intro: bool,
-    ) -> Result<(u64, Option<u64>), ServerError> {
-        // The set's cost and, when it is a connection's (a direct `edges`, `pageInfo` or
-        // `totalCount` field), the part of it its `edges` fields cost.
+        ty: Option<&'a str>,
+        wrap: Wrap,
+    ) -> Result<(u64, u64), ServerError> {
         let mut total: u64 = 0;
-        let mut edges: Option<u64> = None;
+        let mut edges: u64 = 0;
         for sel in &set.items {
             self.visits += 1;
             if self.visits > MAX_VISITS {
@@ -173,26 +234,86 @@ impl<'a> Walk<'a> {
                         }
                         self.intro_lists.push(name);
                     }
+                    // The schema field (keyed on the field name, never the alias).
+                    let mf = if intro {
+                        None
+                    } else {
+                        ty.and_then(|t| self.reg.types.get(t))
+                            .and_then(|t| t.field_by_name(name))
+                    };
+                    let fty: Option<&'a str> = mf.map(|f| base_type(&f.ty));
+                    let conn = fty.is_some_and(|t| t.ends_with("Connection"));
+                    // Only a connection or a list returns a page: a scalar that shares a paged
+                    // field's name (`FungibleChainAccount.balance`) is not multiplied.
+                    let pages = mf.is_none_or(|f| conn || f.ty.starts_with('['));
                     let mult = if intro {
                         list.unwrap_or(1)
-                    } else {
+                    } else if pages {
                         self.multiplier(f)
+                    } else {
+                        1
                     };
-                    let child = self.set(&f.selection_set.node, d, intro);
+                    let own: u64 = match name {
+                        _ if intro => 1,
+                        "edges" if wrap == Wrap::Conn => 0,
+                        "node" if wrap == Wrap::Edges => 0,
+                        "totalCount" if wrap == Wrap::Conn && ty.is_some_and(deferred_count) => {
+                            // A count walk (GQ-10): a fixed cost, and few per operation.
+                            self.counts = self.counts.saturating_add(self.outer);
+                            if self.counts > MAX_COUNTS {
+                                return Err(limit(
+                                    "complexity",
+                                    format!(
+                                        "more than {MAX_COUNTS} list totalCounts in one operation"
+                                    ),
+                                ));
+                            }
+                            self.s.max_page as u64
+                        }
+                        _ => 1,
+                    };
+                    let inner = if conn {
+                        Wrap::Conn
+                    } else if name == "edges" && wrap == Wrap::Conn {
+                        Wrap::Edges
+                    } else {
+                        Wrap::None
+                    };
+                    // A connection's own fields run once; its `edges` once per item.
+                    let (saved, saved_cm) = (self.outer, self.conn_mult);
+                    if conn {
+                        self.conn_mult = mult.max(1);
+                    } else if inner == Wrap::Edges {
+                        self.outer = self.outer.saturating_mul(self.conn_mult);
+                    } else {
+                        self.outer = self.outer.saturating_mul(mult.max(1));
+                    }
+                    let child = self.set(&f.selection_set.node, d, intro, fty, inner);
+                    (self.outer, self.conn_mult) = (saved, saved_cm);
                     if list.is_some() {
                         self.intro_lists.pop();
                     }
-                    // A connection's page multiplies its `edges` only: `totalCount` and
-                    // `pageInfo` are answered once per connection (R7I-8).
+                    // A connection's page multiplies its `edges` only (`totalCount` and
+                    // `pageInfo` are answered once), each item at least 1 when the page is
+                    // read (`edges` or `pageInfo` selected); a list multiplies all of it, each
+                    // item at least 1 (R7I-8).
                     let (all, part) = child?;
-                    // The Relay wrappers `edges` and `node` cost nothing themselves (the
-                    // page's items are counted by what they select).
-                    let own = u64::from(intro || !matches!(name, "edges" | "node"));
-                    let c = if let (false, Some(part)) = (intro, part) {
-                        own.saturating_add(all - part)
-                            .saturating_add(mult.saturating_mul(part))
-                    } else {
+                    let c = if intro {
                         own.saturating_add(mult.saturating_mul(all))
+                    } else if conn {
+                        let reads = f.selection_set.node.items.iter().any(|x| match &x.node {
+                            Selection::Field(g) => {
+                                matches!(g.node.name.node.as_str(), "edges" | "pageInfo")
+                            }
+                            _ => true,
+                        });
+                        let per = if reads { part.max(1) } else { part };
+                        own.saturating_add(all - part)
+                            .saturating_add(mult.saturating_mul(per))
+                    } else if mult > 1 {
+                        own.saturating_add(mult.saturating_mul(all.max(1)))
+                    } else {
+                        own.saturating_add(all)
                     };
                     if intro && depth == 0 {
                         // `__schema`/`__type`: counted against the introspection cap.
@@ -205,20 +326,21 @@ impl<'a> Walk<'a> {
                         }
                     } else {
                         total = total.saturating_add(c);
-                        match name {
-                            "edges" => edges = Some(edges.unwrap_or(0).saturating_add(c)),
-                            "pageInfo" | "totalCount" => edges = Some(edges.unwrap_or(0)),
-                            _ => {}
+                        if name == "edges" && wrap == Wrap::Conn {
+                            edges = edges.saturating_add(c);
                         }
                     }
                 }
                 Selection::InlineFragment(i) => {
-                    let (t, e) = self.set(&i.node.selection_set.node, depth, intro)?;
+                    let on = i
+                        .node
+                        .type_condition
+                        .as_ref()
+                        .map(|c| c.node.on.node.as_str())
+                        .or(ty);
+                    let (t, e) = self.set(&i.node.selection_set.node, depth, intro, on, wrap)?;
                     total = total.saturating_add(t);
-                    edges = match (edges, e) {
-                        (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                        (a, b) => a.or(b),
-                    };
+                    edges = edges.saturating_add(e);
                 }
                 Selection::FragmentSpread(fs) => {
                     let name = fs.node.fragment_name.node.as_str();
@@ -230,13 +352,11 @@ impl<'a> Walk<'a> {
                         continue;
                     };
                     self.stack.push(name);
-                    let (t, e) = self.set(&def.node.selection_set.node, depth, intro)?;
+                    let on = Some(def.node.type_condition.node.on.node.as_str());
+                    let (t, e) = self.set(&def.node.selection_set.node, depth, intro, on, wrap)?;
                     self.stack.pop();
                     total = total.saturating_add(t);
-                    edges = match (edges, e) {
-                        (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                        (a, b) => a.or(b),
-                    };
+                    edges = edges.saturating_add(e);
                 }
             }
         }
@@ -335,6 +455,10 @@ pub fn analyze(
         defaults: Default::default(),
         intro_lists: Vec::new(),
         intro_cost: 0,
+        reg: type_registry(),
+        outer: 1,
+        conn_mult: 1,
+        counts: 0,
     };
     let ops: Vec<_> = match &doc.operations {
         DocumentOperations::Single(op) => vec![op],
@@ -353,7 +477,20 @@ pub fn analyze(
             })
             .collect();
         w.intro_cost = 0;
-        let (c, _) = w.set(&op.node.selection_set.node, 0, false)?;
+        let root = match op.node.ty {
+            OperationType::Query => "Query",
+            OperationType::Mutation => "Mutation",
+            OperationType::Subscription => "Subscription",
+        };
+        w.outer = 1;
+        w.counts = 0;
+        let (c, _) = w.set(
+            &op.node.selection_set.node,
+            0,
+            false,
+            Some(root),
+            Wrap::None,
+        )?;
         w.cost.complexity = w.cost.complexity.max(c);
         if c > s.max_complexity {
             return Err(limit(
@@ -455,15 +592,79 @@ mod tests {
     }
 
     #[test]
+    fn wrappers_are_free_only_inside_a_connection() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        // `edges { node }` under a connection: free.
+        assert_eq!(
+            c("{ transactions(first: 100) { edges { node { hash } } } }"),
+            Ok(101)
+        );
+        // A root `node(id)` is a field like any other, aliased or not.
+        let roots: String = (0..100)
+            .map(|i| format!("n{i}: node(id: \"x\") {{ id }} "))
+            .collect();
+        assert!(c(&format!("{{ {roots} }}")).unwrap() >= 200);
+        let roots: String = (0..1100)
+            .map(|i| format!("n{i}: node(id: \"x\") {{ id }} "))
+            .collect();
+        assert_eq!(c(&format!("{{ {roots} }}")), Err("\"complexity\"".into()));
+        // An alias named like a wrapper is not one.
+        assert_eq!(c("{ edges: lastBlockHeight }"), Ok(1));
+    }
+
+    #[test]
+    fn every_page_item_costs_at_least_one() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        assert_eq!(
+            c("{ transactions(blockHash: \"x\", first: 100) { edges { node { __typename } } } }"),
+            Ok(101)
+        );
+        // A scalar named like a paged field is not a page.
+        assert_eq!(
+            c("{ fungibleAccount(accountName: \"a\") { chainAccounts { balance } } }"),
+            Ok(22)
+        );
+        let many: String = (0..20)
+            .map(|i| format!("t{i}: transactions(blockHash: \"x\", first: 100) {{ edges {{ node {{ __typename }} }} }} "))
+            .collect();
+        assert_eq!(c(&format!("{{ {many} }}")), Err("\"complexity\"".into()));
+    }
+
+    #[test]
+    fn list_counts_are_costed_and_few() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        let ten: String = (0..10)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
+            .collect();
+        assert_eq!(c(&format!("{{ {ten} }}")), Err("\"complexity\"".into()));
+        let two: String = (0..2)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
+            .collect();
+        assert_eq!(c(&format!("{{ {two} }}")), Ok(2 * 101));
+        // A count walk under a per-chain list runs once per chain: refused.
+        assert_eq!(
+            c("{ fungibleChainAccounts(accountName: \"a\") { transactions { totalCount } } }"),
+            Err("\"complexity\"".into())
+        );
+        // A block's count is not a walk: kadscan's block list passes.
+        assert!(c("{ blocksFromDepth(minimumDepth: 0, first: 25) { totalCount edges { node { transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }").unwrap() < 2000);
+    }
+
+    #[test]
     fn connections_multiply_their_edges_only() {
         let c = |q: &str| cost(q, serde_json::json!({})).unwrap().complexity;
-        // 1 (transactions) + 1 (totalCount) + 1 + 1 (pageInfo) + 100 x 1 (hash).
+        // 1 (transactions) + 100 (a list's totalCount walk) + 2 (pageInfo) + 100 x 1 (hash).
         assert_eq!(
             c("{ transactions(first: 100) { totalCount pageInfo { hasNextPage } edges { node { hash } } } }"),
-            104
+            203
         );
-        // A connection that selects only its count is not multiplied.
-        assert_eq!(c("{ transactions { totalCount } }"), 2);
+        // A connection that selects only its count reads no page; a block's count is
+        // known with its rows (cost 1), a list's count walk costs max_page.
+        assert_eq!(
+            c("{ block(hash: \"x\") { transactions { totalCount } } }"),
+            3
+        );
+        assert_eq!(c("{ transactions { totalCount } }"), 101);
         // A list (no connection fields) is multiplied whole: `quantity` sizes it.
         assert_eq!(
             c("subscription { transactions(quantity: 50) { hash } }"),

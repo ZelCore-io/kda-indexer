@@ -777,6 +777,13 @@ pub fn selects(ctx: &Context<'_>, name: &str) -> bool {
     walk(ctx.field(), name, 0)
 }
 
+/// Whether the field being resolved selects one of `names` directly (aliases resolved).
+pub fn selects_direct(ctx: &Context<'_>, names: &[&str]) -> bool {
+    ctx.field()
+        .selection_set()
+        .any(|s| names.contains(&s.name()))
+}
+
 /// A page of a tx-keyed list and its lazy `totalCount`.
 pub struct ListPage {
     pub edges: Vec<(String, Item)>,
@@ -796,9 +803,22 @@ pub async fn list(
     let dl = deadline(ctx);
     let xchain = matches!(spec.rows, Rows::Transfers { nft: false, .. })
         && selects(ctx, "crossChainTransfer");
+    // The page is read only when its items or page info are selected.
+    let reads = selects_direct(ctx, &["edges", "pageInfo"]);
+    // A block's or a request key's rows are few: counted with the page, exactly.
+    let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk(_))
+        && selects_direct(ctx, &["totalCount"]);
     let sp = spec.clone();
-    let (edges, info) = state
+    let (edges, info, exact) = state
         .read_heavy(move |view| {
+            let exact = if bounded {
+                Some(count(view, &sp, dl)?.0)
+            } else {
+                None
+            };
+            if !reads {
+                return Ok((Vec::new(), PageInfo::default(), exact));
+            }
             let (mut edges, info) = run_page(view, &sp, &page, dl)?;
             if xchain {
                 let mut blocks = Blocks::default();
@@ -808,10 +828,17 @@ pub async fn list(
                     }
                 }
             }
-            Ok((edges, info))
+            Ok((edges, info, exact))
         })
         .await
         .map_err(from_api)?;
+    if let Some(n) = exact {
+        return Ok(ListPage {
+            edges,
+            info,
+            total: Total::Exact(n),
+        });
+    }
     let total = Total::Deferred(Arc::new(move || {
         let state = state.clone();
         let spec = spec.clone();

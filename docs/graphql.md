@@ -75,10 +75,16 @@ All in `[graphql]` (defaults shown). A refusal answers a GraphQL error with
 Rate: a request takes one token of the per-IP rate limit (`api.rate_per_ip`); a batch of N
 operations takes N.
 
-Complexity: each field costs 1 (`__typename` and the Relay wrappers `edges` and `node` cost
-0). A field that returns a page multiplies what it selects by the page size it will return:
-of a connection, only its `edges` (`totalCount` and `pageInfo` are answered once); of a list
-(`newBlocks`, the `transactions` subscription), all of it, sized by `quantity` when given.
+Complexity (field types from the schema; aliases change nothing): each field costs 1
+(`__typename` 0, and a connection's `edges` and their `node` 0). A connection or list field
+multiplies what it selects by the page size it will return, each item at least 1: of a
+connection, only its `edges` (`totalCount` and `pageInfo` are answered once; a connection
+that selects neither `edges` nor `pageInfo` reads no page); of a list (`newBlocks`, the
+`transactions` subscription), all of it, sized by `quantity` when given. A list's
+`totalCount` that is a count walk (`transactions`, `events`, `transfers`,
+`transactionsByPublicKey` and the account `transactions`) costs `max_page`, and an
+operation may run at most 2 of them, outer multipliers included (`complexity` otherwise). A
+block's or a tx's `totalCount` is counted with its rows.
 
 Depth counts nested fields; fragments are expanded where they are spread, so fragments,
 inline fragments and aliases do not get around depth or complexity. Every operation in a
@@ -284,7 +290,9 @@ relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `Strin
 | `events(moduleName: String)` | events of that module. `qualifiedEventName` or `moduleName` is required (`BAD_USER_INPUT` otherwise); with both, both filter. `moduleName` alone has no posting list: unless `blockHash` or `requestKey` picks the txs, heights are walked down from the tip (at most 20,000 heights, within the deadline) |
 | `NetworkInfo.countersOfEachChain: [CountersOfEachChain!]!` | per chain, ascending: `chainId`, `blocksCount` (genesis to stored tip). `transactionCount: Int` and `totalGasUsedInKda: String` answer `null` with `NOT_AVAILABLE`: the store keeps no all-time per-chain tx or gas counter |
 | `balance(accountName, module, chainIds, first/last/after/before): QueryBalanceConnection!` | an account's present fungible balances, one `BalanceNode {accountName module chainId balance}` per module and chain, listed by module name then chain, filtered by `module` and `chainIds`; at most 4,096 rows per account (`LIMIT` above). Without `accountName` (a module's holders): `NOT_SUPPORTED`, as the store keeps no holders index |
-| `transactionsByPactCode(pactCode, first/after): QueryTransactionsByPactCodeConnection!` | txs whose own exec code contains `pactCode` (`%`/`_` wildcards), newest first, through the `/txs/search` engine: its pattern checks, per-client search gate, code index or bounded newest-first scan, caps and time budget. Rows are `TransactionSummary {requestKey height chainId canonical creationTime badResult sender gas gasLimit gasPrice code}`. Forward paging only (`last`/`before`: `BAD_USER_INPUT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |
+| `transactionsByPactCode(pactCode, first/after): QueryTransactionsByPactCodeConnection!` | txs whose own exec code contains `pactCode` (`%`/`_` wildcards), newest first, through the `/txs/search` engine: its pattern checks, per-client search gate, code index or bounded newest-first scan, caps and time budget. Rows are `TransactionSummary {requestKey height chainId canonical creationTime badResult sender gas gasLimit gasPrice code}`. Forward paging only (`last`/`before`: `BAD_USER_INPUT`). The search gate counts per client
+address (HTTP, or the websocket's accepted connection); an operation without a known address
+is refused (`LIMIT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |
 | `lastTokenPriceInKda(moduleName): Decimal` | `NOT_SUPPORTED`: no price data |
 | `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 100) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
 | `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 100) per message; a message per feed batch that has any |
