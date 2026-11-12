@@ -57,11 +57,17 @@ pub struct Place {
     pub parent_br: u8,
 }
 
-pub fn prepare(pool: &[Value], p: Place) -> (DecodedBlock, VerifyReport) {
+/// The served header of pool block `p.pool`, moved to `p`.
+pub fn header(pool: &[Value], p: Place) -> Value {
     let mut h = pool[p.pool]["header"].clone();
     h["height"] = Value::from(p.height);
     h["hash"] = Value::from(hh(p.height, p.br));
     h["parent"] = Value::from(hh(p.height.wrapping_sub(1), p.parent_br));
+    h
+}
+
+pub fn prepare(pool: &[Value], p: Place) -> (DecodedBlock, VerifyReport) {
+    let h = header(pool, p);
     let r = pipeline::prepare_value(0, p.height, &h, &pool[p.pool]["payload"]).unwrap();
     assert!(r.1.merkle_verified(), "pool {} must verify", p.pool);
     r
@@ -107,9 +113,26 @@ pub fn opts(dir: &Path, step: u64, range: u64, finality: u64) -> IngestOpts {
 /// A single-chain (chain 0) context on `<dir>/hot`, `<dir>/segments`, `<dir>/etl`. The node
 /// client points at a closed port: nothing here talks to a node.
 pub fn ctx(dir: &Path, step: u64, range: u64, finality: u64) -> Ctx {
+    ctx_with_node(dir, step, range, finality, "http://127.0.0.1:9")
+}
+
+/// [`ctx`] with the node client at `base`.
+pub fn ctx_with_node(dir: &Path, step: u64, range: u64, finality: u64, base: &str) -> Ctx {
+    ctx_full(dir, step, range, finality, base, &[0])
+}
+
+/// [`ctx_with_node`] on a graph of `chains` (from height 0).
+pub fn ctx_full(
+    dir: &Path,
+    step: u64,
+    range: u64,
+    finality: u64,
+    base: &str,
+    chains: &[u8],
+) -> Ctx {
     let hot = Arc::new(HotStore::open(&dir.join("hot"), Geometry::default()).unwrap());
     let node = NodeClient::new(&NodeClientConfig {
-        base: "http://127.0.0.1:9".parse().unwrap(),
+        base: base.parse().unwrap(),
         network: "mainnet01".into(),
         timeout: Duration::from_secs(1),
         max_rps: 0,
@@ -123,7 +146,7 @@ pub fn ctx(dir: &Path, step: u64, range: u64, finality: u64) -> Ctx {
     let info = NodeInfo {
         node_version: String::new(),
         chainweb_version: "mainnet01".into(),
-        graph_history: vec![(0, vec![0])],
+        graph_history: vec![(0, chains.to_vec())],
         raw: Value::Null,
     };
     std::fs::create_dir_all(dir.join("segments")).unwrap();
