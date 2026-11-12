@@ -76,6 +76,8 @@ enum Point {
     Txn,
     /// The manifest was read; nothing of this read is copied or linked yet.
     Manifest,
+    /// The segment swap lock is held (shared), before the first manifest read (m14).
+    SwapLocked,
 }
 
 pub fn run(a: SnapshotArgs) -> anyhow::Result<()> {
@@ -282,6 +284,10 @@ fn snapshot_into(
     };
     let mut have: HashSet<PathBuf> = HashSet::new();
     let (mut merge_reads, mut name_waits) = (0usize, 0usize);
+    // m14: no `rebuild-range` swap runs while segment files are placed, so a range's files
+    // all come from one side of its swap (a data dir we cannot lock still gets `resolve`).
+    let swap_guard = kdx_segment::swap::swap_lock(&src_seg, false).ok();
+    hook(Point::SwapLocked, 0);
     let (manifest_bytes, manifest, info) = loop {
         rep.attempts += 1;
         // A fresh T before every manifest read.
@@ -336,6 +342,7 @@ fn snapshot_into(
             }
         }
         if !missing {
+            drop(swap_guard);
             break (bytes, m, info);
         }
         merge_reads += 1;
@@ -521,6 +528,51 @@ mod tests {
     /// reads the manifest again, links the merged range, drops the files of the old read and
     /// writes the new manifest bytes.
     #[test]
+    fn snapshot_waits_for_a_segment_swap_in_progress() {
+        // m14: a snapshot placing files across a `rebuild-range` commit point could pair old
+        // and new files of one range. The swap holds `segments.swap.lock` exclusively; the
+        // snapshot takes it shared before reading the manifest, so it waits.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let seg = data.join("segments");
+        fs::create_dir_all(&seg).unwrap();
+        let hs = HotStore::open(&data.join("hot"), Geometry::default()).unwrap();
+        commit_names(&hs, 20, b"a");
+        let a = entry(0, 20, 0);
+        let mut m = Manifest::new("net");
+        m.push(a.clone()).unwrap();
+        m.commit(&seg).unwrap();
+        put(&seg, &a);
+        let swap = kdx_segment::swap::swap_lock(&seg, true).unwrap();
+        let locked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let args = SnapshotArgs {
+            data_dir: data.clone(),
+            out: tmp.path().join("out"),
+            copy: false,
+        };
+        let rep = std::thread::scope(|sc| {
+            let l = locked.clone();
+            let h = sc.spawn(|| {
+                snapshot_with(&args, &hs, Duration::ZERO, &mut move |p, _| {
+                    if p == Point::SwapLocked {
+                        l.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !locked.load(std::sync::atomic::Ordering::SeqCst),
+                "the snapshot did not wait for the swap"
+            );
+            drop(swap);
+            h.join().unwrap()
+        })
+        .unwrap();
+        assert!(locked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(rep.attempts, 1);
+    }
+
+    #[test]
     fn merge_between_manifest_read_and_links() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
@@ -625,6 +677,7 @@ mod tests {
         assert_eq!(
             seen,
             vec![
+                (Point::SwapLocked, 0, false),
                 (Point::Txn, 1, false),
                 (Point::Manifest, 1, false),
                 (Point::Txn, 2, false),

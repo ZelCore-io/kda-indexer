@@ -52,6 +52,23 @@ pub fn pending(segdir: &Path, start: u32) -> bool {
     rebuild_dir(segdir, start).join(JOURNAL).exists()
 }
 
+/// `<data dir>/segments.swap.lock`. `rebuild-range` holds it exclusively while it recovers
+/// or swaps a range; `snapshot` holds it shared while it places segment files, so a snapshot
+/// never pairs files from both sides of a swap (m14). It sits outside `segments/`, so
+/// `remove_unlisted` never deletes it and a snapshot never copies it. Blocks until granted.
+pub fn swap_lock(segdir: &Path, exclusive: bool) -> Result<fs::File> {
+    let p = segdir.parent().unwrap_or(segdir).join("segments.swap.lock");
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&p)
+        .with_context(|| format!("open {}", p.display()))?;
+    if exclusive { f.lock() } else { f.lock_shared() }
+        .with_context(|| format!("lock {}", p.display()))?;
+    Ok(f)
+}
+
 /// Commit point: write the journal (temp + rename + dir fsync).
 pub fn commit_journal(segdir: &Path, start: u32, journal: &[u8]) -> Result<()> {
     replace_file(&rebuild_dir(segdir, start).join(JOURNAL), journal)
@@ -69,6 +86,9 @@ pub fn finish(segdir: &Path, start: u32, names: &[String], mid: &dyn Fn()) -> Re
         let _ = fs::remove_file(&tmp);
         fs::hard_link(d.join(n), &tmp).with_context(|| format!("link {n}"))?;
         fs::rename(&tmp, segdir.join(n)).with_context(|| format!("swap {n}"))?;
+        // When `<name>` already is this inode (a finish run again by `recover`), POSIX
+        // `rename` does nothing and both names stay: drop the `.swap-` link (m8).
+        let _ = fs::remove_file(&tmp);
         if i == 0 {
             fsync_dir(segdir)?;
             mid();
@@ -176,5 +196,64 @@ mod tests {
         recover(seg).unwrap();
         assert_eq!(fs::read(seg.join(n)).unwrap(), b"new");
         assert!(!d.exists());
+    }
+
+    #[test]
+    fn finish_run_again_after_a_finished_swap_leaves_no_swap_links() {
+        // m8 (T9): a crash after `finish` but before `remove` makes `recover` finish again.
+        // `<name>` is then the same inode as the rebuilt file, so `rename(.swap-n, n)` is a
+        // no-op and the `.swap-` link stayed, holding the old inode's space.
+        let t = tempfile::tempdir().unwrap();
+        let seg = t.path().join("segments");
+        fs::create_dir_all(&seg).unwrap();
+        let names: Vec<String> = [
+            "net-txs-000000010-000000020.seg",
+            "net-range-000000010-000000020.toml",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let d = rebuild_dir(&seg, 10);
+        fs::create_dir_all(&d).unwrap();
+        for n in &names {
+            fs::write(seg.join(n), b"old").unwrap();
+            fs::write(d.join(n), b"new").unwrap();
+        }
+        commit_journal(&seg, 10, b"{}").unwrap();
+        finish(&seg, 10, &names, &|| {}).unwrap();
+        let lines = recover(&seg).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let left: Vec<String> = fs::read_dir(&seg)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".swap-") || n.starts_with("rebuild."))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        for n in &names {
+            assert_eq!(fs::read(seg.join(n)).unwrap(), b"new");
+        }
+    }
+
+    #[test]
+    fn swap_lock_excludes_shared_holders() {
+        let t = tempfile::tempdir().unwrap();
+        let seg = t.path().join("segments");
+        fs::create_dir_all(&seg).unwrap();
+        let ex = swap_lock(&seg, true).unwrap();
+        let p = t.path().join("segments.swap.lock");
+        let other = fs::OpenOptions::new().write(true).open(&p).unwrap();
+        assert!(matches!(
+            other.try_lock_shared(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(ex);
+        let a = swap_lock(&seg, false).unwrap();
+        other.try_lock_shared().unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(a);
     }
 }
