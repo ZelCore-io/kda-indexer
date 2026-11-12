@@ -114,17 +114,7 @@ impl Block {
     /// The store keeps the canonical chain only (a reorg replaces blocks), so a block read in
     /// the same request is canonical; one held across a reorg (a subscription) may not be.
     async fn canonical(&self, ctx: &Context<'_>) -> Result<bool> {
-        let b = self.b.clone();
-        gql(ctx)
-            .state()?
-            .read(move |view| {
-                let Ok(h) = u32::try_from(b.height) else {
-                    return Ok(false);
-                };
-                Ok(view.block(b.chain, h)?.is_some_and(|x| x.hash == b.hash))
-            })
-            .await
-            .map_err(from_api)
+        is_stored(ctx, &self.b).await
     }
     /// ZelCore extension: the block's coinbase output as compact JSON text (`gas`, `logs`,
     /// `txId`, `events`, `reqKey`, `result`, `metaData`, `continuation`).
@@ -270,6 +260,22 @@ pub fn chain_set(ids: Option<&[String]>) -> Result<Vec<u8>> {
     v.sort_unstable();
     v.dedup();
     Ok(v)
+}
+
+/// Whether `b` is the stored block at its chain and height (the store keeps the canonical
+/// chain only).
+pub(crate) async fn is_stored(ctx: &Context<'_>, b: &BlockRecord) -> Result<bool> {
+    let (chain, height, hash) = (b.chain, b.height, b.hash);
+    gql(ctx)
+        .state()?
+        .read(move |view| {
+            let Ok(h) = u32::try_from(height) else {
+                return Ok(false);
+            };
+            Ok(view.block_hash(chain, h)? == Some(hash))
+        })
+        .await
+        .map_err(from_api)
 }
 
 /// Which blocks a list holds: per chain, heights `lo..=hi`; listed by height descending, then

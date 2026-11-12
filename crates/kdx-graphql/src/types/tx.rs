@@ -763,9 +763,9 @@ impl TransactionSummary {
     async fn chain_id(&self) -> BigInt {
         BigInt::new(i128::from(self.d.key().chain()))
     }
-    /// Rows are read from the store, which keeps the canonical chain only.
-    async fn canonical(&self) -> bool {
-        true
+    /// Whether the row's block is the stored block at its height, as `Block.canonical` (M9).
+    async fn canonical(&self, ctx: &Context<'_>) -> Result<bool> {
+        super::block::is_stored(ctx, &self.d.block).await
     }
     async fn creation_time(&self) -> DateTime {
         let m = self.d.cmd.as_ref().and_then(|c| c.get("meta"));
@@ -1112,5 +1112,62 @@ mod tests {
         assert!(t.contains(r#","1","0","#), "{t}");
         let sg = dec(&v["cmd"]["signers"][0]["id"]);
         assert!(sg.ends_with(r#","0"]"#), "{sg}");
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use async_graphql::{EmptyMutation, EmptySubscription, Schema};
+    use kdx_types::record::TxRecord;
+    use kdx_types::TxKey;
+
+    use super::*;
+    use crate::testutil;
+    use crate::GraphqlSettings;
+
+    struct Q {
+        d: Arc<TxData>,
+    }
+
+    #[Object]
+    impl Q {
+        async fn s(&self) -> TransactionSummary {
+            TransactionSummary { d: self.d.clone() }
+        }
+    }
+
+    /// M9: a summary is canonical only while its block is the stored one at its height.
+    #[tokio::test]
+    async fn summary_canonical_follows_the_stored_block() {
+        let f = testutil::store();
+        f.apply(0, 5, 1);
+        for (fork, want) in [(1u8, true), (0, false)] {
+            let d = Arc::new(TxData {
+                rec: TxRecord {
+                    key: TxKey::new(5, 0, 1),
+                    ..TxRecord::default()
+                },
+                block: testutil::feed_block(0, 5, fork).block.clone(),
+                out: Value::Null,
+                cmd: None,
+                evs: Vec::new(),
+                trs: Vec::new(),
+                nfts: Vec::new(),
+            });
+            let settings = GraphqlSettings::default();
+            let schema = Schema::build(Q { d }, EmptyMutation, EmptySubscription)
+                .data(crate::Gql {
+                    state: Some(f.st.clone()),
+                    ws: crate::ws::WsState::new(&settings),
+                    settings,
+                    feed: None,
+                    search: None,
+                })
+                .finish();
+            let r = schema.execute("{ s { canonical } }").await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let v = r.data.into_json().unwrap();
+            assert_eq!(v["s"]["canonical"], want, "fork {fork}");
+        }
     }
 }
