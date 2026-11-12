@@ -444,11 +444,30 @@ Stop the service first: it takes the data dir lock.
   files is compared, and the blake3 of every stored and rebuilt file is logged. A store
   rebuilt with its own dictionary gives equal bytes; across stores only the content is
   comparable (`segments digest --content`).
-- `--dry-run` builds and compares, prints the report and removes the rebuild.
+- The rebuilt range must link to its neighbours: the first block of each chain must name the
+  stored last block before the range as its parent, and the stored first block after it (the
+  next entry, or the hot store) must name the rebuilt last block. Otherwise nothing is
+  swapped; a reorg that spans two steps needs both rebuilt, starting with the later one only
+  after the earlier one links.
+- When the content differs (or the stored range was unreadable), the rebuild marks dirty the
+  balance rows of every account and module in the transfers of both the old and the new
+  content, and marks the search index stale from `S` (`stale_from_height` in
+  `search/manifest.json`). Until a search rebuild runs, native `/search/code` answers
+  `partial: true` and compat `/txs/search` scans instead of trusting the index; the periodic
+  rebuild treats the mark as due, or run `kda-indexer search rebuild`. The report's
+  `dirty_marks` and `search_marked_stale` say what was done.
+- `--dry-run` builds and compares, prints the report and removes the rebuild. It writes
+  nothing to the hot store, but like every writer start it first finishes or drops other
+  ranges' interrupted swaps.
 - The swap is crash-safe at every point: before the journal `rebuild.<S>/rebuild.json`
   exists the old files stay; after it, readers use the rebuilt set, and the next writer start
   (`run`, `backfill`, `rebuild-range`) finishes the swap. `segments check` passes in between.
-- A `serve` keeps the files it has open until it restarts; restart it after a repair.
+- Restart `serve` after every `rebuild-range` that swapped (`"swapped": true`). A running
+  `serve` keeps the files and indexes it opened before the swap and opens others lazily, so it
+  can pair an old index with a new file of the swapped range (wrong rows or decode errors).
+- `snapshot` and the swap exclude each other through `segments.swap.lock` in the data dir: a
+  snapshot waits for a swap in progress, and a swap waits for a snapshot to place its
+  segment files.
 - Size note (B10): two mainnet 100k `txs.seg` files are about 4.8 and 4.3 GB. They verify and
   read correctly; a rebuild works per 10k step, so prefer `--step` over `--range`.
 
