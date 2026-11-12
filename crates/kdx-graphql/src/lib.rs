@@ -71,6 +71,8 @@ pub struct GraphqlSettings {
     pub ws_idle: Duration,
     pub ws_tx_wait: Duration,
     pub feed_poll: Duration,
+    /// Byte budget of the decoded blocks the feed's broadcast ring holds (M-3).
+    pub feed_ring_bytes: usize,
     /// `networkInfo.networkId`.
     pub network_id: String,
     /// `networkInfo.networkHost` (never the node URL).
@@ -115,6 +117,7 @@ impl Default for GraphqlSettings {
             ws_idle: Duration::from_secs(600),
             ws_tx_wait: Duration::from_secs(3600),
             feed_poll: Duration::from_millis(1000),
+            feed_ring_bytes: crate::feed::RING_BYTES,
             network_id: "mainnet01".into(),
             network_host: String::new(),
             apq: false,

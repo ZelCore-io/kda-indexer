@@ -62,6 +62,7 @@ rate_per_ip = 20
 # ws_idle_secs = 600
 # ws_tx_wait_secs = 3600
 # feed_poll_ms = 1000
+# feed_ring_mb = 64          # decoded blocks the subscription feed's ring holds at most
 # network_host = ""          # networkInfo.networkHost: a public name, never the node URL
 
 [log]

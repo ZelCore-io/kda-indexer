@@ -286,6 +286,8 @@ pub struct GraphqlConfig {
     pub ws_idle_secs: u64,
     pub ws_tx_wait_secs: u64,
     pub feed_poll_ms: u64,
+    /// Byte budget (MB) of the decoded blocks the subscription feed's ring holds.
+    pub feed_ring_mb: u32,
     /// `networkInfo.networkHost`: a public name for clients, never the node URL.
     pub network_host: String,
     /// Automatic persisted queries. Not built: `true` is refused.
@@ -315,6 +317,7 @@ impl Default for GraphqlConfig {
             ws_idle_secs: 600,
             ws_tx_wait_secs: 3600,
             feed_poll_ms: 1000,
+            feed_ring_mb: 64,
             network_host: String::new(),
             apq: false,
         }
@@ -355,6 +358,10 @@ impl GraphqlConfig {
             "graphql.feed_poll_ms must be at least 100"
         );
         anyhow::ensure!(
+            (8..=4096).contains(&self.feed_ring_mb),
+            "graphql.feed_ring_mb must be in 8..=4096"
+        );
+        anyhow::ensure!(
             !self.apq,
             "graphql.apq: automatic persisted queries are not built in this version"
         );
@@ -389,6 +396,7 @@ impl GraphqlConfig {
             ws_idle: Duration::from_secs(self.ws_idle_secs),
             ws_tx_wait: Duration::from_secs(self.ws_tx_wait_secs),
             feed_poll: Duration::from_millis(self.feed_poll_ms),
+            feed_ring_bytes: self.feed_ring_mb as usize * (1 << 20),
             network_id: network.to_owned(),
             network_host: self.network_host.clone(),
             apq: self.apq,

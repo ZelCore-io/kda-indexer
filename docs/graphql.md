@@ -161,7 +161,7 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | client messages | one per-IP rate token each (pings too) | close 4429 (`ws_rate`) |
 | a client that does not read | 30 s per server message | close 4008 (`ws_slow_reader`) |
 | a chain whose feed read fails | 30 ticks in a row | that chain alone is skipped each tick (a WARN line with the chain and its failure count; the other chains keep delivering), then resumes from its tip with a gap |
-| a subscriber behind the feed | 1,024 feed items | one `INTERNAL` error; the subscription goes on from the feed's newest item |
+| a subscriber behind the feed | 1,024 feed items, or behind blocks the ring had to drop to stay within `feed_ring_mb = 64` MB of decoded blocks | one `INTERNAL` error; the subscription goes on from the feed's newest item |
 | a query or mutation over the socket | subscriptions only | `NOT_SUPPORTED` error, nothing runs (`ws_query`); send queries over HTTP |
 | one subscription message | the HTTP request deadline, shared by all its resolvers | `TIMEOUT` error for that message |
 
@@ -205,6 +205,15 @@ number open.
 
 Subscriptions read a feed that polls the stored chain tips every `feed_poll_ms` (1,000), so
 `serve` and replicas serve them as `run` does.
+
+The feed decodes each new block's txs once and shares them with every subscriber through a
+broadcast ring of 1,024 items. The ring is byte-bounded (`feed_ring_mb`, 64 MB by default):
+before a block would take the decoded blocks it holds past the budget, the feed pushes the
+oldest blocks out of the ring with empty items. Only a subscriber that has not read those
+blocks yet gets the lag error; a subscriber that keeps up skips the empty items and loses
+nothing. Full blocks of maximum-size txs therefore cannot pin more than the budget (plus one
+block over the budget, alone) behind a client that stops reading. `kdx_graphql_feed_ring_bytes`
+is the current estimate.
 
 - A message never carries more items than its complexity priced: a catch-up is split over
   several messages.

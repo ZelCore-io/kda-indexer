@@ -15,9 +15,14 @@
 //!   `…FromDepth` releases, pruned per chain (M4). A tick
 //!   reads every moved chain before it caches, publishes tips or sends anything, and drops
 //!   the cached heights a rollback, reorg or gap made stale.
+//! - The ring is byte-bounded (M-3): the feed keeps an estimate of the decoded blocks among
+//!   the last [`CAPACITY`] items that are still alive. Before a block would take it past
+//!   the budget ([`RING_BYTES`] by default), the feed sends [`FeedItem::Pad`] items until the
+//!   oldest held blocks leave the ring. Only a receiver that has not read those blocks lags
+//!   (the existing lag error); a receiver that keeps up only skips the pads.
 //! - The polling task ends when the last handle drops.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +42,8 @@ pub const MAX_PER_TICK: u64 = 200;
 pub const RING: usize = 64;
 /// Recent canonical blocks kept per chain for depth releases.
 pub const RECENT: u64 = 256;
+/// Default byte budget of the decoded blocks the broadcast ring holds (M-3).
+pub const RING_BYTES: usize = 64 << 20;
 
 /// One new canonical block with its txs (coinbase first).
 #[derive(Debug)]
@@ -53,6 +60,9 @@ pub enum FeedItem {
     Block(Arc<FeedBlock>),
     /// Blocks of `chain` were skipped (catch-up or deep fork).
     Gap(u8),
+    /// No content: sent to push old blocks out of the ring past its byte budget (M-3).
+    /// Receivers skip it.
+    Pad,
 }
 
 struct Inner {
@@ -61,6 +71,128 @@ struct Inner {
     /// Per chain, by height: block records only (txs are loaded again on release), so the
     /// cache stays a few MB in the dense era.
     recent: Mutex<HashMap<u8, BTreeMap<u64, Arc<BlockRecord>>>>,
+    /// Every send goes through it (M-3).
+    ring: Mutex<Ring>,
+}
+
+/// The byte account of the broadcast ring (M-3).
+struct Ring {
+    /// Items sent into the channel: its tail position (a send with no receiver stores
+    /// nothing and is not counted).
+    sent: u64,
+    /// Blocks among the last [`CAPACITY`] sent that may still be alive, oldest first:
+    /// (position, block, approximate bytes).
+    held: VecDeque<(u64, Weak<FeedBlock>, usize)>,
+    /// Their bytes.
+    bytes: usize,
+    budget: usize,
+}
+
+impl Ring {
+    /// Forget the blocks every receiver has read (the channel dropped them) and those the
+    /// channel has overwritten.
+    fn prune(&mut self) {
+        let floor = self.sent.saturating_sub(CAPACITY as u64);
+        let mut bytes = 0;
+        self.held.retain(|(pos, w, n)| {
+            let keep = *pos >= floor && w.strong_count() > 0;
+            if keep {
+                bytes += n;
+            }
+            keep
+        });
+        self.bytes = bytes;
+    }
+
+    /// Room for `need` more bytes: pads until the oldest held blocks leave the ring (the
+    /// channel overwrites position `p` when it sends `p + CAPACITY`). At most [`CAPACITY`]
+    /// pads in all, so a receiver that has read every block sent so far never lags; a block
+    /// over the whole budget leaves the ring holding only itself.
+    fn make_room(&mut self, tx: &broadcast::Sender<FeedItem>, need: usize) {
+        loop {
+            self.prune();
+            if self.bytes + need <= self.budget {
+                return;
+            }
+            let Some(&(oldest, ..)) = self.held.front() else {
+                return;
+            };
+            let pads = (oldest + CAPACITY as u64 + 1).saturating_sub(self.sent);
+            for _ in 0..pads {
+                if tx.send(FeedItem::Pad).is_err() {
+                    // No receiver: the channel holds nothing.
+                    self.held.clear();
+                    self.bytes = 0;
+                    return;
+                }
+                self.sent += 1;
+            }
+        }
+    }
+}
+
+/// Approximate heap bytes of a JSON value (each node counted at its inline size).
+fn value_bytes(v: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    const NODE: usize = std::mem::size_of::<Value>();
+    NODE + match v {
+        Value::String(s) => s.len(),
+        Value::Array(a) => a.iter().map(value_bytes).sum(),
+        Value::Object(m) => m.iter().map(|(k, v)| NODE + k.len() + value_bytes(v)).sum(),
+        _ => 0,
+    }
+}
+
+/// Approximate bytes of a decoded tx: its stored record's buffers and the decoded output,
+/// command, events and transfers.
+fn tx_bytes(d: &TxData) -> usize {
+    use std::mem::size_of;
+    let r = &d.rec;
+    let opt = |b: &Option<Vec<u8>>| b.as_ref().map_or(0, Vec::len);
+    let rec = r.result.len()
+        + opt(&r.cmd)
+        + opt(&r.metadata)
+        + opt(&r.continuation)
+        + opt(&r.extra)
+        + opt(&r.raw_tx)
+        + opt(&r.raw_output)
+        + std::mem::size_of_val(r.sigs.as_slice())
+        + std::mem::size_of_val(r.events.as_slice())
+        + std::mem::size_of_val(r.transfers.as_slice());
+    let evs: usize = d
+        .evs
+        .iter()
+        .map(|e| {
+            size_of::<kdx_api::compat::shapes::Ev>()
+                + e.qual_name.len()
+                + e.module.len()
+                + e.module_hash.len()
+                + value_bytes(&e.params)
+        })
+        .sum();
+    let tr = |t: &kdx_api::compat::shapes::Transfer| {
+        size_of::<kdx_api::compat::shapes::Transfer>()
+            + t.token.len()
+            + t.from.len()
+            + t.to.len()
+            + t.amount.len()
+    };
+    let trs: usize = d.trs.iter().map(tr).sum();
+    let nfts: usize = d.nfts.iter().map(|n| tr(&n.tr) + n.token_id.len()).sum();
+    size_of::<TxData>()
+        + rec
+        + value_bytes(&d.out)
+        + d.cmd.as_ref().map_or(0, value_bytes)
+        + evs
+        + trs
+        + nfts
+}
+
+/// Approximate bytes a feed block holds (its txs; the record is small and shared).
+pub fn block_bytes(b: &FeedBlock) -> usize {
+    std::mem::size_of::<FeedBlock>()
+        + std::mem::size_of::<BlockRecord>()
+        + b.txs.iter().map(|d| tx_bytes(d)).sum::<usize>()
 }
 
 /// Handle of the block feed (cheap to clone).
@@ -80,19 +212,31 @@ impl BlockFeed {
     ///
     /// [`inject`]: BlockFeed::inject
     pub fn detached() -> BlockFeed {
+        BlockFeed::detached_with(RING_BYTES)
+    }
+
+    /// A detached feed whose ring holds at most `ring_bytes` of decoded blocks (M-3).
+    pub fn detached_with(ring_bytes: usize) -> BlockFeed {
         let (tx, _) = broadcast::channel(CAPACITY);
         BlockFeed {
             inner: Arc::new(Inner {
                 tx,
                 tips: Mutex::new(BTreeMap::new()),
                 recent: Mutex::new(HashMap::new()),
+                ring: Mutex::new(Ring {
+                    sent: 0,
+                    held: VecDeque::new(),
+                    bytes: 0,
+                    budget: ring_bytes,
+                }),
             }),
         }
     }
 
-    /// Start polling `state` every `poll`.
-    pub fn spawn(state: Arc<ApiState>, poll: Duration) -> BlockFeed {
-        let feed = BlockFeed::detached();
+    /// Start polling `state` every `poll`; the ring holds at most `ring_bytes` of decoded
+    /// blocks (M-3).
+    pub fn spawn(state: Arc<ApiState>, poll: Duration, ring_bytes: usize) -> BlockFeed {
+        let feed = BlockFeed::detached_with(ring_bytes);
         let weak = Arc::downgrade(&feed.inner);
         tokio::spawn(run(state, poll.max(Duration::from_millis(50)), weak));
         feed
@@ -130,7 +274,37 @@ impl BlockFeed {
             let e = t.entry(b.chain).or_insert(b.height);
             *e = (*e).max(b.height);
         }
-        let _ = self.inner.tx.send(item);
+        self.send(item);
+    }
+
+    /// Send `item`, within the ring's byte budget (M-3).
+    fn send(&self, item: FeedItem) {
+        let mut ring = self.inner.ring.lock().unwrap_or_else(|e| e.into_inner());
+        let block = match &item {
+            FeedItem::Block(b) => Some((Arc::downgrade(b), block_bytes(b))),
+            _ => None,
+        };
+        if let Some((_, need)) = &block {
+            ring.make_room(&self.inner.tx, *need);
+        }
+        if self.inner.tx.send(item).is_ok() {
+            let pos = ring.sent;
+            ring.sent += 1;
+            if let Some((w, need)) = block {
+                ring.held.push_back((pos, w, need));
+            }
+        }
+        ring.prune();
+        kdx_metrics::get()
+            .graphql_feed_ring_bytes
+            .set(i64::try_from(ring.bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Approximate bytes of decoded blocks the ring holds (M-3).
+    pub fn ring_bytes(&self) -> usize {
+        let mut ring = self.inner.ring.lock().unwrap_or_else(|e| e.into_inner());
+        ring.prune();
+        ring.bytes
     }
 
     /// Drop the cached blocks of `chain` above `height` (all of them with `None`): they are
@@ -366,7 +540,7 @@ async fn step(
         }
     }
     for item in items {
-        let _ = feed.inner.tx.send(item);
+        feed.send(item);
     }
     Ok(())
 }
@@ -375,6 +549,74 @@ async fn step(
 mod tests {
     use super::*;
     use crate::testutil::{self, hash};
+
+    /// A block of `chain` at `height` with one tx whose output holds `bytes` of text.
+    fn big_block(chain: u8, height: u64, bytes: usize) -> Arc<FeedBlock> {
+        let b = testutil::feed_block(chain, height, 0);
+        let tx = TxData {
+            rec: kdx_types::record::TxRecord {
+                key: kdx_types::TxKey::new(height as u32, chain, 1),
+                ..Default::default()
+            },
+            block: b.block.clone(),
+            out: serde_json::Value::String("x".repeat(bytes)),
+            cmd: None,
+            evs: Vec::new(),
+            trs: Vec::new(),
+            nfts: Vec::new(),
+        };
+        Arc::new(FeedBlock {
+            chain,
+            height,
+            hash: b.hash,
+            block: b.block.clone(),
+            txs: Arc::new(vec![Arc::new(tx)]),
+        })
+    }
+
+    /// M-3: a receiver that never reads holds at most the ring's byte budget of decoded
+    /// blocks (counted by the blocks still alive, not only the estimate); it gets the lag
+    /// error, and a receiver that keeps up gets every block and never lags.
+    #[test]
+    fn a_stalled_receiver_holds_at_most_the_ring_budget() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        const MB: usize = 1 << 20;
+        let feed = BlockFeed::detached();
+        let mut stalled = feed.subscribe();
+        let mut live = feed.subscribe();
+        let mut weak = Vec::new();
+        let mut got = Vec::new();
+        for h in 0..100u64 {
+            let b = big_block(3, h, MB);
+            weak.push(Arc::downgrade(&b));
+            feed.inject(FeedItem::Block(b));
+            loop {
+                match live.try_recv() {
+                    Ok(FeedItem::Block(b)) => got.push(b.height),
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(e) => panic!("the live receiver lagged at {h}: {e:?}"),
+                }
+            }
+            let alive = weak.iter().filter(|w| w.strong_count() > 0).count();
+            assert!(
+                alive * MB <= RING_BYTES,
+                "{alive} blocks of 1 MB alive at {h}"
+            );
+            assert!(feed.ring_bytes() <= RING_BYTES, "{}", feed.ring_bytes());
+        }
+        assert_eq!(got, (0..100).collect::<Vec<_>>());
+        assert!(matches!(stalled.try_recv(), Err(TryRecvError::Lagged(_))));
+        // A block over the whole budget leaves the ring holding only itself.
+        let huge = big_block(3, 100, RING_BYTES + MB);
+        let w = Arc::downgrade(&huge);
+        feed.inject(FeedItem::Block(huge));
+        assert_eq!(weak.iter().filter(|w| w.strong_count() > 0).count(), 0);
+        assert!(w.strong_count() > 0);
+        drop((stalled, live));
+        feed.inject(FeedItem::Block(big_block(3, 101, MB)));
+        assert_eq!(feed.ring_bytes(), 0);
+    }
 
     /// I-5: a subscriber woken by one chain's new block never sees another chain's new tip
     /// while that chain's reorged height still holds the orphaned block.
