@@ -200,9 +200,28 @@ enum Step {
 
 /// Sent `(height, hash)` per chain, oldest first.
 type Sent = HashMap<u8, Vec<(u64, Hash32)>>;
+/// Consecutive failed reads per chain (M-4).
+type Fails = HashMap<u8, u32>;
+
+/// Consecutive failed reads after which a chain resumes from its tip with a `Gap` (M-4).
+pub const MAX_CHAIN_FAILS: u32 = 30;
+
+#[cfg(test)]
+static FAIL_CHAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Test hook: the reads of `chain` fail.
+#[cfg(test)]
+fn injected_failure(chain: u8) -> bool {
+    FAIL_CHAIN.load(std::sync::atomic::Ordering::Relaxed) == u32::from(chain)
+}
+#[cfg(not(test))]
+fn injected_failure(_: u8) -> bool {
+    false
+}
 
 async fn run(state: Arc<ApiState>, poll: Duration, weak: Weak<Inner>) {
     let mut sent: Sent = HashMap::new();
+    let mut fails: Fails = HashMap::new();
     let mut newest_ct: u64 = 0;
     let mut tick = tokio::time::interval(poll);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -212,8 +231,8 @@ async fn run(state: Arc<ApiState>, poll: Duration, weak: Weak<Inner>) {
             return;
         };
         let feed = BlockFeed { inner };
-        if let Err(e) = step(&state, &feed, &mut sent, &mut newest_ct).await {
-            tracing::debug!(error = %e, "graphql feed tick failed");
+        if let Err(e) = step(&state, &feed, &mut sent, &mut fails, &mut newest_ct).await {
+            tracing::warn!(error = %e, "graphql feed: reading the chain tips failed");
         }
         if newest_ct > 0 {
             let now = SystemTime::now()
@@ -230,13 +249,17 @@ async fn step(
     state: &Arc<ApiState>,
     feed: &BlockFeed,
     sent: &mut Sent,
+    fails: &mut Fails,
     newest_ct: &mut u64,
 ) -> ApiResult<()> {
     let tips = state.read_status(|v| v.chain_tips()).await?;
     // Read every moved chain first. Nothing is cached, published or sent until all reads
     // are done, so a subscriber woken by one chain's block never sees another chain's new
     // tip while its reorged heights still hold the orphaned blocks (I-5).
+    // M-4: one chain's failed read skips that chain only (its tip is not published either),
+    // and after MAX_CHAIN_FAILS in a row the chain resumes from its tip with a Gap.
     let mut moved = Vec::new();
+    let mut skipped = Vec::new();
     for &(c, h, hash) in &tips {
         let h = u64::from(h);
         let Some(ring) = sent.get(&c) else {
@@ -248,8 +271,11 @@ async fn step(
             continue;
         }
         let r = ring.clone();
-        let step = state
+        let res = state
             .read(move |view| {
+                if injected_failure(c) {
+                    return Err(kdx_api::ApiError::Unavailable("injected".into()));
+                }
                 let mut from = None;
                 for (hh, hhash) in r.iter().rev() {
                     let Ok(h32) = u32::try_from(*hh) else {
@@ -275,7 +301,29 @@ async fn step(
                     blocks: load_blocks(view, &keys)?,
                 })
             })
-            .await?;
+            .await;
+        let step = match res {
+            Ok(s) => {
+                fails.remove(&c);
+                s
+            }
+            Err(e) => {
+                let n = fails.entry(c).or_insert(0);
+                *n += 1;
+                tracing::warn!(
+                    chain = c,
+                    failures = *n,
+                    error = %e,
+                    "graphql feed: reading a chain's new blocks failed; the chain is skipped this tick"
+                );
+                if *n < MAX_CHAIN_FAILS {
+                    skipped.push(c);
+                    continue;
+                }
+                fails.remove(&c);
+                Step::Gap
+            }
+        };
         moved.push((c, h, hash, step));
     }
     // No await from here on: cache the replacements, then publish the tips, then send.
@@ -313,7 +361,7 @@ async fn step(
     }
     {
         let mut t = feed.inner.tips.lock().unwrap_or_else(|e| e.into_inner());
-        for (c, h, _) in &tips {
+        for (c, h, _) in tips.iter().filter(|t| !skipped.contains(&t.0)) {
             t.insert(*c, u64::from(*h));
         }
     }
@@ -338,9 +386,13 @@ mod tests {
         }
         let feed = BlockFeed::detached();
         let (mut sent, mut ct) = (Sent::new(), 0);
-        step(&f.st, &feed, &mut sent, &mut ct).await.unwrap();
+        step(&f.st, &feed, &mut sent, &mut Fails::new(), &mut ct)
+            .await
+            .unwrap();
         f.apply(5, 1, 0);
-        step(&f.st, &feed, &mut sent, &mut ct).await.unwrap();
+        step(&f.st, &feed, &mut sent, &mut Fails::new(), &mut ct)
+            .await
+            .unwrap();
         assert_eq!(feed.recent(5, 1).map(|b| b.hash), Some(hash(5, 1, 0)));
         // One tick: chain 5 replaces height 1 and grows to 2; chain 2 gains a block.
         f.unwind(5, 0);
@@ -359,9 +411,59 @@ mod tests {
                 }
             }
         });
-        step(&f.st, &feed, &mut sent, &mut ct).await.unwrap();
+        step(&f.st, &feed, &mut sent, &mut Fails::new(), &mut ct)
+            .await
+            .unwrap();
         let (tip, at1) = seen.await.unwrap();
         assert_eq!((tip, at1), (2, Some(hash(5, 1, 1))));
+    }
+
+    /// M-4: a chain whose reads fail is skipped alone: the other chains keep delivering,
+    /// and after MAX_CHAIN_FAILS failures in a row the failing chain gets a Gap.
+    #[tokio::test]
+    async fn one_failing_chain_does_not_stop_the_others() {
+        let f = testutil::store();
+        for c in [0u8, 1] {
+            f.apply(c, 0, 0);
+        }
+        let feed = BlockFeed::detached();
+        let (mut sent, mut fails, mut ct) = (Sent::new(), Fails::new(), 0);
+        step(&f.st, &feed, &mut sent, &mut fails, &mut ct)
+            .await
+            .unwrap();
+        let mut rx = feed.subscribe();
+        FAIL_CHAIN.store(1, std::sync::atomic::Ordering::Relaxed);
+        for h in 1..MAX_CHAIN_FAILS as u64 {
+            f.apply(0, h, 0);
+            f.apply(1, h, 0);
+            step(&f.st, &feed, &mut sent, &mut fails, &mut ct)
+                .await
+                .unwrap();
+            match rx.try_recv() {
+                Ok(FeedItem::Block(b)) => assert_eq!((b.chain, b.height), (0, h)),
+                other => panic!("tick {h}: {other:?}"),
+            }
+            assert!(rx.try_recv().is_err(), "chain 1 sent nothing");
+            assert_eq!(feed.tips().get(&1), Some(&0), "chain 1's tip is held");
+            assert_eq!(fails.get(&1), Some(&(h as u32)));
+        }
+        // The 30th failure in a row: chain 1 resumes from its tip with a Gap.
+        step(&f.st, &feed, &mut sent, &mut fails, &mut ct)
+            .await
+            .unwrap();
+        FAIL_CHAIN.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(rx.try_recv(), Ok(FeedItem::Gap(1))));
+        let tip = MAX_CHAIN_FAILS as u64 - 1;
+        assert_eq!(feed.tips().get(&1), Some(&tip));
+        assert!(fails.is_empty());
+        f.apply(1, tip + 1, 0);
+        step(&f.st, &feed, &mut sent, &mut fails, &mut ct)
+            .await
+            .unwrap();
+        match rx.try_recv() {
+            Ok(FeedItem::Block(b)) => assert_eq!((b.chain, b.height), (1, tip + 1)),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// M4: the recent cache keeps block records only (never a block's txs) and prunes each
