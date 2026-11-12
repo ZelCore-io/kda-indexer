@@ -60,9 +60,14 @@ fn keys_with_decreasing_starts_count_zero_instead_of_underflowing() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("keys.ef");
     std::fs::write(&p, &bytes).unwrap();
-    let k = kdx_segment::keys::Keys::open(&p).expect("opens");
-    for s in 0..k.slots() + 2 {
-        let _ = (k.first(s), k.count(s));
+    // Since M-6 the Elias-Fano data is rebuilt and compared at open, so a damaged file no
+    // longer opens. If it ever does, the lookups must still not underflow.
+    let r = kdx_segment::keys::Keys::open(&p);
+    assert!(r.is_err(), "damaged keys.ef opened");
+    if let Ok(k) = r {
+        for s in 0..k.slots() + 2 {
+            let _ = (k.first(s), k.count(s));
+        }
     }
 }
 #[test]
@@ -81,4 +86,19 @@ fn postings_trailer_with_huge_sizes_is_refused_not_an_overflow_panic() {
         .err()
         .expect("refused");
     assert!(e.to_string().contains("trailer"), "{e}");
+}
+
+#[test]
+fn keys_with_slot_count_u64_max_is_refused_not_an_overflow_panic() {
+    // Found by the `ef_keys` fuzz target once M-6 let damaged Elias-Fano data reach the slot
+    // check: `slots + 1` overflowed for a stored slot count of u64::MAX.
+    const HEX: &str = "4b44584b0102000000ffffffffffffffff020000000000000055555555555955555555010000000000540000000000000001000000000000000000000000000000020000000000000000004000000000000000000029000000000000000100000000000000000000000000000000000000000000000000002900000000000000";
+    let bytes: Vec<u8> = (0..HEX.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&HEX[i..i + 2], 16).unwrap())
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("keys.ef");
+    std::fs::write(&p, &bytes).unwrap();
+    assert!(kdx_segment::keys::Keys::open(&p).is_err());
 }

@@ -13,6 +13,8 @@ use anyhow::{bail, Context, Result};
 use sucds::mii_sequences::{EliasFano, EliasFanoBuilder};
 use sucds::Serializable;
 
+use crate::ef;
+
 use crate::files::DurableFile;
 
 pub const MAGIC: &[u8; 4] = b"KDXK";
@@ -51,8 +53,18 @@ impl Keys {
         }
         let slot_width = u32::from_le_bytes(b[5..9].try_into()?);
         let slots = u64::from_le_bytes(b[9..17].try_into()?) as usize;
-        let ef = EliasFano::deserialize_from(&b[17..])?.enable_rank();
-        if ef.len() != slots + 1 {
+        // Checked read: a damaged file is an `Err`, not a panic or an abort inside sucds (M-6).
+        let (ef, used) = ef::load(&b[17..]).with_context(|| format!("{}", path.display()))?;
+        if 17 + used != b.len() {
+            bail!(
+                "{}: {} bytes after the Elias-Fano data",
+                path.display(),
+                b.len() - 17 - used
+            );
+        }
+        let ef = ef.enable_rank();
+        // A damaged slot count must not overflow (fuzz `ef_keys`, found after M-6).
+        if slots.checked_add(1) != Some(ef.len()) {
             bail!("{}: {} values for {slots} slots", path.display(), ef.len());
         }
         Ok(Keys {

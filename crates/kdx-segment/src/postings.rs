@@ -27,6 +27,8 @@ use kdx_types::varint::{get_u64, put_u64};
 use memmap2::Mmap;
 use roaring::RoaringBitmap;
 use sucds::mii_sequences::{EliasFano, EliasFanoBuilder};
+
+use crate::ef;
 use sucds::Serializable;
 
 use crate::files::DurableFile;
@@ -78,6 +80,26 @@ pub fn encode_list(vals: &[u32], range_txs: u64, out: &mut Vec<u8>) -> Result<()
     Ok(())
 }
 
+/// An Elias-Fano list body (after the length): decoded by `ef::values`, which checks every
+/// stored length, so damaged bytes are an `Err` (M-6). The values fit `u32` (relative TxNums).
+fn ef_list(b: &[u8], n: usize) -> Result<Vec<u32>> {
+    let d = ef::values(b)?;
+    ensure!(
+        d.used == b.len(),
+        "EF list: {} bytes after its data",
+        b.len() - d.used
+    );
+    ensure!(
+        d.values.len() == n,
+        "EF list length {} != {n}",
+        d.values.len()
+    );
+    d.values
+        .into_iter()
+        .map(|v| u32::try_from(v).context("EF list value past u32"))
+        .collect()
+}
+
 pub fn decode_list(mut b: &[u8]) -> Result<Vec<u32>> {
     let enc = *b.first().context("empty list")?;
     b = &b[1..];
@@ -103,11 +125,7 @@ pub fn decode_list(mut b: &[u8]) -> Result<Vec<u32>> {
         ENC_EF => {
             let buf = &mut b;
             let n = get_u64(buf)? as usize;
-            let ef = EliasFano::deserialize_from(*buf)?;
-            if ef.len() != n {
-                bail!("EF list length {} != {n}", ef.len());
-            }
-            Ok(ef.iter(0).map(|x| x as u32).collect())
+            ef_list(buf, n)
         }
         ENC_ROARING => {
             let r = RoaringBitmap::deserialize_from(b)?;
@@ -195,9 +213,11 @@ pub struct Postings {
     offsets: EliasFano,
 }
 
-/// TxNums of one list, newest (largest) first. A Delta list is decoded up to the bound (it
-/// is small by construction); Elias-Fano and Roaring lists are walked lazily from the back,
-/// so a page of 10 from a list of a million entries touches about 10 of them (R4).
+/// TxNums of one list, newest (largest) first. Delta and Elias-Fano lists are decoded whole
+/// and cut at the bound: both are short by construction (an Elias-Fano list holds at most
+/// `range_txs / 32` entries), and the Elias-Fano decode checks every stored length (M-6).
+/// Roaring lists, the long ones, are walked lazily from the back, so a page of 10 from a list
+/// of a million entries touches about 10 of them (R4).
 pub struct PostingIter {
     inner: Inner,
     base: u64,
@@ -206,8 +226,6 @@ pub struct PostingIter {
 
 enum Inner {
     Vec(Vec<u32>),
-    /// The list and the count of values not yet returned (values `[0, k)` remain).
-    Ef(Box<EliasFano>, usize),
     Roaring(RoaringIter),
 }
 
@@ -216,10 +234,6 @@ impl Iterator for PostingIter {
     fn next(&mut self) -> Option<u64> {
         let v = match &mut self.inner {
             Inner::Vec(v) => v.pop(),
-            Inner::Ef(ef, k) => {
-                *k = k.checked_sub(1)?;
-                ef.select(*k).map(|x| x as u32)
-            }
             Inner::Roaring(it) => it.next(),
         }?;
         self.len = self.len.saturating_sub(1);
@@ -228,8 +242,8 @@ impl Iterator for PostingIter {
 }
 
 impl PostingIter {
-    /// The same entries, oldest (smallest) first. Delta and Elias-Fano lists stay lazy; a
-    /// Roaring list is decoded whole (one range's list) and walked backwards.
+    /// The same entries, oldest (smallest) first. A decoded (Delta or Elias-Fano) list is
+    /// walked forwards; a Roaring list is decoded whole (one range's list) and reversed.
     pub fn oldest_first(self) -> Box<dyn Iterator<Item = u64>> {
         let base = self.base;
         if matches!(self.inner, Inner::Roaring(_)) {
@@ -239,11 +253,6 @@ impl PostingIter {
         }
         match self.inner {
             Inner::Vec(v) => Box::new(v.into_iter().map(move |x| base + u64::from(x))),
-            Inner::Ef(ef, k) => Box::new(
-                (0..k)
-                    .map_while(move |i| ef.select(i))
-                    .map(move |x| base + x as u64),
-            ),
             Inner::Roaring(_) => unreachable!("handled above"),
         }
     }
@@ -266,35 +275,6 @@ fn list_le(b: &[u8], max: Option<u32>, base: u64) -> Result<PostingIter> {
         let backing: Backing = Arc::new(b.to_vec());
         let view = Arc::new(RoaringView::parse(backing, 1, b.len())?);
         return roaring_list(view, max, base);
-    }
-    if enc == ENC_EF {
-        let mut buf = &b[1..];
-        let n = get_u64(&mut buf)? as usize;
-        let ef = EliasFano::deserialize_from(buf)?;
-        if ef.len() != n {
-            bail!("EF list length {} != {n}", ef.len());
-        }
-        // Count of values <= m by binary search over select (no rank index needed).
-        let k = match max {
-            None => n,
-            Some(m) => {
-                let (mut lo, mut hi) = (0usize, n);
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if ef.select(mid).is_some_and(|x| x <= m as usize) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                lo
-            }
-        };
-        return Ok(PostingIter {
-            inner: Inner::Ef(Box::new(ef), k),
-            base,
-            len: k,
-        });
     }
     let mut v = decode_list(b)?;
     if let Some(m) = max {
@@ -333,7 +313,12 @@ impl Postings {
         if ef_at.saturating_add(ef_len).saturating_add(24) != len {
             bail!("{}: inconsistent trailer", path.display());
         }
-        let offsets = EliasFano::deserialize_from(&map[ef_at..ef_at + ef_len])?;
+        // Checked read: a damaged file is an `Err`, not a panic or an abort inside sucds (M-6).
+        let (offsets, used) =
+            ef::load(&map[ef_at..ef_at + ef_len]).with_context(|| format!("{}", path.display()))?;
+        if used != ef_len {
+            bail!("{}: offsets take {used} of {ef_len} bytes", path.display());
+        }
         if offsets.len() != n + 1 {
             bail!(
                 "{}: {} offsets for {n} entities",

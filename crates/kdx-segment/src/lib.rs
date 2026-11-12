@@ -5,6 +5,7 @@ pub mod adj;
 pub mod blockfile;
 pub mod check;
 pub mod content;
+pub mod ef;
 pub mod etl;
 pub mod files;
 pub mod keys;

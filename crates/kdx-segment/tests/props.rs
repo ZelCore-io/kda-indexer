@@ -702,14 +702,48 @@ props! {
     }
 }
 
+/// The fuzz paths of `ef_keys` and `postings_list` over one input; a crash is the failure.
+fn sucds_fuzz_paths(name: &str, data: &[u8], dir: &std::path::Path) {
+    if name.contains("ef_keys") {
+        let p = dir.join("keys.ef");
+        std::fs::write(&p, data).unwrap();
+        if let Ok(k) = Keys::open(&p) {
+            for s in 0..k.slots().min(64) + 2 {
+                let _ = (k.first(s), k.count(s));
+            }
+            for t in [0, 1, k.tx_count() / 2, k.tx_count(), u64::MAX] {
+                let _ = k.slot_of(t);
+            }
+        }
+    } else if data.len() >= 12 {
+        let bound = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let body = &data[12..];
+        let _ = decode_list(body);
+        let p = dir.join("postings");
+        std::fs::write(&p, body).unwrap();
+        if let Ok(pf) = Postings::open(&p, 1_000) {
+            for i in 0..pf.entities().min(64) {
+                if let Ok(full) = pf.list_at(i) {
+                    let _ = pf.lazy_walk_matches(i, &full, u64::from(bound));
+                }
+                for max in [None, Some(bound)] {
+                    if let Ok(Some(it)) = pf.list_le(pf.entity_at(i), max) {
+                        for _ in it.take(256) {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
-#[ignore = "finding: sucds Vec::with_capacity(stored length) panics or aborts the process on a damaged keys.ef or Elias-Fano posting list"]
-fn finding_sucds_stored_length_aborts_instead_of_erroring() {
-    // `Keys::open` hands the payload to `sucds::EliasFano::deserialize_from`, whose `Vec<S>`
-    // reader calls `Vec::with_capacity(len)` with a length read from the file. A damaged length
-    // is a `capacity overflow` panic or an allocation abort (not catchable), where a refusal is wanted. Run in a child process
-    // so the abort does not take the test harness with it.
-    const CHILD: &str = "KDX_FINDING_SUCDS_CHILD";
+fn damaged_elias_fano_data_is_refused_not_a_crash() {
+    // M-6 (R-P5P9-25): sucds' `deserialize_from` trusts stored lengths, so a damaged keys.ef
+    // or Elias-Fano posting list panicked inside sucds or aborted the process on a huge
+    // `Vec::with_capacity`. `kdx_segment::ef` now checks the bytes first. The fixtures are the
+    // fuzz findings (each crashed before the fix). Run in a child process, so an abort fails
+    // this test instead of taking the harness with it.
+    const CHILD: &str = "KDX_SUCDS_CHILD";
     if std::env::var(CHILD).is_ok() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("keys.ef");
@@ -719,23 +753,39 @@ fn finding_sucds_stored_length_aborts_instead_of_erroring() {
             let mut b = good.clone();
             b[at..at + 8].copy_from_slice(&(1u64 << 60).to_le_bytes());
             std::fs::write(&p, &b).unwrap();
-            let _ = Keys::open(&p);
+            assert!(Keys::open(&p).is_err(), "length 2^60 at byte {at} opened");
         }
         // The same class in a posting list: encoding byte 1 (Elias-Fano) over garbage.
         for b in 0..=255u8 {
-            let _ = decode_list(&[1, b, b, b, b, b, b, b, b, b, 1, 2, 3, 4, 5, 6, 7, 8]);
+            let r = decode_list(&[1, b, b, b, b, b, b, b, b, b, 1, 2, 3, 4, 5, 6, 7, 8]);
+            assert!(r.is_err());
         }
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sucds");
+        let mut seen = 0;
+        for e in std::fs::read_dir(&fixtures).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy().into_owned();
+            sucds_fuzz_paths(&name, &std::fs::read(e.path()).unwrap(), dir.path());
+            if name.contains("ef_keys") {
+                std::fs::write(&p, std::fs::read(e.path()).unwrap()).unwrap();
+                assert!(Keys::open(&p).is_err(), "{name} opened");
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 8, "fixtures in {}", fixtures.display());
         return;
     }
     let exe = std::env::current_exe().unwrap();
     let st = std::process::Command::new(exe)
-        .args([
-            "--exact",
-            "finding_sucds_stored_length_aborts_instead_of_erroring",
-            "--ignored",
-        ])
+        .args(["--exact", "damaged_elias_fano_data_is_refused_not_a_crash"])
         .env(CHILD, "1")
         .output()
         .unwrap();
-    assert!(st.status.success(), "child died: {:?}", st.status);
+    assert!(
+        st.status.success(),
+        "child died: {:?}\n{}",
+        st.status,
+        String::from_utf8_lossy(&st.stderr)
+    );
 }
