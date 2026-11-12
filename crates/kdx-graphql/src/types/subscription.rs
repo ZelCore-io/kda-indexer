@@ -157,9 +157,8 @@ impl DepthGate {
         }
         want.sort_unstable();
         want.truncate(cap.max(1));
-        for &(h, c) in &want {
-            self.next.insert(c, h + 1);
-        }
+        // L-1: `next` moves only past heights actually released (below), so a failed read
+        // or a height the store does not hold yet is picked again on the next call.
         let picked: Vec<_> = want
             .into_iter()
             .map(|(h, c)| ((c, h), feed.recent(c, h)))
@@ -195,6 +194,10 @@ impl DepthGate {
             .await
             .map_err(from_api)?;
         out.sort_by_key(|b| (b.height, b.chain));
+        for b in &out {
+            let n = self.next.entry(b.chain).or_insert(b.height + 1);
+            *n = (*n).max(b.height + 1);
+        }
         Ok((out, gap))
     }
 }
@@ -540,6 +543,33 @@ mod tests {
         let (out, gap) = gate.release(&feed, &f.st, 20).await.unwrap();
         let got: Vec<_> = out.iter().map(|b| (b.height, b.hash)).collect();
         assert_eq!((got, gap), (vec![(1, hash(5, 1, 1))], None));
+    }
+
+    /// L-1: a height the store does not hold yet is not skipped: `next` stops before it,
+    /// and the next call releases it.
+    #[tokio::test]
+    async fn depth_gate_does_not_skip_an_unreleased_height() {
+        let f = testutil::store();
+        let feed = BlockFeed::detached();
+        for h in 0..=3 {
+            if h <= 1 {
+                f.apply(5, h, 0);
+            }
+            feed.inject(FeedItem::Block(feed_block(5, h, 0)));
+        }
+        let mut gate = DepthGate {
+            depth: 1,
+            txs: false,
+            chains: vec![5],
+            next: HashMap::from([(5, 1)]),
+        };
+        let (out, _) = gate.release(&feed, &f.st, 20).await.unwrap();
+        assert_eq!(out.iter().map(|b| b.height).collect::<Vec<_>>(), [1]);
+        assert_eq!(gate.next[&5], 2);
+        f.apply(5, 2, 0);
+        let (out, _) = gate.release(&feed, &f.st, 20).await.unwrap();
+        assert_eq!(out.iter().map(|b| b.height).collect::<Vec<_>>(), [2]);
+        assert_eq!(gate.next[&5], 3);
     }
 
     /// I-1: a depth release carries at most `cap` blocks; the rest follow on the next calls.
