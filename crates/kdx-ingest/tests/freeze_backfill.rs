@@ -234,9 +234,105 @@ async fn rebuild_repairs_a_corrupted_step() {
     .await
     .unwrap();
     assert!(rep.swapped && !rep.bytes_equal, "{rep:?}");
-    assert_ne!(rep.content_equal, Some(true), "{rep:?}");
+    // The damaged step is unreadable, so no content digest is compared (I-1 covers that).
+    assert_eq!(rep.content_equal, None, "{rep:?}");
     deep_check(&c);
     assert_eq!(content(&c), before);
+}
+
+type Blocks = Vec<(
+    kdx_types::record::BlockRecord,
+    Vec<kdx_types::record::TxRecord>,
+)>;
+
+/// Every block of `c`'s frozen entries with its txs, as the reader returns them.
+fn frozen_blocks(c: &kdx_ingest::Ctx) -> Blocks {
+    let m = kdx_segment::Manifest::load(&c.segdir).unwrap().unwrap();
+    let mut out = Vec::new();
+    for e in &m.entries {
+        let r = kdx_segment::RangeReader::open(&c.segdir, e, &m.network).unwrap();
+        for s in 0..r.slots() {
+            let Some(b) = r.block_at(s).unwrap() else {
+                continue;
+            };
+            let (a, n) = (r.keys.first(s).unwrap(), r.keys.count(s));
+            let txs = (a..a + n).map(|rel| r.tx_rel(rel).unwrap()).collect();
+            out.push((b, txs));
+        }
+    }
+    out
+}
+
+/// I-1: the content digest sees a content change. The same blocks digest equal; a header
+/// field, a tx's output, a transfer index, the presence bits, a dropped tx and the block
+/// order each change it. Two stores whose node served another payload at one height differ
+/// in that step and in the total, and agree on every other step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_digest_differs_on_every_content_change() {
+    use kdx_segment::content::ContentDigest;
+    let pool = pool();
+    let places = places_for(&[0], 24);
+    let base = fake_node(&pool, &places);
+    let da = tempfile::tempdir().unwrap();
+    let a = freeze_store(da.path(), &pool, &base, &places, &[0]);
+    let dict = kdx_hot::HotDict::load(&a.hot.ro().unwrap()).unwrap();
+    let blocks = frozen_blocks(&a);
+    let digest = |bs: &Blocks| {
+        let mut d = ContentDigest::new();
+        for (b, txs) in bs {
+            d.block(b, txs, &dict).unwrap();
+        }
+        d.finish()
+    };
+    let same = digest(&blocks);
+    assert_eq!(digest(&blocks.clone()), same);
+    assert!(same.txs > 0 && blocks.len() >= 10, "{same:?}");
+    let (bi, ti) = blocks
+        .iter()
+        .enumerate()
+        .find_map(|(i, (_, txs))| {
+            txs.iter()
+                .position(|t| !t.transfers.is_empty() && t.present != 0)
+                .map(|j| (i, j))
+        })
+        .expect("fixture: a tx with a transfer");
+    let changes: [(&str, fn(&mut Blocks, usize, usize)); 6] = [
+        ("header nonce", |bs, i, _| bs[i].0.nonce ^= 1),
+        ("output gas", |bs, i, j| bs[i].1[j].gas += 1),
+        ("transfer index", |bs, i, j| bs[i].1[j].transfers[0] ^= 1),
+        ("presence bits", |bs, i, j| {
+            let p = bs[i].1[j].present;
+            bs[i].1[j].present = p & (p - 1);
+        }),
+        ("tx dropped", |bs, i, _| {
+            bs[i].1.pop();
+        }),
+        ("block order", |bs, _, _| bs.swap(0, 1)),
+    ];
+    for (what, change) in changes {
+        let mut bs = blocks.clone();
+        change(&mut bs, bi, ti);
+        assert_ne!(digest(&bs).blake3, same.blake3, "{what}");
+    }
+
+    // One height served with another payload: that step and the total differ.
+    let mut other = places.clone();
+    other[0].1[5].pool = (other[0].1[5].pool + 1) % POOL_LEN;
+    let base = fake_node(&pool, &other);
+    let db = tempfile::tempdir().unwrap();
+    let b = freeze_store(db.path(), &pool, &base, &other, &[0]);
+    let (pa, ta) = content(&a);
+    let (pb, tb) = content(&b);
+    assert_eq!(pa.len(), pb.len());
+    assert_ne!(ta, tb, "total");
+    for (x, y) in pa.iter().zip(&pb) {
+        assert_eq!((x.0, x.1), (y.0, y.1));
+        if (x.0..x.1).contains(&5) {
+            assert_ne!(x.2, y.2, "step {}..{}", x.0, x.1);
+        } else {
+            assert_eq!(x.2, y.2, "step {}..{}", x.0, x.1);
+        }
+    }
 }
 
 /// The two-chain store of `rebuild_on_two_chains_is_content_equal`, reopened against a node

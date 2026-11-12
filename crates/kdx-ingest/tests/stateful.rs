@@ -21,11 +21,25 @@ use kdx_hot::{HotDict, Table, Txn};
 use kdx_types::{Dict, DictKind};
 
 const CASES: u64 = 12;
+/// Seeds of the ignored `_long` twins (T-1 long mode, `cargo test -- --ignored long`); they
+/// follow the default seeds, so a long run covers 1..=512.
+const LONG_CASES: u64 = 500;
+const LONG: std::ops::RangeInclusive<u64> = CASES + 1..=CASES + LONG_CASES;
 
 #[test]
 fn apply_then_undo_equals_the_prefix() {
+    apply_then_undo(1..=CASES);
+}
+
+#[test]
+#[ignore = "long mode: 500 seeds"]
+fn apply_then_undo_equals_the_prefix_long() {
+    apply_then_undo(LONG);
+}
+
+fn apply_then_undo(seeds: std::ops::RangeInclusive<u64>) {
     let pool = pool();
-    for seed in 1..=CASES {
+    for seed in seeds {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ seed);
         let n = rng.range(3, 16) as usize;
         let mut ids: Vec<usize> = (0..POOL_LEN).collect();
@@ -89,13 +103,25 @@ fn marks(hot: &kdx_hot::HotStore) -> BTreeMap<Vec<u8>, Mark> {
 /// the same order and the digests must be byte-equal.
 #[test]
 fn a_reorg_with_the_same_payloads_equals_the_linear_apply() {
-    reorg_cases(false);
+    reorg_cases(false, 1..=CASES);
+}
+
+#[test]
+#[ignore = "long mode: 500 seeds"]
+fn a_reorg_with_the_same_payloads_equals_the_linear_apply_long() {
+    reorg_cases(false, LONG);
 }
 
 /// General: a random loser. Equal modulo dictionary ids, with full mark coverage (B-3, M-3).
 #[test]
 fn a_reorg_equals_the_linear_apply_of_the_winner_and_marks_both_branches() {
-    reorg_cases(true);
+    reorg_cases(true, 1..=CASES);
+}
+
+#[test]
+#[ignore = "long mode: 500 seeds"]
+fn a_reorg_equals_the_linear_apply_of_the_winner_and_marks_both_branches_long() {
+    reorg_cases(true, LONG);
 }
 
 /// 9B-1, as ruled (R-P5P9-29): names that only the losing branch interned keep their ids
@@ -130,10 +156,10 @@ fn a_reorg_with_new_names_on_the_loser_is_content_equal_to_the_linear_apply() {
     assert_ne!(digest(&r.hot), digest(&l.hot), "the bytes do differ (ids)");
 }
 
-fn reorg_cases(general: bool) {
+fn reorg_cases(general: bool, seeds: std::ops::RangeInclusive<u64>) {
     let pool = pool();
     let mut sides_checked = 0usize;
-    for seed in 1..=CASES {
+    for seed in seeds {
         let mut rng = Rng(0xd1b5_4a32_d192_ed03 ^ seed);
         let mut ids: Vec<usize> = (0..POOL_LEN).collect();
         rng.shuffle(&mut ids);
