@@ -117,6 +117,9 @@ pub struct ApiState {
     heavy_clients: Arc<HeavyClients>,
     in_flight: Arc<Semaphore>,
     limiter: RateLimiter,
+    /// `[balances] key_modules` (M-1, SEC-2): the modules `GET /keys/{pubkey}/accounts`
+    /// lists without `token`; unset means `["coin"]`.
+    key_modules: std::sync::OnceLock<Vec<String>>,
 }
 
 tokio::task_local! {
@@ -229,6 +232,19 @@ impl ApiState {
         headers: &axum::http::HeaderMap,
     ) -> std::net::IpAddr {
         client_ip(peer, headers, &self.settings.trusted_proxies)
+    }
+
+    /// Set `[balances] key_modules` (once, before serving; later calls are ignored).
+    pub fn set_key_modules(&self, modules: Vec<String>) {
+        let _ = self.key_modules.set(modules);
+    }
+
+    /// The governance-trusted modules of the by-key listing (default `["coin"]`).
+    pub fn key_modules(&self) -> Vec<String> {
+        self.key_modules
+            .get()
+            .cloned()
+            .unwrap_or_else(|| vec!["coin".to_owned()])
     }
 
     /// `read` on the reserved status slots (cheap tip reads only).
@@ -458,6 +474,7 @@ impl Api {
             status_reads: Arc::new(Semaphore::new(STATUS_READS)),
             heavy: Arc::new(Semaphore::new((settings.read_threads / 2).max(1))),
             heavy_clients: Arc::default(),
+            key_modules: std::sync::OnceLock::new(),
             in_flight: Arc::new(Semaphore::new(settings.max_in_flight.max(1))),
             limiter: RateLimiter::new(settings.rate_per_ip, settings.rate_burst),
             store,
