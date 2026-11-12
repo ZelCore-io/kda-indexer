@@ -108,6 +108,8 @@ pub struct Row {
     pub skew: u64,
     pub errors_a: u64,
     pub errors_b: u64,
+    /// Oracle server faults (HTTP 5xx, `INTERNAL_SERVER_ERROR`): a subset of `errors_b`.
+    pub oracle_faults: u64,
     pub p50_a: Option<f64>,
     pub p99_a: Option<f64>,
     pub p50_b: Option<f64>,
@@ -203,7 +205,8 @@ pub fn rows(w: &Window) -> Vec<Row> {
             allowlisted: n("allowlisted") + n("legacy-cmd"),
             skew: n("skew"),
             errors_a: n("a-error"),
-            errors_b: n("b-error"),
+            errors_b: n("b-error") + n("oracle-fault"),
+            oracle_faults: n("oracle-fault"),
             ..Default::default()
         };
         if let Some(h) = lat(a) {
@@ -312,9 +315,58 @@ pub const GRAPHQL_NODE_ROUTES: &[(&str, u64, u64)] = &[
 pub const GRAPHQL_PER_OP: (u64, u64) = (20, 100);
 pub const GRAPHQL_TOTAL: (u64, u64) = (200, 2_000);
 
+/// The node-pair route that covers an operation, by what its stem names: transactions,
+/// transfers and events by `NodeTx`; accounts and balances by `NodeBalance`; blocks and
+/// heights by `NodeBlock` (the transaction words win, so `QTransactionsByBlock` is `NodeTx`).
+/// `None` for the node routes themselves and for operations nothing covers.
+pub fn node_cover(route: &str) -> Option<&'static str> {
+    let stem = route.strip_prefix("graphql:")?.to_ascii_lowercase();
+    if stem.starts_with("node") {
+        return None;
+    }
+    let has = |ws: &[&str]| ws.iter().any(|w| stem.contains(w));
+    if has(&["transaction", "transfer", "event"]) {
+        Some("graphql:NodeTx")
+    } else if has(&["account", "balance"]) {
+        Some("graphql:NodeBalance")
+    } else if has(&["block", "height"]) {
+        Some("graphql:NodeBlock")
+    } else {
+        None
+    }
+}
+
+/// Rows with the oracle's own faults counted as "node-checked": where the oracle answered an
+/// operation with a server fault (`oracle-fault`: it fails on `networkInfo`,
+/// `completedBlockHeights`, some `blocksFromHeight` selections) and the node pair that covers
+/// it reached its minimum without an unexplained diff, each fault counts as a compare. An
+/// oracle that is merely unreachable or slow (`b-error`) does not.
+fn node_checked(rows: &[Row], size: GateSize) -> Vec<Row> {
+    let node_green = |n: &str| {
+        let of = || rows.iter().filter(|r| r.route == n);
+        let min = GRAPHQL_NODE_ROUTES
+            .iter()
+            .find(|x| x.0 == n)
+            .map(|x| if size == GateSize::Small { x.1 } else { x.2 })
+            .unwrap_or(u64::MAX);
+        of().map(|r| r.compared).max().unwrap_or(0) >= min && of().all(|r| r.unexplained == 0)
+    };
+    rows.iter()
+        .map(|r| {
+            let mut r = r.clone();
+            if r.b != "node" && r.oracle_faults > 0 && node_cover(&r.route).is_some_and(node_green)
+            {
+                r.compared += r.oracle_faults;
+            }
+            r
+        })
+        .collect()
+}
+
 /// The GraphQL gate (plan Task 7): every operation seen in the window has at least its minimum
 /// compared, the node pairs reach theirs, the total is reached, and nothing is unexplained.
 pub fn graphql_gate(rows: &[Row], size: GateSize) -> (bool, Vec<String>) {
+    let rows = &node_checked(rows, size)[..];
     let pick = |s: (u64, u64)| if size == GateSize::Small { s.0 } else { s.1 };
     let mut routes: Vec<&str> = rows
         .iter()
@@ -563,6 +615,81 @@ mod tests {
             !ok && why.iter().any(|w| w.starts_with("graphql:NodeBalance")),
             "{why:?}"
         );
+    }
+
+    #[test]
+    fn oracle_faults_are_node_checked_when_a_node_pair_covers_the_operation() {
+        let fault = |route: &str, compared: u64, faults: u64| Row {
+            oracle_faults: faults,
+            errors_b: faults,
+            ..grow(route, "oracle", compared, 0)
+        };
+        let nodes = |n: u64| {
+            vec![
+                grow("graphql:NodeTx", "node", n, 0),
+                grow("graphql:NodeBlock", "node", n, 0),
+                grow("graphql:NodeBalance", "node", n, 0),
+            ]
+        };
+        let mut rows = vec![
+            // The oracle fails every blocksFromHeight call: 0 compared, 25 faults.
+            fault("graphql:QBlocksFromHeight", 0, 25),
+            // An oracle that was merely unreachable: still 0 compared.
+            Row {
+                errors_b: 25,
+                ..grow("graphql:QBlock", "oracle", 0, 0)
+            },
+        ];
+        for i in 0..10 {
+            rows.push(grow(&format!("graphql:Op{i}"), "oracle", 25, 0));
+        }
+        rows.extend(nodes(50));
+        let (ok, why) = graphql_gate(&rows, GateSize::Small);
+        assert!(!ok, "{why:?}");
+        // Faults count for the covered operation, not for the merely unreachable one.
+        assert!(
+            !why.iter()
+                .any(|w| w.starts_with("graphql:QBlocksFromHeight")),
+            "{why:?}"
+        );
+        assert!(
+            why.iter().any(|w| w.starts_with("graphql:QBlock:")),
+            "{why:?}"
+        );
+        // No cover without the node pair reaching its minimum.
+        let mut rows2 = rows.clone();
+        rows2.retain(|r| r.route != "graphql:NodeBlock");
+        rows2.push(grow("graphql:NodeBlock", "node", 10, 0));
+        let (_, why) = graphql_gate(&rows2, GateSize::Small);
+        assert!(
+            why.iter()
+                .any(|w| w.starts_with("graphql:QBlocksFromHeight")),
+            "{why:?}"
+        );
+        // Nor when the covering node pair has an unexplained diff.
+        let mut rows3 = rows.clone();
+        rows3.push(grow("graphql:NodeBlock", "node", 0, 1));
+        let (_, why) = graphql_gate(&rows3, GateSize::Small);
+        assert!(
+            why.iter()
+                .any(|w| w.starts_with("graphql:QBlocksFromHeight")),
+            "{why:?}"
+        );
+        // Mapping by stem.
+        assert_eq!(
+            node_cover("graphql:QTransactionsByBlock"),
+            Some("graphql:NodeTx")
+        );
+        assert_eq!(
+            node_cover("graphql:QFungibleAccount"),
+            Some("graphql:NodeBalance")
+        );
+        assert_eq!(
+            node_cover("graphql:QBlocksFromHeight"),
+            Some("graphql:NodeBlock")
+        );
+        assert_eq!(node_cover("graphql:QNetworkInfo"), None);
+        assert_eq!(node_cover("graphql:NodeBlock"), None);
     }
 
     #[test]

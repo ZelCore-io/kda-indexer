@@ -1091,7 +1091,9 @@ impl Ctx {
                 );
             }
         };
-        // Oracle server faults are its own (R3E-14 material), not a compare.
+        // Oracle server faults are its own (R3E-14 material), not a compare. Class
+        // `oracle-fault` (shown in errB): a node pair that covers the operation stands in for
+        // it at the gate (R-P5P9-19).
         if b.status >= 500 || b.error_codes().iter().any(|c| c == "INTERNAL_SERVER_ERROR") {
             return self.gql_record(
                 op,
@@ -1102,7 +1104,7 @@ impl Ctx {
                 Some(b.status),
                 &b.raw,
                 Vec::new(),
-                "b-error",
+                "oracle-fault",
                 &[],
                 Some("oracle server error".into()),
             );
