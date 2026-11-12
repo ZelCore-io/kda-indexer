@@ -21,3 +21,6 @@ tokio.workspace = true
 tracing.workspace = true
 kdx-metrics.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
