@@ -65,3 +65,20 @@ fn keys_with_decreasing_starts_count_zero_instead_of_underflowing() {
         let _ = (k.first(s), k.count(s));
     }
 }
+#[test]
+fn postings_trailer_with_huge_sizes_is_refused_not_an_overflow_panic() {
+    // Found by the `postings_list` fuzz target: `ef_at + ef_len + 24` overflowed.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("t.post");
+    let mut b = b"KDXP".to_vec();
+    b.extend_from_slice(&[1, 0]);
+    b.extend_from_slice(&1000u64.to_le_bytes());
+    for v in [0u64, 0, u64::MAX] {
+        b.extend_from_slice(&v.to_le_bytes()); // entities, lists_len, ef_len
+    }
+    std::fs::write(&p, &b).unwrap();
+    let e = kdx_segment::postings::Postings::open(&p, 0)
+        .err()
+        .expect("refused");
+    assert!(e.to_string().contains("trailer"), "{e}");
+}

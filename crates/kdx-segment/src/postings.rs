@@ -305,9 +305,10 @@ impl Postings {
             ) as usize
         };
         let (n, lists_len, ef_len) = (t(0), t(1), t(2));
-        let ent_at = HEAD + lists_len;
-        let ef_at = ent_at + 8 * n;
-        if ef_at + ef_len + 24 != len {
+        // Damaged trailer values must not overflow the size arithmetic.
+        let ent_at = HEAD.saturating_add(lists_len);
+        let ef_at = n.saturating_mul(8).saturating_add(ent_at);
+        if ef_at.saturating_add(ef_len).saturating_add(24) != len {
             bail!("{}: inconsistent trailer", path.display());
         }
         let offsets = EliasFano::deserialize_from(&map[ef_at..ef_at + ef_len])?;
