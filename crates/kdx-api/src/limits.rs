@@ -368,6 +368,79 @@ mod tests {
         assert!(l.allow_n(b, 5), "the refused batch took no tokens");
     }
 
+    /// The token bucket refills at `rate` per second up to `burst`, on injected time (no
+    /// sleeps): every step is checked against an exact integer model in millitokens. Steps
+    /// are quarter seconds, so the `f64` arithmetic of the limiter is exact too.
+    mod refill {
+        use super::*;
+        use proptest::prelude::*;
+        use std::time::Duration;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Wait(u32),
+            Take(u32),
+        }
+
+        fn ops() -> impl Strategy<Value = Vec<Op>> {
+            proptest::collection::vec(
+                prop_oneof![(0u32..60).prop_map(Op::Wait), (1u32..8).prop_map(Op::Take)],
+                1..60,
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+            #[test]
+            fn refill_matches_the_integer_model(rate in 1u32..20, burst in 1u32..30, ops in ops()) {
+                let l = RateLimiter::new(rate, burst);
+                let ip: IpAddr = "198.51.100.1".parse().unwrap();
+                let t0 = Instant::now();
+                let mut now = t0;
+                // Millitokens: a quarter second adds `rate * 250`.
+                let cap = i64::from(burst) * 1000;
+                let mut tokens = cap;
+                for op in ops {
+                    match op {
+                        Op::Wait(q) => {
+                            now += Duration::from_millis(250 * u64::from(q));
+                            tokens = (tokens + i64::from(rate) * 250 * i64::from(q)).min(cap);
+                        }
+                        Op::Take(n) => {
+                            let want = i64::from(n) * 1000;
+                            let allowed = l.allow_n_at(ip, n, now);
+                            prop_assert_eq!(allowed, tokens >= want, "tokens {} want {}", tokens, want);
+                            if allowed {
+                                tokens -= want;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// A drained bucket yields nothing until time passes, one token after `1/rate` s, and
+        /// never more than `burst` after a long idle.
+        #[test]
+        fn drained_bucket_refills_one_token_per_interval() {
+            let l = RateLimiter::new(2, 4);
+            let ip: IpAddr = "198.51.100.2".parse().unwrap();
+            let t0 = Instant::now();
+            assert!(l.allow_n_at(ip, 4, t0));
+            assert!(!l.allow_n_at(ip, 1, t0));
+            assert!(!l.allow_n_at(ip, 1, t0 + Duration::from_millis(250)));
+            assert!(l.allow_n_at(ip, 1, t0 + Duration::from_millis(500)));
+            assert!(!l.allow_n_at(ip, 1, t0 + Duration::from_millis(500)));
+            let idle = t0 + Duration::from_secs(3600);
+            assert!(l.allow_n_at(ip, 4, idle));
+            assert!(
+                !l.allow_n_at(ip, 1, idle),
+                "idle time never banks more than burst"
+            );
+        }
+    }
+
     #[test]
     fn internal_and_cidr() {
         for a in [

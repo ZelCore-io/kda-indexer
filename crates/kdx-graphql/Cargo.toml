@@ -24,6 +24,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tokio-tungstenite = "0.29"
 tempfile.workspace = true
 tower.workspace = true
