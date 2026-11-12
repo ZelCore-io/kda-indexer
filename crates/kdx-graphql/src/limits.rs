@@ -460,10 +460,11 @@ impl<'a> Walk<'a> {
             "fungibleChainAccounts" | "newBlocks" | "newBlocksFromDepth" => {
                 list_len("chainIds", CHAINS, CHAINS)
             }
-            "chainAccounts"
-            | "fungibleAccountsByPublicKey"
-            | "fungibleChainAccountsByPublicKey"
-            | "countersOfEachChain" => CHAINS,
+            "chainAccounts" | "countersOfEachChain" => CHAINS,
+            // Every account a key guards, up to the resolver's cap (I-3).
+            "fungibleAccountsByPublicKey" | "fungibleChainAccountsByPublicKey" => {
+                crate::types::account::MAX_KEY_ACCOUNTS as u64
+            }
             "nonFungibleTokenBalances" => s.max_page as u64,
             _ if PAGED.contains(&name) => page(None),
             _ => 1,
@@ -642,6 +643,24 @@ mod tests {
             c("subscription { newBlocks(quantity: 100) { hash } }").ok(),
             Some(51)
         );
+    }
+
+    /// I-3: the by-public-key lists are priced at the accounts they can return (100).
+    #[test]
+    fn by_public_key_lists_are_priced_at_their_cap() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        for root in [
+            "fungibleAccountsByPublicKey(publicKey: \"k\")",
+            "fungibleChainAccountsByPublicKey(publicKey: \"k\", chainId: \"0\")",
+        ] {
+            assert_eq!(c(&format!("{{ {root} {{ accountName }} }}")), Ok(101));
+            assert_eq!(
+                c(&format!(
+                    "{{ {root} {{ transactions(first: 98) {{ edges {{ node {{ hash }} }} }} }} }}"
+                )),
+                Err("\"complexity\"".into())
+            );
+        }
     }
 
     #[test]
