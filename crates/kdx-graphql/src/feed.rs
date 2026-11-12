@@ -61,6 +61,25 @@ struct Inner {
     /// Per chain, by height: block records only (txs are loaded again on release), so the
     /// cache stays a few MB in the dense era.
     recent: Mutex<HashMap<u8, BTreeMap<u64, Arc<BlockRecord>>>>,
+    /// The order of the feed's state changes (tests assert it, L-1).
+    #[cfg(test)]
+    log: Mutex<Vec<&'static str>>,
+}
+
+impl Inner {
+    /// Record a state change: `cache` (the recent cache changed), `tips` (the tips were
+    /// published) or `send` (an item went to the subscribers).
+    #[cfg(test)]
+    fn note(&self, what: &'static str) {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(what);
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn note(&self, _what: &'static str) {}
 }
 
 /// Handle of the block feed (cheap to clone).
@@ -86,6 +105,8 @@ impl BlockFeed {
                 tx,
                 tips: Mutex::new(BTreeMap::new()),
                 recent: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                log: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -136,6 +157,7 @@ impl BlockFeed {
     /// Drop the cached blocks of `chain` above `height` (all of them with `None`): they are
     /// no longer canonical after a rollback, a reorg or a gap.
     fn forget_above(&self, chain: u8, height: Option<u64>) {
+        self.inner.note("cache");
         let mut r = self.inner.recent.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = r.get_mut(&chain) {
             match height {
@@ -148,6 +170,7 @@ impl BlockFeed {
     /// Cache the record of `b`, dropping its chain's heights more than [`RECENT`] below it
     /// (per chain, not a scan of the whole cache).
     fn remember(&self, b: &FeedBlock) {
+        self.inner.note("cache");
         let mut r = self.inner.recent.lock().unwrap_or_else(|e| e.into_inner());
         let m = r.entry(b.chain).or_default();
         m.insert(b.height, b.block.clone());
@@ -313,11 +336,13 @@ async fn step(
     }
     {
         let mut t = feed.inner.tips.lock().unwrap_or_else(|e| e.into_inner());
+        feed.inner.note("tips");
         for (c, h, _) in &tips {
             t.insert(*c, u64::from(*h));
         }
     }
     for item in items {
+        feed.inner.note("send");
         let _ = feed.inner.tx.send(item);
     }
     Ok(())
@@ -347,6 +372,7 @@ mod tests {
         f.apply(5, 1, 1);
         f.apply(5, 2, 1);
         f.apply(2, 1, 0);
+        feed.inner.log.lock().unwrap().clear();
         let mut rx = feed.subscribe();
         let obs = feed.clone();
         let seen = tokio::spawn(async move {
@@ -362,6 +388,26 @@ mod tests {
         step(&f.st, &feed, &mut sent, &mut ct).await.unwrap();
         let (tip, at1) = seen.await.unwrap();
         assert_eq!((tip, at1), (2, Some(hash(5, 1, 1))));
+        // L-1: assert the order itself, not only what an observer happens to see. Within the
+        // tick every cache change (the stale height dropped, the replacements stored) comes
+        // before the tips are published, and the tips before the first item is sent.
+        let log = feed.inner.log.lock().unwrap().clone();
+        let tips = log
+            .iter()
+            .position(|x| *x == "tips")
+            .expect("tips published");
+        let first_send = log.iter().position(|x| *x == "send").expect("items sent");
+        // Chain 5: the stale height dropped and the replacement stored; chain 2: its block.
+        assert!(
+            log[..tips].iter().filter(|x| **x == "cache").count() >= 3,
+            "{log:?}"
+        );
+        assert!(
+            log[tips..].iter().all(|x| *x != "cache"),
+            "cache after tips: {log:?}"
+        );
+        assert!(tips < first_send, "{log:?}");
+        assert_eq!(log.iter().filter(|x| **x == "tips").count(), 1, "{log:?}");
     }
 
     /// M4: the recent cache keeps block records only (never a block's txs) and prunes each
