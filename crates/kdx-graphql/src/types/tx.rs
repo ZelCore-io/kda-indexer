@@ -676,7 +676,7 @@ pub async fn query_events(
             false,
         )?,
         rows: Rows::Events {
-            qual,
+            qual: Some(qual),
             order_index: order_index.map(i64::from),
             params,
         },

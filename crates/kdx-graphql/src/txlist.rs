@@ -232,9 +232,10 @@ pub enum Rows {
     /// The tx itself; `sender` keeps only txs whose `meta.sender` is it; `nft` keeps only txs
     /// with an event of an NFT ledger.
     Txs { sender: Option<String>, nft: bool },
-    /// Its events named `qual`, with the optional `orderIndex` and parameter filters.
+    /// Its events (named `qual` when given: `Block.events` lists them all), with the
+    /// optional `orderIndex` and parameter filters.
     Events {
-        qual: String,
+        qual: Option<String>,
         order_index: Option<i64>,
         params: Option<ParamFilter>,
     },
@@ -296,7 +297,7 @@ impl Rows {
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| {
-                    e.qual_name == *qual
+                    qual.as_deref().is_none_or(|q| e.qual_name == q)
                         && order_index.is_none_or(|o| shapes::ev_idx(d.key(), e.pos) == o)
                         && params.as_ref().is_none_or(|p| p.matches(&e.params))
                 })
