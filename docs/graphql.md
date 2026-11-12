@@ -86,7 +86,11 @@ that selects neither `edges` nor `pageInfo` reads no page); of a list (`newBlock
 `totalCount` that is a count walk (`transactions`, `events`, `transfers`,
 `transactionsByPublicKey` and the account `transactions`) costs `max_page`, and an
 operation may run at most 2 of them, outer multipliers included (`complexity` otherwise). A
-block's or a tx's `totalCount` is counted with its rows.
+block's `transactions` and a tx's own `totalCount`s are counted with their rows. A block's
+`events` `totalCount` decodes every tx of the block, so it costs the default page per block
+(not a count walk). `fungibleAccountsByPublicKey` and `fungibleChainAccountsByPublicKey` are
+sized at 100 accounts, the most they return. A subscription's `quantity` is clamped to
+`max_page`, and the `transactions` subscription without one is sized at 20.
 
 Depth counts nested fields; fragments are expanded where they are spread, so fragments,
 inline fragments and aliases do not get around depth or complexity. Every operation in a
@@ -137,7 +141,9 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | client message or frame | 64 KB | connection closed (`ws_message`) |
 | client messages | one per-IP rate token each (pings too) | close 4429 (`ws_rate`) |
 | a client that does not read | 30 s per server message | close 4008 (`ws_slow_reader`) |
-| a subscriber behind the feed | 1,024 feed items | one `LIMIT` error (`ws_lagged`), then the subscription ends |
+| a subscriber behind the feed | 1,024 feed items | one `INTERNAL` error; the subscription goes on from the feed's newest item |
+| a query or mutation over the socket | subscriptions only | `NOT_SUPPORTED` error, nothing runs (`ws_query`); send queries over HTTP |
+| one subscription message | the HTTP request deadline, shared by all its resolvers | `TIMEOUT` error for that message |
 
 Depth, complexity and the size limits apply to subscription documents as to queries. Every
 slot is released when its subscription or connection ends; `kdx_graphql_subscriptions` is the
@@ -175,16 +181,22 @@ number open.
 Subscriptions read a feed that polls the stored chain tips every `feed_poll_ms` (1,000), so
 `serve` and replicas serve them as `run` does.
 
-- `newBlocks(chainIds)`: each message lists the new blocks of the subscribed chains (at most
-  100). After a reorg the replacing blocks are sent again.
+- A message never carries more items than its complexity priced: a catch-up is split over
+  several messages.
+- `newBlocks(chainIds)`: each message lists new blocks of the subscribed chains, at most one
+  per subscribed chain. After a reorg the replacing blocks are sent again.
 - `newBlocksFromDepth(chainIds, minimumDepth)`: a block is sent once its chain's tip is
-  `minimumDepth` above it, starting from the subscription's start; only canonical blocks.
+  `minimumDepth` above it, starting from the subscription's start; only blocks the store
+  still holds at their height (checked on release); at most one per subscribed chain per
+  message.
 - `events(qualifiedEventName, chainId, minimumDepth, parametersFilter)`: the matching events
-  of each new (or deep enough) block; `parametersFilter` takes the forms `events` takes.
+  of each new (or deep enough) block, at most the default page (20) per message, the rest in
+  the next messages; `parametersFilter` takes the forms `events` takes.
 - `transaction(requestKey, chainId)`: one message when the tx is (or becomes) indexed, then
   the subscription completes; `TIMEOUT` after `ws_tx_wait_secs`.
 - More than 200 new blocks on a chain in one poll (a catch-up), or a reorg deeper than 64
-  blocks, is a gap: subscribers of that chain get one `INTERNAL` error and stay subscribed.
+  blocks, is a gap: subscribers of that chain get the blocks before it, then one `INTERNAL`
+  error, and stay subscribed.
 
 ## Ids and cursors
 
@@ -331,8 +343,8 @@ relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `Strin
 address (HTTP, or the websocket's accepted connection); an operation without a known address
 is refused (`LIMIT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |
 | `lastTokenPriceInKda(moduleName): Decimal` | `NOT_SUPPORTED`: no price data |
-| `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 100) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
-| `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 100) per message; a message per feed batch that has any |
+| `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 100, clamped to `max_page`) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
+| `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 100, clamped to `max_page`) per message; a message per feed batch that has any |
 
 `pactQuery` stays `NOT_SUPPORTED`.
 
