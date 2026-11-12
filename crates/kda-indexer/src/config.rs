@@ -27,6 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub api: ApiConfig,
     #[serde(default)]
+    pub graphql: GraphqlConfig,
+    #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
     pub balances: BalancesConfig,
@@ -153,7 +155,7 @@ impl Default for TailConfig {
 pub struct ApiConfig {
     pub native: String,
     pub compat: String,
-    /// Parsed, not bound before P7.
+    /// GraphQL listener (spec §5.3; `[graphql]` holds its limits).
     pub graphql: String,
     pub admin: String,
     /// Peers (IP or CIDR) whose `X-Forwarded-For` is trusted for the client IP.
@@ -211,7 +213,7 @@ impl ApiConfig {
         };
         let native = parse("native", &self.native)?;
         let compat = parse("compat", &self.compat)?;
-        let _graphql = parse("graphql", &self.graphql)?;
+        let graphql = parse("graphql", &self.graphql)?;
         let admin = parse("admin", &self.admin)?;
         for (key, a) in [("native", native), ("admin", admin)] {
             anyhow::ensure!(
@@ -222,6 +224,7 @@ impl ApiConfig {
         Ok(kdx_api::server::Binds {
             native: Some(native),
             compat: Some(compat),
+            graphql: Some(graphql),
             admin: Some(admin),
         })
     }
@@ -247,6 +250,129 @@ impl ApiConfig {
             ready_max_lag: self.ready_max_lag,
             max_event_lists: self.max_event_lists,
         })
+    }
+}
+
+/// `[graphql]`: limits of the GraphQL listener (plan GQ-9, GQ-13). The address is
+/// `api.graphql`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GraphqlConfig {
+    /// Page size when a connection gets neither `first` nor `last`.
+    pub default_page: u32,
+    /// Larger `first`/`last` values are clamped to this.
+    pub max_page: u32,
+    pub max_depth: u32,
+    pub max_complexity: u64,
+    pub introspection: bool,
+    /// Depth cap of introspection (exempt from `max_depth`).
+    pub introspection_depth: u32,
+    /// Operations in one batched request (a batch of N takes N rate tokens).
+    pub max_batch: u32,
+    pub max_query_bytes: u32,
+    pub max_variables_bytes: u32,
+    pub ws_subs_per_conn: u32,
+    pub ws_subs_max: u32,
+    pub ws_conns_per_ip: u32,
+    pub ws_init_secs: u64,
+    pub ws_idle_secs: u64,
+    pub ws_tx_wait_secs: u64,
+    pub feed_poll_ms: u64,
+    /// `networkInfo.networkHost`: a public name for clients, never the node URL.
+    pub network_host: String,
+    /// Automatic persisted queries. Not built: `true` is refused.
+    pub apq: bool,
+}
+
+impl Default for GraphqlConfig {
+    fn default() -> Self {
+        Self {
+            default_page: 20,
+            max_page: 100,
+            max_depth: 10,
+            max_complexity: 2000,
+            introspection: true,
+            introspection_depth: 15,
+            max_batch: 10,
+            max_query_bytes: 32768,
+            max_variables_bytes: 65536,
+            ws_subs_per_conn: 20,
+            ws_subs_max: 2000,
+            ws_conns_per_ip: 10,
+            ws_init_secs: 10,
+            ws_idle_secs: 600,
+            ws_tx_wait_secs: 3600,
+            feed_poll_ms: 1000,
+            network_host: String::new(),
+            apq: false,
+        }
+    }
+}
+
+impl GraphqlConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=1000).contains(&self.max_page) && (1..=self.max_page).contains(&self.default_page),
+            "graphql.max_page must be in 1..=1000 and graphql.default_page in 1..=max_page"
+        );
+        anyhow::ensure!(
+            self.max_depth > 0
+                && self.max_complexity > 0
+                && self.introspection_depth > 0
+                && self.max_batch > 0
+                && self.ws_subs_per_conn > 0
+                && self.ws_subs_max > 0
+                && self.ws_conns_per_ip > 0
+                && self.ws_init_secs > 0
+                && self.ws_idle_secs > 0
+                && self.ws_tx_wait_secs > 0,
+            "graphql limits must be > 0"
+        );
+        anyhow::ensure!(
+            (1024..=kdx_graphql::MAX_BODY_BYTES as u32).contains(&self.max_query_bytes)
+                && (1..=kdx_graphql::MAX_BODY_BYTES as u32).contains(&self.max_variables_bytes),
+            "graphql.max_query_bytes must be in 1024..={0} and max_variables_bytes in 1..={0}",
+            kdx_graphql::MAX_BODY_BYTES
+        );
+        anyhow::ensure!(
+            self.feed_poll_ms >= 100,
+            "graphql.feed_poll_ms must be at least 100"
+        );
+        anyhow::ensure!(
+            !self.apq,
+            "graphql.apq: automatic persisted queries are not built in this version"
+        );
+        anyhow::ensure!(
+            !self.network_host.contains('<') && !self.network_host.contains('>'),
+            "graphql.network_host still holds a placeholder"
+        );
+        Ok(())
+    }
+
+    pub fn settings(&self, network: &str) -> kdx_graphql::GraphqlSettings {
+        use std::time::Duration;
+        kdx_graphql::GraphqlSettings {
+            default_page: self.default_page as usize,
+            max_page: self.max_page as usize,
+            max_depth: self.max_depth as usize,
+            max_complexity: self.max_complexity,
+            introspection: self.introspection,
+            introspection_depth: self.introspection_depth as usize,
+            max_batch: self.max_batch as usize,
+            max_query_bytes: self.max_query_bytes as usize,
+            max_variables_bytes: self.max_variables_bytes as usize,
+            max_body_bytes: kdx_graphql::MAX_BODY_BYTES,
+            ws_subs_per_conn: self.ws_subs_per_conn as usize,
+            ws_subs_max: self.ws_subs_max as usize,
+            ws_conns_per_ip: self.ws_conns_per_ip as usize,
+            ws_init: Duration::from_secs(self.ws_init_secs),
+            ws_idle: Duration::from_secs(self.ws_idle_secs),
+            ws_tx_wait: Duration::from_secs(self.ws_tx_wait_secs),
+            feed_poll: Duration::from_millis(self.feed_poll_ms),
+            network_id: network.to_owned(),
+            network_host: self.network_host.clone(),
+            apq: self.apq,
+        }
     }
 }
 
@@ -456,6 +582,7 @@ impl Config {
         );
         anyhow::ensure!(b.dict_samples > 0, "backfill.dict_samples must be > 0");
         self.balances.validate()?;
+        self.graphql.validate()?;
         let s = &self.search;
         s.mode_sel()?;
         anyhow::ensure!(
@@ -500,6 +627,44 @@ pub const MAX_BATCH_SIZE: u32 = 1000;
 #[cfg(test)]
 mod balances_tests {
     use super::*;
+
+    /// `[graphql]` defaults are the plan's GQ-9 values; bad values are refused.
+    #[test]
+    fn graphql_values_are_validated() {
+        let ok = GraphqlConfig::default();
+        assert!(ok.validate().is_ok());
+        let s = ok.settings("mainnet01");
+        assert_eq!(
+            (
+                s.default_page,
+                s.max_page,
+                s.max_depth,
+                s.max_complexity,
+                s.max_batch
+            ),
+            (20, 100, 10, 2000, 10)
+        );
+        for bad in [
+            GraphqlConfig {
+                apq: true,
+                ..ok.clone()
+            },
+            GraphqlConfig {
+                default_page: 101,
+                ..ok.clone()
+            },
+            GraphqlConfig {
+                max_depth: 0,
+                ..ok.clone()
+            },
+            GraphqlConfig {
+                max_query_bytes: 1 << 20,
+                ..ok.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
 
     /// M-6: `local_rps` 0 (no limit) or above the B-1 budget, and zero concurrency, are refused.
     #[test]

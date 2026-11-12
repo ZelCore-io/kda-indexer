@@ -77,6 +77,7 @@ binds `127.0.0.1`:
 | `node.url` | `http://127.0.0.1:31351` | the chainweb-node service API |
 | `api.native` | `127.0.0.1:31361` | loopback or a private address only; the server refuses anything else |
 | `api.compat` | `127.0.0.1:31362` | chainweb-data compatible routes |
+| `api.graphql` | `127.0.0.1:31363` | GraphQL (`/graphql`, Kadena graph schema); limits in `[graphql]`, see `graphql.md` |
 | `api.admin` | `127.0.0.1:31369` | `/healthz`, `/readyz`, `/status`, `/metrics`; loopback or private only |
 
 All keys, with their defaults, are in `/usr/share/doc/kda-indexer/examples/mainnet01.toml.example`.

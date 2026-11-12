@@ -12,6 +12,7 @@ use crate::config::Config;
 pub mod backfill;
 pub mod dump;
 pub mod frames;
+pub mod graphql;
 pub mod hot;
 pub mod inspect;
 pub mod measure;

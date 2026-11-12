@@ -266,7 +266,18 @@ impl RateLimiter {
         self.allow_at(ip, Instant::now())
     }
 
+    /// Take `n` tokens at once (a GraphQL batch of N takes N); none are taken when fewer
+    /// than `n` are left.
+    pub fn allow_n(&self, ip: IpAddr, n: u32) -> bool {
+        self.allow_n_at(ip, n, Instant::now())
+    }
+
     fn allow_at(&self, ip: IpAddr, now: Instant) -> bool {
+        self.allow_n_at(ip, 1, now)
+    }
+
+    fn allow_n_at(&self, ip: IpAddr, n: u32, now: Instant) -> bool {
+        let need = n.max(1) as f64;
         let (rate, burst) = (self.rate, self.burst);
         let mut g = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         let (main, over) = &mut *g;
@@ -276,8 +287,8 @@ impl RateLimiter {
         } else {
             tokens
         };
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
+        if *tokens >= need {
+            *tokens -= need;
             true
         } else {
             false
@@ -288,6 +299,18 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A GraphQL batch of N takes N tokens at once; a refusal takes none.
+    #[test]
+    fn allow_n_takes_all_or_nothing() {
+        let l = RateLimiter::new(1, 5);
+        let a: IpAddr = "198.51.100.7".parse().unwrap();
+        assert!(l.allow_n(a, 5));
+        assert!(!l.allow(a));
+        let b: IpAddr = "198.51.100.8".parse().unwrap();
+        assert!(!l.allow_n(b, 6));
+        assert!(l.allow_n(b, 5), "the refused batch took no tokens");
+    }
 
     #[test]
     fn internal_and_cidr() {
