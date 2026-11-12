@@ -2,14 +2,18 @@
 //!
 //! - Every subscription holds a per-connection and a per-process slot ([`crate::ws`]) and
 //!   counts in `kdx_graphql_subscriptions`; all are released when its stream drops.
-//! - A subscriber that falls more than the feed's capacity behind gets one `LIMIT` error and
-//!   its stream ends. A feed gap on a subscribed chain is one `INTERNAL` error; the stream
-//!   stays open.
+//! - A message never carries more items than the limits walker priced (I-1): `newBlocks`
+//!   and `newBlocksFromDepth` at most one block per subscribed chain (a catch-up is split
+//!   over several messages), `quantity` at most `quantity` (clamped to `max_page`), and
+//!   `events` at most the default page of events (the rest follow in the next messages).
+//! - A feed gap on a subscribed chain is one `INTERNAL` error, after the blocks before it;
+//!   the stream stays open. A subscriber that falls more than the feed's capacity behind is
+//!   moved to the feed's tail and gets the same error (memory stays bounded).
 //! - `…FromDepth` and `events(minimumDepth)` release a block once its chain's tip is at least
 //!   `minimumDepth` above it, from the feed's recent canonical blocks once the store confirms
 //!   each is still canonical (one store read per release).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,7 +25,7 @@ use tokio::sync::broadcast::Receiver;
 
 use super::block::chain_set;
 use super::{Block, Event, Transaction};
-use crate::error::{bad_input, err, from_api, limit, not_supported, Code};
+use crate::error::{bad_input, err, from_api, not_supported, Code};
 use crate::feed::{load_blocks, BlockFeed, FeedBlock, FeedItem, MAX_PER_TICK};
 use crate::gql;
 use crate::txlist::{chain_arg, hash_arg, load, name_arg, Blocks, ParamFilter};
@@ -47,9 +51,9 @@ fn feed_of(ctx: &Context<'_>) -> Result<BlockFeed> {
 struct Sub {
     rx: Receiver<FeedItem>,
     _slot: SubSlot,
-    done: bool,
-    /// A gap met inside a batch: reported on the next call, after the blocks before it.
-    pending_gap: Option<u8>,
+    /// A gap or lag met inside a batch: reported on the next call, after the blocks before
+    /// it.
+    pending: Option<async_graphql::Error>,
 }
 
 fn gap_error(chain: u8) -> async_graphql::Error {
@@ -60,42 +64,41 @@ fn gap_error(chain: u8) -> async_graphql::Error {
 }
 
 fn lag_error() -> async_graphql::Error {
-    let e = limit(
-        "ws_lagged",
-        "subscriber fell behind the block feed; subscribe again",
-    );
-    async_graphql::Error {
-        message: e.message,
-        source: None,
-        extensions: e.extensions,
-    }
+    err(
+        Code::Internal,
+        "blocks were skipped: the subscriber fell behind the block feed",
+    )
 }
 
-/// The next feed item for `chains` (blocks in a batch), or an error item; `None` ends.
-async fn next_batch(sub: &mut Sub, chains: &[u8]) -> Option<Result<Vec<Arc<FeedBlock>>>> {
-    if sub.done {
-        return None;
+/// The next feed items for `chains` (a batch of at most `cap` blocks), or an error item;
+/// `None` ends. A lagging receiver moves to the feed's tail (the skip is the error).
+async fn next_batch(
+    sub: &mut Sub,
+    chains: &[u8],
+    cap: usize,
+) -> Option<Result<Vec<Arc<FeedBlock>>>> {
+    if let Some(e) = sub.pending.take() {
+        return Some(Err(e));
     }
-    if let Some(c) = sub.pending_gap.take() {
-        return Some(Err(gap_error(c)));
-    }
+    let cap = cap.max(1);
     loop {
         match sub.rx.recv().await {
             Ok(FeedItem::Block(b)) if chains.contains(&b.chain) => {
                 let mut out = vec![b];
-                while out.len() < MAX_BATCH {
+                while out.len() < cap {
                     match sub.rx.try_recv() {
                         Ok(FeedItem::Block(b)) if chains.contains(&b.chain) => out.push(b),
                         Ok(FeedItem::Gap(c)) if chains.contains(&c) => {
                             // Deliver what we have; the gap is reported on the next call,
                             // and the items queued behind it follow (I-4).
-                            sub.pending_gap = Some(c);
+                            sub.pending = Some(gap_error(c));
                             return Some(Ok(out));
                         }
                         Ok(_) => {}
                         Err(TryRecvError::Lagged(_)) => {
-                            sub.done = true;
-                            return Some(Err(lag_error()));
+                            sub.rx = sub.rx.resubscribe();
+                            sub.pending = Some(lag_error());
+                            return Some(Ok(out));
                         }
                         Err(_) => break,
                     }
@@ -105,7 +108,7 @@ async fn next_batch(sub: &mut Sub, chains: &[u8]) -> Option<Result<Vec<Arc<FeedB
             Ok(FeedItem::Gap(c)) if chains.contains(&c) => return Some(Err(gap_error(c))),
             Ok(_) => {}
             Err(RecvError::Lagged(_)) => {
-                sub.done = true;
+                sub.rx = sub.rx.resubscribe();
                 return Some(Err(lag_error()));
             }
             Err(RecvError::Closed) => return None,
@@ -121,13 +124,17 @@ struct DepthGate {
 }
 
 impl DepthGate {
+    /// The next blocks at `depth`, at most `cap` of them (lowest heights first; the rest
+    /// wait for the next call), and a chain more than [`MAX_PER_TICK`] behind (skipped to
+    /// its target: a gap).
     async fn release(
         &mut self,
         feed: &BlockFeed,
         state: &Arc<ApiState>,
+        cap: usize,
     ) -> Result<(Vec<Arc<FeedBlock>>, Option<u8>)> {
         let tips = feed.tips();
-        let mut picked = Vec::new();
+        let mut want = Vec::new();
         let mut gap = None;
         for &c in &self.chains {
             let Some(&tip) = tips.get(&c) else { continue };
@@ -138,16 +145,22 @@ impl DepthGate {
             if next > target {
                 continue;
             }
-            let hi = target.min(next + MAX_PER_TICK - 1);
-            if hi < target {
+            if target - next >= MAX_PER_TICK {
                 gap = Some(c);
+                self.next.insert(c, target + 1);
+                continue;
             }
-            for h in next..=hi {
-                picked.push(((c, h), feed.recent(c, h)));
-            }
-            self.next
-                .insert(c, if gap == Some(c) { target + 1 } else { hi + 1 });
+            want.extend((next..=target).map(|h| (h, c)));
         }
+        want.sort_unstable();
+        want.truncate(cap.max(1));
+        for &(h, c) in &want {
+            self.next.insert(c, h + 1);
+        }
+        let picked: Vec<_> = want
+            .into_iter()
+            .map(|(h, c)| ((c, h), feed.recent(c, h)))
+            .collect();
         if picked.is_empty() {
             return Ok((Vec::new(), gap));
         }
@@ -174,11 +187,25 @@ impl DepthGate {
     }
 }
 
-/// Feed items for `chains`, released at `depth` when given.
+/// State of a depth-released stream.
+struct DepthSub {
+    sub: Sub,
+    chains: Vec<u8>,
+    gate: DepthGate,
+    feed: BlockFeed,
+    state: Arc<ApiState>,
+    /// Try a release before waiting for the next feed item (false after an empty or failed
+    /// release, so errors never repeat without a new item).
+    ready: bool,
+}
+
+/// Feed items for `chains` in batches of at most `cap` blocks, released at `depth` when
+/// given.
 fn feed_stream(
     ctx: &Context<'_>,
     chains: Vec<u8>,
     depth: Option<u64>,
+    cap: usize,
 ) -> Result<BoxStream<'static, Result<Vec<Arc<FeedBlock>>>>> {
     let feed = feed_of(ctx)?;
     let state = gql(ctx).state()?.clone();
@@ -186,13 +213,12 @@ fn feed_stream(
     let sub = Sub {
         rx: feed.subscribe(),
         _slot: slot,
-        done: false,
-        pending_gap: None,
+        pending: None,
     };
     match depth.filter(|d| *d > 0) {
         None => Ok(
-            stream::unfold((sub, chains), |(mut sub, chains)| async move {
-                let item = next_batch(&mut sub, &chains).await?;
+            stream::unfold((sub, chains), move |(mut sub, chains)| async move {
+                let item = next_batch(&mut sub, &chains, cap).await?;
                 Some((item, (sub, chains)))
             })
             .boxed(),
@@ -203,36 +229,50 @@ fn feed_stream(
                 chains: chains.clone(),
                 next: HashMap::new(),
             };
-            Ok(stream::unfold(
-                (sub, chains, gate, feed, state),
-                |(mut sub, chains, mut gate, feed, state)| async move {
-                    loop {
-                        // Any feed item for these chains is a wake-up.
-                        if let Err(e) = next_batch(&mut sub, &chains).await? {
-                            return Some((Err(e), (sub, chains, gate, feed, state)));
-                        }
-                        match gate.release(&feed, &state).await {
-                            Err(e) => return Some((Err(e), (sub, chains, gate, feed, state))),
-                            Ok((_, Some(c))) => {
-                                return Some((Err(gap_error(c)), (sub, chains, gate, feed, state)))
+            let st = DepthSub {
+                sub,
+                chains,
+                gate,
+                feed,
+                state,
+                ready: false,
+            };
+            Ok(stream::unfold(st, move |mut st| async move {
+                loop {
+                    if let Some(e) = st.sub.pending.take() {
+                        return Some((Err(e), st));
+                    }
+                    if st.ready {
+                        st.ready = false;
+                        match st.gate.release(&st.feed, &st.state, cap).await {
+                            Err(e) => return Some((Err(e), st)),
+                            Ok((blocks, gap)) if !blocks.is_empty() => {
+                                // More may be due: release again before waiting.
+                                st.ready = true;
+                                st.sub.pending = gap.map(gap_error);
+                                return Some((Ok(blocks), st));
                             }
-                            Ok((blocks, None)) if !blocks.is_empty() => {
-                                return Some((Ok(blocks), (sub, chains, gate, feed, state)))
-                            }
+                            Ok((_, Some(c))) => return Some((Err(gap_error(c)), st)),
                             Ok(_) => {}
                         }
                     }
-                },
-            )
+                    // Any feed item for these chains is a wake-up.
+                    if let Err(e) = next_batch(&mut st.sub, &st.chains, MAX_BATCH).await? {
+                        return Some((Err(e), st));
+                    }
+                    st.ready = true;
+                }
+            })
             .boxed())
         }
     }
 }
 
-/// A `quantity` argument (ZelCore extension): 1..=[`MAX_BATCH`]; absent is 20.
-fn quantity_arg(v: Option<i32>) -> Result<usize> {
+/// A `quantity` argument (ZelCore extension): 1..=[`MAX_BATCH`]; absent is 20. Clamped to
+/// `max_page`, as the limits walker prices it (M3).
+fn quantity_arg(v: Option<i32>, max_page: usize) -> Result<usize> {
     match v.unwrap_or(20) {
-        n @ 1..=100 => Ok(n as usize),
+        n @ 1..=100 => Ok((n as usize).min(max_page.max(1))),
         _ => Err(bad_input(format!(
             "quantity must be between 1 and {MAX_BATCH}"
         ))),
@@ -278,34 +318,39 @@ impl Subscription {
             .map(ParamFilter::parse)
             .transpose()?;
         let depth = depth_arg("minimumDepth", minimum_depth)?;
-        let s = feed_stream(ctx, chains, depth)?;
-        Ok(s.filter_map(move |item| {
-            let out = item.map(|blocks| {
-                let evs: Vec<Event> = blocks
-                    .iter()
-                    .flat_map(|b| b.txs.iter())
-                    .flat_map(|d| {
-                        d.evs
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, e)| {
-                                e.qual_name == qual
-                                    && params.as_ref().is_none_or(|p| p.matches(&e.params))
-                            })
-                            .map(|(i, _)| Event::new(d.clone(), i))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                evs
-            });
-            async move {
-                match out {
-                    Ok(v) if v.is_empty() => None,
-                    Ok(v) => Some(Ok(Some(v))),
-                    Err(e) => Some(Err(e)),
+        // At most the walker's price per message: the default page (I-1).
+        let per_msg = {
+            let s = &gql(ctx).settings;
+            s.default_page.min(s.max_page).max(1)
+        };
+        let cap = chains.len();
+        let s = feed_stream(ctx, chains, depth, cap)?;
+        Ok(stream::unfold(
+            (s, VecDeque::new(), qual, params),
+            move |(mut s, mut q, qual, params)| async move {
+                loop {
+                    if !q.is_empty() {
+                        let n = q.len().min(per_msg);
+                        let msg: Vec<Event> = q.drain(..n).collect();
+                        return Some((Ok(Some(msg)), (s, q, qual, params)));
+                    }
+                    match s.next().await? {
+                        Err(e) => return Some((Err(e), (s, q, qual, params))),
+                        Ok(blocks) => {
+                            for d in blocks.iter().flat_map(|b| b.txs.iter()) {
+                                for (i, e) in d.evs.iter().enumerate() {
+                                    if e.qual_name == qual
+                                        && params.as_ref().is_none_or(|p| p.matches(&e.params))
+                                    {
+                                        q.push_back(Event::new(d.clone(), i));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-        })
+            },
+        )
         .boxed())
     }
 
@@ -314,15 +359,19 @@ impl Subscription {
         ctx: &Context<'_>,
         #[graphql(default_with = "default_chain_ids()")] chain_ids: Option<Vec<String>>,
         // ZelCore extension: at most this many blocks per message (the newest). Absent keeps
-        // Kadena's behaviour (a message per feed batch, up to `MAX_BATCH` blocks).
+        // Kadena's behaviour (every block), at most one block per subscribed chain per
+        // message, as priced.
         quantity: Option<i32>,
     ) -> Result<BoxStream<'static, Result<Option<Vec<Block>>>>> {
         let chains = chain_set(chain_ids.as_deref())?;
-        let q = match quantity {
-            Some(_) => quantity_arg(quantity)?,
-            None => MAX_BATCH,
+        let (cap, q) = match quantity {
+            Some(_) => (
+                MAX_BATCH,
+                quantity_arg(quantity, gql(ctx).settings.max_page)?,
+            ),
+            None => (chains.len(), usize::MAX),
         };
-        Ok(feed_stream(ctx, chains, None)?
+        Ok(feed_stream(ctx, chains, None, cap)?
             .map(move |item| {
                 item.map(|bs| {
                     let skip = bs.len().saturating_sub(q);
@@ -344,8 +393,8 @@ impl Subscription {
         ctx: &Context<'_>,
         #[graphql(default = 20)] quantity: Option<i32>,
     ) -> Result<BoxStream<'static, Result<Option<Vec<Transaction>>>>> {
-        let q = quantity_arg(quantity)?;
-        let s = feed_stream(ctx, chain_set(None)?, None)?;
+        let q = quantity_arg(quantity, gql(ctx).settings.max_page)?;
+        let s = feed_stream(ctx, chain_set(None)?, None, MAX_BATCH)?;
         Ok(s.filter_map(move |item| {
             let out = item.map(|blocks| newest_txs(&blocks, q));
             async move {
@@ -367,11 +416,9 @@ impl Subscription {
     ) -> Result<BoxStream<'static, Result<Option<Vec<Block>>>>> {
         let chains = chain_set(chain_ids.as_deref())?;
         let depth = depth_arg("minimumDepth", Some(minimum_depth))?.unwrap_or(0);
-        let s = if depth == 0 {
-            feed_stream(ctx, chains, None)?
-        } else {
-            feed_stream(ctx, chains, Some(depth))?
-        };
+        // At most one block per subscribed chain per message, as priced (I-1).
+        let cap = chains.len();
+        let s = feed_stream(ctx, chains, Some(depth).filter(|d| *d > 0), cap)?;
         Ok(s.map(|item| {
             item.map(|bs| Some(bs.iter().map(|b| Block::new(b.block.clone())).collect()))
         })
@@ -475,8 +522,30 @@ mod tests {
             chains: vec![5],
             next: HashMap::from([(5, 1)]),
         };
-        let (out, gap) = gate.release(&feed, &f.st).await.unwrap();
+        let (out, gap) = gate.release(&feed, &f.st, 20).await.unwrap();
         let got: Vec<_> = out.iter().map(|b| (b.height, b.hash)).collect();
         assert_eq!((got, gap), (vec![(1, hash(5, 1, 1))], None));
+    }
+
+    /// I-1: a depth release carries at most `cap` blocks; the rest follow on the next calls.
+    #[tokio::test]
+    async fn depth_gate_releases_at_most_cap_per_call() {
+        let f = testutil::store();
+        let feed = BlockFeed::detached();
+        for h in 0..=4 {
+            f.apply(5, h, 0);
+            feed.inject(FeedItem::Block(feed_block(5, h, 0)));
+        }
+        let mut gate = DepthGate {
+            depth: 1,
+            chains: vec![5],
+            next: HashMap::from([(5, 1)]),
+        };
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let (out, _) = gate.release(&feed, &f.st, 1).await.unwrap();
+            got.push(out.iter().map(|b| b.height).collect::<Vec<_>>());
+        }
+        assert_eq!(got, [vec![1], vec![2], vec![3], vec![]]);
     }
 }

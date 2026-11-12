@@ -3,17 +3,20 @@
 //! `connection_init` timeout, the idle close, the message size cap and the per-message rate
 //! tokens. Slots return to zero when a client goes away.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use kdx_api::compat::shapes::Ev;
 use kdx_api::{Api, ApiSettings, ApiState, Store, TipWatch};
 use kdx_graphql::feed::{FeedBlock, FeedItem};
+use kdx_graphql::txlist::TxData;
 use kdx_graphql::ws::active_subscriptions;
 use kdx_graphql::{build_schema, router, BlockFeed, GraphqlSettings, KdxSchema};
-use kdx_types::record::BlockRecord;
-use kdx_types::Hash32;
+use kdx_types::record::{BlockRecord, TxRecord};
+use kdx_types::{Hash32, TxKey};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -327,4 +330,144 @@ async fn gap_inside_a_batch_loses_nothing() {
         });
     }
     assert_eq!(got, ["0/1", "\"INTERNAL\"", "1/2"]);
+}
+
+/// Block `(chain, height)` with one tx of `n` `coin.TRANSFER` events.
+fn block_with_events(chain: u8, height: u64, n: usize) -> FeedItem {
+    let FeedItem::Block(b) = block(chain, height) else {
+        unreachable!()
+    };
+    let evs = (0..n)
+        .map(|i| Ev {
+            pos: i,
+            qual_name: "coin.TRANSFER".into(),
+            module: "coin".into(),
+            module_hash: String::new(),
+            params: json!(["a", "b", 1.0]),
+        })
+        .collect();
+    let tx = TxData {
+        rec: TxRecord {
+            key: TxKey::new(height as u32, chain, 1),
+            ..TxRecord::default()
+        },
+        block: b.block.clone(),
+        out: Value::Null,
+        cmd: None,
+        evs,
+        trs: Vec::new(),
+        nfts: Vec::new(),
+    };
+    FeedItem::Block(Arc::new(FeedBlock {
+        chain,
+        height,
+        hash: b.hash,
+        block: b.block.clone(),
+        txs: Arc::new(vec![Arc::new(tx)]),
+        reorg: false,
+    }))
+}
+
+/// The list sizes of the next `n` `next` messages, per subscription id.
+async fn sizes(ws: &mut Ws, n: usize, field: &str) -> BTreeMap<String, Vec<Vec<i64>>> {
+    let mut got: BTreeMap<String, Vec<Vec<i64>>> = BTreeMap::new();
+    for _ in 0..n {
+        let m = recv(ws).await.unwrap();
+        assert_eq!(m["type"], "next", "{m}");
+        let items = m["payload"]["data"][field].as_array().expect("a list");
+        let hs = items
+            .iter()
+            .map(|b| b["height"].as_i64().unwrap_or(0))
+            .collect();
+        got.entry(m["id"].as_str().unwrap().into())
+            .or_default()
+            .push(hs);
+    }
+    got
+}
+
+/// I-1, M3: a message carries at most its priced blocks: one per subscribed chain without
+/// `quantity`, and the newest `quantity` (clamped to `max_page`) with it.
+#[tokio::test]
+async fn messages_carry_at_most_their_priced_blocks() {
+    let settings = GraphqlSettings {
+        max_page: 2,
+        ..GraphqlSettings::default()
+    };
+    let s = server(settings, 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    for (id, q) in [
+        (
+            "1",
+            "subscription { newBlocks(chainIds: [\"0\"]) { height } }",
+        ),
+        (
+            "2",
+            "subscription { newBlocks(chainIds: [\"0\"], quantity: 3) { height } }",
+        ),
+    ] {
+        send(
+            &mut a,
+            json!({"id": id, "type": "subscribe", "payload": {"query": q}}),
+        )
+        .await;
+    }
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 2).await);
+    for h in 1..=3 {
+        s.feed.inject(block(0, h));
+    }
+    let got = sizes(&mut a, 4, "newBlocks").await;
+    assert_eq!(got["1"], [vec![1], vec![2], vec![3]]);
+    assert_eq!(got["2"], [vec![2, 3]]);
+}
+
+/// I-1: an `events` message carries at most the default page of events; the rest follow.
+#[tokio::test]
+async fn events_messages_carry_at_most_the_priced_events() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let q =
+        "subscription { events(qualifiedEventName: \"coin.TRANSFER\", chainId: \"0\") { height } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": q}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    s.feed.inject(block_with_events(0, 7, 45));
+    let got = sizes(&mut a, 3, "events").await;
+    let lens: Vec<usize> = got["1"].iter().map(Vec::len).collect();
+    assert_eq!(lens, [20, 20, 5]);
+}
+
+/// I-1: a subscriber that falls more than the feed's buffer behind gets one gap error and
+/// stays open from the feed's tail.
+#[tokio::test]
+async fn lagging_subscriber_gets_a_gap_and_stays_open() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    for h in 0..1100 {
+        s.feed.inject(block(5, h));
+    }
+    let m = recv(&mut a).await.unwrap();
+    assert_eq!(
+        (
+            m["type"].as_str(),
+            m["payload"]["errors"][0]["extensions"]["code"].as_str()
+        ),
+        (Some("next"), Some("INTERNAL")),
+        "{m}"
+    );
+    s.feed.inject(block(0, 1));
+    let got = sizes(&mut a, 1, "newBlocks").await;
+    assert_eq!(got["1"], [vec![1]]);
 }

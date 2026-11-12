@@ -66,6 +66,9 @@ const WIDE: &[&str] = &[
     "balance",
 ];
 
+/// The `transactions` subscription's `quantity` when absent (its SDL default).
+const SUB_TXS_QUANTITY: i64 = 20;
+
 /// Deferred `totalCount`s (count walks) one operation may run, outer multipliers included.
 pub const MAX_COUNTS: u64 = 2;
 
@@ -263,9 +266,9 @@ impl<'a> Walk<'a> {
                     } else if mf.is_none() {
                         // A field the walker cannot resolve (unknown parent type): the
                         // conservative page size, its subtree priced at the per-item floor.
-                        self.multiplier(f).max(self.s.max_page as u64)
+                        self.multiplier(f, ty).max(self.s.max_page as u64)
                     } else if pages {
-                        self.multiplier(f)
+                        self.multiplier(f, ty)
                     } else {
                         1
                     };
@@ -414,7 +417,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn multiplier(&self, f: &'a Field) -> u64 {
+    fn multiplier(&self, f: &'a Field, parent: Option<&str>) -> u64 {
         let s = self.s;
         // The wide lists clamp at `wide_page` (R-P5P9-20), everything else at `max_page`.
         let name = f.name.node.as_str();
@@ -436,10 +439,15 @@ impl<'a> Walk<'a> {
         if first.is_some() || last.is_some() {
             return page(first.max(last));
         }
-        // ZelCore `quantity` (subscriptions `newBlocks`, `transactions`): the list size.
+        // ZelCore `quantity` (subscriptions `newBlocks`, `transactions`): the list size, clamped
+        // to `max_page` as the resolver clamps it. The `transactions` subscription's absent
+        // `quantity` is its SDL default (M3).
         match self.arg(f, "quantity") {
             Arg::Unbound => return s.max_page as u64,
             Arg::Val(v) => return page(Self::int(&v)),
+            Arg::Absent if parent == Some("Subscription") && name == "transactions" => {
+                return page(Some(SUB_TXS_QUANTITY));
+            }
             Arg::Absent => {}
         }
         let list_len = |arg: &str, absent: u64, unbound: u64| match self.arg(f, arg) {
@@ -614,6 +622,26 @@ mod tests {
             let x = e.extensions.unwrap();
             format!("{}", x.get("limit").unwrap())
         })
+    }
+
+    /// M3: the `transactions` subscription's absent `quantity` is priced at its SDL default
+    /// (20, not `default_page`), and `quantity` at most `max_page`, as the resolver serves.
+    #[test]
+    fn subscription_quantity_is_priced_as_served() {
+        let s = GraphqlSettings {
+            default_page: 5,
+            max_page: 50,
+            ..GraphqlSettings::default()
+        };
+        let c = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            analyze(&doc, &Variables::default(), &s).map(|c| c.complexity)
+        };
+        assert_eq!(c("subscription { transactions { hash } }").ok(), Some(21));
+        assert_eq!(
+            c("subscription { newBlocks(quantity: 100) { hash } }").ok(),
+            Some(51)
+        );
     }
 
     #[test]
