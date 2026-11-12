@@ -251,6 +251,8 @@ async fn drive(
         );
     let mut data = Data::default();
     data.insert(ConnSubs(per_conn.clone()));
+    // Per-client gates (search, S-5) key on it; operations over this socket carry it.
+    data.insert(crate::ClientIp(ip));
     let init_flag = inited.clone();
     let gql_ws = GqlWebSocket::new((*schema).clone(), incoming, protocol)
         .connection_data(data)

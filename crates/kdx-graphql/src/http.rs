@@ -234,8 +234,10 @@ async fn execute(
     }
     let budget = st.settings.deadline.saturating_sub(DEADLINE_MARGIN);
     let deadline = Instant::now() + budget;
-    let ip = peer.map(|p| st.client_ip_of(p, headers));
-    let batch = batch.data(ReqCtx { deadline, ip });
+    let mut batch = batch.data(ReqCtx { deadline });
+    if let Some(p) = peer {
+        batch = batch.data(crate::ClientIp(st.client_ip_of(p, headers)));
+    }
     let resp = match tokio::time::timeout(budget, schema.execute_batch(batch)).await {
         Ok(r) => r,
         Err(_) => {

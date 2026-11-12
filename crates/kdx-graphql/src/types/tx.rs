@@ -808,6 +808,26 @@ impl TransactionSummary {
     }
 }
 
+/// A search-gate permit for the client at `ip`. An operation whose client address is not
+/// known is refused: sharing one bucket among such clients would defeat the per-client limit.
+pub fn search_permit(
+    gate: &Arc<kdx_api::search::SearchGate>,
+    ip: Option<std::net::IpAddr>,
+) -> Result<kdx_api::search::SearchPermit> {
+    let ip = ip.ok_or_else(|| {
+        err(
+            Code::Limit,
+            "search needs a known client address (HTTP or an accepted websocket)",
+        )
+    })?;
+    gate.try_acquire(ip).map_err(|_| {
+        err(
+            Code::Limit,
+            "too many searches in flight: try again shortly",
+        )
+    })
+}
+
 /// A number's exact text (a string or `{"decimal": ..}` unwrapped); "0" when absent.
 fn number_text(v: Option<&Value>) -> String {
     match v {
@@ -852,16 +872,7 @@ pub async fn query_transactions_by_pact_code(
         Some(PageCursor::Block(_)) => return Err(bad_input("invalid cursor")),
     };
     let had_cursor = next.is_some();
-    let ip = ctx
-        .data_opt::<crate::ReqCtx>()
-        .and_then(|r| r.ip)
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    let permit = search.gate.try_acquire(ip).map_err(|_| {
-        err(
-            Code::Limit,
-            "too many searches in flight: try again shortly",
-        )
-    })?;
+    let permit = search_permit(&search.gate, crate::client_ip(ctx))?;
     let n = page.n;
     let (rows, resume, truncated) = g
         .state()?
@@ -951,5 +962,22 @@ mod tests {
         assert_eq!(s.address, None);
         assert_eq!(s.clist[1].args, r#"["k:a","k:b",1.5]"#);
         assert_eq!(s.clist[0].args, "[]");
+    }
+
+    #[test]
+    fn search_permits_are_per_client_and_need_an_address() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let gate = Arc::new(kdx_api::search::SearchGate::new(8, 1));
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let pa = search_permit(&gate, Some(a)).expect("first client");
+        let _pb = search_permit(&gate, Some(b)).expect("a second client has its own bucket");
+        assert!(
+            search_permit(&gate, Some(a)).is_err(),
+            "per-client limit holds"
+        );
+        assert!(search_permit(&gate, None).is_err(), "no address: refused");
+        drop(pa);
+        assert!(search_permit(&gate, Some(a)).is_ok(), "released on drop");
     }
 }

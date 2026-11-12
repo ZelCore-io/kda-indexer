@@ -124,12 +124,20 @@ pub fn gql<'a>(ctx: &Context<'a>) -> &'a Gql {
     ctx.data_unchecked::<Gql>()
 }
 
-/// Per-request data: the deadline every batch of one HTTP request shares, and the client IP
-/// (the search gate counts per client).
+/// Per-request data: the deadline every batch of one HTTP request shares.
 #[derive(Debug, Clone, Copy)]
 pub struct ReqCtx {
     pub deadline: Instant,
-    pub ip: Option<std::net::IpAddr>,
+}
+
+/// The client address of an HTTP request or a websocket connection (`trusted_proxies`
+/// applied). Per-client gates (the search gate, S-5) refuse an operation without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIp(pub std::net::IpAddr);
+
+/// The client address of the operation being resolved, when known.
+pub fn client_ip(ctx: &Context<'_>) -> Option<std::net::IpAddr> {
+    ctx.data_opt::<ClientIp>().map(|c| c.0)
 }
 
 /// The request deadline (a request without one, such as a subscription event, gets the
