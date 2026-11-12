@@ -333,6 +333,11 @@ frozen, 147,800 hot) in 84 minutes: every one `ok`, none `ok_unflagged`, `bad_fl
 `bad_legacy`, `bad_other` or errored, in every era. Peak process memory of one run was about
 2 GB.
 
+Size and memory notes: the two 100k ranges whose `txs.seg` is above 4 GB are heights 4.4M to 4.5M
+(4.79 GB) and 4.5M to 4.6M (4.30 GB); they verify and read normally, and the range size stays
+100k. ≥ 32 GiB RAM recommended for a full backfill beside a node (this 24 GiB host swapped in the
+dense eras).
+
 ## Before any big write
 
 Before a backfill, a merge of many ranges, a rebuild or a replica copy on a host with shared
