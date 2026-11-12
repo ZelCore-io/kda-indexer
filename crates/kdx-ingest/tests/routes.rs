@@ -36,10 +36,16 @@ fn served(places: &[Place]) -> Served {
 
 /// `places` applied to a fresh single-chain store: (data dir, API state, ingest context).
 fn store(places: &[Place]) -> (tempfile::TempDir, Arc<kdx_api::ApiState>, kdx_ingest::Ctx) {
-    let pool = pool();
+    store_from(&pool(), places)
+}
+
+fn store_from(
+    pool: &[Value],
+    places: &[Place],
+) -> (tempfile::TempDir, Arc<kdx_api::ApiState>, kdx_ingest::Ctx) {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path(), 10_000, 10_000, 10);
-    apply_linear(&ctx, &pool, places, 4);
+    apply_linear(&ctx, pool, places, 4);
     // The meta the ingest context writes at start: the network and the chain graph give the
     // store its genesis heights.
     let mut w = ctx.hot.rw().unwrap();
@@ -246,4 +252,80 @@ async fn search_code_is_partial_while_the_index_is_marked_stale() {
     assert!(!ask("fresh index").await);
     assert!(kdx_search::manifest::mark_stale(&sdir, 3).unwrap());
     assert!(ask("marked stale").await);
+}
+
+/// S-3 (T-3): a captured mainnet block (chain 0, height 4,500,122: two `exec` txs of
+/// `free.radio02` and two `cont` txs, step 1 of cross-chain coin transfers with SPV
+/// proofs), served at height 3 after three pool blocks. `pactid` lists exactly the cont tx
+/// of that defpact; `search` matches the exec txs by their own code and never a cont tx,
+/// whose own code is null, not even for its defpact's code (chainweb-data matches cont txs
+/// through `initialCode`; this route does not, allowlist class `search-cont-history`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_cont_txs_are_listed_by_pactid_and_never_matched_by_search() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/chain0_4500122_cont.json.zst"
+    );
+    let raw = zstd::decode_all(std::fs::File::open(path).unwrap()).unwrap();
+    let cont: Vec<Value> = serde_json::from_slice(&raw).unwrap();
+    let mut pool = pool();
+    pool.extend(cont);
+    let (dir, state, _) = store_from(&pool, &branch(&[0, 1, 2, POOL_LEN], 0, 0, 0));
+    let s = Served {
+        _dir: dir,
+        app: routers(&state, SearchCtx::new(SearchSettings::default(), None)),
+    };
+    let rks = |body: &str| -> Vec<String> {
+        let v: Value = serde_json::from_str(body).unwrap();
+        v.as_array()
+            .unwrap_or_else(|| panic!("not a list: {body}"))
+            .iter()
+            .map(|t| t["requestKey"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let conts = [
+        (
+            "oo-DEBaUsFh0M1UrxYgKx8oyuE1UTjsZzDiUgImrgUk",
+            "n8PPgNdm0jsnGDvZzasc70W__dUXNKfAkbdg7HI1jYM",
+        ),
+        (
+            "aIY94yJsWCU8DLNrLMAgeoBwjllC8Rgcggmq3TP0FD4",
+            "1jT4uEoDSgezw59BjAWz3e6q17siqNy2aPBgvQ_cV3A",
+        ),
+    ];
+    for (rk, pact) in conts {
+        let (st, body) = get(&s, &format!("/txs/search?pactid={pact}")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(rks(&body), vec![rk.to_owned()], "pactid {pact}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v[0]["code"].is_null(), "{body}");
+    }
+    let (st, body) = get(&s, "/txs/search?search=radio02&limit=50").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    // The pool blocks hold radio02 txs too; the fixture's two exec txs must be among them.
+    let got = rks(&body);
+    for rk in [
+        "8DivnTk4_u9f_Rkt6lhLR_HZRg_7iU1ko6ci0l7iNSU",
+        "uThG32wS4FYQP5aZzmlsRfMBMmcLdE8YtJi7vkBTGXM",
+    ] {
+        assert!(
+            got.iter().any(|g| g == rk),
+            "radio02: {rk} missing from {got:?}"
+        );
+    }
+    // The pact ids are in the cont txs' own cmd (`payload.cont.pactId`), not in any code.
+    for pat in [
+        "transfer-crosschain",
+        "coin.transfer",
+        "k:e7f",
+        conts[0].1,
+        conts[1].1,
+    ] {
+        let (st, body) = get(&s, &format!("/txs/search?search={pat}&limit=250")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let got = rks(&body);
+        for (rk, _) in conts {
+            assert!(!got.iter().any(|g| g == rk), "{pat} matched cont tx {rk}");
+        }
+    }
 }
