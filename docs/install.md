@@ -65,6 +65,16 @@ It never changes ownership of an existing `/opt/coins/data/kadena/kda-indexer` t
 dedicated volume can be mounted there before or after the install (with the service
 stopped).
 
+**The volume root must be traversable by the service user.** A freshly formatted or
+copied-over volume often has its root at `0700` or `0750` `root:root`; the service user
+(`kda-indexer`) then cannot reach `<volume>/mainnet01` even though that directory is its own,
+and the unit fails to open the store. Set the mode of the mounted volume root to `0755`
+(`chmod 0755 /opt/coins/data/kadena/kda-indexer`) before the first start. The package never
+changes the mode of an existing directory; instead the postinst checks, as the service user,
+that every directory down to the data dir can be entered and that the data dir is writable,
+and stops with a message naming the directory and the fix if not. Re-run
+`dpkg --configure kda-indexer` after fixing it.
+
 ## Configure
 
 Edit `/opt/coins/kda-indexer/mainnet01/config/mainnet01.toml`. As shipped it passes `config check` and every listener
