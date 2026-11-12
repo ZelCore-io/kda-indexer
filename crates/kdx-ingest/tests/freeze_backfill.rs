@@ -7,103 +7,11 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+
 use std::path::Path;
 use std::sync::Arc;
 
 use common::*;
-use serde_json::{json, Value};
-
-/// A minimal chainweb stand-in for chain 0 holding `chain` (ascending, linear).
-fn fake_node(pool: Vec<Value>, chain: Vec<Place>) -> String {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    let headers: Vec<Value> = chain.iter().map(|p| header(&pool, *p)).collect();
-    let payloads: BTreeMap<String, Value> = chain
-        .iter()
-        .map(|p| {
-            let v = pool[p.pool]["payload"].clone();
-            (v["payloadHash"].as_str().unwrap().to_owned(), v)
-        })
-        .collect();
-    std::thread::spawn(move || {
-        for s in l.incoming() {
-            let Ok(mut s) = s else { return };
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            let (head, body) = loop {
-                let n = s.read(&mut tmp).unwrap_or(0);
-                if n == 0 {
-                    break (String::new(), Vec::new());
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-                    continue;
-                };
-                let head = String::from_utf8_lossy(&buf[..i]).into_owned();
-                let len = head
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    })
-                    .unwrap_or(0);
-                if buf.len() >= i + 4 + len {
-                    break (head, buf[i + 4..i + 4 + len].to_vec());
-                }
-            };
-            let line = head.lines().next().unwrap_or("").to_owned();
-            let path = line.split(' ').nth(1).unwrap_or("").to_owned();
-            let (route, query) = path.split_once('?').unwrap_or((&path, ""));
-            let q: BTreeMap<&str, u64> = query
-                .split('&')
-                .filter_map(|kv| {
-                    let (k, v) = kv.split_once('=')?;
-                    Some((k, v.parse().ok()?))
-                })
-                .collect();
-            let resp = if route.ends_with("/cut") {
-                let tip = headers.last().unwrap();
-                json!({"hashes": {"0": {"height": tip["height"], "hash": tip["hash"]}},
-                       "height": tip["height"], "weight": "AAAA", "origin": null,
-                       "instance": "mainnet01", "id": "x"})
-            } else if route.ends_with("/header/branch") {
-                let (lo, hi) = (
-                    q.get("minheight").copied().unwrap_or(0),
-                    q.get("maxheight").copied().unwrap_or(u64::MAX),
-                );
-                let items: Vec<&Value> = headers
-                    .iter()
-                    .rev()
-                    .filter(|h| (lo..=hi).contains(&h["height"].as_u64().unwrap()))
-                    .collect();
-                json!({"items": items, "limit": items.len(), "next": null})
-            } else if route.ends_with("/payload/outputs/batch") {
-                let want: Vec<String> = serde_json::from_slice(&body).unwrap_or_default();
-                Value::Array(
-                    want.iter()
-                        .filter_map(|h| payloads.get(h).cloned())
-                        .collect(),
-                )
-            } else {
-                Value::Null
-            };
-            let (status, b) = if resp.is_null() {
-                ("404 Not Found", b"{}".to_vec())
-            } else {
-                ("200 OK", serde_json::to_vec(&resp).unwrap())
-            };
-            let _ = write!(
-                s,
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                b.len()
-            );
-            let _ = s.write_all(&b);
-        }
-    });
-    format!("http://{addr}")
-}
 
 fn files(dir: &Path) -> BTreeMap<String, String> {
     std::fs::read_dir(dir)
@@ -139,7 +47,7 @@ async fn freeze_equals_backfill(range: u64) {
     };
     assert_eq!(frozen.frontier, 20);
 
-    let base = fake_node(pool, chain);
+    let base = fake_node(&pool, &[(0, chain)]);
     let db = tempfile::tempdir().unwrap();
     let c = Arc::new(ctx_with_node(db.path(), 2, range, 2, &base));
     kdx_ingest::backfill::run(c.clone(), 0, 19, kdx_ingest::HeaderMode::Cut)
@@ -169,47 +77,164 @@ async fn a_merged_range_equals_a_backfilled_range() {
     freeze_equals_backfill(20).await;
 }
 
-/// Two chains, the same blocks, committed per height chain 0 first in one store and chain 1
-/// first in the other (the tail commits chains in arrival order; backfill builds in
-/// (height, chain) order). New names get ids in commit order and the freezer copies the hot
-/// bytes, so the frozen steps differ, and at most one of the two orders can equal a backfill.
-#[test]
-#[ignore = "finding 9B-2: frozen step bytes depend on the cross-chain tail commit order (dictionary ids in arrival order), so freeze = backfill holds byte for byte only when the tail happened to commit in (height, chain) order"]
-fn frozen_steps_do_not_depend_on_the_cross_chain_commit_order() {
+/// Content digest per manifest entry plus the split-independent total.
+fn content(c: &kdx_ingest::Ctx) -> (Vec<(u32, u32, String)>, String) {
+    use kdx_segment::content::{self, ContentDigest};
+    let m = kdx_segment::Manifest::load(&c.segdir).unwrap().unwrap();
+    let dict = kdx_hot::HotDict::load(&c.hot.ro().unwrap()).unwrap();
+    let mut total = ContentDigest::new();
+    let mut per = Vec::new();
+    for e in &m.entries {
+        let r = kdx_segment::RangeReader::open(&c.segdir, e, &m.network).unwrap();
+        per.push((e.start, e.end, content::range(&r, &dict).unwrap().blake3));
+        content::feed(&r, &dict, &mut total).unwrap();
+    }
+    (per, total.finish().blake3)
+}
+
+fn deep_check(c: &kdx_ingest::Ctx) {
+    let rep = kdx_segment::check(&c.segdir, true).unwrap();
+    assert!(rep.ok(), "{rep:?}");
+}
+
+/// 9B-2, as ruled (R-P5P9-29): two chains, the same blocks, committed per height chain 0
+/// first in one store and chain 1 first in the other. Names get ids in commit order and the
+/// freezer copies the hot bytes, so the step bytes may differ (accepted); the content of
+/// every step is equal, and equal to a backfill of the same heights from the node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frozen_step_content_does_not_depend_on_the_cross_chain_commit_order() {
     let pool = pool();
-    let run = |dir: &Path, order: [u8; 2]| {
-        let c = ctx_full(dir, 2, 1000, 2, "http://127.0.0.1:9", &[0, 1]);
-        for h in 0..12u32 {
-            for chain in order {
-                let p = Place {
-                    pool: h as usize * 2 + chain as usize,
-                    height: h,
-                    br: chain,
-                    parent_br: chain,
-                };
-                let mut hd = header(&pool, p);
-                hd["chainId"] = json!(chain);
-                let b =
-                    kdx_ingest::pipeline::prepare_value(chain, h, &hd, &pool[p.pool]["payload"])
-                        .unwrap();
-                kdx_ingest::apply::commit(
-                    &c,
-                    &[kdx_ingest::apply::Batch {
-                        chain,
-                        fork: None,
-                        blocks: vec![b],
-                        halted: false,
-                        halt_reason: "",
-                    }],
-                )
-                .unwrap();
-            }
-        }
-        while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
-        files(&dir.join("segments"))
-    };
-    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let a = run(da.path(), [0, 1]);
-    assert!(a.len() > 15, "{a:?}");
-    assert_eq!(run(db.path(), [1, 0]), a);
+    let places = places_for(&[0, 1], 12);
+    let base = fake_node(&pool, &places);
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let a = content(&freeze_store(da.path(), &pool, &base, &places, &[0, 1]));
+    let b = content(&freeze_store(db.path(), &pool, &base, &places, &[1, 0]));
+    assert!(a.0.len() >= 4, "{a:?}");
+    assert_eq!(a, b);
+    let last = a.0.last().unwrap().1 - 1;
+    let c = Arc::new(ctx_full(dc.path(), 2, 1000, 2, &base, &[0, 1]));
+    kdx_ingest::backfill::run(c.clone(), 0, last, kdx_ingest::HeaderMode::Cut)
+        .await
+        .unwrap();
+    assert_eq!(content(&c), a, "backfill content");
+}
+
+/// T-4 determinism: `rebuild-range --step` of a frozen single-chain step gives blake3-equal
+/// files; the swap leaves no rebuild dir and a store that passes `segments check --deep`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_of_a_frozen_step_is_byte_equal_on_one_chain() {
+    let pool = pool();
+    let places = places_for(&[0], 24);
+    let base = fake_node(&pool, &places);
+    let d = tempfile::tempdir().unwrap();
+    let c = Arc::new(freeze_store(d.path(), &pool, &base, &places, &[0]));
+    let before = content(&c);
+    let e = kdx_segment::Manifest::load(&c.segdir)
+        .unwrap()
+        .unwrap()
+        .entries[3]
+        .clone();
+    let rep = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(rep.swapped && rep.bytes_equal, "{rep:?}");
+    assert_eq!(rep.content_equal, Some(true));
+    assert!(!kdx_segment::swap::rebuild_dir(&c.segdir, e.start).exists());
+    deep_check(&c);
+    assert_eq!(content(&c), before);
+}
+
+/// Multi-chain step committed in non-backfill order: the rebuild is content-equal (bytes
+/// may differ, R-P5P9-29), both blake3 sets are reported, `--dry-run` swaps nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_on_two_chains_is_content_equal() {
+    let pool = pool();
+    let places = places_for(&[0, 1], 12);
+    let base = fake_node(&pool, &places);
+    let d = tempfile::tempdir().unwrap();
+    let c = Arc::new(freeze_store(d.path(), &pool, &base, &places, &[1, 0]));
+    let before = content(&c);
+    let e = kdx_segment::Manifest::load(&c.segdir)
+        .unwrap()
+        .unwrap()
+        .entries[2]
+        .clone();
+    let dry = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(!dry.swapped && dry.content_equal == Some(true), "{dry:?}");
+    assert!(!kdx_segment::swap::rebuild_dir(&c.segdir, e.start).exists());
+    let rep = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(rep.swapped, "{rep:?}");
+    assert_eq!(rep.content_equal, Some(true));
+    assert_eq!(rep.old_blake3.len(), rep.new_blake3.len());
+    deep_check(&c);
+    assert_eq!(content(&c), before);
+}
+
+/// Repair: one step's txs file damaged, `segments check` fails, `rebuild-range` restores it
+/// and `segments check --deep` passes with the original content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_repairs_a_corrupted_step() {
+    let pool = pool();
+    let places = places_for(&[0, 1], 12);
+    let base = fake_node(&pool, &places);
+    let d = tempfile::tempdir().unwrap();
+    let c = Arc::new(freeze_store(d.path(), &pool, &base, &places, &[0, 1]));
+    let before = content(&c);
+    let e = kdx_segment::Manifest::load(&c.segdir)
+        .unwrap()
+        .unwrap()
+        .entries[1]
+        .clone();
+    let txs = c.segdir.join(kdx_segment::files::file_name(
+        "mainnet01",
+        kdx_segment::files::FileKind::Txs,
+        e.start,
+        e.end,
+    ));
+    let mut b = std::fs::read(&txs).unwrap();
+    let mid = b.len() / 2;
+    for x in &mut b[mid..mid + 16] {
+        *x ^= 0xa5;
+    }
+    std::fs::write(&txs, &b).unwrap();
+    assert!(!kdx_segment::check(&c.segdir, false).unwrap().ok());
+    let rep = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(rep.swapped && !rep.bytes_equal, "{rep:?}");
+    assert_ne!(rep.content_equal, Some(true), "{rep:?}");
+    deep_check(&c);
+    assert_eq!(content(&c), before);
 }

@@ -217,6 +217,7 @@ pub fn postings(
     name: &str,
     module: Option<&str>,
     limit: usize,
+    oldest: bool,
 ) -> anyhow::Result<()> {
     let fam = Family::ALL
         .into_iter()
@@ -229,24 +230,57 @@ pub fn postings(
         .txn
         .scan(Table::TailPostings, &prefix, |k| k.starts_with(&prefix))?;
     let mut out = Vec::new();
-    for (k, _) in hot.iter().rev() {
-        if out.len() >= limit {
-            break;
-        }
+    let hot_item = |k: &[u8]| -> anyhow::Result<serde_json::Value> {
         let tk = parse_txkey(&k[9..]).context("posting key")?;
         let r = match s.txn.get(Table::TailTxs, &tk.to_be_bytes())? {
             Some(v) => Some(decode_tx(&v)?),
             None => None,
         };
-        out.push(json!({"source": "hot", "txkey": tk.0, "chain": tk.chain(), "height": tk.height(), "pos": tk.pos(), "rk": rk_of(r)}));
-    }
-    for t in s.seg.postings(fam, ent) {
-        if out.len() >= limit {
-            break;
-        }
+        Ok(
+            json!({"source": "hot", "txkey": tk.0, "chain": tk.chain(), "height": tk.height(), "pos": tk.pos(), "rk": rk_of(r)}),
+        )
+    };
+    let frozen_item = |t: u64| -> anyhow::Result<serde_json::Value> {
         let tk = s.seg.txkey(t).context("txkey of posting")?;
         let rk = rk_of(s.seg.tx(t)?);
-        out.push(json!({"source": "frozen", "txnum": t, "txkey": tk.0, "chain": tk.chain(), "height": tk.height(), "pos": tk.pos(), "rk": rk}));
+        Ok(
+            json!({"source": "frozen", "txnum": t, "txkey": tk.0, "chain": tk.chain(), "height": tk.height(), "pos": tk.pos(), "rk": rk}),
+        )
+    };
+    if oldest {
+        // B3: ranges from the lowest up, each list oldest first; stops at `limit` without
+        // touching later ranges.
+        'ranges: for r in &s.seg.ranges {
+            for t in r
+                .postings(fam, ent)
+                .into_iter()
+                .flat_map(|p| p.oldest_first())
+            {
+                if out.len() >= limit {
+                    break 'ranges;
+                }
+                out.push(frozen_item(t)?);
+            }
+        }
+        for (k, _) in &hot {
+            if out.len() >= limit {
+                break;
+            }
+            out.push(hot_item(k)?);
+        }
+    } else {
+        for (k, _) in hot.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            out.push(hot_item(k)?);
+        }
+        for t in s.seg.postings(fam, ent) {
+            if out.len() >= limit {
+                break;
+            }
+            out.push(frozen_item(t)?);
+        }
     }
     println!(
         "{}",

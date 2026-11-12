@@ -2,7 +2,7 @@
 
 ## Commands that write
 
-`run`, `backfill` and `unwind` (and the hidden `tail`) write to the data directory. Each one
+`run`, `backfill`, `rebuild-range` and `unwind` (and the hidden `tail`) write to the data directory. Each one
 takes an exclusive lock on `<data_dir>/LOCK` and exits at once with an error if another
 kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer-<network>`) before running
 `backfill` or `unwind` by hand. Read-only commands (`inspect`, `segments`, `hot stats`) do
@@ -422,6 +422,32 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 - Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
+
+## Rebuilding a range or step
+
+`kda-indexer rebuild-range --step S` (or `--range S` for a 100k range) refetches the heights of
+the manifest entry that starts at `S` from the node and swaps the rebuilt files in. Use it to
+repair a file that `segments check` reports (blake3 or size), and for deep-reorg recovery.
+Stop the service first: it takes the data dir lock.
+
+- The rebuild is built in `segments/rebuild.<S>/` with the backfill writer. A payload Merkle
+  mismatch aborts it (legacy-era mismatches are stored unverified, as in a backfill).
+- The tx and block counts and the first TxNum must equal the manifest entry, or nothing is
+  swapped. The content digest (decoded records, names resolved) of the stored and rebuilt
+  files is compared, and the blake3 of every stored and rebuilt file is logged. A store
+  rebuilt with its own dictionary gives equal bytes; across stores only the content is
+  comparable (`segments digest --content`).
+- `--dry-run` builds and compares, prints the report and removes the rebuild.
+- The swap is crash-safe at every point: before the journal `rebuild.<S>/rebuild.json`
+  exists the old files stay; after it, readers use the rebuilt set, and the next writer start
+  (`run`, `backfill`, `rebuild-range`) finishes the swap. `segments check` passes in between.
+- A `serve` keeps the files it has open until it restarts; restart it after a repair.
+- Size note (B10): two mainnet 100k `txs.seg` files are about 4.8 and 4.3 GB. They verify and
+  read correctly; a rebuild works per 10k step, so prefer `--step` over `--range`.
+
+Compare stores with `segments digest --content` (per entry, plus a total that does not depend
+on the range/step split) and `hot stats --digest` (name-resolved: records, postings by name,
+dictionaries as name sets).
 
 ## Before any big write
 

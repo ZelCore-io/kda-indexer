@@ -49,8 +49,9 @@ cannot be upgraded in place; rebuild it (`docs/operations.md`, "Format upgrade")
   defpact history. Entity = the first 8 bytes of the pactId, big-endian. A tx is posted when
   it has a pactId: an exec whose output `continuation.pactId` is set (it starts a pact) and
   every `cont` step (`payload.cont.pactId` of the cmd, else the output's). Readers verify
-  the full pactId on the record. The hot `Defpacts` table is still written by the tail but
-  has no reader.
+  the full pactId on the record. The hot `Defpacts` table is deprecated (T-5): the tail no longer
+  writes it, nothing reads it, and rows left by older versions stay until an undo of their
+  block removes them.
 - **Versions.** Hot `Meta format_version` 2; `manifest.json` and every `range.toml`
   `format_version` 2. Posting files keep their own version byte 1 and records keep 1.
 - **MDBX** opens with 64 named-database slots (`max_dbs`; 32 before), room for later
@@ -147,6 +148,10 @@ A backfill range commits in this order:
 
 The manifest is the source of truth. On start, backfill:
 
+- finishes a committed `rebuild-range` swap (a `segments/rebuild.<start>/` with its journal
+  `rebuild.json`: every file is hard-linked to `.swap-<name>` and renamed over the old one,
+  then the journal and the dir are removed) and removes an uncommitted rebuild dir; readers
+  take a committed rebuild's files from that dir until the journal is gone;
 - deletes everything under `etl/` (raw spools and posting runs are never reused);
 - deletes every file and temp directory in `segments/` that the manifest does not list;
 - when the hot store's `frozen_frontier`/`next_txnum` or `Headers` checkpoints differ from

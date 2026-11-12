@@ -374,3 +374,182 @@ pub fn assert_same_state_modulo_ids(a: &HotStore, b: &HotStore, what: &str) {
         "{what}: rendered blocks"
     );
 }
+/// `header` with `chainId` set (blocks of a multi-chain graph).
+pub fn chain_header(pool: &[Value], p: Place, chain: u8) -> Value {
+    let mut h = header(pool, p);
+    h["chainId"] = Value::from(chain);
+    h
+}
+
+/// A minimal chainweb stand-in (`/info`, `/cut`, `header/branch`, `payload/outputs/batch`)
+/// holding per chain the blocks `places` (ascending, linear), headers from [`chain_header`].
+pub fn fake_node(pool: &[Value], chains: &[(u8, Vec<Place>)]) -> String {
+    use serde_json::json;
+    use std::io::Write;
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let headers: BTreeMap<u8, Vec<Value>> = chains
+        .iter()
+        .map(|(c, ps)| (*c, ps.iter().map(|p| chain_header(pool, *p, *c)).collect()))
+        .collect();
+    let payloads: BTreeMap<String, Value> = chains
+        .iter()
+        .flat_map(|(_, ps)| ps.iter())
+        .map(|p| {
+            let v = pool[p.pool]["payload"].clone();
+            (v["payloadHash"].as_str().unwrap().to_owned(), v)
+        })
+        .collect();
+    let ids: Vec<u8> = headers.keys().copied().collect();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 8192];
+            let (head, body) = loop {
+                let n = s.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break (String::new(), Vec::new());
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..i]).into_owned();
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= i + 4 + len {
+                    break (head, buf[i + 4..i + 4 + len].to_vec());
+                }
+            };
+            let line = head.lines().next().unwrap_or("").to_owned();
+            let path = line.split(' ').nth(1).unwrap_or("").to_owned();
+            let (route, query) = path.split_once('?').unwrap_or((&path, ""));
+            let q: BTreeMap<&str, u64> = query
+                .split('&')
+                .filter_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    Some((k, v.parse().ok()?))
+                })
+                .collect();
+            let chain: Option<u8> = route
+                .split("/chain/")
+                .nth(1)
+                .and_then(|r| r.split('/').next()?.parse().ok());
+            let resp = if route.ends_with("/info") {
+                let g: Vec<Value> = ids.iter().map(|c| json!([c, []])).collect();
+                json!({"nodeVersion": "mainnet01", "nodePackageVersion": "test",
+                       "nodeGraphHistory": [[0, g]]})
+            } else if route.ends_with("/cut") {
+                let hashes: serde_json::Map<String, Value> = headers
+                    .iter()
+                    .map(|(c, hs)| {
+                        let t = hs.last().unwrap();
+                        (
+                            c.to_string(),
+                            json!({"height": t["height"], "hash": t["hash"]}),
+                        )
+                    })
+                    .collect();
+                let tip = headers[&0].last().unwrap();
+                json!({"hashes": hashes,
+                       "height": tip["height"], "weight": "AAAA", "origin": null,
+                       "instance": "mainnet01", "id": "x"})
+            } else if route.ends_with("/header/branch") {
+                let (lo, hi) = (
+                    q.get("minheight").copied().unwrap_or(0),
+                    q.get("maxheight").copied().unwrap_or(u64::MAX),
+                );
+                let items: Vec<&Value> = chain
+                    .and_then(|c| headers.get(&c))
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .filter(|h| (lo..=hi).contains(&h["height"].as_u64().unwrap()))
+                    .collect();
+                json!({"items": items, "limit": items.len(), "next": null})
+            } else if route.ends_with("/payload/outputs/batch") {
+                let want: Vec<String> = serde_json::from_slice(&body).unwrap_or_default();
+                Value::Array(
+                    want.iter()
+                        .filter_map(|h| payloads.get(h).cloned())
+                        .collect(),
+                )
+            } else {
+                Value::Null
+            };
+            let (status, b) = if resp.is_null() {
+                ("404 Not Found", b"{}".to_vec())
+            } else {
+                ("200 OK", serde_json::to_vec(&resp).unwrap())
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                b.len()
+            );
+            let _ = s.write_all(&b);
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Per chain, `heights` pool blocks from height 0 (pool index `h × chains + chain`), branch
+/// id = chain so the hashes differ across chains.
+pub fn places_for(chains: &[u8], heights: u32) -> Vec<(u8, Vec<Place>)> {
+    chains
+        .iter()
+        .map(|&c| {
+            let ps = (0..heights)
+                .map(|h| Place {
+                    pool: (h as usize * chains.len() + c as usize) % POOL_LEN,
+                    height: h,
+                    br: c,
+                    parent_br: c,
+                })
+                .collect();
+            (c, ps)
+        })
+        .collect()
+}
+
+/// Commit `places` through the tail one block per commit, per height in chain `order`
+/// (the tail commits chains in arrival order), then freeze every step it can (step 2).
+pub fn freeze_store(
+    dir: &Path,
+    pool: &[Value],
+    base: &str,
+    places: &[(u8, Vec<Place>)],
+    order: &[u8],
+) -> kdx_ingest::Ctx {
+    let chains: Vec<u8> = places.iter().map(|(c, _)| *c).collect();
+    let c = ctx_full(dir, 2, 1000, 2, base, &chains);
+    for i in 0..places[0].1.len() {
+        for &ch in order {
+            let p = places.iter().find(|(x, _)| *x == ch).unwrap().1[i];
+            let hd = chain_header(pool, p, ch);
+            let b =
+                kdx_ingest::pipeline::prepare_value(ch, p.height, &hd, &pool[p.pool]["payload"])
+                    .unwrap();
+            kdx_ingest::apply::commit(
+                &c,
+                &[kdx_ingest::apply::Batch {
+                    chain: ch,
+                    fork: None,
+                    blocks: vec![b],
+                    halted: false,
+                    halt_reason: "",
+                }],
+            )
+            .unwrap();
+        }
+    }
+    while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+    c
+}

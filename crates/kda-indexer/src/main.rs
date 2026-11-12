@@ -78,6 +78,26 @@ enum Command {
         #[arg(long, default_value = "auto", hide = true)]
         header_mode: kdx_ingest::HeaderMode,
     },
+    /// Refetch one frozen range or step from the node and swap it in crash-safely (repair
+    /// or deep-reorg recovery). Compares record counts and the content digest, logs the
+    /// blake3 of every stored and rebuilt file. Takes the data dir lock.
+    RebuildRange {
+        /// Start height of the 100k range to rebuild.
+        #[arg(long, conflicts_with = "step", required_unless_present = "step")]
+        range: Option<u32>,
+        /// Start height of the step to rebuild.
+        #[arg(long)]
+        step: Option<u32>,
+        /// Build and compare, then remove the rebuilt files (no swap).
+        #[arg(long)]
+        dry_run: bool,
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Canonical header walk: auto, cut or anchor.
+        #[arg(long, default_value = "auto", hide = true)]
+        header_mode: kdx_ingest::HeaderMode,
+    },
     /// Index the network: backfill what is final, then follow the tip and freeze (until
     /// SIGTERM/SIGINT).
     Run {
@@ -315,6 +335,18 @@ enum SegmentsAction {
         #[arg(long)]
         deep: bool,
     },
+    /// Digest of each range or step. `--content`: blake3 over the decoded records in
+    /// (height, chain, tx index) order with names resolved (equal for the same blocks
+    /// whatever the dictionary ids or compression); otherwise blake3 of the files.
+    Digest {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        content: bool,
+        /// Only the entry starting at this height.
+        #[arg(long)]
+        start: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -336,6 +368,10 @@ enum InspectWhat {
         module: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Oldest first: walk the frozen lists from the lowest range up, lazily (stops at
+        /// `--limit`), then the hot rows.
+        #[arg(long)]
+        oldest: bool,
     },
     /// Dev: loop read views (postings walk, request-key lookups, cursors) for N seconds
     /// beside a running indexer; reports duplicates, order breaks, lookup misses, errors.
@@ -439,6 +475,28 @@ async fn main() -> anyhow::Result<()> {
                     index,
                     merkle,
                 },
+            )
+            .await
+        }
+        Command::RebuildRange {
+            range,
+            step,
+            dry_run,
+            data_dir,
+            header_mode,
+        } => {
+            let (kind, start) = match (range, step) {
+                (Some(s), _) => (kdx_segment::RangeKind::Range, s),
+                (None, Some(s)) => (kdx_segment::RangeKind::Step, s),
+                (None, None) => anyhow::bail!("--range or --step is required"),
+            };
+            kda_indexer::cmd::rebuild::run(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                kind,
+                start,
+                header_mode,
+                dry_run,
             )
             .await
         }
@@ -599,6 +657,16 @@ async fn main() -> anyhow::Result<()> {
                 data_dir.as_deref().unwrap_or(&cfg.data_dir),
                 deep,
             ),
+            SegmentsAction::Digest {
+                data_dir,
+                content,
+                start,
+            } => kda_indexer::cmd::segments::digest(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                content,
+                start,
+            ),
         },
         Command::Inspect { data_dir, what } => {
             use kda_indexer::cmd::inspect;
@@ -618,7 +686,8 @@ async fn main() -> anyhow::Result<()> {
                     name,
                     module,
                     limit,
-                } => inspect::postings(&s, &family, &name, module.as_deref(), limit),
+                    oldest,
+                } => inspect::postings(&s, &family, &name, module.as_deref(), limit, oldest),
                 InspectWhat::Sample {
                     count,
                     compare_node,

@@ -324,7 +324,8 @@ fn snapshot_into(
                 if have.contains(&f) {
                     continue;
                 }
-                match place(&src_seg.join(&f), &out_seg.join(&f), a.copy) {
+                let src = kdx_segment::swap::resolve(&src_seg, &f.to_string_lossy());
+                match place(&src, &out_seg.join(&f), a.copy) {
                     Ok(n) => {
                         rep.segment_bytes += n;
                         have.insert(f);

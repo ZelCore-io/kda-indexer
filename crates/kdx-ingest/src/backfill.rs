@@ -143,6 +143,9 @@ pub fn remove_unlisted(ctx: &Ctx, m: &Manifest) -> Result<Vec<String>> {
 /// list, reset the hot frontier to the manifest's, re-derive `Headers` checkpoints.
 pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
     let net = &ctx.opts.network;
+    for l in kdx_segment::swap::recover(&ctx.segdir)? {
+        tracing::warn!("resume: {l}");
+    }
     recover_merkle_spools(ctx);
     etl::clear_dir(&ctx.etl)?;
     let m = Manifest::load(&ctx.segdir)?.unwrap_or_else(|| Manifest::new(net));
@@ -269,14 +272,14 @@ fn rss_over_cap(cap_mb: u64, at: &str) -> bool {
     }
 }
 
-struct Fetched {
-    coll: Collector,
+pub(crate) struct Fetched {
+    pub(crate) coll: Collector,
     blocks: u64,
     secs: f64,
 }
 
 /// Fetch every canonical block of `u` into a raw spool under `etl/raw-<start>`.
-async fn fetch_unit(
+pub(crate) async fn fetch_unit(
     ctx: Arc<Ctx>,
     walker: Arc<Walker>,
     u: Unit,

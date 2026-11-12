@@ -98,13 +98,11 @@ fn a_reorg_equals_the_linear_apply_of_the_winner_and_marks_both_branches() {
     reorg_cases(true);
 }
 
-/// The general case, compared byte for byte. Names that only the losing branch interned
-/// keep their ids (by design, review M1), so every new name of the winner gets a later id
-/// than in a linear apply: the hot rows (and the step files frozen from them) differ in
-/// bytes, not in content.
+/// 9B-1, as ruled (R-P5P9-29): names that only the losing branch interned keep their ids
+/// (by design, review M1), so the winner's new names get later ids than in a linear apply
+/// and the hot bytes differ; the name-resolved digest (`hot stats --digest`) is equal.
 #[test]
-#[ignore = "finding 9B-1: after a reorg whose losing branch interned new names, hot rows and frozen step bytes differ from a linear replay (dictionary ids shift); content is equal (see the modulo-ids test)"]
-fn a_reorg_with_new_names_on_the_loser_is_byte_equal_to_the_linear_apply() {
+fn a_reorg_with_new_names_on_the_loser_is_content_equal_to_the_linear_apply() {
     let pool = pool();
     let mut ids: Vec<usize> = (0..POOL_LEN).collect();
     Rng(7).shuffle(&mut ids);
@@ -118,7 +116,18 @@ fn a_reorg_with_new_names_on_the_loser_is_byte_equal_to_the_linear_apply() {
     let l = ctx(dl.path(), 100, 1000, 100);
     apply_linear(&l, &pool, &branch(pre, 0, 0, 0), 3);
     apply_linear(&l, &pool, &branch(win, 3, 2, 0), 4);
-    assert_same_state(&r.hot, &l.hot, "random loser");
+    let a = kdx_ingest::content::hot_digest(&r.hot.ro().unwrap()).unwrap();
+    let b = kdx_ingest::content::hot_digest(&l.hot.ro().unwrap()).unwrap();
+    for k in [
+        "records",
+        "TailPostings",
+        "TailRk",
+        "HeaderByHash",
+        "StageCheckpoint",
+    ] {
+        assert_eq!(a[k], b[k], "{k}");
+    }
+    assert_ne!(digest(&r.hot), digest(&l.hot), "the bytes do differ (ids)");
 }
 
 fn reorg_cases(general: bool) {
