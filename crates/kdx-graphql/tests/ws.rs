@@ -47,7 +47,8 @@ async fn server(settings: GraphqlSettings, rate_burst: u32) -> Server {
         v1txs_max_body_bytes: 8 << 20,
         rate_per_ip: 1,
         rate_burst,
-        trusted_proxies: Vec::new(),
+        // Loopback is the proxy: a test client names itself in `X-Forwarded-For`.
+        trusted_proxies: vec![kdx_api::limits::IpNet::parse("127.0.0.1/32").unwrap()],
         read_threads: 2,
         ready_max_lag: 10,
         max_event_lists: 64,
@@ -75,11 +76,20 @@ async fn server(settings: GraphqlSettings, rate_burst: u32) -> Server {
 }
 
 async fn connect(s: &Server, proto: &str) -> Result<Ws, u16> {
+    connect_as(s, proto, None).await
+}
+
+/// Connect as client `xff` (sent in `X-Forwarded-For`; loopback is a trusted proxy).
+async fn connect_as(s: &Server, proto: &str, xff: Option<&str>) -> Result<Ws, u16> {
     let mut req = format!("ws://{}/graphql", s.addr)
         .into_client_request()
         .unwrap();
     req.headers_mut()
         .insert("sec-websocket-protocol", proto.parse().unwrap());
+    if let Some(ip) = xff {
+        req.headers_mut()
+            .insert("x-forwarded-for", ip.parse().unwrap());
+    }
     match tokio_tungstenite::connect_async(req).await {
         Ok((ws, _)) => Ok(ws),
         Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
@@ -535,4 +545,92 @@ async fn fragment_bomb_over_the_socket_is_refused_fast() {
     )
     .await;
     assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+}
+
+/// Subscribe `ids` on `ws` (`newBlocks`, which waits for blocks and sends nothing).
+async fn subscribe_all(ws: &mut Ws, ids: std::ops::Range<u32>) {
+    for id in ids {
+        send(
+            ws,
+            json!({"id": id.to_string(), "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+        )
+        .await;
+    }
+}
+
+/// The next message is a `LIMIT` refusal of subscription `id`, for `reason`.
+async fn refused(ws: &mut Ws, id: &str, reason: &str) {
+    let e = recv(ws).await.unwrap();
+    assert_eq!(e["id"], id, "{e}");
+    let x = &e["payload"]["errors"][0]["extensions"];
+    assert_eq!(
+        (x["code"].as_str(), x["limit"].as_str()),
+        (Some("LIMIT"), Some(reason)),
+        "{e}"
+    );
+}
+
+/// M-2 with the default caps: one client holds at most `ws_subs_per_ip` (40) subscriptions
+/// over all its connections; the /64s of one IPv6 /48 share `ws_conns_per_48` (30)
+/// connections and `ws_subs_per_48` (120) subscriptions; other clients are still served.
+#[tokio::test]
+async fn per_client_and_per_48_caps() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let proto = "graphql-transport-ws";
+    // IPv4 client A: 20 + 20 subscriptions on two connections, the 41st on a third is
+    // refused.
+    let mut a = Vec::new();
+    for i in 0..3u32 {
+        let mut w = connect_as(&s, proto, Some("192.0.2.1")).await.unwrap();
+        init(&mut w).await;
+        if i < 2 {
+            subscribe_all(&mut w, i * 20..i * 20 + 20).await;
+        }
+        a.push(w);
+    }
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 40).await);
+    subscribe_all(&mut a[2], 40..41).await;
+    refused(&mut a[2], "40", "ws_subscriptions_per_client").await;
+    // A fresh client still subscribes.
+    let mut b = connect_as(&s, proto, Some("192.0.2.2")).await.unwrap();
+    init(&mut b).await;
+    subscribe_all(&mut b, 0..1).await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 41).await);
+    drop((a, b));
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 0).await);
+
+    // One /48: three /64s hold 40 subscriptions each on 2 connections; a fourth /64's
+    // first subscription is refused at the /48's 120.
+    let mut v6 = Vec::new();
+    for net in 1..=3u32 {
+        for c in 0..2u32 {
+            let ip = format!("2001:db8:1:{net}::1");
+            let mut w = connect_as(&s, proto, Some(&ip)).await.unwrap();
+            init(&mut w).await;
+            subscribe_all(&mut w, c * 20..c * 20 + 20).await;
+            v6.push(w);
+        }
+    }
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 120).await);
+    let mut d = connect_as(&s, proto, Some("2001:db8:1:4::1"))
+        .await
+        .unwrap();
+    init(&mut d).await;
+    subscribe_all(&mut d, 0..1).await;
+    refused(&mut d, "0", "ws_subscriptions_per_client").await;
+    // Connections: the /48 holds 7; 23 more from fresh /64s fill its 30, the next is 429.
+    for net in 5..28u32 {
+        let ip = format!("2001:db8:1:{net}::1");
+        v6.push(connect_as(&s, proto, Some(&ip)).await.unwrap());
+    }
+    assert_eq!(
+        connect_as(&s, proto, Some("2001:db8:1:99::1")).await.err(),
+        Some(429)
+    );
+    // Another /48 and an IPv4 client are not affected.
+    let mut e = connect_as(&s, proto, Some("2001:db8:2::1")).await.unwrap();
+    init(&mut e).await;
+    subscribe_all(&mut e, 0..1).await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 121).await);
+    assert!(connect_as(&s, proto, Some("192.0.2.3")).await.is_ok());
 }

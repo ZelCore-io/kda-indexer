@@ -272,8 +272,16 @@ pub struct GraphqlConfig {
     pub max_query_bytes: u32,
     pub max_variables_bytes: u32,
     pub ws_subs_per_conn: u32,
+    /// Subscriptions per client (IPv4 address or IPv6 /64) over all its connections.
+    pub ws_subs_per_ip: u32,
+    /// Subscriptions per IPv6 /48.
+    pub ws_subs_per_48: u32,
     pub ws_subs_max: u32,
     pub ws_conns_per_ip: u32,
+    /// Connections per IPv6 /48.
+    pub ws_conns_per_48: u32,
+    /// Connections per process.
+    pub ws_conns_max: u32,
     pub ws_init_secs: u64,
     pub ws_idle_secs: u64,
     pub ws_tx_wait_secs: u64,
@@ -297,8 +305,12 @@ impl Default for GraphqlConfig {
             max_query_bytes: 32768,
             max_variables_bytes: 65536,
             ws_subs_per_conn: 20,
+            ws_subs_per_ip: 40,
+            ws_subs_per_48: 120,
             ws_subs_max: 2000,
             ws_conns_per_ip: 10,
+            ws_conns_per_48: 30,
+            ws_conns_max: 1000,
             ws_init_secs: 10,
             ws_idle_secs: 600,
             ws_tx_wait_secs: 3600,
@@ -321,8 +333,12 @@ impl GraphqlConfig {
                 && self.introspection_depth > 0
                 && self.max_batch > 0
                 && self.ws_subs_per_conn > 0
+                && self.ws_subs_per_ip > 0
+                && self.ws_subs_per_48 > 0
                 && self.ws_subs_max > 0
                 && self.ws_conns_per_ip > 0
+                && self.ws_conns_per_48 > 0
+                && self.ws_conns_max > 0
                 && self.ws_init_secs > 0
                 && self.ws_idle_secs > 0
                 && self.ws_tx_wait_secs > 0,
@@ -363,8 +379,12 @@ impl GraphqlConfig {
             max_variables_bytes: self.max_variables_bytes as usize,
             max_body_bytes: kdx_graphql::MAX_BODY_BYTES,
             ws_subs_per_conn: self.ws_subs_per_conn as usize,
+            ws_subs_per_ip: self.ws_subs_per_ip as usize,
+            ws_subs_per_48: self.ws_subs_per_48 as usize,
             ws_subs_max: self.ws_subs_max as usize,
             ws_conns_per_ip: self.ws_conns_per_ip as usize,
+            ws_conns_per_48: self.ws_conns_per_48 as usize,
+            ws_conns_max: self.ws_conns_max as usize,
             ws_init: Duration::from_secs(self.ws_init_secs),
             ws_idle: Duration::from_secs(self.ws_idle_secs),
             ws_tx_wait: Duration::from_secs(self.ws_tx_wait_secs),

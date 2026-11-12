@@ -149,8 +149,11 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | Limit | Default | On refusal |
 |---|---|---|
 | connections per client IP (an IPv6 client counts by its /64) | `ws_conns_per_ip = 10` | upgrade answers 429 (`ws_connections_per_ip`) |
-| connections per process | `ws_subs_max = 2000` | upgrade answers 429 (`ws_connections`) |
+| connections per IPv6 /48 (all its /64s together) | `ws_conns_per_48 = 30` | upgrade answers 429 (`ws_connections_per_ip`) |
+| connections per process | `ws_conns_max = 1000` | upgrade answers 429 (`ws_connections`) |
 | subscriptions per connection | `ws_subs_per_conn = 20` | the subscription gets a `LIMIT` error (`ws_subscriptions_per_connection`), the connection stays |
+| subscriptions per client IP (IPv4 address or IPv6 /64), over all its connections | `ws_subs_per_ip = 40` | `LIMIT` error (`ws_subscriptions_per_client`), the connection stays |
+| subscriptions per IPv6 /48 | `ws_subs_per_48 = 120` | `LIMIT` error (`ws_subscriptions_per_client`), the connection stays |
 | subscriptions per process | `ws_subs_max = 2000` | `LIMIT` error (`ws_subscriptions`) |
 | `connection_init` | within `ws_init_secs = 10` | close 4408 (`ws_init_timeout`) |
 | no subscription open | for `ws_idle_secs = 600` | close 4000 (`ws_idle`) |
@@ -161,6 +164,11 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | a subscriber behind the feed | 1,024 feed items | one `INTERNAL` error; the subscription goes on from the feed's newest item |
 | a query or mutation over the socket | subscriptions only | `NOT_SUPPORTED` error, nothing runs (`ws_query`); send queries over HTTP |
 | one subscription message | the HTTP request deadline, shared by all its resolvers | `TIMEOUT` error for that message |
+
+The per-client and per-/48 caps keep a few clients from holding every process slot: a
+kadscan page holds a handful of subscriptions on one connection, so one client fits several
+open pages under `ws_subs_per_ip`. An IPv4 client is capped per address only; an IPv6 client
+by its /64 and, with the other /64s of its /48, by the /48 caps.
 
 Depth, complexity and the size limits apply to subscription documents as to queries. Every
 slot is released when its subscription or connection ends; `kdx_graphql_subscriptions` is the
