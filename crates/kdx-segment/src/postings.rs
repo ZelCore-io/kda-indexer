@@ -228,6 +228,28 @@ impl Iterator for PostingIter {
 }
 
 impl PostingIter {
+    /// The same entries, oldest (smallest) first. Delta and Elias-Fano lists stay lazy; a
+    /// Roaring list is decoded whole (one range's list) and walked backwards.
+    pub fn oldest_first(self) -> Box<dyn Iterator<Item = u64>> {
+        let base = self.base;
+        if matches!(self.inner, Inner::Roaring(_)) {
+            let mut v: Vec<u64> = self.collect();
+            v.reverse();
+            return Box::new(v.into_iter());
+        }
+        match self.inner {
+            Inner::Vec(v) => Box::new(v.into_iter().map(move |x| base + u64::from(x))),
+            Inner::Ef(ef, k) => Box::new(
+                (0..k)
+                    .map_while(move |i| ef.select(i))
+                    .map(move |x| base + x as u64),
+            ),
+            Inner::Roaring(_) => unreachable!("handled above"),
+        }
+    }
+}
+
+impl PostingIter {
     /// Entries left.
     pub fn len(&self) -> usize {
         self.len

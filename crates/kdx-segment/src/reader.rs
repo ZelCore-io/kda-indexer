@@ -33,7 +33,15 @@ pub struct RangeReader {
 
 impl RangeReader {
     pub fn open(dir: &Path, e: &RangeEntry, network: &str) -> Result<RangeReader> {
-        let f = |k: FileKind| dir.join(file_name(network, k, e.start, e.end));
+        match Self::open_once(dir, e, network) {
+            // A committed swap moved a file between `resolve` and `open`: resolve again.
+            Err(_) if crate::swap::pending(dir, e.start) => Self::open_once(dir, e, network),
+            r => r,
+        }
+    }
+
+    fn open_once(dir: &Path, e: &RangeEntry, network: &str) -> Result<RangeReader> {
+        let f = |k: FileKind| crate::swap::resolve(dir, &file_name(network, k, e.start, e.end));
         let info = RangeInfo::load(&f(FileKind::Range))?;
         if info.entry() != *e {
             bail!(

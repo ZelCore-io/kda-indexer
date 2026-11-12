@@ -4,6 +4,7 @@
 pub mod adj;
 pub mod blockfile;
 pub mod check;
+pub mod content;
 pub mod etl;
 pub mod files;
 pub mod keys;
@@ -11,6 +12,7 @@ pub mod manifest;
 pub mod phf;
 pub mod postings;
 pub mod reader;
+pub mod swap;
 pub mod writer;
 
 pub use check::{check, CheckReport};

@@ -74,7 +74,7 @@ pub fn check(dir: &Path, deep: bool) -> Result<CheckReport> {
         }
         expect = e.end_txnum();
         known.extend(range_file_names(&m.network, e.start, e.end));
-        let rt = dir.join(file_name(&m.network, FileKind::Range, e.start, e.end));
+        let rt = crate::swap::resolve(dir, &file_name(&m.network, FileKind::Range, e.start, e.end));
         let info = match RangeInfo::load(&rt) {
             Ok(i) => i,
             Err(err) => {
@@ -84,7 +84,7 @@ pub fn check(dir: &Path, deep: bool) -> Result<CheckReport> {
         };
         rep.files_ok += 1;
         for (name, st) in &info.files {
-            let p = dir.join(name);
+            let p = crate::swap::resolve(dir, name);
             match std::fs::metadata(&p) {
                 Err(_) => rep.errors.push(format!("missing {name}")),
                 Ok(md) if md.len() != st.bytes => rep.blake3_bad.push(format!("{name} (size)")),
