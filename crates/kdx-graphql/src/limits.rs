@@ -7,7 +7,9 @@
 //!
 //! Fragments are expanded where they are spread, so neither fragments, aliases nor inline
 //! fragments get around depth or complexity. Every operation of a document is checked (not
-//! only the one that runs). The walk itself is bounded by [`MAX_VISITS`].
+//! only the one that runs). The walk itself is bounded by [`MAX_VISITS`], and it runs on the
+//! freshly parsed document before any other walk of it (C-1), counting directives too
+//! ([`MAX_DIRECTIVES`] per field, fragment or spread).
 //!
 //! Cost model (field types from the schema, keyed on field names, never aliases): each field
 //! costs 1 (`__typename` 0, and a connection's `edges` and their `node` 0). A
@@ -22,14 +24,14 @@
 use std::sync::Arc;
 
 use async_graphql::extensions::{
-    Extension, ExtensionContext, ExtensionFactory, NextParseQuery, NextValidation,
+    Extension, ExtensionContext, ExtensionFactory, NextPrepareRequest, NextValidation,
 };
 use async_graphql::parser::types::{
     DocumentOperations, ExecutableDocument, Field, FragmentDefinition, OperationType, Selection,
     SelectionSet,
 };
 use async_graphql::registry::Registry;
-use async_graphql::{Name, ServerError, ServerResult, ValidationResult, Value, Variables};
+use async_graphql::{Name, Request, ServerError, ServerResult, ValidationResult, Value, Variables};
 
 use crate::error::limit;
 use crate::{Gql, GraphqlSettings};
@@ -150,6 +152,19 @@ struct Walk<'a> {
     intro_cost: u64,
 }
 
+/// The directive cap of one field, fragment or spread (C-1: counted here, inside the
+/// bounded walk, instead of async-graphql's `limit_directives`, whose walk expands every
+/// fragment spread with no visit cap).
+fn directives(n: usize, what: &str) -> Result<(), ServerError> {
+    if n > MAX_DIRECTIVES {
+        return Err(limit(
+            "directives",
+            format!("more than {MAX_DIRECTIVES} directives on `{what}`"),
+        ));
+    }
+    Ok(())
+}
+
 /// An argument as the analysis sees it.
 enum Arg {
     Absent,
@@ -211,6 +226,7 @@ impl<'a> Walk<'a> {
                 Selection::Field(f) => {
                     let f = &f.node;
                     let name = f.name.node.as_str();
+                    directives(f.directives.len(), name)?;
                     if name == "__typename" {
                         continue;
                     }
@@ -358,6 +374,7 @@ impl<'a> Walk<'a> {
                     }
                 }
                 Selection::InlineFragment(i) => {
+                    directives(i.node.directives.len(), "inline fragment")?;
                     let on = i
                         .node
                         .type_condition
@@ -370,6 +387,7 @@ impl<'a> Walk<'a> {
                 }
                 Selection::FragmentSpread(fs) => {
                     let name = fs.node.fragment_name.node.as_str();
+                    directives(fs.node.directives.len(), name)?;
                     // A cycle or an unknown fragment is left to validation, which refuses it.
                     if self.stack.contains(&name) {
                         continue;
@@ -377,6 +395,7 @@ impl<'a> Walk<'a> {
                     let Some(def) = self.frags.get(name) else {
                         continue;
                     };
+                    directives(def.node.directives.len(), name)?;
                     self.stack.push(name);
                     let on = Some(def.node.type_condition.node.on.node.as_str());
                     let (t, e) = self.set(&def.node.selection_set.node, depth, intro, on, wrap)?;
@@ -571,18 +590,23 @@ struct LimitsExt;
 
 #[async_graphql::async_trait::async_trait]
 impl Extension for LimitsExt {
-    async fn parse_query(
+    /// C-1: the sizes are checked, then the document is parsed here and analyzed (a walk
+    /// capped at [`MAX_VISITS`]) before anything else sees it. async-graphql's own parse step
+    /// (`check_recursive_depth`, and `limit_directives` when set) expands every fragment spread
+    /// with no memo and no visit cap, synchronously on a runtime worker; a fragment bomb of
+    /// 1.4 KB cost minutes of CPU there. The parsed document is kept on the request, so
+    /// that step reuses it and only ever walks a document this analysis has bounded.
+    async fn prepare_request(
         &self,
         ctx: &ExtensionContext<'_>,
-        query: &str,
-        variables: &Variables,
-        next: NextParseQuery<'_>,
-    ) -> ServerResult<ExecutableDocument> {
+        mut request: Request,
+        next: NextPrepareRequest<'_>,
+    ) -> ServerResult<Request> {
         let s = &ctx.data_unchecked::<Gql>().settings;
-        check_sizes(query, variables, s)?;
-        let doc = next.run(ctx, query, variables).await?;
-        analyze(&doc, variables, s)?;
-        Ok(doc)
+        check_sizes(&request.query, &request.variables, s)?;
+        let vars = request.variables.clone();
+        analyze(request.parsed_query()?, &vars, s)?;
+        next.run(ctx, request).await
     }
 }
 
