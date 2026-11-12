@@ -226,15 +226,23 @@ Alerts to set up in your own alerting:
 
 ## Snapshots and replicas
 
-`kda-indexer snapshot --out DIR` writes a consistent copy of a data dir. It only reads, takes
-no lock and can run beside the live `run` (and beside the freezer and merges). The copy is a
-data dir: `serve --data-dir DIR` answers on it, and `run` on it resumes the tail from the
-checkpoints it holds.
+`kda-indexer snapshot --out DIR` writes a consistent copy of a data dir. It only reads the
+source, does not take the data dir lock and can run beside the live `run` (and beside the
+freezer and merges); it holds the swap locks (`segments.swap.lock`, `search.swap.lock`) only
+while it places files. The copy is a data dir: `serve --data-dir DIR` answers on it, and `run`
+on it resumes the tail from the checkpoints it holds.
 
 ```sh
-kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
+sudo kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
     snapshot --out /opt/coins/data/kadena/kda-indexer/mainnet01.replica [--copy]
 ```
+
+- Run it as root. The volume root is owned by root (see [install.md](install.md)), so the
+  service user cannot create `DIR` there. Run as root, the command gives `DIR` and everything
+  it wrote to the owner of the source data dir when it is done (hard-linked segment files
+  already belong to it), and does the same for the two swap lock files if it created them. To
+  run it as the service user instead, first create the empty `DIR` as root and
+  `chown kda-indexer:kda-indexer` it.
 
 - `DIR` must not exist or be empty, and must not lie inside the source data dir. Without
   `--copy` it must be on the same filesystem as the source: the segment files are
@@ -268,9 +276,16 @@ kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
 A local replica:
 
 ```sh
-kda-indexer --config .../mainnet01.toml snapshot --out /opt/coins/data/kadena/kda-indexer/replica
-kda-indexer --config .../replica.toml serve        # replica.toml: data_dir of the snapshot, own api.* ports
+sudo kda-indexer --config .../mainnet01.toml snapshot --out /opt/coins/data/kadena/kda-indexer/replica
+sudo -u kda-indexer kda-indexer --config .../replica.toml segments check
+sudo -u kda-indexer kda-indexer --config .../replica.toml serve   # replica.toml: data_dir of the snapshot, own api.* ports
 ```
+
+Restoring a data dir (a snapshot, a copy on another host, a backup put back) always runs
+`segments check` on it before its first `serve` or `run`. The check verifies the manifest and
+the size and blake3 of every file each `range.toml` lists, so a copy that lost a file in
+transit, or paired the old and new files of a range that was swapped while it was taken, is
+refused before it answers anything. Start the service only when it passes.
 
 To seed another host, take a hard-linked snapshot on the source volume (no `--copy`: on the
 same volume `--copy` writes a second full copy of every segment file there; keep it for
@@ -303,7 +318,9 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search que
   smallest `fallback_min_len` whose projection is at most 30 GB. Set `[search] mode` and
   `fallback_min_len` from it.
 - `search rebuild` is read-only on `hot/` and `segments/`, so it can run beside the service
-  (as the service user, `nice -n 19 ionice -c3` on a busy host). It writes `search.new/`, then
+  (as the service user, `nice -n 19 ionice -c3` on a busy host). It holds
+  `segments.swap.lock` shared while it runs, so a `rebuild-range` waits for it (see
+  "Rebuilding a range or step"). It writes `search.new/`, then
   swaps it in; the running `run` notices the new `built_at` and reopens. One rebuild at a
   time (`search.lock`). It is a big write: run "Before any big write" first.
 - `[search] build_threads` and `heap_mb` set the rebuild's threads and tantivy writer heap;
@@ -468,12 +485,27 @@ Stop the service first: it takes the data dir lock.
 - `snapshot` and the swap exclude each other through `segments.swap.lock` in the data dir: a
   snapshot waits for a swap in progress, and a swap waits for a snapshot to place its
   segment files.
-- Size note (B10): two mainnet 100k `txs.seg` files are about 4.8 and 4.3 GB. They verify and
-  read correctly; a rebuild works per 10k step, so prefer `--step` over `--range`.
+- A `search rebuild` started by hand holds `segments.swap.lock` shared from start to end. A
+  `rebuild-range` started meanwhile waits at its commit step (before its dirty and stale
+  marks) until that search rebuild finishes, which can take hours on mainnet: run the two one
+  after the other. The background search rebuild of `run` does not take this lock (it cannot
+  overlap a `rebuild-range`, which needs the data dir lock).
+- `--step S` works only where the manifest still lists that 10k step. Once its steps are
+  merged into a 100k range, `rebuild-range` matches an entry by its exact start and kind, so
+  `--step` inside the range fails and `--range S` (the whole range) is the only option for
+  those heights. A range rebuild refetches 100,000 heights of 20 chains (2M blocks): at the
+  backfill rates of "Measured mainnet backfill" below, about 6 minutes in the sparse eras and
+  about 11 minutes in the dense 3.7M to 5.3M era, plus the digest compare. Until the swap, the
+  rebuilt files sit next to the old ones in `segments/rebuild.<S>/`: the largest mainnet
+  range has a 4.8 GB `txs.seg` (B10; the next is 4.3 GB), so check free space first.
 
 Compare stores with `segments digest --content` (per entry, plus a total that does not depend
 on the range/step split) and `hot stats --digest` (name-resolved: records, postings by name,
-dictionaries as name sets).
+dictionaries as name sets). Between two stores built separately, only these `hot stats
+--digest` lines must match: `records`, `TailPostings`, `TailRk`, `HeaderByHash`,
+`StageCheckpoint` and `Counters`. The `Undo` line hashes raw bytes that hold entity ids, which
+differ whenever the stores assigned ids in another order, and the `Dict*` name sets differ when
+one store interned names from blocks that were later orphaned.
 
 ## Measured mainnet backfill
 

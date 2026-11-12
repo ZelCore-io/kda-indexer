@@ -212,9 +212,12 @@ shared storage that is the allocation risk "Before any big write" in
 another local filesystem.
 
 ```sh
-sudo -u kda-indexer kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
+sudo kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
     snapshot --out /opt/coins/data/kadena/kda-indexer/snapshot-copy
 ```
+
+Run it as root: the volume root is root-owned, so the service user cannot create the
+directory there. The command gives the finished copy to the data dir's owner.
 
 On the new host, install the package as above, but leave the data dir empty, stop the unit,
 and copy the snapshot in (the directory must end up owned by `kda-indexer`):
@@ -223,8 +226,14 @@ and copy the snapshot in (the directory must end up owned by `kda-indexer`):
 rsync -aH --delete source-host:/opt/coins/data/kadena/kda-indexer/snapshot-copy/ \
     /opt/coins/data/kadena/kda-indexer/mainnet01/
 sudo chown -R kda-indexer:kda-indexer /opt/coins/data/kadena/kda-indexer/mainnet01
+sudo -u kda-indexer kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
+    segments check
 sudo systemctl start kda-indexer-mainnet01
 ```
+
+Start the unit only when `segments check` passes: it verifies the size and blake3 of every
+segment file the copy lists, so a file damaged or missed in transit is found before the
+service answers from it.
 
 The service resumes the tail from the checkpoints in the snapshot and reaches lag 0 in
 minutes to hours depending on the snapshot's age. Use `serve` instead of `run` for a replica
