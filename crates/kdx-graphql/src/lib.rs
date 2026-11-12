@@ -71,6 +71,15 @@ pub struct GraphqlSettings {
 /// Request body cap (plan GQ-9: body ≤ 128 KB).
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
 
+impl GraphqlSettings {
+    /// The clamp of the few lists that need more than `max_page`: the block lists (the home
+    /// list asks 120) and account balances (the assets tab asks 200); twice `max_page`,
+    /// 200 by default (R-P5P9-20). The per-item cost floor still bounds them.
+    pub fn wide_page(&self) -> usize {
+        self.max_page.saturating_mul(2)
+    }
+}
+
 impl Default for GraphqlSettings {
     fn default() -> Self {
         GraphqlSettings {

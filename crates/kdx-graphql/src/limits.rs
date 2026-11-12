@@ -57,6 +57,15 @@ const PAGED: &[&str] = &[
     "balance",
 ];
 
+/// Lists that clamp at `wide_page` instead of `max_page`: the block lists and account
+/// balances (R-P5P9-20).
+const WIDE: &[&str] = &[
+    "blocksFromDepth",
+    "blocksFromHeight",
+    "completedBlockHeights",
+    "balance",
+];
+
 /// Deferred `totalCount`s (count walks) one operation may run, outer multipliers included.
 pub const MAX_COUNTS: u64 = 2;
 
@@ -407,17 +416,23 @@ impl<'a> Walk<'a> {
 
     fn multiplier(&self, f: &'a Field) -> u64 {
         let s = self.s;
+        // The wide lists clamp at `wide_page` (R-P5P9-20), everything else at `max_page`.
+        let name = f.name.node.as_str();
+        let cap = if WIDE.contains(&name) {
+            s.wide_page()
+        } else {
+            s.max_page
+        };
         let page = |n: Option<i64>| match n {
-            Some(n) => n.clamp(0, s.max_page as i64) as u64,
-            None => s.default_page.min(s.max_page) as u64,
+            Some(n) => n.clamp(0, cap as i64) as u64,
+            None => s.default_page.min(cap) as u64,
         };
         let (fa, la) = (self.arg(f, "first"), self.arg(f, "last"));
         if matches!(fa, Arg::Unbound) || matches!(la, Arg::Unbound) {
-            return s.max_page as u64;
+            return cap as u64;
         }
         let first = fa.val().and_then(Self::int);
         let last = la.val().and_then(Self::int);
-        let name = f.name.node.as_str();
         if first.is_some() || last.is_some() {
             return page(first.max(last));
         }
@@ -711,6 +726,30 @@ mod tests {
     }
 
     #[test]
+    fn wide_lists_cost_up_to_200_and_the_rest_100() {
+        let c = |q: &str| cost(q, serde_json::json!({})).unwrap().complexity;
+        // Block lists and balances: 200 items (+1 for the field itself).
+        assert_eq!(
+            c("{ blocksFromDepth(minimumDepth: 0, first: 500) { edges { node { hash } } } }"),
+            201
+        );
+        assert_eq!(
+            c("{ blocksFromHeight(startHeight: 0, first: 120) { edges { node { hash } } } }"),
+            121
+        );
+        assert_eq!(
+            c("{ balance(accountName: \"a\", first: 200) { edges { node { balance } } } }"),
+            201
+        );
+        // Everything else stays at 100.
+        assert_eq!(
+            c("{ transactions(first: 200) { edges { node { hash } } } }"),
+            101
+        );
+        assert_eq!(c("{ blocksFromDepth(minimumDepth: 0, first: 5) { edges { node { transactions(first: 200) { edges { node { hash } } } } } } }"), 1 + 5 * 101);
+    }
+
+    #[test]
     fn connections_multiply_their_edges_only() {
         let c = |q: &str| cost(q, serde_json::json!({})).unwrap().complexity;
         // 1 (transactions) + 100 (a list's totalCount walk) + 2 (pageInfo) + 100 x 1 (hash).
@@ -764,20 +803,20 @@ mod tests {
             cost(&q(19), serde_json::json!({})).unwrap().complexity,
             1901
         );
-        // A variable page size counts like a literal; 1000 is clamped to 100.
+        // A variable page size counts like a literal; 1000 is clamped to 200 on a block list.
         let qv = format!(
             "query($n: Int) {{ blocksFromHeight(startHeight: 0, first: $n) {{ edges {{ node {{ {} }} }} }} }}",
-            block_fields(19)
+            block_fields(9)
         );
         assert_eq!(
             cost(&qv, serde_json::json!({"n": 1000}))
                 .unwrap()
                 .complexity,
-            1901
+            1801
         );
         assert_eq!(
             cost(&qv, serde_json::json!({"n": 1})).unwrap().complexity,
-            20
+            10
         );
         // Omitted: the default page (20).
         let qd = "{ transactions(blockHash: \"x\") { edges { node { hash } } } }";

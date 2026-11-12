@@ -35,7 +35,9 @@ Differences from Kadena graph:
   transaction that is not indexed is `null`.
 - Page sizes: the schema text says 500 by default. Here a connection returns 20 items when
   `first`/`last` are omitted, and larger values are clamped to 100 (not refused);
-  `pageInfo.hasNextPage` stays correct.
+  `pageInfo.hasNextPage` stays correct. The block lists (`blocksFromHeight`, `blocksFromDepth`,
+  `completedBlockHeights`) and account balances (`balance`) clamp at 200 (twice `max_page`):
+  kadscan's home list asks for 120 blocks and its assets tab for 200 balances.
 - The schema has no "as of height" field, so GraphQL answers do not carry one (the native API
   does).
 - Fields not served yet answer `NOT_SUPPORTED` with the rest of the operation intact.
@@ -69,7 +71,7 @@ All in `[graphql]` (defaults shown). A refusal answers a GraphQL error with
 | query text | `max_query_bytes = 32768` | `query_size` |
 | variables (JSON) | `max_variables_bytes = 65536` | `variables_size` |
 | request body | 131072 bytes (HTTP 413) | `body_size` |
-| page size | `default_page = 20`, `max_page = 100` (clamped) | — |
+| page size | `default_page = 20`, `max_page = 100` (clamped); block lists and `balance` clamp at `2 × max_page` | — |
 | request deadline | `api.deadline_ms` (5 s), shared by a batch | `TIMEOUT` code |
 
 Rate: a request takes one token of the per-IP rate limit (`api.rate_per_ip`); a batch of N
@@ -92,6 +94,7 @@ document is checked, not only the one that runs.
 
 Complexity: each field costs 1 (`__typename` 0). A field that returns a page multiplies the
 cost of its selection by the page size it returns (`first`/`last` clamped to `max_page`, or
+`2 × max_page` on the block lists and `balance`, or
 `default_page` when omitted; this applies to `events`, `transactions`, `transfers`,
 `blocksFromHeight`, `blocksFromDepth`, `completedBlockHeights`, `transactionsByPublicKey`).
 `nodes(ids)` multiplies by the number of ids, per-chain account lists by the number of chains
@@ -101,6 +104,13 @@ cost of its selection by the page size it returns (`first`/`last` clamped to `ma
 
 A page size bound to a variable is costed at the variable's value, else at its default in the
 operation, else (no value, no default) at `max_page`, never at `default_page`.
+
+The walker fails closed (SR7-3): a `totalCount` is cheap only under the connection types on its
+cheap list (a block's or tx's own rows, block ranges, account transfers, balances). Under any
+other connection, or under a parent the walker cannot resolve (an interface or unknown type
+condition, a fragment on one), it is a deferred count walk costing `max_page` and counting
+toward the two per operation. A field the walker cannot resolve costs the page maximum with
+its subtree priced per item.
 
 Introspection (`__schema`, `__type`) is counted on its own budget of 100,000 per operation
 (`extensions.limit = "introspection_complexity"`): its list fields multiply their selection by

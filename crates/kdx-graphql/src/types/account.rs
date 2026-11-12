@@ -632,7 +632,9 @@ pub async fn query_balance(
     if (first.is_some() && before.is_some()) || (last.is_some() && after.is_some()) {
         return Err(bad_input("after goes with first, before with last"));
     }
-    let probe = PageArgs::new(None, None, first, last).parse(&g.settings)?;
+    let probe = PageArgs::new(None, None, first, last)
+        .wide()
+        .parse(&g.settings)?;
     let dir = if last.is_some() || (first.is_none() && before.is_some()) {
         Dir::Backward
     } else {
