@@ -296,6 +296,16 @@ pub fn walk_blocks(
 ) -> ApiResult<Vec<Arc<BlockRecord>>> {
     let want = page.n + 1;
     let mut out = Vec::new();
+    // Nothing is stored below the store floor: start there, as `totalCount` does (M7).
+    let floor = u64::from(kdx_api::compat::store_floor(view));
+    let set = &BlockSet {
+        chains: set
+            .chains
+            .iter()
+            .filter(|c| c.2 >= floor)
+            .map(|&(c, lo, hi)| (c, lo.max(floor), hi))
+            .collect(),
+    };
     let Some((lo, hi)) = set.bounds() else {
         return Ok(out);
     };
@@ -575,5 +585,40 @@ mod tests {
         let ids = vec!["3".to_string(), "1".into(), "3".into()];
         assert_eq!(chain_set(Some(&ids)).unwrap(), vec![1, 3]);
         assert!(chain_set(Some(&["x".to_string()])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::testutil;
+
+    /// M7: a walk from genesis on a partial store starts at the store floor instead of
+    /// probing every empty height below it until the deadline.
+    #[tokio::test]
+    async fn block_walks_start_at_the_store_floor() {
+        let f = testutil::store();
+        let top: u64 = 40_000_000;
+        f.set_floor(top as u32);
+        f.apply(0, top, 0);
+        f.apply(0, top + 1, 0);
+        let set = BlockSet {
+            chains: vec![(0, 0, top + 1)],
+        };
+        let page = Page {
+            dir: Dir::Backward,
+            n: 5,
+            cursor: None,
+        };
+        let t = Instant::now();
+        let got =
+            f.st.read(move |view| walk_blocks(view, &set, &page))
+                .await
+                .expect("the walk ends before the deadline");
+        let hs: Vec<u64> = got.iter().map(|b| b.height).collect();
+        assert_eq!(hs, [top, top + 1]);
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 }

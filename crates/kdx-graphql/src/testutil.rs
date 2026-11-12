@@ -90,6 +90,13 @@ impl Fixture {
         w.commit().unwrap();
     }
 
+    /// Start the store at `height` (a partial store: nothing below it).
+    pub fn set_floor(&self, height: u32) {
+        let mut w = self.hot.rw().unwrap();
+        w.set_frozen_frontier(height).unwrap();
+        w.commit().unwrap();
+    }
+
     /// Undo every block of `chain` above `height` (a reorg's rollback).
     pub fn unwind(&self, chain: u8, height: u32) {
         let mut w = self.hot.rw().unwrap();
