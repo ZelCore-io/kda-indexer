@@ -132,45 +132,85 @@ impl Query {
 
     async fn fungible_account(
         &self,
+        ctx: &Context<'_>,
         account_name: String,
         #[graphql(default_with = "coin()")] fungible_name: Option<String>,
     ) -> Result<Option<FungibleAccount>> {
-        unserved!("Query.fungibleAccount")
+        crate::types::account::fungible_account(ctx, &account_name, fungible_name.as_deref()).await
     }
 
     async fn fungible_accounts_by_public_key(
         &self,
+        ctx: &Context<'_>,
         fungible_name: Option<String>,
         public_key: String,
     ) -> Result<Vec<FungibleAccount>> {
-        unserved!("Query.fungibleAccountsByPublicKey")
+        crate::types::account::accounts_by_public_key(
+            ctx,
+            &public_key,
+            fungible_name.as_deref(),
+            None,
+        )
+        .await
     }
 
     async fn fungible_chain_account(
         &self,
+        ctx: &Context<'_>,
         account_name: String,
         chain_id: String,
         #[graphql(default_with = "coin()")] fungible_name: Option<String>,
     ) -> Result<Option<FungibleChainAccount>> {
-        unserved!("Query.fungibleChainAccount")
+        Ok(crate::types::account::fungible_chain_accounts(
+            ctx,
+            &account_name,
+            &[chain_id],
+            fungible_name.as_deref(),
+        )
+        .await?
+        .and_then(|v| v.into_iter().next()))
     }
 
     async fn fungible_chain_accounts(
         &self,
+        ctx: &Context<'_>,
         account_name: String,
         #[graphql(default_with = "default_chain_ids()")] chain_ids: Option<Vec<String>>,
         #[graphql(default_with = "coin()")] fungible_name: Option<String>,
     ) -> Result<Option<Vec<FungibleChainAccount>>> {
-        unserved!("Query.fungibleChainAccounts")
+        crate::types::account::fungible_chain_accounts(
+            ctx,
+            &account_name,
+            &chain_ids.unwrap_or_default(),
+            fungible_name.as_deref(),
+        )
+        .await
     }
 
     async fn fungible_chain_accounts_by_public_key(
         &self,
+        ctx: &Context<'_>,
         chain_id: String,
         fungible_name: Option<String>,
         public_key: String,
     ) -> Result<Vec<FungibleChainAccount>> {
-        unserved!("Query.fungibleChainAccountsByPublicKey")
+        Ok(crate::types::account::accounts_by_public_key(
+            ctx,
+            &public_key,
+            fungible_name.as_deref(),
+            Some(crate::txlist::chain_arg(&chain_id)?),
+        )
+        .await?
+        .into_iter()
+        .flat_map(|a| {
+            let (account, module) = (a.account, a.module);
+            a.rows.into_iter().map(move |row| FungibleChainAccount {
+                account: account.clone(),
+                module: module.clone(),
+                row,
+            })
+        })
+        .collect())
     }
 
     /// Not served (Q9): the indexer does not run Pact.
@@ -200,17 +240,31 @@ impl Query {
 
     async fn non_fungible_account(
         &self,
+        ctx: &Context<'_>,
         account_name: String,
     ) -> Result<Option<NonFungibleAccount>> {
-        unserved!("Query.nonFungibleAccount")
+        Ok(crate::types::nft::non_fungible(ctx, &account_name, None)
+            .await?
+            .map(|(account, items)| NonFungibleAccount { account, items }))
     }
 
     async fn non_fungible_chain_account(
         &self,
+        ctx: &Context<'_>,
         account_name: String,
         chain_id: String,
     ) -> Result<Option<NonFungibleChainAccount>> {
-        unserved!("Query.nonFungibleChainAccount")
+        Ok(crate::types::nft::non_fungible(
+            ctx,
+            &account_name,
+            Some(crate::txlist::chain_arg(&chain_id)?),
+        )
+        .await?
+        .map(|(account, items)| NonFungibleChainAccount {
+            account,
+            chain: crate::txlist::chain_arg(&chain_id).unwrap_or(0),
+            items,
+        }))
     }
 
     /// Not served (Q9): arbitrary Pact code is never run for clients.

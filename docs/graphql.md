@@ -117,6 +117,62 @@ pages on another, and a cursor whose block was reorged away is refused.
 | `DateTime` | `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC, milliseconds) |
 | `Decimal` | a JSON number with the exact decimal digits (no float rounding) |
 
+## Transactions, events and transfers
+
+- **Lists.** `transactions`, `transactionsByPublicKey`, `transfers`, `events` and the account
+  connections walk the same posting lists as the native API. Order: newest first by
+  (height, chain, position in the block); rows of one tx (events, transfers) in event order.
+  `first`/`after` pages walk down from the newest row; `last`/`before` pages first collect
+  the keys between the cursor and the newest row (keys only, at most 200,000, else `LIMIT`).
+  Every walk checks the request deadline every 64 keys and answers `TIMEOUT` past it.
+- **Cursors** are the native API's tokens (tx key, row position and a fingerprint of the
+  row's block): portable between instances, refused with `BAD_USER_INPUT` after a reorg of
+  that block.
+- **Coinbase.** Coinbase txs are not `Transaction`s (as in Kadena graph): transaction lists
+  leave them out, and `Event.transaction`/`Transfer.transaction` of a coinbase row is `null`.
+  Their events and transfers are listed, with request key `<coinbase>` and order index 0
+  (the compat rendering).
+- **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` with
+  `fungibleName` (txs with a transfer of that token on the account's side), `accountName`
+  alone (every tx touching the account), `fungibleName` alone (txs with a `<token>.TRANSFER`
+  event); with none of them, every user tx from the tip down (at most 20,000 heights), as
+  a latest-transactions list asks. `chainId`, `minHeight`, `maxHeight` and
+  `minimumDepth` (height ≤ the chain's tip − depth) filter any source.
+- **`transfers`** use the same sources; rows are the tx's transfers of `fungibleName` with
+  `accountName` on either side when given. `crossChainTransfer` is the other half of a
+  cross-chain transfer (the `cont` step of the pact, or the tx that started it), `null`
+  while that half is not indexed.
+- **`events`**: `qualifiedEventName` is required. `parametersFilter` accepts only
+  `{"array_starts_with": <value or array>}` (the event's first parameters equal the value or
+  the array's values); anything else is `UNSUPPORTED_FILTER`.
+- **`transaction(requestKey)`**: `null` when not indexed; a request key stored in several
+  genesis blocks answers `BAD_USER_INPUT` unless `blockHash` picks one copy.
+- **`totalCount`** is computed only when selected: a count walk of at most 10,000 rows
+  within half of the remaining deadline (`COUNT_TIMEOUT` past it). Larger lists show 10,000.
+  `totalCount` is non-null, so a `COUNT_TIMEOUT` nulls its connection.
+- **Text forms.** `goodResult`, `badResult`, `continuation`, `metadata`, `Event.parameters`,
+  payload `data` and capability `args` are compact JSON text of the node's values (numbers
+  keep their exact text). `Transfer.amount` is the decimal of the event's amount parameter.
+
+## Accounts
+
+- `fungibleAccount`, `fungibleChainAccount(s)` and `…ByPublicKey` read the reconciled
+  balance rows (spec §3.9); resolvers never call the node. Stale rows are served; chains
+  without a row are absent from `chainAccounts`; with no row the account is `null`.
+- `totalBalance` is the exact decimal sum of the chain balances; `balance` is the stored
+  text as a float.
+- Guards: an inline keyset or a resolved keyset reference is a `KeysetGuard` (`raw` is the
+  stored guard), a user guard is a `UserGuard`, anything else a `RawGuard`.
+- `…ByPublicKey` lists at most 100 accounts, only rows whose guard holds the key, of `coin`
+  (the default) or of a module confirmed `fungible-v2` on that chain.
+- `FungibleAccount.transactions`: txs with a transfer of the token on the account's side;
+  `FungibleChainAccount.transactions`: txs on that chain the account sent (`meta.sender`),
+  as the schema says.
+- `nonFungibleAccount`/`nonFungibleChainAccount` list positive NFT holdings (at most
+  `max_page`); `version` is `v1` (`marmalade.ledger`), `v2` (`marmalade-v2.ledger`) or the
+  ledger name. `NonFungibleTokenBalance.info` and `.guard` are not stored and answer
+  `NOT_SUPPORTED`; `guard` is non-null, so that error nulls the account.
+
 ## Fields compared with the node, not an oracle
 
 Tip-relative answers change from second to second, so the comparison harness checks them
