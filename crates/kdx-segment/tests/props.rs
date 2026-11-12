@@ -105,7 +105,74 @@ props! {
 
 /// A range size and a few entities with sets of relative TxNums, shaped to hit the delta,
 /// Elias-Fano and Roaring (array, bitmap) encodings, in one or several 65536-containers.
+/// One case in five takes a mainnet-sized universe (`wide_lists`, m3).
 fn lists() -> impl Strategy<Value = (u32, BTreeMap<u64, BTreeSet<u32>>)> {
+    prop_oneof![4 => small_lists(), 1 => wide_lists()]
+}
+
+/// Mainnet ranges hold millions of txs (m3). 1M..2.2M: Roaring lists (more than `r / 32`
+/// entries) whose containers reach key 33, as strided sets (array containers) and dense runs
+/// near the top (bitmap/run containers); 4M..`u32::MAX / 2`: delta and Elias-Fano lists over
+/// a large universe, spread or packed near the top.
+fn wide_lists() -> impl Strategy<Value = (u32, BTreeMap<u64, BTreeSet<u32>>)> {
+    prop_oneof![1_000_000u32..2_200_000, 4_000_000u32..u32::MAX / 2].prop_flat_map(|r| {
+        let roaring = r < 4_000_000;
+        let shape = prop_oneof![
+            proptest::collection::btree_set(0..r, 0..17),
+            proptest::collection::btree_set(0..r, 17..2500),
+            proptest::collection::btree_set(r - r / 64..r, 17..2500),
+            (1u32..4000, 0u32..70_000).prop_map(move |(extra, gap)| {
+                let len = if roaring {
+                    r / 32 + extra
+                } else {
+                    3000 + extra
+                };
+                let end = r - gap.min(r - len);
+                (end - len..end).collect()
+            }),
+            (24u32..32, 0u32..1000).prop_map(move |(step, off)| {
+                if roaring {
+                    (off..r).step_by(step as usize).collect()
+                } else {
+                    (r - 2000 * step..r).step_by(step as usize).collect()
+                }
+            }),
+        ];
+        (
+            Just(r),
+            proptest::collection::btree_map(any::<u64>(), shape, 1..4),
+        )
+    })
+}
+
+/// m3: the wide generator does reach what it is for (fixed seed, 64 samples): Roaring lists
+/// with a container key above 2, and Elias-Fano lists in a universe over 4M.
+#[test]
+fn wide_lists_reach_high_roaring_containers_and_large_ef_universes() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::{Config, RngSeed, TestRunner};
+    let mut runner = TestRunner::new(Config {
+        rng_seed: RngSeed::Fixed(prop::seed_of("wide_lists")),
+        ..Config::default()
+    });
+    let (mut roaring_high, mut ef_large) = (0, 0);
+    for _ in 0..64 {
+        let (r, map) = wide_lists().new_tree(&mut runner).unwrap().current();
+        for set in map.values() {
+            match kdx_segment::postings::encoding_for(set.len(), r as u64) {
+                2 if set.last().is_some_and(|&v| v >> 16 > 2) => roaring_high += 1,
+                1 if r > 4_000_000 => ef_large += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        roaring_high > 0 && ef_large > 0,
+        "{roaring_high} {ef_large}"
+    );
+}
+
+fn small_lists() -> impl Strategy<Value = (u32, BTreeMap<u64, BTreeSet<u32>>)> {
     prop_oneof![64u32..3000, 66_000u32..140_000].prop_flat_map(|r| {
         let cap = |n: usize| (r as usize).min(n) + 1;
         let shape = prop_oneof![
@@ -168,15 +235,22 @@ props! {
             let it = pf.list(*e).unwrap();
             prop_assert_eq!(it.len(), want.len());
             prop_assert_eq!(it.collect::<Vec<_>>(), want);
+            // Oldest first (m5, `inspect postings --oldest`): ascending.
+            let asc: Vec<u64> = set.iter().map(|&v| base + v as u64).collect();
+            prop_assert_eq!(pf.list(*e).unwrap().oldest_first().collect::<Vec<_>>(), asc);
             // Any bound: the lazy walk equals the filtered full decode (R4), with and without
-            // a memo, and from the container edges.
+            // a memo, and from the container edges (the first two and the top one).
             let mut bs: Vec<u32> = bounds.iter().map(|b| b % (r + 2)).collect();
-            bs.extend([0, 65_535, 65_536, r.saturating_sub(1)]);
+            let top = (r >> 16) << 16;
+            bs.extend([0, 65_535, 65_536, r.saturating_sub(1), top, top.saturating_sub(1)]);
             for b in bs {
                 let want: Vec<u64> = set.range(..=b).rev().map(|&v| base + v as u64).collect();
                 let it = pf.list_le(*e, Some(b)).unwrap().unwrap();
                 prop_assert_eq!(it.len(), want.len());
                 prop_assert_eq!(it.collect::<Vec<_>>(), want.clone());
+                let asc: Vec<u64> = set.range(..=b).map(|&v| base + v as u64).collect();
+                let old = pf.list_le(*e, Some(b)).unwrap().unwrap().oldest_first();
+                prop_assert_eq!(old.collect::<Vec<_>>(), asc);
                 let m = pf.list_le_memo(*e, Some(b), Some((&memo, 7))).unwrap().unwrap();
                 prop_assert_eq!(m.collect::<Vec<_>>(), want);
             }
