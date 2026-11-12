@@ -1,0 +1,2 @@
+# kdx: oracle
+query QNonFungibleAccount($accountName: String!) { nonFungibleAccount(accountName: $accountName) { id accountName chainAccounts { id chainId accountName } } }

@@ -234,7 +234,9 @@ pub fn half_left(view: &View) -> Instant {
     now + view.deadline.saturating_duration_since(now) / 2
 }
 
-fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiResult<Page> {
+/// One `search` page (index path, else the bounded scan): also GraphQL's
+/// `transactionsByPactCode`.
+pub fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiResult<Page> {
     let empty = |truncated| Page {
         rows: Vec::new(),
         next: None,

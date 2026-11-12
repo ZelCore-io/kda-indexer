@@ -1,0 +1,2 @@
+# kdx: oracle
+query QNode($blockId: ID!) { node(id: $blockId) { __typename id ... on Block { hash height chainId } } }

@@ -29,7 +29,7 @@ cut_poll_secs = 10
 [api]
 native = "127.0.0.1:31361"     # internal only: loopback or a private address
 compat = "127.0.0.1:31362"
-graphql = "127.0.0.1:31363"    # reserved, not bound yet
+graphql = "127.0.0.1:31363"    # GraphQL; loopback until the G4 host config
 admin = "127.0.0.1:31369"      # /healthz /readyz /status /metrics; loopback or private only
 trusted_proxies = []           # proxy IPs or CIDRs whose X-Forwarded-For is trusted
 rate_per_ip = 20
@@ -38,6 +38,27 @@ rate_per_ip = 20
 # /usr/share/doc/kda-indexer/install.md; the directory must be writable by kda-indexer).
 # [metrics]
 # textfile = "/var/lib/node_exporter/textfile_collector/kda_indexer.prom"
+
+
+[graphql]
+# GraphQL limits (docs/graphql.md); the listener address is api.graphql. All optional.
+# default_page = 20          # page size when first/last are omitted
+# max_page = 100             # larger first/last are clamped to this
+# max_depth = 10
+# max_complexity = 2000
+# introspection = true
+# introspection_depth = 14   # introspection is exempt from max_depth, capped here
+# max_batch = 10             # operations per batched request (N rate tokens)
+# max_query_bytes = 32768
+# max_variables_bytes = 65536
+# ws_subs_per_conn = 20
+# ws_subs_max = 2000
+# ws_conns_per_ip = 10
+# ws_init_secs = 10
+# ws_idle_secs = 600
+# ws_tx_wait_secs = 3600
+# feed_poll_ms = 1000
+# network_host = ""          # networkInfo.networkHost: a public name, never the node URL
 
 [log]
 format = "text"    # or "json"

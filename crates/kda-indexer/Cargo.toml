@@ -37,6 +37,8 @@ kdx-segment.workspace = true
 kdx-search.workspace = true
 kdx-ingest.workspace = true
 kdx-api.workspace = true
+kdx-graphql.workspace = true
+async-graphql.workspace = true
 kdx-metrics.workspace = true
 base64.workspace = true
 rand.workspace = true
@@ -73,6 +75,7 @@ assets = [
     ["../../packaging/config/mainnet01.toml", "opt/coins/kda-indexer/mainnet01/config/", "640"],
     ["../../compare/allowlist.toml", "usr/share/kda-indexer/compare/", "644"],
     ["../../compare/seeds/mainnet01.toml", "usr/share/kda-indexer/compare/seeds/", "644"],
+    ["../../compare/graphql/*.graphql", "usr/share/kda-indexer/compare/graphql/", "644"],
     ["../../README.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../LICENSE-MIT", "usr/share/doc/kda-indexer/", "644"],
     ["../../LICENSE-APACHE", "usr/share/doc/kda-indexer/", "644"],
@@ -82,6 +85,7 @@ assets = [
     ["../../docs/install.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/operations.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/api.md", "usr/share/doc/kda-indexer/", "644"],
+    ["../../docs/graphql.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/openapi.json", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/format.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../packaging/config/mainnet01.toml.example", "usr/share/doc/kda-indexer/examples/", "644"],

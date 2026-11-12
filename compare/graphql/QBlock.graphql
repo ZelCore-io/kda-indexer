@@ -1,0 +1,2 @@
+# kdx: oracle
+query QBlock($hash: String!) { block(hash: $hash) { id hash height chainId creationTime difficulty weight nonce epoch powHash target payloadHash parent { hash } transactions(first: 5) { totalCount pageInfo { hasNextPage hasPreviousPage } edges { cursor node { id hash } } } events(first: 5) { totalCount edges { node { id name qualifiedName orderIndex } } } } }

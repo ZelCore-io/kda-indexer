@@ -62,6 +62,9 @@ impl GateSize {
 pub enum RouteSet {
     Must,
     Should,
+    /// The GraphQL routes (`graphql:<operation>`).
+    Graphql,
+    /// Must and should routes, plus the GraphQL routes when the window has any.
     All,
 }
 
@@ -70,8 +73,9 @@ impl RouteSet {
         match s {
             "must" => Ok(RouteSet::Must),
             "should" => Ok(RouteSet::Should),
+            "graphql" => Ok(RouteSet::Graphql),
             "all" => Ok(RouteSet::All),
-            _ => anyhow::bail!("--routes must be `must`, `should` or `all`"),
+            _ => anyhow::bail!("--routes must be `must`, `should`, `graphql` or `all`"),
         }
     }
 
@@ -84,6 +88,7 @@ impl RouteSet {
         match self {
             RouteSet::Must => must.to_vec(),
             RouteSet::Should => SHOULD.to_vec(),
+            RouteSet::Graphql => Vec::new(),
             RouteSet::All => must.iter().chain(SHOULD).copied().collect(),
         }
     }
@@ -103,6 +108,8 @@ pub struct Row {
     pub skew: u64,
     pub errors_a: u64,
     pub errors_b: u64,
+    /// Oracle server faults (HTTP 5xx, `INTERNAL_SERVER_ERROR`): a subset of `errors_b`.
+    pub oracle_faults: u64,
     pub p50_a: Option<f64>,
     pub p99_a: Option<f64>,
     pub p50_b: Option<f64>,
@@ -198,7 +205,8 @@ pub fn rows(w: &Window) -> Vec<Row> {
             allowlisted: n("allowlisted") + n("legacy-cmd"),
             skew: n("skew"),
             errors_a: n("a-error"),
-            errors_b: n("b-error"),
+            errors_b: n("b-error") + n("oracle-fault"),
+            oracle_faults: n("oracle-fault"),
             ..Default::default()
         };
         if let Some(h) = lat(a) {
@@ -297,6 +305,107 @@ pub fn render(
     (s, green)
 }
 
+/// Node-pair routes of the GraphQL gate and their minimums (small, full).
+pub const GRAPHQL_NODE_ROUTES: &[(&str, u64, u64)] = &[
+    ("graphql:NodeTx", 50, 500),
+    ("graphql:NodeBlock", 50, 500),
+    ("graphql:NodeBalance", 50, 2_000),
+];
+/// Per operation against the reference server (or the internal pair), and in total.
+pub const GRAPHQL_PER_OP: (u64, u64) = (20, 100);
+pub const GRAPHQL_TOTAL: (u64, u64) = (200, 2_000);
+
+/// The node-pair route that covers an operation, by what its stem names: transactions,
+/// transfers and events by `NodeTx`; accounts and balances by `NodeBalance`; blocks and
+/// heights by `NodeBlock` (the transaction words win, so `QTransactionsByBlock` is `NodeTx`).
+/// `None` for the node routes themselves and for operations nothing covers.
+pub fn node_cover(route: &str) -> Option<&'static str> {
+    let stem = route.strip_prefix("graphql:")?.to_ascii_lowercase();
+    if stem.starts_with("node") {
+        return None;
+    }
+    let has = |ws: &[&str]| ws.iter().any(|w| stem.contains(w));
+    if has(&["transaction", "transfer", "event"]) {
+        Some("graphql:NodeTx")
+    } else if has(&["account", "balance"]) {
+        Some("graphql:NodeBalance")
+    } else if has(&["block", "height"]) {
+        Some("graphql:NodeBlock")
+    } else {
+        None
+    }
+}
+
+/// Rows with the oracle's own faults counted as "node-checked": where the oracle answered an
+/// operation with a server fault (`oracle-fault`: it fails on `networkInfo`,
+/// `completedBlockHeights`, some `blocksFromHeight` selections) and the node pair that covers
+/// it reached its minimum without an unexplained diff, each fault counts as a compare. An
+/// oracle that is merely unreachable or slow (`b-error`) does not.
+fn node_checked(rows: &[Row], size: GateSize) -> Vec<Row> {
+    let node_green = |n: &str| {
+        let of = || rows.iter().filter(|r| r.route == n);
+        let min = GRAPHQL_NODE_ROUTES
+            .iter()
+            .find(|x| x.0 == n)
+            .map(|x| if size == GateSize::Small { x.1 } else { x.2 })
+            .unwrap_or(u64::MAX);
+        of().map(|r| r.compared).max().unwrap_or(0) >= min && of().all(|r| r.unexplained == 0)
+    };
+    rows.iter()
+        .map(|r| {
+            let mut r = r.clone();
+            if r.b != "node" && r.oracle_faults > 0 && node_cover(&r.route).is_some_and(node_green)
+            {
+                r.compared += r.oracle_faults;
+            }
+            r
+        })
+        .collect()
+}
+
+/// The GraphQL gate (plan Task 7): every operation seen in the window has at least its minimum
+/// compared, the node pairs reach theirs, the total is reached, and nothing is unexplained.
+pub fn graphql_gate(rows: &[Row], size: GateSize) -> (bool, Vec<String>) {
+    let rows = &node_checked(rows, size)[..];
+    let pick = |s: (u64, u64)| if size == GateSize::Small { s.0 } else { s.1 };
+    let mut routes: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.route.starts_with("graphql:"))
+        .map(|r| r.route.as_str())
+        .collect();
+    routes.sort_unstable();
+    routes.dedup();
+    let is_node = |r: &str| GRAPHQL_NODE_ROUTES.iter().any(|(n, _, _)| *n == r);
+    let mut required: Vec<(&str, u64)> = Vec::new();
+    for r in &routes {
+        if !is_node(r) {
+            required.push((r, pick(GRAPHQL_PER_OP)));
+        }
+    }
+    for (n, s, f) in GRAPHQL_NODE_ROUTES {
+        required.push((n, if size == GateSize::Small { *s } else { *f }));
+    }
+    let (_, mut why) = gate(rows, &required);
+    let total: u64 = routes
+        .iter()
+        .filter(|r| !is_node(r))
+        .map(|r| {
+            rows.iter()
+                .filter(|x| x.route == **r)
+                .map(|x| x.compared)
+                .max()
+                .unwrap_or(0)
+        })
+        .sum();
+    if total < pick(GRAPHQL_TOTAL) {
+        why.push(format!(
+            "graphql total: {total} compared, needs {}",
+            pick(GRAPHQL_TOTAL)
+        ));
+    }
+    (why.is_empty(), why)
+}
+
 /// `summary` command: prints the table; returns whether the gate is green.
 pub fn run(out_dir: &Path, since: &str, routes: &str, gate: &str) -> anyhow::Result<bool> {
     let set = RouteSet::parse(routes)?;
@@ -304,7 +413,26 @@ pub fn run(out_dir: &Path, since: &str, routes: &str, gate: &str) -> anyhow::Res
     let since_secs = parse_since(since)?;
     let w = load(out_dir, since_secs)?;
     let label = format!("gate {gate}, routes {routes}");
-    let (text, green) = render(&rows(&w), &set.required(size), routes == "all", &label);
+    let all_rows = rows(&w);
+    let with_graphql = set == RouteSet::Graphql
+        || (set == RouteSet::All && all_rows.iter().any(|r| r.route.starts_with("graphql:")));
+    let required = set.required(size);
+    let (mut text, mut green) = if set == RouteSet::Graphql {
+        (render(&all_rows, &[], true, &label).0, true)
+    } else {
+        render(&all_rows, &required, routes == "all", &label)
+    };
+    if with_graphql {
+        let (ok, why) = graphql_gate(&all_rows, size);
+        text.push_str(&format!(
+            "graphql gate {gate}: {}\n",
+            if ok { "GREEN" } else { "RED" }
+        ));
+        for w in why {
+            text.push_str(&format!("  {w}\n"));
+        }
+        green &= ok;
+    }
     print!("{text}");
     Ok(green)
 }
@@ -436,5 +564,137 @@ mod tests {
         assert!(!gate(&rows, &should).0);
         assert!(!gate(&rows, &all).0);
         assert!(RouteSet::parse("x").is_err() && GateSize::parse("x").is_err());
+    }
+
+    fn grow(route: &str, b: &str, compared: u64, unexplained: u64) -> Row {
+        Row {
+            route: route.into(),
+            a: "gql".into(),
+            b: b.into(),
+            compared,
+            unexplained,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn graphql_gate_small_and_full() {
+        let mut rows = vec![
+            grow("graphql:QBlock", "oracle", 20, 0),
+            grow("graphql:QEvents", "oracle", 25, 0),
+        ];
+        for _ in 0..8 {
+            rows.push(grow("graphql:QX", "oracle", 20, 0));
+        }
+        rows.extend([
+            grow("graphql:NodeTx", "node", 50, 0),
+            grow("graphql:NodeBlock", "node", 50, 0),
+            grow("graphql:NodeBalance", "node", 50, 0),
+        ]);
+        // 20 + 25 + 20 = 65 per-operation compares: below the 200 total.
+        let (ok, why) = graphql_gate(&rows, GateSize::Small);
+        assert!(
+            !ok && why.iter().any(|w| w.starts_with("graphql total")),
+            "{why:?}"
+        );
+        for i in 0..8 {
+            rows.push(grow(&format!("graphql:Op{i}"), "oracle", 25, 0));
+        }
+        let (ok, why) = graphql_gate(&rows, GateSize::Small);
+        assert!(ok, "{why:?}");
+        // The full gate asks 100 per operation and 500/500/2,000 on the node pairs.
+        let (ok, why) = graphql_gate(&rows, GateSize::Full);
+        assert!(!ok && why.len() > 5, "{why:?}");
+        // An unexplained diff fails the small gate, and so does a missing node route.
+        rows.push(grow("graphql:QBlock", "oracle", 0, 1));
+        assert!(!graphql_gate(&rows, GateSize::Small).0);
+        rows.pop();
+        rows.retain(|r| r.route != "graphql:NodeBalance");
+        let (ok, why) = graphql_gate(&rows, GateSize::Small);
+        assert!(
+            !ok && why.iter().any(|w| w.starts_with("graphql:NodeBalance")),
+            "{why:?}"
+        );
+    }
+
+    #[test]
+    fn oracle_faults_are_node_checked_when_a_node_pair_covers_the_operation() {
+        let fault = |route: &str, compared: u64, faults: u64| Row {
+            oracle_faults: faults,
+            errors_b: faults,
+            ..grow(route, "oracle", compared, 0)
+        };
+        let nodes = |n: u64| {
+            vec![
+                grow("graphql:NodeTx", "node", n, 0),
+                grow("graphql:NodeBlock", "node", n, 0),
+                grow("graphql:NodeBalance", "node", n, 0),
+            ]
+        };
+        let mut rows = vec![
+            // The oracle fails every blocksFromHeight call: 0 compared, 25 faults.
+            fault("graphql:QBlocksFromHeight", 0, 25),
+            // An oracle that was merely unreachable: still 0 compared.
+            Row {
+                errors_b: 25,
+                ..grow("graphql:QBlock", "oracle", 0, 0)
+            },
+        ];
+        for i in 0..10 {
+            rows.push(grow(&format!("graphql:Op{i}"), "oracle", 25, 0));
+        }
+        rows.extend(nodes(50));
+        let (ok, why) = graphql_gate(&rows, GateSize::Small);
+        assert!(!ok, "{why:?}");
+        // Faults count for the covered operation, not for the merely unreachable one.
+        assert!(
+            !why.iter()
+                .any(|w| w.starts_with("graphql:QBlocksFromHeight")),
+            "{why:?}"
+        );
+        assert!(
+            why.iter().any(|w| w.starts_with("graphql:QBlock:")),
+            "{why:?}"
+        );
+        // No cover without the node pair reaching its minimum.
+        let mut rows2 = rows.clone();
+        rows2.retain(|r| r.route != "graphql:NodeBlock");
+        rows2.push(grow("graphql:NodeBlock", "node", 10, 0));
+        let (_, why) = graphql_gate(&rows2, GateSize::Small);
+        assert!(
+            why.iter()
+                .any(|w| w.starts_with("graphql:QBlocksFromHeight")),
+            "{why:?}"
+        );
+        // Nor when the covering node pair has an unexplained diff.
+        let mut rows3 = rows.clone();
+        rows3.push(grow("graphql:NodeBlock", "node", 0, 1));
+        let (_, why) = graphql_gate(&rows3, GateSize::Small);
+        assert!(
+            why.iter()
+                .any(|w| w.starts_with("graphql:QBlocksFromHeight")),
+            "{why:?}"
+        );
+        // Mapping by stem.
+        assert_eq!(
+            node_cover("graphql:QTransactionsByBlock"),
+            Some("graphql:NodeTx")
+        );
+        assert_eq!(
+            node_cover("graphql:QFungibleAccount"),
+            Some("graphql:NodeBalance")
+        );
+        assert_eq!(
+            node_cover("graphql:QBlocksFromHeight"),
+            Some("graphql:NodeBlock")
+        );
+        assert_eq!(node_cover("graphql:QNetworkInfo"), None);
+        assert_eq!(node_cover("graphql:NodeBlock"), None);
+    }
+
+    #[test]
+    fn route_set_graphql_parses() {
+        assert_eq!(RouteSet::parse("graphql").unwrap(), RouteSet::Graphql);
+        assert!(RouteSet::Graphql.required(GateSize::Small).is_empty());
     }
 }

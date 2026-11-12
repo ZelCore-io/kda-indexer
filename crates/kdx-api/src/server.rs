@@ -45,6 +45,8 @@ pub struct ApiSettings {
 pub struct Binds {
     pub native: Option<SocketAddr>,
     pub compat: Option<SocketAddr>,
+    /// GraphQL (P7; spec §5.3).
+    pub graphql: Option<SocketAddr>,
     pub admin: Option<SocketAddr>,
 }
 
@@ -133,6 +135,27 @@ impl ApiState {
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
         self.read_on(Some(&self.heavy), &self.reads, f).await
+    }
+
+    /// Take `n` more rate tokens for the client of this request (the guard took one): a
+    /// GraphQL batch of N takes N. False when the client has fewer left.
+    pub fn allow_extra(&self, peer: SocketAddr, headers: &axum::http::HeaderMap, n: u32) -> bool {
+        let ip = client_ip(peer, headers, &self.settings.trusted_proxies);
+        self.limiter.allow_n(ip, n)
+    }
+
+    /// Take `n` rate tokens for a client IP already resolved (websocket messages, GQ-9).
+    pub fn allow_ip(&self, ip: std::net::IpAddr, n: u32) -> bool {
+        self.limiter.allow_n(ip, n)
+    }
+
+    /// The client IP of a request (`trusted_proxies` applied, as the guard).
+    pub fn client_ip_of(
+        &self,
+        peer: SocketAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> std::net::IpAddr {
+        client_ip(peer, headers, &self.settings.trusted_proxies)
     }
 
     /// `read` on the reserved status slots (cheap tip reads only).
@@ -328,6 +351,7 @@ pub struct Api {
     state: Arc<ApiState>,
     native: Router<Arc<ApiState>>,
     compat: Router<Arc<ApiState>>,
+    graphql: Router<Arc<ApiState>>,
     on_bound: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -347,6 +371,7 @@ impl Api {
             state,
             native: Router::new().route("/status", axum::routing::get(status::handler)),
             compat: Router::new(),
+            graphql: Router::new(),
             on_bound: None,
         }
     }
@@ -370,6 +395,12 @@ impl Api {
     /// Add compat routes (Tasks 5, 6).
     pub fn compat_routes(mut self, r: Router<Arc<ApiState>>) -> Api {
         self.compat = self.compat.merge(r);
+        self
+    }
+
+    /// Add the GraphQL routes (P7): same guard and tracking as compat, CORS `Any`.
+    pub fn graphql_routes(mut self, r: Router<Arc<ApiState>>) -> Api {
+        self.graphql = self.graphql.merge(r);
         self
     }
 
@@ -398,6 +429,12 @@ impl Api {
                 .allow_headers(Any)
                 .expose_headers([CHAINWEB_NEXT]),
         );
+        let graphql = data(self.graphql, "graphql").layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        );
         let admin = admin::router()
             .layer(middleware::from_fn_with_state(st.clone(), admin_guard))
             .layer(middleware::from_fn_with_state("admin", track))
@@ -407,6 +444,7 @@ impl Api {
         for (name, addr, app) in [
             ("native", binds.native, native),
             ("compat", binds.compat, compat),
+            ("graphql", binds.graphql, graphql),
             ("admin", binds.admin, admin),
         ] {
             let Some(addr) = addr else { continue };

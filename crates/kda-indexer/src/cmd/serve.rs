@@ -1,4 +1,4 @@
-//! `serve`: the read-only API process (native, compat, admin) over a data dir another
+//! `serve`: the read-only API process (native, compat, GraphQL, admin) over a data dir another
 //! process writes (P3: beside run E; later read replicas). Read-only MDBX open, no `LOCK`,
 //! no ingest. Node tips come from a light `/cut` poll; the node is optional.
 
@@ -83,9 +83,15 @@ pub fn api(
         max_results: cfg.search.max_results as usize,
     };
     let search = kdx_api::search::SearchCtx::new(settings, Some(kdx_search::search_dir(data_dir)));
-    Ok(Api::new(store, cfg.api.settings(&cfg.network)?, tips)
+    let api = Api::new(store, cfg.api.settings(&cfg.network)?, tips)
         .native_routes(kdx_api::native::router(search.clone()))
-        .compat_routes(kdx_api::compat::router(search)))
+        .compat_routes(kdx_api::compat::router(search.clone()));
+    // GraphQL (spec §5.3) on `api.graphql`; subscriptions come from the committed-block feed
+    // (GQ-6), which polls the store, so `serve` and replicas have them as `run` does.
+    let gs = cfg.graphql.settings(&cfg.network);
+    let feed = kdx_graphql::BlockFeed::spawn(api.state(), gs.feed_poll);
+    let schema = kdx_graphql::build_schema_with_search(api.state(), gs, Some(feed), search);
+    Ok(api.graphql_routes(kdx_graphql::router(schema)))
 }
 
 pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {

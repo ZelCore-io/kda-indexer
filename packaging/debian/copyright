@@ -32,3 +32,10 @@ License: BSD-3-clause
  Data files copied from kda-community/chainweb-data and the circulating-supply formula of
  its Chainweb.Coins module. The licence text is in
  /usr/share/doc/kda-indexer/THIRD_PARTY_NOTICES.
+
+Files: crates/kdx-graphql/schema/kadena-graph.graphql
+Copyright: 2018 - 2024 Kadena LLC
+License: BSD-3-clause
+ The @kadena/graph schema, vendored unchanged from kadena-community/kadena.js (commit
+ 1b05828f9c1cff7ccd8f7665c577a0a9e599aa2b); the GraphQL types of the binary reproduce
+ its names. The licence text is in /usr/share/doc/kda-indexer/THIRD_PARTY_NOTICES.

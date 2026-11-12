@@ -1,0 +1,2 @@
+# kdx: oracle
+query QTransactionsByPublicKey($publicKey: String!, $first: Int, $after: String) { transactionsByPublicKey(publicKey: $publicKey, first: $first, after: $after) { totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id hash } } } }

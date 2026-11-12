@@ -13,6 +13,7 @@ members = [
     "crates/kdx-api",
     "crates/kdx-metrics",
     "crates/kdx-search",
+    "crates/kdx-graphql",
 ]
 # Vendored third-party code builds as a path dependency, not as a workspace member (no lints).
 exclude = ["vendor/ptr_hash"]
@@ -70,6 +71,10 @@ tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 tower-http = { version = "0.6", features = ["cors", "limit"] }
 # Code search (P6, spec 3.8). Pinned exactly; only mmap and the zstd doc store.
 tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "zstd-compression"] }
+# GraphQL (P7, spec 5.3). Pinned exactly; no default features (no GraphiQL, playground or
+# tracing). `dataloader` for the per-request loaders (GQ-5).
+async-graphql = { version = "=7.2.1", default-features = false, features = ["dataloader"] }
+async-graphql-axum = { version = "=7.2.1", default-features = false }
 
 kdx-types = { path = "crates/kdx-types" }
 kdx-node = { path = "crates/kdx-node" }
@@ -80,6 +85,7 @@ kdx-ingest = { path = "crates/kdx-ingest" }
 kdx-api = { path = "crates/kdx-api" }
 kdx-metrics = { path = "crates/kdx-metrics" }
 kdx-search = { path = "crates/kdx-search" }
+kdx-graphql = { path = "crates/kdx-graphql" }
 
 # Spec 6.2. target-cpu stays generic so a package built on one node installs on the others.
 # If codegen-units = 1 makes the node build exceed ~20 minutes, say so in the run report.

@@ -1,0 +1,2 @@
+# kdx: oracle
+query QTransfersByAccount($accountName: String, $fungibleName: String, $first: Int, $after: String) { transfers(accountName: $accountName, fungibleName: $fungibleName, first: $first, after: $after) { totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id amount creationTime orderIndex senderAccount receiverAccount moduleName chainId blockHash requestKey } } } }

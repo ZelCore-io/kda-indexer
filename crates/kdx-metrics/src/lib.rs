@@ -81,6 +81,15 @@ pub struct Metrics {
     pub balance_reconcile: Count,
     /// Duration of one `/local` reconcile call (`result` as above).
     pub balance_reconcile_seconds: Hist,
+    /// GraphQL requests: `kind` = query | batch | subscription, `result` = ok | error |
+    /// rejected | timeout.
+    pub graphql_requests: Count,
+    /// GraphQL refusals by limit (`reason` = depth | complexity | batch | query_size | ...).
+    pub graphql_rejected: Count,
+    /// Open GraphQL subscriptions.
+    pub graphql_subscriptions: Gauge,
+    /// Age of the newest block the subscription feed has seen.
+    pub graphql_feed_lag_seconds: FGauge,
 }
 
 impl Metrics {
@@ -251,6 +260,26 @@ impl Metrics {
             "Balance reconcile outcomes (result ok|absent|error|skipped|parked)",
             Count::default()
         );
+        let graphql_requests = reg!(
+            "kdx_graphql_requests",
+            "GraphQL requests (kind query|batch|subscription, result ok|error|rejected|timeout)",
+            Count::default()
+        );
+        let graphql_rejected = reg!(
+            "kdx_graphql_rejected",
+            "GraphQL requests refused by a limit (reason)",
+            Count::default()
+        );
+        let graphql_subscriptions = reg!(
+            "kdx_graphql_subscriptions",
+            "Open GraphQL subscriptions",
+            Gauge::default()
+        );
+        let graphql_feed_lag_seconds = reg!(
+            "kdx_graphql_feed_lag_seconds",
+            "Age of the newest block seen by the GraphQL subscription feed",
+            FGauge::default()
+        );
         let balance_reconcile_seconds = reg!(
             "kdx_balance_reconcile_seconds",
             "Balance reconcile call duration (result ok|absent|error|skipped)",
@@ -291,6 +320,10 @@ impl Metrics {
             balance_dirty_rows,
             balance_reconcile,
             balance_reconcile_seconds,
+            graphql_requests,
+            graphql_rejected,
+            graphql_subscriptions,
+            graphql_feed_lag_seconds,
         }
     }
 
@@ -358,6 +391,18 @@ impl Metrics {
         self.balance_reconcile_seconds
             .get_or_create(&l)
             .observe(secs);
+    }
+
+    pub fn graphql_request(&self, kind: &'static str, result: &'static str) {
+        self.graphql_requests
+            .get_or_create(&vec![("kind", kind.into()), ("result", result.into())])
+            .inc();
+    }
+
+    pub fn graphql_rejected(&self, reason: &'static str) {
+        self.graphql_rejected
+            .get_or_create(&vec![("reason", reason.into())])
+            .inc();
     }
 
     pub fn search_rejected(&self, reason: &'static str) {

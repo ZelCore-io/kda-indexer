@@ -1,0 +1,2 @@
+# kdx: node-tx
+query NodeTx($requestKey: String!, $blockHash: String) { transaction(requestKey: $requestKey, blockHash: $blockHash) { hash cmd { meta { chainId sender } } result { ... on TransactionResult { badResult gas height block { hash height chainId } } } } }

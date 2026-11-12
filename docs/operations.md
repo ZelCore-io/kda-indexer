@@ -400,6 +400,16 @@ the rows of the unwound txs dirty, and the reconciler reads `NftDirty` rows with
 as balances) between its balance batches. `kda-indexer inspect nft-check --count 20
 --compare-node` samples stored rows and compares them with the node.
 
+For GraphQL (GQ-15) the reconciler also fills `NftDetails`: each loop walks up to 4,096
+`NftBalances` rows from a cursor that wraps, and makes at most 32 calls in the same `/local`
+budget. The calls are `({ledger}.details (read-msg "t") (read-msg "a"))` for a positive holding's
+guard and `({ledger}.get-token-info (read-msg "t"))` for its token's info. A row is read again
+once its balance row moves. An unusable answer is stored as failed until then, with no back-off.
+A node error stores nothing and, when it is the majority of a step's calls, the cursor stays.
+`reconcile-balances --status` prints `nft_details_rows`. On a store from before P7 the first `run` creates the
+table, and the first laps fill it; until then `guard`/`info` answer `NOT_AVAILABLE`. A `serve`
+opened before that `run` sees the table only after a restart, as with the P6 tables.
+
 - The fill records the ledger set it walked (`Meta nft_filled_ledgers`). A ledger added to
   `[nft] ledgers` later is walked on the next `run` start: only that ledger's events, from its
   postings (hot tail and segments), with no node calls. `reconcile-balances --nft-fill` walks

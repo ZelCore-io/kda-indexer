@@ -1,0 +1,136 @@
+//! Response-level flags (R-P5P9-14): resolvers mark a request, and the response carries the
+//! marks in its top-level `extensions`.
+//!
+//! - `totalCountLowerBound: true`: a `totalCount` ran out of its share of the deadline; it
+//!   answers the items counted so far (a lower bound) and the edges are kept.
+//! - `searchTruncated: true`: `transactionsByPactCode` stopped at a search cap or its time
+//!   budget; `pageInfo.endCursor` resumes it.
+//!
+//! One [`RespFlags`] per request (an extension instance is created per request), so the
+//! requests of a batch are flagged separately. Subscription events carry no flags.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use async_graphql::extensions::{
+    Extension, ExtensionContext, ExtensionFactory, NextExecute, NextPrepareRequest,
+};
+use async_graphql::{Context, Request, Response, ServerResult, Value};
+
+/// The marks of one request.
+#[derive(Debug, Default)]
+pub struct RespFlags {
+    count_lower_bound: AtomicBool,
+    search_truncated: AtomicBool,
+}
+
+/// Which mark to set.
+#[derive(Debug, Clone, Copy)]
+pub enum Flag {
+    CountLowerBound,
+    SearchTruncated,
+}
+
+impl RespFlags {
+    fn cell(&self, f: Flag) -> &AtomicBool {
+        match f {
+            Flag::CountLowerBound => &self.count_lower_bound,
+            Flag::SearchTruncated => &self.search_truncated,
+        }
+    }
+    pub fn is_set(&self, f: Flag) -> bool {
+        self.cell(f).load(Ordering::Relaxed)
+    }
+}
+
+/// Mark the request being resolved (no-op outside one, e.g. a subscription event).
+pub fn mark(ctx: &Context<'_>, f: Flag) {
+    if let Some(r) = ctx.data_opt::<Arc<RespFlags>>() {
+        r.cell(f).store(true, Ordering::Relaxed);
+    }
+}
+
+/// The extension (installed by `build_schema`).
+pub struct Flags;
+
+impl ExtensionFactory for Flags {
+    fn create(&self) -> Arc<dyn Extension> {
+        Arc::new(FlagsExt(Arc::new(RespFlags::default())))
+    }
+}
+
+struct FlagsExt(Arc<RespFlags>);
+
+#[async_graphql::async_trait::async_trait]
+impl Extension for FlagsExt {
+    async fn prepare_request(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        request: Request,
+        next: NextPrepareRequest<'_>,
+    ) -> ServerResult<Request> {
+        next.run(ctx, request.data(self.0.clone())).await
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        operation_name: Option<&str>,
+        next: NextExecute<'_>,
+    ) -> Response {
+        let mut r = next.run(ctx, operation_name).await;
+        for (f, name) in [
+            (Flag::CountLowerBound, "totalCountLowerBound"),
+            (Flag::SearchTruncated, "searchTruncated"),
+        ] {
+            if self.0.is_set(f) {
+                r.extensions.insert(name.to_owned(), Value::Boolean(true));
+            }
+        }
+        r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
+
+    use crate::connection::Total;
+
+    struct Q;
+
+    #[Object]
+    impl Q {
+        async fn exact(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<i32> {
+            Total::Deferred(Arc::new(|| Box::pin(async { Ok((7, true)) })))
+                .resolve(ctx)
+                .await
+        }
+        async fn bound(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<i32> {
+            Total::Deferred(Arc::new(|| Box::pin(async { Ok((5, false)) })))
+                .resolve(ctx)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_count_cut_short_is_a_flagged_lower_bound() {
+        let s = Schema::build(Q, EmptyMutation, EmptySubscription)
+            .extension(super::Flags)
+            .finish();
+        let r = s.execute("{ exact }").await;
+        assert!(r.errors.is_empty() && r.extensions.is_empty());
+        let r = s.execute("{ exact bound }").await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(
+            r.data.into_json().unwrap(),
+            serde_json::json!({"exact": 7, "bound": 5})
+        );
+        assert_eq!(
+            r.extensions.get("totalCountLowerBound"),
+            Some(&async_graphql::Value::Boolean(true))
+        );
+    }
+}
