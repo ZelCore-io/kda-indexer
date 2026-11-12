@@ -1720,6 +1720,7 @@ dependencies = [
  "kdx-types",
  "rand 0.10.3",
  "rayon",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

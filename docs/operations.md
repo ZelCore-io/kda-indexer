@@ -240,9 +240,11 @@ sudo kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml
 - Run it as root. The volume root is owned by root (see [install.md](install.md)), so the
   service user cannot create `DIR` there. Run as root, the command gives `DIR` and everything
   it wrote to the owner of the source data dir when it is done (hard-linked segment files
-  already belong to it), and does the same for the two swap lock files if it created them. To
-  run it as the service user instead, first create the empty `DIR` as root and
-  `chown kda-indexer:kda-indexer` it.
+  already belong to it), and does the same for the two swap lock files if it created them. It
+  never follows a symbolic link, and gives each directory only after everything in it: when
+  an entry cannot be given, that entry and the directories above it stay root's and a warning
+  names them (then `chown -R kda-indexer:kda-indexer DIR`). To run it as the service user
+  instead, first create the empty `DIR` as root and `chown kda-indexer:kda-indexer` it.
 
 - `DIR` must not exist or be empty, and must not lie inside the source data dir. Without
   `--copy` it must be on the same filesystem as the source: the segment files are

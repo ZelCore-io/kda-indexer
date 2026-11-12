@@ -44,9 +44,11 @@ base64.workspace = true
 rand.workspace = true
 rayon.workspace = true
 zstd.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 # `make deb` (cargo-deb, built on the node, spec 6.2/6.3). Asset sources are relative to this
 # crate; the binaries come from the workspace target dir.

@@ -66,6 +66,9 @@ hex = "0.4"
 bytes = "1"
 rayon = "1"
 libc = "0.2"
+# Safe *at syscalls (openat, fstatat, fchown on descriptors) for the snapshot handoff; already
+# in the tree through tantivy (fs4) and async-io, same version and features.
+rustix = { version = "1.1", features = ["fs"] }
 arc-swap = "1"
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 tower-http = { version = "0.6", features = ["cors", "limit"] }
