@@ -20,8 +20,41 @@ use serde_json::Value;
 
 // ---------------------------------------------------------------- varint
 
+/// u64 values with the small and boundary ones uniform `any::<u64>()` never reaches (m2):
+/// below and at `u32::MAX`, one past it, every power of two and every all-ones value (each
+/// varint length from 1 to 10 bytes, and both sides of every length step).
+fn u64_edges() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        2 => any::<u64>(),
+        2 => 0..=u32::MAX as u64,
+        1 => 0u64..300,
+        1 => Just(u32::MAX as u64),
+        1 => Just(u32::MAX as u64 + 1),
+        1 => Just(u64::MAX),
+        2 => (0u32..64).prop_map(|s| 1u64 << s),
+        2 => (1u32..=64).prop_map(|s| u64::MAX >> (64 - s)),
+    ]
+}
+
+/// M8 of the P9 review: a `get_u32` that always errors survived the uniform property.
+#[test]
+fn get_u32_accepts_every_u32_and_refuses_one_more() {
+    for v in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64] {
+        let mut out = Vec::new();
+        put_u64(&mut out, v);
+        let mut s = out.as_slice();
+        assert_eq!(get_u32(&mut s).unwrap() as u64, v);
+        assert!(s.is_empty());
+    }
+    for v in [u32::MAX as u64 + 1, u64::MAX] {
+        let mut out = Vec::new();
+        put_u64(&mut out, v);
+        assert!(get_u32(&mut out.as_slice()).is_err(), "{v}");
+    }
+}
+
 props! {
-    fn varint_roundtrip_and_length(v in any::<u64>()) {
+    fn varint_roundtrip_and_length(v in u64_edges()) {
         let mut out = Vec::new();
         put_u64(&mut out, v);
         // Reference length: ceil(bits / 7), at least one byte.
@@ -32,7 +65,7 @@ props! {
         prop_assert!(s.is_empty());
     }
 
-    fn varint_padded_encoding_is_refused(v in any::<u64>(), pad in 1usize..4) {
+    fn varint_padded_encoding_is_refused(v in u64_edges(), pad in 1usize..4) {
         // Canonical form only (L5): append zero-continuation padding after the shortest form.
         let mut out = Vec::new();
         put_u64(&mut out, v);
@@ -55,7 +88,7 @@ props! {
         }
     }
 
-    fn varint_u32_bound(v in any::<u64>()) {
+    fn varint_u32_bound(v in u64_edges()) {
         let mut out = Vec::new();
         put_u64(&mut out, v);
         let mut s = out.as_slice();
@@ -521,6 +554,39 @@ props! {
         prop_assert_eq!(like.matches(&hay), like_regex(&needle).is_match(&hay), "needle {:?} hay {:?}", needle, hay);
     }
 
+    fn like_equals_regex_reference_on_near_misses(
+        needle in like_alphabet(),
+        fill in proptest::collection::vec("[ab_é]{0,2}", 12),
+        ch in proptest::collection::vec(prop_oneof![Just('a'), Just('b'), Just('é')], 12),
+        edit in (any::<proptest::sample::Index>(), 0u8..3, prop_oneof![Just('a'), Just('b'), Just('_'), Just('é')]),
+    ) {
+        // m1: a haystack instantiated from the needle (a match), then one char inserted,
+        // deleted or replaced, so both sides are often near the match boundary (a `_` that
+        // matches zero or two chars, an escape that matches the wrong char).
+        let mut hay: Vec<char> = Vec::new();
+        let (mut f, mut c) = (fill.iter(), ch.iter());
+        let mut it = needle.chars();
+        while let Some(x) = it.next() {
+            match x {
+                '%' => hay.extend(f.next().map(String::as_str).unwrap_or("").chars()),
+                '_' => hay.push(*c.next().unwrap_or(&'a')),
+                '\\' => hay.push(it.next().unwrap_or('\\')),
+                x => hay.push(x),
+            }
+        }
+        let (at, op, x) = edit;
+        let i = at.index(hay.len() + 1);
+        match op {
+            0 => hay.insert(i, x),
+            1 if i < hay.len() => { hay.remove(i); }
+            _ if i < hay.len() => hay[i] = x,
+            _ => hay.push(x),
+        }
+        let hay: String = hay.into_iter().collect();
+        let like = Like::new(&needle);
+        prop_assert_eq!(like.matches(&hay), like_regex(&needle).is_match(&hay), "needle {:?} hay {:?}", needle, hay);
+    }
+
     fn like_prefilter_is_a_superset(needle in like_alphabet(), fill in proptest::collection::vec("[ab%_é]{0,3}", 12), ch in proptest::collection::vec(prop_oneof![Just('a'), Just('é'), Just('Z')], 12)) {
         // Build a haystack that matches by instantiating the pattern (so matches are common).
         let mut hay = String::new();
@@ -553,6 +619,36 @@ props! {
                 prop_assert!(hay.contains(&run));
             }
         }
+    }
+}
+
+/// m1: fixed near misses of `_` and of an escaped `_`.
+#[test]
+fn like_underscore_near_misses() {
+    for (needle, hay, want) in [
+        ("_", "", false),
+        ("_", "x", true),
+        ("a_b", "ab", false),
+        ("a_b", "axb", true),
+        ("a_b", "axxb", false),
+        ("a__b", "ab", false),
+        ("a__b", "axb", false),
+        ("a__b", "axyb", true),
+        ("\\_", "_", true),
+        ("\\_", "x", false),
+        ("a\\_b", "axb", false),
+        ("a\\_b", "a_b", true),
+    ] {
+        assert_eq!(
+            Like::new(needle).matches(hay),
+            want,
+            "{needle:?} vs {hay:?}"
+        );
+        assert_eq!(
+            like_regex(needle).is_match(hay),
+            want,
+            "reference {needle:?} vs {hay:?}"
+        );
     }
 }
 

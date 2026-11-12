@@ -428,7 +428,13 @@ mod tests {
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+            // Fixed seed (T-1): the same cases on every run.
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                failure_persistence: None,
+                rng_seed: proptest::test_runner::RngSeed::Fixed(0x6c69_6d69_7473),
+                ..ProptestConfig::default()
+            })]
 
             #[test]
             fn refill_matches_the_integer_model(rate in 1u32..20, burst in 1u32..30, ops in ops()) {
