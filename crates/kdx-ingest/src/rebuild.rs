@@ -259,6 +259,11 @@ pub async fn run(
         return Ok(rep);
     }
 
+    // Held from here to the end: snapshots hold it shared while they place segment files
+    // (m14), and `search rebuild` holds it shared from its census to its manifest commit, so
+    // the stale mark below lands after any rebuild that read the old content (M-7).
+    let _swap = swap::swap_lock(&ctx.segdir, true)?;
+
     // M-7: before the commit point, so a crash after it never loses them (marks for a swap
     // that then does not happen only cost a re-read).
     if content_equal != Some(true) {
@@ -285,7 +290,6 @@ pub async fn run(
     }
 
     // Commit point: the journal. Readers take the rebuilt files from here on.
-    let _swap = swap::swap_lock(&ctx.segdir, true)?;
     crash_at("rebuild-before-rename");
     rep.swapped = true;
     swap::commit_journal(&ctx.segdir, start, &serde_json::to_vec_pretty(&rep)?)?;

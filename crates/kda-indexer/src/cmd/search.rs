@@ -23,6 +23,18 @@ pub struct RebuildArgs {
 }
 
 pub fn rebuild(cfg: &Config, a: RebuildArgs) -> anyhow::Result<()> {
+    // The segment swap lock, shared, from the census to the manifest commit: `rebuild-range`
+    // takes it exclusively before it marks the index stale and swaps a range, so a rebuild
+    // either reads the swapped content or is marked stale after it commits (M-7). Waits
+    // while a swap is in progress; snapshots share it.
+    let _swap = if a.dry_run {
+        None
+    } else {
+        Some(kdx_segment::swap::swap_lock(
+            &a.data_dir.join("segments"),
+            false,
+        )?)
+    };
     let s = &cfg.search;
     let mode = match &a.mode {
         Some(m) => ModeSel::parse(m, s.fallback_min_len)?,
@@ -113,5 +125,50 @@ pub fn query(cfg: &Config, data_dir: PathBuf, pattern: &str, show: usize) -> any
             Ok(())
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// M-7 follow-up: `search rebuild` waits while `rebuild-range` holds the segment swap
+    /// lock (it marks the index stale and swaps under it), and goes on once it is released.
+    #[test]
+    fn search_rebuild_waits_for_a_segment_swap_in_progress() {
+        let d = tempfile::tempdir().unwrap();
+        let seg = d.path().join("segments");
+        std::fs::create_dir_all(&seg).unwrap();
+        let swap = kdx_segment::swap::swap_lock(&seg, true).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let dir = d.path().to_path_buf();
+        let cfg: Config = toml::from_str(
+            "network = \"mainnet01\"\ndata_dir = \"unused\"\n[node]\nurl = \"http://127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        let t = std::thread::spawn(move || {
+            let r = rebuild(
+                &cfg,
+                RebuildArgs {
+                    data_dir: dir,
+                    dry_run: false,
+                    mode: None,
+                    trial_docs: 0,
+                },
+            );
+            tx.send(r.is_ok()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "search rebuild went on during a swap"
+        );
+        drop(swap);
+        // No hot store here: past the lock the rebuild fails, which is all this needs.
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("search rebuild still waiting after the swap");
+        t.join().unwrap();
     }
 }

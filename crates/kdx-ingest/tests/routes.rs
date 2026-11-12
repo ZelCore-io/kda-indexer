@@ -29,6 +29,13 @@ struct Served {
 
 /// `places` applied to a fresh single-chain store, behind both routers.
 fn served(places: &[Place]) -> Served {
+    let (dir, state, _) = store(places);
+    let app = routers(&state, SearchCtx::new(SearchSettings::default(), None));
+    Served { _dir: dir, app }
+}
+
+/// `places` applied to a fresh single-chain store: (data dir, API state, ingest context).
+fn store(places: &[Place]) -> (tempfile::TempDir, Arc<kdx_api::ApiState>, kdx_ingest::Ctx) {
     let pool = pool();
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path(), 10_000, 10_000, 10);
@@ -56,12 +63,15 @@ fn served(places: &[Place]) -> Served {
         max_event_lists: 64,
     };
     let api = Api::new(store, settings, TipWatch::default());
-    let search = SearchCtx::new(SearchSettings::default(), None);
-    let app = axum::Router::new()
+    (dir, api.state(), ctx)
+}
+
+/// Both routers over `state`, with `search` as the search context.
+fn routers(state: &Arc<kdx_api::ApiState>, search: Arc<SearchCtx>) -> axum::Router {
+    axum::Router::new()
         .merge(kdx_api::compat::router(search.clone()))
         .merge(kdx_api::native::router(search))
-        .with_state(api.state());
-    Served { _dir: dir, app }
+        .with_state(state.clone())
 }
 
 async fn get(s: &Served, uri: &str) -> (StatusCode, String) {
@@ -195,4 +205,45 @@ async fn r3e8_same_height_order_is_the_node_order() {
     let mut rev = want.clone();
     rev.reverse();
     assert_eq!(keys(&body), rev);
+}
+
+/// M-7 follow-up: after `rebuild-range` swapped a range with other content it marks the code
+/// index stale (`stale_from_height`); until a search rebuild clears the mark, native
+/// `/search/code` answers `partial: true`, though the index is fully built and not lagging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_code_is_partial_while_the_index_is_marked_stale() {
+    let all: Vec<usize> = (0..POOL_LEN).collect();
+    let (dir, state, ctx) = store(&branch(&all, 0, 0, 0));
+    let o = kdx_search::BuildOpts {
+        data_dir: dir.path().to_path_buf(),
+        mode: kdx_search::ModeSel::Full,
+        threads: 1,
+        heap_mb: 64,
+        trial_docs: 0,
+        stop: Default::default(),
+    };
+    kdx_search::rebuild(&o, &ctx.hot).unwrap();
+    let sdir = kdx_search::search_dir(dir.path());
+    let ask = |label: &'static str| {
+        let s = Served {
+            _dir: tempfile::tempdir().unwrap(),
+            app: routers(
+                &state,
+                SearchCtx::new(SearchSettings::default(), Some(sdir.clone())),
+            ),
+        };
+        async move {
+            let (st, body) = get(&s, "/api/v1/search/code?q=coin.transfer&limit=5").await;
+            assert_eq!(st, StatusCode::OK, "{label}: {body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                !v["items"].as_array().unwrap().is_empty(),
+                "{label}: {body}"
+            );
+            v["partial"].as_bool().unwrap()
+        }
+    };
+    assert!(!ask("fresh index").await);
+    assert!(kdx_search::manifest::mark_stale(&sdir, 3).unwrap());
+    assert!(ask("marked stale").await);
 }
