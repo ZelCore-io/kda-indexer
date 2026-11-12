@@ -1,20 +1,25 @@
 //! Non-fungible accounts and token balances (GQ-15, Task 5), served from `NftBalances`
-//! (balances above zero only, as native). `NonFungibleTokenBalance.info` and `.guard` are
-//! not stored and answer `NOT_SUPPORTED` (see `docs/graphql.md`).
+//! (balances above zero only, as native). `NonFungibleTokenBalance.guard` and `.info` come from
+//! `NftDetails`, which the reconciler fills with two fixed `/local` forms; resolvers never call
+//! the node. Details read before the balance row last moved are served (stale, as GQ-14 serves
+//! stale balances). A holding with no usable details gets a `NOT_AVAILABLE` error on that field
+//! only: `info` is `null`, and the non-null `guard` answers an empty `RawGuard` beside the
+//! error, so the account and its other holdings still answer (see `docs/graphql.md`).
 
 use async_graphql::{Context, Object, Result, SimpleObject, ID};
 use kdx_api::{ApiResult, View};
-use kdx_hot::nft::{parse_nft_key, NftRow};
+use kdx_hot::nft::{self, parse_nft_key, HolderDetails, NftRow, TokenDetails};
 use kdx_hot::{Table, Txn};
 use kdx_types::{Dict, DictKind};
 
+use super::guard::{map_guard, RawGuard};
 use super::{
-    unserved, IGuard, NonFungibleAccountTransactionsConnection,
-    NonFungibleAccountTransactionsConnectionEdge, NonFungibleChainAccountTransactionsConnection,
+    IGuard, NonFungibleAccountTransactionsConnection, NonFungibleAccountTransactionsConnectionEdge,
+    NonFungibleChainAccountTransactionsConnection,
     NonFungibleChainAccountTransactionsConnectionEdge, Transaction,
 };
 use crate::connection::{PageArgs, Total};
-use crate::error::from_api;
+use crate::error::{err, from_api, Code};
 use crate::gql;
 use crate::ids::{encode, NodeKey};
 use crate::txlist::{list, Item, KeyFilter, ListPage, ListSpec, Rows, SourceSpec};
@@ -26,6 +31,9 @@ pub struct NftItem {
     pub ledger: String,
     pub chain: u8,
     pub balance: String,
+    /// The holding's `NftDetails` guard row and its token's info row (GQ-15).
+    pub holder: Option<HolderDetails>,
+    pub info: Option<TokenDetails>,
 }
 
 /// The positive holdings of `account` (on `chain` when given), at most `cap`, in key order.
@@ -48,12 +56,17 @@ pub fn nft_rows(
             .scan_limit(Table::NftBalances, &from, 256, |k| k.starts_with(&prefix))?;
         for (k, v) in &rows {
             view.check_deadline()?;
-            let (Some((_, _, _, c)), Some(r)) = (parse_nft_key(k), NftRow::decode(v)) else {
+            let (Some((_, _, _, c)), Some(r), Ok(key)) = (
+                parse_nft_key(k),
+                NftRow::decode(v),
+                <[u8; 25]>::try_from(k.as_slice()),
+            ) else {
                 continue;
             };
             if !r.positive() || chain.is_some_and(|x| x != c) {
                 continue;
             }
+            let (holder, info) = nft::details(&view.txn, &key)?;
             out.push(NftItem {
                 token_id: r.token_id.clone(),
                 ledger: d
@@ -62,6 +75,8 @@ pub fn nft_rows(
                     .to_owned(),
                 chain: c,
                 balance: r.balance.clone(),
+                holder,
+                info,
             });
             if out.len() == cap {
                 return Ok(out);
@@ -249,17 +264,32 @@ impl NonFungibleTokenBalance {
         &self.account
     }
     async fn balance(&self) -> i32 {
-        self.item
-            .balance
-            .parse::<f64>()
-            .map(|f| f.clamp(0.0, i32::MAX as f64) as i32)
-            .unwrap_or(0)
+        int_of(&self.item.balance)
     }
     async fn chain_id(&self) -> String {
         self.item.chain.to_string()
     }
-    async fn guard(&self) -> Result<IGuard> {
-        unserved!("NonFungibleTokenBalance.guard")
+    /// The holding's guard from `NftDetails`. Without a usable row: an empty `RawGuard` and a
+    /// `NOT_AVAILABLE` error for this field (the type is non-null, and an error alone would
+    /// null the whole account).
+    async fn guard(&self, ctx: &Context<'_>) -> IGuard {
+        let field = "NonFungibleTokenBalance.guard";
+        let found = self
+            .item
+            .holder
+            .as_ref()
+            .filter(|h| h.status == nft::DETAIL_FOUND)
+            .and_then(|h| serde_json::from_str::<serde_json::Value>(&h.guard).ok());
+        if let Some(g) = found {
+            return map_guard(&g, None);
+        }
+        let e = not_available(field, self.item.holder.as_ref().map(|h| h.status));
+        ctx.add_error(ctx.set_error_path(e.into_server_error(ctx.item.pos)));
+        IGuard::RawGuard(RawGuard {
+            keys: vec![],
+            predicate: String::new(),
+            raw: String::new(),
+        })
     }
     pub async fn id(&self) -> Result<ID> {
         Ok(ID(encode(&NodeKey::NonFungibleTokenBalance {
@@ -268,8 +298,21 @@ impl NonFungibleTokenBalance {
             chain: self.item.chain.to_string(),
         })))
     }
+    /// The token's info from `NftDetails`; `null` for a ledger without `get-token-info`
+    /// (marmalade v1), `null` with `NOT_AVAILABLE` when there is no usable row.
     async fn info(&self) -> Result<Option<NonFungibleToken>> {
-        unserved!("NonFungibleTokenBalance.info")
+        match &self.item.info {
+            Some(t) if t.status == nft::DETAIL_FOUND => Ok(Some(NonFungibleToken {
+                precision: t.precision,
+                supply: int_of(&t.supply),
+                uri: t.uri.clone(),
+            })),
+            Some(t) if t.status == nft::DETAIL_UNDEFINED => Ok(None),
+            t => Err(not_available(
+                "NonFungibleTokenBalance.info",
+                t.as_ref().map(|t| t.status),
+            )),
+        }
     }
     async fn token_id(&self) -> &str {
         &self.item.token_id
@@ -277,6 +320,23 @@ impl NonFungibleTokenBalance {
     async fn version(&self) -> String {
         ledger_version(&self.item.ledger)
     }
+}
+
+/// A decimal text as `Int`: truncated toward zero, clamped to `0..=i32::MAX` (R7D-9).
+fn int_of(s: &str) -> i32 {
+    s.parse::<f64>()
+        .map(|f| f.clamp(0.0, i32::MAX as f64) as i32)
+        .unwrap_or(0)
+}
+
+/// `NOT_AVAILABLE` for a details field, saying why (`status` of the stored row, if any).
+fn not_available(field: &str, status: Option<u8>) -> async_graphql::Error {
+    let why = match status {
+        None => "not read from the node yet",
+        Some(nft::DETAIL_ABSENT) => "the ledger has no such row",
+        Some(_) => "the node's answer could not be used",
+    };
+    err(Code::NotAvailable, format!("{field}: {why}"))
 }
 
 /// `nonFungibleAccount` / `nonFungibleChainAccount` (`chain`): `null` when the account holds

@@ -17,6 +17,9 @@ pub enum Code {
     CountTimeout,
     /// An `events.parametersFilter` form that is not served (GQ-11).
     UnsupportedFilter,
+    /// Stored data a field needs is not there (yet): NFT `guard`/`info` before the reconciler
+    /// read them, or when the node had no usable answer (GQ-15).
+    NotAvailable,
     Internal,
 }
 
@@ -29,6 +32,7 @@ impl Code {
             Code::Timeout => "TIMEOUT",
             Code::CountTimeout => "COUNT_TIMEOUT",
             Code::UnsupportedFilter => "UNSUPPORTED_FILTER",
+            Code::NotAvailable => "NOT_AVAILABLE",
             Code::Internal => "INTERNAL",
         }
     }

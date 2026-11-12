@@ -4,7 +4,9 @@
 //! | Table | Key | Value |
 //! |---|---|---|
 //! | `NftBalances` | AccountId u32, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 | source u8 (1 = ledger event, 2 = `/local`), ledger ModuleId u32, as_of u32, token-id length u16, token id, balance text |
-//! | `NftDirty` | same | marked_height u32, ledger ModuleId u32, token id |
+//! | `NftDirty` | same | marked_height u32, seq u64, ledger ModuleId u32, token id |
+//! | `NftDetails` (GQ-15) | 1, then the `NftBalances` key | status u8, as_of u32, guard JSON |
+//! | `NftDetails` (GQ-15) | 2, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 | status u8, as_of u32, precision i32, supply length u16, supply text, uri |
 //!
 //! - A *ledger* is a module on the allowlist ([`DEFAULT_LEDGERS`], or `[nft] ledgers`): anyone can
 //!   deploy a module named `ledger` and emit marmalade-shaped events for a real token id, so a
@@ -21,6 +23,10 @@
 //!   read from the node: a fill or a replay never moves a row back.
 //! - Zero balances are kept (they carry `as_of`, so an older event cannot resurrect a balance);
 //!   the route lists positive balances only.
+//! - `NftDetails` caches what GraphQL's `NonFungibleTokenBalance.guard` and `.info` show, read
+//!   by the reconciler with `{ledger}.details` and `{ledger}.get-token-info` (`kdx-ingest`
+//!   `nft_details`). A row is fresh while its `as_of` is at least the balance row's `as_of`;
+//!   holder rows of a zero balance are deleted, token rows stay (one per token).
 //! - An account that is not in the account dictionary (a non-principal name never seen as a tx
 //!   sender or a `TRANSFER` party) has no AccountId and gets no row.
 
@@ -265,6 +271,175 @@ pub fn is_dirty(
 ) -> Result<bool> {
     let k = nft_key(account, ledger, &token_hash(token_id), chain);
     Ok(txn.get(Table::NftDirty, &k)?.is_some())
+}
+
+// ---------------------------------------------------------------------------------------
+// Holding guards and token info (GQ-15, P7): `NftDetails`
+
+/// `NftDetails` key tag of a holding's guard: `1 ‖ nft_key` (26 bytes).
+pub const DETAIL_HOLDER: u8 = 1;
+/// `NftDetails` key tag of a token's info: `2 ‖ ledger ModuleId u32 ‖ token hash [16] ‖ chain u8`
+/// (22 bytes).
+pub const DETAIL_TOKEN: u8 = 2;
+
+/// The node answered (`{ledger}.details` guard, or `{ledger}.get-token-info`).
+pub const DETAIL_FOUND: u8 = 1;
+/// The node has no such ledger or token row.
+pub const DETAIL_ABSENT: u8 = 2;
+/// The call failed in Pact, its answer was unusable, or B-1 refused it: a property of the key,
+/// retried only once the balance row moves past `as_of`.
+pub const DETAIL_FAILED: u8 = 3;
+/// The ledger has no `get-token-info` (marmalade v1): `info` is `null`, not an error.
+pub const DETAIL_UNDEFINED: u8 = 4;
+
+/// Longest guard JSON and token uri kept (bytes); a longer answer is unusable.
+pub const MAX_DETAIL_TEXT: usize = 4096;
+
+pub fn holder_details_key(key: &[u8; 25]) -> [u8; 26] {
+    let mut k = [0u8; 26];
+    k[0] = DETAIL_HOLDER;
+    k[1..].copy_from_slice(key);
+    k
+}
+
+pub fn token_details_key(ledger: u32, token: &[u8; 16], chain: u8) -> [u8; 22] {
+    let mut k = [0u8; 22];
+    k[0] = DETAIL_TOKEN;
+    k[1..5].copy_from_slice(&ledger.to_be_bytes());
+    k[5..21].copy_from_slice(token);
+    k[21] = chain;
+    k
+}
+
+/// The token key of a holding's `nft_key`.
+pub fn token_details_key_of(key: &[u8; 25]) -> [u8; 22] {
+    let mut k = [0u8; 22];
+    k[0] = DETAIL_TOKEN;
+    k[1..].copy_from_slice(&key[4..]);
+    k
+}
+
+/// One holder value: `status u8 ‖ as_of u32 ‖ guard JSON` (compact; empty unless found).
+/// `as_of` is the tip height the node read at (found), else the height up to which the answer
+/// stands (the chain's tail, at least the balance row's `as_of`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderDetails {
+    pub status: u8,
+    pub as_of: u32,
+    pub guard: String,
+}
+
+impl HolderDetails {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(5 + self.guard.len());
+        v.push(self.status);
+        v.extend_from_slice(&self.as_of.to_be_bytes());
+        v.extend_from_slice(self.guard.as_bytes());
+        v
+    }
+
+    pub fn decode(v: &[u8]) -> Option<HolderDetails> {
+        if v.len() < 5 {
+            return None;
+        }
+        Some(HolderDetails {
+            status: v[0],
+            as_of: be_u32(&v[1..5])?,
+            guard: std::str::from_utf8(&v[5..]).ok()?.to_owned(),
+        })
+    }
+}
+
+/// One token value: `status u8 ‖ as_of u32 ‖ precision i32 ‖ supply length u16 ‖ supply text ‖
+/// uri` (the numbers and texts are zero/empty unless found).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenDetails {
+    pub status: u8,
+    pub as_of: u32,
+    pub precision: i32,
+    pub supply: String,
+    pub uri: String,
+}
+
+impl TokenDetails {
+    /// A row with no answer (absent, failed, undefined).
+    pub fn empty(status: u8, as_of: u32) -> TokenDetails {
+        TokenDetails {
+            status,
+            as_of,
+            precision: 0,
+            supply: String::new(),
+            uri: String::new(),
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let s = self.supply.as_bytes();
+        let mut v = Vec::with_capacity(11 + s.len() + self.uri.len());
+        v.push(self.status);
+        v.extend_from_slice(&self.as_of.to_be_bytes());
+        v.extend_from_slice(&self.precision.to_be_bytes());
+        v.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        v.extend_from_slice(s);
+        v.extend_from_slice(self.uri.as_bytes());
+        v
+    }
+
+    pub fn decode(v: &[u8]) -> Option<TokenDetails> {
+        if v.len() < 11 {
+            return None;
+        }
+        let n = usize::from(u16::from_be_bytes(v[9..11].try_into().ok()?));
+        let s = v.get(11..11 + n)?;
+        Some(TokenDetails {
+            status: v[0],
+            as_of: be_u32(&v[1..5])?,
+            precision: i32::from_be_bytes(v[5..9].try_into().ok()?),
+            supply: std::str::from_utf8(s).ok()?.to_owned(),
+            uri: std::str::from_utf8(&v[11 + n..]).ok()?.to_owned(),
+        })
+    }
+}
+
+/// A holding's guard row and its token's info row.
+pub type NftDetailsPair = (Option<HolderDetails>, Option<TokenDetails>);
+
+/// The stored guard and token info of one holding (`nft_key`); a missing table or row is `None`.
+pub fn details(txn: &impl Txn, key: &[u8; 25]) -> Result<NftDetailsPair> {
+    let h = txn
+        .get(Table::NftDetails, &holder_details_key(key))?
+        .and_then(|v| HolderDetails::decode(&v));
+    let t = txn
+        .get(Table::NftDetails, &token_details_key_of(key))?
+        .and_then(|v| TokenDetails::decode(&v));
+    Ok((h, t))
+}
+
+/// Store a holder answer unless the stored one is newer (read at a later tip).
+pub fn put_holder_details(txn: &mut RwTxn<'_>, key: &[u8; 25], d: &HolderDetails) -> Result<()> {
+    let k = holder_details_key(key);
+    if let Some(old) = txn
+        .get(Table::NftDetails, &k)?
+        .and_then(|v| HolderDetails::decode(&v))
+    {
+        if old.as_of > d.as_of {
+            return Ok(());
+        }
+    }
+    txn.put(Table::NftDetails, &k, &d.encode())
+}
+
+/// Store a token answer unless the stored one is newer.
+pub fn put_token_details(txn: &mut RwTxn<'_>, key: &[u8; 22], d: &TokenDetails) -> Result<()> {
+    if let Some(old) = txn
+        .get(Table::NftDetails, key)?
+        .and_then(|v| TokenDetails::decode(&v))
+    {
+        if old.as_of > d.as_of {
+            return Ok(());
+        }
+    }
+    txn.put(Table::NftDetails, key, &d.encode())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -866,5 +1041,95 @@ mod tests {
         txn.put(Table::NftBalances, &k, &bad.encode()).unwrap();
         assert!(!upsert_event(&mut txn, 1, "t:a", 0, 5, 200, "2.0").unwrap());
         txn.commit().unwrap();
+    }
+
+    /// GQ-15: `NftDetails` codecs and keys, an answer never replaced by an older one, and a
+    /// P6 store (every table but `NftDetails`) opens read-only and reads it as empty (A-1).
+    #[test]
+    fn nft_details_rows() {
+        use crate::{Geometry, HotStore};
+        let key = nft_key(7, 3, &token_hash("t:a"), 2);
+        assert_eq!(holder_details_key(&key)[0], DETAIL_HOLDER);
+        assert_eq!(&holder_details_key(&key)[1..], &key[..]);
+        assert_eq!(
+            token_details_key_of(&key),
+            token_details_key(3, &token_hash("t:a"), 2)
+        );
+        let h = HolderDetails {
+            status: DETAIL_FOUND,
+            as_of: 90,
+            guard: r#"{"keys":["ab"],"pred":"keys-all"}"#.into(),
+        };
+        assert_eq!(HolderDetails::decode(&h.encode()), Some(h.clone()));
+        let t = TokenDetails {
+            status: DETAIL_FOUND,
+            as_of: 90,
+            precision: 0,
+            supply: "1.0".into(),
+            uri: "ipfs://x".into(),
+        };
+        assert_eq!(TokenDetails::decode(&t.encode()), Some(t.clone()));
+        let e = TokenDetails::empty(DETAIL_UNDEFINED, 4);
+        assert_eq!(TokenDetails::decode(&e.encode()), Some(e));
+        assert_eq!(HolderDetails::decode(&[1, 0, 0]), None);
+        assert_eq!(
+            TokenDetails::decode(&[1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 9]),
+            None
+        );
+
+        let d = tempfile::tempdir().unwrap();
+        {
+            // A P6 store: every table but `NftDetails`.
+            let env = reth_libmdbx::Environment::builder()
+                .set_max_dbs(crate::env::MAX_DBS)
+                .open(d.path())
+                .unwrap();
+            let txn = env.begin_rw_txn().unwrap();
+            for t in Table::all().into_iter().filter(|t| *t != Table::NftDetails) {
+                let db = txn
+                    .create_db(Some(&t.name()), reth_libmdbx::DatabaseFlags::CREATE)
+                    .unwrap();
+                if t == Table::Meta {
+                    txn.put(
+                        db.dbi(),
+                        crate::env::meta::FORMAT_VERSION,
+                        crate::FORMAT_VERSION.to_be_bytes(),
+                        reth_libmdbx::WriteFlags::empty(),
+                    )
+                    .unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        {
+            let ro = HotStore::open_ro(d.path()).unwrap();
+            let txn = ro.ro().unwrap();
+            assert!(!txn.has_table(Table::NftDetails));
+            assert_eq!(details(&txn, &key).unwrap(), (None, None));
+        }
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        put_holder_details(&mut txn, &key, &h).unwrap();
+        put_token_details(&mut txn, &token_details_key_of(&key), &t).unwrap();
+        // An older answer (a slower call, a lagging node) never replaces a newer one.
+        let older = HolderDetails {
+            as_of: 80,
+            guard: "{}".into(),
+            ..h.clone()
+        };
+        put_holder_details(&mut txn, &key, &older).unwrap();
+        put_token_details(
+            &mut txn,
+            &token_details_key_of(&key),
+            &TokenDetails::empty(DETAIL_FAILED, 80),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        let txn = hot.ro().unwrap();
+        assert_eq!(details(&txn, &key).unwrap(), (Some(h), Some(t)));
+        // Another holder of the same token shares the token row.
+        let other = nft_key(8, 3, &token_hash("t:a"), 2);
+        assert!(details(&txn, &other).unwrap().1.is_some());
+        assert!(details(&txn, &other).unwrap().0.is_none());
     }
 }

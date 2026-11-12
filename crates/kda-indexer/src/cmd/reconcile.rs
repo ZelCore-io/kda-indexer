@@ -143,6 +143,7 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
         "tokens": txn.count(Table::Tokens)?,
         "nft_rows": txn.count(Table::NftBalances)?,
         "nft_dirty_rows": txn.count(Table::NftDirty)?,
+        "nft_details_rows": txn.count(Table::NftDetails)?,
         "nft_filled_height": txn
             .meta(kdx_hot::nft::meta::NFT_FILLED)?
             .and_then(|v| v.try_into().ok().map(u32::from_be_bytes)),

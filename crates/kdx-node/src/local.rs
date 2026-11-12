@@ -2,11 +2,13 @@
 //! Task 9, rulings B-1 and H-1).
 //!
 //! Safety (B-1):
-//! - Only four code forms are ever sent, each a fixed text with names passed in `data`:
+//! - Only six code forms are ever sent, each a fixed text with names passed in `data`:
 //!   `({m}.details (read-msg "a"))`, `(describe-keyset (read-msg "k"))`,
-//!   `({m}.get-balance (read-msg "t") (read-msg "a"))` and the fungible check
-//!   `(contains "fungible-v2" (at 'interfaces (describe-module (read-msg "m"))))`. Account, keyset and token names come
-//!   from chain data and may be hostile; they never enter code.
+//!   `({m}.get-balance (read-msg "t") (read-msg "a"))`, the fungible check
+//!   `(contains "fungible-v2" (at 'interfaces (describe-module (read-msg "m"))))`, and the two
+//!   GQ-15 forms for a trusted NFT ledger, `({m}.details (read-msg "t") (read-msg "a"))` and
+//!   `({m}.get-token-info (read-msg "t"))`. Account, keyset and token names come from chain
+//!   data and may be hostile; they never enter code.
 //! - `m` must match `^[A-Za-z_][A-Za-z0-9_\-]*(\.[A-Za-z_][A-Za-z0-9_\-]*)?$`, otherwise the
 //!   call is not made ([`LocalError::Skipped`]).
 //! - Names are capped at [`MAX_NAME_LEN`] bytes; `meta.gasLimit` is [`GAS_LIMIT`].
@@ -120,6 +122,25 @@ pub fn command(network: &str, chain: u8, code: &str, data: &Value, now_secs: u64
     let digest = Blake2b::<blake2::digest::consts::U32>::digest(cmd.as_bytes());
     let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
     json!({"hash": hash, "sigs": [], "cmd": cmd})
+}
+
+/// The failure message means `module` has no member `member` (Pact 5, measured on mainnet01:
+/// `Module marmalade.ledger has no such member: get-token-info`). Exact match: the ledger is a
+/// trusted name and the code is fixed, so no hostile text can produce it.
+pub fn is_no_member_message(msg: &str, module: &str, member: &str) -> bool {
+    msg == format!("Module {module} has no such member: {member}")
+        || msg == format!("Cannot resolve {module}.{member}")
+}
+
+/// Longest guard JSON and token uri accepted from an NFT ledger answer (bytes, GQ-15).
+pub const MAX_NFT_TEXT: usize = 4096;
+
+/// `{ledger}.get-token-info` of one token (GQ-15): `precision`, `supply` (decimal text) and `uri`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenInfo {
+    pub precision: i32,
+    pub supply: String,
+    pub uri: String,
 }
 
 /// Longest decimal text accepted from a node answer (bytes).
@@ -370,9 +391,196 @@ impl LocalClient {
     }
 }
 
+impl LocalClient {
+    /// `({ledger}.details (read-msg "t") (read-msg "a"))` with `data {"t": token, "a": account}`
+    /// (GQ-15): the holding's guard, compact JSON. The answer must name the same token and
+    /// account when it names them, and the guard must be an object of at most [`MAX_NFT_TEXT`]
+    /// bytes; anything else is unusable.
+    pub async fn nft_guard(
+        &self,
+        chain: u8,
+        ledger: &str,
+        token_id: &str,
+        account: &str,
+    ) -> LocalResult<String> {
+        check_module(ledger)?;
+        check_name("account", account)?;
+        check_name("token", token_id)?;
+        let code = format!("({ledger}.details (read-msg \"t\") (read-msg \"a\"))");
+        let r = self
+            .call(chain, &code, json!({ "t": token_id, "a": account }))
+            .await?;
+        nft_guard_of(r, token_id, account)
+    }
+
+    /// `({ledger}.get-token-info (read-msg "t"))` with `data {"t": token}` (GQ-15). A ledger
+    /// without the function answers a [`LocalError::Failure`] that [`is_no_member_message`]
+    /// recognizes.
+    pub async fn nft_token_info(
+        &self,
+        chain: u8,
+        ledger: &str,
+        token_id: &str,
+    ) -> LocalResult<TokenInfo> {
+        check_module(ledger)?;
+        check_name("token", token_id)?;
+        let code = format!("({ledger}.get-token-info (read-msg \"t\"))");
+        let r = self.call(chain, &code, json!({ "t": token_id })).await?;
+        token_info_of(r, token_id)
+    }
+}
+
+fn echoes(v: &Value, field: &str, want: &str) -> bool {
+    v.get(field).is_none_or(|x| x.as_str() == Some(want))
+}
+
+fn nft_guard_of(r: Local<Value>, token_id: &str, account: &str) -> LocalResult<String> {
+    let (value, height) = match r {
+        Local::Absent => return Ok(Local::Absent),
+        Local::Found { value, height } => (value, height),
+    };
+    if !echoes(&value, "id", token_id) || !echoes(&value, "account", account) {
+        return Err(invalid("nft details: another token or account"));
+    }
+    let guard = match value.get("guard") {
+        Some(g @ Value::Object(_)) => g.to_string(),
+        _ => return Err(invalid("nft details: no guard object")),
+    };
+    if guard.len() > MAX_NFT_TEXT {
+        return Err(invalid("nft details: guard over the size cap"));
+    }
+    Ok(Local::Found {
+        value: guard,
+        height,
+    })
+}
+
+fn token_info_of(r: Local<Value>, token_id: &str) -> LocalResult<TokenInfo> {
+    let (value, height) = match r {
+        Local::Absent => return Ok(Local::Absent),
+        Local::Found { value, height } => (value, height),
+    };
+    if !echoes(&value, "id", token_id) {
+        return Err(invalid("token info: another token"));
+    }
+    let precision = value
+        .get("precision")
+        .and_then(|p| p.as_i64().or_else(|| p.get("int").and_then(Value::as_i64)))
+        .and_then(|p| i32::try_from(p).ok())
+        .filter(|p| *p >= 0)
+        .ok_or_else(|| invalid("token info: no integer precision"))?;
+    let supply = value
+        .get("supply")
+        .and_then(decimal_text)
+        .ok_or_else(|| invalid("token info: no decimal supply"))?;
+    let uri = value
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|u| u.len() <= MAX_NFT_TEXT)
+        .ok_or_else(|| invalid("token info: no uri text within the size cap"))?
+        .to_owned();
+    Ok(Local::Found {
+        value: TokenInfo {
+            precision,
+            supply,
+            uri,
+        },
+        height,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GQ-15: the two NFT forms keep the token and account in `data`; answers are checked.
+    #[test]
+    fn nft_forms_and_answers() {
+        let (t, a) = ("t:x\") (coin.transfer", "k:y\") (z");
+        let code = "(marmalade-v2.ledger.details (read-msg \"t\") (read-msg \"a\"))";
+        let b = command("mainnet01", 8, code, &json!({ "t": t, "a": a }), 1_000);
+        let cmd: Value = serde_json::from_str(b["cmd"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            cmd.pointer("/payload/exec/code").and_then(Value::as_str),
+            Some(code)
+        );
+        assert_eq!(cmd.pointer("/payload/exec/data/t"), Some(&json!(t)));
+        assert_eq!(cmd.pointer("/payload/exec/data/a"), Some(&json!(a)));
+        let found = |v: Value| Local::Found {
+            value: v,
+            height: 9,
+        };
+        let g = json!({"keys": ["ab"], "pred": "keys-all"});
+        assert_eq!(
+            nft_guard_of(
+                found(json!({"id": "t:1", "account": "k:a", "balance": 1, "guard": g})),
+                "t:1",
+                "k:a"
+            )
+            .unwrap(),
+            Local::Found {
+                value: r#"{"keys":["ab"],"pred":"keys-all"}"#.into(),
+                height: 9
+            }
+        );
+        for bad in [
+            json!({"id": "t:2", "account": "k:a", "guard": g}),
+            json!({"id": "t:1", "account": "k:b", "guard": g}),
+            json!({"id": "t:1", "account": "k:a", "guard": null}),
+            json!({"id": "t:1", "account": "k:a", "guard": "x"}),
+            json!({"guard": {"k": "x".repeat(MAX_NFT_TEXT)}}),
+        ] {
+            assert!(
+                nft_guard_of(found(bad.clone()), "t:1", "k:a").is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            nft_guard_of(Local::Absent, "t:1", "k:a").unwrap(),
+            Local::Absent
+        );
+        let info = token_info_of(
+            found(json!({"id": "t:1", "supply": 1.0, "precision": 0, "uri": "ipfs://x", "policies": []})),
+            "t:1",
+        )
+        .unwrap();
+        assert_eq!(
+            info,
+            Local::Found {
+                value: TokenInfo {
+                    precision: 0,
+                    supply: "1.0".into(),
+                    uri: "ipfs://x".into()
+                },
+                height: 9
+            }
+        );
+        assert!(token_info_of(
+            found(json!({"supply": {"decimal": "2.5"}, "precision": {"int": 1}, "uri": ""})),
+            "t:1"
+        )
+        .is_ok());
+        for bad in [
+            json!({"id": "t:2", "supply": 1, "precision": 0, "uri": ""}),
+            json!({"supply": "lots", "precision": 0, "uri": ""}),
+            json!({"supply": 1, "precision": -1, "uri": ""}),
+            json!({"supply": 1, "precision": 1.5, "uri": ""}),
+            json!({"supply": 1, "precision": 0}),
+            json!({"supply": 1, "precision": 0, "uri": "x".repeat(MAX_NFT_TEXT + 1)}),
+        ] {
+            assert!(token_info_of(found(bad.clone()), "t:1").is_err(), "{bad}");
+        }
+        assert!(is_no_member_message(
+            "Module marmalade.ledger has no such member: get-token-info",
+            "marmalade.ledger",
+            "get-token-info"
+        ));
+        assert!(!is_no_member_message(
+            "Module marmalade.ledger has no such member: get-token-info x",
+            "marmalade.ledger",
+            "get-token-info"
+        ));
+    }
 
     #[test]
     fn module_check() {
@@ -461,7 +669,8 @@ mod tests {
     }
 
     /// Live dev check (B-1): `KDX_LOCAL_NODE=<service url> cargo test -p kdx-node -- --ignored
-    /// local_live`. Four `/local` reads on mainnet01 chain 0, nothing else.
+    /// local_live`. Six `/local` reads on mainnet01 chains 0 and 8 (two more per optional
+    /// `KDX_LOCAL_NFT` / `KDX_LOCAL_ACCOUNT` holding), nothing else.
     #[tokio::test]
     #[ignore]
     async fn local_live() {
@@ -500,6 +709,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(miss, Local::Absent);
+        // GQ-15: hostile token and account ids are data and answer `Absent` on both forms.
+        let (t, a) = ("t:x\") (coin.transfer", "k:y\") (z");
+        let v2 = "marmalade-v2.ledger";
+        assert_eq!(l.nft_guard(8, v2, t, a).await.unwrap(), Local::Absent);
+        assert_eq!(l.nft_token_info(8, v2, t).await.unwrap(), Local::Absent);
+        // `KDX_LOCAL_NFT=chain,ledger,token,account`: one real holding.
+        if let Ok(spec) = std::env::var("KDX_LOCAL_NFT") {
+            let p: Vec<&str> = spec.splitn(4, ',').collect();
+            let chain: u8 = p[0].parse().unwrap();
+            let g = l.nft_guard(chain, p[1], p[2], p[3]).await.unwrap();
+            println!("guard: {g:?}");
+            assert!(matches!(g, Local::Found { .. }));
+            match l.nft_token_info(chain, p[1], p[2]).await {
+                Err(LocalError::Failure(m)) => {
+                    println!("info: {m}");
+                    assert!(is_no_member_message(&m, p[1], "get-token-info"));
+                }
+                r => {
+                    println!("info: {r:?}");
+                    assert!(matches!(r, Ok(Local::Found { .. })));
+                }
+            }
+        }
         if let Ok(acct) = std::env::var("KDX_LOCAL_ACCOUNT") {
             let d = l.details(0, "coin", &acct).await.unwrap();
             println!("{acct}: {d:?}");

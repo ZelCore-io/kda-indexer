@@ -626,7 +626,9 @@ reorg marks the affected balance rows dirty instead.
 | `KeyAccounts` | blake2b-128 of the public key [16], AccountId u32 | empty |
 | `Tokens` | ModuleId u32 | first_height u32, holders u64, kind u8 (0 = fungible) |
 | `NftBalances` | AccountId u32, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 | source u8 (1 = ledger event, 2 = `/local`), ledger ModuleId u32, as_of u32, token-id length u16, token id, balance text |
-| `NftDirty` | same | marked_height u32, ledger ModuleId u32, token id |
+| `NftDirty` | same | marked_height u32, seq u64 (write txn id), ledger ModuleId u32, token id |
+| `NftDetails` (P7, GQ-15) | 1, then the `NftBalances` key (a holding's guard) | status u8 (1 found, 2 absent, 3 failed), as_of u32, guard JSON |
+| `NftDetails` (P7, GQ-15) | 2, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 (a token's info) | status u8 (1 found, 2 absent, 3 failed, 4 the ledger has no `get-token-info`), as_of u32, precision i32, supply length u16, supply text, uri |
 
 `Meta` keys of the balance seed: `balances_seeded` (u32: the highest tail height when the seed
 finished), `balances_seed_cursor` (13 bytes while a seed runs: range start u32, range end u32,
@@ -640,6 +642,12 @@ at height `h` replaces a row unless the row is newer, so replays and the history
 move a row back. Tail undo marks the rows the undone txs touched `NftDirty`; the reconciler
 reads them with `get-balance`. `Meta nft_filled` (u32: the highest tail height when the history
 fill finished) marks the one-time fill that walks the `evt` postings of every ledger event name.
+
+`NftDetails` (`nft.rs`) caches the GraphQL `NonFungibleTokenBalance.guard` and `.info`. `as_of`
+is the node tip of the answer, or, without an answer, the chain's tail (at least the balance
+row's `as_of`). A row is due again once its balance row's `as_of` passes it. Guard rows of a zero
+balance are deleted. Guard JSON and uri are capped at 4,096 bytes. Like the other additive
+tables it is created by `open` and read as empty by a read-only open of an older store.
 
 `KeyAccounts` is keyed by a hash of the key text, not by a `PubKey` dictionary id: the
 dictionary stays a pure function of the blocks (`hot stats --digest` replay checks), and keys

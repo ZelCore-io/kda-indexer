@@ -51,6 +51,7 @@ Errors carry `extensions.code`:
 | `TIMEOUT` | the request deadline passed |
 | `COUNT_TIMEOUT` | `totalCount` could not be counted in time; the edges are still returned |
 | `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
+| `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
 
 ## Limits
@@ -245,8 +246,17 @@ pages on another, and a cursor whose block was reorged away is refused.
   as the schema says.
 - `nonFungibleAccount`/`nonFungibleChainAccount` list positive NFT holdings (at most
   `max_page`); `version` is `v1` (`marmalade.ledger`), `v2` (`marmalade-v2.ledger`) or the
-  ledger name. `NonFungibleTokenBalance.info` and `.guard` are not stored and answer
-  `NOT_SUPPORTED`; `guard` is non-null, so that error nulls the account.
+  ledger name.
+- `NonFungibleTokenBalance.guard` and `.info` come from the `NftDetails` table. The reconciler
+  fills it with `({ledger}.details (read-msg "t") (read-msg "a"))` and
+  `({ledger}.get-token-info (read-msg "t"))` (GQ-15); resolvers never call the node.
+  - Details read before the holding's balance last changed are served, as stale balances are.
+  - `info` is `null` with no error for a ledger without `get-token-info` (`marmalade.ledger`).
+    `supply` is truncated toward zero, like `balance`.
+  - A holding whose details are not read yet, or whose node answer was absent or unusable, gets
+    a `NOT_AVAILABLE` error on that field only. `info` is then `null`. `guard` is non-null, so
+    it answers an empty `RawGuard` (`raw: ""`, no keys) beside the error: the account and its
+    other holdings still answer.
 
 ## Fields compared with the node, not an oracle
 
