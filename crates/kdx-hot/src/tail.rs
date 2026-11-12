@@ -331,3 +331,44 @@ mod balance_mark_tests {
         txn.commit().unwrap();
     }
 }
+
+#[cfg(test)]
+mod legacy_defpact_undo_tests {
+    use kdx_types::{Hash32, TxKey};
+
+    use super::{defpact_bytes, defpact_list, unwind_to};
+    use crate::tables::block_key;
+    use crate::undo::{self, UndoOp};
+    use crate::{Geometry, HotStore, Table, Txn};
+
+    /// m12 (T-5): an undo record written before T-5 names `Defpacts` rows; unwinding its
+    /// block drops that key from each row, and a row left without keys is deleted.
+    #[test]
+    fn unwinding_a_pre_t5_defpact_step_drops_the_rows_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let (two, one) = (Hash32([7u8; 32]), Hash32([9u8; 32]));
+        let (k1, k2, k3) = (
+            TxKey::new(5, 0, 1),
+            TxKey::new(3, 0, 2),
+            TxKey::new(5, 0, 2),
+        );
+        let mut txn = hot.rw().unwrap();
+        txn.put(Table::Defpacts, &two.0, &defpact_bytes(&[k2, k1]))
+            .unwrap();
+        txn.put(Table::Defpacts, &one.0, &defpact_bytes(&[k3]))
+            .unwrap();
+        let ops = [
+            UndoOp::DefpactStep { pact: two, key: k1 },
+            UndoOp::DefpactStep { pact: one, key: k3 },
+        ];
+        txn.put(Table::Undo, &block_key(0, 5), &undo::encode(&ops))
+            .unwrap();
+        assert_eq!(unwind_to(&mut txn, 0, 4).unwrap(), 1);
+        let left = txn.get(Table::Defpacts, &two.0).unwrap().expect("row kept");
+        assert_eq!(defpact_list(&left), vec![k2]);
+        assert!(txn.get(Table::Defpacts, &one.0).unwrap().is_none());
+        assert!(txn.get(Table::Undo, &block_key(0, 5)).unwrap().is_none());
+        txn.commit().unwrap();
+    }
+}
