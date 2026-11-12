@@ -342,6 +342,10 @@ the oracle puts them.
   is answered as the caller's own choice. Even a `coin` row proves only that the account's guard
   holds the key, not who owns the account: anyone can create an account guarded by someone
   else's key without their signature.
+  The 100 are counted after the module filter: accounts of other modules guarded by the same
+  key (spam needs no signature) never push the asked module's accounts out. The walk over the
+  key's accounts stops at 100 matches or after its 1 s scan window; when it stops with
+  accounts of the key left unread, the response carries `"extensions": {"truncated": true}`.
 - `FungibleAccount.transactions`: txs with a transfer of the token on the account's side;
   `FungibleChainAccount.transactions`: txs on that chain the account sent (`meta.sender`),
   as the schema says.
