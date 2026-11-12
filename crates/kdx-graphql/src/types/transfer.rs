@@ -22,14 +22,34 @@ pub struct Transfer {
     pub i: usize,
     /// The preloaded other half (`Some(None)`: there is none).
     pub xchain: Option<XHalf>,
+    /// An NFT transfer: `i` indexes `d.nfts` (ZelCore `transfers(isNFT: true)`).
+    pub nft: bool,
 }
 
 impl Transfer {
     pub fn new(d: Arc<TxData>, i: usize, xchain: Option<XHalf>) -> Transfer {
-        Transfer { d, i, xchain }
+        Transfer {
+            d,
+            i,
+            xchain,
+            nft: false,
+        }
+    }
+    /// The NFT transfer at `nfts[i]` of `d`.
+    pub fn nft(d: Arc<TxData>, i: usize) -> Transfer {
+        Transfer {
+            d,
+            i,
+            xchain: Some(None),
+            nft: true,
+        }
     }
     fn t(&self) -> &shapes::Transfer {
-        &self.d.trs[self.i]
+        if self.nft {
+            &self.d.nfts[self.i].tr
+        } else {
+            &self.d.trs[self.i]
+        }
     }
     pub(crate) fn ord_idx(&self) -> i64 {
         shapes::ev_idx(self.d.key(), self.t().pos)
@@ -64,7 +84,16 @@ fn amount(d: &TxData, t: &shapes::Transfer) -> Decimal {
 #[Object]
 impl Transfer {
     async fn amount(&self) -> Decimal {
+        if self.nft {
+            let t = self.t();
+            return Decimal::new(&t.amount)
+                .unwrap_or_else(|| Decimal::new("0").expect("0 is a decimal"));
+        }
         amount(&self.d, self.t())
+    }
+    /// ZelCore extension: the token id of an NFT transfer; `null` for a fungible one.
+    async fn token_id(&self) -> Option<String> {
+        self.nft.then(|| self.d.nfts[self.i].token_id.clone())
     }
     async fn block(&self) -> Block {
         block_node(&self.d.block)

@@ -1,6 +1,8 @@
 //! Schema parity (GQ-3, Review Focus 1): our SDL against the vendored Kadena schema, both
 //! normalised (sorted, descriptions dropped). Names, arguments, argument defaults, types and
-//! nullability, interfaces, union members and deprecations must be identical.
+//! nullability, interfaces, union members and deprecations must be identical, except for the
+//! pinned ZelCore extensions (`tests/extensions.txt`, R-P5P9-16): our schema is Kadena's
+//! plus those additive lines, with one relaxed argument (`RELAXED`).
 
 use std::collections::BTreeSet;
 
@@ -106,18 +108,40 @@ fn normalise(sdl: &str) -> BTreeSet<String> {
     out
 }
 
+/// Kadena lines our schema relaxes (ZelCore extension, R7I-2): every document valid against
+/// Kadena's schema stays valid (a non-null variable may fill a nullable argument).
+const RELAXED: &[&str] = &["arg Query.events(qualifiedEventName): String! = -"];
+
+/// The ZelCore extension lines (R-P5P9-16), normalised; listed in `docs/graphql.md`. Any
+/// other difference from the vendored schema fails.
+const EXTENSIONS: &str = include_str!("extensions.txt");
+
+fn trimmed(set: &BTreeSet<String>) -> BTreeSet<String> {
+    set.iter().map(|l| l.trim_end().to_owned()).collect()
+}
+
 #[test]
-fn our_schema_is_the_kadena_schema() {
+fn our_schema_is_kadena_plus_the_extensions() {
     let ours = build_schema_detached(GraphqlSettings::default()).sdl();
-    let a = normalise(VENDORED);
-    let b = normalise(&ours);
-    let missing: Vec<_> = a.difference(&b).collect();
-    let extra: Vec<_> = b.difference(&a).collect();
+    let a = trimmed(&normalise(VENDORED));
+    let b = trimmed(&normalise(&ours));
+    let relaxed: BTreeSet<String> = RELAXED.iter().map(|s| s.to_string()).collect();
+    let ext: BTreeSet<String> = EXTENSIONS
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    let missing: BTreeSet<String> = a.difference(&b).cloned().collect();
+    let extra: BTreeSet<String> = b.difference(&a).cloned().collect();
+    let fmt = |v: Vec<&String>| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n");
     assert!(
-        missing.is_empty() && extra.is_empty(),
-        "schema differs from the vendored Kadena schema\n-- missing in ours:\n{}\n-- extra in ours:\n{}",
-        missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"),
-        extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"),
+        missing == relaxed && extra == ext,
+        "schema is not Kadena's plus the pinned extensions\n-- missing in ours (not relaxed):\n{}\n-- relaxed but not missing:\n{}\n-- extra in ours (not pinned):\n{}\n-- pinned but absent:\n{}",
+        fmt(missing.difference(&relaxed).collect()),
+        fmt(relaxed.difference(&missing).collect()),
+        fmt(extra.difference(&ext).collect()),
+        fmt(ext.difference(&extra).collect()),
     );
     // Sanity: the normaliser saw the whole file.
     assert!(a.len() > 300, "{}", a.len());

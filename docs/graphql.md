@@ -24,7 +24,8 @@ The schema is Kadena's `generated-schema.graphql`, vendored unchanged in
 `crates/kdx-graphql/schema/kadena-graph.graphql` (kadena.js commit
 `1b05828f9c1cff7ccd8f7665c577a0a9e599aa2b`, BSD-3-Clause, see `THIRD_PARTY_NOTICES`). Type,
 field and argument names, argument defaults, nullability, interfaces, unions and deprecations
-are identical; a test compares the two. Descriptions are not reproduced.
+are identical, plus the ZelCore extensions below; a test compares the two and pins every
+extension line (`crates/kdx-graphql/tests/extensions.txt`). Descriptions are not reproduced.
 
 Differences from Kadena graph:
 
@@ -49,7 +50,7 @@ Errors carry `extensions.code`:
 | `BAD_USER_INPUT` | a bad argument, cursor or request body |
 | `LIMIT` | a resource limit; `extensions.limit` names it (table below) |
 | `TIMEOUT` | the request deadline passed |
-| `COUNT_TIMEOUT` | `totalCount` could not be counted in time; the edges are still returned |
+| `COUNT_TIMEOUT` | reserved; a count cut short answers a lower bound instead (see `totalCount`) |
 | `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
 | `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
@@ -73,6 +74,11 @@ All in `[graphql]` (defaults shown). A refusal answers a GraphQL error with
 
 Rate: a request takes one token of the per-IP rate limit (`api.rate_per_ip`); a batch of N
 operations takes N.
+
+Complexity: each field costs 1 (`__typename` and the Relay wrappers `edges` and `node` cost
+0). A field that returns a page multiplies what it selects by the page size it will return:
+of a connection, only its `edges` (`totalCount` and `pageInfo` are answered once); of a list
+(`newBlocks`, the `transactions` subscription), all of it, sized by `quantity` when given.
 
 Depth counts nested fields; fragments are expanded where they are spread, so fragments,
 inline fragments and aliases do not get around depth or complexity. Every operation in a
@@ -224,8 +230,9 @@ pages on another, and a cursor whose block was reorged away is refused.
 - **`transaction(requestKey)`**: `null` when not indexed; a request key stored in several
   genesis blocks answers `BAD_USER_INPUT` unless `blockHash` picks one copy.
 - **`totalCount`** is computed only when selected: a count walk of at most 10,000 rows
-  within half of the remaining deadline (`COUNT_TIMEOUT` past it). Larger lists show 10,000.
-  `totalCount` is non-null, so a `COUNT_TIMEOUT` nulls its connection.
+  within half of the remaining deadline. Larger lists show 10,000. When the time share runs
+  out, `totalCount` answers the rows counted so far (a lower bound), the edges are kept, and
+  the response carries `"extensions": {"totalCountLowerBound": true}` (R-P5P9-14).
 - **Text forms.** `goodResult`, `badResult`, `continuation`, `metadata`, `Event.parameters`,
   payload `data` and capability `args` are compact JSON text of the node's values (numbers
   keep their exact text). `Transfer.amount` is the decimal of the event's amount parameter.
@@ -257,6 +264,32 @@ pages on another, and a cursor whose block was reorged away is refused.
     a `NOT_AVAILABLE` error on that field only. `info` is then `null`. `guard` is non-null, so
     it answers an empty `RawGuard` (`raw: ""`, no keys) beside the error: the account and its
     other holdings still answer.
+
+## ZelCore extensions
+
+Additive fields and arguments that kadscan's operations use (R-P5P9-16), built clean-room on
+our store; they are not in Kadena's schema. Every Kadena document stays valid: the one
+relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `String!` did.
+
+| Extension | Answer |
+|---|---|
+| `Block.canonical: Boolean!` | whether the block is the stored block at its chain and height. The store keeps the canonical chain only, so a block read in the same request is `true`; one held across a reorg (a subscription) may not be. One read per block |
+| `Block.coinbase: String!` | the coinbase output as compact JSON text (`gas`, `logs`, `txId`, `events`, `reqKey`, `result`, `metaData`, `continuation`). One read per block |
+| `Transaction.orphanedTransactions: [Transaction]` | always `[]`: the store keeps no orphaned blocks |
+| `QueryBlocksFromDepthConnection.totalCount` | blocks in the whole list, from the per-chain height ranges (store floor to tip minus `minimumDepth`); exact without a walk, since blocks are dense |
+| `TransactionResultTransfersConnection.totalCount` | the tx's transfer count |
+| `transactions(isCoinbase: Boolean)` | `false` or absent: user txs (as without it). `true`: `NOT_SUPPORTED` (coinbase txs are not `Transaction`s here; read `Block.coinbase`) |
+| `transfers(isNFT: Boolean)` | `true`: NFT transfers instead of fungible ones, the four-parameter `TRANSFER (id sender receiver amount)` events of the NFT ledgers (`[nft] ledgers`). An account's come from its `acct` postings; with neither account, module, block nor request key, heights are walked down from the tip (as `transactions` without a selective argument). `crossChainTransfer` is `null` for them |
+| `Transfer.tokenId: String` | the NFT transfer's token id; `null` for a fungible transfer |
+| `events(moduleName: String)` | events of that module. `qualifiedEventName` or `moduleName` is required (`BAD_USER_INPUT` otherwise); with both, both filter. `moduleName` alone has no posting list: unless `blockHash` or `requestKey` picks the txs, heights are walked down from the tip (at most 20,000 heights, within the deadline) |
+| `NetworkInfo.countersOfEachChain: [CountersOfEachChain!]!` | per chain, ascending: `chainId`, `blocksCount` (genesis to stored tip). `transactionCount: Int` and `totalGasUsedInKda: String` answer `null` with `NOT_AVAILABLE`: the store keeps no all-time per-chain tx or gas counter |
+| `balance(accountName, module, chainIds, first/last/after/before): QueryBalanceConnection!` | an account's present fungible balances, one `BalanceNode {accountName module chainId balance}` per module and chain, listed by module name then chain, filtered by `module` and `chainIds`; at most 4,096 rows per account (`LIMIT` above). Without `accountName` (a module's holders): `NOT_SUPPORTED`, as the store keeps no holders index |
+| `transactionsByPactCode(pactCode, first/after): QueryTransactionsByPactCodeConnection!` | txs whose own exec code contains `pactCode` (`%`/`_` wildcards), newest first, through the `/txs/search` engine: its pattern checks, per-client search gate, code index or bounded newest-first scan, caps and time budget. Rows are `TransactionSummary {requestKey height chainId canonical creationTime badResult sender gas gasLimit gasPrice code}`. Forward paging only (`last`/`before`: `BAD_USER_INPUT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |
+| `lastTokenPriceInKda(moduleName): Decimal` | `NOT_SUPPORTED`: no price data |
+| `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 100) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
+| `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 100) per message; a message per feed batch that has any |
+
+`pactQuery` stays `NOT_SUPPORTED`.
 
 ## Fields compared with the node, not an oracle
 

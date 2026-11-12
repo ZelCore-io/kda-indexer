@@ -291,6 +291,7 @@ fn transfers_spec(account: &str, module: &str, chain: Option<u8>) -> ListSpec {
         rows: Rows::Transfers {
             module: Some(module.to_owned()),
             account: Some(account.to_owned()),
+            nft: false,
         },
     }
 }
@@ -558,6 +559,173 @@ pub async fn accounts_by_public_key(
         .map_err(from_api)
 }
 
+// ---------------------------------------------------------------------------------------
+// ZelCore extension: Query.balance (R-P5P9-16)
+
+/// Fungible rows `balance(accountName)` reads for one account at most (all modules and
+/// chains); an account with more answers `LIMIT`.
+pub const MAX_BALANCE_ROWS: usize = 4_096;
+
+/// One row of `balance` (ZelCore extension): an account's balance of one module on one chain.
+#[derive(Debug, Clone, async_graphql::SimpleObject)]
+pub struct BalanceNode {
+    pub account_name: String,
+    pub module: String,
+    pub chain_id: String,
+    pub balance: String,
+}
+
+/// A `balance` cursor: the `(module, chain)` of a row, as `bal1:<chain>:<module>` in
+/// base64url (rows are listed by module name, then chain).
+pub fn balance_cursor(module: &str, chain: u8) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("bal1:{chain}:{module}"))
+}
+
+pub fn decode_balance_cursor(s: &str) -> Result<(String, u8)> {
+    use base64::Engine;
+    let bad = || bad_input("invalid cursor");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s.as_bytes())
+        .map_err(|_| bad())?;
+    let t = String::from_utf8(raw).map_err(|_| bad())?;
+    let rest = t.strip_prefix("bal1:").ok_or_else(bad)?;
+    let (c, m) = rest.split_once(':').ok_or_else(bad)?;
+    Ok((m.to_owned(), c.parse::<u8>().map_err(|_| bad())?))
+}
+
+/// `balance(accountName, module, chainIds)`: an account's present fungible rows (the
+/// reconciled balances), listed by module name then chain, filtered by `module` and
+/// `chainIds`. Without `accountName` (a module's holders) it is `NOT_SUPPORTED`: the store
+/// keeps no holders-by-module index, and a scan of every balance row is not bounded (R7I-5).
+#[allow(clippy::too_many_arguments)]
+pub async fn query_balance(
+    ctx: &Context<'_>,
+    account_name: Option<String>,
+    chain_ids: Option<Vec<String>>,
+    module: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    first: Option<i32>,
+    last: Option<i32>,
+) -> Result<super::QueryBalanceConnection> {
+    use crate::connection::{finish, Dir, Page, PageCursor};
+    let Some(account) = account_name else {
+        return Err(crate::error::not_supported(
+            "balance without accountName (a module's holders)",
+        ));
+    };
+    let account = crate::txlist::name_arg("accountName", &account)?.to_owned();
+    let module = module
+        .as_deref()
+        .map(|m| crate::txlist::name_arg("module", m).map(str::to_owned))
+        .transpose()?;
+    let chains: Option<Vec<u8>> = chain_ids
+        .as_deref()
+        .map(|cs| cs.iter().map(|c| crate::txlist::chain_arg(c)).collect())
+        .transpose()?;
+    let g = gql(ctx);
+    // Count and the cursor rules of every connection; the cursor is our own.
+    if after.is_some() && before.is_some() {
+        return Err(bad_input("pass after or before, not both"));
+    }
+    if (first.is_some() && before.is_some()) || (last.is_some() && after.is_some()) {
+        return Err(bad_input("after goes with first, before with last"));
+    }
+    let probe = PageArgs::new(None, None, first, last).parse(&g.settings)?;
+    let dir = if last.is_some() || (first.is_none() && before.is_some()) {
+        Dir::Backward
+    } else {
+        Dir::Forward
+    };
+    let cur = after
+        .as_deref()
+        .or(before.as_deref())
+        .map(decode_balance_cursor)
+        .transpose()?;
+    let acct = account.clone();
+    let mut rows: Vec<(String, u8, String)> = g
+        .state()?
+        .read(move |view| {
+            let d = view.dict();
+            let Some(a) = d.find(DictKind::Account, &acct) else {
+                return Ok(Vec::new());
+            };
+            let prefix = a.to_be_bytes().to_vec();
+            let found =
+                view.txn
+                    .scan_limit(Table::Balances, &prefix, MAX_BALANCE_ROWS + 1, |k| {
+                        k.starts_with(&prefix)
+                    })?;
+            if found.len() > MAX_BALANCE_ROWS {
+                return Err(kdx_api::ApiError::Unavailable(format!(
+                    "the account has more than {MAX_BALANCE_ROWS} balance rows"
+                )));
+            }
+            let mut out = Vec::new();
+            for (k, v) in found {
+                let (Some((_, m, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
+                    continue;
+                };
+                if r.absent || chains.as_ref().is_some_and(|cs| !cs.contains(&c)) {
+                    continue;
+                }
+                let Some(name) = d.name(DictKind::Module, m).map(str::to_owned) else {
+                    continue;
+                };
+                if module.as_ref().is_some_and(|x| *x != name) || hidden(view, m)? {
+                    continue;
+                }
+                out.push((name, c, r.balance.clone()));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(from_api)?;
+    rows.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
+    let key = |r: &(String, u8, String)| (r.0.clone(), r.1);
+    let walked: Vec<(String, u8, String)> = match (dir, &cur) {
+        (Dir::Forward, _) => rows
+            .into_iter()
+            .filter(|r| cur.as_ref().is_none_or(|c| key(r) > *c))
+            .take(probe.n + 1)
+            .collect(),
+        (Dir::Backward, _) => rows
+            .into_iter()
+            .rev()
+            .filter(|r| cur.as_ref().is_none_or(|c| key(r) < *c))
+            .take(probe.n + 1)
+            .collect(),
+    };
+    let page: Page<PageCursor> = Page {
+        dir,
+        n: probe.n,
+        // Only its presence is read (hasPreviousPage / hasNextPage).
+        cursor: cur.as_ref().map(|_| {
+            PageCursor::Block(crate::connection::BlockCursor {
+                height: 0,
+                chain: 0,
+            })
+        }),
+    };
+    let (edges, page_info) = finish(walked, &page, |r| balance_cursor(&r.0, r.1));
+    Ok(super::QueryBalanceConnection {
+        edges: edges
+            .into_iter()
+            .map(|(cursor, (m, c, b))| super::QueryBalanceConnectionEdge {
+                cursor,
+                node: BalanceNode {
+                    account_name: account.clone(),
+                    module: m,
+                    chain_id: c.to_string(),
+                    balance: b,
+                },
+            })
+            .collect(),
+        page_info,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::decimal_sum;
@@ -584,5 +752,22 @@ mod tests {
         assert_eq!(decimal_sum(["1.x"]), None);
         assert_eq!(decimal_sum(["-1"]), None);
         assert_eq!(decimal_sum([".5"]), None);
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    #[test]
+    fn balance_cursors_round_trip_and_refuse_junk() {
+        let c = balance_cursor("free.my:token", 19);
+        assert_eq!(
+            decode_balance_cursor(&c).unwrap(),
+            ("free.my:token".to_owned(), 19)
+        );
+        for bad in ["", "!!", "YmFsMTp4", "YmFsMjoxOmNvaW4"] {
+            assert!(decode_balance_cursor(bad).is_err(), "{bad}");
+        }
     }
 }

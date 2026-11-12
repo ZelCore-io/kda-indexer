@@ -85,7 +85,7 @@ async fn limits_answer_limit_fast() {
     );
     let complex = format!(
         "{{ blocksFromHeight(startHeight: 0, first: 100) {{ edges {{ node {{ {} }} }} }} }}",
-        fields(18)
+        fields(20)
     );
     let aliases: String = (0..100)
         .map(|i| format!("t{i}: transactions(blockHash: \"x\", first: 100) {{ edges {{ node {{ hash }} }} }} "))

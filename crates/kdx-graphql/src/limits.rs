@@ -9,9 +9,11 @@
 //! fragments get around depth or complexity. Every operation of a document is checked (not
 //! only the one that runs). The walk itself is bounded by [`MAX_VISITS`].
 //!
-//! Cost model: each field costs 1 (`__typename` 0). A field that returns a page
+//! Cost model: each field costs 1 (`__typename` and the Relay wrappers `edges` and `node`
+//! 0). A field that returns a page
 //! (`first`/`last` or a connection field without them) multiplies the cost of its
-//! selection by the page size it will return (clamped like the resolver: `max_page`, or
+//! selection (of a connection, its `edges` only: `totalCount` and `pageInfo` are answered
+//! once per connection) by the page size it will return (clamped like the resolver: `max_page`, or
 //! `default_page` when omitted). `nodes(ids)` multiplies by the number of ids; per-chain
 //! account lists by the chain count (20 or `chainIds`).
 
@@ -46,6 +48,9 @@ const PAGED: &[&str] = &[
     "blocksFromHeight",
     "completedBlockHeights",
     "transactionsByPublicKey",
+    // ZelCore extensions.
+    "transactionsByPactCode",
+    "balance",
 ];
 
 /// What a document needs.
@@ -112,8 +117,11 @@ impl<'a> Walk<'a> {
         set: &'a SelectionSet,
         depth: usize,
         intro: bool,
-    ) -> Result<u64, ServerError> {
+    ) -> Result<(u64, Option<u64>), ServerError> {
+        // The set's cost and, when it is a connection's (a direct `edges`, `pageInfo` or
+        // `totalCount` field), the part of it its `edges` fields cost.
         let mut total: u64 = 0;
+        let mut edges: Option<u64> = None;
         for sel in &set.items {
             self.visits += 1;
             if self.visits > MAX_VISITS {
@@ -174,7 +182,18 @@ impl<'a> Walk<'a> {
                     if list.is_some() {
                         self.intro_lists.pop();
                     }
-                    let c = 1u64.saturating_add(mult.saturating_mul(child?));
+                    // A connection's page multiplies its `edges` only: `totalCount` and
+                    // `pageInfo` are answered once per connection (R7I-8).
+                    let (all, part) = child?;
+                    // The Relay wrappers `edges` and `node` cost nothing themselves (the
+                    // page's items are counted by what they select).
+                    let own = u64::from(intro || !matches!(name, "edges" | "node"));
+                    let c = if let (false, Some(part)) = (intro, part) {
+                        own.saturating_add(all - part)
+                            .saturating_add(mult.saturating_mul(part))
+                    } else {
+                        own.saturating_add(mult.saturating_mul(all))
+                    };
                     if intro && depth == 0 {
                         // `__schema`/`__type`: counted against the introspection cap.
                         self.intro_cost = self.intro_cost.saturating_add(c);
@@ -186,11 +205,20 @@ impl<'a> Walk<'a> {
                         }
                     } else {
                         total = total.saturating_add(c);
+                        match name {
+                            "edges" => edges = Some(edges.unwrap_or(0).saturating_add(c)),
+                            "pageInfo" | "totalCount" => edges = Some(edges.unwrap_or(0)),
+                            _ => {}
+                        }
                     }
                 }
                 Selection::InlineFragment(i) => {
-                    total =
-                        total.saturating_add(self.set(&i.node.selection_set.node, depth, intro)?);
+                    let (t, e) = self.set(&i.node.selection_set.node, depth, intro)?;
+                    total = total.saturating_add(t);
+                    edges = match (edges, e) {
+                        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                        (a, b) => a.or(b),
+                    };
                 }
                 Selection::FragmentSpread(fs) => {
                     let name = fs.node.fragment_name.node.as_str();
@@ -202,13 +230,17 @@ impl<'a> Walk<'a> {
                         continue;
                     };
                     self.stack.push(name);
-                    let c = self.set(&def.node.selection_set.node, depth, intro)?;
+                    let (t, e) = self.set(&def.node.selection_set.node, depth, intro)?;
                     self.stack.pop();
-                    total = total.saturating_add(c);
+                    total = total.saturating_add(t);
+                    edges = match (edges, e) {
+                        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                        (a, b) => a.or(b),
+                    };
                 }
             }
         }
-        Ok(total)
+        Ok((total, edges))
     }
 
     /// An argument's value with variables substituted (`None` when absent or unbound).
@@ -259,6 +291,12 @@ impl<'a> Walk<'a> {
         if first.is_some() || last.is_some() {
             return page(first.max(last));
         }
+        // ZelCore `quantity` (subscriptions `newBlocks`, `transactions`): the list size.
+        match self.arg(f, "quantity") {
+            Arg::Unbound => return s.max_page as u64,
+            Arg::Val(v) => return page(Self::int(&v)),
+            Arg::Absent => {}
+        }
         let list_len = |arg: &str, absent: u64, unbound: u64| match self.arg(f, arg) {
             Arg::Absent => absent,
             Arg::Unbound => unbound,
@@ -271,7 +309,8 @@ impl<'a> Walk<'a> {
             }
             "chainAccounts"
             | "fungibleAccountsByPublicKey"
-            | "fungibleChainAccountsByPublicKey" => CHAINS,
+            | "fungibleChainAccountsByPublicKey"
+            | "countersOfEachChain" => CHAINS,
             "nonFungibleTokenBalances" => s.max_page as u64,
             _ if PAGED.contains(&name) => page(None),
             _ => 1,
@@ -314,7 +353,7 @@ pub fn analyze(
             })
             .collect();
         w.intro_cost = 0;
-        let c = w.set(&op.node.selection_set.node, 0, false)?;
+        let (c, _) = w.set(&op.node.selection_set.node, 0, false)?;
         w.cost.complexity = w.cost.complexity.max(c);
         if c > s.max_complexity {
             return Err(limit(
@@ -415,13 +454,41 @@ mod tests {
         })
     }
 
+    #[test]
+    fn connections_multiply_their_edges_only() {
+        let c = |q: &str| cost(q, serde_json::json!({})).unwrap().complexity;
+        // 1 (transactions) + 1 (totalCount) + 1 + 1 (pageInfo) + 100 x 1 (hash).
+        assert_eq!(
+            c("{ transactions(first: 100) { totalCount pageInfo { hasNextPage } edges { node { hash } } } }"),
+            104
+        );
+        // A connection that selects only its count is not multiplied.
+        assert_eq!(c("{ transactions { totalCount } }"), 2);
+        // A list (no connection fields) is multiplied whole: `quantity` sizes it.
+        assert_eq!(
+            c("subscription { transactions(quantity: 50) { hash } }"),
+            51
+        );
+        assert_eq!(c("subscription { newBlocks(quantity: 500) { hash } }"), 101);
+        // An unbound quantity costs max_page.
+        assert_eq!(
+            cost(
+                "subscription($q: Int) { transactions(quantity: $q) { hash } }",
+                serde_json::json!({})
+            )
+            .unwrap()
+            .complexity,
+            101
+        );
+    }
+
     fn block_fields(n: usize) -> String {
         (0..n).map(|i| format!("h{i}: hash ")).collect()
     }
 
     #[test]
     fn complexity_counts_pages() {
-        // 1 + 100 * (edges 1 + node (1 + n))
+        // 1 + 100 * n (the `edges` and `node` wrappers cost nothing)
         let q = |n| {
             format!(
                 "{{ blocksFromHeight(startHeight: 0, first: 100) {{ edges {{ node {{ {} }} }} }} }}",
@@ -429,17 +496,17 @@ mod tests {
             )
         };
         assert_eq!(
-            cost(&q(18), serde_json::json!({})),
+            cost(&q(20), serde_json::json!({})),
             Err("\"complexity\"".into())
         );
         assert_eq!(
-            cost(&q(17), serde_json::json!({})).unwrap().complexity,
+            cost(&q(19), serde_json::json!({})).unwrap().complexity,
             1901
         );
         // A variable page size counts like a literal; 1000 is clamped to 100.
         let qv = format!(
             "query($n: Int) {{ blocksFromHeight(startHeight: 0, first: $n) {{ edges {{ node {{ {} }} }} }} }}",
-            block_fields(17)
+            block_fields(19)
         );
         assert_eq!(
             cost(&qv, serde_json::json!({"n": 1000}))
@@ -453,7 +520,7 @@ mod tests {
         );
         // Omitted: the default page (20).
         let qd = "{ transactions(blockHash: \"x\") { edges { node { hash } } } }";
-        assert_eq!(cost(qd, serde_json::json!({})).unwrap().complexity, 61);
+        assert_eq!(cost(qd, serde_json::json!({})).unwrap().complexity, 21);
     }
 
     #[test]
@@ -469,7 +536,7 @@ mod tests {
         let q = "query { ...A ...A } fragment A on Query { transactions(blockHash: \"x\", first: 100) { edges { node { ...B ...B } } } } fragment B on Transaction { hash id }";
         assert_eq!(
             cost(q, serde_json::json!({})).unwrap().complexity,
-            2 * (1 + 100 * 6)
+            2 * (1 + 100 * 4)
         );
         // Exponential fragment fan-out hits the visit budget, quickly.
         let mut q = String::from("query { ...F0 }");
@@ -547,10 +614,10 @@ mod tests {
         let q = |n| {
             format!(
                 "query($n: Int{n}) {{ blocksFromHeight(startHeight: 0, first: $n) {{ edges {{ node {{ {} }} }} }} }}",
-                block_fields(18)
+                block_fields(20)
             )
         };
-        // No variables, no default: costed at max_page (100), so 18 fields x 100 + ... > 2,000.
+        // No variables, no default: costed at max_page (100), so 20 fields x 100 + 1 > 2,000.
         assert_eq!(
             cost(&q(""), serde_json::json!({})).unwrap_err(),
             "\"complexity\""

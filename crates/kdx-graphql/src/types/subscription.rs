@@ -211,6 +211,30 @@ fn feed_stream(
     }
 }
 
+/// A `quantity` argument (ZelCore extension): 1..=[`MAX_BATCH`]; absent is 20.
+fn quantity_arg(v: Option<i32>) -> Result<usize> {
+    match v.unwrap_or(20) {
+        n @ 1..=100 => Ok(n as usize),
+        _ => Err(bad_input(format!(
+            "quantity must be between 1 and {MAX_BATCH}"
+        ))),
+    }
+}
+
+/// The user txs of `blocks`, newest first (height, chain, position descending), at most `q`.
+fn newest_txs(blocks: &[Arc<FeedBlock>], q: usize) -> Vec<Transaction> {
+    let mut txs: Vec<_> = blocks
+        .iter()
+        .flat_map(|b| b.txs.iter())
+        .filter(|d| !d.is_coinbase())
+        .collect();
+    txs.sort_by_key(|d| std::cmp::Reverse(d.key()));
+    txs.into_iter()
+        .take(q)
+        .filter_map(|d| Transaction::new(d.clone()))
+        .collect()
+}
+
 fn depth_arg(name: &str, v: Option<i32>) -> Result<Option<u64>> {
     v.map(|d| u64::try_from(d).map_err(|_| bad_input(format!("{name} must not be negative"))))
         .transpose()
@@ -271,13 +295,50 @@ impl Subscription {
         &self,
         ctx: &Context<'_>,
         #[graphql(default_with = "default_chain_ids()")] chain_ids: Option<Vec<String>>,
+        // ZelCore extension: at most this many blocks per message (the newest). Absent keeps
+        // Kadena's behaviour (a message per feed batch, up to `MAX_BATCH` blocks).
+        quantity: Option<i32>,
     ) -> Result<BoxStream<'static, Result<Option<Vec<Block>>>>> {
         let chains = chain_set(chain_ids.as_deref())?;
+        let q = match quantity {
+            Some(_) => quantity_arg(quantity)?,
+            None => MAX_BATCH,
+        };
         Ok(feed_stream(ctx, chains, None)?
-            .map(|item| {
-                item.map(|bs| Some(bs.iter().map(|b| Block::new(b.block.clone())).collect()))
+            .map(move |item| {
+                item.map(|bs| {
+                    let skip = bs.len().saturating_sub(q);
+                    Some(
+                        bs.iter()
+                            .skip(skip)
+                            .map(|b| Block::new(b.block.clone()))
+                            .collect(),
+                    )
+                })
             })
             .boxed())
+    }
+
+    /// ZelCore extension: the user txs of newly committed blocks on every chain, newest
+    /// first, at most `quantity` per message (a message per feed batch that has any).
+    async fn transactions(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 20)] quantity: Option<i32>,
+    ) -> Result<BoxStream<'static, Result<Option<Vec<Transaction>>>>> {
+        let q = quantity_arg(quantity)?;
+        let s = feed_stream(ctx, chain_set(None)?, None)?;
+        Ok(s.filter_map(move |item| {
+            let out = item.map(|blocks| newest_txs(&blocks, q));
+            async move {
+                match out {
+                    Ok(v) if v.is_empty() => None,
+                    Ok(v) => Some(Ok(Some(v))),
+                    Err(e) => Some(Err(e)),
+                }
+            }
+        })
+        .boxed())
     }
 
     async fn new_blocks_from_depth(

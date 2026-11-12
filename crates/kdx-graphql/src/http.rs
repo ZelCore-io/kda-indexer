@@ -234,7 +234,8 @@ async fn execute(
     }
     let budget = st.settings.deadline.saturating_sub(DEADLINE_MARGIN);
     let deadline = Instant::now() + budget;
-    let batch = batch.data(ReqCtx { deadline });
+    let ip = peer.map(|p| st.client_ip_of(p, headers));
+    let batch = batch.data(ReqCtx { deadline, ip });
     let resp = match tokio::time::timeout(budget, schema.execute_batch(batch)).await {
         Ok(r) => r,
         Err(_) => {

@@ -58,6 +58,48 @@ pub struct TxData {
     pub cmd: Option<Value>,
     pub evs: Vec<Ev>,
     pub trs: Vec<shapes::Transfer>,
+    /// NFT transfers (ZelCore extension `transfers(isNFT: true)`): the four-parameter
+    /// `TRANSFER (id sender receiver amount)` events of NFT ledgers, with the token id.
+    pub nfts: Vec<NftTransfer>,
+}
+
+/// One NFT transfer of a tx: the transfer (amount from the fourth parameter) and its token.
+#[derive(Debug, Clone)]
+pub struct NftTransfer {
+    pub tr: shapes::Transfer,
+    pub token_id: String,
+}
+
+/// The NFT transfers of a tx's events (ledgers per `kdx_hot::nft::is_ledger`).
+pub fn nft_transfers(evs: &[Ev]) -> Vec<NftTransfer> {
+    evs.iter()
+        .filter_map(|e| {
+            if !kdx_hot::nft::is_ledger(&e.module)
+                || e.qual_name != format!("{}.TRANSFER", e.module)
+            {
+                return None;
+            }
+            let p = e.params.as_array().filter(|p| p.len() == 4)?;
+            let amount = match &p[3] {
+                Value::Number(n) => n.to_string(),
+                Value::Object(o) => match o.get("decimal").or_else(|| o.get("int"))? {
+                    Value::String(s) => s.clone(),
+                    v => v.to_string(),
+                },
+                _ => return None,
+            };
+            Some(NftTransfer {
+                tr: shapes::Transfer {
+                    pos: e.pos,
+                    token: e.module.clone(),
+                    from: p[1].as_str()?.to_owned(),
+                    to: p[2].as_str()?.to_owned(),
+                    amount,
+                },
+                token_id: p[0].as_str()?.to_owned(),
+            })
+        })
+        .collect()
 }
 
 impl TxData {
@@ -131,6 +173,7 @@ pub fn load(
     };
     let evs = shapes::events(&out);
     let trs = shapes::transfers(&evs);
+    let nfts = nft_transfers(&evs);
     Ok(Some(Arc::new(TxData {
         rec,
         block,
@@ -138,6 +181,7 @@ pub fn load(
         cmd,
         evs,
         trs,
+        nfts,
     })))
 }
 
@@ -232,17 +276,21 @@ pub enum Rows {
     /// The tx itself; `sender` keeps only txs whose `meta.sender` is it; `nft` keeps only txs
     /// with an event of an NFT ledger.
     Txs { sender: Option<String>, nft: bool },
-    /// Its events (named `qual` when given: `Block.events` lists them all), with the
-    /// optional `orderIndex` and parameter filters.
+    /// Its events (named `qual` when given: `Block.events` lists them all; of `module` when
+    /// given, the ZelCore `events(moduleName)` extension), with the optional `orderIndex` and
+    /// parameter filters.
     Events {
         qual: Option<String>,
+        module: Option<String>,
         order_index: Option<i64>,
         params: Option<ParamFilter>,
     },
-    /// Its transfers, of `module` and with `account` on a side when given.
+    /// Its transfers, of `module` and with `account` on a side when given; its NFT
+    /// transfers instead with `nft` (ZelCore `transfers(isNFT: true)`).
     Transfers {
         module: Option<String>,
         account: Option<String>,
+        nft: bool,
     },
 }
 
@@ -253,6 +301,8 @@ pub enum Item {
     Event(Arc<TxData>, usize),
     /// The transfer and, when preloaded, the other half of a cross-chain transfer.
     Transfer(Arc<TxData>, usize, Option<XHalf>),
+    /// The NFT transfer at index `i` of `nfts`.
+    Nft(Arc<TxData>, usize),
 }
 
 /// A preloaded `crossChainTransfer`: `None` when there is no other half (yet).
@@ -290,6 +340,7 @@ impl Rows {
             }
             Rows::Events {
                 qual,
+                module,
                 order_index,
                 params,
             } => d
@@ -298,12 +349,32 @@ impl Rows {
                 .enumerate()
                 .filter(|(_, e)| {
                     qual.as_deref().is_none_or(|q| e.qual_name == q)
+                        && module.as_deref().is_none_or(|m| e.module == m)
                         && order_index.is_none_or(|o| shapes::ev_idx(d.key(), e.pos) == o)
                         && params.as_ref().is_none_or(|p| p.matches(&e.params))
                 })
                 .map(|(i, e)| (sub_of(e.pos), Item::Event(d.clone(), i)))
                 .collect(),
-            Rows::Transfers { module, account } => d
+            Rows::Transfers {
+                module,
+                account,
+                nft: true,
+            } => d
+                .nfts
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| {
+                    let t = &n.tr;
+                    module.as_deref().is_none_or(|m| t.token == m)
+                        && account.as_deref().is_none_or(|a| t.from == a || t.to == a)
+                })
+                .map(|(i, n)| (sub_of(n.tr.pos), Item::Nft(d.clone(), i)))
+                .collect(),
+            Rows::Transfers {
+                module,
+                account,
+                nft: false,
+            } => d
                 .trs
                 .iter()
                 .enumerate()
@@ -613,8 +684,9 @@ pub fn run_page(
     Ok((edges.into_iter().map(|(_, e)| e).collect(), info))
 }
 
-/// Items of `spec`, up to [`COUNT_CAP`]; `None` when `until` passed first.
-pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<Option<u64>> {
+/// Items of `spec`, up to [`COUNT_CAP`], and whether the count is exact: when `until`
+/// passes first, the items counted so far (a lower bound) and `false`.
+pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bool)> {
     let src = resolve(view, &spec.source)?;
     let caps = Caps::of(view, &spec.filter)?;
     let mut blocks = Blocks::default();
@@ -622,7 +694,7 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<Option<u
     let mut n = 0u64;
     for (i, kr) in keys(view, &src, spec.filter, &caps, Bounds::default())?.enumerate() {
         if i % CHECK_EVERY == CHECK_EVERY - 1 && Instant::now() >= until {
-            return Ok(None);
+            return Ok((n, false));
         }
         let (k, rec) = kr?;
         if decode {
@@ -633,10 +705,10 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<Option<u
             n += 1;
         }
         if n >= COUNT_CAP {
-            return Ok(Some(COUNT_CAP));
+            return Ok((COUNT_CAP, true));
         }
     }
-    Ok(Some(n))
+    Ok((n, true))
 }
 
 /// The other half of the cross-chain transfer at `trs[i]` of `d`: for an outgoing half
@@ -722,7 +794,8 @@ pub async fn list(
     let state = g.state()?.clone();
     let page = args.parse(&g.settings)?;
     let dl = deadline(ctx);
-    let xchain = matches!(spec.rows, Rows::Transfers { .. }) && selects(ctx, "crossChainTransfer");
+    let xchain = matches!(spec.rows, Rows::Transfers { nft: false, .. })
+        && selects(ctx, "crossChainTransfer");
     let sp = spec.clone();
     let (edges, info) = state
         .read_heavy(move |view| {
@@ -745,17 +818,10 @@ pub async fn list(
         Box::pin(async move {
             let now = Instant::now();
             let until = now + dl.saturating_duration_since(now) / 2;
-            match state
+            state
                 .read_heavy(move |view| count(view, &spec, until))
                 .await
-                .map_err(from_api)?
-            {
-                Some(n) => Ok(n),
-                None => Err(err(
-                    Code::CountTimeout,
-                    "totalCount could not be counted in time",
-                )),
-            }
+                .map_err(from_api)
         })
     }));
     Ok(ListPage { edges, info, total })
@@ -871,5 +937,68 @@ mod tests {
         assert!(name_arg("accountName", "").is_err());
         assert!(name_arg("accountName", &"a".repeat(513)).is_err());
         assert!(hash_arg("requestKey", "short").is_err());
+    }
+}
+
+#[cfg(test)]
+mod nft_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ev(pos: usize, module: &str, name: &str, params: Value) -> Ev {
+        Ev {
+            pos,
+            qual_name: format!("{module}.{name}"),
+            module: module.to_owned(),
+            module_hash: String::new(),
+            params,
+        }
+    }
+
+    #[test]
+    fn nft_transfers_are_four_parameter_ledger_transfers() {
+        let evs = vec![
+            ev(0, "coin", "TRANSFER", json!(["a", "b", 1.5])),
+            ev(
+                1,
+                "marmalade-v2.ledger",
+                "TRANSFER",
+                json!(["t:x", "a", "b", 1.0]),
+            ),
+            ev(
+                2,
+                "marmalade-v2.ledger",
+                "TRANSFER",
+                json!(["t:y", "a", "b", {"decimal": "2.5"}]),
+            ),
+            ev(3, "free.ledger", "TRANSFER", json!(["t:z", "a", "b", 1.0])),
+            ev(
+                4,
+                "marmalade-v2.ledger",
+                "RECONCILE",
+                json!(["t:x", 1.0, {}, {}]),
+            ),
+            ev(
+                5,
+                "marmalade-v2.ledger",
+                "TRANSFER",
+                json!(["t:w", "a", "b"]),
+            ),
+        ];
+        let n = nft_transfers(&evs);
+        let got: Vec<_> = n
+            .iter()
+            .map(|t| {
+                (
+                    t.token_id.as_str(),
+                    t.tr.pos,
+                    t.tr.from.as_str(),
+                    t.tr.amount.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(got, vec![("t:x", 1, "a", "1.0"), ("t:y", 2, "a", "2.5")]);
+        // The fungible rule is unchanged: only the coin transfer.
+        assert_eq!(shapes::transfers(&evs).len(), 1);
     }
 }

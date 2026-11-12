@@ -74,6 +74,7 @@ impl Block {
             filter: KeyFilter::default(),
             rows: Rows::Events {
                 qual: None,
+                module: None,
                 order_index: None,
                 params: None,
             },
@@ -108,6 +109,46 @@ impl Block {
         Ok(ID(encode(&NodeKey::Block {
             hash: self.hash_text(),
         })))
+    }
+    /// ZelCore extension: whether this block is the stored block at its chain and height.
+    /// The store keeps the canonical chain only (a reorg replaces blocks), so a block read in
+    /// the same request is canonical; one held across a reorg (a subscription) may not be.
+    async fn canonical(&self, ctx: &Context<'_>) -> Result<bool> {
+        let b = self.b.clone();
+        gql(ctx)
+            .state()?
+            .read(move |view| {
+                let Ok(h) = u32::try_from(b.height) else {
+                    return Ok(false);
+                };
+                Ok(view.block(b.chain, h)?.is_some_and(|x| x.hash == b.hash))
+            })
+            .await
+            .map_err(from_api)
+    }
+    /// ZelCore extension: the block's coinbase output as compact JSON text (`gas`, `logs`,
+    /// `txId`, `events`, `reqKey`, `result`, `metaData`, `continuation`).
+    async fn coinbase(&self, ctx: &Context<'_>) -> Result<String> {
+        let b = self.b.clone();
+        let out = gql(ctx)
+            .state()?
+            .read(move |view| {
+                let Ok(h) = u32::try_from(b.height) else {
+                    return Ok(None);
+                };
+                match view.tx(kdx_types::TxKey::new(h, b.chain, 0))? {
+                    Some(r) => Ok(Some(kdx_api::compat::shapes::output(view, &r)?)),
+                    None => Ok(None),
+                }
+            })
+            .await
+            .map_err(from_api)?;
+        out.map(|v| super::tx::json_text(&v)).ok_or_else(|| {
+            err(
+                Code::NotAvailable,
+                "the coinbase of this block is not stored",
+            )
+        })
     }
     /// The miner's `coin` account on this chain (its current reconciled row).
     async fn miner_account(&self, ctx: &Context<'_>) -> Result<FungibleChainAccount> {
@@ -330,7 +371,7 @@ pub fn walk_blocks(
 }
 
 /// Per-chain stored tips and genesis heights.
-fn tips_and_genesis(view: &View) -> ApiResult<Vec<(u8, u64, u64)>> {
+pub(crate) fn tips_and_genesis(view: &View) -> ApiResult<Vec<(u8, u64, u64)>> {
     let genesis: Vec<(u8, u32)> = view.genesis.chains().collect();
     Ok(view
         .chain_tips()?
@@ -353,7 +394,10 @@ pub enum Span {
     Completed { count: u64, complete: bool },
 }
 
-pub type BlockEdges = (Vec<(String, Block)>, PageInfo);
+/// Edges, page info and the number of blocks in the whole list (ZelCore `totalCount` of
+/// `blocksFromDepth`: arithmetic over the per-chain height ranges, from the store floor up;
+/// blocks are dense, so it is exact without a walk).
+pub type BlockEdges = (Vec<(String, Block)>, PageInfo, u64);
 
 /// One page of a block list.
 pub async fn block_page(
@@ -368,7 +412,7 @@ pub async fn block_page(
         return Err(bad_input("invalid cursor"));
     }
     let p = page.clone();
-    let rows = g
+    let (rows, total) = g
         .state()?
         .read(move |view| {
             let tips = tips_and_genesis(view)?;
@@ -376,7 +420,13 @@ pub async fn block_page(
             let set = BlockSet {
                 chains: span_set(&tips, span),
             };
-            walk_blocks(view, &set, &p)
+            let floor = u64::from(kdx_api::compat::store_floor(view));
+            let total: u64 = set
+                .chains
+                .iter()
+                .map(|&(_, lo, hi)| (hi + 1).saturating_sub(lo.max(floor)))
+                .sum();
+            Ok((walk_blocks(view, &set, &p)?, total))
         })
         .await
         .map_err(from_api)?;
@@ -390,6 +440,7 @@ pub async fn block_page(
     Ok((
         edges.into_iter().map(|(c, b)| (c, Block::new(b))).collect(),
         info,
+        total,
     ))
 }
 

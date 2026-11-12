@@ -18,6 +18,7 @@ use kdx_api::ApiState;
 pub mod connection;
 pub mod error;
 pub mod feed;
+pub mod flags;
 pub mod http;
 pub mod ids;
 pub mod limits;
@@ -103,6 +104,9 @@ pub struct Gql {
     pub settings: GraphqlSettings,
     pub feed: Option<BlockFeed>,
     pub ws: ws::WsState,
+    /// The P6 search context (code index and gate) `transactionsByPactCode` runs on; `None`
+    /// answers that field `NOT_SUPPORTED`.
+    pub search: Option<Arc<kdx_api::search::SearchCtx>>,
 }
 
 impl Gql {
@@ -120,10 +124,12 @@ pub fn gql<'a>(ctx: &Context<'a>) -> &'a Gql {
     ctx.data_unchecked::<Gql>()
 }
 
-/// Per-request data: the deadline every batch of one HTTP request shares.
+/// Per-request data: the deadline every batch of one HTTP request shares, and the client IP
+/// (the search gate counts per client).
 #[derive(Debug, Clone, Copy)]
 pub struct ReqCtx {
     pub deadline: Instant,
+    pub ip: Option<std::net::IpAddr>,
 }
 
 /// The request deadline (a request without one, such as a subscription event, gets the
@@ -140,23 +146,34 @@ pub fn build_schema(
     settings: GraphqlSettings,
     feed: Option<BlockFeed>,
 ) -> KdxSchema {
-    build(Some(state), settings, feed, false)
+    build(Some(state), settings, feed, None, false)
+}
+
+/// The schema over a store, with the P6 search context for `transactionsByPactCode`.
+pub fn build_schema_with_search(
+    state: Arc<ApiState>,
+    settings: GraphqlSettings,
+    feed: Option<BlockFeed>,
+    search: Arc<kdx_api::search::SearchCtx>,
+) -> KdxSchema {
+    build(Some(state), settings, feed, Some(search), false)
 }
 
 /// The schema with no store (`graphql print-schema`).
 pub fn build_schema_detached(settings: GraphqlSettings) -> KdxSchema {
-    build(None, settings, None, false)
+    build(None, settings, None, None, false)
 }
 
 /// The schema of `graphql check-ops`: validation and limits run, execution never does.
 pub fn build_schema_check(settings: GraphqlSettings) -> KdxSchema {
-    build(None, settings, None, true)
+    build(None, settings, None, None, true)
 }
 
 fn build(
     state: Option<Arc<ApiState>>,
     settings: GraphqlSettings,
     feed: Option<BlockFeed>,
+    search: Option<Arc<kdx_api::search::SearchCtx>>,
     check_only: bool,
 ) -> KdxSchema {
     let introspection = settings.introspection;
@@ -170,8 +187,10 @@ fn build(
         ws: ws::WsState::new(&settings),
         settings,
         feed,
+        search,
     })
     .extension(limits::Limits)
+    .extension(flags::Flags)
     // Parser recursion and directive caps (the AST walk in `limits` is bounded separately).
     .limit_recursive_depth(limits::PARSER_RECURSION)
     .limit_directives(limits::MAX_DIRECTIVES);

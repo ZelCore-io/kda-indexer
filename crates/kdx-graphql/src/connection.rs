@@ -181,21 +181,31 @@ pub fn finish<T, C: Fn(&T) -> String>(
 }
 
 /// `totalCount` of a connection (GQ-10): known up front, computed only when selected, or
-/// not served.
+/// not served. A deferred count answers `(n, exact)`; an inexact one (its time share ran out)
+/// is a lower bound, flagged in the response `extensions` (R-P5P9-14 COUNT_TIMEOUT).
+/// A deferred count: `(items, exact)`.
+pub type CountFn = dyn Fn() -> BoxFuture<'static, async_graphql::Result<(u64, bool)>> + Send + Sync;
+
 #[derive(Clone, Default)]
 pub enum Total {
     #[default]
     Unsupported,
     Exact(u64),
-    Deferred(Arc<dyn Fn() -> BoxFuture<'static, async_graphql::Result<u64>> + Send + Sync>),
+    Deferred(Arc<CountFn>),
 }
 
 impl Total {
-    pub async fn resolve(&self) -> async_graphql::Result<i32> {
+    pub async fn resolve(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<i32> {
         let n = match self {
             Total::Unsupported => return Err(not_supported("totalCount")),
             Total::Exact(n) => *n,
-            Total::Deferred(f) => f().await?,
+            Total::Deferred(f) => {
+                let (n, exact) = f().await?;
+                if !exact {
+                    crate::flags::mark(ctx, crate::flags::Flag::CountLowerBound);
+                }
+                n
+            }
         };
         Ok(n.min(i32::MAX as u64) as i32)
     }

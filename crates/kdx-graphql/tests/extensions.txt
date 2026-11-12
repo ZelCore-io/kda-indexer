@@ -1,0 +1,65 @@
+# ZelCore extensions to Kadena's schema (R-P5P9-16), one normalised parity line each.
+arg Query.balance(accountName): String = -
+arg Query.balance(after): String = -
+arg Query.balance(before): String = -
+arg Query.balance(chainIds): [String!] = -
+arg Query.balance(first): Int = -
+arg Query.balance(last): Int = -
+arg Query.balance(module): String = -
+arg Query.events(moduleName): String = -
+arg Query.events(qualifiedEventName): String = -
+arg Query.lastTokenPriceInKda(moduleName): String! = -
+arg Query.transactions(isCoinbase): Boolean = -
+arg Query.transactionsByPactCode(after): String = -
+arg Query.transactionsByPactCode(before): String = -
+arg Query.transactionsByPactCode(first): Int = -
+arg Query.transactionsByPactCode(last): Int = -
+arg Query.transactionsByPactCode(pactCode): String! = -
+arg Query.transfers(isNFT): Boolean = -
+arg Subscription.newBlocks(quantity): Int = -
+arg Subscription.transactions(quantity): Int = 20
+field BalanceNode.accountName: String!
+field BalanceNode.balance: String!
+field BalanceNode.chainId: String!
+field BalanceNode.module: String!
+field Block.canonical: Boolean!
+field Block.coinbase: String!
+field CountersOfEachChain.blocksCount: Int!
+field CountersOfEachChain.chainId: String!
+field CountersOfEachChain.totalGasUsedInKda: String
+field CountersOfEachChain.transactionCount: Int
+field NetworkInfo.countersOfEachChain: [CountersOfEachChain!]!
+field Query.balance: QueryBalanceConnection!
+field Query.lastTokenPriceInKda: Decimal
+field Query.transactionsByPactCode: QueryTransactionsByPactCodeConnection!
+field QueryBalanceConnection.edges: [QueryBalanceConnectionEdge!]!
+field QueryBalanceConnection.pageInfo: PageInfo!
+field QueryBalanceConnectionEdge.cursor: String!
+field QueryBalanceConnectionEdge.node: BalanceNode!
+field QueryBlocksFromDepthConnection.totalCount: Int!
+field QueryTransactionsByPactCodeConnection.edges: [QueryTransactionsByPactCodeConnectionEdge!]!
+field QueryTransactionsByPactCodeConnection.pageInfo: PageInfo!
+field QueryTransactionsByPactCodeConnectionEdge.cursor: String!
+field QueryTransactionsByPactCodeConnectionEdge.node: TransactionSummary!
+field Subscription.transactions: [Transaction!]
+field Transaction.orphanedTransactions: [Transaction]
+field TransactionResultTransfersConnection.totalCount: Int!
+field TransactionSummary.badResult: String
+field TransactionSummary.canonical: Boolean!
+field TransactionSummary.chainId: BigInt!
+field TransactionSummary.code: String
+field TransactionSummary.creationTime: DateTime!
+field TransactionSummary.gas: String!
+field TransactionSummary.gasLimit: String!
+field TransactionSummary.gasPrice: String!
+field TransactionSummary.height: BigInt!
+field TransactionSummary.requestKey: String!
+field TransactionSummary.sender: String!
+field Transfer.tokenId: String
+type BalanceNode implements []
+type CountersOfEachChain implements []
+type QueryBalanceConnection implements []
+type QueryBalanceConnectionEdge implements []
+type QueryTransactionsByPactCodeConnection implements []
+type QueryTransactionsByPactCodeConnectionEdge implements []
+type TransactionSummary implements []

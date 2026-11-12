@@ -4,7 +4,7 @@
 use async_graphql::{Context, InputObject, Object, Result, SimpleObject, ID};
 
 use crate::connection::PageArgs;
-use crate::scalars::BigInt;
+use crate::scalars::{BigInt, Decimal};
 use crate::types::{
     default_chain_ids, unserved, Block, FungibleAccount, FungibleChainAccount, GraphConfiguration,
     NetworkInfo, Node, NonFungibleAccount, NonFungibleChainAccount, QueryBlocksFromDepthConnection,
@@ -14,6 +14,7 @@ use crate::types::{
     QueryTransactionsByPublicKeyConnection, QueryTransactionsConnection, QueryTransfersConnection,
     Transaction,
 };
+use crate::types::{QueryBalanceConnection, QueryTransactionsByPactCodeConnection};
 
 pub struct Query;
 
@@ -71,7 +72,7 @@ impl Query {
     ) -> Result<Option<QueryBlocksFromDepthConnection>> {
         use crate::types::block::{block_page, chain_set, non_negative, Span};
         let depth = non_negative("minimumDepth", minimum_depth)?;
-        let (edges, page_info) = block_page(
+        let (edges, page_info, total) = block_page(
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Depth(depth),
@@ -84,6 +85,7 @@ impl Query {
                 .map(|(cursor, node)| QueryBlocksFromDepthConnectionEdge { cursor, node })
                 .collect(),
             page_info,
+            total: crate::connection::Total::Exact(total),
         }))
     }
 
@@ -103,7 +105,7 @@ impl Query {
         let end = end_height
             .map(|e| non_negative("endHeight", e))
             .transpose()?;
-        let (edges, page_info) = block_page(
+        let (edges, page_info, _) = block_page(
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Heights { start, end },
@@ -137,7 +139,7 @@ impl Query {
                 "heightCount must be between 0 and {MAX_HEIGHT_COUNT}"
             )));
         }
-        let (edges, page_info) = block_page(
+        let (edges, page_info, _) = block_page(
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Completed {
@@ -170,8 +172,12 @@ impl Query {
         minimum_depth: Option<i32>,
         order_index: Option<i32>,
         parameters_filter: Option<String>,
-        qualified_event_name: String,
+        // Kadena: `String!`. Relaxed (ZelCore extension, R7I-2): `qualifiedEventName` or
+        // `moduleName` is required.
+        qualified_event_name: Option<String>,
         request_key: Option<String>,
+        // ZelCore extension.
+        module_name: Option<String>,
     ) -> Result<QueryEventsConnection> {
         crate::types::tx::query_events(
             ctx,
@@ -188,6 +194,7 @@ impl Query {
             parameters_filter,
             qualified_event_name,
             request_key,
+            module_name,
         )
         .await
     }
@@ -359,6 +366,8 @@ impl Query {
         min_height: Option<i32>,
         minimum_depth: Option<i32>,
         request_key: Option<String>,
+        // ZelCore extension: `false`/absent lists user txs; `true` is `NOT_SUPPORTED`.
+        is_coinbase: Option<bool>,
     ) -> Result<QueryTransactionsConnection> {
         crate::types::tx::query_transactions(
             ctx,
@@ -374,8 +383,55 @@ impl Query {
             min_height,
             minimum_depth,
             request_key,
+            is_coinbase,
         )
         .await
+    }
+
+    /// ZelCore extension: txs whose exec code contains `pactCode`, on the P6 bounded search.
+    async fn transactions_by_pact_code(
+        &self,
+        ctx: &Context<'_>,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+        pact_code: String,
+    ) -> Result<QueryTransactionsByPactCodeConnection> {
+        crate::types::tx::query_transactions_by_pact_code(
+            ctx, after, before, first, last, pact_code,
+        )
+        .await
+    }
+
+    /// ZelCore extension: an account's fungible balances per module and chain.
+    async fn balance(
+        &self,
+        ctx: &Context<'_>,
+        account_name: Option<String>,
+        chain_ids: Option<Vec<String>>,
+        module: Option<String>,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<QueryBalanceConnection> {
+        crate::types::account::query_balance(
+            ctx,
+            account_name,
+            chain_ids,
+            module,
+            after,
+            before,
+            first,
+            last,
+        )
+        .await
+    }
+
+    /// ZelCore extension, not served: the indexer keeps no price data.
+    async fn last_token_price_in_kda(&self, module_name: String) -> Result<Option<Decimal>> {
+        unserved!("Query.lastTokenPriceInKda")
     }
 
     async fn transactions_by_public_key(
@@ -405,6 +461,8 @@ impl Query {
         fungible_name: Option<String>,
         last: Option<i32>,
         request_key: Option<String>,
+        // ZelCore extension: `true` lists NFT transfers (with `tokenId`).
+        #[graphql(name = "isNFT")] is_nft: Option<bool>,
     ) -> Result<QueryTransfersConnection> {
         crate::types::tx::query_transfers(
             ctx,
@@ -417,6 +475,7 @@ impl Query {
             fungible_name,
             last,
             request_key,
+            is_nft,
         )
         .await
     }

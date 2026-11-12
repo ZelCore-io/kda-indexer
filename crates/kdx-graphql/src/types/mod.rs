@@ -17,16 +17,16 @@ pub mod subscription;
 pub mod transfer;
 pub mod tx;
 
-pub use account::{FungibleAccount, FungibleChainAccount};
+pub use account::{BalanceNode, FungibleAccount, FungibleChainAccount};
 pub use block::{Block, BlockNeighbor};
 pub use event::Event;
 pub use guard::{IGuard, KeysetGuard, RawGuard, UserGuard};
-pub use network::{GraphConfiguration, NetworkInfo};
+pub use network::{CountersOfEachChain, GraphConfiguration, NetworkInfo};
 pub use nft::{
     NonFungibleAccount, NonFungibleChainAccount, NonFungibleToken, NonFungibleTokenBalance,
 };
 pub use transfer::Transfer;
-pub use tx::{Signer, Transaction};
+pub use tx::{Signer, Transaction, TransactionSummary};
 
 /// `NOT_SUPPORTED` until the owning task serves the field.
 macro_rules! unserved {
@@ -76,8 +76,11 @@ macro_rules! connection {
             async fn page_info(&self) -> &PageInfo {
                 &self.page_info
             }
-            async fn total_count(&self) -> async_graphql::Result<i32> {
-                self.total.resolve().await
+            async fn total_count(
+                &self,
+                ctx: &async_graphql::Context<'_>,
+            ) -> async_graphql::Result<i32> {
+                self.total.resolve(ctx).await
             }
         }
     };
@@ -114,8 +117,11 @@ macro_rules! connection {
             async fn page_info(&self) -> &PageInfo {
                 &self.page_info
             }
-            async fn total_count(&self) -> async_graphql::Result<i32> {
-                self.total.resolve().await
+            async fn total_count(
+                &self,
+                ctx: &async_graphql::Context<'_>,
+            ) -> async_graphql::Result<i32> {
+                self.total.resolve(ctx).await
             }
         }
     };
@@ -201,12 +207,13 @@ connection!(
     required,
     total
 );
+// ZelCore extension: `totalCount` (kadscan's block list).
 connection!(
     QueryBlocksFromDepthConnection,
     QueryBlocksFromDepthConnectionEdge,
     Block,
     nullable,
-    none
+    total
 );
 connection!(
     QueryBlocksFromHeightConnection,
@@ -257,10 +264,26 @@ connection!(
     nullable,
     total
 );
+// ZelCore extension: `totalCount` (kadscan's tx page).
 connection!(
     TransactionResultTransfersConnection,
     TransactionResultTransfersConnectionEdge,
     Transfer,
     nullable,
+    total
+);
+// ZelCore extensions (not in Kadena's schema).
+connection!(
+    QueryBalanceConnection,
+    QueryBalanceConnectionEdge,
+    account::BalanceNode,
+    required,
+    none
+);
+connection!(
+    QueryTransactionsByPactCodeConnection,
+    QueryTransactionsByPactCodeConnectionEdge,
+    tx::TransactionSummary,
+    required,
     none
 );

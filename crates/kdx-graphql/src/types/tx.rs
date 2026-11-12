@@ -87,6 +87,11 @@ impl Transaction {
     async fn hash(&self) -> String {
         self.d.rk()
     }
+    /// ZelCore extension: copies of this transaction in orphaned blocks. The store keeps
+    /// the canonical chain only (a reorg replaces blocks), so this is always empty.
+    async fn orphaned_transactions(&self) -> Option<Vec<Option<Transaction>>> {
+        Some(Vec::new())
+    }
     pub async fn id(&self) -> Result<ID> {
         Ok(ID(encode(&NodeKey::Transaction {
             block_hash: self.d.block_hash(),
@@ -314,6 +319,7 @@ impl TransactionResult {
                 })
                 .collect(),
             page_info,
+            total: Total::Exact(self.d.trs.len() as u64),
         })
     }
 }
@@ -525,7 +531,14 @@ pub async fn query_transactions(
     min_height: Option<i32>,
     minimum_depth: Option<i32>,
     request_key: Option<String>,
+    is_coinbase: Option<bool>,
 ) -> Result<QueryTransactionsConnection> {
+    if is_coinbase == Some(true) {
+        // Coinbase txs are not `Transaction`s here (R7D-3); `Block.coinbase` has them.
+        return Err(crate::error::not_supported(
+            "transactions(isCoinbase: true) (use Block.coinbase)",
+        ));
+    }
     let spec = ListSpec {
         source: list_source(
             account_name.as_deref(),
@@ -600,18 +613,28 @@ pub async fn query_transfers(
     fungible_name: Option<String>,
     last: Option<i32>,
     request_key: Option<String>,
+    is_nft: Option<bool>,
 ) -> Result<QueryTransfersConnection> {
-    let spec = ListSpec {
-        source: list_source(
+    let nft = is_nft == Some(true);
+    let source = match (nft, &account_name) {
+        // NFT moves have no `xfer` postings: an account's come from its `acct` postings.
+        (true, Some(a)) if request_key.is_none() && block_hash.is_none() => {
+            SourceSpec::Acct(name_arg("accountName", a)?.to_owned())
+        }
+        _ => list_source(
             account_name.as_deref(),
             fungible_name.as_deref(),
             block_hash.as_deref(),
             request_key.as_deref(),
         )?,
+    };
+    let spec = ListSpec {
+        source,
         filter: key_filter(chain_id.as_deref(), None, None, None, false)?,
         rows: Rows::Transfers {
             module: fungible_name,
             account: account_name,
+            nft,
         },
     };
     let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
@@ -623,6 +646,10 @@ pub async fn query_transfers(
                 Item::Transfer(d, i, x) => Some(QueryTransfersConnectionEdge {
                     cursor,
                     node: Transfer::new(d, i, x),
+                }),
+                Item::Nft(d, i) => Some(QueryTransfersConnectionEdge {
+                    cursor,
+                    node: Transfer::nft(d, i),
                 }),
                 _ => None,
             })
@@ -646,10 +673,21 @@ pub async fn query_events(
     minimum_depth: Option<i32>,
     order_index: Option<i32>,
     parameters_filter: Option<String>,
-    qualified_event_name: String,
+    qualified_event_name: Option<String>,
     request_key: Option<String>,
+    module_name: Option<String>,
 ) -> Result<QueryEventsConnection> {
-    let qual = name_arg("qualifiedEventName", &qualified_event_name)?.to_owned();
+    let qual = qualified_event_name
+        .as_deref()
+        .map(|q| name_arg("qualifiedEventName", q).map(str::to_owned))
+        .transpose()?;
+    let module = module_name
+        .as_deref()
+        .map(|m| name_arg("moduleName", m).map(str::to_owned))
+        .transpose()?;
+    if qual.is_none() && module.is_none() {
+        return Err(bad_input("events needs qualifiedEventName or moduleName"));
+    }
     let params = parameters_filter
         .as_deref()
         .map(ParamFilter::parse)
@@ -658,13 +696,18 @@ pub async fn query_events(
         SourceSpec::Rk(hash_arg("requestKey", rk)?)
     } else if let Some(bh) = &block_hash {
         SourceSpec::Block(hash_arg("blockHash", bh)?)
-    } else if let Some(a) = params.as_ref().and_then(|p| p.first_str()) {
-        SourceSpec::AcctOrEvt {
-            account: a.to_owned(),
-            qual: qual.clone(),
+    } else if let Some(q) = &qual {
+        match params.as_ref().and_then(|p| p.first_str()) {
+            Some(a) => SourceSpec::AcctOrEvt {
+                account: a.to_owned(),
+                qual: q.clone(),
+            },
+            None => SourceSpec::EvtName(q.clone()),
         }
     } else {
-        SourceSpec::EvtName(qual.clone())
+        // `moduleName` alone (ZelCore extension): no module posting family, so heights are
+        // walked down from the tip, as a list without a selective argument (GQ-20).
+        SourceSpec::Heights
     };
     let spec = ListSpec {
         source,
@@ -676,7 +719,8 @@ pub async fn query_events(
             false,
         )?,
         rows: Rows::Events {
-            qual: Some(qual),
+            qual,
+            module,
             order_index: order_index.map(i64::from),
             params,
         },
@@ -697,6 +741,185 @@ pub async fn query_events(
         page_info: p.info,
         total: p.total,
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// ZelCore extension: transactionsByPactCode (R-P5P9-16, on the P6 bounded search)
+
+/// One row of `transactionsByPactCode` (ZelCore extension): a flat summary of a user tx.
+#[derive(Debug, Clone)]
+pub struct TransactionSummary {
+    pub d: Arc<TxData>,
+}
+
+#[Object]
+impl TransactionSummary {
+    async fn request_key(&self) -> String {
+        self.d.rk()
+    }
+    async fn height(&self) -> BigInt {
+        BigInt(i128::from(self.d.key().height()))
+    }
+    async fn chain_id(&self) -> BigInt {
+        BigInt(i128::from(self.d.key().chain()))
+    }
+    /// Rows are read from the store, which keeps the canonical chain only.
+    async fn canonical(&self) -> bool {
+        true
+    }
+    async fn creation_time(&self) -> DateTime {
+        let m = self.d.cmd.as_ref().and_then(|c| c.get("meta"));
+        DateTime((float_of(m.and_then(|m| m.get("creationTime"))) * 1e6) as i64)
+    }
+    async fn bad_result(&self) -> Option<String> {
+        (self.d.out.pointer("/result/status").and_then(Value::as_str) != Some("success"))
+            .then(|| json_text(self.d.out.pointer("/result/error").unwrap_or(&Value::Null)))
+    }
+    async fn sender(&self) -> String {
+        self.d.sender().unwrap_or_default().to_owned()
+    }
+    async fn gas(&self) -> String {
+        int_of(self.d.out.get("gas")).to_string()
+    }
+    async fn gas_limit(&self) -> String {
+        int_of(
+            self.d
+                .cmd
+                .as_ref()
+                .and_then(|c| c.pointer("/meta/gasLimit")),
+        )
+        .to_string()
+    }
+    async fn gas_price(&self) -> String {
+        number_text(
+            self.d
+                .cmd
+                .as_ref()
+                .and_then(|c| c.pointer("/meta/gasPrice")),
+        )
+    }
+    async fn code(&self) -> Option<String> {
+        self.d
+            .cmd
+            .as_ref()
+            .and_then(|c| c.pointer("/payload/exec/code"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+}
+
+/// A number's exact text (a string or `{"decimal": ..}` unwrapped); "0" when absent.
+fn number_text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.trim().to_owned(),
+        Some(Value::Object(o)) => number_text(o.get("decimal").or_else(|| o.get("int"))),
+        _ => "0".to_owned(),
+    }
+}
+
+/// `transactionsByPactCode(pactCode)`: the txs whose own exec code contains `pactCode`
+/// (`%`/`_` wildcards), newest first, through the P6 search (`/txs/search`): its pattern
+/// checks, per-client gate, code index or bounded newest-first scan, candidate caps and time
+/// budget. Forward paging only. A page the search cut short is flagged `searchTruncated`
+/// in the response `extensions`, and `pageInfo.endCursor` resumes it.
+pub async fn query_transactions_by_pact_code(
+    ctx: &Context<'_>,
+    after: Option<String>,
+    before: Option<String>,
+    first: Option<i32>,
+    last: Option<i32>,
+    pact_code: String,
+) -> Result<super::QueryTransactionsByPactCodeConnection> {
+    use crate::connection::PageCursor;
+    use kdx_api::compat::Paging;
+    let g = gql(ctx);
+    let Some(search) = g.search.clone() else {
+        return Err(crate::error::not_supported(
+            "transactionsByPactCode (no search index)",
+        ));
+    };
+    if last.is_some() || before.is_some() {
+        return Err(bad_input(
+            "transactionsByPactCode pages forward only (first/after)",
+        ));
+    }
+    kdx_api::search::check_pattern("pactCode", &pact_code).map_err(bad_input)?;
+    let page = PageArgs::new(after, None, first, None).parse(&g.settings)?;
+    let next = match page.cursor {
+        None => None,
+        Some(PageCursor::Tx(c)) => Some(c),
+        Some(PageCursor::Block(_)) => return Err(bad_input("invalid cursor")),
+    };
+    let had_cursor = next.is_some();
+    let ip = ctx
+        .data_opt::<crate::ReqCtx>()
+        .and_then(|r| r.ip)
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let permit = search.gate.try_acquire(ip).map_err(|_| {
+        err(
+            Code::Limit,
+            "too many searches in flight: try again shortly",
+        )
+    })?;
+    let n = page.n;
+    let (rows, resume, truncated) = g
+        .state()?
+        .clone()
+        .read_heavy(move |view| {
+            let _permit = permit;
+            let pg = Paging {
+                limit: n,
+                offset: 0,
+                next,
+                min_height: None,
+                max_height: None,
+                empty: n == 0,
+            };
+            let p = kdx_api::compat::search::search_page(view, &search, &pact_code, &pg)?;
+            let mut blocks = Blocks::default();
+            let mut rows = Vec::new();
+            for r in &p.rows {
+                let rk = r.get("requestKey").and_then(Value::as_str).unwrap_or("");
+                let Ok(rk) = kdx_types::Hash32::from_b64url(rk) else {
+                    continue;
+                };
+                let chain = r.get("chain").and_then(Value::as_u64);
+                let height = r.get("height").and_then(Value::as_u64);
+                let hit = view.txs_by_rk(&rk)?.into_iter().find(|(k, _)| {
+                    !k.is_coinbase()
+                        && chain.is_none_or(|c| u64::from(k.chain()) == c)
+                        && height.is_none_or(|h| u64::from(k.height()) == h)
+                });
+                if let Some((k, rec)) = hit {
+                    if let Some(d) = load(view, k, Some(rec), &mut blocks)? {
+                        rows.push(d);
+                    }
+                }
+            }
+            Ok((rows, p.next, p.truncated))
+        })
+        .await
+        .map_err(from_api)?;
+    if truncated {
+        crate::flags::mark(ctx, crate::flags::Flag::SearchTruncated);
+    }
+    let edges: Vec<super::QueryTransactionsByPactCodeConnectionEdge> = rows
+        .into_iter()
+        .map(|d| super::QueryTransactionsByPactCodeConnectionEdge {
+            cursor: d.cursor(0).encode(),
+            node: TransactionSummary { d },
+        })
+        .collect();
+    let page_info = crate::connection::PageInfo {
+        start_cursor: edges.first().map(|e| e.cursor.clone()),
+        end_cursor: resume
+            .map(|c| c.encode())
+            .or_else(|| edges.last().map(|e| e.cursor.clone())),
+        has_next_page: resume.is_some(),
+        has_previous_page: had_cursor,
+    };
+    Ok(super::QueryTransactionsByPactCodeConnection { edges, page_info })
 }
 
 #[cfg(test)]
