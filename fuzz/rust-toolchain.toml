@@ -1,2 +1,4 @@
 [toolchain]
-channel = "nightly"
+# Dated nightly (T-2): the one the P9 fuzz runs used. cargo-fuzz needs a nightly; bump the
+# date deliberately and re-run `cargo fuzz build` when changing it.
+channel = "nightly-2026-07-15"
