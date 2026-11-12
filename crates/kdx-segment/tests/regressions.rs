@@ -33,3 +33,17 @@ fn damaged_block_file_offsets_are_an_error_not_a_slice_panic() {
         assert!(f.record(i).is_err());
     }
 }
+
+#[test]
+fn sorted_index_with_a_huge_key_count_is_refused_not_an_overflow_panic() {
+    // Found by the `phf_open` fuzz target: `14 + 13 * n` overflowed for a damaged key count.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("t.idx");
+    let mut b = b"KDXH".to_vec();
+    b.extend_from_slice(&[1, 1]); // version 1, sorted
+    b.extend_from_slice(&(u64::MAX / 8).to_le_bytes());
+    b.extend_from_slice(&[0; 13]);
+    std::fs::write(&p, &b).unwrap();
+    let e = kdx_segment::Index::open(&p).err().expect("refused");
+    assert!(e.to_string().contains("key count"), "{e}");
+}

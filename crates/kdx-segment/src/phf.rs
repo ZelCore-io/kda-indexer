@@ -232,8 +232,14 @@ impl Index {
                 })))
             }
             1 => {
-                if map.len() != 14 + 13 * n {
-                    bail!("{}: size {} != {}", path.display(), map.len(), 14 + 13 * n);
+                let want = n
+                    .checked_mul(13)
+                    .and_then(|x| x.checked_add(14))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{}: corrupt index (key count)", path.display())
+                    })?;
+                if map.len() != want {
+                    bail!("{}: size {} != {want}", path.display(), map.len());
                 }
                 Ok(Index::Sorted(SortedIndex { map, n }))
             }
