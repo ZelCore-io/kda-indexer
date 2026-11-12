@@ -471,7 +471,8 @@ pub fn rebuilt_through(c: &Census) -> u32 {
 /// Whether a periodic rebuild is due (R-P5P9-9 #5): `every_secs` since the index's
 /// `built_at`, or readers' upper expansion window (`tip − rebuilt_through_height`, the
 /// heights every hit walks) at `window_heights` or more. 0 turns either rule off. A manifest
-/// without `rebuilt_through_height` expands from `first_h`: its window counts from 0.
+/// without `rebuilt_through_height` expands from `first_h`: its window counts from 0. A
+/// manifest marked stale by `rebuild-range` (`stale_from_height`, M-7) is always due.
 pub fn rebuild_due(
     m: &SearchManifest,
     now: u64,
@@ -484,7 +485,7 @@ pub fn rebuild_due(
         && tip.is_some_and(|t| {
             t.saturating_sub(m.rebuilt_through_height.unwrap_or(0)) >= window_heights
         });
-    age || window
+    age || window || m.stale_from_height.is_some()
 }
 
 /// Census, projection (`auto`, or `fallback` with no threshold), pass 1, hot pass, then
@@ -530,6 +531,7 @@ pub fn rebuild(o: &BuildOpts, hot: &HotStore) -> Result<RebuildReport> {
         fallback_min_len: mode.min_len(),
         built_through_height: built_through,
         rebuilt_through_height: Some(rebuilt_through(&c)),
+        stale_from_height: None,
         docs,
         bytes: dir_bytes(&new)?,
         built_at: now_secs(),
@@ -748,6 +750,7 @@ mod tests {
             fallback_min_len: 0,
             built_through_height: built_through,
             rebuilt_through_height: Some(rt),
+            stale_from_height: None,
             docs: 0,
             bytes: 0,
             built_at: 1,
@@ -797,6 +800,7 @@ mod tests {
             fallback_min_len: 0,
             built_through_height: 1,
             rebuilt_through_height: Some(1),
+            stale_from_height: None,
             docs: codes.len() as u64,
             bytes: 0,
             built_at,
@@ -862,6 +866,35 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_marked_stale_by_rebuild_range_is_due() {
+        // M-7: `rebuild-range` swapped changed content under the index.
+        let t = tempfile::tempdir().unwrap();
+        assert!(
+            !crate::manifest::mark_stale(t.path(), 5).unwrap(),
+            "no index"
+        );
+        let m = SearchManifest {
+            format: FORMAT,
+            tantivy: "test".into(),
+            mode: "full".into(),
+            fallback_min_len: 0,
+            built_through_height: 100,
+            rebuilt_through_height: Some(100),
+            stale_from_height: None,
+            docs: 1,
+            bytes: 1,
+            built_at: 1_000,
+        };
+        m.commit(t.path()).unwrap();
+        assert!(!rebuild_due(&m, 1_001, Some(100), 0, 0));
+        assert!(crate::manifest::mark_stale(t.path(), 40).unwrap());
+        assert!(crate::manifest::mark_stale(t.path(), 60).unwrap());
+        let s = SearchManifest::load(t.path()).unwrap().unwrap();
+        assert_eq!(s.stale_from_height, Some(40));
+        assert!(rebuild_due(&s, 1_001, Some(100), 0, 0));
+    }
+
+    #[test]
     fn periodic_rebuild_is_due_by_age_or_window() {
         let m = SearchManifest {
             format: FORMAT,
@@ -870,6 +903,7 @@ mod tests {
             fallback_min_len: 0,
             built_through_height: 1_200,
             rebuilt_through_height: Some(1_000),
+            stale_from_height: None,
             docs: 0,
             bytes: 0,
             built_at: 10_000,
@@ -891,6 +925,7 @@ mod tests {
         // No field: the window counts from 0.
         let old = SearchManifest {
             rebuilt_through_height: None,
+            stale_from_height: None,
             ..m
         };
         assert!(rebuild_due(&old, 10_001, Some(30_000), week, 30_000));

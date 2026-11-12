@@ -182,7 +182,14 @@ pub fn index_path(
         .index
         .built_through()
         .or(Some(s.manifest.built_through_height));
-    let lagging = lagging(tip, built_through);
+    // A swapped range under the index (M-7) is treated like lag: compat scans, native says
+    // `partial: true`, until a rebuild clears the mark.
+    let stale = ctx
+        .index
+        .stale_from()
+        .or(s.manifest.stale_from_height)
+        .is_some();
+    let lagging = lagging(tip, built_through) || stale;
     if complete && lagging {
         rejected("lag");
         return IndexPath::None;

@@ -238,3 +238,206 @@ async fn rebuild_repairs_a_corrupted_step() {
     deep_check(&c);
     assert_eq!(content(&c), before);
 }
+
+/// The two-chain store of `rebuild_on_two_chains_is_content_equal`, reopened against a node
+/// that serves `node` instead: (ctx, step entry 2, data dir guard).
+fn store_with_node(
+    node: impl Fn(&mut Vec<(u8, Vec<Place>)>),
+) -> (
+    Arc<kdx_ingest::Ctx>,
+    kdx_segment::RangeEntry,
+    tempfile::TempDir,
+) {
+    let pool = pool();
+    let places = places_for(&[0, 1], 12);
+    let d = tempfile::tempdir().unwrap();
+    {
+        let base = fake_node(&pool, &places);
+        let _ = freeze_store(d.path(), &pool, &base, &places, &[1, 0]);
+    }
+    let mut served = places.clone();
+    node(&mut served);
+    let base = fake_node(&pool, &served);
+    let c = Arc::new(ctx_full(d.path(), 2, 1000, 2, &base, &[0, 1]));
+    let e = kdx_segment::Manifest::load(&c.segdir)
+        .unwrap()
+        .unwrap()
+        .entries[2]
+        .clone();
+    (c, e, d)
+}
+
+fn dict_fwd_rows(c: &kdx_ingest::Ctx) -> usize {
+    use kdx_hot::Txn;
+    let txn = c.hot.ro().unwrap();
+    kdx_types::dict::DictKind::ALL
+        .into_iter()
+        .map(|k| txn.count(kdx_hot::Table::DictFwd(k)).unwrap())
+        .sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dry_run_rebuild_persists_no_dictionary_names() {
+    // m6: `write` persisted every name interned while indexing the refetched blocks, dry run
+    // or not. A name only the in-memory dictionary holds stands in for one first seen there.
+    use kdx_types::dict::DictMut;
+    let (c, e, _d) = store_with_node(|_| {});
+    let before = dict_fwd_rows(&c);
+    c.dict
+        .lock()
+        .unwrap()
+        .intern(kdx_types::dict::DictKind::Module, "m6.dry-run-only");
+    let dry = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(dry.dry_run && !dry.swapped, "{dry:?}");
+    assert_eq!(
+        dict_fwd_rows(&c),
+        before,
+        "a dry run wrote dictionary names"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_refuses_a_range_that_does_not_link_to_its_neighbours() {
+    // m7: the node's chain forked inside the range and stayed forked: the rebuilt step links
+    // to the stored one before it, but not to the stored first block after it.
+    let (c, e, _d) = store_with_node(|s| {
+        for (ch, ps) in s.iter_mut() {
+            for p in ps.iter_mut().filter(|p| p.height >= 4) {
+                p.br = *ch + 7;
+                p.parent_br = if p.height == 4 { *ch } else { *ch + 7 };
+            }
+        }
+    });
+    let err = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("linkage"), "{err:#}");
+    assert!(!kdx_segment::swap::rebuild_dir(&c.segdir, e.start).exists());
+    deep_check(&c);
+
+    // Forked from the height before the range: its first block has no stored parent.
+    let (c, e, _d) = store_with_node(|s| {
+        for (ch, ps) in s.iter_mut() {
+            for p in ps.iter_mut().filter(|p| p.height >= 3) {
+                p.br = *ch + 7;
+                p.parent_br = if p.height == 3 { *ch } else { *ch + 7 };
+            }
+        }
+    });
+    let err = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("does not follow stored"),
+        "{err:#}"
+    );
+}
+
+/// (account, chain) of every acct posting of `e` (balance rows of the coin module).
+fn coin_rows(
+    c: &kdx_ingest::Ctx,
+    e: &kdx_segment::RangeEntry,
+) -> std::collections::BTreeSet<(u32, u8)> {
+    let r = kdx_segment::RangeReader::open(&c.segdir, e, "mainnet01").unwrap();
+    let p = &r.postings[kdx_decode::Family::Acct as usize];
+    let mut out = std::collections::BTreeSet::new();
+    for i in 0..p.entities() {
+        for rel in p.list_at(i).unwrap() {
+            let (chain, _) = r.slot_pos(r.keys.slot_of(u64::from(rel)).unwrap());
+            out.insert((p.entity_at(i) as u32, chain));
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_with_changed_content_marks_both_versions_dirty_and_search_stale() {
+    // M-7: the node moved step 2's blocks between the chains (same hashes, so the linkage
+    // holds; other txs per chain). Balances of the old and the new content are marked dirty
+    // and the search index is marked stale from the step.
+    use kdx_hot::Txn;
+    let (c, e, d) = store_with_node(|s| {
+        for h in [4usize, 5] {
+            let (a, b) = (s[0].1[h].pool, s[1].1[h].pool);
+            s[0].1[h].pool = b;
+            s[1].1[h].pool = a;
+        }
+    });
+    let old = coin_rows(&c, &e);
+    {
+        let mut txn = c.hot.rw().unwrap();
+        for t in [kdx_hot::Table::BalanceDirty, kdx_hot::Table::BalanceSeed] {
+            for (k, _) in txn.scan(t, &[], |_| true).unwrap() {
+                txn.del(t, &k).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+    let sdir = kdx_search::search_dir(d.path());
+    std::fs::create_dir_all(&sdir).unwrap();
+    kdx_search::SearchManifest {
+        format: kdx_search::manifest::FORMAT,
+        tantivy: "test".into(),
+        mode: "full".into(),
+        fallback_min_len: 0,
+        built_through_height: 11,
+        rebuilt_through_height: Some(11),
+        stale_from_height: None,
+        docs: 0,
+        bytes: 0,
+        built_at: 1,
+    }
+    .commit(&sdir)
+    .unwrap();
+
+    let rep = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(rep.swapped && rep.content_equal == Some(false), "{rep:?}");
+    assert!(rep.dirty_marks > 0 && rep.search_marked_stale, "{rep:?}");
+    let new = coin_rows(&c, &e);
+    assert!(
+        old.difference(&new).next().is_some(),
+        "fixture: no old-only row"
+    );
+    assert!(
+        new.difference(&old).next().is_some(),
+        "fixture: no new-only row"
+    );
+    let txn = c.hot.ro().unwrap();
+    let coin = kdx_hot::balances::coin_module(&txn).unwrap().unwrap();
+    for &(a, ch) in old.union(&new) {
+        assert!(
+            kdx_hot::balances::is_dirty(&txn, a, coin, ch).unwrap(),
+            "account {a} chain {ch} not dirty"
+        );
+    }
+    let m = kdx_search::SearchManifest::load(&sdir).unwrap().unwrap();
+    assert_eq!(m.stale_from_height, Some(e.start));
+}
