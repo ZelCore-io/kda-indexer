@@ -47,3 +47,21 @@ fn sorted_index_with_a_huge_key_count_is_refused_not_an_overflow_panic() {
     let e = kdx_segment::Index::open(&p).err().expect("refused");
     assert!(e.to_string().contains("key count"), "{e}");
 }
+
+#[test]
+fn keys_with_decreasing_starts_count_zero_instead_of_underflowing() {
+    // Found by the `ef_keys` fuzz target (128 bytes, as the fuzzer wrote it): the file opens,
+    // but a slot start is below the one before it, so `count` underflowed.
+    const HEX: &str = "4b44584b010200000028000000000000000200000000000000552a5555555555555555010000000000540000000000008001000000000000000000000000000000020000000000000000004000000000000000000029000000000000000100000000000000000000000000000000000100000000000000000000000000000000";
+    let bytes: Vec<u8> = (0..HEX.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&HEX[i..i + 2], 16).unwrap())
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("keys.ef");
+    std::fs::write(&p, &bytes).unwrap();
+    let k = kdx_segment::keys::Keys::open(&p).expect("opens");
+    for s in 0..k.slots() + 2 {
+        let _ = (k.first(s), k.count(s));
+    }
+}

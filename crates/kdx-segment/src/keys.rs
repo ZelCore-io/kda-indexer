@@ -79,7 +79,8 @@ impl Keys {
     /// Txs in slot `s` (0 = no block).
     pub fn count(&self, s: usize) -> u64 {
         match (self.first(s), self.first(s + 1)) {
-            (Some(a), Some(b)) => b - a,
+            // Starts are ascending in a sound file; a damaged one is a count of 0, not an overflow.
+            (Some(a), Some(b)) => b.saturating_sub(a),
             _ => 0,
         }
     }
