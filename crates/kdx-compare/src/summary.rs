@@ -62,6 +62,9 @@ impl GateSize {
 pub enum RouteSet {
     Must,
     Should,
+    /// The GraphQL routes (`graphql:<operation>`).
+    Graphql,
+    /// Must and should routes, plus the GraphQL routes when the window has any.
     All,
 }
 
@@ -70,8 +73,9 @@ impl RouteSet {
         match s {
             "must" => Ok(RouteSet::Must),
             "should" => Ok(RouteSet::Should),
+            "graphql" => Ok(RouteSet::Graphql),
             "all" => Ok(RouteSet::All),
-            _ => anyhow::bail!("--routes must be `must`, `should` or `all`"),
+            _ => anyhow::bail!("--routes must be `must`, `should`, `graphql` or `all`"),
         }
     }
 
@@ -84,6 +88,7 @@ impl RouteSet {
         match self {
             RouteSet::Must => must.to_vec(),
             RouteSet::Should => SHOULD.to_vec(),
+            RouteSet::Graphql => Vec::new(),
             RouteSet::All => must.iter().chain(SHOULD).copied().collect(),
         }
     }
@@ -297,6 +302,58 @@ pub fn render(
     (s, green)
 }
 
+/// Node-pair routes of the GraphQL gate and their minimums (small, full).
+pub const GRAPHQL_NODE_ROUTES: &[(&str, u64, u64)] = &[
+    ("graphql:NodeTx", 50, 500),
+    ("graphql:NodeBlock", 50, 500),
+    ("graphql:NodeBalance", 50, 2_000),
+];
+/// Per operation against the reference server (or the internal pair), and in total.
+pub const GRAPHQL_PER_OP: (u64, u64) = (20, 100);
+pub const GRAPHQL_TOTAL: (u64, u64) = (200, 2_000);
+
+/// The GraphQL gate (plan Task 7): every operation seen in the window has at least its minimum
+/// compared, the node pairs reach theirs, the total is reached, and nothing is unexplained.
+pub fn graphql_gate(rows: &[Row], size: GateSize) -> (bool, Vec<String>) {
+    let pick = |s: (u64, u64)| if size == GateSize::Small { s.0 } else { s.1 };
+    let mut routes: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.route.starts_with("graphql:"))
+        .map(|r| r.route.as_str())
+        .collect();
+    routes.sort_unstable();
+    routes.dedup();
+    let is_node = |r: &str| GRAPHQL_NODE_ROUTES.iter().any(|(n, _, _)| *n == r);
+    let mut required: Vec<(&str, u64)> = Vec::new();
+    for r in &routes {
+        if !is_node(r) {
+            required.push((r, pick(GRAPHQL_PER_OP)));
+        }
+    }
+    for (n, s, f) in GRAPHQL_NODE_ROUTES {
+        required.push((n, if size == GateSize::Small { *s } else { *f }));
+    }
+    let (_, mut why) = gate(rows, &required);
+    let total: u64 = routes
+        .iter()
+        .filter(|r| !is_node(r))
+        .map(|r| {
+            rows.iter()
+                .filter(|x| x.route == **r)
+                .map(|x| x.compared)
+                .max()
+                .unwrap_or(0)
+        })
+        .sum();
+    if total < pick(GRAPHQL_TOTAL) {
+        why.push(format!(
+            "graphql total: {total} compared, needs {}",
+            pick(GRAPHQL_TOTAL)
+        ));
+    }
+    (why.is_empty(), why)
+}
+
 /// `summary` command: prints the table; returns whether the gate is green.
 pub fn run(out_dir: &Path, since: &str, routes: &str, gate: &str) -> anyhow::Result<bool> {
     let set = RouteSet::parse(routes)?;
@@ -304,7 +361,26 @@ pub fn run(out_dir: &Path, since: &str, routes: &str, gate: &str) -> anyhow::Res
     let since_secs = parse_since(since)?;
     let w = load(out_dir, since_secs)?;
     let label = format!("gate {gate}, routes {routes}");
-    let (text, green) = render(&rows(&w), &set.required(size), routes == "all", &label);
+    let all_rows = rows(&w);
+    let with_graphql = set == RouteSet::Graphql
+        || (set == RouteSet::All && all_rows.iter().any(|r| r.route.starts_with("graphql:")));
+    let required = set.required(size);
+    let (mut text, mut green) = if set == RouteSet::Graphql {
+        (render(&all_rows, &[], true, &label).0, true)
+    } else {
+        render(&all_rows, &required, routes == "all", &label)
+    };
+    if with_graphql {
+        let (ok, why) = graphql_gate(&all_rows, size);
+        text.push_str(&format!(
+            "graphql gate {gate}: {}\n",
+            if ok { "GREEN" } else { "RED" }
+        ));
+        for w in why {
+            text.push_str(&format!("  {w}\n"));
+        }
+        green &= ok;
+    }
     print!("{text}");
     Ok(green)
 }
@@ -436,5 +512,62 @@ mod tests {
         assert!(!gate(&rows, &should).0);
         assert!(!gate(&rows, &all).0);
         assert!(RouteSet::parse("x").is_err() && GateSize::parse("x").is_err());
+    }
+
+    fn grow(route: &str, b: &str, compared: u64, unexplained: u64) -> Row {
+        Row {
+            route: route.into(),
+            a: "gql".into(),
+            b: b.into(),
+            compared,
+            unexplained,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn graphql_gate_small_and_full() {
+        let mut rows = vec![
+            grow("graphql:QBlock", "oracle", 20, 0),
+            grow("graphql:QEvents", "oracle", 25, 0),
+        ];
+        for _ in 0..8 {
+            rows.push(grow("graphql:QX", "oracle", 20, 0));
+        }
+        rows.extend([
+            grow("graphql:NodeTx", "node", 50, 0),
+            grow("graphql:NodeBlock", "node", 50, 0),
+            grow("graphql:NodeBalance", "node", 50, 0),
+        ]);
+        // 20 + 25 + 20 = 65 per-operation compares: below the 200 total.
+        let (ok, why) = graphql_gate(&rows, GateSize::Small);
+        assert!(
+            !ok && why.iter().any(|w| w.starts_with("graphql total")),
+            "{why:?}"
+        );
+        for i in 0..8 {
+            rows.push(grow(&format!("graphql:Op{i}"), "oracle", 25, 0));
+        }
+        let (ok, why) = graphql_gate(&rows, GateSize::Small);
+        assert!(ok, "{why:?}");
+        // The full gate asks 100 per operation and 500/500/2,000 on the node pairs.
+        let (ok, why) = graphql_gate(&rows, GateSize::Full);
+        assert!(!ok && why.len() > 5, "{why:?}");
+        // An unexplained diff fails the small gate, and so does a missing node route.
+        rows.push(grow("graphql:QBlock", "oracle", 0, 1));
+        assert!(!graphql_gate(&rows, GateSize::Small).0);
+        rows.pop();
+        rows.retain(|r| r.route != "graphql:NodeBalance");
+        let (ok, why) = graphql_gate(&rows, GateSize::Small);
+        assert!(
+            !ok && why.iter().any(|w| w.starts_with("graphql:NodeBalance")),
+            "{why:?}"
+        );
+    }
+
+    #[test]
+    fn route_set_graphql_parses() {
+        assert_eq!(RouteSet::parse("graphql").unwrap(), RouteSet::Graphql);
+        assert!(RouteSet::Graphql.required(GateSize::Small).is_empty());
     }
 }

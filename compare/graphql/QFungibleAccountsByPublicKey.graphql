@@ -1,0 +1,2 @@
+# kdx: oracle
+query QFungibleAccountsByPublicKey($publicKey: String!, $fungibleName: String) { fungibleAccountsByPublicKey(publicKey: $publicKey, fungibleName: $fungibleName) { id accountName fungibleName } }

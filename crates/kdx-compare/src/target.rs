@@ -89,11 +89,26 @@ impl Target {
         limiter: Arc<Limiter>,
         max_body_bytes: usize,
     ) -> anyhow::Result<Target> {
+        Target::with_tls(name, url, kind, timeout, limiter, max_body_bytes, false)
+    }
+
+    /// [`Target::new`] with the option to accept a self-signed certificate (an internal
+    /// `graphql_oracle` only; never for public endpoints).
+    pub fn with_tls(
+        name: &str,
+        url: Url,
+        kind: TargetKind,
+        timeout: Duration,
+        limiter: Arc<Limiter>,
+        max_body_bytes: usize,
+        insecure_tls: bool,
+    ) -> anyhow::Result<Target> {
         let http = reqwest::Client::builder()
             .user_agent(kdx_node::USER_AGENT)
             .timeout(timeout)
             // chainweb-data (Warp) closes idle keep-alive connections; do not reuse old ones.
             .pool_idle_timeout(Duration::from_secs(5))
+            .danger_accept_invalid_certs(insecure_tls)
             .build()
             .context("building http client")?;
         Ok(Target {
@@ -112,16 +127,65 @@ impl Target {
         cfg.targets
             .iter()
             .map(|(n, t)| {
-                Target::new(
+                // The GraphQL oracle never shares the bucket: its own limiter, at most 1 r/s.
+                let lim = match t.kind {
+                    TargetKind::GraphqlOracle => Limiter::new(t.rate_rps.unwrap_or(1.0).min(1.0)),
+                    _ => match t.rate_rps {
+                        Some(r) => Limiter::new(r),
+                        None => limiter.clone(),
+                    },
+                };
+                Target::with_tls(
                     n,
                     t.url.clone(),
                     t.kind,
                     cfg.timeout(),
-                    limiter.clone(),
+                    lim,
                     cfg.max_body_bytes,
+                    t.insecure_tls,
                 )
             })
             .collect()
+    }
+
+    /// One `POST {url}` with a JSON body, under this target's limiter (HTTP status and body
+    /// returned as captured; transport failures and timeouts are errors).
+    pub async fn post_json(&self, body: &serde_json::Value) -> anyhow::Result<HttpCapture> {
+        let _permit = self
+            .limiter
+            .in_flight
+            .acquire()
+            .await
+            .context("limiter closed")?;
+        self.limiter.acquire().await;
+        let t0 = Instant::now();
+        let mut resp = self
+            .http
+            .post(self.url.clone())
+            .header("accept", "application/json")
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("{} POST", self.name))?;
+        let status = resp.status().as_u16();
+        let limit = self.max_body_bytes;
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .with_context(|| format!("{} POST body", self.name))?
+        {
+            if buf.len() + chunk.len() > limit {
+                anyhow::bail!("{} POST: body exceeds {limit} bytes", self.name);
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(HttpCapture {
+            status,
+            headers: Vec::new(),
+            body: Bytes::from(buf),
+            ms: t0.elapsed().as_millis() as u64,
+        })
     }
 
     fn full_url(&self, path_and_query: &str) -> String {

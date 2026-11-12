@@ -75,6 +75,7 @@ assets = [
     ["../../packaging/config/mainnet01.toml", "opt/coins/kda-indexer/mainnet01/config/", "640"],
     ["../../compare/allowlist.toml", "usr/share/kda-indexer/compare/", "644"],
     ["../../compare/seeds/mainnet01.toml", "usr/share/kda-indexer/compare/seeds/", "644"],
+    ["../../compare/graphql/*.graphql", "usr/share/kda-indexer/compare/graphql/", "644"],
     ["../../README.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../LICENSE-MIT", "usr/share/doc/kda-indexer/", "644"],
     ["../../LICENSE-APACHE", "usr/share/doc/kda-indexer/", "644"],

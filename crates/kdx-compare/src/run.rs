@@ -333,6 +333,8 @@ pub struct Ctx {
     backoff: Mutex<(Option<tokio::time::Instant>, Duration)>,
     /// chainweb-data tip per target name (time read, max height on `/txs/recent`).
     oracle_tips: Mutex<HashMap<String, (std::time::Instant, u64)>>,
+    /// GraphQL operations, sampler and oracle guard (empty without GraphQL pairs).
+    pub gql: crate::graphql::GqlState,
 }
 
 /// What one compare produced.
@@ -352,7 +354,9 @@ impl Ctx {
         let allow = Allowlist::load(&cfg.allowlist)?;
         let log = DiffLog::new(&cfg.out_dir)?;
         let graph = node.chain_graph().await?;
+        let gql = crate::graphql::GqlState::new(&cfg)?;
         let ctx = Ctx {
+            gql,
             graph,
             node,
             targets,
@@ -371,7 +375,7 @@ impl Ctx {
         Ok(ctx)
     }
 
-    fn primary(&self) -> Option<&Target> {
+    pub fn primary(&self) -> Option<&Target> {
         self.cfg.primary_target().and_then(|n| self.targets.get(n))
     }
 
@@ -387,7 +391,7 @@ impl Ctx {
         }
     }
 
-    fn count_class(&self, route: &str, class: &str) {
+    pub(crate) fn count_class(&self, route: &str, class: &str) {
         self.metrics.diff(route, class);
         self.summary.lock().expect("summary").class(route, class);
     }
@@ -2462,6 +2466,36 @@ pub async fn run(cfg: CompareConfig, max_secs: Option<u64>) -> anyhow::Result<()
                 tracing::error!(error = %e, "metrics server");
             }
         });
+    }
+    if ctx.cfg.has_graphql_pairs() {
+        tokio::spawn(crate::graphql::run_loop(ctx.clone()));
+    }
+    let rest = ctx
+        .cfg
+        .pairs
+        .iter()
+        .any(|(a, _)| ctx.targets.get(a).is_some_and(|t| !t.kind.is_graphql()));
+    if !rest {
+        // GraphQL pairs only: no REST generator or workers; tips and summaries as usual.
+        let c = ctx.clone();
+        tokio::spawn(async move {
+            let mut t_tip = tokio::time::interval(TIP_REFRESH);
+            let mut t_sum = tokio::time::interval(SUMMARY_FLUSH);
+            t_tip.tick().await;
+            loop {
+                tokio::select! {
+                    _ = t_tip.tick() => {
+                        if let Err(e) = c.refresh_tips().await {
+                            tracing::warn!(error = %e, "tip refresh");
+                        }
+                    }
+                    _ = t_sum.tick() => c.flush_summary(),
+                }
+            }
+        });
+        shutdown_signal(max_secs).await;
+        let (tx, _rx) = mpsc::channel::<Request>(1);
+        return finish(ctx, tx, Vec::new()).await;
     }
     let graph = ctx.node.chain_graph().await?;
     let random = Some(RandomGen::new(

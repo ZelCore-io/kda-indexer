@@ -36,8 +36,12 @@ enum Cmd {
     },
     /// One request through the pipeline.
     Once {
-        #[arg(long)]
+        /// A REST path (compat routes), or with `--graphql` ignored.
+        #[arg(long, default_value = "")]
         path: String,
+        /// One GraphQL operation (file stem, e.g. `QBlock`) through every GraphQL pair.
+        #[arg(long)]
+        graphql: Option<String>,
         /// Debug: fetch A twice and diff it against itself.
         #[arg(long, hide = true)]
         against_self: bool,
@@ -51,6 +55,20 @@ enum Cmd {
         haproxy: PathBuf,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Hold GraphQL subscriptions open (`graphql-transport-ws`) and check `newBlocks` items
+    /// against the node: duplicates, misses and delivery delay.
+    WsSoak {
+        /// `ws://host:port/graphql` of the adapter (a `run` instance).
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value_t = 1)]
+        conns: usize,
+        /// Subscriptions per connection, spread over the subscription kinds.
+        #[arg(long, default_value_t = 3)]
+        subs: usize,
+        #[arg(long, default_value_t = 5.0)]
+        minutes: f64,
     },
     /// Parse and validate the config, then print it.
     CheckConfig,
@@ -78,7 +96,7 @@ enum Cmd {
         count: usize,
         #[arg(long)]
         print: bool,
-        /// Only this source: random, seeds or replay (default: the configured mix).
+        /// Only this source: random, seeds, replay or graphql (default: the configured mix).
         #[arg(long)]
         source: Option<String>,
     },
@@ -109,10 +127,34 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::WsSoak {
+            url,
+            conns,
+            subs,
+            minutes,
+        } => {
+            if !kdx_compare::graphql_ws::soak(&cfg, &url, conns, subs, minutes).await? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Once {
+            graphql: Some(stem),
+            ..
+        } => {
+            for o in kdx_compare::graphql::once(cfg.clone(), &stem).await? {
+                println!("class={}", o.class);
+                if let Some(r) = o.record {
+                    println!("{}", serde_json::to_string_pretty(&r)?);
+                }
+            }
+            Ok(())
+        }
         Cmd::Once {
             path,
             against_self,
             mutate,
+            ..
         } => {
             let targets = Target::all(&cfg)?;
             let name = cfg.primary_target().context("no targets configured")?;
@@ -215,6 +257,9 @@ async fn gen_debug(
     print: bool,
     source: Option<&str>,
 ) -> anyhow::Result<()> {
+    if source == Some("graphql") {
+        return kdx_compare::graphql::gen_debug(cfg, count, print).await;
+    }
     let node = cfg.node_client()?;
     let targets = Target::all(cfg)?;
     let a = cfg

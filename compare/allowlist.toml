@@ -32,11 +32,29 @@ owner_note = "Tolerance from spec section 7.3."
 [[entry]]
 id = "graphql-page-size"
 route = "other"
-json_path_glob = "/**"
+json_path_glob = "/~graphql-page-cut"
 condition = "any"
-request_contains = "graphql"
-reason = "GraphQL pages larger than 100 items are capped in kda-indexer (decision Q10)."
-owner_note = "Accepted by the owner; only applies once the GraphQL adapter is compared."
+request_contains = "graphql:"
+reason = "GraphQL pages larger than 100 items are capped in kda-indexer (decision Q10), the reference server does not clamp. The harness compares the common prefix of the two sides after following the same number of pages."
+owner_note = "Accepted by the owner; the visible hit /~graphql-page-cut appears only when one side stopped at a smaller page and still had a next page."
+
+[[entry]]
+id = "graphql-totalcount-cap"
+route = "other"
+json_path_glob = "/~graphql-totalcount-cap"
+condition = "any"
+request_contains = "graphql:"
+reason = "totalCount above 10,000 is a bounded count walk in kda-indexer (GQ-10): min(count, 10,000)."
+owner_note = "Accepted by the owner; the normaliser caps both sides, the visible hit records that the reference count was above the cap."
+
+[[entry]]
+id = "graphql-oracle-stall"
+route = "other"
+json_path_glob = "/~graphql-oracle-stall"
+condition = "any"
+request_contains = "graphql:"
+reason = "The reference server stopped indexing at a fixed height; rows above the configured max_height exist only on kda-indexer and are dropped from both sides before the diff."
+owner_note = "Accepted by the owner (GQ-16); only the visible hit is allowlisted, any other difference stays unexplained."
 
 # --- From the first live runs (P1, chainweb-data vs node oracle) ---
 
