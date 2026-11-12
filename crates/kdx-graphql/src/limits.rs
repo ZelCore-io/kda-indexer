@@ -72,21 +72,22 @@ const SUB_TXS_QUANTITY: i64 = 20;
 /// Deferred `totalCount`s (count walks) one operation may run, outer multipliers included.
 pub const MAX_COUNTS: u64 = 2;
 
-/// Connections whose `totalCount` is known with their page (a block's or a tx's rows, block
-/// ranges, an account's transfers): bounded and cheap. Every other `totalCount`, including
-/// one under a type the walker cannot resolve, is a deferred count walk (fail closed, SR7-3).
+/// Connections whose `totalCount` is known with their page and needs no decoding (a block's
+/// tx keys, a tx's own rows, a block range): bounded and cheap. Every other `totalCount`,
+/// including one under a type the walker cannot resolve, is a deferred count walk (fail
+/// closed, SR7-3). A block's `events` count is neither: see [`BLOCK_EVENTS`]. Only
+/// connections that have a `totalCount` field are listed (M8).
 const CHEAP_COUNTS: &[&str] = &[
-    "BlockEventsConnection",
     "BlockTransactionsConnection",
-    "FungibleAccountTransfersConnection",
-    "FungibleChainAccountTransfersConnection",
-    "QueryBalanceConnection",
     "QueryBlocksFromDepthConnection",
-    "QueryBlocksFromHeightConnection",
-    "QueryCompletedBlockHeightsConnection",
     "TransactionResultEventsConnection",
     "TransactionResultTransfersConnection",
 ];
+
+/// A block's `events` count decodes every tx output of the block: priced as a default page
+/// of tx loads per block, not a count walk (kadscan counts the events of every block of a
+/// block page) (M2).
+const BLOCK_EVENTS: &str = "BlockEventsConnection";
 
 fn cheap_count(ty: &str) -> bool {
     CHEAP_COUNTS.contains(&ty)
@@ -276,6 +277,9 @@ impl<'a> Walk<'a> {
                         _ if intro => 1,
                         "edges" if wrap == Wrap::Conn => 0,
                         "node" if wrap == Wrap::Edges => 0,
+                        "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
+                            self.s.default_page.min(self.s.max_page) as u64
+                        }
                         // Cheap only under a known connection type listed as cheap; anywhere
                         // else (unknown or unresolved parent, interface, fragment) it is a
                         // count walk.
@@ -645,6 +649,36 @@ mod tests {
         );
     }
 
+    /// M8: every cheap count names a connection that has a `totalCount` field.
+    #[test]
+    fn cheap_counts_are_real_count_fields() {
+        let reg = type_registry();
+        for t in CHEAP_COUNTS {
+            let f = reg
+                .types
+                .get(*t)
+                .and_then(|x| x.field_by_name("totalCount"));
+            assert!(f.is_some(), "{t} has no totalCount");
+        }
+    }
+
+    /// M2: a block's `events` count decodes the whole block: priced at a default page per
+    /// block, so a wide block list of them is refused and a default page passes.
+    #[test]
+    fn block_event_counts_are_priced_per_block() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        assert_eq!(
+            c("{ blocksFromHeight(startHeight: 0, first: 200) { edges { node { events { totalCount } } } } }"),
+            Err("\"complexity\"".into())
+        );
+        assert_eq!(
+            c("{ blocksFromHeight(startHeight: 0) { edges { node { events { totalCount } } } } }"),
+            Ok(1 + 20 * 21)
+        );
+        // A block's tx count needs no decoding: still cheap under a list.
+        assert!(c("{ blocksFromHeight(startHeight: 0, first: 200) { edges { node { transactions { totalCount } } } } }").unwrap() < 1000);
+    }
+
     /// I-3: the by-public-key lists are priced at the accounts they can return (100).
     #[test]
     fn by_public_key_lists_are_priced_at_their_cap() {
@@ -726,7 +760,8 @@ mod tests {
     fn sr7_3_unresolved_total_counts_fail_closed() {
         let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
         let over = Err("\"complexity\"".to_string());
-        // Happy path: two deferred counts pass, a block's own counts are cheap.
+        // Happy path: two deferred counts pass, a block's own counts are not walks (its
+        // events count is priced at a default page, M2).
         assert_eq!(
             c("{ a: transactions(accountName: \"a\") { totalCount } b: events(qualifiedEventName: \"x\") { totalCount } }"),
             Ok(2 * 101)
@@ -734,7 +769,7 @@ mod tests {
         assert!(
             c("{ block(hash: \"h\") { transactions { totalCount } events { totalCount } } }")
                 .unwrap()
-                < 20
+                < 40
         );
         // Three deferred counts through an inline fragment on an interface (`Node`).
         let q: String = (0..3)
