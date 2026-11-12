@@ -360,6 +360,13 @@ with `[balances] enabled = false`.
   through `/local`, re-checked every `[balances] recheck_hours`, default 24). Any other module's
   balances are stored and served, but its guard indexes no key, and its keyset references are
   not resolved.
+- **By-key listing** (SEC-2): `GET /keys/{pk}/accounts` lists only the modules in
+  `[balances] key_modules` (default `["coin"]`; each entry must be `name` or
+  `namespace.name`). A confirmed `fungible-v2` module still only proves the interface: its
+  `details` can report any balance under any key. Another module's rows are listed only when
+  a client asks with `?token=<module>`, and only on chains where that module is a confirmed
+  `fungible-v2`. Each row carries `trusted` (the module is in `key_modules`). Adding a module
+  to `key_modules` takes a restart of `serve`/`run`; the stored rows do not change.
 - **Not fungible**: a module whose `details` calls all fail in 3 batches in a row is marked
   not fungible: the tail stops marking it, its dirty rows are dropped without a call
   (`result="not_fungible"`) and `/tokens` hides it until the re-check `recheck_hours` later.

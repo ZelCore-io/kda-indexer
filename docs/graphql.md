@@ -96,6 +96,22 @@ Depth counts nested fields; fragments are expanded where they are spread, so fra
 inline fragments and aliases do not get around depth or complexity. Every operation in a
 document is checked, not only the one that runs.
 
+The document is parsed and walked by these limits before anything else looks at it, and that
+walk stops at 20,000 fields after fragment expansion (`LIMIT`, `limit: complexity`, "query has
+more than 20000 fields after fragment expansion"). A fragment bomb (each fragment spreading the
+one before it twice) is refused in about a millisecond, over HTTP and over the websocket. At
+most 8 directives are allowed on one field, fragment, fragment spread or inline fragment
+(`LIMIT`, `limit: directives`).
+
+A `crossChainTransfer` inside another `crossChainTransfer` costs 10 per item, the price of the
+store read it would need. It is answered from the pair already loaded and reads nothing.
+
+List pages (`transactions`, `transfers`, `events` and the other lists) share the API's heavy
+read slots (half the read threads). Each client key (an IPv4 address or an IPv6 /64, as the
+rate limiter keys it) holds at most one of them. Up to 3 more of its heavy reads wait behind
+that one. Past that, one is refused at once with `LIMIT`. One page scans for at most 1 s; a
+sparse or empty match then ends with `TIMEOUT`: narrow the filter.
+
 Complexity: each field costs 1 (`__typename` 0). A field that returns a page multiplies the
 cost of its selection by the page size it returns (`first`/`last` clamped to `max_page`, or
 `2 × max_page` on the block lists and `balance`, or
@@ -138,9 +154,10 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | subscriptions per process | `ws_subs_max = 2000` | `LIMIT` error (`ws_subscriptions`) |
 | `connection_init` | within `ws_init_secs = 10` | close 4408 (`ws_init_timeout`) |
 | no subscription open | for `ws_idle_secs = 600` | close 4000 (`ws_idle`) |
-| client message or frame | 64 KB | connection closed (`ws_message`) |
+| client message or frame | 64 KB | close 1009 (`ws_message`); a malformed frame closes 1002 |
 | client messages | one per-IP rate token each (pings too) | close 4429 (`ws_rate`) |
 | a client that does not read | 30 s per server message | close 4008 (`ws_slow_reader`) |
+| a chain whose feed read fails | 30 ticks in a row | that chain alone is skipped each tick (a WARN line with the chain and its failure count; the other chains keep delivering), then resumes from its tip with a gap |
 | a subscriber behind the feed | 1,024 feed items | one `INTERNAL` error; the subscription goes on from the feed's newest item |
 | a query or mutation over the socket | subscriptions only | `NOT_SUPPORTED` error, nothing runs (`ws_query`); send queries over HTTP |
 | one subscription message | the HTTP request deadline, shared by all its resolvers | `TIMEOUT` error for that message |
@@ -302,7 +319,12 @@ the oracle puts them.
 - Guards: an inline keyset or a resolved keyset reference is a `KeysetGuard` (`raw` is the
   stored guard), a user guard is a `UserGuard`, anything else a `RawGuard`.
 - `…ByPublicKey` lists at most 100 accounts, only rows whose guard holds the key, of `coin`
-  (the default) or of a module confirmed `fungible-v2` on that chain.
+  (the default) or of a module confirmed `fungible-v2` on that chain. Only the
+  `[balances] key_modules` (default `coin`) are governance-trusted. Any module can implement
+  `fungible-v2` and report any balance under any key. A `fungibleName` outside `key_modules`
+  is answered as the caller's own choice. Even a `coin` row proves only that the account's guard
+  holds the key, not who owns the account: anyone can create an account guarded by someone
+  else's key without their signature.
 - `FungibleAccount.transactions`: txs with a transfer of the token on the account's side;
   `FungibleChainAccount.transactions`: txs on that chain the account sent (`meta.sender`),
   as the schema says.
