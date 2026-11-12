@@ -66,8 +66,8 @@ hex = "0.4"
 bytes = "1"
 rayon = "1"
 libc = "0.2"
-# Safe *at syscalls (openat, fstatat, fchown on descriptors) for the snapshot handoff; already
-# in the tree through tantivy (fs4) and async-io, same version and features.
+# Safe syscalls for `snapshot` (open with O_NOFOLLOW, geteuid); already in the tree through
+# tantivy (fs4) and async-io, same version.
 rustix = { version = "1.1", features = ["fs"] }
 arc-swap = "1"
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }

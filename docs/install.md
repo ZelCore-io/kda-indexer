@@ -212,12 +212,14 @@ shared storage that is the allocation risk "Before any big write" in
 another local filesystem.
 
 ```sh
-sudo kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
+sudo install -d -o kda-indexer -g kda-indexer -m 0750 /opt/coins/data/kadena/kda-indexer/snapshot-copy
+sudo -u kda-indexer kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
     snapshot --out /opt/coins/data/kadena/kda-indexer/snapshot-copy
 ```
 
-Run it as root: the volume root is root-owned, so the service user cannot create the
-directory there. The command gives the finished copy to the data dir's owner.
+The snapshot runs as the service user, the data dir's owner; it refuses to run as root. The
+volume root is root-owned, so root only creates the empty directory for it first (the
+`install -d` line).
 
 On the new host, install the package as above, but leave the data dir empty, stop the unit,
 and copy the snapshot in (the directory must end up owned by `kda-indexer`):

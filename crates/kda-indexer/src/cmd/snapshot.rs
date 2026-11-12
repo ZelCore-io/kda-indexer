@@ -24,6 +24,12 @@
 //! outside `segments/`, `hot/` and `search/`. The snapshot is a data dir (`serve --data-dir
 //! DIR`, `run`).
 //! On a refusal nothing is created; on a later failure what this run created is removed.
+//!
+//! The snapshot runs as the data dir's owner (the service user); root is refused on a data
+//! dir it does not own ([`refuse_root`]) and only pre-creates an empty `--out`. A listed file
+//! is placed only when it is a regular file: a symlink at its name is refused, never followed
+//! ([`place`]). The manifest's `network` is a plain name (`Manifest::validate`), so a listed
+//! name never leaves `segments/`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -37,12 +43,12 @@ use kdx_hot::env::meta;
 use kdx_hot::{dict, HotStore, RoTxn, Stage, Table, Txn};
 use kdx_segment::files::{fsync_dir, replace_file};
 use kdx_segment::Manifest;
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 use serde_json::json;
 
 use super::hot::hot_dir;
 use super::segments::segments_dir;
-
-mod handoff;
 
 /// Manifest re-reads when a merge removes files under the snapshot.
 const MAX_ATTEMPTS: usize = 5;
@@ -109,6 +115,11 @@ pub fn snapshot(a: &SnapshotArgs) -> anyhow::Result<SnapshotReport> {
             (p == "snapshot-after-manifest").then(|| n.parse::<u64>().ok())?
         })
         .map(Duration::from_secs);
+    // Before anything is opened or created (the hot store open creates its lock file).
+    let owner = fs::metadata(&a.data_dir)
+        .with_context(|| format!("stat {}", a.data_dir.display()))?
+        .uid();
+    refuse_root(rustix::process::geteuid().as_raw(), owner)?;
     let hs = HotStore::open_ro(&hot_dir(&a.data_dir))?;
     snapshot_with(a, &hs, NAME_WAIT_PAUSE, &mut |p, _| {
         if let (Point::Manifest, Some(d)) = (p, sleep) {
@@ -126,89 +137,28 @@ fn snapshot_with(
     hook: &mut dyn FnMut(Point, usize),
 ) -> anyhow::Result<SnapshotReport> {
     let created = prepare_out(&a.out, &a.data_dir)?;
-    // The directory this run writes into (device, inode): the handoff only acts on it.
-    let r = fs::metadata(&a.out)
-        .with_context(|| format!("stat {}", a.out.display()))
-        .and_then(|m| Ok(((m.dev(), m.ino()), snapshot_into(a, hs, pause, hook)?)));
-    match r {
-        Ok((out_id, rep)) => {
-            hand_to_owner(&a.out, out_id, &a.data_dir);
-            Ok(rep)
-        }
-        Err(e) => {
-            remove_created(&a.out, created.as_deref());
-            Err(e)
-        }
+    let r = snapshot_into(a, hs, pause, hook);
+    if r.is_err() {
+        remove_created(&a.out, created.as_deref());
     }
+    r
 }
 
-/// A snapshot run by another user than the data dir's owner (root, typically: the service
-/// user cannot create `--out` under the root-owned volume root, 5E) gives what it wrote to
-/// the data dir's owner, so the service can open the copy: `--out` and everything under it,
-/// plus the data dir's own lock files it may have created (`segments.swap.lock`,
-/// `search.swap.lock`). Only the directory the snapshot wrote is walked (`out_id`: device and
-/// inode), and every change goes through a file descriptor, never through a symlink, each
-/// directory after everything in it ([`handoff`]). Hard links (files shared with the source)
-/// and symlinks keep their owner. Needs root; without it, or when an entry cannot be given
-/// (it and the directories above it keep their owner), a warning names the entries and the
-/// owner to set.
-fn hand_to_owner(out: &Path, out_id: (u64, u64), data_dir: &Path) {
-    let Ok(data) = fs::canonicalize(data_dir).and_then(|d| handoff::open_dir(&d)) else {
-        return;
-    };
-    let Ok(src) = data.metadata() else {
-        return;
-    };
-    let (uid, gid) = (src.uid(), src.gid());
-    let root = fs::canonicalize(out)
-        .and_then(|p| handoff::open_dir(&p))
-        .and_then(|f| {
-            let m = f.metadata()?;
-            if (m.dev(), m.ino()) != out_id {
-                return Err(io::Error::other("not the directory the snapshot wrote"));
-            }
-            Ok((f, m))
-        });
-    let (root, m) = match root {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                out = %out.display(),
-                "snapshot: the copy was not given to the data dir's owner {uid}:{gid}: {e} \
-                 (chown -R {uid}:{gid} the copy)"
-            );
-            return;
-        }
-    };
-    if (m.uid(), m.gid()) == (uid, gid) {
-        return;
-    }
-    let walk = handoff::tree(&root, uid, gid, &mut |_| {});
-    let mut given = walk.changed.len();
-    let mut failed: Vec<String> = walk
-        .failed
-        .iter()
-        .map(|(p, e)| format!("{}: {e}", out.join(p).display()))
-        .collect();
-    for lock in ["segments.swap.lock", "search.swap.lock"] {
-        match handoff::file_in(&data, lock, uid, gid) {
-            Ok(g) => given += usize::from(g),
-            Err(e) => failed.push(format!("{}: {e}", data_dir.join(lock).display())),
-        }
-    }
-    if !failed.is_empty() {
-        const SHOWN: usize = 10;
-        tracing::warn!(
-            out = %out.display(),
-            "snapshot: {} of {} entries could not be given to the data dir's owner {uid}:{gid}, \
-             a directory keeps its owner while an entry in it is not given (run as root, or \
-             chown -R {uid}:{gid} the copy): {}{}",
-            failed.len(),
-            given + failed.len(),
-            failed[..failed.len().min(SHOWN)].join("; "),
-            if failed.len() > SHOWN { "; ..." } else { "" }
+/// Refuses a snapshot run as root (`euid` 0) of a data dir that root does not own
+/// (`data_owner`: the uid owning the data dir). The service user owns the data dir and may be
+/// compromised (the API runs as it); root reading and writing by path in a tree that user
+/// controls could be pointed at any file on the host. The snapshot runs as the data dir's
+/// owner; root only creates the empty `--out` for it first.
+fn refuse_root(euid: u32, data_owner: u32) -> anyhow::Result<()> {
+    if euid == 0 && data_owner != 0 {
+        bail!(
+            "snapshot refuses to run as root on a data dir owned by uid {data_owner}: run it as \
+             the data dir's owner (sudo -u kda-indexer kda-indexer ... snapshot --out DIR, or \
+             sudo -u '#{data_owner}' ...); when that user cannot create DIR, create it empty \
+             as root first (install -d -o kda-indexer -g kda-indexer -m 0750 DIR)"
         );
     }
+    Ok(())
 }
 
 /// Refuses an `--out` inside the data dir or not empty before creating anything, then creates
@@ -366,7 +316,11 @@ fn snapshot_into(
     let (mut merge_reads, mut name_waits) = (0usize, 0usize);
     // m14: no `rebuild-range` swap runs while segment files are placed, so a range's files
     // all come from one side of its swap (a data dir we cannot lock still gets `resolve`).
-    let swap_guard = kdx_segment::swap::swap_lock(&src_seg, false).ok();
+    let swap_guard = kdx_segment::swap::swap_lock(&src_seg, false)
+        .inspect_err(|e| {
+            tracing::warn!("snapshot: placing segment files without the swap lock: {e:#}")
+        })
+        .ok();
     hook(Point::SwapLocked, 0);
     let (manifest_bytes, manifest, info) = loop {
         rep.attempts += 1;
@@ -484,9 +438,13 @@ fn snapshot_search(
 ) -> anyhow::Result<Option<(usize, u64, u32)>> {
     // No rebuild swap, stage commit or merge runs while the files are read and linked (a
     // source we cannot lock still gets the re-read checks of `live`).
-    let _swap = src
-        .parent()
-        .and_then(|d| kdx_search::build::swap_lock(d).ok());
+    let _swap = src.parent().and_then(|d| {
+        kdx_search::build::swap_lock(d)
+            .inspect_err(|e| {
+                tracing::warn!("snapshot: copying search/ without the swap lock: {e:#}")
+            })
+            .ok()
+    });
     for _ in 0..MAX_ATTEMPTS {
         let sf = match kdx_search::snapshot::live(src)? {
             kdx_search::snapshot::Live::None => return Ok(None),
@@ -523,19 +481,72 @@ fn snapshot_search(
     bail!("search/ kept changing under the snapshot ({MAX_ATTEMPTS} reads)")
 }
 
-/// Hard-link `src` to `dst`, or copy it durably; returns its size.
-fn place(src: &Path, dst: &Path, copy: bool) -> std::io::Result<u64> {
+/// Hard-link `src` to `dst`, or copy it durably; returns its size. `src` must be a regular
+/// file: a symbolic link (or anything else) at its name is refused, and neither mode reads
+/// through one. The copy opens `src` with `O_NOFOLLOW` and checks the open descriptor, and
+/// creates `dst` with `O_CREAT | O_EXCL | O_NOFOLLOW`. The hard link is made without
+/// following a symlink (`linkat` with no flags) and must be the inode checked before it.
+fn place(src: &Path, dst: &Path, copy: bool) -> io::Result<u64> {
     if !copy {
-        let n = fs::metadata(src)?.len();
-        return match fs::hard_link(src, dst) {
-            Ok(()) => Ok(n),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(0),
-            Err(e) => Err(e),
-        };
+        let m = fs::symlink_metadata(src)?;
+        regular_file(src, &m)?;
+        match fs::hard_link(src, dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(0),
+            Err(e) => return Err(e),
+        }
+        // `src` swapped for a symlink after the check: the link is that symlink.
+        let l = fs::symlink_metadata(dst)?;
+        if (l.dev(), l.ino()) != (m.dev(), m.ino()) {
+            let _ = fs::remove_file(dst);
+            return Err(io::Error::other(format!(
+                "{} changed while it was linked",
+                src.display()
+            )));
+        }
+        return Ok(m.len());
     }
-    let n = fs::copy(src, dst)?;
-    fs::File::open(dst)?.sync_all()?;
+    // NONBLOCK and NOCTTY: a FIFO or a terminal at `src` neither blocks the open nor becomes
+    // the controlling tty; the descriptor check below refuses it.
+    let from = rustix::fs::open(
+        src,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::LOOP => io::Error::other(format!(
+            "{} is a symbolic link: the snapshot never follows one",
+            src.display()
+        )),
+        e => io::Error::from(e),
+    })?;
+    let mut from = fs::File::from(from);
+    regular_file(src, &from.metadata()?)?;
+    let to = rustix::fs::open(
+        dst,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+    )?;
+    let mut to = fs::File::from(to);
+    let n = io::copy(&mut from, &mut to)?;
+    to.sync_all()?;
     Ok(n)
+}
+
+/// Refuses anything but a regular file at `path` (`m`: its metadata, not following a link).
+fn regular_file(path: &Path, m: &fs::Metadata) -> io::Result<()> {
+    let t = m.file_type();
+    if t.is_file() {
+        return Ok(());
+    }
+    let what = if t.is_symlink() {
+        "a symbolic link: the snapshot never follows one"
+    } else if t.is_dir() {
+        "a directory, not a regular file"
+    } else {
+        "not a regular file"
+    };
+    Err(io::Error::other(format!("{} is {what}", path.display())))
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` of unix seconds (civil-from-days, proleptic Gregorian).
@@ -830,56 +841,164 @@ mod tests {
         assert_eq!(utc_iso(1_709_164_800), "2024-02-29T00:00:00Z");
     }
 
-    /// 5E: what a snapshot run as root gives to the data dir's owner: `--out`, its entries
-    /// and the swap lock files, never a file hard-linked with the source or a symlink, and
-    /// only when `--out` is still the directory the snapshot wrote. The owner here differs
-    /// by group (a test cannot give files to another user); with no second group to use,
-    /// only the quiet return is seen.
+    /// Root may not snapshot a data dir it does not own (the service user's): the run would
+    /// read and write as root in a tree that user controls. Root on a root-owned data dir and
+    /// any other user run.
     #[test]
-    fn handoff_gives_the_copy_but_not_shared_hard_links() {
-        use super::hand_to_owner;
-        use std::os::unix::fs::MetadataExt;
-        let d = tempfile::tempdir().unwrap();
-        let (uid, from, to) = super::handoff::test_ids(d.path());
-        let gid = |p: &Path| fs::symlink_metadata(p).unwrap().gid();
-        let data = d.path().join("data");
-        fs::create_dir(&data).unwrap();
-        fs::write(data.join("src.seg"), b"x").unwrap();
-        fs::write(data.join("segments.swap.lock"), b"").unwrap();
-        let out = d.path().join("out");
-        fs::create_dir_all(out.join("hot")).unwrap();
-        fs::write(out.join("hot/mdbx.dat"), b"y").unwrap();
-        fs::write(out.join("SNAPSHOT.json"), b"{}").unwrap();
-        fs::hard_link(data.join("src.seg"), out.join("linked.seg")).unwrap();
-        std::os::unix::fs::symlink("hot", out.join("ln")).unwrap();
-        let m = fs::metadata(&out).unwrap();
-        let id = (m.dev(), m.ino());
-        // Already the owner's: nothing to do, and the handoff returns quietly.
-        hand_to_owner(&out, id, &data);
-        let given = [
-            out.clone(),
-            out.join("SNAPSHOT.json"),
-            out.join("hot"),
-            out.join("hot/mdbx.dat"),
-            data.join("segments.swap.lock"),
-        ];
-        let kept = [data.join("src.seg"), out.join("linked.seg"), out.join("ln")];
-        for p in given.iter().chain(&kept) {
-            assert_eq!(gid(p), from, "{}", p.display());
+    fn root_is_refused_on_a_data_dir_it_does_not_own() {
+        let e = super::refuse_root(0, 1001).unwrap_err().to_string();
+        assert!(e.contains("sudo -u kda-indexer"), "{e}");
+        assert!(e.contains("uid 1001"), "{e}");
+        assert!(e.contains("install -d"), "{e}");
+        super::refuse_root(0, 0).unwrap();
+        super::refuse_root(1001, 1001).unwrap();
+        super::refuse_root(1002, 1001).unwrap();
+    }
+
+    /// A data dir with one listed range `0..20` whose names the hot store sees, and the
+    /// snapshot arguments for `out`.
+    fn store_with_one_range(data: &Path, out: &Path, copy: bool) -> (HotStore, SnapshotArgs) {
+        let seg = data.join("segments");
+        fs::create_dir_all(&seg).unwrap();
+        let hs = HotStore::open(&data.join("hot"), Geometry::default()).unwrap();
+        commit_names(&hs, 20, b"a");
+        let a = entry(0, 20, 0);
+        let mut m = Manifest::new("net");
+        m.push(a.clone()).unwrap();
+        m.commit(&seg).unwrap();
+        put(&seg, &a);
+        let args = SnapshotArgs {
+            data_dir: data.to_path_buf(),
+            out: out.to_path_buf(),
+            copy,
+        };
+        (hs, args)
+    }
+
+    /// Every regular file under `dir` (empty when it does not exist).
+    fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut v = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd {
+                let p = e.unwrap().path();
+                let t = fs::symlink_metadata(&p).unwrap().file_type();
+                if t.is_dir() {
+                    todo.push(p);
+                } else if t.is_file() {
+                    v.push(p);
+                }
+            }
         }
-        // The data dir's owner differs. Another directory at `--out` is left alone.
-        std::os::unix::fs::lchown(&data, Some(uid), Some(to)).unwrap();
-        hand_to_owner(&out, (id.0, id.1 + 1), &data);
-        for p in given.iter().chain(&kept) {
-            assert_eq!(gid(p), from, "{}", p.display());
+        v
+    }
+
+    /// A manifest whose `network` climbs out of `segments/` (`../../x`) would make the
+    /// snapshot read `<data>/../x-*` and write `<out>/../x-*`, outside `--out`. The manifest
+    /// read refuses it, before any segment file is placed, and the run leaves nothing.
+    #[test]
+    fn a_traversal_network_is_refused_before_anything_is_placed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let out = tmp.path().join("o/out");
+        let (hs, args) = store_with_one_range(&data, &out, false);
+        let seg = data.join("segments");
+        // The hostile manifest, written past `Manifest::commit`'s own check.
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&fs::read(seg.join("manifest.json")).unwrap()).unwrap();
+        v["network"] = "../../x".into();
+        fs::write(seg.join("manifest.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+        // Its files exist where the traversal points (`<tmp>/x-*`).
+        for f in kdx_segment::files::range_file_names("../../x", 0, 20) {
+            fs::write(seg.join(f), b"x").unwrap();
         }
-        // The copy: every entry but the shared hard link and the symlink.
-        hand_to_owner(&out, id, &data);
-        for p in &given {
-            assert_eq!(gid(p), to, "{}", p.display());
+        let e = snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {}).unwrap_err();
+        assert!(format!("{e:#}").contains("network"), "{e:#}");
+        // `<out>/segments/../../x-*` is `<tmp>/o/x-*`: nothing was placed there, and the
+        // directories the run created (`o`) are gone.
+        assert!(!tmp.path().join("o").exists());
+    }
+
+    /// A listed segment file swapped for a symlink to a file outside the data dir: `--copy`
+    /// refuses it without reading through the link, the hard-link mode refuses it too, and
+    /// no copy of the target's bytes is left anywhere under `--out`.
+    #[test]
+    fn a_symlinked_segment_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let secret = tmp.path().join("outside/secret");
+        fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        fs::write(&secret, b"SECRET").unwrap();
+        for copy in [true, false] {
+            let out = tmp.path().join(format!("out-{copy}"));
+            let (hs, args) = store_with_one_range(&data, &out, copy);
+            let seg = data.join("segments");
+            let victim = seg.join(&kdx_segment::files::range_file_names("net", 0, 20)[0]);
+            fs::remove_file(&victim).unwrap();
+            std::os::unix::fs::symlink(&secret, &victim).unwrap();
+            let e = snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {}).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("symbolic link"),
+                "copy {copy}: {e:#}"
+            );
+            assert!(!out.exists(), "copy {copy}");
+            for f in files_under(tmp.path()) {
+                if f != secret {
+                    assert_ne!(fs::read(&f).unwrap(), b"SECRET", "{}", f.display());
+                }
+            }
+            drop(hs);
+            fs::remove_dir_all(&data).unwrap();
         }
-        for p in &kept {
-            assert_eq!(gid(p), from, "{}", p.display());
+        // `place` alone: a symlink, a directory and a dangling symlink, in both modes, and
+        // nothing is created at the destination.
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        std::os::unix::fs::symlink(&secret, src.join("ln")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("none"), src.join("dangling")).unwrap();
+        fs::create_dir(src.join("dir")).unwrap();
+        let dst = tmp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        for copy in [true, false] {
+            for name in ["ln", "dangling", "dir"] {
+                let e = super::place(&src.join(name), &dst.join(name), copy).unwrap_err();
+                assert_ne!(e.kind(), std::io::ErrorKind::NotFound, "{name} copy {copy}");
+                assert!(
+                    fs::symlink_metadata(dst.join(name)).is_err(),
+                    "{name} copy {copy}"
+                );
+            }
         }
+        // A regular file is still placed in both modes.
+        fs::write(src.join("ok"), b"ok").unwrap();
+        assert_eq!(
+            super::place(&src.join("ok"), &dst.join("ok1"), true).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::place(&src.join("ok"), &dst.join("ok2"), false).unwrap(),
+            2
+        );
+        assert_eq!(fs::read(dst.join("ok1")).unwrap(), b"ok");
+        assert_eq!(fs::read(dst.join("ok2")).unwrap(), b"ok");
+    }
+
+    /// Symlinks planted at the swap lock paths of the data dir are not followed: the targets
+    /// are never created (the snapshot runs on without those locks and says so).
+    #[test]
+    fn planted_lock_symlinks_are_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let out = tmp.path().join("out");
+        let (hs, args) = store_with_one_range(&data, &out, false);
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        for lock in ["segments.swap.lock", "search.swap.lock"] {
+            std::os::unix::fs::symlink(outside.join(lock), data.join(lock)).unwrap();
+        }
+        snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {}).unwrap();
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(out.join("SNAPSHOT.json").is_file());
     }
 }

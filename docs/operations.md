@@ -233,18 +233,28 @@ while it places files. The copy is a data dir: `serve --data-dir DIR` answers on
 on it resumes the tail from the checkpoints it holds.
 
 ```sh
-sudo kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
+sudo install -d -o kda-indexer -g kda-indexer -m 0750 /opt/coins/data/kadena/kda-indexer/mainnet01.replica
+sudo -u kda-indexer kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
     snapshot --out /opt/coins/data/kadena/kda-indexer/mainnet01.replica [--copy]
 ```
 
-- Run it as root. The volume root is owned by root (see [install.md](install.md)), so the
-  service user cannot create `DIR` there. Run as root, the command gives `DIR` and everything
-  it wrote to the owner of the source data dir when it is done (hard-linked segment files
-  already belong to it), and does the same for the two swap lock files if it created them. It
-  never follows a symbolic link, and gives each directory only after everything in it: when
-  an entry cannot be given, that entry and the directories above it stay root's and a warning
-  names them (then `chown -R kda-indexer:kda-indexer DIR`). To run it as the service user
-  instead, first create the empty `DIR` as root and `chown kda-indexer:kda-indexer` it.
+- Run it as the service user (`sudo -u kda-indexer`), the owner of the data dir. The volume
+  root is owned by root (see [install.md](install.md)), so that user cannot create `DIR`
+  there: root creates the empty `DIR` owned by `kda-indexer` first (the `install -d` line),
+  and does nothing else. The command refuses to run as root on a data dir root does not own,
+  before it opens or creates anything: as root it would read and write, by path, in a tree
+  the service user controls.
+- Every file the manifest (or `search/meta.json`) lists must be a regular file. A symbolic
+  link at a listed file's name, or anything else that is not a regular file, makes the
+  command fail: with `--copy` the file is opened with `O_NOFOLLOW` and checked on the open
+  descriptor, and the copy is created with `O_CREAT | O_EXCL | O_NOFOLLOW`; without `--copy`
+  the hard link is made without following a symlink and must be the file checked before it.
+  The swap lock files are opened with `O_NOFOLLOW` too: a symlink at `segments.swap.lock` or
+  `search.swap.lock` is refused (the snapshot then runs without that lock and logs a
+  warning). Directories above a listed file (`segments/`, `search/`, a `rebuild.<S>/` of a
+  pending swap) are opened as their paths resolve. The manifest's `network` must be a plain
+  name (`A-Z a-z 0-9 . _ -`, no leading `.`, no `..`, at most 64 characters), so a listed
+  name never points outside `segments/`.
 
 - `DIR` must not exist or be empty, and must not lie inside the source data dir. Without
   `--copy` it must be on the same filesystem as the source: the segment files are
@@ -278,7 +288,8 @@ sudo kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml
 A local replica:
 
 ```sh
-sudo kda-indexer --config .../mainnet01.toml snapshot --out /opt/coins/data/kadena/kda-indexer/replica
+sudo install -d -o kda-indexer -g kda-indexer -m 0750 /opt/coins/data/kadena/kda-indexer/replica
+sudo -u kda-indexer kda-indexer --config .../mainnet01.toml snapshot --out /opt/coins/data/kadena/kda-indexer/replica
 sudo -u kda-indexer kda-indexer --config .../replica.toml segments check
 sudo -u kda-indexer kda-indexer --config .../replica.toml serve   # replica.toml: data_dir of the snapshot, own api.* ports
 ```

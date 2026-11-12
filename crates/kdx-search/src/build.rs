@@ -22,7 +22,7 @@ use kdx_decode::index::code_entity;
 use kdx_decode::Family;
 use kdx_hot::{checkpoint, HotStore, Stage, Table, Txn};
 use kdx_segment::blockfile::{row_record, BlockFile};
-use kdx_segment::files::fsync_dir;
+use kdx_segment::files::{fsync_dir, open_lock_file};
 use kdx_segment::{RangeReader, Segments};
 use kdx_types::record::decode_tx;
 use kdx_types::{blake2b_128, MemDict, TxKey};
@@ -359,15 +359,10 @@ pub fn lock(data_dir: &Path) -> Result<File> {
 /// The swap lock (`search.swap.lock`, blocking): held by [`swap_in`] around its renames, by
 /// the tail stage around every write into `search/` ([`with_current`]) and by `snapshot`
 /// while it reads and links the live files. Every holder is short (one stage commit, two
-/// renames, one set of links).
+/// renames, one set of links). A symlink at the lock path is refused, never followed.
 pub fn swap_lock(data_dir: &Path) -> Result<File> {
     let p = data_dir.join("search.swap.lock");
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&p)
-        .with_context(|| format!("open {}", p.display()))?;
+    let f = open_lock_file(&p)?;
     f.lock().with_context(|| format!("lock {}", p.display()))?;
     Ok(f)
 }
@@ -816,6 +811,16 @@ mod tests {
             .unwrap()
             .hashes
             .len()
+    }
+
+    /// A symlink planted at `search.swap.lock` is refused: its target is never created.
+    #[test]
+    fn swap_lock_never_follows_a_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("outside");
+        std::os::unix::fs::symlink(&target, d.path().join("search.swap.lock")).unwrap();
+        assert!(swap_lock(d.path()).is_err());
+        assert!(!target.exists());
     }
 
     /// I-2: a rebuild that swaps `search/` while the stage holds docs never gets the stage's

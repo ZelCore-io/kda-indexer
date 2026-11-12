@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::files::{fsync_dir, replace_file};
+use crate::files::{fsync_dir, open_lock_file, replace_file};
 
 /// Journal file name inside a rebuild dir.
 pub const JOURNAL: &str = "rebuild.json";
@@ -56,14 +56,10 @@ pub fn pending(segdir: &Path, start: u32) -> bool {
 /// or swaps a range; `snapshot` holds it shared while it places segment files, so a snapshot
 /// never pairs files from both sides of a swap (m14). It sits outside `segments/`, so
 /// `remove_unlisted` never deletes it and a snapshot never copies it. Blocks until granted.
+/// A symlink at the lock path is refused, never followed ([`open_lock_file`]).
 pub fn swap_lock(segdir: &Path, exclusive: bool) -> Result<fs::File> {
     let p = segdir.parent().unwrap_or(segdir).join("segments.swap.lock");
-    let f = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&p)
-        .with_context(|| format!("open {}", p.display()))?;
+    let f = open_lock_file(&p)?;
     if exclusive { f.lock() } else { f.lock_shared() }
         .with_context(|| format!("lock {}", p.display()))?;
     Ok(f)
@@ -255,5 +251,26 @@ mod tests {
             Err(fs::TryLockError::WouldBlock)
         ));
         drop(a);
+    }
+
+    /// A symlink planted at `segments.swap.lock` (to a file that does not exist, or to one
+    /// that does) is refused: the target is neither created nor opened.
+    #[test]
+    fn swap_lock_never_follows_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let seg = t.path().join("segments");
+        fs::create_dir_all(&seg).unwrap();
+        let target = t.path().join("outside");
+        std::os::unix::fs::symlink(&target, t.path().join("segments.swap.lock")).unwrap();
+        for exclusive in [true, false] {
+            assert!(swap_lock(&seg, exclusive).is_err());
+            assert!(!target.exists());
+        }
+        // An existing target is not opened (following the link would take this shared lock).
+        fs::write(&target, b"keep").unwrap();
+        let held = fs::File::open(&target).unwrap();
+        held.lock_shared().unwrap();
+        assert!(swap_lock(&seg, false).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
     }
 }
