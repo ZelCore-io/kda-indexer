@@ -76,7 +76,8 @@ fn pending_json(module: &str, c: u8, r: Option<&BalanceRow>) -> Value {
 /// `(module, chain)` of an `/accounts/{a}/balances` cursor: 10 hex digits.
 fn parse_bal_cursor(c: &str) -> ApiResult<(u32, u8)> {
     let bad = || ApiError::BadRequest("invalid cursor".into());
-    if c.len() != 10 {
+    // ASCII hex only, so the byte slices below always fall on char boundaries.
+    if c.len() != 10 || !c.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(bad());
     }
     let m = u32::from_str_radix(&c[..8], 16).map_err(|_| bad())?;
@@ -283,4 +284,24 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
         list_response(view, items, next)
     })
     .await
+}
+
+#[cfg(test)]
+mod cursor_parse_tests {
+    use super::parse_bal_cursor;
+
+    #[test]
+    fn rejects_non_hex_and_multibyte_without_panicking() {
+        assert_eq!(parse_bal_cursor("0000000a13").ok(), Some((10, 0x13)));
+        // 10 bytes long, but byte 8 is inside a multi-byte char.
+        for bad in [
+            "0000000\u{e9}0",
+            "00000000\u{e9}",
+            "zzzzzzzzzz",
+            "",
+            "0000000000ff",
+        ] {
+            assert!(parse_bal_cursor(bad).is_err(), "{bad:?}");
+        }
+    }
 }
