@@ -25,7 +25,7 @@ use crate::{KdxSchema, ReqCtx};
 
 /// Time kept back from the request deadline to answer `TIMEOUT` as GraphQL before the
 /// guard's 504.
-const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+pub(crate) const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
 
 /// The `/graphql` routes (`Api::graphql_routes` adds the guard, tracking and CORS).
 pub fn router(schema: KdxSchema) -> Router<Arc<ApiState>> {

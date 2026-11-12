@@ -15,6 +15,11 @@
 //! - a client that does not read for [`SEND_TIMEOUT`] is closed, and a subscriber that falls
 //!   behind the feed's buffer gets an error (memory stays bounded).
 //!
+//! - only subscriptions run over the socket: a document with a query or mutation answers a
+//!   `NOT_SUPPORTED` error before anything runs (kadscan sends only subscriptions there);
+//! - every subscription message runs under one deadline (the HTTP request budget) that all
+//!   of its resolvers share, bounded by an outer timeout (I-2).
+//!
 //! All slots are held by guards and released on close, error or task end.
 
 use std::net::{IpAddr, SocketAddr};
@@ -22,8 +27,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_graphql::extensions::{
+    Extension, ExtensionContext, ExtensionFactory, NextExecute, NextParseQuery,
+};
 use async_graphql::http::{WebSocket as GqlWebSocket, WebSocketProtocols, WsMessage};
-use async_graphql::{Context, Data};
+use async_graphql::parser::types::{DocumentOperations, ExecutableDocument, OperationType};
+use async_graphql::{Context, Data, ServerResult, Variables};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, Request as HttpRequest};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -34,7 +43,7 @@ use kdx_api::ApiState;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{limit, server, Code};
-use crate::{gql, Gql, KdxSchema};
+use crate::{gql, Gql, KdxSchema, ReqCtx};
 
 /// Largest client message and frame.
 pub const MAX_MESSAGE: usize = 64 * 1024;
@@ -77,6 +86,83 @@ pub fn active_subscriptions(schema: &KdxSchema) -> usize {
 /// Per-connection subscription slots (connection data).
 #[derive(Clone)]
 pub struct ConnSubs(Arc<Semaphore>);
+
+/// The websocket rules of the schema (I-2): only subscriptions over a socket, and one
+/// deadline per subscription message.
+pub struct WsOps;
+
+impl ExtensionFactory for WsOps {
+    fn create(&self) -> Arc<dyn Extension> {
+        Arc::new(WsOpsExt)
+    }
+}
+
+struct WsOpsExt;
+
+/// A message's budget without a store attached (no `ApiSettings` to read).
+const MESSAGE_BUDGET: Duration = Duration::from_secs(5);
+
+#[async_graphql::async_trait::async_trait]
+impl Extension for WsOpsExt {
+    async fn parse_query(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        query: &str,
+        variables: &Variables,
+        next: NextParseQuery<'_>,
+    ) -> ServerResult<ExecutableDocument> {
+        let doc = next.run(ctx, query, variables).await?;
+        // Over a socket (its connection data) only subscriptions run: a query there would
+        // skip the HTTP in-flight cap and request deadline.
+        if ctx.data_opt::<ConnSubs>().is_some() {
+            let query_op = match &doc.operations {
+                DocumentOperations::Single(op) => op.node.ty != OperationType::Subscription,
+                DocumentOperations::Multiple(m) => m
+                    .values()
+                    .any(|op| op.node.ty != OperationType::Subscription),
+            };
+            if query_op {
+                kdx_metrics::get().graphql_rejected("ws_query");
+                return Err(server(
+                    Code::NotSupported,
+                    "only subscriptions run over the websocket; send queries over HTTP",
+                ));
+            }
+        }
+        Ok(doc)
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        operation_name: Option<&str>,
+        next: NextExecute<'_>,
+    ) -> async_graphql::Response {
+        // An HTTP request carries its deadline; a subscription message gets its own.
+        if ctx.data_opt::<ReqCtx>().is_some() {
+            return next.run(ctx, operation_name).await;
+        }
+        let budget =
+            ctx.data_opt::<Gql>()
+                .and_then(|g| g.state().ok())
+                .map_or(MESSAGE_BUDGET, |st| {
+                    st.settings
+                        .deadline
+                        .saturating_sub(crate::http::DEADLINE_MARGIN)
+                });
+        let mut data = Data::default();
+        data.insert(ReqCtx {
+            deadline: Instant::now() + budget,
+        });
+        match tokio::time::timeout(budget, next.run_with_data(ctx, operation_name, data)).await {
+            Ok(r) => r,
+            Err(_) => async_graphql::Response::from_errors(vec![server(
+                Code::Timeout,
+                "message deadline exceeded",
+            )]),
+        }
+    }
+}
 
 /// The slots one subscription holds; dropping it releases them and the gauge.
 pub struct SubSlot {
@@ -317,4 +403,60 @@ async fn drive(
         .await;
     }
     reader.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use async_graphql::{EmptyMutation, Object, Schema, Subscription};
+    use futures::stream::{self, Stream};
+
+    use super::*;
+
+    struct Q;
+
+    #[Object]
+    impl Q {
+        async fn a(&self) -> i32 {
+            1
+        }
+    }
+
+    struct Tick;
+
+    #[Object]
+    impl Tick {
+        /// Milliseconds left until the deadline the message's resolvers see (-1: none).
+        async fn left(&self, ctx: &Context<'_>) -> i64 {
+            ctx.data_opt::<ReqCtx>().map_or(-1, |r| {
+                r.deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as i64
+            })
+        }
+    }
+
+    struct S;
+
+    #[Subscription]
+    impl S {
+        async fn ticks(&self) -> impl Stream<Item = Tick> {
+            stream::iter([Tick, Tick])
+        }
+    }
+
+    /// I-2: every subscription message runs under one deadline of its own.
+    #[tokio::test]
+    async fn every_subscription_message_has_a_deadline() {
+        let schema = Schema::build(Q, EmptyMutation, S).extension(WsOps).finish();
+        let items: Vec<_> = schema
+            .execute_stream("subscription { ticks { left } }")
+            .collect()
+            .await;
+        assert_eq!(items.len(), 2);
+        for r in items {
+            let v = r.data.into_json().unwrap();
+            let left = v["ticks"]["left"].as_i64().unwrap();
+            assert!((1..=5_000).contains(&left), "{v}");
+        }
+    }
 }

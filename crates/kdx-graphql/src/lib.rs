@@ -210,6 +210,7 @@ fn build(
     })
     .extension(limits::Limits)
     .extension(flags::Flags)
+    .extension(ws::WsOps)
     // Parser recursion and directive caps (the AST walk in `limits` is bounded separately).
     .limit_recursive_depth(limits::PARSER_RECURSION)
     .limit_directives(limits::MAX_DIRECTIVES);

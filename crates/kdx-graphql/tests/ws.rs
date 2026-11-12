@@ -471,3 +471,25 @@ async fn lagging_subscriber_gets_a_gap_and_stays_open() {
     let got = sizes(&mut a, 1, "newBlocks").await;
     assert_eq!(got["1"], [vec![1]]);
 }
+
+/// I-2: a query over the websocket is refused before it runs (only subscriptions there).
+#[tokio::test]
+async fn queries_over_the_socket_are_refused() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let q = "{ graphConfiguration { version } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": q}}),
+    )
+    .await;
+    let m = recv(&mut a).await.unwrap();
+    assert!(m["payload"]["data"].is_null(), "{m}");
+    let errors = if m["type"] == "error" {
+        &m["payload"]
+    } else {
+        &m["payload"]["errors"]
+    };
+    assert_eq!(errors[0]["extensions"]["code"], "NOT_SUPPORTED", "{m}");
+}
