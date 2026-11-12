@@ -1817,6 +1817,7 @@ dependencies = [
  "kdx-hot",
  "kdx-metrics",
  "kdx-types",
+ "libc",
  "proptest",
  "serde",
  "serde_json",

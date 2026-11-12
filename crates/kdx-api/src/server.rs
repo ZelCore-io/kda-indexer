@@ -17,11 +17,11 @@ use axum::http::{header, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::limits::{client_ip, is_internal, IpNet, RateLimiter};
+use crate::limits::{bucket_key, client_ip, is_internal, IpNet, RateLimiter};
 use crate::store::{Store, View};
 use crate::{admin, status, ApiError, ApiResult};
 
@@ -113,8 +113,84 @@ pub struct ApiState {
     /// Expensive request classes (events scan, `/v1/txs`) take one of these before a read
     /// slot: at most half the pool, so they cannot hold every slot.
     heavy: Arc<Semaphore>,
+    /// Heavy reads per client key (H-1): one runs, [`HEAVY_WAITING_PER_CLIENT`] wait.
+    heavy_clients: Arc<HeavyClients>,
     in_flight: Arc<Semaphore>,
     limiter: RateLimiter,
+    /// `[balances] key_modules` (M-1, SEC-2): the modules `GET /keys/{pubkey}/accounts`
+    /// lists without `token`; unset means `["coin"]`.
+    key_modules: std::sync::OnceLock<Vec<String>>,
+}
+
+tokio::task_local! {
+    /// The client key ([`bucket_key`]) of the request being served, set by the data
+    /// listeners' guard (H-1).
+    static CLIENT: std::net::IpAddr;
+}
+
+/// Run `f` as a request of client `ip`: heavy reads inside it count against that client's
+/// share (H-1). The data listeners' guard does this for every request.
+pub async fn as_client<F: std::future::Future>(ip: std::net::IpAddr, f: F) -> F::Output {
+    CLIENT.scope(bucket_key(ip), f).await
+}
+
+/// Heavy reads one client key may have waiting behind its running one (H-1); past that a
+/// heavy read is refused at once (503, GraphQL `LIMIT`). A client never holds more than one
+/// heavy slot, so with two or more slots one client cannot stall another's lists.
+pub const HEAVY_WAITING_PER_CLIENT: usize = 3;
+
+/// Heavy reads in flight per client key: the client's one-slot semaphore and its users
+/// (running and waiting).
+#[derive(Default)]
+struct HeavyClients(
+    std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (Arc<Semaphore>, usize)>>,
+);
+
+/// A client's place among its heavy reads: dropping it leaves the queue.
+struct HeavyTicket {
+    clients: Arc<HeavyClients>,
+    key: std::net::IpAddr,
+    slot: Arc<Semaphore>,
+}
+
+impl HeavyClients {
+    fn enter(self: &Arc<Self>, key: std::net::IpAddr) -> ApiResult<HeavyTicket> {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let e = m
+            .entry(key)
+            .or_insert_with(|| (Arc::new(Semaphore::new(1)), 0));
+        if e.1 > HEAVY_WAITING_PER_CLIENT {
+            tracing::debug!(client = %key, "api: heavy read refused, client queue full");
+            return Err(ApiError::Unavailable(
+                "this client already runs a heavy request and has others waiting: retry when they are done"
+                    .into(),
+            ));
+        }
+        e.1 += 1;
+        Ok(HeavyTicket {
+            clients: self.clone(),
+            key,
+            slot: e.0.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    fn users(&self, key: std::net::IpAddr) -> usize {
+        let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(&key).map_or(0, |e| e.1)
+    }
+}
+
+impl Drop for HeavyTicket {
+    fn drop(&mut self) {
+        let mut m = self.clients.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = m.get_mut(&self.key) {
+            e.1 = e.1.saturating_sub(1);
+            if e.1 == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl ApiState {
@@ -158,6 +234,19 @@ impl ApiState {
         client_ip(peer, headers, &self.settings.trusted_proxies)
     }
 
+    /// Set `[balances] key_modules` (once, before serving; later calls are ignored).
+    pub fn set_key_modules(&self, modules: Vec<String>) {
+        let _ = self.key_modules.set(modules);
+    }
+
+    /// The governance-trusted modules of the by-key listing (default `["coin"]`).
+    pub fn key_modules(&self) -> Vec<String> {
+        self.key_modules
+            .get()
+            .cloned()
+            .unwrap_or_else(|| vec!["coin".to_owned()])
+    }
+
     /// `read` on the reserved status slots (cheap tip reads only).
     pub async fn read_status<T, F>(self: &Arc<Self>, f: F) -> ApiResult<T>
     where
@@ -181,6 +270,22 @@ impl ApiState {
         let acquire = |s: &Arc<Semaphore>| {
             tokio::time::timeout_at(deadline.into(), s.clone().acquire_owned())
         };
+        // A heavy read of a known client first waits for that client's own slot (H-1), so
+        // the shared heavy slots are held by at most one read per client.
+        let own: Option<(HeavyTicket, OwnedSemaphorePermit)> = match first {
+            Some(_) => match CLIENT.try_with(|c| *c) {
+                Ok(key) => {
+                    let t = self.heavy_clients.enter(key)?;
+                    let p = acquire(&t.slot)
+                        .await
+                        .map_err(|_| ApiError::Deadline)?
+                        .map_err(|e| ApiError::Internal(e.into()))?;
+                    Some((t, p))
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
         let gate = match first {
             Some(s) => Some(
                 acquire(s)
@@ -196,7 +301,7 @@ impl ApiState {
             .map_err(|e| ApiError::Internal(e.into()))?;
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
-            let _p = (permit, gate);
+            let _p = (permit, gate, own);
             let view = store.view(deadline)?;
             view.check_deadline()?;
             f(&view)
@@ -255,11 +360,18 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
         st.settings.max_body_bytes
     };
     let delay = debug_delay();
+    let client = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| client_ip(*peer, req.headers(), &st.settings.trusted_proxies));
     let run = async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        next.run(req).await
+        match client {
+            Some(ip) => as_client(ip, next.run(req)).await,
+            None => next.run(req).await,
+        }
     };
     let resp = match tokio::time::timeout(st.settings.deadline, run).await {
         Ok(r) => r,
@@ -361,6 +473,8 @@ impl Api {
             reads: Arc::new(Semaphore::new(settings.read_threads.max(1))),
             status_reads: Arc::new(Semaphore::new(STATUS_READS)),
             heavy: Arc::new(Semaphore::new((settings.read_threads / 2).max(1))),
+            heavy_clients: Arc::default(),
+            key_modules: std::sync::OnceLock::new(),
             in_flight: Arc::new(Semaphore::new(settings.max_in_flight.max(1))),
             limiter: RateLimiter::new(settings.rate_per_ip, settings.rate_burst),
             store,
@@ -540,5 +654,64 @@ mod tests {
             Err(ApiError::Deadline)
         ));
         assert!(st.read(|_| Ok(())).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_client_holds_at_most_one_heavy_slot() {
+        let (_d, store) = crate::testutil::store();
+        // 4 read threads: 2 heavy slots.
+        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let a: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let b: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        // Two deadline-long scans from client A.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let scan = |st: Arc<ApiState>, rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>| {
+            tokio::spawn(as_client(a, async move {
+                st.read_heavy(move |_| {
+                    let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(4));
+                    Ok(())
+                })
+                .await
+            }))
+        };
+        let s1 = scan(st.clone(), rx.clone());
+        let s2 = scan(st.clone(), rx.clone());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while st.heavy_clients.users(bucket_key(a)) < 2 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(st.heavy_clients.users(bucket_key(a)), 2);
+        // Client B's list read is not stalled behind them.
+        let t = Instant::now();
+        let r = as_client(b, st.read_heavy(|_| Ok(()))).await;
+        assert!(r.is_ok());
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        // A's queue is bounded: past one running and HEAVY_WAITING_PER_CLIENT waiting, a
+        // heavy read is refused at once.
+        let mut waiting = Vec::new();
+        for _ in 2..=HEAVY_WAITING_PER_CLIENT {
+            waiting.push(scan(st.clone(), rx.clone()));
+        }
+        while st.heavy_clients.users(bucket_key(a)) < HEAVY_WAITING_PER_CLIENT + 1 {
+            tokio::task::yield_now().await;
+        }
+        let t = Instant::now();
+        let r = as_client(a, st.read_heavy(|_| Ok(()))).await;
+        assert!(matches!(r, Err(ApiError::Unavailable(_))), "{r:?}");
+        assert!(t.elapsed() < Duration::from_millis(100));
+        // Release the scans: every slot and every client entry comes back.
+        for _ in 0..=HEAVY_WAITING_PER_CLIENT + 1 {
+            let _ = tx.send(());
+        }
+        for h in [s1, s2].into_iter().chain(waiting) {
+            assert!(h.await.unwrap().is_ok());
+        }
+        assert_eq!(st.heavy_clients.users(bucket_key(a)), 0);
+        assert_eq!(st.heavy.available_permits(), 2);
     }
 }

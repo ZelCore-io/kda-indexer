@@ -45,6 +45,9 @@ pub const MAX_HEIGHTS: u32 = 20_000;
 pub const MAX_NAME: usize = 512;
 
 const CHECK_EVERY: usize = 64;
+/// How long one page read may scan (H-1): a sparse or empty match stops here and releases
+/// its heavy slot instead of holding it to the request deadline.
+pub const SCAN_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------------------
 // One loaded tx
@@ -812,6 +815,7 @@ pub async fn list(
     let sp = spec.clone();
     let (edges, info, exact) = state
         .read_heavy(move |view| {
+            let dl = dl.min(Instant::now() + SCAN_WINDOW);
             let exact = if bounded {
                 Some(count(view, &sp, dl)?.0)
             } else {

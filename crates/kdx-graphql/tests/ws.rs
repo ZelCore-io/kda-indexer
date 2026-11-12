@@ -272,7 +272,8 @@ async fn message_cap_and_rate_tokens() {
     init(&mut a).await;
     let big = "x".repeat(70 * 1024);
     let _ = a.send(Message::Text(big.into())).await;
-    assert!(recv(&mut a).await.is_err());
+    // L-3: with a close frame (1009), not a dropped connection (1006).
+    assert_eq!(recv(&mut a).await.err(), Some(1009));
     // Each message takes a rate token: out of tokens closes 4429.
     let s = server(GraphqlSettings::default(), 10).await;
     let mut b = connect(&s, "graphql-transport-ws").await.unwrap();
@@ -490,4 +491,48 @@ async fn queries_over_the_socket_are_refused() {
         &m["payload"]["errors"]
     };
     assert_eq!(errors[0]["extensions"]["code"], "NOT_SUPPORTED", "{m}");
+}
+
+#[tokio::test]
+async fn fragment_bomb_over_the_socket_is_refused_fast() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    for (id, n) in [(1, 24), (2, 40), (3, 60)] {
+        let mut q = String::from("fragment F0 on Block { hash } ");
+        for i in 1..=n {
+            q += &format!("fragment F{i} on Block {{ ...F{p} ...F{p} }} ", p = i - 1);
+        }
+        q += &format!("subscription {{ newBlocks {{ ...F{n} }} }}");
+        let t = Instant::now();
+        send(
+            &mut a,
+            json!({"id": id.to_string(), "type": "subscribe", "payload": {"query": q}}),
+        )
+        .await;
+        let m = recv(&mut a).await.unwrap();
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "n={n}: {:?}",
+            t.elapsed()
+        );
+        assert!(m["payload"]["data"].is_null(), "{m}");
+        let errors = if m["type"] == "error" {
+            &m["payload"]
+        } else {
+            &m["payload"]["errors"]
+        };
+        assert_eq!(errors[0]["extensions"]["code"], "LIMIT", "{m}");
+        assert_eq!(errors[0]["extensions"]["limit"], "complexity", "{m}");
+        if m["type"] == "next" {
+            assert_eq!(recv(&mut a).await.unwrap()["type"], "complete");
+        }
+    }
+    // The connection stays usable.
+    send(
+        &mut a,
+        json!({"id": "4", "type": "subscribe", "payload": {"query": "subscription { newBlocks { hash } }"}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
 }

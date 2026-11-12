@@ -454,6 +454,10 @@ pub struct BalancesConfig {
     pub account_rows: u32,
     /// Hours after which a module's fungible check and a not-fungible verdict are re-done.
     pub recheck_hours: u32,
+    /// Modules `GET /keys/{pubkey}/accounts` lists without `token` (M-1, SEC-2). Any module
+    /// can implement fungible-v2 and report a balance under any key, so only the ones listed
+    /// here are governance-trusted; others appear only when asked for by `token`.
+    pub key_modules: Vec<String>,
 }
 
 impl Default for BalancesConfig {
@@ -466,6 +470,7 @@ impl Default for BalancesConfig {
             module_rows: 1_000_000,
             account_rows: 1_000,
             recheck_hours: 24,
+            key_modules: vec!["coin".to_owned()],
         }
     }
 }
@@ -493,6 +498,12 @@ impl BalancesConfig {
                 && self.recheck_hours >= 1,
             "balances.module_share, module_rows, account_rows and recheck_hours must be >= 1"
         );
+        for m in &self.key_modules {
+            anyhow::ensure!(
+                kdx_node::local::valid_module(m),
+                "balances.key_modules: `{m}` is not a module name (name or namespace.name)"
+            );
+        }
         Ok(())
     }
 }
@@ -671,6 +682,12 @@ mod balances_tests {
     fn balances_values_are_validated() {
         let ok = BalancesConfig::default();
         assert!(ok.validate().is_ok());
+        assert_eq!(ok.key_modules, ["coin"]);
+        let wide = BalancesConfig {
+            key_modules: vec!["coin".into(), "kaddex.kdx".into()],
+            ..ok.clone()
+        };
+        assert!(wide.validate().is_ok());
         for bad in [
             BalancesConfig {
                 local_rps: 0,
@@ -686,6 +703,14 @@ mod balances_tests {
             },
             BalancesConfig {
                 account_rows: 0,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                key_modules: vec!["coin".into(), "free.evil; drop".into()],
+                ..ok.clone()
+            },
+            BalancesConfig {
+                key_modules: vec!["".into()],
                 ..ok.clone()
             },
         ] {

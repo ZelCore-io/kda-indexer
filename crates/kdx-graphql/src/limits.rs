@@ -7,7 +7,9 @@
 //!
 //! Fragments are expanded where they are spread, so neither fragments, aliases nor inline
 //! fragments get around depth or complexity. Every operation of a document is checked (not
-//! only the one that runs). The walk itself is bounded by [`MAX_VISITS`].
+//! only the one that runs). The walk itself is bounded by [`MAX_VISITS`], and it runs on the
+//! freshly parsed document before any other walk of it (C-1), counting directives too
+//! ([`MAX_DIRECTIVES`] per field, fragment or spread).
 //!
 //! Cost model (field types from the schema, keyed on field names, never aliases): each field
 //! costs 1 (`__typename` 0, and a connection's `edges` and their `node` 0). A
@@ -22,14 +24,14 @@
 use std::sync::Arc;
 
 use async_graphql::extensions::{
-    Extension, ExtensionContext, ExtensionFactory, NextParseQuery, NextValidation,
+    Extension, ExtensionContext, ExtensionFactory, NextPrepareRequest, NextValidation,
 };
 use async_graphql::parser::types::{
     DocumentOperations, ExecutableDocument, Field, FragmentDefinition, OperationType, Selection,
     SelectionSet,
 };
 use async_graphql::registry::Registry;
-use async_graphql::{Name, ServerError, ServerResult, ValidationResult, Value, Variables};
+use async_graphql::{Name, Request, ServerError, ServerResult, ValidationResult, Value, Variables};
 
 use crate::error::limit;
 use crate::{Gql, GraphqlSettings};
@@ -148,6 +150,25 @@ struct Walk<'a> {
     counts: u64,
     /// Introspection cost of the current operation.
     intro_cost: u64,
+    /// `crossChainTransfer` fields on the current path (M-5).
+    xchain: usize,
+}
+
+/// A `crossChainTransfer` inside another one (M-5): priced as the per-item store read it
+/// would be if not answered from the pair already loaded.
+pub const NESTED_XCHAIN_COST: u64 = 10;
+
+/// The directive cap of one field, fragment or spread (C-1: counted here, inside the
+/// bounded walk, instead of async-graphql's `limit_directives`, whose walk expands every
+/// fragment spread with no visit cap).
+fn directives(n: usize, what: &str) -> Result<(), ServerError> {
+    if n > MAX_DIRECTIVES {
+        return Err(limit(
+            "directives",
+            format!("more than {MAX_DIRECTIVES} directives on `{what}`"),
+        ));
+    }
+    Ok(())
 }
 
 /// An argument as the analysis sees it.
@@ -211,6 +232,7 @@ impl<'a> Walk<'a> {
                 Selection::Field(f) => {
                     let f = &f.node;
                     let name = f.name.node.as_str();
+                    directives(f.directives.len(), name)?;
                     if name == "__typename" {
                         continue;
                     }
@@ -277,6 +299,7 @@ impl<'a> Walk<'a> {
                         _ if intro => 1,
                         "edges" if wrap == Wrap::Conn => 0,
                         "node" if wrap == Wrap::Edges => 0,
+                        "crossChainTransfer" if self.xchain > 0 => NESTED_XCHAIN_COST,
                         "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
                             self.s.default_page.min(self.s.max_page) as u64
                         }
@@ -314,7 +337,10 @@ impl<'a> Walk<'a> {
                     } else {
                         self.outer = self.outer.saturating_mul(mult.max(1));
                     }
+                    let xc = usize::from(name == "crossChainTransfer");
+                    self.xchain += xc;
                     let child = self.set(&f.selection_set.node, d, intro, fty, inner);
+                    self.xchain -= xc;
                     (self.outer, self.conn_mult) = (saved, saved_cm);
                     if list.is_some() {
                         self.intro_lists.pop();
@@ -358,6 +384,7 @@ impl<'a> Walk<'a> {
                     }
                 }
                 Selection::InlineFragment(i) => {
+                    directives(i.node.directives.len(), "inline fragment")?;
                     let on = i
                         .node
                         .type_condition
@@ -370,6 +397,7 @@ impl<'a> Walk<'a> {
                 }
                 Selection::FragmentSpread(fs) => {
                     let name = fs.node.fragment_name.node.as_str();
+                    directives(fs.node.directives.len(), name)?;
                     // A cycle or an unknown fragment is left to validation, which refuses it.
                     if self.stack.contains(&name) {
                         continue;
@@ -377,6 +405,7 @@ impl<'a> Walk<'a> {
                     let Some(def) = self.frags.get(name) else {
                         continue;
                     };
+                    directives(def.node.directives.len(), name)?;
                     self.stack.push(name);
                     let on = Some(def.node.type_condition.node.on.node.as_str());
                     let (t, e) = self.set(&def.node.selection_set.node, depth, intro, on, wrap)?;
@@ -497,6 +526,7 @@ pub fn analyze(
         outer: 1,
         conn_mult: 1,
         counts: 0,
+        xchain: 0,
     };
     let ops: Vec<_> = match &doc.operations {
         DocumentOperations::Single(op) => vec![op],
@@ -571,18 +601,23 @@ struct LimitsExt;
 
 #[async_graphql::async_trait::async_trait]
 impl Extension for LimitsExt {
-    async fn parse_query(
+    /// C-1: the sizes are checked, then the document is parsed here and analyzed (a walk
+    /// capped at [`MAX_VISITS`]) before anything else sees it. async-graphql's own parse step
+    /// (`check_recursive_depth`, and `limit_directives` when set) expands every fragment spread
+    /// with no memo and no visit cap, synchronously on a runtime worker; a fragment bomb of
+    /// 1.4 KB cost minutes of CPU there. The parsed document is kept on the request, so
+    /// that step reuses it and only ever walks a document this analysis has bounded.
+    async fn prepare_request(
         &self,
         ctx: &ExtensionContext<'_>,
-        query: &str,
-        variables: &Variables,
-        next: NextParseQuery<'_>,
-    ) -> ServerResult<ExecutableDocument> {
+        mut request: Request,
+        next: NextPrepareRequest<'_>,
+    ) -> ServerResult<Request> {
         let s = &ctx.data_unchecked::<Gql>().settings;
-        check_sizes(query, variables, s)?;
-        let doc = next.run(ctx, query, variables).await?;
-        analyze(&doc, variables, s)?;
-        Ok(doc)
+        check_sizes(&request.query, &request.variables, s)?;
+        let vars = request.variables.clone();
+        analyze(request.parsed_query()?, &vars, s)?;
+        next.run(ctx, request).await
     }
 }
 
@@ -647,6 +682,38 @@ mod tests {
             c("subscription { newBlocks(quantity: 100) { hash } }").ok(),
             Some(51)
         );
+    }
+
+    /// M-5: a `crossChainTransfer` inside another one is priced at the per-item read cost;
+    /// the first level keeps its price.
+    #[test]
+    fn nested_cross_chain_transfer_is_priced_per_read() {
+        let s = GraphqlSettings::default();
+        let c = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            analyze(&doc, &Variables::default(), &s).map(|c| c.complexity)
+        };
+        let page = |inner: &str| {
+            format!("{{ transfers(accountName: \"a\", first: 10) {{ edges {{ node {{ {inner} }} }} }} }}")
+        };
+        let one = c(&page("crossChainTransfer { amount }")).unwrap();
+        let two = c(&page(
+            "crossChainTransfer { crossChainTransfer { amount } }",
+        ))
+        .unwrap();
+        let three = c(&page(
+            "crossChainTransfer { crossChainTransfer { crossChainTransfer { amount } } }",
+        ))
+        .unwrap();
+        assert_eq!(one, 1 + 10 * 2, "{one}");
+        assert_eq!(two - one, 10 * NESTED_XCHAIN_COST, "{two}");
+        assert_eq!(three - two, 10 * NESTED_XCHAIN_COST, "{three}");
+        // Siblings are not nested.
+        let side = c(&page(
+            "crossChainTransfer { amount } a: crossChainTransfer { amount }",
+        ))
+        .unwrap();
+        assert_eq!(side, 1 + 10 * 4, "{side}");
     }
 
     /// M8: every cheap count names a connection that has a `totalCount` field.

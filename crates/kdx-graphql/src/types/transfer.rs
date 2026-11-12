@@ -122,7 +122,10 @@ impl Transfer {
                     .map_err(from_api)?
             }
         };
-        Ok(half.map(|(d, i)| Transfer::new(d, i, None)))
+        // The other half's other half is this transfer (M-5): a nested
+        // `crossChainTransfer` answers from it, with no store read.
+        let me = Some((self.d.clone(), self.i));
+        Ok(half.map(|(d, i)| Transfer::new(d, i, Some(me))))
     }
     #[graphql(deprecation = "Use `block.height` field instead.")]
     async fn height(&self) -> BigInt {

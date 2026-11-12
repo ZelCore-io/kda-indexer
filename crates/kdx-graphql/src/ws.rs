@@ -302,21 +302,42 @@ async fn drive(
     let per_conn = Arc::new(Semaphore::new(settings.ws_subs_per_conn));
     let inited = Arc::new(AtomicBool::new(false));
     let over_rate = Arc::new(AtomicBool::new(false));
+    let stop_code = Arc::new(std::sync::atomic::AtomicU16::new(0));
     let (mut sink, mut source) = socket.split();
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(INBOX);
 
-    // Reader: one rate token per client message; oversize and protocol errors end it.
+    // Reader: one rate token per client message. Oversize, protocol errors and a client out
+    // of tokens stop the forwarding (L-3): the reason is kept for the close frame, and the
+    // reader keeps draining what the client still sends, so the connection is closed with
+    // a frame (1009, 1002, 4429) and not reset under unread data.
     let rate = over_rate.clone();
-    let reader = tokio::spawn(async move {
+    let stop = stop_code.clone();
+    let mut reader = tokio::spawn(async move {
+        let mut fwd = Some(in_tx);
         while let Some(msg) = source.next().await {
-            let Ok(msg) = msg else {
-                kdx_metrics::get().graphql_rejected("ws_message");
-                break;
+            let msg = match msg {
+                Ok(Message::Close(_)) => break,
+                Ok(_) if fwd.is_none() => continue,
+                Ok(m) => m,
+                Err(e) => {
+                    if fwd.take().is_some() {
+                        kdx_metrics::get().graphql_rejected("ws_message");
+                        let code = if e.to_string().contains("too long") {
+                            1009
+                        } else {
+                            1002
+                        };
+                        stop.store(code, Ordering::Release);
+                    }
+                    break;
+                }
             };
             if !st.allow_ip(ip, 1) {
                 kdx_metrics::get().graphql_rejected("ws_rate");
                 rate.store(true, Ordering::Release);
-                break;
+                stop.store(4429, Ordering::Release);
+                fwd = None;
+                continue;
             }
             let bytes = match msg {
                 Message::Text(t) => t.as_bytes().to_vec(),
@@ -324,7 +345,8 @@ async fn drive(
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) => continue,
             };
-            if in_tx.send(bytes).await.is_err() {
+            let Some(tx) = &fwd else { continue };
+            if tx.send(bytes).await.is_err() {
                 break;
             }
         }
@@ -366,10 +388,12 @@ async fn drive(
                 }
                 Some(WsMessage::Close(code, reason)) => break Some((code, reason)),
                 None => {
-                    break if over_rate.load(Ordering::Acquire) {
-                        Some((4429, "rate limit".into()))
-                    } else {
-                        None
+                    break match stop_code.load(Ordering::Acquire) {
+                        4429 => Some((4429, "rate limit".into())),
+                        1009 => Some((1009, "message too big".into())),
+                        1002 => Some((1002, "protocol error".into())),
+                        _ if over_rate.load(Ordering::Acquire) => Some((4429, "rate limit".into())),
+                        _ => None,
                     };
                 }
             },
@@ -401,6 +425,8 @@ async fn drive(
             sink.send(Message::Close(Some(frame))),
         )
         .await;
+        // Let the reader drain until the client answers the close (L-3), briefly.
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut reader).await;
     }
     reader.abort();
 }

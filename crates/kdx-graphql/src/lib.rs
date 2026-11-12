@@ -211,9 +211,9 @@ fn build(
     .extension(limits::Limits)
     .extension(flags::Flags)
     .extension(ws::WsOps)
-    // Parser recursion and directive caps (the AST walk in `limits` is bounded separately).
-    .limit_recursive_depth(limits::PARSER_RECURSION)
-    .limit_directives(limits::MAX_DIRECTIVES);
+    // Parser recursion cap. No `limit_directives` (C-1): its walk expands fragments with no
+    // visit cap; `limits` counts directives inside its own bounded walk, which runs first.
+    .limit_recursive_depth(limits::PARSER_RECURSION);
     if !introspection {
         b = b.disable_introspection();
     }
