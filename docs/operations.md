@@ -499,10 +499,14 @@ Stop the service first: it takes the data dir lock.
   snapshot waits for a swap in progress, and a swap waits for a snapshot to place its
   segment files.
 - A `search rebuild` started by hand holds `segments.swap.lock` shared from start to end. A
-  `rebuild-range` started meanwhile waits at its commit step (before its dirty and stale
-  marks) until that search rebuild finishes, which can take hours on mainnet: run the two one
-  after the other. The background search rebuild of `run` does not take this lock (it cannot
-  overlap a `rebuild-range`, which needs the data dir lock).
+  `rebuild-range` started meanwhile blocks at its start, before it fetches anything, until
+  that search rebuild finishes, which can take hours on mainnet: run the two one after the
+  other. If a search rebuild starts while the range is being fetched and built, the
+  `rebuild-range` waits again before its dirty and stale marks and the swap. Each wait logs
+  an info line `rebuild: waiting for segments.swap.lock ...` when it begins and
+  `rebuild: got segments.swap.lock after N s` when it ends. The background search rebuild of
+  `run` does not take this lock (it cannot overlap a `rebuild-range`, which needs the data
+  dir lock).
 - `--step S` works only where the manifest still lists that 10k step. Once its steps are
   merged into a 100k range, `rebuild-range` matches an entry by its exact start and kind, so
   `--step` inside the range fails and `--range S` (the whole range) is the only option for

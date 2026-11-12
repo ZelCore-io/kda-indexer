@@ -58,8 +58,30 @@ pub fn pending(segdir: &Path, start: u32) -> bool {
 /// `remove_unlisted` never deletes it and a snapshot never copies it. Blocks until granted.
 /// A symlink at the lock path is refused, never followed ([`open_lock_file`]).
 pub fn swap_lock(segdir: &Path, exclusive: bool) -> Result<fs::File> {
+    swap_lock_or_wait(segdir, exclusive, &mut || {})
+}
+
+/// [`swap_lock`], calling `waiting` once before it blocks when another holder has the lock
+/// (`rebuild-range` logs it).
+pub fn swap_lock_or_wait(
+    segdir: &Path,
+    exclusive: bool,
+    waiting: &mut dyn FnMut(),
+) -> Result<fs::File> {
     let p = segdir.parent().unwrap_or(segdir).join("segments.swap.lock");
     let f = open_lock_file(&p)?;
+    let tried = if exclusive {
+        f.try_lock()
+    } else {
+        f.try_lock_shared()
+    };
+    match tried {
+        Ok(()) => return Ok(f),
+        Err(fs::TryLockError::WouldBlock) => waiting(),
+        Err(fs::TryLockError::Error(e)) => {
+            return Err(e).with_context(|| format!("lock {}", p.display()))
+        }
+    }
     if exclusive { f.lock() } else { f.lock_shared() }
         .with_context(|| format!("lock {}", p.display()))?;
     Ok(f)
@@ -272,5 +294,32 @@ mod tests {
         held.lock_shared().unwrap();
         assert!(swap_lock(&seg, false).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    /// `waiting` runs only when another holder has the lock, before blocking.
+    #[test]
+    fn swap_lock_reports_a_wait() {
+        let t = tempfile::tempdir().unwrap();
+        let seg = t.path().join("segments");
+        fs::create_dir_all(&seg).unwrap();
+        let mut waits = 0;
+        drop(swap_lock_or_wait(&seg, true, &mut || waits += 1).unwrap());
+        assert_eq!(waits, 0);
+        let shared = swap_lock(&seg, false).unwrap();
+        let waited = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                swap_lock_or_wait(&seg, true, &mut || {
+                    waited.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .unwrap()
+            });
+            while waited.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            drop(shared);
+            drop(h.join().unwrap());
+        });
+        assert_eq!(waited.into_inner(), 1);
     }
 }

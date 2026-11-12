@@ -132,6 +132,27 @@ fn file_hashes(dir: &std::path::Path, net: &str, start: u32, end: u32) -> BTreeM
         .collect()
 }
 
+/// `segments.swap.lock`, exclusive. A snapshot placing files or a manual `search rebuild`
+/// holds it shared, the latter for hours on mainnet: an info line says when this starts
+/// waiting for it, and another when it has it.
+fn swap_lock_logged(segdir: &std::path::Path, at: &str) -> Result<std::fs::File> {
+    let mut since = None;
+    let f = swap::swap_lock_or_wait(segdir, true, &mut || {
+        tracing::info!(
+            "rebuild: waiting for segments.swap.lock {at} (a snapshot or a manual `search \
+             rebuild` holds it)"
+        );
+        since = Some(std::time::Instant::now());
+    })?;
+    if let Some(t) = since {
+        tracing::info!(
+            "rebuild: got segments.swap.lock after {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
+    }
+    Ok(f)
+}
+
 /// Rebuild the manifest entry of `kind` starting at `start`. The caller holds the data dir
 /// lock. `--dry-run` builds and compares, then removes the rebuild dir; it writes nothing to
 /// the hot store (names first seen in the refetched blocks are dropped again, m6), but like
@@ -149,8 +170,9 @@ pub async fn run(
 ) -> Result<RebuildReport> {
     let net = ctx.opts.network.clone();
     {
-        // Snapshots hold this shared while they place segment files (m14).
-        let _swap = swap::swap_lock(&ctx.segdir, true)?;
+        // Snapshots hold this shared while they place segment files (m14), and a manual
+        // `search rebuild` for its whole run: a rebuild started meanwhile waits here.
+        let _swap = swap_lock_logged(&ctx.segdir, "at start")?;
         for l in swap::recover(&ctx.segdir)? {
             tracing::warn!("rebuild: {l}");
         }
@@ -262,7 +284,7 @@ pub async fn run(
     // Held from here to the end: snapshots hold it shared while they place segment files
     // (m14), and `search rebuild` holds it shared from its census to its manifest commit, so
     // the stale mark below lands after any rebuild that read the old content (M-7).
-    let _swap = swap::swap_lock(&ctx.segdir, true)?;
+    let _swap = swap_lock_logged(&ctx.segdir, "before the marks and the swap")?;
 
     // M-7: before the commit point, so a crash after it never loses them (marks for a swap
     // that then does not happen only cost a re-read).
