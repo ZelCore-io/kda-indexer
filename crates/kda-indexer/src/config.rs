@@ -256,7 +256,8 @@ impl ApiConfig {
     ///
     /// Refused: an empty list, a placeholder, an address listed twice (within a listener or
     /// across listeners), and a wildcard (`0.0.0.0`, `[::]`) next to another address on the
-    /// same port (the wildcard already covers it, so the second bind would fail).
+    /// same port, in one listener or across two (the wildcard already covers it, so the second
+    /// bind would fail).
     pub fn binds(&self) -> anyhow::Result<kdx_api::server::Binds> {
         use std::net::SocketAddr;
         let parse = |key: &str, l: &ListenAddrs| -> anyhow::Result<Vec<SocketAddr>> {
@@ -305,6 +306,21 @@ impl ApiConfig {
             for (k2, l2) in &all[i + 1..] {
                 if let Some(a) = l1.iter().find(|a| l2.contains(a)) {
                     anyhow::bail!("api.{k1} and api.{k2} both list {a}");
+                }
+                // A wildcard in one listener already covers every address of the other on
+                // that port (the second bind would fail at start on Linux).
+                let clash = l1.iter().find_map(|a| {
+                    l2.iter()
+                        .find(|b| {
+                            a.port() == b.port()
+                                && (a.ip().is_unspecified() || b.ip().is_unspecified())
+                        })
+                        .map(|b| (a, b))
+                });
+                if let Some((a, b)) = clash {
+                    anyhow::bail!(
+                        "api.{k1} {a} and api.{k2} {b} share a port and one is a wildcard"
+                    );
                 }
             }
         }
@@ -869,6 +885,11 @@ mod api_tests {
             (
                 r#"graphql = "127.0.0.1:31362""#,
                 "both list 127.0.0.1:31362",
+            ),
+            (
+                r#"compat = "0.0.0.0:31362"
+graphql = "127.0.0.1:31362""#,
+                "share a port and one is a wildcard",
             ),
         ] {
             let e = api(text).unwrap().binds().unwrap_err();

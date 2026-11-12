@@ -110,7 +110,7 @@ pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {
     super::notify::spawn_status(token.clone(), || "serving (read-only)".into());
     tracing::info!(data_dir = %data_dir.display(), "serve: read-only API");
     api(cfg, store, tips, &data_dir)?
-        .on_bound(|| super::notify::ready("serving (read-only)"))
+        .on_bound(|_| super::notify::ready("serving (read-only)"))
         .serve(cfg.api.binds()?, token)
         .await
 }
