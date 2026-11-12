@@ -12,6 +12,58 @@ fn manifest_tx_count_overflow_is_refused_not_a_panic() {
     assert!(e.contains("overflows"), "{e}");
 }
 
+/// `network` starts every segment file name the manifest lists: a value that is not a plain
+/// name would name files outside `segments/` (`../x` gives `segments/../x-txs-...`). Parse,
+/// commit and the other `validate` callers refuse it.
+#[test]
+fn manifest_network_must_be_a_plain_name() {
+    let parse = |net: &str| {
+        let mut v: serde_json::Value = serde_json::from_str(
+            r#"{"format_version":2,"network":"n","entries":[{"kind":"step","start":0,"end":1,"first_txnum":0,"tx_count":1,"block_count":1}],"frontier":1,"next_txnum":1}"#,
+        )
+        .unwrap();
+        v["network"] = net.into();
+        Manifest::parse(&serde_json::to_vec(&v).unwrap())
+    };
+    let long = "a".repeat(kdx_segment::manifest::MAX_NETWORK_LEN + 1);
+    for bad in [
+        "../x",
+        "..",
+        ".",
+        "a/..",
+        "a/b",
+        "/abs",
+        "a\\b",
+        "..\\x",
+        "a..b",
+        ".hidden",
+        "",
+        "a\0b",
+        "net work",
+        "nét",
+        long.as_str(),
+    ] {
+        let e = parse(bad).unwrap_err().to_string();
+        assert!(e.contains("not a plain name"), "{bad:?}: {e}");
+    }
+    let max = "a".repeat(kdx_segment::manifest::MAX_NETWORK_LEN);
+    for good in [
+        "mainnet01",
+        "testnet04",
+        "development",
+        "fast-development",
+        "net_1.a",
+        max.as_str(),
+    ] {
+        assert_eq!(parse(good).unwrap().network, good);
+    }
+    // Nothing writes one either.
+    let dir = tempfile::tempdir().unwrap();
+    let e = Manifest::new("../x").commit(dir.path()).unwrap_err();
+    assert!(e.to_string().contains("not a plain name"), "{e}");
+    assert!(!dir.path().join("manifest.json").exists());
+}
+
 #[test]
 fn damaged_block_file_offsets_are_an_error_not_a_slice_panic() {
     let dir = tempfile::tempdir().unwrap();

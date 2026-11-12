@@ -21,6 +21,31 @@ pub fn format_refusal(found: u64) -> String {
     )
 }
 
+/// Longest `network` a manifest may hold (chainweb ids are about ten characters).
+pub const MAX_NETWORK_LEN: usize = 64;
+
+/// Refuses a `network` that is not a plain name: it is the first part of every segment file
+/// name (`files::file_name`), so `/`, `\`, `..`, NUL or a leading `.` would let a hostile
+/// `manifest.json` name a file outside `segments/`. Allowed: 1 to [`MAX_NETWORK_LEN`]
+/// characters of `[A-Za-z0-9._-]`, not starting with `.`, without `..`.
+pub fn check_network(network: &str) -> Result<()> {
+    let plain = !network.is_empty()
+        && network.len() <= MAX_NETWORK_LEN
+        && !network.starts_with('.')
+        && !network.contains("..")
+        && network
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !plain {
+        let shown: String = network.chars().take(MAX_NETWORK_LEN + 1).collect();
+        bail!(
+            "manifest: network {shown:?} is not a plain name (1 to {MAX_NETWORK_LEN} of \
+             A-Z a-z 0-9 . _ -, no leading '.', no '..')"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RangeKind {
@@ -115,8 +140,10 @@ impl Manifest {
             .collect()
     }
 
-    /// Entries contiguous in heights and TxNums; frontier and next_txnum match the last entry.
+    /// `network` is a plain name ([`check_network`]); entries contiguous in heights and
+    /// TxNums; frontier and next_txnum match the last entry.
     pub fn validate(&self) -> Result<()> {
+        check_network(&self.network)?;
         let mut h = self.entries.first().map(|e| e.start).unwrap_or(0);
         let mut t = self.entries.first().map(|e| e.first_txnum).unwrap_or(0);
         for e in &self.entries {
