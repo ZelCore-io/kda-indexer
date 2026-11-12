@@ -40,14 +40,16 @@ pub struct ApiSettings {
     pub max_event_lists: usize,
 }
 
-/// Listen addresses; `None` = not bound.
-#[derive(Debug, Clone, Copy, Default)]
+/// Listen addresses, any number per listener; an empty list = not bound. A listener serves
+/// the same router on every one of its addresses (for example loopback plus a private LAN
+/// address behind a load balancer).
+#[derive(Debug, Clone, Default)]
 pub struct Binds {
-    pub native: Option<SocketAddr>,
-    pub compat: Option<SocketAddr>,
+    pub native: Vec<SocketAddr>,
+    pub compat: Vec<SocketAddr>,
     /// GraphQL (P7; spec §5.3).
-    pub graphql: Option<SocketAddr>,
-    pub admin: Option<SocketAddr>,
+    pub graphql: Vec<SocketAddr>,
+    pub admin: Vec<SocketAddr>,
 }
 
 /// Node cut tips per chain (fed by a `/cut` poll) and whether a backfill is running.
@@ -408,8 +410,8 @@ impl Api {
     pub async fn serve(self, binds: Binds, shutdown: CancellationToken) -> anyhow::Result<()> {
         let st = self.state;
         let on_bound = self.on_bound;
-        for (name, a) in [("native", binds.native), ("admin", binds.admin)] {
-            if let Some(a) = a {
+        for (name, list) in [("native", &binds.native), ("admin", &binds.admin)] {
+            for a in list {
                 anyhow::ensure!(
                     is_internal(a.ip()),
                     "api.{name} must bind a loopback or private address (got {a})"
@@ -440,24 +442,32 @@ impl Api {
             .layer(middleware::from_fn_with_state("admin", track))
             .with_state(st.clone());
         tokio::spawn(crate::sampler::run(st.clone(), shutdown.clone()));
-        let mut tasks = Vec::new();
-        for (name, addr, app) in [
-            ("native", binds.native, native),
-            ("compat", binds.compat, compat),
-            ("graphql", binds.graphql, graphql),
-            ("admin", binds.admin, admin),
+        // Bind every address first: one failure drops the listeners bound so far, so nothing
+        // serves until all of them are up.
+        let mut bound = Vec::new();
+        for (name, addrs, app) in [
+            ("native", &binds.native, native),
+            ("compat", &binds.compat, compat),
+            ("graphql", &binds.graphql, graphql),
+            ("admin", &binds.admin, admin),
         ] {
-            let Some(addr) = addr else { continue };
-            let l = tokio::net::TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("api: bind {name} {addr}"))?;
+            for &addr in addrs {
+                let l = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("api: bind {name} {addr}"))?;
+                bound.push((name, l, app.clone()));
+            }
+        }
+        let mut tasks = Vec::new();
+        for (name, l, app) in bound {
+            let addr = l.local_addr()?;
             tracing::info!(listener = name, %addr, "api: listening");
             let stop = shutdown.clone();
             tasks.push(tokio::spawn(async move {
                 axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>())
                     .with_graceful_shutdown(stop.cancelled_owned())
                     .await
-                    .with_context(|| format!("api: {name} listener"))
+                    .with_context(|| format!("api: {name} listener {addr}"))
             }));
         }
         if let Some(f) = on_bound {
@@ -518,6 +528,99 @@ mod tests {
         assert_eq!(st.in_flight.available_permits(), 0, "body not sent yet");
         drop(resp);
         assert_eq!(st.in_flight.available_permits(), 1);
+    }
+
+    /// A free port on `ip` (bound once and released; the tests bind it again right away).
+    fn free_addr(ip: &str) -> Option<SocketAddr> {
+        let l = std::net::TcpListener::bind((ip, 0)).ok()?;
+        l.local_addr().ok()
+    }
+
+    /// The status code of `GET path` on `addr` over plain HTTP/1.1.
+    async fn get_status(addr: SocketAddr, path: &str) -> std::io::Result<u16> {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let t = Some(Duration::from_secs(5));
+            let mut c = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+            c.set_read_timeout(t)?;
+            c.write_all(req.as_bytes())?;
+            let mut head = String::new();
+            c.read_to_string(&mut head)?;
+            let code = head.get(9..12).and_then(|c| c.parse().ok());
+            code.ok_or_else(|| std::io::Error::other(format!("no status line: {head:?}")))
+        })
+        .await
+        .expect("get_status task")
+    }
+
+    /// Task 10: one listener on several addresses (two loopback ports, plus `[::1]` where
+    /// the host has IPv6) answers `/healthz` and `/readyz` on every one of them.
+    #[tokio::test]
+    async fn admin_answers_on_every_listed_address() {
+        let (_d, store) = crate::testutil::store();
+        let mut admin = vec![
+            free_addr("127.0.0.1").unwrap(),
+            free_addr("127.0.0.1").unwrap(),
+        ];
+        admin.extend(free_addr("::1"));
+        let compat = vec![free_addr("127.0.0.1").unwrap()];
+        let binds = Binds {
+            admin: admin.clone(),
+            compat: compat.clone(),
+            ..Binds::default()
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let api = Api::new(store, settings(4), TipWatch::default()).on_bound(move || {
+            let _ = tx.send(());
+        });
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(api.serve(binds, stop.clone()));
+        rx.await.unwrap();
+        for &a in &admin {
+            assert_eq!(get_status(a, "/healthz").await.unwrap(), 200, "{a}");
+            // Not ready (no node tips in a test store), but answered.
+            assert_eq!(get_status(a, "/readyz").await.unwrap(), 503, "{a}");
+        }
+        // The compat router (no routes added here) answers on its own address, not admin's.
+        assert_eq!(get_status(compat[0], "/healthz").await.unwrap(), 404);
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// Task 10: binding is all or nothing; a taken address fails `serve` and leaves none of
+    /// the other addresses listening. A public admin address is refused before any bind.
+    #[tokio::test]
+    async fn one_failed_bind_leaves_nothing_listening() {
+        let first = free_addr("127.0.0.1").unwrap();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let binds = Binds {
+            admin: vec![first, taken.local_addr().unwrap()],
+            ..Binds::default()
+        };
+        let (_d, store) = crate::testutil::store();
+        let api = Api::new(store, settings(4), TipWatch::default()).on_bound(|| {
+            panic!("on_bound must not run when a bind fails");
+        });
+        let e = api
+            .serve(binds, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("api: bind admin"), "{e:#}");
+        assert!(tokio::net::TcpStream::connect(first).await.is_err());
+
+        let (_d, store) = crate::testutil::store();
+        let binds = Binds {
+            admin: vec![first, "8.8.8.8:31369".parse().unwrap()],
+            ..Binds::default()
+        };
+        let api = Api::new(store, settings(4), TipWatch::default());
+        let e = api
+            .serve(binds, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("loopback or private"), "{e:#}");
+        assert!(tokio::net::TcpStream::connect(first).await.is_err());
     }
 
     #[tokio::test]
