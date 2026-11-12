@@ -119,6 +119,9 @@ async fn next_batch(
 /// Releases blocks once they are `depth` below their chain's tip.
 struct DepthGate {
     depth: u64,
+    /// The subscriber reads the blocks' txs: load them from the store (the feed caches
+    /// block records only).
+    txs: bool,
     chains: Vec<u8>,
     next: HashMap<u8, u64>,
 }
@@ -166,6 +169,7 @@ impl DepthGate {
         }
         // A cached block is released only while the store still holds it at its height: a
         // reorg replaces it with the stored block (I-5).
+        let txs = self.txs;
         let mut out = state
             .read(move |view| {
                 let mut out = Vec::with_capacity(picked.len());
@@ -173,7 +177,15 @@ impl DepthGate {
                 for ((c, h), b) in picked {
                     let Ok(h32) = u32::try_from(h) else { continue };
                     match b {
-                        Some(b) if view.block_hash(c, h32)? == Some(b.hash) => out.push(b),
+                        Some(b) if !txs && view.block_hash(c, h32)? == Some(b.hash) => {
+                            out.push(Arc::new(FeedBlock {
+                                chain: c,
+                                height: h,
+                                hash: b.hash,
+                                block: b,
+                                txs: Arc::new(Vec::new()),
+                            }));
+                        }
                         _ => missing.push((c, h)),
                     }
                 }
@@ -206,6 +218,7 @@ fn feed_stream(
     chains: Vec<u8>,
     depth: Option<u64>,
     cap: usize,
+    txs: bool,
 ) -> Result<BoxStream<'static, Result<Vec<Arc<FeedBlock>>>>> {
     let feed = feed_of(ctx)?;
     let state = gql(ctx).state()?.clone();
@@ -226,6 +239,7 @@ fn feed_stream(
         Some(depth) => {
             let gate = DepthGate {
                 depth,
+                txs,
                 chains: chains.clone(),
                 next: HashMap::new(),
             };
@@ -324,7 +338,7 @@ impl Subscription {
             s.default_page.min(s.max_page).max(1)
         };
         let cap = chains.len();
-        let s = feed_stream(ctx, chains, depth, cap)?;
+        let s = feed_stream(ctx, chains, depth, cap, true)?;
         Ok(stream::unfold(
             (s, VecDeque::new(), qual, params),
             move |(mut s, mut q, qual, params)| async move {
@@ -371,7 +385,7 @@ impl Subscription {
             ),
             None => (chains.len(), usize::MAX),
         };
-        Ok(feed_stream(ctx, chains, None, cap)?
+        Ok(feed_stream(ctx, chains, None, cap, false)?
             .map(move |item| {
                 item.map(|bs| {
                     let skip = bs.len().saturating_sub(q);
@@ -394,7 +408,7 @@ impl Subscription {
         #[graphql(default = 20)] quantity: Option<i32>,
     ) -> Result<BoxStream<'static, Result<Option<Vec<Transaction>>>>> {
         let q = quantity_arg(quantity, gql(ctx).settings.max_page)?;
-        let s = feed_stream(ctx, chain_set(None)?, None, MAX_BATCH)?;
+        let s = feed_stream(ctx, chain_set(None)?, None, MAX_BATCH, true)?;
         Ok(s.filter_map(move |item| {
             let out = item.map(|blocks| newest_txs(&blocks, q));
             async move {
@@ -418,7 +432,7 @@ impl Subscription {
         let depth = depth_arg("minimumDepth", Some(minimum_depth))?.unwrap_or(0);
         // At most one block per subscribed chain per message, as priced (I-1).
         let cap = chains.len();
-        let s = feed_stream(ctx, chains, Some(depth).filter(|d| *d > 0), cap)?;
+        let s = feed_stream(ctx, chains, Some(depth).filter(|d| *d > 0), cap, false)?;
         Ok(s.map(|item| {
             item.map(|bs| Some(bs.iter().map(|b| Block::new(b.block.clone())).collect()))
         })
@@ -519,6 +533,7 @@ mod tests {
         feed.inject(FeedItem::Block(feed_block(5, 2, 1)));
         let mut gate = DepthGate {
             depth: 1,
+            txs: false,
             chains: vec![5],
             next: HashMap::from([(5, 1)]),
         };
@@ -538,6 +553,7 @@ mod tests {
         }
         let mut gate = DepthGate {
             depth: 1,
+            txs: false,
             chains: vec![5],
             next: HashMap::from([(5, 1)]),
         };

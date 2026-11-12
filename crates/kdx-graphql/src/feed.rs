@@ -7,11 +7,12 @@
 //!   bounded broadcast channel (capacity [`CAPACITY`]).
 //! - A changed hash at a height already sent is a reorg: the feed walks back over the hashes
 //!   it sent (the last [`RING`] per chain) to the first one still stored, and sends the
-//!   replacements with `reorg: true`.
+//!   replacements.
 //! - More than [`MAX_PER_TICK`] new blocks on a chain in one tick (a catch-up after a pause),
 //!   or a fork deeper than the ring, is a gap: one [`FeedItem::Gap`] and the feed resumes
 //!   from the new tip.
-//! - The last [`RECENT`] heights per chain stay in memory for `…FromDepth` releases. A tick
+//! - The block records (no txs) of the last [`RECENT`] heights per chain stay in memory for
+//!   `…FromDepth` releases, pruned per chain (M4). A tick
 //!   reads every moved chain before it caches, publishes tips or sends anything, and drops
 //!   the cached heights a rollback, reorg or gap made stale.
 //! - The polling task ends when the last handle drops.
@@ -45,8 +46,6 @@ pub struct FeedBlock {
     pub hash: Hash32,
     pub block: Arc<BlockRecord>,
     pub txs: Arc<Vec<Arc<TxData>>>,
-    /// The block replaces one sent before at its height.
-    pub reorg: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +58,9 @@ pub enum FeedItem {
 struct Inner {
     tx: broadcast::Sender<FeedItem>,
     tips: Mutex<BTreeMap<u8, u64>>,
-    recent: Mutex<HashMap<(u8, u64), Arc<FeedBlock>>>,
+    /// Per chain, by height: block records only (txs are loaded again on release), so the
+    /// cache stays a few MB in the dense era.
+    recent: Mutex<HashMap<u8, BTreeMap<u64, Arc<BlockRecord>>>>,
 }
 
 /// Handle of the block feed (cheap to clone).
@@ -110,20 +111,21 @@ impl BlockFeed {
             .clone()
     }
 
-    /// The recent canonical block at `(chain, height)`, if the feed still holds it.
-    pub fn recent(&self, chain: u8, height: u64) -> Option<Arc<FeedBlock>> {
+    /// The recent canonical block record at `(chain, height)`, if the feed still holds it.
+    pub fn recent(&self, chain: u8, height: u64) -> Option<Arc<BlockRecord>> {
         self.inner
             .recent
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(chain, height))
+            .get(&chain)
+            .and_then(|m| m.get(&height))
             .cloned()
     }
 
     /// Send an item as the polling task would (tests and the harness's feed checks).
     pub fn inject(&self, item: FeedItem) {
         if let FeedItem::Block(b) = &item {
-            self.remember(b.clone());
+            self.remember(b);
             let mut t = self.inner.tips.lock().unwrap_or_else(|e| e.into_inner());
             let e = t.entry(b.chain).or_insert(b.height);
             *e = (*e).max(b.height);
@@ -135,14 +137,24 @@ impl BlockFeed {
     /// no longer canonical after a rollback, a reorg or a gap.
     fn forget_above(&self, chain: u8, height: Option<u64>) {
         let mut r = self.inner.recent.lock().unwrap_or_else(|e| e.into_inner());
-        r.retain(|k, _| k.0 != chain || height.is_some_and(|h| k.1 <= h));
+        if let Some(m) = r.get_mut(&chain) {
+            match height {
+                Some(h) => drop(m.split_off(&h.saturating_add(1))),
+                None => m.clear(),
+            }
+        }
     }
 
-    fn remember(&self, b: Arc<FeedBlock>) {
+    /// Cache the record of `b`, dropping its chain's heights more than [`RECENT`] below it
+    /// (per chain, not a scan of the whole cache).
+    fn remember(&self, b: &FeedBlock) {
         let mut r = self.inner.recent.lock().unwrap_or_else(|e| e.into_inner());
-        let (c, h) = (b.chain, b.height);
-        r.insert((c, h), b);
-        r.retain(|k, _| k.0 != c || k.1 + RECENT > h);
+        let m = r.entry(b.chain).or_default();
+        m.insert(b.height, b.block.clone());
+        let floor = (b.height + 1).saturating_sub(RECENT);
+        while m.first_key_value().is_some_and(|(k, _)| *k < floor) {
+            m.pop_first();
+        }
     }
 }
 
@@ -168,7 +180,6 @@ pub fn load_blocks(view: &View, keys: &[(u8, u64)]) -> ApiResult<Vec<Arc<FeedBlo
             hash: b.hash,
             block: Arc::new(b),
             txs: Arc::new(txs),
-            reorg: false,
         }));
     }
     Ok(out)
@@ -271,7 +282,6 @@ async fn step(
     let mut items = Vec::new();
     for (c, h, hash, step) in moved {
         let entry = sent.entry(c).or_default();
-        let last_sent = entry.last().map_or(0, |x| x.0);
         match step {
             Step::Gap => {
                 feed.forget_above(c, None);
@@ -289,17 +299,9 @@ async fn step(
                 feed.forget_above(c, Some(from));
                 entry.retain(|x| x.0 <= from);
                 for b in blocks {
-                    let b = Arc::new(FeedBlock {
-                        reorg: b.height <= last_sent,
-                        chain: b.chain,
-                        height: b.height,
-                        hash: b.hash,
-                        block: b.block.clone(),
-                        txs: b.txs.clone(),
-                    });
                     *newest_ct = (*newest_ct).max(b.block.creation_time);
                     entry.push((b.height, b.hash));
-                    feed.remember(b.clone());
+                    feed.remember(&b);
                     items.push(FeedItem::Block(b));
                 }
                 if entry.len() > RING {
@@ -360,5 +362,38 @@ mod tests {
         step(&f.st, &feed, &mut sent, &mut ct).await.unwrap();
         let (tip, at1) = seen.await.unwrap();
         assert_eq!((tip, at1), (2, Some(hash(5, 1, 1))));
+    }
+
+    /// M4: the recent cache keeps block records only (never a block's txs) and prunes each
+    /// chain on its own.
+    #[test]
+    fn recent_keeps_records_only_and_prunes_per_chain() {
+        let feed = BlockFeed::detached();
+        let tx = Arc::new(TxData {
+            rec: kdx_types::record::TxRecord::default(),
+            block: Arc::new(BlockRecord::default()),
+            out: serde_json::Value::Null,
+            cmd: None,
+            evs: Vec::new(),
+            trs: Vec::new(),
+            nfts: Vec::new(),
+        });
+        let b = testutil::feed_block(0, 1, 0);
+        feed.inject(FeedItem::Block(Arc::new(FeedBlock {
+            txs: Arc::new(vec![tx.clone()]),
+            chain: b.chain,
+            height: b.height,
+            hash: b.hash,
+            block: b.block.clone(),
+        })));
+        // Push the item out of the broadcast buffer: only the cache could still hold it.
+        for h in 0..(CAPACITY as u64 + 10) {
+            feed.inject(FeedItem::Block(testutil::feed_block(1, h, 0)));
+        }
+        assert_eq!(Arc::strong_count(&tx), 1, "the cache holds a block's txs");
+        assert_eq!(feed.recent(0, 1).map(|b| b.hash), Some(hash(0, 1, 0)));
+        let top = CAPACITY as u64 + 9;
+        assert!(feed.recent(1, top - RECENT).is_none());
+        assert!(feed.recent(1, top - RECENT + 1).is_some());
     }
 }

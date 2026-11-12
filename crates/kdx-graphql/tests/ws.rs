@@ -142,7 +142,6 @@ fn block(chain: u8, height: u64) -> FeedItem {
         hash: b.hash,
         block: Arc::new(b),
         txs: Arc::new(Vec::new()),
-        reorg: false,
     }))
 }
 
@@ -364,7 +363,6 @@ fn block_with_events(chain: u8, height: u64, n: usize) -> FeedItem {
         hash: b.hash,
         block: b.block.clone(),
         txs: Arc::new(vec![Arc::new(tx)]),
-        reorg: false,
     }))
 }
 

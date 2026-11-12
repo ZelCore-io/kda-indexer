@@ -71,7 +71,6 @@ pub fn feed_block(chain: u8, height: u64, fork: u8) -> Arc<FeedBlock> {
         hash: b.hash,
         block: Arc::new(b),
         txs: Arc::new(Vec::new()),
-        reorg: false,
     })
 }
 
