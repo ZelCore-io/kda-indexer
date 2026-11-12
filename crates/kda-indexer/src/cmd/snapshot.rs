@@ -127,8 +127,70 @@ fn snapshot_with(
     let r = snapshot_into(a, hs, pause, hook);
     if r.is_err() {
         remove_created(&a.out, created.as_deref());
+    } else {
+        hand_to_owner(&a.out, &a.data_dir);
     }
     r
+}
+
+/// A snapshot run by another user than the data dir's owner (root, typically: the service
+/// user cannot create `--out` under the root-owned volume root, 5E) gives what it wrote to
+/// the data dir's owner, so the service can open the copy: `--out` and everything under it,
+/// plus the data dir's own lock files it may have created (`segments.swap.lock`,
+/// `search.swap.lock`). Hard links (files shared with the source) keep their owner. Needs
+/// root; without it, a warning names the owner to set.
+fn hand_to_owner(out: &Path, data_dir: &Path) {
+    let (Ok(src), Ok(dst)) = (fs::metadata(data_dir), fs::metadata(out)) else {
+        return;
+    };
+    let (uid, gid) = (src.uid(), src.gid());
+    if (dst.uid(), dst.gid()) == (uid, gid) {
+        return;
+    }
+    let mut todo = not_owned_by(out, uid, gid);
+    for lock in ["segments.swap.lock", "search.swap.lock"] {
+        todo.extend(
+            not_owned_by(&data_dir.join(lock), uid, gid)
+                .into_iter()
+                .filter(|p| p.is_file()),
+        );
+    }
+    let failed = todo
+        .iter()
+        .filter(|p| std::os::unix::fs::lchown(p, Some(uid), Some(gid)).is_err())
+        .count();
+    if failed > 0 {
+        tracing::warn!(
+            out = %out.display(),
+            "snapshot: {failed} of {} entries could not be given to the data dir's owner \
+             {uid}:{gid} (run as root, or chown -R {uid}:{gid} the copy)",
+            todo.len()
+        );
+    }
+}
+
+/// `root` and the entries under it not owned by `uid:gid`, except files with more than one
+/// link (shared with the source) and what cannot be read. Symlinks are not followed.
+fn not_owned_by(root: &Path, uid: u32, gid: u32) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(m) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if m.is_dir() {
+            if let Ok(rd) = fs::read_dir(&p) {
+                stack.extend(rd.filter_map(|e| e.ok().map(|e| e.path())));
+            }
+        } else if m.is_file() && m.nlink() > 1 {
+            continue;
+        }
+        if (m.uid(), m.gid()) != (uid, gid) {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Refuses an `--out` inside the data dir or not empty before creating anything, then creates
@@ -748,5 +810,39 @@ mod tests {
         assert_eq!(utc_iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(utc_iso(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(utc_iso(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    /// 5E: what a snapshot run as root gives to the data dir's owner: `--out` and its
+    /// entries, never a file hard-linked with the source; symlinks are not followed.
+    #[test]
+    fn handoff_selects_the_copy_but_not_shared_hard_links() {
+        use super::{hand_to_owner, not_owned_by};
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src.seg");
+        fs::write(&src, b"x").unwrap();
+        let out = d.path().join("out");
+        fs::create_dir_all(out.join("hot")).unwrap();
+        fs::write(out.join("hot/mdbx.dat"), b"y").unwrap();
+        fs::write(out.join("SNAPSHOT.json"), b"{}").unwrap();
+        fs::hard_link(&src, out.join("linked.seg")).unwrap();
+        std::os::unix::fs::symlink("hot", out.join("ln")).unwrap();
+        let m = fs::metadata(&out).unwrap();
+        // Already the owner's: nothing to do, and the handoff returns quietly.
+        assert!(not_owned_by(&out, m.uid(), m.gid()).is_empty());
+        hand_to_owner(&out, d.path());
+        // Another owner: every entry but the shared hard link.
+        let mut want = vec![
+            out.clone(),
+            out.join("SNAPSHOT.json"),
+            out.join("hot"),
+            out.join("hot/mdbx.dat"),
+            out.join("ln"),
+        ];
+        want.sort();
+        assert_eq!(not_owned_by(&out, m.uid() + 1, m.gid()), want);
+        assert_eq!(not_owned_by(&out, m.uid(), m.gid() + 1), want);
+        // A missing path (no lock file yet) selects nothing.
+        assert!(not_owned_by(&d.path().join("search.swap.lock"), 0, 0).is_empty());
     }
 }
