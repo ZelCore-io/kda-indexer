@@ -21,7 +21,7 @@ use crate::files::{
     blake3_file, file_name, fsync_dir, range_file_names, tmp_dir, write_file, FileKind,
 };
 use crate::keys::write_keys;
-use crate::manifest::{RangeEntry, RangeKind, FORMAT_VERSION};
+use crate::manifest::{format_refusal, RangeEntry, RangeKind, FORMAT_VERSION};
 use crate::phf::{debug_fallback_env, write_index, IndexKey};
 use crate::postings::PostingsWriter;
 
@@ -109,7 +109,11 @@ impl RangeInfo {
         let r: RangeInfo =
             toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
         if r.format_version != FORMAT_VERSION {
-            bail!("{}: format version {}", path.display(), r.format_version);
+            bail!(
+                "{}: {}",
+                path.display(),
+                format_refusal(u64::from(r.format_version))
+            );
         }
         Ok(r)
     }

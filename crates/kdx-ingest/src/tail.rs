@@ -168,7 +168,7 @@ async fn follower(
                 return Ok::<_, anyhow::Error>(None);
             }
             if let ReorgOutcome::ChainHalted { .. } = br.outcome {
-                return Ok(Some((br.outcome, Vec::new(), Vec::new())));
+                return Ok(Some((br.outcome, Vec::new(), Vec::new(), None, Vec::new())));
             }
             let hs: Vec<(u32, Hash32)> = br
                 .headers
@@ -176,6 +176,7 @@ async fn follower(
                 .map(|h| Ok((reorg::header_height(h)?, reorg::header_hash(h, "hash")?)))
                 .collect::<Result<_>>()?;
             let bodies = fetch::bodies(&ctx.node, chain, br.headers).await?;
+            let headers: Vec<Value> = bodies.iter().map(|(h, _)| h.clone()).collect();
             let prepared = tokio::task::spawn_blocking(move || {
                 use rayon::prelude::*;
                 bodies
@@ -187,7 +188,9 @@ async fn follower(
                     .collect::<Result<Vec<_>>>()
             })
             .await??;
-            Ok(Some((br.outcome, hs, prepared)))
+            let (prepared, merkle_bad, merkle_seen) =
+                merkle_strict(&ctx, chain, &headers, prepared).await?;
+            Ok(Some((br.outcome, hs, prepared, merkle_bad, merkle_seen)))
         };
         let res = tokio::select! {
             _ = stop.cancelled() => return Ok(()),
@@ -201,7 +204,7 @@ async fn follower(
                     r = target.changed() => { if r.is_err() && stop.is_cancelled() { return Ok(()); } r?; }
                 }
             }
-            Ok(Some((ReorgOutcome::ChainHalted { fork_height, depth }, _, _))) => {
+            Ok(Some((ReorgOutcome::ChainHalted { fork_height, depth }, _, _, _, _))) => {
                 tracing::error!(
                     chain,
                     fork_height,
@@ -214,13 +217,22 @@ async fn follower(
                     fork: None,
                     blocks: Vec::new(),
                     halted: true,
+                    halt_reason: "reorg",
                 })
                 .await
                 .ok();
                 return Ok(());
             }
-            Ok(Some((outcome, hs, prepared))) => {
+            Ok(Some((outcome, mut hs, prepared, merkle_bad, merkle_seen))) => {
                 backoff = 1;
+                // R-5 strict: commit the blocks before the bad one, then halt the chain.
+                hs.truncate(prepared.len());
+                if merkle_bad.is_some() && prepared.is_empty() {
+                    if out.send(merkle_halt(chain)).await.is_ok() {
+                        count_merkle(&merkle_seen);
+                    }
+                    return Ok(());
+                }
                 let fork = match outcome {
                     ReorgOutcome::Reorg(f) => {
                         tracing::warn!(
@@ -242,11 +254,17 @@ async fn follower(
                         fork,
                         blocks: prepared,
                         halted: false,
+                        halt_reason: "",
                     })
                     .await
                     .is_err()
                 {
                     return Ok(()); // writer gone (shutdown or error)
+                }
+                count_merkle(&merkle_seen);
+                if merkle_bad.is_some() {
+                    out.send(merkle_halt(chain)).await.ok();
+                    return Ok(());
                 }
             }
             Err(e) => {
@@ -259,6 +277,88 @@ async fn follower(
             }
         }
     }
+}
+
+/// `kdx_merkle_blocks_total` for a round's outcomes, once its batch reached the writer (a
+/// round that fails before that is retried and counts its blocks then).
+fn count_merkle(labels: &[&'static str]) {
+    let m = kdx_metrics::get();
+    for l in labels {
+        m.merkle(l);
+    }
+}
+
+fn merkle_halt(chain: u8) -> Batch {
+    Batch {
+        chain,
+        fork: None,
+        blocks: Vec::new(),
+        halted: true,
+        halt_reason: "merkle",
+    }
+}
+
+/// Ruling R-5, tail side (strict). Every block's Merkle outcome is returned for counting
+/// (the caller counts after its batch reaches the writer). The first block
+/// whose payload does not verify is fetched again once (single payload); if it still does not
+/// verify, the blocks before it are returned with its height, and the caller commits them and
+/// halts the chain (reason `merkle`; `unwind --clear-halt` resumes it).
+async fn merkle_strict(
+    ctx: &Ctx,
+    chain: u8,
+    headers: &[Value],
+    mut prepared: Vec<(kdx_decode::DecodedBlock, kdx_decode::VerifyReport)>,
+) -> Result<(
+    Vec<(kdx_decode::DecodedBlock, kdx_decode::VerifyReport)>,
+    Option<u64>,
+    Vec<&'static str>,
+)> {
+    let mut seen = Vec::with_capacity(prepared.len());
+    for i in 0..prepared.len() {
+        pipeline::debug_corrupt_merkle(&mut prepared[i]);
+        let r = pipeline::merkle_of(&prepared[i]);
+        if r.is_verified() {
+            seen.push(r.label());
+            continue;
+        }
+        let (height, ph) = {
+            let h = &prepared[i].0.header;
+            (h.height, h.payload_hash.to_b64url())
+        };
+        tracing::warn!(
+            chain,
+            height,
+            result = r.label(),
+            roots = %pipeline::merkle_roots_text(&prepared[i].0),
+            "tail: payload Merkle mismatch; fetching the payload again"
+        );
+        let hdr = headers[i].clone();
+        let payload = ctx.node.payload_with_outputs(chain, &ph).await?;
+        let h32 = u32::try_from(height)?;
+        let mut again = tokio::task::spawn_blocking(move || {
+            pipeline::prepare_value(chain, h32, &hdr, &payload)
+        })
+        .await??;
+        pipeline::debug_corrupt_merkle(&mut again);
+        let r = pipeline::merkle_of(&again);
+        seen.push(r.label());
+        if r.is_verified() {
+            tracing::info!(chain, height, "tail: refetched payload verifies");
+            prepared[i] = again;
+            continue;
+        }
+        tracing::error!(
+            chain,
+            height,
+            reason = "merkle",
+            result = r.label(),
+            roots = %pipeline::merkle_roots_text(&again.0),
+            "tail: payload Merkle mismatch after one refetch; halting this chain (Counters halted.{chain}, halted.{chain}.merkle; resume with unwind --clear-halt)"
+        );
+        prepared.truncate(i);
+        return Ok((prepared, Some(height), seen));
+    }
+    Ok((prepared, None, seen))
 }
 
 /// The single writer: buffers batches, commits per `commit_ms` / `commit_blocks`, drains the
@@ -339,6 +439,7 @@ async fn writer(
                 fork: None,
                 blocks: Vec::new(),
                 halted: true,
+                halt_reason: "poison",
             });
         };
         nblocks = 0;
@@ -397,9 +498,24 @@ pub async fn run(ctx: Arc<Ctx>, shutdown: CancellationToken) -> Result<()> {
             .collect();
         for &c in &chains {
             if halted.contains(&c) {
+                let reasons: Vec<&str> = apply::counters::HALT_REASONS
+                    .iter()
+                    .copied()
+                    .filter(|r| {
+                        txn.counter(&apply::counters::halted_reason(c, r))
+                            .unwrap_or(0)
+                            > 0
+                    })
+                    .collect();
+                let reason = if reasons.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    reasons.join(",")
+                };
                 tracing::error!(
                     chain = c,
-                    "tail: chain is halted (Counters halted.{c}); not following it"
+                    reason,
+                    "tail: chain is halted (Counters halted.{c}, reason {reason}); not following it; see operations.md \"Halted chains\""
                 );
                 continue;
             }

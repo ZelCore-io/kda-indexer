@@ -1,7 +1,10 @@
-# kda-indexer on-disk format, version 1
+# kda-indexer on-disk format, version 2
 
 This document describes the files kda-indexer writes for frozen history: segment files,
-their indexes and the record encoding inside them. Everything here is format version 1.
+their indexes and the record encoding inside them. Everything here is format version 2
+(hot store `format_version` 2, segment `format_version` 2); the record codec version byte
+stays 1. A build refuses a store in another version with
+`store format v1, this build reads v2: rebuild it (docs/operations.md#format-upgrade)`.
 The data directory of one network looks like this:
 
 ```
@@ -9,7 +12,13 @@ The data directory of one network looks like this:
   hot/            MDBX environment: dictionaries, live tail, undo, checkpoints (mutable)
   segments/       immutable range and step files + manifest.json
   etl/            temporary spool files while a range is being built (deleted afterwards)
+  LOCK            held by the writing process
+  merkle-unverified.jsonl   backfill blocks whose payload Merkle roots did not verify
 ```
+
+A snapshot directory (`kda-indexer snapshot --out DIR`) holds `hot/`, `segments/` and
+`SNAPSHOT.json` (format versions, network, frontiers, tail checkpoints, manifest blake3;
+no paths).
 
 Segments refer to names (accounts, modules, event names, public keys, module hashes) by
 the dense integer ids stored in the `hot/` dictionaries. A `segments/` directory is only
@@ -17,6 +26,36 @@ readable together with the `hot/` store it was written with; copy both together.
 
 Integers are little-endian unless stated otherwise. `varint` is unsigned LEB128.
 `bytes` is a varint length followed by that many raw bytes.
+
+## Changes from version 1
+
+Version 2 is one reindex that bundles every stored-bytes change pending after P4. A v1 store
+cannot be upgraded in place; rebuild it (`docs/operations.md`, "Format upgrade").
+
+- **Transfer rule.** A transfer is chainweb-data's `mkTransferRows` row: the qualified event
+  name ends in `TRANSFER`, the event has exactly three params, `from` and `to` are strings,
+  and the amount is a number, a string with a leading rational, or an object whose
+  `decimal` or `int` member is one of those. Version 1 took only events named exactly
+  `TRANSFER` with a number or a one-key `{"decimal"|"int"}` amount. The rule drives the
+  record's `transfers` list and the `xfer` postings (keyed by the event's module). The
+  transfer sides in `acct` keep the version 1 rule: only an event named exactly `TRANSFER`
+  (and passing the amount check above) gives its `from` and `to` an `acct` posting, so a
+  `WIZ_TRANSFER (id, from, to)` event never makes the NFT id or the receiver string an
+  account. Coinbase TRANSFER events count, as before.
+- **`pact` posting family** (family byte 5, file `pact.pst`, `TailPostings` family 5): the
+  defpact history. Entity = the first 8 bytes of the pactId, big-endian. A tx is posted when
+  it has a pactId: an exec whose output `continuation.pactId` is set (it starts a pact) and
+  every `cont` step (`payload.cont.pactId` of the cmd, else the output's). Readers verify
+  the full pactId on the record. The hot `Defpacts` table is still written by the tail but
+  has no reader.
+- **Versions.** Hot `Meta format_version` 2; `manifest.json` and every `range.toml`
+  `format_version` 2. Posting files keep their own version byte 1 and records keep 1.
+- **MDBX** opens with 64 named-database slots (`max_dbs`; 32 before), room for later
+  additive tables.
+- **Merkle bit.** Ingest recomputes the payload Merkle roots from the leaves the node served
+  (see "Payload Merkle verification") and sets the block record's `merkle_verified` when all
+  three match. Version 1 never set it. The bit's position is unchanged; only its value is
+  new.
 
 ## Identifiers
 
@@ -49,7 +88,7 @@ same files; `range.toml` says which kind it is.
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "network": "mainnet01",
   "entries": [
     { "kind": "range", "start": 0, "end": 100000,
@@ -76,7 +115,7 @@ files of unlisted ranges are leftovers and are deleted or rebuilt.
 | `keys` | `.ef` | first TxNum of every slot |
 | `rk` | `.idx` | request key → tx |
 | `bh` | `.idx` | block hash → slot |
-| `acct`, `xfer`, `pk`, `evt`, `code` | `.pst` | posting lists |
+| `acct`, `xfer`, `pk`, `evt`, `code`, `pact` | `.pst` | posting lists |
 | `range` | `.toml` | range header with blake3 of every other file |
 
 ## Write ordering
@@ -195,7 +234,7 @@ a missing table or another `format_version`.
 ## `range.toml`
 
 ```toml
-format_version = 1
+format_version = 2
 network = "mainnet01"
 kind = "range"            # or "step"
 start = 7300000
@@ -291,7 +330,7 @@ bytes   metadata value                     if flags.b4 (absent = JSON null)
 bytes   continuation value                 if flags.b5 (absent = JSON null)
 varint  n_events, then per event: varint ModuleId, varint EventNameId,
         varint ModuleHash id, bytes params value
-varint  n_transfers, then varint event position each (fungible TRANSFER events)
+varint  n_transfers, then varint event position each (transfer events, see "Posting files")
 bytes   extra value (a map)                if flags.b6
 bytes   raw_tx      original tx object bytes   if bits.b1
 bytes   raw_output  original output bytes      if bits.b2
@@ -334,8 +373,59 @@ the **same range**; form 0 is a raw hash. The first height of a range is always 
 raw form, so a range decodes without its neighbours. The hot store writes the plain form
 (b2 clear).
 
-`merkle_verified` stays false until the payload Merkle roots have been recomputed from the
-leaves; until then the payload is consistent with its header but not proven.
+`merkle_verified` is set when the payload Merkle roots recomputed from the leaves at ingest
+matched (see "Payload Merkle verification"). False means not proven: the payload is
+consistent with its header, but its contents were not tied to `payloadHash`.
+
+### Payload Merkle verification
+
+Chainweb commits to a block's payload with three Merkle roots. The header carries
+`payloadHash`; the payload carries `transactionsHash` and `outputsHash`. Ingest recomputes
+all three from the exact base64-decoded bytes the node served and compares them. The block
+header hash itself is not recomputed; headers come from the local node and parent linkage
+is checked separately.
+
+- **Hash.** SHA-512/256, as defined in FIPS 180-4 (its own initial values; not SHA-512 cut
+  to 32 bytes).
+- **Leaves.** Each input is prefixed with a two-byte big-endian type tag. The leaf hash is
+  `H(0x00 ‖ tag ‖ bytes)`. Tags: transaction `0x0013`, transaction output `0x0014`,
+  minerData `0x0017`, coinbase output `0x0018`.
+- **Inner nodes.** `H(0x01 ‖ left ‖ right)`.
+- **Child roots.** When a tree's entry is itself a root (the payload tree), it enters as
+  the 32-byte hash, with no leaf hashing and no tag.
+- **Shape.** Entries are taken left to right onto a stack, each at height 0. While the top
+  two stack entries have the same height, they are replaced by their inner node, one level
+  higher (the lower stack entry is the left child). When the entries run out, the remaining
+  stack entries are combined the same way from the top down, whatever their heights. One
+  entry is its own root; zero entries give `H("")` (never used here, every tree has a
+  header entry).
+- **Trees.**
+  - `transactionsHash` = tree(minerData, tx₁, …, txₙ), the tx objects in payload order.
+  - `outputsHash` = tree(coinbase output, out₁, …, outₙ).
+  - `payloadHash` = tree(`transactionsHash`, `outputsHash`) = `H(0x01 ‖ tx root ‖ out root)`.
+
+The leaves are the tx objects (`{"hash","sigs","cmd"}` bytes), not the `cmd` strings, so a
+tx whose served `cmd` does not hash to its request key (`cmd_reencoded`, below about height
+2.4M) still verifies when the payload bytes are the committed ones. Such a block is called
+**legacy**; a mismatch on a legacy block is reported apart from other mismatches.
+
+Policy on a mismatch:
+
+- **Backfill:** the bit stays false, `kdx_merkle_blocks_total{result}` counts it
+  (`mismatch_legacy` or `mismatch`), a line `{chain, height, hash, which, legacy}` is
+  appended to `<data_dir>/merkle-unverified.jsonl` and fsynced after the range commits, and
+  the range goes on. While the range is built the lines wait in `etl/merkle-<start>.jsonl`;
+  after a crash between the commit and the append the next backfill start appends them. A
+  failed append is a warning (the bit is the durable result; `verify merkle` lists the
+  blocks). `which` is the first root that differed: `tx_root`, `out_root` or
+  `payload_root`.
+- **Tail:** the payload is fetched once more. If it still does not verify, the blocks before
+  it are committed and the chain halts with reason `merkle` (see `operations.md`, "Halted
+  chains").
+
+`kda-indexer verify merkle` recomputes the roots from stored records. The leaves are
+rendered back from the records, so it checks the storage round trip as well as the
+contents. See "Checking".
 
 ### Value codec
 
@@ -388,18 +478,26 @@ One file per family per range. Families and their entity keys:
 
 | family byte | file | entity |
 |---|---|---|
-| 0 | `xfer` | `AccountId << 32 | ModuleId`: txs where the account sends or receives a fungible TRANSFER of that module |
+| 0 | `xfer` | `AccountId << 32 | ModuleId`: txs where the account is `from` or `to` of a transfer (chainweb-data's rule, see below) emitted by that module |
 | 1 | `acct` | AccountId: txs whose sender, signer `addr` or coinbase miner is the account, or one of whose events names it (see below) |
 | 2 | `pk` | PubKeyId: txs signed by the key |
 | 3 | `evt` | EventNameId, or `1 << 32 | ModuleId` for "any event of the module" |
 | 4 | `code` | first 8 bytes of the CodeHash, big-endian (verify the full hash on read) |
+| 5 | `pact` | first 8 bytes of the pactId, big-endian: the exec that starts the defpact and every `cont` step (verify the full pactId on read) |
 
-An event names an account when the account is a side of a fungible `TRANSFER (from, to,
-amount)`, a poly-fungible `TRANSFER (id, from, to, amount)` or a `TRANSFER_XCHAIN` /
+A transfer is an event whose qualified name ends in `TRANSFER` with exactly three params:
+`from` and `to` strings, and an amount that is a number, a string starting with a rational
+(optional sign, digits, optional `.digits`, optional exponent; the rest is ignored), or an
+object whose `decimal` or `int` member is one of those (chainweb-data's `mkTransferRows`).
+
+An event names an account when the account is a side of an event named exactly `TRANSFER`
+that is a transfer (above; a suffix name such as `WIZ_TRANSFER` does not count here), of a
+poly-fungible `TRANSFER (id, from, to, amount)` or of a `TRANSFER_XCHAIN` /
 `TRANSFER_XCHAIN_RECD (from, to, amount, chain)`, or when it is a syntactically valid Pact
 principal (`k:`, `w:`, `r:`, `u:`, `m:`, `p:`, `c:`) anywhere in the event's params. All of
-these are interned before encoding, so the `acct` posting set is a pure function of the
-block: backfill, tail, replay and rebuild give the same set. A non-principal ("vanity")
+these, and the `xfer` sides of every transfer (including a suffix name's), are interned
+before encoding, so the `acct` and `xfer` posting sets and the record bytes are a pure
+function of the block and the ids: backfill, tail, replay and rebuild give the same sets. A non-principal ("vanity")
 account name that appears only in the params of other events gets no posting.
 
 ```
@@ -436,4 +534,16 @@ Readers page newest first: ranges from newest to oldest, each list from its last
 size and blake3 of every file listed in each `range.toml`, and reports orphan files.
 `--deep` also decodes every record, checks every tx's TxKey against `keys.ef`, resolves
 every request key and block hash through the indexes, decodes every adjacent ref and every
-posting list.
+posting list, and walks each Roaring list the way reads do (lazily, by container) from three
+bounds, requiring the same values as its full decode.
+
+`kda-indexer verify merkle [--from H] [--to H] [--chains …] [--sample N | --all] [--json]`
+re-renders each block's leaves from its stored records (hot store first, then segments),
+recomputes the payload roots and sorts blocks into `ok` (verified, bit set),
+`ok_unflagged` (verified, bit clear), `bad_flagged` (mismatch with the bit set: corruption),
+`bad_legacy` and `bad_other` (mismatch, bit clear). A record that does not render counts
+under `errors`. It exits 1 on anything but `ok`: every era must verify, legacy included, and
+`ok_unflagged` points to a bit-setting or render bug (a v2 store sets the bit on every block
+that verifies). It opens the store read-only and takes a fresh read txn per 1,000 heights
+(or 1,000 samples), then reloads the segments if the manifest changed, so blocks frozen
+during the walk are still checked. The default is a sample of 1,000 random blocks.

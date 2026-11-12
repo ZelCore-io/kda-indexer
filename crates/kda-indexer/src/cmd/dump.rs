@@ -1,7 +1,8 @@
 //! `dump` command: fetch a bounded height range, decode, run the consistency checks, build
 //! records with one shared `MemDict`, encode, decode back and check the round trip: values
 //! (Task 5 definition) and the exact Merkle leaf bytes the node served (tx objects, outputs,
-//! coinbase, minerData). Payload contents are not Merkle-verified here (P5).
+//! coinbase, minerData). `--merkle` also recomputes the payload Merkle roots (B8) from the
+//! served leaves and from the built records, and prints the outcome per block.
 //!
 //! Heights stay `ingest.finality_depth` below the lowest cut height, so no block that can
 //! still be reorged is read.
@@ -17,10 +18,12 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context};
 use kdx_decode::json::parse_untrusted;
+use kdx_decode::merkle::check_records;
 use kdx_decode::{
-    build_records, compare_json, decode_block, extract, render_cmd, render_header, render_miner,
-    render_miner_bytes, render_output, render_output_bytes, render_tx, render_tx_bytes,
-    verify_block, verify_linkage, Header,
+    build_records, compare_json, decode_block, extract, merkle_check, merkle_check_roots,
+    render_cmd, render_header, render_miner, render_miner_bytes, render_output,
+    render_output_bytes, render_tx, render_tx_bytes, verify_block, verify_linkage, Header,
+    MerkleResult,
 };
 use kdx_node::{ChainGraph, NodeClient};
 use kdx_types::record::{
@@ -36,6 +39,8 @@ use crate::config::Config;
 
 const SLAB: u64 = 100;
 const BAND: u64 = 100_000;
+/// `--merkle` era width (Task 1 Step 2 sweeps 250k-height eras).
+const MERKLE_ERA: u64 = 250_000;
 
 pub struct DumpArgs {
     pub from: String,
@@ -45,6 +50,57 @@ pub struct DumpArgs {
     pub records_out: Option<PathBuf>,
     pub summary_out: Option<PathBuf>,
     pub index: bool,
+    pub merkle: bool,
+}
+
+/// `--merkle` counters per era (and in total).
+#[derive(Default, Clone, Serialize)]
+struct MerkleCounts {
+    blocks: u64,
+    verified: u64,
+    mismatch_legacy: u64,
+    mismatch: u64,
+    /// Blocks holding at least one user tx with a re-encoded `cmd`.
+    legacy_blocks: u64,
+    user_txs: u64,
+}
+
+impl MerkleCounts {
+    fn add(&mut self, r: &MerkleResult, legacy: bool, txs: usize) {
+        self.blocks += 1;
+        self.user_txs += txs as u64;
+        self.legacy_blocks += legacy as u64;
+        match r.label() {
+            "verified" => self.verified += 1,
+            "mismatch_legacy" => self.mismatch_legacy += 1,
+            _ => self.mismatch += 1,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MerkleMismatch {
+    chain: u8,
+    height: u64,
+    hash: String,
+    which: &'static str,
+    legacy: bool,
+    txs: usize,
+}
+
+/// `--merkle` summary.
+#[derive(Default, Serialize)]
+struct MerkleSum {
+    total: MerkleCounts,
+    /// `chain -> era start height -> counts`.
+    by_chain_era: BTreeMap<String, BTreeMap<String, MerkleCounts>>,
+    blocks_without_txs: u64,
+    blocks_with_one_tx: u64,
+    max_txs_in_block: usize,
+    /// `check_records` (leaves re-rendered from the built records) gave another result than
+    /// the check on the served bytes, or failed to render.
+    records_disagree: u64,
+    mismatches: Vec<MerkleMismatch>,
 }
 
 /// `--index` counters (Task 2 of P2).
@@ -125,6 +181,8 @@ struct Summary {
     requests: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     index: Option<IndexSum>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merkle: Option<MerkleSum>,
 }
 
 struct Ctx {
@@ -252,6 +310,7 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
             from,
             to,
             index: args.index.then(IndexSum::default),
+            merkle: args.merkle.then(MerkleSum::default),
             ..Default::default()
         },
         hashes: BTreeMap::new(),
@@ -333,7 +392,16 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
     }
     sum.requests = nc.stats().iter().map(|r| r.count).sum();
     print_summary(&sum, args.json);
-    if let Some(p) = &args.summary_out {
+    // `--merkle` always leaves a summary file (Task 1 probe evidence).
+    let summary_out = args.summary_out.clone().or_else(|| {
+        args.merkle.then(|| {
+            PathBuf::from(format!(
+                "test-runs/dump-merkle-{}-{from}-{to}.json",
+                cfg.network
+            ))
+        })
+    });
+    if let Some(p) = &summary_out {
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -343,7 +411,20 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         sum.round_trip_failures += ix.adj_ref_round_trip_failures;
         eprintln!("index: {}", serde_json::to_string_pretty(ix)?);
     }
-    let failures = sum.round_trip_failures
+    let mut merkle_failures = 0;
+    if let Some(m) = &sum.merkle {
+        // Every era must verify, legacy included.
+        merkle_failures = m.total.mismatch + m.total.mismatch_legacy + m.records_disagree;
+        eprintln!(
+            "merkle: {} blocks, {} verified, {} mismatch_legacy, {} mismatch (non-legacy), {} records_disagree",
+            m.total.blocks, m.total.verified, m.total.mismatch_legacy, m.total.mismatch, m.records_disagree
+        );
+        if let Some(p) = &summary_out {
+            eprintln!("merkle: summary in {}", p.display());
+        }
+    }
+    let failures = merkle_failures
+        + sum.round_trip_failures
         + sum.byte_mismatches
         + sum.verify_failures
         + sum.decode_failures
@@ -352,6 +433,62 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         bail!("{failures} failure(s)");
     }
     Ok(())
+}
+
+/// `--merkle`: count one block, print its line, and re-check it from the built records.
+fn merkle_block(
+    m: &mut MerkleSum,
+    b: &kdx_decode::DecodedBlock,
+    br: &BlockRecord,
+    trs: &[TxRecord],
+    dict: &MemDict,
+    r: MerkleResult,
+    legacy: bool,
+) {
+    let (chain, height, n) = (br.chain, br.height, b.txs.len());
+    m.total.add(&r, legacy, n);
+    m.by_chain_era
+        .entry(format!("{chain:02}"))
+        .or_default()
+        .entry(format!("{:09}", height / MERKLE_ERA * MERKLE_ERA))
+        .or_default()
+        .add(&r, legacy, n);
+    m.blocks_without_txs += (n == 0) as u64;
+    m.blocks_with_one_tx += (n == 1) as u64;
+    m.max_txs_in_block = m.max_txs_in_block.max(n);
+    let from_records = check_records(br, trs, dict);
+    let agree = matches!(&from_records, Ok(x) if *x == r);
+    if !agree {
+        m.records_disagree += 1;
+        eprintln!("MERKLE RECORDS chain {chain} height {height}: served bytes {r:?}, records {from_records:?}");
+    }
+    match r {
+        MerkleResult::Verified => {
+            println!("merkle chain {chain:>2} height {height:>9} txs {n:>4} verified");
+        }
+        MerkleResult::Mismatch { which, legacy } => {
+            let roots = merkle_check_roots(b);
+            println!(
+                "merkle chain {chain:>2} height {height:>9} txs {n:>4} {} which={} legacy={legacy} computed tx={} out={} payload={} claimed tx={} out={} payload={}",
+                r.label(),
+                which.as_str(),
+                roots.tx,
+                roots.out,
+                roots.payload,
+                b.transactions_hash,
+                b.outputs_hash,
+                b.header.payload_hash
+            );
+            m.mismatches.push(MerkleMismatch {
+                chain,
+                height,
+                hash: br.hash.to_b64url(),
+                which: which.as_str(),
+                legacy,
+                txs: n,
+            });
+        }
+    }
 }
 
 /// `--index`: which height adjacent parents point at, and the adjacent-ref encoding round trip
@@ -434,6 +571,10 @@ fn handle_block(
         }
     }
     cx.prev.insert(chain, b.header.clone());
+    let mut report = report;
+    if cx.sum.merkle.is_some() {
+        report.merkle = Some(merkle_check(&b, &b.header.payload_hash));
+    }
     cx.sum.req_key_unchecked += report.req_key_unchecked.len() as u64;
     let u = &mut cx.sum.unrepresentable;
     u.miner += b.miner_unrepresentable as u64;
@@ -454,6 +595,17 @@ fn handle_block(
     };
     cx.sum.blocks += 1;
     cx.sum.raw_slots.miner += br.raw_miner.is_some() as u64;
+    if let (Some(m), Some(r)) = (cx.sum.merkle.as_mut(), report.merkle) {
+        merkle_block(
+            m,
+            &b,
+            &br,
+            &trs,
+            &cx.dict,
+            r,
+            !report.cmd_hash_mismatch.is_empty(),
+        );
+    }
     if let Some(s) = cx.sum.index.as_mut() {
         cx.hashes.insert((chain, height), br.hash);
         let idx = extract(&b, &trs, &mut cx.dict);

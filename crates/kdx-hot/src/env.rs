@@ -15,8 +15,20 @@ use reth_libmdbx::{
 
 use crate::tables::{Table, Tables};
 
-/// Hot store format version (Meta `format_version`).
-pub const FORMAT_VERSION: u64 = 1;
+/// Hot store format version (Meta `format_version`). Version 2 goes with segment format 2
+/// (`pact` postings, chainweb-data's transfer rule) and opens with `MAX_DBS` 64.
+pub const FORMAT_VERSION: u64 = 2;
+
+/// MDBX named-database slots (20 tables in use; room for the additive P6/P7 tables).
+pub const MAX_DBS: usize = 64;
+
+/// The error for a hot store in another format version.
+pub fn format_refusal(found: u64) -> String {
+    format!(
+        "store format v{found}, this build reads v{FORMAT_VERSION}: rebuild it \
+         (docs/operations.md#format-upgrade)"
+    )
+}
 
 /// MDBX page size (B9: 4 KB pages on Ceph RBD, matching the block device and ext4).
 pub const PAGE_SIZE: usize = 4096;
@@ -59,7 +71,7 @@ pub struct HotStore {
 }
 
 impl HotStore {
-    /// Open (or create) the hot store in `dir`. A new store gets `format_version` 1,
+    /// Open (or create) the hot store in `dir`. A new store gets `format_version` 2,
     /// `frozen_frontier` 0, `next_txnum` 0 and its geometry in `Meta`; an existing store with
     /// another format version is refused.
     pub fn open(dir: &Path, g: Geometry) -> Result<HotStore> {
@@ -73,7 +85,7 @@ impl HotStore {
             .and_then(|x| x.checked_mul(MIB))
             .context("storage.mdbx_growth_mb too large")?;
         let env = Environment::builder()
-            .set_max_dbs(32)
+            .set_max_dbs(MAX_DBS)
             .set_geometry(reth_libmdbx::Geometry {
                 size: Some(0..max),
                 growth_step: Some(growth as isize),
@@ -100,7 +112,7 @@ impl HotStore {
             Some(v) => {
                 let v = be_u64(&v).context("Meta format_version")?;
                 if v != FORMAT_VERSION {
-                    bail!("hot store format version {v}, this build reads {FORMAT_VERSION}");
+                    bail!(format_refusal(v));
                 }
             }
         }
@@ -129,7 +141,7 @@ impl HotStore {
             bail!("no hot store in {}", dir.display());
         }
         let env = Environment::builder()
-            .set_max_dbs(32)
+            .set_max_dbs(MAX_DBS)
             .set_flags(EnvironmentFlags {
                 mode: Mode::ReadOnly,
                 ..Default::default()
@@ -151,7 +163,7 @@ impl HotStore {
                 .context("hot store has no format_version")?;
             let v = be_u64(&v).context("Meta format_version")?;
             if v != FORMAT_VERSION {
-                bail!("hot store format version {v}, this build reads {FORMAT_VERSION}");
+                bail!(format_refusal(v));
             }
         }
         Ok(HotStore {
@@ -185,6 +197,37 @@ impl HotStore {
             txn: self.env.begin_ro_txn()?,
             tables: self.tables.clone(),
         })
+    }
+
+    /// Copy the MVCC snapshot of `txn` (taken from this store) into a new hot store in the
+    /// directory `dest` (created; it must hold no `mdbx.dat`), compacted: free pages omitted and
+    /// pages renumbered. The copy is durable when this returns. The result opens like any hot
+    /// store. Holds `txn` for the whole copy: minutes on a large store.
+    pub fn copy_compact(&self, txn: &RoTxn, dest: &Path) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let file = dest.join("mdbx.dat");
+        if file.exists() {
+            bail!("{} already holds a hot store", dest.display());
+        }
+        std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+        let c = std::ffi::CString::new(file.as_os_str().as_bytes()).context("dest path")?;
+        let rc = txn
+            .raw()
+            .txn_execute(|t| unsafe {
+                reth_libmdbx::ffi::mdbx_txn_copy2pathname(
+                    t,
+                    c.as_ptr(),
+                    reth_libmdbx::ffi::MDBX_CP_COMPACT,
+                )
+            })
+            .map_err(|e| anyhow::anyhow!("copy txn: {e}"))?;
+        if rc != 0 {
+            bail!(
+                "mdbx_txn_copy2pathname {} failed: code {rc}",
+                dest.display()
+            );
+        }
+        Ok(())
     }
 
     /// The write transaction. One writer at a time: blocks while another `RwTxn` is alive.

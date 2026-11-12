@@ -26,11 +26,13 @@ pub enum FileKind {
     Pk,
     Evt,
     Code,
+    /// `pact` postings (format v2).
+    Pact,
     Range,
 }
 
 impl FileKind {
-    pub const ALL: [FileKind; 11] = [
+    pub const ALL: [FileKind; 12] = [
         FileKind::Txs,
         FileKind::Blocks,
         FileKind::Keys,
@@ -41,6 +43,7 @@ impl FileKind {
         FileKind::Pk,
         FileKind::Evt,
         FileKind::Code,
+        FileKind::Pact,
         FileKind::Range,
     ];
     pub fn name(self) -> &'static str {
@@ -55,6 +58,7 @@ impl FileKind {
             FileKind::Pk => "pk",
             FileKind::Evt => "evt",
             FileKind::Code => "code",
+            FileKind::Pact => "pact",
             FileKind::Range => "range",
         }
     }
@@ -75,6 +79,7 @@ impl FileKind {
             kdx_decode::Family::Pk => FileKind::Pk,
             kdx_decode::Family::Evt => FileKind::Evt,
             kdx_decode::Family::Code => FileKind::Code,
+            kdx_decode::Family::Pact => FileKind::Pact,
         }
     }
 }

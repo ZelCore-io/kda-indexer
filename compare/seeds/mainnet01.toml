@@ -149,3 +149,64 @@ note = "defpact with a rollback"
 kind = "height"
 value = "TODO-owner"
 note = "reorged block seen in the tail"
+
+# --- P5: WIZ_TRANSFER (free.wiz-arena) events carry (id, from, to) params. chainweb-data reads
+# params[2] as the amount and makes no transfer row for a `k:` receiver; v2 does the same.
+# `acct` postings keep the TRANSFER-only rule, so the id is never an account. ---
+[[seed]]
+kind = "account"
+value = "k:3ab114faea8b2b67f69035c302da81b3099ae79213969ebcd6fde69861ed7403"
+token = "free.wiz-arena"
+note = "WIZ_TRANSFER sender (heights 6770359, 6776473, 6777512, chain 1)"
+
+[[seed]]
+kind = "account"
+value = "k:cff229b123688c3cbd4d53f128000c91d0ce635383b5739b7ec7c837318e9f84"
+token = "free.wiz-arena"
+note = "WIZ_TRANSFER receiver, id 83"
+
+[[seed]]
+kind = "account"
+value = "k:82d03e59d1f4638220d8510bb56fcc7d16ddc076608dcf8d069aebd1b6140e52"
+token = "free.wiz-arena"
+note = "WIZ_TRANSFER receiver, id 106"
+
+[[seed]]
+kind = "account"
+value = "k:37aa1c4aac7e6e395c51557a58508ea2188f1900f9e53923d4fe78b01a571c0e"
+token = "free.wiz-arena"
+note = "WIZ_TRANSFER receiver, id 205"
+
+[[seed]]
+kind = "account"
+value = "83"
+token = "free.wiz-arena"
+note = "the NFT id of a WIZ_TRANSFER: no transfer row, no acct posting, in both implementations"
+
+# --- P5: cross-chain pact ids (the starter's request key) for /txs/search?pactid. The route is
+# a P6 should route (allowlist search-route-p6 until then); P5's `pact` postings were checked
+# against chainweb-data for these five in run 5B. ---
+[[seed]]
+kind = "pact_id"
+value = "-SIVsJMn4kCVznZKkBBmEPUbsbMBTO9oTP69jd03v9g"
+note = "cross-chain transfer, chain 17 to 0 (height 6776683)"
+
+[[seed]]
+kind = "pact_id"
+value = "w0nXNcpSL0udw8oqlMbhTRzdMaIC5ZKSgIT60wvx1sk"
+note = "cross-chain transfer, chain 7 to 0 (height 6776682)"
+
+[[seed]]
+kind = "pact_id"
+value = "WCviBp776OVtWEkBc6zHstjCUvV9DqsT1ntzWIK67As"
+note = "cross-chain transfer, chain 2 to 1 (height 6776790)"
+
+[[seed]]
+kind = "pact_id"
+value = "gWqW7gPgwvdOT_ZIz_jpUPz75T62_eMz0b_MJBElnBk"
+note = "cross-chain transfer, chain 11 to 0 (height 6776683)"
+
+[[seed]]
+kind = "pact_id"
+value = "W_uonYaeKQ5HNyr6idqUwLyZHOTGsbpzmbDBLiotupg"
+note = "cross-chain transfer, chain 15 to 0 (height 6776683)"

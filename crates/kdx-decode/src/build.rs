@@ -1,4 +1,4 @@
-//! Build v1 records from a decoded block (spec §3.4 "Record encoding").
+//! Build records (record codec version 1, store format v2) from a decoded block (spec §3.4 "Record encoding").
 //!
 //! Names are interned for the whole block first (`intern_block`; first-seen order: miner
 //! account, then coinbase, then user txs in payload order; per tx: meta sender, signer
@@ -88,24 +88,78 @@ pub fn parse_event(e: &Value) -> Option<EventParts<'_>> {
     })
 }
 
-/// Fungible `TRANSFER`: `[from: str, to: str, amount: number | {"decimal"|"int": ..}]`.
+/// Length of the leading rational of `s` as `Data.Text.Read.rational` reads it: an optional
+/// `+`/`-`, at least one ASCII digit, an optional `.` followed by at least one digit, and an
+/// optional `e`/`E` exponent with an optional sign and at least one digit. A `.` or exponent
+/// marker without digits after it ends the number; trailing text is ignored. `None` when `s`
+/// does not start with a number.
+pub fn rational_prefix_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let digits = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        i
+    };
+    let mut i = usize::from(matches!(b.first(), Some(b'-' | b'+')));
+    let ds = i;
+    i = digits(i);
+    if i == ds {
+        return None;
+    }
+    if b.get(i) == Some(&b'.') && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+        i = digits(i + 1);
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        let es = i + 1 + usize::from(matches!(b.get(i + 1), Some(b'-' | b'+')));
+        let j = digits(es);
+        if j > es {
+            i = j;
+        }
+    }
+    Some(i)
+}
+
+/// chainweb-data's `getAmount` succeeds on the amount param: a number, a string with a
+/// leading rational, or an object whose `decimal` or `int` member is one of those (other
+/// members are ignored).
+pub fn transfer_amount_ok(v: &Value) -> bool {
+    let plain = |x: &Value| match x {
+        Value::Number(_) => true,
+        Value::String(s) => rational_prefix_len(s).is_some(),
+        _ => false,
+    };
+    match v {
+        Value::Object(o) => ["decimal", "int"]
+            .iter()
+            .any(|k| o.get(*k).is_some_and(plain)),
+        _ => plain(v),
+    }
+}
+
+/// A transfer row of chainweb-data (`mkTransferRows`): the qualified event name ends in
+/// `TRANSFER`, there are exactly three params, `from` and `to` are strings and the amount
+/// passes `transfer_amount_ok`. Drives the record's `transfers` list and the `xfer` postings
+/// (keyed by the event's module). The `acct` sides use the narrower `acct_transfer_accounts`.
 pub fn transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> {
-    if ev.name != "TRANSFER" {
+    if !ev.event_name.ends_with("TRANSFER") {
         return None;
     }
     let p = ev.params.as_array()?;
-    if p.len() != 3 {
-        return None;
-    }
-    let amount_ok = match &p[2] {
-        Value::Number(_) => true,
-        Value::Object(o) => o.len() == 1 && (o.contains_key("decimal") || o.contains_key("int")),
-        _ => false,
-    };
-    if !amount_ok {
+    if p.len() != 3 || !transfer_amount_ok(&p[2]) {
         return None;
     }
     Some((p[0].as_str()?, p[1].as_str()?))
+}
+
+/// The transfer sides that give `acct` postings: only an event named exactly `TRANSFER` (the
+/// v1 rule) whose params pass `transfer_accounts`. Suffix names such as `WIZ_TRANSFER` carry
+/// `(id, from, to)` params; their "sides" are an NFT id and a receiver, not two accounts.
+pub fn acct_transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> {
+    if ev.name != "TRANSFER" {
+        return None;
+    }
+    transfer_accounts(ev)
 }
 
 /// All events canonical, or None (then the events go to `extra`).
@@ -176,7 +230,7 @@ pub fn event_accounts<'a>(e: &'a Value, out: &mut Vec<&'a str>) {
         return;
     };
     if let (Some(ev), Some(p)) = (parse_event(e), params.as_array()) {
-        if let Some((from, to)) = transfer_accounts(&ev) {
+        if let Some((from, to)) = acct_transfer_accounts(&ev) {
             out.extend([from, to]);
         } else if p.len() == 4 && matches!(p[3], Value::Number(_) | Value::Object(_)) {
             let sides = match ev.name {
@@ -221,6 +275,19 @@ fn intern_output(o: &Value, dict: &mut impl DictMut, unindexed: &mut u32) {
     {
         acc.clear();
         event_accounts(e, &mut acc);
+        // The `xfer` sides (`transfer_accounts`, wider than the `acct` rule): a side that is
+        // neither an `acct` side nor a principal (a suffix-TRANSFER's id, a non-principal
+        // name of an `X_TRANSFER`) is posted by `extract` under `xfer` only. It is interned
+        // here too, after the event's `acct` strings, so `encode_records` already sees it.
+        if let Some(ev) = parse_event(e) {
+            if let Some((from, to)) = transfer_accounts(&ev) {
+                for s in [from, to] {
+                    if !acc.contains(&s) {
+                        acc.push(s);
+                    }
+                }
+            }
+        }
         for a in &acc {
             intern_account(dict, a, unindexed);
         }
@@ -228,8 +295,10 @@ fn intern_output(o: &Value, dict: &mut impl DictMut, unindexed: &mut u32) {
 }
 
 /// Step 1 of `build_records`: intern every name the block references, in first-seen order
-/// (miner account; coinbase output; per user tx: meta sender, signer `addr`s, output). Every
-/// account string `extract` posts is interned here, so postings depend only on the block.
+/// (miner account; coinbase output; per user tx: meta sender, signer `addr`s, output; per
+/// event of an output: its `event_accounts`, then its `xfer` sides not among them). Every
+/// account string `extract` posts (`acct` and `xfer`) is interned here, before the records
+/// are encoded, so record bytes and postings depend only on the block and the ids.
 /// Returns the number of account strings longer than `MAX_ACCOUNT_LEN` (not interned).
 pub fn intern_block(b: &DecodedBlock, dict: &mut impl DictMut) -> u32 {
     let mut unindexed = 0;
@@ -369,7 +438,7 @@ fn finish_extra(r: &mut TxRecord, extra: Map<String, Value>, dict: &dyn Dict) {
 /// `raw_*` slots where they do not (see `record.rs`).
 ///
 /// `report` comes from `verify_block`: user txs listed in `cmd_hash_mismatch` get the
-/// `cmd_reencoded` bit.
+/// `cmd_reencoded` bit, and `report.merkle == Some(Verified)` sets `merkle_verified`.
 pub fn build_records(
     b: &DecodedBlock,
     report: &VerifyReport,
@@ -425,7 +494,7 @@ pub fn encode_records(
         miner_account,
         miner_data: value::to_vec(&b.miner, dict),
         raw_miner: None,
-        merkle_verified: false,
+        merkle_verified: report.merkle_verified(),
     };
     if render_miner_bytes(&block, dict).ok().as_deref() != Some(b.miner_bytes.as_slice()) {
         block.raw_miner = Some(b.miner_bytes.clone());
@@ -473,4 +542,108 @@ pub fn encode_records(
         txs.push(r);
     }
     Ok((block, txs))
+}
+
+#[cfg(test)]
+mod transfer_rule_tests {
+    use serde_json::json;
+
+    use super::{
+        acct_transfer_accounts, event_accounts, parse_event, rational_prefix_len,
+        transfer_accounts, transfer_amount_ok,
+    };
+
+    #[test]
+    fn rational_prefix() {
+        for (s, n) in [
+            ("1", Some(1)),
+            ("-1.5", Some(4)),
+            ("+2e-3x", Some(5)),
+            ("5.", Some(1)),
+            ("5.e3", Some(1)),
+            ("7e", Some(1)),
+            ("0.25E+2", Some(7)),
+            (".5", None),
+            ("-", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            assert_eq!(rational_prefix_len(s), n, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn amount_forms() {
+        for v in [
+            json!(1.5),
+            json!({"decimal": 1.5}),
+            json!({"decimal": "1.5"}),
+            json!({"int": 3}),
+            json!({"int": "3"}),
+            json!("12.5 KDA"),
+            json!({"decimal": "x", "int": 2}),
+            json!({"other": 1, "decimal": 2}),
+        ] {
+            assert!(transfer_amount_ok(&v), "{v}");
+        }
+        for v in [
+            json!("x"),
+            json!({"decimal": "x"}),
+            json!({"other": 1}),
+            json!(null),
+            json!([1]),
+        ] {
+            assert!(!transfer_amount_ok(&v), "{v}");
+        }
+    }
+
+    #[test]
+    fn suffix_rule() {
+        let ev = |name: &str, params| {
+            json!({"params": params, "name": name,
+                   "module": {"namespace": "free", "name": "wiz-arena"}, "moduleHash": "h"})
+        };
+        let e = ev("WIZ_TRANSFER", json!(["a", "b", "1.0"]));
+        assert_eq!(
+            transfer_accounts(&parse_event(&e).unwrap()),
+            Some(("a", "b"))
+        );
+        let e = ev("TRANSFER_XCHAIN", json!(["a", "b", 1.0]));
+        assert_eq!(transfer_accounts(&parse_event(&e).unwrap()), None);
+        let e = ev("TRANSFER", json!(["id", "a", "b", 1.0]));
+        assert_eq!(transfer_accounts(&parse_event(&e).unwrap()), None);
+        let e = ev("TRANSFER", json!(["a", 5, 1.0]));
+        assert_eq!(transfer_accounts(&parse_event(&e).unwrap()), None);
+    }
+
+    #[test]
+    fn acct_keeps_transfer_only_rule() {
+        let ev = |name: &str, params| {
+            json!({"params": params, "name": name,
+                   "module": {"namespace": "free", "name": "wiz-arena"}, "moduleHash": "h"})
+        };
+        let sender = format!("k:{}", "ab".repeat(32));
+        let receiver = "12abc0ffee";
+        // WIZ_TRANSFER (id, from, to): chainweb-data's rule reads params[2] as the amount and
+        // "12abc..." has a leading rational, so the xfer / compat row exists with from "83".
+        let w = ev("WIZ_TRANSFER", json!(["83", sender, receiver]));
+        let parsed = parse_event(&w).unwrap();
+        assert_eq!(transfer_accounts(&parsed), Some(("83", sender.as_str())));
+        assert_eq!(acct_transfer_accounts(&parsed), None);
+        let mut acc = Vec::new();
+        event_accounts(&w, &mut acc);
+        assert!(!acc.contains(&"83"), "{acc:?}");
+        assert!(!acc.contains(&receiver), "{acc:?}");
+        assert!(
+            acc.contains(&sender.as_str()),
+            "principal still listed: {acc:?}"
+        );
+        // A plain coin TRANSFER gives both sides an acct posting.
+        let t = ev("TRANSFER", json!(["alice", "bob", {"decimal": "1.5"}]));
+        let parsed = parse_event(&t).unwrap();
+        assert_eq!(acct_transfer_accounts(&parsed), Some(("alice", "bob")));
+        let mut acc = Vec::new();
+        event_accounts(&t, &mut acc);
+        assert_eq!(acc[..2], ["alice", "bob"]);
+    }
 }

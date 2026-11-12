@@ -1,13 +1,15 @@
-//! Consistency checks on a decoded block (spec §2.2 checks 1-2) plus parent linkage.
+//! Consistency checks on a decoded block (spec §2.2 checks 1-2), parent linkage, and the
+//! payload Merkle check (check 3, B8).
 //!
-//! None of this verifies payload *contents*. The payload-hash check only compares the
-//! payload's own `payloadHash` claim with the header, and the tx checks compare fields of the
-//! same response with each other. Recomputing the Merkle roots from the leaves
-//! (leaves -> `transactionsHash`/`outputsHash` -> `payloadHash`) is P5 (B8); records carry
-//! `merkle_verified = false` until then.
+//! `verify_block` does not verify payload *contents*: the payload-hash check only compares
+//! the payload's own `payloadHash` claim with the header, and the tx checks compare fields of
+//! the same response with each other. `merkle_check` recomputes the roots from the leaves
+//! (leaves -> `transactionsHash`/`outputsHash` -> `payloadHash`, see `merkle.rs`); ingest
+//! stores its outcome in `VerifyReport::merkle` and the record's `merkle_verified` bit.
 
 use kdx_types::{blake2b_256, Hash32};
 
+use crate::merkle::{outputs_root, transactions_root, MerkleResult, MerkleRoots};
 use crate::payload::{DecodedBlock, Header};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -46,9 +48,15 @@ pub struct VerifyReport {
     /// User-tx positions whose output could not be parsed far enough to read `reqKey`
     /// (see `TxFlags::output_unrepresentable`); `hash == reqKey` is unchecked for them.
     pub req_key_unchecked: Vec<usize>,
+    /// Outcome of `merkle_check` (None: not run). Not part of `is_clean`.
+    pub merkle: Option<MerkleResult>,
 }
 
 impl VerifyReport {
+    pub fn merkle_verified(&self) -> bool {
+        self.merkle.is_some_and(|m| m.is_verified())
+    }
+
     pub fn is_clean(&self) -> bool {
         self.cmd_hash_mismatch.is_empty() && self.req_key_unchecked.is_empty()
     }
@@ -108,6 +116,34 @@ pub fn verify_block_strict(
             })
         }
     }
+}
+
+/// The three roots recomputed from the block's served leaf bytes.
+pub fn merkle_check_roots(b: &DecodedBlock) -> MerkleRoots {
+    MerkleRoots::from_children(
+        transactions_root(&b.miner_bytes, b.txs.iter().map(|t| &t.tx_bytes)),
+        outputs_root(&b.coinbase_bytes, b.txs.iter().map(|t| &t.output_bytes)),
+    )
+}
+
+/// Payload Merkle check (spec §2.2 check 3, B8): the computed transactions root against the
+/// payload's `transactionsHash`, the computed outputs root against `outputsHash`, and
+/// `payload_root(computed …)` against the header's `payloadHash`. `legacy` (only computed on
+/// a mismatch) = some user tx's served `cmd` does not hash to its `hash` (`cmd_reencoded`).
+pub fn merkle_check(b: &DecodedBlock, header_payload_hash: &Hash32) -> MerkleResult {
+    merkle_check_roots(b).compare(
+        &b.transactions_hash,
+        &b.outputs_hash,
+        header_payload_hash,
+        || legacy(b),
+    )
+}
+
+/// Some user tx was served with a re-encoded `cmd` (see `VerifyReport::cmd_hash_mismatch`).
+pub fn legacy(b: &DecodedBlock) -> bool {
+    b.txs
+        .iter()
+        .any(|t| blake2b_256(t.cmd.as_bytes()) != t.hash)
 }
 
 /// `next` is the direct child of `prev` on the same chain.

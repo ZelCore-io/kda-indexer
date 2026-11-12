@@ -9,7 +9,17 @@ use serde::{Deserialize, Serialize};
 use crate::files::replace_file;
 
 pub const MANIFEST: &str = "manifest.json";
-pub const FORMAT_VERSION: u8 = 1;
+/// Segment format version (manifest and every `range.toml`). Version 2 adds the `pact`
+/// posting family and chainweb-data's transfer rule (`docs/format.md`).
+pub const FORMAT_VERSION: u8 = 2;
+
+/// The error for a segments dir (manifest or `range.toml`) in another format version.
+pub fn format_refusal(found: u64) -> String {
+    format!(
+        "store format v{found}, this build reads v{FORMAT_VERSION}: rebuild it \
+         (docs/operations.md#format-upgrade)"
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -78,16 +88,29 @@ impl Manifest {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
         };
-        let m: Manifest =
-            serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
+        Manifest::parse(&b)
+            .with_context(|| format!("parse {}", p.display()))
+            .map(Some)
+    }
+
+    /// Parse and validate `manifest.json` bytes (refuses another `format_version`).
+    pub fn parse(b: &[u8]) -> Result<Manifest> {
+        let m: Manifest = serde_json::from_slice(b).context("manifest json")?;
         if m.format_version != FORMAT_VERSION {
-            bail!(
-                "segments format version {} (this build reads {FORMAT_VERSION})",
-                m.format_version
-            );
+            bail!(format_refusal(u64::from(m.format_version)));
         }
         m.validate()?;
-        Ok(Some(m))
+        Ok(m)
+    }
+
+    /// Every file the manifest references (all kinds of every range or step, side files of
+    /// the nippy-jar containers included), without the manifest itself.
+    pub fn files(&self) -> Vec<std::path::PathBuf> {
+        self.entries
+            .iter()
+            .flat_map(|e| crate::files::range_file_names(&self.network, e.start, e.end))
+            .map(std::path::PathBuf::from)
+            .collect()
     }
 
     /// Entries contiguous in heights and TxNums; frontier and next_txnum match the last entry.

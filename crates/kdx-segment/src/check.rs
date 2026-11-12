@@ -214,7 +214,8 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
             }
         }
     }
-    // Posting lists: decode, ascending, inside the range.
+    // Posting lists: decode, ascending, inside the range; a Roaring list's lazy walk (the
+    // read path) equals its full decode from three bounds.
     for f in Family::ALL {
         let p = &r.postings[f as usize];
         for i in 0..p.entities() {
@@ -223,7 +224,20 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
                 Ok(v)
                     if v.windows(2).all(|w| w[0] < w[1])
                         && v.last().is_none_or(|&x| (x as u64) < r.info.tx_count)
-                        && !v.is_empty() => {}
+                        && !v.is_empty() =>
+                {
+                    let seed = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ f as u64;
+                    let why = match p.lazy_walk_matches(i, &v, seed) {
+                        Ok(true) => None,
+                        Ok(false) => Some("lazy Roaring walk differs from the full decode".into()),
+                        Err(e) => Some(format!("lazy Roaring walk: {e:#}")),
+                    };
+                    if let Some(why) = why {
+                        rep.deep_decode_errors += 1;
+                        rep.errors
+                            .push(format!("{tag} {}: list {i}: {why}", f.name()));
+                    }
+                }
                 Ok(_) => {
                     rep.deep_decode_errors += 1;
                     rep.errors.push(format!(

@@ -192,3 +192,57 @@ pub fn unwind_to(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
     }
     Ok(n)
 }
+
+#[cfg(test)]
+mod pact_family_tests {
+    use kdx_decode::index::pact_entity;
+    use kdx_decode::{Family, IndexedBlock, TxIndex};
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{Hash32, TxKey};
+
+    use crate::tables::{posting_key, Table};
+    use crate::{Geometry, HotDict, HotStore, Txn};
+
+    /// Format v2: a `pact` posting (family 5) is written by `apply` and removed by undo.
+    #[test]
+    fn pact_posting_apply_and_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let pact = Hash32([7u8; 32]);
+        let key = TxKey::new(100, 3, 1);
+        let block = BlockRecord {
+            hash: Hash32([1u8; 32]),
+            chain: 3,
+            height: 100,
+            ..Default::default()
+        };
+        let tx = TxRecord {
+            key,
+            request_key: Some(pact),
+            ..Default::default()
+        };
+        let ent = pact_entity(&pact);
+        let ib = IndexedBlock {
+            block,
+            txs: vec![tx],
+            idx: vec![TxIndex {
+                key,
+                postings: vec![(Family::Pact, ent)],
+                pact_id: Some(pact),
+                code_hash: None,
+            }],
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        };
+        let pk = posting_key(Family::Pact as u8, ent, key);
+        assert_eq!(pk[0], 5);
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        super::apply(&mut txn, &ib, &mut dict).unwrap();
+        assert!(txn.get(Table::TailPostings, &pk).unwrap().is_some());
+        assert_eq!(super::unwind_to(&mut txn, 3, 99).unwrap(), 1);
+        assert!(txn.get(Table::TailPostings, &pk).unwrap().is_none());
+        assert!(txn.get(Table::Defpacts, &pact.0).unwrap().is_none());
+        txn.commit().unwrap();
+    }
+}

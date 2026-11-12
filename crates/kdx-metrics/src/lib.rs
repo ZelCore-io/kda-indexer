@@ -62,6 +62,9 @@ pub struct Metrics {
     pub http_requests: Count,
     pub http_request_seconds: Hist,
     pub search_rejected: Count,
+    /// Payload Merkle check per ingested block: `result` = verified | mismatch_legacy |
+    /// mismatch (B8, ruling R-5).
+    pub merkle_blocks: Count,
     /// Freezer work: `op` = freeze | merge.
     pub freezer_runs: Count,
     pub freezer_seconds: Hist,
@@ -193,6 +196,11 @@ impl Metrics {
             "Event text searches rejected (too_short|busy|timeout|cap)",
             Count::default()
         );
+        let merkle_blocks = reg!(
+            "kdx_merkle_blocks",
+            "Payload Merkle check per ingested block (result verified|mismatch_legacy|mismatch)",
+            Count::default()
+        );
         let freezer_runs = reg!(
             "kdx_freezer_runs",
             "Freezer operations (op freeze|merge)",
@@ -238,6 +246,7 @@ impl Metrics {
             http_requests,
             http_request_seconds,
             search_rejected,
+            merkle_blocks,
             freezer_runs,
             freezer_seconds,
             read_view_seconds,
@@ -294,6 +303,12 @@ impl Metrics {
         self.read_view_seconds
             .get_or_create(&vec![("phase", phase.into())])
             .observe(secs);
+    }
+
+    pub fn merkle(&self, result: &'static str) {
+        self.merkle_blocks
+            .get_or_create(&vec![("result", result.into())])
+            .inc();
     }
 
     pub fn search_rejected(&self, reason: &'static str) {

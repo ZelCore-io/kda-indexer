@@ -16,6 +16,6 @@ pub mod writer;
 pub use check::{check, CheckReport};
 pub use manifest::{Manifest, RangeEntry, RangeKind};
 pub use phf::{Index, IndexKind, KeyIndex, PtrHashIndex, SortedIndex};
-pub use postings::PostingIter;
+pub use postings::{ListMemo, PostingIter, RoaringView};
 pub use reader::{RangeReader, Segments};
 pub use writer::{RangeInfo, RangeWriter, WriteOpts, SLOT_WIDTH};

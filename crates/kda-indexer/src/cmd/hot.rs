@@ -41,15 +41,7 @@ pub fn stats(cfg: &Config, data_dir: &Path, digest: bool) -> anyhow::Result<()> 
     let txn = hs.ro()?;
     println!("meta");
     for (k, v) in txn.scan(Table::Meta, &[], |_| true)? {
-        let name = String::from_utf8_lossy(&k);
-        let shown = match (name.as_ref(), v.len()) {
-            (meta::FORMAT_VERSION | meta::NEXT_TXNUM, 8) => {
-                u64::from_be_bytes(v.as_slice().try_into()?).to_string()
-            }
-            (meta::FROZEN_FRONTIER, 4) => u32::from_be_bytes(v.as_slice().try_into()?).to_string(),
-            _ => String::from_utf8_lossy(&v).into_owned(),
-        };
-        println!("  {name:<16} {shown}");
+        println!("{}", meta_line(&k, &v));
     }
     println!("tables");
     for t in Table::all() {
@@ -79,12 +71,93 @@ pub fn stats(cfg: &Config, data_dir: &Path, digest: bool) -> anyhow::Result<()> 
         .collect();
     println!("dict sizes         {}", sizes.join(", "));
     let counters = txn.scan(Table::Counters, &[], |_| true)?;
-    if counters.is_empty() {
-        println!("counters           (none)");
-    }
-    for (k, v) in counters {
-        let n = v.as_slice().try_into().map(u64::from_be_bytes).unwrap_or(0);
-        println!("  counter {:<10} {n}", String::from_utf8_lossy(&k));
+    for line in counter_lines(&counters) {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// One `Meta` row. Known keys print as numbers; `dict_lens@<frontier>` as its five sizes;
+/// anything else as text when printable, else hex. Never raw bytes: a NUL in the output makes
+/// `grep` and friends treat the whole listing as binary and hide the counters below it.
+fn meta_line(k: &[u8], v: &[u8]) -> String {
+    let name = String::from_utf8_lossy(k);
+    let shown = match (name.as_ref(), v.len()) {
+        (meta::FORMAT_VERSION | meta::NEXT_TXNUM, 8) => {
+            u64::from_be_bytes(v.try_into().unwrap_or_default()).to_string()
+        }
+        (meta::FROZEN_FRONTIER, 4) => {
+            u32::from_be_bytes(v.try_into().unwrap_or_default()).to_string()
+        }
+        (n, _) if n.starts_with("dict_lens@") => match kdx_hot::dict::decode_lens(v) {
+            Ok(l) => l.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+            Err(_) => hex(v),
+        },
+        _ => match std::str::from_utf8(v) {
+            Ok(t) if t.chars().all(|c| !c.is_control()) => t.to_owned(),
+            _ => hex(v),
+        },
+    };
+    format!("  {name:<16} {shown}")
+}
+
+fn hex(v: &[u8]) -> String {
+    format!(
+        "0x{}",
+        v.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+
+/// The `Counters` table, one `counter <name> <value>` line per row (values are u64 BE).
+fn counter_lines(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["counters           (none)".to_owned()];
+    }
+    rows.iter()
+        .map(|(k, v)| {
+            let n = <[u8; 8]>::try_from(v.as_slice())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+            format!("  counter {:<24} {n}", String::from_utf8_lossy(k))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{counter_lines, meta_line};
+
+    #[test]
+    fn counters_print_values() {
+        let rows = vec![
+            (b"halted.3".to_vec(), 1u64.to_be_bytes().to_vec()),
+            (b"halted.3.merkle".to_vec(), 1u64.to_be_bytes().to_vec()),
+            (b"user_txs".to_vec(), 986u64.to_be_bytes().to_vec()),
+        ];
+        let out = counter_lines(&rows);
+        assert_eq!(out.len(), 3);
+        assert!(
+            out[0].contains("halted.3") && out[0].ends_with(" 1"),
+            "{out:?}"
+        );
+        assert!(
+            out[1].contains("halted.3.merkle") && out[1].ends_with(" 1"),
+            "{out:?}"
+        );
+        assert!(out[2].ends_with(" 986"), "{out:?}");
+        assert_eq!(counter_lines(&[]), ["counters           (none)"]);
+    }
+
+    #[test]
+    fn meta_lines_are_text() {
+        let mut lens = Vec::new();
+        for n in [0u32, 7, 1, 2, 3] {
+            lens.extend(n.to_be_bytes());
+        }
+        let line = meta_line(b"dict_lens@100", &lens);
+        assert!(line.ends_with("0,7,1,2,3"), "{line}");
+        let line = meta_line(b"odd", &[0, 1, 255]);
+        assert!(line.ends_with("0x0001ff"), "{line}");
+        assert!(meta_line(b"format_version", &2u64.to_be_bytes()).ends_with(" 2"));
+    }
 }
