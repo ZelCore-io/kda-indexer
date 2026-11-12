@@ -60,37 +60,59 @@ pub fn user_tx_count(view: &View) -> ApiResult<u64> {
     Ok(frozen + hot)
 }
 
-static CACHE: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
-/// Held while one request counts: concurrent misses do not each walk the window.
-static COUNTING: Mutex<()> = Mutex::new(());
-
-fn cache_get(fresh_only: bool) -> Option<u64> {
-    let c = (*CACHE.lock().unwrap_or_else(|e| e.into_inner()))?;
-    (!fresh_only || c.0.elapsed() < CACHE_FOR).then_some(c.1)
+/// The last counted answer and the single-flight guard of a recount.
+struct CountCache {
+    last: Mutex<Option<(Instant, u64)>>,
+    /// Held while one request counts: concurrent misses do not each walk the window.
+    counting: Mutex<()>,
 }
 
-/// `user_tx_count`, reused for `CACHE_FOR`. Single-flight: on a miss one request counts;
-/// the others answer the previous value, or wait for the count when there is none yet.
-fn cached_count(view: &View) -> ApiResult<u64> {
-    if let Some(n) = cache_get(true) {
-        return Ok(n);
-    }
-    let _g = match COUNTING.try_lock() {
-        Ok(g) => g,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            if let Some(n) = cache_get(false) {
-                return Ok(n);
-            }
-            COUNTING.lock().unwrap_or_else(|e| e.into_inner())
+static CACHE: CountCache = CountCache::new();
+
+impl CountCache {
+    const fn new() -> CountCache {
+        CountCache {
+            last: Mutex::new(None),
+            counting: Mutex::new(()),
         }
-    };
-    if let Some(n) = cache_get(true) {
-        return Ok(n);
     }
-    let n = user_tx_count(view)?;
-    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), n));
-    Ok(n)
+
+    fn get(&self, fresh_only: bool) -> Option<u64> {
+        let c = (*self.last.lock().unwrap_or_else(|e| e.into_inner()))?;
+        (!fresh_only || c.0.elapsed() < CACHE_FOR).then_some(c.1)
+    }
+
+    /// `user_tx_count`, reused for `CACHE_FOR`. Single-flight: on a miss one request
+    /// counts; the others answer the previous value, or wait for the count when there is
+    /// none yet. A recount that misses the request deadline (cold pages: 5E saw a walk of
+    /// the hot window pass 5 s) answers the last counted value, however old; only with no
+    /// value yet is it a 504. chainweb-data's own count is an estimate.
+    fn count(&self, view: &View) -> ApiResult<u64> {
+        if let Some(n) = self.get(true) {
+            return Ok(n);
+        }
+        let _g = match self.counting.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if let Some(n) = self.get(false) {
+                    return Ok(n);
+                }
+                self.counting.lock().unwrap_or_else(|e| e.into_inner())
+            }
+        };
+        if let Some(n) = self.get(true) {
+            return Ok(n);
+        }
+        match user_tx_count(view) {
+            Ok(n) => {
+                *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), n));
+                Ok(n)
+            }
+            Err(crate::ApiError::Deadline) => self.get(false).ok_or(crate::ApiError::Deadline),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Network whose supply tables `crate::supply` holds.
@@ -104,7 +126,7 @@ pub fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
     };
     let coins = (view.genesis.network == SUPPLY_NETWORK)
         .then(|| crate::supply::circulating(u64::from(h), SystemTime::now()));
-    Ok(Some((cached_count(view)?, coins)))
+    Ok(Some((CACHE.count(view)?, coins)))
 }
 
 pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
@@ -132,6 +154,37 @@ pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// 5E: a recount that misses the deadline answers the last counted value (any age);
+    /// with no value yet it stays a deadline error.
+    #[test]
+    fn a_late_recount_answers_the_last_counted_value() {
+        let (_d, store) = crate::testutil::store();
+        let c = CountCache::new();
+        let late = || store.view(Instant::now() - Duration::from_secs(1)).unwrap();
+        assert!(matches!(c.count(&late()), Err(crate::ApiError::Deadline)));
+        // An in-time count is stored and reused.
+        let n = c
+            .count(
+                &store
+                    .view(Instant::now() + Duration::from_secs(60))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(c.get(true), Some(n));
+        assert_eq!(c.count(&late()).unwrap(), n);
+        // A value older than CACHE_FOR (marked so it cannot be a fresh count): the next call
+        // recounts, misses the deadline and answers it.
+        *c.last.lock().unwrap() = Some((Instant::now() - CACHE_FOR * 4, n + 4242));
+        assert_eq!(c.get(true), None);
+        assert_eq!(c.count(&late()).unwrap(), n + 4242);
+        // An in-time recount replaces it.
+        let fresh = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        *c.last.lock().unwrap() = Some((Instant::now() - CACHE_FOR * 4, n + 4242));
+        assert_eq!(c.count(&fresh).unwrap(), n);
+    }
 
     #[test]
     fn count_checks_the_deadline() {
