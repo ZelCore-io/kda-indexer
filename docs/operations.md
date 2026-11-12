@@ -428,3 +428,7 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 Before a backfill, a merge of many ranges, a rebuild or a replica copy on a host with shared
 storage, check the free space of the volume and, on Ceph-backed volumes, `ceph osd df`: do
 not start if any OSD of the pool is above 75%.
+
+## Fuzzing
+
+`fuzz/` holds cargo-fuzz targets for everything that parses bytes it does not control: `payload_decode` (node payload and output JSON), `record_decode`, `value_decode`, `postings_list`, `ef_keys`, `phf_open`, `manifest_parse` (`manifest.json`, `range.toml`, the search `manifest.json`), `api_tokens` (cursors and Relay ids), `like_match`, `xff_parse` and `graphql_request` (a POST body against an empty store). The crate has its own workspace and a nightly toolchain, so the default build does not see it. Build with `cd fuzz && cargo +nightly fuzz build`; `cargo run --bin gen_seeds -- DIR` writes seed corpora to `DIR/<target>/` from our own writers (nothing is fetched); then run `cargo +nightly fuzz run TARGET DIR/TARGET -- -max_len=4096 -timeout=2`. Corpora and artifacts stay out of the repository. A minimised crash input becomes a regression test in the crate it hit.

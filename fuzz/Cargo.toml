@@ -1,0 +1,105 @@
+[package]
+name = "kdx-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+axum = "0.8"
+tempfile = "3"
+base64 = "0.22"
+tokio = { version = "1", features = ["rt", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+kdx-types = { path = "../crates/kdx-types" }
+kdx-decode = { path = "../crates/kdx-decode" }
+kdx-segment = { path = "../crates/kdx-segment" }
+kdx-search = { path = "../crates/kdx-search" }
+kdx-api = { path = "../crates/kdx-api" }
+kdx-hot = { path = "../crates/kdx-hot" }
+kdx-graphql = { path = "../crates/kdx-graphql" }
+
+# Its own workspace: the fuzz crate is not a member of the main one.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gen_seeds"
+path = "seed_gen/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "payload_decode"
+path = "fuzz_targets/payload_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "record_decode"
+path = "fuzz_targets/record_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "value_decode"
+path = "fuzz_targets/value_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "postings_list"
+path = "fuzz_targets/postings_list.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ef_keys"
+path = "fuzz_targets/ef_keys.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "phf_open"
+path = "fuzz_targets/phf_open.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "manifest_parse"
+path = "fuzz_targets/manifest_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "api_tokens"
+path = "fuzz_targets/api_tokens.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "like_match"
+path = "fuzz_targets/like_match.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xff_parse"
+path = "fuzz_targets/xff_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "graphql_request"
+path = "fuzz_targets/graphql_request.rs"
+test = false
+doc = false

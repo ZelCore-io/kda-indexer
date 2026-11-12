@@ -57,6 +57,9 @@ proptest-regressions/
 
 # --- Build output ---------------------------------------------------------
 /target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
 /build/
 /dist/
 *.deb
