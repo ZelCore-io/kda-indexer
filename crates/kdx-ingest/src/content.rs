@@ -3,6 +3,8 @@
 //!
 //! - `records`: [`kdx_segment::content::ContentDigest`] over `Headers` + `TailTxs`, blocks
 //!   in (height, chain) order, txs in index order.
+//! - `TailTxsOrphans` (only when there are any): `TailTxs` rows whose block has no `Headers`
+//!   row, as (TxKey, request key) pairs in key order. A sound store has none (m11).
 //! - `TailPostings`: (family, resolved entity name, TxKey), sorted.
 //! - `Dict<Kind>`: the sorted set of names (ids not used).
 //! - every other non-additive table except `Meta`: blake3 over its (key, value) rows, as
@@ -81,6 +83,24 @@ pub fn hot_digest(txn: &impl Txn) -> Result<Digest> {
     }
     let c = d.finish();
     out.insert("records".into(), (c.blocks + c.txs, c.blake3));
+    // Rows left in `txs` have no header: an undo that removed `Headers` but not `TailTxs`.
+    // Name-free (TxKey, request key), so equal orphans digest equal across stores.
+    if !txs.is_empty() {
+        let rows: Vec<([u8; 8], Vec<u8>)> = txs
+            .into_values()
+            .flatten()
+            .map(|t| {
+                let rk = t.request_key.map(|h| h.0.to_vec()).unwrap_or_default();
+                (t.key.to_be_bytes(), rk)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .collect();
+        out.insert(
+            "TailTxsOrphans".into(),
+            rows_digest(rows.iter().map(|(k, v)| (&k[..], v.as_slice()))),
+        );
+    }
 
     let mut posts: Vec<(u8, String, Vec<u8>)> = Vec::new();
     for (k, _) in txn.scan(Table::TailPostings, &[], |_| true)? {

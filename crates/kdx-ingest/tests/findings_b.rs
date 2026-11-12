@@ -33,3 +33,34 @@ fn resume_recovers_the_spools_of_listed_ranges_only() {
     assert!(!c.etl.join("merkle-000000002.jsonl").exists());
     assert!(!c.etl.join("merkle-000000900.jsonl").exists());
 }
+
+#[test]
+fn hot_digest_sees_tail_txs_rows_without_a_header() {
+    // m11: `hot_digest` ignored `TailTxs` rows whose block has no `Headers` row (an undo that
+    // removed the header but not the txs), so `hot stats --digest` could not see them.
+    use kdx_hot::Txn;
+    let pool = pool();
+    let ids: Vec<usize> = (0..pool.len()).collect();
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path(), 100, 1000, 100);
+    apply_linear(&c, &pool, &branch(&ids[..6], 0, 0, 0), 3);
+    let before = kdx_ingest::content::hot_digest(&c.hot.ro().unwrap()).unwrap();
+    assert!(!before.contains_key("TailTxsOrphans"), "{before:?}");
+    {
+        let mut txn = c.hot.rw().unwrap();
+        let (_, v) = txn
+            .scan(kdx_hot::Table::TailTxs, &[], |_| true)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("a tail tx");
+        let orphan = kdx_types::TxKey::new(9_000, 0, 1);
+        txn.put(kdx_hot::Table::TailTxs, &orphan.to_be_bytes(), &v)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let after = kdx_ingest::content::hot_digest(&c.hot.ro().unwrap()).unwrap();
+    assert_ne!(before, after);
+    assert_eq!(after["TailTxsOrphans"].0, 1, "{after:?}");
+    assert_eq!(after["records"], before["records"]);
+}
