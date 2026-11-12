@@ -6,7 +6,8 @@
 //!   its stream ends. A feed gap on a subscribed chain is one `INTERNAL` error; the stream
 //!   stays open.
 //! - `…FromDepth` and `events(minimumDepth)` release a block once its chain's tip is at least
-//!   `minimumDepth` above it, from the feed's recent canonical blocks (else one store read).
+//!   `minimumDepth` above it, from the feed's recent canonical blocks once the store confirms
+//!   each is still canonical (one store read per release).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,6 +48,8 @@ struct Sub {
     rx: Receiver<FeedItem>,
     _slot: SubSlot,
     done: bool,
+    /// A gap met inside a batch: reported on the next call, after the blocks before it.
+    pending_gap: Option<u8>,
 }
 
 fn gap_error(chain: u8) -> async_graphql::Error {
@@ -73,6 +76,9 @@ async fn next_batch(sub: &mut Sub, chains: &[u8]) -> Option<Result<Vec<Arc<FeedB
     if sub.done {
         return None;
     }
+    if let Some(c) = sub.pending_gap.take() {
+        return Some(Err(gap_error(c)));
+    }
     loop {
         match sub.rx.recv().await {
             Ok(FeedItem::Block(b)) if chains.contains(&b.chain) => {
@@ -81,8 +87,9 @@ async fn next_batch(sub: &mut Sub, chains: &[u8]) -> Option<Result<Vec<Arc<FeedB
                     match sub.rx.try_recv() {
                         Ok(FeedItem::Block(b)) if chains.contains(&b.chain) => out.push(b),
                         Ok(FeedItem::Gap(c)) if chains.contains(&c) => {
-                            // Deliver what we have; the gap is reported on the next call.
-                            sub.rx = sub.rx.resubscribe();
+                            // Deliver what we have; the gap is reported on the next call,
+                            // and the items queued behind it follow (I-4).
+                            sub.pending_gap = Some(c);
                             return Some(Ok(out));
                         }
                         Ok(_) => {}
@@ -120,8 +127,7 @@ impl DepthGate {
         state: &Arc<ApiState>,
     ) -> Result<(Vec<Arc<FeedBlock>>, Option<u8>)> {
         let tips = feed.tips();
-        let mut out = Vec::new();
-        let mut missing = Vec::new();
+        let mut picked = Vec::new();
         let mut gap = None;
         for &c in &self.chains {
             let Some(&tip) = tips.get(&c) else { continue };
@@ -137,21 +143,32 @@ impl DepthGate {
                 gap = Some(c);
             }
             for h in next..=hi {
-                match feed.recent(c, h) {
-                    Some(b) => out.push(b),
-                    None => missing.push((c, h)),
-                }
+                picked.push(((c, h), feed.recent(c, h)));
             }
             self.next
                 .insert(c, if gap == Some(c) { target + 1 } else { hi + 1 });
         }
-        if !missing.is_empty() {
-            let more = state
-                .read(move |view| load_blocks(view, &missing))
-                .await
-                .map_err(from_api)?;
-            out.extend(more);
+        if picked.is_empty() {
+            return Ok((Vec::new(), gap));
         }
+        // A cached block is released only while the store still holds it at its height: a
+        // reorg replaces it with the stored block (I-5).
+        let mut out = state
+            .read(move |view| {
+                let mut out = Vec::with_capacity(picked.len());
+                let mut missing = Vec::new();
+                for ((c, h), b) in picked {
+                    let Ok(h32) = u32::try_from(h) else { continue };
+                    match b {
+                        Some(b) if view.block_hash(c, h32)? == Some(b.hash) => out.push(b),
+                        _ => missing.push((c, h)),
+                    }
+                }
+                out.extend(load_blocks(view, &missing)?);
+                Ok(out)
+            })
+            .await
+            .map_err(from_api)?;
         out.sort_by_key(|b| (b.height, b.chain));
         Ok((out, gap))
     }
@@ -170,6 +187,7 @@ fn feed_stream(
         rx: feed.subscribe(),
         _slot: slot,
         done: false,
+        pending_gap: None,
     };
     match depth.filter(|d| *d > 0) {
         None => Ok(
@@ -433,5 +451,32 @@ impl Subscription {
             }
         });
         Ok(s.boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{self, feed_block, hash};
+
+    /// I-5: the depth gate releases the stored block when the cached one was reorged away.
+    #[tokio::test]
+    async fn depth_gate_rechecks_the_store() {
+        let f = testutil::store();
+        f.apply(5, 0, 0);
+        f.apply(5, 1, 1);
+        f.apply(5, 2, 1);
+        // The feed still caches the orphaned block of fork 0 at height 1, with tip 2.
+        let feed = BlockFeed::detached();
+        feed.inject(FeedItem::Block(feed_block(5, 1, 0)));
+        feed.inject(FeedItem::Block(feed_block(5, 2, 1)));
+        let mut gate = DepthGate {
+            depth: 1,
+            chains: vec![5],
+            next: HashMap::from([(5, 1)]),
+        };
+        let (out, gap) = gate.release(&feed, &f.st).await.unwrap();
+        let got: Vec<_> = out.iter().map(|b| (b.height, b.hash)).collect();
+        assert_eq!((got, gap), (vec![(1, hash(5, 1, 1))], None));
     }
 }

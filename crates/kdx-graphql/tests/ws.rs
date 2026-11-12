@@ -295,3 +295,36 @@ async fn message_cap_and_rate_tokens() {
     }
     assert_eq!(closed, Some(4429));
 }
+
+/// I-4: a gap inside a batch is reported after the blocks before it, and the blocks queued
+/// behind it still arrive.
+#[tokio::test]
+async fn gap_inside_a_batch_loses_nothing() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    s.feed.inject(block(0, 1));
+    s.feed.inject(FeedItem::Gap(0));
+    s.feed.inject(block(1, 2));
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let m = recv(&mut a).await.unwrap();
+        assert_eq!(m["type"], "next", "{m}");
+        let p = &m["payload"];
+        got.push(match p["data"]["newBlocks"].as_array() {
+            Some(bs) => bs
+                .iter()
+                .map(|b| format!("{}/{}", b["chainId"], b["height"]))
+                .collect::<Vec<_>>()
+                .join(","),
+            None => p["errors"][0]["extensions"]["code"].to_string(),
+        });
+    }
+    assert_eq!(got, ["0/1", "\"INTERNAL\"", "1/2"]);
+}

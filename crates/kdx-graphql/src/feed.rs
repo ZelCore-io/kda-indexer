@@ -11,7 +11,9 @@
 //! - More than [`MAX_PER_TICK`] new blocks on a chain in one tick (a catch-up after a pause),
 //!   or a fork deeper than the ring, is a gap: one [`FeedItem::Gap`] and the feed resumes
 //!   from the new tip.
-//! - The last [`RECENT`] heights per chain stay in memory for `…FromDepth` releases.
+//! - The last [`RECENT`] heights per chain stay in memory for `…FromDepth` releases. A tick
+//!   reads every moved chain before it caches, publishes tips or sends anything, and drops
+//!   the cached heights a rollback, reorg or gap made stale.
 //! - The polling task ends when the last handle drops.
 
 use std::collections::{BTreeMap, HashMap};
@@ -129,6 +131,13 @@ impl BlockFeed {
         let _ = self.inner.tx.send(item);
     }
 
+    /// Drop the cached blocks of `chain` above `height` (all of them with `None`): they are
+    /// no longer canonical after a rollback, a reorg or a gap.
+    fn forget_above(&self, chain: u8, height: Option<u64>) {
+        let mut r = self.inner.recent.lock().unwrap_or_else(|e| e.into_inner());
+        r.retain(|k, _| k.0 != chain || height.is_some_and(|h| k.1 <= h));
+    }
+
     fn remember(&self, b: Arc<FeedBlock>) {
         let mut r = self.inner.recent.lock().unwrap_or_else(|e| e.into_inner());
         let (c, h) = (b.chain, b.height);
@@ -213,15 +222,13 @@ async fn step(
     newest_ct: &mut u64,
 ) -> ApiResult<()> {
     let tips = state.read_status(|v| v.chain_tips()).await?;
-    {
-        let mut t = feed.inner.tips.lock().unwrap_or_else(|e| e.into_inner());
-        for (c, h, _) in &tips {
-            t.insert(*c, u64::from(*h));
-        }
-    }
-    for (c, h, hash) in tips {
+    // Read every moved chain first. Nothing is cached, published or sent until all reads
+    // are done, so a subscriber woken by one chain's block never sees another chain's new
+    // tip while its reorged heights still hold the orphaned blocks (I-5).
+    let mut moved = Vec::new();
+    for &(c, h, hash) in &tips {
         let h = u64::from(h);
-        let Some(ring) = sent.get(&c).cloned() else {
+        let Some(ring) = sent.get(&c) else {
             // First sight: start from the current tip, send nothing.
             sent.insert(c, vec![(h, hash)]);
             continue;
@@ -258,20 +265,28 @@ async fn step(
                 })
             })
             .await?;
-        let last_sent = ring.last().map_or(0, |x| x.0);
+        moved.push((c, h, hash, step));
+    }
+    // No await from here on: cache the replacements, then publish the tips, then send.
+    let mut items = Vec::new();
+    for (c, h, hash, step) in moved {
         let entry = sent.entry(c).or_default();
+        let last_sent = entry.last().map_or(0, |x| x.0);
         match step {
             Step::Gap => {
-                let _ = feed.inner.tx.send(FeedItem::Gap(c));
+                feed.forget_above(c, None);
+                items.push(FeedItem::Gap(c));
                 *entry = vec![(h, hash)];
             }
             Step::Back { from } => {
+                feed.forget_above(c, Some(from));
                 entry.retain(|x| x.0 <= from);
                 if entry.last().map(|x| x.0) != Some(h) {
                     entry.push((h, hash));
                 }
             }
             Step::Blocks { from, blocks } => {
+                feed.forget_above(c, Some(from));
                 entry.retain(|x| x.0 <= from);
                 for b in blocks {
                     let b = Arc::new(FeedBlock {
@@ -285,7 +300,7 @@ async fn step(
                     *newest_ct = (*newest_ct).max(b.block.creation_time);
                     entry.push((b.height, b.hash));
                     feed.remember(b.clone());
-                    let _ = feed.inner.tx.send(FeedItem::Block(b));
+                    items.push(FeedItem::Block(b));
                 }
                 if entry.len() > RING {
                     let cut = entry.len() - RING;
@@ -294,5 +309,56 @@ async fn step(
             }
         }
     }
+    {
+        let mut t = feed.inner.tips.lock().unwrap_or_else(|e| e.into_inner());
+        for (c, h, _) in &tips {
+            t.insert(*c, u64::from(*h));
+        }
+    }
+    for item in items {
+        let _ = feed.inner.tx.send(item);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{self, hash};
+
+    /// I-5: a subscriber woken by one chain's new block never sees another chain's new tip
+    /// while that chain's reorged height still holds the orphaned block.
+    #[tokio::test]
+    async fn tips_move_only_after_the_replacements_are_cached() {
+        let f = testutil::store();
+        for c in [2u8, 5] {
+            f.apply(c, 0, 0);
+        }
+        let feed = BlockFeed::detached();
+        let (mut sent, mut ct) = (Sent::new(), 0);
+        step(&f.st, &feed, &mut sent, &mut ct).await.unwrap();
+        f.apply(5, 1, 0);
+        step(&f.st, &feed, &mut sent, &mut ct).await.unwrap();
+        assert_eq!(feed.recent(5, 1).map(|b| b.hash), Some(hash(5, 1, 0)));
+        // One tick: chain 5 replaces height 1 and grows to 2; chain 2 gains a block.
+        f.unwind(5, 0);
+        f.apply(5, 1, 1);
+        f.apply(5, 2, 1);
+        f.apply(2, 1, 0);
+        let mut rx = feed.subscribe();
+        let obs = feed.clone();
+        let seen = tokio::spawn(async move {
+            loop {
+                if let Ok(FeedItem::Block(b)) = rx.recv().await {
+                    if b.chain == 2 {
+                        let tip = obs.tips()[&5];
+                        return (tip, obs.recent(5, 1).map(|b| b.hash));
+                    }
+                }
+            }
+        });
+        step(&f.st, &feed, &mut sent, &mut ct).await.unwrap();
+        let (tip, at1) = seen.await.unwrap();
+        assert_eq!((tip, at1), (2, Some(hash(5, 1, 1))));
+    }
 }
