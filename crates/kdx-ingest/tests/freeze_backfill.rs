@@ -244,6 +244,8 @@ type Blocks = Vec<(
     kdx_types::record::BlockRecord,
     Vec<kdx_types::record::TxRecord>,
 )>;
+/// One content change applied to block `i` (tx `j`).
+type Change = fn(&mut Blocks, usize, usize);
 
 /// Every block of `c`'s frozen entries with its txs, as the reader returns them.
 fn frozen_blocks(c: &kdx_ingest::Ctx) -> Blocks {
@@ -296,7 +298,7 @@ async fn content_digest_differs_on_every_content_change() {
                 .map(|j| (i, j))
         })
         .expect("fixture: a tx with a transfer");
-    let changes: [(&str, fn(&mut Blocks, usize, usize)); 6] = [
+    let changes: [(&str, Change); 6] = [
         ("header nonce", |bs, i, _| bs[i].0.nonce ^= 1),
         ("output gas", |bs, i, j| bs[i].1[j].gas += 1),
         ("transfer index", |bs, i, j| bs[i].1[j].transfers[0] ^= 1),
