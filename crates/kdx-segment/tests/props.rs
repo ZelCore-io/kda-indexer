@@ -205,11 +205,12 @@ props! {
         }
         w.finish().unwrap();
         let mut b = std::fs::read(&p).unwrap();
-        // Flip inside the delta/Roaring lists or the entity column. The Elias-Fano offsets and the
-        // trailer are left alone: sucds aborts on a flipped length (finding, see below).
+        // Flip inside the entity column only. The lists, the Elias-Fano offsets and the trailer
+        // are left alone: a flipped list encoding byte or length reaches sucds, which panics or
+        // aborts on garbage (finding, see below).
         let n = u64::from_le_bytes(b[b.len() - 24..b.len() - 16].try_into().unwrap()) as usize;
         let lists_len = u64::from_le_bytes(b[b.len() - 16..b.len() - 8].try_into().unwrap()) as usize;
-        let i = 14 + at.index(lists_len + 8 * n);
+        let i = 14 + lists_len + at.index(8 * n);
         b[i] ^= x;
         std::fs::write(&p, &b).unwrap();
         if let Ok(pf) = Postings::open(&p, 0) {
@@ -719,6 +720,10 @@ fn finding_sucds_stored_length_aborts_instead_of_erroring() {
             b[at..at + 8].copy_from_slice(&(1u64 << 60).to_le_bytes());
             std::fs::write(&p, &b).unwrap();
             let _ = Keys::open(&p);
+        }
+        // The same class in a posting list: encoding byte 1 (Elias-Fano) over garbage.
+        for b in 0..=255u8 {
+            let _ = decode_list(&[1, b, b, b, b, b, b, b, b, b, 1, 2, 3, 4, 5, 6, 7, 8]);
         }
         return;
     }

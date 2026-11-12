@@ -24,3 +24,4 @@ url.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+regex = "1"

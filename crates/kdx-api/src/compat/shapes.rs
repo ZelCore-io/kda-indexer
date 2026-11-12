@@ -897,4 +897,39 @@ mod tests {
             r#"{"a":null,"b":[1.0,"x\"\u0001"]}"#
         );
     }
+
+    /// F1 (finding fixture): a command whose `meta.gasLimit` is absent or `null` renders
+    /// `gasLimit: null`, not 0; present values render as integers in every Pact spelling.
+    #[test]
+    fn f1_gas_limit_null_and_spellings() {
+        assert_eq!(int_of(None), Value::Null);
+        assert_eq!(int_of(Some(&json!(null))), Value::Null);
+        assert_eq!(int_of(Some(&json!(150000))), json!(150000));
+        assert_eq!(int_of(Some(&json!("150000"))), json!(150000));
+        assert_eq!(int_of(Some(&json!({"int": 150000}))), json!(150000));
+        assert_eq!(int_of(Some(&json!(true))), Value::Null);
+    }
+
+    /// F3 (finding fixture): `meta.gasPrice` as the node serves it (a JSON number, a numeric
+    /// string or `{"decimal": ..}`) renders as aeson prints the double.
+    #[test]
+    fn f3_gas_price_meta_number_forms() {
+        let render = |v: Value| -> Option<String> {
+            let f = parsed_decimal_text(&v)?.parse::<f64>().ok()?;
+            let mut b = Vec::new();
+            write_aeson(&aeson_double(f), &mut b);
+            Some(String::from_utf8(b).unwrap())
+        };
+        let node: Value = serde_json::from_str(
+            r#"{"a":1e-8,"b":"0.00000001","c":{"decimal":"1.0e-8"},"d":0.1,"e":1,"f":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(render(node["a"].clone()).as_deref(), Some("1.0e-8"));
+        assert_eq!(render(node["b"].clone()).as_deref(), Some("1.0e-8"));
+        assert_eq!(render(node["c"].clone()).as_deref(), Some("1.0e-8"));
+        assert_eq!(render(node["d"].clone()).as_deref(), Some("0.1"));
+        // aeson prints an integral double without a fraction.
+        assert_eq!(render(node["e"].clone()).as_deref(), Some("1"));
+        assert_eq!(render(node["f"].clone()), None);
+    }
 }
