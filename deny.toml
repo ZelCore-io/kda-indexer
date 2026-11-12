@@ -1,0 +1,58 @@
+# cargo-deny config (P9 security review). Run `cargo deny fetch` then `cargo deny check`
+# before a release and in each security review.
+
+[graph]
+# Production is Linux x86_64 (the .deb); the Mac is the dev host.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+all-features = false
+no-default-features = false
+
+[advisories]
+# Fetched locally before each check (`cargo deny fetch`); CI-less project, so the
+# check runs before a release and in each security review.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+    # Add only with a dated reason and an owner ruling, for example:
+    # { id = "RUSTSEC-YYYY-NNNN", reason = "not reachable: <why>; ruling R-…" },
+]
+
+[licenses]
+# Global Constraints: MIT/Apache/BSD/zlib/ISC/BSL-1.0/Unicode/CDLA-Permissive-2.0,
+# or dual-licensed with one of these.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+# Our own crates are publish = false; their licence is still checked.
+private = { ignore = false }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# async-graphql must stay without playground/graphiql/apollo features (Global Constraints):
+[[bans.features]]
+crate = "async-graphql"
+deny = ["playground", "graphiql", "apollo_tracing", "apollo_persisted_queries"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# reth is pinned by full rev in Cargo.toml (libmdbx bindings only).
+allow-git = ["https://github.com/paradigmxyz/reth"]
