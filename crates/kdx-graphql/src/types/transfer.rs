@@ -87,9 +87,10 @@ impl Transfer {
         if self.nft {
             let t = self.t();
             return Decimal::new(&t.amount)
-                .unwrap_or_else(|| Decimal::new("0").expect("0 is a decimal"));
+                .unwrap_or_else(|| Decimal::new("0").expect("0 is a decimal"))
+                .into_text();
         }
-        amount(&self.d, self.t())
+        amount(&self.d, self.t()).into_text()
     }
     /// ZelCore extension: the token id of an NFT transfer; `null` for a fungible one.
     async fn token_id(&self) -> Option<String> {
@@ -104,7 +105,7 @@ impl Transfer {
     }
     #[graphql(deprecation = "Use `block.chainId` field instead.")]
     async fn chain_id(&self) -> BigInt {
-        BigInt(i128::from(self.d.key().chain()))
+        BigInt::new(i128::from(self.d.key().chain()))
     }
     async fn creation_time(&self) -> DateTime {
         DateTime(self.d.block.creation_time as i64)
@@ -125,7 +126,7 @@ impl Transfer {
     }
     #[graphql(deprecation = "Use `block.height` field instead.")]
     async fn height(&self) -> BigInt {
-        BigInt(i128::from(self.d.key().height()))
+        BigInt::new(i128::from(self.d.key().height()))
     }
     pub async fn id(&self) -> Result<ID> {
         Ok(ID(encode(&NodeKey::Transfer {
@@ -143,7 +144,7 @@ impl Transfer {
         self.t().token.clone()
     }
     async fn order_index(&self) -> BigInt {
-        BigInt(i128::from(self.ord_idx()))
+        BigInt::new(i128::from(self.ord_idx()))
     }
     async fn receiver_account(&self) -> String {
         self.t().to.clone()

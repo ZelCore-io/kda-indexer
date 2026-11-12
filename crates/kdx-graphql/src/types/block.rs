@@ -49,14 +49,14 @@ pub struct BlockNeighbor {
 #[Object]
 impl Block {
     async fn chain_id(&self) -> BigInt {
-        BigInt(i128::from(self.b.chain))
+        BigInt::new(i128::from(self.b.chain))
     }
     async fn creation_time(&self) -> DateTime {
         DateTime(self.b.creation_time as i64)
     }
     /// (2^256 − 1) / target (chainweb-node's definition).
     async fn difficulty(&self) -> BigInt {
-        BigInt(header::difficulty(&self.b.target).min(i128::MAX as u128) as i128)
+        BigInt::number(header::difficulty(&self.b.target).min(i128::MAX as u128) as i128)
     }
     async fn epoch(&self) -> DateTime {
         DateTime(self.b.epoch_start as i64)
@@ -103,7 +103,7 @@ impl Block {
         self.hash_text()
     }
     async fn height(&self) -> BigInt {
-        BigInt(i128::from(self.b.height))
+        BigInt::new(i128::from(self.b.height))
     }
     pub async fn id(&self) -> Result<ID> {
         Ok(ID(encode(&NodeKey::Block {
@@ -181,7 +181,7 @@ impl Block {
             .collect()
     }
     async fn nonce(&self) -> Decimal {
-        decimal(self.b.nonce)
+        decimal(self.b.nonce).into_text()
     }
     async fn parent(&self, ctx: &Context<'_>) -> Result<Option<Block>> {
         let (p, c) = (self.b.parent, self.b.chain);
@@ -506,7 +506,7 @@ pub async fn last_block_height(ctx: &Context<'_>) -> Result<Option<BigInt>> {
         .read_status(|view| view.max_indexed_height())
         .await
         .map_err(from_api)?;
-    Ok(h.map(|h| BigInt(i128::from(h))))
+    Ok(h.map(|h| BigInt::new(i128::from(h))))
 }
 
 /// A non-negative `Int` argument.

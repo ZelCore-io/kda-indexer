@@ -84,7 +84,7 @@ pub fn variables(v: serde_json::Value) -> Option<Variables> {
 
 fn error_body(status: StatusCode, e: async_graphql::ServerError) -> HttpResponse {
     let r = Response::from_errors(vec![e]);
-    json_response(status, &serde_json::to_vec(&r).unwrap_or_default())
+    json_response(status, &crate::error::wire_json(&r).unwrap_or_default())
 }
 
 fn json_response(status: StatusCode, body: &[u8]) -> HttpResponse {
@@ -253,7 +253,7 @@ async fn execute(
         BatchResponse::Batch(rs) => rs.iter().map(outcome).max().unwrap_or(Outcome::Ok),
     };
     kdx_metrics::get().graphql_request(kind, result.label());
-    match serde_json::to_vec(&resp) {
+    match crate::error::wire_json(&resp) {
         Ok(b) => json_response(StatusCode::OK, &b),
         Err(e) => {
             tracing::error!(error = %e, "graphql: response serialization");

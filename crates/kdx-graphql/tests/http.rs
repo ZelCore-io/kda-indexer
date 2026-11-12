@@ -143,6 +143,8 @@ async fn introspection_and_unserved_fields() {
     )
     .await;
     assert_eq!(v["errors"][0]["extensions"]["code"], "NOT_SUPPORTED", "{v}");
+    // The oracle sends the code top-level: a copy rides along with `extensions.code`.
+    assert_eq!(v["errors"][0]["code"], "NOT_SUPPORTED", "{v}");
     assert_eq!(
         v["data"]["graphConfiguration"]["minimumBlockHeight"], 0,
         "{v}"

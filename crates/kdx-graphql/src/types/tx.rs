@@ -22,7 +22,7 @@ use crate::error::{bad_input, from_api};
 use crate::error::{err, Code};
 use crate::gql;
 use crate::ids::{encode, NodeKey};
-use crate::scalars::{BigInt, DateTime};
+use crate::scalars::{BigInt, DateTime, FloatText};
 use crate::txlist::{
     block_node, chain_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx, Blocks, Item,
     KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
@@ -128,12 +128,12 @@ impl TransactionCommand {
         let m = self.cmd().get("meta");
         let g = |k: &str| m.and_then(|m| m.get(k));
         TransactionMeta {
-            chain_id: BigInt(int_of(g("chainId"))),
+            chain_id: BigInt::new(int_of(g("chainId"))),
             creation_time: DateTime((float_of(g("creationTime")) * 1e6) as i64),
-            gas_limit: BigInt(int_of(g("gasLimit"))),
-            gas_price: float_of(g("gasPrice")),
+            gas_limit: BigInt::text(int_of(g("gasLimit"))),
+            gas_price: FloatText(format!("{}", float_of(g("gasPrice")))),
             sender: str_of(g("sender")),
-            ttl: BigInt(int_of(g("ttl"))),
+            ttl: BigInt::text(int_of(g("ttl"))),
         }
     }
     async fn network_id(&self) -> String {
@@ -182,7 +182,7 @@ pub struct TransactionMeta {
     pub chain_id: BigInt,
     pub creation_time: DateTime,
     pub gas_limit: BigInt,
-    pub gas_price: f64,
+    pub gas_price: FloatText,
     pub sender: String,
     pub ttl: BigInt,
 }
@@ -241,7 +241,7 @@ impl TransactionResult {
             .map(json_text)
     }
     async fn event_count(&self) -> Option<BigInt> {
-        Some(BigInt(self.d.evs.len() as i128))
+        Some(BigInt::new(self.d.evs.len() as i128))
     }
     async fn events(
         &self,
@@ -269,7 +269,7 @@ impl TransactionResult {
         })
     }
     async fn gas(&self) -> BigInt {
-        BigInt(int_of(self.d.out.get("gas")))
+        BigInt::text(int_of(self.d.out.get("gas")))
     }
     async fn good_result(&self) -> Option<String> {
         self.ok()
@@ -277,7 +277,7 @@ impl TransactionResult {
     }
     #[graphql(deprecation = "Use `block.height` instead.")]
     async fn height(&self) -> BigInt {
-        BigInt(i128::from(self.d.key().height()))
+        BigInt::new(i128::from(self.d.key().height()))
     }
     async fn logs(&self) -> Option<String> {
         self.d
@@ -295,7 +295,7 @@ impl TransactionResult {
             .out
             .get("txId")
             .filter(|v| !v.is_null())
-            .map(|v| BigInt(int_of(Some(v))))
+            .map(|v| BigInt::text(int_of(Some(v))))
     }
     async fn transfers(
         &self,
@@ -758,10 +758,10 @@ impl TransactionSummary {
         self.d.rk()
     }
     async fn height(&self) -> BigInt {
-        BigInt(i128::from(self.d.key().height()))
+        BigInt::new(i128::from(self.d.key().height()))
     }
     async fn chain_id(&self) -> BigInt {
-        BigInt(i128::from(self.d.key().chain()))
+        BigInt::new(i128::from(self.d.key().chain()))
     }
     /// Rows are read from the store, which keeps the canonical chain only.
     async fn canonical(&self) -> bool {
@@ -936,6 +936,7 @@ pub async fn query_transactions_by_pact_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kdx_api::compat::shapes::{self, Ev};
     use serde_json::json;
 
     #[test]
@@ -979,5 +980,137 @@ mod tests {
         assert!(search_permit(&gate, None).is_err(), "no address: refused");
         drop(pa);
         assert!(search_permit(&gate, Some(a)).is_ok(), "released on drop");
+    }
+
+    /// Wire formats of the deployed oracle (R-P5P9-19): `gasLimit`, `ttl`, `gas`, `transactionId`,
+    /// `gasPrice` and `Transfer.amount` are strings, `Block.difficulty` a number above 2^53,
+    /// `Block.nonce` a string, Event/Transfer/Signer ids carry string indexes.
+    #[tokio::test]
+    async fn oracle_wire_formats() {
+        use crate::types::block::Block;
+        use crate::types::event::Event;
+        use crate::types::transfer::Transfer;
+        use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
+        use base64::Engine;
+        use kdx_types::record::BlockRecord;
+        use kdx_types::{Hash32, TxKey};
+
+        let block = Arc::new(BlockRecord {
+            hash: Hash32([7; 32]),
+            parent: Hash32([0; 32]),
+            adjacents: Vec::new(),
+            chain: 1,
+            height: 5,
+            weight: [0; 32],
+            // difficulty = (2^256 - 1) / target = 2^56 + 1 or so: above 2^53.
+            target: {
+                let mut t = [0u8; 32];
+                t[31 - 6] = 0x01; // little-endian 2^200 -> a target of 2^200
+                t
+            },
+            nonce: u64::MAX,
+            creation_time: 1_700_000_000_000_000,
+            epoch_start: 1_700_000_000_000_000,
+            feature_flags: 0,
+            payload_hash: Hash32([0; 32]),
+            transactions_hash: Hash32([0; 32]),
+            outputs_hash: Hash32([0; 32]),
+            chainweb_version: "mainnet01".into(),
+            miner_account: 0,
+            miner_data: Vec::new(),
+            raw_miner: None,
+            merkle_verified: true,
+        });
+        let d = Arc::new(TxData {
+            rec: kdx_types::record::TxRecord {
+                key: TxKey::new(5, 1, 0),
+                request_key: Some(Hash32([9; 32])),
+                ..Default::default()
+            },
+            block: block.clone(),
+            out: json!({"gas": 236, "txId": 21663490}),
+            cmd: Some(json!({"meta": {"chainId": "1", "gasLimit": 600, "ttl": 600,
+                "gasPrice": 1.0e-8, "creationTime": 1.7e9, "sender": "k:a"},
+                "signers": [{"pubKey": "ab"}]})),
+            evs: vec![Ev {
+                pos: 1,
+                qual_name: "coin.TRANSFER".into(),
+                module: "coin".into(),
+                module_hash: String::new(),
+                params: json!(["a", "b", 2.36e-6]),
+            }],
+            trs: vec![shapes::Transfer {
+                pos: 0,
+                token: "coin".into(),
+                from: "a".into(),
+                to: "b".into(),
+                amount: "0.00000236".into(),
+            }],
+            nfts: Vec::new(),
+        });
+        struct Q(Arc<TxData>, Arc<BlockRecord>);
+        #[Object]
+        impl Q {
+            async fn cmd(&self) -> TransactionCommand {
+                TransactionCommand { d: self.0.clone() }
+            }
+            async fn result(&self) -> TransactionResult {
+                TransactionResult { d: self.0.clone() }
+            }
+            async fn transfer(&self) -> Transfer {
+                Transfer::new(self.0.clone(), 0, None)
+            }
+            async fn event(&self) -> Event {
+                Event::new(self.0.clone(), 0)
+            }
+            async fn block(&self) -> Block {
+                Block::new(self.1.clone())
+            }
+        }
+        let schema = Schema::new(Q(d, block), EmptyMutation, EmptySubscription);
+        let r = schema
+            .execute(
+                "{ cmd { meta { chainId gasLimit ttl gasPrice } signers { id } }
+                   result { gas transactionId }
+                   transfer { amount id }
+                   event { id orderIndex }
+                   block { difficulty nonce } }",
+            )
+            .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let v = serde_json::to_value(&r.data).unwrap();
+        // Strings: gasLimit, ttl, gasPrice, gas, transactionId, Transfer.amount.
+        assert_eq!(v["cmd"]["meta"]["gasLimit"], json!("600"));
+        assert_eq!(v["cmd"]["meta"]["ttl"], json!("600"));
+        assert_eq!(v["cmd"]["meta"]["gasPrice"], json!("0.00000001"));
+        assert_eq!(v["result"]["gas"], json!("236"));
+        assert_eq!(v["result"]["transactionId"], json!("21663490"));
+        assert_eq!(v["transfer"]["amount"], json!("0.00000236"));
+        // Numbers stay numbers: meta.chainId, Event.orderIndex.
+        assert_eq!(v["cmd"]["meta"]["chainId"], json!(1));
+        assert!(v["event"]["orderIndex"].is_number());
+        // Block.difficulty: a number even above 2^53; nonce: a string.
+        assert!(v["block"]["difficulty"].is_number(), "{v}");
+        assert!(v["block"]["difficulty"].as_u64().unwrap() > (1 << 53));
+        assert_eq!(v["block"]["nonce"], json!(u64::MAX.to_string()));
+        // Ids: string indexes.
+        let dec = |id: &Value| {
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(id.as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(dec(&v["event"]["id"]).starts_with("Event:["), "{v}");
+        assert!(
+            dec(&v["event"]["id"]).contains(r#"","0","#),
+            "{}",
+            dec(&v["event"]["id"])
+        );
+        let t = dec(&v["transfer"]["id"]);
+        assert!(t.contains(r#","1","0","#), "{t}");
+        let sg = dec(&v["cmd"]["signers"][0]["id"]);
+        assert!(sg.ends_with(r#","0"]"#), "{sg}");
     }
 }

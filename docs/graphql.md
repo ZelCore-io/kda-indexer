@@ -195,13 +195,17 @@ of `<TypeName>:<key>`. The key is the block hash for `Block`, the account name f
 | Type | Key |
 |---|---|
 | `Transaction` | `[blockHash, requestKey]` |
-| `Event` | `[blockHash, orderIndex, requestKey]` |
-| `Transfer` | `[blockHash, chainId, orderIndex, moduleHash, requestKey]` |
-| `Signer` | `[requestKey, orderIndex]` |
+| `Event` | `["blockHash", "orderIndex", "requestKey"]` (the order index as a string) |
+| `Transfer` | `[blockHash, "chainId", "orderIndex", moduleHash, requestKey]` (chain and order index as strings) |
+| `Signer` | `[requestKey, "orderIndex"]` (the index as a string) |
 | `FungibleAccount` | `[fungibleName, accountName]` |
 | `FungibleChainAccount` | `[chainId, fungibleName, accountName]` |
 | `NonFungibleChainAccount` | `[chainId, accountName]` |
 | `NonFungibleTokenBalance` | `[tokenId, accountName, chainId]` |
+
+The numeric key elements are JSON strings (`["hash","1","rk"]`) because that is how the deployed
+oracle writes them (R-P5P9-19); decoding takes a number or a numeric string, so ids of either
+form resolve.
 
 Cursors are opaque. Transaction, event and transfer cursors are the same tokens as the native
 API's (a transaction position plus a block fingerprint), so a cursor taken from one instance
@@ -215,11 +219,34 @@ pages on another, and a cursor whose block was reorged away is refused.
 | `DateTime` | `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC, milliseconds) |
 | `Decimal` | a JSON number with the exact decimal digits (no float rounding) |
 
+### Wire formats that follow the oracle (R-P5P9-19)
+
+The deployed oracle serializes several fields differently from the scalar the schema declares.
+Where the kadscan client parses the field, the wire form follows the oracle; the schema text
+stays Kadena's (the parity test sees the same types, so there is nothing to pin in
+`tests/extensions.txt`). Deviations from the scalar formats above:
+
+| Field | Declared | Wire form |
+|---|---|---|
+| `TransactionMeta.gasLimit`, `.ttl` | `BigInt` | string (`"600"`) |
+| `TransactionMeta.gasPrice` | `Float` | string, plain notation (`"0.00000001"`) |
+| `TransactionResult.gas`, `.transactionId` | `BigInt` | string (`"236"`) |
+| `Transfer.amount` | `Decimal` | string, plain notation (`"0.00000236"`) |
+| `Block.nonce` | `Decimal` | string |
+| `Block.difficulty` | `BigInt` | always a JSON number, also above 2^53 |
+| `FungibleChainAccount.chainId` | `String` | string (already) |
+
+Everything else keeps the scalar rules (`Block.height`, `chainId`, `orderIndex`, `result.height`
+stay numbers; `totalBalance` and `balance` stay numbers). Error codes ride in
+`extensions.code` (GraphQL spec) and are copied to a top-level `code` on each error, the place
+the oracle puts them.
+
 ## Transactions, events and transfers
 
 - **Lists.** `transactions`, `transactionsByPublicKey`, `transfers`, `events` and the account
   connections walk the same posting lists as the native API. Order: newest first by
-  (height, chain, position in the block); rows of one tx (events, transfers) in event order.
+  (height, chain, position in the block); rows of one tx (events, transfers) newest first too,
+  by descending event position (order index 1 before 0), as the deployed oracle lists them.
   `first`/`after` pages walk down from the newest row; `last`/`before` pages first collect
   the keys between the cursor and the newest row (keys only, at most 200,000, else `LIMIT`).
   Every walk checks the request deadline every 64 keys and answers `TIMEOUT` past it.

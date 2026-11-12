@@ -132,7 +132,7 @@ fn refuse(status: StatusCode, code: Code, msg: &str) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_vec(&r).unwrap_or_default(),
+        crate::error::wire_json(&r).unwrap_or_default(),
     )
         .into_response()
 }

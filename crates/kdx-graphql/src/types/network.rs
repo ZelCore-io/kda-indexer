@@ -84,7 +84,7 @@ impl GraphConfiguration {
     /// GQ-13: the package version; full history from height 0.
     pub fn current() -> GraphConfiguration {
         GraphConfiguration {
-            minimum_block_height: Some(BigInt(0)),
+            minimum_block_height: Some(BigInt::new(0)),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }

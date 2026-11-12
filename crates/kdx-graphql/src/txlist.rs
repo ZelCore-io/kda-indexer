@@ -4,7 +4,8 @@
 //!   heights walked down from the tip), key-level filters (chain, heights, `minimumDepth`)
 //!   and a row rule that turns each tx into zero or more items.
 //! - List order is TxKey descending (height, then chain, then position in the block) and,
-//!   inside one tx, ascending by event position. Cursors are `kdx_api::Cursor` (TxKey +
+//!   inside one tx, descending by event position (the oracle's order, R-P5P9-19: order
+//!   index 1 before 0). Cursors are `kdx_api::Cursor` (TxKey +
 //!   position + block fingerprint), so they are portable across instances and refused after
 //!   a reorg of their block.
 //! - One page is one `ApiState::read_heavy` (GQ-5): the records, their blocks, outputs and,
@@ -631,8 +632,10 @@ pub fn run_page(
                 let Some(d) = load(view, k, rec, &mut blocks)? else {
                     continue;
                 };
-                for (sub, it) in spec.rows.rows(&d) {
-                    if cur.is_some_and(|c| c.key == k && sub <= c.sub) {
+                let mut rs = spec.rows.rows(&d);
+                rs.reverse();
+                for (sub, it) in rs {
+                    if cur.is_some_and(|c| c.key == k && sub >= c.sub) {
                         continue;
                     }
                     walked.push((d.cursor(sub).encode(), it));
@@ -666,10 +669,8 @@ pub fn run_page(
                 let Some(d) = load(view, k, None, &mut blocks)? else {
                     continue;
                 };
-                let mut rs = spec.rows.rows(&d);
-                rs.reverse();
-                for (sub, it) in rs {
-                    if cur.is_some_and(|c| c.key == k && sub >= c.sub) {
+                for (sub, it) in spec.rows.rows(&d) {
+                    if cur.is_some_and(|c| c.key == k && sub <= c.sub) {
                         continue;
                     }
                     walked.push((d.cursor(sub).encode(), it));
@@ -854,8 +855,27 @@ pub async fn list(
     Ok(ListPage { edges, info, total })
 }
 
+/// The rows of one tx a page walks, up to `take`: `rows` come ascending by position; the list
+/// is descending (the oracle's order), so a forward page starts at the highest position
+/// below the cursor and a backward one at the lowest above it.
+fn in_tx_walk<T>(rows: Vec<(u16, T)>, dir: Dir, cur: Option<u16>, take: usize) -> Vec<(u16, T)> {
+    match dir {
+        Dir::Forward => rows
+            .into_iter()
+            .rev()
+            .filter(|(s, _)| cur.is_none_or(|c| *s < c))
+            .take(take)
+            .collect(),
+        Dir::Backward => rows
+            .into_iter()
+            .filter(|(s, _)| cur.is_none_or(|c| *s > c))
+            .take(take)
+            .collect(),
+    }
+}
+
 /// Page over the rows of one tx (`TransactionResult.events`/`transfers`): `subs` are the
-/// rows' positions, in list order.
+/// rows' positions (the rows come ascending; the page lists them descending).
 pub fn page_in_tx<T: Clone>(
     d: &TxData,
     rows: Vec<(u16, T)>,
@@ -866,21 +886,10 @@ pub fn page_in_tx<T: Clone>(
         Some(PageCursor::Tx(c)) if c.key == d.key() => Some(c.sub),
         Some(_) => return Err(bad_input("invalid cursor")),
     };
-    let walked: Vec<(String, T)> = match page.dir {
-        Dir::Forward => rows
-            .into_iter()
-            .filter(|(s, _)| cur.is_none_or(|c| *s > c))
-            .take(page.n + 1)
-            .map(|(s, t)| (d.cursor(s).encode(), t))
-            .collect(),
-        Dir::Backward => rows
-            .into_iter()
-            .rev()
-            .filter(|(s, _)| cur.is_none_or(|c| *s < c))
-            .take(page.n + 1)
-            .map(|(s, t)| (d.cursor(s).encode(), t))
-            .collect(),
-    };
+    let walked: Vec<(String, T)> = in_tx_walk(rows, page.dir, cur, page.n + 1)
+        .into_iter()
+        .map(|(s, t)| (d.cursor(s).encode(), t))
+        .collect();
     let (edges, info) = finish(walked, page, |e| e.0.clone());
     Ok((edges.into_iter().map(|(_, e)| e).collect(), info))
 }
@@ -953,6 +962,19 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn rows_inside_one_tx_list_descending() {
+        let rows = || vec![(0u16, "a"), (1, "b"), (2, "c")];
+        // Forward: 2, 1, 0; after the cursor at 1 only 0 is left.
+        let f = in_tx_walk(rows(), Dir::Forward, None, 10);
+        assert_eq!(f.iter().map(|r| r.0).collect::<Vec<_>>(), [2, 1, 0]);
+        let f = in_tx_walk(rows(), Dir::Forward, Some(1), 10);
+        assert_eq!(f.iter().map(|r| r.0).collect::<Vec<_>>(), [0]);
+        // Backward (`last`/`before`): walks away from the cursor towards the newest end.
+        let b = in_tx_walk(rows(), Dir::Backward, Some(0), 10);
+        assert_eq!(b.iter().map(|r| r.0).collect::<Vec<_>>(), [1, 2]);
     }
 
     #[test]
