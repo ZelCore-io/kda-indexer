@@ -272,7 +272,8 @@ async fn message_cap_and_rate_tokens() {
     init(&mut a).await;
     let big = "x".repeat(70 * 1024);
     let _ = a.send(Message::Text(big.into())).await;
-    assert!(recv(&mut a).await.is_err());
+    // L-3: with a close frame (1009), not a dropped connection (1006).
+    assert_eq!(recv(&mut a).await.err(), Some(1009));
     // Each message takes a rate token: out of tokens closes 4429.
     let s = server(GraphqlSettings::default(), 10).await;
     let mut b = connect(&s, "graphql-transport-ws").await.unwrap();
