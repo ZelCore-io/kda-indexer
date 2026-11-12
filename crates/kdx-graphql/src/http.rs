@@ -183,11 +183,11 @@ async fn get_handler(
     State(st): State<Arc<ApiState>>,
     req: HttpRequest,
 ) -> HttpResponse {
+    if crate::ws::is_upgrade(req.headers()) {
+        return crate::ws::upgrade(schema, st, req).await;
+    }
     let peer = peer_of(&req);
     let headers = req.headers().clone();
-    if crate::ws::is_upgrade(&headers) {
-        return crate::ws::upgrade_not_served();
-    }
     let Ok(Query(q)) = Query::<GetParams>::try_from_uri(req.uri()) else {
         return bad("query parameters are not valid");
     };

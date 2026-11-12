@@ -61,7 +61,7 @@ All in `[graphql]` (defaults shown). A refusal answers a GraphQL error with
 | Limit | Default | `extensions.limit` |
 |---|---|---|
 | query depth | `max_depth = 10` | `depth` |
-| introspection depth (`__schema`, `__type`; exempt from `max_depth`) | `introspection_depth = 15` | `introspection_depth` |
+| introspection depth (`__schema`, `__type`; exempt from `max_depth`) | `introspection_depth = 14` | `introspection_depth` |
 | query complexity | `max_complexity = 2000` | `complexity` |
 | operations per batch | `max_batch = 10` | `batch` |
 | query text | `max_query_bytes = 32768` | `query_size` |
@@ -86,7 +86,82 @@ cost of its selection by the page size it returns (`first`/`last` clamped to `ma
 `blocksFromHeight(startHeight: 0, first: 100) { edges { node { hash height } } }` costs
 1 + 100 × (1 + 1 + 2) = 401.
 
-Websocket limits (`ws_*`) apply once subscriptions are served.
+A page size bound to a variable is costed at the variable's value, else at its default in the
+operation, else (no value, no default) at `max_page`, never at `default_page`.
+
+Introspection (`__schema`, `__type`) is counted on its own budget of 100,000 per operation
+(`extensions.limit = "introspection_complexity"`): its list fields multiply their selection by
+the schema's averages (`types` 90, `fields` 4, `args` 1, `inputFields` 1, `enumValues` 2,
+`interfaces` 1, `possibleTypes` 2, `directives` 4). The graphql-js introspection query costs
+about 32,000 and is 14 deep. A list field may not repeat on one introspection path
+(`__schema { types { fields { type { fields … } } } }` is refused as
+`introspection_nesting`).
+
+### Websockets
+
+`GET /graphql` with `Upgrade: websocket` and `Sec-WebSocket-Protocol: graphql-transport-ws`
+(or the legacy `graphql-ws`). Each limit below closes or refuses as shown and counts
+`kdx_graphql_rejected_total{reason}`:
+
+| Limit | Default | On refusal |
+|---|---|---|
+| connections per client IP (an IPv6 client counts by its /64) | `ws_conns_per_ip = 10` | upgrade answers 429 (`ws_connections_per_ip`) |
+| connections per process | `ws_subs_max = 2000` | upgrade answers 429 (`ws_connections`) |
+| subscriptions per connection | `ws_subs_per_conn = 20` | the subscription gets a `LIMIT` error (`ws_subscriptions_per_connection`), the connection stays |
+| subscriptions per process | `ws_subs_max = 2000` | `LIMIT` error (`ws_subscriptions`) |
+| `connection_init` | within `ws_init_secs = 10` | close 4408 (`ws_init_timeout`) |
+| no subscription open | for `ws_idle_secs = 600` | close 4000 (`ws_idle`) |
+| client message or frame | 64 KB | connection closed (`ws_message`) |
+| client messages | one per-IP rate token each (pings too) | close 4429 (`ws_rate`) |
+| a client that does not read | 30 s per server message | close 4008 (`ws_slow_reader`) |
+| a subscriber behind the feed | 1,024 feed items | one `LIMIT` error (`ws_lagged`), then the subscription ends |
+
+Depth, complexity and the size limits apply to subscription documents as to queries. Every
+slot is released when its subscription or connection ends; `kdx_graphql_subscriptions` is the
+number open.
+
+## Blocks and network
+
+- `Block` fields come from the stored header. `powHash` is recomputed from the binary header
+  (`docs/format.md`, "Derived header fields") and rendered as chainweb-data does: lowercase
+  hex of the hash read as a big-endian number. `target` and `weight` are decimal integers
+  (chainweb-data's `numeric` columns); `difficulty` is (2^256 − 1) / target; `nonce` and
+  `flags` are `Decimal` numbers; `epoch` and `creationTime` are `DateTime`s.
+- `neighbors` lists the adjacent blocks ascending by chain id. `parent` is `null` for a
+  genesis block. `minerAccount` is the miner's current `coin` row on the block's chain; a
+  miner without a row is a field error.
+- Block lists (`blocksFromHeight`, `blocksFromDepth`, `completedBlockHeights`) are ordered by
+  height descending, then chain ascending; forward and backward pages hold the same blocks.
+  `blocksFromDepth` lists blocks at least `minimumDepth` below their chain's stored tip.
+  `completedBlockHeights` takes the newest `heightCount` (at most 100) heights: with
+  `completedHeights: true` (default) only heights at or below every requested chain's tip.
+- `Block.transactions` lists the block's user txs (coinbase is not a `Transaction`);
+  `Block.events` lists every event of the block, coinbase included. Both page with the
+  defaults above (20, at most 100), not the 500 the schema text mentions.
+- `lastBlockHeight` is the highest stored tip.
+- `networkInfo`: `networkId` from `network`, `networkHost` from `graphql.network_host`,
+  `apiVersion` `"0.0"`, `transactionCount` and `coinsInCirculation` as `/stats`;
+  `totalDifficulty` is the sum over chains of the tip block's `weight`, `networkHashRate` the
+  sum over chains of the tip block's difficulty divided by 30 s.
+- `node(id)`/`nodes(ids)` (at most 100) resolve every type; a malformed id is
+  `BAD_USER_INPUT`, an object not stored is `null`. Coinbase events and transfers resolve
+  through their block.
+
+## Subscriptions
+
+Subscriptions read a feed that polls the stored chain tips every `feed_poll_ms` (1,000), so
+`serve` and replicas serve them as `run` does.
+
+- `newBlocks(chainIds)`: each message lists the new blocks of the subscribed chains (at most
+  100). After a reorg the replacing blocks are sent again.
+- `newBlocksFromDepth(chainIds, minimumDepth)`: a block is sent once its chain's tip is
+  `minimumDepth` above it, starting from the subscription's start; only canonical blocks.
+- `events(qualifiedEventName, chainId, minimumDepth, parametersFilter)`: the matching events
+  of each new (or deep enough) block; `parametersFilter` takes the forms `events` takes.
+- `transaction(requestKey, chainId)`: one message when the tx is (or becomes) indexed, then
+  the subscription completes; `TIMEOUT` after `ws_tx_wait_secs`.
+- More than 200 new blocks on a chain in one poll (a catch-up), or a reorg deeper than 64
+  blocks, is a gap: subscribers of that chain get one `INTERNAL` error and stay subscribed.
 
 ## Ids and cursors
 

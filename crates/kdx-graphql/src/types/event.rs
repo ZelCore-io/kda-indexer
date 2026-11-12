@@ -26,7 +26,7 @@ impl Event {
     fn ev(&self) -> &Ev {
         &self.d.evs[self.i]
     }
-    fn ord_idx(&self) -> i64 {
+    pub(crate) fn ord_idx(&self) -> i64 {
         shapes::ev_idx(self.d.key(), self.ev().pos)
     }
 }

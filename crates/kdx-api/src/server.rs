@@ -144,6 +144,20 @@ impl ApiState {
         self.limiter.allow_n(ip, n)
     }
 
+    /// Take `n` rate tokens for a client IP already resolved (websocket messages, GQ-9).
+    pub fn allow_ip(&self, ip: std::net::IpAddr, n: u32) -> bool {
+        self.limiter.allow_n(ip, n)
+    }
+
+    /// The client IP of a request (`trusted_proxies` applied, as the guard).
+    pub fn client_ip_of(
+        &self,
+        peer: SocketAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> std::net::IpAddr {
+        client_ip(peer, headers, &self.settings.trusted_proxies)
+    }
+
     /// `read` on the reserved status slots (cheap tip reads only).
     pub async fn read_status<T, F>(self: &Arc<Self>, f: F) -> ApiResult<T>
     where

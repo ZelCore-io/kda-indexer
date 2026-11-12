@@ -591,6 +591,23 @@ stored code is checked with the LIKE matcher. A pattern without such a run has n
 **Snapshot.** `snapshot` reads `search/manifest.json`, then `meta.json`, links the files of
 the segments `meta.json` lists, and writes both plus `.managed.json` (the linked names).
 
+## Derived header fields
+
+GraphQL `Block.powHash` and `difficulty` (GQ-12) are derived from the stored `BlockRecord`,
+following chainweb-node's rules (read from its source, written here in our words):
+
+- The binary header is, in order, all integers little-endian: feature flags (u64), creation
+  time (u64, microseconds), parent hash (32 bytes), the adjacent hashes (a u16 count, then a
+  u32 chain id and a 32-byte hash per adjacent, ascending by chain id), target (32 bytes),
+  payload hash (32), chain id (u32), weight (32), height (u64), chainweb version code (u32:
+  5 for `mainnet01`, 7 for `testnet04`), epoch start (u64, microseconds), nonce (u64), block
+  hash (32). With three adjacents it is 318 bytes; it equals the node's `/header` binary form.
+- The proof-of-work hash is BLAKE2s-256 of those bytes without the trailing block hash. Read
+  as a little-endian 256-bit number it is at most the target for every mined block (genesis
+  blocks are not mined).
+- `target` and `weight` are little-endian 256-bit numbers; difficulty is
+  (2^256 − 1) / target, integer division.
+
 ## Additive tables
 
 The hot store can gain tables without a format version change (rule A-1). Such a table changes no

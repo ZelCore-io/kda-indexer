@@ -78,7 +78,7 @@ impl Default for GraphqlSettings {
             max_depth: 10,
             max_complexity: 2000,
             introspection: true,
-            introspection_depth: 15,
+            introspection_depth: 14,
             max_batch: 10,
             max_query_bytes: 32 * 1024,
             max_variables_bytes: 64 * 1024,
@@ -102,6 +102,7 @@ pub struct Gql {
     state: Option<Arc<ApiState>>,
     pub settings: GraphqlSettings,
     pub feed: Option<BlockFeed>,
+    pub ws: ws::WsState,
 }
 
 impl Gql {
@@ -166,6 +167,7 @@ fn build(
     )
     .data(Gql {
         state,
+        ws: ws::WsState::new(&settings),
         settings,
         feed,
     })

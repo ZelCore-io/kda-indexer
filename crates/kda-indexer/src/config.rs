@@ -292,7 +292,7 @@ impl Default for GraphqlConfig {
             max_depth: 10,
             max_complexity: 2000,
             introspection: true,
-            introspection_depth: 15,
+            introspection_depth: 14,
             max_batch: 10,
             max_query_bytes: 32768,
             max_variables_bytes: 65536,

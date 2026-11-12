@@ -296,6 +296,62 @@ impl RateLimiter {
     }
 }
 
+/// Open connections per client (GraphQL websockets, GQ-9), keyed like the rate limiter
+/// ([`bucket_key`]: an IPv6 client counts by its /64). A slot is held by a [`ConnGuard`] and
+/// released when the guard drops (close, error or task end).
+pub struct ConnLimiter {
+    per_key: usize,
+    open: std::sync::Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+/// One open connection's slot in a [`ConnLimiter`].
+pub struct ConnGuard {
+    key: IpAddr,
+    open: std::sync::Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl ConnLimiter {
+    pub fn new(per_key: usize) -> ConnLimiter {
+        ConnLimiter {
+            per_key,
+            open: Default::default(),
+        }
+    }
+
+    /// A slot for `ip`, or `None` when the client already holds `per_key` connections.
+    pub fn try_acquire(&self, ip: IpAddr) -> Option<ConnGuard> {
+        let key = bucket_key(ip);
+        let mut m = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(key).or_insert(0);
+        if *n >= self.per_key {
+            return None;
+        }
+        *n += 1;
+        Some(ConnGuard {
+            key,
+            open: self.open.clone(),
+        })
+    }
+
+    /// Connections open for `ip`'s key.
+    pub fn open(&self, ip: IpAddr) -> usize {
+        let m = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(&bucket_key(ip)).copied().unwrap_or(0)
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut m = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +546,22 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         assert!((0..3).all(|_| r.allow(ip)));
         assert!(!r.allow(ip));
+    }
+
+    #[test]
+    fn conn_limiter_counts_per_key_and_releases_on_drop() {
+        let l = ConnLimiter::new(2);
+        let a: IpAddr = "2001:db8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8::2".parse().unwrap(); // same /64
+        let c: IpAddr = "192.0.2.7".parse().unwrap();
+        let g1 = l.try_acquire(a).unwrap();
+        let g2 = l.try_acquire(b).unwrap();
+        assert!(l.try_acquire(a).is_none());
+        assert!(l.try_acquire(c).is_some());
+        drop(g1);
+        let g3 = l.try_acquire(b).unwrap();
+        drop((g2, g3));
+        assert_eq!(l.open(a), 0);
+        assert!(l.open.lock().unwrap().is_empty());
     }
 }

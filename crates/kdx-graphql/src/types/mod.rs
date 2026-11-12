@@ -12,6 +12,7 @@ pub mod event;
 pub mod guard;
 pub mod network;
 pub mod nft;
+pub mod node;
 pub mod subscription;
 pub mod transfer;
 pub mod tx;

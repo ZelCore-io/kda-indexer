@@ -347,7 +347,7 @@ pub struct Signer {
 }
 
 impl Signer {
-    fn of(rk: &str, i: usize, s: &Value) -> Signer {
+    pub(crate) fn of(rk: &str, i: usize, s: &Value) -> Signer {
         Signer {
             request_key: rk.to_owned(),
             order_index: i,

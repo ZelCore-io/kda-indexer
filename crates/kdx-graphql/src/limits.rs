@@ -63,7 +63,48 @@ struct Walk<'a> {
     stack: Vec<&'a str>,
     visits: usize,
     cost: Cost,
+    /// Defaults of the current operation's variables (SR7-1).
+    defaults: std::collections::HashMap<Name, Option<Value>>,
+    /// Introspection list fields on the current path (SR7-2: none may repeat).
+    intro_lists: Vec<&'a str>,
+    /// Introspection cost of the current operation.
+    intro_cost: u64,
 }
+
+/// An argument as the analysis sees it.
+enum Arg {
+    Absent,
+    /// Bound to a variable with no value and no default (SR7-1: costed at the maximum).
+    Unbound,
+    Val(Value),
+}
+
+impl Arg {
+    fn val(&self) -> Option<&Value> {
+        match self {
+            Arg::Val(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// Introspection list fields and the multiplier each one's subtree is counted with (SR7-2):
+/// the schema's averages rounded up (about 86 types, 4 fields per type, under one argument
+/// per field), so the cost of a query tracks the size of its answer.
+const INTRO_LISTS: &[(&str, u64)] = &[
+    ("types", 90),
+    ("fields", 4),
+    ("args", 1),
+    ("inputFields", 1),
+    ("enumValues", 2),
+    ("interfaces", 1),
+    ("possibleTypes", 2),
+    ("directives", 4),
+];
+
+/// Introspection cost cap per operation (SR7-2). The graphql-js introspection query costs
+/// about 32,000 under [`INTRO_LISTS`]; three of them in one document are refused.
+pub const MAX_INTROSPECTION_COST: u64 = 100_000;
 
 impl<'a> Walk<'a> {
     fn set(
@@ -110,9 +151,42 @@ impl<'a> Walk<'a> {
                             ));
                         }
                     }
-                    let mult = if intro { 1 } else { self.multiplier(f) };
-                    let child = self.set(&f.selection_set.node, d, intro)?;
-                    total = total.saturating_add(1u64.saturating_add(mult.saturating_mul(child)));
+                    let list = if intro {
+                        INTRO_LISTS.iter().find(|x| x.0 == name).map(|x| x.1)
+                    } else {
+                        None
+                    };
+                    if list.is_some() {
+                        if self.intro_lists.contains(&name) {
+                            return Err(limit(
+                                "introspection_nesting",
+                                format!("introspection field `{name}` repeats on one path"),
+                            ));
+                        }
+                        self.intro_lists.push(name);
+                    }
+                    let mult = if intro {
+                        list.unwrap_or(1)
+                    } else {
+                        self.multiplier(f)
+                    };
+                    let child = self.set(&f.selection_set.node, d, intro);
+                    if list.is_some() {
+                        self.intro_lists.pop();
+                    }
+                    let c = 1u64.saturating_add(mult.saturating_mul(child?));
+                    if intro && depth == 0 {
+                        // `__schema`/`__type`: counted against the introspection cap.
+                        self.intro_cost = self.intro_cost.saturating_add(c);
+                        if self.intro_cost > MAX_INTROSPECTION_COST {
+                            return Err(limit(
+                                "introspection_complexity",
+                                format!("introspection cost exceeds {MAX_INTROSPECTION_COST}"),
+                            ));
+                        }
+                    } else {
+                        total = total.saturating_add(c);
+                    }
                 }
                 Selection::InlineFragment(i) => {
                     total =
@@ -138,16 +212,20 @@ impl<'a> Walk<'a> {
     }
 
     /// An argument's value with variables substituted (`None` when absent or unbound).
-    fn arg(&self, f: &'a Field, name: &str) -> Option<Value> {
-        f.arguments
-            .iter()
-            .find(|(k, _)| k.node.as_str() == name)
-            .and_then(|(_, v)| {
-                v.node
-                    .clone()
-                    .into_const_with(|n| self.vars.get(&n).cloned().ok_or(()))
-                    .ok()
-            })
+    fn arg(&self, f: &'a Field, name: &str) -> Arg {
+        let Some((_, v)) = f.arguments.iter().find(|(k, _)| k.node.as_str() == name) else {
+            return Arg::Absent;
+        };
+        match v.node.clone().into_const_with(|n| {
+            self.vars
+                .get(&n)
+                .cloned()
+                .or_else(|| self.defaults.get(&n).cloned().flatten())
+                .ok_or(())
+        }) {
+            Ok(v) => Arg::Val(v),
+            Err(()) => Arg::Unbound,
+        }
     }
 
     fn int(v: &Value) -> Option<i64> {
@@ -171,18 +249,26 @@ impl<'a> Walk<'a> {
             Some(n) => n.clamp(0, s.max_page as i64) as u64,
             None => s.default_page.min(s.max_page) as u64,
         };
-        let first = self.arg(f, "first").and_then(|v| Self::int(&v));
-        let last = self.arg(f, "last").and_then(|v| Self::int(&v));
+        let (fa, la) = (self.arg(f, "first"), self.arg(f, "last"));
+        if matches!(fa, Arg::Unbound) || matches!(la, Arg::Unbound) {
+            return s.max_page as u64;
+        }
+        let first = fa.val().and_then(Self::int);
+        let last = la.val().and_then(Self::int);
         let name = f.name.node.as_str();
         if first.is_some() || last.is_some() {
             return page(first.max(last));
         }
+        let list_len = |arg: &str, absent: u64, unbound: u64| match self.arg(f, arg) {
+            Arg::Absent => absent,
+            Arg::Unbound => unbound,
+            Arg::Val(v) => Self::len(&v).unwrap_or(absent),
+        };
         match name {
-            "nodes" => self.arg(f, "ids").and_then(|v| Self::len(&v)).unwrap_or(1),
-            "fungibleChainAccounts" | "newBlocks" | "newBlocksFromDepth" => self
-                .arg(f, "chainIds")
-                .and_then(|v| Self::len(&v))
-                .unwrap_or(CHAINS),
+            "nodes" => list_len("ids", 1, s.max_page as u64),
+            "fungibleChainAccounts" | "newBlocks" | "newBlocksFromDepth" => {
+                list_len("chainIds", CHAINS, CHAINS)
+            }
             "chainAccounts"
             | "fungibleAccountsByPublicKey"
             | "fungibleChainAccountsByPublicKey" => CHAINS,
@@ -207,12 +293,27 @@ pub fn analyze(
         stack: Vec::new(),
         visits: 0,
         cost: Cost::default(),
+        defaults: Default::default(),
+        intro_lists: Vec::new(),
+        intro_cost: 0,
     };
     let ops: Vec<_> = match &doc.operations {
         DocumentOperations::Single(op) => vec![op],
         DocumentOperations::Multiple(m) => m.values().collect(),
     };
     for op in ops {
+        w.defaults = op
+            .node
+            .variable_definitions
+            .iter()
+            .map(|d| {
+                (
+                    d.node.name.node.clone(),
+                    d.node.default_value.as_ref().map(|v| v.node.clone()),
+                )
+            })
+            .collect();
+        w.intro_cost = 0;
         let c = w.set(&op.node.selection_set.node, 0, false)?;
         w.cost.complexity = w.cost.complexity.max(c);
         if c > s.max_complexity {
@@ -416,12 +517,12 @@ mod tests {
         assert_eq!(cost(q, serde_json::json!({})), Err("\"depth\"".into()));
         // Introspection gets its own cap.
         let mut q = String::from("{ __schema { types { fields { type { ");
-        q.push_str(&"ofType { ".repeat(10));
+        q.push_str(&"ofType { ".repeat(9));
         q.push_str("name");
-        q.push_str(&" }".repeat(14));
+        q.push_str(&" }".repeat(13));
         q.push_str(" }");
         let c = cost(&q, serde_json::json!({})).unwrap();
-        assert_eq!((c.introspection_depth, c.depth), (15, 0));
+        assert_eq!((c.introspection_depth, c.depth), (14, 0));
         let deeper = q
             .replacen("ofType { ", "ofType { ofType { ", 1)
             .replacen(" }", " } }", 1);
@@ -439,5 +540,79 @@ mod tests {
         let v = crate::http::variables(serde_json::json!({ "a": "x".repeat(65 * 1024) })).unwrap();
         assert!(check_sizes("{ lastBlockHeight }", &v, &s).is_err());
         assert!(check_sizes("{ lastBlockHeight }", &Variables::default(), &s).is_ok());
+    }
+
+    #[test]
+    fn sr7_1_unbound_page_variables_cost_the_maximum() {
+        let q = |n| {
+            format!(
+                "query($n: Int{n}) {{ blocksFromHeight(startHeight: 0, first: $n) {{ edges {{ node {{ {} }} }} }} }}",
+                block_fields(18)
+            )
+        };
+        // No variables, no default: costed at max_page (100), so 18 fields x 100 + ... > 2,000.
+        assert_eq!(
+            cost(&q(""), serde_json::json!({})).unwrap_err(),
+            "\"complexity\""
+        );
+        // The default applies when the variable is absent (clamped to 100 as at run time).
+        assert_eq!(
+            cost(&q(" = 1000"), serde_json::json!({})).unwrap_err(),
+            "\"complexity\""
+        );
+        assert!(cost(&q(" = 5"), serde_json::json!({})).is_ok());
+        // A given value wins over the default.
+        assert!(cost(&q(" = 1000"), serde_json::json!({"n": 5})).is_ok());
+        // `nodes(ids: $ids)` unbound counts max_page ids.
+        let n = format!(
+            "query($ids: [ID!]!) {{ nodes(ids: $ids) {{ id {} }} }}",
+            "id ".repeat(25)
+        );
+        assert_eq!(
+            cost(&n, serde_json::json!({})).unwrap_err(),
+            "\"complexity\""
+        );
+    }
+
+    #[test]
+    fn sr7_2_introspection_is_counted_and_nesting_is_capped() {
+        let std_q = include_str!("../tests/introspection.graphql");
+        let doc = async_graphql::parser::parse_query(std_q).unwrap();
+        let wide = GraphqlSettings {
+            introspection_depth: 64,
+            ..GraphqlSettings::default()
+        };
+        let c = analyze(&doc, &Variables::default(), &wide).unwrap();
+        assert_eq!(
+            c.introspection_depth,
+            GraphqlSettings::default().introspection_depth
+        );
+        assert!(cost(std_q, serde_json::json!({})).is_ok());
+        let three = std_q.replace("query IntrospectionQuery {", "query IntrospectionQuery { a: __schema { types { ...FullType } } b: __schema { types { ...FullType } } ");
+        assert_eq!(
+            cost(&three, serde_json::json!({})).unwrap_err(),
+            "\"introspection_complexity\""
+        );
+        // Repeated `fields` on one path.
+        let nested = "{ __schema { types { fields { type { fields { type { name } } } } } } }";
+        assert_eq!(
+            cost(nested, serde_json::json!({})).unwrap_err(),
+            "\"introspection_nesting\""
+        );
+        // Aliases of a heavy introspection subtree add up against the introspection cap.
+        let heavy = "fields { args { type { name } } type { name } } inputFields { type { name } } enumValues { name } possibleTypes { name } interfaces { name }";
+        let many: String = (0..40)
+            .map(|i| format!("a{i}: __schema {{ types {{ {heavy} }} }} "))
+            .collect();
+        assert_eq!(
+            cost(&format!("{{ {many} }}"), serde_json::json!({})).unwrap_err(),
+            "\"introspection_complexity\""
+        );
+        // `__type` nesting is capped too.
+        let t = "{ __type(name: \"Block\") { fields { type { ofType { fields { name } } } } } }";
+        assert_eq!(
+            cost(t, serde_json::json!({})).unwrap_err(),
+            "\"introspection_nesting\""
+        );
     }
 }

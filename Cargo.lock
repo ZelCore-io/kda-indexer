@@ -1788,6 +1788,8 @@ dependencies = [
 name = "kdx-decode"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "blake2",
  "kdx-types",
  "serde",
  "serde_json",
@@ -1814,6 +1816,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tracing",
 ]

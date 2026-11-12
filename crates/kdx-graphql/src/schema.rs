@@ -3,11 +3,14 @@
 
 use async_graphql::{Context, InputObject, Object, Result, SimpleObject, ID};
 
+use crate::connection::PageArgs;
 use crate::scalars::BigInt;
 use crate::types::{
     default_chain_ids, unserved, Block, FungibleAccount, FungibleChainAccount, GraphConfiguration,
     NetworkInfo, Node, NonFungibleAccount, NonFungibleChainAccount, QueryBlocksFromDepthConnection,
-    QueryBlocksFromHeightConnection, QueryCompletedBlockHeightsConnection, QueryEventsConnection,
+    QueryBlocksFromDepthConnectionEdge, QueryBlocksFromHeightConnection,
+    QueryBlocksFromHeightConnectionEdge, QueryCompletedBlockHeightsConnection,
+    QueryCompletedBlockHeightsConnectionEdge, QueryEventsConnection,
     QueryTransactionsByPublicKeyConnection, QueryTransactionsConnection, QueryTransfersConnection,
     Transaction,
 };
@@ -52,12 +55,13 @@ pub struct GasLimitEstimation {
 #[Object]
 #[allow(unused_variables, clippy::too_many_arguments)]
 impl Query {
-    async fn block(&self, hash: String) -> Result<Option<Block>> {
-        unserved!("Query.block")
+    async fn block(&self, ctx: &Context<'_>, hash: String) -> Result<Option<Block>> {
+        crate::types::block::query_block(ctx, &hash).await
     }
 
     async fn blocks_from_depth(
         &self,
+        ctx: &Context<'_>,
         after: Option<String>,
         before: Option<String>,
         #[graphql(default_with = "default_chain_ids()")] chain_ids: Option<Vec<String>>,
@@ -65,11 +69,27 @@ impl Query {
         last: Option<i32>,
         minimum_depth: i32,
     ) -> Result<Option<QueryBlocksFromDepthConnection>> {
-        unserved!("Query.blocksFromDepth")
+        use crate::types::block::{block_page, chain_set, non_negative, Span};
+        let depth = non_negative("minimumDepth", minimum_depth)?;
+        let (edges, page_info) = block_page(
+            ctx,
+            chain_set(chain_ids.as_deref())?,
+            Span::Depth(depth),
+            PageArgs::new(after, before, first, last),
+        )
+        .await?;
+        Ok(Some(QueryBlocksFromDepthConnection {
+            edges: edges
+                .into_iter()
+                .map(|(cursor, node)| QueryBlocksFromDepthConnectionEdge { cursor, node })
+                .collect(),
+            page_info,
+        }))
     }
 
     async fn blocks_from_height(
         &self,
+        ctx: &Context<'_>,
         after: Option<String>,
         before: Option<String>,
         #[graphql(default_with = "default_chain_ids()")] chain_ids: Option<Vec<String>>,
@@ -78,11 +98,30 @@ impl Query {
         last: Option<i32>,
         start_height: i32,
     ) -> Result<QueryBlocksFromHeightConnection> {
-        unserved!("Query.blocksFromHeight")
+        use crate::types::block::{block_page, chain_set, non_negative, Span};
+        let start = non_negative("startHeight", start_height)?;
+        let end = end_height
+            .map(|e| non_negative("endHeight", e))
+            .transpose()?;
+        let (edges, page_info) = block_page(
+            ctx,
+            chain_set(chain_ids.as_deref())?,
+            Span::Heights { start, end },
+            PageArgs::new(after, before, first, last),
+        )
+        .await?;
+        Ok(QueryBlocksFromHeightConnection {
+            edges: edges
+                .into_iter()
+                .map(|(cursor, node)| QueryBlocksFromHeightConnectionEdge { cursor, node })
+                .collect(),
+            page_info,
+        })
     }
 
     async fn completed_block_heights(
         &self,
+        ctx: &Context<'_>,
         after: Option<String>,
         before: Option<String>,
         #[graphql(default_with = "default_chain_ids()")] chain_ids: Option<Vec<String>>,
@@ -91,7 +130,30 @@ impl Query {
         #[graphql(default_with = "Some(3)")] height_count: Option<i32>,
         last: Option<i32>,
     ) -> Result<QueryCompletedBlockHeightsConnection> {
-        unserved!("Query.completedBlockHeights")
+        use crate::types::block::{block_page, chain_set, Span, MAX_HEIGHT_COUNT};
+        let count = height_count.unwrap_or(3);
+        if !(0..=MAX_HEIGHT_COUNT).contains(&count) {
+            return Err(crate::error::bad_input(format!(
+                "heightCount must be between 0 and {MAX_HEIGHT_COUNT}"
+            )));
+        }
+        let (edges, page_info) = block_page(
+            ctx,
+            chain_set(chain_ids.as_deref())?,
+            Span::Completed {
+                count: count as u64,
+                complete: completed_heights.unwrap_or(true),
+            },
+            PageArgs::new(after, before, first, last),
+        )
+        .await?;
+        Ok(QueryCompletedBlockHeightsConnection {
+            edges: edges
+                .into_iter()
+                .map(|(cursor, node)| QueryCompletedBlockHeightsConnectionEdge { cursor, node })
+                .collect(),
+            page_info,
+        })
     }
 
     async fn events(
@@ -222,20 +284,20 @@ impl Query {
         GraphConfiguration::current()
     }
 
-    async fn last_block_height(&self) -> Result<Option<BigInt>> {
-        unserved!("Query.lastBlockHeight")
+    async fn last_block_height(&self, ctx: &Context<'_>) -> Result<Option<BigInt>> {
+        crate::types::block::last_block_height(ctx).await
     }
 
     async fn network_info(&self, ctx: &Context<'_>) -> Result<Option<NetworkInfo>> {
-        unserved!("Query.networkInfo")
+        crate::types::network::network_info(ctx).await
     }
 
-    async fn node(&self, id: ID) -> Result<Option<Node>> {
-        unserved!("Query.node")
+    async fn node(&self, ctx: &Context<'_>, id: ID) -> Result<Option<Node>> {
+        crate::types::node::node(ctx, &id).await
     }
 
-    async fn nodes(&self, ids: Vec<ID>) -> Result<Vec<Option<Node>>> {
-        unserved!("Query.nodes")
+    async fn nodes(&self, ctx: &Context<'_>, ids: Vec<ID>) -> Result<Vec<Option<Node>>> {
+        crate::types::node::nodes(ctx, &ids).await
     }
 
     async fn non_fungible_account(

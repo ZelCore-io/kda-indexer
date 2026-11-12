@@ -143,8 +143,8 @@ pub fn load(
 
 /// The `Block` node of a stored block. `types/block.rs` (Task 3) gives `Block` its fields;
 /// this is the one place tx, event and transfer nodes build it.
-pub fn block_node(_b: &Arc<BlockRecord>) -> Block {
-    Block::default()
+pub fn block_node(b: &Arc<BlockRecord>) -> Block {
+    Block::new(b.clone())
 }
 
 // ---------------------------------------------------------------------------------------

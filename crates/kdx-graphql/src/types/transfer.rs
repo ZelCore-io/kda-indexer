@@ -31,10 +31,10 @@ impl Transfer {
     fn t(&self) -> &shapes::Transfer {
         &self.d.trs[self.i]
     }
-    fn ord_idx(&self) -> i64 {
+    pub(crate) fn ord_idx(&self) -> i64 {
         shapes::ev_idx(self.d.key(), self.t().pos)
     }
-    fn mod_hash(&self) -> String {
+    pub(crate) fn mod_hash(&self) -> String {
         self.d
             .evs
             .get(self.t().pos)
