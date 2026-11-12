@@ -235,8 +235,15 @@ impl BlockFile {
         if r >= self.rows {
             bail!("row {r} past {}", self.rows);
         }
-        let a = self.data.offset(r)? as usize;
-        let b = self.data.offset(r + 1)? as usize;
+        let a = usize::try_from(self.data.offset(r)?).context("row offset")?;
+        let b = usize::try_from(self.data.offset(r + 1)?).context("row offset")?;
+        // A damaged offsets file must be an error here, not a slice panic in the mmap.
+        if a > b || b > self.data.size() {
+            bail!(
+                "row {r}: offsets {a}..{b} outside the {}-byte data file",
+                self.data.size()
+            );
+        }
         let z = self.data.data(a..b);
         let cap = self.header.max_raw_row as usize;
         let mut d = match &self.ddict {

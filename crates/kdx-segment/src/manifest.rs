@@ -53,7 +53,9 @@ pub struct RangeEntry {
 
 impl RangeEntry {
     pub fn end_txnum(&self) -> u64 {
-        self.first_txnum + self.tx_count
+        // Saturating: a hostile manifest.json must not panic here; `validate` refuses the
+        // overflow before any entry is used.
+        self.first_txnum.saturating_add(self.tx_count)
     }
 }
 
@@ -118,6 +120,15 @@ impl Manifest {
         let mut h = self.entries.first().map(|e| e.start).unwrap_or(0);
         let mut t = self.entries.first().map(|e| e.first_txnum).unwrap_or(0);
         for e in &self.entries {
+            if e.first_txnum.checked_add(e.tx_count).is_none() {
+                bail!(
+                    "manifest: range {}..{} first_txnum {} + tx_count {} overflows",
+                    e.start,
+                    e.end,
+                    e.first_txnum,
+                    e.tx_count
+                );
+            }
             if e.start != h || e.end <= e.start {
                 bail!(
                     "manifest: range {}..{} not contiguous at {h}",
