@@ -1,8 +1,10 @@
 //! `rebuild-range` through the CLI (Task 16 Step 2): the process is killed (SIGKILL) at each
 //! phase of the swap; every time the store still opens, passes `segments check --deep` and
-//! holds the same content. A clean run afterwards recovers and swaps. Two chains committed
-//! in non-backfill order, so the rebuilt step bytes differ from the frozen ones and a mixed
-//! file set would fail the check. The node is the local stand-in of the shared harness.
+//! holds the same content. A clean run afterwards recovers and swaps. Each run compresses at
+//! a zstd level other than the stored files' (I-2: alternating 1 and 5, the freeze uses 3),
+//! so every rebuilt file differs from the one it replaces and a mixed old/new set fails the
+//! per-file blake3 of `range.toml` in `segments check --deep`. The node is the local stand-in
+//! of the shared harness.
 
 #[path = "../../kdx-ingest/tests/common/mod.rs"]
 mod common;
@@ -13,15 +15,16 @@ use std::process::{Command, Stdio};
 
 use common::*;
 
-/// The packaged example config pointed at the stand-in node.
-fn config(dir: &Path, base: &str) -> PathBuf {
+/// The packaged example config pointed at the stand-in node, step files at zstd `level`.
+fn config(dir: &Path, base: &str, level: i32) -> PathBuf {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../packaging/config/mainnet01.toml"
     ))
     .unwrap();
-    let p = dir.join("config.toml");
-    std::fs::write(&p, src.replace("http://127.0.0.1:31351", base)).unwrap();
+    let p = dir.join(format!("config-{level}.toml"));
+    let cfg = src.replace("http://127.0.0.1:31351", base);
+    std::fs::write(&p, format!("{cfg}\n[freezer]\nzstd_level = {level}\n")).unwrap();
     p
 }
 
@@ -76,15 +79,20 @@ fn rebuild_range_killed_at_each_phase_leaves_a_checkable_store() {
             .start
     };
     let before = segment_content(&data);
-    let cfg = config(d.path(), &base);
-    for point in [
+    let cfgs = [config(d.path(), &base, 1), config(d.path(), &base, 5)];
+    for (i, point) in [
         "rebuild-after-build",
         "rebuild-before-rename",
         "rebuild-after-rename",
         "rebuild-mid-swap",
         "rebuild-before-cleanup",
-    ] {
-        let mut child = rebuild(&cfg, &data, start, Some(point)).spawn().unwrap();
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut child = rebuild(&cfgs[i % 2], &data, start, Some(point))
+            .spawn()
+            .unwrap();
         let err = BufReader::new(child.stderr.take().unwrap());
         let mut log = Vec::new();
         let mut reached = false;
@@ -102,7 +110,8 @@ fn rebuild_range_killed_at_each_phase_leaves_a_checkable_store() {
         check_deep(&data, point);
         assert_eq!(segment_content(&data), before, "{point}: content");
     }
-    let out = rebuild(&cfg, &data, start, None).output().unwrap();
+    // The last kill left a finished swap at level 1 behind its journal; level 5 differs.
+    let out = rebuild(&cfgs[1], &data, start, None).output().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -111,10 +120,21 @@ fn rebuild_range_killed_at_each_phase_leaves_a_checkable_store() {
     let rep: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(rep["swapped"], true, "{rep}");
     assert_eq!(rep["content_equal"], true, "{rep}");
-    eprintln!(
-        "two-chain step {start}: bytes_equal {} (old txs blake3 vs new logged per file)",
-        rep["bytes_equal"]
+    assert_eq!(
+        rep["bytes_equal"], false,
+        "the rebuild must not be byte-equal: {rep}"
     );
+    let (old, new) = (&rep["old_blake3"], &rep["new_blake3"]);
+    // zstd-compressed files and `range.toml` differ (posting and index files are not
+    // compressed and may stay equal: a mix of equal bytes cannot be wrong).
+    let mut differ = 0;
+    for (n, h) in new.as_object().unwrap() {
+        if n.ends_with(".seg") || n.ends_with(".toml") {
+            assert_ne!(&old[n], h, "{n}: rebuilt bytes equal the stored ones");
+            differ += 1;
+        }
+    }
+    assert!(differ >= 3, "{new}");
     check_deep(&data, "after the clean run");
     assert_eq!(segment_content(&data), before);
     let seg = data.join("segments");
@@ -122,7 +142,8 @@ fn rebuild_range_killed_at_each_phase_leaves_a_checkable_store() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("rebuild."))
+        .filter(|n| n.starts_with("rebuild.") || n.starts_with(".swap-"))
         .collect();
+    // m8: the recovery of the last kill finished that swap a second time.
     assert!(left.is_empty(), "{left:?}");
 }
