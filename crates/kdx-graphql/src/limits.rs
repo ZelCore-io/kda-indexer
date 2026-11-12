@@ -11,7 +11,7 @@
 //!
 //! Cost model (field types from the schema, keyed on field names, never aliases): each field
 //! costs 1 (`__typename` 0, and a connection's `edges` and their `node` 0). A
-//! deferred `totalCount` (a list's count walk) costs `max_page`, and an operation may run at
+//! deferred `totalCount` (every one but a short list of cheap connections'; fails closed) costs `max_page`, and an operation may run at
 //! most [`MAX_COUNTS`] of them, outer multipliers included. A connection or list field that returns a page
 //! (`first`/`last` or a connection field without them) multiplies the cost of its
 //! selection (of a connection, its `edges` only: `totalCount` and `pageInfo` are answered
@@ -60,21 +60,24 @@ const PAGED: &[&str] = &[
 /// Deferred `totalCount`s (count walks) one operation may run, outer multipliers included.
 pub const MAX_COUNTS: u64 = 2;
 
-/// Connections whose `totalCount` is a count walk (the tx-keyed lists over postings or
-/// heights); the others are known with their page (a block's or a tx's rows, block ranges).
-const DEFERRED_COUNTS: &[&str] = &[
-    "QueryTransactionsConnection",
-    "QueryEventsConnection",
-    "QueryTransfersConnection",
-    "QueryTransactionsByPublicKeyConnection",
-    "FungibleAccountTransactionsConnection",
-    "FungibleChainAccountTransactionsConnection",
-    "NonFungibleAccountTransactionsConnection",
-    "NonFungibleChainAccountTransactionsConnection",
+/// Connections whose `totalCount` is known with their page (a block's or a tx's rows, block
+/// ranges, an account's transfers): bounded and cheap. Every other `totalCount`, including
+/// one under a type the walker cannot resolve, is a deferred count walk (fail closed, SR7-3).
+const CHEAP_COUNTS: &[&str] = &[
+    "BlockEventsConnection",
+    "BlockTransactionsConnection",
+    "FungibleAccountTransfersConnection",
+    "FungibleChainAccountTransfersConnection",
+    "QueryBalanceConnection",
+    "QueryBlocksFromDepthConnection",
+    "QueryBlocksFromHeightConnection",
+    "QueryCompletedBlockHeightsConnection",
+    "TransactionResultEventsConnection",
+    "TransactionResultTransfersConnection",
 ];
 
-fn deferred_count(ty: &str) -> bool {
-    DEFERRED_COUNTS.contains(&ty)
+fn cheap_count(ty: &str) -> bool {
+    CHEAP_COUNTS.contains(&ty)
 }
 
 /// Whose selection a set is.
@@ -248,6 +251,10 @@ impl<'a> Walk<'a> {
                     let pages = mf.is_none_or(|f| conn || f.ty.starts_with('['));
                     let mult = if intro {
                         list.unwrap_or(1)
+                    } else if mf.is_none() {
+                        // A field the walker cannot resolve (unknown parent type): the
+                        // conservative page size, its subtree priced at the per-item floor.
+                        self.multiplier(f).max(self.s.max_page as u64)
                     } else if pages {
                         self.multiplier(f)
                     } else {
@@ -257,7 +264,10 @@ impl<'a> Walk<'a> {
                         _ if intro => 1,
                         "edges" if wrap == Wrap::Conn => 0,
                         "node" if wrap == Wrap::Edges => 0,
-                        "totalCount" if wrap == Wrap::Conn && ty.is_some_and(deferred_count) => {
+                        // Cheap only under a known connection type listed as cheap; anywhere
+                        // else (unknown or unresolved parent, interface, fragment) it is a
+                        // count walk.
+                        "totalCount" if !(wrap == Wrap::Conn && ty.is_some_and(cheap_count)) => {
                             // A count walk (GQ-10): a fixed cost, and few per operation.
                             self.counts = self.counts.saturating_add(self.outer);
                             if self.counts > MAX_COUNTS {
@@ -648,6 +658,56 @@ mod tests {
         );
         // A block's count is not a walk: kadscan's block list passes.
         assert!(c("{ blocksFromDepth(minimumDepth: 0, first: 25) { totalCount edges { node { transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }").unwrap() < 2000);
+    }
+
+    #[test]
+    fn sr7_3_unresolved_total_counts_fail_closed() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        let over = Err("\"complexity\"".to_string());
+        // Happy path: two deferred counts pass, a block's own counts are cheap.
+        assert_eq!(
+            c("{ a: transactions(accountName: \"a\") { totalCount } b: events(qualifiedEventName: \"x\") { totalCount } }"),
+            Ok(2 * 101)
+        );
+        assert!(
+            c("{ block(hash: \"h\") { transactions { totalCount } events { totalCount } } }")
+                .unwrap()
+                < 20
+        );
+        // Three deferred counts through an inline fragment on an interface (`Node`).
+        let q: String = (0..3)
+            .map(|i| {
+                format!(
+                    "t{i}: transactions(accountName: \"a\") {{ ... on Node {{ totalCount }} }} "
+                )
+            })
+            .collect();
+        assert_eq!(c(&format!("{{ {q} }}")), over);
+        // Through a named fragment spread whose type condition is not a connection.
+        let q: String = (0..3)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ ...F }} "))
+            .collect();
+        assert_eq!(
+            c(&format!("{{ {q} }} fragment F on Node {{ totalCount }}")),
+            over
+        );
+        // Through an inline fragment on an unknown type, and an unresolved connection field.
+        let q: String = (0..3)
+            .map(|i| {
+                format!(
+                    "t{i}: transactions(accountName: \"a\") {{ ... on Mystery {{ totalCount }} }} "
+                )
+            })
+            .collect();
+        assert_eq!(c(&format!("{{ {q} }}")), over);
+        assert_eq!(c("{ ... on Mystery { list { totalCount } } }"), over);
+        assert_eq!(
+            c("{ ... on Mutation { list(first: 1) { totalCount } } }"),
+            over
+        );
+        // An unresolved field is never free: its subtree is priced per item.
+        assert!(c("{ ... on Mystery { a b c } }").unwrap() >= 300);
+        assert_eq!(c("{ ... on Mystery { a { b c } } }"), over);
     }
 
     #[test]
