@@ -134,12 +134,33 @@ impl ScalarType for DateTime {
     }
 }
 
-/// A decimal text without an exponent: `2.36e-6` is `0.00000236`.
+/// Largest exponent magnitude a decimal text may carry, and the longest plain expansion
+/// (SR7-4): beyond it the text is refused on input (`Decimal::new`, so `BAD_USER_INPUT`) and
+/// left as written on output (`plain`), never expanded.
+const MAX_EXP: i64 = 1000;
+const MAX_PLAIN: usize = 1100;
+
+/// The exponent of a decimal text, `Some(0)` without one, `None` when it is not a number or
+/// its magnitude passes [`MAX_EXP`] (a long digit string never reaches an integer parse).
+fn exponent(t: &str) -> Option<i64> {
+    let Some((_, exp)) = t.split_once(['e', 'E']) else {
+        return Some(0);
+    };
+    let digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+    if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = exp.parse().ok()?;
+    (n.abs() <= MAX_EXP).then_some(n)
+}
+
+/// A decimal text without an exponent: `2.36e-6` is `0.00000236`. A text whose exponent is
+/// out of range or whose expansion would pass [`MAX_PLAIN`] characters is returned as is.
 fn plain(t: &str) -> String {
-    let Some((mant, exp)) = t.split_once(['e', 'E']) else {
+    let Some((mant, _)) = t.split_once(['e', 'E']) else {
         return t.to_owned();
     };
-    let Ok(exp) = exp.parse::<i32>() else {
+    let Some(exp) = exponent(t).filter(|_| mant.len() <= MAX_PLAIN) else {
         return t.to_owned();
     };
     let (neg, mant) = match mant.strip_prefix('-') {
@@ -148,11 +169,21 @@ fn plain(t: &str) -> String {
     };
     let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
     let digits = format!("{int}{frac}");
-    let point = int.len() as i32 + exp;
+    let Some(point) = (int.len() as i64).checked_add(exp) else {
+        return t.to_owned();
+    };
+    let zeros = if point <= 0 {
+        point.unsigned_abs()
+    } else {
+        (point as u64).saturating_sub(digits.len() as u64)
+    };
+    if zeros as usize > MAX_PLAIN || digits.len() > MAX_PLAIN {
+        return t.to_owned();
+    }
     let body = if point <= 0 {
-        format!("0.{}{}", "0".repeat(point.unsigned_abs() as usize), digits)
+        format!("0.{}{}", "0".repeat(zeros as usize), digits)
     } else if point as usize >= digits.len() {
-        format!("{digits}{}", "0".repeat(point as usize - digits.len()))
+        format!("{digits}{}", "0".repeat(zeros as usize))
     } else {
         format!(
             "{}.{}",
@@ -186,9 +217,10 @@ pub struct Decimal {
 }
 
 impl Decimal {
-    /// A decimal from its text; `None` unless it is a plain JSON number. Serialized as a
-    /// JSON number.
+    /// A decimal from its text; `None` unless it is a plain JSON number whose exponent (if
+    /// any) is at most 1000 in magnitude (SR7-4). Serialized as a JSON number.
     pub fn new(text: &str) -> Option<Decimal> {
+        exponent(text)?;
         Number::from_str(text).ok().map(|_| Decimal {
             text: text.to_owned(),
             as_string: false,
@@ -212,10 +244,9 @@ impl Decimal {
 impl ScalarType for Decimal {
     fn parse(value: Value) -> InputValueResult<Self> {
         match &value {
-            Value::Number(n) => Ok(Decimal {
-                text: n.to_string(),
-                as_string: false,
-            }),
+            Value::Number(n) => {
+                Decimal::new(&n.to_string()).ok_or_else(|| InputValueError::custom("not a decimal"))
+            }
             Value::String(s) => {
                 Decimal::new(s).ok_or_else(|| InputValueError::custom("not a decimal"))
             }
@@ -308,6 +339,42 @@ mod tests {
         );
         // Default stays Kadena's: number while safe, string beyond.
         assert_eq!(BigInt::new(5).to_value(), Value::Number(5.into()));
+    }
+
+    #[test]
+    fn huge_exponents_are_bounded() {
+        let long = format!("1e{}", "9".repeat(30));
+        let long_neg = format!("1e-{}", "9".repeat(30));
+        for t in [
+            "1e2000000000",
+            "1e-2000000000",
+            "1e2147483647",
+            "1e-2147483648",
+            long.as_str(),
+            long_neg.as_str(),
+            "1e1001",
+            "1e-1001",
+        ] {
+            // Input: refused (BAD_USER_INPUT through the scalar), never expanded.
+            assert!(Decimal::new(t).is_none(), "{t}");
+            assert!(Decimal::parse(Value::String(t.into())).is_err(), "{t}");
+            // Output path: left as written.
+            assert_eq!(plain(t), t, "{t}");
+        }
+        // The cap itself: 1000 is accepted on input and expands within the bound.
+        assert!(Decimal::new("1e1000").is_some() && Decimal::new("1e-1000").is_some());
+        let up = Decimal::new("1e1000").unwrap().into_text();
+        assert_eq!(up.as_str().len(), 1001);
+        assert!(up.as_str().starts_with("1000"));
+        let down = plain("1e-1000");
+        assert_eq!(down.len(), 1002);
+        assert!(down.starts_with("0.000") && down.ends_with("01"));
+        // Just beyond the cap is out of range on both signs.
+        assert_eq!(plain("1e1001"), "1e1001");
+        assert_eq!(plain("1e-1001"), "1e-1001");
+        // A long mantissa with an exponent is left alone too.
+        let wide = format!("{}e5", "1".repeat(MAX_PLAIN + 1));
+        assert_eq!(plain(&wide), wide);
     }
 
     #[test]
