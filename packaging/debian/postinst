@@ -42,6 +42,28 @@ configure)
         install -d -m 0750 -o "$USER_NAME" -g "$USER_NAME" "$DATA_ROOT/$NETWORK"
     fi
 
+    # The service user must be able to walk down to its data dir and write there. A volume
+    # mounted at DATA_ROOT often has a root-only mode (0700/0750 root:root), which keeps the
+    # service out of the store even though the store itself is owned by it. Check, and stop
+    # with a clear message; never change a mounted volume's mode silently.
+    if command -v runuser >/dev/null 2>&1; then
+        for d in /opt /opt/coins /opt/coins/data /opt/coins/data/kadena "$DATA_ROOT" "$DATA_ROOT/$NETWORK"; do
+            if ! runuser -u "$USER_NAME" -- test -x "$d"; then
+                echo "kda-indexer: the service user '$USER_NAME' cannot traverse $d (mode $(stat -c '%a %U:%G' "$d"))." >&2
+                echo "  A volume mounted at $DATA_ROOT must be traversable by '$USER_NAME' (mode 0755 on the volume root)." >&2
+                echo "  Fix: chmod 0755 $d   then reconfigure: dpkg --configure kda-indexer" >&2
+                exit 1
+            fi
+        done
+        if ! runuser -u "$USER_NAME" -- test -w "$DATA_ROOT/$NETWORK"; then
+            echo "kda-indexer: the service user '$USER_NAME' cannot write $DATA_ROOT/$NETWORK (owner $(stat -c '%U:%G' "$DATA_ROOT/$NETWORK"))." >&2
+            echo "  Fix: chown $USER_NAME:$USER_NAME $DATA_ROOT/$NETWORK   (postinst does not chown an existing store), then: dpkg --configure kda-indexer" >&2
+            exit 1
+        fi
+    else
+        echo "kda-indexer: runuser not found, skipping the data dir access check for '$USER_NAME'." >&2
+    fi
+
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
         if [ -z "$2" ]; then
