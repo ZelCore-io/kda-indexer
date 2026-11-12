@@ -136,7 +136,11 @@ impl Run {
         for c in [0u8, 1] {
             fx.apply_run(c, 0..=3, 0);
         }
-        let feed = BlockFeed::spawn(fx.st.clone(), Duration::from_millis(50));
+        let feed = BlockFeed::spawn(
+            fx.st.clone(),
+            Duration::from_millis(50),
+            kdx_graphql::feed::RING_BYTES,
+        );
         let schema = build_schema(
             fx.st.clone(),
             GraphqlSettings::default(),

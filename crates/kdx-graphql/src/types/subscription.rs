@@ -503,6 +503,7 @@ impl Subscription {
                             return Ok(Transaction::new(d.clone()));
                         }
                     }
+                    Ok(Ok(FeedItem::Pad)) => {}
                     Ok(Ok(FeedItem::Gap(_))) | Ok(Err(RecvError::Lagged(_))) => {
                         // Items were skipped: look in the store again.
                         rx = rx.resubscribe();

@@ -67,12 +67,17 @@ max_event_lists = 256     # event-name lists one event query may expand to
 # max_query_bytes = 32768
 # max_variables_bytes = 65536
 # ws_subs_per_conn = 20
+# ws_subs_per_ip = 40        # per client (IPv4 address or IPv6 /64), all its connections
+# ws_subs_per_48 = 120       # per IPv6 /48
 # ws_subs_max = 2000
-# ws_conns_per_ip = 10
+# ws_conns_per_ip = 10       # per client (IPv4 address or IPv6 /64)
+# ws_conns_per_48 = 30       # per IPv6 /48
+# ws_conns_max = 1000
 # ws_init_secs = 10
 # ws_idle_secs = 600
 # ws_tx_wait_secs = 3600
 # feed_poll_ms = 1000
+# feed_ring_mb = 64          # decoded blocks the subscription feed's ring holds at most
 # network_host = ""          # networkInfo.networkHost: a public name, never the node URL
 
 [search]

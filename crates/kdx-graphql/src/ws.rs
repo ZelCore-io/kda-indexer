@@ -3,10 +3,12 @@
 //!
 //! Limits, each a security control on a public surface (every refusal counts in
 //! `kdx_graphql_rejected_total{reason}`):
-//! - connections: at most `ws_conns_per_ip` per client (keyed like the rate limiter) and at
-//!   most `ws_subs_max` per process; an upgrade over either answers 429;
-//! - subscriptions: at most `ws_subs_per_conn` per connection and `ws_subs_max` per process;
-//!   a refused `subscribe` gets a `LIMIT` error, the connection stays;
+//! - connections: at most `ws_conns_per_ip` per client (keyed like the rate limiter: an
+//!   IPv4 address or an IPv6 /64), `ws_conns_per_48` per IPv6 /48 and `ws_conns_max` per
+//!   process; an upgrade over any answers 429;
+//! - subscriptions: at most `ws_subs_per_conn` per connection, `ws_subs_per_ip` per client
+//!   over all its connections, `ws_subs_per_48` per IPv6 /48 and `ws_subs_max` per process
+//!   (M-2); a refused `subscribe` gets a `LIMIT` error, the connection stays;
 //! - `connection_init` must arrive within `ws_init`, else close 4408;
 //! - a connection with no subscription for `ws_idle` is closed (4000);
 //! - a message (or frame) over [`MAX_MESSAGE`] closes the connection;
@@ -54,7 +56,10 @@ const INBOX: usize = 16;
 
 /// Process-wide websocket state (in [`Gql`]).
 pub struct WsState {
+    /// Connections per client and per IPv6 /48.
     ips: ConnLimiter,
+    /// Subscriptions per client and per IPv6 /48 (M-2).
+    client_subs: ConnLimiter,
     conns: Arc<Semaphore>,
     subs: Arc<Semaphore>,
     max_subs: usize,
@@ -63,8 +68,9 @@ pub struct WsState {
 impl WsState {
     pub fn new(s: &crate::GraphqlSettings) -> WsState {
         WsState {
-            ips: ConnLimiter::new(s.ws_conns_per_ip),
-            conns: Arc::new(Semaphore::new(s.ws_subs_max)),
+            ips: ConnLimiter::new(s.ws_conns_per_ip, s.ws_conns_per_48),
+            client_subs: ConnLimiter::new(s.ws_subs_per_ip, s.ws_subs_per_48),
+            conns: Arc::new(Semaphore::new(s.ws_conns_max)),
             subs: Arc::new(Semaphore::new(s.ws_subs_max)),
             max_subs: s.ws_subs_max,
         }
@@ -167,6 +173,7 @@ impl Extension for WsOpsExt {
 /// The slots one subscription holds; dropping it releases them and the gauge.
 pub struct SubSlot {
     _conn: Option<OwnedSemaphorePermit>,
+    _client: Option<ConnGuard>,
     _proc: OwnedSemaphorePermit,
 }
 
@@ -192,6 +199,17 @@ pub fn acquire(ctx: &Context<'_>) -> async_graphql::Result<SubSlot> {
         })?),
         None => None,
     };
+    // M-2: per client over all its connections, and per IPv6 /48 (the rate limiter's key;
+    // an unattributed in-process caller has no client).
+    let client = match ctx.data_opt::<crate::ClientIp>() {
+        Some(ip) => Some(gql(ctx).ws.client_subs.try_acquire(ip.0).ok_or_else(|| {
+            to_err(limit(
+                "ws_subscriptions_per_client",
+                "too many subscriptions from this client",
+            ))
+        })?),
+        None => None,
+    };
     let proc_ = gql(ctx)
         .ws
         .subs
@@ -201,6 +219,7 @@ pub fn acquire(ctx: &Context<'_>) -> async_graphql::Result<SubSlot> {
     kdx_metrics::get().graphql_subscriptions.inc();
     Ok(SubSlot {
         _conn: conn,
+        _client: client,
         _proc: proc_,
     })
 }

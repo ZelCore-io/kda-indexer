@@ -56,12 +56,23 @@ pub struct GraphqlSettings {
     /// HTTP request body cap (POST).
     pub max_body_bytes: usize,
     pub ws_subs_per_conn: usize,
+    /// Subscriptions per client (an IPv4 address or an IPv6 /64, as the rate limiter keys
+    /// it), over all its connections (M-2).
+    pub ws_subs_per_ip: usize,
+    /// Subscriptions per IPv6 /48 (M-2).
+    pub ws_subs_per_48: usize,
     pub ws_subs_max: usize,
     pub ws_conns_per_ip: usize,
+    /// Connections per IPv6 /48 (M-2).
+    pub ws_conns_per_48: usize,
+    /// Connections per process (M-2: sized apart from `ws_subs_max`).
+    pub ws_conns_max: usize,
     pub ws_init: Duration,
     pub ws_idle: Duration,
     pub ws_tx_wait: Duration,
     pub feed_poll: Duration,
+    /// Byte budget of the decoded blocks the feed's broadcast ring holds (M-3).
+    pub feed_ring_bytes: usize,
     /// `networkInfo.networkId`.
     pub network_id: String,
     /// `networkInfo.networkHost` (never the node URL).
@@ -96,12 +107,17 @@ impl Default for GraphqlSettings {
             max_variables_bytes: 64 * 1024,
             max_body_bytes: MAX_BODY_BYTES,
             ws_subs_per_conn: 20,
+            ws_subs_per_ip: 40,
+            ws_subs_per_48: 120,
             ws_subs_max: 2000,
             ws_conns_per_ip: 10,
+            ws_conns_per_48: 30,
+            ws_conns_max: 1000,
             ws_init: Duration::from_secs(10),
             ws_idle: Duration::from_secs(600),
             ws_tx_wait: Duration::from_secs(3600),
             feed_poll: Duration::from_millis(1000),
+            feed_ring_bytes: crate::feed::RING_BYTES,
             network_id: "mainnet01".into(),
             network_host: String::new(),
             apq: false,

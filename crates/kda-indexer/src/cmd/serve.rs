@@ -91,7 +91,7 @@ pub fn api(
     // GraphQL (spec §5.3) on `api.graphql`; subscriptions come from the committed-block feed
     // (GQ-6), which polls the store, so `serve` and replicas have them as `run` does.
     let gs = cfg.graphql.settings(&cfg.network);
-    let feed = kdx_graphql::BlockFeed::spawn(api.state(), gs.feed_poll);
+    let feed = kdx_graphql::BlockFeed::spawn(api.state(), gs.feed_poll, gs.feed_ring_bytes);
     let schema = kdx_graphql::build_schema_with_search(api.state(), gs, Some(feed), search);
     Ok(api.graphql_routes(kdx_graphql::router(schema)))
 }

@@ -149,8 +149,11 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | Limit | Default | On refusal |
 |---|---|---|
 | connections per client IP (an IPv6 client counts by its /64) | `ws_conns_per_ip = 10` | upgrade answers 429 (`ws_connections_per_ip`) |
-| connections per process | `ws_subs_max = 2000` | upgrade answers 429 (`ws_connections`) |
+| connections per IPv6 /48 (all its /64s together) | `ws_conns_per_48 = 30` | upgrade answers 429 (`ws_connections_per_ip`) |
+| connections per process | `ws_conns_max = 1000` | upgrade answers 429 (`ws_connections`) |
 | subscriptions per connection | `ws_subs_per_conn = 20` | the subscription gets a `LIMIT` error (`ws_subscriptions_per_connection`), the connection stays |
+| subscriptions per client IP (IPv4 address or IPv6 /64), over all its connections | `ws_subs_per_ip = 40` | `LIMIT` error (`ws_subscriptions_per_client`), the connection stays |
+| subscriptions per IPv6 /48 | `ws_subs_per_48 = 120` | `LIMIT` error (`ws_subscriptions_per_client`), the connection stays |
 | subscriptions per process | `ws_subs_max = 2000` | `LIMIT` error (`ws_subscriptions`) |
 | `connection_init` | within `ws_init_secs = 10` | close 4408 (`ws_init_timeout`) |
 | no subscription open | for `ws_idle_secs = 600` | close 4000 (`ws_idle`) |
@@ -158,9 +161,14 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | client messages | one per-IP rate token each (pings too) | close 4429 (`ws_rate`) |
 | a client that does not read | 30 s per server message | close 4008 (`ws_slow_reader`) |
 | a chain whose feed read fails | 30 ticks in a row | that chain alone is skipped each tick (a WARN line with the chain and its failure count; the other chains keep delivering), then resumes from its tip with a gap |
-| a subscriber behind the feed | 1,024 feed items | one `INTERNAL` error; the subscription goes on from the feed's newest item |
+| a subscriber behind the feed | 1,024 feed items, or behind blocks the ring had to drop to stay within `feed_ring_mb = 64` MB of decoded blocks | one `INTERNAL` error; the subscription goes on from the feed's newest item |
 | a query or mutation over the socket | subscriptions only | `NOT_SUPPORTED` error, nothing runs (`ws_query`); send queries over HTTP |
 | one subscription message | the HTTP request deadline, shared by all its resolvers | `TIMEOUT` error for that message |
+
+The per-client and per-/48 caps keep a few clients from holding every process slot: a
+kadscan page holds a handful of subscriptions on one connection, so one client fits several
+open pages under `ws_subs_per_ip`. An IPv4 client is capped per address only; an IPv6 client
+by its /64 and, with the other /64s of its /48, by the /48 caps.
 
 Depth, complexity and the size limits apply to subscription documents as to queries. Every
 slot is released when its subscription or connection ends; `kdx_graphql_subscriptions` is the
@@ -197,6 +205,15 @@ number open.
 
 Subscriptions read a feed that polls the stored chain tips every `feed_poll_ms` (1,000), so
 `serve` and replicas serve them as `run` does.
+
+The feed decodes each new block's txs once and shares them with every subscriber through a
+broadcast ring of 1,024 items. The ring is byte-bounded (`feed_ring_mb`, 64 MB by default):
+before a block would take the decoded blocks it holds past the budget, the feed pushes the
+oldest blocks out of the ring with empty items. Only a subscriber that has not read those
+blocks yet gets the lag error; a subscriber that keeps up skips the empty items and loses
+nothing. Full blocks of maximum-size txs therefore cannot pin more than the budget (plus one
+block over the budget, alone) behind a client that stops reading. `kdx_graphql_feed_ring_bytes`
+is the current estimate.
 
 - A message never carries more items than its complexity priced: a catch-up is split over
   several messages.
@@ -325,6 +342,10 @@ the oracle puts them.
   is answered as the caller's own choice. Even a `coin` row proves only that the account's guard
   holds the key, not who owns the account: anyone can create an account guarded by someone
   else's key without their signature.
+  The 100 are counted after the module filter: accounts of other modules guarded by the same
+  key (spam needs no signature) never push the asked module's accounts out. The walk over the
+  key's accounts stops at 100 matches or after its 1 s scan window; when it stops with
+  accounts of the key left unread, the response carries `"extensions": {"truncated": true}`.
 - `FungibleAccount.transactions`: txs with a transfer of the token on the account's side;
   `FungibleChainAccount.transactions`: txs on that chain the account sent (`meta.sender`),
   as the schema says.
