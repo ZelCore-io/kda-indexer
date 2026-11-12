@@ -1845,8 +1845,10 @@ name = "kdx-ingest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "blake3",
  "futures",
+ "kdx-api",
  "kdx-decode",
  "kdx-hot",
  "kdx-metrics",
@@ -1863,6 +1865,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "zstd",
 ]

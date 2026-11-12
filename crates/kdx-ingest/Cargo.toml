@@ -27,5 +27,8 @@ zstd.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+kdx-api.workspace = true
+axum.workspace = true
+tower.workspace = true
 tempfile.workspace = true
 blake3.workspace = true
