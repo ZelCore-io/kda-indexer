@@ -951,3 +951,58 @@ mod mem_tests {
         assert!(small.postings_mem_entries < big.postings_mem_entries);
     }
 }
+
+#[cfg(test)]
+mod merkle_spool_tests {
+    use super::*;
+
+    /// A real mainnet block (chain 0 height 3,125,000) from the stateful fixture.
+    fn block() -> (kdx_decode::DecodedBlock, kdx_decode::VerifyReport) {
+        let raw =
+            zstd::decode_all(&include_bytes!("../tests/fixtures/chain0_3125000.json.zst")[..])
+                .unwrap();
+        let v: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
+        pipeline::prepare_value(0, 3_125_000, &v[0]["header"], &v[0]["payload"]).unwrap()
+    }
+
+    /// Review M4 (P5): mismatch lines are spooled in `etl/` during the build, reach
+    /// `merkle-unverified.jsonl` only at `commit` (after the manifest commit), are appended
+    /// after the earlier lines, and the spool is removed. A clean range writes nothing.
+    #[test]
+    fn mismatch_lines_spool_in_etl_and_append_after_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let etl = dir.path().join("etl");
+        fs::create_dir_all(&etl).unwrap();
+        let path = dir.path().join(MERKLE_UNVERIFIED);
+        fs::write(&path, "earlier\n").unwrap();
+        let ok = block();
+        assert!(ok.1.merkle_verified());
+        let mut bad = ok.clone();
+        bad.0.miner_bytes[0] ^= 1;
+        bad.1.merkle = Some(kdx_decode::merkle_check(&bad.0, &bad.0.header.payload_hash));
+
+        let mut t = MerkleTally::new(&etl, 300);
+        t.add(&[ok.clone(), bad]).unwrap();
+        assert_eq!((t.verified, t.mismatch, t.mismatch_legacy), (1, 1, 0));
+        let spool = etl.join(merkle_spool_name(300));
+        assert!(spool.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "earlier\n");
+        t.commit(dir.path(), 300);
+        let s = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 2, "{s}");
+        assert_eq!(lines[0], "earlier");
+        let l: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(
+            (l["height"].as_u64(), l["which"].as_str()),
+            (Some(3_125_000), Some("tx_root"))
+        );
+        assert!(!spool.exists());
+
+        let mut t = MerkleTally::new(&etl, 600);
+        t.add(&[ok]).unwrap();
+        t.commit(dir.path(), 600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), s);
+        assert!(!etl.join(merkle_spool_name(600)).exists());
+    }
+}

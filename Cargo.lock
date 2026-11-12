@@ -1534,6 +1534,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "zstd",
 ]
 
 [[package]]
@@ -1554,6 +1555,7 @@ name = "kdx-ingest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "futures",
  "kdx-decode",
  "kdx-hot",
