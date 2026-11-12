@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
             ..
         } => {
             for o in kdx_compare::graphql::once(cfg.clone(), &stem).await? {
-                println!("class={}", o.class);
+                println!("{}", o.summary_line());
                 if let Some(r) = o.record {
                     println!("{}", serde_json::to_string_pretty(&r)?);
                 }
@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let _ = t;
             for o in kdx_compare::run::once(cfg.clone(), &path).await? {
-                println!("class={}", o.class);
+                println!("{}", o.summary_line());
                 if let Some(r) = o.record {
                     println!("{}", serde_json::to_string_pretty(&r)?);
                 }

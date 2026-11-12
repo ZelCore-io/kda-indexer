@@ -1020,6 +1020,7 @@ impl Ctx {
             note,
         };
         Outcome {
+            allowlist_ids: allowlisted.to_vec(),
             class: class.to_string(),
             record: Some(rec),
         }
@@ -1127,6 +1128,7 @@ impl Ctx {
     ) -> Outcome {
         if d.is_empty() {
             return Outcome {
+                allowlist_ids: Vec::new(),
                 class: "match".into(),
                 record: None,
             };
@@ -1171,6 +1173,7 @@ impl Ctx {
         };
         if a.error_codes().iter().any(|c| c == "NOT_SUPPORTED") {
             return Outcome {
+                allowlist_ids: Vec::new(),
                 class: "match".into(),
                 record: None,
             };
@@ -1309,6 +1312,7 @@ impl Ctx {
     ) -> Outcome {
         if d.is_empty() {
             return Outcome {
+                allowlist_ids: Vec::new(),
                 class: "match".into(),
                 record: None,
             };
@@ -1497,6 +1501,7 @@ impl Ctx {
             }
             if d.is_empty() {
                 return Outcome {
+                    allowlist_ids: Vec::new(),
                     class: "match".into(),
                     record: None,
                 };

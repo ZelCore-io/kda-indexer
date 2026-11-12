@@ -218,6 +218,63 @@ fn replica_clamp(tip_a: u64, tip_b: u64) -> u64 {
     tip_a.min(tip_b).saturating_sub(REPLICA_TIP_MARGIN)
 }
 
+/// Drops the rows above `clamp` on both sides. When that drops any, a side that held its
+/// full limit (`full_a`, `full_b`) covers only the heights from its lowest row up, so both
+/// sides are cut at the higher of those heights. The lowest rows are taken before the drop:
+/// a side can lose every row (5E: a frozen `serve` replica ~120 heights behind, whose
+/// newest-first page of the other side lay wholly above the clamp), and its page still
+/// bounds what it covers. Returns how many rows were dropped.
+fn clamp_lists(va: &mut Value, vb: &mut Value, clamp: u64, full_a: bool, full_b: bool) -> usize {
+    let n = len_of(va) + len_of(vb);
+    let (low_a, low_b) = (min_height(va), min_height(vb));
+    if drop_above(va, clamp) + drop_above(vb, clamp) == 0 {
+        return 0;
+    }
+    let cut = [(full_a, low_a), (full_b, low_b)]
+        .into_iter()
+        .filter_map(|(f, h)| if f { h } else { None })
+        .max();
+    if let Some(cut) = cut {
+        drop_at_or_below(va, cut);
+        drop_at_or_below(vb, cut);
+    }
+    n - (len_of(va) + len_of(vb))
+}
+
+/// Replica pair `/stats`: the supply grows with every height, so two copies at tips
+/// `tip_a` and `tip_b` differ by what the heights between them minted. When the side with
+/// the higher tip holds the higher supply (either way inside `REPLICA_TIP_MARGIN`) and the
+/// difference is within `(tip gap + REPLICA_TIP_MARGIN) * SUPPLY_PER_HEIGHT`, the field is
+/// removed from both sides and the pair returned, reported as the supply tolerance (skew).
+/// 5E: a frozen `serve` replica fell ~120 heights behind and every `/stats` was a diff.
+fn replica_supply_skew(
+    va: &mut Value,
+    vb: &mut Value,
+    tip_a: u64,
+    tip_b: u64,
+) -> Option<(Value, Value)> {
+    const K: &str = "coinsInCirculation";
+    let x = va.get(K).and_then(num_value)?;
+    let y = vb.get(K).and_then(num_value)?;
+    if x == y {
+        return None;
+    }
+    let gap = tip_a.abs_diff(tip_b);
+    let direction = gap <= REPLICA_TIP_MARGIN || (x > y) == (tip_a > tip_b);
+    let tol = 1e-6 * x.abs().max(y.abs());
+    let room = (gap + REPLICA_TIP_MARGIN) as f64 * SUPPLY_PER_HEIGHT + tol;
+    if !direction || (x - y).abs() > room {
+        return None;
+    }
+    let pair = (va.get(K).cloned()?, vb.get(K).cloned()?);
+    for v in [va, vb] {
+        if let Some(m) = v.as_object_mut() {
+            m.remove(K);
+        }
+    }
+    Some(pair)
+}
+
 /// Replica pair: splits off the route-intrinsic tolerance entries (`/stats` count and
 /// supply inside their tolerance, which move on every block, so two independently tailing
 /// stores differ there whenever they read different tips). Returns the other entries and
@@ -342,6 +399,24 @@ pub struct Ctx {
 pub struct Outcome {
     pub class: String,
     pub record: Option<DiffRecord>,
+    /// Allowlist ids that matched (an `allowlisted` outcome carries no record).
+    pub allowlist_ids: Vec<String>,
+}
+
+impl Outcome {
+    /// The line `kda-compare once` prints first: the class, and the allowlist ids that
+    /// matched when there are any.
+    pub fn summary_line(&self) -> String {
+        if self.allowlist_ids.is_empty() {
+            format!("class={}", self.class)
+        } else {
+            format!(
+                "class={} allowlist={}",
+                self.class,
+                self.allowlist_ids.join(",")
+            )
+        }
+    }
 }
 
 impl Ctx {
@@ -695,21 +770,9 @@ impl Ctx {
                 query_limit(&req.path_and_query)
             };
             let full = |n: usize, t: bool| t || limit.is_none_or(|l| n >= l);
-            let (na, nb) = (len_of(&va), len_of(&vb));
-            let fa = full(na, pa.truncated || page_cut);
-            let fb = full(nb, pb.truncated || page_cut);
-            let dropped = drop_above(&mut va, clamp) + drop_above(&mut vb, clamp);
-            if dropped > 0 {
-                let cut = [(fa, min_height(&va)), (fb, min_height(&vb))]
-                    .into_iter()
-                    .filter_map(|(f, h)| if f { h } else { None })
-                    .max();
-                if let Some(cut) = cut {
-                    drop_at_or_below(&mut va, cut);
-                    drop_at_or_below(&mut vb, cut);
-                }
-                lag_rows = (na + nb) - (len_of(&va) + len_of(&vb));
-            }
+            let fa = full(len_of(&va), pa.truncated || page_cut);
+            let fb = full(len_of(&vb), pb.truncated || page_cut);
+            lag_rows = clamp_lists(&mut va, &mut vb, clamp, fa, fb);
         }
         // kda-txs can stop one row short of the limit (seen live: limit 250, 250 rows on A,
         // 249 on kda-txs, A's extra row the oldest). When one side holds `limit` rows and the
@@ -761,6 +824,13 @@ impl Ctx {
                         supply_lag = Some(pair);
                     }
                 }
+            }
+        }
+        // Replica pair /stats: the supply tolerance follows the real tip gap.
+        let mut replica_supply: Option<(Value, Value)> = None;
+        if req.route == RouteKind::Stats && replica && sa == 200 && sb == 200 {
+            if let (Some(x), Some(y)) = (self.oracle_tip(ta).await, self.oracle_tip(tb).await) {
+                replica_supply = replica_supply_skew(&mut va, &mut vb, x, y);
             }
         }
         normalize(&req.route, &mut va);
@@ -1175,6 +1245,14 @@ impl Ctx {
                 b: None,
             });
         }
+        if let Some((x, y)) = replica_supply {
+            d.push(DiffEntry {
+                path: STATS_SUPPLY_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(x),
+                b: Some(y),
+            });
+        }
         if let Some((x, y)) = supply_lag {
             d.push(DiffEntry {
                 path: format!("{ORACLE_LAG_PATH}/coinsInCirculation"),
@@ -1347,6 +1425,7 @@ impl Ctx {
             _ => None,
         };
         Outcome {
+            allowlist_ids: ids,
             class: class.to_string(),
             record,
         }
@@ -1374,6 +1453,7 @@ impl Ctx {
             Some(msg.to_string()),
         );
         Outcome {
+            allowlist_ids: Vec::new(),
             class: "a-error".into(),
             record: Some(rec),
         }
@@ -1402,6 +1482,7 @@ impl Ctx {
             Some(msg.to_string()),
         );
         Outcome {
+            allowlist_ids: Vec::new(),
             class: "b-error".into(),
             record: Some(rec),
         }
@@ -1409,6 +1490,7 @@ impl Ctx {
 
     fn simple(class: &str) -> Outcome {
         Outcome {
+            allowlist_ids: Vec::new(),
             class: class.into(),
             record: None,
         }
@@ -1509,6 +1591,7 @@ impl Ctx {
                     Some("balance differs from /local past the skew allowance".into()),
                 );
                 return Outcome {
+                    allowlist_ids: Vec::new(),
                     class: "skew".into(),
                     record: Some(rec),
                 };
@@ -1673,6 +1756,7 @@ impl Ctx {
                 )),
             );
             return Outcome {
+                allowlist_ids: Vec::new(),
                 class: "reorg".into(),
                 record: Some(rec),
             };
@@ -2407,6 +2491,7 @@ impl Ctx {
                 Some(format!("sampled block {hash} is no longer canonical")),
             );
             return Outcome {
+                allowlist_ids: Vec::new(),
                 class: "reorg".into(),
                 record: Some(rec),
             };
@@ -2815,6 +2900,93 @@ mod tests {
         );
         assert_eq!(query_limit("/txs/account/k:a"), None);
         assert_eq!(num_value(&json!("1.5")), Some(1.5));
+    }
+
+    fn rows(hs: &[u64]) -> Value {
+        Value::Array(hs.iter().map(|h| json!({"height": h})).collect())
+    }
+
+    fn heights(v: &Value) -> Vec<u64> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .filter_map(row_height)
+            .collect()
+    }
+
+    /// 5E: a frozen `serve` replica (tip 100) beside a tailing one (tip 130), `/v1/txs`
+    /// limit 5. A's newest-first page lies wholly above the clamp (95), B's reaches below.
+    /// Both sides held their limit, so nothing below A's page is comparable: both end empty
+    /// (before the fix, B kept 90 and 88 and the pair reported them as missing on A).
+    #[test]
+    fn list_clamp_keeps_a_page_bound_when_a_side_loses_every_row() {
+        let clamp = replica_clamp(130, 100);
+        assert_eq!(clamp, 95);
+        let (mut a, mut b) = (
+            rows(&[130, 128, 126, 100, 98]),
+            rows(&[100, 98, 90, 88, 86]),
+        );
+        assert_eq!(clamp_lists(&mut a, &mut b, clamp, true, true), 10);
+        assert!(heights(&a).is_empty() && heights(&b).is_empty(), "{a} {b}");
+        // A's page reaches below the clamp: the overlap under it is compared.
+        let (mut a, mut b) = (rows(&[130, 100, 94, 90, 88]), rows(&[100, 94, 90, 88, 86]));
+        assert_eq!(clamp_lists(&mut a, &mut b, clamp, true, true), 6);
+        assert_eq!((heights(&a), heights(&b)), (vec![94, 90], vec![94, 90]));
+        // A side short of its limit covers every height: no cut from it.
+        let (mut a, mut b) = (rows(&[130, 128]), rows(&[100, 90, 88]));
+        assert_eq!(clamp_lists(&mut a, &mut b, clamp, false, false), 3);
+        assert_eq!((heights(&a), heights(&b)), (vec![], vec![90, 88]));
+        // Nothing above the clamp: untouched.
+        let (mut a, mut b) = (rows(&[90, 88]), rows(&[90, 88]));
+        assert_eq!(clamp_lists(&mut a, &mut b, clamp, true, true), 0);
+        assert_eq!(heights(&a), vec![90, 88]);
+    }
+
+    /// 5E: the replica `/stats` supply tolerance follows the real tip gap, in the gap's
+    /// direction.
+    #[test]
+    fn replica_supply_tolerance_follows_the_tip_gap() {
+        let s = |x: f64| json!({"transactionCount": 1, "coinsInCirculation": x});
+        let base = 379_720_725.947;
+        // 120 heights apart at ~18 KDA per height: 2160 KDA, far over the 1e-6 tolerance.
+        let (mut a, mut b) = (s(base + 2160.0), s(base));
+        let pair = replica_supply_skew(&mut a, &mut b, 1120, 1000).expect("skew");
+        assert_eq!(pair.1, json!(base));
+        assert!(a.get("coinsInCirculation").is_none() && b.get("coinsInCirculation").is_none());
+        assert_eq!(a.get("transactionCount"), Some(&json!(1)));
+        // Same gap, B ahead: B holds the higher supply.
+        let (mut a, mut b) = (s(base), s(base + 2160.0));
+        assert!(replica_supply_skew(&mut a, &mut b, 1000, 1120).is_some());
+        // The lagging side holding the higher supply is not skew.
+        let (mut a, mut b) = (s(base), s(base + 2160.0));
+        assert!(replica_supply_skew(&mut a, &mut b, 1120, 1000).is_none());
+        assert!(a.get("coinsInCirculation").is_some());
+        // More than the gap can mint (125 heights * 60 KDA + 1e-6 relative ~ 7880 KDA).
+        let (mut a, mut b) = (s(base + 8000.0), s(base));
+        assert!(replica_supply_skew(&mut a, &mut b, 1120, 1000).is_none());
+        // Tips equal: up to the margin's worth either way.
+        let (mut a, mut b) = (s(base), s(base + 200.0));
+        assert!(replica_supply_skew(&mut a, &mut b, 1000, 1000).is_some());
+        // Equal values: nothing to report.
+        let (mut a, mut b) = (s(base), s(base));
+        assert!(replica_supply_skew(&mut a, &mut b, 1120, 1000).is_none());
+    }
+
+    /// `kda-compare once` names the allowlist ids of an allowlisted outcome (it has no record).
+    #[test]
+    fn once_line_names_the_allowlist_ids() {
+        let mut o = Outcome {
+            allowlist_ids: vec!["stats-estimate".into(), "event-order".into()],
+            class: "allowlisted".into(),
+            record: None,
+        };
+        assert_eq!(
+            o.summary_line(),
+            "class=allowlisted allowlist=stats-estimate,event-order"
+        );
+        o.allowlist_ids.clear();
+        o.class = "match".into();
+        assert_eq!(o.summary_line(), "class=match");
     }
 
     /// I1: a replica pair keeps the `/stats` tolerances (as `skew`) and nothing else, and its
