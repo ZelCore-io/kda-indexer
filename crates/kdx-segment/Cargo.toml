@@ -19,6 +19,7 @@ roaring.workspace = true
 blake3.workspace = true
 rayon.workspace = true
 memmap2.workspace = true
+libc.workspace = true
 reth-nippy-jar.workspace = true
 kdx-types.workspace = true
 kdx-decode.workspace = true

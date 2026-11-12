@@ -195,6 +195,27 @@ impl BlockFileWriter {
     }
 }
 
+thread_local! {
+    /// One decompression context per read thread: creating a context per row (and building
+    /// its tables) was ~6% of warm `/v1/txs` CPU. Each call is a one-shot decompression that
+    /// takes the file's dictionary by reference, so the context holds no file state.
+    static DCTX: std::cell::RefCell<zstd::zstd_safe::DCtx<'static>> =
+        std::cell::RefCell::new(zstd::zstd_safe::DCtx::create());
+}
+
+/// The VM page size (madvise needs a page-aligned start).
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        // SAFETY: sysconf has no preconditions.
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(n)
+            .ok()
+            .filter(|n| n.is_power_of_two())
+            .unwrap_or(4096)
+    })
+}
+
 /// Read side: mmapped data + offsets, prepared decoder dictionary.
 pub struct BlockFile {
     data: DataReader,
@@ -245,12 +266,73 @@ impl BlockFile {
             );
         }
         let z = self.data.data(a..b);
-        let cap = self.header.max_raw_row as usize;
-        let mut d = match &self.ddict {
-            Some(dd) => zstd::bulk::Decompressor::with_prepared_dictionary(dd)?,
-            None => zstd::bulk::Decompressor::new()?,
-        };
-        d.decompress(z, cap).context("zstd decompress")
+        let mut out = Vec::with_capacity(self.header.max_raw_row as usize);
+        DCTX.with_borrow_mut(|dctx| {
+            match &self.ddict {
+                Some(dd) => dctx.decompress_using_ddict(&mut out, z, dd.as_ddict()),
+                None => dctx.decompress(&mut out, z),
+            }
+            .map_err(|code| {
+                anyhow::anyhow!("zstd decompress: {}", zstd::zstd_safe::get_error_name(code))
+            })
+        })?;
+        Ok(out)
+    }
+
+    /// Byte spans `(offset, len)` of the compressed rows holding `records` in the data file,
+    /// ascending, adjacent rows merged. Records past the end are skipped.
+    pub fn record_spans(&self, records: impl IntoIterator<Item = u64>) -> Result<Vec<(u64, u64)>> {
+        let br = u64::from(self.header.block_records);
+        let mut rows: Vec<usize> = records
+            .into_iter()
+            .filter(|&i| i < self.header.records)
+            .map(|i| (i / br) as usize)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for r in rows {
+            let (a, b) = (self.data.offset(r)?, self.data.offset(r + 1)?);
+            if a > b || b > self.data.size() as u64 {
+                bail!("row {r}: offsets {a}..{b} outside the data file");
+            }
+            match spans.last_mut() {
+                Some((s, l)) if *s + *l == a => *l += b - a,
+                _ => spans.push((a, b - a)),
+            }
+        }
+        Ok(spans)
+    }
+
+    /// Asks the kernel to read the compressed rows of `records` ahead (`MADV_WILLNEED` on
+    /// their spans of the mapping), so a cold read of many records faults them in parallel
+    /// rather than one page fault at a time. Advisory: errors are ignored. Returns the bytes
+    /// advised.
+    pub fn prefetch(&self, records: impl IntoIterator<Item = u64>) -> Result<u64> {
+        let spans = self.record_spans(records)?;
+        let page = page_size();
+        let mut bytes = 0;
+        for (off, len) in spans {
+            let (off, len) = (off as usize, len as usize);
+            if len == 0 {
+                continue;
+            }
+            let p = self.data.data(off..off + len).as_ptr() as usize;
+            let start = p & !(page - 1);
+            // SAFETY: `start..p + len` lies inside the read-only mapping of the data file
+            // (the mapping begins page-aligned at file offset 0, and `p..p + len` was just
+            // bounds-checked by `record_spans`); MADV_WILLNEED only schedules readahead and
+            // changes no memory contents.
+            unsafe {
+                libc::madvise(
+                    start as *mut libc::c_void,
+                    p + len - start,
+                    libc::MADV_WILLNEED,
+                );
+            }
+            bytes += len as u64;
+        }
+        Ok(bytes)
     }
 
     /// Record `i` (copy).

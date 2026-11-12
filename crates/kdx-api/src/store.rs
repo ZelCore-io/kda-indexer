@@ -397,6 +397,14 @@ impl View {
         ViewDict::new(&self.txn, self.dict.clone())
     }
 
+    /// Read-ahead for the frozen tx and block records of `keys` before a loop decodes them
+    /// one by one (a cold `/v1/txs` page otherwise faults its rows in serially). Advisory.
+    pub fn prefetch(&self, keys: impl IntoIterator<Item = TxKey>) -> ApiResult<u64> {
+        Ok(self
+            .seg
+            .prefetch(keys.into_iter().filter(|k| self.frozen(k.height())))?)
+    }
+
     pub fn tx(&self, k: TxKey) -> ApiResult<Option<TxRecord>> {
         let h = k.height();
         if self.frozen(h) {

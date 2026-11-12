@@ -1943,6 +1943,7 @@ dependencies = [
  "blake3",
  "kdx-decode",
  "kdx-types",
+ "libc",
  "memmap2",
  "proptest",
  "ptr_hash",

@@ -208,6 +208,9 @@ fn entries(
     if namespace != "coin" {
         keys.extend(token_rows(view, account, "coin", limit)?);
     }
+    // Cold pages: ask for every frozen row this page decodes before the first decode
+    // (advisory: a damaged file fails on the decode below).
+    let _ = view.prefetch(keys.iter().map(|(k, _)| *k));
     let mut seen = HashSet::new();
     let mut body = vec![b'['];
     let mut first = true;

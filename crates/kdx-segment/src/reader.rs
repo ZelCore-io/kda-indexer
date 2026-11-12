@@ -394,6 +394,33 @@ impl Segments {
         r.txkey_rel(txnum - r.info.first_txnum)
     }
 
+    /// Read-ahead for the tx and block records of `keys` (see [`BlockFile::prefetch`]),
+    /// grouped per range. Keys outside the frozen ranges are skipped. Returns the bytes
+    /// advised.
+    pub fn prefetch(&self, keys: impl IntoIterator<Item = TxKey>) -> Result<u64> {
+        let mut per: std::collections::BTreeMap<usize, (Vec<u64>, Vec<u64>)> =
+            std::collections::BTreeMap::new();
+        for k in keys {
+            let Some(i) = self.manifest.entry_of_height(k.height()) else {
+                continue;
+            };
+            let r = &self.ranges[i];
+            let e = per.entry(i).or_default();
+            if let Some(rel) = r.rel_of(k) {
+                e.0.push(rel);
+            }
+            if let Some(b) = r.slot(k.chain(), k.height()).and_then(|s| r.block_index(s)) {
+                e.1.push(b);
+            }
+        }
+        let mut bytes = 0;
+        for (i, (txs, blocks)) in per {
+            let r = &self.ranges[i];
+            bytes += r.txs.prefetch(txs)? + r.blocks.prefetch(blocks)?;
+        }
+        Ok(bytes)
+    }
+
     pub fn txnum_of(&self, k: TxKey) -> Option<u64> {
         let r = self.range_of_height(k.height())?;
         r.rel_of(k).map(|x| x + r.info.first_txnum)
