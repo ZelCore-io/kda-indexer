@@ -96,6 +96,7 @@ impl Query {
 
     async fn events(
         &self,
+        ctx: &Context<'_>,
         after: Option<String>,
         before: Option<String>,
         block_hash: Option<String>,
@@ -110,7 +111,23 @@ impl Query {
         qualified_event_name: String,
         request_key: Option<String>,
     ) -> Result<QueryEventsConnection> {
-        unserved!("Query.events")
+        crate::types::tx::query_events(
+            ctx,
+            after,
+            before,
+            block_hash,
+            chain_id,
+            first,
+            last,
+            max_height,
+            min_height,
+            minimum_depth,
+            order_index,
+            parameters_filter,
+            qualified_event_name,
+            request_key,
+        )
+        .await
     }
 
     async fn fungible_account(
@@ -203,15 +220,17 @@ impl Query {
 
     async fn transaction(
         &self,
+        ctx: &Context<'_>,
         block_hash: Option<String>,
         minimum_depth: Option<i32>,
         request_key: String,
     ) -> Result<Option<Transaction>> {
-        unserved!("Query.transaction")
+        crate::types::tx::query_transaction(ctx, block_hash, minimum_depth, request_key).await
     }
 
     async fn transactions(
         &self,
+        ctx: &Context<'_>,
         account_name: Option<String>,
         after: Option<String>,
         before: Option<String>,
@@ -225,22 +244,42 @@ impl Query {
         minimum_depth: Option<i32>,
         request_key: Option<String>,
     ) -> Result<QueryTransactionsConnection> {
-        unserved!("Query.transactions")
+        crate::types::tx::query_transactions(
+            ctx,
+            account_name,
+            after,
+            before,
+            block_hash,
+            chain_id,
+            first,
+            fungible_name,
+            last,
+            max_height,
+            min_height,
+            minimum_depth,
+            request_key,
+        )
+        .await
     }
 
     async fn transactions_by_public_key(
         &self,
+        ctx: &Context<'_>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
         last: Option<i32>,
         public_key: String,
     ) -> Result<QueryTransactionsByPublicKeyConnection> {
-        unserved!("Query.transactionsByPublicKey")
+        crate::types::tx::query_transactions_by_public_key(
+            ctx, after, before, first, last, public_key,
+        )
+        .await
     }
 
     async fn transfers(
         &self,
+        ctx: &Context<'_>,
         account_name: Option<String>,
         after: Option<String>,
         before: Option<String>,
@@ -251,6 +290,18 @@ impl Query {
         last: Option<i32>,
         request_key: Option<String>,
     ) -> Result<QueryTransfersConnection> {
-        unserved!("Query.transfers")
+        crate::types::tx::query_transfers(
+            ctx,
+            account_name,
+            after,
+            before,
+            block_hash,
+            chain_id,
+            first,
+            fungible_name,
+            last,
+            request_key,
+        )
+        .await
     }
 }

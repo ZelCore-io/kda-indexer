@@ -1,61 +1,131 @@
-//! `Transfer` (Task 4).
+//! `Transfer` (Task 4): a transfer of a loaded tx (chainweb-data's `mkTransfer` rule, as
+//! compat). `crossChainTransfer` is preloaded with the page when the operation selects it,
+//! else read on demand.
 
-use async_graphql::{Object, Result, ID};
+use std::sync::Arc;
 
-use super::{unserved, Block, Transaction};
+use async_graphql::{Context, Object, Result, ID};
+use serde_json::Value;
+
+use super::{Block, Transaction};
+use crate::error::from_api;
+use crate::gql;
+use crate::ids::{encode, NodeKey};
 use crate::scalars::{BigInt, DateTime, Decimal};
+use crate::txlist::{block_node, xchain_of, Blocks, TxData, XHalf};
+use kdx_api::compat::shapes;
 
-#[derive(Debug, Clone, Default)]
-pub struct Transfer {}
+#[derive(Debug, Clone)]
+pub struct Transfer {
+    pub d: Arc<TxData>,
+    /// Index in `d.trs`.
+    pub i: usize,
+    /// The preloaded other half (`Some(None)`: there is none).
+    pub xchain: Option<XHalf>,
+}
+
+impl Transfer {
+    pub fn new(d: Arc<TxData>, i: usize, xchain: Option<XHalf>) -> Transfer {
+        Transfer { d, i, xchain }
+    }
+    fn t(&self) -> &shapes::Transfer {
+        &self.d.trs[self.i]
+    }
+    fn ord_idx(&self) -> i64 {
+        shapes::ev_idx(self.d.key(), self.t().pos)
+    }
+    fn mod_hash(&self) -> String {
+        self.d
+            .evs
+            .get(self.t().pos)
+            .map(|e| e.module_hash.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The exact amount text of a transfer: the decimal of the event's third parameter, else
+/// chainweb-data's rendering.
+fn amount(d: &TxData, t: &shapes::Transfer) -> Decimal {
+    let p = d.evs.get(t.pos).and_then(|e| e.params.get(2));
+    let text = match p {
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Object(o)) => o.get("decimal").or_else(|| o.get("int")).map(|v| match v {
+            Value::String(s) => s.clone(),
+            v => v.to_string(),
+        }),
+        _ => None,
+    };
+    text.as_deref()
+        .and_then(Decimal::new)
+        .or_else(|| Decimal::new(&t.amount))
+        .unwrap_or_else(|| Decimal::new("0").expect("0 is a decimal"))
+}
 
 #[Object]
 impl Transfer {
-    async fn amount(&self) -> Result<Decimal> {
-        unserved!("Transfer.amount")
+    async fn amount(&self) -> Decimal {
+        amount(&self.d, self.t())
     }
-    async fn block(&self) -> Result<Block> {
-        unserved!("Transfer.block")
+    async fn block(&self) -> Block {
+        block_node(&self.d.block)
     }
     #[graphql(deprecation = "Use `block.hash` field instead.")]
-    async fn block_hash(&self) -> Result<String> {
-        unserved!("Transfer.blockHash")
+    async fn block_hash(&self) -> String {
+        self.d.block_hash()
     }
     #[graphql(deprecation = "Use `block.chainId` field instead.")]
-    async fn chain_id(&self) -> Result<BigInt> {
-        unserved!("Transfer.chainId")
+    async fn chain_id(&self) -> BigInt {
+        BigInt(i128::from(self.d.key().chain()))
     }
-    async fn creation_time(&self) -> Result<DateTime> {
-        unserved!("Transfer.creationTime")
+    async fn creation_time(&self) -> DateTime {
+        DateTime(self.d.block.creation_time as i64)
     }
-    async fn cross_chain_transfer(&self) -> Result<Option<Transfer>> {
-        unserved!("Transfer.crossChainTransfer")
+    async fn cross_chain_transfer(&self, ctx: &Context<'_>) -> Result<Option<Transfer>> {
+        let half = match &self.xchain {
+            Some(x) => x.clone(),
+            None => {
+                let (d, i) = (self.d.clone(), self.i);
+                gql(ctx)
+                    .state()?
+                    .read(move |view| xchain_of(view, &d, i, &mut Blocks::default()))
+                    .await
+                    .map_err(from_api)?
+            }
+        };
+        Ok(half.map(|(d, i)| Transfer::new(d, i, None)))
     }
     #[graphql(deprecation = "Use `block.height` field instead.")]
-    async fn height(&self) -> Result<BigInt> {
-        unserved!("Transfer.height")
+    async fn height(&self) -> BigInt {
+        BigInt(i128::from(self.d.key().height()))
     }
     pub async fn id(&self) -> Result<ID> {
-        unserved!("Transfer.id")
+        Ok(ID(encode(&NodeKey::Transfer {
+            block_hash: self.d.block_hash(),
+            chain: i64::from(self.d.key().chain()),
+            order_index: self.ord_idx(),
+            module_hash: self.mod_hash(),
+            request_key: self.d.rk(),
+        })))
     }
-    async fn module_hash(&self) -> Result<String> {
-        unserved!("Transfer.moduleHash")
+    async fn module_hash(&self) -> String {
+        self.mod_hash()
     }
-    async fn module_name(&self) -> Result<String> {
-        unserved!("Transfer.moduleName")
+    async fn module_name(&self) -> String {
+        self.t().token.clone()
     }
-    async fn order_index(&self) -> Result<BigInt> {
-        unserved!("Transfer.orderIndex")
+    async fn order_index(&self) -> BigInt {
+        BigInt(i128::from(self.ord_idx()))
     }
-    async fn receiver_account(&self) -> Result<String> {
-        unserved!("Transfer.receiverAccount")
+    async fn receiver_account(&self) -> String {
+        self.t().to.clone()
     }
-    async fn request_key(&self) -> Result<String> {
-        unserved!("Transfer.requestKey")
+    async fn request_key(&self) -> String {
+        self.d.rk()
     }
-    async fn sender_account(&self) -> Result<String> {
-        unserved!("Transfer.senderAccount")
+    async fn sender_account(&self) -> String {
+        self.t().from.clone()
     }
-    async fn transaction(&self) -> Result<Option<Transaction>> {
-        unserved!("Transfer.transaction")
+    async fn transaction(&self) -> Option<Transaction> {
+        Transaction::new(self.d.clone())
     }
 }
