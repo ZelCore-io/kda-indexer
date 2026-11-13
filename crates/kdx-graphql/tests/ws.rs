@@ -802,3 +802,35 @@ async fn floods_are_still_closed_with_the_production_burst() {
         "only {rate_closed} of 10 connections closed for rate"
     );
 }
+
+/// A flood on one connection from a full bucket is closed at exactly message `rate_burst + 1`:
+/// the opening borrow only matters once the bucket is drained, and `ws_subs_per_conn + 2` is
+/// bounded by `rate_burst` (config validation), so it never moves the cut-off. The server
+/// answers every accepted message (`connection_init` with an ack, a ping with a pong), so the
+/// replies counted before the 4429 close are the messages that took a token. Refill is 1/s and
+/// the burst takes milliseconds.
+#[tokio::test]
+async fn flood_from_a_full_bucket_is_closed_at_message_rate_burst_plus_one() {
+    const BURST: usize = 40;
+    let s = server(GraphqlSettings::default(), BURST as u32).await;
+    let mut w = connect_as(&s, "graphql-transport-ws", Some("192.0.2.40"))
+        .await
+        .unwrap();
+    send(&mut w, json!({"type": "connection_init", "payload": {}})).await;
+    for _ in 0..(BURST + 20) {
+        let ping = Message::Text(json!({"type": "ping"}).to_string().into());
+        if w.send(ping).await.is_err() {
+            break;
+        }
+    }
+    let mut accepted = 0;
+    let code = loop {
+        match recv(&mut w).await {
+            Ok(_) => accepted += 1,
+            Err(code) => break code,
+        }
+    };
+    assert_eq!(code, 4429);
+    // `rate_burst` messages (the init and 39 pings) are answered; message 41 is refused.
+    assert_eq!(accepted, BURST, "messages answered before the close");
+}
