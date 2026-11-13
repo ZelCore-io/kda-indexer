@@ -99,6 +99,9 @@ const CANON_CACHE_MAX: usize = 100_000;
 /// JSON path of the visible allowlist hit for `/txs/search` rows chainweb-data lists in a
 /// block that is not on the node's canonical branch (R-P5P9-48).
 const ORACLE_ORPHAN_PATH: &str = "/~oracle-orphan";
+/// JSON path of the visible allowlist hit for `/txs/search` rows chainweb-data lacks below its
+/// tip while the node puts them in kda-indexer's canonical block (R-P5P9-48).
+const ORACLE_GAP_PATH: &str = "/~oracle-gap";
 
 /// For each pair of tx objects at the same place (the object itself, or the same index of
 /// two arrays) whose `events` hold the same items in another order, sorts both `events`
@@ -322,8 +325,23 @@ fn query_account(req: &Request) -> String {
 struct SearchRows {
     /// chainweb-data rows in a block off the node's canonical branch.
     orphans: Vec<Value>,
-    /// A rows dropped below a full chainweb-data page once its orphans were removed.
+    /// A rows above chainweb-data's tip.
+    lag: Vec<Value>,
+    /// A rows below it that the node puts in A's canonical block.
+    gap: Vec<Value>,
+    /// chainweb-data's tip, when it was read.
+    b_tip: Option<u64>,
+    /// Rows of A and of B dropped at or past the last row of a full page.
     a_cut: usize,
+    b_cut: usize,
+}
+
+/// A `/txs/search` row's place in the answer order: `pactid` successful first, then height
+/// descending; `search=` height descending.
+fn search_place(pactid: bool, r: &Value) -> (bool, std::cmp::Reverse<u64>) {
+    let failed = pactid && r.get("result").and_then(Value::as_str) != Some("TxSucceeded");
+    let h = r.get("height").and_then(Value::as_u64).unwrap_or(0);
+    (failed, std::cmp::Reverse(h))
 }
 
 impl SearchRows {
@@ -349,7 +367,25 @@ impl SearchRows {
                 kind: DiffKind::Missing,
                 a: None,
                 b: Some(json!({"rows": self.orphans.len(), "a_cut": self.a_cut,
-                    "first": first(&self.orphans)})),
+                    "b_cut": self.b_cut, "first": first(&self.orphans)})),
+            });
+        }
+        if !self.lag.is_empty() {
+            d.push(DiffEntry {
+                path: ORACLE_LAG_PATH.into(),
+                kind: DiffKind::Extra,
+                a: Some(json!({"rows": self.lag.len(), "b_tip": self.b_tip,
+                    "a_cut": self.a_cut, "b_cut": self.b_cut, "first": first(&self.lag)})),
+                b: None,
+            });
+        }
+        if !self.gap.is_empty() {
+            d.push(DiffEntry {
+                path: ORACLE_GAP_PATH.into(),
+                kind: DiffKind::Extra,
+                a: Some(json!({"rows": self.gap.len(), "b_tip": self.b_tip,
+                    "a_cut": self.a_cut, "b_cut": self.b_cut, "first": first(&self.gap)})),
+                b: None,
             });
         }
         d
@@ -1087,8 +1123,10 @@ impl Ctx {
             && sa == 200
             && sb == 200
         {
-            let full_b = search_page_full(&req.path_and_query, len_of(&vb), page_cut);
-            self.search_oracle_rows(req, &mut va, &mut vb, full_b).await
+            let full = |v: &Value| search_page_full(&req.path_and_query, len_of(v), page_cut);
+            let full = (full(&va), full(&vb));
+            self.search_oracle_rows(req, tb, &mut va, &mut vb, full)
+                .await
         } else {
             SearchRows::default()
         };
@@ -2167,24 +2205,45 @@ impl Ctx {
         Some(v)
     }
 
-    /// `/txs/search` against chainweb-data (R-P5P9-48): a row chainweb-data lists and A does
-    /// not (by request key and block) leaves `vb` when the node's canonical block at its
-    /// (chain, height), on the cut's branch, is another one (seen live in run 6E-3: 23
-    /// records, e.g. chain 2 height 7399318, chainweb-data block oC2lnmOL, canonical
-    /// OHz-ZmnP). Rows the node cannot settle stay. When B held a full page, A is then cut
-    /// to B's length (B's next rows were not fetched). `search=` rows chainweb-data matched
-    /// through a `cont` tx's initial code are left to S-3.
+    /// `/txs/search` against chainweb-data (R-P5P9-48), rows one side lists and the other
+    /// lacks (by request key and block). First, when a side held a full page, rows at or past
+    /// its last row's place in the answer order leave both sides (the next rows of that side
+    /// were not fetched). Then:
+    /// - a chainweb-data row leaves `vb` as an orphan when the node's canonical block at its
+    ///   (chain, height), on the cut's branch, is another one (seen live in run 6E-3: 23
+    ///   records, e.g. chain 2 height 7399318, chainweb-data block oC2lnmOL, canonical
+    ///   OHz-ZmnP). `search=` rows chainweb-data matched through a `cont` tx's initial code
+    ///   are left to S-3.
+    /// - an A row above chainweb-data's tip is oracle lag (seen live: 5unn... chain 0, B's
+    ///   newest row 60-150 heights below A's); below it, oracle gap when the node's `/poll`
+    ///   puts the tx in A's block and that block is canonical (the 2026-11-10 hole).
+    ///
+    /// Rows the node cannot settle stay diffs.
     async fn search_oracle_rows(
         &self,
         req: &Request,
+        tb: &Target,
         va: &mut Value,
         vb: &mut Value,
-        full_b: bool,
+        (full_a, full_b): (bool, bool),
     ) -> SearchRows {
         let mut out = SearchRows::default();
         let (Value::Array(xa), Value::Array(xb)) = (&mut *va, &mut *vb) else {
             return out;
         };
+        let pactid = req.path_and_query.contains("pactid=");
+        let place = |r: &Value| search_place(pactid, r);
+        let bound = [(full_a, xa.last()), (full_b, xb.last())]
+            .into_iter()
+            .filter_map(|(full, last)| if full { last.map(place) } else { None })
+            .min();
+        if let Some(bound) = bound {
+            let (na, nb) = (xa.len(), xb.len());
+            xa.retain(|r| place(r) < bound);
+            xb.retain(|r| place(r) < bound);
+            out.a_cut = na - xa.len();
+            out.b_cut = nb - xb.len();
+        }
         let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
         let key = |r: &Value| (s(r, "requestKey"), s(r, "blockHash"));
         let cont_history = |r: &Value| {
@@ -2221,11 +2280,103 @@ impl Ctx {
                 i += 1;
             }
         }
-        if !out.orphans.is_empty() && full_b && xa.len() > xb.len() {
-            out.a_cut = xa.len() - xb.len();
-            xa.truncate(xb.len());
+        let b_keys: std::collections::HashSet<_> = xb.iter().map(key).collect();
+        let only_a: Vec<usize> = (0..xa.len())
+            .filter(|&i| !b_keys.contains(&key(&xa[i])))
+            .collect();
+        if only_a.is_empty() {
+            return out;
+        }
+        out.b_tip = self.oracle_tip(tb).await;
+        let mut lag = Vec::new();
+        let mut asked = Vec::new();
+        for i in only_a {
+            let h = xa[i].get("height").and_then(Value::as_u64);
+            if h.zip(out.b_tip).is_some_and(|(h, t)| h > t) {
+                lag.push(i);
+            } else {
+                asked.push(i);
+            }
+        }
+        let rows: Vec<&Value> = asked.iter().map(|&i| &xa[i]).collect();
+        let ok = self
+            .node_in_canonical_block(req, &rows, &mut cache, &mut checks)
+            .await;
+        let gap: Vec<usize> = asked
+            .iter()
+            .zip(ok)
+            .filter_map(|(&i, ok)| ok.then_some(i))
+            .collect();
+        let mut gone: Vec<(usize, bool)> = lag
+            .into_iter()
+            .map(|i| (i, true))
+            .chain(gap.into_iter().map(|i| (i, false)))
+            .collect();
+        gone.sort_unstable();
+        for &(i, is_lag) in gone.iter().rev() {
+            let r = xa.remove(i);
+            if is_lag {
+                out.lag.insert(0, r);
+            } else {
+                out.gap.insert(0, r);
+            }
         }
         out
+    }
+
+    /// Per row: the node's `/poll` puts its request key in the row's block, and that block is
+    /// the canonical one at the row's (chain, height) on the cut's branch. At most
+    /// NODE_GAP_CHECKS rows are asked, in `/poll` calls of NODE_POLL_CHUNK; the others, and
+    /// rows the node does not answer, are not confirmed.
+    async fn node_in_canonical_block(
+        &self,
+        req: &Request,
+        rows: &[&Value],
+        cache: &mut HashMap<(u8, u64), Option<String>>,
+        checks: &mut usize,
+    ) -> Vec<bool> {
+        let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+        let mut ok = vec![false; rows.len()];
+        let mut by_chain: std::collections::BTreeMap<u8, Vec<usize>> = Default::default();
+        for (i, r) in rows.iter().enumerate().take(NODE_GAP_CHECKS) {
+            if let (Some(c), Some(_), Some(_)) =
+                (row_chain(r), s(r, "requestKey"), s(r, "blockHash"))
+            {
+                by_chain.entry(c).or_default().push(i);
+            }
+        }
+        for (c, idx) in by_chain {
+            for chunk in idx.chunks(NODE_POLL_CHUNK) {
+                let rks: Vec<String> = chunk
+                    .iter()
+                    .filter_map(|&i| s(rows[i], "requestKey"))
+                    .collect();
+                self.count_request(req.route.as_str(), "node", 1);
+                let Ok(res) = self.node.poll(c, &rks).await else {
+                    continue;
+                };
+                for &i in chunk {
+                    let r = rows[i];
+                    let (Some(rk), Some(bh), Some(h)) = (
+                        s(r, "requestKey"),
+                        s(r, "blockHash"),
+                        r.get("height").and_then(Value::as_u64),
+                    ) else {
+                        continue;
+                    };
+                    let polled = res
+                        .get(&rk)
+                        .and_then(|v| v.pointer("/metaData/blockHash"))
+                        .and_then(Value::as_str);
+                    if polled != Some(bh.as_str()) {
+                        continue;
+                    }
+                    let canon = self.canon_cached(cache, checks, c, h).await.flatten();
+                    ok[i] = canon.as_deref() == Some(bh.as_str());
+                }
+            }
+        }
+        ok
     }
 
     /// Splits oracle rows into (orphans, canonical): a row is canonical when the node's

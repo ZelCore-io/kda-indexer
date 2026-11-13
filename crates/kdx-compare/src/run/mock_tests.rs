@@ -274,23 +274,18 @@ async fn search_orphan_rows_are_oracle_orphan() {
     assert!(ids.is_empty(), "{ids:?}");
 }
 
-/// A full `pactid` page of chainweb-data with an orphan row: A is cut to B's length.
+/// Full `pactid` pages (limit 4): rows at or past the last row of a full page leave both
+/// sides, then chainweb-data's orphan row is classified.
 #[tokio::test]
-async fn pactid_orphan_cuts_a_full_page() {
+async fn pactid_orphan_on_full_pages() {
     let out = tempfile::tempdir().unwrap();
-    let mut node = NodeMock {
-        tip: 7_400_500,
-        ..NodeMock::default()
-    };
-    for h in 7_399_000..7_399_010 {
-        node.canon.insert((2, h), format!("c{h}"));
-    }
-    // limit 3: B lists two canonical rows and an orphan, A three canonical rows.
+    let node = canon_node(&[2], 7_399_000..7_399_010);
     let a = SideMock {
         search: json!([
             row("r9", 2, 7_399_009, "c7399009"),
             row("r8", 2, 7_399_008, "c7399008"),
             row("r7", 2, 7_399_007, "c7399007"),
+            row("r6", 2, 7_399_006, "c7399006"),
         ]),
         ..SideMock::default()
     };
@@ -299,11 +294,136 @@ async fn pactid_orphan_cuts_a_full_page() {
             row("r9", 2, 7_399_009, "c7399009"),
             row("o8", 2, 7_399_008, "orphan8"),
             row("r8", 2, 7_399_008, "c7399008"),
+            row("r7", 2, 7_399_007, "c7399007"),
         ]),
         ..SideMock::default()
     };
     let (ctx, _) = setup(node, a, b, out.path()).await;
-    let (class, ids, paths) = compare(&ctx, "/txs/search?pactid=9INv2Zb3&limit=3").await;
+    let (class, ids, paths) = compare(&ctx, "/txs/search?pactid=9INv2Zb3&limit=4").await;
     assert_eq!(class, "allowlisted", "unexplained: {paths:?}");
     assert_eq!(ids, vec!["oracle-orphan".to_string()]);
+}
+
+/// A node whose canonical block at (c, h) is `c{h}` for every chain in `chains`.
+fn canon_node(chains: &[u8], heights: std::ops::Range<u64>) -> NodeMock {
+    let mut node = NodeMock {
+        tip: 7_400_500,
+        ..NodeMock::default()
+    };
+    for &c in chains {
+        for h in heights.clone() {
+            node.canon.insert((c, h), format!("c{h}"));
+        }
+    }
+    node
+}
+
+/// chainweb-data's tip as `/txs/recent` shows it.
+fn recent_at(h: u64) -> Value {
+    json!([row("x", 7, h, "any")])
+}
+
+/// Rows kda-indexer lists and chainweb-data lacks: above chainweb-data's tip they are
+/// oracle lag, settled without the node.
+#[tokio::test]
+async fn search_rows_above_oracle_tip_are_oracle_lag() {
+    let out = tempfile::tempdir().unwrap();
+    let node = canon_node(&[0], 7_400_000..7_400_400);
+    let a = SideMock {
+        search: json!([
+            row("new2", 0, 7_400_313, "c7400313"),
+            row("new1", 0, 7_400_312, "c7400312"),
+            row("old", 0, 7_400_064, "c7400064"),
+        ]),
+        ..SideMock::default()
+    };
+    let b = SideMock {
+        search: json!([row("old", 0, 7_400_064, "c7400064")]),
+        recent: recent_at(7_400_200),
+        ..SideMock::default()
+    };
+    let (ctx, calls) = setup(node, a, b, out.path()).await;
+    let req = "/txs/search?search=5unn&minheight=7400000&maxheight=7400400&limit=10";
+    let (class, ids, paths) = compare(&ctx, req).await;
+    assert_eq!(class, "allowlisted", "unexplained: {paths:?}");
+    assert_eq!(ids, vec!["oracle-tip-lag".to_string()]);
+    assert!(!calls.lock().unwrap().iter().any(|c| c.contains("/poll")));
+}
+
+/// Rows kda-indexer lists and chainweb-data lacks below its tip: oracle gap only when the
+/// node's /poll puts the tx in kda-indexer's block and that block is canonical.
+#[tokio::test]
+async fn search_rows_the_node_confirms_are_oracle_gap() {
+    let req = "/txs/search?search=Au4cjML8&minheight=7392000&maxheight=7392500&limit=10";
+    let a_rows = json!([
+        row("h2", 1, 7_392_417, "c7392417"),
+        row("h1", 1, 7_392_368, "c7392368"),
+        row("t0", 1, 7_392_000, "c7392000"),
+    ]);
+    let b = || SideMock {
+        search: json!([row("t0", 1, 7_392_000, "c7392000")]),
+        recent: recent_at(7_400_400),
+        ..SideMock::default()
+    };
+    let a = || SideMock {
+        search: a_rows.clone(),
+        ..SideMock::default()
+    };
+    // Both confirmed.
+    let out = tempfile::tempdir().unwrap();
+    let mut node = canon_node(&[1], 7_392_000..7_392_500);
+    node.poll.insert("h2".into(), (1, "c7392417".into()));
+    node.poll.insert("h1".into(), (1, "c7392368".into()));
+    let (ctx, _) = setup(node, a(), b(), out.path()).await;
+    let (class, ids, paths) = compare(&ctx, req).await;
+    assert_eq!(class, "allowlisted", "unexplained: {paths:?}");
+    assert_eq!(ids, vec!["oracle-gap".to_string()]);
+    // The node puts h1 in another block: h1 stays a diff.
+    let out = tempfile::tempdir().unwrap();
+    let mut node = canon_node(&[1], 7_392_000..7_392_500);
+    node.poll.insert("h2".into(), (1, "c7392417".into()));
+    node.poll.insert("h1".into(), (1, "other".into()));
+    let (ctx, _) = setup(node, a(), b(), out.path()).await;
+    let (class, _, _) = compare(&ctx, req).await;
+    assert_eq!(class, "diff");
+    // /poll agrees but the block is not canonical on the cut's branch: still a diff.
+    let out = tempfile::tempdir().unwrap();
+    let mut node = canon_node(&[1], 7_392_000..7_392_500);
+    node.canon.insert((1, 7_392_368), "canonical".into());
+    node.poll.insert("h2".into(), (1, "c7392417".into()));
+    node.poll.insert("h1".into(), (1, "c7392368".into()));
+    let (ctx, _) = setup(node, a(), b(), out.path()).await;
+    let (class, _, _) = compare(&ctx, req).await;
+    assert_eq!(class, "diff");
+}
+
+/// A full kda-indexer `pactid` page whose newest row chainweb-data lacks: the node confirms
+/// it (oracle gap), and chainweb-data's rows past kda-indexer's last row leave the compare.
+#[tokio::test]
+async fn pactid_gap_on_a_full_page() {
+    let out = tempfile::tempdir().unwrap();
+    let mut node = canon_node(&[2], 7_399_000..7_399_400);
+    node.poll.insert("n1".into(), (2, "c7399313".into()));
+    let a = SideMock {
+        search: json!([
+            row("n1", 2, 7_399_313, "c7399313"),
+            row("r9", 2, 7_399_009, "c7399009"),
+            row("r8", 2, 7_399_008, "c7399008"),
+        ]),
+        ..SideMock::default()
+    };
+    let b_rows = json!([
+        row("r9", 2, 7_399_009, "c7399009"),
+        row("r8", 2, 7_399_008, "c7399008"),
+        row("r7", 2, 7_399_007, "c7399007"),
+    ]);
+    let b = SideMock {
+        search: b_rows,
+        recent: recent_at(7_400_400),
+        ..SideMock::default()
+    };
+    let (ctx, _) = setup(node, a, b, out.path()).await;
+    let (class, ids, paths) = compare(&ctx, "/txs/search?pactid=Zq9GapPact&limit=3").await;
+    assert_eq!(class, "allowlisted", "unexplained: {paths:?}");
+    assert_eq!(ids, vec!["oracle-gap".to_string()]);
 }
