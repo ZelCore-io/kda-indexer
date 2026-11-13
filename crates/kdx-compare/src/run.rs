@@ -320,6 +320,29 @@ fn query_account(req: &Request) -> String {
         .unwrap_or_default()
 }
 
+/// `/coins` against chainweb-data (R-P5P9-48): a difference past the relative 1e-6 of
+/// `coins-supply-tolerance` is the tip gap when the side with the higher tip has the higher
+/// supply and the difference is at most the coinbase minted between the two tips, plus that
+/// relative tolerance (seen live in run 6E-3: 2,621.7 KDA with chainweb-data about 145
+/// heights behind). Tips are A's and chainweb-data's `/txs/recent`; no gap, no allowance.
+/// Returns the visible hit.
+fn coins_tip_lag(a: &Value, b: &Value, a_tip: u64, b_tip: u64) -> Option<DiffEntry> {
+    let x = crate::diff::num_or_text_f64(a)?;
+    let y = crate::diff::num_or_text_f64(b)?;
+    let tol = 1e-6 * x.abs().max(y.abs());
+    let d = (x - y).abs();
+    if a_tip == 0 || a_tip == b_tip || d <= tol || (x > y) != (a_tip > b_tip) {
+        return None;
+    }
+    let minted = crate::rewards::minted_between(a_tip.min(b_tip), a_tip.max(b_tip));
+    (d <= minted + tol).then(|| DiffEntry {
+        path: format!("{ORACLE_LAG_PATH}/coins"),
+        kind: DiffKind::Changed,
+        a: Some(json!({"value": a, "tip": a_tip})),
+        b: Some(json!({"value": b, "tip": b_tip, "minted_between": minted})),
+    })
+}
+
 /// What [`Ctx::search_oracle_rows`] moved out of a `/txs/search` compare.
 #[derive(Debug, Default)]
 struct SearchRows {
@@ -859,6 +882,22 @@ impl Ctx {
                 }
             }
         }
+        // /coins against chainweb-data: the supply grows with every block, so a difference
+        // within the coinbase minted between the two tips is that gap (R-P5P9-48).
+        let mut coins_lag: Option<DiffEntry> = None;
+        if req.route == RouteKind::Coins
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && sa == 200
+            && sb == 200
+            && va != vb
+        {
+            if let Some(b_tip) = self.oracle_tip(tb).await {
+                coins_lag = coins_tip_lag(&va, &vb, self.tips.a_tip(), b_tip);
+                if coins_lag.is_some() {
+                    vb = va.clone();
+                }
+            }
+        }
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
         // chainweb-data and kda-txs list a tx's events in their own order (seen live on
@@ -1285,6 +1324,7 @@ impl Ctx {
                 b: None,
             });
         }
+        d.extend(coins_lag);
         if let Some((x, y)) = supply_lag {
             d.push(DiffEntry {
                 path: format!("{ORACLE_LAG_PATH}/coinsInCirculation"),
@@ -3056,6 +3096,37 @@ mod tests {
             ("/row", true, true)
         );
         assert_eq!(super::balance_diff(None, &Local::Absent), (vec![], false));
+    }
+
+    /// R-P5P9-48 item 3: /coins past the relative 1e-6 is chainweb-data's tip lag only within
+    /// the coinbase minted between the two tips (18.08092 KDA per height at 7.40M).
+    #[test]
+    fn coins_tolerance_scales_with_the_tip_gap() {
+        // Run 6E-3, 04:43:29Z: A - B = 2,621.7 KDA, chainweb-data ~145 heights behind.
+        let a: Value = serde_json::from_str("379699987.13176").unwrap();
+        let b: Value = serde_json::from_str("379697365.43176").unwrap();
+        let hit = coins_tip_lag(&a, &b, 7_400_100, 7_399_955).expect("145 heights");
+        assert_eq!(hit.path, "/~oracle-lag/coins");
+        let (left, ids) = crate::allowlist::Allowlist::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+        )
+        .unwrap()
+        .classify_request(&RouteKind::Coins, "/coins", &[], &[hit]);
+        assert!(left.is_empty() && ids == vec!["oracle-tip-lag".to_string()]);
+        // No gap, or a gap whose coinbase (10 heights, 181 KDA) is too small: a diff.
+        assert!(coins_tip_lag(&a, &b, 7_400_100, 7_400_100).is_none());
+        assert!(coins_tip_lag(&a, &b, 7_400_100, 7_400_090).is_none());
+        assert!(coins_tip_lag(&a, &b, 0, 7_399_955).is_none());
+        // The side behind has the higher supply: a diff.
+        assert!(coins_tip_lag(&b, &a, 7_400_100, 7_399_955).is_none());
+        // chainweb-data ahead of A by 145 heights, its supply higher by as much: the gap.
+        assert!(coins_tip_lag(&b, &a, 7_399_955, 7_400_100).is_some());
+        // coins_tolerance_is_numeric's far value (9,987 KDA) stays a diff at 145 heights.
+        let far: Value = serde_json::from_str("379690000.0").unwrap();
+        assert!(coins_tip_lag(&a, &far, 7_400_100, 7_399_955).is_none());
+        // Within the relative tolerance the diff code's own hit applies, not this one.
+        let near: Value = serde_json::from_str("379699932.889").unwrap();
+        assert!(coins_tip_lag(&a, &near, 7_400_100, 7_399_955).is_none());
     }
 
     #[test]

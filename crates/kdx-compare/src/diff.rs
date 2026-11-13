@@ -88,7 +88,8 @@ pub fn diff_route(route: &RouteKind, a: &Value, b: &Value) -> Vec<DiffEntry> {
     diff(a, b)
 }
 
-fn num_or_text_f64(v: &Value) -> Option<f64> {
+/// A number, or a decimal written as text (`/coins`), as f64.
+pub(crate) fn num_or_text_f64(v: &Value) -> Option<f64> {
     match v {
         Value::String(s) => s.parse().ok(),
         _ => number_f64(v),
