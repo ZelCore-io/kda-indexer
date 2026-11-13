@@ -166,6 +166,31 @@ mod tests {
         assert_eq!(ids, vec!["search-window".to_string()]);
     }
 
+    /// R-P5P9-48 item 4: `pactid-cap` matches only an answer carrying X-Search-Truncated (the
+    /// 1,000-tx cap cut the walk); an uncapped pactid answer is compared in full.
+    #[test]
+    fn pactid_cap_needs_the_header() {
+        let al = shipped();
+        let a = serde_json::json!([{"requestKey": "x", "height": 10}]);
+        let b = serde_json::json!([{"requestKey": "y", "height": 10}]);
+        let d = diff_route(&RouteKind::Search, &a, &b);
+        let req = "/txs/search?pactid=wfSVxyz";
+        let (left, ids) = al.classify_request(&RouteKind::Search, req, &[], &d);
+        assert_eq!(
+            left.len(),
+            d.len(),
+            "an uncapped pactid diff is unexplained"
+        );
+        assert!(ids.is_empty());
+        let other = [("content-type".to_string(), "application/json".to_string())];
+        let (left, _) = al.classify_request(&RouteKind::Search, req, &other, &d);
+        assert_eq!(left.len(), d.len());
+        let cut = [("x-search-truncated".to_string(), "true".to_string())];
+        let (left, ids) = al.classify_request(&RouteKind::Search, req, &cut, &d);
+        assert!(left.is_empty());
+        assert_eq!(ids, vec!["pactid-cap".to_string()]);
+    }
+
     /// R-P5P9-10 #3: /coins within 1e-6 relative is a visible allowlist hit; beyond it, a diff.
     #[test]
     fn coins_tolerance_is_numeric() {
@@ -235,7 +260,8 @@ mod tests {
             "balances-tip-skew-e7f7130f",
         );
         miss(RouteKind::Balances, "/api/v1/accounts/k:other/balances");
-        // search: pact-specific classes keep their own hits, any other pactid is the cap.
+        // search: pact-specific classes keep their own hits; any other pactid diff is
+        // unexplained unless the answer says the cap cut it (pactid_cap_needs_the_header).
         hit(
             RouteKind::Search,
             "/txs/search?pactid=Au4cjML8x",
@@ -246,11 +272,7 @@ mod tests {
             "/txs/search?pactid=5unnQ",
             "cwd-search-behind-5unn",
         );
-        hit(
-            RouteKind::Search,
-            "/txs/search?pactid=wfSVxyz",
-            "pactid-cap",
-        );
+        miss(RouteKind::Search, "/txs/search?pactid=wfSVxyz");
         // The genesis defect must stay visible: a plain keyset search is not allowlisted.
         miss(
             RouteKind::Search,
