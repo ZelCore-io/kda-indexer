@@ -289,6 +289,11 @@ stays Kadena's (the parity test sees the same types, so there is nothing to pin 
 | `Block.difficulty` | `BigInt` | always a JSON number, also above 2^53 |
 | `FungibleChainAccount.chainId` | `String` | string (already) |
 
+A union or interface field (`TransactionCommand.payload`, `Transaction.result`, the `guard`
+fields, `node` and `nodes`) whose fragments select none of the value's fields answers `{}`, as
+the oracle does (`payload { ... on ExecutionPayload { code } }` on a continuation), not
+`null`; a missing value is still `null`.
+
 Everything else keeps the scalar rules (`Block.height`, `chainId`, `orderIndex`, `result.height`
 stay numbers; `totalBalance` and `balance` stay numbers). Error codes ride in
 `extensions.code` (GraphQL spec) and are copied to a top-level `code` on each error, the place

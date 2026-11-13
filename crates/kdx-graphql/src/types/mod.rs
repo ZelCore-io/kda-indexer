@@ -41,6 +41,45 @@ pub fn default_chain_ids() -> Option<Vec<String>> {
     Some((0..20).map(|c| c.to_string()).collect())
 }
 
+/// A union or interface value that answers `{}`, not `null`, when the query's fragments
+/// select none of its fields (R-P5P9-57 rule b). graphql-js, and so the oracle that kadscan
+/// reads, keeps the empty object: `payload { ... on ExecutionPayload { code } }` on a
+/// continuation is `{}`. async-graphql folds an empty selection to `null`. The schema is
+/// unchanged: the type, its name and `__typename` are the wrapped value's.
+#[derive(Debug, Clone)]
+pub struct Sel<T>(pub T);
+
+impl<T: async_graphql::OutputType> async_graphql::OutputType for Sel<T> {
+    fn type_name() -> std::borrow::Cow<'static, str> {
+        T::type_name()
+    }
+
+    fn qualified_type_name() -> String {
+        T::qualified_type_name()
+    }
+
+    fn introspection_type_name(&self) -> std::borrow::Cow<'static, str> {
+        self.0.introspection_type_name()
+    }
+
+    fn create_type_info(registry: &mut async_graphql::registry::Registry) -> String {
+        T::create_type_info(registry)
+    }
+
+    async fn resolve(
+        &self,
+        ctx: &async_graphql::ContextSelectionSet<'_>,
+        field: &async_graphql::Positioned<async_graphql::parser::types::Field>,
+    ) -> async_graphql::ServerResult<async_graphql::Value> {
+        // A union or interface never resolves to `null` itself (a missing value is the
+        // `Option` around this), so `null` here is an empty selection.
+        match self.0.resolve(ctx, field).await? {
+            async_graphql::Value::Null => Ok(async_graphql::Value::Object(Default::default())),
+            v => Ok(v),
+        }
+    }
+}
+
 /// The Relay `Node` interface.
 #[derive(Interface)]
 #[graphql(field(name = "id", ty = "ID"))]

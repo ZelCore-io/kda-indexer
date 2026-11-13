@@ -16,7 +16,7 @@ use super::guard::{map_guard, RawGuard};
 use super::{
     IGuard, NonFungibleAccountTransactionsConnection, NonFungibleAccountTransactionsConnectionEdge,
     NonFungibleChainAccountTransactionsConnection,
-    NonFungibleChainAccountTransactionsConnectionEdge, Transaction,
+    NonFungibleChainAccountTransactionsConnectionEdge, Sel, Transaction,
 };
 use crate::connection::{PageArgs, Total};
 use crate::error::{err, from_api, Code};
@@ -272,7 +272,7 @@ impl NonFungibleTokenBalance {
     /// The holding's guard from `NftDetails`. Without a usable row: an empty `RawGuard` and a
     /// `NOT_AVAILABLE` error for this field (the type is non-null, and an error alone would
     /// null the whole account).
-    async fn guard(&self, ctx: &Context<'_>) -> IGuard {
+    async fn guard(&self, ctx: &Context<'_>) -> Sel<IGuard> {
         let field = "NonFungibleTokenBalance.guard";
         let found = self
             .item
@@ -281,15 +281,15 @@ impl NonFungibleTokenBalance {
             .filter(|h| h.status == nft::DETAIL_FOUND)
             .and_then(|h| serde_json::from_str::<serde_json::Value>(&h.guard).ok());
         if let Some(g) = found {
-            return map_guard(&g, None);
+            return Sel(map_guard(&g, None));
         }
         let e = not_available(field, self.item.holder.as_ref().map(|h| h.status));
         ctx.add_error(ctx.set_error_path(e.into_server_error(ctx.item.pos)));
-        IGuard::RawGuard(RawGuard {
+        Sel(IGuard::RawGuard(RawGuard {
             keys: vec![],
             predicate: String::new(),
             raw: String::new(),
-        })
+        }))
     }
     pub async fn id(&self) -> Result<ID> {
         Ok(ID(encode(&NodeKey::NonFungibleTokenBalance {

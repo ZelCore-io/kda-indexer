@@ -14,7 +14,7 @@ use crate::types::{
     QueryTransactionsByPublicKeyConnection, QueryTransactionsConnection, QueryTransfersConnection,
     Transaction,
 };
-use crate::types::{QueryBalanceConnection, QueryTransactionsByPactCodeConnection};
+use crate::types::{QueryBalanceConnection, QueryTransactionsByPactCodeConnection, Sel};
 
 pub struct Query;
 
@@ -299,12 +299,13 @@ impl Query {
         crate::types::network::network_info(ctx).await
     }
 
-    async fn node(&self, ctx: &Context<'_>, id: ID) -> Result<Option<Node>> {
-        crate::types::node::node(ctx, &id).await
+    async fn node(&self, ctx: &Context<'_>, id: ID) -> Result<Option<Sel<Node>>> {
+        Ok(crate::types::node::node(ctx, &id).await?.map(Sel))
     }
 
-    async fn nodes(&self, ctx: &Context<'_>, ids: Vec<ID>) -> Result<Vec<Option<Node>>> {
-        crate::types::node::nodes(ctx, &ids).await
+    async fn nodes(&self, ctx: &Context<'_>, ids: Vec<ID>) -> Result<Vec<Option<Sel<Node>>>> {
+        let found = crate::types::node::nodes(ctx, &ids).await?;
+        Ok(found.into_iter().map(|n| n.map(Sel)).collect())
     }
 
     async fn non_fungible_account(

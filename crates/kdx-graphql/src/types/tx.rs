@@ -9,7 +9,7 @@ use async_graphql::{Context, Object, Result, SimpleObject, Union, ID};
 use serde_json::Value;
 
 use super::{
-    Block, Event, TransactionResultEventsConnection, TransactionResultEventsConnectionEdge,
+    Block, Event, Sel, TransactionResultEventsConnection, TransactionResultEventsConnectionEdge,
     TransactionResultTransfersConnection, TransactionResultTransfersConnectionEdge, Transfer,
 };
 use super::{
@@ -98,8 +98,10 @@ impl Transaction {
             request_key: self.d.rk(),
         })))
     }
-    async fn result(&self) -> TransactionInfo {
-        TransactionInfo::TransactionResult(TransactionResult { d: self.d.clone() })
+    async fn result(&self) -> Sel<TransactionInfo> {
+        Sel(TransactionInfo::TransactionResult(TransactionResult {
+            d: self.d.clone(),
+        }))
     }
     async fn sigs(&self) -> Vec<TransactionSignature> {
         self.d
@@ -119,6 +121,28 @@ pub struct TransactionCommand {
 impl TransactionCommand {
     fn cmd(&self) -> &Value {
         self.d.cmd.as_ref().unwrap_or(&Value::Null)
+    }
+
+    fn payload_value(&self) -> TransactionPayload {
+        let p = self.cmd().get("payload");
+        if let Some(c) = p.and_then(|p| p.get("cont")) {
+            return TransactionPayload::ContinuationPayload(ContinuationPayload {
+                data: json_text(c.get("data").unwrap_or(&Value::Null)),
+                pact_id: c.get("pactId").and_then(Value::as_str).map(str::to_owned),
+                proof: c.get("proof").and_then(Value::as_str).map(str::to_owned),
+                rollback: c.get("rollback").and_then(Value::as_bool),
+                step: c.get("step").and_then(Value::as_i64).map(|s| s as i32),
+            });
+        }
+        let e = p.and_then(|p| p.get("exec"));
+        TransactionPayload::ExecutionPayload(ExecutionPayload {
+            // JSON-quoted, as the oracle sends it and kadscan reads it (R-P5P9-57 F6).
+            code: e
+                .and_then(|e| e.get("code"))
+                .filter(|c| c.is_string())
+                .map(json_text),
+            data: json_text(e.and_then(|e| e.get("data")).unwrap_or(&Value::Null)),
+        })
     }
 }
 
@@ -142,26 +166,8 @@ impl TransactionCommand {
     async fn nonce(&self) -> String {
         str_of(self.cmd().get("nonce"))
     }
-    async fn payload(&self) -> TransactionPayload {
-        let p = self.cmd().get("payload");
-        if let Some(c) = p.and_then(|p| p.get("cont")) {
-            return TransactionPayload::ContinuationPayload(ContinuationPayload {
-                data: json_text(c.get("data").unwrap_or(&Value::Null)),
-                pact_id: c.get("pactId").and_then(Value::as_str).map(str::to_owned),
-                proof: c.get("proof").and_then(Value::as_str).map(str::to_owned),
-                rollback: c.get("rollback").and_then(Value::as_bool),
-                step: c.get("step").and_then(Value::as_i64).map(|s| s as i32),
-            });
-        }
-        let e = p.and_then(|p| p.get("exec"));
-        TransactionPayload::ExecutionPayload(ExecutionPayload {
-            // JSON-quoted, as the oracle sends it and kadscan reads it (R-P5P9-57 F6).
-            code: e
-                .and_then(|e| e.get("code"))
-                .filter(|c| c.is_string())
-                .map(json_text),
-            data: json_text(e.and_then(|e| e.get("data")).unwrap_or(&Value::Null)),
-        })
+    async fn payload(&self) -> Sel<TransactionPayload> {
+        Sel(self.payload_value())
     }
     async fn signers(&self) -> Vec<Signer> {
         let rk = self.d.rk();
@@ -1277,6 +1283,18 @@ mod cgfix_tests {
         async fn block(&self) -> Block {
             Block::new(self.0.block.clone())
         }
+        async fn tx(&self) -> Option<Transaction> {
+            Transaction::new(self.0.clone())
+        }
+        async fn guard(&self) -> Sel<crate::types::IGuard> {
+            Sel(crate::types::guard::map_guard(
+                &json!({"fun": "f", "args": ["a"]}),
+                None,
+            ))
+        }
+        async fn no_guard(&self) -> Option<Sel<crate::types::IGuard>> {
+            None
+        }
     }
 
     async fn run(d: Arc<TxData>, q: &str) -> Value {
@@ -1386,6 +1404,45 @@ mod cgfix_tests {
         let d = tx(0, json!({}), None, json!(["", "miner", 1.0]));
         let v = run(d, "{ transfer { requestKey } }").await;
         assert_eq!(v["transfer"]["requestKey"], json!("<coinbase>"));
+    }
+
+    /// F10 `cmd.payload` null vs `{}` (rule b): a union or interface whose fragments select
+    /// none of its fields answers `{}`, as the oracle does; a matching fragment is unchanged
+    /// and a missing value stays `null`.
+    #[tokio::test]
+    async fn unmatched_fragments_answer_an_empty_object() {
+        let cont = json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": false,
+            "data": {}, "proof": null}}});
+        let out = json!({"result": {"status": "success", "data": ""}});
+        let d = tx(1, out, Some(cont), json!([]));
+        let v = run(
+            d.clone(),
+            "{ cmd { payload { ... on ExecutionPayload { code } } }
+               tx { result { ... on TransactionMempoolInfo { status } } }
+               guard { ... on KeysetGuard { keys } }
+               noGuard { ... on KeysetGuard { keys } } }",
+        )
+        .await;
+        assert_eq!(v["cmd"]["payload"], json!({}));
+        assert_eq!(v["tx"]["result"], json!({}));
+        assert_eq!(v["guard"], json!({}));
+        assert_eq!(v["noGuard"], Value::Null);
+        let v = run(
+            d,
+            "{ cmd { payload { __typename ... on ContinuationPayload { pactId step } } }
+               tx { result { __typename } }
+               guard { __typename ... on UserGuard { fun } } }",
+        )
+        .await;
+        assert_eq!(
+            v["cmd"]["payload"],
+            json!({"__typename": "ContinuationPayload", "pactId": "p", "step": 1})
+        );
+        assert_eq!(
+            v["tx"]["result"],
+            json!({"__typename": "TransactionResult"})
+        );
+        assert_eq!(v["guard"], json!({"__typename": "UserGuard", "fun": "f"}));
     }
 
     /// M1 (GQ-19): `transactions(accountName)` keeps only the account's own txs.
