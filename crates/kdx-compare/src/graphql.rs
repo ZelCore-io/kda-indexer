@@ -18,8 +18,8 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde_json::{json, Map, Value};
 
-use crate::config::{CompareConfig, TargetKind};
-use crate::diff::{decimal_canon, diff};
+use crate::config::{CompareConfig, FieldRule, TargetKind};
+use crate::diff::{decimal_canon, diff, diff_explained};
 use crate::gen::random::RandomGen;
 use crate::gen::Tips;
 use crate::normalize::{iso_eq_coarse, iso_micros, parse_iso, RouteKind};
@@ -463,6 +463,10 @@ pub struct GqlState {
     pub sampler: tokio::sync::Mutex<Option<Sampler>>,
     rng: Mutex<StdRng>,
     cursor: AtomicUsize,
+    node_cursor: AtomicUsize,
+    /// Captured documents no pair compares, by kind (`tip`, `subscription`, `unsupported`):
+    /// the coverage list of the summary (R-P5P9-57).
+    pub unpaired: BTreeMap<String, String>,
     acct_ok: Mutex<HashMap<String, bool>>,
     oracle_timeouts: AtomicU32,
     oracle_pause_until: Mutex<Option<Instant>>,
@@ -471,6 +475,7 @@ pub struct GqlState {
 impl GqlState {
     pub fn new(cfg: &CompareConfig) -> anyhow::Result<GqlState> {
         let mut ops = Vec::new();
+        let mut unpaired = BTreeMap::new();
         if cfg.has_graphql_pairs() {
             let g = &cfg.graphql;
             if g.own_ops_dir.is_dir() {
@@ -479,6 +484,7 @@ impl GqlState {
             if let Some(d) = &g.ops_dir {
                 ops.extend(load_dir(d, true, &g.skip_ops)?);
             }
+            unpaired = unpaired_kinds(&ops);
             ops.retain(|o| o.kind != OpKind::Subscription);
         }
         Ok(GqlState {
@@ -486,6 +492,8 @@ impl GqlState {
             sampler: tokio::sync::Mutex::new(None),
             rng: Mutex::new(StdRng::from_rng(&mut rand::rng())),
             cursor: AtomicUsize::new(0),
+            node_cursor: AtomicUsize::new(0),
+            unpaired,
             acct_ok: Mutex::new(HashMap::new()),
             oracle_timeouts: AtomicU32::new(0),
             oracle_pause_until: Mutex::new(None),
@@ -607,11 +615,17 @@ pub fn normalize_gql(v: &mut Value, count_cap: u64) {
     }
 }
 
-/// Within runs of equal sort keys, orders edges by their canonical text.
+/// Within runs of equal sort keys, orders edges by their canonical text. Rows that carry a
+/// height tie on the height alone: rows within one height compare as a set (R-P5P9-57
+/// M2b/M2c; the order within a height is a contract choice, R3E-8). Rows across heights keep
+/// their order, so a list in another height order (M2a) is still a diff.
 fn sort_ties(edges: &mut [Value]) {
     let keys: Vec<Vec<String>> = edges
         .iter()
-        .map(|e| e.get("node").map(sort_key).unwrap_or_default())
+        .map(|e| match crate::graphql_norm::edge_height_key(e) {
+            Some(h) => vec![h],
+            None => e.get("node").map(sort_key).unwrap_or_default(),
+        })
         .collect();
     let mut i = 0;
     while i < edges.len() {
@@ -715,8 +729,15 @@ fn curl_of(op: &GqlOp, vars: &Map<String, Value>, var: &str) -> String {
 }
 
 /// Prepares and diffs the two answers of an oracle pair: rows above `max` dropped, pages cut to
-/// their common prefix, `totalCount` capped; the visible allowlist hits are added to the diff.
-pub fn compare_answers(a: &mut Answer, b: &mut Answer, max: u64, cap: u64) -> Vec<DiffEntry> {
+/// their common prefix, `totalCount` capped, the R-P5P9-57 normalisers applied (`rules`: the
+/// per-field ones); the visible allowlist hits are added to the diff.
+pub fn compare_answers(
+    a: &mut Answer,
+    b: &mut Answer,
+    max: u64,
+    cap: u64,
+    rules: &[FieldRule],
+) -> Vec<DiffEntry> {
     let mut hits: Vec<DiffEntry> = Vec::new();
     let hit = |p: &str| DiffEntry {
         path: p.into(),
@@ -750,8 +771,17 @@ pub fn compare_answers(a: &mut Answer, b: &mut Answer, max: u64, cap: u64) -> Ve
     let (mut na, mut nb) = (a.body.clone(), b.body.clone());
     normalize_gql(&mut na, cap);
     normalize_gql(&mut nb, cap);
-    let mut d = diff(&na, &nb);
+    if let (Some(da), Some(db)) = (na.get_mut("data"), nb.get_mut("data")) {
+        if let (Some(ca), Some(cb)) = (root_connection(da), root_connection(db)) {
+            if crate::graphql_norm::cut_trailing_ties(ca, cb) {
+                hits.push(hit(crate::graphql_norm::TIE_CUT_PATH));
+            }
+        }
+    }
+    let explain = crate::graphql_norm::explain(rules);
+    let (mut d, fired) = diff_explained(&na, &nb, &explain);
     d.extend(hits);
+    d.extend(fired.into_iter().map(hit));
     d
 }
 
@@ -921,14 +951,38 @@ impl Ctx {
         jobs
     }
 
-    /// One compare round: the next (pair, operation) in turn, with a fresh sample.
-    pub async fn gql_step(&self) -> anyhow::Result<()> {
-        let jobs = self.gql_jobs();
+    /// The jobs of one lane: the oracle pairs (`oracle`), or the node and native pairs, which
+    /// run in their own loop so the oracle limiter does not pace them (R-P5P9-57 cadence).
+    pub(crate) fn lane_jobs(&self, oracle: bool) -> Vec<(usize, Arc<GqlOp>)> {
+        self.gql_jobs()
+            .into_iter()
+            .filter(|(pi, _)| {
+                let b = &self.cfg.pairs[*pi].1;
+                let is_oracle = self
+                    .targets
+                    .get(b)
+                    .is_some_and(|t| t.kind == TargetKind::GraphqlOracle);
+                is_oracle == oracle
+            })
+            .collect()
+    }
+
+    /// One compare round of a lane: the next (pair, operation) in turn, with a fresh sample.
+    /// A draw without usable variables, or with an account newer than the oracle's ceiling,
+    /// is redrawn up to `graphql.redraws` times for the same operation (no oracle request is
+    /// made for a skipped draw).
+    pub async fn gql_step(&self, oracle_lane: bool) -> anyhow::Result<()> {
+        let jobs = self.lane_jobs(oracle_lane);
         if jobs.is_empty() {
             tokio::time::sleep(Duration::from_secs(1)).await;
             return Ok(());
         }
-        let i = self.gql.cursor.fetch_add(1, Ordering::Relaxed) % jobs.len();
+        let cursor = if oracle_lane {
+            &self.gql.cursor
+        } else {
+            &self.gql.node_cursor
+        };
+        let i = cursor.fetch_add(1, Ordering::Relaxed) % jobs.len();
         let (pi, op) = &jobs[i];
         let (a, b) = &self.cfg.pairs[*pi];
         let ta = &self.targets[a];
@@ -937,27 +991,42 @@ impl Ctx {
             tokio::time::sleep(Duration::from_secs(5)).await;
             return Ok(());
         }
-        let Some(sample) = self.gql_sample().await? else {
-            self.count_class("graphql", "gen-error");
-            return Ok(());
-        };
-        let Some(vars) = self.gql_vars(op, &sample) else {
-            self.count_class(&op.route(), "skipped-vars");
-            return Ok(());
-        };
         let route = op.route();
+        let max = tb
+            .and_then(|t| self.cfg.targets.get(&t.name))
+            .and_then(|t| t.max_height)
+            .unwrap_or(u64::MAX);
+        let mut draws = 0;
+        let (sample, vars) = loop {
+            draws += 1;
+            let Some(sample) = self.gql_sample().await? else {
+                self.count_class("graphql", "gen-error");
+                return Ok(());
+            };
+            let skip = match self.gql_vars(op, &sample) {
+                None => "skipped-vars",
+                Some(vars) => {
+                    let acct = vars.get("accountName").and_then(Value::as_str);
+                    let newer = match (op.kind, tb, acct) {
+                        (OpKind::Oracle, Some(_), Some(acct)) => {
+                            !self.account_below(ta, acct, max).await
+                        }
+                        _ => false,
+                    };
+                    if !newer {
+                        break (sample, vars);
+                    }
+                    "skipped-account-newer"
+                }
+            };
+            self.count_class(&route, skip);
+            if draws > self.cfg.graphql.redraws {
+                return Ok(());
+            }
+        };
         let o = match (op.kind, tb) {
             (OpKind::NotSupported, _) => self.gql_not_supported(ta, op, &vars).await,
-            (OpKind::Oracle, Some(tb)) => {
-                let max = self.cfg.targets[&tb.name].max_height.unwrap_or(u64::MAX);
-                if let Some(acct) = vars.get("accountName").and_then(Value::as_str) {
-                    if !self.account_below(ta, acct, max).await {
-                        self.count_class(&route, "skipped-account-newer");
-                        return Ok(());
-                    }
-                }
-                self.gql_vs_oracle(ta, tb, op, &vars, max).await
-            }
+            (OpKind::Oracle, Some(tb)) => self.gql_vs_oracle(ta, tb, op, &vars, max).await,
             (OpKind::NodeTx, None) => self.gql_node_tx(ta, op, &vars, &sample).await,
             (OpKind::NodeBlock, None) => self.gql_node_block(ta, op, &vars, &sample).await,
             (OpKind::NodeBalance, None) => self.gql_node_balance(ta, op, &vars, &sample).await,
@@ -1109,7 +1178,13 @@ impl Ctx {
                 Some("oracle server error".into()),
             );
         }
-        let d = compare_answers(&mut a, &mut b, max, self.cfg.graphql.total_count_cap);
+        let d = compare_answers(
+            &mut a,
+            &mut b,
+            max,
+            self.cfg.graphql.total_count_cap,
+            &self.cfg.graphql.field_rules,
+        );
         self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d)
     }
 
@@ -1397,7 +1472,9 @@ impl Ctx {
     }
 
     /// GraphQL chain balances and guards against `/local` `details` (H-1), retried once after a
-    /// pause because both sides read a moving tip.
+    /// pause because both sides read a moving tip. R-P5P9-57: our `Float` balance compares
+    /// with the node's decimal at f64 precision (F2, a visible hit), and a balance that is
+    /// still one coinbase below the node's after the retry is a one-block skew (class `skew`).
     async fn gql_node_balance(
         &self,
         ta: &Target,
@@ -1418,7 +1495,11 @@ impl Ctx {
             .unwrap_or_default()
             .to_string();
         let mut last: Vec<DiffEntry> = Vec::new();
+        let mut skews: Vec<DiffEntry> = Vec::new();
+        let mut floats = false;
         for attempt in 0..2 {
+            skews.clear();
+            floats = false;
             let data = match self.gql_a_data(ta, op, vars).await {
                 Ok(d) => d,
                 Err(o) => return o,
@@ -1434,8 +1515,8 @@ impl Ctx {
                 else {
                     continue;
                 };
-                let det = match local.details(chain, "coin", &account).await {
-                    Ok(kdx_node::Local::Found { value, .. }) => value,
+                let (det, node_h) = match local.details(chain, "coin", &account).await {
+                    Ok(kdx_node::Local::Found { value, height }) => (value, height),
                     Ok(kdx_node::Local::Absent) => {
                         d.push(DiffEntry {
                             path: format!("/chain{chain}"),
@@ -1465,12 +1546,27 @@ impl Ctx {
                     &text_decimal(r.get("balance")).unwrap_or_default(),
                     &det.balance,
                 ) {
-                    d.push(DiffEntry {
+                    let entry = DiffEntry {
                         path: format!("/chain{chain}/balance"),
                         kind: DiffKind::Changed,
                         a: r.get("balance").cloned(),
                         b: Some(json!(det.balance)),
-                    });
+                    };
+                    let ours = r.get("balance").and_then(crate::graphql_norm::num_f64);
+                    let theirs = det.balance.trim().parse::<f64>().ok();
+                    let reward =
+                        crate::rewards::block_reward(node_h, self.graph.chains_at(node_h).len());
+                    match (ours, theirs, reward) {
+                        (Some(x), Some(y), _) if crate::graphql_norm::f64_eq(x, y) => {
+                            floats = true;
+                        }
+                        (Some(x), _, Some(rw))
+                            if crate::graphql_norm::one_block_skew(x, &det.balance, rw) =>
+                        {
+                            skews.push(entry);
+                        }
+                        _ => d.push(entry),
+                    }
                 }
                 if let Some(g) = r.get("guard").filter(|g| g.get("keys").is_some()) {
                     let keys = |v: &Value| {
@@ -1495,16 +1591,36 @@ impl Ctx {
                     }
                 }
             }
-            if d.is_empty() {
-                return Outcome {
-                    class: "match".into(),
-                    record: None,
-                };
-            }
             last = d;
+            if last.is_empty() && skews.is_empty() {
+                break;
+            }
             if attempt == 0 {
                 tokio::time::sleep(BALANCE_RETRY).await;
             }
+        }
+        if last.is_empty() && !skews.is_empty() {
+            return self.gql_record(
+                op,
+                vars,
+                ta,
+                "node",
+                None,
+                Some(200),
+                "",
+                skews,
+                "skew",
+                &[],
+                Some("one block of coinbase behind /local after the retry (R-P5P9-57)".into()),
+            );
+        }
+        if floats {
+            last.push(DiffEntry {
+                path: crate::graphql_norm::F2_PATH.into(),
+                kind: DiffKind::Changed,
+                a: None,
+                b: None,
+            });
         }
         self.gql_node_outcome(op, vars, ta, last, &Value::Null)
     }
@@ -1591,14 +1707,27 @@ impl Ctx {
                 .and_then(|x| text_decimal(x.get("balance")))
                 .unwrap_or_default();
             if !same_decimal(&text_decimal(r.get("balance")).unwrap_or_default(), &want) {
+                // R-P5P9-57 F2: our `Float` against the native decimal at f64 precision.
+                let float = matches!(
+                    (
+                        r.get("balance").and_then(crate::graphql_norm::num_f64),
+                        want.parse::<f64>().ok(),
+                    ),
+                    (Some(x), Some(y)) if crate::graphql_norm::f64_eq(x, y)
+                );
                 d.push(DiffEntry {
-                    path: format!("/chain{chain}/balance"),
+                    path: if float {
+                        crate::graphql_norm::F2_PATH.into()
+                    } else {
+                        format!("/chain{chain}/balance")
+                    },
                     kind: DiffKind::Changed,
-                    a: r.get("balance").cloned(),
-                    b: Some(json!(want)),
+                    a: (!float).then(|| r.get("balance").cloned()).flatten(),
+                    b: (!float).then(|| json!(want)),
                 });
             }
         }
+        d.dedup_by(|x, y| x.path == y.path && x.a.is_none() && y.a.is_none());
         self.gql_node_outcome(op, vars, ta, d, &Value::Null)
     }
 }
@@ -1629,7 +1758,26 @@ fn same_decimal(a: &str, b: &str) -> bool {
     }
 }
 
-/// `run` loop: one task taking GraphQL steps until `stopping`.
+/// Captured documents that no pair compares, by kind: `tip` (answers depend on the tip; the
+/// soak and the node pairs cover them), `subscription` (the soak) and `unsupported` (answered
+/// `NOT_SUPPORTED`, checked on A alone; gap list).
+pub fn unpaired_kinds(ops: &[GqlOp]) -> BTreeMap<String, String> {
+    ops.iter()
+        .filter(|o| o.captured)
+        .filter_map(|o| {
+            let kind = match o.kind {
+                OpKind::Tip => "tip",
+                OpKind::Subscription => "subscription",
+                OpKind::NotSupported => "unsupported",
+                _ => return None,
+            };
+            Some((o.stem.clone(), kind.to_string()))
+        })
+        .collect()
+}
+
+/// `run` loops: the oracle lane takes GraphQL steps back to back (paced by the oracle's
+/// limiter), the node lane one step every `graphql.node_step_ms`, both until `stopping`.
 pub async fn run_loop(ctx: Arc<Ctx>) {
     // Every (pair, operation) shows in the summary from the start, so a gate sees an operation
     // that never got a compare as "0 compared" instead of not at all.
@@ -1639,9 +1787,23 @@ pub async fn run_loop(ctx: Arc<Ctx>) {
             let (a, b) = &ctx.cfg.pairs[pi];
             s.pair(&op.route(), a, b, "planned");
         }
+        s.graphql_unpaired.clone_from(&ctx.gql.unpaired);
     }
+    let node = ctx.clone();
+    tokio::spawn(async move {
+        let every = Duration::from_millis(node.cfg.graphql.node_step_ms);
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        while !node.stopping.load(Ordering::Relaxed) {
+            tick.tick().await;
+            if let Err(e) = node.gql_step(false).await {
+                tracing::warn!(error = %format!("{e:#}"), "graphql node step");
+                node.count_class("graphql", "gen-error");
+            }
+        }
+    });
     while !ctx.stopping.load(Ordering::Relaxed) {
-        if let Err(e) = ctx.gql_step().await {
+        if let Err(e) = ctx.gql_step(true).await {
             tracing::warn!(error = %format!("{e:#}"), "graphql step");
             ctx.count_class("graphql", "gen-error");
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1854,6 +2016,130 @@ mod tests {
     }
 
     #[test]
+    fn rows_within_a_height_are_a_set_but_heights_keep_their_order() {
+        // M2c (a CG-A transaction list): one height, another creationTime order.
+        let tx = |t: &str, h: u64, k: &str| json!({"node": {"hash": k, "cmd": {"meta": {"creationTime": t}}, "result": {"block": {"height": h}}}});
+        let a = json!({"edges": [tx("12:55:15", 9, "q"), tx("12:55:33", 9, "l"), tx("12:55:01", 8, "z")]});
+        let b = json!({"edges": [tx("12:55:33", 9, "l"), tx("12:55:15", 9, "q"), tx("12:55:01", 8, "z")]});
+        assert!(diff(&norm(a), &norm(b)).is_empty());
+        // M2b (a CG-A block list): blocks of one height in another chain order.
+        let blk = |h: u64, c: u64| json!({"node": {"height": h, "chainId": c, "creationTime": c}});
+        let a = json!({"edges": [blk(5, 0), blk(5, 1), blk(5, 2)]});
+        let b = json!({"edges": [blk(5, 2), blk(5, 0), blk(5, 1)]});
+        assert!(diff(&norm(a), &norm(b)).is_empty());
+        // M2a: heights descending against ascending is still a diff.
+        let a = json!({"edges": [blk(6, 0), blk(5, 0)]});
+        let b = json!({"edges": [blk(5, 0), blk(6, 0)]});
+        assert!(!diff(&norm(a), &norm(b)).is_empty());
+        // A row present on one side only, within a height, is still a diff.
+        let a = json!({"edges": [blk(5, 0), blk(5, 1)]});
+        let b = json!({"edges": [blk(5, 0), blk(5, 3)]});
+        assert!(!diff(&norm(a), &norm(b)).is_empty());
+    }
+
+    #[test]
+    fn oracle_pairs_apply_the_r57_normalisers_as_visible_hits() {
+        use crate::config::{FieldRule, FieldRuleKind};
+        use crate::graphql_norm::{F2_PATH, F7_PATH, FIELD_PATH, TIE_CUT_PATH};
+        let ans = |body: Value| Answer {
+            body,
+            status: 200,
+            raw: String::new(),
+            ms: Vec::new(),
+        };
+        // 60 blocks whose difficulty only differs by the oracle's float rounding, and one real
+        // difference at the end: the explained leaves do not use up the 50-entry cap.
+        let blocks = |last: &str| {
+            let mut e: Vec<Value> = (0..60u64)
+                .map(|i| json!({"node": {"height": 1000 - i, "difficulty": "1308071046363245969"}}))
+                .collect();
+            e.push(json!({"node": {"height": 1, "hash": last}}));
+            json!({"data": {"blocksFromHeight": {"edges": e, "pageInfo": {"hasNextPage": false}}}})
+        };
+        let mut a = ans(blocks("x"));
+        let mut b = ans(blocks("y"));
+        let rounded = b
+            .body
+            .to_string()
+            .replace("1308071046363245969", "1308071046363246000");
+        b.body = serde_json::from_str(&rounded).unwrap();
+        let d = compare_answers(&mut a, &mut b, u64::MAX, 10_000, &[]);
+        let paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["/data/blocksFromHeight/edges/60/node/hash", F2_PATH]
+        );
+        // F7 and a per-field rule on a transaction; F5 without its rule stays a diff.
+        let tx = |nonce: &str, data: &str| json!({"data": {"transaction": {"cmd": {"nonce": nonce, "payload": {"data": data}}}}});
+        let ours = tx(
+            "\"2025-07-15\"",
+            r#"{"k":{"pred":"keys-all","keys":["a"]}}"#,
+        );
+        let theirs = tx("2025-07-15", r#"{"k":{"keys":["a"],"pred":"keys-all"}}"#);
+        let d = compare_answers(
+            &mut ans(ours.clone()),
+            &mut ans(theirs.clone()),
+            u64::MAX,
+            10_000,
+            &[],
+        );
+        let paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["/data/transaction/cmd/nonce", F7_PATH]);
+        let rules = [FieldRule {
+            field: "cmd.nonce".into(),
+            rule: FieldRuleKind::JsonUnquote,
+        }];
+        let d = compare_answers(&mut ans(ours), &mut ans(theirs), u64::MAX, 10_000, &rules);
+        let mut paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, [FIELD_PATH, F7_PATH]);
+        // Both pages continue and the last height's rows were cut at different members.
+        let page = |cs: &[u64]| {
+            let e: Vec<Value> = cs
+                .iter()
+                .enumerate()
+                .map(|(i, c)| json!({"node": {"height": if i == 0 { 9 } else { 8 }, "chainId": c}}))
+                .collect();
+            json!({"data": {"blocksFromHeight": {"edges": e, "pageInfo": {"hasNextPage": true}}}})
+        };
+        let d = compare_answers(
+            &mut ans(page(&[0, 1, 2])),
+            &mut ans(page(&[0, 3, 4])),
+            u64::MAX,
+            10_000,
+            &[],
+        );
+        assert_eq!(
+            d.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            [TIE_CUT_PATH]
+        );
+    }
+
+    #[test]
+    fn unpaired_captured_documents_by_kind() {
+        let doc = |stem: &str, text: &str| parse_op(stem, text, true).unwrap();
+        let ops = vec![
+            doc("TipDoc", "query Query { lastBlockHeight }"),
+            doc("SubDoc", "subscription NewBlocks($quantity: Int) { newBlocks(quantity: $quantity) { hash } }"),
+            doc("PriceDoc", "query Query($moduleName: String!) { lastTokenPriceInKda(moduleName: $moduleName) }"),
+            doc("BlockDoc", "query Block($hash: String!) { block(hash: $hash) { hash } }"),
+            parse_op("QLastBlockHeight", "query { lastBlockHeight }", false).unwrap(),
+        ];
+        let u = unpaired_kinds(&ops);
+        assert_eq!(
+            u.iter()
+                .map(|(s, k)| format!("{s}={k}"))
+                .collect::<Vec<_>>(),
+            ["PriceDoc=unsupported", "SubDoc=subscription", "TipDoc=tip"]
+        );
+        let text = crate::summary::render_unpaired(&u);
+        assert!(text.contains("never paired: 3"), "{text}");
+        assert!(text.contains("  tip (1): TipDoc\n"), "{text}");
+        assert!(text.contains("  subscription (1): SubDoc\n"), "{text}");
+        assert!(text.contains("  unsupported (1): PriceDoc\n"), "{text}");
+    }
+
+    #[test]
     fn numbers_by_decimal_value_and_big_ints_either_way() {
         assert!(diff(&norm(json!({"x": 9.99})), &norm(json!({"x": 9.990}))).is_empty());
         assert!(diff(
@@ -2034,7 +2320,7 @@ mod tests {
         assert_eq!(edges_len(&mut b.body["data"]), 4);
         assert_eq!(a.ms.len(), 2);
         // The longer side is cut to the shorter one; the only entry is the visible hit.
-        let d = compare_answers(&mut a, &mut b, u64::MAX, 10_000);
+        let d = compare_answers(&mut a, &mut b, u64::MAX, 10_000, &[]);
         assert_eq!(
             d.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
             [PAGE_CUT_PATH]
@@ -2042,11 +2328,11 @@ mod tests {
         // Everything followed: both have all 7 rows and match without any hit.
         let mut a = fetch_pages(&ta, &op, &vars, 5).await.unwrap();
         let mut b = fetch_pages(&tb, &op, &vars, 5).await.unwrap();
-        assert!(compare_answers(&mut a, &mut b, u64::MAX, 10_000).is_empty());
+        assert!(compare_answers(&mut a, &mut b, u64::MAX, 10_000, &[]).is_empty());
         // Rows above the oracle's ceiling are dropped from both sides and recorded.
         let mut a = fetch_pages(&ta, &op, &vars, 5).await.unwrap();
         let mut b = fetch_pages(&tb, &op, &vars, 5).await.unwrap();
-        let d = compare_answers(&mut a, &mut b, 103, 10_000);
+        let d = compare_answers(&mut a, &mut b, 103, 10_000, &[]);
         assert_eq!(
             d.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
             [ORACLE_STALL_PATH]
@@ -2068,11 +2354,20 @@ mod tests {
             a: None,
             b: None,
         };
-        let hits = [PAGE_CUT_PATH, TOTALCOUNT_CAP_PATH, ORACLE_STALL_PATH]
-            .map(|p| entry(p, DiffKind::Changed));
+        use crate::graphql_norm::{F2_PATH, F7_PATH, FIELD_PATH, TIE_CUT_PATH};
+        let hits = [
+            PAGE_CUT_PATH,
+            TOTALCOUNT_CAP_PATH,
+            ORACLE_STALL_PATH,
+            F2_PATH,
+            F7_PATH,
+            FIELD_PATH,
+            TIE_CUT_PATH,
+        ]
+        .map(|p| entry(p, DiffKind::Changed));
         let (un, ids) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &hits);
         assert!(un.is_empty(), "{un:?}");
-        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.len(), 7);
         // A real difference on a GraphQL request is not allowlisted.
         let real = [entry("/data/block/hash", DiffKind::Changed)];
         let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &real);

@@ -53,6 +53,10 @@ pub struct CompareConfig {
     /// GraphQL harness settings (spec section 7, plan Task 7).
     #[serde(default)]
     pub graphql: GraphqlConfig,
+    /// `/coins` cadence (R-P5P9-57): one `/coins` compare per REST pair every this many
+    /// seconds, on top of the random draws (a 2% share of them). Unset = random draws only.
+    #[serde(default)]
+    pub coins_every_secs: Option<u64>,
 }
 
 /// `[graphql]`: where the operation documents come from.
@@ -71,6 +75,51 @@ pub struct GraphqlConfig {
     pub window: u64,
     /// `totalCount` values above this compare as this (GQ-10).
     pub total_count_cap: u64,
+    /// Node and native pairs (`NodeTx`, `NodeBlock`, `NodeBalance`) run in their own loop,
+    /// one step every this many milliseconds, so the oracle limiter does not pace them
+    /// (R-P5P9-57 cadence).
+    pub node_step_ms: u64,
+    /// Fresh samples drawn for the same operation when a draw gives no usable variables or an
+    /// account newer than the oracle's ceiling, before the turn passes on. Redraws cost node
+    /// and kda-indexer requests only, never oracle requests.
+    pub redraws: u32,
+    /// Per-field normalisers on the oracle pairs (R-P5P9-57 rules (a) and (b)), set by the
+    /// controller per field after the node referee.
+    pub field_rules: Vec<FieldRule>,
+}
+
+/// One per-field normaliser (R-P5P9-57): at `field`, a difference that `rule` explains is
+/// not a diff; it shows as the visible allowlist hit `/~graphql-r57-field`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldRule {
+    /// Dotted field names, matched against the end of the diff path with list indexes and
+    /// connection wrappers (`edges/<n>/node`) left out: `cmd.nonce` matches
+    /// `/data/transaction/cmd/nonce` and `transfers.amount` matches
+    /// `/data/transfers/edges/3/node/amount`.
+    pub field: String,
+    pub rule: FieldRuleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldRuleKind {
+    /// One side is the other's string JSON-encoded once more (F5 `cmd.nonce`, F6
+    /// `payload.code`).
+    JsonUnquote,
+    /// `null` and `""` are the same (F8 signer `scheme`).
+    NullOrEmpty,
+    /// Decimal texts or numbers with the same decimal value (trailing zeros, exponent form,
+    /// number against string: `Transfer.amount`, F10).
+    DecimalValue,
+    /// JSON texts equal once their numbers compare by decimal value (F9 event `parameters`).
+    JsonNumbersByValue,
+    /// The oracle's `null` against any value of ours: only where the node confirmed ours
+    /// (rule (a)).
+    OracleNull,
+    /// Our `null` against any value of the oracle's: only where the node confirmed that the
+    /// field has no value (rule (a)).
+    OursNull,
 }
 
 impl Default for GraphqlConfig {
@@ -81,6 +130,9 @@ impl Default for GraphqlConfig {
             skip_ops: Vec::new(),
             window: 50,
             total_count_cap: 10_000,
+            node_step_ms: 10_000,
+            redraws: 4,
+            field_rules: Vec::new(),
         }
     }
 }
@@ -224,6 +276,17 @@ impl CompareConfig {
                 bail!("target {n}: insecure_tls is only for graphql_oracle");
             }
         }
+        if self.coins_every_secs == Some(0) {
+            bail!("coins_every_secs must be > 0");
+        }
+        if self.graphql.node_step_ms == 0 {
+            bail!("graphql.node_step_ms must be > 0");
+        }
+        for r in &self.graphql.field_rules {
+            if r.field.is_empty() || r.field.split('.').any(str::is_empty) {
+                bail!("graphql.field_rules: bad field {:?}", r.field);
+            }
+        }
         for (w, n) in [
             (self.mix.replay, "replay"),
             (self.mix.random, "random"),
@@ -322,5 +385,43 @@ max_height = 6000000
             .unwrap_err()
             .to_string()
             .contains("insecure_tls"));
+    }
+
+    #[test]
+    fn cadence_and_field_rule_keys_parse_and_validate() {
+        let c: CompareConfig = toml::from_str(BASE).unwrap();
+        // Defaults: node pairs every 10 s, 4 redraws, no field rules, no /coins cadence.
+        assert_eq!(
+            (
+                c.graphql.node_step_ms,
+                c.graphql.redraws,
+                c.coins_every_secs
+            ),
+            (10_000, 4, None)
+        );
+        assert!(c.graphql.field_rules.is_empty());
+        let text = BASE.replace(
+            "[node]",
+            "coins_every_secs = 480\n[graphql]\nnode_step_ms = 5000\nredraws = 2\nfield_rules = [{ field = \"cmd.nonce\", rule = \"json_unquote\" }, { field = \"signers.scheme\", rule = \"null_or_empty\" }]\n[node]",
+        );
+        let c: CompareConfig = toml::from_str(&text).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.coins_every_secs, Some(480));
+        assert_eq!(c.graphql.node_step_ms, 5000);
+        assert_eq!(
+            c.graphql.field_rules[1],
+            FieldRule {
+                field: "signers.scheme".into(),
+                rule: FieldRuleKind::NullOrEmpty
+            }
+        );
+        let bad = text.replace("signers.scheme", "signers..scheme");
+        let c: CompareConfig = toml::from_str(&bad).unwrap();
+        assert!(c.validate().is_err());
+        let zero = text.replace("coins_every_secs = 480", "coins_every_secs = 0");
+        let c: CompareConfig = toml::from_str(&zero).unwrap();
+        assert!(c.validate().is_err());
+        let unknown = text.replace("json_unquote", "ignore");
+        assert!(toml::from_str::<CompareConfig>(&unknown).is_err());
     }
 }

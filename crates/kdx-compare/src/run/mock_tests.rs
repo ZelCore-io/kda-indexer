@@ -498,3 +498,80 @@ async fn pactid_cap_needs_kda_indexers_header() {
         assert_eq!((got.0.as_str(), got.1), (class, ids), "{:?}", got.2);
     }
 }
+
+/// R-P5P9-57 cadence: the oracle lane holds only the oracle pairs; the node and native pairs
+/// run in their own lane, so the oracle limiter does not pace them.
+#[tokio::test]
+async fn graphql_lanes_split_oracle_and_node_pairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let own = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/graphql");
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let out = dir.path();
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["gql", "oracle"], ["gql", "node"], ["gql", "native"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = {own:?}
+[targets.gql]
+url = "http://127.0.0.1:9/graphql"
+kind = "kda_indexer_graphql"
+[targets.native]
+url = "http://127.0.0.1:9"
+kind = "kda_indexer_native"
+[targets.oracle]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+max_height = 6000000
+"#
+    ))
+    .unwrap();
+    let ctx = Ctx::new(cfg).await.unwrap();
+    let name = |(pi, op): &(usize, Arc<crate::graphql::GqlOp>)| {
+        format!("{}|{}", op.stem, ctx.cfg.pairs[*pi].1)
+    };
+    let oracle: Vec<String> = ctx.lane_jobs(true).iter().map(name).collect();
+    let node: Vec<String> = ctx.lane_jobs(false).iter().map(name).collect();
+    assert!(oracle.iter().all(|j| j.ends_with("|oracle")), "{oracle:?}");
+    assert!(oracle.iter().any(|j| j == "QBlock|oracle"), "{oracle:?}");
+    let mut node_sorted = node.clone();
+    node_sorted.sort();
+    assert_eq!(
+        node_sorted,
+        [
+            "NodeBalance|native",
+            "NodeBalance|node",
+            "NodeBlock|node",
+            "NodeTx|node"
+        ]
+    );
+    assert_eq!(oracle.len() + node.len(), ctx.gql_jobs().len());
+}
+
+/// R-P5P9-57: `coins_every_secs` puts one `/coins` request into the pipeline per period and
+/// stops once the pipeline closes.
+#[tokio::test]
+async fn coins_cadence_feeds_the_pipeline_until_it_closes() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(4);
+    let task = tokio::spawn(super::coins_cadence(
+        tx.downgrade(),
+        std::time::Duration::from_millis(20),
+    ));
+    for _ in 0..3 {
+        let q = rx.recv().await.unwrap();
+        assert_eq!(q.path_and_query, "/coins");
+        assert_eq!(q.route, crate::normalize::RouteKind::Coins);
+    }
+    drop(tx);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("the cadence task ends once the pipeline closes")
+        .unwrap();
+}

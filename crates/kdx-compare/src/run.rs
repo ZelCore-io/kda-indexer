@@ -522,7 +522,10 @@ impl Ctx {
     pub fn flush_summary(&self) {
         let mut s = self.summary.lock().expect("summary");
         match s.flush(&self.cfg.out_dir) {
-            Ok(Some(fresh)) => *s = fresh,
+            Ok(Some(mut fresh)) => {
+                fresh.graphql_unpaired = std::mem::take(&mut s.graphql_unpaired);
+                *s = fresh;
+            }
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %e, "summary flush"),
         }
@@ -2864,6 +2867,9 @@ pub async fn run(cfg: CompareConfig, max_secs: Option<u64>) -> anyhow::Result<()
     let mut mixer = Mixer::new(random, seeds, replay, ctx.cfg.mix.clone());
 
     let (tx, rx) = mpsc::channel::<Request>(32);
+    if let Some(secs) = ctx.cfg.coins_every_secs {
+        tokio::spawn(coins_cadence(tx.downgrade(), Duration::from_secs(secs)));
+    }
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let mut workers = Vec::new();
     for _ in 0..WORKERS {
@@ -2932,6 +2938,22 @@ pub async fn run(cfg: CompareConfig, max_secs: Option<u64>) -> anyhow::Result<()
         }
     }
     finish(ctx, tx, workers).await
+}
+
+/// `coins_every_secs` (R-P5P9-57): one `/coins` request into the REST pipeline per period, so
+/// the `/coins` minimum fits a gate window without a separate `once --path /coins` loop. The
+/// weak sender lets the pipeline close at shutdown.
+async fn coins_cadence(tx: mpsc::WeakSender<Request>, every: Duration) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(tx) = tx.upgrade() else { break };
+        let q = Request::new("/coins".into(), crate::gen::Origin::Random, None);
+        if tx.send(q).await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn finish(
