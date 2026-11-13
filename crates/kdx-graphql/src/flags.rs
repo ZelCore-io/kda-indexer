@@ -75,7 +75,11 @@ impl Extension for FlagsExt {
         request: Request,
         next: NextPrepareRequest<'_>,
     ) -> ServerResult<Request> {
-        next.run(ctx, request.data(self.0.clone())).await
+        // The request's `crossChainTransfer` step budget rides with its flags (one per
+        // request, as the flags).
+        let budget = Arc::new(crate::txlist::XchainBudget::default());
+        next.run(ctx, request.data(self.0.clone()).data(budget))
+            .await
     }
 
     async fn execute(
@@ -119,6 +123,38 @@ mod tests {
             Total::Deferred(Arc::new(|| Box::pin(async { Ok((5, false)) })))
                 .resolve(ctx)
                 .await
+        }
+    }
+
+    struct B;
+
+    #[Object]
+    impl B {
+        /// Spend 5 reads of the request's `crossChainTransfer` budget; what is left.
+        async fn spend(&self, ctx: &async_graphql::Context<'_>) -> i32 {
+            let b = ctx
+                .data_opt::<Arc<crate::txlist::XchainBudget>>()
+                .expect("installed per request");
+            b.take(5);
+            b.left() as i32
+        }
+    }
+
+    /// The security finding on e7da3d0: one `crossChainTransfer` budget per request, shared
+    /// by its fields, fresh for the next request.
+    #[tokio::test]
+    async fn each_request_has_one_xchain_budget() {
+        let s = Schema::build(B, EmptyMutation, EmptySubscription)
+            .extension(super::Flags)
+            .finish();
+        let full = crate::txlist::XCHAIN_BUDGET as i32;
+        for _ in 0..2 {
+            let r = s.execute("{ a: spend b: spend }").await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let v = r.data.into_json().unwrap();
+            let mut left = [v["a"].as_i64().unwrap(), v["b"].as_i64().unwrap()];
+            left.sort_unstable();
+            assert_eq!(left, [i64::from(full - 10), i64::from(full - 5)]);
         }
     }
 

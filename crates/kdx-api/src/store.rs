@@ -346,6 +346,16 @@ pub struct PostingQuery {
 /// Deadline check interval of long walks.
 const CHECK_EVERY: u32 = 64;
 
+/// One stored tx of a defpact ([`View::pact_steps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PactStep {
+    pub key: TxKey,
+    /// A `cont` step (false: the exec that started the pact).
+    pub cont: bool,
+    /// The tx succeeded.
+    pub ok: bool,
+}
+
 /// One consistent read snapshot (see the module docs). Never keep it past the request.
 pub struct View {
     pub txn: RoTxn,
@@ -591,6 +601,13 @@ impl View {
     /// as the cmd's `payload.cont.pactId` or the output's `continuation.pactId`. At most `max`
     /// txs, the newest ones; the flag is true when the walk stopped there (R-P5P9-3).
     pub fn pact_txs(&self, pact: &Hash32, max: usize) -> ApiResult<(Vec<(TxKey, bool)>, bool)> {
+        let (steps, capped) = self.pact_steps(pact, max)?;
+        Ok((steps.into_iter().map(|s| (s.key, s.cont)).collect(), capped))
+    }
+
+    /// [`View::pact_txs`] with each step's stored success flag, read from the record the walk
+    /// decodes anyway (a caller can skip failed steps without another read).
+    pub fn pact_steps(&self, pact: &Hash32, max: usize) -> ApiResult<(Vec<PactStep>, bool)> {
         let mut out = Vec::new();
         let mut capped = false;
         for k in self.postings(Family::Pact, pact_entity(pact), PostingQuery::default())? {
@@ -602,7 +619,11 @@ impl View {
                         capped = true;
                         break;
                     }
-                    out.push((k, cont));
+                    out.push(PactStep {
+                        key: k,
+                        cont,
+                        ok: r.status_ok,
+                    });
                 }
             }
         }

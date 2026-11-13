@@ -119,9 +119,10 @@ impl Transfer {
             Some(x) => x.clone(),
             None => {
                 let (d, i) = (self.d.clone(), self.i);
+                let budget = crate::txlist::xchain_budget(ctx);
                 gql(ctx)
                     .state()?
-                    .read(move |view| xchain_of(view, &d, i, &mut Blocks::default()))
+                    .read(move |view| xchain_of(view, &d, i, &mut Blocks::default(), &budget))
                     .await
                     .map_err(from_api)?
             }

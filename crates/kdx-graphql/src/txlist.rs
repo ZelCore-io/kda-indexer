@@ -18,11 +18,13 @@
 //!   remaining deadline (`COUNT_TIMEOUT` past it), run only when the field is selected.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_graphql::Context;
 use kdx_api::compat::shapes::{self, Ev};
+use kdx_api::store::PactStep;
 use kdx_api::{ApiError, ApiResult, Cursor, PostingQuery, View};
 use kdx_decode::index::xfer_entity;
 use kdx_decode::Family;
@@ -738,27 +740,84 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bo
 /// the native defpact cap.
 const XCHAIN_STEPS: usize = 16;
 const XCHAIN_STEPS_MAX: usize = 1_000;
+/// Pact-step reads one request may spend on `crossChainTransfer` lookups, shared by every
+/// edge and field of the request (H-1: a page of transfers whose pacts carry many retries
+/// cannot multiply the per-item bound). Past it a lookup answers "no other half", as one
+/// that found none.
+pub const XCHAIN_BUDGET: usize = 2_000;
 
-/// The first continuation step of a pact (oldest first) that `matches`, other than `me`:
-/// `steps_of(cap)` lists up to `cap` steps (the newest ones, ascending) and whether there
-/// are more. Reads [`XCHAIN_STEPS`] first and, only when the pact has more, again up to
-/// [`XCHAIN_STEPS_MAX`].
+/// The request's budget of pact-step reads for `crossChainTransfer` ([`XCHAIN_BUDGET`]).
+#[derive(Debug)]
+pub struct XchainBudget(AtomicUsize);
+
+impl Default for XchainBudget {
+    fn default() -> Self {
+        XchainBudget(AtomicUsize::new(XCHAIN_BUDGET))
+    }
+}
+
+impl XchainBudget {
+    /// Take up to `want` reads; the number granted (0 when spent).
+    pub fn take(&self, want: usize) -> usize {
+        let mut got = 0;
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                got = left.min(want);
+                Some(left - got)
+            });
+        got
+    }
+    /// Give back reads granted but not used.
+    pub fn refund(&self, n: usize) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn left(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// The budget of the request being resolved (one per request, installed with the response
+/// flags); a fresh one outside a request.
+pub fn xchain_budget(ctx: &Context<'_>) -> Arc<XchainBudget> {
+    ctx.data_opt::<Arc<XchainBudget>>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The first succeeded continuation step of a pact (oldest first), other than `me`, that
+/// `matches`. `steps_of(cap)` lists up to `cap` steps (the newest ones, ascending) and
+/// whether there are more. Reads [`XCHAIN_STEPS`] first and, only when the pact has more,
+/// again up to [`XCHAIN_STEPS_MAX`]; every listed step and every full decode is paid from
+/// `budget`, and `check` (the request deadline) runs before each decode. Start and failed
+/// steps are skipped on their stored flags, with no decode. A spent budget answers `None`.
 fn find_step<T>(
-    mut steps_of: impl FnMut(usize) -> ApiResult<(Vec<(TxKey, bool)>, bool)>,
+    mut steps_of: impl FnMut(usize) -> ApiResult<(Vec<PactStep>, bool)>,
     me: TxKey,
+    budget: &XchainBudget,
+    mut check: impl FnMut() -> ApiResult<()>,
     mut matches: impl FnMut(TxKey) -> ApiResult<Option<T>>,
 ) -> ApiResult<Option<T>> {
-    for cap in [XCHAIN_STEPS, XCHAIN_STEPS_MAX] {
+    for want in [XCHAIN_STEPS, XCHAIN_STEPS_MAX] {
+        let cap = budget.take(want);
+        if cap == 0 {
+            return Ok(None);
+        }
         let (steps, capped) = steps_of(cap)?;
-        for (k, cont) in steps {
-            if !cont || k == me {
+        budget.refund(cap.saturating_sub(steps.len()));
+        for st in steps {
+            if !st.cont || !st.ok || st.key == me {
                 continue;
             }
-            if let Some(t) = matches(k)? {
+            check()?;
+            if budget.take(1) == 0 {
+                return Ok(None);
+            }
+            if let Some(t) = matches(st.key)? {
                 return Ok(Some(t));
             }
         }
-        if !capped {
+        if !capped || cap < want {
             break;
         }
     }
@@ -773,6 +832,7 @@ pub fn xchain_of(
     d: &TxData,
     i: usize,
     blocks: &mut Blocks,
+    budget: &XchainBudget,
 ) -> ApiResult<Option<(Arc<TxData>, usize)>> {
     let Some(t) = d.trs.get(i) else {
         return Ok(None);
@@ -785,8 +845,10 @@ pub fn xchain_of(
             return Ok(None);
         };
         return find_step(
-            |cap| view.pact_txs(&rk, cap),
+            |cap| view.pact_steps(&rk, cap),
             d.key(),
+            budget,
+            || view.check_deadline(),
             |k| {
                 let Some(o) = load(view, k, None, blocks)? else {
                     return Ok(None);
@@ -854,6 +916,7 @@ pub async fn list(
     let dl = deadline(ctx);
     let xchain = matches!(spec.rows, Rows::Transfers { nft: false, .. })
         && selects(ctx, "crossChainTransfer");
+    let budget = xchain_budget(ctx);
     // The page is read only when its items or page info are selected.
     let reads = selects_direct(ctx, &["edges", "pageInfo"]);
     // A block's or a request key's rows are few: counted with the page, exactly.
@@ -876,7 +939,8 @@ pub async fn list(
                 let mut blocks = Blocks::default();
                 for (_, it) in edges.iter_mut() {
                     if let Item::Transfer(d, i, x) = it {
-                        *x = Some(xchain_of(view, d, *i, &mut blocks)?);
+                        view.check_deadline()?;
+                        *x = Some(xchain_of(view, d, *i, &mut blocks, &budget)?);
                     }
                 }
             }
@@ -1105,43 +1169,155 @@ mod nft_tests {
 
 #[cfg(test)]
 mod xchain_tests {
+    use std::cell::Cell;
+
     use super::*;
 
+    fn step(key: TxKey, cont: bool, ok: bool) -> PactStep {
+        PactStep { key, cont, ok }
+    }
+
+    /// The newest `cap` of `all` (ascending) and whether there are more, as `pact_steps`.
+    fn newest(all: &[PactStep], cap: usize) -> (Vec<PactStep>, bool) {
+        let from = all.len().saturating_sub(cap);
+        (all[from..].to_vec(), from > 0)
+    }
+
     /// R-P5P9-57 (F10 crossChainTransfer): the step that succeeded is found even when more
-    /// than 16 later retries of the continuation follow it.
+    /// than 16 later retries of the continuation follow it; failed retries are never decoded.
     #[test]
     fn successful_step_behind_many_retries_is_found() {
         let me = TxKey::new(3_115_490, 2, 1);
         let ok = TxKey::new(3_115_507, 1, 1);
-        // Ascending: the start, the step that succeeded, then 32 failed retries.
-        let mut all = vec![(me, false), (ok, true)];
-        all.extend((0..32u32).map(|i| (TxKey::new(3_115_509 + i, 1, 2), true)));
-        let mut calls = Vec::new();
-        let steps_of = |cap: usize| {
-            calls.push(cap);
-            let from = all.len().saturating_sub(cap);
-            Ok((all[from..].to_vec(), from > 0))
-        };
-        let got = find_step(steps_of, me, |k| Ok((k == ok).then_some(k))).unwrap();
+        let mut all = vec![step(me, false, true), step(ok, true, true)];
+        all.extend((0..32u32).map(|i| step(TxKey::new(3_115_509 + i, 1, 2), true, false)));
+        let budget = XchainBudget::default();
+        let mut caps = Vec::new();
+        let decoded = Cell::new(0);
+        let got = find_step(
+            |cap| {
+                caps.push(cap);
+                Ok(newest(&all, cap))
+            },
+            me,
+            &budget,
+            || Ok(()),
+            |k| {
+                decoded.set(decoded.get() + 1);
+                Ok((k == ok).then_some(k))
+            },
+        )
+        .unwrap();
         assert_eq!(got, Some(ok));
-        assert_eq!(calls, [XCHAIN_STEPS, XCHAIN_STEPS_MAX]);
+        assert_eq!(caps, [XCHAIN_STEPS, XCHAIN_STEPS_MAX]);
+        assert_eq!(decoded.get(), 1, "only the succeeded step is decoded");
+        // Charged: the 16 listed, the 34 listed, one decode.
+        assert_eq!(XCHAIN_BUDGET - budget.left(), 16 + 34 + 1);
     }
 
-    /// A short pact is read once; the start itself never matches.
+    /// The honest case: a short pact is read once; the start itself never matches.
     #[test]
     fn short_pact_is_read_once() {
         let me = TxKey::new(10, 0, 1);
         let ok = TxKey::new(12, 1, 1);
-        let all = vec![(me, false), (ok, true)];
+        let all = vec![step(me, false, true), step(ok, true, true)];
+        let budget = XchainBudget::default();
         let mut calls = 0;
-        let steps_of = |_cap: usize| {
-            calls += 1;
-            Ok((all.clone(), false))
-        };
-        let got = find_step(steps_of, me, |k| Ok(Some(k))).unwrap();
-        assert_eq!(got, Some(ok));
-        assert_eq!(calls, 1);
-        let none = find_step(|_| Ok((vec![(me, true)], false)), me, |k| Ok(Some(k))).unwrap();
+        let got = find_step(
+            |cap| {
+                calls += 1;
+                Ok(newest(&all, cap))
+            },
+            me,
+            &budget,
+            || Ok(()),
+            |k| Ok(Some(k)),
+        )
+        .unwrap();
+        assert_eq!((got, calls), (Some(ok), 1));
+        assert_eq!(XCHAIN_BUDGET - budget.left(), 2 + 1);
+        let none = find_step(
+            |_| Ok((vec![step(me, true, true)], false)),
+            me,
+            &budget,
+            || Ok(()),
+            |k| Ok(Some(k)),
+        )
+        .unwrap();
         assert_eq!(none, None);
+    }
+
+    /// The security finding on e7da3d0: a page of N edges whose pacts each carry more than
+    /// 16 failed retries spends at most the request budget in total (not N times the
+    /// per-item bound); past it every lookup answers `None`, not an error.
+    #[test]
+    fn a_page_of_retry_heavy_pacts_stays_within_the_request_budget() {
+        const N: usize = 100;
+        let budget = XchainBudget::default();
+        let listed = Cell::new(0usize);
+        let decoded = Cell::new(0usize);
+        let mut answers = Vec::new();
+        for e in 0..N as u32 {
+            let me = TxKey::new(1_000 + e, 2, 1);
+            let mut all = vec![step(me, false, true)];
+            all.extend(
+                (0..900u32).map(|i| step(TxKey::new(2_000 + i, 1, 1 + e as u16), true, false)),
+            );
+            let got = find_step(
+                |cap| {
+                    let r = newest(&all, cap);
+                    listed.set(listed.get() + r.0.len());
+                    Ok(r)
+                },
+                me,
+                &budget,
+                || Ok(()),
+                |k| {
+                    decoded.set(decoded.get() + 1);
+                    Ok(Some(k))
+                },
+            );
+            answers.push(got.expect("a spent budget is not an error"));
+        }
+        assert!(answers.iter().all(Option::is_none));
+        assert_eq!(decoded.get(), 0, "failed retries are never decoded");
+        assert!(listed.get() <= XCHAIN_BUDGET, "listed {}", listed.get());
+        assert_eq!(budget.left(), 0);
+        // An honest pact after the budget is spent answers "no other half".
+        let me = TxKey::new(5, 0, 1);
+        let ok = TxKey::new(6, 1, 1);
+        let all = [step(me, false, true), step(ok, true, true)];
+        let got = find_step(
+            |cap| Ok(newest(&all, cap)),
+            me,
+            &budget,
+            || Ok(()),
+            |k| Ok(Some(k)),
+        );
+        assert_eq!(got.unwrap(), None);
+    }
+
+    /// The request deadline stops the walk before a decode.
+    #[test]
+    fn the_deadline_stops_the_walk() {
+        let me = TxKey::new(10, 0, 1);
+        let all = [
+            step(me, false, true),
+            step(TxKey::new(12, 1, 1), true, true),
+        ];
+        let budget = XchainBudget::default();
+        let decoded = Cell::new(0);
+        let got = find_step(
+            |cap| Ok(newest(&all, cap)),
+            me,
+            &budget,
+            || Err(ApiError::Deadline),
+            |k| {
+                decoded.set(decoded.get() + 1);
+                Ok(Some(k))
+            },
+        );
+        assert!(matches!(got, Err(ApiError::Deadline)));
+        assert_eq!(decoded.get(), 0);
     }
 }
