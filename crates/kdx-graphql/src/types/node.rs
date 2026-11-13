@@ -172,3 +172,120 @@ pub async fn nodes(ctx: &Context<'_>, ids: &[ID]) -> Result<Vec<Option<Node>>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use async_graphql::{Request, Variables};
+    use kdx_decode::{IndexedBlock, TxIndex};
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{Hash32, TxKey};
+    use serde_json::{json, Value};
+
+    use crate::ids::{encode, NodeKey};
+    use crate::testutil;
+
+    /// A coinbase `reqKey` as the node sends it on Pact 5 (base64url of the parent hash
+    /// text, h5801243 c4): not a 32-byte hash.
+    const CB_RK: &str = "aVdla04wempYOThOVHN6UXlPV3hXRmM1azVzODc1SDYtYmpSTFdNOUgyMA";
+    const BH: Hash32 = Hash32([42; 32]);
+    const USER_RK: Hash32 = Hash32([5; 32]);
+
+    fn out(rk: &str) -> Value {
+        json!({
+            "reqKey": rk,
+            "result": {"status": "success", "data": "ok"},
+            "events": [{"name": "TRANSFER", "module": {"name": "coin", "namespace": null},
+                "moduleHash": "mh", "params": ["", "miner", 1.0]}]
+        })
+    }
+
+    fn rec(pos: u16, rk: Option<Hash32>, out: &Value, cmd: Option<Value>) -> TxRecord {
+        TxRecord {
+            key: TxKey::new(10, 0, pos),
+            request_key: rk,
+            status_ok: true,
+            cmd: cmd.map(|c| serde_json::to_vec(&c).unwrap()),
+            raw_output: Some(serde_json::to_vec(out).unwrap()),
+            ..TxRecord::default()
+        }
+    }
+
+    /// Block (chain 0, height 10): a coinbase whose output carries `CB_RK`, and one user tx.
+    fn fixture() -> testutil::Fixture {
+        let f = testutil::store();
+        let cmd = json!({"meta": {"chainId": "0", "creationTime": 1, "sender": "a"},
+            "payload": {"exec": {"code": "1", "data": {}}}, "signers": [], "nonce": "n",
+            "networkId": "mainnet01"});
+        let txs = vec![
+            rec(0, None, &out(CB_RK), None),
+            rec(1, Some(USER_RK), &out(&USER_RK.to_b64url()), Some(cmd)),
+        ];
+        let idx = txs
+            .iter()
+            .map(|r| TxIndex {
+                key: r.key,
+                postings: Vec::new(),
+                pact_id: None,
+                code_hash: None,
+            })
+            .collect();
+        f.apply_block(&IndexedBlock {
+            block: BlockRecord {
+                hash: BH,
+                chain: 0,
+                height: 10,
+                ..BlockRecord::default()
+            },
+            txs,
+            idx,
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        });
+        f
+    }
+
+    fn event_id(rk: &str) -> String {
+        encode(&NodeKey::Event {
+            block_hash: BH.to_b64url(),
+            order_index: 0,
+            request_key: rk.to_owned(),
+        })
+    }
+
+    /// `node(id)` for an event id: its `requestKey`, or null.
+    async fn node_rk(f: &testutil::Fixture, id: &str) -> Value {
+        let schema = crate::build_schema(f.st.clone(), crate::GraphqlSettings::default(), None);
+        let q = "query($id: ID!) { node(id: $id) { ... on Event { requestKey orderIndex } } }";
+        let r = schema
+            .execute(Request::new(q).variables(Variables::from_json(json!({"id": id}))))
+            .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        r.data.into_json().unwrap()["node"].clone()
+    }
+
+    /// Review of the F4 change (Important 2): coinbase event ids resolve by the node's
+    /// coinbase reqKey (new ids) and by compat's `<coinbase>` (ids issued before it); a
+    /// user-tx id resolves its tx, and one that misses falls through to the block's
+    /// coinbase, which does not match it, so it answers null.
+    #[tokio::test]
+    async fn node_resolves_coinbase_and_user_tx_event_ids() {
+        let f = fixture();
+        // A new coinbase id: the node's reqKey.
+        let v = node_rk(&f, &event_id(CB_RK)).await;
+        assert_eq!(v, json!({"requestKey": CB_RK, "orderIndex": 0}));
+        // An old coinbase id: `<coinbase>` still names the block's coinbase.
+        let v = node_rk(&f, &event_id(kdx_api::compat::shapes::COINBASE_RK_TEXT)).await;
+        assert_eq!(v, json!({"requestKey": CB_RK, "orderIndex": 0}));
+        // A user-tx id resolves its own tx.
+        let v = node_rk(&f, &event_id(&USER_RK.to_b64url())).await;
+        assert_eq!(
+            v,
+            json!({"requestKey": USER_RK.to_b64url(), "orderIndex": 0})
+        );
+        // A user-tx id that misses: not this block's tx, and not its coinbase.
+        let miss = Hash32([6; 32]).to_b64url();
+        assert_eq!(node_rk(&f, &event_id(&miss)).await, Value::Null);
+        // An id whose text is neither a hash nor the coinbase's reqKey.
+        assert_eq!(node_rk(&f, &event_id("not-a-key")).await, Value::Null);
+    }
+}
