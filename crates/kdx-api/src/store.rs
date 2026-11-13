@@ -346,6 +346,16 @@ pub struct PostingQuery {
 /// Deadline check interval of long walks.
 const CHECK_EVERY: u32 = 64;
 
+/// One stored tx of a defpact ([`View::pact_steps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PactStep {
+    pub key: TxKey,
+    /// A `cont` step (false: the exec that started the pact).
+    pub cont: bool,
+    /// The tx succeeded.
+    pub ok: bool,
+}
+
 /// One consistent read snapshot (see the module docs). Never keep it past the request.
 pub struct View {
     pub txn: RoTxn,
@@ -591,6 +601,13 @@ impl View {
     /// as the cmd's `payload.cont.pactId` or the output's `continuation.pactId`. At most `max`
     /// txs, the newest ones; the flag is true when the walk stopped there (R-P5P9-3).
     pub fn pact_txs(&self, pact: &Hash32, max: usize) -> ApiResult<(Vec<(TxKey, bool)>, bool)> {
+        let (steps, capped) = self.pact_steps(pact, max)?;
+        Ok((steps.into_iter().map(|s| (s.key, s.cont)).collect(), capped))
+    }
+
+    /// [`View::pact_txs`] with each step's stored success flag, read from the record the walk
+    /// decodes anyway (a caller can skip failed steps without another read).
+    pub fn pact_steps(&self, pact: &Hash32, max: usize) -> ApiResult<(Vec<PactStep>, bool)> {
         let mut out = Vec::new();
         let mut capped = false;
         for k in self.postings(Family::Pact, pact_entity(pact), PostingQuery::default())? {
@@ -602,7 +619,11 @@ impl View {
                         capped = true;
                         break;
                     }
-                    out.push((k, cont));
+                    out.push(PactStep {
+                        key: k,
+                        cont,
+                        ok: r.status_ok,
+                    });
                 }
             }
         }
@@ -1132,5 +1153,140 @@ mod code_search_tests {
         let r20 = view.tx(TxKey::new(20, 0, 1)).unwrap().unwrap();
         let r19 = view.tx(TxKey::new(19, 0, 1)).unwrap().unwrap();
         assert!(code_hit(&r20, &only_a) && !code_hit(&r19, &only_a));
+    }
+}
+
+#[cfg(test)]
+mod pact_steps_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use kdx_decode::index::pact_entity;
+    use kdx_decode::{Family, IndexedBlock, TxIndex};
+    use kdx_hot::HotDict;
+    use kdx_segment::{Manifest, RangeKind, RangeWriter, WriteOpts};
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{Hash32, TxKey};
+
+    use super::{PactStep, Store};
+
+    const PACT: Hash32 = Hash32([77; 32]);
+    /// Heights below this are frozen (in segments), the rest hot.
+    const FRONTIER: u32 = 10;
+
+    /// Block (chain 0, `height`): its coinbase (position 0, as every block has one; a
+    /// segment numbers txs by their place in the block), then one `cont` step of `PACT` per
+    /// flag, in that order.
+    fn block(height: u32, oks: &[bool]) -> IndexedBlock {
+        let cmd = serde_json::json!({"payload": {"cont": {"pactId": PACT.to_b64url(), "step": 1}}});
+        let coinbase = TxRecord {
+            key: TxKey::new(height, 0, 0),
+            status_ok: true,
+            ..TxRecord::default()
+        };
+        let txs: Vec<TxRecord> = std::iter::once(coinbase)
+            .chain(oks.iter().enumerate().map(|(i, &ok)| TxRecord {
+                key: TxKey::new(height, 0, i as u16 + 1),
+                request_key: Some(Hash32([height as u8 * 10 + i as u8; 32])),
+                cmd: Some(serde_json::to_vec(&cmd).unwrap()),
+                status_ok: ok,
+                ..TxRecord::default()
+            }))
+            .collect();
+        let idx = txs
+            .iter()
+            .map(|r| TxIndex {
+                key: r.key,
+                postings: if r.key.is_coinbase() {
+                    Vec::new()
+                } else {
+                    vec![(Family::Pact, pact_entity(&PACT))]
+                },
+                pact_id: None,
+                code_hash: None,
+            })
+            .collect();
+        IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32([height as u8; 32]),
+                chain: 0,
+                height: u64::from(height),
+                ..BlockRecord::default()
+            },
+            txs,
+            idx,
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        }
+    }
+
+    /// Review minor 7: `pact_steps` carries each step's stored success flag, from a frozen
+    /// record (segments) and from a hot one, so `crossChainTransfer` can skip failed steps
+    /// before any decode.
+    #[test]
+    fn pact_steps_carry_the_ok_flag_hot_and_frozen() {
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+        // Frozen: heights [0, FRONTIER) in one step range, as the freezer writes it.
+        let segdir = d.path().join("segments");
+        let mut w = RangeWriter::create(
+            &segdir,
+            &d.path().join("etl"),
+            "mainnet01",
+            RangeKind::Step,
+            0,
+            FRONTIER,
+            0,
+            WriteOpts::new(1, 0),
+        )
+        .unwrap();
+        w.push(&block(5, &[true, false])).unwrap();
+        let entry = w.finish().unwrap();
+        let mut m = Manifest::new("mainnet01");
+        m.push(entry.clone()).unwrap();
+        m.commit(&segdir).unwrap();
+        // Hot: above the frontier.
+        let mut t = hot.rw().unwrap();
+        t.set_frozen_frontier(FRONTIER).unwrap();
+        t.set_next_txnum(entry.end_txnum()).unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        kdx_hot::tail::apply(&mut t, &block(12, &[false, true]), &mut dict).unwrap();
+        t.commit().unwrap();
+
+        let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        assert!(view.frozen(5) && !view.frozen(12));
+        let step = |h: u32, pos: u16, ok: bool| PactStep {
+            key: TxKey::new(h, 0, pos),
+            cont: true,
+            ok,
+        };
+        let (steps, capped) = view.pact_steps(&PACT, 16).unwrap();
+        assert!(!capped);
+        assert_eq!(
+            steps,
+            vec![
+                step(5, 1, true),
+                step(5, 2, false),
+                step(12, 1, false),
+                step(12, 2, true),
+            ]
+        );
+        // `pact_txs` maps the same walk (native and compat unchanged).
+        let (keys, _) = view.pact_txs(&PACT, 16).unwrap();
+        assert_eq!(
+            keys,
+            steps.iter().map(|s| (s.key, s.cont)).collect::<Vec<_>>()
+        );
+        // The newest `max` only, and the flag.
+        let (steps, capped) = view.pact_steps(&PACT, 3).unwrap();
+        assert!(capped);
+        assert_eq!(steps[0], step(5, 2, false));
     }
 }

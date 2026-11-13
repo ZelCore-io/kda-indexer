@@ -21,7 +21,7 @@ use super::{
     FungibleAccountTransfersConnection, FungibleAccountTransfersConnectionEdge,
     FungibleChainAccountTransactionsConnection, FungibleChainAccountTransactionsConnectionEdge,
     FungibleChainAccountTransfersConnection, FungibleChainAccountTransfersConnectionEdge, IGuard,
-    Transaction, Transfer,
+    Sel, Transaction, Transfer,
 };
 use crate::connection::PageArgs;
 use crate::error::{bad_input, from_api};
@@ -437,8 +437,8 @@ impl FungibleChainAccount {
     async fn fungible_name(&self) -> &str {
         &self.module
     }
-    async fn guard(&self) -> &IGuard {
-        &self.row.guard
+    async fn guard(&self) -> Sel<&IGuard> {
+        Sel(&self.row.guard)
     }
     pub async fn id(&self) -> Result<ID> {
         Ok(ID(encode(&NodeKey::FungibleChainAccount {

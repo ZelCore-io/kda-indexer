@@ -193,9 +193,10 @@ impl Block {
             .map(|h| header::pow_hash_hex(&h))
             .ok_or_else(|| err(Code::NotSupported, "unknown chainweb version"))
     }
-    /// The target as a decimal integer (chainweb-data's `numeric` column).
+    /// The target as the node's header sends it: base64url of the 32 little-endian bytes
+    /// (R-P5P9-57 F1; the oracle agrees).
     async fn target(&self) -> String {
-        header::le256_decimal(&self.b.target)
+        kdx_types::hash::b64url_encode(&self.b.target)
     }
     async fn transactions(
         &self,
@@ -231,9 +232,10 @@ impl Block {
             total: p.total,
         })
     }
-    /// The chain's cumulative difficulty at this block, as a decimal integer.
+    /// The chain's cumulative difficulty at this block, as the node's header sends it:
+    /// base64url of the 32 little-endian bytes (R-P5P9-57 F1; the oracle agrees).
     async fn weight(&self) -> String {
-        header::le256_decimal(&self.b.weight)
+        kdx_types::hash::b64url_encode(&self.b.weight)
     }
 }
 
@@ -278,11 +280,13 @@ pub(crate) async fn is_stored(ctx: &Context<'_>, b: &BlockRecord) -> Result<bool
         .map_err(from_api)
 }
 
-/// Which blocks a list holds: per chain, heights `lo..=hi`; listed by height descending, then
-/// chain ascending.
+/// Which blocks a list holds: per chain, heights `lo..=hi`; listed by height descending (or
+/// ascending when `ascending`), then chain ascending.
 #[derive(Debug, Clone)]
 pub struct BlockSet {
     pub chains: Vec<(u8, u64, u64)>,
+    /// Heights ascending: `blocksFromHeight`, in the oracle's order (R-P5P9-57 M2a).
+    pub ascending: bool,
 }
 
 impl BlockSet {
@@ -311,6 +315,7 @@ pub fn walk_blocks(
             .filter(|c| c.2 >= floor)
             .map(|&(c, lo, hi)| (c, lo.max(floor), hi))
             .collect(),
+        ascending: set.ascending,
     };
     let Some((lo, hi)) = set.bounds() else {
         return Ok(out);
@@ -335,52 +340,54 @@ pub fn walk_blocks(
     };
     let mut heights = 0usize;
     let in_set = |h: u64, c: &(u8, u64, u64)| h >= c.1 && h <= c.2;
-    match page.dir {
-        Dir::Forward => {
-            let start = cur.map_or(hi, |c| c.height.min(hi));
-            if start < lo {
+    // List order: heights descending (or ascending, `set.ascending`), chains ascending
+    // within a height. A forward page walks it from the cursor on, a backward page walks
+    // it in reverse.
+    let forward = page.dir == Dir::Forward;
+    let up = forward == set.ascending;
+    let mut h = if up {
+        cur.map_or(lo, |c| c.height.max(lo))
+    } else {
+        let start = cur.map_or(hi, |c| c.height.min(hi));
+        if start < lo {
+            return Ok(out);
+        }
+        start
+    };
+    while h <= hi {
+        heights += 1;
+        if heights.is_multiple_of(4096) {
+            view.check_deadline()?;
+        }
+        let row = set.chains.iter().filter(|c| in_set(h, c));
+        let row: Vec<&(u8, u64, u64)> = if forward {
+            row.collect()
+        } else {
+            row.rev().collect()
+        };
+        for ch in row {
+            let past = |k: &BlockCursor| {
+                if forward {
+                    ch.0 <= k.chain
+                } else {
+                    ch.0 >= k.chain
+                }
+            };
+            if cur.is_some_and(|k| h == k.height && past(&k)) {
+                continue;
+            }
+            visit(h, ch.0, &mut out)?;
+            if out.len() >= want {
                 return Ok(out);
             }
-            let mut h = start;
-            loop {
-                heights += 1;
-                if heights.is_multiple_of(4096) {
-                    view.check_deadline()?;
-                }
-                for ch in set.chains.iter().filter(|c| in_set(h, c)) {
-                    if cur.is_some_and(|k| h == k.height && ch.0 <= k.chain) {
-                        continue;
-                    }
-                    visit(h, ch.0, &mut out)?;
-                    if out.len() >= want {
-                        return Ok(out);
-                    }
-                }
-                if h == lo {
-                    break;
-                }
-                h -= 1;
-            }
         }
-        Dir::Backward => {
-            let start = cur.map_or(lo, |c| c.height.max(lo));
-            let mut h = start;
-            while h <= hi {
-                heights += 1;
-                if heights.is_multiple_of(4096) {
-                    view.check_deadline()?;
-                }
-                for ch in set.chains.iter().rev().filter(|c| in_set(h, c)) {
-                    if cur.is_some_and(|k| h == k.height && ch.0 >= k.chain) {
-                        continue;
-                    }
-                    visit(h, ch.0, &mut out)?;
-                    if out.len() >= want {
-                        return Ok(out);
-                    }
-                }
-                h += 1;
+        if up {
+            h += 1;
+        } else {
+            if h == lo {
+                break;
             }
+            h -= 1;
         }
     }
     Ok(out)
@@ -437,6 +444,7 @@ pub async fn block_page(
             let tips: Vec<_> = tips.into_iter().filter(|t| chains.contains(&t.0)).collect();
             let set = BlockSet {
                 chains: span_set(&tips, span),
+                ascending: matches!(span, Span::Heights { .. }),
             };
             let floor = u64::from(kdx_api::compat::store_floor(view));
             let total: u64 = set
@@ -612,6 +620,7 @@ mod walk_tests {
         f.apply(0, top + 1, 0);
         let set = BlockSet {
             chains: vec![(0, 0, top + 1)],
+            ascending: false,
         };
         let page = Page {
             dir: Dir::Backward,
@@ -626,5 +635,76 @@ mod walk_tests {
         let hs: Vec<u64> = got.iter().map(|b| b.height).collect();
         assert_eq!(hs, [top, top + 1]);
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    /// R-P5P9-57 M2a: `blocksFromHeight` lists heights ascending (the oracle's order),
+    /// chains ascending within a height, and pages both ways in that order;
+    /// `blocksFromDepth` stays newest first.
+    #[tokio::test]
+    async fn blocks_from_height_is_ascending() {
+        let f = testutil::store();
+        for h in 0..=3u64 {
+            for c in [0u8, 1] {
+                f.apply(c, h, 0);
+            }
+        }
+        let schema = crate::build_schema(f.st.clone(), crate::GraphqlSettings::default(), None);
+        let run = |q: String| {
+            let schema = schema.clone();
+            async move {
+                let r = schema.execute(q).await;
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                r.data.into_json().unwrap()
+            }
+        };
+        let rows = |v: &serde_json::Value, f: &str| -> Vec<(u64, u64)> {
+            v[f]["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    let n = &e["node"];
+                    (
+                        n["height"].as_u64().unwrap(),
+                        n["chainId"].as_u64().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let sel = "pageInfo { hasNextPage hasPreviousPage endCursor startCursor } \
+                   edges { node { height chainId } }";
+        let v = run(format!(
+            "{{ blocksFromHeight(startHeight: 1, chainIds: [\"0\", \"1\"], first: 4) {{ {sel} }} }}"
+        ))
+        .await;
+        assert_eq!(
+            rows(&v, "blocksFromHeight"),
+            [(1, 0), (1, 1), (2, 0), (2, 1)]
+        );
+        assert_eq!(v["blocksFromHeight"]["pageInfo"]["hasNextPage"], true);
+        let end = v["blocksFromHeight"]["pageInfo"]["endCursor"].clone();
+        let v = run(format!(
+            "{{ blocksFromHeight(startHeight: 1, chainIds: [\"0\", \"1\"], first: 4, after: {end}) {{ {sel} }} }}"
+        ))
+        .await;
+        assert_eq!(rows(&v, "blocksFromHeight"), [(3, 0), (3, 1)]);
+        assert_eq!(v["blocksFromHeight"]["pageInfo"]["hasNextPage"], false);
+        assert_eq!(v["blocksFromHeight"]["pageInfo"]["hasPreviousPage"], true);
+        let start = v["blocksFromHeight"]["pageInfo"]["startCursor"].clone();
+        let v = run(format!(
+            "{{ blocksFromHeight(startHeight: 1, chainIds: [\"0\", \"1\"], last: 3, before: {start}) {{ {sel} }} }}"
+        ))
+        .await;
+        assert_eq!(rows(&v, "blocksFromHeight"), [(1, 1), (2, 0), (2, 1)]);
+        let v = run(format!(
+            "{{ blocksFromHeight(startHeight: 2, endHeight: 3, chainIds: [\"1\"], last: 1) {{ {sel} }} }}"
+        ))
+        .await;
+        assert_eq!(rows(&v, "blocksFromHeight"), [(3, 1)]);
+        let v = run(format!(
+            "{{ blocksFromDepth(minimumDepth: 0, chainIds: [\"0\", \"1\"], first: 3) {{ {sel} }} }}"
+        ))
+        .await;
+        assert_eq!(rows(&v, "blocksFromDepth"), [(3, 0), (3, 1), (2, 0)]);
     }
 }

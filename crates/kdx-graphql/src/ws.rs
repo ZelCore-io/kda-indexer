@@ -20,7 +20,8 @@
 //! - only subscriptions run over the socket: a document with a query or mutation answers a
 //!   `NOT_SUPPORTED` error before anything runs (kadscan sends only subscriptions there);
 //! - every subscription message runs under one deadline (the HTTP request budget) that all
-//!   of its resolvers share, bounded by an outer timeout (I-2).
+//!   of its resolvers share, bounded by an outer timeout (I-2), and with a fresh
+//!   `crossChainTransfer` step budget of its own (one per message, as one per request).
 //!
 //! All slots are held by guards and released on close, error or task end.
 
@@ -160,6 +161,11 @@ impl Extension for WsOpsExt {
         data.insert(ReqCtx {
             deadline: Instant::now() + budget,
         });
+        // And its own `crossChainTransfer` step budget: `Flags::prepare_request` runs once
+        // per stream, so its budget would otherwise be shared by every message of a
+        // subscription and, once spent, null that field for the rest of its life. Execute
+        // data is looked up first, so this one shadows the stream's.
+        data.insert(Arc::new(crate::txlist::XchainBudget::default()));
         match tokio::time::timeout(budget, next.run_with_data(ctx, operation_name, data)).await {
             Ok(r) => r,
             Err(_) => async_graphql::Response::from_errors(vec![server(
@@ -480,12 +486,35 @@ mod tests {
         }
     }
 
+    /// `crossChainTransfer` lookups one message resolves, and the step reads each costs (an
+    /// honest outgoing half costs about 3).
+    const LOOKUPS: usize = 10;
+    const READS: usize = 3;
+    /// Messages of one subscription: together they read more than one budget.
+    const MESSAGES: usize = 2 * crate::txlist::XCHAIN_BUDGET / (LOOKUPS * READS);
+    const _: () = assert!(MESSAGES * LOOKUPS * READS > crate::txlist::XCHAIN_BUDGET);
+
+    struct Xc;
+
+    #[Object]
+    impl Xc {
+        /// Reads granted to this message's lookups, drawn from the budget the
+        /// `crossChainTransfer` resolver uses.
+        async fn granted(&self, ctx: &Context<'_>) -> usize {
+            let budget = crate::txlist::xchain_budget(ctx);
+            (0..LOOKUPS).map(|_| budget.take(READS)).sum()
+        }
+    }
+
     struct S;
 
     #[Subscription]
     impl S {
         async fn ticks(&self) -> impl Stream<Item = Tick> {
             stream::iter([Tick, Tick])
+        }
+        async fn transfers(&self) -> impl Stream<Item = Xc> {
+            stream::iter((0..MESSAGES).map(|_| Xc))
         }
     }
 
@@ -502,6 +531,29 @@ mod tests {
             let v = r.data.into_json().unwrap();
             let left = v["ticks"]["left"].as_i64().unwrap();
             assert!((1..=5_000).contains(&left), "{v}");
+        }
+    }
+
+    /// Review of f675c6e (Important 1): the step budget is per message, not per stream. The
+    /// extensions run as in `build_schema` (`Flags` installs one budget per stream), and
+    /// every message of a long subscription still gets all its reads, so its
+    /// `crossChainTransfer` still resolves.
+    #[tokio::test]
+    async fn every_subscription_message_has_its_own_xchain_budget() {
+        let schema = Schema::build(Q, EmptyMutation, S)
+            .extension(crate::flags::Flags)
+            .extension(WsOps)
+            .finish();
+        let items: Vec<_> = schema
+            .execute_stream("subscription { transfers { granted } }")
+            .collect()
+            .await;
+        assert_eq!(items.len(), MESSAGES);
+        for (i, r) in items.into_iter().enumerate() {
+            assert!(r.errors.is_empty(), "message {i}: {:?}", r.errors);
+            let v = r.data.into_json().unwrap();
+            let got = v["transfers"]["granted"].as_u64().unwrap() as usize;
+            assert_eq!(got, LOOKUPS * READS, "message {i}");
         }
     }
 }
