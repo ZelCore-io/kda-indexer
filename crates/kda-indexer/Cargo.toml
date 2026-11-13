@@ -85,6 +85,7 @@ assets = [
     ["../../vendor/ptr_hash/LICENSE-MIT", "usr/share/doc/kda-indexer/ptr_hash-LICENSE-MIT", "644"],
     ["../../docs/install.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/operations.md", "usr/share/doc/kda-indexer/", "644"],
+    ["../../docs/load-balancer.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/api.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/graphql.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/openapi.json", "usr/share/doc/kda-indexer/", "644"],

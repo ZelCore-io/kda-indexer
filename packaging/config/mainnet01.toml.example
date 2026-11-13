@@ -39,10 +39,12 @@ commit_blocks = 40
 cut_poll_secs = 10
 
 [api]
-native = "<private-lan-ip>:31361"   # internal only: loopback or private (RFC 1918/4193)
-compat = "127.0.0.1:31362"          # loopback until P8 (public behind the proxy then)
-graphql = "127.0.0.1:31363"         # GraphQL; loopback until the G4 host config
-admin = "127.0.0.1:31369"           # loopback or private only
+# One address or an array; every address is bound (all or nothing).
+native = "127.0.0.1:31361"          # internal only: loopback or private (RFC 1918/4193); loopback unless a LAN consumer needs it:
+                                    # ["127.0.0.1:31361", "<private-lan-ip>:31361"]
+compat = "127.0.0.1:31362"          # behind a load balancer: ["127.0.0.1:31362", "<private-lan-ip>:31362"]
+graphql = "127.0.0.1:31363"         # GraphQL; as compat (docs/load-balancer.md)
+admin = ["127.0.0.1:31369", "<private-lan-ip>:31369"]    # loopback or private only; the balancer checks /readyz here
 trusted_proxies = ["<proxy-private-ip>"]   # IP or CIDR; X-Forwarded-For only from these
 rate_per_ip = 20          # requests/s per client IP (429 past it)
 rate_burst = 40

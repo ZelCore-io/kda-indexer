@@ -183,6 +183,15 @@ Backfill does not halt. A mismatch there leaves the block's `merkle_verified` bi
 adds a line to `<data_dir>/merkle-unverified.jsonl`. `kda-indexer verify merkle --sample N`
 (or `--all`) re-checks stored blocks at any time, read-only, beside a running indexer.
 
+## Behind a load balancer
+
+To serve the compat routes through HAProxy next to chainweb-data, and move them one route at a
+time with a rollback for each step, see [load-balancer.md](load-balancer.md). In short: bind
+the compat, graphql and admin listeners to loopback plus the host's private address, set
+`api.trusted_proxies` to the balancer's address, and let the balancer check `/readyz` on the
+admin port. A host that is not ready leaves the pool, and its routes fall back to
+chainweb-data. Drain the server on the balancer before a planned restart.
+
 ## Metrics and alerts
 
 `/metrics` on the admin port (OpenMetrics text); the same families are written to the

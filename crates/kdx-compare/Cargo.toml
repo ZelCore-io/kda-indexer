@@ -33,3 +33,6 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 kdx-types.workspace = true
 kdx-node.workspace = true
 kdx-decode.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

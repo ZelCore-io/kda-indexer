@@ -91,6 +91,17 @@ const ORACLE_TIP_TTL: Duration = Duration::from_secs(60);
 const SUPPLY_PER_HEIGHT: f64 = 60.0;
 /// Pause before the one retry of a `/v1/txs` diff against kda-txs.
 const KDA_TXS_RETRY: Duration = Duration::from_secs(30);
+/// A canonical hash read on the node is reused by later compares only this many heights or
+/// more below the chain's cut (a fork near the tip can still change it).
+const CANON_CACHE_DEPTH: u64 = 20;
+/// Entries of that cache at most; it is emptied when full.
+const CANON_CACHE_MAX: usize = 100_000;
+/// JSON path of the visible allowlist hit for `/txs/search` rows chainweb-data lists in a
+/// block that is not on the node's canonical branch (R-P5P9-48).
+const ORACLE_ORPHAN_PATH: &str = "/~oracle-orphan";
+/// JSON path of the visible allowlist hit for `/txs/search` rows chainweb-data lacks below its
+/// tip while the node puts them in kda-indexer's canonical block (R-P5P9-48).
+const ORACLE_GAP_PATH: &str = "/~oracle-gap";
 
 /// For each pair of tx objects at the same place (the object itself, or the same index of
 /// two arrays) whose `events` hold the same items in another order, sorts both `events`
@@ -366,6 +377,113 @@ fn query_account(req: &Request) -> String {
         .unwrap_or_default()
 }
 
+/// `/coins` against chainweb-data (R-P5P9-48): a difference past the relative 1e-6 of
+/// `coins-supply-tolerance` is the tip gap when the side with the higher tip has the higher
+/// supply and the difference is at most the coinbase minted between the two tips, plus that
+/// relative tolerance (seen live in run 6E-3: 2,621.7 KDA with chainweb-data about 145
+/// heights behind). Tips are A's and chainweb-data's `/txs/recent`; no gap, no allowance.
+/// Returns the visible hit.
+fn coins_tip_lag(a: &Value, b: &Value, a_tip: u64, b_tip: u64) -> Option<DiffEntry> {
+    let x = crate::diff::num_or_text_f64(a)?;
+    let y = crate::diff::num_or_text_f64(b)?;
+    let tol = 1e-6 * x.abs().max(y.abs());
+    let d = (x - y).abs();
+    if a_tip == 0 || a_tip == b_tip || d <= tol || (x > y) != (a_tip > b_tip) {
+        return None;
+    }
+    let minted = crate::rewards::minted_between(a_tip.min(b_tip), a_tip.max(b_tip));
+    (d <= minted + tol).then(|| DiffEntry {
+        path: format!("{ORACLE_LAG_PATH}/coins"),
+        kind: DiffKind::Changed,
+        a: Some(json!({"value": a, "tip": a_tip})),
+        b: Some(json!({"value": b, "tip": b_tip, "minted_between": minted})),
+    })
+}
+
+/// What [`Ctx::search_oracle_rows`] moved out of a `/txs/search` compare.
+#[derive(Debug, Default)]
+struct SearchRows {
+    /// chainweb-data rows in a block off the node's canonical branch.
+    orphans: Vec<Value>,
+    /// A rows above chainweb-data's tip.
+    lag: Vec<Value>,
+    /// A rows below it that the node puts in A's canonical block.
+    gap: Vec<Value>,
+    /// chainweb-data's tip, when it was read.
+    b_tip: Option<u64>,
+    /// Rows of A and of B dropped at or past the last row of a full page.
+    a_cut: usize,
+    b_cut: usize,
+}
+
+/// A `/txs/search` row's place in the answer order: `pactid` successful first, then height
+/// descending; `search=` height descending.
+fn search_place(pactid: bool, r: &Value) -> (bool, std::cmp::Reverse<u64>) {
+    let failed = pactid && r.get("result").and_then(Value::as_str) != Some("TxSucceeded");
+    let h = r.get("height").and_then(Value::as_u64).unwrap_or(0);
+    (failed, std::cmp::Reverse(h))
+}
+
+impl SearchRows {
+    /// The visible allowlist hits.
+    fn hits(&self) -> Vec<DiffEntry> {
+        let first = |rows: &[Value]| -> Vec<Value> {
+            rows.iter()
+                .take(10)
+                .map(|r| {
+                    json!([
+                        r.get("chain"),
+                        r.get("height"),
+                        r.get("requestKey"),
+                        r.get("blockHash")
+                    ])
+                })
+                .collect()
+        };
+        let mut d = Vec::new();
+        if !self.orphans.is_empty() {
+            d.push(DiffEntry {
+                path: ORACLE_ORPHAN_PATH.into(),
+                kind: DiffKind::Missing,
+                a: None,
+                b: Some(json!({"rows": self.orphans.len(), "a_cut": self.a_cut,
+                    "b_cut": self.b_cut, "first": first(&self.orphans)})),
+            });
+        }
+        if !self.lag.is_empty() {
+            d.push(DiffEntry {
+                path: ORACLE_LAG_PATH.into(),
+                kind: DiffKind::Extra,
+                a: Some(json!({"rows": self.lag.len(), "b_tip": self.b_tip,
+                    "a_cut": self.a_cut, "b_cut": self.b_cut, "first": first(&self.lag)})),
+                b: None,
+            });
+        }
+        if !self.gap.is_empty() {
+            d.push(DiffEntry {
+                path: ORACLE_GAP_PATH.into(),
+                kind: DiffKind::Extra,
+                a: Some(json!({"rows": self.gap.len(), "b_tip": self.b_tip,
+                    "a_cut": self.a_cut, "b_cut": self.b_cut, "first": first(&self.gap)})),
+                b: None,
+            });
+        }
+        d
+    }
+}
+
+/// Whether a `/txs/search` side may hold more rows than it answered: a `pactid` answer has
+/// no `Chainweb-Next`, so one with `limit` rows (default and maximum 50) may be cut; a
+/// `search=` answer is complete unless a pending `Chainweb-Next` was left (then the two
+/// sides were already cut to their common depth).
+fn search_page_full(path_and_query: &str, rows: usize, page_cut: bool) -> bool {
+    if page_cut || !path_and_query.contains("pactid=") {
+        return false;
+    }
+    let limit = query_limit(path_and_query).map_or(50, |l| l.min(50));
+    rows >= limit
+}
+
 fn query_limit(path_and_query: &str) -> Option<usize> {
     let q = path_and_query.split_once('?')?.1;
     url::form_urlencoded::parse(q.as_bytes())
@@ -390,6 +508,10 @@ pub struct Ctx {
     backoff: Mutex<(Option<tokio::time::Instant>, Duration)>,
     /// chainweb-data tip per target name (time read, max height on `/txs/recent`).
     oracle_tips: Mutex<HashMap<String, (std::time::Instant, u64)>>,
+    /// The node's canonical block hash per (chain, height), read on the cut's branch and kept
+    /// across compares once at least CANON_CACHE_DEPTH heights below the chain's cut (the
+    /// answer for every (chain, height, hash) question at that place).
+    canon: Mutex<HashMap<(u8, u64), String>>,
     /// GraphQL operations, sampler and oracle guard (empty without GraphQL pairs).
     pub gql: crate::graphql::GqlState,
 }
@@ -444,6 +566,7 @@ impl Ctx {
             a_errors_in_row: std::sync::atomic::AtomicU32::new(0),
             backoff: Mutex::new((None, BACKOFF_FIRST)),
             oracle_tips: Mutex::new(HashMap::new()),
+            canon: Mutex::new(HashMap::new()),
             cfg,
         };
         ctx.refresh_tips().await?;
@@ -833,6 +956,22 @@ impl Ctx {
                 replica_supply = replica_supply_skew(&mut va, &mut vb, x, y);
             }
         }
+        // /coins against chainweb-data: the supply grows with every block, so a difference
+        // within the coinbase minted between the two tips is that gap (R-P5P9-48).
+        let mut coins_lag: Option<DiffEntry> = None;
+        if req.route == RouteKind::Coins
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && sa == 200
+            && sb == 200
+            && va != vb
+        {
+            if let Some(b_tip) = self.oracle_tip(tb).await {
+                coins_lag = coins_tip_lag(&va, &vb, self.tips.a_tip(), b_tip);
+                if coins_lag.is_some() {
+                    vb = va.clone();
+                }
+            }
+        }
         normalize(&req.route, &mut va);
         normalize(&req.route, &mut vb);
         // chainweb-data and kda-txs list a tx's events in their own order (seen live on
@@ -1090,6 +1229,20 @@ impl Ctx {
         {
             ev_node = self.events_node_tiebreak(req, &va, &mut vb).await;
         }
+        // /txs/search against chainweb-data: rows one side lacks, settled on the node
+        // (R-P5P9-48).
+        let search_rows = if req.route == RouteKind::Search
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && sa == 200
+            && sb == 200
+        {
+            let full = |v: &Value| search_page_full(&req.path_and_query, len_of(v), page_cut);
+            let full = (full(&va), full(&vb));
+            self.search_oracle_rows(req, tb, &mut va, &mut vb, full)
+                .await
+        } else {
+            SearchRows::default()
+        };
         let (mut d, skew) = if let Some(rows) = orphan_tx {
             (
                 vec![DiffEntry {
@@ -1253,6 +1406,7 @@ impl Ctx {
                 b: Some(y),
             });
         }
+        d.extend(coins_lag);
         if let Some((x, y)) = supply_lag {
             d.push(DiffEntry {
                 path: format!("{ORACLE_LAG_PATH}/coinsInCirculation"),
@@ -1288,6 +1442,7 @@ impl Ctx {
                 b: None,
             });
         }
+        d.extend(search_rows.hits());
         if !orphans.is_empty() {
             d.push(DiffEntry {
                 path: "/orphans".into(),
@@ -1566,7 +1721,7 @@ impl Ctx {
                 }
             };
             let (diff, uncertain) = match &b {
-                Ok(l) => balance_diff(row, l),
+                Ok(l) => balance_diff(row, l, &|h| self.graph.chains_at(h).len()),
                 Err(_) => (Vec::new(), false),
             };
             if diff.is_empty() {
@@ -2132,8 +2287,10 @@ impl Ctx {
         moved
     }
 
-    /// The node's canonical block hash at `(c, h)`, from `cache` or one lookup while fewer
-    /// than ORPHAN_CHECKS were made; `None` when the budget is spent.
+    /// The node's canonical block hash at `(c, h)` (`header/branch` up to the cut, never the
+    /// plain header range, which also returns orphans), from `cache`, from the cache shared by
+    /// all compares, or one lookup while fewer than ORPHAN_CHECKS were made; `None` when the
+    /// budget is spent. The node client applies `node_max_rps`.
     async fn canon_cached(
         &self,
         cache: &mut HashMap<(u8, u64), Option<String>>,
@@ -2143,6 +2300,11 @@ impl Ctx {
     ) -> Option<Option<String>> {
         if let Some(v) = cache.get(&(c, h)) {
             return Some(v.clone());
+        }
+        let known = self.canon.lock().expect("canon").get(&(c, h)).cloned();
+        if let Some(v) = known {
+            cache.insert((c, h), Some(v.clone()));
+            return Some(Some(v));
         }
         if *checks >= ORPHAN_CHECKS {
             return None;
@@ -2154,8 +2316,195 @@ impl Ctx {
             .ok()
             .flatten()
             .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string));
+        if let Some(hash) = &v {
+            if self
+                .tips
+                .cut_height(c)
+                .is_some_and(|top| h.saturating_add(CANON_CACHE_DEPTH) <= top)
+            {
+                let mut g = self.canon.lock().expect("canon");
+                if g.len() >= CANON_CACHE_MAX {
+                    g.clear();
+                }
+                g.insert((c, h), hash.clone());
+            }
+        }
         cache.insert((c, h), v.clone());
         Some(v)
+    }
+
+    /// `/txs/search` against chainweb-data (R-P5P9-48), rows one side lists and the other
+    /// lacks (by request key and block). First, when a side held a full page, rows at or past
+    /// its last row's place in the answer order leave both sides (the next rows of that side
+    /// were not fetched). Then:
+    /// - a chainweb-data row leaves `vb` as an orphan when the node's canonical block at its
+    ///   (chain, height), on the cut's branch, is another one (seen live in run 6E-3: 23
+    ///   records, e.g. chain 2 height 7399318, chainweb-data block oC2lnmOL, canonical
+    ///   OHz-ZmnP). `search=` rows chainweb-data matched through a `cont` tx's initial code
+    ///   are left to S-3.
+    /// - an A row above chainweb-data's tip is oracle lag (seen live: 5unn... chain 0, B's
+    ///   newest row 60-150 heights below A's); below it, oracle gap when the node's `/poll`
+    ///   puts the tx in A's block and that block is canonical (the 2026-11-10 hole).
+    ///
+    /// Rows the node cannot settle stay diffs.
+    async fn search_oracle_rows(
+        &self,
+        req: &Request,
+        tb: &Target,
+        va: &mut Value,
+        vb: &mut Value,
+        (full_a, full_b): (bool, bool),
+    ) -> SearchRows {
+        let mut out = SearchRows::default();
+        let (Value::Array(xa), Value::Array(xb)) = (&mut *va, &mut *vb) else {
+            return out;
+        };
+        let pactid = req.path_and_query.contains("pactid=");
+        let place = |r: &Value| search_place(pactid, r);
+        let bound = [(full_a, xa.last()), (full_b, xb.last())]
+            .into_iter()
+            .filter_map(|(full, last)| if full { last.map(place) } else { None })
+            .min();
+        if let Some(bound) = bound {
+            let (na, nb) = (xa.len(), xb.len());
+            xa.retain(|r| place(r) < bound);
+            xb.retain(|r| place(r) < bound);
+            out.a_cut = na - xa.len();
+            out.b_cut = nb - xb.len();
+        }
+        let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+        let key = |r: &Value| (s(r, "requestKey"), s(r, "blockHash"));
+        let cont_history = |r: &Value| {
+            req.path_and_query.contains("search=")
+                && r.get("code").is_some_and(Value::is_null)
+                && r.get("initialCode").is_some_and(|c| !c.is_null())
+        };
+        let mut cache: HashMap<(u8, u64), Option<String>> = HashMap::new();
+        let mut checks = 0usize;
+        let a_keys: std::collections::HashSet<_> = xa.iter().map(key).collect();
+        let mut i = 0;
+        while i < xb.len() {
+            let r = &xb[i];
+            let at = (
+                row_chain(r),
+                r.get("height").and_then(Value::as_u64),
+                s(r, "blockHash"),
+            );
+            let (Some(c), Some(h), Some(bh)) = at else {
+                i += 1;
+                continue;
+            };
+            if a_keys.contains(&key(r)) || cont_history(r) {
+                i += 1;
+                continue;
+            }
+            let canon = self
+                .canon_cached(&mut cache, &mut checks, c, h)
+                .await
+                .flatten();
+            if canon.is_some_and(|ch| ch != bh) {
+                out.orphans.push(xb.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let b_keys: std::collections::HashSet<_> = xb.iter().map(key).collect();
+        let only_a: Vec<usize> = (0..xa.len())
+            .filter(|&i| !b_keys.contains(&key(&xa[i])))
+            .collect();
+        if only_a.is_empty() {
+            return out;
+        }
+        out.b_tip = self.oracle_tip(tb).await;
+        let mut lag = Vec::new();
+        let mut asked = Vec::new();
+        for i in only_a {
+            let h = xa[i].get("height").and_then(Value::as_u64);
+            if h.zip(out.b_tip).is_some_and(|(h, t)| h > t) {
+                lag.push(i);
+            } else {
+                asked.push(i);
+            }
+        }
+        let rows: Vec<&Value> = asked.iter().map(|&i| &xa[i]).collect();
+        let ok = self
+            .node_in_canonical_block(req, &rows, &mut cache, &mut checks)
+            .await;
+        let gap: Vec<usize> = asked
+            .iter()
+            .zip(ok)
+            .filter_map(|(&i, ok)| ok.then_some(i))
+            .collect();
+        let mut gone: Vec<(usize, bool)> = lag
+            .into_iter()
+            .map(|i| (i, true))
+            .chain(gap.into_iter().map(|i| (i, false)))
+            .collect();
+        gone.sort_unstable();
+        for &(i, is_lag) in gone.iter().rev() {
+            let r = xa.remove(i);
+            if is_lag {
+                out.lag.insert(0, r);
+            } else {
+                out.gap.insert(0, r);
+            }
+        }
+        out
+    }
+
+    /// Per row: the node's `/poll` puts its request key in the row's block, and that block is
+    /// the canonical one at the row's (chain, height) on the cut's branch. At most
+    /// NODE_GAP_CHECKS rows are asked, in `/poll` calls of NODE_POLL_CHUNK; the others, and
+    /// rows the node does not answer, are not confirmed.
+    async fn node_in_canonical_block(
+        &self,
+        req: &Request,
+        rows: &[&Value],
+        cache: &mut HashMap<(u8, u64), Option<String>>,
+        checks: &mut usize,
+    ) -> Vec<bool> {
+        let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+        let mut ok = vec![false; rows.len()];
+        let mut by_chain: std::collections::BTreeMap<u8, Vec<usize>> = Default::default();
+        for (i, r) in rows.iter().enumerate().take(NODE_GAP_CHECKS) {
+            if let (Some(c), Some(_), Some(_)) =
+                (row_chain(r), s(r, "requestKey"), s(r, "blockHash"))
+            {
+                by_chain.entry(c).or_default().push(i);
+            }
+        }
+        for (c, idx) in by_chain {
+            for chunk in idx.chunks(NODE_POLL_CHUNK) {
+                let rks: Vec<String> = chunk
+                    .iter()
+                    .filter_map(|&i| s(rows[i], "requestKey"))
+                    .collect();
+                self.count_request(req.route.as_str(), "node", 1);
+                let Ok(res) = self.node.poll(c, &rks).await else {
+                    continue;
+                };
+                for &i in chunk {
+                    let r = rows[i];
+                    let (Some(rk), Some(bh), Some(h)) = (
+                        s(r, "requestKey"),
+                        s(r, "blockHash"),
+                        r.get("height").and_then(Value::as_u64),
+                    ) else {
+                        continue;
+                    };
+                    let polled = res
+                        .get(&rk)
+                        .and_then(|v| v.pointer("/metaData/blockHash"))
+                        .and_then(Value::as_str);
+                    if polled != Some(bh.as_str()) {
+                        continue;
+                    }
+                    let canon = self.canon_cached(cache, checks, c, h).await.flatten();
+                    ok[i] = canon.as_deref() == Some(bh.as_str());
+                }
+            }
+        }
+        ok
     }
 
     /// Splits oracle rows into (orphans, canonical): a row is canonical when the node's
@@ -2754,9 +3103,12 @@ fn percent_decode(s: &str) -> String {
 /// The balances pair's compare of kda-indexer's row for (token, chain) with the node's
 /// `details` answer: the diff entries and whether they may be a race (a missing or extra row,
 /// a guard change, or a balance on a `stale` row or one read 3+ heights below the node's).
+/// A's balance row against the node's `/local`: the diff and whether it may be a race (the
+/// pair then retries once, then counts it as skew). `chains_at`: the chain count at a height.
 fn balance_diff(
     row: Option<&Value>,
     b: &kdx_node::Local<kdx_node::Details>,
+    chains_at: &dyn Fn(u64) -> usize,
 ) -> (Vec<DiffEntry>, bool) {
     let (mut diff, mut uncertain) = (Vec::new(), false);
     let mut push = |path: &str, a: Option<Value>, b: Option<Value>| {
@@ -2783,7 +3135,9 @@ fn balance_diff(
                     );
                     let as_of = r.get("as_of_height").and_then(Value::as_u64).unwrap_or(0);
                     uncertain = r.get("stale").and_then(Value::as_bool) == Some(true)
-                        || as_of + 2 < *height;
+                        || as_of + 2 < *height
+                        || (r.get("module").and_then(Value::as_str) == Some("coin")
+                            && coinbase_skew(bal, as_of, &value.balance, *height, chains_at));
                 }
                 if r.get("guard") != Some(&value.guard) {
                     push("/guard", r.get("guard").cloned(), Some(value.guard.clone()));
@@ -2801,6 +3155,45 @@ fn balance_diff(
     (diff, uncertain)
 }
 
+/// Heights between the two reads that [`coinbase_skew`] considers at most.
+const COINBASE_SKEW_HEIGHTS: u64 = 20;
+
+/// Whether two coin balances of one account, read at heights `ours_h` and `theirs_h`, differ
+/// by the coinbase of some of the blocks between them (R-P5P9-48): a miner's balance grows by
+/// one block reward per block it mines, so the read at the higher height is higher by k
+/// rewards of those heights (1 <= k <= the gap). Seen live in run 6E-3: k:e7f7130f...
+/// chain 12, 32186.381987524380 at 7400410 against the node's 32187.286033524380 at
+/// 7400412, one coinbase of 0.904046.
+fn coinbase_skew(
+    ours: &str,
+    ours_h: u64,
+    theirs: &str,
+    theirs_h: u64,
+    chains_at: &dyn Fn(u64) -> usize,
+) -> bool {
+    use crate::rewards::{block_reward, fixed};
+    let (Some(x), Some(y)) = (fixed(ours), fixed(theirs)) else {
+        return false;
+    };
+    let (lo, hi, d) = if theirs_h > ours_h {
+        (ours_h, theirs_h, y - x)
+    } else {
+        (theirs_h, ours_h, x - y)
+    };
+    if d <= 0 || hi - lo > COINBASE_SKEW_HEIGHTS {
+        return false;
+    }
+    let mut sums = std::collections::BTreeSet::from([0i128]);
+    for h in lo + 1..=hi {
+        let Some(r) = block_reward(h, chains_at(h)) else {
+            return false;
+        };
+        let next: Vec<i128> = sums.iter().map(|s| s + r).collect();
+        sums.extend(next);
+    }
+    sums.contains(&d)
+}
+
 fn same_decimal(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> String {
         let s = s.trim();
@@ -2814,6 +3207,9 @@ fn same_decimal(a: &str, b: &str) -> bool {
     }
     norm(a) == norm(b)
 }
+
+#[cfg(test)]
+mod mock_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2835,34 +3231,149 @@ mod tests {
             serde_json::json!({"module": "coin", "chain": 1, "balance": bal,
                 "guard": guard, "as_of_height": as_of, "stale": stale})
         };
+        let c20 = |_: u64| 20usize;
         // Same decimal in another spelling: a match.
         let r = row("1.50", 100, false);
         assert_eq!(
-            super::balance_diff(Some(&r), &found("1.5", 101)),
+            super::balance_diff(Some(&r), &found("1.5", 101), &c20),
             (vec![], false)
         );
         // A fresh row with another balance: a sure diff.
-        let (d, unsure) = super::balance_diff(Some(&r), &found("2.0", 101));
+        let (d, unsure) = super::balance_diff(Some(&r), &found("2.0", 101), &c20);
         assert_eq!(
             (d.len(), d[0].path.as_str(), unsure),
             (1, "/balance", false)
         );
         // A stale row, or one read 3 heights below the node: maybe a race.
-        assert!(super::balance_diff(Some(&row("1.5", 100, true)), &found("2.0", 101)).1);
-        assert!(super::balance_diff(Some(&r), &found("2.0", 103)).1);
+        assert!(super::balance_diff(Some(&row("1.5", 100, true)), &found("2.0", 101), &c20).1);
+        assert!(super::balance_diff(Some(&r), &found("2.0", 103), &c20).1);
         // Guard change, missing row, extra row.
         let other = serde_json::json!({"module": "coin", "chain": 1, "balance": "1.5",
             "guard": {"keys": ["cd"], "pred": "keys-all"}, "as_of_height": 100});
-        let (d, unsure) = super::balance_diff(Some(&other), &found("1.5", 101));
+        let (d, unsure) = super::balance_diff(Some(&other), &found("1.5", 101), &c20);
         assert_eq!((d[0].path.as_str(), unsure), ("/guard", true));
-        let (d, unsure) = super::balance_diff(None, &found("1.5", 101));
+        let (d, unsure) = super::balance_diff(None, &found("1.5", 101), &c20);
         assert_eq!((d[0].path.as_str(), unsure), ("/row", true));
-        let (d, unsure) = super::balance_diff(Some(&r), &Local::Absent);
+        let (d, unsure) = super::balance_diff(Some(&r), &Local::Absent, &c20);
         assert_eq!(
             (d[0].path.as_str(), d[0].b.is_none(), unsure),
             ("/row", true, true)
         );
-        assert_eq!(super::balance_diff(None, &Local::Absent), (vec![], false));
+        assert_eq!(
+            super::balance_diff(None, &Local::Absent, &c20),
+            (vec![], false)
+        );
+    }
+
+    /// R-P5P9-48 item 3: /coins past the relative 1e-6 is chainweb-data's tip lag only within
+    /// the coinbase minted between the two tips (18.08092 KDA per height at 7.40M).
+    #[test]
+    fn coins_tolerance_scales_with_the_tip_gap() {
+        // Run 6E-3, 04:43:29Z: A - B = 2,621.7 KDA, chainweb-data ~145 heights behind.
+        let a: Value = serde_json::from_str("379699987.13176").unwrap();
+        let b: Value = serde_json::from_str("379697365.43176").unwrap();
+        let hit = coins_tip_lag(&a, &b, 7_400_100, 7_399_955).expect("145 heights");
+        assert_eq!(hit.path, "/~oracle-lag/coins");
+        let (left, ids) = crate::allowlist::Allowlist::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+        )
+        .unwrap()
+        .classify_request(&RouteKind::Coins, "/coins", &[], &[hit]);
+        assert!(left.is_empty() && ids == vec!["oracle-tip-lag".to_string()]);
+        // No gap, or a gap whose coinbase (10 heights, 181 KDA) is too small: a diff.
+        assert!(coins_tip_lag(&a, &b, 7_400_100, 7_400_100).is_none());
+        assert!(coins_tip_lag(&a, &b, 7_400_100, 7_400_090).is_none());
+        assert!(coins_tip_lag(&a, &b, 0, 7_399_955).is_none());
+        // The side behind has the higher supply: a diff.
+        assert!(coins_tip_lag(&b, &a, 7_400_100, 7_399_955).is_none());
+        // chainweb-data ahead of A by 145 heights, its supply higher by as much: the gap.
+        assert!(coins_tip_lag(&b, &a, 7_399_955, 7_400_100).is_some());
+        // coins_tolerance_is_numeric's far value (9,987 KDA) stays a diff at 145 heights.
+        let far: Value = serde_json::from_str("379690000.0").unwrap();
+        assert!(coins_tip_lag(&a, &far, 7_400_100, 7_399_955).is_none());
+        // Within the relative tolerance the diff code's own hit applies, not this one.
+        let near: Value = serde_json::from_str("379699932.889").unwrap();
+        assert!(coins_tip_lag(&a, &near, 7_400_100, 7_399_955).is_none());
+    }
+
+    /// R-P5P9-48 item 5: a balance diff equal to coinbases of the heights between A's read
+    /// and the node's is tip skew (the run 6E-3 record: 0.904046 over 2 heights).
+    #[test]
+    fn balances_coinbase_skew() {
+        use kdx_node::{Details, Local};
+        let guard = serde_json::json!({"keys": ["ab"], "pred": "keys-all"});
+        let node = |bal: &str, height| Local::Found {
+            value: Details {
+                balance: bal.into(),
+                guard: guard.clone(),
+            },
+            height,
+        };
+        let ours = |module: &str, bal: &str, as_of: u64| {
+            serde_json::json!({"module": module, "chain": 12, "balance": bal,
+                "guard": guard, "as_of_height": as_of, "stale": false})
+        };
+        let graph = |h: u64| if h >= 852_054 { 20 } else { 10 };
+        let unsure = |row: Value, n| balance_diff(Some(&row), &n, &graph);
+        // k:e7f7130f... chain 12, 07:38:17Z: one coinbase of 0.904046 over 2 heights.
+        let (d, skew) = unsure(
+            ours("coin", "32186.381987524380", 7_400_410),
+            node("32187.286033524380", 7_400_412),
+        );
+        assert_eq!((d.len(), d[0].path.as_str(), skew), (1, "/balance", true));
+        // Two coinbases over 2 heights: skew. Three, or one off by 1e-6, or the node lower
+        // while ahead: a sure diff.
+        assert!(coinbase_skew(
+            "10.0",
+            7_400_410,
+            "11.808092",
+            7_400_412,
+            &graph
+        ));
+        assert!(!coinbase_skew(
+            "10.0",
+            7_400_410,
+            "12.712138",
+            7_400_412,
+            &graph
+        ));
+        assert!(!coinbase_skew(
+            "10.0",
+            7_400_410,
+            "10.904047",
+            7_400_412,
+            &graph
+        ));
+        assert!(!coinbase_skew(
+            "10.904046",
+            7_400_410,
+            "10.0",
+            7_400_412,
+            &graph
+        ));
+        // The node behind A: A higher by one coinbase is skew too.
+        assert!(coinbase_skew(
+            "10.904046",
+            7_400_412,
+            "10.0",
+            7_400_411,
+            &graph
+        ));
+        // Same height, or another token: no coinbase between.
+        assert!(!coinbase_skew(
+            "10.0",
+            7_400_412,
+            "10.904046",
+            7_400_412,
+            &graph
+        ));
+        let (_, skew) = unsure(
+            ours("free.token", "32186.381987524380", 7_400_410),
+            node("32187.286033524380", 7_400_412),
+        );
+        assert!(!skew);
+        // Before the 20-chain graph the reward is split over 10 chains.
+        assert!(coinbase_skew("1.0", 100, "3.304523", 101, &graph));
     }
 
     #[test]

@@ -148,16 +148,66 @@ impl Default for TailConfig {
     }
 }
 
-/// Listen addresses are plain strings so example configs can carry placeholders (a
-/// `<placeholder>` left in is refused by `validate`).
+/// The addresses of one listener: a string (`"127.0.0.1:31369"`) or an array of strings
+/// (`["127.0.0.1:31369", "10.1.2.3:31369"]`). Every address is bound. They are plain strings
+/// so example configs can carry placeholders (a `<placeholder>` left in is refused by
+/// `validate`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ListenAddrs {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ListenAddrs {
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            ListenAddrs::One(s) => std::slice::from_ref(s),
+            ListenAddrs::Many(v) => v,
+        }
+    }
+}
+
+impl From<&str> for ListenAddrs {
+    fn from(s: &str) -> Self {
+        ListenAddrs::One(s.to_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for ListenAddrs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ListenAddrs;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an \"address:port\" string or an array of them")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ListenAddrs, E> {
+                Ok(ListenAddrs::One(v.to_owned()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ListenAddrs, A::Error> {
+                let mut v = Vec::new();
+                while let Some(s) = seq.next_element::<String>()? {
+                    v.push(s);
+                }
+                Ok(ListenAddrs::Many(v))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ApiConfig {
-    pub native: String,
-    pub compat: String,
+    pub native: ListenAddrs,
+    pub compat: ListenAddrs,
     /// GraphQL listener (spec §5.3; `[graphql]` holds its limits).
-    pub graphql: String,
-    pub admin: String,
+    pub graphql: ListenAddrs,
+    pub admin: ListenAddrs,
     /// Peers (IP or CIDR) whose `X-Forwarded-For` is trusted for the client IP.
     pub trusted_proxies: Vec<String>,
     pub rate_per_ip: u32,
@@ -200,32 +250,85 @@ impl Default for ApiConfig {
 }
 
 impl ApiConfig {
-    /// Parsed listen addresses. Native and admin must be loopback or private (decision Q4);
-    /// compat may be any address (it binds loopback until P8 by configuration).
+    /// Parsed listen addresses, one or more per listener. Native and admin must be loopback
+    /// or private (decision Q4); compat and graphql may be any address (they bind loopback
+    /// until the load-balancer host config adds a private LAN address).
+    ///
+    /// Refused: an empty list, a placeholder, an address listed twice (within a listener or
+    /// across listeners), and a wildcard (`0.0.0.0`, `[::]`) next to another address on the
+    /// same port, in one listener or across two (the wildcard already covers it, so the second
+    /// bind would fail).
     pub fn binds(&self) -> anyhow::Result<kdx_api::server::Binds> {
-        let parse = |key: &str, v: &str| -> anyhow::Result<std::net::SocketAddr> {
-            anyhow::ensure!(
-                !v.contains('<') && !v.contains('>'),
-                "api.{key} still holds a placeholder ({v:?})"
-            );
-            v.parse()
-                .with_context(|| format!("api.{key} is not an address:port ({v:?})"))
+        use std::net::SocketAddr;
+        let parse = |key: &str, l: &ListenAddrs| -> anyhow::Result<Vec<SocketAddr>> {
+            let list = l.as_slice();
+            anyhow::ensure!(!list.is_empty(), "api.{key} lists no address");
+            let mut out: Vec<SocketAddr> = Vec::with_capacity(list.len());
+            for v in list {
+                anyhow::ensure!(
+                    !v.contains('<') && !v.contains('>'),
+                    "api.{key} still holds a placeholder ({v:?})"
+                );
+                let a: SocketAddr = v
+                    .parse()
+                    .with_context(|| format!("api.{key} is not an address:port ({v:?})"))?;
+                anyhow::ensure!(!out.contains(&a), "api.{key} lists {a} twice");
+                out.push(a);
+            }
+            for a in out.iter().filter(|a| a.ip().is_unspecified()) {
+                anyhow::ensure!(
+                    out.iter().filter(|b| b.port() == a.port()).count() == 1,
+                    "api.{key}: {a} already covers every address on port {}; list it alone",
+                    a.port()
+                );
+            }
+            Ok(out)
         };
         let native = parse("native", &self.native)?;
         let compat = parse("compat", &self.compat)?;
         let graphql = parse("graphql", &self.graphql)?;
         let admin = parse("admin", &self.admin)?;
-        for (key, a) in [("native", native), ("admin", admin)] {
-            anyhow::ensure!(
-                kdx_api::limits::is_internal(a.ip()),
-                "api.{key} must bind a loopback or private address (got {a})"
-            );
+        for (key, list) in [("native", &native), ("admin", &admin)] {
+            for a in list {
+                anyhow::ensure!(
+                    kdx_api::limits::is_internal(a.ip()),
+                    "api.{key} must bind a loopback or private address (got {a})"
+                );
+            }
+        }
+        let all = [
+            ("native", &native),
+            ("compat", &compat),
+            ("graphql", &graphql),
+            ("admin", &admin),
+        ];
+        for (i, (k1, l1)) in all.iter().enumerate() {
+            for (k2, l2) in &all[i + 1..] {
+                if let Some(a) = l1.iter().find(|a| l2.contains(a)) {
+                    anyhow::bail!("api.{k1} and api.{k2} both list {a}");
+                }
+                // A wildcard in one listener already covers every address of the other on
+                // that port (the second bind would fail at start on Linux).
+                let clash = l1.iter().find_map(|a| {
+                    l2.iter()
+                        .find(|b| {
+                            a.port() == b.port()
+                                && (a.ip().is_unspecified() || b.ip().is_unspecified())
+                        })
+                        .map(|b| (a, b))
+                });
+                if let Some((a, b)) = clash {
+                    anyhow::bail!(
+                        "api.{k1} {a} and api.{k2} {b} share a port and one is a wildcard"
+                    );
+                }
+            }
         }
         Ok(kdx_api::server::Binds {
-            native: Some(native),
-            compat: Some(compat),
-            graphql: Some(graphql),
-            admin: Some(admin),
+            native,
+            compat,
+            graphql,
+            admin,
         })
     }
 
@@ -743,6 +846,115 @@ mod balances_tests {
             },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod api_tests {
+    use super::*;
+
+    fn api(text: &str) -> anyhow::Result<ApiConfig> {
+        Ok(toml::from_str::<ApiConfig>(text)?)
+    }
+
+    /// Task 10: a listener takes one address or an array; every address is in `Binds`.
+    #[test]
+    fn listeners_take_a_string_or_an_array() {
+        let a = api(r#"
+            native = "127.0.0.1:31361"
+            compat = ["127.0.0.1:31362", "10.1.2.3:31362"]
+            graphql = ["127.0.0.1:31363"]
+            admin = ["127.0.0.1:31369", "10.1.2.3:31369", "[::1]:31369", "[fd00::5]:31369"]
+        "#)
+        .unwrap();
+        assert_eq!(a.native, ListenAddrs::One("127.0.0.1:31361".into()));
+        let b = a.binds().unwrap();
+        let s = |v: &[std::net::SocketAddr]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(s(&b.native), ["127.0.0.1:31361"]);
+        assert_eq!(s(&b.compat), ["127.0.0.1:31362", "10.1.2.3:31362"]);
+        assert_eq!(s(&b.graphql), ["127.0.0.1:31363"]);
+        assert_eq!(
+            s(&b.admin),
+            [
+                "127.0.0.1:31369",
+                "10.1.2.3:31369",
+                "[::1]:31369",
+                "[fd00::5]:31369"
+            ]
+        );
+        // The defaults are one loopback address each.
+        let d = ApiConfig::default().binds().unwrap();
+        assert_eq!(
+            (
+                d.native.len(),
+                d.compat.len(),
+                d.graphql.len(),
+                d.admin.len()
+            ),
+            (1, 1, 1, 1)
+        );
+        // A string and a one-element array serialise back as they came.
+        let text = toml::to_string(&a).unwrap();
+        assert!(text.contains(r#"native = "127.0.0.1:31361""#), "{text}");
+        assert!(text.contains(r#"graphql = ["127.0.0.1:31363"]"#), "{text}");
+    }
+
+    /// Task 10: a public address on native or admin, in any position, is refused, as are empty
+    /// lists, placeholders, repeats and a wildcard next to another address on its port.
+    #[test]
+    fn bad_listener_lists_are_refused() {
+        for (text, want) in [
+            (
+                r#"admin = ["127.0.0.1:31369", "8.8.8.8:31369"]"#,
+                "loopback or private",
+            ),
+            (r#"admin = "0.0.0.0:31369""#, "loopback or private"),
+            (
+                r#"native = ["[::1]:31361", "[2001:db8::1]:31361"]"#,
+                "loopback or private",
+            ),
+            (r#"compat = []"#, "lists no address"),
+            (
+                r#"compat = ["127.0.0.1:31362", "<private-lan-ip>:31362"]"#,
+                "placeholder",
+            ),
+            (
+                r#"compat = ["127.0.0.1:31362", "127.0.0.1"]"#,
+                "not an address:port",
+            ),
+            (
+                r#"compat = ["127.0.0.1:31362", "127.0.0.1:31362"]"#,
+                "twice",
+            ),
+            (
+                r#"compat = ["0.0.0.0:31362", "10.1.2.3:31362"]"#,
+                "list it alone",
+            ),
+            (
+                r#"graphql = ["[::]:31363", "127.0.0.1:31363"]"#,
+                "list it alone",
+            ),
+            (
+                r#"graphql = "127.0.0.1:31362""#,
+                "both list 127.0.0.1:31362",
+            ),
+            (
+                r#"compat = "0.0.0.0:31362"
+graphql = "127.0.0.1:31362""#,
+                "share a port and one is a wildcard",
+            ),
+        ] {
+            let e = api(text).unwrap().binds().unwrap_err();
+            assert!(format!("{e:#}").contains(want), "{text}: {e:#}");
+        }
+        // A wildcard alone, or next to an address on another port, is fine for compat.
+        let ok = api(r#"compat = ["0.0.0.0:31362", "127.0.0.1:31372"]"#).unwrap();
+        assert!(ok.binds().is_ok());
+        // A number or a table is a parse error that names the expected form.
+        for text in ["admin = 31369", "admin = [31369]", "admin = { a = 1 }"] {
+            let e = api(text).unwrap_err();
+            assert!(format!("{e:#}").contains("string"), "{text}: {e:#}");
         }
     }
 }

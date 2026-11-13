@@ -37,8 +37,9 @@ use crate::store::View;
 use crate::{ApiError, ApiResult};
 
 /// Genesis-block txs are not served by the compat list routes (`/txs/account`,
-/// `/txs/events`, `/txs/recent`, `/v1/txs`). `/txs/tx` and `/txs/txs` serve them, as
-/// chainweb-data does (ruling R3E-1, G1). The native API serves them everywhere.
+/// `/txs/events`, `/txs/recent`, `/v1/txs`). `/txs/tx`, `/txs/txs` and `/txs/search` serve
+/// them, as chainweb-data does (rulings R3E-1, G1, and R-P5P9-47 for search). The native
+/// API serves them everywhere.
 pub const COMPAT_HIDE_GENESIS: bool = true;
 
 /// True for a tx the compat list routes must not show. Genesis heights come from the
@@ -341,6 +342,11 @@ pub trait RowSource {
     fn needs_block(&self) -> bool {
         true
     }
+    /// True when the route lists genesis-block txs (`/txs/search`, as chainweb-data does);
+    /// the other list routes hide them.
+    fn lists_genesis(&self) -> bool {
+        false
+    }
 }
 
 /// Where the candidate txs of a height come from.
@@ -416,6 +422,7 @@ pub fn collect_page(
     let mut progressed = false;
     let no_block = BlockRecord::default();
     let mut blocks: BTreeMap<(u8, u32), BlockRecord> = BTreeMap::new();
+    let hide = !src.lists_genesis();
     loop {
         view.check_deadline()?;
         // One height's txs.
@@ -455,7 +462,7 @@ pub fn collect_page(
                 keys.dedup();
                 let mut txs = Vec::with_capacity(keys.len());
                 for k in keys {
-                    if hidden(view, k) {
+                    if hide && hidden(view, k) {
                         continue;
                     }
                     if let Some(r) = view.tx(k)? {
@@ -484,7 +491,7 @@ pub fn collect_page(
                 let mut txs = Vec::new();
                 for c in 0..kdx_segment::SLOT_WIDTH as u8 {
                     for r in view.block_txs(c, h)? {
-                        if !hidden(view, r.key) {
+                        if !(hide && hidden(view, r.key)) {
                             txs.push(r);
                         }
                     }
