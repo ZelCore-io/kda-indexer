@@ -1639,7 +1639,7 @@ impl Ctx {
                 }
             };
             let (diff, uncertain) = match &b {
-                Ok(l) => balance_diff(row, l),
+                Ok(l) => balance_diff(row, l, &|h| self.graph.chains_at(h).len()),
                 Err(_) => (Vec::new(), false),
             };
             if diff.is_empty() {
@@ -3018,9 +3018,12 @@ fn percent_decode(s: &str) -> String {
 /// The balances pair's compare of kda-indexer's row for (token, chain) with the node's
 /// `details` answer: the diff entries and whether they may be a race (a missing or extra row,
 /// a guard change, or a balance on a `stale` row or one read 3+ heights below the node's).
+/// A's balance row against the node's `/local`: the diff and whether it may be a race (the
+/// pair then retries once, then counts it as skew). `chains_at`: the chain count at a height.
 fn balance_diff(
     row: Option<&Value>,
     b: &kdx_node::Local<kdx_node::Details>,
+    chains_at: &dyn Fn(u64) -> usize,
 ) -> (Vec<DiffEntry>, bool) {
     let (mut diff, mut uncertain) = (Vec::new(), false);
     let mut push = |path: &str, a: Option<Value>, b: Option<Value>| {
@@ -3047,7 +3050,9 @@ fn balance_diff(
                     );
                     let as_of = r.get("as_of_height").and_then(Value::as_u64).unwrap_or(0);
                     uncertain = r.get("stale").and_then(Value::as_bool) == Some(true)
-                        || as_of + 2 < *height;
+                        || as_of + 2 < *height
+                        || (r.get("module").and_then(Value::as_str) == Some("coin")
+                            && coinbase_skew(bal, as_of, &value.balance, *height, chains_at));
                 }
                 if r.get("guard") != Some(&value.guard) {
                     push("/guard", r.get("guard").cloned(), Some(value.guard.clone()));
@@ -3063,6 +3068,45 @@ fn balance_diff(
         }
     }
     (diff, uncertain)
+}
+
+/// Heights between the two reads that [`coinbase_skew`] considers at most.
+const COINBASE_SKEW_HEIGHTS: u64 = 20;
+
+/// Whether two coin balances of one account, read at heights `ours_h` and `theirs_h`, differ
+/// by the coinbase of some of the blocks between them (R-P5P9-48): a miner's balance grows by
+/// one block reward per block it mines, so the read at the higher height is higher by k
+/// rewards of those heights (1 <= k <= the gap). Seen live in run 6E-3: k:e7f7130f...
+/// chain 12, 32186.381987524380 at 7400410 against the node's 32187.286033524380 at
+/// 7400412, one coinbase of 0.904046.
+fn coinbase_skew(
+    ours: &str,
+    ours_h: u64,
+    theirs: &str,
+    theirs_h: u64,
+    chains_at: &dyn Fn(u64) -> usize,
+) -> bool {
+    use crate::rewards::{block_reward, fixed};
+    let (Some(x), Some(y)) = (fixed(ours), fixed(theirs)) else {
+        return false;
+    };
+    let (lo, hi, d) = if theirs_h > ours_h {
+        (ours_h, theirs_h, y - x)
+    } else {
+        (theirs_h, ours_h, x - y)
+    };
+    if d <= 0 || hi - lo > COINBASE_SKEW_HEIGHTS {
+        return false;
+    }
+    let mut sums = std::collections::BTreeSet::from([0i128]);
+    for h in lo + 1..=hi {
+        let Some(r) = block_reward(h, chains_at(h)) else {
+            return false;
+        };
+        let next: Vec<i128> = sums.iter().map(|s| s + r).collect();
+        sums.extend(next);
+    }
+    sums.contains(&d)
 }
 
 fn same_decimal(a: &str, b: &str) -> bool {
@@ -3102,34 +3146,38 @@ mod tests {
             serde_json::json!({"module": "coin", "chain": 1, "balance": bal,
                 "guard": guard, "as_of_height": as_of, "stale": stale})
         };
+        let c20 = |_: u64| 20usize;
         // Same decimal in another spelling: a match.
         let r = row("1.50", 100, false);
         assert_eq!(
-            super::balance_diff(Some(&r), &found("1.5", 101)),
+            super::balance_diff(Some(&r), &found("1.5", 101), &c20),
             (vec![], false)
         );
         // A fresh row with another balance: a sure diff.
-        let (d, unsure) = super::balance_diff(Some(&r), &found("2.0", 101));
+        let (d, unsure) = super::balance_diff(Some(&r), &found("2.0", 101), &c20);
         assert_eq!(
             (d.len(), d[0].path.as_str(), unsure),
             (1, "/balance", false)
         );
         // A stale row, or one read 3 heights below the node: maybe a race.
-        assert!(super::balance_diff(Some(&row("1.5", 100, true)), &found("2.0", 101)).1);
-        assert!(super::balance_diff(Some(&r), &found("2.0", 103)).1);
+        assert!(super::balance_diff(Some(&row("1.5", 100, true)), &found("2.0", 101), &c20).1);
+        assert!(super::balance_diff(Some(&r), &found("2.0", 103), &c20).1);
         // Guard change, missing row, extra row.
         let other = serde_json::json!({"module": "coin", "chain": 1, "balance": "1.5",
             "guard": {"keys": ["cd"], "pred": "keys-all"}, "as_of_height": 100});
-        let (d, unsure) = super::balance_diff(Some(&other), &found("1.5", 101));
+        let (d, unsure) = super::balance_diff(Some(&other), &found("1.5", 101), &c20);
         assert_eq!((d[0].path.as_str(), unsure), ("/guard", true));
-        let (d, unsure) = super::balance_diff(None, &found("1.5", 101));
+        let (d, unsure) = super::balance_diff(None, &found("1.5", 101), &c20);
         assert_eq!((d[0].path.as_str(), unsure), ("/row", true));
-        let (d, unsure) = super::balance_diff(Some(&r), &Local::Absent);
+        let (d, unsure) = super::balance_diff(Some(&r), &Local::Absent, &c20);
         assert_eq!(
             (d[0].path.as_str(), d[0].b.is_none(), unsure),
             ("/row", true, true)
         );
-        assert_eq!(super::balance_diff(None, &Local::Absent), (vec![], false));
+        assert_eq!(
+            super::balance_diff(None, &Local::Absent, &c20),
+            (vec![], false)
+        );
     }
 
     /// R-P5P9-48 item 3: /coins past the relative 1e-6 is chainweb-data's tip lag only within
@@ -3161,6 +3209,86 @@ mod tests {
         // Within the relative tolerance the diff code's own hit applies, not this one.
         let near: Value = serde_json::from_str("379699932.889").unwrap();
         assert!(coins_tip_lag(&a, &near, 7_400_100, 7_399_955).is_none());
+    }
+
+    /// R-P5P9-48 item 5: a balance diff equal to coinbases of the heights between A's read
+    /// and the node's is tip skew (the run 6E-3 record: 0.904046 over 2 heights).
+    #[test]
+    fn balances_coinbase_skew() {
+        use kdx_node::{Details, Local};
+        let guard = serde_json::json!({"keys": ["ab"], "pred": "keys-all"});
+        let node = |bal: &str, height| Local::Found {
+            value: Details {
+                balance: bal.into(),
+                guard: guard.clone(),
+            },
+            height,
+        };
+        let ours = |module: &str, bal: &str, as_of: u64| {
+            serde_json::json!({"module": module, "chain": 12, "balance": bal,
+                "guard": guard, "as_of_height": as_of, "stale": false})
+        };
+        let graph = |h: u64| if h >= 852_054 { 20 } else { 10 };
+        let unsure = |row: Value, n| balance_diff(Some(&row), &n, &graph);
+        // k:e7f7130f... chain 12, 07:38:17Z: one coinbase of 0.904046 over 2 heights.
+        let (d, skew) = unsure(
+            ours("coin", "32186.381987524380", 7_400_410),
+            node("32187.286033524380", 7_400_412),
+        );
+        assert_eq!((d.len(), d[0].path.as_str(), skew), (1, "/balance", true));
+        // Two coinbases over 2 heights: skew. Three, or one off by 1e-6, or the node lower
+        // while ahead: a sure diff.
+        assert!(coinbase_skew(
+            "10.0",
+            7_400_410,
+            "11.808092",
+            7_400_412,
+            &graph
+        ));
+        assert!(!coinbase_skew(
+            "10.0",
+            7_400_410,
+            "12.712138",
+            7_400_412,
+            &graph
+        ));
+        assert!(!coinbase_skew(
+            "10.0",
+            7_400_410,
+            "10.904047",
+            7_400_412,
+            &graph
+        ));
+        assert!(!coinbase_skew(
+            "10.904046",
+            7_400_410,
+            "10.0",
+            7_400_412,
+            &graph
+        ));
+        // The node behind A: A higher by one coinbase is skew too.
+        assert!(coinbase_skew(
+            "10.904046",
+            7_400_412,
+            "10.0",
+            7_400_411,
+            &graph
+        ));
+        // Same height, or another token: no coinbase between.
+        assert!(!coinbase_skew(
+            "10.0",
+            7_400_412,
+            "10.904046",
+            7_400_412,
+            &graph
+        ));
+        let (_, skew) = unsure(
+            ours("free.token", "32186.381987524380", 7_400_410),
+            node("32187.286033524380", 7_400_412),
+        );
+        assert!(!skew);
+        // Before the 20-chain graph the reward is split over 10 chains.
+        assert!(coinbase_skew("1.0", 100, "3.304523", 101, &graph));
     }
 
     #[test]
