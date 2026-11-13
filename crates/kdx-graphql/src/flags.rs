@@ -5,6 +5,9 @@
 //!   answers the items counted so far (a lower bound) and the edges are kept.
 //! - `searchTruncated: true`: `transactionsByPactCode` stopped at a search cap or its time
 //!   budget; `pageInfo.endCursor` resumes it.
+//! - `truncated: true`: a `fungibleAccountsByPublicKey` or `fungibleChainAccountsByPublicKey`
+//!   stopped at its 100 matching accounts or its scan window with `KeyAccounts` rows of the
+//!   key left unread (L-2).
 //!
 //! One [`RespFlags`] per request (an extension instance is created per request), so the
 //! requests of a batch are flagged separately. Subscription events carry no flags.
@@ -22,6 +25,7 @@ use async_graphql::{Context, Request, Response, ServerResult, Value};
 pub struct RespFlags {
     count_lower_bound: AtomicBool,
     search_truncated: AtomicBool,
+    key_accounts_truncated: AtomicBool,
 }
 
 /// Which mark to set.
@@ -29,6 +33,7 @@ pub struct RespFlags {
 pub enum Flag {
     CountLowerBound,
     SearchTruncated,
+    KeyAccountsTruncated,
 }
 
 impl RespFlags {
@@ -36,6 +41,7 @@ impl RespFlags {
         match f {
             Flag::CountLowerBound => &self.count_lower_bound,
             Flag::SearchTruncated => &self.search_truncated,
+            Flag::KeyAccountsTruncated => &self.key_accounts_truncated,
         }
     }
     pub fn is_set(&self, f: Flag) -> bool {
@@ -82,6 +88,7 @@ impl Extension for FlagsExt {
         for (f, name) in [
             (Flag::CountLowerBound, "totalCountLowerBound"),
             (Flag::SearchTruncated, "searchTruncated"),
+            (Flag::KeyAccountsTruncated, "truncated"),
         ] {
             if self.0.is_set(f) {
                 r.extensions.insert(name.to_owned(), Value::Boolean(true));

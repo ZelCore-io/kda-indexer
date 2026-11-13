@@ -3,17 +3,20 @@
 //! `connection_init` timeout, the idle close, the message size cap and the per-message rate
 //! tokens. Slots return to zero when a client goes away.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use kdx_api::compat::shapes::Ev;
 use kdx_api::{Api, ApiSettings, ApiState, Store, TipWatch};
 use kdx_graphql::feed::{FeedBlock, FeedItem};
+use kdx_graphql::txlist::TxData;
 use kdx_graphql::ws::active_subscriptions;
 use kdx_graphql::{build_schema, router, BlockFeed, GraphqlSettings, KdxSchema};
-use kdx_types::record::BlockRecord;
-use kdx_types::Hash32;
+use kdx_types::record::{BlockRecord, TxRecord};
+use kdx_types::{Hash32, TxKey};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -44,7 +47,8 @@ async fn server(settings: GraphqlSettings, rate_burst: u32) -> Server {
         v1txs_max_body_bytes: 8 << 20,
         rate_per_ip: 1,
         rate_burst,
-        trusted_proxies: Vec::new(),
+        // Loopback is the proxy: a test client names itself in `X-Forwarded-For`.
+        trusted_proxies: vec![kdx_api::limits::IpNet::parse("127.0.0.1/32").unwrap()],
         read_threads: 2,
         ready_max_lag: 10,
         max_event_lists: 64,
@@ -72,11 +76,20 @@ async fn server(settings: GraphqlSettings, rate_burst: u32) -> Server {
 }
 
 async fn connect(s: &Server, proto: &str) -> Result<Ws, u16> {
+    connect_as(s, proto, None).await
+}
+
+/// Connect as client `xff` (sent in `X-Forwarded-For`; loopback is a trusted proxy).
+async fn connect_as(s: &Server, proto: &str, xff: Option<&str>) -> Result<Ws, u16> {
     let mut req = format!("ws://{}/graphql", s.addr)
         .into_client_request()
         .unwrap();
     req.headers_mut()
         .insert("sec-websocket-protocol", proto.parse().unwrap());
+    if let Some(ip) = xff {
+        req.headers_mut()
+            .insert("x-forwarded-for", ip.parse().unwrap());
+    }
     match tokio_tungstenite::connect_async(req).await {
         Ok((ws, _)) => Ok(ws),
         Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
@@ -139,7 +152,6 @@ fn block(chain: u8, height: u64) -> FeedItem {
         hash: b.hash,
         block: Arc::new(b),
         txs: Arc::new(Vec::new()),
-        reorg: false,
     }))
 }
 
@@ -270,7 +282,8 @@ async fn message_cap_and_rate_tokens() {
     init(&mut a).await;
     let big = "x".repeat(70 * 1024);
     let _ = a.send(Message::Text(big.into())).await;
-    assert!(recv(&mut a).await.is_err());
+    // L-3: with a close frame (1009), not a dropped connection (1006).
+    assert_eq!(recv(&mut a).await.err(), Some(1009));
     // Each message takes a rate token: out of tokens closes 4429.
     let s = server(GraphqlSettings::default(), 10).await;
     let mut b = connect(&s, "graphql-transport-ws").await.unwrap();
@@ -294,4 +307,330 @@ async fn message_cap_and_rate_tokens() {
         }
     }
     assert_eq!(closed, Some(4429));
+}
+
+/// I-4: a gap inside a batch is reported after the blocks before it, and the blocks queued
+/// behind it still arrive.
+#[tokio::test]
+async fn gap_inside_a_batch_loses_nothing() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    s.feed.inject(block(0, 1));
+    s.feed.inject(FeedItem::Gap(0));
+    s.feed.inject(block(1, 2));
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let m = recv(&mut a).await.unwrap();
+        assert_eq!(m["type"], "next", "{m}");
+        let p = &m["payload"];
+        got.push(match p["data"]["newBlocks"].as_array() {
+            Some(bs) => bs
+                .iter()
+                .map(|b| format!("{}/{}", b["chainId"], b["height"]))
+                .collect::<Vec<_>>()
+                .join(","),
+            None => p["errors"][0]["extensions"]["code"].to_string(),
+        });
+    }
+    assert_eq!(got, ["0/1", "\"INTERNAL\"", "1/2"]);
+}
+
+/// Block `(chain, height)` with one tx of `n` `coin.TRANSFER` events.
+fn block_with_events(chain: u8, height: u64, n: usize) -> FeedItem {
+    let FeedItem::Block(b) = block(chain, height) else {
+        unreachable!()
+    };
+    let evs = (0..n)
+        .map(|i| Ev {
+            pos: i,
+            qual_name: "coin.TRANSFER".into(),
+            module: "coin".into(),
+            module_hash: String::new(),
+            params: json!(["a", "b", 1.0]),
+        })
+        .collect();
+    let tx = TxData {
+        rec: TxRecord {
+            key: TxKey::new(height as u32, chain, 1),
+            ..TxRecord::default()
+        },
+        block: b.block.clone(),
+        out: Value::Null,
+        cmd: None,
+        evs,
+        trs: Vec::new(),
+        nfts: Vec::new(),
+    };
+    FeedItem::Block(Arc::new(FeedBlock {
+        chain,
+        height,
+        hash: b.hash,
+        block: b.block.clone(),
+        txs: Arc::new(vec![Arc::new(tx)]),
+    }))
+}
+
+/// The list sizes of the next `n` `next` messages, per subscription id.
+async fn sizes(ws: &mut Ws, n: usize, field: &str) -> BTreeMap<String, Vec<Vec<i64>>> {
+    let mut got: BTreeMap<String, Vec<Vec<i64>>> = BTreeMap::new();
+    for _ in 0..n {
+        let m = recv(ws).await.unwrap();
+        assert_eq!(m["type"], "next", "{m}");
+        let items = m["payload"]["data"][field].as_array().expect("a list");
+        let hs = items
+            .iter()
+            .map(|b| b["height"].as_i64().unwrap_or(0))
+            .collect();
+        got.entry(m["id"].as_str().unwrap().into())
+            .or_default()
+            .push(hs);
+    }
+    got
+}
+
+/// I-1, M3: a message carries at most its priced blocks: one per subscribed chain without
+/// `quantity`, and the newest `quantity` (clamped to `max_page`) with it.
+#[tokio::test]
+async fn messages_carry_at_most_their_priced_blocks() {
+    let settings = GraphqlSettings {
+        max_page: 2,
+        ..GraphqlSettings::default()
+    };
+    let s = server(settings, 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    for (id, q) in [
+        (
+            "1",
+            "subscription { newBlocks(chainIds: [\"0\"]) { height } }",
+        ),
+        (
+            "2",
+            "subscription { newBlocks(chainIds: [\"0\"], quantity: 3) { height } }",
+        ),
+    ] {
+        send(
+            &mut a,
+            json!({"id": id, "type": "subscribe", "payload": {"query": q}}),
+        )
+        .await;
+    }
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 2).await);
+    for h in 1..=3 {
+        s.feed.inject(block(0, h));
+    }
+    let got = sizes(&mut a, 4, "newBlocks").await;
+    assert_eq!(got["1"], [vec![1], vec![2], vec![3]]);
+    assert_eq!(got["2"], [vec![2, 3]]);
+}
+
+/// I-1: an `events` message carries at most the default page of events; the rest follow.
+#[tokio::test]
+async fn events_messages_carry_at_most_the_priced_events() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let q =
+        "subscription { events(qualifiedEventName: \"coin.TRANSFER\", chainId: \"0\") { height } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": q}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    s.feed.inject(block_with_events(0, 7, 45));
+    let got = sizes(&mut a, 3, "events").await;
+    let lens: Vec<usize> = got["1"].iter().map(Vec::len).collect();
+    assert_eq!(lens, [20, 20, 5]);
+}
+
+/// I-1: a subscriber that falls more than the feed's buffer behind gets one gap error and
+/// stays open from the feed's tail.
+#[tokio::test]
+async fn lagging_subscriber_gets_a_gap_and_stays_open() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    for h in 0..1100 {
+        s.feed.inject(block(5, h));
+    }
+    let m = recv(&mut a).await.unwrap();
+    assert_eq!(
+        (
+            m["type"].as_str(),
+            m["payload"]["errors"][0]["extensions"]["code"].as_str()
+        ),
+        (Some("next"), Some("INTERNAL")),
+        "{m}"
+    );
+    s.feed.inject(block(0, 1));
+    let got = sizes(&mut a, 1, "newBlocks").await;
+    assert_eq!(got["1"], [vec![1]]);
+}
+
+/// I-2: a query over the websocket is refused before it runs (only subscriptions there).
+#[tokio::test]
+async fn queries_over_the_socket_are_refused() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let q = "{ graphConfiguration { version } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": q}}),
+    )
+    .await;
+    let m = recv(&mut a).await.unwrap();
+    assert!(m["payload"]["data"].is_null(), "{m}");
+    let errors = if m["type"] == "error" {
+        &m["payload"]
+    } else {
+        &m["payload"]["errors"]
+    };
+    assert_eq!(errors[0]["extensions"]["code"], "NOT_SUPPORTED", "{m}");
+}
+
+#[tokio::test]
+async fn fragment_bomb_over_the_socket_is_refused_fast() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    for (id, n) in [(1, 24), (2, 40), (3, 60)] {
+        let mut q = String::from("fragment F0 on Block { hash } ");
+        for i in 1..=n {
+            q += &format!("fragment F{i} on Block {{ ...F{p} ...F{p} }} ", p = i - 1);
+        }
+        q += &format!("subscription {{ newBlocks {{ ...F{n} }} }}");
+        let t = Instant::now();
+        send(
+            &mut a,
+            json!({"id": id.to_string(), "type": "subscribe", "payload": {"query": q}}),
+        )
+        .await;
+        let m = recv(&mut a).await.unwrap();
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "n={n}: {:?}",
+            t.elapsed()
+        );
+        assert!(m["payload"]["data"].is_null(), "{m}");
+        let errors = if m["type"] == "error" {
+            &m["payload"]
+        } else {
+            &m["payload"]["errors"]
+        };
+        assert_eq!(errors[0]["extensions"]["code"], "LIMIT", "{m}");
+        assert_eq!(errors[0]["extensions"]["limit"], "complexity", "{m}");
+        if m["type"] == "next" {
+            assert_eq!(recv(&mut a).await.unwrap()["type"], "complete");
+        }
+    }
+    // The connection stays usable.
+    send(
+        &mut a,
+        json!({"id": "4", "type": "subscribe", "payload": {"query": "subscription { newBlocks { hash } }"}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+}
+
+/// Subscribe `ids` on `ws` (`newBlocks`, which waits for blocks and sends nothing).
+async fn subscribe_all(ws: &mut Ws, ids: std::ops::Range<u32>) {
+    for id in ids {
+        send(
+            ws,
+            json!({"id": id.to_string(), "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+        )
+        .await;
+    }
+}
+
+/// The next message is a `LIMIT` refusal of subscription `id`, for `reason`.
+async fn refused(ws: &mut Ws, id: &str, reason: &str) {
+    let e = recv(ws).await.unwrap();
+    assert_eq!(e["id"], id, "{e}");
+    let x = &e["payload"]["errors"][0]["extensions"];
+    assert_eq!(
+        (x["code"].as_str(), x["limit"].as_str()),
+        (Some("LIMIT"), Some(reason)),
+        "{e}"
+    );
+}
+
+/// M-2 with the default caps: one client holds at most `ws_subs_per_ip` (40) subscriptions
+/// over all its connections; the /64s of one IPv6 /48 share `ws_conns_per_48` (30)
+/// connections and `ws_subs_per_48` (120) subscriptions; other clients are still served.
+#[tokio::test]
+async fn per_client_and_per_48_caps() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let proto = "graphql-transport-ws";
+    // IPv4 client A: 20 + 20 subscriptions on two connections, the 41st on a third is
+    // refused.
+    let mut a = Vec::new();
+    for i in 0..3u32 {
+        let mut w = connect_as(&s, proto, Some("192.0.2.1")).await.unwrap();
+        init(&mut w).await;
+        if i < 2 {
+            subscribe_all(&mut w, i * 20..i * 20 + 20).await;
+        }
+        a.push(w);
+    }
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 40).await);
+    subscribe_all(&mut a[2], 40..41).await;
+    refused(&mut a[2], "40", "ws_subscriptions_per_client").await;
+    // A fresh client still subscribes.
+    let mut b = connect_as(&s, proto, Some("192.0.2.2")).await.unwrap();
+    init(&mut b).await;
+    subscribe_all(&mut b, 0..1).await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 41).await);
+    drop((a, b));
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 0).await);
+
+    // One /48: three /64s hold 40 subscriptions each on 2 connections; a fourth /64's
+    // first subscription is refused at the /48's 120.
+    let mut v6 = Vec::new();
+    for net in 1..=3u32 {
+        for c in 0..2u32 {
+            let ip = format!("2001:db8:1:{net}::1");
+            let mut w = connect_as(&s, proto, Some(&ip)).await.unwrap();
+            init(&mut w).await;
+            subscribe_all(&mut w, c * 20..c * 20 + 20).await;
+            v6.push(w);
+        }
+    }
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 120).await);
+    let mut d = connect_as(&s, proto, Some("2001:db8:1:4::1"))
+        .await
+        .unwrap();
+    init(&mut d).await;
+    subscribe_all(&mut d, 0..1).await;
+    refused(&mut d, "0", "ws_subscriptions_per_client").await;
+    // Connections: the /48 holds 7; 23 more from fresh /64s fill its 30, the next is 429.
+    for net in 5..28u32 {
+        let ip = format!("2001:db8:1:{net}::1");
+        v6.push(connect_as(&s, proto, Some(&ip)).await.unwrap());
+    }
+    assert_eq!(
+        connect_as(&s, proto, Some("2001:db8:1:99::1")).await.err(),
+        Some(429)
+    );
+    // Another /48 and an IPv4 client are not affected.
+    let mut e = connect_as(&s, proto, Some("2001:db8:2::1")).await.unwrap();
+    init(&mut e).await;
+    subscribe_all(&mut e, 0..1).await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 121).await);
+    assert!(connect_as(&s, proto, Some("192.0.2.3")).await.is_ok());
 }

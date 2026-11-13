@@ -7,10 +7,14 @@
 //!
 //! Fragments are expanded where they are spread, so neither fragments, aliases nor inline
 //! fragments get around depth or complexity. Every operation of a document is checked (not
-//! only the one that runs). The walk itself is bounded by [`MAX_VISITS`].
+//! only the one that runs). The walk itself is bounded by [`MAX_VISITS`], and it runs on the
+//! freshly parsed document before any other walk of it (C-1), counting directives too
+//! ([`MAX_DIRECTIVES`] per field, fragment or spread).
 //!
-//! Cost model: each field costs 1 (`__typename` and the Relay wrappers `edges` and `node`
-//! 0). A field that returns a page
+//! Cost model (field types from the schema, keyed on field names, never aliases): each field
+//! costs 1 (`__typename` 0, and a connection's `edges` and their `node` 0). A
+//! deferred `totalCount` (every one but a short list of cheap connections'; fails closed) costs `max_page`, and an operation may run at
+//! most [`MAX_COUNTS`] of them, outer multipliers included. A connection or list field that returns a page
 //! (`first`/`last` or a connection field without them) multiplies the cost of its
 //! selection (of a connection, its `edges` only: `totalCount` and `pageInfo` are answered
 //! once per connection) by the page size it will return (clamped like the resolver: `max_page`, or
@@ -20,12 +24,14 @@
 use std::sync::Arc;
 
 use async_graphql::extensions::{
-    Extension, ExtensionContext, ExtensionFactory, NextParseQuery, NextValidation,
+    Extension, ExtensionContext, ExtensionFactory, NextPrepareRequest, NextValidation,
 };
 use async_graphql::parser::types::{
-    DocumentOperations, ExecutableDocument, Field, FragmentDefinition, Selection, SelectionSet,
+    DocumentOperations, ExecutableDocument, Field, FragmentDefinition, OperationType, Selection,
+    SelectionSet,
 };
-use async_graphql::{Name, ServerError, ServerResult, ValidationResult, Value, Variables};
+use async_graphql::registry::Registry;
+use async_graphql::{Name, Request, ServerError, ServerResult, ValidationResult, Value, Variables};
 
 use crate::error::limit;
 use crate::{Gql, GraphqlSettings};
@@ -53,6 +59,68 @@ const PAGED: &[&str] = &[
     "balance",
 ];
 
+/// Lists that clamp at `wide_page` instead of `max_page`: the block lists and account
+/// balances (R-P5P9-20).
+const WIDE: &[&str] = &[
+    "blocksFromDepth",
+    "blocksFromHeight",
+    "completedBlockHeights",
+    "balance",
+];
+
+/// The `transactions` subscription's `quantity` when absent (its SDL default).
+const SUB_TXS_QUANTITY: i64 = 20;
+
+/// Deferred `totalCount`s (count walks) one operation may run, outer multipliers included.
+pub const MAX_COUNTS: u64 = 2;
+
+/// Connections whose `totalCount` is known with their page and needs no decoding (a block's
+/// tx keys, a tx's own rows, a block range): bounded and cheap. Every other `totalCount`,
+/// including one under a type the walker cannot resolve, is a deferred count walk (fail
+/// closed, SR7-3). A block's `events` count is neither: see [`BLOCK_EVENTS`]. Only
+/// connections that have a `totalCount` field are listed (M8).
+const CHEAP_COUNTS: &[&str] = &[
+    "BlockTransactionsConnection",
+    "QueryBlocksFromDepthConnection",
+    "TransactionResultEventsConnection",
+    "TransactionResultTransfersConnection",
+];
+
+/// A block's `events` count decodes every tx output of the block: priced as a default page
+/// of tx loads per block, not a count walk (kadscan counts the events of every block of a
+/// block page) (M2).
+const BLOCK_EVENTS: &str = "BlockEventsConnection";
+
+fn cheap_count(ty: &str) -> bool {
+    CHEAP_COUNTS.contains(&ty)
+}
+
+/// Whose selection a set is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrap {
+    None,
+    /// A connection's.
+    Conn,
+    /// A connection's `edges`.
+    Edges,
+}
+
+/// `[Foo!]!` → `Foo`.
+fn base_type(t: &str) -> &str {
+    t.trim_matches(|c| matches!(c, '[' | ']' | '!'))
+}
+
+/// The schema's output types (built once; the same types the served schema registers).
+pub fn type_registry() -> &'static Registry {
+    static REG: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    REG.get_or_init(|| {
+        let mut r = Registry::default();
+        <crate::schema::Query as async_graphql::OutputType>::create_type_info(&mut r);
+        <crate::types::subscription::Subscription as async_graphql::SubscriptionType>::create_type_info(&mut r);
+        r
+    })
+}
+
 /// What a document needs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Cost {
@@ -72,8 +140,35 @@ struct Walk<'a> {
     defaults: std::collections::HashMap<Name, Option<Value>>,
     /// Introspection list fields on the current path (SR7-2: none may repeat).
     intro_lists: Vec<&'a str>,
+    /// Output types, to tell connections from lists (R7I-8).
+    reg: &'a Registry,
+    /// Product of the page multipliers above the current field (how often it runs).
+    outer: u64,
+    /// The page multiplier of the connection whose selection is being walked.
+    conn_mult: u64,
+    /// Deferred `totalCount`s the current operation runs (times their outer multipliers).
+    counts: u64,
     /// Introspection cost of the current operation.
     intro_cost: u64,
+    /// `crossChainTransfer` fields on the current path (M-5).
+    xchain: usize,
+}
+
+/// A `crossChainTransfer` inside another one (M-5): priced as the per-item store read it
+/// would be if not answered from the pair already loaded.
+pub const NESTED_XCHAIN_COST: u64 = 10;
+
+/// The directive cap of one field, fragment or spread (C-1: counted here, inside the
+/// bounded walk, instead of async-graphql's `limit_directives`, whose walk expands every
+/// fragment spread with no visit cap).
+fn directives(n: usize, what: &str) -> Result<(), ServerError> {
+    if n > MAX_DIRECTIVES {
+        return Err(limit(
+            "directives",
+            format!("more than {MAX_DIRECTIVES} directives on `{what}`"),
+        ));
+    }
+    Ok(())
 }
 
 /// An argument as the analysis sees it.
@@ -112,16 +207,19 @@ const INTRO_LISTS: &[(&str, u64)] = &[
 pub const MAX_INTROSPECTION_COST: u64 = 100_000;
 
 impl<'a> Walk<'a> {
+    /// The cost of a selection set on type `ty` (`None`: unknown), and the part of it its
+    /// direct `edges` fields cost; `wrap` says whose selection it is (a connection's, or a
+    /// connection's `edges`), so only those Relay wrappers are free (R7I-8).
     fn set(
         &mut self,
         set: &'a SelectionSet,
         depth: usize,
         intro: bool,
-    ) -> Result<(u64, Option<u64>), ServerError> {
-        // The set's cost and, when it is a connection's (a direct `edges`, `pageInfo` or
-        // `totalCount` field), the part of it its `edges` fields cost.
+        ty: Option<&'a str>,
+        wrap: Wrap,
+    ) -> Result<(u64, u64), ServerError> {
         let mut total: u64 = 0;
-        let mut edges: Option<u64> = None;
+        let mut edges: u64 = 0;
         for sel in &set.items {
             self.visits += 1;
             if self.visits > MAX_VISITS {
@@ -134,6 +232,7 @@ impl<'a> Walk<'a> {
                 Selection::Field(f) => {
                     let f = &f.node;
                     let name = f.name.node.as_str();
+                    directives(f.directives.len(), name)?;
                     if name == "__typename" {
                         continue;
                     }
@@ -173,26 +272,100 @@ impl<'a> Walk<'a> {
                         }
                         self.intro_lists.push(name);
                     }
+                    // The schema field (keyed on the field name, never the alias).
+                    let mf = if intro {
+                        None
+                    } else {
+                        ty.and_then(|t| self.reg.types.get(t))
+                            .and_then(|t| t.field_by_name(name))
+                    };
+                    let fty: Option<&'a str> = mf.map(|f| base_type(&f.ty));
+                    let conn = fty.is_some_and(|t| t.ends_with("Connection"));
+                    // Only a connection or a list returns a page: a scalar that shares a paged
+                    // field's name (`FungibleChainAccount.balance`) is not multiplied.
+                    let pages = mf.is_none_or(|f| conn || f.ty.starts_with('['));
                     let mult = if intro {
                         list.unwrap_or(1)
+                    } else if mf.is_none() {
+                        // A field the walker cannot resolve (unknown parent type): the
+                        // conservative page size, its subtree priced at the per-item floor.
+                        self.multiplier(f, ty).max(self.s.max_page as u64)
+                    } else if pages {
+                        self.multiplier(f, ty)
                     } else {
-                        self.multiplier(f)
+                        1
                     };
-                    let child = self.set(&f.selection_set.node, d, intro);
+                    let own: u64 = match name {
+                        _ if intro => 1,
+                        "edges" if wrap == Wrap::Conn => 0,
+                        "node" if wrap == Wrap::Edges => 0,
+                        "crossChainTransfer" if self.xchain > 0 => NESTED_XCHAIN_COST,
+                        "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
+                            self.s.default_page.min(self.s.max_page) as u64
+                        }
+                        // Cheap only under a known connection type listed as cheap; anywhere
+                        // else (unknown or unresolved parent, interface, fragment) it is a
+                        // count walk.
+                        "totalCount" if !(wrap == Wrap::Conn && ty.is_some_and(cheap_count)) => {
+                            // A count walk (GQ-10): a fixed cost, and few per operation.
+                            self.counts = self.counts.saturating_add(self.outer);
+                            if self.counts > MAX_COUNTS {
+                                return Err(limit(
+                                    "complexity",
+                                    format!(
+                                        "more than {MAX_COUNTS} list totalCounts in one operation"
+                                    ),
+                                ));
+                            }
+                            self.s.max_page as u64
+                        }
+                        _ => 1,
+                    };
+                    let inner = if conn {
+                        Wrap::Conn
+                    } else if name == "edges" && wrap == Wrap::Conn {
+                        Wrap::Edges
+                    } else {
+                        Wrap::None
+                    };
+                    // A connection's own fields run once; its `edges` once per item.
+                    let (saved, saved_cm) = (self.outer, self.conn_mult);
+                    if conn {
+                        self.conn_mult = mult.max(1);
+                    } else if inner == Wrap::Edges {
+                        self.outer = self.outer.saturating_mul(self.conn_mult);
+                    } else {
+                        self.outer = self.outer.saturating_mul(mult.max(1));
+                    }
+                    let xc = usize::from(name == "crossChainTransfer");
+                    self.xchain += xc;
+                    let child = self.set(&f.selection_set.node, d, intro, fty, inner);
+                    self.xchain -= xc;
+                    (self.outer, self.conn_mult) = (saved, saved_cm);
                     if list.is_some() {
                         self.intro_lists.pop();
                     }
-                    // A connection's page multiplies its `edges` only: `totalCount` and
-                    // `pageInfo` are answered once per connection (R7I-8).
+                    // A connection's page multiplies its `edges` only (`totalCount` and
+                    // `pageInfo` are answered once), each item at least 1 when the page is
+                    // read (`edges` or `pageInfo` selected); a list multiplies all of it, each
+                    // item at least 1 (R7I-8).
                     let (all, part) = child?;
-                    // The Relay wrappers `edges` and `node` cost nothing themselves (the
-                    // page's items are counted by what they select).
-                    let own = u64::from(intro || !matches!(name, "edges" | "node"));
-                    let c = if let (false, Some(part)) = (intro, part) {
-                        own.saturating_add(all - part)
-                            .saturating_add(mult.saturating_mul(part))
-                    } else {
+                    let c = if intro {
                         own.saturating_add(mult.saturating_mul(all))
+                    } else if conn {
+                        let reads = f.selection_set.node.items.iter().any(|x| match &x.node {
+                            Selection::Field(g) => {
+                                matches!(g.node.name.node.as_str(), "edges" | "pageInfo")
+                            }
+                            _ => true,
+                        });
+                        let per = if reads { part.max(1) } else { part };
+                        own.saturating_add(all - part)
+                            .saturating_add(mult.saturating_mul(per))
+                    } else if mult > 1 {
+                        own.saturating_add(mult.saturating_mul(all.max(1)))
+                    } else {
+                        own.saturating_add(all)
                     };
                     if intro && depth == 0 {
                         // `__schema`/`__type`: counted against the introspection cap.
@@ -205,23 +378,26 @@ impl<'a> Walk<'a> {
                         }
                     } else {
                         total = total.saturating_add(c);
-                        match name {
-                            "edges" => edges = Some(edges.unwrap_or(0).saturating_add(c)),
-                            "pageInfo" | "totalCount" => edges = Some(edges.unwrap_or(0)),
-                            _ => {}
+                        if name == "edges" && wrap == Wrap::Conn {
+                            edges = edges.saturating_add(c);
                         }
                     }
                 }
                 Selection::InlineFragment(i) => {
-                    let (t, e) = self.set(&i.node.selection_set.node, depth, intro)?;
+                    directives(i.node.directives.len(), "inline fragment")?;
+                    let on = i
+                        .node
+                        .type_condition
+                        .as_ref()
+                        .map(|c| c.node.on.node.as_str())
+                        .or(ty);
+                    let (t, e) = self.set(&i.node.selection_set.node, depth, intro, on, wrap)?;
                     total = total.saturating_add(t);
-                    edges = match (edges, e) {
-                        (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                        (a, b) => a.or(b),
-                    };
+                    edges = edges.saturating_add(e);
                 }
                 Selection::FragmentSpread(fs) => {
                     let name = fs.node.fragment_name.node.as_str();
+                    directives(fs.node.directives.len(), name)?;
                     // A cycle or an unknown fragment is left to validation, which refuses it.
                     if self.stack.contains(&name) {
                         continue;
@@ -229,14 +405,13 @@ impl<'a> Walk<'a> {
                     let Some(def) = self.frags.get(name) else {
                         continue;
                     };
+                    directives(def.node.directives.len(), name)?;
                     self.stack.push(name);
-                    let (t, e) = self.set(&def.node.selection_set.node, depth, intro)?;
+                    let on = Some(def.node.type_condition.node.on.node.as_str());
+                    let (t, e) = self.set(&def.node.selection_set.node, depth, intro, on, wrap)?;
                     self.stack.pop();
                     total = total.saturating_add(t);
-                    edges = match (edges, e) {
-                        (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                        (a, b) => a.or(b),
-                    };
+                    edges = edges.saturating_add(e);
                 }
             }
         }
@@ -275,26 +450,37 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn multiplier(&self, f: &'a Field) -> u64 {
+    fn multiplier(&self, f: &'a Field, parent: Option<&str>) -> u64 {
         let s = self.s;
+        // The wide lists clamp at `wide_page` (R-P5P9-20), everything else at `max_page`.
+        let name = f.name.node.as_str();
+        let cap = if WIDE.contains(&name) {
+            s.wide_page()
+        } else {
+            s.max_page
+        };
         let page = |n: Option<i64>| match n {
-            Some(n) => n.clamp(0, s.max_page as i64) as u64,
-            None => s.default_page.min(s.max_page) as u64,
+            Some(n) => n.clamp(0, cap as i64) as u64,
+            None => s.default_page.min(cap) as u64,
         };
         let (fa, la) = (self.arg(f, "first"), self.arg(f, "last"));
         if matches!(fa, Arg::Unbound) || matches!(la, Arg::Unbound) {
-            return s.max_page as u64;
+            return cap as u64;
         }
         let first = fa.val().and_then(Self::int);
         let last = la.val().and_then(Self::int);
-        let name = f.name.node.as_str();
         if first.is_some() || last.is_some() {
             return page(first.max(last));
         }
-        // ZelCore `quantity` (subscriptions `newBlocks`, `transactions`): the list size.
+        // ZelCore `quantity` (subscriptions `newBlocks`, `transactions`): the list size, clamped
+        // to `max_page` as the resolver clamps it. The `transactions` subscription's absent
+        // `quantity` is its SDL default (M3).
         match self.arg(f, "quantity") {
             Arg::Unbound => return s.max_page as u64,
             Arg::Val(v) => return page(Self::int(&v)),
+            Arg::Absent if parent == Some("Subscription") && name == "transactions" => {
+                return page(Some(SUB_TXS_QUANTITY));
+            }
             Arg::Absent => {}
         }
         let list_len = |arg: &str, absent: u64, unbound: u64| match self.arg(f, arg) {
@@ -307,10 +493,11 @@ impl<'a> Walk<'a> {
             "fungibleChainAccounts" | "newBlocks" | "newBlocksFromDepth" => {
                 list_len("chainIds", CHAINS, CHAINS)
             }
-            "chainAccounts"
-            | "fungibleAccountsByPublicKey"
-            | "fungibleChainAccountsByPublicKey"
-            | "countersOfEachChain" => CHAINS,
+            "chainAccounts" | "countersOfEachChain" => CHAINS,
+            // Every account a key guards, up to the resolver's cap (I-3).
+            "fungibleAccountsByPublicKey" | "fungibleChainAccountsByPublicKey" => {
+                crate::types::account::MAX_KEY_ACCOUNTS as u64
+            }
             "nonFungibleTokenBalances" => s.max_page as u64,
             _ if PAGED.contains(&name) => page(None),
             _ => 1,
@@ -335,6 +522,11 @@ pub fn analyze(
         defaults: Default::default(),
         intro_lists: Vec::new(),
         intro_cost: 0,
+        reg: type_registry(),
+        outer: 1,
+        conn_mult: 1,
+        counts: 0,
+        xchain: 0,
     };
     let ops: Vec<_> = match &doc.operations {
         DocumentOperations::Single(op) => vec![op],
@@ -353,7 +545,20 @@ pub fn analyze(
             })
             .collect();
         w.intro_cost = 0;
-        let (c, _) = w.set(&op.node.selection_set.node, 0, false)?;
+        let root = match op.node.ty {
+            OperationType::Query => "Query",
+            OperationType::Mutation => "Mutation",
+            OperationType::Subscription => "Subscription",
+        };
+        w.outer = 1;
+        w.counts = 0;
+        let (c, _) = w.set(
+            &op.node.selection_set.node,
+            0,
+            false,
+            Some(root),
+            Wrap::None,
+        )?;
         w.cost.complexity = w.cost.complexity.max(c);
         if c > s.max_complexity {
             return Err(limit(
@@ -396,18 +601,23 @@ struct LimitsExt;
 
 #[async_graphql::async_trait::async_trait]
 impl Extension for LimitsExt {
-    async fn parse_query(
+    /// C-1: the sizes are checked, then the document is parsed here and analyzed (a walk
+    /// capped at [`MAX_VISITS`]) before anything else sees it. async-graphql's own parse step
+    /// (`check_recursive_depth`, and `limit_directives` when set) expands every fragment spread
+    /// with no memo and no visit cap, synchronously on a runtime worker; a fragment bomb of
+    /// 1.4 KB cost minutes of CPU there. The parsed document is kept on the request, so
+    /// that step reuses it and only ever walks a document this analysis has bounded.
+    async fn prepare_request(
         &self,
         ctx: &ExtensionContext<'_>,
-        query: &str,
-        variables: &Variables,
-        next: NextParseQuery<'_>,
-    ) -> ServerResult<ExecutableDocument> {
+        mut request: Request,
+        next: NextPrepareRequest<'_>,
+    ) -> ServerResult<Request> {
         let s = &ctx.data_unchecked::<Gql>().settings;
-        check_sizes(query, variables, s)?;
-        let doc = next.run(ctx, query, variables).await?;
-        analyze(&doc, variables, s)?;
-        Ok(doc)
+        check_sizes(&request.query, &request.variables, s)?;
+        let vars = request.variables.clone();
+        analyze(request.parsed_query()?, &vars, s)?;
+        next.run(ctx, request).await
     }
 }
 
@@ -454,16 +664,255 @@ mod tests {
         })
     }
 
+    /// M3: the `transactions` subscription's absent `quantity` is priced at its SDL default
+    /// (20, not `default_page`), and `quantity` at most `max_page`, as the resolver serves.
+    #[test]
+    fn subscription_quantity_is_priced_as_served() {
+        let s = GraphqlSettings {
+            default_page: 5,
+            max_page: 50,
+            ..GraphqlSettings::default()
+        };
+        let c = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            analyze(&doc, &Variables::default(), &s).map(|c| c.complexity)
+        };
+        assert_eq!(c("subscription { transactions { hash } }").ok(), Some(21));
+        assert_eq!(
+            c("subscription { newBlocks(quantity: 100) { hash } }").ok(),
+            Some(51)
+        );
+    }
+
+    /// M-5: a `crossChainTransfer` inside another one is priced at the per-item read cost;
+    /// the first level keeps its price.
+    #[test]
+    fn nested_cross_chain_transfer_is_priced_per_read() {
+        let s = GraphqlSettings::default();
+        let c = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            analyze(&doc, &Variables::default(), &s).map(|c| c.complexity)
+        };
+        let page = |inner: &str| {
+            format!("{{ transfers(accountName: \"a\", first: 10) {{ edges {{ node {{ {inner} }} }} }} }}")
+        };
+        let one = c(&page("crossChainTransfer { amount }")).unwrap();
+        let two = c(&page(
+            "crossChainTransfer { crossChainTransfer { amount } }",
+        ))
+        .unwrap();
+        let three = c(&page(
+            "crossChainTransfer { crossChainTransfer { crossChainTransfer { amount } } }",
+        ))
+        .unwrap();
+        assert_eq!(one, 1 + 10 * 2, "{one}");
+        assert_eq!(two - one, 10 * NESTED_XCHAIN_COST, "{two}");
+        assert_eq!(three - two, 10 * NESTED_XCHAIN_COST, "{three}");
+        // Siblings are not nested.
+        let side = c(&page(
+            "crossChainTransfer { amount } a: crossChainTransfer { amount }",
+        ))
+        .unwrap();
+        assert_eq!(side, 1 + 10 * 4, "{side}");
+    }
+
+    /// M8: every cheap count names a connection that has a `totalCount` field.
+    #[test]
+    fn cheap_counts_are_real_count_fields() {
+        let reg = type_registry();
+        for t in CHEAP_COUNTS {
+            let f = reg
+                .types
+                .get(*t)
+                .and_then(|x| x.field_by_name("totalCount"));
+            assert!(f.is_some(), "{t} has no totalCount");
+        }
+    }
+
+    /// M2: a block's `events` count decodes the whole block: priced at a default page per
+    /// block, so a wide block list of them is refused and a default page passes.
+    #[test]
+    fn block_event_counts_are_priced_per_block() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        assert_eq!(
+            c("{ blocksFromHeight(startHeight: 0, first: 200) { edges { node { events { totalCount } } } } }"),
+            Err("\"complexity\"".into())
+        );
+        assert_eq!(
+            c("{ blocksFromHeight(startHeight: 0) { edges { node { events { totalCount } } } } }"),
+            Ok(1 + 20 * 21)
+        );
+        // A block's tx count needs no decoding: still cheap under a list.
+        assert!(c("{ blocksFromHeight(startHeight: 0, first: 200) { edges { node { transactions { totalCount } } } } }").unwrap() < 1000);
+    }
+
+    /// I-3: the by-public-key lists are priced at the accounts they can return (100).
+    #[test]
+    fn by_public_key_lists_are_priced_at_their_cap() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        for root in [
+            "fungibleAccountsByPublicKey(publicKey: \"k\")",
+            "fungibleChainAccountsByPublicKey(publicKey: \"k\", chainId: \"0\")",
+        ] {
+            assert_eq!(c(&format!("{{ {root} {{ accountName }} }}")), Ok(101));
+            assert_eq!(
+                c(&format!(
+                    "{{ {root} {{ transactions(first: 98) {{ edges {{ node {{ hash }} }} }} }} }}"
+                )),
+                Err("\"complexity\"".into())
+            );
+        }
+    }
+
+    #[test]
+    fn wrappers_are_free_only_inside_a_connection() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        // `edges { node }` under a connection: free.
+        assert_eq!(
+            c("{ transactions(first: 100) { edges { node { hash } } } }"),
+            Ok(101)
+        );
+        // A root `node(id)` is a field like any other, aliased or not.
+        let roots: String = (0..100)
+            .map(|i| format!("n{i}: node(id: \"x\") {{ id }} "))
+            .collect();
+        assert!(c(&format!("{{ {roots} }}")).unwrap() >= 200);
+        let roots: String = (0..1100)
+            .map(|i| format!("n{i}: node(id: \"x\") {{ id }} "))
+            .collect();
+        assert_eq!(c(&format!("{{ {roots} }}")), Err("\"complexity\"".into()));
+        // An alias named like a wrapper is not one.
+        assert_eq!(c("{ edges: lastBlockHeight }"), Ok(1));
+    }
+
+    #[test]
+    fn every_page_item_costs_at_least_one() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        assert_eq!(
+            c("{ transactions(blockHash: \"x\", first: 100) { edges { node { __typename } } } }"),
+            Ok(101)
+        );
+        // A scalar named like a paged field is not a page.
+        assert_eq!(
+            c("{ fungibleAccount(accountName: \"a\") { chainAccounts { balance } } }"),
+            Ok(22)
+        );
+        let many: String = (0..20)
+            .map(|i| format!("t{i}: transactions(blockHash: \"x\", first: 100) {{ edges {{ node {{ __typename }} }} }} "))
+            .collect();
+        assert_eq!(c(&format!("{{ {many} }}")), Err("\"complexity\"".into()));
+    }
+
+    #[test]
+    fn list_counts_are_costed_and_few() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        let ten: String = (0..10)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
+            .collect();
+        assert_eq!(c(&format!("{{ {ten} }}")), Err("\"complexity\"".into()));
+        let two: String = (0..2)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
+            .collect();
+        assert_eq!(c(&format!("{{ {two} }}")), Ok(2 * 101));
+        // A count walk under a per-chain list runs once per chain: refused.
+        assert_eq!(
+            c("{ fungibleChainAccounts(accountName: \"a\") { transactions { totalCount } } }"),
+            Err("\"complexity\"".into())
+        );
+        // A block's count is not a walk: kadscan's block list passes.
+        assert!(c("{ blocksFromDepth(minimumDepth: 0, first: 25) { totalCount edges { node { transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }").unwrap() < 2000);
+    }
+
+    #[test]
+    fn sr7_3_unresolved_total_counts_fail_closed() {
+        let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
+        let over = Err("\"complexity\"".to_string());
+        // Happy path: two deferred counts pass, a block's own counts are not walks (its
+        // events count is priced at a default page, M2).
+        assert_eq!(
+            c("{ a: transactions(accountName: \"a\") { totalCount } b: events(qualifiedEventName: \"x\") { totalCount } }"),
+            Ok(2 * 101)
+        );
+        assert!(
+            c("{ block(hash: \"h\") { transactions { totalCount } events { totalCount } } }")
+                .unwrap()
+                < 40
+        );
+        // Three deferred counts through an inline fragment on an interface (`Node`).
+        let q: String = (0..3)
+            .map(|i| {
+                format!(
+                    "t{i}: transactions(accountName: \"a\") {{ ... on Node {{ totalCount }} }} "
+                )
+            })
+            .collect();
+        assert_eq!(c(&format!("{{ {q} }}")), over);
+        // Through a named fragment spread whose type condition is not a connection.
+        let q: String = (0..3)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ ...F }} "))
+            .collect();
+        assert_eq!(
+            c(&format!("{{ {q} }} fragment F on Node {{ totalCount }}")),
+            over
+        );
+        // Through an inline fragment on an unknown type, and an unresolved connection field.
+        let q: String = (0..3)
+            .map(|i| {
+                format!(
+                    "t{i}: transactions(accountName: \"a\") {{ ... on Mystery {{ totalCount }} }} "
+                )
+            })
+            .collect();
+        assert_eq!(c(&format!("{{ {q} }}")), over);
+        assert_eq!(c("{ ... on Mystery { list { totalCount } } }"), over);
+        assert_eq!(
+            c("{ ... on Mutation { list(first: 1) { totalCount } } }"),
+            over
+        );
+        // An unresolved field is never free: its subtree is priced per item.
+        assert!(c("{ ... on Mystery { a b c } }").unwrap() >= 300);
+        assert_eq!(c("{ ... on Mystery { a { b c } } }"), over);
+    }
+
+    #[test]
+    fn wide_lists_cost_up_to_200_and_the_rest_100() {
+        let c = |q: &str| cost(q, serde_json::json!({})).unwrap().complexity;
+        // Block lists and balances: 200 items (+1 for the field itself).
+        assert_eq!(
+            c("{ blocksFromDepth(minimumDepth: 0, first: 500) { edges { node { hash } } } }"),
+            201
+        );
+        assert_eq!(
+            c("{ blocksFromHeight(startHeight: 0, first: 120) { edges { node { hash } } } }"),
+            121
+        );
+        assert_eq!(
+            c("{ balance(accountName: \"a\", first: 200) { edges { node { balance } } } }"),
+            201
+        );
+        // Everything else stays at 100.
+        assert_eq!(
+            c("{ transactions(first: 200) { edges { node { hash } } } }"),
+            101
+        );
+        assert_eq!(c("{ blocksFromDepth(minimumDepth: 0, first: 5) { edges { node { transactions(first: 200) { edges { node { hash } } } } } } }"), 1 + 5 * 101);
+    }
+
     #[test]
     fn connections_multiply_their_edges_only() {
         let c = |q: &str| cost(q, serde_json::json!({})).unwrap().complexity;
-        // 1 (transactions) + 1 (totalCount) + 1 + 1 (pageInfo) + 100 x 1 (hash).
+        // 1 (transactions) + 100 (a list's totalCount walk) + 2 (pageInfo) + 100 x 1 (hash).
         assert_eq!(
             c("{ transactions(first: 100) { totalCount pageInfo { hasNextPage } edges { node { hash } } } }"),
-            104
+            203
         );
-        // A connection that selects only its count is not multiplied.
-        assert_eq!(c("{ transactions { totalCount } }"), 2);
+        // A connection that selects only its count reads no page; a block's count is
+        // known with its rows (cost 1), a list's count walk costs max_page.
+        assert_eq!(
+            c("{ block(hash: \"x\") { transactions { totalCount } } }"),
+            3
+        );
+        assert_eq!(c("{ transactions { totalCount } }"), 101);
         // A list (no connection fields) is multiplied whole: `quantity` sizes it.
         assert_eq!(
             c("subscription { transactions(quantity: 50) { hash } }"),
@@ -503,20 +952,20 @@ mod tests {
             cost(&q(19), serde_json::json!({})).unwrap().complexity,
             1901
         );
-        // A variable page size counts like a literal; 1000 is clamped to 100.
+        // A variable page size counts like a literal; 1000 is clamped to 200 on a block list.
         let qv = format!(
             "query($n: Int) {{ blocksFromHeight(startHeight: 0, first: $n) {{ edges {{ node {{ {} }} }} }} }}",
-            block_fields(19)
+            block_fields(9)
         );
         assert_eq!(
             cost(&qv, serde_json::json!({"n": 1000}))
                 .unwrap()
                 .complexity,
-            1901
+            1801
         );
         assert_eq!(
             cost(&qv, serde_json::json!({"n": 1})).unwrap().complexity,
-            20
+            10
         );
         // Omitted: the default page (20).
         let qd = "{ transactions(blockHash: \"x\") { edges { node { hash } } } }";

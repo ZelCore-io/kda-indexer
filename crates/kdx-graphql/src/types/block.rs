@@ -49,14 +49,14 @@ pub struct BlockNeighbor {
 #[Object]
 impl Block {
     async fn chain_id(&self) -> BigInt {
-        BigInt(i128::from(self.b.chain))
+        BigInt::new(i128::from(self.b.chain))
     }
     async fn creation_time(&self) -> DateTime {
         DateTime(self.b.creation_time as i64)
     }
     /// (2^256 − 1) / target (chainweb-node's definition).
     async fn difficulty(&self) -> BigInt {
-        BigInt(header::difficulty(&self.b.target).min(i128::MAX as u128) as i128)
+        BigInt::number(header::difficulty(&self.b.target).min(i128::MAX as u128) as i128)
     }
     async fn epoch(&self) -> DateTime {
         DateTime(self.b.epoch_start as i64)
@@ -103,7 +103,7 @@ impl Block {
         self.hash_text()
     }
     async fn height(&self) -> BigInt {
-        BigInt(i128::from(self.b.height))
+        BigInt::new(i128::from(self.b.height))
     }
     pub async fn id(&self) -> Result<ID> {
         Ok(ID(encode(&NodeKey::Block {
@@ -114,17 +114,7 @@ impl Block {
     /// The store keeps the canonical chain only (a reorg replaces blocks), so a block read in
     /// the same request is canonical; one held across a reorg (a subscription) may not be.
     async fn canonical(&self, ctx: &Context<'_>) -> Result<bool> {
-        let b = self.b.clone();
-        gql(ctx)
-            .state()?
-            .read(move |view| {
-                let Ok(h) = u32::try_from(b.height) else {
-                    return Ok(false);
-                };
-                Ok(view.block(b.chain, h)?.is_some_and(|x| x.hash == b.hash))
-            })
-            .await
-            .map_err(from_api)
+        is_stored(ctx, &self.b).await
     }
     /// ZelCore extension: the block's coinbase output as compact JSON text (`gas`, `logs`,
     /// `txId`, `events`, `reqKey`, `result`, `metaData`, `continuation`).
@@ -181,7 +171,7 @@ impl Block {
             .collect()
     }
     async fn nonce(&self) -> Decimal {
-        decimal(self.b.nonce)
+        decimal(self.b.nonce).into_text()
     }
     async fn parent(&self, ctx: &Context<'_>) -> Result<Option<Block>> {
         let (p, c) = (self.b.parent, self.b.chain);
@@ -272,6 +262,22 @@ pub fn chain_set(ids: Option<&[String]>) -> Result<Vec<u8>> {
     Ok(v)
 }
 
+/// Whether `b` is the stored block at its chain and height (the store keeps the canonical
+/// chain only).
+pub(crate) async fn is_stored(ctx: &Context<'_>, b: &BlockRecord) -> Result<bool> {
+    let (chain, height, hash) = (b.chain, b.height, b.hash);
+    gql(ctx)
+        .state()?
+        .read(move |view| {
+            let Ok(h) = u32::try_from(height) else {
+                return Ok(false);
+            };
+            Ok(view.block_hash(chain, h)? == Some(hash))
+        })
+        .await
+        .map_err(from_api)
+}
+
 /// Which blocks a list holds: per chain, heights `lo..=hi`; listed by height descending, then
 /// chain ascending.
 #[derive(Debug, Clone)]
@@ -296,6 +302,16 @@ pub fn walk_blocks(
 ) -> ApiResult<Vec<Arc<BlockRecord>>> {
     let want = page.n + 1;
     let mut out = Vec::new();
+    // Nothing is stored below the store floor: start there, as `totalCount` does (M7).
+    let floor = u64::from(kdx_api::compat::store_floor(view));
+    let set = &BlockSet {
+        chains: set
+            .chains
+            .iter()
+            .filter(|c| c.2 >= floor)
+            .map(|&(c, lo, hi)| (c, lo.max(floor), hi))
+            .collect(),
+    };
     let Some((lo, hi)) = set.bounds() else {
         return Ok(out);
     };
@@ -412,6 +428,8 @@ pub async fn block_page(
         return Err(bad_input("invalid cursor"));
     }
     let p = page.clone();
+    // The blocks are read only when the edges or page info are selected.
+    let reads = crate::txlist::selects_direct(ctx, &["edges", "pageInfo"]);
     let (rows, total) = g
         .state()?
         .read(move |view| {
@@ -426,7 +444,12 @@ pub async fn block_page(
                 .iter()
                 .map(|&(_, lo, hi)| (hi + 1).saturating_sub(lo.max(floor)))
                 .sum();
-            Ok((walk_blocks(view, &set, &p)?, total))
+            let rows = if reads {
+                walk_blocks(view, &set, &p)?
+            } else {
+                Vec::new()
+            };
+            Ok((rows, total))
         })
         .await
         .map_err(from_api)?;
@@ -499,7 +522,7 @@ pub async fn last_block_height(ctx: &Context<'_>) -> Result<Option<BigInt>> {
         .read_status(|view| view.max_indexed_height())
         .await
         .map_err(from_api)?;
-    Ok(h.map(|h| BigInt(i128::from(h))))
+    Ok(h.map(|h| BigInt::new(i128::from(h))))
 }
 
 /// A non-negative `Int` argument.
@@ -568,5 +591,40 @@ mod tests {
         let ids = vec!["3".to_string(), "1".into(), "3".into()];
         assert_eq!(chain_set(Some(&ids)).unwrap(), vec![1, 3]);
         assert!(chain_set(Some(&["x".to_string()])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::testutil;
+
+    /// M7: a walk from genesis on a partial store starts at the store floor instead of
+    /// probing every empty height below it until the deadline.
+    #[tokio::test]
+    async fn block_walks_start_at_the_store_floor() {
+        let f = testutil::store();
+        let top: u64 = 40_000_000;
+        f.set_floor(top as u32);
+        f.apply(0, top, 0);
+        f.apply(0, top + 1, 0);
+        let set = BlockSet {
+            chains: vec![(0, 0, top + 1)],
+        };
+        let page = Page {
+            dir: Dir::Backward,
+            n: 5,
+            cursor: None,
+        };
+        let t = Instant::now();
+        let got =
+            f.st.read(move |view| walk_blocks(view, &set, &page))
+                .await
+                .expect("the walk ends before the deadline");
+        let hs: Vec<u64> = got.iter().map(|b| b.height).collect();
+        assert_eq!(hs, [top, top + 1]);
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 }

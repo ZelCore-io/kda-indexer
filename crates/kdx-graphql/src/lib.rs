@@ -25,6 +25,8 @@ pub mod limits;
 pub mod loaders;
 pub mod scalars;
 pub mod schema;
+#[cfg(test)]
+mod testutil;
 pub mod txlist;
 pub mod types;
 pub mod ws;
@@ -54,12 +56,23 @@ pub struct GraphqlSettings {
     /// HTTP request body cap (POST).
     pub max_body_bytes: usize,
     pub ws_subs_per_conn: usize,
+    /// Subscriptions per client (an IPv4 address or an IPv6 /64, as the rate limiter keys
+    /// it), over all its connections (M-2).
+    pub ws_subs_per_ip: usize,
+    /// Subscriptions per IPv6 /48 (M-2).
+    pub ws_subs_per_48: usize,
     pub ws_subs_max: usize,
     pub ws_conns_per_ip: usize,
+    /// Connections per IPv6 /48 (M-2).
+    pub ws_conns_per_48: usize,
+    /// Connections per process (M-2: sized apart from `ws_subs_max`).
+    pub ws_conns_max: usize,
     pub ws_init: Duration,
     pub ws_idle: Duration,
     pub ws_tx_wait: Duration,
     pub feed_poll: Duration,
+    /// Byte budget of the decoded blocks the feed's broadcast ring holds (M-3).
+    pub feed_ring_bytes: usize,
     /// `networkInfo.networkId`.
     pub network_id: String,
     /// `networkInfo.networkHost` (never the node URL).
@@ -70,6 +83,15 @@ pub struct GraphqlSettings {
 
 /// Request body cap (plan GQ-9: body ≤ 128 KB).
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
+
+impl GraphqlSettings {
+    /// The clamp of the few lists that need more than `max_page`: the block lists (the home
+    /// list asks 120) and account balances (the assets tab asks 200); twice `max_page`,
+    /// 200 by default (R-P5P9-20). The per-item cost floor still bounds them.
+    pub fn wide_page(&self) -> usize {
+        self.max_page.saturating_mul(2)
+    }
+}
 
 impl Default for GraphqlSettings {
     fn default() -> Self {
@@ -85,12 +107,17 @@ impl Default for GraphqlSettings {
             max_variables_bytes: 64 * 1024,
             max_body_bytes: MAX_BODY_BYTES,
             ws_subs_per_conn: 20,
+            ws_subs_per_ip: 40,
+            ws_subs_per_48: 120,
             ws_subs_max: 2000,
             ws_conns_per_ip: 10,
+            ws_conns_per_48: 30,
+            ws_conns_max: 1000,
             ws_init: Duration::from_secs(10),
             ws_idle: Duration::from_secs(600),
             ws_tx_wait: Duration::from_secs(3600),
             feed_poll: Duration::from_millis(1000),
+            feed_ring_bytes: crate::feed::RING_BYTES,
             network_id: "mainnet01".into(),
             network_host: String::new(),
             apq: false,
@@ -124,12 +151,20 @@ pub fn gql<'a>(ctx: &Context<'a>) -> &'a Gql {
     ctx.data_unchecked::<Gql>()
 }
 
-/// Per-request data: the deadline every batch of one HTTP request shares, and the client IP
-/// (the search gate counts per client).
+/// Per-request data: the deadline every batch of one HTTP request shares.
 #[derive(Debug, Clone, Copy)]
 pub struct ReqCtx {
     pub deadline: Instant,
-    pub ip: Option<std::net::IpAddr>,
+}
+
+/// The client address of an HTTP request or a websocket connection (`trusted_proxies`
+/// applied). Per-client gates (the search gate, S-5) refuse an operation without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIp(pub std::net::IpAddr);
+
+/// The client address of the operation being resolved, when known.
+pub fn client_ip(ctx: &Context<'_>) -> Option<std::net::IpAddr> {
+    ctx.data_opt::<ClientIp>().map(|c| c.0)
 }
 
 /// The request deadline (a request without one, such as a subscription event, gets the
@@ -191,9 +226,10 @@ fn build(
     })
     .extension(limits::Limits)
     .extension(flags::Flags)
-    // Parser recursion and directive caps (the AST walk in `limits` is bounded separately).
-    .limit_recursive_depth(limits::PARSER_RECURSION)
-    .limit_directives(limits::MAX_DIRECTIVES);
+    .extension(ws::WsOps)
+    // Parser recursion cap. No `limit_directives` (C-1): its walk expands fragments with no
+    // visit cap; `limits` counts directives inside its own bounded walk, which runs first.
+    .limit_recursive_depth(limits::PARSER_RECURSION);
     if !introspection {
         b = b.disable_introspection();
     }

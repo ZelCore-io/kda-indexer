@@ -369,6 +369,13 @@ with `[balances] enabled = false`.
   through `/local`, re-checked every `[balances] recheck_hours`, default 24). Any other module's
   balances are stored and served, but its guard indexes no key, and its keyset references are
   not resolved.
+- **By-key listing** (SEC-2): `GET /keys/{pk}/accounts` lists only the modules in
+  `[balances] key_modules` (default `["coin"]`; each entry must be `name` or
+  `namespace.name`). A confirmed `fungible-v2` module still only proves the interface: its
+  `details` can report any balance under any key. Another module's rows are listed only when
+  a client asks with `?token=<module>`, and only on chains where that module is a confirmed
+  `fungible-v2`. Each row carries `trusted` (the module is in `key_modules`). Adding a module
+  to `key_modules` takes a restart of `serve`/`run`; the stored rows do not change.
 - **Not fungible**: a module whose `details` calls all fail in 3 batches in a row is marked
   not fungible: the tail stops marking it, its dirty rows are dropped without a call
   (`result="not_fungible"`) and `/tokens` hides it until the re-check `recheck_hours` later.
@@ -431,6 +438,71 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 - Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
+
+## Measured mainnet backfill
+
+One full format-v2 backfill of mainnet01 (20 chains, heights 0 to 7,390,000: 139,279,460
+blocks and 369,200,367 transactions), from an empty store. Setup: one range in flight, the
+`examples/backfill.conf` drop-in (idle IO, nice 10), `etl_mem_mb = 512`, `mem_cap_mb = 8192`,
+`MemoryHigh=10G`, on a 24 GiB host that also ran the chainweb-node it read from (local service
+API, 8 cores) and a local data volume. Use these numbers to size a host, not as a promise.
+
+| Measure | Value |
+|---|---|
+| Wall time | 31,419 s (8 h 44 min) |
+| Overall rate | about 4,430 blocks/s, 11,750 txs/s |
+| Peak process memory (VmHWM) | 9.8 GiB (10,037 MiB; peak sampled RssAnon 9.45 GiB) |
+| Peak cgroup memory (page cache included) | 10.0 GiB |
+| Spool (`etl/`) peak | 19.7 GB |
+| Volume used at the peak | 129.0 GB (`etl/` included) |
+| Store when done | 125.6 GB of segments, 0.5 GB hot store, empty `etl/` |
+| Node container CPU, sampled every 5 min | up to 361% (more than 300% in 11 of 105 samples) |
+| Time to tail lag 0 after the post-backfill restart | under 10 s |
+
+Rate by density band (blocks/s and txs/s are the band's blocks and txs over the summed wall time
+of its ranges; the dense eras are CPU-bound in decode and index, the sparse ones wait on the node):
+
+| Heights | Blocks | Txs | Blocks/s | Txs/s |
+|---|---|---|---|---|
+| 0 to 0.85M (10 chains) | 8.0M | 8.1M | 5,770 | 5,870 |
+| 0.85M to 2.0M | 22.0M | 22.7M | 6,210 | 6,420 |
+| 2.0M to 3.4M | 28.0M | 37.9M | 5,360 | 7,260 |
+| 3.4M to 3.7M | 6.0M | 11.2M | 4,700 | 8,760 |
+| 3.7M to 5.3M (dense) | 32.0M | 166.1M | 3,000 | 15,570 |
+| 5.3M to 7.39M | 41.8M | 121.6M | 4,610 | 13,410 |
+
+Stage time, summed over the 82 ranges (the stages overlap, so the sum is more than the wall
+time): fetch 26,429 s, decode and index 13,545 s, finish 8,344 s, commit 70 s.
+
+Size per component of the finished store:
+
+| Component | Files | Bytes |
+|---|---|---|
+| `txs.seg` | 82 | 95.96 GB |
+| `blocks.seg` | 82 | 21.66 GB |
+| `rk.idx` | 82 | 1.93 GB |
+| `code.pst` | 82 | 2.55 GB |
+| `bh.idx` | 82 | 1.17 GB |
+| `xfer.pst` | 82 | 0.81 GB |
+| `acct.pst` | 82 | 0.75 GB |
+| `pk.pst` | 82 | 0.40 GB |
+| `evt.pst` | 82 | 0.18 GB |
+| `keys.ef`, `pact.pst`, `txs.off`, `blocks.conf`, `blocks.off`, `txs.conf`, `range.toml` | 82 each | 0.19 GB together |
+
+The largest single `txs.seg` is 4.79 GB (a 100k-height range in the densest era); two ranges
+are above 4 GB. Memory for a backfill peaks in the dense eras: `ranges_in_flight = 1` and a
+`MemoryHigh` of at least peak plus 2 GB (`MemoryMax` plus 4 GB) is the setting this host needed.
+Every block of the backfill was Merkle-verified as it was written (139,423,890 verified, none
+unverified), and a later `verify merkle --all` over the whole store, one process per 250k-height
+era and four at a time next to the running service, rechecked 139,427,260 blocks (139,279,460
+frozen, 147,800 hot) in 84 minutes: every one `ok`, none `ok_unflagged`, `bad_flagged`,
+`bad_legacy`, `bad_other` or errored, in every era. Peak process memory of one run was about
+2 GB.
+
+Size and memory notes: the two 100k ranges whose `txs.seg` is above 4 GB are heights 4.4M to 4.5M
+(4.79 GB) and 4.5M to 4.6M (4.30 GB); they verify and read normally, and the range size stays
+100k. ≥ 32 GiB RAM recommended for a full backfill beside a node (this 24 GiB host swapped in the
+dense eras).
 
 ## Before any big write
 

@@ -76,7 +76,8 @@ fn pending_json(module: &str, c: u8, r: Option<&BalanceRow>) -> Value {
 /// `(module, chain)` of an `/accounts/{a}/balances` cursor: 10 hex digits.
 fn parse_bal_cursor(c: &str) -> ApiResult<(u32, u8)> {
     let bad = || ApiError::BadRequest("invalid cursor".into());
-    if c.len() != 10 {
+    // ASCII hex only, so the byte slices below always fall on char boundaries.
+    if c.len() != 10 || !c.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(bad());
     }
     let m = u32::from_str_radix(&c[..8], 16).map_err(|_| bad())?;
@@ -200,14 +201,19 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
         ("pubkey" = String, Path, description = "Public key"),
         ("limit" = Option<u32>, Query, description = "1..=100, default 20"),
         ("cursor" = Option<String>, Query, description = "Opaque page cursor"),
+        ("token" = Option<String>, Query, description = "Only this module's rows, if it is a confirmed fungible-v2 on the row's chain. Without it, only the `[balances] key_modules` (default `coin`)"),
     ),
-    responses((status = 200, description = "`items` of {account, modules: [{module, chain, balance, as_of_height, stale}]}, `next_cursor`, `as_of`"))
+    responses((status = 200, description = "`items` of {account, modules: [{module, chain, balance, as_of_height, stale, trusted}]}, `next_cursor`, `as_of`. `trusted`: the module is one of `key_modules`. A row proves only that the account's guard holds the key, not ownership: anyone can create an account guarded by someone else's key"))
 )]
 pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
     let (pk, q) = match (parse_path(path), parse_query(q)) {
         (Ok(p), Ok(q)) => (p, q),
         (Err(e), _) | (_, Err(e)) => return e.into_response(),
     };
+    // M-1 (SEC-2): a module that merely implements fungible-v2 can list any balance under
+    // any key, so by default only the governance-trusted `key_modules` are listed; another
+    // module only when asked for by `token`, and marked `trusted: false`.
+    let key_modules = st.0.key_modules();
     run(st.0, move |view| {
         if pk.is_empty() || pk.len() > MAX_KEY_LEN {
             return Err(ApiError::BadRequest(format!(
@@ -245,6 +251,32 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
             })?;
         let d = view.dict();
         let coin = balances::coin_module(&view.txn)?;
+        let module_id = |name: &str| -> ApiResult<Option<u32>> {
+            Ok(view
+                .txn
+                .get(
+                    Table::DictFwd(DictKind::Module),
+                    &kdx_hot::dict::fwd_key(name.as_bytes()),
+                )?
+                .and_then(|v| v.get(..4).and_then(|b| b.try_into().ok()))
+                .map(u32::from_be_bytes))
+        };
+        // The modules listed, and whether each is one of `key_modules`.
+        let wanted: Vec<(u32, bool)> = match q.token.as_deref() {
+            Some(t) => module_id(t)?
+                .map(|m| (m, key_modules.iter().any(|k| k == t)))
+                .into_iter()
+                .collect(),
+            None => {
+                let mut v = Vec::new();
+                for k in &key_modules {
+                    if let Some(m) = module_id(k)? {
+                        v.push((m, true));
+                    }
+                }
+                v
+            }
+        };
         let mut items = Vec::new();
         let mut last = None;
         for (k, _) in rows.iter().take(limit as usize) {
@@ -257,6 +289,9 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
             last = Some(a);
             let mut modules = Vec::new();
             for (m, c, r) in balances::account_rows(&view.txn, a)? {
+                let Some(&(_, key_module)) = wanted.iter().find(|w| w.0 == m) else {
+                    continue;
+                };
                 if r.absent
                     || !balances::trusted(&view.txn, m, c, coin)?
                     || !balances::stored_guard_keys(&view.txn, &r.guard, c)?.contains(&pk)
@@ -269,7 +304,12 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
                     "balance": r.balance,
                     "as_of_height": r.as_of,
                     "stale": r.unverified || balances::is_dirty(&view.txn, a, m, c)?,
+                    "trusted": key_module,
                 }));
+            }
+            // The cursor still walks `KeyAccounts`; an account with no listed row is left out.
+            if modules.is_empty() {
+                continue;
             }
             items.push(json!({
                 "account": d.name(DictKind::Account, a).unwrap_or_default(),
@@ -283,4 +323,155 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
         list_response(view, items, next)
     })
     .await
+}
+
+#[cfg(test)]
+mod cursor_parse_tests {
+    use super::parse_bal_cursor;
+
+    #[test]
+    fn rejects_non_hex_and_multibyte_without_panicking() {
+        assert_eq!(parse_bal_cursor("0000000a13").ok(), Some((10, 0x13)));
+        // 10 bytes long, but byte 8 is inside a multi-byte char.
+        for bad in [
+            "0000000\u{e9}0",
+            "00000000\u{e9}",
+            "zzzzzzzzzz",
+            "",
+            "0000000000ff",
+        ] {
+            assert!(parse_bal_cursor(bad).is_err(), "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_accounts_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::extract::{Path, Query, State};
+    use kdx_hot::balances::{bal_key, guard_hash, key_account_key, key_hash, BalanceRow, TokenRow};
+    use kdx_hot::{HotDict, Table};
+    use kdx_types::{DictKind, DictMut};
+    use serde_json::Value;
+
+    use crate::{Api, ApiSettings, Store, TipWatch};
+
+    /// `coin` and a confirmed fungible-v2 `free.evil` both hold an account guarded by `k1`.
+    fn fixture() -> (tempfile::TempDir, Arc<crate::ApiState>) {
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+        let mut w = hot.rw().unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        let coin = dict.intern(DictKind::Module, "coin");
+        let evil = dict.intern(DictKind::Module, "free.evil");
+        let a = dict.intern(DictKind::Account, "alice");
+        let b = dict.intern(DictKind::Account, "bob");
+        dict.persist(&mut w).unwrap();
+        let guard = br#"{"keys":["k1"],"pred":"keys-all"}"#;
+        let gh = guard_hash(guard);
+        w.put(Table::Guards, &gh, guard).unwrap();
+        let row = |bal: &str| BalanceRow {
+            absent: false,
+            balance: bal.into(),
+            guard: gh,
+            as_of: 1,
+            reconciled_at: 1,
+            unverified: false,
+        };
+        let token = TokenRow {
+            fungible_chains: 1,
+            checked_chains: 1,
+            ..TokenRow::default()
+        };
+        w.put(Table::Tokens, &evil.to_be_bytes(), &token.encode())
+            .unwrap();
+        // alice: coin and free.evil; bob: free.evil only.
+        for (acct, m, bal) in [(a, coin, "1.5"), (a, evil, "1000000"), (b, evil, "42")] {
+            w.put(Table::Balances, &bal_key(acct, m, 0), &row(bal).encode())
+                .unwrap();
+            w.put(
+                Table::KeyAccounts,
+                &key_account_key(&key_hash("k1"), acct),
+                &[],
+            )
+            .unwrap();
+        }
+        w.commit().unwrap();
+        let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        let settings = ApiSettings {
+            network: "mainnet01".into(),
+            deadline: Duration::from_secs(5),
+            max_in_flight: 16,
+            max_body_bytes: 8 << 20,
+            v1txs_max_body_bytes: 8 << 20,
+            rate_per_ip: 20,
+            rate_burst: 40,
+            trusted_proxies: Vec::new(),
+            read_threads: 2,
+            ready_max_lag: 10,
+            max_event_lists: 64,
+        };
+        (d, Api::new(store, settings, TipWatch::default()).state())
+    }
+
+    async fn get(st: &Arc<crate::ApiState>, token: Option<&str>) -> Value {
+        let q = super::Q {
+            token: token.map(str::to_owned),
+            ..super::Q::default()
+        };
+        let r = super::key_accounts(State(st.clone()), Ok(Path("k1".into())), Ok(Query(q))).await;
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn rows(v: &Value) -> Vec<(String, String, bool)> {
+        let mut out = Vec::new();
+        for it in v["items"].as_array().unwrap() {
+            for m in it["modules"].as_array().unwrap() {
+                out.push((
+                    it["account"].as_str().unwrap().to_owned(),
+                    m["module"].as_str().unwrap().to_owned(),
+                    m["trusted"].as_bool().unwrap(),
+                ));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn by_key_lists_only_key_modules_unless_asked() {
+        let (_d, st) = fixture();
+        // Default: coin only; bob (free.evil only) is left out of the page.
+        let v = get(&st, None).await;
+        assert_eq!(rows(&v), [("alice".into(), "coin".into(), true)], "{v}");
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+        // Asked for by name: listed, and marked untrusted.
+        let v = get(&st, Some("free.evil")).await;
+        assert_eq!(
+            rows(&v),
+            [
+                ("alice".into(), "free.evil".into(), false),
+                ("bob".into(), "free.evil".into(), false)
+            ],
+            "{v}"
+        );
+        // An unknown or unconfirmed module lists nothing.
+        let v = get(&st, Some("free.none")).await;
+        assert!(rows(&v).is_empty(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn key_modules_setting_widens_the_default() {
+        let (_d, st) = fixture();
+        st.set_key_modules(vec!["coin".into(), "free.evil".into()]);
+        let v = get(&st, None).await;
+        assert_eq!(rows(&v).len(), 3, "{v}");
+        assert!(rows(&v).iter().all(|r| r.2), "{v}");
+    }
 }

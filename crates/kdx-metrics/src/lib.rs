@@ -90,6 +90,8 @@ pub struct Metrics {
     pub graphql_subscriptions: Gauge,
     /// Age of the newest block the subscription feed has seen.
     pub graphql_feed_lag_seconds: FGauge,
+    /// Approximate bytes of decoded blocks the subscription feed's broadcast ring holds (M-3).
+    pub graphql_feed_ring_bytes: Gauge,
 }
 
 impl Metrics {
@@ -280,6 +282,11 @@ impl Metrics {
             "Age of the newest block seen by the GraphQL subscription feed",
             FGauge::default()
         );
+        let graphql_feed_ring_bytes = reg!(
+            "kdx_graphql_feed_ring_bytes",
+            "Approximate bytes of decoded blocks held by the GraphQL subscription feed's ring",
+            Gauge::default()
+        );
         let balance_reconcile_seconds = reg!(
             "kdx_balance_reconcile_seconds",
             "Balance reconcile call duration (result ok|absent|error|skipped)",
@@ -324,6 +331,7 @@ impl Metrics {
             graphql_rejected,
             graphql_subscriptions,
             graphql_feed_lag_seconds,
+            graphql_feed_ring_bytes,
         }
     }
 

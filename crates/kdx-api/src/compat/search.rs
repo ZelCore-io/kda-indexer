@@ -9,13 +9,15 @@
 //! match; otherwise from the bounded newest-first scan (`search.max_scan_heights`,
 //! `search.timeout_ms`). Either path answers what it found with `X-Search-Truncated: true`
 //! when the deadline or a cap cut it, plus `Chainweb-Next` when there is more to read.
-//! chainweb-data also matches `cont` txs through their initial tx's code; this route does
+//! Genesis-block txs are listed, as chainweb-data does (6E-F); the other compat list routes
+//! hide them. chainweb-data also matches `cont` txs through their initial tx's code; this route does
 //! not (S-3, allowlist class `search-cont-history`).
 //!
 //! `pactid`: the `cont` txs whose `payload.cont.pactId` is the given one (the starter is
 //! excluded), successful first, then height desc (ties: request key ascending), limit 50
 //! (max 50, the newest 1,000 txs of the pact considered, R-P5P9-3); height and paging
-//! parameters are ignored and no `Chainweb-Next` is sent, as chainweb-data does.
+//! parameters are ignored and no `Chainweb-Next` is sent, as chainweb-data does. When that
+//! cap cut the walk the answer carries `X-Search-Truncated: true` (R-P5P9-48).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -30,9 +32,9 @@ use kdx_types::{Hash32, TxKey};
 use serde_json::Value;
 
 use super::{
-    aeson, check_strategy, collect_page, hidden, int_param, page_response, paging, recent,
+    aeson, check_strategy, collect_page, int_param, page_response, paging, recent,
     resume_exhausted, resume_max, shapes, store_floor, text, Candidates, Like, Page, Paging,
-    Params, RowSource, ScanLimits,
+    Params, RowSource, ScanLimits, SEARCH_TRUNCATED,
 };
 use crate::search::{check_pattern, index_covers, lagging, rejected, ClientIp, SearchCtx};
 use crate::server::ApiState;
@@ -126,6 +128,10 @@ impl RowSource for Summaries {
 
     fn idx_of_sub(&self, _k: TxKey, _sub: u16) -> i64 {
         0
+    }
+
+    fn lists_genesis(&self) -> bool {
+        true
     }
 
     fn render(
@@ -348,38 +354,250 @@ async fn by_pact(st: Arc<ApiState>, p: &Params, pid: String) -> Response {
     };
     let limit = limit as usize;
     let res = st
-        .read(move |view| {
-            let (keys, _capped) = view.pact_txs(&pact, PACT_CAP)?;
-            let mut rows: Vec<(bool, TxKey, Vec<u8>, Value)> = Vec::new();
-            for (i, (k, cont)) in keys.into_iter().enumerate() {
-                if i % 64 == 63 {
-                    view.check_deadline()?;
-                }
-                if !cont || hidden(view, k) {
-                    continue;
-                }
-                let (Some(r), Some(b)) = (view.tx(k)?, view.block(k.chain(), k.height())?) else {
-                    continue;
-                };
-                if let Some(d) = shapes::tx_detail(view, &r, &b)? {
-                    let ok = d.get("success").and_then(Value::as_bool) == Some(true);
-                    rows.push((ok, k, shapes::rk_order(&r), recent::summary(&d)));
-                }
-            }
-            // Successful first, then height desc. chainweb-data leaves ties to Postgres; live
-            // it answered them request key ascending (2 of 2 tied pairs, 2026-11-11).
-            rows.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then(b.1.height().cmp(&a.1.height()))
-                    .then(a.2.cmp(&b.2))
-                    .then(a.1.chain().cmp(&b.1.chain()))
-            });
-            rows.truncate(limit);
-            Ok(rows.into_iter().map(|r| r.3).collect::<Vec<_>>())
-        })
+        .read(move |view| pact_rows(view, &pact, limit, PACT_CAP))
         .await;
     match res {
-        Ok(v) => aeson(&Value::Array(v)),
+        Ok((rows, capped)) => pact_response(rows, capped),
         Err(e) => e.into_response(),
+    }
+}
+
+/// The `cont` rows of `pact` among its newest `cap` txs, successful first, then height desc,
+/// at most `limit`; the flag is true when the cap cut the walk (older txs were not read).
+fn pact_rows(
+    view: &View,
+    pact: &Hash32,
+    limit: usize,
+    cap: usize,
+) -> ApiResult<(Vec<Value>, bool)> {
+    let (keys, capped) = view.pact_txs(pact, cap)?;
+    let mut rows: Vec<(bool, TxKey, Vec<u8>, Value)> = Vec::new();
+    for (i, (k, cont)) in keys.into_iter().enumerate() {
+        if i % 64 == 63 {
+            view.check_deadline()?;
+        }
+        if !cont {
+            continue;
+        }
+        let (Some(r), Some(b)) = (view.tx(k)?, view.block(k.chain(), k.height())?) else {
+            continue;
+        };
+        if let Some(d) = shapes::tx_detail(view, &r, &b)? {
+            let ok = d.get("success").and_then(Value::as_bool) == Some(true);
+            rows.push((ok, k, shapes::rk_order(&r), recent::summary(&d)));
+        }
+    }
+    // Successful first, then height desc. chainweb-data leaves ties to Postgres; live it
+    // answered them request key ascending (2 of 2 tied pairs, 2026-11-11).
+    rows.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.height().cmp(&a.1.height()))
+            .then(a.2.cmp(&b.2))
+            .then(a.1.chain().cmp(&b.1.chain()))
+    });
+    rows.truncate(limit);
+    Ok((rows.into_iter().map(|r| r.3).collect(), capped))
+}
+
+/// The `pactid` answer: `X-Search-Truncated: true` when the cap cut the walk (R-P5P9-48; an
+/// additive header that chainweb-data clients ignore), no such header otherwise.
+fn pact_response(rows: Vec<Value>, capped: bool) -> Response {
+    let mut resp = aeson(&Value::Array(rows));
+    if capped {
+        resp.headers_mut().insert(
+            SEARCH_TRUNCATED,
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
+    resp
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use kdx_decode::{Family, IndexedBlock, TxIndex};
+    use kdx_hot::{Geometry, HotDict, HotStore};
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{blake2b_128, Hash32, TxKey};
+
+    use super::super::hidden;
+    use super::*;
+    use crate::search::SearchCtx;
+    use crate::store::Store;
+
+    fn block(chain: u8, height: u32, code: &str) -> IndexedBlock {
+        let h = blake2b_128(code.as_bytes());
+        let key = TxKey::new(height, chain, 1);
+        let tx = TxRecord {
+            key,
+            request_key: Some(Hash32([chain.wrapping_add(1); 32])),
+            cmd: Some(
+                serde_json::to_vec(&serde_json::json!({"payload": {"exec": {"code": code}}}))
+                    .unwrap(),
+            ),
+            raw_output: Some(
+                br#"{"gas":1,"result":{"status":"success","data":"ok"},"reqKey":"x","logs":null,"events":[],"metaData":null,"continuation":null,"txId":1}"#.to_vec(),
+            ),
+            status_ok: true,
+            ..TxRecord::default()
+        };
+        IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32([chain.wrapping_add(100); 32]),
+                chain,
+                height: u64::from(height),
+                ..BlockRecord::default()
+            },
+            txs: vec![tx],
+            idx: vec![TxIndex {
+                key,
+                postings: vec![(Family::Code, kdx_decode::index::code_entity(&h))],
+                pact_id: None,
+                code_hash: Some(h),
+            }],
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        }
+    }
+
+    /// A `cont` tx of `pact` at (`chain`, `height`).
+    fn cont_block(chain: u8, height: u32, pact: &Hash32) -> IndexedBlock {
+        let key = TxKey::new(height, chain, 1);
+        let cmd = serde_json::json!({"payload": {"cont": {"pactId": pact.to_b64url(),
+            "step": 1, "rollback": false, "data": {}, "proof": null}}});
+        let tx = TxRecord {
+            key,
+            request_key: Some(Hash32([height as u8; 32])),
+            cmd: Some(serde_json::to_vec(&cmd).unwrap()),
+            raw_output: Some(
+                br#"{"gas":1,"result":{"status":"success","data":"ok"},"reqKey":"x","logs":null,"events":[],"metaData":null,"continuation":null,"txId":1}"#.to_vec(),
+            ),
+            status_ok: true,
+            ..TxRecord::default()
+        };
+        IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32([height as u8; 32]),
+                chain,
+                height: u64::from(height),
+                ..BlockRecord::default()
+            },
+            txs: vec![tx],
+            idx: vec![TxIndex {
+                key,
+                postings: vec![(Family::Pact, kdx_decode::index::pact_entity(pact))],
+                pact_id: Some(*pact),
+                code_hash: None,
+            }],
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        }
+    }
+
+    /// R-P5P9-48 item 4: a `pactid` answer carries `X-Search-Truncated: true` exactly when
+    /// the cap cut the walk (here a cap of 2 over 3 txs; the route uses PACT_CAP, 1,000).
+    #[test]
+    fn pactid_cap_sends_the_truncated_header() {
+        let d = tempfile::tempdir().unwrap();
+        let g = Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(HotStore::open(&d.path().join("hot"), g).unwrap());
+        let pact = Hash32([7; 32]);
+        {
+            let mut w = hot.rw().unwrap();
+            w.set_meta(kdx_hot::env::meta::NETWORK, b"mainnet01")
+                .unwrap();
+            w.set_meta(
+                kdx_hot::env::meta::CHAIN_GRAPH,
+                b"[[0,[0,1,2,3,4,5,6,7,8,9]]]",
+            )
+            .unwrap();
+            let mut dict = HotDict::load(&w).unwrap();
+            for h in [20, 21, 22] {
+                kdx_hot::tail::apply(&mut w, &cont_block(3, h, &pact), &mut dict).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        let view = store
+            .view(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let heights = |rows: &[Value]| -> Vec<u64> {
+            rows.iter().map(|r| r["height"].as_u64().unwrap()).collect()
+        };
+        // Capped: the newest 2 txs, and the header.
+        let (rows, capped) = pact_rows(&view, &pact, 50, 2).unwrap();
+        assert_eq!((heights(&rows), capped), (vec![22, 21], true));
+        let resp = pact_response(rows, capped);
+        assert_eq!(
+            resp.headers().get(SEARCH_TRUNCATED).map(|v| v.as_bytes()),
+            Some(&b"true"[..])
+        );
+        // Not capped (the cap holds every tx, or exactly all of them): no header.
+        for cap in [3, PACT_CAP] {
+            let (rows, capped) = pact_rows(&view, &pact, 50, cap).unwrap();
+            assert_eq!((heights(&rows), capped), (vec![22, 21, 20], false));
+            assert!(pact_response(rows, capped)
+                .headers()
+                .get(SEARCH_TRUNCATED)
+                .is_none());
+        }
+    }
+
+    /// 6E-F: `/txs/search` lists genesis txs as chainweb-data does (mainnet: h0 on chains
+    /// 0-9, h852054 on chains 10-19), while the other compat list routes still hide them.
+    /// The fixture's graph puts the genesis blocks at heights 5 and 8, so the bounded scan
+    /// stays small.
+    #[test]
+    fn search_lists_genesis_txs() {
+        let d = tempfile::tempdir().unwrap();
+        let g = Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(HotStore::open(&d.path().join("hot"), g).unwrap());
+        let code = "(coin.create-account \"kad-ops-20\" (read-keyset \"kad-ops-20\"))";
+        {
+            let mut w = hot.rw().unwrap();
+            w.set_meta(kdx_hot::env::meta::NETWORK, b"mainnet01")
+                .unwrap();
+            w.set_meta(
+                kdx_hot::env::meta::CHAIN_GRAPH,
+                b"[[5,[0,1,2,3,4,5,6,7,8,9]],[8,[10,11,12,13,14,15,16,17,18,19]]]",
+            )
+            .unwrap();
+            let mut dict = HotDict::load(&w).unwrap();
+            for b in [block(3, 5, code), block(12, 8, code), block(12, 9, code)] {
+                kdx_hot::tail::apply(&mut w, &b, &mut dict).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        let view = store
+            .view(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let ctx = SearchCtx::new(super::super::SearchSettings::default(), None);
+        let pg = Paging {
+            limit: 10,
+            offset: 0,
+            next: None,
+            min_height: None,
+            max_height: None,
+            empty: false,
+        };
+        let page = search_page(&view, &ctx, "kad-ops-20", &pg).unwrap();
+        let heights: Vec<u64> = page
+            .rows
+            .iter()
+            .map(|r| r["height"].as_u64().unwrap())
+            .collect();
+        assert_eq!(heights, vec![9, 8, 5], "{:?}", page.rows);
+        // The other list routes keep hiding them.
+        assert!(hidden(&view, TxKey::new(8, 12, 1)));
+        assert!(hidden(&view, TxKey::new(5, 3, 1)));
     }
 }

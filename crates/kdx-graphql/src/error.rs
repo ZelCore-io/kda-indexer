@@ -38,6 +38,30 @@ impl Code {
     }
 }
 
+/// A response body with each error's `extensions.code` also copied to a top-level `code`:
+/// the GraphQL-spec place stays, and clients written against the oracle, which sends the
+/// code top-level, read it too (R-P5P9-19). Takes a `Response` or a batch of them.
+pub fn wire_json<T: serde::Serialize>(resp: &T) -> serde_json::Result<Vec<u8>> {
+    let mut v = serde_json::to_value(resp)?;
+    match &mut v {
+        serde_json::Value::Array(rs) => rs.iter_mut().for_each(copy_codes),
+        r => copy_codes(r),
+    }
+    serde_json::to_vec(&v)
+}
+
+fn copy_codes(resp: &mut serde_json::Value) {
+    let Some(errors) = resp.get_mut("errors").and_then(|e| e.as_array_mut()) else {
+        return;
+    };
+    for e in errors {
+        let code = e.pointer("/extensions/code").cloned();
+        if let (Some(code), Some(o)) = (code, e.as_object_mut()) {
+            o.entry("code").or_insert(code);
+        }
+    }
+}
+
 /// A resolver error with `extensions.code`.
 pub fn err(code: Code, msg: impl Into<String>) -> async_graphql::Error {
     async_graphql::Error::new(msg).extend_with(|_, e| e.set("code", code.as_str()))
@@ -87,5 +111,28 @@ pub fn from_api(e: ApiError) -> async_graphql::Error {
             tracing::error!(error = format!("{e:#}"), "graphql: internal error");
             err(Code::Internal, "internal error")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_code_is_also_top_level() {
+        let one = async_graphql::Response::from_errors(vec![server(Code::Limit, "x")]);
+        let v: serde_json::Value = serde_json::from_slice(&wire_json(&one).unwrap()).unwrap();
+        assert_eq!(v["errors"][0]["extensions"]["code"], "LIMIT");
+        assert_eq!(v["errors"][0]["code"], "LIMIT");
+        // A batch: every response gets it; an error without a code is left alone.
+        let plain = async_graphql::Response::from_errors(vec![ServerError::new("y", None)]);
+        let batch = vec![one, plain];
+        let v: serde_json::Value = serde_json::from_slice(&wire_json(&batch).unwrap()).unwrap();
+        assert_eq!(v[0]["errors"][0]["code"], "LIMIT");
+        assert!(v[1]["errors"][0].get("code").is_none());
+        // Data responses are untouched.
+        let ok = async_graphql::Response::new(async_graphql::Value::Null);
+        let v: serde_json::Value = serde_json::from_slice(&wire_json(&ok).unwrap()).unwrap();
+        assert!(v.get("errors").is_none());
     }
 }

@@ -375,12 +375,22 @@ pub struct GraphqlConfig {
     pub max_query_bytes: u32,
     pub max_variables_bytes: u32,
     pub ws_subs_per_conn: u32,
+    /// Subscriptions per client (IPv4 address or IPv6 /64) over all its connections.
+    pub ws_subs_per_ip: u32,
+    /// Subscriptions per IPv6 /48.
+    pub ws_subs_per_48: u32,
     pub ws_subs_max: u32,
     pub ws_conns_per_ip: u32,
+    /// Connections per IPv6 /48.
+    pub ws_conns_per_48: u32,
+    /// Connections per process.
+    pub ws_conns_max: u32,
     pub ws_init_secs: u64,
     pub ws_idle_secs: u64,
     pub ws_tx_wait_secs: u64,
     pub feed_poll_ms: u64,
+    /// Byte budget (MB) of the decoded blocks the subscription feed's ring holds.
+    pub feed_ring_mb: u32,
     /// `networkInfo.networkHost`: a public name for clients, never the node URL.
     pub network_host: String,
     /// Automatic persisted queries. Not built: `true` is refused.
@@ -400,12 +410,17 @@ impl Default for GraphqlConfig {
             max_query_bytes: 32768,
             max_variables_bytes: 65536,
             ws_subs_per_conn: 20,
+            ws_subs_per_ip: 40,
+            ws_subs_per_48: 120,
             ws_subs_max: 2000,
             ws_conns_per_ip: 10,
+            ws_conns_per_48: 30,
+            ws_conns_max: 1000,
             ws_init_secs: 10,
             ws_idle_secs: 600,
             ws_tx_wait_secs: 3600,
             feed_poll_ms: 1000,
+            feed_ring_mb: 64,
             network_host: String::new(),
             apq: false,
         }
@@ -424,8 +439,12 @@ impl GraphqlConfig {
                 && self.introspection_depth > 0
                 && self.max_batch > 0
                 && self.ws_subs_per_conn > 0
+                && self.ws_subs_per_ip > 0
+                && self.ws_subs_per_48 > 0
                 && self.ws_subs_max > 0
                 && self.ws_conns_per_ip > 0
+                && self.ws_conns_per_48 > 0
+                && self.ws_conns_max > 0
                 && self.ws_init_secs > 0
                 && self.ws_idle_secs > 0
                 && self.ws_tx_wait_secs > 0,
@@ -440,6 +459,10 @@ impl GraphqlConfig {
         anyhow::ensure!(
             self.feed_poll_ms >= 100,
             "graphql.feed_poll_ms must be at least 100"
+        );
+        anyhow::ensure!(
+            (8..=4096).contains(&self.feed_ring_mb),
+            "graphql.feed_ring_mb must be in 8..=4096"
         );
         anyhow::ensure!(
             !self.apq,
@@ -466,12 +489,17 @@ impl GraphqlConfig {
             max_variables_bytes: self.max_variables_bytes as usize,
             max_body_bytes: kdx_graphql::MAX_BODY_BYTES,
             ws_subs_per_conn: self.ws_subs_per_conn as usize,
+            ws_subs_per_ip: self.ws_subs_per_ip as usize,
+            ws_subs_per_48: self.ws_subs_per_48 as usize,
             ws_subs_max: self.ws_subs_max as usize,
             ws_conns_per_ip: self.ws_conns_per_ip as usize,
+            ws_conns_per_48: self.ws_conns_per_48 as usize,
+            ws_conns_max: self.ws_conns_max as usize,
             ws_init: Duration::from_secs(self.ws_init_secs),
             ws_idle: Duration::from_secs(self.ws_idle_secs),
             ws_tx_wait: Duration::from_secs(self.ws_tx_wait_secs),
             feed_poll: Duration::from_millis(self.feed_poll_ms),
+            feed_ring_bytes: self.feed_ring_mb as usize * (1 << 20),
             network_id: network.to_owned(),
             network_host: self.network_host.clone(),
             apq: self.apq,
@@ -557,6 +585,10 @@ pub struct BalancesConfig {
     pub account_rows: u32,
     /// Hours after which a module's fungible check and a not-fungible verdict are re-done.
     pub recheck_hours: u32,
+    /// Modules `GET /keys/{pubkey}/accounts` lists without `token` (M-1, SEC-2). Any module
+    /// can implement fungible-v2 and report a balance under any key, so only the ones listed
+    /// here are governance-trusted; others appear only when asked for by `token`.
+    pub key_modules: Vec<String>,
 }
 
 impl Default for BalancesConfig {
@@ -569,6 +601,7 @@ impl Default for BalancesConfig {
             module_rows: 1_000_000,
             account_rows: 1_000,
             recheck_hours: 24,
+            key_modules: vec!["coin".to_owned()],
         }
     }
 }
@@ -596,6 +629,12 @@ impl BalancesConfig {
                 && self.recheck_hours >= 1,
             "balances.module_share, module_rows, account_rows and recheck_hours must be >= 1"
         );
+        for m in &self.key_modules {
+            anyhow::ensure!(
+                kdx_node::local::valid_module(m),
+                "balances.key_modules: `{m}` is not a module name (name or namespace.name)"
+            );
+        }
         Ok(())
     }
 }
@@ -774,6 +813,12 @@ mod balances_tests {
     fn balances_values_are_validated() {
         let ok = BalancesConfig::default();
         assert!(ok.validate().is_ok());
+        assert_eq!(ok.key_modules, ["coin"]);
+        let wide = BalancesConfig {
+            key_modules: vec!["coin".into(), "kaddex.kdx".into()],
+            ..ok.clone()
+        };
+        assert!(wide.validate().is_ok());
         for bad in [
             BalancesConfig {
                 local_rps: 0,
@@ -789,6 +834,14 @@ mod balances_tests {
             },
             BalancesConfig {
                 account_rows: 0,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                key_modules: vec!["coin".into(), "free.evil; drop".into()],
+                ..ok.clone()
+            },
+            BalancesConfig {
+                key_modules: vec!["".into()],
                 ..ok.clone()
             },
         ] {

@@ -76,7 +76,7 @@ impl Query {
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Depth(depth),
-            PageArgs::new(after, before, first, last),
+            PageArgs::new(after, before, first, last).wide(),
         )
         .await?;
         Ok(Some(QueryBlocksFromDepthConnection {
@@ -109,7 +109,7 @@ impl Query {
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Heights { start, end },
-            PageArgs::new(after, before, first, last),
+            PageArgs::new(after, before, first, last).wide(),
         )
         .await?;
         Ok(QueryBlocksFromHeightConnection {
@@ -146,7 +146,7 @@ impl Query {
                 count: count as u64,
                 complete: completed_heights.unwrap_or(true),
             },
-            PageArgs::new(after, before, first, last),
+            PageArgs::new(after, before, first, last).wide(),
         )
         .await?;
         Ok(QueryCompletedBlockHeightsConnection {

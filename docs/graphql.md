@@ -35,7 +35,9 @@ Differences from Kadena graph:
   transaction that is not indexed is `null`.
 - Page sizes: the schema text says 500 by default. Here a connection returns 20 items when
   `first`/`last` are omitted, and larger values are clamped to 100 (not refused);
-  `pageInfo.hasNextPage` stays correct.
+  `pageInfo.hasNextPage` stays correct. The block lists (`blocksFromHeight`, `blocksFromDepth`,
+  `completedBlockHeights`) and account balances (`balance`) clamp at 200 (twice `max_page`):
+  kadscan's home list asks for 120 blocks and its assets tab for 200 balances.
 - The schema has no "as of height" field, so GraphQL answers do not carry one (the native API
   does).
 - Fields not served yet answer `NOT_SUPPORTED` with the rest of the operation intact.
@@ -69,23 +71,50 @@ All in `[graphql]` (defaults shown). A refusal answers a GraphQL error with
 | query text | `max_query_bytes = 32768` | `query_size` |
 | variables (JSON) | `max_variables_bytes = 65536` | `variables_size` |
 | request body | 131072 bytes (HTTP 413) | `body_size` |
-| page size | `default_page = 20`, `max_page = 100` (clamped) | — |
+| page size | `default_page = 20`, `max_page = 100` (clamped); block lists and `balance` clamp at `2 × max_page` | — |
 | request deadline | `api.deadline_ms` (5 s), shared by a batch | `TIMEOUT` code |
 
 Rate: a request takes one token of the per-IP rate limit (`api.rate_per_ip`); a batch of N
 operations takes N.
 
-Complexity: each field costs 1 (`__typename` and the Relay wrappers `edges` and `node` cost
-0). A field that returns a page multiplies what it selects by the page size it will return:
-of a connection, only its `edges` (`totalCount` and `pageInfo` are answered once); of a list
-(`newBlocks`, the `transactions` subscription), all of it, sized by `quantity` when given.
+Complexity (field types from the schema; aliases change nothing): each field costs 1
+(`__typename` 0, and a connection's `edges` and their `node` 0). A connection or list field
+multiplies what it selects by the page size it will return, each item at least 1: of a
+connection, only its `edges` (`totalCount` and `pageInfo` are answered once; a connection
+that selects neither `edges` nor `pageInfo` reads no page); of a list (`newBlocks`, the
+`transactions` subscription), all of it, sized by `quantity` when given. A list's
+`totalCount` that is a count walk (`transactions`, `events`, `transfers`,
+`transactionsByPublicKey` and the account `transactions`) costs `max_page`, and an
+operation may run at most 2 of them, outer multipliers included (`complexity` otherwise). A
+block's `transactions` and a tx's own `totalCount`s are counted with their rows. A block's
+`events` `totalCount` decodes every tx of the block, so it costs the default page per block
+(not a count walk). `fungibleAccountsByPublicKey` and `fungibleChainAccountsByPublicKey` are
+sized at 100 accounts, the most they return. A subscription's `quantity` is clamped to
+`max_page`, and the `transactions` subscription without one is sized at 20.
 
 Depth counts nested fields; fragments are expanded where they are spread, so fragments,
 inline fragments and aliases do not get around depth or complexity. Every operation in a
 document is checked, not only the one that runs.
 
+The document is parsed and walked by these limits before anything else looks at it, and that
+walk stops at 20,000 fields after fragment expansion (`LIMIT`, `limit: complexity`, "query has
+more than 20000 fields after fragment expansion"). A fragment bomb (each fragment spreading the
+one before it twice) is refused in about a millisecond, over HTTP and over the websocket. At
+most 8 directives are allowed on one field, fragment, fragment spread or inline fragment
+(`LIMIT`, `limit: directives`).
+
+A `crossChainTransfer` inside another `crossChainTransfer` costs 10 per item, the price of the
+store read it would need. It is answered from the pair already loaded and reads nothing.
+
+List pages (`transactions`, `transfers`, `events` and the other lists) share the API's heavy
+read slots (half the read threads). Each client key (an IPv4 address or an IPv6 /64, as the
+rate limiter keys it) holds at most one of them. Up to 3 more of its heavy reads wait behind
+that one. Past that, one is refused at once with `LIMIT`. One page scans for at most 1 s; a
+sparse or empty match then ends with `TIMEOUT`: narrow the filter.
+
 Complexity: each field costs 1 (`__typename` 0). A field that returns a page multiplies the
 cost of its selection by the page size it returns (`first`/`last` clamped to `max_page`, or
+`2 × max_page` on the block lists and `balance`, or
 `default_page` when omitted; this applies to `events`, `transactions`, `transfers`,
 `blocksFromHeight`, `blocksFromDepth`, `completedBlockHeights`, `transactionsByPublicKey`).
 `nodes(ids)` multiplies by the number of ids, per-chain account lists by the number of chains
@@ -95,6 +124,13 @@ cost of its selection by the page size it returns (`first`/`last` clamped to `ma
 
 A page size bound to a variable is costed at the variable's value, else at its default in the
 operation, else (no value, no default) at `max_page`, never at `default_page`.
+
+The walker fails closed (SR7-3): a `totalCount` is cheap only under the connection types on its
+cheap list (a block's or tx's own rows, block ranges, account transfers, balances). Under any
+other connection, or under a parent the walker cannot resolve (an interface or unknown type
+condition, a fragment on one), it is a deferred count walk costing `max_page` and counting
+toward the two per operation. A field the walker cannot resolve costs the page maximum with
+its subtree priced per item.
 
 Introspection (`__schema`, `__type`) is counted on its own budget of 100,000 per operation
 (`extensions.limit = "introspection_complexity"`): its list fields multiply their selection by
@@ -113,15 +149,26 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | Limit | Default | On refusal |
 |---|---|---|
 | connections per client IP (an IPv6 client counts by its /64) | `ws_conns_per_ip = 10` | upgrade answers 429 (`ws_connections_per_ip`) |
-| connections per process | `ws_subs_max = 2000` | upgrade answers 429 (`ws_connections`) |
+| connections per IPv6 /48 (all its /64s together) | `ws_conns_per_48 = 30` | upgrade answers 429 (`ws_connections_per_ip`) |
+| connections per process | `ws_conns_max = 1000` | upgrade answers 429 (`ws_connections`) |
 | subscriptions per connection | `ws_subs_per_conn = 20` | the subscription gets a `LIMIT` error (`ws_subscriptions_per_connection`), the connection stays |
+| subscriptions per client IP (IPv4 address or IPv6 /64), over all its connections | `ws_subs_per_ip = 40` | `LIMIT` error (`ws_subscriptions_per_client`), the connection stays |
+| subscriptions per IPv6 /48 | `ws_subs_per_48 = 120` | `LIMIT` error (`ws_subscriptions_per_client`), the connection stays |
 | subscriptions per process | `ws_subs_max = 2000` | `LIMIT` error (`ws_subscriptions`) |
 | `connection_init` | within `ws_init_secs = 10` | close 4408 (`ws_init_timeout`) |
 | no subscription open | for `ws_idle_secs = 600` | close 4000 (`ws_idle`) |
-| client message or frame | 64 KB | connection closed (`ws_message`) |
+| client message or frame | 64 KB | close 1009 (`ws_message`); a malformed frame closes 1002 |
 | client messages | one per-IP rate token each (pings too) | close 4429 (`ws_rate`) |
 | a client that does not read | 30 s per server message | close 4008 (`ws_slow_reader`) |
-| a subscriber behind the feed | 1,024 feed items | one `LIMIT` error (`ws_lagged`), then the subscription ends |
+| a chain whose feed read fails | 30 ticks in a row | that chain alone is skipped each tick (a WARN line with the chain and its failure count; the other chains keep delivering), then resumes from its tip with a gap |
+| a subscriber behind the feed | 1,024 feed items, or behind blocks the ring had to drop to stay within `feed_ring_mb = 64` MB of decoded blocks | one `INTERNAL` error; the subscription goes on from the feed's newest item |
+| a query or mutation over the socket | subscriptions only | `NOT_SUPPORTED` error, nothing runs (`ws_query`); send queries over HTTP |
+| one subscription message | the HTTP request deadline, shared by all its resolvers | `TIMEOUT` error for that message |
+
+The per-client and per-/48 caps keep a few clients from holding every process slot: a
+kadscan page holds a handful of subscriptions on one connection, so one client fits several
+open pages under `ws_subs_per_ip`. An IPv4 client is capped per address only; an IPv6 client
+by its /64 and, with the other /64s of its /48, by the /48 caps.
 
 Depth, complexity and the size limits apply to subscription documents as to queries. Every
 slot is released when its subscription or connection ends; `kdx_graphql_subscriptions` is the
@@ -159,16 +206,31 @@ number open.
 Subscriptions read a feed that polls the stored chain tips every `feed_poll_ms` (1,000), so
 `serve` and replicas serve them as `run` does.
 
-- `newBlocks(chainIds)`: each message lists the new blocks of the subscribed chains (at most
-  100). After a reorg the replacing blocks are sent again.
+The feed decodes each new block's txs once and shares them with every subscriber through a
+broadcast ring of 1,024 items. The ring is byte-bounded (`feed_ring_mb`, 64 MB by default):
+before a block would take the decoded blocks it holds past the budget, the feed pushes the
+oldest blocks out of the ring with empty items. Only a subscriber that has not read those
+blocks yet gets the lag error; a subscriber that keeps up skips the empty items and loses
+nothing. Full blocks of maximum-size txs therefore cannot pin more than the budget (plus one
+block over the budget, alone) behind a client that stops reading. `kdx_graphql_feed_ring_bytes`
+is the current estimate.
+
+- A message never carries more items than its complexity priced: a catch-up is split over
+  several messages.
+- `newBlocks(chainIds)`: each message lists new blocks of the subscribed chains, at most one
+  per subscribed chain. After a reorg the replacing blocks are sent again.
 - `newBlocksFromDepth(chainIds, minimumDepth)`: a block is sent once its chain's tip is
-  `minimumDepth` above it, starting from the subscription's start; only canonical blocks.
+  `minimumDepth` above it, starting from the subscription's start; only blocks the store
+  still holds at their height (checked on release); at most one per subscribed chain per
+  message.
 - `events(qualifiedEventName, chainId, minimumDepth, parametersFilter)`: the matching events
-  of each new (or deep enough) block; `parametersFilter` takes the forms `events` takes.
+  of each new (or deep enough) block, at most the default page (20) per message, the rest in
+  the next messages; `parametersFilter` takes the forms `events` takes.
 - `transaction(requestKey, chainId)`: one message when the tx is (or becomes) indexed, then
   the subscription completes; `TIMEOUT` after `ws_tx_wait_secs`.
 - More than 200 new blocks on a chain in one poll (a catch-up), or a reorg deeper than 64
-  blocks, is a gap: subscribers of that chain get one `INTERNAL` error and stay subscribed.
+  blocks, is a gap: subscribers of that chain get the blocks before it, then one `INTERNAL`
+  error, and stay subscribed.
 
 ## Ids and cursors
 
@@ -179,13 +241,17 @@ of `<TypeName>:<key>`. The key is the block hash for `Block`, the account name f
 | Type | Key |
 |---|---|
 | `Transaction` | `[blockHash, requestKey]` |
-| `Event` | `[blockHash, orderIndex, requestKey]` |
-| `Transfer` | `[blockHash, chainId, orderIndex, moduleHash, requestKey]` |
-| `Signer` | `[requestKey, orderIndex]` |
+| `Event` | `["blockHash", "orderIndex", "requestKey"]` (the order index as a string) |
+| `Transfer` | `[blockHash, "chainId", "orderIndex", moduleHash, requestKey]` (chain and order index as strings) |
+| `Signer` | `[requestKey, "orderIndex"]` (the index as a string) |
 | `FungibleAccount` | `[fungibleName, accountName]` |
 | `FungibleChainAccount` | `[chainId, fungibleName, accountName]` |
 | `NonFungibleChainAccount` | `[chainId, accountName]` |
 | `NonFungibleTokenBalance` | `[tokenId, accountName, chainId]` |
+
+The numeric key elements are JSON strings (`["hash","1","rk"]`) because that is how the deployed
+oracle writes them (R-P5P9-19); decoding takes a number or a numeric string, so ids of either
+form resolve.
 
 Cursors are opaque. Transaction, event and transfer cursors are the same tokens as the native
 API's (a transaction position plus a block fingerprint), so a cursor taken from one instance
@@ -199,11 +265,34 @@ pages on another, and a cursor whose block was reorged away is refused.
 | `DateTime` | `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC, milliseconds) |
 | `Decimal` | a JSON number with the exact decimal digits (no float rounding) |
 
+### Wire formats that follow the oracle (R-P5P9-19)
+
+The deployed oracle serializes several fields differently from the scalar the schema declares.
+Where the kadscan client parses the field, the wire form follows the oracle; the schema text
+stays Kadena's (the parity test sees the same types, so there is nothing to pin in
+`tests/extensions.txt`). Deviations from the scalar formats above:
+
+| Field | Declared | Wire form |
+|---|---|---|
+| `TransactionMeta.gasLimit`, `.ttl` | `BigInt` | string (`"600"`) |
+| `TransactionMeta.gasPrice` | `Float` | string, plain notation (`"0.00000001"`) |
+| `TransactionResult.gas`, `.transactionId` | `BigInt` | string (`"236"`) |
+| `Transfer.amount` | `Decimal` | string, plain notation (`"0.00000236"`) |
+| `Block.nonce` | `Decimal` | string |
+| `Block.difficulty` | `BigInt` | always a JSON number, also above 2^53 |
+| `FungibleChainAccount.chainId` | `String` | string (already) |
+
+Everything else keeps the scalar rules (`Block.height`, `chainId`, `orderIndex`, `result.height`
+stay numbers; `totalBalance` and `balance` stay numbers). Error codes ride in
+`extensions.code` (GraphQL spec) and are copied to a top-level `code` on each error, the place
+the oracle puts them.
+
 ## Transactions, events and transfers
 
 - **Lists.** `transactions`, `transactionsByPublicKey`, `transfers`, `events` and the account
   connections walk the same posting lists as the native API. Order: newest first by
-  (height, chain, position in the block); rows of one tx (events, transfers) in event order.
+  (height, chain, position in the block); rows of one tx (events, transfers) newest first too,
+  by descending event position (order index 1 before 0), as the deployed oracle lists them.
   `first`/`after` pages walk down from the newest row; `last`/`before` pages first collect
   the keys between the cursor and the newest row (keys only, at most 200,000, else `LIMIT`).
   Every walk checks the request deadline every 64 keys and answers `TIMEOUT` past it.
@@ -247,7 +336,16 @@ pages on another, and a cursor whose block was reorged away is refused.
 - Guards: an inline keyset or a resolved keyset reference is a `KeysetGuard` (`raw` is the
   stored guard), a user guard is a `UserGuard`, anything else a `RawGuard`.
 - `…ByPublicKey` lists at most 100 accounts, only rows whose guard holds the key, of `coin`
-  (the default) or of a module confirmed `fungible-v2` on that chain.
+  (the default) or of a module confirmed `fungible-v2` on that chain. Only the
+  `[balances] key_modules` (default `coin`) are governance-trusted. Any module can implement
+  `fungible-v2` and report any balance under any key. A `fungibleName` outside `key_modules`
+  is answered as the caller's own choice. Even a `coin` row proves only that the account's guard
+  holds the key, not who owns the account: anyone can create an account guarded by someone
+  else's key without their signature.
+  The 100 are counted after the module filter: accounts of other modules guarded by the same
+  key (spam needs no signature) never push the asked module's accounts out. The walk over the
+  key's accounts stops at 100 matches or after its 1 s scan window; when it stops with
+  accounts of the key left unread, the response carries `"extensions": {"truncated": true}`.
 - `FungibleAccount.transactions`: txs with a transfer of the token on the account's side;
   `FungibleChainAccount.transactions`: txs on that chain the account sent (`meta.sender`),
   as the schema says.
@@ -284,10 +382,12 @@ relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `Strin
 | `events(moduleName: String)` | events of that module. `qualifiedEventName` or `moduleName` is required (`BAD_USER_INPUT` otherwise); with both, both filter. `moduleName` alone has no posting list: unless `blockHash` or `requestKey` picks the txs, heights are walked down from the tip (at most 20,000 heights, within the deadline) |
 | `NetworkInfo.countersOfEachChain: [CountersOfEachChain!]!` | per chain, ascending: `chainId`, `blocksCount` (genesis to stored tip). `transactionCount: Int` and `totalGasUsedInKda: String` answer `null` with `NOT_AVAILABLE`: the store keeps no all-time per-chain tx or gas counter |
 | `balance(accountName, module, chainIds, first/last/after/before): QueryBalanceConnection!` | an account's present fungible balances, one `BalanceNode {accountName module chainId balance}` per module and chain, listed by module name then chain, filtered by `module` and `chainIds`; at most 4,096 rows per account (`LIMIT` above). Without `accountName` (a module's holders): `NOT_SUPPORTED`, as the store keeps no holders index |
-| `transactionsByPactCode(pactCode, first/after): QueryTransactionsByPactCodeConnection!` | txs whose own exec code contains `pactCode` (`%`/`_` wildcards), newest first, through the `/txs/search` engine: its pattern checks, per-client search gate, code index or bounded newest-first scan, caps and time budget. Rows are `TransactionSummary {requestKey height chainId canonical creationTime badResult sender gas gasLimit gasPrice code}`. Forward paging only (`last`/`before`: `BAD_USER_INPUT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |
+| `transactionsByPactCode(pactCode, first/after): QueryTransactionsByPactCodeConnection!` | txs whose own exec code contains `pactCode` (`%`/`_` wildcards), newest first, through the `/txs/search` engine: its pattern checks, per-client search gate, code index or bounded newest-first scan, caps and time budget. Rows are `TransactionSummary {requestKey height chainId canonical creationTime badResult sender gas gasLimit gasPrice code}`. Forward paging only (`last`/`before`: `BAD_USER_INPUT`). The search gate counts per client
+address (HTTP, or the websocket's accepted connection); an operation without a known address
+is refused (`LIMIT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |
 | `lastTokenPriceInKda(moduleName): Decimal` | `NOT_SUPPORTED`: no price data |
-| `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 100) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
-| `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 100) per message; a message per feed batch that has any |
+| `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 100, clamped to `max_page`) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
+| `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 100, clamped to `max_page`) per message; a message per feed batch that has any |
 
 `pactQuery` stays `NOT_SUPPORTED`.
 

@@ -97,6 +97,8 @@ pub struct PageArgs {
     pub last: Option<i32>,
     pub before: Option<String>,
     pub after: Option<String>,
+    /// The field takes the wide clamp (`GraphqlSettings::wide_page`).
+    pub wide: bool,
 }
 
 impl PageArgs {
@@ -111,17 +113,26 @@ impl PageArgs {
             last,
             before,
             after,
+            wide: false,
         }
+    }
+
+    /// Clamp to the wide page (block lists and account balances, R-P5P9-20) instead of
+    /// `max_page`.
+    pub fn wide(mut self) -> PageArgs {
+        self.wide = true;
+        self
     }
 
     /// The page. `first` with `last`, negative counts, `after` with `last` or `before` with
     /// `first` are `BAD_USER_INPUT`; counts above `max_page` are clamped (GQ-9).
     pub fn parse(&self, s: &GraphqlSettings) -> async_graphql::Result<Page<PageCursor>> {
+        let cap = if self.wide { s.wide_page() } else { s.max_page };
         let clamp = |n: i32| -> async_graphql::Result<usize> {
             if n < 0 {
                 return Err(bad_input("first and last must not be negative"));
             }
-            Ok((n as usize).min(s.max_page))
+            Ok((n as usize).min(cap))
         };
         let (dir, n) = match (self.first, self.last) {
             (Some(_), Some(_)) => return Err(bad_input("pass first or last, not both")),
@@ -231,6 +242,21 @@ mod tests {
         assert_eq!((p.dir, p.n), (Dir::Backward, 5));
         let p = PageArgs::default().parse(&s()).unwrap();
         assert_eq!((p.dir, p.n), (Dir::Forward, 20));
+        // The wide clamp (block lists, account balances): up to 200, no further.
+        let p = PageArgs::new(None, None, Some(120), None)
+            .wide()
+            .parse(&s())
+            .unwrap();
+        assert_eq!(p.n, 120);
+        let p = PageArgs::new(None, None, Some(1000), None)
+            .wide()
+            .parse(&s())
+            .unwrap();
+        assert_eq!(p.n, 200);
+        let p = PageArgs::new(None, None, Some(120), None)
+            .parse(&s())
+            .unwrap();
+        assert_eq!(p.n, 100);
     }
 
     #[test]

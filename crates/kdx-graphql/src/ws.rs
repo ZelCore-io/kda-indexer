@@ -3,10 +3,12 @@
 //!
 //! Limits, each a security control on a public surface (every refusal counts in
 //! `kdx_graphql_rejected_total{reason}`):
-//! - connections: at most `ws_conns_per_ip` per client (keyed like the rate limiter) and at
-//!   most `ws_subs_max` per process; an upgrade over either answers 429;
-//! - subscriptions: at most `ws_subs_per_conn` per connection and `ws_subs_max` per process;
-//!   a refused `subscribe` gets a `LIMIT` error, the connection stays;
+//! - connections: at most `ws_conns_per_ip` per client (keyed like the rate limiter: an
+//!   IPv4 address or an IPv6 /64), `ws_conns_per_48` per IPv6 /48 and `ws_conns_max` per
+//!   process; an upgrade over any answers 429;
+//! - subscriptions: at most `ws_subs_per_conn` per connection, `ws_subs_per_ip` per client
+//!   over all its connections, `ws_subs_per_48` per IPv6 /48 and `ws_subs_max` per process
+//!   (M-2); a refused `subscribe` gets a `LIMIT` error, the connection stays;
 //! - `connection_init` must arrive within `ws_init`, else close 4408;
 //! - a connection with no subscription for `ws_idle` is closed (4000);
 //! - a message (or frame) over [`MAX_MESSAGE`] closes the connection;
@@ -15,6 +17,11 @@
 //! - a client that does not read for [`SEND_TIMEOUT`] is closed, and a subscriber that falls
 //!   behind the feed's buffer gets an error (memory stays bounded).
 //!
+//! - only subscriptions run over the socket: a document with a query or mutation answers a
+//!   `NOT_SUPPORTED` error before anything runs (kadscan sends only subscriptions there);
+//! - every subscription message runs under one deadline (the HTTP request budget) that all
+//!   of its resolvers share, bounded by an outer timeout (I-2).
+//!
 //! All slots are held by guards and released on close, error or task end.
 
 use std::net::{IpAddr, SocketAddr};
@@ -22,8 +29,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_graphql::extensions::{
+    Extension, ExtensionContext, ExtensionFactory, NextExecute, NextParseQuery,
+};
 use async_graphql::http::{WebSocket as GqlWebSocket, WebSocketProtocols, WsMessage};
-use async_graphql::{Context, Data};
+use async_graphql::parser::types::{DocumentOperations, ExecutableDocument, OperationType};
+use async_graphql::{Context, Data, ServerResult, Variables};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, Request as HttpRequest};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -34,7 +45,7 @@ use kdx_api::ApiState;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{limit, server, Code};
-use crate::{gql, Gql, KdxSchema};
+use crate::{gql, Gql, KdxSchema, ReqCtx};
 
 /// Largest client message and frame.
 pub const MAX_MESSAGE: usize = 64 * 1024;
@@ -45,7 +56,10 @@ const INBOX: usize = 16;
 
 /// Process-wide websocket state (in [`Gql`]).
 pub struct WsState {
+    /// Connections per client and per IPv6 /48.
     ips: ConnLimiter,
+    /// Subscriptions per client and per IPv6 /48 (M-2).
+    client_subs: ConnLimiter,
     conns: Arc<Semaphore>,
     subs: Arc<Semaphore>,
     max_subs: usize,
@@ -54,8 +68,9 @@ pub struct WsState {
 impl WsState {
     pub fn new(s: &crate::GraphqlSettings) -> WsState {
         WsState {
-            ips: ConnLimiter::new(s.ws_conns_per_ip),
-            conns: Arc::new(Semaphore::new(s.ws_subs_max)),
+            ips: ConnLimiter::new(s.ws_conns_per_ip, s.ws_conns_per_48),
+            client_subs: ConnLimiter::new(s.ws_subs_per_ip, s.ws_subs_per_48),
+            conns: Arc::new(Semaphore::new(s.ws_conns_max)),
             subs: Arc::new(Semaphore::new(s.ws_subs_max)),
             max_subs: s.ws_subs_max,
         }
@@ -78,9 +93,87 @@ pub fn active_subscriptions(schema: &KdxSchema) -> usize {
 #[derive(Clone)]
 pub struct ConnSubs(Arc<Semaphore>);
 
+/// The websocket rules of the schema (I-2): only subscriptions over a socket, and one
+/// deadline per subscription message.
+pub struct WsOps;
+
+impl ExtensionFactory for WsOps {
+    fn create(&self) -> Arc<dyn Extension> {
+        Arc::new(WsOpsExt)
+    }
+}
+
+struct WsOpsExt;
+
+/// A message's budget without a store attached (no `ApiSettings` to read).
+const MESSAGE_BUDGET: Duration = Duration::from_secs(5);
+
+#[async_graphql::async_trait::async_trait]
+impl Extension for WsOpsExt {
+    async fn parse_query(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        query: &str,
+        variables: &Variables,
+        next: NextParseQuery<'_>,
+    ) -> ServerResult<ExecutableDocument> {
+        let doc = next.run(ctx, query, variables).await?;
+        // Over a socket (its connection data) only subscriptions run: a query there would
+        // skip the HTTP in-flight cap and request deadline.
+        if ctx.data_opt::<ConnSubs>().is_some() {
+            let query_op = match &doc.operations {
+                DocumentOperations::Single(op) => op.node.ty != OperationType::Subscription,
+                DocumentOperations::Multiple(m) => m
+                    .values()
+                    .any(|op| op.node.ty != OperationType::Subscription),
+            };
+            if query_op {
+                kdx_metrics::get().graphql_rejected("ws_query");
+                return Err(server(
+                    Code::NotSupported,
+                    "only subscriptions run over the websocket; send queries over HTTP",
+                ));
+            }
+        }
+        Ok(doc)
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        operation_name: Option<&str>,
+        next: NextExecute<'_>,
+    ) -> async_graphql::Response {
+        // An HTTP request carries its deadline; a subscription message gets its own.
+        if ctx.data_opt::<ReqCtx>().is_some() {
+            return next.run(ctx, operation_name).await;
+        }
+        let budget =
+            ctx.data_opt::<Gql>()
+                .and_then(|g| g.state().ok())
+                .map_or(MESSAGE_BUDGET, |st| {
+                    st.settings
+                        .deadline
+                        .saturating_sub(crate::http::DEADLINE_MARGIN)
+                });
+        let mut data = Data::default();
+        data.insert(ReqCtx {
+            deadline: Instant::now() + budget,
+        });
+        match tokio::time::timeout(budget, next.run_with_data(ctx, operation_name, data)).await {
+            Ok(r) => r,
+            Err(_) => async_graphql::Response::from_errors(vec![server(
+                Code::Timeout,
+                "message deadline exceeded",
+            )]),
+        }
+    }
+}
+
 /// The slots one subscription holds; dropping it releases them and the gauge.
 pub struct SubSlot {
     _conn: Option<OwnedSemaphorePermit>,
+    _client: Option<ConnGuard>,
     _proc: OwnedSemaphorePermit,
 }
 
@@ -106,6 +199,17 @@ pub fn acquire(ctx: &Context<'_>) -> async_graphql::Result<SubSlot> {
         })?),
         None => None,
     };
+    // M-2: per client over all its connections, and per IPv6 /48 (the rate limiter's key;
+    // an unattributed in-process caller has no client).
+    let client = match ctx.data_opt::<crate::ClientIp>() {
+        Some(ip) => Some(gql(ctx).ws.client_subs.try_acquire(ip.0).ok_or_else(|| {
+            to_err(limit(
+                "ws_subscriptions_per_client",
+                "too many subscriptions from this client",
+            ))
+        })?),
+        None => None,
+    };
     let proc_ = gql(ctx)
         .ws
         .subs
@@ -115,6 +219,7 @@ pub fn acquire(ctx: &Context<'_>) -> async_graphql::Result<SubSlot> {
     kdx_metrics::get().graphql_subscriptions.inc();
     Ok(SubSlot {
         _conn: conn,
+        _client: client,
         _proc: proc_,
     })
 }
@@ -132,7 +237,7 @@ fn refuse(status: StatusCode, code: Code, msg: &str) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_vec(&r).unwrap_or_default(),
+        crate::error::wire_json(&r).unwrap_or_default(),
     )
         .into_response()
 }
@@ -216,21 +321,42 @@ async fn drive(
     let per_conn = Arc::new(Semaphore::new(settings.ws_subs_per_conn));
     let inited = Arc::new(AtomicBool::new(false));
     let over_rate = Arc::new(AtomicBool::new(false));
+    let stop_code = Arc::new(std::sync::atomic::AtomicU16::new(0));
     let (mut sink, mut source) = socket.split();
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(INBOX);
 
-    // Reader: one rate token per client message; oversize and protocol errors end it.
+    // Reader: one rate token per client message. Oversize, protocol errors and a client out
+    // of tokens stop the forwarding (L-3): the reason is kept for the close frame, and the
+    // reader keeps draining what the client still sends, so the connection is closed with
+    // a frame (1009, 1002, 4429) and not reset under unread data.
     let rate = over_rate.clone();
-    let reader = tokio::spawn(async move {
+    let stop = stop_code.clone();
+    let mut reader = tokio::spawn(async move {
+        let mut fwd = Some(in_tx);
         while let Some(msg) = source.next().await {
-            let Ok(msg) = msg else {
-                kdx_metrics::get().graphql_rejected("ws_message");
-                break;
+            let msg = match msg {
+                Ok(Message::Close(_)) => break,
+                Ok(_) if fwd.is_none() => continue,
+                Ok(m) => m,
+                Err(e) => {
+                    if fwd.take().is_some() {
+                        kdx_metrics::get().graphql_rejected("ws_message");
+                        let code = if e.to_string().contains("too long") {
+                            1009
+                        } else {
+                            1002
+                        };
+                        stop.store(code, Ordering::Release);
+                    }
+                    break;
+                }
             };
             if !st.allow_ip(ip, 1) {
                 kdx_metrics::get().graphql_rejected("ws_rate");
                 rate.store(true, Ordering::Release);
-                break;
+                stop.store(4429, Ordering::Release);
+                fwd = None;
+                continue;
             }
             let bytes = match msg {
                 Message::Text(t) => t.as_bytes().to_vec(),
@@ -238,7 +364,8 @@ async fn drive(
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) => continue,
             };
-            if in_tx.send(bytes).await.is_err() {
+            let Some(tx) = &fwd else { continue };
+            if tx.send(bytes).await.is_err() {
                 break;
             }
         }
@@ -251,6 +378,8 @@ async fn drive(
         );
     let mut data = Data::default();
     data.insert(ConnSubs(per_conn.clone()));
+    // Per-client gates (search, S-5) key on it; operations over this socket carry it.
+    data.insert(crate::ClientIp(ip));
     let init_flag = inited.clone();
     let gql_ws = GqlWebSocket::new((*schema).clone(), incoming, protocol)
         .connection_data(data)
@@ -278,10 +407,12 @@ async fn drive(
                 }
                 Some(WsMessage::Close(code, reason)) => break Some((code, reason)),
                 None => {
-                    break if over_rate.load(Ordering::Acquire) {
-                        Some((4429, "rate limit".into()))
-                    } else {
-                        None
+                    break match stop_code.load(Ordering::Acquire) {
+                        4429 => Some((4429, "rate limit".into())),
+                        1009 => Some((1009, "message too big".into())),
+                        1002 => Some((1002, "protocol error".into())),
+                        _ if over_rate.load(Ordering::Acquire) => Some((4429, "rate limit".into())),
+                        _ => None,
                     };
                 }
             },
@@ -313,6 +444,64 @@ async fn drive(
             sink.send(Message::Close(Some(frame))),
         )
         .await;
+        // Let the reader drain until the client answers the close (L-3), briefly.
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut reader).await;
     }
     reader.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use async_graphql::{EmptyMutation, Object, Schema, Subscription};
+    use futures::stream::{self, Stream};
+
+    use super::*;
+
+    struct Q;
+
+    #[Object]
+    impl Q {
+        async fn a(&self) -> i32 {
+            1
+        }
+    }
+
+    struct Tick;
+
+    #[Object]
+    impl Tick {
+        /// Milliseconds left until the deadline the message's resolvers see (-1: none).
+        async fn left(&self, ctx: &Context<'_>) -> i64 {
+            ctx.data_opt::<ReqCtx>().map_or(-1, |r| {
+                r.deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as i64
+            })
+        }
+    }
+
+    struct S;
+
+    #[Subscription]
+    impl S {
+        async fn ticks(&self) -> impl Stream<Item = Tick> {
+            stream::iter([Tick, Tick])
+        }
+    }
+
+    /// I-2: every subscription message runs under one deadline of its own.
+    #[tokio::test]
+    async fn every_subscription_message_has_a_deadline() {
+        let schema = Schema::build(Q, EmptyMutation, S).extension(WsOps).finish();
+        let items: Vec<_> = schema
+            .execute_stream("subscription { ticks { left } }")
+            .collect()
+            .await;
+        assert_eq!(items.len(), 2);
+        for r in items {
+            let v = r.data.into_json().unwrap();
+            let left = v["ticks"]["left"].as_i64().unwrap();
+            assert!((1..=5_000).contains(&left), "{v}");
+        }
+    }
 }

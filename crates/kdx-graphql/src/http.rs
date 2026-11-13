@@ -25,7 +25,7 @@ use crate::{KdxSchema, ReqCtx};
 
 /// Time kept back from the request deadline to answer `TIMEOUT` as GraphQL before the
 /// guard's 504.
-const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+pub(crate) const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
 
 /// The `/graphql` routes (`Api::graphql_routes` adds the guard, tracking and CORS).
 pub fn router(schema: KdxSchema) -> Router<Arc<ApiState>> {
@@ -84,7 +84,7 @@ pub fn variables(v: serde_json::Value) -> Option<Variables> {
 
 fn error_body(status: StatusCode, e: async_graphql::ServerError) -> HttpResponse {
     let r = Response::from_errors(vec![e]);
-    json_response(status, &serde_json::to_vec(&r).unwrap_or_default())
+    json_response(status, &crate::error::wire_json(&r).unwrap_or_default())
 }
 
 fn json_response(status: StatusCode, body: &[u8]) -> HttpResponse {
@@ -234,8 +234,10 @@ async fn execute(
     }
     let budget = st.settings.deadline.saturating_sub(DEADLINE_MARGIN);
     let deadline = Instant::now() + budget;
-    let ip = peer.map(|p| st.client_ip_of(p, headers));
-    let batch = batch.data(ReqCtx { deadline, ip });
+    let mut batch = batch.data(ReqCtx { deadline });
+    if let Some(p) = peer {
+        batch = batch.data(crate::ClientIp(st.client_ip_of(p, headers)));
+    }
     let resp = match tokio::time::timeout(budget, schema.execute_batch(batch)).await {
         Ok(r) => r,
         Err(_) => {
@@ -251,7 +253,7 @@ async fn execute(
         BatchResponse::Batch(rs) => rs.iter().map(outcome).max().unwrap_or(Outcome::Ok),
     };
     kdx_metrics::get().graphql_request(kind, result.label());
-    match serde_json::to_vec(&resp) {
+    match crate::error::wire_json(&resp) {
         Ok(b) => json_response(StatusCode::OK, &b),
         Err(e) => {
             tracing::error!(error = %e, "graphql: response serialization");

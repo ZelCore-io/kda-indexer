@@ -6,6 +6,7 @@
 //! - Rows of a module marked not fungible are never served (as native).
 //! - `…ByPublicKey` lists only rows whose guard holds the key, of `coin` (the default
 //!   `fungibleName`, SEC-2) or of a module confirmed `fungible-v2` on the row's chain (I-6).
+//!   At most [`MAX_KEY_ACCOUNTS`] matching accounts; a cut answer is flagged (L-2).
 
 use async_graphql::{Context, Object, Result, ID};
 use kdx_api::{ApiResult, View};
@@ -126,44 +127,46 @@ pub fn chain_account_in(
         }))
 }
 
-/// Accounts whose guard holds `pk`, with only those rows (on `chain` when given).
+/// Accounts whose guard holds `pk`, with only those rows (on `chain` when given): at most
+/// [`MAX_KEY_ACCOUNTS`] of them, and `true` when the walk stopped before the key's last
+/// `KeyAccounts` row (L-2). The module filter runs on every candidate before the cut, so
+/// accounts of other modules (anyone can guard a spam account with any key) never crowd
+/// out the asked module's. The walk stops at the cap or after
+/// [`SCAN_WINDOW`](crate::txlist::SCAN_WINDOW) and answers what it found, flagged.
 fn by_key(
     view: &View,
     pk: &str,
     module: &str,
     chain: Option<u8>,
-) -> ApiResult<Vec<FungibleAccount>> {
+) -> ApiResult<(Vec<FungibleAccount>, bool)> {
     let d = view.dict();
     let Some(m) = d.find(DictKind::Module, module) else {
-        return Ok(vec![]);
+        return Ok((vec![], false));
     };
     if hidden(view, m)? {
-        return Ok(vec![]);
+        return Ok((vec![], false));
     }
     let coin = balances::coin_module(&view.txn)?;
     let kh = key_hash(pk);
+    let stop_at = view
+        .deadline
+        .min(std::time::Instant::now() + crate::txlist::SCAN_WINDOW);
     let mut out = Vec::new();
-    for (k, _) in view
-        .txn
-        .scan_limit(Table::KeyAccounts, &kh, MAX_KEY_ACCOUNTS, |k| {
-            k.starts_with(&kh)
-        })?
-    {
-        view.check_deadline()?;
-        let Some(a) = k
-            .get(16..20)
-            .and_then(|b| b.try_into().ok())
-            .map(u32::from_be_bytes)
-        else {
-            continue;
-        };
-        let Some(name) = d.name(DictKind::Account, a).map(str::to_owned) else {
-            continue;
-        };
+    let mut truncated = false;
+    let mut failed = None;
+    // One account's rows of `m`, kept when present, on `chain`, trusted and guarded by `pk`.
+    let rows_of = |a: u32| -> ApiResult<Vec<ChainRow>> {
+        let mut prefix = a.to_be_bytes().to_vec();
+        prefix.extend_from_slice(&m.to_be_bytes());
         let mut rows = Vec::new();
-        for (rm, c, r) in balances::account_rows(&view.txn, a)? {
-            if rm != m
-                || r.absent
+        for (k, v) in view
+            .txn
+            .scan_limit(Table::Balances, &prefix, 256, |k| k.starts_with(&prefix))?
+        {
+            let (Some((_, _, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
+                continue;
+            };
+            if r.absent
                 || chain.is_some_and(|x| x != c)
                 || !balances::trusted(&view.txn, m, c, coin)?
                 || !balances::stored_guard_keys(&view.txn, &r.guard, c)?
@@ -178,15 +181,44 @@ fn by_key(
                 guard: guard_of(view, &r.guard, c)?,
             });
         }
-        if !rows.is_empty() {
-            out.push(FungibleAccount {
-                account: name,
+        Ok(rows)
+    };
+    view.txn.walk_keys(Table::KeyAccounts, &kh, |k| {
+        if !k.starts_with(&kh) {
+            return false;
+        }
+        if out.len() >= MAX_KEY_ACCOUNTS || std::time::Instant::now() >= stop_at {
+            truncated = true;
+            return false;
+        }
+        let Some(a) = k
+            .get(16..20)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_be_bytes)
+        else {
+            return true;
+        };
+        let Some(name) = d.name(DictKind::Account, a) else {
+            return true;
+        };
+        match rows_of(a) {
+            Ok(rows) if rows.is_empty() => {}
+            Ok(rows) => out.push(FungibleAccount {
+                account: name.to_owned(),
                 module: module.to_owned(),
                 rows,
-            });
+            }),
+            Err(e) => {
+                failed = Some(e);
+                return false;
+            }
         }
+        true
+    })?;
+    if let Some(e) = failed {
+        return Err(e);
     }
-    Ok(out)
+    Ok((out, truncated))
 }
 
 /// A non-negative decimal text (`12`, `0.5`, `9.666e-5`) as `(integer digits, fraction
@@ -552,11 +584,15 @@ pub async fn accounts_by_public_key(
 ) -> Result<Vec<FungibleAccount>> {
     let pk = crate::txlist::name_arg("publicKey", public_key)?.to_owned();
     let module = crate::txlist::name_arg("fungibleName", module.unwrap_or("coin"))?.to_owned();
-    gql(ctx)
+    let (out, truncated) = gql(ctx)
         .state()?
         .read(move |view| by_key(view, &pk, &module, chain))
         .await
-        .map_err(from_api)
+        .map_err(from_api)?;
+    if truncated {
+        crate::flags::mark(ctx, crate::flags::Flag::KeyAccountsTruncated);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -632,7 +668,9 @@ pub async fn query_balance(
     if (first.is_some() && before.is_some()) || (last.is_some() && after.is_some()) {
         return Err(bad_input("after goes with first, before with last"));
     }
-    let probe = PageArgs::new(None, None, first, last).parse(&g.settings)?;
+    let probe = PageArgs::new(None, None, first, last)
+        .wide()
+        .parse(&g.settings)?;
     let dir = if last.is_some() || (first.is_none() && before.is_some()) {
         Dir::Backward
     } else {
@@ -769,5 +807,97 @@ mod balance_tests {
         for bad in ["", "!!", "YmFsMTp4", "YmFsMjoxOmNvaW4"] {
             assert!(decode_balance_cursor(bad).is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod by_key_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kdx_api::{Api, ApiSettings, ApiState, Store, TipWatch};
+    use kdx_hot::balances::{bal_key, guard_hash, key_account_key, key_hash, BalanceRow};
+    use kdx_hot::{HotDict, Table};
+    use kdx_types::{DictKind, DictMut};
+
+    use super::by_key;
+
+    /// `k1` guards 150 accounts of `free.spam` and then one `coin` account, `victim`
+    /// (interned last, so its `KeyAccounts` row sorts last); `k2` guards 101 `coin` accounts.
+    fn fixture() -> (tempfile::TempDir, Arc<ApiState>) {
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+        let mut w = hot.rw().unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        let coin = dict.intern(DictKind::Module, "coin");
+        let spam = dict.intern(DictKind::Module, "free.spam");
+        let mut rows = Vec::new();
+        for i in 0..150 {
+            rows.push(("k1", dict.intern(DictKind::Account, &format!("s{i}")), spam));
+        }
+        rows.push(("k1", dict.intern(DictKind::Account, "victim"), coin));
+        for i in 0..101 {
+            rows.push(("k2", dict.intern(DictKind::Account, &format!("c{i}")), coin));
+        }
+        dict.persist(&mut w).unwrap();
+        for (pk, acct, m) in rows {
+            let guard = format!(r#"{{"keys":["{pk}"],"pred":"keys-all"}}"#);
+            let gh = guard_hash(guard.as_bytes());
+            w.put(Table::Guards, &gh, guard.as_bytes()).unwrap();
+            let row = BalanceRow {
+                absent: false,
+                balance: "1".into(),
+                guard: gh,
+                as_of: 1,
+                reconciled_at: 1,
+                unverified: false,
+            };
+            w.put(Table::Balances, &bal_key(acct, m, 0), &row.encode())
+                .unwrap();
+            w.put(
+                Table::KeyAccounts,
+                &key_account_key(&key_hash(pk), acct),
+                &[],
+            )
+            .unwrap();
+        }
+        w.commit().unwrap();
+        let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        let settings = ApiSettings {
+            network: "mainnet01".into(),
+            deadline: Duration::from_secs(5),
+            max_in_flight: 16,
+            max_body_bytes: 8 << 20,
+            v1txs_max_body_bytes: 8 << 20,
+            rate_per_ip: 20,
+            rate_burst: 40,
+            trusted_proxies: Vec::new(),
+            read_threads: 2,
+            ready_max_lag: 10,
+            max_event_lists: 64,
+        };
+        (d, Api::new(store, settings, TipWatch::default()).state())
+    }
+
+    async fn names(st: &Arc<ApiState>, pk: &'static str) -> (Vec<String>, bool) {
+        let (accts, cut) = st
+            .read(move |view| by_key(view, pk, "coin", None))
+            .await
+            .unwrap();
+        (accts.into_iter().map(|a| a.account).collect(), cut)
+    }
+
+    /// L-2: rows of other modules never crowd the asked module out of the 100-account cut,
+    /// and a cut answer says so.
+    #[tokio::test]
+    async fn module_filter_runs_before_the_cut_and_a_cut_is_flagged() {
+        let (_d, st) = fixture();
+        assert_eq!(names(&st, "k1").await, (vec!["victim".to_owned()], false));
+        let (k2, cut) = names(&st, "k2").await;
+        assert_eq!((k2.len(), cut), (super::MAX_KEY_ACCOUNTS, true));
     }
 }

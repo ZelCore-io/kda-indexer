@@ -1,8 +1,9 @@
 //! Relay node ids (GQ-7): Kadena graph's global id format, standard base64 (with padding)
 //! of `<TypeName>:<key>`. The key is the natural key of the type: the block hash for
 //! `Block`, the account name for `NonFungibleAccount`, else a compact JSON array of the key
-//! fields in Kadena graph's order (numbers as JSON numbers). Captured client responses
-//! decide if they differ (the captured format wins).
+//! fields in Kadena graph's order. The deployed oracle writes the numeric elements (order
+//! index, chain) as JSON strings (`["hash","1","rk"]`, R-P5P9-19), so ids are encoded that
+//! way; decoding takes a number or a numeric string.
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
@@ -89,7 +90,7 @@ impl NodeKey {
 
     fn key_text(&self) -> String {
         let s = |v: &str| Value::String(v.to_owned());
-        let n = |v: i64| Value::Number(v.into());
+        let n = |v: i64| Value::String(v.to_string());
         let arr = |v: Vec<Value>| Value::Array(v).to_string();
         match self {
             NodeKey::Block { hash } => hash.clone(),
@@ -162,7 +163,11 @@ pub fn decode(id: &str) -> Result<NodeKey, IdError> {
         }
     };
     let s = |v: &Value| v.as_str().map(str::to_owned).ok_or(IdError);
-    let n = |v: &Value| v.as_i64().ok_or(IdError);
+    // A number or a numeric string (the oracle's form).
+    let n = |v: &Value| match v {
+        Value::String(t) => t.parse::<i64>().map_err(|_| IdError),
+        v => v.as_i64().ok_or(IdError),
+    };
     let k = match ty {
         "Block" => NodeKey::Block {
             hash: key.to_owned(),
@@ -293,7 +298,52 @@ mod tests {
             order_index: 2,
             request_key: "r".into(),
         });
-        assert_eq!(STANDARD.decode(&id).unwrap(), br#"Event:["h",2,"r"]"#);
+        assert_eq!(STANDARD.decode(&id).unwrap(), br#"Event:["h","2","r"]"#);
+        let id = encode(&NodeKey::Transfer {
+            block_hash: "h".into(),
+            chain: 1,
+            order_index: 0,
+            module_hash: "m".into(),
+            request_key: "r".into(),
+        });
+        assert_eq!(
+            STANDARD.decode(&id).unwrap(),
+            br#"Transfer:["h","1","0","m","r"]"#
+        );
+        let id = encode(&NodeKey::Signer {
+            request_key: "r".into(),
+            order_index: 3,
+        });
+        assert_eq!(STANDARD.decode(&id).unwrap(), br#"Signer:["r","3"]"#);
+    }
+
+    #[test]
+    fn numeric_elements_decode_from_numbers_and_strings() {
+        let ev = |t: &str| decode(&STANDARD.encode(t)).unwrap();
+        let want = NodeKey::Event {
+            block_hash: "h".into(),
+            order_index: 2,
+            request_key: "r".into(),
+        };
+        assert_eq!(ev(r#"Event:["h","2","r"]"#), want);
+        assert_eq!(ev(r#"Event:["h",2,"r"]"#), want);
+        assert_eq!(
+            ev(r#"Transfer:["h","1",0,"m","r"]"#),
+            NodeKey::Transfer {
+                block_hash: "h".into(),
+                chain: 1,
+                order_index: 0,
+                module_hash: "m".into(),
+                request_key: "r".into(),
+            }
+        );
+        assert_eq!(
+            ev(r#"Signer:["r","3"]"#),
+            NodeKey::Signer {
+                request_key: "r".into(),
+                order_index: 3
+            }
+        );
     }
 
     #[test]

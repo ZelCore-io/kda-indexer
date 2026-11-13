@@ -1091,7 +1091,9 @@ impl Ctx {
                 );
             }
         };
-        // Oracle server faults are its own (R3E-14 material), not a compare.
+        // Oracle server faults are its own (R3E-14 material), not a compare. Class
+        // `oracle-fault` (shown in errB): a node pair that covers the operation stands in for
+        // it at the gate (R-P5P9-19).
         if b.status >= 500 || b.error_codes().iter().any(|c| c == "INTERNAL_SERVER_ERROR") {
             return self.gql_record(
                 op,
@@ -1102,7 +1104,7 @@ impl Ctx {
                 Some(b.status),
                 &b.raw,
                 Vec::new(),
-                "b-error",
+                "oracle-fault",
                 &[],
                 Some("oracle server error".into()),
             );
@@ -1740,10 +1742,64 @@ mod tests {
         v
     }
 
+    /// The capture-style stems (`"<Name>-<8 lowercase hex>"`) in `text`.
+    fn capture_stems(text: &str) -> Vec<&str> {
+        let b = text.as_bytes();
+        let mut out = Vec::new();
+        for (i, _) in text.match_indices('-') {
+            let Some(hex) = b.get(i + 1..i + 9) else {
+                continue;
+            };
+            let hex_ok = hex
+                .iter()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c));
+            if !hex_ok || b.get(i + 9) != Some(&b'"') {
+                continue;
+            }
+            let start = b[..i]
+                .iter()
+                .rposition(|c| !c.is_ascii_alphabetic())
+                .map_or(0, |p| p + 1);
+            if start > 0 && start < i && b[start - 1] == b'"' {
+                out.push(&text[start..i + 9]);
+            }
+        }
+        out
+    }
+
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// M1: no committed source names a captured operation by its capture stem (operation
+    /// name plus capture sha); the capture set stays out of the public repo.
+    #[test]
+    fn no_capture_stems_in_sources() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        rust_files(&crates, &mut files);
+        assert!(files.len() > 10);
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let hits = capture_stems(&text);
+            assert!(hits.is_empty(), "{}: {hits:?}", f.display());
+        }
+    }
+
     #[test]
     fn parse_variables_and_roots() {
         let op = parse_op(
-            "BlocksByHeight-7d3a4973",
+            "QBlocks-test",
             "# kdx-compare note\nquery X($startHeight: Int!, $chainIds: [String!], $first: Int = 5) {\n blocksFromHeight(startHeight: $startHeight, chainIds: $chainIds, first: $first) { edges { node { hash } } }\n lastBlockHeight\n}",
             true,
         )

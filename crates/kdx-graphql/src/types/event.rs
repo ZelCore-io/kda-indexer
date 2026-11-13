@@ -37,10 +37,10 @@ impl Event {
         block_node(&self.d.block)
     }
     async fn chain_id(&self) -> BigInt {
-        BigInt(i128::from(self.d.key().chain()))
+        BigInt::new(i128::from(self.d.key().chain()))
     }
     async fn height(&self) -> BigInt {
-        BigInt(i128::from(self.d.key().height()))
+        BigInt::new(i128::from(self.d.key().height()))
     }
     pub async fn id(&self) -> Result<ID> {
         Ok(ID(encode(&NodeKey::Event {
@@ -61,7 +61,7 @@ impl Event {
             .to_owned()
     }
     async fn order_index(&self) -> BigInt {
-        BigInt(i128::from(self.ord_idx()))
+        BigInt::new(i128::from(self.ord_idx()))
     }
     async fn parameter_text(&self) -> String {
         shapes::param_text(&self.ev().params)

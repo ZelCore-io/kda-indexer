@@ -2,7 +2,10 @@
 //! normalised (sorted, descriptions dropped). Names, arguments, argument defaults, types and
 //! nullability, interfaces, union members and deprecations must be identical, except for the
 //! pinned ZelCore extensions (`tests/extensions.txt`, R-P5P9-16): our schema is Kadena's
-//! plus those additive lines, with one relaxed argument (`RELAXED`).
+//! plus those additive lines, with one relaxed argument (`RELAXED`). Wire formats that follow
+//! the oracle (strings for `gasLimit`, `ttl`, `gas`, `transactionId`, `gasPrice`,
+//! `Transfer.amount`, `Block.nonce`; a number for `Block.difficulty`; R-P5P9-19) change no
+//! type in the SDL, so nothing is pinned for them here; `docs/graphql.md` lists them.
 
 use std::collections::BTreeSet;
 

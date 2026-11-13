@@ -143,6 +143,8 @@ async fn introspection_and_unserved_fields() {
     )
     .await;
     assert_eq!(v["errors"][0]["extensions"]["code"], "NOT_SUPPORTED", "{v}");
+    // The oracle sends the code top-level: a copy rides along with `extensions.code`.
+    assert_eq!(v["errors"][0]["code"], "NOT_SUPPORTED", "{v}");
     assert_eq!(
         v["data"]["graphConfiguration"]["minimumBlockHeight"], 0,
         "{v}"
@@ -216,3 +218,165 @@ async fn get_and_upgrade() {
 
 /// graphql-js `getIntrospectionQuery()` (v16, default options).
 const INTROSPECTION: &str = include_str!("introspection.graphql");
+
+/// A fragment bomb (C-1): `F{i}` spreads `F{i-1}` twice, so `F{n}` expands to 2^n fields in
+/// about 50 bytes per level.
+fn bomb(n: usize) -> String {
+    let mut s = String::from("fragment F0 on Transaction { hash } ");
+    for i in 1..=n {
+        s += &format!(
+            "fragment F{i} on Transaction {{ ...F{p} ...F{p} }} ",
+            p = i - 1
+        );
+    }
+    s + &format!("{{ transactions(first: 1) {{ edges {{ node {{ ...F{n} }} }} }} }}")
+}
+
+/// CPU time of the calling thread.
+fn thread_cpu() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    assert_eq!(r, 0);
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+#[tokio::test]
+async fn fragment_bomb_is_refused_before_any_unbounded_walk() {
+    let f = fixture();
+    // A current-thread runtime: the whole request runs on this thread, so its CPU time is
+    // the request's.
+    for n in [20, 26, 28, 40, 60] {
+        let q = bomb(n);
+        assert!(q.len() < 4096, "{}", q.len());
+        let cpu = thread_cpu();
+        let (s, v, el) = query(&f, &q).await;
+        let cpu = thread_cpu() - cpu;
+        assert_eq!(
+            (s, limit_of(&v)),
+            (StatusCode::OK, Some("complexity")),
+            "{v}"
+        );
+        let msg = v["errors"][0]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("fragment expansion"), "{msg}");
+        assert!(
+            cpu < Duration::from_millis(50),
+            "n={n}: {cpu:?} CPU ({el:?})"
+        );
+    }
+    // The directive cap now lives in the bounded walk: 8 pass the limits, 9 are refused.
+    let on_field = |k: usize| format!("{{ lastBlockHeight {} }}", "@include(if: true) ".repeat(k));
+    let (_, v, _) = query(&f, &on_field(9)).await;
+    assert_eq!(limit_of(&v), Some("directives"), "{v}");
+    let (_, v, _) = query(&f, &on_field(8)).await;
+    assert_ne!(limit_of(&v), Some("directives"), "{v}");
+    // On a spread and on an inline fragment, and inside a fragment.
+    let spread = format!(
+        "fragment A on Query {{ lastBlockHeight }} {{ ...A {} }}",
+        "@include(if: true) ".repeat(9)
+    );
+    let (_, v, _) = query(&f, &spread).await;
+    assert_eq!(limit_of(&v), Some("directives"), "{v}");
+    let inline = format!(
+        "{{ ... on Query {} {{ lastBlockHeight }} }}",
+        "@include(if: true) ".repeat(9)
+    );
+    let (_, v, _) = query(&f, &inline).await;
+    assert_eq!(limit_of(&v), Some("directives"), "{v}");
+    let inside = format!(
+        "fragment A on Query {{ lastBlockHeight {} }} {{ ...A }}",
+        "@include(if: true) ".repeat(9)
+    );
+    let (_, v, _) = query(&f, &inside).await;
+    assert_eq!(limit_of(&v), Some("directives"), "{v}");
+}
+
+/// Serves the GraphQL router and a `/healthz` stand-in (another listener) on their own
+/// 4-worker runtime, so a pinned worker there cannot stop the test's own timers.
+fn serve_apart(f: &Fixture) -> (std::net::SocketAddr, std::net::SocketAddr) {
+    let st = f.st.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let app =
+                router(build_schema(st.clone(), GraphqlSettings::default(), None)).with_state(st);
+            let health =
+                axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" }));
+            let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tx.send((a.local_addr().unwrap(), b.local_addr().unwrap()))
+                .unwrap();
+            let a = axum::serve(
+                a,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            );
+            let b = axum::serve(b, health);
+            let _ = tokio::join!(a, b);
+        });
+    });
+    rx.recv().unwrap()
+}
+
+/// One HTTP/1.1 exchange on a fresh connection: the status line and the body.
+async fn raw(addr: std::net::SocketAddr, method: &str, path: &str, body: &str) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    c.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).await.unwrap();
+    let out = String::from_utf8_lossy(&out).to_string();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    (
+        head.lines().next().unwrap_or("").to_string(),
+        body.to_string(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_fragment_bombs_leave_other_listeners_answering() {
+    let f = fixture();
+    let (gql, health) = serve_apart(&f);
+    let body = json!({ "query": bomb(28) }).to_string();
+    let t = Instant::now();
+    let bombs: Vec<_> = (0..14)
+        .map(|_| {
+            let body = body.clone();
+            tokio::spawn(async move { raw(gql, "POST", "/graphql", &body).await })
+        })
+        .collect();
+    // While the bombs are in flight, the other listener keeps answering.
+    for _ in 0..5 {
+        let h = Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(2), raw(health, "GET", "/healthz", ""))
+            .await
+            .expect("/healthz did not answer within 2 s");
+        assert!(r.0.contains("200"), "{r:?}");
+        assert!(
+            h.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            h.elapsed()
+        );
+    }
+    for b in bombs {
+        let (status, body) = tokio::time::timeout(Duration::from_secs(5), b)
+            .await
+            .expect("a bomb was not answered within 5 s")
+            .unwrap();
+        assert!(status.contains("200"), "{status}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(limit_of(&v), Some("complexity"), "{v}");
+    }
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+}
