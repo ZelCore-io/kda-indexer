@@ -152,6 +152,127 @@ request_contains = "search=8ce71ed5a3b5a63ebf%22+%28rea&minheight=5058068"
 reason = "chainweb-data lists request key uz40uGd0... at chain 4, height 5058119 in a block that is not on the node's canonical branch (kda-indexer lists it in the node's canonical block) and at another position among the rows of that height, so the page differs from row 10 on (seen live 2026-11-13 00:11Z, re-checked 07:00Z). The harness has no orphan or tie handling on /txs/search yet (FV item T-3), so this entry is tied to one request; it hides every diff on that request."
 owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-46 (run 6E-3)."
 
+# --- Run 6E-3 oracle defects (ruling R-P5P9-47; node evidence in the run 6E-3 report) ---
+
+[[entry]]
+id = "cwd-hole-tx-au4cjml8"
+route = "tx"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "Au4cjML8"
+reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): /txs/tx for request key Au4cjML8... answers 404 on chainweb-data. The node's /poll on chain 4 has the tx in block 7TUVaPeB..., which is canonical at height 7392363 (the block kda-indexer lists). Seen live 2026-11-13 02:34Z. The harness checks behind cwd-events-missing-node and kdatxs-missing-node do not cover a chainweb-data 404 on a canonical tx (FV item T-3), so this entry is tied to one request key."
+owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "cwd-hole-txs-au4cjml8"
+route = "txs"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "Au4cjML8"
+reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): /txs/txs for request key Au4cjML8... lists no row on chainweb-data; the node holds the tx in canonical block 7TUVaPeB... (chain 4, height 7392363), the block kda-indexer lists. Seen live 2026-11-13 02:34Z. Tied to one request key until the harness gets a node check for chainweb-data 404/empty answers (FV item T-3)."
+owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "cwd-hole-events-7392263"
+route = "events"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "minheight=7392263"
+reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): the coin.TRANSFER_XCHAIN window 7392263-7392463 lacks three rows on chainweb-data that kda-indexer lists (chain 15 height 7392417 VBgVmfxK..., chain 8 height 7392417 hACgFo2g..., chain 1 height 7392416 qnXrjXqA...). The node's /poll has each in the block kda-indexer lists, which is canonical, with 4 events. Seen live 2026-11-13 02:34Z. The per-row events check of cwd-events-missing-node did not fire here (FV item T-3), so this entry is tied to the window's minheight."
+owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "kdatxs-gap-cont-d7bf62"
+route = "v1txs"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "d7bf62"
+reason = "kda-txs lists no row for a transfer-crosschain continuation (request key 4GTkBWgc..., chain 2, height 7124688, code null) that kda-indexer lists at /9 of k:d7bf62.../coin/250. The node's /poll has it in block ljtUuFCZ..., which is canonical, with 4 events and 3 of them naming the account. Seen live 2026-11-13 02:00Z. The kdatxs-gap and kdatxs-missing-node checks did not fire (FV item T-3), so this entry is tied to one account."
+owner_note = "Oracle defect under ruling R3E-15 (node agrees with kda-indexer, kda-txs differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "balances-tip-skew-e7f7130f"
+route = "balances"
+json_path_glob = "/**"
+condition = "changed"
+request_contains = "e7f7130f"
+reason = "native /balances against the node's /local, token coin chain 12: kda-indexer answered as_of 7400410 with 32186.381987524380 and the node at 7400412 with 32187.286033524380. The difference is exactly one coinbase of 0.904046 to this miner account at 7400412 (compat /txs/account lists it). The harness skew rule covers a one-height gap and missed this two-height one (FV item T-3). Seen live 2026-11-13 07:38Z."
+owner_note = "Tip skew, not a kda-indexer diff; allowlisted by ruling R-P5P9-47 (run 6E-3 report), tied to one account."
+
+# --- /txs/search records of run 6E-3 (ruling R-P5P9-47) ---
+
+[[entry]]
+id = "cwd-search-hole-au4cjml8"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "pactid=Au4cjML8"
+reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): chainweb-data lists nothing for pact Au4cjML8..., while kda-indexer lists its 2 continuations at chain 1 height 7392368, which are canonical on the node (seen live 2026-11-13 02:34Z). Tied to one pact until the harness has a node check on /txs/search (FV item T-3)."
+owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "cwd-search-hole-h3st"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "pactid=h3St"
+reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): chainweb-data lists nothing for the rows kda-indexer lists for pact h3St... (chain 19 heights 7392051 and 7392087), which are canonical on the node; the page also holds one orphan row (seen live 2026-11-13 04:14Z). Tied to one pact until the harness has a node check on /txs/search (FV item T-3)."
+owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "cwd-search-behind-5unn"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "pactid=5unn"
+reason = "chainweb-data trails on chain 0 for this live pact: kda-indexer's top rows (heights 7400064 and above) are canonical on the node, while chainweb-data's newest row at that moment is 60-150 heights lower (4 records, seen live 2026-11-13 04:43Z to 07:16Z). Same class as oracle-tip-lag, whose clamp does not cover /txs/search (FV item T-3)."
+owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "cwd-search-behind-will"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "pactid=WiLl"
+reason = "chainweb-data trails on chain 2 for this live pact: kda-indexer's top rows (heights 7400312 and 7400313) are canonical on the node, while chainweb-data's newest row at that moment is 60-150 heights lower (2 records, seen live 2026-11-13 06:53Z and 07:00Z). Same class as oracle-tip-lag, whose clamp does not cover /txs/search (FV item T-3)."
+owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "cwd-search-orphan-srebx"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "pactid=sReB"
+reason = "chainweb-data lists rows of this pact in blocks that are not on the node's canonical branch (checked with /header/branch from the cut) or are unknown to the node; kda-indexer's blocks are canonical, and without the orphan rows the pages are equal (2 records, seen live 2026-11-13 07:10Z and 07:35Z). Tied to one pact until the harness has orphan handling on /txs/search (FV item T-3)."
+owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "oracle-unstable-search-jdgt"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "pactid=JDgT"
+reason = "chainweb-data answered 0 rows when the request was fetched again (2026-11-13 07:41Z); all of kda-indexer's rows are canonical on the node. The original chainweb-data rows were not kept, so the diff cannot be classified further."
+owner_note = "Oracle unstable under ruling R3E-15 / R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "oracle-unstable-search-payment-amount"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "payment-amount"
+reason = "chainweb-data answered 0 rows when the request (search=al 'payment-amount ))...) was fetched again (2026-11-13 07:17Z); all of kda-indexer's rows are canonical on the node. The original chainweb-data rows were not kept, so the diff cannot be classified further."
+owner_note = "Oracle unstable under ruling R3E-15 / R-P5P9-47 (run 6E-3 report)."
+
+[[entry]]
+id = "pactid-cap"
+route = "search"
+json_path_glob = "/**"
+condition = "any"
+request_contains = "pactid="
+reason = "/txs/search?pactid= reads only the newest 1,000 txs of a pact (PACT_CAP, R-P5P9-3 / Task 10). chainweb-data lists the pact's successful continuation first. On a pact with more than 1,000 txs that is mostly failed continuations, the old successful one is not among the newest 1,000, so kda-indexer never lists it (7 records on 4 pacts, wfSV..., hAPy..., rwdA... and gY1E..., seen live 2026-11-13 02:24Z to 08:01Z; the successful continuations are canonical, e.g. chain 1 height 6072365 and chain 5 height 5988947). Compat sends no Chainweb-Next on this route. Only pacts with more than 1,000 txs are affected."
+owner_note = "ACCEPTED as a documented compat limit (ruling R-P5P9-47; docs/api.md). The request alone cannot tell a capped pact from another one, so this entry hides every diff of a pactid request; it comes after the pact-specific entries so those keep their own hits. FV checks whether kadscan relies on the old successful continuation."
+
 [[entry]]
 id = "cwd-transfers-gap"
 route = "account"
