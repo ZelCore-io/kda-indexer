@@ -158,12 +158,22 @@ about 32,000 and is 14 deep. A list field may not repeat on one introspection pa
 | `connection_init` | within `ws_init_secs = 10` | close 4408 (`ws_init_timeout`) |
 | no subscription open | for `ws_idle_secs = 600` | close 4000 (`ws_idle`) |
 | client message or frame | 64 KB | close 1009 (`ws_message`); a malformed frame closes 1002 |
-| client messages | one per-IP rate token each (pings too) | close 4429 (`ws_rate`) |
+| client messages | one per-IP rate token each (pings too); the opening burst below may borrow | close 4429 (`ws_rate`) |
 | a client that does not read | 30 s per server message | close 4008 (`ws_slow_reader`) |
 | a chain whose feed read fails | 30 ticks in a row | that chain alone is skipped each tick (a WARN line with the chain and its failure count; the other chains keep delivering), then resumes from its tip with a gap |
 | a subscriber behind the feed | 1,024 feed items, or behind blocks the ring had to drop to stay within `feed_ring_mb = 64` MB of decoded blocks | one `INTERNAL` error; the subscription goes on from the feed's newest item |
 | a query or mutation over the socket | subscriptions only | `NOT_SUPPORTED` error, nothing runs (`ws_query`); send queries over HTTP |
 | one subscription message | the HTTP request deadline, shared by all its resolvers | `TIMEOUT` error for that message |
+
+Opening burst: a connection's first `ws_subs_per_conn + 2` messages (`connection_init`, a
+full set of subscribes and one more, which the per-connection cap refuses with `LIMIT`) may
+borrow up to that many tokens of the client's future refill when its bucket is empty. A
+client that fills a connection's subscriptions at once is therefore not closed for rate, even
+right after its other connections or HTTP requests used its burst. The borrow is one floor
+per client, not a grant per connection: the client's sustained rate stays `api.rate_per_ip`,
+its largest burst grows by at most `ws_subs_per_conn + 2`, the refill repays borrowed tokens
+before an HTTP request or a message outside an opening burst gets one, and a flood is still
+closed 4429.
 
 The per-client and per-/48 caps keep a few clients from holding every process slot: a
 kadscan page holds a handful of subscriptions on one connection, so one client fits several

@@ -13,7 +13,10 @@
 //! - a connection with no subscription for `ws_idle` is closed (4000);
 //! - a message (or frame) over [`MAX_MESSAGE`] closes the connection;
 //! - every client message takes one rate token of the client's IP; out of tokens closes
-//!   the connection (4429);
+//!   the connection (4429). A connection's first `ws_subs_per_conn + 2` messages
+//!   (`connection_init`, a full set of subscribes and one more) may borrow up to that many
+//!   tokens of the client's refill, so filling the per-connection cap in one burst is never
+//!   closed for rate (R-P5P9-57);
 //! - a client that does not read for [`SEND_TIMEOUT`] is closed, and a subscriber that falls
 //!   behind the feed's buffer gets an error (memory stays bounded).
 //!
@@ -335,10 +338,22 @@ async fn drive(
     // of tokens stop the forwarding (L-3): the reason is kept for the close frame, and the
     // reader keeps draining what the client still sends, so the connection is closed with
     // a frame (1009, 1002, 4429) and not reset under unread data.
+    //
+    // The opening burst (R-P5P9-57): the connection's first `ws_subs_per_conn + 2` messages
+    // (`connection_init`, a full set of subscribes and one more, which the cap refuses with
+    // LIMIT) may borrow up to that many tokens of the client's refill. A client that fills
+    // its per-connection cap at once is then not closed when its other connections or HTTP
+    // requests just drained its bucket. The borrow is a floor on the client's one bucket,
+    // not a grant per connection: it widens one burst by at most `opening`, the sustained
+    // rate stays `api.rate_per_ip`, and a flood is still closed.
+    let opening = u32::try_from(settings.ws_subs_per_conn)
+        .unwrap_or(u32::MAX)
+        .saturating_add(2);
     let rate = over_rate.clone();
     let stop = stop_code.clone();
     let mut reader = tokio::spawn(async move {
         let mut fwd = Some(in_tx);
+        let mut seen: u32 = 0;
         while let Some(msg) = source.next().await {
             let msg = match msg {
                 Ok(Message::Close(_)) => break,
@@ -357,7 +372,9 @@ async fn drive(
                     break;
                 }
             };
-            if !st.allow_ip(ip, 1) {
+            seen = seen.saturating_add(1);
+            let borrow = if seen <= opening { opening } else { 0 };
+            if !st.allow_ip_borrowing(ip, 1, borrow) {
                 kdx_metrics::get().graphql_rejected("ws_rate");
                 rate.store(true, Ordering::Release);
                 stop.store(4429, Ordering::Release);

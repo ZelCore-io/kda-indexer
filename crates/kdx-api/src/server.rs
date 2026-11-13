@@ -227,6 +227,13 @@ impl ApiState {
         self.limiter.allow_n(ip, n)
     }
 
+    /// As [`ApiState::allow_ip`], but the client's bucket may go as low as `-borrow`
+    /// ([`crate::limits::RateLimiter::allow_n_borrowing`]): a websocket connection's opening
+    /// burst (R-P5P9-57).
+    pub fn allow_ip_borrowing(&self, ip: std::net::IpAddr, n: u32, borrow: u32) -> bool {
+        self.limiter.allow_n_borrowing(ip, n, borrow)
+    }
+
     /// The client IP of a request (`trusted_proxies` applied, as the guard).
     pub fn client_ip_of(
         &self,

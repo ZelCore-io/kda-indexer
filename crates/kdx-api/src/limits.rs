@@ -272,22 +272,37 @@ impl RateLimiter {
         self.allow_n_at(ip, n, Instant::now())
     }
 
+    /// Take `n` tokens, letting the client's bucket go as low as `-borrow` (a websocket
+    /// connection's opening burst, R-P5P9-57). The refill repays borrowed tokens before a
+    /// take without a borrow succeeds, and no take goes below `-borrow`, so the sustained
+    /// rate stays `rate` and the largest burst a client gets grows by at most `borrow`,
+    /// however many connections it opens. Never from an overflow bucket: a new key under
+    /// eviction pressure takes its token as [`RateLimiter::allow_n`] does. `borrow = 0` is
+    /// `allow_n`.
+    pub fn allow_n_borrowing(&self, ip: IpAddr, n: u32, borrow: u32) -> bool {
+        self.take_at(ip, n, borrow, Instant::now())
+    }
+
     fn allow_at(&self, ip: IpAddr, now: Instant) -> bool {
         self.allow_n_at(ip, 1, now)
     }
 
     fn allow_n_at(&self, ip: IpAddr, n: u32, now: Instant) -> bool {
+        self.take_at(ip, n, 0, now)
+    }
+
+    fn take_at(&self, ip: IpAddr, n: u32, borrow: u32, now: Instant) -> bool {
         let need = n.max(1) as f64;
         let (rate, burst) = (self.rate, self.burst);
         let mut g = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         let (main, over) = &mut *g;
         let (tokens, pressured) = main.bucket(bucket_key(ip), now, rate, burst);
-        let tokens = if pressured {
-            over.bucket(overflow_key(ip), now, rate, burst).0
+        let (tokens, floor) = if pressured {
+            (over.bucket(overflow_key(ip), now, rate, burst).0, 0.0)
         } else {
-            tokens
+            (tokens, f64::from(borrow))
         };
-        if *tokens >= need {
+        if *tokens + floor >= need {
             *tokens -= need;
             true
         } else {
@@ -482,6 +497,90 @@ mod tests {
                 !l.allow_n_at(ip, 1, idle),
                 "idle time never banks more than burst"
             );
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                failure_persistence: None,
+                rng_seed: proptest::test_runner::RngSeed::Fixed(0x626f_7272_6f77),
+                ..ProptestConfig::default()
+            })]
+
+            /// R-P5P9-57: a take may borrow down to `-borrow`, exactly as the integer model
+            /// says, and however the borrows are spread, a client never gets more than
+            /// `burst + max borrow + rate × elapsed` tokens: borrowing widens one burst and
+            /// leaves the sustained rate alone.
+            #[test]
+            fn borrowing_matches_the_model_and_never_beats_the_rate(
+                rate in 1u32..20,
+                burst in 1u32..30,
+                max_borrow in 0u32..30,
+                ops in proptest::collection::vec(
+                    prop_oneof![
+                        (0u32..8).prop_map(|q| (q, 0u32, 0u32)),
+                        (1u32..4, 0u32..30).prop_map(|(n, b)| (0, n, b)),
+                    ],
+                    1..120,
+                ),
+            ) {
+                let l = RateLimiter::new(rate, burst);
+                let ip: IpAddr = "198.51.100.3".parse().unwrap();
+                let t0 = Instant::now();
+                let mut now = t0;
+                let cap = i64::from(burst) * 1000;
+                let mut tokens = cap;
+                let mut granted = 0i64;
+                for (wait, n, borrow) in ops {
+                    if n == 0 {
+                        now += Duration::from_millis(250 * u64::from(wait));
+                        tokens = (tokens + i64::from(rate) * 250 * i64::from(wait)).min(cap);
+                        continue;
+                    }
+                    let borrow = borrow.min(max_borrow);
+                    let want = i64::from(n) * 1000;
+                    let allowed = l.take_at(ip, n, borrow, now);
+                    prop_assert_eq!(
+                        allowed,
+                        tokens + i64::from(borrow) * 1000 >= want,
+                        "tokens {} want {} borrow {}", tokens, want, borrow
+                    );
+                    if allowed {
+                        tokens -= want;
+                        granted += want;
+                    }
+                    let elapsed_ms = i64::try_from((now - t0).as_millis()).unwrap();
+                    let bound = cap + i64::from(max_borrow) * 1000 + i64::from(rate) * elapsed_ms;
+                    prop_assert!(granted <= bound, "granted {} by {} ms", granted, elapsed_ms);
+                }
+            }
+        }
+
+        /// A borrowed bucket is repaid before the client gets another token, and a new key
+        /// under eviction pressure (its first token from the prefix's overflow bucket) cannot
+        /// borrow there.
+        #[test]
+        fn borrowed_tokens_are_repaid_first_and_never_from_overflow() {
+            let l = RateLimiter::new(2, 4);
+            let ip: IpAddr = "198.51.100.4".parse().unwrap();
+            let t0 = Instant::now();
+            assert!(l.allow_n_at(ip, 4, t0));
+            assert!(!l.allow_n_at(ip, 1, t0));
+            assert!((0..3).all(|_| l.take_at(ip, 1, 3, t0)), "3 borrowed");
+            assert!(!l.take_at(ip, 1, 3, t0), "not past the floor");
+            // 1.5 s refills 3 tokens: the debt, nothing for the client yet.
+            let t15 = t0 + Duration::from_millis(1500);
+            assert!(!l.allow_n_at(ip, 1, t15));
+            assert!(l.allow_n_at(ip, 1, t15 + Duration::from_millis(500)));
+
+            let r = RateLimiter::with_cap(1, 1, 1);
+            let a = IpAddr::from([1, 1, 1, 1]);
+            let b = IpAddr::from([1, 1, 1, 2]);
+            assert!(r.allow_at(a, t0));
+            // b evicts the drained a: its token comes from 1.1.1.0/24's overflow bucket
+            // (burst 1), and borrowing does not reach past it.
+            assert!(r.take_at(b, 1, 10, t0));
+            assert!(!r.take_at(IpAddr::from([1, 1, 1, 3]), 1, 10, t0));
         }
     }
 
