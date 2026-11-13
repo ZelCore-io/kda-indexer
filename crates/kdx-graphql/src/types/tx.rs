@@ -153,7 +153,7 @@ impl TransactionCommand {
         let g = |k: &str| m.and_then(|m| m.get(k));
         TransactionMeta {
             chain_id: BigInt::new(int_of(g("chainId"))),
-            creation_time: DateTime((float_of(g("creationTime")) * 1e6) as i64),
+            creation_time: crate::txlist::creation_time(self.cmd()).unwrap_or(DateTime(0)),
             gas_limit: BigInt::text(int_of(g("gasLimit"))),
             gas_price: FloatText(format!("{}", float_of(g("gasPrice")))),
             sender: str_of(g("sender")),
@@ -791,8 +791,7 @@ impl TransactionSummary {
         super::block::is_stored(ctx, &self.d.block).await
     }
     async fn creation_time(&self) -> DateTime {
-        let m = self.d.cmd.as_ref().and_then(|c| c.get("meta"));
-        DateTime((float_of(m.and_then(|m| m.get("creationTime"))) * 1e6) as i64)
+        self.d.meta_creation_time().unwrap_or(DateTime(0))
     }
     async fn bad_result(&self) -> Option<String> {
         (self.d.out.pointer("/result/status").and_then(Value::as_str) != Some("success"))
@@ -1404,6 +1403,77 @@ mod cgfix_tests {
         let d = tx(0, json!({}), None, json!(["", "miner", 1.0]));
         let v = run(d, "{ transfer { requestKey } }").await;
         assert_eq!(v["transfer"]["requestKey"], json!("<coinbase>"));
+    }
+
+    /// Review minor 4: `Transfer.creationTime`, `TransactionMeta.creationTime` and the
+    /// summary's `creationTime` share one parser (Pact's `ParsedInteger`): a number, a
+    /// numeric string or `{"int": n}`, in whole seconds (a fraction rounds as Pact does).
+    #[tokio::test]
+    async fn creation_time_forms_agree() {
+        for (ct, secs) in [
+            (json!(1718110252), 1718110252),
+            (json!("1718110252"), 1718110252),
+            (json!({"int": 1718110252}), 1718110252),
+            (json!({"int": "1718110252"}), 1718110252),
+            (json!(1718110252.532), 1718110253),
+            (json!(1718110252.4), 1718110252),
+        ] {
+            let cmd = json!({"meta": {"chainId": "4", "creationTime": ct, "sender": "a"},
+                "payload": {"exec": {"code": "1", "data": {}}}, "signers": []});
+            let out = json!({"result": {"status": "success", "data": ""}});
+            let d = tx(1, out, Some(cmd), json!([]));
+            assert_eq!(d.meta_creation_time().map(|t| t.0), Some(secs * 1_000_000));
+            let want = if secs == 1718110252 {
+                "2024-06-11T12:50:52.000Z"
+            } else {
+                "2024-06-11T12:50:53.000Z"
+            };
+            let v = run(
+                d,
+                "{ cmd { meta { creationTime } } transfer { creationTime } }",
+            )
+            .await;
+            assert_eq!(v["cmd"]["meta"]["creationTime"], json!(want), "{ct}");
+            assert_eq!(v["transfer"]["creationTime"], json!(want), "{ct}");
+        }
+        // No usable value: the transfer keeps its block's time, the meta the epoch (as
+        // before).
+        let cmd = json!({"meta": {"creationTime": {"decimal": "x"}}, "payload": {}});
+        let d = tx(1, json!({}), Some(cmd), json!([]));
+        let v = run(
+            d,
+            "{ cmd { meta { creationTime } } transfer { creationTime } }",
+        )
+        .await;
+        assert_eq!(
+            v["transfer"]["creationTime"],
+            json!("2025-05-06T07:58:43.432Z")
+        );
+        assert_eq!(
+            v["cmd"]["meta"]["creationTime"],
+            json!("1970-01-01T00:00:00.000Z")
+        );
+    }
+
+    /// F9 precision (review, cross-branch): an 18-digit decimal reaches the node, the oracle
+    /// and us as Pact's `{"decimal": "..."}` object, and `parameterText` keeps it verbatim,
+    /// equal to the oracle's text (live sample: kaddex.exchange.UPDATE, c2 h6951209,
+    /// requestKey hEffZb8kQ_Dm99fiTK95AenYeJqWyHIkyBDc8Ry_GqI).
+    #[tokio::test]
+    async fn long_decimals_keep_the_node_text() {
+        let params: Value = serde_json::from_str(
+            r#"["coin:n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC",{"decimal":"540796.439262685228"},3693.343969]"#,
+        )
+        .unwrap();
+        let out = json!({"result": {"status": "success", "data": ""}});
+        let d = tx(1, out, None, params);
+        let v = run(d, "{ event { parameterText } }").await;
+        assert_eq!(
+            v["event"]["parameterText"],
+            json!(
+                r#"["coin:n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC",{"decimal":"540796.439262685228"},3693.343969]"#
+            )
+        );
     }
 
     /// F10 `cmd.payload` null vs `{}` (rule b): a union or interface whose fragments select

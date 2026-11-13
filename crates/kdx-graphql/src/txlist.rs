@@ -125,13 +125,7 @@ impl TxData {
     }
     /// The command's `meta.creationTime` (`None` for a coinbase or a command without one).
     pub fn meta_creation_time(&self) -> Option<crate::scalars::DateTime> {
-        let v = self.cmd.as_ref()?.pointer("/meta/creationTime")?;
-        let secs = match v {
-            Value::Number(n) => n.as_f64()?,
-            Value::String(s) => s.trim().parse().ok()?,
-            _ => return None,
-        };
-        Some(crate::scalars::DateTime((secs * 1e6) as i64))
+        creation_time(self.cmd.as_ref()?)
     }
     pub fn block_hash(&self) -> String {
         self.block.hash.to_b64url()
@@ -169,6 +163,15 @@ impl Blocks {
         self.0.insert((c, h), b.clone());
         Ok(b)
     }
+}
+
+/// A command's `meta.creationTime` in whole seconds, as the oracle sends it: a Pact
+/// `ParsedInteger` (a number, a numeric string or `{"int": n}`), a fraction rounded as Pact
+/// rounds it. One parser for `Transfer.creationTime` and `TransactionMeta.creationTime`
+/// (R-P5P9-57 F3), so the two never disagree on a tx.
+pub fn creation_time(cmd: &Value) -> Option<crate::scalars::DateTime> {
+    let secs = shapes::parsed_integer(cmd.pointer("/meta/creationTime")?)?;
+    Some(crate::scalars::DateTime(secs.checked_mul(1_000_000)?))
 }
 
 /// Load the tx at `k` (or the record already read).

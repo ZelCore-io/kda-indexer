@@ -174,7 +174,7 @@ pub fn utc_secs(secs: i64) -> String {
 /// number, a string holding a number (`"600"`), or `{"int": ...}`. Pact accepts all three
 /// in a command, so stored commands carry all three. A fraction rounds like Haskell
 /// `round` (F2: chainweb-data and kda-txs show 1692638383.532 as ...:44).
-fn parsed_integer(v: &Value) -> Option<i64> {
+pub fn parsed_integer(v: &Value) -> Option<i64> {
     let s = match v {
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.trim().to_owned(),
