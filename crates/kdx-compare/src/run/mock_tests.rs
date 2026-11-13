@@ -25,6 +25,10 @@ pub(super) struct NodeMock {
     /// `/local` answers by (chain, account): the `result.data` of a `details` read. Each
     /// call logs `local <chain> <code> <account>`.
     pub local: HashMap<(u8, String), Value>,
+    /// `GET /header` answers by (chain, height): every header the node holds at that height
+    /// (orphans included), and `payload/<hash>/outputs` answers by payload hash.
+    pub headers: HashMap<(u8, u64), Vec<Value>>,
+    pub payloads: HashMap<String, Value>,
     pub calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -82,6 +86,30 @@ async fn node_server(n: NodeMock) -> String {
                         })
                         .collect();
                     Json(json!({"items": items, "next": null, "limit": items.len()}))
+                },
+            ),
+        )
+        .route(
+            "/chainweb/0.0/mainnet01/chain/{c}/header",
+            get(
+                |State(n): State<NodeMock>,
+                 Path(c): Path<u8>,
+                 Query(q): Query<HashMap<String, u64>>| async move {
+                    let items: Vec<Value> = (q["minheight"]..=q["maxheight"])
+                        .flat_map(|h| n.headers.get(&(c, h)).cloned().unwrap_or_default())
+                        .collect();
+                    Json(json!({"items": items, "next": null, "limit": items.len()}))
+                },
+            ),
+        )
+        .route(
+            "/chainweb/0.0/mainnet01/chain/{c}/payload/{hash}/outputs",
+            get(
+                |State(n): State<NodeMock>, Path((_c, hash)): Path<(u8, String)>| async move {
+                    match n.payloads.get(&hash) {
+                        Some(p) => Json(p.clone()).into_response(),
+                        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
                 },
             ),
         )
@@ -798,4 +826,94 @@ max_height = 6400000
         ]
     );
     assert!(calls.iter().all(|c| !c.contains("/header?")), "{calls:?}");
+}
+
+/// N2: the one-block skew accepts a coinbase only from a lone header at the height; a fork
+/// there (the plain header range returns orphans too) leaves the diff.
+#[tokio::test]
+async fn n2_mined_at_needs_a_single_header_at_the_height() {
+    let dir = tempfile::tempdir().unwrap();
+    let cb = |to: &str| {
+        let v = json!({"result": {"status": "success"}, "events": [{"name": "TRANSFER",
+            "module": {"name": "coin", "namespace": null}, "params": ["", to, 0.9]}]});
+        json!({"coinbase": kdx_types::hash::b64url_encode(v.to_string().as_bytes())})
+    };
+    let hd = |h: &str, p: &str| json!({"hash": h, "payloadHash": p, "height": 100, "chainId": 0});
+    let mut node = NodeMock::default();
+    node.headers.insert((0, 100), vec![hd("h1", "p1")]);
+    node.headers
+        .insert((1, 100), vec![hd("h1", "p1"), hd("h2", "p2")]);
+    node.payloads.insert("p1".into(), cb("k:miner"));
+    node.payloads.insert("p2".into(), cb("k:miner"));
+    let (ctx, _) = setup(node, SideMock::default(), SideMock::default(), dir.path()).await;
+    assert!(ctx.mined_at(0, 100, "k:miner").await);
+    assert!(!ctx.mined_at(0, 100, "k:other").await);
+    // Two headers at the height: a fork, even though both coinbases pay the miner.
+    assert!(!ctx.mined_at(1, 100, "k:miner").await);
+}
+
+/// R3: a request key whose copy in our data is at height 0 (genesis keys repeat across
+/// chains) is never settled by `oracle_orphan_dupes`: the oracle keeps both copies.
+#[tokio::test]
+async fn r3_genesis_request_keys_are_not_deduped() {
+    use crate::graphql::{base64_std, Answer};
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock {
+        tip: 100,
+        ..NodeMock::default()
+    };
+    node.canon.insert((0, 0), "GenOurs".into());
+    let nu = node_server(node).await;
+    let au = gql_server(json!({"GenOurs": {"chainId": 0, "height": 0}}), json!({})).await;
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let out = dir.path();
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = "no-such-dir"
+field_rules = [
+  {{ field = "transactionsByPublicKey", rule = "oracle_orphan_dupes" }},
+]
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_graphql"
+[targets.b]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+max_height = 100
+"#
+    ))
+    .unwrap();
+    let ctx = Ctx::new(cfg).await.unwrap();
+    let ta = &ctx.targets["a"];
+    let e = |b: &str, rk: &str| {
+        let id = base64_std(format!("Transaction:[\"{b}\",\"{rk}\"]").as_bytes());
+        json!({"node": {"id": id, "hash": rk}})
+    };
+    let conn = |n: u64, edges: Vec<Value>| Answer {
+        body: json!({"data": {"transactionsByPublicKey": {"totalCount": n, "edges": edges,
+            "pageInfo": {"hasNextPage": false}}}}),
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    };
+    let mut a = conn(1, vec![e("GenOurs", "genesis-rk")]);
+    let mut b = conn(
+        2,
+        vec![e("GenOurs", "genesis-rk"), e("GenOther", "genesis-rk")],
+    );
+    let none = serde_json::Map::new();
+    let hits = ctx.gql_row_rules(ta, &none, &mut a, &mut b).await;
+    assert!(hits.is_empty(), "{hits:?}");
+    let kept = &b.body["data"]["transactionsByPublicKey"];
+    assert_eq!(kept["totalCount"], 2);
+    assert_eq!(kept["edges"].as_array().unwrap().len(), 2);
 }

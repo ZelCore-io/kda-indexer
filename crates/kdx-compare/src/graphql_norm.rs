@@ -226,6 +226,34 @@ pub fn rule_explains(
     })
 }
 
+/// Whether our raw response's count flag may explain a count (N1): `totalCountLowerBound` is
+/// true and our `data` holds exactly one `totalCount` outside any `edges` subtree. With two
+/// such counts the flag cannot say which one it is about, so the diff stays for triage.
+pub fn count_flag_applies(raw: &Value) -> bool {
+    fn count(v: &Value, n: &mut usize) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m {
+                    if k == "edges" {
+                        continue;
+                    }
+                    if k == "totalCount" {
+                        *n += 1;
+                    }
+                    count(x, n);
+                }
+            }
+            Value::Array(xs) => xs.iter().for_each(|x| count(x, n)),
+            _ => {}
+        }
+    }
+    let mut n = 0;
+    if let Some(d) = raw.get("data") {
+        count(d, &mut n);
+    }
+    raw.pointer("/extensions/totalCountLowerBound") == Some(&Value::Bool(true)) && n == 1
+}
+
 /// The explainer of one oracle pair diff: per-field rules first, then F2 and F7. Returns the
 /// visible hit path of the rule that explains `a` (ours) against `b` (the oracle) at `path`.
 /// `lower_bound`: our raw response flagged `totalCountLowerBound` (read before
@@ -235,6 +263,9 @@ pub fn explain<'r>(
     lower_bound: bool,
 ) -> impl Fn(&str, &Value, &Value) -> Option<&'static str> + 'r {
     move |path: &str, a: &Value, b: &Value| {
+        // Counts under `edges` are exact by construction: the flag never explains them.
+        let in_edges = path.split('/').any(|s| s == "edges");
+        let lower_bound = lower_bound && !in_edges;
         let hit = rules
             .iter()
             .filter(|r| !r.rule.is_row() && field_matches(path, &r.field))
@@ -604,6 +635,28 @@ mod tests {
         assert_eq!(explain(&rules, false)(t, &json!(1663), &json!(4590)), None);
         // Only on the listed field.
         assert_eq!(flagged("/data/block/height", &json!(1), &json!(2)), None);
+    }
+
+    #[test]
+    fn n1_count_flag_applies_only_to_the_sole_count_outside_edges() {
+        let flag = |mut v: Value| {
+            v["extensions"] = json!({"totalCountLowerBound": true});
+            v
+        };
+        let one = json!({"data": {"transfers": {"totalCount": 1, "edges": []}}});
+        assert!(count_flag_applies(&flag(one.clone())));
+        assert!(!count_flag_applies(&one));
+        let two = json!({"data": {"fungibleAccount": {
+            "transactions": {"totalCount": 5}, "transfers": {"totalCount": 1}}}});
+        assert!(!count_flag_applies(&flag(two)));
+        // A nested count under `edges` does not count against the root count.
+        let nested = json!({"data": {"transfers": {"totalCount": 1,
+            "edges": [{"node": {"result": {"transfers": {"totalCount": 2}}}}]}}});
+        assert!(count_flag_applies(&flag(nested)));
+        // The path under `edges` is never explained, even when the flag applies.
+        let rules = [rule("totalCount", FieldRuleKind::CountLowerBound)];
+        let e = "/data/transfers/edges/0/node/result/transfers/totalCount";
+        assert_eq!(explain(&rules, true)(e, &json!(1), &json!(2)), None);
     }
 
     #[test]

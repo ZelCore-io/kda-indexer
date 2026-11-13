@@ -287,6 +287,53 @@ pub fn load_dir(dir: &Path, captured: bool, skip: &[String]) -> anyhow::Result<V
     Ok(out)
 }
 
+/// Our `transaction` (`t`) and the node's poll answer `p` for the sampled `s`, as the two
+/// documents the `NodeTx` pair diffs. `signers` carries the scheme per signer (a string, or
+/// null when absent): the node's command is the referee of `signers.scheme`, so a scheme
+/// present there must match and an absent one must be null in ours (R1).
+fn node_tx_views(t: &Value, p: &Value, s: &Sample) -> (Value, Value) {
+    let ok = p.pointer("/result/status").and_then(Value::as_str) == Some("success");
+    let mut got = json!({
+        "hash": t["hash"],
+        "chain": t.pointer("/cmd/meta/chainId"),
+        "sender": t.pointer("/cmd/meta/sender"),
+        "gas": text_decimal(t.pointer("/result/gas")),
+        "height": t.pointer("/result/height"),
+        "blockHash": t.pointer("/result/block/hash"),
+        "blockChain": t.pointer("/result/block/chainId"),
+        "failed": t.pointer("/result/badResult").map(|b| !b.is_null()),
+    });
+    let mut want = json!({
+        "hash": s.request_key,
+        "chain": s.chain,
+        "sender": s.meta.get("sender"),
+        "gas": text_decimal(p.get("gas")),
+        "height": p.pointer("/metaData/blockHeight"),
+        "blockHash": p.pointer("/metaData/blockHash"),
+        "blockChain": s.chain,
+        "failed": !ok,
+    });
+    if let Some(node) = s.signers.as_array() {
+        let schemes = |v: &[Value]| -> Value {
+            v.iter()
+                .map(|x| {
+                    x.get("scheme")
+                        .filter(|v| !v.is_null())
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                })
+                .collect()
+        };
+        let ours = t
+            .pointer("/cmd/signers")
+            .and_then(Value::as_array)
+            .map_or(Value::Null, |v| schemes(v));
+        got["signers"] = ours;
+        want["signers"] = schemes(node);
+    }
+    (got, want)
+}
+
 /// What a sampled canonical transaction offers to the variables of an operation.
 #[derive(Debug, Clone)]
 pub struct Sample {
@@ -299,6 +346,8 @@ pub struct Sample {
     pub header: Value,
     /// `meta` of the command (sender, gas, ttl, creation time).
     pub meta: Value,
+    /// `signers` of the command as the node served it: the referee of `signers.scheme`.
+    pub signers: Value,
 }
 
 impl Sample {
@@ -449,6 +498,11 @@ impl Sampler {
                             .cmd_parsed
                             .as_ref()
                             .and_then(|c| c.get("meta").cloned())
+                            .unwrap_or(Value::Null),
+                        signers: tx
+                            .cmd_parsed
+                            .as_ref()
+                            .and_then(|c| c.get("signers").cloned())
                             .unwrap_or(Value::Null),
                     });
                 }
@@ -788,8 +842,8 @@ pub fn compare_answers(
         }
     }
     // R-P5P9-58: our response's count flag, read before `normalize_gql` drops `extensions`.
-    let lower_bound =
-        a.body.pointer("/extensions/totalCountLowerBound") == Some(&Value::Bool(true));
+    // N1: the flag explains only the sole `totalCount` outside `edges`.
+    let lower_bound = crate::graphql_norm::count_flag_applies(&a.body);
     let explain = crate::graphql_norm::explain(rules, lower_bound);
     let (mut d, fired) = diff_explained(&na, &nb, &explain);
     d.extend(hits);
@@ -1296,6 +1350,11 @@ impl Ctx {
             ) else {
                 continue;
             };
+            // R3: genesis request keys repeat across chains, so "our copy is canonical" says
+            // nothing about the oracle's other copy at height 0.
+            if h == 0 {
+                continue;
+            }
             va.push(json!({"requestKey": rk, "blockHash": abh, "chain": c, "height": h}));
             vb.extend(
                 copies
@@ -1402,11 +1461,16 @@ impl Ctx {
     /// Whether the node's block(s) at `(chain, h)` carry a coinbase that paid `account`
     /// (R-P5P9-58: the one-block skew needs the balance to have changed at `h`). Header range
     /// at one height (any fork) and that block's payload; at most 3 blocks.
-    async fn mined_at(&self, chain: u8, h: u64, account: &str) -> bool {
+    pub(crate) async fn mined_at(&self, chain: u8, h: u64, account: &str) -> bool {
         let Ok(page) = self.node.headers(chain, h, h, Some(3), None).await else {
             return false;
         };
         self.count_request(ROW_RULE_ROUTE, "node", 1);
+        // N2: the range also returns orphans. More than one header means a fork at `h`, and
+        // the coinbase could be the orphan's: leave the diff.
+        if page.items.len() != 1 {
+            return false;
+        }
         for hd in page.items {
             let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
                 continue;
@@ -1578,28 +1642,7 @@ impl Ctx {
                 Some("poll: not found".into()),
             );
         };
-        let t = &data["transaction"];
-        let ok = p.pointer("/result/status").and_then(Value::as_str) == Some("success");
-        let mut got = json!({
-            "hash": t["hash"],
-            "chain": t.pointer("/cmd/meta/chainId"),
-            "sender": t.pointer("/cmd/meta/sender"),
-            "gas": text_decimal(t.pointer("/result/gas")),
-            "height": t.pointer("/result/height"),
-            "blockHash": t.pointer("/result/block/hash"),
-            "blockChain": t.pointer("/result/block/chainId"),
-            "failed": t.pointer("/result/badResult").map(|b| !b.is_null()),
-        });
-        let mut want = json!({
-            "hash": s.request_key,
-            "chain": s.chain,
-            "sender": s.meta.get("sender"),
-            "gas": text_decimal(p.get("gas")),
-            "height": p.pointer("/metaData/blockHeight"),
-            "blockHash": p.pointer("/metaData/blockHash"),
-            "blockChain": s.chain,
-            "failed": !ok,
-        });
+        let (mut got, mut want) = node_tx_views(&data["transaction"], p, s);
         for v in [&mut got, &mut want] {
             normalize_gql(v, u64::MAX);
         }
@@ -2448,6 +2491,61 @@ mod tests {
         assert_eq!(paths(d), ["/data/transfers/totalCount"]);
     }
 
+    /// N1: the flag explains only the sole `totalCount` outside `edges`. A lower nested count
+    /// under `edges`, or one of two root-object counts, stays a diff.
+    #[test]
+    fn the_count_flag_never_explains_nested_or_ambiguous_counts() {
+        use crate::graphql_norm::COUNT_LOWER_BOUND_PATH;
+        let rules = [
+            FieldRule::new("transfers.totalCount", FieldRuleKind::CountLowerBound),
+            FieldRule::new("transactions.totalCount", FieldRuleKind::CountLowerBound),
+        ];
+        let ans = |data: Value| {
+            let mut v = json!({"data": data, "extensions": {"totalCountLowerBound": true}});
+            v["data"]["pageInfoPad"] = Value::Null;
+            Answer {
+                body: v,
+                status: 200,
+                raw: String::new(),
+                ms: Vec::new(),
+            }
+        };
+        let paths = |d: Vec<DiffEntry>| d.into_iter().map(|e| e.path).collect::<Vec<_>>();
+        // A lower nested count under `edges`, with the flagged root count equal.
+        let root = |n: u64, nested: u64| {
+            json!({"txs": {"totalCount": n, "edges": [{"node": {"result":
+                {"transfers": {"totalCount": nested}}}}], "pageInfo": {"hasNextPage": false}}})
+        };
+        let d = compare_answers(
+            &mut ans(root(10, 1)),
+            &mut ans(root(10, 5)),
+            u64::MAX,
+            10_000,
+            &rules,
+        );
+        assert_eq!(
+            paths(d),
+            ["/data/txs/edges/0/node/result/transfers/totalCount"]
+        );
+        // Two root-object counts, one of them lower: both stay as they are.
+        let two = |t: u64, x: u64| {
+            json!({"fungibleAccount": {"transactions": {"totalCount": t},
+                "transfers": {"totalCount": x}}})
+        };
+        let d = compare_answers(
+            &mut ans(two(5, 1)),
+            &mut ans(two(5, 9)),
+            u64::MAX,
+            10_000,
+            &rules,
+        );
+        assert_eq!(paths(d), ["/data/fungibleAccount/transfers/totalCount"]);
+        // The single flagged root count is still explained.
+        let one = |x: u64| json!({"fungibleAccount": {"transfers": {"totalCount": x}}});
+        let d = compare_answers(&mut ans(one(1)), &mut ans(one(9)), u64::MAX, 10_000, &rules);
+        assert_eq!(paths(d), [COUNT_LOWER_BOUND_PATH]);
+    }
+
     #[test]
     fn unpaired_captured_documents_by_kind() {
         let doc = |stem: &str, text: &str| parse_op(stem, text, true).unwrap();
@@ -2509,6 +2607,47 @@ mod tests {
         assert_eq!(edges_len(&mut d), 1);
     }
 
+    /// R1: the node's command is the referee of `signers.scheme`: a present scheme must match
+    /// and an absent one must be null in ours.
+    #[test]
+    fn node_tx_pair_checks_the_signer_scheme_against_the_nodes_command() {
+        let s = |signers: Value| Sample {
+            chain: 3,
+            height: 100,
+            block_hash: "H".into(),
+            request_key: "R".into(),
+            accounts: vec![],
+            header: Value::Null,
+            meta: json!({"sender": "k:a"}),
+            signers,
+        };
+        let poll = json!({"result": {"status": "success"}, "gas": 5,
+            "metaData": {"blockHeight": 100, "blockHash": "H"}});
+        let ours = |signers: Value| {
+            json!({"hash": "R", "cmd": {"meta": {"chainId": 3, "sender": "k:a"},
+                "signers": signers},
+                "result": {"gas": 5, "height": 100, "badResult": null,
+                    "block": {"hash": "H", "chainId": 3}}})
+        };
+        let d = |sample: &Sample, t: Value| {
+            let (mut a, mut b) = node_tx_views(&t, &poll, sample);
+            normalize_gql(&mut a, u64::MAX);
+            normalize_gql(&mut b, u64::MAX);
+            diff(&a, &b)
+        };
+        // The node's scheme present: ours must carry it.
+        let present = s(json!([{"pubKey": "ab", "scheme": "WebAuthn"}]));
+        let x = d(&present, ours(json!([{"scheme": "WebAuthn"}])));
+        assert!(x.is_empty(), "{x:?}");
+        assert!(!d(&present, ours(json!([{"scheme": "ED25519"}]))).is_empty());
+        assert!(!d(&present, ours(json!([{"scheme": null}]))).is_empty());
+        // The node's scheme absent: ours must be null, never a value (nor "").
+        let absent = s(json!([{"pubKey": "ab"}]));
+        assert!(d(&absent, ours(json!([{"scheme": null}]))).is_empty());
+        assert!(!d(&absent, ours(json!([{"scheme": "ED25519"}]))).is_empty());
+        assert!(!d(&absent, ours(json!([{"scheme": ""}]))).is_empty());
+    }
+
     #[test]
     fn variables_follow_the_sample() {
         let op = parse_op(
@@ -2525,6 +2664,7 @@ mod tests {
             accounts: vec!["k:a".into()],
             header: Value::Null,
             meta: Value::Null,
+            signers: Value::Null,
         };
         let mut rng = StdRng::seed_from_u64(1);
         let v = vars_for(&op, &s, &mut rng).unwrap();

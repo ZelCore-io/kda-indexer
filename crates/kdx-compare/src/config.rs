@@ -501,6 +501,7 @@ field_rules = [
   { field = "result.transactionId",        rule = "ours_null", oracle = "0" },
   { field = "result.goodResult",           rule = "oracle_null", ours = "\"\"" },
   { field = "signers.scheme",              rule = "oracle_empty" },
+  # events.parameters: F9: keep ours (P7F-2 evidence, 23:10Z)
   { field = "events.parameters",           rule = "json_numbers_by_value" },
   { field = "transfers.totalCount",        rule = "count_lower_bound" },
   { field = "transactions.totalCount",     rule = "count_lower_bound" },
