@@ -732,6 +732,39 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bo
     Ok((n, true))
 }
 
+/// Steps of a pact a `crossChainTransfer` lookup reads first, and at most when the pact has
+/// more (failed retries of a continuation can push the step that succeeded out of the
+/// newest 16; R-P5P9-57, node-checked: pact `XSU4iQjQ…` has 34 steps). The larger bound is
+/// the native defpact cap.
+const XCHAIN_STEPS: usize = 16;
+const XCHAIN_STEPS_MAX: usize = 1_000;
+
+/// The first continuation step of a pact (oldest first) that `matches`, other than `me`:
+/// `steps_of(cap)` lists up to `cap` steps (the newest ones, ascending) and whether there
+/// are more. Reads [`XCHAIN_STEPS`] first and, only when the pact has more, again up to
+/// [`XCHAIN_STEPS_MAX`].
+fn find_step<T>(
+    mut steps_of: impl FnMut(usize) -> ApiResult<(Vec<(TxKey, bool)>, bool)>,
+    me: TxKey,
+    mut matches: impl FnMut(TxKey) -> ApiResult<Option<T>>,
+) -> ApiResult<Option<T>> {
+    for cap in [XCHAIN_STEPS, XCHAIN_STEPS_MAX] {
+        let (steps, capped) = steps_of(cap)?;
+        for (k, cont) in steps {
+            if !cont || k == me {
+                continue;
+            }
+            if let Some(t) = matches(k)? {
+                return Ok(Some(t));
+            }
+        }
+        if !capped {
+            break;
+        }
+    }
+    Ok(None)
+}
+
 /// The other half of the cross-chain transfer at `trs[i]` of `d`: for an outgoing half
 /// (empty receiver) the `cont` step of the pact this tx started, for an incoming half (empty
 /// sender, a `cont` tx) the tx that started the pact. `None` when it is not (yet) indexed.
@@ -751,22 +784,19 @@ pub fn xchain_of(
         let Some(rk) = d.rec.request_key else {
             return Ok(None);
         };
-        let (steps, _) = view.pact_txs(&rk, 16)?;
-        for (k, cont) in steps {
-            if !cont || k == d.key() {
-                continue;
-            }
-            if let Some(o) = load(view, k, None, blocks)? {
-                if let Some(j) = o
-                    .trs
+        return find_step(
+            |cap| view.pact_txs(&rk, cap),
+            d.key(),
+            |k| {
+                let Some(o) = load(view, k, None, blocks)? else {
+                    return Ok(None);
+                };
+                Ok(o.trs
                     .iter()
                     .position(|x| x.from.is_empty() && !x.to.is_empty() && x.token == t.token)
-                {
-                    return Ok(Some((o, j)));
-                }
-            }
-        }
-        return Ok(None);
+                    .map(|j| (o.clone(), j)))
+            },
+        );
     }
     if t.from.is_empty() && !t.to.is_empty() {
         let Some(pact) = d.cmd.as_ref().and_then(shapes::pact_id) else {
@@ -1070,5 +1100,48 @@ mod nft_tests {
         assert_eq!(got, vec![("t:x", 1, "a", "1.0"), ("t:y", 2, "a", "2.5")]);
         // The fungible rule is unchanged: only the coin transfer.
         assert_eq!(shapes::transfers(&evs).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod xchain_tests {
+    use super::*;
+
+    /// R-P5P9-57 (F10 crossChainTransfer): the step that succeeded is found even when more
+    /// than 16 later retries of the continuation follow it.
+    #[test]
+    fn successful_step_behind_many_retries_is_found() {
+        let me = TxKey::new(3_115_490, 2, 1);
+        let ok = TxKey::new(3_115_507, 1, 1);
+        // Ascending: the start, the step that succeeded, then 32 failed retries.
+        let mut all = vec![(me, false), (ok, true)];
+        all.extend((0..32u32).map(|i| (TxKey::new(3_115_509 + i, 1, 2), true)));
+        let mut calls = Vec::new();
+        let steps_of = |cap: usize| {
+            calls.push(cap);
+            let from = all.len().saturating_sub(cap);
+            Ok((all[from..].to_vec(), from > 0))
+        };
+        let got = find_step(steps_of, me, |k| Ok((k == ok).then_some(k))).unwrap();
+        assert_eq!(got, Some(ok));
+        assert_eq!(calls, [XCHAIN_STEPS, XCHAIN_STEPS_MAX]);
+    }
+
+    /// A short pact is read once; the start itself never matches.
+    #[test]
+    fn short_pact_is_read_once() {
+        let me = TxKey::new(10, 0, 1);
+        let ok = TxKey::new(12, 1, 1);
+        let all = vec![(me, false), (ok, true)];
+        let mut calls = 0;
+        let steps_of = |_cap: usize| {
+            calls += 1;
+            Ok((all.clone(), false))
+        };
+        let got = find_step(steps_of, me, |k| Ok(Some(k))).unwrap();
+        assert_eq!(got, Some(ok));
+        assert_eq!(calls, 1);
+        let none = find_step(|_| Ok((vec![(me, true)], false)), me, |k| Ok(Some(k))).unwrap();
+        assert_eq!(none, None);
     }
 }
