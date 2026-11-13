@@ -128,8 +128,14 @@ impl Target {
             .iter()
             .map(|(n, t)| {
                 // The GraphQL oracle never shares the bucket: its own limiter, at most 1 r/s.
+                // kda-indexer's GraphQL never shares it either (R-P5P9-57 cadence): the shared
+                // bucket is chainweb-data's budget, and its one request in flight made every
+                // GraphQL step wait behind slow chainweb-data reads.
                 let lim = match t.kind {
                     TargetKind::GraphqlOracle => Limiter::new(t.rate_rps.unwrap_or(1.0).min(1.0)),
+                    TargetKind::KdaIndexerGraphql => {
+                        Limiter::new(t.rate_rps.unwrap_or(cfg.rate_rps))
+                    }
                     _ => match t.rate_rps {
                         Some(r) => Limiter::new(r),
                         None => limiter.clone(),
@@ -303,5 +309,53 @@ impl Target {
             body,
             ms: t0.elapsed().as_millis() as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn graphql_targets_never_share_the_rest_bucket() {
+        let cfg: CompareConfig = toml::from_str(
+            r#"
+network = "mainnet01"
+pairs = [["compat", "cwd"], ["gql", "oracle"]]
+[node]
+url = "http://127.0.0.1:31351"
+[targets.cwd]
+url = "http://127.0.0.1:31352"
+kind = "chainweb_data"
+[targets.compat]
+url = "http://127.0.0.1:31362"
+kind = "kda_indexer_compat"
+[targets.gql]
+url = "http://127.0.0.1:31363/graphql"
+kind = "kda_indexer_graphql"
+[targets.oracle]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+max_height = 6000000
+"#,
+        )
+        .unwrap();
+        let t: BTreeMap<String, Target> = Target::all(&cfg)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.name.clone(), t))
+            .collect();
+        // chainweb-data and compat share the bucket (and its one request in flight) ...
+        assert!(Arc::ptr_eq(&t["cwd"].limiter, &t["compat"].limiter));
+        // ... kda-indexer's GraphQL and the oracle have their own (R-P5P9-57 cadence).
+        assert!(!Arc::ptr_eq(&t["gql"].limiter, &t["cwd"].limiter));
+        assert!(!Arc::ptr_eq(&t["oracle"].limiter, &t["cwd"].limiter));
+        assert!(!Arc::ptr_eq(&t["gql"].limiter, &t["oracle"].limiter));
+        // The GraphQL limiter runs at the shared rate when the target sets none.
+        assert_eq!(
+            t["gql"].limiter.interval,
+            Duration::from_secs_f64(1.0 / 5.0)
+        );
     }
 }

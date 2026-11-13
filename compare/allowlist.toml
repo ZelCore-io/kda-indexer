@@ -56,6 +56,78 @@ request_contains = "graphql:"
 reason = "The reference server stopped indexing at a fixed height; rows above the configured max_height exist only on kda-indexer and are dropped from both sides before the diff."
 owner_note = "Accepted by the owner (GQ-16); only the visible hit is allowlisted, any other difference stays unexplained."
 
+[[entry]]
+id = "graphql-r57-float"
+route = "other"
+json_path_glob = "/~graphql-r57-float"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-57 F2: Float and float-valued Decimal fields (balance, totalBalance, gasPrice, the networkInfo floats) and any number above 2^53 compare at f64 precision. The reference server computes them as JavaScript floats (difficulty rounding, totalBalance float sum); kda-indexer's values are exact. The NodeBalance and native pairs compare our Float balance with the decimal at f64 precision."
+owner_note = "Controller ruling R-P5P9-57 (harness only); a difference beyond f64 precision stays unexplained."
+
+[[entry]]
+id = "graphql-r57-json-object"
+route = "other"
+json_path_glob = "/~graphql-r57-json-object"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-57 F7: JSON texts that hold objects (payload.data, goodResult, badResult) compare as objects, so key order is not a difference. Numbers inside keep their text, so a decimal format difference (F9) is not hidden."
+owner_note = "Controller ruling R-P5P9-57 (harness only)."
+
+[[entry]]
+id = "graphql-r57-height-ties"
+route = "other"
+json_path_glob = "/~graphql-r57-height-tie-cut"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-57 M2b/M2c: rows within one height compare as a set (order within a height is a contract choice, R3E-8). When both sides still have a next page and the page end cut the last height's rows at different members, those trailing rows are left out of both sides; the rows before them still compare."
+owner_note = "Controller ruling R-P5P9-57; the order across heights (M2a) is still compared."
+
+[[entry]]
+id = "graphql-r57-field"
+route = "other"
+json_path_glob = "/~graphql-r57-field"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-57 rules (a) and (b): a per-field normaliser from the harness config ([graphql] field_rules) explained the difference. The controller sets each field after the node referee (F5, F6, F8, F9, F10, Transfer.amount)."
+owner_note = "Controller ruling R-P5P9-57; only the fields listed in the config, only the listed rule."
+
+[[entry]]
+id = "graphql-r58-oracle-empty"
+route = "other"
+json_path_glob = "/~graphql-r58-oracle-empty"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-57 rule (a), R-P5P9-58 kind oracle_empty: at a field listed in [graphql] field_rules, the reference server's empty string against a non-null value of ours (F8 signers.scheme present: the node's command carries the scheme ours serves). Our null against its empty string is not explained, and an optional ours matcher narrows it to one value."
+owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z class table); only the listed fields."
+
+[[entry]]
+id = "graphql-r58-count-lower-bound"
+route = "other"
+json_path_glob = "/~graphql-r58-count-lower-bound"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-57 unresolved counts, R-P5P9-58 kind count_lower_bound: our response carried extensions.totalCountLowerBound (the count ran out of its deadline share, R-P5P9-14), and our count is below the reference server's. An unflagged count, or a flagged count above the oracle's, stays unexplained."
+owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z: transfer totalCount is ours-correct, lower only when flagged)."
+
+[[entry]]
+id = "graphql-r58-oracle-orphan-dupes"
+route = "other"
+json_path_glob = "/~graphql-r58-oracle-orphan-dupes"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-57 unresolved counts, R-P5P9-58 kind oracle_orphan_dupes: the reference server listed a request key twice, and the node's canonical header at our copy's (chain, height) is our block, so its copy in the other block is an orphan. That copy left its list and its totalCount dropped by one (oracle_orphans, the R-P5P9-48 rule). Copies the node does not settle stay, and a count difference beyond the copies dropped stays unexplained."
+owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z: transactionsByPublicKey orphan duplicates are an oracle defect)."
+
+[[entry]]
+id = "graphql-r58-by-key-extra-row"
+route = "other"
+json_path_glob = "/~graphql-r58-by-key-extra-row"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-57 unresolved counts, R-P5P9-58 kind by_key_extra_row: a by-key account row only ours lists left the compare because the node's /local (coin.details \"<account>\") guard, on the chain the key is on, holds the key. One single-row read per row at the harness's node rate, never a scan; a row the node does not confirm stays unexplained."
+owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z: the extra fungibleAccountsByPublicKey row is an oracle defect; node-confirmed guards)."
+
 # --- From the first live runs (P1, chainweb-data vs node oracle) ---
 
 [[entry]]

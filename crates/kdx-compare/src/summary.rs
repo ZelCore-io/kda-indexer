@@ -412,6 +412,7 @@ pub fn run(out_dir: &Path, since: &str, routes: &str, gate: &str) -> anyhow::Res
     let size = GateSize::parse(gate)?;
     let since_secs = parse_since(since)?;
     let w = load(out_dir, since_secs)?;
+    let unpaired = load_unpaired(out_dir, since_secs)?;
     let label = format!("gate {gate}, routes {routes}");
     let all_rows = rows(&w);
     let with_graphql = set == RouteSet::Graphql
@@ -432,9 +433,69 @@ pub fn run(out_dir: &Path, since: &str, routes: &str, gate: &str) -> anyhow::Res
             text.push_str(&format!("  {w}\n"));
         }
         green &= ok;
+        text.push_str(&render_unpaired(&unpaired));
     }
     print!("{text}");
     Ok(green)
+}
+
+/// The union of the summaries' unpaired captured documents since `since_secs` (by day).
+fn load_unpaired(out_dir: &Path, since_secs: u64) -> anyhow::Result<BTreeMap<String, String>> {
+    let first_date = date_of(since_secs);
+    let mut out = BTreeMap::new();
+    for e in std::fs::read_dir(out_dir)
+        .with_context(|| format!("reading {}", out_dir.display()))?
+        .filter_map(Result::ok)
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(date) = name
+            .strip_prefix("summary-")
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if date < first_date.as_str() {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path())?;
+        if let Ok(day) = serde_json::from_str::<DailySummary>(&text) {
+            out.extend(day.graphql_unpaired);
+        }
+    }
+    Ok(out)
+}
+
+/// R-P5P9-57 coverage: the captured documents the harness never pairs, by kind (tip and
+/// subscription kinds are covered by the soak and the node pairs; unsupported ones go on
+/// the gap list).
+pub fn render_unpaired(unpaired: &BTreeMap<String, String>) -> String {
+    let mut by_kind: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (stem, kind) in unpaired {
+        by_kind
+            .entry(kind.as_str())
+            .or_default()
+            .push(stem.as_str());
+    }
+    let mut text = format!(
+        "graphql captured documents never paired: {}\n",
+        unpaired.len()
+    );
+    for kind in ["tip", "subscription", "unsupported"] {
+        let stems = by_kind.remove(kind).unwrap_or_default();
+        text.push_str(&format!(
+            "  {kind} ({}): {}\n",
+            stems.len(),
+            stems.join(" ")
+        ));
+    }
+    for (kind, stems) in by_kind {
+        text.push_str(&format!(
+            "  {kind} ({}): {}\n",
+            stems.len(),
+            stems.join(" ")
+        ));
+    }
+    text
 }
 
 #[cfg(test)]
