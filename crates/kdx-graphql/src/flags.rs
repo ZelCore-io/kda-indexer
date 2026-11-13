@@ -76,7 +76,8 @@ impl Extension for FlagsExt {
         next: NextPrepareRequest<'_>,
     ) -> ServerResult<Request> {
         // The request's `crossChainTransfer` step budget rides with its flags (one per
-        // request, as the flags).
+        // request, as the flags). This runs once per subscription stream, so `ws::WsOps`
+        // gives each subscription message a fresh one that shadows it.
         let budget = Arc::new(crate::txlist::XchainBudget::default());
         next.run(ctx, request.data(self.0.clone()).data(budget))
             .await
