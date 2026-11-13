@@ -141,6 +141,15 @@ impl Tips {
             .get(&chain)
             .map(|(_, h)| h.clone())
     }
+
+    /// The chain's height in the cut.
+    pub fn cut_height(&self, chain: u8) -> Option<u64> {
+        self.cut
+            .lock()
+            .expect("tips poisoned")
+            .get(&chain)
+            .map(|(h, _)| *h)
+    }
 }
 
 pub fn rng() -> StdRng {
