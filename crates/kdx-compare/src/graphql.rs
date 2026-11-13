@@ -18,7 +18,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde_json::{json, Map, Value};
 
-use crate::config::{CompareConfig, FieldRule, TargetKind};
+use crate::config::{CompareConfig, FieldRule, FieldRuleKind, TargetKind};
 use crate::diff::{decimal_canon, diff, diff_explained};
 use crate::gen::random::RandomGen;
 use crate::gen::Tips;
@@ -51,6 +51,11 @@ const ORACLE_PAUSE: Duration = Duration::from_secs(600);
 const BALANCE_RETRY: Duration = Duration::from_secs(15);
 /// Samples taken per drawn block window.
 const SAMPLES_PER_BLOCK: usize = 3;
+/// Rows one R-P5P9-58 row rule checks per compare (each costs one read of ours and one of
+/// the node).
+const ROW_RULE_CHECKS: usize = 3;
+/// Summary route of the row rules' and the skew check's own reads.
+const ROW_RULE_ROUTE: &str = "graphql-row-rule";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
@@ -353,7 +358,7 @@ pub fn vars_for(op: &GqlOp, s: &Sample, rng: &mut StdRng) -> Option<Map<String, 
     Some(m)
 }
 
-fn base64_std(b: &[u8]) -> String {
+pub(crate) fn base64_std(b: &[u8]) -> String {
     use std::fmt::Write as _;
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -470,6 +475,9 @@ pub struct GqlState {
     acct_ok: Mutex<HashMap<String, bool>>,
     oracle_timeouts: AtomicU32,
     oracle_pause_until: Mutex<Option<Instant>>,
+    /// One `/local` client for every GraphQL read of the node (NodeBalance, the by-key guard
+    /// check): one limiter at `node_max_rps`, one call in flight.
+    local: std::sync::OnceLock<kdx_node::LocalClient>,
 }
 
 impl GqlState {
@@ -497,6 +505,7 @@ impl GqlState {
             acct_ok: Mutex::new(HashMap::new()),
             oracle_timeouts: AtomicU32::new(0),
             oracle_pause_until: Mutex::new(None),
+            local: std::sync::OnceLock::new(),
         })
     }
 
@@ -778,7 +787,10 @@ pub fn compare_answers(
             }
         }
     }
-    let explain = crate::graphql_norm::explain(rules);
+    // R-P5P9-58: our response's count flag, read before `normalize_gql` drops `extensions`.
+    let lower_bound =
+        a.body.pointer("/extensions/totalCountLowerBound") == Some(&Value::Bool(true));
+    let explain = crate::graphql_norm::explain(rules, lower_bound);
     let (mut d, fired) = diff_explained(&na, &nb, &explain);
     d.extend(hits);
     d.extend(fired.into_iter().map(hit));
@@ -1178,14 +1190,235 @@ impl Ctx {
                 Some("oracle server error".into()),
             );
         }
-        let d = compare_answers(
+        let row_hits = self.gql_row_rules(ta, vars, &mut a, &mut b).await;
+        let mut d = compare_answers(
             &mut a,
             &mut b,
             max,
             self.cfg.graphql.total_count_cap,
             &self.cfg.graphql.field_rules,
         );
+        d.extend(row_hits.into_iter().map(|p| DiffEntry {
+            path: p.into(),
+            kind: DiffKind::Changed,
+            a: None,
+            b: None,
+        }));
         self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d)
+    }
+
+    /// The shared `/local` client of the GraphQL node reads.
+    fn gql_local(&self) -> &kdx_node::LocalClient {
+        self.gql.local.get_or_init(|| {
+            kdx_node::LocalClient::new(
+                self.node.clone(),
+                kdx_node::LocalOpts {
+                    rps: self.cfg.node_max_rps.max(1),
+                    concurrency: 1,
+                },
+            )
+        })
+    }
+
+    /// One small read of ours (A) for a row rule; `data` or `None`.
+    async fn gql_read(&self, ta: &Target, query: &str, vars: Value) -> Option<Value> {
+        let c = ta
+            .post_json(&json!({ "query": query, "variables": vars }))
+            .await
+            .ok()?;
+        self.gql_count(ROW_RULE_ROUTE, &ta.name, &[c.ms]);
+        let v: Value = serde_json::from_slice(&c.body).ok()?;
+        v.get("data").filter(|d| !d.is_null()).cloned()
+    }
+
+    /// R-P5P9-58 row rules of an oracle pair (`[graphql] field_rules`), applied before the
+    /// diff; returns their visible hits.
+    pub(crate) async fn gql_row_rules(
+        &self,
+        ta: &Target,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+    ) -> Vec<&'static str> {
+        use crate::graphql_norm::{BY_KEY_EXTRA_PATH, ORPHAN_DUPES_PATH};
+        let mut hits = Vec::new();
+        for r in &self.cfg.graphql.field_rules {
+            let (dropped, path) = match r.rule {
+                FieldRuleKind::OracleOrphanDupes => (
+                    self.oracle_orphan_dupes(ta, &r.field, a, b).await,
+                    ORPHAN_DUPES_PATH,
+                ),
+                FieldRuleKind::ByKeyExtraRow => (
+                    self.by_key_extra_rows(ta, &r.field, vars, a, b).await,
+                    BY_KEY_EXTRA_PATH,
+                ),
+                _ => continue,
+            };
+            if dropped > 0 {
+                hits.push(path);
+            }
+        }
+        hits.dedup();
+        hits
+    }
+
+    /// `oracle_orphan_dupes` on the root connection `root`: for each request key the oracle
+    /// lists twice (at most [`ROW_RULE_CHECKS`]), our copy's block is located on ours and the
+    /// node's canonical header at that (chain, height) is asked through `oracle_orphans`
+    /// (REST R-P5P9-48 rule, `header/branch`, its cache and budget). Only the oracle's copies
+    /// in another block than a node-canonical one of ours leave. Returns the rows dropped.
+    async fn oracle_orphan_dupes(
+        &self,
+        ta: &Target,
+        root: &str,
+        a: &mut Answer,
+        b: &mut Answer,
+    ) -> usize {
+        use crate::graphql_norm::{conn_block_of, drop_copies, dupe_copies};
+        let ptr = format!("/data/{root}");
+        let (Some(ca), Some(cb)) = (a.body.pointer(&ptr), b.body.pointer(&ptr)) else {
+            return 0;
+        };
+        let mut va = Vec::new();
+        let mut vb = Vec::new();
+        for (rk, copies) in dupe_copies(cb).into_iter().take(ROW_RULE_CHECKS) {
+            let Some(abh) = conn_block_of(ca, &rk) else {
+                continue;
+            };
+            let q = "query($h: String!) { block(hash: $h) { chainId height } }";
+            let Some(blk) = self.gql_read(ta, q, json!({ "h": abh })).await else {
+                continue;
+            };
+            let at = |k: &str| text_decimal(blk.pointer(&format!("/block/{k}")));
+            let (Some(c), Some(h)) = (
+                at("chainId").and_then(|c| c.parse::<u8>().ok()),
+                at("height").and_then(|h| h.parse::<u64>().ok()),
+            ) else {
+                continue;
+            };
+            va.push(json!({"requestKey": rk, "blockHash": abh, "chain": c, "height": h}));
+            vb.extend(
+                copies
+                    .into_iter()
+                    .map(|bh| json!({"requestKey": rk, "blockHash": bh})),
+            );
+        }
+        if va.is_empty() {
+            return 0;
+        }
+        let (mut va, mut vb) = (Value::Array(va), Value::Array(vb));
+        let moved = self.oracle_orphans(&mut va, &mut vb).await;
+        let drop: Vec<(String, String)> = moved
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.get("requestKey")?.as_str()?.to_string(),
+                    r.get("blockHash")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let cap = self.cfg.graphql.total_count_cap;
+        b.body
+            .pointer_mut(&ptr)
+            .map_or(0, |cb| drop_copies(cb, &drop, cap))
+    }
+
+    /// `by_key_extra_row` on the root list `root`: a row only ours lists (at most
+    /// [`ROW_RULE_CHECKS`]) leaves when the node's `/local` `(coin.details "<account>")`
+    /// guard holds the key `publicKey`, on the chain the row names or else the first chain
+    /// whose guard holds the key on ours. One single-row read per row, through the shared
+    /// `/local` limiter; never a scan. Returns the rows dropped.
+    async fn by_key_extra_rows(
+        &self,
+        ta: &Target,
+        root: &str,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &Answer,
+    ) -> usize {
+        use crate::graphql_norm::{extra_rows, guard_holds};
+        let ptr = format!("/data/{root}");
+        let Some(pk) = vars.get("publicKey").and_then(Value::as_str) else {
+            return 0;
+        };
+        let coin = |v: Option<&Value>| v.is_none_or(|f| f.is_null() || f.as_str() == Some("coin"));
+        if !coin(vars.get("fungibleName")) {
+            return 0;
+        }
+        let (Some(Value::Array(ra)), Some(Value::Array(rb))) =
+            (a.body.pointer(&ptr), b.body.pointer(&ptr))
+        else {
+            return 0;
+        };
+        let mut accepted = Vec::new();
+        for i in extra_rows(ra, rb).into_iter().take(ROW_RULE_CHECKS) {
+            let row = &ra[i];
+            let Some(account) = row.get("accountName").and_then(Value::as_str) else {
+                continue;
+            };
+            if !coin(row.get("fungibleName")) {
+                continue;
+            }
+            let chain = match text_decimal(row.get("chainId")) {
+                Some(c) => c.parse::<u8>().ok(),
+                None => self.gql_key_chain(ta, account, pk).await,
+            };
+            let Some(chain) = chain else {
+                continue;
+            };
+            let (r, secs) = self.gql_local().details_timed(chain, "coin", account).await;
+            self.gql_count(ROW_RULE_ROUTE, "node", &[(secs * 1000.0) as u64]);
+            if let Ok(kdx_node::Local::Found { value, .. }) = r {
+                if guard_holds(&value.guard, pk) {
+                    accepted.push(i);
+                }
+            }
+        }
+        let n = accepted.len();
+        if let Some(Value::Array(ra)) = a.body.pointer_mut(&ptr) {
+            for i in accepted.into_iter().rev() {
+                ra.remove(i);
+            }
+        }
+        n
+    }
+
+    /// The first chain (by id) where our guard of `account` holds `key`: the chain the node
+    /// is asked on.
+    async fn gql_key_chain(&self, ta: &Target, account: &str, key: &str) -> Option<u8> {
+        let q = "query($a: String!) { fungibleAccount(accountName: $a, fungibleName: \"coin\") { chainAccounts { chainId guard { ... on KeysetGuard { keys } } } } }";
+        let d = self.gql_read(ta, q, json!({ "a": account })).await?;
+        d.pointer("/fungibleAccount/chainAccounts")?
+            .as_array()?
+            .iter()
+            .filter(|r| {
+                r.get("guard")
+                    .is_some_and(|g| crate::graphql_norm::guard_holds(g, key))
+            })
+            .filter_map(|r| text_decimal(r.get("chainId"))?.parse::<u8>().ok())
+            .min()
+    }
+
+    /// Whether the node's block(s) at `(chain, h)` carry a coinbase that paid `account`
+    /// (R-P5P9-58: the one-block skew needs the balance to have changed at `h`). Header range
+    /// at one height (any fork) and that block's payload; at most 3 blocks.
+    async fn mined_at(&self, chain: u8, h: u64, account: &str) -> bool {
+        let Ok(page) = self.node.headers(chain, h, h, Some(3), None).await else {
+            return false;
+        };
+        self.count_request(ROW_RULE_ROUTE, "node", 1);
+        for hd in page.items {
+            let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
+                continue;
+            };
+            self.count_request(ROW_RULE_ROUTE, "node", 1);
+            if let Ok(p) = self.node.payload_with_outputs(chain, ph).await {
+                if crate::graphql_norm::coinbase_pays(&p, account) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1474,7 +1707,9 @@ impl Ctx {
     /// GraphQL chain balances and guards against `/local` `details` (H-1), retried once after a
     /// pause because both sides read a moving tip. R-P5P9-57: our `Float` balance compares
     /// with the node's decimal at f64 precision (F2, a visible hit), and a balance that is
-    /// still one coinbase below the node's after the retry is a one-block skew (class `skew`).
+    /// still one coinbase below the node's after the retry is a one-block skew (class `skew`)
+    /// when the node's block at its read height paid that coinbase to the account. R-P5P9-58:
+    /// F2 here is exact f64 equality, and a record with real diffs keeps its skew entries.
     async fn gql_node_balance(
         &self,
         ta: &Target,
@@ -1482,13 +1717,7 @@ impl Ctx {
         vars: &Map<String, Value>,
         _s: &Sample,
     ) -> Outcome {
-        let local = kdx_node::LocalClient::new(
-            self.node.clone(),
-            kdx_node::LocalOpts {
-                rps: self.cfg.node_max_rps.max(1),
-                concurrency: 1,
-            },
-        );
+        let local = self.gql_local();
         let account = vars
             .get("accountName")
             .and_then(Value::as_str)
@@ -1552,20 +1781,27 @@ impl Ctx {
                         a: r.get("balance").cloned(),
                         b: Some(json!(det.balance)),
                     };
+                    // F2 on this pair is exact f64 equality: our Float is the node's decimal
+                    // rounded once (R-P5P9-58).
                     let ours = r.get("balance").and_then(crate::graphql_norm::num_f64);
                     let theirs = det.balance.trim().parse::<f64>().ok();
                     let reward =
                         crate::rewards::block_reward(node_h, self.graph.chains_at(node_h).len());
-                    match (ours, theirs, reward) {
-                        (Some(x), Some(y), _) if crate::graphql_norm::f64_eq(x, y) => {
-                            floats = true;
+                    if ours.is_some() && ours == theirs {
+                        floats = true;
+                    } else if match (ours, reward) {
+                        (Some(x), Some(rw)) => {
+                            crate::graphql_norm::one_block_skew(x, &det.balance, rw)
+                                && self.mined_at(chain, node_h, &account).await
                         }
-                        (Some(x), _, Some(rw))
-                            if crate::graphql_norm::one_block_skew(x, &det.balance, rw) =>
-                        {
-                            skews.push(entry);
-                        }
-                        _ => d.push(entry),
+                        _ => false,
+                    } {
+                        skews.push(DiffEntry {
+                            path: format!("/chain{chain}/balance~skew"),
+                            ..entry
+                        });
+                    } else {
+                        d.push(entry);
                     }
                 }
                 if let Some(g) = r.get("guard").filter(|g| g.get("keys").is_some()) {
@@ -1611,7 +1847,11 @@ impl Ctx {
                 skews,
                 "skew",
                 &[],
-                Some("one block of coinbase behind /local after the retry (R-P5P9-57)".into()),
+                Some(
+                    "one block of coinbase behind /local after the retry; the node's block at \
+                     its read height paid it (R-P5P9-57/-58)"
+                        .into(),
+                ),
             );
         }
         if floats {
@@ -1622,6 +1862,8 @@ impl Ctx {
                 b: None,
             });
         }
+        // R-P5P9-58: a record with real diffs keeps its skew entries too.
+        last.extend(skews);
         self.gql_node_outcome(op, vars, ta, last, &Value::Null)
     }
 
@@ -1707,13 +1949,14 @@ impl Ctx {
                 .and_then(|x| text_decimal(x.get("balance")))
                 .unwrap_or_default();
             if !same_decimal(&text_decimal(r.get("balance")).unwrap_or_default(), &want) {
-                // R-P5P9-57 F2: our `Float` against the native decimal at f64 precision.
+                // R-P5P9-57 F2: our `Float` against the native decimal, exact f64 equality
+                // (one rounding, R-P5P9-58).
                 let float = matches!(
                     (
                         r.get("balance").and_then(crate::graphql_norm::num_f64),
                         want.parse::<f64>().ok(),
                     ),
-                    (Some(x), Some(y)) if crate::graphql_norm::f64_eq(x, y)
+                    (Some(x), Some(y)) if x == y
                 );
                 d.push(DiffEntry {
                     path: if float {
@@ -1778,6 +2021,8 @@ pub fn unpaired_kinds(ops: &[GqlOp]) -> BTreeMap<String, String> {
 
 /// `run` loops: the oracle lane takes GraphQL steps back to back (paced by the oracle's
 /// limiter), the node lane one step every `graphql.node_step_ms`, both until `stopping`.
+/// Returns once both lanes finished their last step, so `run` flushes the final summary
+/// after them (R-P5P9-58).
 pub async fn run_loop(ctx: Arc<Ctx>) {
     // Every (pair, operation) shows in the summary from the start, so a gate sees an operation
     // that never got a compare as "0 compared" instead of not at all.
@@ -1790,12 +2035,15 @@ pub async fn run_loop(ctx: Arc<Ctx>) {
         s.graphql_unpaired.clone_from(&ctx.gql.unpaired);
     }
     let node = ctx.clone();
-    tokio::spawn(async move {
+    let node_lane = tokio::spawn(async move {
         let every = Duration::from_millis(node.cfg.graphql.node_step_ms);
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        while !node.stopping.load(Ordering::Relaxed) {
+        loop {
             tick.tick().await;
+            if node.stopping.load(Ordering::Relaxed) {
+                break;
+            }
             if let Err(e) = node.gql_step(false).await {
                 tracing::warn!(error = %format!("{e:#}"), "graphql node step");
                 node.count_class("graphql", "gen-error");
@@ -1809,6 +2057,7 @@ pub async fn run_loop(ctx: Arc<Ctx>) {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
+    let _ = node_lane.await;
 }
 
 /// `once --graphql <stem>`: one compare of that operation per configured pair.
@@ -2085,10 +2334,7 @@ mod tests {
         );
         let paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, ["/data/transaction/cmd/nonce", F7_PATH]);
-        let rules = [FieldRule {
-            field: "cmd.nonce".into(),
-            rule: FieldRuleKind::JsonUnquote,
-        }];
+        let rules = [FieldRule::new("cmd.nonce", FieldRuleKind::JsonUnquote)];
         let d = compare_answers(&mut ans(ours), &mut ans(theirs), u64::MAX, 10_000, &rules);
         let mut paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
         paths.sort_unstable();
@@ -2113,6 +2359,93 @@ mod tests {
             d.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
             [TIE_CUT_PATH]
         );
+    }
+
+    /// R-P5P9-58 Important 3: a page whose rows all share one height (a block's transactions)
+    /// is compared in full as a set even when both sides continue; one missing row stays a
+    /// diff, and the same rows in another order match.
+    #[test]
+    fn a_single_height_page_with_a_missing_row_stays_a_diff() {
+        let ans = |body: Value| Answer {
+            body,
+            status: 200,
+            raw: String::new(),
+            ms: Vec::new(),
+        };
+        let page = |keys: &[&str], n: usize| {
+            let e: Vec<Value> = keys
+                .iter()
+                .map(|k| json!({"node": {"hash": k, "result": {"height": 7}}}))
+                .collect();
+            json!({"data": {"transactions": {"edges": e[..n].to_vec(), "pageInfo": {"hasNextPage": true}}}})
+        };
+        // Ours lists r1 r2 r3; the oracle has r1 r3 r4 (r2 missing), both pages continue.
+        let d = compare_answers(
+            &mut ans(page(&["r1", "r2", "r3"], 3)),
+            &mut ans(page(&["r1", "r3", "r4"], 3)),
+            u64::MAX,
+            10_000,
+            &[],
+        );
+        assert!(!d.is_empty());
+        assert!(d
+            .iter()
+            .all(|e| e.path.starts_with("/data/transactions/edges/")));
+        // The same rows in another order: a match.
+        let d = compare_answers(
+            &mut ans(page(&["r1", "r2", "r3"], 3)),
+            &mut ans(page(&["r3", "r1", "r2"], 3)),
+            u64::MAX,
+            10_000,
+            &[],
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    /// R-P5P9-58: `count_lower_bound` reads our raw `extensions` (dropped later by
+    /// `normalize_gql`) and accepts only our flagged count at or below the oracle's.
+    #[test]
+    fn a_flagged_lower_count_is_a_visible_hit_and_unflagged_stays_a_diff() {
+        use crate::graphql_norm::COUNT_LOWER_BOUND_PATH;
+        let rules = [FieldRule::new("totalCount", FieldRuleKind::CountLowerBound)];
+        let body = |n: u64, flag: bool| {
+            let mut v = json!({"data": {"transfers": {"totalCount": n, "edges": [],
+                "pageInfo": {"hasNextPage": false}}}});
+            if flag {
+                v["extensions"] = json!({"totalCountLowerBound": true});
+            }
+            Answer {
+                body: v,
+                status: 200,
+                raw: String::new(),
+                ms: Vec::new(),
+            }
+        };
+        let paths = |d: Vec<DiffEntry>| d.into_iter().map(|e| e.path).collect::<Vec<_>>();
+        let d = compare_answers(
+            &mut body(1663, true),
+            &mut body(4590, false),
+            u64::MAX,
+            10_000,
+            &rules,
+        );
+        assert_eq!(paths(d), [COUNT_LOWER_BOUND_PATH]);
+        let d = compare_answers(
+            &mut body(1663, false),
+            &mut body(4590, false),
+            u64::MAX,
+            10_000,
+            &rules,
+        );
+        assert_eq!(paths(d), ["/data/transfers/totalCount"]);
+        let d = compare_answers(
+            &mut body(4600, true),
+            &mut body(4590, false),
+            u64::MAX,
+            10_000,
+            &rules,
+        );
+        assert_eq!(paths(d), ["/data/transfers/totalCount"]);
     }
 
     #[test]
@@ -2354,7 +2687,10 @@ mod tests {
             a: None,
             b: None,
         };
-        use crate::graphql_norm::{F2_PATH, F7_PATH, FIELD_PATH, TIE_CUT_PATH};
+        use crate::graphql_norm::{
+            BY_KEY_EXTRA_PATH, COUNT_LOWER_BOUND_PATH, F2_PATH, F7_PATH, FIELD_PATH,
+            ORACLE_EMPTY_PATH, ORPHAN_DUPES_PATH, TIE_CUT_PATH,
+        };
         let hits = [
             PAGE_CUT_PATH,
             TOTALCOUNT_CAP_PATH,
@@ -2363,11 +2699,23 @@ mod tests {
             F7_PATH,
             FIELD_PATH,
             TIE_CUT_PATH,
+            ORACLE_EMPTY_PATH,
+            COUNT_LOWER_BOUND_PATH,
+            ORPHAN_DUPES_PATH,
+            BY_KEY_EXTRA_PATH,
         ]
         .map(|p| entry(p, DiffKind::Changed));
         let (un, ids) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &hits);
         assert!(un.is_empty(), "{un:?}");
-        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.len(), 11);
+        for id in [
+            "graphql-r58-oracle-empty",
+            "graphql-r58-count-lower-bound",
+            "graphql-r58-oracle-orphan-dupes",
+            "graphql-r58-by-key-extra-row",
+        ] {
+            assert!(ids.iter().any(|i| i == id), "{id} not hit: {ids:?}");
+        }
         // A real difference on a GraphQL request is not allowlisted.
         let real = [entry("/data/block/hash", DiffKind::Changed)];
         let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &real);

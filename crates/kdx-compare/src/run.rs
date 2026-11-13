@@ -506,7 +506,7 @@ impl Ctx {
         self.tips.refresh(&self.node, self.primary()).await
     }
 
-    fn count_request(&self, route: &str, target: &str, n: usize) {
+    pub(crate) fn count_request(&self, route: &str, target: &str, n: usize) {
         let mut s = self.summary.lock().expect("summary");
         for _ in 0..n {
             self.metrics.request(route, target);
@@ -2099,7 +2099,7 @@ impl Ctx {
         Some(h)
     }
 
-    async fn oracle_orphans(&self, va: &mut Value, vb: &mut Value) -> Vec<Value> {
+    pub(crate) async fn oracle_orphans(&self, va: &mut Value, vb: &mut Value) -> Vec<Value> {
         let (Value::Array(xa), Value::Array(xb)) = (&mut *va, &mut *vb) else {
             return Vec::new();
         };
@@ -2819,9 +2819,13 @@ pub async fn run(cfg: CompareConfig, max_secs: Option<u64>) -> anyhow::Result<()
             }
         });
     }
-    if ctx.cfg.has_graphql_pairs() {
-        tokio::spawn(crate::graphql::run_loop(ctx.clone()));
-    }
+    // The GraphQL lanes are awaited by `finish`, so their last steps land before the final
+    // summary flush (R-P5P9-58).
+    let gql: Vec<tokio::task::JoinHandle<()>> = if ctx.cfg.has_graphql_pairs() {
+        vec![tokio::spawn(crate::graphql::run_loop(ctx.clone()))]
+    } else {
+        Vec::new()
+    };
     let rest = ctx
         .cfg
         .pairs
@@ -2847,7 +2851,7 @@ pub async fn run(cfg: CompareConfig, max_secs: Option<u64>) -> anyhow::Result<()
         });
         shutdown_signal(max_secs).await;
         let (tx, _rx) = mpsc::channel::<Request>(1);
-        return finish(ctx, tx, Vec::new()).await;
+        return finish(ctx, tx, gql).await;
     }
     let graph = ctx.node.chain_graph().await?;
     let random = Some(RandomGen::new(
@@ -2871,7 +2875,7 @@ pub async fn run(cfg: CompareConfig, max_secs: Option<u64>) -> anyhow::Result<()
         tokio::spawn(coins_cadence(tx.downgrade(), Duration::from_secs(secs)));
     }
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
-    let mut workers = Vec::new();
+    let mut workers = gql;
     for _ in 0..WORKERS {
         let ctx = ctx.clone();
         let rx = rx.clone();

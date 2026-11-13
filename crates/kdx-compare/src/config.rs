@@ -99,13 +99,31 @@ pub struct FieldRule {
     /// `/data/transfers/edges/3/node/amount`.
     pub field: String,
     pub rule: FieldRuleKind,
+    /// Optional exact value of our side (`oracle_null`, `oracle_empty`): a string's text, or
+    /// a number's decimal value. The rule then explains only that value (R-P5P9-58).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ours: Option<String>,
+    /// Optional exact value of the oracle's side (`ours_null`), as for `ours`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<String>,
+}
+
+impl FieldRule {
+    pub fn new(field: &str, rule: FieldRuleKind) -> FieldRule {
+        FieldRule {
+            field: field.into(),
+            rule,
+            ours: None,
+            oracle: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldRuleKind {
-    /// One side is the other's string JSON-encoded once more (F5 `cmd.nonce`, F6
-    /// `payload.code`).
+    /// Ours is the oracle's string JSON-encoded once more, never the other way (F5
+    /// `cmd.nonce`; R-P5P9-58).
     JsonUnquote,
     /// `null` and `""` are the same (F8 signer `scheme`).
     NullOrEmpty,
@@ -120,6 +138,40 @@ pub enum FieldRuleKind {
     /// Our `null` against any value of the oracle's: only where the node confirmed that the
     /// field has no value (rule (a)).
     OursNull,
+    /// The oracle's `""` against a non-null value of ours (F8 `signers.scheme` present: the
+    /// node's scheme is ours, R-P5P9-58). Visible hit `/~graphql-r58-oracle-empty`.
+    OracleEmpty,
+    /// A count our response flags as a lower bound (`extensions.totalCountLowerBound`,
+    /// R-P5P9-14) below the oracle's. Visible hit `/~graphql-r58-count-lower-bound`.
+    CountLowerBound,
+    /// Row rule; `field` names a root connection of transactions. A request key the oracle
+    /// lists twice loses each copy outside our block once the node shows our block is
+    /// canonical (`oracle_orphans`); the oracle's `totalCount` drops by the copies dropped.
+    /// Visible hit `/~graphql-r58-oracle-orphan-dupes`.
+    OracleOrphanDupes,
+    /// Row rule; `field` names a root by-key account list. A row only ours lists leaves when
+    /// the node's `/local` `(coin.details "<account>")` guard, on the chain ours lists for the
+    /// key, holds the key. Visible hit `/~graphql-r58-by-key-extra-row`.
+    ByKeyExtraRow,
+}
+
+impl FieldRuleKind {
+    /// Rules on the rows of a root field, applied before the diff (with node reads).
+    pub fn is_row(self) -> bool {
+        matches!(
+            self,
+            FieldRuleKind::OracleOrphanDupes | FieldRuleKind::ByKeyExtraRow
+        )
+    }
+
+    /// The exact-value matchers the rule takes: (ours, oracle).
+    pub fn matchers(self) -> (bool, bool) {
+        match self {
+            FieldRuleKind::OursNull => (false, true),
+            FieldRuleKind::OracleNull | FieldRuleKind::OracleEmpty => (true, false),
+            _ => (false, false),
+        }
+    }
 }
 
 impl Default for GraphqlConfig {
@@ -286,6 +338,21 @@ impl CompareConfig {
             if r.field.is_empty() || r.field.split('.').any(str::is_empty) {
                 bail!("graphql.field_rules: bad field {:?}", r.field);
             }
+            let (ours, oracle) = r.rule.matchers();
+            if (r.ours.is_some() && !ours) || (r.oracle.is_some() && !oracle) {
+                bail!(
+                    "graphql.field_rules: {:?} on {:?} takes no matcher on that side",
+                    r.rule,
+                    r.field
+                );
+            }
+            if r.rule.is_row() && r.field.contains('.') {
+                bail!(
+                    "graphql.field_rules: {:?} needs a root field name, not {:?}",
+                    r.rule,
+                    r.field
+                );
+            }
         }
         for (w, n) in [
             (self.mix.replay, "replay"),
@@ -410,10 +477,7 @@ max_height = 6000000
         assert_eq!(c.graphql.node_step_ms, 5000);
         assert_eq!(
             c.graphql.field_rules[1],
-            FieldRule {
-                field: "signers.scheme".into(),
-                rule: FieldRuleKind::NullOrEmpty
-            }
+            FieldRule::new("signers.scheme", FieldRuleKind::NullOrEmpty)
         );
         let bad = text.replace("signers.scheme", "signers..scheme");
         let c: CompareConfig = toml::from_str(&bad).unwrap();
@@ -423,5 +487,52 @@ max_height = 6000000
         assert!(c.validate().is_err());
         let unknown = text.replace("json_unquote", "ignore");
         assert!(toml::from_str::<CompareConfig>(&unknown).is_err());
+    }
+
+    /// The CG-2 `field_rules` (R-P5P9-58), as recorded in the P7H report: they parse and
+    /// validate, the matchers land on the right side, and a matcher a kind does not take, or
+    /// a row rule on a dotted field, is refused at load.
+    #[test]
+    fn cg2_field_rules_parse_with_matchers_and_row_kinds() {
+        let rules = r#"[graphql]
+field_rules = [
+  { field = "cmd.nonce",                   rule = "json_unquote" },
+  { field = "payload.pactId",              rule = "oracle_null" },
+  { field = "result.transactionId",        rule = "ours_null", oracle = "0" },
+  { field = "result.goodResult",           rule = "oracle_null", ours = "\"\"" },
+  { field = "signers.scheme",              rule = "oracle_empty" },
+  { field = "events.parameters",           rule = "json_numbers_by_value" },
+  { field = "totalCount",                  rule = "count_lower_bound" },
+  { field = "transactionsByPublicKey",     rule = "oracle_orphan_dupes" },
+  { field = "fungibleAccountsByPublicKey", rule = "by_key_extra_row" },
+]
+[node]"#;
+        let text = BASE.replace("[node]", rules);
+        let c: CompareConfig = toml::from_str(&text).unwrap();
+        c.validate().unwrap();
+        let r = &c.graphql.field_rules;
+        assert_eq!(r.len(), 9);
+        assert_eq!(
+            (r[2].ours.as_deref(), r[2].oracle.as_deref()),
+            (None, Some("0"))
+        );
+        assert_eq!(r[3].ours.as_deref(), Some("\"\""));
+        assert_eq!(r[4].rule, FieldRuleKind::OracleEmpty);
+        assert!(r[7].rule.is_row() && r[8].rule.is_row());
+        for bad in [
+            text.replace("rule = \"ours_null\", oracle", "rule = \"ours_null\", ours"),
+            text.replace(
+                "rule = \"oracle_null\", ours",
+                "rule = \"oracle_null\", oracle",
+            ),
+            text.replace("\"json_unquote\" }", "\"json_unquote\", ours = \"x\" }"),
+            text.replace(
+                "\"transactionsByPublicKey\"",
+                "\"x.transactionsByPublicKey\"",
+            ),
+        ] {
+            let c: CompareConfig = toml::from_str(&bad).unwrap();
+            assert!(c.validate().is_err(), "{bad}");
+        }
     }
 }
