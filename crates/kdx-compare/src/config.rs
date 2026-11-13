@@ -502,7 +502,8 @@ field_rules = [
   { field = "result.goodResult",           rule = "oracle_null", ours = "\"\"" },
   { field = "signers.scheme",              rule = "oracle_empty" },
   { field = "events.parameters",           rule = "json_numbers_by_value" },
-  { field = "totalCount",                  rule = "count_lower_bound" },
+  { field = "transfers.totalCount",        rule = "count_lower_bound" },
+  { field = "transactions.totalCount",     rule = "count_lower_bound" },
   { field = "transactionsByPublicKey",     rule = "oracle_orphan_dupes" },
   { field = "fungibleAccountsByPublicKey", rule = "by_key_extra_row" },
 ]
@@ -511,14 +512,14 @@ field_rules = [
         let c: CompareConfig = toml::from_str(&text).unwrap();
         c.validate().unwrap();
         let r = &c.graphql.field_rules;
-        assert_eq!(r.len(), 9);
+        assert_eq!(r.len(), 10);
         assert_eq!(
             (r[2].ours.as_deref(), r[2].oracle.as_deref()),
             (None, Some("0"))
         );
         assert_eq!(r[3].ours.as_deref(), Some("\"\""));
         assert_eq!(r[4].rule, FieldRuleKind::OracleEmpty);
-        assert!(r[7].rule.is_row() && r[8].rule.is_row());
+        assert!(r[8].rule.is_row() && r[9].rule.is_row());
         for bad in [
             text.replace("rule = \"ours_null\", oracle", "rule = \"ours_null\", ours"),
             text.replace(
