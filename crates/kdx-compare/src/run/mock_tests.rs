@@ -427,3 +427,35 @@ async fn pactid_gap_on_a_full_page() {
     assert_eq!(class, "allowlisted", "unexplained: {paths:?}");
     assert_eq!(ids, vec!["oracle-gap".to_string()]);
 }
+
+/// /coins against a chainweb-data 145 heights behind: 2,621.7 KDA lower is that gap (the
+/// coinbase minted over it is 2,621.73 KDA). With the tips equal it is a diff.
+#[tokio::test]
+async fn coins_lag_scales_with_the_tip_gap() {
+    let side = |coins: &str, tip: u64| SideMock {
+        coins: coins.into(),
+        recent: recent_at(tip),
+        ..SideMock::default()
+    };
+    let out = tempfile::tempdir().unwrap();
+    let (ctx, _) = setup(
+        canon_node(&[], 0..0),
+        side("379699987.13176", 7_400_100),
+        side("379697365.43176", 7_399_955),
+        out.path(),
+    )
+    .await;
+    let (class, ids, paths) = compare(&ctx, "/coins").await;
+    assert_eq!(class, "allowlisted", "unexplained: {paths:?}");
+    assert_eq!(ids, vec!["oracle-tip-lag".to_string()]);
+    let out = tempfile::tempdir().unwrap();
+    let (ctx, _) = setup(
+        canon_node(&[], 0..0),
+        side("379699987.13176", 7_400_100),
+        side("379697365.43176", 7_400_100),
+        out.path(),
+    )
+    .await;
+    let (class, _, paths) = compare(&ctx, "/coins").await;
+    assert_eq!((class.as_str(), paths), ("diff", vec!["/".to_string()]));
+}
