@@ -134,42 +134,6 @@ condition = "any"
 reason = "/txs/search?pactid= orders by success then height only; chainweb-data leaves ties to Postgres, which answered them in both request-key orders live (2026-11-11). The harness sorts ties by request key on both sides and reports this visible hit."
 owner_note = "Run 6B finding; kda-indexer answers ties request key ascending."
 
-[[entry]]
-id = "cwd-search-orphan-x4ltrweu"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "pactid=X4ltrWEU0sBD6h9w1hoo0Rq0IZAkYYpMQryxE9gNycI"
-reason = "chainweb-data lists request key wcGKSfLP... (chain 15, height 6911978) twice, once in block 8CcRJjft..., which is not on the node's canonical branch (node canonical wiC6zHHi..., the block kda-indexer lists). The extra row shifts the rest of the 50-row page (seen live 2026-11-12 23:54Z, re-checked 2026-11-13 07:00Z). The harness has no orphan or tie handling on /txs/search yet (FV item T-3), so this entry is tied to one request; it hides every diff on that request."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-46 (run 6E-3)."
-
-[[entry]]
-id = "cwd-search-orphan-9inv2zb3"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "pactid=9INv2Zb37Sq8K23Lm2YWmQz9S6naeltW2Fvyw_mpy0k"
-reason = "chainweb-data lists a row of this pact at chain 2, height 7399318 in block oC2lnmOL..., which is not on the node's canonical branch (node canonical OHz-ZmnP..., the block kda-indexer lists); the rows after it shift (seen live 2026-11-13 00:24Z and 01:19Z). The harness has no orphan or tie handling on /txs/search yet (FV item T-3), so this entry is tied to one request; it hides every diff on that request."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-46 (run 6E-3)."
-
-[[entry]]
-id = "cwd-search-orphan-2c-read-keyset"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "search=2c%22+%28read-keyset&minheight=6119317"
-reason = "chainweb-data lists an extra row ZvhrI88e... at chain 19, height 6119366 in a block that is not on the node's canonical branch; without it both pages are the same (seen live 2026-11-13 00:56Z, re-checked 07:00Z). The harness has no orphan or tie handling on /txs/search yet (FV item T-3), so this entry is tied to one request; it hides every diff on that request."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-46 (run 6E-3)."
-
-[[entry]]
-id = "cwd-search-orphan-tie-8ce71ed5"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "search=8ce71ed5a3b5a63ebf%22+%28rea&minheight=5058068"
-reason = "chainweb-data lists request key uz40uGd0... at chain 4, height 5058119 in a block that is not on the node's canonical branch (kda-indexer lists it in the node's canonical block) and at another position among the rows of that height, so the page differs from row 10 on (seen live 2026-11-13 00:11Z, re-checked 07:00Z). The harness has no orphan or tie handling on /txs/search yet (FV item T-3), so this entry is tied to one request; it hides every diff on that request."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-46 (run 6E-3)."
-
 # --- Run 6E-3 oracle defects (ruling R-P5P9-47; node evidence in the run 6E-3 report) ---
 
 [[entry]]
@@ -208,79 +172,7 @@ request_contains = "d7bf62"
 reason = "kda-txs lists no row for a transfer-crosschain continuation (request key 4GTkBWgc..., chain 2, height 7124688, code null) that kda-indexer lists at /9 of k:d7bf62.../coin/250. The node's /poll has it in block ljtUuFCZ..., which is canonical, with 4 events and 3 of them naming the account. Seen live 2026-11-13 02:00Z. The kdatxs-gap and kdatxs-missing-node checks did not fire (FV item T-3), so this entry is tied to one account."
 owner_note = "Oracle defect under ruling R3E-15 (node agrees with kda-indexer, kda-txs differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
 
-[[entry]]
-id = "balances-tip-skew-e7f7130f"
-route = "balances"
-json_path_glob = "/**"
-condition = "changed"
-request_contains = "e7f7130f"
-reason = "native /balances against the node's /local, token coin chain 12: kda-indexer answered as_of 7400410 with 32186.381987524380 and the node at 7400412 with 32187.286033524380. The difference is exactly one coinbase of 0.904046 to this miner account at 7400412 (compat /txs/account lists it). The harness skew rule covers a one-height gap and missed this two-height one (FV item T-3). Seen live 2026-11-13 07:38Z."
-owner_note = "Tip skew, not a kda-indexer diff; allowlisted by ruling R-P5P9-47 (run 6E-3 report), tied to one account."
-
-# --- /txs/search records of run 6E-3 (ruling R-P5P9-47) ---
-
-[[entry]]
-id = "cwd-search-hole-au4cjml8"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "pactid=Au4cjML8"
-reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): chainweb-data lists nothing for pact Au4cjML8..., while kda-indexer lists its 2 continuations at chain 1 height 7392368, which are canonical on the node (seen live 2026-11-13 02:34Z). Tied to one pact until the harness has a node check on /txs/search (FV item T-3)."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
-
-[[entry]]
-id = "cwd-search-hole-h3st"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "pactid=h3St"
-reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): chainweb-data lists nothing for the rows kda-indexer lists for pact h3St... (chain 19 heights 7392051 and 7392087), which are canonical on the node; the page also holds one orphan row (seen live 2026-11-13 04:14Z). Tied to one pact until the harness has a node check on /txs/search (FV item T-3)."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
-
-[[entry]]
-id = "cwd-search-behind-5unn"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "pactid=5unn"
-reason = "chainweb-data trails on chain 0 for this live pact: kda-indexer's top rows (heights 7400064 and above) are canonical on the node, while chainweb-data's newest row at that moment is 60-150 heights lower (4 records, seen live 2026-11-13 04:43Z to 07:16Z). Same class as oracle-tip-lag, whose clamp does not cover /txs/search (FV item T-3)."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
-
-[[entry]]
-id = "cwd-search-behind-will"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "pactid=WiLl"
-reason = "chainweb-data trails on chain 2 for this live pact: kda-indexer's top rows (heights 7400312 and 7400313) are canonical on the node, while chainweb-data's newest row at that moment is 60-150 heights lower (2 records, seen live 2026-11-13 06:53Z and 07:00Z). Same class as oracle-tip-lag, whose clamp does not cover /txs/search (FV item T-3)."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
-
-[[entry]]
-id = "cwd-search-orphan-srebx"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "pactid=sReB"
-reason = "chainweb-data lists rows of this pact in blocks that are not on the node's canonical branch (checked with /header/branch from the cut) or are unknown to the node; kda-indexer's blocks are canonical, and without the orphan rows the pages are equal (2 records, seen live 2026-11-13 07:10Z and 07:35Z). Tied to one pact until the harness has orphan handling on /txs/search (FV item T-3)."
-owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
-
-[[entry]]
-id = "oracle-unstable-search-jdgt"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "pactid=JDgT"
-reason = "chainweb-data answered 0 rows when the request was fetched again (2026-11-13 07:41Z); all of kda-indexer's rows are canonical on the node. The original chainweb-data rows were not kept, so the diff cannot be classified further."
-owner_note = "Oracle unstable under ruling R3E-15 / R-P5P9-47 (run 6E-3 report)."
-
-[[entry]]
-id = "oracle-unstable-search-payment-amount"
-route = "search"
-json_path_glob = "/**"
-condition = "any"
-request_contains = "payment-amount"
-reason = "chainweb-data answered 0 rows when the request (search=al 'payment-amount ))...) was fetched again (2026-11-13 07:17Z); all of kda-indexer's rows are canonical on the node. The original chainweb-data rows were not kept, so the diff cannot be classified further."
-owner_note = "Oracle unstable under ruling R3E-15 / R-P5P9-47 (run 6E-3 report)."
+# --- /txs/search oracle classes (ruling R-P5P9-48; per-request 6E-3 entries removed by R-P5P9-49) ---
 
 [[entry]]
 id = "oracle-orphan"

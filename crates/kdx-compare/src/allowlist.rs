@@ -207,8 +207,8 @@ mod tests {
         assert!(ids.is_empty());
         assert!(diff_route(&RouteKind::Coins, &a, &a).is_empty());
     }
-    /// R-P5P9-47: the run 6E-3 oracle defects are tied to their requests; a genesis search
-    /// (the 6E-F defect) and other requests stay unexplained.
+    /// R-P5P9-47: the run 6E-3 chainweb-data hole and kda-txs gap entries are tied to their
+    /// requests; a genesis search (the 6E-F defect) and other requests stay unexplained.
     #[test]
     fn run_6e3_entries_are_scoped() {
         let al = shipped();
@@ -254,23 +254,20 @@ mod tests {
             "/v1/txs/k:d7bf62aa/coin/250",
             "kdatxs-gap-cont-d7bf62",
         );
-        hit(
+        // R-P5P9-49: the one-off balances and search entries are gone; the coinbase skew rule
+        // and the oracle-orphan, -lag and -gap classes cover them, so a diff on those
+        // requests stays unexplained here. A pactid diff is unexplained unless the answer
+        // says the cap cut it (pactid_cap_needs_the_header).
+        miss(
             RouteKind::Balances,
             "/api/v1/accounts/k:e7f7130fab/balances?token=coin&chain=12",
-            "balances-tip-skew-e7f7130f",
         );
         miss(RouteKind::Balances, "/api/v1/accounts/k:other/balances");
-        // search: pact-specific classes keep their own hits; any other pactid diff is
-        // unexplained unless the answer says the cap cut it (pactid_cap_needs_the_header).
-        hit(
+        miss(RouteKind::Search, "/txs/search?pactid=Au4cjML8x");
+        miss(RouteKind::Search, "/txs/search?pactid=5unnQ");
+        miss(
             RouteKind::Search,
-            "/txs/search?pactid=Au4cjML8x",
-            "cwd-search-hole-au4cjml8",
-        );
-        hit(
-            RouteKind::Search,
-            "/txs/search?pactid=5unnQ",
-            "cwd-search-behind-5unn",
+            "/txs/search?pactid=X4ltrWEU0sBD6h9w1hoo0Rq0IZAkYYpMQryxE9gNycI",
         );
         miss(RouteKind::Search, "/txs/search?pactid=wfSVxyz");
         // The genesis defect must stay visible: a plain keyset search is not allowlisted.
