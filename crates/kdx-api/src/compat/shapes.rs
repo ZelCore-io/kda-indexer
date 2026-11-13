@@ -245,10 +245,16 @@ fn parsed_decimal_text(v: &Value) -> Option<String> {
 /// Compact aeson text of `v`: keys sorted by code point at every depth, aeson numbers and
 /// string escapes.
 pub fn write_aeson(v: &Value, out: &mut Vec<u8>) {
+    write_aeson_with(v, out, &aeson_number);
+}
+
+/// [`write_aeson`] with each number's text rendered by `num` (the GraphQL adapter renders
+/// numbers as the oracle does, R-P5P9-57 F9).
+pub fn write_aeson_with(v: &Value, out: &mut Vec<u8>, num: &dyn Fn(&str) -> String) {
     match v {
         Value::Null => out.extend_from_slice(b"null"),
         Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-        Value::Number(n) => out.extend_from_slice(aeson_number(&n.to_string()).as_bytes()),
+        Value::Number(n) => out.extend_from_slice(num(&n.to_string()).as_bytes()),
         Value::String(s) => write_str(s, out),
         Value::Array(a) => {
             out.push(b'[');
@@ -256,7 +262,7 @@ pub fn write_aeson(v: &Value, out: &mut Vec<u8>) {
                 if i > 0 {
                     out.push(b',');
                 }
-                write_aeson(x, out);
+                write_aeson_with(x, out, num);
             }
             out.push(b']');
         }
@@ -270,7 +276,7 @@ pub fn write_aeson(v: &Value, out: &mut Vec<u8>) {
                 }
                 write_str(k, out);
                 out.push(b':');
-                write_aeson(&m[k], out);
+                write_aeson_with(&m[k], out, num);
             }
             out.push(b'}');
         }

@@ -110,9 +110,26 @@ impl TxData {
     pub fn key(&self) -> TxKey {
         self.rec.key
     }
-    /// Request key text (`cb` for coinbase, as compat and chainweb-data).
+    /// Request key text. A coinbase has the node's coinbase `reqKey` from its stored output,
+    /// as the oracle sends it (R-P5P9-57 F4); compat's `<coinbase>` only when the output has
+    /// none.
     pub fn rk(&self) -> String {
+        if self.is_coinbase() {
+            if let Some(rk) = self.out.get("reqKey").and_then(Value::as_str) {
+                return rk.to_owned();
+            }
+        }
         shapes::rk_text(&self.rec)
+    }
+    /// The command's `meta.creationTime` (`None` for a coinbase or a command without one).
+    pub fn meta_creation_time(&self) -> Option<crate::scalars::DateTime> {
+        let v = self.cmd.as_ref()?.pointer("/meta/creationTime")?;
+        let secs = match v {
+            Value::Number(n) => n.as_f64()?,
+            Value::String(s) => s.trim().parse().ok()?,
+            _ => return None,
+        };
+        Some(crate::scalars::DateTime((secs * 1e6) as i64))
     }
     pub fn block_hash(&self) -> String {
         self.block.hash.to_b64url()

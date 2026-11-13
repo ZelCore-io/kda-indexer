@@ -31,10 +31,13 @@ async fn tx(
 }
 
 /// The tx an event or transfer id names: a user tx by request key, or the block's coinbase
-/// (whose rows carry the coinbase request-key text, R7D-3).
+/// (whose rows carry the node's coinbase `reqKey`, R-P5P9-57 F4; ids issued before it carry
+/// compat's `<coinbase>`, still accepted).
 async fn row_tx(ctx: &Context<'_>, block_hash: String, rk: String) -> Result<Option<Arc<TxData>>> {
     if Hash32::from_b64url(&rk).is_ok() {
-        return Ok(tx(ctx, Some(block_hash), rk).await?.map(|t| t.d));
+        if let Some(t) = tx(ctx, Some(block_hash.clone()), rk.clone()).await? {
+            return Ok(Some(t.d));
+        }
     }
     let bh = hash_arg("blockHash", &block_hash)?;
     gql(ctx)
@@ -47,7 +50,9 @@ async fn row_tx(ctx: &Context<'_>, block_hash: String, rk: String) -> Result<Opt
             for rec in view.block_txs(c, h)? {
                 if rec.key.is_coinbase() {
                     let d = load(view, rec.key, Some(rec), &mut blocks)?;
-                    return Ok(d.filter(|d| d.rk() == rk));
+                    return Ok(d.filter(|d| {
+                        d.rk() == rk || rk == kdx_api::compat::shapes::COINBASE_RK_TEXT
+                    }));
                 }
             }
             Ok(None)
