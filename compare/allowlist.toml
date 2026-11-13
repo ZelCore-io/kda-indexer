@@ -286,8 +286,9 @@ route = "search"
 json_path_glob = "/**"
 condition = "any"
 request_contains = "pactid="
-reason = "/txs/search?pactid= reads only the newest 1,000 txs of a pact (PACT_CAP, R-P5P9-3 / Task 10). chainweb-data lists the pact's successful continuation first. On a pact with more than 1,000 txs that is mostly failed continuations, the old successful one is not among the newest 1,000, so kda-indexer never lists it (7 records on 4 pacts, wfSV..., hAPy..., rwdA... and gY1E..., seen live 2026-11-13 02:24Z to 08:01Z; the successful continuations are canonical, e.g. chain 1 height 6072365 and chain 5 height 5988947). Compat sends no Chainweb-Next on this route. Only pacts with more than 1,000 txs are affected."
-owner_note = "ACCEPTED as a documented compat limit (ruling R-P5P9-47; docs/api.md). The request alone cannot tell a capped pact from another one, so this entry hides every diff of a pactid request; it comes after the pact-specific entries so those keep their own hits. FV checks whether kadscan relies on the old successful continuation."
+a_header = "x-search-truncated"
+reason = "/txs/search?pactid= reads only the newest 1,000 txs of a pact (PACT_CAP, R-P5P9-3 / Task 10) and says so with X-Search-Truncated: true when that cap cut the walk. chainweb-data lists the pact's successful continuation first. On a pact with more than 1,000 txs that is mostly failed continuations, the old successful one is not among the newest 1,000, so kda-indexer never lists it (7 records on 4 pacts, wfSV..., hAPy..., rwdA... and gY1E..., seen live 2026-11-13 02:24Z to 08:01Z; the successful continuations are canonical, e.g. chain 1 height 6072365 and chain 5 height 5988947). Compat sends no Chainweb-Next on this route. Only pacts with more than 1,000 txs are affected, and only their answers carry the header; an answer without it is compared in full."
+owner_note = "ACCEPTED as a documented compat limit (ruling R-P5P9-47; docs/api.md). Made precise in R-P5P9-48: matches only answers carrying X-Search-Truncated. It comes after the pact-specific entries so those keep their own hits. FV checks whether kadscan relies on the old successful continuation."
 
 [[entry]]
 id = "cwd-transfers-gap"

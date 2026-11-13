@@ -459,3 +459,42 @@ async fn coins_lag_scales_with_the_tip_gap() {
     let (class, _, paths) = compare(&ctx, "/coins").await;
     assert_eq!((class.as_str(), paths), ("diff", vec!["/".to_string()]));
 }
+
+/// A capped `pactid` answer (X-Search-Truncated) that lacks chainweb-data's old successful
+/// continuation is the `pactid-cap` class; the same answer without the header is a diff.
+#[tokio::test]
+async fn pactid_cap_needs_kda_indexers_header() {
+    let failed = |mut r: Value| {
+        r["result"] = json!("TxFailed");
+        r
+    };
+    let a_rows = json!([
+        failed(row("f9", 1, 7_399_009, "c7399009")),
+        failed(row("f8", 1, 7_399_008, "c7399008")),
+    ]);
+    let b_rows = json!([
+        row("ok", 1, 6_072_365, "c6072365"),
+        failed(row("f9", 1, 7_399_009, "c7399009")),
+        failed(row("f8", 1, 7_399_008, "c7399008")),
+    ]);
+    for (truncated, class, ids) in [
+        (true, "allowlisted", vec!["pactid-cap".to_string()]),
+        (false, "diff", vec![]),
+    ] {
+        let out = tempfile::tempdir().unwrap();
+        let mut node = canon_node(&[1], 7_399_000..7_399_010);
+        node.canon.insert((1, 6_072_365), "c6072365".into());
+        let a = SideMock {
+            search: a_rows.clone(),
+            truncated,
+            ..SideMock::default()
+        };
+        let b = SideMock {
+            search: b_rows.clone(),
+            ..SideMock::default()
+        };
+        let (ctx, _) = setup(node, a, b, out.path()).await;
+        let got = compare(&ctx, "/txs/search?pactid=wfSVcapped").await;
+        assert_eq!((got.0.as_str(), got.1), (class, ids), "{:?}", got.2);
+    }
+}
