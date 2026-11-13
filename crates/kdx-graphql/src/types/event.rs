@@ -1,5 +1,5 @@
 //! `Event` (Task 4): one event of a loaded tx, as chainweb-data stores it (coinbase events
-//! carry request key `cb` and order index 0, as compat).
+//! carry the node's coinbase request key and order index 0, R-P5P9-57 F4).
 
 use std::sync::Arc;
 
@@ -63,8 +63,13 @@ impl Event {
     async fn order_index(&self) -> BigInt {
         BigInt::new(i128::from(self.ord_idx()))
     }
+    /// The parameters as aeson text with the oracle's number layout (`0.00000236`, not
+    /// `2.36e-6`): kadscan reads this field (R-P5P9-57 F9). `parameters` keeps the node's
+    /// numbers (no captured kadscan document requests it).
     async fn parameter_text(&self) -> String {
-        shapes::param_text(&self.ev().params)
+        let mut b = Vec::new();
+        shapes::write_aeson_with(&self.ev().params, &mut b, &crate::scalars::js_number);
+        String::from_utf8(b).unwrap_or_default()
     }
     async fn parameters(&self) -> Option<String> {
         Some(json_text(&self.ev().params))

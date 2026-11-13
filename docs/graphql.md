@@ -178,14 +178,17 @@ number open.
 
 - `Block` fields come from the stored header. `powHash` is recomputed from the binary header
   (`docs/format.md`, "Derived header fields") and rendered as chainweb-data does: lowercase
-  hex of the hash read as a big-endian number. `target` and `weight` are decimal integers
-  (chainweb-data's `numeric` columns); `difficulty` is (2^256 − 1) / target; `nonce` and
+  hex of the hash read as a big-endian number. `target` and `weight` are the node's header
+  form, base64url of the 32 little-endian bytes (the oracle agrees; R-P5P9-57 F1);
+  `difficulty` is (2^256 − 1) / target; `nonce` and
   `flags` are `Decimal` numbers; `epoch` and `creationTime` are `DateTime`s.
 - `neighbors` lists the adjacent blocks ascending by chain id. `parent` is `null` for a
   genesis block. `minerAccount` is the miner's current `coin` row on the block's chain; a
   miner without a row is a field error.
-- Block lists (`blocksFromHeight`, `blocksFromDepth`, `completedBlockHeights`) are ordered by
-  height descending, then chain ascending; forward and backward pages hold the same blocks.
+- Block lists are ordered by height, then chain ascending: `blocksFromHeight` ascending by
+  height, as the oracle lists it (R-P5P9-57 M2a); `blocksFromDepth` and
+  `completedBlockHeights` descending. Forward and backward pages hold the same blocks. The
+  order of blocks within one height is a contract choice (R3E-8).
   `blocksFromDepth` lists blocks at least `minimumDepth` below their chain's stored tip.
   `completedBlockHeights` takes the newest `heightCount` (at most 100) heights: with
   `completedHeights: true` (default) only heights at or below every requested chain's tip.
@@ -277,10 +280,19 @@ stays Kadena's (the parity test sees the same types, so there is nothing to pin 
 | `TransactionMeta.gasLimit`, `.ttl` | `BigInt` | string (`"600"`) |
 | `TransactionMeta.gasPrice` | `Float` | string, plain notation (`"0.00000001"`) |
 | `TransactionResult.gas`, `.transactionId` | `BigInt` | string (`"236"`) |
-| `Transfer.amount` | `Decimal` | string, plain notation (`"0.00000236"`) |
+| `Transfer.amount` | `Decimal` | string, plain notation without trailing zeros (`"0.00000236"`, `"26.57382"`) |
+| `Transfer.creationTime` | `DateTime` | the tx's `meta.creationTime` (whole seconds); a coinbase transfer has its block's time |
+| `ExecutionPayload.code` | `String` | the code JSON-quoted (`"\"(coin.transfer …)\""`) |
+| `Signer.scheme` | `String` | `""` when the signer names no scheme, else the command's scheme |
+| `Event.parameterText` | `String!` | numbers in JavaScript layout (`0.00000236`, `1e-7`); `parameters` keeps the node's numbers |
 | `Block.nonce` | `Decimal` | string |
 | `Block.difficulty` | `BigInt` | always a JSON number, also above 2^53 |
 | `FungibleChainAccount.chainId` | `String` | string (already) |
+
+A union or interface field (`TransactionCommand.payload`, `Transaction.result`, the `guard`
+fields, `node` and `nodes`) whose fragments select none of the value's fields answers `{}`, as
+the oracle does (`payload { ... on ExecutionPayload { code } }` on a continuation), not
+`null`; a missing value is still `null`.
 
 Everything else keeps the scalar rules (`Block.height`, `chainId`, `orderIndex`, `result.height`
 stay numbers; `totalBalance` and `balance` stay numbers). Error codes ride in
@@ -301,14 +313,17 @@ the oracle puts them.
   that block.
 - **Coinbase.** Coinbase txs are not `Transaction`s (as in Kadena graph): transaction lists
   leave them out, and `Event.transaction`/`Transfer.transaction` of a coinbase row is `null`.
-  Their events and transfers are listed, with request key `<coinbase>` and order index 0
-  (the compat rendering).
+  Their events and transfers are listed with order index 0 and the node's coinbase request
+  key (the `reqKey` of the stored coinbase output, as the oracle lists it; R-P5P9-57 F4).
+  Event and Transfer ids carry that key; `node(id)` still accepts ids with `<coinbase>`.
 - **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` with
   `fungibleName` (txs with a transfer of that token on the account's side), `accountName`
-  alone (every tx touching the account), `fungibleName` alone (txs with a `<token>.TRANSFER`
+  alone (txs touching the account), `fungibleName` alone (txs with a `<token>.TRANSFER`
   event); with none of them, every user tx from the tip down (at most 20,000 heights), as
   a latest-transactions list asks. `chainId`, `minHeight`, `maxHeight` and
-  `minimumDepth` (height ≤ the chain's tip − depth) filter any source.
+  `minimumDepth` (height ≤ the chain's tip − depth) filter any source. With `accountName`,
+  only the txs the account sent (`meta.sender`) are listed and counted, as the oracle does
+  (GQ-19, R-P5P9-57 M1).
 - **`transfers`** use the same sources; rows are the tx's transfers of `fungibleName` with
   `accountName` on either side when given. `crossChainTransfer` is the other half of a
   cross-chain transfer (the `cont` step of the pact, or the tx that started it), `null`

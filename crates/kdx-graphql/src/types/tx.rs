@@ -9,7 +9,7 @@ use async_graphql::{Context, Object, Result, SimpleObject, Union, ID};
 use serde_json::Value;
 
 use super::{
-    Block, Event, TransactionResultEventsConnection, TransactionResultEventsConnectionEdge,
+    Block, Event, Sel, TransactionResultEventsConnection, TransactionResultEventsConnectionEdge,
     TransactionResultTransfersConnection, TransactionResultTransfersConnectionEdge, Transfer,
 };
 use super::{
@@ -98,8 +98,10 @@ impl Transaction {
             request_key: self.d.rk(),
         })))
     }
-    async fn result(&self) -> TransactionInfo {
-        TransactionInfo::TransactionResult(TransactionResult { d: self.d.clone() })
+    async fn result(&self) -> Sel<TransactionInfo> {
+        Sel(TransactionInfo::TransactionResult(TransactionResult {
+            d: self.d.clone(),
+        }))
     }
     async fn sigs(&self) -> Vec<TransactionSignature> {
         self.d
@@ -120,29 +122,8 @@ impl TransactionCommand {
     fn cmd(&self) -> &Value {
         self.d.cmd.as_ref().unwrap_or(&Value::Null)
     }
-}
 
-#[Object]
-impl TransactionCommand {
-    async fn meta(&self) -> TransactionMeta {
-        let m = self.cmd().get("meta");
-        let g = |k: &str| m.and_then(|m| m.get(k));
-        TransactionMeta {
-            chain_id: BigInt::new(int_of(g("chainId"))),
-            creation_time: DateTime((float_of(g("creationTime")) * 1e6) as i64),
-            gas_limit: BigInt::text(int_of(g("gasLimit"))),
-            gas_price: FloatText(format!("{}", float_of(g("gasPrice")))),
-            sender: str_of(g("sender")),
-            ttl: BigInt::text(int_of(g("ttl"))),
-        }
-    }
-    async fn network_id(&self) -> String {
-        str_of(self.cmd().get("networkId"))
-    }
-    async fn nonce(&self) -> String {
-        str_of(self.cmd().get("nonce"))
-    }
-    async fn payload(&self) -> TransactionPayload {
+    fn payload_value(&self) -> TransactionPayload {
         let p = self.cmd().get("payload");
         if let Some(c) = p.and_then(|p| p.get("cont")) {
             return TransactionPayload::ContinuationPayload(ContinuationPayload {
@@ -155,12 +136,38 @@ impl TransactionCommand {
         }
         let e = p.and_then(|p| p.get("exec"));
         TransactionPayload::ExecutionPayload(ExecutionPayload {
+            // JSON-quoted, as the oracle sends it and kadscan reads it (R-P5P9-57 F6).
             code: e
                 .and_then(|e| e.get("code"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+                .filter(|c| c.is_string())
+                .map(json_text),
             data: json_text(e.and_then(|e| e.get("data")).unwrap_or(&Value::Null)),
         })
+    }
+}
+
+#[Object]
+impl TransactionCommand {
+    async fn meta(&self) -> TransactionMeta {
+        let m = self.cmd().get("meta");
+        let g = |k: &str| m.and_then(|m| m.get(k));
+        TransactionMeta {
+            chain_id: BigInt::new(int_of(g("chainId"))),
+            creation_time: crate::txlist::creation_time(self.cmd()).unwrap_or(DateTime(0)),
+            gas_limit: BigInt::text(int_of(g("gasLimit"))),
+            gas_price: FloatText(format!("{}", float_of(g("gasPrice")))),
+            sender: str_of(g("sender")),
+            ttl: BigInt::text(int_of(g("ttl"))),
+        }
+    }
+    async fn network_id(&self) -> String {
+        str_of(self.cmd().get("networkId"))
+    }
+    async fn nonce(&self) -> String {
+        str_of(self.cmd().get("nonce"))
+    }
+    async fn payload(&self) -> Sel<TransactionPayload> {
+        Sel(self.payload_value())
     }
     async fn signers(&self) -> Vec<Signer> {
         let rk = self.d.rk();
@@ -359,7 +366,14 @@ impl Signer {
             order_index: i,
             pubkey: str_of(s.get("pubKey")),
             address: s.get("addr").and_then(Value::as_str).map(str::to_owned),
-            scheme: s.get("scheme").and_then(Value::as_str).map(str::to_owned),
+            // "" when the signer names no scheme, as the oracle sends it; a scheme the
+            // command names is kept (the node's value, R-P5P9-57 F8).
+            scheme: Some(
+                s.get("scheme")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
             clist: s
                 .get("clist")
                 .and_then(Value::as_array)
@@ -516,6 +530,26 @@ fn key_filter(
     })
 }
 
+/// The list behind `transactions(...)`. GQ-19 (R-P5P9-57 M1): `accountName` lists the txs
+/// the account sent (`meta.sender`), as the oracle does, filtered on top of the postings.
+fn transactions_spec(
+    account_name: Option<&str>,
+    block_hash: Option<&str>,
+    chain_id: Option<&str>,
+    fungible_name: Option<&str>,
+    (min_height, max_height, minimum_depth): (Option<i32>, Option<i32>, Option<i32>),
+    request_key: Option<&str>,
+) -> Result<ListSpec> {
+    Ok(ListSpec {
+        source: list_source(account_name, fungible_name, block_hash, request_key)?,
+        filter: key_filter(chain_id, min_height, max_height, minimum_depth, true)?,
+        rows: Rows::Txs {
+            sender: account_name.map(str::to_owned),
+            nft: false,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn query_transactions(
     ctx: &Context<'_>,
@@ -539,25 +573,14 @@ pub async fn query_transactions(
             "transactions(isCoinbase: true) (use Block.coinbase)",
         ));
     }
-    let spec = ListSpec {
-        source: list_source(
-            account_name.as_deref(),
-            fungible_name.as_deref(),
-            block_hash.as_deref(),
-            request_key.as_deref(),
-        )?,
-        filter: key_filter(
-            chain_id.as_deref(),
-            min_height,
-            max_height,
-            minimum_depth,
-            true,
-        )?,
-        rows: Rows::Txs {
-            sender: None,
-            nft: false,
-        },
-    };
+    let spec = transactions_spec(
+        account_name.as_deref(),
+        block_hash.as_deref(),
+        chain_id.as_deref(),
+        fungible_name.as_deref(),
+        (min_height, max_height, minimum_depth),
+        request_key.as_deref(),
+    )?;
     let (edges, page_info, total) =
         txs(list(ctx, spec, PageArgs::new(after, before, first, last)).await?);
     Ok(QueryTransactionsConnection {
@@ -768,8 +791,7 @@ impl TransactionSummary {
         super::block::is_stored(ctx, &self.d.block).await
     }
     async fn creation_time(&self) -> DateTime {
-        let m = self.d.cmd.as_ref().and_then(|c| c.get("meta"));
-        DateTime((float_of(m.and_then(|m| m.get("creationTime"))) * 1e6) as i64)
+        self.d.meta_creation_time().unwrap_or(DateTime(0))
     }
     async fn bad_result(&self) -> Option<String> {
         (self.d.out.pointer("/result/status").and_then(Value::as_str) != Some("success"))
@@ -1169,5 +1191,373 @@ mod canonical_tests {
             let v = r.data.into_json().unwrap();
             assert_eq!(v["s"]["canonical"], want, "fork {fork}");
         }
+    }
+}
+
+/// R-P5P9-57 (CG fix round): the served formats and values the gate's diff classes fixed.
+#[cfg(test)]
+mod cgfix_tests {
+    use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
+    use base64::Engine;
+    use kdx_api::compat::shapes::{self, Ev};
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{Hash32, TxKey};
+    use serde_json::json;
+
+    use super::*;
+    use crate::types::block::Block;
+    use crate::types::event::Event;
+    use crate::types::transfer::Transfer;
+
+    /// A mainnet header's `weight` and `target` (chain 4, h5801238): the node's base64url
+    /// and the decimal the build before this fix served.
+    const WEIGHT_B64: &str = "yjE9L07e77qFMAEAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const WEIGHT_DEC: &str = "1438066297983613385126346";
+    const TARGET_B64: &str = "TBokDqB9G-OMpihJATl6slilqwREufm4FgAAAAAAAAA";
+    const TARGET_DEC: &str = "142631823828797198123037655622276534200691233580490055490124";
+    /// A coinbase's `reqKey` as the node sends it (h5801243 c4, Pact 5: base64url of the
+    /// parent hash text) and as the oracle lists it.
+    const CB_RK: &str = "aVdla04wempYOThOVHN6UXlPV3hXRmM1azVzODc1SDYtYmpSTFdNOUgyMA";
+
+    fn le32(b64: &str) -> [u8; 32] {
+        kdx_types::hash::b64url_decode(b64)
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    fn block() -> Arc<BlockRecord> {
+        Arc::new(BlockRecord {
+            hash: Hash32([7; 32]),
+            chain: 4,
+            height: 5_801_243,
+            weight: le32(WEIGHT_B64),
+            target: le32(TARGET_B64),
+            creation_time: 1_746_518_323_432_000,
+            ..BlockRecord::default()
+        })
+    }
+
+    fn tx(pos: u16, out: Value, cmd: Option<Value>, params: Value) -> Arc<TxData> {
+        let rec = TxRecord {
+            key: TxKey::new(5_801_243, 4, pos),
+            request_key: (pos > 0).then_some(Hash32([9; 32])),
+            ..Default::default()
+        };
+        Arc::new(TxData {
+            rec,
+            block: block(),
+            out,
+            cmd,
+            evs: vec![Ev {
+                pos: 0,
+                qual_name: "coin.TRANSFER".into(),
+                module: "coin".into(),
+                module_hash: "mh".into(),
+                params,
+            }],
+            trs: vec![shapes::Transfer {
+                pos: 0,
+                token: "coin".into(),
+                from: "a".into(),
+                to: "b".into(),
+                amount: "26.57382".into(),
+            }],
+            nfts: Vec::new(),
+        })
+    }
+
+    struct Q(Arc<TxData>);
+    #[Object]
+    impl Q {
+        async fn cmd(&self) -> TransactionCommand {
+            TransactionCommand { d: self.0.clone() }
+        }
+        async fn transfer(&self) -> Transfer {
+            Transfer::new(self.0.clone(), 0, None)
+        }
+        async fn event(&self) -> Event {
+            Event::new(self.0.clone(), 0)
+        }
+        async fn block(&self) -> Block {
+            Block::new(self.0.block.clone())
+        }
+        async fn tx(&self) -> Option<Transaction> {
+            Transaction::new(self.0.clone())
+        }
+        async fn guard(&self) -> Sel<crate::types::IGuard> {
+            Sel(crate::types::guard::map_guard(
+                &json!({"fun": "f", "args": ["a"]}),
+                None,
+            ))
+        }
+        async fn no_guard(&self) -> Option<Sel<crate::types::IGuard>> {
+            None
+        }
+    }
+
+    async fn run(d: Arc<TxData>, q: &str) -> Value {
+        let r = Schema::new(Q(d), EmptyMutation, EmptySubscription)
+            .execute(q)
+            .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        serde_json::to_value(&r.data).unwrap()
+    }
+
+    fn id_text(v: &Value) -> String {
+        let b = base64::engine::general_purpose::STANDARD
+            .decode(v.as_str().unwrap())
+            .unwrap();
+        String::from_utf8(b).unwrap()
+    }
+
+    /// F1, F3, F5, F6, F8, F9 and `Transfer.amount` on a user tx.
+    #[tokio::test]
+    async fn user_tx_formats() {
+        let cmd = json!({
+            "nonce": "\"2024-06-11T12:52:52.004Z\"",
+            "meta": {"chainId": "4", "creationTime": 1718110252, "sender": "a"},
+            "payload": {"exec": {"code": "(coin.transfer \"a\" \"b\" 1.0)\n", "data": {}}},
+            "signers": [{"pubKey": "ab"}, {"pubKey": "cd", "scheme": "ED25519"}]
+        });
+        let params: Value =
+            serde_json::from_str(r#"["a","b",26.57382000000000000000000000,2.36e-6,1.0e-7]"#)
+                .unwrap();
+        let d = tx(
+            1,
+            json!({"result": {"status": "success", "data": ""}}),
+            Some(cmd),
+            params,
+        );
+        let v = run(
+            d,
+            "{ cmd { nonce payload { ... on ExecutionPayload { code } } signers { scheme } }
+               transfer { creationTime amount requestKey }
+               event { parameterText parameters requestKey }
+               block { weight target } }",
+        )
+        .await;
+        // F1: the node's base64url, the same numbers as the old decimals.
+        assert_eq!(v["block"]["weight"], json!(WEIGHT_B64));
+        assert_eq!(v["block"]["target"], json!(TARGET_B64));
+        assert_eq!(
+            kdx_decode::header::le256_decimal(&le32(WEIGHT_B64)),
+            WEIGHT_DEC
+        );
+        assert_eq!(
+            kdx_decode::header::le256_decimal(&le32(TARGET_B64)),
+            TARGET_DEC
+        );
+        // F3: the tx's meta creationTime (whole seconds), not the block time.
+        assert_eq!(
+            v["transfer"]["creationTime"],
+            json!("2024-06-11T12:50:52.000Z")
+        );
+        // F5 (rule a): the nonce is the command's string as the node holds it.
+        assert_eq!(v["cmd"]["nonce"], json!("\"2024-06-11T12:52:52.004Z\""));
+        // F6: the code JSON-quoted, as the oracle sends it.
+        assert_eq!(
+            v["cmd"]["payload"]["code"],
+            json!(r#""(coin.transfer \"a\" \"b\" 1.0)\n""#)
+        );
+        // F8: "" when the signer names no scheme; a named scheme is kept (rule a).
+        assert_eq!(
+            v["cmd"]["signers"],
+            json!([{"scheme": ""}, {"scheme": "ED25519"}])
+        );
+        // F9: parameterText in the oracle's number layout; parameters keeps the node's.
+        assert_eq!(
+            v["event"]["parameterText"],
+            json!(r#"["a","b",26.57382,0.00000236,1e-7]"#)
+        );
+        assert_eq!(
+            v["event"]["parameters"],
+            json!(r#"["a","b",26.57382000000000000000000000,2.36e-6,1.0e-7]"#)
+        );
+        // Transfer.amount without trailing zeros.
+        assert_eq!(v["transfer"]["amount"], json!("26.57382"));
+    }
+
+    /// F4: coinbase rows carry the node's coinbase reqKey, and their ids follow it.
+    #[tokio::test]
+    async fn coinbase_rows_carry_the_node_req_key() {
+        let out = json!({"reqKey": CB_RK, "result": {"status": "success", "data": "ok"}});
+        let d = tx(0, out, None, json!(["", "miner", 1.0]));
+        let v = run(
+            d,
+            "{ transfer { requestKey id creationTime } event { requestKey id } }",
+        )
+        .await;
+        assert_eq!(v["transfer"]["requestKey"], json!(CB_RK));
+        assert_eq!(v["event"]["requestKey"], json!(CB_RK));
+        let t = id_text(&v["transfer"]["id"]);
+        assert!(t.ends_with(&format!(r#","{CB_RK}"]"#)), "{t}");
+        let e = id_text(&v["event"]["id"]);
+        assert!(e.ends_with(&format!(r#","0","{CB_RK}"]"#)), "{e}");
+        // No command: the block's time.
+        assert_eq!(
+            v["transfer"]["creationTime"],
+            json!("2025-05-06T07:58:43.432Z")
+        );
+        // An output without a reqKey keeps compat's text.
+        let d = tx(0, json!({}), None, json!(["", "miner", 1.0]));
+        let v = run(d, "{ transfer { requestKey } }").await;
+        assert_eq!(v["transfer"]["requestKey"], json!("<coinbase>"));
+    }
+
+    /// Review minor 4: `Transfer.creationTime`, `TransactionMeta.creationTime` and the
+    /// summary's `creationTime` share one parser (Pact's `ParsedInteger`): a number, a
+    /// numeric string or `{"int": n}`, in whole seconds (a fraction rounds as Pact does).
+    #[tokio::test]
+    async fn creation_time_forms_agree() {
+        for (ct, secs) in [
+            (json!(1718110252), 1718110252),
+            (json!("1718110252"), 1718110252),
+            (json!({"int": 1718110252}), 1718110252),
+            (json!({"int": "1718110252"}), 1718110252),
+            (json!(1718110252.532), 1718110253),
+            (json!(1718110252.4), 1718110252),
+        ] {
+            let cmd = json!({"meta": {"chainId": "4", "creationTime": ct, "sender": "a"},
+                "payload": {"exec": {"code": "1", "data": {}}}, "signers": []});
+            let out = json!({"result": {"status": "success", "data": ""}});
+            let d = tx(1, out, Some(cmd), json!([]));
+            assert_eq!(d.meta_creation_time().map(|t| t.0), Some(secs * 1_000_000));
+            let want = if secs == 1718110252 {
+                "2024-06-11T12:50:52.000Z"
+            } else {
+                "2024-06-11T12:50:53.000Z"
+            };
+            let v = run(
+                d,
+                "{ cmd { meta { creationTime } } transfer { creationTime } }",
+            )
+            .await;
+            assert_eq!(v["cmd"]["meta"]["creationTime"], json!(want), "{ct}");
+            assert_eq!(v["transfer"]["creationTime"], json!(want), "{ct}");
+        }
+        // No usable value: the transfer keeps its block's time, the meta the epoch (as
+        // before).
+        let cmd = json!({"meta": {"creationTime": {"decimal": "x"}}, "payload": {}});
+        let d = tx(1, json!({}), Some(cmd), json!([]));
+        let v = run(
+            d,
+            "{ cmd { meta { creationTime } } transfer { creationTime } }",
+        )
+        .await;
+        assert_eq!(
+            v["transfer"]["creationTime"],
+            json!("2025-05-06T07:58:43.432Z")
+        );
+        assert_eq!(
+            v["cmd"]["meta"]["creationTime"],
+            json!("1970-01-01T00:00:00.000Z")
+        );
+    }
+
+    /// F9 precision (review, cross-branch): an 18-digit decimal reaches the node, the oracle
+    /// and us as Pact's `{"decimal": "..."}` object, and `parameterText` keeps it verbatim,
+    /// equal to the oracle's text (live sample: kaddex.exchange.UPDATE, c2 h6951209,
+    /// requestKey hEffZb8kQ_Dm99fiTK95AenYeJqWyHIkyBDc8Ry_GqI).
+    #[tokio::test]
+    async fn long_decimals_keep_the_node_text() {
+        let params: Value = serde_json::from_str(
+            r#"["coin:n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC",{"decimal":"540796.439262685228"},3693.343969]"#,
+        )
+        .unwrap();
+        let out = json!({"result": {"status": "success", "data": ""}});
+        let d = tx(1, out, None, params);
+        let v = run(d, "{ event { parameterText } }").await;
+        assert_eq!(
+            v["event"]["parameterText"],
+            json!(
+                r#"["coin:n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC",{"decimal":"540796.439262685228"},3693.343969]"#
+            )
+        );
+    }
+
+    /// F10 `cmd.payload` null vs `{}` (rule b): a union or interface whose fragments select
+    /// none of its fields answers `{}`, as the oracle does; a matching fragment is unchanged
+    /// and a missing value stays `null`.
+    #[tokio::test]
+    async fn unmatched_fragments_answer_an_empty_object() {
+        let cont = json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": false,
+            "data": {}, "proof": null}}});
+        let out = json!({"result": {"status": "success", "data": ""}});
+        let d = tx(1, out, Some(cont), json!([]));
+        let v = run(
+            d.clone(),
+            "{ cmd { payload { ... on ExecutionPayload { code } } }
+               tx { result { ... on TransactionMempoolInfo { status } } }
+               guard { ... on KeysetGuard { keys } }
+               noGuard { ... on KeysetGuard { keys } } }",
+        )
+        .await;
+        assert_eq!(v["cmd"]["payload"], json!({}));
+        assert_eq!(v["tx"]["result"], json!({}));
+        assert_eq!(v["guard"], json!({}));
+        assert_eq!(v["noGuard"], Value::Null);
+        let v = run(
+            d,
+            "{ cmd { payload { __typename ... on ContinuationPayload { pactId step } } }
+               tx { result { __typename } }
+               guard { __typename ... on UserGuard { fun } } }",
+        )
+        .await;
+        assert_eq!(
+            v["cmd"]["payload"],
+            json!({"__typename": "ContinuationPayload", "pactId": "p", "step": 1})
+        );
+        assert_eq!(
+            v["tx"]["result"],
+            json!({"__typename": "TransactionResult"})
+        );
+        assert_eq!(v["guard"], json!({"__typename": "UserGuard", "fun": "f"}));
+    }
+
+    /// M1 (GQ-19): `transactions(accountName)` keeps only the account's own txs.
+    #[test]
+    fn account_transactions_are_sender_rows() {
+        let spec = transactions_spec(Some("k:a"), None, Some("2"), None, (None, None, None), None)
+            .unwrap();
+        let Rows::Txs { sender, nft } = &spec.rows else {
+            panic!("tx rows")
+        };
+        assert_eq!((sender.as_deref(), *nft), (Some("k:a"), false));
+        let with_token = transactions_spec(
+            Some("k:a"),
+            None,
+            None,
+            Some("coin"),
+            (None, None, None),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(&with_token.rows, Rows::Txs { sender: Some(s), .. } if s == "k:a"));
+        let by_block = transactions_spec(
+            None,
+            Some("lYOEd2WyPiTx_bfiTIbwRH2N4beFtFtQuNRZA2umjyo"),
+            None,
+            None,
+            (None, None, None),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(&by_block.rows, Rows::Txs { sender: None, .. }));
+        // The row filter: a tx another account sent is dropped, the account's own is kept.
+        let mine = tx(
+            1,
+            json!({}),
+            Some(json!({"meta": {"sender": "k:a"}})),
+            json!([]),
+        );
+        let other = tx(
+            1,
+            json!({}),
+            Some(json!({"meta": {"sender": "k:b"}})),
+            json!([]),
+        );
+        assert_eq!(spec.rows.rows(&mine).len(), 1);
+        assert!(spec.rows.rows(&other).is_empty());
     }
 }

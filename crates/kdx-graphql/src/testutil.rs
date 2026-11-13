@@ -90,6 +90,14 @@ impl Fixture {
         w.commit().unwrap();
     }
 
+    /// Store `b` (with its txs) as the new tip of its chain.
+    pub fn apply_block(&self, b: &IndexedBlock) {
+        let mut w = self.hot.rw().unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        kdx_hot::tail::apply(&mut w, b, &mut dict).unwrap();
+        w.commit().unwrap();
+    }
+
     /// Start the store at `height` (a partial store: nothing below it).
     pub fn set_floor(&self, height: u32) {
         let mut w = self.hot.rw().unwrap();

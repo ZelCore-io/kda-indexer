@@ -173,6 +173,10 @@ pub struct DailySummary {
     /// summary --since`.
     #[serde(default)]
     pub windows: BTreeMap<String, Window>,
+    /// Captured GraphQL documents no pair compares: stem -> `tip`, `subscription` or
+    /// `unsupported` (R-P5P9-57 coverage list).
+    #[serde(default)]
+    pub graphql_unpaired: BTreeMap<String, String>,
 }
 
 /// Seconds per `DailySummary.windows` bucket.

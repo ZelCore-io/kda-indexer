@@ -1,5 +1,7 @@
 //! Structural JSON diff (spec section 7.3) and paginated fetch.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use crate::normalize::{iso_eq_coarse, number_f64, parse_iso, RouteKind, FLOAT_KEYS};
@@ -27,8 +29,34 @@ pub const STATS_ESTIMATE_PATH: &str = "/transactionCount~estimate";
 /// Diff of two (normalised) values. Objects compare as maps, arrays positionally.
 pub fn diff(a: &Value, b: &Value) -> Vec<DiffEntry> {
     let mut out = Vec::new();
-    walk(a, b, &mut String::new(), None, &mut out);
+    walk(a, b, &mut String::new(), None, &mut out, &mut None);
     out
+}
+
+/// A normaliser consulted at each differing leaf (path, A value, B value): the id of the rule
+/// that explains the difference, or `None` when it stays a diff.
+pub type Explain<'a> = &'a dyn Fn(&str, &Value, &Value) -> Option<&'static str>;
+
+struct Hook<'a> {
+    explain: Explain<'a>,
+    hits: BTreeSet<&'static str>,
+}
+
+/// [`diff`] with a normaliser: a leaf difference that `explain` accepts is left out (it does
+/// not use up [`MAX_ENTRIES`]); returns the remaining entries and the ids of the rules that
+/// fired.
+pub fn diff_explained(
+    a: &Value,
+    b: &Value,
+    explain: Explain<'_>,
+) -> (Vec<DiffEntry>, BTreeSet<&'static str>) {
+    let mut out = Vec::new();
+    let mut hook = Some(Hook {
+        explain,
+        hits: BTreeSet::new(),
+    });
+    walk(a, b, &mut String::new(), None, &mut out, &mut hook);
+    (out, hook.map(|h| h.hits).unwrap_or_default())
 }
 
 /// `diff` plus route rules that need both sides (the `/stats` tolerances).
@@ -199,7 +227,32 @@ fn push(
     }
 }
 
-fn walk(a: &Value, b: &Value, path: &mut String, key: Option<&str>, out: &mut Vec<DiffEntry>) {
+/// A changed leaf: left out when the hook explains it.
+fn leaf(
+    out: &mut Vec<DiffEntry>,
+    path: &str,
+    kind: DiffKind,
+    a: &Value,
+    b: &Value,
+    hook: &mut Option<Hook<'_>>,
+) {
+    if let Some(h) = hook {
+        if let Some(id) = (h.explain)(path, a, b) {
+            h.hits.insert(id);
+            return;
+        }
+    }
+    push(out, path, kind, Some(a), Some(b));
+}
+
+fn walk(
+    a: &Value,
+    b: &Value,
+    path: &mut String,
+    key: Option<&str>,
+    out: &mut Vec<DiffEntry>,
+    hook: &mut Option<Hook<'_>>,
+) {
     if out.len() >= MAX_ENTRIES {
         return;
     }
@@ -210,7 +263,7 @@ fn walk(a: &Value, b: &Value, path: &mut String, key: Option<&str>, out: &mut Ve
                 path.push('/');
                 path.push_str(&escape(k));
                 match mb.get(k) {
-                    Some(vb) => walk(va, vb, path, Some(k), out),
+                    Some(vb) => walk(va, vb, path, Some(k), out, hook),
                     None => push(out, path, DiffKind::Extra, Some(va), None),
                 }
                 path.truncate(len);
@@ -228,7 +281,7 @@ fn walk(a: &Value, b: &Value, path: &mut String, key: Option<&str>, out: &mut Ve
                 path.push('/');
                 path.push_str(&i.to_string());
                 match (xa.get(i), xb.get(i)) {
-                    (Some(va), Some(vb)) => walk(va, vb, path, None, out),
+                    (Some(va), Some(vb)) => walk(va, vb, path, None, out, hook),
                     (Some(va), None) => push(out, path, DiffKind::Extra, Some(va), None),
                     (None, Some(vb)) => push(out, path, DiffKind::Missing, None, Some(vb)),
                     (None, None) => {}
@@ -252,7 +305,7 @@ fn walk(a: &Value, b: &Value, path: &mut String, key: Option<&str>, out: &mut Ve
                     }
                 }
             }
-            push(out, path, DiffKind::Changed, Some(a), Some(b));
+            leaf(out, path, DiffKind::Changed, a, b, hook);
         }
         (Value::String(sa), Value::String(sb)) => {
             if sa == sb {
@@ -263,11 +316,11 @@ fn walk(a: &Value, b: &Value, path: &mut String, key: Option<&str>, out: &mut Ve
                     return;
                 }
             }
-            push(out, path, DiffKind::Changed, Some(a), Some(b));
+            leaf(out, path, DiffKind::Changed, a, b, hook);
         }
         _ if a == b => {}
-        _ if kind_of(a) == kind_of(b) => push(out, path, DiffKind::Changed, Some(a), Some(b)),
-        _ => push(out, path, DiffKind::Type, Some(a), Some(b)),
+        _ if kind_of(a) == kind_of(b) => leaf(out, path, DiffKind::Changed, a, b, hook),
+        _ => leaf(out, path, DiffKind::Type, a, b, hook),
     }
 }
 
@@ -505,5 +558,24 @@ mod harness_rule_tests {
         let a: Value = serde_json::from_str("[9.99]").unwrap();
         let b: Value = serde_json::from_str("[9.990000000000]").unwrap();
         assert!(diff_route(&RouteKind::Tx, &a, &b).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn explained_leaves_are_left_out_and_reported() {
+        let ex = |p: &str, _a: &Value, _b: &Value| p.ends_with("/f").then_some("rule-f");
+        let a = json!({"f": 1, "g": "x", "o": {"f": "a"}, "t": 1});
+        let b = json!({"f": 2, "g": "y", "o": {"f": "b"}, "t": "1"});
+        let (d, hits) = diff_explained(&a, &b, &ex);
+        let paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["/g", "/t"]);
+        assert_eq!(hits.into_iter().collect::<Vec<_>>(), ["rule-f"]);
+        // Without a hook, the same as `diff`.
+        assert_eq!(diff(&a, &b).len(), 4);
     }
 }

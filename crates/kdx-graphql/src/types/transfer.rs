@@ -107,17 +107,22 @@ impl Transfer {
     async fn chain_id(&self) -> BigInt {
         BigInt::new(i128::from(self.d.key().chain()))
     }
+    /// The tx's `meta.creationTime` (whole seconds), as the oracle sends it (R-P5P9-57 F3);
+    /// a coinbase transfer (no command) has its block's time.
     async fn creation_time(&self) -> DateTime {
-        DateTime(self.d.block.creation_time as i64)
+        self.d
+            .meta_creation_time()
+            .unwrap_or(DateTime(self.d.block.creation_time as i64))
     }
     async fn cross_chain_transfer(&self, ctx: &Context<'_>) -> Result<Option<Transfer>> {
         let half = match &self.xchain {
             Some(x) => x.clone(),
             None => {
                 let (d, i) = (self.d.clone(), self.i);
+                let budget = crate::txlist::xchain_budget(ctx);
                 gql(ctx)
                     .state()?
-                    .read(move |view| xchain_of(view, &d, i, &mut Blocks::default()))
+                    .read(move |view| xchain_of(view, &d, i, &mut Blocks::default(), &budget))
                     .await
                     .map_err(from_api)?
             }

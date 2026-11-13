@@ -209,6 +209,83 @@ fn plain(t: &str) -> String {
     }
 }
 
+/// A plain decimal text without trailing fraction zeros (`1.50` is `1.5`, `2.0` is `2`).
+/// Texts that still carry an exponent (out of `plain`'s range) are left alone.
+fn trim_zeros(t: String) -> String {
+    if !t.contains('.') || t.contains(['e', 'E']) {
+        return t;
+    }
+    let s = t.trim_end_matches('0').trim_end_matches('.');
+    match s {
+        "-0" | "" => "0".to_owned(),
+        s => s.to_owned(),
+    }
+}
+
+/// A JSON number's text as JavaScript's `Number.prototype.toString` lays it out, over the
+/// exact digits (no rounding to f64): plain notation for 1e-7 < |x| < 1e21 (`2.36e-6` is
+/// `0.00000236`, `1.0e-5` is `0.00001`, `5.0` is `5`), exponent notation beyond
+/// (`1e-7`, `1.5e+21`). The oracle renders event parameters this way (R-P5P9-57 F9).
+/// A text that is not a plain JSON number is returned as is.
+pub fn js_number(t: &str) -> String {
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, t),
+    };
+    let (mant, exp) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => {
+            let d = e.strip_prefix(['+', '-']).unwrap_or(e);
+            if d.is_empty() || d.len() > 9 || !d.bytes().all(|c| c.is_ascii_digit()) {
+                return t.to_owned();
+            }
+            match e.parse::<i64>() {
+                Ok(n) => (m, n),
+                Err(_) => return t.to_owned(),
+            }
+        }
+        None => (body, 0),
+    };
+    let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
+    if int.is_empty() || !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) {
+        return t.to_owned();
+    }
+    // value = 0.<digits> x 10^n, digits without leading or trailing zeros
+    let all = format!("{int}{frac}");
+    let digits = all.trim_start_matches('0');
+    if digits.is_empty() {
+        return "0".to_owned();
+    }
+    let skipped = (all.len() - digits.len()) as i64;
+    let n = int.len() as i64 + exp - skipped;
+    let digits = digits.trim_end_matches('0');
+    let k = digits.len() as i64;
+    let body = if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat((-n) as usize))
+    } else {
+        let e = n - 1;
+        let sign = if e < 0 { '-' } else { '+' };
+        if k == 1 {
+            format!("{digits}e{sign}{}", e.unsigned_abs())
+        } else {
+            format!(
+                "{}.{}e{sign}{}",
+                &digits[..1],
+                &digits[1..],
+                e.unsigned_abs()
+            )
+        }
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
 /// An exact decimal (amounts, balances), kept as its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decimal {
@@ -228,10 +305,11 @@ impl Decimal {
     }
 
     /// The same decimal serialized as a JSON string (the oracle's `Transfer.amount`), in
-    /// plain notation (`0.00000236`, never `2.36e-6`).
+    /// plain notation (`0.00000236`, never `2.36e-6`) and without trailing fraction zeros
+    /// (`26.57382000` is `26.57382`, R-P5P9-57).
     pub fn into_text(mut self) -> Decimal {
         self.as_string = true;
-        self.text = plain(&self.text);
+        self.text = trim_zeros(plain(&self.text));
         self
     }
 
@@ -390,9 +468,56 @@ mod tests {
             ("-2.5E-3", "-0.0025"),
             ("0.5", "0.5"),
             ("12", "12"),
-            ("1.0", "1.0"),
+            ("1.0", "1"),
+            ("26.57382000000000000000000000", "26.57382"),
+            ("377.763370000000000000000000000000", "377.76337"),
+            ("6000", "6000"),
+            ("100.500", "100.5"),
+            ("0.0", "0"),
+            ("-0.10", "-0.1"),
         ] {
             assert_eq!(Decimal::new(i).unwrap().into_text().as_str(), o, "{i}");
+        }
+    }
+
+    #[test]
+    fn js_number_layout() {
+        // R-P5P9-57 F9: the oracle's event-parameter numbers (JavaScript layout).
+        for (i, o) in [
+            ("2.36e-6", "0.00000236"),
+            ("1.0e-5", "0.00001"),
+            ("6.0e-6", "0.000006"),
+            ("9.05e-4", "0.000905"),
+            ("1.0e-3", "0.001"),
+            ("1.5e-3", "0.0015"),
+            ("5.0", "5"),
+            ("5", "5"),
+            ("0", "0"),
+            ("0.0", "0"),
+            ("-0.0", "0"),
+            ("0.9830265", "0.9830265"),
+            ("26.57382000000000000000000000", "26.57382"),
+            ("1500.0", "1500"),
+            ("1.5e3", "1500"),
+            ("-2.5E-3", "-0.0025"),
+            ("1e-7", "1e-7"),
+            ("1.0e-7", "1e-7"),
+            ("1.25e-7", "1.25e-7"),
+            ("0.000000125", "1.25e-7"),
+            ("1e21", "1e+21"),
+            ("1.5e21", "1.5e+21"),
+            ("123456789012345678901", "123456789012345678901"),
+            ("1234567890123456789012", "1.234567890123456789012e+21"),
+            ("0.123456789012345678901", "0.123456789012345678901"),
+            ("007.50", "7.5"),
+            ("0.00100", "0.001"),
+            ("-12", "-12"),
+        ] {
+            assert_eq!(js_number(i), o, "{i}");
+        }
+        // Not a plain JSON number: left alone, never expanded.
+        for t in ["abc", "1e", "1e999999999999", "--1", ".5", "1.2.3"] {
+            assert_eq!(js_number(t), t, "{t}");
         }
     }
 }
