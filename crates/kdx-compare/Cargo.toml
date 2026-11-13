@@ -32,3 +32,6 @@ url.workspace = true
 kdx-types.workspace = true
 kdx-node.workspace = true
 kdx-decode.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

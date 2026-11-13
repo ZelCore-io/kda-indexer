@@ -265,6 +265,14 @@ reason = "chainweb-data answered 0 rows when the request (search=al 'payment-amo
 owner_note = "Oracle unstable under ruling R3E-15 / R-P5P9-47 (run 6E-3 report)."
 
 [[entry]]
+id = "oracle-orphan"
+route = "search"
+json_path_glob = "/~oracle-orphan"
+condition = "any"
+reason = "chainweb-data keeps /txs/search rows of blocks that are not canonical (seen live in run 6E-3: 23 records, e.g. chain 2 height 7399318, chainweb-data block oC2lnmOL, canonical OHz-ZmnP; chain 5 height 7372639, zbojrfLx vs 3vd0hYPX). A row chainweb-data lists and kda-indexer does not (by request key and block) moves here only when the node's canonical block at its chain and height, read with header/branch up to the current cut (never the plain header range, which also returns orphans), is another one. When chainweb-data's pactid page was full, kda-indexer's page is then cut to its length (a_cut)."
+owner_note = "R-P5P9-48 item 1 (Fix 6E-G); oracle defect under ruling R3E-14."
+
+[[entry]]
 id = "pactid-cap"
 route = "search"
 json_path_glob = "/**"

@@ -91,6 +91,14 @@ const ORACLE_TIP_TTL: Duration = Duration::from_secs(60);
 const SUPPLY_PER_HEIGHT: f64 = 60.0;
 /// Pause before the one retry of a `/v1/txs` diff against kda-txs.
 const KDA_TXS_RETRY: Duration = Duration::from_secs(30);
+/// A canonical hash read on the node is reused by later compares only this many heights or
+/// more below the chain's cut (a fork near the tip can still change it).
+const CANON_CACHE_DEPTH: u64 = 20;
+/// Entries of that cache at most; it is emptied when full.
+const CANON_CACHE_MAX: usize = 100_000;
+/// JSON path of the visible allowlist hit for `/txs/search` rows chainweb-data lists in a
+/// block that is not on the node's canonical branch (R-P5P9-48).
+const ORACLE_ORPHAN_PATH: &str = "/~oracle-orphan";
 
 /// For each pair of tx objects at the same place (the object itself, or the same index of
 /// two arrays) whose `events` hold the same items in another order, sorts both `events`
@@ -309,6 +317,57 @@ fn query_account(req: &Request) -> String {
         .unwrap_or_default()
 }
 
+/// What [`Ctx::search_oracle_rows`] moved out of a `/txs/search` compare.
+#[derive(Debug, Default)]
+struct SearchRows {
+    /// chainweb-data rows in a block off the node's canonical branch.
+    orphans: Vec<Value>,
+    /// A rows dropped below a full chainweb-data page once its orphans were removed.
+    a_cut: usize,
+}
+
+impl SearchRows {
+    /// The visible allowlist hits.
+    fn hits(&self) -> Vec<DiffEntry> {
+        let first = |rows: &[Value]| -> Vec<Value> {
+            rows.iter()
+                .take(10)
+                .map(|r| {
+                    json!([
+                        r.get("chain"),
+                        r.get("height"),
+                        r.get("requestKey"),
+                        r.get("blockHash")
+                    ])
+                })
+                .collect()
+        };
+        let mut d = Vec::new();
+        if !self.orphans.is_empty() {
+            d.push(DiffEntry {
+                path: ORACLE_ORPHAN_PATH.into(),
+                kind: DiffKind::Missing,
+                a: None,
+                b: Some(json!({"rows": self.orphans.len(), "a_cut": self.a_cut,
+                    "first": first(&self.orphans)})),
+            });
+        }
+        d
+    }
+}
+
+/// Whether a `/txs/search` side may hold more rows than it answered: a `pactid` answer has
+/// no `Chainweb-Next`, so one with `limit` rows (default and maximum 50) may be cut; a
+/// `search=` answer is complete unless a pending `Chainweb-Next` was left (then the two
+/// sides were already cut to their common depth).
+fn search_page_full(path_and_query: &str, rows: usize, page_cut: bool) -> bool {
+    if page_cut || !path_and_query.contains("pactid=") {
+        return false;
+    }
+    let limit = query_limit(path_and_query).map_or(50, |l| l.min(50));
+    rows >= limit
+}
+
 fn query_limit(path_and_query: &str) -> Option<usize> {
     let q = path_and_query.split_once('?')?.1;
     url::form_urlencoded::parse(q.as_bytes())
@@ -333,6 +392,10 @@ pub struct Ctx {
     backoff: Mutex<(Option<tokio::time::Instant>, Duration)>,
     /// chainweb-data tip per target name (time read, max height on `/txs/recent`).
     oracle_tips: Mutex<HashMap<String, (std::time::Instant, u64)>>,
+    /// The node's canonical block hash per (chain, height), read on the cut's branch and kept
+    /// across compares once at least CANON_CACHE_DEPTH heights below the chain's cut (the
+    /// answer for every (chain, height, hash) question at that place).
+    canon: Mutex<HashMap<(u8, u64), String>>,
 }
 
 /// What one compare produced.
@@ -365,6 +428,7 @@ impl Ctx {
             a_errors_in_row: std::sync::atomic::AtomicU32::new(0),
             backoff: Mutex::new((None, BACKOFF_FIRST)),
             oracle_tips: Mutex::new(HashMap::new()),
+            canon: Mutex::new(HashMap::new()),
             cfg,
         };
         ctx.refresh_tips().await?;
@@ -1016,6 +1080,18 @@ impl Ctx {
         {
             ev_node = self.events_node_tiebreak(req, &va, &mut vb).await;
         }
+        // /txs/search against chainweb-data: rows one side lacks, settled on the node
+        // (R-P5P9-48).
+        let search_rows = if req.route == RouteKind::Search
+            && tb.kind == crate::config::TargetKind::ChainwebData
+            && sa == 200
+            && sb == 200
+        {
+            let full_b = search_page_full(&req.path_and_query, len_of(&vb), page_cut);
+            self.search_oracle_rows(req, &mut va, &mut vb, full_b).await
+        } else {
+            SearchRows::default()
+        };
         let (mut d, skew) = if let Some(rows) = orphan_tx {
             (
                 vec![DiffEntry {
@@ -1206,6 +1282,7 @@ impl Ctx {
                 b: None,
             });
         }
+        d.extend(search_rows.hits());
         if !orphans.is_empty() {
             d.push(DiffEntry {
                 path: "/orphans".into(),
@@ -2044,8 +2121,10 @@ impl Ctx {
         moved
     }
 
-    /// The node's canonical block hash at `(c, h)`, from `cache` or one lookup while fewer
-    /// than ORPHAN_CHECKS were made; `None` when the budget is spent.
+    /// The node's canonical block hash at `(c, h)` (`header/branch` up to the cut, never the
+    /// plain header range, which also returns orphans), from `cache`, from the cache shared by
+    /// all compares, or one lookup while fewer than ORPHAN_CHECKS were made; `None` when the
+    /// budget is spent. The node client applies `node_max_rps`.
     async fn canon_cached(
         &self,
         cache: &mut HashMap<(u8, u64), Option<String>>,
@@ -2055,6 +2134,11 @@ impl Ctx {
     ) -> Option<Option<String>> {
         if let Some(v) = cache.get(&(c, h)) {
             return Some(v.clone());
+        }
+        let known = self.canon.lock().expect("canon").get(&(c, h)).cloned();
+        if let Some(v) = known {
+            cache.insert((c, h), Some(v.clone()));
+            return Some(Some(v));
         }
         if *checks >= ORPHAN_CHECKS {
             return None;
@@ -2066,8 +2150,82 @@ impl Ctx {
             .ok()
             .flatten()
             .and_then(|hd| hd.get("hash").and_then(Value::as_str).map(str::to_string));
+        if let Some(hash) = &v {
+            if self
+                .tips
+                .cut_height(c)
+                .is_some_and(|top| h.saturating_add(CANON_CACHE_DEPTH) <= top)
+            {
+                let mut g = self.canon.lock().expect("canon");
+                if g.len() >= CANON_CACHE_MAX {
+                    g.clear();
+                }
+                g.insert((c, h), hash.clone());
+            }
+        }
         cache.insert((c, h), v.clone());
         Some(v)
+    }
+
+    /// `/txs/search` against chainweb-data (R-P5P9-48): a row chainweb-data lists and A does
+    /// not (by request key and block) leaves `vb` when the node's canonical block at its
+    /// (chain, height), on the cut's branch, is another one (seen live in run 6E-3: 23
+    /// records, e.g. chain 2 height 7399318, chainweb-data block oC2lnmOL, canonical
+    /// OHz-ZmnP). Rows the node cannot settle stay. When B held a full page, A is then cut
+    /// to B's length (B's next rows were not fetched). `search=` rows chainweb-data matched
+    /// through a `cont` tx's initial code are left to S-3.
+    async fn search_oracle_rows(
+        &self,
+        req: &Request,
+        va: &mut Value,
+        vb: &mut Value,
+        full_b: bool,
+    ) -> SearchRows {
+        let mut out = SearchRows::default();
+        let (Value::Array(xa), Value::Array(xb)) = (&mut *va, &mut *vb) else {
+            return out;
+        };
+        let s = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+        let key = |r: &Value| (s(r, "requestKey"), s(r, "blockHash"));
+        let cont_history = |r: &Value| {
+            req.path_and_query.contains("search=")
+                && r.get("code").is_some_and(Value::is_null)
+                && r.get("initialCode").is_some_and(|c| !c.is_null())
+        };
+        let mut cache: HashMap<(u8, u64), Option<String>> = HashMap::new();
+        let mut checks = 0usize;
+        let a_keys: std::collections::HashSet<_> = xa.iter().map(key).collect();
+        let mut i = 0;
+        while i < xb.len() {
+            let r = &xb[i];
+            let at = (
+                row_chain(r),
+                r.get("height").and_then(Value::as_u64),
+                s(r, "blockHash"),
+            );
+            let (Some(c), Some(h), Some(bh)) = at else {
+                i += 1;
+                continue;
+            };
+            if a_keys.contains(&key(r)) || cont_history(r) {
+                i += 1;
+                continue;
+            }
+            let canon = self
+                .canon_cached(&mut cache, &mut checks, c, h)
+                .await
+                .flatten();
+            if canon.is_some_and(|ch| ch != bh) {
+                out.orphans.push(xb.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        if !out.orphans.is_empty() && full_b && xa.len() > xb.len() {
+            out.a_cut = xa.len() - xb.len();
+            xa.truncate(xb.len());
+        }
+        out
     }
 
     /// Splits oracle rows into (orphans, canonical): a row is canonical when the node's
@@ -2695,6 +2853,9 @@ fn same_decimal(a: &str, b: &str) -> bool {
     }
     norm(a) == norm(b)
 }
+
+#[cfg(test)]
+mod mock_tests;
 
 #[cfg(test)]
 mod tests {
