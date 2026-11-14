@@ -253,8 +253,8 @@ sudo -u kda-indexer kda-indexer --config /opt/coins/kda-indexer/mainnet01/config
   and does nothing else. The command refuses to run as root on a data dir root does not own,
   before it opens or creates anything: as root it would read and write, by path, in a tree
   the service user controls. Run it as root only on a data dir whose whole tree root owns:
-  as root it also refuses when `segments/`, or `DIR` if it exists, is not root-owned, and
-  names each such path.
+  as root it also refuses when `segments/`, `hot/`, `search/`, or `DIR` if it exists (even
+  empty), is not root-owned, and names each such path.
 - Every file the manifest (or `search/meta.json`) lists must be a regular file. A symbolic
   link at a listed file's name, or anything else that is not a regular file, makes the
   command fail: with `--copy` the file is opened with `O_NOFOLLOW` and checked on the open
@@ -264,10 +264,14 @@ sudo -u kda-indexer kda-indexer --config /opt/coins/kda-indexer/mainnet01/config
   `search.swap.lock` is never followed and makes the command fail (without the lock a swap
   already in progress could pair files from both sides); remove it as the data dir's owner
   and run again. Any other failure to open a lock file (a read-only data dir where it cannot
-  be created) is logged as a warning and the snapshot runs without that lock. Directories above a listed file (`segments/`, `search/`, a `rebuild.<S>/` of a
-  pending swap) are opened as their paths resolve. The manifest's `network` must be a plain
-  name (`A-Z a-z 0-9 . _ -`, no leading `.`, no `..`, at most 64 characters), so a listed
-  name never points outside `segments/`.
+  be created) is logged as a warning and the snapshot runs without that lock. Only the
+  symlink form is closed this way: a race that remains (a directory planted at the lock
+  path, or the lock file renamed away) needs write access as the service user, so it crosses
+  no privilege boundary, and `segments check` on restore catches a mixed set. Directories
+  above a listed file (`segments/`, `search/`, a `rebuild.<S>/` of a pending swap) are opened
+  as their paths resolve. The manifest's `network` must be a plain name (`A-Z a-z 0-9 . _ -`,
+  no leading `.`, no `..`, at most 64 characters), so a listed name never points outside
+  `segments/`.
 
 - `DIR` must not exist or be empty, and must not lie inside the source data dir. Without
   `--copy` it must be on the same filesystem as the source: the segment files are
