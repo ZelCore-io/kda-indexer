@@ -621,11 +621,43 @@ fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
     }
 }
 
+/// The schema type at a checked level of a row's node (R-P5P9-71 (3)), for its
+/// `__typename`. `cmd.payload` is a union: its member follows from the fields it selects
+/// (`code` an `ExecutionPayload`; `pactId`, `proof`, `rollback` or `step` a
+/// `ContinuationPayload`), and is unknown with neither or both. `result` is the mined
+/// member of its union, `TransactionResult` (ours has no mempool).
+fn type_at(kind: Kind, path: &str, m: &Map<String, Value>) -> Option<&'static str> {
+    Some(match (kind, path) {
+        (Kind::Tx, "") => "Transaction",
+        (Kind::Transfer, "") => "Transfer",
+        (Kind::Event, "") => "Event",
+        (Kind::Block, "") | (Kind::Tx, "result.block") | (Kind::Block, "parent") => "Block",
+        (Kind::Transfer | Kind::Event, "block") => "Block",
+        (Kind::Tx, "result") => "TransactionResult",
+        (Kind::Tx, "cmd") => "TransactionCommand",
+        (Kind::Tx, "cmd.meta") => "TransactionMeta",
+        (Kind::Tx, "cmd.signers") => "Signer",
+        (Kind::Tx, "cmd.signers.clist") => "TransactionCapability",
+        (Kind::Tx, "cmd.payload") => {
+            let exec = m.contains_key("code");
+            let cont = ["pactId", "proof", "rollback", "step"]
+                .iter()
+                .any(|k| m.contains_key(*k));
+            match (exec, cont) {
+                (true, false) => "ExecutionPayload",
+                (false, true) => "ContinuationPayload",
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// R-P5P9-70 (I-1): the first field a row's node selects that the harness does not check
 /// against the node (dotted path, list indices left out), or `None`. An empty object, a null
 /// where an object is selected and a list or object where a value is selected are unchecked
-/// too (an empty `cmd.payload` among them); so is a row without a kind. The root
-/// `__typename` must be the kind's type.
+/// too (an empty `cmd.payload` among them); so is a row without a kind. R-P5P9-71 (3): a
+/// `__typename` at any checked level passes when it is the schema type there ([`type_at`]).
 pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
     fn walk(kind: Kind, v: &Value, path: &str) -> Option<String> {
         let keys = checked_keys(kind, path);
@@ -636,17 +668,12 @@ pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
                 } else {
                     format!("{path}.{k}")
                 };
+                if k == "__typename" {
+                    let want = type_at(kind, path, m);
+                    return (want.is_none() || x.as_str() != want).then_some(p);
+                }
                 if !keys.contains(&k.as_str()) {
                     return Some(p);
-                }
-                if p == "__typename" {
-                    let want = match kind {
-                        Kind::Tx => "Transaction",
-                        Kind::Transfer => "Transfer",
-                        Kind::Event => "Event",
-                        Kind::Block => "Block",
-                    };
-                    return (x.as_str() != Some(want)).then_some(p);
                 }
                 if !checked_keys(kind, &p).is_empty() {
                     walk(kind, x, &p)
@@ -818,6 +845,8 @@ pub fn cmd_mismatch(c: &Value, node: &Value) -> Option<String> {
         for (k, x) in m {
             let y = at(meta, k);
             let ok = match k.as_str() {
+                // R-P5P9-71 (3): checked by [`unchecked_field`] against the schema type.
+                "__typename" => true,
                 "sender" => *x == y,
                 "chainId" | "gasLimit" | "ttl" => same_amount(x, &y, false),
                 "gasPrice" => same_amount(x, &y, true),
@@ -842,6 +871,7 @@ pub fn cmd_mismatch(c: &Value, node: &Value) -> Option<String> {
     if let Some(p) = c.get("payload").and_then(Value::as_object) {
         for (k, x) in p {
             let ok = match k.as_str() {
+                "__typename" => true,
                 "code" => exec.is_some() && json_field(x) == at(exec, "code"),
                 "data" => {
                     let y = at(exec.or(cont), "data");
@@ -868,6 +898,7 @@ pub fn cmd_mismatch(c: &Value, node: &Value) -> Option<String> {
         for (s, n) in ss.iter().zip(ns) {
             for (k, x) in s.as_object().into_iter().flatten() {
                 let ok = match k.as_str() {
+                    "__typename" => true,
                     "pubkey" => *x == at(Some(n), "pubKey"),
                     "address" => *x == at(Some(n), "addr"),
                     "clist" => {
@@ -881,6 +912,7 @@ pub fn cmd_mismatch(c: &Value, node: &Value) -> Option<String> {
                         for (cx, cn) in xc.iter().zip(nc) {
                             for (ck, cv) in cx.as_object().into_iter().flatten() {
                                 let ok = match ck.as_str() {
+                                    "__typename" => true,
                                     "name" => *cv == at(Some(cn), "name"),
                                     "args" => {
                                         same_value(&json_field(cv), &at(Some(cn), "args"), false)
@@ -1172,7 +1204,13 @@ fn block_fields(n: &Value, hd: &Value, oracle: bool) -> Result<(), Field> {
                 text(x).is_some() && text(x) == d.map(|d| d.to_string())
             }
             "parent" => {
-                if let Some(f) = x.as_object().and_then(|p| p.keys().find(|f| *f != "hash")) {
+                // R-P5P9-71 (3): the parent's `__typename` is the constant `Block`.
+                let other = |p: &Map<String, Value>| {
+                    p.iter()
+                        .find(|(f, v)| *f != "hash" && !(*f == "__typename" && *v == "Block"))
+                        .map(|(f, _)| f.clone())
+                };
+                if let Some(f) = x.as_object().and_then(other) {
                     return Err(Field::Unchecked(format!("parent.{f}")));
                 }
                 let p = x.get("hash").and_then(text);
@@ -3297,6 +3335,48 @@ impl Ctx {
 
 #[cfg(test)]
 mod tests {
+
+    /// R-P5P9-71 (3): `cmd.payload`'s `__typename` passes only as the union member its own
+    /// fields name; with neither `code` nor a continuation field it is unknown and refused.
+    #[test]
+    fn c5b_payload_typename_follows_its_member() {
+        let row =
+            |payload: Value| json!({"__typename": "Transaction", "cmd": {"payload": payload}});
+        let cases = [
+            (
+                json!({"__typename": "ExecutionPayload", "code": "(+ 1 2)"}),
+                None,
+            ),
+            (
+                json!({"__typename": "ContinuationPayload", "pactId": "p", "step": 1}),
+                None,
+            ),
+            (
+                json!({"__typename": "ContinuationPayload", "code": "(+ 1 2)"}),
+                Some("cmd.payload.__typename"),
+            ),
+            (
+                json!({"__typename": "ExecutionPayload"}),
+                Some("cmd.payload.__typename"),
+            ),
+            (
+                json!({"__typename": "Signer", "code": "x"}),
+                Some("cmd.payload.__typename"),
+            ),
+        ];
+        for (payload, want) in cases {
+            let got = unchecked_field(Some(Kind::Tx), &row(payload.clone()));
+            assert_eq!(got.as_deref(), want, "{payload}");
+        }
+        let block = json!({"__typename": "Block", "hash": "h", "parent": {"__typename": "Block", "hash": "p"}});
+        assert_eq!(unchecked_field(Some(Kind::Block), &block), None);
+        let wrong =
+            json!({"__typename": "Block", "hash": "h", "parent": {"__typename": "Transfer"}});
+        assert_eq!(
+            unchecked_field(Some(Kind::Block), &wrong).as_deref(),
+            Some("parent.__typename")
+        );
+    }
     use super::*;
 
     /// R-P5P9-70 (I-1) with R-P5P9-62 H9: the node's `meta.creationTime` as ours renders it,

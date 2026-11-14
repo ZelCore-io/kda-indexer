@@ -4640,9 +4640,10 @@ async fn c4_ours_only_tx_rows_have_their_cmd_fields_checked_against_the_node() {
     // A selected cmd field the harness does not check: the excuse is refused.
     for (ptr, value, name) in [
         ("/signers/0/scheme", json!("ED25519"), "cmd.signers.scheme"),
+        // R-P5P9-71 (3): a `__typename` that is not the schema type at its level.
         (
             "/meta/__typename",
-            json!("TransactionMeta"),
+            json!("TransactionCommand"),
             "cmd.meta.__typename",
         ),
     ] {
@@ -4656,6 +4657,14 @@ async fn c4_ours_only_tx_rows_have_their_cmd_fields_checked_against_the_node() {
             "{name}: {note}"
         );
     }
+    // R-P5P9-71 (3): the schema type there is explained.
+    let mut c = ours_cmd.clone();
+    c["meta"]["__typename"] = json!("TransactionMeta");
+    let (un, note) = run(c).await;
+    assert!(
+        un.is_empty(),
+        "cmd.meta.__typename TransactionMeta: {un:?} {note}"
+    );
 }
 
 /// R-P5P9-70 (I-1): an ours-only row is excused only when every field it selects was checked
@@ -4771,6 +4780,42 @@ async fn c5_ours_only_rows_have_every_selected_field_checked() {
         let (un, note) = run(top.clone(), tvars(), vec![tx("t1", 101), t2]).await;
         assert!(!un.is_empty(), "{name}: {note}");
         assert!(note.contains(name), "{name}: {note}");
+    }
+    // R-P5P9-71 (3): a nested `__typename` is a constant, checked against the schema type at
+    // its level: the right one is explained, a wrong one is a diff.
+    let typed = |result: &str, block: &str| {
+        let mut t2 = tx("t2", 100);
+        t2["node"]["__typename"] = json!("Transaction");
+        t2["node"]["result"]["__typename"] = json!(result);
+        t2["node"]["result"]["block"]["__typename"] = json!(block);
+        t2
+    };
+    let (un, note) = run(
+        top.clone(),
+        tvars(),
+        vec![tx("t1", 101), typed("TransactionResult", "Block")],
+    )
+    .await;
+    assert!(un.is_empty(), "the right nested __typename: {un:?} {note}");
+    for (result, block, name) in [
+        (
+            "TransactionResult",
+            "Transaction",
+            "result.block.__typename",
+        ),
+        ("TransactionMempoolInfo", "Block", "result.__typename"),
+    ] {
+        let (un, note) = run(
+            top.clone(),
+            tvars(),
+            vec![tx("t1", 101), typed(result, block)],
+        )
+        .await;
+        assert!(!un.is_empty(), "{name}: {note}");
+        assert!(
+            note.contains(&format!("unchecked field: {name}")),
+            "{name}: {note}"
+        );
     }
 }
 
