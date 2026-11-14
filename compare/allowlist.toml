@@ -410,7 +410,7 @@ route = "other"
 json_path_glob = "/~graphql-r60-scoped-list-finished"
 condition = "any"
 request_contains = "graphql:"
-reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block's transactions or events, a transaction's transfers or events) had its page cut on either side; the harness read that list to its end on both sides (at each target's own rate, at most 20 pages) and compared the full sets. A row only one side's full list holds stays a diff, and a list it could not finish stays as it was."
+reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block's transactions or events, a transaction's transfers or events) had its page cut on either side; the harness read that list to its end on both sides (at each target's own rate, at most 20 pages per list and list_page_budget pages per side and compare, with each row's key read so a row twice on one side leaves the list unfinished; R-P5P9-61 H6) and compared the full sets with their totalCount. A row only one side's full list holds stays a diff, and a list it could not finish stays as it was."
 owner_note = "Controller ruling R-P5P9-60 (H2); the order within one block or tx is a contract choice (M2c, R3E-8)."
 
 [[entry]]

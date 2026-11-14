@@ -86,6 +86,11 @@ pub struct GraphqlConfig {
     /// Per-field normalisers on the oracle pairs (R-P5P9-57 rules (a) and (b)), set by the
     /// controller per field after the node referee.
     pub field_rules: Vec<FieldRule>,
+    /// R-P5P9-61 H6: pages the harness reads per side and compare to finish cut lists of one
+    /// block or one tx (each page one request at that target's rate, so the oracle's share
+    /// stays inside its budget). A list it cannot finish within it stays a diff, marked as a
+    /// harness limit.
+    pub list_page_budget: usize,
 }
 
 /// One per-field normaliser (R-P5P9-57): at `field`, a difference that `rule` explains is
@@ -207,6 +212,7 @@ impl Default for GraphqlConfig {
             node_step_ms: 10_000,
             redraws: 4,
             field_rules: Vec::new(),
+            list_page_budget: 40,
         }
     }
 }

@@ -761,6 +761,15 @@ fn truncate_edges(data: &mut Value, n: usize) {
     }
 }
 
+/// Why a nested list read stopped before its end (R-P5P9-61 H6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListStop {
+    /// An error, a page past `MAX_PAGES`, or a row key missing or seen twice.
+    Failed,
+    /// The compare's page budget for that side ran out: a harness limit.
+    Budget,
+}
+
 /// An answer: the response (pages merged), the HTTP statuses and a verdict on transport.
 pub struct Answer {
     pub body: Value,
@@ -1299,11 +1308,10 @@ impl Ctx {
             );
         }
         let mut row_hits = self.gql_row_rules(ta, vars, &mut a, &mut b).await;
-        if self
+        let (finished, limit) = self
             .gql_finish_lists(op, vars, ta, tb, &mut a, &mut b)
-            .await
-            > 0
-        {
+            .await;
+        if finished > 0 {
             row_hits.push(crate::graphql_scope::SCOPED_FINISHED_PATH);
         }
         // R-P5P9-61 H5: a top-level list cut at a height boundary, settled on the node.
@@ -1319,6 +1327,7 @@ impl Ctx {
             root_scoped,
         );
         d.extend(boundary);
+        d.extend(limit);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
             path: p.into(),
             kind: DiffKind::Changed,
@@ -1328,12 +1337,14 @@ impl Ctx {
         self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d)
     }
 
-    /// R-P5P9-60 H2: the nested block and tx lists of an oracle pair whose page is cut on
-    /// either side are read to their end on both sides (the harness's own list query, at
-    /// each target's own rate, at most `MAX_PAGES` pages per side) and stand in for the page
-    /// when each side's page is a part of its own full list. At most `MAX_LISTS` lists are
-    /// tried per compare; a list not finished is left as it was (its diff stays). Returns
-    /// how many lists were finished.
+    /// R-P5P9-60 H2 and R-P5P9-61 H6: the nested block and tx lists of an oracle pair whose
+    /// page is cut on either side are read to their end on both sides (the harness's own list
+    /// query, at each target's own rate, at most `MAX_PAGES` pages per list and
+    /// `list_page_budget` pages per side and compare) and stand in for the page when each
+    /// side's page is a part of its own full list and no row key comes twice; the full sets
+    /// then compare with their `totalCount`. A list not finished is left as it was (its
+    /// diff stays). Returns how many lists were finished, and the harness-limit entry when
+    /// the budget left a cut list unread.
     pub(crate) async fn gql_finish_lists(
         &self,
         op: &GqlOp,
@@ -1342,10 +1353,10 @@ impl Ctx {
         tb: &Target,
         a: &mut Answer,
         b: &mut Answer,
-    ) -> usize {
+    ) -> (usize, Option<DiffEntry>) {
         use crate::graphql_scope::{
             finish_ok, hash_query, is_cut, list_query, put_hashes, scoped_lists, take_hashes,
-            MAX_LISTS,
+            HARNESS_LIMIT_PATH,
         };
         // A cut list under a root block list that selects no hash: one read of the root's
         // block hashes per side, put in for the lists' parents and taken out after.
@@ -1372,7 +1383,8 @@ impl Ctx {
             }
         }
         let (la, lb) = (scoped_lists(&a.body), scoped_lists(&b.body));
-        let (mut tried, mut done) = (0, 0);
+        let mut budget = [self.cfg.graphql.list_page_budget; 2];
+        let (mut done, mut limited) = (0, Vec::new());
         for l in la.iter().filter(|l| lb.contains(l)) {
             let (Some(ca), Some(cb)) = (a.body.pointer(&l.pointer), b.body.pointer(&l.pointer))
             else {
@@ -1384,16 +1396,21 @@ impl Ctx {
             let Some((q, vars, at)) = list_query(&op.query, l) else {
                 continue;
             };
-            if tried == MAX_LISTS {
-                break;
-            }
-            tried += 1;
-            let Some(fa) = self.gql_read_list(ta, &q, &vars, at).await else {
-                continue;
+            let fa = self.gql_read_list(ta, &q, &vars, at, &mut budget[0]).await;
+            let fb = match &fa {
+                Ok(_) => self.gql_read_list(tb, &q, &vars, at, &mut budget[1]).await,
+                Err(e) => Err(*e),
             };
-            let Some(fb) = self.gql_read_list(tb, &q, &vars, at).await else {
-                continue;
+            let (fa, fb) = match (fa, fb) {
+                (Ok(fa), Ok(fb)) => (fa, fb),
+                (Err(ListStop::Budget), _) | (_, Err(ListStop::Budget)) => {
+                    limited.push(json!(l.pointer));
+                    continue;
+                }
+                _ => continue,
             };
+            // Unequal lengths are not a reason to leave the cut pages: the full sets (and each
+            // side's totalCount) then compare, so a row one side lacks shows as a diff.
             if !finish_ok(ca, &fa) || !finish_ok(cb, &fb) {
                 continue;
             }
@@ -1408,50 +1425,94 @@ impl Ctx {
         take_hashes(&mut b.body, &put[1]);
         // The record shows the finished lists (H3): the diff paths index into them.
         if done > 0 {
-            for ans in [a, b] {
+            for ans in [&mut *a, &mut *b] {
                 ans.raw = trim_body(ans.body.to_string().as_bytes());
             }
         }
-        done
+        let limit = (!limited.is_empty()).then(|| {
+            tracing::warn!(
+                op = %op.stem,
+                lists = limited.len(),
+                budget = self.cfg.graphql.list_page_budget,
+                "harness limit: cut nested lists left unread (list_page_budget)"
+            );
+            DiffEntry {
+                path: HARNESS_LIMIT_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({"budget": self.cfg.graphql.list_page_budget,
+                    "left_a": budget[0], "left_b": budget[1]})),
+                b: Some(json!({"lists": limited})),
+            }
+        });
+        (done, limit)
     }
 
     /// One side's whole nested list through the harness's list query (`at`: the list in its
-    /// answer), as edges `{node}`; `None` on any error or past `MAX_PAGES` pages.
+    /// answer), as edges `{node}`. Each page takes one from `budget`. Fails on any error,
+    /// past `MAX_PAGES` pages, or on a row key (the query's key alias) missing or seen twice.
     async fn gql_read_list(
         &self,
         t: &Target,
         query: &str,
         vars: &Value,
         at: &str,
-    ) -> Option<Vec<Value>> {
+        budget: &mut usize,
+    ) -> Result<Vec<Value>, ListStop> {
+        use crate::graphql_scope::{KEY_ALIAS, MAX_PAGES};
         let mut vars = vars.clone();
         let mut out = Vec::new();
-        for _ in 0..crate::graphql_scope::MAX_PAGES {
+        let mut keys = std::collections::HashSet::new();
+        let failed = |_| ListStop::Failed;
+        for _ in 0..MAX_PAGES {
+            if *budget == 0 {
+                return Err(ListStop::Budget);
+            }
+            *budget -= 1;
             let c = t
                 .post_json(&json!({ "query": query, "variables": vars }))
                 .await
-                .ok()?;
+                .map_err(failed)?;
             self.gql_count(SCOPED_LIST_ROUTE, &t.name, &[c.ms]);
             if c.status != 200 {
-                return None;
+                return Err(ListStop::Failed);
             }
-            let v: Value = serde_json::from_slice(&c.body).ok()?;
+            let v: Value = serde_json::from_slice(&c.body).map_err(|_| ListStop::Failed)?;
             if v.get("errors")
                 .and_then(Value::as_array)
                 .is_some_and(|e| !e.is_empty())
             {
-                return None;
+                return Err(ListStop::Failed);
             }
-            let conn = v.pointer(at)?;
-            for e in conn.get("edges")?.as_array()? {
-                out.push(json!({ "node": e.get("node")? }));
+            let conn = v.pointer(at).ok_or(ListStop::Failed)?;
+            let edges = conn
+                .get("edges")
+                .and_then(Value::as_array)
+                .ok_or(ListStop::Failed)?;
+            for e in edges {
+                let key = e
+                    .get(KEY_ALIAS)
+                    .filter(|k| !k.is_null())
+                    .ok_or(ListStop::Failed)?;
+                if !keys.insert(key.to_string()) {
+                    return Err(ListStop::Failed);
+                }
+                out.push(json!({ "node": e.get("node").ok_or(ListStop::Failed)? }));
             }
-            if !conn.pointer("/pageInfo/hasNextPage")?.as_bool()? {
-                return Some(out);
+            let more = conn
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool);
+            match more {
+                Some(false) => return Ok(out),
+                Some(true) => {
+                    vars["after"] = conn
+                        .pointer("/pageInfo/endCursor")
+                        .cloned()
+                        .ok_or(ListStop::Failed)?;
+                }
+                None => return Err(ListStop::Failed),
             }
-            vars["after"] = conn.pointer("/pageInfo/endCursor")?.clone();
         }
-        None
+        Err(ListStop::Failed)
     }
 
     /// The shared `/local` client of the GraphQL node reads.

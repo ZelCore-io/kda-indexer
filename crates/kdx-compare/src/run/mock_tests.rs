@@ -936,6 +936,18 @@ max_height = 100
 /// pages `lists[<block hash>]` two rows at a time (whatever `first` asks), the cursor being
 /// the next index, and counts its calls.
 async fn list_server(lists: Value, calls: Arc<Mutex<usize>>) -> String {
+    keyed_list_server(lists, calls, 2, None).await
+}
+
+/// [`list_server`] with `per` rows a page and, with `fail`, a 500 for that (block, page).
+/// Each edge also answers the harness's key read (`kdxKey`, R-P5P9-61 H6): a list entry is
+/// a node (its key is its `hash`) or a `[key, node]` pair.
+async fn keyed_list_server(
+    lists: Value,
+    calls: Arc<Mutex<usize>>,
+    per: usize,
+    fail: Option<(&'static str, usize)>,
+) -> String {
     let app = Router::new().route(
         "/graphql",
         post(move |Json(req): Json<Value>| {
@@ -943,16 +955,24 @@ async fn list_server(lists: Value, calls: Arc<Mutex<usize>>) -> String {
             async move {
                 *calls.lock().unwrap() += 1;
                 let v = &req["variables"];
-                let rows = lists[v["p"].as_str().unwrap_or("")]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
+                let p = v["p"].as_str().unwrap_or("");
+                let rows = lists[p].as_array().cloned().unwrap_or_default();
                 let at: usize = v["after"].as_str().map_or(0, |c| c.parse().unwrap());
-                let end = (at + 2).min(rows.len());
-                let edges: Vec<Value> = rows[at..end].iter().map(|n| json!({"node": n})).collect();
+                if fail == Some((p, at / per)) {
+                    return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                let end = (at + per).min(rows.len());
+                let edges: Vec<Value> = rows[at..end]
+                    .iter()
+                    .map(|r| match r {
+                        Value::Array(kn) => json!({"node": kn[1], "kdxKey": {"hash": kn[0]}}),
+                        n => json!({"node": n, "kdxKey": {"hash": n["hash"]}}),
+                    })
+                    .collect();
                 Json(json!({"data": {"block": {"c": {
                     "pageInfo": {"hasNextPage": end < rows.len(), "endCursor": end.to_string()},
                     "edges": edges}}}}))
+                .into_response()
             }
         }),
     );
@@ -1028,7 +1048,7 @@ rate_rps = 1000.0
     };
     let (ctx, op) = (&ctx, &op);
     let run = |mut a: Answer, mut b: Answer| async move {
-        let n = ctx
+        let (n, _) = ctx
             .gql_finish_lists(op, &serde_json::Map::new(), ta, tb, &mut a, &mut b)
             .await;
         let d = compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false);
@@ -1318,4 +1338,157 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
     assert!(cut.is_none());
     let d = compare_answers_with(&mut a, &mut b, 7_000_000, 10_000, &[], false);
     assert!(stays_diff(&d), "{d:?}");
+}
+
+/// R-P5P9-61 H6 (ruling (3)): the nested `transactions` of large blocks (BlocksByHeight: no
+/// key selected, only `gasPrice`) are paged to the end on both sides within the page budget
+/// and compared as one multiset per block with its totalCount. The 147-tx shape (equal sets,
+/// different page subsets, five cut blocks in one answer) is explained; one changed field, a
+/// list one row short (unequal lengths), a page that fails part way, a key twice on one side
+/// and a spent budget each stay a diff, the last marked as a harness limit.
+#[tokio::test]
+async fn h6_large_block_lists_are_paged_to_the_end_within_the_budget() {
+    use crate::graphql::{compare_answers_with, parse_op};
+    use crate::graphql_scope::HARNESS_LIMIT_PATH;
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let gp = |i: usize| json!({"cmd": {"meta": {"gasPrice": if i.is_multiple_of(3) { 1e-6 } else { 1e-7 }}}});
+    let block =
+        |n: usize| -> Vec<Value> { (0..n).map(|i| json!([format!("k{i}"), gp(i)])).collect() };
+    let big = block(147);
+    let mut changed = big.clone();
+    changed[50] = json!(["k50", {"cmd": {"meta": {"gasPrice": 2e-7}}}]);
+    // The oracle's paging repeats k3 where k6 belongs: the same value, so only the key shows.
+    let mut twice = big.clone();
+    twice[6] = big[3].clone();
+    let mut short = big.clone();
+    short.pop();
+    let ours = json!({"CVQ6": big, "B1": block(30), "B2": block(30), "B3": block(30),
+        "B4": block(30), "CH": big, "FAIL": big, "TW": big, "SH": short});
+    let oracle = json!({"CVQ6": big, "B1": block(30), "B2": block(30), "B3": block(30),
+        "B4": block(30), "CH": changed, "FAIL": big, "TW": twice, "SH": big});
+    let calls = Arc::new(Mutex::new(0));
+    let au = keyed_list_server(ours.clone(), calls.clone(), 50, Some(("FAIL", 1))).await;
+    let bu = keyed_list_server(oracle.clone(), calls.clone(), 50, None).await;
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let out = dir.path();
+    let cfg = |budget: usize| -> CompareConfig {
+        toml::from_str(&format!(
+            r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = "no-such-dir"
+list_page_budget = {budget}
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_graphql"
+rate_rps = 1000.0
+[targets.b]
+url = "{bu}"
+kind = "kda_indexer_graphql"
+rate_rps = 1000.0
+"#
+        ))
+        .unwrap()
+    };
+    let ctx = Ctx::new(cfg(40)).await.unwrap();
+    let small = Ctx::new(cfg(2)).await.unwrap();
+    let op = parse_op(
+        "BlocksByHeight",
+        "query BlocksByHeight($startHeight: Int!, $endHeight: Int) { blocksFromHeight(startHeight: $startHeight, endHeight: $endHeight) { edges { node { chainId creationTime transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } height coinbase hash canonical } } } }",
+        false,
+    )
+    .unwrap();
+    // One answer: per block its hash, the totalCount it claims and the rows of its page
+    // (ours the first 20, the oracle's the last 20 in reverse).
+    fn answer(src: &Value, blocks: &[(&str, usize)], head: bool) -> crate::graphql::Answer {
+        let edges: Vec<Value> = blocks
+            .iter()
+            .map(|(h, total)| {
+                let rows = src[*h].as_array().unwrap();
+                let idx: Vec<usize> = if head {
+                    (0..20).collect()
+                } else {
+                    (rows.len() - 20..rows.len()).rev().collect()
+                };
+                let tx: Vec<Value> = idx.iter().map(|i| json!({"node": rows[*i][1]})).collect();
+                json!({"node": {"chainId": 0, "hash": h, "height": 4968386,
+                    "transactions": {"totalCount": total, "edges": tx}}})
+            })
+            .collect();
+        crate::graphql::Answer {
+            body: json!({"data": {"blocksFromHeight": {"edges": edges}}}),
+            status: 200,
+            raw: String::new(),
+            ms: Vec::new(),
+        }
+    }
+    async fn run(
+        ctx: &Ctx,
+        op: &crate::graphql::GqlOp,
+        src: (&Value, &Value),
+        blocks: &[(&str, usize)],
+    ) -> (usize, Option<String>, Vec<String>) {
+        let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+        let (mut a, mut b) = (answer(src.0, blocks, true), answer(src.1, blocks, false));
+        let (n, limit) = ctx
+            .gql_finish_lists(op, &serde_json::Map::new(), ta, tb, &mut a, &mut b)
+            .await;
+        let d = compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false);
+        (
+            n,
+            limit.map(|e| e.path),
+            d.into_iter().map(|e| e.path).collect(),
+        )
+    }
+    let src = (&ours, &oracle);
+    // The 147-tx shape in five cut blocks: every list finished, no diff.
+    let five = [
+        ("CVQ6", 147),
+        ("B1", 30),
+        ("B2", 30),
+        ("B3", 30),
+        ("B4", 30),
+    ];
+    let (n, limit, d) = run(&ctx, &op, src, &five).await;
+    assert_eq!((n, limit, d.clone()), (5, None, vec![]), "{d:?}");
+    // One changed field in one nested row: finished, and the row stays a diff.
+    let (n, _, d) = run(&ctx, &op, src, &[("CH", 147)]).await;
+    assert_eq!(n, 1);
+    assert!(
+        d.iter()
+            .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions/edges")),
+        "{d:?}"
+    );
+    // Ours' full list one row short of its totalCount: finished, the missing row a diff.
+    let (n, _, d) = run(&ctx, &op, src, &[("SH", 147)]).await;
+    assert_eq!(n, 1);
+    assert!(
+        d.iter()
+            .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions/edges")),
+        "{d:?}"
+    );
+    // Ours fails on its second page, or the oracle's paging gives k3 twice (in place of k6,
+    // the same value): not finished, the cut pages stay a diff.
+    for (h, total) in [("FAIL", 147), ("TW", 147)] {
+        let (n, limit, d) = run(&ctx, &op, src, &[(h, total)]).await;
+        assert_eq!((n, limit), (0, None), "{h}");
+        assert!(
+            d.iter()
+                .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")),
+            "{h}: {d:?}"
+        );
+    }
+    // A budget of 2 pages a side: the 3-page list is not read to its end; a diff marked as a
+    // harness limit.
+    let (n, limit, d) = run(&small, &op, src, &[("CVQ6", 147)]).await;
+    assert_eq!((n, limit.as_deref()), (0, Some(HARNESS_LIMIT_PATH)));
+    assert!(!d.is_empty());
 }
