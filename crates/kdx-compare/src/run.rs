@@ -487,7 +487,8 @@ impl Ctx {
         // R-P5P9-66 concern 4, R-P5P9-67 m-2: H7's header-by-hash reads (1 r/s, their own
         // client) and the node client (`node_max_rps` − 1) stay within `node_max_rps` only
         // from 2 up; with an oracle target (header reads on) a lower one is refused, here so
-        // that `referee --rps 1` is refused too. 0 (no limit) has no bound to keep.
+        // that `referee --rps 1` is refused too. 0 (no limit) is refused as well: it keeps
+        // no bound on the node.
         let oracle = cfg
             .targets
             .values()
