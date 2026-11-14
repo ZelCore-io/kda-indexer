@@ -4869,3 +4869,53 @@ async fn c5_mined_at_rereads_the_cut_once_when_the_tip_moved() {
     assert!(!ctx.mined_at(0, 105, "k:miner", &mut st).await);
     assert_eq!(*cut.lock().unwrap(), 3, "one re-read per height, no loop");
 }
+
+/// R-P5P9-70 (m-5): N2's one-block skew is excused only when ours' tip on the chain is
+/// `node_h - 1` (one read of ours) and the node stores exactly one header at `node_h`, the cut
+/// branch's, whose coinbase paid the account.
+#[tokio::test]
+async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let cb = |to: &str| {
+        let v = json!({"result": {"status": "success"}, "events": [{"name": "TRANSFER",
+            "module": {"name": "coin", "namespace": null}, "params": ["", to, 0.9]}]});
+        json!({"coinbase": kdx_types::hash::b64url_encode(v.to_string().as_bytes())})
+    };
+    let hd =
+        |h: &str, p: &str, c: u8| json!({"hash": h, "payloadHash": p, "height": 100, "chainId": c});
+    let mut node = NodeMock::default();
+    node.headers.insert((0, 100), vec![hd("x0", "p0", 0)]);
+    node.headers.insert((1, 100), vec![hd("x1", "p1", 1)]);
+    // Chain 2: a fork at node_h; the cut's branch names the block that pays the miner.
+    node.headers
+        .insert((2, 100), vec![hd("x2", "p2", 2), hd("y2", "q2", 2)]);
+    node.canon.insert((2, 100), "x2".into());
+    for p in ["p0", "p1", "p2", "q2"] {
+        node.payloads.insert(p.into(), cb("k:miner"));
+    }
+    // Ours: one block below node_h on chains 0 and 2; already at node_h on chain 1.
+    let au = ours_fn_server(|req: &Value| {
+        let c = req["variables"]["c"][0].as_str().unwrap_or("0").to_string();
+        let start = req["variables"]["h"].as_u64().unwrap_or(0);
+        let tip = if c == "1" { 100 } else { 99 };
+        let edges: Vec<Value> = (start..=tip)
+            .take(2)
+            .map(|h| json!({"node": {"height": h, "chainId": c}}))
+            .collect();
+        json!({"data": {"blocksFromHeight": {"pageInfo": {"hasNextPage": tip >= start + 2},
+            "edges": edges}}})
+    })
+    .await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let ta = &ctx.targets["a"];
+    let skew = |c: u8| {
+        let ctx = &ctx;
+        async move {
+            ctx.n2_skew(ta, c, 100, "k:miner", &mut Reads::default())
+                .await
+        }
+    };
+    assert!(skew(0).await, "the true skew");
+    assert!(!skew(1).await, "ours at node_h: no skew");
+    assert!(!skew(2).await, "a fork at node_h");
+}

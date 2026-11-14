@@ -2806,7 +2806,12 @@ impl Ctx {
 
     /// Every header the node stores at `(chain, h)` (orphans included): for a block's payload
     /// hash by its block hash only, never for canonicity.
-    async fn h7_headers(&self, chain: u8, h: u64, st: &mut Reads) -> Result<Vec<Value>, String> {
+    pub(crate) async fn h7_headers(
+        &self,
+        chain: u8,
+        h: u64,
+        st: &mut Reads,
+    ) -> Result<Vec<Value>, String> {
         if let Some(v) = st.headers.get(&(chain, h)) {
             return v.clone();
         }

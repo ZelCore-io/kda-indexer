@@ -2166,6 +2166,57 @@ impl Ctx {
         }
     }
 
+    /// R-P5P9-70 (m-5): N2's one-block skew at `(chain, node_h)` is excused only when ours'
+    /// tip on that chain is `node_h - 1` (one read of ours: our blocks from that height hold
+    /// exactly that one), the node stores exactly one header at `node_h` and it is the cut
+    /// branch's, and its coinbase paid `account` ([`Ctx::mined_at`]). Anything else, a failed
+    /// read or the cap leaves the diff.
+    pub(crate) async fn n2_skew(
+        &self,
+        ta: &Target,
+        chain: u8,
+        node_h: u64,
+        account: &str,
+        st: &mut crate::graphql_window::Reads,
+    ) -> bool {
+        let Some(below) = node_h.checked_sub(1) else {
+            return false;
+        };
+        const TIP: &str = "query N2Tip($c: [String!], $h: Int!) { blocksFromHeight(startHeight: \
+                           $h, chainIds: $c, first: 2) { pageInfo { hasNextPage } edges { node \
+                           { height chainId } } } }";
+        st.ours += 1;
+        let vars = json!({"c": [chain.to_string()], "h": below});
+        let Some(data) = self.gql_read(ta, TIP, vars).await else {
+            return false;
+        };
+        let conn = &data["blocksFromHeight"];
+        let rows: Vec<(Option<String>, Option<String>)> = conn["edges"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|e| {
+                (
+                    text_decimal(e.pointer("/node/height")),
+                    text_decimal(e.pointer("/node/chainId")),
+                )
+            })
+            .collect();
+        let one_below = rows == [(Some(below.to_string()), Some(chain.to_string()))]
+            && conn.pointer("/pageInfo/hasNextPage") == Some(&json!(false));
+        if !one_below {
+            return false;
+        }
+        let one = match self.h7_headers(chain, node_h, st).await {
+            Ok(hs) if hs.len() == 1 => hs[0].get("hash").cloned(),
+            _ => return false,
+        };
+        if one.is_none() || !self.mined_at(chain, node_h, account, st).await {
+            return false;
+        }
+        matches!(self.h7_canonical(chain, node_h, st).await, Ok(Some(hd)) if hd.get("hash") == one.as_ref())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gql_classify(
         &self,
@@ -2520,7 +2571,9 @@ impl Ctx {
                     } else if match (ours, reward) {
                         (Some(x), Some(rw)) => {
                             crate::graphql_norm::one_block_skew(x, &det.balance, rw)
-                                && self.mined_at(chain, node_h, &account, &mut n2_reads).await
+                                && self
+                                    .n2_skew(ta, chain, node_h, &account, &mut n2_reads)
+                                    .await
                         }
                         _ => false,
                     } {
