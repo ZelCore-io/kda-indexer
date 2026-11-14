@@ -1584,7 +1584,7 @@ impl Ctx {
         let note = format!(
             "streamed /v1/txs compare (an answer over the {}-byte body cap): A {} bytes, {} rows; \
              B {} bytes, {} rows{found}",
-            ta.max_body_bytes(),
+            ta.body_cap(&req.path_and_query),
             a.bytes,
             a.rows.len(),
             b.bytes,

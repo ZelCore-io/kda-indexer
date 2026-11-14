@@ -4294,15 +4294,21 @@ async fn v1_compare(ctx: &Ctx, path: &str) -> super::Outcome {
         .await
 }
 
-/// Item 2: two answers over the 8 MiB cap compare by a streamed hash of the normalized
-/// rows: equal sets pass (order and kda-txs's `_id` aside), one differing row is a diff that
-/// names the row, with both copies from a bounded second read. Never an a-error, never cut.
+/// Item 2, R-P5P9-69: two answers over the 32 MiB cap (here about 40 MiB each) compare by a
+/// streamed hash of the normalized rows: equal sets pass (order and kda-txs's `_id` aside),
+/// one differing row is a diff that names the row, with both copies from a bounded second
+/// read. Never an a-error, never cut.
 #[tokio::test]
 async fn c4_large_v1txs_answers_are_compared_by_streamed_hash() {
     let dir = tempfile::tempdir().unwrap();
-    let rows = v1_rows(250, 36_000);
+    let rows = v1_rows(250, 168_000);
     let a = serde_json::to_vec(&rows).unwrap();
-    assert!(a.len() > crate::report::BODY_CAP, "{} bytes", a.len());
+    assert!(a.len() > 40 << 20, "{} bytes", a.len());
+    assert!(
+        a.len() > crate::graphql::MERGED_BYTES_CAP,
+        "{} bytes",
+        a.len()
+    );
     let mut same = rows.clone();
     same.reverse();
     same[3]["_id"] = json!("cache-3");
@@ -4338,21 +4344,51 @@ async fn c4_large_v1txs_answers_are_compared_by_streamed_hash() {
     assert_eq!(left.len(), rec.diff.len(), "{ids:?}");
 }
 
-/// Item 3 (the I-6 residual of run 6E): ours' 250-row page over 8 MiB (`/v1/txs/669bd564…/
-/// coin/250`, an a-error at the body cap) goes through the same streamed path while kda-txs's
-/// answer is under the cap and read as usual: the same rows pass; kda-txs lacking a row is a
-/// diff naming it (no limit-edge or lag rule applies to a streamed compare).
+/// R-P5P9-69 concern 2: a `/v1/txs` answer of about 12 MiB a side (over the old 8 MiB cap,
+/// under 32 MiB) keeps the normal in-memory compare with every rule. Here kda-txs stops one
+/// row short of the limit, which `oracle-limit-edge` explains: allowlisted, not streamed (the
+/// streamed compare has no rules, so this was a diff at 17a6058).
 #[tokio::test]
-async fn c4_a_250_row_page_over_8_mib_goes_through_the_streamed_path() {
+async fn c4_a_12_mib_v1txs_pair_keeps_its_rules() {
     let dir = tempfile::tempdir().unwrap();
-    let rows = v1_rows(250, 33_000);
+    let rows = v1_rows(250, 51_000);
+    let a = serde_json::to_vec(&rows).unwrap();
+    let b = serde_json::to_vec(&rows[..249]).unwrap();
+    assert!(
+        a.len() > 12 << 20 && b.len() > 12 << 20,
+        "{} {}",
+        a.len(),
+        b.len()
+    );
+    assert!(a.len() < crate::graphql::MERGED_BYTES_CAP);
+    let ctx = v1_setup(a, b, dir.path()).await;
+    let o = v1_compare(&ctx, "/v1/txs/k:big/coin/250").await;
+    // An explained answer keeps no record; a streamed compare would have kept a diff.
+    assert_eq!(
+        o.class,
+        "allowlisted",
+        "{:?}",
+        o.record.map(|r| (r.note, r.diff))
+    );
+    assert!(o.record.is_none());
+}
+
+/// Item 3 (the I-6 residual of run 6E): ours' 250-row page over the 32 MiB cap (`/v1/txs/
+/// 669bd564…/coin/250`, an a-error at the body cap) goes through the same streamed path while
+/// kda-txs's answer is under the cap and read as usual: the same rows pass; kda-txs lacking a
+/// row is a diff naming it (no limit-edge or lag rule applies to a streamed compare).
+#[tokio::test]
+async fn c4_a_250_row_page_over_the_cap_goes_through_the_streamed_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = v1_rows(250, 130_000);
     let b = serde_json::to_vec(&rows).unwrap();
     // Ours: the same rows, with whitespace that takes the answer over the cap.
     let mut a = b.clone();
     let end = a.pop().unwrap();
-    a.extend(std::iter::repeat_n(b' ', 300_000));
+    a.extend(std::iter::repeat_n(b' ', 2_000_000));
     a.push(end);
-    assert!(a.len() > crate::report::BODY_CAP && b.len() < crate::report::BODY_CAP);
+    let cap = crate::graphql::MERGED_BYTES_CAP;
+    assert!(a.len() > cap && b.len() < cap, "{} {}", a.len(), b.len());
     let path = "/v1/txs/k:669bd564/coin/250";
     let ctx = v1_setup(a.clone(), b, dir.path()).await;
     let o = v1_compare(&ctx, path).await;

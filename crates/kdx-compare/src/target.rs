@@ -75,9 +75,9 @@ impl HttpCapture {
     }
 }
 
-/// An answer over the target's body cap (`max_body_bytes`). A `/v1/txs` answer over the cap
-/// goes through the streamed compare ([`crate::streamed`], R-P5P9-52 concern 5); a composed
-/// `kda_txs_via_cwd` answer carries its capture, so it is not composed twice.
+/// An answer over the body cap of its request ([`Target::body_cap`]). A `/v1/txs` answer over
+/// the cap goes through the streamed compare ([`crate::streamed`], R-P5P9-52 concern 5); a
+/// composed `kda_txs_via_cwd` answer carries its capture, so it is not composed twice.
 #[derive(Debug)]
 pub struct BodyOverCap {
     pub msg: String,
@@ -277,6 +277,18 @@ impl Target {
         self.max_body_bytes
     }
 
+    /// The most bytes one read of `path_and_query` keeps in memory. A `/v1/txs` answer is
+    /// compared in memory, with every rule, up to [`crate::graphql::MERGED_BYTES_CAP`] per
+    /// side (R-P5P9-69, the cap of m-3's merged GraphQL bytes); only an answer above it goes
+    /// through the streamed hash. Every other read keeps the target's `max_body_bytes`.
+    pub fn body_cap(&self, path_and_query: &str) -> usize {
+        if path_and_query.starts_with("/v1/txs") {
+            crate::graphql::MERGED_BYTES_CAP
+        } else {
+            self.max_body_bytes
+        }
+    }
+
     fn full_url(&self, path_and_query: &str) -> String {
         let base = self.url.as_str().trim_end_matches('/');
         format!("{base}{path_and_query}")
@@ -298,11 +310,12 @@ impl Target {
                     ms: 0,
                 }
             };
-            if cap.body.len() > self.max_body_bytes {
+            let limit = self.body_cap(path_and_query);
+            if cap.body.len() > limit {
                 return Err(BodyOverCap {
                     msg: format!(
-                        "{} GET {path_and_query}: composed body exceeds {} bytes",
-                        self.name, self.max_body_bytes
+                        "{} GET {path_and_query}: composed body exceeds {limit} bytes",
+                        self.name
                     ),
                     capture: Some(cap),
                 }
@@ -356,7 +369,7 @@ impl Target {
         let status = resp.status().as_u16();
         let headers = kept_headers(&resp);
         // Bodies are untrusted (replayed heavy routes, a misbehaving target): read with a cap.
-        let limit = self.max_body_bytes;
+        let limit = self.body_cap(path_and_query);
         let over = || -> anyhow::Error {
             BodyOverCap {
                 msg: format!(
