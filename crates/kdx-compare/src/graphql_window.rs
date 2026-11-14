@@ -22,6 +22,9 @@
 //!   field the node's entry has (R-P5P9-64 I-2, our amounts exact: M-3) and matches the
 //!   query's own filter (R-P5P9-63 (1)). It is then outside the oracle's window (beyond its
 //!   last `creationTime` while its page is cut) or a node-confirmed oracle gap;
+//!   every field it selects is one the harness checks against the node (a per-kind whitelist;
+//!   a transfer's `creationTime` against the node's command) and identity fields it selects
+//!   more than once agree (R-P5P9-70 I-1);
 //! - ours is in the list's height order: descending, or ascending for `blocksFromHeight`
 //!   (R-P5P9-63 (6)); a cut page of ours shorter than `first` × the pages fetched is not a
 //!   window (I-3).
@@ -329,6 +332,9 @@ pub struct Verdict {
     /// R-P5P9-68 (2): ours-only tx rows' `cmd` fields against the node's signed command
     /// (`None`: not checked).
     pub cmd: Option<CmdCheck>,
+    /// R-P5P9-70 (I-1): an ours-only transfer row's `creationTime` against the node's command
+    /// (or, for a coinbase, its block's time), in ours' form (`None`: not checked).
+    pub ctime: Option<CmdCheck>,
 }
 
 /// The check of an ours-only tx row's `cmd` fields against the node (R-P5P9-68 (2)).
@@ -359,6 +365,7 @@ impl Verdict {
             matches: 0,
             transfers: Vec::new(),
             cmd: None,
+            ctime: None,
         }
     }
 
@@ -524,12 +531,30 @@ pub fn tx_matches(n: &Value, p: &Value, oracle: bool) -> bool {
             .is_none_or(|x| json_is(x, p.get("continuation")))
 }
 
-/// The `cmd` fields the harness checks against the node's signed command (R-P5P9-68 (2)),
-/// per level of ours' `TransactionCommand`: every other selected field is unchecked.
-fn cmd_checked_keys(path: &str) -> &'static [&'static str] {
-    match path {
-        "cmd" => &["meta", "networkId", "nonce", "payload", "signers"],
-        "cmd.meta" => &[
+/// The fields of a list row's node the harness checks against the node, per kind and level
+/// (R-P5P9-68 (2) for `cmd`, widened to the whole row by R-P5P9-70 I-1): a level lists its
+/// checked keys, and a key with its own entry is an object (or, for the signers and their
+/// capabilities, a list of objects). Every other selected field is unchecked.
+fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
+    match (kind, path) {
+        // The row's identity (cross-checked by [`id_conflict`]), `cmd` against the node's
+        // signed command, `result` against its `/poll` entry or coinbase output.
+        (Kind::Tx, "") => &["__typename", "cmd", "hash", "id", "result"],
+        (Kind::Tx, "result") => &[
+            "badResult",
+            "block",
+            "continuation",
+            "eventCount",
+            "gas",
+            "goodResult",
+            "height",
+            "transactionId",
+        ],
+        (Kind::Tx, "result.block") | (Kind::Transfer | Kind::Event, "block") => {
+            &["chainId", "hash", "height"]
+        }
+        (Kind::Tx, "cmd") => &["meta", "networkId", "nonce", "payload", "signers"],
+        (Kind::Tx, "cmd.meta") => &[
             "chainId",
             "creationTime",
             "gasLimit",
@@ -537,28 +562,94 @@ fn cmd_checked_keys(path: &str) -> &'static [&'static str] {
             "sender",
             "ttl",
         ],
-        "cmd.payload" => &["code", "data", "pactId", "proof", "rollback", "step"],
-        "cmd.signers" => &["address", "clist", "pubkey"],
-        "cmd.signers.clist" => &["args", "name"],
+        (Kind::Tx, "cmd.payload") => &["code", "data", "pactId", "proof", "rollback", "step"],
+        (Kind::Tx, "cmd.signers") => &["address", "clist", "pubkey"],
+        (Kind::Tx, "cmd.signers.clist") => &["args", "name"],
+        // [`transfer_matches`] against the node's event, the identity, and `creationTime`
+        // against the node's command (or the coinbase's block).
+        (Kind::Transfer, "") => &[
+            "__typename",
+            "amount",
+            "block",
+            "blockHash",
+            "chainId",
+            "creationTime",
+            "height",
+            "id",
+            "moduleHash",
+            "moduleName",
+            "orderIndex",
+            "receiverAccount",
+            "requestKey",
+            "senderAccount",
+        ],
+        // [`event_matches`] against the node's event, and the identity.
+        (Kind::Event, "") => &[
+            "__typename",
+            "block",
+            "blockHash",
+            "chainId",
+            "height",
+            "id",
+            "moduleHash",
+            "name",
+            "orderIndex",
+            "parameterText",
+            "parameters",
+            "qualifiedName",
+            "requestKey",
+        ],
+        // [`block_fields`] against the canonical header.
+        (Kind::Block, "") => &[
+            "__typename",
+            "chainId",
+            "creationTime",
+            "difficulty",
+            "epoch",
+            "hash",
+            "height",
+            "id",
+            "nonce",
+            "parent",
+            "payloadHash",
+            "powHash",
+            "target",
+            "weight",
+        ],
+        (Kind::Block, "parent") => &["hash"],
         _ => &[],
     }
 }
 
-/// The first `cmd` field a tx row selects that the harness does not check (dotted path, list
-/// indices left out), or `None`.
-pub fn unchecked_cmd_field(n: &Value) -> Option<String> {
-    fn walk(v: &Value, path: &str) -> Option<String> {
-        let keys = cmd_checked_keys(path);
+/// R-P5P9-70 (I-1): the first field a row's node selects that the harness does not check
+/// against the node (dotted path, list indices left out), or `None`. An empty object, a null
+/// where an object is selected and a list or object where a value is selected are unchecked
+/// too (an empty `cmd.payload` among them); so is a row without a kind. The root
+/// `__typename` must be the kind's type.
+pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
+    fn walk(kind: Kind, v: &Value, path: &str) -> Option<String> {
+        let keys = checked_keys(kind, path);
         match v {
-            Value::Object(m) if !keys.is_empty() => m.iter().find_map(|(k, x)| {
-                let p = format!("{path}.{k}");
+            Value::Object(m) if !m.is_empty() => m.iter().find_map(|(k, x)| {
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
                 if !keys.contains(&k.as_str()) {
                     return Some(p);
                 }
-                let nested = matches!(p.as_str(), "cmd.meta" | "cmd.payload")
-                    || matches!(p.as_str(), "cmd.signers" | "cmd.signers.clist");
-                if nested {
-                    walk(x, &p)
+                if p == "__typename" {
+                    let want = match kind {
+                        Kind::Tx => "Transaction",
+                        Kind::Transfer => "Transfer",
+                        Kind::Event => "Event",
+                        Kind::Block => "Block",
+                    };
+                    return (x.as_str() != Some(want)).then_some(p);
+                }
+                if !checked_keys(kind, &p).is_empty() {
+                    walk(kind, x, &p)
                 } else if x.is_object() || x.is_array() {
                     Some(p)
                 } else {
@@ -566,29 +657,158 @@ pub fn unchecked_cmd_field(n: &Value) -> Option<String> {
                 }
             }),
             Value::Array(a) if matches!(path, "cmd.signers" | "cmd.signers.clist") => {
-                a.iter().find_map(|x| walk(x, path))
+                a.iter().find_map(|x| walk(kind, x, path))
             }
-            Value::Object(_) | Value::Array(_) => Some(path.to_string()),
-            // A null `cmd`, `meta`, … or a scalar where an object is selected.
+            _ if path.is_empty() => Some("node".into()),
+            // An empty object, a null where an object is selected, or a scalar there.
             _ => Some(path.to_string()),
         }
     }
-    n.get("cmd").and_then(|c| walk(c, "cmd"))
+    match kind {
+        Some(k) => walk(k, n, ""),
+        None => Some("node (no kind)".into()),
+    }
 }
 
-/// The node's `meta.creationTime` in whole seconds.
+/// R-P5P9-70 (I-1): where a row selects one identity part more than once (its relay `id`'s
+/// parts against its `requestKey`/`hash`/`blockHash`/`block.hash`/`orderIndex`/`chainId`
+/// fields, and every height field against the others), the first part whose values differ;
+/// also an `id` that does not decode as the row's kind. Block rows are compared field by
+/// field with the header ([`block_fields`]).
+pub fn id_conflict(e: &Value, kind: Option<Kind>) -> Option<String> {
+    let n = e.get("node").unwrap_or(&Value::Null);
+    let kind = kind.filter(|k| *k != Kind::Block)?;
+    let tv = |v: &Value| {
+        if v.is_null() {
+            Some("null".to_string())
+        } else {
+            text(v)
+        }
+    };
+    // (part, source, value text; `None` for a list or an object).
+    let mut got: Vec<(&str, String, Option<String>)> = Vec::new();
+    for (part, ptrs) in [
+        ("request key", &["/requestKey", "/hash"][..]),
+        (
+            "block",
+            &["/blockHash", "/block/hash", "/result/block/hash"][..],
+        ),
+        (
+            "chain",
+            &[
+                "/chainId",
+                "/block/chainId",
+                "/result/block/chainId",
+                "/cmd/meta/chainId",
+            ][..],
+        ),
+        ("index", &["/orderIndex"][..]),
+        (
+            "height",
+            &[
+                "/height",
+                "/result/height",
+                "/block/height",
+                "/result/block/height",
+            ][..],
+        ),
+        ("module hash", &["/moduleHash"][..]),
+    ] {
+        for p in ptrs {
+            if *p == "/hash" && kind != Kind::Tx {
+                continue;
+            }
+            if let Some(v) = n.pointer(p) {
+                got.push((part, p[1..].replace('/', "."), tv(v)));
+            }
+        }
+    }
+    if let Some(id) = n.get("id") {
+        let (ty, names): (&str, &[&str]) = match kind {
+            Kind::Tx => ("Transaction", &["block", "request key"]),
+            Kind::Transfer => (
+                "Transfer",
+                &["block", "chain", "index", "module hash", "request key"],
+            ),
+            _ => ("Event", &["block", "index", "request key"]),
+        };
+        let parts = id
+            .as_str()
+            .and_then(decode_id)
+            .filter(|(t, _)| t == ty)
+            .and_then(|(_, k)| id_parts(&k))
+            .filter(|p| p.len() == names.len());
+        let Some(parts) = parts else {
+            return Some(format!("its id does not decode as a {ty} id"));
+        };
+        for (part, v) in names.iter().zip(parts) {
+            got.push((part, "id".into(), Some(v)));
+        }
+    }
+    for (i, (part, src, v)) in got.iter().enumerate() {
+        if v.is_none() {
+            return Some(format!("its {src} is not a value"));
+        }
+        if let Some((_, src0, v0)) = got[..i].iter().find(|(p, _, _)| p == part) {
+            if v0 != v {
+                let o = |x: &Option<String>| x.clone().unwrap_or_default();
+                return Some(format!(
+                    "its {part} differs: {src0} {}, {src} {}",
+                    o(v0),
+                    o(v)
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The module hash a transfer row's relay id holds (its fourth part), when it selects `id`.
+fn transfer_id_module(n: &Value) -> Option<String> {
+    let (t, k) = n.get("id")?.as_str().and_then(decode_id)?;
+    let parts = id_parts(&k).filter(|p| p.len() == 5 && t == "Transfer")?;
+    parts.get(3).cloned()
+}
+
+/// The request key of a block payload's coinbase output, when it decodes.
+fn coinbase_key(payload: &Value) -> Option<String> {
+    let cb = payload.get("coinbase")?.as_str()?;
+    let b = kdx_types::hash::b64url_decode(cb).ok()?;
+    let v: Value = serde_json::from_slice(&b).ok()?;
+    v.get("reqKey")?.as_str().map(str::to_string)
+}
+
+/// The node's `meta.creationTime` in whole seconds, as ours renders it (R-P5P9-62 H9: Pact's
+/// `ParsedInteger`, a fraction rounded half to even; `{"int": n}` unwrapped).
 fn node_secs(v: &Value) -> Option<u64> {
+    let v = match v {
+        Value::Object(o) => o.get("int")?,
+        v => v,
+    };
     let t = text(v)?;
-    t.parse::<u64>().ok().or_else(|| {
-        let f = t.parse::<f64>().ok()?;
-        (f >= 0.0 && f.fract() == 0.0).then_some(f as u64)
-    })
+    let t = t.trim();
+    if let Ok(s) = t.parse::<u64>() {
+        return Some(s);
+    }
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    if let Some((i, f)) = t.split_once('.').filter(|(i, f)| digits(i) && digits(f)) {
+        let s: u64 = i.parse().ok()?;
+        let f = f.trim_end_matches('0');
+        let up = match f.as_bytes().first() {
+            Some(b'6'..=b'9') => true,
+            Some(b'5') => f.len() > 1 || s % 2 == 1,
+            _ => false,
+        };
+        return s.checked_add(u64::from(up));
+    }
+    let f = t.parse::<f64>().ok()?;
+    ((0.0..9.0e15).contains(&f) && f.fract() == 0.0).then_some(f as u64)
 }
 
 /// The first checked `cmd` field of ours' row `c` (its `cmd` object) that is not the node's
 /// signed command `node`, in ours' encodings (`code` and the JSON texts quoted, the times as
 /// `.mmmZ`, the integers as text); `None` when all are the node's. Run only on a row
-/// [`unchecked_cmd_field`] passes.
+/// [`unchecked_field`] passes.
 pub fn cmd_mismatch(c: &Value, node: &Value) -> Option<String> {
     let null = Value::Null;
     let at = |v: Option<&Value>, k: &str| v.and_then(|v| v.get(k)).unwrap_or(&null).clone();
@@ -1799,35 +2019,71 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
             ));
             continue;
         }
-        // R-P5P9-68 (2): every `cmd` field the row selects must have been checked against
-        // the node.
-        if ra.id.kind == Some(Kind::Tx) && node_of(ra).get("cmd").is_some() {
-            match &v.cmd {
-                Some(CmdCheck::Same) => {}
-                Some(CmdCheck::Differs(f)) => {
-                    d.rejected.push((
-                        Some(ra.edge.clone()),
-                        None,
-                        format!("an ours-only row whose {f} is not the node's"),
-                    ));
-                    continue;
-                }
-                Some(CmdCheck::Unsettled(w)) => {
-                    d.undecided.push(format!(
-                        "an ours-only row whose cmd the node did not settle ({w}): {}",
-                        ra.id.evidence()
-                    ));
-                    continue;
-                }
-                None => {
-                    let f = unchecked_cmd_field(node_of(ra)).unwrap_or_else(|| "cmd".into());
-                    d.rejected.push((
-                        Some(ra.edge.clone()),
-                        None,
-                        format!("an ours-only canonical row: unchecked field: {f}"),
-                    ));
-                    continue;
-                }
+        // R-P5P9-70 (I-1): every field the row selects must have been checked against the
+        // node; identity fields selected more than once must agree (R-P5P9-68 (2) for `cmd`).
+        if let Some(why) = id_conflict(&ra.edge, ra.id.kind) {
+            d.undecided.push(format!(
+                "an ours-only row whose identity fields disagree ({why}): {}",
+                ra.id.evidence()
+            ));
+            continue;
+        }
+        if let Some(f) = unchecked_field(ra.id.kind, node_of(ra)) {
+            d.rejected.push((
+                Some(ra.edge.clone()),
+                None,
+                format!("an ours-only canonical row: unchecked field: {f}"),
+            ));
+            continue;
+        }
+        let n = node_of(ra);
+        let checks = [
+            (
+                ra.id.kind == Some(Kind::Tx) && n.get("cmd").is_some(),
+                &v.cmd,
+                "cmd",
+            ),
+            (
+                ra.id.kind == Some(Kind::Transfer) && n.get("creationTime").is_some(),
+                &v.ctime,
+                "creationTime",
+            ),
+        ];
+        let mut settled = true;
+        for (_, check, what) in checks.iter().filter(|c| c.0) {
+            match check {
+                Some(CmdCheck::Same) => continue,
+                Some(CmdCheck::Differs(f)) => d.rejected.push((
+                    Some(ra.edge.clone()),
+                    None,
+                    format!("an ours-only row whose {f} is not the node's"),
+                )),
+                Some(CmdCheck::Unsettled(w)) => d.undecided.push(format!(
+                    "an ours-only row whose {what} the node did not settle ({w}): {}",
+                    ra.id.evidence()
+                )),
+                None => d.rejected.push((
+                    Some(ra.edge.clone()),
+                    None,
+                    format!("an ours-only canonical row: unchecked field: {what}"),
+                )),
+            }
+            settled = false;
+            break;
+        }
+        if !settled {
+            continue;
+        }
+        // A transfer's relay id holds its module hash: the node's event's.
+        if let Some(mh) = transfer_id_module(n) {
+            let node_mh = v.event.as_ref().and_then(|e| e.get("moduleHash"));
+            if node_mh.and_then(Value::as_str) != Some(mh.as_str()) {
+                d.rejected.push((
+                    Some(ra.edge.clone()),
+                    None,
+                    "an ours-only row whose id (its module hash) is not the node's".into(),
+                ));
+                continue;
             }
         }
         let outside_filter = w.filter.outside(ra, ha[i], v);
@@ -1875,6 +2131,17 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
     for g in &m.oracle {
         let j = g[0];
         let (rb, vj) = (&p.b[j], vb[j].as_ref());
+        // R-P5P9-70 (I-1): an identity that disagrees with itself settles nothing.
+        if let Some((k, why)) = g
+            .iter()
+            .find_map(|&k| id_conflict(&p.b[k].edge, p.b[k].id.kind).map(|w| (k, w)))
+        {
+            d.undecided.push(format!(
+                "an oracle-only row whose identity fields disagree ({why}): {}",
+                p.b[k].id.evidence()
+            ));
+            continue;
+        }
         match canon(&vb[j]) {
             Canon::No => d
                 .oracle
@@ -2060,6 +2327,7 @@ impl Ctx {
             let mut v = self.h7_verdict(ta, r, side == 1, st).await;
             if side == 0 && ours_only.contains(&i) {
                 self.h7_cmd_check(r, &mut v, st).await;
+                self.h7_ctime_check(r, &mut v, st).await;
             }
             if side == 0 {
                 va[i] = Some(v);
@@ -2291,12 +2559,35 @@ impl Ctx {
         coinbase_verdict(id, n, h, hd.as_ref(), payload.as_ref(), oracle)
     }
 
+    /// The node's canonical header at `(chain, h)` (on the cut's branch) and its payload, when
+    /// that header is block `block` (the one the node placed the row in); else why not. One
+    /// cached payload read per block, within the compare's cap.
+    async fn h7_branch_payload(
+        &self,
+        chain: u8,
+        h: u64,
+        block: Option<&str>,
+        st: &mut Reads,
+    ) -> Result<(Value, Value), String> {
+        let hd = match self.h7_canonical(chain, h, st).await? {
+            Some(hd) => hd,
+            None => return Err("no canonical header at the height".into()),
+        };
+        if hd.get("hash").and_then(Value::as_str) != block {
+            return Err("the poll's block is not the cut branch's".into());
+        }
+        let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
+            return Err("the header has no payload hash".into());
+        };
+        let payload = self.h7_payload(chain, ph, st).await?;
+        Ok((hd, payload))
+    }
+
     /// R-P5P9-68 (2): an ours-only tx row that the node places (`v`) and that selects only
-    /// checkable `cmd` fields, against the node's signed command: from the payload of the
-    /// block `/poll` placed it in, that block being the cut branch's at its height (one
-    /// cached payload read per block, within the compare's cap). Sets `v.cmd`; the canonical
-    /// verdict itself is left as it is. Rows with an unchecked field are refused in
-    /// [`decide`] without a read.
+    /// checked fields ([`unchecked_field`]), its `cmd` against the node's signed command: from
+    /// the payload of the block `/poll` placed it in, that block being the cut branch's at its
+    /// height. Sets `v.cmd`; the canonical verdict itself is left as it is. Rows with an
+    /// unchecked field are refused in [`decide`] without a read.
     async fn h7_cmd_check(&self, r: &Row, v: &mut Verdict, st: &mut Reads) {
         let n = node_of(r);
         let (Some(chain), Some(rk)) = (v.chain, r.id.rk.as_deref()) else {
@@ -2305,7 +2596,7 @@ impl Ctx {
         if r.id.kind != Some(Kind::Tx)
             || v.canon != Canon::Yes
             || n.get("cmd").is_none()
-            || unchecked_cmd_field(n).is_some()
+            || unchecked_field(r.id.kind, n).is_some()
         {
             return;
         }
@@ -2326,27 +2617,8 @@ impl Ctx {
             v.cmd = unsettled("no block height in the poll entry".into());
             return;
         };
-        let hd = match self.h7_canonical(chain, ph, st).await {
-            Ok(Some(hd)) => hd,
-            Ok(None) => {
-                v.cmd = unsettled("no canonical header at the height".into());
-                return;
-            }
-            Err(w) => {
-                v.cmd = unsettled(w);
-                return;
-            }
-        };
-        if hd.get("hash").and_then(Value::as_str) != pb {
-            v.cmd = unsettled("the poll's block is not the cut branch's".into());
-            return;
-        }
-        let Some(payload_hash) = hd.get("payloadHash").and_then(Value::as_str) else {
-            v.cmd = unsettled("the header has no payload hash".into());
-            return;
-        };
-        let payload = match self.h7_payload(chain, payload_hash, st).await {
-            Ok(x) => x,
+        let payload = match self.h7_branch_payload(chain, ph, pb, st).await {
+            Ok((_, x)) => x,
             Err(w) => {
                 v.cmd = unsettled(w);
                 return;
@@ -2358,6 +2630,56 @@ impl Ctx {
                 Some(f) => CmdCheck::Differs(f),
                 None => CmdCheck::Same,
             },
+        });
+    }
+
+    /// R-P5P9-70 (I-1): an ours-only transfer row that the node places (`v`, its block and
+    /// height) and that selects `creationTime`: ours serves its tx's `meta.creationTime` in
+    /// whole seconds (H9's rounding), and a coinbase's block time cut to whole seconds, both
+    /// as `.000Z`. Read from that block, the cut branch's at its height. Sets `v.ctime`.
+    async fn h7_ctime_check(&self, r: &Row, v: &mut Verdict, st: &mut Reads) {
+        let n = node_of(r);
+        let Some(x) = n.get("creationTime") else {
+            return;
+        };
+        if r.id.kind != Some(Kind::Transfer)
+            || v.canon != Canon::Yes
+            || unchecked_field(r.id.kind, n).is_some()
+        {
+            return;
+        }
+        let unsettled = |w: &str| Some(CmdCheck::Unsettled(w.to_string()));
+        let (Some(chain), Some(rk), Some(h)) = (v.chain, r.id.rk.as_deref(), v.height) else {
+            v.ctime = unsettled("no chain, key or height for the row");
+            return;
+        };
+        let (hd, payload) = match self
+            .h7_branch_payload(chain, h, v.block.as_deref(), st)
+            .await
+        {
+            Ok(x) => x,
+            Err(w) => {
+                v.ctime = unsettled(&w);
+                return;
+            }
+        };
+        let secs = if coinbase_key(&payload).as_deref() == Some(rk) {
+            hd.get("creationTime")
+                .and_then(Value::as_u64)
+                .map(|us| us / 1_000_000)
+        } else {
+            match node_cmd(&payload, rk) {
+                Some(cmd) => cmd.pointer("/meta/creationTime").and_then(node_secs),
+                None => {
+                    v.ctime = unsettled("the block's payload lacks the key");
+                    return;
+                }
+            }
+        };
+        v.ctime = Some(match secs.and_then(|s| s.checked_mul(1_000_000)) {
+            None => CmdCheck::Unsettled("the node's creationTime does not read".into()),
+            Some(us) if time_is(x, Some(us), false) => CmdCheck::Same,
+            Some(_) => CmdCheck::Differs("creationTime".into()),
         });
     }
 
@@ -2934,6 +3256,27 @@ impl Ctx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-P5P9-70 (I-1) with R-P5P9-62 H9: the node's `meta.creationTime` as ours renders it,
+    /// whole seconds with a fraction rounded half to even.
+    #[test]
+    fn node_secs_rounds_as_ours_does() {
+        for (v, want) in [
+            (json!(1_700_000_000u64), Some(1_700_000_000)),
+            (json!("1700000000"), Some(1_700_000_000)),
+            (json!({"int": 1_700_000_000u64}), Some(1_700_000_000)),
+            (json!(1_700_000_000.0), Some(1_700_000_000)),
+            (json!("1700000000.4"), Some(1_700_000_000)),
+            (json!("1700000000.5"), Some(1_700_000_000)),
+            (json!("1700000001.5"), Some(1_700_000_002)),
+            (json!("1700000000.50001"), Some(1_700_000_001)),
+            (json!(1_700_000_000.6), Some(1_700_000_001)),
+            (json!(-1), None),
+            (json!("x"), None),
+        ] {
+            assert_eq!(node_secs(&v), want, "{v}");
+        }
+    }
 
     fn b64(s: &str) -> String {
         crate::graphql::base64_std(s.as_bytes())

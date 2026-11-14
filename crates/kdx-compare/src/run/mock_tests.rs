@@ -1668,9 +1668,9 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
     // H5's cases, now H7 cases. QTransfersByAccount's rows: a block hash, no height (the
     // node gives it). Transfers-825fa035's rows: a height, no block hash.
     let by_block = |rk: &str, b: &str| {
-        json!({"cursor": "c", "node": {"id": format!("{b}/{rk}"), "amount": "1.5",
-            "senderAccount": "s", "receiverAccount": "r", "chainId": 0, "blockHash": b,
-            "requestKey": rk}})
+        // No relay id: R-P5P9-70 (I-1) cross-checks a selected `id` with the row's fields.
+        json!({"cursor": "c", "node": {"amount": "1.5", "senderAccount": "s",
+            "receiverAccount": "r", "chainId": 0, "blockHash": b, "requestKey": rk}})
     };
     let by_height = |rk: &str, h: u64, to: &str| {
         json!({"cursor": "c", "node": {"amount": 1.5, "senderAccount": "s",
@@ -4629,5 +4629,121 @@ async fn c4_ours_only_tx_rows_have_their_cmd_fields_checked_against_the_node() {
             note.contains(&format!("unchecked field: {name}")),
             "{name}: {note}"
         );
+    }
+}
+
+/// R-P5P9-70 (I-1): an ours-only row is excused only when every field it selects was checked
+/// against the node. A per-kind whitelist walk over the whole row refuses any other field
+/// ("unchecked field: <path>", an empty `cmd.payload` included); identity fields selected more
+/// than once must agree; a transfer's `creationTime` is the node's command's.
+#[tokio::test]
+async fn c5_ours_only_rows_have_every_selected_field_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("t1", 101), ("t2", 100)] {
+        let (k, v) = h7_xfer_poll(rk, &format!("B{h}"), h, "alice", "bob", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    h7_back_cmds(&mut node, "2023-11-14T22:13:20Z", &[]);
+    let au = ours_fn_server(|_: &Value| json!({"data": {"block": {"chainId": "0"}}})).await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let run = |op: crate::graphql::GqlOp, vars: Vec<(&'static str, Value)>, ours: Vec<Value>| {
+        let ctx = &ctx;
+        async move {
+            let root = if op.stem == "QTxs" {
+                "transactions"
+            } else {
+                "transfers"
+            };
+            let mut a = h7_page(root, false, ours.clone());
+            let mut b = h7_page(root, false, vec![ours[0].clone()]);
+            let (d, note) = ctx
+                .gql_settle_op(
+                    &ctx.targets["a"],
+                    Some(&op),
+                    &h7_vars(&vars),
+                    &mut a,
+                    &mut b,
+                    7_000_000,
+                    false,
+                )
+                .await;
+            (c3_unexplained(ctx, &d), note.unwrap_or_default())
+        }
+    };
+    // QTransfersByAccount: a transfer's creationTime against the node's command.
+    let xop = crate::graphql::parse_op(
+        "QTransfersByAccount",
+        "query QTransfersByAccount($accountName: String!, $first: Int, $after: String) { \
+         transfers(accountName: $accountName, first: $first, after: $after) { totalCount \
+         pageInfo { hasNextPage endCursor } edges { cursor node { amount block { chainId \
+         height } requestKey senderAccount receiverAccount creationTime } } } }",
+        false,
+    )
+    .unwrap();
+    let x = |rk: &str, h: u64, ct: &str| {
+        let mut e = h7_xrow(rk, h, json!("1.0"), Some(("alice", "bob")));
+        e["node"]["creationTime"] = json!(ct);
+        e
+    };
+    let xvars = || vec![("accountName", json!("alice")), ("first", json!(2))];
+    let ok = "2023-11-14T22:13:20.000Z";
+    let (un, note) = run(
+        xop.clone(),
+        xvars(),
+        vec![x("t1", 101, ok), x("t2", 100, ok)],
+    )
+    .await;
+    assert!(un.is_empty(), "a correct transfer: {un:?} {note}");
+    let late = "2023-11-14T22:13:21.000Z";
+    let (un, note) = run(
+        xop.clone(),
+        xvars(),
+        vec![x("t1", 101, ok), x("t2", 100, late)],
+    )
+    .await;
+    assert!(!un.is_empty(), "creationTime + 1 s: {note}");
+    assert!(note.contains("creationTime"), "{note}");
+    // A transaction row of QTransactionsByAccount's shape (no account filter here).
+    let top = crate::graphql::parse_op(
+        "QTxs",
+        "query QTxs($first: Int, $after: String) { transactions(first: $first, after: $after) \
+         { totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash sigs { \
+         sig } cmd { payload { ... on ExecutionPayload { code } } } result { ... on \
+         TransactionResult { height logs block { hash height chainId } } } } } } }",
+        false,
+    )
+    .unwrap();
+    let tx = |rk: &str, h: u64| {
+        let id = crate::graphql::base64_std(format!("Transaction:[\"B{h}\",\"{rk}\"]").as_bytes());
+        json!({"cursor": "c", "node": {"id": id, "hash": rk,
+            "result": {"height": h, "block": {"hash": format!("B{h}"), "height": h, "chainId": 0}}}})
+    };
+    let tvars = || vec![("first", json!(2))];
+    let (un, note) = run(top.clone(), tvars(), vec![tx("t1", 101), tx("t2", 100)]).await;
+    assert!(un.is_empty(), "a correct tx: {un:?} {note}");
+    let other_id = crate::graphql::base64_std(b"Transaction:[\"B99\",\"t2\"]");
+    for (ptr, value, name) in [
+        ("/node/hash", json!("t9"), "hash"),
+        ("/node/result/block/height", json!(99), "height"),
+        ("/node/id", json!(other_id), "block"),
+        ("/node/sigs", json!([{"sig": "s"}]), "unchecked field: sigs"),
+        (
+            "/node/result/logs",
+            json!("L"),
+            "unchecked field: result.logs",
+        ),
+        (
+            "/node/cmd",
+            json!({"payload": {}}),
+            "unchecked field: cmd.payload",
+        ),
+    ] {
+        let mut t2 = tx("t2", 100);
+        let (parent, key) = ptr.rsplit_once('/').unwrap();
+        t2.pointer_mut(parent).unwrap()[key] = value;
+        let (un, note) = run(top.clone(), tvars(), vec![tx("t1", 101), t2]).await;
+        assert!(!un.is_empty(), "{name}: {note}");
+        assert!(note.contains(name), "{name}: {note}");
     }
 }
