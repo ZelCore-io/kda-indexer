@@ -259,8 +259,10 @@ sudo -u kda-indexer kda-indexer --config /opt/coins/kda-indexer/mainnet01/config
   descriptor, and the copy is created with `O_CREAT | O_EXCL | O_NOFOLLOW`; without `--copy`
   the hard link is made without following a symlink and must be the file checked before it.
   The swap lock files are opened with `O_NOFOLLOW` too: a symlink at `segments.swap.lock` or
-  `search.swap.lock` is refused (the snapshot then runs without that lock and logs a
-  warning). Directories above a listed file (`segments/`, `search/`, a `rebuild.<S>/` of a
+  `search.swap.lock` is never followed and makes the command fail (without the lock a swap
+  already in progress could pair files from both sides); remove it as the data dir's owner
+  and run again. Any other failure to open a lock file (a read-only data dir where it cannot
+  be created) is logged as a warning and the snapshot runs without that lock. Directories above a listed file (`segments/`, `search/`, a `rebuild.<S>/` of a
   pending swap) are opened as their paths resolve. The manifest's `network` must be a plain
   name (`A-Z a-z 0-9 . _ -`, no leading `.`, no `..`, at most 64 characters), so a listed
   name never points outside `segments/`.

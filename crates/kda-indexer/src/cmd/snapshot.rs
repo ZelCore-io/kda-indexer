@@ -316,11 +316,10 @@ fn snapshot_into(
     let (mut merge_reads, mut name_waits) = (0usize, 0usize);
     // m14: no `rebuild-range` swap runs while segment files are placed, so a range's files
     // all come from one side of its swap (a data dir we cannot lock still gets `resolve`).
-    let swap_guard = kdx_segment::swap::swap_lock(&src_seg, false)
-        .inspect_err(|e| {
-            tracing::warn!("snapshot: placing segment files without the swap lock: {e:#}")
-        })
-        .ok();
+    let swap_guard = lock_or_warn(
+        kdx_segment::swap::swap_lock(&src_seg, false),
+        "placing segment files",
+    )?;
     hook(Point::SwapLocked, 0);
     let (manifest_bytes, manifest, info) = loop {
         rep.attempts += 1;
@@ -429,6 +428,33 @@ fn snapshot_into(
     Ok(rep)
 }
 
+/// A swap lock as taken (`r`), for the step `doing`. FV-1: a symlink planted at the lock
+/// path (`ELOOP` anywhere in the cause chain; the open never follows it) fails the snapshot,
+/// since without the lock a swap already in progress could pair files from both sides. Any
+/// other cause (a read-only data dir where the lock file cannot be created, say) is logged and
+/// the step runs on without the lock: no writer can run there either.
+fn lock_or_warn(r: anyhow::Result<fs::File>, doing: &str) -> anyhow::Result<Option<fs::File>> {
+    match r {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if is_eloop(&e) => Err(e).context(format!(
+            "snapshot: a symlink is planted at a swap lock path; {doing} without that lock is \
+             refused (remove the symlink as the data dir's owner)"
+        )),
+        Err(e) => {
+            tracing::warn!("snapshot: {doing} without the swap lock: {e:#}");
+            Ok(None)
+        }
+    }
+}
+
+/// Whether `e`'s cause chain holds `ELOOP` (40 on Linux, 62 on macOS): an `O_NOFOLLOW` open
+/// met a symlink. (`io::ErrorKind::FilesystemLoop` is not stable, so the raw errno is read.)
+fn is_eloop(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<io::Error>())
+        .any(|c| c.raw_os_error() == Some(Errno::LOOP.raw_os_error()))
+}
+
 /// `search/` into `out` (see the module doc): `(files, bytes, built_through_height)`, None
 /// when the source has no built index.
 fn snapshot_search(
@@ -438,13 +464,10 @@ fn snapshot_search(
 ) -> anyhow::Result<Option<(usize, u64, u32)>> {
     // No rebuild swap, stage commit or merge runs while the files are read and linked (a
     // source we cannot lock still gets the re-read checks of `live`).
-    let _swap = src.parent().and_then(|d| {
-        kdx_search::build::swap_lock(d)
-            .inspect_err(|e| {
-                tracing::warn!("snapshot: copying search/ without the swap lock: {e:#}")
-            })
-            .ok()
-    });
+    let _swap = match src.parent() {
+        Some(d) => lock_or_warn(kdx_search::build::swap_lock(d), "copying search/")?,
+        None => None,
+    };
     for _ in 0..MAX_ATTEMPTS {
         let sf = match kdx_search::snapshot::live(src)? {
             kdx_search::snapshot::Live::None => return Ok(None),
@@ -984,21 +1007,60 @@ mod tests {
         assert_eq!(fs::read(dst.join("ok2")).unwrap(), b"ok");
     }
 
-    /// Symlinks planted at the swap lock paths of the data dir are not followed: the targets
-    /// are never created (the snapshot runs on without those locks and says so).
+    /// FV-1: a symlink planted at either swap lock path of the data dir is not followed (the
+    /// target is never created) and fails the snapshot: without the lock a swap already in
+    /// progress could pair files from both sides. The run leaves nothing under `--out`.
     #[test]
     fn planted_lock_symlinks_are_not_followed() {
         let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let out = tmp.path().join("out");
-        let (hs, args) = store_with_one_range(&data, &out, false);
         let outside = tmp.path().join("outside");
         fs::create_dir(&outside).unwrap();
         for lock in ["segments.swap.lock", "search.swap.lock"] {
+            let data = tmp.path().join(format!("data-{lock}"));
+            let out = tmp.path().join(format!("out-{lock}"));
+            let (hs, args) = store_with_one_range(&data, &out, false);
             std::os::unix::fs::symlink(outside.join(lock), data.join(lock)).unwrap();
+            let e = snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {}).unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains("symlink"), "{lock}: {e}");
+            assert!(e.contains(lock), "{lock}: {e}");
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "{lock}");
+            assert!(!out.exists(), "{lock}");
+        }
+    }
+
+    /// FV-1: any other cause of a lock-open failure keeps warn-and-run, so a data dir where
+    /// the lock files cannot be created can still be snapshotted: a directory at each lock
+    /// path (`EISDIR`, also as root), and a read-only data dir (`EACCES`; root creates the
+    /// lock files anyway).
+    #[test]
+    fn an_unopenable_lock_that_is_no_symlink_warns_and_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let (hs, args) = store_with_one_range(&data, &tmp.path().join("out-dirs"), false);
+        let locks = ["segments.swap.lock", "search.swap.lock"];
+        for lock in locks {
+            fs::create_dir(data.join(lock)).unwrap();
         }
         snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {}).unwrap();
-        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
-        assert!(out.join("SNAPSHOT.json").is_file());
+        assert!(args.out.join("SNAPSHOT.json").is_file());
+        for lock in locks {
+            fs::remove_dir(data.join(lock)).unwrap();
+        }
+        let args = SnapshotArgs {
+            out: tmp.path().join("out-ro"),
+            ..args
+        };
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o555)).unwrap();
+        let r = snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {});
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+        r.unwrap();
+        assert!(args.out.join("SNAPSHOT.json").is_file());
+        if !rustix::process::geteuid().is_root() {
+            for lock in locks {
+                assert!(fs::symlink_metadata(data.join(lock)).is_err(), "{lock}");
+            }
+        }
     }
 }
