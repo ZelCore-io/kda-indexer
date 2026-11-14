@@ -2283,24 +2283,53 @@ impl Ctx {
         }
         let query = op.map(|o| o.query.as_str());
         let first_var = arg_var(query, "first");
+        let root = a.body.get("data").and_then(root_name);
         // R-P5P9-64 I-3, R-P5P9-67 I-A (a): a cut page of ours shorter than first × the pages
         // fetched (a follow page that failed, or a short page) is not a window, and a diff:
         // never the common prefix. The one exception is ours' Q10 cap, a page of exactly
-        // min(first, 100) × pages.
-        let first = vars.get(&first_var).and_then(Value::as_u64);
+        // min(first, 100) × pages. R-P5P9-70 (I-2): `first` is the root's own argument, a
+        // literal or a set variable (else, when the root's arguments do not read, the
+        // variable the document passes to `first`).
+        let first = match query
+            .zip(root.as_deref())
+            .and_then(|(q, r)| root_args(q, r))
+        {
+            Some(args) => args.iter().find(|(n, _)| n == "first").and_then(|(_, v)| {
+                match v.strip_prefix('$') {
+                    Some(var) => vars.get(var).and_then(Value::as_u64),
+                    None => v.parse::<u64>().ok(),
+                }
+            }),
+            None => vars.get(&first_var).and_then(Value::as_u64),
+        };
         let pages = a.ms.len() as u64;
-        let rows_a = ca
-            .get("edges")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len) as u64;
-        if let (true, Some(f)) = (more(&ca) && pages > 0, first) {
-            if rows_a < f * pages && rows_a != f.min(OURS_PAGE_CAP) * pages {
-                let note = format!(
-                    "H7 not explained: our cut page holds {rows_a} rows, fewer than first {f} × \
-                     {pages} pages; a short page is not a window"
-                );
-                let ev = json!({"rows": rows_a, "first": f, "pages": pages});
-                return (vec![entry(SHORT_PAGE_PATH, Some(ev), None)], Some(note));
+        let rows = |c: &Value| c.get("edges").and_then(Value::as_array).map_or(0, Vec::len) as u64;
+        let (rows_a, rows_b) = (rows(&ca), rows(&cb));
+        if more(&ca) {
+            match first {
+                Some(f)
+                    if pages > 0
+                        && rows_a < f * pages
+                        && rows_a != f.min(OURS_PAGE_CAP) * pages =>
+                {
+                    let note = format!(
+                        "H7 not explained: our cut page holds {rows_a} rows, fewer than first {f} \
+                         × {pages} pages; a short page is not a window"
+                    );
+                    let ev = json!({"rows": rows_a, "first": f, "pages": pages});
+                    return (vec![entry(SHORT_PAGE_PATH, Some(ev), None)], Some(note));
+                }
+                // R-P5P9-70 (I-2): no page size to hold ours' page against.
+                None if rows_a < rows_b => {
+                    let note = format!(
+                        "H7 not explained: page size unknown, and our cut page holds {rows_a} \
+                         rows, fewer than the oracle's {rows_b}; a short page is not a window"
+                    );
+                    let ev = json!({"rows": rows_a, "first": "page size unknown",
+                        "oracleRows": rows_b, "pages": pages});
+                    return (vec![entry(SHORT_PAGE_PATH, Some(ev), None)], Some(note));
+                }
+                _ => {}
             }
         }
         let prep = match prepare(&ca, &cb) {
@@ -2315,7 +2344,6 @@ impl Ctx {
                 return (Vec::new(), note);
             }
         };
-        let root = a.body.get("data").and_then(root_name);
         let asc = root.as_deref() == Some("blocksFromHeight");
         let filter = Filter::of(query, root.as_deref().or(Some("")), vars);
         let (node0, ours0) = (st.node, st.ours);

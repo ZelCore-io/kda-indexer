@@ -4747,3 +4747,63 @@ async fn c5_ours_only_rows_have_every_selected_field_checked() {
         assert!(note.contains(name), "{name}: {note}");
     }
 }
+
+/// R-P5P9-70 (I-2): the page size also comes from the root's literal `first`; when no page
+/// size is known (a null `$first`, no `first`) and ours' cut page holds fewer rows than the
+/// oracle's, it is a short page ("page size unknown"), never a window.
+#[tokio::test]
+async fn c5_a_literal_null_or_absent_first_keeps_the_short_page_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for i in 1..=5u64 {
+        let h = 1000 - i;
+        let (k, v) = h7_poll(&format!("t{i}"), &format!("B{h}"), h, json!([]));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let t = |i: u64| {
+        h7_tx(
+            &format!("t{i}"),
+            1000 - i,
+            &format!("B{}", 1000 - i),
+            "2024-01-01T10:00:00Z",
+        )
+    };
+    let body = "{ totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash \
+                cmd { meta { chainId creationTime } } result { height block { hash chainId } } \
+                } } }";
+    for (args, vars, what) in [
+        ("first: 5, after: $after", vec![], "a literal first"),
+        (
+            "first: $first, after: $after",
+            vec![("first", Value::Null)],
+            "a null $first",
+        ),
+        ("after: $after", vec![], "no first"),
+    ] {
+        let q = format!("query QL($first: Int, $after: String) {{ transactions({args}) {body} }}");
+        let op = crate::graphql::parse_op("QL", &q, false).unwrap();
+        let mut a = crate::graphql::Answer {
+            ms: vec![1],
+            ..h7_page("transactions", true, (1..=3).map(t).collect())
+        };
+        let mut b = h7_page("transactions", true, (1..=5).map(t).collect());
+        let (d, note) = ctx
+            .gql_settle_op(
+                &ctx.targets["a"],
+                Some(&op),
+                &h7_vars(&vars),
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await;
+        let un = c3_unexplained(&ctx, &d);
+        assert!(
+            un.iter()
+                .any(|p| p == crate::graphql_window::SHORT_PAGE_PATH),
+            "{what}: {un:?} {note:?}"
+        );
+    }
+}
