@@ -118,16 +118,37 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
     };
     for path in &opts.logs {
         let f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-        for (n, line) in std::io::BufReader::new(f).lines().enumerate() {
-            let line = line.with_context(|| format!("reading {}", path.display()))?;
+        let mut reader = std::io::BufReader::new(f);
+        let mut buf = Vec::new();
+        let mut n = 0;
+        loop {
+            // R-P5P9-67 m-4: lines are read as bytes; one that is not UTF-8 is listed.
+            buf.clear();
+            let got = reader
+                .read_until(b'\n', &mut buf)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if got == 0 {
+                break;
+            }
+            n += 1;
+            let at = format!("{}:{n}", path.display());
+            let line = match std::str::from_utf8(&buf) {
+                Ok(l) => l,
+                Err(e) => {
+                    rep.records += 1;
+                    let why = format!("the line is not UTF-8 ({e}), so not a diff record");
+                    let class = "not refereed: not a diff record";
+                    not_refereed(&mut rep, json!({ "at": at }), class, why);
+                    continue;
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
             rep.records += 1;
-            let at = format!("{}:{}", path.display(), n + 1);
             // R-P5P9-64 I-4: a line that does not parse (a cut append, a disk that filled)
             // may be a diff record: listed, never dropped.
-            let rec = match serde_json::from_str::<DiffRecord>(&line) {
+            let rec = match serde_json::from_str::<DiffRecord>(line) {
                 Ok(rec) => rec,
                 Err(e) => {
                     let why = format!("the line is not a diff record: {e}");
@@ -153,6 +174,28 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
             if let Err(why) = oracle {
                 let class = "not refereed: B is not an oracle in this config";
                 not_refereed(&mut rep, head, class, why);
+                continue;
+            }
+            // R-P5P9-67 I-A (b), m-3: a follow-page fault of ours or the merged-bytes cap is a
+            // fact of the fetch, with no pages to re-run: it stays unexplained.
+            let stop = rec.diff.iter().find(|e| {
+                e.path == crate::graphql::FOLLOW_PAGE_FAULT_PATH
+                    || e.path == crate::graphql::MERGED_BYTES_PATH
+            });
+            if let Some(e) = stop {
+                let kind = if e.path == crate::graphql::FOLLOW_PAGE_FAULT_PATH {
+                    "follow-page-fault"
+                } else {
+                    "harness-limit"
+                };
+                rep.unexplained += 1;
+                count(&mut rep, format!("unexplained: {kind}"));
+                let mut v = head;
+                v["class"] = json!(kind);
+                v["note"] = json!(rec.note);
+                v["unexplainedCount"] = json!(rec.diff.len());
+                v["unexplained"] = json!(rec.diff.iter().take(MAX_SHOWN).collect::<Vec<_>>());
+                rep.still_unexplained.push(v);
                 continue;
             }
             // R-P5P9-64 M-8: once the cap is spent, every record left is unread.

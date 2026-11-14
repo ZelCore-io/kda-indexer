@@ -484,6 +484,21 @@ pub struct Outcome {
 
 impl Ctx {
     pub async fn new(cfg: CompareConfig) -> anyhow::Result<Ctx> {
+        // R-P5P9-66 concern 4, R-P5P9-67 m-2: H7's header-by-hash reads (1 r/s, their own
+        // client) and the node client (`node_max_rps` − 1) stay within `node_max_rps` only
+        // from 2 up; with an oracle target (header reads on) a lower one is refused, here so
+        // that `referee --rps 1` is refused too. 0 (no limit) has no bound to keep.
+        let oracle = cfg
+            .targets
+            .values()
+            .any(|t| t.kind == crate::config::TargetKind::GraphqlOracle);
+        if oracle && cfg.node_max_rps < 2 {
+            anyhow::bail!(
+                "node_max_rps {} is below 2: with a GraphQL oracle target, H7's header reads \
+                 (1 r/s) and the node client must share at least 2 reads a second",
+                cfg.node_max_rps
+            );
+        }
         let node = cfg.node_client()?;
         let targets = Target::all(&cfg)?
             .into_iter()

@@ -28,9 +28,12 @@
 //!
 //! Every one-sided row gets a single-row node read: `/poll` for its request key (the row's
 //! block or height, and its content against the node's entry). A row `/poll` does not know
-//! (a coinbase row) is settled by the node's only header at its height (its own, or its
+//! (a coinbase row) is settled by the node's canonical header at its height (its own, or its
 //! block's by the node's header-by-hash route, R-P5P9-63 (5)) and that block's coinbase; a
-//! block row by the node's headers at its height. At most 300 node reads per compare
+//! block row by the node's canonical header at its height, every selected field compared
+//! (R-P5P9-67 I-B). The canonical header is the one on the branch of the node's cut, read
+//! once per compare (R-P5P9-67 m-5), never the `/header` range by height, which also holds
+//! orphans; above the cut there is none, and the row is unsettled. At most 300 node reads per compare
 //! (R-P5P9-63 (4)), shared with H8 and the `payload.data` matcher.
 //! A failed read, a spent read cap or a row whose identity cannot be decided leave the pair
 //! as it was (unexplained), with the reason in the record's note. A row H7 cannot explain
@@ -64,6 +67,14 @@ pub const PREFIX_EXTRA: usize = 50;
 pub const ORDER_INDEX_PATH: &str = "/~graphql-h8-transfer-order-index";
 /// Visible hit of the `payload.data` matcher (allowlist id `graphql-r62-payload-data`).
 pub const PAYLOAD_DATA_PATH: &str = "/~graphql-r62-payload-data";
+/// R-P5P9-67 I-A (a): a cut page of ours shorter than `first` × the pages fetched. No
+/// allowlist entry matches it.
+pub const SHORT_PAGE_PATH: &str = "/~graphql-h7-short-page";
+/// R-P5P9-67 m-6 (with R-P5P9-64 I-1): rows H7 identified but could not settle. No allowlist
+/// entry matches it, so the pre-H7 page and tie cuts never excuse what H7 left undecided.
+pub const UNDECIDED_PATH: &str = "/~graphql-h7-undecided";
+/// Ours' page size cap (Q10): a page of `first` above it holds this many rows.
+pub const OURS_PAGE_CAP: u64 = 100;
 const ROUTE: &str = "graphql-window-referee";
 
 fn text(v: &Value) -> Option<String> {
@@ -610,29 +621,29 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
 }
 
 /// A row `/poll` does not know (a coinbase row: its request key is the coinbase's) at height
-/// `h` (its own, or the node's height of its block): the node's headers at `h` and the
-/// payload (with outputs) of the only one. Not canonical only by block (R-P5P9-63 (2)).
+/// `h` (its own, or the node's height of its block): the node's canonical header at `h` (on
+/// the cut's branch, R-P5P9-67 m-5) and its payload (with outputs). Not canonical only by
+/// block (R-P5P9-63 (2)).
 pub fn coinbase_verdict(
     r: &RowId,
     n: &Value,
     h: u64,
-    headers: &[Value],
+    canonical: Option<&Value>,
     payload: Option<&Value>,
     oracle: bool,
 ) -> Verdict {
-    if headers.len() != 1 {
-        return Verdict::unknown(format!("coinbase: {} headers at the height", headers.len()));
-    }
-    let hash = headers[0]
-        .get("hash")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let Some(hd) = canonical else {
+        return Verdict::unknown(
+            "coinbase: no canonical block at the height on the cut's branch (above the cut)",
+        );
+    };
+    let hash = hd.get("hash").and_then(Value::as_str).map(str::to_string);
     let v =
         |canon, why: &str| Verdict::new(canon, Some(h), hash.clone(), format!("coinbase: {why}"));
     if r.block.as_ref().is_some_and(|b| Some(b) != hash.as_ref()) {
         return v(
             Canon::No,
-            "the row's block is not the node's block at its height",
+            "the row's block is not the node's canonical block at its height",
         );
     }
     let Some(cb) = payload
@@ -652,19 +663,136 @@ pub fn coinbase_verdict(
     content_verdict(r, n, &cb, oracle, v)
 }
 
-/// A block row: the node's headers at its height (orphans included).
-pub fn block_verdict(r: &RowId, headers: &[Value]) -> Verdict {
-    let has = headers
-        .iter()
-        .any(|h| h.get("hash").and_then(Value::as_str) == r.block.as_deref());
+/// A block row `n` against the node's canonical header at its height, on the cut's branch
+/// (R-P5P9-67 m-5): `None` when there is none (above the cut). Canonical only as that block
+/// with every selected field the node's, in ours' encodings (R-P5P9-67 I-B). A field that
+/// differs makes ours' row not canonical and leaves the oracle's unsettled; a field the
+/// harness cannot compare leaves either unsettled.
+pub fn block_verdict(r: &RowId, n: &Value, canonical: Option<&Value>, oracle: bool) -> Verdict {
     let v =
         |canon, why: &str| Verdict::new(canon, r.height, r.block.clone(), format!("header: {why}"));
-    match (has, headers.len()) {
-        (true, 1) => v(Canon::Yes, "the node's only block at the height"),
-        (true, _) => Verdict::unknown("header: a fork at the height"),
-        (false, 0) => Verdict::unknown("header: none at the height"),
-        (false, _) => v(Canon::No, "not among the node's blocks at the height"),
+    let Some(hd) = canonical else {
+        return Verdict::unknown(
+            "header: no canonical block at the height on the cut's branch (above the cut)",
+        );
+    };
+    if hd.get("hash").and_then(Value::as_str) != r.block.as_deref() {
+        return v(
+            Canon::No,
+            "not the canonical block at the height (on the cut's branch)",
+        );
     }
+    match block_fields(n, hd, oracle) {
+        Ok(()) => v(
+            Canon::Yes,
+            "the canonical block at the height, with its fields",
+        ),
+        Err(Field::Differs(f)) if !oracle => {
+            v(Canon::No, &format!("the row's {f} is not the node's"))
+        }
+        Err(Field::Differs(f)) => {
+            Verdict::unknown(format!("header: the oracle's {f} is not the node's"))
+        }
+        Err(Field::Unchecked(f)) => Verdict::unknown(format!(
+            "header: the row selects {f}, which the harness cannot compare"
+        )),
+    }
+}
+
+/// Why a block row's field is not settled against the header.
+enum Field {
+    Differs(String),
+    Unchecked(String),
+}
+
+/// Whether time text `x` is the header's `micros`: ours' form is milliseconds, truncated
+/// (`…SS.mmmZ`); the oracle's may also be whole microseconds.
+fn time_is(x: &Value, micros: Option<u64>, oracle: bool) -> bool {
+    let (Some(t), Some(us)) = (x.as_str(), micros) else {
+        return false;
+    };
+    let Some((secs, nanos, rest)) = parse_utc(t) else {
+        return false;
+    };
+    let frac = t.rsplit_once('.').map_or(0, |(_, f)| f.len() - 1);
+    let (s, sub) = ((us / 1_000_000) as i64, (us % 1_000_000) as u32);
+    let ms = sub / 1_000 * 1_000_000;
+    secs == s
+        && !rest
+        && ((frac == 3 && nanos == ms) || (oracle && (nanos == ms || nanos == sub * 1_000)))
+}
+
+/// The proof-of-work hash of the node's header (`powHash` as chainweb-data and ours render
+/// it), when the header decodes.
+fn node_pow_hash(hd: &Value) -> Option<String> {
+    let h = kdx_decode::payload::decode_header(hd).ok()?;
+    let mut adjacents: Vec<(u8, kdx_types::Hash32)> = Vec::new();
+    for c in &h.adjacents_order {
+        adjacents.push((*c, *h.adjacents.get(c)?));
+    }
+    let b = kdx_types::record::BlockRecord {
+        hash: h.hash,
+        parent: h.parent,
+        adjacents,
+        chain: h.chain_id,
+        height: h.height,
+        weight: h.weight,
+        target: h.target,
+        nonce: h.nonce,
+        creation_time: h.creation_time,
+        epoch_start: h.epoch_start,
+        feature_flags: h.feature_flags,
+        payload_hash: h.payload_hash,
+        chainweb_version: h.chainweb_version,
+        ..Default::default()
+    };
+    let p = kdx_decode::header::pow_hash(&b)?;
+    Some(kdx_decode::header::pow_hash_hex(&p))
+}
+
+/// Every field block row `n` selects against the node's header `hd` (object encoding).
+fn block_fields(n: &Value, hd: &Value, oracle: bool) -> Result<(), Field> {
+    let Some(o) = n.as_object() else {
+        return Ok(());
+    };
+    let node = |k: &str| hd.get(k).and_then(text);
+    for (k, x) in o {
+        let same = match k.as_str() {
+            "__typename" => x.as_str() == Some("Block"),
+            "id" => x
+                .as_str()
+                .and_then(decode_id)
+                .is_some_and(|(t, key)| t == "Block" && Some(key) == node("hash")),
+            "hash" | "height" | "chainId" | "nonce" | "payloadHash" | "target" | "weight" => {
+                text(x).is_some() && text(x) == node(k)
+            }
+            "creationTime" => time_is(x, hd.get("creationTime").and_then(Value::as_u64), oracle),
+            "epoch" => time_is(x, hd.get("epochStart").and_then(Value::as_u64), oracle),
+            "difficulty" => {
+                let d = node("target")
+                    .and_then(|t| kdx_types::hash::b64url_decode(&t).ok())
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .map(|t| kdx_decode::header::difficulty(&t).min(i128::MAX as u128));
+                text(x).is_some() && text(x) == d.map(|d| d.to_string())
+            }
+            "parent" => {
+                if let Some(f) = x.as_object().and_then(|p| p.keys().find(|f| *f != "hash")) {
+                    return Err(Field::Unchecked(format!("parent.{f}")));
+                }
+                let p = x.get("hash").and_then(text);
+                p.is_some() && p == node("parent")
+            }
+            "powHash" => match node_pow_hash(hd) {
+                Some(p) => x.as_str() == Some(p.as_str()),
+                None => return Err(Field::Unchecked(k.clone())),
+            },
+            _ => return Err(Field::Unchecked(k.clone())),
+        };
+        if !same {
+            return Err(Field::Differs(k.clone()));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -714,6 +842,192 @@ pub struct Filter {
     pub max_height: Option<u64>,
     pub block: Option<String>,
     pub rk: Option<String>,
+    /// R-P5P9-67 I-C: the root's other arguments with a non-null value or a literal (`first`,
+    /// `after`, `last` and `before` aside). The harness does not check them, so they refuse
+    /// the ours-only excuse.
+    pub unchecked: Vec<String>,
+}
+
+/// The root arguments [`Filter`] reads (from variables only).
+const READ_ARGS: [&str; 12] = [
+    "accountName",
+    "fungibleName",
+    "chainId",
+    "chainIds",
+    "qualifiedEventName",
+    "parametersFilter",
+    "minHeight",
+    "maxHeight",
+    "startHeight",
+    "endHeight",
+    "blockHash",
+    "requestKey",
+];
+/// The paging arguments, which are no filter.
+const PAGE_ARGS: [&str; 4] = ["first", "after", "last", "before"];
+
+/// The arguments of root field `key` (its alias or its name) in document `query`, as (name,
+/// value text); `None` when the field or its arguments cannot be read.
+pub fn root_args(query: &str, key: &str) -> Option<Vec<(String, String)>> {
+    let b = query.as_bytes();
+    let ident = |mut i: usize| {
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        i
+    };
+    let space = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let (mut depth, mut paren, mut i) = (0i32, 0i32, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'#' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            c if (c.is_ascii_alphabetic() || c == b'_') && depth == 1 && paren == 0 => {
+                let j = ident(i);
+                if &query[i..j] != key {
+                    i = j;
+                    continue;
+                }
+                let mut k = space(j);
+                if b.get(k) == Some(&b':') {
+                    k = space(ident(space(k + 1)));
+                }
+                if b.get(k) != Some(&b'(') {
+                    return Some(Vec::new());
+                }
+                return parse_args(query, k + 1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The `name: value` pairs of an argument list from byte `i` (past its `(`) to its `)`.
+fn parse_args(q: &str, mut i: usize) -> Option<Vec<(String, String)>> {
+    let b = q.as_bytes();
+    let mut out = Vec::new();
+    loop {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
+            i += 1;
+        }
+        if *b.get(i)? == b')' {
+            return Some(out);
+        }
+        let s = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        let name = q[s..i].to_string();
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if name.is_empty() || b.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let (vs, mut d) = (i, 0i32);
+        while i < b.len() {
+            match b[i] {
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'[' | b'{' => d += 1,
+                b']' | b'}' => d -= 1,
+                b',' | b')' if d == 0 => break,
+                c if c.is_ascii_whitespace() && d == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        if vs == i || i > b.len() {
+            return None;
+        }
+        out.push((name, q[vs..i].to_string()));
+    }
+}
+
+/// Whether the document's variable `var` has a default other than `null`.
+fn var_default(query: &str, var: &str) -> bool {
+    let head = query.split('{').next().unwrap_or_default();
+    let pat = format!("${var}");
+    let mut rest = head;
+    while let Some(i) = rest.find(&pat) {
+        let after = &rest[i + pat.len()..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            rest = after;
+            continue;
+        }
+        let def = after.split(['$', ')']).next().unwrap_or_default();
+        return def
+            .split_once('=')
+            .is_some_and(|(_, d)| d.trim().trim_end_matches(',').trim() != "null");
+    }
+    false
+}
+
+/// R-P5P9-67 I-C: the arguments of the root `root` the harness does not check: any other than
+/// the paging ones with a literal value, or with a variable that is set (or has a default),
+/// unless [`Filter`] reads it from that variable. Without a document: none (the tests'
+/// entry point).
+fn unchecked_args(
+    query: Option<&str>,
+    root: Option<&str>,
+    vars: &Map<String, Value>,
+) -> Vec<String> {
+    let Some(q) = query else {
+        return Vec::new();
+    };
+    let Some(args) = root.and_then(|r| root_args(q, r)) else {
+        return vec!["the root field's arguments, which the harness cannot read".into()];
+    };
+    let mut out = Vec::new();
+    for (name, value) in args {
+        if PAGE_ARGS.contains(&name.as_str()) || value == "null" {
+            continue;
+        }
+        let Some(var) = value.strip_prefix('$') else {
+            out.push(name);
+            continue;
+        };
+        let set = vars
+            .get(var)
+            .map_or_else(|| var_default(q, var), |v| !v.is_null());
+        let read = READ_ARGS.contains(&name.as_str()) && arg_var(query, &name) == var;
+        if set && !read {
+            out.push(name);
+        }
+    }
+    out
 }
 
 fn params_filter(t: &str) -> Result<Vec<Value>, String> {
@@ -729,6 +1043,12 @@ fn params_filter(t: &str) -> Result<Vec<Value>, String> {
 
 impl Filter {
     pub fn from_vars(query: Option<&str>, vars: &Map<String, Value>) -> Filter {
+        Filter::of(query, None, vars)
+    }
+
+    /// The filter of root `root` (its key in `data`), with the root's arguments the harness
+    /// does not check ([`Filter::unchecked`]).
+    pub fn of(query: Option<&str>, root: Option<&str>, vars: &Map<String, Value>) -> Filter {
         let get = |arg: &str| vars.get(&arg_var(query, arg)).filter(|v| !v.is_null());
         let s = |arg: &str| get(arg).and_then(text);
         let h = |arg: &str| s(arg).and_then(|t| t.parse::<u64>().ok());
@@ -752,6 +1072,7 @@ impl Filter {
             max_height: h("maxHeight").or_else(|| h("endHeight")),
             block: s("blockHash"),
             rk: s("requestKey"),
+            unchecked: root.map_or_else(Vec::new, |_| unchecked_args(query, root, vars)),
         }
     }
 
@@ -767,6 +1088,38 @@ impl Filter {
                 .and_then(text)
         };
         let fail = |what: &str| Some(format!("outside the query's {what}"));
+        // R-P5P9-67 I-C: every argument with a value must be one the harness checks for the
+        // row's kind.
+        let kind = r.id.kind;
+        let not_read = [
+            (
+                "accountName",
+                self.account.is_some() && !matches!(kind, Some(Kind::Transfer | Kind::Tx)),
+            ),
+            (
+                "fungibleName",
+                self.fungible.is_some()
+                    && !(kind == Some(Kind::Transfer)
+                        || (kind == Some(Kind::Tx) && self.account.is_some())),
+            ),
+            (
+                "qualifiedEventName",
+                self.event.is_some() && kind != Some(Kind::Event),
+            ),
+            (
+                "parametersFilter",
+                self.params.is_some() && kind != Some(Kind::Event),
+            ),
+        ];
+        if let Some(name) = self
+            .unchecked
+            .iter()
+            .map(String::as_str)
+            .chain(not_read.iter().filter(|x| x.1).map(|x| x.0))
+            .next()
+        {
+            return Some(format!("under a filter the harness does not check: {name}"));
+        }
         if let Some(cs) = &self.chains {
             if !r.id.chain.or(v.chain).is_some_and(|c| cs.contains(&c)) {
                 return fail("chain");
@@ -1028,9 +1381,16 @@ pub struct Window<'a> {
     /// The list ascends by height (`blocksFromHeight`); else it descends (R-P5P9-63 (6)).
     pub asc: bool,
     pub filter: &'a Filter,
-    /// Our longer read (R-P5P9-64, I-1): each row's identity key and node; `None` while it
-    /// is not read.
-    pub prefix: Option<&'a Result<Vec<(String, Value)>, String>>,
+    /// Our longer read (R-P5P9-64, I-1); `None` while it is not read.
+    pub prefix: Option<&'a Result<Longer, String>>,
+}
+
+/// Our longer read (R-P5P9-64, I-1): each row's identity key and node, and whether ours
+/// capped it (fewer rows than asked, with a next page; R-P5P9-67 m-6).
+#[derive(Debug, Clone, Default)]
+pub struct Longer {
+    pub rows: Vec<(String, Value)>,
+    pub capped: bool,
 }
 
 /// H7's verdict on a pair.
@@ -1087,19 +1447,15 @@ enum Place {
 /// R-P5P9-64 (I-1): an oracle-only row at our boundary height lies outside our window only
 /// when our page (`n` rows, keys `ours`) is a prefix of our longer read and the row appears
 /// in that read after our cut.
-fn after_our_cut(
-    prefix: Option<&Result<Vec<(String, Value)>, String>>,
-    ours: &[Row],
-    rb: &Row,
-) -> Place {
-    let rows = match prefix {
+fn after_our_cut(prefix: Option<&Result<Longer, String>>, ours: &[Row], rb: &Row) -> Place {
+    let (rows, capped) = match prefix {
         None => {
             return Place::Wait(
                 "an oracle-only row at our boundary height waits for our longer read".into(),
             )
         }
         Some(Err(w)) => return Place::Wait(format!("our longer read: {w}")),
-        Some(Ok(rows)) => rows,
+        Some(Ok(l)) => (&l.rows, l.capped),
     };
     if rows.len() < ours.len() {
         return Place::Wait(format!(
@@ -1119,6 +1475,13 @@ fn after_our_cut(
         .any(|(k, n)| *k == rb.key && (rb.id.indexed() || n == node_of(rb)));
     if later {
         Place::Outside("after-our-cut")
+    } else if capped {
+        // R-P5P9-67 m-6: ours cut the read short of `first` with a next page; the row may
+        // lie past it.
+        Place::Wait(format!(
+            "undecided: our longer read was capped ({} rows, with a next page)",
+            rows.len()
+        ))
     } else {
         Place::Inside(
             "an oracle-only canonical row at our boundary height that our longer read does not \
@@ -1369,6 +1732,10 @@ pub(crate) struct Reads {
     pub(crate) ours: usize,
     polls: HashMap<(u8, String), Result<Option<Value>, String>>,
     headers: HashMap<(u8, u64), Result<Vec<Value>, String>>,
+    /// R-P5P9-67 m-5: the node's cut (one read per compare) and the canonical header per
+    /// (chain, height) on its branch.
+    cut: Option<Result<HashMap<u8, String>, String>>,
+    canonical: HashMap<(u8, u64), Result<Option<Value>, String>>,
     payloads: HashMap<String, Result<Value, String>>,
     by_hash: HashMap<String, Result<Option<u64>, String>>,
     chains: HashMap<String, Option<u8>>,
@@ -1432,6 +1799,28 @@ impl Ctx {
         if norm(&ca) == norm(&cb) {
             return (Vec::new(), None);
         }
+        let query = op.map(|o| o.query.as_str());
+        let first_var = arg_var(query, "first");
+        // R-P5P9-64 I-3, R-P5P9-67 I-A (a): a cut page of ours shorter than first × the pages
+        // fetched (a follow page that failed, or a short page) is not a window, and a diff:
+        // never the common prefix. The one exception is ours' Q10 cap, a page of exactly
+        // min(first, 100) × pages.
+        let first = vars.get(&first_var).and_then(Value::as_u64);
+        let pages = a.ms.len() as u64;
+        let rows_a = ca
+            .get("edges")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len) as u64;
+        if let (true, Some(f)) = (more(&ca) && pages > 0, first) {
+            if rows_a < f * pages && rows_a != f.min(OURS_PAGE_CAP) * pages {
+                let note = format!(
+                    "H7 not explained: our cut page holds {rows_a} rows, fewer than first {f} × \
+                     {pages} pages; a short page is not a window"
+                );
+                let ev = json!({"rows": rows_a, "first": f, "pages": pages});
+                return (vec![entry(SHORT_PAGE_PATH, Some(ev), None)], Some(note));
+            }
+        }
         let prep = match prepare(&ca, &cb) {
             Ok(p) => p,
             Err(why) => {
@@ -1444,28 +1833,9 @@ impl Ctx {
                 return (Vec::new(), note);
             }
         };
-        let query = op.map(|o| o.query.as_str());
-        let first_var = arg_var(query, "first");
-        // R-P5P9-64 I-3: a cut page of ours shorter than first × the pages fetched is not a
-        // window (a follow page that failed, or a short page).
-        let first = vars.get(&first_var).and_then(Value::as_u64);
-        let pages = a.ms.len() as u64;
-        if let (true, Some(f)) = (prep.a_cut && pages > 0, first) {
-            if (prep.a.len() as u64) < f * pages {
-                let note = format!(
-                    "H7 not explained: our cut page holds {} rows, fewer than first {f} × {pages} \
-                     pages; a short page is not a window",
-                    prep.a.len()
-                );
-                return (Vec::new(), Some(note));
-            }
-        }
-        let asc = a
-            .body
-            .get("data")
-            .and_then(root_name)
-            .is_some_and(|r| r == "blocksFromHeight");
-        let filter = Filter::from_vars(query, vars);
+        let root = a.body.get("data").and_then(root_name);
+        let asc = root.as_deref() == Some("blocksFromHeight");
+        let filter = Filter::of(query, root.as_deref().or(Some("")), vars);
         let (node0, ours0) = (st.node, st.ours);
         let mut va: Vec<Option<Verdict>> = vec![None; prep.a.len()];
         let mut vb: Vec<Option<Verdict>> = vec![None; prep.b.len()];
@@ -1506,6 +1876,10 @@ impl Ctx {
             "oursReads": or, "oneSided": d.oracle});
         if !d.undecided.is_empty() || !d.grouped {
             let mut out = Vec::new();
+            if !d.undecided.is_empty() {
+                let ev = json!({"undecided": d.undecided, "reads": reads});
+                out.push(entry(UNDECIDED_PATH, Some(ev), None));
+            }
             let mut whys = d.undecided.clone();
             for (ra, rb, why) in &d.rejected {
                 out.push(entry(
@@ -1582,7 +1956,7 @@ impl Ctx {
         first_var: &str,
         n: usize,
         st: &mut Reads,
-    ) -> Result<Vec<(String, Value)>, String> {
+    ) -> Result<Longer, String> {
         if !vars.get(first_var).is_some_and(Value::is_u64) {
             return Err(format!("no page size ({first_var}) to read it with"));
         }
@@ -1594,11 +1968,15 @@ impl Ctx {
             .gql_read(ta, &op.query, Value::Object(v))
             .await
             .ok_or("the read failed")?;
-        let edges = crate::graphql::root_connection(&mut data)
-            .and_then(|c| c.get("edges"))
+        let conn = crate::graphql::root_connection(&mut data).ok_or("the read holds no list")?;
+        let more = conn
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool);
+        let edges = conn
+            .get("edges")
             .and_then(Value::as_array)
             .ok_or("the read holds no list")?;
-        Ok(edges
+        let rows: Vec<(String, Value)> = edges
             .iter()
             .map(|e| {
                 (
@@ -1606,7 +1984,10 @@ impl Ctx {
                     e.get("node").cloned().unwrap_or(Value::Null),
                 )
             })
-            .collect())
+            .collect();
+        // R-P5P9-67 m-6: fewer rows than asked, and a next page (or no word on one): capped.
+        let capped = rows.len() < n + PREFIX_EXTRA && more != Some(false);
+        Ok(Longer { rows, capped })
     }
 
     /// One row's node verdict (single-row reads, cached per compare). `oracle`: the row is
@@ -1631,8 +2012,8 @@ impl Ctx {
             let Some(h) = id.height else {
                 return Verdict::unknown("a block row without a height");
             };
-            return match self.h7_headers(chain, h, st).await {
-                Ok(hs) => block_verdict(id, &hs),
+            return match self.h7_canonical(chain, h, st).await {
+                Ok(hd) => block_verdict(id, n, hd.as_ref(), oracle),
                 Err(w) => Verdict::unknown(w),
             };
         }
@@ -1673,20 +2054,22 @@ impl Ctx {
                 )
             }
         };
-        let hs = match self.h7_headers(chain, h, st).await {
-            Ok(hs) => hs,
+        let hd = match self.h7_canonical(chain, h, st).await {
+            Ok(hd) => hd,
             Err(w) => return Verdict::unknown(w),
         };
         let mut payload = None;
-        if let [hd] = hs.as_slice() {
-            if let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) {
-                match self.h7_payload(chain, ph, st).await {
-                    Ok(p) => payload = Some(p),
-                    Err(w) => return Verdict::unknown(w),
-                }
+        if let Some(ph) = hd
+            .as_ref()
+            .and_then(|x| x.get("payloadHash"))
+            .and_then(Value::as_str)
+        {
+            match self.h7_payload(chain, ph, st).await {
+                Ok(p) => payload = Some(p),
+                Err(w) => return Verdict::unknown(w),
             }
         }
-        coinbase_verdict(id, n, h, &hs, payload.as_ref(), oracle)
+        coinbase_verdict(id, n, h, hd.as_ref(), payload.as_ref(), oracle)
     }
 
     /// Takes one node read from the compare's cap and the run's budget.
@@ -1720,6 +2103,61 @@ impl Ctx {
         r
     }
 
+    /// R-P5P9-67 m-5: the node's canonical header at `(chain, h)`, on the branch of the
+    /// node's cut (read once per compare); `None` when the branch holds none there (above
+    /// the cut). Never the `/header` range by height, which also holds orphans.
+    async fn h7_canonical(
+        &self,
+        chain: u8,
+        h: u64,
+        st: &mut Reads,
+    ) -> Result<Option<Value>, String> {
+        if let Some(v) = st.canonical.get(&(chain, h)) {
+            return v.clone();
+        }
+        if st.cut.is_none() {
+            let cut = match self.h7_take(st) {
+                Ok(()) => self
+                    .node
+                    .cut()
+                    .await
+                    .map(|c| c.hashes.into_iter().map(|(c, e)| (c, e.hash)).collect())
+                    .map_err(|e| format!("cut read failed: {e}")),
+                Err(w) => Err(w),
+            };
+            st.cut = Some(cut);
+        }
+        let upper = match st.cut.as_ref() {
+            Some(Ok(m)) => m
+                .get(&chain)
+                .cloned()
+                .ok_or_else(|| format!("the node's cut has no chain {chain}"))?,
+            Some(Err(w)) => return Err(w.clone()),
+            None => return Err("no cut".into()),
+        };
+        self.h7_take(st)?;
+        let r = match self
+            .node
+            .header_branch(chain, &[], &[upper], Some(h), Some(h))
+            .await
+        {
+            Err(e) => Err(format!("branch read failed: {e}")),
+            Ok(p) => match p.items.as_slice() {
+                [] => Ok(None),
+                [x] if x.get("height").and_then(Value::as_u64) == Some(h) => Ok(Some(x.clone())),
+                [_] => Err("the cut's branch answered a header at another height".into()),
+                xs => Err(format!(
+                    "the cut's branch holds {} headers at the height",
+                    xs.len()
+                )),
+            },
+        };
+        st.canonical.insert((chain, h), r.clone());
+        r
+    }
+
+    /// Every header the node stores at `(chain, h)` (orphans included): for a block's payload
+    /// hash by its block hash only, never for canonicity.
     async fn h7_headers(&self, chain: u8, h: u64, st: &mut Reads) -> Result<Vec<Value>, String> {
         if let Some(v) = st.headers.get(&(chain, h)) {
             return v.clone();
@@ -2287,27 +2725,34 @@ mod tests {
             let t = json!({"reqKey": rk, "events": [xfer]}).to_string();
             json!({"coinbase": kdx_types::hash::b64url_encode(t.as_bytes())})
         };
-        let hd = vec![json!({"hash": "B", "payloadHash": "P"})];
+        let hd = json!({"hash": "B", "payloadHash": "P"});
         let r = id(None, Some(9), Some(0));
         assert_eq!(
-            coinbase_verdict(&r, &n, 9, &hd, Some(&cb("k")), false).canon,
+            coinbase_verdict(&r, &n, 9, Some(&hd), Some(&cb("k")), false).canon,
             Canon::Yes
         );
         assert_eq!(
-            coinbase_verdict(&r, &n, 9, &hd, Some(&cb("j")), false).canon,
+            coinbase_verdict(&r, &n, 9, Some(&hd), Some(&cb("j")), false).canon,
             Canon::No
         );
-        let two = vec![hd[0].clone(), json!({"hash": "F"})];
         assert_eq!(
-            coinbase_verdict(&r, &n, 9, &two, None, false).canon,
+            coinbase_verdict(&r, &n, 9, None, None, false).canon,
             Canon::Unknown
         );
-        // A block row: the node's only header at the height.
+        // A block row: the canonical header at the height (the cut's branch).
         let mut b = id(Some("B"), Some(9), None);
         b.kind = Some(Kind::Block);
-        assert_eq!(block_verdict(&b, &hd).canon, Canon::Yes);
-        assert_eq!(block_verdict(&b, &two).canon, Canon::Unknown);
-        assert_eq!(block_verdict(&b, &[json!({"hash": "F"})]).canon, Canon::No);
+        let row = json!({"hash": "B", "payloadHash": "P"});
+        assert_eq!(block_verdict(&b, &row, Some(&hd), false).canon, Canon::Yes);
+        assert_eq!(block_verdict(&b, &row, None, false).canon, Canon::Unknown);
+        let f = json!({"hash": "F"});
+        assert_eq!(block_verdict(&b, &row, Some(&f), true).canon, Canon::No);
+        let other = json!({"hash": "B", "payloadHash": "Q"});
+        assert_eq!(block_verdict(&b, &other, Some(&hd), false).canon, Canon::No);
+        assert_eq!(
+            block_verdict(&b, &other, Some(&hd), true).canon,
+            Canon::Unknown
+        );
     }
 
     #[test]

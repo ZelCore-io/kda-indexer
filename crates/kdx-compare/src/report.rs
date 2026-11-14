@@ -202,11 +202,16 @@ impl DiffRecord {
             b_status: self.b_status,
             a_body_trimmed: a_body,
             b_body_trimmed: b_body,
+            // R-P5P9-67 m-1: H6's entries (an unfinished list, a harness limit) are kept past
+            // the cap, so the referee's stored H6 still sees them.
             diff: self
                 .diff
                 .iter()
-                .take(crate::diff::MAX_ENTRIES)
-                .map(|e| DiffEntry {
+                .enumerate()
+                .filter(|(i, e)| {
+                    *i < crate::diff::MAX_ENTRIES || crate::graphql_scope::is_h6_entry(&e.path)
+                })
+                .map(|(_, e)| DiffEntry {
                     path: short(&e.path),
                     kind: e.kind,
                     a: bound_value(e.a.clone()),

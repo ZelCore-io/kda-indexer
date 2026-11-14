@@ -44,6 +44,14 @@ const TIP_ROOTS: &[&str] = &[
 pub const PAGE_CUT_PATH: &str = "/~graphql-page-cut";
 pub const TOTALCOUNT_CAP_PATH: &str = "/~graphql-totalcount-cap";
 pub const ORACLE_STALL_PATH: &str = "/~graphql-oracle-stall";
+/// R-P5P9-67 I-A (b): a follow page of ours that answered but is no page. No allowlist entry
+/// matches it.
+pub const FOLLOW_PAGE_FAULT_PATH: &str = "/~graphql-follow-page-fault";
+/// R-P5P9-67 m-3: one side's merged pages passed [`MERGED_BYTES_CAP`]. No allowlist entry
+/// matches it.
+pub const MERGED_BYTES_PATH: &str = "/~harness-limit/graphql-merged-bytes";
+/// The merged bytes of one side's pages at most (R-P5P9-67 m-3).
+pub const MERGED_BYTES_CAP: usize = 32 << 20;
 /// Pause after this many consecutive oracle timeouts, and for how long (GQ-16).
 const ORACLE_TIMEOUTS_BEFORE_PAUSE: u32 = 3;
 const ORACLE_PAUSE: Duration = Duration::from_secs(600);
@@ -971,9 +979,90 @@ pub fn follow_page_fault(status: u16, page: &Value) -> Option<String> {
     root.is_none().then(|| "no root connection".into())
 }
 
+/// A follow page that answered, but not as a page (R-P5P9-67 I-A (b)): GraphQL `errors`, no
+/// `data`, no root connection or no JSON, at a status that is no transport or server fault
+/// (not 5xx, 408 or 429). On ours it is a diff, not an error.
+#[derive(Debug)]
+pub struct FollowPageFault {
+    pub target: String,
+    pub page: u32,
+    pub status: u16,
+    pub why: String,
+}
+
+impl std::fmt::Display for FollowPageFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: follow page {} failed: HTTP {}, {}",
+            self.target, self.page, self.status, self.why
+        )
+    }
+}
+
+impl std::error::Error for FollowPageFault {}
+
+/// One side's merged pages passed [`MERGED_BYTES_CAP`] (R-P5P9-67 m-3).
+#[derive(Debug)]
+pub struct MergedBytes {
+    pub target: String,
+    pub bytes: usize,
+    pub pages: u32,
+}
+
+impl std::fmt::Display for MergedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: harness limit: {} bytes in {} pages, past the cap of {MERGED_BYTES_CAP} merged \
+             bytes per side",
+            self.target, self.bytes, self.pages
+        )
+    }
+}
+
+impl std::error::Error for MergedBytes {}
+
+/// A status at which a follow page that is no page is ours' fault, not the transport's or the
+/// server's load (R-P5P9-67 I-A (b): 5xx, timeouts and rate limits stay errors).
+fn page_fault_is_ours(status: u16) -> bool {
+    status < 500 && status != 408 && status != 429
+}
+
+/// The diff entry of a fetch that stopped at a follow-page fault of ours or the merged-bytes
+/// cap (R-P5P9-67 I-A (b), m-3); `ours`: the side is ours (a follow-page fault of the
+/// oracle's stays `b-error`).
+pub fn fetch_stop_entry(e: &anyhow::Error, ours: bool) -> Option<DiffEntry> {
+    let (path, ev) = if let Some(f) = e.downcast_ref::<FollowPageFault>() {
+        if !ours {
+            return None;
+        }
+        let ev = json!({"page": f.page, "status": f.status, "why": f.why});
+        (FOLLOW_PAGE_FAULT_PATH, ev)
+    } else if let Some(m) = e.downcast_ref::<MergedBytes>() {
+        let ev = json!({"bytes": m.bytes, "pages": m.pages, "cap": MERGED_BYTES_CAP});
+        (MERGED_BYTES_PATH, ev)
+    } else {
+        return None;
+    };
+    let (a, b) = if ours {
+        (Some(ev), None)
+    } else {
+        (None, Some(ev))
+    };
+    Some(DiffEntry {
+        path: path.into(),
+        kind: DiffKind::Changed,
+        a,
+        b,
+    })
+}
+
 /// Sends `op` and follows `hasNextPage`/`after` up to `depth` more pages (the root
 /// connection's edges are concatenated; the last page's `pageInfo` is kept). A follow page
-/// that fails ([`follow_page_fault`]) fails the fetch.
+/// that fails ([`follow_page_fault`]) fails the fetch, as a [`FollowPageFault`] when it
+/// answered at a status that is ours' fault; past [`MERGED_BYTES_CAP`] bytes the fetch stops
+/// with [`MergedBytes`].
 pub async fn fetch_pages(
     t: &Target,
     op: &GqlOp,
@@ -984,6 +1073,17 @@ pub async fn fetch_pages(
     let mut ms: Vec<u64> = Vec::new();
     let cap = t.post_json(&body_of(op, &vars)).await?;
     ms.push(cap.ms);
+    let mut bytes = cap.body.len();
+    if bytes > MERGED_BYTES_CAP {
+        let pages = 1;
+        let target = t.name.clone();
+        return Err(MergedBytes {
+            target,
+            bytes,
+            pages,
+        }
+        .into());
+    }
     let status = cap.status;
     let raw = trim_body(&cap.body);
     let mut merged: Value = serde_json::from_slice(&cap.body).with_context(|| {
@@ -1006,8 +1106,34 @@ pub async fn fetch_pages(
         vars.insert("after".into(), json!(end));
         let c = t.post_json(&body_of(op, &vars)).await?;
         ms.push(c.ms);
-        let mut next: Value = serde_json::from_slice(&c.body).context("page is not JSON")?;
+        bytes += c.body.len();
+        if bytes > MERGED_BYTES_CAP {
+            let target = t.name.clone();
+            let pages = pages + 1;
+            return Err(MergedBytes {
+                target,
+                bytes,
+                pages,
+            }
+            .into());
+        }
+        let fault = |why: String| FollowPageFault {
+            target: t.name.clone(),
+            page: pages + 1,
+            status: c.status,
+            why,
+        };
+        let mut next: Value = match serde_json::from_slice(&c.body) {
+            Ok(v) => v,
+            Err(e) if page_fault_is_ours(c.status) => {
+                return Err(fault(format!("not JSON: {e}")).into());
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("page is not JSON")),
+        };
         if let Some(why) = follow_page_fault(c.status, &next) {
+            if page_fault_is_ours(c.status) {
+                return Err(fault(why).into());
+            }
             anyhow::bail!("{}: follow page {} failed: {why}", t.name, pages + 1);
         }
         let Some(nd) = next.get_mut("data").filter(|d| !d.is_null()) else {
@@ -1318,7 +1444,7 @@ impl Ctx {
     }
 
     /// GraphQL vs the reference server (oracle) at heights up to `max`.
-    async fn gql_vs_oracle(
+    pub(crate) async fn gql_vs_oracle(
         &self,
         ta: &Target,
         tb: &Target,
@@ -1338,7 +1464,12 @@ impl Ctx {
         };
         let mut a = match self.gql_fetch(ta, op, vars, depth).await {
             Ok(a) => a,
-            Err(e) => return self.gql_a_error(op, vars, ta, &tb.name, &format!("{e:#}")),
+            // R-P5P9-67 I-A (b), m-3: a follow-page fault of ours, or the merged-bytes cap, is
+            // a diff; transport errors, timeouts and 5xx stay `a-error`.
+            Err(e) => match fetch_stop_entry(&e, true) {
+                Some(d) => return self.gql_fetch_stop(op, vars, ta, &tb.name, None, d, &e),
+                None => return self.gql_a_error(op, vars, ta, &tb.name, &format!("{e:#}")),
+            },
         };
         if a.status >= 500 {
             return self.gql_a_error(op, vars, ta, &tb.name, &format!("HTTP {}", a.status));
@@ -1347,6 +1478,11 @@ impl Ctx {
             Ok(b) => {
                 self.gql.note_oracle(false);
                 b
+            }
+            Err(e) if fetch_stop_entry(&e, false).is_some() => {
+                self.gql.note_oracle(false);
+                let d = fetch_stop_entry(&e, false).expect("entry");
+                return self.gql_fetch_stop(op, vars, ta, &tb.name, Some(&a), d, &e);
             }
             Err(e) => {
                 let timed_out = e.chain().any(|c| {
@@ -1391,6 +1527,35 @@ impl Ctx {
             .gql_rules(ta, H6::Live(tb), op, vars, &mut a, &mut b, max)
             .await;
         self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d, note)
+    }
+
+    /// A fetch that stopped at a follow-page fault of ours or the merged-bytes cap (R-P5P9-67
+    /// I-A (b), m-3): a record with its one entry, which no allowlist entry matches.
+    #[allow(clippy::too_many_arguments)]
+    fn gql_fetch_stop(
+        &self,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        ta: &Target,
+        b_name: &str,
+        a: Option<&Answer>,
+        entry: DiffEntry,
+        e: &anyhow::Error,
+    ) -> Outcome {
+        let d = vec![entry];
+        let (unexplained, ids) = self.allow.classify_request(
+            &RouteKind::Other,
+            &format!("graphql:{}", op.stem),
+            &[],
+            &d,
+        );
+        let class = if unexplained.is_empty() {
+            "allowlisted"
+        } else {
+            "diff"
+        };
+        let note = Some(format!("{e:#}"));
+        self.gql_record(op, vars, ta, b_name, a, None, "", d, class, &ids, note)
     }
 
     /// Every rule on an oracle pair's two answers after the fetch, in one place for the live
@@ -1558,12 +1723,14 @@ impl Ctx {
             };
             let total = |c: &Value| c.get("totalCount").and_then(Value::as_u64);
             let (ta_total, tb_total) = (total(ca), total(cb));
+            // R-P5P9-67 I-D: the one-page retry is the oracle's only (its `Block.events`); a
+            // cursor-page failure of ours leaves the list unfinished.
             let fa = self
-                .gql_read_list(ta, &q, &vars, at, &mut budget[0], ta_total)
+                .gql_read_list(ta, &q, &vars, at, &mut budget[0], ta_total, false)
                 .await;
             let fb = match &fa {
                 Ok(_) => {
-                    self.gql_read_list(tb, &q, &vars, at, &mut budget[1], tb_total)
+                    self.gql_read_list(tb, &q, &vars, at, &mut budget[1], tb_total, true)
                         .await
                 }
                 Err(e) => Err(*e),
@@ -1652,9 +1819,11 @@ impl Ctx {
     /// One side's whole nested list through the harness's list query (`at`: the list in its
     /// answer), as edges `{node}`. Each page takes one from `budget`. Fails on any error or a
     /// row key (the query's key alias) missing or seen twice; past `MAX_PAGES` pages it is a
-    /// harness limit. R-P5P9-64 I-5: a failure on a cursor page (any page after the first) is
-    /// retried once in one page of `first` = `total` (that side's `totalCount`), with the same
-    /// key checks; a `total` above `MAX_PAGES` × `PAGE_SIZE` is a harness limit.
+    /// harness limit. R-P5P9-64 I-5: with `retry` (the oracle's side only, R-P5P9-67 I-D), a
+    /// failure on a cursor page (any page after the first) is retried once in one page of
+    /// `first` = `total` (that side's `totalCount`), with the same key checks; a `total` above
+    /// `MAX_PAGES` × `PAGE_SIZE` is a harness limit.
+    #[allow(clippy::too_many_arguments)]
     async fn gql_read_list(
         &self,
         t: &Target,
@@ -1663,6 +1832,7 @@ impl Ctx {
         at: &str,
         budget: &mut usize,
         total: Option<u64>,
+        retry: bool,
     ) -> Result<Vec<Value>, ListStop> {
         use crate::graphql_scope::{one_page, MAX_PAGES, PAGE_SIZE};
         let mut v = vars.clone();
@@ -1675,7 +1845,7 @@ impl Ctx {
             {
                 Ok(None) => return Ok(out),
                 Ok(Some(after)) => v["after"] = after,
-                Err(ListStop::Failed(why)) if page > 0 => {
+                Err(ListStop::Failed(why)) if retry && page > 0 => {
                     let Some(n) = total.filter(|n| *n > 0) else {
                         return Err(ListStop::Failed(why));
                     };
@@ -3416,10 +3586,16 @@ mod tests {
         let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &tie);
         assert_eq!(un.len(), 1, "search-tie-order matches /txs/search only");
         // R-P5P9-64 I-5, M-5: H6's unfinished lists and harness limits are never allowlisted.
+        // R-P5P9-67: nor a short page of ours, a follow-page fault of ours, the merged-bytes
+        // cap or rows H7 left undecided.
         for p in [
             crate::graphql_scope::UNFINISHED_PATH,
             crate::graphql_scope::MAX_PAGES_PATH,
             crate::graphql_scope::HARNESS_LIMIT_PATH,
+            crate::graphql_window::SHORT_PAGE_PATH,
+            crate::graphql_window::UNDECIDED_PATH,
+            FOLLOW_PAGE_FAULT_PATH,
+            MERGED_BYTES_PATH,
         ] {
             let (un, _) = allow.classify_request(
                 &RouteKind::Other,

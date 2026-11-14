@@ -33,6 +33,8 @@ pub(super) struct NodeMock {
     /// and events; `poll_fail`: every `/poll` answers 500.
     pub polls: HashMap<String, (u8, Value)>,
     pub poll_fail: bool,
+    /// `header/branch` answers nothing above this height (a height above the node's cut).
+    pub branch_top: Option<u64>,
     pub calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -82,11 +84,22 @@ async fn node_server(n: NodeMock) -> String {
                       Query(q): Query<HashMap<String, u64>>| async move {
                     log(&n, &uri);
                     let (lo, hi) = (q["minheight"], q["maxheight"]);
+                    // The canonical header at each height: `canon`'s block (its stored
+                    // header when `headers` holds it), else the only header stored there.
                     let items: Vec<Value> = (lo..=hi)
+                        .filter(|h| n.branch_top.is_none_or(|top| *h <= top))
                         .filter_map(|h| {
-                            n.canon
-                                .get(&(c, h))
-                                .map(|x| json!({"height": h, "hash": x, "chainId": c}))
+                            let stored = n.headers.get(&(c, h)).cloned().unwrap_or_default();
+                            match n.canon.get(&(c, h)) {
+                                Some(x) => Some(
+                                    stored
+                                        .into_iter()
+                                        .find(|s| s["hash"] == json!(x))
+                                        .unwrap_or_else(|| json!({"height": h, "hash": x, "chainId": c})),
+                                ),
+                                None if stored.len() == 1 => stored.into_iter().next(),
+                                None => None,
+                            }
                         })
                         .collect();
                     Json(json!({"items": items, "next": null, "limit": items.len()}))
@@ -1029,7 +1042,13 @@ async fn keyed_list_server(
                         .into_response();
                 }
                 let end = (at + per).min(rows.len());
-                let edges: Vec<Value> = rows[at..end]
+                // REP: a cursor page repeats the last row of the page before it.
+                let start = if p.starts_with("REP") && cursor {
+                    at - 1
+                } else {
+                    at
+                };
+                let edges: Vec<Value> = rows[start..end]
                     .iter()
                     .map(|r| match r {
                         Value::Array(kn) => json!({"node": kn[1], "kdxKey": {"hash": kn[0]}}),
@@ -2936,10 +2955,10 @@ async fn h6_large_block_lists_are_paged_to_the_end_within_the_budget() {
     let huge = block(1001);
     let ours = json!({"CVQ6": big, "B1": block(30), "B2": block(30), "B3": block(30),
         "B4": block(30), "CH": big, "FAIL": big, "TW": big, "SH": short, "CUR": big,
-        "DEAD": big, "HUGE": huge});
+        "DEAD": big, "HUGE": huge, "REP": big});
     let oracle = json!({"CVQ6": big, "B1": block(30), "B2": block(30), "B3": block(30),
         "B4": block(30), "CH": changed, "FAIL": big, "TW": twice, "SH": big, "CUR": big,
-        "DEAD": big, "HUGE": huge});
+        "DEAD": big, "HUGE": huge, "REP": big});
     let calls = Arc::new(Mutex::new(0));
     let au = keyed_list_server(ours.clone(), calls.clone(), 50, Some(("FAIL", 1)), false).await;
     // The oracle as CG-3T found it: its `Block.events` cursor fails past the first page.
@@ -3059,12 +3078,20 @@ rate_rps = 1000.0
             .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions/edges")),
         "{d:?}"
     );
-    // R-P5P9-64 I-5: ours fails on its second page, and the oracle (CUR) fails every cursor
-    // page, as its `Block.events` does: each is read again in one page of its totalCount,
-    // with the key checks, and finished.
-    for h in ["FAIL", "CUR"] {
+    // R-P5P9-64 I-5: the oracle (CUR) fails every cursor page, as its `Block.events` does:
+    // it is read again in one page of its totalCount, with the key checks, and finished.
+    let (n, limit, d) = run(&ctx, &op, src, &[("CUR", 147)]).await;
+    assert_eq!((n, limit, d.clone()), (1, vec![], vec![]), "CUR: {d:?}");
+    // R-P5P9-67 I-D: the retry is the oracle's only. Ours' page 2 answering 500 (FAIL), or
+    // repeating a key (REP), leaves the list unfinished: a cursor-page defect of ours.
+    for h in ["FAIL", "REP"] {
         let (n, limit, d) = run(&ctx, &op, src, &[(h, 147)]).await;
-        assert_eq!((n, limit, d.clone()), (1, vec![], vec![]), "{h}: {d:?}");
+        assert_eq!((n, limit), (0, vec![UNFINISHED_PATH.to_string()]), "{h}");
+        assert!(
+            d.iter()
+                .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")),
+            "{h}: {d:?}"
+        );
     }
     // The oracle cannot be paged to its end (DEAD: the retry fails too), or its paging gives
     // k3 twice (in place of k6, the same value): not finished, the cut pages stay a diff, and
@@ -3342,4 +3369,717 @@ kind = "graphql_oracle"
     assert!(n >= 1 && h >= 1, "{n} {h}");
     // 4 r/s for 2 s, plus one: the limiters' first reads are not delayed.
     assert!(n + h <= 4 * 2 + 1, "node {n} + header {h} reads in 2 s");
+}
+
+// ---------------------------------------------------------------------------------------------
+// FVH-C3 (R-P5P9-67): the re-review's findings I-A to I-D and m-1 to m-6.
+
+/// A config with ours at `au`, the oracle at `bu`, the documents of `ops`, and `extra` lines
+/// at the top level.
+fn c3_cfg(
+    nu: &str,
+    au: &str,
+    bu: &str,
+    out: &std::path::Path,
+    ops: &std::path::Path,
+    extra: &str,
+) -> CompareConfig {
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+{extra}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = {ops:?}
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_graphql"
+rate_rps = 1000.0
+[targets.b]
+url = "{bu}"
+kind = "graphql_oracle"
+max_height = 7000000
+rate_rps = 1000.0
+"#
+    ))
+    .unwrap()
+}
+
+/// The paths of `d` no allowlist entry explains.
+fn c3_unexplained(ctx: &Ctx, d: &[crate::report::DiffEntry]) -> Vec<String> {
+    let (un, _) =
+        ctx.allow
+            .classify_request(&crate::normalize::RouteKind::Other, "graphql:QH7", &[], d);
+    un.into_iter().map(|e| e.path).collect()
+}
+
+/// An ops dir holding QH7 over `transfers`.
+fn c3_ops(dir: &std::path::Path) -> std::path::PathBuf {
+    let ops = dir.join("ops");
+    std::fs::create_dir_all(&ops).unwrap();
+    std::fs::write(
+        ops.join("QH7.graphql"),
+        format!("# kdx: oracle\n{}\n", h7_op("transfers").query),
+    )
+    .unwrap();
+    ops
+}
+
+/// R-P5P9-67 I-A (a): a cut page of ours shorter than `first` × the pages fetched is a diff
+/// (`/~graphql-h7-short-page`), never the allowlisted common prefix. The one exception is
+/// ours' Q10 cap, a page of exactly min(first, 100) × pages, which H7 takes as a window.
+#[tokio::test]
+async fn c3_a_short_page_of_ours_is_not_explained() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let (k, v) = h7_poll("x", "B10", 10, json!([]));
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let t = |i: u64| {
+        h7_tx(
+            &format!("t{i}"),
+            1000 - i,
+            &format!("B{}", 1000 - i),
+            "2024-01-01T10:00:00Z",
+        )
+    };
+    let page = |rows: Vec<Value>, pages: usize| crate::graphql::Answer {
+        ms: vec![1; pages],
+        ..h7_page("transactions", true, rows)
+    };
+    // The review's scenario: first 5, two pages. Ours ends with 8 rows (a cursor join lost
+    // t9 and t10); the oracle lists t1 to t10. The prefix is equal.
+    let mut a = page((1..=8).map(t).collect(), 2);
+    let mut b = page((1..=10).map(t).collect(), 2);
+    let vars = h7_vars(&[("first", json!(5))]);
+    let (d, note) = ctx
+        .gql_settle(&ctx.targets["a"], &vars, &mut a, &mut b, 7_000_000, false)
+        .await;
+    let un = c3_unexplained(&ctx, &d);
+    assert!(
+        un.iter().any(|p| p == "/~graphql-h7-short-page"),
+        "{un:?} {note:?}"
+    );
+    // Ours' cap: first 150, one page of 100 rows. The oracle's 101st row lies below our
+    // window: explained by H7.
+    let mut a = page((1..=100).map(t).collect(), 1);
+    let mut rows: Vec<Value> = (1..=100).map(t).collect();
+    rows.push(h7_tx("x", 10, "B10", "2024-01-01T09:00:00Z"));
+    let mut b = page(rows, 1);
+    let vars = h7_vars(&[("first", json!(150))]);
+    let (d, note) = ctx
+        .gql_settle(&ctx.targets["a"], &vars, &mut a, &mut b, 7_000_000, false)
+        .await;
+    assert!(c3_unexplained(&ctx, &d).is_empty(), "{d:?} {note:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_window::WINDOW_PATH),
+        "{d:?}"
+    );
+}
+
+/// R-P5P9-67 I-A (b): a follow page of ours that answers HTTP 200 with GraphQL `errors`,
+/// no `data` or no root connection is class `diff` with `/~graphql-follow-page-fault`; a
+/// 503 stays `a-error`.
+#[tokio::test]
+async fn c3_a_follow_page_fault_of_ours_is_a_diff_and_a_5xx_an_error() {
+    use axum::http::StatusCode;
+    let dir = tempfile::tempdir().unwrap();
+    let app = Router::new().route(
+        "/graphql",
+        post(|Json(req): Json<Value>| async move {
+            let v = &req["variables"];
+            if v["after"].is_null() {
+                return Json(json!({"data": {"transfers": {
+                    "pageInfo": {"hasNextPage": true, "endCursor": "c1"},
+                    "edges": [{"cursor": "c1", "node": {"requestKey": "k1"}}]}}}))
+                .into_response();
+            }
+            match v["accountName"].as_str().unwrap_or("") {
+                "errors" => {
+                    Json(json!({"errors": [{"message": "cursor"}], "data": null})).into_response()
+                }
+                "no-data" => Json(json!({})).into_response(),
+                "no-root" => Json(json!({"data": {"other": 1}})).into_response(),
+                _ => (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response(),
+            }
+        }),
+    );
+    let au = format!("{}graphql", serve(app).await);
+    let ctx = gql_ctx_at(NodeMock::default(), dir.path(), &au).await;
+    let op = h7_op("transfers");
+    for (mode, class) in [
+        ("errors", "diff"),
+        ("no-data", "diff"),
+        ("no-root", "diff"),
+        ("busy", "a-error"),
+    ] {
+        let vars = h7_vars(&[("accountName", json!(mode)), ("first", json!(1))]);
+        let o = ctx
+            .gql_vs_oracle(&ctx.targets["a"], &ctx.targets["b"], &op, &vars, 7_000_000)
+            .await;
+        assert_eq!(o.class, class, "{mode}: {o:?}");
+        let rec = o.record.unwrap();
+        let fault = rec
+            .diff
+            .iter()
+            .any(|e| e.path == "/~graphql-follow-page-fault");
+        assert_eq!(fault, class == "diff", "{mode}: {rec:?}");
+        if fault {
+            let (un, _) = ctx.allow.classify_request(
+                &crate::normalize::RouteKind::Other,
+                "graphql:QH7",
+                &[],
+                &rec.diff,
+            );
+            assert_eq!(un.len(), 1, "{mode}");
+        }
+    }
+}
+
+/// R-P5P9-67 I-B: an ours-only block row is checked on every selected field against the
+/// node's canonical header, in ours' encodings. One changed field stays a diff; a field the
+/// header cannot give (`powHash` of an undecodable header) leaves the row unsettled.
+#[tokio::test]
+async fn c3_ours_only_block_rows_are_checked_on_every_selected_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let ones = kdx_types::hash::b64url_encode(&[0xffu8; 32]);
+    let mut other = [0xffu8; 32];
+    other[0] = 0xfe;
+    let other = kdx_types::hash::b64url_encode(&other);
+    // 2024-01-01T10:00:00.123456Z in microseconds.
+    let ct: u64 = 1_704_103_200_123_456;
+    for h in 10..=12u64 {
+        node.headers.insert(
+            (0, h),
+            vec![
+                json!({"hash": format!("B{h}"), "height": h, "chainId": 0, "nonce": "777",
+                "creationTime": ct, "epochStart": ct - 1_000_000, "target": ones,
+                "weight": ones, "payloadHash": format!("P{h}"),
+                "parent": format!("B{}", h - 1)}),
+            ],
+        );
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let blk = |h: u64| {
+        json!({"cursor": "c", "node": {"hash": format!("B{h}"), "height": h, "chainId": 0,
+            "nonce": "777", "creationTime": "2024-01-01T10:00:00.123Z",
+            "epoch": "2024-01-01T09:59:59.123Z", "target": ones, "weight": ones,
+            "difficulty": 1, "payloadHash": format!("P{h}"),
+            "parent": {"hash": format!("B{}", h - 1)}}})
+    };
+    let run = |last: Value| {
+        let ctx = &ctx;
+        let (a, b) = (vec![blk(10), blk(11), last], vec![blk(10), blk(11)]);
+        async move {
+            let mut a = h7_page("blocksFromHeight", false, a);
+            let mut b = h7_page("blocksFromHeight", false, b);
+            let (d, note) = ctx
+                .gql_settle(
+                    &ctx.targets["a"],
+                    &serde_json::Map::new(),
+                    &mut a,
+                    &mut b,
+                    7_000_000,
+                    false,
+                )
+                .await;
+            (c3_unexplained(ctx, &d), note.unwrap_or_default())
+        }
+    };
+    // Every field the node's: a node-confirmed oracle gap.
+    let (un, note) = run(blk(12)).await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    for (field, value) in [
+        ("nonce", json!("778")),
+        ("creationTime", json!("2024-01-01T10:00:00.124Z")),
+        ("epoch", json!("2024-01-01T09:59:58.123Z")),
+        ("target", json!(other)),
+        ("weight", json!(other)),
+        ("difficulty", json!(2)),
+        ("payloadHash", json!("PX")),
+        ("parent", json!({"hash": "BX"})),
+    ] {
+        let mut row = blk(12);
+        row["node"][field] = value;
+        let (un, note) = run(row).await;
+        assert!(!un.is_empty(), "{field}: {note}");
+        assert!(note.contains(field), "{field}: {note}");
+    }
+    let mut row = blk(12);
+    row["node"]["powHash"] = json!("00ab");
+    let (un, note) = run(row).await;
+    assert!(!un.is_empty(), "powHash: {note}");
+    assert!(note.contains("powHash"), "{note}");
+}
+
+/// R-P5P9-67 I-C: an ours-only row is excused only when the harness checked every root
+/// argument with a non-null value or a literal (`first`, `after`, `last`, `before` aside).
+#[tokio::test]
+async fn c3_root_filters_the_harness_does_not_check_refuse_the_excuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("t1", 101), ("t2", 100)] {
+        let (k, v) = h7_poll(rk, &format!("B{h}"), h, json!([]));
+        node.polls.insert(k, v);
+    }
+    for h in [11u64, 12] {
+        node.headers.insert(
+            (0, h),
+            vec![json!({"hash": format!("B{h}"), "height": h, "chainId": 0})],
+        );
+    }
+    let au = ours_fn_server(|_: &Value| json!({"data": {"block": {"chainId": "0"}}})).await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let parse = |stem: &str, q: &str| crate::graphql::parse_op(stem, q, false).unwrap();
+    let by_key = parse(
+        "QTransactionsByPublicKey",
+        "query QTransactionsByPublicKey($publicKey: String, $first: Int, $after: String) { \
+         transactionsByPublicKey(publicKey: $publicKey, first: $first, after: $after) { \
+         totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash } } } }",
+    );
+    let plain = parse(
+        "QTxs",
+        "query QTxs($first: Int, $after: String) { transactions(first: $first, after: $after) \
+         { totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash } } } }",
+    );
+    let heights = |literal: &str| {
+        parse(
+            "QCompletedBlockHeights",
+            &format!(
+                "query QCompletedBlockHeights($chainIds: [String!], $first: Int) {{ \
+                 completedBlockHeights(chainIds: $chainIds,{literal} first: $first) {{ \
+                 pageInfo {{ hasNextPage }} edges {{ node {{ height chainId hash }} }} }} }}"
+            ),
+        )
+    };
+    let tx = |rk: &str, h: u64| {
+        let id = crate::graphql::base64_std(format!("Transaction:[\"B{h}\",\"{rk}\"]").as_bytes());
+        json!({"cursor": "c", "node": {"id": id, "hash": rk}})
+    };
+    let blk = |h: u64| json!({"cursor": "c", "node": {"height": h, "chainId": 0, "hash": format!("B{h}")}});
+    let run = |op: crate::graphql::GqlOp,
+               root: &'static str,
+               a: Vec<Value>,
+               b: Vec<Value>,
+               vars: serde_json::Map<String, Value>| {
+        let ctx = &ctx;
+        async move {
+            let mut a = h7_page(root, false, a);
+            let mut b = h7_page(root, false, b);
+            let (d, note) = ctx
+                .gql_settle_op(
+                    &ctx.targets["a"],
+                    Some(&op),
+                    &vars,
+                    &mut a,
+                    &mut b,
+                    7_000_000,
+                    false,
+                )
+                .await;
+            (c3_unexplained(ctx, &d), note.unwrap_or_default())
+        }
+    };
+    let txs = || (vec![tx("t1", 101), tx("t2", 100)], vec![tx("t1", 101)]);
+    // QTransactionsByPublicKey: t2 is canonical, but the harness does not check the key.
+    let (a, b) = txs();
+    let vars = h7_vars(&[("publicKey", json!("pk")), ("first", json!(2))]);
+    let (un, note) = run(by_key.clone(), "transactionsByPublicKey", a, b, vars).await;
+    assert!(!un.is_empty(), "{note}");
+    assert!(
+        note.contains("a filter the harness does not check: publicKey"),
+        "{note}"
+    );
+    // The same rows with the key null, and on a list with no filter: explained.
+    let (a, b) = txs();
+    let vars = h7_vars(&[("publicKey", Value::Null), ("first", json!(2))]);
+    let (un, note) = run(by_key, "transactionsByPublicKey", a, b, vars).await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    let (a, b) = txs();
+    let (un, note) = run(plain, "transactions", a, b, h7_vars(&[("first", json!(2))])).await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    // A literal `heightCount`: B11 is canonical, but the literal is not checked.
+    let vars = || h7_vars(&[("chainIds", json!(["0"])), ("first", json!(2))]);
+    let (un, note) = run(
+        heights(" heightCount: 3,"),
+        "completedBlockHeights",
+        vec![blk(12), blk(11)],
+        vec![blk(12)],
+        vars(),
+    )
+    .await;
+    assert!(!un.is_empty(), "{note}");
+    assert!(
+        note.contains("a filter the harness does not check: heightCount"),
+        "{note}"
+    );
+    let (un, note) = run(
+        heights(""),
+        "completedBlockHeights",
+        vec![blk(12), blk(11)],
+        vec![blk(12)],
+        vars(),
+    )
+    .await;
+    assert!(un.is_empty(), "{un:?} {note}");
+}
+
+/// R-P5P9-67 m-1: H6's entries survive the record's 50-entry cap, so the referee keeps a
+/// record with an unfinished list unexplained even behind 60 field diffs.
+#[tokio::test]
+async fn c3_the_referee_keeps_h6_past_the_records_entry_cap() {
+    use crate::report::{DiffEntry, DiffKind, DiffRecord};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let ops = c3_ops(dir.path());
+    let cfg = c3_cfg(
+        &nu,
+        "http://127.0.0.1:9/graphql",
+        "https://oracle.invalid/graphql",
+        dir.path(),
+        &ops,
+        "",
+    );
+    let body = json!({"data": {"transfers": {"totalCount": 1, "pageInfo": {"hasNextPage": false},
+        "edges": [{"cursor": "c", "node": {"requestKey": "k1"}}]}}})
+    .to_string();
+    let mut diff: Vec<DiffEntry> = (0..60)
+        .map(|i| DiffEntry {
+            path: format!("/data/transfers/edges/0/node/f{i}"),
+            kind: DiffKind::Changed,
+            a: Some(json!(1)),
+            b: Some(json!(2)),
+        })
+        .collect();
+    diff.push(DiffEntry {
+        path: crate::graphql_scope::UNFINISHED_PATH.into(),
+        kind: DiffKind::Changed,
+        a: Some(json!({"lists": []})),
+        b: Some(json!({"lists": [{"list": "/data/x", "why": "a page read failed"}]})),
+    });
+    let rec = DiffRecord {
+        ts: "2026-11-14T20:00:00Z".into(),
+        route: "graphql:QH7".into(),
+        request: format!("QH7 {}", json!({"first": 1})),
+        a_target: "a".into(),
+        b_target: "b".into(),
+        a_status: Some(200),
+        b_status: Some(200),
+        a_body_trimmed: body.clone(),
+        b_body_trimmed: body,
+        diff,
+        class: "diff".into(),
+        allowlisted: None,
+        curl: String::new(),
+        note: None,
+        body_cap: None,
+        a_pages: Some(1),
+    };
+    let log = dir.path().join("diffs-cap.jsonl");
+    let line = serde_json::to_string(&rec.bounded()).unwrap();
+    std::fs::write(&log, format!("{line}\n")).unwrap();
+    let opts = crate::referee::Opts {
+        logs: vec![log],
+        max_reads: 100,
+        rps: 10,
+    };
+    let rep = crate::referee::run(cfg, &opts).await.unwrap();
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
+    let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+    assert!(still.contains("h6-unfinished"), "{still}");
+}
+
+/// R-P5P9-67 m-2: `node_max_rps` below 2 is refused in `Ctx::new` while header reads are
+/// on (an oracle target), so `referee --rps 1` is refused too.
+#[tokio::test]
+async fn c3_node_max_rps_below_2_is_refused_with_header_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let none = dir.path().join("no-ops");
+    let cfg = |extra: &str| {
+        c3_cfg(
+            &nu,
+            "http://127.0.0.1:9/graphql",
+            "https://oracle.invalid/graphql",
+            dir.path(),
+            &none,
+            extra,
+        )
+    };
+    for n in [0, 1] {
+        let Err(e) = Ctx::new(cfg(&format!("node_max_rps = {n}"))).await else {
+            panic!("node_max_rps {n} was accepted");
+        };
+        assert!(format!("{e:#}").contains("node_max_rps"), "{e:#}");
+    }
+    assert!(Ctx::new(cfg("node_max_rps = 2")).await.is_ok());
+    let log = dir.path().join("empty.jsonl");
+    std::fs::write(&log, "").unwrap();
+    let opts = |rps| crate::referee::Opts {
+        logs: vec![log.clone()],
+        max_reads: 10,
+        rps,
+    };
+    assert!(crate::referee::run(cfg(""), &opts(1)).await.is_err());
+    assert!(crate::referee::run(cfg(""), &opts(2)).await.is_ok());
+}
+
+/// R-P5P9-67 m-3: merged bytes per side are capped at 32 MiB; past it the record is a diff
+/// with `/~harness-limit/graphql-merged-bytes`, which no allowlist entry matches.
+#[tokio::test]
+async fn c3_merged_bytes_per_side_are_capped_at_32_mib() {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    // Pages of 7 MiB with a next page each time: six pages (follow_depth 5) are 42 MiB.
+    let big = ours_fn_server(|req: &Value| {
+        let n: u64 = req["variables"]["after"]
+            .as_str()
+            .map_or(0, |c| c.parse().unwrap());
+        json!({"data": {"transfers": {"pageInfo": {"hasNextPage": true,
+            "endCursor": (n + 1).to_string()},
+            "edges": [{"cursor": "c", "node": {"requestKey": format!("k{n}"),
+                "memo": "x".repeat(7 << 20)}}]}}})
+    })
+    .await;
+    let small = ours_fn_server(|_: &Value| {
+        json!({"data": {"transfers": {"pageInfo": {"hasNextPage": false},
+            "edges": [{"cursor": "c", "node": {"requestKey": "k0"}}]}}})
+    })
+    .await;
+    let none = dir.path().join("no-ops");
+    let op = h7_op("transfers");
+    let vars = h7_vars(&[("first", json!(1))]);
+    for (au, bu) in [(&big, &small), (&small, &big)] {
+        let ctx = Ctx::new(c3_cfg(&nu, au, bu, dir.path(), &none, "follow_depth = 5"))
+            .await
+            .unwrap();
+        let o = ctx
+            .gql_vs_oracle(&ctx.targets["a"], &ctx.targets["b"], &op, &vars, 7_000_000)
+            .await;
+        assert_eq!(o.class, "diff", "{:?}", o.record.as_ref().map(|r| &r.note));
+        let rec = o.record.unwrap();
+        let un = c3_unexplained(&ctx, &rec.diff);
+        assert!(
+            un.iter()
+                .any(|p| p == "/~harness-limit/graphql-merged-bytes"),
+            "{un:?}"
+        );
+    }
+}
+
+/// R-P5P9-67 m-4: the referee reads lines as bytes; a line that is not UTF-8 is listed as
+/// not refereed and the run goes on.
+#[tokio::test]
+async fn c3_the_referee_lists_a_line_that_is_not_utf8_and_goes_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let ops = c3_ops(dir.path());
+    let cfg = c3_cfg(
+        &nu,
+        "http://127.0.0.1:9/graphql",
+        "https://oracle.invalid/graphql",
+        dir.path(),
+        &ops,
+        "",
+    );
+    let body = json!({"data": {"transfers": {"pageInfo": {"hasNextPage": false},
+        "edges": [{"cursor": "c", "node": {"requestKey": "k1"}}]}}})
+    .to_string();
+    let rec = json!({"ts": "2026-11-14T20:00:00Z", "route": "graphql:QH7",
+        "request": format!("QH7 {}", json!({"first": 1})), "a_target": "a", "b_target": "b",
+        "a_status": 200, "b_status": 200, "a_body_trimmed": body, "b_body_trimmed": body,
+        "diff": [], "class": "diff", "curl": "", "a_pages": 1});
+    let mut bytes = b"{\"class\": \"diff\", \"note\": \"cut \xe2\x82".to_vec();
+    bytes.extend_from_slice(b"\xff\n");
+    bytes.extend_from_slice(format!("{rec}\n").as_bytes());
+    let log = dir.path().join("diffs-utf8.jsonl");
+    std::fs::write(&log, bytes).unwrap();
+    let opts = crate::referee::Opts {
+        logs: vec![log],
+        max_reads: 100,
+        rps: 10,
+    };
+    let rep = crate::referee::run(cfg, &opts)
+        .await
+        .expect("the run goes on past a line that is not UTF-8");
+    assert_eq!(
+        (rep.records, rep.explained, rep.not_refereed),
+        (2, 1, 1),
+        "{rep:?}"
+    );
+    let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+    assert!(
+        still.contains("not UTF-8") && still.contains("diffs-utf8.jsonl:1"),
+        "{still}"
+    );
+}
+
+/// R-P5P9-67 m-5: H7 decides canonicity through the node's cut branch, not the `/header`
+/// range by height (which holds orphans, and above the cut can lack the canonical block).
+#[tokio::test]
+async fn c3_h7_canonicity_comes_through_the_cuts_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let hd = |h: &str| json!({"hash": h, "height": 50, "chainId": 0});
+    let blk =
+        |h: &str, n: u64| json!({"cursor": "c", "node": {"hash": h, "height": n, "chainId": 0}});
+    let b51 = || blk("B51", 51);
+    let node = |range: &[&str], canon: Option<&str>, top: Option<u64>| {
+        let mut n = NodeMock {
+            branch_top: top,
+            ..NodeMock::default()
+        };
+        n.headers.insert(
+            (0, 51),
+            vec![json!({"hash": "B51", "height": 51, "chainId": 0})],
+        );
+        n.headers
+            .insert((0, 50), range.iter().map(|h| hd(h)).collect());
+        if let Some(c) = canon {
+            n.canon.insert((0, 50), c.to_string());
+        }
+        n
+    };
+    let run = |n: NodeMock, a: Vec<Value>, b: Vec<Value>| {
+        let dir = dir.path().to_path_buf();
+        async move {
+            let ctx = gql_ctx(n, &dir).await;
+            let mut a = h7_page("blocksFromDepth", false, a);
+            let mut b = h7_page("blocksFromDepth", false, b);
+            let (d, note) = ctx
+                .gql_settle(
+                    &ctx.targets["a"],
+                    &serde_json::Map::new(),
+                    &mut a,
+                    &mut b,
+                    7_000_000,
+                    false,
+                )
+                .await;
+            let row = d.iter().any(|e| e.path == crate::graphql_window::ROW_PATH);
+            (
+                c3_unexplained(&ctx, &d),
+                row,
+                format!("{d:?}"),
+                note.unwrap_or_default(),
+            )
+        }
+    };
+    // An ours-only row in the orphan O50, where the range holds only O50 (the canonical X50
+    // not stored there) or both: not canonical, a diff.
+    for range in [&["O50"][..], &["O50", "X50"][..]] {
+        let (un, row, _, note) = run(
+            node(range, Some("X50"), None),
+            vec![b51(), blk("O50", 50)],
+            vec![b51()],
+        )
+        .await;
+        assert!(!un.is_empty() && row, "{range:?}: {note}");
+        assert!(note.contains("not canonical"), "{range:?}: {note}");
+    }
+    // An oracle-only row in the canonical X50, where the range holds only O50: canonical, so
+    // not an orphan; our list is complete, so a diff.
+    let (un, _, d, note) = run(
+        node(&["O50"], Some("X50"), None),
+        vec![b51()],
+        vec![b51(), blk("X50", 50)],
+    )
+    .await;
+    assert!(!un.is_empty(), "{note}");
+    assert!(!d.contains("orphan"), "{d}");
+    // The neighbour: an oracle-only row in O50 beside the canonical X50 is an orphan.
+    let (un, _, d, note) = run(
+        node(&["X50", "O50"], Some("X50"), None),
+        vec![b51()],
+        vec![b51(), blk("O50", 50)],
+    )
+    .await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    assert!(d.contains("orphan"), "{d}");
+    // Above the cut (the branch ends at 49): no canonical block at 50 yet, so unsettled.
+    let (un, row, _, note) = run(
+        node(&["X50"], None, Some(49)),
+        vec![b51(), blk("X50", 50)],
+        vec![b51()],
+    )
+    .await;
+    assert!(!un.is_empty() && !row, "{note}");
+}
+
+/// R-P5P9-67 m-6: our longer read keeps its `hasNextPage`. A row absent from a read that ours
+/// capped (100 rows, Q10) with a next page is "undecided: our longer read was capped", at
+/// n = 100 and at n = 60; a row within the capped read is still explained.
+#[tokio::test]
+async fn c3_a_row_absent_from_our_capped_longer_read_is_undecided() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x", "r59", "r99"] {
+        let (k, v) = h7_poll(rk, "B941", 941, json!([]));
+        node.polls.insert(k, v);
+    }
+    // Ours' whole list: 59 rows above height 941, then rows at 941 with x at `xAt`.
+    fn full(x_at: usize) -> Vec<Value> {
+        let h = |i: usize| if i < 59 { 1000 - i as u64 } else { 941 };
+        let t = |rk: &str, h: u64| h7_tx(rk, h, &format!("B{h}"), "2024-01-01T10:00:00Z");
+        let mut v: Vec<Value> = (0..x_at).map(|i| t(&format!("r{i}"), h(i))).collect();
+        v.push(t("x", 941));
+        v.extend((x_at..x_at + 10).map(|i| t(&format!("r{i}"), 941)));
+        v
+    }
+    let au = ours_fn_server(|req: &Value| {
+        let x_at: usize = req["variables"]["xAt"].as_str().unwrap().parse().unwrap();
+        let rows = full(x_at);
+        let n = (req["variables"]["first"].as_u64().unwrap_or(0) as usize).min(100);
+        let page: Vec<Value> = rows.iter().take(n).cloned().collect();
+        json!({"data": {"transactions": {"pageInfo": {"hasNextPage": n < rows.len()},
+            "edges": page}}})
+    })
+    .await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let op = h7_op("transactions");
+    for (n, x_at, explained) in [(100, 105, false), (60, 105, false), (60, 80, true)] {
+        let rows = full(x_at);
+        let ours: Vec<Value> = rows.iter().take(n).cloned().collect();
+        // The oracle lists x in place of our last row (canonical: an oracle gap).
+        let mut oracle = ours[..n - 1].to_vec();
+        oracle.push(rows[x_at].clone());
+        let mut a = crate::graphql::Answer {
+            ms: vec![1],
+            ..h7_page("transactions", true, ours)
+        };
+        let mut b = h7_page("transactions", true, oracle);
+        let vars = h7_vars(&[("xAt", json!(x_at.to_string())), ("first", json!(n))]);
+        let (d, note) = ctx
+            .gql_settle_op(
+                &ctx.targets["a"],
+                Some(&op),
+                &vars,
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await;
+        let note = note.unwrap_or_default();
+        let un = c3_unexplained(&ctx, &d);
+        assert_eq!(
+            un.is_empty(),
+            explained,
+            "n {n}, x at {x_at}: {un:?} {note}"
+        );
+        if !explained {
+            assert!(
+                note.contains("undecided: our longer read was capped"),
+                "n {n}: {note}"
+            );
+        }
+    }
 }
