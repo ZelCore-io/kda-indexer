@@ -4406,6 +4406,113 @@ async fn c4_a_250_row_page_over_the_cap_goes_through_the_streamed_path() {
     assert!(row.a.is_some() && row.b.is_none(), "{row:?}");
 }
 
+/// R-P5P9-69 concern 4: a composed `kda_txs_via_cwd` answer over the 32 MiB cap is a
+/// `BodyOverCap` that carries its capture, so the streamed compare hashes the capture and
+/// takes the differing row's copy from it: chainweb-data is composed once per compare, never
+/// twice. Equal rows → `match`; one row ours lacks → `diff` naming the row, with the
+/// composed side's copy only.
+#[tokio::test]
+async fn c4_an_over_cap_composed_kda_txs_via_cwd_answer_is_composed_once_and_streamed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    // 250 transactions of about 140 KB, so that the composed answer passes 32 MiB.
+    let mut rows = v1_rows(250, 140_000);
+    for (i, r) in rows.iter_mut().enumerate() {
+        r["requestKey"] = json!(format!("{i:043}"));
+    }
+    let keys: Vec<Value> = rows
+        .iter()
+        .map(|r| json!({"requestKey": r["requestKey"]}))
+        .collect();
+    let account_calls = Arc::new(AtomicUsize::new(0));
+    let detail_calls = Arc::new(AtomicUsize::new(0));
+    let (ac, dc) = (account_calls.clone(), detail_calls.clone());
+    let details = rows.clone();
+    let app = Router::new()
+        .route(
+            "/txs/account/{a}",
+            get(move || {
+                ac.fetch_add(1, Ordering::SeqCst);
+                let k = keys.clone();
+                async move { Json(k) }
+            }),
+        )
+        .route(
+            "/txs/txs",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                dc.fetch_add(1, Ordering::SeqCst);
+                let found: Vec<Value> = details
+                    .iter()
+                    .filter(|d| d["requestKey"].as_str() == q.get("requestkey").map(String::as_str))
+                    .cloned()
+                    .collect();
+                async move { Json(found) }
+            }),
+        );
+    let (nu, cu) = (node_server(NodeMock::default()).await, serve(app).await);
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let out = dir.path();
+    let path = "/v1/txs/k:big/coin/250";
+    let ctx_for = |a: Vec<u8>| {
+        let (nu, cu, allow) = (nu.clone(), cu.clone(), allow.clone());
+        async move {
+            let au = bytes_server(a).await;
+            let cfg: CompareConfig = toml::from_str(&format!(
+                r#"
+network = "mainnet01"
+rate_rps = 1000.0
+follow_depth = 0
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 60000
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_compat"
+[targets.b]
+url = "{cu}"
+kind = "kda_txs_via_cwd"
+"#
+            ))
+            .unwrap();
+            Ctx::new(cfg).await.unwrap()
+        }
+    };
+    let a = serde_json::to_vec(&rows).unwrap();
+    assert!(
+        a.len() > crate::graphql::MERGED_BYTES_CAP,
+        "{} bytes",
+        a.len()
+    );
+    let ctx = ctx_for(a).await;
+    let o = v1_compare(&ctx, path).await;
+    assert_eq!(o.class, "match", "{:?}", o.record.map(|r| (r.note, r.diff)));
+    assert_eq!(account_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(detail_calls.load(Ordering::SeqCst), 250);
+    // Ours lacks one row: a diff naming it, whose second read is the capture, not a recompose.
+    account_calls.store(0, Ordering::SeqCst);
+    detail_calls.store(0, Ordering::SeqCst);
+    let mut short = rows.clone();
+    let gone = short.remove(100);
+    let ctx = ctx_for(serde_json::to_vec(&short).unwrap()).await;
+    let o = v1_compare(&ctx, path).await;
+    let rec = o.record.expect("a record");
+    assert_eq!(o.class, "diff", "{:?} {:?}", rec.note, rec.diff);
+    let key = gone["requestKey"].as_str().unwrap();
+    let row = rec
+        .diff
+        .iter()
+        .find(|e| e.path == format!("{}/{key}", crate::streamed::ROW_PATH))
+        .expect("the row ours lacks is named");
+    assert!(row.a.is_none() && row.b.is_some(), "{row:?}");
+    assert_eq!(account_calls.load(Ordering::SeqCst), 1, "composed twice");
+    assert_eq!(detail_calls.load(Ordering::SeqCst), 250, "composed twice");
+}
+
 /// R-P5P9-68 (2): an ours-only transaction row is excused only when every `cmd` field it
 /// selects was checked against the node's signed command (one cached `payload_with_outputs`
 /// read per block); a selected field the harness does not check refuses the excuse.
