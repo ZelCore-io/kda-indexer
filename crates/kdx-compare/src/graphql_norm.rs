@@ -15,6 +15,10 @@
 //! - R-P5P9-58 kinds: `oracle_empty`, `count_lower_bound` (leaf rules) and the row rules
 //!   `oracle_orphan_dupes` and `by_key_extra_row` (node-checked, applied before the diff; the
 //!   pure parts are here, the node reads in `graphql.rs`). Each has its own visible hit.
+//! - R-P5P9-60 kinds (rule (a), node = ours): `oracle_strips_quotes` (`cmd.nonce` with inner
+//!   quotes) and `count_self_consistent` (a root count the oracle's own complete list
+//!   contradicts). Decimal text in `result.continuation` and `result.goodResult` uses the
+//!   existing `json_numbers_by_value`. `payload.rollback` has no rule.
 
 use serde_json::Value;
 
@@ -37,6 +41,10 @@ pub const COUNT_LOWER_BOUND_PATH: &str = "/~graphql-r58-count-lower-bound";
 pub const ORPHAN_DUPES_PATH: &str = "/~graphql-r58-oracle-orphan-dupes";
 /// Visible hit of `by_key_extra_row` (allowlist id `graphql-r58-by-key-extra-row`).
 pub const BY_KEY_EXTRA_PATH: &str = "/~graphql-r58-by-key-extra-row";
+/// Visible hit of `oracle_strips_quotes` (allowlist id `graphql-r60-oracle-strips-quotes`).
+pub const STRIPS_QUOTES_PATH: &str = "/~graphql-r60-oracle-strips-quotes";
+/// Visible hit of `count_self_consistent` (allowlist id `graphql-r60-count-self-consistent`).
+pub const COUNT_SELF_CONSISTENT_PATH: &str = "/~graphql-r60-count-self-consistent";
 
 /// Fields typed `Float` or float-valued `Decimal` in the vendored schema
 /// (`crates/kdx-graphql/schema/kadena-graph.graphql`): `FungibleChainAccount.balance`,
@@ -217,10 +225,37 @@ pub fn rule_explains(
         FieldRuleKind::CountLowerBound => {
             lower_bound && matches!((a.as_u64(), b.as_u64()), (Some(x), Some(y)) if x < y)
         }
-        FieldRuleKind::OracleOrphanDupes | FieldRuleKind::ByKeyExtraRow => false,
+        // R-P5P9-60: ours decodes to a string with a `"` in it, and the oracle's is that
+        // string with every `"` removed (it strips them). Nothing else.
+        FieldRuleKind::OracleStripsQuotes => {
+            matches!((a, b), (Value::String(s), Value::String(t))
+                if serde_json::from_str::<String>(s)
+                    .is_ok_and(|u| u.contains('"') && u.replace('"', "") == *t))
+        }
+        // R-P5P9-60 amendment: an f64-rounded oracle decimal against ours, the exact one.
+        FieldRuleKind::OracleF64Rounded => match (a, b) {
+            (Value::String(s), Value::String(t)) if s != t => {
+                match (
+                    decimal_canon(s),
+                    decimal_canon(t),
+                    s.parse::<f64>(),
+                    t.parse::<f64>(),
+                ) {
+                    (Some(x), Some(y), Ok(p), Ok(q)) => {
+                        x != y && p.is_finite() && p == q && x.1.len() >= y.1.len()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        FieldRuleKind::OracleOrphanDupes
+        | FieldRuleKind::ByKeyExtraRow
+        | FieldRuleKind::CountSelfConsistent => false,
     };
     ok.then_some(match r.rule {
         FieldRuleKind::OracleEmpty => ORACLE_EMPTY_PATH,
+        FieldRuleKind::OracleStripsQuotes => STRIPS_QUOTES_PATH,
         FieldRuleKind::CountLowerBound => COUNT_LOWER_BOUND_PATH,
         _ => FIELD_PATH,
     })
@@ -252,6 +287,52 @@ pub fn count_flag_applies(raw: &Value) -> bool {
         count(d, &mut n);
     }
     raw.pointer("/extensions/totalCountLowerBound") == Some(&Value::Bool(true)) && n == 1
+}
+
+/// R-P5P9-60 count self-consistency, on the normalised answers `a` (ours) and `b` (the
+/// oracle's): for each `count_self_consistent` rule `<root>.totalCount`, the oracle's count
+/// takes ours only when neither page is cut (`pageInfo.hasNextPage` false and
+/// `hasPreviousPage` not true on both), the two edge sets match, ours' count equals its own
+/// edge count and the oracle's count is below its own edge count (the refereed direction:
+/// CG-A2's node = ours 4/4 against the oracle's 1). An oracle count above its edges stays a
+/// diff, since ours may be the one that undercounts. Returns whether any count was explained.
+pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> bool {
+    let whole = |c: &Value| {
+        c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(false))
+            && c.pointer("/pageInfo/hasPreviousPage") != Some(&Value::Bool(true))
+    };
+    let edges = |c: &Value| {
+        c.get("edges").and_then(Value::as_array).map(|e| {
+            let mut s: Vec<String> = e.iter().map(Value::to_string).collect();
+            s.sort();
+            s
+        })
+    };
+    let count = |c: &Value| c.get("totalCount").and_then(Value::as_u64);
+    let mut hit = false;
+    for r in rules
+        .iter()
+        .filter(|r| r.rule == FieldRuleKind::CountSelfConsistent)
+    {
+        let Some((root, "totalCount")) = r.field.split_once('.') else {
+            continue;
+        };
+        let ptr = format!("/data/{root}");
+        let (Some(ca), Some(cb)) = (a.pointer(&ptr), b.pointer(&ptr)) else {
+            continue;
+        };
+        let (Some(ea), Some(eb), Some(na), Some(nb)) = (edges(ca), edges(cb), count(ca), count(cb))
+        else {
+            continue;
+        };
+        if whole(ca) && whole(cb) && ea == eb && na == ea.len() as u64 && nb < eb.len() as u64 {
+            if let Some(n) = b.pointer_mut(&format!("{ptr}/totalCount")) {
+                *n = Value::from(na);
+                hit = true;
+            }
+        }
+    }
+    hit
 }
 
 /// The explainer of one oracle pair diff: per-field rules first, then F2 and F7. Returns the
@@ -917,5 +998,261 @@ mod tests {
         assert!(guard_holds(&g, "e7f7130f"));
         assert!(!guard_holds(&g, "251efb06"));
         assert!(!guard_holds(&json!({"fun": "x"}), "e7f7130f"));
+    }
+
+    /// R-P5P9-60 `cmd.nonce` inner quotes: ours decodes to a string with `"` in it and the
+    /// oracle's is it with every `"` removed (CG-2 QTransactionByKey, node = ours 3/3).
+    #[test]
+    fn r60_oracle_strips_quotes_explains_only_the_stripped_nonce() {
+        let r = [rule("cmd.nonce", FieldRuleKind::OracleStripsQuotes)];
+        let e = explain(&r, false);
+        let p = "/data/transaction/cmd/nonce";
+        let s = |x: &str| Value::String(x.into());
+        // The ruled class, both CG-2 shapes.
+        let ours = s(r#""\"2024-07-30T00:14:10.646Z\"""#);
+        assert_eq!(
+            e(p, &ours, &s("2024-07-30T00:14:10.646Z")),
+            Some(STRIPS_QUOTES_PATH)
+        );
+        let ours2 = s(r#""XEDS-\"2022-12-20T13:23:43.670Z\"""#);
+        assert_eq!(
+            e(p, &ours2, &s("XEDS-2022-12-20T13:23:43.670Z")),
+            Some(STRIPS_QUOTES_PATH)
+        );
+        // Neighbours stay diffs: another value once stripped, quotes kept or partly
+        // stripped, ours with no inner quote (that is F5's json_unquote), ours not JSON
+        // encoded, a non-string side, and another field.
+        assert_eq!(e(p, &ours, &s("2024-07-30T00:14:10.647Z")), None);
+        assert_eq!(e(p, &ours, &s(r#""2024-07-30T00:14:10.646Z""#)), None);
+        assert_eq!(e(p, &ours2, &s(r#"XEDS-"2022-12-20T13:23:43.670Z"#)), None);
+        assert_eq!(e(p, &s(r#""abc""#), &s("abc")), None);
+        assert_eq!(e(p, &s(r#"a"b"#), &s("ab")), None);
+        assert_eq!(e(p, &ours, &Value::Null), None);
+        assert_eq!(
+            e(
+                "/data/transaction/hash",
+                &ours,
+                &s("2024-07-30T00:14:10.646Z")
+            ),
+            None
+        );
+        // Never the other way round.
+        assert_eq!(e(p, &s("2024-07-30T00:14:10.646Z"), &ours), None);
+    }
+
+    /// R-P5P9-60 decimal text in `result.continuation` and `result.goodResult` (CG-2
+    /// GetRelatedTransaction and QTransactionByKey): numbers by value, objects as objects;
+    /// `goodResult` keeps its exact `oracle_null` rule too.
+    #[test]
+    fn r60_continuation_and_good_result_numbers_by_value() {
+        let mut good = FieldRule::new("result.goodResult", FieldRuleKind::OracleNull);
+        good.ours = Some("\"\"".into());
+        let r = [
+            rule("result.continuation", FieldRuleKind::JsonNumbersByValue),
+            good,
+            rule("result.goodResult", FieldRuleKind::JsonNumbersByValue),
+        ];
+        let e = explain(&r, false);
+        let s = |x: &str| Value::String(x.into());
+        let cont = "/data/transaction/result/continuation";
+        let ours = s(
+            r#"{"executed":null,"pactId":"7wSC","stepHasRollback":false,"step":0,"yield":{"data":{"amount":5.0e-2,"receiver":"k:08df"}},"continuation":{"args":["k:08df","2",5.0e-2],"def":"coin.transfer-crosschain"},"stepCount":2}"#,
+        );
+        let oracle = s(
+            r#"{"step":0,"yield":{"data":{"receiver":"k:08df","amount":0.05}},"pactId":"7wSC","executed":null,"stepCount":2,"continuation":{"def":"coin.transfer-crosschain","args":["k:08df","2",0.05]},"stepHasRollback":false}"#,
+        );
+        assert_eq!(e(cont, &ours, &oracle), Some(FIELD_PATH));
+        assert_eq!(
+            e(cont, &s(r#"{"a":1.0e-3}"#), &s(r#"{"a":0.001}"#)),
+            Some(FIELD_PATH)
+        );
+        let gr = "/data/transaction/result/goodResult";
+        assert_eq!(
+            e(gr, &s(r#"{"amount":5.0e-2}"#), &s(r#"{"amount":0.05}"#)),
+            Some(FIELD_PATH)
+        );
+        // Both goodResult rules apply: the exact oracle_null one still explains its class.
+        assert_eq!(e(gr, &s("\"\""), &Value::Null), Some(FIELD_PATH));
+        // Neighbours stay diffs: another amount, a key missing, a number against its text,
+        // a step of another value, and another field.
+        assert_eq!(e(cont, &s(r#"{"a":5.0e-2}"#), &s(r#"{"a":0.5}"#)), None);
+        assert_eq!(e(cont, &s(r#"{"a":1,"b":2}"#), &s(r#"{"a":1}"#)), None);
+        assert_eq!(e(cont, &s(r#"{"a":1}"#), &s(r#"{"a":"1"}"#)), None);
+        assert_eq!(e(cont, &s(r#"{"step":0}"#), &s(r#"{"step":1}"#)), None);
+        assert_eq!(e(gr, &s(r#"{"a":1}"#), &Value::Null), None);
+        assert_eq!(
+            e(
+                "/data/transaction/cmd/payload/data",
+                &s(r#"{"a":1.0}"#),
+                &s(r#"{"a":1}"#)
+            ),
+            None
+        );
+    }
+
+    /// R-P5P9-60 Transactions-9e58b95d: the oracle's count contradicts its own complete list.
+    #[test]
+    fn r60_count_self_consistent_only_when_the_oracle_contradicts_its_own_list() {
+        let r = [rule(
+            "transactions.totalCount",
+            FieldRuleKind::CountSelfConsistent,
+        )];
+        let conn = |n: u64, ids: &[&str], next: bool| {
+            let edges: Vec<Value> = ids.iter().map(|i| json!({"node": {"hash": i}})).collect();
+            json!({"data": {"transactions": {"totalCount": n, "edges": edges,
+                "pageInfo": {"hasNextPage": next, "hasPreviousPage": false}}}})
+        };
+        let run = |a: Value, mut b: Value| {
+            let hit = count_self_consistent(&r, &a, &mut b);
+            (hit, b["data"]["transactions"]["totalCount"].clone())
+        };
+        let ids = ["g", "p", "e", "P"];
+        // The CG-2 class: ours 4 of 4 against the oracle's 1 over the same 4 rows (the node
+        // agrees with ours), where the oracle's count is below its own edge count.
+        assert_eq!(
+            run(conn(4, &ids, false), conn(1, &ids, false)),
+            (true, json!(4))
+        );
+        // The oracle's count above its own edges stays a diff (ours may undercount): ours 1 of 1
+        // against the oracle's 3 over the same row, and ours 0 of 0 against the oracle's 0 rows
+        // with a count of 3.
+        assert_eq!(
+            run(conn(1, &["l"], false), conn(3, &["l"], false)),
+            (false, json!(3))
+        );
+        assert_eq!(
+            run(conn(0, &[], false), conn(3, &[], false)),
+            (false, json!(3))
+        );
+        // Neighbours stay: a cut page on either side, other rows, ours' own count off, the
+        // oracle's count matching its rows (then ours is the odd one), and another root.
+        assert_eq!(
+            run(conn(4, &ids, true), conn(1, &ids, false)),
+            (false, json!(1))
+        );
+        assert_eq!(
+            run(conn(4, &ids, false), conn(1, &ids, true)),
+            (false, json!(1))
+        );
+        assert_eq!(
+            run(conn(4, &ids, false), conn(1, &["g", "p", "e", "x"], false)),
+            (false, json!(1))
+        );
+        assert_eq!(
+            run(conn(5, &ids, false), conn(1, &ids, false)),
+            (false, json!(1))
+        );
+        assert_eq!(
+            run(conn(4, &ids[..3], false), conn(4, &ids[..3], false)),
+            (false, json!(4))
+        );
+        let mut prev = conn(1, &ids, false);
+        prev["data"]["transactions"]["pageInfo"]["hasPreviousPage"] = json!(true);
+        assert_eq!(run(conn(4, &ids, false), prev), (false, json!(1)));
+        let mut no_info = conn(1, &ids, false);
+        no_info["data"]["transactions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pageInfo");
+        assert_eq!(run(conn(4, &ids, false), no_info), (false, json!(1)));
+        let other = [rule(
+            "transfers.totalCount",
+            FieldRuleKind::CountSelfConsistent,
+        )];
+        let mut b = conn(1, &ids, false);
+        assert!(!count_self_consistent(
+            &other,
+            &conn(4, &ids, false),
+            &mut b
+        ));
+    }
+
+    /// R-P5P9-60 amendment 1: `signers.clist.args` numbers by value (node = ours 2/2:
+    /// `1e-06`, `1.0`; the oracle `0.000001`, `1`).
+    #[test]
+    fn r60_clist_args_numbers_by_value() {
+        let r = [rule(
+            "signers.clist.args",
+            FieldRuleKind::JsonNumbersByValue,
+        )];
+        let e = explain(&r, false);
+        let p = "/data/transaction/cmd/signers/0/clist/0/args";
+        let s = |x: &str| Value::String(x.into());
+        assert_eq!(
+            e(
+                p,
+                &s(r#"["k:e4f0","k:b51e",1e-06]"#),
+                &s(r#"["k:e4f0","k:b51e",0.000001]"#)
+            ),
+            Some(FIELD_PATH)
+        );
+        assert_eq!(
+            e(
+                p,
+                &s(r#"["cyberfly-account-gas",{"int":1},1.0]"#),
+                &s(r#"["cyberfly-account-gas",{"int":1},1]"#)
+            ),
+            Some(FIELD_PATH)
+        );
+        // Neighbours stay: another amount, a number against its text, another account, an
+        // extra argument, and another field.
+        assert_eq!(e(p, &s(r#"["k:a",1e-06]"#), &s(r#"["k:a",0.00001]"#)), None);
+        assert_eq!(e(p, &s(r#"["k:a",1.0]"#), &s(r#"["k:a","1"]"#)), None);
+        assert_eq!(e(p, &s(r#"["k:a",1.0]"#), &s(r#"["k:b",1]"#)), None);
+        assert_eq!(e(p, &s(r#"["k:a",1.0]"#), &s(r#"["k:a",1,2]"#)), None);
+        let other = "/data/transaction/cmd/signers/0/clist/0/name";
+        assert_eq!(e(other, &s("[1.0]"), &s("[1]")), None);
+    }
+
+    /// R-P5P9-60 amendment 2: `transfers.amount`, the oracle's f64-rounded string against
+    /// ours, the exact Pact decimal.
+    #[test]
+    fn r60_transfer_amount_f64_rounded_only() {
+        let r = [rule("transfers.amount", FieldRuleKind::OracleF64Rounded)];
+        let e = explain(&r, false);
+        let p = "/data/transfers/edges/0/node/amount";
+        let s = |x: &str| Value::String(x.into());
+        // The ruled class: same f64, ours the longer exact decimal.
+        assert_eq!(
+            e(p, &s("123456789.123456789012"), &s("123456789.12345679")),
+            Some(FIELD_PATH)
+        );
+        assert_eq!(
+            e(p, &s("540796.439262685228"), &s("540796.4392626852")),
+            Some(FIELD_PATH)
+        );
+        // Equal values in another text form (trailing zeros) are a format diff, not rounding.
+        assert_eq!(e(p, &s("1.0"), &s("1")), None);
+        assert_eq!(e(p, &s("1"), &s("1.0")), None);
+        assert_eq!(e(p, &s("2.50"), &s("2.5")), None);
+        assert_eq!(e(p, &s("2.5"), &s("2.50")), None);
+        // A real 1-unit-in-the-last-place difference on a small amount stays a diff.
+        assert_eq!(e(p, &s("1.000000000001"), &s("1.000000000002")), None);
+        assert_eq!(e(p, &s("0.000001"), &s("0.000002")), None);
+        // A difference above f64 precision, the oracle with more digits than ours, a
+        // non-numeric string, a number against a string, and another field stay diffs.
+        assert_eq!(
+            e(p, &s("123456789.123456789012"), &s("123456789.1234566")),
+            None
+        );
+        assert_eq!(
+            e(p, &s("123456789.12345679"), &s("123456789.123456789012")),
+            None
+        );
+        assert_eq!(e(p, &s("1.5x"), &s("1.5")), None);
+        assert_eq!(e(p, &s("NaN"), &s("NaN ")), None);
+        assert_eq!(
+            e(p, &s("123456789.123456789012"), &json!(123456789.12345679)),
+            None
+        );
+        let other = "/data/transfers/edges/0/node/creationTime";
+        assert_eq!(
+            e(
+                other,
+                &s("123456789.123456789012"),
+                &s("123456789.12345679")
+            ),
+            None
+        );
     }
 }

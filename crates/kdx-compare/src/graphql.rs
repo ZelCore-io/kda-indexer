@@ -56,6 +56,8 @@ const SAMPLES_PER_BLOCK: usize = 3;
 const ROW_RULE_CHECKS: usize = 3;
 /// Summary route of the row rules' and the skew check's own reads.
 const ROW_RULE_ROUTE: &str = "graphql-row-rule";
+/// Summary route of the harness's own nested-list reads (R-P5P9-60 H2).
+const SCOPED_LIST_ROUTE: &str = "graphql-scoped-list";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
@@ -288,9 +290,11 @@ pub fn load_dir(dir: &Path, captured: bool, skip: &[String]) -> anyhow::Result<V
 }
 
 /// Our `transaction` (`t`) and the node's poll answer `p` for the sampled `s`, as the two
-/// documents the `NodeTx` pair diffs. `signers` carries the scheme per signer (a string, or
-/// null when absent): the node's command is the referee of `signers.scheme`, so a scheme
-/// present there must match and an absent one must be null in ours (R1).
+/// documents the `NodeTx` pair diffs. `signers` carries the scheme per signer: the node's
+/// command is the referee of `signers.scheme`, so a scheme present there must match (R1).
+/// An absent (or null) node scheme stands for the ruled form `""` (F8 rule (b); R-P5P9-60
+/// H1), so ours must be exactly `""`: ours null or a value against it, and ours `""` against
+/// a present scheme, stay diffs.
 fn node_tx_views(t: &Value, p: &Value, s: &Sample) -> (Value, Value) {
     let ok = p.pointer("/result/status").and_then(Value::as_str) == Some("success");
     let mut got = json!({
@@ -314,22 +318,22 @@ fn node_tx_views(t: &Value, p: &Value, s: &Sample) -> (Value, Value) {
         "failed": !ok,
     });
     if let Some(node) = s.signers.as_array() {
-        let schemes = |v: &[Value]| -> Value {
-            v.iter()
-                .map(|x| {
-                    x.get("scheme")
-                        .filter(|v| !v.is_null())
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                })
-                .collect()
-        };
         let ours = t
             .pointer("/cmd/signers")
             .and_then(Value::as_array)
-            .map_or(Value::Null, |v| schemes(v));
+            .map_or(Value::Null, |v| {
+                v.iter()
+                    .map(|x| x.get("scheme").cloned().unwrap_or(Value::Null))
+                    .collect()
+            });
         got["signers"] = ours;
-        want["signers"] = schemes(node);
+        want["signers"] = node
+            .iter()
+            .map(|x| match x.get("scheme") {
+                Some(v) if !v.is_null() => v.clone(),
+                _ => json!(""),
+            })
+            .collect();
     }
     (got, want)
 }
@@ -801,6 +805,21 @@ pub fn compare_answers(
     cap: u64,
     rules: &[FieldRule],
 ) -> Vec<DiffEntry> {
+    compare_answers_with(a, b, max, cap, rules, false)
+}
+
+/// [`compare_answers`]; `root_scoped`: the root list is bounded by one block or one tx
+/// (R-P5P9-60 H2, [`crate::graphql_scope::root_scoped`]), so it compares as a set and is never
+/// cut to a common prefix (a list still cut after paging stays a diff). Nested block and tx
+/// lists always compare as sets.
+pub fn compare_answers_with(
+    a: &mut Answer,
+    b: &mut Answer,
+    max: u64,
+    cap: u64,
+    rules: &[FieldRule],
+    root_scoped: bool,
+) -> Vec<DiffEntry> {
     let mut hits: Vec<DiffEntry> = Vec::new();
     let hit = |p: &str| DiffEntry {
         path: p.into(),
@@ -817,7 +836,7 @@ pub fn compare_answers(
     // Pages cut at a different size: compare the common prefix.
     if let (Some(da), Some(db)) = (a.body.get_mut("data"), b.body.get_mut("data")) {
         let (la, lb) = (edges_len(da), edges_len(db));
-        if la != lb {
+        if la != lb && !root_scoped {
             let (more_a, more_b) = (has_next(da), has_next(db));
             if (la < lb && more_a) || (lb < la && more_b) {
                 truncate_edges(da, la.min(lb));
@@ -834,6 +853,22 @@ pub fn compare_answers(
     let (mut na, mut nb) = (a.body.clone(), b.body.clone());
     normalize_gql(&mut na, cap);
     normalize_gql(&mut nb, cap);
+    // R-P5P9-60 H2: lists bounded by one block or one tx compare as sets.
+    for v in [&mut na, &mut nb] {
+        for l in crate::graphql_scope::scoped_lists(v) {
+            if let Some(c) = v.pointer_mut(&l.pointer) {
+                crate::graphql_scope::sort_as_set(c);
+            }
+        }
+        if root_scoped {
+            if let Some(c) = v.get_mut("data").and_then(root_connection) {
+                crate::graphql_scope::sort_as_set(c);
+            }
+        }
+    }
+    if crate::graphql_norm::count_self_consistent(rules, &na, &mut nb) {
+        hits.push(hit(crate::graphql_norm::COUNT_SELF_CONSISTENT_PATH));
+    }
     if let (Some(da), Some(db)) = (na.get_mut("data"), nb.get_mut("data")) {
         if let (Some(ca), Some(cb)) = (root_connection(da), root_connection(db)) {
             if crate::graphql_norm::cut_trailing_ties(ca, cb) {
@@ -865,8 +900,10 @@ pub async fn fetch_pages(
     ms.push(cap.ms);
     let status = cap.status;
     let raw = trim_body(&cap.body);
-    let mut merged: Value = serde_json::from_slice(&cap.body)
-        .with_context(|| format!("{}: HTTP {status}, body is not JSON: {raw}", t.name))?;
+    let mut merged: Value = serde_json::from_slice(&cap.body).with_context(|| {
+        let head = crate::report::trim_escaped(&raw, crate::report::SHORT_TRIM);
+        format!("{}: HTTP {status}, body is not JSON: {head}", t.name)
+    })?;
     let can_page = op.has_var("after") && vars.get("first").is_some_and(|f| !f.is_null());
     let mut pages = 1;
     while can_page && pages <= depth && merged.get("data").is_some_and(|d| !d.is_null()) {
@@ -903,6 +940,12 @@ pub async fn fetch_pages(
         }
         pages += 1;
     }
+    // A paged answer is recorded as merged (R-P5P9-60 H3): the diff paths index into it.
+    let raw = if pages > 1 {
+        trim_body(merged.to_string().as_bytes())
+    } else {
+        raw
+    };
     Ok(Answer {
         body: merged,
         status,
@@ -1192,7 +1235,16 @@ impl Ctx {
         vars: &Map<String, Value>,
         max: u64,
     ) -> Outcome {
-        let depth = self.cfg.follow_depth;
+        // R-P5P9-60 H2: a root list of one block or one tx is paged to its end (at most
+        // `MAX_PAGES` pages per side, each at its own target's rate).
+        let root_scoped = crate::graphql_scope::root_scoped(&op.roots, vars);
+        let depth = if root_scoped {
+            self.cfg
+                .follow_depth
+                .max(crate::graphql_scope::MAX_PAGES as u32 - 1)
+        } else {
+            self.cfg.follow_depth
+        };
         let mut a = match self.gql_fetch(ta, op, vars, depth).await {
             Ok(a) => a,
             Err(e) => return self.gql_a_error(op, vars, ta, &tb.name, &format!("{e:#}")),
@@ -1244,13 +1296,21 @@ impl Ctx {
                 Some("oracle server error".into()),
             );
         }
-        let row_hits = self.gql_row_rules(ta, vars, &mut a, &mut b).await;
-        let mut d = compare_answers(
+        let mut row_hits = self.gql_row_rules(ta, vars, &mut a, &mut b).await;
+        if self
+            .gql_finish_lists(op, vars, ta, tb, &mut a, &mut b)
+            .await
+            > 0
+        {
+            row_hits.push(crate::graphql_scope::SCOPED_FINISHED_PATH);
+        }
+        let mut d = compare_answers_with(
             &mut a,
             &mut b,
             max,
             self.cfg.graphql.total_count_cap,
             &self.cfg.graphql.field_rules,
+            root_scoped,
         );
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
             path: p.into(),
@@ -1259,6 +1319,132 @@ impl Ctx {
             b: None,
         }));
         self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d)
+    }
+
+    /// R-P5P9-60 H2: the nested block and tx lists of an oracle pair whose page is cut on
+    /// either side are read to their end on both sides (the harness's own list query, at
+    /// each target's own rate, at most `MAX_PAGES` pages per side) and stand in for the page
+    /// when each side's page is a part of its own full list. At most `MAX_LISTS` lists are
+    /// tried per compare; a list not finished is left as it was (its diff stays). Returns
+    /// how many lists were finished.
+    pub(crate) async fn gql_finish_lists(
+        &self,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        ta: &Target,
+        tb: &Target,
+        a: &mut Answer,
+        b: &mut Answer,
+    ) -> usize {
+        use crate::graphql_scope::{
+            finish_ok, hash_query, is_cut, list_query, put_hashes, scoped_lists, take_hashes,
+            MAX_LISTS,
+        };
+        // A cut list under a root block list that selects no hash: one read of the root's
+        // block hashes per side, put in for the lists' parents and taken out after.
+        let unknown = |v: &Value| {
+            scoped_lists(v).into_iter().find_map(|l| {
+                let cut = v.pointer(&l.pointer).is_some_and(is_cut);
+                (cut && l.parent.is_none() && l.doc_path.len() == 4).then(|| l.doc_path[0].clone())
+            })
+        };
+        let mut put: [Vec<String>; 2] = Default::default();
+        if let Some(root) = unknown(&a.body).or_else(|| unknown(&b.body)) {
+            if let Some(q) = hash_query(&op.query, &root) {
+                let vars = Value::Object(vars.clone());
+                if let (Some(ha), Some(hb)) = (
+                    self.gql_read(ta, &q, vars.clone()).await,
+                    self.gql_read(tb, &q, vars).await,
+                ) {
+                    let wrap = |d: Value| json!({ "data": d });
+                    put = [
+                        put_hashes(&mut a.body, &root, &wrap(ha)),
+                        put_hashes(&mut b.body, &root, &wrap(hb)),
+                    ];
+                }
+            }
+        }
+        let (la, lb) = (scoped_lists(&a.body), scoped_lists(&b.body));
+        let (mut tried, mut done) = (0, 0);
+        for l in la.iter().filter(|l| lb.contains(l)) {
+            let (Some(ca), Some(cb)) = (a.body.pointer(&l.pointer), b.body.pointer(&l.pointer))
+            else {
+                continue;
+            };
+            if !is_cut(ca) && !is_cut(cb) {
+                continue;
+            }
+            let Some((q, vars, at)) = list_query(&op.query, l) else {
+                continue;
+            };
+            if tried == MAX_LISTS {
+                break;
+            }
+            tried += 1;
+            let Some(fa) = self.gql_read_list(ta, &q, &vars, at).await else {
+                continue;
+            };
+            let Some(fb) = self.gql_read_list(tb, &q, &vars, at).await else {
+                continue;
+            };
+            if !finish_ok(ca, &fa) || !finish_ok(cb, &fb) {
+                continue;
+            }
+            for (ans, full) in [(&mut *a, fa), (&mut *b, fb)] {
+                if let Some(c) = ans.body.pointer_mut(&l.pointer) {
+                    c["edges"] = Value::Array(full);
+                }
+            }
+            done += 1;
+        }
+        take_hashes(&mut a.body, &put[0]);
+        take_hashes(&mut b.body, &put[1]);
+        // The record shows the finished lists (H3): the diff paths index into them.
+        if done > 0 {
+            for ans in [a, b] {
+                ans.raw = trim_body(ans.body.to_string().as_bytes());
+            }
+        }
+        done
+    }
+
+    /// One side's whole nested list through the harness's list query (`at`: the list in its
+    /// answer), as edges `{node}`; `None` on any error or past `MAX_PAGES` pages.
+    async fn gql_read_list(
+        &self,
+        t: &Target,
+        query: &str,
+        vars: &Value,
+        at: &str,
+    ) -> Option<Vec<Value>> {
+        let mut vars = vars.clone();
+        let mut out = Vec::new();
+        for _ in 0..crate::graphql_scope::MAX_PAGES {
+            let c = t
+                .post_json(&json!({ "query": query, "variables": vars }))
+                .await
+                .ok()?;
+            self.gql_count(SCOPED_LIST_ROUTE, &t.name, &[c.ms]);
+            if c.status != 200 {
+                return None;
+            }
+            let v: Value = serde_json::from_slice(&c.body).ok()?;
+            if v.get("errors")
+                .and_then(Value::as_array)
+                .is_some_and(|e| !e.is_empty())
+            {
+                return None;
+            }
+            let conn = v.pointer(at)?;
+            for e in conn.get("edges")?.as_array()? {
+                out.push(json!({ "node": e.get("node")? }));
+            }
+            if !conn.pointer("/pageInfo/hasNextPage")?.as_bool()? {
+                return Some(out);
+            }
+            vars["after"] = conn.pointer("/pageInfo/endCursor")?.clone();
+        }
+        None
     }
 
     /// The shared `/local` client of the GraphQL node reads.
@@ -2641,11 +2827,24 @@ mod tests {
         assert!(x.is_empty(), "{x:?}");
         assert!(!d(&present, ours(json!([{"scheme": "ED25519"}]))).is_empty());
         assert!(!d(&present, ours(json!([{"scheme": null}]))).is_empty());
-        // The node's scheme absent: ours must be null, never a value (nor "").
+        // R-P5P9-60 H1: the node's scheme absent (or null) equals ours "" (the F8 form) ...
         let absent = s(json!([{"pubKey": "ab"}]));
-        assert!(d(&absent, ours(json!([{"scheme": null}]))).is_empty());
+        let x = d(&absent, ours(json!([{"scheme": ""}])));
+        assert!(x.is_empty(), "{x:?}");
+        let null = s(json!([{"pubKey": "ab", "scheme": null}]));
+        assert!(d(&null, ours(json!([{"scheme": ""}]))).is_empty());
+        // ... and no other pair: ours non-empty or null against absent, ours "" against a
+        // present scheme.
         assert!(!d(&absent, ours(json!([{"scheme": "ED25519"}]))).is_empty());
-        assert!(!d(&absent, ours(json!([{"scheme": ""}]))).is_empty());
+        assert!(!d(&absent, ours(json!([{"scheme": null}]))).is_empty());
+        assert!(!d(&absent, ours(json!([{}]))).is_empty());
+        assert!(!d(&present, ours(json!([{"scheme": ""}]))).is_empty());
+        let ed = s(json!([{"pubKey": "ab", "scheme": "ED25519"}]));
+        assert!(!d(&ed, ours(json!([{"scheme": ""}]))).is_empty());
+        // One signer of two off is still a diff.
+        let two = s(json!([{"pubKey": "ab"}, {"pubKey": "cd", "scheme": "WebAuthn"}]));
+        assert!(d(&two, ours(json!([{"scheme": ""}, {"scheme": "WebAuthn"}]))).is_empty());
+        assert!(!d(&two, ours(json!([{"scheme": ""}, {"scheme": ""}]))).is_empty());
     }
 
     #[test]
@@ -2828,9 +3027,11 @@ mod tests {
             b: None,
         };
         use crate::graphql_norm::{
-            BY_KEY_EXTRA_PATH, COUNT_LOWER_BOUND_PATH, F2_PATH, F7_PATH, FIELD_PATH,
-            ORACLE_EMPTY_PATH, ORPHAN_DUPES_PATH, TIE_CUT_PATH,
+            BY_KEY_EXTRA_PATH, COUNT_LOWER_BOUND_PATH, COUNT_SELF_CONSISTENT_PATH, F2_PATH,
+            F7_PATH, FIELD_PATH, ORACLE_EMPTY_PATH, ORPHAN_DUPES_PATH, STRIPS_QUOTES_PATH,
+            TIE_CUT_PATH,
         };
+        use crate::graphql_scope::SCOPED_FINISHED_PATH;
         let hits = [
             PAGE_CUT_PATH,
             TOTALCOUNT_CAP_PATH,
@@ -2843,12 +3044,18 @@ mod tests {
             COUNT_LOWER_BOUND_PATH,
             ORPHAN_DUPES_PATH,
             BY_KEY_EXTRA_PATH,
+            STRIPS_QUOTES_PATH,
+            COUNT_SELF_CONSISTENT_PATH,
+            SCOPED_FINISHED_PATH,
         ]
         .map(|p| entry(p, DiffKind::Changed));
         let (un, ids) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &hits);
         assert!(un.is_empty(), "{un:?}");
-        assert_eq!(ids.len(), 11);
+        assert_eq!(ids.len(), 14);
         for id in [
+            "graphql-r60-oracle-strips-quotes",
+            "graphql-r60-count-self-consistent",
+            "graphql-r60-scoped-list",
             "graphql-r58-oracle-empty",
             "graphql-r58-count-lower-bound",
             "graphql-r58-oracle-orphan-dupes",
@@ -2860,6 +3067,107 @@ mod tests {
         let real = [entry("/data/block/hash", DiffKind::Changed)];
         let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &real);
         assert_eq!(un.len(), 1);
+    }
+
+    /// R-P5P9-60 H2 in the compare: nested block and tx lists, and a root list of one block
+    /// or tx, compare as sets; a root list of one block is never cut to a common prefix, so a
+    /// page still cut after paging stays a diff; an account list keeps its order.
+    #[test]
+    fn h2_block_and_tx_lists_compare_as_sets() {
+        let ans = |body: Value| Answer {
+            body,
+            status: 200,
+            raw: String::new(),
+            ms: Vec::new(),
+        };
+        let rows = |ids: &[&str]| -> Vec<Value> {
+            ids.iter().map(|i| json!({"node": {"id": i}})).collect()
+        };
+        let cmp = |a: Value, b: Value, scoped: bool| {
+            compare_answers_with(&mut ans(a), &mut ans(b), u64::MAX, 10_000, &[], scoped)
+        };
+        // QBlock events in another order (CG-2: ours orderIndex 3,2,1,0, the oracle 0..3).
+        let block = |ids: &[&str]| {
+            json!({"data": {"block": {"hash": "B",
+            "events": {"totalCount": 4, "edges": rows(ids)}}}})
+        };
+        assert!(cmp(
+            block(&["3", "2", "1", "0"]),
+            block(&["0", "1", "2", "3"]),
+            false
+        )
+        .is_empty());
+        // ... but a row of another id is a diff.
+        assert!(!cmp(
+            block(&["3", "2", "1", "0"]),
+            block(&["0", "1", "2", "4"]),
+            false
+        )
+        .is_empty());
+        // A tx's transfers (QTransactionByKey, nested under result).
+        let tx = |ids: &[&str]| {
+            json!({"data": {"transaction": {"hash": "R",
+            "result": {"transfers": {"edges": rows(ids)}}}}})
+        };
+        assert!(cmp(tx(&["4", "0"]), tx(&["0", "4"]), false).is_empty());
+        // A root list of one block (QTransactionsByBlock): a set when scoped ...
+        let root = |ids: &[&str], next: bool| {
+            json!({"data": {"transactions": {
+            "edges": rows(ids), "pageInfo": {"hasNextPage": next}}}})
+        };
+        assert!(cmp(root(&["b", "a"], false), root(&["a", "b"], false), true).is_empty());
+        // ... and a page still cut after paging is not cut to the common prefix.
+        let d = cmp(root(&["a", "b", "c"], false), root(&["a", "b"], true), true);
+        assert!(
+            d.iter().any(|e| e.path.starts_with("/data/transactions")),
+            "{d:?}"
+        );
+        assert!(d.iter().all(|e| e.path != PAGE_CUT_PATH));
+        // An account-scoped root list is not scoped: order differences across rows stay.
+        let acct = |ids: &[(&str, u32)]| {
+            json!({"data": {"transfers": {"edges": ids.iter()
+            .map(|(i, h)| json!({"node": {"id": i, "height": h}})).collect::<Vec<_>>(),
+            "pageInfo": {"hasNextPage": false}}}})
+        };
+        // The same (id, height) rows in two orders: a set compare would call them equal.
+        assert!(!cmp(
+            acct(&[("a", 1), ("b", 0)]),
+            acct(&[("b", 0), ("a", 1)]),
+            false
+        )
+        .is_empty());
+        // The count rule's visible hit through the compare.
+        let r = [FieldRule::new(
+            "transactions.totalCount",
+            FieldRuleKind::CountSelfConsistent,
+        )];
+        let counted = |n: u64, ids: &[&str]| {
+            json!({"data": {"transactions": {"totalCount": n,
+            "edges": rows(ids), "pageInfo": {"hasNextPage": false}}}})
+        };
+        // The oracle's count below its own edges (ours 4 of 4): explained.
+        let ids = ["a", "b", "c", "d"];
+        let d = compare_answers(
+            &mut ans(counted(4, &ids)),
+            &mut ans(counted(1, &ids)),
+            u64::MAX,
+            10_000,
+            &r,
+        );
+        let paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, [crate::graphql_norm::COUNT_SELF_CONSISTENT_PATH]);
+        // The oracle's count above its own edges (ours 1 of 1 against 3) stays a diff.
+        let d = compare_answers(
+            &mut ans(counted(1, &["a"])),
+            &mut ans(counted(3, &["a"])),
+            u64::MAX,
+            10_000,
+            &r,
+        );
+        assert!(
+            d.iter().any(|e| e.path == "/data/transactions/totalCount"),
+            "{d:?}"
+        );
     }
 
     #[test]
