@@ -111,9 +111,11 @@ read slots (half the read threads). Each client key (an IPv4 address or an IPv6 
 rate limiter keys it) holds at most one of them. Up to 3 more of its heavy reads wait behind
 that one. Past that, one is refused at once with `LIMIT`. One page scans for at most 1 s; a
 sparse or empty match then ends with `TIMEOUT`: narrow the filter. A connection nested in one
-block (`Block.transactions`, `Block.events`) is not a heavy read: it reads only that block, by
-key, on a plain read slot, so one request over many blocks gets every block's page
-(R-P5P9-60). A transaction's own `events` and `transfers` read nothing; they page the
+block (`Block.transactions`, `Block.events`), and the root `transactions`, `events` and
+`transfers` with a `blockHash` (and no `requestKey`), are not heavy reads: each reads only that
+block, by key, on a plain read slot, so one request over many blocks gets every block's page
+(R-P5P9-60). `minimumDepth` (it reads the chain tips) and, on `transfers`, a selected
+`crossChainTransfer` (it reads the pact's other chain) keep the heavy read for that call. A transaction's own `events` and `transfers` read nothing; they page the
 transaction already loaded.
 
 Complexity: each field costs 1 (`__typename` 0). A field that returns a page multiplies the

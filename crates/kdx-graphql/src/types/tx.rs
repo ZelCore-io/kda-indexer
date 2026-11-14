@@ -24,8 +24,8 @@ use crate::gql;
 use crate::ids::{encode, NodeKey};
 use crate::scalars::{BigInt, DateTime, FloatText};
 use crate::txlist::{
-    block_node, chain_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx, Blocks, Item,
-    KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
+    block_list, block_node, chain_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx,
+    Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
 };
 
 /// A user transaction (coinbase txs are not listed as transactions, as in Kadena graph).
@@ -584,7 +584,7 @@ pub async fn query_transactions(
         request_key.as_deref(),
     )?;
     let (edges, page_info, total) =
-        txs(list(ctx, spec, PageArgs::new(after, before, first, last)).await?);
+        txs(block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?);
     Ok(QueryTransactionsConnection {
         edges: edges
             .into_iter()
@@ -662,7 +662,7 @@ pub async fn query_transfers(
             nft,
         },
     };
-    let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
+    let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
     Ok(QueryTransfersConnection {
         edges: p
             .edges
@@ -750,7 +750,7 @@ pub async fn query_events(
             params,
         },
     };
-    let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
+    let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
     Ok(QueryEventsConnection {
         edges: p
             .edges

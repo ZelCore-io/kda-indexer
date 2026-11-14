@@ -11,8 +11,9 @@
 //! - One page is one store read (GQ-5): the records, their blocks, outputs and, when the
 //!   operation selects it, the other half of each cross-chain transfer are loaded in that
 //!   read; nested fields then answer from owned data. No `View` crosses an `.await`. A list
-//!   is a heavy read (`ApiState::read_heavy`, H-1), except a connection nested in one block
-//!   ([`block_list`], R-P5P9-60 D1), which reads that block by key on a plain read slot.
+//!   is a heavy read (`ApiState::read_heavy`, H-1), except a list of one block
+//!   ([`block_list`], R-P5P9-60 D1): nested in the block or a root list with `blockHash`,
+//!   which reads that block by key on a plain read slot.
 //! - `first`/`after` walks newest first. `last`/`before` first collects the keys between the
 //!   cursor and the newest end (keys only, at most [`BACK_KEYS`]), then loads from the cursor
 //!   outward. Both check the request deadline every 64 keys.
@@ -918,21 +919,23 @@ pub async fn list(
     list_as(ctx, spec, args, false).await
 }
 
-/// `list` for a connection nested in one block (`Block.transactions`, `Block.events`;
-/// R-P5P9-60 D1): a plain read, not a per-client heavy one, so one request over many blocks
-/// gets every block's page. Such a page reads only its own block, by key: the block's
-/// location by hash, the block's txs (`block_txs` at that chain and height), the cursor's
-/// block fingerprint, and each tx's block record and output; its `totalCount` walks the same
-/// txs. A spec that could read past its block (another source, a `minimumDepth` filter, or
-/// `crossChainTransfer` lookups) stays a heavy read.
+/// `list` for a list of one block: a connection nested in it (`Block.transactions`,
+/// `Block.events`; R-P5P9-60 D1) or a root list with `blockHash` and no `requestKey`
+/// (`transactions`, `events`, `transfers`; R-P5P9-60 round 2). A plain read, not a per-client
+/// heavy one, so one request over many blocks gets every block's page. Such a page reads only
+/// its own block, by key: the block's location by hash, the block's txs (`block_txs` at that
+/// chain and height; `chainId`, `minHeight` and `maxHeight` only filter those keys in memory),
+/// the cursor's block fingerprint, and each tx's block record and output; its `totalCount`
+/// walks the same txs. Anything that could read past the block stays a heavy read: another
+/// source (an account, a posting, a height walk, a request key, which wins over `blockHash`),
+/// a `minimumDepth` filter (it reads the chain tips), and, for transfers, a selected
+/// `crossChainTransfer` (it reads the pact's other chain).
 pub async fn block_list(
     ctx: &Context<'_>,
     spec: ListSpec,
     args: PageArgs,
 ) -> async_graphql::Result<ListPage> {
-    let one_block = matches!(spec.source, SourceSpec::Block(_))
-        && spec.filter.depth.is_none()
-        && !matches!(spec.rows, Rows::Transfers { .. });
+    let one_block = matches!(spec.source, SourceSpec::Block(_)) && spec.filter.depth.is_none();
     list_as(ctx, spec, args, one_block).await
 }
 
@@ -962,6 +965,8 @@ async fn list_as(
     let xchain = matches!(spec.rows, Rows::Transfers { nft: false, .. })
         && selects(ctx, "crossChainTransfer");
     let budget = xchain_budget(ctx);
+    // A `crossChainTransfer` lookup reads the pact's other chain: past one block.
+    let one_block = one_block && !xchain;
     // The page is read only when its items or page info are selected.
     let reads = selects_direct(ctx, &["edges", "pageInfo"]);
     // A block's or a request key's rows are few: counted with the page, exactly.

@@ -715,6 +715,117 @@ mod walk_tests {
         assert!(refused > 0 && refused <= most, "{refused}: {v}");
     }
 
+    /// D1 round 2 (R-P5P9-60, C2-P7S concern 3): the root lists of one block
+    /// (`transactions`, `events`, `transfers` with `blockHash`) take no per-client heavy ticket
+    /// either: 5 concurrent requests of one client all answer, and so do 20 aliases in one.
+    /// What can read past the block keeps the ticket for that call: `minimumDepth`, and a
+    /// selected `crossChainTransfer`. An account-scoped root list is H-1 as before.
+    #[tokio::test]
+    async fn root_block_lists_take_no_heavy_ticket() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let f = testutil::store();
+        f.apply(0, 10, 0);
+        let client: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        let post = |q: String| {
+            let app = crate::router(crate::build_schema(
+                f.st.clone(),
+                crate::GraphqlSettings::default(),
+                None,
+            ))
+            .with_state(f.st.clone());
+            let req = Request::post("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({ "query": q }).to_string()))
+                .unwrap();
+            async move {
+                let resp = kdx_api::server::as_client(client, app.oneshot(req))
+                    .await
+                    .unwrap();
+                let b = axum::body::to_bytes(resp.into_body(), 8 << 20)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+            }
+        };
+        let limits = |v: &serde_json::Value| {
+            v["errors"].as_array().map_or(0, |es| {
+                es.iter()
+                    .filter(|e| e["extensions"]["code"] == "LIMIT")
+                    .count()
+            })
+        };
+        let v = post(
+            "{ blocksFromHeight(startHeight: 10, endHeight: 10, chainIds: [\"0\"], first: 1) \
+               { edges { node { hash } } } }"
+                .into(),
+        )
+        .await;
+        let hash = v["data"]["blocksFromHeight"]["edges"][0]["node"]["hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_owned();
+        // 5 concurrent requests of one client, each a root `transactions(blockHash:)`.
+        let q =
+            format!("{{ transactions(blockHash: \"{hash}\", first: 5) {{ edges {{ cursor }} }} }}");
+        let rs = tokio::join!(
+            post(q.clone()),
+            post(q.clone()),
+            post(q.clone()),
+            post(q.clone()),
+            post(q.clone())
+        );
+        for v in [&rs.0, &rs.1, &rs.2, &rs.3, &rs.4] {
+            assert_eq!(limits(v), 0, "{v}");
+            assert!(v["errors"].is_null(), "{v}");
+            assert_eq!(v["data"]["transactions"]["edges"], serde_json::json!([]));
+        }
+        // 20 aliases of the three root lists in one request.
+        let sel = |name: &str, i: usize, extra: &str| {
+            format!(
+                "{name}{i}: {name}(blockHash: \"{hash}\", first: 1{extra}) {{ edges {{ cursor }} }} "
+            )
+        };
+        let all: String = (0..20)
+            .map(|i| match i % 3 {
+                0 => sel("transactions", i, ""),
+                1 => sel("transfers", i, ""),
+                _ => sel("events", i, ", qualifiedEventName: \"coin.TRANSFER\""),
+            })
+            .collect();
+        let v = post(format!("{{ {all} }}")).await;
+        assert_eq!(limits(&v), 0, "{v}");
+        assert!(v["errors"].is_null(), "{v}");
+        // `minimumDepth` reads the chain tips: it keeps the heavy ticket.
+        let deep: String = (0..20)
+            .map(|i| sel("transactions", i, ", minimumDepth: 0"))
+            .collect();
+        let v = post(format!("{{ {deep} }}")).await;
+        assert!(limits(&v) > 0, "{v}");
+        // A selected `crossChainTransfer` reads the pact's other chain: it keeps the ticket.
+        let xc: String = (0..20)
+            .map(|i| {
+                format!(
+                    "x{i}: transfers(blockHash: \"{hash}\", first: 1) {{ edges {{ node {{ crossChainTransfer {{ amount }} }} }} }} "
+                )
+            })
+            .collect();
+        let v = post(format!("{{ {xc} }}")).await;
+        assert!(limits(&v) > 0, "{v}");
+        // The account-scoped root list is H-1 as before.
+        let acct: String = (0..20)
+            .map(|i| {
+                format!(
+                    "a{i}: transactions(accountName: \"k:a\", first: 1) {{ edges {{ cursor }} }} "
+                )
+            })
+            .collect();
+        let v = post(format!("{{ {acct} }}")).await;
+        assert!(limits(&v) > 0, "{v}");
+    }
+
     /// R-P5P9-57 M2a: `blocksFromHeight` lists heights ascending (the oracle's order),
     /// chains ascending within a height, and pages both ways in that order;
     /// `blocksFromDepth` stays newest first.
