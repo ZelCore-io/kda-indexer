@@ -944,17 +944,18 @@ impl Ctx {
             }
         }
         // kda-txs can stop one row short of the limit (seen live: limit 250, 250 rows on A,
-        // 249 on kda-txs, A's extra row the oldest). When one side holds `limit` rows and the
-        // counts differ, both sides keep the rows above the higher of the two lowest heights.
+        // 249 on kda-txs, A's extra row the oldest). R-P5P9-70 (m-4): only when ours holds
+        // `limit` rows and kda-txs exactly one fewer (`nb + 1 == na == limit`), both sides are
+        // cut at the higher of the two lowest heights ([`cut_at_limit`]).
         let mut limit_edge = 0usize;
         if req.route == RouteKind::V1Txs && sa == 200 && sb == 200 {
             if let Ok(l) = crate::via_cwd::parse(&req.path_and_query).limit {
                 let (na, nb) = (len_of(&va), len_of(&vb));
-                if na != nb && na.max(nb) as u64 == l {
-                    let cut = min_height(&va).max(min_height(&vb));
-                    if let Some(cut) = cut {
-                        drop_at_or_below(&mut va, cut);
-                        drop_at_or_below(&mut vb, cut);
+                if nb + 1 == na && na as u64 == l {
+                    if let (Some(x), Some(y)) = (min_height(&va), min_height(&vb)) {
+                        // Both sides stop at a limit (kda-txs one short of it): at the cut, a
+                        // row the limiting side has and the other lacks stays a diff.
+                        cut_at_limit(&mut va, &mut vb, x.max(y), x >= y, y >= x);
                         limit_edge = (na + nb) - (len_of(&va) + len_of(&vb));
                     }
                 }

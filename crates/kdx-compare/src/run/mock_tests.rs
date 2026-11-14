@@ -4982,6 +4982,37 @@ async fn c5_a_first_page_fault_of_ours_is_a_diff_and_a_5xx_an_error() {
     }
 }
 
+/// R-P5P9-70 (m-4): `oracle-limit-edge` cuts only when kda-txs is short by exactly one at the
+/// limit (`nb + 1 == na == limit`). kda-txs short by two, or ours short by one, stays a diff.
+/// R-P5P9-71 (1): so does ours lacking kda-txs's lowest row while it holds one more below.
+#[tokio::test]
+async fn c5_the_limit_edge_needs_the_oracle_one_short_at_the_limit() {
+    let rows = v1_rows(11, 10);
+    let gap = [&rows[..8], &rows[9..11]].concat();
+    let cases: [(&[Value], &[Value], &str); 4] = [
+        (&rows[..10], &rows[..9], "allowlisted"),
+        (&rows[..10], &rows[..8], "diff"),
+        (&rows[..9], &rows[..10], "diff"),
+        (&gap, &rows[..9], "diff"),
+    ];
+    for (a, b, class) in cases {
+        let (na, nb) = (a.len(), b.len());
+        let dir = tempfile::tempdir().unwrap();
+        let a = serde_json::to_vec(a).unwrap();
+        let b = serde_json::to_vec(b).unwrap();
+        let ctx = v1_setup(a, b, dir.path()).await;
+        // Every row below the oracle-lag window (R3E-11), so the limit edge alone decides.
+        ctx.tips.set_a_tip(7_000_000 + 2 * super::ORACLE_HORIZON);
+        let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+        assert_eq!(
+            o.class,
+            class,
+            "ours {na}, kda-txs {nb}, class {class}: {:?}",
+            o.record.map(|r| (r.note, r.diff))
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // FVH-C5b: the oracle-lag rule (R3E-11) explained rows ours lacks (R-P5P9-71 item 1)
 
