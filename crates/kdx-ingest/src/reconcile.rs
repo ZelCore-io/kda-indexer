@@ -860,12 +860,12 @@ async fn nft_fill_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool>
     Ok(!rep.stopped)
 }
 
-/// M-8: NFT rows are a "should"; a failed fill is logged and retried after
-/// [`NFT_FILL_RETRY`], while the balance seed and reconcile ("must") go on.
-fn nft_failed(e: &anyhow::Error) {
+/// M-8: NFT rows are a "should"; a failed fill is logged and retried after `retry`
+/// ([`NFT_FILL_RETRY`]), while the balance seed and reconcile ("must") go on.
+fn nft_failed(e: &anyhow::Error, retry: Duration) {
     tracing::error!(
         error = format!("{e:#}"),
-        retry_secs = NFT_FILL_RETRY.as_secs(),
+        retry_secs = retry.as_secs(),
         "nft: history fill failed; balances go on, the fill is retried later"
     );
 }
@@ -890,13 +890,25 @@ pub async fn run(
     o: ReconcileOpts,
     stop: CancellationToken,
 ) -> Result<()> {
+    run_with(ctx, node, o, stop, NFT_FILL_RETRY).await
+}
+
+/// [`run`] with `fill_retry`, the pause before a failed NFT fill is tried again (P6 M-8: the
+/// test shortens it).
+async fn run_with(
+    ctx: Arc<Ctx>,
+    node: NodeClient,
+    o: ReconcileOpts,
+    stop: CancellationToken,
+    fill_retry: Duration,
+) -> Result<()> {
     let mut nft_retry: Option<Instant> = None;
     if o.seed {
         match nft_fill_pass(&ctx, &stop).await {
             Ok(true) => {}
             Ok(false) => return Ok(()),
             Err(e) => {
-                nft_failed(&e);
+                nft_failed(&e, fill_retry);
                 nft_retry = Some(Instant::now());
             }
         }
@@ -927,12 +939,12 @@ pub async fn run(
                 return Ok(());
             }
         }
-        if nft_retry.is_some_and(|t| t.elapsed() >= NFT_FILL_RETRY) {
+        if nft_retry.is_some_and(|t| t.elapsed() >= fill_retry) {
             match nft_fill_pass(&ctx, &stop).await {
                 Ok(true) => nft_retry = None,
                 Ok(false) => return Ok(()),
                 Err(e) => {
-                    nft_failed(&e);
+                    nft_failed(&e, fill_retry);
                     nft_retry = Some(Instant::now());
                 }
             }
@@ -1645,6 +1657,85 @@ mod tests {
 
     /// M-11: a block applied above a chain's mark watermark + 1 (blocks applied without marks)
     /// makes the reconciler re-run the seed; contiguous blocks and a chain's first block do not.
+    /// P6 M-8 fixture: a trusted ledger's event posting whose hot tx record does not decode,
+    /// so the NFT history fill fails on it. Returns the tx key.
+    fn undecodable_ledger_event(hot: &HotStore) -> kdx_types::TxKey {
+        let ev = intern(hot, DictKind::EventName, &["marmalade-v2.ledger.RECONCILE"])[0];
+        let k = kdx_types::TxKey::new(5, 0, 1);
+        let mut pk = vec![kdx_decode::Family::Evt as u8];
+        pk.extend_from_slice(&u64::from(ev).to_be_bytes());
+        pk.extend_from_slice(&k.to_be_bytes());
+        let mut txn = hot.rw().unwrap();
+        txn.put(Table::TailPostings, &pk, &[]).unwrap();
+        txn.put(Table::TailTxs, &k.to_be_bytes(), b"\xffnot a tx record")
+            .unwrap();
+        txn.commit().unwrap();
+        k
+    }
+
+    /// Polls `f` every 50 ms for up to 20 s.
+    async fn until(what: &str, f: impl Fn() -> bool) {
+        let end = Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(Instant::now() < end, "timed out waiting for: {what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// P6 M-8: an NFT history fill that keeps failing never blocks the balances. `run` logs
+    /// the failure, seeds and reconciles anyway, and retries the fill; once the bad record is
+    /// gone a retry completes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_nft_fill_is_retried_while_balances_go_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &[]);
+        let segdir = dir.path().join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+        let k = undecodable_ledger_event(&hot);
+        let e = crate::nft_fill::run(&hot, &segdir, None, &|| false).unwrap_err();
+        assert!(format!("{e:#}").contains("hot tx record"), "{e:#}");
+        let (ctx, _) = client(dir.path(), &hot);
+        let node = ctx.node.clone();
+        let o = ReconcileOpts {
+            local: LocalOpts {
+                rps: 0,
+                concurrency: 4,
+            },
+            batch: 10,
+            seed: true,
+            caps: Caps::default(),
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run_with(
+            Arc::new(ctx),
+            node,
+            o,
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        let pending = || {
+            crate::nft_fill::pending_ledgers(&hot.ro().unwrap())
+                .unwrap()
+                .len()
+        };
+        until("the balance seed", || {
+            assert!(!task.is_finished(), "run ended on the fill error");
+            crate::seed::seeded(&hot.ro().unwrap()).unwrap()
+        })
+        .await;
+        assert!(pending() > 0, "the fill cannot have completed");
+        let mut txn = hot.rw().unwrap();
+        txn.del(Table::TailTxs, &k.to_be_bytes()).unwrap();
+        txn.commit().unwrap();
+        until("the fill retry", || {
+            assert!(!task.is_finished(), "run ended");
+            pending() == 0
+        })
+        .await;
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     #[test]
     fn a_mark_gap_reruns_the_seed() {
         let dir = tempfile::tempdir().unwrap();
