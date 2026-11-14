@@ -9,18 +9,29 @@
 //! - rows on both sides match by identity: kind, request key, event or transfer index, block
 //!   hash, chain and height, as far as the operation selects them (the same fields on both
 //!   sides). Never by value alone, and never by `id` text: a relay id is only decoded for
-//!   those key fields. The matched rows then compare field by field with the ruled matchers;
-//! - an oracle-only row is non-canonical on the node (orphan), an extra copy of a row the
-//!   node holds once (duplicate), or canonical and outside our window: below our lowest
-//!   height, or at it while our page is cut (R3E-8);
-//! - an ours-only row is canonical on the node. It is then outside the oracle's window (at
-//!   or below its lowest `creationTime` while its page is cut) or a node-confirmed oracle gap;
-//! - ours is in descending height order (our sort key).
+//!   those key fields. Rows without an index within one key match as a multiset on every
+//!   selected field (R-P5P9-63 (3)). The matched rows then compare field by field with the
+//!   ruled matchers;
+//! - an oracle-only row is non-canonical on the node by block (orphan: its block is not the
+//!   node's at its height, R-P5P9-63 (2); never by content), an extra copy of a row the node
+//!   holds once (duplicate), or canonical and outside our window by our full order: beyond
+//!   our boundary height, or at it and listed after our page by our own longer read (one
+//!   read of ours, `first` = our rows + 50, no `after`; our page must be its prefix:
+//!   R-P5P9-64, I-1);
+//! - an ours-only row is canonical on the node, holds the node's content on every selected
+//!   field the node's entry has (R-P5P9-64 I-2, our amounts exact: M-3) and matches the
+//!   query's own filter (R-P5P9-63 (1)). It is then outside the oracle's window (beyond its
+//!   last `creationTime` while its page is cut) or a node-confirmed oracle gap;
+//! - ours is in the list's height order: descending, or ascending for `blocksFromHeight`
+//!   (R-P5P9-63 (6)); a cut page of ours shorter than `first` × the pages fetched is not a
+//!   window (I-3).
 //!
 //! Every one-sided row gets a single-row node read: `/poll` for its request key (the row's
-//! block or height, and for a transfer or event the node's event at its index). A row
-//! `/poll` does not know (a coinbase row) is settled by the node's only header at its height
-//! and that block's coinbase request key; a block row by the node's headers at its height.
+//! block or height, and its content against the node's entry). A row `/poll` does not know
+//! (a coinbase row) is settled by the node's only header at its height (its own, or its
+//! block's by the node's header-by-hash route, R-P5P9-63 (5)) and that block's coinbase; a
+//! block row by the node's headers at its height. At most 300 node reads per compare
+//! (R-P5P9-63 (4)), shared with H8 and the `payload.data` matcher.
 //! A failed read, a spent read cap or a row whose identity cannot be decided leave the pair
 //! as it was (unexplained), with the reason in the record's note. A row H7 cannot explain
 //! gets its own entry, `/~graphql-h7-row`, which no allowlist entry matches.
@@ -31,7 +42,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Map, Value};
 
-use crate::graphql::Answer;
+use crate::graphql::{Answer, GqlOp};
 use crate::graphql_norm::edge_height_key;
 use crate::report::{DiffEntry, DiffKind};
 use crate::run::Ctx;
@@ -43,8 +54,11 @@ pub const WINDOW_PATH: &str = "/~graphql-h7-window-referee";
 pub const ROW_PATH: &str = "/~graphql-h7-row";
 /// The tag that keeps matched rows paired through `normalize_gql`'s tie sort.
 pub const ALIGN_KEY: &str = "kdxH7";
-/// Node reads per compare at most (single-row reads, both sides together).
-pub const NODE_READS: usize = 100;
+/// Node reads per compare at most (single-row reads, both sides together; H8, the
+/// `payload.data` matcher and H7 share it): R-P5P9-63 (4).
+pub const NODE_READS: usize = 300;
+/// Rows past our page in our longer read (R-P5P9-64, I-1).
+pub const PREFIX_EXTRA: usize = 50;
 /// Visible hit of H8 (allowlist id `graphql-h8-transfer-order-index`); it carries the
 /// evidence per request key.
 pub const ORDER_INDEX_PATH: &str = "/~graphql-h8-transfer-order-index";
@@ -293,21 +307,52 @@ pub struct Verdict {
     pub height: Option<u64>,
     pub block: Option<String>,
     pub why: String,
+    /// The chain the node was read on.
+    pub chain: Option<u8>,
+    /// For a transfer or event row the node places: the node's event that is the row, and
+    /// how many of the transaction's events have the row's content (R-P5P9-63 (3)).
+    pub event: Option<Value>,
+    pub matches: usize,
+    /// The node's TRANSFER events of the row's transaction (a tx row's account filter).
+    pub transfers: Vec<Value>,
 }
 
 impl Verdict {
-    pub fn unknown(why: impl Into<String>) -> Verdict {
+    pub fn new(
+        canon: Canon,
+        height: Option<u64>,
+        block: Option<String>,
+        why: impl Into<String>,
+    ) -> Verdict {
         Verdict {
-            canon: Canon::Unknown,
-            height: None,
-            block: None,
+            canon,
+            height,
+            block,
             why: why.into(),
+            chain: None,
+            event: None,
+            matches: 0,
+            transfers: Vec::new(),
         }
+    }
+
+    pub fn unknown(why: impl Into<String>) -> Verdict {
+        Verdict::new(Canon::Unknown, None, None, why)
     }
 
     fn evidence(&self) -> Value {
         json!({"node": self.canon.as_str(), "nodeHeight": self.height,
             "nodeBlock": self.block, "via": self.why})
+    }
+}
+
+/// What a row whose content the node does not hold is: rejected when it is ours; unknown
+/// when it is the oracle's (R-P5P9-63 (2): an orphan is decided by block, never by content).
+fn not_held(oracle: bool) -> Canon {
+    if oracle {
+        Canon::Unknown
+    } else {
+        Canon::No
     }
 }
 
@@ -319,9 +364,9 @@ fn pact_text(v: &Value) -> Option<String> {
     }
 }
 
-/// The same amount: equal decimal values, or the same f64 (the oracle's f64-rounded
-/// amounts, R-P5P9-60 amendment).
-pub fn same_amount(a: &Value, b: &Value) -> bool {
+/// The same amount: equal decimal values, or the same f64 only when `f64_ok` (the oracle's
+/// f64-rounded amounts, R-P5P9-60 amendment). Ours must be exact (R-P5P9-64 M-3).
+pub fn same_amount(a: &Value, b: &Value, f64_ok: bool) -> bool {
     let (Some(x), Some(y)) = (pact_text(a), pact_text(b)) else {
         return false;
     };
@@ -329,7 +374,44 @@ pub fn same_amount(a: &Value, b: &Value) -> bool {
     if matches!((dc(&x), dc(&y)), (Some(p), Some(q)) if p == q) {
         return true;
     }
-    matches!((x.parse::<f64>(), y.parse::<f64>()), (Ok(p), Ok(q)) if p.is_finite() && p == q)
+    f64_ok
+        && matches!((x.parse::<f64>(), y.parse::<f64>()), (Ok(p), Ok(q)) if p.is_finite() && p == q)
+}
+
+fn is_number(v: &Value) -> bool {
+    match v {
+        Value::Number(_) => true,
+        Value::Object(m) => m.len() == 1 && (m.contains_key("decimal") || m.contains_key("int")),
+        _ => false,
+    }
+}
+
+/// Two Pact values equal: numbers (and the `{"decimal"}`/`{"int"}` forms) by value, the f64
+/// form only when `f64_ok`; everything else exactly.
+pub fn same_value(a: &Value, b: &Value, f64_ok: bool) -> bool {
+    if is_number(a) && is_number(b) {
+        return same_amount(a, b, f64_ok);
+    }
+    match (a, b) {
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_value(p, q, f64_ok))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, p)| y.get(k).is_some_and(|q| same_value(p, q, f64_ok)))
+        }
+        _ => a == b,
+    }
+}
+
+/// A selected JSON-text field (`parameters`, `goodResult`, `continuation`) as its value: the
+/// text parsed, else the text itself.
+fn json_field(v: &Value) -> Value {
+    match v {
+        Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| v.clone()),
+        v => v.clone(),
+    }
 }
 
 fn module_name(ev: &Value) -> Option<String> {
@@ -341,65 +423,163 @@ fn module_name(ev: &Value) -> Option<String> {
     })
 }
 
-/// Whether the node's event `ev` is the transfer row `n` (each field the row selects).
-pub fn transfer_matches(n: &Value, ev: &Value) -> bool {
-    let s = |k: &str| n.get(k).and_then(Value::as_str);
+/// A field the row selects (not null).
+fn sel<'a>(n: &'a Value, k: &str) -> Option<&'a Value> {
+    n.get(k).filter(|v| !v.is_null())
+}
+
+/// Whether the node's event `ev` is the transfer row `n`: every field the row selects that
+/// the event holds (sender, receiver, amount, module name and hash; R-P5P9-64 I-2). `oracle`:
+/// the row is the oracle's, whose f64-rounded amount is allowed (M-3).
+pub fn transfer_matches(n: &Value, ev: &Value, oracle: bool) -> bool {
     let p = |i: usize| ev.pointer(&format!("/params/{i}"));
     ev.get("name").and_then(Value::as_str) == Some("TRANSFER")
-        && s("senderAccount").is_none_or(|x| p(0).and_then(Value::as_str) == Some(x))
-        && s("receiverAccount").is_none_or(|x| p(1).and_then(Value::as_str) == Some(x))
-        && n.get("amount")
-            .is_none_or(|x| p(2).is_some_and(|y| same_amount(x, y)))
-        && s("moduleName").is_none_or(|x| module_name(ev).as_deref() == Some(x))
+        && sel(n, "senderAccount").is_none_or(|x| p(0) == Some(x))
+        && sel(n, "receiverAccount").is_none_or(|x| p(1) == Some(x))
+        && sel(n, "amount").is_none_or(|x| p(2).is_some_and(|y| same_amount(x, y, oracle)))
+        && sel(n, "moduleName").is_none_or(|x| module_name(ev).as_deref() == x.as_str())
+        && sel(n, "moduleHash").is_none_or(|x| ev.get("moduleHash") == Some(x))
 }
 
-/// Whether the node's event `ev` is the event row `n` (its name and qualified name, as
-/// selected).
-pub fn event_matches(n: &Value, ev: &Value) -> bool {
+/// Whether the node's event `ev` is the event row `n`: every field the row selects that the
+/// event holds (name, qualified name, parameters by value, module hash; R-P5P9-64 I-2).
+pub fn event_matches(n: &Value, ev: &Value, oracle: bool) -> bool {
     let name = ev.get("name").and_then(Value::as_str);
-    let s = |k: &str| n.get(k).and_then(Value::as_str);
-    s("name").is_none_or(|x| name == Some(x))
-        && s("qualifiedName").is_none_or(|x| {
+    let params = ev.get("params").cloned().unwrap_or(Value::Null);
+    sel(n, "name").is_none_or(|x| x.as_str() == name)
+        && sel(n, "qualifiedName").is_none_or(|x| {
             module_name(ev)
                 .zip(name)
-                .is_some_and(|(m, nm)| format!("{m}.{nm}") == x)
+                .is_some_and(|(m, nm)| x.as_str() == Some(format!("{m}.{nm}").as_str()))
         })
+        && ["parameters", "parameterText"]
+            .iter()
+            .all(|k| sel(n, k).is_none_or(|x| same_value(&json_field(x), &params, oracle)))
+        && sel(n, "moduleHash").is_none_or(|x| ev.get("moduleHash") == Some(x))
 }
 
-/// The row's content against the node's events of its transaction: at its index when it
-/// has one. A matching event at another index leaves the verdict unknown (the index is not
-/// the node's).
+/// Whether the node's entry `p` (a `/poll` entry or a coinbase output) is the tx row `n`:
+/// the result fields the row selects that the entry holds (status and data, gas, transaction
+/// id, continuation, event count; R-P5P9-64 I-2). A failure's error is compared on ours only
+/// (the oracle's error text has its own shape).
+pub fn tx_matches(n: &Value, p: &Value, oracle: bool) -> bool {
+    let Some(r) = n.get("result").filter(|r| r.is_object()) else {
+        return true;
+    };
+    let status = p.pointer("/result/status").and_then(Value::as_str);
+    let num = |x: &Value, y: Option<&Value>| match y.filter(|y| !y.is_null()) {
+        Some(y) => same_amount(x, y, oracle),
+        None => x.is_null(),
+    };
+    let events = json!(p
+        .get("events")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len));
+    let json_is = |x: &Value, node: Option<&Value>| {
+        let node = node.unwrap_or(&Value::Null);
+        if x.is_null() {
+            node.is_null()
+        } else {
+            same_value(&json_field(x), node, oracle)
+        }
+    };
+    r.get("gas").is_none_or(|x| num(x, p.get("gas")))
+        && r.get("transactionId").is_none_or(|x| num(x, p.get("txId")))
+        && r.get("eventCount").is_none_or(|x| num(x, Some(&events)))
+        && r.get("goodResult").is_none_or(|x| {
+            (status == Some("success")) != x.is_null()
+                && (x.is_null() || json_is(x, p.pointer("/result/data")))
+        })
+        && r.get("badResult").is_none_or(|x| {
+            (status == Some("failure")) != x.is_null()
+                && (x.is_null() || oracle || json_is(x, p.pointer("/result/error")))
+        })
+        && r.get("continuation")
+            .is_none_or(|x| json_is(x, p.get("continuation")))
+}
+
+/// The row's content against the node's entry for its transaction (a `/poll` entry or a
+/// coinbase output): a tx row's result; a transfer or event row at its index when it has one
+/// (a matching event at another index leaves the verdict unknown). Content the node does not
+/// hold is [`not_held`].
 fn content_verdict(
     r: &RowId,
     n: &Value,
-    events: &[&Value],
+    entry: &Value,
+    oracle: bool,
     v: impl Fn(Canon, &str) -> Verdict,
 ) -> Verdict {
-    let m: fn(&Value, &Value) -> bool = match r.kind {
+    let events: Vec<&Value> = entry
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let with = |mut x: Verdict, event: Option<&Value>, matches: usize| {
+        x.event = event.cloned();
+        x.matches = matches;
+        x.transfers = events
+            .iter()
+            .filter(|e| e.get("name").and_then(Value::as_str) == Some("TRANSFER"))
+            .map(|e| (*e).clone())
+            .collect();
+        x
+    };
+    let m: fn(&Value, &Value, bool) -> bool = match r.kind {
         Some(Kind::Transfer) => transfer_matches,
         Some(Kind::Event) => event_matches,
-        _ => return v(Canon::Yes, "placed"),
+        Some(Kind::Tx) => {
+            return if tx_matches(n, entry, oracle) {
+                with(v(Canon::Yes, "placed, with the row's result"), None, 1)
+            } else {
+                with(
+                    v(not_held(oracle), "the node's result is not the row's"),
+                    None,
+                    0,
+                )
+            };
+        }
+        _ => return with(v(Canon::Yes, "placed"), None, 1),
     };
-    let any = events.iter().any(|ev| m(n, ev));
+    let hits: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, ev)| m(n, ev, oracle))
+        .map(|(i, _)| i)
+        .collect();
     let at = r
         .index
         .and_then(|i| usize::try_from(i).ok())
-        .and_then(|i| events.get(i))
-        .is_some_and(|ev| m(n, ev));
-    match (r.index, any, at) {
-        (_, false, _) => v(Canon::No, "the node's transaction lacks the row"),
-        (None, true, _) | (Some(_), true, true) => v(Canon::Yes, "placed, with the row's content"),
-        (Some(_), true, false) => {
-            let mut x = v(Canon::Unknown, "the row's index is not the node's");
-            x.canon = Canon::Unknown;
-            x
-        }
+        .filter(|i| hits.contains(i));
+    match (r.index, hits.first(), at) {
+        (_, None, _) => with(
+            v(not_held(oracle), "the node's transaction lacks the row"),
+            None,
+            0,
+        ),
+        (None, Some(&i), _) => with(
+            v(Canon::Yes, "placed, with the row's content"),
+            Some(events[i]),
+            hits.len(),
+        ),
+        (Some(_), Some(_), Some(i)) => with(
+            v(Canon::Yes, "placed, with the row's content"),
+            Some(events[i]),
+            1,
+        ),
+        (Some(_), Some(_), None) => with(
+            v(Canon::Unknown, "the row's index is not the node's"),
+            None,
+            0,
+        ),
     }
 }
 
-/// The node's verdict on a row from its `/poll` entry: its block (or height) must be the
-/// row's, and a transfer's or event's content must be the node's event at its index.
-pub fn poll_verdict(r: &RowId, n: &Value, p: &Value) -> Verdict {
+/// The node's verdict on a row from its `/poll` entry `p`. A row in another block than the
+/// node's for the key is not canonical only when that block sits at the key's height (by
+/// block, R-P5P9-63 (2)); `bh` is the node's height of the row's block when the row selects
+/// no height (R-P5P9-63 (5)). Otherwise the row's content must be the node's.
+pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u64>) -> Verdict {
     let pb = p
         .pointer("/metaData/blockHash")
         .and_then(Value::as_str)
@@ -408,36 +588,37 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value) -> Verdict {
     if pb.is_none() && ph.is_none() {
         return Verdict::unknown("poll: no block in the entry");
     }
-    let v = |canon, why: &str| Verdict {
-        canon,
-        height: ph,
-        block: pb.clone(),
-        why: format!("poll: {why}"),
-    };
-    let placed = match (&r.block, r.height) {
-        (Some(b), h) => pb.as_deref() == Some(b.as_str()) && h.is_none_or(|h| ph == Some(h)),
-        (None, Some(h)) => ph == Some(h),
-        (None, None) => true,
-    };
-    if !placed {
-        return v(Canon::No, "the node's block for the key is another");
+    let v = |canon, why: &str| Verdict::new(canon, ph, pb.clone(), format!("poll: {why}"));
+    if let Some(b) = &r.block {
+        if pb.as_deref() != Some(b.as_str()) {
+            return match r.height.or(bh) {
+                Some(h) if Some(h) == ph => v(
+                    Canon::No,
+                    "the row's block is not the node's block at the key's height",
+                ),
+                _ => v(
+                    not_held(oracle),
+                    "the row's block is not the node's for the key, at another height",
+                ),
+            };
+        }
     }
-    let events: Vec<&Value> = p
-        .get("events")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .collect();
-    content_verdict(r, n, &events, v)
+    if r.height.is_some_and(|h| Some(h) != ph) {
+        return v(not_held(oracle), "the node's height for the key is another");
+    }
+    content_verdict(r, n, p, oracle, v)
 }
 
-/// A row `/poll` does not know (a coinbase row: its request key is the coinbase's): the
-/// node's headers at the row's height and the payload (with outputs) of the only one.
+/// A row `/poll` does not know (a coinbase row: its request key is the coinbase's) at height
+/// `h` (its own, or the node's height of its block): the node's headers at `h` and the
+/// payload (with outputs) of the only one. Not canonical only by block (R-P5P9-63 (2)).
 pub fn coinbase_verdict(
     r: &RowId,
     n: &Value,
+    h: u64,
     headers: &[Value],
     payload: Option<&Value>,
+    oracle: bool,
 ) -> Verdict {
     if headers.len() != 1 {
         return Verdict::unknown(format!("coinbase: {} headers at the height", headers.len()));
@@ -446,14 +627,13 @@ pub fn coinbase_verdict(
         .get("hash")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let v = |canon, why: &str| Verdict {
-        canon,
-        height: r.height,
-        block: hash.clone(),
-        why: format!("coinbase: {why}"),
-    };
+    let v =
+        |canon, why: &str| Verdict::new(canon, Some(h), hash.clone(), format!("coinbase: {why}"));
     if r.block.as_ref().is_some_and(|b| Some(b) != hash.as_ref()) {
-        return v(Canon::No, "the node's block at the height is another");
+        return v(
+            Canon::No,
+            "the row's block is not the node's block at its height",
+        );
     }
     let Some(cb) = payload
         .and_then(|p| p.get("coinbase"))
@@ -465,17 +645,11 @@ pub fn coinbase_verdict(
     };
     if cb.get("reqKey").and_then(Value::as_str) != r.rk.as_deref() {
         return v(
-            Canon::No,
+            not_held(oracle),
             "the key is neither polled nor the block's coinbase",
         );
     }
-    let events: Vec<&Value> = cb
-        .get("events")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .collect();
-    content_verdict(r, n, &events, v)
+    content_verdict(r, n, &cb, oracle, v)
 }
 
 /// A block row: the node's headers at its height (orphans included).
@@ -483,12 +657,8 @@ pub fn block_verdict(r: &RowId, headers: &[Value]) -> Verdict {
     let has = headers
         .iter()
         .any(|h| h.get("hash").and_then(Value::as_str) == r.block.as_deref());
-    let v = |canon, why: &str| Verdict {
-        canon,
-        height: r.height,
-        block: r.block.clone(),
-        why: format!("header: {why}"),
-    };
+    let v =
+        |canon, why: &str| Verdict::new(canon, r.height, r.block.clone(), format!("header: {why}"));
     match (has, headers.len()) {
         (true, 1) => v(Canon::Yes, "the node's only block at the height"),
         (true, _) => Verdict::unknown("header: a fork at the height"),
@@ -497,12 +667,214 @@ pub fn block_verdict(r: &RowId, headers: &[Value]) -> Verdict {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-63 (1): the query's own filter
+
+/// The variable a document passes to argument `arg` (`arg: $v`), else `arg` itself.
+pub fn arg_var(query: Option<&str>, arg: &str) -> String {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let mut rest = query.unwrap_or_default();
+    while let Some(i) = rest.find(arg) {
+        let before = rest[..i].chars().next_back();
+        let after = &rest[i + arg.len()..];
+        rest = after;
+        if before.is_some_and(word) || after.chars().next().is_some_and(word) {
+            continue;
+        }
+        let Some(v) = after
+            .trim_start()
+            .strip_prefix(':')
+            .and_then(|a| a.trim_start().strip_prefix('$'))
+        else {
+            continue;
+        };
+        let name: String = v
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    arg.to_string()
+}
+
+/// The query's own filter (R-P5P9-63 (1)): the root field's arguments an ours-only row is
+/// checked against, each from the variable the document passes to it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Filter {
+    pub account: Option<String>,
+    pub fungible: Option<String>,
+    pub chains: Option<Vec<u8>>,
+    pub event: Option<String>,
+    /// `parametersFilter` (`{"array_starts_with": …}`, as ours serves it); `Err` when the
+    /// harness cannot read it.
+    pub params: Option<Result<Vec<Value>, String>>,
+    pub min_height: Option<u64>,
+    pub max_height: Option<u64>,
+    pub block: Option<String>,
+    pub rk: Option<String>,
+}
+
+fn params_filter(t: &str) -> Result<Vec<Value>, String> {
+    let bad = || format!("a parametersFilter the harness cannot read: {t}");
+    let v: Value = serde_json::from_str(t).map_err(|_| bad())?;
+    let o = v.as_object().filter(|o| o.len() == 1).ok_or_else(bad)?;
+    match o.get("array_starts_with") {
+        Some(Value::Array(a)) if !a.is_empty() => Ok(a.clone()),
+        Some(Value::Array(_)) | None => Err(bad()),
+        Some(x) => Ok(vec![x.clone()]),
+    }
+}
+
+impl Filter {
+    pub fn from_vars(query: Option<&str>, vars: &Map<String, Value>) -> Filter {
+        let get = |arg: &str| vars.get(&arg_var(query, arg)).filter(|v| !v.is_null());
+        let s = |arg: &str| get(arg).and_then(text);
+        let h = |arg: &str| s(arg).and_then(|t| t.parse::<u64>().ok());
+        let chains = match (s("chainId"), get("chainIds").and_then(Value::as_array)) {
+            (Some(c), _) => Some(c.parse().ok().into_iter().collect()),
+            (None, Some(cs)) => Some(
+                cs.iter()
+                    .filter_map(text)
+                    .filter_map(|c| c.parse().ok())
+                    .collect(),
+            ),
+            _ => None,
+        };
+        Filter {
+            account: s("accountName"),
+            fungible: s("fungibleName"),
+            chains,
+            event: s("qualifiedEventName"),
+            params: s("parametersFilter").map(|t| params_filter(&t)),
+            min_height: h("minHeight").or_else(|| h("startHeight")),
+            max_height: h("maxHeight").or_else(|| h("endHeight")),
+            block: s("blockHash"),
+            rk: s("requestKey"),
+        }
+    }
+
+    /// Why a canonical ours-only row is outside the filter, if it is: by the row's own fields
+    /// where it selects them, else by the node's (its event, its transaction's TRANSFER
+    /// events, its chain and block). `h`: the row's height.
+    pub fn outside(&self, r: &Row, h: Option<u64>, v: &Verdict) -> Option<String> {
+        let n = r.edge.get("node").unwrap_or(&Value::Null);
+        let field = |k: &str| sel(n, k).and_then(text);
+        let ev = v.event.as_ref();
+        let param = |i: usize| {
+            ev.and_then(|e| e.pointer(&format!("/params/{i}")))
+                .and_then(text)
+        };
+        let fail = |what: &str| Some(format!("outside the query's {what}"));
+        if let Some(cs) = &self.chains {
+            if !r.id.chain.or(v.chain).is_some_and(|c| cs.contains(&c)) {
+                return fail("chain");
+            }
+        }
+        if self.min_height.is_some_and(|lo| h.is_none_or(|h| h < lo))
+            || self.max_height.is_some_and(|hi| h.is_none_or(|h| h > hi))
+        {
+            return fail("height window");
+        }
+        if self
+            .block
+            .as_ref()
+            .is_some_and(|b| r.id.block.as_ref().or(v.block.as_ref()) != Some(b))
+        {
+            return fail("block");
+        }
+        if self
+            .rk
+            .as_ref()
+            .is_some_and(|k| r.id.rk.as_ref() != Some(k))
+        {
+            return fail("request key");
+        }
+        let fungible =
+            |m: Option<String>| self.fungible.as_ref().is_none_or(|f| m.as_ref() == Some(f));
+        match r.id.kind {
+            Some(Kind::Transfer) => {
+                if let Some(a) = &self.account {
+                    let from = field("senderAccount").or_else(|| param(0));
+                    let to = field("receiverAccount").or_else(|| param(1));
+                    if from.as_ref() != Some(a) && to.as_ref() != Some(a) {
+                        return fail("account");
+                    }
+                }
+                if !fungible(field("moduleName").or_else(|| ev.and_then(module_name))) {
+                    return fail("fungible");
+                }
+            }
+            Some(Kind::Event) => {
+                let node_name = ev.and_then(|e| {
+                    Some(format!("{}.{}", module_name(e)?, e.get("name")?.as_str()?))
+                });
+                if self
+                    .event
+                    .as_ref()
+                    .is_some_and(|q| field("qualifiedName").or(node_name).as_ref() != Some(q))
+                {
+                    return fail("event name");
+                }
+                match &self.params {
+                    None => {}
+                    Some(Err(w)) => return Some(w.clone()),
+                    Some(Ok(pre)) => {
+                        let ps = ev.and_then(|e| e.get("params")).and_then(Value::as_array);
+                        let starts = ps.is_some_and(|ps| {
+                            ps.len() >= pre.len()
+                                && pre.iter().zip(ps).all(|(a, b)| same_value(a, b, false))
+                        });
+                        if !starts {
+                            return fail("parametersFilter");
+                        }
+                    }
+                }
+            }
+            Some(Kind::Tx) => {
+                // `transactions(accountName)` lists the txs the account sent (GQ-19: ours
+                // filters on `meta.sender`); the sender pays the gas, the transaction's last
+                // TRANSFER event. With `fungibleName`, a TRANSFER of that module names it.
+                if let Some(a) = &self.account {
+                    let p = |e: &Value, i: usize| {
+                        e.pointer(&format!("/params/{i}"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    };
+                    let payer = v.transfers.last().and_then(|e| p(e, 0));
+                    let sender = n.pointer("/cmd/meta/sender").and_then(Value::as_str);
+                    if payer.as_ref() != Some(a) || sender.is_some_and(|s| s != a) {
+                        return fail("account (the sender)");
+                    }
+                    let names = |e: &Value| {
+                        (p(e, 0).as_ref() == Some(a) || p(e, 1).as_ref() == Some(a))
+                            && fungible(module_name(e))
+                    };
+                    if self.fungible.is_some() && !v.transfers.iter().any(names) {
+                        return fail("fungible");
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Matching and the decision
+
 /// One row of a side with its identity.
 #[derive(Debug, Clone)]
 pub struct Row {
     pub id: RowId,
     pub key: String,
     pub edge: Value,
+}
+
+fn node_of(r: &Row) -> &Value {
+    r.edge.get("node").unwrap_or(&Value::Null)
 }
 
 /// Both pages' rows, identified.
@@ -535,8 +907,7 @@ fn group<'a>(rows: &'a [Row], live: &[usize]) -> (Vec<&'a str>, HashMap<&'a str,
 }
 
 /// The rows of two root connections (ours `ca`, the oracle's `cb`) with their identities.
-/// Fails when a row's identity cannot be decided, or rows without an index share a key
-/// (which row is which cannot be told).
+/// Fails when a row's identity cannot be decided.
 pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
     let rows = |c: &Value| -> Result<Vec<Row>, String> {
         let mut out = Vec::new();
@@ -557,50 +928,109 @@ pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
         }
         Ok(out)
     };
-    let (a, b) = (rows(ca)?, rows(cb)?);
-    for side in [&a, &b] {
-        let all: Vec<usize> = (0..side.len()).collect();
-        let (_, g) = group(side, &all);
-        if let Some(r) = side
-            .iter()
-            .find(|r| !r.id.indexed() && g[r.key.as_str()].len() > 1)
-        {
-            return Err(format!(
-                "rows without an index share one identity: {}",
-                r.id.evidence()
-            ));
-        }
-    }
     Ok(Prep {
-        a,
-        b,
+        a: rows(ca)?,
+        b: rows(cb)?,
         a_cut: more(ca),
         b_cut: more(cb),
     })
 }
 
+/// The rows matched across the sides, per identity key in ours' first-seen order. An indexed
+/// key pairs its first rows. Rows without an index within one key match as a multiset on
+/// every selected field (R-P5P9-63 (3)): rows equal in every field pair, the rest are
+/// one-sided.
+struct Matching {
+    /// (ours' row, the oracle's row), in ours' order.
+    pairs: Vec<(usize, usize)>,
+    /// Ours' rows no oracle row matches (an indexed key's first row only).
+    ours: Vec<usize>,
+    /// The oracle's rows no row of ours matches: an indexed key's rows together, else one
+    /// row per group.
+    oracle: Vec<Vec<usize>>,
+}
+
+fn matching(p: &Prep, live_a: &[usize], live_b: &[usize]) -> Matching {
+    let (oa, ga) = group(&p.a, live_a);
+    let (ob, gb) = group(&p.b, live_b);
+    let mut m = Matching {
+        pairs: Vec::new(),
+        ours: Vec::new(),
+        oracle: Vec::new(),
+    };
+    let mut left: HashMap<&str, Vec<usize>> = HashMap::new();
+    for k in &oa {
+        let ia = &ga[k];
+        let multiset = !p.a[ia[0]].id.indexed();
+        if !multiset {
+            match gb.get(k).and_then(|j| j.first()) {
+                Some(&j) => m.pairs.push((ia[0], j)),
+                None => m.ours.push(ia[0]),
+            }
+            continue;
+        }
+        let mut free = gb.get(k).cloned().unwrap_or_default();
+        for &i in ia {
+            match free
+                .iter()
+                .position(|&j| node_of(&p.b[j]) == node_of(&p.a[i]))
+            {
+                Some(x) => m.pairs.push((i, free.remove(x))),
+                None => m.ours.push(i),
+            }
+        }
+        left.insert(k, free);
+    }
+    for k in &ob {
+        let rows = left.remove(k).unwrap_or_else(|| {
+            if ga.contains_key(k) {
+                Vec::new()
+            } else {
+                gb[k].clone()
+            }
+        });
+        if rows.is_empty() {
+            continue;
+        }
+        if p.b[rows[0]].id.indexed() {
+            m.oracle.push(rows);
+        } else {
+            m.oracle.extend(rows.into_iter().map(|j| vec![j]));
+        }
+    }
+    m
+}
+
 impl Prep {
     /// The rows that need a node verdict, as (side: 0 ours, 1 the oracle's; row index):
-    /// ours without a height or not matched once, and one row per oracle-only identity.
+    /// ours without a height or not matched once, and one row per oracle-only group.
     pub fn reads(&self) -> Vec<(usize, usize)> {
         let all_a: Vec<usize> = (0..self.a.len()).collect();
         let all_b: Vec<usize> = (0..self.b.len()).collect();
-        let (_, ga) = group(&self.a, &all_a);
-        let (ob, gb) = group(&self.b, &all_b);
+        let m = matching(self, &all_a, &all_b);
+        let (_, gb) = group(&self.b, &all_b);
         let mut out = Vec::new();
         for (i, r) in self.a.iter().enumerate() {
             let nb = gb.get(r.key.as_str()).map_or(0, Vec::len);
-            if r.id.height.is_none() || nb != 1 {
+            if r.id.height.is_none() || m.ours.contains(&i) || (r.id.indexed() && nb != 1) {
                 out.push((0, i));
             }
         }
-        for k in ob {
-            if !ga.contains_key(k) {
-                out.push((1, gb[k][0]));
-            }
-        }
+        out.extend(m.oracle.iter().map(|g| (1, g[0])));
         out
     }
+}
+
+/// What H7 knows of a pair besides its rows: the oracle's ceiling, the list's direction, the
+/// query's filter and our longer read (I-1).
+pub struct Window<'a> {
+    pub max: u64,
+    /// The list ascends by height (`blocksFromHeight`); else it descends (R-P5P9-63 (6)).
+    pub asc: bool,
+    pub filter: &'a Filter,
+    /// Our longer read (R-P5P9-64, I-1): each row's identity key and node; `None` while it
+    /// is not read.
+    pub prefix: Option<&'a Result<Vec<(String, Value)>, String>>,
 }
 
 /// H7's verdict on a pair.
@@ -620,9 +1050,12 @@ pub struct Decision {
     pub oracle: Vec<Value>,
     /// Rows above the oracle's ceiling, left out (the stall rule).
     pub above: usize,
-    /// Our lowest height and the oracle's lowest `creationTime` on the pages.
+    /// Our boundary height (the lowest, or the highest on an ascending list) and the
+    /// oracle's last `creationTime` in its order.
     pub lowest: Option<u64>,
     pub oracle_lowest_ctime: Option<String>,
+    /// An oracle-only row at our boundary height waits for our longer read (I-1).
+    pub needs_prefix: bool,
 }
 
 impl Decision {
@@ -644,9 +1077,60 @@ fn why_of(v: Option<&Verdict>) -> String {
     v.map_or_else(|| "no read".into(), |v| v.why.clone())
 }
 
+/// Where an oracle-only canonical row lies against our window.
+enum Place {
+    Outside(&'static str),
+    Inside(String),
+    Wait(String),
+}
+
+/// R-P5P9-64 (I-1): an oracle-only row at our boundary height lies outside our window only
+/// when our page (`n` rows, keys `ours`) is a prefix of our longer read and the row appears
+/// in that read after our cut.
+fn after_our_cut(
+    prefix: Option<&Result<Vec<(String, Value)>, String>>,
+    ours: &[Row],
+    rb: &Row,
+) -> Place {
+    let rows = match prefix {
+        None => {
+            return Place::Wait(
+                "an oracle-only row at our boundary height waits for our longer read".into(),
+            )
+        }
+        Some(Err(w)) => return Place::Wait(format!("our longer read: {w}")),
+        Some(Ok(rows)) => rows,
+    };
+    if rows.len() < ours.len() {
+        return Place::Wait(format!(
+            "our longer read holds {} rows, fewer than our page's {}",
+            rows.len(),
+            ours.len()
+        ));
+    }
+    if ours.iter().zip(rows).any(|(r, (k, _))| r.key != *k) {
+        return Place::Inside(
+            "our page is not a prefix of our own longer read (a cursor join, or the list moved)"
+                .into(),
+        );
+    }
+    let later = rows[ours.len()..]
+        .iter()
+        .any(|(k, n)| *k == rb.key && (rb.id.indexed() || n == node_of(rb)));
+    if later {
+        Place::Outside("after-our-cut")
+    } else {
+        Place::Inside(
+            "an oracle-only canonical row at our boundary height that our longer read does not \
+             list after our page: a row we skipped"
+                .into(),
+        )
+    }
+}
+
 /// H7 on prepared pages with the node's verdicts (`va` per row of ours, `vb` per row of the
-/// oracle's; `None` where none was read). `max`: the oracle's ceiling.
-pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], max: u64) -> Decision {
+/// oracle's; `None` where none was read).
+pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Window) -> Decision {
     let mut d = Decision::default();
     let canon = |v: &Option<Verdict>| v.as_ref().map_or(Canon::Unknown, |v| v.canon);
     // A row's height: its own, else the node's for a row the node places.
@@ -659,22 +1143,23 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], max: u64
     };
     let ha: Vec<Option<u64>> = p.a.iter().zip(va).map(|(r, v)| height(r, v)).collect();
     let hb: Vec<Option<u64>> = p.b.iter().zip(vb).map(|(r, v)| height(r, v)).collect();
-    let above = |h: &Option<u64>| h.is_some_and(|h| h > max);
+    let above = |h: &Option<u64>| h.is_some_and(|h| h > w.max);
     let live_a: Vec<usize> = (0..p.a.len()).filter(|&i| !above(&ha[i])).collect();
     let live_b: Vec<usize> = (0..p.b.len()).filter(|&j| !above(&hb[j])).collect();
     d.above = p.a.len() + p.b.len() - live_a.len() - live_b.len();
-    // Ours: a height for every row, in descending order (our sort key).
+    let not_canonical = |i: usize| {
+        format!(
+            "a row of ours the node calls not canonical ({})",
+            why_of(va[i].as_ref())
+        )
+    };
+    // Ours: a height for every row, in the list's height order (our sort key).
     for &i in &live_a {
         if ha[i].is_none() {
             match canon(&va[i]) {
-                Canon::No => d.rejected.push((
-                    Some(p.a[i].edge.clone()),
-                    None,
-                    format!(
-                        "a row of ours the node calls not canonical ({})",
-                        why_of(va[i].as_ref())
-                    ),
-                )),
+                Canon::No => d
+                    .rejected
+                    .push((Some(p.a[i].edge.clone()), None, not_canonical(i))),
                 _ => d.undecided.push(format!(
                     "no height for a row of ours ({}): {}",
                     why_of(va[i].as_ref()),
@@ -687,25 +1172,34 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], max: u64
         return d;
     }
     let hs: Vec<u64> = live_a.iter().filter_map(|&i| ha[i]).collect();
-    if hs.windows(2).any(|w| w[0] < w[1]) {
+    let (dir, back) = if w.asc {
+        ("ascending", hs.windows(2).any(|x| x[0] > x[1]))
+    } else {
+        ("descending", hs.windows(2).any(|x| x[0] < x[1]))
+    };
+    if back {
         d.rejected
-            .push((None, None, "ours is not in descending height order".into()));
+            .push((None, None, format!("ours is not in {dir} height order")));
         return d;
     }
-    d.lowest = hs.iter().min().copied();
+    d.lowest = if w.asc {
+        hs.iter().max()
+    } else {
+        hs.iter().min()
+    }
+    .copied();
     let ct = |r: &Row| r.id.ctime.as_deref().and_then(parse_utc);
-    let b_low = live_b
-        .iter()
-        .filter_map(|&j| ct(&p.b[j]).map(|t| (t, j)))
-        .min();
-    d.oracle_lowest_ctime = b_low.and_then(|(_, j)| p.b[j].id.ctime.clone());
+    let times = live_b.iter().filter_map(|&j| ct(&p.b[j]).map(|t| (t, j)));
+    let b_last = if w.asc { times.max() } else { times.min() };
+    d.oracle_lowest_ctime = b_last.and_then(|(_, j)| p.b[j].id.ctime.clone());
     d.grouped = true;
-    let (oa, ga) = group(&p.a, &live_a);
-    let (ob, gb) = group(&p.b, &live_b);
-    for k in &oa {
-        let i = ga[k][0];
+    let m = matching(p, &live_a, &live_b);
+    let (_, ga) = group(&p.a, &live_a);
+    let (_, gb) = group(&p.b, &live_b);
+    let twice = |i: usize| p.a[i].id.indexed() && ga[p.a[i].key.as_str()].len() > 1;
+    for &(i, j) in &m.pairs {
         let (ra, vi) = (&p.a[i], va[i].as_ref());
-        if ga[k].len() > 1 {
+        if twice(i) {
             d.rejected.push((
                 Some(ra.edge.clone()),
                 None,
@@ -713,88 +1207,130 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], max: u64
             ));
             continue;
         }
-        match gb.get(k) {
-            Some(jb) => {
-                d.pairs.push((i, jb[0]));
-                if jb.len() > 1 {
-                    // The node holds the row once: the oracle's other copies are duplicates.
-                    match canon(&va[i]) {
-                        Canon::Yes => d
-                            .oracle
-                            .extend(jb[1..].iter().map(|&j| evidence(&p.b[j], vi, "duplicate"))),
-                        Canon::No => d.rejected.push((
-                            Some(ra.edge.clone()),
-                            None,
-                            format!(
-                                "a row of ours the node calls not canonical ({})",
-                                why_of(vi)
-                            ),
-                        )),
-                        Canon::Unknown => d.undecided.push(format!(
-                            "an oracle duplicate the node did not settle ({}): {}",
-                            why_of(vi),
-                            ra.id.evidence()
-                        )),
-                    }
-                }
-            }
-            None => match canon(&va[i]) {
-                Canon::Yes => {
-                    let outside =
-                        p.b_cut && matches!((ct(ra), b_low), (Some(t), Some((lo, _))) if t <= lo);
-                    let why = if outside {
-                        "outside-oracle-window"
-                    } else {
-                        "oracle-gap"
-                    };
-                    d.ours.push(evidence(ra, vi, why));
-                }
-                Canon::No => d.rejected.push((
-                    Some(ra.edge.clone()),
-                    None,
-                    format!(
-                        "an ours-only row the node calls not canonical ({})",
-                        why_of(vi)
-                    ),
-                )),
+        d.pairs.push((i, j));
+        let jb = &gb[ra.key.as_str()];
+        if ra.id.indexed() && jb.len() > 1 {
+            // The node holds the row once: the oracle's other copies are duplicates.
+            match canon(&va[i]) {
+                Canon::Yes => d
+                    .oracle
+                    .extend(jb[1..].iter().map(|&j| evidence(&p.b[j], vi, "duplicate"))),
+                Canon::No => d
+                    .rejected
+                    .push((Some(ra.edge.clone()), None, not_canonical(i))),
                 Canon::Unknown => d.undecided.push(format!(
-                    "an ours-only row the node did not settle ({}): {}",
+                    "an oracle duplicate the node did not settle ({}): {}",
                     why_of(vi),
                     ra.id.evidence()
                 )),
-            },
+            }
         }
     }
-    for k in &ob {
-        if ga.contains_key(k) {
+    for &i in &m.ours {
+        let (ra, vi) = (&p.a[i], va[i].as_ref());
+        if twice(i) {
+            d.rejected.push((
+                Some(ra.edge.clone()),
+                None,
+                "ours lists the row twice".into(),
+            ));
             continue;
         }
-        let jb = &gb[k];
-        let j = jb[0];
+        let Some(v) = vi.filter(|v| v.canon != Canon::Unknown) else {
+            d.undecided.push(format!(
+                "an ours-only row the node did not settle ({}): {}",
+                why_of(vi),
+                ra.id.evidence()
+            ));
+            continue;
+        };
+        if v.canon == Canon::No {
+            d.rejected.push((
+                Some(ra.edge.clone()),
+                None,
+                format!("an ours-only row the node calls not canonical ({})", v.why),
+            ));
+            continue;
+        }
+        let outside_filter = w.filter.outside(ra, ha[i], v);
+        if let Some(why) = outside_filter {
+            d.rejected.push((
+                Some(ra.edge.clone()),
+                None,
+                format!("an ours-only canonical row {why}"),
+            ));
+            continue;
+        }
+        let copies = ga[ra.key.as_str()]
+            .iter()
+            .filter(|&&x| node_of(&p.a[x]) == node_of(ra))
+            .count();
+        if !ra.id.indexed() && copies > v.matches {
+            d.rejected.push((
+                Some(ra.edge.clone()),
+                None,
+                format!(
+                    "ours lists the row {copies} times; the node's transaction holds it {} times",
+                    v.matches
+                ),
+            ));
+            continue;
+        }
+        let outside = p.b_cut
+            && match (ct(ra), b_last) {
+                (Some(t), Some((lo, _))) => {
+                    if w.asc {
+                        t >= lo
+                    } else {
+                        t <= lo
+                    }
+                }
+                _ => false,
+            };
+        let why = if outside {
+            "outside-oracle-window"
+        } else {
+            "oracle-gap"
+        };
+        d.ours.push(evidence(ra, vi, why));
+    }
+    for g in &m.oracle {
+        let j = g[0];
         let (rb, vj) = (&p.b[j], vb[j].as_ref());
         match canon(&vb[j]) {
             Canon::No => d
                 .oracle
-                .extend(jb.iter().map(|&j| evidence(&p.b[j], vj, "orphan"))),
+                .extend(g.iter().map(|&j| evidence(&p.b[j], vj, "orphan"))),
             Canon::Yes => {
-                let why = match (p.a_cut, d.lowest, hb[j]) {
-                    (false, _, _) => Err("an oracle-only canonical row; our list is complete"),
-                    (true, Some(lo), Some(h)) if h < lo => Ok("below-our-window"),
-                    (true, Some(lo), Some(h)) if h == lo => Ok("at-our-boundary-height"),
-                    (true, Some(_), Some(_)) => {
-                        Err("an oracle-only canonical row strictly inside our window")
+                let beyond = |h: u64, bd: u64| if w.asc { h > bd } else { h < bd };
+                let place = match (p.a_cut, d.lowest, hb[j]) {
+                    (false, _, _) => {
+                        Place::Inside("an oracle-only canonical row; our list is complete".into())
                     }
-                    _ => Err("an oracle-only canonical row without a height to place"),
+                    (true, Some(bd), Some(h)) if beyond(h, bd) => Place::Outside(if w.asc {
+                        "above-our-window"
+                    } else {
+                        "below-our-window"
+                    }),
+                    (true, Some(bd), Some(h)) if h == bd => after_our_cut(w.prefix, &p.a, rb),
+                    (true, Some(_), Some(_)) => Place::Inside(
+                        "an oracle-only canonical row strictly inside our window".into(),
+                    ),
+                    _ => Place::Inside(
+                        "an oracle-only canonical row without a height to place".into(),
+                    ),
                 };
-                match why {
-                    Ok(w) => {
-                        d.oracle.push(evidence(rb, vj, w));
+                match place {
+                    Place::Outside(why) => {
+                        d.oracle.push(evidence(rb, vj, why));
                         d.oracle
-                            .extend(jb[1..].iter().map(|&j| evidence(&p.b[j], vj, "duplicate")));
+                            .extend(g[1..].iter().map(|&j| evidence(&p.b[j], vj, "duplicate")));
                     }
-                    Err(w) => d
-                        .rejected
-                        .push((None, Some(rb.edge.clone()), w.to_string())),
+                    Place::Inside(why) => d.rejected.push((None, Some(rb.edge.clone()), why)),
+                    Place::Wait(why) => {
+                        d.needs_prefix |= w.prefix.is_none();
+                        d.undecided.push(format!("{why}: {}", rb.id.evidence()));
+                    }
                 }
             }
             Canon::Unknown => d.undecided.push(format!(
@@ -825,14 +1361,16 @@ pub fn realign(conn: &mut Value) -> bool {
     true
 }
 
-/// Node and ours reads of one compare, cached per key.
+/// Node and ours reads of one compare, cached per key. H8, the `payload.data` matcher and H7
+/// share one, so [`NODE_READS`] caps the compare.
 #[derive(Default)]
-struct Reads {
-    node: usize,
-    ours: usize,
+pub(crate) struct Reads {
+    pub(crate) node: usize,
+    pub(crate) ours: usize,
     polls: HashMap<(u8, String), Result<Option<Value>, String>>,
     headers: HashMap<(u8, u64), Result<Vec<Value>, String>>,
     payloads: HashMap<String, Result<Value, String>>,
+    by_hash: HashMap<String, Result<Option<u64>, String>>,
     chains: HashMap<String, Option<u8>>,
 }
 
@@ -845,19 +1383,33 @@ fn entry(path: &str, a: Option<Value>, b: Option<Value>) -> DiffEntry {
     }
 }
 
+/// The name of the root connection field of `data`.
+fn root_name(data: &Value) -> Option<String> {
+    data.as_object()?
+        .iter()
+        .find(|(_, v)| v.get("edges").is_some_and(Value::is_array) && v.get("pageInfo").is_some())
+        .map(|(k, _)| k.clone())
+}
+
 impl Ctx {
     /// R-P5P9-62 H7 on an oracle pair's root list (see the module docs). When every row is
     /// accounted for, the pages hold the matched rows, paired in ours' order, and the hit
     /// carries the evidence. When the node settles a row against ours, the matched rows are
     /// paired the same way and each such row gets a [`ROW_PATH`] entry. When anything
     /// cannot be settled, the pages stay as they were. The note says why, with the reads.
+    /// `op`: the document, for our longer read (I-1) and the filter's variables; without it
+    /// a boundary row is not excused.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn gql_window_referee(
         &self,
         ta: &Target,
+        op: Option<&GqlOp>,
+        vars: &Map<String, Value>,
         a: &mut Answer,
         b: &mut Answer,
         max: u64,
         root_scoped: bool,
+        st: &mut Reads,
     ) -> (Vec<DiffEntry>, Option<String>) {
         if root_scoped {
             return (Vec::new(), None);
@@ -892,25 +1444,66 @@ impl Ctx {
                 return (Vec::new(), note);
             }
         };
-        let mut st = Reads::default();
+        let query = op.map(|o| o.query.as_str());
+        let first_var = arg_var(query, "first");
+        // R-P5P9-64 I-3: a cut page of ours shorter than first × the pages fetched is not a
+        // window (a follow page that failed, or a short page).
+        let first = vars.get(&first_var).and_then(Value::as_u64);
+        let pages = a.ms.len() as u64;
+        if let (true, Some(f)) = (prep.a_cut && pages > 0, first) {
+            if (prep.a.len() as u64) < f * pages {
+                let note = format!(
+                    "H7 not explained: our cut page holds {} rows, fewer than first {f} × {pages} \
+                     pages; a short page is not a window",
+                    prep.a.len()
+                );
+                return (Vec::new(), Some(note));
+            }
+        }
+        let asc = a
+            .body
+            .get("data")
+            .and_then(root_name)
+            .is_some_and(|r| r == "blocksFromHeight");
+        let filter = Filter::from_vars(query, vars);
+        let (node0, ours0) = (st.node, st.ours);
         let mut va: Vec<Option<Verdict>> = vec![None; prep.a.len()];
         let mut vb: Vec<Option<Verdict>> = vec![None; prep.b.len()];
         for (side, i) in prep.reads() {
             let r = if side == 0 { &prep.a[i] } else { &prep.b[i] };
-            let v = self.h7_verdict(ta, r, &mut st).await;
+            let v = self.h7_verdict(ta, r, side == 1, st).await;
             if side == 0 {
                 va[i] = Some(v);
             } else {
                 vb[i] = Some(v);
             }
         }
-        let d = decide(&prep, &va, &vb, max);
-        let reads = format!("{} node reads, {} reads of ours", st.node, st.ours);
-        let ev_a = json!({"rows": prep.a.len(), "cut": prep.a_cut, "lowestHeight": d.lowest,
-            "oneSided": d.ours});
+        let ext;
+        let mut w = Window {
+            max,
+            asc,
+            filter: &filter,
+            prefix: None,
+        };
+        let mut d = decide(&prep, &va, &vb, &w);
+        if d.needs_prefix {
+            ext = match op {
+                Some(op) => {
+                    self.h7_prefix(ta, op, vars, &first_var, prep.a.len(), st)
+                        .await
+                }
+                None => Err("no document to read it with".into()),
+            };
+            w.prefix = Some(&ext);
+            d = decide(&prep, &va, &vb, &w);
+        }
+        let (nr, or) = (st.node - node0, st.ours - ours0);
+        let reads = format!("{nr} node reads, {or} reads of ours");
+        let ev_a = json!({"rows": prep.a.len(), "cut": prep.a_cut, "boundaryHeight": d.lowest,
+            "ascending": asc, "oneSided": d.ours});
         let ev_b = json!({"rows": prep.b.len(), "cut": prep.b_cut,
-            "lowestCreationTime": d.oracle_lowest_ctime, "nodeReads": st.node,
-            "oursReads": st.ours, "oneSided": d.oracle});
+            "lastCreationTime": d.oracle_lowest_ctime, "nodeReads": nr,
+            "oursReads": or, "oneSided": d.oracle});
         if !d.undecided.is_empty() || !d.grouped {
             let mut out = Vec::new();
             let mut whys = d.undecided.clone();
@@ -978,17 +1571,62 @@ impl Ctx {
         (out, Some(note))
     }
 
-    /// One row's node verdict (single-row reads, cached per compare).
-    async fn h7_verdict(&self, ta: &Target, r: &Row, st: &mut Reads) -> Verdict {
-        let id = &r.id;
-        let n = r.edge.get("node").unwrap_or(&Value::Null);
-        let chain = match id.chain {
+    /// R-P5P9-64 (I-1): one read of ours with the same document and variables, `first` = the
+    /// rows on our page + [`PREFIX_EXTRA`], one page with no `after`: each row's identity key
+    /// and node.
+    async fn h7_prefix(
+        &self,
+        ta: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        first_var: &str,
+        n: usize,
+        st: &mut Reads,
+    ) -> Result<Vec<(String, Value)>, String> {
+        if !vars.get(first_var).is_some_and(Value::is_u64) {
+            return Err(format!("no page size ({first_var}) to read it with"));
+        }
+        let mut v = vars.clone();
+        v.insert(first_var.to_string(), json!(n + PREFIX_EXTRA));
+        v.remove(&arg_var(Some(&op.query), "after"));
+        st.ours += 1;
+        let mut data = self
+            .gql_read(ta, &op.query, Value::Object(v))
+            .await
+            .ok_or("the read failed")?;
+        let edges = crate::graphql::root_connection(&mut data)
+            .and_then(|c| c.get("edges"))
+            .and_then(Value::as_array)
+            .ok_or("the read holds no list")?;
+        Ok(edges
+            .iter()
+            .map(|e| {
+                (
+                    row_id(e).key().unwrap_or_default(),
+                    e.get("node").cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect())
+    }
+
+    /// One row's node verdict (single-row reads, cached per compare). `oracle`: the row is
+    /// the oracle's.
+    async fn h7_verdict(&self, ta: &Target, r: &Row, oracle: bool, st: &mut Reads) -> Verdict {
+        let chain = match r.id.chain {
             Some(c) => Some(c),
-            None => self.h7_chain(ta, id, st).await,
+            None => self.h7_chain(ta, &r.id, st).await,
         };
         let Some(chain) = chain else {
             return Verdict::unknown("no chain for the row");
         };
+        let mut v = self.h7_verdict_on(chain, r, oracle, st).await;
+        v.chain = Some(chain);
+        v
+    }
+
+    async fn h7_verdict_on(&self, chain: u8, r: &Row, oracle: bool, st: &mut Reads) -> Verdict {
+        let id = &r.id;
+        let n = r.edge.get("node").unwrap_or(&Value::Null);
         if id.kind == Some(Kind::Block) {
             let Some(h) = id.height else {
                 return Verdict::unknown("a block row without a height");
@@ -1006,11 +1644,34 @@ impl Ctx {
             Err(w) => return Verdict::unknown(w),
         };
         if let Some(p) = polled {
-            return poll_verdict(id, n, &p);
+            // A row in another block than the node's, without a height: the node's height of
+            // its block decides whether that block is an orphan at the key's height.
+            let pb = p.pointer("/metaData/blockHash").and_then(Value::as_str);
+            let bh = match (&id.block, id.height) {
+                (Some(b), None) if pb != Some(b.as_str()) => {
+                    match self.h7_block_height(chain, b, st).await {
+                        Ok(h) => h,
+                        Err(w) => return Verdict::unknown(w),
+                    }
+                }
+                _ => None,
+            };
+            return poll_verdict(id, n, &p, oracle, bh);
         }
-        // Unknown to /poll: a coinbase row is settled by the node's block at its height.
-        let Some(h) = id.height else {
-            return Verdict::unknown("poll: key unknown, and no height to read a coinbase at");
+        // Unknown to /poll: a coinbase row, settled by the node's block at its height (its
+        // own, or the node's height of its block: R-P5P9-63 (5)).
+        let h = match (id.height, &id.block) {
+            (Some(h), _) => h,
+            (None, Some(b)) => match self.h7_block_height(chain, b, st).await {
+                Ok(Some(h)) => h,
+                Ok(None) => return Verdict::unknown("header: the node does not know the block"),
+                Err(w) => return Verdict::unknown(w),
+            },
+            (None, None) => {
+                return Verdict::unknown(
+                    "poll: key unknown, and no height or block to read a coinbase at",
+                )
+            }
         };
         let hs = match self.h7_headers(chain, h, st).await {
             Ok(hs) => hs,
@@ -1025,11 +1686,11 @@ impl Ctx {
                 }
             }
         }
-        coinbase_verdict(id, n, &hs, payload.as_ref())
+        coinbase_verdict(id, n, h, &hs, payload.as_ref(), oracle)
     }
 
     /// Takes one node read from the compare's cap and the run's budget.
-    fn h7_take(&self, st: &mut Reads) -> Result<(), String> {
+    pub(crate) fn h7_take(&self, st: &mut Reads) -> Result<(), String> {
         if st.node >= NODE_READS {
             return Err(format!(
                 "the cap of {NODE_READS} node reads per compare is reached"
@@ -1088,6 +1749,59 @@ impl Ctx {
         r
     }
 
+    /// R-P5P9-63 (5): the node's height of block `hash`, by the node's header-by-hash route
+    /// (`GET /chain/{c}/header/{hash}`, object encoding); `None` when the node does not know
+    /// the block. The node client has no such call, so the harness reads it with its own
+    /// client, paced at `node_max_rps`, one read in flight.
+    async fn h7_block_height(
+        &self,
+        chain: u8,
+        hash: &str,
+        st: &mut Reads,
+    ) -> Result<Option<u64>, String> {
+        if let Some(v) = st.by_hash.get(hash) {
+            return v.clone();
+        }
+        self.h7_take(st)?;
+        let (client, limiter) = self
+            .gql
+            .header_reader(self.cfg.node_max_rps, self.cfg.node.timeout_ms);
+        let path = format!(
+            "chainweb/0.0/{}/chain/{chain}/header/{hash}",
+            self.cfg.network
+        );
+        let r = async {
+            let url = self
+                .node
+                .base()
+                .join(&path)
+                .map_err(|e| format!("header url: {e}"))?;
+            limiter.acquire().await;
+            let resp = client
+                .get(url)
+                .header("Accept", "application/json;blockheader-encoding=object")
+                .send()
+                .await
+                .map_err(|e| format!("header read failed: {e}"))?;
+            match resp.status().as_u16() {
+                404 => Ok(None),
+                200 => {
+                    let body = resp
+                        .bytes()
+                        .await
+                        .map_err(|e| format!("header read failed: {e}"))?;
+                    let v: Value = serde_json::from_slice(&body)
+                        .map_err(|e| format!("header is not JSON: {e}"))?;
+                    Ok(v.get("height").and_then(Value::as_u64))
+                }
+                s => Err(format!("header read failed: HTTP {s}")),
+            }
+        }
+        .await;
+        st.by_hash.insert(hash.to_string(), r.clone());
+        r
+    }
+
     /// The chain of a row that selects none: ours' block for its block hash, else ours'
     /// transaction for its request key (one read of ours each, cached per block).
     async fn h7_chain(&self, ta: &Target, id: &RowId, st: &mut Reads) -> Option<u8> {
@@ -1119,7 +1833,7 @@ impl Ctx {
 // ---------------------------------------------------------------------------------------------
 // R-P5P9-62 H8: `Transfer.orderIndex`
 
-/// Request keys H8 reads (one read of ours each) per compare at most.
+/// Request keys H8 reads (one node `/poll` each) per compare at most.
 pub const ORDER_INDEX_READS: usize = 20;
 
 /// Whether two transfer rows hold the same transfer: every field both select is equal
@@ -1138,36 +1852,44 @@ pub fn same_transfer(x: &Value, y: &Value) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => true,
     }) && match (x.get("amount"), y.get("amount")) {
-        (Some(a), Some(b)) => same_amount(a, b),
+        (Some(a), Some(b)) => same_amount(a, b, true),
         _ => true,
     }
 }
 
-/// H8 on one request key. `ours`: our transaction's transfers (their indexes, which are
-/// TRANSFER event indexes, and rows), from our own `transfers(requestKey)`; `oracle`: the
-/// oracle's rows of that key with their values. Returns (the oracle's value, our index)
-/// per oracle row when each value is the rank, among our indexes, of the transfer with the
-/// row's content; else why not.
-pub fn rank_map(
-    ours: &[(i64, Value)],
+/// H8 on one request key against the node's events of its transaction (R-P5P9-64 M-4): the
+/// oracle's value r of a row is the rank of a TRANSFER event among the node's TRANSFER events
+/// (event order); that event must have the row's content, and the row must select its amount
+/// and an account (with no content selected there is no remap). Returns (the oracle's value,
+/// the node's event index, which is ours' numbering) per oracle row, else why not.
+pub fn node_rank_map(
+    events: &[Value],
     oracle: &[(i64, &Value)],
 ) -> Result<Vec<(i64, i64)>, String> {
-    let mut idx: Vec<&(i64, Value)> = ours.iter().collect();
-    idx.sort_by_key(|x| x.0);
+    let xs: Vec<(usize, &Value)> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.get("name").and_then(Value::as_str) == Some("TRANSFER"))
+        .collect();
     let mut out = Vec::new();
     for (r, row) in oracle {
-        let Some((i, mine)) = usize::try_from(*r).ok().and_then(|u| idx.get(u).copied()) else {
+        let content = sel(row, "amount").is_some()
+            && (sel(row, "senderAccount").is_some() || sel(row, "receiverAccount").is_some());
+        if !content {
+            return Err("the row selects no amount and account to rank it by".into());
+        }
+        let Some(&(i, ev)) = usize::try_from(*r).ok().and_then(|u| xs.get(u)) else {
             return Err(format!(
-                "the oracle's {r} is past our {} transfers",
-                idx.len()
+                "the oracle's {r} is past the node's {} TRANSFER events",
+                xs.len()
             ));
         };
-        if !same_transfer(row, mine) {
+        if !transfer_matches(row, ev, true) {
             return Err(format!(
-                "the oracle's {r} is not the rank of our transfer with its content"
+                "the oracle's {r} is not the rank of the node's TRANSFER event with its content"
             ));
         }
-        out.push((*r, *i));
+        out.push((*r, i as i64));
     }
     Ok(out)
 }
@@ -1202,15 +1924,17 @@ pub fn reindex_transfer(node: &mut Value, i: i64) {
 impl Ctx {
     /// R-P5P9-62 H8 on the root list of an oracle pair: for each request key with an oracle
     /// transfer row that ours does not hold at the same identity with the same content (at
-    /// most [`ORDER_INDEX_READS`]), one read of our own `transfers(requestKey)`. When every
-    /// oracle value of that key is the rank of our transfer with its content, the oracle's
-    /// rows take our indexes (`orderIndex` and the relay id); the hit lists each key's
-    /// indexes. Anything else leaves the rows as they were.
+    /// most [`ORDER_INDEX_READS`]), one node `/poll` (R-P5P9-64 M-4). When every oracle value
+    /// of that key is the rank of the node's TRANSFER event with its content, the oracle's
+    /// rows take that event's index (`orderIndex` and the relay id), which is ours' numbering;
+    /// H7 or the diff then checks ours against it. The hit lists each key's indexes. Anything
+    /// else leaves the rows as they were.
     pub(crate) async fn gql_transfer_order(
         &self,
         ta: &Target,
         a: &Answer,
         b: &mut Answer,
+        st: &mut Reads,
     ) -> Option<DiffEntry> {
         let mut da = a.body.get("data")?.clone();
         let ca = crate::graphql::root_connection(&mut da)?;
@@ -1229,7 +1953,7 @@ impl Ctx {
             .get_mut("data")
             .and_then(crate::graphql::root_connection)?;
         let edges = cb.get_mut("edges")?.as_array_mut()?;
-        let mut keys: Vec<(String, Option<u8>)> = Vec::new();
+        let mut keys: Vec<(String, RowId)> = Vec::new();
         for e in edges.iter() {
             let Some(id) = transfer(e) else { continue };
             let (Some(k), Some(rk)) = (id.key(), id.rk.clone()) else {
@@ -1239,35 +1963,26 @@ impl Ctx {
                 .get(&k)
                 .is_some_and(|n| same_transfer(n, e.get("node").unwrap_or(&Value::Null)));
             if !held && !keys.iter().any(|(x, _)| *x == rk) {
-                keys.push((rk, id.chain));
+                keys.push((rk, id));
             }
         }
-        let q = "query($k: String!) { transfers(requestKey: $k, first: 100) { pageInfo { hasNextPage } edges { node { orderIndex amount senderAccount receiverAccount moduleName chainId blockHash requestKey } } } }";
         let mut evidence = Vec::new();
         let mut reads = 0;
-        for (rk, chain) in keys.into_iter().take(ORDER_INDEX_READS) {
+        for (rk, id) in keys.into_iter().take(ORDER_INDEX_READS) {
+            let chain = match id.chain {
+                Some(c) => Some(c),
+                None => self.h7_chain(ta, &id, st).await,
+            };
+            let Some(chain) = chain else { continue };
             reads += 1;
-            let Some(d) = self.gql_read(ta, q, json!({ "k": rk })).await else {
+            let Ok(Some(p)) = self.h7_poll(chain, &rk, st).await else {
                 continue;
             };
-            if d.pointer("/transfers/pageInfo/hasNextPage") != Some(&Value::Bool(false)) {
-                continue;
-            }
-            let mine: Vec<(i64, Value)> = d
-                .pointer("/transfers/edges")
+            let events: Vec<Value> = p
+                .get("events")
                 .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.get("node"))
-                .filter(|n| {
-                    chain.is_none_or(|c| {
-                        n.get("chainId").and_then(text).as_deref() == Some(&c.to_string())
-                    })
-                })
-                .filter_map(|n| {
-                    Some((n.get("orderIndex").and_then(text)?.parse().ok()?, n.clone()))
-                })
-                .collect();
+                .cloned()
+                .unwrap_or_default();
             let theirs: Vec<(usize, i64)> = edges
                 .iter()
                 .enumerate()
@@ -1280,16 +1995,21 @@ impl Ctx {
                 .iter()
                 .map(|(j, r)| (*r, edges[*j].get("node").unwrap_or(&Value::Null)))
                 .collect();
-            match rank_map(&mine, &rows) {
+            match node_rank_map(&events, &rows) {
                 Ok(map) => {
                     for ((j, _), (_, i)) in theirs.iter().zip(&map) {
                         if let Some(n) = edges[*j].get_mut("node") {
                             reindex_transfer(n, *i);
                         }
                     }
-                    let mut idx: Vec<i64> = mine.iter().map(|x| x.0).collect();
-                    idx.sort_unstable();
-                    evidence.push(json!({"requestKey": rk, "ours": idx,
+                    let node: Vec<usize> = events
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.get("name").and_then(Value::as_str) == Some("TRANSFER"))
+                        .map(|(i, _)| i)
+                        .collect();
+                    evidence.push(json!({"requestKey": rk, "chain": chain,
+                        "nodeTransferIndexes": node,
                         "oracle": map.iter().map(|x| x.0).collect::<Vec<_>>(),
                         "mapped": map.iter().map(|x| x.1).collect::<Vec<_>>()}));
                 }
@@ -1299,7 +2019,7 @@ impl Ctx {
         (!evidence.is_empty()).then(|| {
             entry(
                 ORDER_INDEX_PATH,
-                Some(json!({"readsOfOurs": reads})),
+                Some(json!({"nodePolls": reads})),
                 Some(Value::Array(evidence)),
             )
         })
@@ -1390,6 +2110,7 @@ impl Ctx {
         vars: &Map<String, Value>,
         a: &Answer,
         b: &mut Answer,
+        st: &mut Reads,
     ) -> Option<DiffEntry> {
         let ours = payload_data_txs(&a.body);
         let theirs = payload_data_txs(&b.body);
@@ -1397,7 +2118,7 @@ impl Ctx {
             .get("chainId")
             .and_then(text)
             .and_then(|c| c.parse::<u8>().ok());
-        let mut st = Reads::default();
+        let node0 = st.node;
         let mut checked: HashMap<String, bool> = HashMap::new();
         let mut evidence = Vec::new();
         for (rk, chain_b, ptr_b) in theirs {
@@ -1417,7 +2138,7 @@ impl Ctx {
                 None => {
                     let chain = chain_a.or(chain_b).or(var_chain);
                     let found = match chain {
-                        Some(c) => self.node_cont_data_null(c, &rk, &mut st).await,
+                        Some(c) => self.node_cont_data_null(c, &rk, st).await,
                         None => Err("no chain".into()),
                     };
                     match &found {
@@ -1439,7 +2160,7 @@ impl Ctx {
         (!evidence.is_empty()).then(|| {
             entry(
                 PAYLOAD_DATA_PATH,
-                Some(json!({"nodeReads": st.node})),
+                Some(json!({"nodeReads": st.node - node0})),
                 Some(Value::Array(evidence)),
             )
         })
@@ -1544,21 +2265,21 @@ mod tests {
         let other = json!({"name": "X", "params": []});
         let p = poll("B", 9, json!([other, xfer]));
         assert_eq!(
-            poll_verdict(&id(Some("B"), None, Some(1)), &n, &p).canon,
+            poll_verdict(&id(Some("B"), None, Some(1)), &n, &p, false, None).canon,
             Canon::Yes
         );
         assert_eq!(
-            poll_verdict(&id(Some("C"), None, Some(1)), &n, &p).canon,
+            poll_verdict(&id(Some("C"), None, Some(1)), &n, &p, false, None).canon,
             Canon::No
         );
         // The row's index points at another event: not the node's numbering, unknown.
         assert_eq!(
-            poll_verdict(&id(None, Some(9), Some(0)), &n, &p).canon,
+            poll_verdict(&id(None, Some(9), Some(0)), &n, &p, false, None).canon,
             Canon::Unknown
         );
         let p2 = poll("B", 9, json!([other]));
         assert_eq!(
-            poll_verdict(&id(None, Some(9), None), &n, &p2).canon,
+            poll_verdict(&id(None, Some(9), None), &n, &p2, false, None).canon,
             Canon::No
         );
         // A coinbase row: the only header at its height and its coinbase request key.
@@ -1569,15 +2290,18 @@ mod tests {
         let hd = vec![json!({"hash": "B", "payloadHash": "P"})];
         let r = id(None, Some(9), Some(0));
         assert_eq!(
-            coinbase_verdict(&r, &n, &hd, Some(&cb("k"))).canon,
+            coinbase_verdict(&r, &n, 9, &hd, Some(&cb("k")), false).canon,
             Canon::Yes
         );
         assert_eq!(
-            coinbase_verdict(&r, &n, &hd, Some(&cb("j"))).canon,
+            coinbase_verdict(&r, &n, 9, &hd, Some(&cb("j")), false).canon,
             Canon::No
         );
         let two = vec![hd[0].clone(), json!({"hash": "F"})];
-        assert_eq!(coinbase_verdict(&r, &n, &two, None).canon, Canon::Unknown);
+        assert_eq!(
+            coinbase_verdict(&r, &n, 9, &two, None, false).canon,
+            Canon::Unknown
+        );
         // A block row: the node's only header at the height.
         let mut b = id(Some("B"), Some(9), None);
         b.kind = Some(Kind::Block);

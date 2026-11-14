@@ -540,6 +540,8 @@ pub struct GqlState {
     /// Node reads the node-refereed rules may still make in this process (R-P5P9-62: the
     /// referee's run cap; unbounded in a live run, where each compare has its own cap).
     pub node_budget: AtomicUsize,
+    /// The client and limiter of H7's header-by-hash reads (R-P5P9-63 (5)).
+    header: std::sync::OnceLock<(reqwest::Client, Arc<crate::target::Limiter>)>,
 }
 
 impl GqlState {
@@ -569,6 +571,23 @@ impl GqlState {
             oracle_pause_until: Mutex::new(None),
             local: std::sync::OnceLock::new(),
             node_budget: AtomicUsize::new(usize::MAX),
+            header: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The client and limiter (at `rps`, one read in flight) of the node's header-by-hash
+    /// reads, which the node client does not offer (R-P5P9-63 (5)).
+    pub(crate) fn header_reader(
+        &self,
+        rps: u32,
+        timeout_ms: u64,
+    ) -> &(reqwest::Client, Arc<crate::target::Limiter>) {
+        self.header.get_or_init(|| {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(timeout_ms))
+                .build()
+                .unwrap_or_default();
+            (client, crate::target::Limiter::new(f64::from(rps.max(1))))
         })
     }
 
@@ -914,8 +933,35 @@ pub fn compare_answers_with(
     d
 }
 
+/// Why a follow page fails the whole fetch (R-P5P9-64 I-3): a status other than 200,
+/// GraphQL `errors`, no `data` or no root connection. Such a page is never read as a cut page.
+pub fn follow_page_fault(status: u16, page: &Value) -> Option<String> {
+    if status != 200 {
+        return Some(format!("HTTP {status}"));
+    }
+    if let Some(e) = page
+        .get("errors")
+        .and_then(Value::as_array)
+        .filter(|e| !e.is_empty())
+    {
+        return Some(format!(
+            "errors: {}",
+            crate::report::trim_escaped(&Value::Array(e.clone()).to_string(), 300)
+        ));
+    }
+    let Some(d) = page.get("data").filter(|d| !d.is_null()) else {
+        return Some("no data".into());
+    };
+    let root = d.as_object().and_then(|o| {
+        o.values()
+            .find(|v| v.get("edges").is_some_and(Value::is_array) && v.get("pageInfo").is_some())
+    });
+    root.is_none().then(|| "no root connection".into())
+}
+
 /// Sends `op` and follows `hasNextPage`/`after` up to `depth` more pages (the root
-/// connection's edges are concatenated; the last page's `pageInfo` is kept).
+/// connection's edges are concatenated; the last page's `pageInfo` is kept). A follow page
+/// that fails ([`follow_page_fault`]) fails the fetch.
 pub async fn fetch_pages(
     t: &Target,
     op: &GqlOp,
@@ -949,6 +995,9 @@ pub async fn fetch_pages(
         let c = t.post_json(&body_of(op, &vars)).await?;
         ms.push(c.ms);
         let mut next: Value = serde_json::from_slice(&c.body).context("page is not JSON")?;
+        if let Some(why) = follow_page_fault(c.status, &next) {
+            anyhow::bail!("{}: follow page {} failed: {why}", t.name, pages + 1);
+        }
         let Some(nd) = next.get_mut("data").filter(|d| !d.is_null()) else {
             break;
         };
@@ -1334,7 +1383,7 @@ impl Ctx {
         }
         // R-P5P9-62: H7 and the diff.
         let (mut d, note) = self
-            .gql_settle(ta, vars, &mut a, &mut b, max, root_scoped)
+            .gql_settle_op(ta, Some(op), vars, &mut a, &mut b, max, root_scoped)
             .await;
         d.extend(limit);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
@@ -1360,10 +1409,32 @@ impl Ctx {
         max: u64,
         root_scoped: bool,
     ) -> (Vec<DiffEntry>, Option<String>) {
-        // H8 first: the oracle's transfer rows take our indexes, so H7 matches them.
-        let h8 = self.gql_transfer_order(ta, a, b).await;
-        let data = self.gql_payload_data(vars, a, b).await;
-        let (h7, note) = self.gql_window_referee(ta, a, b, max, root_scoped).await;
+        self.gql_settle_op(ta, None, vars, a, b, max, root_scoped)
+            .await
+    }
+
+    /// [`Ctx::gql_settle`] with the operation's document, which H7 needs for our longer read
+    /// (R-P5P9-64, I-1) and the filter's variables (R-P5P9-63 (1)). Without it an oracle-only
+    /// row at our boundary height is not excused. H8, the `payload.data` matcher and H7 share
+    /// one node read cap (R-P5P9-63 (4)).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_settle_op(
+        &self,
+        ta: &Target,
+        op: Option<&GqlOp>,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        root_scoped: bool,
+    ) -> (Vec<DiffEntry>, Option<String>) {
+        let mut st = crate::graphql_window::Reads::default();
+        // H8 first: the oracle's transfer rows take the node's indexes, so H7 matches them.
+        let h8 = self.gql_transfer_order(ta, a, b, &mut st).await;
+        let data = self.gql_payload_data(vars, a, b, &mut st).await;
+        let (h7, note) = self
+            .gql_window_referee(ta, op, vars, a, b, max, root_scoped, &mut st)
+            .await;
         let mut d = compare_answers_with(
             a,
             b,
