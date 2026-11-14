@@ -25,8 +25,9 @@
 //! DIR`, `run`).
 //! On a refusal nothing is created; on a later failure what this run created is removed.
 //!
-//! The snapshot runs as the data dir's owner (the service user); root is refused on a data
-//! dir it does not own ([`refuse_root`]) and only pre-creates an empty `--out`. A listed file
+//! The snapshot runs as the data dir's owner (the service user); root is refused unless it owns
+//! the whole tree (the data dir, `segments/` and an existing `--out`; [`refuse_root`]), and
+//! only pre-creates an empty `--out`. A listed file
 //! is placed only when it is a regular file: a symlink at its name is refused, never followed
 //! ([`place`]). The manifest's `network` is a plain name (`Manifest::validate`), so a listed
 //! name never leaves `segments/`.
@@ -124,7 +125,12 @@ fn snapshot_as(euid: u32, a: &SnapshotArgs) -> anyhow::Result<SnapshotReport> {
     let owner = fs::metadata(&a.data_dir)
         .with_context(|| format!("stat {}", a.data_dir.display()))?
         .uid();
-    refuse_root(euid, owner)?;
+    let below = if euid == 0 {
+        tree_owners(a)?
+    } else {
+        Vec::new()
+    };
+    refuse_root(euid, owner, &below)?;
     let hs = HotStore::open_ro(&hot_dir(&a.data_dir))?;
     snapshot_with(a, &hs, NAME_WAIT_PAUSE, &mut |p, _| {
         if let (Point::Manifest, Some(d)) = (p, sleep) {
@@ -149,21 +155,64 @@ fn snapshot_with(
     r
 }
 
-/// Refuses a snapshot run as root (`euid` 0) of a data dir that root does not own
-/// (`data_owner`: the uid owning the data dir). The service user owns the data dir and may be
-/// compromised (the API runs as it); root reading and writing by path in a tree that user
-/// controls could be pointed at any file on the host. The snapshot runs as the data dir's
-/// owner; root only creates the empty `--out` for it first.
-fn refuse_root(euid: u32, data_owner: u32) -> anyhow::Result<()> {
-    if euid == 0 && data_owner != 0 {
+/// Refuses a snapshot run as root (`euid` 0) unless root owns the whole tree it reads and
+/// writes by path: the data dir (`data_owner`: the uid owning it) and each of `below` (path,
+/// owner; [`tree_owners`]). The service user owns the data dir and may be compromised (the
+/// API runs as it); root reading and writing by path in a tree that user controls could be
+/// pointed at any file on the host. The snapshot runs as the data dir's owner; root only
+/// creates the empty `--out` for it first. The refusal names every path root does not own.
+fn refuse_root(euid: u32, data_owner: u32, below: &[(PathBuf, u32)]) -> anyhow::Result<()> {
+    if euid != 0 {
+        return Ok(());
+    }
+    let others: Vec<String> = below
+        .iter()
+        .filter(|(_, uid)| *uid != 0)
+        .map(|(p, uid)| format!("{} (uid {uid})", p.display()))
+        .collect();
+    if data_owner != 0 {
+        let also = if others.is_empty() {
+            String::new()
+        } else {
+            format!(" (not root-owned either: {})", others.join(", "))
+        };
         bail!(
-            "snapshot refuses to run as root on a data dir owned by uid {data_owner}: run it as \
-             the data dir's owner (sudo -u kda-indexer kda-indexer ... snapshot --out DIR, or \
-             sudo -u '#{data_owner}' ...); when that user cannot create DIR, create it empty \
-             as root first (install -d -o kda-indexer -g kda-indexer -m 0750 DIR)"
+            "snapshot refuses to run as root on a data dir owned by uid {data_owner}{also}: run \
+             it as the data dir's owner (sudo -u kda-indexer kda-indexer ... snapshot --out \
+             DIR, or sudo -u '#{data_owner}' ...); when that user cannot create DIR, create it \
+             empty as root first (install -d -o kda-indexer -g kda-indexer -m 0750 DIR)"
+        );
+    }
+    if !others.is_empty() {
+        bail!(
+            "snapshot refuses to run as root: it runs as root only on a data dir whose whole \
+             tree root owns, and these are not root-owned: {}; run it as the data dir's owner",
+            others.join(", ")
         );
     }
     Ok(())
+}
+
+/// FV-3: the owners of what a root run reads and writes by path besides the data dir itself:
+/// `segments/`, and `--out` when it exists. A symlink counts with its own owner and, when that
+/// is root, its target's. Missing paths are left out.
+fn tree_owners(a: &SnapshotArgs) -> anyhow::Result<Vec<(PathBuf, u32)>> {
+    let mut v = Vec::new();
+    for p in [segments_dir(&a.data_dir), a.out.clone()] {
+        let m = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat {}", p.display())),
+        };
+        let mut uid = m.uid();
+        if uid == 0 && m.file_type().is_symlink() {
+            if let Ok(t) = fs::metadata(&p) {
+                uid = t.uid();
+            }
+        }
+        v.push((p, uid));
+    }
+    Ok(v)
 }
 
 /// Refuses an `--out` inside the data dir or not empty before creating anything, then creates
@@ -874,13 +923,36 @@ mod tests {
     /// any other user run.
     #[test]
     fn root_is_refused_on_a_data_dir_it_does_not_own() {
-        let e = super::refuse_root(0, 1001).unwrap_err().to_string();
+        let e = super::refuse_root(0, 1001, &[]).unwrap_err().to_string();
         assert!(e.contains("sudo -u kda-indexer"), "{e}");
         assert!(e.contains("uid 1001"), "{e}");
         assert!(e.contains("install -d"), "{e}");
-        super::refuse_root(0, 0).unwrap();
-        super::refuse_root(1001, 1001).unwrap();
-        super::refuse_root(1002, 1001).unwrap();
+        super::refuse_root(0, 0, &[]).unwrap();
+        super::refuse_root(1001, 1001, &[]).unwrap();
+        super::refuse_root(1002, 1001, &[]).unwrap();
+    }
+
+    /// FV-3: root on a root-owned data dir is refused when `segments/` or the existing
+    /// `--out` is not root-owned; the refusal names them. Other users are never refused.
+    #[test]
+    fn root_is_refused_below_a_root_owned_data_dir_it_does_not_own() {
+        let (seg, out) = (
+            std::path::PathBuf::from("/d/segments"),
+            std::path::PathBuf::from("/o"),
+        );
+        for (below, bad) in [
+            (
+                vec![(seg.clone(), 1001), (out.clone(), 0)],
+                "/d/segments (uid 1001)",
+            ),
+            (vec![(seg.clone(), 0), (out.clone(), 1001)], "/o (uid 1001)"),
+        ] {
+            let e = super::refuse_root(0, 0, &below).unwrap_err().to_string();
+            assert!(e.contains("whole tree root owns"), "{e}");
+            assert!(e.contains(bad), "{e}");
+        }
+        super::refuse_root(0, 0, &[(seg.clone(), 0), (out.clone(), 0)]).unwrap();
+        super::refuse_root(1001, 1001, &[(seg, 5), (out, 6)]).unwrap();
     }
 
     /// FV-2: the root refusal at its call site. Run as euid 0 on a data dir root does not own
@@ -905,6 +977,37 @@ mod tests {
         assert!(e.contains("refuses to run as root"), "{e}");
         assert!(!data.join("hot").exists());
         assert!(!out.exists());
+        assert!(fs::symlink_metadata(data.join("segments.swap.lock")).is_err());
+    }
+
+    /// FV-3: as root the snapshot runs only on a data dir whose whole tree root owns. Run as
+    /// euid 0 on a tree another uid owns (the test user's; chowned to 65534 when the tests
+    /// run as root), the refusal names `segments/` and the existing `--out` next to the data
+    /// dir, and the run leaves `--out` empty and creates nothing in the data dir.
+    #[test]
+    fn root_names_every_path_of_the_tree_it_does_not_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let seg = data.join("segments");
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&seg).unwrap();
+        fs::create_dir(&out).unwrap();
+        if rustix::process::geteuid().is_root() {
+            for p in [&data, &seg, &out] {
+                std::os::unix::fs::chown(p, Some(65534), None).unwrap();
+            }
+        }
+        let args = SnapshotArgs {
+            data_dir: data.clone(),
+            out: out.clone(),
+            copy: false,
+        };
+        let e = format!("{:#}", super::snapshot_as(0, &args).unwrap_err());
+        assert!(e.contains("refuses to run as root"), "{e}");
+        assert!(e.contains(&format!("{} (uid", seg.display())), "{e}");
+        assert!(e.contains(&format!("{} (uid", out.display())), "{e}");
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
+        assert!(!data.join("hot").exists());
         assert!(fs::symlink_metadata(data.join("segments.swap.lock")).is_err());
     }
 

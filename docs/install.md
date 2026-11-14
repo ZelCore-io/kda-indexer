@@ -244,7 +244,8 @@ sudo -u kda-indexer kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainn
 
 The snapshot runs as the service user, the data dir's owner; it refuses to run as root. The
 volume root is root-owned, so root only creates the empty directory for it first (the
-`install -d` line).
+`install -d` line). Run it as root only on a data dir whose whole tree root owns: as root it
+refuses a data dir, a `segments/` or an existing `--out` that root does not own.
 
 On the new host, install the package as above, but leave the data dir empty, stop the unit,
 and copy the snapshot in (the directory must end up owned by `kda-indexer`):

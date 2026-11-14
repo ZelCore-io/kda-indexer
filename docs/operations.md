@@ -252,7 +252,9 @@ sudo -u kda-indexer kda-indexer --config /opt/coins/kda-indexer/mainnet01/config
   there: root creates the empty `DIR` owned by `kda-indexer` first (the `install -d` line),
   and does nothing else. The command refuses to run as root on a data dir root does not own,
   before it opens or creates anything: as root it would read and write, by path, in a tree
-  the service user controls.
+  the service user controls. Run it as root only on a data dir whose whole tree root owns:
+  as root it also refuses when `segments/`, or `DIR` if it exists, is not root-owned, and
+  names each such path.
 - Every file the manifest (or `search/meta.json`) lists must be a regular file. A symbolic
   link at a listed file's name, or anything else that is not a regular file, makes the
   command fail: with `--copy` the file is opened with `O_NOFOLLOW` and checked on the open
