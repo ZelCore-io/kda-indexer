@@ -110,7 +110,13 @@ List pages (`transactions`, `transfers`, `events` and the other lists) share the
 read slots (half the read threads). Each client key (an IPv4 address or an IPv6 /64, as the
 rate limiter keys it) holds at most one of them. Up to 3 more of its heavy reads wait behind
 that one. Past that, one is refused at once with `LIMIT`. One page scans for at most 1 s; a
-sparse or empty match then ends with `TIMEOUT`: narrow the filter.
+sparse or empty match then ends with `TIMEOUT`: narrow the filter. A connection nested in one
+block (`Block.transactions`, `Block.events`), and the root `transactions`, `events` and
+`transfers` with a `blockHash` (and no `requestKey`), are not heavy reads: each reads only that
+block, by key, on a plain read slot, so one request over many blocks gets every block's page
+(R-P5P9-60). `minimumDepth` (it reads the chain tips) and, on `transfers`, a selected
+`crossChainTransfer` (it reads the pact's other chain) keep the heavy read for that call. A transaction's own `events` and `transfers` read nothing; they page the
+transaction already loaded.
 
 Complexity: each field costs 1 (`__typename` 0). A field that returns a page multiplies the
 cost of its selection by the page size it returns (`first`/`last` clamped to `max_page`, or
@@ -181,7 +187,8 @@ number open.
   hex of the hash read as a big-endian number. `target` and `weight` are the node's header
   form, base64url of the 32 little-endian bytes (the oracle agrees; R-P5P9-57 F1);
   `difficulty` is (2^256 − 1) / target; `nonce` and
-  `flags` are `Decimal` numbers; `epoch` and `creationTime` are `DateTime`s.
+  `flags` are `Decimal`s sent as strings (the oracle's form); `epoch` and `creationTime` are
+  `DateTime`s.
 - `neighbors` lists the adjacent blocks ascending by chain id. `parent` is `null` for a
   genesis block. `minerAccount` is the miner's current `coin` row on the block's chain; a
   miner without a row is a field error.
@@ -281,11 +288,11 @@ stays Kadena's (the parity test sees the same types, so there is nothing to pin 
 | `TransactionMeta.gasPrice` | `Float` | string, plain notation (`"0.00000001"`) |
 | `TransactionResult.gas`, `.transactionId` | `BigInt` | string (`"236"`) |
 | `Transfer.amount` | `Decimal` | string, plain notation without trailing zeros (`"0.00000236"`, `"26.57382"`) |
-| `Transfer.creationTime` | `DateTime` | the tx's `meta.creationTime` (whole seconds); a coinbase transfer has its block's time |
+| `Transfer.creationTime` | `DateTime` | the tx's `meta.creationTime` (whole seconds); a coinbase transfer has its block's time cut to whole seconds |
 | `ExecutionPayload.code` | `String` | the code JSON-quoted (`"\"(coin.transfer …)\""`) |
 | `Signer.scheme` | `String` | `""` when the signer names no scheme, else the command's scheme |
 | `Event.parameterText` | `String!` | numbers in JavaScript layout (`0.00000236`, `1e-7`); `parameters` keeps the node's numbers |
-| `Block.nonce` | `Decimal` | string |
+| `Block.nonce`, `Block.flags` | `Decimal` | string |
 | `Block.difficulty` | `BigInt` | always a JSON number, also above 2^53 |
 | `FungibleChainAccount.chainId` | `String` | string (already) |
 

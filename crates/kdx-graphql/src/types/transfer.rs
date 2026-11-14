@@ -108,11 +108,13 @@ impl Transfer {
         BigInt::new(i128::from(self.d.key().chain()))
     }
     /// The tx's `meta.creationTime` (whole seconds), as the oracle sends it (R-P5P9-57 F3);
-    /// a coinbase transfer (no command) has its block's time.
+    /// a coinbase transfer (no command) has its block's time cut to whole seconds, as the
+    /// oracle sends it (.916 and .004 both give .000; R-P5P9-60 D3).
     async fn creation_time(&self) -> DateTime {
-        self.d
-            .meta_creation_time()
-            .unwrap_or(DateTime(self.d.block.creation_time as i64))
+        self.d.meta_creation_time().unwrap_or_else(|| {
+            let micros = self.d.block.creation_time as i64;
+            DateTime(micros - micros.rem_euclid(1_000_000))
+        })
     }
     async fn cross_chain_transfer(&self, ctx: &Context<'_>) -> Result<Option<Transfer>> {
         let half = match &self.xchain {

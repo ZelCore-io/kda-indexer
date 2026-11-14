@@ -20,7 +20,7 @@ use crate::error::{bad_input, err, from_api, Code};
 use crate::gql;
 use crate::ids::{encode, NodeKey};
 use crate::scalars::{BigInt, DateTime, Decimal};
-use crate::txlist::{chain_arg, hash_arg, list, Item, KeyFilter, ListSpec, Rows, SourceSpec};
+use crate::txlist::{block_list, chain_arg, hash_arg, Item, KeyFilter, ListSpec, Rows, SourceSpec};
 
 /// Most heights `completedBlockHeights` takes (`heightCount`).
 pub const MAX_HEIGHT_COUNT: i32 = 100;
@@ -79,7 +79,7 @@ impl Block {
                 params: None,
             },
         };
-        let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
+        let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
         Ok(BlockEventsConnection {
             edges: p
                 .edges
@@ -96,8 +96,9 @@ impl Block {
             total: p.total,
         })
     }
+    /// The oracle's string, as `nonce` (R-P5P9-60 D2, rule (b): kadscan requests it).
     async fn flags(&self) -> Decimal {
-        decimal(self.b.feature_flags)
+        decimal(self.b.feature_flags).into_text()
     }
     async fn hash(&self) -> String {
         self.hash_text()
@@ -217,7 +218,7 @@ impl Block {
                 nft: false,
             },
         };
-        let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
+        let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
         Ok(BlockTransactionsConnection {
             edges: p
                 .edges
@@ -635,6 +636,194 @@ mod walk_tests {
         let hs: Vec<u64> = got.iter().map(|b| b.height).collect();
         assert_eq!(hs, [top, top + 1]);
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    /// D1 (R-P5P9-60): one HTTP request of one client over 4 heights × 5 chains gets all 20
+    /// blocks' nested `transactions` and `events` (40 connections), none refused with
+    /// `LIMIT`: a connection nested in one block takes no per-client heavy ticket. The same
+    /// client's account-scoped lists keep H-1: 1 runs, 3 wait, the others get `LIMIT`.
+    #[tokio::test]
+    async fn nested_block_connections_take_no_heavy_ticket() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let f = testutil::store();
+        for h in 10..14u64 {
+            for c in 0..5u8 {
+                f.apply(c, h, 0);
+            }
+        }
+        let client: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let post = |q: String| {
+            let app = crate::router(crate::build_schema(
+                f.st.clone(),
+                crate::GraphqlSettings::default(),
+                None,
+            ))
+            .with_state(f.st.clone());
+            let req = Request::post("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({ "query": q }).to_string()))
+                .unwrap();
+            async move {
+                let resp = kdx_api::server::as_client(client, app.oneshot(req))
+                    .await
+                    .unwrap();
+                let b = axum::body::to_bytes(resp.into_body(), 8 << 20)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+            }
+        };
+        let limits = |v: &serde_json::Value| {
+            v["errors"].as_array().map_or(0, |es| {
+                es.iter()
+                    .filter(|e| e["extensions"]["code"] == "LIMIT")
+                    .count()
+            })
+        };
+        let v = post(
+            "{ blocksFromHeight(startHeight: 10, endHeight: 13, \
+               chainIds: [\"0\", \"1\", \"2\", \"3\", \"4\"], first: 20) \
+               { edges { node { height transactions { totalCount } events { totalCount } } } } }"
+                .into(),
+        )
+        .await;
+        assert_eq!(limits(&v), 0, "{v}");
+        assert!(v["errors"].is_null(), "{v}");
+        let edges = v["blocksFromHeight"]["edges"].as_array();
+        let edges = edges.or(v["data"]["blocksFromHeight"]["edges"].as_array());
+        let edges = edges.expect("edges");
+        assert_eq!(edges.len(), 20);
+        for e in edges {
+            assert_eq!(e["node"]["transactions"]["totalCount"], 0, "{e}");
+            assert_eq!(e["node"]["events"]["totalCount"], 0, "{e}");
+        }
+        // H-1 still holds for the client's account-scoped lists.
+        let q: String = (0..20)
+            .map(|i| {
+                format!(
+                    "a{i}: transactions(accountName: \"k:a\", first: 1) {{ edges {{ cursor }} }} "
+                )
+            })
+            .collect();
+        // A read that ends during the poll pass frees its place early, so up to 16 are refused.
+        let v = post(format!("{{ {q} }}")).await;
+        let refused = limits(&v);
+        let most = 20 - 1 - kdx_api::server::HEAVY_WAITING_PER_CLIENT;
+        assert!(refused > 0 && refused <= most, "{refused}: {v}");
+    }
+
+    /// D1 round 2 (R-P5P9-60, C2-P7S concern 3): the root lists of one block
+    /// (`transactions`, `events`, `transfers` with `blockHash`) take no per-client heavy ticket
+    /// either: 5 concurrent requests of one client all answer, and so do 20 aliases in one.
+    /// What can read past the block keeps the ticket for that call: `minimumDepth`, and a
+    /// selected `crossChainTransfer`. An account-scoped root list is H-1 as before.
+    #[tokio::test]
+    async fn root_block_lists_take_no_heavy_ticket() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let f = testutil::store();
+        f.apply(0, 10, 0);
+        let client: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        let post = |q: String| {
+            let app = crate::router(crate::build_schema(
+                f.st.clone(),
+                crate::GraphqlSettings::default(),
+                None,
+            ))
+            .with_state(f.st.clone());
+            let req = Request::post("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({ "query": q }).to_string()))
+                .unwrap();
+            async move {
+                let resp = kdx_api::server::as_client(client, app.oneshot(req))
+                    .await
+                    .unwrap();
+                let b = axum::body::to_bytes(resp.into_body(), 8 << 20)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+            }
+        };
+        let limits = |v: &serde_json::Value| {
+            v["errors"].as_array().map_or(0, |es| {
+                es.iter()
+                    .filter(|e| e["extensions"]["code"] == "LIMIT")
+                    .count()
+            })
+        };
+        let v = post(
+            "{ blocksFromHeight(startHeight: 10, endHeight: 10, chainIds: [\"0\"], first: 1) \
+               { edges { node { hash } } } }"
+                .into(),
+        )
+        .await;
+        let hash = v["data"]["blocksFromHeight"]["edges"][0]["node"]["hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_owned();
+        // 5 concurrent requests of one client, each a root `transactions(blockHash:)`.
+        let q =
+            format!("{{ transactions(blockHash: \"{hash}\", first: 5) {{ edges {{ cursor }} }} }}");
+        let rs = tokio::join!(
+            post(q.clone()),
+            post(q.clone()),
+            post(q.clone()),
+            post(q.clone()),
+            post(q.clone())
+        );
+        for v in [&rs.0, &rs.1, &rs.2, &rs.3, &rs.4] {
+            assert_eq!(limits(v), 0, "{v}");
+            assert!(v["errors"].is_null(), "{v}");
+            assert_eq!(v["data"]["transactions"]["edges"], serde_json::json!([]));
+        }
+        // 20 aliases of the three root lists in one request.
+        let sel = |name: &str, i: usize, extra: &str| {
+            format!(
+                "{name}{i}: {name}(blockHash: \"{hash}\", first: 1{extra}) {{ edges {{ cursor }} }} "
+            )
+        };
+        let all: String = (0..20)
+            .map(|i| match i % 3 {
+                0 => sel("transactions", i, ""),
+                1 => sel("transfers", i, ""),
+                _ => sel("events", i, ", qualifiedEventName: \"coin.TRANSFER\""),
+            })
+            .collect();
+        let v = post(format!("{{ {all} }}")).await;
+        assert_eq!(limits(&v), 0, "{v}");
+        assert!(v["errors"].is_null(), "{v}");
+        // `minimumDepth` reads the chain tips: it keeps the heavy ticket.
+        let deep: String = (0..20)
+            .map(|i| sel("transactions", i, ", minimumDepth: 0"))
+            .collect();
+        let v = post(format!("{{ {deep} }}")).await;
+        assert!(limits(&v) > 0, "{v}");
+        // A selected `crossChainTransfer` reads the pact's other chain: it keeps the ticket.
+        let xc: String = (0..20)
+            .map(|i| {
+                format!(
+                    "x{i}: transfers(blockHash: \"{hash}\", first: 1) {{ edges {{ node {{ crossChainTransfer {{ amount }} }} }} }} "
+                )
+            })
+            .collect();
+        let v = post(format!("{{ {xc} }}")).await;
+        assert!(limits(&v) > 0, "{v}");
+        // The account-scoped root list is H-1 as before.
+        let acct: String = (0..20)
+            .map(|i| {
+                format!(
+                    "a{i}: transactions(accountName: \"k:a\", first: 1) {{ edges {{ cursor }} }} "
+                )
+            })
+            .collect();
+        let v = post(format!("{{ {acct} }}")).await;
+        assert!(limits(&v) > 0, "{v}");
     }
 
     /// R-P5P9-57 M2a: `blocksFromHeight` lists heights ascending (the oracle's order),

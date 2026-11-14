@@ -917,3 +917,159 @@ max_height = 100
     assert_eq!(kept["totalCount"], 2);
     assert_eq!(kept["edges"].as_array().unwrap().len(), 2);
 }
+
+/// A GraphQL server of whole block lists for the harness's list query (R-P5P9-60 H2): it
+/// pages `lists[<block hash>]` two rows at a time (whatever `first` asks), the cursor being
+/// the next index, and counts its calls.
+async fn list_server(lists: Value, calls: Arc<Mutex<usize>>) -> String {
+    let app = Router::new().route(
+        "/graphql",
+        post(move |Json(req): Json<Value>| {
+            let (lists, calls) = (lists.clone(), calls.clone());
+            async move {
+                *calls.lock().unwrap() += 1;
+                let v = &req["variables"];
+                let rows = lists[v["p"].as_str().unwrap_or("")]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let at: usize = v["after"].as_str().map_or(0, |c| c.parse().unwrap());
+                let end = (at + 2).min(rows.len());
+                let edges: Vec<Value> = rows[at..end].iter().map(|n| json!({"node": n})).collect();
+                Json(json!({"data": {"block": {"c": {
+                    "pageInfo": {"hasNextPage": end < rows.len(), "endCursor": end.to_string()},
+                    "edges": edges}}}}))
+            }
+        }),
+    );
+    format!("{}graphql", serve(app).await)
+}
+
+/// R-P5P9-60 H2: a nested block list cut on either side is read to its end on both sides at
+/// each target's rate, and the full sets compare: the same rows in another order and cut at
+/// other members are not a diff; a row only one side's full list has stays a diff; a list
+/// past `MAX_PAGES` pages, or with no parent hash in the answer, is left as it was.
+#[tokio::test]
+async fn h2_cut_block_lists_are_finished_and_compared_as_sets() {
+    use crate::graphql::{compare_answers_with, parse_op, Answer};
+    use crate::graphql_scope::MAX_PAGES;
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let t = |i: u32| json!({"id": format!("T{i}"), "hash": format!("h{i}")});
+    let all: Vec<Value> = (1..=7).map(t).collect();
+    let long: Vec<Value> = (1..=(2 * MAX_PAGES as u32 + 2)).map(t).collect();
+    let (ca, cb) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(0)));
+    // Ours lacks T7 in block "M"; both have the whole of "B" and the over-long "L".
+    let au = list_server(json!({"B": all, "M": all[..6], "L": long}), ca.clone()).await;
+    let bu = list_server(json!({"B": all, "M": all, "L": long}), cb.clone()).await;
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let out = dir.path();
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = "no-such-dir"
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_graphql"
+rate_rps = 1000.0
+[targets.b]
+url = "{bu}"
+kind = "kda_indexer_graphql"
+rate_rps = 1000.0
+"#
+    ))
+    .unwrap();
+    let ctx = Ctx::new(cfg).await.unwrap();
+    let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+    let op = parse_op(
+        "QBlock",
+        "query QBlock($hash: String!) { block(hash: $hash) { hash transactions(first: 5) { totalCount pageInfo { hasNextPage } edges { cursor node { id hash } } } } }",
+        false,
+    )
+    .unwrap();
+    let page = |hash: Option<&str>, total: usize, ids: &[u32]| {
+        let edges: Vec<Value> = ids
+            .iter()
+            .map(|i| json!({"cursor": "x", "node": t(*i)}))
+            .collect();
+        let mut block = json!({"transactions": {"totalCount": total,
+            "pageInfo": {"hasNextPage": total > ids.len()}, "edges": edges}});
+        if let Some(h) = hash {
+            block["hash"] = json!(h);
+        }
+        Answer {
+            body: json!({"data": {"block": block}}),
+            status: 200,
+            raw: String::new(),
+            ms: Vec::new(),
+        }
+    };
+    let (ctx, op) = (&ctx, &op);
+    let run = |mut a: Answer, mut b: Answer| async move {
+        let n = ctx
+            .gql_finish_lists(op, &serde_json::Map::new(), ta, tb, &mut a, &mut b)
+            .await;
+        let d = compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false);
+        let paths: Vec<String> = d.into_iter().map(|e| e.path).collect();
+        (n, paths)
+    };
+    // Block B: both pages cut at other members and in another order: finished, no diff.
+    let (n, d) = run(
+        page(Some("B"), 7, &[5, 4, 3, 2, 1]),
+        page(Some("B"), 7, &[3, 4, 5, 6, 7]),
+    )
+    .await;
+    assert_eq!((n, d.clone()), (1, vec![]), "{d:?}");
+    assert_eq!((*ca.lock().unwrap(), *cb.lock().unwrap()), (4, 4));
+    // Block M: ours' full list lacks T7, a real difference: both pages claim 7 (so the count
+    // does not differ), ours finishes to 6 rows, and the missing row stays a diff in the edges.
+    let (n, d) = run(
+        page(Some("M"), 7, &[1, 2, 3, 4, 5]),
+        page(Some("M"), 7, &[1, 2, 3, 4, 5]),
+    )
+    .await;
+    assert_eq!(n, 1);
+    assert!(
+        d.iter()
+            .any(|p| p.starts_with("/data/block/transactions/edges")),
+        "{d:?}"
+    );
+    // Block L: past MAX_PAGES pages: not finished; the cut pages stay a diff.
+    let (n, d) = run(
+        page(Some("L"), 42, &[1, 2, 3, 4, 5]),
+        page(Some("L"), 42, &[2, 3, 4, 5, 6]),
+    )
+    .await;
+    assert_eq!(n, 0);
+    assert!(
+        d.iter()
+            .any(|p| p.starts_with("/data/block/transactions/edges")),
+        "{d:?}"
+    );
+    // No parent hash in the answer: not finished, no reads.
+    let before = *ca.lock().unwrap();
+    let (n, d) = run(
+        page(None, 7, &[5, 4, 3, 2, 1]),
+        page(None, 7, &[3, 4, 5, 6, 7]),
+    )
+    .await;
+    assert_eq!(n, 0);
+    assert!(!d.is_empty());
+    assert_eq!(*ca.lock().unwrap(), before);
+    // Not cut on either side: compared as a set with no reads (order only).
+    let (n, d) = run(
+        page(Some("B"), 3, &[3, 1, 2]),
+        page(Some("B"), 3, &[1, 2, 3]),
+    )
+    .await;
+    assert_eq!((n, d), (0, vec![]));
+    assert_eq!(*ca.lock().unwrap(), before);
+}
