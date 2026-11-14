@@ -17,6 +17,7 @@ pub mod referee;
 pub mod report;
 pub mod rewards;
 pub mod run;
+pub mod streamed;
 pub mod summary;
 pub mod target;
 pub mod via_cwd;

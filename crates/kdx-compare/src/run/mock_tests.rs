@@ -4154,3 +4154,110 @@ async fn c3_a_row_absent_from_our_capped_longer_read_is_undecided() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// FVH-C4: `/v1/txs` answers over the body cap (R-P5P9-52 concern 5, R-P5P9-66 T-items)
+
+/// `/v1/txs` rows of `pad` bytes of code each.
+fn v1_rows(n: usize, pad: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| {
+            json!({"requestKey": format!("rk{i:04}"), "chain": i % 20,
+                "height": 7_000_000 - i as u64, "blockHash": format!("b{i}"), "amount": 1.5,
+                "code": "x".repeat(pad), "events": [], "gasLimit": 600})
+        })
+        .collect()
+}
+
+/// A server answering `body` on every path.
+async fn bytes_server(body: Vec<u8>) -> String {
+    let body = bytes::Bytes::from(body);
+    let app = Router::new().fallback(move || {
+        let b = body.clone();
+        async move { ([("content-type", "application/json")], b) }
+    });
+    serve(app).await
+}
+
+/// A context comparing compat (`a`) with kda-txs (`b`) on `/v1/txs`, each answering its bytes.
+async fn v1_setup(a: Vec<u8>, b: Vec<u8>, out: &std::path::Path) -> Ctx {
+    let (nu, au, bu) = (
+        node_server(NodeMock::default()).await,
+        bytes_server(a).await,
+        bytes_server(b).await,
+    );
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+rate_rps = 1000.0
+follow_depth = 0
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 20000
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_compat"
+[targets.b]
+url = "{bu}"
+kind = "kda_txs"
+"#
+    ))
+    .unwrap();
+    Ctx::new(cfg).await.unwrap()
+}
+
+/// One `/v1/txs` compare of the pair, without `process`'s 30 s kda-txs retry.
+async fn v1_compare(ctx: &Ctx, path: &str) -> super::Outcome {
+    let req = Request::new(path.to_string(), Origin::Seed, None);
+    ctx.vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
+        .await
+}
+
+/// Item 2: two answers over the 8 MiB cap compare by a streamed hash of the normalized
+/// rows: equal sets pass (order and kda-txs's `_id` aside), one differing row is a diff that
+/// names the row, with both copies from a bounded second read. Never an a-error, never cut.
+#[tokio::test]
+async fn c4_large_v1txs_answers_are_compared_by_streamed_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = v1_rows(250, 36_000);
+    let a = serde_json::to_vec(&rows).unwrap();
+    assert!(a.len() > crate::report::BODY_CAP, "{} bytes", a.len());
+    let mut same = rows.clone();
+    same.reverse();
+    same[3]["_id"] = json!("cache-3");
+    let ctx = v1_setup(a.clone(), serde_json::to_vec(&same).unwrap(), dir.path()).await;
+    let o = v1_compare(&ctx, "/v1/txs/k:big/coin/250").await;
+    assert_eq!(o.class, "match", "{:?}", o.record.map(|r| (r.note, r.diff)));
+    let mut one = rows.clone();
+    one[137]["amount"] = json!(2.5);
+    let ctx = v1_setup(a, serde_json::to_vec(&one).unwrap(), dir.path()).await;
+    let o = v1_compare(&ctx, "/v1/txs/k:big/coin/250").await;
+    let rec = o.record.expect("a record");
+    assert_eq!(o.class, "diff", "{:?} {:?}", rec.note, rec.diff);
+    let hash = rec
+        .diff
+        .iter()
+        .find(|e| e.path == crate::streamed::HASH_PATH)
+        .expect("the hash entry");
+    assert_ne!(hash.a, hash.b);
+    let row = rec
+        .diff
+        .iter()
+        .find(|e| e.path == format!("{}/rk0137", crate::streamed::ROW_PATH))
+        .expect("the first differing row is named");
+    assert_eq!(row.a.as_ref().unwrap()["amount"], json!(1.5));
+    assert_eq!(row.b.as_ref().unwrap()["amount"], json!(2.5));
+    // No allowlist entry explains either entry, on any /v1/txs request.
+    let (left, ids) = ctx.allow.classify_request(
+        &crate::normalize::RouteKind::V1Txs,
+        "/v1/txs/k:d7bf62aa/coin/250",
+        &[],
+        &rec.diff,
+    );
+    assert_eq!(left.len(), rec.diff.len(), "{ids:?}");
+}

@@ -75,6 +75,49 @@ impl HttpCapture {
     }
 }
 
+/// An answer over the target's body cap (`max_body_bytes`). A `/v1/txs` answer over the cap
+/// goes through the streamed compare ([`crate::streamed`], R-P5P9-52 concern 5); a composed
+/// `kda_txs_via_cwd` answer carries its capture, so it is not composed twice.
+#[derive(Debug)]
+pub struct BodyOverCap {
+    pub msg: String,
+    pub capture: Option<HttpCapture>,
+}
+
+impl std::fmt::Display for BodyOverCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for BodyOverCap {}
+
+/// A streamed read's status, kept headers, bytes read and time.
+#[derive(Debug, Clone)]
+pub struct StreamMeta {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub bytes: usize,
+    pub ms: u64,
+}
+
+/// The response headers the harness keeps: `content-type`, `Chainweb-Next` and
+/// `x-search-truncated`.
+fn kept_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    for k in ["content-type", "chainweb-next", "x-search-truncated"] {
+        if let Some(v) = resp.headers().get(k).and_then(|v| v.to_str().ok()) {
+            let name = if k == "chainweb-next" {
+                "Chainweb-Next"
+            } else {
+                k
+            };
+            headers.push((name.to_string(), v.to_string()));
+        }
+    }
+    headers
+}
+
 /// The HTTP client options of one target.
 #[derive(Debug, Clone)]
 pub struct ClientOpts {
@@ -229,6 +272,11 @@ impl Target {
         })
     }
 
+    /// The body cap of this target's reads.
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes
+    }
+
     fn full_url(&self, path_and_query: &str) -> String {
         let base = self.url.as_str().trim_end_matches('/');
         format!("{base}{path_and_query}")
@@ -251,11 +299,14 @@ impl Target {
                 }
             };
             if cap.body.len() > self.max_body_bytes {
-                anyhow::bail!(
-                    "{} GET {path_and_query}: composed body exceeds {} bytes",
-                    self.name,
-                    self.max_body_bytes
-                );
+                return Err(BodyOverCap {
+                    msg: format!(
+                        "{} GET {path_and_query}: composed body exceeds {} bytes",
+                        self.name, self.max_body_bytes
+                    ),
+                    capture: Some(cap),
+                }
+                .into());
             }
             return Ok(cap);
         }
@@ -303,24 +354,21 @@ impl Target {
             }
         };
         let status = resp.status().as_u16();
-        let mut headers = Vec::new();
-        for k in ["content-type", "chainweb-next", "x-search-truncated"] {
-            if let Some(v) = resp.headers().get(k).and_then(|v| v.to_str().ok()) {
-                let name = if k == "chainweb-next" {
-                    "Chainweb-Next"
-                } else {
-                    k
-                };
-                headers.push((name.to_string(), v.to_string()));
-            }
-        }
+        let headers = kept_headers(&resp);
         // Bodies are untrusted (replayed heavy routes, a misbehaving target): read with a cap.
         let limit = self.max_body_bytes;
+        let over = || -> anyhow::Error {
+            BodyOverCap {
+                msg: format!(
+                    "{} GET {path_and_query}: body exceeds {limit} bytes",
+                    self.name
+                ),
+                capture: None,
+            }
+            .into()
+        };
         if resp.content_length().is_some_and(|n| n > limit as u64) {
-            anyhow::bail!(
-                "{} GET {path_and_query}: body exceeds {limit} bytes",
-                self.name
-            );
+            return Err(over());
         }
         let mut resp = resp;
         let mut buf = Vec::new();
@@ -330,10 +378,7 @@ impl Target {
             .with_context(|| format!("{} GET {path_and_query} body", self.name))?
         {
             if buf.len() + chunk.len() > limit {
-                anyhow::bail!(
-                    "{} GET {path_and_query}: body exceeds {limit} bytes",
-                    self.name
-                );
+                return Err(over());
             }
             buf.extend_from_slice(&chunk);
         }
@@ -342,6 +387,76 @@ impl Target {
             status,
             headers,
             body,
+            ms: t0.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+impl Target {
+    /// `GET {url}{path_and_query}` read as a stream, for an answer over the body cap
+    /// ([`crate::streamed`]): each chunk goes to `sink`, which returns `true` to stop. Reads at
+    /// most `limit` bytes. One request under the shared limit (a `kda_txs_via_cwd` target
+    /// composes its answer as [`Target::get`] does). Transport failures and timeouts are
+    /// errors; any status is returned.
+    pub async fn get_chunks(
+        &self,
+        path_and_query: &str,
+        limit: usize,
+        sink: &mut (dyn FnMut(&[u8]) -> bool + Send),
+    ) -> anyhow::Result<StreamMeta> {
+        let t0 = Instant::now();
+        if self.kind == TargetKind::KdaTxsViaCwd {
+            let cap = if path_and_query.starts_with("/v1/txs") {
+                crate::via_cwd::fetch(self, path_and_query).await?
+            } else {
+                HttpCapture {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: Bytes::from_static(b"Not Found"),
+                    ms: 0,
+                }
+            };
+            let n = cap.body.len().min(limit);
+            sink(&cap.body[..n]);
+            return Ok(StreamMeta {
+                status: cap.status,
+                headers: cap.headers,
+                bytes: n,
+                ms: t0.elapsed().as_millis() as u64,
+            });
+        }
+        let _permit = self
+            .limiter
+            .in_flight
+            .acquire()
+            .await
+            .context("limiter closed")?;
+        self.limiter.acquire().await;
+        let url = self.full_url(path_and_query);
+        let mut resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("{} GET {path_and_query}", self.name))?;
+        let status = resp.status().as_u16();
+        let headers = kept_headers(&resp);
+        let mut bytes = 0usize;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .with_context(|| format!("{} GET {path_and_query} body", self.name))?
+        {
+            let n = chunk.len().min(limit - bytes);
+            bytes += n;
+            if sink(&chunk[..n]) || bytes >= limit {
+                break;
+            }
+        }
+        Ok(StreamMeta {
+            status,
+            headers,
+            bytes,
             ms: t0.elapsed().as_millis() as u64,
         })
     }

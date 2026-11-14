@@ -25,7 +25,7 @@ use crate::oracle;
 use crate::report::{
     iso_secs, now_secs, sh_quote, sh_url, trim_body, DailySummary, DiffLog, DiffRecord,
 };
-use crate::target::Target;
+use crate::target::{HttpCapture, Target};
 
 /// Workers sending requests concurrently (the shared limiter caps the rate). Kept low:
 /// slow chainweb-data queries (account/events pages) can take 30 s each.
@@ -187,7 +187,7 @@ fn num_canon_text(v: &Value) -> String {
 }
 
 /// Rewrites every JSON number as its nearest f64.
-fn numbers_as_f64(v: &mut Value) {
+pub(crate) fn numbers_as_f64(v: &mut Value) {
     match v {
         Value::Number(n) => {
             if let Some(x) = n.as_f64().and_then(serde_json::Number::from_f64) {
@@ -739,6 +739,16 @@ impl Ctx {
     ) -> Outcome {
         let pa = self.fetch_a(req, ta).await;
         let pb = self.fetch_a(req, tb).await;
+        // R-P5P9-52 concern 5, R-P5P9-66: a /v1/txs answer over the body cap on either side
+        // is compared by a streamed hash of the normalized rows, never cut or set aside.
+        let over = |p: &anyhow::Result<Paged>| {
+            p.as_ref()
+                .err()
+                .is_some_and(|e| e.is::<crate::target::BodyOverCap>())
+        };
+        if req.route == RouteKind::V1Txs && (over(&pa) || over(&pb)) {
+            return self.v1txs_streamed(req, ta, tb, pa, pb, extra).await;
+        }
         let (pa, pb) = match (pa, pb) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) => return self.a_error(req, ta, &tb.name, None, &format!("{e:#}")),
@@ -1474,6 +1484,193 @@ impl Ctx {
             o.class = "skew".into();
         }
         o
+    }
+
+    /// A `/v1/txs` compare where a side's answer is over the body cap (R-P5P9-52 concern 5,
+    /// R-P5P9-66; the 250-row page over 8 MB of run 6E): both sides are hashed row by row
+    /// ([`crate::streamed`]). Equal row sets pass; anything else is a diff with
+    /// `/~v1txs-streamed-hash`, and the first differing row, when a bounded second read finds
+    /// it, under `/~v1txs-streamed-row/<request key>`. No row rule of [`Ctx::vs_target`]
+    /// applies. Transport failures stay a-error or b-error.
+    async fn v1txs_streamed(
+        &self,
+        req: &Request,
+        ta: &Target,
+        tb: &Target,
+        pa: anyhow::Result<Paged>,
+        pb: anyhow::Result<Paged>,
+        extra: Option<DiffEntry>,
+    ) -> Outcome {
+        use crate::streamed::{self as st, HASH_PATH, ROW_PATH};
+        let f64 = tb.kind == crate::config::TargetKind::KdaTxs;
+        let (a, a_mem) = match self.streamed_side(req, ta, pa, f64).await {
+            Ok(x) => x,
+            Err(e) => return self.a_error(req, ta, &tb.name, None, &e),
+        };
+        let (b, b_mem) = match self.streamed_side(req, tb, pb, f64).await {
+            Ok(x) => x,
+            Err(e) => return self.b_error(req, ta, &tb.name, None, &e, String::new()),
+        };
+        let pa = Paged {
+            pages: vec![HttpCapture {
+                status: a.status,
+                headers: a.headers.clone(),
+                body: bytes::Bytes::new(),
+                ms: a.ms,
+            }],
+            items: Value::Null,
+            truncated: false,
+            boundary_dups: 0,
+        };
+        if a.status >= 500 {
+            return self.a_error(req, ta, &tb.name, Some(&pa), "5xx");
+        }
+        if tb.kind == crate::config::TargetKind::KdaTxs
+            && b.status == 404
+            && b.ms >= KDA_TXS_LIMIT_MS
+        {
+            return self.b_error(
+                req,
+                ta,
+                &tb.name,
+                Some(&pa),
+                "kda-txs answered 404 at its 30 s query limit",
+                String::new(),
+            );
+        }
+        let mut d = Vec::new();
+        let mut found = String::new();
+        if !st::equal(&a, &b) {
+            if a.status != b.status {
+                d.push(DiffEntry {
+                    path: "/@status".into(),
+                    kind: DiffKind::Changed,
+                    a: Some(json!(a.status)),
+                    b: Some(json!(b.status)),
+                });
+            }
+            d.push(DiffEntry {
+                path: HASH_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(a.summary()),
+                b: Some(b.summary()),
+            });
+            if let Some(k) = st::first_differing(&a, &b) {
+                let ra = self.streamed_row(req, ta, a_mem.as_ref(), &k, f64).await;
+                let rb = self.streamed_row(req, tb, b_mem.as_ref(), &k, f64).await;
+                found = format!(
+                    "; first differing row {k}: the second read found it on {}",
+                    match (&ra, &rb) {
+                        (Some(_), Some(_)) => "both sides",
+                        (Some(_), None) => "A only",
+                        (None, Some(_)) => "B only",
+                        (None, None) => "neither side",
+                    }
+                );
+                let kind = match (&ra, &rb) {
+                    (Some(_), None) => DiffKind::Extra,
+                    (None, Some(_)) => DiffKind::Missing,
+                    _ => DiffKind::Changed,
+                };
+                d.push(DiffEntry {
+                    path: format!("{ROW_PATH}/{k}"),
+                    kind,
+                    a: ra,
+                    b: rb,
+                });
+            }
+        }
+        d.extend(extra);
+        let note = format!(
+            "streamed /v1/txs compare (an answer over the {}-byte body cap): A {} bytes, {} rows; \
+             B {} bytes, {} rows{found}",
+            ta.max_body_bytes(),
+            a.bytes,
+            a.rows.len(),
+            b.bytes,
+            b.rows.len()
+        );
+        tracing::info!(request = %req.path_and_query, equal = d.is_empty(), "{note}");
+        let curl_b = format!("curl -s {}", sh_url("B", &req.path_and_query));
+        self.finish(
+            req,
+            ta,
+            &tb.name,
+            &pa,
+            Some(b.status),
+            String::new(),
+            d,
+            false,
+            curl_b,
+            Some(note),
+        )
+    }
+
+    /// One side of [`Ctx::v1txs_streamed`]: an answer read in memory is hashed there (a
+    /// composed answer over the cap carries its capture); an answer over the cap is read
+    /// again as a stream. The capture, when in memory, serves the second read.
+    async fn streamed_side(
+        &self,
+        req: &Request,
+        t: &Target,
+        prior: anyhow::Result<Paged>,
+        f64: bool,
+    ) -> Result<(crate::streamed::Side, Option<HttpCapture>), String> {
+        use crate::streamed::{hash_capture, Hasher, STREAM_CAP};
+        let mem = match prior {
+            Ok(p) => p.pages.into_iter().next(),
+            Err(e) => match e.downcast::<crate::target::BodyOverCap>() {
+                Ok(o) => o.capture,
+                Err(e) => return Err(format!("{e:#}")),
+            },
+        };
+        if let Some(c) = mem {
+            return Ok((hash_capture(&c, f64), Some(c)));
+        }
+        let mut h = Hasher::new(200, f64);
+        let meta = t
+            .get_chunks(&req.path_and_query, STREAM_CAP + 1, &mut |c| h.feed(c))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        self.count_request(req.route.as_str(), &t.name, 1);
+        // The hasher is made before the status is known: a status other than 200 is a fault
+        // of its own.
+        let mut side = h.finish(meta.headers, meta.ms);
+        if meta.status != 200 {
+            side.fault = Some(format!("HTTP {}", meta.status));
+            side.rows.clear();
+        }
+        side.status = meta.status;
+        Ok((side, None))
+    }
+
+    /// The bounded second read of [`Ctx::v1txs_streamed`]: the first row with request key
+    /// `key` (at most [`crate::streamed::SHOWN_ROW_CAP`] bytes), from the capture in memory
+    /// or one more streamed read that stops at the row.
+    async fn streamed_row(
+        &self,
+        req: &Request,
+        t: &Target,
+        mem: Option<&HttpCapture>,
+        key: &str,
+        f64: bool,
+    ) -> Option<Value> {
+        let mut f = crate::streamed::Finder::new(key, f64);
+        match mem {
+            Some(c) => {
+                f.feed(&c.body);
+            }
+            None => {
+                let r = t
+                    .get_chunks(&req.path_and_query, crate::streamed::STREAM_CAP, &mut |c| {
+                        f.feed(c)
+                    })
+                    .await;
+                self.count_request(req.route.as_str(), &t.name, 1);
+                r.ok()?;
+            }
+        }
+        f.found
     }
 
     #[allow(clippy::too_many_arguments)]

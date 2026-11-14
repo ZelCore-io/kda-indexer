@@ -115,16 +115,23 @@ impl Allowlist {
         let mut unexplained = Vec::new();
         let mut ids: Vec<String> = Vec::new();
         for d in diffs {
-            let hit = self.entries.iter().find(|e| {
-                (e.route == "*" || e.route == route.as_str())
-                    && e.condition.matches(d.kind)
-                    && e.request_contains
-                        .as_deref()
-                        .is_none_or(|s| request.contains(s))
-                    && e.a_header
-                        .as_deref()
-                        .is_none_or(|h| a_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h)))
-                    && glob(&e.json_path_glob, &d.path)
+            // A streamed `/v1/txs` hash or row difference is a diff whatever the allowlist
+            // says (R-P5P9-52 concern 5): a request-scoped `/**` entry must not explain it.
+            let never = [crate::streamed::HASH_PATH, crate::streamed::ROW_PATH]
+                .iter()
+                .any(|p| d.path.starts_with(p));
+            let hit = (!never).then_some(()).and_then(|()| {
+                self.entries.iter().find(|e| {
+                    (e.route == "*" || e.route == route.as_str())
+                        && e.condition.matches(d.kind)
+                        && e.request_contains
+                            .as_deref()
+                            .is_none_or(|s| request.contains(s))
+                        && e.a_header.as_deref().is_none_or(|h| {
+                            a_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h))
+                        })
+                        && glob(&e.json_path_glob, &d.path)
+                })
             });
             match hit {
                 Some(e) => {
