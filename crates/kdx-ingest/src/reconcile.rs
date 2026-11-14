@@ -1655,8 +1655,6 @@ mod tests {
         assert_eq!(balances::dirty_count(&txn).unwrap(), 0);
     }
 
-    /// M-11: a block applied above a chain's mark watermark + 1 (blocks applied without marks)
-    /// makes the reconciler re-run the seed; contiguous blocks and a chain's first block do not.
     /// P6 M-8 fixture: a trusted ledger's event posting whose hot tx record does not decode,
     /// so the NFT history fill fails on it. Returns the tx key.
     fn undecodable_ledger_event(hot: &HotStore) -> kdx_types::TxKey {
@@ -1736,6 +1734,8 @@ mod tests {
         task.await.unwrap().unwrap();
     }
 
+    /// M-11: a block applied above a chain's mark watermark + 1 (blocks applied without marks)
+    /// makes the reconciler re-run the seed; contiguous blocks and a chain's first block do not.
     #[test]
     fn a_mark_gap_reruns_the_seed() {
         let dir = tempfile::tempdir().unwrap();
