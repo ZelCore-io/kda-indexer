@@ -553,6 +553,21 @@ pub fn transfer_detail(r: &TxRecord, b: &BlockRecord, evs: &[Ev], t: &Transfer) 
 // ---------------------------------------------------------------------------------------
 // TxDetail
 
+/// The continuation of a payload. A JSON-null `cont` is absent (R-P5P9-60 D4):
+/// an exec payload that also carries `"cont": null` is still an exec.
+pub(crate) fn cont_of(payload: &Value) -> Option<&Value> {
+    payload.get("cont").filter(|c| !c.is_null())
+}
+
+/// The `data` of a payload: the continuation's when it has one, else the exec's.
+pub(crate) fn payload_data(cont: Option<&Value>, exec: Option<&Value>) -> Value {
+    match (cont, exec) {
+        (Some(c), _) => c.get("data").cloned().unwrap_or(Value::Null),
+        (None, Some(e)) => e.get("data").cloned().unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
 /// The parsed signed `cmd` of a user tx (None for coinbase or an unparsable cmd).
 pub fn cmd_value(r: &TxRecord) -> Option<Value> {
     if r.cmd_unparsed {
@@ -652,7 +667,7 @@ pub fn tx_detail_with(
         return Ok(None);
     };
     let meta = cmd.get("meta").cloned().unwrap_or(Value::Null);
-    let cont = cmd.pointer("/payload/cont");
+    let cont = cmd.get("payload").and_then(cont_of);
     let exec = cmd.pointer("/payload/exec");
     let pact = cont.and_then(|c| c.get("pactId")).and_then(Value::as_str);
     let success = out.pointer("/result/status").and_then(Value::as_str) == Some("success");
@@ -723,11 +738,7 @@ pub fn tx_detail_with(
             .unwrap_or(Value::Null),
     );
     m.insert("step".into(), int_of(cont.and_then(|c| c.get("step"))));
-    let data = match (cont, exec) {
-        (Some(c), _) => c.get("data").cloned().unwrap_or(Value::Null),
-        (None, Some(e)) => e.get("data").cloned().unwrap_or(Value::Null),
-        _ => Value::Null,
-    };
+    let data = payload_data(cont, exec);
     m.insert("data".into(), censor(data));
     m.insert(
         "proof".into(),
@@ -834,6 +845,24 @@ mod tests {
             Some("0.00001")
         );
         assert_eq!(parsed_decimal_text(&json!(1e-8)).as_deref(), Some("1e-8"));
+    }
+
+    /// R-P5P9-60 D4: an exec payload that also carries `"cont": null` keeps its
+    /// exec data; a real continuation still wins.
+    #[test]
+    fn null_cont_is_absent() {
+        let cmd = json!({"payload": {
+            "exec": {"code": "(+ 1 2)", "data": {"ks": {"keys": ["k"], "pred": "keys-all"}}},
+            "cont": null}});
+        let payload = cmd.get("payload").unwrap();
+        let cont = cont_of(payload);
+        assert!(cont.is_none());
+        let data = payload_data(cont, payload.get("exec"));
+        assert_eq!(data, json!({"ks": {"keys": ["k"], "pred": "keys-all"}}));
+        let real = json!({"cont": {"pactId": "p", "step": 1, "data": {"d": 1}}});
+        let cont = cont_of(&real);
+        assert_eq!(payload_data(cont, None), json!({"d": 1}));
+        assert_eq!(cont.and_then(|c| c.get("step")), Some(&json!(1)));
     }
 
     #[test]
