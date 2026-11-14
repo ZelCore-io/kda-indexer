@@ -1722,6 +1722,76 @@ async fn h8_transfer_order_index_is_the_rank_of_ours() {
     assert!(d.iter().all(|e| e.path != ORDER_INDEX_PATH), "{d:?}");
 }
 
+/// R-P5P9-62 `payload.data`: ours sends the node's null `cont.data` as the text `"null"`,
+/// the oracle `"{}"`. Explained only in that direction, only on a continuation, and only
+/// where the node's command for the request key has `cont.data` null (single-row reads:
+/// `/poll`, the header at its height, that block's payload). An exec payload, the reverse
+/// direction and a node `cont.data` that is not null stay diffs.
+#[tokio::test]
+async fn r62_payload_data_null_only_where_the_node_cont_data_is_null() {
+    use crate::graphql_window::PAYLOAD_DATA_PATH;
+    use kdx_types::hash::b64url_encode;
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let cmd = |rk: &str, payload: Value| {
+        let c = json!({"payload": payload, "meta": {"chainId": "0"}}).to_string();
+        let w = json!({"hash": rk, "sigs": [], "cmd": c}).to_string();
+        json!([b64url_encode(w.as_bytes()), b64url_encode(b"{}")])
+    };
+    let cont = |data: Value| json!({"cont": {"pactId": "p", "step": 1, "rollback": false, "data": data, "proof": null}});
+    node.payloads.insert(
+        "PP".into(),
+        json!({"transactions": [
+            cmd("c1", cont(Value::Null)),
+            cmd("e1", json!({"exec": {"code": "(+ 1 2)", "data": null}})),
+            cmd("c2", cont(json!({"x": 1}))),
+        ]}),
+    );
+    node.headers.insert(
+        (0, 50),
+        vec![json!({"hash": "BP", "height": 50, "payloadHash": "PP"})],
+    );
+    for rk in ["c1", "e1", "c2"] {
+        let (k, v) = h7_poll(rk, "BP", 50, json!([]));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let tx = |rk: &str, data: &str| crate::graphql::Answer {
+        body: json!({"data": {"transaction": {"hash": rk,
+            "cmd": {"meta": {"chainId": "0"}, "payload": {"data": data}}}}}),
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    };
+    let vars = serde_json::Map::new();
+    let settle = |mut a: crate::graphql::Answer, mut b: crate::graphql::Answer| {
+        let (ctx, vars) = (&ctx, &vars);
+        async move {
+            ctx.gql_settle(&ctx.targets["a"], vars, &mut a, &mut b, 7_000_000, false)
+                .await
+                .0
+        }
+    };
+    let only_hits = |d: &[crate::report::DiffEntry]| d.iter().all(|e| e.path.starts_with("/~"));
+    // A continuation whose node cont.data is null: ours "null", the oracle's "{}".
+    let d = settle(tx("c1", "null"), tx("c1", "{}")).await;
+    assert!(only_hits(&d), "{d:?}");
+    let hit = d.iter().find(|e| e.path == PAYLOAD_DATA_PATH).expect("hit");
+    assert!(
+        hit.b.as_ref().unwrap().to_string().contains("c1"),
+        "{hit:?}"
+    );
+    // An exec payload: a diff.
+    let d = settle(tx("e1", "null"), tx("e1", "{}")).await;
+    assert!(!only_hits(&d), "{d:?}");
+    // Ours "{}" against the oracle's "null": a diff.
+    let d = settle(tx("c1", "{}"), tx("c1", "null")).await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The node's cont.data is not null: a diff.
+    let d = settle(tx("c2", "null"), tx("c2", "{}")).await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
 /// R-P5P9-61 H6 (ruling (3)): the nested `transactions` of large blocks (BlocksByHeight: no
 /// key selected, only `gasPrice`) are paged to the end on both sides within the page budget
 /// and compared as one multiset per block with its totalCount. The 147-tx shape (equal sets,

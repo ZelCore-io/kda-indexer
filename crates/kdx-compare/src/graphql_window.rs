@@ -48,6 +48,8 @@ pub const NODE_READS: usize = 100;
 /// Visible hit of H8 (allowlist id `graphql-h8-transfer-order-index`); it carries the
 /// evidence per request key.
 pub const ORDER_INDEX_PATH: &str = "/~graphql-h8-transfer-order-index";
+/// Visible hit of the `payload.data` matcher (allowlist id `graphql-r62-payload-data`).
+pub const PAYLOAD_DATA_PATH: &str = "/~graphql-r62-payload-data";
 const ROUTE: &str = "graphql-window-referee";
 
 fn text(v: &Value) -> Option<String> {
@@ -1301,6 +1303,178 @@ impl Ctx {
                 Some(Value::Array(evidence)),
             )
         })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-62 `payload.data`
+
+/// Transactions the `payload.data` matcher reads the node for per compare at most.
+pub const PAYLOAD_DATA_CHECKS: usize = 5;
+
+/// The transactions in an answer that select `cmd.payload.data`: (request key, chain if
+/// selected, JSON pointer to `data`).
+pub fn payload_data_txs(v: &Value) -> Vec<(String, Option<u8>, String)> {
+    fn walk(v: &Value, ptr: &mut String, out: &mut Vec<(String, Option<u8>, String)>) {
+        match v {
+            Value::Object(m) => {
+                let data = m
+                    .get("cmd")
+                    .and_then(|c| c.get("payload"))
+                    .is_some_and(|p| p.get("data").is_some());
+                let rk = m
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        m.get("id")
+                            .and_then(Value::as_str)
+                            .and_then(crate::graphql_norm::tx_id_block)
+                            .map(|x| x.1)
+                    });
+                if let (true, Some(rk)) = (data, rk) {
+                    let chain = ["/cmd/meta/chainId", "/result/block/chainId"]
+                        .iter()
+                        .find_map(|q| v.pointer(q))
+                        .and_then(text)
+                        .and_then(|c| c.parse().ok());
+                    out.push((rk, chain, format!("{ptr}/cmd/payload/data")));
+                }
+                for (k, x) in m {
+                    let n = ptr.len();
+                    ptr.push('/');
+                    ptr.push_str(&k.replace('~', "~0").replace('/', "~1"));
+                    walk(x, ptr, out);
+                    ptr.truncate(n);
+                }
+            }
+            Value::Array(xs) => {
+                for (i, x) in xs.iter().enumerate() {
+                    let n = ptr.len();
+                    ptr.push_str(&format!("/{i}"));
+                    walk(x, ptr, out);
+                    ptr.truncate(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, &mut String::new(), &mut out);
+    out
+}
+
+/// The node's command for `rk` (decoded) from its block's payload with outputs.
+pub fn node_cmd(payload: &Value, rk: &str) -> Option<Value> {
+    payload
+        .get("transactions")?
+        .as_array()?
+        .iter()
+        .find_map(|t| {
+            let raw = kdx_types::hash::b64url_decode(t.get(0)?.as_str()?).ok()?;
+            let w: Value = serde_json::from_slice(&raw).ok()?;
+            if w.get("hash")?.as_str()? != rk {
+                return None;
+            }
+            serde_json::from_str(w.get("cmd")?.as_str()?).ok()
+        })
+}
+
+impl Ctx {
+    /// R-P5P9-62 `payload.data` (rule (a), exact): where ours sends `"null"` and the oracle
+    /// `"{}"` for the same request key, and the node's command for that key is a
+    /// continuation whose `cont.data` is null (at most [`PAYLOAD_DATA_CHECKS`] keys, single-row
+    /// reads), the oracle's value takes ours. Anything else stays as it was.
+    pub(crate) async fn gql_payload_data(
+        &self,
+        vars: &Map<String, Value>,
+        a: &Answer,
+        b: &mut Answer,
+    ) -> Option<DiffEntry> {
+        let ours = payload_data_txs(&a.body);
+        let theirs = payload_data_txs(&b.body);
+        let var_chain = vars
+            .get("chainId")
+            .and_then(text)
+            .and_then(|c| c.parse::<u8>().ok());
+        let mut st = Reads::default();
+        let mut checked: HashMap<String, bool> = HashMap::new();
+        let mut evidence = Vec::new();
+        for (rk, chain_b, ptr_b) in theirs {
+            if b.body.pointer(&ptr_b) != Some(&json!("{}")) {
+                continue;
+            }
+            let Some(chain_a) = ours
+                .iter()
+                .find(|(k, _, p)| *k == rk && a.body.pointer(p) == Some(&json!("null")))
+                .map(|x| x.1)
+            else {
+                continue;
+            };
+            let ok = match checked.get(&rk) {
+                Some(x) => *x,
+                None if checked.len() >= PAYLOAD_DATA_CHECKS => continue,
+                None => {
+                    let chain = chain_a.or(chain_b).or(var_chain);
+                    let found = match chain {
+                        Some(c) => self.node_cont_data_null(c, &rk, &mut st).await,
+                        None => Err("no chain".into()),
+                    };
+                    match &found {
+                        Ok(true) => evidence.push(json!({"requestKey": rk, "chain": chain,
+                            "nodeCont": true, "nodeContData": null})),
+                        other => tracing::debug!(rk, ?other, "payload.data not explained"),
+                    }
+                    let x = found == Ok(true);
+                    checked.insert(rk.clone(), x);
+                    x
+                }
+            };
+            if ok {
+                if let Some(v) = b.body.pointer_mut(&ptr_b) {
+                    *v = json!("null");
+                }
+            }
+        }
+        (!evidence.is_empty()).then(|| {
+            entry(
+                PAYLOAD_DATA_PATH,
+                Some(json!({"nodeReads": st.node})),
+                Some(Value::Array(evidence)),
+            )
+        })
+    }
+
+    /// Whether the node's command for `rk` on `chain` is a continuation with `cont.data`
+    /// null: `/poll` for its block, the headers at its height, that block's payload.
+    async fn node_cont_data_null(
+        &self,
+        chain: u8,
+        rk: &str,
+        st: &mut Reads,
+    ) -> Result<bool, String> {
+        let p = self
+            .h7_poll(chain, rk, st)
+            .await?
+            .ok_or("poll: key unknown")?;
+        let block = p
+            .pointer("/metaData/blockHash")
+            .and_then(Value::as_str)
+            .ok_or("poll: no block")?;
+        let h = p
+            .pointer("/metaData/blockHeight")
+            .and_then(Value::as_u64)
+            .ok_or("poll: no height")?;
+        let hs = self.h7_headers(chain, h, st).await?;
+        let ph = hs
+            .iter()
+            .find(|x| x.get("hash").and_then(Value::as_str) == Some(block))
+            .and_then(|x| x.get("payloadHash").and_then(Value::as_str))
+            .ok_or("no header for the block")?
+            .to_string();
+        let payload = self.h7_payload(chain, &ph, st).await?;
+        let cmd = node_cmd(&payload, rk).ok_or("the block's payload lacks the key")?;
+        Ok(cmd.pointer("/payload/cont/data") == Some(&Value::Null))
     }
 }
 
