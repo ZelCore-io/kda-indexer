@@ -4919,3 +4919,60 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
     assert!(!skew(1).await, "ours at node_h: no skew");
     assert!(!skew(2).await, "a fork at node_h");
 }
+
+/// R-P5P9-70 (m-3, R-P5P9-67 I-A (b) on the first page): ours' first page with HTTP 200 and a
+/// body that is not JSON, or a 4xx other than 408/429, is a diff with its own entry, which no
+/// allowlist entry matches; a 503 or a 429 stays an error.
+#[tokio::test]
+async fn c5_a_first_page_fault_of_ours_is_a_diff_and_a_5xx_an_error() {
+    use axum::http::StatusCode;
+    let dir = tempfile::tempdir().unwrap();
+    let app = Router::new().route(
+        "/graphql",
+        post(|Json(req): Json<Value>| async move {
+            match req["variables"]["accountName"].as_str().unwrap_or("") {
+                "text" => (StatusCode::OK, "<html>oops</html>").into_response(),
+                "bad-request" => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"errors": [{"message": "invalid"}]})),
+                )
+                    .into_response(),
+                "not-found" => (StatusCode::NOT_FOUND, "no").into_response(),
+                "rate" => (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response(),
+                _ => (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response(),
+            }
+        }),
+    );
+    let au = format!("{}graphql", serve(app).await);
+    let ctx = gql_ctx_at(NodeMock::default(), dir.path(), &au).await;
+    let op = h7_op("transfers");
+    for (mode, class) in [
+        ("text", "diff"),
+        ("bad-request", "diff"),
+        ("not-found", "diff"),
+        ("rate", "a-error"),
+        ("busy", "a-error"),
+    ] {
+        let vars = h7_vars(&[("accountName", json!(mode)), ("first", json!(1))]);
+        let o = ctx
+            .gql_vs_oracle(&ctx.targets["a"], &ctx.targets["b"], &op, &vars, 7_000_000)
+            .await;
+        assert_eq!(o.class, class, "{mode}: {o:?}");
+        if class == "diff" {
+            let rec = o.record.unwrap();
+            assert!(
+                rec.diff
+                    .iter()
+                    .any(|e| e.path == crate::graphql::FIRST_PAGE_FAULT_PATH),
+                "{mode}: {rec:?}"
+            );
+            let (un, _) = ctx.allow.classify_request(
+                &crate::normalize::RouteKind::Other,
+                "graphql:QH7",
+                &[],
+                &rec.diff,
+            );
+            assert_eq!(un.len(), 1, "{mode}");
+        }
+    }
+}

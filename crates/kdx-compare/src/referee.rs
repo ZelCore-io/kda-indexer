@@ -178,15 +178,17 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
             }
             // R-P5P9-67 I-A (b), m-3: a follow-page fault of ours or the merged-bytes cap is a
             // fact of the fetch, with no pages to re-run: it stays unexplained.
+            // R-P5P9-70 (m-3): so is a first-page fault of ours.
             let stop = rec.diff.iter().find(|e| {
                 e.path == crate::graphql::FOLLOW_PAGE_FAULT_PATH
+                    || e.path == crate::graphql::FIRST_PAGE_FAULT_PATH
                     || e.path == crate::graphql::MERGED_BYTES_PATH
             });
             if let Some(e) = stop {
-                let kind = if e.path == crate::graphql::FOLLOW_PAGE_FAULT_PATH {
-                    "follow-page-fault"
-                } else {
-                    "harness-limit"
+                let kind = match e.path.as_str() {
+                    crate::graphql::FOLLOW_PAGE_FAULT_PATH => "follow-page-fault",
+                    crate::graphql::FIRST_PAGE_FAULT_PATH => "first-page-fault",
+                    _ => "harness-limit",
                 };
                 rep.unexplained += 1;
                 count(&mut rep, format!("unexplained: {kind}"));

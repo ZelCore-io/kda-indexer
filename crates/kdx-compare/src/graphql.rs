@@ -47,6 +47,9 @@ pub const ORACLE_STALL_PATH: &str = "/~graphql-oracle-stall";
 /// R-P5P9-67 I-A (b): a follow page of ours that answered but is no page. No allowlist entry
 /// matches it.
 pub const FOLLOW_PAGE_FAULT_PATH: &str = "/~graphql-follow-page-fault";
+/// R-P5P9-70 (m-3): ours' first page answered HTTP 200 with a body that is not JSON, or a 4xx
+/// other than 408/429. No allowlist entry matches it.
+pub const FIRST_PAGE_FAULT_PATH: &str = "/~graphql-first-page-fault";
 /// R-P5P9-67 m-3: one side's merged pages passed [`MERGED_BYTES_CAP`]. No allowlist entry
 /// matches it.
 pub const MERGED_BYTES_PATH: &str = "/~harness-limit/graphql-merged-bytes";
@@ -1002,6 +1005,28 @@ impl std::fmt::Display for FollowPageFault {
 
 impl std::error::Error for FollowPageFault {}
 
+/// The first page answered, but not as a page (R-P5P9-70 m-3): a body that is not JSON, or a
+/// 4xx, at a status that is no transport or server fault (not 5xx, 408 or 429). On ours it is
+/// a diff, not an error.
+#[derive(Debug)]
+pub struct FirstPageFault {
+    pub target: String,
+    pub status: u16,
+    pub why: String,
+}
+
+impl std::fmt::Display for FirstPageFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: first page failed: HTTP {}, {}",
+            self.target, self.status, self.why
+        )
+    }
+}
+
+impl std::error::Error for FirstPageFault {}
+
 /// One side's merged pages passed [`MERGED_BYTES_CAP`] (R-P5P9-67 m-3).
 #[derive(Debug)]
 pub struct MergedBytes {
@@ -1039,6 +1064,12 @@ pub fn fetch_stop_entry(e: &anyhow::Error, ours: bool) -> Option<DiffEntry> {
         }
         let ev = json!({"page": f.page, "status": f.status, "why": f.why});
         (FOLLOW_PAGE_FAULT_PATH, ev)
+    } else if let Some(f) = e.downcast_ref::<FirstPageFault>() {
+        if !ours {
+            return None;
+        }
+        let ev = json!({"page": 1, "status": f.status, "why": f.why});
+        (FIRST_PAGE_FAULT_PATH, ev)
     } else if let Some(m) = e.downcast_ref::<MergedBytes>() {
         let ev = json!({"bytes": m.bytes, "pages": m.pages, "cap": MERGED_BYTES_CAP});
         (MERGED_BYTES_PATH, ev)
@@ -1086,7 +1117,24 @@ pub async fn fetch_pages(
     }
     let status = cap.status;
     let raw = trim_body(&cap.body);
-    let mut merged: Value = serde_json::from_slice(&cap.body).with_context(|| {
+    // R-P5P9-70 (m-3): a first page that is not JSON, or a 4xx, at a status that is ours'
+    // fault (not 5xx, 408 or 429).
+    let parsed = serde_json::from_slice::<Value>(&cap.body);
+    if page_fault_is_ours(status) && (parsed.is_err() || (400..500).contains(&status)) {
+        let head = crate::report::trim_escaped(&raw, crate::report::SHORT_TRIM);
+        let why = match &parsed {
+            Err(e) => format!("not JSON: {e}: {head}"),
+            Ok(_) => format!("a client error: {head}"),
+        };
+        let target = t.name.clone();
+        return Err(FirstPageFault {
+            target,
+            status,
+            why,
+        }
+        .into());
+    }
+    let mut merged: Value = parsed.with_context(|| {
         let head = crate::report::trim_escaped(&raw, crate::report::SHORT_TRIM);
         format!("{}: HTTP {status}, body is not JSON: {head}", t.name)
     })?;
@@ -3659,6 +3707,7 @@ mod tests {
             crate::graphql_window::SHORT_PAGE_PATH,
             crate::graphql_window::UNDECIDED_PATH,
             FOLLOW_PAGE_FAULT_PATH,
+            FIRST_PAGE_FAULT_PATH,
             MERGED_BYTES_PATH,
         ] {
             let (un, _) = allow.classify_request(
