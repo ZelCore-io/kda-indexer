@@ -25,12 +25,12 @@
 //! DIR`, `run`).
 //! On a refusal nothing is created; on a later failure what this run created is removed.
 //!
-//! The snapshot runs as the data dir's owner (the service user); root is refused unless it owns
-//! the whole tree (the data dir, `segments/` and an existing `--out`; [`refuse_root`]), and
-//! only pre-creates an empty `--out`. A listed file
-//! is placed only when it is a regular file: a symlink at its name is refused, never followed
-//! ([`place`]). The manifest's `network` is a plain name (`Manifest::validate`), so a listed
-//! name never leaves `segments/`.
+//! The snapshot runs as the data dir's owner (the service user). Root is refused unless it
+//! owns the whole tree (the data dir, `segments/`, `hot/`, `search/` and an existing `--out`;
+//! [`refuse_root`]); otherwise root only pre-creates the empty `--out` (`install -d`) for the
+//! owner's run. A listed file is placed only when it is a regular file: a symlink at its name
+//! is refused, never followed ([`place`]). The manifest's `network` is a plain name
+//! (`Manifest::validate`), so a listed name never leaves `segments/`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -132,22 +132,35 @@ fn snapshot_as(euid: u32, a: &SnapshotArgs) -> anyhow::Result<SnapshotReport> {
     };
     refuse_root(euid, owner, &below)?;
     let hs = HotStore::open_ro(&hot_dir(&a.data_dir))?;
-    snapshot_with(a, &hs, NAME_WAIT_PAUSE, &mut |p, _| {
+    snapshot_with_as(euid, a, &hs, NAME_WAIT_PAUSE, &mut |p, _| {
         if let (Point::Manifest, Some(d)) = (p, sleep) {
             std::thread::sleep(d);
         }
     })
 }
 
-/// `snapshot` of the hot store `hs` (opened on the data dir's `hot/`), with a hook at each
-/// [`Point`] and the pause before a re-read for missing names.
+/// [`snapshot_with_as`] run with the process's effective uid.
+#[cfg(test)]
 fn snapshot_with(
     a: &SnapshotArgs,
     hs: &HotStore,
     pause: Duration,
     hook: &mut dyn FnMut(Point, usize),
 ) -> anyhow::Result<SnapshotReport> {
-    let created = prepare_out(&a.out, &a.data_dir)?;
+    snapshot_with_as(rustix::process::geteuid().as_raw(), a, hs, pause, hook)
+}
+
+/// `snapshot` of the hot store `hs` (opened on the data dir's `hot/`), with a hook at each
+/// [`Point`] and the pause before a re-read for missing names; `euid` is the effective uid
+/// ([`prepare_out`]).
+fn snapshot_with_as(
+    euid: u32,
+    a: &SnapshotArgs,
+    hs: &HotStore,
+    pause: Duration,
+    hook: &mut dyn FnMut(Point, usize),
+) -> anyhow::Result<SnapshotReport> {
+    let created = prepare_out(&a.out, &a.data_dir, euid)?;
     let r = snapshot_into(a, hs, pause, hook);
     if r.is_err() {
         remove_created(&a.out, created.as_deref());
@@ -194,30 +207,44 @@ fn refuse_root(euid: u32, data_owner: u32, below: &[(PathBuf, u32)]) -> anyhow::
 }
 
 /// FV-3: the owners of what a root run reads and writes by path besides the data dir itself:
-/// `segments/`, and `--out` when it exists. A symlink counts with its own owner and, when that
-/// is root, its target's. Missing paths are left out.
+/// `segments/`, `hot/`, `search/`, and `--out` when it exists (even empty). A symlink counts
+/// with its own owner and, when that is root, its target's. Missing paths are left out.
 fn tree_owners(a: &SnapshotArgs) -> anyhow::Result<Vec<(PathBuf, u32)>> {
     let mut v = Vec::new();
-    for p in [segments_dir(&a.data_dir), a.out.clone()] {
-        let m = match fs::symlink_metadata(&p) {
-            Ok(m) => m,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+    for p in [
+        segments_dir(&a.data_dir),
+        hot_dir(&a.data_dir),
+        kdx_search::search_dir(&a.data_dir),
+        a.out.clone(),
+    ] {
+        match owner_uid(&p) {
+            Ok(uid) => v.push((p, uid)),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("stat {}", p.display())),
-        };
-        let mut uid = m.uid();
-        if uid == 0 && m.file_type().is_symlink() {
-            if let Ok(t) = fs::metadata(&p) {
-                uid = t.uid();
-            }
         }
-        v.push((p, uid));
     }
     Ok(v)
 }
 
+/// The owner of `p` itself: a symlink counts with its own owner and, when that is root, its
+/// target's.
+fn owner_uid(p: &Path) -> io::Result<u32> {
+    let m = fs::symlink_metadata(p)?;
+    let mut uid = m.uid();
+    if uid == 0 && m.file_type().is_symlink() {
+        if let Ok(t) = fs::metadata(p) {
+            uid = t.uid();
+        }
+    }
+    Ok(uid)
+}
+
 /// Refuses an `--out` inside the data dir or not empty before creating anything, then creates
-/// it. Returns the topmost directory this created (None: `--out` existed, empty).
-fn prepare_out(out: &Path, data_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+/// it. Returns the topmost directory this created (None: `--out` existed, empty). Run as root
+/// (`euid` 0), an existing `--out` is accepted only when root owns it (Review PRE-F M-1: the
+/// owner is read where the directory is accepted, so one created after [`tree_owners`] ran is
+/// refused too).
+fn prepare_out(out: &Path, data_dir: &Path, euid: u32) -> anyhow::Result<Option<PathBuf>> {
     let data_abs =
         fs::canonicalize(data_dir).with_context(|| format!("resolve {}", data_dir.display()))?;
     let out_abs = resolve(out)?;
@@ -226,6 +253,16 @@ fn prepare_out(out: &Path, data_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     }
     match fs::read_dir(out) {
         Ok(mut d) => {
+            if euid == 0 {
+                let uid = owner_uid(out).with_context(|| format!("stat {}", out.display()))?;
+                if uid != 0 {
+                    bail!(
+                        "snapshot refuses to run as root: {} (uid {uid}) is not root-owned; \
+                         run it as the data dir's owner",
+                        out.display()
+                    );
+                }
+            }
             if d.next().is_some() {
                 bail!("{} is not empty", out.display());
             }
@@ -981,9 +1018,12 @@ mod tests {
     }
 
     /// FV-3: as root the snapshot runs only on a data dir whose whole tree root owns. Run as
-    /// euid 0 on a tree another uid owns (the test user's; chowned to 65534 when the tests
-    /// run as root), the refusal names `segments/` and the existing `--out` next to the data
-    /// dir, and the run leaves `--out` empty and creates nothing in the data dir.
+    /// euid 0 on a tree another uid owns (the test user's), the refusal names `segments/` and
+    /// the existing `--out` next to the data dir, and the run leaves `--out` empty and
+    /// creates nothing in the data dir. When the tests run as root, the data dir stays
+    /// root-owned and only `segments/` and `--out` go to 65534, so the second refusal (the
+    /// whole-tree rule) runs end to end; otherwise the data dir is another uid's and the
+    /// first one (which also lists them) does.
     #[test]
     fn root_names_every_path_of_the_tree_it_does_not_own() {
         let tmp = tempfile::tempdir().unwrap();
@@ -993,7 +1033,7 @@ mod tests {
         fs::create_dir_all(&seg).unwrap();
         fs::create_dir(&out).unwrap();
         if rustix::process::geteuid().is_root() {
-            for p in [&data, &seg, &out] {
+            for p in [&seg, &out] {
                 std::os::unix::fs::chown(p, Some(65534), None).unwrap();
             }
         }
@@ -1006,9 +1046,74 @@ mod tests {
         assert!(e.contains("refuses to run as root"), "{e}");
         assert!(e.contains(&format!("{} (uid", seg.display())), "{e}");
         assert!(e.contains(&format!("{} (uid", out.display())), "{e}");
+        if rustix::process::geteuid().is_root() {
+            assert!(e.contains("whole tree root owns"), "{e}");
+        }
         assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
         assert!(!data.join("hot").exists());
         assert!(fs::symlink_metadata(data.join("segments.swap.lock")).is_err());
+    }
+
+    /// FV-3 (Review PRE-F M-2): `hot/` and `search/` are part of the tree a root run owns: a
+    /// root-owned data dir whose `hot/` or `search/` another uid owns is refused, naming it
+    /// (the test user's own directory, chowned to 65534 when the tests run as root).
+    #[test]
+    fn root_is_refused_when_hot_or_search_is_not_root_owned() {
+        for sub in ["hot", "search"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            fs::create_dir_all(data.join(sub)).unwrap();
+            let args = SnapshotArgs {
+                data_dir: data.clone(),
+                out: tmp.path().join("out"),
+                copy: false,
+            };
+            if rustix::process::geteuid().is_root() {
+                std::os::unix::fs::chown(data.join(sub), Some(65534), None).unwrap();
+            }
+            let owners = super::tree_owners(&args).unwrap();
+            let listed = owners
+                .iter()
+                .find(|(p, _)| p == &data.join(sub))
+                .unwrap_or_else(|| panic!("{sub} is not in tree_owners: {owners:?}"));
+            assert_ne!(listed.1, 0, "{sub}");
+            let mut below = owners;
+            below.retain(|(p, _)| p == &data.join(sub));
+            let e = super::refuse_root(0, 0, &below).unwrap_err().to_string();
+            assert!(e.contains("whole tree root owns"), "{e}");
+            assert!(e.contains(&data.join(sub).display().to_string()), "{e}");
+        }
+    }
+
+    /// FV-3 (Review PRE-F M-1): as root an existing `--out`, even an empty one, is accepted
+    /// only when root owns it; the owner is read where the directory is accepted, so one
+    /// created after the early owner check is refused too. Other users, and a `--out` that
+    /// does not exist yet, are unaffected.
+    #[test]
+    fn root_accepts_an_existing_empty_out_only_when_root_owns_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let is_root = rustix::process::geteuid().is_root();
+        if is_root {
+            std::os::unix::fs::chown(&out, Some(65534), None).unwrap();
+        }
+        let e = format!("{:#}", super::prepare_out(&out, &data, 0).unwrap_err());
+        assert!(e.contains("refuses to run as root"), "{e}");
+        assert!(e.contains("is not root-owned"), "{e}");
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
+        // Another euid is not refused on the owner.
+        assert!(super::prepare_out(&out, &data, 1001).unwrap().is_none());
+        // A missing `--out` is created as before, even under euid 0.
+        let fresh = tmp.path().join("fresh");
+        assert!(super::prepare_out(&fresh, &data, 0).unwrap().is_some());
+        // Root owning an existing empty `--out` is accepted.
+        if is_root {
+            std::os::unix::fs::chown(&out, Some(0), None).unwrap();
+            assert!(super::prepare_out(&out, &data, 0).unwrap().is_none());
+        }
     }
 
     /// A data dir with one listed range `0..20` whose names the hot store sees, and the
