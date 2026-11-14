@@ -26,6 +26,14 @@ libmdbx (bundled by reth-mdbx-sys, statically linked)
   contain the binary (packaging/debian/libmdbx-NOTICE; installed as
   /usr/share/doc/kda-indexer/NOTICE.libmdbx). Source: https://libmdbx.dqdkfa.ru
 
+jemalloc (bundled by tikv-jemalloc-sys 0.5.4, statically linked; the global allocator)
+  Copyright (C) 2002-present Jason Evans <jasone@canonware.com>; (C) 2007-2012 Mozilla
+  Foundation; (C) 2009-present Facebook, Inc. BSD-2-Clause. Its licence text asks that binary
+  distributions reproduce the notice; it is reproduced in packages that contain the binary
+  (packaging/debian/jemalloc-NOTICE; installed as /usr/share/doc/kda-indexer/NOTICE.jemalloc).
+  The Rust bindings tikv-jemallocator and tikv-jemalloc-ctl are MIT OR Apache-2.0.
+  Source: https://github.com/jemalloc/jemalloc (as patched by https://github.com/tikv/jemallocator)
+
 chainweb-data (crates/kdx-api/data/{miner_rewards.csv,token_payments.csv}, src/supply.rs)
   The two CSV files are copied from kda-community/chainweb-data (haskell-src/data), and
   src/supply.rs reproduces the circulating-supply formula of its Chainweb.Coins module.

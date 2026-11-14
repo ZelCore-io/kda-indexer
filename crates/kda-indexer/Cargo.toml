@@ -86,6 +86,7 @@ assets = [
     ["../../LICENSE-APACHE", "usr/share/doc/kda-indexer/", "644"],
     ["../../THIRD_PARTY_NOTICES", "usr/share/doc/kda-indexer/", "644"],
     ["../../packaging/debian/libmdbx-NOTICE", "usr/share/doc/kda-indexer/NOTICE.libmdbx", "644"],
+    ["../../packaging/debian/jemalloc-NOTICE", "usr/share/doc/kda-indexer/NOTICE.jemalloc", "644"],
     ["../../vendor/ptr_hash/LICENSE-MIT", "usr/share/doc/kda-indexer/ptr_hash-LICENSE-MIT", "644"],
     ["../../docs/install.md", "usr/share/doc/kda-indexer/", "644"],
     ["../../docs/operations.md", "usr/share/doc/kda-indexer/", "644"],
