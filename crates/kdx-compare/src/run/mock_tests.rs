@@ -4261,3 +4261,35 @@ async fn c4_large_v1txs_answers_are_compared_by_streamed_hash() {
     );
     assert_eq!(left.len(), rec.diff.len(), "{ids:?}");
 }
+
+/// Item 3 (the I-6 residual of run 6E): ours' 250-row page over 8 MiB (`/v1/txs/669bd564…/
+/// coin/250`, an a-error at the body cap) goes through the same streamed path while kda-txs's
+/// answer is under the cap and read as usual: the same rows pass; kda-txs lacking a row is a
+/// diff naming it (no limit-edge or lag rule applies to a streamed compare).
+#[tokio::test]
+async fn c4_a_250_row_page_over_8_mib_goes_through_the_streamed_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = v1_rows(250, 33_000);
+    let b = serde_json::to_vec(&rows).unwrap();
+    // Ours: the same rows, with whitespace that takes the answer over the cap.
+    let mut a = b.clone();
+    let end = a.pop().unwrap();
+    a.extend(std::iter::repeat_n(b' ', 300_000));
+    a.push(end);
+    assert!(a.len() > crate::report::BODY_CAP && b.len() < crate::report::BODY_CAP);
+    let path = "/v1/txs/k:669bd564/coin/250";
+    let ctx = v1_setup(a.clone(), b, dir.path()).await;
+    let o = v1_compare(&ctx, path).await;
+    assert_eq!(o.class, "match", "{:?}", o.record.map(|r| (r.note, r.diff)));
+    let short = serde_json::to_vec(&rows[..249]).unwrap();
+    let ctx = v1_setup(a, short, dir.path()).await;
+    let o = v1_compare(&ctx, path).await;
+    let rec = o.record.expect("a record");
+    assert_eq!(o.class, "diff", "{:?} {:?}", rec.note, rec.diff);
+    let row = rec
+        .diff
+        .iter()
+        .find(|e| e.path == format!("{}/rk0249", crate::streamed::ROW_PATH))
+        .expect("the row only ours lists is named");
+    assert!(row.a.is_some() && row.b.is_none(), "{row:?}");
+}
