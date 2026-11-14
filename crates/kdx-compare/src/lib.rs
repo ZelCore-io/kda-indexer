@@ -13,6 +13,7 @@ pub mod graphql_ws;
 pub mod metrics;
 pub mod normalize;
 pub mod oracle;
+pub mod referee;
 pub mod report;
 pub mod rewards;
 pub mod run;

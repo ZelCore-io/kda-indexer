@@ -1792,6 +1792,196 @@ async fn r62_payload_data_null_only_where_the_node_cont_data_is_null() {
     assert!(!only_hits(&d), "{d:?}");
 }
 
+/// R-P5P9-62 `kda-compare referee` on a stored record log and a mock node: the GraphQL
+/// oracle-pair records still unexplained are re-refereed with H7, H8, H9 and `payload.data`
+/// (single-row node reads under the run's cap and rate). The output counts the classes and
+/// lists every record still unexplained with its evidence; a spent cap leaves a record
+/// unexplained, and records of other pairs are left alone.
+#[tokio::test]
+async fn referee_reruns_the_node_verdicts_on_a_stored_log() {
+    use crate::referee::{run, Opts};
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock {
+        tip: 7_000_000,
+        ..NodeMock::default()
+    };
+    for (rk, h) in [
+        ("r100", 100),
+        ("r103", 103),
+        ("r104", 104),
+        ("r105", 105),
+        ("x104", 104),
+    ] {
+        let (k, v) = h7_poll(rk, &format!("B{h}"), h, json!([]));
+        node.polls.insert(k, v);
+    }
+    let nu = node_server(node).await;
+    let ops = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/graphql");
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let out = dir.path();
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = {ops:?}
+field_rules = [{{ field = "transfers.creationTime", rule = "creation_time_half_even" }}]
+[targets.a]
+url = "http://127.0.0.1:9/graphql"
+kind = "kda_indexer_graphql"
+[targets.b]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+max_height = 7000000
+"#
+    ))
+    .unwrap();
+    let t = |m: &str| format!("2024-01-01T10:{m}Z");
+    let (t05, t01, t04, t03, t02) = (t("05:00"), t("01:00"), t("04:00"), t("03:00"), t("02:00"));
+    let txs = |rows: &[(&str, u64, &str)]| {
+        h7_page(
+            "transactions",
+            true,
+            rows.iter()
+                .map(|(rk, h, ct)| h7_tx(rk, *h, &format!("B{h}"), ct))
+                .collect(),
+        )
+        .body
+        .to_string()
+    };
+    let xfer = |ct: &str| {
+        json!({"data": {"transfers": {"pageInfo": {"hasNextPage": false}, "edges": [
+            {"cursor": "c", "node": {"amount": "1.5", "creationTime": ct, "orderIndex": 0,
+            "senderAccount": "s", "receiverAccount": "r", "chainId": "0", "blockHash": "B9",
+            "requestKey": "u1"}}]}}})
+        .to_string()
+    };
+    let rec = |stem: &str, vars: Value, b_target: &str, a: String, b: String, cap: bool| {
+        let mut r = json!({"ts": "2026-11-14T20:00:00Z", "route": format!("graphql:{stem}"),
+            "request": format!("{stem} {vars}"), "a_target": "a", "b_target": b_target,
+            "a_status": 200, "b_status": 200, "a_body_trimmed": a, "b_body_trimmed": b,
+            "diff": [{"path": "/data", "kind": "Changed"}], "class": "diff",
+            "curl": ""});
+        if cap {
+            r["body_cap"] = json!("bodies cut at the 8 MiB body limit");
+        }
+        r.to_string()
+    };
+    let acct = json!({"accountName": "k:x", "first": 3});
+    let lines = [
+        // The CG-3T sort-key shape: explained by H7 (2 node reads).
+        rec(
+            "QTransactionsByAccount",
+            acct.clone(),
+            "b",
+            txs(&[
+                ("r105", 105, &t05),
+                ("r104", 104, &t01),
+                ("r103", 103, &t04),
+            ]),
+            txs(&[
+                ("r105", 105, &t05),
+                ("r103", 103, &t04),
+                ("r100", 100, &t03),
+            ]),
+            false,
+        ),
+        // The page-join shape: still unexplained, with the row.
+        rec(
+            "QTransactionsByAccount",
+            acct.clone(),
+            "b",
+            txs(&[
+                ("r105", 105, &t05),
+                ("r104", 104, &t01),
+                ("r103", 103, &t04),
+            ]),
+            txs(&[
+                ("r105", 105, &t05),
+                ("x104", 104, &t02),
+                ("r104", 104, &t01),
+            ]),
+            false,
+        ),
+        // A creationTime fraction: explained by H9, no node read.
+        rec(
+            "QTransfersByRequestKey",
+            json!({"requestKey": "u1"}),
+            "b",
+            xfer("2024-01-01T10:00:15.000Z"),
+            xfer("2024-01-01T10:00:15.290Z"),
+            false,
+        ),
+        // A body cut by the log cap: not refereed.
+        rec(
+            "QTransactionsByAccount",
+            acct.clone(),
+            "b",
+            "{".into(),
+            "{".into(),
+            true,
+        ),
+        // Another pair's record: left alone.
+        rec("QBlock", json!({}), "node", "{}".into(), "{}".into(), false),
+    ];
+    let log = out.join("diffs-2026-11-14.jsonl");
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let opts = Opts {
+        logs: vec![log.clone()],
+        max_reads: 6_000,
+        rps: 10,
+    };
+    let rep = run(cfg.clone(), &opts).await.unwrap();
+    assert_eq!(
+        (
+            rep.records,
+            rep.refereed,
+            rep.explained,
+            rep.unexplained,
+            rep.not_refereed
+        ),
+        (5, 4, 2, 1, 1),
+        "{rep:?}"
+    );
+    assert_eq!(
+        rep.by_class.get("graphql-h7-window-referee"),
+        Some(&1),
+        "{rep:?}"
+    );
+    assert_eq!(
+        rep.by_class.get("graphql-h9-creation-time-fraction"),
+        Some(&1),
+        "{rep:?}"
+    );
+    assert_eq!(rep.by_class.get("unexplained: h7-row"), Some(&1), "{rep:?}");
+    assert_eq!(rep.node_reads, 4, "{rep:?}");
+    let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+    assert!(
+        still.contains("x104") && still.contains("inside our window"),
+        "{still}"
+    );
+    // A cap of one node read: the sort-key record cannot be settled, and says so.
+    let rep = run(
+        cfg,
+        &Opts {
+            max_reads: 1,
+            ..opts
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((rep.explained, rep.unexplained), (1, 2), "{rep:?}");
+    assert_eq!(rep.node_reads, 1, "{rep:?}");
+    let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+    assert!(still.contains("node read cap"), "{still}");
+}
+
 /// R-P5P9-61 H6 (ruling (3)): the nested `transactions` of large blocks (BlocksByHeight: no
 /// key selected, only `gasPrice`) are paged to the end on both sides within the page budget
 /// and compared as one multiset per block with its totalCount. The 147-tx shape (equal sets,

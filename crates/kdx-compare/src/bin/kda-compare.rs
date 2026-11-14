@@ -70,6 +70,21 @@ enum Cmd {
         #[arg(long, default_value_t = 5.0)]
         minutes: f64,
     },
+    /// R-P5P9-62: re-run the node-refereed rules (H7, H8, H9, `payload.data`) on the GraphQL
+    /// oracle-pair records a run left unexplained, from stored diff logs, with a node read
+    /// cap and rate. Prints per-class counts and every record still unexplained with its
+    /// evidence (JSON). Never asks the oracle. Exit 0 iff none is left unexplained.
+    Referee {
+        /// A diff log (`<out_dir>/diffs-YYYY-MM-DD.jsonl`); repeat for several days.
+        #[arg(long = "log", required = true)]
+        logs: Vec<PathBuf>,
+        /// Node reads for the whole run at most.
+        #[arg(long, default_value_t = kdx_compare::referee::DEFAULT_MAX_READS)]
+        max_reads: usize,
+        /// Node reads per second at most (single-row reads, one limiter).
+        #[arg(long, default_value_t = kdx_compare::referee::DEFAULT_RPS)]
+        rps: u32,
+    },
     /// Parse and validate the config, then print it.
     CheckConfig,
     /// P3 gate: per route and pair, requests compared, unexplained diffs, allowlisted hits,
@@ -123,6 +138,23 @@ async fn main() -> anyhow::Result<()> {
             gate,
         } => {
             if !kdx_compare::summary::run(&cfg.out_dir, &since, &routes, &gate)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Referee {
+            logs,
+            max_reads,
+            rps,
+        } => {
+            let opts = kdx_compare::referee::Opts {
+                logs,
+                max_reads,
+                rps,
+            };
+            let rep = kdx_compare::referee::run(cfg, &opts).await?;
+            println!("{}", serde_json::to_string_pretty(&rep)?);
+            if rep.unexplained + rep.not_refereed > 0 {
                 std::process::exit(1);
             }
             Ok(())
