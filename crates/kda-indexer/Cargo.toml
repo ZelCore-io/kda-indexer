@@ -46,6 +46,10 @@ rayon.workspace = true
 zstd.workspace = true
 rustix = { workspace = true, features = ["process"] }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+tikv-jemallocator.workspace = true
+tikv-jemalloc-ctl.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

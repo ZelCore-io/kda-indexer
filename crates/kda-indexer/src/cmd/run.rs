@@ -86,6 +86,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         let stop = token.clone();
         super::serve::spawn_tip_poll(cfg, tips.clone(), token.clone());
         super::serve::spawn_textfile(cfg, token.clone());
+        crate::alloc::spawn_stats(token.clone());
         let (t, range) = (tips.clone(), cfg.backfill.range_heights.max(1));
         super::notify::spawn_status(token.clone(), move || status_text(&t, range));
         tokio::spawn(async move {
