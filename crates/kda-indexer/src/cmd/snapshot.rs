@@ -106,6 +106,11 @@ pub fn run(a: SnapshotArgs) -> anyhow::Result<()> {
 }
 
 pub fn snapshot(a: &SnapshotArgs) -> anyhow::Result<SnapshotReport> {
+    snapshot_as(rustix::process::geteuid().as_raw(), a)
+}
+
+/// [`snapshot`] run with the effective uid `euid` (FV-2: tests pass 0 without being root).
+fn snapshot_as(euid: u32, a: &SnapshotArgs) -> anyhow::Result<SnapshotReport> {
     // Debug hook `KDX_DEBUG_SLEEP_AT=snapshot-after-manifest:<secs>`: widen the window between
     // the manifest read and the links (a merge can delete step files in it).
     let sleep = std::env::var("KDX_DEBUG_SLEEP_AT")
@@ -119,7 +124,7 @@ pub fn snapshot(a: &SnapshotArgs) -> anyhow::Result<SnapshotReport> {
     let owner = fs::metadata(&a.data_dir)
         .with_context(|| format!("stat {}", a.data_dir.display()))?
         .uid();
-    refuse_root(rustix::process::geteuid().as_raw(), owner)?;
+    refuse_root(euid, owner)?;
     let hs = HotStore::open_ro(&hot_dir(&a.data_dir))?;
     snapshot_with(a, &hs, NAME_WAIT_PAUSE, &mut |p, _| {
         if let (Point::Manifest, Some(d)) = (p, sleep) {
@@ -876,6 +881,31 @@ mod tests {
         super::refuse_root(0, 0).unwrap();
         super::refuse_root(1001, 1001).unwrap();
         super::refuse_root(1002, 1001).unwrap();
+    }
+
+    /// FV-2: the root refusal at its call site. Run as euid 0 on a data dir root does not own
+    /// (the test user's; chowned away from root when the tests run as root), the snapshot
+    /// fails with the refusal before it opens or creates anything: no `<data>/hot/`, no
+    /// `--out`, no `segments.swap.lock`.
+    #[test]
+    fn root_is_refused_before_anything_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        fs::create_dir_all(data.join("segments")).unwrap();
+        if rustix::process::geteuid().is_root() {
+            std::os::unix::fs::chown(&data, Some(65534), None).unwrap();
+        }
+        let out = tmp.path().join("out");
+        let args = SnapshotArgs {
+            data_dir: data.clone(),
+            out: out.clone(),
+            copy: false,
+        };
+        let e = format!("{:#}", super::snapshot_as(0, &args).unwrap_err());
+        assert!(e.contains("refuses to run as root"), "{e}");
+        assert!(!data.join("hot").exists());
+        assert!(!out.exists());
+        assert!(fs::symlink_metadata(data.join("segments.swap.lock")).is_err());
     }
 
     /// A data dir with one listed range `0..20` whose names the hot store sees, and the
