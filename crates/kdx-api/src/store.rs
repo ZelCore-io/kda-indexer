@@ -763,11 +763,20 @@ impl View {
                 Box::new(std::iter::empty())
             } else {
                 let max_txnum = match upper {
-                    Some(u) if u.height() < self.seg_frontier => match seg.txnum_of(u) {
-                        Some(t) => t.checked_sub(1),
-                        // Not a stored key: bound by its height, the key filter below is exact.
-                        None => seg.last_txnum_below_height(u.height().saturating_add(1)),
-                    },
+                    Some(u) if u.height() < self.seg_frontier => {
+                        // `txnum_of` reads only a key's (height, chain, position). A bound
+                        // between two tx keys (above the tx at its position, such as a page
+                        // cursor + 1) keeps that tx; a tx's own key stops below it
+                        // (R-P5P9-62).
+                        let at = TxKey::new(u.height(), u.chain(), u.pos());
+                        match seg.txnum_of(at) {
+                            Some(t) if at == u => t.checked_sub(1),
+                            Some(t) => Some(t),
+                            // Not a stored key: bound by its height, the key filter below is
+                            // exact.
+                            None => seg.last_txnum_below_height(u.height().saturating_add(1)),
+                        }
+                    }
                     _ => seg.last_txnum_below_height(self.seg_frontier),
                 };
                 match max_txnum {
@@ -1220,11 +1229,9 @@ mod pact_steps_tests {
         }
     }
 
-    /// Review minor 7: `pact_steps` carries each step's stored success flag, from a frozen
-    /// record (segments) and from a hot one, so `crossChainTransfer` can skip failed steps
-    /// before any decode.
-    #[test]
-    fn pact_steps_carry_the_ok_flag_hot_and_frozen() {
+    /// Block 5 frozen (in one step range below `FRONTIER`, as the freezer writes it) and block
+    /// 12 hot: the steps of `PACT` at positions 1 and 2 of each.
+    fn frozen_and_hot() -> (tempfile::TempDir, Arc<Store>) {
         let d = tempfile::tempdir().unwrap();
         let g = kdx_hot::Geometry {
             max_gb: 1,
@@ -1258,6 +1265,15 @@ mod pact_steps_tests {
         t.commit().unwrap();
 
         let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        (d, store)
+    }
+
+    /// Review minor 7: `pact_steps` carries each step's stored success flag, from a frozen
+    /// record (segments) and from a hot one, so `crossChainTransfer` can skip failed steps
+    /// before any decode.
+    #[test]
+    fn pact_steps_carry_the_ok_flag_hot_and_frozen() {
+        let (_d, store) = frozen_and_hot();
         let view = store
             .view(Instant::now() + Duration::from_secs(60))
             .unwrap();
@@ -1288,5 +1304,37 @@ mod pact_steps_tests {
         let (steps, capped) = view.pact_steps(&PACT, 3).unwrap();
         assert!(capped);
         assert_eq!(steps[0], step(5, 2, false));
+    }
+
+    /// R-P5P9-62: `before` keeps only keys strictly below it, frozen and hot alike, also when
+    /// it is not a tx key (a page cursor + 1 keeps the cursor's tx, which may have rows left).
+    #[test]
+    fn postings_before_is_exact_between_tx_keys() {
+        let (_d, store) = frozen_and_hot();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let k = |h: u32, pos: u16| TxKey::new(h, 0, pos);
+        let walk = |before: TxKey| -> Vec<TxKey> {
+            let q = super::PostingQuery {
+                min_height: None,
+                max_height: None,
+                chain: None,
+                before: Some(before),
+            };
+            view.postings(Family::Pact, pact_entity(&PACT), q)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let plus_one = |t: TxKey| TxKey(t.0 + 1);
+        // Frozen: between tx keys, at a tx key, at a position past the block's last tx.
+        assert_eq!(walk(plus_one(k(5, 2))), [k(5, 2), k(5, 1)]);
+        assert_eq!(walk(plus_one(k(5, 1))), [k(5, 1)]);
+        assert_eq!(walk(k(5, 2)), [k(5, 1)]);
+        assert_eq!(walk(k(5, 3)), [k(5, 2), k(5, 1)]);
+        // Hot, and the walk on into the frozen part.
+        assert_eq!(walk(plus_one(k(12, 1))), [k(12, 1), k(5, 2), k(5, 1)]);
+        assert_eq!(walk(k(12, 1)), [k(5, 2), k(5, 1)]);
     }
 }
