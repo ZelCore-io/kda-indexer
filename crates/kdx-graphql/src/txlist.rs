@@ -8,6 +8,13 @@
 //!   index 1 before 0). Cursors are `kdx_api::Cursor` (TxKey +
 //!   position + block fingerprint), so they are portable across instances and refused after
 //!   a reorg of their block.
+//! - A cursor names a row: its tx and the row's position in the tx (`sub`: the event
+//!   position of an event or transfer, 0 for a tx row). The next page resumes at the row after
+//!   it, inside the same tx when the tx has more rows (R-P5P9-62, `through_tx`). The cursor
+//!   format (version 1) did not change with that fix, only the resume: a cursor issued before
+//!   it decodes as before and now resumes at its row (before, a frozen tx's remaining rows were
+//!   skipped); a damaged or foreign cursor is refused with `invalid cursor`, one whose block
+//!   was reorged away with `cursor invalidated by reorg`.
 //! - One page is one store read (GQ-5): the records, their blocks, outputs and, when the
 //!   operation selects it, the other half of each cross-chain transfer are loaded in that
 //!   read; nested fields then answer from owned data. No `View` crosses an `.await`. A list
@@ -527,6 +534,17 @@ fn opt_min(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     }
 }
 
+/// The exclusive posting bound of a walk that lists keys up to and including `upto`: the next
+/// tx position after it (a TxKey keeps the position in bits 8..24), as the native walk bounds
+/// a cursor (`kdx_api::native`). A page that ended inside a tx resumes at that tx's next row,
+/// so the tx itself must stay in the walk (R-P5P9-62). The bound was `upto + 1`, which is not a
+/// tx key: the frozen half of `View::postings` looked it up by its (height, chain, position),
+/// found the cursor's own tx and stopped below it, so the rest of a frozen tx was dropped and
+/// the page resumed at the next tx. `View::postings` now keeps that tx for such a bound too.
+fn through_tx(upto: TxKey) -> TxKey {
+    TxKey(upto.0.saturating_add(1 << 8))
+}
+
 /// Candidate keys, newest first, with every key-level filter applied.
 fn keys<'v>(
     view: &'v View,
@@ -557,7 +575,7 @@ fn keys<'v>(
                 min_height: min_h,
                 max_height: max_h,
                 chain: f.chain,
-                before: b.upto.map(|u| TxKey(u.0.saturating_add(1))),
+                before: b.upto.map(through_tx),
             };
             Box::new(
                 view.postings(*fam, *entity, q)?
