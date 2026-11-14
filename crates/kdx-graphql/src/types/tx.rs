@@ -24,8 +24,8 @@ use crate::gql;
 use crate::ids::{encode, NodeKey};
 use crate::scalars::{BigInt, DateTime, FloatText};
 use crate::txlist::{
-    block_node, chain_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx, Blocks, Item,
-    KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
+    block_list, block_node, chain_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx,
+    Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
 };
 
 /// A user transaction (coinbase txs are not listed as transactions, as in Kadena graph).
@@ -125,7 +125,9 @@ impl TransactionCommand {
 
     fn payload_value(&self) -> TransactionPayload {
         let p = self.cmd().get("payload");
-        if let Some(c) = p.and_then(|p| p.get("cont")) {
+        // A JSON-null `cont` is absent: an exec payload may carry `"cont": null`
+        // (R-P5P9-60 D4).
+        if let Some(c) = p.and_then(|p| p.get("cont")).filter(|c| !c.is_null()) {
             return TransactionPayload::ContinuationPayload(ContinuationPayload {
                 data: json_text(c.get("data").unwrap_or(&Value::Null)),
                 pact_id: c.get("pactId").and_then(Value::as_str).map(str::to_owned),
@@ -582,7 +584,7 @@ pub async fn query_transactions(
         request_key.as_deref(),
     )?;
     let (edges, page_info, total) =
-        txs(list(ctx, spec, PageArgs::new(after, before, first, last)).await?);
+        txs(block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?);
     Ok(QueryTransactionsConnection {
         edges: edges
             .into_iter()
@@ -660,7 +662,7 @@ pub async fn query_transfers(
             nft,
         },
     };
-    let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
+    let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
     Ok(QueryTransfersConnection {
         edges: p
             .edges
@@ -748,7 +750,7 @@ pub async fn query_events(
             params,
         },
     };
-    let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
+    let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
     Ok(QueryEventsConnection {
         edges: p
             .edges
@@ -1394,10 +1396,10 @@ mod cgfix_tests {
         assert!(t.ends_with(&format!(r#","{CB_RK}"]"#)), "{t}");
         let e = id_text(&v["event"]["id"]);
         assert!(e.ends_with(&format!(r#","0","{CB_RK}"]"#)), "{e}");
-        // No command: the block's time.
+        // No command: the block's time in whole seconds (R-P5P9-60 D3).
         assert_eq!(
             v["transfer"]["creationTime"],
-            json!("2025-05-06T07:58:43.432Z")
+            json!("2025-05-06T07:58:43.000Z")
         );
         // An output without a reqKey keeps compat's text.
         let d = tx(0, json!({}), None, json!(["", "miner", 1.0]));
@@ -1436,8 +1438,8 @@ mod cgfix_tests {
             assert_eq!(v["cmd"]["meta"]["creationTime"], json!(want), "{ct}");
             assert_eq!(v["transfer"]["creationTime"], json!(want), "{ct}");
         }
-        // No usable value: the transfer keeps its block's time, the meta the epoch (as
-        // before).
+        // No usable value: the transfer keeps its block's time in whole seconds (the same
+        // fallback, R-P5P9-60 D3), the meta the epoch (as before).
         let cmd = json!({"meta": {"creationTime": {"decimal": "x"}}, "payload": {}});
         let d = tx(1, json!({}), Some(cmd), json!([]));
         let v = run(
@@ -1447,7 +1449,7 @@ mod cgfix_tests {
         .await;
         assert_eq!(
             v["transfer"]["creationTime"],
-            json!("2025-05-06T07:58:43.432Z")
+            json!("2025-05-06T07:58:43.000Z")
         );
         assert_eq!(
             v["cmd"]["meta"]["creationTime"],
@@ -1559,5 +1561,86 @@ mod cgfix_tests {
         );
         assert_eq!(spec.rows.rows(&mine).len(), 1);
         assert!(spec.rows.rows(&other).is_empty());
+    }
+
+    /// D2 (R-P5P9-60, rule (b)): `Block.flags` is the oracle's string, as `Block.nonce`.
+    #[tokio::test]
+    async fn block_flags_is_a_string() {
+        let v = run(
+            tx(1, json!({}), None, json!([])),
+            "{ block { flags nonce } }",
+        )
+        .await;
+        assert_eq!(v["block"]["flags"], json!("0"));
+        assert_eq!(v["block"]["nonce"], json!("0"));
+    }
+
+    /// A coinbase tx (no command) whose block was made at `micros`.
+    fn coinbase_at(micros: u64) -> Arc<TxData> {
+        let d = tx(0, json!({}), None, json!([]));
+        let mut b = (*d.block).clone();
+        b.creation_time = micros;
+        Arc::new(TxData {
+            rec: d.rec.clone(),
+            block: Arc::new(b),
+            out: d.out.clone(),
+            cmd: None,
+            evs: d.evs.clone(),
+            trs: d.trs.clone(),
+            nfts: Vec::new(),
+        })
+    }
+
+    /// D3 (R-P5P9-60): a coinbase transfer's `creationTime` is its block's time cut to whole
+    /// seconds, as the oracle sends it (.916 and .004 both give .000). `Block.creationTime`
+    /// keeps its milliseconds.
+    #[tokio::test]
+    async fn coinbase_transfer_time_is_whole_seconds() {
+        for (micros, want) in [
+            (1_763_093_440_916_000, "2025-11-14T04:10:40.000Z"),
+            (1_763_093_440_004_000, "2025-11-14T04:10:40.000Z"),
+            (1_763_093_440_000_000, "2025-11-14T04:10:40.000Z"),
+        ] {
+            let v = run(
+                coinbase_at(micros),
+                "{ transfer { creationTime } block { creationTime } }",
+            )
+            .await;
+            assert_eq!(v["transfer"]["creationTime"], json!(want), "{micros}");
+            assert_ne!(v["block"]["creationTime"], Value::Null);
+        }
+        let v = run(
+            coinbase_at(1_763_093_440_916_000),
+            "{ block { creationTime } }",
+        )
+        .await;
+        assert_eq!(
+            v["block"]["creationTime"],
+            json!("2025-11-14T04:10:40.916Z")
+        );
+    }
+
+    /// D4 (R-P5P9-60): an exec payload that also carries `"cont": null` (request key
+    /// 7xY0mtkTR9IZ…, chain 2, h2706534) is an exec: its `data` is served. A real
+    /// continuation is unchanged.
+    #[tokio::test]
+    async fn null_cont_is_absent() {
+        let ks = json!({"ks": {"keys": ["k1"], "pred": "keys-all"}});
+        let exec = json!({"payload": {"exec": {"code": "(f)", "data": ks}, "cont": null}});
+        let q = "{ cmd { payload { __typename ... on ExecutionPayload { code data }
+                   ... on ContinuationPayload { pactId step } } } }";
+        let v = run(tx(1, json!({}), Some(exec), json!([])), q).await;
+        assert_eq!(v["cmd"]["payload"]["__typename"], json!("ExecutionPayload"));
+        assert_eq!(v["cmd"]["payload"]["code"], json!("\"(f)\""));
+        let data: Value =
+            serde_json::from_str(v["cmd"]["payload"]["data"].as_str().unwrap()).unwrap();
+        assert_eq!(data, ks);
+        let cont = json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": false,
+            "data": {}, "proof": null}}});
+        let v = run(tx(1, json!({}), Some(cont), json!([])), q).await;
+        assert_eq!(
+            v["cmd"]["payload"],
+            json!({"__typename": "ContinuationPayload", "pactId": "p", "step": 1})
+        );
     }
 }

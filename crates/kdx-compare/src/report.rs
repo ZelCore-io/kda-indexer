@@ -10,8 +10,21 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Body bytes kept per side in a diff record.
-pub const BODY_TRIM: usize = 4096;
+/// Body bytes kept per side in a diff record (R-P5P9-60 H3: 1 MiB, was 4 KB, so CG-3 can
+/// classify every record from the record alone). The request, the curl line and the note
+/// keep as much; each is cut by its JSON-escaped length ([`DiffRecord::bounded`]).
+pub const BODY_TRIM: usize = 1 << 20;
+/// JSON-escaped bytes kept per diff entry value; a bigger value is replaced by a marked
+/// string cut to this length (the bodies still carry it, up to [`BODY_TRIM`]).
+pub const ENTRY_VALUE_TRIM: usize = 32 << 10;
+/// JSON-escaped bytes kept of a diff entry path and of each short field.
+pub const SHORT_TRIM: usize = 4 << 10;
+/// Upper bound of one diff log line: five long strings, at most `MAX_ENTRIES` entries of a
+/// path and two values, and the short fields with the JSON punctuation around them.
+pub const MAX_RECORD_BYTES: usize = 5 * (BODY_TRIM + 2)
+    + crate::diff::MAX_ENTRIES * (SHORT_TRIM + 2 * (ENTRY_VALUE_TRIM + 2) + 64)
+    + 8 * (SHORT_TRIM + 2)
+    + 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffKind {
@@ -66,6 +79,71 @@ pub fn sh_quote(s: &str) -> String {
 /// `"$VAR"'<quoted suffix>'`: the base URL variable expands, the rest stays literal.
 pub fn sh_url(var: &str, suffix: &str) -> String {
     format!("\"${var}\"{}", sh_quote(suffix))
+}
+
+/// `s` cut to at most `max` bytes once JSON-escaped (on a char boundary).
+pub fn trim_escaped(s: &str, max: usize) -> String {
+    let mut n = 0;
+    for (i, c) in s.char_indices() {
+        let w = match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        };
+        if n + w > max {
+            return s[..i].to_string();
+        }
+        n += w;
+    }
+    s.to_string()
+}
+
+/// A diff entry value cut to [`ENTRY_VALUE_TRIM`] escaped bytes: kept when it fits,
+/// otherwise a string `<clipped N bytes> <its text, cut>`.
+fn bound_value(v: Option<Value>) -> Option<Value> {
+    let v = v?;
+    let text = v.to_string();
+    if text.len() <= ENTRY_VALUE_TRIM {
+        return Some(v);
+    }
+    let mark = format!("<clipped {} bytes> ", text.len());
+    let body = trim_escaped(&text, ENTRY_VALUE_TRIM - mark.len());
+    Some(Value::String(mark + &body))
+}
+
+impl DiffRecord {
+    /// The record with every field bounded (R-P5P9-60 H3): its line is at most
+    /// [`MAX_RECORD_BYTES`] whatever the bodies and the diff hold.
+    pub fn bounded(&self) -> DiffRecord {
+        let long = |s: &str| trim_escaped(s, BODY_TRIM);
+        let short = |s: &str| trim_escaped(s, SHORT_TRIM);
+        DiffRecord {
+            ts: short(&self.ts),
+            route: short(&self.route),
+            request: long(&self.request),
+            a_target: short(&self.a_target),
+            b_target: short(&self.b_target),
+            a_status: self.a_status,
+            b_status: self.b_status,
+            a_body_trimmed: long(&self.a_body_trimmed),
+            b_body_trimmed: long(&self.b_body_trimmed),
+            diff: self
+                .diff
+                .iter()
+                .take(crate::diff::MAX_ENTRIES)
+                .map(|e| DiffEntry {
+                    path: short(&e.path),
+                    kind: e.kind,
+                    a: bound_value(e.a.clone()),
+                    b: bound_value(e.b.clone()),
+                })
+                .collect(),
+            class: short(&self.class),
+            allowlisted: self.allowlisted.as_deref().map(short),
+            curl: long(&self.curl),
+            note: self.note.as_deref().map(long),
+        }
+    }
 }
 
 pub fn trim_body(b: &[u8]) -> String {
@@ -148,7 +226,7 @@ impl DiffLog {
             .append(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        let mut line = serde_json::to_vec(rec)?;
+        let mut line = serde_json::to_vec(&rec.bounded())?;
         line.push(b'\n');
         f.write_all(&line)?;
         Ok(())
@@ -321,7 +399,8 @@ pub fn generic_path(p: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sh_quote, sh_url};
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn sh_quote_hostile_path() {
@@ -343,5 +422,83 @@ mod tests {
         {
             assert_eq!(String::from_utf8_lossy(&out.stdout), hostile);
         }
+    }
+
+    fn rec(body: String, request: String, diff: Vec<DiffEntry>) -> DiffRecord {
+        DiffRecord {
+            ts: "2026-11-14T00:00:00Z".into(),
+            route: "graphql:QBlock".into(),
+            request,
+            a_target: "gql".into(),
+            b_target: "oracle".into(),
+            a_status: Some(200),
+            b_status: Some(200),
+            a_body_trimmed: body.clone(),
+            b_body_trimmed: body.clone(),
+            diff,
+            class: "diff".into(),
+            allowlisted: None,
+            curl: body.clone(),
+            note: Some(body),
+        }
+    }
+
+    fn line_of(r: &DiffRecord) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let log = DiffLog::new(dir.path()).unwrap();
+        log.append(r).unwrap();
+        let p = log.path_for(&date_of(now_secs()));
+        std::fs::read(p).unwrap()
+    }
+
+    /// R-P5P9-60 H3: a body up to 1 MiB is kept whole (was cut at 4 KB), and the record line
+    /// stays bounded whatever the bodies, request and diff values hold.
+    #[test]
+    fn h3_records_keep_bodies_to_1_mib_and_stay_bounded() {
+        // A 900 KB JSON body (the class CG-2 cut at 4 KB) is kept whole and parses.
+        let rows: Vec<String> = (0..9000)
+            .map(|i| format!("{{\"node\":{{\"id\":\"{i:090}\"}}}}"))
+            .collect();
+        let body = format!("{{\"data\":{{\"edges\":[{}]}}}}", rows.join(","));
+        assert!(body.len() > 900_000 && body.len() < BODY_TRIM);
+        let b = trim_body(body.as_bytes());
+        let line = line_of(&rec(b, "QBlock {}".into(), vec![]));
+        let back: DiffRecord = serde_json::from_slice(&line).unwrap();
+        assert_eq!(back.a_body_trimmed, body);
+        assert!(serde_json::from_str::<Value>(&back.b_body_trimmed).is_ok());
+        // The worst case: 3 MiB of quotes and control bytes in every long field, 60 entries
+        // with 1 MiB values and long paths. The line is bounded and still one JSON record.
+        let worst: String = "\"\u{1}\\x".repeat(3 << 18);
+        let big = Value::String("\"".repeat(1 << 20));
+        let entries: Vec<DiffEntry> = (0..60)
+            .map(|i| DiffEntry {
+                path: format!("/{}{i}", "a/".repeat(5000)),
+                kind: DiffKind::Changed,
+                a: Some(big.clone()),
+                b: Some(json!({"edges": [big.clone()]})),
+            })
+            .collect();
+        let line = line_of(&rec(worst.clone(), worst, entries));
+        assert!(
+            line.len() <= MAX_RECORD_BYTES,
+            "{} > {MAX_RECORD_BYTES}",
+            line.len()
+        );
+        const { assert!(MAX_RECORD_BYTES < 12 << 20) };
+        let back: DiffRecord = serde_json::from_slice(&line).unwrap();
+        assert_eq!(back.diff.len(), crate::diff::MAX_ENTRIES);
+        let a = back.diff[0].a.as_ref().and_then(Value::as_str).unwrap();
+        assert!(a.starts_with("<clipped "), "{}", &a[..40]);
+        // Small values are kept as they are.
+        assert_eq!(bound_value(Some(json!(5))), Some(json!(5)));
+    }
+
+    #[test]
+    fn trim_escaped_counts_escapes_and_keeps_chars_whole() {
+        assert_eq!(trim_escaped("abc", 3), "abc");
+        assert_eq!(trim_escaped("a\"b", 2), "a");
+        assert_eq!(trim_escaped("a\u{1}b", 6), "a");
+        assert_eq!(trim_escaped("aé", 2), "a");
+        assert_eq!(trim_escaped("aé", 3), "aé");
     }
 }

@@ -8,9 +8,12 @@
 //!   index 1 before 0). Cursors are `kdx_api::Cursor` (TxKey +
 //!   position + block fingerprint), so they are portable across instances and refused after
 //!   a reorg of their block.
-//! - One page is one `ApiState::read_heavy` (GQ-5): the records, their blocks, outputs and,
-//!   when the operation selects it, the other half of each cross-chain transfer are loaded
-//!   in that read; nested fields then answer from owned data. No `View` crosses an `.await`.
+//! - One page is one store read (GQ-5): the records, their blocks, outputs and, when the
+//!   operation selects it, the other half of each cross-chain transfer are loaded in that
+//!   read; nested fields then answer from owned data. No `View` crosses an `.await`. A list
+//!   is a heavy read (`ApiState::read_heavy`, H-1), except a list of one block
+//!   ([`block_list`], R-P5P9-60 D1): nested in the block or a root list with `blockHash`,
+//!   which reads that block by key on a plain read slot.
 //! - `first`/`after` walks newest first. `last`/`before` first collects the keys between the
 //!   cursor and the newest end (keys only, at most [`BACK_KEYS`]), then loads from the cursor
 //!   outward. Both check the request deadline every 64 keys.
@@ -907,11 +910,53 @@ pub struct ListPage {
     pub total: Total,
 }
 
-/// Run one list page for the field being resolved.
+/// Run one list page for the field being resolved, as a heavy read (H-1: per-client share).
 pub async fn list(
     ctx: &Context<'_>,
     spec: ListSpec,
     args: PageArgs,
+) -> async_graphql::Result<ListPage> {
+    list_as(ctx, spec, args, false).await
+}
+
+/// `list` for a list of one block: a connection nested in it (`Block.transactions`,
+/// `Block.events`; R-P5P9-60 D1) or a root list with `blockHash` and no `requestKey`
+/// (`transactions`, `events`, `transfers`; R-P5P9-60 round 2). A plain read, not a per-client
+/// heavy one, so one request over many blocks gets every block's page. Such a page reads only
+/// its own block, by key: the block's location by hash, the block's txs (`block_txs` at that
+/// chain and height; `chainId`, `minHeight` and `maxHeight` only filter those keys in memory),
+/// the cursor's block fingerprint, and each tx's block record and output; its `totalCount`
+/// walks the same txs. Anything that could read past the block stays a heavy read: another
+/// source (an account, a posting, a height walk, a request key, which wins over `blockHash`),
+/// a `minimumDepth` filter (it reads the chain tips), and, for transfers, a selected
+/// `crossChainTransfer` (it reads the pact's other chain).
+pub async fn block_list(
+    ctx: &Context<'_>,
+    spec: ListSpec,
+    args: PageArgs,
+) -> async_graphql::Result<ListPage> {
+    let one_block = matches!(spec.source, SourceSpec::Block(_)) && spec.filter.depth.is_none();
+    list_as(ctx, spec, args, one_block).await
+}
+
+/// One store read of `state`: plain when `one_block` ([`block_list`]), else heavy.
+async fn read_list<T, F>(state: &Arc<kdx_api::ApiState>, one_block: bool, f: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+{
+    if one_block {
+        state.read(f).await
+    } else {
+        state.read_heavy(f).await
+    }
+}
+
+async fn list_as(
+    ctx: &Context<'_>,
+    spec: ListSpec,
+    args: PageArgs,
+    one_block: bool,
 ) -> async_graphql::Result<ListPage> {
     let g = gql(ctx);
     let state = g.state()?.clone();
@@ -920,37 +965,38 @@ pub async fn list(
     let xchain = matches!(spec.rows, Rows::Transfers { nft: false, .. })
         && selects(ctx, "crossChainTransfer");
     let budget = xchain_budget(ctx);
+    // A `crossChainTransfer` lookup reads the pact's other chain: past one block.
+    let one_block = one_block && !xchain;
     // The page is read only when its items or page info are selected.
     let reads = selects_direct(ctx, &["edges", "pageInfo"]);
     // A block's or a request key's rows are few: counted with the page, exactly.
     let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk(_))
         && selects_direct(ctx, &["totalCount"]);
     let sp = spec.clone();
-    let (edges, info, exact) = state
-        .read_heavy(move |view| {
-            let dl = dl.min(Instant::now() + SCAN_WINDOW);
-            let exact = if bounded {
-                Some(count(view, &sp, dl)?.0)
-            } else {
-                None
-            };
-            if !reads {
-                return Ok((Vec::new(), PageInfo::default(), exact));
-            }
-            let (mut edges, info) = run_page(view, &sp, &page, dl)?;
-            if xchain {
-                let mut blocks = Blocks::default();
-                for (_, it) in edges.iter_mut() {
-                    if let Item::Transfer(d, i, x) = it {
-                        view.check_deadline()?;
-                        *x = Some(xchain_of(view, d, *i, &mut blocks, &budget)?);
-                    }
+    let (edges, info, exact) = read_list(&state, one_block, move |view| {
+        let dl = dl.min(Instant::now() + SCAN_WINDOW);
+        let exact = if bounded {
+            Some(count(view, &sp, dl)?.0)
+        } else {
+            None
+        };
+        if !reads {
+            return Ok((Vec::new(), PageInfo::default(), exact));
+        }
+        let (mut edges, info) = run_page(view, &sp, &page, dl)?;
+        if xchain {
+            let mut blocks = Blocks::default();
+            for (_, it) in edges.iter_mut() {
+                if let Item::Transfer(d, i, x) = it {
+                    view.check_deadline()?;
+                    *x = Some(xchain_of(view, d, *i, &mut blocks, &budget)?);
                 }
             }
-            Ok((edges, info, exact))
-        })
-        .await
-        .map_err(from_api)?;
+        }
+        Ok((edges, info, exact))
+    })
+    .await
+    .map_err(from_api)?;
     if let Some(n) = exact {
         return Ok(ListPage {
             edges,
@@ -964,8 +1010,7 @@ pub async fn list(
         Box::pin(async move {
             let now = Instant::now();
             let until = now + dl.saturating_duration_since(now) / 2;
-            state
-                .read_heavy(move |view| count(view, &spec, until))
+            read_list(&state, one_block, move |view| count(view, &spec, until))
                 .await
                 .map_err(from_api)
         })

@@ -7,6 +7,7 @@ pub mod diff;
 pub mod gen;
 pub mod graphql;
 pub mod graphql_norm;
+pub mod graphql_scope;
 pub mod graphql_ws;
 pub mod metrics;
 pub mod normalize;

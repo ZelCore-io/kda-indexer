@@ -70,6 +70,29 @@ impl HttpCapture {
     }
 }
 
+/// The HTTP client options of one target.
+#[derive(Debug, Clone)]
+pub struct ClientOpts {
+    pub timeout: Duration,
+    /// Accept a self-signed certificate (an internal `graphql_oracle` only).
+    pub insecure_tls: bool,
+    /// Local address the client binds (`[targets.<n>] source_addr`, R-P5P9-60 H4).
+    pub source_addr: Option<std::net::IpAddr>,
+}
+
+impl ClientOpts {
+    /// The client builder of these options.
+    pub fn builder(&self) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .user_agent(kdx_node::USER_AGENT)
+            .timeout(self.timeout)
+            // chainweb-data (Warp) closes idle keep-alive connections; do not reuse old ones.
+            .pool_idle_timeout(Duration::from_secs(5))
+            .danger_accept_invalid_certs(self.insecure_tls)
+            .local_address(self.source_addr)
+    }
+}
+
 #[derive(Clone)]
 pub struct Target {
     pub name: String,
@@ -103,14 +126,24 @@ impl Target {
         max_body_bytes: usize,
         insecure_tls: bool,
     ) -> anyhow::Result<Target> {
-        let http = reqwest::Client::builder()
-            .user_agent(kdx_node::USER_AGENT)
-            .timeout(timeout)
-            // chainweb-data (Warp) closes idle keep-alive connections; do not reuse old ones.
-            .pool_idle_timeout(Duration::from_secs(5))
-            .danger_accept_invalid_certs(insecure_tls)
-            .build()
-            .context("building http client")?;
+        let opts = ClientOpts {
+            timeout,
+            insecure_tls,
+            source_addr: None,
+        };
+        Target::with_opts(name, url, kind, limiter, max_body_bytes, &opts)
+    }
+
+    /// [`Target::new`] with every client option ([`ClientOpts`]).
+    pub fn with_opts(
+        name: &str,
+        url: Url,
+        kind: TargetKind,
+        limiter: Arc<Limiter>,
+        max_body_bytes: usize,
+        opts: &ClientOpts,
+    ) -> anyhow::Result<Target> {
+        let http = opts.builder().build().context("building http client")?;
         Ok(Target {
             name: name.to_string(),
             url,
@@ -141,15 +174,12 @@ impl Target {
                         None => limiter.clone(),
                     },
                 };
-                Target::with_tls(
-                    n,
-                    t.url.clone(),
-                    t.kind,
-                    cfg.timeout(),
-                    lim,
-                    cfg.max_body_bytes,
-                    t.insecure_tls,
-                )
+                let opts = ClientOpts {
+                    timeout: cfg.timeout(),
+                    insecure_tls: t.insecure_tls,
+                    source_addr: t.source_addr,
+                };
+                Target::with_opts(n, t.url.clone(), t.kind, lim, cfg.max_body_bytes, &opts)
             })
             .collect()
     }
@@ -357,5 +387,73 @@ max_height = 6000000
             t["gql"].limiter.interval,
             Duration::from_secs_f64(1.0 / 5.0)
         );
+    }
+
+    /// A one-shot HTTP server on 127.0.0.1 that answers `{}` and reports each peer address.
+    async fn peer_server() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<std::net::IpAddr>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/graphql", l.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut s, peer)) = l.accept().await {
+                let _ = tx.send(peer.ip());
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                    .await;
+            }
+        });
+        (url, rx)
+    }
+
+    fn one_target(url: &str, source: Option<&str>) -> Target {
+        let src = source.map_or(String::new(), |a| format!("source_addr = \"{a}\"\n"));
+        let cfg: CompareConfig = toml::from_str(&format!(
+            "network = \"mainnet01\"\npairs = []\n[node]\nurl = \"http://127.0.0.1:1\"\n\
+             [targets.gql]\nurl = \"{url}\"\nkind = \"kda_indexer_graphql\"\n{src}"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        Target::all(&cfg).unwrap().remove(0)
+    }
+
+    /// R-P5P9-60 H4: `[targets.<n>] source_addr` reaches the target's client builder: the
+    /// server sees that source, and an address the host does not own fails the bind.
+    #[tokio::test]
+    async fn h4_source_addr_reaches_the_client_builder() {
+        let (url, mut peers) = peer_server().await;
+        let body = serde_json::json!({"query": "{ x }"});
+        // Bound to loopback: the request goes out from it.
+        let t = one_target(&url, Some("127.0.0.1"));
+        assert_eq!(t.post_json(&body).await.unwrap().status, 200);
+        assert_eq!(peers.recv().await.unwrap().to_string(), "127.0.0.1");
+        // Bound to TEST-NET-1 (never a local address): the connect fails at the bind, so the
+        // option is in the client; without it the same URL answers.
+        let bad = one_target(&url, Some("192.0.2.1"));
+        assert!(bad.post_json(&body).await.is_err());
+        let none = one_target(&url, None);
+        assert_eq!(none.post_json(&body).await.unwrap().status, 200);
+        // A bad address is a config error, not a silent default.
+        let e = toml::from_str::<CompareConfig>(&format!(
+            "network = \"m\"\npairs = []\n[node]\nurl = \"http://127.0.0.1:1\"\n\
+             [targets.gql]\nurl = \"{url}\"\nkind = \"kda_indexer_graphql\"\nsource_addr = \"localhost\"\n"
+        ));
+        assert!(e.is_err());
+    }
+
+    /// On Linux every 127/8 address is local: a second loopback source is seen as itself.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn h4_a_second_loopback_source_is_what_the_server_sees() {
+        let (url, mut peers) = peer_server().await;
+        let t = one_target(&url, Some("127.0.0.2"));
+        let body = serde_json::json!({"query": "{ x }"});
+        assert_eq!(t.post_json(&body).await.unwrap().status, 200);
+        assert_eq!(peers.recv().await.unwrap().to_string(), "127.0.0.2");
     }
 }
