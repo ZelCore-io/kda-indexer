@@ -222,6 +222,51 @@ fn drop_at_or_below(v: &mut Value, h: u64) {
     }
 }
 
+/// Cuts both sides at `cut`, the lowest height of a side that held its full limit: rows
+/// below it go on both sides. At `cut` itself a limiting side (`split_a`, `split_b`: full, its
+/// lowest height `cut`) may hold only some of the height's rows, so the other side's rows
+/// there that it lacks go; when both are limiting, every row at `cut` goes. A limiting
+/// side's row at `cut` that the complete side lacks stays a difference (R-P5P9-71 (1)).
+fn cut_at_limit(va: &mut Value, vb: &mut Value, cut: u64, split_a: bool, split_b: bool) {
+    let at = |v: &Value| -> Value {
+        Value::Array(
+            v.as_array()
+                .map(|x| {
+                    x.iter()
+                        .filter(|r| row_height(r) == Some(cut))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    };
+    let (at_a, at_b) = (at(va), at(vb));
+    let keep = |v: &mut Value, keep_at: Vec<Value>| {
+        drop_at_or_below(v, cut);
+        if let Value::Array(x) = v {
+            x.extend(keep_at);
+        }
+    };
+    match (split_a, split_b) {
+        (true, false) => {
+            let b_surplus = only_keys_in_first(&at_b, &at_a);
+            let b_keep = only_keys_in_first(&at_b, &Value::Array(b_surplus));
+            keep(va, at_a.as_array().cloned().unwrap_or_default());
+            keep(vb, b_keep);
+        }
+        (false, true) => {
+            let a_surplus = only_keys_in_first(&at_a, &at_b);
+            let a_keep = only_keys_in_first(&at_a, &Value::Array(a_surplus));
+            keep(va, a_keep);
+            keep(vb, at_b.as_array().cloned().unwrap_or_default());
+        }
+        _ => {
+            drop_at_or_below(va, cut);
+            drop_at_or_below(vb, cut);
+        }
+    }
+}
+
 fn min_height(v: &Value) -> Option<u64> {
     v.as_array()?.iter().filter_map(row_height).min()
 }
@@ -868,17 +913,34 @@ impl Ctx {
             let (na, nb) = (len_of(&va), len_of(&vb));
             let fa = full(na, pa.truncated || page_cut);
             let fb = full(nb, pb.truncated || page_cut);
+            // R-P5P9-71 (1): the window is for rows the oracle has not filled yet, which are
+            // rows it lacks. A row only the oracle lists there is no lag: it stays in the
+            // compare unless it is near A's tip or the node shows its block is an orphan.
+            let kept_b = if replica {
+                Vec::new()
+            } else {
+                self.lag_window_oracle_only(&va, &mut vb, clamp).await
+            };
             let dropped = drop_above(&mut va, clamp) + drop_above(&mut vb, clamp);
             if dropped > 0 {
-                let cut = [(fa, min_height(&va)), (fb, min_height(&vb))]
+                let (min_a, min_b) = (min_height(&va), min_height(&vb));
+                let cut = [(fa, min_a), (fb, min_b)]
                     .into_iter()
                     .filter_map(|(f, h)| if f { h } else { None })
                     .max();
                 if let Some(cut) = cut {
-                    drop_at_or_below(&mut va, cut);
-                    drop_at_or_below(&mut vb, cut);
+                    cut_at_limit(
+                        &mut va,
+                        &mut vb,
+                        cut,
+                        fa && min_a == Some(cut),
+                        fb && min_b == Some(cut),
+                    );
                 }
-                lag_rows = (na + nb) - (len_of(&va) + len_of(&vb));
+                lag_rows = (na + nb) - (len_of(&va) + len_of(&vb) + kept_b.len());
+            }
+            if let Value::Array(xb) = &mut vb {
+                xb.extend(kept_b);
             }
         }
         // kda-txs can stop one row short of the limit (seen live: limit 250, 250 rows on A,
@@ -1116,8 +1178,8 @@ impl Ctx {
             let (mut ca, mut cb) = (va.clone(), vb.clone());
             if full_a0 && full_b0 {
                 if let (Some(x), Some(y)) = (min_height(&ca), min_height(&cb)) {
-                    drop_at_or_below(&mut ca, x.max(y));
-                    drop_at_or_below(&mut cb, x.max(y));
+                    // R-P5P9-71 (1): at the cut, only the complete side's surplus goes.
+                    cut_at_limit(&mut ca, &mut cb, x.max(y), x >= y, y >= x);
                 }
             }
             // Rows match by (requestKey, blockHash, idx): value diffs of a shared row (F1, F2,
@@ -2675,6 +2737,58 @@ impl Ctx {
             }
         }
         ok
+    }
+
+    /// R-P5P9-71 (1), the oracle-lag window (R3E-11) narrowed: rows above `clamp` that only
+    /// the oracle (`vb`) lists, by (requestKey, blockHash, idx), are taken out of `vb` and
+    /// returned to stay in the compare. Lag explains rows the oracle lacks, not rows it has
+    /// and A lacks. Left in `vb` (to be dropped with the window) are only rows within
+    /// `REPLICA_TIP_MARGIN` of A's tip (the oracle may be read after a new block) and rows
+    /// whose block the node shows is not canonical (an orphan the oracle keeps). A row the
+    /// node cannot settle (no header, the read budget spent) stays in the compare.
+    async fn lag_window_oracle_only(&self, va: &Value, vb: &mut Value, clamp: u64) -> Vec<Value> {
+        let near_tip = self.tips.a_tip().saturating_sub(REPLICA_TIP_MARGIN);
+        let window = |v: &Value| -> Value {
+            Value::Array(
+                v.as_array()
+                    .map(|x| {
+                        x.iter()
+                            .filter(|r| row_height(r).is_some_and(|h| h > clamp && h <= near_tip))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        };
+        let only_b = only_keys_in_first(&window(vb), va);
+        let mut cache = HashMap::new();
+        let mut checks = 0usize;
+        let mut kept = Vec::new();
+        for r in only_b {
+            let orphan = match (
+                row_chain(&r),
+                row_height(&r),
+                r.get("blockHash").and_then(Value::as_str),
+            ) {
+                (Some(c), Some(h), Some(bh)) => self
+                    .canon_cached(&mut cache, &mut checks, c, h)
+                    .await
+                    .flatten()
+                    .is_some_and(|ch| ch != bh),
+                _ => false,
+            };
+            if !orphan {
+                kept.push(r);
+            }
+        }
+        if let Value::Array(xb) = vb {
+            for r in &kept {
+                if let Some(i) = xb.iter().position(|x| x == r) {
+                    xb.remove(i);
+                }
+            }
+        }
+        kept
     }
 
     /// Splits oracle rows into (orphans, canonical): a row is canonical when the node's

@@ -4278,8 +4278,13 @@ async fn bytes_server(body: Vec<u8>) -> String {
 
 /// A context comparing compat (`a`) with kda-txs (`b`) on `/v1/txs`, each answering its bytes.
 async fn v1_setup(a: Vec<u8>, b: Vec<u8>, out: &std::path::Path) -> Ctx {
+    v1_setup_node(a, b, out, NodeMock::default()).await
+}
+
+/// [`v1_setup`] with its own node mock.
+async fn v1_setup_node(a: Vec<u8>, b: Vec<u8>, out: &std::path::Path, node: NodeMock) -> Ctx {
     let (nu, au, bu) = (
-        node_server(NodeMock::default()).await,
+        node_server(node).await,
         bytes_server(a).await,
         bytes_server(b).await,
     );
@@ -4975,4 +4980,130 @@ async fn c5_a_first_page_fault_of_ours_is_a_diff_and_a_5xx_an_error() {
             assert_eq!(un.len(), 1, "{mode}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// FVH-C5b: the oracle-lag rule (R3E-11) explained rows ours lacks (R-P5P9-71 item 1)
+
+/// R-P5P9-71 (1): in the oracle-lag window a row only kda-txs lists is no lag. Ours short by
+/// one there is a diff; kda-txs lacking recent rows (the rule's case) and a kda-txs row the
+/// node shows is an orphan stay explained, as does a row near A's tip.
+#[tokio::test]
+async fn c5b_the_lag_window_explains_only_rows_the_oracle_lacks() {
+    // Heights 7_000_000 down to 6_999_990; A's tip (its /txs/recent) is the highest, so every
+    // row is in the window and rows down to 6_999_995 are near the tip.
+    let rows = v1_rows(11, 10);
+    let orphan = {
+        let mut r = rows[9].clone();
+        r["blockHash"] = json!("orphan9");
+        r
+    };
+    let node = || NodeMock {
+        canon: HashMap::from([((9, 6_999_991), "b9".to_string())]),
+        ..NodeMock::default()
+    };
+    let cases: [(&str, Vec<Value>, Vec<Value>, &str); 4] = [
+        (
+            "ours short by one",
+            rows[..9].to_vec(),
+            rows[..10].to_vec(),
+            "diff",
+        ),
+        (
+            "kda-txs lacks recent rows",
+            rows[..10].to_vec(),
+            rows[3..10].to_vec(),
+            "allowlisted",
+        ),
+        (
+            "kda-txs keeps an orphan",
+            rows[..10].to_vec(),
+            [&rows[..10], &[orphan]].concat(),
+            "allowlisted",
+        ),
+        (
+            "near A's tip",
+            rows[1..10].to_vec(),
+            rows[..10].to_vec(),
+            "allowlisted",
+        ),
+    ];
+    for (name, a, b, class) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let tip = a.iter().filter_map(|r| r["height"].as_u64()).max().unwrap();
+        let ctx = v1_setup_node(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            dir.path(),
+            node(),
+        )
+        .await;
+        ctx.tips.set_a_tip(tip.max(7_000_000));
+        let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+        assert_eq!(
+            o.class,
+            class,
+            "{name}: {:?}",
+            o.record.map(|r| (r.note, r.diff))
+        );
+    }
+}
+
+/// R-P5P9-71 (1): when the window drops rows, the cut at a full side's lowest height drops
+/// only the other side's surplus there. A row the limiting side (kda-txs, full) has at its
+/// lowest height and ours (not full) lacks stays a diff; kda-txs lagging and reaching lower
+/// (the cut's case) stays explained.
+#[tokio::test]
+async fn c5b_the_lag_cut_keeps_a_row_only_the_limiting_side_has() {
+    let rows = v1_rows(11, 10);
+    let cases: [(&str, Vec<Value>, Vec<Value>, &str); 2] = [
+        (
+            "ours short by one",
+            rows[..9].to_vec(),
+            rows[..10].to_vec(),
+            "diff",
+        ),
+        (
+            "kda-txs lags and reaches lower",
+            rows[..10].to_vec(),
+            rows[1..11].to_vec(),
+            "allowlisted",
+        ),
+    ];
+    for (name, a, b, class) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = v1_setup(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            dir.path(),
+        )
+        .await;
+        // Only height 7_000_000 is in the window, far from A's tip.
+        ctx.tips.set_a_tip(7_000_000 + super::ORACLE_HORIZON - 1);
+        let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+        assert_eq!(
+            o.class,
+            class,
+            "{name}: {:?}",
+            o.record.map(|r| (r.note, r.diff))
+        );
+    }
+}
+
+/// R-P5P9-71 (1): the node-confirmed rule (R3E-14) cuts two full sides at the higher lowest
+/// height. kda-txs's row there that ours lacks (ours holding one more row below) stays a diff.
+#[tokio::test]
+async fn c5b_the_node_gap_cut_keeps_a_row_only_the_limiting_side_has() {
+    let rows = v1_rows(11, 10);
+    let a = [&rows[..9], &rows[10..11]].concat();
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = v1_setup(
+        serde_json::to_vec(&a).unwrap(),
+        serde_json::to_vec(&rows[..10]).unwrap(),
+        dir.path(),
+    )
+    .await;
+    ctx.tips.set_a_tip(7_000_000 + 2 * super::ORACLE_HORIZON);
+    let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+    assert_eq!(o.class, "diff", "{:?}", o.record.map(|r| (r.note, r.diff)));
 }
