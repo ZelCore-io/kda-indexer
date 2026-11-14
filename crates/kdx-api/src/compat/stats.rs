@@ -78,13 +78,14 @@ pub fn user_tx_count(view: &View) -> ApiResult<u64> {
 }
 
 /// The last counted answer and the single-flight guard of a recount.
-struct CountCache {
+pub(crate) struct CountCache {
     last: Mutex<Option<(Instant, u64)>>,
     /// Held while one request counts: concurrent misses do not each walk the window.
     counting: Mutex<()>,
 }
 
-static CACHE: CountCache = CountCache::new();
+/// The process-wide cache ([`crate::ApiState`] holds it for `/stats`; [`stats`] reads it).
+pub(crate) static CACHE: CountCache = CountCache::new();
 
 impl CountCache {
     const fn new() -> CountCache {
@@ -153,21 +154,23 @@ const SUPPLY_NETWORK: &str = "mainnet01";
 /// `(user tx count, coins in circulation)` as `/stats` answers them (GraphQL `networkInfo`
 /// reads the same).
 pub fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
-    Ok(stats_aged(view)?.map(|(c, coins)| (c.n, coins)))
+    Ok(stats_aged(&CACHE, view)?.map(|(c, coins)| (c.n, coins)))
 }
 
-/// [`stats`] with the count's age (`/stats` sends it as [`COUNT_AGE`]).
-fn stats_aged(view: &View) -> ApiResult<Option<(TxCount, Option<f64>)>> {
+/// [`stats`] with the count's age (`/stats` sends it as [`COUNT_AGE`]), counted through
+/// `cache`.
+fn stats_aged(cache: &CountCache, view: &View) -> ApiResult<Option<(TxCount, Option<f64>)>> {
     let Some(h) = view.max_indexed_height()? else {
         return Ok(None);
     };
     let coins = (view.genesis.network == SUPPLY_NETWORK)
         .then(|| crate::supply::circulating(u64::from(h), SystemTime::now()));
-    Ok(Some((CACHE.count(view)?, coins)))
+    Ok(Some((cache.count(view)?, coins)))
 }
 
 pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
-    match st.read(stats_aged).await {
+    let cache = st.stats_cache;
+    match st.read(move |v| stats_aged(cache, v)).await {
         Ok(Some((count, coins))) => {
             let n = count.n;
             let mut b = format!("{{\"transactionCount\":{n},\"coinsInCirculation\":").into_bytes();
@@ -281,6 +284,78 @@ mod tests {
             drop(busy);
             assert_eq!(h.join().unwrap(), TxCount { n, age: None });
         });
+    }
+
+    /// FV-6: `/stats` over HTTP (the compat router, `tower::oneshot`). While another request
+    /// recounts, it answers the last counted value with its age in `x-count-age`; a fresh
+    /// count has no such header.
+    #[tokio::test]
+    async fn stats_sends_the_count_age_header() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let (_d, store) = crate::testutil::store();
+        let mut w = store.hot_for_tests().rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut w,
+            kdx_hot::Stage::Tail,
+            0,
+            10,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        w.commit().unwrap();
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::new()));
+        *cache.last.lock().unwrap() = Some((Instant::now() - Duration::from_secs(60), 7));
+        let settings = crate::ApiSettings {
+            network: "testnet04".into(),
+            deadline: Duration::from_secs(10),
+            max_in_flight: 16,
+            max_body_bytes: 1 << 20,
+            v1txs_max_body_bytes: 1 << 20,
+            rate_per_ip: 1000,
+            rate_burst: 1000,
+            trusted_proxies: Vec::new(),
+            read_threads: 2,
+            ready_max_lag: 10,
+            max_event_lists: 64,
+        };
+        let st = crate::Api::new(store, settings, crate::TipWatch::default())
+            .with_stats_cache(cache)
+            .state();
+        let search = crate::search::SearchCtx::new(super::super::SearchSettings::default(), None);
+        let app = super::super::router(search).with_state(st);
+        let get = || Request::get("/stats").body(Body::empty()).unwrap();
+        let body = |r: Response| async move {
+            let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        };
+        // Another request holds the recount: this one answers the 60 s old value.
+        let (held_tx, held) = std::sync::mpsc::channel::<()>();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let _g = cache.counting.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held.recv().unwrap();
+        let r = app.clone().oneshot(get()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let age: u64 = r.headers()[COUNT_AGE].to_str().unwrap().parse().unwrap();
+        assert!((60..120).contains(&age), "{age}");
+        assert_eq!(
+            body(r).await,
+            "{\"transactionCount\":7,\"coinsInCirculation\":null}"
+        );
+        release.send(()).unwrap();
+        t.join().unwrap();
+        // Nobody else counts now: a fresh count of the (empty) store, with no age header.
+        let r = app.oneshot(get()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(COUNT_AGE).is_none());
+        assert_eq!(
+            body(r).await,
+            "{\"transactionCount\":0,\"coinsInCirculation\":null}"
+        );
     }
 
     #[test]

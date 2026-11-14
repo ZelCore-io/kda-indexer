@@ -122,6 +122,9 @@ pub struct ApiState {
     /// `[balances] key_modules` (M-1, SEC-2): the modules `GET /keys/{pubkey}/accounts`
     /// lists without `token`; unset means `["coin"]`.
     key_modules: std::sync::OnceLock<Vec<String>>,
+    /// The `/stats` count cache: the process-wide one (GraphQL `networkInfo` shares it); a
+    /// test injects its own (FV-6).
+    pub(crate) stats_cache: &'static crate::compat::stats::CountCache,
 }
 
 tokio::task_local! {
@@ -489,6 +492,7 @@ impl Api {
             heavy: Arc::new(Semaphore::new((settings.read_threads / 2).max(1))),
             heavy_clients: Arc::default(),
             key_modules: std::sync::OnceLock::new(),
+            stats_cache: &crate::compat::stats::CACHE,
             in_flight: Arc::new(Semaphore::new(settings.max_in_flight.max(1))),
             limiter: RateLimiter::new(settings.rate_per_ip, settings.rate_burst),
             store,
@@ -512,6 +516,16 @@ impl Api {
 
     pub fn state(&self) -> Arc<ApiState> {
         self.state.clone()
+    }
+
+    /// The `/stats` count cache `c` instead of the process-wide one (FV-6); before
+    /// [`Api::state`] is taken.
+    #[cfg(test)]
+    pub(crate) fn with_stats_cache(mut self, c: &'static crate::compat::stats::CountCache) -> Api {
+        Arc::get_mut(&mut self.state)
+            .expect("with_stats_cache before state()")
+            .stats_cache = c;
+        self
     }
 
     /// Add native routes (Task 4).
