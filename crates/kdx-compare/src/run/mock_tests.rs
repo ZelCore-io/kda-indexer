@@ -1137,21 +1137,55 @@ max_height = 7000000
     Ctx::new(cfg).await.unwrap()
 }
 
-/// R-P5P9-61 H5: a top-level list cut on both sides at a height boundary is explained only
-/// when the rows above the boundary match, the boundary counts hold and the node settles
-/// every boundary row with a single-row `/poll`; the evidence is in the record. A swap above
-/// the boundary, a boundary row the node calls not canonical, unequal boundary counts and a
-/// node failure each stay a diff.
+/// A transaction row of Transactions' shape: a relay id (block, request key), a height and
+/// the sender's `creationTime` (the oracle's sort key).
+fn h7_tx(rk: &str, h: u64, block: &str, ct: &str) -> Value {
+    let id = crate::graphql::base64_std(format!("Transaction:[\"{block}\",\"{rk}\"]").as_bytes());
+    json!({"cursor": "c", "node": {"id": id, "hash": rk,
+        "cmd": {"meta": {"chainId": "0", "creationTime": ct}},
+        "result": {"height": h, "block": {"hash": block, "chainId": 0}}}})
+}
+
+/// A node `/poll` entry: the request key in `block` at `h`, with these events.
+fn h7_poll(rk: &str, block: &str, h: u64, events: Value) -> (String, (u8, Value)) {
+    (
+        rk.to_string(),
+        (
+            0,
+            json!({"reqKey": rk, "metaData": {"blockHash": block, "blockHeight": h},
+                "events": events}),
+        ),
+    )
+}
+
+/// A root connection page.
+fn h7_page(root: &str, more: bool, edges: Vec<Value>) -> crate::graphql::Answer {
+    crate::graphql::Answer {
+        body: json!({"data": {root: {"totalCount": 40,
+            "pageInfo": {"hasNextPage": more}, "edges": edges}}}),
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    }
+}
+
+/// R-P5P9-62 H7, the window referee (it replaces R-P5P9-61 H5, whose cases stay below as H7
+/// cases). Rows match by identity (request key, index, block, chain); each side's window is
+/// its own sort key (ours by height, the oracle's by `creationTime`); every one-sided row
+/// gets a single-row node read. The CG-3T sort-key shape, an oracle orphan and a
+/// node-confirmed oracle gap are explained; the page-join shape, an ours-only row the node
+/// rejects, two rows equal in value under different request keys and a node failure stay
+/// diffs. The node reads per compare are in the record.
 #[tokio::test]
-async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
-    use crate::graphql::{compare_answers_with, Answer};
-    use crate::graphql_cut::BOUNDARY_CUT_PATH;
+async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
+    use crate::graphql::Answer;
+    use crate::graphql_window::{ROW_PATH, WINDOW_PATH};
     let dir = tempfile::tempdir().unwrap();
     let mut node = NodeMock {
         tip: 7_000_000,
         ..NodeMock::default()
     };
-    // The node's canonical transfers: request key -> (block, height, receiver).
+    // H5's transfers: request key -> (block, height, receiver).
     let canon = [
         ("t1", "B1", 101, "r"),
         ("t2", "B2", 100, "r"),
@@ -1161,60 +1195,267 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
         ("t7", "B3", 99, "r"),
         ("w1", "B2", 100, "k:miner-a"),
         ("w2", "B2", 100, "k:miner-a"),
+        ("k1", "B2", 100, "r"),
+        ("k2", "B2", 100, "r"),
     ];
     for (rk, b, h, to) in canon {
-        node.polls.insert(
-            rk.into(),
-            (
-                0,
-                json!({"reqKey": rk, "metaData": {"blockHash": b, "blockHeight": h},
-                    "events": [{"name": "TRANSFER", "params": ["s", to, 1.5]}]}),
-            ),
+        let (k, v) = h7_poll(
+            rk,
+            b,
+            h,
+            json!([{"name": "TRANSFER", "params": ["s", to, 1.5]}]),
         );
+        node.polls.insert(k, v);
     }
+    // Transactions: r100..r105 in B<h>; z104 is in Q104 on the node (ours lists it in B104).
+    for (rk, h) in [
+        ("r100", 100),
+        ("r103", 103),
+        ("r104", 104),
+        ("r105", 105),
+        ("x104", 104),
+    ] {
+        let (k, v) = h7_poll(rk, &format!("B{h}"), h, json!([]));
+        node.polls.insert(k, v);
+    }
+    let (k, v) = h7_poll("z104", "Q104", 104, json!([]));
+    node.polls.insert(k, v);
     let calls = node.calls.clone();
     let ctx = gql_ctx(node.clone(), dir.path()).await;
-    // QTransfersByAccount's rows: a block hash, no height (the node gives it).
+    let ctx = &ctx;
+    let polls = || {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("poll"))
+            .count()
+    };
+    let run = |mut a: Answer, mut b: Answer| async move {
+        let ta = &ctx.targets["a"];
+        let vars = serde_json::Map::new();
+        ctx.gql_settle(ta, &vars, &mut a, &mut b, 7_000_000, false)
+            .await
+    };
+    let hit = |d: &[crate::report::DiffEntry]| d.iter().find(|e| e.path == WINDOW_PATH).cloned();
+    let explained = |d: &[crate::report::DiffEntry]| {
+        hit(d).is_some()
+            && d.iter()
+                .all(|e| e.path.starts_with("/~") && e.path != ROW_PATH)
+    };
+    let stays_diff = |d: &[crate::report::DiffEntry]| {
+        d.iter()
+            .any(|e| !e.path.starts_with("/~") || e.path == ROW_PATH)
+    };
+    let txs = |more: bool, rows: &[(&str, u64, &str)]| {
+        h7_page(
+            "transactions",
+            more,
+            rows.iter()
+                .map(|(rk, h, ct)| h7_tx(rk, *h, &format!("B{h}"), ct))
+                .collect(),
+        )
+    };
+    let t = |m: &str| format!("2024-01-01T10:{m}Z");
+    let (t05, t01, t04, t03, t02) = (t("05:00"), t("01:00"), t("04:00"), t("03:00"), t("02:00"));
+
+    // 1. The CG-3T sort-key shape: ours the top 3 by height, the oracle the top 3 by
+    //    creationTime. r104 (ours only) sits below the oracle's lowest creationTime; r100
+    //    (oracle only) below our lowest height. Both canonical: explained, 2 single-row reads.
+    let before = polls();
+    let (d, _) = run(
+        txs(
+            true,
+            &[
+                ("r105", 105, &t05),
+                ("r104", 104, &t01),
+                ("r103", 103, &t04),
+            ],
+        ),
+        txs(
+            true,
+            &[
+                ("r105", 105, &t05),
+                ("r103", 103, &t04),
+                ("r100", 100, &t03),
+            ],
+        ),
+    )
+    .await;
+    assert!(explained(&d), "{d:?}");
+    let ev = hit(&d).unwrap();
+    let text = format!("{} {}", ev.a.clone().unwrap(), ev.b.clone().unwrap());
+    assert!(text.contains("outside-oracle-window"), "{text}");
+    assert!(text.contains("below-our-window"), "{text}");
+    assert_eq!(ev.b.clone().unwrap()["nodeReads"], json!(2), "{text}");
+    assert_eq!(polls() - before, 2);
+    //    The same rows on full pages, in the oracle's creationTime order: explained, no read.
+    let before = polls();
+    let (d, _) = run(
+        txs(
+            false,
+            &[
+                ("r105", 105, &t05),
+                ("r104", 104, &t01),
+                ("r103", 103, &t04),
+            ],
+        ),
+        txs(
+            false,
+            &[
+                ("r105", 105, &t05),
+                ("r103", 103, &t04),
+                ("r104", 104, &t01),
+            ],
+        ),
+    )
+    .await;
+    assert!(explained(&d), "{d:?}");
+    assert_eq!(polls(), before);
+    //    Ours out of height order is our defect, never explained.
+    let (d, _) = run(
+        txs(
+            false,
+            &[
+                ("r105", 105, &t05),
+                ("r103", 103, &t04),
+                ("r104", 104, &t01),
+            ],
+        ),
+        txs(
+            false,
+            &[
+                ("r105", 105, &t05),
+                ("r103", 103, &t04),
+                ("r104", 104, &t01),
+            ],
+        ),
+    )
+    .await;
+    assert!(d.is_empty() || stays_diff(&d), "{d:?}");
+    let (d, _) = run(
+        txs(
+            false,
+            &[
+                ("r105", 105, &t05),
+                ("r103", 103, &t04),
+                ("r104", 104, &t01),
+            ],
+        ),
+        txs(
+            false,
+            &[
+                ("r105", 105, &t05),
+                ("r104", 104, &t01),
+                ("r103", 103, &t04),
+            ],
+        ),
+    )
+    .await;
+    assert!(stays_diff(&d), "{d:?}");
+
+    // 2. The page-join shape: x104, canonical, only on the oracle's page and strictly
+    //    inside our window (above our lowest height 103): a diff, the row named.
+    let (d, note) = run(
+        txs(
+            true,
+            &[
+                ("r105", 105, &t05),
+                ("r104", 104, &t01),
+                ("r103", 103, &t04),
+            ],
+        ),
+        txs(
+            true,
+            &[
+                ("r105", 105, &t05),
+                ("x104", 104, &t02),
+                ("r104", 104, &t01),
+            ],
+        ),
+    )
+    .await;
+    assert!(stays_diff(&d), "{d:?}");
+    let row = d.iter().find(|e| e.path == ROW_PATH).expect("the row");
+    assert!(
+        row.b.as_ref().unwrap().to_string().contains("x104"),
+        "{row:?}"
+    );
+    assert!(note.unwrap_or_default().contains("inside our window"));
+
+    // 3. An oracle orphan: the oracle's copy of r104 in block X104, the node's is B104.
+    let mut orphan = h7_tx("r104", 104, "X104", &t01);
+    orphan["node"]["result"]["block"]["hash"] = json!("X104");
+    let mut b = txs(false, &[("r105", 105, &t05), ("r104", 104, &t01)]);
+    b.body["data"]["transactions"]["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(orphan);
+    let (d, _) = run(txs(false, &[("r105", 105, &t05), ("r104", 104, &t01)]), b).await;
+    assert!(explained(&d), "{d:?}");
+    assert!(hit(&d).unwrap().b.unwrap().to_string().contains("orphan"));
+
+    // 4. A node-confirmed oracle gap: r104 canonical, inside the oracle's complete list.
+    let (d, _) = run(
+        txs(
+            false,
+            &[
+                ("r105", 105, &t05),
+                ("r104", 104, &t01),
+                ("r103", 103, &t04),
+            ],
+        ),
+        txs(false, &[("r105", 105, &t05), ("r103", 103, &t04)]),
+    )
+    .await;
+    assert!(explained(&d), "{d:?}");
+    assert!(hit(&d)
+        .unwrap()
+        .a
+        .unwrap()
+        .to_string()
+        .contains("oracle-gap"));
+
+    // 5. An ours-only row the node puts in another block: a diff.
+    let mut z = h7_tx("z104", 104, "B104", &t01);
+    z["node"]["result"]["block"]["hash"] = json!("B104");
+    let mut a = txs(false, &[("r105", 105, &t05)]);
+    a.body["data"]["transactions"]["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(z);
+    let (d, _) = run(a, txs(false, &[("r105", 105, &t05)])).await;
+    assert!(stays_diff(&d), "{d:?}");
+
+    // 6. Two rows equal in value under different request keys (k1 ours, k2 the oracle's),
+    //    both canonical, our list complete: k2 is a row ours lacks, a diff.
+    let xfer = |rk: &str| {
+        json!({"cursor": "c", "node": {"amount": 1.5, "senderAccount": "s",
+            "receiverAccount": "r", "block": {"chainId": "0", "height": 100}, "requestKey": rk}})
+    };
+    let (d, _) = run(
+        h7_page("transfers", false, vec![xfer("k1")]),
+        h7_page("transfers", false, vec![xfer("k2")]),
+    )
+    .await;
+    assert!(stays_diff(&d), "{d:?}");
+
+    // H5's cases, now H7 cases. QTransfersByAccount's rows: a block hash, no height (the
+    // node gives it). Transfers-825fa035's rows: a height, no block hash.
     let by_block = |rk: &str, b: &str| {
         json!({"cursor": "c", "node": {"id": format!("{b}/{rk}"), "amount": "1.5",
             "senderAccount": "s", "receiverAccount": "r", "chainId": 0, "blockHash": b,
             "requestKey": rk}})
     };
-    // Transfers-825fa035's rows: a height, no block hash (the node's TRANSFER decides).
     let by_height = |rk: &str, h: u64, to: &str| {
         json!({"cursor": "c", "node": {"amount": 1.5, "senderAccount": "s",
             "receiverAccount": to, "block": {"chainId": "0", "height": h}, "requestKey": rk}})
     };
-    let page = |edges: Vec<Value>| Answer {
-        body: json!({"data": {"transfers": {"totalCount": 40,
-            "pageInfo": {"hasNextPage": true}, "edges": edges}}}),
-        status: 200,
-        raw: String::new(),
-        ms: Vec::new(),
-    };
-    let ctx = &ctx;
-    let run = |mut a: Answer, mut b: Answer| async move {
-        let cut = ctx.gql_boundary_cut(&mut a, &mut b, 7_000_000, false).await;
-        let mut d = compare_answers_with(&mut a, &mut b, 7_000_000, 10_000, &[], false);
-        d.extend(cut);
-        d
-    };
-    let explained = |d: &[crate::report::DiffEntry]| {
-        d.iter().any(|e| e.path == BOUNDARY_CUT_PATH) && d.iter().all(|e| e.path.starts_with("/~"))
-    };
-    let stays_diff = |d: &[crate::report::DiffEntry]| {
-        !d.iter().any(|e| e.path == BOUNDARY_CUT_PATH)
-            && d.iter().any(|e| !e.path.starts_with("/~"))
-    };
-    // The CG-3 shape (QTransfersByAccount): the same row above the boundary, each side a
-    // different canonical subset of the boundary height.
-    let polls_before = calls
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|c| c.starts_with("poll"))
-        .count();
-    let d = run(
+    let page = |edges: Vec<Value>| h7_page("transfers", true, edges);
+    // The CG-3 shape: each side a different canonical subset of the boundary height; one
+    // single-row /poll per (chain, request key): ours' heights (t1, t2, t3) and t4.
+    let before = polls();
+    let (d, _) = run(
         page(vec![
             by_block("t1", "B1"),
             by_block("t2", "B2"),
@@ -1228,38 +1469,25 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
     )
     .await;
     assert!(explained(&d), "{d:?}");
-    let ev = d.iter().find(|e| e.path == BOUNDARY_CUT_PATH).unwrap();
-    let (ea, eb) = (ev.a.clone().unwrap(), ev.b.clone().unwrap());
-    assert_eq!(
-        (ea["height"].clone(), ea["rows"].clone()),
-        (json!(100), json!(2))
-    );
-    assert_eq!(
-        (eb["orphans"].clone(), eb["gaps"].clone()),
-        (json!(0), json!(0))
-    );
-    assert!(
-        ea["node"].to_string().contains("\"t3\"") && eb["node"].to_string().contains("canonical")
-    );
-    // Single-row reads only: one /poll per (chain, request key), cached across the steps.
-    let polls: Vec<String> = calls
-        .lock()
+    assert!(hit(&d)
         .unwrap()
-        .iter()
-        .filter(|c| c.starts_with("poll"))
-        .cloned()
-        .collect();
-    assert_eq!(polls.len() - polls_before, 4, "{polls:?}");
-    assert!(polls.iter().all(|c| c.ends_with(" 1")), "{polls:?}");
-    // The whole page at one height (Transfers-825fa035; the trailing-tie rule never cuts it).
-    let d = run(
+        .b
+        .unwrap()
+        .to_string()
+        .contains("at-our-boundary-height"));
+    let log: Vec<String> = calls.lock().unwrap().clone();
+    let polled: Vec<&String> = log.iter().filter(|c| c.starts_with("poll")).collect();
+    assert_eq!(polled.len() - before, 4, "{polled:?}");
+    assert!(polled.iter().all(|c| c.ends_with(" 1")), "{polled:?}");
+    // The whole page at one height.
+    let (d, _) = run(
         page(vec![by_height("t2", 100, "r"), by_height("t3", 100, "r")]),
         page(vec![by_height("t4", 100, "r"), by_height("t2", 100, "r")]),
     )
     .await;
     assert!(explained(&d), "{d:?}");
     // A swap above the boundary (t1 against the canonical t6 at 101): a diff.
-    let d = run(
+    let (d, _) = run(
         page(vec![
             by_block("t1", "B1"),
             by_block("t2", "B2"),
@@ -1273,8 +1501,8 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
     )
     .await;
     assert!(stays_diff(&d), "{d:?}");
-    // A boundary row of ours the node calls not canonical (w1 paid another receiver): a diff.
-    let d = run(
+    // The same row (w1) paid to another receiver on our side: a field diff.
+    let (d, _) = run(
         page(vec![
             by_height("t2", 100, "r"),
             by_height("w1", 100, "k:miner-b"),
@@ -1286,9 +1514,10 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
     )
     .await;
     assert!(stays_diff(&d), "{d:?}");
-    // Unequal boundary counts: ours' boundary set (100) is complete on its page, the oracle
-    // shows one canonical row there and two orphan copies (w1, w2 paid to another miner).
-    let d = run(
+    // H5 left this a diff (its literal boundary count): the oracle's w1 and w2 pay another
+    // receiver than the node's (orphan copies), and t3, t7 are canonical rows of ours.
+    // Under H7 every row is accounted for: explained.
+    let (d, _) = run(
         page(vec![
             by_height("t1", 101, "r"),
             by_height("t2", 100, "r"),
@@ -1303,9 +1532,9 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
         ]),
     )
     .await;
-    assert!(stays_diff(&d), "{d:?}");
-    // ...while one orphan copy taking the oracle's last slot is explained (counts 2 = 3 - 1).
-    let d = run(
+    assert!(explained(&d), "{d:?}");
+    // One orphan copy in the oracle's last slot: explained.
+    let (d, _) = run(
         page(vec![
             by_height("t1", 101, "r"),
             by_height("t2", 100, "r"),
@@ -1321,9 +1550,10 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
     )
     .await;
     assert!(explained(&d), "{d:?}");
-    // The same rows on both pages, in another order: the order rules decide, no node read.
+    // The same rows on both pages in another order, no height selected: the order rules
+    // decide, no node read.
     let before = calls.lock().unwrap().len();
-    let d = run(
+    let (d, _) = run(
         page(vec![
             by_block("t1", "B1"),
             by_block("t2", "B2"),
@@ -1338,7 +1568,8 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
     .await;
     assert!(d.is_empty(), "{d:?}");
     assert_eq!(calls.lock().unwrap().len(), before);
-    // A node failure: the CG-3 shape stays a diff.
+
+    // 7. A node failure: the CG-3T shape stays a diff, with the reason in the note.
     let failing = gql_ctx(
         NodeMock {
             poll_fail: true,
@@ -1347,14 +1578,35 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
         dir.path(),
     )
     .await;
-    let mut a = page(vec![by_height("t2", 100, "r"), by_height("t3", 100, "r")]);
-    let mut b = page(vec![by_height("t4", 100, "r"), by_height("t2", 100, "r")]);
-    let cut = failing
-        .gql_boundary_cut(&mut a, &mut b, 7_000_000, false)
+    let mut a = txs(
+        true,
+        &[
+            ("r105", 105, &t05),
+            ("r104", 104, &t01),
+            ("r103", 103, &t04),
+        ],
+    );
+    let mut b = txs(
+        true,
+        &[
+            ("r105", 105, &t05),
+            ("r103", 103, &t04),
+            ("r100", 100, &t03),
+        ],
+    );
+    let vars = serde_json::Map::new();
+    let (d, note) = failing
+        .gql_settle(
+            &failing.targets["a"],
+            &vars,
+            &mut a,
+            &mut b,
+            7_000_000,
+            false,
+        )
         .await;
-    assert!(cut.is_none());
-    let d = compare_answers_with(&mut a, &mut b, 7_000_000, 10_000, &[], false);
-    assert!(stays_diff(&d), "{d:?}");
+    assert!(stays_diff(&d) && hit(&d).is_none(), "{d:?}");
+    assert!(note.unwrap_or_default().contains("did not settle"));
 }
 
 /// R-P5P9-61 H6 (ruling (3)): the nested `transactions` of large blocks (BlocksByHeight: no

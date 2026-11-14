@@ -59,7 +59,6 @@ const ROW_RULE_ROUTE: &str = "graphql-row-rule";
 /// Summary route of the harness's own nested-list reads (R-P5P9-60 H2).
 const SCOPED_LIST_ROUTE: &str = "graphql-scoped-list";
 /// Route name of the H5 node reads (R-P5P9-61).
-const BOUNDARY_ROUTE: &str = "graphql-boundary-cut";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
@@ -538,6 +537,9 @@ pub struct GqlState {
     /// One `/local` client for every GraphQL read of the node (NodeBalance, the by-key guard
     /// check): one limiter at `node_max_rps`, one call in flight.
     local: std::sync::OnceLock<kdx_node::LocalClient>,
+    /// Node reads the node-refereed rules may still make in this process (R-P5P9-62: the
+    /// referee's run cap; unbounded in a live run, where each compare has its own cap).
+    pub node_budget: AtomicUsize,
 }
 
 impl GqlState {
@@ -566,7 +568,15 @@ impl GqlState {
             oracle_timeouts: AtomicU32::new(0),
             oracle_pause_until: Mutex::new(None),
             local: std::sync::OnceLock::new(),
+            node_budget: AtomicUsize::new(usize::MAX),
         })
+    }
+
+    /// Takes one node read from the run's budget; false once it is spent.
+    pub fn take_node_read(&self) -> bool {
+        self.node_budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
     }
 
     fn oracle_paused(&self) -> bool {
@@ -713,7 +723,7 @@ fn sort_ties(edges: &mut [Value]) {
 // Pages
 
 /// The first root field of `data` that is a connection (`edges` and `pageInfo`).
-fn root_connection(data: &mut Value) -> Option<&mut Value> {
+pub(crate) fn root_connection(data: &mut Value) -> Option<&mut Value> {
     data.as_object_mut()?
         .values_mut()
         .find(|v| v.get("edges").is_some_and(Value::is_array) && v.get("pageInfo").is_some())
@@ -864,6 +874,13 @@ pub fn compare_answers_with(
     let (mut na, mut nb) = (a.body.clone(), b.body.clone());
     normalize_gql(&mut na, cap);
     normalize_gql(&mut nb, cap);
+    // R-P5P9-62 H7 paired the root rows: keep them paired through the tie sort.
+    let mut aligned = false;
+    for v in [&mut na, &mut nb] {
+        if let Some(c) = v.get_mut("data").and_then(root_connection) {
+            aligned |= crate::graphql_window::realign(c);
+        }
+    }
     // R-P5P9-60 H2: lists bounded by one block or one tx compare as sets.
     for v in [&mut na, &mut nb] {
         for l in crate::graphql_scope::scoped_lists(v) {
@@ -882,7 +899,7 @@ pub fn compare_answers_with(
     }
     if let (Some(da), Some(db)) = (na.get_mut("data"), nb.get_mut("data")) {
         if let (Some(ca), Some(cb)) = (root_connection(da), root_connection(db)) {
-            if crate::graphql_norm::cut_trailing_ties(ca, cb) {
+            if !aligned && crate::graphql_norm::cut_trailing_ties(ca, cb) {
                 hits.push(hit(crate::graphql_norm::TIE_CUT_PATH));
             }
         }
@@ -1315,19 +1332,10 @@ impl Ctx {
         if finished > 0 {
             row_hits.push(crate::graphql_scope::SCOPED_FINISHED_PATH);
         }
-        // R-P5P9-61 H5: a top-level list cut at a height boundary, settled on the node.
-        let boundary = self
-            .gql_boundary_cut(&mut a, &mut b, max, root_scoped)
+        // R-P5P9-62: H7 and the diff.
+        let (mut d, note) = self
+            .gql_settle(ta, vars, &mut a, &mut b, max, root_scoped)
             .await;
-        let mut d = compare_answers_with(
-            &mut a,
-            &mut b,
-            max,
-            self.cfg.graphql.total_count_cap,
-            &self.cfg.graphql.field_rules,
-            root_scoped,
-        );
-        d.extend(boundary);
         d.extend(limit);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
             path: p.into(),
@@ -1335,7 +1343,33 @@ impl Ctx {
             a: None,
             b: None,
         }));
-        self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d)
+        self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d, note)
+    }
+
+    /// R-P5P9-62: the node-refereed rules on an oracle pair's two answers after the fetch
+    /// and the row rules: H7 (the window referee) and the diff with the ruled matchers.
+    /// Returns the diff entries and H7's note. Shared by the live compare and
+    /// `kda-compare referee`.
+    pub(crate) async fn gql_settle(
+        &self,
+        ta: &Target,
+        _vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        root_scoped: bool,
+    ) -> (Vec<DiffEntry>, Option<String>) {
+        let (h7, note) = self.gql_window_referee(ta, a, b, max, root_scoped).await;
+        let mut d = compare_answers_with(
+            a,
+            b,
+            max,
+            self.cfg.graphql.total_count_cap,
+            &self.cfg.graphql.field_rules,
+            root_scoped,
+        );
+        d.extend(h7);
+        (d, note)
     }
 
     /// R-P5P9-60 H2 and R-P5P9-61 H6: the nested block and tx lists of an oracle pair whose
@@ -1530,7 +1564,7 @@ impl Ctx {
     }
 
     /// One small read of ours (A) for a row rule; `data` or `None`.
-    async fn gql_read(&self, ta: &Target, query: &str, vars: Value) -> Option<Value> {
+    pub(crate) async fn gql_read(&self, ta: &Target, query: &str, vars: Value) -> Option<Value> {
         let c = ta
             .post_json(&json!({ "query": query, "variables": vars }))
             .await
@@ -1569,161 +1603,6 @@ impl Ctx {
         }
         hits.dedup();
         hits
-    }
-
-    /// R-P5P9-61 H5 (ruling (2), [`crate::graphql_cut`]): when both pages of a top-level
-    /// list are cut, the rows' heights (the node's, for rows that select none), the boundary
-    /// plan and single-row `/poll` verdicts on every boundary row decide. When ruling (2)'s
-    /// conditions hold, the rows at and below the boundary leave both pages and the visible
-    /// hit carries the node evidence; otherwise nothing changes and the difference stays.
-    /// Rows above the oracle's ceiling `max` are left to the stall rule.
-    pub(crate) async fn gql_boundary_cut(
-        &self,
-        a: &mut Answer,
-        b: &mut Answer,
-        max: u64,
-        root_scoped: bool,
-    ) -> Option<DiffEntry> {
-        use crate::graphql_cut::{
-            canon_verdict, explains, plan, row_ref, Canon, Rows, BOUNDARY_CUT_PATH,
-        };
-        if root_scoped {
-            return None;
-        }
-        let conn = |ans: &mut Answer| ans.body.get_mut("data").and_then(root_connection).cloned();
-        let (ca, cb) = (conn(a)?, conn(b)?);
-        let more = |c: &Value| c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(true));
-        if !more(&ca) || !more(&cb) {
-            return None;
-        }
-        // The same rows on both pages: only their order differs, which the order rules
-        // decide; no node read.
-        let set = |c: &Value| {
-            let mut s: Vec<String> = c["edges"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(crate::graphql_cut::row_text)
-                .collect();
-            s.sort();
-            s
-        };
-        if set(&ca) == set(&cb) {
-            return None;
-        }
-        let mut cache: HashMap<(u8, String), Option<Value>> = HashMap::new();
-        let mut reads = 0usize;
-        // Every row's height; a row that selects none takes the node's, when the node puts
-        // its request key in the row's block.
-        let mut heights: [Vec<u64>; 2] = Default::default();
-        for (hs, c) in heights.iter_mut().zip([&ca, &cb]) {
-            for e in c.get("edges")?.as_array()? {
-                let r = row_ref(e);
-                let h = match r.height {
-                    Some(h) => h,
-                    None => {
-                        let p = self.h5_poll(&r, &mut cache, &mut reads).await?;
-                        match canon_verdict(e, &r, p.as_ref()) {
-                            (Canon::Yes, Some(h)) => h,
-                            _ => return None,
-                        }
-                    }
-                };
-                hs.push(h);
-            }
-        }
-        let rows = |c: &Value, hs: &[u64]| -> Rows {
-            c["edges"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .zip(hs)
-                .filter(|(_, h)| **h <= max)
-                .map(|(e, h)| (*h, e.clone()))
-                .collect()
-        };
-        let p = plan(&rows(&ca, &heights[0]), &rows(&cb, &heights[1])).ok()?;
-        // (iii): one verdict per boundary row of either side.
-        let mut verdicts: [Vec<Canon>; 2] = Default::default();
-        let mut evidence: [Vec<Value>; 2] = Default::default();
-        for (side, list) in [&p.a, &p.b].into_iter().enumerate() {
-            for e in list {
-                let r = row_ref(e);
-                let polled = self.h5_poll(&r, &mut cache, &mut reads).await;
-                let entry = polled.clone().flatten();
-                let (v, _) = match &polled {
-                    Some(x) => canon_verdict(e, &r, x.as_ref()),
-                    None => (Canon::Unknown, None),
-                };
-                verdicts[side].push(v);
-                evidence[side].push(json!({
-                    "chain": r.chain, "requestKey": r.rk, "block": r.block, "height": p.height,
-                    "node": v.as_str(),
-                    "nodeBlock": entry.as_ref().and_then(|x| x.pointer("/metaData/blockHash")),
-                    "nodeHeight": entry.as_ref().and_then(|x| x.pointer("/metaData/blockHeight")),
-                }));
-            }
-        }
-        let (orphans, gaps) = match explains(&p, &verdicts[0], &verdicts[1]) {
-            Ok(x) => x,
-            Err(why) => {
-                tracing::debug!(why, height = p.height, "H5 boundary cut not explained");
-                return None;
-            }
-        };
-        for (ans, hs) in [(a, &heights[0]), (b, &heights[1])] {
-            if let Some(e) = ans
-                .body
-                .get_mut("data")
-                .and_then(root_connection)
-                .and_then(|c| c.get_mut("edges"))
-                .and_then(Value::as_array_mut)
-            {
-                let mut keep = hs.iter().map(|h| *h > p.height);
-                e.retain(|_| keep.next().unwrap_or(true));
-            }
-        }
-        let [ea, eb] = evidence;
-        Some(DiffEntry {
-            path: BOUNDARY_CUT_PATH.into(),
-            kind: DiffKind::Changed,
-            a: Some(
-                json!({"height": p.height, "rows": p.a.len(), "complete": p.a_complete,
-                "node": ea}),
-            ),
-            b: Some(
-                json!({"height": p.height, "rows": p.b.len(), "complete": p.b_complete,
-                "orphans": orphans, "gaps": gaps, "nodeReads": reads, "node": eb}),
-            ),
-        })
-    }
-
-    /// One single-row `/poll` of H5, cached per (chain, request key). `None` when the row has
-    /// no chain or request key, or past [`crate::graphql_cut::NODE_CHECKS`] reads; otherwise
-    /// the node's entry, `None` inside when the read failed or the node lacks the key.
-    async fn h5_poll(
-        &self,
-        r: &crate::graphql_cut::RowRef,
-        cache: &mut HashMap<(u8, String), Option<Value>>,
-        reads: &mut usize,
-    ) -> Option<Option<Value>> {
-        let key = (r.chain?, r.rk.clone()?);
-        if let Some(v) = cache.get(&key) {
-            return Some(v.clone());
-        }
-        if *reads >= crate::graphql_cut::NODE_CHECKS {
-            return None;
-        }
-        *reads += 1;
-        self.count_request(BOUNDARY_ROUTE, "node", 1);
-        let v = self
-            .node
-            .poll(key.0, std::slice::from_ref(&key.1))
-            .await
-            .ok()
-            .and_then(|m| m.get(&key.1).cloned());
-        cache.insert(key, v.clone());
-        Some(v)
     }
 
     /// `oracle_orphan_dupes` on the root connection `root`: for each request key the oracle
@@ -1906,6 +1785,7 @@ impl Ctx {
         b_status: u16,
         b_raw: &str,
         d: Vec<DiffEntry>,
+        note: Option<String>,
     ) -> Outcome {
         if d.is_empty() {
             return Outcome {
@@ -1936,7 +1816,7 @@ impl Ctx {
             shown,
             class,
             &ids,
-            None,
+            note,
         )
     }
 
