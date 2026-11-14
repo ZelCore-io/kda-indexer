@@ -3181,7 +3181,10 @@ mod tests {
             );
         }
         // H7 replaces H5; a row H7 cannot explain is never allowlisted.
-        assert!(!allow.entries.iter().any(|e| e.id == "graphql-h5-boundary-cut"));
+        assert!(!allow
+            .entries
+            .iter()
+            .any(|e| e.id == "graphql-h5-boundary-cut"));
         let row = [entry(crate::graphql_window::ROW_PATH, DiffKind::Changed)];
         let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &row);
         assert_eq!(un.len(), 1);
