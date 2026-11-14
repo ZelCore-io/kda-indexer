@@ -1207,6 +1207,7 @@ impl Ctx {
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
             curl: format!("{} ; {}", curl_of(op, vars, "A"), curl_of(op, vars, "B")),
             note,
+            body_cap: None,
         };
         Outcome {
             class: class.to_string(),

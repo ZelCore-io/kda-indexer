@@ -346,6 +346,19 @@ fn coins_tip_lag(a: &Value, b: &Value, a_tip: u64, b_tip: u64) -> Option<DiffEnt
     })
 }
 
+/// A side's whole answer for the diff log: the first page's body, or the pages' rows merged
+/// when it was paged (the diff paths index into the merged rows).
+fn paged_body(p: &Paged) -> String {
+    match p.pages.as_slice() {
+        [one] => trim_body(&one.body),
+        _ if p.items.is_array() => trim_body(p.items.to_string().as_bytes()),
+        pages => pages
+            .first()
+            .map(|c| trim_body(&c.body))
+            .unwrap_or_default(),
+    }
+}
+
 /// What [`Ctx::search_oracle_rows`] moved out of a `/txs/search` compare.
 #[derive(Debug, Default)]
 struct SearchRows {
@@ -688,13 +701,14 @@ impl Ctx {
             b_target: b_name.to_string(),
             a_status: first.map(|c| c.status),
             b_status,
-            a_body_trimmed: first.map(|c| trim_body(&c.body)).unwrap_or_default(),
+            a_body_trimmed: a_cap.map(paged_body).unwrap_or_default(),
             b_body_trimmed: trim_body(b_body.as_bytes()),
             diff,
             class: class.to_string(),
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
             curl: format!("curl -s {} ; {}", sh_url("A", &req.path_and_query), b_curl),
             note,
+            body_cap: None,
         }
     }
 
@@ -1425,7 +1439,7 @@ impl Ctx {
             );
         }
         let curl_b = format!("curl -s {}", sh_url("B", &req.path_and_query));
-        let b_body = trim_body(&pb.pages[0].body);
+        let b_body = paged_body(&pb);
         let mut o = self.finish(
             req,
             ta,

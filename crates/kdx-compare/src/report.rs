@@ -10,10 +10,14 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Body bytes kept per side in a diff record (R-P5P9-60 H3: 1 MiB, was 4 KB, so CG-3 can
-/// classify every record from the record alone). The request, the curl line and the note
-/// keep as much; each is cut by its JSON-escaped length ([`DiffRecord::bounded`]).
+/// Body bytes kept per side in an explained diff record (R-P5P9-60 H3: 1 MiB, was 4 KB). The
+/// request, the curl line and the note keep as much; each is cut by its JSON-escaped length
+/// ([`DiffRecord::bounded`]).
 pub const BODY_TRIM: usize = 1 << 20;
+/// The existing 8 MiB body limit (`[node] max_body_bytes`, the targets' response cap): an
+/// unexplained record (class `diff`) keeps both bodies whole up to this many JSON-escaped
+/// bytes for the two together (fv-checklist T-item, R-P5P9-61), and says so when it cuts.
+pub const BODY_CAP: usize = 8 << 20;
 /// JSON-escaped bytes kept per diff entry value; a bigger value is replaced by a marked
 /// string cut to this length (the bodies still carry it, up to [`BODY_TRIM`]).
 pub const ENTRY_VALUE_TRIM: usize = 32 << 10;
@@ -21,9 +25,10 @@ pub const ENTRY_VALUE_TRIM: usize = 32 << 10;
 pub const SHORT_TRIM: usize = 4 << 10;
 /// Upper bound of one diff log line: five long strings, at most `MAX_ENTRIES` entries of a
 /// path and two values, and the short fields with the JSON punctuation around them.
-pub const MAX_RECORD_BYTES: usize = 5 * (BODY_TRIM + 2)
+pub const MAX_RECORD_BYTES: usize = (BODY_CAP + 4)
+    + 3 * (BODY_TRIM + 2)
     + crate::diff::MAX_ENTRIES * (SHORT_TRIM + 2 * (ENTRY_VALUE_TRIM + 2) + 64)
-    + 8 * (SHORT_TRIM + 2)
+    + 9 * (SHORT_TRIM + 2)
     + 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +72,10 @@ pub struct DiffRecord {
     /// Free-form detail (e.g. the legacy-cmd rehash result).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Set when the log cut a body: which cap applied and how much of each side it kept
+    /// ([`DiffRecord::bounded`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_cap: Option<String>,
 }
 
 /// POSIX shell single-quoting: the result is one literal word whatever `s` holds (quotes,
@@ -79,6 +88,59 @@ pub fn sh_quote(s: &str) -> String {
 /// `"$VAR"'<quoted suffix>'`: the base URL variable expands, the rest stays literal.
 pub fn sh_url(var: &str, suffix: &str) -> String {
     format!("\"${var}\"{}", sh_quote(suffix))
+}
+
+/// The length of `s` once JSON-escaped (without the quotes).
+pub fn escaped_len(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
+/// The two bodies of a record as the log keeps them, and the note when a cap cut them: an
+/// unexplained record keeps both whole up to [`BODY_CAP`] escaped bytes together (a side
+/// under half keeps all of it and the other takes the rest), any other record
+/// [`BODY_TRIM`] a side.
+fn bound_bodies(a: &str, b: &str, unexplained: bool) -> (String, String, Option<String>) {
+    let (ea, eb) = (escaped_len(a), escaped_len(b));
+    let half = BODY_CAP / 2;
+    let (ka, kb, cap) = if !unexplained {
+        let cut = ea > BODY_TRIM || eb > BODY_TRIM;
+        (
+            BODY_TRIM,
+            BODY_TRIM,
+            cut.then_some("1 MiB a body (explained record)"),
+        )
+    } else if ea + eb <= BODY_CAP {
+        (ea, eb, None)
+    } else if eb <= half {
+        (
+            BODY_CAP - eb,
+            eb,
+            Some("the 8 MiB body limit for both bodies"),
+        )
+    } else if ea <= half {
+        (
+            ea,
+            BODY_CAP - ea,
+            Some("the 8 MiB body limit for both bodies"),
+        )
+    } else {
+        (half, half, Some("the 8 MiB body limit for both bodies"))
+    };
+    let (ta, tb) = (trim_escaped(a, ka), trim_escaped(b, kb));
+    let note = cap.map(|c| {
+        format!(
+            "bodies cut at {c}: a kept {} of {ea} escaped bytes, b kept {} of {eb}",
+            escaped_len(&ta),
+            escaped_len(&tb)
+        )
+    });
+    (ta, tb, note)
 }
 
 /// `s` cut to at most `max` bytes once JSON-escaped (on a char boundary).
@@ -117,6 +179,15 @@ impl DiffRecord {
     pub fn bounded(&self) -> DiffRecord {
         let long = |s: &str| trim_escaped(s, BODY_TRIM);
         let short = |s: &str| trim_escaped(s, SHORT_TRIM);
+        let (a_body, b_body, cut) = bound_bodies(
+            &self.a_body_trimmed,
+            &self.b_body_trimmed,
+            self.class == "diff",
+        );
+        let body_cap = match (&self.body_cap, cut) {
+            (Some(x), Some(y)) => Some(format!("{x}; {y}")),
+            (x, y) => x.clone().or(y),
+        };
         DiffRecord {
             ts: short(&self.ts),
             route: short(&self.route),
@@ -125,8 +196,8 @@ impl DiffRecord {
             b_target: short(&self.b_target),
             a_status: self.a_status,
             b_status: self.b_status,
-            a_body_trimmed: long(&self.a_body_trimmed),
-            b_body_trimmed: long(&self.b_body_trimmed),
+            a_body_trimmed: a_body,
+            b_body_trimmed: b_body,
             diff: self
                 .diff
                 .iter()
@@ -142,12 +213,14 @@ impl DiffRecord {
             allowlisted: self.allowlisted.as_deref().map(short),
             curl: long(&self.curl),
             note: self.note.as_deref().map(long),
+            body_cap: body_cap.as_deref().map(short),
         }
     }
 }
 
+/// A body as text, whole up to [`BODY_CAP`] bytes (the log applies its caps when it writes).
 pub fn trim_body(b: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&b[..b.len().min(BODY_TRIM)]);
+    let s = String::from_utf8_lossy(&b[..b.len().min(BODY_CAP)]);
     s.into_owned()
 }
 
@@ -440,7 +513,58 @@ mod tests {
             allowlisted: None,
             curl: body.clone(),
             note: Some(body),
+            body_cap: None,
         }
+    }
+
+    /// fv-checklist T-item (R-P5P9-61): an unexplained record keeps both bodies whole up to
+    /// the 8 MiB body limit for the two together, and says so when that cap cuts them; an
+    /// explained record keeps 1 MiB a side, as before, and says so too.
+    #[test]
+    fn unexplained_records_keep_full_bodies_to_the_8_mib_cap() {
+        let body = |n: usize| format!("{{\"data\":\"{}\"}}", "x".repeat(n));
+        let back = |r: &DiffRecord| -> DiffRecord { serde_json::from_slice(&line_of(r)).unwrap() };
+        assert_eq!(
+            trim_body(body(3 << 20).as_bytes()).len(),
+            body(3 << 20).len()
+        );
+        // 3 MiB and 2 MiB: both whole, parseable, no cap note.
+        let mut r = rec(body(3 << 20), "Q {}".into(), vec![]);
+        r.b_body_trimmed = body(2 << 20);
+        let got = back(&r);
+        assert_eq!(got.a_body_trimmed, r.a_body_trimmed);
+        assert_eq!(got.b_body_trimmed, r.b_body_trimmed);
+        assert!(serde_json::from_str::<Value>(&got.a_body_trimmed).is_ok());
+        assert_eq!(got.body_cap, None);
+        // 6 MiB and 6 MiB: 8 MiB for the two, half each, and the record says so.
+        r.a_body_trimmed = body(6 << 20);
+        r.b_body_trimmed = body(6 << 20);
+        let got = back(&r);
+        let (la, lb) = (
+            escaped_len(&got.a_body_trimmed),
+            escaped_len(&got.b_body_trimmed),
+        );
+        assert!(la == 4 << 20 && lb == 4 << 20, "{la} {lb}");
+        let note = got.body_cap.unwrap();
+        assert!(
+            note.contains("8 MiB") && note.contains(&format!("of {}", escaped_len(&body(6 << 20)))),
+            "{note}"
+        );
+        // A small side stays whole; the other (8 MiB, a merged paged answer) takes the rest.
+        r.a_body_trimmed = body(1 << 10);
+        r.b_body_trimmed = body(8 << 20);
+        let got = back(&r);
+        assert_eq!(got.a_body_trimmed, r.a_body_trimmed);
+        assert_eq!(
+            escaped_len(&got.b_body_trimmed),
+            (8 << 20) - escaped_len(&r.a_body_trimmed)
+        );
+        // An explained record keeps 1 MiB a side, and says so.
+        r.class = "allowlisted".into();
+        r.a_body_trimmed = body(3 << 20);
+        let got = back(&r);
+        assert_eq!(escaped_len(&got.a_body_trimmed), BODY_TRIM);
+        assert!(got.body_cap.unwrap().contains("1 MiB"));
     }
 
     fn line_of(r: &DiffRecord) -> Vec<u8> {
@@ -452,7 +576,8 @@ mod tests {
     }
 
     /// R-P5P9-60 H3: a body up to 1 MiB is kept whole (was cut at 4 KB), and the record line
-    /// stays bounded whatever the bodies, request and diff values hold.
+    /// stays bounded whatever the bodies, request and diff values hold (with full bodies,
+    /// R-P5P9-61, the bound is about 14.4 MiB).
     #[test]
     fn h3_records_keep_bodies_to_1_mib_and_stay_bounded() {
         // A 900 KB JSON body (the class CG-2 cut at 4 KB) is kept whole and parses.
@@ -484,13 +609,51 @@ mod tests {
             "{} > {MAX_RECORD_BYTES}",
             line.len()
         );
-        const { assert!(MAX_RECORD_BYTES < 12 << 20) };
+        const { assert!(MAX_RECORD_BYTES < 16 << 20) };
         let back: DiffRecord = serde_json::from_slice(&line).unwrap();
         assert_eq!(back.diff.len(), crate::diff::MAX_ENTRIES);
         let a = back.diff[0].a.as_ref().and_then(Value::as_str).unwrap();
         assert!(a.starts_with("<clipped "), "{}", &a[..40]);
         // Small values are kept as they are.
         assert_eq!(bound_value(Some(json!(5))), Some(json!(5)));
+    }
+
+    /// Log growth on a CG-sized run (fv-checklist T-item; run by hand with `--ignored
+    /// --nocapture`): 4,000 records whose bodies follow an assumed mix (72% about 3 KB a
+    /// side, 20% 40 KB, 7% 400 KB, 1% 6 MiB), written once as unexplained records (full
+    /// bodies, 8 MiB cap) and once under the 1 MiB-a-side trim they had before.
+    #[test]
+    #[ignore]
+    fn log_growth_cg_sized_run() {
+        let size = |i: usize| match i % 100 {
+            0 => 6 << 20,
+            1..=7 => 400 << 10,
+            8..=27 => 40 << 10,
+            _ => 3 << 10,
+        };
+        let mut out = Vec::new();
+        for class in ["diff", "allowlisted"] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = DiffLog::new(dir.path()).unwrap();
+            for i in 0..4000 {
+                let body = format!("{{\"data\":\"{}\"}}", "x".repeat(size(i)));
+                let mut r = rec(body.clone(), format!("Q{i} {{}}"), vec![]);
+                r.curl = "curl -s \"$A\"'/graphql' ; curl -s \"$B\"'/graphql'".into();
+                r.note = None;
+                r.class = class.into();
+                log.append(&r).unwrap();
+            }
+            let n = std::fs::metadata(log.path_for(&date_of(now_secs())))
+                .unwrap()
+                .len();
+            out.push((class, n));
+        }
+        for (class, n) in out {
+            println!(
+                "{class}: {n} bytes ({:.1} MiB)",
+                n as f64 / (1u64 << 20) as f64
+            );
+        }
     }
 
     #[test]
