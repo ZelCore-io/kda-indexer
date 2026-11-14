@@ -55,6 +55,9 @@ const CWD_TRANSFERS_GAP_PATH: &str = "/~cwd-transfers-gap";
 const SEARCH_CONT_HISTORY_PATH: &str = "/~search-cont-history";
 /// Visible hit of `/txs/search?pactid=` rows compared with ties sorted by request key.
 const PACTID_TIE_ORDER_PATH: &str = "/~pactid-tie-order";
+/// Visible hit of `/txs/search?search=` rows of one height in another order (allowlist id
+/// `search-tie-order`; fv-checklist T-item, R3E-8).
+const SEARCH_TIE_ORDER_PATH: &str = "/~search-tie-order";
 
 /// JSON path of the visible allowlist hit for [`events_as_multiset`].
 const EVENT_ORDER_PATH: &str = "/~event-order";
@@ -1243,7 +1246,25 @@ impl Ctx {
                     }
                 }
             }
+            // chainweb-data orders `search=` rows by height only and leaves the rows of one
+            // height to Postgres (R3E-8): those compare as a set; across heights the order
+            // counts, and a row listed twice changes the set.
+            let differed = va != vb;
+            let mut reordered = false;
+            for v in [&mut va, &mut vb] {
+                if let Value::Array(x) = v {
+                    reordered |= crate::normalize::height_ties_as_set(x);
+                }
+            }
             let mut d = diff_route(&req.route, &va, &vb);
+            if differed && reordered {
+                d.push(DiffEntry {
+                    path: SEARCH_TIE_ORDER_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: None,
+                    b: None,
+                });
+            }
             if dropped > 0 {
                 d.push(DiffEntry {
                     path: SEARCH_CONT_HISTORY_PATH.into(),

@@ -206,6 +206,15 @@ condition = "any"
 reason = "/txs/search?pactid= orders by success then height only; chainweb-data leaves ties to Postgres, which answered them in both request-key orders live (2026-11-11). The harness sorts ties by request key on both sides and reports this visible hit."
 owner_note = "Run 6B finding; kda-indexer answers ties request key ascending."
 
+[[entry]]
+id = "search-tie-order"
+route = "search"
+json_path_glob = "/~search-tie-order"
+condition = "any"
+request_contains = "search="
+reason = "/txs/search?search= orders by height only; chainweb-data leaves the rows of one height to Postgres. The harness orders the rows within each height by their text on both sides (a set per height) and reports this visible hit; rows across heights keep their order, and a missing, extra or twice-listed row still shows."
+owner_note = "fv-checklist harness T-item (within-height tie order on /txs/search); R3E-8, R-P5P9-48/49. kda-indexer answers a height's rows in node order."
+
 # --- Run 6E-3 oracle defects (ruling R-P5P9-47; node evidence in the run 6E-3 report) ---
 
 [[entry]]

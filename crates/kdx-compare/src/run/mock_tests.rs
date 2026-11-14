@@ -1492,3 +1492,52 @@ rate_rps = 1000.0
     assert_eq!((n, limit.as_deref()), (0, Some(HARNESS_LIMIT_PATH)));
     assert!(!d.is_empty());
 }
+
+/// fv-checklist T-item (R3E-8, R-P5P9-48/49): `/txs/search?search=` rows within one height
+/// compare as a set against chainweb-data (its query leaves the order inside a height to
+/// Postgres), with the visible hit `/~search-tie-order`; across heights the order still
+/// counts, and a row listed twice stays a diff.
+#[tokio::test]
+async fn search_ties_within_a_height_compare_as_a_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = NodeMock {
+        tip: 7_000_000,
+        ..NodeMock::default()
+    };
+    let rows = |order: &[(&str, u64)]| {
+        Value::Array(
+            order
+                .iter()
+                .map(|(rk, h)| row(rk, 0, *h, &format!("B{h}")))
+                .collect(),
+        )
+    };
+    let ours = SideMock {
+        search: rows(&[("x", 10), ("y", 10), ("w", 10), ("z", 9)]),
+        ..SideMock::default()
+    };
+    let path = "/txs/search?search=coin.transfer&limit=10";
+    let case = |b: &[(&str, u64)]| {
+        let b = SideMock {
+            search: rows(b),
+            ..SideMock::default()
+        };
+        let (node, ours, out) = (node.clone(), ours.clone(), dir.path().to_path_buf());
+        async move {
+            let (ctx, _) = setup(node, ours, b, &out).await;
+            compare(&ctx, path).await
+        }
+    };
+    // The same rows of height 10 in another order: explained, with the visible hit.
+    let (class, ids, paths) = case(&[("w", 10), ("x", 10), ("y", 10), ("z", 9)]).await;
+    assert_eq!(class, "allowlisted", "{paths:?}");
+    assert!(ids.contains(&"search-tie-order".to_string()), "{ids:?}");
+    // The same rows with heights in another order: a diff.
+    let (class, _, paths) = case(&[("z", 9), ("x", 10), ("y", 10), ("w", 10)]).await;
+    assert_eq!(class, "diff");
+    assert!(paths.iter().any(|p| !p.starts_with("/~")), "{paths:?}");
+    // A row listed twice inside the height (in place of w): a diff.
+    let (class, _, paths) = case(&[("y", 10), ("x", 10), ("x", 10), ("z", 9)]).await;
+    assert_eq!(class, "diff");
+    assert!(paths.iter().any(|p| !p.starts_with("/~")), "{paths:?}");
+}
