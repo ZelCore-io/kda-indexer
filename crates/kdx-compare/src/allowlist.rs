@@ -31,6 +31,16 @@ impl Condition {
     }
 }
 
+/// An entry's standing (R-P5P9-66 concern 8). Both match the same way; the FV preconditions
+/// need every entry ACCEPTED, and the controller flips a PROPOSED entry by a ruling once CG-4
+/// shows its hits are explained by its rule and nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Status {
+    Proposed,
+    Accepted,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -47,7 +57,11 @@ pub struct Entry {
     /// (name, any case), e.g. `x-search-truncated` for a cut search.
     #[serde(default)]
     pub a_header: Option<String>,
+    /// Required: PROPOSED or ACCEPTED.
+    pub status: Status,
     pub reason: String,
+    /// Required: the ruling (or, for an owner-accepted entry, the owner note) that admits it.
+    pub ruling: String,
     pub owner_note: String,
 }
 
@@ -72,6 +86,11 @@ impl Allowlist {
         let mut ids = std::collections::HashSet::new();
         for e in &f.entries {
             anyhow::ensure!(ids.insert(e.id.clone()), "duplicate allowlist id {}", e.id);
+            anyhow::ensure!(
+                !e.reason.trim().is_empty() && !e.ruling.trim().is_empty(),
+                "allowlist entry {} needs a reason and a ruling",
+                e.id
+            );
         }
         Ok(Allowlist { entries: f.entries })
     }
@@ -146,6 +165,77 @@ mod tests {
         let p =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
         Allowlist::load(&p).unwrap()
+    }
+
+    /// R-P5P9-66 concern 8: every shipped entry carries `status` (PROPOSED or ACCEPTED),
+    /// `reason` and `ruling`, read from the file itself so a missing key is seen even if the
+    /// loader defaulted it.
+    #[test]
+    fn every_shipped_entry_carries_status_reason_and_ruling() {
+        let p =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+        let raw: toml::Value = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let entries = raw["entry"].as_array().expect("entries");
+        assert!(entries.len() > 40, "{} entries", entries.len());
+        let mut lacking = Vec::new();
+        for e in entries {
+            let id = e["id"].as_str().unwrap_or("?");
+            for k in ["status", "reason", "ruling"] {
+                let v = e.get(k).and_then(toml::Value::as_str).unwrap_or("");
+                if v.trim().is_empty() {
+                    lacking.push(format!("{id}: {k}"));
+                }
+            }
+            let st = e.get("status").and_then(toml::Value::as_str).unwrap_or("");
+            if !["PROPOSED", "ACCEPTED"].contains(&st) && !st.is_empty() {
+                lacking.push(format!("{id}: status {st}"));
+            }
+        }
+        assert!(lacking.is_empty(), "entries lacking a field: {lacking:?}");
+        // The loader agrees: the shipped file loads with a status on every entry.
+        let al = shipped();
+        assert_eq!(al.entries.len(), entries.len());
+        // Only entries whose owner note says the owner accepted them are ACCEPTED.
+        for e in &al.entries {
+            if e.status == super::Status::Accepted {
+                assert!(
+                    e.owner_note.contains("by the owner") || e.owner_note.contains("owner ruling"),
+                    "{} is ACCEPTED without an owner acceptance in its note",
+                    e.id
+                );
+            }
+        }
+    }
+
+    /// An entry without `status` or `ruling`, with an empty one, or with a status other than
+    /// PROPOSED or ACCEPTED does not load.
+    #[test]
+    fn an_entry_without_a_status_or_ruling_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |extra: &str| {
+            let p = dir.path().join("a.toml");
+            std::fs::write(
+                &p,
+                format!(
+                    "[[entry]]\nid = \"x\"\nroute = \"*\"\njson_path_glob = \"/x\"\n\
+                     condition = \"any\"\nreason = \"r\"\nowner_note = \"n\"\n{extra}"
+                ),
+            )
+            .unwrap();
+            Allowlist::load(&p)
+        };
+        assert!(load("status = \"PROPOSED\"\nruling = \"R-1\"\n").is_ok());
+        assert!(load("status = \"ACCEPTED\"\nruling = \"R-1\"\n").is_ok());
+        assert!(load("ruling = \"R-1\"\n").is_err(), "no status");
+        assert!(load("status = \"PROPOSED\"\n").is_err(), "no ruling");
+        assert!(
+            load("status = \"PROPOSED\"\nruling = \" \"\n").is_err(),
+            "empty ruling"
+        );
+        assert!(
+            load("status = \"MAYBE\"\nruling = \"R-1\"\n").is_err(),
+            "unknown status"
+        );
     }
 
     /// I-4: a `search=` diff is excused only when kda-indexer said it cut the answer.

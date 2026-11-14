@@ -2,7 +2,12 @@
 # Each entry: id, route (tx, txs, account, events, recent, stats, search, coins, v1txs,
 # other or "*"), json_path_glob (JSON pointer; `*` = one segment, `**` = any depth),
 # condition (a_extra = only in A, b_extra = only in B, changed, any), optional
-# request_contains, reason and owner_note. Everything not matched is a reported diff.
+# request_contains, reason, status, ruling and owner_note. Everything not matched is a
+# reported diff.
+# status (R-P5P9-66 concern 8): PROPOSED or ACCEPTED; both match the same way. An entry is
+# ACCEPTED only where its owner note says the owner accepted it; every other entry is
+# PROPOSED, citing its ruling, until the controller flips it by a ruling at the FV
+# preconditions (once CG-4 shows its hits are explained by its rule and nothing more).
 
 [[entry]]
 id = "event-search-window"
@@ -11,6 +16,8 @@ json_path_glob = "/**"
 condition = "any"
 request_contains = "search="
 reason = "Event text search only covers a bounded recent window in kda-indexer (decision Q2); chainweb-data scans further back, so older matches differ."
+status = "ACCEPTED"
+ruling = "Owner note: accepted by the owner (decision Q2); run 3E ruling R3E-6 for the minimum search length."
 owner_note = "Accepted by the owner. Exact module/name event queries are not covered by this entry. Also covers the minimum search length (kda-indexer 400, chainweb-data 200 on short strings): known G2, compat is to match chainweb-data in the fix round (run 3E ruling R3E-6)."
 
 [[entry]]
@@ -19,6 +26,8 @@ route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
 reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing. Against chainweb-data (no oracle) the rows of blocks other than A's go under /orphans (the node pair checks that A's block is canonical), and chainweb-data's /txs/tx answers 404 for such a request key (seen live: YbvRG1..., chain 2, canonical block QCOhs8... and orphan du_5-bB... at one height); the harness then confirms with one /txs/txs call and reports /orphans."
+status = "PROPOSED"
+ruling = "Spec section 4.5 (builder call: orphans are not kept); R3E-9 extends it (oracle-orphan-rows)."
 owner_note = "Builder call (spec section 4.5): orphans are not kept."
 
 [[entry]]
@@ -27,6 +36,8 @@ route = "stats"
 json_path_glob = "/transactionCount~estimate"
 condition = "changed"
 reason = "chainweb-data returns a Postgres row estimate for transactionCount; counts within 1% are accepted. Larger differences are reported at /transactionCount."
+status = "PROPOSED"
+ruling = "Spec section 7.3 (the 1% tolerance); R3E-4."
 owner_note = "Tolerance from spec section 7.3."
 
 [[entry]]
@@ -36,6 +47,8 @@ json_path_glob = "/~graphql-page-cut"
 condition = "any"
 request_contains = "graphql:"
 reason = "GraphQL pages larger than 100 items are capped in kda-indexer (decision Q10), the reference server does not clamp. The harness compares the common prefix of the two sides after following the same number of pages."
+status = "ACCEPTED"
+ruling = "Owner note: accepted by the owner (decision Q10)."
 owner_note = "Accepted by the owner; the visible hit /~graphql-page-cut appears only when one side stopped at a smaller page and still had a next page."
 
 [[entry]]
@@ -45,6 +58,8 @@ json_path_glob = "/~graphql-totalcount-cap"
 condition = "any"
 request_contains = "graphql:"
 reason = "totalCount above 10,000 is a bounded count walk in kda-indexer (GQ-10): min(count, 10,000)."
+status = "ACCEPTED"
+ruling = "Owner note: accepted by the owner (GQ-10)."
 owner_note = "Accepted by the owner; the normaliser caps both sides, the visible hit records that the reference count was above the cap."
 
 [[entry]]
@@ -54,6 +69,8 @@ json_path_glob = "/~graphql-oracle-stall"
 condition = "any"
 request_contains = "graphql:"
 reason = "The reference server stopped indexing at a fixed height; rows above the configured max_height exist only on kda-indexer and are dropped from both sides before the diff."
+status = "ACCEPTED"
+ruling = "Owner note: accepted by the owner (GQ-16)."
 owner_note = "Accepted by the owner (GQ-16); only the visible hit is allowlisted, any other difference stays unexplained."
 
 [[entry]]
@@ -63,6 +80,8 @@ json_path_glob = "/~graphql-r57-float"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 F2: Float and float-valued Decimal fields (balance, totalBalance, gasPrice, the networkInfo floats) and any number above 2^53 compare at f64 precision. The reference server computes them as JavaScript floats (difficulty rounding, totalBalance float sum); kda-indexer's values are exact. The NodeBalance and native pairs compare our Float balance with the decimal at f64 precision."
+status = "PROPOSED"
+ruling = "R-P5P9-57 F2."
 owner_note = "Controller ruling R-P5P9-57 (harness only); a difference beyond f64 precision stays unexplained."
 
 [[entry]]
@@ -72,6 +91,8 @@ json_path_glob = "/~graphql-r57-json-object"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 F7: JSON texts that hold objects (payload.data, goodResult, badResult) compare as objects, so key order is not a difference. Numbers inside keep their text, so a decimal format difference (F9) is not hidden."
+status = "PROPOSED"
+ruling = "R-P5P9-57 F7."
 owner_note = "Controller ruling R-P5P9-57 (harness only)."
 
 [[entry]]
@@ -81,6 +102,8 @@ json_path_glob = "/~graphql-r57-height-tie-cut"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 M2b/M2c: rows within one height compare as a set (order within a height is a contract choice, R3E-8). When both sides still have a next page and the page end cut the last height's rows at different members, those trailing rows are left out of both sides; the rows before them still compare."
+status = "PROPOSED"
+ruling = "R-P5P9-57 M2b/M2c; R3E-8."
 owner_note = "Controller ruling R-P5P9-57; the order across heights (M2a) is still compared."
 
 [[entry]]
@@ -90,6 +113,8 @@ json_path_glob = "/~graphql-r57-field"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 rules (a) and (b): a per-field normaliser from the harness config ([graphql] field_rules) explained the difference. The controller sets each field after the node referee (F5, F6, F8, F9, F10, Transfer.amount)."
+status = "PROPOSED"
+ruling = "R-P5P9-57 rules (a) and (b)."
 owner_note = "Controller ruling R-P5P9-57; only the fields listed in the config, only the listed rule."
 
 [[entry]]
@@ -99,6 +124,8 @@ json_path_glob = "/~graphql-r58-oracle-empty"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 rule (a), R-P5P9-58 kind oracle_empty: at a field listed in [graphql] field_rules, the reference server's empty string against a non-null value of ours (F8 signers.scheme present: the node's command carries the scheme ours serves). Our null against its empty string is not explained, and an optional ours matcher narrows it to one value."
+status = "PROPOSED"
+ruling = "R-P5P9-57 rule (a); R-P5P9-58 (oracle_empty, 22:40Z class table)."
 owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z class table); only the listed fields."
 
 [[entry]]
@@ -108,6 +135,8 @@ json_path_glob = "/~graphql-r58-count-lower-bound"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 unresolved counts, R-P5P9-58 kind count_lower_bound: our response carried extensions.totalCountLowerBound (the count ran out of its deadline share, R-P5P9-14), and our count is below the reference server's. An unflagged count, or a flagged count above the oracle's, stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-57; R-P5P9-58 (count_lower_bound); R-P5P9-14."
 owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z: transfer totalCount is ours-correct, lower only when flagged)."
 
 [[entry]]
@@ -117,6 +146,8 @@ json_path_glob = "/~graphql-r58-oracle-orphan-dupes"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 unresolved counts, R-P5P9-58 kind oracle_orphan_dupes: the reference server listed a request key twice, and the node's canonical header at our copy's (chain, height) is our block, so its copy in the other block is an orphan. That copy left its list and its totalCount dropped by one (oracle_orphans, the R-P5P9-48 rule). Copies the node does not settle stay, and a count difference beyond the copies dropped stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-57; R-P5P9-58 (oracle_orphan_dupes); R-P5P9-48."
 owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z: transactionsByPublicKey orphan duplicates are an oracle defect)."
 
 [[entry]]
@@ -126,6 +157,8 @@ json_path_glob = "/~graphql-r58-by-key-extra-row"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 unresolved counts, R-P5P9-58 kind by_key_extra_row: a by-key account row only ours lists left the compare because the node's /local (coin.details \"<account>\") guard, on the chain the key is on, holds the key. One single-row read per row at the harness's node rate, never a scan; a row the node does not confirm stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-57; R-P5P9-58 (by_key_extra_row)."
 owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z: the extra fungibleAccountsByPublicKey row is an oracle defect; node-confirmed guards)."
 
 # --- From the first live runs (P1, chainweb-data vs node oracle) ---
@@ -136,6 +169,8 @@ route = "tx"
 json_path_glob = "/~genesis-multi-chain"
 condition = "b_extra"
 reason = "Some genesis txs repeat their request key across chains (seen live: 48T0LjAn... in the genesis blocks of all 20 chains, xJHaykvaH... on chains 10-19). chainweb-data's /txs/txs lists every row and its /txs/tx answers 404 for a request key with several rows; compat does the same (F4). Against the node's /poll on one chain, compat's /txs/tx 404 moves here only when compat's /txs/txs lists the request key in that chain's canonical genesis block and in at least one other genesis block."
+status = "PROPOSED"
+ruling = "R3E-1 (G1) and the F4 fix (run 3E-g)."
 owner_note = "Compat behaviour by design (F4 fix, run 3E-g): matches chainweb-data. Replaces genesis-txs-not-indexed (G1 fixed: compat serves genesis txs on /txs/tx and /txs/txs, so a genesis 404 against chainweb-data is a diff again)."
 
 [[entry]]
@@ -144,6 +179,8 @@ route = "*"
 json_path_glob = "/result/error/callStack**"
 condition = "any"
 reason = "For failed txs chainweb-data kept the Pact error as produced at execution time, with a callStack; the node serves the stored output without callStack."
+status = "PROPOSED"
+ruling = "No ruling found: a P1 live-run finding (chainweb-data against the node oracle)."
 owner_note = "Seen on old failed txs (heights 1.5M-2.0M). The error message and type still compare."
 
 [[entry]]
@@ -152,6 +189,8 @@ route = "*"
 json_path_glob = "/result/error/info"
 condition = "changed"
 reason = "For failed txs chainweb-data's error info has the source position at execution time (\"<interactive>:0:11937\"); the node serves \"<toplevel>:0\"."
+status = "PROPOSED"
+ruling = "No ruling found: a P1 live-run finding, as failed-tx-callstack."
 owner_note = "Same txs as failed-tx-callstack."
 
 # --- Harness tolerances reported as visible hits (P3, Task 7) ---
@@ -162,6 +201,8 @@ route = "stats"
 json_path_glob = "/coinsInCirculation~tolerance"
 condition = "changed"
 reason = "Both sides compute the circulating supply at their own tip height and time; values within a relative 1e-6 are accepted. Larger differences are reported at /coinsInCirculation."
+status = "PROPOSED"
+ruling = "P3 plan Task 7 (tolerance); R3E-11."
 owner_note = "Tolerance from the P3 plan (Task 7)."
 
 # --- From the live comparison on the full store (P3, Task 8 / run 3E) ---
@@ -172,6 +213,8 @@ route = "*"
 json_path_glob = "/~page-cut"
 condition = "changed"
 reason = "chainweb-data pages hold limit x a throttling factor rows and still carry a Chainweb-Next token, so after the same number of followed pages it has fewer rows. The harness cuts both sides to the heights the shorter side covered completely and reports this visible hit; rows above the cut are compared as usual."
+status = "PROPOSED"
+ruling = "P3 controller rulings (run 3C finding)."
 owner_note = "Accepted in the P3 controller rulings (run 3C finding)."
 
 [[entry]]
@@ -180,6 +223,8 @@ route = "stats"
 json_path_glob = "/transactionCount"
 condition = "changed"
 reason = "chainweb-data's transactionCount is pg_class.reltuples of a transactions table that is never analyzed, so the value is frozen (200,841,520 on 2026-11-10 while the table holds 233,094,876 rows). Its rows also include txs of orphaned blocks and miss blocks it never fetched. kda-indexer counts canonical user txs exactly (229.9M); per-height windows match chainweb-data where it holds no orphans or gaps."
+status = "PROPOSED"
+ruling = "R3E-4."
 owner_note = "Accepted (run 3E ruling R3E-4). Without it /stats can never be within 1%: the reference value is stale, not an estimate."
 
 [[entry]]
@@ -188,6 +233,8 @@ route = "*"
 json_path_glob = "/~page-dup"
 condition = "changed"
 reason = "chainweb-data can start a Chainweb-Next page with the last row of the previous page (seen live on /txs/account with throttled pages: the same transfer, same chain and idx, twice in a row). The harness drops the repeated row (never a transfer to oneself, which chainweb-data lists twice on purpose) and reports this visible hit; kda-indexer pages never repeat a row."
+status = "PROPOSED"
+ruling = "R3E-5."
 owner_note = "Accepted (run 3E ruling R3E-5): chainweb-data paging bug."
 
 [[entry]]
@@ -196,6 +243,8 @@ route = "search"
 json_path_glob = "/~search-cont-history"
 condition = "changed"
 reason = "/txs/search?search= matches a tx's own exec code. chainweb-data also returns cont txs through the code of their initial tx (coalesce(tx.code, contHist.code)); the harness drops those rows (code null, initialCode set), cuts our page to the rows left and reports this visible hit."
+status = "PROPOSED"
+ruling = "Ruling S-3 (P5/P6 plan)."
 owner_note = "Ruling S-3 (P5/P6 plan): about 10 requests a day on the whole route; an exact expansion needs a cont->code side index (a `contcode` file in search/, no reindex) if ever wanted."
 
 [[entry]]
@@ -204,6 +253,8 @@ route = "search"
 json_path_glob = "/~pactid-tie-order"
 condition = "any"
 reason = "/txs/search?pactid= orders by success then height only; chainweb-data leaves ties to Postgres, which answered them in both request-key orders live (2026-11-11). The harness sorts ties by request key on both sides and reports this visible hit."
+status = "PROPOSED"
+ruling = "R3E-8 (order within a height); run 6B finding."
 owner_note = "Run 6B finding; kda-indexer answers ties request key ascending."
 
 [[entry]]
@@ -213,6 +264,8 @@ json_path_glob = "/~search-tie-order"
 condition = "any"
 request_contains = "search="
 reason = "/txs/search?search= orders by height only; chainweb-data leaves the rows of one height to Postgres. The harness orders the rows within each height by their text on both sides (a set per height) and reports this visible hit; rows across heights keep their order, and a missing, extra or twice-listed row still shows."
+status = "PROPOSED"
+ruling = "R3E-8; R-P5P9-48/49; R-P5P9-64 M-7."
 owner_note = "PROPOSED (rulings R3E-8, R-P5P9-48/49 and R-P5P9-64 M-7; the FV preconditions flip it): fv-checklist harness T-item (within-height tie order on /txs/search). kda-indexer answers a height's rows in node order."
 
 # --- Run 6E-3 oracle defects (ruling R-P5P9-47; node evidence in the run 6E-3 report) ---
@@ -224,6 +277,8 @@ json_path_glob = "/**"
 condition = "any"
 request_contains = "Au4cjML8"
 reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): /txs/tx for request key Au4cjML8... answers 404 on chainweb-data. The node's /poll on chain 4 has the tx in block 7TUVaPeB..., which is canonical at height 7392363 (the block kda-indexer lists). Seen live 2026-11-13 02:34Z. The harness checks behind cwd-events-missing-node and kdatxs-missing-node do not cover a chainweb-data 404 on a canonical tx (FV item T-3), so this entry is tied to one request key."
+status = "PROPOSED"
+ruling = "R3E-14 (oracle defect class); R-P5P9-47."
 owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
 
 [[entry]]
@@ -233,6 +288,8 @@ json_path_glob = "/**"
 condition = "any"
 request_contains = "Au4cjML8"
 reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): /txs/txs for request key Au4cjML8... lists no row on chainweb-data; the node holds the tx in canonical block 7TUVaPeB... (chain 4, height 7392363), the block kda-indexer lists. Seen live 2026-11-13 02:34Z. Tied to one request key until the harness gets a node check for chainweb-data 404/empty answers (FV item T-3)."
+status = "PROPOSED"
+ruling = "R3E-14 (oracle defect class); R-P5P9-47."
 owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
 
 [[entry]]
@@ -242,6 +299,8 @@ json_path_glob = "/**"
 condition = "any"
 request_contains = "minheight=7392263"
 reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): the coin.TRANSFER_XCHAIN window 7392263-7392463 lacks three rows on chainweb-data that kda-indexer lists (chain 15 height 7392417 VBgVmfxK..., chain 8 height 7392417 hACgFo2g..., chain 1 height 7392416 qnXrjXqA...). The node's /poll has each in the block kda-indexer lists, which is canonical, with 4 events. Seen live 2026-11-13 02:34Z. The per-row events check of cwd-events-missing-node did not fire here (FV item T-3), so this entry is tied to the window's minheight."
+status = "PROPOSED"
+ruling = "R3E-14 (oracle defect class); R-P5P9-47."
 owner_note = "Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
 
 [[entry]]
@@ -251,6 +310,8 @@ json_path_glob = "/**"
 condition = "any"
 request_contains = "d7bf62"
 reason = "kda-txs lists no row for a transfer-crosschain continuation (request key 4GTkBWgc..., chain 2, height 7124688, code null) that kda-indexer lists at /9 of k:d7bf62.../coin/250. The node's /poll has it in block ljtUuFCZ..., which is canonical, with 4 events and 3 of them naming the account. Seen live 2026-11-13 02:00Z. The kdatxs-gap and kdatxs-missing-node checks did not fire (FV item T-3), so this entry is tied to one account."
+status = "PROPOSED"
+ruling = "R3E-15 (oracle defect class); R-P5P9-47."
 owner_note = "Oracle defect under ruling R3E-15 (node agrees with kda-indexer, kda-txs differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report)."
 
 # --- /txs/search oracle classes (ruling R-P5P9-48; per-request 6E-3 entries removed by R-P5P9-49) ---
@@ -261,6 +322,8 @@ route = "search"
 json_path_glob = "/~oracle-orphan"
 condition = "any"
 reason = "chainweb-data keeps /txs/search rows of blocks that are not canonical (seen live in run 6E-3: 23 records, e.g. chain 2 height 7399318, chainweb-data block oC2lnmOL, canonical OHz-ZmnP; chain 5 height 7372639, zbojrfLx vs 3vd0hYPX). A row chainweb-data lists and kda-indexer does not (by request key and block) moves here only when the node's canonical block at its chain and height, read with header/branch up to the current cut (never the plain header range, which also returns orphans), is another one. When chainweb-data's pactid page was full, kda-indexer's page is then cut to its length (a_cut)."
+status = "PROPOSED"
+ruling = "R-P5P9-48 item 1; R3E-14."
 owner_note = "R-P5P9-48 item 1 (Fix 6E-G); oracle defect under ruling R3E-14."
 
 [[entry]]
@@ -269,6 +332,8 @@ route = "search"
 json_path_glob = "/~oracle-gap"
 condition = "any"
 reason = "chainweb-data leaves out /txs/search rows of canonical blocks below its own tip (seen live in run 6E-3: the 2026-11-10 hole at heights ~7392051-7392417, e.g. pactid Au4cjML8..., 2 continuations at chain 1 height 7392368; h3St... at chain 19 heights 7392051 and 7392087). A row kda-indexer lists and chainweb-data does not (by request key and block), at or below chainweb-data's tip (its /txs/recent), moves here only when the node's /poll puts the tx in kda-indexer's block and that block is the canonical one at its chain and height on the cut's branch. When a pactid page was full, rows at or past its last row's place are dropped on both sides first (a_cut, b_cut)."
+status = "PROPOSED"
+ruling = "R-P5P9-48 item 2; R3E-14."
 owner_note = "R-P5P9-48 item 2 (Fix 6E-G); oracle defect under ruling R3E-14 (node agrees with kda-indexer)."
 
 [[entry]]
@@ -279,6 +344,8 @@ condition = "any"
 request_contains = "pactid="
 a_header = "x-search-truncated"
 reason = "/txs/search?pactid= reads only the newest 1,000 txs of a pact (PACT_CAP, R-P5P9-3 / Task 10) and says so with X-Search-Truncated: true when that cap cut the walk. chainweb-data lists the pact's successful continuation first. On a pact with more than 1,000 txs that is mostly failed continuations, the old successful one is not among the newest 1,000, so kda-indexer never lists it (7 records on 4 pacts, wfSV..., hAPy..., rwdA... and gY1E..., seen live 2026-11-13 02:24Z to 08:01Z; the successful continuations are canonical, e.g. chain 1 height 6072365 and chain 5 height 5988947). Compat sends no Chainweb-Next on this route. Only pacts with more than 1,000 txs are affected, and only their answers carry the header; an answer without it is compared in full."
+status = "PROPOSED"
+ruling = "R-P5P9-47 (documented compat limit); R-P5P9-48 item 4."
 owner_note = "ACCEPTED as a documented compat limit (ruling R-P5P9-47; docs/api.md). Made precise in R-P5P9-48: matches only answers carrying X-Search-Truncated. It comes after the pact-specific entries so those keep their own hits. FV checks whether kadscan relies on the old successful continuation."
 
 [[entry]]
@@ -287,6 +354,8 @@ route = "account"
 json_path_glob = "/~cwd-transfers-gap"
 condition = "any"
 reason = "chainweb-data's transfers table misses some rows whose TRANSFER event it holds in its events table (seen live: erkng6rS... at 1595413, TI1Kfck... at 1687775 and Sd2fLvTg... at 1685777, all chain 0: events present, transfers rows absent, so /txs/account leaves them out). The harness moves an A-only row here only when B lists no row of its own and chainweb-data's own /txs/tx for that request key, in the same block, carries the matching {token}.TRANSFER event."
+status = "PROPOSED"
+ruling = "R3E-9."
 owner_note = "Accepted (run 3E ruling R3E-9): chainweb-data data gap, kda-indexer derives transfers from the events it indexes."
 
 [[entry]]
@@ -295,6 +364,8 @@ route = "*"
 json_path_glob = "/~event-order"
 condition = "changed"
 reason = "chainweb-data (/txs/tx, /txs/txs) and kda-txs (/v1/txs) list some txs' events in another order than the node's output (seen live: 5xNbYLRE... and vjUp8NVn..., chain 2; node and kda-indexer [coin.TRANSFER, coin.TRANSFER_XCHAIN, coin.TRANSFER, pact.X_YIELD], both oracles [coin.TRANSFER, coin.TRANSFER, coin.TRANSFER_XCHAIN, pact.X_YIELD]). Against these oracles a tx's events compare as a multiset and this visible hit is reported; the node pair still checks the order."
+status = "PROPOSED"
+ruling = "R3E-9."
 owner_note = "Accepted (run 3E ruling R3E-9): kda-indexer keeps the node's order."
 
 [[entry]]
@@ -303,6 +374,8 @@ route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
 reason = "chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height, or, where kda-indexer lists no row at that chain and height, after the node's canonical block there is another one (seen live: k:b649fd12...?token=coin, chainweb-data row in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M)."
+status = "PROPOSED"
+ruling = "R3E-9; spec section 4.5."
 owner_note = "Accepted (run 3E ruling R3E-9); extends orphan-rows-txs (spec section 4.5: orphans are not kept). Also covers chainweb-data coinbase rows at an A height in another block (no request key to match), node-confirmed the same way."
 
 [[entry]]
@@ -311,6 +384,8 @@ route = "*"
 json_path_glob = "/~oracle-lag**"
 condition = "any"
 reason = "chainweb-data lags kda-indexer and fills recent heights late (seen live 2026-11-10: its /txs/recent at the tip while /txs/account still missed rows 1-4 h old, e.g. xwallet-xchain-gas at 7392405 and 7392384; kda-txs likewise). Account, event and /v1/txs rows of the last 1440 heights (12 h) below A's tip are dropped on both sides, then a side that held its full limit is cut at its lowest height on both sides; on /stats a supply higher on A by at most 60 KDA per height of tip difference (at least 240 heights) is not compared; on /txs/recent a continuation whose initialCode/previousSteps chainweb-data still shows null is reported here; on /txs/search a row kda-indexer lists above chainweb-data's tip (its /txs/recent) that chainweb-data lacks is reported here (seen live in run 6E-3: pacts 5unn... and WiLl..., chainweb-data's newest row 60-150 heights below kda-indexer's); on /coins a difference past the relative 1e-6 is reported at /~oracle-lag/coins when the side with the higher tip (both read on /txs/recent) has the higher supply and the difference is at most the coinbase minted between the two tips (miner reward table) plus that 1e-6 (seen live in run 6E-3: 2,621.7 KDA with chainweb-data about 145 heights behind). All leave this visible hit."
+status = "PROPOSED"
+ruling = "R3E-11."
 owner_note = "Accepted (run 3E ruling R3E-11): oracle lag, not a kda-indexer diff."
 
 [[entry]]
@@ -319,6 +394,8 @@ route = "v1txs"
 json_path_glob = "/~oracle-unstable"
 condition = "any"
 reason = "kda-txs is fed by its own indexer and can answer the same /v1/txs request differently moments apart (seen live: set shifts at /0 that were gone when both sides were fetched again). A /v1/txs diff against kda-txs is retried once after 30 s (seen live: a partial answer, 20 of 41 rows, that was whole minutes later); when the retry agrees, this visible hit replaces the diff."
+status = "PROPOSED"
+ruling = "R3E-15."
 owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c)."
 
 [[entry]]
@@ -327,6 +404,8 @@ route = "v1txs"
 json_path_glob = "/~limit-edge"
 condition = "any"
 reason = "kda-txs can return one row fewer than the limit (seen live: xwallet-xchain-gas/coin/250, 250 rows on kda-indexer, 249 on kda-txs, the extra row the oldest at 7385234). When one side holds exactly `limit` rows and the counts differ, both keep only the rows above the higher of the two lowest heights; this visible hit is reported."
+status = "PROPOSED"
+ruling = "R3E-15."
 owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c)."
 
 [[entry]]
@@ -335,6 +414,8 @@ route = "*"
 json_path_glob = "/~cwd-cursor-skip"
 condition = "any"
 reason = "chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain, so a page that ends on a coinbase row makes the next page skip the coinbase rows of the other chains at that height (seen live: /txs/events?modulename=coin&name=TRANSFER&minheight=3293727&maxheight=3293927, cursor ((3293927,\"cb\",0),0), chainweb-data 13 rows at 3293927 over three pages, kda-indexer all 23). The harness drops that height on both sides and reports this visible hit."
+status = "PROPOSED"
+ruling = "R3E-15."
 owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c): chainweb-data pagination defect; compat lists every row."
 
 [[entry]]
@@ -343,6 +424,8 @@ route = "v1txs"
 json_path_glob = "/~kdatxs-gap"
 condition = "any"
 reason = "kda-txs leaves out some /v1/txs rows in canonical blocks (seen live: 28481ce2... chain 0 height 1288814, 1 row on kda-indexer, none on kda-txs; xwallet-xchain-gas chain 5 height 7386167). An A-only row, when kda-txs lists no row of its own, moves here only when chainweb-data's /txs/tx for that request key is in the same block and has an event naming the account."
+status = "PROPOSED"
+ruling = "R3E-15."
 owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c): kda-txs data gap."
 
 [[entry]]
@@ -351,6 +434,8 @@ route = "account"
 json_path_glob = "/~cwd-missing-node"
 condition = "any"
 reason = "chainweb-data leaves out account rows the node holds (seen live: 7590fd61...?chain=0&limit=50, 7 rows and no Chainweb-Next on every refetch, kda-indexer 50; 6d87fd6e...?minheight=1151496&maxheight=1153496, no rows, kda-indexer 35 in node block 6tpjetrL at chain 0 height 1152748; k:5adb1666... rows at heights 7306102-7306103 on several chains). When both sides held their full limit they are first cut at the higher of their lowest heights. With no row only chainweb-data lists, every row only kda-indexer lists must be in the same block on the node's /poll, with an event naming the account; those rows move here. Rows match by (requestKey, blockHash, idx), so value diffs of shared rows stay diffs. A cut that alone leaves no row on either side only is reported here too (rows 0; seen live: 99cb7008...?minheight=6040728&maxheight=6042728, both pages full at one height, ordered differently within it)."
+status = "ACCEPTED"
+ruling = "Owner note: ACCEPTED by owner ruling R3E-14 (run 3E-d)."
 owner_note = "ACCEPTED (owner ruling R3E-14, run 3E-d): node agrees with kda-indexer, so chainweb-data's missing rows and short pages without a next-page token are chainweb-data defects."
 
 [[entry]]
@@ -359,6 +444,8 @@ route = "v1txs"
 json_path_glob = "/~kdatxs-missing-node"
 condition = "any"
 reason = "kda-txs answers a varying subset of an account's /v1/txs rows (seen live: acc28032.../coin/250, 63, 54, 404 and 47 rows on four fetches, every row also on kda-indexer, which lists 125; 40a8967d.../coin/10, kda-txs never lists JxrH9wub... at chain 0 height 3697206, node block Cr4YV2QE). Same check as cwd-missing-node: both full -> cut at the higher lowest height; no kda-txs-only row; every kda-indexer-only row in the same block on the node's /poll with an event naming the account."
+status = "PROPOSED"
+ruling = "R3E-15 (run 3E-d)."
 owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-d): kda-txs data gap / unstable subset, confirmed per row on the node."
 
 [[entry]]
@@ -367,6 +454,8 @@ route = "v1txs"
 json_path_glob = "/~kdatxs-events-node"
 condition = "any"
 reason = "kda-txs answers a row's events differently from one fetch to the next (seen live: k:d763d377.../coin/50 and k:e4f0a329.../coin/50, the gas TRANSFER and the main TRANSFER with from/to and amounts that disagreed, gone on a refetch). Rows both sides list (by requestKey, blockHash, idx) whose events differ are polled on the node (at most 25 per compare); only when the node has every such tx in kda-indexer's block with kda-indexer's events (as a multiset) are kda-txs's events replaced by kda-indexer's, and this visible hit is reported."
+status = "PROPOSED"
+ruling = "R3E-15 (run 3E-g)."
 owner_note = "Oracle defect class under ruling R3E-15 (node agrees with kda-indexer, kda-txs differs); added in run 3E-g."
 
 [[entry]]
@@ -375,6 +464,8 @@ route = "events"
 json_path_glob = "/~cwd-events-missing-node"
 condition = "any"
 reason = "chainweb-data lacks the events of whole height ranges (seen live 2026-11-11: no coin.TRANSFER event at heights 7392632-7392963, about 2.8 h of 2026-11-10, while its tip was at 7395650, so its /txs/events pages skip those heights). kda-indexer rows at a height above chainweb-data's lowest listed height where chainweb-data lists no row at all move here only when the node confirms every one: a user tx in the same block on /poll with an event of the same name and params, a coinbase row in the node's canonical block at its (chain, height). With both pages full, both sides are then cut at the higher of their lowest heights."
+status = "PROPOSED"
+ruling = "R3E-14 (run 3E-g)."
 owner_note = "Oracle defect class under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); added in run 3E-g. Triage sample: 22/22 user rows confirmed on /poll, 99/100 coinbase rows with the node's only header equal to kda-indexer's block (the 100th at a forked height, kda-indexer's block among the two)."
 
 [[entry]]
@@ -385,6 +476,8 @@ condition = "any"
 request_contains = "search="
 a_header = "x-search-truncated"
 reason = "kda-indexer cut its answer and said so with X-Search-Truncated: a `search=` with no literal run of 3 characters, or a window past search.max_scan_heights, runs the bounded newest-first scan (S-4) and stops at its height or time limit; on the index path the candidate cap or the time budget drops the oldest bodies. chainweb-data scans the whole window, so rows below the cut differ. An answer without the header is compared in full."
+status = "PROPOSED"
+ruling = "Plan Task 12 (S-4); R-P5P9-48 item 4 (X-Search-Truncated)."
 owner_note = "Plan Task 12 (S-4), like event-search-window."
 
 [[entry]]
@@ -393,6 +486,8 @@ route = "coins"
 json_path_glob = "/~coins-supply-tolerance"
 condition = "changed"
 reason = "Both sides compute the circulating supply at their own tip height; /coins is a text decimal that grows with every block, so the diff code moves a difference within the supply tolerance of the stats route (relative 1e-6, numeric) to this path, reported as a visible hit. A bigger difference stays a root diff and is unexplained, unless chainweb-data's tip lags and the coinbase minted over that gap covers it (oracle-tip-lag, R-P5P9-48)."
+status = "PROPOSED"
+ruling = "Plan Task 12; R-P5P9-10 #3; R-P5P9-48."
 owner_note = "Plan Task 12; same tolerance as stats-supply-tolerance."
 
 [[entry]]
@@ -402,6 +497,8 @@ json_path_glob = "/~graphql-r60-oracle-strips-quotes"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-60 rule (a), kind oracle_strips_quotes (cmd.nonce with inner quotes; CG-2 node = ours 3/3): our value decodes, one JSON string layer, to a string that contains a double quote, and the reference server's value is that string with every double quote removed. Any other pair stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-60."
 owner_note = "Controller ruling R-P5P9-60 (oracle defects normalised in the harness); only the listed fields."
 
 [[entry]]
@@ -411,6 +508,8 @@ json_path_glob = "/~graphql-r60-count-self-consistent"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-60 rule (a), kind count_self_consistent (Transactions-9e58b95d; CG-A2 node counts = ours 4/4): neither page is cut, the two edge sets match, our totalCount equals our edge count, and the reference server's totalCount is below its own edge count (an oracle count above its edges stays a diff, R-P5P9-60 round 2). Any other count difference stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-60."
 owner_note = "Controller ruling R-P5P9-60; only the listed root counts."
 
 [[entry]]
@@ -420,6 +519,8 @@ json_path_glob = "/~graphql-r60-scoped-list-finished"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block's transactions or events, a transaction's transfers or events) had its page cut on either side; the harness read that list to its end on both sides (at each target's own rate, at most 20 pages per list and list_page_budget pages per side and compare, with each row's key read so a row twice on one side leaves the list unfinished; R-P5P9-61 H6) and compared the full sets with their totalCount. A list whose cursor page fails (the oracle's Block.events) is read again once in one page of its totalCount (R-P5P9-64 I-5). A row only one side's full list holds stays a diff, and a list it could not finish keeps its cut pages and a /~graphql-h6-unfinished or /~harness-limit/ entry, which no entry matches, so the record stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-60 H2; R-P5P9-61 H6; R-P5P9-64 I-5/M-5/M-7."
 owner_note = "PROPOSED (rulings R-P5P9-60 H2, R-P5P9-61 H6 and R-P5P9-64 I-5/M-5/M-7; the FV preconditions flip it): the order within one block or tx is a contract choice (M2c, R3E-8)."
 
 [[entry]]
@@ -429,6 +530,8 @@ json_path_glob = "/~graphql-h7-window-referee"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-62 H7 (window referee; replaces R-P5P9-61 H5): a top-level list where the reference server orders by the transaction's creationTime and ours by block height (our contract, R-P5P9-62 sort key; R3E-8 within a height). Every row is accounted for: rows on both sides match by identity (request key, event or transfer index, block hash, chain, height; never by value alone or id text) and then compare with the ruled matchers; each oracle-only row is non-canonical on the node, a node-confirmed duplicate, or canonical below our lowest height or at it while our page is cut; each ours-only row is canonical on the node (outside the oracle's creationTime window, or an oracle gap); ours is in descending height order. Every one-sided row was read on the node (single-row reads); the entry carries the evidence and the read counts. A failed read, a spent cap or an undecidable identity leaves the record unexplained, and a row the node settles against ours shows as /~graphql-h7-row, which no entry matches."
+status = "PROPOSED"
+ruling = "R-P5P9-62."
 owner_note = "PROPOSED (ruling R-P5P9-62; the FV preconditions flip it): the oracle's creationTime order goes into the G4 package as a compat note for the owner."
 
 [[entry]]
@@ -438,6 +541,8 @@ json_path_glob = "/~graphql-h8-transfer-order-index"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-62 H8 (Transfer.orderIndex): ours numbers a transfer by its TRANSFER event's index in the transaction (node-consistent), the reference server by its rank among the transaction's TRANSFER events. For each request key, one read of our own transfers(requestKey) showed that every oracle value is exactly the rank of our transfer with the row's content; the oracle's rows then took our indexes (orderIndex and the index inside the Transfer id; the id's other fields stay the oracle's). Any other numbering stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-62."
 owner_note = "PROPOSED (ruling R-P5P9-62; the FV preconditions flip it): no kadscan document requests the field."
 
 [[entry]]
@@ -447,6 +552,8 @@ json_path_glob = "/~graphql-h9-creation-time-fraction"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-62 H9 (creationTime fraction, R-P5P9-58 watch item #55): at a field set to creation_time_half_even in [graphql] field_rules (transfers.creationTime, meta.creationTime), the reference server's time has a non-zero fraction of a second, ours has none, and ours equals the oracle's value rounded half to even to whole seconds (Pact's ParsedInteger). Whole-second differences and a fraction on our side stay unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-62."
 owner_note = "PROPOSED (ruling R-P5P9-62; the FV preconditions flip it): exact matcher."
 
 [[entry]]
@@ -456,4 +563,6 @@ json_path_glob = "/~graphql-r62-payload-data"
 condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-62 payload.data (rule (a), exact): ours sends the text \"null\" (the node's JSON null) and the reference server \"{}\" for the same request key, and the node's command for that key, read single-row (/poll, the header at its height, that block's payload), is a continuation whose cont.data is null. An exec payload, the reverse direction and a node cont.data that is not null stay unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-62."
 owner_note = "PROPOSED (ruling R-P5P9-62; the FV preconditions flip it): a G4 compat note; kadscan's detail page for such a transaction is to be checked on our backend."
