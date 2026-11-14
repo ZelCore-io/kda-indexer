@@ -523,7 +523,9 @@ fn snapshot_into(
 /// path (`ELOOP` anywhere in the cause chain; the open never follows it) fails the snapshot,
 /// since without the lock a swap already in progress could pair files from both sides. Any
 /// other cause (a read-only data dir where the lock file cannot be created, say) is logged and
-/// the step runs on without the lock: no writer can run there either.
+/// the step runs on without the lock. A writer that already holds the lock (or, after EACCES,
+/// one run as another user) can then swap meanwhile; that needs write access as the service
+/// user, and `segments check` on restore catches a mixed set (Review PRE-F M-3).
 fn lock_or_warn(r: anyhow::Result<fs::File>, doing: &str) -> anyhow::Result<Option<fs::File>> {
     match r {
         Ok(f) => Ok(Some(f)),
