@@ -2223,6 +2223,15 @@ pub(crate) struct Reads {
     chains: HashMap<String, Option<u8>>,
 }
 
+impl Reads {
+    /// R-P5P9-70 (m-1): drops the cached cut and the canonical entry at `(chain, h)`, so the
+    /// next [`Ctx::h7_canonical`] reads the node's current cut.
+    pub(crate) fn forget_cut(&mut self, chain: u8, h: u64) {
+        self.cut = None;
+        self.canonical.remove(&(chain, h));
+    }
+}
+
 fn entry(path: &str, a: Option<Value>, b: Option<Value>) -> DiffEntry {
     DiffEntry {
         path: path.into(),

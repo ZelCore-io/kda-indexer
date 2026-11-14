@@ -39,6 +39,9 @@ pub(super) struct NodeMock {
     /// `header/branch` answers this header at (chain, height) before any other rule (a
     /// canonical header the plain `/header` range does not hold).
     pub branch: HashMap<(u8, u64), Value>,
+    /// A tip that moves: the k-th cut read answers hashes `cut-<c>-<k>` at `tip + k - 1`, and
+    /// `header/branch` from that cut answers nothing above that height.
+    pub moving_cut: Option<Arc<Mutex<u64>>>,
     pub calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -73,8 +76,17 @@ async fn node_server(n: NodeMock) -> String {
         .route(
             "/chainweb/0.0/mainnet01/cut",
             get(|State(n): State<NodeMock>| async move {
+                let k = n.moving_cut.as_ref().map(|m| {
+                    let mut k = m.lock().unwrap();
+                    *k += 1;
+                    *k
+                });
+                let (tip, sfx) = match k {
+                    Some(k) => (n.tip + k - 1, format!("-{k}")),
+                    None => (n.tip, String::new()),
+                };
                 let hashes: serde_json::Map<String, Value> = (0..20u8)
-                    .map(|c| (c.to_string(), json!({"height": n.tip, "hash": format!("cut-{c}")})))
+                    .map(|c| (c.to_string(), json!({"height": tip, "hash": format!("cut-{c}{sfx}")})))
                     .collect();
                 Json(json!({"hashes": hashes, "height": n.tip * 20, "weight": "w"}))
             }),
@@ -85,13 +97,22 @@ async fn node_server(n: NodeMock) -> String {
                 move |State(n): State<NodeMock>,
                       Path(c): Path<u8>,
                       uri: Uri,
-                      Query(q): Query<HashMap<String, u64>>| async move {
+                      Query(q): Query<HashMap<String, u64>>,
+                      body: axum::body::Bytes| async move {
                     log(&n, &uri);
                     let (lo, hi) = (q["minheight"], q["maxheight"]);
+                    // A moving cut: the branch from the k-th cut tops at `tip + k - 1`.
+                    let body: Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let from_cut = n.moving_cut.as_ref().and_then(|_| {
+                        let u = body.pointer("/upper/0")?.as_str()?;
+                        let k: u64 = u.rsplit('-').next()?.parse().ok()?;
+                        Some(n.tip + k - 1)
+                    });
                     // The canonical header at each height: `canon`'s block (its stored
                     // header when `headers` holds it), else the only header stored there.
                     let items: Vec<Value> = (lo..=hi)
                         .filter(|h| n.branch_top.is_none_or(|top| *h <= top))
+                        .filter(|h| from_cut.is_none_or(|top| *h <= top))
                         .filter_map(|h| {
                             if let Some(x) = n.branch.get(&(c, h)) {
                                 return Some(x.clone());
@@ -4806,4 +4827,45 @@ async fn c5_a_literal_null_or_absent_first_keeps_the_short_page_check() {
             "{what}: {un:?} {note:?}"
         );
     }
+}
+
+/// R-P5P9-70 (m-1): N2 reads the cut per attempt, and a height above the cached cut (the tip
+/// moved since it was read) drops the cut and that height's entry once and reads again. Here
+/// the second read is one block past the first cut: the coinbase there is found.
+#[tokio::test]
+async fn c5_mined_at_rereads_the_cut_once_when_the_tip_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let cb = |to: &str| {
+        let v = json!({"result": {"status": "success"}, "events": [{"name": "TRANSFER",
+            "module": {"name": "coin", "namespace": null}, "params": ["", to, 0.9]}]});
+        json!({"coinbase": kdx_types::hash::b64url_encode(v.to_string().as_bytes())})
+    };
+    let cut = Arc::new(Mutex::new(0u64));
+    let mut node = NodeMock {
+        tip: 100,
+        moving_cut: Some(cut.clone()),
+        ..NodeMock::default()
+    };
+    for h in [100u64, 101] {
+        let ph = format!("p{h}");
+        node.headers.insert(
+            (0, h),
+            vec![json!({"hash": format!("h{h}"), "payloadHash": ph, "height": h, "chainId": 0})],
+        );
+        node.payloads.insert(ph, cb("k:miner"));
+    }
+    let (ctx, _) = setup(node, SideMock::default(), SideMock::default(), dir.path()).await;
+    // The run's own cut reads at setup do not count: the compare's first cut is at 100.
+    *cut.lock().unwrap() = 0;
+    let mut st = Reads::default();
+    assert!(ctx.mined_at(0, 100, "k:miner", &mut st).await);
+    // The tip moved to 101 after the cut was read: one re-read finds the block there.
+    assert!(
+        ctx.mined_at(0, 101, "k:miner", &mut st).await,
+        "a height above the cached cut re-reads the cut once"
+    );
+    assert_eq!(*cut.lock().unwrap(), 2, "one cut read more");
+    // Above the newest cut too: the re-read happens once, then the diff stays.
+    assert!(!ctx.mined_at(0, 105, "k:miner", &mut st).await);
+    assert_eq!(*cut.lock().unwrap(), 3, "one re-read per height, no loop");
 }

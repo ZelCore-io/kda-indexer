@@ -2136,8 +2136,9 @@ impl Ctx {
     /// N2 (R-P5P9-68 (7)): the canonical block comes from the node's cut branch, through H7's
     /// helper (R-P5P9-67 m-5), never the `/header` range by height, which also holds
     /// orphans. One cut read per compare (`st`), then one branch read and one payload read,
-    /// all within the compare's node read cap. A height above the cut, a failed read or the
-    /// cap leaves the diff.
+    /// all within the compare's node read cap. R-P5P9-70 (m-1): a height above the cached cut
+    /// (the tip moved since it was read) drops the cut and that height's entry once and reads
+    /// again; above the new cut too, a failed read or the cap leaves the diff.
     pub(crate) async fn mined_at(
         &self,
         chain: u8,
@@ -2145,8 +2146,16 @@ impl Ctx {
         account: &str,
         st: &mut crate::graphql_window::Reads,
     ) -> bool {
-        let Ok(Some(hd)) = self.h7_canonical(chain, h, st).await else {
-            return false;
+        let hd = match self.h7_canonical(chain, h, st).await {
+            Ok(Some(hd)) => hd,
+            Ok(None) => {
+                st.forget_cut(chain, h);
+                match self.h7_canonical(chain, h, st).await {
+                    Ok(Some(hd)) => hd,
+                    _ => return false,
+                }
+            }
+            Err(_) => return false,
         };
         let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
             return false;
@@ -2441,10 +2450,11 @@ impl Ctx {
             .to_string();
         let mut last: Vec<DiffEntry> = Vec::new();
         let mut skews: Vec<DiffEntry> = Vec::new();
-        // The node reads of `mined_at` (N2): one cut per compare, capped like H7's.
-        let mut n2_reads = crate::graphql_window::Reads::default();
         let mut floats = false;
         for attempt in 0..2 {
+            // The node reads of `mined_at` (N2): one cut per attempt (R-P5P9-70 m-1: the
+            // retry reads the moved tip), capped like H7's.
+            let mut n2_reads = crate::graphql_window::Reads::default();
             skews.clear();
             floats = false;
             let data = match self.gql_a_data(ta, op, vars).await {
