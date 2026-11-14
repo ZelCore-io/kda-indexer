@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use super::Ctx;
 use crate::config::CompareConfig;
 use crate::gen::{Origin, Request};
+use crate::graphql_window::Reads;
 
 /// The node: every chain's cut at `tip`, the canonical hash per (chain, height) and the block
 /// `/poll` puts each request key in. Every path asked is logged.
@@ -35,6 +36,9 @@ pub(super) struct NodeMock {
     pub poll_fail: bool,
     /// `header/branch` answers nothing above this height (a height above the node's cut).
     pub branch_top: Option<u64>,
+    /// `header/branch` answers this header at (chain, height) before any other rule (a
+    /// canonical header the plain `/header` range does not hold).
+    pub branch: HashMap<(u8, u64), Value>,
     pub calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -89,6 +93,9 @@ async fn node_server(n: NodeMock) -> String {
                     let items: Vec<Value> = (lo..=hi)
                         .filter(|h| n.branch_top.is_none_or(|top| *h <= top))
                         .filter_map(|h| {
+                            if let Some(x) = n.branch.get(&(c, h)) {
+                                return Some(x.clone());
+                            }
                             let stored = n.headers.get(&(c, h)).cloned().unwrap_or_default();
                             match n.canon.get(&(c, h)) {
                                 Some(x) => Some(
@@ -903,8 +910,9 @@ max_height = 6400000
     assert_eq!(after, calls.len(), "no node read past the cap");
 }
 
-/// N2: the one-block skew accepts a coinbase only from a lone header at the height; a fork
-/// there (the plain header range returns orphans too) leaves the diff.
+/// N2: the one-block skew accepts a coinbase only from the canonical block at the height. A
+/// fork the cut's branch does not settle (the mock's branch answers no header where two are
+/// stored and none is `canon`) leaves the diff.
 #[tokio::test]
 async fn n2_mined_at_needs_a_single_header_at_the_height() {
     let dir = tempfile::tempdir().unwrap();
@@ -921,10 +929,73 @@ async fn n2_mined_at_needs_a_single_header_at_the_height() {
     node.payloads.insert("p1".into(), cb("k:miner"));
     node.payloads.insert("p2".into(), cb("k:miner"));
     let (ctx, _) = setup(node, SideMock::default(), SideMock::default(), dir.path()).await;
-    assert!(ctx.mined_at(0, 100, "k:miner").await);
-    assert!(!ctx.mined_at(0, 100, "k:other").await);
+    assert!(ctx.mined_at(0, 100, "k:miner", &mut Reads::default()).await);
+    assert!(!ctx.mined_at(0, 100, "k:other", &mut Reads::default()).await);
     // Two headers at the height: a fork, even though both coinbases pay the miner.
-    assert!(!ctx.mined_at(1, 100, "k:miner").await);
+    assert!(!ctx.mined_at(1, 100, "k:miner", &mut Reads::default()).await);
+}
+
+/// R-P5P9-68 (7): N2's `mined_at` takes the canonical block from the cut's branch (the H7
+/// helper, R-P5P9-67 m-5), never the `/header` range by height, which holds orphans too.
+#[tokio::test]
+async fn c4_mined_at_takes_the_canonical_block_from_the_cuts_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let cb = |to: &str| {
+        let v = json!({"result": {"status": "success"}, "events": [{"name": "TRANSFER",
+            "module": {"name": "coin", "namespace": null}, "params": ["", to, 0.9]}]});
+        json!({"coinbase": kdx_types::hash::b64url_encode(v.to_string().as_bytes())})
+    };
+    let hd = |h: &str, p: &str, at: u64, c: u8| json!({"hash": h, "payloadHash": p, "height": at, "chainId": c});
+    let mut node = NodeMock {
+        tip: 200,
+        branch_top: Some(120),
+        ..NodeMock::default()
+    };
+    // Chain 2: the range holds only an orphan, whose coinbase pays the miner; the cut's
+    // branch holds the canonical block, whose coinbase pays another account.
+    node.headers
+        .insert((2, 100), vec![hd("orphan2", "po2", 100, 2)]);
+    node.branch.insert((2, 100), hd("canon2", "pc2", 100, 2));
+    node.payloads.insert("po2".into(), cb("k:miner"));
+    node.payloads.insert("pc2".into(), cb("k:other"));
+    // Chain 3: a fork in the range; the cut's branch names the block that pays the miner.
+    node.headers.insert(
+        (3, 100),
+        vec![hd("orphan3", "po3", 100, 3), hd("canon3", "pc3", 100, 3)],
+    );
+    node.canon.insert((3, 100), "canon3".into());
+    node.payloads.insert("po3".into(), cb("k:other"));
+    node.payloads.insert("pc3".into(), cb("k:miner"));
+    // Chain 4: one header at a height above the cut (the branch holds none there).
+    node.headers
+        .insert((4, 150), vec![hd("above4", "pa4", 150, 4)]);
+    node.payloads.insert("pa4".into(), cb("k:miner"));
+    let (ctx, calls) = setup(node, SideMock::default(), SideMock::default(), dir.path()).await;
+    assert!(
+        !ctx.mined_at(2, 100, "k:miner", &mut Reads::default()).await,
+        "an orphan at the height is not taken as canonical"
+    );
+    assert!(
+        ctx.mined_at(2, 100, "k:other", &mut Reads::default()).await,
+        "the canonical block's coinbase"
+    );
+    assert!(
+        ctx.mined_at(3, 100, "k:miner", &mut Reads::default()).await,
+        "the branch settles a fork"
+    );
+    assert!(!ctx.mined_at(3, 100, "k:other", &mut Reads::default()).await);
+    assert!(
+        !ctx.mined_at(4, 150, "k:miner", &mut Reads::default()).await,
+        "above the cut: not settled"
+    );
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("header/branch")),
+        "the canonical block is read through the cut's branch"
+    );
 }
 
 /// R3: a request key whose copy in our data is at height 0 (genesis keys repeat across

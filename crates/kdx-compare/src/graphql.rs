@@ -2131,31 +2131,30 @@ impl Ctx {
             .min()
     }
 
-    /// Whether the node's block(s) at `(chain, h)` carry a coinbase that paid `account`
-    /// (R-P5P9-58: the one-block skew needs the balance to have changed at `h`). Header range
-    /// at one height (any fork) and that block's payload; at most 3 blocks.
-    pub(crate) async fn mined_at(&self, chain: u8, h: u64, account: &str) -> bool {
-        let Ok(page) = self.node.headers(chain, h, h, Some(3), None).await else {
+    /// Whether the node's canonical block at `(chain, h)` carries a coinbase that paid
+    /// `account` (R-P5P9-58: the one-block skew needs the balance to have changed at `h`).
+    /// N2 (R-P5P9-68 (7)): the canonical block comes from the node's cut branch, through H7's
+    /// helper (R-P5P9-67 m-5), never the `/header` range by height, which also holds
+    /// orphans. One cut read per compare (`st`), then one branch read and one payload read,
+    /// all within the compare's node read cap. A height above the cut, a failed read or the
+    /// cap leaves the diff.
+    pub(crate) async fn mined_at(
+        &self,
+        chain: u8,
+        h: u64,
+        account: &str,
+        st: &mut crate::graphql_window::Reads,
+    ) -> bool {
+        let Ok(Some(hd)) = self.h7_canonical(chain, h, st).await else {
             return false;
         };
-        self.count_request(ROW_RULE_ROUTE, "node", 1);
-        // N2: the range also returns orphans. More than one header means a fork at `h`, and
-        // the coinbase could be the orphan's: leave the diff.
-        if page.items.len() != 1 {
+        let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
             return false;
+        };
+        match self.h7_payload(chain, ph, st).await {
+            Ok(p) => crate::graphql_norm::coinbase_pays(&p, account),
+            Err(_) => false,
         }
-        for hd in page.items {
-            let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
-                continue;
-            };
-            self.count_request(ROW_RULE_ROUTE, "node", 1);
-            if let Ok(p) = self.node.payload_with_outputs(chain, ph).await {
-                if crate::graphql_norm::coinbase_pays(&p, account) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2442,6 +2441,8 @@ impl Ctx {
             .to_string();
         let mut last: Vec<DiffEntry> = Vec::new();
         let mut skews: Vec<DiffEntry> = Vec::new();
+        // The node reads of `mined_at` (N2): one cut per compare, capped like H7's.
+        let mut n2_reads = crate::graphql_window::Reads::default();
         let mut floats = false;
         for attempt in 0..2 {
             skews.clear();
@@ -2509,7 +2510,7 @@ impl Ctx {
                     } else if match (ours, reward) {
                         (Some(x), Some(rw)) => {
                             crate::graphql_norm::one_block_skew(x, &det.balance, rw)
-                                && self.mined_at(chain, node_h, &account).await
+                                && self.mined_at(chain, node_h, &account, &mut n2_reads).await
                         }
                         _ => false,
                     } {

@@ -2106,7 +2106,7 @@ impl Ctx {
     /// R-P5P9-67 m-5: the node's canonical header at `(chain, h)`, on the branch of the
     /// node's cut (read once per compare); `None` when the branch holds none there (above
     /// the cut). Never the `/header` range by height, which also holds orphans.
-    async fn h7_canonical(
+    pub(crate) async fn h7_canonical(
         &self,
         chain: u8,
         h: u64,
@@ -2173,7 +2173,12 @@ impl Ctx {
         r
     }
 
-    async fn h7_payload(&self, chain: u8, ph: &str, st: &mut Reads) -> Result<Value, String> {
+    pub(crate) async fn h7_payload(
+        &self,
+        chain: u8,
+        ph: &str,
+        st: &mut Reads,
+    ) -> Result<Value, String> {
         if let Some(v) = st.payloads.get(ph) {
             return v.clone();
         }
