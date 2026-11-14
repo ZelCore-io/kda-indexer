@@ -1596,6 +1596,21 @@ impl Ctx {
         if !more(&ca) || !more(&cb) {
             return None;
         }
+        // The same rows on both pages: only their order differs, which the order rules
+        // decide; no node read.
+        let set = |c: &Value| {
+            let mut s: Vec<String> = c["edges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(crate::graphql_cut::row_text)
+                .collect();
+            s.sort();
+            s
+        };
+        if set(&ca) == set(&cb) {
+            return None;
+        }
         let mut cache: HashMap<(u8, String), Option<Value>> = HashMap::new();
         let mut reads = 0usize;
         // Every row's height; a row that selects none takes the node's, when the node puts

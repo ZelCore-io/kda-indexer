@@ -1321,6 +1321,23 @@ async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
     )
     .await;
     assert!(explained(&d), "{d:?}");
+    // The same rows on both pages, in another order: the order rules decide, no node read.
+    let before = calls.lock().unwrap().len();
+    let d = run(
+        page(vec![
+            by_block("t1", "B1"),
+            by_block("t2", "B2"),
+            by_block("t3", "B2"),
+        ]),
+        page(vec![
+            by_block("t3", "B2"),
+            by_block("t1", "B1"),
+            by_block("t2", "B2"),
+        ]),
+    )
+    .await;
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(calls.lock().unwrap().len(), before);
     // A node failure: the CG-3 shape stays a diff.
     let failing = gql_ctx(
         NodeMock {
