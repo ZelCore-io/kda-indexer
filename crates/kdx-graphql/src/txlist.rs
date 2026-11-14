@@ -13,8 +13,8 @@
 //!   it, inside the same tx when the tx has more rows (R-P5P9-62, `through_tx`). The cursor
 //!   format (version 1) did not change with that fix, only the resume: a cursor issued before
 //!   it decodes as before and now resumes at its row (before, a frozen tx's remaining rows were
-//!   skipped); a damaged or foreign cursor is refused with `invalid cursor`, one whose block
-//!   was reorged away with `cursor invalidated by reorg`.
+//!   skipped); a damaged cursor or a block-list cursor is refused with `invalid cursor`, one
+//!   whose block was reorged away with `cursor invalidated by reorg`.
 //! - One page is one store read (GQ-5): the records, their blocks, outputs and, when the
 //!   operation selects it, the other half of each cross-chain transfer are loaded in that
 //!   read; nested fields then answer from owned data. No `View` crosses an `.await`. A list
