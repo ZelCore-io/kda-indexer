@@ -7,7 +7,8 @@
 //!   the wire form its field needs (`BigInt::text`, `BigInt::number`);
 //! - `DateTime`: `YYYY-MM-DDTHH:MM:SS.mmmZ` (JavaScript `toISOString`);
 //! - `Decimal`: a JSON number carrying the exact decimal text (no float rounding); the oracle
-//!   sends `Transfer.amount` and `Block.nonce` as strings (`Decimal::into_text`).
+//!   sends `Transfer.amount`, `Block.nonce` and `Block.flags` as strings
+//!   (`Decimal::into_text`).
 
 use std::borrow::Cow;
 use std::str::FromStr;
