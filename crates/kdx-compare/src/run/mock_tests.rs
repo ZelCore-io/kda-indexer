@@ -29,6 +29,10 @@ pub(super) struct NodeMock {
     /// (orphans included), and `payload/<hash>/outputs` answers by payload hash.
     pub headers: HashMap<(u8, u64), Vec<Value>>,
     pub payloads: HashMap<String, Value>,
+    /// Whole `/poll` entries by request key (chain, entry), for reads that need the height
+    /// and events; `poll_fail`: every `/poll` answers 500.
+    pub polls: HashMap<String, (u8, Value)>,
+    pub poll_fail: bool,
     pub calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -121,9 +125,19 @@ async fn node_server(n: NodeMock) -> String {
                       uri: Uri,
                       Json(body): Json<Value>| async move {
                     log(&n, &uri);
+                    let keys = body["requestKeys"].as_array().map_or(0, Vec::len);
+                    n.calls.lock().unwrap().push(format!("poll {c} {keys}"));
+                    if n.poll_fail {
+                        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
                     let mut out = serde_json::Map::new();
                     for rk in body["requestKeys"].as_array().into_iter().flatten() {
                         let rk = rk.as_str().unwrap_or_default();
+                        if let Some((pc, v)) = n.polls.get(rk) {
+                            if *pc == c {
+                                out.insert(rk.into(), v.clone());
+                            }
+                        }
                         if let Some((pc, bh)) = n.poll.get(rk) {
                             if *pc == c {
                                 out.insert(
@@ -133,7 +147,7 @@ async fn node_server(n: NodeMock) -> String {
                             }
                         }
                     }
-                    Json(Value::Object(out))
+                    Json(Value::Object(out)).into_response()
                 },
             ),
         )
@@ -1072,4 +1086,236 @@ rate_rps = 1000.0
     .await;
     assert_eq!((n, d), (0, vec![]));
     assert_eq!(*ca.lock().unwrap(), before);
+}
+
+/// A context for direct GraphQL oracle-pair checks against `node` (the targets are not read).
+async fn gql_ctx(node: NodeMock, out: &std::path::Path) -> Ctx {
+    let nu = node_server(node).await;
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = "no-such-dir"
+[targets.a]
+url = "http://127.0.0.1:9/graphql"
+kind = "kda_indexer_graphql"
+[targets.b]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+max_height = 7000000
+"#
+    ))
+    .unwrap();
+    Ctx::new(cfg).await.unwrap()
+}
+
+/// R-P5P9-61 H5: a top-level list cut on both sides at a height boundary is explained only
+/// when the rows above the boundary match, the boundary counts hold and the node settles
+/// every boundary row with a single-row `/poll`; the evidence is in the record. A swap above
+/// the boundary, a boundary row the node calls not canonical, unequal boundary counts and a
+/// node failure each stay a diff.
+#[tokio::test]
+async fn h5_boundary_cut_is_explained_only_with_node_evidence() {
+    use crate::graphql::{compare_answers_with, Answer};
+    use crate::graphql_cut::BOUNDARY_CUT_PATH;
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock {
+        tip: 7_000_000,
+        ..NodeMock::default()
+    };
+    // The node's canonical transfers: request key -> (block, height, receiver).
+    let canon = [
+        ("t1", "B1", 101, "r"),
+        ("t2", "B2", 100, "r"),
+        ("t3", "B2", 100, "r"),
+        ("t4", "B2", 100, "r"),
+        ("t6", "B1", 101, "r"),
+        ("t7", "B3", 99, "r"),
+        ("w1", "B2", 100, "k:miner-a"),
+        ("w2", "B2", 100, "k:miner-a"),
+    ];
+    for (rk, b, h, to) in canon {
+        node.polls.insert(
+            rk.into(),
+            (
+                0,
+                json!({"reqKey": rk, "metaData": {"blockHash": b, "blockHeight": h},
+                    "events": [{"name": "TRANSFER", "params": ["s", to, 1.5]}]}),
+            ),
+        );
+    }
+    let calls = node.calls.clone();
+    let ctx = gql_ctx(node.clone(), dir.path()).await;
+    // QTransfersByAccount's rows: a block hash, no height (the node gives it).
+    let by_block = |rk: &str, b: &str| {
+        json!({"cursor": "c", "node": {"id": format!("{b}/{rk}"), "amount": "1.5",
+            "senderAccount": "s", "receiverAccount": "r", "chainId": 0, "blockHash": b,
+            "requestKey": rk}})
+    };
+    // Transfers-825fa035's rows: a height, no block hash (the node's TRANSFER decides).
+    let by_height = |rk: &str, h: u64, to: &str| {
+        json!({"cursor": "c", "node": {"amount": 1.5, "senderAccount": "s",
+            "receiverAccount": to, "block": {"chainId": "0", "height": h}, "requestKey": rk}})
+    };
+    let page = |edges: Vec<Value>| Answer {
+        body: json!({"data": {"transfers": {"totalCount": 40,
+            "pageInfo": {"hasNextPage": true}, "edges": edges}}}),
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    };
+    let ctx = &ctx;
+    let run = |mut a: Answer, mut b: Answer| async move {
+        let cut = ctx.gql_boundary_cut(&mut a, &mut b, 7_000_000, false).await;
+        let mut d = compare_answers_with(&mut a, &mut b, 7_000_000, 10_000, &[], false);
+        d.extend(cut);
+        d
+    };
+    let explained = |d: &[crate::report::DiffEntry]| {
+        d.iter().any(|e| e.path == BOUNDARY_CUT_PATH) && d.iter().all(|e| e.path.starts_with("/~"))
+    };
+    let stays_diff = |d: &[crate::report::DiffEntry]| {
+        !d.iter().any(|e| e.path == BOUNDARY_CUT_PATH)
+            && d.iter().any(|e| !e.path.starts_with("/~"))
+    };
+    // The CG-3 shape (QTransfersByAccount): the same row above the boundary, each side a
+    // different canonical subset of the boundary height.
+    let polls_before = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("poll"))
+        .count();
+    let d = run(
+        page(vec![
+            by_block("t1", "B1"),
+            by_block("t2", "B2"),
+            by_block("t3", "B2"),
+        ]),
+        page(vec![
+            by_block("t1", "B1"),
+            by_block("t2", "B2"),
+            by_block("t4", "B2"),
+        ]),
+    )
+    .await;
+    assert!(explained(&d), "{d:?}");
+    let ev = d.iter().find(|e| e.path == BOUNDARY_CUT_PATH).unwrap();
+    let (ea, eb) = (ev.a.clone().unwrap(), ev.b.clone().unwrap());
+    assert_eq!(
+        (ea["height"].clone(), ea["rows"].clone()),
+        (json!(100), json!(2))
+    );
+    assert_eq!(
+        (eb["orphans"].clone(), eb["gaps"].clone()),
+        (json!(0), json!(0))
+    );
+    assert!(
+        ea["node"].to_string().contains("\"t3\"") && eb["node"].to_string().contains("canonical")
+    );
+    // Single-row reads only: one /poll per (chain, request key), cached across the steps.
+    let polls: Vec<String> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("poll"))
+        .cloned()
+        .collect();
+    assert_eq!(polls.len() - polls_before, 4, "{polls:?}");
+    assert!(polls.iter().all(|c| c.ends_with(" 1")), "{polls:?}");
+    // The whole page at one height (Transfers-825fa035; the trailing-tie rule never cuts it).
+    let d = run(
+        page(vec![by_height("t2", 100, "r"), by_height("t3", 100, "r")]),
+        page(vec![by_height("t4", 100, "r"), by_height("t2", 100, "r")]),
+    )
+    .await;
+    assert!(explained(&d), "{d:?}");
+    // A swap above the boundary (t1 against the canonical t6 at 101): a diff.
+    let d = run(
+        page(vec![
+            by_block("t1", "B1"),
+            by_block("t2", "B2"),
+            by_block("t3", "B2"),
+        ]),
+        page(vec![
+            by_block("t6", "B1"),
+            by_block("t2", "B2"),
+            by_block("t3", "B2"),
+        ]),
+    )
+    .await;
+    assert!(stays_diff(&d), "{d:?}");
+    // A boundary row of ours the node calls not canonical (w1 paid another receiver): a diff.
+    let d = run(
+        page(vec![
+            by_height("t2", 100, "r"),
+            by_height("w1", 100, "k:miner-b"),
+        ]),
+        page(vec![
+            by_height("t2", 100, "r"),
+            by_height("w1", 100, "k:miner-a"),
+        ]),
+    )
+    .await;
+    assert!(stays_diff(&d), "{d:?}");
+    // Unequal boundary counts: ours' boundary set (100) is complete on its page, the oracle
+    // shows one canonical row there and two orphan copies (w1, w2 paid to another miner).
+    let d = run(
+        page(vec![
+            by_height("t1", 101, "r"),
+            by_height("t2", 100, "r"),
+            by_height("t3", 100, "r"),
+            by_height("t7", 99, "r"),
+        ]),
+        page(vec![
+            by_height("t1", 101, "r"),
+            by_height("t2", 100, "r"),
+            by_height("w1", 100, "k:miner-b"),
+            by_height("w2", 100, "k:miner-b"),
+        ]),
+    )
+    .await;
+    assert!(stays_diff(&d), "{d:?}");
+    // ...while one orphan copy taking the oracle's last slot is explained (counts 2 = 3 - 1).
+    let d = run(
+        page(vec![
+            by_height("t1", 101, "r"),
+            by_height("t2", 100, "r"),
+            by_height("t3", 100, "r"),
+            by_height("t7", 99, "r"),
+        ]),
+        page(vec![
+            by_height("t1", 101, "r"),
+            by_height("t3", 100, "r"),
+            by_height("t2", 100, "r"),
+            by_height("w1", 100, "k:miner-b"),
+        ]),
+    )
+    .await;
+    assert!(explained(&d), "{d:?}");
+    // A node failure: the CG-3 shape stays a diff.
+    let failing = gql_ctx(
+        NodeMock {
+            poll_fail: true,
+            ..node
+        },
+        dir.path(),
+    )
+    .await;
+    let mut a = page(vec![by_height("t2", 100, "r"), by_height("t3", 100, "r")]);
+    let mut b = page(vec![by_height("t4", 100, "r"), by_height("t2", 100, "r")]);
+    let cut = failing
+        .gql_boundary_cut(&mut a, &mut b, 7_000_000, false)
+        .await;
+    assert!(cut.is_none());
+    let d = compare_answers_with(&mut a, &mut b, 7_000_000, 10_000, &[], false);
+    assert!(stays_diff(&d), "{d:?}");
 }

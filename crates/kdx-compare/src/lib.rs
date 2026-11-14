@@ -6,6 +6,7 @@ pub mod config;
 pub mod diff;
 pub mod gen;
 pub mod graphql;
+pub mod graphql_cut;
 pub mod graphql_norm;
 pub mod graphql_scope;
 pub mod graphql_ws;

@@ -58,6 +58,8 @@ const ROW_RULE_CHECKS: usize = 3;
 const ROW_RULE_ROUTE: &str = "graphql-row-rule";
 /// Summary route of the harness's own nested-list reads (R-P5P9-60 H2).
 const SCOPED_LIST_ROUTE: &str = "graphql-scoped-list";
+/// Route name of the H5 node reads (R-P5P9-61).
+const BOUNDARY_ROUTE: &str = "graphql-boundary-cut";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
@@ -1304,6 +1306,10 @@ impl Ctx {
         {
             row_hits.push(crate::graphql_scope::SCOPED_FINISHED_PATH);
         }
+        // R-P5P9-61 H5: a top-level list cut at a height boundary, settled on the node.
+        let boundary = self
+            .gql_boundary_cut(&mut a, &mut b, max, root_scoped)
+            .await;
         let mut d = compare_answers_with(
             &mut a,
             &mut b,
@@ -1312,6 +1318,7 @@ impl Ctx {
             &self.cfg.graphql.field_rules,
             root_scoped,
         );
+        d.extend(boundary);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
             path: p.into(),
             kind: DiffKind::Changed,
@@ -1500,6 +1507,146 @@ impl Ctx {
         }
         hits.dedup();
         hits
+    }
+
+    /// R-P5P9-61 H5 (ruling (2), [`crate::graphql_cut`]): when both pages of a top-level
+    /// list are cut, the rows' heights (the node's, for rows that select none), the boundary
+    /// plan and single-row `/poll` verdicts on every boundary row decide. When ruling (2)'s
+    /// conditions hold, the rows at and below the boundary leave both pages and the visible
+    /// hit carries the node evidence; otherwise nothing changes and the difference stays.
+    /// Rows above the oracle's ceiling `max` are left to the stall rule.
+    pub(crate) async fn gql_boundary_cut(
+        &self,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        root_scoped: bool,
+    ) -> Option<DiffEntry> {
+        use crate::graphql_cut::{
+            canon_verdict, explains, plan, row_ref, Canon, Rows, BOUNDARY_CUT_PATH,
+        };
+        if root_scoped {
+            return None;
+        }
+        let conn = |ans: &mut Answer| ans.body.get_mut("data").and_then(root_connection).cloned();
+        let (ca, cb) = (conn(a)?, conn(b)?);
+        let more = |c: &Value| c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(true));
+        if !more(&ca) || !more(&cb) {
+            return None;
+        }
+        let mut cache: HashMap<(u8, String), Option<Value>> = HashMap::new();
+        let mut reads = 0usize;
+        // Every row's height; a row that selects none takes the node's, when the node puts
+        // its request key in the row's block.
+        let mut heights: [Vec<u64>; 2] = Default::default();
+        for (hs, c) in heights.iter_mut().zip([&ca, &cb]) {
+            for e in c.get("edges")?.as_array()? {
+                let r = row_ref(e);
+                let h = match r.height {
+                    Some(h) => h,
+                    None => {
+                        let p = self.h5_poll(&r, &mut cache, &mut reads).await?;
+                        match canon_verdict(e, &r, p.as_ref()) {
+                            (Canon::Yes, Some(h)) => h,
+                            _ => return None,
+                        }
+                    }
+                };
+                hs.push(h);
+            }
+        }
+        let rows = |c: &Value, hs: &[u64]| -> Rows {
+            c["edges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .zip(hs)
+                .filter(|(_, h)| **h <= max)
+                .map(|(e, h)| (*h, e.clone()))
+                .collect()
+        };
+        let p = plan(&rows(&ca, &heights[0]), &rows(&cb, &heights[1])).ok()?;
+        // (iii): one verdict per boundary row of either side.
+        let mut verdicts: [Vec<Canon>; 2] = Default::default();
+        let mut evidence: [Vec<Value>; 2] = Default::default();
+        for (side, list) in [&p.a, &p.b].into_iter().enumerate() {
+            for e in list {
+                let r = row_ref(e);
+                let polled = self.h5_poll(&r, &mut cache, &mut reads).await;
+                let entry = polled.clone().flatten();
+                let (v, _) = match &polled {
+                    Some(x) => canon_verdict(e, &r, x.as_ref()),
+                    None => (Canon::Unknown, None),
+                };
+                verdicts[side].push(v);
+                evidence[side].push(json!({
+                    "chain": r.chain, "requestKey": r.rk, "block": r.block, "height": p.height,
+                    "node": v.as_str(),
+                    "nodeBlock": entry.as_ref().and_then(|x| x.pointer("/metaData/blockHash")),
+                    "nodeHeight": entry.as_ref().and_then(|x| x.pointer("/metaData/blockHeight")),
+                }));
+            }
+        }
+        let (orphans, gaps) = match explains(&p, &verdicts[0], &verdicts[1]) {
+            Ok(x) => x,
+            Err(why) => {
+                tracing::debug!(why, height = p.height, "H5 boundary cut not explained");
+                return None;
+            }
+        };
+        for (ans, hs) in [(a, &heights[0]), (b, &heights[1])] {
+            if let Some(e) = ans
+                .body
+                .get_mut("data")
+                .and_then(root_connection)
+                .and_then(|c| c.get_mut("edges"))
+                .and_then(Value::as_array_mut)
+            {
+                let mut keep = hs.iter().map(|h| *h > p.height);
+                e.retain(|_| keep.next().unwrap_or(true));
+            }
+        }
+        let [ea, eb] = evidence;
+        Some(DiffEntry {
+            path: BOUNDARY_CUT_PATH.into(),
+            kind: DiffKind::Changed,
+            a: Some(
+                json!({"height": p.height, "rows": p.a.len(), "complete": p.a_complete,
+                "node": ea}),
+            ),
+            b: Some(
+                json!({"height": p.height, "rows": p.b.len(), "complete": p.b_complete,
+                "orphans": orphans, "gaps": gaps, "nodeReads": reads, "node": eb}),
+            ),
+        })
+    }
+
+    /// One single-row `/poll` of H5, cached per (chain, request key). `None` when the row has
+    /// no chain or request key, or past [`crate::graphql_cut::NODE_CHECKS`] reads; otherwise
+    /// the node's entry, `None` inside when the read failed or the node lacks the key.
+    async fn h5_poll(
+        &self,
+        r: &crate::graphql_cut::RowRef,
+        cache: &mut HashMap<(u8, String), Option<Value>>,
+        reads: &mut usize,
+    ) -> Option<Option<Value>> {
+        let key = (r.chain?, r.rk.clone()?);
+        if let Some(v) = cache.get(&key) {
+            return Some(v.clone());
+        }
+        if *reads >= crate::graphql_cut::NODE_CHECKS {
+            return None;
+        }
+        *reads += 1;
+        self.count_request(BOUNDARY_ROUTE, "node", 1);
+        let v = self
+            .node
+            .poll(key.0, std::slice::from_ref(&key.1))
+            .await
+            .ok()
+            .and_then(|m| m.get(&key.1).cloned());
+        cache.insert(key, v.clone());
+        Some(v)
     }
 
     /// `oracle_orphan_dupes` on the root connection `root`: for each request key the oracle

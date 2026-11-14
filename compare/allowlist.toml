@@ -412,3 +412,12 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block's transactions or events, a transaction's transfers or events) had its page cut on either side; the harness read that list to its end on both sides (at each target's own rate, at most 20 pages) and compared the full sets. A row only one side's full list holds stays a diff, and a list it could not finish stays as it was."
 owner_note = "Controller ruling R-P5P9-60 (H2); the order within one block or tx is a contract choice (M2c, R3E-8)."
+
+[[entry]]
+id = "graphql-h5-boundary-cut"
+route = "other"
+json_path_glob = "/~graphql-h5-boundary-cut"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-61 H5 (ruling (2)): a top-level list in descending height order, cut on both sides at a height boundary. The rows at every height above the boundary match as multisets; at the boundary both sides hold the same number of rows once node-confirmed oracle orphan copies are removed and node-confirmed oracle gaps added back; and every boundary row of either side was checked on the node with a single-row /poll (ours all canonical). The boundary rows leave both pages; the entry carries the node evidence. Anything the node cannot settle stays a diff."
+owner_note = "Controller ruling R-P5P9-61 (2), extending R3E-8: only the order within the boundary height is excused."
