@@ -174,6 +174,11 @@ pub enum FieldRuleKind {
     /// parse as decimals, they parse to the same f64, and ours has at least as many
     /// significant digits as the oracle's.
     OracleF64Rounded,
+    /// R-P5P9-62 H9 (`creationTime` fraction, the tx's Pact `ParsedInteger`): the oracle's
+    /// time has a non-zero fraction of a second, ours has none (or zeros only), and ours is
+    /// the oracle's rounded half to even to whole seconds. Whole-second differences, and a
+    /// fraction on our side, stay diffs. Visible hit `/~graphql-h9-creation-time-fraction`.
+    CreationTimeHalfEven,
 }
 
 impl FieldRuleKind {
