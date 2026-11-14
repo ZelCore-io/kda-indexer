@@ -486,10 +486,22 @@ pub fn rebuild_due(
 /// Census, projection (`auto`, or `fallback` with no threshold), pass 1, hot pass, then
 /// `search.new/` replaces `search/`. `hot` is the caller's environment (`run` shares its own).
 pub fn rebuild(o: &BuildOpts, hot: &HotStore) -> Result<RebuildReport> {
+    rebuild_with(o, hot, &mut || {})
+}
+
+/// [`rebuild`], calling `after_census` between the census and pass 1 (P6 I-1: the end-to-end
+/// test commits a recurring body there, as the tail does during a long pass 1).
+#[doc(hidden)]
+pub fn rebuild_with(
+    o: &BuildOpts,
+    hot: &HotStore,
+    after_census: &mut dyn FnMut(),
+) -> Result<RebuildReport> {
     let t0 = Instant::now();
     let _lock = lock(&o.data_dir)?;
     let seg = open_segments(&o.data_dir)?;
     let c = distinct_code_keys(&seg, hot)?;
+    after_census();
     tracing::info!(
         distinct = c.len(),
         ranges = seg.ranges.len(),

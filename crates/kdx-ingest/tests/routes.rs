@@ -18,6 +18,7 @@ use common::*;
 use kdx_api::compat::SearchSettings;
 use kdx_api::search::SearchCtx;
 use kdx_api::{Api, ApiSettings, Store, TipWatch};
+use kdx_hot::Txn;
 use kdx_types::hash::b64url_decode;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -46,6 +47,12 @@ fn store_from(
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path(), 10_000, 10_000, 10);
     apply_linear(&ctx, pool, places, 4);
+    let state = api_state(dir.path(), &ctx);
+    (dir, state, ctx)
+}
+
+/// The API state over the store of `ctx` in `dir`.
+fn api_state(dir: &std::path::Path, ctx: &kdx_ingest::Ctx) -> Arc<kdx_api::ApiState> {
     // The meta the ingest context writes at start: the network and the chain graph give the
     // store its genesis heights.
     let mut w = ctx.hot.rw().unwrap();
@@ -54,7 +61,7 @@ fn store_from(
     w.set_meta(kdx_hot::env::meta::CHAIN_GRAPH, b"[[0,[0]]]")
         .unwrap();
     w.commit().unwrap();
-    let store = Arc::new(Store::open(ctx.hot.clone(), dir.path()).unwrap());
+    let store = Arc::new(Store::open(ctx.hot.clone(), dir).unwrap());
     let settings = ApiSettings {
         network: "mainnet01".into(),
         deadline: Duration::from_secs(10),
@@ -68,8 +75,7 @@ fn store_from(
         ready_max_lag: 10,
         max_event_lists: 64,
     };
-    let api = Api::new(store, settings, TipWatch::default());
-    (dir, api.state(), ctx)
+    Api::new(store, settings, TipWatch::default()).state()
 }
 
 /// Both routers over `state`, with `search` as the search context.
@@ -327,5 +333,156 @@ async fn s3_cont_txs_are_listed_by_pactid_and_never_matched_by_search() {
         for (rk, _) in conts {
             assert!(!got.iter().any(|g| g == rk), "{pat} matched cont tx {rk}");
         }
+    }
+}
+
+/// The request key and code of the first `exec` tx of pool block `i` (decoded here from the
+/// captured payload).
+fn first_exec(pool: &[Value], i: usize) -> Option<(String, String)> {
+    for t in pool[i]["payload"]["transactions"].as_array()? {
+        let raw = b64url_decode(t[0].as_str()?).ok()?;
+        let tx: Value = serde_json::from_slice(&raw).ok()?;
+        let cmd: Value = serde_json::from_str(tx["cmd"].as_str()?).ok()?;
+        if let Some(code) = cmd["payload"]["exec"]["code"].as_str() {
+            return Some((tx["hash"].as_str()?.to_owned(), code.to_owned()));
+        }
+    }
+    None
+}
+
+/// A search pattern for pool block `i`'s first exec tx, taken from `ids`: the block, its
+/// request key and the longest run of its code that a query string carries unescaped.
+fn exec_pattern(pool: &[Value], ids: std::ops::Range<usize>) -> (usize, String, String) {
+    ids.filter_map(|i| {
+        let (rk, code) = first_exec(pool, i)?;
+        let pat: String = code
+            .split(|c: char| !(c.is_ascii_alphanumeric() || "._:-".contains(c)))
+            .max_by_key(|s| s.len())?
+            .chars()
+            .take(60)
+            .collect();
+        (pat.len() >= 8).then_some((i, rk, pat))
+    })
+    .next()
+    .expect("a pool block with an exec tx")
+}
+
+/// P6 I-1 and I-2 end to end, through the tail, the freezer, the search stage and the routes.
+///
+/// - I-1: a body recurs in a hot block between the rebuild's census and its pass 1, so its
+///   doc keeps the census `last_h`. After freezes move the hot floor above the recurrence,
+///   `/txs/search?search=` still lists the recurring tx (readers expand from
+///   `rebuilt_through_height + 1`, the census frontier, not from pass 1's checkpoint).
+/// - I-2: the running stage holds buffered docs when a rebuild (as `search rebuild` beside
+///   `run`) swaps a new index in; its next commit writes nothing into the new index, which
+///   still opens and serves native `/search/code` afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_stage_end_to_end_recurrence_after_freeze_and_swap() {
+    let pool = pool();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().to_path_buf();
+    // Steps of 4 heights, finality 2: the freezer moves the frontier while the tail runs.
+    let ctx = Arc::new(ctx(&data, 4, 1000, 2));
+    let freeze = |ctx: &kdx_ingest::Ctx| while kdx_ingest::freezer::tick(ctx).unwrap().is_some() {};
+    apply_linear(
+        &ctx,
+        &pool,
+        &branch(&(0..8).collect::<Vec<_>>(), 0, 0, 0),
+        4,
+    );
+    freeze(&ctx);
+    let state = api_state(&data, &ctx);
+    // The recurring body: pool block r, first at height r (hot at the census, 4..8).
+    let (r, rk, pat) = exec_pattern(&pool, 4..8);
+    let bo = kdx_search::BuildOpts {
+        data_dir: data.clone(),
+        mode: kdx_search::ModeSel::Full,
+        threads: 1,
+        heap_mb: 64,
+        trial_docs: 0,
+        stop: Default::default(),
+    };
+    let first = kdx_search::build::rebuild_with(&bo, &ctx.hot, &mut || {
+        // The tail meanwhile: block r again at height 8, then 9..12.
+        let mut ids = vec![r];
+        ids.extend(9..12);
+        apply_linear(&ctx, &pool, &branch(&ids, 8, 0, 0), 4);
+    })
+    .unwrap();
+    assert!(
+        first.manifest.built_through_height >= 8,
+        "{:?}",
+        first.manifest
+    );
+    // The stage tails the index; commits only when stopped (its buffer stays pending).
+    let stop = tokio_util::sync::CancellationToken::new();
+    // A failed assertion stops the stage too (the runtime waits for its blocking thread).
+    let _stop_on_panic = stop.clone().drop_guard();
+    let so = kdx_ingest::search_stage::SearchStageOpts {
+        data_dir: data.clone(),
+        mode: kdx_search::ModeSel::Full,
+        commit_secs: 3600,
+        build_threads: 1,
+        heap_mb: 64,
+        rebuild_every_secs: 0,
+        rebuild_window_heights: 0,
+    };
+    let stage = tokio::spawn(kdx_ingest::search_stage::run(ctx.clone(), so, stop.clone()));
+    apply_linear(
+        &ctx,
+        &pool,
+        &branch(&(12..20).collect::<Vec<_>>(), 12, 0, 0),
+        4,
+    );
+    freeze(&ctx);
+    let frontier = ctx.hot.ro().unwrap().frozen_frontier().unwrap();
+    assert!(frontier > 8, "frontier {frontier}");
+    let sdir = kdx_search::search_dir(&data);
+    let served = || Served {
+        _dir: tempfile::tempdir().unwrap(),
+        app: routers(
+            &state,
+            SearchCtx::new(SearchSettings::default(), Some(sdir.clone())),
+        ),
+    };
+    let s = served();
+    let (st, body) = get(&s, &format!("/txs/search?search={pat}&limit=250")).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let rows: Vec<Value> = serde_json::from_str(&body).unwrap();
+    let heights: Vec<u64> = rows
+        .iter()
+        .filter(|t| t["requestKey"] == rk.as_str())
+        .map(|t| t["height"].as_u64().unwrap())
+        .collect();
+    assert!(
+        heights.contains(&8),
+        "I-1: the recurrence at 8 (frozen below {frontier}) is missing: {heights:?} for {pat}"
+    );
+    assert!(heights.contains(&(r as u64)), "{heights:?}");
+    // I-2: new bodies reach the stage's buffer; then a rebuild swaps a new index in, at
+    // least a second after the first (`built_at` is in seconds), and the stage stops.
+    apply_linear(
+        &ctx,
+        &pool,
+        &branch(&(20..24).collect::<Vec<_>>(), 20, 0, 0),
+        4,
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let second = kdx_search::rebuild(&bo, &ctx.hot).unwrap();
+    assert_ne!(second.manifest.built_at, first.manifest.built_at);
+    stop.cancel();
+    stage.await.unwrap().unwrap();
+    let m = kdx_search::SearchManifest::load(&sdir).unwrap().unwrap();
+    assert_eq!(m.built_at, second.manifest.built_at);
+    let (_, _, new_pat) = exec_pattern(&pool, 20..24);
+    let s = served();
+    for q in [new_pat.as_str(), pat.as_str()] {
+        let (st, body) = get(&s, &format!("/api/v1/search/code?q={q}&limit=5")).await;
+        assert_eq!(st, StatusCode::OK, "I-2: {q}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            !v["items"].as_array().unwrap().is_empty(),
+            "I-2: {q}: {body}"
+        );
     }
 }
