@@ -1029,15 +1029,17 @@ rate_rps = 1000.0
     .await;
     assert_eq!((n, d.clone()), (1, vec![]), "{d:?}");
     assert_eq!((*ca.lock().unwrap(), *cb.lock().unwrap()), (4, 4));
-    // Block M: ours' full list lacks T7, a real difference: finished, and it stays a diff.
+    // Block M: ours' full list lacks T7, a real difference: both pages claim 7 (so the count
+    // does not differ), ours finishes to 6 rows, and the missing row stays a diff in the edges.
     let (n, d) = run(
-        page(Some("M"), 6, &[1, 2, 3, 4, 5]),
+        page(Some("M"), 7, &[1, 2, 3, 4, 5]),
         page(Some("M"), 7, &[1, 2, 3, 4, 5]),
     )
     .await;
     assert_eq!(n, 1);
     assert!(
-        d.iter().any(|p| p.starts_with("/data/block/transactions")),
+        d.iter()
+            .any(|p| p.starts_with("/data/block/transactions/edges")),
         "{d:?}"
     );
     // Block L: past MAX_PAGES pages: not finished; the cut pages stay a diff.

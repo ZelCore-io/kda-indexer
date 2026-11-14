@@ -476,13 +476,48 @@ pub fn hash_query(doc: &str, root: &str) -> Option<String> {
         return None;
     }
     let set = op_set(&t)?;
-    let defs = t[..set]
-        .iter()
-        .position(|x| x.0 == Tok::Punct(b'('))
-        .and_then(|o| Some(&doc[t[o].1..t[closing(&t, o)?].2]))
-        .unwrap_or("");
+    let defs_open = t[..set].iter().position(|x| x.0 == Tok::Punct(b'('));
     let f = find_in_set(&t, set, root)?;
     let args = f.args.map_or("", |(o, c)| &doc[t[o].1..t[c].2]);
+    // Only the variable definitions the root field's arguments use: the document's other
+    // variables belong to the nested selection that this read drops, and an unused definition
+    // is an invalid document (the "All Variables Used" rule) on both servers.
+    let used: Vec<&str> = f.args.map_or_else(Vec::new, |(o, c)| {
+        (o..c)
+            .filter(|&i| t[i].0 == Tok::Punct(b'$'))
+            .filter_map(|i| match t.get(i + 1) {
+                Some((Tok::Name(n), _, _)) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    });
+    let mut kept: Vec<&str> = Vec::new();
+    if let Some(o) = defs_open {
+        let c = closing(&t, o)?;
+        let mut depth = 0usize;
+        let mut starts: Vec<usize> = Vec::new();
+        for (i, (k, _, _)) in t.iter().enumerate().take(c).skip(o + 1) {
+            match k {
+                Tok::Punct(b'(' | b'[' | b'{') => depth += 1,
+                Tok::Punct(b')' | b']' | b'}') => depth = depth.saturating_sub(1),
+                Tok::Punct(b'$') if depth == 0 => starts.push(i),
+                _ => {}
+            }
+        }
+        for (n, &s) in starts.iter().enumerate() {
+            let last = starts.get(n + 1).map_or(c, |&e| e) - 1;
+            if let Some((Tok::Name(name), _, _)) = t.get(s + 1) {
+                if used.contains(name) {
+                    kept.push(&doc[t[s].1..t[last].2]);
+                }
+            }
+        }
+    }
+    let defs = if kept.is_empty() {
+        String::new()
+    } else {
+        format!("({})", kept.join(", "))
+    };
     Some(format!(
         "query{defs} {{ {root}{args} {{ edges {{ node {{ hash }} }} }} }}"
     ))
@@ -718,14 +753,77 @@ mod tests {
         assert!(list_query(QBLOCK, &none).is_none());
     }
 
+    /// The "All Variables Used" validation rule, on a built query: every `$x` it defines is
+    /// also used (a `$x` that is not followed by `:` is a use, a definition is `$x: Type`).
+    fn assert_all_variables_used(q: &str) {
+        let t = lex(q).unwrap();
+        let name_at = |i: usize| match t.get(i + 1) {
+            Some((Tok::Name(n), _, _)) => Some(*n),
+            _ => None,
+        };
+        let var_ixs: Vec<usize> = (0..t.len())
+            .filter(|&i| t[i].0 == Tok::Punct(b'$') && name_at(i).is_some())
+            .collect();
+        let is_def = |i: usize| matches!(t.get(i + 2), Some((Tok::Punct(b':'), _, _)));
+        for &i in var_ixs.iter().filter(|&&i| is_def(i)) {
+            let n = name_at(i).unwrap();
+            assert!(
+                var_ixs.iter().any(|&j| !is_def(j) && name_at(j) == Some(n)),
+                "${n} is defined and not used in: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn built_queries_define_only_variables_they_use() {
+        for parent in [Parent::Block("B".into()), Parent::Tx("RK".into())] {
+            let (path, doc) = match parent {
+                Parent::Block(_) => (&["block", "transactions"][..], QBLOCK),
+                Parent::Tx(_) => (
+                    &["transaction", "result", "events"][..],
+                    "query($rk: String!, $x: Int) { transaction(requestKey: $rk) { result { ... on TransactionResult { events(first: 5) { totalCount edges { node { id } } } } } } }",
+                ),
+            };
+            let list = ScopedList {
+                pointer: String::new(),
+                doc_path: path.iter().map(|s| s.to_string()).collect(),
+                parent: Some(parent),
+            };
+            let (q, _, _) = list_query(doc, &list).unwrap();
+            assert_all_variables_used(&q);
+        }
+        assert_all_variables_used("query QBlock($hash: String!) { block(hash: $hash) { id } }");
+        // The helper itself rejects an unused definition (the old hash query's text).
+        let bad = std::panic::catch_unwind(|| {
+            assert_all_variables_used(
+                "query($a: Int, $first: Int) { f(a: $a) { edges { node { hash } } } }",
+            )
+        });
+        assert!(bad.is_err());
+    }
+
     #[test]
     fn hash_reads_reissue_the_root_block_list() {
         let doc = "query blockTransactions($startHeight: Int!, $endHeight: Int, $chainIds: [String!], $first: Int, $after: String) { blocksFromHeight(startHeight: $startHeight, endHeight: $endHeight, chainIds: $chainIds) { edges { node { transactions(first: $first, after: $after) { totalCount edges { node { result { ... on TransactionResult { gas } } } } pageInfo { endCursor hasNextPage } } } } } }";
         let q = hash_query(doc, "blocksFromHeight").unwrap();
+        // `$first` and `$after` belong to the nested `transactions(...)` this read drops, so
+        // they are not defined (an unused definition is an invalid document on both servers).
         assert_eq!(
             q,
-            "query($startHeight: Int!, $endHeight: Int, $chainIds: [String!], $first: Int, $after: String) { blocksFromHeight(startHeight: $startHeight, endHeight: $endHeight, chainIds: $chainIds) { edges { node { hash } } } }"
+            "query($startHeight: Int!, $endHeight: Int, $chainIds: [String!]) { blocksFromHeight(startHeight: $startHeight, endHeight: $endHeight, chainIds: $chainIds) { edges { node { hash } } } }"
         );
+        assert_all_variables_used(&q);
+        // A root with no variable in its arguments gets no definition group at all.
+        let inline = doc.replace(
+            "blocksFromHeight(startHeight: $startHeight, endHeight: $endHeight, chainIds: $chainIds)",
+            "blocksFromHeight(startHeight: 1)",
+        );
+        let q = hash_query(&inline, "blocksFromHeight").unwrap();
+        assert_eq!(
+            q,
+            "query { blocksFromHeight(startHeight: 1) { edges { node { hash } } } }"
+        );
+        assert_all_variables_used(&q);
         assert!(hash_query(doc, "transactions").is_none());
         assert!(hash_query(
             &format!("{doc} fragment F on Block {{ hash }}"),

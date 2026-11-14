@@ -3124,30 +3124,50 @@ mod tests {
         );
         assert!(d.iter().all(|e| e.path != PAGE_CUT_PATH));
         // An account-scoped root list is not scoped: order differences across rows stay.
-        let acct = |ids: &[&str]| {
-            json!({"data": {"transfers": {"edges": ids.iter().enumerate()
-            .map(|(h, i)| json!({"node": {"id": i, "height": h}})).collect::<Vec<_>>(),
+        let acct = |ids: &[(&str, u32)]| {
+            json!({"data": {"transfers": {"edges": ids.iter()
+            .map(|(i, h)| json!({"node": {"id": i, "height": h}})).collect::<Vec<_>>(),
             "pageInfo": {"hasNextPage": false}}}})
         };
-        assert!(!cmp(acct(&["b", "a"]), acct(&["a", "b"]), false).is_empty());
+        // The same (id, height) rows in two orders: a set compare would call them equal.
+        assert!(!cmp(
+            acct(&[("a", 1), ("b", 0)]),
+            acct(&[("b", 0), ("a", 1)]),
+            false
+        )
+        .is_empty());
         // The count rule's visible hit through the compare.
         let r = [FieldRule::new(
             "transactions.totalCount",
             FieldRuleKind::CountSelfConsistent,
         )];
-        let counted = |n: u64| {
+        let counted = |n: u64, ids: &[&str]| {
             json!({"data": {"transactions": {"totalCount": n,
-            "edges": rows(&["a"]), "pageInfo": {"hasNextPage": false}}}})
+            "edges": rows(ids), "pageInfo": {"hasNextPage": false}}}})
         };
+        // The oracle's count below its own edges (ours 4 of 4): explained.
+        let ids = ["a", "b", "c", "d"];
         let d = compare_answers(
-            &mut ans(counted(1)),
-            &mut ans(counted(3)),
+            &mut ans(counted(4, &ids)),
+            &mut ans(counted(1, &ids)),
             u64::MAX,
             10_000,
             &r,
         );
         let paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, [crate::graphql_norm::COUNT_SELF_CONSISTENT_PATH]);
+        // The oracle's count above its own edges (ours 1 of 1 against 3) stays a diff.
+        let d = compare_answers(
+            &mut ans(counted(1, &["a"])),
+            &mut ans(counted(3, &["a"])),
+            u64::MAX,
+            10_000,
+            &r,
+        );
+        assert!(
+            d.iter().any(|e| e.path == "/data/transactions/totalCount"),
+            "{d:?}"
+        );
     }
 
     #[test]

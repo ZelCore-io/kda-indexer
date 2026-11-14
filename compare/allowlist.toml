@@ -401,7 +401,7 @@ route = "other"
 json_path_glob = "/~graphql-r60-count-self-consistent"
 condition = "any"
 request_contains = "graphql:"
-reason = "R-P5P9-60 rule (a), kind count_self_consistent (Transactions-9e58b95d; CG-A2 node counts = ours 4/4): neither page is cut, the two edge sets match, our totalCount equals our edge count, and the reference server's totalCount differs from its own edge count. Any other count difference stays unexplained."
+reason = "R-P5P9-60 rule (a), kind count_self_consistent (Transactions-9e58b95d; CG-A2 node counts = ours 4/4): neither page is cut, the two edge sets match, our totalCount equals our edge count, and the reference server's totalCount is below its own edge count (an oracle count above its edges stays a diff, R-P5P9-60 round 2). Any other count difference stays unexplained."
 owner_note = "Controller ruling R-P5P9-60; only the listed root counts."
 
 [[entry]]

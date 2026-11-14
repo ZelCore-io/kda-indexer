@@ -159,13 +159,15 @@ pub enum FieldRuleKind {
     OracleStripsQuotes,
     /// R-P5P9-60 count self-consistency; `field` is `<root>.totalCount` of a root connection.
     /// Explains the count only when neither side's page is cut, the two edge sets match,
-    /// ours' count equals its own edge count and the oracle's count differs from its own.
+    /// ours' count equals its own edge count and the oracle's count is below its own edge count
+    /// (an oracle count above its edges stays a diff).
     /// Visible hit `/~graphql-r60-count-self-consistent`.
     CountSelfConsistent,
     /// R-P5P9-60 amendment (`transfers.amount`): the oracle sends some amounts as
     /// f64-rounded strings, ours is the exact Pact decimal. Explains only when the two
-    /// strings differ, both parse as decimals, they parse to the same f64, and ours has at
-    /// least as many significant digits as the oracle's.
+    /// strings differ as exact decimals (`1.0` against `1` is a format diff and stays), both
+    /// parse as decimals, they parse to the same f64, and ours has at least as many
+    /// significant digits as the oracle's.
     OracleF64Rounded,
 }
 

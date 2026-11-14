@@ -242,7 +242,7 @@ pub fn rule_explains(
                     t.parse::<f64>(),
                 ) {
                     (Some(x), Some(y), Ok(p), Ok(q)) => {
-                        p.is_finite() && p == q && x.1.len() >= y.1.len()
+                        x != y && p.is_finite() && p == q && x.1.len() >= y.1.len()
                     }
                     _ => false,
                 }
@@ -293,8 +293,9 @@ pub fn count_flag_applies(raw: &Value) -> bool {
 /// oracle's): for each `count_self_consistent` rule `<root>.totalCount`, the oracle's count
 /// takes ours only when neither page is cut (`pageInfo.hasNextPage` false and
 /// `hasPreviousPage` not true on both), the two edge sets match, ours' count equals its own
-/// edge count and the oracle's count differs from its own. Returns whether any count was
-/// explained.
+/// edge count and the oracle's count is below its own edge count (the refereed direction:
+/// CG-A2's node = ours 4/4 against the oracle's 1). An oracle count above its edges stays a
+/// diff, since ours may be the one that undercounts. Returns whether any count was explained.
 pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> bool {
     let whole = |c: &Value| {
         c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(false))
@@ -324,7 +325,7 @@ pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> b
         else {
             continue;
         };
-        if whole(ca) && whole(cb) && ea == eb && na == ea.len() as u64 && nb != eb.len() as u64 {
+        if whole(ca) && whole(cb) && ea == eb && na == ea.len() as u64 && nb < eb.len() as u64 {
             if let Some(n) = b.pointer_mut(&format!("{ptr}/totalCount")) {
                 *n = Value::from(na);
                 hit = true;
@@ -1106,15 +1107,22 @@ mod tests {
             (hit, b["data"]["transactions"]["totalCount"].clone())
         };
         let ids = ["g", "p", "e", "P"];
-        // The CG-2 classes: ours 4 of 4 against the oracle's 1 over the same 4 rows, and
-        // ours 1 of 1 against its 3 over the same row.
+        // The CG-2 class: ours 4 of 4 against the oracle's 1 over the same 4 rows (the node
+        // agrees with ours), where the oracle's count is below its own edge count.
         assert_eq!(
             run(conn(4, &ids, false), conn(1, &ids, false)),
             (true, json!(4))
         );
+        // The oracle's count above its own edges stays a diff (ours may undercount): ours 1 of 1
+        // against the oracle's 3 over the same row, and ours 0 of 0 against the oracle's 0 rows
+        // with a count of 3.
         assert_eq!(
             run(conn(1, &["l"], false), conn(3, &["l"], false)),
-            (true, json!(1))
+            (false, json!(3))
+        );
+        assert_eq!(
+            run(conn(0, &[], false), conn(3, &[], false)),
+            (false, json!(3))
         );
         // Neighbours stay: a cut page on either side, other rows, ours' own count off, the
         // oracle's count matching its rows (then ours is the odd one), and another root.
@@ -1213,6 +1221,11 @@ mod tests {
             e(p, &s("540796.439262685228"), &s("540796.4392626852")),
             Some(FIELD_PATH)
         );
+        // Equal values in another text form (trailing zeros) are a format diff, not rounding.
+        assert_eq!(e(p, &s("1.0"), &s("1")), None);
+        assert_eq!(e(p, &s("1"), &s("1.0")), None);
+        assert_eq!(e(p, &s("2.50"), &s("2.5")), None);
+        assert_eq!(e(p, &s("2.5"), &s("2.50")), None);
         // A real 1-unit-in-the-last-place difference on a small amount stays a diff.
         assert_eq!(e(p, &s("1.000000000001"), &s("1.000000000002")), None);
         assert_eq!(e(p, &s("0.000001"), &s("0.000002")), None);
