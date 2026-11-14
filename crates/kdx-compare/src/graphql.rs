@@ -1346,8 +1346,9 @@ impl Ctx {
         self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d, note)
     }
 
-    /// R-P5P9-62: the node-refereed rules on an oracle pair's two answers after the fetch
-    /// and the row rules: H7 (the window referee) and the diff with the ruled matchers.
+    /// R-P5P9-62: the refereed rules on an oracle pair's two answers after the fetch and the
+    /// row rules: H8 (`Transfer.orderIndex`), H7 (the window referee) and the diff with the
+    /// ruled matchers.
     /// Returns the diff entries and H7's note. Shared by the live compare and
     /// `kda-compare referee`.
     pub(crate) async fn gql_settle(
@@ -1359,6 +1360,8 @@ impl Ctx {
         max: u64,
         root_scoped: bool,
     ) -> (Vec<DiffEntry>, Option<String>) {
+        // H8 first: the oracle's transfer rows take our indexes, so H7 matches them.
+        let h8 = self.gql_transfer_order(ta, a, b).await;
         let (h7, note) = self.gql_window_referee(ta, a, b, max, root_scoped).await;
         let mut d = compare_answers_with(
             a,
@@ -1368,6 +1371,7 @@ impl Ctx {
             &self.cfg.graphql.field_rules,
             root_scoped,
         );
+        d.extend(h8);
         d.extend(h7);
         (d, note)
     }

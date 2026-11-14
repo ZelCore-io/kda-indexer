@@ -1110,6 +1110,11 @@ rate_rps = 1000.0
 
 /// A context for direct GraphQL oracle-pair checks against `node` (the targets are not read).
 async fn gql_ctx(node: NodeMock, out: &std::path::Path) -> Ctx {
+    gql_ctx_at(node, out, "http://127.0.0.1:9/graphql").await
+}
+
+/// [`gql_ctx`] with ours (A) at `a_url`.
+async fn gql_ctx_at(node: NodeMock, out: &std::path::Path, a_url: &str) -> Ctx {
     let nu = node_server(node).await;
     let allow =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
@@ -1125,7 +1130,7 @@ timeout_ms = 5000
 [graphql]
 own_ops_dir = "no-such-dir"
 [targets.a]
-url = "http://127.0.0.1:9/graphql"
+url = "{a_url}"
 kind = "kda_indexer_graphql"
 [targets.b]
 url = "https://oracle.invalid/graphql"
@@ -1607,6 +1612,114 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
         .await;
     assert!(stays_diff(&d) && hit(&d).is_none(), "{d:?}");
     assert!(note.unwrap_or_default().contains("did not settle"));
+}
+
+/// Ours (A) as a GraphQL mock: `transfers(requestKey: $k)` answers the full list in
+/// `transfers` under that key; anything else answers no data.
+async fn ours_transfers_server(transfers: Value) -> String {
+    let app = Router::new().route(
+        "/graphql",
+        post(move |Json(req): Json<Value>| {
+            let transfers = transfers.clone();
+            async move {
+                let q = req["query"].as_str().unwrap_or("");
+                let k = req["variables"]["k"].as_str().unwrap_or("");
+                Json(if q.contains("transfers(requestKey") {
+                    let edges: Vec<Value> = transfers[k]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|n| json!({"node": n}))
+                        .collect();
+                    json!({"data": {"transfers": {"pageInfo": {"hasNextPage": false},
+                        "edges": edges}}})
+                } else {
+                    json!({"data": null})
+                })
+            }
+        }),
+    );
+    format!("{}graphql", serve(app).await)
+}
+
+/// R-P5P9-62 H8 (`Transfer.orderIndex`): ours numbers a transfer by its TRANSFER event's
+/// index in the transaction, the oracle by its rank among the transaction's TRANSFER events.
+/// Explained only when, for the request key, every oracle value is the rank of the transfer
+/// with its content among ours (one read of our own `transfers(requestKey)`); the `Transfer`
+/// id that embeds the value is settled by the same check. Ours 0, 1, 2, 5 against the
+/// oracle's 0, 1, 2, 3 is explained; the oracle's 0, 1, 3, 2 and a transfer ours lacks stay
+/// diffs.
+#[tokio::test]
+async fn h8_transfer_order_index_is_the_rank_of_ours() {
+    use crate::graphql_window::ORDER_INDEX_PATH;
+    let dir = tempfile::tempdir().unwrap();
+    let xfer = |idx: i64, amount: &str| {
+        let id = crate::graphql::base64_std(
+            format!("Transfer:[\"B9\",\"0\",\"{idx}\",\"mh\",\"u1\"]").as_bytes(),
+        );
+        json!({"id": id, "amount": amount, "creationTime": "2024-01-01T10:00:00Z",
+            "orderIndex": idx, "senderAccount": "s", "receiverAccount": "r",
+            "moduleName": "coin", "chainId": "0", "blockHash": "B9", "requestKey": "u1"})
+    };
+    let page = |rows: &[(i64, &str)]| {
+        h7_page(
+            "transfers",
+            false,
+            rows.iter()
+                .map(|(i, a)| json!({"cursor": "c", "node": xfer(*i, a)}))
+                .collect(),
+        )
+    };
+    let ours = [(0, "1.0"), (1, "2.0"), (2, "3.0"), (5, "4.0")];
+    let full = |rows: &[(i64, &str)]| -> Value {
+        json!({"u1": rows.iter().map(|(i, a)| xfer(*i, a)).collect::<Vec<_>>()})
+    };
+    let a_url = ours_transfers_server(full(&ours)).await;
+    let ctx = gql_ctx_at(NodeMock::default(), dir.path(), &a_url).await;
+    let mut vars = serde_json::Map::new();
+    vars.insert("requestKey".into(), json!("u1"));
+    let settle = |mut a: crate::graphql::Answer, mut b: crate::graphql::Answer| {
+        let (ctx, vars) = (&ctx, &vars);
+        async move {
+            ctx.gql_settle(&ctx.targets["a"], vars, &mut a, &mut b, 7_000_000, true)
+                .await
+                .0
+        }
+    };
+    let only_hits = |d: &[crate::report::DiffEntry]| d.iter().all(|e| e.path.starts_with("/~"));
+    // Ours 0, 1, 2, 5; the oracle's 0, 1, 2, 3 (the ranks): explained, ids included.
+    let d = settle(
+        page(&ours),
+        page(&[(0, "1.0"), (1, "2.0"), (2, "3.0"), (3, "4.0")]),
+    )
+    .await;
+    assert!(only_hits(&d), "{d:?}");
+    let hit = d
+        .iter()
+        .find(|e| e.path == ORDER_INDEX_PATH)
+        .expect("H8 hit");
+    assert!(
+        hit.b.as_ref().unwrap().to_string().contains("u1"),
+        "{hit:?}"
+    );
+    // The oracle's 0, 1, 3, 2: its 3 sits on the transfer ranked 2: a diff.
+    let d = settle(
+        page(&ours),
+        page(&[(0, "1.0"), (1, "2.0"), (3, "3.0"), (2, "4.0")]),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    assert!(d.iter().all(|e| e.path != ORDER_INDEX_PATH), "{d:?}");
+    // A transfer ours lacks (ours 0, 1, 5; the oracle's 0, 1, 2, 3): a diff.
+    let a_url = ours_transfers_server(full(&[(0, "1.0"), (1, "2.0"), (5, "4.0")])).await;
+    let short = gql_ctx_at(NodeMock::default(), dir.path(), &a_url).await;
+    let mut a = page(&[(0, "1.0"), (1, "2.0"), (5, "4.0")]);
+    let mut b = page(&[(0, "1.0"), (1, "2.0"), (2, "3.0"), (3, "4.0")]);
+    let (d, _) = short
+        .gql_settle(&short.targets["a"], &vars, &mut a, &mut b, 7_000_000, true)
+        .await;
+    assert!(!only_hits(&d), "{d:?}");
+    assert!(d.iter().all(|e| e.path != ORDER_INDEX_PATH), "{d:?}");
 }
 
 /// R-P5P9-61 H6 (ruling (3)): the nested `transactions` of large blocks (BlocksByHeight: no

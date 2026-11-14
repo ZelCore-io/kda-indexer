@@ -45,6 +45,9 @@ pub const ROW_PATH: &str = "/~graphql-h7-row";
 pub const ALIGN_KEY: &str = "kdxH7";
 /// Node reads per compare at most (single-row reads, both sides together).
 pub const NODE_READS: usize = 100;
+/// Visible hit of H8 (allowlist id `graphql-h8-transfer-order-index`); it carries the
+/// evidence per request key.
+pub const ORDER_INDEX_PATH: &str = "/~graphql-h8-transfer-order-index";
 const ROUTE: &str = "graphql-window-referee";
 
 fn text(v: &Value) -> Option<String> {
@@ -1108,6 +1111,196 @@ impl Ctx {
         self.gql_read(ta, q, json!({ "k": rk }))
             .await
             .and_then(|d| parse(d.pointer("/transaction/cmd/meta/chainId")))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-62 H8: `Transfer.orderIndex`
+
+/// Request keys H8 reads (one read of ours each) per compare at most.
+pub const ORDER_INDEX_READS: usize = 20;
+
+/// Whether two transfer rows hold the same transfer: every field both select is equal
+/// (the amount by value, or the oracle's f64-rounded form).
+pub fn same_transfer(x: &Value, y: &Value) -> bool {
+    let s = |n: &Value, k: &str| n.get(k).and_then(text);
+    [
+        "senderAccount",
+        "receiverAccount",
+        "moduleName",
+        "chainId",
+        "requestKey",
+    ]
+    .iter()
+    .all(|k| match (s(x, k), s(y, k)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }) && match (x.get("amount"), y.get("amount")) {
+        (Some(a), Some(b)) => same_amount(a, b),
+        _ => true,
+    }
+}
+
+/// H8 on one request key. `ours`: our transaction's transfers (their indexes, which are
+/// TRANSFER event indexes, and rows), from our own `transfers(requestKey)`; `oracle`: the
+/// oracle's rows of that key with their values. Returns (the oracle's value, our index)
+/// per oracle row when each value is the rank, among our indexes, of the transfer with the
+/// row's content; else why not.
+pub fn rank_map(
+    ours: &[(i64, Value)],
+    oracle: &[(i64, &Value)],
+) -> Result<Vec<(i64, i64)>, String> {
+    let mut idx: Vec<&(i64, Value)> = ours.iter().collect();
+    idx.sort_by_key(|x| x.0);
+    let mut out = Vec::new();
+    for (r, row) in oracle {
+        let Some((i, mine)) = usize::try_from(*r).ok().and_then(|u| idx.get(u).copied()) else {
+            return Err(format!(
+                "the oracle's {r} is past our {} transfers",
+                idx.len()
+            ));
+        };
+        if !same_transfer(row, mine) {
+            return Err(format!(
+                "the oracle's {r} is not the rank of our transfer with its content"
+            ));
+        }
+        out.push((*r, *i));
+    }
+    Ok(out)
+}
+
+/// The same JSON type as `like`: a string for a string, else a number.
+fn like(like: &Value, i: i64) -> Value {
+    match like {
+        Value::String(_) => json!(i.to_string()),
+        _ => json!(i),
+    }
+}
+
+/// Puts our index `i` in an oracle transfer row: its `orderIndex` and the index inside its
+/// relay id (the other id fields stay the oracle's, so a difference there still shows).
+pub fn reindex_transfer(node: &mut Value, i: i64) {
+    if let Some(o) = node.get_mut("orderIndex") {
+        *o = like(o, i);
+    }
+    let Some((t, k)) = node.get("id").and_then(Value::as_str).and_then(decode_id) else {
+        return;
+    };
+    let Ok(mut parts) = serde_json::from_str::<Vec<Value>>(&k) else {
+        return;
+    };
+    if t == "Transfer" && parts.len() == 5 {
+        parts[2] = like(&parts[2], i);
+        let id = format!("Transfer:{}", Value::Array(parts));
+        node["id"] = json!(crate::graphql::base64_std(id.as_bytes()));
+    }
+}
+
+impl Ctx {
+    /// R-P5P9-62 H8 on the root list of an oracle pair: for each request key with an oracle
+    /// transfer row that ours does not hold at the same identity with the same content (at
+    /// most [`ORDER_INDEX_READS`]), one read of our own `transfers(requestKey)`. When every
+    /// oracle value of that key is the rank of our transfer with its content, the oracle's
+    /// rows take our indexes (`orderIndex` and the relay id); the hit lists each key's
+    /// indexes. Anything else leaves the rows as they were.
+    pub(crate) async fn gql_transfer_order(
+        &self,
+        ta: &Target,
+        a: &Answer,
+        b: &mut Answer,
+    ) -> Option<DiffEntry> {
+        let mut da = a.body.get("data")?.clone();
+        let ca = crate::graphql::root_connection(&mut da)?;
+        let transfer = |e: &Value| {
+            let id = row_id(e);
+            (id.kind == Some(Kind::Transfer) && id.index.is_some()).then_some(id)
+        };
+        let ours: HashMap<String, Value> = ca
+            .get("edges")?
+            .as_array()?
+            .iter()
+            .filter_map(|e| Some((transfer(e)?.key()?, e.get("node")?.clone())))
+            .collect();
+        let cb = b
+            .body
+            .get_mut("data")
+            .and_then(crate::graphql::root_connection)?;
+        let edges = cb.get_mut("edges")?.as_array_mut()?;
+        let mut keys: Vec<(String, Option<u8>)> = Vec::new();
+        for e in edges.iter() {
+            let Some(id) = transfer(e) else { continue };
+            let (Some(k), Some(rk)) = (id.key(), id.rk.clone()) else {
+                continue;
+            };
+            let held = ours
+                .get(&k)
+                .is_some_and(|n| same_transfer(n, e.get("node").unwrap_or(&Value::Null)));
+            if !held && !keys.iter().any(|(x, _)| *x == rk) {
+                keys.push((rk, id.chain));
+            }
+        }
+        let q = "query($k: String!) { transfers(requestKey: $k, first: 100) { pageInfo { hasNextPage } edges { node { orderIndex amount senderAccount receiverAccount moduleName chainId blockHash requestKey } } } }";
+        let mut evidence = Vec::new();
+        let mut reads = 0;
+        for (rk, chain) in keys.into_iter().take(ORDER_INDEX_READS) {
+            reads += 1;
+            let Some(d) = self.gql_read(ta, q, json!({ "k": rk })).await else {
+                continue;
+            };
+            if d.pointer("/transfers/pageInfo/hasNextPage") != Some(&Value::Bool(false)) {
+                continue;
+            }
+            let mine: Vec<(i64, Value)> = d
+                .pointer("/transfers/edges")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.get("node"))
+                .filter(|n| {
+                    chain.is_none_or(|c| {
+                        n.get("chainId").and_then(text).as_deref() == Some(&c.to_string())
+                    })
+                })
+                .filter_map(|n| {
+                    Some((n.get("orderIndex").and_then(text)?.parse().ok()?, n.clone()))
+                })
+                .collect();
+            let theirs: Vec<(usize, i64)> = edges
+                .iter()
+                .enumerate()
+                .filter_map(|(j, e)| {
+                    let id = transfer(e)?;
+                    (id.rk.as_deref() == Some(rk.as_str())).then_some((j, id.index?))
+                })
+                .collect();
+            let rows: Vec<(i64, &Value)> = theirs
+                .iter()
+                .map(|(j, r)| (*r, edges[*j].get("node").unwrap_or(&Value::Null)))
+                .collect();
+            match rank_map(&mine, &rows) {
+                Ok(map) => {
+                    for ((j, _), (_, i)) in theirs.iter().zip(&map) {
+                        if let Some(n) = edges[*j].get_mut("node") {
+                            reindex_transfer(n, *i);
+                        }
+                    }
+                    let mut idx: Vec<i64> = mine.iter().map(|x| x.0).collect();
+                    idx.sort_unstable();
+                    evidence.push(json!({"requestKey": rk, "ours": idx,
+                        "oracle": map.iter().map(|x| x.0).collect::<Vec<_>>(),
+                        "mapped": map.iter().map(|x| x.1).collect::<Vec<_>>()}));
+                }
+                Err(why) => tracing::debug!(rk, why, "H8 not explained"),
+            }
+        }
+        (!evidence.is_empty()).then(|| {
+            entry(
+                ORDER_INDEX_PATH,
+                Some(json!({"readsOfOurs": reads})),
+                Some(Value::Array(evidence)),
+            )
+        })
     }
 }
 
