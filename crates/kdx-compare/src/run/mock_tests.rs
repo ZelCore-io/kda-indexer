@@ -1303,9 +1303,60 @@ max_height = 7000000
 /// the sender's `creationTime` (the oracle's sort key).
 fn h7_tx(rk: &str, h: u64, block: &str, ct: &str) -> Value {
     let id = crate::graphql::base64_std(format!("Transaction:[\"{block}\",\"{rk}\"]").as_bytes());
+    // Ours sends `.mmmZ` (R-P5P9-68 (2) checks the form), so the fixture does too.
+    let ct = match ct.strip_suffix('Z') {
+        Some(t) if !t.contains('.') => format!("{t}.000Z"),
+        _ => ct.to_string(),
+    };
     json!({"cursor": "c", "node": {"id": id, "hash": rk,
         "cmd": {"meta": {"chainId": "0", "creationTime": ct}},
         "result": {"height": h, "block": {"hash": block, "chainId": 0}}}})
+}
+
+/// R-P5P9-68 (2): backs every `/poll` entry of `node` with the node's own copy of the signed
+/// command, so a one-sided `h7_tx` row that selects `cmd { meta { chainId creationTime } }` is
+/// settled against the node: a header at the poll's height (the block the poll names, and the
+/// only one stored there) whose payload holds the key's command. Ours' fixture rows sit in
+/// `B<height>`, so a poll that names another block (the node places the key elsewhere) is left
+/// unbacked. `cts` gives a key's creationTime (ours' form); other keys take `default_ct`.
+fn h7_back_cmds(node: &mut NodeMock, default_ct: &str, cts: &[(&str, &str)]) {
+    let polls: Vec<(String, u8, String, u64)> = node
+        .polls
+        .iter()
+        .filter_map(|(rk, (c, v))| {
+            Some((
+                rk.clone(),
+                *c,
+                v.pointer("/metaData/blockHash")?.as_str()?.to_string(),
+                v.pointer("/metaData/blockHeight")?.as_u64()?,
+            ))
+        })
+        .collect();
+    for (rk, c, block, h) in polls {
+        if block != format!("B{h}") {
+            continue;
+        }
+        let ct = cts
+            .iter()
+            .find(|(k, _)| *k == rk)
+            .map_or(default_ct, |(_, t)| *t);
+        let secs = crate::graphql_window::parse_utc(ct).unwrap().0;
+        let cmd = json!({"meta": {"chainId": c.to_string(), "creationTime": secs}});
+        let w = json!({"hash": rk, "sigs": [], "cmd": cmd.to_string()}).to_string();
+        let ph = format!("P{block}");
+        let heads = node.headers.entry((c, h)).or_default();
+        if !heads.iter().any(|x| x["hash"] == json!(block)) {
+            heads.push(json!({"hash": block, "height": h, "chainId": c, "payloadHash": ph}));
+        }
+        let pl = node
+            .payloads
+            .entry(ph)
+            .or_insert_with(|| json!({"transactions": []}));
+        pl["transactions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!([kdx_types::hash::b64url_encode(w.as_bytes()), ""]));
+    }
 }
 
 /// A node `/poll` entry: the request key in `block` at `h`, with these events.
@@ -1382,6 +1433,14 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
     }
     let (k, v) = h7_poll("z104", "Q104", 104, json!([]));
     node.polls.insert(k, v);
+    h7_back_cmds(
+        &mut node,
+        "2024-01-01T10:01:00Z",
+        &[
+            ("r105", "2024-01-01T10:05:00Z"),
+            ("r103", "2024-01-01T10:04:00Z"),
+        ],
+    );
     let calls = node.calls.clone();
     let ctx = gql_ctx(node.clone(), dir.path()).await;
     let ctx = &ctx;
@@ -1449,7 +1508,9 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
     let text = format!("{} {}", ev.a.clone().unwrap(), ev.b.clone().unwrap());
     assert!(text.contains("outside-oracle-window"), "{text}");
     assert!(text.contains("below-our-window"), "{text}");
-    assert_eq!(ev.b.clone().unwrap()["nodeReads"], json!(2), "{text}");
+    // Two polls, plus the cut, the branch header and the payload that check ours-only r104's
+    // `cmd` (R-P5P9-68 (2)).
+    assert_eq!(ev.b.clone().unwrap()["nodeReads"], json!(5), "{text}");
     assert_eq!(polls() - before, 2);
     //    The same rows on full pages, in the oracle's creationTime order: explained, no read.
     let before = polls();
@@ -2266,6 +2327,7 @@ async fn h7_content_of_one_sided_rows_is_the_nodes() {
         v.1["gas"] = json!(50);
         node.polls.insert(k, v);
     }
+    h7_back_cmds(&mut node, "2024-01-01T10:00:00Z", &[]);
     let ctx = gql_ctx(node, dir.path()).await;
     let ev = |rk: &str, params: &str| {
         json!({"cursor": "c", "node": {"name": "TRANSFER", "qualifiedName": "coin.TRANSFER",
@@ -2560,6 +2622,7 @@ async fn h7_duplicates_twice_ceiling_and_undecidable_rows() {
         let (k, v) = h7_poll(rk, b, h, json!([]));
         node.polls.insert(k, v);
     }
+    h7_back_cmds(&mut node, "2024-01-01T10:00:00Z", &[]);
     let ctx = gql_ctx(node, dir.path()).await;
     let ct = "2024-01-01T10:00:00Z";
     let tx = |rk: &str, h: u64| h7_tx(rk, h, &format!("B{h}"), ct);
@@ -2743,6 +2806,16 @@ async fn referee_reruns_the_node_verdicts_on_a_stored_log() {
         let (k, v) = h7_poll(rk, &format!("B{h}"), h, gas);
         node.polls.insert(k, v);
     }
+    h7_back_cmds(
+        &mut node,
+        "2024-01-01T10:01:00Z",
+        &[
+            ("r105", "2024-01-01T10:05:00Z"),
+            ("r103", "2024-01-01T10:04:00Z"),
+            ("r100", "2024-01-01T10:03:00Z"),
+            ("x104", "2024-01-01T10:02:00Z"),
+        ],
+    );
     let nu = node_server(node).await;
     let ops = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/graphql");
     let allow =
@@ -2969,8 +3042,10 @@ max_height = 7000000
         "{rep:?}"
     );
     assert_eq!(rep.by_class.get("unexplained: h7-row"), Some(&1), "{rep:?}");
-    // The node's chain graph, then two reads per H7 record.
-    assert_eq!(rep.node_reads, 5, "{rep:?}");
+    // The node's chain graph, then two reads per H7 record, and three more (the cut, the
+    // branch header, the payload) for each of the two records whose ours-only row has its
+    // `cmd` checked (R-P5P9-68 (2)).
+    assert_eq!(rep.node_reads, 11, "{rep:?}");
     let still = serde_json::to_string(&rep.still_unexplained).unwrap();
     assert!(
         still.contains("x104") && still.contains("inside our window"),
@@ -4114,6 +4189,7 @@ async fn c3_a_row_absent_from_our_capped_longer_read_is_undecided() {
             "edges": page}}})
     })
     .await;
+    h7_back_cmds(&mut node, "2024-01-01T10:00:00Z", &[]);
     let ctx = gql_ctx_at(node, dir.path(), &au).await;
     let op = h7_op("transactions");
     for (n, x_at, explained) in [(100, 105, false), (60, 105, false), (60, 80, true)] {
@@ -4292,4 +4368,123 @@ async fn c4_a_250_row_page_over_8_mib_goes_through_the_streamed_path() {
         .find(|e| e.path == format!("{}/rk0249", crate::streamed::ROW_PATH))
         .expect("the row only ours lists is named");
     assert!(row.a.is_some() && row.b.is_none(), "{row:?}");
+}
+
+/// R-P5P9-68 (2): an ours-only transaction row is excused only when every `cmd` field it
+/// selects was checked against the node's signed command (one cached `payload_with_outputs`
+/// read per block); a selected field the harness does not check refuses the excuse.
+#[tokio::test]
+async fn c4_ours_only_tx_rows_have_their_cmd_fields_checked_against_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("t1", 101), ("t2", 100)] {
+        let (k, v) = h7_poll(rk, &format!("B{h}"), h, json!([]));
+        node.polls.insert(k, v);
+    }
+    node.headers.insert(
+        (0, 100),
+        vec![json!({"hash": "B100", "height": 100, "chainId": 0, "payloadHash": "P100"})],
+    );
+    let cmd = json!({"networkId": "mainnet01", "nonce": "n2",
+        "meta": {"chainId": "0", "sender": "alice", "gasLimit": 600, "gasPrice": 1.0e-8,
+            "ttl": 28800, "creationTime": 1_700_000_000},
+        "payload": {"exec": {"code": "(coin.transfer \"alice\" \"bob\" 1.0)", "data": {"k": 1}}},
+        "signers": [{"pubKey": "pk1", "clist": [{"name": "coin.GAS", "args": []}]}]});
+    let w = json!({"hash": "t2", "sigs": [], "cmd": cmd.to_string()}).to_string();
+    node.payloads.insert(
+        "P100".into(),
+        json!({"transactions": [[kdx_types::hash::b64url_encode(w.as_bytes()), ""]]}),
+    );
+    let au = ours_fn_server(|_: &Value| json!({"data": {"block": {"chainId": "0"}}})).await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let plain = crate::graphql::parse_op(
+        "QTxs",
+        "query QTxs($first: Int, $after: String) { transactions(first: $first, after: $after) \
+         { totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash cmd { \
+         networkId nonce meta { chainId sender gasLimit gasPrice ttl creationTime } payload { \
+         ... on ExecutionPayload { code data } } signers { pubkey clist { name args } } } } } } }",
+        false,
+    )
+    .unwrap();
+    let ours_cmd = json!({"networkId": "mainnet01", "nonce": "n2",
+        "meta": {"chainId": 0, "sender": "alice", "gasLimit": "600", "gasPrice": "0.00000001",
+            "ttl": "28800", "creationTime": "2023-11-14T22:13:20.000Z"},
+        "payload": {"code": "\"(coin.transfer \\\"alice\\\" \\\"bob\\\" 1.0)\"", "data": "{\"k\":1}"},
+        "signers": [{"pubkey": "pk1", "clist": [{"name": "coin.GAS", "args": "[]"}]}]});
+    let tx = |rk: &str, h: u64, c: &Value| {
+        let id = crate::graphql::base64_std(format!("Transaction:[\"B{h}\",\"{rk}\"]").as_bytes());
+        json!({"cursor": "c", "node": {"id": id, "hash": rk, "cmd": c}})
+    };
+    let run = |c: Value| {
+        let ctx = &ctx;
+        let op = plain.clone();
+        let t1 = tx("t1", 101, &json!({"nonce": "n1"}));
+        async move {
+            let mut a = h7_page("transactions", false, vec![t1.clone(), tx("t2", 100, &c)]);
+            let mut b = h7_page("transactions", false, vec![t1]);
+            let (d, note) = ctx
+                .gql_settle_op(
+                    &ctx.targets["a"],
+                    Some(&op),
+                    &h7_vars(&[("first", json!(2))]),
+                    &mut a,
+                    &mut b,
+                    7_000_000,
+                    false,
+                )
+                .await;
+            (c3_unexplained(ctx, &d), note.unwrap_or_default())
+        }
+    };
+    // Every selected cmd field is the node's: a node-confirmed oracle gap.
+    let (un, note) = run(ours_cmd.clone()).await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    // A wrong sender (and each other checked field) on the ours-only row: a diff.
+    for (ptr, value, name) in [
+        ("/meta/sender", json!("mallory"), "cmd.meta.sender"),
+        ("/meta/gasLimit", json!("601"), "cmd.meta.gasLimit"),
+        (
+            "/meta/creationTime",
+            json!("2023-11-14T22:13:21.000Z"),
+            "cmd.meta.creationTime",
+        ),
+        ("/nonce", json!("nX"), "cmd.nonce"),
+        (
+            "/payload/code",
+            json!("\"(coin.details \\\"alice\\\")\""),
+            "cmd.payload.code",
+        ),
+        ("/payload/data", json!("{\"k\":2}"), "cmd.payload.data"),
+        ("/signers/0/pubkey", json!("pk2"), "cmd.signers.pubkey"),
+        (
+            "/signers/0/clist/0/args",
+            json!("[1]"),
+            "cmd.signers.clist.args",
+        ),
+    ] {
+        let mut c = ours_cmd.clone();
+        *c.pointer_mut(ptr).unwrap() = value;
+        let (un, note) = run(c).await;
+        assert!(!un.is_empty(), "{name}: {note}");
+        assert!(note.contains(name), "{name}: {note}");
+    }
+    // A selected cmd field the harness does not check: the excuse is refused.
+    for (ptr, value, name) in [
+        ("/signers/0/scheme", json!("ED25519"), "cmd.signers.scheme"),
+        (
+            "/meta/__typename",
+            json!("TransactionMeta"),
+            "cmd.meta.__typename",
+        ),
+    ] {
+        let mut c = ours_cmd.clone();
+        let (parent, key) = ptr.rsplit_once('/').unwrap();
+        c.pointer_mut(parent).unwrap()[key] = value;
+        let (un, note) = run(c).await;
+        assert!(!un.is_empty(), "{name}: {note}");
+        assert!(
+            note.contains(&format!("unchecked field: {name}")),
+            "{name}: {note}"
+        );
+    }
 }

@@ -326,6 +326,20 @@ pub struct Verdict {
     pub matches: usize,
     /// The node's TRANSFER events of the row's transaction (a tx row's account filter).
     pub transfers: Vec<Value>,
+    /// R-P5P9-68 (2): ours-only tx rows' `cmd` fields against the node's signed command
+    /// (`None`: not checked).
+    pub cmd: Option<CmdCheck>,
+}
+
+/// The check of an ours-only tx row's `cmd` fields against the node (R-P5P9-68 (2)).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CmdCheck {
+    /// Every selected field is the node's.
+    Same,
+    /// The named field is not the node's.
+    Differs(String),
+    /// The node's command could not be read (why).
+    Unsettled(String),
 }
 
 impl Verdict {
@@ -344,6 +358,7 @@ impl Verdict {
             event: None,
             matches: 0,
             transfers: Vec::new(),
+            cmd: None,
         }
     }
 
@@ -507,6 +522,167 @@ pub fn tx_matches(n: &Value, p: &Value, oracle: bool) -> bool {
         })
         && r.get("continuation")
             .is_none_or(|x| json_is(x, p.get("continuation")))
+}
+
+/// The `cmd` fields the harness checks against the node's signed command (R-P5P9-68 (2)),
+/// per level of ours' `TransactionCommand`: every other selected field is unchecked.
+fn cmd_checked_keys(path: &str) -> &'static [&'static str] {
+    match path {
+        "cmd" => &["meta", "networkId", "nonce", "payload", "signers"],
+        "cmd.meta" => &[
+            "chainId",
+            "creationTime",
+            "gasLimit",
+            "gasPrice",
+            "sender",
+            "ttl",
+        ],
+        "cmd.payload" => &["code", "data", "pactId", "proof", "rollback", "step"],
+        "cmd.signers" => &["address", "clist", "pubkey"],
+        "cmd.signers.clist" => &["args", "name"],
+        _ => &[],
+    }
+}
+
+/// The first `cmd` field a tx row selects that the harness does not check (dotted path, list
+/// indices left out), or `None`.
+pub fn unchecked_cmd_field(n: &Value) -> Option<String> {
+    fn walk(v: &Value, path: &str) -> Option<String> {
+        let keys = cmd_checked_keys(path);
+        match v {
+            Value::Object(m) if !keys.is_empty() => m.iter().find_map(|(k, x)| {
+                let p = format!("{path}.{k}");
+                if !keys.contains(&k.as_str()) {
+                    return Some(p);
+                }
+                let nested = matches!(p.as_str(), "cmd.meta" | "cmd.payload")
+                    || matches!(p.as_str(), "cmd.signers" | "cmd.signers.clist");
+                if nested {
+                    walk(x, &p)
+                } else if x.is_object() || x.is_array() {
+                    Some(p)
+                } else {
+                    None
+                }
+            }),
+            Value::Array(a) if matches!(path, "cmd.signers" | "cmd.signers.clist") => {
+                a.iter().find_map(|x| walk(x, path))
+            }
+            Value::Object(_) | Value::Array(_) => Some(path.to_string()),
+            // A null `cmd`, `meta`, … or a scalar where an object is selected.
+            _ => Some(path.to_string()),
+        }
+    }
+    n.get("cmd").and_then(|c| walk(c, "cmd"))
+}
+
+/// The node's `meta.creationTime` in whole seconds.
+fn node_secs(v: &Value) -> Option<u64> {
+    let t = text(v)?;
+    t.parse::<u64>().ok().or_else(|| {
+        let f = t.parse::<f64>().ok()?;
+        (f >= 0.0 && f.fract() == 0.0).then_some(f as u64)
+    })
+}
+
+/// The first checked `cmd` field of ours' row `c` (its `cmd` object) that is not the node's
+/// signed command `node`, in ours' encodings (`code` and the JSON texts quoted, the times as
+/// `.mmmZ`, the integers as text); `None` when all are the node's. Run only on a row
+/// [`unchecked_cmd_field`] passes.
+pub fn cmd_mismatch(c: &Value, node: &Value) -> Option<String> {
+    let null = Value::Null;
+    let at = |v: Option<&Value>, k: &str| v.and_then(|v| v.get(k)).unwrap_or(&null).clone();
+    let txt = |x: &Value, y: &Value| x == y || json_field(x) == *y;
+    let meta = node.get("meta");
+    if let Some(m) = c.get("meta").and_then(Value::as_object) {
+        for (k, x) in m {
+            let y = at(meta, k);
+            let ok = match k.as_str() {
+                "sender" => *x == y,
+                "chainId" | "gasLimit" | "ttl" => same_amount(x, &y, false),
+                "gasPrice" => same_amount(x, &y, true),
+                "creationTime" => node_secs(&y)
+                    .and_then(|s| s.checked_mul(1_000_000))
+                    .is_some_and(|us| time_is(x, Some(us), false)),
+                _ => false,
+            };
+            if !ok {
+                return Some(format!("cmd.meta.{k}"));
+            }
+        }
+    }
+    for k in ["networkId", "nonce"] {
+        if c.get(k).is_some_and(|x| *x != at(Some(node), k)) {
+            return Some(format!("cmd.{k}"));
+        }
+    }
+    let pl = node.get("payload");
+    let exec = pl.and_then(|p| p.get("exec"));
+    let cont = pl.and_then(|p| p.get("cont"));
+    if let Some(p) = c.get("payload").and_then(Value::as_object) {
+        for (k, x) in p {
+            let ok = match k.as_str() {
+                "code" => exec.is_some() && json_field(x) == at(exec, "code"),
+                "data" => {
+                    let y = at(exec.or(cont), "data");
+                    same_value(&json_field(x), &y, false)
+                }
+                "pactId" | "proof" => cont.is_some() && txt(x, &at(cont, k)),
+                "step" => cont.is_some() && same_amount(x, &at(cont, "step"), false),
+                "rollback" => cont.is_some() && *x == at(cont, "rollback"),
+                _ => false,
+            };
+            if !ok {
+                return Some(format!("cmd.payload.{k}"));
+            }
+        }
+    }
+    if let Some(ss) = c.get("signers") {
+        let ns: &[Value] = node
+            .get("signers")
+            .and_then(Value::as_array)
+            .map_or(&[], Vec::as_slice);
+        let Some(ss) = ss.as_array().filter(|s| s.len() == ns.len()) else {
+            return Some("cmd.signers".into());
+        };
+        for (s, n) in ss.iter().zip(ns) {
+            for (k, x) in s.as_object().into_iter().flatten() {
+                let ok = match k.as_str() {
+                    "pubkey" => *x == at(Some(n), "pubKey"),
+                    "address" => *x == at(Some(n), "addr"),
+                    "clist" => {
+                        let nc: &[Value] = n
+                            .get("clist")
+                            .and_then(Value::as_array)
+                            .map_or(&[], Vec::as_slice);
+                        let Some(xc) = x.as_array().filter(|x| x.len() == nc.len()) else {
+                            return Some("cmd.signers.clist".into());
+                        };
+                        for (cx, cn) in xc.iter().zip(nc) {
+                            for (ck, cv) in cx.as_object().into_iter().flatten() {
+                                let ok = match ck.as_str() {
+                                    "name" => *cv == at(Some(cn), "name"),
+                                    "args" => {
+                                        same_value(&json_field(cv), &at(Some(cn), "args"), false)
+                                    }
+                                    _ => false,
+                                };
+                                if !ok {
+                                    return Some(format!("cmd.signers.clist.{ck}"));
+                                }
+                            }
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    return Some(format!("cmd.signers.{k}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The row's content against the node's entry for its transaction (a `/poll` entry or a
@@ -1372,6 +1548,14 @@ impl Prep {
         out.extend(m.oracle.iter().map(|g| (1, g[0])));
         out
     }
+
+    /// Ours' rows the oracle does not list (over all rows): the rows whose `cmd` fields are
+    /// checked against the node (R-P5P9-68 (2)).
+    pub fn ours_only(&self) -> Vec<usize> {
+        let all_a: Vec<usize> = (0..self.a.len()).collect();
+        let all_b: Vec<usize> = (0..self.b.len()).collect();
+        matching(self, &all_a, &all_b).ours
+    }
 }
 
 /// What H7 knows of a pair besides its rows: the oracle's ceiling, the list's direction, the
@@ -1615,6 +1799,37 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
             ));
             continue;
         }
+        // R-P5P9-68 (2): every `cmd` field the row selects must have been checked against
+        // the node.
+        if ra.id.kind == Some(Kind::Tx) && node_of(ra).get("cmd").is_some() {
+            match &v.cmd {
+                Some(CmdCheck::Same) => {}
+                Some(CmdCheck::Differs(f)) => {
+                    d.rejected.push((
+                        Some(ra.edge.clone()),
+                        None,
+                        format!("an ours-only row whose {f} is not the node's"),
+                    ));
+                    continue;
+                }
+                Some(CmdCheck::Unsettled(w)) => {
+                    d.undecided.push(format!(
+                        "an ours-only row whose cmd the node did not settle ({w}): {}",
+                        ra.id.evidence()
+                    ));
+                    continue;
+                }
+                None => {
+                    let f = unchecked_cmd_field(node_of(ra)).unwrap_or_else(|| "cmd".into());
+                    d.rejected.push((
+                        Some(ra.edge.clone()),
+                        None,
+                        format!("an ours-only canonical row: unchecked field: {f}"),
+                    ));
+                    continue;
+                }
+            }
+        }
         let outside_filter = w.filter.outside(ra, ha[i], v);
         if let Some(why) = outside_filter {
             d.rejected.push((
@@ -1839,9 +2054,13 @@ impl Ctx {
         let (node0, ours0) = (st.node, st.ours);
         let mut va: Vec<Option<Verdict>> = vec![None; prep.a.len()];
         let mut vb: Vec<Option<Verdict>> = vec![None; prep.b.len()];
+        let ours_only = prep.ours_only();
         for (side, i) in prep.reads() {
             let r = if side == 0 { &prep.a[i] } else { &prep.b[i] };
-            let v = self.h7_verdict(ta, r, side == 1, st).await;
+            let mut v = self.h7_verdict(ta, r, side == 1, st).await;
+            if side == 0 && ours_only.contains(&i) {
+                self.h7_cmd_check(r, &mut v, st).await;
+            }
             if side == 0 {
                 va[i] = Some(v);
             } else {
@@ -2070,6 +2289,76 @@ impl Ctx {
             }
         }
         coinbase_verdict(id, n, h, hd.as_ref(), payload.as_ref(), oracle)
+    }
+
+    /// R-P5P9-68 (2): an ours-only tx row that the node places (`v`) and that selects only
+    /// checkable `cmd` fields, against the node's signed command: from the payload of the
+    /// block `/poll` placed it in, that block being the cut branch's at its height (one
+    /// cached payload read per block, within the compare's cap). Sets `v.cmd`; the canonical
+    /// verdict itself is left as it is. Rows with an unchecked field are refused in
+    /// [`decide`] without a read.
+    async fn h7_cmd_check(&self, r: &Row, v: &mut Verdict, st: &mut Reads) {
+        let n = node_of(r);
+        let (Some(chain), Some(rk)) = (v.chain, r.id.rk.as_deref()) else {
+            return;
+        };
+        if r.id.kind != Some(Kind::Tx)
+            || v.canon != Canon::Yes
+            || n.get("cmd").is_none()
+            || unchecked_cmd_field(n).is_some()
+        {
+            return;
+        }
+        let unsettled = |w: String| Some(CmdCheck::Unsettled(w));
+        let p = match self.h7_poll(chain, rk, st).await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                v.cmd = unsettled("the node's poll does not know the key".into());
+                return;
+            }
+            Err(w) => {
+                v.cmd = unsettled(w);
+                return;
+            }
+        };
+        let pb = p.pointer("/metaData/blockHash").and_then(Value::as_str);
+        let Some(ph) = p.pointer("/metaData/blockHeight").and_then(Value::as_u64) else {
+            v.cmd = unsettled("no block height in the poll entry".into());
+            return;
+        };
+        let hd = match self.h7_canonical(chain, ph, st).await {
+            Ok(Some(hd)) => hd,
+            Ok(None) => {
+                v.cmd = unsettled("no canonical header at the height".into());
+                return;
+            }
+            Err(w) => {
+                v.cmd = unsettled(w);
+                return;
+            }
+        };
+        if hd.get("hash").and_then(Value::as_str) != pb {
+            v.cmd = unsettled("the poll's block is not the cut branch's".into());
+            return;
+        }
+        let Some(payload_hash) = hd.get("payloadHash").and_then(Value::as_str) else {
+            v.cmd = unsettled("the header has no payload hash".into());
+            return;
+        };
+        let payload = match self.h7_payload(chain, payload_hash, st).await {
+            Ok(x) => x,
+            Err(w) => {
+                v.cmd = unsettled(w);
+                return;
+            }
+        };
+        v.cmd = Some(match node_cmd(&payload, rk) {
+            None => CmdCheck::Unsettled("the block's payload lacks the key".into()),
+            Some(cmd) => match cmd_mismatch(n.get("cmd").unwrap_or(&Value::Null), &cmd) {
+                Some(f) => CmdCheck::Differs(f),
+                None => CmdCheck::Same,
+            },
+        });
     }
 
     /// Takes one node read from the compare's cap and the run's budget.
