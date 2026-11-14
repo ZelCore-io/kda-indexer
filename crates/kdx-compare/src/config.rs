@@ -153,6 +153,20 @@ pub enum FieldRuleKind {
     /// the node's `/local` `(coin.details "<account>")` guard, on the chain ours lists for the
     /// key, holds the key. Visible hit `/~graphql-r58-by-key-extra-row`.
     ByKeyExtraRow,
+    /// R-P5P9-60 `cmd.nonce` inner quotes: ours decodes (one JSON string layer) to a string
+    /// that contains `"`, and the oracle's is that string with every `"` removed. Any other
+    /// pair stays a diff. Visible hit `/~graphql-r60-oracle-strips-quotes`.
+    OracleStripsQuotes,
+    /// R-P5P9-60 count self-consistency; `field` is `<root>.totalCount` of a root connection.
+    /// Explains the count only when neither side's page is cut, the two edge sets match,
+    /// ours' count equals its own edge count and the oracle's count differs from its own.
+    /// Visible hit `/~graphql-r60-count-self-consistent`.
+    CountSelfConsistent,
+    /// R-P5P9-60 amendment (`transfers.amount`): the oracle sends some amounts as
+    /// f64-rounded strings, ours is the exact Pact decimal. Explains only when the two
+    /// strings differ, both parse as decimals, they parse to the same f64, and ours has at
+    /// least as many significant digits as the oracle's.
+    OracleF64Rounded,
 }
 
 impl FieldRuleKind {
@@ -162,6 +176,12 @@ impl FieldRuleKind {
             self,
             FieldRuleKind::OracleOrphanDupes | FieldRuleKind::ByKeyExtraRow
         )
+    }
+
+    /// Rules on a whole root connection (its count against its edges), applied on the
+    /// normalised answers before the diff.
+    pub fn is_connection(self) -> bool {
+        self == FieldRuleKind::CountSelfConsistent
     }
 
     /// The exact-value matchers the rule takes: (ours, oracle).
@@ -205,6 +225,11 @@ pub struct TargetConfig {
     /// margin). Required for that kind.
     #[serde(default)]
     pub max_height: Option<u64>,
+    /// Local address this target's client binds for its connections (R-P5P9-60 H4), so a
+    /// run can give the harness its own loopback source without forwarders. Unset = the OS
+    /// picks it.
+    #[serde(default)]
+    pub source_addr: Option<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +367,15 @@ impl CompareConfig {
             if (r.ours.is_some() && !ours) || (r.oracle.is_some() && !oracle) {
                 bail!(
                     "graphql.field_rules: {:?} on {:?} takes no matcher on that side",
+                    r.rule,
+                    r.field
+                );
+            }
+            if r.rule.is_connection()
+                && !matches!(r.field.split_once('.'), Some((root, "totalCount")) if !root.contains('.'))
+            {
+                bail!(
+                    "graphql.field_rules: {:?} needs `<root>.totalCount`, not {:?}",
                     r.rule,
                     r.field
                 );
@@ -536,5 +570,71 @@ field_rules = [
             let c: CompareConfig = toml::from_str(&bad).unwrap();
             assert!(c.validate().is_err(), "{bad}");
         }
+    }
+
+    /// The CG-3 block (R-P5P9-60): CG-2's rules plus the three ruled normalisers, two rules
+    /// on one field where the ruling keeps both, and `source_addr` on a target.
+    #[test]
+    fn cg3_field_rules_and_source_addr_parse_and_validate() {
+        let rules = r#"[graphql]
+field_rules = [
+  { field = "cmd.nonce",                   rule = "json_unquote" },
+  { field = "cmd.nonce",                   rule = "oracle_strips_quotes" },
+  { field = "payload.pactId",              rule = "oracle_null" },
+  { field = "result.transactionId",        rule = "ours_null", oracle = "0" },
+  { field = "result.goodResult",           rule = "oracle_null", ours = "\"\"" },
+  { field = "result.goodResult",           rule = "json_numbers_by_value" },
+  { field = "result.continuation",         rule = "json_numbers_by_value" },
+  { field = "signers.scheme",              rule = "oracle_empty" },
+  { field = "events.parameters",           rule = "json_numbers_by_value" },
+  { field = "transfers.totalCount",        rule = "count_lower_bound" },
+  { field = "transactions.totalCount",     rule = "count_lower_bound" },
+  { field = "transactions.totalCount",     rule = "count_self_consistent" },
+  { field = "transactionsByPublicKey",     rule = "oracle_orphan_dupes" },
+  { field = "fungibleAccountsByPublicKey", rule = "by_key_extra_row" },
+  { field = "signers.clist.args",          rule = "json_numbers_by_value" },
+  { field = "transfers.amount",            rule = "oracle_f64_rounded" },
+]
+[node]"#;
+        let text = BASE.replace("[node]", rules).replace(
+            "rate_rps = 5.0\n",
+            "rate_rps = 5.0\nsource_addr = \"127.0.0.1\"\n",
+        );
+        let c: CompareConfig = toml::from_str(&text).unwrap();
+        c.validate().unwrap();
+        let r = &c.graphql.field_rules;
+        assert_eq!(r.len(), 16);
+        assert_eq!(r[1].rule, FieldRuleKind::OracleStripsQuotes);
+        assert_eq!(r[15].rule, FieldRuleKind::OracleF64Rounded);
+        assert!(r[11].rule.is_connection() && !r[11].rule.is_row());
+        assert_eq!(
+            c.targets["oracle"].source_addr,
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(c.targets["gql"].source_addr, None);
+        for bad in [
+            // The count rule names a root's own totalCount, nothing deeper or shallower.
+            text.replace(
+                "\"transactions.totalCount\",     rule = \"count_self_consistent\"",
+                "\"transactions\", rule = \"count_self_consistent\"",
+            ),
+            text.replace(
+                "\"transactions.totalCount\",     rule = \"count_self_consistent\"",
+                "\"block.transactions.totalCount\", rule = \"count_self_consistent\"",
+            ),
+            text.replace(
+                "\"transactions.totalCount\",     rule = \"count_self_consistent\"",
+                "\"transactions.edges\", rule = \"count_self_consistent\"",
+            ),
+            // The new kinds take no matcher.
+            text.replace(
+                "\"oracle_strips_quotes\" }",
+                "\"oracle_strips_quotes\", ours = \"x\" }",
+            ),
+        ] {
+            let c: CompareConfig = toml::from_str(&bad).unwrap();
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<CompareConfig>(&text.replace("127.0.0.1\"", "lo0\"")).is_err());
     }
 }

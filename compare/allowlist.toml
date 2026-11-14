@@ -385,3 +385,30 @@ json_path_glob = "/~coins-supply-tolerance"
 condition = "changed"
 reason = "Both sides compute the circulating supply at their own tip height; /coins is a text decimal that grows with every block, so the diff code moves a difference within the supply tolerance of the stats route (relative 1e-6, numeric) to this path, reported as a visible hit. A bigger difference stays a root diff and is unexplained, unless chainweb-data's tip lags and the coinbase minted over that gap covers it (oracle-tip-lag, R-P5P9-48)."
 owner_note = "Plan Task 12; same tolerance as stats-supply-tolerance."
+
+[[entry]]
+id = "graphql-r60-oracle-strips-quotes"
+route = "other"
+json_path_glob = "/~graphql-r60-oracle-strips-quotes"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-60 rule (a), kind oracle_strips_quotes (cmd.nonce with inner quotes; CG-2 node = ours 3/3): our value decodes, one JSON string layer, to a string that contains a double quote, and the reference server's value is that string with every double quote removed. Any other pair stays unexplained."
+owner_note = "Controller ruling R-P5P9-60 (oracle defects normalised in the harness); only the listed fields."
+
+[[entry]]
+id = "graphql-r60-count-self-consistent"
+route = "other"
+json_path_glob = "/~graphql-r60-count-self-consistent"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-60 rule (a), kind count_self_consistent (Transactions-9e58b95d; CG-A2 node counts = ours 4/4): neither page is cut, the two edge sets match, our totalCount equals our edge count, and the reference server's totalCount differs from its own edge count. Any other count difference stays unexplained."
+owner_note = "Controller ruling R-P5P9-60; only the listed root counts."
+
+[[entry]]
+id = "graphql-r60-scoped-list"
+route = "other"
+json_path_glob = "/~graphql-r60-scoped-list-finished"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block's transactions or events, a transaction's transfers or events) had its page cut on either side; the harness read that list to its end on both sides (at each target's own rate, at most 20 pages) and compared the full sets. A row only one side's full list holds stays a diff, and a list it could not finish stays as it was."
+owner_note = "Controller ruling R-P5P9-60 (H2); the order within one block or tx is a contract choice (M2c, R3E-8)."
