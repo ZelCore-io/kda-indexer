@@ -168,7 +168,16 @@ Remove the drop-in when the backfill has finished.
 
 The unit ships `MemoryHigh=12G` and `MemoryMax=16G`, sized for a 23 GiB host. Memory-mapped
 segment pages are reclaimable page cache and do not count against the hard limit like heap.
-Set your own values in a drop-in (`examples/memory.conf`).
+The unit also sets `MemorySwapMax=0`: the process's heap never swaps, and reclaim under
+`MemoryHigh` takes page cache only. A runaway heap therefore ends in an OOM kill at
+`MemoryMax` instead of slow swap. Set your own limits in a drop-in (`examples/memory.conf`).
+
+The binary uses jemalloc as its allocator, tuned to hand freed memory back to the OS within
+about 5 seconds. `/metrics` shows its counters as `kdx_alloc_allocated_bytes` (live data),
+`kdx_alloc_active_bytes`, `kdx_alloc_resident_bytes` (what the allocator keeps in RAM),
+`kdx_alloc_retained_bytes` and `kdx_alloc_mapped_bytes`, refreshed every 10 seconds. Resident
+bytes well above allocated bytes for a long time means retention; allocated bytes that only
+climb means a leak.
 
 ### The sandbox and the data dir
 

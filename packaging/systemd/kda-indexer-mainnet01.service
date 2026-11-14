@@ -24,6 +24,8 @@ CPUWeight=50
 IOWeight=50
 MemoryHigh=12G
 MemoryMax=16G
+# Anonymous memory never swaps; reclaim under MemoryHigh takes page cache only (run MEM).
+MemorySwapMax=0
 # Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict

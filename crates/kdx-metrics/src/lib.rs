@@ -92,6 +92,12 @@ pub struct Metrics {
     pub graphql_feed_lag_seconds: FGauge,
     /// Approximate bytes of decoded blocks the subscription feed's broadcast ring holds (M-3).
     pub graphql_feed_ring_bytes: Gauge,
+    /// Allocator stats (jemalloc `stats.*`), refreshed every 10 s by the process.
+    pub alloc_allocated_bytes: Gauge,
+    pub alloc_active_bytes: Gauge,
+    pub alloc_resident_bytes: Gauge,
+    pub alloc_retained_bytes: Gauge,
+    pub alloc_mapped_bytes: Gauge,
 }
 
 impl Metrics {
@@ -292,6 +298,31 @@ impl Metrics {
             "Balance reconcile call duration (result ok|absent|error|skipped)",
             hist(seconds)
         );
+        let alloc_allocated_bytes = reg!(
+            "kdx_alloc_allocated_bytes",
+            "Bytes the application has allocated and not freed (jemalloc stats.allocated)",
+            Gauge::default()
+        );
+        let alloc_active_bytes = reg!(
+            "kdx_alloc_active_bytes",
+            "Bytes in active pages backing allocations (jemalloc stats.active)",
+            Gauge::default()
+        );
+        let alloc_resident_bytes = reg!(
+            "kdx_alloc_resident_bytes",
+            "Bytes in physically resident allocator pages (jemalloc stats.resident)",
+            Gauge::default()
+        );
+        let alloc_retained_bytes = reg!(
+            "kdx_alloc_retained_bytes",
+            "Bytes of virtual memory the allocator retains, not returned to the OS (jemalloc stats.retained)",
+            Gauge::default()
+        );
+        let alloc_mapped_bytes = reg!(
+            "kdx_alloc_mapped_bytes",
+            "Bytes in active extents mapped by the allocator (jemalloc stats.mapped)",
+            Gauge::default()
+        );
         Metrics {
             registry: r,
             build_info,
@@ -332,6 +363,11 @@ impl Metrics {
             graphql_subscriptions,
             graphql_feed_lag_seconds,
             graphql_feed_ring_bytes,
+            alloc_allocated_bytes,
+            alloc_active_bytes,
+            alloc_resident_bytes,
+            alloc_retained_bytes,
+            alloc_mapped_bytes,
         }
     }
 
