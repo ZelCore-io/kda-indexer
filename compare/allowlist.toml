@@ -423,10 +423,37 @@ reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block'
 owner_note = "Controller ruling R-P5P9-60 (H2); the order within one block or tx is a contract choice (M2c, R3E-8)."
 
 [[entry]]
-id = "graphql-h5-boundary-cut"
+id = "graphql-h7-window-referee"
 route = "other"
-json_path_glob = "/~graphql-h5-boundary-cut"
+json_path_glob = "/~graphql-h7-window-referee"
 condition = "any"
 request_contains = "graphql:"
-reason = "R-P5P9-61 H5 (ruling (2)): a top-level list in descending height order, cut on both sides at a height boundary. The rows at every height above the boundary match as multisets; at the boundary both sides hold the same number of rows once node-confirmed oracle orphan copies are removed and node-confirmed oracle gaps added back; and every boundary row of either side was checked on the node with a single-row /poll (ours all canonical). The boundary rows leave both pages; the entry carries the node evidence. Anything the node cannot settle stays a diff."
-owner_note = "Controller ruling R-P5P9-61 (2), extending R3E-8: only the order within the boundary height is excused."
+reason = "R-P5P9-62 H7 (window referee; replaces R-P5P9-61 H5): a top-level list where the reference server orders by the transaction's creationTime and ours by block height (our contract, R-P5P9-62 sort key; R3E-8 within a height). Every row is accounted for: rows on both sides match by identity (request key, event or transfer index, block hash, chain, height; never by value alone or id text) and then compare with the ruled matchers; each oracle-only row is non-canonical on the node, a node-confirmed duplicate, or canonical below our lowest height or at it while our page is cut; each ours-only row is canonical on the node (outside the oracle's creationTime window, or an oracle gap); ours is in descending height order. Every one-sided row was read on the node (single-row reads); the entry carries the evidence and the read counts. A failed read, a spent cap or an undecidable identity leaves the record unexplained, and a row the node settles against ours shows as /~graphql-h7-row, which no entry matches."
+owner_note = "PROPOSED (ruling R-P5P9-62; the FV preconditions flip it): the oracle's creationTime order goes into the G4 package as a compat note for the owner."
+
+[[entry]]
+id = "graphql-h8-transfer-order-index"
+route = "other"
+json_path_glob = "/~graphql-h8-transfer-order-index"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-62 H8 (Transfer.orderIndex): ours numbers a transfer by its TRANSFER event's index in the transaction (node-consistent), the reference server by its rank among the transaction's TRANSFER events. For each request key, one read of our own transfers(requestKey) showed that every oracle value is exactly the rank of our transfer with the row's content; the oracle's rows then took our indexes (orderIndex and the index inside the Transfer id; the id's other fields stay the oracle's). Any other numbering stays unexplained."
+owner_note = "PROPOSED (ruling R-P5P9-62; the FV preconditions flip it): no kadscan document requests the field."
+
+[[entry]]
+id = "graphql-h9-creation-time-fraction"
+route = "other"
+json_path_glob = "/~graphql-h9-creation-time-fraction"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-62 H9 (creationTime fraction, R-P5P9-58 watch item #55): at a field set to creation_time_half_even in [graphql] field_rules (transfers.creationTime, meta.creationTime), the reference server's time has a non-zero fraction of a second, ours has none, and ours equals the oracle's value rounded half to even to whole seconds (Pact's ParsedInteger). Whole-second differences and a fraction on our side stay unexplained."
+owner_note = "PROPOSED (ruling R-P5P9-62; the FV preconditions flip it): exact matcher."
+
+[[entry]]
+id = "graphql-r62-payload-data"
+route = "other"
+json_path_glob = "/~graphql-r62-payload-data"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-62 payload.data (rule (a), exact): ours sends the text \"null\" (the node's JSON null) and the reference server \"{}\" for the same request key, and the node's command for that key, read single-row (/poll, the header at its height, that block's payload), is a continuation whose cont.data is null. An exec payload, the reverse direction and a node cont.data that is not null stay unexplained."
+owner_note = "PROPOSED (ruling R-P5P9-62; the FV preconditions flip it): a G4 compat note; kadscan's detail page for such a transaction is to be checked on our backend."

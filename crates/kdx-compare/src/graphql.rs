@@ -3157,11 +3157,34 @@ mod tests {
             STRIPS_QUOTES_PATH,
             COUNT_SELF_CONSISTENT_PATH,
             SCOPED_FINISHED_PATH,
+            crate::graphql_window::WINDOW_PATH,
+            crate::graphql_window::ORDER_INDEX_PATH,
+            crate::graphql_window::PAYLOAD_DATA_PATH,
+            crate::graphql_norm::H9_PATH,
         ]
         .map(|p| entry(p, DiffKind::Changed));
         let (un, ids) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &hits);
         assert!(un.is_empty(), "{un:?}");
-        assert_eq!(ids.len(), 14);
+        assert_eq!(ids.len(), 18);
+        // R-P5P9-62: one entry per new rule, PROPOSED until the FV preconditions flip it.
+        for id in [
+            "graphql-h7-window-referee",
+            "graphql-h8-transfer-order-index",
+            "graphql-h9-creation-time-fraction",
+            "graphql-r62-payload-data",
+        ] {
+            assert!(ids.iter().any(|i| i == id), "{id} not hit: {ids:?}");
+            let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+            assert!(
+                e.owner_note.starts_with("PROPOSED") && e.reason.contains("R-P5P9-62"),
+                "{id}: {e:?}"
+            );
+        }
+        // H7 replaces H5; a row H7 cannot explain is never allowlisted.
+        assert!(!allow.entries.iter().any(|e| e.id == "graphql-h5-boundary-cut"));
+        let row = [entry(crate::graphql_window::ROW_PATH, DiffKind::Changed)];
+        let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &row);
+        assert_eq!(un.len(), 1);
         for id in [
             "graphql-r60-oracle-strips-quotes",
             "graphql-r60-count-self-consistent",
