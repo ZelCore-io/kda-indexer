@@ -90,6 +90,16 @@ fn status_and_result(out: &Value) -> (&'static str, Value) {
     )
 }
 
+/// The summary `kind` of a payload. A JSON-null `cont` is absent (R-P5P9-60 D4),
+/// so an exec payload that also carries `"cont": null` stays "exec".
+fn payload_kind(payload: Option<&Value>) -> &'static str {
+    match payload {
+        Some(p) if shapes::cont_of(p).is_some() => "cont",
+        Some(_) => "exec",
+        None => "unknown",
+    }
+}
+
 /// Short, list-sized view of a tx.
 pub fn summary(view: &View, r: &TxRecord, b: &BlockRecord) -> ApiResult<Value> {
     let out = shapes::output(view, r)?;
@@ -102,11 +112,7 @@ pub fn summary(view: &View, r: &TxRecord, b: &BlockRecord) -> ApiResult<Value> {
         return Ok(Value::Object(m));
     }
     let cmd = shapes::cmd_value(r);
-    let kind = match cmd.as_ref().and_then(|c| c.pointer("/payload")) {
-        Some(p) if p.get("cont").is_some() => "cont",
-        Some(_) => "exec",
-        None => "unknown",
-    };
+    let kind = payload_kind(cmd.as_ref().and_then(|c| c.pointer("/payload")));
     m.insert("kind".into(), kind.into());
     m.insert(
         "sender".into(),
@@ -182,7 +188,7 @@ pub fn detail(view: &View, r: &TxRecord, b: &BlockRecord, proof: bool) -> ApiRes
         .cloned()
         .unwrap_or(Value::Null);
     let mut c = Map::new();
-    if let Some(cont) = payload.get("cont") {
+    if let Some(cont) = shapes::cont_of(&payload) {
         m.insert("kind".into(), "cont".into());
         c.insert(
             "pact_id".into(),
@@ -420,4 +426,22 @@ fn output_pact(out: &Value) -> (Option<kdx_types::Hash32>, Option<Value>) {
             .and_then(|s| kdx_types::Hash32::from_b64url(s).ok()),
         c.and_then(|c| c.get("step")).cloned(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R-P5P9-60 D4: an exec payload that also carries `"cont": null` stays
+    /// "exec"; a real continuation is still "cont".
+    #[test]
+    fn null_cont_kind_is_exec() {
+        let exec_null = json!({
+            "exec": {"code": "(+ 1 2)", "data": {"ks": {"keys": ["k"]}}},
+            "cont": null});
+        assert_eq!(payload_kind(Some(&exec_null)), "exec");
+        let real = json!({"cont": {"pactId": "p", "step": 0}});
+        assert_eq!(payload_kind(Some(&real)), "cont");
+        assert_eq!(payload_kind(None), "unknown");
+    }
 }
