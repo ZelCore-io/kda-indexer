@@ -19,11 +19,14 @@ use kdx_hot::balances::{bal_key, BalanceRow};
 use kdx_hot::{HotDict, Table};
 use kdx_segment::{Manifest, RangeKind, RangeWriter, WriteOpts};
 use kdx_types::hash::b64url_encode;
-use kdx_types::{blake2b_256, DictKind, DictMut};
+use kdx_types::{blake2b_256, DictKind, DictMut, TxKey};
 use serde_json::{json, Value};
 
 /// Heights below this are frozen (in segments), the rest hot.
 const FRONTIER: u32 = 10;
+/// The frozen blocks are written as two step ranges, `[0, FIRST_RANGE_END)` and
+/// `[FIRST_RANGE_END, FRONTIER)`.
+const FIRST_RANGE_END: u32 = 5;
 const ALICE: &str = "k:alice";
 const BOB: &str = "k:bob";
 const CAROL: &str = "k:carol";
@@ -46,9 +49,14 @@ enum Shape {
 
 /// The fixture's blocks: `(chain, height, user txs)`. Heights below [`FRONTIER`] are frozen.
 const BLOCKS: &[(u8, u32, &[Shape])] = &[
-    (0, 4, &[Shape::Many, Shape::One]),
+    // The last tx of range 1 has several rows: a cursor in it bounds at the start of range 2.
+    (0, 4, &[Shape::One, Shape::Many]),
     (0, 6, &[Shape::Nft, Shape::Many]),
     (1, 6, &[Shape::Many]),
+    // The top frozen height: a cursor here bounds at `FRONTIER` (the `next_txnum` arm).
+    (1, 9, &[Shape::Many, Shape::Nft]),
+    // Hot, exactly at the frontier.
+    (0, FRONTIER, &[Shape::Many]),
     (0, 11, &[Shape::Many, Shape::Nft]),
     (0, 12, &[Shape::Many]),
     (1, 12, &[Shape::One, Shape::Many]),
@@ -158,8 +166,8 @@ struct Fx {
     rks: HashMap<(u8, u32), Vec<String>>,
 }
 
-/// The store: [`BLOCKS`] below [`FRONTIER`] in one frozen step range (as the freezer writes
-/// it), the rest applied to the hot store by the tail writer; Alice holds coin on both
+/// The store: [`BLOCKS`] below [`FRONTIER`] in two frozen step ranges (as the freezer writes
+/// them), the rest applied to the hot store by the tail writer; Alice holds coin on both
 /// chains and NFTs on chain 0, so her account nodes resolve.
 fn fixture() -> Fx {
     let d = tempfile::tempdir().unwrap();
@@ -177,26 +185,32 @@ fn fixture() -> Fx {
         index_block(&b, &VerifyReport::default(), dict).expect("block indexes")
     };
     let segdir = d.path().join("segments");
-    let mut w = RangeWriter::create(
-        &segdir,
-        &d.path().join("etl"),
-        "mainnet01",
-        RangeKind::Step,
-        0,
-        FRONTIER,
-        0,
-        WriteOpts::new(1, 0),
-    )
-    .unwrap();
-    for &(c, h, shapes) in BLOCKS.iter().filter(|b| b.1 < FRONTIER) {
-        w.push(&index(c, h, shapes, &mut dict)).unwrap();
-    }
-    let entry = w.finish().unwrap();
+    // Two step ranges, so that a cursor in the last tx of range 1 bounds at the first height
+    // of range 2 (`FIRST_RANGE_END`), and one cursor bounds at `FRONTIER`.
     let mut m = Manifest::new("mainnet01");
-    m.push(entry.clone()).unwrap();
+    let mut first_txnum = 0;
+    for (start, end) in [(0, FIRST_RANGE_END), (FIRST_RANGE_END, FRONTIER)] {
+        let mut w = RangeWriter::create(
+            &segdir,
+            &d.path().join(format!("etl-{start}")),
+            "mainnet01",
+            RangeKind::Step,
+            start,
+            end,
+            first_txnum,
+            WriteOpts::new(1, 0),
+        )
+        .unwrap();
+        for &(c, h, shapes) in BLOCKS.iter().filter(|b| (start..end).contains(&b.1)) {
+            w.push(&index(c, h, shapes, &mut dict)).unwrap();
+        }
+        let entry = w.finish().unwrap();
+        first_txnum = entry.end_txnum();
+        m.push(entry).unwrap();
+    }
     m.commit(&segdir).unwrap();
     t.set_frozen_frontier(FRONTIER).unwrap();
-    t.set_next_txnum(entry.end_txnum()).unwrap();
+    t.set_next_txnum(first_txnum).unwrap();
     for &(c, h, shapes) in BLOCKS.iter().filter(|b| b.1 >= FRONTIER) {
         let ib = index(c, h, shapes, &mut dict);
         kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
@@ -706,4 +720,177 @@ async fn cursors_keep_their_format_and_bad_ones_are_refused() {
             .unwrap_or_default();
         assert!(msg.contains("invalid cursor"), "{bad}: {:?}", r.errors);
     }
+}
+
+/// The cursor of Alice's transfer at order index 5 of the first user tx of block 6 on chain 1
+/// (`6/1/1`, sub 5), as a version-1 cursor minted before the fix encoded it: version 1, tx key
+/// (height 6, chain 1, position 1), sub 5, fingerprint of that block's hash. The fixture's keys
+/// and hashes are fixed, so the text is too; it does not come from the code under test.
+const GOLDEN_CURSOR: &str = "AQAAAAYBAAEAAAWBBrCw";
+
+/// A cursor minted before the fix resumes at its row: the rest of its tx (orders 4, 3, 1), in
+/// a frozen block. The code now mints the same text for that row.
+#[tokio::test]
+async fn a_cursor_minted_before_the_fix_resumes_at_its_row() {
+    let fx = fixture();
+    let rk = &fx.rks[&(1, 6)][0];
+    let page = |args: &str| {
+        format!(
+            "{{ transfers(accountName: \"{ALICE}\", {args}) \
+             {{ edges {{ cursor node {{ requestKey orderIndex }} }} }} }}"
+        )
+    };
+    // Today's code mints the golden text for that row.
+    let v = run(&fx.schema, &page("first: 100")).await;
+    let minted = v["transfers"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["node"]["requestKey"] == rk.as_str() && e["node"]["orderIndex"] == 5)
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(minted["cursor"], GOLDEN_CURSOR);
+    // `after:` the golden cursor gives the next rows of the same tx.
+    let v = run(
+        &fx.schema,
+        &page(&format!("first: 3, after: \"{GOLDEN_CURSOR}\"")),
+    )
+    .await;
+    let rows = v["transfers"]["edges"].as_array().unwrap();
+    let got: Vec<String> = rows
+        .iter()
+        .map(|e| format!("{}#{}", e["node"]["requestKey"], e["node"]["orderIndex"]))
+        .collect();
+    let want: Vec<String> = [4, 3, 1].iter().map(|o| format!("\"{rk}\"#{o}")).collect();
+    assert_eq!(got, want, "{v}");
+}
+
+/// Well-formed cursors that no page minted: the fingerprint of a stored block (so the reorg
+/// check passes) with a key or sub the list never issues. Each answers at most `n` rows and
+/// no error, except `cursor invalidated by reorg` where the block is not the stored one.
+#[tokio::test]
+async fn crafted_well_formed_cursors_answer_at_most_a_page() {
+    let fx = fixture();
+    // The fingerprint of block `(c, h)`: the first 4 bytes of its hash (`hash_of`).
+    let fp = |c: u8, h: u32| u32::from_be_bytes([0x80 | c, h as u8, 0xB0, 0xB0]);
+    let at = TxKey::new(6, 1, 1);
+    let crafted: Vec<(&str, kdx_api::Cursor)> = vec![
+        (
+            "sub past the end of the tx",
+            kdx_api::Cursor {
+                key: at,
+                sub: 99,
+                fp: fp(1, 6),
+            },
+        ),
+        (
+            "sub u16::MAX",
+            kdx_api::Cursor {
+                key: at,
+                sub: u16::MAX,
+                fp: fp(1, 6),
+            },
+        ),
+        (
+            "pos past the block",
+            kdx_api::Cursor {
+                key: TxKey::new(6, 1, 50),
+                sub: 0,
+                fp: fp(1, 6),
+            },
+        ),
+        (
+            "non-zero low byte",
+            kdx_api::Cursor {
+                key: TxKey(at.0 | 0x01),
+                sub: 3,
+                fp: fp(1, 6),
+            },
+        ),
+        (
+            "non-zero low byte, hot block",
+            kdx_api::Cursor {
+                key: TxKey(TxKey::new(11, 0, 1).0 | 0xFF),
+                sub: 3,
+                fp: fp(0, 11),
+            },
+        ),
+        (
+            "fp 0 at an empty position",
+            kdx_api::Cursor {
+                key: TxKey::new(7, 0, 0),
+                sub: 0,
+                fp: 0,
+            },
+        ),
+        (
+            "fp 0 at a stored block (reorg)",
+            kdx_api::Cursor {
+                key: at,
+                sub: 1,
+                fp: 0,
+            },
+        ),
+        (
+            "key u64::MAX",
+            kdx_api::Cursor {
+                key: TxKey(u64::MAX),
+                sub: u16::MAX,
+                fp: 0,
+            },
+        ),
+        (
+            "key u64::MAX, fp u32::MAX",
+            kdx_api::Cursor {
+                key: TxKey(u64::MAX),
+                sub: u16::MAX,
+                fp: u32::MAX,
+            },
+        ),
+        (
+            "key 0",
+            kdx_api::Cursor {
+                key: TxKey(0),
+                sub: 0,
+                fp: 0,
+            },
+        ),
+    ];
+    let n = 3;
+    let (mut bad, mut answered, mut reorged) = (Vec::new(), 0, 0);
+    for field in [
+        "transfers(accountName: \"k:alice\"",
+        "events(qualifiedEventName: \"coin.TRANSFER\"",
+        "transactions(accountName: \"k:alice\"",
+    ] {
+        for (what, c) in &crafted {
+            let tok = c.encode();
+            for args in [
+                format!("first: {n}, after: \"{tok}\""),
+                format!("last: {n}, before: \"{tok}\""),
+            ] {
+                let q = format!("{{ {field}, {args}) {{ edges {{ cursor }} }} }}");
+                let r = fx.schema.execute(q.as_str()).await;
+                let name = field.split('(').next().unwrap();
+                if let Some(e) = r.errors.first() {
+                    if !e.message.contains(kdx_api::cursor::REORGED) {
+                        bad.push(format!("{what}, {args}: {name}: error {}", e.message));
+                    }
+                    reorged += 1;
+                    continue;
+                }
+                answered += 1;
+                let v = serde_json::to_value(&r.data).unwrap();
+                let rows = v[name]["edges"].as_array().map_or(0, Vec::len);
+                if rows > n {
+                    bad.push(format!("{what}, {args}: {name}: {rows} rows for n = {n}"));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // Both outcomes occur, so the table is not vacuous.
+    assert!(
+        answered > 0 && reorged > 0,
+        "{answered} answered, {reorged} reorged"
+    );
 }
