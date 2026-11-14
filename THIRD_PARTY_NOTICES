@@ -29,7 +29,8 @@ libmdbx (bundled by reth-mdbx-sys, statically linked)
 chainweb-data (crates/kdx-api/data/{miner_rewards.csv,token_payments.csv}, src/supply.rs)
   The two CSV files are copied from kda-community/chainweb-data (haskell-src/data), and
   src/supply.rs reproduces the circulating-supply formula of its Chainweb.Coins module.
-  The comparison harness (crates/kdx-compare/src/rewards.rs) embeds miner_rewards.csv.
+  The comparison harness embeds a copy of miner_rewards.csv
+  (crates/kdx-compare/data/miner_rewards.csv, read by src/rewards.rs).
   BSD-3-Clause. The licence text of that repository follows.
 
   Copyright Author name here (c) 2019
