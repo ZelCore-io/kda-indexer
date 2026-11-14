@@ -5138,3 +5138,116 @@ async fn c5b_the_node_gap_cut_keeps_a_row_only_the_limiting_side_has() {
     let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
     assert_eq!(o.class, "diff", "{:?}", o.record.map(|r| (r.note, r.diff)));
 }
+
+// ---------------------------------------------------------------------------------------------
+// FVH-C5b: memory bounds (R-P5P9-70 m-2)
+
+/// R-P5P9-70 (m-2): H6's nested pages count per side against `MERGED_BYTES_CAP`. A cut list
+/// whose pages pass it (300 rows of about 120 KiB, 6 MiB pages) is left unread, with the
+/// `/~harness-limit/` merged-bytes entry, and its cut page stays a diff.
+#[tokio::test]
+async fn c5b_h6_nested_pages_count_against_the_merged_bytes_cap() {
+    use crate::graphql::{compare_answers_with, parse_op, MERGED_BYTES_PATH};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let rows: Vec<Value> = (0..300)
+        .map(|i| json!([format!("k{i}"), {"cmd": {"meta": {"gasPrice": i as f64 * 1e-9, "pad": "x".repeat(120 << 10)}}}]))
+        .collect();
+    let lists = json!({ "FAT": rows });
+    let calls = Arc::new(Mutex::new(0));
+    let au = keyed_list_server(lists.clone(), calls.clone(), 50, None, false).await;
+    let bu = keyed_list_server(lists.clone(), calls.clone(), 50, None, false).await;
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let out = dir.path();
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = "no-such-dir"
+list_page_budget = 40
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_graphql"
+rate_rps = 1000.0
+[targets.b]
+url = "{bu}"
+kind = "kda_indexer_graphql"
+rate_rps = 1000.0
+"#
+    ))
+    .unwrap();
+    let ctx = Ctx::new(cfg).await.unwrap();
+    let op = parse_op(
+        "BlocksByHeight",
+        "query BlocksByHeight($startHeight: Int!, $endHeight: Int) { blocksFromHeight(startHeight: $startHeight, endHeight: $endHeight) { edges { node { chainId creationTime transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } height coinbase hash canonical } } } }",
+        false,
+    )
+    .unwrap();
+    // Ours' cut page is the first 20 rows, the oracle's the last 20.
+    let answer = |head: bool| {
+        let r = lists["FAT"].as_array().unwrap();
+        let idx: Vec<usize> = if head {
+            (0..20).collect()
+        } else {
+            (280..300).collect()
+        };
+        let tx: Vec<Value> = idx.iter().map(|i| json!({"node": r[*i][1]})).collect();
+        crate::graphql::Answer {
+            body: json!({"data": {"blocksFromHeight": {"edges": [{"node": {"chainId": 0,
+                "hash": "FAT", "height": 4968386,
+                "transactions": {"totalCount": 300, "edges": tx}}}]}}}),
+            status: 200,
+            raw: String::new(),
+            ms: Vec::new(),
+        }
+    };
+    let (mut a, mut b) = (answer(true), answer(false));
+    let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+    let (n, entries) = ctx
+        .gql_finish_lists(&op, &serde_json::Map::new(), ta, tb, &mut a, &mut b)
+        .await;
+    let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!((n, paths), (0, vec![MERGED_BYTES_PATH]), "{entries:?}");
+    let d = compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false);
+    assert!(!d.is_empty());
+}
+
+/// R-P5P9-70 (m-2): an in-memory `/v1/txs` compare with a side over 8 MiB waits for the
+/// process-wide permit: while another large compare holds it, this one does not finish; a
+/// small one does. Released, the large one finishes.
+#[tokio::test]
+async fn c5b_the_semaphore_serialises_large_v1txs_answers() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    // About 9 MiB a side: over the 8 MiB mark, under the 32 MiB cap (in memory).
+    let large = serde_json::to_vec(&v1_rows(60, 160_000)).unwrap();
+    assert!(large.len() > super::V1TXS_LARGE_BYTES && large.len() < 16 << 20);
+    let ctx = v1_setup(large.clone(), large, dir.path()).await;
+    let small_dir = tempfile::tempdir().unwrap();
+    let small = serde_json::to_vec(&v1_rows(10, 10)).unwrap();
+    let small_ctx = v1_setup(small.clone(), small, small_dir.path()).await;
+    // The time a large compare takes unhindered (under the permit, released at once).
+    let t0 = Instant::now();
+    let o = v1_compare(&ctx, "/v1/txs/k:big/coin/60").await;
+    assert_eq!(o.class, "allowlisted", "{:?}", o.record.map(|r| r.diff));
+    let wait = (t0.elapsed() * 3).max(Duration::from_secs(2));
+    // Another large compare holds the permit.
+    let held = super::V1TXS_LARGE.acquire().await.unwrap();
+    let blocked = tokio::time::timeout(wait, v1_compare(&ctx, "/v1/txs/k:big/coin/60")).await;
+    assert!(blocked.is_err(), "a large compare ran beside another");
+    let o = tokio::time::timeout(wait, v1_compare(&small_ctx, "/v1/txs/k:big/coin/10")).await;
+    assert!(o.is_ok(), "a small compare waited for the permit");
+    drop(held);
+    let o = tokio::time::timeout(wait * 2, v1_compare(&ctx, "/v1/txs/k:big/coin/60")).await;
+    assert!(
+        o.is_ok(),
+        "the large compare did not finish once the permit was free"
+    );
+}

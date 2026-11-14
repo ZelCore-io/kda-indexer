@@ -820,6 +820,9 @@ pub(crate) enum ListStop {
     /// More than `MAX_PAGES` pages (or a `totalCount` above `MAX_PAGES` × `PAGE_SIZE` for the
     /// one-page retry): a harness limit (R-P5P9-64 M-5).
     MaxPages,
+    /// That side's nested page bytes in this compare passed [`MERGED_BYTES_CAP`]: a harness
+    /// limit (R-P5P9-70 m-2).
+    Bytes,
 }
 
 /// An answer: the response (pages merged), the HTTP statuses and a verdict on transport.
@@ -1753,6 +1756,9 @@ impl Ctx {
         }
         let (la, lb) = (scoped_lists(&a.body), scoped_lists(&b.body));
         let mut budget = [self.cfg.graphql.list_page_budget; 2];
+        // R-P5P9-70 (m-2): each side's nested page bytes, against MERGED_BYTES_CAP.
+        let mut bytes = [0usize; 2];
+        let mut heavy = Vec::new();
         let (mut done, mut limited, mut long) = (0, Vec::new(), Vec::new());
         // R-P5P9-64 I-5: a cut list left unfinished, per side, with why.
         let mut unfinished: [Vec<Value>; 2] = Default::default();
@@ -1774,17 +1780,37 @@ impl Ctx {
             // R-P5P9-67 I-D: the one-page retry is the oracle's only (its `Block.events`); a
             // cursor-page failure of ours leaves the list unfinished.
             let fa = self
-                .gql_read_list(ta, &q, &vars, at, &mut budget[0], ta_total, false)
+                .gql_read_list(
+                    ta,
+                    &q,
+                    &vars,
+                    at,
+                    (&mut budget[0], &mut bytes[0]),
+                    ta_total,
+                    false,
+                )
                 .await;
             let fb = match &fa {
                 Ok(_) => {
-                    self.gql_read_list(tb, &q, &vars, at, &mut budget[1], tb_total, true)
-                        .await
+                    self.gql_read_list(
+                        tb,
+                        &q,
+                        &vars,
+                        at,
+                        (&mut budget[1], &mut bytes[1]),
+                        tb_total,
+                        true,
+                    )
+                    .await
                 }
                 Err(e) => Err(*e),
             };
             let (fa, fb) = match (fa, fb) {
                 (Ok(fa), Ok(fb)) => (fa, fb),
+                (Err(ListStop::Bytes), _) | (_, Err(ListStop::Bytes)) => {
+                    heavy.push(json!(l.pointer));
+                    continue;
+                }
                 (Err(ListStop::Budget), _) | (_, Err(ListStop::Budget)) => {
                     limited.push(json!(l.pointer));
                     continue;
@@ -1842,6 +1868,17 @@ impl Ctx {
                 b: Some(json!({"lists": limited})),
             });
         }
+        if !heavy.is_empty() {
+            tracing::warn!(op = %op.stem, lists = heavy.len(),
+                "harness limit: cut nested lists past the merged-bytes cap");
+            out.push(DiffEntry {
+                path: MERGED_BYTES_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({"bytes_a": bytes[0], "bytes_b": bytes[1],
+                    "cap": MERGED_BYTES_CAP})),
+                b: Some(json!({"lists": heavy})),
+            });
+        }
         if !long.is_empty() {
             tracing::warn!(op = %op.stem, lists = long.len(),
                 "harness limit: cut nested lists past MAX_PAGES pages");
@@ -1878,7 +1915,7 @@ impl Ctx {
         query: &str,
         vars: &Value,
         at: &str,
-        budget: &mut usize,
+        (budget, bytes): (&mut usize, &mut usize),
         total: Option<u64>,
         retry: bool,
     ) -> Result<Vec<Value>, ListStop> {
@@ -1888,7 +1925,15 @@ impl Ctx {
         let mut keys = std::collections::HashSet::new();
         for page in 0..MAX_PAGES {
             match self
-                .gql_list_page(t, query, &v, at, budget, &mut keys, &mut out)
+                .gql_list_page(
+                    t,
+                    query,
+                    &v,
+                    at,
+                    (&mut *budget, &mut *bytes),
+                    &mut keys,
+                    &mut out,
+                )
                 .await
             {
                 Ok(None) => return Ok(out),
@@ -1903,7 +1948,7 @@ impl Ctx {
                     let (mut keys, mut out) = (std::collections::HashSet::new(), Vec::new());
                     let q = one_page(query, n);
                     return match self
-                        .gql_list_page(t, &q, vars, at, budget, &mut keys, &mut out)
+                        .gql_list_page(t, &q, vars, at, (budget, bytes), &mut keys, &mut out)
                         .await?
                     {
                         None => Ok(out),
@@ -1927,11 +1972,14 @@ impl Ctx {
         query: &str,
         vars: &Value,
         at: &str,
-        budget: &mut usize,
+        (budget, bytes): (&mut usize, &mut usize),
         keys: &mut std::collections::HashSet<String>,
         out: &mut Vec<Value>,
     ) -> Result<Option<Value>, ListStop> {
         use crate::graphql_scope::KEY_ALIAS;
+        if *bytes > MERGED_BYTES_CAP {
+            return Err(ListStop::Bytes);
+        }
         if *budget == 0 {
             return Err(ListStop::Budget);
         }
@@ -1943,6 +1991,11 @@ impl Ctx {
         self.gql_count(SCOPED_LIST_ROUTE, &t.name, &[c.ms]);
         if c.status != 200 {
             return Err(ListStop::Failed("a page answered a status other than 200"));
+        }
+        // R-P5P9-70 (m-2): the page counts before it is parsed.
+        *bytes += c.body.len();
+        if *bytes > MERGED_BYTES_CAP {
+            return Err(ListStop::Bytes);
         }
         let bad = ListStop::Failed("a page is not a list answer");
         let v: Value = serde_json::from_slice(&c.body).map_err(|_| bad)?;

@@ -32,6 +32,12 @@ use crate::target::{HttpCapture, Target};
 const WORKERS: usize = 3;
 /// kda-txs's own query limit; a 404 that took this long is its timeout.
 const KDA_TXS_LIMIT_MS: u64 = 29_000;
+/// R-P5P9-70 (m-2): an in-memory `/v1/txs` compare with a side's body over this many bytes
+/// takes the one permit of [`V1TXS_LARGE`] first.
+const V1TXS_LARGE_BYTES: usize = 8 << 20;
+/// R-P5P9-70 (m-2): process-wide, one large in-memory `/v1/txs` compare at a time (about
+/// 0.8 GiB at the 32 MiB cap a side), so the workers together stay under `MemoryMax=4G`.
+pub(crate) static V1TXS_LARGE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// At most this many A-only account rows are checked against chainweb-data's /txs/tx.
 const GAP_CHECKS: usize = 5;
 /// At most this many canonical-header lookups on the node per compare for the orphan rules
@@ -794,7 +800,7 @@ impl Ctx {
         if req.route == RouteKind::V1Txs && (over(&pa) || over(&pb)) {
             return self.v1txs_streamed(req, ta, tb, pa, pb, extra).await;
         }
-        let (pa, pb) = match (pa, pb) {
+        let (mut pa, mut pb) = match (pa, pb) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) => return self.a_error(req, ta, &tb.name, None, &format!("{e:#}")),
             (Ok(a), Err(e)) => {
@@ -828,7 +834,31 @@ impl Ctx {
                 String::new(),
             );
         }
-        let (mut va, mut vb) = (pa.items.clone(), pb.items.clone());
+        // R-P5P9-70 (m-2): a large in-memory /v1/txs answer waits for the process-wide permit,
+        // held to the end of this compare.
+        let bytes = |p: &Paged| p.pages.iter().map(|c| c.body.len()).sum::<usize>();
+        let _large = if req.route == RouteKind::V1Txs
+            && (bytes(&pa) > V1TXS_LARGE_BYTES || bytes(&pb) > V1TXS_LARGE_BYTES)
+        {
+            Some(
+                V1TXS_LARGE
+                    .acquire()
+                    .await
+                    .expect("V1TXS_LARGE is never closed"),
+            )
+        } else {
+            None
+        };
+        // A one-page answer's rows are moved, not copied (R-P5P9-70 m-2): its record shows
+        // the page body. Merged pages keep their rows for the record.
+        let rows = |p: &mut Paged| {
+            if p.pages.len() == 1 {
+                std::mem::take(&mut p.items)
+            } else {
+                p.items.clone()
+            }
+        };
+        let (mut va, mut vb) = (rows(&mut pa), rows(&mut pb));
         let page_cut = req.route.paginated()
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         // chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain:
