@@ -333,6 +333,10 @@ fn d_out_dir() -> PathBuf {
     PathBuf::from("test-runs/compare")
 }
 
+/// H7's header-by-hash reads a second (one in flight), outside the node client's limiter
+/// (R-P5P9-65 (2)).
+pub const HEADER_RPS: u32 = 1;
+
 impl CompareConfig {
     pub fn load(path: &Path) -> anyhow::Result<CompareConfig> {
         let text =
@@ -436,6 +440,17 @@ impl CompareConfig {
         })
     }
 
+    /// The node client's rate (R-P5P9-65 (2)): `node_max_rps` less the one read a second of
+    /// H7's header-by-hash reads ([`HEADER_RPS`]), which the node client does not offer, so
+    /// the two together stay within `node_max_rps`. 0 (no limit) stays 0; at 1 the node
+    /// client keeps 1.
+    pub fn node_client_rps(&self) -> u32 {
+        match self.node_max_rps {
+            0 => 0,
+            n => n.saturating_sub(HEADER_RPS).max(1),
+        }
+    }
+
     pub fn node_client(&self) -> anyhow::Result<kdx_node::NodeClient> {
         let p2p_cert_sha256 = self
             .node
@@ -448,7 +463,7 @@ impl CompareConfig {
             base: self.node.url.clone(),
             network: self.network.clone(),
             timeout: Duration::from_millis(self.node.timeout_ms),
-            max_rps: self.node_max_rps,
+            max_rps: self.node_client_rps(),
             concurrency: 8,
             p2p_url: self.node.p2p_url.clone(),
             p2p_cert_sha256,

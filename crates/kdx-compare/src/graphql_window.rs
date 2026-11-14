@@ -1752,8 +1752,9 @@ impl Ctx {
     /// R-P5P9-63 (5): the node's height of block `hash`, by the node's header-by-hash route
     /// (`GET /chain/{c}/header/{hash}`, object encoding); `None` when the node does not know
     /// the block. The node client has no such call, so the harness reads it with its own
-    /// client, paced at `node_max_rps`, one read in flight.
-    async fn h7_block_height(
+    /// client at [`crate::config::HEADER_RPS`], one read in flight; the node client runs at
+    /// `node_max_rps` less that, so the two stay within `node_max_rps` (R-P5P9-65 (2)).
+    pub(crate) async fn h7_block_height(
         &self,
         chain: u8,
         hash: &str,
@@ -1763,9 +1764,7 @@ impl Ctx {
             return v.clone();
         }
         self.h7_take(st)?;
-        let (client, limiter) = self
-            .gql
-            .header_reader(self.cfg.node_max_rps, self.cfg.node.timeout_ms);
+        let (client, limiter) = self.gql.header_reader(self.cfg.node.timeout_ms);
         let path = format!(
             "chainweb/0.0/{}/chain/{chain}/header/{hash}",
             self.cfg.network
@@ -1776,6 +1775,7 @@ impl Ctx {
                 .base()
                 .join(&path)
                 .map_err(|e| format!("header url: {e}"))?;
+            let _slot = limiter.slot().await;
             limiter.acquire().await;
             let resp = client
                 .get(url)

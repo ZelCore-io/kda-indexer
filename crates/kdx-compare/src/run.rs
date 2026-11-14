@@ -709,6 +709,7 @@ impl Ctx {
             curl: format!("curl -s {} ; {}", sh_url("A", &req.path_and_query), b_curl),
             note,
             body_cap: None,
+            a_pages: None,
         }
     }
 
@@ -2244,7 +2245,8 @@ impl Ctx {
     /// The node's canonical block hash at `(c, h)` (`header/branch` up to the cut, never the
     /// plain header range, which also returns orphans), from `cache`, from the cache shared by
     /// all compares, or one lookup while fewer than ORPHAN_CHECKS were made; `None` when the
-    /// budget is spent. The node client applies `node_max_rps`.
+    /// budget (or the referee's run cap, R-P5P9-64 M-8) is spent. The node client applies
+    /// its share of `node_max_rps`.
     async fn canon_cached(
         &self,
         cache: &mut HashMap<(u8, u64), Option<String>>,
@@ -2260,7 +2262,8 @@ impl Ctx {
             cache.insert((c, h), Some(v.clone()));
             return Some(Some(v));
         }
-        if *checks >= ORPHAN_CHECKS {
+        // R-P5P9-64 M-8: the referee's run cap counts this read too (unbounded in a live run).
+        if *checks >= ORPHAN_CHECKS || !self.gql.take_node_read() {
             return None;
         }
         *checks += 1;

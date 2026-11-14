@@ -154,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let rep = kdx_compare::referee::run(cfg, &opts).await?;
             println!("{}", serde_json::to_string_pretty(&rep)?);
-            if rep.unexplained + rep.not_refereed > 0 {
+            if !rep.passed() {
                 std::process::exit(1);
             }
             Ok(())

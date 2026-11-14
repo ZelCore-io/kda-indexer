@@ -58,7 +58,6 @@ const ROW_RULE_CHECKS: usize = 3;
 const ROW_RULE_ROUTE: &str = "graphql-row-rule";
 /// Summary route of the harness's own nested-list reads (R-P5P9-60 H2).
 const SCOPED_LIST_ROUTE: &str = "graphql-scoped-list";
-/// Route name of the H5 node reads (R-P5P9-61).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
@@ -540,7 +539,7 @@ pub struct GqlState {
     /// Node reads the node-refereed rules may still make in this process (R-P5P9-62: the
     /// referee's run cap; unbounded in a live run, where each compare has its own cap).
     pub node_budget: AtomicUsize,
-    /// The client and limiter of H7's header-by-hash reads (R-P5P9-63 (5)).
+    /// The client and limiter of H7's header-by-hash reads (R-P5P9-63 (5), R-P5P9-65 (2)).
     header: std::sync::OnceLock<(reqwest::Client, Arc<crate::target::Limiter>)>,
 }
 
@@ -575,13 +574,14 @@ impl GqlState {
         })
     }
 
-    /// The client and limiter (at `rps`, one read in flight) of the node's header-by-hash
-    /// reads, which the node client does not offer (R-P5P9-63 (5)).
+    /// The client and limiter (at [`crate::config::HEADER_RPS`], one read in flight) of the
+    /// node's header-by-hash reads, which the node client does not offer (R-P5P9-63 (5)); the
+    /// node client runs at `node_max_rps` less that (R-P5P9-65 (2)).
     pub(crate) fn header_reader(
         &self,
-        rps: u32,
         timeout_ms: u64,
     ) -> &(reqwest::Client, Arc<crate::target::Limiter>) {
+        let rps = crate::config::HEADER_RPS;
         self.header.get_or_init(|| {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -790,13 +790,25 @@ fn truncate_edges(data: &mut Value, n: usize) {
     }
 }
 
+/// Where H6 (finishing cut nested lists) comes from in [`Ctx::gql_rules`].
+pub(crate) enum H6<'a> {
+    /// The live compare reads the lists on both sides (B: the oracle).
+    Live(&'a Target),
+    /// The referee, which never asks the oracle, carries the stored record's H6 entries
+    /// (its unexplained diff): a list the live run did not finish stays unexplained.
+    Stored(&'a [DiffEntry]),
+}
+
 /// Why a nested list read stopped before its end (R-P5P9-61 H6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ListStop {
-    /// An error, a page past `MAX_PAGES`, or a row key missing or seen twice.
-    Failed,
+    /// An error, or a row key missing or seen twice: why.
+    Failed(&'static str),
     /// The compare's page budget for that side ran out: a harness limit.
     Budget,
+    /// More than `MAX_PAGES` pages (or a `totalCount` above `MAX_PAGES` × `PAGE_SIZE` for the
+    /// one-page retry): a harness limit (R-P5P9-64 M-5).
+    MaxPages,
 }
 
 /// An answer: the response (pages merged), the HTTP statuses and a verdict on transport.
@@ -1274,6 +1286,7 @@ impl Ctx {
             curl: format!("{} ; {}", curl_of(op, vars, "A"), curl_of(op, vars, "B")),
             note,
             body_cap: None,
+            a_pages: a_ans.map(|x| x.ms.len()),
         };
         Outcome {
             class: class.to_string(),
@@ -1374,32 +1387,63 @@ impl Ctx {
                 Some("oracle server error".into()),
             );
         }
-        let mut row_hits = self.gql_row_rules(ta, vars, &mut a, &mut b).await;
-        let (finished, limit) = self
-            .gql_finish_lists(op, vars, ta, tb, &mut a, &mut b)
+        let (d, note) = self
+            .gql_rules(ta, H6::Live(tb), op, vars, &mut a, &mut b, max)
             .await;
-        if finished > 0 {
-            row_hits.push(crate::graphql_scope::SCOPED_FINISHED_PATH);
-        }
+        self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d, note)
+    }
+
+    /// Every rule on an oracle pair's two answers after the fetch, in one place for the live
+    /// compare and `kda-compare referee` (R-P5P9-64 M-1, R-P5P9-65 (1)): the row rules, H6
+    /// (live, or the stored record's H6 entries), then [`Ctx::gql_settle_op`] with the
+    /// document. Returns the diff entries to classify and H7's note.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_rules(
+        &self,
+        ta: &Target,
+        h6: H6<'_>,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+    ) -> (Vec<DiffEntry>, Option<String>) {
+        let root_scoped = crate::graphql_scope::root_scoped(&op.roots, vars);
+        let mut row_hits = self.gql_row_rules(ta, vars, a, b).await;
+        let h6 = match h6 {
+            H6::Live(tb) => {
+                let (finished, entries) = self.gql_finish_lists(op, vars, ta, tb, a, b).await;
+                if finished > 0 {
+                    row_hits.push(crate::graphql_scope::SCOPED_FINISHED_PATH);
+                }
+                entries
+            }
+            H6::Stored(diff) => diff
+                .iter()
+                .filter(|e| crate::graphql_scope::is_h6_entry(&e.path))
+                .cloned()
+                .collect(),
+        };
         // R-P5P9-62: H7 and the diff.
         let (mut d, note) = self
-            .gql_settle_op(ta, Some(op), vars, &mut a, &mut b, max, root_scoped)
+            .gql_settle_op(ta, Some(op), vars, a, b, max, root_scoped)
             .await;
-        d.extend(limit);
+        d.extend(h6);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
             path: p.into(),
             kind: DiffKind::Changed,
             a: None,
             b: None,
         }));
-        self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d, note)
+        (d, note)
     }
 
     /// R-P5P9-62: the refereed rules on an oracle pair's two answers after the fetch and the
     /// row rules: H8 (`Transfer.orderIndex`), the `payload.data` matcher, H7 (the window
     /// referee) and the diff with the ruled matchers (H9 among them).
-    /// Returns the diff entries and H7's note. Shared by the live compare and
-    /// `kda-compare referee`.
+    /// Returns the diff entries and H7's note. Without the document: the tests' entry point;
+    /// the live compare and `kda-compare referee` go through [`Ctx::gql_rules`].
+    #[cfg(test)]
     pub(crate) async fn gql_settle(
         &self,
         ta: &Target,
@@ -1455,8 +1499,8 @@ impl Ctx {
     /// `list_page_budget` pages per side and compare) and stand in for the page when each
     /// side's page is a part of its own full list and no row key comes twice; the full sets
     /// then compare with their `totalCount`. A list not finished is left as it was (its
-    /// diff stays). Returns how many lists were finished, and the harness-limit entry when
-    /// the budget left a cut list unread.
+    /// diff stays). Returns how many lists were finished, and H6's entries for the cut lists
+    /// it did not finish (R-P5P9-64 I-5, M-5): the budget, `MAX_PAGES`, or any other reason.
     pub(crate) async fn gql_finish_lists(
         &self,
         op: &GqlOp,
@@ -1465,10 +1509,10 @@ impl Ctx {
         tb: &Target,
         a: &mut Answer,
         b: &mut Answer,
-    ) -> (usize, Option<DiffEntry>) {
+    ) -> (usize, Vec<DiffEntry>) {
         use crate::graphql_scope::{
             finish_ok, hash_query, is_cut, list_query, put_hashes, scoped_lists, take_hashes,
-            HARNESS_LIMIT_PATH,
+            HARNESS_LIMIT_PATH, MAX_PAGES, MAX_PAGES_PATH, PAGE_SIZE, UNFINISHED_PATH,
         };
         // A cut list under a root block list that selects no hash: one read of the root's
         // block hashes per side, put in for the lists' parents and taken out after.
@@ -1496,7 +1540,9 @@ impl Ctx {
         }
         let (la, lb) = (scoped_lists(&a.body), scoped_lists(&b.body));
         let mut budget = [self.cfg.graphql.list_page_budget; 2];
-        let (mut done, mut limited) = (0, Vec::new());
+        let (mut done, mut limited, mut long) = (0, Vec::new(), Vec::new());
+        // R-P5P9-64 I-5: a cut list left unfinished, per side, with why.
+        let mut unfinished: [Vec<Value>; 2] = Default::default();
         for l in la.iter().filter(|l| lb.contains(l)) {
             let (Some(ca), Some(cb)) = (a.body.pointer(&l.pointer), b.body.pointer(&l.pointer))
             else {
@@ -1506,11 +1552,20 @@ impl Ctx {
                 continue;
             }
             let Some((q, vars, at)) = list_query(&op.query, l) else {
+                unfinished[0].push(json!({"list": l.pointer,
+                    "why": "the selection cannot be re-issued alone"}));
                 continue;
             };
-            let fa = self.gql_read_list(ta, &q, &vars, at, &mut budget[0]).await;
+            let total = |c: &Value| c.get("totalCount").and_then(Value::as_u64);
+            let (ta_total, tb_total) = (total(ca), total(cb));
+            let fa = self
+                .gql_read_list(ta, &q, &vars, at, &mut budget[0], ta_total)
+                .await;
             let fb = match &fa {
-                Ok(_) => self.gql_read_list(tb, &q, &vars, at, &mut budget[1]).await,
+                Ok(_) => {
+                    self.gql_read_list(tb, &q, &vars, at, &mut budget[1], tb_total)
+                        .await
+                }
                 Err(e) => Err(*e),
             };
             let (fa, fb) = match (fa, fb) {
@@ -1519,11 +1574,26 @@ impl Ctx {
                     limited.push(json!(l.pointer));
                     continue;
                 }
-                _ => continue,
+                (Err(ListStop::MaxPages), _) | (_, Err(ListStop::MaxPages)) => {
+                    long.push(json!(l.pointer));
+                    continue;
+                }
+                (Err(ListStop::Failed(why)), _) => {
+                    unfinished[0].push(json!({"list": l.pointer, "why": why}));
+                    continue;
+                }
+                (_, Err(ListStop::Failed(why))) => {
+                    unfinished[1].push(json!({"list": l.pointer, "why": why}));
+                    continue;
+                }
             };
             // Unequal lengths are not a reason to leave the cut pages: the full sets (and each
             // side's totalCount) then compare, so a row one side lacks shows as a diff.
-            if !finish_ok(ca, &fa) || !finish_ok(cb, &fb) {
+            let (oka, okb) = (finish_ok(ca, &fa), finish_ok(cb, &fb));
+            if !oka || !okb {
+                let why = json!({"list": l.pointer,
+                    "why": "the page is not a part of that side's full list"});
+                unfinished[usize::from(oka)].push(why);
                 continue;
             }
             for (ans, full) in [(&mut *a, fa), (&mut *b, fb)] {
@@ -1541,27 +1611,50 @@ impl Ctx {
                 ans.raw = trim_body(ans.body.to_string().as_bytes());
             }
         }
-        let limit = (!limited.is_empty()).then(|| {
+        let mut out = Vec::new();
+        if !limited.is_empty() {
             tracing::warn!(
                 op = %op.stem,
                 lists = limited.len(),
                 budget = self.cfg.graphql.list_page_budget,
                 "harness limit: cut nested lists left unread (list_page_budget)"
             );
-            DiffEntry {
+            out.push(DiffEntry {
                 path: HARNESS_LIMIT_PATH.into(),
                 kind: DiffKind::Changed,
                 a: Some(json!({"budget": self.cfg.graphql.list_page_budget,
                     "left_a": budget[0], "left_b": budget[1]})),
                 b: Some(json!({"lists": limited})),
-            }
-        });
-        (done, limit)
+            });
+        }
+        if !long.is_empty() {
+            tracing::warn!(op = %op.stem, lists = long.len(),
+                "harness limit: cut nested lists past MAX_PAGES pages");
+            out.push(DiffEntry {
+                path: MAX_PAGES_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({"maxPages": MAX_PAGES, "pageSize": PAGE_SIZE})),
+                b: Some(json!({"lists": long})),
+            });
+        }
+        if unfinished.iter().any(|u| !u.is_empty()) {
+            let [ua, ub] = unfinished;
+            out.push(DiffEntry {
+                path: UNFINISHED_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({ "lists": ua })),
+                b: Some(json!({ "lists": ub })),
+            });
+        }
+        (done, out)
     }
 
     /// One side's whole nested list through the harness's list query (`at`: the list in its
-    /// answer), as edges `{node}`. Each page takes one from `budget`. Fails on any error,
-    /// past `MAX_PAGES` pages, or on a row key (the query's key alias) missing or seen twice.
+    /// answer), as edges `{node}`. Each page takes one from `budget`. Fails on any error or a
+    /// row key (the query's key alias) missing or seen twice; past `MAX_PAGES` pages it is a
+    /// harness limit. R-P5P9-64 I-5: a failure on a cursor page (any page after the first) is
+    /// retried once in one page of `first` = `total` (that side's `totalCount`), with the same
+    /// key checks; a `total` above `MAX_PAGES` × `PAGE_SIZE` is a harness limit.
     async fn gql_read_list(
         &self,
         t: &Target,
@@ -1569,62 +1662,102 @@ impl Ctx {
         vars: &Value,
         at: &str,
         budget: &mut usize,
+        total: Option<u64>,
     ) -> Result<Vec<Value>, ListStop> {
-        use crate::graphql_scope::{KEY_ALIAS, MAX_PAGES};
-        let mut vars = vars.clone();
+        use crate::graphql_scope::{one_page, MAX_PAGES, PAGE_SIZE};
+        let mut v = vars.clone();
         let mut out = Vec::new();
         let mut keys = std::collections::HashSet::new();
-        let failed = |_| ListStop::Failed;
-        for _ in 0..MAX_PAGES {
-            if *budget == 0 {
-                return Err(ListStop::Budget);
-            }
-            *budget -= 1;
-            let c = t
-                .post_json(&json!({ "query": query, "variables": vars }))
+        for page in 0..MAX_PAGES {
+            match self
+                .gql_list_page(t, query, &v, at, budget, &mut keys, &mut out)
                 .await
-                .map_err(failed)?;
-            self.gql_count(SCOPED_LIST_ROUTE, &t.name, &[c.ms]);
-            if c.status != 200 {
-                return Err(ListStop::Failed);
-            }
-            let v: Value = serde_json::from_slice(&c.body).map_err(|_| ListStop::Failed)?;
-            if v.get("errors")
-                .and_then(Value::as_array)
-                .is_some_and(|e| !e.is_empty())
             {
-                return Err(ListStop::Failed);
-            }
-            let conn = v.pointer(at).ok_or(ListStop::Failed)?;
-            let edges = conn
-                .get("edges")
-                .and_then(Value::as_array)
-                .ok_or(ListStop::Failed)?;
-            for e in edges {
-                let key = e
-                    .get(KEY_ALIAS)
-                    .filter(|k| !k.is_null())
-                    .ok_or(ListStop::Failed)?;
-                if !keys.insert(key.to_string()) {
-                    return Err(ListStop::Failed);
+                Ok(None) => return Ok(out),
+                Ok(Some(after)) => v["after"] = after,
+                Err(ListStop::Failed(why)) if page > 0 => {
+                    let Some(n) = total.filter(|n| *n > 0) else {
+                        return Err(ListStop::Failed(why));
+                    };
+                    if n > (MAX_PAGES as u64) * u64::from(PAGE_SIZE) {
+                        return Err(ListStop::MaxPages);
+                    }
+                    let (mut keys, mut out) = (std::collections::HashSet::new(), Vec::new());
+                    let q = one_page(query, n);
+                    return match self
+                        .gql_list_page(t, &q, vars, at, budget, &mut keys, &mut out)
+                        .await?
+                    {
+                        None => Ok(out),
+                        Some(_) => {
+                            Err(ListStop::Failed("the one-page retry still has a next page"))
+                        }
+                    };
                 }
-                out.push(json!({ "node": e.get("node").ok_or(ListStop::Failed)? }));
-            }
-            let more = conn
-                .pointer("/pageInfo/hasNextPage")
-                .and_then(Value::as_bool);
-            match more {
-                Some(false) => return Ok(out),
-                Some(true) => {
-                    vars["after"] = conn
-                        .pointer("/pageInfo/endCursor")
-                        .cloned()
-                        .ok_or(ListStop::Failed)?;
-                }
-                None => return Err(ListStop::Failed),
+                Err(e) => return Err(e),
             }
         }
-        Err(ListStop::Failed)
+        Err(ListStop::MaxPages)
+    }
+
+    /// One page of [`Ctx::gql_read_list`]: its rows into `out` (keys checked), and the
+    /// cursor of the next page, `None` at the end.
+    #[allow(clippy::too_many_arguments)]
+    async fn gql_list_page(
+        &self,
+        t: &Target,
+        query: &str,
+        vars: &Value,
+        at: &str,
+        budget: &mut usize,
+        keys: &mut std::collections::HashSet<String>,
+        out: &mut Vec<Value>,
+    ) -> Result<Option<Value>, ListStop> {
+        use crate::graphql_scope::KEY_ALIAS;
+        if *budget == 0 {
+            return Err(ListStop::Budget);
+        }
+        *budget -= 1;
+        let c = t
+            .post_json(&json!({ "query": query, "variables": vars }))
+            .await
+            .map_err(|_| ListStop::Failed("a page read failed"))?;
+        self.gql_count(SCOPED_LIST_ROUTE, &t.name, &[c.ms]);
+        if c.status != 200 {
+            return Err(ListStop::Failed("a page answered a status other than 200"));
+        }
+        let bad = ListStop::Failed("a page is not a list answer");
+        let v: Value = serde_json::from_slice(&c.body).map_err(|_| bad)?;
+        if v.get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|e| !e.is_empty())
+        {
+            return Err(ListStop::Failed("a page answered errors"));
+        }
+        let conn = v.pointer(at).ok_or(bad)?;
+        let edges = conn.get("edges").and_then(Value::as_array).ok_or(bad)?;
+        for e in edges {
+            let key = e
+                .get(KEY_ALIAS)
+                .filter(|k| !k.is_null())
+                .ok_or(ListStop::Failed("a row has no key"))?;
+            if !keys.insert(key.to_string()) {
+                return Err(ListStop::Failed("a row key came twice"));
+            }
+            out.push(json!({ "node": e.get("node").ok_or(bad)? }));
+        }
+        match conn
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+        {
+            Some(false) => Ok(None),
+            Some(true) => conn
+                .pointer("/pageInfo/endCursor")
+                .cloned()
+                .map(Some)
+                .ok_or(bad),
+            None => Err(bad),
+        }
     }
 
     /// The shared `/local` client of the GraphQL node reads.
@@ -1791,6 +1924,10 @@ impl Ctx {
             let Some(chain) = chain else {
                 continue;
             };
+            // R-P5P9-64 M-8: the referee's run cap counts this read; spent, the row stays.
+            if !self.gql.take_node_read() {
+                break;
+            }
             let (r, secs) = self.gql_local().details_timed(chain, "coin", account).await;
             self.gql_count(ROW_RULE_ROUTE, "node", &[(secs * 1000.0) as u64]);
             if let Ok(kdx_node::Local::Found { value, .. }) = r {
@@ -3250,6 +3387,47 @@ mod tests {
                 e.owner_note.starts_with("PROPOSED") && e.reason.contains("R-P5P9-62"),
                 "{id}: {e:?}"
             );
+        }
+        // R-P5P9-64 M-7: the harness rounds' entries are each PROPOSED with a reason and a
+        // ruling id, and each matches only its own visible hit (no wildcard), which only its
+        // rule emits.
+        for id in [
+            "search-tie-order",
+            "graphql-r60-scoped-list",
+            "graphql-h7-window-referee",
+            "graphql-h8-transfer-order-index",
+            "graphql-h9-creation-time-fraction",
+            "graphql-r62-payload-data",
+        ] {
+            let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+            let ruled = ["R-P5P9-", "R3E-"]
+                .iter()
+                .any(|r| e.owner_note.contains(r) || e.reason.contains(r));
+            assert!(
+                e.owner_note.starts_with("PROPOSED") && ruled && !e.reason.is_empty(),
+                "{id}: {e:?}"
+            );
+            assert!(
+                e.json_path_glob.starts_with("/~") && !e.json_path_glob.contains('*'),
+                "{id}: {e:?}"
+            );
+        }
+        let tie = [entry("/~search-tie-order", DiffKind::Changed)];
+        let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &tie);
+        assert_eq!(un.len(), 1, "search-tie-order matches /txs/search only");
+        // R-P5P9-64 I-5, M-5: H6's unfinished lists and harness limits are never allowlisted.
+        for p in [
+            crate::graphql_scope::UNFINISHED_PATH,
+            crate::graphql_scope::MAX_PAGES_PATH,
+            crate::graphql_scope::HARNESS_LIMIT_PATH,
+        ] {
+            let (un, _) = allow.classify_request(
+                &RouteKind::Other,
+                "graphql:QBlock",
+                &[],
+                &[entry(p, DiffKind::Changed)],
+            );
+            assert_eq!(un.len(), 1, "{p}");
         }
         // H7 replaces H5; a row H7 cannot explain is never allowlisted.
         assert!(!allow

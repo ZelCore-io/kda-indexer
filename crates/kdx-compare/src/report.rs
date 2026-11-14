@@ -76,6 +76,10 @@ pub struct DiffRecord {
     /// ([`DiffRecord::bounded`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_cap: Option<String>,
+    /// GraphQL oracle pairs: the pages ours' answer was fetched in, which H7's short-page
+    /// check needs when `kda-compare referee` re-runs the record (R-P5P9-64 I-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_pages: Option<usize>,
 }
 
 /// POSIX shell single-quoting: the result is one literal word whatever `s` holds (quotes,
@@ -214,14 +218,16 @@ impl DiffRecord {
             curl: long(&self.curl),
             note: self.note.as_deref().map(long),
             body_cap: body_cap.as_deref().map(short),
+            a_pages: self.a_pages,
         }
     }
 }
 
-/// A body as text, whole up to [`BODY_CAP`] bytes (the log applies its caps when it writes).
+/// A body as text, whole. The log applies its caps when it writes ([`DiffRecord::bounded`]),
+/// so a cut is always marked in `body_cap` with the original length (R-P5P9-64 M-6); a merged
+/// paged answer can be above [`BODY_CAP`].
 pub fn trim_body(b: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&b[..b.len().min(BODY_CAP)]);
-    s.into_owned()
+    String::from_utf8_lossy(b).into_owned()
 }
 
 /// Seconds since the Unix epoch, now.
@@ -514,6 +520,7 @@ mod tests {
             curl: body.clone(),
             note: Some(body),
             body_cap: None,
+            a_pages: None,
         }
     }
 
@@ -565,6 +572,25 @@ mod tests {
         let got = back(&r);
         assert_eq!(escaped_len(&got.a_body_trimmed), BODY_TRIM);
         assert!(got.body_cap.unwrap().contains("1 MiB"));
+    }
+
+    /// R-P5P9-64 M-6: a merged body over the 8 MiB cap reaches the log whole (`trim_body` no
+    /// longer cuts it first), so the cap is applied by `bound_bodies` and the record says so
+    /// with the original length, also when the other side is empty.
+    #[test]
+    fn a_body_over_the_cap_is_cut_by_the_log_and_marked() {
+        let big = format!("{{\"data\":\"{}\"}}", "x".repeat(9 << 20));
+        let kept = trim_body(big.as_bytes());
+        assert_eq!(kept.len(), big.len());
+        let mut r = rec(kept, "Q {}".into(), vec![]);
+        r.b_body_trimmed = String::new();
+        let got: DiffRecord = serde_json::from_slice(&line_of(&r)).unwrap();
+        assert_eq!(escaped_len(&got.a_body_trimmed), BODY_CAP);
+        let note = got.body_cap.expect("a cut body is marked");
+        assert!(
+            note.contains("8 MiB") && note.contains(&format!("of {}", escaped_len(&big))),
+            "{note}"
+        );
     }
 
     fn line_of(r: &DiffRecord) -> Vec<u8> {

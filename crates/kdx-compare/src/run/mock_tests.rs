@@ -706,6 +706,7 @@ async fn r58_row_rules_follow_the_node_with_single_row_reads() {
         json!({"balance": 1.0, "guard": guard("zzz")}),
     );
     let calls = node.calls.clone();
+    let node_calls = node.calls.clone();
     let nu = node_server(node).await;
     let chains = |cs: &[(&str, &str)]| {
         let rows: Vec<Value> = cs
@@ -859,6 +860,34 @@ max_height = 6400000
         ]
     );
     assert!(calls.iter().all(|c| !c.contains("/header?")), "{calls:?}");
+    // R-P5P9-64 M-8: the row rules' node reads count against the referee's run cap. Spent,
+    // they read nothing and drop nothing (the rows stay a diff); the orphan check alike.
+    ctx.gql
+        .node_budget
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut a = list(vec![acct("251efb06"), acct("k:251efb06")]);
+    let mut b = list(vec![acct("251efb06")]);
+    assert!(ctx
+        .gql_row_rules(ta, &vars, &mut a, &mut b)
+        .await
+        .is_empty());
+    ctx.canon.lock().unwrap().clear();
+    let mut a = ours();
+    let mut b = conn(
+        4,
+        vec![
+            e("XJfQNVV9", "aYo73A6i"),
+            e("Ye2tcl_c", "aYo73A6i"),
+            e("VpOurs", "VpiDdEFw"),
+            e("B1", "r3"),
+        ],
+    );
+    assert!(ctx
+        .gql_row_rules(ta, &none, &mut a, &mut b)
+        .await
+        .is_empty());
+    let after = node_calls.lock().unwrap().len();
+    assert_eq!(after, calls.len(), "no node read past the cap");
 }
 
 /// N2: the one-block skew accepts a coinbase only from a lone header at the height; a fork
@@ -955,17 +984,21 @@ max_height = 100
 /// pages `lists[<block hash>]` two rows at a time (whatever `first` asks), the cursor being
 /// the next index, and counts its calls.
 async fn list_server(lists: Value, calls: Arc<Mutex<usize>>) -> String {
-    keyed_list_server(lists, calls, 2, None).await
+    keyed_list_server(lists, calls, 2, None, false).await
 }
 
 /// [`list_server`] with `per` rows a page and, with `fail`, a 500 for that (block, page).
 /// Each edge also answers the harness's key read (`kdxKey`, R-P5P9-61 H6): a list entry is
-/// a node (its key is its `hash`) or a `[key, node]` pair.
+/// a node (its key is its `hash`) or a `[key, node]` pair. A read whose `first` is not the
+/// harness's page size (I-5's one-page retry) answers that many rows. With `oracle_cursor`,
+/// a block named `CUR…` fails every cursor page (`after` set), as the oracle's
+/// `Block.events` does, and `DEAD…` also fails the one-page retry.
 async fn keyed_list_server(
     lists: Value,
     calls: Arc<Mutex<usize>>,
     per: usize,
     fail: Option<(&'static str, usize)>,
+    oracle_cursor: bool,
 ) -> String {
     let app = Router::new().route(
         "/graphql",
@@ -977,8 +1010,23 @@ async fn keyed_list_server(
                 let p = v["p"].as_str().unwrap_or("");
                 let rows = lists[p].as_array().cloned().unwrap_or_default();
                 let at: usize = v["after"].as_str().map_or(0, |c| c.parse().unwrap());
-                if fail == Some((p, at / per)) {
-                    return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                let q = req["query"].as_str().unwrap_or("");
+                let first: usize = q
+                    .split_once("(first: ")
+                    .and_then(|(_, r)| r.split(|c: char| !c.is_ascii_digit()).next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(per);
+                let one = first != crate::graphql_scope::PAGE_SIZE as usize;
+                let per = if one { first } else { per };
+                let cursor = v["after"].is_string();
+                if fail == Some((p, at / per))
+                    || (oracle_cursor && p.starts_with("CUR") && cursor)
+                    || (oracle_cursor && p.starts_with("DEAD") && (cursor || one))
+                {
+                    let err = json!({"errors": [{"message": "invalid input syntax for type integer",
+                        "extensions": {"code": "INTERNAL_SERVER_ERROR"}}], "data": null});
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                        .into_response();
                 }
                 let end = (at + per).min(rows.len());
                 let edges: Vec<Value> = rows[at..end]
@@ -2661,7 +2709,21 @@ max_height = 7000000
         if cap {
             r["body_cap"] = json!("bodies cut at the 8 MiB body limit");
         }
+        r["a_pages"] = json!(1);
         r.to_string()
+    };
+    // The same with its stored diff holding H6's entry `path` (R-P5P9-64 M-1), or with no
+    // page count.
+    let with = |line: String, f: &dyn Fn(&mut Value)| {
+        let mut v: Value = serde_json::from_str(&line).unwrap();
+        f(&mut v);
+        v.to_string()
+    };
+    let h6 = |path: &'static str| {
+        move |v: &mut Value| {
+            v["diff"] = json!([{"path": path, "kind": "Changed",
+                "b": {"lists": ["/data/block/events"]}}]);
+        }
     };
     let acct = json!({"accountName": "k:x", "first": 3});
     let lines = [
@@ -2717,8 +2779,50 @@ max_height = 7000000
             "{".into(),
             true,
         ),
-        // Another pair's record: left alone.
+        // R-P5P9-64 I-4: another pair's record (B the node, not an oracle here) and a B
+        // target this config does not know: listed, not refereed.
         rec("QBlock", json!({}), "node", "{}".into(), "{}".into(), false),
+        rec("QBlock", json!({}), "c", "{}".into(), "{}".into(), false),
+        //    A line cut part way (a crash during an append, a full disk): listed with its line.
+        r#"{"ts": "2026-11-14T20:00:00Z", "route": "graphql:QTransac"#.to_string(),
+        // R-P5P9-64 M-1: H9's record with a list the live run did not finish (the oracle's
+        // cursor) or left for its budget: H6's entries keep it unexplained, by class.
+        with(
+            rec(
+                "QTransfersByRequestKey",
+                json!({"requestKey": "u1"}),
+                "b",
+                xfer("2024-01-01T10:00:15.000Z"),
+                xfer("2024-01-01T10:00:15.290Z"),
+                false,
+            ),
+            &h6(crate::graphql_scope::UNFINISHED_PATH),
+        ),
+        with(
+            rec(
+                "QTransfersByRequestKey",
+                json!({"requestKey": "u1"}),
+                "b",
+                xfer("2024-01-01T10:00:15.000Z"),
+                xfer("2024-01-01T10:00:15.290Z"),
+                false,
+            ),
+            &h6(crate::graphql_scope::HARNESS_LIMIT_PATH),
+        ),
+        //    A record with no page count of ours (H7's short-page check needs it).
+        with(
+            rec(
+                "QTransactionsByAccount",
+                acct.clone(),
+                "b",
+                txs(&[("r105", 105, &t05)]),
+                txs(&[("r103", 103, &t04)]),
+                false,
+            ),
+            &|v| {
+                v.as_object_mut().unwrap().remove("a_pages");
+            },
+        ),
     ];
     let log = out.join("diffs-2026-11-14.jsonl");
     std::fs::write(&log, lines.join("\n") + "\n").unwrap();
@@ -2736,9 +2840,34 @@ max_height = 7000000
             rep.unexplained,
             rep.not_refereed
         ),
-        (5, 4, 2, 1, 1),
+        (10, 9, 2, 3, 5),
         "{rep:?}"
     );
+    assert!(!rep.passed());
+    let class = |rep: &crate::referee::Report, c: &str| rep.by_class.get(c).copied();
+    assert_eq!(
+        class(&rep, "not refereed: B is not an oracle in this config"),
+        Some(2)
+    );
+    assert_eq!(class(&rep, "not refereed: not a diff record"), Some(1));
+    assert_eq!(
+        class(&rep, "unexplained: h6-unfinished"),
+        Some(1),
+        "{rep:?}"
+    );
+    assert_eq!(
+        class(&rep, "unexplained: harness-limit"),
+        Some(1),
+        "{rep:?}"
+    );
+    let listed = |rep: &crate::referee::Report, at: &str| {
+        rep.still_unexplained
+            .iter()
+            .any(|v| v["at"] == json!(format!("{}:{at}", log.display())))
+    };
+    for at in ["5", "6", "7", "10"] {
+        assert!(listed(&rep, at), "line {at}: {:?}", rep.still_unexplained);
+    }
     assert_eq!(
         rep.by_class.get("graphql-h7-window-referee"),
         Some(&1),
@@ -2750,24 +2879,33 @@ max_height = 7000000
         "{rep:?}"
     );
     assert_eq!(rep.by_class.get("unexplained: h7-row"), Some(&1), "{rep:?}");
-    assert_eq!(rep.node_reads, 4, "{rep:?}");
+    // The node's chain graph, then two reads per H7 record.
+    assert_eq!(rep.node_reads, 5, "{rep:?}");
     let still = serde_json::to_string(&rep.still_unexplained).unwrap();
     assert!(
         still.contains("x104") && still.contains("inside our window"),
         "{still}"
     );
-    // A cap of one node read: the sort-key record cannot be settled, and says so.
+    // R-P5P9-64 M-8: a cap of two node reads (the chain graph and one): the sort-key record
+    // cannot be settled and says so; every record after it is unread, never passed, the H9
+    // record (no node read) among them.
     let rep = run(
         cfg,
         &Opts {
-            max_reads: 1,
+            max_reads: 2,
             ..opts
         },
     )
     .await
     .unwrap();
-    assert_eq!((rep.explained, rep.unexplained), (1, 2), "{rep:?}");
-    assert_eq!(rep.node_reads, 1, "{rep:?}");
+    assert_eq!(
+        (rep.explained, rep.unexplained, rep.not_refereed),
+        (0, 1, 9),
+        "{rep:?}"
+    );
+    assert_eq!(class(&rep, crate::referee::UNREAD), Some(6), "{rep:?}");
+    assert_eq!(rep.node_reads, 2, "{rep:?}");
+    assert!(!rep.passed());
     let still = serde_json::to_string(&rep.still_unexplained).unwrap();
     assert!(still.contains("node read cap"), "{still}");
 }
@@ -2781,7 +2919,7 @@ max_height = 7000000
 #[tokio::test]
 async fn h6_large_block_lists_are_paged_to_the_end_within_the_budget() {
     use crate::graphql::{compare_answers_with, parse_op};
-    use crate::graphql_scope::HARNESS_LIMIT_PATH;
+    use crate::graphql_scope::{HARNESS_LIMIT_PATH, MAX_PAGES_PATH, UNFINISHED_PATH};
     let dir = tempfile::tempdir().unwrap();
     let nu = node_server(NodeMock::default()).await;
     let gp = |i: usize| json!({"cmd": {"meta": {"gasPrice": if i.is_multiple_of(3) { 1e-6 } else { 1e-7 }}}});
@@ -2795,13 +2933,17 @@ async fn h6_large_block_lists_are_paged_to_the_end_within_the_budget() {
     twice[6] = big[3].clone();
     let mut short = big.clone();
     short.pop();
+    let huge = block(1001);
     let ours = json!({"CVQ6": big, "B1": block(30), "B2": block(30), "B3": block(30),
-        "B4": block(30), "CH": big, "FAIL": big, "TW": big, "SH": short});
+        "B4": block(30), "CH": big, "FAIL": big, "TW": big, "SH": short, "CUR": big,
+        "DEAD": big, "HUGE": huge});
     let oracle = json!({"CVQ6": big, "B1": block(30), "B2": block(30), "B3": block(30),
-        "B4": block(30), "CH": changed, "FAIL": big, "TW": twice, "SH": big});
+        "B4": block(30), "CH": changed, "FAIL": big, "TW": twice, "SH": big, "CUR": big,
+        "DEAD": big, "HUGE": huge});
     let calls = Arc::new(Mutex::new(0));
-    let au = keyed_list_server(ours.clone(), calls.clone(), 50, Some(("FAIL", 1))).await;
-    let bu = keyed_list_server(oracle.clone(), calls.clone(), 50, None).await;
+    let au = keyed_list_server(ours.clone(), calls.clone(), 50, Some(("FAIL", 1)), false).await;
+    // The oracle as CG-3T found it: its `Block.events` cursor fails past the first page.
+    let bu = keyed_list_server(oracle.clone(), calls.clone(), 50, None, true).await;
     let allow =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
     let out = dir.path();
@@ -2867,16 +3009,26 @@ rate_rps = 1000.0
         op: &crate::graphql::GqlOp,
         src: (&Value, &Value),
         blocks: &[(&str, usize)],
-    ) -> (usize, Option<String>, Vec<String>) {
+    ) -> (usize, Vec<String>, Vec<String>) {
+        run_with(ctx, op, src, blocks, false).await
+    }
+    // `same`: the oracle's page is ours' page (equal cut pages).
+    async fn run_with(
+        ctx: &Ctx,
+        op: &crate::graphql::GqlOp,
+        src: (&Value, &Value),
+        blocks: &[(&str, usize)],
+        same: bool,
+    ) -> (usize, Vec<String>, Vec<String>) {
         let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
-        let (mut a, mut b) = (answer(src.0, blocks, true), answer(src.1, blocks, false));
-        let (n, limit) = ctx
+        let (mut a, mut b) = (answer(src.0, blocks, true), answer(src.1, blocks, same));
+        let (n, entries) = ctx
             .gql_finish_lists(op, &serde_json::Map::new(), ta, tb, &mut a, &mut b)
             .await;
         let d = compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false);
         (
             n,
-            limit.map(|e| e.path),
+            entries.into_iter().map(|e| e.path).collect(),
             d.into_iter().map(|e| e.path).collect(),
         )
     }
@@ -2890,7 +3042,7 @@ rate_rps = 1000.0
         ("B4", 30),
     ];
     let (n, limit, d) = run(&ctx, &op, src, &five).await;
-    assert_eq!((n, limit, d.clone()), (5, None, vec![]), "{d:?}");
+    assert_eq!((n, limit, d.clone()), (5, vec![], vec![]), "{d:?}");
     // One changed field in one nested row: finished, and the row stays a diff.
     let (n, _, d) = run(&ctx, &op, src, &[("CH", 147)]).await;
     assert_eq!(n, 1);
@@ -2907,21 +3059,38 @@ rate_rps = 1000.0
             .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions/edges")),
         "{d:?}"
     );
-    // Ours fails on its second page, or the oracle's paging gives k3 twice (in place of k6,
-    // the same value): not finished, the cut pages stay a diff.
-    for (h, total) in [("FAIL", 147), ("TW", 147)] {
-        let (n, limit, d) = run(&ctx, &op, src, &[(h, total)]).await;
-        assert_eq!((n, limit), (0, None), "{h}");
+    // R-P5P9-64 I-5: ours fails on its second page, and the oracle (CUR) fails every cursor
+    // page, as its `Block.events` does: each is read again in one page of its totalCount,
+    // with the key checks, and finished.
+    for h in ["FAIL", "CUR"] {
+        let (n, limit, d) = run(&ctx, &op, src, &[(h, 147)]).await;
+        assert_eq!((n, limit, d.clone()), (1, vec![], vec![]), "{h}: {d:?}");
+    }
+    // The oracle cannot be paged to its end (DEAD: the retry fails too), or its paging gives
+    // k3 twice (in place of k6, the same value): not finished, the cut pages stay a diff, and
+    // the record says why (no allowlist entry matches it).
+    for h in ["DEAD", "TW"] {
+        let (n, limit, d) = run(&ctx, &op, src, &[(h, 147)]).await;
+        assert_eq!((n, limit), (0, vec![UNFINISHED_PATH.to_string()]), "{h}");
         assert!(
             d.iter()
                 .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")),
             "{h}: {d:?}"
         );
     }
+    // Equal cut pages are no match without the full lists: the entry stays.
+    let (n, limit, d) = run_with(&ctx, &op, src, &[("DEAD", 147)], true).await;
+    assert_eq!(
+        (n, limit, d),
+        (0, vec![UNFINISHED_PATH.to_string()], vec![])
+    );
+    // R-P5P9-64 M-5: past MAX_PAGES (1,001 rows in pages of 50): a harness limit, marked.
+    let (n, limit, _) = run(&ctx, &op, src, &[("HUGE", 1001)]).await;
+    assert_eq!((n, limit), (0, vec![MAX_PAGES_PATH.to_string()]));
     // A budget of 2 pages a side: the 3-page list is not read to its end; a diff marked as a
     // harness limit.
     let (n, limit, d) = run(&small, &op, src, &[("CVQ6", 147)]).await;
-    assert_eq!((n, limit.as_deref()), (0, Some(HARNESS_LIMIT_PATH)));
+    assert_eq!((n, limit), (0, vec![HARNESS_LIMIT_PATH.to_string()]));
     assert!(!d.is_empty());
 }
 
@@ -2972,4 +3141,205 @@ async fn search_ties_within_a_height_compare_as_a_set() {
     let (class, _, paths) = case(&[("y", 10), ("x", 10), ("x", 10), ("z", 9)]).await;
     assert_eq!(class, "diff");
     assert!(paths.iter().any(|p| !p.starts_with("/~")), "{paths:?}");
+}
+
+/// R-P5P9-65 (1): the referee runs the live compare's rules with the document, so I-1's
+/// longer read of ours runs there too. An oracle-only row at our boundary height that our
+/// longer read lists after our page is explained, and a row we skipped stays a diff, in the
+/// live run and in the referee alike.
+#[tokio::test]
+async fn boundary_rows_settle_alike_in_the_live_run_and_the_referee() {
+    use crate::graphql::{Answer, H6};
+    use crate::normalize::RouteKind;
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock {
+        tip: 7_000_000,
+        ..NodeMock::default()
+    };
+    for (rk, b, h) in [("t2", "B2", 100), ("t3", "B2", 100), ("t4", "B2", 100)] {
+        let (k, v) = h7_xfer_poll(rk, b, h, "s", "r", json!(1.5));
+        node.polls.insert(k, v);
+    }
+    let nu = node_server(node).await;
+    let row = |rk: &str, h: u64| {
+        json!({"cursor": "c", "node": {"amount": 1.5, "senderAccount": "s",
+            "receiverAccount": "r", "block": {"chainId": "0", "height": h}, "requestKey": rk}})
+    };
+    // Ours: the longer read (first = 2 + 50) by account: "s" lists t2, t3, t4 (t4 after our
+    // page), "r" lists t2, t4, t7 (t3, the oracle's, absent: a row we skipped).
+    let (excused, skipped) = (
+        vec![row("t2", 100), row("t3", 100), row("t4", 100)],
+        vec![row("t2", 100), row("t4", 100), row("t7", 99)],
+    );
+    let au = ours_fn_server(move |req: &Value| {
+        let rows = if req["variables"]["accountName"] == json!("s") {
+            &excused
+        } else {
+            &skipped
+        };
+        longer_reply("transfers", rows)(req)
+    })
+    .await;
+    let op = h7_op("transfers");
+    let ops = dir.path().join("ops");
+    std::fs::create_dir_all(&ops).unwrap();
+    std::fs::write(
+        ops.join("QH7.graphql"),
+        format!("# kdx: oracle\n{}\n", op.query),
+    )
+    .unwrap();
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let out = dir.path();
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = {ops:?}
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_graphql"
+[targets.b]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+max_height = 7000000
+"#
+    ))
+    .unwrap();
+    let ctx = Ctx::new(cfg.clone()).await.unwrap();
+    let page = |edges: Vec<Value>| Answer {
+        ms: vec![0],
+        ..h7_page("transfers", true, edges)
+    };
+    let cases = [
+        // Ours [t2, t3], the oracle [t4, t2]: t4 lies after our page.
+        (
+            "s",
+            vec![row("t2", 100), row("t3", 100)],
+            vec![row("t4", 100), row("t2", 100)],
+            true,
+        ),
+        // Ours [t2, t4] (t3 skipped), the oracle [t3, t2].
+        (
+            "r",
+            vec![row("t2", 100), row("t4", 100)],
+            vec![row("t3", 100), row("t2", 100)],
+            false,
+        ),
+    ];
+    for (acct, ours, oracle, ok) in cases {
+        let vars = h7_vars(&[("accountName", json!(acct)), ("first", json!(2))]);
+        let (mut a, mut b) = (page(ours), page(oracle));
+        let (a_body, b_body) = (a.body.to_string(), b.body.to_string());
+        // The live run.
+        let (d, note) = ctx
+            .gql_rules(
+                &ctx.targets["a"],
+                H6::Live(&ctx.targets["b"]),
+                &op,
+                &vars,
+                &mut a,
+                &mut b,
+                7_000_000,
+            )
+            .await;
+        let (un, _) = ctx
+            .allow
+            .classify_request(&RouteKind::Other, "graphql:QH7", &[], &d);
+        assert_eq!(un.is_empty(), ok, "live {acct}: {un:?} {note:?}");
+        // The referee, on the record the run would log.
+        let rec = json!({"ts": "2026-11-14T20:00:00Z", "route": "graphql:QH7",
+            "request": format!("QH7 {}", Value::Object(vars.clone())), "a_target": "a",
+            "b_target": "b", "a_status": 200, "b_status": 200, "a_body_trimmed": a_body,
+            "b_body_trimmed": b_body, "diff": [], "class": "diff", "curl": "", "a_pages": 1});
+        let log = out.join(format!("diffs-{acct}.jsonl"));
+        std::fs::write(&log, format!("{rec}\n")).unwrap();
+        let opts = crate::referee::Opts {
+            logs: vec![log],
+            max_reads: 6_000,
+            rps: 10,
+        };
+        let rep = crate::referee::run(cfg.clone(), &opts).await.unwrap();
+        assert_eq!(
+            (rep.explained, rep.unexplained, rep.not_refereed),
+            (usize::from(ok), usize::from(!ok), 0),
+            "referee {acct}: {rep:?}"
+        );
+        if !ok {
+            let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+            assert!(still.contains("a row we skipped"), "{still}");
+        }
+    }
+}
+
+/// R-P5P9-65 (2): H7's header-by-hash reads (their own client, 1 r/s, one in flight) and the
+/// node client (at `node_max_rps` − 1) together stay within `node_max_rps` on the node.
+#[tokio::test]
+async fn header_reads_and_the_node_client_stay_within_node_max_rps() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let out = dir.path();
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+out_dir = {out:?}
+node_max_rps = 4
+allowlist = {allow:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = "no-such-dir"
+[targets.a]
+url = "http://127.0.0.1:9/graphql"
+kind = "kda_indexer_graphql"
+[targets.b]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+"#
+    ))
+    .unwrap();
+    assert_eq!(cfg.node_client_rps(), 3);
+    let ctx = Ctx::new(cfg).await.unwrap();
+    let ctx = &ctx;
+    let t0 = tokio::time::Instant::now();
+    let until = t0 + Duration::from_secs(2);
+    // Reads completed inside the two seconds, each side as fast as its limiter allows.
+    let node = async move {
+        let mut n = 0;
+        while tokio::time::Instant::now() < until {
+            let ok = ctx.node.cut().await.is_ok();
+            n += usize::from(ok && tokio::time::Instant::now() < until);
+        }
+        n
+    };
+    let header = async move {
+        let mut n = 0;
+        for i in 0.. {
+            if tokio::time::Instant::now() >= until {
+                break;
+            }
+            let mut st = crate::graphql_window::Reads::default();
+            let ok = ctx
+                .h7_block_height(0, &format!("H{i}"), &mut st)
+                .await
+                .is_ok();
+            n += usize::from(ok && tokio::time::Instant::now() < until);
+        }
+        n
+    };
+    let (n, h) = tokio::join!(node, header);
+    assert!(n >= 1 && h >= 1, "{n} {h}");
+    // 4 r/s for 2 s, plus one: the limiters' first reads are not delayed.
+    assert!(n + h <= 4 * 2 + 1, "node {n} + header {h} reads in 2 s");
 }

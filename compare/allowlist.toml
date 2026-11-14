@@ -213,7 +213,7 @@ json_path_glob = "/~search-tie-order"
 condition = "any"
 request_contains = "search="
 reason = "/txs/search?search= orders by height only; chainweb-data leaves the rows of one height to Postgres. The harness orders the rows within each height by their text on both sides (a set per height) and reports this visible hit; rows across heights keep their order, and a missing, extra or twice-listed row still shows."
-owner_note = "fv-checklist harness T-item (within-height tie order on /txs/search); R3E-8, R-P5P9-48/49. kda-indexer answers a height's rows in node order."
+owner_note = "PROPOSED (rulings R3E-8, R-P5P9-48/49 and R-P5P9-64 M-7; the FV preconditions flip it): fv-checklist harness T-item (within-height tie order on /txs/search). kda-indexer answers a height's rows in node order."
 
 # --- Run 6E-3 oracle defects (ruling R-P5P9-47; node evidence in the run 6E-3 report) ---
 
@@ -419,8 +419,8 @@ route = "other"
 json_path_glob = "/~graphql-r60-scoped-list-finished"
 condition = "any"
 request_contains = "graphql:"
-reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block's transactions or events, a transaction's transfers or events) had its page cut on either side; the harness read that list to its end on both sides (at each target's own rate, at most 20 pages per list and list_page_budget pages per side and compare, with each row's key read so a row twice on one side leaves the list unfinished; R-P5P9-61 H6) and compared the full sets with their totalCount. A row only one side's full list holds stays a diff, and a list it could not finish stays as it was."
-owner_note = "Controller ruling R-P5P9-60 (H2); the order within one block or tx is a contract choice (M2c, R3E-8)."
+reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block's transactions or events, a transaction's transfers or events) had its page cut on either side; the harness read that list to its end on both sides (at each target's own rate, at most 20 pages per list and list_page_budget pages per side and compare, with each row's key read so a row twice on one side leaves the list unfinished; R-P5P9-61 H6) and compared the full sets with their totalCount. A list whose cursor page fails (the oracle's Block.events) is read again once in one page of its totalCount (R-P5P9-64 I-5). A row only one side's full list holds stays a diff, and a list it could not finish keeps its cut pages and a /~graphql-h6-unfinished or /~harness-limit/ entry, which no entry matches, so the record stays unexplained."
+owner_note = "PROPOSED (rulings R-P5P9-60 H2, R-P5P9-61 H6 and R-P5P9-64 I-5/M-5/M-7; the FV preconditions flip it): the order within one block or tx is a contract choice (M2c, R3E-8)."
 
 [[entry]]
 id = "graphql-h7-window-referee"

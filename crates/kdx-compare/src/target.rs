@@ -31,6 +31,11 @@ impl Limiter {
         })
     }
 
+    /// One of the limiter's in-flight slots (held for the length of a read).
+    pub(crate) async fn slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.in_flight.acquire().await.ok()
+    }
+
     pub async fn acquire(&self) {
         let mut next = self.next.lock().await;
         let now = tokio::time::Instant::now();
