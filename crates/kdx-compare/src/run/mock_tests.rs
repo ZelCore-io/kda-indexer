@@ -7893,3 +7893,60 @@ async fn e1_sk_the_longer_read_pages_past_the_boundary_height() {
         }
     }
 }
+
+/// R-P5P9-86 F: Transfers-8c8a0f56 selects no `pageInfo` (CG-5 #28, #58, #78), so its root
+/// list is not a connection H7 can window: the record says "H7 not applied: the root list
+/// selects no pageInfo" and stays a diff. Its rows (`requestKey`, `block { height chainId }`,
+/// no hash, no `orderIndex`) get an identity by request-key multiset.
+#[tokio::test]
+async fn e1_f_a_root_list_without_page_info_gets_the_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["u", "v"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.5));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let r = |rk: &str| {
+        json!({"node": {"amount": 1.5, "requestKey": rk,
+            "block": {"height": 100, "chainId": "0"}}})
+    };
+    let page = |edges: Vec<Value>| crate::graphql::Answer {
+        body: json!({"data": {"transfers": {"edges": edges}}}),
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    };
+    let (mut a, mut b) = (page(vec![r("u"), r("v")]), page(vec![r("u")]));
+    let (d, note) = ctx
+        .gql_settle(
+            &ctx.targets["a"],
+            &serde_json::Map::new(),
+            &mut a,
+            &mut b,
+            7_000_000,
+            false,
+        )
+        .await;
+    assert!(!only_hits(&d), "{d:?}");
+    assert_eq!(
+        note.as_deref(),
+        Some("H7 not applied: the root list selects no pageInfo"),
+        "{d:?}"
+    );
+    // The rows' identity: transfers by request-key multiset (no index, no block hash).
+    let conn = |rows: Vec<Value>| json!({"pageInfo": {"hasNextPage": false}, "edges": rows});
+    let p = crate::graphql_window::prepare_in(
+        &conn(vec![r("u"), r("u")]),
+        &conn(vec![r("u")]),
+        "transfers",
+    )
+    .unwrap();
+    assert!(p
+        .a
+        .iter()
+        .all(|x| x.id.kind == Some(crate::graphql_window::Kind::Transfer)
+            && x.id.index.is_none()
+            && x.id.block.is_none()));
+    assert_eq!(p.a[0].key, p.b[0].key);
+}

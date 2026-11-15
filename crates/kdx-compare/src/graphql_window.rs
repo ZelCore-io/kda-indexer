@@ -3097,7 +3097,22 @@ impl Ctx {
                 .cloned()
         };
         let (Some(ca), Some(cb)) = (conn(a), conn(b)) else {
-            return (Vec::new(), None);
+            // R-P5P9-86 F: a root list without `pageInfo` (Transfers-8c8a0f56) is no window
+            // H7 can read; say so.
+            let bare = |ans: &Answer| {
+                ans.body
+                    .get("data")
+                    .and_then(Value::as_object)
+                    .is_some_and(|d| {
+                        d.values().any(|v| {
+                            v.get("edges").is_some_and(Value::is_array)
+                                && v.get("pageInfo").is_none()
+                        })
+                    })
+            };
+            let note = (bare(a) || bare(b))
+                .then(|| "H7 not applied: the root list selects no pageInfo".to_string());
+            return (Vec::new(), note);
         };
         // The same rows in the same order (after the tie rules): nothing to referee.
         let norm = |c: &Value| {
