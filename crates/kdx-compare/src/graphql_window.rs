@@ -3934,17 +3934,29 @@ pub fn single_block_cut(
             node.len().saturating_sub(start)
         )
     })?;
-    if let Some((i, (r, k))) =
+    // R-P5P9-86 N: ours in the node's block order, or in exactly its reverse (from the
+    // block's end), from ours' cursor. Any other order is not.
+    let reversed: Vec<String> = node
+        .iter()
+        .rev()
+        .skip(start)
+        .take(p.a.len())
+        .cloned()
+        .collect();
+    let differs = |want: &[String]| {
         p.a.iter()
             .zip(want)
             .enumerate()
             .find(|(_, (r, k))| rk(r) != **k)
-    {
-        return Err(format!(
-            "ours is not the node block's order from its cursor: row {i} is {} where the node \
-             has {k}",
-            rk(r)
-        ));
+            .map(|(i, (r, k))| (i, rk(r), k.clone()))
+    };
+    if let Some((i, r, k)) = differs(want) {
+        if reversed.len() != p.a.len() || differs(&reversed).is_some() {
+            return Err(format!(
+                "ours is not the node block's order from its cursor, nor its reverse: row {i} \
+                 is {r} where the node has {k}"
+            ));
+        }
     }
     let held: std::collections::HashSet<&str> = node.iter().map(String::as_str).collect();
     if let Some(r) = p.b.iter().find(|r| !held.contains(rk(r).as_str())) {

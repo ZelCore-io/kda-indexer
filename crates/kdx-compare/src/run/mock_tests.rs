@@ -7712,3 +7712,41 @@ async fn e1_m_orphans_by_an_unknown_block_and_by_height() {
     .await;
     assert!(!only_hits(&d), "{d:?}");
 }
+
+/// R-P5P9-86 N: a single-block cut where ours lists the node's block in exactly its reverse
+/// order (CG-5 #178: 219 node txs, ours' 200 are the node's 218..19) is explained; a shuffled
+/// order of the same rows is not.
+#[tokio::test]
+async fn e1_n_ours_in_the_nodes_block_order_reversed() {
+    use crate::graphql_window::SINGLE_BLOCK_PATH;
+    let dir = tempfile::tempdir().unwrap();
+    let rks: Vec<String> = (0..219).map(|i| format!("t{i:03}")).collect();
+    let mut node = NodeMock::default();
+    d3_block(&mut node, "BLK612", 4_476_191, &rks);
+    let au = ours_fn_server(|req: &Value| {
+        if req["query"].as_str().unwrap_or("").contains("block(hash") {
+            json!({"data": {"block": {"chainId": "0"}}})
+        } else {
+            json!({"data": null})
+        }
+    })
+    .await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let vars = h7_vars(&[("blockHash", json!("BLK612")), ("first", json!(200))]);
+    let ours: Vec<String> = rks.iter().rev().take(200).cloned().collect();
+    assert_eq!((ours[0].as_str(), ours[199].as_str()), ("t218", "t019"));
+    let oracle: Vec<String> = rks[..200].to_vec();
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &ours, &oracle).await;
+    assert!(
+        d.iter().any(|e| e.path == SINGLE_BLOCK_PATH),
+        "{d:?} {note:?}"
+    );
+    assert!(only_hits(&d) && note.is_none(), "{d:?} {note:?}");
+    // The same rows shuffled: neither the node's order nor its reverse.
+    let mut shuffled = ours.clone();
+    shuffled.swap(0, 100);
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &shuffled, &oracle).await;
+    assert!(d.iter().all(|e| e.path != SINGLE_BLOCK_PATH), "{d:?}");
+    assert!(!only_hits(&d) || note.is_some(), "{d:?} {note:?}");
+    assert!(note.unwrap_or_default().contains("N not explained"));
+}
