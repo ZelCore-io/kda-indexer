@@ -3775,6 +3775,18 @@ impl Ctx {
         if !(p.a_cut || p.b_cut) || p.a.is_empty() {
             return Err(None);
         }
+        // R-P5P9-78 (H2 m-5): N's reference is the node's whole block, so the request's
+        // filter may name nothing beyond the block, the chain and the height.
+        let f = Filter::of(query, Some(p.root.as_str()), vars);
+        if f.account.is_some()
+            || f.fungible.is_some()
+            || f.event.is_some()
+            || f.params.is_some()
+            || f.rk.is_some()
+            || !f.unchecked.is_empty()
+        {
+            return Err(None);
+        }
         let rows = || p.a.iter().chain(&p.b);
         let one = |xs: std::collections::BTreeSet<String>| match xs.len() {
             0 => Ok(None),

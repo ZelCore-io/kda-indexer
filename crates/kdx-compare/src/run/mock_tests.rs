@@ -7232,3 +7232,95 @@ async fn d4a_h1_m3_e_and_f_read_field_names_not_aliases() {
         assert!(only_hits(&d) && !d.is_empty(), "{key}: {d:?} {note:?}");
     }
 }
+
+/// The N case of `d3_n_run` with the document `query`.
+async fn d4a_n_run(
+    ctx: &Ctx,
+    query: &str,
+    vars: &serde_json::Map<String, Value>,
+    ours: &[String],
+    oracle: &[String],
+) -> (Vec<crate::report::DiffEntry>, Option<String>) {
+    let op = crate::graphql::parse_op("QTransactionsByBlock", query, false).unwrap();
+    let page = |keys: &[String]| {
+        h7_page(
+            "transactions",
+            true,
+            keys.iter().map(|k| d3_row("BLK612", k)).collect(),
+        )
+    };
+    let (mut a, mut b) = (page(ours), page(oracle));
+    ctx.gql_window_referee(
+        &ctx.targets["a"],
+        Some(&op),
+        vars,
+        &mut a,
+        &mut b,
+        7_000_000,
+        false,
+        &mut Reads::default(),
+    )
+    .await
+}
+
+/// R-P5P9-78 (H2 m-5): N applies only when the request's filter names nothing beyond block,
+/// chain and height. With `accountName` set, ours' rows being the node block's first 200 does
+/// not show they are the account's: a diff. `chainId` with the block still takes N.
+#[tokio::test]
+async fn d4a_h2_m5_n_only_under_a_block_chain_or_height_filter() {
+    use crate::graphql_window::{ROW_PATH, SINGLE_BLOCK_PATH, UNDECIDED_PATH};
+    let dir = tempfile::tempdir().unwrap();
+    let rks: Vec<String> = (0..233).map(|i| format!("t{i:03}")).collect();
+    let mut node = NodeMock::default();
+    d3_block(&mut node, "BLK612", 5_607_111, &rks);
+    let au = ours_fn_server(|req: &Value| {
+        if req["query"].as_str().unwrap_or("").contains("block(hash") {
+            json!({"data": {"block": {"chainId": "0"}}})
+        } else {
+            json!({"data": null})
+        }
+    })
+    .await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let ours: Vec<String> = rks[..200].to_vec();
+    let oracle: Vec<String> = rks[33..].iter().rev().cloned().collect();
+    let q = |arg: &str, def: &str| {
+        format!(
+            "query QTransactionsByBlock($blockHash: String, {def} $first: Int, $after: String) \
+             {{ transactions(blockHash: $blockHash, {arg} first: $first, after: $after) {{ \
+             totalCount pageInfo {{ hasNextPage endCursor }} edges {{ cursor node {{ id hash }} \
+             }} }} }}"
+        )
+    };
+    let base = h7_vars(&[("blockHash", json!("BLK612")), ("first", json!(200))]);
+    let mut vars = base.clone();
+    vars.insert("accountName".into(), json!("k:someone"));
+    let (d, note) = d4a_n_run(
+        &ctx,
+        &q("accountName: $accountName,", "$accountName: String,"),
+        &vars,
+        &ours,
+        &oracle,
+    )
+    .await;
+    assert!(
+        d.iter().all(|e| e.path != SINGLE_BLOCK_PATH)
+            && d.iter()
+                .any(|e| e.path == UNDECIDED_PATH || e.path == ROW_PATH),
+        "{d:?} {note:?}"
+    );
+    let mut vars = base.clone();
+    vars.insert("chainId".into(), json!("0"));
+    let (d, note) = d4a_n_run(
+        &ctx,
+        &q("chainId: $chainId,", "$chainId: String,"),
+        &vars,
+        &ours,
+        &oracle,
+    )
+    .await;
+    assert!(
+        d.iter().any(|e| e.path == SINGLE_BLOCK_PATH) && only_hits(&d),
+        "{d:?} {note:?}"
+    );
+}
