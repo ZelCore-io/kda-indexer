@@ -7,8 +7,8 @@
 //! record's field order, not alphabetical (chainweb-data encodes the record directly).
 //!
 //! The count walks every hot tx key, so a request never makes it (R-P5P9-75): a background
-//! task ([`run_refresh`], started and stopped with the server) recounts every
-//! [`REFRESH_EVERY`], and a request answers the last count with its age in `x-count-age`.
+//! task ([`run_refresh`], started and stopped with the server) recounts [`REFRESH_EVERY`]
+//! after each count ended, and a request answers the last count with its age in `x-count-age`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -26,11 +26,13 @@ use crate::server::ApiState;
 use crate::store::View;
 use crate::{ApiError, ApiResult};
 
-/// The background count runs this often.
+/// The background count starts this long after the previous one ended.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(120);
-/// A refresh may take this long (cold pages: 5E saw a walk of the hot window pass 5 s, the
-/// request deadline). A slower one fails and the last count stays.
-const REFRESH_BUDGET: Duration = Duration::from_secs(60);
+/// A refresh that takes longer than this logs one WARN with its duration (5E saw a walk of
+/// the hot window pass 5 s, the request deadline). It still runs to completion.
+const SLOW_REFRESH: Duration = Duration::from_secs(60);
+/// The refresh's read has no practical deadline: the count always finishes.
+const NO_DEADLINE: Duration = Duration::from_secs(365 * 24 * 3600);
 /// A failing refresh logs one WARN per this long.
 const WARN_EVERY: Duration = Duration::from_secs(10 * 60);
 /// `Retry-After` (seconds) of the `503` before the first count exists.
@@ -151,9 +153,14 @@ impl CountCache {
         true
     }
 
-    /// One recount. A failed or slow one (past [`REFRESH_BUDGET`]) keeps the last count.
-    async fn refresh(&self, st: &Arc<ApiState>) {
-        match st.read_for(REFRESH_BUDGET, self.counter).await {
+    /// One recount, run to completion; a failure keeps the last count. A count that took
+    /// longer than `slow_after` logs one WARN with its duration; true then.
+    async fn refresh(&self, st: &Arc<ApiState>, slow_after: Duration) -> bool {
+        let started = Instant::now();
+        let result = st.read_for(NO_DEADLINE, self.counter).await;
+        let took = started.elapsed();
+        let slow = took > slow_after;
+        match result {
             Ok(n) => self.store(n, Instant::now()),
             Err(e) => {
                 let now = Instant::now();
@@ -167,6 +174,13 @@ impl CountCache {
                 }
             }
         }
+        if slow {
+            tracing::warn!(
+                took_secs = took.as_secs_f64(),
+                "stats: count refresh was slow (it finished; requests answered the last count meanwhile)"
+            );
+        }
+        slow
     }
 }
 
@@ -175,18 +189,17 @@ pub(crate) async fn run_refresh(st: Arc<ApiState>, shutdown: CancellationToken) 
     refresh_every(st, REFRESH_EVERY, shutdown).await;
 }
 
+/// Refresh, wait `every` after it ends, repeat: two refreshes never overlap.
 async fn refresh_every(st: Arc<ApiState>, every: Duration, shutdown: CancellationToken) {
     let cache = st.stats_cache;
-    let mut tick = tokio::time::interval(every);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
-            _ = tick.tick() => {}
+            _ = cache.refresh(&st, SLOW_REFRESH) => {}
         }
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = cache.refresh(&st) => {}
+            () = tokio::time::sleep(every) => {}
         }
     }
 }
@@ -339,7 +352,7 @@ mod tests {
         let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(failing)));
         let (_d, _app, st) = app(cache);
         cache.store(7, Instant::now() - Duration::from_secs(300));
-        cache.refresh(&st).await;
+        cache.refresh(&st, SLOW_REFRESH).await;
         let c = cache.peek(Instant::now()).unwrap();
         assert_eq!(c.n, 7);
         assert!(c.age >= Duration::from_secs(300));
@@ -462,5 +475,33 @@ mod tests {
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(r.headers().contains_key(header::RETRY_AFTER));
         assert!(took < Duration::from_millis(1200), "{took:?}");
+    }
+
+    /// A counter that honours the deadline like the real one and needs 300 ms.
+    fn long_count(v: &View) -> ApiResult<u64> {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(300) {
+            v.check_deadline()?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(42)
+    }
+
+    /// A count slower than the budget still lands (the budget only warns), and the next
+    /// request answers 200 with it.
+    #[tokio::test]
+    async fn a_count_past_the_budget_still_lands() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(long_count)));
+        let (_d, app, st) = app(cache);
+        assert!(
+            cache.refresh(&st, Duration::from_millis(100)).await,
+            "not slow"
+        );
+        let (r, _) = get(&app).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            body(r).await,
+            "{\"transactionCount\":42,\"coinsInCirculation\":null}"
+        );
     }
 }
