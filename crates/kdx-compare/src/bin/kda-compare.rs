@@ -85,6 +85,18 @@ enum Cmd {
         #[arg(long, default_value_t = kdx_compare::referee::DEFAULT_RPS)]
         rps: u32,
     },
+    /// R-P5P9-86 (the leak line): the FV memory criterion over jemalloc `allocated` samples
+    /// (`<YYYY-MM-DDTHH:MM:SSZ> <bytes>` per line). The first hour after `--start` is
+    /// warm-up; after it, any rise over 100 MB above the lowest earlier sample fails, and so
+    /// does no sample after the warm-up. Exit 0 iff the line holds.
+    Leak {
+        /// The process start, `YYYY-MM-DDTHH:MM:SSZ`.
+        #[arg(long)]
+        start: String,
+        /// The samples file.
+        #[arg(long)]
+        samples: PathBuf,
+    },
     /// Parse and validate the config, then print it.
     CheckConfig,
     /// P3 gate: per route and pair, requests compared, unexplained diffs, allowlisted hits,
@@ -127,8 +139,24 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    // The leak line needs no config.
+    if let Cmd::Leak { start, samples } = &cli.cmd {
+        let start = kdx_compare::summary::parse_since(start)?;
+        let text = std::fs::read_to_string(samples)?;
+        let samples = kdx_compare::leak::parse_samples(&text)?;
+        match kdx_compare::leak::verdict(start, &samples) {
+            Ok(t) => println!("{t}"),
+            Err(t) => {
+                println!("{t}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let cfg = CompareConfig::load(&cli.config)?;
     match cli.cmd {
+        // Handled above, before the config.
+        Cmd::Leak { .. } => Ok(()),
         Cmd::CheckConfig => {
             println!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())

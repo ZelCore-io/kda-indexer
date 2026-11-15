@@ -11,6 +11,7 @@ pub mod graphql_norm;
 pub mod graphql_scope;
 pub mod graphql_window;
 pub mod graphql_ws;
+pub mod leak;
 pub mod metrics;
 pub mod normalize;
 pub mod oracle;
