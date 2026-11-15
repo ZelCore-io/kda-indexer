@@ -3836,7 +3836,8 @@ async fn c3_root_filters_the_harness_does_not_check_refuse_the_excuse() {
         "QTransactionsByPublicKey",
         "query QTransactionsByPublicKey($publicKey: String, $first: Int, $after: String) { \
          transactionsByPublicKey(publicKey: $publicKey, first: $first, after: $after) { \
-         totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash } } } }",
+         totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash result { \
+         ... on TransactionResult { height block { hash height chainId } } } } } } }",
     );
     let plain = parse(
         "QTxs",
@@ -3855,7 +3856,10 @@ async fn c3_root_filters_the_harness_does_not_check_refuse_the_excuse() {
     };
     let tx = |rk: &str, h: u64| {
         let id = crate::graphql::base64_std(format!("Transaction:[\"B{h}\",\"{rk}\"]").as_bytes());
-        json!({"cursor": "c", "node": {"id": id, "hash": rk}})
+        // R-P5P9-86 W: the rows our QTransactionsByPublicKey document selects (the block's
+        // height, chain and hash), so H7 places them.
+        json!({"cursor": "c", "node": {"id": id, "hash": rk, "result": {"height": h,
+            "block": {"hash": format!("B{h}"), "height": h, "chainId": 0}}}})
     };
     let blk = |h: u64| json!({"cursor": "c", "node": {"height": h, "chainId": 0, "hash": format!("B{h}")}});
     let run = |op: crate::graphql::GqlOp,
