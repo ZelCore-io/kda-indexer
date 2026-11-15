@@ -48,6 +48,50 @@ pub const COUNT_SELF_CONSISTENT_PATH: &str = "/~graphql-r60-count-self-consisten
 /// Visible hit of `oracle_counts_heights` (allowlist id `graphql-r75-oracle-counts-heights`,
 /// scoped to Transactions-9e58b95d).
 pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
+/// R-P5P9-86 X: visible hit of an oracle `amount` that differs from ours only by trailing
+/// zeros (equal as exact decimals), once the node's TRANSFER event shows ours' text
+/// (allowlist `graphql-oracle-decimal-zeros`).
+pub const DECIMAL_ZEROS_PATH: &str = "/~graphql-oracle-decimal-zeros";
+/// The same candidate before the node check. No entry matches it, so a candidate left
+/// unchecked (a caller without the node) stays unexplained.
+pub const DECIMAL_ZEROS_UNCHECKED_PATH: &str = "/~graphql-oracle-decimal-zeros-unchecked";
+
+/// R-P5P9-86 X: whether `ours` and `oracle` are decimal literals (`-`, digits, `.`, digits)
+/// that differ in text and are equal as exact decimals by trailing zeros of the fraction
+/// alone. Compared as text, never through floats: a float-equal but decimal-unequal pair is
+/// not.
+pub fn decimal_zeros_only(ours: &str, oracle: &str) -> bool {
+    fn lit(s: &str) -> Option<(bool, &str, &str)> {
+        let (neg, s) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        let (i, f) = s.split_once('.').unwrap_or((s, ""));
+        let digits = |x: &str| x.bytes().all(|b| b.is_ascii_digit());
+        (!i.is_empty() && digits(i) && digits(f)).then(|| (neg, i, f.trim_end_matches('0')))
+    }
+    ours != oracle && matches!((lit(ours), lit(oracle)), (Some(a), Some(b)) if a == b)
+}
+
+/// R-P5P9-86 X: each `…/amount` text difference that [`decimal_zeros_only`] allows becomes an
+/// unchecked candidate carrying ours' row (read from `na`, the normalized answer the diff
+/// ran on), for [`crate::run::Ctx::gql_decimal_zeros`] to settle on the node.
+pub fn decimal_zeros_candidates(d: &mut [crate::report::DiffEntry], na: &Value) {
+    for e in d.iter_mut() {
+        let Some(parent) = e.path.strip_suffix("/amount") else {
+            continue;
+        };
+        let (Some(Value::String(x)), Some(Value::String(y))) = (&e.a, &e.b) else {
+            continue;
+        };
+        if e.kind != crate::report::DiffKind::Changed || !decimal_zeros_only(x, y) {
+            continue;
+        }
+        let row = na.pointer(parent).cloned().unwrap_or(Value::Null);
+        e.a = Some(serde_json::json!({"amount": x, "row": row, "at": e.path}));
+        e.path = DECIMAL_ZEROS_UNCHECKED_PATH.into();
+    }
+}
 /// Visible hit of `creation_time_half_even` (allowlist id `graphql-h9-creation-time-fraction`).
 pub const H9_PATH: &str = "/~graphql-h9-creation-time-fraction";
 

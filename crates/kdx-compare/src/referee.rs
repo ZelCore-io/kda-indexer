@@ -5,10 +5,14 @@
 //! record the run left unexplained (class `diff`). For each oracle-pair record it re-runs, on
 //! the stored answers, the live compare's own rules ([`Ctx::gql_rules`], with the document):
 //! the row rules, H8, the `payload.data` matcher, H7 and the diff with the ruled field
-//! matchers (H9 among them), then classifies with the allowlist as the run does. It never
-//! asks the oracle: H6 (finishing cut nested lists) needs it, so the stored record's H6
-//! entries (a harness limit, an unfinished list) are carried into the result and keep the
-//! record unexplained (R-P5P9-64 M-1).
+//! matchers (H9 among them), then classifies with the allowlist as the run does. It does
+//! not finish cut nested lists: H6's stored entries (a harness limit, an unfinished list)
+//! are carried into the result and keep the record unexplained (R-P5P9-64 M-1). The one
+//! oracle read is R-P5P9-86 TC's count walk over the frozen oracle (R-P5P9-87).
+//!
+//! R-P5P9-86 with R-P5P9-87, the REST records: an `account` record against chainweb-data
+//! and a `v1txs` record against kda-txs are settled by their stored forms
+//! ([`Ctx::rest_stored`]): the rules combined row by row, and the v1txs edge.
 //!
 //! Nothing is dropped from the verdict (R-P5P9-64 I-4): a line that is not a diff record,
 //! a GraphQL diff record whose B target this config does not know as an oracle, a record
@@ -348,10 +352,18 @@ async fn settle(ctx: &Ctx, rec: &DiffRecord) -> Result<Settled, String> {
         .get(&rec.b_target)
         .and_then(|t| t.max_height)
         .unwrap_or(u64::MAX);
+    // R-P5P9-87 TC: the record's height, before the rules pair the rows.
+    let bound = crate::graphql_window::highest_row(&a.body).map_or(max, |h| h.min(max));
     // The live compare's rules with the document (R-P5P9-65 (1)); H6 from the stored diff.
-    let (d, note) = ctx
+    let (mut d, mut note) = ctx
         .gql_rules(ta, H6::Stored(&rec.diff), op, &vars, &mut a, &mut b, max)
         .await;
+    // R-P5P9-86 TC with R-P5P9-87: a count-only record walks ours bounded at the record's
+    // height or the oracle's frozen height, whichever is lower, and the oracle as it is now.
+    if let Some(tb) = ctx.targets.get(&rec.b_target) {
+        ctx.gql_count_walk(ta, tb, op, &vars, &mut d, &mut note, max, bound)
+            .await;
+    }
     // R-P5P9-86 (P, Q): the live run's request text, so the KNOWN-GAP entries scoped by
     // operation and account read as they do live.
     let c = ctx.allow.classify_known(

@@ -744,3 +744,25 @@ reason = "R-P5P9-75 D and F, made visible by R-P5P9-81 (m-1): H7 settled one or 
 status = "PROPOSED"
 ruling = "R-P5P9-75 (D, F); R-P5P9-81 (m-1)."
 owner_note = "PROPOSED (ruling R-P5P9-81 m-1): stays PROPOSED until CG-5 shows clean hits of D and F."
+
+[[entry]]
+id = "graphql-count-walk"
+route = "other"
+json_path_glob = "/~graphql-count-walk"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-86 TC (replaces R-P5P9-75 I's 'oracle below ours' condition): a record whose only difference outside the visible hits is its root totalCount, the oracle above or below ours. Both lists are walked to the end by the operation's own document (100 rows a page, at most 5,000 rows a side, at the harness rate), and every one-sided row is settled by the H7 rules on the node (H7's own hits stay beside this one, each with its entry). Explained only when every one-sided row is and the difference in the counts equals the difference in one-sided rows; the hit carries each side's count, walked rows and one-sided rows. Stored (R-P5P9-87, the referee): ours is walked bounded at the record's height (its highest stored row) or the oracle's frozen height, whichever is lower, and the frozen oracle as it is now. A side past 5,000 rows is /~graphql-count-walk-capped ('count walk capped', which no entry matches); a failed page, a row H7 does not settle or counts the rows do not account for leave the count difference unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-86 TC; R-P5P9-87 (the stored form)."
+owner_note = "PROPOSED (ruling R-P5P9-86 TC): new in FVH-E2b; CG-5 class TC (#243, #87, #866)."
+
+[[entry]]
+id = "graphql-oracle-decimal-zeros"
+route = "other"
+json_path_glob = "/~graphql-oracle-decimal-zeros"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-86 X (oracle format): a shared row's amount where the oracle's text differs from ours only by trailing zeros of the fraction (equal as exact decimals, compared as text, never through floats; CG-5 #744, ours 0.92363, the oracle 0.923630000000000000000000000000). Explained only when ours' row names a request key and chain, the node's /poll entry for it holds a TRANSFER event that is the row on every other selected field, and that event's amount text equals ours' text exactly; the hit carries the node's text. Ours unlike the node, a float-equal but decimal-unequal pair, a coinbase key (never polled) or a failed read stay unexplained at the amount."
+status = "PROPOSED"
+ruling = "R-P5P9-86 X."
+owner_note = "PROPOSED (ruling R-P5P9-86 X): new in FVH-E2b; CG-5 class X (#744)."

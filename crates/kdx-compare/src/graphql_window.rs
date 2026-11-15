@@ -79,6 +79,31 @@ pub const SHORT_PAGE_PATH: &str = "/~graphql-h7-short-page";
 /// R-P5P9-67 m-6 (with R-P5P9-64 I-1): rows H7 identified but could not settle. No allowlist
 /// entry matches it, so the pre-H7 page and tie cuts never excuse what H7 left undecided.
 pub const UNDECIDED_PATH: &str = "/~graphql-h7-undecided";
+/// R-P5P9-86 TC: visible hit of a totalCount-only difference the count walk settled
+/// (allowlist `graphql-count-walk`), with each side's count, walked rows and one-sided rows.
+pub const COUNT_WALK_PATH: &str = "/~graphql-count-walk";
+/// R-P5P9-86 TC: the walk passed [`COUNT_WALK_ROWS`] rows on a side, "count walk capped"
+/// (unexplained, its own reason; never allowlisted).
+pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
+/// R-P5P9-86 TC: rows a side the count walk reads at most.
+pub const COUNT_WALK_ROWS: usize = 5_000;
+
+/// R-P5P9-87 TC: the record's height, the highest row of ours' stored page (its root list).
+pub fn highest_row(body: &Value) -> Option<u64> {
+    let data = body.get("data")?;
+    let root = root_name(data)?;
+    data.get(&root)?
+        .get("edges")?
+        .as_array()?
+        .iter()
+        .filter_map(|e| prepared_id(e, &root).height)
+        .max()
+}
+
+/// H7's entries that are never explained: a row it rejected, an undecided row, a short page.
+fn never_explained(path: &str) -> bool {
+    [ROW_PATH, UNDECIDED_PATH, SHORT_PAGE_PATH].contains(&path)
+}
 /// R-P5P9-75 N: visible hit of a page cut inside one block, explained by the node's block
 /// order (allowlist id `graphql-r75-single-block-cut`); it carries the evidence.
 pub const SINGLE_BLOCK_PATH: &str = "/~graphql-r75-single-block-cut";
@@ -1139,7 +1164,7 @@ pub const SKEW_WINDOW: u64 = 10;
 
 /// R-P5P9-86 S′: what the block's coinbase pays `account` (a coin TRANSFER from the empty
 /// account), in fixed point.
-fn coinbase_paid(payload: &Value, account: &str) -> Option<i128> {
+pub(crate) fn coinbase_paid(payload: &Value, account: &str) -> Option<i128> {
     let cb = payload.get("coinbase")?.as_str()?;
     let b = kdx_types::hash::b64url_decode(cb).ok()?;
     let v: Value = serde_json::from_slice(&b).ok()?;
@@ -3869,6 +3894,299 @@ impl Ctx {
             Ok(None) => Err("no canonical header at the height on the cut's branch".into()),
             Err(w) => Err(w),
         });
+    }
+
+    /// R-P5P9-86 X: each unchecked decimal-zeros candidate
+    /// ([`crate::graphql_norm::decimal_zeros_candidates`]) is settled on the node: ours' row
+    /// names a request key and chain, the node's `/poll` entry for it holds a TRANSFER event
+    /// that is the row (every other selected field), and that event's amount text equals
+    /// ours' text exactly. Then the hit is `/~graphql-oracle-decimal-zeros`; otherwise the
+    /// entry goes back to the amount difference, with why.
+    pub(crate) async fn gql_decimal_zeros(&self, d: &mut [DiffEntry], st: &mut Reads) {
+        use crate::graphql_norm::{DECIMAL_ZEROS_PATH, DECIMAL_ZEROS_UNCHECKED_PATH};
+        for e in d
+            .iter_mut()
+            .filter(|e| e.path == DECIMAL_ZEROS_UNCHECKED_PATH)
+        {
+            let a = e.a.clone().unwrap_or(Value::Null);
+            let ours = a["amount"].as_str().unwrap_or_default().to_string();
+            match self.decimal_zeros_node(&a["row"], &ours, st).await {
+                Ok(ev) => {
+                    e.path = DECIMAL_ZEROS_PATH.into();
+                    e.a = Some(json!({"amount": ours, "node": ev}));
+                }
+                Err(why) => {
+                    e.path = a["at"].as_str().unwrap_or("/amount").to_string();
+                    e.a = Some(json!(ours));
+                    e.b = Some(json!({"oracle": e.b, "why": why}));
+                }
+            }
+        }
+    }
+
+    async fn decimal_zeros_node(
+        &self,
+        row: &Value,
+        ours: &str,
+        st: &mut Reads,
+    ) -> Result<Value, String> {
+        let rk = row
+            .get("requestKey")
+            .and_then(Value::as_str)
+            .ok_or("ours' row selects no requestKey")?;
+        let chain = row
+            .pointer("/block/chainId")
+            .or_else(|| row.get("chainId"))
+            .and_then(|c| text(c).and_then(|t| t.parse::<u8>().ok()))
+            .ok_or("ours' row selects no chain")?;
+        let poll = self
+            .h7_poll(chain, rk, st)
+            .await?
+            .ok_or("the node does not hold the request key")?;
+        let mut other = row.clone();
+        if let Some(o) = other.as_object_mut() {
+            o.remove("amount");
+        }
+        let hit = poll
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|ev| transfer_matches(&other, ev, false))
+            .find_map(|ev| {
+                let at = format!("/params/{}", 2 + transfer_offset(ev));
+                text(ev.pointer(&at)?).filter(|t| t == ours)
+            });
+        match hit {
+            Some(t) => Ok(json!({"requestKey": rk, "chain": chain, "amount": t})),
+            None => Err(format!(
+                "no TRANSFER of the row on the node has ours' amount text {ours}"
+            )),
+        }
+    }
+
+    /// R-P5P9-86 TC: a record whose only difference outside the hits is its root
+    /// `totalCount` (and no unsettled H7 row) is settled by walking both lists to their end,
+    /// [`OURS_PAGE_CAP`] rows a page, at most [`COUNT_WALK_ROWS`] rows a side, and settling
+    /// every one-sided row by the H7 rules ([`Ctx::gql_window_referee`] on the two whole
+    /// lists, `max` the oracle's height). It is explained (`/~graphql-count-walk`, with H7's
+    /// hits) only when every one-sided row is and the difference in the counts equals the
+    /// difference in one-sided rows. Past the cap the reason is `count walk capped`
+    /// (`/~graphql-count-walk-capped`, never allowlisted). R-P5P9-87: the referee walks ours
+    /// bounded at `ours_bound` (the record's height or the oracle's, whichever is lower);
+    /// live, `u64::MAX`. Anything else leaves the count difference, with why in the note.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_count_walk(
+        &self,
+        ta: &Target,
+        tb: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        d: &mut Vec<DiffEntry>,
+        note: &mut Option<String>,
+        max: u64,
+        ours_bound: u64,
+    ) {
+        if d.iter().any(|e| {
+            never_explained(&e.path)
+                || crate::graphql_scope::is_h6_entry(&e.path)
+                || e.path.starts_with("/~harness-limit/")
+        }) {
+            return;
+        }
+        let raw: Vec<usize> = (0..d.len())
+            .filter(|&i| !d[i].path.starts_with("/~"))
+            .collect();
+        let [i] = raw[..] else {
+            return;
+        };
+        let Some(root) = d[i]
+            .path
+            .strip_prefix("/data/")
+            .and_then(|p| p.strip_suffix("/totalCount"))
+            .filter(|r| !r.contains('/'))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let count = |v: &Option<Value>| v.as_ref().and_then(Value::as_u64);
+        let (Some(na), Some(nb)) = (count(&d[i].a), count(&d[i].b)) else {
+            return;
+        };
+        let walked = self
+            .count_walk(ta, tb, op, vars, &root, (na, nb), max, ours_bound)
+            .await;
+        let why = match walked {
+            Ok(hits) => {
+                d.remove(i);
+                d.extend(hits);
+                return;
+            }
+            Err((true, why)) => {
+                d.push(entry(COUNT_WALK_CAPPED_PATH, Some(json!(why)), None));
+                why
+            }
+            Err((false, why)) => why,
+        };
+        *note = Some(match note.take() {
+            Some(n) => format!("{n}; {why}"),
+            None => why,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn count_walk(
+        &self,
+        ta: &Target,
+        tb: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        (na, nb): (u64, u64),
+        max: u64,
+        ours_bound: u64,
+    ) -> Result<Vec<DiffEntry>, (bool, String)> {
+        let q = Some(op.query.as_str());
+        let (fv, av) = (arg_var(q, "first"), arg_var(q, "after"));
+        if fv.is_empty() || av.is_empty() {
+            return Err((
+                false,
+                "count walk not applied: the document passes no first and after variables".into(),
+            ));
+        }
+        let mut wa = self.walk_list(ta, op, vars, root, &fv, &av).await?;
+        let wb = self.walk_list(tb, op, vars, root, &fv, &av).await?;
+        if ours_bound < u64::MAX {
+            let mut unplaced = false;
+            wa.retain(|e| match prepared_id(e, root).height {
+                Some(h) => h <= ours_bound,
+                None => {
+                    unplaced = true;
+                    true
+                }
+            });
+            if unplaced {
+                return Err((
+                    false,
+                    "count walk: a row of ours has no height to bound the walk at".into(),
+                ));
+            }
+        }
+        let (la, lb) = (wa.len() as i64, wb.len() as i64);
+        let page = |edges: Vec<Value>, n: u64| Answer {
+            body: json!({"data": {root: {"totalCount": n,
+                "pageInfo": {"hasNextPage": false, "hasPreviousPage": false},
+                "edges": edges}}}),
+            status: 200,
+            raw: String::new(),
+            ms: vec![0],
+        };
+        let (mut a, mut b) = (page(wa, na), page(wb, nb));
+        let mut st = Reads::default();
+        let (h7, h7_note) = self
+            .gql_window_referee(ta, Some(op), vars, &mut a, &mut b, max, false, &mut st)
+            .await;
+        if let Some(n) = h7_note {
+            return Err((false, format!("count walk: {n}")));
+        }
+        if h7.iter().any(|e| never_explained(&e.path)) {
+            return Err((
+                false,
+                "count walk: H7 left a one-sided row unsettled".into(),
+            ));
+        }
+        let edges = |x: &Answer| {
+            x.body
+                .pointer(&format!("/data/{root}/edges"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as i64
+        };
+        let (pa, pb) = (edges(&a), edges(&b));
+        let (one_a, one_b) = (la - pa, lb - pb);
+        let counts = na as i64 - nb as i64;
+        if pa != pb || counts != one_a - one_b {
+            return Err((
+                false,
+                format!(
+                    "count walk: the counts differ by {counts} (ours {na}, the oracle's {nb}), \
+                     the one-sided rows by {} (ours {one_a} of {la}, the oracle's {one_b} of \
+                     {lb})",
+                    one_a - one_b
+                ),
+            ));
+        }
+        let mut out = h7;
+        out.push(entry(
+            COUNT_WALK_PATH,
+            Some(json!({"count": na, "walked": la, "oneSided": one_a,
+                "bound": (ours_bound < u64::MAX).then_some(ours_bound)})),
+            Some(json!({"count": nb, "walked": lb, "oneSided": one_b,
+                "nodeReads": st.node})),
+        ));
+        Ok(out)
+    }
+
+    /// One whole list by the document, `first` = [`OURS_PAGE_CAP`] and `after` = the last
+    /// page's `endCursor` (else its last row's `cursor`); `Err((true, _))` past
+    /// [`COUNT_WALK_ROWS`] rows.
+    async fn walk_list(
+        &self,
+        t: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        first_var: &str,
+        after_var: &str,
+    ) -> Result<Vec<Value>, (bool, String)> {
+        let fail = |why: &str| (false, format!("count walk: {} {why}", t.name));
+        let mut out: Vec<Value> = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut v = vars.clone();
+            v.insert(first_var.into(), json!(OURS_PAGE_CAP));
+            match &after {
+                Some(c) => v.insert(after_var.into(), json!(c)),
+                None => v.remove(after_var),
+            };
+            let data = self
+                .gql_read(t, &op.query, Value::Object(v))
+                .await
+                .ok_or_else(|| fail("answered a page of the walk with no data"))?;
+            let c = data
+                .get(root)
+                .ok_or_else(|| fail("answered a page without the root list"))?;
+            let edges = c
+                .get("edges")
+                .and_then(Value::as_array)
+                .ok_or_else(|| fail("answered a page without edges"))?;
+            out.extend(edges.iter().cloned());
+            if out.len() > COUNT_WALK_ROWS {
+                return Err((
+                    true,
+                    format!(
+                        "count walk capped: {} lists more than {COUNT_WALK_ROWS} rows",
+                        t.name
+                    ),
+                ));
+            }
+            let more = c
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| fail("answered a page without hasNextPage"))?;
+            if !more {
+                return Ok(out);
+            }
+            let next = c
+                .pointer("/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .or_else(|| edges.last()?.get("cursor")?.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| fail("answered a page with no cursor to page on"))?;
+            if edges.is_empty() || after.as_deref() == Some(next.as_str()) {
+                return Err(fail("answered a page that does not advance"));
+            }
+            after = Some(next);
+        }
     }
 
     /// R-P5P9-86 S′ with R-P5P9-87, the stored-record form: a stored NodeBalance record's

@@ -16,6 +16,8 @@ use crate::config::CompareConfig;
 use crate::gen::{Origin, Request};
 use crate::graphql_window::Reads;
 
+mod e2b;
+
 /// The node: every chain's cut at `tip`, the canonical hash per (chain, height) and the block
 /// `/poll` puts each request key in. Every path asked is logged.
 #[derive(Clone, Default)]
@@ -6435,10 +6437,9 @@ fn d2_shipped() -> crate::allowlist::Allowlist {
     .unwrap()
 }
 
-/// R-P5P9-75 I: `oracle_counts_heights` on Transactions-9e58b95d's root `totalCount`: the
-/// oracle's count below ours takes ours with a visible hit, which only that operation's
-/// entry explains. An oracle count at or above ours, a nested count, and the hit on another
-/// operation stay diffs.
+/// R-P5P9-75 I, as R-P5P9-86 TC leaves it: the operation's entry stays (no removals), but
+/// `oracle_counts_heights` no longer takes ours' count without the walk, below ours or above;
+/// a nested count is never the root's.
 #[test]
 fn d2_i_oracle_counts_heights_only_below_ours_on_transactions_9e58b95d() {
     use crate::config::{FieldRule, FieldRuleKind};
@@ -6470,30 +6471,16 @@ fn d2_i_oracle_counts_heights_only_below_ours_on_transactions_9e58b95d() {
         .and_then(|e| e.request_contains.clone())
         .unwrap();
     assert!(op.len() > "graphql:".len(), "{op}");
-    let d = cmp(4, 1);
-    assert_eq!(d.len(), 1, "{d:?}");
-    assert_eq!(d[0].path, ORACLE_COUNTS_HEIGHTS_PATH);
-    assert_eq!(
-        (d[0].a.clone(), d[0].b.clone()),
-        (Some(json!(4)), Some(json!(1)))
-    );
-    let (un, ids) = al.classify_request(&crate::normalize::RouteKind::Other, &op, &[], &d);
-    assert!(un.is_empty(), "{un:?}");
-    assert_eq!(ids, vec!["graphql-r75-oracle-counts-heights".to_string()]);
-    // The same hit on another operation is not explained.
-    let (un, _) = al.classify_request(
-        &crate::normalize::RouteKind::Other,
-        "graphql:QTransactionsByAccount",
-        &[],
-        &d,
-    );
-    assert_eq!(un.len(), 1);
-    // The oracle at or above ours: the count diff stays.
-    let d = cmp(4, 5);
-    assert!(
-        d.iter().any(|e| e.path == "/data/transactions/totalCount"),
-        "{d:?}"
-    );
+    // R-P5P9-86 TC removed I's "oracle below ours" condition: the count difference stays in
+    // the diff, above or below ours, for the count walk to settle on the node.
+    for (x, y) in [(4, 1), (4, 5)] {
+        let d = cmp(x, y);
+        assert!(
+            d.iter().any(|e| e.path == "/data/transactions/totalCount"),
+            "{d:?}"
+        );
+        assert!(d.iter().all(|e| e.path != ORACLE_COUNTS_HEIGHTS_PATH));
+    }
     assert!(cmp(4, 4).is_empty());
     // A nested count is not the root's.
     let nested =

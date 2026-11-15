@@ -969,15 +969,9 @@ pub fn compare_answers_with(
             b: Some(json!({ "list": list, "missing": missing })),
         });
     }
-    // R-P5P9-75 I: the oracle counts heights on Transactions-9e58b95d (scoped by the entry).
-    for (ours, oracle) in crate::graphql_norm::oracle_counts_heights(rules, &na, &mut nb) {
-        hits.push(DiffEntry {
-            path: crate::graphql_norm::ORACLE_COUNTS_HEIGHTS_PATH.into(),
-            kind: DiffKind::Changed,
-            a: Some(json!(ours)),
-            b: Some(json!(oracle)),
-        });
-    }
+    // R-P5P9-86 TC replaces R-P5P9-75 I's "oracle below ours" condition: a root totalCount
+    // difference stays here, and the count walk ([`Ctx::gql_count_walk`]) settles it with
+    // the node, the oracle above or below ours.
     if let (Some(da), Some(db)) = (na.get_mut("data"), nb.get_mut("data")) {
         if let (Some(ca), Some(cb)) = (root_connection(da), root_connection(db)) {
             if !aligned && crate::graphql_norm::cut_trailing_ties(ca, cb) {
@@ -990,6 +984,8 @@ pub fn compare_answers_with(
     let lower_bound = crate::graphql_norm::count_flag_applies(&a.body);
     let explain = crate::graphql_norm::explain(rules, lower_bound);
     let (mut d, fired) = diff_explained(&na, &nb, &explain);
+    // R-P5P9-86 X: an oracle amount with trailing zeros, checked on the node after.
+    crate::graphql_norm::decimal_zeros_candidates(&mut d, &na);
     d.extend(hits);
     d.extend(fired.into_iter().map(hit));
     d
@@ -1664,6 +1660,10 @@ impl Ctx {
     ) -> (Vec<DiffEntry>, Option<String>) {
         let root_scoped = crate::graphql_scope::root_scoped(&op.roots, vars);
         let mut row_hits = self.gql_row_rules(ta, vars, a, b).await;
+        let live_tb = match &h6 {
+            H6::Live(tb) => Some(*tb),
+            H6::Stored(_) => None,
+        };
         let h6 = match h6 {
             H6::Live(tb) => {
                 let (finished, entries) = self.gql_finish_lists(op, vars, ta, tb, a, b).await;
@@ -1679,7 +1679,7 @@ impl Ctx {
                 .collect(),
         };
         // R-P5P9-62: H7 and the diff.
-        let (mut d, note) = self
+        let (mut d, mut note) = self
             .gql_settle_op(ta, Some(op), vars, a, b, max, root_scoped)
             .await;
         d.extend(h6);
@@ -1689,6 +1689,12 @@ impl Ctx {
             a: None,
             b: None,
         }));
+        // R-P5P9-86 TC: live, both lists are walked to the end (the referee walks ours
+        // bounded, R-P5P9-87).
+        if let Some(tb) = live_tb {
+            self.gql_count_walk(ta, tb, op, vars, &mut d, &mut note, max, u64::MAX)
+                .await;
+        }
         (d, note)
     }
 
@@ -1745,6 +1751,8 @@ impl Ctx {
             &self.cfg.graphql.field_rules,
             root_scoped,
         );
+        // R-P5P9-86 X: ours' amount text against the node's TRANSFER event.
+        self.gql_decimal_zeros(&mut d, &mut st).await;
         d.extend(h8);
         d.extend(data);
         d.extend(nested);
