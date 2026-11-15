@@ -370,8 +370,10 @@ pub const MISSING_CHAIN_ROWS_PATH: &str = "/~known-gap-missing-chain-rows";
 /// at the same place on both sides whose rows are all objects with a `chainId`, keyed by
 /// (`chainId`, `tokenId` when selected) with each key once per side, where ours' keys are a
 /// strict subset of the oracle's: the oracle's rows that ours lacks leave its list and the
-/// rest take ours' order, so the diff then compares the rows both hold. Returns (pointer, the
-/// keys ours lacks) per list. A row only ours holds, a key twice, or another shape: nothing.
+/// rest keep the oracle's own order, so the diff then compares the rows both hold, order
+/// included. Returns (pointer, the keys ours lacks) per list. A row only ours holds, a key
+/// twice, another shape, or (R-P5P9-78, H2 m-4) an empty list of ours: nothing, so an answer
+/// of ours with no chain rows at all stays a diff.
 pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)> {
     fn lists(v: &Value, ptr: &mut String, parent: &str, out: &mut Vec<String>) {
         match v {
@@ -416,12 +418,18 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
         let ka: Vec<Value> = ra.iter().map(key).collect();
         let kb: Vec<Value> = rb.iter().map(key).collect();
         let once = |k: &[Value]| k.iter().enumerate().all(|(i, x)| !k[..i].contains(x));
-        if !once(&ka) || !once(&kb) || ka.len() >= kb.len() || !ka.iter().all(|k| kb.contains(k)) {
+        if ka.is_empty()
+            || !once(&ka)
+            || !once(&kb)
+            || ka.len() >= kb.len()
+            || !ka.iter().all(|k| kb.contains(k))
+        {
             continue;
         }
-        let kept: Vec<Value> = ka
+        let kept: Vec<Value> = rb
             .iter()
-            .filter_map(|k| rb.iter().find(|r| key(r) == *k).cloned())
+            .filter(|r| ka.contains(&key(r)))
+            .cloned()
             .collect();
         let gone: Vec<Value> = kb.iter().filter(|k| !ka.contains(k)).cloned().collect();
         if let Some(x) = b.pointer_mut(&p) {
@@ -1613,5 +1621,31 @@ mod tests {
             take(conn(8, Some(4), true), conn(1, Some(4), true)),
             vec![(8, 1)]
         );
+    }
+
+    /// R-P5P9-78 (H2 m-4): the Q marker needs ours' list non-empty, and the oracle's kept rows
+    /// keep the oracle's own order (a difference in chain-row order still shows).
+    #[test]
+    fn missing_chain_rows_needs_ours_non_empty_and_keeps_the_oracles_order() {
+        let row = |c: &str| json!({"chainId": c, "balance": "1"});
+        let acct = |rows: Vec<Value>| json!({"data": {"fungibleAccount": {"chainAccounts": rows}}});
+        // Ours holds no chain row at all: no marker, the oracle's list is left whole.
+        let a = acct(vec![]);
+        let mut b = acct(vec![row("0"), row("1")]);
+        assert!(missing_chain_rows(&a, &mut b).is_empty());
+        assert_eq!(b, acct(vec![row("0"), row("1")]));
+        // Ours [2, 0], the oracle [0, 1, 2]: the marker names 1, and the oracle keeps [0, 2].
+        let a = acct(vec![row("2"), row("0")]);
+        let mut b = acct(vec![row("0"), row("1"), row("2")]);
+        let m = missing_chain_rows(&a, &mut b);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].0, "/data/fungibleAccount/chainAccounts");
+        assert_eq!(b, acct(vec![row("0"), row("2")]));
+        assert_ne!(a, b, "the order difference still shows");
+        // The neighbour: ours [0, 2] in the oracle's order compares equal after the marker.
+        let a = acct(vec![row("0"), row("2")]);
+        let mut b = acct(vec![row("0"), row("1"), row("2")]);
+        assert_eq!(missing_chain_rows(&a, &mut b).len(), 1);
+        assert_eq!(a, b);
     }
 }
