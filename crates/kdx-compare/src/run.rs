@@ -686,6 +686,10 @@ impl Ctx {
             canon: Mutex::new(HashMap::new()),
             cfg,
         };
+        // R-P5P9-88 (3a): the `compare/` assets and the build, logged and kept in the summary.
+        let line = crate::assets::assets_line(&ctx.cfg.allowlist, &ctx.cfg.graphql.own_ops_dir)?;
+        tracing::info!(assets = %line, "harness assets");
+        ctx.summary.lock().expect("summary").assets.insert(line);
         ctx.refresh_tips().await?;
         Ok(ctx)
     }
@@ -716,6 +720,7 @@ impl Ctx {
         match s.flush(&self.cfg.out_dir) {
             Ok(Some(mut fresh)) => {
                 fresh.graphql_unpaired = std::mem::take(&mut s.graphql_unpaired);
+                fresh.assets = std::mem::take(&mut s.assets);
                 *s = fresh;
             }
             Ok(None) => {}

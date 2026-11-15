@@ -2,6 +2,7 @@
 //! the chainweb-node oracle (spec section 7).
 
 pub mod allowlist;
+pub mod assets;
 pub mod config;
 pub mod diff;
 pub mod gen;

@@ -395,3 +395,17 @@ async fn e3b_the_v1txs_stored_reread_counts_in_max_reads() {
         "{short:?}"
     );
 }
+
+/// R-P5P9-88 (3a): at start the harness takes its assets hash and build sha into the day's
+/// summary (and the log), from the allowlist and the documents it loads.
+#[tokio::test]
+async fn e3b_the_harness_records_its_assets_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let ops = c3_ops(dir.path());
+    let cfg = c3_cfg(&nu, &nu, &nu, dir.path(), &ops, "");
+    let want = crate::assets::assets_line(&cfg.allowlist, &ops).unwrap();
+    let ctx = Ctx::new(cfg).await.unwrap();
+    let got = ctx.summary.lock().unwrap().assets.clone();
+    assert_eq!(got.into_iter().collect::<Vec<_>>(), vec![want]);
+}

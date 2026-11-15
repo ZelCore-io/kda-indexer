@@ -349,6 +349,10 @@ pub struct DailySummary {
     /// `unsupported` (R-P5P9-57 coverage list).
     #[serde(default)]
     pub graphql_unpaired: BTreeMap<String, String>,
+    /// R-P5P9-88 (3a): each start's `assets <hash> build <sha>` line this day
+    /// ([`crate::assets::assets_line`]).
+    #[serde(default)]
+    pub assets: std::collections::BTreeSet<String>,
 }
 
 /// Seconds per `DailySummary.windows` bucket.

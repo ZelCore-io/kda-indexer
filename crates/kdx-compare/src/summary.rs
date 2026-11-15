@@ -455,6 +455,7 @@ pub fn run_text(
     let since_secs = parse_since(since)?;
     let w = load(out_dir, since_secs)?;
     let unpaired = load_unpaired(out_dir, since_secs)?;
+    let assets = load_assets(out_dir, since_secs)?;
     let label = format!("gate {gate}, routes {routes}");
     let all_rows = rows(&w);
     // R-P5P9-81 (I-2): under `all` the graphql gate runs whatever the window holds, so a
@@ -513,6 +514,7 @@ pub fn run_text(
     } else {
         format!("routes {routes}")
     };
+    text.push_str(&render_assets(&assets));
     let _ = writeln!(
         text,
         "verdict (gate {gate}, {scope}): {} (unexplained diffs {unexplained}; {})",
@@ -666,6 +668,50 @@ pub fn render_known_gaps(kg: &KnownGaps) -> (String, bool) {
         if ok { "within limits" } else { "OVER" }
     );
     (s, ok)
+}
+
+/// R-P5P9-88 (3a): the `assets <hash> build <sha>` lines of the summaries since
+/// `since_secs` (by day), each with the days it shows in.
+fn load_assets(out_dir: &Path, since_secs: u64) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+    let first_date = date_of(since_secs);
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for e in std::fs::read_dir(out_dir)
+        .with_context(|| format!("reading {}", out_dir.display()))?
+        .filter_map(Result::ok)
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(date) = name
+            .strip_prefix("summary-")
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if date < first_date.as_str() {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path())?;
+        if let Ok(day) = serde_json::from_str::<DailySummary>(&text) {
+            for a in day.assets {
+                out.entry(a).or_default().push(date.to_string());
+            }
+        }
+    }
+    for days in out.values_mut() {
+        days.sort();
+    }
+    Ok(out)
+}
+
+/// R-P5P9-88 (3a): the harness's assets and build lines, for the FV setup to check against F.
+pub fn render_assets(assets: &BTreeMap<String, Vec<String>>) -> String {
+    if assets.is_empty() {
+        return "harness assets: none recorded\n".into();
+    }
+    let mut text = format!("harness assets: {} distinct\n", assets.len());
+    for (line, days) in assets {
+        text.push_str(&format!("  {line} ({})\n", days.join(", ")));
+    }
+    text
 }
 
 /// The union of the summaries' unpaired captured documents since `since_secs` (by day).
@@ -1032,6 +1078,39 @@ mod tests {
             serde_json::to_vec(&day).unwrap(),
         )
         .unwrap();
+    }
+
+    /// R-P5P9-88 (3a): the summary prints each start's assets hash and build sha with the
+    /// days it shows in, and says so when none is recorded.
+    #[test]
+    fn the_summary_prints_the_harness_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (text, _) = run_text(dir.path(), "2026-11-15T00:00:00Z", "must", "small").unwrap();
+        assert!(text.contains("harness assets: none recorded"), "{text}");
+        for (date, line) in [
+            ("2026-11-15", "assets 0a1b build 56b34b9aaaaa"),
+            ("2026-11-16", "assets 0a1b build 56b34b9aaaaa"),
+            ("2026-11-16", "assets 9f9f build 0123456789ab"),
+        ] {
+            let path = dir.path().join(format!("summary-{date}.json"));
+            let mut day: DailySummary = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            day.date = date.into();
+            day.assets.insert(line.into());
+            std::fs::write(&path, serde_json::to_vec(&day).unwrap()).unwrap();
+        }
+        let (text, _) = run_text(dir.path(), "2026-11-15T00:00:00Z", "must", "small").unwrap();
+        assert!(text.contains("harness assets: 2 distinct"), "{text}");
+        assert!(
+            text.contains("  assets 0a1b build 56b34b9aaaaa (2026-11-15, 2026-11-16)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  assets 9f9f build 0123456789ab (2026-11-16)"),
+            "{text}"
+        );
     }
 
     /// Writes one summary file per day: (date, buckets, its pair's class, known-gap-p records
