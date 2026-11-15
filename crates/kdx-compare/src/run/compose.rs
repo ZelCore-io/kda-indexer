@@ -355,6 +355,33 @@ impl Ctx {
         }
     }
 
+    /// R-P5P9-92 (9), R-P5P9-93: the stored form's read of `t` now, one read of the run's
+    /// budget (the referee's `--max-reads`) per page; past it, why, its own reason.
+    async fn read_now_charged(&self, req: &Request, t: &Target) -> Result<Value, String> {
+        let cap = || {
+            format!(
+                "the run's read cap is reached before the re-read of {}",
+                t.name
+            )
+        };
+        if !self.gql.take_node_read() {
+            return Err(cap());
+        }
+        let p = self
+            .fetch_a(req, t)
+            .await
+            .map_err(|e| format!("the read now failed: {e:#}"))?;
+        for _ in 1..p.pages.len() {
+            if !self.gql.take_node_read() {
+                return Err(cap());
+            }
+        }
+        if p.pages.first().map(|c| c.status) != Some(200) {
+            return Err("the read now did not answer 200".into());
+        }
+        Ok(p.items)
+    }
+
     /// R-P5P9-86 v1txs with R-P5P9-87, the stored form: every stored row of both sides is
     /// node-canonical, and a read of both sides now agrees on its overlap.
     async fn v1txs_edge_stored(
@@ -371,15 +398,8 @@ impl Ctx {
             .flatten()
             .collect();
         self.rows_node_canonical(req, &rows).await?;
-        let read = |p: anyhow::Result<Paged>| -> Result<Value, String> {
-            let p = p.map_err(|e| format!("the read now failed: {e:#}"))?;
-            if p.pages.first().map(|c| c.status) != Some(200) {
-                return Err("the read now did not answer 200".into());
-            }
-            Ok(p.items)
-        };
-        let ra = read(self.fetch_a(req, ta).await)?;
-        let rb = read(self.fetch_a(req, tb).await)?;
+        let ra = self.read_now_charged(req, ta).await?;
+        let rb = self.read_now_charged(req, tb).await?;
         let n = overlap_agrees(&req.route, &ra, &rb)?;
         Ok(
             json!({"stored": "every row node-canonical", "nodeCanonical": rows.len(),

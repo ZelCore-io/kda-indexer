@@ -276,7 +276,7 @@ async fn e2b_x_trailing_zeros_with_ours_equal_to_the_node() {
 /// A REST side answering its n-th compare request (an account or /v1/txs path) with
 /// `bodies[n]` (the last one after that), and `[]` on any other path (no tip, so no lag
 /// window).
-async fn reads_server(bodies: Vec<Value>) -> String {
+pub(super) async fn reads_server(bodies: Vec<Value>) -> String {
     let n = Arc::new(Mutex::new(0usize));
     let app = Router::new().fallback(move |uri: Uri| {
         let (n, bodies) = (n.clone(), bodies.clone());
@@ -294,7 +294,13 @@ async fn reads_server(bodies: Vec<Value>) -> String {
     serve(app).await.trim_end_matches('/').to_string()
 }
 
-fn rest_cfg(nu: &str, au: &str, bu: &str, out: &std::path::Path, b_kind: &str) -> CompareConfig {
+pub(super) fn rest_cfg(
+    nu: &str,
+    au: &str,
+    bu: &str,
+    out: &std::path::Path,
+    b_kind: &str,
+) -> CompareConfig {
     let allow =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
     toml::from_str(&format!(
@@ -411,15 +417,15 @@ async fn e2b_rest_rules_combine_row_by_row() {
     }
 }
 
-fn v1_row(rk: &str, h: u64) -> Value {
+pub(super) fn v1_row(rk: &str, h: u64) -> Value {
     json!({"requestKey": rk, "chain": 0, "height": h, "blockHash": format!("c{h}"),
         "amount": 1.5, "code": "x", "events": [], "gasLimit": 600})
 }
 
-const V1_REQ: &str = "/v1/txs/k:5fd26d23/coin/10";
+pub(super) const V1_REQ: &str = "/v1/txs/k:5fd26d23/coin/10";
 
 /// #1871's first reads: ours' one row at 7006546, kda-txs' four at 7006517-520.
-fn v1_first() -> (Value, Value) {
+pub(super) fn v1_first() -> (Value, Value) {
     let b: Vec<Value> = (517..=520)
         .rev()
         .map(|h| v1_row(&format!("r{h}"), 7_006_000 + h))
@@ -427,7 +433,7 @@ fn v1_first() -> (Value, Value) {
     (json!([v1_row("r546", 7_006_546)]), Value::Array(b))
 }
 
-fn v1_node(bad: Option<&str>) -> NodeMock {
+pub(super) fn v1_node(bad: Option<&str>) -> NodeMock {
     let mut node = canon_node(&[0], 7_006_500..7_006_600);
     for h in [517u64, 518, 519, 520, 546] {
         let rk = format!("r{h}");
@@ -473,7 +479,12 @@ async fn e2b_v1txs_edge_rereads_once() {
     }
 }
 
-fn rest_record(route: &str, req: &str, a: &Value, b: &Value) -> crate::report::DiffRecord {
+pub(super) fn rest_record(
+    route: &str,
+    req: &str,
+    a: &Value,
+    b: &Value,
+) -> crate::report::DiffRecord {
     crate::report::DiffRecord {
         ts: "2026-11-15T09:00:00Z".into(),
         route: route.into(),

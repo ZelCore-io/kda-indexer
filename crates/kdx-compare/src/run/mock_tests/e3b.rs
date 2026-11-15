@@ -353,3 +353,45 @@ async fn e3b_w_the_referee_places_height_less_rows_by_poll() {
         );
     }
 }
+
+/// R-P5P9-92 (9) with R-P5P9-93: the /v1/txs edge's stored form reads ours and kda-txs now,
+/// and each of those reads takes one read of `--max-reads`. #1871's shape: with the reads
+/// the record needs it is explained; one read fewer leaves the re-read of kda-txs past the
+/// cap, unexplained with that reason.
+#[tokio::test]
+async fn e3b_the_v1txs_stored_reread_counts_in_max_reads() {
+    let (a0, b0) = super::e2b::v1_first();
+    let all: Vec<Value> = std::iter::once(super::e2b::v1_row("r546", 7_006_546))
+        .chain(b0.as_array().unwrap().iter().cloned())
+        .collect();
+    let run = |max_reads: usize| {
+        let (a0, b0, all) = (a0.clone(), b0.clone(), all.clone());
+        async move {
+            let dir = tempfile::tempdir().unwrap();
+            let nu = node_server(super::e2b::v1_node(None)).await;
+            let au = super::e2b::reads_server(vec![Value::Array(all.clone())]).await;
+            let bu = super::e2b::reads_server(vec![Value::Array(all)]).await;
+            let cfg = super::e2b::rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs");
+            let rec = super::e2b::rest_record("v1txs", super::e2b::V1_REQ, &a0, &b0);
+            let log = dir.path().join("diffs-v1.jsonl");
+            std::fs::write(&log, serde_json::to_string(&rec.bounded()).unwrap() + "\n").unwrap();
+            let opts = crate::referee::Opts {
+                logs: vec![log],
+                max_reads,
+                rps: 100,
+            };
+            crate::referee::run(cfg, &opts).await.unwrap()
+        }
+    };
+    let full = run(200).await;
+    assert_eq!(full.explained, 1, "{full:?}");
+    let need = full.node_reads;
+    let rep = run(need).await;
+    assert_eq!(rep.explained, 1, "{need}: {rep:?}");
+    let short = run(need - 1).await;
+    assert_eq!(short.explained, 0, "{need}: {short:?}");
+    assert!(
+        format!("{short:?}").contains("the run's read cap is reached before the re-read"),
+        "{short:?}"
+    );
+}
