@@ -946,14 +946,23 @@ impl Ctx {
             // R-P5P9-71 (1): the window is for rows the oracle has not filled yet, which are
             // rows it lacks. A row only the oracle lists there is no lag: it stays in the
             // compare unless it is near A's tip or the node shows its block is an orphan.
+            // R-P5P9-72 (1): when ours held a known limit (or was cut at a page), an
+            // oracle-only row at or below ours' lowest height is ours' limit, not evidence.
+            let (min_a0, min_b0) = (min_height(&va), min_height(&vb));
+            let at_limit_a = pa.truncated || page_cut || limit.is_some_and(|l| na >= l);
+            let floor = min_a0.filter(|_| at_limit_a);
             let kept_b = if replica {
                 Vec::new()
             } else {
-                self.lag_window_oracle_only(&va, &mut vb, clamp).await
+                self.lag_window_oracle_only(&va, &mut vb, clamp, floor)
+                    .await
             };
             let dropped = drop_above(&mut va, clamp) + drop_above(&mut vb, clamp);
             if dropped > 0 {
-                let (min_a, min_b) = (min_height(&va), min_height(&vb));
+                // R-P5P9-72 (1): the lowest heights before the window dropped rows, so a full
+                // side whose page lies wholly in the window still cuts the other side's rows
+                // below it.
+                let (min_a, min_b) = (min_a0, min_b0);
                 let cut = [(fa, min_a), (fb, min_b)]
                     .into_iter()
                     .filter_map(|(f, h)| if f { h } else { None })
@@ -2777,14 +2786,23 @@ impl Ctx {
     /// `REPLICA_TIP_MARGIN` of A's tip (the oracle may be read after a new block) and rows
     /// whose block the node shows is not canonical (an orphan the oracle keeps). A row the
     /// node cannot settle (no header, the read budget spent) stays in the compare.
-    async fn lag_window_oracle_only(&self, va: &Value, vb: &mut Value, clamp: u64) -> Vec<Value> {
+    /// R-P5P9-72 (1): `floor`, ours' lowest height when ours held a known limit (or was cut
+    /// at a page): rows at or below it are ours' limit, not evidence, and stay in `vb`.
+    async fn lag_window_oracle_only(
+        &self,
+        va: &Value,
+        vb: &mut Value,
+        clamp: u64,
+        floor: Option<u64>,
+    ) -> Vec<Value> {
         let near_tip = self.tips.a_tip().saturating_sub(REPLICA_TIP_MARGIN);
+        let low = clamp.max(floor.unwrap_or(0));
         let window = |v: &Value| -> Value {
             Value::Array(
                 v.as_array()
                     .map(|x| {
                         x.iter()
-                            .filter(|r| row_height(r).is_some_and(|h| h > clamp && h <= near_tip))
+                            .filter(|r| row_height(r).is_some_and(|h| h > low && h <= near_tip))
                             .cloned()
                             .collect()
                     })

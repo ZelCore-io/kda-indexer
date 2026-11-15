@@ -4283,6 +4283,18 @@ async fn v1_setup(a: Vec<u8>, b: Vec<u8>, out: &std::path::Path) -> Ctx {
 
 /// [`v1_setup`] with its own node mock.
 async fn v1_setup_node(a: Vec<u8>, b: Vec<u8>, out: &std::path::Path, node: NodeMock) -> Ctx {
+    bytes_pair_setup(a, b, out, node, "kda_txs").await
+}
+
+/// A context comparing compat (`a`) with an oracle of `b_kind` (`b`), each answering its
+/// bytes on every path.
+async fn bytes_pair_setup(
+    a: Vec<u8>,
+    b: Vec<u8>,
+    out: &std::path::Path,
+    node: NodeMock,
+    b_kind: &str,
+) -> Ctx {
     let (nu, au, bu) = (
         node_server(node).await,
         bytes_server(a).await,
@@ -4306,7 +4318,7 @@ url = "{au}"
 kind = "kda_indexer_compat"
 [targets.b]
 url = "{bu}"
-kind = "kda_txs"
+kind = "{b_kind}"
 "#
     ))
     .unwrap();
@@ -5295,4 +5307,82 @@ async fn c5b_the_semaphore_serialises_large_v1txs_answers() {
         o.is_ok(),
         "the large compare did not finish once the permit was free"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// FVH-C6: the oracle-lag window's floor and cut (R-P5P9-72 item 1)
+
+/// R-P5P9-72 (1), review-fvh-e I-1: when ours holds its limit, a row only kda-txs lists at
+/// or below ours' lowest height is ours' limit, not evidence, and goes with the window: the
+/// oracle one block behind and tie order at ours' lowest height stay explained. The cut is
+/// taken from both sides' lowest heights before the window drops rows, so kda-txs's rows
+/// below the window, under ours' page, go too. Ours not full stays a diff.
+#[tokio::test]
+async fn c6_the_lag_window_floor_is_ours_lowest_height_at_its_limit() {
+    // Heights 7_000_000 down to 6_999_985.
+    let rows = v1_rows(16, 10);
+    let at_9 = |rk: &str| {
+        let mut r = rows[9].clone();
+        r["requestKey"] = json!(rk);
+        r
+    };
+    // Every row in the window, rows down to 6_999_995 near A's tip.
+    let all_in = 7_000_000;
+    // The window above 6_999_988: ours' page (down to 6_999_991) lies wholly inside it.
+    let below = 6_999_988 + super::ORACLE_HORIZON;
+    let cases: [(&str, Vec<Value>, Vec<Value>, u64, &str); 5] = [
+        (
+            "kda-txs one block behind",
+            rows[..10].to_vec(),
+            rows[1..11].to_vec(),
+            all_in,
+            "allowlisted",
+        ),
+        (
+            "tie order at ours' lowest height",
+            [&rows[..9], &[at_9("rkX")]].concat(),
+            [&rows[..9], &[at_9("rkY")]].concat(),
+            all_in,
+            "allowlisted",
+        ),
+        (
+            "ours not full, short by one",
+            rows[..9].to_vec(),
+            rows[1..11].to_vec(),
+            all_in,
+            "diff",
+        ),
+        (
+            "kda-txs reaches below the window",
+            rows[..10].to_vec(),
+            rows[5..15].to_vec(),
+            below,
+            "allowlisted",
+        ),
+        (
+            "kda-txs reaches below the window, ours not full",
+            rows[..9].to_vec(),
+            rows[5..15].to_vec(),
+            below,
+            "diff",
+        ),
+    ];
+    for (name, a, b, tip, class) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = v1_setup_node(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            dir.path(),
+            NodeMock::default(),
+        )
+        .await;
+        ctx.tips.set_a_tip(tip);
+        let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+        assert_eq!(
+            o.class,
+            class,
+            "{name}: {:?}",
+            o.record.map(|r| (r.note, r.diff))
+        );
+    }
 }
