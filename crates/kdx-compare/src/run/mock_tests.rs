@@ -7530,9 +7530,18 @@ async fn d4a_h2_i2_e_m_o_k_have_their_own_visible_hits_and_proposed_entries() {
         );
         assert!(un.is_empty() && ids == [id], "{path}: {un:?} {ids:?}");
         let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+        // R-P5P9-86 flipped K and O to ACCEPTED on CG-5's node checks.
+        let flipped = e.status == crate::allowlist::Status::Accepted
+            && e.ruling.contains("R-P5P9-86, CG-5")
+            && [
+                "graphql-r75-exec-payload-data",
+                "graphql-r75-nested-order-index",
+            ]
+            .contains(&id);
         assert!(
-            e.status == crate::allowlist::Status::Proposed
-                && e.owner_note.starts_with("PROPOSED")
+            (flipped
+                || e.status == crate::allowlist::Status::Proposed
+                    && e.owner_note.starts_with("PROPOSED"))
                 && e.reason.contains("R-P5P9-78"),
             "{id}: {e:?}"
         );
