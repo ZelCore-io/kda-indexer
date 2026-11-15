@@ -5957,3 +5957,91 @@ async fn d1_b_result_block_canonical_is_h7s_own_verdict() {
     let (d, _) = run(node(Some("X100")), tx("t1", json!(true))).await;
     assert!(!only_hits(&d), "{d:?}");
 }
+
+/// [`gql_ctx`] with the oracle-pair field rule `transfers.amount = oracle_f64_rounded`.
+async fn d1_ctx_f64(node: NodeMock, out: &std::path::Path) -> Ctx {
+    let nu = node_server(node).await;
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = "no-such-dir"
+field_rules = [{{ field = "transfers.amount", rule = "oracle_f64_rounded" }}]
+[targets.a]
+url = "http://127.0.0.1:9/graphql"
+kind = "kda_indexer_graphql"
+[targets.b]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+max_height = 7000000
+"#
+    ))
+    .unwrap();
+    Ctx::new(cfg).await.unwrap()
+}
+
+/// R-P5P9-75 D: rows without an index match as a multiset after the ruled field matchers
+/// (here `oracle_f64_rounded`): ours' exact amount pairs with the oracle's f64-rounded one
+/// (CG-4 #136, #348). The node-confirmed duplicate excuse applies to rows without an index:
+/// the oracle lists a transfer twice that the node's transaction and ours hold once (#84).
+/// An amount that is not the f64 rounding, and an oracle copy the node also holds, stay diffs.
+#[tokio::test]
+async fn d1_d_multiset_identity_runs_the_ruled_matchers_and_the_duplicate_excuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let exact = "65913.172664045997";
+    let (k, v) = h7_xfer_poll("f", "B100", 100, "s", "r", json!({ "decimal": exact }));
+    node.polls.insert(k, v);
+    let (k, v) = h7_xfer_poll("u", "B100", 100, "s", "r", json!(1.0));
+    node.polls.insert(k, v);
+    let ev = json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "r", 2.0]});
+    let (k, v) = h7_poll("w", "B100", 100, json!([ev.clone(), ev]));
+    node.polls.insert(k, v);
+    let ctx = d1_ctx_f64(node, dir.path()).await;
+    let x = |rk: &str, a: &str| h7_xrow(rk, 100, json!(a), Some(("s", "r")));
+    // The oracle's amount is ours' as an f64.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x("f", exact)],
+        vec![x("f", "65913.172664046")],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // The oracle lists u twice; the node's transaction and ours hold it once.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x("u", "1.0")],
+        vec![x("u", "1.0"), x("u", "1.0")],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(format!("{d:?}").contains("duplicate"), "{d:?}");
+    // Not the f64 rounding of ours: a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x("f", exact)],
+        vec![x("f", "65913.17")],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The node holds w twice, ours once: the oracle's second copy is a row ours lacks.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x("w", "2.0")],
+        vec![x("w", "2.0"), x("w", "2.0")],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}

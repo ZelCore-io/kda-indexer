@@ -1787,20 +1787,40 @@ fn node_of(r: &Row) -> &Value {
     r.edge.get("node").unwrap_or(&Value::Null)
 }
 
-/// Whether ours' row node `x` is the oracle's row `rb` in every selected field (R-P5P9-63
-/// (3)); an encoded coinbase key of the oracle's compares in its decoded form (R-P5P9-75 C).
-fn same_node(x: &Value, rb: &Row) -> bool {
-    let y = node_of(rb);
-    match (
-        &rb.id.encoded_rk,
-        y.get("requestKey").and_then(Value::as_str),
-    ) {
-        (Some(enc), Some(k)) if k == enc => {
-            let mut y = y.clone();
-            y["requestKey"] = json!(rb.id.rk);
-            *x == y
+/// R-P5P9-75 D: whether ours' value `x` is the oracle's `y` at `path` (a JSON pointer from
+/// the body root), exactly or, at a leaf, by a ruled value matcher of `rules`
+/// (`oracle_f64_rounded`, H9's `creation_time_half_even`).
+fn same_ruled(x: &Value, y: &Value, path: &str, rules: &[crate::config::FieldRule]) -> bool {
+    use crate::config::FieldRuleKind as K;
+    if x == y {
+        return true;
+    }
+    match (x, y) {
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(k, v)| {
+                    b.get(k)
+                        .is_some_and(|w| same_ruled(v, w, &format!("{path}/{k}"), rules))
+                })
         }
-        _ => x == y,
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .enumerate()
+                    .all(|(i, (v, w))| same_ruled(v, w, &format!("{path}/{i}"), rules))
+        }
+        _ => {
+            let txt = |v: &Value| match v {
+                Value::Number(n) => json!(n.to_string()),
+                v => v.clone(),
+            };
+            rules
+                .iter()
+                .filter(|r| matches!(r.rule, K::OracleF64Rounded | K::CreationTimeHalfEven))
+                .filter(|r| crate::graphql_norm::field_matches(path, &r.field))
+                .any(|r| crate::graphql_norm::rule_explains(r, &txt(x), &txt(y), false).is_some())
+        }
     }
 }
 
@@ -1811,6 +1831,10 @@ pub struct Prep {
     pub b: Vec<Row>,
     pub a_cut: bool,
     pub b_cut: bool,
+    /// R-P5P9-75 D: the oracle-pair field rules whose value matchers rows without an index
+    /// match under, and the root list's response key (the rules' paths start there).
+    pub rules: Vec<crate::config::FieldRule>,
+    pub root: String,
 }
 
 fn more(c: &Value) -> bool {
@@ -1866,6 +1890,8 @@ pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
         b: rows(cb, true)?,
         a_cut: more(ca),
         b_cut: more(cb),
+        rules: Vec::new(),
+        root: String::new(),
     })
 }
 
@@ -1904,10 +1930,7 @@ fn matching(p: &Prep, live_a: &[usize], live_b: &[usize]) -> Matching {
         }
         let mut free = gb.get(k).cloned().unwrap_or_default();
         for &i in ia {
-            match free
-                .iter()
-                .position(|&j| same_node(node_of(&p.a[i]), &p.b[j]))
-            {
+            match free.iter().position(|&j| p.same(node_of(&p.a[i]), &p.b[j])) {
                 Some(x) => m.pairs.push((i, free.remove(x))),
                 None => m.ours.push(i),
             }
@@ -1935,6 +1958,26 @@ fn matching(p: &Prep, live_a: &[usize], live_b: &[usize]) -> Matching {
 }
 
 impl Prep {
+    /// Whether ours' row node `x` is the oracle's row `rb` in every selected field
+    /// (R-P5P9-63 (3)), after the ruled value matchers (R-P5P9-75 D); an encoded coinbase key
+    /// of the oracle's compares in its decoded form (R-P5P9-75 C).
+    fn same(&self, x: &Value, rb: &Row) -> bool {
+        let y = node_of(rb);
+        let root = self.root.replace('~', "~0").replace('/', "~1");
+        let path = format!("/data/{root}/edges/0/node");
+        match (
+            &rb.id.encoded_rk,
+            y.get("requestKey").and_then(Value::as_str),
+        ) {
+            (Some(enc), Some(k)) if k == enc => {
+                let mut y = y.clone();
+                y["requestKey"] = json!(rb.id.rk);
+                same_ruled(x, &y, &path, &self.rules)
+            }
+            _ => same_ruled(x, y, &path, &self.rules),
+        }
+    }
+
     /// The rows that need a node verdict, as (side: 0 ours, 1 the oracle's; row index):
     /// ours without a height or not matched once, and one row per oracle-only group.
     pub fn reads(&self) -> Vec<(usize, usize)> {
@@ -2044,7 +2087,8 @@ enum Place {
 /// R-P5P9-64 (I-1): an oracle-only row at our boundary height lies outside our window only
 /// when our page (`n` rows, keys `ours`) is a prefix of our longer read and the row appears
 /// in that read after our cut.
-fn after_our_cut(prefix: Option<&Result<Longer, String>>, ours: &[Row], rb: &Row) -> Place {
+fn after_our_cut(prefix: Option<&Result<Longer, String>>, p: &Prep, rb: &Row) -> Place {
+    let ours = &p.a;
     let (rows, capped) = match prefix {
         None => {
             return Place::Wait(
@@ -2069,7 +2113,7 @@ fn after_our_cut(prefix: Option<&Result<Longer, String>>, ours: &[Row], rb: &Row
     }
     let later = rows[ours.len()..]
         .iter()
-        .any(|(k, n)| *k == rb.key && (rb.id.indexed() || same_node(n, rb)));
+        .any(|(k, n)| *k == rb.key && (rb.id.indexed() || p.same(n, rb)));
     if later {
         Place::Outside("after-our-cut")
     } else if capped {
@@ -2386,9 +2430,28 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
         };
         d.ours.push(evidence(ra, vi, why));
     }
+    // R-P5P9-75 D: per oracle row content without an index, how many of its copies the node
+    // does not hold (the oracle's count less the node's): that many leftover copies are
+    // node-confirmed duplicates.
+    let mut spare: HashMap<(String, String), usize> = HashMap::new();
     for g in &m.oracle {
         let j = g[0];
         let (rb, vj) = (&p.b[j], vb[j].as_ref());
+        if !rb.id.indexed() && canon(&vb[j]) == Canon::Yes {
+            let sig = (rb.key.clone(), node_of(rb).to_string());
+            let left = spare.entry(sig).or_insert_with(|| {
+                let copies = gb[rb.key.as_str()]
+                    .iter()
+                    .filter(|&&x| node_of(&p.b[x]) == node_of(rb))
+                    .count();
+                copies.saturating_sub(vj.map_or(usize::MAX, |v| v.matches))
+            });
+            if *left > 0 {
+                *left -= 1;
+                d.oracle.push(evidence(rb, vj, "duplicate"));
+                continue;
+            }
+        }
         // R-P5P9-70 (I-1): an identity that disagrees with itself settles nothing.
         if let Some((k, why)) = g
             .iter()
@@ -2415,7 +2478,7 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                     } else {
                         "below-our-window"
                     }),
-                    (true, Some(bd), Some(h)) if h == bd => after_our_cut(w.prefix, &p.a, rb),
+                    (true, Some(bd), Some(h)) if h == bd => after_our_cut(w.prefix, p, rb),
                     (true, Some(_), Some(_)) => Place::Inside(
                         "an oracle-only canonical row strictly inside our window".into(),
                     ),
@@ -2600,7 +2663,12 @@ impl Ctx {
             }
         }
         let prep = match prepare(&ca, &cb) {
-            Ok(p) => p,
+            Ok(mut p) => {
+                // R-P5P9-75 D: rows without an index match after the ruled value matchers.
+                p.rules = self.cfg.graphql.field_rules.clone();
+                p.root = root.clone().unwrap_or_default();
+                p
+            }
             Err(why) => {
                 let rows = |c: &Value| {
                     c.get("edges")
