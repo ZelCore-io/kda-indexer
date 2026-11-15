@@ -6431,7 +6431,7 @@ fn d2_cmd_node(cmds: &[(&str, Value)]) -> NodeMock {
 /// signer's `addr`). Each negative neighbour (ours not the node's) stays a diff.
 #[tokio::test]
 async fn d2_j_k_l_tx_fields_against_the_nodes_command() {
-    use crate::graphql_window::{PAYLOAD_DATA_PATH, ROLLBACK_PATH, SIGNER_ADDRESS_PATH};
+    use crate::graphql_window::{EXEC_PAYLOAD_DATA_PATH, ROLLBACK_PATH, SIGNER_ADDRESS_PATH};
     let dir = tempfile::tempdir().unwrap();
     let cont = |rb: bool| {
         json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": rb, "data": {},
@@ -6484,7 +6484,7 @@ async fn d2_j_k_l_tx_fields_against_the_nodes_command() {
         tx("k1", data("{}"), json!([])),
     )
     .await;
-    assert!(only_hits(&d) && has(&d, PAYLOAD_DATA_PATH), "{d:?}");
+    assert!(only_hits(&d) && has(&d, EXEC_PAYLOAD_DATA_PATH), "{d:?}");
     // By value: ours' JSON text of the node's object.
     let d = settle(
         tx("k2", data(r#"{"ks":["a"]}"#), json!([])),
@@ -6528,7 +6528,7 @@ async fn d2_j_k_l_tx_fields_against_the_nodes_command() {
 /// numbering. Ours with another index stays a diff.
 #[tokio::test]
 async fn d2_o_h8_applies_to_nested_transfer_lists() {
-    use crate::graphql_window::ORDER_INDEX_PATH;
+    use crate::graphql_window::NESTED_ORDER_INDEX_PATH as ORDER_INDEX_PATH;
     let dir = tempfile::tempdir().unwrap();
     let mut node = NodeMock::default();
     let ev = json!([
@@ -7354,4 +7354,89 @@ async fn d4a_h2_m5_n_only_under_a_block_chain_or_height_filter() {
         d.iter().any(|e| e.path == SINGLE_BLOCK_PATH) && only_hits(&d),
         "{d:?} {note:?}"
     );
+}
+
+/// R-P5P9-78 (H2 I-2; closes H1 m-5): E and M, O and K each emit a visible hit of their own,
+/// which only its own PROPOSED entry explains. A window settled without E or M emits no
+/// off-chain hit.
+#[tokio::test]
+async fn d4a_h2_i2_e_m_o_k_have_their_own_visible_hits_and_proposed_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("x0", 100), ("e", 100), ("v", 100)] {
+        let (k, v) = h7_xfer_poll(rk, &format!("B{h}"), h, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let off = "/~graphql-r75-h7-off-chain";
+    let x = |rk: &str, to: &str, amount: f64| h7_xrow(rk, 100, json!(amount), Some(("s", to)));
+    let x0 = x("x0", "r", 1.0);
+    // E.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), x("e", "miner2", 0.0000323)],
+        (false, false),
+    )
+    .await;
+    assert!(
+        only_hits(&d) && d.iter().any(|e| e.path == off),
+        "{d:?} {note:?}"
+    );
+    // M: the oracle places e in X90 at height 90.
+    let mut m = h7_xrow("e", 90, json!(1.0), Some(("s", "r")));
+    m["node"]["blockHash"] = json!("X90");
+    let mut ours = h7_xrow("e", 100, json!(1.0), Some(("s", "r")));
+    ours["node"]["blockHash"] = json!("B100");
+    let (d, note) = d1_settle(&ctx, vec![ours], vec![m], (false, false)).await;
+    assert!(
+        only_hits(&d) && d.iter().any(|e| e.path == off),
+        "{d:?} {note:?}"
+    );
+    // A node-confirmed oracle gap only: no off-chain hit.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), x("v", "r", 1.0)],
+        vec![x0.clone()],
+        (false, false),
+    )
+    .await;
+    assert!(
+        only_hits(&d) && d.iter().all(|e| e.path != off),
+        "{d:?} {note:?}"
+    );
+    // Each new hit is explained by its own PROPOSED entry, and only by it.
+    let allow = d2_shipped();
+    for (path, id) in [
+        (off, "graphql-r75-h7-off-chain"),
+        (
+            "/~graphql-r75-nested-order-index",
+            "graphql-r75-nested-order-index",
+        ),
+        (
+            "/~graphql-r75-exec-payload-data",
+            "graphql-r75-exec-payload-data",
+        ),
+    ] {
+        let hit = crate::report::DiffEntry {
+            path: path.into(),
+            kind: crate::report::DiffKind::Changed,
+            a: None,
+            b: None,
+        };
+        let (un, ids) = allow.classify_request(
+            &crate::normalize::RouteKind::Other,
+            "graphql:QD4a",
+            &[],
+            &[hit],
+        );
+        assert!(un.is_empty() && ids == [id], "{path}: {un:?} {ids:?}");
+        let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+        assert!(
+            e.status == crate::allowlist::Status::Proposed
+                && e.owner_note.starts_with("PROPOSED")
+                && e.reason.contains("R-P5P9-78"),
+            "{id}: {e:?}"
+        );
+    }
 }

@@ -84,6 +84,16 @@ pub const OURS_PAGE_CAP: u64 = 100;
 /// R-P5P9-75 C: the oracle's base64-encoded coinbase `requestKey` that decodes to ours' key,
 /// ours being the node's coinbase key (the block's parent hash).
 pub const COINBASE_KEY_PATH: &str = "/~graphql-r75-coinbase-request-key";
+/// R-P5P9-78 (H2 I-2): next to [`WINDOW_PATH`] when a one-sided oracle row was settled off the
+/// node's chain by E ([`NOT_IN_NODE_TX`]) or as an orphan by block (M); it lists those rows
+/// (allowlist id `graphql-r75-h7-off-chain`).
+pub const OFF_CHAIN_PATH: &str = "/~graphql-r75-h7-off-chain";
+/// R-P5P9-78 (H2 I-2): O, H8 on the transfer lists nested in a transaction (allowlist id
+/// `graphql-r75-nested-order-index`).
+pub const NESTED_ORDER_INDEX_PATH: &str = "/~graphql-r75-nested-order-index";
+/// R-P5P9-78 (H2 I-2): K, a tx's exec `cmd.payload.data` against the node's command
+/// (allowlist id `graphql-r75-exec-payload-data`).
+pub const EXEC_PAYLOAD_DATA_PATH: &str = "/~graphql-r75-exec-payload-data";
 const ROUTE: &str = "graphql-window-referee";
 
 fn text(v: &Value) -> Option<String> {
@@ -2288,6 +2298,8 @@ pub struct Decision {
     pub needs_prefix: bool,
     /// R-P5P9-75 C: paired oracle rows whose encoded coinbase key the node confirmed.
     pub coinbase_keys: Vec<usize>,
+    /// R-P5P9-78 (H2 I-2): the oracle rows settled off the node's chain by E or M.
+    pub off_chain: Vec<Value>,
 }
 
 impl Decision {
@@ -2722,6 +2734,9 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                         ));
                     } else {
                         d.oracle.push(evidence(&p.b[k], vj, class));
+                        if by_content || vj.is_some_and(|v| v.why.contains("orphan by block")) {
+                            d.off_chain.push(evidence(&p.b[k], vj, class));
+                        }
                     }
                 }
             }
@@ -3097,6 +3112,13 @@ impl Ctx {
                 COINBASE_KEY_PATH,
                 None,
                 Some(json!({ "keys": keys })),
+            ));
+        }
+        if !d.off_chain.is_empty() {
+            out.push(entry(
+                OFF_CHAIN_PATH,
+                None,
+                Some(json!({ "rows": d.off_chain })),
             ));
         }
         if d.rejected.is_empty() {
@@ -4420,7 +4442,7 @@ impl Ctx {
             }
         }
         let reads = st.node - node0;
-        [ROLLBACK_PATH, PAYLOAD_DATA_PATH, SIGNER_ADDRESS_PATH]
+        [ROLLBACK_PATH, EXEC_PAYLOAD_DATA_PATH, SIGNER_ADDRESS_PATH]
             .iter()
             .zip(ev)
             .filter(|(_, e)| !e.is_empty())
@@ -4527,7 +4549,7 @@ impl Ctx {
         }
         (!evidence.is_empty()).then(|| {
             entry(
-                ORDER_INDEX_PATH,
+                NESTED_ORDER_INDEX_PATH,
                 Some(json!({"nodePolls": reads})),
                 Some(Value::Array(evidence)),
             )

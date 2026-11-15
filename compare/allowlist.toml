@@ -663,3 +663,39 @@ reason = "R-P5P9-62 H9 (creationTime fraction, R-P5P9-58 watch item #55): at a f
 status = "ACCEPTED"
 ruling = "R-P5P9-62; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R-P5P9-62: ours = the node's Pact ParsedInteger, round half to even; a judgment call for the controller)."
+
+# R-P5P9-78 D4a (H2 I-2): the classes D1 and D2 added under ACCEPTED entries each emit a
+# visible hit of their own, PROPOSED until CG-5 samples them.
+
+[[entry]]
+id = "graphql-r75-h7-off-chain"
+route = "other"
+json_path_glob = "/~graphql-r75-h7-off-chain"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-75 E and M, made visible by R-P5P9-78 (H2 I-2): H7 settled one or more oracle-only rows off the node's chain, and this hit lists them next to /~graphql-h7-window-referee. E: an oracle transfer row whose (sender, receiver, amount) the key's canonical transaction on the node does not hold (the module fields left out; the oracle's f64 amount allowed), only when the node's /poll entry lists its events; the verdict holds for that row's content only (R-P5P9-78 H1 I-1, I-2, m-2). M: an oracle row in a block the node does not hold the key in, at another known height (an orphan by block). An oracle row of other content under the same key, a /poll entry without events, a row whose triple the node holds, or a row selection with an alias stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-75 (E, M); R-P5P9-78 (H2 I-2)."
+owner_note = "PROPOSED (ruling R-P5P9-78 H2 I-2; evidence CG-4 #23 for E): stays PROPOSED until CG-5 shows clean hits of E and M."
+
+[[entry]]
+id = "graphql-r75-nested-order-index"
+route = "other"
+json_path_glob = "/~graphql-r75-nested-order-index"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-75 O, made visible by R-P5P9-78 (H2 I-2): H8 on the transfer lists nested in a transaction (QTransactionByKey's result.transfers). For each nested list of the oracle's whose rows ours does not hold at the same place with the same orderIndex and content (at most 20 keys per compare), one node /poll of the parent tx's request key showed that every oracle value is the rank of the node's TRANSFER event with the row's content; the rows then took that event's index (ours' numbering, R-P5P9-62), and the diff checks ours against it. Any other numbering, or a row the node's events do not hold, stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-75 (O); R-P5P9-78 (H2 I-2)."
+owner_note = "PROPOSED (ruling R-P5P9-78 H2 I-2): stays PROPOSED until CG-5 shows clean hits of O."
+
+[[entry]]
+id = "graphql-r75-exec-payload-data"
+route = "other"
+json_path_glob = "/~graphql-r75-exec-payload-data"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-75 K, made visible by R-P5P9-78 (H2 I-2): where ours and the oracle differ on a tx's exec cmd.payload.data, the oracle's value took ours only because ours (its JSON text, by value) equals the node's exec.data for that request key, read single-row (at most 5 keys per compare). The reverse direction, a node value that is not ours, or a failed read stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-75 (K); R-P5P9-78 (H2 I-2)."
+owner_note = "PROPOSED (ruling R-P5P9-78 H2 I-2; evidence CG-4 #381, #914, #1471): stays PROPOSED until CG-5 shows clean hits of K."
