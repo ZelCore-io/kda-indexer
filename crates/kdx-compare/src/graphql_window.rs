@@ -1173,20 +1173,27 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
     }
     let mut out = content_verdict(r, n, p, oracle, v);
     // R-P5P9-75 E: an oracle transfer row whose (sender, receiver, amount) the key's canonical
-    // transaction on the node does not hold is off the node's chain.
+    // transaction on the node does not hold is off the node's chain. R-P5P9-78 (H1 I-2, H2
+    // m-3): the triple alone, the module fields left out (a row that differs from the node
+    // in its module only is not off the chain).
     let full = ["senderAccount", "receiverAccount", "amount"]
         .iter()
         .all(|k| sel(n, k).is_some());
+    let triple = |ev: &Value| {
+        let p = |i: usize| ev.pointer(&format!("/params/{i}"));
+        p(0) == sel(n, "senderAccount")
+            && p(1) == sel(n, "receiverAccount")
+            && p(2)
+                .zip(sel(n, "amount"))
+                .is_some_and(|(y, x)| same_amount(x, y, true))
+    };
     if oracle
         && full
         && r.kind == Some(Kind::Transfer)
         && out.canon == Canon::Unknown
         && out.matches == 0
         && out.why.ends_with("the node's transaction lacks the row")
-        && !out
-            .transfers
-            .iter()
-            .any(|ev| transfer_matches(n, ev, oracle))
+        && !out.transfers.iter().any(triple)
     {
         out.canon = Canon::No;
         out.why = format!("poll: {NOT_IN_NODE_TX}: the node's transaction holds no TRANSFER with the row's sender, receiver and amount");

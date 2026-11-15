@@ -6982,3 +6982,46 @@ async fn d4a_h1_i1_e_verdict_is_per_row_not_per_key_and_index() {
         "{d:?}"
     );
 }
+
+/// R-P5P9-78 (H1 I-2, H2 m-3): E matches only (sender, receiver, amount). CASE2: the oracle
+/// lists the node's transfer with another module name (or module hash); ours lacks it. The
+/// row is not off the node's chain, so it stays a diff. A triple the node lacks, with the
+/// module selected, stays explained.
+#[tokio::test]
+async fn d4a_h1_i2_e_matches_sender_receiver_and_amount_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x0", "e"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("s", "r")));
+    let with = |to: &str, amount: f64, k: &str, v: &str| {
+        let mut e = h7_xrow("e", 100, json!(amount), Some(("s", to)));
+        e["node"][k] = json!(v);
+        e
+    };
+    for (k, v) in [("moduleName", "n_abc.coin"), ("moduleHash", "zzz")] {
+        let (d, note) = d1_settle(
+            &ctx,
+            vec![x0.clone()],
+            vec![x0.clone(), with("r", 1.0, k, v)],
+            (false, false),
+        )
+        .await;
+        assert!(!only_hits(&d), "CASE2 {k}: {d:?} {note:?}");
+    }
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), with("miner2", 0.0000323, "moduleName", "coin")],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        format!("{d:?}").contains(crate::graphql_window::NOT_IN_NODE_TX),
+        "{d:?}"
+    );
+}
