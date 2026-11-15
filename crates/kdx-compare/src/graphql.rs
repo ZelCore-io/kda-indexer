@@ -2341,7 +2341,7 @@ impl Ctx {
             .ok_or_else(|| format!("node_h {node_h} is below 2"))?;
         const TIP: &str = "query STip($c: [String!], $h: Int!) { blocksFromHeight(startHeight: \
                            $h, chainIds: $c, first: 2) { pageInfo { hasNextPage } edges { node \
-                           { height chainId } } } }";
+                           { height chainId hash } } } }";
         st.ours += 1;
         let vars = json!({"c": [chain.to_string()], "h": lo});
         let data = self
@@ -2356,11 +2356,15 @@ impl Ctx {
             ));
         }
         let mut hs = Vec::new();
+        let mut hashes = std::collections::HashMap::new();
         for e in conn["edges"].as_array().into_iter().flatten() {
             let c = text_decimal(e.pointer("/node/chainId"));
             let h = text_decimal(e.pointer("/node/height")).and_then(|h| h.parse::<u64>().ok());
             match h {
-                Some(h) if c.as_deref() == Some(chain.to_string().as_str()) => hs.push(h),
+                Some(h) if c.as_deref() == Some(chain.to_string().as_str()) => {
+                    hs.push(h);
+                    hashes.insert(h, e.pointer("/node/hash").cloned());
+                }
                 _ => return Err(format!("ours' tip read holds a row off chain {chain}: {e}")),
             }
         }
@@ -2368,6 +2372,18 @@ impl Ctx {
         let tip = *hs.last().ok_or_else(|| {
             format!("ours holds no block from {lo} on chain {chain}: 3 or more below node_h")
         })?;
+        // R-P5P9-78 (H2 m-6): ours' own block at its tip is the cut branch's header there (a
+        // fork of ours at `tip` whose net equals the canonical block's would pass otherwise).
+        let mine = hashes.get(&tip).cloned().flatten().filter(Value::is_string);
+        let at_tip = self.canonical_reread(chain, tip, st).await;
+        if mine.is_none() || at_tip.as_ref().and_then(|hd| hd.get("hash")) != mine.as_ref() {
+            return Err(format!(
+                "ours' block at its tip {tip} on chain {chain} ({}) is not the cut branch's \
+                 header there",
+                mine.as_ref()
+                    .map_or_else(|| "no hash".to_string(), Value::to_string)
+            ));
+        }
         if hs != (lo..=tip).collect::<Vec<u64>>() || !(tip + 1 == node_h || tip + 2 == node_h) {
             return Err(format!(
                 "ours' blocks from {lo} on chain {chain} are {hs:?}: not one per height up to \

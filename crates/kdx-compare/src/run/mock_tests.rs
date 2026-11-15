@@ -4992,6 +4992,12 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
     for p in ["p0", "p1", "p2", "q2"] {
         node.payloads.insert(p.into(), cb("k:miner"));
     }
+    // R-P5P9-78 (H2 m-6): ours' block at its tip (99) is the cut branch's header there.
+    for c in [0u8, 2] {
+        let h =
+            json!({"hash": format!("t{c}-99"), "payloadHash": "pt", "height": 99, "chainId": c});
+        node.headers.insert((c, 99), vec![h]);
+    }
     // Ours: one block below node_h on chains 0 and 2; already at node_h on chain 1.
     let au = ours_fn_server(|req: &Value| {
         let c = req["variables"]["c"][0].as_str().unwrap_or("0").to_string();
@@ -4999,7 +5005,7 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
         let tip = if c == "1" { 100 } else { 99 };
         let edges: Vec<Value> = (start..=tip)
             .take(2)
-            .map(|h| json!({"node": {"height": h, "chainId": c}}))
+            .map(|h| json!({"node": {"height": h, "chainId": c, "hash": format!("t{c}-{h}")}}))
             .collect();
         json!({"data": {"blocksFromHeight": {"pageInfo": {"hasNextPage": tip >= start + 2},
             "edges": edges}}})
@@ -6840,7 +6846,10 @@ async fn d3_ours_tips(tips: &'static [(u8, u64)]) -> String {
             .map_or(0, |(_, t)| *t);
         let edges: Vec<Value> = (start..=tip)
             .take(first as usize)
-            .map(|h| json!({"node": {"height": h, "chainId": c}}))
+            .map(|h| {
+                let x = (b'a' + c.parse::<u8>().unwrap_or(0)) as char;
+                json!({"node": {"height": h, "chainId": c, "hash": format!("{x}{h}")}})
+            })
             .collect();
         json!({"data": {"blocksFromHeight": {"pageInfo": {"hasNextPage": tip >= start + first},
             "edges": edges}}})
@@ -6897,7 +6906,24 @@ async fn d3_s_node_balance_skew_is_the_event_net_of_one_or_two_blocks() {
     block(&mut node, 4, 100, "e100", cb_miner());
     // Chain 5: ours already at node_h.
     block(&mut node, 5, 100, "f100", cb_miner());
-    static TIPS: [(u8, u64); 6] = [(0, 99), (1, 98), (2, 99), (3, 97), (4, 98), (5, 100)];
+    // R-P5P9-78 (H2 m-6): ours' block at its tip is the cut branch's header there.
+    for (c, h) in [(0, 99), (1, 98), (2, 99), (3, 97), (4, 98)] {
+        let x = (b'a' + c) as char;
+        block(&mut node, c, h, &format!("{x}{h}"), cb_other(&[]));
+    }
+    // Chain 6: ours one behind on a fork at its tip (ours g99, the branch z99); the block
+    // above pays the miner, so the net would hold.
+    block(&mut node, 6, 99, "z99", cb_other(&[]));
+    block(&mut node, 6, 100, "g100", cb_miner());
+    static TIPS: [(u8, u64); 7] = [
+        (0, 99),
+        (1, 98),
+        (2, 99),
+        (3, 97),
+        (4, 98),
+        (5, 100),
+        (6, 99),
+    ];
     let au = d3_ours_tips(&TIPS).await;
     let ctx = gql_ctx_at(node, dir.path(), &au).await;
     let ta = &ctx.targets["a"];
@@ -6934,6 +6960,11 @@ async fn d3_s_node_balance_skew_is_the_event_net_of_one_or_two_blocks() {
         "a fork at a skipped height: {fork:?}"
     );
     assert!(skew(5, 10.0, "10.904046").await.is_err(), "ours at node_h");
+    let fork = skew(6, 10.0, "10.904046").await;
+    assert!(
+        fork.as_ref().is_err_and(|w| w.contains("tip")),
+        "ours on a fork at its tip: {fork:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
