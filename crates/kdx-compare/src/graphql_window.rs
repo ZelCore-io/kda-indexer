@@ -90,6 +90,10 @@ pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
 pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
 /// R-P5P9-86 TC: rows a side the count walk reads at most.
 pub const COUNT_WALK_ROWS: usize = 5_000;
+/// R-P5P9-92 (2): ours' rows above the oracle's height that the count walk polls at most.
+pub const ABOVE_TIP_ROWS: usize = 50;
+/// R-P5P9-93: the widest query window (in heights) whose node counts the walk reads.
+pub const WINDOW_HEIGHTS: u64 = 100;
 
 /// R-P5P9-87 TC: the record's height, the highest row of ours' stored page (its root list).
 pub fn highest_row(body: &Value) -> Option<u64> {
@@ -4139,8 +4143,14 @@ impl Ctx {
     /// hits) only when every one-sided row is and the difference in the counts equals the
     /// difference in one-sided rows. Past the cap the reason is `count walk capped`
     /// (`/~graphql-count-walk-capped`, never allowlisted). R-P5P9-87: the referee walks ours
-    /// bounded at `ours_bound` (the record's height or the oracle's, whichever is lower);
-    /// live, `u64::MAX`. Anything else leaves the count difference, with why in the note.
+    /// bounded at `record_height` (the record's height: rows above it are newer than the
+    /// record and left out); live, `u64::MAX`. R-P5P9-92 (2): ours' rows above the oracle's
+    /// height `max` (up to `record_height`) are in ours' count but not the oracle's: each must
+    /// be node-canonical by `/poll` ([`Ctx::above_tip_rows`]), at most [`ABOVE_TIP_ROWS`],
+    /// and counts as a settled one-sided row of ours. R-P5P9-93: the oracle counting the
+    /// heights of the query's window is the ACCEPTED rule's predicate
+    /// ([`crate::graphql_norm::oracle_counts_window_heights`]). Anything else leaves the
+    /// count difference, with why in the note.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn gql_count_walk(
         &self,
@@ -4151,7 +4161,7 @@ impl Ctx {
         d: &mut Vec<DiffEntry>,
         note: &mut Option<String>,
         max: u64,
-        ours_bound: u64,
+        record_height: u64,
     ) {
         if d.iter().any(|e| {
             never_explained(&e.path)
@@ -4180,7 +4190,7 @@ impl Ctx {
             return;
         };
         let walked = self
-            .count_walk(ta, tb, op, vars, &root, (na, nb), max, ours_bound)
+            .count_walk(ta, tb, op, vars, &root, (na, nb), max, record_height)
             .await;
         let why = match walked {
             Ok(hits) => {
@@ -4210,7 +4220,7 @@ impl Ctx {
         root: &str,
         (na, nb): (u64, u64),
         max: u64,
-        ours_bound: u64,
+        record_height: u64,
     ) -> Result<Vec<DiffEntry>, (bool, String)> {
         let q = Some(op.query.as_str());
         let (fv, av) = (arg_var(q, "first"), arg_var(q, "after"));
@@ -4220,25 +4230,36 @@ impl Ctx {
                 "count walk not applied: the document passes no first and after variables".into(),
             ));
         }
-        let mut wa = self.walk_list(ta, op, vars, root, &fv, &av).await?;
+        let wa = self.walk_list(ta, op, vars, root, &fv, &av).await?;
         let wb = self.walk_list(tb, op, vars, root, &fv, &av).await?;
-        if ours_bound < u64::MAX {
-            let mut unplaced = false;
-            wa.retain(|e| match prepared_id(e, root).height {
-                Some(h) => h <= ours_bound,
-                None => {
-                    unplaced = true;
-                    true
+        let bounded = record_height < u64::MAX;
+        let bound = record_height.min(max);
+        // Ours' rows: up to the oracle's height (walked against the oracle), above it up to
+        // the record's height (R-P5P9-92 (2)), and above the record (newer: left out).
+        let (mut wa_below, mut above) = (Vec::new(), Vec::new());
+        for e in wa {
+            match prepared_id(&e, root).height {
+                Some(h) if h > record_height => {}
+                Some(h) if h > bound => above.push((h, e)),
+                None if bounded => {
+                    return Err((
+                        false,
+                        "count walk: a row of ours has no height to bound the walk at".into(),
+                    ))
                 }
-            });
-            if unplaced {
-                return Err((
-                    false,
-                    "count walk: a row of ours has no height to bound the walk at".into(),
-                ));
+                _ => wa_below.push(e),
             }
         }
-        let (la, lb) = (wa.len() as i64, wb.len() as i64);
+        let mut st = Reads::default();
+        let n_above = above.len() as i64;
+        if !above.is_empty() {
+            self.above_tip_rows(ta, root, max, &above, &mut st).await?;
+        }
+        let walked: Vec<Option<u64>> = wa_below
+            .iter()
+            .map(|e| prepared_id(e, root).height)
+            .collect();
+        let (la, lb) = (wa_below.len() as i64, wb.len() as i64);
         let page = |edges: Vec<Value>, n: u64| Answer {
             body: json!({"data": {root: {"totalCount": n,
                 "pageInfo": {"hasNextPage": false, "hasPreviousPage": false},
@@ -4247,8 +4268,7 @@ impl Ctx {
             raw: String::new(),
             ms: vec![0],
         };
-        let (mut a, mut b) = (page(wa, na), page(wb, nb));
-        let mut st = Reads::default();
+        let (mut a, mut b) = (page(wa_below, na), page(wb, nb));
         let (h7, h7_note) = self
             .gql_window_referee(ta, Some(op), vars, &mut a, &mut b, max, false, &mut st)
             .await;
@@ -4268,49 +4288,51 @@ impl Ctx {
                 .map_or(0, Vec::len) as i64
         };
         let (pa, pb) = (edges(&a), edges(&b));
-        let (one_a, one_b) = (la - pa, lb - pb);
+        let (one_a, one_b) = (la - pa + n_above, lb - pb);
         let counts = na as i64 - nb as i64;
-        // R-P5P9-92 (1): the oracle counts heights. Every walked row settled (paired, no
-        // one-sided row), ours' count = the walked rows, and the oracle's count = the
-        // distinct heights among those rows (per the ACCEPTED oracle-counts-heights rule).
-        let heights: std::collections::BTreeSet<u64> = a
-            .body
-            .pointer(&format!("/data/{root}/edges"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| prepared_id(e, root).height)
-            .collect();
-        let by_heights = pa == pb
-            && one_a == 0
-            && one_b == 0
-            && la >= 0
-            && na == la as u64
-            && nb == heights.len() as u64
-            && na != nb;
-        if by_heights {
-            let mut out = h7;
-            out.push(entry(
-                COUNT_WALK_PATH,
-                Some(json!({"count": na, "walked": la, "oneSided": 0,
-                    "bound": (ours_bound < u64::MAX).then_some(ours_bound)})),
-                Some(json!({"count": nb, "walked": lb, "oneSided": 0,
-                    "distinctHeights": heights.len(), "nodeReads": st.node})),
-            ));
-            out.push(entry(
-                ORACLE_COUNTS_HEIGHTS_PATH,
-                Some(json!(na)),
-                Some(json!(nb)),
-            ));
-            return Ok(out);
-        }
+        let ev_a = |one: i64| {
+            json!({"count": na, "walked": la, "oneSided": one, "aboveOracleTip": n_above,
+                "bound": bounded.then_some(record_height)})
+        };
+        // R-P5P9-93: every walked row is settled (H7 above); the oracle's count is the
+        // number of heights in the query's window, and ours' count the walked rows and the
+        // node's per-height counts over it: the ACCEPTED oracle-counts-heights predicate.
+        let heights_why = if na != nb && n_above == 0 {
+            match self
+                .window_heights(op, vars, root, (na, nb), &walked, &mut st)
+                .await
+            {
+                Ok(node) => {
+                    let mut out = h7;
+                    out.push(entry(
+                        COUNT_WALK_PATH,
+                        Some(ev_a(one_a)),
+                        Some(json!({"count": nb, "walked": lb, "oneSided": one_b,
+                            "windowHeights": node.len(), "nodeTxsPerHeight": node,
+                            "nodeReads": st.node})),
+                    ));
+                    out.push(entry(
+                        ORACLE_COUNTS_HEIGHTS_PATH,
+                        Some(json!(na)),
+                        Some(json!(nb)),
+                    ));
+                    return Ok(out);
+                }
+                Err(w) => Some(w),
+            }
+        } else {
+            None
+        };
         if pa != pb || counts != one_a - one_b {
+            let heights = heights_why.map_or(String::new(), |w| {
+                format!("; the oracle does not count the window's heights: {w}")
+            });
             return Err((
                 false,
                 format!(
                     "count walk: the counts differ by {counts} (ours {na}, the oracle's {nb}), \
-                     the one-sided rows by {} (ours {one_a} of {la}, the oracle's {one_b} of \
-                     {lb})",
+                     the one-sided rows by {} (ours {one_a} of {la} plus {n_above} above the \
+                     oracle's height, the oracle's {one_b} of {lb}){heights}",
                     one_a - one_b
                 ),
             ));
@@ -4318,12 +4340,121 @@ impl Ctx {
         let mut out = h7;
         out.push(entry(
             COUNT_WALK_PATH,
-            Some(json!({"count": na, "walked": la, "oneSided": one_a,
-                "bound": (ours_bound < u64::MAX).then_some(ours_bound)})),
+            Some(ev_a(one_a)),
             Some(json!({"count": nb, "walked": lb, "oneSided": one_b,
                 "nodeReads": st.node})),
         ));
         Ok(out)
+    }
+
+    /// R-P5P9-93: the node's tx count at each height of the query's window
+    /// (`minHeight..=maxHeight` on its one `chainId`), from the canonical header on the
+    /// cut's branch and its payload, when [`crate::graphql_norm::oracle_counts_window_heights`]
+    /// holds for them; at most [`WINDOW_HEIGHTS`] heights. `Err`: why not.
+    async fn window_heights(
+        &self,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        counts: (u64, u64),
+        walked: &[Option<u64>],
+        st: &mut Reads,
+    ) -> Result<Vec<u64>, String> {
+        use crate::graphql_norm::oracle_counts_window_heights as holds;
+        let rules = &self.cfg.graphql.field_rules;
+        let f = Filter::of(Some(&op.query), Some(root), vars);
+        let window = f.min_height.zip(f.max_height);
+        // The predicate without the node first: no node read for a record it cannot explain.
+        if let Err(w) = holds(rules, root, counts, walked, window, &[]) {
+            if !w.starts_with("the node's counts") {
+                return Err(w);
+            }
+        }
+        let Some((lo, hi)) = window else {
+            return Err("the query has no minHeight..maxHeight window".into());
+        };
+        let chain = match f.chains.as_deref() {
+            Some([c]) => *c,
+            _ => return Err("the query names no single chainId".into()),
+        };
+        if hi - lo >= WINDOW_HEIGHTS {
+            return Err(format!("the window is wider than {WINDOW_HEIGHTS} heights"));
+        }
+        let mut node = Vec::new();
+        for h in lo..=hi {
+            let hd = self
+                .h7_canonical(chain, h, st)
+                .await?
+                .ok_or_else(|| format!("no canonical header at {h} on the cut's branch"))?;
+            let ph = hd
+                .get("payloadHash")
+                .and_then(Value::as_str)
+                .ok_or("a header without its payload hash")?;
+            let p = self.h7_payload(chain, ph, st).await?;
+            let n = p
+                .get("transactions")
+                .and_then(Value::as_array)
+                .ok_or("a payload without its transaction list")?
+                .len();
+            node.push(n as u64);
+        }
+        holds(rules, root, counts, walked, window, &node)?;
+        Ok(node)
+    }
+
+    /// R-P5P9-92 (2): ours' rows above the oracle's height `max` (`(height, row)`), each
+    /// node-canonical by `/poll`: the node places its key at the row's height, in the block
+    /// that is the canonical header there on the cut's branch. More than [`ABOVE_TIP_ROWS`]
+    /// is `Err((true, "rows above the oracle tip: capped …"))`; a row that is not, why.
+    async fn above_tip_rows(
+        &self,
+        ta: &Target,
+        root: &str,
+        max: u64,
+        above: &[(u64, Value)],
+        st: &mut Reads,
+    ) -> Result<(), (bool, String)> {
+        if above.len() > ABOVE_TIP_ROWS {
+            return Err((
+                true,
+                format!(
+                    "rows above the oracle tip: capped: ours lists {} rows above the oracle's \
+                     height {max} (more than {ABOVE_TIP_ROWS})",
+                    above.len()
+                ),
+            ));
+        }
+        for (h, e) in above {
+            let id = prepared_id(e, root);
+            let what = id.evidence();
+            let r = Row {
+                id,
+                key: String::new(),
+                edge: e.clone(),
+            };
+            let v = self.h7_verdict(ta, &r, false, st).await;
+            let fail = |why: String| {
+                Err((
+                    false,
+                    format!(
+                        "count walk: a row of ours above the oracle's height {max} is not \
+                         node-canonical ({why}): {what}"
+                    ),
+                ))
+            };
+            if v.canon != Canon::Yes || v.height != Some(*h) {
+                return fail(format!("{:?} at {:?}: {}", v.canon, v.height, v.why));
+            }
+            let (Some(chain), Some(b)) = (v.chain, v.block.as_deref()) else {
+                return fail("no chain or block from the node".into());
+            };
+            match self.h7_canonical(chain, *h, st).await {
+                Ok(Some(hd)) if hd.get("hash").and_then(Value::as_str) == Some(b) => {}
+                Ok(_) => return fail("its block is not the cut branch's at its height".into()),
+                Err(w) => return fail(w),
+            }
+        }
+        Ok(())
     }
 
     /// One whole list by the document, `first` = [`OURS_PAGE_CAP`] and `after` = the last

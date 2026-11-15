@@ -17,6 +17,7 @@ use crate::gen::{Origin, Request};
 use crate::graphql_window::Reads;
 
 mod e2b;
+mod e3b;
 
 /// The node: every chain's cut at `tip`, the canonical hash per (chain, height) and the block
 /// `/poll` puts each request key in. Every path asked is logged.

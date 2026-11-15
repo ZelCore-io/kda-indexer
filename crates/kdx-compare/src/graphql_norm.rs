@@ -497,13 +497,7 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
 /// Returns (ours, the oracle's) per count taken.
 pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
-    for r in rules
-        .iter()
-        .filter(|r| r.rule == FieldRuleKind::OracleCountsHeights)
-    {
-        let Some((root, "totalCount")) = r.field.split_once('.') else {
-            continue;
-        };
+    for root in counts_heights_roots(rules) {
         let ptr = format!("/data/{root}/totalCount");
         let (Some(na), Some(nb)) = (
             a.pointer(&ptr).and_then(Value::as_u64),
@@ -529,6 +523,81 @@ pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> V
         }
     }
     out
+}
+
+/// The roots `<root>` of every configured `oracle_counts_heights` rule `<root>.totalCount`
+/// (`[graphql] field_rules`): the rule applies to these root counts only.
+pub fn counts_heights_roots(rules: &[FieldRule]) -> Vec<&str> {
+    rules
+        .iter()
+        .filter(|r| r.rule == FieldRuleKind::OracleCountsHeights)
+        .filter_map(|r| match r.field.split_once('.') {
+            Some((root, "totalCount")) => Some(root),
+            _ => None,
+        })
+        .collect()
+}
+
+/// R-P5P9-93: the predicate of the ACCEPTED `graphql-r75-oracle-counts-heights` rule as the
+/// count walk (R-P5P9-86 TC) applies it to a root count `root`, once every walked row is
+/// settled. The rule must be configured for `<root>.totalCount`, and:
+/// - the oracle's count `nb` = the number of heights in the query's height window
+///   `window` (`minHeight..=maxHeight`, both given);
+/// - ours' count `na` = ours' walked rows, each with a height inside the window
+///   (`walked`, ours' row heights);
+/// - ours' count = the node's per-height tx counts summed over the window (`node`, one per
+///   height from `minHeight` on).
+///
+/// `Err`: why not.
+pub fn oracle_counts_window_heights(
+    rules: &[FieldRule],
+    root: &str,
+    (na, nb): (u64, u64),
+    walked: &[Option<u64>],
+    window: Option<(u64, u64)>,
+    node: &[u64],
+) -> Result<(), String> {
+    if !counts_heights_roots(rules).contains(&root) {
+        return Err(format!(
+            "no oracle_counts_heights rule on {root}.totalCount"
+        ));
+    }
+    let Some((lo, hi)) = window.filter(|(lo, hi)| lo <= hi) else {
+        return Err("the query has no minHeight..maxHeight window".into());
+    };
+    let heights = hi - lo + 1;
+    if nb != heights {
+        return Err(format!(
+            "the oracle's count {nb} is not the {heights} heights of the window {lo}..={hi}"
+        ));
+    }
+    if walked.len() as u64 != na {
+        return Err(format!(
+            "ours' count {na} is not ours' {} walked rows",
+            walked.len()
+        ));
+    }
+    if let Some(h) = walked
+        .iter()
+        .find(|h| !h.is_some_and(|h| (lo..=hi).contains(&h)))
+    {
+        return Err(format!(
+            "a walked row of ours at {h:?} is outside the window {lo}..={hi}"
+        ));
+    }
+    if node.len() as u64 != heights {
+        return Err(format!(
+            "the node's counts cover {} of {heights} heights",
+            node.len()
+        ));
+    }
+    let sum: u64 = node.iter().sum();
+    if sum != na {
+        return Err(format!(
+            "ours' count {na} is not the node's {sum} txs over the window ({node:?})"
+        ));
+    }
+    Ok(())
 }
 
 /// The explainer of one oracle pair diff: per-field rules first, then F2 and F7. Returns the
