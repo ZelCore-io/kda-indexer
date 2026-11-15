@@ -951,7 +951,11 @@ impl Ctx {
             // R-P5P9-72 (1): when ours held a known limit (or was cut at a page), an
             // oracle-only row at or below ours' lowest height is ours' limit, not evidence.
             let (min_a0, min_b0) = (min_height(&va), min_height(&vb));
-            let floor = min_a0.filter(|_| fa);
+            // R-P5P9-73 I-1: on a paged route the page cut already removed the partial height,
+            // and `na >= limit` counts merged pages, so neither marks ours' limit edge. The
+            // floor and the cut before the drop are for the single-page route only.
+            let single = !req.route.paginated();
+            let floor = min_a0.filter(|_| single && fa);
             let kept_b = if replica {
                 Vec::new()
             } else {
@@ -963,7 +967,11 @@ impl Ctx {
                 // R-P5P9-72 (1): the lowest heights before the window dropped rows, so a full
                 // side whose page lies wholly in the window still cuts the other side's rows
                 // below it.
-                let (min_a, min_b) = (min_a0, min_b0);
+                let (min_a, min_b) = if single {
+                    (min_a0, min_b0)
+                } else {
+                    (min_height(&va), min_height(&vb))
+                };
                 let cut = [(fa, min_a), (fb, min_b)]
                     .into_iter()
                     .filter_map(|(f, h)| if f { h } else { None })

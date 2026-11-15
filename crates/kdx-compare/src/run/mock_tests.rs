@@ -4305,13 +4305,26 @@ async fn bytes_pair_setup(
         bytes_server(a).await,
         bytes_server(b).await,
     );
+    urls_pair_setup(&nu, &au, &bu, out, b_kind, 0).await
+}
+
+/// A context comparing the servers at `au` (compat) and `bu` (`b_kind`) with `depth` follow-up
+/// pages per paged answer.
+async fn urls_pair_setup(
+    nu: &str,
+    au: &str,
+    bu: &str,
+    out: &std::path::Path,
+    b_kind: &str,
+    depth: u32,
+) -> Ctx {
     let allow =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
     let cfg: CompareConfig = toml::from_str(&format!(
         r#"
 network = "mainnet01"
 rate_rps = 1000.0
-follow_depth = 0
+follow_depth = {depth}
 pairs = [["a", "b"]]
 allowlist = {allow:?}
 out_dir = {out:?}
@@ -5570,4 +5583,137 @@ async fn c6_an_ours_only_event_with_null_parameters_stays_a_diff() {
         unchecked_field(Some(Kind::Event), &ev).as_deref(),
         Some("parameters")
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// FVH-C7: the lag-window floor is for the single-page route only (R-P5P9-73 I-1)
+
+/// A server answering `rows` in pages of `size`: no `next` is page 0, `next=n` is page n. Each
+/// page with a successor sets `Chainweb-Next`; with `pending` the last page sets one too, as
+/// chainweb-data does when more rows exist than the pages followed.
+async fn paged_server(rows: Vec<Value>, size: usize, pending: bool) -> String {
+    let pages: Vec<Vec<Value>> = rows.chunks(size).map(<[Value]>::to_vec).collect();
+    let app = Router::new().fallback(move |uri: Uri| {
+        let pages = pages.clone();
+        async move {
+            let n: usize = uri
+                .query()
+                .and_then(|q| {
+                    url::form_urlencoded::parse(q.as_bytes())
+                        .find(|(k, _)| k == "next")
+                        .and_then(|(_, v)| v.parse().ok())
+                })
+                .unwrap_or(0);
+            let body = serde_json::to_vec(pages.get(n).unwrap_or(&Vec::new())).unwrap();
+            let mut r = ([("content-type", "application/json")], body).into_response();
+            if n + 1 < pages.len() || pending {
+                r.headers_mut()
+                    .insert("chainweb-next", (n + 1).to_string().parse().unwrap());
+            }
+            r
+        }
+    });
+    serve(app).await
+}
+
+/// One `/txs/events` compare of paged answers (`chainweb_data` oracle, three pages followed),
+/// A's tip 7_000_000 so every row lies in the lag window.
+async fn paged_compare(
+    (a, a_size, a_pending): (Vec<Value>, usize, bool),
+    (b, b_size, b_pending): (Vec<Value>, usize, bool),
+    limit: Option<usize>,
+) -> (String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let au = paged_server(a, a_size, a_pending).await;
+    let bu = paged_server(b, b_size, b_pending).await;
+    let ctx = urls_pair_setup(&nu, &au, &bu, dir.path(), "chainweb_data", 3).await;
+    ctx.tips.set_a_tip(7_000_000);
+    let lim = limit.map_or(String::new(), |l| format!("&limit={l}"));
+    let path = format!(
+        "/txs/events?modulename=coin&name=TRANSFER&minheight=6999900&maxheight=7000100{lim}"
+    );
+    let o = v1_compare(&ctx, &path).await;
+    let note = format!("{:?}", o.record.map(|r| (r.note, r.diff)));
+    (o.class.to_string(), note)
+}
+
+/// P1: ours answers 8 rows on one page and says it is complete; the oracle is cut after four
+/// pages of three. Ours lacks the 3 rows at 6_999_992 to 6_999_990: a diff, not lag.
+#[tokio::test]
+async fn c7_a_page_cut_does_not_explain_rows_ours_lacks() {
+    let rows = v1_rows(16, 10);
+    let (class, note) = paged_compare(
+        (rows[..8].to_vec(), 8, false),
+        (rows[..12].to_vec(), 3, true),
+        None,
+    )
+    .await;
+    assert_eq!(class, "diff", "{note}");
+}
+
+/// P2: `&limit=3`, both complete over merged pages (ours 8 rows in 3 pages, the oracle 11 in
+/// 4). Ours lacks the lowest 3 rows: a diff, not ours' limit edge.
+#[tokio::test]
+async fn c7_a_known_limit_over_merged_pages_does_not_floor_the_window() {
+    let rows = v1_rows(16, 10);
+    let (class, note) = paged_compare(
+        (rows[..8].to_vec(), 3, false),
+        (rows[..11].to_vec(), 3, false),
+        Some(3),
+    )
+    .await;
+    assert_eq!(class, "diff", "{note}");
+}
+
+/// P3: the oracle one block behind (it lacks the newest row), both cut after four pages.
+#[tokio::test]
+async fn c7_oracle_one_block_behind_both_truncated_is_allowlisted() {
+    let rows = v1_rows(16, 10);
+    let (class, note) = paged_compare(
+        (rows[..12].to_vec(), 3, true),
+        (rows[1..13].to_vec(), 3, true),
+        None,
+    )
+    .await;
+    assert_eq!(class, "allowlisted", "{note}");
+}
+
+/// P4: the oracle one block behind, both complete at `limit=3`.
+#[tokio::test]
+async fn c7_oracle_one_block_behind_both_complete_is_allowlisted() {
+    let rows = v1_rows(16, 10);
+    let (class, note) = paged_compare(
+        (rows[..11].to_vec(), 3, false),
+        (rows[1..11].to_vec(), 3, false),
+        Some(3),
+    )
+    .await;
+    assert_eq!(class, "allowlisted", "{note}");
+}
+
+/// P5: ours cut after four pages, the oracle complete.
+#[tokio::test]
+async fn c7_ours_truncated_oracle_complete_is_allowlisted() {
+    let rows = v1_rows(16, 10);
+    let (class, note) = paged_compare(
+        (rows[..12].to_vec(), 3, true),
+        (rows[..11].to_vec(), 3, false),
+        None,
+    )
+    .await;
+    assert_eq!(class, "allowlisted", "{note}");
+}
+
+/// P0: equal answers, both cut after four pages (the page cut alone is allowlisted).
+#[tokio::test]
+async fn c7_equal_page_cut_answers_are_allowlisted() {
+    let rows = v1_rows(16, 10);
+    let (class, note) = paged_compare(
+        (rows[..12].to_vec(), 3, true),
+        (rows[..12].to_vec(), 3, true),
+        None,
+    )
+    .await;
+    assert_eq!(class, "allowlisted", "{note}");
 }
