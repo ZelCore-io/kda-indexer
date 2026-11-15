@@ -1,5 +1,5 @@
-//! `kda-compare summary --since <iso> [--routes must|should|all] --gate small|full`: the
-//! P3 exit gate (and its P5 small and full forms). Reads the
+//! `kda-compare summary --since <iso> [--routes must|should|graphql|all|rest]
+//! --gate small|full`: the P3 exit gate (and its P5 small and full forms). Reads the
 //! ten-minute buckets the `run` loop writes into `summary-<date>.json` (flushed every minute
 //! and on shutdown), merges the buckets that start at or after `--since`, and prints one row
 //! per route and pair. Exit status 0 iff every must route is green.
@@ -64,8 +64,11 @@ pub enum RouteSet {
     Should,
     /// The GraphQL routes (`graphql:<operation>`).
     Graphql,
-    /// Must and should routes, plus the GraphQL routes when the window has any.
+    /// Must and should routes, plus the graphql gate, which always runs (R-P5P9-81, I-2): a
+    /// window with no GraphQL record fails it.
     All,
+    /// Must and should routes without the graphql gate: a REST-only run (R-P5P9-81, I-2).
+    Rest,
 }
 
 impl RouteSet {
@@ -75,7 +78,8 @@ impl RouteSet {
             "should" => Ok(RouteSet::Should),
             "graphql" => Ok(RouteSet::Graphql),
             "all" => Ok(RouteSet::All),
-            _ => anyhow::bail!("--routes must be `must`, `should`, `graphql` or `all`"),
+            "rest" => Ok(RouteSet::Rest),
+            _ => anyhow::bail!("--routes must be `must`, `should`, `graphql`, `all` or `rest`"),
         }
     }
 
@@ -89,7 +93,7 @@ impl RouteSet {
             RouteSet::Must => must.to_vec(),
             RouteSet::Should => SHOULD.to_vec(),
             RouteSet::Graphql => Vec::new(),
-            RouteSet::All => must.iter().chain(SHOULD).copied().collect(),
+            RouteSet::All | RouteSet::Rest => must.iter().chain(SHOULD).copied().collect(),
         }
     }
 }
@@ -453,8 +457,9 @@ pub fn run_text(
     let unpaired = load_unpaired(out_dir, since_secs)?;
     let label = format!("gate {gate}, routes {routes}");
     let all_rows = rows(&w);
-    let with_graphql = set == RouteSet::Graphql
-        || (set == RouteSet::All && all_rows.iter().any(|r| r.route.starts_with("graphql:")));
+    // R-P5P9-81 (I-2): under `all` the graphql gate runs whatever the window holds, so a
+    // GraphQL compare that stopped producing records reads "NOT met", never a silent skip.
+    let with_graphql = matches!(set, RouteSet::Graphql | RouteSet::All);
     let required = set.required(size);
     let met = |ok: bool| if ok { "met" } else { "NOT met" };
     let (mut text, routes_ok) = if set == RouteSet::Graphql {
@@ -1150,6 +1155,57 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.matches("GREEN").count(), 1, "{text}");
+    }
+
+    /// R-P5P9-81 (I-2): under `--routes all` the graphql gate always runs, whatever the gate
+    /// size. A window with only REST rows at their minimums has no GraphQL record, so the
+    /// graphql gate is NOT met and the last line is RED. The neighbour: the same window read
+    /// with `--routes rest` (must and should, no graphql gate) is GREEN.
+    #[test]
+    fn routes_all_always_runs_the_graphql_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let rest: Vec<(String, Vec<(&str, u64)>)> = MUST
+            .iter()
+            .chain(SHOULD)
+            .map(|(r, min)| (format!("{r}|compat|cwd"), vec![("match", *min)]))
+            .collect();
+        let pairs: Vec<(&str, &[(&str, u64)])> = rest
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        write_day(dir.path(), &pairs, &[], &[]);
+        for gate in ["full", "small"] {
+            let (text, green) = run_text(dir.path(), "2026-11-15", "all", gate).unwrap();
+            assert!(!green, "{text}");
+            assert!(
+                text.contains(&format!("graphql gate {gate}: NOT met\n")),
+                "{text}"
+            );
+            assert!(text.contains("graphql total: 0 compared"), "{text}");
+            assert_eq!(
+                text.lines().last(),
+                Some(
+                    format!(
+                        "verdict (gate {gate}, routes all): RED (unexplained diffs 0; routes met; \
+                         graphql gate NOT met; known gaps within limits)"
+                    )
+                    .as_str()
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("GREEN"), "{text}");
+        }
+        let (text, green) = run_text(dir.path(), "2026-11-15", "rest", "full").unwrap();
+        assert!(green, "{text}");
+        assert!(!text.contains("graphql gate"), "{text}");
+        assert_eq!(
+            text.lines().last(),
+            Some(
+                "verdict (gate full, routes rest): GREEN (unexplained diffs 0; routes met; \
+                 known gaps within limits)"
+            ),
+            "{text}"
+        );
     }
 
     /// R-P5P9-78 (H2 m-1): the shipped P baseline counts only the records P matches (3 over
