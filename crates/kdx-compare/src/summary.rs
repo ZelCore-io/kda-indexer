@@ -294,14 +294,17 @@ pub fn render(
             format!("{}/{}", ms(r.p50_b), ms(r.p99_b)),
         );
     }
+    // R-P5P9-78 (H2 I-3): a part of the verdict, never worded as one ("met", not GREEN); the
+    // one verdict line is `run_text`'s last.
     let (green, why) = gate(rows, required);
     if green {
         let _ = writeln!(
             s,
-            "GREEN ({label}): every required route is at its minimum with 0 unexplained diffs"
+            "routes ({label}): met: every required route is at its minimum with 0 unexplained \
+             diffs"
         );
     } else {
-        let _ = writeln!(s, "NOT GREEN ({label}):");
+        let _ = writeln!(s, "routes ({label}): NOT met:");
         for w in why {
             let _ = writeln!(s, "  {w}");
         }
@@ -453,41 +456,64 @@ pub fn run_text(
     let with_graphql = set == RouteSet::Graphql
         || (set == RouteSet::All && all_rows.iter().any(|r| r.route.starts_with("graphql:")));
     let required = set.required(size);
-    let (mut text, mut green) = if set == RouteSet::Graphql {
-        // R-P5P9-75 (CG-4 concern 3): no verdict line from an empty required list; the graphql
-        // gate below (node pairs and oracle pairs) is the verdict.
+    let met = |ok: bool| if ok { "met" } else { "NOT met" };
+    let (mut text, routes_ok) = if set == RouteSet::Graphql {
+        // R-P5P9-75 (CG-4 concern 3): no line from an empty required list; the graphql gate
+        // below (node pairs and oracle pairs) is that part of the verdict.
         let (table, _) = render(&all_rows, &[], true, &label);
         let table: String = table
             .lines()
-            .filter(|l| !l.starts_with("GREEN (") && !l.starts_with("NOT GREEN ("))
+            .filter(|l| !l.starts_with("routes ("))
             .map(|l| format!("{l}\n"))
             .collect();
         (table, true)
     } else {
         render(&all_rows, &required, routes == "all", &label)
     };
+    let mut parts = Vec::new();
+    if set != RouteSet::Graphql {
+        parts.push(format!("routes {}", met(routes_ok)));
+    }
+    let mut graphql_ok = true;
     if with_graphql {
         let (ok, why) = graphql_gate(&all_rows, size);
-        text.push_str(&format!(
-            "graphql gate {gate}: {}\n",
-            if ok { "GREEN" } else { "RED" }
-        ));
+        graphql_ok = ok;
+        text.push_str(&format!("graphql gate {gate}: {}\n", met(ok)));
         for w in why {
             text.push_str(&format!("  {w}\n"));
         }
-        green &= ok;
         text.push_str(&render_unpaired(&unpaired));
-        if set == RouteSet::Graphql {
-            text.push_str(&format!(
-                "verdict (gate {gate}, routes graphql: node pairs and oracle pairs): {}\n",
-                if ok { "GREEN" } else { "RED" }
-            ));
-        }
+        parts.push(format!("graphql gate {}", met(ok)));
     }
     let kg = load_known_gaps(out_dir, since_secs)?;
     let (kg_text, kg_ok) = render_known_gaps(&kg);
     text.push_str(&kg_text);
-    green &= kg_ok;
+    parts.push(format!(
+        "known gaps {}",
+        if kg_ok { "within limits" } else { "OVER" }
+    ));
+    // R-P5P9-78 (H2 I-3): one verdict line, printed last, folding in the unexplained diffs of
+    // the routes it covers, the graphql gate and the known gaps.
+    let unexplained: u64 = all_rows
+        .iter()
+        .filter(|r| {
+            required.iter().any(|(m, _)| *m == r.route)
+                || (with_graphql && r.route.starts_with("graphql:"))
+        })
+        .map(|r| r.unexplained)
+        .sum();
+    let green = routes_ok && graphql_ok && kg_ok && unexplained == 0;
+    let scope = if set == RouteSet::Graphql {
+        "routes graphql: node pairs and oracle pairs".to_string()
+    } else {
+        format!("routes {routes}")
+    };
+    let _ = writeln!(
+        text,
+        "verdict (gate {gate}, {scope}): {} (unexplained diffs {unexplained}; {})",
+        if green { "GREEN" } else { "RED" },
+        parts.join("; ")
+    );
     Ok((text, green))
 }
 
@@ -1053,6 +1079,77 @@ mod tests {
         assert_eq!(merged.buckets, 7);
         // A bucket with only an error of ours is no compared hour.
         assert_eq!(kg(&[("2026-11-15", 6, "a-error", 0, 6.0)]).buckets, 0);
+    }
+
+    /// R-P5P9-78 (H2 I-3, review probe 2): one verdict line, printed last, folds in the
+    /// unexplained diffs, the graphql gate and the known gaps; no earlier line reads GREEN.
+    /// A known gap over its limit makes the last line RED on `must` and on `graphql`.
+    #[test]
+    fn the_last_line_is_the_one_verdict_and_folds_in_the_known_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let must: Vec<(String, Vec<(&str, u64)>)> = MUST_SMALL
+            .iter()
+            .map(|(r, min)| (format!("{r}|compat|cwd"), vec![("match", *min)]))
+            .collect();
+        let node: &[(&str, u64)] = &[("match", 60)];
+        let oracle: &[(&str, u64)] = &[("match", 250), ("known-gap", 2)];
+        let mut pairs: Vec<(&str, &[(&str, u64)])> = must
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        pairs.extend([
+            ("graphql:NodeTx|compat|node", node),
+            ("graphql:NodeBlock|compat|node", node),
+            ("graphql:NodeBalance|compat|node", node),
+            ("graphql:QFungibleAccount|compat|oracle", oracle),
+        ]);
+        // Baseline 6/h x 1.5 x 1/6 h = 1.5: two records are over.
+        write_day(
+            dir.path(),
+            &pairs,
+            &[("known-gap-q", 2)],
+            &[("known-gap-q", 6.0)],
+        );
+        for (routes, verdict) in [
+            (
+                "must",
+                "verdict (gate small, routes must): RED (unexplained diffs 0; routes met; \
+                 known gaps OVER)",
+            ),
+            (
+                "graphql",
+                "verdict (gate small, routes graphql: node pairs and oracle pairs): RED \
+                 (unexplained diffs 0; graphql gate met; known gaps OVER)",
+            ),
+            (
+                "all",
+                "verdict (gate small, routes all): RED (unexplained diffs 0; routes NOT met; \
+                 graphql gate met; known gaps OVER)",
+            ),
+        ] {
+            let (text, green) = run_text(dir.path(), "2026-11-15", routes, "small").unwrap();
+            assert!(!green, "{text}");
+            assert_eq!(text.lines().last(), Some(verdict), "{text}");
+            assert!(!text.contains("GREEN"), "{text}");
+        }
+        // The neighbour: the same window within the limit (one record) is GREEN, last.
+        write_day(
+            dir.path(),
+            &pairs,
+            &[("known-gap-q", 1)],
+            &[("known-gap-q", 6.0)],
+        );
+        let (text, green) = run_text(dir.path(), "2026-11-15", "must", "small").unwrap();
+        assert!(green, "{text}");
+        assert_eq!(
+            text.lines().last(),
+            Some(
+                "verdict (gate small, routes must): GREEN (unexplained diffs 0; routes met; \
+                 known gaps within limits)"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("GREEN").count(), 1, "{text}");
     }
 
     /// R-P5P9-78 (H2 m-8): known-gap records do not reach a route minimum; the same count
