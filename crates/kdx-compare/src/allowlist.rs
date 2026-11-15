@@ -368,12 +368,12 @@ mod tests {
         let (left, ids) = al.classify_request(&RouteKind::Search, req, &[], &d);
         assert_eq!(left.len(), d.len(), "a plain search diff is unexplained");
         assert!(ids.is_empty());
-        // R-P5P9-75: `search-window` had no hit in CG-4 and its ruling cites no node
-        // evidence, so it is removed: a cut answer's diff is unexplained too.
+        // R-P5P9-77 item 3: `search-window` is back (PROPOSED; CG-4 could not log REST
+        // hits): a cut answer's diff is its visible hit.
         let cut = [("x-search-truncated".to_string(), "true".to_string())];
         let (left, ids) = al.classify_request(&RouteKind::Search, req, &cut, &d);
-        assert_eq!(left.len(), d.len());
-        assert!(ids.is_empty());
+        assert!(left.is_empty());
+        assert_eq!(ids, vec!["search-window".to_string()]);
     }
 
     /// R-P5P9-48 item 4: `pactid-cap` matches only an answer carrying X-Search-Truncated (the
@@ -434,15 +434,37 @@ mod tests {
             let (left, ids) = class(route, req);
             assert!(left > 0 && ids.is_empty(), "{req} must stay unexplained");
         };
-        miss(RouteKind::Tx, "/txs/tx?requestkey=Au4cjML8abc");
-        miss(RouteKind::Txs, "/txs/txs?requestkey=Au4cjML8abc");
+        // R-P5P9-77 item 3: the four one-offs are back (PROPOSED), each on its own request.
+        let hit = |route: RouteKind, req: &str, id: &str| {
+            let (left, ids) = class(route, req);
+            assert_eq!(
+                (left, ids),
+                (0, vec![id.to_string()]),
+                "{req} should be {id}"
+            );
+        };
+        hit(
+            RouteKind::Tx,
+            "/txs/tx?requestkey=Au4cjML8abc",
+            "cwd-hole-tx-au4cjml8",
+        );
+        hit(
+            RouteKind::Txs,
+            "/txs/txs?requestkey=Au4cjML8abc",
+            "cwd-hole-txs-au4cjml8",
+        );
         miss(RouteKind::Tx, "/txs/tx?requestkey=Other");
-        miss(
+        hit(
             RouteKind::Events,
             "/txs/events?modulename=coin&name=TRANSFER_XCHAIN&minheight=7392263&maxheight=7392463",
+            "cwd-hole-events-7392263",
         );
         miss(RouteKind::Events, "/txs/events?minheight=7392264");
-        miss(RouteKind::V1Txs, "/v1/txs/k:d7bf62aa/coin/250");
+        hit(
+            RouteKind::V1Txs,
+            "/v1/txs/k:d7bf62aa/coin/250",
+            "kdatxs-gap-cont-d7bf62",
+        );
         // R-P5P9-49: the one-off balances and search entries are gone; the coinbase skew rule
         // and the oracle-orphan, -lag and -gap classes cover them, so a diff on those
         // requests stays unexplained here. A pactid diff is unexplained unless the answer
@@ -464,6 +486,48 @@ mod tests {
             RouteKind::Search,
             "/txs/search?search=keyset+%22kad-ops-20%22%29&minheight=852004&maxheight=852104",
         );
+    }
+
+    /// R-P5P9-77 item 3: CG-4 did not log allowlisted REST records, so a REST entry's zero
+    /// hits are no evidence. Every REST entry D2 removed for zero hits (its zero-hit table and
+    /// the four one-offs) is back, PROPOSED, with the note that CG-5 decides.
+    #[test]
+    fn rest_zero_hit_removals_are_restored_as_proposed() {
+        let al = shipped();
+        for id in [
+            "stats-estimate",
+            "cwd-page-boundary-dup",
+            "oracle-unstable",
+            "kdatxs-gap",
+            "search-window",
+            "kdatxs-gap-cont-d7bf62",
+            "cwd-hole-tx-au4cjml8",
+            "cwd-hole-txs-au4cjml8",
+            "cwd-hole-events-7392263",
+        ] {
+            let e = al
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("{id} is not restored"));
+            assert_eq!(e.status, super::Status::Proposed, "{id}");
+            assert!(
+                e.owner_note
+                    .contains("CG-4 could not log REST hits; CG-5 decides")
+                    && e.ruling.contains("R-P5P9-77"),
+                "{id}: {} / {}",
+                e.owner_note,
+                e.ruling
+            );
+        }
+        // stats-estimate's rule is relative (1% of the count), with no per-block bound, so
+        // x-count-age does not widen it; a count within 1% is its visible hit again.
+        let a = serde_json::json!({"transactionCount": 1000});
+        let near = serde_json::json!({"transactionCount": 1010});
+        let d = diff_route(&RouteKind::Stats, &a, &near);
+        let (left, ids) = al.classify_request(&RouteKind::Stats, "/stats", &[], &d);
+        assert!(left.is_empty(), "{d:?}");
+        assert_eq!(ids, vec!["stats-estimate".to_string()]);
     }
 
     /// R-P5P9-75 (P, Q): a KNOWN-GAP entry loads only with `baseline_per_hour`, and only it
