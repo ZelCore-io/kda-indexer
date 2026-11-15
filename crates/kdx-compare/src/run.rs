@@ -377,6 +377,34 @@ fn query_account(req: &Request) -> String {
         .unwrap_or_default()
 }
 
+/// Seconds per block height on every chain (Kadena's block time).
+const SECS_PER_HEIGHT: f64 = 30.0;
+
+/// Heights produced in ours' `x-count-age` (STATS-FIX, R-P5P9-75 item 4): the age over the
+/// block time, rounded up; no header (or one that is no number), no widening.
+fn count_age_heights(age_secs: Option<f64>) -> f64 {
+    age_secs
+        .filter(|a| a.is_finite() && *a > 0.0)
+        .map_or(0.0, |a| (a / SECS_PER_HEIGHT).ceil())
+}
+
+/// `/stats.coinsInCirculation` against chainweb-data, ours `x`, chainweb-data's `y`, past the
+/// relative 1e-6 (R3E-11): ours above by at most the supply minted in the tip gap (at least
+/// 240 heights: chainweb-data fills recent heights late), or, since STATS-FIX serves a count
+/// up to `x-count-age` old, ours below by at most the supply minted in the heights of that
+/// age (the same per-height maximum). Without the header ours may not be below.
+fn stats_supply_lag(x: f64, y: f64, a_tip: u64, b_tip: u64, age_secs: Option<f64>) -> bool {
+    let d = a_tip.saturating_sub(b_tip).max(240) as f64;
+    let tol = 1e-6 * x.abs().max(y.abs());
+    let aged = count_age_heights(age_secs) * SUPPLY_PER_HEIGHT;
+    (x - y).abs() > tol
+        && if x > y {
+            x - y <= d * SUPPLY_PER_HEIGHT + tol
+        } else {
+            y - x <= aged + tol
+        }
+}
+
 /// `/coins` against chainweb-data (R-P5P9-48): a difference past the relative 1e-6 of
 /// `coins-supply-tolerance` is the tip gap when the side with the higher tip has the higher
 /// supply and the difference is at most the coinbase minted between the two tips, plus that
@@ -1024,12 +1052,14 @@ impl Ctx {
                 let b_tip = self.oracle_tip(tb).await.unwrap_or(a_tip);
                 let x = va.get("coinsInCirculation").and_then(num_value);
                 let y = vb.get("coinsInCirculation").and_then(num_value);
+                // STATS-FIX: ours' /stats is up to `x-count-age` seconds old.
+                let age = pa
+                    .pages
+                    .first()
+                    .and_then(|c| c.header("x-count-age"))
+                    .and_then(|v| v.trim().parse::<f64>().ok());
                 if let (Some(x), Some(y)) = (x, y) {
-                    // chainweb-data also fills recent heights late (seen live: 5153 KDA lower
-                    // with its /txs/recent near the tip), so at least 240 heights (2 h) count.
-                    let d = a_tip.saturating_sub(b_tip).max(240) as f64;
-                    let tol = 1e-6 * x.abs().max(y.abs());
-                    if x > y && d > 0.0 && x - y > tol && x - y <= d * SUPPLY_PER_HEIGHT + tol {
+                    if stats_supply_lag(x, y, a_tip, b_tip, age) {
                         let pair = (
                             va.get("coinsInCirculation").cloned().unwrap_or(Value::Null),
                             vb.get("coinsInCirculation").cloned().unwrap_or(Value::Null),
@@ -3648,6 +3678,26 @@ mod tests {
 
     /// R-P5P9-48 item 3: /coins past the relative 1e-6 is chainweb-data's tip lag only within
     /// the coinbase minted between the two tips (18.08092 KDA per height at 7.40M).
+    /// R-P5P9-75 item 4 (STATS-FIX): ours' /stats supply below chainweb-data's by what the
+    /// heights of its `x-count-age` minted is explained; by more, or with no header, a diff.
+    /// Ours above keeps the tip-gap rule.
+    #[test]
+    fn stats_supply_tolerance_widens_by_our_count_age() {
+        let y = 379_866_205.03;
+        // 1e-6 of the supply is about 380; 240 s = 8 heights = 480 at 60 per height.
+        let lag = |by: f64, age: Option<f64>| stats_supply_lag(y - by, y, 100, 100, age);
+        assert!(lag(800.0, Some(240.0)), "lags by its age");
+        assert!(!lag(900.0, Some(240.0)), "lags by more than its age");
+        assert!(!lag(800.0, None), "no header, no widening");
+        assert!(!lag(800.0, Some(f64::NAN)));
+        assert!(!lag(10.0, Some(240.0)), "inside 1e-6 is no lag");
+        assert_eq!(count_age_heights(Some(241.0)), 9.0);
+        assert_eq!(count_age_heights(Some(-5.0)), 0.0);
+        // Ours above: the tip gap (240 heights at least), as before.
+        assert!(stats_supply_lag(y + 10_000.0, y, 100, 100, None));
+        assert!(!stats_supply_lag(y + 20_000.0, y, 100, 100, None));
+    }
+
     #[test]
     fn coins_tolerance_scales_with_the_tip_gap() {
         // Run 6E-3, 04:43:29Z: A - B = 2,621.7 KDA, chainweb-data ~145 heights behind.
