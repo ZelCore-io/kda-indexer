@@ -6241,3 +6241,54 @@ fn d1_h_transactions_by_public_key_selects_the_block_to_place_rows() {
         (Some(7), Some(3), Some("B7"))
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// FVH-D2 (R-P5P9-75, the "Harness, FVH-D2" part)
+// ---------------------------------------------------------------------------------------
+
+/// R-P5P9-75 item 0 (E's leak, the ~06:25Z ruling): E's node match runs the ruled amount
+/// matchers first. Ours lacks a real node transfer and the oracle lists it with its
+/// f64-rounded amount: the oracle row is the node's transfer, so it stays a diff.
+#[tokio::test]
+async fn d2_0_e_matches_an_f64_rounded_oracle_amount_before_calling_the_row_off_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let exact = "65913.172664045997";
+    for (rk, amount) in [
+        ("x0", json!(1.0)),
+        ("e", json!({ "decimal": exact })),
+        ("en", serde_json::from_str::<Value>(exact).unwrap()),
+    ] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", amount);
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("s", "r")));
+    for rk in ["e", "en"] {
+        // The oracle's f64-rounded amount of the node's real transfer; ours lacks the row.
+        let rounded = h7_xrow(rk, 100, json!("65913.172664046"), Some(("s", "r")));
+        let (d, note) = d1_settle(
+            &ctx,
+            vec![x0.clone()],
+            vec![x0.clone(), rounded],
+            (false, false),
+        )
+        .await;
+        assert!(!only_hits(&d), "{rk}: {d:?} {note:?}");
+        assert!(
+            !format!("{d:?}").contains(crate::graphql_window::NOT_IN_NODE_TX),
+            "{rk}: {d:?}"
+        );
+    }
+    // Negative: an oracle amount that is no rounding of the node's (another value) is still
+    // off the node's transaction.
+    let wrong = h7_xrow("e", 100, json!("65913.1726"), Some(("s", "r")));
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), wrong],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+}
