@@ -5,40 +5,46 @@
 //! `X` is the circulating supply at the highest stored height and the current time, on
 //! mainnet01 only (the supply tables are mainnet's, R9); `null` on other networks. The key order is the
 //! record's field order, not alphabetical (chainweb-data encodes the record directly).
+//!
+//! The count walks every hot tx key, so a request never makes it (R-P5P9-75): a background
+//! task ([`run_refresh`], started and stopped with the server) recounts every
+//! [`REFRESH_EVERY`], and a request answers the last count with its age in `x-count-age`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderName, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use kdx_hot::{Table, Txn};
 use kdx_types::TxKey;
+use tokio_util::sync::CancellationToken;
 
 use super::{shapes, text};
 use crate::server::ApiState;
 use crate::store::View;
-use crate::ApiResult;
+use crate::{ApiError, ApiResult};
 
-/// A counted answer is reused this long (the count walks every hot tx key).
-const CACHE_FOR: Duration = Duration::from_secs(5);
-/// A recount that misses its deadline answers the last counted value only while that value
-/// is younger than this; an older one is not served (the request gets the deadline error,
-/// `504`, as when nothing was counted yet).
-pub const MAX_FALLBACK_AGE: Duration = Duration::from_secs(10 * 60);
+/// The background count runs this often.
+pub const REFRESH_EVERY: Duration = Duration::from_secs(120);
+/// A refresh may take this long (cold pages: 5E saw a walk of the hot window pass 5 s, the
+/// request deadline). A slower one fails and the last count stays.
+const REFRESH_BUDGET: Duration = Duration::from_secs(60);
+/// A failing refresh logs one WARN per this long.
+const WARN_EVERY: Duration = Duration::from_secs(10 * 60);
+/// `Retry-After` (seconds) of the `503` before the first count exists.
+const RETRY_AFTER_SECS: &str = "5";
 
-/// Header on a `/stats` answer that is the last counted value, not a fresh count: its age in
-/// whole seconds.
+/// Header on every `/stats` answer: the age of the count in whole seconds.
 pub const COUNT_AGE: HeaderName = HeaderName::from_static("x-count-age");
 
 /// A user-tx count as `/stats` answers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxCount {
     pub n: u64,
-    /// How old the count is when it is the last counted value (a recount missed its
-    /// deadline, or another request is recounting); None for a count within `CACHE_FOR`.
-    pub age: Option<Duration>,
+    /// How long ago the count finished.
+    pub age: Duration,
 }
 
 /// Exact user-tx count of what `view` serves: frozen ranges (`tx_count - block_count`,
@@ -72,16 +78,19 @@ pub fn user_tx_count(view: &View) -> ApiResult<u64> {
         })?;
     }
     if late {
-        return Err(crate::ApiError::Deadline);
+        return Err(ApiError::Deadline);
     }
     Ok(frozen + hot)
 }
 
-/// The last counted answer and the single-flight guard of a recount.
+/// The last counted value. Written by the refresh task only; no lock is held while counting.
 pub(crate) struct CountCache {
     last: Mutex<Option<(Instant, u64)>>,
-    /// Held while one request counts: concurrent misses do not each walk the window.
-    counting: Mutex<()>,
+    /// Wakes requests that wait for the first count.
+    first: tokio::sync::Notify,
+    /// When the last refresh failure was logged.
+    warned: Mutex<Option<Instant>>,
+    counter: fn(&View) -> ApiResult<u64>,
 }
 
 /// The process-wide cache ([`crate::ApiState`] holds it for `/stats`; [`stats`] reads it).
@@ -89,61 +98,95 @@ pub(crate) static CACHE: CountCache = CountCache::new();
 
 impl CountCache {
     const fn new() -> CountCache {
+        CountCache::with_counter(user_tx_count)
+    }
+
+    /// A cache whose refresh counts with `counter` (tests inject a slow or failing one).
+    const fn with_counter(counter: fn(&View) -> ApiResult<u64>) -> CountCache {
         CountCache {
             last: Mutex::new(None),
-            counting: Mutex::new(()),
+            first: tokio::sync::Notify::const_new(),
+            warned: Mutex::new(None),
+            counter,
         }
     }
 
-    /// The last counted value at `now`: within `CACHE_FOR` it is fresh (no age); otherwise,
-    /// unless `fresh_only`, it is served with its age while that is under
-    /// `MAX_FALLBACK_AGE`.
-    fn get(&self, fresh_only: bool, now: Instant) -> Option<TxCount> {
+    /// The last counted value with its age at `now`; None before the first count.
+    fn peek(&self, now: Instant) -> Option<TxCount> {
         let (at, n) = (*self.last.lock().unwrap_or_else(|e| e.into_inner()))?;
-        let age = now.saturating_duration_since(at);
-        if age < CACHE_FOR {
-            return Some(TxCount { n, age: None });
-        }
-        (!fresh_only && age < MAX_FALLBACK_AGE).then_some(TxCount { n, age: Some(age) })
+        Some(TxCount {
+            n,
+            age: now.saturating_duration_since(at),
+        })
     }
 
-    /// `user_tx_count`, reused for `CACHE_FOR`. Single-flight: on a miss one request
-    /// counts; the others answer the previous value, or wait for the count when there is
-    /// none yet. A recount that misses the request deadline (cold pages: 5E saw a walk of
-    /// the hot window pass 5 s) answers the last counted value with its age while that is
-    /// under `MAX_FALLBACK_AGE`; with no such value it is a 504. chainweb-data's own count is
-    /// an estimate.
-    fn count(&self, view: &View) -> ApiResult<TxCount> {
-        self.count_at(view, Instant::now)
+    fn store(&self, n: u64, at: Instant) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, n));
+        self.first.notify_waiters();
     }
 
-    /// [`Self::count`] with the clock `now` (tests move it forward).
-    fn count_at(&self, view: &View, now: impl Fn() -> Instant) -> ApiResult<TxCount> {
-        if let Some(c) = self.get(true, now()) {
-            return Ok(c);
+    /// The count, waiting until `until` for the first one; None when there is still none.
+    async fn wait_for_count(&self, until: Instant) -> Option<TxCount> {
+        loop {
+            // Arm the wakeup before looking, so a count stored in between is not missed.
+            let woken = self.first.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if let Some(c) = self.peek(Instant::now()) {
+                return Some(c);
+            }
+            if tokio::time::timeout_at(until.into(), woken).await.is_err() {
+                return self.peek(Instant::now());
+            }
         }
-        let _g = match self.counting.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if let Some(c) = self.get(false, now()) {
-                    return Ok(c);
+    }
+
+    /// True once per [`WARN_EVERY`].
+    fn warn_due(&self, now: Instant) -> bool {
+        let mut w = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        if w.is_some_and(|at| now.saturating_duration_since(at) < WARN_EVERY) {
+            return false;
+        }
+        *w = Some(now);
+        true
+    }
+
+    /// One recount. A failed or slow one (past [`REFRESH_BUDGET`]) keeps the last count.
+    async fn refresh(&self, st: &Arc<ApiState>) {
+        match st.read_for(REFRESH_BUDGET, self.counter).await {
+            Ok(n) => self.store(n, Instant::now()),
+            Err(e) => {
+                let now = Instant::now();
+                if self.warn_due(now) {
+                    let age = self.peek(now).map(|c| c.age.as_secs());
+                    tracing::warn!(
+                        error = %e,
+                        count_age_secs = ?age,
+                        "stats: count refresh failed; the last count stays"
+                    );
                 }
-                self.counting.lock().unwrap_or_else(|e| e.into_inner())
             }
-        };
-        if let Some(c) = self.get(true, now()) {
-            return Ok(c);
         }
-        match user_tx_count(view) {
-            Ok(n) => {
-                *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some((now(), n));
-                Ok(TxCount { n, age: None })
-            }
-            Err(crate::ApiError::Deadline) => {
-                self.get(false, now()).ok_or(crate::ApiError::Deadline)
-            }
-            Err(e) => Err(e),
+    }
+}
+
+/// Recount every [`REFRESH_EVERY`] until `shutdown`; `serve` starts it.
+pub(crate) async fn run_refresh(st: Arc<ApiState>, shutdown: CancellationToken) {
+    refresh_every(st, REFRESH_EVERY, shutdown).await;
+}
+
+async fn refresh_every(st: Arc<ApiState>, every: Duration, shutdown: CancellationToken) {
+    let cache = st.stats_cache;
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = cache.refresh(&st) => {}
         }
     }
 }
@@ -151,149 +194,188 @@ impl CountCache {
 /// Network whose supply tables `crate::supply` holds.
 const SUPPLY_NETWORK: &str = "mainnet01";
 
-/// `(user tx count, coins in circulation)` as `/stats` answers them (GraphQL `networkInfo`
-/// reads the same).
-pub fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
-    Ok(stats_aged(&CACHE, view)?.map(|(c, coins)| (c.n, coins)))
-}
-
-/// [`stats`] with the count's age (`/stats` sends it as [`COUNT_AGE`]), counted through
-/// `cache`.
-fn stats_aged(cache: &CountCache, view: &View) -> ApiResult<Option<(TxCount, Option<f64>)>> {
+/// The circulating supply at the highest stored height: `Some(coins)` (`coins` None off
+/// mainnet), or None on an empty store.
+fn supply(view: &View) -> ApiResult<Option<Option<f64>>> {
     let Some(h) = view.max_indexed_height()? else {
         return Ok(None);
     };
-    let coins = (view.genesis.network == SUPPLY_NETWORK)
-        .then(|| crate::supply::circulating(u64::from(h), SystemTime::now()));
-    Ok(Some((cache.count(view)?, coins)))
+    Ok(Some((view.genesis.network == SUPPLY_NETWORK).then(|| {
+        crate::supply::circulating(u64::from(h), SystemTime::now())
+    })))
+}
+
+/// `(user tx count, coins in circulation)` as `/stats` answers them (GraphQL `networkInfo`
+/// reads the same): the last refreshed count, never a recount. Unavailable before the first
+/// count (startup).
+pub fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
+    let Some(coins) = supply(view)? else {
+        return Ok(None);
+    };
+    let c = CACHE
+        .peek(Instant::now())
+        .ok_or_else(|| ApiError::Unavailable("the transaction count is not ready yet".into()))?;
+    Ok(Some((c.n, coins)))
 }
 
 pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
+    let until = Instant::now() + st.settings.deadline;
     let cache = st.stats_cache;
-    match st.read(move |v| stats_aged(cache, v)).await {
-        Ok(Some((count, coins))) => {
-            let n = count.n;
-            let mut b = format!("{{\"transactionCount\":{n},\"coinsInCirculation\":").into_bytes();
-            match coins {
-                Some(c) => shapes::write_aeson(&shapes::aeson_double(c), &mut b),
-                None => b.extend_from_slice(b"null"),
-            }
-            b.push(b'}');
-            let mut resp = (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json;charset=utf-8")],
-                Body::from(b),
-            )
-                .into_response();
-            if let Some(age) = count.age {
-                resp.headers_mut()
-                    .insert(COUNT_AGE, header::HeaderValue::from(age.as_secs()));
-            }
-            resp
-        }
-        Ok(None) => text(StatusCode::NOT_FOUND, "Server database is empty"),
-        Err(e) => e.into_response(),
+    let coins = match st.read(supply).await {
+        Ok(Some(coins)) => coins,
+        Ok(None) => return text(StatusCode::NOT_FOUND, "Server database is empty"),
+        Err(e) => return e.into_response(),
+    };
+    let Some(count) = cache.wait_for_count(until).await else {
+        let mut resp = text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the transaction count is not ready yet",
+        );
+        resp.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(RETRY_AFTER_SECS),
+        );
+        return resp;
+    };
+    let mut b = format!("{{\"transactionCount\":{},\"coinsInCirculation\":", count.n).into_bytes();
+    match coins {
+        Some(c) => shapes::write_aeson(&shapes::aeson_double(c), &mut b),
+        None => b.extend_from_slice(b"null"),
     }
+    b.push(b'}');
+    let mut resp = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json;charset=utf-8")],
+        Body::from(b),
+    )
+        .into_response();
+    resp.headers_mut()
+        .insert(COUNT_AGE, HeaderValue::from(count.age.as_secs()));
+    resp
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// 5E: a recount that misses the deadline answers the last counted value with its age,
-    /// while that is under `MAX_FALLBACK_AGE`; with no value yet, or only an older one, it
-    /// stays a deadline error.
     #[test]
-    fn a_late_recount_answers_the_last_counted_value() {
+    fn count_checks_the_deadline() {
         let (_d, store) = crate::testutil::store();
-        let c = CountCache::new();
-        let late = || store.view(Instant::now() - Duration::from_secs(1)).unwrap();
-        let in_time = || {
-            store
-                .view(Instant::now() + Duration::from_secs(60))
-                .unwrap()
-        };
-        assert!(matches!(c.count(&late()), Err(crate::ApiError::Deadline)));
-        // An in-time count is stored and reused, with no age.
-        let t0 = Instant::now();
-        let n = c.count_at(&in_time(), || t0).unwrap().n;
-        let fresh = TxCount { n, age: None };
-        assert_eq!(c.get(true, t0), Some(fresh));
-        assert_eq!(c.count_at(&late(), || t0).unwrap(), fresh);
-        // Older than CACHE_FOR: the next call recounts, misses the deadline and answers the
-        // stored value with its age.
-        let at = |d: Duration| move || t0 + d;
-        let old = CACHE_FOR * 4;
-        assert_eq!(c.get(true, t0 + old), None);
-        assert_eq!(
-            c.count_at(&late(), at(old)).unwrap(),
-            TxCount { n, age: Some(old) }
-        );
-        // Just under the bound: still served, with its age.
-        let under = MAX_FALLBACK_AGE - Duration::from_secs(1);
-        assert_eq!(
-            c.count_at(&late(), at(under)).unwrap(),
-            TxCount {
-                n,
-                age: Some(under)
-            }
-        );
-        // At and past the bound: the deadline error, as with no value.
-        for past in [MAX_FALLBACK_AGE, MAX_FALLBACK_AGE + Duration::from_secs(1)] {
-            assert!(
-                matches!(
-                    c.count_at(&late(), at(past)),
-                    Err(crate::ApiError::Deadline)
-                ),
-                "{past:?}"
-            );
-            assert_eq!(c.get(false, t0 + past), None);
-        }
-        // An in-time recount replaces it.
-        let later = t0 + MAX_FALLBACK_AGE * 2;
-        assert_eq!(c.count_at(&in_time(), || later).unwrap(), fresh);
-        assert_eq!(c.get(true, later), Some(fresh));
+        let view = store.view(Instant::now() - Duration::from_secs(1)).unwrap();
+        assert!(matches!(user_tx_count(&view), Err(ApiError::Deadline)));
     }
 
-    /// While another request recounts, a waiting request answers the previous value with its
-    /// age only under `MAX_FALLBACK_AGE`; an older one makes it wait for the count.
+    /// 2: the age grows with the clock while no refresh succeeds, and a refresh resets it.
     #[test]
-    fn a_concurrent_miss_serves_only_a_bounded_previous_value() {
-        let (_d, store) = crate::testutil::store();
+    fn the_age_grows_until_a_refresh_stores_a_new_count() {
         let c = CountCache::new();
         let t0 = Instant::now();
-        let view = store
-            .view(Instant::now() + Duration::from_secs(60))
-            .unwrap();
-        let n = c.count_at(&view, || t0).unwrap().n;
-        let busy = c.counting.lock().unwrap();
-        let under = MAX_FALLBACK_AGE - Duration::from_secs(1);
-        assert_eq!(
-            c.count_at(&view, || t0 + under).unwrap(),
-            TxCount {
-                n,
-                age: Some(under)
-            }
-        );
-        // Past the bound it waits for the count in progress (here: until `busy` is dropped).
-        std::thread::scope(|s| {
-            let h = s.spawn(|| c.count_at(&view, || t0 + MAX_FALLBACK_AGE).unwrap());
-            std::thread::sleep(Duration::from_millis(100));
-            assert!(!h.is_finished(), "a value past the bound was served");
-            drop(busy);
-            assert_eq!(h.join().unwrap(), TxCount { n, age: None });
-        });
+        assert_eq!(c.peek(t0), None);
+        c.store(5, t0);
+        let age = |d: u64| c.peek(t0 + Duration::from_secs(d)).unwrap().age.as_secs();
+        assert_eq!((age(0), age(10), age(130), age(3600)), (0, 10, 130, 3600));
+        c.store(6, t0 + Duration::from_secs(120));
+        let again = c.peek(t0 + Duration::from_secs(130)).unwrap();
+        assert_eq!((again.n, again.age.as_secs()), (6, 10));
     }
 
-    /// FV-6: `/stats` over HTTP (the compat router, `tower::oneshot`). While another request
-    /// recounts, it answers the last counted value with its age in `x-count-age`; a fresh
-    /// count has no such header.
+    /// One WARN per `WARN_EVERY`.
+    #[test]
+    fn a_failing_refresh_warns_once_per_window() {
+        let c = CountCache::new();
+        let t0 = Instant::now();
+        let due = |d: Duration| c.warn_due(t0 + d);
+        assert!(due(Duration::ZERO));
+        assert!(!due(Duration::from_secs(1)));
+        assert!(!due(WARN_EVERY - Duration::from_secs(1)));
+        assert!(due(WARN_EVERY));
+        assert!(!due(WARN_EVERY + Duration::from_secs(1)));
+    }
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted(_: &View) -> ApiResult<u64> {
+        Ok(CALLS.fetch_add(1, Ordering::SeqCst) as u64 + 1)
+    }
+
+    fn failing(_: &View) -> ApiResult<u64> {
+        Err(ApiError::Deadline)
+    }
+
+    /// 4: the refresh task counts at its interval and stops on shutdown.
     #[tokio::test]
-    async fn stats_sends_the_count_age_header() {
-        use axum::http::Request;
-        use tower::ServiceExt;
-        let (_d, store) = crate::testutil::store();
+    async fn the_refresh_task_stops_on_shutdown() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(counted)));
+        let (_d, _app, st) = app(cache);
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(refresh_every(st, Duration::from_millis(20), stop.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while CALLS.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the task keeps refreshing");
+        assert!(cache.peek(Instant::now()).is_some());
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the task stops on shutdown")
+            .unwrap();
+        let after = CALLS.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            after,
+            "counted after shutdown"
+        );
+    }
+
+    /// A failed refresh keeps the last count; the first one stores it and wakes a waiting
+    /// request.
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_last_count() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(failing)));
+        let (_d, _app, st) = app(cache);
+        cache.store(7, Instant::now() - Duration::from_secs(300));
+        cache.refresh(&st).await;
+        let c = cache.peek(Instant::now()).unwrap();
+        assert_eq!(c.n, 7);
+        assert!(c.age >= Duration::from_secs(300));
+    }
+
+    /// A request waiting for the first count is answered when the refresh stores it.
+    #[tokio::test]
+    async fn a_waiting_request_gets_the_first_count() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::new()));
+        let (_d, app, _st) = app(cache);
+        let t = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cache.store(11, Instant::now());
+        });
+        let (r, took) = get(&app).await;
+        t.await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(took < Duration::from_millis(250), "{took:?}");
+        assert_eq!(
+            body(r).await,
+            "{\"transactionCount\":11,\"coinsInCirculation\":null}"
+        );
+    }
+
+    // ---- STATS-FIX (R-P5P9-75): the count is refreshed in the background ----
+
+    fn slow_count(_: &View) -> ApiResult<u64> {
+        std::thread::sleep(Duration::from_millis(1500));
+        Ok(99)
+    }
+
+    /// The compat router over a store with a checkpoint, a 300 ms deadline and `cache`.
+    fn app(
+        cache: &'static CountCache,
+    ) -> (tempfile::TempDir, axum::Router, std::sync::Arc<ApiState>) {
+        let (d, store) = crate::testutil::store();
         let mut w = store.hot_for_tests().rw().unwrap();
         kdx_hot::set_checkpoint(
             &mut w,
@@ -304,11 +386,9 @@ mod tests {
         )
         .unwrap();
         w.commit().unwrap();
-        let cache: &'static CountCache = Box::leak(Box::new(CountCache::new()));
-        *cache.last.lock().unwrap() = Some((Instant::now() - Duration::from_secs(60), 7));
         let settings = crate::ApiSettings {
             network: "testnet04".into(),
-            deadline: Duration::from_secs(10),
+            deadline: Duration::from_millis(300),
             max_in_flight: 16,
             max_body_bytes: 1 << 20,
             v1txs_max_body_bytes: 1 << 20,
@@ -323,48 +403,64 @@ mod tests {
             .with_stats_cache(cache)
             .state();
         let search = crate::search::SearchCtx::new(super::super::SearchSettings::default(), None);
-        let app = super::super::router(search).with_state(st);
-        let get = || Request::get("/stats").body(Body::empty()).unwrap();
-        let body = |r: Response| async move {
-            let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
-            String::from_utf8(b.to_vec()).unwrap()
-        };
-        // Another request holds the recount: this one answers the 60 s old value.
-        let (held_tx, held) = std::sync::mpsc::channel::<()>();
-        let (release, release_rx) = std::sync::mpsc::channel::<()>();
-        let t = std::thread::spawn(move || {
-            let _g = cache.counting.lock().unwrap();
-            held_tx.send(()).unwrap();
-            let _ = release_rx.recv();
-        });
-        held.recv().unwrap();
-        let r = app.clone().oneshot(get()).await.unwrap();
+        (d, super::super::router(search).with_state(st.clone()), st)
+    }
+
+    async fn get(app: &axum::Router) -> (Response, Duration) {
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let t = Instant::now();
+        let r = app
+            .clone()
+            .oneshot(Request::get("/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        (r, t.elapsed())
+    }
+
+    async fn body(r: Response) -> String {
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        String::from_utf8(b.to_vec()).unwrap()
+    }
+
+    /// 1: a count slower than the deadline never holds a request once a count exists: the
+    /// request answers 200 at once with the previous count and its age.
+    #[tokio::test]
+    async fn a_slow_count_does_not_block_a_request_after_the_first_count() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(slow_count)));
+        *cache.last.lock().unwrap() = Some((Instant::now() - Duration::from_secs(60), 7));
+        let (_d, app, _st) = app(cache);
+        let (r, took) = get(&app).await;
         assert_eq!(r.status(), StatusCode::OK);
+        assert!(took < Duration::from_millis(250), "{took:?}");
         let age: u64 = r.headers()[COUNT_AGE].to_str().unwrap().parse().unwrap();
-        assert!((60..120).contains(&age), "{age}");
+        assert!((60..65).contains(&age), "{age}");
         assert_eq!(
             body(r).await,
             "{\"transactionCount\":7,\"coinsInCirculation\":null}"
         );
-        release.send(()).unwrap();
-        t.join().unwrap();
-        // Nobody else counts now: a fresh count of the (empty) store, with no age header.
-        let r = app.oneshot(get()).await.unwrap();
-        assert_eq!(r.status(), StatusCode::OK);
-        assert!(r.headers().get(COUNT_AGE).is_none());
-        assert_eq!(
-            body(r).await,
-            "{\"transactionCount\":0,\"coinsInCirculation\":null}"
-        );
     }
 
-    #[test]
-    fn count_checks_the_deadline() {
-        let (_d, store) = crate::testutil::store();
-        let view = store.view(Instant::now() - Duration::from_secs(1)).unwrap();
-        assert!(matches!(
-            user_tx_count(&view),
-            Err(crate::ApiError::Deadline)
-        ));
+    /// 2: the header is on every answer, a fresh count included.
+    #[tokio::test]
+    async fn the_age_header_is_on_a_fresh_count_too() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::new()));
+        *cache.last.lock().unwrap() = Some((Instant::now(), 3));
+        let (_d, app, _st) = app(cache);
+        let (r, _) = get(&app).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()[COUNT_AGE], "0");
+    }
+
+    /// 3: at startup, with no count yet and a slow count, the request waits the deadline and
+    /// answers 503 with `Retry-After`.
+    #[tokio::test]
+    async fn startup_without_a_count_answers_503_with_retry_after() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(slow_count)));
+        let (_d, app, _st) = app(cache);
+        let (r, took) = get(&app).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+        assert!(took < Duration::from_millis(1200), "{took:?}");
     }
 }

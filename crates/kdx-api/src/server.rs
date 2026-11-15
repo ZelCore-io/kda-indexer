@@ -206,7 +206,18 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        self.read_on(None, &self.reads, f).await
+        self.read_on(None, &self.reads, self.settings.deadline, f)
+            .await
+    }
+
+    /// `read` with its own time budget instead of `settings.deadline`: the background work
+    /// that is not a request (the `/stats` count refresh).
+    pub(crate) async fn read_for<T, F>(self: &Arc<Self>, budget: Duration, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        self.read_on(None, &self.reads, budget, f).await
     }
 
     /// `read` for an expensive request class: a `heavy` slot first, then a read slot.
@@ -215,7 +226,8 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        self.read_on(Some(&self.heavy), &self.reads, f).await
+        self.read_on(Some(&self.heavy), &self.reads, self.settings.deadline, f)
+            .await
     }
 
     /// Take `n` more rate tokens for the client of this request (the guard took one): a
@@ -265,20 +277,22 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        self.read_on(None, &self.status_reads, f).await
+        self.read_on(None, &self.status_reads, self.settings.deadline, f)
+            .await
     }
 
     async fn read_on<T, F>(
         self: &Arc<Self>,
         first: Option<&Arc<Semaphore>>,
         pool: &Arc<Semaphore>,
+        budget: Duration,
         f: F,
     ) -> ApiResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        let deadline = Instant::now() + self.settings.deadline;
+        let deadline = Instant::now() + budget;
         let acquire = |s: &Arc<Semaphore>| {
             tokio::time::timeout_at(deadline.into(), s.clone().acquire_owned())
         };
@@ -582,6 +596,10 @@ impl Api {
             .layer(middleware::from_fn_with_state("admin", track))
             .with_state(st.clone());
         tokio::spawn(crate::sampler::run(st.clone(), shutdown.clone()));
+        tokio::spawn(crate::compat::stats::run_refresh(
+            st.clone(),
+            shutdown.clone(),
+        ));
         // Bind every address first: one failure drops the listeners bound so far, so nothing
         // serves until all of them are up.
         let mut bound = Vec::new();
