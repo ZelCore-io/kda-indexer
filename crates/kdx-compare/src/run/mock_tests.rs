@@ -5898,3 +5898,62 @@ async fn d1_a_cross_chain_transfer_is_checked_against_the_nodes_xchain_event() {
     let (d, _) = settle(row("x1", "r", xc)).await;
     assert!(!only_hits(&d), "{d:?}");
 }
+
+/// R-P5P9-75 B: an ours-only tx row's `result.block.canonical` is accepted when it equals
+/// H7's own verdict: the node places the row in the block that is the canonical one at its
+/// height on the cut's branch. `false` against that verdict, or `true` for a block the cut's
+/// branch does not hold at the height, stays a diff.
+#[tokio::test]
+async fn d1_b_result_block_canonical_is_h7s_own_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx = |rk: &str, canonical: Value| {
+        let id = crate::graphql::base64_std(format!("Transaction:[\"B100\",\"{rk}\"]").as_bytes());
+        json!({"cursor": "c", "node": {"id": id, "hash": rk, "result": {"height": 100,
+            "block": {"hash": "B100", "chainId": 0, "height": 100, "canonical": canonical}}}})
+    };
+    let node = |branch: Option<&str>| {
+        let mut n = NodeMock::default();
+        for rk in ["t0", "t1"] {
+            let (k, v) = h7_poll(rk, "B100", 100, json!([]));
+            n.polls.insert(k, v);
+        }
+        n.headers.insert(
+            (0, 100),
+            vec![json!({"hash": "B100", "height": 100, "chainId": 0, "payloadHash": "P100"})],
+        );
+        if let Some(b) = branch {
+            n.branch.insert(
+                (0, 100),
+                json!({"hash": b, "height": 100, "chainId": 0, "payloadHash": "PX"}),
+            );
+        }
+        n
+    };
+    let run = |n: NodeMock, ours: Value| {
+        let dir = dir.path().to_path_buf();
+        async move {
+            let ctx = gql_ctx(n, &dir).await;
+            let t0 = tx("t0", json!(true));
+            let mut a = h7_page("transactions", false, vec![t0.clone(), ours]);
+            let mut b = h7_page("transactions", false, vec![t0]);
+            ctx.gql_settle(
+                &ctx.targets["a"],
+                &serde_json::Map::new(),
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await
+        }
+    };
+    let (d, note) = run(node(None), tx("t1", json!(true))).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // Ours says false where the node places the row on the cut's branch: a diff.
+    let (d, note) = run(node(None), tx("t1", json!(false))).await;
+    assert!(!only_hits(&d), "{d:?}");
+    assert!(note.unwrap_or_default().contains("canonical"));
+    // The cut's branch holds another block at 100: ours' true is not H7's verdict.
+    let (d, _) = run(node(Some("X100")), tx("t1", json!(true))).await;
+    assert!(!only_hits(&d), "{d:?}");
+}

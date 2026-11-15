@@ -367,6 +367,9 @@ pub struct Verdict {
     /// R-P5P9-70 (I-1): an ours-only transfer row's `creationTime` against the node's command
     /// (or, for a coinbase, its block's time), in ours' form (`None`: not checked).
     pub ctime: Option<CmdCheck>,
+    /// R-P5P9-75 B: whether the block the node placed the row in is the canonical one at its
+    /// height on the cut's branch (`None`: not read; `Err`: why it could not be read).
+    pub branch: Option<Result<bool, String>>,
 }
 
 /// The check of an ours-only tx row's `cmd` fields against the node (R-P5P9-68 (2)).
@@ -399,6 +402,7 @@ impl Verdict {
             xchain: Vec::new(),
             cmd: None,
             ctime: None,
+            branch: None,
         }
     }
 
@@ -583,9 +587,9 @@ fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
             "height",
             "transactionId",
         ],
-        (Kind::Tx, "result.block") | (Kind::Transfer | Kind::Event, "block") => {
-            &["chainId", "hash", "height"]
-        }
+        // R-P5P9-75 B: `canonical` against H7's own verdict on the cut's branch.
+        (Kind::Tx, "result.block") => &["canonical", "chainId", "hash", "height"],
+        (Kind::Transfer | Kind::Event, "block") => &["chainId", "hash", "height"],
         (Kind::Tx, "cmd") => &["meta", "networkId", "nonce", "payload", "signers"],
         (Kind::Tx, "cmd.meta") => &[
             "chainId",
@@ -2282,6 +2286,39 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
         if !settled {
             continue;
         }
+        // R-P5P9-75 B: ours' `result.block.canonical` is H7's own verdict on the cut's branch.
+        if let Some(x) = n
+            .pointer("/result/block/canonical")
+            .filter(|_| ra.id.kind == Some(Kind::Tx))
+        {
+            match (x, &v.branch) {
+                (Value::Bool(true), Some(Ok(true))) => {}
+                (_, Some(Err(w))) => {
+                    d.undecided.push(format!(
+                        "an ours-only row whose result.block.canonical the node did not settle \
+                         ({w}): {}",
+                        ra.id.evidence()
+                    ));
+                    continue;
+                }
+                (x, b) => {
+                    let h7 = match b {
+                        Some(Ok(true)) => "canonical on the cut's branch",
+                        Some(Ok(false)) => "not the cut branch's block at its height",
+                        _ => "not read",
+                    };
+                    d.rejected.push((
+                        Some(ra.edge.clone()),
+                        None,
+                        format!(
+                            "an ours-only row whose result.block.canonical {x} is not H7's \
+                             verdict ({h7})"
+                        ),
+                    ));
+                    continue;
+                }
+            }
+        }
         // R-P5P9-75 A: `crossChainTransfer` against the node's cross-chain events.
         if let Some(why) = n
             .get("crossChainTransfer")
@@ -2586,6 +2623,7 @@ impl Ctx {
             if side == 0 && ours_only.contains(&i) {
                 self.h7_cmd_check(r, &mut v, st).await;
                 self.h7_ctime_check(r, &mut v, st).await;
+                self.h7_branch_check(r, &mut v, st).await;
             }
             if side == 0 {
                 va[i] = Some(v);
@@ -2967,6 +3005,29 @@ impl Ctx {
             None => CmdCheck::Unsettled("the node's creationTime does not read".into()),
             Some(us) if time_is(x, Some(us), false) => CmdCheck::Same,
             Some(_) => CmdCheck::Differs("creationTime".into()),
+        });
+    }
+
+    /// R-P5P9-75 B: an ours-only tx row that the node places (`v`) and that selects
+    /// `result.block.canonical`: whether the node's block for it is the canonical one at its
+    /// height on the cut's branch. Sets `v.branch`.
+    async fn h7_branch_check(&self, r: &Row, v: &mut Verdict, st: &mut Reads) {
+        let n = node_of(r);
+        if r.id.kind != Some(Kind::Tx)
+            || v.canon != Canon::Yes
+            || n.pointer("/result/block/canonical").is_none()
+            || unchecked_field(r.id.kind, n).is_some()
+        {
+            return;
+        }
+        let (Some(chain), Some(h), Some(b)) = (v.chain, v.height, v.block.clone()) else {
+            v.branch = Some(Err("no chain, height or block for the row".into()));
+            return;
+        };
+        v.branch = Some(match self.h7_canonical(chain, h, st).await {
+            Ok(Some(hd)) => Ok(hd.get("hash").and_then(Value::as_str) == Some(b.as_str())),
+            Ok(None) => Err("no canonical header at the height on the cut's branch".into()),
+            Err(w) => Err(w),
         });
     }
 
