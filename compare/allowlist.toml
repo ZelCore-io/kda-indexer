@@ -577,3 +577,14 @@ reason = "R-P5P9-75 C (oracle convention): the reference server sends a coinbase
 status = "PROPOSED"
 ruling = "R-P5P9-75."
 owner_note = "PROPOSED (ruling R-P5P9-75 C; evidence CG-4 #30, #69, #88): a G4 compat note; ours sends the coinbase key as the node does."
+
+[[entry]]
+id = "graphql-r75-nested-multiset"
+route = "other"
+json_path_glob = "/~graphql-r75-nested-multiset"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-75 G: a nested list below a root list's rows whose rows select no key (BlocksByHeight's transactions { cmd { meta { gasPrice } } }), outside H2's scope, compared as a multiset of the selected values per parent: only when both sides' lists are complete (no next page, totalCount equal to the rows) with equal totalCount. A value one side lacks stays a diff; a list not complete on both sides, or with another totalCount, keeps its order and a /~graphql-h6-unfinished entry with why, which no entry matches."
+status = "PROPOSED"
+ruling = "R-P5P9-75."
+owner_note = "PROPOSED (ruling R-P5P9-75 G; CG-4 #54, #75, #196): the order within a block is a contract choice (R3E-8)."

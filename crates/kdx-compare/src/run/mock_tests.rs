@@ -6082,3 +6082,59 @@ async fn d1_f_key_only_transfer_rows_get_a_request_key_identity_and_a_note() {
     let (_, note) = d1_settle(&ctx, vec![bare, r("u")], vec![r("u")], (false, false)).await;
     assert!(note.unwrap_or_default().starts_with("H7 not applied"));
 }
+
+/// R-P5P9-75 G: a nested list whose rows select no key (BlocksByHeight's
+/// `transactions { cmd { meta { gasPrice } } }`, here with each row's `creationTime` so the
+/// tie sort leaves the order alone) compares as a multiset of the selected values
+/// per parent, only when both sides' lists are complete with equal `totalCount`; otherwise it
+/// is `/~graphql-h6-unfinished` with why. A value one side lacks stays a diff.
+#[test]
+fn d1_g_unkeyed_nested_lists_compare_as_multisets_only_when_complete() {
+    use crate::graphql::{compare_answers_with, Answer};
+    let page = |total: u64, prices: &[&str]| {
+        let edges: Vec<Value> = prices
+            .iter()
+            .map(|p| {
+                // Each row its own creationTime, so the tie sort does not order them.
+                let ct = format!("2026-01-01T00:00:0{}Z", &p[..1]);
+                json!({"node": {"cmd": {"meta": {"creationTime": ct, "gasPrice": p}}}})
+            })
+            .collect();
+        Answer {
+            body: json!({"data": {"completedBlockHeights": {"pageInfo": {"hasNextPage": false},
+                "edges": [{"node": {"hash": "B1", "height": 1, "chainId": 0,
+                    "transactions": {"totalCount": total, "edges": edges}}}]}}}),
+            status: 200,
+            raw: String::new(),
+            ms: Vec::new(),
+        }
+    };
+    let run = |a: Answer, b: Answer| {
+        let (mut a, mut b) = (a, b);
+        compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false)
+    };
+    let unfinished = |d: &[crate::report::DiffEntry]| {
+        d.iter()
+            .any(|e| e.path == crate::graphql_scope::UNFINISHED_PATH)
+    };
+    // Complete on both sides, equal totalCount, another order: explained.
+    let d = run(page(2, &["1e-8", "2e-8"]), page(2, &["2e-8", "1e-8"]));
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_scope::NESTED_MULTISET_PATH),
+        "{d:?}"
+    );
+    // A value the oracle's block lacks: a diff.
+    let d = run(page(2, &["1e-8", "2e-8"]), page(2, &["2e-8", "3e-8"]));
+    assert!(!only_hits(&d), "{d:?}");
+    // Cut on both sides (totalCount above the rows): unfinished, with why.
+    let d = run(page(3, &["1e-8", "2e-8"]), page(3, &["2e-8", "1e-8"]));
+    assert!(unfinished(&d), "{d:?}");
+    // Unequal totalCount: unfinished.
+    let d = run(
+        page(2, &["1e-8", "2e-8"]),
+        page(3, &["2e-8", "1e-8", "3e-8"]),
+    );
+    assert!(unfinished(&d), "{d:?}");
+}

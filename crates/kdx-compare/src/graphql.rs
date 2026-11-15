@@ -939,6 +939,19 @@ pub fn compare_answers_with(
             }
         }
     }
+    // R-P5P9-75 G: nested lists without a key compare as multisets when complete.
+    let (sorted, left) = crate::graphql_scope::unkeyed_nested(&mut na, &mut nb);
+    if sorted {
+        hits.push(hit(crate::graphql_scope::NESTED_MULTISET_PATH));
+    }
+    if !left.is_empty() {
+        hits.push(DiffEntry {
+            path: crate::graphql_scope::UNFINISHED_PATH.into(),
+            kind: DiffKind::Changed,
+            a: Some(json!({ "lists": left })),
+            b: None,
+        });
+    }
     if crate::graphql_norm::count_self_consistent(rules, &na, &mut nb) {
         hits.push(hit(crate::graphql_norm::COUNT_SELF_CONSISTENT_PATH));
     }

@@ -87,7 +87,7 @@ pub fn f64_eq(x: f64, y: f64) -> bool {
 
 /// The exact decimal value of a numeric leaf (sign, digits, exponent), in any of the forms
 /// [`num_f64`] reads.
-fn decimal_value(v: &Value) -> Option<(bool, String, i64)> {
+pub(crate) fn decimal_value(v: &Value) -> Option<(bool, String, i64)> {
     match v {
         Value::Number(n) => decimal_canon(&n.to_string()),
         Value::String(s) => match s.strip_prefix('#') {
