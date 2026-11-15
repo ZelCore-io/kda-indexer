@@ -25,13 +25,19 @@ use crate::oracle;
 use crate::report::{
     iso_secs, now_secs, sh_quote, sh_url, trim_body, DailySummary, DiffLog, DiffRecord,
 };
-use crate::target::Target;
+use crate::target::{HttpCapture, Target};
 
 /// Workers sending requests concurrently (the shared limiter caps the rate). Kept low:
 /// slow chainweb-data queries (account/events pages) can take 30 s each.
 const WORKERS: usize = 3;
 /// kda-txs's own query limit; a 404 that took this long is its timeout.
 const KDA_TXS_LIMIT_MS: u64 = 29_000;
+/// R-P5P9-70 (m-2): an in-memory `/v1/txs` compare with a side's body over this many bytes
+/// takes the one permit of [`V1TXS_LARGE`] first.
+const V1TXS_LARGE_BYTES: usize = 8 << 20;
+/// R-P5P9-70 (m-2): process-wide, one large in-memory `/v1/txs` compare at a time (about
+/// 0.8 GiB at the 32 MiB cap a side), so the workers together stay under `MemoryMax=4G`.
+pub(crate) static V1TXS_LARGE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// At most this many A-only account rows are checked against chainweb-data's /txs/tx.
 const GAP_CHECKS: usize = 5;
 /// At most this many canonical-header lookups on the node per compare for the orphan rules
@@ -55,6 +61,9 @@ const CWD_TRANSFERS_GAP_PATH: &str = "/~cwd-transfers-gap";
 const SEARCH_CONT_HISTORY_PATH: &str = "/~search-cont-history";
 /// Visible hit of `/txs/search?pactid=` rows compared with ties sorted by request key.
 const PACTID_TIE_ORDER_PATH: &str = "/~pactid-tie-order";
+/// Visible hit of `/txs/search?search=` rows of one height in another order (allowlist id
+/// `search-tie-order`; fv-checklist T-item, R3E-8).
+const SEARCH_TIE_ORDER_PATH: &str = "/~search-tie-order";
 
 /// JSON path of the visible allowlist hit for [`events_as_multiset`].
 const EVENT_ORDER_PATH: &str = "/~event-order";
@@ -184,7 +193,7 @@ fn num_canon_text(v: &Value) -> String {
 }
 
 /// Rewrites every JSON number as its nearest f64.
-fn numbers_as_f64(v: &mut Value) {
+pub(crate) fn numbers_as_f64(v: &mut Value) {
     match v {
         Value::Number(n) => {
             if let Some(x) = n.as_f64().and_then(serde_json::Number::from_f64) {
@@ -219,6 +228,51 @@ fn drop_at_or_below(v: &mut Value, h: u64) {
     }
 }
 
+/// Cuts both sides at `cut`, the lowest height of a side that held its full limit: rows
+/// below it go on both sides. At `cut` itself a limiting side (`split_a`, `split_b`: full, its
+/// lowest height `cut`) may hold only some of the height's rows, so the other side's rows
+/// there that it lacks go; when both are limiting, every row at `cut` goes. A limiting
+/// side's row at `cut` that the complete side lacks stays a difference (R-P5P9-71 (1)).
+fn cut_at_limit(va: &mut Value, vb: &mut Value, cut: u64, split_a: bool, split_b: bool) {
+    let at = |v: &Value| -> Value {
+        Value::Array(
+            v.as_array()
+                .map(|x| {
+                    x.iter()
+                        .filter(|r| row_height(r) == Some(cut))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    };
+    let (at_a, at_b) = (at(va), at(vb));
+    let keep = |v: &mut Value, keep_at: Vec<Value>| {
+        drop_at_or_below(v, cut);
+        if let Value::Array(x) = v {
+            x.extend(keep_at);
+        }
+    };
+    match (split_a, split_b) {
+        (true, false) => {
+            let b_surplus = only_keys_in_first(&at_b, &at_a);
+            let b_keep = only_keys_in_first(&at_b, &Value::Array(b_surplus));
+            keep(va, at_a.as_array().cloned().unwrap_or_default());
+            keep(vb, b_keep);
+        }
+        (false, true) => {
+            let a_surplus = only_keys_in_first(&at_a, &at_b);
+            let a_keep = only_keys_in_first(&at_a, &Value::Array(a_surplus));
+            keep(va, a_keep);
+            keep(vb, at_b.as_array().cloned().unwrap_or_default());
+        }
+        _ => {
+            drop_at_or_below(va, cut);
+            drop_at_or_below(vb, cut);
+        }
+    }
+}
+
 fn min_height(v: &Value) -> Option<u64> {
     v.as_array()?.iter().filter_map(row_height).min()
 }
@@ -227,29 +281,6 @@ fn min_height(v: &Value) -> Option<u64> {
 /// `REPLICA_TIP_MARGIN`.
 fn replica_clamp(tip_a: u64, tip_b: u64) -> u64 {
     tip_a.min(tip_b).saturating_sub(REPLICA_TIP_MARGIN)
-}
-
-/// Drops the rows above `clamp` on both sides. When that drops any, a side that held its
-/// full limit (`full_a`, `full_b`) covers only the heights from its lowest row up, so both
-/// sides are cut at the higher of those heights. The lowest rows are taken before the drop:
-/// a side can lose every row (5E: a frozen `serve` replica ~120 heights behind, whose
-/// newest-first page of the other side lay wholly above the clamp), and its page still
-/// bounds what it covers. Returns how many rows were dropped.
-fn clamp_lists(va: &mut Value, vb: &mut Value, clamp: u64, full_a: bool, full_b: bool) -> usize {
-    let n = len_of(va) + len_of(vb);
-    let (low_a, low_b) = (min_height(va), min_height(vb));
-    if drop_above(va, clamp) + drop_above(vb, clamp) == 0 {
-        return 0;
-    }
-    let cut = [(full_a, low_a), (full_b, low_b)]
-        .into_iter()
-        .filter_map(|(f, h)| if f { h } else { None })
-        .max();
-    if let Some(cut) = cut {
-        drop_at_or_below(va, cut);
-        drop_at_or_below(vb, cut);
-    }
-    n - (len_of(va) + len_of(vb))
 }
 
 /// Replica pair `/stats`: the supply grows with every height, so two copies at tips
@@ -400,6 +431,19 @@ fn coins_tip_lag(a: &Value, b: &Value, a_tip: u64, b_tip: u64) -> Option<DiffEnt
     })
 }
 
+/// A side's whole answer for the diff log: the first page's body, or the pages' rows merged
+/// when it was paged (the diff paths index into the merged rows).
+fn paged_body(p: &Paged) -> String {
+    match p.pages.as_slice() {
+        [one] => trim_body(&one.body),
+        _ if p.items.is_array() => trim_body(p.items.to_string().as_bytes()),
+        pages => pages
+            .first()
+            .map(|c| trim_body(&c.body))
+            .unwrap_or_default(),
+    }
+}
+
 /// What [`Ctx::search_oracle_rows`] moved out of a `/txs/search` compare.
 #[derive(Debug, Default)]
 struct SearchRows {
@@ -543,6 +587,22 @@ impl Outcome {
 
 impl Ctx {
     pub async fn new(cfg: CompareConfig) -> anyhow::Result<Ctx> {
+        // R-P5P9-66 concern 4, R-P5P9-67 m-2: H7's header-by-hash reads (1 r/s, their own
+        // client) and the node client (`node_max_rps` − 1) stay within `node_max_rps` only
+        // from 2 up; with an oracle target (header reads on) a lower one is refused, here so
+        // that `referee --rps 1` is refused too. 0 (no limit) is refused as well: it keeps
+        // no bound on the node.
+        let oracle = cfg
+            .targets
+            .values()
+            .any(|t| t.kind == crate::config::TargetKind::GraphqlOracle);
+        if oracle && cfg.node_max_rps < 2 {
+            anyhow::bail!(
+                "node_max_rps {} is below 2: with a GraphQL oracle target, H7's header reads \
+                 (1 r/s) and the node client must share at least 2 reads a second",
+                cfg.node_max_rps
+            );
+        }
         let node = cfg.node_client()?;
         let targets = Target::all(&cfg)?
             .into_iter()
@@ -760,13 +820,15 @@ impl Ctx {
             b_target: b_name.to_string(),
             a_status: first.map(|c| c.status),
             b_status,
-            a_body_trimmed: first.map(|c| trim_body(&c.body)).unwrap_or_default(),
+            a_body_trimmed: a_cap.map(paged_body).unwrap_or_default(),
             b_body_trimmed: trim_body(b_body.as_bytes()),
             diff,
             class: class.to_string(),
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
             curl: format!("curl -s {} ; {}", sh_url("A", &req.path_and_query), b_curl),
             note,
+            body_cap: None,
+            a_pages: None,
         }
     }
 
@@ -780,7 +842,17 @@ impl Ctx {
     ) -> Outcome {
         let pa = self.fetch_a(req, ta).await;
         let pb = self.fetch_a(req, tb).await;
-        let (pa, pb) = match (pa, pb) {
+        // R-P5P9-52 concern 5, R-P5P9-66: a /v1/txs answer over the body cap on either side
+        // is compared by a streamed hash of the normalized rows, never cut or set aside.
+        let over = |p: &anyhow::Result<Paged>| {
+            p.as_ref()
+                .err()
+                .is_some_and(|e| e.is::<crate::target::BodyOverCap>())
+        };
+        if req.route == RouteKind::V1Txs && (over(&pa) || over(&pb)) {
+            return self.v1txs_streamed(req, ta, tb, pa, pb, extra).await;
+        }
+        let (mut pa, mut pb) = match (pa, pb) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) => return self.a_error(req, ta, &tb.name, None, &format!("{e:#}")),
             (Ok(a), Err(e)) => {
@@ -814,7 +886,31 @@ impl Ctx {
                 String::new(),
             );
         }
-        let (mut va, mut vb) = (pa.items.clone(), pb.items.clone());
+        // R-P5P9-70 (m-2): a large in-memory /v1/txs answer waits for the process-wide permit,
+        // held to the end of this compare.
+        let bytes = |p: &Paged| p.pages.iter().map(|c| c.body.len()).sum::<usize>();
+        let _large = if req.route == RouteKind::V1Txs
+            && (bytes(&pa) > V1TXS_LARGE_BYTES || bytes(&pb) > V1TXS_LARGE_BYTES)
+        {
+            Some(
+                V1TXS_LARGE
+                    .acquire()
+                    .await
+                    .expect("V1TXS_LARGE is never closed"),
+            )
+        } else {
+            None
+        };
+        // A one-page answer's rows are moved, not copied (R-P5P9-70 m-2): its record shows
+        // the page body. Merged pages keep their rows for the record.
+        let rows = |p: &mut Paged| {
+            if p.pages.len() == 1 {
+                std::mem::take(&mut p.items)
+            } else {
+                p.items.clone()
+            }
+        };
+        let (mut va, mut vb) = (rows(&mut pa), rows(&mut pb));
         let page_cut = req.route.paginated()
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         // chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain:
@@ -895,23 +991,71 @@ impl Ctx {
             } else {
                 query_limit(&req.path_and_query)
             };
-            let full = |n: usize, t: bool| t || limit.is_none_or(|l| n >= l);
-            let fa = full(len_of(&va), pa.truncated || page_cut);
-            let fb = full(len_of(&vb), pb.truncated || page_cut);
-            lag_rows = clamp_lists(&mut va, &mut vb, clamp, fa, fb);
+            // R-P5P9-72 (2): only a known limit (or a cut page) makes a side partial at its
+            // lowest height; an unknown limit (`/txs/events`) is not full.
+            let full = |n: usize, t: bool| t || limit.is_some_and(|l| n >= l);
+            let (na, nb) = (len_of(&va), len_of(&vb));
+            let fa = full(na, pa.truncated || page_cut);
+            let fb = full(nb, pb.truncated || page_cut);
+            // R-P5P9-71 (1): the window is for rows the oracle has not filled yet, which are
+            // rows it lacks. A row only the oracle lists there is no lag: it stays in the
+            // compare unless it is near A's tip or the node shows its block is an orphan.
+            // R-P5P9-72 (1): when ours held a known limit (or was cut at a page), an
+            // oracle-only row at or below ours' lowest height is ours' limit, not evidence.
+            let (min_a0, min_b0) = (min_height(&va), min_height(&vb));
+            // R-P5P9-73 I-1: on a paged route the page cut already removed the partial height,
+            // and `na >= limit` counts merged pages, so neither marks ours' limit edge. The
+            // floor and the cut before the drop are for the single-page route only.
+            let single = !req.route.paginated();
+            let floor = min_a0.filter(|_| single && fa);
+            let kept_b = if replica {
+                Vec::new()
+            } else {
+                self.lag_window_oracle_only(&va, &mut vb, clamp, floor)
+                    .await
+            };
+            let dropped = drop_above(&mut va, clamp) + drop_above(&mut vb, clamp);
+            if dropped > 0 {
+                // R-P5P9-72 (1): the lowest heights before the window dropped rows, so a full
+                // side whose page lies wholly in the window still cuts the other side's rows
+                // below it.
+                let (min_a, min_b) = if single {
+                    (min_a0, min_b0)
+                } else {
+                    (min_height(&va), min_height(&vb))
+                };
+                let cut = [(fa, min_a), (fb, min_b)]
+                    .into_iter()
+                    .filter_map(|(f, h)| if f { h } else { None })
+                    .max();
+                if let Some(cut) = cut {
+                    cut_at_limit(
+                        &mut va,
+                        &mut vb,
+                        cut,
+                        fa && min_a == Some(cut),
+                        fb && min_b == Some(cut),
+                    );
+                }
+                lag_rows = (na + nb) - (len_of(&va) + len_of(&vb) + kept_b.len());
+            }
+            if let Value::Array(xb) = &mut vb {
+                xb.extend(kept_b);
+            }
         }
         // kda-txs can stop one row short of the limit (seen live: limit 250, 250 rows on A,
-        // 249 on kda-txs, A's extra row the oldest). When one side holds `limit` rows and the
-        // counts differ, both sides keep the rows above the higher of the two lowest heights.
+        // 249 on kda-txs, A's extra row the oldest). R-P5P9-70 (m-4): only when ours holds
+        // `limit` rows and kda-txs exactly one fewer (`nb + 1 == na == limit`), both sides are
+        // cut at the higher of the two lowest heights ([`cut_at_limit`]).
         let mut limit_edge = 0usize;
         if req.route == RouteKind::V1Txs && sa == 200 && sb == 200 {
             if let Ok(l) = crate::via_cwd::parse(&req.path_and_query).limit {
                 let (na, nb) = (len_of(&va), len_of(&vb));
-                if na != nb && na.max(nb) as u64 == l {
-                    let cut = min_height(&va).max(min_height(&vb));
-                    if let Some(cut) = cut {
-                        drop_at_or_below(&mut va, cut);
-                        drop_at_or_below(&mut vb, cut);
+                if nb + 1 == na && na as u64 == l {
+                    if let (Some(x), Some(y)) = (min_height(&va), min_height(&vb)) {
+                        // Both sides stop at a limit (kda-txs one short of it): at the cut, a
+                        // row the limiting side has and the other lacks stays a diff.
+                        cut_at_limit(&mut va, &mut vb, x.max(y), x >= y, y >= x);
                         limit_edge = (na + nb) - (len_of(&va) + len_of(&vb));
                     }
                 }
@@ -1142,8 +1286,8 @@ impl Ctx {
             let (mut ca, mut cb) = (va.clone(), vb.clone());
             if full_a0 && full_b0 {
                 if let (Some(x), Some(y)) = (min_height(&ca), min_height(&cb)) {
-                    drop_at_or_below(&mut ca, x.max(y));
-                    drop_at_or_below(&mut cb, x.max(y));
+                    // R-P5P9-71 (1): at the cut, only the complete side's surplus goes.
+                    cut_at_limit(&mut ca, &mut cb, x.max(y), x >= y, y >= x);
                 }
             }
             // Rows match by (requestKey, blockHash, idx): value diffs of a shared row (F1, F2,
@@ -1313,7 +1457,25 @@ impl Ctx {
                     }
                 }
             }
+            // chainweb-data orders `search=` rows by height only and leaves the rows of one
+            // height to Postgres (R3E-8): those compare as a set; across heights the order
+            // counts, and a row listed twice changes the set.
+            let differed = va != vb;
+            let mut reordered = false;
+            for v in [&mut va, &mut vb] {
+                if let Value::Array(x) = v {
+                    reordered |= crate::normalize::height_ties_as_set(x);
+                }
+            }
             let mut d = diff_route(&req.route, &va, &vb);
+            if differed && reordered {
+                d.push(DiffEntry {
+                    path: SEARCH_TIE_ORDER_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: None,
+                    b: None,
+                });
+            }
             if dropped > 0 {
                 d.push(DiffEntry {
                     path: SEARCH_CONT_HISTORY_PATH.into(),
@@ -1482,7 +1644,7 @@ impl Ctx {
             );
         }
         let curl_b = format!("curl -s {}", sh_url("B", &req.path_and_query));
-        let b_body = trim_body(&pb.pages[0].body);
+        let b_body = paged_body(&pb);
         let mut o = self.finish(
             req,
             ta,
@@ -1500,6 +1662,193 @@ impl Ctx {
             o.class = "skew".into();
         }
         o
+    }
+
+    /// A `/v1/txs` compare where a side's answer is over the body cap (R-P5P9-52 concern 5,
+    /// R-P5P9-66; the 250-row page over 8 MB of run 6E): both sides are hashed row by row
+    /// ([`crate::streamed`]). Equal row sets pass; anything else is a diff with
+    /// `/~v1txs-streamed-hash`, and the first differing row, when a bounded second read finds
+    /// it, under `/~v1txs-streamed-row/<request key>`. No row rule of [`Ctx::vs_target`]
+    /// applies. Transport failures stay a-error or b-error.
+    async fn v1txs_streamed(
+        &self,
+        req: &Request,
+        ta: &Target,
+        tb: &Target,
+        pa: anyhow::Result<Paged>,
+        pb: anyhow::Result<Paged>,
+        extra: Option<DiffEntry>,
+    ) -> Outcome {
+        use crate::streamed::{self as st, HASH_PATH, ROW_PATH};
+        let f64 = tb.kind == crate::config::TargetKind::KdaTxs;
+        let (a, a_mem) = match self.streamed_side(req, ta, pa, f64).await {
+            Ok(x) => x,
+            Err(e) => return self.a_error(req, ta, &tb.name, None, &e),
+        };
+        let (b, b_mem) = match self.streamed_side(req, tb, pb, f64).await {
+            Ok(x) => x,
+            Err(e) => return self.b_error(req, ta, &tb.name, None, &e, String::new()),
+        };
+        let pa = Paged {
+            pages: vec![HttpCapture {
+                status: a.status,
+                headers: a.headers.clone(),
+                body: bytes::Bytes::new(),
+                ms: a.ms,
+            }],
+            items: Value::Null,
+            truncated: false,
+            boundary_dups: 0,
+        };
+        if a.status >= 500 {
+            return self.a_error(req, ta, &tb.name, Some(&pa), "5xx");
+        }
+        if tb.kind == crate::config::TargetKind::KdaTxs
+            && b.status == 404
+            && b.ms >= KDA_TXS_LIMIT_MS
+        {
+            return self.b_error(
+                req,
+                ta,
+                &tb.name,
+                Some(&pa),
+                "kda-txs answered 404 at its 30 s query limit",
+                String::new(),
+            );
+        }
+        let mut d = Vec::new();
+        let mut found = String::new();
+        if !st::equal(&a, &b) {
+            if a.status != b.status {
+                d.push(DiffEntry {
+                    path: "/@status".into(),
+                    kind: DiffKind::Changed,
+                    a: Some(json!(a.status)),
+                    b: Some(json!(b.status)),
+                });
+            }
+            d.push(DiffEntry {
+                path: HASH_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(a.summary()),
+                b: Some(b.summary()),
+            });
+            if let Some(k) = st::first_differing(&a, &b) {
+                let ra = self.streamed_row(req, ta, a_mem.as_ref(), &k, f64).await;
+                let rb = self.streamed_row(req, tb, b_mem.as_ref(), &k, f64).await;
+                found = format!(
+                    "; first differing row {k}: the second read found it on {}",
+                    match (&ra, &rb) {
+                        (Some(_), Some(_)) => "both sides",
+                        (Some(_), None) => "A only",
+                        (None, Some(_)) => "B only",
+                        (None, None) => "neither side",
+                    }
+                );
+                let kind = match (&ra, &rb) {
+                    (Some(_), None) => DiffKind::Extra,
+                    (None, Some(_)) => DiffKind::Missing,
+                    _ => DiffKind::Changed,
+                };
+                d.push(DiffEntry {
+                    path: format!("{ROW_PATH}/{k}"),
+                    kind,
+                    a: ra,
+                    b: rb,
+                });
+            }
+        }
+        d.extend(extra);
+        let note = format!(
+            "streamed /v1/txs compare (an answer over the {}-byte body cap): A {} bytes, {} rows; \
+             B {} bytes, {} rows{found}",
+            ta.body_cap(&req.path_and_query),
+            a.bytes,
+            a.rows.len(),
+            b.bytes,
+            b.rows.len()
+        );
+        tracing::info!(request = %req.path_and_query, equal = d.is_empty(), "{note}");
+        let curl_b = format!("curl -s {}", sh_url("B", &req.path_and_query));
+        self.finish(
+            req,
+            ta,
+            &tb.name,
+            &pa,
+            Some(b.status),
+            String::new(),
+            d,
+            false,
+            curl_b,
+            Some(note),
+        )
+    }
+
+    /// One side of [`Ctx::v1txs_streamed`]: an answer read in memory is hashed there (a
+    /// composed answer over the cap carries its capture); an answer over the cap is read
+    /// again as a stream. The capture, when in memory, serves the second read.
+    async fn streamed_side(
+        &self,
+        req: &Request,
+        t: &Target,
+        prior: anyhow::Result<Paged>,
+        f64: bool,
+    ) -> Result<(crate::streamed::Side, Option<HttpCapture>), String> {
+        use crate::streamed::{hash_capture, Hasher, STREAM_CAP};
+        let mem = match prior {
+            Ok(p) => p.pages.into_iter().next(),
+            Err(e) => match e.downcast::<crate::target::BodyOverCap>() {
+                Ok(o) => o.capture,
+                Err(e) => return Err(format!("{e:#}")),
+            },
+        };
+        if let Some(c) = mem {
+            return Ok((hash_capture(&c, f64), Some(c)));
+        }
+        let mut h = Hasher::new(200, f64);
+        let meta = t
+            .get_chunks(&req.path_and_query, STREAM_CAP + 1, &mut |c| h.feed(c))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        self.count_request(req.route.as_str(), &t.name, 1);
+        // The hasher is made before the status is known: a status other than 200 is a fault
+        // of its own.
+        let mut side = h.finish(meta.headers, meta.ms);
+        if meta.status != 200 {
+            side.fault = Some(format!("HTTP {}", meta.status));
+            side.rows.clear();
+        }
+        side.status = meta.status;
+        Ok((side, None))
+    }
+
+    /// The bounded second read of [`Ctx::v1txs_streamed`]: the first row with request key
+    /// `key` (at most [`crate::streamed::SHOWN_ROW_CAP`] bytes), from the capture in memory
+    /// or one more streamed read that stops at the row.
+    async fn streamed_row(
+        &self,
+        req: &Request,
+        t: &Target,
+        mem: Option<&HttpCapture>,
+        key: &str,
+        f64: bool,
+    ) -> Option<Value> {
+        let mut f = crate::streamed::Finder::new(key, f64);
+        match mem {
+            Some(c) => {
+                f.feed(&c.body);
+            }
+            None => {
+                let r = t
+                    .get_chunks(&req.path_and_query, crate::streamed::STREAM_CAP, &mut |c| {
+                        f.feed(c)
+                    })
+                    .await;
+                self.count_request(req.route.as_str(), &t.name, 1);
+                r.ok()?;
+            }
+        }
+        f.found
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2293,7 +2642,8 @@ impl Ctx {
     /// The node's canonical block hash at `(c, h)` (`header/branch` up to the cut, never the
     /// plain header range, which also returns orphans), from `cache`, from the cache shared by
     /// all compares, or one lookup while fewer than ORPHAN_CHECKS were made; `None` when the
-    /// budget is spent. The node client applies `node_max_rps`.
+    /// budget (or the referee's run cap, R-P5P9-64 M-8) is spent. The node client applies
+    /// its share of `node_max_rps`.
     async fn canon_cached(
         &self,
         cache: &mut HashMap<(u8, u64), Option<String>>,
@@ -2309,7 +2659,8 @@ impl Ctx {
             cache.insert((c, h), Some(v.clone()));
             return Some(Some(v));
         }
-        if *checks >= ORPHAN_CHECKS {
+        // R-P5P9-64 M-8: the referee's run cap counts this read too (unbounded in a live run).
+        if *checks >= ORPHAN_CHECKS || !self.gql.take_node_read() {
             return None;
         }
         *checks += 1;
@@ -2508,6 +2859,67 @@ impl Ctx {
             }
         }
         ok
+    }
+
+    /// R-P5P9-71 (1), the oracle-lag window (R3E-11) narrowed: rows above `clamp` that only
+    /// the oracle (`vb`) lists, by (requestKey, blockHash, idx), are taken out of `vb` and
+    /// returned to stay in the compare. Lag explains rows the oracle lacks, not rows it has
+    /// and A lacks. Left in `vb` (to be dropped with the window) are only rows within
+    /// `REPLICA_TIP_MARGIN` of A's tip (the oracle may be read after a new block) and rows
+    /// whose block the node shows is not canonical (an orphan the oracle keeps). A row the
+    /// node cannot settle (no header, the read budget spent) stays in the compare.
+    /// R-P5P9-72 (1): `floor`, ours' lowest height when ours held a known limit (or was cut
+    /// at a page): rows at or below it are ours' limit, not evidence, and stay in `vb`.
+    async fn lag_window_oracle_only(
+        &self,
+        va: &Value,
+        vb: &mut Value,
+        clamp: u64,
+        floor: Option<u64>,
+    ) -> Vec<Value> {
+        let near_tip = self.tips.a_tip().saturating_sub(REPLICA_TIP_MARGIN);
+        let low = clamp.max(floor.unwrap_or(0));
+        let window = |v: &Value| -> Value {
+            Value::Array(
+                v.as_array()
+                    .map(|x| {
+                        x.iter()
+                            .filter(|r| row_height(r).is_some_and(|h| h > low && h <= near_tip))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        };
+        let only_b = only_keys_in_first(&window(vb), va);
+        let mut cache = HashMap::new();
+        let mut checks = 0usize;
+        let mut kept = Vec::new();
+        for r in only_b {
+            let orphan = match (
+                row_chain(&r),
+                row_height(&r),
+                r.get("blockHash").and_then(Value::as_str),
+            ) {
+                (Some(c), Some(h), Some(bh)) => self
+                    .canon_cached(&mut cache, &mut checks, c, h)
+                    .await
+                    .flatten()
+                    .is_some_and(|ch| ch != bh),
+                _ => false,
+            };
+            if !orphan {
+                kept.push(r);
+            }
+        }
+        if let Value::Array(xb) = vb {
+            for r in &kept {
+                if let Some(i) = xb.iter().position(|x| x == r) {
+                    xb.remove(i);
+                }
+            }
+        }
+        kept
     }
 
     /// Splits oracle rows into (orphans, canonical): a row is canonical when the node's
@@ -3449,34 +3861,6 @@ mod tests {
             .iter()
             .filter_map(row_height)
             .collect()
-    }
-
-    /// 5E: a frozen `serve` replica (tip 100) beside a tailing one (tip 130), `/v1/txs`
-    /// limit 5. A's newest-first page lies wholly above the clamp (95), B's reaches below.
-    /// Both sides held their limit, so nothing below A's page is comparable: both end empty
-    /// (before the fix, B kept 90 and 88 and the pair reported them as missing on A).
-    #[test]
-    fn list_clamp_keeps_a_page_bound_when_a_side_loses_every_row() {
-        let clamp = replica_clamp(130, 100);
-        assert_eq!(clamp, 95);
-        let (mut a, mut b) = (
-            rows(&[130, 128, 126, 100, 98]),
-            rows(&[100, 98, 90, 88, 86]),
-        );
-        assert_eq!(clamp_lists(&mut a, &mut b, clamp, true, true), 10);
-        assert!(heights(&a).is_empty() && heights(&b).is_empty(), "{a} {b}");
-        // A's page reaches below the clamp: the overlap under it is compared.
-        let (mut a, mut b) = (rows(&[130, 100, 94, 90, 88]), rows(&[100, 94, 90, 88, 86]));
-        assert_eq!(clamp_lists(&mut a, &mut b, clamp, true, true), 6);
-        assert_eq!((heights(&a), heights(&b)), (vec![94, 90], vec![94, 90]));
-        // A side short of its limit covers every height: no cut from it.
-        let (mut a, mut b) = (rows(&[130, 128]), rows(&[100, 90, 88]));
-        assert_eq!(clamp_lists(&mut a, &mut b, clamp, false, false), 3);
-        assert_eq!((heights(&a), heights(&b)), (vec![], vec![90, 88]));
-        // Nothing above the clamp: untouched.
-        let (mut a, mut b) = (rows(&[90, 88]), rows(&[90, 88]));
-        assert_eq!(clamp_lists(&mut a, &mut b, clamp, true, true), 0);
-        assert_eq!(heights(&a), vec![90, 88]);
     }
 
     /// 5E: the replica `/stats` supply tolerance follows the real tip gap, in the gap's

@@ -10,6 +10,21 @@
 //! cannot finish (no parent identity in the answer, a selection it cannot re-issue, an error,
 //! more than [`MAX_PAGES`] pages, or a first page that is not a part of that side's own full
 //! list) is left as it was, so its difference stays a diff.
+//!
+//! R-P5P9-61 H6 (ruling (3)): every cut list of a compare is tried (no per-compare list cap)
+//! within `[graphql] list_page_budget` pages per side; a list the budget leaves unread stays a
+//! diff marked [`HARNESS_LIMIT_PATH`]. Each read also selects the row's key under
+//! [`KEY_ALIAS`] (`hash`, or `requestKey orderIndex`), and a key seen twice on one side leaves
+//! the list unfinished, so a paging repeat is not taken for a row of equal value.
+//!
+//! R-P5P9-64 (I-5, M-5): a list read that fails on a cursor page (the oracle's `Block.events`
+//! cursor fails past its first page) is retried once in one page of `first` = that side's
+//! `totalCount`, at most [`MAX_PAGES`] × [`PAGE_SIZE`] rows, with the same key checks. A
+//! cut list still not finished leaves an entry no allowlist entry matches, so the record
+//! stays unexplained and says why: [`MAX_PAGES_PATH`] past [`MAX_PAGES`] pages,
+//! [`UNFINISHED_PATH`] for any other reason (a read that failed, a key twice, a selection
+//! that cannot be re-issued, a page that is not a part of its side's full list). Equal cut
+//! pages are not a match without the full lists.
 
 use serde_json::{json, Map, Value};
 
@@ -19,8 +34,32 @@ pub const SCOPED_FINISHED_PATH: &str = "/~graphql-r60-scoped-list-finished";
 pub const MAX_PAGES: usize = 20;
 /// Page size of the harness's own list reads.
 pub const PAGE_SIZE: u32 = 50;
-/// Cut lists finished per compare at most; the rest stay as they are.
-pub const MAX_LISTS: usize = 4;
+/// Diff entry of a cut list the harness did not read to its end within its page budget
+/// (R-P5P9-61 H6): no allowlist entry, so the record stays a diff, marked as a harness limit.
+pub const HARNESS_LIMIT_PATH: &str = "/~harness-limit/graphql-scoped-list-budget";
+/// Diff entry of a cut list past [`MAX_PAGES`] pages (R-P5P9-64 M-5): a harness limit, no
+/// allowlist entry.
+pub const MAX_PAGES_PATH: &str = "/~harness-limit/graphql-scoped-list-max-pages";
+/// Diff entry of a cut list H6 could not finish for any other reason, per side and list with
+/// the reason (R-P5P9-64 I-5): no allowlist entry, so the record stays unexplained.
+pub const UNFINISHED_PATH: &str = "/~graphql-h6-unfinished";
+/// Response key of the row key in the harness's list reads.
+pub const KEY_ALIAS: &str = "kdxKey";
+
+/// Whether a diff entry is H6's: a harness limit or an unfinished list. The referee carries
+/// these from the stored record (R-P5P9-64 M-1), since H6 needs both servers.
+pub fn is_h6_entry(path: &str) -> bool {
+    path.starts_with("/~harness-limit/") || path == UNFINISHED_PATH
+}
+
+/// A list query of [`list_query`] reissued as one page of `first` rows (I-5's retry).
+pub fn one_page(query: &str, first: u64) -> String {
+    query.replacen(
+        &format!("(first: {PAGE_SIZE}, after: $after)"),
+        &format!("(first: {first}, after: $after)"),
+        1,
+    )
+}
 
 const BLOCK_PARENTS: &[&str] = &["block", "blocksFromHeight", "blocksFromDepth"];
 const BLOCK_LISTS: &[&str] = &["transactions", "events"];
@@ -444,8 +483,15 @@ pub fn list_query(doc: &str, list: &ScopedList) -> Option<(String, Value, &'stat
         return None;
     }
     let sel = &doc[t[no].1..t[nc].2];
+    // R-P5P9-61 H6: each row's key under an alias of its own, so a row the paging returns
+    // twice shows even when the document selects no key (BlocksByHeight: `gasPrice` only).
+    let key = if field == "transactions" {
+        "hash"
+    } else {
+        "requestKey orderIndex"
+    };
     let conn = format!(
-        "c: {field}(first: {PAGE_SIZE}, after: $after) {{ pageInfo {{ hasNextPage endCursor }} edges {{ node {sel} }} }}"
+        "c: {field}(first: {PAGE_SIZE}, after: $after) {{ pageInfo {{ hasNextPage endCursor }} edges {{ node {sel} {KEY_ALIAS}: node {{ {key} }} }} }}"
     );
     Some(match parent {
         Parent::Block(h) => (
@@ -706,12 +752,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             q,
-            "query($p: String!, $after: String) { block(hash: $p) { c: transactions(first: 50, after: $after) { pageInfo { hasNextPage endCursor } edges { node { id hash } } } } }"
+            "query($p: String!, $after: String) { block(hash: $p) { c: transactions(first: 50, after: $after) { pageInfo { hasNextPage endCursor } edges { node { id hash } kdxKey: node { hash } } } } }"
         );
         assert_eq!((v, at), (json!({"p": "B"}), "/data/block/c"));
         let (q, _, _) =
             list_query(QBLOCK, &l(&["block", "events"], Parent::Block("B".into()))).unwrap();
-        assert!(q.contains("c: events(first: 50, after: $after) { pageInfo { hasNextPage endCursor } edges { node { id name qualifiedName orderIndex } } }"), "{q}");
+        assert!(q.contains("c: events(first: 50, after: $after) { pageInfo { hasNextPage endCursor } edges { node { id name qualifiedName orderIndex } kdxKey: node { requestKey orderIndex } } }"), "{q}");
         // Through an inline fragment; a `$first` page argument is the harness's own.
         let (q, v, at) = list_query(
             BY_KEY,
@@ -722,7 +768,12 @@ mod tests {
         )
         .unwrap();
         assert!(q.contains("transaction(requestKey: $p) { result { ... on TransactionResult { c: transfers(first: 50, after: $after)"), "{q}");
-        assert!(q.ends_with("edges { node { id amount } } } } } } }"), "{q}");
+        assert!(
+            q.ends_with(
+                "edges { node { id amount } kdxKey: node { requestKey orderIndex } } } } } } }"
+            ),
+            "{q}"
+        );
         assert_eq!((v, at), (json!({"p": "R"}), "/data/transaction/result/c"));
         // Not re-issued: an unknown field, another argument, a variable in the selection, a
         // named fragment, no parent identity.

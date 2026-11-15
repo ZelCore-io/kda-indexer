@@ -224,6 +224,15 @@ fn events_key(v: &Value) -> SortKey {
     vec![field(v, "height")]
 }
 
+/// `/txs/search` rows within one height as a set (fv-checklist T-item, R3E-8): rows of one
+/// height (adjacent, `height desc`) are ordered by their canonical text; rows across heights
+/// keep their order. Returns whether the order changed.
+pub fn height_ties_as_set(items: &mut [Value]) -> bool {
+    let before = items.to_vec();
+    tie_groups(items, account_key);
+    items != before.as_slice()
+}
+
 fn tie_groups(items: &mut [Value], key: fn(&Value) -> SortKey) {
     let mut start = 0;
     while start < items.len() {
