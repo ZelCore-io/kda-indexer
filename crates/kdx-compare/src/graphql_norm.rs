@@ -593,6 +593,101 @@ pub fn one_block_skew(ours: f64, node: &str, reward: i128) -> bool {
         .is_ok_and(|x| x == ours)
 }
 
+/// R-P5P9-75 S: the node's balance `node` less `net` (both in fixed point of 12 places),
+/// computed exactly, must be our `Float` exactly once rounded to f64.
+pub fn skew_net_holds(ours: f64, node: &str, net: i128) -> bool {
+    let Some(before) = fixed12(node).and_then(|n| n.checked_sub(net)) else {
+        return false;
+    };
+    if before < 0 {
+        return false;
+    }
+    let unit = 1_000_000_000_000i128;
+    format!("{}.{:012}", before / unit, before % unit)
+        .parse::<f64>()
+        .is_ok_and(|x| x == ours)
+}
+
+/// A fixed-point amount of 12 places as decimal text (for evidence).
+pub fn fixed12_text(x: i128) -> String {
+    let unit = 1_000_000_000_000i128;
+    let (sign, a) = if x < 0 { ("-", -x) } else { ("", x) };
+    let frac = format!("{:012}", a % unit);
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() {
+        format!("{sign}{}", a / unit)
+    } else {
+        format!("{sign}{}.{frac}", a / unit)
+    }
+}
+
+/// An exact Pact amount in fixed point of 12 places: a JSON number by its text,
+/// `{"decimal": text}` or `{"int": n}`; `None` for anything else (an exponent, a negative).
+fn pact_fixed12(v: &Value) -> Option<i128> {
+    let t = |x: &Value| match x {
+        Value::String(s) => fixed12(s),
+        Value::Number(n) => fixed12(&n.to_string()),
+        _ => None,
+    };
+    match v {
+        Value::Number(_) => t(v),
+        Value::Object(m) => m.get("decimal").or_else(|| m.get("int")).and_then(t),
+        _ => None,
+    }
+}
+
+/// R-P5P9-75 S: the exact net (fixed point of 12 places) of the `coin.TRANSFER` events that
+/// touch `account` in a node payload with outputs: the coinbase's events and every
+/// transaction output's (gas fees included), received less sent. Other modules' TRANSFER
+/// events do not move the coin balance and are left out. A coinbase or output that does not
+/// decode, or a TRANSFER touching the account whose amount is not exact, is an error: the
+/// net is then unknown.
+pub fn transfer_net(payload: &Value, account: &str) -> Result<i128, String> {
+    let decode = |t: Option<&Value>, what: &str| -> Result<Value, String> {
+        t.and_then(Value::as_str)
+            .and_then(|x| kdx_types::hash::b64url_decode(x).ok())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .ok_or_else(|| format!("{what} that does not decode"))
+    };
+    let mut outs = vec![decode(payload.get("coinbase"), "a coinbase")?];
+    for t in payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("the payload holds no transaction list")?
+    {
+        outs.push(decode(t.get(1), "a transaction output")?);
+    }
+    let mut net: i128 = 0;
+    for e in outs.iter().flat_map(|o| {
+        o.get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+    }) {
+        let coin = e.get("name").and_then(Value::as_str) == Some("TRANSFER")
+            && e.pointer("/module/name").and_then(Value::as_str) == Some("coin")
+            && e.pointer("/module/namespace").is_none_or(Value::is_null);
+        let param = |i: usize| e.pointer(&format!("/params/{i}"));
+        let (from, to) = (
+            param(0).and_then(Value::as_str),
+            param(1).and_then(Value::as_str),
+        );
+        if !coin || (from != Some(account) && to != Some(account)) {
+            continue;
+        }
+        let amount = param(2).and_then(pact_fixed12).ok_or_else(|| {
+            format!("a TRANSFER touching the account whose amount is not exact: {e}")
+        })?;
+        if to == Some(account) {
+            net += amount;
+        }
+        if from == Some(account) {
+            net -= amount;
+        }
+    }
+    Ok(net)
+}
+
 /// Whether a node payload with outputs (`payload/<hash>/outputs`) carries a successful
 /// coinbase whose `coin.TRANSFER` pays `account`: its balance changed in that block.
 pub fn coinbase_pays(payload: &Value, account: &str) -> bool {
@@ -1035,6 +1130,49 @@ mod tests {
         ));
         assert!(one_block_skew(0.904046, "1.808092", r));
         assert!(!one_block_skew(0.0, "0.5", r));
+    }
+
+    /// R-P5P9-75 S: the net counts every coin TRANSFER touching the account in the coinbase
+    /// and the outputs (gas included) exactly; other modules' TRANSFERs are left out; an
+    /// amount that is not exact, or an output that does not decode, leaves the net unknown.
+    /// The balance check is exact to one unit (1e-12) where f64 holds it.
+    #[test]
+    fn d3_s_transfer_net_is_exact_and_counts_gas_and_coinbase() {
+        let enc = |v: Value| kdx_types::hash::b64url_encode(v.to_string().as_bytes());
+        let num = |t: &str| serde_json::from_str::<Value>(t).unwrap();
+        let x = |m: Value, from: &str, to: &str, a: Value| json!({"name": "TRANSFER", "module": m, "params": [from, to, a]});
+        let coin = || json!({"name": "coin", "namespace": null});
+        let out = |evs: Vec<Value>| enc(json!({"result": {"status": "success"}, "events": evs}));
+        let p = json!({
+            "coinbase": out(vec![x(coin(), "", "k:m", num("0.904046"))]),
+            "transactions": [
+                ["tx", out(vec![
+                    x(coin(), "k:m", "k:b", json!({"decimal": "1.5"})),
+                    x(json!({"name": "token", "namespace": "free"}), "k:m", "k:b", num("7.0")),
+                    x(coin(), "k:m", "k:miner2", num("0.0000123")),
+                ])],
+                ["tx", out(vec![x(coin(), "k:c", "k:m", json!({"int": 2}))])],
+            ]
+        });
+        // 0.904046 - 1.5 - 0.0000123 + 2 = 1.4040337
+        assert_eq!(transfer_net(&p, "k:m").unwrap(), 1_404_033_700_000);
+        assert_eq!(fixed12_text(transfer_net(&p, "k:m").unwrap()), "1.4040337");
+        assert_eq!(transfer_net(&p, "k:nobody").unwrap(), 0);
+        let bad = json!({"coinbase": out(vec![x(coin(), "", "k:m", num("1e-3"))]),
+            "transactions": []});
+        assert!(
+            transfer_net(&bad, "k:m").is_err(),
+            "an exponent is not exact"
+        );
+        let undecodable = json!({"coinbase": out(vec![]), "transactions": [["tx", "%%"]]});
+        assert!(transfer_net(&undecodable, "k:m").is_err());
+        assert!(skew_net_holds(10.0, "11.4040337", 1_404_033_700_000));
+        assert!(!skew_net_holds(10.0, "11.404033700001", 1_404_033_700_000));
+        assert!(
+            skew_net_holds(12.5, "11.0", -1_500_000_000_000),
+            "a negative net"
+        );
+        assert_eq!(fixed12_text(-1_500_000_000_000), "-1.5");
     }
 
     #[test]

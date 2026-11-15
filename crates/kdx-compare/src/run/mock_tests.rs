@@ -4976,7 +4976,9 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
     let cb = |to: &str| {
         let v = json!({"result": {"status": "success"}, "events": [{"name": "TRANSFER",
             "module": {"name": "coin", "namespace": null}, "params": ["", to, 0.9]}]});
-        json!({"coinbase": kdx_types::hash::b64url_encode(v.to_string().as_bytes())})
+        // S reads the whole payload: a block's transaction list too (empty here).
+        json!({"coinbase": kdx_types::hash::b64url_encode(v.to_string().as_bytes()),
+            "transactions": []})
     };
     let hd =
         |h: &str, p: &str, c: u8| json!({"hash": h, "payloadHash": p, "height": 100, "chainId": c});
@@ -5008,8 +5010,10 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
     let skew = |c: u8| {
         let ctx = &ctx;
         async move {
-            ctx.n2_skew(ta, c, 100, "k:miner", &mut Reads::default())
+            // R-P5P9-75 S replaced N2's coinbase-only check: the same cases hold under it.
+            ctx.s_skew(ta, c, 100, "k:miner", 10.0, "10.9", &mut Reads::default())
                 .await
+                .is_ok()
         }
     };
     assert!(skew(0).await, "the true skew");
@@ -6799,4 +6803,135 @@ async fn d3_n_a_single_block_cut_is_the_nodes_order_from_ours_cursor() {
     after.insert("after".into(), json!("someCursor"));
     let (d, note, ..) = d3_n_run(&ctx, &after, &ours, &oracle).await;
     diff(&d, &note, "a request after a cursor");
+}
+
+/// A node payload with outputs: a coinbase whose events are `cb`, and transactions whose
+/// outputs hold these events.
+fn d3_payload(cb: Value, txs: &[Value]) -> Value {
+    let enc = |v: Value| kdx_types::hash::b64url_encode(v.to_string().as_bytes());
+    let out = |ev: &Value| json!({"result": {"status": "success"}, "events": ev});
+    let t: Vec<Value> = txs
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| {
+            let w = json!({"hash": format!("rk{i}"), "sigs": [], "cmd": "{}"});
+            json!([enc(w), enc(out(ev))])
+        })
+        .collect();
+    json!({"transactions": t, "coinbase": enc(out(&cb))})
+}
+
+/// A `coin.TRANSFER` event; `amount` is the node's JSON number text.
+fn d3_xfer(from: &str, to: &str, amount: &str) -> Value {
+    json!({"name": "TRANSFER", "module": {"name": "coin", "namespace": null},
+        "params": [from, to, serde_json::from_str::<Value>(amount).unwrap()]})
+}
+
+/// Ours answering N2's tip read: chain `c`'s blocks from `h`, at most `first`, to its tip.
+async fn d3_ours_tips(tips: &'static [(u8, u64)]) -> String {
+    ours_fn_server(move |req: &Value| {
+        let v = &req["variables"];
+        let c = v["c"][0].as_str().unwrap_or("0").to_string();
+        let start = v["h"].as_u64().unwrap_or(0);
+        let first = v["first"].as_u64().unwrap_or(2);
+        let tip = tips
+            .iter()
+            .find(|(x, _)| x.to_string() == c)
+            .map_or(0, |(_, t)| *t);
+        let edges: Vec<Value> = (start..=tip)
+            .take(first as usize)
+            .map(|h| json!({"node": {"height": h, "chainId": c}}))
+            .collect();
+        json!({"data": {"blocksFromHeight": {"pageInfo": {"hasNextPage": tip >= start + first},
+            "edges": edges}}})
+    })
+    .await
+}
+
+/// R-P5P9-75 S: the NodeBalance skew is allowed when ours' tip is 1 or 2 blocks below
+/// `node_h`, with exactly one header per height on the cut branch, and the node's balance less
+/// ours is exactly the net of the coin TRANSFER events touching the account in the node's
+/// blocks above ours' tip (gas fees and coinbase included). CG-4 #77's shape (a miner one
+/// block behind) and two blocks behind with a fee-paying tx are explained; a net one unit off,
+/// three blocks behind, a fork at a skipped height and ours at `node_h` are diffs.
+#[tokio::test]
+async fn d3_s_node_balance_skew_is_the_event_net_of_one_or_two_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let hd = |c: u8, h: u64, x: &str| json!({"hash": x, "payloadHash": format!("p-{x}"), "height": h, "chainId": c});
+    let mut node = NodeMock::default();
+    let block = |node: &mut NodeMock, c: u8, h: u64, x: &str, p: Value| {
+        node.headers.entry((c, h)).or_default().push(hd(c, h, x));
+        node.payloads.insert(format!("p-{x}"), p);
+    };
+    let cb_miner = || d3_payload(json!([d3_xfer("", "k:miner", "0.904046")]), &[]);
+    let cb_other = |txs: &[Value]| d3_payload(json!([d3_xfer("", "k:m2", "0.904046")]), txs);
+    // Chain 0 (CG-4 #77): ours one block behind; the node's block 100 paid the miner.
+    block(&mut node, 0, 100, "a100", cb_miner());
+    // Chain 1: two behind; at 99 the account pays 1.5 and its gas (0.0000123 to the miner of
+    // that block), and a non-coin TRANSFER that does not move its coin balance; at 100 a
+    // transfer between others.
+    let paid = json!([
+        d3_xfer("k:miner", "k:bob", "1.5"),
+        {"name": "TRANSFER", "module": {"name": "token", "namespace": "free"},
+            "params": ["k:miner", "k:x", 7.0]},
+        d3_xfer("k:miner", "k:m2", "0.0000123")
+    ]);
+    block(&mut node, 1, 99, "b99", cb_other(&[paid]));
+    block(
+        &mut node,
+        1,
+        100,
+        "b100",
+        cb_other(&[json!([d3_xfer("k:carol", "k:dave", "3.0")])]),
+    );
+    // Chain 2: as chain 0; the balances are one unit (1e-12) off the net.
+    block(&mut node, 2, 100, "c100", cb_miner());
+    // Chain 3: three behind, every block paying the miner.
+    for h in 98..=100 {
+        block(&mut node, 3, h, &format!("d{h}"), cb_miner());
+    }
+    // Chain 4: two behind with a fork at 99 (the branch names x99); the net would hold.
+    block(&mut node, 4, 99, "x99", cb_other(&[]));
+    block(&mut node, 4, 99, "y99", cb_miner());
+    node.canon.insert((4, 99), "x99".into());
+    block(&mut node, 4, 100, "e100", cb_miner());
+    // Chain 5: ours already at node_h.
+    block(&mut node, 5, 100, "f100", cb_miner());
+    static TIPS: [(u8, u64); 6] = [(0, 99), (1, 98), (2, 99), (3, 97), (4, 98), (5, 100)];
+    let au = d3_ours_tips(&TIPS).await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let ta = &ctx.targets["a"];
+    let skew = |c: u8, ours: f64, node: &'static str| {
+        let ctx = &ctx;
+        async move {
+            ctx.s_skew(ta, c, 100, "k:miner", ours, node, &mut Reads::default())
+                .await
+        }
+    };
+    let ok = skew(0, 10.0, "10.904046").await;
+    assert!(ok.is_ok(), "CG-4 #77's shape: {ok:?}");
+    let ok = skew(1, 6.5000123, "5.0").await;
+    assert!(ok.is_ok(), "two behind with a fee-paying tx: {ok:?}");
+    assert!(
+        skew(1, 6.5, "5.0").await.is_err(),
+        "the gas fee is part of the net"
+    );
+    assert!(
+        skew(2, 10.0, "10.904046000001").await.is_err(),
+        "a net one unit off"
+    );
+    assert!(
+        skew(2, 10.000000000001, "10.904046").await.is_err(),
+        "a net one unit off, the other way"
+    );
+    assert!(
+        skew(3, 10.0, "12.712138").await.is_err(),
+        "three blocks behind"
+    );
+    let fork = skew(4, 10.0, "10.904046").await;
+    assert!(
+        fork.as_ref().is_err_and(|w| w.contains("header")),
+        "a fork at a skipped height: {fork:?}"
+    );
+    assert!(skew(5, 10.0, "10.904046").await.is_err(), "ours at node_h");
 }
