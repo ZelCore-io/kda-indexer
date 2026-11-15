@@ -5283,7 +5283,9 @@ rate_rps = 1000.0
 
 /// R-P5P9-70 (m-2): an in-memory `/v1/txs` compare with a side over 8 MiB waits for the
 /// process-wide permit: while another large compare holds it, this one does not finish; a
-/// small one does. Released, the large one finishes.
+/// small one does. Released, the large one finishes. R-P5P9-72 (5): the two positive checks
+/// are bounded at 60 s (another test's large compare may take the permit first); the
+/// negative check keeps `wait`, since the permit is held through it.
 #[tokio::test]
 async fn c5b_the_semaphore_serialises_large_v1txs_answers() {
     use std::time::{Duration, Instant};
@@ -5304,10 +5306,11 @@ async fn c5b_the_semaphore_serialises_large_v1txs_answers() {
     let held = super::V1TXS_LARGE.acquire().await.unwrap();
     let blocked = tokio::time::timeout(wait, v1_compare(&ctx, "/v1/txs/k:big/coin/60")).await;
     assert!(blocked.is_err(), "a large compare ran beside another");
-    let o = tokio::time::timeout(wait, v1_compare(&small_ctx, "/v1/txs/k:big/coin/10")).await;
+    let positive = Duration::from_secs(60);
+    let o = tokio::time::timeout(positive, v1_compare(&small_ctx, "/v1/txs/k:big/coin/10")).await;
     assert!(o.is_ok(), "a small compare waited for the permit");
     drop(held);
-    let o = tokio::time::timeout(wait * 2, v1_compare(&ctx, "/v1/txs/k:big/coin/60")).await;
+    let o = tokio::time::timeout(positive, v1_compare(&ctx, "/v1/txs/k:big/coin/60")).await;
     assert!(
         o.is_ok(),
         "the large compare did not finish once the permit was free"
