@@ -5513,3 +5513,56 @@ async fn c6_ours_first_page_fault_is_a_diff_in_the_node_lanes() {
         .await;
     fault(&o, "node-balance");
 }
+
+// ---------------------------------------------------------------------------------------------
+// FVH-C6: a null leaf is not an unselected field (R-P5P9-72 item 4)
+
+/// R-P5P9-72 (4), review-fvh-e m-3: an ours-only event row whose `parameters` is null is not
+/// excused (the checks read a null as "not selected"): it stays a diff. The same row with
+/// the node's parameters is explained.
+#[tokio::test]
+async fn c6_an_ours_only_event_with_null_parameters_stays_a_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let xfer = json!([{"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "r", 1.5]}]);
+    for rk in ["e1", "e5"] {
+        let (k, v) = h7_poll(rk, "B100", 100, xfer.clone());
+        node.polls.insert(k, v);
+    }
+    h7_back_cmds(&mut node, "2024-01-01T10:00:00Z", &[]);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let ev = |rk: &str, params: Value| {
+        json!({"cursor": "c", "node": {"name": "TRANSFER", "qualifiedName": "coin.TRANSFER",
+            "orderIndex": 0, "parameters": params, "chainId": "0",
+            "block": {"hash": "B100", "height": 100}, "requestKey": rk}})
+    };
+    let e1 = ev("e1", json!(r#"["s","r",1.5]"#));
+    for (e5, explained) in [
+        (ev("e5", json!(r#"["s","r",1.5]"#)), true),
+        (ev("e5", Value::Null), false),
+    ] {
+        let mut a = h7_page("events", false, vec![e1.clone(), e5.clone()]);
+        let mut b = h7_page("events", false, vec![e1.clone()]);
+        let (d, _) = ctx
+            .gql_settle(
+                &ctx.targets["a"],
+                &serde_json::Map::new(),
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await;
+        assert_eq!(only_hits(&d) && !d.is_empty(), explained, "{e5}: {d:?}");
+    }
+    // Under a tx's `result` and `cmd` a null is compared as a value, so it is no refusal.
+    use crate::graphql_window::{unchecked_field, Kind};
+    let tx = json!({"result": {"continuation": null}, "cmd": {"payload": {"data": null,
+        "code": "(+ 1 2)"}}});
+    assert_eq!(unchecked_field(Some(Kind::Tx), &tx), None);
+    let ev = json!({"name": "TRANSFER", "parameters": null});
+    assert_eq!(
+        unchecked_field(Some(Kind::Event), &ev).as_deref(),
+        Some("parameters")
+    );
+}

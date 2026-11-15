@@ -653,11 +653,18 @@ fn type_at(kind: Kind, path: &str, m: &Map<String, Value>) -> Option<&'static st
     })
 }
 
+/// R-P5P9-72 (4): whether a null at the leaf `path` is compared as a value: under a tx's
+/// `result` (its checks compare a null) and `cmd` (against the node's signed command).
+fn null_is_checked(path: &str) -> bool {
+    ["result.", "cmd."].iter().any(|p| path.starts_with(p))
+}
+
 /// R-P5P9-70 (I-1): the first field a row's node selects that the harness does not check
 /// against the node (dotted path, list indices left out), or `None`. An empty object, a null
 /// where an object is selected and a list or object where a value is selected are unchecked
 /// too (an empty `cmd.payload` among them); so is a row without a kind. R-P5P9-71 (3): a
 /// `__typename` at any checked level passes when it is the schema type there ([`type_at`]).
+/// R-P5P9-72 (4): so is a null leaf, except under `result` and `cmd` ([`null_is_checked`]).
 pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
     fn walk(kind: Kind, v: &Value, path: &str) -> Option<String> {
         let keys = checked_keys(kind, path);
@@ -678,6 +685,9 @@ pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
                 if !checked_keys(kind, &p).is_empty() {
                     walk(kind, x, &p)
                 } else if x.is_object() || x.is_array() {
+                    Some(p)
+                } else if x.is_null() && !null_is_checked(&p) {
+                    // R-P5P9-72 (4): the field checks read a null as "not selected".
                     Some(p)
                 } else {
                     None
