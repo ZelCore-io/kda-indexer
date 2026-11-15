@@ -1322,7 +1322,8 @@ impl Ctx {
         // chainweb-data keeps rows of orphaned blocks: on /txs/txs it lists them beside the
         // canonical row, and its /txs/tx answers 404 when a request key has several rows.
         // A's row must be one of B's (the node pair checks that A's block is canonical); B's
-        // other rows go under /orphans (allowlist `orphan-rows-txs`).
+        // other rows go under /orphans (allowlist `orphan-rows-txs`, whose `request_any` names
+        // /txs/txs since R-P5P9-81, I-1).
         // A B row in the node's canonical block is no orphan: it stays a row A lacks (F4, seen
         // live: genesis request keys on every chain, chainweb-data listing all 20 rows and
         // compat one).
@@ -3792,8 +3793,8 @@ mod tests {
 
     /// R-P5P9-78 (H2 m-7): `/orphans` is credited to the entry whose rule produced it, so
     /// each orphan entry is hit: account, events and /v1/txs to the ACCEPTED
-    /// `oracle-orphan-rows`, /txs/tx (404) and /txs/recent to `orphan-rows-txs`; a request
-    /// neither covers stays a diff.
+    /// `oracle-orphan-rows`, /txs/tx (404), /txs/recent and /txs/txs (R-P5P9-81, I-1) to
+    /// `orphan-rows-txs`; a request neither covers stays a diff.
     #[test]
     fn orphan_entries_are_scoped_so_each_is_hit() {
         let al = crate::allowlist::Allowlist::load(
@@ -3822,7 +3823,8 @@ mod tests {
         assert_eq!(id(RouteKind::Tx, "/txs/tx?requestkey=YbvRG1"), txs);
         assert_eq!(id(RouteKind::Recent, "/txs/recent?limit=50"), txs);
         assert_eq!(id(RouteKind::Search, "/txs/search?search=coin"), None);
-        assert_eq!(id(RouteKind::Txs, "/txs/txs?requestkey=YbvRG1"), None);
+        // R-P5P9-81 (I-1): /txs/txs is the request this entry is named for.
+        assert_eq!(id(RouteKind::Txs, "/txs/txs?requestkey=YbvRG1"), txs);
     }
 
     #[test]
