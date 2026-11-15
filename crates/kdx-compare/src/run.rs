@@ -939,7 +939,9 @@ impl Ctx {
             } else {
                 query_limit(&req.path_and_query)
             };
-            let full = |n: usize, t: bool| t || limit.is_none_or(|l| n >= l);
+            // R-P5P9-72 (2): only a known limit (or a cut page) makes a side partial at its
+            // lowest height; an unknown limit (`/txs/events`) is not full.
+            let full = |n: usize, t: bool| t || limit.is_some_and(|l| n >= l);
             let (na, nb) = (len_of(&va), len_of(&vb));
             let fa = full(na, pa.truncated || page_cut);
             let fb = full(nb, pb.truncated || page_cut);
@@ -949,8 +951,7 @@ impl Ctx {
             // R-P5P9-72 (1): when ours held a known limit (or was cut at a page), an
             // oracle-only row at or below ours' lowest height is ours' limit, not evidence.
             let (min_a0, min_b0) = (min_height(&va), min_height(&vb));
-            let at_limit_a = pa.truncated || page_cut || limit.is_some_and(|l| na >= l);
-            let floor = min_a0.filter(|_| at_limit_a);
+            let floor = min_a0.filter(|_| fa);
             let kept_b = if replica {
                 Vec::new()
             } else {

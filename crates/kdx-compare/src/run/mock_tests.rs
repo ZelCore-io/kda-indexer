@@ -5310,7 +5310,7 @@ async fn c5b_the_semaphore_serialises_large_v1txs_answers() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// FVH-C6: the oracle-lag window's floor and cut (R-P5P9-72 item 1)
+// FVH-C6: the oracle-lag window's floor and cut (R-P5P9-72 items 1 and 2)
 
 /// R-P5P9-72 (1), review-fvh-e I-1: when ours holds its limit, a row only kda-txs lists at
 /// or below ours' lowest height is ours' limit, not evidence, and goes with the window: the
@@ -5382,6 +5382,38 @@ async fn c6_the_lag_window_floor_is_ours_lowest_height_at_its_limit() {
             o.class,
             class,
             "{name}: {:?}",
+            o.record.map(|r| (r.note, r.diff))
+        );
+    }
+}
+
+/// R-P5P9-72 (2), review-fvh-e m-1: `/txs/events` carries no limit, so neither side is cut
+/// at its lowest height: ours lacking the lowest row of an otherwise equal answer is a diff,
+/// with rows in the oracle-lag window or not.
+#[tokio::test]
+async fn c6_an_unknown_limit_is_not_full_in_the_lag_cut() {
+    let rows = v1_rows(11, 10);
+    let path = "/txs/events?modulename=coin&name=TRANSFER&minheight=6999900&maxheight=7000100";
+    // 5 of 11 rows in the window (above 6_999_995), or none.
+    for tip in [
+        6_999_995 + super::ORACLE_HORIZON,
+        7_000_000 + 2 * super::ORACLE_HORIZON,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = bytes_pair_setup(
+            serde_json::to_vec(&rows[..10]).unwrap(),
+            serde_json::to_vec(&rows).unwrap(),
+            dir.path(),
+            NodeMock::default(),
+            "chainweb_data",
+        )
+        .await;
+        ctx.tips.set_a_tip(tip);
+        let o = v1_compare(&ctx, path).await;
+        assert_eq!(
+            o.class,
+            "diff",
+            "tip {tip}: {:?}",
             o.record.map(|r| (r.note, r.diff))
         );
     }
