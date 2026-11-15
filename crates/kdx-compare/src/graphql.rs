@@ -955,7 +955,12 @@ pub fn compare_answers_with(
         crate::graphql_scope::align_block_parents(&mut na, &mut nb);
     }
     // R-P5P9-75 G: nested lists without a key compare as multisets when complete.
-    let (sorted, left) = crate::graphql_scope::unkeyed_nested(&mut na, &mut nb);
+    let (sorted, left) = crate::graphql_scope::unkeyed_nested_with(
+        &mut na,
+        &mut nb,
+        Some((&a.body, &b.body)),
+        rules,
+    );
     if sorted {
         hits.push(hit(crate::graphql_scope::NESTED_MULTISET_PATH));
     }
@@ -1683,9 +1688,12 @@ impl Ctx {
                 }
                 entries
             }
+            // R-P5P9-88 (G): the compare's own unfinished entry (no `b`) is made again from
+            // the stored bodies, so only H6's list reads' entries are carried.
             H6::Stored(diff) => diff
                 .iter()
                 .filter(|e| crate::graphql_scope::is_h6_entry(&e.path))
+                .filter(|e| !(e.path == crate::graphql_scope::UNFINISHED_PATH && e.b.is_none()))
                 .cloned()
                 .collect(),
         };
@@ -1764,6 +1772,8 @@ impl Ctx {
         );
         // R-P5P9-86 X: ours' amount text against the node's TRANSFER event.
         self.gql_decimal_zeros(&mut d, &mut st).await;
+        // R-P5P9-88 (G): cut nested lists by prefix, ours' rows against the node's payload.
+        self.gql_h6_prefix(&mut d, &mut st).await;
         d.extend(h8);
         d.extend(data);
         d.extend(nested);

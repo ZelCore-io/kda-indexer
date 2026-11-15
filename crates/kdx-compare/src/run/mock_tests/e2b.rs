@@ -573,3 +573,126 @@ async fn e3_f_a_root_list_without_page_info_is_a_connection_of_first() {
     assert!(a.body.pointer("/data/transfers/pageInfo").is_none());
     assert!(b.body.pointer("/data/transfers/pageInfo").is_none());
 }
+
+/// BlocksByHeight's page (as E1's #70 test, `completedBlockHeights`) of blocks at height 58 (c0 and c19), each with a nested
+/// `transactions` list without a key: `(chain, totalCount, cut, gas prices)`.
+fn g_page(blocks: &[(u64, u64, bool, Vec<String>)]) -> Value {
+    let edges: Vec<Value> = blocks
+        .iter()
+        .map(|(chain, total, more, prices)| {
+            let txs: Vec<Value> = prices
+                .iter()
+                .map(|p| json!({"node": {"cmd": {"meta": {"gasPrice": p}}}}))
+                .collect();
+            json!({"node": {"transactions": {"totalCount": total,
+                "pageInfo": {"hasNextPage": more}, "edges": txs},
+                "hash": format!("H{chain}"), "height": 58, "chainId": chain.to_string()}})
+        })
+        .collect();
+    json!({"data": {"completedBlockHeights": {"pageInfo": {"hasNextPage": false},
+        "edges": edges}}})
+}
+
+/// The node: c0's canonical block at 58 is H0, whose payload holds `n` transactions.
+fn g_node(n: usize) -> NodeMock {
+    let mut node = NodeMock::default();
+    node.headers.insert(
+        (0, 58),
+        vec![json!({"hash": "H0", "height": 58, "payloadHash": "P0", "chainId": 0})],
+    );
+    let txs: Vec<Value> = (0..n)
+        .map(|i| {
+            let w = json!({"hash": format!("rk{i}")}).to_string();
+            json!([kdx_types::hash::b64url_encode(w.as_bytes()), ""])
+        })
+        .collect();
+    node.payloads
+        .insert("P0".into(), json!({"transactions": txs}));
+    node
+}
+
+/// R-P5P9-88 (G): #70's shape. The oracle cut c0's nested list at 20 of 126 rows and ours
+/// lists all 126. The oracle's 20 are ours' first 20 in order, and the node's block holds
+/// 126 txs: settled by prefix (`/~graphql-h6-prefix`), live and from the stored record. A
+/// prefix out of order, and a node block of another count, stay `/~graphql-h6-unfinished`.
+#[tokio::test]
+async fn e3_g_a_cut_nested_list_is_settled_by_prefix() {
+    let prices: Vec<String> = (0..126).map(|i| format!("{i}e-8")).collect();
+    let ours = g_page(&[
+        (0, 126, false, prices.clone()),
+        (19, 1, false, vec!["1e-8".into()]),
+    ]);
+    let oracle = g_page(&[
+        (0, 126, true, prices[..20].to_vec()),
+        (19, 1, false, vec!["1e-8".into()]),
+    ]);
+    let mut swapped = prices[..20].to_vec();
+    swapped.swap(0, 1);
+    let oracle_bad = g_page(&[(0, 126, true, swapped), (19, 1, false, vec!["1e-8".into()])]);
+    let settle = |n: usize, a: Value, b: Value| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = gql_ctx(g_node(n), dir.path()).await;
+        let (mut a, mut b) = (answer(a), answer(b));
+        let (d, _) = ctx
+            .gql_settle(
+                &ctx.targets["a"],
+                &serde_json::Map::new(),
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await;
+        (c3_unexplained(&ctx, &d), d)
+    };
+    let (un, d) = settle(126, ours.clone(), oracle.clone()).await;
+    assert!(un.is_empty(), "{un:?} {d:?}");
+    let hit = d
+        .iter()
+        .find(|e| e.path == crate::graphql_scope::PREFIX_PATH)
+        .expect("the prefix hit");
+    assert_eq!(
+        hit.a.as_ref().unwrap()["lists"][0]["node"]["txs"],
+        json!(126)
+    );
+    // The oracle's rows are not ours' prefix in order.
+    let (un, _) = settle(126, ours.clone(), oracle_bad).await;
+    assert!(
+        un.contains(&crate::graphql_scope::UNFINISHED_PATH.to_string()),
+        "{un:?}"
+    );
+    // Ours' 126 rows against a node block of 125 txs.
+    let (un, d) = settle(125, ours.clone(), oracle.clone()).await;
+    assert!(
+        un.contains(&crate::graphql_scope::UNFINISHED_PATH.to_string()),
+        "{un:?}"
+    );
+    assert!(
+        format!("{d:?}").contains("the node's block 125 txs"),
+        "{d:?}"
+    );
+
+    // The stored record (R-P5P9-87), with the positional diff CG-5 logged.
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(g_node(126)).await;
+    let ops = dir.path().join("ops");
+    std::fs::create_dir_all(&ops).unwrap();
+    std::fs::write(
+        ops.join("QG.graphql"),
+        "# kdx: oracle\nquery QG { completedBlockHeights(heights: [58]) { pageInfo { hasNextPage } \
+         edges { node { hash height chainId transactions { totalCount pageInfo { hasNextPage } \
+         edges { node { cmd { meta { gasPrice } } } } } } } } }\n",
+    )
+    .unwrap();
+    let cfg = c3_cfg(&nu, &nu, &nu, dir.path(), &ops, "");
+    let pos = DiffEntry {
+        path: "/data/completedBlockHeights/edges/0/node/chainId".into(),
+        kind: DiffKind::Changed,
+        a: Some(json!("0")),
+        b: Some(json!("19")),
+    };
+    let rec = e2_stored("QG", json!({}), ours, oracle, vec![pos]);
+    let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    assert_eq!(rep.by_class.get("graphql-h6-prefix"), Some(&1), "{rep:?}");
+}

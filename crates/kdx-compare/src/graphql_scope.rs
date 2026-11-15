@@ -240,12 +240,119 @@ pub fn align_block_parents(a: &mut Value, b: &mut Value) {
     }
 }
 
+/// R-P5P9-88 (G): visible hit of cut nested `transactions` lists settled by prefix: the
+/// oracle's cut list equals ours' complete list's prefix of the same length, in order, and
+/// ours' rows are the node's payload for the parent block by count (and by request key when
+/// the rows select one). Allowlist id `graphql-h6-prefix`.
+pub const PREFIX_PATH: &str = "/~graphql-h6-prefix";
+
+/// R-P5P9-88 (G): an unfinished nested list that may be settled by prefix: ours' (`ca`)
+/// complete `transactions` list under a root row naming its block (height, chainId, hash),
+/// the oracle's (`cb`) cut, with the same `totalCount`, and its rows ours' first rows in
+/// order. The candidate carries the block and ours' rows (count, and keys when selected)
+/// for the node's check; it is still an unfinished list until that check passes.
+fn prefix_candidate(
+    p: &str,
+    ca: &Value,
+    cb: &Value,
+    parent: Option<&Value>,
+    rules: &[crate::config::FieldRule],
+) -> Option<Value> {
+    if !p.ends_with("/transactions") {
+        return None;
+    }
+    let rows = |c: &Value| c.get("edges").and_then(Value::as_array).cloned();
+    let (ra, rb) = (rows(ca)?, rows(cb)?);
+    let total = |c: &Value| {
+        c.get("totalCount")
+            .and_then(crate::graphql_norm::decimal_value)
+    };
+    let ours_complete = ca.pointer("/pageInfo/hasNextPage") != Some(&Value::Bool(true))
+        && total(ca).is_some()
+        && total(ca) == crate::graphql_norm::decimal_value(&json!(ra.len()));
+    let oracle_cut = cb.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(true))
+        || total(cb)
+            .is_some_and(|t| crate::graphql_norm::decimal_value(&json!(rb.len())) != Some(t));
+    if !ours_complete || !oracle_cut || rb.len() >= ra.len() {
+        return None;
+    }
+    // In the served order, each oracle row is ours' row at the same place (by the ruled
+    // matchers).
+    let explain = crate::graphql_norm::explain(rules, false);
+    let same = |x: &Value, y: &Value| crate::diff::diff_explained(x, y, &explain).0.is_empty();
+    if !ra.iter().zip(&rb).all(|(x, y)| same(x, y)) {
+        return None;
+    }
+    if total(cb).is_some() && total(cb) != total(ca) {
+        return None;
+    }
+    let n = parent?.get("node")?;
+    let height = n.get("height")?.as_u64()?;
+    let chain = match n.get("chainId")? {
+        Value::String(c) => c.parse::<u8>().ok()?,
+        c => u8::try_from(c.as_u64()?).ok()?,
+    };
+    let hash = n.get("hash")?.as_str()?;
+    let keys: Vec<Value> = ra
+        .iter()
+        .filter_map(|e| {
+            e.pointer("/node/hash")
+                .or_else(|| e.pointer("/node/requestKey"))
+                .cloned()
+        })
+        .collect();
+    Some(
+        json!({"list": p, "why": "a cut nested list of the oracle's that is ours' prefix, \
+        not yet checked on the node", "prefix": {"rows": rb.len(), "of": ra.len(),
+        "chain": chain, "height": height, "hash": hash,
+        "keys": (keys.len() == ra.len()).then_some(keys)}}),
+    )
+}
+
+/// R-P5P9-88 (G): a root row's block (chainId as text, hash), read the same way on a raw and
+/// a normalized body (normalization rewrites numbers, so the height is read on the raw row).
+fn block_key(e: &Value) -> Option<(String, String)> {
+    let n = e.get("node")?;
+    let chain = match n.get("chainId")? {
+        Value::String(c) => c.clone(),
+        c => c.as_u64()?.to_string(),
+    };
+    Some((chain, n.get("hash")?.as_str()?.to_string()))
+}
+
+/// R-P5P9-88 (G): in a raw body, the nested list at `p` (a normalized pointer under the root
+/// row `parent`) found under the raw root row of the same block `id`, since normalization
+/// may reorder root rows.
+fn raw_list<'v>(
+    raw: &'v Value,
+    parent: &str,
+    p: &str,
+    id: &(String, String),
+) -> Option<(&'v Value, &'v Value)> {
+    let (list, _) = parent.rsplit_once('/')?;
+    let rows = raw.pointer(list)?.as_array()?;
+    let row = rows.iter().find(|e| block_key(e).as_ref() == Some(id))?;
+    Some((row, row.pointer(p.strip_prefix(parent)?)?))
+}
+
 /// R-P5P9-75 G: the nested lists of two normalized bodies (below a root list's rows, at the
 /// same pointer on both sides, outside H2's scope) whose rows select no key and differ. Each
 /// is sorted as a multiset of its rows' selected values (per parent) when both sides' lists
 /// are complete (no next page, `totalCount` equal to the rows) with equal `totalCount`;
 /// otherwise it is listed with why. Returns whether any was sorted, and the lists left.
 pub fn unkeyed_nested(a: &mut Value, b: &mut Value) -> (bool, Vec<Value>) {
+    unkeyed_nested_with(a, b, None, &[])
+}
+
+/// [`unkeyed_nested`] with the raw bodies (ours', the oracle's) before normalization, for
+/// R-P5P9-88 (G)'s prefix in the served order, and the ruled field matchers its rows compare
+/// with.
+pub fn unkeyed_nested_with(
+    a: &mut Value,
+    b: &mut Value,
+    raw: Option<(&Value, &Value)>,
+    rules: &[crate::config::FieldRule],
+) -> (bool, Vec<Value>) {
     fn walk(v: &Value, ptr: &str, out: &mut Vec<String>) {
         match v {
             Value::Object(m) => {
@@ -315,6 +422,28 @@ pub fn unkeyed_nested(a: &mut Value, b: &mut Value) -> (bool, Vec<Value>) {
                 json!({"list": p, "why": "a nested list without a key whose parent \
                 block (chainId, height, hash) is not the same block on both sides"}),
             );
+            continue;
+        }
+        // R-P5P9-88 (G): the oracle's cut list is ours' complete list's prefix of the same
+        // length, in order, under the same block: a candidate the node settles (ours' rows
+        // against the node's payload for that block), else it stays unfinished.
+        let raw_lists = raw.and_then(|(ra, rb)| {
+            let id = a.pointer(&parent).and_then(block_key)?;
+            Some((
+                raw_list(ra, &parent, p, &id)?,
+                raw_list(rb, &parent, p, &id)?,
+            ))
+        });
+        let candidate =
+            raw_lists.and_then(|((pa, xa), (_, xb))| prefix_candidate(p, xa, xb, Some(pa), rules));
+        if let Some(c) = candidate {
+            // The list's own differences are the candidate's: the oracle's cut list stands
+            // as ours' whole one, and the entry stays unfinished until the node settles it.
+            let whole = ca.clone();
+            if let Some(x) = b.pointer_mut(p) {
+                *x = whole;
+            }
+            left.push(c);
             continue;
         }
         let why = if !complete(ca) || !complete(cb) {

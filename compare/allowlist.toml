@@ -806,3 +806,14 @@ reason = "R-P5P9-86 (v1txs at the recent-window edge; CG-5 #1871): ours' and kda
 status = "PROPOSED"
 ruling = "R-P5P9-86 (v1txs edge); R-P5P9-87 (the stored form)."
 owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b; CG-5 REST v1txs (#1871)."
+
+[[entry]]
+id = "graphql-h6-prefix"
+route = "other"
+json_path_glob = "/~graphql-h6-prefix"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-88 (G, on R-P5P9-86 G): a nested transactions list without a key that the oracle cut (BlocksByHeight: 20 of 126 edges) and ours lists whole, under root rows that pair by their block (chainId, height, hash). Explained only when the oracle's cut list equals ours' prefix of the same length, in order, with the same totalCount, and ours' whole list is the node's payload for that block (the canonical header on the cut's branch at the row's height is the row's block) by count, and by request key when ours' rows select one; one payload read per block, within the compare's cap. Anything else stays /~graphql-h6-unfinished, which no entry matches. Live and in the referee alike; the hit lists each block and the node's tx count."
+status = "PROPOSED"
+ruling = "R-P5P9-88 (G); R-P5P9-86 G."
+owner_note = "PROPOSED (ruling R-P5P9-88 concern 4): new in FVH-E3; CG-5 class G (#70, #91, #147)."

@@ -4042,6 +4042,92 @@ impl Ctx {
         }
     }
 
+    /// R-P5P9-88 (G): the compare's unfinished nested lists that are prefix candidates
+    /// ([`crate::graphql_scope::PREFIX_PATH`]): each block's canonical header on the cut's
+    /// branch must be the row's block, and its payload must hold ours' rows by count (and by
+    /// request key, in order of the multiset, when ours' rows select one). One payload read
+    /// per block, within the compare's cap. When every list of the entry passes, the entry
+    /// becomes the prefix hit; otherwise it stays unfinished, each failed list saying why.
+    pub(crate) async fn gql_h6_prefix(&self, d: &mut [DiffEntry], st: &mut Reads) {
+        use crate::graphql_scope::{PREFIX_PATH, UNFINISHED_PATH};
+        for e in d.iter_mut() {
+            if e.path != UNFINISHED_PATH || e.b.is_some() {
+                continue;
+            }
+            let Some(lists) =
+                e.a.as_ref()
+                    .and_then(|a| a.get("lists"))
+                    .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            if lists.is_empty() || !lists.iter().all(|l| l.get("prefix").is_some()) {
+                continue;
+            }
+            let mut out = Vec::new();
+            let mut ok = true;
+            for l in lists {
+                let mut l = l.clone();
+                let c = &l["prefix"];
+                let (chain, height, hash) = (
+                    c["chain"].as_u64().and_then(|x| u8::try_from(x).ok()),
+                    c["height"].as_u64(),
+                    c["hash"].as_str().map(str::to_string),
+                );
+                let rows = c["of"].as_u64().unwrap_or(u64::MAX);
+                let keys = c["keys"].as_array().cloned();
+                let check = match (chain, height, hash) {
+                    (Some(ch), Some(h), Some(b)) => {
+                        match self.h7_branch_payload(ch, h, Some(&b), st).await {
+                            Err(w) => Err(w),
+                            Ok((_, payload)) => block_request_keys(&payload).and_then(|nk| {
+                                if nk.len() as u64 != rows {
+                                    return Err(format!(
+                                        "ours lists {rows} rows, the node's block {} txs",
+                                        nk.len()
+                                    ));
+                                }
+                                if let Some(k) = &keys {
+                                    let mut ours: Vec<String> = k
+                                        .iter()
+                                        .filter_map(|x| x.as_str().map(str::to_string))
+                                        .collect();
+                                    let mut node = nk.clone();
+                                    ours.sort();
+                                    node.sort();
+                                    if ours != node {
+                                        return Err("ours' request keys are not the node's \
+                                            block's"
+                                            .into());
+                                    }
+                                }
+                                Ok(nk.len())
+                            }),
+                        }
+                    }
+                    _ => Err("no block to read".into()),
+                };
+                match check {
+                    Ok(n) => l["node"] = json!({"txs": n}),
+                    Err(w) => {
+                        ok = false;
+                        l["why"] = json!(format!(
+                            "a cut nested list of the oracle's that is \
+                            ours' prefix, not settled on the node: {w}"
+                        ));
+                    }
+                }
+                out.push(l);
+            }
+            if ok {
+                e.path = PREFIX_PATH.into();
+                e.a = Some(json!({ "lists": out }));
+            } else {
+                e.a = Some(json!({ "lists": out }));
+            }
+        }
+    }
+
     /// R-P5P9-86 TC: a record whose only difference outside the hits is its root
     /// `totalCount` (and no unsettled H7 row) is settled by walking both lists to their end,
     /// [`OURS_PAGE_CAP`] rows a page, at most [`COUNT_WALK_ROWS`] rows a side, and settling
