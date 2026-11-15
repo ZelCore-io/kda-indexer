@@ -25,9 +25,10 @@ id = "orphan-rows-txs"
 route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
-reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing. Against chainweb-data (no oracle) the rows of blocks other than A's go under /orphans (the node pair checks that A's block is canonical), and chainweb-data's /txs/tx answers 404 for such a request key (seen live: YbvRG1..., chain 2, canonical block QCOhs8... and orphan du_5-bB... at one height); the harness then confirms with one /txs/txs call and reports /orphans."
+request_any = ["/txs/tx?", "/txs/recent"]
+reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. Scoped (R-P5P9-78, H2 m-7) to the two requests whose /orphans this entry covers, both node-checked: chainweb-data's /txs/tx answers 404 for a request key it holds in several blocks (seen live: YbvRG1..., chain 2, canonical block QCOhs8... and orphan du_5-bB... at one height); the harness then confirms with one /txs/txs call that it lists A's block plus others, and reports the others under /orphans only when none of them is the node's canonical block there. On /txs/recent, a chainweb-data row whose request key A lists in another block goes under /orphans, A's row in its place, only when the node's canonical block at A's chain and height is A's (seen live: qTm3DYap..., chain 14 height 7395953, chainweb-data block G33Rgc_P beside the canonical rt2smpaG). Account, event and /v1/txs orphans are oracle-orphan-rows'."
 status = "PROPOSED"
-ruling = "Spec section 4.5 (builder call: orphans are not kept); R3E-9 extends it (oracle-orphan-rows)."
+ruling = "Spec section 4.5 (builder call: orphans are not kept); R3E-9 extends it (oracle-orphan-rows); R-P5P9-78 (H2 m-7): scoped apart from oracle-orphan-rows, so each is hit."
 owner_note = "Builder call (spec section 4.5): orphans are not kept."
 
 [[entry]]
@@ -373,9 +374,10 @@ id = "oracle-orphan-rows"
 route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
-reason = "chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height, or, where kda-indexer lists no row at that chain and height, after the node's canonical block there is another one (seen live: k:b649fd12...?token=coin, chainweb-data row in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M)."
+request_any = ["/txs/account/", "/txs/events", "/v1/txs/"]
+reason = "Scoped (R-P5P9-78, H2 m-7) to account, event and /v1/txs requests; /txs/tx and /txs/recent orphans are orphan-rows-txs'. chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height, or, where kda-indexer lists no row at that chain and height, after the node's canonical block there is another one (seen live: k:b649fd12...?token=coin, chainweb-data row in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M)."
 status = "ACCEPTED"
-ruling = "R3E-9; spec section 4.5; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence)."
+ruling = "R3E-9; spec section 4.5; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence); R-P5P9-78 (H2 m-7): no longer shadowed by orphan-rows-txs."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R3E-9: the node confirms ours' block)."
 
 [[entry]]
@@ -387,6 +389,16 @@ reason = "chainweb-data lags kda-indexer and fills recent heights late (seen liv
 status = "PROPOSED"
 ruling = "R3E-11."
 owner_note = "Accepted (run 3E ruling R3E-11): oracle lag, not a kda-indexer diff."
+
+[[entry]]
+id = "stats-count-age-lag"
+route = "stats"
+json_path_glob = "/~stats-count-age/coinsInCirculation"
+condition = "changed"
+reason = "kda-indexer serves /stats from a count its background refresher renews every 120 s, and states the count's age in seconds in the x-count-age header (STATS-FIX). Against chainweb-data, a coinsInCirculation lower on kda-indexer by at most 60 KDA per 30 s height of that age, rounded up, plus the relative 1e-6, is not compared and leaves this visible hit. The age is honoured only up to 360 s (the served WARN threshold, 3 x the refresh interval); an older count, or a header that is no age, gives no widening and is a diff at /~stats-count-age. This is kda-indexer's count lag, not the oracle's."
+status = "PROPOSED"
+ruling = "R-P5P9-75 item 4 (STATS-FIX); R-P5P9-78 (H2 I-1): its own path and entry, the age capped at 360 s."
+owner_note = "PROPOSED (R-P5P9-78): CG-5 decides."
 
 [[entry]]
 id = "oracle-unstable"
@@ -647,10 +659,10 @@ condition = "any"
 request_contains = "graphql:"
 request_any = ['"k:465174a5', '"k:a8ba06d2', '"b581bc62']
 a_value_contains = "request deadline exceeded"
-baseline_per_hour = 0.99
-reason = "R-P5P9-75 P (accepted heavy-account TIMEOUT, a diff by design, R-P5P9-67): ours' first- or follow-page fault whose error says \"request deadline exceeded\", only on the heavy accounts CG-2/CG-3 measured, by key (a variable value starting with): k:465174a5..., k:a8ba06d2..., b581bc62.... Any other account (CG-4 #293's k:58ddb72d... among them), another fault, or another difference in the record stays unexplained. CG-4 baseline: 4 records (#293, #322, #512, #1868) in the 00:55:00-04:58:10Z window (4.05 h) = 0.99/h; gate limit 1.48/h."
+baseline_per_hour = 0.74
+reason = "R-P5P9-75 P (accepted heavy-account TIMEOUT, a diff by design, R-P5P9-67): ours' first- or follow-page fault whose error says \"request deadline exceeded\", only on the heavy accounts CG-2/CG-3 measured, by key (a variable value starting with): k:465174a5..., k:a8ba06d2..., b581bc62.... Any other account (CG-4 #293's k:58ddb72d... among them), another fault, or another difference in the record stays unexplained. CG-4 baseline: the 3 records this entry matches (#322, #512, #1868; #293 is k:58ddb72d..., which it rules out) in the 00:55:00-04:58:10Z window (4.05 h) = 0.74/h; gate limit 1.11/h (R-P5P9-78, H2 m-1)."
 status = "KNOWN-GAP"
-ruling = "R-P5P9-75 (P, Q); R-P5P9-60; R-P5P9-67."
+ruling = "R-P5P9-75 (P, Q); R-P5P9-60; R-P5P9-67; R-P5P9-78 (H2 m-1: the baseline counts only matched records)."
 owner_note = "KNOWN-GAP (accepted for G4 by the controller, R-P5P9-60 line 595: heavy-account cold TIMEOUT): never explained; listed for the owner in the G4 package."
 
 [[entry]]

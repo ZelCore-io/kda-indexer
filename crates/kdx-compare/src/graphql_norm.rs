@@ -308,6 +308,13 @@ pub fn count_flag_applies(raw: &Value) -> bool {
     raw.pointer("/extensions/totalCountLowerBound") == Some(&Value::Bool(true)) && n == 1
 }
 
+/// A connection's page is not cut: `pageInfo.hasNextPage` false and `hasPreviousPage` not
+/// true (R-P5P9-60).
+fn page_whole(c: &Value) -> bool {
+    c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(false))
+        && c.pointer("/pageInfo/hasPreviousPage") != Some(&Value::Bool(true))
+}
+
 /// R-P5P9-60 count self-consistency, on the normalised answers `a` (ours) and `b` (the
 /// oracle's): for each `count_self_consistent` rule `<root>.totalCount`, the oracle's count
 /// takes ours only when neither page is cut (`pageInfo.hasNextPage` false and
@@ -316,10 +323,6 @@ pub fn count_flag_applies(raw: &Value) -> bool {
 /// CG-A2's node = ours 4/4 against the oracle's 1). An oracle count above its edges stays a
 /// diff, since ours may be the one that undercounts. Returns whether any count was explained.
 pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> bool {
-    let whole = |c: &Value| {
-        c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(false))
-            && c.pointer("/pageInfo/hasPreviousPage") != Some(&Value::Bool(true))
-    };
     let edges = |c: &Value| {
         c.get("edges").and_then(Value::as_array).map(|e| {
             let mut s: Vec<String> = e.iter().map(Value::to_string).collect();
@@ -344,7 +347,12 @@ pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> b
         else {
             continue;
         };
-        if whole(ca) && whole(cb) && ea == eb && na == ea.len() as u64 && nb < eb.len() as u64 {
+        if page_whole(ca)
+            && page_whole(cb)
+            && ea == eb
+            && na == ea.len() as u64
+            && nb < eb.len() as u64
+        {
             if let Some(n) = b.pointer_mut(&format!("{ptr}/totalCount")) {
                 *n = Value::from(na);
                 hit = true;
@@ -362,8 +370,10 @@ pub const MISSING_CHAIN_ROWS_PATH: &str = "/~known-gap-missing-chain-rows";
 /// at the same place on both sides whose rows are all objects with a `chainId`, keyed by
 /// (`chainId`, `tokenId` when selected) with each key once per side, where ours' keys are a
 /// strict subset of the oracle's: the oracle's rows that ours lacks leave its list and the
-/// rest take ours' order, so the diff then compares the rows both hold. Returns (pointer, the
-/// keys ours lacks) per list. A row only ours holds, a key twice, or another shape: nothing.
+/// rest keep the oracle's own order, so the diff then compares the rows both hold, order
+/// included. Returns (pointer, the keys ours lacks) per list. A row only ours holds, a key
+/// twice, another shape, or (R-P5P9-78, H2 m-4) an empty list of ours: nothing, so an answer
+/// of ours with no chain rows at all stays a diff.
 pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)> {
     fn lists(v: &Value, ptr: &mut String, parent: &str, out: &mut Vec<String>) {
         match v {
@@ -408,12 +418,18 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
         let ka: Vec<Value> = ra.iter().map(key).collect();
         let kb: Vec<Value> = rb.iter().map(key).collect();
         let once = |k: &[Value]| k.iter().enumerate().all(|(i, x)| !k[..i].contains(x));
-        if !once(&ka) || !once(&kb) || ka.len() >= kb.len() || !ka.iter().all(|k| kb.contains(k)) {
+        if ka.is_empty()
+            || !once(&ka)
+            || !once(&kb)
+            || ka.len() >= kb.len()
+            || !ka.iter().all(|k| kb.contains(k))
+        {
             continue;
         }
-        let kept: Vec<Value> = ka
+        let kept: Vec<Value> = rb
             .iter()
-            .filter_map(|k| rb.iter().find(|r| key(r) == *k).cloned())
+            .filter(|r| ka.contains(&key(r)))
+            .cloned()
             .collect();
         let gone: Vec<Value> = kb.iter().filter(|k| !ka.contains(k)).cloned().collect();
         if let Some(x) = b.pointer_mut(&p) {
@@ -426,8 +442,11 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
 
 /// R-P5P9-75 I: for each `oracle_counts_heights` rule `<root>.totalCount`, the oracle's root
 /// count takes ours when it is below ours (the oracle counts heights). Only the root
-/// connection's own count: nested counts are never touched. Returns (ours, the oracle's) per
-/// count taken.
+/// connection's own count: nested counts are never touched. R-P5P9-78 (H2 I-4), the
+/// R-P5P9-60 bound: when ours' page is not cut (`hasNextPage` false, `hasPreviousPage` not
+/// true; so whenever neither page is), ours' count must also equal ours' own edge count, or
+/// nothing is taken (an overcount of ours stays a diff; no `edges` selected, likewise).
+/// Returns (ours, the oracle's) per count taken.
 pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     for r in rules
@@ -444,6 +463,16 @@ pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> V
         ) else {
             continue;
         };
+        let ca = a.pointer(&format!("/data/{root}"));
+        if ca.is_some_and(page_whole) {
+            let edges = ca
+                .and_then(|c| c.get("edges"))
+                .and_then(Value::as_array)
+                .map(|e| e.len() as u64);
+            if edges != Some(na) {
+                continue;
+            }
+        }
         if nb < na {
             if let Some(n) = b.pointer_mut(&ptr) {
                 *n = Value::from(na);
@@ -1551,5 +1580,72 @@ mod tests {
         assert_eq!(ok("15.100", "15.290"), None);
         // Not times: a diff.
         assert_eq!(rule_explains(&r, &json!("x"), &json!("y"), false), None);
+    }
+
+    /// R-P5P9-78 (H2 I-4), the R-P5P9-60 bound: on an uncut page of ours, the oracle's count
+    /// below ours takes ours only when ours' count equals ours' own edge count. Ours' 8 for 4
+    /// rows stays a diff; 4 for 4 is taken; a cut page of ours keeps the ruled cost.
+    #[test]
+    fn oracle_counts_heights_needs_ours_self_consistent_on_an_uncut_page() {
+        let rules = [FieldRule::new(
+            "transactions.totalCount",
+            FieldRuleKind::OracleCountsHeights,
+        )];
+        let edges = |n: usize| {
+            (0..n)
+                .map(|i| json!({"node": {"i": i}}))
+                .collect::<Vec<_>>()
+        };
+        let conn = |count: u64, rows: Option<usize>, next: bool| {
+            let mut c = json!({"totalCount": count,
+                "pageInfo": {"hasNextPage": next, "hasPreviousPage": false}});
+            if let Some(n) = rows {
+                c["edges"] = Value::Array(edges(n));
+            }
+            json!({"data": {"transactions": c}})
+        };
+        let take = |a: Value, mut b: Value| oracle_counts_heights(&rules, &a, &mut b);
+        // Ours double-counts: 8 for its 4 rows, both pages whole.
+        assert!(take(conn(8, Some(4), false), conn(1, Some(4), false)).is_empty());
+        // The oracle's page cut, ours whole: ours' own count is still checked.
+        assert!(take(conn(8, Some(4), false), conn(1, Some(2), true)).is_empty());
+        // Ours whole but no edges selected: nothing to check against, nothing taken.
+        assert!(take(conn(4, None, false), conn(1, None, false)).is_empty());
+        // The neighbour: ours 4 for 4, the oracle's 1 (it counts heights) is taken.
+        assert_eq!(
+            take(conn(4, Some(4), false), conn(1, Some(4), false)),
+            vec![(4, 1)]
+        );
+        // Ours' page cut: its count cannot be checked by its edges (the ruled cost).
+        assert_eq!(
+            take(conn(8, Some(4), true), conn(1, Some(4), true)),
+            vec![(8, 1)]
+        );
+    }
+
+    /// R-P5P9-78 (H2 m-4): the Q marker needs ours' list non-empty, and the oracle's kept rows
+    /// keep the oracle's own order (a difference in chain-row order still shows).
+    #[test]
+    fn missing_chain_rows_needs_ours_non_empty_and_keeps_the_oracles_order() {
+        let row = |c: &str| json!({"chainId": c, "balance": "1"});
+        let acct = |rows: Vec<Value>| json!({"data": {"fungibleAccount": {"chainAccounts": rows}}});
+        // Ours holds no chain row at all: no marker, the oracle's list is left whole.
+        let a = acct(vec![]);
+        let mut b = acct(vec![row("0"), row("1")]);
+        assert!(missing_chain_rows(&a, &mut b).is_empty());
+        assert_eq!(b, acct(vec![row("0"), row("1")]));
+        // Ours [2, 0], the oracle [0, 1, 2]: the marker names 1, and the oracle keeps [0, 2].
+        let a = acct(vec![row("2"), row("0")]);
+        let mut b = acct(vec![row("0"), row("1"), row("2")]);
+        let m = missing_chain_rows(&a, &mut b);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].0, "/data/fungibleAccount/chainAccounts");
+        assert_eq!(b, acct(vec![row("0"), row("2")]));
+        assert_ne!(a, b, "the order difference still shows");
+        // The neighbour: ours [0, 2] in the oracle's order compares equal after the marker.
+        let a = acct(vec![row("0"), row("2")]);
+        let mut b = acct(vec![row("0"), row("1"), row("2")]);
+        assert_eq!(missing_chain_rows(&a, &mut b).len(), 1);
+        assert_eq!(a, b);
     }
 }

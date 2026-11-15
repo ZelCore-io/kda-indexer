@@ -95,14 +95,9 @@ impl RouteSet {
 }
 
 /// Classes that count as a request compared (the two sides answered and were diffed).
-const COMPARED: &[&str] = &[
-    "match",
-    "diff",
-    "allowlisted",
-    "legacy-cmd",
-    "skew",
-    "known-gap",
-];
+/// R-P5P9-78 (H2 m-8): a `known-gap` record is not one: a P record is a fetch that stopped
+/// at ours' fault, so it counts toward no route minimum and no GraphQL total.
+const COMPARED: &[&str] = &["match", "diff", "allowlisted", "legacy-cmd", "skew"];
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Row {
@@ -299,14 +294,17 @@ pub fn render(
             format!("{}/{}", ms(r.p50_b), ms(r.p99_b)),
         );
     }
+    // R-P5P9-78 (H2 I-3): a part of the verdict, never worded as one ("met", not GREEN); the
+    // one verdict line is `run_text`'s last.
     let (green, why) = gate(rows, required);
     if green {
         let _ = writeln!(
             s,
-            "GREEN ({label}): every required route is at its minimum with 0 unexplained diffs"
+            "routes ({label}): met: every required route is at its minimum with 0 unexplained \
+             diffs"
         );
     } else {
-        let _ = writeln!(s, "NOT GREEN ({label}):");
+        let _ = writeln!(s, "routes ({label}): NOT met:");
         for w in why {
             let _ = writeln!(s, "  {w}");
         }
@@ -458,84 +456,125 @@ pub fn run_text(
     let with_graphql = set == RouteSet::Graphql
         || (set == RouteSet::All && all_rows.iter().any(|r| r.route.starts_with("graphql:")));
     let required = set.required(size);
-    let (mut text, mut green) = if set == RouteSet::Graphql {
-        // R-P5P9-75 (CG-4 concern 3): no verdict line from an empty required list; the graphql
-        // gate below (node pairs and oracle pairs) is the verdict.
+    let met = |ok: bool| if ok { "met" } else { "NOT met" };
+    let (mut text, routes_ok) = if set == RouteSet::Graphql {
+        // R-P5P9-75 (CG-4 concern 3): no line from an empty required list; the graphql gate
+        // below (node pairs and oracle pairs) is that part of the verdict.
         let (table, _) = render(&all_rows, &[], true, &label);
         let table: String = table
             .lines()
-            .filter(|l| !l.starts_with("GREEN (") && !l.starts_with("NOT GREEN ("))
+            .filter(|l| !l.starts_with("routes ("))
             .map(|l| format!("{l}\n"))
             .collect();
         (table, true)
     } else {
         render(&all_rows, &required, routes == "all", &label)
     };
+    let mut parts = Vec::new();
+    if set != RouteSet::Graphql {
+        parts.push(format!("routes {}", met(routes_ok)));
+    }
+    let mut graphql_ok = true;
     if with_graphql {
         let (ok, why) = graphql_gate(&all_rows, size);
-        text.push_str(&format!(
-            "graphql gate {gate}: {}\n",
-            if ok { "GREEN" } else { "RED" }
-        ));
+        graphql_ok = ok;
+        text.push_str(&format!("graphql gate {gate}: {}\n", met(ok)));
         for w in why {
             text.push_str(&format!("  {w}\n"));
         }
-        green &= ok;
         text.push_str(&render_unpaired(&unpaired));
-        if set == RouteSet::Graphql {
-            text.push_str(&format!(
-                "verdict (gate {gate}, routes graphql: node pairs and oracle pairs): {}\n",
-                if ok { "GREEN" } else { "RED" }
-            ));
-        }
+        parts.push(format!("graphql gate {}", met(ok)));
     }
     let kg = load_known_gaps(out_dir, since_secs)?;
     let (kg_text, kg_ok) = render_known_gaps(&kg);
     text.push_str(&kg_text);
-    green &= kg_ok;
+    parts.push(format!(
+        "known gaps {}",
+        if kg_ok { "within limits" } else { "OVER" }
+    ));
+    // R-P5P9-78 (H2 I-3): one verdict line, printed last, folding in the unexplained diffs of
+    // the routes it covers, the graphql gate and the known gaps.
+    let unexplained: u64 = all_rows
+        .iter()
+        .filter(|r| {
+            required.iter().any(|(m, _)| *m == r.route)
+                || (with_graphql && r.route.starts_with("graphql:"))
+        })
+        .map(|r| r.unexplained)
+        .sum();
+    let green = routes_ok && graphql_ok && kg_ok && unexplained == 0;
+    let scope = if set == RouteSet::Graphql {
+        "routes graphql: node pairs and oracle pairs".to_string()
+    } else {
+        format!("routes {routes}")
+    };
+    let _ = writeln!(
+        text,
+        "verdict (gate {gate}, {scope}): {} (unexplained diffs {unexplained}; {})",
+        if green { "GREEN" } else { "RED" },
+        parts.join("; ")
+    );
     Ok((text, green))
 }
 
 /// R-P5P9-75: the KNOWN-GAP counts of a window: per entry and UTC day, the entries'
 /// baselines, and the window's length in ten-minute buckets with any compare.
+/// R-P5P9-78 (H2 m-2): also each day's compared buckets and baselines, so each UTC day is
+/// gated as well as the window.
 #[derive(Debug, Clone, Default)]
 pub struct KnownGaps {
     pub per_day: BTreeMap<String, BTreeMap<String, u64>>,
+    /// The days' baselines merged in date order: the latest day's value wins.
     pub baselines: BTreeMap<String, f64>,
     pub buckets: u64,
+    /// Ten-minute buckets with any compare, per UTC day.
+    pub buckets_per_day: BTreeMap<String, u64>,
+    /// Each day's own baselines (its summary file's).
+    pub baselines_per_day: BTreeMap<String, BTreeMap<String, f64>>,
 }
 
-/// Reads [`KnownGaps`] from the summary files since `since_secs`.
+/// Hours of `buckets` ten-minute buckets.
+fn bucket_hours(buckets: u64) -> f64 {
+    buckets as f64 * crate::report::WINDOW_SECS as f64 / 3600.0
+}
+
+/// Reads [`KnownGaps`] from the summary files since `since_secs`, in date order (R-P5P9-78,
+/// H2 m-2: `read_dir` is unsorted, and a later day's baseline must win). A bucket counts
+/// toward the hours only when it holds a compared record (H2 m-8).
 pub fn load_known_gaps(out_dir: &Path, since_secs: u64) -> anyhow::Result<KnownGaps> {
     let first_date = date_of(since_secs);
     let mut kg = KnownGaps::default();
-    for e in std::fs::read_dir(out_dir)
+    let mut files: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(out_dir)
         .with_context(|| format!("reading {}", out_dir.display()))?
         .filter_map(Result::ok)
-    {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(date) = name
-            .strip_prefix("summary-")
-            .and_then(|n| n.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        if date < first_date.as_str() {
-            continue;
-        }
-        let text = std::fs::read_to_string(e.path())?;
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let date = name.strip_prefix("summary-")?.strip_suffix(".json")?;
+            (date >= first_date.as_str()).then(|| (date.to_string(), e.path()))
+        })
+        .collect();
+    files.sort();
+    for (date, path) in files {
+        let text = std::fs::read_to_string(&path)?;
         let day: DailySummary =
-            serde_json::from_str(&text).with_context(|| format!("parsing {name}"))?;
-        kg.baselines.extend(day.known_gap_baselines);
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        kg.baselines.extend(day.known_gap_baselines.clone());
+        kg.baselines_per_day
+            .insert(date.clone(), day.known_gap_baselines);
         for (start, w) in day.windows {
             let secs = parse_iso(&start).map(|t| t.secs).unwrap_or(-1);
             if secs < 0 || (secs as u64) < since_secs {
                 continue;
             }
-            if !w.pairs.is_empty() {
+            let compared = w
+                .pairs
+                .values()
+                .any(|m| COMPARED.iter().any(|c| m.get(*c).is_some_and(|n| *n > 0)));
+            if compared {
                 kg.buckets += 1;
+                *kg.buckets_per_day.entry(date.clone()).or_default() += 1;
             }
-            let d = kg.per_day.entry(date.to_string()).or_default();
+            let d = kg.per_day.entry(date.clone()).or_default();
             for (id, n) in w.known_gaps {
                 *d.entry(id).or_default() += n;
             }
@@ -547,9 +586,10 @@ pub fn load_known_gaps(out_dir: &Path, since_secs: u64) -> anyhow::Result<KnownG
 
 /// The KNOWN-GAP lines of `summary` and the FV daily read: each entry's records per day and
 /// in the window, never counted as explained, against its limit (the CG-4 per-hour baseline
-/// × 1.5 × the window's hours). An entry over its limit, or with no baseline, fails.
+/// × 1.5 × the compared hours), over the window and (R-P5P9-78, H2 m-2) over each UTC day,
+/// that day with its own baseline. An entry over a limit, or with no baseline, fails.
 pub fn render_known_gaps(kg: &KnownGaps) -> (String, bool) {
-    let hours = kg.buckets as f64 * crate::report::WINDOW_SECS as f64 / 3600.0;
+    let hours = bucket_hours(kg.buckets);
     let mut total: BTreeMap<&str, u64> = BTreeMap::new();
     for m in kg.per_day.values() {
         for (id, n) in m {
@@ -562,28 +602,38 @@ pub fn render_known_gaps(kg: &KnownGaps) -> (String, bool) {
     let mut ok = true;
     let mut s = format!(
         "known gaps (never explained; gate: at most the CG-4 baseline per hour x 1.5 over \
-         {hours:.1} h):\n"
+         {hours:.1} h, and over each UTC day's compared hours):\n"
     );
-    for (id, n) in &total {
-        let line = match kg.baselines.get(*id) {
+    let judge = |n: u64, b: Option<f64>, h: f64| -> (String, bool) {
+        match b {
             Some(b) => {
-                let limit = b * 1.5 * hours;
-                let over = *n as f64 > limit;
-                ok &= !over;
-                format!(
-                    "  {id}: {n} (limit {limit:.1}: baseline {b}/h x 1.5){}",
-                    if over { " OVER" } else { "" }
+                let limit = b * 1.5 * h;
+                let over = n as f64 > limit;
+                let tail = if over { " OVER" } else { "" };
+                (
+                    format!("{n} (limit {limit:.1}: baseline {b}/h x 1.5 x {h:.1} h){tail}"),
+                    !over,
                 )
             }
-            None => {
-                ok = false;
-                format!("  {id}: {n} (no baseline: OVER)")
-            }
-        };
-        let _ = writeln!(s, "{line}");
+            None => (format!("{n} (no baseline: OVER)"), false),
+        }
+    };
+    for (id, n) in &total {
+        let (line, within) = judge(*n, kg.baselines.get(*id).copied(), hours);
+        ok &= within;
+        let _ = writeln!(s, "  {id}: {line}");
         for (date, m) in &kg.per_day {
             if let Some(d) = m.get(*id) {
-                let _ = writeln!(s, "    {date}: {d}");
+                let b = kg
+                    .baselines_per_day
+                    .get(date)
+                    .and_then(|x| x.get(*id))
+                    .or_else(|| kg.baselines.get(*id))
+                    .copied();
+                let h = bucket_hours(kg.buckets_per_day.get(date).copied().unwrap_or(0));
+                let (line, within) = judge(*d, b, h);
+                ok &= within;
+                let _ = writeln!(s, "    {date}: {line}");
             }
         }
     }
@@ -961,6 +1011,199 @@ mod tests {
         .unwrap();
     }
 
+    /// Writes one summary file per day: (date, buckets, its pair's class, known-gap-p records
+    /// in the first bucket, known-gap-p baseline per hour).
+    fn write_days(dir: &Path, days: &[(&str, u64, &str, u64, f64)]) {
+        for (date, buckets, class, kg, base) in days {
+            let windows = (0..*buckets)
+                .map(|i| {
+                    let mut w = window(&[("account|compat|cwd", &[(*class, 1)])]);
+                    if i == 0 && *kg > 0 {
+                        w.known_gaps.insert("known-gap-p".into(), *kg);
+                    }
+                    (format!("{date}T{:02}:{:02}:00Z", i / 6, (i % 6) * 10), w)
+                })
+                .collect();
+            let day = DailySummary {
+                date: date.to_string(),
+                windows,
+                known_gap_baselines: [("known-gap-p".to_string(), *base)].into_iter().collect(),
+                ..Default::default()
+            };
+            std::fs::write(
+                dir.join(format!("summary-{date}.json")),
+                serde_json::to_vec(&day).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    /// R-P5P9-78 (H2 m-2): each UTC day is gated against its own baseline and compared hours,
+    /// so a one-day burst fails though the window's total is within; the baselines merge in
+    /// date order (the latest day's wins); a bucket with no compare adds no hour.
+    #[test]
+    fn known_gaps_are_gated_per_day() {
+        let kg = |days: &[(&str, u64, &str, u64, f64)]| {
+            let dir = tempfile::tempdir().unwrap();
+            write_days(dir.path(), days);
+            load_known_gaps(dir.path(), 0).unwrap()
+        };
+        // Baseline 6/h. 11-14: 1 h, 12 records (day limit 9). 11-15: 5 h, none. The window's
+        // limit is 6 x 1.5 x 6 h = 54.
+        let burst = kg(&[
+            ("2026-11-14", 6, "match", 12, 6.0),
+            ("2026-11-15", 30, "match", 0, 6.0),
+        ]);
+        let (text, ok) = render_known_gaps(&burst);
+        assert!(!ok, "{text}");
+        assert!(text.contains("known-gap-p: 12 (limit 54.0"), "{text}");
+        assert!(!text.contains("limit 54.0: baseline 6/h x 1.5 x 6.0 h) OVER"));
+        assert!(text.contains("2026-11-14: 12 (limit 9.0") && text.contains("OVER"));
+        // The same day with 9 records is within.
+        let quiet = kg(&[
+            ("2026-11-14", 6, "match", 9, 6.0),
+            ("2026-11-15", 30, "match", 0, 6.0),
+        ]);
+        let (text, ok) = render_known_gaps(&quiet);
+        assert!(ok, "{text}");
+        // Seven days, each with its own baseline: the latest day's wins the window.
+        let days: Vec<(String, f64)> = (9..=15)
+            .map(|d| (format!("2026-11-{d:02}"), d as f64))
+            .collect();
+        let rows: Vec<(&str, u64, &str, u64, f64)> = days
+            .iter()
+            .map(|(d, b)| (d.as_str(), 1, "match", 0, *b))
+            .collect();
+        let merged = kg(&rows);
+        assert_eq!(merged.baselines.get("known-gap-p"), Some(&15.0));
+        assert_eq!(merged.buckets, 7);
+        // A bucket with only an error of ours is no compared hour.
+        assert_eq!(kg(&[("2026-11-15", 6, "a-error", 0, 6.0)]).buckets, 0);
+    }
+
+    /// R-P5P9-78 (H2 I-3, review probe 2): one verdict line, printed last, folds in the
+    /// unexplained diffs, the graphql gate and the known gaps; no earlier line reads GREEN.
+    /// A known gap over its limit makes the last line RED on `must` and on `graphql`.
+    #[test]
+    fn the_last_line_is_the_one_verdict_and_folds_in_the_known_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let must: Vec<(String, Vec<(&str, u64)>)> = MUST_SMALL
+            .iter()
+            .map(|(r, min)| (format!("{r}|compat|cwd"), vec![("match", *min)]))
+            .collect();
+        let node: &[(&str, u64)] = &[("match", 60)];
+        let oracle: &[(&str, u64)] = &[("match", 250), ("known-gap", 2)];
+        let mut pairs: Vec<(&str, &[(&str, u64)])> = must
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        pairs.extend([
+            ("graphql:NodeTx|compat|node", node),
+            ("graphql:NodeBlock|compat|node", node),
+            ("graphql:NodeBalance|compat|node", node),
+            ("graphql:QFungibleAccount|compat|oracle", oracle),
+        ]);
+        // Baseline 6/h x 1.5 x 1/6 h = 1.5: two records are over.
+        write_day(
+            dir.path(),
+            &pairs,
+            &[("known-gap-q", 2)],
+            &[("known-gap-q", 6.0)],
+        );
+        for (routes, verdict) in [
+            (
+                "must",
+                "verdict (gate small, routes must): RED (unexplained diffs 0; routes met; \
+                 known gaps OVER)",
+            ),
+            (
+                "graphql",
+                "verdict (gate small, routes graphql: node pairs and oracle pairs): RED \
+                 (unexplained diffs 0; graphql gate met; known gaps OVER)",
+            ),
+            (
+                "all",
+                "verdict (gate small, routes all): RED (unexplained diffs 0; routes NOT met; \
+                 graphql gate met; known gaps OVER)",
+            ),
+        ] {
+            let (text, green) = run_text(dir.path(), "2026-11-15", routes, "small").unwrap();
+            assert!(!green, "{text}");
+            assert_eq!(text.lines().last(), Some(verdict), "{text}");
+            assert!(!text.contains("GREEN"), "{text}");
+        }
+        // The neighbour: the same window within the limit (one record) is GREEN, last.
+        write_day(
+            dir.path(),
+            &pairs,
+            &[("known-gap-q", 1)],
+            &[("known-gap-q", 6.0)],
+        );
+        let (text, green) = run_text(dir.path(), "2026-11-15", "must", "small").unwrap();
+        assert!(green, "{text}");
+        assert_eq!(
+            text.lines().last(),
+            Some(
+                "verdict (gate small, routes must): GREEN (unexplained diffs 0; routes met; \
+                 known gaps within limits)"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("GREEN").count(), 1, "{text}");
+    }
+
+    /// R-P5P9-78 (H2 m-1): the shipped P baseline counts only the records P matches (3 over
+    /// 4.05 h = 0.74/h, limit 1.11/h): 3 records in 2 h are over (limit 2.2), 2 are within.
+    #[test]
+    fn the_shipped_p_baseline_counts_only_matched_records() {
+        let al = crate::allowlist::Allowlist::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+        )
+        .unwrap();
+        let p = "known-gap-p-heavy-account-deadline";
+        let b = al.baseline(p).unwrap();
+        assert_eq!(b, 0.74);
+        let gate = |n: u64| {
+            let dir = tempfile::tempdir().unwrap();
+            write_days(dir.path(), &[("2026-11-15", 12, "match", 0, b)]);
+            let mut kg = load_known_gaps(dir.path(), 0).unwrap();
+            kg.baselines = [(p.to_string(), b)].into_iter().collect();
+            kg.baselines_per_day.clear();
+            kg.per_day = [(
+                "2026-11-15".to_string(),
+                [(p.to_string(), n)].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect();
+            render_known_gaps(&kg)
+        };
+        let (text, ok) = gate(3);
+        assert!(!ok && text.contains("limit 2.2"), "{text}");
+        let (text, ok) = gate(2);
+        assert!(ok, "{text}");
+    }
+
+    /// R-P5P9-78 (H2 m-8): known-gap records do not reach a route minimum; the same count
+    /// of matches does.
+    #[test]
+    fn known_gap_records_do_not_reach_a_minimum() {
+        let pairs = |last: &'static [(&'static str, u64)]| -> Vec<Row> {
+            let mut p: Vec<(String, Vec<(&str, u64)>)> = MUST_SMALL
+                .iter()
+                .map(|(r, min)| (format!("{r}|compat|cwd"), vec![("match", *min)]))
+                .collect();
+            p[0].1 = last.to_vec();
+            let refs: Vec<(&str, &[(&str, u64)])> =
+                p.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+            rows(&window(&refs))
+        };
+        let (g, why) = gate(&pairs(&[("match", 99), ("known-gap", 1)]), MUST_SMALL);
+        assert!(!g);
+        assert_eq!(why, vec!["account: 99 compared, needs 100".to_string()]);
+        let (g, why) = gate(&pairs(&[("match", 100), ("known-gap", 1)]), MUST_SMALL);
+        assert!(g, "{why:?}");
+    }
+
     /// R-P5P9-75 (CG-4 concern 3): `--routes graphql` prints no GREEN line from an empty
     /// required list; its verdict counts the oracle pairs as well as the node pairs.
     #[test]
@@ -1008,9 +1251,10 @@ mod tests {
         assert!(text.contains("oracle pairs): GREEN"), "{text}");
     }
 
-    /// R-P5P9-75: known-gap records count as compared, never as explained or unexplained;
-    /// the summary lists them per entry and day and gates each against its CG-4 baseline per
-    /// hour x 1.5 over the window (one bucket: 1/6 h). Over it, or without a baseline: RED.
+    /// R-P5P9-75: known-gap records count neither as explained nor as unexplained, and
+    /// (R-P5P9-78, H2 m-8) not as compared either; the summary lists them per entry and day
+    /// and gates each against its CG-4 baseline per hour x 1.5 over the window (one bucket:
+    /// 1/6 h). Over it, or without a baseline: RED.
     #[test]
     fn known_gaps_are_reported_apart_and_gated_by_their_baseline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1042,7 +1286,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (q.compared, q.unexplained, q.allowlisted, q.known_gap),
-            (11, 0, 0, 1)
+            (10, 0, 0, 1)
         );
         // Two records: over.
         write_day(
