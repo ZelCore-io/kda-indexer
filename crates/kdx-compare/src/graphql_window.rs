@@ -1244,6 +1244,22 @@ fn content_verdict(
 /// block, R-P5P9-63 (2)); `bh` is the node's height of the row's block when the row selects
 /// no height (R-P5P9-63 (5)). Otherwise the row's content must be the node's.
 pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u64>) -> Verdict {
+    poll_verdict_at(r, n, p, oracle, bh, false)
+}
+
+/// [`poll_verdict`], with `gone`: the node does not hold the row's block (a header-by-hash
+/// 404, read twice). R-P5P9-86 M: the oracle's row in a block the node does not hold, while the
+/// node holds the key in another, is an orphan by block; the oracle's row with only a height,
+/// another than the node's for the key, is an orphan by height ([`decide`] then requires ours
+/// to list the row at the node's block).
+pub fn poll_verdict_at(
+    r: &RowId,
+    n: &Value,
+    p: &Value,
+    oracle: bool,
+    bh: Option<u64>,
+    gone: bool,
+) -> Verdict {
     let pb = p
         .pointer("/metaData/blockHash")
         .and_then(Value::as_str)
@@ -1267,6 +1283,11 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
                     "the row's block is not the node's for the key, at another height: an \
                      orphan by block",
                 ),
+                None if oracle && gone => v(
+                    Canon::No,
+                    "the node does not hold the row's block (a header-by-hash 404, read twice) \
+                     and holds the key in another: an orphan by block",
+                ),
                 _ => v(
                     not_held(oracle),
                     "the row's block is not the node's for the key, at another height",
@@ -1275,6 +1296,12 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
         }
     }
     if r.height.is_some_and(|h| Some(h) != ph) {
+        if oracle && r.block.is_none() && ph.is_some() {
+            return v(
+                Canon::No,
+                &format!("{HEIGHT_ORPHAN}: the row has only a height, another than the node's for the key"),
+            );
+        }
         return v(not_held(oracle), "the node's height for the key is another");
     }
     let mut out = content_verdict(r, n, p, oracle, v);
@@ -1309,6 +1336,9 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
     }
     out
 }
+
+/// R-P5P9-86 M: an oracle row with only a height, another than the node's for its key.
+pub const HEIGHT_ORPHAN: &str = "an orphan by height";
 
 /// R-P5P9-75 E: the class of an oracle row off the node's chain by its transaction.
 pub const NOT_IN_NODE_TX: &str = "oracle-row-not-in-node-tx";
@@ -2861,6 +2891,25 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                 // the rows of the group with that content; a block verdict holds for the key.
                 let by_content = vj.is_some_and(|v| v.why.contains(NOT_IN_NODE_TX));
                 let class = if by_content { NOT_IN_NODE_TX } else { "orphan" };
+                // R-P5P9-86 M: an orphan by height only when ours lists the row at the node's
+                // block for the key.
+                let by_height = vj.is_some_and(|v| v.why.contains(HEIGHT_ORPHAN));
+                let ours_at_node = p.a.iter().zip(va).any(|(ra, x)| {
+                    ra.id.rk == rb.id.rk
+                        && x.as_ref().is_some_and(|x| {
+                            x.canon == Canon::Yes
+                                && x.block.is_some()
+                                && x.block == vj.and_then(|v| v.block.clone())
+                        })
+                });
+                if by_height && !ours_at_node {
+                    d.undecided.push(format!(
+                        "an oracle row with only a height, another than the node's for the key, \
+                         that ours does not list at the node's block: {}",
+                        rb.id.evidence()
+                    ));
+                    continue;
+                }
                 for &k in g {
                     if by_content && node_of(&p.b[k]) != node_of(rb) {
                         d.undecided.push(format!(
@@ -2870,7 +2919,7 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                         ));
                     } else {
                         d.oracle.push(evidence(&p.b[k], vj, class));
-                        if by_content || vj.is_some_and(|v| v.why.contains("orphan by block")) {
+                        if by_content || vj.is_some_and(|v| v.why.contains("an orphan by")) {
                             d.off_chain.push(evidence(&p.b[k], vj, class));
                         }
                     }
@@ -3378,16 +3427,26 @@ impl Ctx {
             // A row in another block than the node's, without a height: the node's height of
             // its block decides whether that block is an orphan at the key's height.
             let pb = p.pointer("/metaData/blockHash").and_then(Value::as_str);
-            let bh = match (&id.block, id.height) {
-                (Some(b), None) if pb != Some(b.as_str()) => {
+            let (mut bh, mut gone) = (None, false);
+            if let (Some(b), None) = (&id.block, id.height) {
+                if pb != Some(b.as_str()) {
                     match self.h7_block_height(chain, b, st).await {
-                        Ok(h) => h,
+                        Ok(Some(h)) => bh = Some(h),
+                        // R-P5P9-86 M: a 404 is read once more before the block counts as one
+                        // the node does not hold.
+                        Ok(None) if oracle => {
+                            st.by_hash.remove(b.as_str());
+                            match self.h7_block_height(chain, b, st).await {
+                                Ok(h) => (bh, gone) = (h, h.is_none()),
+                                Err(w) => return Verdict::unknown(w),
+                            }
+                        }
+                        Ok(None) => {}
                         Err(w) => return Verdict::unknown(w),
                     }
                 }
-                _ => None,
-            };
-            return poll_verdict(id, n, &p, oracle, bh);
+            }
+            return poll_verdict_at(id, n, &p, oracle, bh, gone);
         }
         // Unknown to /poll: a coinbase row, settled by the node's block at its height (its
         // own, or the node's height of its block: R-P5P9-63 (5)).

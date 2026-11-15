@@ -7641,3 +7641,74 @@ async fn d5_m1_rows_settled_without_an_index_have_their_own_visible_hit() {
         "{e:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// FVH-E1 (R-P5P9-86, the harness round after CG-5)
+
+/// R-P5P9-86 M (widened): `/poll` puts the key in B100 and the node does not hold the oracle
+/// row's block X9 (a header-by-hash 404, read twice): the oracle row is an orphan by block
+/// (CG-5 #226). A row with only a height, at another height than the node's for the key, is
+/// an orphan by height only when ours has the row at the node's block (#1997); otherwise it
+/// stays a diff.
+#[tokio::test]
+async fn e1_m_orphans_by_an_unknown_block_and_by_height() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x0", "m"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let calls = node.calls.clone();
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("s", "r")));
+    let at = |b: Option<&str>, h: Option<u64>| {
+        let mut e = h7_xrow("m", 0, json!(1.0), Some(("s", "r")));
+        let blk = &mut e["node"]["block"];
+        match h {
+            Some(h) => blk["height"] = json!(h),
+            None => {
+                blk.as_object_mut().unwrap().remove("height");
+            }
+        }
+        if let Some(b) = b {
+            blk["hash"] = json!(b);
+        }
+        e
+    };
+    // The unknown-block orphan: X9 is not a block the node holds; no height on the row.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), at(Some("B100"), Some(100))],
+        vec![x0.clone(), at(Some("X9"), None)],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(format!("{d:?}").contains("orphan"), "{d:?}");
+    let reads = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str() == "header-by-hash X9")
+        .count();
+    assert_eq!(reads, 2, "the 404 is read twice");
+    // The height-only orphan: the oracle's m at 99, the node's at 100 (B100), ours at B100.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), at(None, Some(100))],
+        vec![x0.clone(), at(None, Some(99))],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(format!("{d:?}").contains("orphan by height"), "{d:?}");
+    // Height-only, but ours lacks the row at the node's block: a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), at(None, Some(99))],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}
