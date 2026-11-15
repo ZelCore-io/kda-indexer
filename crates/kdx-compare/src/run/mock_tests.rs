@@ -5819,3 +5819,82 @@ async fn d1_c_the_oracle_coinbase_request_key_is_decoded_and_settled_on_the_coin
     .await;
     assert!(!only_hits(&d), "{d:?}");
 }
+
+/// Runs H7 and the diff on one pair of `transfers` pages (no variables).
+async fn d1_settle(
+    ctx: &Ctx,
+    a: Vec<Value>,
+    b: Vec<Value>,
+    cut: (bool, bool),
+) -> (Vec<crate::report::DiffEntry>, Option<String>) {
+    let mut a = h7_page("transfers", cut.0, a);
+    let mut b = h7_page("transfers", cut.1, b);
+    ctx.gql_settle(
+        &ctx.targets["a"],
+        &serde_json::Map::new(),
+        &mut a,
+        &mut b,
+        7_000_000,
+        false,
+    )
+    .await
+}
+
+/// R-P5P9-75 A: an ours-only transfer row's `crossChainTransfer` is checked against the node:
+/// null iff the node's transaction has no TRANSFER_XCHAIN for that transfer, else the target
+/// chain and receiver of that event. A TRANSFER_XCHAIN row with a null `crossChainTransfer`,
+/// or one that names another chain, stays a diff.
+#[tokio::test]
+async fn d1_a_cross_chain_transfer_is_checked_against_the_nodes_xchain_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x0", "x1"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.5));
+        node.polls.insert(k, v);
+    }
+    let ev = |name: &str, p: Value| json!({"name": name, "module": {"name": "coin"}, "params": p});
+    let (k, v) = h7_poll(
+        "x2",
+        "B100",
+        100,
+        json!([
+            ev("TRANSFER", json!(["s", "", 1.5])),
+            ev("TRANSFER_XCHAIN", json!(["s", "r", 1.5, "1"]))
+        ]),
+    );
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let row = |rk: &str, to: &str, x: Value| {
+        let mut e = h7_xrow(rk, 100, json!(1.5), Some(("s", to)));
+        e["node"]["crossChainTransfer"] = x;
+        e
+    };
+    let x0 = row("x0", "r", Value::Null);
+    let settle = |ours: Value| {
+        d1_settle(
+            &ctx,
+            vec![x0.clone(), ours],
+            vec![x0.clone()],
+            (false, false),
+        )
+    };
+    // No TRANSFER_XCHAIN in the node's transaction: ours' null is the node's.
+    let (d, note) = settle(row("x1", "r", Value::Null)).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // The transfer's TRANSFER_XCHAIN to chain 1 and r: ours names both.
+    let xc = json!({"__typename": "Transfer", "chainId": "1", "receiverAccount": "r"});
+    let (d, note) = settle(row("x2", "", xc)).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // A TRANSFER_XCHAIN row with crossChainTransfer null: a diff.
+    let (d, note) = settle(row("x2", "", Value::Null)).await;
+    assert!(!only_hits(&d), "{d:?}");
+    assert!(note.unwrap_or_default().contains("crossChainTransfer"));
+    // Another target chain: a diff.
+    let xc = json!({"chainId": "2", "receiverAccount": "r"});
+    let (d, _) = settle(row("x2", "", xc)).await;
+    assert!(!only_hits(&d), "{d:?}");
+    // A link where the node's transaction has none: a diff.
+    let xc = json!({"chainId": "1", "receiverAccount": "r"});
+    let (d, _) = settle(row("x1", "r", xc)).await;
+    assert!(!only_hits(&d), "{d:?}");
+}

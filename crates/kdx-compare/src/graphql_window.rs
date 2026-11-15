@@ -358,6 +358,9 @@ pub struct Verdict {
     pub matches: usize,
     /// The node's TRANSFER events of the row's transaction (a tx row's account filter).
     pub transfers: Vec<Value>,
+    /// R-P5P9-75 A: the node's TRANSFER_XCHAIN and TRANSFER_XCHAIN_RECD events of the row's
+    /// transaction.
+    pub xchain: Vec<Value>,
     /// R-P5P9-68 (2): ours-only tx rows' `cmd` fields against the node's signed command
     /// (`None`: not checked).
     pub cmd: Option<CmdCheck>,
@@ -393,6 +396,7 @@ impl Verdict {
             event: None,
             matches: 0,
             transfers: Vec::new(),
+            xchain: Vec::new(),
             cmd: None,
             ctime: None,
         }
@@ -603,6 +607,7 @@ fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
             "blockHash",
             "chainId",
             "creationTime",
+            "crossChainTransfer",
             "height",
             "id",
             "moduleHash",
@@ -646,6 +651,8 @@ fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
             "weight",
         ],
         (Kind::Block, "parent") => &["hash"],
+        // R-P5P9-75 A: [`xchain_mismatch`] against the node's TRANSFER_XCHAIN.
+        (Kind::Transfer, "crossChainTransfer") => &["chainId", "receiverAccount"],
         _ => &[],
     }
 }
@@ -662,6 +669,7 @@ fn type_at(kind: Kind, path: &str, m: &Map<String, Value>) -> Option<&'static st
         (Kind::Event, "") => "Event",
         (Kind::Block, "") | (Kind::Tx, "result.block") | (Kind::Block, "parent") => "Block",
         (Kind::Transfer | Kind::Event, "block") => "Block",
+        (Kind::Transfer, "crossChainTransfer") => "Transfer",
         (Kind::Tx, "result") => "TransactionResult",
         (Kind::Tx, "cmd") => "TransactionCommand",
         (Kind::Tx, "cmd.meta") => "TransactionMeta",
@@ -688,6 +696,58 @@ fn null_is_checked(path: &str) -> bool {
     ["result.", "cmd."].iter().any(|p| path.starts_with(p))
 }
 
+/// R-P5P9-75 A: why an ours-only transfer row's `crossChainTransfer` (`x`) is not the node's,
+/// or `None` when it is. The row is the node's event `v.event`; the node's TRANSFER_XCHAIN
+/// for it has the same sender and amount (a TRANSFER_XCHAIN_RECD the same receiver and
+/// amount). Null iff the transaction holds neither for it; otherwise one TRANSFER_XCHAIN,
+/// whose target chain and receiver are the selected `chainId` and `receiverAccount`.
+pub fn xchain_mismatch(x: &Value, v: &Verdict) -> Option<String> {
+    let Some(ev) = v.event.as_ref() else {
+        return Some("crossChainTransfer: no node event for the row".into());
+    };
+    let p = |e: &Value, i: usize| e.pointer(&format!("/params/{i}")).cloned();
+    let same = |e: &Value, i: usize| p(e, i).is_some() && p(e, i) == p(ev, i);
+    let amount = |e: &Value| {
+        p(e, 2)
+            .zip(p(ev, 2))
+            .is_some_and(|(a, b)| same_amount(&a, &b, false))
+    };
+    let name = |e: &Value| e.get("name").and_then(Value::as_str).map(str::to_string);
+    let sent: Vec<&Value> = v
+        .xchain
+        .iter()
+        .filter(|e| name(e).as_deref() == Some("TRANSFER_XCHAIN") && same(e, 0) && amount(e))
+        .collect();
+    let recd = v
+        .xchain
+        .iter()
+        .any(|e| name(e).as_deref() == Some("TRANSFER_XCHAIN_RECD") && same(e, 1) && amount(e));
+    if x.is_null() {
+        return (!sent.is_empty() || recd).then(|| {
+            "crossChainTransfer is null; the node's transaction holds a cross-chain event for \
+             the transfer"
+                .into()
+        });
+    }
+    let [e] = sent.as_slice() else {
+        return Some(format!(
+            "crossChainTransfer is set; the node's transaction holds {} TRANSFER_XCHAIN for the \
+             transfer",
+            sent.len()
+        ));
+    };
+    let ok = |k: &str, i: usize| {
+        sel(x, k).is_none_or(|y| text(y).is_some() && text(y) == p(e, i).as_ref().and_then(text))
+    };
+    if !ok("chainId", 3) {
+        return Some("crossChainTransfer.chainId is not the node's target chain".into());
+    }
+    if !ok("receiverAccount", 1) {
+        return Some("crossChainTransfer.receiverAccount is not the node's receiver".into());
+    }
+    None
+}
+
 /// R-P5P9-70 (I-1): the first field a row's node selects that the harness does not check
 /// against the node (dotted path, list indices left out), or `None`. An empty object, a null
 /// where an object is selected and a list or object where a value is selected are unchecked
@@ -711,7 +771,10 @@ pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
                 if !keys.contains(&k.as_str()) {
                     return Some(p);
                 }
-                if !checked_keys(kind, &p).is_empty() {
+                if x.is_null() && kind == Kind::Transfer && p == "crossChainTransfer" {
+                    // R-P5P9-75 A: a null link is checked by [`xchain_mismatch`].
+                    None
+                } else if !checked_keys(kind, &p).is_empty() {
                     walk(kind, x, &p)
                 } else if x.is_object() || x.is_array() {
                     Some(p)
@@ -999,6 +1062,16 @@ fn content_verdict(
         x.transfers = events
             .iter()
             .filter(|e| e.get("name").and_then(Value::as_str) == Some("TRANSFER"))
+            .map(|e| (*e).clone())
+            .collect();
+        x.xchain = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.get("name").and_then(Value::as_str),
+                    Some("TRANSFER_XCHAIN" | "TRANSFER_XCHAIN_RECD")
+                )
+            })
             .map(|e| (*e).clone())
             .collect();
         x
@@ -2207,6 +2280,19 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
             break;
         }
         if !settled {
+            continue;
+        }
+        // R-P5P9-75 A: `crossChainTransfer` against the node's cross-chain events.
+        if let Some(why) = n
+            .get("crossChainTransfer")
+            .filter(|_| ra.id.kind == Some(Kind::Transfer))
+            .and_then(|x| xchain_mismatch(x, v))
+        {
+            d.rejected.push((
+                Some(ra.edge.clone()),
+                None,
+                format!("an ours-only row whose {why}"),
+            ));
             continue;
         }
         // A transfer's relay id holds its module hash: the node's event's.
