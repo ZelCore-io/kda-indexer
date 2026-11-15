@@ -1008,9 +1008,10 @@ impl std::fmt::Display for FollowPageFault {
 
 impl std::error::Error for FollowPageFault {}
 
-/// The first page answered, but not as a page (R-P5P9-70 m-3): a body that is not JSON, or a
-/// 4xx, at a status that is no transport or server fault (not 5xx, 408 or 429). On ours it is
-/// a diff, not an error.
+/// Ours' first page answered, but not as a page (R-P5P9-70 m-3): a body that is not JSON, or
+/// a 4xx, at a status that is no transport or server fault (not 5xx, 408 or 429). It is a
+/// diff, not an error, in the oracle pair, the NOT_SUPPORTED lane and the node lanes
+/// (R-P5P9-72 (3)); the oracle's first page is not checked this way.
 #[derive(Debug)]
 pub struct FirstPageFault {
     pub target: String,
@@ -1057,9 +1058,9 @@ fn page_fault_is_ours(status: u16) -> bool {
     status < 500 && status != 408 && status != 429
 }
 
-/// The diff entry of a fetch that stopped at a follow-page fault of ours or the merged-bytes
-/// cap (R-P5P9-67 I-A (b), m-3); `ours`: the side is ours (a follow-page fault of the
-/// oracle's stays `b-error`).
+/// The diff entry of a fetch that stopped at a first- or follow-page fault of ours or the
+/// merged-bytes cap (R-P5P9-67 I-A (b), m-3); `ours`: the side is ours (a follow-page fault
+/// of the oracle's stays `b-error`; its first page is never a [`FirstPageFault`]).
 pub fn fetch_stop_entry(e: &anyhow::Error, ours: bool) -> Option<DiffEntry> {
     let (path, ev) = if let Some(f) = e.downcast_ref::<FollowPageFault>() {
         if !ours {
@@ -1096,12 +1097,14 @@ pub fn fetch_stop_entry(e: &anyhow::Error, ours: bool) -> Option<DiffEntry> {
 /// connection's edges are concatenated; the last page's `pageInfo` is kept). A follow page
 /// that fails ([`follow_page_fault`]) fails the fetch, as a [`FollowPageFault`] when it
 /// answered at a status that is ours' fault; past [`MERGED_BYTES_CAP`] bytes the fetch stops
-/// with [`MergedBytes`].
+/// with [`MergedBytes`]. `ours`: the target is ours, whose first page that is no page fails
+/// the fetch as a [`FirstPageFault`] (R-P5P9-72 (3): the oracle's keeps the plain parse).
 pub async fn fetch_pages(
     t: &Target,
     op: &GqlOp,
     vars: &Map<String, Value>,
     depth: u32,
+    ours: bool,
 ) -> anyhow::Result<Answer> {
     let mut vars = vars.clone();
     let mut ms: Vec<u64> = Vec::new();
@@ -1120,10 +1123,10 @@ pub async fn fetch_pages(
     }
     let status = cap.status;
     let raw = trim_body(&cap.body);
-    // R-P5P9-70 (m-3): a first page that is not JSON, or a 4xx, at a status that is ours'
-    // fault (not 5xx, 408 or 429).
+    // R-P5P9-70 (m-3): ours' first page that is not JSON, or a 4xx, at a status that is
+    // ours' fault (not 5xx, 408 or 429).
     let parsed = serde_json::from_slice::<Value>(&cap.body);
-    if page_fault_is_ours(status) && (parsed.is_err() || (400..500).contains(&status)) {
+    if ours && page_fault_is_ours(status) && (parsed.is_err() || (400..500).contains(&status)) {
         let head = crate::report::trim_escaped(&raw, crate::report::SHORT_TRIM);
         let why = match &parsed {
             Err(e) => format!("not JSON: {e}: {head}"),
@@ -1237,8 +1240,9 @@ impl Ctx {
         op: &GqlOp,
         vars: &Map<String, Value>,
         depth: u32,
+        ours: bool,
     ) -> anyhow::Result<Answer> {
-        let a = fetch_pages(t, op, vars, depth).await?;
+        let a = fetch_pages(t, op, vars, depth, ours).await?;
         self.gql_count(&op.route(), &t.name, &a.ms);
         Ok(a)
     }
@@ -1513,7 +1517,7 @@ impl Ctx {
         } else {
             self.cfg.follow_depth
         };
-        let mut a = match self.gql_fetch(ta, op, vars, depth).await {
+        let mut a = match self.gql_fetch(ta, op, vars, depth, true).await {
             Ok(a) => a,
             // R-P5P9-67 I-A (b), m-3: a follow-page fault of ours, or the merged-bytes cap, is
             // a diff; transport errors, timeouts and 5xx stay `a-error`.
@@ -1525,7 +1529,7 @@ impl Ctx {
         if a.status >= 500 {
             return self.gql_a_error(op, vars, ta, &tb.name, &format!("HTTP {}", a.status));
         }
-        let mut b = match self.gql_fetch(tb, op, vars, depth).await {
+        let mut b = match self.gql_fetch(tb, op, vars, depth, false).await {
             Ok(b) => {
                 self.gql.note_oracle(false);
                 b
@@ -2365,14 +2369,19 @@ impl Ctx {
     }
 
     /// `pactQuery` and friends answer `NOT_SUPPORTED` (checked on A alone).
-    async fn gql_not_supported(
+    pub(crate) async fn gql_not_supported(
         &self,
         ta: &Target,
         op: &GqlOp,
         vars: &Map<String, Value>,
     ) -> Outcome {
-        let a = match self.gql_fetch(ta, op, vars, 0).await {
+        let a = match self.gql_fetch(ta, op, vars, 0, true).await {
             Ok(a) => a,
+            // R-P5P9-72 (3): ours' first-page fault is a diff here too.
+            Err(e) if e.downcast_ref::<FirstPageFault>().is_some() => {
+                let d = fetch_stop_entry(&e, true).expect("entry");
+                return self.gql_fetch_stop(op, vars, ta, "expected", None, d, &e);
+            }
             Err(e) => return self.gql_a_error(op, vars, ta, "expected", &format!("{e:#}")),
         };
         if a.error_codes().iter().any(|c| c == "NOT_SUPPORTED") {
@@ -2408,7 +2417,7 @@ impl Ctx {
         op: &GqlOp,
         vars: &Map<String, Value>,
     ) -> Result<Value, Outcome> {
-        match self.gql_fetch(ta, op, vars, 0).await {
+        match self.gql_fetch(ta, op, vars, 0, true).await {
             Ok(a) if a.status < 500 && a.body.get("errors").is_none() => Ok(a.body["data"].clone()),
             Ok(a) => Err(self.gql_record(
                 op,
@@ -2423,6 +2432,11 @@ impl Ctx {
                 &[],
                 Some(format!("HTTP {} errors {:?}", a.status, a.error_codes())),
             )),
+            // R-P5P9-72 (3): ours' first-page fault is a diff in every node lane.
+            Err(e) if e.downcast_ref::<FirstPageFault>().is_some() => {
+                let d = fetch_stop_entry(&e, true).expect("entry");
+                Err(self.gql_fetch_stop(op, vars, ta, "node", None, d, &e))
+            }
             Err(e) => Err(self.gql_a_error(op, vars, ta, "node", &format!("{e:#}"))),
         }
     }
@@ -2587,7 +2601,7 @@ impl Ctx {
     /// still one coinbase below the node's after the retry is a one-block skew (class `skew`)
     /// when the node's block at its read height paid that coinbase to the account. R-P5P9-58:
     /// F2 here is exact f64 equality, and a record with real diffs keeps its skew entries.
-    async fn gql_node_balance(
+    pub(crate) async fn gql_node_balance(
         &self,
         ta: &Target,
         op: &GqlOp,
@@ -3639,8 +3653,8 @@ mod tests {
             target(&mock(true).await, "b"),
         );
         // Depth 1 follows one more page: 3 + 3 rows on A, 2 + 2 on B.
-        let mut a = fetch_pages(&ta, &op, &vars, 1).await.unwrap();
-        let mut b = fetch_pages(&tb, &op, &vars, 1).await.unwrap();
+        let mut a = fetch_pages(&ta, &op, &vars, 1, true).await.unwrap();
+        let mut b = fetch_pages(&tb, &op, &vars, 1, false).await.unwrap();
         assert_eq!(edges_len(&mut a.body["data"]), 6);
         assert_eq!(edges_len(&mut b.body["data"]), 4);
         assert_eq!(a.ms.len(), 2);
@@ -3651,12 +3665,12 @@ mod tests {
             [PAGE_CUT_PATH]
         );
         // Everything followed: both have all 7 rows and match without any hit.
-        let mut a = fetch_pages(&ta, &op, &vars, 5).await.unwrap();
-        let mut b = fetch_pages(&tb, &op, &vars, 5).await.unwrap();
+        let mut a = fetch_pages(&ta, &op, &vars, 5, true).await.unwrap();
+        let mut b = fetch_pages(&tb, &op, &vars, 5, false).await.unwrap();
         assert!(compare_answers(&mut a, &mut b, u64::MAX, 10_000, &[]).is_empty());
         // Rows above the oracle's ceiling are dropped from both sides and recorded.
-        let mut a = fetch_pages(&ta, &op, &vars, 5).await.unwrap();
-        let mut b = fetch_pages(&tb, &op, &vars, 5).await.unwrap();
+        let mut a = fetch_pages(&ta, &op, &vars, 5, true).await.unwrap();
+        let mut b = fetch_pages(&tb, &op, &vars, 5, false).await.unwrap();
         let d = compare_answers(&mut a, &mut b, 103, 10_000, &[]);
         assert_eq!(
             d.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),

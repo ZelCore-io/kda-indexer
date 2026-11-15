@@ -1293,6 +1293,11 @@ async fn gql_ctx(node: NodeMock, out: &std::path::Path) -> Ctx {
 
 /// [`gql_ctx`] with ours (A) at `a_url`.
 async fn gql_ctx_at(node: NodeMock, out: &std::path::Path, a_url: &str) -> Ctx {
+    gql_ctx_ab(node, out, a_url, "https://oracle.invalid/graphql").await
+}
+
+/// [`gql_ctx_at`] with the oracle (`b`) at `b_url`.
+async fn gql_ctx_ab(node: NodeMock, out: &std::path::Path, a_url: &str, b_url: &str) -> Ctx {
     let nu = node_server(node).await;
     let allow =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
@@ -1311,7 +1316,7 @@ own_ops_dir = "no-such-dir"
 url = "{a_url}"
 kind = "kda_indexer_graphql"
 [targets.b]
-url = "https://oracle.invalid/graphql"
+url = "{b_url}"
 kind = "graphql_oracle"
 max_height = 7000000
 "#
@@ -2425,7 +2430,7 @@ async fn h7_failed_or_short_follow_pages_are_not_windows() {
     let ctx = gql_ctx_at(NodeMock::default(), dir.path(), &url).await;
     let op = h7_op("transfers");
     let vars = h7_vars(&[("first", json!(1))]);
-    let Err(err) = crate::graphql::fetch_pages(&ctx.targets["a"], &op, &vars, 3).await else {
+    let Err(err) = crate::graphql::fetch_pages(&ctx.targets["a"], &op, &vars, 3, true).await else {
         panic!("a follow page with errors was read as a cut page");
     };
     assert!(
@@ -5417,4 +5422,94 @@ async fn c6_an_unknown_limit_is_not_full_in_the_lag_cut() {
             o.record.map(|r| (r.note, r.diff))
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// FVH-C6: the first-page fault is ours only (R-P5P9-72 item 3)
+
+/// A GraphQL server answering every request with HTTP 400 and a JSON `errors` body.
+async fn gql_400_server() -> String {
+    use axum::http::StatusCode;
+    let app = Router::new().route(
+        "/graphql",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"errors": [{"message": "invalid"}]})),
+            )
+                .into_response()
+        }),
+    );
+    format!("{}graphql", serve(app).await)
+}
+
+/// R-P5P9-72 (3), review-fvh-e m-2: the oracle's first page keeps the plain parse, so its
+/// HTTP 400 JSON answer against ours' 200 is compared (a diff), not a `b-error`.
+#[tokio::test]
+async fn c6_an_oracle_first_page_client_error_is_compared() {
+    let dir = tempfile::tempdir().unwrap();
+    let au = ours_fn_server(|_: &Value| {
+        json!({"data": {"transfers": {"totalCount": 0,
+            "pageInfo": {"hasNextPage": false, "endCursor": null}, "edges": []}}})
+    })
+    .await;
+    let bu = gql_400_server().await;
+    let ctx = gql_ctx_ab(NodeMock::default(), dir.path(), &au, &bu).await;
+    let op = h7_op("transfers");
+    let vars = h7_vars(&[("accountName", json!("k:x")), ("first", json!(1))]);
+    let o = ctx
+        .gql_vs_oracle(&ctx.targets["a"], &ctx.targets["b"], &op, &vars, 7_000_000)
+        .await;
+    assert_eq!(o.class, "diff", "{o:?}");
+}
+
+/// R-P5P9-72 (3), review-fvh-e m-2: ours' first-page fault (here HTTP 400 JSON) is the
+/// `/~graphql-first-page-fault` diff in the NOT_SUPPORTED lane and in a node lane, not an
+/// `a-error`.
+#[tokio::test]
+async fn c6_ours_first_page_fault_is_a_diff_in_the_node_lanes() {
+    let dir = tempfile::tempdir().unwrap();
+    let au = gql_400_server().await;
+    let ctx = gql_ctx_at(NodeMock::default(), dir.path(), &au).await;
+    let ta = &ctx.targets["a"];
+    let fault = |o: &super::Outcome, lane: &str| {
+        assert_eq!(o.class, "diff", "{lane}: {o:?}");
+        let rec = o.record.as_ref().unwrap();
+        assert!(
+            rec.diff
+                .iter()
+                .any(|e| e.path == crate::graphql::FIRST_PAGE_FAULT_PATH),
+            "{lane}: {rec:?}"
+        );
+    };
+    let ns = crate::graphql::parse_op(
+        "p",
+        "query($q: [String!]!) { pactQuery(pactQuery: $q) { chainId } }",
+        true,
+    )
+    .unwrap();
+    let o = ctx
+        .gql_not_supported(ta, &ns, &h7_vars(&[("q", json!(["(+ 1 2)"]))]))
+        .await;
+    fault(&o, "not-supported");
+    let nb = crate::graphql::parse_op(
+        "NodeBalance",
+        "# kdx: node-balance\nquery NodeBalance($accountName: String!) { fungibleAccount(accountName: $accountName) { chainAccounts { chainId balance } } }",
+        false,
+    )
+    .unwrap();
+    let sample = crate::graphql::Sample {
+        chain: 0,
+        height: 100,
+        block_hash: "b".into(),
+        request_key: "rk".into(),
+        accounts: vec!["k:x".into()],
+        header: json!({}),
+        meta: json!({}),
+        signers: json!([]),
+    };
+    let o = ctx
+        .gql_node_balance(ta, &nb, &h7_vars(&[("accountName", json!("k:x"))]), &sample)
+        .await;
+    fault(&o, "node-balance");
 }
