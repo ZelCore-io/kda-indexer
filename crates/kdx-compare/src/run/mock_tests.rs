@@ -5338,7 +5338,9 @@ async fn c6_the_lag_window_floor_is_ours_lowest_height_at_its_limit() {
     let all_in = 7_000_000;
     // The window above 6_999_988: ours' page (down to 6_999_991) lies wholly inside it.
     let below = 6_999_988 + super::ORACLE_HORIZON;
-    let cases: [(&str, Vec<Value>, Vec<Value>, u64, &str); 5] = [
+    // (name, ours, kda-txs, A's tip, class).
+    type Case = (&'static str, Vec<Value>, Vec<Value>, u64, &'static str);
+    let cases: [Case; 5] = [
         (
             "kda-txs one block behind",
             rows[..10].to_vec(),
