@@ -1187,8 +1187,11 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
                 .zip(sel(n, "amount"))
                 .is_some_and(|(y, x)| same_amount(x, y, true))
     };
+    // R-P5P9-78 (H1 m-2): only on the node's word: an entry without `events` says nothing.
+    let events = p.get("events").is_some_and(Value::is_array);
     if oracle
         && full
+        && events
         && r.kind == Some(Kind::Transfer)
         && out.canon == Canon::Unknown
         && out.matches == 0

@@ -7025,3 +7025,27 @@ async fn d4a_h1_i2_e_matches_sender_receiver_and_amount_only() {
         "{d:?}"
     );
 }
+
+/// R-P5P9-78 (H1 m-2): E refuses when the node's `/poll` entry has no `events`. CASE5: the
+/// oracle row stays a diff. An entry whose `events` is an empty list is the node's word that
+/// the transaction holds no TRANSFER: E explains.
+#[tokio::test]
+async fn d4a_h1_m2_e_refuses_a_poll_entry_without_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let (k, v) = h7_xfer_poll("x0", "B100", 100, "s", "r", json!(1.0));
+    node.polls.insert(k, v);
+    let meta = json!({"blockHash": "B100", "blockHeight": 100});
+    node.polls
+        .insert("e".into(), (0, json!({"reqKey": "e", "metaData": meta})));
+    node.polls.insert(
+        "f".into(),
+        (0, json!({"reqKey": "f", "metaData": meta, "events": []})),
+    );
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x = |rk: &str| h7_xrow(rk, 100, json!(1.0), Some(("s", "r")));
+    let (d, note) = d1_settle(&ctx, vec![x("x0")], vec![x("x0"), x("e")], (false, false)).await;
+    assert!(!only_hits(&d), "CASE5: {d:?} {note:?}");
+    let (d, note) = d1_settle(&ctx, vec![x("x0")], vec![x("x0"), x("f")], (false, false)).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+}
