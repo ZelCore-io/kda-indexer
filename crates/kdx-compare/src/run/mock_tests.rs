@@ -7049,3 +7049,51 @@ async fn d4a_h1_m2_e_refuses_a_poll_entry_without_events() {
     let (d, note) = d1_settle(&ctx, vec![x("x0")], vec![x("x0"), x("f")], (false, false)).await;
     assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
 }
+
+/// R-P5P9-78 (H1 I-3): F's key-only rows are checked against the node transfers the request's
+/// filter selects. CASE3: under `accountName: r`, tx k holds one TRANSFER naming r and a gas
+/// TRANSFER; ours lists k twice, the oracle once: a diff. Under `accountName: s` both
+/// TRANSFERs are inside the filter, and the same pages are explained. An account no node
+/// TRANSFER names is a diff.
+#[tokio::test]
+async fn d4a_h1_i3_key_only_rows_count_the_node_transfers_inside_the_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let ev = |from: &str, to: &str, a: f64| json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": [from, to, a]});
+    let (k, v) = h7_poll(
+        "k",
+        "B100",
+        100,
+        json!([ev("s", "r", 1.0), ev("s", "miner", 0.01)]),
+    );
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let op = h7_op("transfers");
+    let r = || json!({"cursor": "c", "node": {"chainId": "0", "requestKey": "k"}});
+    let settle = |account: &'static str, a: Vec<Value>, b: Vec<Value>| {
+        let (ctx, op) = (&ctx, &op);
+        async move {
+            let vars = h7_vars(&[("accountName", json!(account))]);
+            let (mut a, mut b) = (
+                h7_page("transfers", false, a),
+                h7_page("transfers", false, b),
+            );
+            ctx.gql_settle_op(
+                &ctx.targets["a"],
+                Some(op),
+                &vars,
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await
+        }
+    };
+    let (d, note) = settle("r", vec![r(), r()], vec![r()]).await;
+    assert!(!only_hits(&d), "CASE3: {d:?} {note:?}");
+    let (d, note) = settle("s", vec![r(), r()], vec![r()]).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    let (d, note) = settle("zed", vec![r()], vec![]).await;
+    assert!(!only_hits(&d), "{d:?} {note:?}");
+}

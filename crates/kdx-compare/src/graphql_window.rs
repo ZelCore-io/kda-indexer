@@ -1747,6 +1747,19 @@ impl Filter {
         let fungible =
             |m: Option<String>| self.fungible.as_ref().is_none_or(|f| m.as_ref() == Some(f));
         match r.id.kind {
+            // R-P5P9-78 (H1 I-3): a row without an index is any node TRANSFER with its
+            // content, so the filter holds against those, never against the first one.
+            Some(Kind::Transfer) if !r.id.indexed() => {
+                if (self.account.is_some() || self.fungible.is_some())
+                    && self.transfers_inside(n, v) == 0
+                {
+                    return fail(if self.account.is_some() {
+                        "account: no node TRANSFER with the row's content names it"
+                    } else {
+                        "fungible: no node TRANSFER with the row's content is of it"
+                    });
+                }
+            }
             Some(Kind::Transfer) => {
                 if let Some(a) = &self.account {
                     let from = field("senderAccount").or_else(|| param(0));
@@ -1812,6 +1825,29 @@ impl Filter {
             _ => {}
         }
         None
+    }
+
+    /// R-P5P9-78 (H1 I-3): how many of the node's TRANSFER events are ours' transfer row `n`
+    /// (every field it selects) and lie inside the filter's account and fungible (by the
+    /// row's own fields where it selects them, else by the event's).
+    fn transfers_inside(&self, n: &Value, v: &Verdict) -> usize {
+        let field = |k: &str| sel(n, k).and_then(text);
+        let param = |e: &Value, i: usize| e.pointer(&format!("/params/{i}")).and_then(text);
+        v.transfers
+            .iter()
+            .filter(|e| transfer_matches(n, e, false))
+            .filter(|e| {
+                self.account.as_ref().is_none_or(|a| {
+                    field("senderAccount").or_else(|| param(e, 0)).as_ref() == Some(a)
+                        || field("receiverAccount").or_else(|| param(e, 1)).as_ref() == Some(a)
+                })
+            })
+            .filter(|e| {
+                self.fungible.as_ref().is_none_or(|f| {
+                    field("moduleName").or_else(|| module_name(e)).as_ref() == Some(f)
+                })
+            })
+            .count()
     }
 }
 
@@ -2454,13 +2490,19 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
             .iter()
             .filter(|&&x| node_of(&p.a[x]) == node_of(ra))
             .count();
-        if !ra.id.indexed() && copies > v.matches {
+        // R-P5P9-78 (H1 I-3): a transfer row counts the node's TRANSFERs inside the filter.
+        let held = if ra.id.kind == Some(Kind::Transfer) {
+            w.filter.transfers_inside(n, v)
+        } else {
+            v.matches
+        };
+        if !ra.id.indexed() && copies > held {
             d.rejected.push((
                 Some(ra.edge.clone()),
                 None,
                 format!(
-                    "ours lists the row {copies} times; the node's transaction holds it {} times",
-                    v.matches
+                    "ours lists the row {copies} times; the node's transaction holds it {held} \
+                     times inside the query's filter"
                 ),
             ));
             continue;
