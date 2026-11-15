@@ -202,6 +202,44 @@ const ROW_KEYS: &[&str] = &[
     KEY_ALIAS,
 ];
 
+/// R-P5P9-86 G: a root row's block identity (height, chainId, hash), when it selects all three.
+fn parent_id(e: &Value) -> Option<[String; 3]> {
+    let f = |k: &str| e.pointer(&format!("/node/{k}")).map(Value::to_string);
+    Some([f("height")?, f("chainId")?, f("hash")?])
+}
+
+/// R-P5P9-86 G: the tie sort orders a run of root rows at one height by their whole text, so
+/// rows whose nested lists differ (one side's cut) can land in another order on each side
+/// (CG-5 #70: BlocksByHeight's 20 blocks at one height). When every root row selects
+/// (height, chainId, hash), each run of one height is ordered by (chainId, hash) on both
+/// sides instead, so the rows (and their nested lists) pair by block. Heights keep their
+/// order; the rows themselves are unchanged.
+pub fn align_block_parents(a: &mut Value, b: &mut Value) {
+    for v in [a, b] {
+        let Some(edges) = v
+            .get_mut("data")
+            .and_then(crate::graphql::root_connection)
+            .and_then(|c| c.get_mut("edges"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let Some(ids) = edges.iter().map(parent_id).collect::<Option<Vec<_>>>() else {
+            continue;
+        };
+        let mut run = 0usize;
+        let mut keyed: Vec<(usize, String, String, Value)> = Vec::with_capacity(edges.len());
+        for (i, (e, [h, c, k])) in edges.iter().zip(ids.iter()).enumerate() {
+            if i > 0 && ids[i - 1][0] != *h {
+                run += 1;
+            }
+            keyed.push((run, c.clone(), k.clone(), e.clone()));
+        }
+        keyed.sort_by(|x, y| (x.0, &x.1, &x.2).cmp(&(y.0, &y.1, &y.2)));
+        *edges = keyed.into_iter().map(|x| x.3).collect();
+    }
+}
+
 /// R-P5P9-75 G: the nested lists of two normalized bodies (below a root list's rows, at the
 /// same pointer on both sides, outside H2's scope) whose rows select no key and differ. Each
 /// is sorted as a multiset of its rows' selected values (per parent) when both sides' lists
@@ -260,6 +298,23 @@ pub fn unkeyed_nested(a: &mut Value, b: &mut Value) -> (bool, Vec<Value>) {
             continue;
         };
         if keyed(ca) || keyed(cb) || ca.get("edges") == cb.get("edges") {
+            continue;
+        }
+        // R-P5P9-86 G: nested lists pair by their root parent's block, never by position.
+        let parent = p
+            .strip_prefix("/data/")
+            .and_then(|rest| {
+                let at = rest.find("/edges/")? + "/edges/".len();
+                let n = rest[at..].find('/').map_or(rest.len(), |x| at + x);
+                Some(format!("/data/{}", &rest[..n]))
+            })
+            .unwrap_or_default();
+        let pa = a.pointer(&parent).and_then(parent_id);
+        if pa.is_some() && pa != b.pointer(&parent).and_then(parent_id) {
+            left.push(
+                json!({"list": p, "why": "a nested list without a key whose parent \
+                block (chainId, height, hash) is not the same block on both sides"}),
+            );
             continue;
         }
         let why = if !complete(ca) || !complete(cb) {

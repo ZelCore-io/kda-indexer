@@ -7950,3 +7950,54 @@ async fn e1_f_a_root_list_without_page_info_gets_the_note() {
             && x.id.block.is_none()));
     assert_eq!(p.a[0].key, p.b[0].key);
 }
+
+/// R-P5P9-86 G: BlocksByHeight's root rows at one height pair by block (chainId, height,
+/// hash), not by position after the tie sort (CG-5 #70: the oracle's c0 list is cut, so the
+/// text sort put c0 and c19 in another order on each side). c19's lists, complete on both
+/// sides, compare as a multiset; c0's cut list is `/~graphql-h6-unfinished` with why.
+#[test]
+fn e1_g_nested_lists_pair_by_their_parent_block() {
+    use crate::graphql::{compare_answers_with, Answer};
+    let blk = |chain: u64, total: u64, more: bool, prices: &[&str]| {
+        let edges: Vec<Value> = prices
+            .iter()
+            .map(|p| {
+                let ct = format!("2026-01-01T00:00:0{}Z", &p[..1]);
+                json!({"node": {"cmd": {"meta": {"creationTime": ct, "gasPrice": p}}}})
+            })
+            .collect();
+        json!({"node": {"transactions": {"totalCount": total,
+            "pageInfo": {"hasNextPage": more}, "edges": edges},
+            "hash": format!("H{chain}"), "height": 58, "chainId": chain}})
+    };
+    let page = |edges: Vec<Value>| Answer {
+        body: json!({"data": {"completedBlockHeights": {"pageInfo": {"hasNextPage": false},
+            "edges": edges}}}),
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    };
+    let mut a = page(vec![
+        blk(0, 3, false, &["1e-8", "2e-8", "3e-8"]),
+        blk(19, 2, false, &["4e-8", "5e-8"]),
+    ]);
+    let mut b = page(vec![
+        blk(0, 126, true, &["1e-8"]),
+        blk(19, 2, false, &["5e-8", "4e-8"]),
+    ]);
+    let d = compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false);
+    let root = |e: &crate::report::DiffEntry| {
+        e.path.ends_with("/node/chainId") || e.path.ends_with("/node/hash")
+    };
+    assert!(!d.iter().any(root), "parents paired by position: {d:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_scope::NESTED_MULTISET_PATH),
+        "{d:?}"
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_scope::UNFINISHED_PATH),
+        "{d:?}"
+    );
+}

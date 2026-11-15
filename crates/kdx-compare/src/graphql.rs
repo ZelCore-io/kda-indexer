@@ -939,6 +939,10 @@ pub fn compare_answers_with(
             }
         }
     }
+    // R-P5P9-86 G: root rows at one height pair by block, unless H7 paired them.
+    if !aligned && !root_scoped {
+        crate::graphql_scope::align_block_parents(&mut na, &mut nb);
+    }
     // R-P5P9-75 G: nested lists without a key compare as multisets when complete.
     let (sorted, left) = crate::graphql_scope::unkeyed_nested(&mut na, &mut nb);
     if sorted {
