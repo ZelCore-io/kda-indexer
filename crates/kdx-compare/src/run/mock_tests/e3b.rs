@@ -304,3 +304,52 @@ async fn e3b_tc_the_referee_counts_ours_rows_between_the_oracle_and_the_record()
     assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
     assert_eq!(rep.by_class.get("graphql-count-walk"), Some(&1), "{rep:?}");
 }
+
+/// R-P5P9-88 (3b), W: a stored record whose rows carry no height (#404's shape: the
+/// document on the host selected none). The referee reads the node's height for each row's
+/// request key (`/poll`) and applies the normal rules: the oracle's extra row below ours'
+/// cut (100, ours' lowest 101) is outside ours' window, explained. The same row at 102
+/// (inside ours' window) stays unexplained, and so does one the node does not place.
+#[tokio::test]
+async fn e3b_w_the_referee_places_height_less_rows_by_poll() {
+    let bare = |rk: &str| {
+        json!({"cursor": "c", "node": {"requestKey": rk,
+        "block": {"chainId": "0"}}})
+    };
+    for (extra_at, placed, explained) in [
+        (100u64, true, true),
+        (102, true, false),
+        (100, false, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keys = vec![("t3", 103u64), ("t2", 101)];
+        if placed {
+            keys.push(("t1", extra_at));
+        }
+        let nu = node_server(node_of(&keys, 0, &[])).await;
+        let ops = c3_ops(dir.path());
+        let cfg = c3_cfg(&nu, &nu, &nu, dir.path(), &ops, "");
+        let ours = page(vec![bare("t3"), bare("t2")], 40, true);
+        let oracle = page(vec![bare("t3"), bare("t2"), bare("t1")], 40, true);
+        let added = DiffEntry {
+            path: "/data/transfers/edges/2".into(),
+            kind: DiffKind::Missing,
+            a: None,
+            b: Some(bare("t1")),
+        };
+        let rec = e2_stored(
+            "QH7",
+            json!({"accountName": "s", "first": 2}),
+            ours,
+            oracle,
+            vec![added],
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        let case = format!("{extra_at} {placed}: {rep:?}");
+        assert_eq!(rep.explained == 1, explained, "{case}");
+        assert!(
+            !format!("{rep:?}").contains("without a height to place"),
+            "{case}"
+        );
+    }
+}
