@@ -373,7 +373,8 @@ pub const MISSING_CHAIN_ROWS_PATH: &str = "/~known-gap-missing-chain-rows";
 /// rest keep the oracle's own order, so the diff then compares the rows both hold, order
 /// included. Returns (pointer, the keys ours lacks) per list. A row only ours holds, a key
 /// twice, another shape, or (R-P5P9-78, H2 m-4) an empty list of ours: nothing, so an answer
-/// of ours with no chain rows at all stays a diff.
+/// of ours with no chain rows at all stays a diff. R-P5P9-86 Q: except on the non-fungible
+/// path (`nonFungibleAccount.chainAccounts`), where an empty list of ours is the marker.
 pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)> {
     fn lists(v: &Value, ptr: &mut String, parent: &str, out: &mut Vec<String>) {
         match v {
@@ -418,7 +419,10 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
         let ka: Vec<Value> = ra.iter().map(key).collect();
         let kb: Vec<Value> = rb.iter().map(key).collect();
         let once = |k: &[Value]| k.iter().enumerate().all(|(i, x)| !k[..i].contains(x));
-        if ka.is_empty()
+        // R-P5P9-86 Q (CG-5 #37): on the non-fungible path an empty list of ours is the
+        // marker too: a holder on one chain that ours misses has no chain row left.
+        let nft = p.ends_with("/nonFungibleAccount/chainAccounts");
+        if (ka.is_empty() && !nft)
             || !once(&ka)
             || !once(&kb)
             || ka.len() >= kb.len()
@@ -1647,5 +1651,34 @@ mod tests {
         let mut b = acct(vec![row("0"), row("1"), row("2")]);
         assert_eq!(missing_chain_rows(&a, &mut b).len(), 1);
         assert_eq!(a, b);
+    }
+
+    /// R-P5P9-86 Q (CG-5 #37): on the non-fungible path an empty list of ours is the marker
+    /// too (a holder on one chain that ours misses); on the fungible path it stays a diff.
+    #[test]
+    fn e2_q_the_non_fungible_chain_accounts_path() {
+        let row = |c: &str| json!({"id": format!("x{c}"), "chainId": c, "accountName": "k:a"});
+        let nft =
+            |rows: Vec<Value>| json!({"data": {"nonFungibleAccount": {"chainAccounts": rows}}});
+        let a = nft(vec![]);
+        let mut b = nft(vec![row("8")]);
+        let m = missing_chain_rows(&a, &mut b);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].0, "/data/nonFungibleAccount/chainAccounts");
+        assert_eq!(m[0].1, vec![json!(["8", null])]);
+        assert_eq!(a, b);
+        // Ours [0], the oracle [0, 8]: the marker as on the fungible path.
+        let a = nft(vec![row("0")]);
+        let mut b = nft(vec![row("0"), row("8")]);
+        assert_eq!(missing_chain_rows(&a, &mut b).len(), 1);
+        assert_eq!(a, b);
+        // A row only ours holds stays a diff.
+        let a = nft(vec![row("1")]);
+        let mut b = nft(vec![row("0"), row("8")]);
+        assert!(missing_chain_rows(&a, &mut b).is_empty());
+        // The fungible path keeps R-P5P9-78 (H2 m-4): ours empty is no marker.
+        let fa = |rows: Vec<Value>| json!({"data": {"fungibleAccount": {"chainAccounts": rows}}});
+        let mut b = fa(vec![row("8")]);
+        assert!(missing_chain_rows(&fa(vec![]), &mut b).is_empty());
     }
 }

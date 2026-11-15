@@ -60,10 +60,14 @@ pub struct Report {
     pub refereed: usize,
     pub explained: usize,
     pub unexplained: usize,
+    /// R-P5P9-86 (P, Q): records whose every difference a KNOWN-GAP entry matches. They are
+    /// never explained; the FV gate counts them per entry against its baseline.
+    pub known_gap: usize,
     /// Lines and taken-up records that could not be re-run (a line that is not a diff
     /// record, a B target that is not an oracle here, a body the log cut, an operation not
     /// loaded, the read cap spent, …); they stay unexplained, each listed with its reason.
-    /// `explained + unexplained + not_refereed` = `refereed` + the lines that did not parse.
+    /// `explained + unexplained + known_gap + not_refereed` = `refereed` + the lines that did
+    /// not parse.
     pub not_refereed: usize,
     /// Per class: each allowlist id among the explained records, `unexplained: <kind>`
     /// (`h7-row`: a row the node settles against ours; `h6-unfinished`: a cut nested list
@@ -81,6 +85,8 @@ pub struct Report {
 impl Report {
     /// The verdict: true only when every record taken up was explained and every line read
     /// (R-P5P9-64 I-4); `kda-compare referee` exits non-zero otherwise.
+    /// R-P5P9-86 (P, Q): a known gap is neither (as a live `known-gap` record, which the
+    /// referee does not take up); the FV gate reads its count against the entry's baseline.
     pub fn passed(&self) -> bool {
         self.unexplained == 0 && self.not_refereed == 0
     }
@@ -90,6 +96,8 @@ impl Report {
 struct Settled {
     unexplained: Vec<DiffEntry>,
     ids: Vec<String>,
+    /// The KNOWN-GAP entries the record hit (R-P5P9-86 P, Q).
+    known_ids: Vec<String>,
     note: Option<String>,
     /// The hits that carry evidence.
     hits: Vec<DiffEntry>,
@@ -185,6 +193,21 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
                     || e.path == crate::graphql::MERGED_BYTES_PATH
             });
             if let Some(e) = stop {
+                // R-P5P9-86 P: a fault on a heavy account P lists is a known gap, read with
+                // the live run's request text (`graphql:<operation> <variables>`).
+                let c = ctx.allow.classify_known(
+                    &RouteKind::Other,
+                    &format!("graphql:{}", rec.request),
+                    &[],
+                    &rec.diff,
+                );
+                if c.unexplained.is_empty() && !c.known_ids.is_empty() {
+                    rep.known_gap += 1;
+                    for id in c.known_ids {
+                        count(&mut rep, format!("known-gap: {id}"));
+                    }
+                    continue;
+                }
                 let kind = match e.path.as_str() {
                     crate::graphql::FOLLOW_PAGE_FAULT_PATH => "follow-page-fault",
                     crate::graphql::FIRST_PAGE_FAULT_PATH => "first-page-fault",
@@ -210,6 +233,12 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
                 Err(why) => {
                     let class = format!("not refereed: {why}");
                     not_refereed(&mut rep, head, &class, why);
+                }
+                Ok(s) if s.unexplained.is_empty() && !s.known_ids.is_empty() => {
+                    rep.known_gap += 1;
+                    for id in s.known_ids {
+                        count(&mut rep, format!("known-gap: {id}"));
+                    }
                 }
                 Ok(s) if s.unexplained.is_empty() => {
                     rep.explained += 1;
@@ -296,9 +325,21 @@ async fn settle(ctx: &Ctx, rec: &DiffRecord) -> Result<Settled, String> {
     let (d, note) = ctx
         .gql_rules(ta, H6::Stored(&rec.diff), op, &vars, &mut a, &mut b, max)
         .await;
-    let (unexplained, ids) = ctx
-        .allow
-        .classify_request(&RouteKind::Other, &rec.route, &[], &d);
+    // R-P5P9-86 (P, Q): the live run's request text, so the KNOWN-GAP entries scoped by
+    // operation and account read as they do live.
+    let c = ctx.allow.classify_known(
+        &RouteKind::Other,
+        &format!("graphql:{}", rec.request),
+        &[],
+        &d,
+    );
+    let (ids, known_ids) = (c.ids, c.known_ids);
+    // A KNOWN-GAP hit is never explained: with another difference it stays unexplained.
+    let unexplained = if c.unexplained.is_empty() {
+        c.unexplained
+    } else {
+        [c.unexplained, c.known].concat()
+    };
     let hits = d
         .into_iter()
         .filter(|e| e.path.starts_with("/~") && (e.a.is_some() || e.b.is_some()))
@@ -306,6 +347,7 @@ async fn settle(ctx: &Ctx, rec: &DiffRecord) -> Result<Settled, String> {
     Ok(Settled {
         unexplained,
         ids,
+        known_ids,
         note,
         hits,
     })

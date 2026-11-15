@@ -8005,3 +8005,140 @@ fn e1_g_nested_lists_pair_by_their_parent_block() {
         "{d:?}"
     );
 }
+
+/// A stored GraphQL diff record of ours against the oracle (`a` against `b`), for the
+/// referee (R-P5P9-87: every rule settles a stored record).
+fn e2_stored(
+    stem: &str,
+    vars: Value,
+    a: Value,
+    b: Value,
+    diff: Vec<crate::report::DiffEntry>,
+) -> crate::report::DiffRecord {
+    crate::report::DiffRecord {
+        ts: "2026-11-15T09:00:00Z".into(),
+        route: format!("graphql:{stem}"),
+        request: format!("{stem} {vars}"),
+        a_target: "a".into(),
+        b_target: "b".into(),
+        a_status: Some(200),
+        b_status: Some(200),
+        a_body_trimmed: a.to_string(),
+        b_body_trimmed: b.to_string(),
+        diff,
+        class: "diff".into(),
+        allowlisted: None,
+        known_gap: None,
+        curl: String::new(),
+        note: None,
+        body_cap: None,
+        a_pages: Some(1),
+    }
+}
+
+/// Writes `recs` as a diff log and runs the referee over it.
+async fn e2_referee(
+    cfg: CompareConfig,
+    dir: &std::path::Path,
+    recs: &[crate::report::DiffRecord],
+) -> crate::referee::Report {
+    let log = dir.join(format!("diffs-e2-{}.jsonl", recs.len()));
+    let lines: Vec<String> = recs
+        .iter()
+        .map(|r| serde_json::to_string(&r.bounded()).unwrap())
+        .collect();
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let opts = crate::referee::Opts {
+        logs: vec![log],
+        max_reads: 200,
+        rps: 10,
+    };
+    crate::referee::run(cfg, &opts).await.unwrap()
+}
+
+/// R-P5P9-86 (P, Q) with R-P5P9-87: the referee reads a stored record's KNOWN-GAP hits with
+/// the live run's request text. #520's shape (a follow-page fault on a P key) and #37's
+/// (QNonFungibleAccount, ours without the oracle's one chain row) are known gaps, never
+/// explained; the same fault on another account stays unexplained.
+#[tokio::test]
+async fn e2_pq_the_referee_reads_known_gaps_on_stored_records() {
+    use crate::report::{DiffEntry, DiffKind};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let ops = c3_ops(dir.path());
+    std::fs::write(
+        ops.join("QNonFungibleAccount.graphql"),
+        "# kdx: oracle\nquery QNonFungibleAccount($accountName: String!) { nonFungibleAccount(\
+         accountName: $accountName) { id accountName chainAccounts { id chainId accountName } } }\n",
+    )
+    .unwrap();
+    let cfg = || {
+        c3_cfg(
+            &nu,
+            "http://127.0.0.1:9/graphql",
+            "https://oracle.invalid/graphql",
+            dir.path(),
+            &ops,
+            "",
+        )
+    };
+    let fault = vec![DiffEntry {
+        path: crate::graphql::FOLLOW_PAGE_FAULT_PATH.into(),
+        kind: DiffKind::Changed,
+        a: Some(json!({"page": 2, "status": 200,
+            "why": r#"errors: [{"message":"request deadline exceeded"}]"#})),
+        b: None,
+    }];
+    let page = json!({"data": {"transfers": {"pageInfo": {"hasNextPage": false}, "edges": []}}});
+    let k520 = "af7943004d0b08fe5402c23ec317f7a8d1bdd6ce4cc52414efcf8dbfa68ca256";
+    let p = e2_stored(
+        "QH7",
+        json!({"accountName": k520, "first": 1}),
+        page.clone(),
+        page.clone(),
+        fault.clone(),
+    );
+    let other = e2_stored(
+        "QH7",
+        json!({"accountName": "k:0000", "first": 1}),
+        page.clone(),
+        page,
+        fault,
+    );
+    let nft = |rows: Value| {
+        json!({"data": {"nonFungibleAccount": {"id": "n", "accountName": "k:a",
+            "chainAccounts": rows}}})
+    };
+    let row = json!({"id": "c8", "chainId": "8", "accountName": "k:a"});
+    let q = e2_stored(
+        "QNonFungibleAccount",
+        json!({"accountName": "k:a"}),
+        nft(json!([])),
+        nft(json!([row.clone()])),
+        vec![DiffEntry {
+            path: "/data/nonFungibleAccount/chainAccounts/0".into(),
+            kind: DiffKind::Missing,
+            a: None,
+            b: Some(row),
+        }],
+    );
+    let rep = e2_referee(cfg(), dir.path(), &[p, q]).await;
+    assert_eq!(
+        (rep.explained, rep.unexplained, rep.known_gap),
+        (0, 0, 2),
+        "{rep:?}"
+    );
+    assert_eq!(
+        rep.by_class
+            .get("known-gap: known-gap-p-heavy-account-deadline"),
+        Some(&1)
+    );
+    assert_eq!(
+        rep.by_class
+            .get("known-gap: known-gap-q-missing-chain-rows"),
+        Some(&1)
+    );
+    assert!(rep.passed(), "a known gap is no unexplained record");
+    let rep = e2_referee(cfg(), dir.path(), &[other]).await;
+    assert_eq!((rep.unexplained, rep.known_gap), (1, 0), "{rep:?}");
+}

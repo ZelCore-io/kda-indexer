@@ -648,4 +648,51 @@ mod tests {
         });
         assert_eq!(known(&req("QFungibleAccount", "k:a"), &both).0, "diff");
     }
+
+    /// R-P5P9-86 P: the two heavy accounts CG-5 measured (#520, #977) are P's, by their full
+    /// key; a key that only starts like one of them, or another fault, stays a diff.
+    #[test]
+    fn e2_p_the_cg5_heavy_accounts_are_known_gaps() {
+        use crate::report::{DiffEntry, DiffKind};
+        let al = shipped();
+        let fault = |path: &str, why: &str| {
+            vec![DiffEntry {
+                path: path.into(),
+                kind: DiffKind::Changed,
+                a: Some(serde_json::json!({"page": 2, "status": 200, "why": why})),
+                b: None,
+            }]
+        };
+        let deadline = r#"errors: [{"message":"request deadline exceeded"}]"#;
+        let req = |stem: &str, acct: &str| format!("graphql:{stem} {{\"accountName\":\"{acct}\"}}");
+        let known = |r: &str, d: &[DiffEntry]| {
+            let c = al.classify_known(&RouteKind::Other, r, &[], d);
+            (c.class(d).0, c.known_ids)
+        };
+        let p = vec!["known-gap-p-heavy-account-deadline".to_string()];
+        let k520 = "af7943004d0b08fe5402c23ec317f7a8d1bdd6ce4cc52414efcf8dbfa68ca256";
+        let k977 = "k:22fbc926b497bf3ecc7199b923039e74cdeda12726e1dc4f443953007cf8cc43";
+        let follow = fault("/~graphql-follow-page-fault", deadline);
+        let first = fault("/~graphql-first-page-fault", deadline);
+        assert_eq!(
+            known(&req("QTransactionsByAccount", k520), &follow),
+            ("known-gap", p.clone())
+        );
+        assert_eq!(
+            known(&req("Transactions-bca501b0", k977), &first),
+            ("known-gap", p.clone())
+        );
+        // The full key only: a longer value that starts with it is another account.
+        let longer = format!("{k977}00");
+        assert_eq!(
+            known(&req("Transactions-bca501b0", &longer), &first).0,
+            "diff"
+        );
+        // Another fault on the same account stays a diff.
+        let other = fault("/~graphql-follow-page-fault", "HTTP 500");
+        assert_eq!(
+            known(&req("QTransactionsByAccount", k520), &other).0,
+            "diff"
+        );
+    }
 }
