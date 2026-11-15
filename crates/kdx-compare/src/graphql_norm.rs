@@ -45,6 +45,9 @@ pub const BY_KEY_EXTRA_PATH: &str = "/~graphql-r58-by-key-extra-row";
 pub const STRIPS_QUOTES_PATH: &str = "/~graphql-r60-oracle-strips-quotes";
 /// Visible hit of `count_self_consistent` (allowlist id `graphql-r60-count-self-consistent`).
 pub const COUNT_SELF_CONSISTENT_PATH: &str = "/~graphql-r60-count-self-consistent";
+/// Visible hit of `oracle_counts_heights` (allowlist id `graphql-r75-oracle-counts-heights`,
+/// scoped to Transactions-9e58b95d).
+pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
 /// Visible hit of `creation_time_half_even` (allowlist id `graphql-h9-creation-time-fraction`).
 pub const H9_PATH: &str = "/~graphql-h9-creation-time-fraction";
 
@@ -87,7 +90,7 @@ pub fn f64_eq(x: f64, y: f64) -> bool {
 
 /// The exact decimal value of a numeric leaf (sign, digits, exponent), in any of the forms
 /// [`num_f64`] reads.
-fn decimal_value(v: &Value) -> Option<(bool, String, i64)> {
+pub(crate) fn decimal_value(v: &Value) -> Option<(bool, String, i64)> {
     match v {
         Value::Number(n) => decimal_canon(&n.to_string()),
         Value::String(s) => match s.strip_prefix('#') {
@@ -265,7 +268,8 @@ pub fn rule_explains(
         }
         FieldRuleKind::OracleOrphanDupes
         | FieldRuleKind::ByKeyExtraRow
-        | FieldRuleKind::CountSelfConsistent => false,
+        | FieldRuleKind::CountSelfConsistent
+        | FieldRuleKind::OracleCountsHeights => false,
     };
     ok.then_some(match r.rule {
         FieldRuleKind::OracleEmpty => ORACLE_EMPTY_PATH,
@@ -304,6 +308,13 @@ pub fn count_flag_applies(raw: &Value) -> bool {
     raw.pointer("/extensions/totalCountLowerBound") == Some(&Value::Bool(true)) && n == 1
 }
 
+/// A connection's page is not cut: `pageInfo.hasNextPage` false and `hasPreviousPage` not
+/// true (R-P5P9-60).
+fn page_whole(c: &Value) -> bool {
+    c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(false))
+        && c.pointer("/pageInfo/hasPreviousPage") != Some(&Value::Bool(true))
+}
+
 /// R-P5P9-60 count self-consistency, on the normalised answers `a` (ours) and `b` (the
 /// oracle's): for each `count_self_consistent` rule `<root>.totalCount`, the oracle's count
 /// takes ours only when neither page is cut (`pageInfo.hasNextPage` false and
@@ -312,10 +323,6 @@ pub fn count_flag_applies(raw: &Value) -> bool {
 /// CG-A2's node = ours 4/4 against the oracle's 1). An oracle count above its edges stays a
 /// diff, since ours may be the one that undercounts. Returns whether any count was explained.
 pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> bool {
-    let whole = |c: &Value| {
-        c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(false))
-            && c.pointer("/pageInfo/hasPreviousPage") != Some(&Value::Bool(true))
-    };
     let edges = |c: &Value| {
         c.get("edges").and_then(Value::as_array).map(|e| {
             let mut s: Vec<String> = e.iter().map(Value::to_string).collect();
@@ -340,7 +347,12 @@ pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> b
         else {
             continue;
         };
-        if whole(ca) && whole(cb) && ea == eb && na == ea.len() as u64 && nb < eb.len() as u64 {
+        if page_whole(ca)
+            && page_whole(cb)
+            && ea == eb
+            && na == ea.len() as u64
+            && nb < eb.len() as u64
+        {
             if let Some(n) = b.pointer_mut(&format!("{ptr}/totalCount")) {
                 *n = Value::from(na);
                 hit = true;
@@ -348,6 +360,127 @@ pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> b
         }
     }
     hit
+}
+
+/// R-P5P9-75 Q marker: ours lacks chain rows the oracle lists (KNOWN-GAP entry
+/// `known-gap-q-missing-chain-rows`, scoped to the four account operations; never explained).
+pub const MISSING_CHAIN_ROWS_PATH: &str = "/~known-gap-missing-chain-rows";
+
+/// R-P5P9-75 Q, on the normalised answers: in each plain list (not a connection's `edges`)
+/// at the same place on both sides whose rows are all objects with a `chainId`, keyed by
+/// (`chainId`, `tokenId` when selected) with each key once per side, where ours' keys are a
+/// strict subset of the oracle's: the oracle's rows that ours lacks leave its list and the
+/// rest keep the oracle's own order, so the diff then compares the rows both hold, order
+/// included. Returns (pointer, the keys ours lacks) per list. A row only ours holds, a key
+/// twice, another shape, or (R-P5P9-78, H2 m-4) an empty list of ours: nothing, so an answer
+/// of ours with no chain rows at all stays a diff.
+pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)> {
+    fn lists(v: &Value, ptr: &mut String, parent: &str, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m {
+                    let n = ptr.len();
+                    ptr.push('/');
+                    ptr.push_str(&k.replace('~', "~0").replace('/', "~1"));
+                    lists(x, ptr, k, out);
+                    ptr.truncate(n);
+                }
+            }
+            Value::Array(xs) => {
+                if parent != "edges"
+                    && !xs.is_empty()
+                    && xs.iter().all(|x| x.get("chainId").is_some())
+                {
+                    out.push(ptr.clone());
+                }
+                for (i, x) in xs.iter().enumerate() {
+                    let n = ptr.len();
+                    ptr.push_str(&format!("/{i}"));
+                    lists(x, ptr, "", out);
+                    ptr.truncate(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    let key = |r: &Value| serde_json::json!([r.get("chainId"), r.get("tokenId")]);
+    let mut ptrs = Vec::new();
+    lists(b, &mut String::new(), "", &mut ptrs);
+    let mut out = Vec::new();
+    for p in ptrs {
+        let (Some(Value::Array(ra)), Some(Value::Array(rb))) = (a.pointer(&p), b.pointer(&p))
+        else {
+            continue;
+        };
+        if ra.iter().any(|r| r.get("chainId").is_none()) {
+            continue;
+        }
+        let ka: Vec<Value> = ra.iter().map(key).collect();
+        let kb: Vec<Value> = rb.iter().map(key).collect();
+        let once = |k: &[Value]| k.iter().enumerate().all(|(i, x)| !k[..i].contains(x));
+        if ka.is_empty()
+            || !once(&ka)
+            || !once(&kb)
+            || ka.len() >= kb.len()
+            || !ka.iter().all(|k| kb.contains(k))
+        {
+            continue;
+        }
+        let kept: Vec<Value> = rb
+            .iter()
+            .filter(|r| ka.contains(&key(r)))
+            .cloned()
+            .collect();
+        let gone: Vec<Value> = kb.iter().filter(|k| !ka.contains(k)).cloned().collect();
+        if let Some(x) = b.pointer_mut(&p) {
+            *x = Value::Array(kept);
+            out.push((p, gone));
+        }
+    }
+    out
+}
+
+/// R-P5P9-75 I: for each `oracle_counts_heights` rule `<root>.totalCount`, the oracle's root
+/// count takes ours when it is below ours (the oracle counts heights). Only the root
+/// connection's own count: nested counts are never touched. R-P5P9-78 (H2 I-4), the
+/// R-P5P9-60 bound: when ours' page is not cut (`hasNextPage` false, `hasPreviousPage` not
+/// true; so whenever neither page is), ours' count must also equal ours' own edge count, or
+/// nothing is taken (an overcount of ours stays a diff; no `edges` selected, likewise).
+/// Returns (ours, the oracle's) per count taken.
+pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for r in rules
+        .iter()
+        .filter(|r| r.rule == FieldRuleKind::OracleCountsHeights)
+    {
+        let Some((root, "totalCount")) = r.field.split_once('.') else {
+            continue;
+        };
+        let ptr = format!("/data/{root}/totalCount");
+        let (Some(na), Some(nb)) = (
+            a.pointer(&ptr).and_then(Value::as_u64),
+            b.pointer(&ptr).and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        let ca = a.pointer(&format!("/data/{root}"));
+        if ca.is_some_and(page_whole) {
+            let edges = ca
+                .and_then(|c| c.get("edges"))
+                .and_then(Value::as_array)
+                .map(|e| e.len() as u64);
+            if edges != Some(na) {
+                continue;
+            }
+        }
+        if nb < na {
+            if let Some(n) = b.pointer_mut(&ptr) {
+                *n = Value::from(na);
+                out.push((na, nb));
+            }
+        }
+    }
+    out
 }
 
 /// The explainer of one oracle pair diff: per-field rules first, then F2 and F7. Returns the
@@ -487,6 +620,101 @@ pub fn one_block_skew(ours: f64, node: &str, reward: i128) -> bool {
     format!("{}.{:012}", before / unit, before % unit)
         .parse::<f64>()
         .is_ok_and(|x| x == ours)
+}
+
+/// R-P5P9-75 S: the node's balance `node` less `net` (both in fixed point of 12 places),
+/// computed exactly, must be our `Float` exactly once rounded to f64.
+pub fn skew_net_holds(ours: f64, node: &str, net: i128) -> bool {
+    let Some(before) = fixed12(node).and_then(|n| n.checked_sub(net)) else {
+        return false;
+    };
+    if before < 0 {
+        return false;
+    }
+    let unit = 1_000_000_000_000i128;
+    format!("{}.{:012}", before / unit, before % unit)
+        .parse::<f64>()
+        .is_ok_and(|x| x == ours)
+}
+
+/// A fixed-point amount of 12 places as decimal text (for evidence).
+pub fn fixed12_text(x: i128) -> String {
+    let unit = 1_000_000_000_000i128;
+    let (sign, a) = if x < 0 { ("-", -x) } else { ("", x) };
+    let frac = format!("{:012}", a % unit);
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() {
+        format!("{sign}{}", a / unit)
+    } else {
+        format!("{sign}{}.{frac}", a / unit)
+    }
+}
+
+/// An exact Pact amount in fixed point of 12 places: a JSON number by its text,
+/// `{"decimal": text}` or `{"int": n}`; `None` for anything else (an exponent, a negative).
+fn pact_fixed12(v: &Value) -> Option<i128> {
+    let t = |x: &Value| match x {
+        Value::String(s) => fixed12(s),
+        Value::Number(n) => fixed12(&n.to_string()),
+        _ => None,
+    };
+    match v {
+        Value::Number(_) => t(v),
+        Value::Object(m) => m.get("decimal").or_else(|| m.get("int")).and_then(t),
+        _ => None,
+    }
+}
+
+/// R-P5P9-75 S: the exact net (fixed point of 12 places) of the `coin.TRANSFER` events that
+/// touch `account` in a node payload with outputs: the coinbase's events and every
+/// transaction output's (gas fees included), received less sent. Other modules' TRANSFER
+/// events do not move the coin balance and are left out. A coinbase or output that does not
+/// decode, or a TRANSFER touching the account whose amount is not exact, is an error: the
+/// net is then unknown.
+pub fn transfer_net(payload: &Value, account: &str) -> Result<i128, String> {
+    let decode = |t: Option<&Value>, what: &str| -> Result<Value, String> {
+        t.and_then(Value::as_str)
+            .and_then(|x| kdx_types::hash::b64url_decode(x).ok())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .ok_or_else(|| format!("{what} that does not decode"))
+    };
+    let mut outs = vec![decode(payload.get("coinbase"), "a coinbase")?];
+    for t in payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("the payload holds no transaction list")?
+    {
+        outs.push(decode(t.get(1), "a transaction output")?);
+    }
+    let mut net: i128 = 0;
+    for e in outs.iter().flat_map(|o| {
+        o.get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+    }) {
+        let coin = e.get("name").and_then(Value::as_str) == Some("TRANSFER")
+            && e.pointer("/module/name").and_then(Value::as_str) == Some("coin")
+            && e.pointer("/module/namespace").is_none_or(Value::is_null);
+        let param = |i: usize| e.pointer(&format!("/params/{i}"));
+        let (from, to) = (
+            param(0).and_then(Value::as_str),
+            param(1).and_then(Value::as_str),
+        );
+        if !coin || (from != Some(account) && to != Some(account)) {
+            continue;
+        }
+        let amount = param(2).and_then(pact_fixed12).ok_or_else(|| {
+            format!("a TRANSFER touching the account whose amount is not exact: {e}")
+        })?;
+        if to == Some(account) {
+            net += amount;
+        }
+        if from == Some(account) {
+            net -= amount;
+        }
+    }
+    Ok(net)
 }
 
 /// Whether a node payload with outputs (`payload/<hash>/outputs`) carries a successful
@@ -933,6 +1161,49 @@ mod tests {
         assert!(!one_block_skew(0.0, "0.5", r));
     }
 
+    /// R-P5P9-75 S: the net counts every coin TRANSFER touching the account in the coinbase
+    /// and the outputs (gas included) exactly; other modules' TRANSFERs are left out; an
+    /// amount that is not exact, or an output that does not decode, leaves the net unknown.
+    /// The balance check is exact to one unit (1e-12) where f64 holds it.
+    #[test]
+    fn d3_s_transfer_net_is_exact_and_counts_gas_and_coinbase() {
+        let enc = |v: Value| kdx_types::hash::b64url_encode(v.to_string().as_bytes());
+        let num = |t: &str| serde_json::from_str::<Value>(t).unwrap();
+        let x = |m: Value, from: &str, to: &str, a: Value| json!({"name": "TRANSFER", "module": m, "params": [from, to, a]});
+        let coin = || json!({"name": "coin", "namespace": null});
+        let out = |evs: Vec<Value>| enc(json!({"result": {"status": "success"}, "events": evs}));
+        let p = json!({
+            "coinbase": out(vec![x(coin(), "", "k:m", num("0.904046"))]),
+            "transactions": [
+                ["tx", out(vec![
+                    x(coin(), "k:m", "k:b", json!({"decimal": "1.5"})),
+                    x(json!({"name": "token", "namespace": "free"}), "k:m", "k:b", num("7.0")),
+                    x(coin(), "k:m", "k:miner2", num("0.0000123")),
+                ])],
+                ["tx", out(vec![x(coin(), "k:c", "k:m", json!({"int": 2}))])],
+            ]
+        });
+        // 0.904046 - 1.5 - 0.0000123 + 2 = 1.4040337
+        assert_eq!(transfer_net(&p, "k:m").unwrap(), 1_404_033_700_000);
+        assert_eq!(fixed12_text(transfer_net(&p, "k:m").unwrap()), "1.4040337");
+        assert_eq!(transfer_net(&p, "k:nobody").unwrap(), 0);
+        let bad = json!({"coinbase": out(vec![x(coin(), "", "k:m", num("1e-3"))]),
+            "transactions": []});
+        assert!(
+            transfer_net(&bad, "k:m").is_err(),
+            "an exponent is not exact"
+        );
+        let undecodable = json!({"coinbase": out(vec![]), "transactions": [["tx", "%%"]]});
+        assert!(transfer_net(&undecodable, "k:m").is_err());
+        assert!(skew_net_holds(10.0, "11.4040337", 1_404_033_700_000));
+        assert!(!skew_net_holds(10.0, "11.404033700001", 1_404_033_700_000));
+        assert!(
+            skew_net_holds(12.5, "11.0", -1_500_000_000_000),
+            "a negative net"
+        );
+        assert_eq!(fixed12_text(-1_500_000_000_000), "-1.5");
+    }
+
     #[test]
     fn coinbase_pays_only_its_miner_on_success() {
         let cb = |status: &str, to: &str| {
@@ -1309,5 +1580,72 @@ mod tests {
         assert_eq!(ok("15.100", "15.290"), None);
         // Not times: a diff.
         assert_eq!(rule_explains(&r, &json!("x"), &json!("y"), false), None);
+    }
+
+    /// R-P5P9-78 (H2 I-4), the R-P5P9-60 bound: on an uncut page of ours, the oracle's count
+    /// below ours takes ours only when ours' count equals ours' own edge count. Ours' 8 for 4
+    /// rows stays a diff; 4 for 4 is taken; a cut page of ours keeps the ruled cost.
+    #[test]
+    fn oracle_counts_heights_needs_ours_self_consistent_on_an_uncut_page() {
+        let rules = [FieldRule::new(
+            "transactions.totalCount",
+            FieldRuleKind::OracleCountsHeights,
+        )];
+        let edges = |n: usize| {
+            (0..n)
+                .map(|i| json!({"node": {"i": i}}))
+                .collect::<Vec<_>>()
+        };
+        let conn = |count: u64, rows: Option<usize>, next: bool| {
+            let mut c = json!({"totalCount": count,
+                "pageInfo": {"hasNextPage": next, "hasPreviousPage": false}});
+            if let Some(n) = rows {
+                c["edges"] = Value::Array(edges(n));
+            }
+            json!({"data": {"transactions": c}})
+        };
+        let take = |a: Value, mut b: Value| oracle_counts_heights(&rules, &a, &mut b);
+        // Ours double-counts: 8 for its 4 rows, both pages whole.
+        assert!(take(conn(8, Some(4), false), conn(1, Some(4), false)).is_empty());
+        // The oracle's page cut, ours whole: ours' own count is still checked.
+        assert!(take(conn(8, Some(4), false), conn(1, Some(2), true)).is_empty());
+        // Ours whole but no edges selected: nothing to check against, nothing taken.
+        assert!(take(conn(4, None, false), conn(1, None, false)).is_empty());
+        // The neighbour: ours 4 for 4, the oracle's 1 (it counts heights) is taken.
+        assert_eq!(
+            take(conn(4, Some(4), false), conn(1, Some(4), false)),
+            vec![(4, 1)]
+        );
+        // Ours' page cut: its count cannot be checked by its edges (the ruled cost).
+        assert_eq!(
+            take(conn(8, Some(4), true), conn(1, Some(4), true)),
+            vec![(8, 1)]
+        );
+    }
+
+    /// R-P5P9-78 (H2 m-4): the Q marker needs ours' list non-empty, and the oracle's kept rows
+    /// keep the oracle's own order (a difference in chain-row order still shows).
+    #[test]
+    fn missing_chain_rows_needs_ours_non_empty_and_keeps_the_oracles_order() {
+        let row = |c: &str| json!({"chainId": c, "balance": "1"});
+        let acct = |rows: Vec<Value>| json!({"data": {"fungibleAccount": {"chainAccounts": rows}}});
+        // Ours holds no chain row at all: no marker, the oracle's list is left whole.
+        let a = acct(vec![]);
+        let mut b = acct(vec![row("0"), row("1")]);
+        assert!(missing_chain_rows(&a, &mut b).is_empty());
+        assert_eq!(b, acct(vec![row("0"), row("1")]));
+        // Ours [2, 0], the oracle [0, 1, 2]: the marker names 1, and the oracle keeps [0, 2].
+        let a = acct(vec![row("2"), row("0")]);
+        let mut b = acct(vec![row("0"), row("1"), row("2")]);
+        let m = missing_chain_rows(&a, &mut b);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].0, "/data/fungibleAccount/chainAccounts");
+        assert_eq!(b, acct(vec![row("0"), row("2")]));
+        assert_ne!(a, b, "the order difference still shows");
+        // The neighbour: ours [0, 2] in the oracle's order compares equal after the marker.
+        let a = acct(vec![row("0"), row("2")]);
+        let mut b = acct(vec![row("0"), row("1"), row("2")]);
+        assert_eq!(missing_chain_rows(&a, &mut b).len(), 1);
+        assert_eq!(a, b);
     }
 }

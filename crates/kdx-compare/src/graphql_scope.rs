@@ -43,6 +43,8 @@ pub const MAX_PAGES_PATH: &str = "/~harness-limit/graphql-scoped-list-max-pages"
 /// Diff entry of a cut list H6 could not finish for any other reason, per side and list with
 /// the reason (R-P5P9-64 I-5): no allowlist entry, so the record stays unexplained.
 pub const UNFINISHED_PATH: &str = "/~graphql-h6-unfinished";
+/// R-P5P9-75 G: nested lists whose rows select no key compared as multisets per parent.
+pub const NESTED_MULTISET_PATH: &str = "/~graphql-r75-nested-multiset";
 /// Response key of the row key in the harness's list reads.
 pub const KEY_ALIAS: &str = "kdxKey";
 
@@ -188,6 +190,98 @@ pub fn sort_as_set(conn: &mut Value) {
     if let Some(e) = conn.get_mut("edges").and_then(Value::as_array_mut) {
         e.sort_by_cached_key(Value::to_string);
     }
+}
+
+/// Fields that give a nested row a key (R-P5P9-75 G leaves such lists to the other rules).
+const ROW_KEYS: &[&str] = &[
+    "id",
+    "hash",
+    "requestKey",
+    "blockHash",
+    "orderIndex",
+    KEY_ALIAS,
+];
+
+/// R-P5P9-75 G: the nested lists of two normalized bodies (below a root list's rows, at the
+/// same pointer on both sides, outside H2's scope) whose rows select no key and differ. Each
+/// is sorted as a multiset of its rows' selected values (per parent) when both sides' lists
+/// are complete (no next page, `totalCount` equal to the rows) with equal `totalCount`;
+/// otherwise it is listed with why. Returns whether any was sorted, and the lists left.
+pub fn unkeyed_nested(a: &mut Value, b: &mut Value) -> (bool, Vec<Value>) {
+    fn walk(v: &Value, ptr: &str, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m {
+                    let p = format!("{ptr}/{}", esc(k));
+                    if x.get("edges").is_some_and(Value::is_array) && p.contains("/edges/") {
+                        out.push(p.clone());
+                    }
+                    walk(x, &p, out);
+                }
+            }
+            Value::Array(xs) => {
+                for (i, x) in xs.iter().enumerate() {
+                    walk(x, &format!("{ptr}/{i}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut lists = Vec::new();
+    if let Some(d) = a.get("data") {
+        walk(d, "/data", &mut lists);
+    }
+    let scoped: Vec<String> = scoped_lists(a).into_iter().map(|l| l.pointer).collect();
+    let keyed = |c: &Value| {
+        c.get("edges")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|e| {
+                ROW_KEYS
+                    .iter()
+                    .any(|k| e.pointer(&format!("/node/{k}")).is_some())
+            })
+    };
+    let num = |v: Option<&Value>| v.and_then(crate::graphql_norm::decimal_value);
+    let rows = |c: &Value| c.get("edges").and_then(Value::as_array).map_or(0, Vec::len);
+    let complete = |c: &Value| {
+        c.pointer("/pageInfo/hasNextPage") != Some(&Value::Bool(true))
+            && num(c.get("totalCount")).is_some()
+            && num(c.get("totalCount")) == num(Some(&json!(rows(c))))
+    };
+    let (mut sorted, mut left) = (false, Vec::new());
+    // Deepest first, so a sort never moves a list still to visit.
+    for p in lists.iter().rev() {
+        if scoped.contains(p) {
+            continue;
+        }
+        let (Some(ca), Some(cb)) = (a.pointer(p), b.pointer(p)) else {
+            continue;
+        };
+        if keyed(ca) || keyed(cb) || ca.get("edges") == cb.get("edges") {
+            continue;
+        }
+        let why = if !complete(ca) || !complete(cb) {
+            Some("a nested list without a key that is not complete on both sides")
+        } else if num(ca.get("totalCount")) != num(cb.get("totalCount")) {
+            Some("a nested list without a key whose totalCount differs")
+        } else {
+            None
+        };
+        match why {
+            Some(w) => left.push(json!({"list": p, "why": w})),
+            None => {
+                for v in [&mut *a, &mut *b] {
+                    if let Some(c) = v.pointer_mut(p) {
+                        sort_as_set(c);
+                    }
+                }
+                sorted = true;
+            }
+        }
+    }
+    (sorted, left)
 }
 
 /// The node texts of a list's edges, sorted (a multiset).

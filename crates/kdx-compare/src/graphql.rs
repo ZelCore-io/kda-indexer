@@ -939,8 +939,40 @@ pub fn compare_answers_with(
             }
         }
     }
+    // R-P5P9-75 G: nested lists without a key compare as multisets when complete.
+    let (sorted, left) = crate::graphql_scope::unkeyed_nested(&mut na, &mut nb);
+    if sorted {
+        hits.push(hit(crate::graphql_scope::NESTED_MULTISET_PATH));
+    }
+    if !left.is_empty() {
+        hits.push(DiffEntry {
+            path: crate::graphql_scope::UNFINISHED_PATH.into(),
+            kind: DiffKind::Changed,
+            a: Some(json!({ "lists": left })),
+            b: None,
+        });
+    }
     if crate::graphql_norm::count_self_consistent(rules, &na, &mut nb) {
         hits.push(hit(crate::graphql_norm::COUNT_SELF_CONSISTENT_PATH));
+    }
+    // R-P5P9-75 Q: ours' missing chain rows become one marker, which only the KNOWN-GAP entry
+    // (four account operations) matches, and never explains.
+    for (list, missing) in crate::graphql_norm::missing_chain_rows(&na, &mut nb) {
+        hits.push(DiffEntry {
+            path: crate::graphql_norm::MISSING_CHAIN_ROWS_PATH.into(),
+            kind: DiffKind::Missing,
+            a: None,
+            b: Some(json!({ "list": list, "missing": missing })),
+        });
+    }
+    // R-P5P9-75 I: the oracle counts heights on Transactions-9e58b95d (scoped by the entry).
+    for (ours, oracle) in crate::graphql_norm::oracle_counts_heights(rules, &na, &mut nb) {
+        hits.push(DiffEntry {
+            path: crate::graphql_norm::ORACLE_COUNTS_HEIGHTS_PATH.into(),
+            kind: DiffKind::Changed,
+            a: Some(json!(ours)),
+            b: Some(json!(oracle)),
+        });
     }
     if let (Some(da), Some(db)) = (na.get_mut("data"), nb.get_mut("data")) {
         if let (Some(ca), Some(cb)) = (root_connection(da), root_connection(db)) {
@@ -1417,11 +1449,7 @@ impl Ctx {
             let mut s = self.summary.lock().expect("summary");
             s.pair(&route, a, pair_b, &o.class);
             if let Some(rec) = &o.record {
-                if let Some(ids) = &rec.allowlisted {
-                    for id in ids.split(',') {
-                        s.allowlist_hit(id);
-                    }
-                }
+                s.record_hits(rec, &self.allow);
                 if rec.class == "diff" {
                     s.unexplained(&route, &rec.diff);
                 }
@@ -1464,6 +1492,7 @@ impl Ctx {
             diff,
             class: class.to_string(),
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
+            known_gap: None,
             curl: format!("{} ; {}", curl_of(op, vars, "A"), curl_of(op, vars, "B")),
             note,
             body_cap: None,
@@ -1598,19 +1627,14 @@ impl Ctx {
         e: &anyhow::Error,
     ) -> Outcome {
         let d = vec![entry];
-        let (unexplained, ids) = self.allow.classify_request(
-            &RouteKind::Other,
-            &format!("graphql:{}", op.stem),
-            &[],
-            &d,
-        );
-        let class = if unexplained.is_empty() {
-            "allowlisted"
-        } else {
-            "diff"
-        };
+        let c = self
+            .allow
+            .classify_known(&RouteKind::Other, &Self::gql_request(op, vars), &[], &d);
+        let (class, _) = c.class(&d);
+        let ids = c.ids.clone();
         let note = Some(format!("{e:#}"));
-        self.gql_record(op, vars, ta, b_name, a, None, "", d, class, &ids, note)
+        let o = self.gql_record(op, vars, ta, b_name, a, None, "", d, class, &ids, note);
+        Self::with_known_gap(o, &c)
     }
 
     /// Every rule on an oracle pair's two answers after the fetch, in one place for the live
@@ -1696,6 +1720,10 @@ impl Ctx {
         // H8 first: the oracle's transfer rows take the node's indexes, so H7 matches them.
         let h8 = self.gql_transfer_order(ta, a, b, &mut st).await;
         let data = self.gql_payload_data(vars, a, b, &mut st).await;
+        // R-P5P9-75 O: H8 on nested transfer lists; J, K, L: tx fields against the node's
+        // command.
+        let nested = self.gql_nested_transfer_order(vars, a, b, &mut st).await;
+        let cmd_fields = self.gql_node_cmd_fields(vars, a, b, &mut st).await;
         let (h7, note) = self
             .gql_window_referee(ta, op, vars, a, b, max, root_scoped, &mut st)
             .await;
@@ -1709,6 +1737,8 @@ impl Ctx {
         );
         d.extend(h8);
         d.extend(data);
+        d.extend(nested);
+        d.extend(cmd_fields);
         d.extend(h7);
         (d, note)
     }
@@ -2244,6 +2274,9 @@ impl Ctx {
     /// all within the compare's node read cap. R-P5P9-70 (m-1): a height above the cached cut
     /// (the tip moved since it was read) drops the cut and that height's entry once and reads
     /// again; above the new cut too, a failed read or the cap leaves the diff.
+    /// R-P5P9-75 S took over the skew check; this stays for the N2 tests of the cut-branch
+    /// read ([`Ctx::canonical_reread`]), which S uses.
+    #[cfg(test)]
     pub(crate) async fn mined_at(
         &self,
         chain: u8,
@@ -2251,16 +2284,8 @@ impl Ctx {
         account: &str,
         st: &mut crate::graphql_window::Reads,
     ) -> bool {
-        let hd = match self.h7_canonical(chain, h, st).await {
-            Ok(Some(hd)) => hd,
-            Ok(None) => {
-                st.forget_cut(chain, h);
-                match self.h7_canonical(chain, h, st).await {
-                    Ok(Some(hd)) => hd,
-                    _ => return false,
-                }
-            }
-            Err(_) => return false,
+        let Some(hd) = self.canonical_reread(chain, h, st).await else {
+            return false;
         };
         let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
             return false;
@@ -2271,55 +2296,141 @@ impl Ctx {
         }
     }
 
-    /// R-P5P9-70 (m-5): N2's one-block skew at `(chain, node_h)` is excused only when ours'
-    /// tip on that chain is `node_h - 1` (one read of ours: our blocks from that height hold
-    /// exactly that one), the node stores exactly one header at `node_h` and it is the cut
-    /// branch's, and its coinbase paid `account` ([`Ctx::mined_at`]). Anything else, a failed
-    /// read or the cap leaves the diff.
-    pub(crate) async fn n2_skew(
+    /// The node's canonical header at `(chain, h)` on the cut's branch (H7's helper,
+    /// R-P5P9-67 m-5). R-P5P9-70 (m-1): a height above the cached cut (the tip moved since it
+    /// was read) drops the cut and that height's entry once and reads again; above the new
+    /// cut too, a failed read or the cap gives `None`.
+    pub(crate) async fn canonical_reread(
+        &self,
+        chain: u8,
+        h: u64,
+        st: &mut crate::graphql_window::Reads,
+    ) -> Option<Value> {
+        match self.h7_canonical(chain, h, st).await {
+            Ok(Some(hd)) => Some(hd),
+            Ok(None) => {
+                st.forget_cut(chain, h);
+                self.h7_canonical(chain, h, st).await.ok().flatten()
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// R-P5P9-75 S (it replaces R-P5P9-70 m-5's coinbase-only N2 check): the NodeBalance
+    /// skew on `chain`. Allowed when ours' tip is 1 or 2 blocks below `node_h` (one read of
+    /// ours: its blocks from `node_h - 2` on that chain, one per height, with no next page),
+    /// every height above ours' tip holds exactly one header and it is the cut branch's
+    /// ([`Ctx::canonical_reread`]), and the node's balance `node` less ours (`ours`, our
+    /// `Float`) is exactly the net of the coin TRANSFER events touching `account` in those
+    /// blocks, coinbase and gas fees included ([`crate::graphql_norm::transfer_net`]; the
+    /// node's balance less the net, rounded once to f64, is ours). One cached payload read
+    /// per block, within the compare's node read cap. `Ok`: the evidence; `Err`: why not.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn s_skew(
         &self,
         ta: &Target,
         chain: u8,
         node_h: u64,
         account: &str,
+        ours: f64,
+        node: &str,
         st: &mut crate::graphql_window::Reads,
-    ) -> bool {
-        let Some(below) = node_h.checked_sub(1) else {
-            return false;
-        };
-        const TIP: &str = "query N2Tip($c: [String!], $h: Int!) { blocksFromHeight(startHeight: \
+    ) -> Result<String, String> {
+        let lo = node_h
+            .checked_sub(2)
+            .ok_or_else(|| format!("node_h {node_h} is below 2"))?;
+        const TIP: &str = "query STip($c: [String!], $h: Int!) { blocksFromHeight(startHeight: \
                            $h, chainIds: $c, first: 2) { pageInfo { hasNextPage } edges { node \
-                           { height chainId } } } }";
+                           { height chainId hash } } } }";
         st.ours += 1;
-        let vars = json!({"c": [chain.to_string()], "h": below});
-        let Some(data) = self.gql_read(ta, TIP, vars).await else {
-            return false;
-        };
+        let vars = json!({"c": [chain.to_string()], "h": lo});
+        let data = self
+            .gql_read(ta, TIP, vars)
+            .await
+            .ok_or("ours' tip read failed")?;
         let conn = &data["blocksFromHeight"];
-        let rows: Vec<(Option<String>, Option<String>)> = conn["edges"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|e| {
-                (
-                    text_decimal(e.pointer("/node/height")),
-                    text_decimal(e.pointer("/node/chainId")),
-                )
-            })
-            .collect();
-        let one_below = rows == [(Some(below.to_string()), Some(chain.to_string()))]
-            && conn.pointer("/pageInfo/hasNextPage") == Some(&json!(false));
-        if !one_below {
-            return false;
+        if conn.pointer("/pageInfo/hasNextPage") != Some(&json!(false)) {
+            return Err(format!(
+                "ours is not 1 or 2 blocks below node_h {node_h} on chain {chain} (a next page \
+                 from {lo}, or no word on one)"
+            ));
         }
-        let one = match self.h7_headers(chain, node_h, st).await {
-            Ok(hs) if hs.len() == 1 => hs[0].get("hash").cloned(),
-            _ => return false,
-        };
-        if one.is_none() || !self.mined_at(chain, node_h, account, st).await {
-            return false;
+        let mut hs = Vec::new();
+        let mut hashes = std::collections::HashMap::new();
+        for e in conn["edges"].as_array().into_iter().flatten() {
+            let c = text_decimal(e.pointer("/node/chainId"));
+            let h = text_decimal(e.pointer("/node/height")).and_then(|h| h.parse::<u64>().ok());
+            match h {
+                Some(h) if c.as_deref() == Some(chain.to_string().as_str()) => {
+                    hs.push(h);
+                    hashes.insert(h, e.pointer("/node/hash").cloned());
+                }
+                _ => return Err(format!("ours' tip read holds a row off chain {chain}: {e}")),
+            }
         }
-        matches!(self.h7_canonical(chain, node_h, st).await, Ok(Some(hd)) if hd.get("hash") == one.as_ref())
+        hs.sort_unstable();
+        let tip = *hs.last().ok_or_else(|| {
+            format!("ours holds no block from {lo} on chain {chain}: 3 or more below node_h")
+        })?;
+        // R-P5P9-78 (H2 m-6): ours' own block at its tip is the cut branch's header there (a
+        // fork of ours at `tip` whose net equals the canonical block's would pass otherwise).
+        let mine = hashes.get(&tip).cloned().flatten().filter(Value::is_string);
+        let at_tip = self.canonical_reread(chain, tip, st).await;
+        if mine.is_none() || at_tip.as_ref().and_then(|hd| hd.get("hash")) != mine.as_ref() {
+            return Err(format!(
+                "ours' block at its tip {tip} on chain {chain} ({}) is not the cut branch's \
+                 header there",
+                mine.as_ref()
+                    .map_or_else(|| "no hash".to_string(), Value::to_string)
+            ));
+        }
+        if hs != (lo..=tip).collect::<Vec<u64>>() || !(tip + 1 == node_h || tip + 2 == node_h) {
+            return Err(format!(
+                "ours' blocks from {lo} on chain {chain} are {hs:?}: not one per height up to \
+                 1 or 2 below node_h {node_h}"
+            ));
+        }
+        let mut net: i128 = 0;
+        for h in tip + 1..=node_h {
+            let one = match self.h7_headers(chain, h, st).await? {
+                hs if hs.len() == 1 => hs[0].get("hash").cloned(),
+                hs => {
+                    return Err(format!(
+                        "{} headers at height {h} on chain {chain}: not one per height",
+                        hs.len()
+                    ))
+                }
+            };
+            let hd = self
+                .canonical_reread(chain, h, st)
+                .await
+                .ok_or_else(|| format!("no canonical header at height {h} on chain {chain}"))?;
+            if one.is_none() || hd.get("hash") != one.as_ref() {
+                return Err(format!(
+                    "the header at height {h} on chain {chain} is not the cut branch's"
+                ));
+            }
+            let ph = hd
+                .get("payloadHash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("the header at height {h} has no payload hash"))?;
+            let p = self.h7_payload(chain, ph, st).await?;
+            net += crate::graphql_norm::transfer_net(&p, account)
+                .map_err(|w| format!("height {h} on chain {chain}: {w}"))?;
+        }
+        let net_text = crate::graphql_norm::fixed12_text(net);
+        if !crate::graphql_norm::skew_net_holds(ours, node, net) {
+            return Err(format!(
+                "chain {chain}: the node's {node} less the net {net_text} of heights {}..={node_h} \
+                 is not ours {ours}",
+                tip + 1
+            ));
+        }
+        Ok(format!(
+            "chain {chain}: ours' tip {tip}, node_h {node_h}, the node's {node} less ours {ours} \
+             = the TRANSFER net {net_text} of {} block(s)",
+            node_h - tip
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2341,19 +2452,11 @@ impl Ctx {
                 record: None,
             };
         }
-        let (unexplained, ids) = self.allow.classify_request(
-            &RouteKind::Other,
-            &format!("graphql:{}", op.stem),
-            &[],
-            &d,
-        );
-        let class = if unexplained.is_empty() {
-            "allowlisted"
-        } else {
-            "diff"
-        };
-        let shown: Vec<DiffEntry> = if class == "diff" { unexplained } else { d };
-        self.gql_record(
+        let c = self
+            .allow
+            .classify_known(&RouteKind::Other, &Self::gql_request(op, vars), &[], &d);
+        let (class, shown) = c.class(&d);
+        let o = self.gql_record(
             op,
             vars,
             ta,
@@ -2363,9 +2466,25 @@ impl Ctx {
             b_raw,
             shown,
             class,
-            &ids,
+            &c.ids,
             note,
-        )
+        );
+        Self::with_known_gap(o, &c)
+    }
+
+    /// The request text the allowlist reads for a GraphQL compare: `graphql:<operation>
+    /// <variables as JSON>` (R-P5P9-75 P: a KNOWN-GAP entry is scoped to accounts by
+    /// `request_any`).
+    pub fn gql_request(op: &GqlOp, vars: &Map<String, Value>) -> String {
+        format!("graphql:{} {}", op.stem, Value::Object(vars.clone()))
+    }
+
+    /// The KNOWN-GAP entries a classified record hit go on its record (R-P5P9-75).
+    fn with_known_gap(mut o: Outcome, c: &crate::allowlist::Classified) -> Outcome {
+        if let Some(r) = o.record.as_mut() {
+            r.known_gap = (!c.known_ids.is_empty()).then(|| c.known_ids.join(","));
+        }
+        o
     }
 
     /// `pactQuery` and friends answer `NOT_SUPPORTED` (checked on A alone).
@@ -2518,23 +2637,12 @@ impl Ctx {
             raw: String::new(),
             ms: Vec::new(),
         };
-        let (unexplained, ids) = self.allow.classify_request(
-            &RouteKind::Other,
-            &format!("graphql:{}", op.stem),
-            &[],
-            &d,
-        );
-        let class = if unexplained.is_empty() {
-            "allowlisted"
-        } else {
-            "diff"
-        };
-        let shown = if unexplained.is_empty() {
-            d
-        } else {
-            unexplained
-        };
-        self.gql_record(
+        let c = self
+            .allow
+            .classify_known(&RouteKind::Other, &Self::gql_request(op, vars), &[], &d);
+        let (class, shown) = c.class(&d);
+        let ids = c.ids.clone();
+        let o = self.gql_record(
             op,
             vars,
             ta,
@@ -2546,7 +2654,8 @@ impl Ctx {
             class,
             &ids,
             None,
-        )
+        );
+        Self::with_known_gap(o, &c)
     }
 
     /// GraphQL block fields against the canonical header the node served.
@@ -2616,12 +2725,14 @@ impl Ctx {
             .to_string();
         let mut last: Vec<DiffEntry> = Vec::new();
         let mut skews: Vec<DiffEntry> = Vec::new();
+        let mut s_ev: Vec<String> = Vec::new();
         let mut floats = false;
         for attempt in 0..2 {
             // The node reads of `mined_at` (N2): one cut per attempt (R-P5P9-70 m-1: the
             // retry reads the moved tip), capped like H7's.
             let mut n2_reads = crate::graphql_window::Reads::default();
             skews.clear();
+            s_ev.clear();
             floats = false;
             let data = match self.gql_a_data(ta, op, vars).await {
                 Ok(d) => d,
@@ -2679,25 +2790,35 @@ impl Ctx {
                     // rounded once (R-P5P9-58).
                     let ours = r.get("balance").and_then(crate::graphql_norm::num_f64);
                     let theirs = det.balance.trim().parse::<f64>().ok();
-                    let reward =
-                        crate::rewards::block_reward(node_h, self.graph.chains_at(node_h).len());
                     if ours.is_some() && ours == theirs {
                         floats = true;
-                    } else if match (ours, reward) {
-                        (Some(x), Some(rw)) => {
-                            crate::graphql_norm::one_block_skew(x, &det.balance, rw)
-                                && self
-                                    .n2_skew(ta, chain, node_h, &account, &mut n2_reads)
-                                    .await
-                        }
-                        _ => false,
-                    } {
-                        skews.push(DiffEntry {
-                            path: format!("/chain{chain}/balance~skew"),
-                            ..entry
-                        });
                     } else {
-                        d.push(entry);
+                        // R-P5P9-75 S: ours 1 or 2 blocks behind, by the exact event net.
+                        let s = match ours {
+                            Some(x) => {
+                                self.s_skew(
+                                    ta,
+                                    chain,
+                                    node_h,
+                                    &account,
+                                    x,
+                                    &det.balance,
+                                    &mut n2_reads,
+                                )
+                                .await
+                            }
+                            None => Err("ours' balance is not a number".into()),
+                        };
+                        match s {
+                            Ok(ev) => {
+                                s_ev.push(ev);
+                                skews.push(DiffEntry {
+                                    path: format!("/chain{chain}/balance~skew"),
+                                    ..entry
+                                });
+                            }
+                            Err(_) => d.push(entry),
+                        }
                     }
                 }
                 if let Some(g) = r.get("guard").filter(|g| g.get("keys").is_some()) {
@@ -2743,11 +2864,11 @@ impl Ctx {
                 skews,
                 "skew",
                 &[],
-                Some(
-                    "one block of coinbase behind /local after the retry; the node's block at \
-                     its read height paid it (R-P5P9-57/-58)"
-                        .into(),
-                ),
+                Some(format!(
+                    "1 or 2 blocks behind /local after the retry, by the exact net of the \
+                     node's TRANSFER events above ours' tip (R-P5P9-75 S; R-P5P9-57/-58): {}",
+                    s_ev.join("; ")
+                )),
             );
         }
         if floats {
@@ -3733,7 +3854,9 @@ mod tests {
             assert!(ids.iter().any(|i| i == id), "{id} not hit: {ids:?}");
             let e = allow.entries.iter().find(|e| e.id == id).unwrap();
             assert!(
-                e.owner_note.starts_with("PROPOSED") && e.reason.contains("R-P5P9-62"),
+                (e.owner_note.starts_with("PROPOSED")
+                    || e.owner_note.starts_with("ACCEPTED (R-P5P9-75"))
+                    && e.reason.contains("R-P5P9-62"),
                 "{id}: {e:?}"
             );
         }
@@ -3753,7 +3876,10 @@ mod tests {
                 .iter()
                 .any(|r| e.owner_note.contains(r) || e.reason.contains(r));
             assert!(
-                e.owner_note.starts_with("PROPOSED") && ruled && !e.reason.is_empty(),
+                (e.owner_note.starts_with("PROPOSED")
+                    || e.owner_note.starts_with("ACCEPTED (R-P5P9-75"))
+                    && ruled
+                    && !e.reason.is_empty(),
                 "{id}: {e:?}"
             );
             assert!(
