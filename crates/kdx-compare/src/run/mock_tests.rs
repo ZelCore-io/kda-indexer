@@ -2396,7 +2396,12 @@ async fn h7_content_of_one_sided_rows_is_the_nodes() {
     )
     .await;
     assert!(!only_hits(&d), "{d:?}");
-    assert!(note.unwrap_or_default().contains("not canonical"));
+    // R-P5P9-86 NC: unsettled (the node's block for the key is the row's), not "not canonical".
+    let note = note.unwrap_or_default();
+    assert!(
+        note.contains("the node's transaction lacks the row") && !note.contains("not canonical"),
+        "{note}"
+    );
     let (d, _) = settle(
         vec![e1.clone(), ev("e5", r#"["s","r",1.50]"#)],
         vec![e1],
@@ -7749,4 +7754,52 @@ async fn e1_n_ours_in_the_nodes_block_order_reversed() {
     assert!(d.iter().all(|e| e.path != SINGLE_BLOCK_PATH), "{d:?}");
     assert!(!only_hits(&d) || note.is_some(), "{d:?} {note:?}");
     assert!(note.unwrap_or_default().contains("N not explained"));
+}
+
+/// R-P5P9-86 NC: an ours-only failed tx whose `badResult` differs from the node's error only
+/// in `info` (ours "", the node "<toplevel>:0": the ACCEPTED `failed-tx-error-info` class) is
+/// judged after that equivalence (CG-5 #1010): canonical, an oracle gap. A `badResult` that
+/// differs in another field stays a diff, and is never called "not canonical" when the
+/// node's block for the key is the row's.
+#[tokio::test]
+async fn e1_nc_failed_tx_error_info_before_judging_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["t0", "t1"] {
+        let (k, mut v) = h7_poll(rk, "B100", 100, json!([]));
+        v.1["result"] = json!({"status": "failure", "error": {"info": "<toplevel>:0",
+            "message": "boom", "type": "TxFailure"}});
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let tx = |rk: &str, info: &str, message: &str| {
+        let bad = json!({"info": info, "message": message, "type": "TxFailure"}).to_string();
+        json!({"cursor": "c", "node": {"hash": rk, "result": {"badResult": bad,
+            "block": {"hash": "B100", "height": 100, "chainId": "0"}}}})
+    };
+    let settle = |a: Vec<Value>, b: Vec<Value>| {
+        let ctx = &ctx;
+        async move {
+            let mut a = h7_page("transactions", false, a);
+            let mut b = h7_page("transactions", false, b);
+            ctx.gql_settle(
+                &ctx.targets["a"],
+                &serde_json::Map::new(),
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await
+        }
+    };
+    let t0 = tx("t0", "<toplevel>:0", "boom");
+    // Ours' t1 with info "": the accepted equivalence, so the node holds it: an oracle gap.
+    let (d, note) = settle(vec![t0.clone(), tx("t1", "", "boom")], vec![t0.clone()]).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // Another message: a diff, but not "not canonical" (the node's block is the row's).
+    let (d, note) = settle(vec![t0.clone(), tx("t1", "", "other")], vec![t0.clone()]).await;
+    assert!(!only_hits(&d), "{d:?}");
+    let all = format!("{d:?} {note:?}");
+    assert!(!all.contains("not canonical"), "{all}");
 }

@@ -640,10 +640,33 @@ pub fn tx_matches(n: &Value, p: &Value, oracle: bool) -> bool {
         })
         && r.get("badResult").is_none_or(|x| {
             (status == Some("failure")) != x.is_null()
-                && (x.is_null() || oracle || json_is(x, p.pointer("/result/error")))
+                && (x.is_null() || oracle || bad_result_is(x, p.pointer("/result/error")))
         })
         && r.get("continuation")
             .is_none_or(|x| json_is(x, p.get("continuation")))
+}
+
+/// R-P5P9-86 NC: ours' `badResult` against the node's error, after the ACCEPTED
+/// `failed-tx-error-info` equivalence (`/result/error/info`, changed: both hold an `info`
+/// text, and only the text differs). Every other field must be the node's.
+fn bad_result_is(x: &Value, node: Option<&Value>) -> bool {
+    let node = node.unwrap_or(&Value::Null);
+    let ours = json_field(x);
+    let info = |v: &Value| v.get("info").filter(|i| i.is_string()).is_some();
+    if same_value(&ours, node, false) {
+        return true;
+    }
+    if !(info(&ours) && info(node)) {
+        return false;
+    }
+    let drop = |v: &Value| {
+        let mut v = v.clone();
+        if let Some(m) = v.as_object_mut() {
+            m.shift_remove("info");
+        }
+        v
+    };
+    same_value(&drop(&ours), &drop(node), false)
 }
 
 /// The fields of a list row's node the harness checks against the node, per kind and level
@@ -1196,8 +1219,10 @@ fn content_verdict(
             return if tx_matches(n, entry, oracle) {
                 with(v(Canon::Yes, "placed, with the row's result"), None, 1)
             } else {
+                // R-P5P9-86 NC: the node placed the key in the row's block, so a content
+                // difference is unsettled, never "not canonical".
                 with(
-                    v(not_held(oracle), "the node's result is not the row's"),
+                    v(Canon::Unknown, "the node's result is not the row's"),
                     None,
                     0,
                 )
@@ -1217,7 +1242,7 @@ fn content_verdict(
         .filter(|i| hits.contains(i));
     match (r.index, hits.first(), at) {
         (_, None, _) => with(
-            v(not_held(oracle), "the node's transaction lacks the row"),
+            v(Canon::Unknown, "the node's transaction lacks the row"),
             None,
             0,
         ),
@@ -4926,10 +4951,12 @@ mod tests {
             poll_verdict(&id(None, Some(9), Some(0)), &n, &p, false, None).canon,
             Canon::Unknown
         );
+        // R-P5P9-86 NC: the node's block for the key is the row's, so the node's transaction
+        // lacking the row leaves it unsettled, never "not canonical".
         let p2 = poll("B", 9, json!([other]));
         assert_eq!(
             poll_verdict(&id(None, Some(9), None), &n, &p2, false, None).canon,
-            Canon::No
+            Canon::Unknown
         );
         // A coinbase row: the only header at its height and its coinbase request key.
         let cb = |rk: &str| {
