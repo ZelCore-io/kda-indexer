@@ -7155,3 +7155,80 @@ async fn d4a_h1_m1_cross_chain_link_is_judged_against_every_matching_event() {
     .await;
     assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
 }
+
+/// The settle of `transfers` pages with the document `query` and `vars`.
+async fn d4a_settle(
+    ctx: &Ctx,
+    query: &str,
+    vars: &serde_json::Map<String, Value>,
+    a: Vec<Value>,
+    b: Vec<Value>,
+) -> (Vec<crate::report::DiffEntry>, Option<String>) {
+    let op = crate::graphql::parse_op("QD4a", query, false).unwrap();
+    let mut a = h7_page("transfers", false, a);
+    let mut b = h7_page("transfers", false, b);
+    ctx.gql_settle_op(
+        &ctx.targets["a"],
+        Some(&op),
+        vars,
+        &mut a,
+        &mut b,
+        7_000_000,
+        false,
+    )
+    .await
+}
+
+/// R-P5P9-78 (H1 m-3): E and F read the selection's field names, never the aliases. A row
+/// selection with an alias (`senderAccount: receiverAccount`) makes H7 refuse, so E cannot
+/// read a swapped pair as off the node's chain; a root aliased `transfers: events(...)` is
+/// not F's `transfers`. The harness's own `kdxKey` alias and plain names stay explained.
+#[tokio::test]
+async fn d4a_h1_m3_e_and_f_read_field_names_not_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("x0", 100), ("e", 100), ("u", 101), ("v", 100)] {
+        let (k, v) = h7_xfer_poll(rk, &format!("B{h}"), h, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let vars = serde_json::Map::new();
+    // E: the oracle's row of e is the node's s -> r, under swapped aliases.
+    let swapped = "query Q($first: Int) { transfers(first: $first) { totalCount pageInfo { \
+                   hasNextPage endCursor } edges { cursor node { requestKey block { chainId \
+                   height } senderAccount: receiverAccount receiverAccount: senderAccount \
+                   amount } } } }";
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("r", "s")));
+    let e = h7_xrow("e", 100, json!(1.0), Some(("r", "s")));
+    let (d, note) = d4a_settle(&ctx, swapped, &vars, vec![x0.clone()], vec![x0.clone(), e]).await;
+    assert!(!only_hits(&d), "{d:?} {note:?}");
+    assert!(note.unwrap_or_default().contains("alias"));
+    // F: key-only rows under `transfers: events(...)`.
+    let r = |rk: &str| json!({"cursor": "c", "node": {"chainId": "0", "requestKey": rk}});
+    let q = |root: &str, key: &str| {
+        format!(
+            "query Q($first: Int) {{ {root}(first: $first) {{ totalCount pageInfo {{ \
+             hasNextPage endCursor }} edges {{ cursor node {{ chainId requestKey }} {key} }} }} }}"
+        )
+    };
+    let (d, note) = d4a_settle(
+        &ctx,
+        &q("transfers: events", ""),
+        &vars,
+        vec![r("u"), r("v")],
+        vec![r("u")],
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?} {note:?}");
+    for key in ["", "kdxKey: node { requestKey orderIndex }"] {
+        let (d, note) = d4a_settle(
+            &ctx,
+            &q("transfers", key),
+            &vars,
+            vec![r("u"), r("v")],
+            vec![r("u")],
+        )
+        .await;
+        assert!(only_hits(&d) && !d.is_empty(), "{key}: {d:?} {note:?}");
+    }
+}

@@ -1553,6 +1553,118 @@ pub fn root_args(query: &str, key: &str) -> Option<Vec<(String, String)>> {
     None
 }
 
+/// R-P5P9-78 (H1 m-3): root field `key` (its alias or its name) in document `query`: the field
+/// it names, and every alias its selection set uses below it (the harness's own `kdxKey`
+/// aside; a named fragment spread, which the harness does not read, counts as `...Name`).
+/// `None` when the root is not found.
+pub fn root_selection(query: &str, key: &str) -> Option<(String, Vec<String>)> {
+    let b = query.as_bytes();
+    let ident = |mut i: usize| {
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        i
+    };
+    let space = |mut i: usize| {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
+            i += 1;
+        }
+        i
+    };
+    // Past a string or a comment at `i`, else `i`.
+    let skip = |mut i: usize| match b.get(i) {
+        Some(b'"') => {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i + 1
+        }
+        Some(b'#') => {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            i
+        }
+        _ => i,
+    };
+    let (mut depth, mut paren, mut i) = (0i32, 0i32, 0usize);
+    let start = loop {
+        let j = skip(i);
+        if j != i {
+            i = j;
+            continue;
+        }
+        match *b.get(i)? {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            c if (c.is_ascii_alphabetic() || c == b'_') && depth == 1 && paren == 0 => {
+                let j = ident(i);
+                if &query[i..j] == key {
+                    break j;
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    };
+    let mut k = space(start);
+    let mut field = key.to_string();
+    if b.get(k) == Some(&b':') {
+        let f = space(k + 1);
+        k = ident(f);
+        field = query[f..k].to_string();
+    }
+    let mut aliases = Vec::new();
+    let (mut depth, mut paren, mut i) = (0i32, 0i32, space(k));
+    while i < b.len() {
+        let j = skip(i);
+        if j != i {
+            i = j;
+            continue;
+        }
+        match b[i] {
+            b'{' if paren == 0 => depth += 1,
+            b'}' if paren == 0 => {
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            }
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'.' if paren == 0 && query[i..].starts_with("...") => {
+                let n = space(i + 3);
+                let e = ident(n);
+                if e > n && &query[n..e] != "on" {
+                    aliases.push(format!("...{}", &query[n..e]));
+                }
+                i = e.max(i + 3);
+                continue;
+            }
+            c if (c.is_ascii_alphabetic() || c == b'_') && paren == 0 => {
+                let e = ident(i);
+                let name = &query[i..e];
+                if depth > 0
+                    && b.get(space(e)) == Some(&b':')
+                    && name != crate::graphql_scope::KEY_ALIAS
+                {
+                    aliases.push(name.to_string());
+                }
+                i = e;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Some((field, aliases))
+}
+
 /// The `name: value` pairs of an argument list from byte `i` (past its `(`) to its `)`.
 fn parse_args(q: &str, mut i: usize) -> Option<Vec<(String, String)>> {
     let b = q.as_bytes();
@@ -2808,7 +2920,22 @@ impl Ctx {
                 _ => {}
             }
         }
-        let prep = match prepare_in(&ca, &cb, root.as_deref().unwrap_or_default()) {
+        // R-P5P9-78 (H1 m-3): E, F and the matchers read the rows by field name, so a row
+        // selection with an alias is refused, and F reads the root's field, not its alias.
+        let (field, aliases) = query
+            .zip(root.as_deref())
+            .and_then(|(q, r)| root_selection(q, r))
+            .unwrap_or_else(|| (root.clone().unwrap_or_default(), Vec::new()));
+        if !aliases.is_empty() {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "H7 not applied: the row selection has an alias ({}); H7 reads field names",
+                    aliases.join(", ")
+                )),
+            );
+        }
+        let prep = match prepare_in(&ca, &cb, &field) {
             Ok(mut p) => {
                 // R-P5P9-75 D: rows without an index match after the ruled value matchers.
                 p.rules = self.cfg.graphql.field_rules.clone();
