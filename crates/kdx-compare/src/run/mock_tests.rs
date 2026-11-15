@@ -6644,3 +6644,159 @@ async fn d2_rest_allowlisted_records_are_logged_with_the_entry_id() {
         "{log}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// FVH-D3: R-P5P9-75 N (a page cut inside one block) and S (the NodeBalance skew)
+
+/// A block of the node at (chain 0, `h`): its header (the only one at the height, so the
+/// cut's branch holds it) and a payload whose transactions are `rks` in that order.
+fn d3_block(node: &mut NodeMock, blk: &str, h: u64, rks: &[String]) {
+    let ph = format!("P{blk}");
+    node.headers.insert(
+        (0, h),
+        vec![json!({"hash": blk, "height": h, "chainId": 0, "payloadHash": ph})],
+    );
+    let txs: Vec<Value> = rks
+        .iter()
+        .map(|rk| {
+            let w = json!({"hash": rk, "sigs": [], "cmd": "{}"}).to_string();
+            json!([kdx_types::hash::b64url_encode(w.as_bytes()), ""])
+        })
+        .collect();
+    node.payloads.insert(ph, json!({"transactions": txs}));
+}
+
+/// A QTransactionsByBlock row: the relay id (block, request key) and the request key.
+fn d3_row(blk: &str, rk: &str) -> Value {
+    let id = crate::graphql::base64_std(format!("Transaction:[\"{blk}\",\"{rk}\"]").as_bytes());
+    json!({"cursor": "c", "node": {"id": id, "hash": rk}})
+}
+
+async fn d3_n_run(
+    ctx: &Ctx,
+    vars: &serde_json::Map<String, Value>,
+    ours: &[String],
+    oracle: &[String],
+) -> (
+    Vec<crate::report::DiffEntry>,
+    Option<String>,
+    crate::graphql::Answer,
+    crate::graphql::Answer,
+) {
+    let op = crate::graphql::parse_op(
+        "QTransactionsByBlock",
+        "query QTransactionsByBlock($blockHash: String, $first: Int, $after: String) { \
+         transactions(blockHash: $blockHash, first: $first, after: $after) { totalCount \
+         pageInfo { hasNextPage endCursor } edges { cursor node { id hash } } } }",
+        false,
+    )
+    .unwrap();
+    let page = |keys: &[String]| {
+        h7_page(
+            "transactions",
+            true,
+            keys.iter().map(|k| d3_row("BLK612", k)).collect(),
+        )
+    };
+    let (mut a, mut b) = (page(ours), page(oracle));
+    let (d, note) = ctx
+        .gql_window_referee(
+            &ctx.targets["a"],
+            Some(&op),
+            vars,
+            &mut a,
+            &mut b,
+            7_000_000,
+            false,
+            &mut Reads::default(),
+        )
+        .await;
+    (d, note, a, b)
+}
+
+/// R-P5P9-75 N: a page cut inside one block is explained iff ours' rows are the node's block
+/// transactions in the node's order from ours' cursor position, and every oracle row is in
+/// that node block (one cached payload read per block). CG-4 #612's shape: 233 node txs, two
+/// 200-row pages in different orders, ours in node order. Ours in another order, a row of
+/// ours or of the oracle's outside the block, or a request that starts after a cursor (ours'
+/// position unknown) stay diffs.
+#[tokio::test]
+async fn d3_n_a_single_block_cut_is_the_nodes_order_from_ours_cursor() {
+    use crate::graphql_window::{ROW_PATH, SINGLE_BLOCK_PATH, UNDECIDED_PATH};
+    let dir = tempfile::tempdir().unwrap();
+    let rks: Vec<String> = (0..233).map(|i| format!("t{i:03}")).collect();
+    let mut node = NodeMock::default();
+    d3_block(&mut node, "BLK612", 5_607_111, &rks);
+    let calls = node.calls.clone();
+    let au = ours_fn_server(|req: &Value| {
+        if req["query"].as_str().unwrap_or("").contains("block(hash") {
+            json!({"data": {"block": {"chainId": "0"}}})
+        } else {
+            json!({"data": null})
+        }
+    })
+    .await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let vars = h7_vars(&[("blockHash", json!("BLK612")), ("first", json!(200))]);
+    // Ours: the node's first 200 in its order. The oracle: 200 others of the block, reversed.
+    let ours: Vec<String> = rks[..200].to_vec();
+    let oracle: Vec<String> = rks[33..].iter().rev().cloned().collect();
+    let (d, note, a, b) = d3_n_run(&ctx, &vars, &ours, &oracle).await;
+    assert!(
+        d.iter().any(|e| e.path == SINGLE_BLOCK_PATH),
+        "{d:?} {note:?}"
+    );
+    assert!(only_hits(&d) && note.is_none(), "{d:?} {note:?}");
+    let edges = |x: &crate::graphql::Answer| x.body["data"]["transactions"]["edges"].clone();
+    let (ea, eb) = (edges(&a), edges(&b));
+    assert_eq!(
+        ea.as_array().unwrap().len(),
+        167,
+        "the rows both sides hold, paired"
+    );
+    assert_eq!(ea[0]["node"]["hash"], json!("t033"), "in ours' order");
+    assert_eq!(eb[0]["node"]["hash"], json!("t033"));
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("header-by-hash BLK612"))
+            .count(),
+        1,
+        "the block is located once"
+    );
+    let diff = |d: &[crate::report::DiffEntry], note: &Option<String>, what: &str| {
+        assert!(
+            d.iter().all(|e| e.path != SINGLE_BLOCK_PATH),
+            "{what}: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|e| e.path == UNDECIDED_PATH || e.path == ROW_PATH),
+            "{what}: {d:?}"
+        );
+        let n = note.clone().unwrap_or_default();
+        assert!(n.contains("N not explained"), "{what}: {n}");
+    };
+    // Ours in another order than the node's.
+    let mut swapped = ours.clone();
+    swapped.swap(10, 11);
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &swapped, &oracle).await;
+    diff(&d, &note, "ours out of the node's order");
+    // A row of ours the node block does not hold.
+    let mut foreign = ours.clone();
+    foreign[199] = "zzz".into();
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &foreign, &oracle).await;
+    diff(&d, &note, "ours holds a row outside the block");
+    // An oracle row the node block does not hold.
+    let mut stray = oracle.clone();
+    stray[0] = "yyy".into();
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &ours, &stray).await;
+    diff(&d, &note, "an oracle row outside the block");
+    // Ours' cursor position is not known when the request starts after a cursor.
+    let mut after = vars.clone();
+    after.insert("after".into(), json!("someCursor"));
+    let (d, note, ..) = d3_n_run(&ctx, &after, &ours, &oracle).await;
+    diff(&d, &note, "a request after a cursor");
+}

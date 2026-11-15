@@ -515,6 +515,17 @@ status = "PROPOSED"
 ruling = "R-P5P9-75 L."
 owner_note = "PROPOSED (ruling R-P5P9-75 L): new in FVH-D2; stays PROPOSED until CG-5 shows clean hits."
 
+[[entry]]
+id = "graphql-r75-single-block-cut"
+route = "other"
+json_path_glob = "/~graphql-r75-single-block-cut"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-75 N (contract choice, R3E-8): a page cut inside one block or height that H7 does not explain is explained only when ours' rows are the node's block transactions in the node's order from ours' cursor position (a prefix of the node's order; a request after a cursor is not settled), and every oracle row is in that node block. The block is the node's canonical one on the cut's branch at its height; its payload is read once per compare and block. One-sided rows may select their identity only. Ours in another order, a row of ours or of the oracle's outside the block, or a failed read stays unexplained. Evidence: CG-4 class N, #612 (block c0 h5,607,111, 233 node txs, two 200-row pages in different orders)."
+status = "PROPOSED"
+ruling = "R-P5P9-75 N."
+owner_note = "PROPOSED (ruling R-P5P9-75 N): new in FVH-D3; stays PROPOSED until CG-5 shows clean hits."
+
 # R-P5P9-75 (P, Q): KNOWN-GAP entries. A hit is never explained: its record is class
 # `known-gap`, counted per entry and day; the FV gate reads 0 unexplained plus each entry's
 # count not above its CG-4 per-hour baseline x 1.5 over the window. The G4 package lists them.

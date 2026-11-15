@@ -76,6 +76,9 @@ pub const SHORT_PAGE_PATH: &str = "/~graphql-h7-short-page";
 /// R-P5P9-67 m-6 (with R-P5P9-64 I-1): rows H7 identified but could not settle. No allowlist
 /// entry matches it, so the pre-H7 page and tie cuts never excuse what H7 left undecided.
 pub const UNDECIDED_PATH: &str = "/~graphql-h7-undecided";
+/// R-P5P9-75 N: visible hit of a page cut inside one block, explained by the node's block
+/// order (allowlist id `graphql-r75-single-block-cut`); it carries the evidence.
+pub const SINGLE_BLOCK_PATH: &str = "/~graphql-r75-single-block-cut";
 /// Ours' page size cap (Q10): a page of `first` above it holds this many rows.
 pub const OURS_PAGE_CAP: u64 = 100;
 /// R-P5P9-75 C: the oracle's base64-encoded coinbase `requestKey` that decodes to ours' key,
@@ -2756,6 +2759,39 @@ impl Ctx {
             w.prefix = Some(&ext);
             d = decide(&prep, &va, &vb, &w);
         }
+        // R-P5P9-75 N: a page cut inside one block, where H7 does not explain the pair.
+        let mut n_note = String::new();
+        if !d.explained() || !d.grouped {
+            match self.n_single_block(ta, query, vars, &prep, st).await {
+                Ok((pairs, ev)) => {
+                    let side = |rows: &[Row], ours: bool| -> Vec<Value> {
+                        pairs
+                            .iter()
+                            .enumerate()
+                            .map(|(n, (i, j))| tagged(&rows[if ours { *i } else { *j }].edge, n))
+                            .collect()
+                    };
+                    let (ea, eb) = (side(&prep.a, true), side(&prep.b, false));
+                    for (ans, edges) in [(&mut *a, ea), (&mut *b, eb)] {
+                        if let Some(c) = ans
+                            .body
+                            .get_mut("data")
+                            .and_then(crate::graphql::root_connection)
+                        {
+                            c["edges"] = Value::Array(edges);
+                        }
+                    }
+                    let (nr, or) = (st.node - node0, st.ours - ours0);
+                    let ours = json!({"rows": prep.a.len(), "inNodeOrder": true});
+                    let mut ev = ev;
+                    ev["nodeReads"] = json!(nr);
+                    ev["oursReads"] = json!(or);
+                    return (vec![entry(SINGLE_BLOCK_PATH, Some(ours), Some(ev))], None);
+                }
+                Err(Some(why)) => n_note = format!("; N not explained: {why}"),
+                Err(None) => {}
+            }
+        }
         let (nr, or) = (st.node - node0, st.ours - ours0);
         let reads = format!("{nr} node reads, {or} reads of ours");
         let ev_a = json!({"rows": prep.a.len(), "cut": prep.a_cut, "boundaryHeight": d.lowest,
@@ -2778,7 +2814,7 @@ impl Ctx {
                 ));
                 whys.push(why.clone());
             }
-            let note = format!("H7 not explained ({reads}): {}", whys.join("; "));
+            let note = format!("H7 not explained ({reads}): {}{n_note}", whys.join("; "));
             return (out, Some(note));
         }
         let tag = |e: &Value, n: usize| {
@@ -2852,7 +2888,7 @@ impl Ctx {
             whys.push(why);
         }
         let note = format!(
-            "H7 not explained ({reads}): {}; evidence: ours {ev_a}, oracle {ev_b}",
+            "H7 not explained ({reads}): {}; evidence: ours {ev_a}, oracle {ev_b}{n_note}",
             whys.join("; ")
         );
         (out, Some(note))
@@ -3340,6 +3376,248 @@ impl Ctx {
         self.gql_read(ta, q, json!({ "k": rk }))
             .await
             .and_then(|d| parse(d.pointer("/transaction/cmd/meta/chainId")))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-75 N: a page cut inside one block
+
+/// The first field a one-sided row selects that N does not check: N settles a row's identity
+/// only (its relay id, request key, block, chain and height), never other content.
+fn beyond_identity(e: &Value) -> Option<String> {
+    let Some(edge) = e.as_object() else {
+        return Some("an edge that is not an object".into());
+    };
+    if let Some(k) = edge.keys().find(|k| *k != "cursor" && *k != "node") {
+        return Some(k.clone());
+    }
+    let Some(n) = e.get("node").and_then(Value::as_object) else {
+        return Some("node".into());
+    };
+    for (k, v) in n {
+        match k.as_str() {
+            "id" | "hash" | "requestKey" | "chainId" | "blockHash" | "height" | "__typename" => {}
+            "block" => {
+                let Some(b) = v.as_object() else {
+                    return Some("block".into());
+                };
+                if let Some(bk) = b
+                    .keys()
+                    .find(|bk| !matches!(bk.as_str(), "hash" | "height" | "chainId" | "__typename"))
+                {
+                    return Some(format!("block.{bk}"));
+                }
+            }
+            _ => return Some(k.clone()),
+        }
+    }
+    None
+}
+
+/// The request keys of a node payload's transactions, in the node's order.
+pub fn block_request_keys(payload: &Value) -> Result<Vec<String>, String> {
+    payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("the payload holds no transaction list")?
+        .iter()
+        .map(|t| {
+            let raw = t
+                .get(0)
+                .and_then(Value::as_str)
+                .and_then(|x| kdx_types::hash::b64url_decode(x).ok())
+                .ok_or("a payload transaction that does not decode")?;
+            let w: Value = serde_json::from_slice(&raw)
+                .map_err(|_| "a payload transaction that is not JSON".to_string())?;
+            w.get("hash")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "a payload transaction without a hash".to_string())
+        })
+        .collect()
+}
+
+/// R-P5P9-75 N on prepared pages that lie inside one node block whose transactions are
+/// `node` (request keys in the node's order); `start` is ours' cursor position in that order.
+/// Explained iff every row is a transaction whose identity agrees with itself, ours' rows are
+/// `node[start..]`'s prefix (the node's order from ours' cursor) and every oracle row is in
+/// the block. A one-sided row may select its identity only. Returns the pairs (ours' row, the
+/// oracle's row) by request key, in ours' order.
+pub fn single_block_cut(
+    p: &Prep,
+    node: &[String],
+    start: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    for (side, rows) in [("ours", &p.a), ("the oracle's", &p.b)] {
+        for r in rows.iter() {
+            if r.id.kind != Some(Kind::Tx) || r.id.rk.is_none() {
+                return Err(format!(
+                    "a row of {side} that is not a transaction: {}",
+                    r.id.evidence()
+                ));
+            }
+            if let Some(w) = id_conflict(&r.edge, r.id.kind) {
+                return Err(format!(
+                    "a row of {side} whose identity fields disagree ({w}): {}",
+                    r.id.evidence()
+                ));
+            }
+        }
+    }
+    let rk = |r: &Row| r.id.rk.clone().unwrap_or_default();
+    let want = node.get(start..start + p.a.len()).ok_or_else(|| {
+        format!(
+            "ours holds {} rows; the node block holds {} after ours' cursor ({start})",
+            p.a.len(),
+            node.len().saturating_sub(start)
+        )
+    })?;
+    if let Some((i, (r, k))) =
+        p.a.iter()
+            .zip(want)
+            .enumerate()
+            .find(|(_, (r, k))| rk(r) != **k)
+    {
+        return Err(format!(
+            "ours is not the node block's order from its cursor: row {i} is {} where the node \
+             has {k}",
+            rk(r)
+        ));
+    }
+    let held: std::collections::HashSet<&str> = node.iter().map(String::as_str).collect();
+    if let Some(r) = p.b.iter().find(|r| !held.contains(rk(r).as_str())) {
+        return Err(format!(
+            "an oracle row not in the node block: {}",
+            r.id.evidence()
+        ));
+    }
+    let mut used = vec![false; p.b.len()];
+    let mut pairs = Vec::new();
+    for (i, r) in p.a.iter().enumerate() {
+        match (0..p.b.len()).find(|&j| !used[j] && p.b[j].id.rk == r.id.rk) {
+            Some(j) => {
+                used[j] = true;
+                pairs.push((i, j));
+            }
+            None => {
+                if let Some(f) = beyond_identity(&r.edge) {
+                    return Err(format!(
+                        "an ours-only row selects {f}, which N does not check"
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(f) =
+        p.b.iter()
+            .zip(&used)
+            .filter(|(_, u)| !**u)
+            .find_map(|(r, _)| beyond_identity(&r.edge))
+    {
+        return Err(format!(
+            "an oracle-only row selects {f}, which N does not check"
+        ));
+    }
+    Ok(pairs)
+}
+
+/// A row tagged with its pair's place, so `normalize_gql`'s tie sort keeps the pairs.
+fn tagged(e: &Value, n: usize) -> Value {
+    let mut m = Map::new();
+    m.insert(ALIGN_KEY.into(), json!(format!("{n:06}")));
+    if let Some(o) = e.as_object() {
+        m.extend(o.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    Value::Object(m)
+}
+
+impl Ctx {
+    /// R-P5P9-75 N: when every row of both pages lies in one block (one block hash, chain and
+    /// height among the rows that select them) and a page is cut, the node's canonical block
+    /// there (the cut branch's; the chain from ours by the block hash, the height by the
+    /// node's header-by-hash route when the rows select none) and its payload (one cached
+    /// read per block) decide by [`single_block_cut`]. Ours' cursor position is the block's
+    /// start when the request has no `after`; a request after a cursor is not settled.
+    /// `Err(None)`: N does not apply; `Err(Some(why))`: it applies and does not explain.
+    pub(crate) async fn n_single_block(
+        &self,
+        ta: &Target,
+        query: Option<&str>,
+        vars: &Map<String, Value>,
+        p: &Prep,
+        st: &mut Reads,
+    ) -> Result<(Vec<(usize, usize)>, Value), Option<String>> {
+        if !(p.a_cut || p.b_cut) || p.a.is_empty() {
+            return Err(None);
+        }
+        let rows = || p.a.iter().chain(&p.b);
+        let one = |xs: std::collections::BTreeSet<String>| match xs.len() {
+            0 => Ok(None),
+            1 => Ok(xs.into_iter().next()),
+            _ => Err(None),
+        };
+        let block = one(rows().filter_map(|r| r.id.block.clone()).collect())?;
+        let chain = one(rows()
+            .filter_map(|r| r.id.chain.map(|c| c.to_string()))
+            .collect())?;
+        let height = one(rows()
+            .filter_map(|r| r.id.height.map(|h| h.to_string()))
+            .collect())?;
+        if block.is_none() && height.is_none() {
+            return Err(None);
+        }
+        if vars
+            .get(&arg_var(query, "after"))
+            .is_some_and(|v| !v.is_null())
+        {
+            return Err(Some(
+                "the request starts after a cursor: ours' position in the block is not known"
+                    .into(),
+            ));
+        }
+        let chain: u8 = match chain {
+            Some(c) => c.parse().map_err(|_| Some(format!("a chain id {c}")))?,
+            None => {
+                let id = rows().next().map(|r| r.id.clone()).unwrap_or_default();
+                self.h7_chain(ta, &id, st)
+                    .await
+                    .ok_or_else(|| Some("no chain for the block".to_string()))?
+            }
+        };
+        let h: u64 = match (height, &block) {
+            (Some(h), _) => h.parse().map_err(|_| Some(format!("a height {h}")))?,
+            (None, Some(b)) => self
+                .h7_block_height(chain, b, st)
+                .await
+                .map_err(Some)?
+                .ok_or_else(|| Some("the node does not know the block".to_string()))?,
+            (None, None) => return Err(None),
+        };
+        let hd = self
+            .h7_canonical(chain, h, st)
+            .await
+            .map_err(Some)?
+            .ok_or_else(|| Some("no canonical header at the height (above the cut)".into()))?;
+        let hash = hd
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Some("the header has no hash".to_string()))?;
+        if block.as_deref().is_some_and(|b| b != hash) {
+            return Err(Some(
+                "the rows' block is not the cut branch's at its height".into(),
+            ));
+        }
+        let ph = hd
+            .get("payloadHash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Some("the header has no payload hash".to_string()))?;
+        let payload = self.h7_payload(chain, ph, st).await.map_err(Some)?;
+        let node = block_request_keys(&payload).map_err(Some)?;
+        let pairs = single_block_cut(p, &node, 0).map_err(Some)?;
+        let ev = json!({"chain": chain, "height": h, "block": hash, "nodeTxs": node.len(),
+            "cursorPosition": 0, "ours": p.a.len(), "oracle": p.b.len(),
+            "paired": pairs.len()});
+        Ok((pairs, ev))
     }
 }
 
