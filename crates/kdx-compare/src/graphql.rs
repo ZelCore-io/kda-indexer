@@ -3761,7 +3761,9 @@ mod tests {
             assert!(ids.iter().any(|i| i == id), "{id} not hit: {ids:?}");
             let e = allow.entries.iter().find(|e| e.id == id).unwrap();
             assert!(
-                e.owner_note.starts_with("PROPOSED") && e.reason.contains("R-P5P9-62"),
+                (e.owner_note.starts_with("PROPOSED")
+                    || e.owner_note.starts_with("ACCEPTED (R-P5P9-75"))
+                    && e.reason.contains("R-P5P9-62"),
                 "{id}: {e:?}"
             );
         }
@@ -3781,7 +3783,10 @@ mod tests {
                 .iter()
                 .any(|r| e.owner_note.contains(r) || e.reason.contains(r));
             assert!(
-                e.owner_note.starts_with("PROPOSED") && ruled && !e.reason.is_empty(),
+                (e.owner_note.starts_with("PROPOSED")
+                    || e.owner_note.starts_with("ACCEPTED (R-P5P9-75"))
+                    && ruled
+                    && !e.reason.is_empty(),
                 "{id}: {e:?}"
             );
             assert!(

@@ -316,7 +316,8 @@ mod tests {
                 assert!(
                     e.owner_note.contains("by the owner")
                         || e.owner_note.contains("owner ruling")
-                        || (e.ruling.contains("R-P5P9-75, CG-4") && e.owner_note.contains('#')),
+                        || (e.ruling.contains("R-P5P9-75, CG-4")
+                            && (e.owner_note.contains('#') || e.owner_note.contains("zero hits"))),
                     "{} is ACCEPTED without an owner acceptance or a flip ruling with evidence",
                     e.id
                 );
@@ -367,10 +368,12 @@ mod tests {
         let (left, ids) = al.classify_request(&RouteKind::Search, req, &[], &d);
         assert_eq!(left.len(), d.len(), "a plain search diff is unexplained");
         assert!(ids.is_empty());
+        // R-P5P9-75: `search-window` had no hit in CG-4 and its ruling cites no node
+        // evidence, so it is removed: a cut answer's diff is unexplained too.
         let cut = [("x-search-truncated".to_string(), "true".to_string())];
         let (left, ids) = al.classify_request(&RouteKind::Search, req, &cut, &d);
-        assert!(left.is_empty());
-        assert_eq!(ids, vec!["search-window".to_string()]);
+        assert_eq!(left.len(), d.len());
+        assert!(ids.is_empty());
     }
 
     /// R-P5P9-48 item 4: `pactid-cap` matches only an answer carrying X-Search-Truncated (the
@@ -427,40 +430,19 @@ mod tests {
             let (left, ids) = al.classify_request(&route, req, &[], &d);
             (left.len(), ids)
         };
-        let hit = |route: RouteKind, req: &str, id: &str| {
-            let (left, ids) = class(route, req);
-            assert_eq!(
-                (left, ids),
-                (0, vec![id.to_string()]),
-                "{req} should be {id}"
-            );
-        };
         let miss = |route: RouteKind, req: &str| {
             let (left, ids) = class(route, req);
             assert!(left > 0 && ids.is_empty(), "{req} must stay unexplained");
         };
-        hit(
-            RouteKind::Tx,
-            "/txs/tx?requestkey=Au4cjML8abc",
-            "cwd-hole-tx-au4cjml8",
-        );
-        hit(
-            RouteKind::Txs,
-            "/txs/txs?requestkey=Au4cjML8abc",
-            "cwd-hole-txs-au4cjml8",
-        );
+        miss(RouteKind::Tx, "/txs/tx?requestkey=Au4cjML8abc");
+        miss(RouteKind::Txs, "/txs/txs?requestkey=Au4cjML8abc");
         miss(RouteKind::Tx, "/txs/tx?requestkey=Other");
-        hit(
+        miss(
             RouteKind::Events,
             "/txs/events?modulename=coin&name=TRANSFER_XCHAIN&minheight=7392263&maxheight=7392463",
-            "cwd-hole-events-7392263",
         );
         miss(RouteKind::Events, "/txs/events?minheight=7392264");
-        hit(
-            RouteKind::V1Txs,
-            "/v1/txs/k:d7bf62aa/coin/250",
-            "kdatxs-gap-cont-d7bf62",
-        );
+        miss(RouteKind::V1Txs, "/v1/txs/k:d7bf62aa/coin/250");
         // R-P5P9-49: the one-off balances and search entries are gone; the coinbase skew rule
         // and the oracle-orphan, -lag and -gap classes cover them, so a diff on those
         // requests stays unexplained here. A pactid diff is unexplained unless the answer
