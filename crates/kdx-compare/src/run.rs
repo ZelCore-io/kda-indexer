@@ -3851,18 +3851,6 @@ mod tests {
         assert_eq!(num_value(&json!("1.5")), Some(1.5));
     }
 
-    fn rows(hs: &[u64]) -> Value {
-        Value::Array(hs.iter().map(|h| json!({"height": h})).collect())
-    }
-
-    fn heights(v: &Value) -> Vec<u64> {
-        v.as_array()
-            .unwrap()
-            .iter()
-            .filter_map(row_height)
-            .collect()
-    }
-
     /// 5E: the replica `/stats` supply tolerance follows the real tip gap, in the gap's
     /// direction.
     #[test]

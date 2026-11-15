@@ -5717,3 +5717,84 @@ async fn c7_equal_page_cut_answers_are_allowlisted() {
     .await;
     assert_eq!(class, "allowlisted", "{note}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// 5E regression through the merged lag block (R-P5P9-74): `clamp_lists` and its unit test are
+// gone; these two cases keep what it covered.
+
+/// One `/v1/txs`-shaped row at height `h`; the same height gives the same row on both sides.
+fn row_at(h: u64) -> Value {
+    json!({"requestKey": format!("rk{h}"), "chain": h % 20, "height": h,
+        "blockHash": format!("b{h}"), "amount": 1.5, "code": "x", "events": [], "gasLimit": 600})
+}
+
+/// A kda-indexer replica: `/txs/recent` shows one row at its `tip`, every other path `rows`.
+async fn replica_server(tip: u64, rows: Vec<Value>) -> String {
+    let app = Router::new().fallback(move |uri: Uri| {
+        let body = if uri.path() == "/txs/recent" {
+            json!([row_at(tip)])
+        } else {
+            Value::Array(rows.clone())
+        };
+        async move { Json(body) }
+    });
+    serve(app).await
+}
+
+/// 5E (ac2013f's case), `/v1/txs/.../5` on a replica pair, tips 7_000_030 and 7_000_000 (clamp
+/// 6_999_995). One side's full page, 7_000_030 down to 6_999_998, lies wholly above the clamp,
+/// the other side's reaches below it. Both held their limit, so nothing below the first page's
+/// lowest row is comparable: no diff (before ac2013f the lower rows were reported as missing
+/// on the first side). Both orientations: ours as the page above the clamp, and as the one below.
+#[tokio::test]
+async fn r74_v1_txs_a_full_page_wholly_above_the_clamp_bounds_the_other_side() {
+    const B: u64 = 6_999_900;
+    let above: Vec<Value> = [130, 128, 126, 100, 98].map(|x| row_at(B + x)).to_vec();
+    let below: Vec<Value> = [100, 98, 90, 88, 86].map(|x| row_at(B + x)).to_vec();
+    for (ours_above, ours, oracle) in [
+        (false, below.clone(), above.clone()),
+        (true, above.clone(), below.clone()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(NodeMock::default()).await;
+        let (ta, tb) = if ours_above {
+            (B + 130, B + 100)
+        } else {
+            (B + 100, B + 130)
+        };
+        let (au, bu) = (
+            replica_server(ta, ours).await,
+            replica_server(tb, oracle).await,
+        );
+        let ctx = urls_pair_setup(&nu, &au, &bu, dir.path(), "kda_indexer_compat", 0).await;
+        let o = v1_compare(&ctx, "/v1/txs/k:big/coin/5").await;
+        assert!(
+            o.class != "diff" && o.class != "a-error",
+            "ours above: {ours_above}: {} {:?}",
+            o.class,
+            o.record.map(|r| (r.note, r.diff))
+        );
+    }
+}
+
+/// 5E on a paginated route: `/txs/account`, the oracle cut after four pages of three rows
+/// (7_000_000 down to 6_999_989) with every page above the clamp (6_999_985), and ours one
+/// complete page that reaches below the oracle's last page. Ours' rows below it are not
+/// diffs: the page cut covers them, and the rows above the clamp are dropped on both sides.
+#[tokio::test]
+async fn r74_account_oracle_cut_with_every_page_above_the_clamp_is_no_diff() {
+    let rows = v1_rows(20, 10);
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let au = paged_server(rows.clone(), 20, false).await;
+    let bu = paged_server(rows[..12].to_vec(), 3, true).await;
+    let ctx = urls_pair_setup(&nu, &au, &bu, dir.path(), "chainweb_data", 3).await;
+    ctx.tips.set_a_tip(6_999_985 + super::ORACLE_HORIZON);
+    let o = v1_compare(&ctx, "/txs/account/k:big?token=coin").await;
+    assert!(
+        o.class != "diff" && o.class != "a-error",
+        "{} {:?}",
+        o.class,
+        o.record.map(|r| (r.note, r.diff))
+    );
+}
