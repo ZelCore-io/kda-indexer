@@ -50,8 +50,9 @@ pub struct TxCount {
 }
 
 /// Exact user-tx count of what `view` serves: frozen ranges (`tx_count - block_count`,
-/// one coinbase per block) plus the hot rows at or above the split.
-pub fn user_tx_count(view: &View) -> ApiResult<u64> {
+/// one coinbase per block) plus the hot rows at or above the split. The walk stops with an
+/// error at its next check (every 4096 keys) once `stop` is cancelled (R-P5P9-76).
+pub fn user_tx_count(view: &View, stop: &CancellationToken) -> ApiResult<u64> {
     let frozen: u64 = view
         .seg
         .manifest
@@ -63,13 +64,20 @@ pub fn user_tx_count(view: &View) -> ApiResult<u64> {
     let mut hot = 0u64;
     let mut seen = 0u64;
     let mut late = view.check_deadline().is_err();
-    if !late {
+    let mut stopped = stop.is_cancelled();
+    if !late && !stopped {
         // Keys only: the hot window can hold hundreds of thousands of txs.
         view.txn.walk_keys(Table::TailTxs, &lo, |k| {
             seen += 1;
-            if seen.is_multiple_of(4096) && view.check_deadline().is_err() {
-                late = true;
-                return false;
+            if seen.is_multiple_of(4096) {
+                if stop.is_cancelled() {
+                    stopped = true;
+                    return false;
+                }
+                if view.check_deadline().is_err() {
+                    late = true;
+                    return false;
+                }
             }
             if let Ok(b) = <[u8; 8]>::try_from(k) {
                 if !TxKey::from_be_bytes(b).is_coinbase() {
@@ -78,6 +86,11 @@ pub fn user_tx_count(view: &View) -> ApiResult<u64> {
             }
             true
         })?;
+    }
+    if stopped {
+        return Err(ApiError::Unavailable(
+            "the count was stopped by shutdown".into(),
+        ));
     }
     if late {
         return Err(ApiError::Deadline);
@@ -92,7 +105,7 @@ pub(crate) struct CountCache {
     first: tokio::sync::Notify,
     /// When the last refresh failure was logged.
     warned: Mutex<Option<Instant>>,
-    counter: fn(&View) -> ApiResult<u64>,
+    counter: fn(&View, &CancellationToken) -> ApiResult<u64>,
 }
 
 /// The process-wide cache ([`crate::ApiState`] holds it for `/stats`; [`stats`] reads it).
@@ -104,7 +117,7 @@ impl CountCache {
     }
 
     /// A cache whose refresh counts with `counter` (tests inject a slow or failing one).
-    const fn with_counter(counter: fn(&View) -> ApiResult<u64>) -> CountCache {
+    const fn with_counter(counter: fn(&View, &CancellationToken) -> ApiResult<u64>) -> CountCache {
         CountCache {
             last: Mutex::new(None),
             first: tokio::sync::Notify::const_new(),
@@ -153,11 +166,18 @@ impl CountCache {
         true
     }
 
-    /// One recount, run to completion; a failure keeps the last count. A count that took
-    /// longer than `slow_after` logs one WARN with its duration; true then.
-    async fn refresh(&self, st: &Arc<ApiState>, slow_after: Duration) -> bool {
+    /// One recount, run to completion unless `stop` is cancelled (the walk then ends at its
+    /// next check); a failure keeps the last count. A count that took longer than
+    /// `slow_after` logs one WARN with its duration; true then.
+    async fn refresh(
+        &self,
+        st: &Arc<ApiState>,
+        slow_after: Duration,
+        stop: &CancellationToken,
+    ) -> bool {
         let started = Instant::now();
-        let result = st.read_for(NO_DEADLINE, self.counter).await;
+        let (counter, stop) = (self.counter, stop.clone());
+        let result = st.read_for(NO_DEADLINE, move |v| counter(v, &stop)).await;
         let took = started.elapsed();
         let slow = took > slow_after;
         match result {
@@ -195,7 +215,7 @@ async fn refresh_every(st: Arc<ApiState>, every: Duration, shutdown: Cancellatio
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
-            _ = cache.refresh(&st, SLOW_REFRESH) => {}
+            _ = cache.refresh(&st, SLOW_REFRESH, &shutdown) => {}
         }
         tokio::select! {
             () = shutdown.cancelled() => return,
@@ -276,7 +296,10 @@ mod tests {
     fn count_checks_the_deadline() {
         let (_d, store) = crate::testutil::store();
         let view = store.view(Instant::now() - Duration::from_secs(1)).unwrap();
-        assert!(matches!(user_tx_count(&view), Err(ApiError::Deadline)));
+        assert!(matches!(
+            user_tx_count(&view, &CancellationToken::new()),
+            Err(ApiError::Deadline)
+        ));
     }
 
     /// 2: the age grows with the clock while no refresh succeeds, and a refresh resets it.
@@ -308,11 +331,11 @@ mod tests {
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    fn counted(_: &View) -> ApiResult<u64> {
+    fn counted(_: &View, _: &CancellationToken) -> ApiResult<u64> {
         Ok(CALLS.fetch_add(1, Ordering::SeqCst) as u64 + 1)
     }
 
-    fn failing(_: &View) -> ApiResult<u64> {
+    fn failing(_: &View, _: &CancellationToken) -> ApiResult<u64> {
         Err(ApiError::Deadline)
     }
 
@@ -352,7 +375,9 @@ mod tests {
         let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(failing)));
         let (_d, _app, st) = app(cache);
         cache.store(7, Instant::now() - Duration::from_secs(300));
-        cache.refresh(&st, SLOW_REFRESH).await;
+        cache
+            .refresh(&st, SLOW_REFRESH, &CancellationToken::new())
+            .await;
         let c = cache.peek(Instant::now()).unwrap();
         assert_eq!(c.n, 7);
         assert!(c.age >= Duration::from_secs(300));
@@ -377,9 +402,84 @@ mod tests {
         );
     }
 
+    /// I-1: a cancelled token ends the walk with an error, not a count.
+    #[test]
+    fn a_cancelled_token_stops_the_walk() {
+        let (_d, store) = crate::testutil::store();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        assert!(user_tx_count(&view, &CancellationToken::new()).is_ok());
+        let stop = CancellationToken::new();
+        stop.cancel();
+        assert!(matches!(
+            user_tx_count(&view, &stop),
+            Err(ApiError::Unavailable(_))
+        ));
+    }
+
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// A 3 s count that checks the token every 5 ms, like the real walk does.
+    fn stoppable_count(_: &View, stop: &CancellationToken) -> ApiResult<u64> {
+        STARTED.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) {
+            if stop.is_cancelled() {
+                return Err(ApiError::Unavailable("stopped".into()));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(1)
+    }
+
+    /// I-1: shutdown while a count runs: the runtime drop (which waits for blocking work, as
+    /// `#[tokio::main]` does at exit) returns within one check interval, not after the walk.
+    #[test]
+    fn a_count_in_progress_is_abandoned_on_shutdown() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cache: &'static CountCache =
+            Box::leak(Box::new(CountCache::with_counter(stoppable_count)));
+        let stop = CancellationToken::new();
+        let (_d, _app, task) = rt.block_on(async {
+            let (d, app, st) = app(cache);
+            let task = tokio::spawn(refresh_every(st, Duration::from_secs(60), stop.clone()));
+            (d, app, task)
+        });
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !STARTED.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the count starts");
+            stop.cancel();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("the task stops on shutdown")
+                .unwrap();
+        });
+        let t = Instant::now();
+        drop(rt);
+        let took = t.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "runtime drop took {took:?}"
+        );
+        assert!(
+            cache.peek(Instant::now()).is_none(),
+            "an abandoned count is not stored"
+        );
+    }
+
     // ---- STATS-FIX (R-P5P9-75): the count is refreshed in the background ----
 
-    fn slow_count(_: &View) -> ApiResult<u64> {
+    fn slow_count(_: &View, _: &CancellationToken) -> ApiResult<u64> {
         std::thread::sleep(Duration::from_millis(1500));
         Ok(99)
     }
@@ -478,7 +578,7 @@ mod tests {
     }
 
     /// A counter that honours the deadline like the real one and needs 300 ms.
-    fn long_count(v: &View) -> ApiResult<u64> {
+    fn long_count(v: &View, _: &CancellationToken) -> ApiResult<u64> {
         let t = Instant::now();
         while t.elapsed() < Duration::from_millis(300) {
             v.check_deadline()?;
@@ -494,7 +594,9 @@ mod tests {
         let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(long_count)));
         let (_d, app, st) = app(cache);
         assert!(
-            cache.refresh(&st, Duration::from_millis(100)).await,
+            cache
+                .refresh(&st, Duration::from_millis(100), &CancellationToken::new())
+                .await,
             "not slow"
         );
         let (r, _) = get(&app).await;

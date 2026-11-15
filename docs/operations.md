@@ -196,7 +196,8 @@ chainweb-data. Drain the server on the balancer before a planned restart.
 
 The compat `/stats` (and GraphQL `networkInfo`) never counts on the request. A background task
 started with the server recounts the user transactions, starting each count 2 minutes after the
-previous one ended (counts never overlap), and stops with it. A count always runs to completion,
+previous one ended (counts never overlap), and stops with it: an in-progress count is abandoned
+on shutdown, so the exit does not wait for the walk. Otherwise a count runs to completion,
 however long it takes. A request answers the last count with `X-Count-Age: <seconds>`
 since that count finished, so the header stays near the 2 minute interval plus the count time when
 refreshes succeed and grows when they do not. There is no age after which the count is refused.
