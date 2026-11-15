@@ -199,18 +199,23 @@ started with the server recounts the user transactions, starting each count 2 mi
 previous one ended (counts never overlap), and stops with it: an in-progress count is abandoned
 on shutdown, so the exit does not wait for the walk. Otherwise a count runs to completion,
 however long it takes. A request answers the last count with `X-Count-Age: <seconds>`
-since that count finished, so the header stays near the 2 minute interval plus the count time when
-refreshes succeed and grows when they do not. There is no age after which the count is refused.
+since that count started (the snapshot the count read), so the header stays under the 2 minute
+interval plus one count time when refreshes succeed and grows when they do not. There is no age after which the count is
+refused.
 
 - A refresh that takes over 60 s logs one `stats: count refresh was slow` WARN with its
   duration when it ends; the age grows meanwhile and requests keep the last count. A refresh
   that fails keeps the last count and logs one `stats: count refresh failed` WARN per 10
   minutes. A repeated slow WARN means cold pages: check the disk and the `read_threads` load.
+  A request that finds the count older than 6 minutes (3 intervals) logs one
+  `stats: the count is stale` WARN per 10 minutes: a count is stuck or failing.
 - Right after a start there is no count yet. A request waits up to the API deadline, then
   answers `503` with `Retry-After: 5`; GraphQL `networkInfo` answers the same error at once.
   Both clear when the first count finishes, which takes as long as one walk of the hot window.
-- The transaction count in a `/stats` answer can be up to the refresh interval plus a count
-  behind the store; the supply is computed per request.
+  A failed first count is retried after 5 s (later counts after 2 minutes).
+- The transaction count in a `/stats` answer can be up to the refresh interval plus one count
+  behind the store (`X-Count-Age` measures from the start of that count); the supply is computed
+  per request.
 
 ## Metrics and alerts
 

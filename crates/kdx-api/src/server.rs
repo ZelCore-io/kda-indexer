@@ -583,7 +583,7 @@ impl Api {
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any)
-                .expose_headers([CHAINWEB_NEXT]),
+                .expose_headers([CHAINWEB_NEXT, crate::compat::stats::COUNT_AGE]),
         );
         let graphql = data(self.graphql, "graphql").layer(
             CorsLayer::new()

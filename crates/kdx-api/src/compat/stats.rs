@@ -8,7 +8,8 @@
 //!
 //! The count walks every hot tx key, so a request never makes it (R-P5P9-75): a background
 //! task ([`run_refresh`], started and stopped with the server) recounts [`REFRESH_EVERY`]
-//! after each count ended, and a request answers the last count with its age in `x-count-age`.
+//! after each count ended, and a request answers the last count with its age in `x-count-age`
+//! (counted from the start of that count).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -37,15 +38,19 @@ const NO_DEADLINE: Duration = Duration::from_secs(365 * 24 * 3600);
 const WARN_EVERY: Duration = Duration::from_secs(10 * 60);
 /// `Retry-After` (seconds) of the `503` before the first count exists.
 const RETRY_AFTER_SECS: &str = "5";
+/// While no count exists, a failed refresh is retried after this long (the `Retry-After`).
+const FIRST_RETRY: Duration = Duration::from_secs(5);
+/// The count is stale after this many refresh intervals; a request then logs a WARN.
+const STALE_AFTER_INTERVALS: u32 = 3;
 
-/// Header on every `/stats` answer: the age of the count in whole seconds.
+/// Header on every `/stats` 200: the age of the count in whole seconds.
 pub const COUNT_AGE: HeaderName = HeaderName::from_static("x-count-age");
 
 /// A user-tx count as `/stats` answers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxCount {
     pub n: u64,
-    /// How long ago the count finished.
+    /// How long ago the count started (its snapshot is that old).
     pub age: Duration,
 }
 
@@ -105,6 +110,8 @@ pub(crate) struct CountCache {
     first: tokio::sync::Notify,
     /// When the last refresh failure was logged.
     warned: Mutex<Option<Instant>>,
+    /// When a request last logged that the count is stale.
+    stale_warned: Mutex<Option<Instant>>,
     counter: fn(&View, &CancellationToken) -> ApiResult<u64>,
 }
 
@@ -122,6 +129,7 @@ impl CountCache {
             last: Mutex::new(None),
             first: tokio::sync::Notify::const_new(),
             warned: Mutex::new(None),
+            stale_warned: Mutex::new(None),
             counter,
         }
     }
@@ -156,9 +164,21 @@ impl CountCache {
         }
     }
 
-    /// True once per [`WARN_EVERY`].
+    /// True once per [`WARN_EVERY`] (a refresh failure).
     fn warn_due(&self, now: Instant) -> bool {
-        let mut w = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        Self::once_per_window(&self.warned, now)
+    }
+
+    /// True once per [`WARN_EVERY`] while a count of `age` is older than
+    /// [`STALE_AFTER_INTERVALS`] refresh intervals: a refresh that never ends logs nothing
+    /// itself (M-5).
+    fn stale_warn_due(&self, age: Duration, now: Instant) -> bool {
+        age > REFRESH_EVERY * STALE_AFTER_INTERVALS
+            && Self::once_per_window(&self.stale_warned, now)
+    }
+
+    fn once_per_window(slot: &Mutex<Option<Instant>>, now: Instant) -> bool {
+        let mut w = slot.lock().unwrap_or_else(|e| e.into_inner());
         if w.is_some_and(|at| now.saturating_duration_since(at) < WARN_EVERY) {
             return false;
         }
@@ -181,7 +201,7 @@ impl CountCache {
         let took = started.elapsed();
         let slow = took > slow_after;
         match result {
-            Ok(n) => self.store(n, Instant::now()),
+            Ok(n) => self.store(n, started),
             Err(e) => {
                 let now = Instant::now();
                 if self.warn_due(now) {
@@ -206,20 +226,31 @@ impl CountCache {
 
 /// Recount every [`REFRESH_EVERY`] until `shutdown`; `serve` starts it.
 pub(crate) async fn run_refresh(st: Arc<ApiState>, shutdown: CancellationToken) {
-    refresh_every(st, REFRESH_EVERY, shutdown).await;
+    refresh_every(st, REFRESH_EVERY, FIRST_RETRY, shutdown).await;
 }
 
-/// Refresh, wait `every` after it ends, repeat: two refreshes never overlap.
-async fn refresh_every(st: Arc<ApiState>, every: Duration, shutdown: CancellationToken) {
+/// Refresh, wait `every` after it ends (`retry` while no count exists yet), repeat: two
+/// refreshes never overlap.
+async fn refresh_every(
+    st: Arc<ApiState>,
+    every: Duration,
+    retry: Duration,
+    shutdown: CancellationToken,
+) {
     let cache = st.stats_cache;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
             _ = cache.refresh(&st, SLOW_REFRESH, &shutdown) => {}
         }
+        let wait = if cache.peek(Instant::now()).is_some() {
+            every
+        } else {
+            retry
+        };
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = tokio::time::sleep(every) => {}
+            () = tokio::time::sleep(wait) => {}
         }
     }
 }
@@ -270,6 +301,13 @@ pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
         );
         return resp;
     };
+    if cache.stale_warn_due(count.age, Instant::now()) {
+        tracing::warn!(
+            count_age_secs = count.age.as_secs(),
+            "stats: the count is stale (no refresh has finished for over {STALE_AFTER_INTERVALS} intervals); \
+             a count may be stuck or failing"
+        );
+    }
     let mut b = format!("{{\"transactionCount\":{},\"coinsInCirculation\":", count.n).into_bytes();
     match coins {
         Some(c) => shapes::write_aeson(&shapes::aeson_double(c), &mut b),
@@ -345,7 +383,12 @@ mod tests {
         let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(counted)));
         let (_d, _app, st) = app(cache);
         let stop = CancellationToken::new();
-        let task = tokio::spawn(refresh_every(st, Duration::from_millis(20), stop.clone()));
+        let task = tokio::spawn(refresh_every(
+            st,
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            stop.clone(),
+        ));
         tokio::time::timeout(Duration::from_secs(5), async {
             while CALLS.load(Ordering::SeqCst) < 3 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -361,11 +404,9 @@ mod tests {
             .unwrap();
         let after = CALLS.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            CALLS.load(Ordering::SeqCst),
-            after,
-            "counted after shutdown"
-        );
+        // One count may already be submitted to the blocking pool when the cancel lands.
+        let now = CALLS.load(Ordering::SeqCst);
+        assert!(now <= after + 1, "counted after shutdown: {after} -> {now}");
     }
 
     /// A failed refresh keeps the last count; the first one stores it and wakes a waiting
@@ -447,7 +488,12 @@ mod tests {
         let stop = CancellationToken::new();
         let (_d, _app, task) = rt.block_on(async {
             let (d, app, st) = app(cache);
-            let task = tokio::spawn(refresh_every(st, Duration::from_secs(60), stop.clone()));
+            let task = tokio::spawn(refresh_every(
+                st,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                stop.clone(),
+            ));
             (d, app, task)
         });
         rt.block_on(async {
@@ -488,6 +534,16 @@ mod tests {
     fn app(
         cache: &'static CountCache,
     ) -> (tempfile::TempDir, axum::Router, std::sync::Arc<ApiState>) {
+        let (d, store) = seeded_store();
+        let st = crate::Api::new(store, test_settings(), crate::TipWatch::default())
+            .with_stats_cache(cache)
+            .state();
+        let search = crate::search::SearchCtx::new(super::super::SearchSettings::default(), None);
+        (d, super::super::router(search).with_state(st.clone()), st)
+    }
+
+    /// A store with a checkpoint (so `/stats` finds a highest height).
+    fn seeded_store() -> (tempfile::TempDir, std::sync::Arc<crate::store::Store>) {
         let (d, store) = crate::testutil::store();
         let mut w = store.hot_for_tests().rw().unwrap();
         kdx_hot::set_checkpoint(
@@ -499,7 +555,11 @@ mod tests {
         )
         .unwrap();
         w.commit().unwrap();
-        let settings = crate::ApiSettings {
+        (d, store)
+    }
+
+    fn test_settings() -> crate::ApiSettings {
+        crate::ApiSettings {
             network: "testnet04".into(),
             deadline: Duration::from_millis(300),
             max_in_flight: 16,
@@ -511,12 +571,7 @@ mod tests {
             read_threads: 2,
             ready_max_lag: 10,
             max_event_lists: 64,
-        };
-        let st = crate::Api::new(store, settings, crate::TipWatch::default())
-            .with_stats_cache(cache)
-            .state();
-        let search = crate::search::SearchCtx::new(super::super::SearchSettings::default(), None);
-        (d, super::super::router(search).with_state(st.clone()), st)
+        }
     }
 
     async fn get(app: &axum::Router) -> (Response, Duration) {
@@ -605,5 +660,156 @@ mod tests {
             body(r).await,
             "{\"transactionCount\":42,\"coinsInCirculation\":null}"
         );
+    }
+    // ---- STATS-FIX-2 (R-P5P9-76) ----
+
+    /// M-1: the age counts from the start of the count (the snapshot's age).
+    #[tokio::test]
+    async fn the_age_counts_from_the_start_of_the_count() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(long_count)));
+        let (_d, _app, st) = app(cache);
+        cache
+            .refresh(&st, SLOW_REFRESH, &CancellationToken::new())
+            .await;
+        let age = cache.peek(Instant::now()).unwrap().age;
+        assert!(age >= Duration::from_millis(300), "{age:?}");
+    }
+
+    static FLAKY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Fails on the first call, then counts.
+    fn flaky(_: &View, _: &CancellationToken) -> ApiResult<u64> {
+        if FLAKY_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(ApiError::Deadline)
+        } else {
+            Ok(5)
+        }
+    }
+
+    /// M-2: while no count exists, a failed refresh is retried after `retry`, not `every`.
+    #[tokio::test]
+    async fn a_failed_first_count_is_retried_soon() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(flaky)));
+        let (_d, _app, st) = app(cache);
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(refresh_every(
+            st,
+            Duration::from_secs(3600),
+            Duration::from_millis(20),
+            stop.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cache.peek(Instant::now()).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first count lands after the retry");
+        assert_eq!(cache.peek(Instant::now()).unwrap().n, 5);
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    /// M-3a: while a refresh is running (holding no lock), a request answers 200 at once
+    /// with the old count and its age.
+    #[tokio::test]
+    async fn a_request_during_a_running_refresh_answers_the_old_count() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(slow_count)));
+        cache.store(7, Instant::now() - Duration::from_secs(10));
+        let (_d, app, st) = app(cache);
+        let refresh = tokio::spawn(async move {
+            cache
+                .refresh(&st, SLOW_REFRESH, &CancellationToken::new())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!refresh.is_finished(), "the refresh is running");
+        let (r, took) = get(&app).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(took < Duration::from_millis(250), "{took:?}");
+        let age: u64 = r.headers()[COUNT_AGE].to_str().unwrap().parse().unwrap();
+        assert!((10..15).contains(&age), "{age}");
+        assert_eq!(
+            body(r).await,
+            "{\"transactionCount\":7,\"coinsInCirculation\":null}"
+        );
+        refresh.await.unwrap();
+        assert_eq!(cache.peek(Instant::now()).unwrap().n, 99);
+    }
+
+    /// M-5: the stale-count WARN is due only for an old count, and once per window.
+    #[test]
+    fn a_stale_count_warns_once_per_window() {
+        let c = CountCache::new();
+        let t0 = Instant::now();
+        let stale = REFRESH_EVERY * STALE_AFTER_INTERVALS + Duration::from_secs(1);
+        assert!(!c.stale_warn_due(REFRESH_EVERY * STALE_AFTER_INTERVALS, t0));
+        assert!(c.stale_warn_due(stale, t0));
+        assert!(!c.stale_warn_due(stale, t0 + Duration::from_secs(1)));
+        assert!(c.stale_warn_due(stale, t0 + WARN_EVERY));
+    }
+
+    /// The raw head and body of `GET /stats` on `addr`, with `extra` header lines.
+    async fn raw_get(addr: std::net::SocketAddr, extra: &str) -> String {
+        let req = format!("GET /stats HTTP/1.1\r\nHost: x\r\n{extra}Connection: close\r\n\r\n");
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.write_all(req.as_bytes()).unwrap();
+            let mut out = String::new();
+            c.read_to_string(&mut out).unwrap();
+            out
+        })
+        .await
+        .unwrap()
+    }
+
+    /// M-3b, M-6: `Api::serve` starts the refresh task (so `/stats` reaches 200) and the
+    /// compat CORS layer exposes `x-count-age`.
+    #[tokio::test]
+    async fn serve_starts_the_refresh_and_exposes_the_age() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(counted)));
+        let (_d, store) = seeded_store();
+        let search = crate::search::SearchCtx::new(super::super::SearchSettings::default(), None);
+        let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let api = crate::Api::new(store, test_settings(), crate::TipWatch::default())
+            .with_stats_cache(cache)
+            .compat_routes(super::super::router(search))
+            .on_bound(move |a| {
+                let _ = tx.send(a.to_vec());
+            });
+        let binds = crate::Binds {
+            compat: vec![loopback],
+            ..crate::Binds::default()
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(api.serve(binds, stop.clone()));
+        let addr = rx
+            .await
+            .unwrap()
+            .iter()
+            .find(|b| b.0 == "compat")
+            .unwrap()
+            .1;
+        let mut out = String::new();
+        for _ in 0..100 {
+            out = raw_get(addr, "Origin: http://example.com\r\n").await;
+            if out.starts_with("HTTP/1.1 200") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let low = out.to_ascii_lowercase();
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(low.contains("x-count-age: "), "{out}");
+        let expose = low
+            .lines()
+            .find(|l| l.starts_with("access-control-expose-headers:"))
+            .unwrap_or_default();
+        assert!(expose.contains("x-count-age"), "{out}");
+        stop.cancel();
+        task.await.unwrap().unwrap();
     }
 }
