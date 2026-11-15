@@ -1,12 +1,16 @@
 //! Coinbase rewards by block height, from the miner reward table that chainweb-data's supply
-//! also reads (`crates/kdx-api/data/miner_rewards.csv`, see THIRD_PARTY_NOTICES). The harness
-//! uses them for tip gaps (R-P5P9-48): `/coins` against a chainweb-data that lags, and a
-//! balance read a few heights apart from the node's `/local`.
+//! also reads (see THIRD_PARTY_NOTICES). The harness uses them for tip gaps (R-P5P9-48):
+//! `/coins` against a chainweb-data that lags, and a balance read a few heights apart from the
+//! node's `/local`.
+//!
+//! The table is packaged with the harness (R-P5P9-49 concern 5): `data/miner_rewards.csv` in
+//! this crate, a copy of the served `crates/kdx-api/data/miner_rewards.csv` that a test keeps
+//! equal. It is compiled in, so the installed binary reads no file.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-const MINER_REWARDS: &str = include_str!("../../kdx-api/data/miner_rewards.csv");
+const MINER_REWARDS: &str = include_str!("../data/miner_rewards.csv");
 
 /// Fixed point: units per KDA (coin's 12 decimal places).
 pub const SCALE: i128 = 1_000_000_000_000;
@@ -84,6 +88,37 @@ pub fn minted_between(lo: u64, hi: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-P5P9-49 concern 5 (FV T-3): the table is packaged with the harness. The embedded
+    /// file lives in this crate (`data/miner_rewards.csv`), not by a path into another crate,
+    /// and it is byte for byte the table the served `/coins` supply reads.
+    #[test]
+    fn the_reward_table_is_packaged_in_the_harness_crate() {
+        let own = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/miner_rewards.csv");
+        let packaged = std::fs::read_to_string(&own)
+            .unwrap_or_else(|e| panic!("{} is not in the package: {e}", own.display()));
+        assert_eq!(
+            MINER_REWARDS, packaged,
+            "the embedded table is the packaged file"
+        );
+        let src = include_str!("rewards.rs");
+        let include = src
+            .lines()
+            .find(|l| l.starts_with("const MINER_REWARDS"))
+            .expect("the include line");
+        assert!(
+            include.contains("include_str!(\"../data/miner_rewards.csv\")"),
+            "the table is embedded from the crate's own data dir: {include}"
+        );
+        let served = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kdx-api/data/miner_rewards.csv");
+        let served = std::fs::read_to_string(&served)
+            .unwrap_or_else(|e| panic!("reading the served table {}: {e}", served.display()));
+        assert_eq!(
+            packaged, served,
+            "the harness copy drifted from the served table"
+        );
+    }
 
     #[test]
     fn rewards_at_the_run_6e_heights() {

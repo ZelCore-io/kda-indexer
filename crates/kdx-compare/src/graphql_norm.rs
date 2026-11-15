@@ -45,6 +45,8 @@ pub const BY_KEY_EXTRA_PATH: &str = "/~graphql-r58-by-key-extra-row";
 pub const STRIPS_QUOTES_PATH: &str = "/~graphql-r60-oracle-strips-quotes";
 /// Visible hit of `count_self_consistent` (allowlist id `graphql-r60-count-self-consistent`).
 pub const COUNT_SELF_CONSISTENT_PATH: &str = "/~graphql-r60-count-self-consistent";
+/// Visible hit of `creation_time_half_even` (allowlist id `graphql-h9-creation-time-fraction`).
+pub const H9_PATH: &str = "/~graphql-h9-creation-time-fraction";
 
 /// Fields typed `Float` or float-valued `Decimal` in the vendored schema
 /// (`crates/kdx-graphql/schema/kadena-graph.graphql`): `FungibleChainAccount.balance`,
@@ -249,6 +251,18 @@ pub fn rule_explains(
             }
             _ => false,
         },
+        // R-P5P9-62 H9: ours is the oracle's time rounded half to even to whole seconds.
+        FieldRuleKind::CreationTimeHalfEven => {
+            let t = |v: &Value| v.as_str().and_then(crate::graphql_window::parse_utc);
+            match (t(a), t(b)) {
+                (Some((sa, 0, false)), Some((sb, nb, rb))) if nb != 0 || rb => {
+                    const HALF: u32 = 500_000_000;
+                    let up = nb > HALF || (nb == HALF && (rb || sb.rem_euclid(2) == 1));
+                    sa == sb + i64::from(up)
+                }
+                _ => false,
+            }
+        }
         FieldRuleKind::OracleOrphanDupes
         | FieldRuleKind::ByKeyExtraRow
         | FieldRuleKind::CountSelfConsistent => false,
@@ -257,6 +271,7 @@ pub fn rule_explains(
         FieldRuleKind::OracleEmpty => ORACLE_EMPTY_PATH,
         FieldRuleKind::OracleStripsQuotes => STRIPS_QUOTES_PATH,
         FieldRuleKind::CountLowerBound => COUNT_LOWER_BOUND_PATH,
+        FieldRuleKind::CreationTimeHalfEven => H9_PATH,
         _ => FIELD_PATH,
     })
 }
@@ -1254,5 +1269,45 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// R-P5P9-62 H9: ours is the oracle's `creationTime` rounded half to even to whole
+    /// seconds, and only then.
+    #[test]
+    fn h9_creation_time_is_the_oracles_rounded_half_to_even() {
+        let r = FieldRule::new(
+            "transfers.creationTime",
+            FieldRuleKind::CreationTimeHalfEven,
+        );
+        let t = |s: &str| Value::String(format!("2024-01-01T13:30:{s}Z"));
+        let ok = |ours: &str, oracle: &str| rule_explains(&r, &t(ours), &t(oracle), false);
+        // .290 against ours .000 (or no fraction): explained.
+        assert_eq!(ok("15.000", "15.290"), Some(H9_PATH));
+        assert_eq!(ok("15", "15.290"), Some(H9_PATH));
+        // .500 on an even second rounds down; on an odd second, up.
+        assert_eq!(ok("14.000", "14.500"), Some(H9_PATH));
+        assert_eq!(ok("15.000", "14.500"), None);
+        assert_eq!(ok("16.000", "15.500"), Some(H9_PATH));
+        assert_eq!(ok("15.000", "15.500"), None);
+        // Past the half: up, across the minute; digits past the ninth count.
+        assert_eq!(ok("16.000", "15.7"), Some(H9_PATH));
+        assert_eq!(ok("15.000", "14.5000000001"), Some(H9_PATH));
+        assert_eq!(ok("14.000", "14.5000000001"), None);
+        assert_eq!(
+            rule_explains(
+                &r,
+                &json!("2025-01-01T00:00:00.000Z"),
+                &json!("2024-12-31T23:59:59.700Z"),
+                false
+            ),
+            Some(H9_PATH)
+        );
+        // A whole-second difference, with or without the oracle's fraction: a diff.
+        assert_eq!(ok("16.000", "15.290"), None);
+        assert_eq!(ok("16.000", "15.000"), None);
+        // A fraction on our side: a diff.
+        assert_eq!(ok("15.100", "15.290"), None);
+        // Not times: a diff.
+        assert_eq!(rule_explains(&r, &json!("x"), &json!("y"), false), None);
     }
 }

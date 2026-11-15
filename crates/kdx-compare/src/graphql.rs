@@ -44,6 +44,17 @@ const TIP_ROOTS: &[&str] = &[
 pub const PAGE_CUT_PATH: &str = "/~graphql-page-cut";
 pub const TOTALCOUNT_CAP_PATH: &str = "/~graphql-totalcount-cap";
 pub const ORACLE_STALL_PATH: &str = "/~graphql-oracle-stall";
+/// R-P5P9-67 I-A (b): a follow page of ours that answered but is no page. No allowlist entry
+/// matches it.
+pub const FOLLOW_PAGE_FAULT_PATH: &str = "/~graphql-follow-page-fault";
+/// R-P5P9-70 (m-3): ours' first page answered HTTP 200 with a body that is not JSON, or a 4xx
+/// other than 408/429. No allowlist entry matches it.
+pub const FIRST_PAGE_FAULT_PATH: &str = "/~graphql-first-page-fault";
+/// R-P5P9-67 m-3: one side's merged pages passed [`MERGED_BYTES_CAP`]. No allowlist entry
+/// matches it.
+pub const MERGED_BYTES_PATH: &str = "/~harness-limit/graphql-merged-bytes";
+/// The merged bytes of one side's pages at most (R-P5P9-67 m-3).
+pub const MERGED_BYTES_CAP: usize = 32 << 20;
 /// Pause after this many consecutive oracle timeouts, and for how long (GQ-16).
 const ORACLE_TIMEOUTS_BEFORE_PAUSE: u32 = 3;
 const ORACLE_PAUSE: Duration = Duration::from_secs(600);
@@ -536,6 +547,11 @@ pub struct GqlState {
     /// One `/local` client for every GraphQL read of the node (NodeBalance, the by-key guard
     /// check): one limiter at `node_max_rps`, one call in flight.
     local: std::sync::OnceLock<kdx_node::LocalClient>,
+    /// Node reads the node-refereed rules may still make in this process (R-P5P9-62: the
+    /// referee's run cap; unbounded in a live run, where each compare has its own cap).
+    pub node_budget: AtomicUsize,
+    /// The client and limiter of H7's header-by-hash reads (R-P5P9-63 (5), R-P5P9-65 (2)).
+    header: std::sync::OnceLock<(reqwest::Client, Arc<crate::target::Limiter>)>,
 }
 
 impl GqlState {
@@ -564,7 +580,33 @@ impl GqlState {
             oracle_timeouts: AtomicU32::new(0),
             oracle_pause_until: Mutex::new(None),
             local: std::sync::OnceLock::new(),
+            node_budget: AtomicUsize::new(usize::MAX),
+            header: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The client and limiter (at [`crate::config::HEADER_RPS`], one read in flight) of the
+    /// node's header-by-hash reads, which the node client does not offer (R-P5P9-63 (5)); the
+    /// node client runs at `node_max_rps` less that (R-P5P9-65 (2)).
+    pub(crate) fn header_reader(
+        &self,
+        timeout_ms: u64,
+    ) -> &(reqwest::Client, Arc<crate::target::Limiter>) {
+        let rps = crate::config::HEADER_RPS;
+        self.header.get_or_init(|| {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(timeout_ms))
+                .build()
+                .unwrap_or_default();
+            (client, crate::target::Limiter::new(f64::from(rps.max(1))))
+        })
+    }
+
+    /// Takes one node read from the run's budget; false once it is spent.
+    pub fn take_node_read(&self) -> bool {
+        self.node_budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
     }
 
     fn oracle_paused(&self) -> bool {
@@ -711,7 +753,7 @@ fn sort_ties(edges: &mut [Value]) {
 // Pages
 
 /// The first root field of `data` that is a connection (`edges` and `pageInfo`).
-fn root_connection(data: &mut Value) -> Option<&mut Value> {
+pub(crate) fn root_connection(data: &mut Value) -> Option<&mut Value> {
     data.as_object_mut()?
         .values_mut()
         .find(|v| v.get("edges").is_some_and(Value::is_array) && v.get("pageInfo").is_some())
@@ -757,6 +799,30 @@ fn truncate_edges(data: &mut Value, n: usize) {
             p.insert("hasNextPage".into(), json!(false));
         }
     }
+}
+
+/// Where H6 (finishing cut nested lists) comes from in [`Ctx::gql_rules`].
+pub(crate) enum H6<'a> {
+    /// The live compare reads the lists on both sides (B: the oracle).
+    Live(&'a Target),
+    /// The referee, which never asks the oracle, carries the stored record's H6 entries
+    /// (its unexplained diff): a list the live run did not finish stays unexplained.
+    Stored(&'a [DiffEntry]),
+}
+
+/// Why a nested list read stopped before its end (R-P5P9-61 H6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListStop {
+    /// An error, or a row key missing or seen twice: why.
+    Failed(&'static str),
+    /// The compare's page budget for that side ran out: a harness limit.
+    Budget,
+    /// More than `MAX_PAGES` pages (or a `totalCount` above `MAX_PAGES` × `PAGE_SIZE` for the
+    /// one-page retry): a harness limit (R-P5P9-64 M-5).
+    MaxPages,
+    /// That side's nested page bytes in this compare passed [`MERGED_BYTES_CAP`]: a harness
+    /// limit (R-P5P9-70 m-2).
+    Bytes,
 }
 
 /// An answer: the response (pages merged), the HTTP statuses and a verdict on transport.
@@ -853,6 +919,13 @@ pub fn compare_answers_with(
     let (mut na, mut nb) = (a.body.clone(), b.body.clone());
     normalize_gql(&mut na, cap);
     normalize_gql(&mut nb, cap);
+    // R-P5P9-62 H7 paired the root rows: keep them paired through the tie sort.
+    let mut aligned = false;
+    for v in [&mut na, &mut nb] {
+        if let Some(c) = v.get_mut("data").and_then(root_connection) {
+            aligned |= crate::graphql_window::realign(c);
+        }
+    }
     // R-P5P9-60 H2: lists bounded by one block or one tx compare as sets.
     for v in [&mut na, &mut nb] {
         for l in crate::graphql_scope::scoped_lists(v) {
@@ -871,7 +944,7 @@ pub fn compare_answers_with(
     }
     if let (Some(da), Some(db)) = (na.get_mut("data"), nb.get_mut("data")) {
         if let (Some(ca), Some(cb)) = (root_connection(da), root_connection(db)) {
-            if crate::graphql_norm::cut_trailing_ties(ca, cb) {
+            if !aligned && crate::graphql_norm::cut_trailing_ties(ca, cb) {
                 hits.push(hit(crate::graphql_norm::TIE_CUT_PATH));
             }
         }
@@ -886,21 +959,188 @@ pub fn compare_answers_with(
     d
 }
 
+/// Why a follow page fails the whole fetch (R-P5P9-64 I-3): a status other than 200,
+/// GraphQL `errors`, no `data` or no root connection. Such a page is never read as a cut page.
+pub fn follow_page_fault(status: u16, page: &Value) -> Option<String> {
+    if status != 200 {
+        return Some(format!("HTTP {status}"));
+    }
+    if let Some(e) = page
+        .get("errors")
+        .and_then(Value::as_array)
+        .filter(|e| !e.is_empty())
+    {
+        return Some(format!(
+            "errors: {}",
+            crate::report::trim_escaped(&Value::Array(e.clone()).to_string(), 300)
+        ));
+    }
+    let Some(d) = page.get("data").filter(|d| !d.is_null()) else {
+        return Some("no data".into());
+    };
+    let root = d.as_object().and_then(|o| {
+        o.values()
+            .find(|v| v.get("edges").is_some_and(Value::is_array) && v.get("pageInfo").is_some())
+    });
+    root.is_none().then(|| "no root connection".into())
+}
+
+/// A follow page that answered, but not as a page (R-P5P9-67 I-A (b)): GraphQL `errors`, no
+/// `data`, no root connection or no JSON, at a status that is no transport or server fault
+/// (not 5xx, 408 or 429). On ours it is a diff, not an error.
+#[derive(Debug)]
+pub struct FollowPageFault {
+    pub target: String,
+    pub page: u32,
+    pub status: u16,
+    pub why: String,
+}
+
+impl std::fmt::Display for FollowPageFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: follow page {} failed: HTTP {}, {}",
+            self.target, self.page, self.status, self.why
+        )
+    }
+}
+
+impl std::error::Error for FollowPageFault {}
+
+/// Ours' first page answered, but not as a page (R-P5P9-70 m-3): a body that is not JSON, or
+/// a 4xx, at a status that is no transport or server fault (not 5xx, 408 or 429). It is a
+/// diff, not an error, in the oracle pair, the NOT_SUPPORTED lane and the node lanes
+/// (R-P5P9-72 (3)); the oracle's first page is not checked this way.
+#[derive(Debug)]
+pub struct FirstPageFault {
+    pub target: String,
+    pub status: u16,
+    pub why: String,
+}
+
+impl std::fmt::Display for FirstPageFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: first page failed: HTTP {}, {}",
+            self.target, self.status, self.why
+        )
+    }
+}
+
+impl std::error::Error for FirstPageFault {}
+
+/// One side's merged pages passed [`MERGED_BYTES_CAP`] (R-P5P9-67 m-3).
+#[derive(Debug)]
+pub struct MergedBytes {
+    pub target: String,
+    pub bytes: usize,
+    pub pages: u32,
+}
+
+impl std::fmt::Display for MergedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: harness limit: {} bytes in {} pages, past the cap of {MERGED_BYTES_CAP} merged \
+             bytes per side",
+            self.target, self.bytes, self.pages
+        )
+    }
+}
+
+impl std::error::Error for MergedBytes {}
+
+/// A status at which a follow page that is no page is ours' fault, not the transport's or the
+/// server's load (R-P5P9-67 I-A (b): 5xx, timeouts and rate limits stay errors).
+fn page_fault_is_ours(status: u16) -> bool {
+    status < 500 && status != 408 && status != 429
+}
+
+/// The diff entry of a fetch that stopped at a first- or follow-page fault of ours or the
+/// merged-bytes cap (R-P5P9-67 I-A (b), m-3); `ours`: the side is ours (a follow-page fault
+/// of the oracle's stays `b-error`; its first page is never a [`FirstPageFault`]).
+pub fn fetch_stop_entry(e: &anyhow::Error, ours: bool) -> Option<DiffEntry> {
+    let (path, ev) = if let Some(f) = e.downcast_ref::<FollowPageFault>() {
+        if !ours {
+            return None;
+        }
+        let ev = json!({"page": f.page, "status": f.status, "why": f.why});
+        (FOLLOW_PAGE_FAULT_PATH, ev)
+    } else if let Some(f) = e.downcast_ref::<FirstPageFault>() {
+        if !ours {
+            return None;
+        }
+        let ev = json!({"page": 1, "status": f.status, "why": f.why});
+        (FIRST_PAGE_FAULT_PATH, ev)
+    } else if let Some(m) = e.downcast_ref::<MergedBytes>() {
+        let ev = json!({"bytes": m.bytes, "pages": m.pages, "cap": MERGED_BYTES_CAP});
+        (MERGED_BYTES_PATH, ev)
+    } else {
+        return None;
+    };
+    let (a, b) = if ours {
+        (Some(ev), None)
+    } else {
+        (None, Some(ev))
+    };
+    Some(DiffEntry {
+        path: path.into(),
+        kind: DiffKind::Changed,
+        a,
+        b,
+    })
+}
+
 /// Sends `op` and follows `hasNextPage`/`after` up to `depth` more pages (the root
-/// connection's edges are concatenated; the last page's `pageInfo` is kept).
+/// connection's edges are concatenated; the last page's `pageInfo` is kept). A follow page
+/// that fails ([`follow_page_fault`]) fails the fetch, as a [`FollowPageFault`] when it
+/// answered at a status that is ours' fault; past [`MERGED_BYTES_CAP`] bytes the fetch stops
+/// with [`MergedBytes`]. `ours`: the target is ours, whose first page that is no page fails
+/// the fetch as a [`FirstPageFault`] (R-P5P9-72 (3): the oracle's keeps the plain parse).
 pub async fn fetch_pages(
     t: &Target,
     op: &GqlOp,
     vars: &Map<String, Value>,
     depth: u32,
+    ours: bool,
 ) -> anyhow::Result<Answer> {
     let mut vars = vars.clone();
     let mut ms: Vec<u64> = Vec::new();
     let cap = t.post_json(&body_of(op, &vars)).await?;
     ms.push(cap.ms);
+    let mut bytes = cap.body.len();
+    if bytes > MERGED_BYTES_CAP {
+        let pages = 1;
+        let target = t.name.clone();
+        return Err(MergedBytes {
+            target,
+            bytes,
+            pages,
+        }
+        .into());
+    }
     let status = cap.status;
     let raw = trim_body(&cap.body);
-    let mut merged: Value = serde_json::from_slice(&cap.body).with_context(|| {
+    // R-P5P9-70 (m-3): ours' first page that is not JSON, or a 4xx, at a status that is
+    // ours' fault (not 5xx, 408 or 429).
+    let parsed = serde_json::from_slice::<Value>(&cap.body);
+    if ours && page_fault_is_ours(status) && (parsed.is_err() || (400..500).contains(&status)) {
+        let head = crate::report::trim_escaped(&raw, crate::report::SHORT_TRIM);
+        let why = match &parsed {
+            Err(e) => format!("not JSON: {e}: {head}"),
+            Ok(_) => format!("a client error: {head}"),
+        };
+        let target = t.name.clone();
+        return Err(FirstPageFault {
+            target,
+            status,
+            why,
+        }
+        .into());
+    }
+    let mut merged: Value = parsed.with_context(|| {
         let head = crate::report::trim_escaped(&raw, crate::report::SHORT_TRIM);
         format!("{}: HTTP {status}, body is not JSON: {head}", t.name)
     })?;
@@ -920,7 +1160,36 @@ pub async fn fetch_pages(
         vars.insert("after".into(), json!(end));
         let c = t.post_json(&body_of(op, &vars)).await?;
         ms.push(c.ms);
-        let mut next: Value = serde_json::from_slice(&c.body).context("page is not JSON")?;
+        bytes += c.body.len();
+        if bytes > MERGED_BYTES_CAP {
+            let target = t.name.clone();
+            let pages = pages + 1;
+            return Err(MergedBytes {
+                target,
+                bytes,
+                pages,
+            }
+            .into());
+        }
+        let fault = |why: String| FollowPageFault {
+            target: t.name.clone(),
+            page: pages + 1,
+            status: c.status,
+            why,
+        };
+        let mut next: Value = match serde_json::from_slice(&c.body) {
+            Ok(v) => v,
+            Err(e) if page_fault_is_ours(c.status) => {
+                return Err(fault(format!("not JSON: {e}")).into());
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("page is not JSON")),
+        };
+        if let Some(why) = follow_page_fault(c.status, &next) {
+            if page_fault_is_ours(c.status) {
+                return Err(fault(why).into());
+            }
+            anyhow::bail!("{}: follow page {} failed: {why}", t.name, pages + 1);
+        }
         let Some(nd) = next.get_mut("data").filter(|d| !d.is_null()) else {
             break;
         };
@@ -971,8 +1240,9 @@ impl Ctx {
         op: &GqlOp,
         vars: &Map<String, Value>,
         depth: u32,
+        ours: bool,
     ) -> anyhow::Result<Answer> {
-        let a = fetch_pages(t, op, vars, depth).await?;
+        let a = fetch_pages(t, op, vars, depth, ours).await?;
         self.gql_count(&op.route(), &t.name, &a.ms);
         Ok(a)
     }
@@ -1196,6 +1466,8 @@ impl Ctx {
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
             curl: format!("{} ; {}", curl_of(op, vars, "A"), curl_of(op, vars, "B")),
             note,
+            body_cap: None,
+            a_pages: a_ans.map(|x| x.ms.len()),
         };
         Outcome {
             class: class.to_string(),
@@ -1227,7 +1499,7 @@ impl Ctx {
     }
 
     /// GraphQL vs the reference server (oracle) at heights up to `max`.
-    async fn gql_vs_oracle(
+    pub(crate) async fn gql_vs_oracle(
         &self,
         ta: &Target,
         tb: &Target,
@@ -1245,17 +1517,27 @@ impl Ctx {
         } else {
             self.cfg.follow_depth
         };
-        let mut a = match self.gql_fetch(ta, op, vars, depth).await {
+        let mut a = match self.gql_fetch(ta, op, vars, depth, true).await {
             Ok(a) => a,
-            Err(e) => return self.gql_a_error(op, vars, ta, &tb.name, &format!("{e:#}")),
+            // R-P5P9-67 I-A (b), m-3: a follow-page fault of ours, or the merged-bytes cap, is
+            // a diff; transport errors, timeouts and 5xx stay `a-error`.
+            Err(e) => match fetch_stop_entry(&e, true) {
+                Some(d) => return self.gql_fetch_stop(op, vars, ta, &tb.name, None, d, &e),
+                None => return self.gql_a_error(op, vars, ta, &tb.name, &format!("{e:#}")),
+            },
         };
         if a.status >= 500 {
             return self.gql_a_error(op, vars, ta, &tb.name, &format!("HTTP {}", a.status));
         }
-        let mut b = match self.gql_fetch(tb, op, vars, depth).await {
+        let mut b = match self.gql_fetch(tb, op, vars, depth, false).await {
             Ok(b) => {
                 self.gql.note_oracle(false);
                 b
+            }
+            Err(e) if fetch_stop_entry(&e, false).is_some() => {
+                self.gql.note_oracle(false);
+                let d = fetch_stop_entry(&e, false).expect("entry");
+                return self.gql_fetch_stop(op, vars, ta, &tb.name, Some(&a), d, &e);
             }
             Err(e) => {
                 let timed_out = e.chain().any(|c| {
@@ -1296,37 +1578,149 @@ impl Ctx {
                 Some("oracle server error".into()),
             );
         }
-        let mut row_hits = self.gql_row_rules(ta, vars, &mut a, &mut b).await;
-        if self
-            .gql_finish_lists(op, vars, ta, tb, &mut a, &mut b)
-            .await
-            > 0
-        {
-            row_hits.push(crate::graphql_scope::SCOPED_FINISHED_PATH);
-        }
-        let mut d = compare_answers_with(
-            &mut a,
-            &mut b,
-            max,
-            self.cfg.graphql.total_count_cap,
-            &self.cfg.graphql.field_rules,
-            root_scoped,
+        let (d, note) = self
+            .gql_rules(ta, H6::Live(tb), op, vars, &mut a, &mut b, max)
+            .await;
+        self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d, note)
+    }
+
+    /// A fetch that stopped at a follow-page fault of ours or the merged-bytes cap (R-P5P9-67
+    /// I-A (b), m-3): a record with its one entry, which no allowlist entry matches.
+    #[allow(clippy::too_many_arguments)]
+    fn gql_fetch_stop(
+        &self,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        ta: &Target,
+        b_name: &str,
+        a: Option<&Answer>,
+        entry: DiffEntry,
+        e: &anyhow::Error,
+    ) -> Outcome {
+        let d = vec![entry];
+        let (unexplained, ids) = self.allow.classify_request(
+            &RouteKind::Other,
+            &format!("graphql:{}", op.stem),
+            &[],
+            &d,
         );
+        let class = if unexplained.is_empty() {
+            "allowlisted"
+        } else {
+            "diff"
+        };
+        let note = Some(format!("{e:#}"));
+        self.gql_record(op, vars, ta, b_name, a, None, "", d, class, &ids, note)
+    }
+
+    /// Every rule on an oracle pair's two answers after the fetch, in one place for the live
+    /// compare and `kda-compare referee` (R-P5P9-64 M-1, R-P5P9-65 (1)): the row rules, H6
+    /// (live, or the stored record's H6 entries), then [`Ctx::gql_settle_op`] with the
+    /// document. Returns the diff entries to classify and H7's note.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_rules(
+        &self,
+        ta: &Target,
+        h6: H6<'_>,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+    ) -> (Vec<DiffEntry>, Option<String>) {
+        let root_scoped = crate::graphql_scope::root_scoped(&op.roots, vars);
+        let mut row_hits = self.gql_row_rules(ta, vars, a, b).await;
+        let h6 = match h6 {
+            H6::Live(tb) => {
+                let (finished, entries) = self.gql_finish_lists(op, vars, ta, tb, a, b).await;
+                if finished > 0 {
+                    row_hits.push(crate::graphql_scope::SCOPED_FINISHED_PATH);
+                }
+                entries
+            }
+            H6::Stored(diff) => diff
+                .iter()
+                .filter(|e| crate::graphql_scope::is_h6_entry(&e.path))
+                .cloned()
+                .collect(),
+        };
+        // R-P5P9-62: H7 and the diff.
+        let (mut d, note) = self
+            .gql_settle_op(ta, Some(op), vars, a, b, max, root_scoped)
+            .await;
+        d.extend(h6);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
             path: p.into(),
             kind: DiffKind::Changed,
             a: None,
             b: None,
         }));
-        self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d)
+        (d, note)
     }
 
-    /// R-P5P9-60 H2: the nested block and tx lists of an oracle pair whose page is cut on
-    /// either side are read to their end on both sides (the harness's own list query, at
-    /// each target's own rate, at most `MAX_PAGES` pages per side) and stand in for the page
-    /// when each side's page is a part of its own full list. At most `MAX_LISTS` lists are
-    /// tried per compare; a list not finished is left as it was (its diff stays). Returns
-    /// how many lists were finished.
+    /// R-P5P9-62: the refereed rules on an oracle pair's two answers after the fetch and the
+    /// row rules: H8 (`Transfer.orderIndex`), the `payload.data` matcher, H7 (the window
+    /// referee) and the diff with the ruled matchers (H9 among them).
+    /// Returns the diff entries and H7's note. Without the document: the tests' entry point;
+    /// the live compare and `kda-compare referee` go through [`Ctx::gql_rules`].
+    #[cfg(test)]
+    pub(crate) async fn gql_settle(
+        &self,
+        ta: &Target,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        root_scoped: bool,
+    ) -> (Vec<DiffEntry>, Option<String>) {
+        self.gql_settle_op(ta, None, vars, a, b, max, root_scoped)
+            .await
+    }
+
+    /// [`Ctx::gql_settle`] with the operation's document, which H7 needs for our longer read
+    /// (R-P5P9-64, I-1) and the filter's variables (R-P5P9-63 (1)). Without it an oracle-only
+    /// row at our boundary height is not excused. H8, the `payload.data` matcher and H7 share
+    /// one node read cap (R-P5P9-63 (4)).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_settle_op(
+        &self,
+        ta: &Target,
+        op: Option<&GqlOp>,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        root_scoped: bool,
+    ) -> (Vec<DiffEntry>, Option<String>) {
+        let mut st = crate::graphql_window::Reads::default();
+        // H8 first: the oracle's transfer rows take the node's indexes, so H7 matches them.
+        let h8 = self.gql_transfer_order(ta, a, b, &mut st).await;
+        let data = self.gql_payload_data(vars, a, b, &mut st).await;
+        let (h7, note) = self
+            .gql_window_referee(ta, op, vars, a, b, max, root_scoped, &mut st)
+            .await;
+        let mut d = compare_answers_with(
+            a,
+            b,
+            max,
+            self.cfg.graphql.total_count_cap,
+            &self.cfg.graphql.field_rules,
+            root_scoped,
+        );
+        d.extend(h8);
+        d.extend(data);
+        d.extend(h7);
+        (d, note)
+    }
+
+    /// R-P5P9-60 H2 and R-P5P9-61 H6: the nested block and tx lists of an oracle pair whose
+    /// page is cut on either side are read to their end on both sides (the harness's own list
+    /// query, at each target's own rate, at most `MAX_PAGES` pages per list and
+    /// `list_page_budget` pages per side and compare) and stand in for the page when each
+    /// side's page is a part of its own full list and no row key comes twice; the full sets
+    /// then compare with their `totalCount`. A list not finished is left as it was (its
+    /// diff stays). Returns how many lists were finished, and H6's entries for the cut lists
+    /// it did not finish (R-P5P9-64 I-5, M-5): the budget, `MAX_PAGES`, or any other reason.
     pub(crate) async fn gql_finish_lists(
         &self,
         op: &GqlOp,
@@ -1335,10 +1729,10 @@ impl Ctx {
         tb: &Target,
         a: &mut Answer,
         b: &mut Answer,
-    ) -> usize {
+    ) -> (usize, Vec<DiffEntry>) {
         use crate::graphql_scope::{
             finish_ok, hash_query, is_cut, list_query, put_hashes, scoped_lists, take_hashes,
-            MAX_LISTS,
+            HARNESS_LIMIT_PATH, MAX_PAGES, MAX_PAGES_PATH, PAGE_SIZE, UNFINISHED_PATH,
         };
         // A cut list under a root block list that selects no hash: one read of the root's
         // block hashes per side, put in for the lists' parents and taken out after.
@@ -1365,7 +1759,13 @@ impl Ctx {
             }
         }
         let (la, lb) = (scoped_lists(&a.body), scoped_lists(&b.body));
-        let (mut tried, mut done) = (0, 0);
+        let mut budget = [self.cfg.graphql.list_page_budget; 2];
+        // R-P5P9-70 (m-2): each side's nested page bytes, against MERGED_BYTES_CAP.
+        let mut bytes = [0usize; 2];
+        let mut heavy = Vec::new();
+        let (mut done, mut limited, mut long) = (0, Vec::new(), Vec::new());
+        // R-P5P9-64 I-5: a cut list left unfinished, per side, with why.
+        let mut unfinished: [Vec<Value>; 2] = Default::default();
         for l in la.iter().filter(|l| lb.contains(l)) {
             let (Some(ca), Some(cb)) = (a.body.pointer(&l.pointer), b.body.pointer(&l.pointer))
             else {
@@ -1375,19 +1775,70 @@ impl Ctx {
                 continue;
             }
             let Some((q, vars, at)) = list_query(&op.query, l) else {
+                unfinished[0].push(json!({"list": l.pointer,
+                    "why": "the selection cannot be re-issued alone"}));
                 continue;
             };
-            if tried == MAX_LISTS {
-                break;
-            }
-            tried += 1;
-            let Some(fa) = self.gql_read_list(ta, &q, &vars, at).await else {
-                continue;
+            let total = |c: &Value| c.get("totalCount").and_then(Value::as_u64);
+            let (ta_total, tb_total) = (total(ca), total(cb));
+            // R-P5P9-67 I-D: the one-page retry is the oracle's only (its `Block.events`); a
+            // cursor-page failure of ours leaves the list unfinished.
+            let fa = self
+                .gql_read_list(
+                    ta,
+                    &q,
+                    &vars,
+                    at,
+                    (&mut budget[0], &mut bytes[0]),
+                    ta_total,
+                    false,
+                )
+                .await;
+            let fb = match &fa {
+                Ok(_) => {
+                    self.gql_read_list(
+                        tb,
+                        &q,
+                        &vars,
+                        at,
+                        (&mut budget[1], &mut bytes[1]),
+                        tb_total,
+                        true,
+                    )
+                    .await
+                }
+                Err(e) => Err(*e),
             };
-            let Some(fb) = self.gql_read_list(tb, &q, &vars, at).await else {
-                continue;
+            let (fa, fb) = match (fa, fb) {
+                (Ok(fa), Ok(fb)) => (fa, fb),
+                (Err(ListStop::Bytes), _) | (_, Err(ListStop::Bytes)) => {
+                    heavy.push(json!(l.pointer));
+                    continue;
+                }
+                (Err(ListStop::Budget), _) | (_, Err(ListStop::Budget)) => {
+                    limited.push(json!(l.pointer));
+                    continue;
+                }
+                (Err(ListStop::MaxPages), _) | (_, Err(ListStop::MaxPages)) => {
+                    long.push(json!(l.pointer));
+                    continue;
+                }
+                (Err(ListStop::Failed(why)), _) => {
+                    unfinished[0].push(json!({"list": l.pointer, "why": why}));
+                    continue;
+                }
+                (_, Err(ListStop::Failed(why))) => {
+                    unfinished[1].push(json!({"list": l.pointer, "why": why}));
+                    continue;
+                }
             };
-            if !finish_ok(ca, &fa) || !finish_ok(cb, &fb) {
+            // Unequal lengths are not a reason to leave the cut pages: the full sets (and each
+            // side's totalCount) then compare, so a row one side lacks shows as a diff.
+            let (oka, okb) = (finish_ok(ca, &fa), finish_ok(cb, &fb));
+            if !oka || !okb {
+                let why = json!({"list": l.pointer,
+                    "why": "the page is not a part of that side's full list"});
+                unfinished[usize::from(oka)].push(why);
                 continue;
             }
             for (ans, full) in [(&mut *a, fa), (&mut *b, fb)] {
@@ -1401,50 +1852,187 @@ impl Ctx {
         take_hashes(&mut b.body, &put[1]);
         // The record shows the finished lists (H3): the diff paths index into them.
         if done > 0 {
-            for ans in [a, b] {
+            for ans in [&mut *a, &mut *b] {
                 ans.raw = trim_body(ans.body.to_string().as_bytes());
             }
         }
-        done
+        let mut out = Vec::new();
+        if !limited.is_empty() {
+            tracing::warn!(
+                op = %op.stem,
+                lists = limited.len(),
+                budget = self.cfg.graphql.list_page_budget,
+                "harness limit: cut nested lists left unread (list_page_budget)"
+            );
+            out.push(DiffEntry {
+                path: HARNESS_LIMIT_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({"budget": self.cfg.graphql.list_page_budget,
+                    "left_a": budget[0], "left_b": budget[1]})),
+                b: Some(json!({"lists": limited})),
+            });
+        }
+        if !heavy.is_empty() {
+            tracing::warn!(op = %op.stem, lists = heavy.len(),
+                "harness limit: cut nested lists past the merged-bytes cap");
+            out.push(DiffEntry {
+                path: MERGED_BYTES_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({"bytes_a": bytes[0], "bytes_b": bytes[1],
+                    "cap": MERGED_BYTES_CAP})),
+                b: Some(json!({"lists": heavy})),
+            });
+        }
+        if !long.is_empty() {
+            tracing::warn!(op = %op.stem, lists = long.len(),
+                "harness limit: cut nested lists past MAX_PAGES pages");
+            out.push(DiffEntry {
+                path: MAX_PAGES_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({"maxPages": MAX_PAGES, "pageSize": PAGE_SIZE})),
+                b: Some(json!({"lists": long})),
+            });
+        }
+        if unfinished.iter().any(|u| !u.is_empty()) {
+            let [ua, ub] = unfinished;
+            out.push(DiffEntry {
+                path: UNFINISHED_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({ "lists": ua })),
+                b: Some(json!({ "lists": ub })),
+            });
+        }
+        (done, out)
     }
 
     /// One side's whole nested list through the harness's list query (`at`: the list in its
-    /// answer), as edges `{node}`; `None` on any error or past `MAX_PAGES` pages.
+    /// answer), as edges `{node}`. Each page takes one from `budget`. Fails on any error or a
+    /// row key (the query's key alias) missing or seen twice; past `MAX_PAGES` pages it is a
+    /// harness limit. R-P5P9-64 I-5: with `retry` (the oracle's side only, R-P5P9-67 I-D), a
+    /// failure on a cursor page (any page after the first) is retried once in one page of
+    /// `first` = `total` (that side's `totalCount`), with the same key checks; a `total` above
+    /// `MAX_PAGES` × `PAGE_SIZE` is a harness limit.
+    #[allow(clippy::too_many_arguments)]
     async fn gql_read_list(
         &self,
         t: &Target,
         query: &str,
         vars: &Value,
         at: &str,
-    ) -> Option<Vec<Value>> {
-        let mut vars = vars.clone();
+        (budget, bytes): (&mut usize, &mut usize),
+        total: Option<u64>,
+        retry: bool,
+    ) -> Result<Vec<Value>, ListStop> {
+        use crate::graphql_scope::{one_page, MAX_PAGES, PAGE_SIZE};
+        let mut v = vars.clone();
         let mut out = Vec::new();
-        for _ in 0..crate::graphql_scope::MAX_PAGES {
-            let c = t
-                .post_json(&json!({ "query": query, "variables": vars }))
+        let mut keys = std::collections::HashSet::new();
+        for page in 0..MAX_PAGES {
+            match self
+                .gql_list_page(
+                    t,
+                    query,
+                    &v,
+                    at,
+                    (&mut *budget, &mut *bytes),
+                    &mut keys,
+                    &mut out,
+                )
                 .await
-                .ok()?;
-            self.gql_count(SCOPED_LIST_ROUTE, &t.name, &[c.ms]);
-            if c.status != 200 {
-                return None;
-            }
-            let v: Value = serde_json::from_slice(&c.body).ok()?;
-            if v.get("errors")
-                .and_then(Value::as_array)
-                .is_some_and(|e| !e.is_empty())
             {
-                return None;
+                Ok(None) => return Ok(out),
+                Ok(Some(after)) => v["after"] = after,
+                Err(ListStop::Failed(why)) if retry && page > 0 => {
+                    let Some(n) = total.filter(|n| *n > 0) else {
+                        return Err(ListStop::Failed(why));
+                    };
+                    if n > (MAX_PAGES as u64) * u64::from(PAGE_SIZE) {
+                        return Err(ListStop::MaxPages);
+                    }
+                    let (mut keys, mut out) = (std::collections::HashSet::new(), Vec::new());
+                    let q = one_page(query, n);
+                    return match self
+                        .gql_list_page(t, &q, vars, at, (budget, bytes), &mut keys, &mut out)
+                        .await?
+                    {
+                        None => Ok(out),
+                        Some(_) => {
+                            Err(ListStop::Failed("the one-page retry still has a next page"))
+                        }
+                    };
+                }
+                Err(e) => return Err(e),
             }
-            let conn = v.pointer(at)?;
-            for e in conn.get("edges")?.as_array()? {
-                out.push(json!({ "node": e.get("node")? }));
-            }
-            if !conn.pointer("/pageInfo/hasNextPage")?.as_bool()? {
-                return Some(out);
-            }
-            vars["after"] = conn.pointer("/pageInfo/endCursor")?.clone();
         }
-        None
+        Err(ListStop::MaxPages)
+    }
+
+    /// One page of [`Ctx::gql_read_list`]: its rows into `out` (keys checked), and the
+    /// cursor of the next page, `None` at the end.
+    #[allow(clippy::too_many_arguments)]
+    async fn gql_list_page(
+        &self,
+        t: &Target,
+        query: &str,
+        vars: &Value,
+        at: &str,
+        (budget, bytes): (&mut usize, &mut usize),
+        keys: &mut std::collections::HashSet<String>,
+        out: &mut Vec<Value>,
+    ) -> Result<Option<Value>, ListStop> {
+        use crate::graphql_scope::KEY_ALIAS;
+        if *bytes > MERGED_BYTES_CAP {
+            return Err(ListStop::Bytes);
+        }
+        if *budget == 0 {
+            return Err(ListStop::Budget);
+        }
+        *budget -= 1;
+        let c = t
+            .post_json(&json!({ "query": query, "variables": vars }))
+            .await
+            .map_err(|_| ListStop::Failed("a page read failed"))?;
+        self.gql_count(SCOPED_LIST_ROUTE, &t.name, &[c.ms]);
+        if c.status != 200 {
+            return Err(ListStop::Failed("a page answered a status other than 200"));
+        }
+        // R-P5P9-70 (m-2): the page counts before it is parsed.
+        *bytes += c.body.len();
+        if *bytes > MERGED_BYTES_CAP {
+            return Err(ListStop::Bytes);
+        }
+        let bad = ListStop::Failed("a page is not a list answer");
+        let v: Value = serde_json::from_slice(&c.body).map_err(|_| bad)?;
+        if v.get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|e| !e.is_empty())
+        {
+            return Err(ListStop::Failed("a page answered errors"));
+        }
+        let conn = v.pointer(at).ok_or(bad)?;
+        let edges = conn.get("edges").and_then(Value::as_array).ok_or(bad)?;
+        for e in edges {
+            let key = e
+                .get(KEY_ALIAS)
+                .filter(|k| !k.is_null())
+                .ok_or(ListStop::Failed("a row has no key"))?;
+            if !keys.insert(key.to_string()) {
+                return Err(ListStop::Failed("a row key came twice"));
+            }
+            out.push(json!({ "node": e.get("node").ok_or(bad)? }));
+        }
+        match conn
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+        {
+            Some(false) => Ok(None),
+            Some(true) => conn
+                .pointer("/pageInfo/endCursor")
+                .cloned()
+                .map(Some)
+                .ok_or(bad),
+            None => Err(bad),
+        }
     }
 
     /// The shared `/local` client of the GraphQL node reads.
@@ -1461,7 +2049,7 @@ impl Ctx {
     }
 
     /// One small read of ours (A) for a row rule; `data` or `None`.
-    async fn gql_read(&self, ta: &Target, query: &str, vars: Value) -> Option<Value> {
+    pub(crate) async fn gql_read(&self, ta: &Target, query: &str, vars: Value) -> Option<Value> {
         let c = ta
             .post_json(&json!({ "query": query, "variables": vars }))
             .await
@@ -1611,6 +2199,10 @@ impl Ctx {
             let Some(chain) = chain else {
                 continue;
             };
+            // R-P5P9-64 M-8: the referee's run cap counts this read; spent, the row stays.
+            if !self.gql.take_node_read() {
+                break;
+            }
             let (r, secs) = self.gql_local().details_timed(chain, "coin", account).await;
             self.gql_count(ROW_RULE_ROUTE, "node", &[(secs * 1000.0) as u64]);
             if let Ok(kdx_node::Local::Found { value, .. }) = r {
@@ -1644,31 +2236,90 @@ impl Ctx {
             .min()
     }
 
-    /// Whether the node's block(s) at `(chain, h)` carry a coinbase that paid `account`
-    /// (R-P5P9-58: the one-block skew needs the balance to have changed at `h`). Header range
-    /// at one height (any fork) and that block's payload; at most 3 blocks.
-    pub(crate) async fn mined_at(&self, chain: u8, h: u64, account: &str) -> bool {
-        let Ok(page) = self.node.headers(chain, h, h, Some(3), None).await else {
-            return false;
-        };
-        self.count_request(ROW_RULE_ROUTE, "node", 1);
-        // N2: the range also returns orphans. More than one header means a fork at `h`, and
-        // the coinbase could be the orphan's: leave the diff.
-        if page.items.len() != 1 {
-            return false;
-        }
-        for hd in page.items {
-            let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
-                continue;
-            };
-            self.count_request(ROW_RULE_ROUTE, "node", 1);
-            if let Ok(p) = self.node.payload_with_outputs(chain, ph).await {
-                if crate::graphql_norm::coinbase_pays(&p, account) {
-                    return true;
+    /// Whether the node's canonical block at `(chain, h)` carries a coinbase that paid
+    /// `account` (R-P5P9-58: the one-block skew needs the balance to have changed at `h`).
+    /// N2 (R-P5P9-68 (7)): the canonical block comes from the node's cut branch, through H7's
+    /// helper (R-P5P9-67 m-5), never the `/header` range by height, which also holds
+    /// orphans. One cut read per compare (`st`), then one branch read and one payload read,
+    /// all within the compare's node read cap. R-P5P9-70 (m-1): a height above the cached cut
+    /// (the tip moved since it was read) drops the cut and that height's entry once and reads
+    /// again; above the new cut too, a failed read or the cap leaves the diff.
+    pub(crate) async fn mined_at(
+        &self,
+        chain: u8,
+        h: u64,
+        account: &str,
+        st: &mut crate::graphql_window::Reads,
+    ) -> bool {
+        let hd = match self.h7_canonical(chain, h, st).await {
+            Ok(Some(hd)) => hd,
+            Ok(None) => {
+                st.forget_cut(chain, h);
+                match self.h7_canonical(chain, h, st).await {
+                    Ok(Some(hd)) => hd,
+                    _ => return false,
                 }
             }
+            Err(_) => return false,
+        };
+        let Some(ph) = hd.get("payloadHash").and_then(Value::as_str) else {
+            return false;
+        };
+        match self.h7_payload(chain, ph, st).await {
+            Ok(p) => crate::graphql_norm::coinbase_pays(&p, account),
+            Err(_) => false,
         }
-        false
+    }
+
+    /// R-P5P9-70 (m-5): N2's one-block skew at `(chain, node_h)` is excused only when ours'
+    /// tip on that chain is `node_h - 1` (one read of ours: our blocks from that height hold
+    /// exactly that one), the node stores exactly one header at `node_h` and it is the cut
+    /// branch's, and its coinbase paid `account` ([`Ctx::mined_at`]). Anything else, a failed
+    /// read or the cap leaves the diff.
+    pub(crate) async fn n2_skew(
+        &self,
+        ta: &Target,
+        chain: u8,
+        node_h: u64,
+        account: &str,
+        st: &mut crate::graphql_window::Reads,
+    ) -> bool {
+        let Some(below) = node_h.checked_sub(1) else {
+            return false;
+        };
+        const TIP: &str = "query N2Tip($c: [String!], $h: Int!) { blocksFromHeight(startHeight: \
+                           $h, chainIds: $c, first: 2) { pageInfo { hasNextPage } edges { node \
+                           { height chainId } } } }";
+        st.ours += 1;
+        let vars = json!({"c": [chain.to_string()], "h": below});
+        let Some(data) = self.gql_read(ta, TIP, vars).await else {
+            return false;
+        };
+        let conn = &data["blocksFromHeight"];
+        let rows: Vec<(Option<String>, Option<String>)> = conn["edges"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|e| {
+                (
+                    text_decimal(e.pointer("/node/height")),
+                    text_decimal(e.pointer("/node/chainId")),
+                )
+            })
+            .collect();
+        let one_below = rows == [(Some(below.to_string()), Some(chain.to_string()))]
+            && conn.pointer("/pageInfo/hasNextPage") == Some(&json!(false));
+        if !one_below {
+            return false;
+        }
+        let one = match self.h7_headers(chain, node_h, st).await {
+            Ok(hs) if hs.len() == 1 => hs[0].get("hash").cloned(),
+            _ => return false,
+        };
+        if one.is_none() || !self.mined_at(chain, node_h, account, st).await {
+            return false;
+        }
+        matches!(self.h7_canonical(chain, node_h, st).await, Ok(Some(hd)) if hd.get("hash") == one.as_ref())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1682,6 +2333,7 @@ impl Ctx {
         b_status: u16,
         b_raw: &str,
         d: Vec<DiffEntry>,
+        note: Option<String>,
     ) -> Outcome {
         if d.is_empty() {
             return Outcome {
@@ -1712,19 +2364,24 @@ impl Ctx {
             shown,
             class,
             &ids,
-            None,
+            note,
         )
     }
 
     /// `pactQuery` and friends answer `NOT_SUPPORTED` (checked on A alone).
-    async fn gql_not_supported(
+    pub(crate) async fn gql_not_supported(
         &self,
         ta: &Target,
         op: &GqlOp,
         vars: &Map<String, Value>,
     ) -> Outcome {
-        let a = match self.gql_fetch(ta, op, vars, 0).await {
+        let a = match self.gql_fetch(ta, op, vars, 0, true).await {
             Ok(a) => a,
+            // R-P5P9-72 (3): ours' first-page fault is a diff here too.
+            Err(e) if e.downcast_ref::<FirstPageFault>().is_some() => {
+                let d = fetch_stop_entry(&e, true).expect("entry");
+                return self.gql_fetch_stop(op, vars, ta, "expected", None, d, &e);
+            }
             Err(e) => return self.gql_a_error(op, vars, ta, "expected", &format!("{e:#}")),
         };
         if a.error_codes().iter().any(|c| c == "NOT_SUPPORTED") {
@@ -1760,7 +2417,7 @@ impl Ctx {
         op: &GqlOp,
         vars: &Map<String, Value>,
     ) -> Result<Value, Outcome> {
-        match self.gql_fetch(ta, op, vars, 0).await {
+        match self.gql_fetch(ta, op, vars, 0, true).await {
             Ok(a) if a.status < 500 && a.body.get("errors").is_none() => Ok(a.body["data"].clone()),
             Ok(a) => Err(self.gql_record(
                 op,
@@ -1775,6 +2432,11 @@ impl Ctx {
                 &[],
                 Some(format!("HTTP {} errors {:?}", a.status, a.error_codes())),
             )),
+            // R-P5P9-72 (3): ours' first-page fault is a diff in every node lane.
+            Err(e) if e.downcast_ref::<FirstPageFault>().is_some() => {
+                let d = fetch_stop_entry(&e, true).expect("entry");
+                Err(self.gql_fetch_stop(op, vars, ta, "node", None, d, &e))
+            }
             Err(e) => Err(self.gql_a_error(op, vars, ta, "node", &format!("{e:#}"))),
         }
     }
@@ -1939,7 +2601,7 @@ impl Ctx {
     /// still one coinbase below the node's after the retry is a one-block skew (class `skew`)
     /// when the node's block at its read height paid that coinbase to the account. R-P5P9-58:
     /// F2 here is exact f64 equality, and a record with real diffs keeps its skew entries.
-    async fn gql_node_balance(
+    pub(crate) async fn gql_node_balance(
         &self,
         ta: &Target,
         op: &GqlOp,
@@ -1956,6 +2618,9 @@ impl Ctx {
         let mut skews: Vec<DiffEntry> = Vec::new();
         let mut floats = false;
         for attempt in 0..2 {
+            // The node reads of `mined_at` (N2): one cut per attempt (R-P5P9-70 m-1: the
+            // retry reads the moved tip), capped like H7's.
+            let mut n2_reads = crate::graphql_window::Reads::default();
             skews.clear();
             floats = false;
             let data = match self.gql_a_data(ta, op, vars).await {
@@ -2021,7 +2686,9 @@ impl Ctx {
                     } else if match (ours, reward) {
                         (Some(x), Some(rw)) => {
                             crate::graphql_norm::one_block_skew(x, &det.balance, rw)
-                                && self.mined_at(chain, node_h, &account).await
+                                && self
+                                    .n2_skew(ta, chain, node_h, &account, &mut n2_reads)
+                                    .await
                         }
                         _ => false,
                     } {
@@ -2986,8 +3653,8 @@ mod tests {
             target(&mock(true).await, "b"),
         );
         // Depth 1 follows one more page: 3 + 3 rows on A, 2 + 2 on B.
-        let mut a = fetch_pages(&ta, &op, &vars, 1).await.unwrap();
-        let mut b = fetch_pages(&tb, &op, &vars, 1).await.unwrap();
+        let mut a = fetch_pages(&ta, &op, &vars, 1, true).await.unwrap();
+        let mut b = fetch_pages(&tb, &op, &vars, 1, false).await.unwrap();
         assert_eq!(edges_len(&mut a.body["data"]), 6);
         assert_eq!(edges_len(&mut b.body["data"]), 4);
         assert_eq!(a.ms.len(), 2);
@@ -2998,12 +3665,12 @@ mod tests {
             [PAGE_CUT_PATH]
         );
         // Everything followed: both have all 7 rows and match without any hit.
-        let mut a = fetch_pages(&ta, &op, &vars, 5).await.unwrap();
-        let mut b = fetch_pages(&tb, &op, &vars, 5).await.unwrap();
+        let mut a = fetch_pages(&ta, &op, &vars, 5, true).await.unwrap();
+        let mut b = fetch_pages(&tb, &op, &vars, 5, false).await.unwrap();
         assert!(compare_answers(&mut a, &mut b, u64::MAX, 10_000, &[]).is_empty());
         // Rows above the oracle's ceiling are dropped from both sides and recorded.
-        let mut a = fetch_pages(&ta, &op, &vars, 5).await.unwrap();
-        let mut b = fetch_pages(&tb, &op, &vars, 5).await.unwrap();
+        let mut a = fetch_pages(&ta, &op, &vars, 5, true).await.unwrap();
+        let mut b = fetch_pages(&tb, &op, &vars, 5, false).await.unwrap();
         let d = compare_answers(&mut a, &mut b, 103, 10_000, &[]);
         assert_eq!(
             d.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
@@ -3047,11 +3714,85 @@ mod tests {
             STRIPS_QUOTES_PATH,
             COUNT_SELF_CONSISTENT_PATH,
             SCOPED_FINISHED_PATH,
+            crate::graphql_window::WINDOW_PATH,
+            crate::graphql_window::ORDER_INDEX_PATH,
+            crate::graphql_window::PAYLOAD_DATA_PATH,
+            crate::graphql_norm::H9_PATH,
         ]
         .map(|p| entry(p, DiffKind::Changed));
         let (un, ids) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &hits);
         assert!(un.is_empty(), "{un:?}");
-        assert_eq!(ids.len(), 14);
+        assert_eq!(ids.len(), 18);
+        // R-P5P9-62: one entry per new rule, PROPOSED until the FV preconditions flip it.
+        for id in [
+            "graphql-h7-window-referee",
+            "graphql-h8-transfer-order-index",
+            "graphql-h9-creation-time-fraction",
+            "graphql-r62-payload-data",
+        ] {
+            assert!(ids.iter().any(|i| i == id), "{id} not hit: {ids:?}");
+            let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+            assert!(
+                e.owner_note.starts_with("PROPOSED") && e.reason.contains("R-P5P9-62"),
+                "{id}: {e:?}"
+            );
+        }
+        // R-P5P9-64 M-7: the harness rounds' entries are each PROPOSED with a reason and a
+        // ruling id, and each matches only its own visible hit (no wildcard), which only its
+        // rule emits.
+        for id in [
+            "search-tie-order",
+            "graphql-r60-scoped-list",
+            "graphql-h7-window-referee",
+            "graphql-h8-transfer-order-index",
+            "graphql-h9-creation-time-fraction",
+            "graphql-r62-payload-data",
+        ] {
+            let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+            let ruled = ["R-P5P9-", "R3E-"]
+                .iter()
+                .any(|r| e.owner_note.contains(r) || e.reason.contains(r));
+            assert!(
+                e.owner_note.starts_with("PROPOSED") && ruled && !e.reason.is_empty(),
+                "{id}: {e:?}"
+            );
+            assert!(
+                e.json_path_glob.starts_with("/~") && !e.json_path_glob.contains('*'),
+                "{id}: {e:?}"
+            );
+        }
+        let tie = [entry("/~search-tie-order", DiffKind::Changed)];
+        let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &tie);
+        assert_eq!(un.len(), 1, "search-tie-order matches /txs/search only");
+        // R-P5P9-64 I-5, M-5: H6's unfinished lists and harness limits are never allowlisted.
+        // R-P5P9-67: nor a short page of ours, a follow-page fault of ours, the merged-bytes
+        // cap or rows H7 left undecided.
+        for p in [
+            crate::graphql_scope::UNFINISHED_PATH,
+            crate::graphql_scope::MAX_PAGES_PATH,
+            crate::graphql_scope::HARNESS_LIMIT_PATH,
+            crate::graphql_window::SHORT_PAGE_PATH,
+            crate::graphql_window::UNDECIDED_PATH,
+            FOLLOW_PAGE_FAULT_PATH,
+            FIRST_PAGE_FAULT_PATH,
+            MERGED_BYTES_PATH,
+        ] {
+            let (un, _) = allow.classify_request(
+                &RouteKind::Other,
+                "graphql:QBlock",
+                &[],
+                &[entry(p, DiffKind::Changed)],
+            );
+            assert_eq!(un.len(), 1, "{p}");
+        }
+        // H7 replaces H5; a row H7 cannot explain is never allowlisted.
+        assert!(!allow
+            .entries
+            .iter()
+            .any(|e| e.id == "graphql-h5-boundary-cut"));
+        let row = [entry(crate::graphql_window::ROW_PATH, DiffKind::Changed)];
+        let (un, _) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &row);
+        assert_eq!(un.len(), 1);
         for id in [
             "graphql-r60-oracle-strips-quotes",
             "graphql-r60-count-self-consistent",
