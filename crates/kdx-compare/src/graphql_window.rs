@@ -1536,6 +1536,9 @@ pub fn root_args(query: &str, key: &str) -> Option<Vec<(String, String)>> {
         i
     };
     let (mut depth, mut paren, mut i) = (0i32, 0i32, 0usize);
+    // R-P5P9-81 (m-2): an identifier right after a `:` at depth 1 is the field half of an
+    // alias, never a response key.
+    let mut field_next = false;
     while i < b.len() {
         match b[i] {
             b'"' => {
@@ -1553,9 +1556,10 @@ pub fn root_args(query: &str, key: &str) -> Option<Vec<(String, String)>> {
             b'}' => depth -= 1,
             b'(' => paren += 1,
             b')' => paren -= 1,
+            b':' if depth == 1 && paren == 0 => field_next = true,
             c if (c.is_ascii_alphabetic() || c == b'_') && depth == 1 && paren == 0 => {
                 let j = ident(i);
-                if &query[i..j] != key {
+                if std::mem::take(&mut field_next) || &query[i..j] != key {
                     i = j;
                     continue;
                 }
@@ -1568,6 +1572,7 @@ pub fn root_args(query: &str, key: &str) -> Option<Vec<(String, String)>> {
                 }
                 return parse_args(query, k + 1);
             }
+            c if !c.is_ascii_whitespace() && c != b',' => field_next = false,
             _ => {}
         }
         i += 1;
@@ -1611,6 +1616,9 @@ pub fn root_selection(query: &str, key: &str) -> Option<(String, Vec<String>)> {
         _ => i,
     };
     let (mut depth, mut paren, mut i) = (0i32, 0i32, 0usize);
+    // R-P5P9-81 (m-2): an identifier right after a `:` at depth 1 is the field half of an
+    // alias, never a response key (as in `root_args`).
+    let mut field_next = false;
     let start = loop {
         let j = skip(i);
         if j != i {
@@ -1622,14 +1630,16 @@ pub fn root_selection(query: &str, key: &str) -> Option<(String, Vec<String>)> {
             b'}' => depth -= 1,
             b'(' => paren += 1,
             b')' => paren -= 1,
+            b':' if depth == 1 && paren == 0 => field_next = true,
             c if (c.is_ascii_alphabetic() || c == b'_') && depth == 1 && paren == 0 => {
                 let j = ident(i);
-                if &query[i..j] == key {
+                if !std::mem::take(&mut field_next) && &query[i..j] == key {
                     break j;
                 }
                 i = j;
                 continue;
             }
+            c if !c.is_ascii_whitespace() && c != b',' => field_next = false,
             _ => {}
         }
         i += 1;
@@ -4826,6 +4836,46 @@ mod tests {
         assert_eq!(
             settle_counts(&[], 0),
             json!({"oracle-gap": 0, "outside-oracle-window": 0, "duplicate": 0, "key-only": 0})
+        );
+    }
+
+    /// R-P5P9-81 (m-2): at depth 1, an identifier that directly follows `:` is a field name,
+    /// never a response key. In review-fvh-i's probe document the root `transfers` is the
+    /// alias of `events`, not x's field, in both `root_selection` and `root_args`.
+    #[test]
+    fn root_lookups_skip_the_field_half_of_an_alias() {
+        let q = "query Q($a: String, $e: String) { x: transfers(accountName: $a) { edges { \
+                 node { requestKey } } } transfers: events(qualifiedEventName: $e) { edges { \
+                 node { y: requestKey } } } }";
+        assert_eq!(
+            root_selection(q, "transfers"),
+            Some(("events".to_string(), vec!["y".to_string()]))
+        );
+        assert_eq!(
+            root_args(q, "transfers"),
+            Some(vec![("qualifiedEventName".to_string(), "$e".to_string())])
+        );
+        // The same with a comment between the colon and the field name.
+        let q2 = "{ x: # the field\n transfers { a } transfers: events { b } }";
+        assert_eq!(
+            root_selection(q2, "transfers").map(|s| s.0),
+            Some("events".into())
+        );
+        assert_eq!(root_args(q2, "transfers"), Some(Vec::new()));
+        // A field named once, and an alias of it, are still found.
+        assert_eq!(
+            root_selection(q, "x"),
+            Some(("transfers".to_string(), Vec::new()))
+        );
+        assert_eq!(
+            root_args(q, "x"),
+            Some(vec![("accountName".to_string(), "$a".to_string())])
+        );
+        // A key that is only ever a field name after an alias is not a root.
+        assert_eq!(root_selection("{ x: transfers { a } }", "transfers"), None);
+        assert_eq!(
+            root_args("{ x: transfers(first: 1) { a } }", "transfers"),
+            None
         );
     }
 }
