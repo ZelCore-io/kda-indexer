@@ -529,7 +529,8 @@ pub fn run_text(
 #[derive(Debug, Clone, Default)]
 pub struct KnownGaps {
     pub per_day: BTreeMap<String, BTreeMap<String, u64>>,
-    /// The days' baselines merged in date order: the latest day's value wins.
+    /// The days' baselines merged in date order: the latest day's value wins
+    /// ([`merge_baselines`]).
     pub baselines: BTreeMap<String, f64>,
     pub buckets: u64,
     /// Ten-minute buckets with any compare, per UTC day.
@@ -541,6 +542,17 @@ pub struct KnownGaps {
 /// Hours of `buckets` ten-minute buckets.
 fn bucket_hours(buckets: u64) -> f64 {
     buckets as f64 * crate::report::WINDOW_SECS as f64 / 3600.0
+}
+
+/// R-P5P9-81 (m-3): the days' known-gap baselines, as (date, baselines), merged in date order
+/// whatever order they come in: an entry takes the value of the latest day that has one.
+pub fn merge_baselines(mut days: Vec<(String, BTreeMap<String, f64>)>) -> BTreeMap<String, f64> {
+    days.sort_by(|x, y| x.0.cmp(&y.0));
+    let mut out = BTreeMap::new();
+    for (_, b) in days {
+        out.extend(b);
+    }
+    out
 }
 
 /// Reads [`KnownGaps`] from the summary files since `since_secs`, in date order (R-P5P9-78,
@@ -563,7 +575,6 @@ pub fn load_known_gaps(out_dir: &Path, since_secs: u64) -> anyhow::Result<KnownG
         let text = std::fs::read_to_string(&path)?;
         let day: DailySummary =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        kg.baselines.extend(day.known_gap_baselines.clone());
         kg.baselines_per_day
             .insert(date.clone(), day.known_gap_baselines);
         for (start, w) in day.windows {
@@ -585,6 +596,13 @@ pub fn load_known_gaps(out_dir: &Path, since_secs: u64) -> anyhow::Result<KnownG
             }
         }
     }
+    // R-P5P9-81 (m-3): the merge sorts by date itself, whatever order the files came in.
+    kg.baselines = merge_baselines(
+        kg.baselines_per_day
+            .iter()
+            .map(|(d, b)| (d.clone(), b.clone()))
+            .collect(),
+    );
     kg.per_day.retain(|_, m| !m.is_empty());
     Ok(kg)
 }
@@ -1206,6 +1224,36 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// R-P5P9-81 (m-3): the baseline merge is pure and sorts by date inside: days given in
+    /// reverse order still let the latest day's value win, and keep an entry only an earlier
+    /// day has.
+    #[test]
+    fn baselines_merge_in_date_order_whatever_the_input_order() {
+        let day = |date: &str, b: &[(&str, f64)]| {
+            (
+                date.to_string(),
+                b.iter()
+                    .map(|(k, v)| (k.to_string(), *v))
+                    .collect::<BTreeMap<String, f64>>(),
+            )
+        };
+        let days = vec![
+            day("2026-11-17", &[("known-gap-p", 3.0)]),
+            day("2026-11-16", &[("known-gap-p", 2.0)]),
+            day("2026-11-15", &[("known-gap-p", 1.0), ("known-gap-q", 5.0)]),
+        ];
+        let want: BTreeMap<String, f64> = [
+            ("known-gap-p".to_string(), 3.0),
+            ("known-gap-q".to_string(), 5.0),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(merge_baselines(days.clone()), want);
+        let mut forward = days;
+        forward.reverse();
+        assert_eq!(merge_baselines(forward), want);
     }
 
     /// R-P5P9-78 (H2 m-1): the shipped P baseline counts only the records P matches (3 over
