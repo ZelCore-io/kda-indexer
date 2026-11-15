@@ -5834,11 +5834,6 @@ fn d1_key(tag: &str) -> String {
     format!("{tag:_<43}")
 }
 
-/// The oracle's coinbase `requestKey` form (CG-4 class C): base64 of the JSON-quoted key.
-fn d1_encoded(key: &str) -> String {
-    crate::graphql::base64_std(format!("\"{key}\"").as_bytes())
-}
-
 /// A node holding block `B<h>` at height `h` on chain 0 whose parent is `parent` and whose
 /// coinbase (key `cb_key`) pays `miner` 1.5.
 fn d1_coinbase_node(h: u64, parent: &str, cb_key: &str) -> NodeMock {
@@ -5858,16 +5853,28 @@ fn d1_coinbase_node(h: u64, parent: &str, cb_key: &str) -> NodeMock {
     node
 }
 
-/// R-P5P9-75 C: the oracle's coinbase `requestKey` is 60 characters of base64 over the
-/// JSON-quoted key. It is decoded for the row's identity and the row is settled on the
-/// coinbase path (the block's header and its parent), never `/poll`. The served difference is
-/// explained only when the decoded key is ours and ours is the node's coinbase key (the parent
-/// hash); a key that decodes to another, or a node whose coinbase key is another, stays a diff.
+/// R-P5P9-86 C: the node's coinbase key in its two eras: 60 characters of base64url over the
+/// JSON-quoted parent hash, or 58 characters of base64 over the bare parent hash.
+fn c86_node_key(parent: &str, era60: bool) -> String {
+    if era60 {
+        kdx_types::hash::b64url_encode(format!("\"{parent}\"").as_bytes())
+    } else {
+        crate::graphql::base64_std(parent.as_bytes())
+            .trim_end_matches('=')
+            .to_string()
+    }
+}
+
+/// R-P5P9-86 C: a row whose key is not a 43-character hash is a coinbase row, paired by its
+/// place and settled on the coinbase path only (the canonical header at its height and the
+/// payload's coinbase output reqKey), never `/poll`. Ours' key must be the node's byte for
+/// byte, in either era; the oracle's is excused only as that header's bare parent hash or as
+/// base64 of its own hash (`/~graphql-coinbase-oracle-key-form`). An oracle key that decodes
+/// to another hash, or ours differing from the node, stays a diff.
 #[tokio::test]
-async fn d1_c_the_oracle_coinbase_request_key_is_decoded_and_settled_on_the_coinbase_path() {
+async fn e1_c_coinbase_keys_in_both_node_eras_and_both_oracle_forms() {
     let dir = tempfile::tempdir().unwrap();
-    let k = d1_key("Y_oq3-w1");
-    assert_eq!(d1_encoded(&k).len(), 60);
+    let parent = d1_key("Y_oq3-w1");
     let row = |rk: &str| h7_xrow(rk, 100, json!(1.5), Some(("", "miner")));
     let run = |node: NodeMock, a: Vec<Value>, b: Vec<Value>| {
         let dir = dir.path().to_path_buf();
@@ -5895,37 +5902,52 @@ async fn d1_c_the_oracle_coinbase_request_key_is_decoded_and_settled_on_the_coin
             (out, polls)
         }
     };
-    // Ours the node's key, the oracle's that key encoded: explained, without a /poll read.
-    let ((d, note), polls) = run(
-        d1_coinbase_node(100, &k, &k),
-        vec![row(&k)],
-        vec![row(&d1_encoded(&k))],
-    )
-    .await;
-    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
-    assert!(
+    let form = |d: &[crate::report::DiffEntry]| {
         d.iter()
-            .any(|e| e.path == crate::graphql_window::COINBASE_KEY_PATH),
-        "{d:?}"
-    );
-    assert_eq!(polls, 0, "a coinbase row is not polled");
-    // A 60-character key that decodes to a key other than ours or the node's: a diff.
-    let other = d1_key("Z_other");
+            .any(|e| e.path == crate::graphql_window::COINBASE_FORM_PATH)
+    };
+    // The oracle's base64 of the block's own hash.
+    let hash = d1_key("B100_own");
+    let own = crate::graphql::base64_std(hash.as_bytes())
+        .trim_end_matches('=')
+        .to_string();
+    let node = |k: &str| {
+        let mut n = d1_coinbase_node(100, &parent, k);
+        n.headers.get_mut(&(0, 100)).unwrap()[0]["hash"] = json!(hash);
+        n
+    };
+    for era60 in [true, false] {
+        let k = c86_node_key(&parent, era60);
+        assert_eq!(k.len(), if era60 { 60 } else { 58 });
+        for oracle in [parent.clone(), own.clone()] {
+            let ((d, note), polls) = run(node(&k), vec![row(&k)], vec![row(&oracle)]).await;
+            assert!(
+                only_hits(&d) && form(&d),
+                "era60 {era60} oracle {oracle}: {d:?} {note:?}"
+            );
+            assert_eq!(polls, 0, "a coinbase row is never polled");
+        }
+    }
+    let k = c86_node_key(&parent, true);
+    // An oracle key that decodes to another hash than the header's own: a diff.
+    let other = crate::graphql::base64_std(d1_key("Z_other").as_bytes())
+        .trim_end_matches('=')
+        .to_string();
+    let ((d, _), polls) = run(node(&k), vec![row(&k)], vec![row(&other)]).await;
+    assert!(!only_hits(&d) && !form(&d), "{d:?}");
+    assert_eq!(polls, 0);
+    // A bare hash that is not the header's parent: a diff.
+    let ((d, _), _) = run(node(&k), vec![row(&k)], vec![row(&d1_key("Z_other"))]).await;
+    assert!(!only_hits(&d) && !form(&d), "{d:?}");
+    // Ours' key in the other era's encoding than the node's: a diff, though the oracle's
+    // bare parent hash is that header's.
     let ((d, _), _) = run(
-        d1_coinbase_node(100, &k, &k),
-        vec![row(&k)],
-        vec![row(&d1_encoded(&other))],
+        node(&k),
+        vec![row(&c86_node_key(&parent, false))],
+        vec![row(&parent)],
     )
     .await;
-    assert!(!only_hits(&d), "{d:?}");
-    // The decoded key is ours, but the node's coinbase key (the block's parent) is another.
-    let ((d, _), _) = run(
-        d1_coinbase_node(100, &other, &other),
-        vec![row(&k)],
-        vec![row(&d1_encoded(&k))],
-    )
-    .await;
-    assert!(!only_hits(&d), "{d:?}");
+    assert!(!only_hits(&d) && !form(&d), "{d:?}");
 }
 
 /// Runs H7 and the diff on one pair of `transfers` pages (no variables).

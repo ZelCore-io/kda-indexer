@@ -580,6 +580,17 @@ ruling = "R-P5P9-75."
 owner_note = "PROPOSED (ruling R-P5P9-75 C; evidence CG-4 #30, #69, #88): a G4 compat note; ours sends the coinbase key as the node does."
 
 [[entry]]
+id = "graphql-coinbase-oracle-key-form"
+route = "other"
+json_path_glob = "/~graphql-coinbase-oracle-key-form"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-86 C (oracle convention): a row whose requestKey is not a 43-character hash is a coinbase row; it pairs by its place (chain, block, height, index) and is settled on the coinbase path only (the canonical header at the row's height on the cut's branch and its payload's coinbase output reqKey), never /poll. Ours' key must equal the node's coinbase key byte for byte, in either of the node's eras (60 characters of base64url over the JSON-quoted parent hash, or 58 characters of base64 over the bare parent hash). The oracle's key is excused only when it is that same header's bare parent hash or base64 of that header's own hash; the record lists each pair with ours' and the oracle's keys. Any other oracle key, or ours differing from the node, stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-86."
+owner_note = "PROPOSED (ruling R-P5P9-86 C; evidence CG-5 #35, #63, #83): a G4 compat note; the oracle sends coinbase keys in its own forms, ours sends the node's."
+
+[[entry]]
 id = "graphql-r75-nested-multiset"
 route = "other"
 json_path_glob = "/~graphql-r75-nested-multiset"
