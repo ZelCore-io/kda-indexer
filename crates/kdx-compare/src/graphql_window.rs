@@ -16,7 +16,8 @@
 //!   node's at its height, R-P5P9-63 (2); never by content), an extra copy of a row the node
 //!   holds once (duplicate), or canonical and outside our window by our full order: beyond
 //!   our boundary height, or at it and listed after our page by our own longer read (one
-//!   read of ours, `first` = our rows + 50, no `after`; our page must be its prefix:
+//!   read of ours, `first` = our rows + 50, no `after`, paged on by `endCursor` until it
+//!   passes our boundary height, else capped (R-P5P9-86 SK); our page must be its prefix:
 //!   R-P5P9-64, I-1);
 //! - an ours-only row is canonical on the node, holds the node's content on every selected
 //!   field the node's entry has (R-P5P9-64 I-2, our amounts exact: M-3) and matches the
@@ -65,6 +66,8 @@ pub const ALIGN_KEY: &str = "kdxH7";
 pub const NODE_READS: usize = 300;
 /// Rows past our page in our longer read (R-P5P9-64, I-1).
 pub const PREFIX_EXTRA: usize = 50;
+/// R-P5P9-86 SK: the pages of ours the longer read takes at most to pass the boundary height.
+pub const PREFIX_PAGES: usize = 10;
 /// Visible hit of H8 (allowlist id `graphql-h8-transfer-order-index`); it carries the
 /// evidence per request key.
 pub const ORDER_INDEX_PATH: &str = "/~graphql-h8-transfer-order-index";
@@ -2232,6 +2235,18 @@ pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
     prepare_in(ca, cb, "")
 }
 
+/// A row's identity as [`prepare_in`] reads it on its own side under the root list `root`
+/// (R-P5P9-75 F's key-only transfer rows; R-P5P9-86 C's coinbase rows).
+pub fn prepared_id(e: &Value, root: &str) -> RowId {
+    let mut id = row_id(e);
+    if id.kind.is_none() && root == "transfers" && id.rk.is_some() {
+        id.kind = Some(Kind::Transfer);
+    }
+    // R-P5P9-86 C: a key that is not a 43-character hash is a coinbase key.
+    id.coinbase = id.kind != Some(Kind::Block) && id.rk.as_deref().is_some_and(is_coinbase_key);
+    id
+}
+
 /// [`prepare`] under the root list `root`. R-P5P9-75 F: a row of the `transfers` root that
 /// selects a request key but no field naming its kind is a transfer row without an index
 /// (identity by request-key multiset).
@@ -2243,14 +2258,7 @@ pub fn prepare_in(ca: &Value, cb: &Value, root: &str) -> Result<Prep, String> {
             .and_then(Value::as_array)
             .ok_or("a page without edges")?
         {
-            let mut id = row_id(e);
-            if id.kind.is_none() && root == "transfers" && id.rk.is_some() {
-                id.kind = Some(Kind::Transfer);
-            }
-            // R-P5P9-86 C: a key that is not a 43-character hash is a coinbase key.
-            id.coinbase =
-                id.kind != Some(Kind::Block) && id.rk.as_deref().is_some_and(is_coinbase_key);
-            out.push((id, e.clone()));
+            out.push((prepared_id(e, root), e.clone()));
         }
         Ok(out)
     };
@@ -3207,7 +3215,7 @@ impl Ctx {
         if d.needs_prefix {
             ext = match op {
                 Some(op) => {
-                    self.h7_prefix(ta, op, vars, &first_var, prep.a.len(), st)
+                    self.h7_prefix(ta, op, vars, &first_var, prep.a.len(), &field, d.lowest, st)
                         .await
                 }
                 None => Err("no document to read it with".into()),
@@ -3367,6 +3375,7 @@ impl Ctx {
     /// R-P5P9-64 (I-1): one read of ours with the same document and variables, `first` = the
     /// rows on our page + [`PREFIX_EXTRA`], one page with no `after`: each row's identity key
     /// and node.
+    #[allow(clippy::too_many_arguments)]
     async fn h7_prefix(
         &self,
         ta: &Target,
@@ -3374,38 +3383,65 @@ impl Ctx {
         vars: &Map<String, Value>,
         first_var: &str,
         n: usize,
+        root: &str,
+        bound: Option<u64>,
         st: &mut Reads,
     ) -> Result<Longer, String> {
         if !vars.get(first_var).is_some_and(Value::is_u64) {
             return Err(format!("no page size ({first_var}) to read it with"));
         }
+        let after_var = arg_var(Some(&op.query), "after");
         let mut v = vars.clone();
         v.insert(first_var.to_string(), json!(n + PREFIX_EXTRA));
-        v.remove(&arg_var(Some(&op.query), "after"));
-        st.ours += 1;
-        let mut data = self
-            .gql_read(ta, &op.query, Value::Object(v))
-            .await
-            .ok_or("the read failed")?;
-        let conn = crate::graphql::root_connection(&mut data).ok_or("the read holds no list")?;
-        let more = conn
-            .pointer("/pageInfo/hasNextPage")
-            .and_then(Value::as_bool);
-        let edges = conn
-            .get("edges")
-            .and_then(Value::as_array)
-            .ok_or("the read holds no list")?;
-        let rows: Vec<(String, Value)> = edges
-            .iter()
-            .map(|e| {
-                (
-                    row_id(e).key().unwrap_or_default(),
+        v.remove(&after_var);
+        let mut rows: Vec<(String, Value)> = Vec::new();
+        let mut last_h = None;
+        let (mut first_page, mut pages) = (true, 0);
+        let (more, short) = loop {
+            st.ours += 1;
+            pages += 1;
+            let mut data = self
+                .gql_read(ta, &op.query, Value::Object(v.clone()))
+                .await
+                .ok_or("the read failed")?;
+            let conn =
+                crate::graphql::root_connection(&mut data).ok_or("the read holds no list")?;
+            let more = conn
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool);
+            let end = conn
+                .pointer("/pageInfo/endCursor")
+                .filter(|c| c.is_string())
+                .cloned();
+            let edges = conn
+                .get("edges")
+                .and_then(Value::as_array)
+                .ok_or("the read holds no list")?;
+            for e in edges {
+                last_h = row_id(e).height;
+                rows.push((
+                    prepared_id(e, root).key().unwrap_or_default(),
                     e.get("node").cloned().unwrap_or(Value::Null),
-                )
-            })
-            .collect();
-        // R-P5P9-67 m-6: fewer rows than asked, and a next page (or no word on one): capped.
-        let capped = rows.len() < n + PREFIX_EXTRA && more != Some(false);
+                ));
+            }
+            // R-P5P9-67 m-6: fewer rows than asked, and a next page (or no word on one).
+            let short = first_page && rows.len() < n + PREFIX_EXTRA && more != Some(false);
+            first_page = false;
+            // R-P5P9-86 SK: page on by `endCursor` until the read passes our boundary height.
+            let (Some(b), Some(end)) = (bound, end) else {
+                break (more, short);
+            };
+            let past = rows.len() > n && last_h.is_some_and(|h| h != b);
+            if past || more != Some(true) || pages >= PREFIX_PAGES || edges.is_empty() {
+                break (more, short);
+            }
+            v.insert(after_var.clone(), end);
+        };
+        let capped = match bound {
+            // Not past the boundary height while the list may go on: capped.
+            Some(b) => !(rows.len() > n && last_h.is_some_and(|h| h != b)) && more != Some(false),
+            None => short,
+        };
         Ok(Longer { rows, capped })
     }
 

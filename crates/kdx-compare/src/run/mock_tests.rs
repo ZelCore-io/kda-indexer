@@ -7803,3 +7803,93 @@ async fn e1_nc_failed_tx_error_info_before_judging_the_row() {
     let all = format!("{d:?} {note:?}");
     assert!(!all.contains("not canonical"), "{all}");
 }
+
+/// R-P5P9-86 SK: ours' longer read pages on by `endCursor` until it passes our boundary
+/// height. CG-5 #25: ours lists 312 rows at one height; the oracle-only row sits at ours'
+/// position 200, past `first` + 50: found after our cut, explained. A tie set too long for
+/// the read's page budget is "our longer read was capped", never "a row we skipped".
+#[tokio::test]
+async fn e1_sk_the_longer_read_pages_past_the_boundary_height() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["r19", "r200", "r1500"] {
+        let (k, v) = h7_poll(rk, "B941", 941, json!([]));
+        node.polls.insert(k, v);
+    }
+    // Ours' whole list: 5 rows above 941, then `ties` rows at 941, then 3 rows at 940.
+    fn full(ties: usize) -> Vec<Value> {
+        let h = |i: usize| match i {
+            i if i < 5 => 1000 - i as u64,
+            i if i < 5 + ties => 941,
+            _ => 940,
+        };
+        (0..5 + ties + 3)
+            .map(|i| {
+                let hi = h(i);
+                let mut e = h7_tx(
+                    &format!("r{i}"),
+                    hi,
+                    &format!("B{hi}"),
+                    "2024-01-01T10:00:00Z",
+                );
+                e["cursor"] = json!(i.to_string());
+                e
+            })
+            .collect()
+    }
+    let au = ours_fn_server(|req: &Value| {
+        let ties: usize = req["variables"]["ties"].as_str().unwrap().parse().unwrap();
+        let rows = full(ties);
+        let from = req["variables"]["after"]
+            .as_str()
+            .map_or(0, |c| c.parse::<usize>().unwrap() + 1);
+        let n = (req["variables"]["first"].as_u64().unwrap_or(0) as usize).min(100);
+        let page: Vec<Value> = rows.iter().skip(from).take(n).cloned().collect();
+        let end = page
+            .last()
+            .map(|e| e["cursor"].clone())
+            .unwrap_or(Value::Null);
+        json!({"data": {"transactions": {"pageInfo": {"hasNextPage": from + n < rows.len(),
+            "endCursor": end}, "edges": page}}})
+    })
+    .await;
+    h7_back_cmds(&mut node, "2024-01-01T10:00:00Z", &[]);
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let op = h7_op("transactions");
+    for (ties, x, explained) in [(312, "r200", true), (2000, "r1500", false)] {
+        let rows = full(ties);
+        let ours: Vec<Value> = rows.iter().take(20).cloned().collect();
+        // The oracle lists x in place of our last row (canonical: an oracle gap).
+        let mut oracle = ours[..19].to_vec();
+        oracle.push(
+            rows.iter()
+                .find(|e| e["node"]["hash"] == json!(x))
+                .unwrap()
+                .clone(),
+        );
+        let mut a = crate::graphql::Answer {
+            ms: vec![1],
+            ..h7_page("transactions", true, ours)
+        };
+        let mut b = h7_page("transactions", true, oracle);
+        let vars = h7_vars(&[("ties", json!(ties.to_string())), ("first", json!(20))]);
+        let (d, note) = ctx
+            .gql_settle_op(
+                &ctx.targets["a"],
+                Some(&op),
+                &vars,
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await;
+        let note = note.unwrap_or_default();
+        let un = c3_unexplained(&ctx, &d);
+        assert_eq!(un.is_empty(), explained, "ties {ties}: {un:?} {note}");
+        assert!(!note.contains("a row we skipped"), "ties {ties}: {note}");
+        if !explained {
+            assert!(note.contains("our longer read was capped"), "{note}");
+        }
+    }
+}
