@@ -1521,6 +1521,8 @@ impl Ctx {
             note,
             body_cap: None,
             a_pages: a_ans.map(|x| x.ms.len()),
+            a_tip_height: None,
+            a_lowest_height: None,
         };
         Outcome {
             allowlist_ids: allowlisted.to_vec(),

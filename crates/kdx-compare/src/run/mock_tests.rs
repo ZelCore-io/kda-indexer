@@ -18,6 +18,7 @@ use crate::graphql_window::Reads;
 
 mod e2b;
 mod e3b;
+mod g;
 
 /// The node: every chain's cut at `tip`, the canonical hash per (chain, height) and the block
 /// `/poll` puts each request key in. Every path asked is logged.
@@ -3984,6 +3985,8 @@ async fn c3_the_referee_keeps_h6_past_the_records_entry_cap() {
         note: None,
         body_cap: None,
         a_pages: Some(1),
+        a_tip_height: None,
+        a_lowest_height: None,
     };
     let log = dir.path().join("diffs-cap.jsonl");
     let line = serde_json::to_string(&rec.bounded()).unwrap();
@@ -8029,6 +8032,8 @@ fn e2_stored(
         note: None,
         body_cap: None,
         a_pages: Some(1),
+        a_tip_height: None,
+        a_lowest_height: None,
     }
 }
 

@@ -533,8 +533,8 @@ impl Ctx {
     /// chainweb-data, a /v1/txs pair against kda-txs) settled by its stored form. A /v1/txs
     /// record of the edge shape is settled by [`Ctx::v1txs_edge_stored`]; any other record by
     /// the stored rows: normalized, the node's orphans moved out, the rows combined by
-    /// [`Ctx::rest_compose`] (ours full when it holds the request's limit), the rest diffed
-    /// and classified. There is no live window drop: a recent row the oracle lacks must pass
+    /// [`Ctx::rest_compose`] (ours full when it holds the request's limit; the lag horizon
+    /// from the record's tip of ours, R-P5P9-96 (2a)), the rest diffed and classified. There is no live window drop: a recent row the oracle lacks must pass
     /// the node check. Returns the unexplained entries, the explaining ids and a note;
     /// `Err` when the record has no stored form.
     pub(crate) async fn rest_stored(
@@ -612,8 +612,18 @@ impl Ctx {
         };
         let full_a = limit.is_some_and(|l| len_of(&raw_a) >= l);
         let lowest = min_height(&raw_a);
+        // R-P5P9-96 (2a): a record that carries ours' tip and ours' lowest listed height
+        // bounds an oracle-only row at ours' lowest height by the lag horizon from that tip,
+        // as live does. Without them (CG-5's records), or with a lowest height that is not
+        // the stored page's, there is no horizon and such a row stays unexplained.
+        let horizon = match (rec.a_tip_height, rec.a_lowest_height) {
+            (Some(t), Some(m)) if Some(m) == lowest && t > ORACLE_HORIZON => {
+                Some(t - ORACLE_HORIZON)
+            }
+            _ => None,
+        };
         let mut d = match self
-            .rest_compose(&req, kdatxs, &mut va, &mut vb, full_a, lowest, None)
+            .rest_compose(&req, kdatxs, &mut va, &mut vb, full_a, lowest, horizon)
             .await
         {
             Ok(h) => h,

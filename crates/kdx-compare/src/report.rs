@@ -83,6 +83,14 @@ pub struct DiffRecord {
     /// check needs when `kda-compare referee` re-runs the record (R-P5P9-64 I-3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a_pages: Option<usize>,
+    /// R-P5P9-96 (2a), REST records: ours' tip height as the compare read it, and the lowest
+    /// height ours listed (before any rule dropped rows). The stored forms bound an
+    /// oracle-only row at ours' lowest height by them, as the live form does; a record
+    /// without them (CG-5's) never explains such a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_tip_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_lowest_height: Option<u64>,
 }
 
 /// POSIX shell single-quoting: the result is one literal word whatever `s` holds (quotes,
@@ -228,6 +236,8 @@ impl DiffRecord {
             note: self.note.as_deref().map(long),
             body_cap: body_cap.as_deref().map(short),
             a_pages: self.a_pages,
+            a_tip_height: self.a_tip_height,
+            a_lowest_height: self.a_lowest_height,
         }
     }
 }
@@ -327,6 +337,16 @@ impl DiffLog {
 /// whole, read back and checked equal to the raw file before the raw file is removed (a
 /// failed check keeps the raw file and is an error). Returns (date, raw, zst) per rotated day.
 pub fn rotate_logs(out_dir: &Path, today: &str) -> anyhow::Result<Vec<(String, u64, u64)>> {
+    rotate_logs_with(out_dir, today, &mut |_| {})
+}
+
+/// [`rotate_logs`], with `written` called on each raw file once its day's `.zst` is written
+/// and before the raw file's length is checked (R-P5P9-96 (4): a test appends there).
+fn rotate_logs_with(
+    out_dir: &Path,
+    today: &str,
+    written: &mut dyn FnMut(&Path),
+) -> anyhow::Result<Vec<(String, u64, u64)>> {
     let mut days: Vec<(String, PathBuf)> = std::fs::read_dir(out_dir)
         .with_context(|| format!("reading {}", out_dir.display()))?
         .filter_map(Result::ok)
@@ -375,6 +395,7 @@ pub fn rotate_logs(out_dir: &Path, today: &str) -> anyhow::Result<Vec<(String, u
             "{}: the written compressed log does not read back",
             zst_path.display()
         );
+        written(&raw_path);
         // R-P5P9-95 m-12: a record appended since the read stays: the raw file is removed only
         // when it is the bytes compressed, else the day's `.zst` is put back as it was.
         let now = std::fs::metadata(&raw_path)?.len();
@@ -677,6 +698,8 @@ mod tests {
             note: Some(body),
             body_cap: None,
             a_pages: None,
+            a_tip_height: None,
+            a_lowest_height: None,
         }
     }
 
@@ -865,5 +888,52 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(lines, vec!["{\"a\":1}", "{\"a\":2}"]);
+    }
+
+    /// R-P5P9-96 (4), m-12: a record appended to the raw log while it is rotated is kept. The
+    /// raw file stays whole, the rotation fails, and the day's `.zst` is put back as it was:
+    /// absent for a first rotation, its earlier records for a day rotated before.
+    #[test]
+    fn g_m12_a_raw_log_that_grew_is_rolled_back() {
+        use std::io::BufRead;
+        let day = |dir: &Path| dir.join("diffs-2026-11-14.jsonl");
+        let late = |p: &Path| {
+            let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+            f.write_all(b"{\"late\":1}\n").unwrap();
+        };
+        // A first rotation.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = day(dir.path());
+        std::fs::write(&raw, "{\"a\":1}\n").unwrap();
+        let r = rotate_logs_with(dir.path(), "2026-11-15", &mut |p| late(p));
+        assert!(r.unwrap_err().to_string().contains("grew"));
+        assert_eq!(
+            std::fs::read_to_string(&raw).unwrap(),
+            "{\"a\":1}\n{\"late\":1}\n"
+        );
+        assert!(!dir.path().join("diffs-2026-11-14.jsonl.zst").exists());
+        // A day rotated before: its `.zst` keeps the earlier records only.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = day(dir.path());
+        std::fs::write(&raw, "{\"a\":1}\n").unwrap();
+        rotate_logs(dir.path(), "2026-11-15").unwrap();
+        let zst = dir.path().join("diffs-2026-11-14.jsonl.zst");
+        let before = std::fs::read(&zst).unwrap();
+        std::fs::write(&raw, "{\"a\":2}\n").unwrap();
+        let r = rotate_logs_with(dir.path(), "2026-11-15", &mut |p| late(p));
+        assert!(r.is_err());
+        assert_eq!(std::fs::read(&zst).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(&raw).unwrap(),
+            "{\"a\":2}\n{\"late\":1}\n"
+        );
+        // The next rotation takes the whole day.
+        rotate_logs(dir.path(), "2026-11-15").unwrap();
+        let lines: Vec<String> = open_log(&raw)
+            .unwrap()
+            .lines()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(lines, vec!["{\"a\":1}", "{\"a\":2}", "{\"late\":1}"]);
     }
 }

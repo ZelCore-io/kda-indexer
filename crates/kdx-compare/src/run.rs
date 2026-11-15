@@ -917,6 +917,8 @@ impl Ctx {
             note,
             body_cap: None,
             a_pages: None,
+            a_tip_height: None,
+            a_lowest_height: None,
         }
     }
 
@@ -1046,10 +1048,10 @@ impl Ctx {
         }
         // Ruling R3E-11: the oracles lag A and fill recent heights late. Account, event and
         // /v1/txs rows are compared only below A's tip minus ORACLE_HORIZON; when that drops
-        // rows, a side that held its full limit (or was cut at a page) is cut at its lowest
-        // height on both sides.
-        // Whether each side held its full limit (or was cut at a page), read before any rule
-        // drops rows; used by the node-confirmed rule below.
+        // rows, a side that held its full limit (the oracle also when cut at a page) is cut at
+        // its lowest height on both sides.
+        // Whether each side held its full limit, read before any rule drops rows; used by the
+        // node-confirmed rule below too.
         let row_limit = if req.route == RouteKind::V1Txs {
             crate::via_cwd::parse(&req.path_and_query)
                 .limit
@@ -1058,26 +1060,26 @@ impl Ctx {
         } else {
             query_limit(&req.path_and_query)
         };
-        let full_a0 = pa.truncated || page_cut || row_limit.is_none_or(|l| len_of(&va) >= l);
-        let full_b0 = pb.truncated || page_cut || row_limit.is_none_or(|l| len_of(&vb) >= l);
-        // R-P5P9-72 (2): for R-P5P9-86's row-by-row rules, only a known limit makes ours
-        // full. R-P5P9-95 I-2: read from ours' own page (cut, or its rows before any cut at
-        // the limit), never from `page_cut`, which the oracle's cut sets too.
+        // R-P5P9-96 (1): in every rule ours is full only by its own page: cut at its own
+        // depth, or holding a known limit's rows counted before any cut. `page_cut` is never
+        // evidence of it (the oracle's cut sets it too), and an unknown limit is not full.
         let full_a_known = pa.truncated || row_limit.is_some_and(|l| len_a0 >= l);
+        let full_b0 = pb.truncated || page_cut || row_limit.is_none_or(|l| len_of(&vb) >= l);
         let mut lag_rows = 0usize;
         // Replica pair (two kda-indexer targets): rows above the lower of the two tips minus
         // a margin are dropped (the sides read different tips and a chain can trail its
         // side's tip), with no allowlist hit.
         let replica = ta.kind == crate::config::TargetKind::KdaIndexerCompat
             && tb.kind == crate::config::TargetKind::KdaIndexerCompat;
+        // R-P5P9-96 (2a): ours' tip as this compare read it, also kept on the record.
+        let a_tip0 = self.tips.a_tip();
         let clamp_to = if replica {
             match (self.oracle_tip(ta).await, self.oracle_tip(tb).await) {
                 (Some(x), Some(y)) => Some(replica_clamp(x, y)),
                 _ => None,
             }
         } else {
-            let t = self.tips.a_tip();
-            (t > ORACLE_HORIZON).then(|| t - ORACLE_HORIZON)
+            (a_tip0 > ORACLE_HORIZON).then(|| a_tip0 - ORACLE_HORIZON)
         };
         if matches!(
             req.route,
@@ -1096,10 +1098,11 @@ impl Ctx {
                 query_limit(&req.path_and_query)
             };
             // R-P5P9-72 (2): only a known limit (or a cut page) makes a side partial at its
-            // lowest height; an unknown limit (`/txs/events`) is not full.
+            // lowest height; an unknown limit (`/txs/events`) is not full. R-P5P9-96 (1): for
+            // ours, only ours' own page (`full_a_known`), never the oracle's cut.
             let full = |n: usize, t: bool| t || limit.is_some_and(|l| n >= l);
             let (na, nb) = (len_of(&va), len_of(&vb));
-            let fa = full(na, pa.truncated || page_cut);
+            let fa = full_a_known;
             let fb = full(nb, pb.truncated || page_cut);
             // R-P5P9-71 (1): the window is for rows the oracle has not filled yet, which are
             // rows it lacks. A row only the oracle lists there is no lag: it stays in the
@@ -1368,7 +1371,7 @@ impl Ctx {
                 if let Value::Array(xa) = &mut va {
                     xa.retain(|r| !gap.contains(r));
                 }
-                if full_a0 && full_b0 {
+                if full_a_known && full_b0 {
                     if let Some(cut) = a_min0.max(b_min) {
                         drop_at_or_below(&mut va, cut);
                         drop_at_or_below(&mut vb, cut);
@@ -1395,7 +1398,7 @@ impl Ctx {
         );
         if node_gap_pair && sa == 200 && sb == 200 && gap_rows.is_empty() && kt_gap.is_empty() {
             let (mut ca, mut cb) = (va.clone(), vb.clone());
-            if full_a0 && full_b0 {
+            if full_a_known && full_b0 {
                 if let (Some(x), Some(y)) = (min_height(&ca), min_height(&cb)) {
                     // R-P5P9-71 (1): at the cut, only the complete side's surplus goes.
                     cut_at_limit(&mut ca, &mut cb, x.max(y), x >= y, y >= x);
@@ -1824,6 +1827,11 @@ impl Ctx {
             curl_b,
             None,
         );
+        // R-P5P9-96 (2a): the stored forms bound oracle-only rows by these, as live does.
+        if let Some(r) = &mut o.record {
+            r.a_tip_height = (a_tip0 > 0).then_some(a_tip0);
+            r.a_lowest_height = lowest_a0;
+        }
         // Items on one side only (the sides read slightly different tips) are not a diff.
         if skew && o.class == "match" {
             o.class = "skew".into();

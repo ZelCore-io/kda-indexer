@@ -23,3 +23,8 @@ pub mod streamed;
 pub mod summary;
 pub mod target;
 pub mod via_cwd;
+
+/// R-P5P9-96 (4): `build.rs`'s sha and watched files, tested with the crate.
+#[cfg(test)]
+#[path = "../build_git.rs"]
+mod build_git;

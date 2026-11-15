@@ -6,7 +6,7 @@ use crate::report::{DiffEntry, DiffKind};
 
 /// A list server for the count walk: `rows` under `root`, `first` a page from the `after`
 /// cursor (a row index), with `count` as totalCount.
-fn walk_reply(
+pub(super) fn walk_reply(
     root: &'static str,
     rows: Vec<Value>,
     count: u64,
@@ -327,7 +327,7 @@ kind = "{b_kind}"
 
 const ACCT: &str = "k:5fd26d23";
 
-fn acct_row(rk: &str, h: u64, amount: &str) -> Value {
+pub(super) fn acct_row(rk: &str, h: u64, amount: &str) -> Value {
     json!({"requestKey": rk, "blockHash": format!("c{h}"), "chain": 9, "height": h, "idx": 0,
         "amount": amount, "fromAccount": if rk == "<coinbase>" { "" } else { "x" },
         "toAccount": ACCT, "token": "coin"})
@@ -335,7 +335,7 @@ fn acct_row(rk: &str, h: u64, amount: &str) -> Value {
 
 /// The node of #1854's shape on chain 9: u1 in its block with an event naming the account,
 /// and the coinbase of c7000104 paying the account 0.904046.
-fn rest_node() -> NodeMock {
+pub(super) fn rest_node() -> NodeMock {
     let mut node = canon_node(&[9], 6_999_990..7_000_200);
     node.polls.insert(
         "u1".into(),
@@ -362,11 +362,11 @@ fn rest_node() -> NodeMock {
     node
 }
 
-const ACCT_REQ: &str = "/txs/account/k:5fd26d23?token=coin&chain=9&limit=5";
+pub(super) const ACCT_REQ: &str = "/txs/account/k:5fd26d23?token=coin&chain=9&limit=5";
 
 /// Ours (full, limit 5) and chainweb-data: a user row and a coinbase row only ours lists,
 /// and a chainweb-data-only row at `edge` (ours' lowest height is 7000100).
-fn acct_pair(edge: u64) -> (Value, Value) {
+pub(super) fn acct_pair(edge: u64) -> (Value, Value) {
     let shared = [
         acct_row("s1", 7_000_103, "2.0"),
         acct_row("s2", 7_000_101, "3.0"),
@@ -505,6 +505,8 @@ pub(super) fn rest_record(
         note: None,
         body_cap: None,
         a_pages: None,
+        a_tip_height: None,
+        a_lowest_height: None,
     }
 }
 
