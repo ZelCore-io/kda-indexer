@@ -3221,6 +3221,31 @@ fn entry(path: &str, a: Option<Value>, b: Option<Value>) -> DiffEntry {
 }
 
 /// The name of the root connection field of `data`.
+/// R-P5P9-88 (F): the root list of `body` that selects `edges` but no `pageInfo`.
+fn bare_root(body: &Value) -> Option<String> {
+    body.get("data")?
+        .as_object()?
+        .iter()
+        .find(|(_, v)| v.get("edges").is_some_and(Value::is_array) && v.get("pageInfo").is_none())
+        .map(|(k, _)| k.clone())
+}
+
+/// The page size `first` of root list `root`: its own argument (a literal or a set
+/// variable), else the variable the document passes to `first`.
+fn root_first(query: Option<&str>, root: &str, vars: &Map<String, Value>) -> Option<u64> {
+    match query.and_then(|q| root_args(q, root)) {
+        Some(args) => {
+            args.iter()
+                .find(|(n, _)| n == "first")
+                .and_then(|(_, v)| match v.strip_prefix('$') {
+                    Some(var) => vars.get(var).and_then(Value::as_u64),
+                    None => v.parse::<u64>().ok(),
+                })
+        }
+        None => vars.get(&arg_var(query, "first")).and_then(Value::as_u64),
+    }
+}
+
 fn root_name(data: &Value) -> Option<String> {
     data.as_object()?
         .iter()
@@ -3251,6 +3276,57 @@ impl Ctx {
         if root_scoped {
             return (Vec::new(), None);
         }
+        // R-P5P9-88 (F): a root list without `pageInfo` (Transfers-8c8a0f56) is a connection
+        // of page size `first`: cut when it holds min(first, ours' cap) rows, else complete.
+        // The `pageInfo` stands in for H7 only and is taken off again after it.
+        let query = op.map(|o| o.query.as_str());
+        let bare = [&*a, &*b].iter().find_map(|x| bare_root(&x.body));
+        let first = bare.as_deref().and_then(|r| root_first(query, r, vars));
+        let (Some(root), Some(f)) = (bare, first) else {
+            return self
+                .gql_window_referee_conn(ta, op, vars, a, b, max, st)
+                .await;
+        };
+        let mut added = [false, false];
+        for (x, add) in [&mut *a, &mut *b].into_iter().zip(added.iter_mut()) {
+            if let Some(c) = x.body.pointer_mut(&format!("/data/{root}")) {
+                if c.get("pageInfo").is_none() && c.get("edges").is_some_and(Value::is_array) {
+                    let rows = c["edges"].as_array().map_or(0, Vec::len) as u64;
+                    let cut = rows >= f.min(OURS_PAGE_CAP);
+                    c["pageInfo"] = json!({"hasNextPage": cut, "hasPreviousPage": false});
+                    *add = true;
+                }
+            }
+        }
+        let out = self
+            .gql_window_referee_conn(ta, op, vars, a, b, max, st)
+            .await;
+        for (x, add) in [&mut *a, &mut *b].into_iter().zip(added) {
+            if add {
+                if let Some(c) = x
+                    .body
+                    .pointer_mut(&format!("/data/{root}"))
+                    .and_then(Value::as_object_mut)
+                {
+                    c.remove("pageInfo");
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Ctx::gql_window_referee`] on a root list that is a connection.
+    #[allow(clippy::too_many_arguments)]
+    async fn gql_window_referee_conn(
+        &self,
+        ta: &Target,
+        op: Option<&GqlOp>,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        st: &mut Reads,
+    ) -> (Vec<DiffEntry>, Option<String>) {
         let conn = |ans: &mut Answer| {
             ans.body
                 .get_mut("data")
@@ -3271,6 +3347,7 @@ impl Ctx {
                         })
                     })
             };
+            // R-P5P9-88 (F): only when `first` is missing (else it is a connection above).
             let note = (bare(a) || bare(b))
                 .then(|| "H7 not applied: the root list selects no pageInfo".to_string());
             return (Vec::new(), note);

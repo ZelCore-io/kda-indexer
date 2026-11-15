@@ -921,8 +921,19 @@ pub fn compare_answers_with(
     normalize_gql(&mut nb, cap);
     // R-P5P9-62 H7 paired the root rows: keep them paired through the tie sort.
     let mut aligned = false;
+    // R-P5P9-88 (F): a root list without `pageInfo` that H7 read as a connection too.
     for v in [&mut na, &mut nb] {
-        if let Some(c) = v.get_mut("data").and_then(root_connection) {
+        let bare = v.pointer("/data").and_then(|d| {
+            d.as_object()?
+                .iter()
+                .find(|(_, x)| x.get("edges").is_some_and(Value::is_array))
+                .map(|(k, _)| format!("/data/{}", crate::graphql_scope::esc(k)))
+        });
+        let c = match v.get_mut("data").and_then(root_connection) {
+            Some(c) => Some(c),
+            None => bare.and_then(|p| v.pointer_mut(&p)),
+        };
+        if let Some(c) = c {
             aligned |= crate::graphql_window::realign(c);
         }
     }

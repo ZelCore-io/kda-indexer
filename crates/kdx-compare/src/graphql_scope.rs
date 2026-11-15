@@ -90,7 +90,7 @@ pub struct ScopedList {
     pub parent: Option<Parent>,
 }
 
-fn esc(k: &str) -> String {
+pub(crate) fn esc(k: &str) -> String {
     k.replace('~', "~0").replace('/', "~1")
 }
 

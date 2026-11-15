@@ -539,3 +539,37 @@ async fn e2b_the_referee_settles_stored_rest_records() {
         }
     }
 }
+
+/// R-P5P9-88 (F): Transfers-8c8a0f56's root list selects no `pageInfo`. With `first` set it
+/// is a connection of that page size, and H7 settles it: ours' full page (2 of first 2) is
+/// cut, the oracle's 1 row is complete, and ours' extra row is canonical on the node.
+/// The stand-in `pageInfo` is taken off the bodies again. Without `first` the note stays.
+#[tokio::test]
+async fn e3_f_a_root_list_without_page_info_is_a_connection_of_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["u", "v"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.5));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let r = |rk: &str| {
+        json!({"node": {"amount": 1.5, "requestKey": rk,
+            "block": {"height": 100, "chainId": "0"}}})
+    };
+    let page = |edges: Vec<Value>| answer(json!({"data": {"transfers": {"edges": edges}}}));
+    let (mut a, mut b) = (page(vec![r("u"), r("v")]), page(vec![r("u")]));
+    let vars = h7_vars(&[("first", json!(2))]);
+    let (d, note) = ctx
+        .gql_settle(&ctx.targets["a"], &vars, &mut a, &mut b, 7_000_000, false)
+        .await;
+    assert!(only_hits(&d), "{d:?} {note:?}");
+    assert!(c3_unexplained(&ctx, &d).is_empty(), "{d:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_window::WINDOW_PATH),
+        "{d:?}"
+    );
+    assert!(a.body.pointer("/data/transfers/pageInfo").is_none());
+    assert!(b.body.pointer("/data/transfers/pageInfo").is_none());
+}
