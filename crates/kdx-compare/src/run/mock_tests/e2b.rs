@@ -272,3 +272,270 @@ async fn e2b_x_trailing_zeros_with_ours_equal_to_the_node() {
     assert!(!decimal_zeros_only("-0.5", "0.50"));
     assert!(!decimal_zeros_only("1e2", "100"));
 }
+
+/// A REST side answering its n-th compare request (an account or /v1/txs path) with
+/// `bodies[n]` (the last one after that), and `[]` on any other path (no tip, so no lag
+/// window).
+async fn reads_server(bodies: Vec<Value>) -> String {
+    let n = Arc::new(Mutex::new(0usize));
+    let app = Router::new().fallback(move |uri: Uri| {
+        let (n, bodies) = (n.clone(), bodies.clone());
+        async move {
+            let p = uri.path();
+            if !(p.starts_with("/v1/txs") || p.starts_with("/txs/account")) {
+                return Json(json!([]));
+            }
+            let mut g = n.lock().unwrap();
+            let body = bodies[(*g).min(bodies.len() - 1)].clone();
+            *g += 1;
+            Json(body)
+        }
+    });
+    serve(app).await.trim_end_matches('/').to_string()
+}
+
+fn rest_cfg(nu: &str, au: &str, bu: &str, out: &std::path::Path, b_kind: &str) -> CompareConfig {
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+rate_rps = 1000.0
+follow_depth = 0
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 20000
+[targets.a]
+url = "{au}"
+kind = "kda_indexer_compat"
+[targets.b]
+url = "{bu}"
+kind = "{b_kind}"
+"#
+    ))
+    .unwrap()
+}
+
+const ACCT: &str = "k:5fd26d23";
+
+fn acct_row(rk: &str, h: u64, amount: &str) -> Value {
+    json!({"requestKey": rk, "blockHash": format!("c{h}"), "chain": 9, "height": h, "idx": 0,
+        "amount": amount, "fromAccount": if rk == "<coinbase>" { "" } else { "x" },
+        "toAccount": ACCT, "token": "coin"})
+}
+
+/// The node of #1854's shape on chain 9: u1 in its block with an event naming the account,
+/// and the coinbase of c7000104 paying the account 0.904046.
+fn rest_node() -> NodeMock {
+    let mut node = canon_node(&[9], 6_999_990..7_000_200);
+    node.polls.insert(
+        "u1".into(),
+        (
+            9,
+            json!({"reqKey": "u1", "metaData": {"blockHash": "c7000105"},
+                "events": [{"name": "TRANSFER", "params": ["x", ACCT, 1.5]}]}),
+        ),
+    );
+    node.headers.insert(
+        (9, 7_000_104),
+        vec![
+            json!({"hash": "c7000104", "height": 7_000_104, "chainId": 9,
+            "payloadHash": "P104"}),
+        ],
+    );
+    let cb = json!({"reqKey": "cb", "events": [{"name": "TRANSFER", "module": {"name": "coin"},
+        "params": ["", ACCT, 0.904046]}]})
+    .to_string();
+    node.payloads.insert(
+        "P104".into(),
+        json!({"coinbase": kdx_types::hash::b64url_encode(cb.as_bytes())}),
+    );
+    node
+}
+
+const ACCT_REQ: &str = "/txs/account/k:5fd26d23?token=coin&chain=9&limit=5";
+
+/// Ours (full, limit 5) and chainweb-data: a user row and a coinbase row only ours lists,
+/// and a chainweb-data-only row at `edge` (ours' lowest height is 7000100).
+fn acct_pair(edge: u64) -> (Value, Value) {
+    let shared = [
+        acct_row("s1", 7_000_103, "2.0"),
+        acct_row("s2", 7_000_101, "3.0"),
+        acct_row("s3", 7_000_100, "4.0"),
+    ];
+    let mut a = vec![
+        acct_row("u1", 7_000_105, "1.5"),
+        acct_row("<coinbase>", 7_000_104, "0.904046"),
+    ];
+    a.extend(shared.iter().cloned());
+    let mut b: Vec<Value> = shared.to_vec();
+    b.push(acct_row("e1", edge, "5.0"));
+    (Value::Array(a), Value::Array(b))
+}
+
+/// R-P5P9-86 (REST records where several rules apply), #1854's shape: a user row and a
+/// coinbase row only ours lists (each node-confirmed), and a chainweb-data-only row at ours'
+/// bottom boundary height while ours held its limit. Each part has its rule, and the record
+/// is explained, listing each rule and its rows. The chainweb-data-only row above ours'
+/// lowest height leaves the record unexplained.
+#[tokio::test]
+async fn e2b_rest_rules_combine_row_by_row() {
+    for (edge, explained) in [(7_000_100, true), (7_000_102, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = acct_pair(edge);
+        let nu = node_server(rest_node()).await;
+        let (au, bu) = (reads_server(vec![a]).await, reads_server(vec![b]).await);
+        let ctx = Ctx::new(rest_cfg(&nu, &au, &bu, dir.path(), "chainweb_data"))
+            .await
+            .unwrap();
+        let req = Request::new(ACCT_REQ.into(), Origin::Seed, None);
+        let o = ctx
+            .vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
+            .await;
+        if explained {
+            assert_eq!(o.class, "allowlisted", "{o:?}");
+            for id in [
+                "cwd-missing-node",
+                "cwd-missing-node-coinbase",
+                "ours-limit-edge",
+                "rest-compose",
+            ] {
+                assert!(o.allowlist_ids.contains(&id.to_string()), "{id} {o:?}");
+            }
+        } else {
+            assert_eq!(o.class, "diff", "{o:?}");
+        }
+    }
+}
+
+fn v1_row(rk: &str, h: u64) -> Value {
+    json!({"requestKey": rk, "chain": 0, "height": h, "blockHash": format!("c{h}"),
+        "amount": 1.5, "code": "x", "events": [], "gasLimit": 600})
+}
+
+const V1_REQ: &str = "/v1/txs/k:5fd26d23/coin/10";
+
+/// #1871's first reads: ours' one row at 7006546, kda-txs' four at 7006517-520.
+fn v1_first() -> (Value, Value) {
+    let b: Vec<Value> = (517..=520)
+        .rev()
+        .map(|h| v1_row(&format!("r{h}"), 7_006_000 + h))
+        .collect();
+    (json!([v1_row("r546", 7_006_546)]), Value::Array(b))
+}
+
+fn v1_node(bad: Option<&str>) -> NodeMock {
+    let mut node = canon_node(&[0], 7_006_500..7_006_600);
+    for h in [517u64, 518, 519, 520, 546] {
+        let rk = format!("r{h}");
+        let block = if bad == Some(rk.as_str()) {
+            "elsewhere".to_string()
+        } else {
+            format!("c{}", 7_006_000 + h)
+        };
+        node.poll.insert(rk, (0, block));
+    }
+    node
+}
+
+/// R-P5P9-86 v1txs, live, #1871's shape: the pages do not overlap and kda-txs' rows end
+/// lower. The re-read 60 s later agrees on the overlap: explained as oracle lag. A re-read
+/// still apart, with a row kda-txs lacks on the overlap, stays unexplained.
+#[tokio::test]
+async fn e2b_v1txs_edge_rereads_once() {
+    let (a0, b0) = v1_first();
+    let all: Vec<Value> = std::iter::once(v1_row("r546", 7_006_546))
+        .chain(b0.as_array().unwrap().iter().cloned())
+        .collect();
+    let mut gap = all.clone();
+    gap.remove(2);
+    for (b1, explained) in [
+        (Value::Array(all.clone()), true),
+        (Value::Array(gap), false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(v1_node(None)).await;
+        let au = reads_server(vec![a0.clone(), Value::Array(all.clone())]).await;
+        let bu = reads_server(vec![b0.clone(), b1]).await;
+        let ctx = Ctx::new(rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs"))
+            .await
+            .unwrap();
+        let o = v1_compare(&ctx, V1_REQ).await;
+        if explained {
+            assert_eq!(o.class, "allowlisted", "{o:?}");
+            assert_eq!(o.allowlist_ids, vec!["kdatxs-edge-lag".to_string()]);
+        } else {
+            assert_eq!(o.class, "diff", "{o:?}");
+        }
+    }
+}
+
+fn rest_record(route: &str, req: &str, a: &Value, b: &Value) -> crate::report::DiffRecord {
+    crate::report::DiffRecord {
+        ts: "2026-11-15T09:00:00Z".into(),
+        route: route.into(),
+        request: req.into(),
+        a_target: "a".into(),
+        b_target: "b".into(),
+        a_status: Some(200),
+        b_status: Some(200),
+        a_body_trimmed: a.to_string(),
+        b_body_trimmed: b.to_string(),
+        diff: Vec::new(),
+        class: "diff".into(),
+        allowlisted: None,
+        known_gap: None,
+        curl: String::new(),
+        note: None,
+        body_cap: None,
+        a_pages: None,
+    }
+}
+
+/// R-P5P9-87, the stored forms in the referee. An account record of #1854's shape is
+/// explained by the rules combined row by row, and its neighbour (a chainweb-data-only row
+/// above ours' lowest height) stays unexplained. A /v1/txs record of #1871's shape is
+/// explained when every stored row is node-canonical and a read now agrees on the overlap;
+/// one stored row the node puts in another block leaves it unexplained.
+#[tokio::test]
+async fn e2b_the_referee_settles_stored_rest_records() {
+    for (edge, explained) in [(7_000_100, 1), (7_000_102, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = acct_pair(edge);
+        let nu = node_server(rest_node()).await;
+        let cfg = rest_cfg(
+            &nu,
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            dir.path(),
+            "chainweb_data",
+        );
+        let rec = rest_record("account", ACCT_REQ, &a, &b);
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!((rep.refereed, rep.explained), (1, explained), "{rep:?}");
+        assert_eq!(rep.unexplained, 1 - explained, "{rep:?}");
+        if explained == 1 {
+            assert_eq!(rep.by_class.get("rest-compose"), Some(&1), "{rep:?}");
+        }
+    }
+    let (a0, b0) = v1_first();
+    let all: Vec<Value> = std::iter::once(v1_row("r546", 7_006_546))
+        .chain(b0.as_array().unwrap().iter().cloned())
+        .collect();
+    for (bad, explained) in [(None, 1), (Some("r518"), 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(v1_node(bad)).await;
+        let au = reads_server(vec![Value::Array(all.clone())]).await;
+        let bu = reads_server(vec![Value::Array(all.clone())]).await;
+        let cfg = rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs");
+        let rec = rest_record("v1txs", V1_REQ, &a0, &b0);
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!((rep.refereed, rep.explained), (1, explained), "{rep:?}");
+        if explained == 1 {
+            assert_eq!(rep.by_class.get("kdatxs-edge-lag"), Some(&1), "{rep:?}");
+        }
+    }
+}

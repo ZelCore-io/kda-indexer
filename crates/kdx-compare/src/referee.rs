@@ -60,7 +60,8 @@ pub struct Opts {
 pub struct Report {
     /// Non-empty lines read from the logs.
     pub records: usize,
-    /// GraphQL records the run left unexplained (class `diff`): the ones taken up.
+    /// GraphQL, REST account and /v1/txs records the run left unexplained (class `diff`):
+    /// the ones taken up.
     pub refereed: usize,
     pub explained: usize,
     pub unexplained: usize,
@@ -169,12 +170,45 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
                     continue;
                 }
             };
-            if rec.class != "diff" || !rec.route.starts_with("graphql:") {
+            // R-P5P9-86 with R-P5P9-87: the REST account and /v1/txs records too.
+            let rest = matches!(rec.route.as_str(), "account" | "v1txs");
+            if rec.class != "diff" || !(rest || rec.route.starts_with("graphql:")) {
                 continue;
             }
             rep.refereed += 1;
-            let head = json!({"at": at, "ts": rec.ts, "request": rec.request,
-                "a": rec.a_target, "b": rec.b_target});
+            let head = json!({"at": at, "ts": rec.ts, "route": rec.route,
+                "request": rec.request, "a": rec.a_target, "b": rec.b_target});
+            if rest {
+                if ctx.gql.node_budget.load(Ordering::Relaxed) == 0 {
+                    let why = format!("the cap of {} node reads is spent", opts.max_reads);
+                    not_refereed(&mut rep, head, UNREAD, why);
+                    continue;
+                }
+                match ctx.rest_stored(&rec).await {
+                    Err(why) => {
+                        let class = format!("not refereed: {why}");
+                        not_refereed(&mut rep, head, &class, why);
+                    }
+                    Ok((un, ids, _)) if un.is_empty() => {
+                        rep.explained += 1;
+                        for id in ids {
+                            count(&mut rep, id);
+                        }
+                    }
+                    Ok((un, ids, note)) => {
+                        rep.unexplained += 1;
+                        count(&mut rep, format!("unexplained: rest-{}", rec.route));
+                        let mut v = head;
+                        v["class"] = json!(format!("rest-{}", rec.route));
+                        v["note"] = json!(note);
+                        v["unexplainedCount"] = json!(un.len());
+                        v["unexplained"] = json!(un.iter().take(MAX_SHOWN).collect::<Vec<_>>());
+                        v["explainedBy"] = json!(ids);
+                        rep.still_unexplained.push(v);
+                    }
+                }
+                continue;
+            }
             // R-P5P9-86 S′ with R-P5P9-87: a NodeBalance record against ours' native API
             // (labelled `node` before S′) is settled by its stored form.
             if native_op(&ctx, &rec).is_some() {

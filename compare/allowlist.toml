@@ -766,3 +766,43 @@ reason = "R-P5P9-86 X (oracle format): a shared row's amount where the oracle's 
 status = "PROPOSED"
 ruling = "R-P5P9-86 X."
 owner_note = "PROPOSED (ruling R-P5P9-86 X): new in FVH-E2b; CG-5 class X (#744)."
+
+[[entry]]
+id = "rest-compose"
+route = "*"
+json_path_glob = "/~rest-compose"
+condition = "any"
+reason = "R-P5P9-86 (REST account records where several rules apply; CG-5 #1385, #1854, #1966): on an account pair against chainweb-data or a /v1/txs pair against kda-txs, rules combine on one record row by row. Each one-sided row is explained by exactly one rule's own check: a row only ours lists by the node (cwd-missing-node / kdatxs-missing-node: a user tx in ours' block on the node's /poll with an event naming the account; cwd-missing-node-coinbase: the node's canonical block at the row's height is the row's and its coinbase pays the account the row's amount), a row only the oracle lists by ours' limit (ours-limit-edge). Field differences of shared rows stay diffs for their own rules. This hit lists each rule and its row count; the record is explained only when every row and every field is. Stored (R-P5P9-87, the referee): the same on the stored rows, without the live window drop (a recent row the oracle lacks must then pass the node check)."
+status = "PROPOSED"
+ruling = "R-P5P9-86 (REST composition); R-P5P9-87 (the stored form)."
+owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b; CG-5 REST account (#1385, #1854, #1966)."
+
+[[entry]]
+id = "cwd-missing-node-coinbase"
+route = "account"
+json_path_glob = "/~cwd-missing-node-coinbase"
+condition = "any"
+reason = "R-P5P9-86 (REST composition, CG-5 #1854: chainweb-data lacks 167 coinbase rows): a coinbase row only ours lists on an account pair. Explained only when the node's canonical block at the row's (chain, height), on the cut's branch, is the row's block and that block's coinbase output pays the account (coin TRANSFER from \"\") exactly the row's amount. Comes with /~rest-compose. A read that fails, another block or another amount stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-86 (REST composition)."
+owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b."
+
+[[entry]]
+id = "ours-limit-edge"
+route = "*"
+json_path_glob = "/~ours-limit-edge"
+condition = "any"
+reason = "R-P5P9-86 (REST composition) with R-P5P9-72 (1): on an account or /v1/txs pair, a row only the oracle lists at or below ours' lowest height while ours held its known limit (or was cut at a page) is ours' limit, not evidence (CG-5 #1854: chainweb-data-only rows at ours' bottom boundary height). Comes with /~rest-compose. An oracle-only row above ours' lowest height, or with ours short of its limit, stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-86 (REST composition); R-P5P9-72 (1)."
+owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b."
+
+[[entry]]
+id = "kdatxs-edge-lag"
+route = "v1txs"
+json_path_glob = "/~kdatxs-edge-lag"
+condition = "any"
+reason = "R-P5P9-86 (v1txs at the recent-window edge; CG-5 #1871): ours' and kda-txs' rows do not overlap in height and kda-txs' rows end lower. Live: both sides are re-read once, 60 s later; explained as oracle lag when the re-read agrees on its (non-empty) height overlap, or shows the same no-overlap shape with kda-txs further on and every row of both first reads node-canonical (in its block on the node's /poll, that block canonical on the cut's branch). Stored (R-P5P9-87, the referee): every stored row of both sides is node-canonical, and a read of both sides now agrees on its non-empty overlap. Anything else stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-86 (v1txs edge); R-P5P9-87 (the stored form)."
+owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b; CG-5 REST v1txs (#1871)."

@@ -965,6 +965,16 @@ impl Ctx {
             }
         };
         let (mut va, mut vb) = (rows(&mut pa), rows(&mut pb));
+        // R-P5P9-86: ours' lowest height as fetched, for the row-by-row rules.
+        let lowest_a0 = min_height(&va);
+        // R-P5P9-86 v1txs: the two pages do not overlap in height and kda-txs' rows end lower
+        // (the first reads kept for the re-read's node check).
+        let edge_rows = (req.route == RouteKind::V1Txs
+            && tb.kind == crate::config::TargetKind::KdaTxs
+            && sa == 200
+            && sb == 200
+            && compose::edge_shape(&va, &vb))
+        .then(|| (va.clone(), vb.clone()));
         let page_cut = req.route.paginated()
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         // chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain:
@@ -1014,6 +1024,9 @@ impl Ctx {
         };
         let full_a0 = pa.truncated || page_cut || row_limit.is_none_or(|l| len_of(&va) >= l);
         let full_b0 = pb.truncated || page_cut || row_limit.is_none_or(|l| len_of(&vb) >= l);
+        // R-P5P9-72 (2): for R-P5P9-86's row-by-row rules, only a known limit (or a cut page)
+        // makes ours full.
+        let full_a_known = pa.truncated || page_cut || row_limit.is_some_and(|l| len_of(&va) >= l);
         let mut lag_rows = 0usize;
         // Replica pair (two kda-indexer targets): rows above the lower of the two tips minus
         // a margin are dropped (the sides read different tips and a chain can trail its
@@ -1378,6 +1391,28 @@ impl Ctx {
                 }
             }
         }
+        // R-P5P9-86 (REST records where several rules apply): when no single rule above took
+        // the record, its one-sided rows are settled row by row, each by one rule's check.
+        let mut composed: Vec<DiffEntry> = Vec::new();
+        if node_gap_pair
+            && sa == 200
+            && sb == 200
+            && gap_rows.is_empty()
+            && kt_gap.is_empty()
+            && node_gap.is_empty()
+            && window_cut == 0
+        {
+            let (mut ca, mut cb) = (va.clone(), vb.clone());
+            let kdatxs = tb.kind == crate::config::TargetKind::KdaTxs;
+            if let Ok(h) = self
+                .rest_compose(req, kdatxs, &mut ca, &mut cb, full_a_known, lowest_a0)
+                .await
+            {
+                va = ca;
+                vb = cb;
+                composed = h;
+            }
+        }
         // chainweb-data keeps rows of orphaned blocks: on /txs/txs it lists them beside the
         // canonical row, and its /txs/tx answers 404 when a request key has several rows.
         // A's row must be one of B's (the node pair checks that A's block is canonical); B's
@@ -1580,6 +1615,7 @@ impl Ctx {
                 b: None,
             });
         }
+        d.extend(composed);
         if !ev_gap.is_empty() {
             let first: Vec<Value> = ev_gap
                 .iter()
@@ -1711,6 +1747,23 @@ impl Ctx {
                     b: Some(json!(sb)),
                 },
             );
+        }
+        // R-P5P9-86 v1txs: a record the rules leave unexplained at the recent-window edge is
+        // re-read once, 60 s later.
+        if let Some((a0, b0)) = &edge_rows {
+            let (un, _) = self
+                .allow
+                .classify_request(&req.route, &req.path_and_query, &[], &d);
+            if !un.is_empty() {
+                if let Ok(ev) = self.v1txs_edge_live(req, ta, tb, a0, b0).await {
+                    d = vec![DiffEntry {
+                        path: compose::KDATXS_EDGE_LAG_PATH.into(),
+                        kind: DiffKind::Changed,
+                        a: Some(ev),
+                        b: None,
+                    }];
+                }
+            }
         }
         let curl_b = format!("curl -s {}", sh_url("B", &req.path_and_query));
         let b_body = paged_body(&pb);
@@ -3731,6 +3784,8 @@ fn same_decimal(a: &str, b: &str) -> bool {
     }
     norm(a) == norm(b)
 }
+
+mod compose;
 
 #[cfg(test)]
 mod mock_tests;
