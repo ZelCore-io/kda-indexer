@@ -2508,12 +2508,21 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
         }
         match canon(&vb[j]) {
             Canon::No => {
-                let class = match vj {
-                    Some(v) if v.why.contains(NOT_IN_NODE_TX) => NOT_IN_NODE_TX,
-                    _ => "orphan",
-                };
-                d.oracle
-                    .extend(g.iter().map(|&j| evidence(&p.b[j], vj, class)));
+                // R-P5P9-78 (H1 I-1): E's verdict is on g[0]'s content, so it holds only for
+                // the rows of the group with that content; a block verdict holds for the key.
+                let by_content = vj.is_some_and(|v| v.why.contains(NOT_IN_NODE_TX));
+                let class = if by_content { NOT_IN_NODE_TX } else { "orphan" };
+                for &k in g {
+                    if by_content && node_of(&p.b[k]) != node_of(rb) {
+                        d.undecided.push(format!(
+                            "an oracle row of other content under the same key and index, \
+                             not read on the node: {}",
+                            p.b[k].id.evidence()
+                        ));
+                    } else {
+                        d.oracle.push(evidence(&p.b[k], vj, class));
+                    }
+                }
             }
             Canon::Yes => {
                 let beyond = |h: u64, bd: u64| if w.asc { h > bd } else { h < bd };

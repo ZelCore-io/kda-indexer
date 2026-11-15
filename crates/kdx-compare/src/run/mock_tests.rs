@@ -6935,3 +6935,50 @@ async fn d3_s_node_balance_skew_is_the_event_net_of_one_or_two_blocks() {
     );
     assert!(skew(5, 10.0, "10.904046").await.is_err(), "ours at node_h");
 }
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-78 D4a: the harness findings of review-fvh-h1 and review-fvh-h2 (FVH-D4a).
+
+/// A transfer row at height 100 with sender, receiver, amount and the index `i`.
+fn d4a_irow(rk: &str, to: &str, amount: f64, i: i64) -> Value {
+    let mut e = h7_xrow(rk, 100, json!(amount), Some(("s", to)));
+    e["node"]["orderIndex"] = json!(i);
+    e
+}
+
+/// R-P5P9-78 (H1 I-1): E's verdict is per row, never shared by key and index. CASE1: the
+/// oracle lists tx e twice at index 0, another miner's gas row first and the node's own event
+/// 0 second; ours lacks e. The node's own row is not explained by the gas row's class. Two
+/// copies of the gas row both take E's class.
+#[tokio::test]
+async fn d4a_h1_i1_e_verdict_is_per_row_not_per_key_and_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x0", "e"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = d4a_irow("x0", "r", 1.0, 0);
+    let gas = d4a_irow("e", "miner2", 0.0000323, 0);
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), gas.clone(), d4a_irow("e", "r", 1.0, 0)],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "CASE1: {d:?} {note:?}");
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), gas.clone(), gas],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        format!("{d:?}").contains(crate::graphql_window::NOT_IN_NODE_TX),
+        "{d:?}"
+    );
+}
