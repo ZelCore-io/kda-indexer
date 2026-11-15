@@ -8316,6 +8316,13 @@ async fn e2_s_the_native_pair_rereads_a_gap_in_the_other_order() {
         "{:?}",
         rec.diff
     );
+    // R-P5P9-95 I-4: the re-read that still differs is kept as evidence.
+    let ev = rec
+        .diff
+        .iter()
+        .find(|e| e.path == "/~graphql-native-reread-differs")
+        .unwrap_or_else(|| panic!("the re-read's evidence: {:?}", rec.diff));
+    assert!(ev.a.is_some(), "{ev:?}");
 }
 
 /// R-P5P9-86 S′ with R-P5P9-87, stored: a CG-5 NodeBalance record (labelled `node`) is miner
@@ -8385,7 +8392,9 @@ async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
     let rep = e2_referee(cfg(), dir.path(), &[rec("10.904046")]).await;
     assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
     assert_eq!(rep.by_class.get("graphql-native-miner-skew"), Some(&1));
-    for native in ["12.712138", "10.5"] {
+    // R-P5P9-95 I-4: 9.095954 is GraphQL one coinbase above native (a skew leaves GraphQL
+    // below native only).
+    for native in ["12.712138", "10.5", "9.095954"] {
         let rep = e2_referee(cfg(), dir.path(), &[rec(native)]).await;
         assert_eq!(
             (rep.explained, rep.unexplained),
@@ -8393,4 +8402,14 @@ async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
             "{native}: {rep:?}"
         );
     }
+    // R-P5P9-95 I-4: a record whose live re-read still differed is refused.
+    let mut r = rec("10.904046");
+    r.diff.push(DiffEntry {
+        path: "/~graphql-native-reread-differs".into(),
+        kind: DiffKind::Changed,
+        a: Some(json!({"reread": "differs"})),
+        b: None,
+    });
+    let rep = e2_referee(cfg(), dir.path(), &[r]).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
 }

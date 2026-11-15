@@ -51,7 +51,8 @@ fn first_keys(rows: &[Value]) -> Vec<Value> {
 /// Two reads of one /v1/txs pair compared on their height overlap, as the compare does
 /// (normalized, numbers at f64 precision, a tx's events as a multiset). `Err`: no overlap,
 /// or a difference there.
-fn overlap_agrees(route: &RouteKind, a: &Value, b: &Value) -> Result<usize, String> {
+/// R-P5P9-95 I-3: or (`whole`) on every row of both reads.
+fn reads_agree(route: &RouteKind, a: &Value, b: &Value, whole: bool) -> Result<usize, String> {
     let (mut a, mut b) = (a.clone(), b.clone());
     normalize(route, &mut a);
     normalize(route, &mut b);
@@ -62,12 +63,14 @@ fn overlap_agrees(route: &RouteKind, a: &Value, b: &Value) -> Result<usize, Stri
     ) else {
         return Err("a side lists no row".into());
     };
-    if lo > hi {
+    if lo > hi && !whole {
         return Err(format!("the reads do not overlap in height ({lo} > {hi})"));
     }
-    for v in [&mut a, &mut b] {
-        if let Value::Array(x) = v {
-            x.retain(|r| row_height(r).is_some_and(|h| (lo..=hi).contains(&h)));
+    if !whole {
+        for v in [&mut a, &mut b] {
+            if let Value::Array(x) = v {
+                x.retain(|r| row_height(r).is_some_and(|h| (lo..=hi).contains(&h)));
+            }
         }
     }
     numbers_as_f64(&mut a);
@@ -76,12 +79,56 @@ fn overlap_agrees(route: &RouteKind, a: &Value, b: &Value) -> Result<usize, Stri
     let d = diff_route(route, &a, &b);
     if d.is_empty() {
         Ok(len_of(&a))
+    } else if whole {
+        Err(format!("the re-reads differ ({} entries)", d.len()))
     } else {
         Err(format!(
             "the reads differ on the overlap {lo}..={hi} ({} entries)",
             d.len()
         ))
     }
+}
+
+/// R-P5P9-95 I-3, live: the re-reads (`ra` ours, `rb` kda-txs) agree only when no row only
+/// kda-txs listed in the first reads (`va`, `vb`) is still listed by kda-txs' re-read while
+/// ours' re-read lacks it; and, when kda-txs' re-read reaches ours' top, on every row (else
+/// on their height overlap).
+fn reread_agrees(
+    route: &RouteKind,
+    (va, vb): (&Value, &Value),
+    ra: &Value,
+    rb: &Value,
+) -> Result<usize, String> {
+    let listed = |v: &Value, k: &RowKey| {
+        v.as_array()
+            .is_some_and(|x| x.iter().any(|r| row_key(r) == *k))
+    };
+    let still = only_keys_in_first(vb, va)
+        .iter()
+        .filter(|r| {
+            let k = row_key(r);
+            listed(rb, &k) && !listed(ra, &k)
+        })
+        .count();
+    if still > 0 {
+        return Err(format!(
+            "{still} rows only kda-txs listed at first are still in kda-txs' re-read and not \
+             in ours'"
+        ));
+    }
+    reads_agree(route, ra, rb, max_height(rb) >= max_height(ra))
+}
+
+/// RFC 3986 percent-encoding of a path segment (unreserved characters and `:` kept).
+fn pct_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                (b as char).to_string()
+            }
+            b => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 impl Ctx {
@@ -99,6 +146,7 @@ impl Ctx {
     ///
     /// Those rows leave both sides; shared rows' field differences stay for their own rules.
     /// Returns the hits, with `/~rest-compose` listing each rule and its rows.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn rest_compose(
         &self,
         req: &Request,
@@ -107,19 +155,40 @@ impl Ctx {
         vb: &mut Value,
         full_a: bool,
         lowest_a: Option<u64>,
+        horizon: Option<u64>,
     ) -> Result<Vec<DiffEntry>, String> {
         let only_a = only_keys_in_first(va, vb);
         let only_b = only_keys_in_first(vb, va);
         if only_a.is_empty() && only_b.is_empty() {
             return Err("no one-sided row".into());
         }
+        // R-P5P9-95 m-6: a row only ours lists that ours lists more than once settles nothing
+        // (each copy would pass the node check on its own).
+        let mut copies: HashMap<RowKey, usize> = HashMap::new();
+        for r in va.as_array().into_iter().flatten() {
+            *copies.entry(row_key(r)).or_default() += 1;
+        }
+        if only_a
+            .iter()
+            .any(|r| copies.get(&row_key(r)).copied() > Some(1))
+        {
+            return Err("a row only ours lists is listed more than once".into());
+        }
         let lowest = lowest_a;
         for r in &only_b {
             let h = row_height(r);
-            if !(full_a && matches!((h, lowest), (Some(h), Some(m)) if h <= m)) {
+            // R-P5P9-95 m-6: below ours' lowest height by position; at it, only inside the
+            // lag horizon (`horizon`: ours' tip less 1,440; `None`: never).
+            let placed = match (h, lowest) {
+                (Some(h), Some(m)) if h < m => true,
+                (Some(h), Some(m)) if h == m => horizon.is_some_and(|f| h >= f),
+                _ => false,
+            };
+            if !(full_a && placed) {
                 return Err(format!(
-                    "an oracle-only row at height {h:?} is not at or below ours' lowest \
-                     {lowest:?} with ours' limit held ({full_a})"
+                    "an oracle-only row at height {h:?} is not below ours' lowest {lowest:?} \
+                     (or at it inside the lag horizon from {horizon:?}) with ours' limit held \
+                     ({full_a})"
                 ));
             }
         }
@@ -336,8 +405,8 @@ impl Ctx {
         };
         let ra = read(self.fetch_a(req, ta).await)?;
         let rb = read(self.fetch_a(req, tb).await)?;
-        match overlap_agrees(&req.route, &ra, &rb) {
-            Ok(n) => Ok(json!({"reread": "agrees on the overlap", "rows": n})),
+        match reread_agrees(&req.route, (va, vb), &ra, &rb) {
+            Ok(n) => Ok(json!({"reread": "agrees", "rows": n})),
             Err(why) => {
                 let further = max_height(&rb) > max_height(vb);
                 if !(edge_shape(&ra, &rb) && further) {
@@ -357,7 +426,7 @@ impl Ctx {
 
     /// R-P5P9-92 (9), R-P5P9-93: the stored form's read of `t` now, one read of the run's
     /// budget (the referee's `--max-reads`) per page; past it, why, its own reason.
-    async fn read_now_charged(&self, req: &Request, t: &Target) -> Result<Value, String> {
+    async fn read_now_charged(&self, req: &Request, t: &Target) -> Result<(Value, bool), String> {
         let cap = || {
             format!(
                 "the run's read cap is reached before the re-read of {}",
@@ -379,16 +448,19 @@ impl Ctx {
         if p.pages.first().map(|c| c.status) != Some(200) {
             return Err("the read now did not answer 200".into());
         }
-        Ok(p.items)
+        Ok((p.items, p.truncated))
     }
 
     /// R-P5P9-86 v1txs with R-P5P9-87, the stored form: every stored row of both sides is
-    /// node-canonical, and a read of both sides now agrees on its overlap.
+    /// node-canonical. R-P5P9-95 I-3: and ours' window floor at the record's height (ours'
+    /// highest stored row) lies above every kda-txs-only row: ours' newest `limit` transfer
+    /// rows, coinbases included, read now from ours' `/txs/account` bounded by `maxheight`
+    /// (coin only). Ours with fewer rows has no floor, and a read the API does not bound by
+    /// height settles nothing.
     async fn v1txs_edge_stored(
         &self,
         req: &Request,
         ta: &Target,
-        tb: &Target,
         va: &Value,
         vb: &Value,
     ) -> Result<Value, String> {
@@ -398,12 +470,62 @@ impl Ctx {
             .flatten()
             .collect();
         self.rows_node_canonical(req, &rows).await?;
-        let ra = self.read_now_charged(req, ta).await?;
-        let rb = self.read_now_charged(req, tb).await?;
-        let n = overlap_agrees(&req.route, &ra, &rb)?;
+        let p = crate::via_cwd::parse(&req.path_and_query);
+        let limit = p.limit.map_err(|_| "the request's limit does not read")?;
+        if p.namespace != "coin" {
+            return Err(format!(
+                "ours' window floor is read for coin only, not {}",
+                p.namespace
+            ));
+        }
+        let top = max_height(va).ok_or("ours' stored page lists no row")?;
+        let floor_req = Request {
+            route: RouteKind::Account,
+            path_and_query: format!(
+                "/txs/account/{}?token=coin&limit={limit}&maxheight={top}",
+                pct_segment(&p.account)
+            ),
+            origin: crate::gen::Origin::Replay,
+            oracle: None,
+        };
+        let (now, cut) = self.read_now_charged(&floor_req, ta).await?;
+        let mut hs = Vec::new();
+        for r in now.as_array().into_iter().flatten() {
+            match row_height(r) {
+                Some(h) if h <= top => hs.push(h),
+                Some(h) => {
+                    return Err(format!(
+                        "ours' API did not bound the read at the record's height {top} (a row \
+                         at {h})"
+                    ))
+                }
+                None => return Err("a row of ours' window read has no height".into()),
+            }
+        }
+        hs.sort_unstable_by(|x, y| y.cmp(x));
+        let Some(&floor) = usize::try_from(limit)
+            .ok()
+            .and_then(|l| hs.get(l.checked_sub(1)?))
+        else {
+            return Err(format!(
+                "ours lists {} of {limit} rows up to the record's height{}: no window floor",
+                hs.len(),
+                if cut { " (the read was cut)" } else { "" }
+            ));
+        };
+        let only_b = only_keys_in_first(vb, va);
+        if let Some(r) = only_b
+            .iter()
+            .find(|r| row_height(r).is_none_or(|h| h >= floor))
+        {
+            return Err(format!(
+                "a kda-txs-only row at {:?} is not below ours' window floor {floor}",
+                row_height(r)
+            ));
+        }
         Ok(
             json!({"stored": "every row node-canonical", "nodeCanonical": rows.len(),
-            "readNow": "agrees on the overlap", "rows": n}),
+            "oursWindowFloor": floor, "recordHeight": top, "kdatxsOnly": only_b.len()}),
         )
     }
 
@@ -462,7 +584,7 @@ impl Ctx {
         let classify = |d: &[DiffEntry]| self.allow.classify_request(&route, &rec.request, &[], d);
         let mut why = Vec::new();
         if route == RouteKind::V1Txs && edge_shape(&raw_a, &raw_b) {
-            match self.v1txs_edge_stored(&req, ta, tb, &raw_a, &raw_b).await {
+            match self.v1txs_edge_stored(&req, ta, &raw_a, &raw_b).await {
                 Ok(ev) => {
                     let d = [DiffEntry {
                         path: KDATXS_EDGE_LAG_PATH.into(),
@@ -491,7 +613,7 @@ impl Ctx {
         let full_a = limit.is_some_and(|l| len_of(&raw_a) >= l);
         let lowest = min_height(&raw_a);
         let mut d = match self
-            .rest_compose(&req, kdatxs, &mut va, &mut vb, full_a, lowest)
+            .rest_compose(&req, kdatxs, &mut va, &mut vb, full_a, lowest, None)
             .await
         {
             Ok(h) => h,

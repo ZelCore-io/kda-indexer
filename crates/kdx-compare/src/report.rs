@@ -350,17 +350,44 @@ pub fn rotate_logs(out_dir: &Path, today: &str) -> anyhow::Result<Vec<(String, u
         );
         let zst_path = out_dir.join(format!("diffs-{date}.jsonl.zst"));
         let tmp = out_dir.join(format!("diffs-{date}.jsonl.zst.tmp"));
+        // R-P5P9-95 m-12: a day already rotated keeps its records: the raw file that
+        // reappeared is added as a second zstd frame, never written over them.
+        let old = match std::fs::read(&zst_path) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", zst_path.display())),
+        };
+        let mut want = match &old {
+            Some(b) => zstd::decode_all(b.as_slice())?,
+            None => Vec::new(),
+        };
+        want.extend_from_slice(&raw);
+        let mut whole = old.clone().unwrap_or_default();
+        whole.extend_from_slice(&zst);
         {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&zst)?;
+            f.write_all(&whole)?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &zst_path)?;
         anyhow::ensure!(
-            zstd::decode_all(std::fs::read(&zst_path)?.as_slice())? == raw,
+            zstd::decode_all(std::fs::read(&zst_path)?.as_slice())? == want,
             "{}: the written compressed log does not read back",
             zst_path.display()
         );
+        // R-P5P9-95 m-12: a record appended since the read stays: the raw file is removed only
+        // when it is the bytes compressed, else the day's `.zst` is put back as it was.
+        let now = std::fs::metadata(&raw_path)?.len();
+        if now != raw.len() as u64 {
+            match &old {
+                Some(b) => std::fs::write(&zst_path, b)?,
+                None => std::fs::remove_file(&zst_path)?,
+            }
+            anyhow::bail!(
+                "{}: the raw log grew while it was rotated; kept",
+                raw_path.display()
+            );
+        }
         std::fs::remove_file(&raw_path)?;
         let sum_path = out_dir.join(format!("summary-{date}.json"));
         let mut day: DailySummary = std::fs::read(&sum_path)
@@ -371,8 +398,8 @@ pub fn rotate_logs(out_dir: &Path, today: &str) -> anyhow::Result<Vec<(String, u
                 ..Default::default()
             });
         day.diff_log_bytes = [
-            ("raw".to_string(), raw.len() as u64),
-            ("zst".to_string(), zst.len() as u64),
+            ("raw".to_string(), want.len() as u64),
+            ("zst".to_string(), whole.len() as u64),
         ]
         .into_iter()
         .collect();
@@ -818,5 +845,25 @@ mod tests {
         assert_eq!(trim_escaped("a\u{1}b", 6), "a");
         assert_eq!(trim_escaped("aé", 2), "a");
         assert_eq!(trim_escaped("aé", 3), "aé");
+    }
+
+    /// R-P5P9-95 m-12: a past day's raw log that reappears after its rotation is added to
+    /// that day's `.zst`, never written over it.
+    #[test]
+    fn f_m12_rotation_never_drops_a_days_records() {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("diffs-2026-11-14.jsonl");
+        std::fs::write(&raw, "{\"a\":1}\n").unwrap();
+        rotate_logs(dir.path(), "2026-11-15").unwrap();
+        std::fs::write(&raw, "{\"a\":2}\n").unwrap();
+        rotate_logs(dir.path(), "2026-11-15").unwrap();
+        assert!(!raw.exists());
+        let lines: Vec<String> = open_log(&raw)
+            .unwrap()
+            .lines()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(lines, vec!["{\"a\":1}", "{\"a\":2}"]);
     }
 }

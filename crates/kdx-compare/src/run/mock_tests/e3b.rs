@@ -369,7 +369,12 @@ async fn e3b_the_v1txs_stored_reread_counts_in_max_reads() {
         async move {
             let dir = tempfile::tempdir().unwrap();
             let nu = node_server(super::e2b::v1_node(None)).await;
-            let au = super::e2b::reads_server(vec![Value::Array(all.clone())]).await;
+            // R-P5P9-95 I-3: ours' window floor above kda-txs' rows.
+            let au = super::e2b::paths_server(
+                Value::Array(all.clone()),
+                super::e2b::floor_rows(7_006_546, 10),
+            )
+            .await;
             let bu = super::e2b::reads_server(vec![Value::Array(all)]).await;
             let cfg = super::e2b::rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs");
             let rec = super::e2b::rest_record("v1txs", super::e2b::V1_REQ, &a0, &b0);
@@ -404,7 +409,14 @@ async fn e3b_the_harness_records_its_assets_at_start() {
     let nu = node_server(NodeMock::default()).await;
     let ops = c3_ops(dir.path());
     let cfg = c3_cfg(&nu, &nu, &nu, dir.path(), &ops, "");
-    let want = crate::assets::assets_line(&cfg.allowlist, &ops).unwrap();
+    // R-P5P9-95 m-13: with the config's field rules and replay documents.
+    let want = crate::assets::assets_line_with(
+        &cfg.allowlist,
+        &ops,
+        &cfg.graphql.field_rules,
+        cfg.replay.as_deref(),
+    )
+    .unwrap();
     let ctx = Ctx::new(cfg).await.unwrap();
     let got = ctx.summary.lock().unwrap().assets.clone();
     assert_eq!(got.into_iter().collect::<Vec<_>>(), vec![want]);
@@ -484,4 +496,196 @@ async fn e3b_diff_logs_rotate_daily_and_keep_every_record() {
     assert!(crate::report::rotate_logs(dir.path(), "2026-11-15")
         .unwrap()
         .is_empty());
+}
+
+/// R-P5P9-95 I-1: ours' rows above the oracle tip get the ours-only checks before they
+/// count in the walk. One above-tip row the node places but outside the query's account
+/// filter, and one above-tip row ours lists twice, each leave the count unexplained.
+#[tokio::test]
+async fn f_i1_rows_above_the_oracle_tip_get_the_ours_only_checks() {
+    let top = 7_000_001u64;
+    let bt = format!("B{top}");
+    for case in ["outside", "twice"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = node_of(&[("t2", 100), ("u0", top)], 0, &[]);
+        let mut u0 = xrow("u0", top, &bt);
+        let mut ours = vec![u0.clone()];
+        if case == "outside" {
+            u0["node"]["senderAccount"] = json!("x");
+            u0["node"]["receiverAccount"] = json!("y");
+            ours = vec![u0];
+            let (k, v) = h7_xfer_poll("u0", &bt, top, "x", "y", json!(1.5));
+            node.polls.insert(k, v);
+        } else {
+            ours.push(u0);
+        }
+        ours.push(xrow("t2", 100, "B100"));
+        let n = ours.len() as u64;
+        let nu = node_server(node).await;
+        let au = ours_fn_server(walk(ours.clone(), n)).await;
+        let bu = ours_fn_server(walk(vec![xrow("t2", 100, "B100")], 1)).await;
+        let ops = c3_ops(dir.path());
+        let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, ""))
+            .await
+            .unwrap();
+        let op = ctx.gql.ops.iter().find(|o| o.stem == "QH7").unwrap();
+        let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+        let vars = h7_vars(&[("accountName", json!("s")), ("first", json!(100))]);
+        let (mut a, mut b) = (
+            answer(page(ours, n, false)),
+            answer(page(vec![xrow("t2", 100, "B100")], 1, false)),
+        );
+        let (d, note) = ctx
+            .gql_rules(ta, H6::Live(tb), op, &vars, &mut a, &mut b, 7_000_000)
+            .await;
+        let un = c3_unexplained(&ctx, &d);
+        assert!(
+            un.contains(&"/data/transfers/totalCount".to_string()),
+            "{case}: {un:?} {d:?} {note:?}"
+        );
+    }
+}
+
+/// R-P5P9-95 m-5: ours' count must be ours' walked rows. Ours counts 3 and lists 2 (t2 and
+/// u1, u1 node-canonical and only ours'); the oracle counts 2 and lists t2. The counts and
+/// the one-sided rows differ by one each, but ours overcounts: unexplained.
+#[tokio::test]
+async fn f_m5_ours_count_is_ours_walked_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(node_of(&[("t2", 100), ("u1", 101)], 0, &[])).await;
+    let ours = vec![xrow("u1", 101, "B101"), xrow("t2", 100, "B100")];
+    let au = ours_fn_server(walk(ours.clone(), 3)).await;
+    let bu = ours_fn_server(walk(vec![xrow("t2", 100, "B100")], 2)).await;
+    let ops = c3_ops(dir.path());
+    let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, ""))
+        .await
+        .unwrap();
+    let op = ctx.gql.ops.iter().find(|o| o.stem == "QH7").unwrap();
+    let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+    let vars = h7_vars(&[("accountName", json!("s")), ("first", json!(100))]);
+    let mut d = vec![count_diff(3, 2)];
+    let mut note = None;
+    let mut st = Reads::default();
+    ctx.gql_count_walk(
+        ta,
+        tb,
+        op,
+        &vars,
+        &mut d,
+        &mut note,
+        7_000_000,
+        u64::MAX,
+        &mut st,
+    )
+    .await;
+    let un = c3_unexplained(&ctx, &d);
+    assert!(
+        un.contains(&"/data/transfers/totalCount".to_string()),
+        "{un:?} {d:?} {note:?}"
+    );
+}
+
+/// R-P5P9-95 m-10: the walk has a byte budget a side; past it, `count walk capped`.
+#[tokio::test]
+async fn f_m10_the_walk_has_a_byte_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(node_of(&[("t2", 100)], 0, &[])).await;
+    let big = "x".repeat(crate::graphql_window::COUNT_WALK_BYTES / 2);
+    let ours: Vec<Value> = (0..3)
+        .map(|i| {
+            let mut e = xrow("t2", 100, "B100");
+            e["node"]["pad"] = json!(format!("{i}{big}"));
+            e
+        })
+        .collect();
+    let au = ours_fn_server(walk(ours, 3)).await;
+    let bu = ours_fn_server(walk(vec![xrow("t2", 100, "B100")], 1)).await;
+    let ops = c3_ops(dir.path());
+    let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, ""))
+        .await
+        .unwrap();
+    let op = ctx.gql.ops.iter().find(|o| o.stem == "QH7").unwrap();
+    let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+    let vars = h7_vars(&[("accountName", json!("s")), ("first", json!(100))]);
+    let mut d = vec![count_diff(3, 1)];
+    let mut note = None;
+    let mut st = Reads::default();
+    ctx.gql_count_walk(
+        ta,
+        tb,
+        op,
+        &vars,
+        &mut d,
+        &mut note,
+        7_000_000,
+        u64::MAX,
+        &mut st,
+    )
+    .await;
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_window::COUNT_WALK_CAPPED_PATH),
+        "{d:?} {note:?}"
+    );
+    assert!(note.unwrap_or_default().contains("bytes"));
+}
+
+/// R-P5P9-95 m-8: S′'s stored height search must converge. Block times that jump between
+/// two hours before and after the record's time leave the search swinging between the tip
+/// and the genesis; the miner's coinbases near the tip then explain nothing.
+#[tokio::test]
+async fn f_m8_the_stored_height_search_must_converge() {
+    let dir = tempfile::tempdir().unwrap();
+    let base: u64 = 1_794_733_200;
+    let mut node = NodeMock {
+        tip: 110,
+        ..NodeMock::default()
+    };
+    for h in 0..=110u64 {
+        let t = if h > 50 { base + 3_600 } else { base - 3_600 };
+        node.headers.insert(
+            (0, h),
+            vec![json!({"hash": format!("H{h}"), "height": h, "chainId": 0,
+                "creationTime": t * 1_000_000, "payloadHash": format!("P{h}")})],
+        );
+        let miner = if h == 105 { "k:m" } else { "k:o" };
+        let cb = json!({"events": [{"name": "TRANSFER", "module": {"name": "coin"},
+            "params": ["", miner, 0.904046]}]})
+        .to_string();
+        node.payloads.insert(
+            format!("P{h}"),
+            json!({"transactions": [], "coinbase": kdx_types::hash::b64url_encode(cb.as_bytes())}),
+        );
+    }
+    let nu = node_server(node).await;
+    let ops = c3_ops(dir.path());
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compare/graphql/NodeBalance.graphql"),
+        ops.join("NodeBalance.graphql"),
+    )
+    .unwrap();
+    let cfg = c3_cfg(
+        &nu,
+        "http://127.0.0.1:9/graphql",
+        "https://oracle.invalid/graphql",
+        dir.path(),
+        &ops,
+        "",
+    );
+    let mut r = e2_stored(
+        "NodeBalance",
+        json!({"accountName": "k:m"}),
+        Value::Null,
+        Value::Null,
+        vec![DiffEntry {
+            path: "/chain0/balance".into(),
+            kind: DiffKind::Changed,
+            a: Some(json!("10.0")),
+            b: Some(json!("10.904046")),
+        }],
+    );
+    r.b_target = "node".into();
+    let rep = e2_referee(cfg, dir.path(), &[r]).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
 }

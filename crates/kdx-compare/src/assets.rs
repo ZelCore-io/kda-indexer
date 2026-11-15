@@ -42,6 +42,55 @@ pub fn assets_hash(allowlist: &Path, ops_dir: &Path) -> anyhow::Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// R-P5P9-95 m-13: [`assets_hash`] with the other explainers: the config's
+/// `[graphql] field_rules` (serialized) and the `replay` documents.
+pub fn assets_hash_with(
+    allowlist: &Path,
+    ops_dir: &Path,
+    rules: &[crate::config::FieldRule],
+    replay: Option<&Path>,
+) -> anyhow::Result<String> {
+    let mut h = Sha256::new();
+    h.update(assets_hash(allowlist, ops_dir)?.as_bytes());
+    h.update(b"\0field_rules\0");
+    h.update(serde_json::to_vec(rules)?);
+    if let Some(r) = replay {
+        let mut files: Vec<(String, std::path::PathBuf)> = if r.is_dir() {
+            std::fs::read_dir(r)
+                .with_context(|| format!("reading {}", r.display()))?
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| Some((e.file_name().into_string().ok()?, e.path())))
+                .collect()
+        } else {
+            vec![("replay".into(), r.to_path_buf())]
+        };
+        files.sort();
+        for (name, path) in files {
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            h.update(b"\0replay/");
+            h.update(name.as_bytes());
+            h.update([0]);
+            h.update(&bytes);
+        }
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// [`assets_line`] over [`assets_hash_with`] (R-P5P9-95 m-13): what the harness logs.
+pub fn assets_line_with(
+    allowlist: &Path,
+    ops_dir: &Path,
+    rules: &[crate::config::FieldRule],
+    replay: Option<&Path>,
+) -> anyhow::Result<String> {
+    Ok(format!(
+        "assets {} build {BUILD_SHA}",
+        assets_hash_with(allowlist, ops_dir, rules, replay)?
+    ))
+}
+
 /// The line the harness logs and the summary keeps: `assets <hash> build <sha>`.
 pub fn assets_line(allowlist: &Path, ops_dir: &Path) -> anyhow::Result<String> {
     Ok(format!(
@@ -94,5 +143,31 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare");
         let h = assets_hash(&root.join("allowlist.toml"), &root.join("graphql")).unwrap();
         assert_eq!(h.len(), 64);
+    }
+
+    /// R-P5P9-95 m-13: the field rules and the replay documents explain too, so they are
+    /// hashed.
+    #[test]
+    fn f_m13_the_hash_covers_field_rules_and_replay() {
+        use crate::config::{FieldRule, FieldRuleKind};
+        let dir = tempfile::tempdir().unwrap();
+        let (allow, ops, replay) = (
+            dir.path().join("allowlist.toml"),
+            dir.path().join("graphql"),
+            dir.path().join("replay"),
+        );
+        std::fs::create_dir_all(&ops).unwrap();
+        std::fs::create_dir_all(&replay).unwrap();
+        std::fs::write(&allow, "a").unwrap();
+        std::fs::write(replay.join("r1.txt"), "/txs/account/k:a").unwrap();
+        let rule = FieldRule::new("transfers.totalCount", FieldRuleKind::OracleCountsHeights);
+        let h = |rules: &[FieldRule]| {
+            assets_hash_with(&allow, &ops, rules, Some(replay.as_path())).unwrap()
+        };
+        let h0 = h(&[]);
+        let h1 = h(std::slice::from_ref(&rule));
+        assert_ne!(h0, h1);
+        std::fs::write(replay.join("r1.txt"), "/txs/account/k:b").unwrap();
+        assert_ne!(h(&[]), h0);
     }
 }

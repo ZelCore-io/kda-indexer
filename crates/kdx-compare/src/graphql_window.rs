@@ -90,6 +90,12 @@ pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
 pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
 /// R-P5P9-86 TC: rows a side the count walk reads at most.
 pub const COUNT_WALK_ROWS: usize = 5_000;
+/// R-P5P9-95 m-10: the count walk's byte budget a side (the rows' JSON text); past it,
+/// `count walk capped`.
+#[cfg(not(test))]
+pub const COUNT_WALK_BYTES: usize = 64 << 20;
+#[cfg(test)]
+pub const COUNT_WALK_BYTES: usize = 256 << 10;
 /// R-P5P9-92 (2): ours' rows above the oracle's height that the count walk polls at most.
 pub const ABOVE_TIP_ROWS: usize = 50;
 /// R-P5P9-93: the widest query window (in heights) whose node counts the walk reads.
@@ -722,6 +728,11 @@ fn bad_result_is(x: &Value, node: Option<&Value>) -> bool {
     if !(info(&ours) && info(node)) {
         return false;
     }
+    // R-P5P9-95 m-7: CG-5's evidence is ours "" against the node's text; nothing wider.
+    let oi = ours.get("info");
+    if !(oi == Some(&json!("")) || oi == node.get("info")) {
+        return false;
+    }
     let drop = |v: &Value| {
         let mut v = v.clone();
         if let Some(m) = v.as_object_mut() {
@@ -908,10 +919,21 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
         return Some("crossChainTransfer: no node event for the row".into());
     };
     let p = |e: &Value, i: usize| e.pointer(&format!("/params/{i}")).cloned();
-    let same = |e: &Value, i: usize| p(e, i).is_some() && p(e, i) == p(ev, i);
+    // R-P5P9-95 m-3: a marmalade TRANSFER (token, sender, receiver, amount) and a
+    // marmalade cross-chain event (token, sender, receiver, amount, target) are read past
+    // their token, and only against an event of the same token.
+    let o = transfer_offset(ev);
+    let xo = |e: &Value| match e.get("params").and_then(Value::as_array) {
+        Some(ps) if ps.len() == 5 => 1,
+        _ => 0,
+    };
+    let pe = |e: &Value, i: usize| p(e, i + xo(e));
+    let pt = |i: usize| p(ev, i + o);
+    let token = |e: &Value| xo(e) == o && (o == 0 || p(e, 0) == p(ev, 0));
+    let same = |e: &Value, i: usize| token(e) && pe(e, i).is_some() && pe(e, i) == pt(i);
     let amount = |e: &Value| {
-        p(e, 2)
-            .zip(p(ev, 2))
+        pe(e, 2)
+            .zip(pt(2))
             .is_some_and(|(a, b)| same_amount(&a, &b, false))
     };
     let name = |e: &Value| e.get("name").and_then(Value::as_str).map(str::to_string);
@@ -939,7 +961,7 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
         ));
     };
     let ok = |k: &str, i: usize| {
-        sel(x, k).is_none_or(|y| text(y).is_some() && text(y) == p(e, i).as_ref().and_then(text))
+        sel(x, k).is_none_or(|y| text(y).is_some() && text(y) == pe(e, i).as_ref().and_then(text))
     };
     if !ok("chainId", 3) {
         return Some("crossChainTransfer.chainId is not the node's target chain".into());
@@ -949,9 +971,11 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
     }
     // R-P5P9-86 T: the receiving half's sender is the sending half's receiver on the node,
     // the empty account of coin's `transfer-crosschain`.
-    let leg = p(ev, 1).as_ref().and_then(text);
+    // R-P5P9-95 m-2: that constant is coin's; another module's sender is refused.
+    let leg = pt(1).as_ref().and_then(text);
+    let coin = module_name(ev).as_deref() == Some("coin");
     if sel(x, "senderAccount")
-        .is_some_and(|y| text(y).is_none() || text(y) != leg || leg.as_deref() != Some(""))
+        .is_some_and(|y| !coin || text(y).is_none() || text(y) != leg || leg.as_deref() != Some(""))
     {
         return Some(
             "crossChainTransfer.senderAccount is not the node's (the sending leg's receiver)"
@@ -959,6 +983,34 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
         );
     }
     None
+}
+
+/// R-P5P9-86 T: whether the document `q` selects `... on ExecutionPayload` and
+/// `... on ContinuationPayload`. R-P5P9-95 m-1: `None` (unknown, so a bare payload is
+/// refused) when it holds a named spread (`...` and a name other than `on`) or a fragment
+/// on either member: the text does not show what those select.
+pub fn payload_members(q: &str) -> Option<(bool, bool)> {
+    let named = q.split("...").skip(1).any(|f| {
+        let id: String = f
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        !id.is_empty() && id != "on"
+    });
+    let on_member = q.split("fragment").skip(1).any(|f| {
+        let head = f.split('{').next().unwrap_or("");
+        head.contains("ExecutionPayload") || head.contains("ContinuationPayload")
+    });
+    if named || on_member {
+        return None;
+    }
+    let has = |m: &str| {
+        q.split("...")
+            .skip(1)
+            .any(|f| f.trim_start().starts_with(m))
+    };
+    Some((has("on ExecutionPayload"), has("on ContinuationPayload")))
 }
 
 /// R-P5P9-86 T: why ours' `cmd.payload` `m`, which selects no field of its member (only
@@ -2205,8 +2257,10 @@ impl Filter {
             }
             Some(Kind::Transfer) => {
                 if let Some(a) = &self.account {
-                    let from = field("senderAccount").or_else(|| param(0));
-                    let to = field("receiverAccount").or_else(|| param(1));
+                    // R-P5P9-95 m-3: a marmalade TRANSFER's accounts follow its token.
+                    let off = ev.map_or(0, transfer_offset);
+                    let from = field("senderAccount").or_else(|| param(off));
+                    let to = field("receiverAccount").or_else(|| param(off + 1));
                     if from.as_ref() != Some(a) && to.as_ref() != Some(a) {
                         return fail("account");
                     }
@@ -2296,8 +2350,12 @@ impl Filter {
             .filter(|e| transfer_matches(n, e, false))
             .filter(|e| {
                 self.account.as_ref().is_none_or(|a| {
-                    field("senderAccount").or_else(|| param(e, 0)).as_ref() == Some(a)
-                        || field("receiverAccount").or_else(|| param(e, 1)).as_ref() == Some(a)
+                    let off = transfer_offset(e);
+                    field("senderAccount").or_else(|| param(e, off)).as_ref() == Some(a)
+                        || field("receiverAccount")
+                            .or_else(|| param(e, off + 1))
+                            .as_ref()
+                            == Some(a)
                 })
             })
             .filter(|e| {
@@ -3369,14 +3427,7 @@ impl Ctx {
             return (Vec::new(), None);
         }
         let query = op.map(|o| o.query.as_str());
-        st.payload_members = query.map(|q| {
-            let has = |m: &str| {
-                q.split("...")
-                    .skip(1)
-                    .any(|f| f.trim_start().starts_with(m))
-            };
-            (has("on ExecutionPayload"), has("on ContinuationPayload"))
-        });
+        st.payload_members = query.and_then(payload_members);
         let first_var = arg_var(query, "first");
         let root = a.body.get("data").and_then(root_name);
         // R-P5P9-64 I-3, R-P5P9-67 I-A (a): a cut page of ours shorter than first × the pages
@@ -4108,6 +4159,16 @@ impl Ctx {
                                             .into());
                                     }
                                 }
+                                // R-P5P9-95 m-4: ours' rows past the prefix, by field.
+                                if let Some(f) = c["unchecked"].as_str() {
+                                    return Err(format!(
+                                        "ours' rows past the prefix select {f}, which the \
+                                         node check does not read"
+                                    ));
+                                }
+                                if let Some(cmds) = c["cmds"].as_array() {
+                                    prefix_cmds_match(&payload, cmds)?;
+                                }
                                 Ok(nk.len())
                             }),
                         }
@@ -4162,6 +4223,7 @@ impl Ctx {
         note: &mut Option<String>,
         max: u64,
         record_height: u64,
+        st: &mut Reads,
     ) {
         if d.iter().any(|e| {
             never_explained(&e.path)
@@ -4190,7 +4252,7 @@ impl Ctx {
             return;
         };
         let walked = self
-            .count_walk(ta, tb, op, vars, &root, (na, nb), max, record_height)
+            .count_walk(ta, tb, op, vars, &root, (na, nb), max, record_height, st)
             .await;
         let why = match walked {
             Ok(hits) => {
@@ -4221,6 +4283,7 @@ impl Ctx {
         (na, nb): (u64, u64),
         max: u64,
         record_height: u64,
+        st: &mut Reads,
     ) -> Result<Vec<DiffEntry>, (bool, String)> {
         let q = Some(op.query.as_str());
         let (fv, av) = (arg_var(q, "first"), arg_var(q, "after"));
@@ -4250,16 +4313,41 @@ impl Ctx {
                 _ => wa_below.push(e),
             }
         }
-        let mut st = Reads::default();
+        // R-P5P9-95 m-9: the compare's reads (H7's among them), under its one cap.
         let n_above = above.len() as i64;
+        let (la, lb) = (wa_below.len() as i64, wb.len() as i64);
+        // R-P5P9-95 m-5: ours' count is ours' walked rows (an overcount of ours stays a
+        // diff, R-P5P9-78 H2 I-4).
+        if na as i64 != la + n_above {
+            return Err((
+                false,
+                format!(
+                    "count walk: ours counts {na} and lists {la} rows plus {n_above} above the \
+                     oracle's height"
+                ),
+            ));
+        }
         if !above.is_empty() {
-            self.above_tip_rows(ta, root, max, &above, &mut st).await?;
+            self.above_tip_rows(ta, root, max, &above, st).await?;
+            // R-P5P9-95 I-1: and each gets the checks an ours-only row gets.
+            let rows: Vec<Value> = above.iter().map(|(_, e)| e.clone()).collect();
+            if let Err(w) = self
+                .above_tip_checks(ta, op, vars, root, &rows, &wa_below, st)
+                .await
+            {
+                return Err((
+                    false,
+                    format!(
+                        "count walk: a row of ours above the oracle's height {max} is not \
+                         settled as an ours-only row: {w}"
+                    ),
+                ));
+            }
         }
         let walked: Vec<Option<u64>> = wa_below
             .iter()
             .map(|e| prepared_id(e, root).height)
             .collect();
-        let (la, lb) = (wa_below.len() as i64, wb.len() as i64);
         let page = |edges: Vec<Value>, n: u64| Answer {
             body: json!({"data": {root: {"totalCount": n,
                 "pageInfo": {"hasNextPage": false, "hasPreviousPage": false},
@@ -4270,7 +4358,7 @@ impl Ctx {
         };
         let (mut a, mut b) = (page(wa_below, na), page(wb, nb));
         let (h7, h7_note) = self
-            .gql_window_referee(ta, Some(op), vars, &mut a, &mut b, max, false, &mut st)
+            .gql_window_referee(ta, Some(op), vars, &mut a, &mut b, max, false, st)
             .await;
         if let Some(n) = h7_note {
             return Err((false, format!("count walk: {n}")));
@@ -4299,7 +4387,7 @@ impl Ctx {
         // node's per-height counts over it: the ACCEPTED oracle-counts-heights predicate.
         let heights_why = if na != nb && n_above == 0 {
             match self
-                .window_heights(op, vars, root, (na, nb), &walked, &mut st)
+                .window_heights(op, vars, root, (na, nb), &walked, st)
                 .await
             {
                 Ok(node) => {
@@ -4402,6 +4490,83 @@ impl Ctx {
         Ok(node)
     }
 
+    /// R-P5P9-95 I-1: ours' rows `above` the oracle's tip are ours-only rows: each gets the
+    /// checks [`decide`] gives one (its identity, `unchecked_field`, `cmd` and
+    /// `creationTime` against the node, `result.block.canonical`, `crossChainTransfer`, the
+    /// query's filter with U's signers, and duplicates), and none shares its identity with
+    /// a row of ours `below` the tip. `Err`: why not.
+    #[allow(clippy::too_many_arguments)]
+    async fn above_tip_checks(
+        &self,
+        ta: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        above: &[Value],
+        below: &[Value],
+        st: &mut Reads,
+    ) -> Result<(), String> {
+        let q = op.query.as_str();
+        let (field, aliases) =
+            root_selection(q, root).unwrap_or_else(|| (root.to_string(), Vec::new()));
+        if !aliases.is_empty() {
+            return Err(format!(
+                "the row selection has an alias ({})",
+                aliases.join(", ")
+            ));
+        }
+        let conn = |rows: Vec<Value>| json!({"edges": rows, "pageInfo": {"hasNextPage": false}});
+        let empty = conn(Vec::new());
+        let mut all = below.to_vec();
+        all.extend(above.iter().cloned());
+        let whole = prepare_in(&conn(all), &empty, &field)?;
+        let (lo, hi) = whole.a.split_at(below.len());
+        if let Some(r) = hi.iter().find(|r| lo.iter().any(|x| x.key == r.key)) {
+            return Err(format!(
+                "ours also lists it below the oracle's height: {}",
+                r.id.evidence()
+            ));
+        }
+        let mut prep = prepare_in(&conn(above.to_vec()), &empty, &field)?;
+        prep.rules = self.cfg.graphql.field_rules.clone();
+        prep.root = root.to_string();
+        st.payload_members = payload_members(q);
+        let filter = Filter::of(Some(q), Some(root), vars);
+        let mut va = Vec::new();
+        for r in &prep.a {
+            let mut v = self.h7_verdict(ta, r, false, st).await;
+            self.h7_cmd_check(r, &mut v, st).await;
+            self.h7_ctime_check(r, &mut v, st).await;
+            self.h7_branch_check(r, &mut v, st).await;
+            self.h7_signers_check(r, &mut v, &filter, st).await;
+            va.push(Some(v));
+        }
+        let w = Window {
+            max: u64::MAX,
+            asc: root == "blocksFromHeight",
+            filter: &filter,
+            prefix: None,
+        };
+        let d = decide(&prep, &va, &[], &w);
+        let mut whys = d.undecided.clone();
+        whys.extend(d.rejected.iter().map(|x| x.2.clone()));
+        if !d.grouped {
+            whys.push("its rows do not group".into());
+        }
+        if whys.is_empty() && d.ours.len() != prep.a.len() {
+            whys.push(format!(
+                "{} of its {} rows settled",
+                d.ours.len(),
+                prep.a.len()
+            ));
+        }
+        if whys.is_empty() {
+            Ok(())
+        } else {
+            Err(whys.join("; "))
+        }
+    }
+
     /// R-P5P9-92 (2): ours' rows above the oracle's height `max` (`(height, row)`), each
     /// node-canonical by `/poll`: the node places its key at the row's height, in the block
     /// that is the canonical header there on the cut's branch. More than [`ABOVE_TIP_ROWS`]
@@ -4472,6 +4637,7 @@ impl Ctx {
         let fail = |why: &str| (false, format!("count walk: {} {why}", t.name));
         let mut out: Vec<Value> = Vec::new();
         let mut after: Option<String> = None;
+        let mut bytes = 0usize;
         loop {
             // R-P5P9-92 (9): each page of ours' or the oracle's is one read of the run's
             // budget (the referee's `--max-reads`; unbounded live), its own reason past it.
@@ -4504,6 +4670,17 @@ impl Ctx {
                 .and_then(Value::as_array)
                 .ok_or_else(|| fail("answered a page without edges"))?;
             out.extend(edges.iter().cloned());
+            // R-P5P9-95 m-10: a byte budget a side, as the rows' JSON text.
+            bytes += edges.iter().map(|e| e.to_string().len()).sum::<usize>();
+            if bytes > COUNT_WALK_BYTES {
+                return Err((
+                    true,
+                    format!(
+                        "count walk capped: {} lists more than {COUNT_WALK_BYTES} bytes",
+                        t.name
+                    ),
+                ));
+            }
             if out.len() > COUNT_WALK_ROWS {
                 return Err((
                     true,
@@ -4552,9 +4729,14 @@ impl Ctx {
         let (Some(x), Some(y)) = (fixed(ours), fixed(native)) else {
             return Err("a balance is not a decimal".into());
         };
-        let gap = (y - x).abs();
+        // R-P5P9-95 I-4: the live pair reads GraphQL first, so a skew leaves GraphQL below
+        // native only: native − GraphQL = +k × reward.
+        let gap = y - x;
         if gap == 0 {
             return Err("no gap".into());
+        }
+        if gap < 0 {
+            return Err("GraphQL is above native; a skew leaves it below".into());
         }
         self.h7_take(&mut st)?;
         let tip = self
@@ -4568,6 +4750,8 @@ impl Ctx {
             .ok_or("the cut lacks the chain")?;
         // The height whose block time is nearest `ts`, by steps of 30 s a block.
         let mut h = tip;
+        // R-P5P9-95 m-8: the search must converge (within a block of `ts`).
+        let mut converged = false;
         for _ in 0..6 {
             let hd = self
                 .h7_canonical(chain, h, &mut st)
@@ -4580,9 +4764,13 @@ impl Ctx {
                 / 1_000_000;
             let dh = (t as i64 - ts as i64) / 30;
             if dh.abs() <= 1 {
+                converged = true;
                 break;
             }
             h = (h as i64 - dh).clamp(0, tip as i64) as u64;
+        }
+        if !converged {
+            return Err("the height search did not converge on the record's time".into());
         }
         let mut paid: Vec<(u64, i128)> = Vec::new();
         for hh in h.saturating_sub(SKEW_WINDOW)..=(h + SKEW_WINDOW).min(tip) {
@@ -5357,6 +5545,42 @@ pub fn payload_data_txs(v: &Value) -> Vec<(String, Option<u8>, String)> {
     out
 }
 
+/// R-P5P9-95 m-4: ours' rows' `cmd` subtrees `cmds` matched one to one (a multiset) with
+/// the signed commands of the node's block `payload`, each by [`cmd_mismatch`] after
+/// [`unchecked_field`]. `Err`: why not.
+fn prefix_cmds_match(payload: &Value, cmds: &[Value]) -> Result<(), String> {
+    let mut node: Vec<Option<Value>> = payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("the payload holds no transaction list")?
+        .iter()
+        .map(|t| {
+            let raw = kdx_types::hash::b64url_decode(t.get(0)?.as_str()?).ok()?;
+            let w: Value = serde_json::from_slice(&raw).ok()?;
+            serde_json::from_str(w.get("cmd")?.as_str()?).ok()
+        })
+        .collect();
+    for c in cmds {
+        if let Some(f) = unchecked_field(Some(Kind::Tx), &json!({ "cmd": c })) {
+            return Err(format!("a row past the prefix: unchecked field: {f}"));
+        }
+        let hit = node
+            .iter()
+            .position(|n| n.as_ref().is_some_and(|n| cmd_mismatch(c, n).is_none()));
+        match hit {
+            Some(i) => node[i] = None,
+            None => {
+                return Err(
+                    "a row past the prefix whose cmd is no unmatched command of the \
+                    node's block"
+                        .into(),
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The node's command for `rk` (decoded) from its block's payload with outputs.
 pub fn node_cmd(payload: &Value, rk: &str) -> Option<Value> {
     payload
@@ -5818,7 +6042,9 @@ mod tests {
     #[test]
     fn e2_t_cross_chain_sender_is_the_sending_legs_receiver() {
         let mut v = Verdict::new(Canon::Yes, Some(10), Some("B".into()), "placed");
-        v.event = Some(json!({"name": "TRANSFER", "params": ["s", "", 1.0]}));
+        // R-P5P9-95 m-2: coin's transfer (the node's events name their module).
+        v.event = Some(json!({"name": "TRANSFER", "module": {"name": "coin"},
+            "params": ["s", "", 1.0]}));
         v.xchain = vec![json!({"name": "TRANSFER_XCHAIN", "params": ["s", "r", 1.0, "2"]})];
         let x = |sender: &str| {
             json!({"chainId": "2", "receiverAccount": "r",
@@ -6085,5 +6311,57 @@ mod tests {
             root_args("{ x: transfers(first: 1) { a } }", "transfers"),
             None
         );
+    }
+
+    /// R-P5P9-95 m-1: a named spread (or a fragment on a payload member) hides which member
+    /// the document selects: unknown, so a bare payload is refused.
+    #[test]
+    fn f_m1_named_spreads_leave_the_payload_members_unknown() {
+        let inline = "query Q { transactions { edges { node { cmd { payload { \
+                      ... on ContinuationPayload { pactId } } } } } } }";
+        assert_eq!(payload_members(inline), Some((false, true)));
+        let named = "query Q { transactions { edges { node { cmd { payload { \
+                     ... on ContinuationPayload { pactId } ...ExecFields } } } } } } \
+                     fragment ExecFields on ExecutionPayload { code }";
+        assert_eq!(payload_members(named), None);
+    }
+
+    /// R-P5P9-95 m-2: `crossChainTransfer.senderAccount` is checked only for coin's
+    /// transfer; another module's is refused.
+    #[test]
+    fn f_m2_cross_chain_sender_only_for_coin() {
+        let mut v = Verdict::new(Canon::Yes, Some(10), Some("B".into()), "placed");
+        v.event = Some(json!({"name": "TRANSFER", "module": {"name": "coin"},
+            "params": ["s", "", 1.0]}));
+        v.xchain = vec![json!({"name": "TRANSFER_XCHAIN", "params": ["s", "r", 1.0, "2"]})];
+        let x = json!({"chainId": "2", "receiverAccount": "r", "senderAccount": ""});
+        assert_eq!(xchain_mismatch(&x, &v), None);
+        v.event = Some(json!({"name": "TRANSFER", "module": {"name": "my-token"},
+            "params": ["s", "", 1.0]}));
+        let why = xchain_mismatch(&x, &v).unwrap_or_default();
+        assert!(why.contains("senderAccount"), "{why}");
+    }
+
+    /// R-P5P9-95 m-3: a marmalade TRANSFER (token, sender, receiver, amount) is read past its
+    /// token: a null `crossChainTransfer` is refused when the node's tx holds the
+    /// TRANSFER_XCHAIN for it.
+    #[test]
+    fn f_m3_marmalade_transfers_in_the_cross_chain_check() {
+        let mut v = Verdict::new(Canon::Yes, Some(10), Some("B".into()), "placed");
+        v.event = Some(json!({"name": "TRANSFER", "params": ["t:1", "s", "", 1.0]}));
+        v.xchain = vec![json!({"name": "TRANSFER_XCHAIN",
+            "params": ["t:1", "s", "r", 1.0, "2"]})];
+        let why = xchain_mismatch(&Value::Null, &v).unwrap_or_default();
+        assert!(why.contains("crossChainTransfer is null"), "{why}");
+    }
+
+    /// R-P5P9-95 m-7: NC's equivalence takes ours' `info` "" or the node's text, nothing else.
+    #[test]
+    fn f_m7_bad_result_info_is_empty_or_the_nodes() {
+        let node = json!({"message": "m", "info": "<toplevel>:0"});
+        let ours = |info: &str| json!({"message": "m", "info": info}).to_string();
+        assert!(bad_result_is(&json!(ours("")), Some(&node)));
+        assert!(bad_result_is(&json!(ours("<toplevel>:0")), Some(&node)));
+        assert!(!bad_result_is(&json!(ours("other")), Some(&node)));
     }
 }

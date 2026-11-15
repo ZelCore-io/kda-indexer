@@ -396,15 +396,36 @@ async fn settle(ctx: &Ctx, rec: &DiffRecord) -> Result<Settled, String> {
     // the rows. Ours' rows above it are newer than the record.
     let record_height = crate::graphql_window::highest_row(&a.body).unwrap_or(max);
     // The live compare's rules with the document (R-P5P9-65 (1)); H6 from the stored diff.
+    // R-P5P9-95 m-9: the rules and the count walk share the compare's reads and cap.
+    let mut st = crate::graphql_window::Reads::default();
     let (mut d, mut note) = ctx
-        .gql_rules(ta, H6::Stored(&rec.diff), op, &vars, &mut a, &mut b, max)
+        .gql_rules_st(
+            ta,
+            H6::Stored(&rec.diff),
+            op,
+            &vars,
+            &mut a,
+            &mut b,
+            max,
+            &mut st,
+        )
         .await;
     // R-P5P9-86 TC with R-P5P9-87: a count-only record walks ours bounded at the record's
     // height, and the oracle as it is now (frozen); ours' rows between the oracle's height
     // and the record's are polled node-canonical (R-P5P9-92 (2)).
     if let Some(tb) = ctx.targets.get(&rec.b_target) {
-        ctx.gql_count_walk(ta, tb, op, &vars, &mut d, &mut note, max, record_height)
-            .await;
+        ctx.gql_count_walk(
+            ta,
+            tb,
+            op,
+            &vars,
+            &mut d,
+            &mut note,
+            max,
+            record_height,
+            &mut st,
+        )
+        .await;
     }
     // R-P5P9-86 (P, Q): the live run's request text, so the KNOWN-GAP entries scoped by
     // operation and account read as they do live.
@@ -480,6 +501,14 @@ async fn settle_native(
         .get("accountName")
         .and_then(Value::as_str)
         .ok_or("no accountName")?;
+    // R-P5P9-95 I-4: the live re-read disproved skew; nothing is settled (no read).
+    if rec
+        .diff
+        .iter()
+        .any(|e| e.path == crate::graphql::NATIVE_REREAD_DIFFERS_PATH)
+    {
+        return Ok((rec.diff.clone(), Vec::new()));
+    }
     let ts = ts_secs(&rec.ts).ok_or("the record's time does not read")?;
     let mut d = Vec::new();
     for e in &rec.diff {

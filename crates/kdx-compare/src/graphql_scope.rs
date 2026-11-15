@@ -301,11 +301,38 @@ fn prefix_candidate(
                 .cloned()
         })
         .collect();
+    // R-P5P9-95 m-4: ours' rows past the oracle's prefix are only ours' word. Each must
+    // select only fields the node check reads (its key, `cmd`, `__typename`), and its `cmd`
+    // (when selected, on every row) is matched against the block's commands.
+    let past = &ra[rb.len()..];
+    let mut cmds = Vec::new();
+    let mut unchecked: Option<String> = None;
+    for e in past {
+        let Some(n) = e.get("node").and_then(Value::as_object) else {
+            unchecked = Some("node".into());
+            break;
+        };
+        if let Some(k) = n.iter().find_map(|(k, v)| match k.as_str() {
+            "hash" | "requestKey" | "cmd" => None,
+            "__typename" if v.as_str() == Some("Transaction") => None,
+            _ => Some(k.clone()),
+        }) {
+            unchecked = Some(k);
+            break;
+        }
+        if let Some(c) = n.get("cmd") {
+            cmds.push(c.clone());
+        }
+    }
+    if unchecked.is_none() && !cmds.is_empty() && cmds.len() != past.len() {
+        unchecked = Some("cmd (not on every row)".into());
+    }
     Some(
         json!({"list": p, "why": "a cut nested list of the oracle's that is ours' prefix, \
         not yet checked on the node", "prefix": {"rows": rb.len(), "of": ra.len(),
         "chain": chain, "height": height, "hash": hash,
-        "keys": (keys.len() == ra.len()).then_some(keys)}}),
+        "keys": (keys.len() == ra.len()).then_some(keys),
+        "unchecked": unchecked, "cmds": (!cmds.is_empty()).then_some(cmds)}}),
     )
 }
 

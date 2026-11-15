@@ -1011,6 +1011,9 @@ pub fn compare_answers_with(
 /// a re-read in the other order agrees; stored, the gap is 1 to 3 of the chain's coinbase
 /// rewards and the node shows the account receiving that many in the record's height window.
 pub const NATIVE_SKEW_PATH: &str = "/~graphql-native-miner-skew";
+/// R-P5P9-95 I-4: the native pair's live re-read still differs (the re-read's values); no
+/// allowlist entry, and the referee refuses a stored record that carries it.
+pub const NATIVE_REREAD_DIFFERS_PATH: &str = "/~graphql-native-reread-differs";
 
 /// Why a follow page fails the whole fetch (R-P5P9-64 I-3): a status other than 200,
 /// GraphQL `errors`, no `data` or no root connection. Such a page is never read as a cut page.
@@ -1674,6 +1677,25 @@ impl Ctx {
         b: &mut Answer,
         max: u64,
     ) -> (Vec<DiffEntry>, Option<String>) {
+        let mut st = crate::graphql_window::Reads::default();
+        self.gql_rules_st(ta, h6, op, vars, a, b, max, &mut st)
+            .await
+    }
+
+    /// [`Ctx::gql_rules`] on the compare's reads `st` (R-P5P9-95 m-9: the referee's count
+    /// walk takes the same reads).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_rules_st(
+        &self,
+        ta: &Target,
+        h6: H6<'_>,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        st: &mut crate::graphql_window::Reads,
+    ) -> (Vec<DiffEntry>, Option<String>) {
         let root_scoped = crate::graphql_scope::root_scoped(&op.roots, vars);
         let mut row_hits = self.gql_row_rules(ta, vars, a, b).await;
         let live_tb = match &h6 {
@@ -1698,8 +1720,9 @@ impl Ctx {
                 .collect(),
         };
         // R-P5P9-62: H7 and the diff.
+        // R-P5P9-95 m-9: one compare, one node read cap: the count walk shares H7's reads.
         let (mut d, mut note) = self
-            .gql_settle_op(ta, Some(op), vars, a, b, max, root_scoped)
+            .gql_settle_op_st(ta, Some(op), vars, a, b, max, root_scoped, st)
             .await;
         d.extend(h6);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
@@ -1711,7 +1734,7 @@ impl Ctx {
         // R-P5P9-86 TC: live, both lists are walked to the end (the referee walks ours
         // bounded, R-P5P9-87).
         if let Some(tb) = live_tb {
-            self.gql_count_walk(ta, tb, op, vars, &mut d, &mut note, max, u64::MAX)
+            self.gql_count_walk(ta, tb, op, vars, &mut d, &mut note, max, u64::MAX, st)
                 .await;
         }
         (d, note)
@@ -1740,6 +1763,7 @@ impl Ctx {
     /// (R-P5P9-64, I-1) and the filter's variables (R-P5P9-63 (1)). Without it an oracle-only
     /// row at our boundary height is not excused. H8, the `payload.data` matcher and H7 share
     /// one node read cap (R-P5P9-63 (4)).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn gql_settle_op(
         &self,
@@ -1752,15 +1776,32 @@ impl Ctx {
         root_scoped: bool,
     ) -> (Vec<DiffEntry>, Option<String>) {
         let mut st = crate::graphql_window::Reads::default();
+        self.gql_settle_op_st(ta, op, vars, a, b, max, root_scoped, &mut st)
+            .await
+    }
+
+    /// [`Ctx::gql_settle_op`] on the compare's reads `st` (R-P5P9-95 m-9).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_settle_op_st(
+        &self,
+        ta: &Target,
+        op: Option<&GqlOp>,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        root_scoped: bool,
+        st: &mut crate::graphql_window::Reads,
+    ) -> (Vec<DiffEntry>, Option<String>) {
         // H8 first: the oracle's transfer rows take the node's indexes, so H7 matches them.
-        let h8 = self.gql_transfer_order(ta, a, b, &mut st).await;
-        let data = self.gql_payload_data(vars, a, b, &mut st).await;
+        let h8 = self.gql_transfer_order(ta, a, b, st).await;
+        let data = self.gql_payload_data(vars, a, b, st).await;
         // R-P5P9-75 O: H8 on nested transfer lists; J, K, L: tx fields against the node's
         // command.
-        let nested = self.gql_nested_transfer_order(vars, a, b, &mut st).await;
-        let cmd_fields = self.gql_node_cmd_fields(vars, a, b, &mut st).await;
+        let nested = self.gql_nested_transfer_order(vars, a, b, st).await;
+        let cmd_fields = self.gql_node_cmd_fields(vars, a, b, st).await;
         let (h7, note) = self
-            .gql_window_referee(ta, op, vars, a, b, max, root_scoped, &mut st)
+            .gql_window_referee(ta, op, vars, a, b, max, root_scoped, st)
             .await;
         let mut d = compare_answers_with(
             a,
@@ -1771,9 +1812,9 @@ impl Ctx {
             root_scoped,
         );
         // R-P5P9-86 X: ours' amount text against the node's TRANSFER event.
-        self.gql_decimal_zeros(&mut d, &mut st).await;
+        self.gql_decimal_zeros(&mut d, st).await;
         // R-P5P9-88 (G): cut nested lists by prefix, ours' rows against the node's payload.
-        self.gql_h6_prefix(&mut d, &mut st).await;
+        self.gql_h6_prefix(&mut d, st).await;
         d.extend(h8);
         d.extend(data);
         d.extend(nested);
@@ -3067,6 +3108,20 @@ impl Ctx {
                     a: Some(json!({"first": first, "reread": "agrees", "chains": gaps})),
                     b: None,
                 }];
+            } else {
+                // R-P5P9-95 I-4: the re-read that still differs is the record's evidence (no
+                // allowlist entry); the referee refuses a record that carries it.
+                let reread: Vec<Value> = gaps
+                    .iter()
+                    .zip(&native)
+                    .map(|(c, n)| json!({"chain": c, "native": n, "graphql": ours(c)}))
+                    .collect();
+                d.push(DiffEntry {
+                    path: NATIVE_REREAD_DIFFERS_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: Some(json!({ "reread": reread })),
+                    b: None,
+                });
             }
         }
         // R-P5P9-86 S′: the pair's B is the native target, not the node.

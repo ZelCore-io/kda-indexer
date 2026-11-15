@@ -83,6 +83,92 @@ pub fn verdict(start: u64, samples: &[Sample]) -> Result<String, String> {
     }
 }
 
+/// R-P5P9-95 m-11: the line's span. `starts`: the process start and each restart (each
+/// begins its own warm-up and baseline); `end`: the close; `interval`: the sampler's
+/// interval in seconds.
+#[derive(Debug, Clone)]
+pub struct Line {
+    pub starts: Vec<u64>,
+    pub end: u64,
+    pub interval: u64,
+}
+
+/// The verdict over `line`: each run (from a start to the next start, the last to the
+/// close) is judged by [`verdict`] on its own samples, after its own warm-up. The line is
+/// measured only when, in each run, the samples after its warm-up begin within two
+/// intervals of it, have no gap over two intervals, and (the last run) reach within two
+/// intervals of the close; else it fails as not measured.
+pub fn verdict_line(line: &Line, samples: &[Sample]) -> Result<String, String> {
+    let iso = crate::report::iso_secs;
+    let mut starts = line.starts.clone();
+    starts.sort_unstable();
+    starts.dedup();
+    if starts.is_empty() {
+        return Err("leak line: FAIL, no start".into());
+    }
+    let slack = 2 * line.interval.max(1);
+    let mut texts = Vec::new();
+    let mut failed = false;
+    for (i, &s) in starts.iter().enumerate() {
+        let until = starts.get(i + 1).copied().unwrap_or(line.end);
+        let run: Vec<Sample> = samples
+            .iter()
+            .copied()
+            .filter(|(t, _)| {
+                *t >= s && *t < until.max(s + 1) || (i + 1 == starts.len() && *t == until)
+            })
+            .collect();
+        let from = s + WARM_UP_SECS;
+        if from >= until {
+            texts.push(format!("run from {}: ends inside its warm-up", iso(s)));
+            continue;
+        }
+        let after: Vec<u64> = run.iter().map(|x| x.0).filter(|t| *t >= from).collect();
+        let mut gaps = Vec::new();
+        match (after.first(), after.last()) {
+            (Some(&f), Some(&l)) => {
+                if f > from + slack {
+                    gaps.push((from, f));
+                }
+                gaps.extend(
+                    after
+                        .windows(2)
+                        .filter(|w| w[1] - w[0] > slack)
+                        .map(|w| (w[0], w[1])),
+                );
+                if until > l + slack {
+                    gaps.push((l, until));
+                }
+            }
+            _ => gaps.push((from, until)),
+        }
+        if let Some((a, b)) = gaps.first() {
+            failed = true;
+            texts.push(format!(
+                "run from {}: not measured from {} to {} (more than two intervals of {} s)",
+                iso(s),
+                iso(*a),
+                iso(*b),
+                line.interval
+            ));
+            continue;
+        }
+        match verdict(s, &run) {
+            Ok(t) => texts.push(format!("run from {}: {t}", iso(s))),
+            Err(t) => {
+                failed = true;
+                texts.push(format!("run from {}: {t}", iso(s)));
+            }
+        }
+    }
+    let text = texts.join("; ");
+    if failed {
+        Err(format!("{text}: FAIL"))
+    } else {
+        Ok(format!("{text}: PASS"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +234,34 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(parse_samples("2026-11-15T09:16:00Z 9e8").is_err());
         assert!(parse_samples("908000000").is_err());
+    }
+
+    /// R-P5P9-95 m-11: a restart begins its own warm-up (its +241 MB step passes with the
+    /// restart given, fails without); a sampler that stops before the close, or a gap of
+    /// more than two intervals, fails as not measured.
+    #[test]
+    fn f_m11_restarts_and_coverage() {
+        let start = crate::summary::parse_since("2026-11-15T08:16:00Z").unwrap();
+        let base = 908 * MB;
+        let restart = start + 240 * 60;
+        let s = samples(start, 480, base, &[(240 + 47, 241)]);
+        let end = start + 480 * 60;
+        let line = |starts: Vec<u64>, end: u64| Line {
+            starts,
+            end,
+            interval: 60,
+        };
+        assert!(verdict_line(&line(vec![start, restart], end), &s).is_ok());
+        assert!(verdict_line(&line(vec![start], end), &s).is_err());
+        let flat = samples(start, 180, base, &[]);
+        let why = verdict_line(&line(vec![start], start + 24 * 3_600), &flat).unwrap_err();
+        assert!(why.contains("not measured"), "{why}");
+        let gap: Vec<Sample> = samples(start, 480, base, &[])
+            .into_iter()
+            .filter(|(t, _)| !(start + 120 * 60..start + 180 * 60).contains(t))
+            .collect();
+        let why = verdict_line(&line(vec![start], end), &gap).unwrap_err();
+        assert!(why.contains("not measured"), "{why}");
+        assert!(verdict_line(&line(vec![start], end), &samples(start, 480, base, &[])).is_ok());
     }
 }

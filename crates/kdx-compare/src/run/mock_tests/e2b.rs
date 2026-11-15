@@ -389,7 +389,9 @@ fn acct_pair(edge: u64) -> (Value, Value) {
 /// lowest height leaves the record unexplained.
 #[tokio::test]
 async fn e2b_rest_rules_combine_row_by_row() {
-    for (edge, explained) in [(7_000_100, true), (7_000_102, false)] {
+    // R-P5P9-95 m-6: the oracle-only row below ours' lowest height (at it, only inside the
+    // lag horizon: f_m6_…).
+    for (edge, explained) in [(7_000_099, true), (7_000_102, false)] {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = acct_pair(edge);
         let nu = node_server(rest_node()).await;
@@ -513,7 +515,9 @@ pub(super) fn rest_record(
 /// one stored row the node puts in another block leaves it unexplained.
 #[tokio::test]
 async fn e2b_the_referee_settles_stored_rest_records() {
-    for (edge, explained) in [(7_000_100, 1), (7_000_102, 0)] {
+    // R-P5P9-95 m-6: below ours' lowest height; at it the stored form has no tip to bound
+    // the row by, so it stays unexplained.
+    for (edge, explained) in [(7_000_099, 1), (7_000_100, 0), (7_000_102, 0)] {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = acct_pair(edge);
         let nu = node_server(rest_node()).await;
@@ -539,7 +543,8 @@ async fn e2b_the_referee_settles_stored_rest_records() {
     for (bad, explained) in [(None, 1), (Some("r518"), 0)] {
         let dir = tempfile::tempdir().unwrap();
         let nu = node_server(v1_node(bad)).await;
-        let au = reads_server(vec![Value::Array(all.clone())]).await;
+        // R-P5P9-95 I-3: ours' window floor (10 rows down to 7006537) above kda-txs' rows.
+        let au = paths_server(Value::Array(all.clone()), floor_rows(7_006_546, 10)).await;
         let bu = reads_server(vec![Value::Array(all.clone())]).await;
         let cfg = rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs");
         let rec = rest_record("v1txs", V1_REQ, &a0, &b0);
@@ -611,9 +616,11 @@ fn g_node(n: usize) -> NodeMock {
         (0, 58),
         vec![json!({"hash": "H0", "height": 58, "payloadHash": "P0", "chainId": 0})],
     );
+    // R-P5P9-95 m-4: each tx's signed command, its gas price ours' row's (`{i}e-8`).
     let txs: Vec<Value> = (0..n)
         .map(|i| {
-            let w = json!({"hash": format!("rk{i}")}).to_string();
+            let cmd = format!("{{\"meta\": {{\"gasPrice\": {i}e-8}}}}");
+            let w = json!({"hash": format!("rk{i}"), "cmd": cmd}).to_string();
             json!([kdx_types::hash::b64url_encode(w.as_bytes()), ""])
         })
         .collect();
@@ -756,4 +763,218 @@ async fn e3_tc_the_referee_walk_stops_at_the_read_cap() {
             );
         }
     }
+}
+
+/// R-P5P9-95 m-4: ours' rows past the oracle's prefix are checked against the node's block
+/// by their `cmd`, not by count alone. Ours' row 50 (past the oracle's 20) has a gas price
+/// no tx of the node's block has: unfinished.
+#[tokio::test]
+async fn f_m4_rows_past_the_prefix_match_the_nodes_commands() {
+    let prices: Vec<String> = (0..126).map(|i| format!("{i}e-8")).collect();
+    let mut bad = prices.clone();
+    bad[50] = "999e-8".into();
+    let ours = g_page(&[(0, 126, false, bad), (19, 1, false, vec!["1e-8".into()])]);
+    let oracle = g_page(&[
+        (0, 126, true, prices[..20].to_vec()),
+        (19, 1, false, vec!["1e-8".into()]),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = gql_ctx(g_node(126), dir.path()).await;
+    let (mut a, mut b) = (answer(ours), answer(oracle));
+    let (d, _) = ctx
+        .gql_settle(
+            &ctx.targets["a"],
+            &serde_json::Map::new(),
+            &mut a,
+            &mut b,
+            7_000_000,
+            false,
+        )
+        .await;
+    let un = c3_unexplained(&ctx, &d);
+    assert!(
+        un.contains(&crate::graphql_scope::UNFINISHED_PATH.to_string()),
+        "{un:?} {d:?}"
+    );
+}
+
+/// A server of ours that answers `/v1/txs` with `v1` and `/txs/account` with `acct`.
+pub(super) async fn paths_server(v1: Value, acct: Value) -> String {
+    let app = Router::new().fallback(move |uri: Uri| {
+        let (v1, acct) = (v1.clone(), acct.clone());
+        async move {
+            let p = uri.path();
+            Json(if p.starts_with("/v1/txs") {
+                v1
+            } else if p.starts_with("/txs/account") {
+                acct
+            } else {
+                json!([])
+            })
+        }
+    });
+    serve(app).await.trim_end_matches('/').to_string()
+}
+
+/// R-P5P9-95 I-2: live, "ours full" is read from ours' own page, never from the oracle's
+/// cut. Ours is complete (80 rows of limit 100, no Chainweb-Next): 79 shared rows and a
+/// coinbase row the node pays (so R3E-14's node-gap rule does not take the record and the
+/// rows are combined row by row). Chainweb-data lists the 79 and 19 older rows ours lacks,
+/// and its page is cut at its depth: a diff, though the older rows lie below ours' lowest.
+#[tokio::test]
+async fn f_i2_ours_full_is_read_from_ours_own_page() {
+    use axum::response::IntoResponse;
+    let dir = tempfile::tempdir().unwrap();
+    let shared: Vec<Value> = (0..79u64)
+        .map(|i| acct_row(&format!("s{i}"), 7_000_200 - i, "1.0"))
+        .collect();
+    let mut ours = shared.clone();
+    ours.push(acct_row("<coinbase>", 7_000_104, "0.904046"));
+    let mut cwd = shared;
+    cwd.extend((0..19u64).map(|i| acct_row(&format!("o{i}"), 7_000_103 - i, "1.0")));
+    let nu = node_server(rest_node()).await;
+    let au = reads_server(vec![Value::Array(ours)]).await;
+    let body = Value::Array(cwd);
+    let app = Router::new().fallback(move || {
+        let body = body.clone();
+        async move { ([("Chainweb-Next", "next")], Json(body)).into_response() }
+    });
+    let bu = serve(app).await.trim_end_matches('/').to_string();
+    let ctx = Ctx::new(rest_cfg(&nu, &au, &bu, dir.path(), "chainweb_data"))
+        .await
+        .unwrap();
+    let req = Request::new(
+        "/txs/account/k:5fd26d23?token=coin&chain=9&limit=100".into(),
+        Origin::Seed,
+        None,
+    );
+    let o = ctx
+        .vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
+        .await;
+    assert_eq!(o.class, "diff", "{o:?}");
+}
+
+/// R-P5P9-95 I-3, live: kda-txs' re-read has caught up and still lists 517-520, which ours'
+/// re-read (546 only) lacks. The re-reads agree on their overlap (546), but that is not
+/// agreement: a diff.
+#[tokio::test]
+async fn f_i3_the_reread_must_cover_the_first_reads_kdatxs_rows() {
+    let (a0, b0) = v1_first();
+    let all: Vec<Value> = std::iter::once(v1_row("r546", 7_006_546))
+        .chain(b0.as_array().unwrap().iter().cloned())
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(v1_node(None)).await;
+    let au = reads_server(vec![a0.clone(), a0.clone()]).await;
+    let bu = reads_server(vec![b0.clone(), Value::Array(all)]).await;
+    let ctx = Ctx::new(rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs"))
+        .await
+        .unwrap();
+    let o = v1_compare(&ctx, V1_REQ).await;
+    assert_eq!(o.class, "diff", "{o:?}");
+}
+
+/// Ours' `/txs/account` rows (coinbases included) from `top` down, `n` of them.
+pub(super) fn floor_rows(top: u64, n: u64) -> Value {
+    Value::Array(
+        (0..n)
+            .map(|i| {
+                let mut r = acct_row("<coinbase>", top - i, "0.9");
+                r["chain"] = json!(0);
+                r
+            })
+            .collect(),
+    )
+}
+
+/// R-P5P9-95 I-3, the stored form: ours' newest `limit` rows bounded at the record's height
+/// give ours' window floor, and every kda-txs-only row must lie below it. Ours' 10 rows
+/// down to 7006537 put 517-520 below: explained. Ours' 10 rows down to 7006518 put 518-520
+/// inside ours' window: unexplained, though the read now agrees on its overlap. Ours with
+/// fewer than `limit` rows has no floor: unexplained.
+#[tokio::test]
+async fn f_i3_the_stored_form_reads_ours_window_floor() {
+    let (a0, b0) = v1_first();
+    let all: Vec<Value> = std::iter::once(v1_row("r546", 7_006_546))
+        .chain(b0.as_array().unwrap().iter().cloned())
+        .collect();
+    for (floor, explained) in [
+        (floor_rows(7_006_546, 10), 1),
+        (floor_rows(7_006_527, 10), 0),
+        (floor_rows(7_006_546, 9), 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(v1_node(None)).await;
+        let au = paths_server(Value::Array(all.clone()), floor).await;
+        let bu = reads_server(vec![Value::Array(all.clone())]).await;
+        let cfg = rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs");
+        let rec = rest_record("v1txs", V1_REQ, &a0, &b0);
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!((rep.refereed, rep.explained), (1, explained), "{rep:?}");
+    }
+}
+
+/// R-P5P9-95 m-6: a one-sided row of ours listed twice settles nothing (each copy would pass
+/// the node check on its own), and an oracle-only row at ours' lowest height is ours' limit
+/// only inside the lag horizon (no tip here: never).
+#[tokio::test]
+async fn f_m6_rest_compose_refuses_duplicates_and_the_unbounded_edge() {
+    for (twice, edge) in [(true, 7_000_099), (false, 7_000_100)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, b) = acct_pair(edge);
+        if twice {
+            let u1 = a[0].clone();
+            a.as_array_mut().unwrap().insert(1, u1);
+        }
+        let nu = node_server(rest_node()).await;
+        let (au, bu) = (reads_server(vec![a]).await, reads_server(vec![b]).await);
+        let ctx = Ctx::new(rest_cfg(&nu, &au, &bu, dir.path(), "chainweb_data"))
+            .await
+            .unwrap();
+        let req = Request::new(ACCT_REQ.into(), Origin::Seed, None);
+        let o = ctx
+            .vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
+            .await;
+        assert_eq!(o.class, "diff", "{twice} {edge}: {o:?}");
+    }
+}
+
+/// R-P5P9-95 m-9: the REST stored form's node polls (`node_confirms`) are reads of the run's
+/// budget. With only the chain graph's read allowed, a user row only ours lists is not
+/// confirmed; with the budget it is.
+#[tokio::test]
+async fn f_m9_rest_node_polls_count_in_max_reads() {
+    let shared = [
+        acct_row("s1", 7_000_103, "2.0"),
+        acct_row("s2", 7_000_101, "3.0"),
+        acct_row("s3", 7_000_100, "4.0"),
+    ];
+    let mut a = vec![acct_row("u1", 7_000_105, "1.5")];
+    a.extend(shared.iter().cloned());
+    let (a, b) = (Value::Array(a), Value::Array(shared.to_vec()));
+    let mut reads = Vec::new();
+    for (max_reads, explained) in [(200usize, 1usize), (1, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(rest_node()).await;
+        let cfg = rest_cfg(
+            &nu,
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            dir.path(),
+            "chainweb_data",
+        );
+        let rec = rest_record("account", ACCT_REQ, &a, &b);
+        let log = dir.path().join("diffs-m9.jsonl");
+        std::fs::write(&log, serde_json::to_string(&rec.bounded()).unwrap() + "\n").unwrap();
+        let opts = crate::referee::Opts {
+            logs: vec![log],
+            max_reads,
+            rps: 100,
+        };
+        let rep = crate::referee::run(cfg, &opts).await.unwrap();
+        assert_eq!(rep.explained, explained, "{max_reads}: {rep:?}");
+        reads.push(rep.node_reads);
+    }
+    // The chain graph and u1's `/poll` (one chunk; before the fix only the chain graph).
+    assert_eq!(reads[0], 2, "{reads:?}");
 }

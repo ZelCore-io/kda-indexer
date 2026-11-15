@@ -687,7 +687,12 @@ impl Ctx {
             cfg,
         };
         // R-P5P9-88 (3a): the `compare/` assets and the build, logged and kept in the summary.
-        let line = crate::assets::assets_line(&ctx.cfg.allowlist, &ctx.cfg.graphql.own_ops_dir)?;
+        let line = crate::assets::assets_line_with(
+            &ctx.cfg.allowlist,
+            &ctx.cfg.graphql.own_ops_dir,
+            &ctx.cfg.graphql.field_rules,
+            ctx.cfg.replay.as_deref(),
+        )?;
         tracing::info!(assets = %line, "harness assets");
         ctx.summary.lock().expect("summary").assets.insert(line);
         ctx.refresh_tips().await?;
@@ -717,16 +722,24 @@ impl Ctx {
 
     pub fn flush_summary(&self) {
         let mut s = self.summary.lock().expect("summary");
-        match s.flush(&self.cfg.out_dir) {
+        let rolled = match s.flush(&self.cfg.out_dir) {
             Ok(Some(mut fresh)) => {
                 fresh.graphql_unpaired = std::mem::take(&mut s.graphql_unpaired);
                 fresh.assets = std::mem::take(&mut s.assets);
                 *s = fresh;
-                // R-P5P9-86: the day rolled; the past days' diff logs are rotated.
-                self.rotate_logs();
+                true
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "summary flush"),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "summary flush");
+                false
+            }
+        };
+        // R-P5P9-86: the day rolled; the past days' diff logs are rotated (R-P5P9-95 m-12:
+        // outside the summary lock).
+        drop(s);
+        if rolled {
+            self.rotate_logs();
         }
     }
 
@@ -988,6 +1001,8 @@ impl Ctx {
         let (mut va, mut vb) = (rows(&mut pa), rows(&mut pb));
         // R-P5P9-86: ours' lowest height as fetched, for the row-by-row rules.
         let lowest_a0 = min_height(&va);
+        // R-P5P9-95 I-2: ours' own row count before any cut.
+        let len_a0 = len_of(&va);
         // R-P5P9-86 v1txs: the two pages do not overlap in height and kda-txs' rows end lower
         // (the first reads kept for the re-read's node check).
         let edge_rows = (req.route == RouteKind::V1Txs
@@ -1045,9 +1060,10 @@ impl Ctx {
         };
         let full_a0 = pa.truncated || page_cut || row_limit.is_none_or(|l| len_of(&va) >= l);
         let full_b0 = pb.truncated || page_cut || row_limit.is_none_or(|l| len_of(&vb) >= l);
-        // R-P5P9-72 (2): for R-P5P9-86's row-by-row rules, only a known limit (or a cut page)
-        // makes ours full.
-        let full_a_known = pa.truncated || page_cut || row_limit.is_some_and(|l| len_of(&va) >= l);
+        // R-P5P9-72 (2): for R-P5P9-86's row-by-row rules, only a known limit makes ours
+        // full. R-P5P9-95 I-2: read from ours' own page (cut, or its rows before any cut at
+        // the limit), never from `page_cut`, which the oracle's cut sets too.
+        let full_a_known = pa.truncated || row_limit.is_some_and(|l| len_a0 >= l);
         let mut lag_rows = 0usize;
         // Replica pair (two kda-indexer targets): rows above the lower of the two tips minus
         // a margin are dropped (the sides read different tips and a chain can trail its
@@ -1426,7 +1442,15 @@ impl Ctx {
             let (mut ca, mut cb) = (va.clone(), vb.clone());
             let kdatxs = tb.kind == crate::config::TargetKind::KdaTxs;
             if let Ok(h) = self
-                .rest_compose(req, kdatxs, &mut ca, &mut cb, full_a_known, lowest_a0)
+                .rest_compose(
+                    req,
+                    kdatxs,
+                    &mut ca,
+                    &mut cb,
+                    full_a_known,
+                    lowest_a0,
+                    clamp_to,
+                )
                 .await
             {
                 va = ca;
@@ -2593,6 +2617,10 @@ impl Ctx {
         }
         for (c, keys) in by_chain {
             for chunk in keys.chunks(NODE_POLL_CHUNK) {
+                // R-P5P9-95 m-9: one read of the run's budget (the referee's --max-reads).
+                if !self.gql.take_node_read() {
+                    return false;
+                }
                 let rks: Vec<String> = chunk.iter().map(|(rk, _)| rk.clone()).collect();
                 self.count_request(req.route.as_str(), "node", 1);
                 let Ok(res) = self.node.poll(c, &rks).await else {
