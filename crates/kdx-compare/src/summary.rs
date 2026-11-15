@@ -493,44 +493,62 @@ pub fn run_text(
 
 /// R-P5P9-75: the KNOWN-GAP counts of a window: per entry and UTC day, the entries'
 /// baselines, and the window's length in ten-minute buckets with any compare.
+/// R-P5P9-78 (H2 m-2): also each day's compared buckets and baselines, so each UTC day is
+/// gated as well as the window.
 #[derive(Debug, Clone, Default)]
 pub struct KnownGaps {
     pub per_day: BTreeMap<String, BTreeMap<String, u64>>,
+    /// The days' baselines merged in date order: the latest day's value wins.
     pub baselines: BTreeMap<String, f64>,
     pub buckets: u64,
+    /// Ten-minute buckets with any compare, per UTC day.
+    pub buckets_per_day: BTreeMap<String, u64>,
+    /// Each day's own baselines (its summary file's).
+    pub baselines_per_day: BTreeMap<String, BTreeMap<String, f64>>,
 }
 
-/// Reads [`KnownGaps`] from the summary files since `since_secs`.
+/// Hours of `buckets` ten-minute buckets.
+fn bucket_hours(buckets: u64) -> f64 {
+    buckets as f64 * crate::report::WINDOW_SECS as f64 / 3600.0
+}
+
+/// Reads [`KnownGaps`] from the summary files since `since_secs`, in date order (R-P5P9-78,
+/// H2 m-2: `read_dir` is unsorted, and a later day's baseline must win). A bucket counts
+/// toward the hours only when it holds a compared record (H2 m-8).
 pub fn load_known_gaps(out_dir: &Path, since_secs: u64) -> anyhow::Result<KnownGaps> {
     let first_date = date_of(since_secs);
     let mut kg = KnownGaps::default();
-    for e in std::fs::read_dir(out_dir)
+    let mut files: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(out_dir)
         .with_context(|| format!("reading {}", out_dir.display()))?
         .filter_map(Result::ok)
-    {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(date) = name
-            .strip_prefix("summary-")
-            .and_then(|n| n.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        if date < first_date.as_str() {
-            continue;
-        }
-        let text = std::fs::read_to_string(e.path())?;
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let date = name.strip_prefix("summary-")?.strip_suffix(".json")?;
+            (date >= first_date.as_str()).then(|| (date.to_string(), e.path()))
+        })
+        .collect();
+    files.sort();
+    for (date, path) in files {
+        let text = std::fs::read_to_string(&path)?;
         let day: DailySummary =
-            serde_json::from_str(&text).with_context(|| format!("parsing {name}"))?;
-        kg.baselines.extend(day.known_gap_baselines);
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        kg.baselines.extend(day.known_gap_baselines.clone());
+        kg.baselines_per_day
+            .insert(date.clone(), day.known_gap_baselines);
         for (start, w) in day.windows {
             let secs = parse_iso(&start).map(|t| t.secs).unwrap_or(-1);
             if secs < 0 || (secs as u64) < since_secs {
                 continue;
             }
-            if !w.pairs.is_empty() {
+            let compared = w
+                .pairs
+                .values()
+                .any(|m| COMPARED.iter().any(|c| m.get(*c).is_some_and(|n| *n > 0)));
+            if compared {
                 kg.buckets += 1;
+                *kg.buckets_per_day.entry(date.clone()).or_default() += 1;
             }
-            let d = kg.per_day.entry(date.to_string()).or_default();
+            let d = kg.per_day.entry(date.clone()).or_default();
             for (id, n) in w.known_gaps {
                 *d.entry(id).or_default() += n;
             }
@@ -542,9 +560,10 @@ pub fn load_known_gaps(out_dir: &Path, since_secs: u64) -> anyhow::Result<KnownG
 
 /// The KNOWN-GAP lines of `summary` and the FV daily read: each entry's records per day and
 /// in the window, never counted as explained, against its limit (the CG-4 per-hour baseline
-/// × 1.5 × the window's hours). An entry over its limit, or with no baseline, fails.
+/// × 1.5 × the compared hours), over the window and (R-P5P9-78, H2 m-2) over each UTC day,
+/// that day with its own baseline. An entry over a limit, or with no baseline, fails.
 pub fn render_known_gaps(kg: &KnownGaps) -> (String, bool) {
-    let hours = kg.buckets as f64 * crate::report::WINDOW_SECS as f64 / 3600.0;
+    let hours = bucket_hours(kg.buckets);
     let mut total: BTreeMap<&str, u64> = BTreeMap::new();
     for m in kg.per_day.values() {
         for (id, n) in m {
@@ -557,28 +576,38 @@ pub fn render_known_gaps(kg: &KnownGaps) -> (String, bool) {
     let mut ok = true;
     let mut s = format!(
         "known gaps (never explained; gate: at most the CG-4 baseline per hour x 1.5 over \
-         {hours:.1} h):\n"
+         {hours:.1} h, and over each UTC day's compared hours):\n"
     );
-    for (id, n) in &total {
-        let line = match kg.baselines.get(*id) {
+    let judge = |n: u64, b: Option<f64>, h: f64| -> (String, bool) {
+        match b {
             Some(b) => {
-                let limit = b * 1.5 * hours;
-                let over = *n as f64 > limit;
-                ok &= !over;
-                format!(
-                    "  {id}: {n} (limit {limit:.1}: baseline {b}/h x 1.5){}",
-                    if over { " OVER" } else { "" }
+                let limit = b * 1.5 * h;
+                let over = n as f64 > limit;
+                let tail = if over { " OVER" } else { "" };
+                (
+                    format!("{n} (limit {limit:.1}: baseline {b}/h x 1.5 x {h:.1} h){tail}"),
+                    !over,
                 )
             }
-            None => {
-                ok = false;
-                format!("  {id}: {n} (no baseline: OVER)")
-            }
-        };
-        let _ = writeln!(s, "{line}");
+            None => (format!("{n} (no baseline: OVER)"), false),
+        }
+    };
+    for (id, n) in &total {
+        let (line, within) = judge(*n, kg.baselines.get(*id).copied(), hours);
+        ok &= within;
+        let _ = writeln!(s, "  {id}: {line}");
         for (date, m) in &kg.per_day {
             if let Some(d) = m.get(*id) {
-                let _ = writeln!(s, "    {date}: {d}");
+                let b = kg
+                    .baselines_per_day
+                    .get(date)
+                    .and_then(|x| x.get(*id))
+                    .or_else(|| kg.baselines.get(*id))
+                    .copied();
+                let h = bucket_hours(kg.buckets_per_day.get(date).copied().unwrap_or(0));
+                let (line, within) = judge(*d, b, h);
+                ok &= within;
+                let _ = writeln!(s, "    {date}: {line}");
             }
         }
     }
@@ -954,6 +983,76 @@ mod tests {
             serde_json::to_vec(&day).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Writes one summary file per day: (date, buckets, its pair's class, known-gap-p records
+    /// in the first bucket, known-gap-p baseline per hour).
+    fn write_days(dir: &Path, days: &[(&str, u64, &str, u64, f64)]) {
+        for (date, buckets, class, kg, base) in days {
+            let windows = (0..*buckets)
+                .map(|i| {
+                    let mut w = window(&[("account|compat|cwd", &[(*class, 1)])]);
+                    if i == 0 && *kg > 0 {
+                        w.known_gaps.insert("known-gap-p".into(), *kg);
+                    }
+                    (format!("{date}T{:02}:{:02}:00Z", i / 6, (i % 6) * 10), w)
+                })
+                .collect();
+            let day = DailySummary {
+                date: date.to_string(),
+                windows,
+                known_gap_baselines: [("known-gap-p".to_string(), *base)].into_iter().collect(),
+                ..Default::default()
+            };
+            std::fs::write(
+                dir.join(format!("summary-{date}.json")),
+                serde_json::to_vec(&day).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    /// R-P5P9-78 (H2 m-2): each UTC day is gated against its own baseline and compared hours,
+    /// so a one-day burst fails though the window's total is within; the baselines merge in
+    /// date order (the latest day's wins); a bucket with no compare adds no hour.
+    #[test]
+    fn known_gaps_are_gated_per_day() {
+        let kg = |days: &[(&str, u64, &str, u64, f64)]| {
+            let dir = tempfile::tempdir().unwrap();
+            write_days(dir.path(), days);
+            load_known_gaps(dir.path(), 0).unwrap()
+        };
+        // Baseline 6/h. 11-14: 1 h, 12 records (day limit 9). 11-15: 5 h, none. The window's
+        // limit is 6 x 1.5 x 6 h = 54.
+        let burst = kg(&[
+            ("2026-11-14", 6, "match", 12, 6.0),
+            ("2026-11-15", 30, "match", 0, 6.0),
+        ]);
+        let (text, ok) = render_known_gaps(&burst);
+        assert!(!ok, "{text}");
+        assert!(text.contains("known-gap-p: 12 (limit 54.0"), "{text}");
+        assert!(!text.contains("limit 54.0: baseline 6/h x 1.5 x 6.0 h) OVER"));
+        assert!(text.contains("2026-11-14: 12 (limit 9.0") && text.contains("OVER"));
+        // The same day with 9 records is within.
+        let quiet = kg(&[
+            ("2026-11-14", 6, "match", 9, 6.0),
+            ("2026-11-15", 30, "match", 0, 6.0),
+        ]);
+        let (text, ok) = render_known_gaps(&quiet);
+        assert!(ok, "{text}");
+        // Seven days, each with its own baseline: the latest day's wins the window.
+        let days: Vec<(String, f64)> = (9..=15)
+            .map(|d| (format!("2026-11-{d:02}"), d as f64))
+            .collect();
+        let rows: Vec<(&str, u64, &str, u64, f64)> = days
+            .iter()
+            .map(|(d, b)| (d.as_str(), 1, "match", 0, *b))
+            .collect();
+        let merged = kg(&rows);
+        assert_eq!(merged.baselines.get("known-gap-p"), Some(&15.0));
+        assert_eq!(merged.buckets, 7);
+        // A bucket with only an error of ours is no compared hour.
+        assert_eq!(kg(&[("2026-11-15", 6, "a-error", 0, 6.0)]).buckets, 0);
     }
 
     /// R-P5P9-78 (H2 m-8): known-gap records do not reach a route minimum; the same count
