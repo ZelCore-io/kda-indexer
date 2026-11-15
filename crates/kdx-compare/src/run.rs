@@ -69,6 +69,14 @@ const SEARCH_TIE_ORDER_PATH: &str = "/~search-tie-order";
 const EVENT_ORDER_PATH: &str = "/~event-order";
 /// JSON path of the visible allowlist hit for rows above a lagging oracle's tip (ruling R3E-11).
 const ORACLE_LAG_PATH: &str = "/~oracle-lag";
+/// JSON path of the diff for ours' `/stats` count older than [`STATS_COUNT_AGE_CAP`] (or an
+/// `x-count-age` that is no age), and, under it, of the visible allowlist hit for ours' supply
+/// lagging by what the heights of an honoured age minted (R-P5P9-78, H2 I-1).
+const STATS_COUNT_AGE_PATH: &str = "/~stats-count-age";
+/// The largest `x-count-age` the harness honours (R-P5P9-78, H2 I-1): the served WARN
+/// threshold, 3 x the refresher's `REFRESH_EVERY` (120 s). An older count means a stuck
+/// refresher, a defect of ours: no widening, and the record carries `/~stats-count-age`.
+const STATS_COUNT_AGE_CAP: f64 = 360.0;
 /// JSON path of the visible allowlist hit for a kda-txs answer that changed on a retry.
 const ORACLE_UNSTABLE_PATH: &str = "/~oracle-unstable";
 /// JSON path of the visible allowlist hit for the oldest height cut at a `/v1/txs` limit.
@@ -381,11 +389,29 @@ fn query_account(req: &Request) -> String {
 const SECS_PER_HEIGHT: f64 = 30.0;
 
 /// Heights produced in ours' `x-count-age` (STATS-FIX, R-P5P9-75 item 4): the age over the
-/// block time, rounded up; no header (or one that is no number), no widening.
+/// block time, rounded up; no header (or one that is no number), no widening. An age above
+/// [`STATS_COUNT_AGE_CAP`] gives no widening either (R-P5P9-78, H2 I-1).
 fn count_age_heights(age_secs: Option<f64>) -> f64 {
     age_secs
-        .filter(|a| a.is_finite() && *a > 0.0)
+        .filter(|a| a.is_finite() && *a > 0.0 && *a <= STATS_COUNT_AGE_CAP)
         .map_or(0.0, |a| (a / SECS_PER_HEIGHT).ceil())
+}
+
+/// R-P5P9-78 (H2 I-1): ours' `x-count-age` header that is not an age the harness honours (a
+/// number from 0 to [`STATS_COUNT_AGE_CAP`]) is a diff at `/~stats-count-age`: a stuck
+/// refresher serves an ever older count. No header gives no diff (and no widening).
+fn stats_count_age_diff(header: Option<&str>) -> Option<DiffEntry> {
+    let h = header?;
+    let honoured = h
+        .trim()
+        .parse::<f64>()
+        .is_ok_and(|a| a.is_finite() && (0.0..=STATS_COUNT_AGE_CAP).contains(&a));
+    (!honoured).then(|| DiffEntry {
+        path: STATS_COUNT_AGE_PATH.into(),
+        kind: DiffKind::Changed,
+        a: Some(json!(h)),
+        b: Some(json!(STATS_COUNT_AGE_CAP)),
+    })
 }
 
 /// `/stats.coinsInCirculation` against chainweb-data, ours `x`, chainweb-data's `y`, past the
@@ -1037,9 +1063,18 @@ impl Ctx {
                 }
             }
         }
+        // STATS-FIX: ours' /stats count is up to `x-count-age` seconds old. Past the cap the
+        // refresher is stuck: a diff on every pair, and no widening (R-P5P9-78, H2 I-1).
+        let count_age = pa
+            .pages
+            .first()
+            .and_then(|c| c.header("x-count-age"))
+            .filter(|_| req.route == RouteKind::Stats && sa == 200);
+        let count_age_diff = stats_count_age_diff(count_age);
         // /stats against a lagging chainweb-data: the supply differs by what was minted in
-        // the heights between the two tips (R3E-11).
-        let mut supply_lag: Option<(Value, Value)> = None;
+        // the heights between the two tips (R3E-11), or, ours below, by what the heights of
+        // ours' honoured count age minted (reported at `/~stats-count-age/coinsInCirculation`).
+        let mut supply_lag: Option<(bool, Value, Value)> = None;
         if req.route == RouteKind::Stats
             && tb.kind == crate::config::TargetKind::ChainwebData
             && sa == 200
@@ -1052,15 +1087,11 @@ impl Ctx {
                 let b_tip = self.oracle_tip(tb).await.unwrap_or(a_tip);
                 let x = va.get("coinsInCirculation").and_then(num_value);
                 let y = vb.get("coinsInCirculation").and_then(num_value);
-                // STATS-FIX: ours' /stats is up to `x-count-age` seconds old.
-                let age = pa
-                    .pages
-                    .first()
-                    .and_then(|c| c.header("x-count-age"))
-                    .and_then(|v| v.trim().parse::<f64>().ok());
+                let age = count_age.and_then(|v| v.trim().parse::<f64>().ok());
                 if let (Some(x), Some(y)) = (x, y) {
                     if stats_supply_lag(x, y, a_tip, b_tip, age) {
                         let pair = (
+                            x < y,
                             va.get("coinsInCirculation").cloned().unwrap_or(Value::Null),
                             vb.get("coinsInCirculation").cloned().unwrap_or(Value::Null),
                         );
@@ -1535,9 +1566,16 @@ impl Ctx {
             });
         }
         d.extend(coins_lag);
-        if let Some((x, y)) = supply_lag {
+        d.extend(count_age_diff);
+        if let Some((aged, x, y)) = supply_lag {
+            // Ours below is ours' count lag, not the oracle's (R-P5P9-78, H2 I-1).
+            let at = if aged {
+                STATS_COUNT_AGE_PATH
+            } else {
+                ORACLE_LAG_PATH
+            };
             d.push(DiffEntry {
-                path: format!("{ORACLE_LAG_PATH}/coinsInCirculation"),
+                path: format!("{at}/coinsInCirculation"),
                 kind: DiffKind::Changed,
                 a: Some(x),
                 b: Some(y),
@@ -3696,6 +3734,60 @@ mod tests {
         // Ours above: the tip gap (240 heights at least), as before.
         assert!(stats_supply_lag(y + 10_000.0, y, 100, 100, None));
         assert!(!stats_supply_lag(y + 20_000.0, y, 100, 100, None));
+    }
+
+    /// R-P5P9-78 (H2 I-1): the honoured `x-count-age` is capped at 360 s, the served WARN
+    /// threshold. A stuck refresher (age 10,000 s, 1e6 s) widens nothing, and its header is a
+    /// diff at `/~stats-count-age`; an age at the cap still widens (12 heights, 720 KDA).
+    #[test]
+    fn stats_count_age_is_capped_at_the_warn_threshold() {
+        let y = 379_866_205.03;
+        let lag = |by: f64, age: Option<f64>| stats_supply_lag(y - by, y, 100, 100, age);
+        // Review probe 1: a lag of 1,000,000 KDA under an age of 1e6 s.
+        assert!(!lag(1_000_000.0, Some(1e6)), "a stuck count widens nothing");
+        // Inside ceil(10,000 / 30) x 60 = 20,040 KDA, yet past the cap: a diff.
+        assert!(!lag(10_000.0, Some(10_000.0)));
+        assert!(!lag(1_000.0, Some(361.0)), "one second past the cap");
+        assert!(
+            lag(1_000.0, Some(360.0)),
+            "at the cap: 720 + 1e-6 of the supply"
+        );
+        assert_eq!(count_age_heights(Some(361.0)), 0.0);
+        assert_eq!(count_age_heights(Some(360.0)), 12.0);
+        // The header past the cap (or no age at all) is a diff; an honoured one, or none, not.
+        for ok in [None, Some("0"), Some("120"), Some(" 360 ")] {
+            assert!(stats_count_age_diff(ok).is_none(), "{ok:?}");
+        }
+        for bad in ["361", "10000", "-5", "inf", "NaN", "soon"] {
+            let e = stats_count_age_diff(Some(bad)).expect(bad);
+            assert_eq!(e.path, "/~stats-count-age");
+            assert_eq!(e.a, Some(json!(bad)));
+        }
+    }
+
+    /// R-P5P9-78 (H2 I-1): the aged lag is ours' and has its own PROPOSED entry; the bare
+    /// `/~stats-count-age` diff matches no entry, and the oracle's tip lag keeps its own.
+    #[test]
+    fn stats_count_age_hits_are_ours_not_the_oracles() {
+        let al = crate::allowlist::Allowlist::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+        )
+        .unwrap();
+        let classify = |path: &str| {
+            let e = DiffEntry {
+                path: path.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!(1.0)),
+                b: Some(json!(2.0)),
+            };
+            al.classify_request(&RouteKind::Stats, "/stats", &[], &[e])
+        };
+        let (left, ids) = classify("/~stats-count-age/coinsInCirculation");
+        assert!(left.is_empty() && ids == vec!["stats-count-age-lag".to_string()]);
+        let (left, ids) = classify("/~stats-count-age");
+        assert_eq!((left.len(), ids.len()), (1, 0), "a stuck count is a diff");
+        let (left, ids) = classify("/~oracle-lag/coinsInCirculation");
+        assert!(left.is_empty() && ids == vec!["oracle-tip-lag".to_string()]);
     }
 
     #[test]
