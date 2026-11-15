@@ -193,6 +193,9 @@ fn num_canon_text(v: &Value) -> String {
 }
 
 /// Rewrites every JSON number as its nearest f64.
+/// R-P5P9-75 (CG-4 concern 4): body bytes an allowlisted REST record keeps on each side.
+pub const ALLOWLISTED_BODY: usize = 4096;
+
 pub(crate) fn numbers_as_f64(v: &mut Value) {
     match v {
         Value::Number(n) => {
@@ -708,11 +711,7 @@ impl Ctx {
             if let Some(rec) = &o.record {
                 {
                     let mut s = self.summary.lock().expect("summary");
-                    if let Some(ids) = &rec.allowlisted {
-                        for id in ids.split(',') {
-                            s.allowlist_hit(id);
-                        }
-                    }
+                    s.record_hits(rec, &self.allow);
                     if rec.class == "diff" {
                         s.unexplained(route, &rec.diff);
                     }
@@ -773,6 +772,7 @@ impl Ctx {
             diff,
             class: class.to_string(),
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
+            known_gap: None,
             curl: format!("curl -s {} ; {}", sh_url("A", &req.path_and_query), b_curl),
             note,
             body_cap: None,
@@ -1806,15 +1806,18 @@ impl Ctx {
             && self.targets.get(b_name).map(|t| t.kind)
                 == Some(crate::config::TargetKind::KdaIndexerCompat);
         let mut replica_skew = false;
-        let (unexplained, ids) = if replica_pair {
+        let all = d.clone();
+        let (unexplained, ids, known) = if replica_pair {
             let (rest, skew) = split_replica_skew(d);
             replica_skew = skew;
-            (rest, Vec::new())
+            (rest, Vec::new(), Default::default())
         } else {
             let a_headers: Vec<(String, String)> =
                 pa.pages.iter().flat_map(|c| c.headers.clone()).collect();
-            self.allow
-                .classify_request(&req.route, &req.path_and_query, &a_headers, &d)
+            let c = self
+                .allow
+                .classify_known(&req.route, &req.path_and_query, &a_headers, &d);
+            (c.unexplained.clone(), c.ids.clone(), c)
         };
         let (legacy_entries, other): (Vec<_>, Vec<_>) = if legacy {
             unexplained
@@ -1825,6 +1828,9 @@ impl Ctx {
         };
         let class = if !other.is_empty() {
             "diff"
+        } else if !known.known.is_empty() {
+            // R-P5P9-75: a KNOWN-GAP hit is never explained.
+            "known-gap"
         } else if legacy {
             // Known category: the node serves a re-encoded cmd for this tx (logged with the
             // rehash note even when every projected field agrees).
@@ -1836,18 +1842,19 @@ impl Ctx {
         } else {
             "match"
         };
-        if !ids.is_empty() {
-            let mut s = self.summary.lock().expect("summary");
-            if class == "allowlisted" || class == "match" {
-                for id in &ids {
-                    s.allowlist_hit(id);
-                }
-            }
-        }
+        // R-P5P9-75 (CG-4 concern 4): an allowlisted record is logged with its entry ids (its
+        // hits are counted from the record, as for the others); its bodies are cut to
+        // `ALLOWLISTED_BODY` bytes, since its diff entries carry the values.
         let record = match class {
-            "diff" | "legacy-cmd" => {
-                let mut entries = other;
-                entries.extend(legacy_entries);
+            "diff" | "legacy-cmd" | "known-gap" | "allowlisted" => {
+                let mut entries = match class {
+                    "known-gap" | "allowlisted" => all,
+                    _ => other,
+                };
+                if class == "diff" || class == "legacy-cmd" {
+                    entries.extend(legacy_entries);
+                    entries.extend(known.known.iter().cloned());
+                }
                 Some(self.record(
                     req,
                     ta,
@@ -1861,6 +1868,16 @@ impl Ctx {
                     curl_b,
                     note,
                 ))
+                .map(|mut r| {
+                    r.known_gap = (!known.known_ids.is_empty()).then(|| known.known_ids.join(","));
+                    if class == "allowlisted" {
+                        r.a_body_trimmed =
+                            crate::report::trim_escaped(&r.a_body_trimmed, ALLOWLISTED_BODY);
+                        r.b_body_trimmed =
+                            crate::report::trim_escaped(&r.b_body_trimmed, ALLOWLISTED_BODY);
+                    }
+                    r
+                })
             }
             _ => None,
         };

@@ -67,6 +67,9 @@ pub struct DiffRecord {
     pub diff: Vec<DiffEntry>,
     pub class: String,
     pub allowlisted: Option<String>,
+    /// R-P5P9-75: the KNOWN-GAP entries the record hit (never explained).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_gap: Option<String>,
     /// curl repro for A and B, relative to `$A` and `$B`.
     pub curl: String,
     /// Free-form detail (e.g. the legacy-cmd rehash result).
@@ -220,6 +223,7 @@ impl DiffRecord {
                 .collect(),
             class: short(&self.class),
             allowlisted: self.allowlisted.as_deref().map(short),
+            known_gap: self.known_gap.clone(),
             curl: long(&self.curl),
             note: self.note.as_deref().map(long),
             body_cap: body_cap.as_deref().map(short),
@@ -329,6 +333,12 @@ pub struct DailySummary {
     pub classes: BTreeMap<String, BTreeMap<String, u64>>,
     /// allowlist id -> matched diff records.
     pub allowlist_hits: BTreeMap<String, u64>,
+    /// R-P5P9-75: KNOWN-GAP entry id -> records this day (never explained).
+    #[serde(default)]
+    pub known_gaps: BTreeMap<String, u64>,
+    /// KNOWN-GAP entry id -> its CG-4 per-hour baseline, as the run's allowlist said.
+    #[serde(default)]
+    pub known_gap_baselines: BTreeMap<String, f64>,
     /// Unexplained diff paths (normalised: array indexes replaced by `*`) -> count.
     pub unexplained_paths: BTreeMap<String, u64>,
     /// Ten-minute buckets (key: the bucket start, `YYYY-MM-DDTHH:MM:SSZ`) for `kda-compare
@@ -351,6 +361,9 @@ pub struct Window {
     pub pairs: BTreeMap<String, BTreeMap<String, u64>>,
     /// `route|target` -> latency histogram (see `lat_bucket`) -> HTTP exchanges.
     pub lat: BTreeMap<String, BTreeMap<u16, u64>>,
+    /// R-P5P9-75: KNOWN-GAP entry id -> records in the bucket.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub known_gaps: BTreeMap<String, u64>,
 }
 
 /// Latency histogram bucket: log scale, ratio 1.2 (percentiles are good to about 20%).
@@ -438,6 +451,30 @@ impl DailySummary {
         *self.allowlist_hits.entry(id.to_string()).or_default() += 1;
     }
 
+    /// One record hit the KNOWN-GAP entry `id` (R-P5P9-75): counted per day and per bucket,
+    /// with the entry's baseline.
+    pub fn known_gap_hit(&mut self, id: &str, baseline: Option<f64>) {
+        *self.known_gaps.entry(id.to_string()).or_default() += 1;
+        if let Some(b) = baseline {
+            self.known_gap_baselines.insert(id.to_string(), b);
+        }
+        *self.window().known_gaps.entry(id.to_string()).or_default() += 1;
+    }
+
+    /// The allowlist and KNOWN-GAP hits of a logged record.
+    pub fn record_hits(&mut self, rec: &DiffRecord, allow: &crate::allowlist::Allowlist) {
+        if let Some(ids) = &rec.allowlisted {
+            for id in ids.split(',') {
+                self.allowlist_hit(id);
+            }
+        }
+        if let Some(ids) = &rec.known_gap {
+            for id in ids.split(',') {
+                self.known_gap_hit(id, allow.baseline(id));
+            }
+        }
+    }
+
     pub fn unexplained(&mut self, route: &str, entries: &[DiffEntry]) {
         let mut seen = std::collections::BTreeSet::new();
         for e in entries {
@@ -522,6 +559,7 @@ mod tests {
             diff,
             class: "diff".into(),
             allowlisted: None,
+            known_gap: None,
             curl: body.clone(),
             note: Some(body),
             body_cap: None,

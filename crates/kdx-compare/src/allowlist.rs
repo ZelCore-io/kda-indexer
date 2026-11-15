@@ -39,6 +39,12 @@ impl Condition {
 pub enum Status {
     Proposed,
     Accepted,
+    /// R-P5P9-75 (P, Q): a gap the controller accepted for G4. Matched like the others, but a
+    /// hit is **never** explained: `classify_request` leaves it unexplained, and
+    /// `classify_known` returns it apart, as a `known-gap` record that the summary counts per
+    /// entry and day and gates against `baseline_per_hour` × 1.5.
+    #[serde(rename = "KNOWN-GAP")]
+    KnownGap,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,7 +63,18 @@ pub struct Entry {
     /// (name, any case), e.g. `x-search-truncated` for a cut search.
     #[serde(default)]
     pub a_header: Option<String>,
-    /// Required: PROPOSED or ACCEPTED.
+    /// Optional (R-P5P9-75 P, Q): the request must contain one of these texts. A GraphQL
+    /// request reads `graphql:<operation> <variables as JSON>`.
+    #[serde(default)]
+    pub request_any: Vec<String>,
+    /// Optional (R-P5P9-75 P): the diff entry's A value, as JSON text, must contain this text.
+    #[serde(default)]
+    pub a_value_contains: Option<String>,
+    /// KNOWN-GAP only, and required there: the CG-4 per-hour baseline of its records. The gate
+    /// allows at most 1.5 × this per hour of the window.
+    #[serde(default)]
+    pub baseline_per_hour: Option<f64>,
+    /// Required: PROPOSED, ACCEPTED or KNOWN-GAP.
     pub status: Status,
     pub reason: String,
     /// Required: the ruling (or, for an owner-accepted entry, the owner note) that admits it.
@@ -91,6 +108,14 @@ impl Allowlist {
                 "allowlist entry {} needs a reason and a ruling",
                 e.id
             );
+            anyhow::ensure!(
+                (e.status == Status::KnownGap) == e.baseline_per_hour.is_some()
+                    && e.baseline_per_hour
+                        .is_none_or(|b| b.is_finite() && b >= 0.0),
+                "allowlist entry {}: a KNOWN-GAP entry needs baseline_per_hour (>= 0), and only \
+                 a KNOWN-GAP entry takes one",
+                e.id
+            );
         }
         Ok(Allowlist { entries: f.entries })
     }
@@ -104,7 +129,8 @@ impl Allowlist {
         self.classify_request(route, "", &[], diffs)
     }
 
-    /// `a_headers`: the response headers of A's pages.
+    /// `a_headers`: the response headers of A's pages. A KNOWN-GAP hit is never explained:
+    /// it stays in the unexplained list here (use [`Allowlist::classify_known`] to see it).
     pub fn classify_request(
         &self,
         route: &RouteKind,
@@ -115,34 +141,115 @@ impl Allowlist {
         let mut unexplained = Vec::new();
         let mut ids: Vec<String> = Vec::new();
         for d in diffs {
-            // A streamed `/v1/txs` hash or row difference is a diff whatever the allowlist
-            // says (R-P5P9-52 concern 5): a request-scoped `/**` entry must not explain it.
-            let never = [crate::streamed::HASH_PATH, crate::streamed::ROW_PATH]
-                .iter()
-                .any(|p| d.path.starts_with(p));
-            let hit = (!never).then_some(()).and_then(|()| {
-                self.entries.iter().find(|e| {
-                    (e.route == "*" || e.route == route.as_str())
-                        && e.condition.matches(d.kind)
-                        && e.request_contains
-                            .as_deref()
-                            .is_none_or(|s| request.contains(s))
-                        && e.a_header.as_deref().is_none_or(|h| {
-                            a_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h))
-                        })
-                        && glob(&e.json_path_glob, &d.path)
-                })
-            });
-            match hit {
-                Some(e) => {
-                    if !ids.contains(&e.id) {
-                        ids.push(e.id.clone());
-                    }
-                }
-                None => unexplained.push(d.clone()),
+            match self.hit(route, request, a_headers, d) {
+                Some(e) if e.status != Status::KnownGap => push_id(&mut ids, &e.id),
+                _ => unexplained.push(d.clone()),
             }
         }
         (unexplained, ids)
+    }
+
+    /// [`Allowlist::classify_request`] with the KNOWN-GAP hits apart: they are neither
+    /// explained nor unexplained, and their record is a `known-gap` one.
+    pub fn classify_known(
+        &self,
+        route: &RouteKind,
+        request: &str,
+        a_headers: &[(String, String)],
+        diffs: &[DiffEntry],
+    ) -> Classified {
+        let mut c = Classified::default();
+        for d in diffs {
+            match self.hit(route, request, a_headers, d) {
+                Some(e) if e.status == Status::KnownGap => {
+                    push_id(&mut c.known_ids, &e.id);
+                    c.known.push(d.clone());
+                }
+                Some(e) => push_id(&mut c.ids, &e.id),
+                None => c.unexplained.push(d.clone()),
+            }
+        }
+        c
+    }
+
+    /// The CG-4 per-hour baseline of a KNOWN-GAP entry.
+    pub fn baseline(&self, id: &str) -> Option<f64> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.baseline_per_hour)
+    }
+
+    /// The entry that matches `d`: an explaining entry first, else a KNOWN-GAP one.
+    fn hit(
+        &self,
+        route: &RouteKind,
+        request: &str,
+        a_headers: &[(String, String)],
+        d: &DiffEntry,
+    ) -> Option<&Entry> {
+        // A streamed `/v1/txs` hash or row difference is a diff whatever the allowlist
+        // says (R-P5P9-52 concern 5): a request-scoped `/**` entry must not explain it.
+        let never = [crate::streamed::HASH_PATH, crate::streamed::ROW_PATH]
+            .iter()
+            .any(|p| d.path.starts_with(p));
+        if never {
+            return None;
+        }
+        let fits = |e: &&Entry| {
+            (e.route == "*" || e.route == route.as_str())
+                && e.condition.matches(d.kind)
+                && e.request_contains
+                    .as_deref()
+                    .is_none_or(|s| request.contains(s))
+                && (e.request_any.is_empty() || e.request_any.iter().any(|s| request.contains(s)))
+                && e.a_value_contains
+                    .as_deref()
+                    .is_none_or(|t| d.a.as_ref().is_some_and(|v| v.to_string().contains(t)))
+                && e.a_header
+                    .as_deref()
+                    .is_none_or(|h| a_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h)))
+                && glob(&e.json_path_glob, &d.path)
+        };
+        let known = |e: &&Entry| e.status == Status::KnownGap;
+        self.entries
+            .iter()
+            .filter(|e| !known(e))
+            .find(fits)
+            .or_else(|| self.entries.iter().filter(known).find(fits))
+    }
+}
+
+fn push_id(ids: &mut Vec<String>, id: &str) {
+    if !ids.iter().any(|i| i == id) {
+        ids.push(id.to_string());
+    }
+}
+
+/// [`Allowlist::classify_known`]'s split of one record's diff entries.
+#[derive(Debug, Clone, Default)]
+pub struct Classified {
+    pub unexplained: Vec<DiffEntry>,
+    /// The explaining entries that matched.
+    pub ids: Vec<String>,
+    /// Entries a KNOWN-GAP entry matched: never explained.
+    pub known: Vec<DiffEntry>,
+    pub known_ids: Vec<String>,
+}
+
+impl Classified {
+    /// The record's class and the entries it shows: `diff` (the unexplained, then the known
+    /// gaps), `known-gap` (every entry) or `allowlisted` (every entry).
+    pub fn class(&self, all: &[DiffEntry]) -> (&'static str, Vec<DiffEntry>) {
+        if !self.unexplained.is_empty() {
+            let mut d = self.unexplained.clone();
+            d.extend(self.known.iter().cloned());
+            ("diff", d)
+        } else if !self.known.is_empty() {
+            ("known-gap", all.to_vec())
+        } else {
+            ("allowlisted", all.to_vec())
+        }
     }
 }
 
@@ -194,7 +301,7 @@ mod tests {
                 }
             }
             let st = e.get("status").and_then(toml::Value::as_str).unwrap_or("");
-            if !["PROPOSED", "ACCEPTED"].contains(&st) && !st.is_empty() {
+            if !["PROPOSED", "ACCEPTED", "KNOWN-GAP"].contains(&st) && !st.is_empty() {
                 lacking.push(format!("{id}: status {st}"));
             }
         }
@@ -202,12 +309,15 @@ mod tests {
         // The loader agrees: the shipped file loads with a status on every entry.
         let al = shipped();
         assert_eq!(al.entries.len(), entries.len());
-        // Only entries whose owner note says the owner accepted them are ACCEPTED.
+        // Only entries the owner accepted, or the controller flipped by a ruling on a run's
+        // evidence (R-P5P9-75, CG-4, with its example records), are ACCEPTED.
         for e in &al.entries {
             if e.status == super::Status::Accepted {
                 assert!(
-                    e.owner_note.contains("by the owner") || e.owner_note.contains("owner ruling"),
-                    "{} is ACCEPTED without an owner acceptance in its note",
+                    e.owner_note.contains("by the owner")
+                        || e.owner_note.contains("owner ruling")
+                        || (e.ruling.contains("R-P5P9-75, CG-4") && e.owner_note.contains('#')),
+                    "{} is ACCEPTED without an owner acceptance or a flip ruling with evidence",
                     e.id
                 );
             }
@@ -372,5 +482,124 @@ mod tests {
             RouteKind::Search,
             "/txs/search?search=keyset+%22kad-ops-20%22%29&minheight=852004&maxheight=852104",
         );
+    }
+
+    /// R-P5P9-75 (P, Q): a KNOWN-GAP entry loads only with `baseline_per_hour`, and only it
+    /// takes one. Its hit is never explained: `classify_request` leaves it unexplained, and
+    /// `classify_known` returns it apart with a `known-gap` class.
+    #[test]
+    fn known_gap_is_never_explained() {
+        use super::Status;
+        use crate::report::{DiffEntry, DiffKind};
+        let dir = tempfile::tempdir().unwrap();
+        let load = |extra: &str| {
+            let p = dir.path().join("k.toml");
+            std::fs::write(
+                &p,
+                format!(
+                    "[[entry]]\nid = \"k\"\nroute = \"*\"\njson_path_glob = \"/x\"\n\
+                     condition = \"any\"\nreason = \"r\"\nruling = \"R-1\"\nowner_note = \"n\"\n\
+                     {extra}"
+                ),
+            )
+            .unwrap();
+            Allowlist::load(&p)
+        };
+        let k = load("status = \"KNOWN-GAP\"\nbaseline_per_hour = 2.0\n").unwrap();
+        assert_eq!(k.entries[0].status, Status::KnownGap);
+        assert!(load("status = \"KNOWN-GAP\"\n").is_err(), "no baseline");
+        assert!(load("status = \"ACCEPTED\"\nbaseline_per_hour = 1.0\n").is_err());
+        assert!(load("status = \"KNOWN-GAP\"\nbaseline_per_hour = -1.0\n").is_err());
+        let d = [DiffEntry {
+            path: "/x".into(),
+            kind: DiffKind::Changed,
+            a: None,
+            b: None,
+        }];
+        let (un, ids) = k.classify_request(&RouteKind::Other, "graphql:Q {}", &[], &d);
+        assert_eq!((un.len(), ids.len()), (1, 0), "never explained");
+        let c = k.classify_known(&RouteKind::Other, "graphql:Q {}", &[], &d);
+        assert!(c.unexplained.is_empty() && c.ids.is_empty());
+        assert_eq!(c.known_ids, vec!["k".to_string()]);
+        assert_eq!(c.class(&d).0, "known-gap");
+        assert_eq!(k.baseline("k"), Some(2.0));
+    }
+
+    /// R-P5P9-75 P and Q, the shipped entries: P only on the measured heavy accounts and a
+    /// "request deadline exceeded" page fault; Q only on the four account operations.
+    #[test]
+    fn shipped_known_gaps_are_scoped() {
+        use crate::report::{DiffEntry, DiffKind};
+        let al = shipped();
+        let fault = |path: &str, why: &str| {
+            vec![DiffEntry {
+                path: path.into(),
+                kind: DiffKind::Changed,
+                a: Some(serde_json::json!({"page": 3, "status": 200, "why": why})),
+                b: None,
+            }]
+        };
+        let deadline = r#"errors: [{"message":"request deadline exceeded"}]"#;
+        let req = |stem: &str, acct: &str| format!("graphql:{stem} {{\"accountName\":\"{acct}\"}}");
+        let known = |r: &str, d: &[DiffEntry]| {
+            let c = al.classify_known(&RouteKind::Other, r, &[], d);
+            (c.class(d).0, c.known_ids)
+        };
+        let p = "known-gap-p-heavy-account-deadline".to_string();
+        let d = fault("/~graphql-follow-page-fault", deadline);
+        let full = format!("k:465174a5{}", "0".repeat(56));
+        assert_eq!(
+            known(&req("QTransactionsByAccount", &full), &d),
+            ("known-gap", vec![p.clone()])
+        );
+        let d1 = fault("/~graphql-first-page-fault", deadline);
+        assert_eq!(
+            known(&req("Transactions", "b581bc62ff"), &d1).0,
+            "known-gap"
+        );
+        // Another account (CG-4 #293's), another fault text: diffs.
+        assert_eq!(known(&req("Transactions", "k:58ddb72d00"), &d1).0, "diff");
+        let other = fault("/~graphql-follow-page-fault", "HTTP 500");
+        assert_eq!(
+            known(&req("QTransactionsByAccount", &full), &other).0,
+            "diff"
+        );
+        // The key must start the value: a key inside another value is not the account.
+        assert_eq!(
+            known(&req("QTransactionsByAccount", "k:00465174a5"), &d).0,
+            "diff"
+        );
+        // Q: the marker on the four operations is a known gap, elsewhere a diff.
+        let q = vec![DiffEntry {
+            path: crate::graphql_norm::MISSING_CHAIN_ROWS_PATH.into(),
+            kind: DiffKind::Missing,
+            a: None,
+            b: Some(serde_json::json!({"list": "/data/x", "missing": [["1", null]]})),
+        }];
+        // The four operations' names come from the entry (no capture stem in the sources).
+        let qe = al
+            .entries
+            .iter()
+            .find(|e| e.id == "known-gap-q-missing-chain-rows")
+            .unwrap();
+        assert_eq!(qe.request_any.len(), 4);
+        for r in &qe.request_any {
+            let stem = r.trim_start_matches("graphql:").trim_end();
+            assert_eq!(known(&req(stem, "k:a"), &q).0, "known-gap", "{stem}");
+        }
+        assert_eq!(
+            known(&req("QFungibleAccountsByPublicKey", "k:a"), &q).0,
+            "diff"
+        );
+        assert_eq!(known(&req("QFungibleChainAccounts", "k:a"), &q).0, "diff");
+        // A known gap with another unexplained entry in the record: a diff.
+        let mut both = q.clone();
+        both.push(DiffEntry {
+            path: "/data/fungibleAccount/totalBalance".into(),
+            kind: DiffKind::Changed,
+            a: Some(serde_json::json!("#1e0")),
+            b: Some(serde_json::json!("#2e0")),
+        });
+        assert_eq!(known(&req("QFungibleAccount", "k:a"), &both).0, "diff");
     }
 }

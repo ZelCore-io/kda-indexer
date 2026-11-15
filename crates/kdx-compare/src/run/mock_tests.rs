@@ -3966,6 +3966,7 @@ async fn c3_the_referee_keeps_h6_past_the_records_entry_cap() {
         diff,
         class: "diff".into(),
         allowlisted: None,
+        known_gap: None,
         curl: String::new(),
         note: None,
         body_cap: None,
@@ -4434,14 +4435,15 @@ async fn c4_a_12_mib_v1txs_pair_keeps_its_rules() {
     assert!(a.len() < crate::graphql::MERGED_BYTES_CAP);
     let ctx = v1_setup(a, b, dir.path()).await;
     let o = v1_compare(&ctx, "/v1/txs/k:big/coin/250").await;
-    // An explained answer keeps no record; a streamed compare would have kept a diff.
+    // An explained answer keeps no diff record (R-P5P9-75: its allowlisted record is logged);
+    // a streamed compare would have kept a diff.
     assert_eq!(
         o.class,
         "allowlisted",
         "{:?}",
-        o.record.map(|r| (r.note, r.diff))
+        o.record.as_ref().map(|r| (&r.note, &r.diff))
     );
-    assert!(o.record.is_none());
+    assert!(o.record.is_some_and(|r| r.class == "allowlisted"));
 }
 
 /// Item 3 (the I-6 residual of run 6E): ours' 250-row page over the 32 MiB cap (`/v1/txs/
@@ -6339,6 +6341,14 @@ fn d2_i_oracle_counts_heights_only_below_ours_on_transactions_9e58b95d() {
         )
     };
     let al = d2_shipped();
+    // The operation's name comes from its entry (no capture stem in the sources, M1).
+    let op = al
+        .entries
+        .iter()
+        .find(|e| e.id == "graphql-r75-oracle-counts-heights")
+        .and_then(|e| e.request_contains.clone())
+        .unwrap();
+    assert!(op.len() > "graphql:".len(), "{op}");
     let d = cmp(4, 1);
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].path, ORACLE_COUNTS_HEIGHTS_PATH);
@@ -6346,12 +6356,7 @@ fn d2_i_oracle_counts_heights_only_below_ours_on_transactions_9e58b95d() {
         (d[0].a.clone(), d[0].b.clone()),
         (Some(json!(4)), Some(json!(1)))
     );
-    let (un, ids) = al.classify_request(
-        &crate::normalize::RouteKind::Other,
-        "graphql:Transactions-9e58b95d",
-        &[],
-        &d,
-    );
+    let (un, ids) = al.classify_request(&crate::normalize::RouteKind::Other, &op, &[], &d);
     assert!(un.is_empty(), "{un:?}");
     assert_eq!(ids, vec!["graphql-r75-oracle-counts-heights".to_string()]);
     // The same hit on another operation is not explained.
@@ -6550,4 +6555,92 @@ async fn d2_o_h8_applies_to_nested_transfer_lists() {
     // The oracle's 0 is the gas transfer's rank, not this content: a diff.
     let d = settle(tx(json!(2)), tx(json!(0))).await;
     assert!(!only_hits(&d), "{d:?}");
+}
+
+/// R-P5P9-75 Q: ours lacks a chain row the oracle lists. The oracle's extra row leaves and
+/// one marker stays, carrying the missing key; the rows both hold still compare. A row only
+/// ours holds stays a plain diff.
+#[test]
+fn d2_q_missing_chain_rows_become_one_marker() {
+    use crate::graphql_norm::MISSING_CHAIN_ROWS_PATH;
+    let row = |c: &str, bal: &str| json!({"chainId": c, "balance": bal, "accountName": "k:a"});
+    let acct = |rows: Vec<Value>| {
+        d2_answer(
+            json!({"data": {"fungibleAccount": {"accountName": "k:a", "chainAccounts": rows}}}),
+        )
+    };
+    let cmp = |a: Vec<Value>, b: Vec<Value>| {
+        crate::graphql::compare_answers_with(&mut acct(a), &mut acct(b), 50, 10_000, &[], false)
+    };
+    let d = cmp(
+        vec![row("0", "1.5"), row("2", "3")],
+        vec![row("0", "1.5"), row("1", "0"), row("2", "3")],
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, MISSING_CHAIN_ROWS_PATH);
+    assert!(
+        d[0].b.as_ref().unwrap().to_string().contains("\"1\""),
+        "{d:?}"
+    );
+    // A row both hold with another balance still shows.
+    let d = cmp(
+        vec![row("0", "1.5"), row("2", "4")],
+        vec![row("0", "1.5"), row("1", "0"), row("2", "3")],
+    );
+    assert!(d.iter().any(|e| e.path.ends_with("/balance")), "{d:?}");
+    // A row only ours holds: no marker.
+    let d = cmp(vec![row("0", "1.5"), row("5", "1")], vec![row("0", "1.5")]);
+    assert!(d.iter().all(|e| e.path != MISSING_CHAIN_ROWS_PATH), "{d:?}");
+    assert!(!d.is_empty());
+}
+
+/// R-P5P9-75 (CG-4 concern 4): an allowlisted REST record is logged with its entry id (its
+/// hit counted once, from the record), bodies cut to `ALLOWLISTED_BODY`.
+#[tokio::test]
+async fn d2_rest_allowlisted_records_are_logged_with_the_entry_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = NodeMock {
+        tip: 7_000_000,
+        ..NodeMock::default()
+    };
+    let rows = |order: &[(&str, u64)]| {
+        Value::Array(
+            order
+                .iter()
+                .map(|(rk, h)| row(rk, 0, *h, &format!("B{h}")))
+                .collect(),
+        )
+    };
+    let ours = SideMock {
+        search: rows(&[("x", 10), ("y", 10), ("w", 10), ("z", 9)]),
+        ..SideMock::default()
+    };
+    let b = SideMock {
+        search: rows(&[("w", 10), ("x", 10), ("y", 10), ("z", 9)]),
+        ..SideMock::default()
+    };
+    let (ctx, _) = setup(node, ours, b, dir.path()).await;
+    let req = Request::new(
+        "/txs/search?search=coin.transfer&limit=10".to_string(),
+        Origin::Seed,
+        None,
+    );
+    let o = ctx.process(&req).await.remove(0);
+    assert_eq!(o.class, "allowlisted");
+    let rec = o.record.as_ref().expect("an allowlisted record");
+    assert_eq!(rec.allowlisted.as_deref(), Some("search-tie-order"));
+    assert!(rec.a_body_trimmed.len() <= crate::run::ALLOWLISTED_BODY + 64);
+    let s = ctx.summary.lock().unwrap();
+    assert_eq!(s.allowlist_hits.get("search-tie-order"), Some(&1));
+    drop(s);
+    let log: String = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("diffs-"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert!(
+        log.contains("\"class\":\"allowlisted\"") && log.contains("search-tie-order"),
+        "{log}"
+    );
 }

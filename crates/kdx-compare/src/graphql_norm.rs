@@ -354,6 +354,76 @@ pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> b
     hit
 }
 
+/// R-P5P9-75 Q marker: ours lacks chain rows the oracle lists (KNOWN-GAP entry
+/// `known-gap-q-missing-chain-rows`, scoped to the four account operations; never explained).
+pub const MISSING_CHAIN_ROWS_PATH: &str = "/~known-gap-missing-chain-rows";
+
+/// R-P5P9-75 Q, on the normalised answers: in each plain list (not a connection's `edges`)
+/// at the same place on both sides whose rows are all objects with a `chainId`, keyed by
+/// (`chainId`, `tokenId` when selected) with each key once per side, where ours' keys are a
+/// strict subset of the oracle's: the oracle's rows that ours lacks leave its list and the
+/// rest take ours' order, so the diff then compares the rows both hold. Returns (pointer, the
+/// keys ours lacks) per list. A row only ours holds, a key twice, or another shape: nothing.
+pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)> {
+    fn lists(v: &Value, ptr: &mut String, parent: &str, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m {
+                    let n = ptr.len();
+                    ptr.push('/');
+                    ptr.push_str(&k.replace('~', "~0").replace('/', "~1"));
+                    lists(x, ptr, k, out);
+                    ptr.truncate(n);
+                }
+            }
+            Value::Array(xs) => {
+                if parent != "edges"
+                    && !xs.is_empty()
+                    && xs.iter().all(|x| x.get("chainId").is_some())
+                {
+                    out.push(ptr.clone());
+                }
+                for (i, x) in xs.iter().enumerate() {
+                    let n = ptr.len();
+                    ptr.push_str(&format!("/{i}"));
+                    lists(x, ptr, "", out);
+                    ptr.truncate(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    let key = |r: &Value| serde_json::json!([r.get("chainId"), r.get("tokenId")]);
+    let mut ptrs = Vec::new();
+    lists(b, &mut String::new(), "", &mut ptrs);
+    let mut out = Vec::new();
+    for p in ptrs {
+        let (Some(Value::Array(ra)), Some(Value::Array(rb))) = (a.pointer(&p), b.pointer(&p))
+        else {
+            continue;
+        };
+        if ra.iter().any(|r| r.get("chainId").is_none()) {
+            continue;
+        }
+        let ka: Vec<Value> = ra.iter().map(key).collect();
+        let kb: Vec<Value> = rb.iter().map(key).collect();
+        let once = |k: &[Value]| k.iter().enumerate().all(|(i, x)| !k[..i].contains(x));
+        if !once(&ka) || !once(&kb) || ka.len() >= kb.len() || !ka.iter().all(|k| kb.contains(k)) {
+            continue;
+        }
+        let kept: Vec<Value> = ka
+            .iter()
+            .filter_map(|k| rb.iter().find(|r| key(r) == *k).cloned())
+            .collect();
+        let gone: Vec<Value> = kb.iter().filter(|k| !ka.contains(k)).cloned().collect();
+        if let Some(x) = b.pointer_mut(&p) {
+            *x = Value::Array(kept);
+            out.push((p, gone));
+        }
+    }
+    out
+}
+
 /// R-P5P9-75 I: for each `oracle_counts_heights` rule `<root>.totalCount`, the oracle's root
 /// count takes ours when it is below ours (the oracle counts heights). Only the root
 /// connection's own count: nested counts are never touched. Returns (ours, the oracle's) per

@@ -955,6 +955,16 @@ pub fn compare_answers_with(
     if crate::graphql_norm::count_self_consistent(rules, &na, &mut nb) {
         hits.push(hit(crate::graphql_norm::COUNT_SELF_CONSISTENT_PATH));
     }
+    // R-P5P9-75 Q: ours' missing chain rows become one marker, which only the KNOWN-GAP entry
+    // (four account operations) matches, and never explains.
+    for (list, missing) in crate::graphql_norm::missing_chain_rows(&na, &mut nb) {
+        hits.push(DiffEntry {
+            path: crate::graphql_norm::MISSING_CHAIN_ROWS_PATH.into(),
+            kind: DiffKind::Missing,
+            a: None,
+            b: Some(json!({ "list": list, "missing": missing })),
+        });
+    }
     // R-P5P9-75 I: the oracle counts heights on Transactions-9e58b95d (scoped by the entry).
     for (ours, oracle) in crate::graphql_norm::oracle_counts_heights(rules, &na, &mut nb) {
         hits.push(DiffEntry {
@@ -1439,11 +1449,7 @@ impl Ctx {
             let mut s = self.summary.lock().expect("summary");
             s.pair(&route, a, pair_b, &o.class);
             if let Some(rec) = &o.record {
-                if let Some(ids) = &rec.allowlisted {
-                    for id in ids.split(',') {
-                        s.allowlist_hit(id);
-                    }
-                }
+                s.record_hits(rec, &self.allow);
                 if rec.class == "diff" {
                     s.unexplained(&route, &rec.diff);
                 }
@@ -1486,6 +1492,7 @@ impl Ctx {
             diff,
             class: class.to_string(),
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
+            known_gap: None,
             curl: format!("{} ; {}", curl_of(op, vars, "A"), curl_of(op, vars, "B")),
             note,
             body_cap: None,
@@ -1620,19 +1627,14 @@ impl Ctx {
         e: &anyhow::Error,
     ) -> Outcome {
         let d = vec![entry];
-        let (unexplained, ids) = self.allow.classify_request(
-            &RouteKind::Other,
-            &format!("graphql:{}", op.stem),
-            &[],
-            &d,
-        );
-        let class = if unexplained.is_empty() {
-            "allowlisted"
-        } else {
-            "diff"
-        };
+        let c = self
+            .allow
+            .classify_known(&RouteKind::Other, &Self::gql_request(op, vars), &[], &d);
+        let (class, _) = c.class(&d);
+        let ids = c.ids.clone();
         let note = Some(format!("{e:#}"));
-        self.gql_record(op, vars, ta, b_name, a, None, "", d, class, &ids, note)
+        let o = self.gql_record(op, vars, ta, b_name, a, None, "", d, class, &ids, note);
+        Self::with_known_gap(o, &c)
     }
 
     /// Every rule on an oracle pair's two answers after the fetch, in one place for the live
@@ -2369,19 +2371,11 @@ impl Ctx {
                 record: None,
             };
         }
-        let (unexplained, ids) = self.allow.classify_request(
-            &RouteKind::Other,
-            &format!("graphql:{}", op.stem),
-            &[],
-            &d,
-        );
-        let class = if unexplained.is_empty() {
-            "allowlisted"
-        } else {
-            "diff"
-        };
-        let shown: Vec<DiffEntry> = if class == "diff" { unexplained } else { d };
-        self.gql_record(
+        let c = self
+            .allow
+            .classify_known(&RouteKind::Other, &Self::gql_request(op, vars), &[], &d);
+        let (class, shown) = c.class(&d);
+        let o = self.gql_record(
             op,
             vars,
             ta,
@@ -2391,9 +2385,25 @@ impl Ctx {
             b_raw,
             shown,
             class,
-            &ids,
+            &c.ids,
             note,
-        )
+        );
+        Self::with_known_gap(o, &c)
+    }
+
+    /// The request text the allowlist reads for a GraphQL compare: `graphql:<operation>
+    /// <variables as JSON>` (R-P5P9-75 P: a KNOWN-GAP entry is scoped to accounts by
+    /// `request_any`).
+    pub fn gql_request(op: &GqlOp, vars: &Map<String, Value>) -> String {
+        format!("graphql:{} {}", op.stem, Value::Object(vars.clone()))
+    }
+
+    /// The KNOWN-GAP entries a classified record hit go on its record (R-P5P9-75).
+    fn with_known_gap(mut o: Outcome, c: &crate::allowlist::Classified) -> Outcome {
+        if let Some(r) = o.record.as_mut() {
+            r.known_gap = (!c.known_ids.is_empty()).then(|| c.known_ids.join(","));
+        }
+        o
     }
 
     /// `pactQuery` and friends answer `NOT_SUPPORTED` (checked on A alone).
@@ -2546,23 +2556,12 @@ impl Ctx {
             raw: String::new(),
             ms: Vec::new(),
         };
-        let (unexplained, ids) = self.allow.classify_request(
-            &RouteKind::Other,
-            &format!("graphql:{}", op.stem),
-            &[],
-            &d,
-        );
-        let class = if unexplained.is_empty() {
-            "allowlisted"
-        } else {
-            "diff"
-        };
-        let shown = if unexplained.is_empty() {
-            d
-        } else {
-            unexplained
-        };
-        self.gql_record(
+        let c = self
+            .allow
+            .classify_known(&RouteKind::Other, &Self::gql_request(op, vars), &[], &d);
+        let (class, shown) = c.class(&d);
+        let ids = c.ids.clone();
+        let o = self.gql_record(
             op,
             vars,
             ta,
@@ -2574,7 +2573,8 @@ impl Ctx {
             class,
             &ids,
             None,
-        )
+        );
+        Self::with_known_gap(o, &c)
     }
 
     /// GraphQL block fields against the canonical header the node served.
