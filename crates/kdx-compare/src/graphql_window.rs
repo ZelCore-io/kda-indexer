@@ -1151,6 +1151,13 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
                     Canon::No,
                     "the row's block is not the node's block at the key's height",
                 ),
+                // R-P5P9-75 M: the oracle's row in a block the node does not hold the key in,
+                // at another known height: an orphan by block.
+                Some(_) if oracle => v(
+                    Canon::No,
+                    "the row's block is not the node's for the key, at another height: an \
+                     orphan by block",
+                ),
                 _ => v(
                     not_held(oracle),
                     "the row's block is not the node's for the key, at another height",
@@ -1161,8 +1168,31 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
     if r.height.is_some_and(|h| Some(h) != ph) {
         return v(not_held(oracle), "the node's height for the key is another");
     }
-    content_verdict(r, n, p, oracle, v)
+    let mut out = content_verdict(r, n, p, oracle, v);
+    // R-P5P9-75 E: an oracle transfer row whose (sender, receiver, amount) the key's canonical
+    // transaction on the node does not hold is off the node's chain.
+    let full = ["senderAccount", "receiverAccount", "amount"]
+        .iter()
+        .all(|k| sel(n, k).is_some());
+    if oracle
+        && full
+        && r.kind == Some(Kind::Transfer)
+        && out.canon == Canon::Unknown
+        && out.matches == 0
+        && out.why.ends_with("the node's transaction lacks the row")
+        && !out
+            .transfers
+            .iter()
+            .any(|ev| transfer_matches(n, ev, oracle))
+    {
+        out.canon = Canon::No;
+        out.why = format!("poll: {NOT_IN_NODE_TX}: the node's transaction holds no TRANSFER with the row's sender, receiver and amount");
+    }
+    out
 }
+
+/// R-P5P9-75 E: the class of an oracle row off the node's chain by its transaction.
+pub const NOT_IN_NODE_TX: &str = "oracle-row-not-in-node-tx";
 
 /// A row `/poll` does not know (a coinbase row: its request key is the coinbase's) at height
 /// `h` (its own, or the node's height of its block): the node's canonical header at `h` (on
@@ -2474,9 +2504,14 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
             continue;
         }
         match canon(&vb[j]) {
-            Canon::No => d
-                .oracle
-                .extend(g.iter().map(|&j| evidence(&p.b[j], vj, "orphan"))),
+            Canon::No => {
+                let class = match vj {
+                    Some(v) if v.why.contains(NOT_IN_NODE_TX) => NOT_IN_NODE_TX,
+                    _ => "orphan",
+                };
+                d.oracle
+                    .extend(g.iter().map(|&j| evidence(&p.b[j], vj, class)));
+            }
             Canon::Yes => {
                 let beyond = |h: u64, bd: u64| if w.asc { h > bd } else { h < bd };
                 let place = match (p.a_cut, d.lowest, hb[j]) {

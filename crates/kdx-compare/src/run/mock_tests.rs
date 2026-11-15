@@ -1836,7 +1836,8 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
     .await;
     assert!(stays_diff(&d), "{d:?}");
     // The oracle's w1 and w2 pay another receiver than the node's, in the node's canonical
-    // block: never orphans by content (R-P5P9-63 (2)), so unknown: a diff.
+    // block: never orphans by content (R-P5P9-63 (2)), but off the node's chain by its
+    // transaction (R-P5P9-75 E, CG-4 #23): explained as oracle-row-not-in-node-tx.
     let (d, _) = run(
         page(vec![
             by_height("t1", 101, "r"),
@@ -1852,8 +1853,12 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
         ]),
     )
     .await;
-    assert!(stays_diff(&d), "{d:?}");
-    // One such copy in the oracle's last slot: a diff too.
+    assert!(!stays_diff(&d), "{d:?}");
+    assert!(
+        format!("{d:?}").contains(crate::graphql_window::NOT_IN_NODE_TX),
+        "{d:?}"
+    );
+    // One such copy in the oracle's last slot: off the node's transaction too (R-P5P9-75 E).
     let (d, _) = run(
         page(vec![
             by_height("t1", 101, "r"),
@@ -1869,7 +1874,7 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
         ]),
     )
     .await;
-    assert!(stays_diff(&d), "{d:?}");
+    assert!(!stays_diff(&d), "{d:?}");
     // The same rows on both pages in another order, no height selected: the order rules
     // decide, no node read.
     let before = calls.lock().unwrap().len();
@@ -2146,8 +2151,15 @@ async fn h7_rows_without_an_index_compare_as_a_multiset() {
     let (d, note) = run(vec![u("1.0"), u("1.0")], vec![u("1.0")]).await;
     assert!(!only_hits(&d), "{d:?}");
     assert!(note.unwrap_or_default().contains("holds it 1 times"));
-    // The oracle's 3.0 is not the node's: unknown, a diff.
+    // The oracle's 3.0 is not the node's: off the node's transaction (R-P5P9-75 E), while
+    // ours' 2.0 is a node-confirmed oracle gap.
     let (d, _) = run(vec![u("1.0"), u("2.0")], vec![u("1.0"), u("3.0")]).await;
+    assert!(only_hits(&d), "{d:?}");
+    assert!(format!("{d:?}").contains("oracle-row-not-in-node-tx"));
+    // Selecting the amount alone, the oracle's 3.0 cannot be placed off the node's chain
+    // (E needs the sender, receiver and amount): unknown, a diff.
+    let v = |a: &str| h7_xrow("u", 100, json!(a), None);
+    let (d, _) = run(vec![v("1.0"), v("2.0")], vec![v("1.0"), v("3.0")]).await;
     assert!(!only_hits(&d), "{d:?}");
 }
 
@@ -6026,14 +6038,9 @@ async fn d1_d_multiset_identity_runs_the_ruled_matchers_and_the_duplicate_excuse
     .await;
     assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
     assert!(format!("{d:?}").contains("duplicate"), "{d:?}");
-    // Not the f64 rounding of ours: a diff.
-    let (d, _) = d1_settle(
-        &ctx,
-        vec![x("f", exact)],
-        vec![x("f", "65913.17")],
-        (false, false),
-    )
-    .await;
+    // Not the f64 rounding of ours (rows selecting the amount alone, so E does not apply).
+    let y = |a: &str| h7_xrow("f", 100, json!(a), None);
+    let (d, _) = d1_settle(&ctx, vec![y(exact)], vec![y("65913.17")], (false, false)).await;
     assert!(!only_hits(&d), "{d:?}");
     // The node holds w twice, ours once: the oracle's second copy is a row ours lacks.
     let (d, _) = d1_settle(
@@ -6137,4 +6144,78 @@ fn d1_g_unkeyed_nested_lists_compare_as_multisets_only_when_complete() {
         page(3, &["2e-8", "1e-8", "3e-8"]),
     );
     assert!(unfinished(&d), "{d:?}");
+}
+
+/// R-P5P9-75 E and M. E: an oracle-only transfer row whose request key's canonical
+/// transaction on the node holds no TRANSFER with its (sender, receiver, amount) is off the
+/// node's chain (CG-4 #23: another miner's gas row): explained as `oracle-row-not-in-node-tx`.
+/// The node holding the transfer, or no canonical transaction for the key, stays a diff.
+/// M: an oracle row whose block is not the node's for the key, at another height, is an
+/// orphan by block; ours must place the row at the node's block.
+#[tokio::test]
+async fn d1_e_m_oracle_rows_off_the_nodes_tx_or_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, to) in [("x0", "r"), ("e", "r"), ("m", "r")] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", to, json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x = |rk: &str, to: &str, amount: f64| h7_xrow(rk, 100, json!(amount), Some(("s", to)));
+    let x0 = x("x0", "r", 1.0);
+    // E: the oracle's gas row to another miner, which the node's transaction of e lacks.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), x("e", "miner2", 0.0000323)],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        format!("{d:?}").contains("oracle-row-not-in-node-tx"),
+        "{d:?}"
+    );
+    // The node holds e's transfer: a row ours lacks, a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), x("e", "r", 1.0)],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // No canonical transaction for the key on the node: a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), x("q", "miner2", 0.5)],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // M: the oracle places m in X90 at height 90; the node's block for m is B100.
+    let at = |b: &str, h: u64| {
+        let mut e = h7_xrow("m", h, json!(1.0), Some(("s", "r")));
+        e["node"]["blockHash"] = json!(b);
+        e
+    };
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![at("B100", 100)],
+        vec![at("X90", 90)],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(format!("{d:?}").contains("orphan"), "{d:?}");
+    // Ours places m in X90 too: not the node's block, a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x0.clone(), at("X90", 90)],
+        vec![x0.clone()],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
 }
