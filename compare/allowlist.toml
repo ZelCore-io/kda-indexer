@@ -25,9 +25,10 @@ id = "orphan-rows-txs"
 route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
-reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. The harness moves non-canonical rows under /orphans before diffing. Against chainweb-data (no oracle) the rows of blocks other than A's go under /orphans (the node pair checks that A's block is canonical), and chainweb-data's /txs/tx answers 404 for such a request key (seen live: YbvRG1..., chain 2, canonical block QCOhs8... and orphan du_5-bB... at one height); the harness then confirms with one /txs/txs call and reports /orphans."
+request_any = ["/txs/tx?", "/txs/recent"]
+reason = "/txs/txs in chainweb-data can return rows from orphaned blocks; kda-indexer keeps canonical blocks only. Scoped (R-P5P9-78, H2 m-7) to the two requests whose /orphans this entry covers, both node-checked: chainweb-data's /txs/tx answers 404 for a request key it holds in several blocks (seen live: YbvRG1..., chain 2, canonical block QCOhs8... and orphan du_5-bB... at one height); the harness then confirms with one /txs/txs call that it lists A's block plus others, and reports the others under /orphans only when none of them is the node's canonical block there. On /txs/recent, a chainweb-data row whose request key A lists in another block goes under /orphans, A's row in its place, only when the node's canonical block at A's chain and height is A's (seen live: qTm3DYap..., chain 14 height 7395953, chainweb-data block G33Rgc_P beside the canonical rt2smpaG). Account, event and /v1/txs orphans are oracle-orphan-rows'."
 status = "PROPOSED"
-ruling = "Spec section 4.5 (builder call: orphans are not kept); R3E-9 extends it (oracle-orphan-rows)."
+ruling = "Spec section 4.5 (builder call: orphans are not kept); R3E-9 extends it (oracle-orphan-rows); R-P5P9-78 (H2 m-7): scoped apart from oracle-orphan-rows, so each is hit."
 owner_note = "Builder call (spec section 4.5): orphans are not kept."
 
 [[entry]]
@@ -373,9 +374,10 @@ id = "oracle-orphan-rows"
 route = "*"
 json_path_glob = "/orphans**"
 condition = "any"
-reason = "chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height, or, where kda-indexer lists no row at that chain and height, after the node's canonical block there is another one (seen live: k:b649fd12...?token=coin, chainweb-data row in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M)."
+request_any = ["/txs/account/", "/txs/events", "/v1/txs/"]
+reason = "Scoped (R-P5P9-78, H2 m-7) to account, event and /v1/txs requests; /txs/tx and /txs/recent orphans are orphan-rows-txs'. chainweb-data (account, events) and kda-txs (/v1/txs) can list a tx in a block that is not canonical (seen live: 2rqJEvT9... at chain 0 height 6286753, node canonical mxw3QFzu..., both oracles BiThOhus...). The harness moves such rows under /orphans only after the node confirms kda-indexer's block at that chain and height, or, where kda-indexer lists no row at that chain and height, after the node's canonical block there is another one (seen live: k:b649fd12...?token=coin, chainweb-data row in ytgyQjrM at chain 0 height 6894865, canonical TDOizl_M)."
 status = "ACCEPTED"
-ruling = "R3E-9; spec section 4.5; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence)."
+ruling = "R3E-9; spec section 4.5; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence); R-P5P9-78 (H2 m-7): no longer shadowed by orphan-rows-txs."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R3E-9: the node confirms ours' block)."
 
 [[entry]]

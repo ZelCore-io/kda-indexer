@@ -3790,6 +3790,41 @@ mod tests {
         assert!(left.is_empty() && ids == vec!["oracle-tip-lag".to_string()]);
     }
 
+    /// R-P5P9-78 (H2 m-7): `/orphans` is credited to the entry whose rule produced it, so
+    /// each orphan entry is hit: account, events and /v1/txs to the ACCEPTED
+    /// `oracle-orphan-rows`, /txs/tx (404) and /txs/recent to `orphan-rows-txs`; a request
+    /// neither covers stays a diff.
+    #[test]
+    fn orphan_entries_are_scoped_so_each_is_hit() {
+        let al = crate::allowlist::Allowlist::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+        )
+        .unwrap();
+        let orphans = [DiffEntry {
+            path: "/orphans".into(),
+            kind: DiffKind::Missing,
+            a: None,
+            b: Some(json!([{"blockHash": "x"}])),
+        }];
+        let id = |route: RouteKind, request: &str| {
+            let (left, ids) = al.classify_request(&route, request, &[], &orphans);
+            left.is_empty().then(|| ids.join(","))
+        };
+        let node_checked = Some("oracle-orphan-rows".to_string());
+        let txs = Some("orphan-rows-txs".to_string());
+        assert_eq!(
+            id(RouteKind::Account, "/txs/account/k:ab?token=coin"),
+            node_checked
+        );
+        let events = "/txs/events?modulename=coin&name=TRANSFER";
+        assert_eq!(id(RouteKind::Events, events), node_checked);
+        assert_eq!(id(RouteKind::V1Txs, "/v1/txs/k:ab/coin/250"), node_checked);
+        assert_eq!(id(RouteKind::Tx, "/txs/tx?requestkey=YbvRG1"), txs);
+        assert_eq!(id(RouteKind::Recent, "/txs/recent?limit=50"), txs);
+        assert_eq!(id(RouteKind::Search, "/txs/search?search=coin"), None);
+        assert_eq!(id(RouteKind::Txs, "/txs/txs?requestkey=YbvRG1"), None);
+    }
+
     #[test]
     fn coins_tolerance_scales_with_the_tip_gap() {
         // Run 6E-3, 04:43:29Z: A - B = 2,621.7 KDA, chainweb-data ~145 heights behind.
