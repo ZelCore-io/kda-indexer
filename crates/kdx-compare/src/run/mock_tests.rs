@@ -5717,3 +5717,105 @@ async fn c7_equal_page_cut_answers_are_allowlisted() {
     .await;
     assert_eq!(class, "allowlisted", "{note}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-75, harness round D1 (CG-4's identity and structure classes)
+
+/// A 43-character coinbase key (a parent block hash) from a short tag.
+fn d1_key(tag: &str) -> String {
+    format!("{tag:_<43}")
+}
+
+/// The oracle's coinbase `requestKey` form (CG-4 class C): base64 of the JSON-quoted key.
+fn d1_encoded(key: &str) -> String {
+    crate::graphql::base64_std(format!("\"{key}\"").as_bytes())
+}
+
+/// A node holding block `B<h>` at height `h` on chain 0 whose parent is `parent` and whose
+/// coinbase (key `cb_key`) pays `miner` 1.5.
+fn d1_coinbase_node(h: u64, parent: &str, cb_key: &str) -> NodeMock {
+    let mut node = NodeMock::default();
+    node.headers.insert(
+        (0, h),
+        vec![json!({"hash": format!("B{h}"), "height": h, "chainId": 0,
+            "parent": parent, "payloadHash": format!("P{h}")})],
+    );
+    let cb = json!({"reqKey": cb_key, "events": [{"name": "TRANSFER",
+        "module": {"name": "coin"}, "params": ["", "miner", 1.5]}]})
+    .to_string();
+    node.payloads.insert(
+        format!("P{h}"),
+        json!({"coinbase": kdx_types::hash::b64url_encode(cb.as_bytes())}),
+    );
+    node
+}
+
+/// R-P5P9-75 C: the oracle's coinbase `requestKey` is 60 characters of base64 over the
+/// JSON-quoted key. It is decoded for the row's identity and the row is settled on the
+/// coinbase path (the block's header and its parent), never `/poll`. The served difference is
+/// explained only when the decoded key is ours and ours is the node's coinbase key (the parent
+/// hash); a key that decodes to another, or a node whose coinbase key is another, stays a diff.
+#[tokio::test]
+async fn d1_c_the_oracle_coinbase_request_key_is_decoded_and_settled_on_the_coinbase_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = d1_key("Y_oq3-w1");
+    assert_eq!(d1_encoded(&k).len(), 60);
+    let row = |rk: &str| h7_xrow(rk, 100, json!(1.5), Some(("", "miner")));
+    let run = |node: NodeMock, a: Vec<Value>, b: Vec<Value>| {
+        let dir = dir.path().to_path_buf();
+        async move {
+            let calls = node.calls.clone();
+            let ctx = gql_ctx(node, &dir).await;
+            let mut a = h7_page("transfers", false, a);
+            let mut b = h7_page("transfers", false, b);
+            let out = ctx
+                .gql_settle(
+                    &ctx.targets["a"],
+                    &serde_json::Map::new(),
+                    &mut a,
+                    &mut b,
+                    7_000_000,
+                    false,
+                )
+                .await;
+            let polls = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.contains("poll"))
+                .count();
+            (out, polls)
+        }
+    };
+    // Ours the node's key, the oracle's that key encoded: explained, without a /poll read.
+    let ((d, note), polls) = run(
+        d1_coinbase_node(100, &k, &k),
+        vec![row(&k)],
+        vec![row(&d1_encoded(&k))],
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_window::COINBASE_KEY_PATH),
+        "{d:?}"
+    );
+    assert_eq!(polls, 0, "a coinbase row is not polled");
+    // A 60-character key that decodes to a key other than ours or the node's: a diff.
+    let other = d1_key("Z_other");
+    let ((d, _), _) = run(
+        d1_coinbase_node(100, &k, &k),
+        vec![row(&k)],
+        vec![row(&d1_encoded(&other))],
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The decoded key is ours, but the node's coinbase key (the block's parent) is another.
+    let ((d, _), _) = run(
+        d1_coinbase_node(100, &other, &other),
+        vec![row(&k)],
+        vec![row(&d1_encoded(&k))],
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}

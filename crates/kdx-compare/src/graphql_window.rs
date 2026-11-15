@@ -78,6 +78,9 @@ pub const SHORT_PAGE_PATH: &str = "/~graphql-h7-short-page";
 pub const UNDECIDED_PATH: &str = "/~graphql-h7-undecided";
 /// Ours' page size cap (Q10): a page of `first` above it holds this many rows.
 pub const OURS_PAGE_CAP: u64 = 100;
+/// R-P5P9-75 C: the oracle's base64-encoded coinbase `requestKey` that decodes to ours' key,
+/// ours being the node's coinbase key (the block's parent hash).
+pub const COINBASE_KEY_PATH: &str = "/~graphql-r75-coinbase-request-key";
 const ROUTE: &str = "graphql-window-referee";
 
 fn text(v: &Value) -> Option<String> {
@@ -182,6 +185,9 @@ pub struct RowId {
     pub index: Option<i64>,
     /// The oracle's sort key (the tx's `creationTime`), when selected.
     pub ctime: Option<String>,
+    /// R-P5P9-75 C: the oracle's coinbase `requestKey` as sent (base64 of the JSON-quoted
+    /// key), when `rk` holds its decoded key.
+    pub encoded_rk: Option<String>,
 }
 
 impl RowId {
@@ -212,10 +218,32 @@ impl RowId {
     }
 
     pub fn evidence(&self) -> Value {
-        json!({"kind": self.kind.map(Kind::as_str), "chain": self.chain,
+        let mut e = json!({"kind": self.kind.map(Kind::as_str), "chain": self.chain,
             "requestKey": self.rk, "index": self.index, "block": self.block,
-            "height": self.height})
+            "height": self.height});
+        if let Some(x) = &self.encoded_rk {
+            e["encodedRequestKey"] = json!(x);
+        }
+        e
     }
+}
+
+/// R-P5P9-75 C: the key in the oracle's coinbase `requestKey` form, 60 characters of base64
+/// (either alphabet) over a JSON string; `None` for any other text.
+pub fn decode_coinbase_rk(s: &str) -> Option<String> {
+    if s.len() != 60 {
+        return None;
+    }
+    let url: String = s
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect();
+    let b = kdx_types::hash::b64url_decode(&url).ok()?;
+    serde_json::from_slice::<String>(&b).ok()
 }
 
 /// The identity of a root list row (`edges[i]`) in the shapes the operations select.
@@ -293,6 +321,7 @@ pub fn row_id(e: &Value) -> RowId {
         rk,
         index,
         ctime: get(&["/creationTime", "/cmd/meta/creationTime"]),
+        encoded_rk: None,
     }
 }
 
@@ -1084,6 +1113,13 @@ pub fn coinbase_verdict(
             "the row's block is not the node's canonical block at its height",
         );
     }
+    // R-P5P9-75 C: a decoded coinbase key is the block's parent hash.
+    if r.encoded_rk.is_some() && hd.get("parent").and_then(Value::as_str) != r.rk.as_deref() {
+        return v(
+            not_held(oracle),
+            "the decoded coinbase key is not the block's parent hash",
+        );
+    }
     let Some(cb) = payload
         .and_then(|p| p.get("coinbase"))
         .and_then(Value::as_str)
@@ -1674,6 +1710,23 @@ fn node_of(r: &Row) -> &Value {
     r.edge.get("node").unwrap_or(&Value::Null)
 }
 
+/// Whether ours' row node `x` is the oracle's row `rb` in every selected field (R-P5P9-63
+/// (3)); an encoded coinbase key of the oracle's compares in its decoded form (R-P5P9-75 C).
+fn same_node(x: &Value, rb: &Row) -> bool {
+    let y = node_of(rb);
+    match (
+        &rb.id.encoded_rk,
+        y.get("requestKey").and_then(Value::as_str),
+    ) {
+        (Some(enc), Some(k)) if k == enc => {
+            let mut y = y.clone();
+            y["requestKey"] = json!(rb.id.rk);
+            *x == y
+        }
+        _ => x == y,
+    }
+}
+
 /// Both pages' rows, identified.
 #[derive(Debug, Clone)]
 pub struct Prep {
@@ -1706,14 +1759,20 @@ fn group<'a>(rows: &'a [Row], live: &[usize]) -> (Vec<&'a str>, HashMap<&'a str,
 /// The rows of two root connections (ours `ca`, the oracle's `cb`) with their identities.
 /// Fails when a row's identity cannot be decided.
 pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
-    let rows = |c: &Value| -> Result<Vec<Row>, String> {
+    let rows = |c: &Value, oracle: bool| -> Result<Vec<Row>, String> {
         let mut out = Vec::new();
         for e in c
             .get("edges")
             .and_then(Value::as_array)
             .ok_or("a page without edges")?
         {
-            let id = row_id(e);
+            let mut id = row_id(e);
+            // R-P5P9-75 C: the oracle's coinbase key form, decoded for the identity.
+            if oracle && id.kind != Some(Kind::Block) {
+                if let Some(k) = id.rk.as_deref().and_then(decode_coinbase_rk) {
+                    id.encoded_rk = id.rk.replace(k);
+                }
+            }
             let key = id.key().ok_or_else(|| {
                 format!("a row whose identity cannot be decided: {}", id.evidence())
             })?;
@@ -1726,8 +1785,8 @@ pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
         Ok(out)
     };
     Ok(Prep {
-        a: rows(ca)?,
-        b: rows(cb)?,
+        a: rows(ca, false)?,
+        b: rows(cb, true)?,
         a_cut: more(ca),
         b_cut: more(cb),
     })
@@ -1770,7 +1829,7 @@ fn matching(p: &Prep, live_a: &[usize], live_b: &[usize]) -> Matching {
         for &i in ia {
             match free
                 .iter()
-                .position(|&j| node_of(&p.b[j]) == node_of(&p.a[i]))
+                .position(|&j| same_node(node_of(&p.a[i]), &p.b[j]))
             {
                 Some(x) => m.pairs.push((i, free.remove(x))),
                 None => m.ours.push(i),
@@ -1814,6 +1873,13 @@ impl Prep {
             }
         }
         out.extend(m.oracle.iter().map(|g| (1, g[0])));
+        // R-P5P9-75 C: a paired oracle row with an encoded coinbase key, on the node.
+        out.extend(
+            m.pairs
+                .iter()
+                .filter(|(_, j)| self.b[*j].id.encoded_rk.is_some())
+                .map(|&(_, j)| (1, j)),
+        );
         out
     }
 
@@ -1868,6 +1934,8 @@ pub struct Decision {
     pub oracle_lowest_ctime: Option<String>,
     /// An oracle-only row at our boundary height waits for our longer read (I-1).
     pub needs_prefix: bool,
+    /// R-P5P9-75 C: paired oracle rows whose encoded coinbase key the node confirmed.
+    pub coinbase_keys: Vec<usize>,
 }
 
 impl Decision {
@@ -1924,7 +1992,7 @@ fn after_our_cut(prefix: Option<&Result<Longer, String>>, ours: &[Row], rb: &Row
     }
     let later = rows[ours.len()..]
         .iter()
-        .any(|(k, n)| *k == rb.key && (rb.id.indexed() || n == node_of(rb)));
+        .any(|(k, n)| *k == rb.key && (rb.id.indexed() || same_node(n, rb)));
     if later {
         Place::Outside("after-our-cut")
     } else if capped {
@@ -2023,6 +2091,25 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
             continue;
         }
         d.pairs.push((i, j));
+        // R-P5P9-75 C: the decoded key is ours (paired by it), and the node's coinbase key.
+        if p.b[j].id.encoded_rk.is_some() {
+            match vb[j].as_ref() {
+                Some(v) if v.canon == Canon::Yes => d.coinbase_keys.push(j),
+                Some(v) if v.canon == Canon::No => d.rejected.push((
+                    None,
+                    Some(p.b[j].edge.clone()),
+                    format!(
+                        "an oracle coinbase requestKey the node does not hold ({})",
+                        v.why
+                    ),
+                )),
+                v => d.undecided.push(format!(
+                    "an oracle coinbase requestKey the node did not settle ({}): {}",
+                    why_of(v),
+                    p.b[j].id.evidence()
+                )),
+            }
+        }
         let jb = &gb[ra.key.as_str()];
         if ra.id.indexed() && jb.len() > 1 {
             // The node holds the row once: the oracle's other copies are duplicates.
@@ -2478,12 +2565,29 @@ impl Ctx {
             .enumerate()
             .map(|(n, (i, _))| tag(&prep.a[*i].edge, n))
             .collect();
-        let eb: Vec<Value> = d
+        let mut eb: Vec<Value> = d
             .pairs
             .iter()
             .enumerate()
             .map(|(n, (_, j))| tag(&prep.b[*j].edge, n))
             .collect();
+        // R-P5P9-75 C: the confirmed coinbase keys take their decoded form.
+        let mut keys = Vec::new();
+        for (n, (_, j)) in d.pairs.iter().enumerate() {
+            let id = &prep.b[*j].id;
+            let (Some(enc), Some(rk)) = (&id.encoded_rk, &id.rk) else {
+                continue;
+            };
+            let node = eb[n].get_mut("node");
+            if let Some(x) = node.and_then(|x| x.get_mut("requestKey")) {
+                if d.coinbase_keys.contains(j) && x.as_str() == Some(enc.as_str()) {
+                    *x = json!(rk);
+                    keys.push(
+                        json!({"oracle": enc, "decoded": rk, "via": why_of(vb[*j].as_ref())}),
+                    );
+                }
+            }
+        }
         for (ans, edges) in [(a, ea), (b, eb)] {
             if let Some(c) = ans
                 .body
@@ -2496,6 +2600,13 @@ impl Ctx {
         let mut out = Vec::new();
         if d.above > 0 {
             out.push(entry(crate::graphql::ORACLE_STALL_PATH, None, None));
+        }
+        if !keys.is_empty() {
+            out.push(entry(
+                COINBASE_KEY_PATH,
+                None,
+                Some(json!({ "keys": keys })),
+            ));
         }
         if d.rejected.is_empty() {
             out.push(entry(WINDOW_PATH, Some(ev_a), Some(ev_b)));
@@ -2592,9 +2703,14 @@ impl Ctx {
         let Some(rk) = id.rk.clone() else {
             return Verdict::unknown("no request key");
         };
-        let polled = match self.h7_poll(chain, &rk, st).await {
-            Ok(p) => p,
-            Err(w) => return Verdict::unknown(w),
+        // R-P5P9-75 C: a decoded coinbase key is settled on the coinbase path, never /poll.
+        let polled = if id.encoded_rk.is_some() {
+            None
+        } else {
+            match self.h7_poll(chain, &rk, st).await {
+                Ok(p) => p,
+                Err(w) => return Verdict::unknown(w),
+            }
         };
         if let Some(p) = polled {
             // A row in another block than the node's, without a height: the node's height of
@@ -3466,6 +3582,7 @@ mod tests {
             rk: Some("k".into()),
             index,
             ctime: None,
+            encoded_rk: None,
         };
         let poll = |b: &str, h: u64, evs: Value| json!({"metaData": {"blockHash": b, "blockHeight": h}, "events": evs});
         let xfer = json!({"name": "TRANSFER", "params": ["s", "r", {"decimal": "1.50"}]});
