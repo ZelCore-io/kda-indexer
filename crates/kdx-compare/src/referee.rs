@@ -171,6 +171,33 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
             rep.refereed += 1;
             let head = json!({"at": at, "ts": rec.ts, "request": rec.request,
                 "a": rec.a_target, "b": rec.b_target});
+            // R-P5P9-86 S′ with R-P5P9-87: a NodeBalance record against ours' native API
+            // (labelled `node` before S′) is settled by its stored form.
+            if native_op(&ctx, &rec).is_some() {
+                match settle_native(&ctx, &rec).await {
+                    Err(why) => {
+                        let class = format!("not refereed: {why}");
+                        not_refereed(&mut rep, head, &class, why);
+                    }
+                    Ok((d, ids)) if d.is_empty() => {
+                        rep.explained += 1;
+                        for id in ids {
+                            count(&mut rep, id);
+                        }
+                    }
+                    Ok((d, ids)) => {
+                        rep.unexplained += 1;
+                        count(&mut rep, "unexplained: native-skew".into());
+                        let mut v = head;
+                        v["class"] = json!("native-skew");
+                        v["unexplainedCount"] = json!(d.len());
+                        v["unexplained"] = json!(d);
+                        v["explainedBy"] = json!(ids);
+                        rep.still_unexplained.push(v);
+                    }
+                }
+                continue;
+            }
             let oracle = match ctx.targets.get(&rec.b_target) {
                 None => Err(format!("B target {} is not configured here", rec.b_target)),
                 Some(t) if t.kind != TargetKind::GraphqlOracle => Err(format!(
@@ -351,4 +378,82 @@ async fn settle(ctx: &Ctx, rec: &DiffRecord) -> Result<Settled, String> {
         note,
         hits,
     })
+}
+
+/// The NodeBalance operation of a stored record whose B is not an oracle (R-P5P9-86 S′).
+fn native_op<'a>(ctx: &'a Ctx, rec: &DiffRecord) -> Option<&'a crate::graphql::GqlOp> {
+    let stem = rec.request.split_once(' ')?.0;
+    let op = ctx.gql.ops.iter().find(|o| o.stem == stem)?;
+    let oracle = ctx
+        .targets
+        .get(&rec.b_target)
+        .is_some_and(|t| t.kind == TargetKind::GraphqlOracle);
+    (op.kind == crate::graphql::OpKind::NodeBalance && !oracle).then_some(op)
+}
+
+/// Unix seconds of a record's `ts` (`YYYY-MM-DDTHH:MM:SS[.fff]Z`).
+fn ts_secs(ts: &str) -> Option<u64> {
+    let (d, t) = ts.strip_suffix('Z')?.split_once('T')?;
+    let n = |x: &str| x.parse::<i64>().ok();
+    let mut dp = d.split('-');
+    let (y, m, dd) = (n(dp.next()?)?, n(dp.next()?)?, n(dp.next()?)?);
+    let mut tp = t.split(':');
+    let (hh, mm) = (n(tp.next()?)?, n(tp.next()?)?);
+    let ss = n(tp.next()?.split('.').next()?)?;
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + dd - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3_600 + mm * 60 + ss).ok()
+}
+
+/// R-P5P9-86 S′, the stored form: every entry is a `/chain<N>/balance` gap that
+/// [`Ctx::native_skew_stored`] settles; any other entry stays unexplained. Returns the
+/// unexplained entries and the explaining ids.
+async fn settle_native(
+    ctx: &Ctx,
+    rec: &DiffRecord,
+) -> Result<(Vec<DiffEntry>, Vec<String>), String> {
+    let vars: Map<String, Value> = rec
+        .request
+        .split_once(' ')
+        .and_then(|(_, v)| serde_json::from_str(v).ok())
+        .ok_or("the variables are not JSON")?;
+    let account = vars
+        .get("accountName")
+        .and_then(Value::as_str)
+        .ok_or("no accountName")?;
+    let ts = ts_secs(&rec.ts).ok_or("the record's time does not read")?;
+    let mut d = Vec::new();
+    for e in &rec.diff {
+        let chain = e
+            .path
+            .strip_prefix("/chain")
+            .and_then(|p| p.strip_suffix("/balance"))
+            .and_then(|c| c.parse::<u8>().ok());
+        let dec = |v: &Option<Value>| v.as_ref().and_then(Value::as_str).map(str::to_string);
+        let settled = match (chain, dec(&e.a), dec(&e.b)) {
+            (Some(c), Some(x), Some(y)) => ctx.native_skew_stored(c, account, &x, &y, ts).await,
+            _ => Err("not a balance gap".into()),
+        };
+        match settled {
+            Ok(ev) => d.push(DiffEntry {
+                path: crate::graphql::NATIVE_SKEW_PATH.into(),
+                kind: crate::report::DiffKind::Changed,
+                a: Some(json!({"stored": ev, "gap": [e.a, e.b]})),
+                b: None,
+            }),
+            Err(why) => {
+                let mut x = e.clone();
+                x.b = Some(json!({"native": e.b, "why": why}));
+                d.push(x);
+            }
+        }
+    }
+    let req = format!("graphql:{}", rec.request);
+    let (un, ids) = ctx.allow.classify_request(&RouteKind::Other, &req, &[], &d);
+    Ok((un, ids))
 }

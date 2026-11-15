@@ -995,6 +995,11 @@ pub fn compare_answers_with(
     d
 }
 
+/// R-P5P9-86 S′: ours' GraphQL balance against ours' native one differs by miner skew: live,
+/// a re-read in the other order agrees; stored, the gap is 1 to 3 of the chain's coinbase
+/// rewards and the node shows the account receiving that many in the record's height window.
+pub const NATIVE_SKEW_PATH: &str = "/~graphql-native-miner-skew";
+
 /// Why a follow page fails the whole fetch (R-P5P9-64 I-3): a status other than 200,
 /// GraphQL `errors`, no `data` or no root connection. Such a page is never read as a cut page.
 pub fn follow_page_fault(status: u16, page: &Value) -> Option<String> {
@@ -2621,14 +2626,16 @@ impl Ctx {
             normalize_gql(v, u64::MAX);
         }
         let d = diff(&got, &want);
-        self.gql_node_outcome(op, vars, ta, d, &want)
+        self.gql_node_outcome(op, vars, ta, "node", d, &want)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gql_node_outcome(
         &self,
         op: &GqlOp,
         vars: &Map<String, Value>,
         ta: &Target,
+        b_name: &str,
         d: Vec<DiffEntry>,
         want: &Value,
     ) -> Outcome {
@@ -2654,7 +2661,7 @@ impl Ctx {
             op,
             vars,
             ta,
-            "node",
+            b_name,
             Some(&dummy),
             Some(200),
             &want.to_string(),
@@ -2709,7 +2716,7 @@ impl Ctx {
             normalize_gql(v, u64::MAX);
         }
         let d = diff(&got, &want);
-        self.gql_node_outcome(op, vars, ta, d, &want)
+        self.gql_node_outcome(op, vars, ta, "node", d, &want)
     }
 
     /// GraphQL chain balances and guards against `/local` `details` (H-1), retried once after a
@@ -2889,11 +2896,11 @@ impl Ctx {
         }
         // R-P5P9-58: a record with real diffs keeps its skew entries too.
         last.extend(skews);
-        self.gql_node_outcome(op, vars, ta, last, &Value::Null)
+        self.gql_node_outcome(op, vars, ta, "node", last, &Value::Null)
     }
 
     /// The internal pair: GraphQL chain balances against the native balances API.
-    async fn gql_native_balance(
+    pub(crate) async fn gql_native_balance(
         &self,
         ta: &Target,
         tb: &Target,
@@ -2996,7 +3003,65 @@ impl Ctx {
             }
         }
         d.dedup_by(|x, y| x.path == y.path && x.a.is_none() && y.a.is_none());
-        self.gql_node_outcome(op, vars, ta, d, &Value::Null)
+        // R-P5P9-86 S′: on a gap, one re-read in the other order (native, then GraphQL,
+        // within 1 s). Miner skew only when the re-read agrees on every chain with a gap.
+        let gaps: Vec<String> = d
+            .iter()
+            .filter_map(|e| e.path.strip_prefix("/chain")?.strip_suffix("/balance"))
+            .map(str::to_string)
+            .collect();
+        if !gaps.is_empty() && gaps.len() == d.len() {
+            let mut native = Vec::new();
+            for c in &gaps {
+                native.push(self.native_coin_balance(tb, account, c).await);
+            }
+            let again = self.gql_a_data(ta, op, vars).await.ok();
+            let ours = |c: &str| {
+                again
+                    .as_ref()?
+                    .pointer("/fungibleAccount/chainAccounts")?
+                    .as_array()?
+                    .iter()
+                    .find(|r| text_decimal(r.get("chainId")).as_deref() == Some(c))
+                    .and_then(|r| text_decimal(r.get("balance")))
+            };
+            let agree = gaps.iter().zip(&native).all(|(c, n)| {
+                n.as_ref()
+                    .zip(ours(c))
+                    .is_some_and(|(n, o)| same_decimal(&o, n))
+            });
+            if agree {
+                let first: Vec<Value> = d.iter().map(|e| json!([e.path, e.a, e.b])).collect();
+                d = vec![DiffEntry {
+                    path: NATIVE_SKEW_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: Some(json!({"first": first, "reread": "agrees", "chains": gaps})),
+                    b: None,
+                }];
+            }
+        }
+        // R-P5P9-86 S′: the pair's B is the native target, not the node.
+        self.gql_node_outcome(op, vars, ta, &tb.name, d, &Value::Null)
+    }
+
+    /// Ours' native coin balance of `account` on `chain` (R-P5P9-86 S′'s re-read); `None`
+    /// when it does not read.
+    async fn native_coin_balance(&self, tb: &Target, account: &str, chain: &str) -> Option<String> {
+        let path = format!(
+            "/api/v1/accounts/{}/balances?token=coin&chain={chain}",
+            crate::gen::enc_segment(account)
+        );
+        let cap = tb.get(&path).await.ok().filter(|c| c.status == 200)?;
+        let rows = cap.json()?.get("items")?.as_array()?.clone();
+        rows.into_iter()
+            .find(|x| {
+                x.get("module").and_then(Value::as_str) == Some("coin")
+                    && x.get("chain")
+                        .and_then(Value::as_u64)
+                        .map(|c| c.to_string())
+                        == Some(chain.to_string())
+            })
+            .and_then(|x| text_decimal(x.get("balance")))
     }
 }
 

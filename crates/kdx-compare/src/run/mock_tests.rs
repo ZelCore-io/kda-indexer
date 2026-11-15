@@ -8250,3 +8250,150 @@ async fn e2_u_the_public_key_filter_against_the_nodes_signers() {
     assert!(!un.is_empty(), "{note}");
     assert!(note.contains("publicKey: no signer"), "{note}");
 }
+
+/// R-P5P9-86 S′, live: the native pair is labelled with its B target (`gql|native`), and a
+/// gap is re-read once in the other order. A re-read that agrees is miner skew; one that
+/// still differs stays a diff.
+#[tokio::test]
+async fn e2_s_the_native_pair_rereads_a_gap_in_the_other_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let native = serve(Router::new().route(
+        "/api/v1/accounts/{a}/balances",
+        get(|| async {
+            Json(json!({"items": [{"module": "coin", "chain": 0, "balance": "10.904046"}]}))
+        }),
+    ))
+    .await;
+    let run = |late: bool| {
+        let (nu, native, dir) = (nu.clone(), native.clone(), dir.path().to_path_buf());
+        async move {
+            let n = Arc::new(AtomicUsize::new(0));
+            let gql = ours_fn_server(move |_: &Value| {
+                // The first read is a block behind; the re-read (when `late`) has caught up.
+                let k = n.fetch_add(1, O::SeqCst);
+                let bal = if late && k > 0 { "10.904046" } else { "10.0" };
+                json!({"data": {"fungibleAccount": {"chainAccounts": [
+                    {"chainId": "0", "balance": bal, "guard": null}]}}})
+            })
+            .await;
+            let own =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/graphql");
+            let allow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../compare/allowlist.toml");
+            let cfg: CompareConfig = toml::from_str(&format!(
+                "network = \"mainnet01\"\npairs = [[\"gql\", \"native\"]]\nallowlist = {allow:?}\n\
+                 out_dir = {dir:?}\n[node]\nurl = \"{nu}\"\ntimeout_ms = 5000\n[graphql]\n\
+                 own_ops_dir = {own:?}\n[targets.gql]\nurl = \"{gql}\"\n\
+                 kind = \"kda_indexer_graphql\"\n[targets.native]\nurl = \"{native}\"\n\
+                 kind = \"kda_indexer_native\"\n"
+            ))
+            .unwrap();
+            let ctx = Ctx::new(cfg).await.unwrap();
+            let op = ctx
+                .gql
+                .ops
+                .iter()
+                .find(|o| o.stem == "NodeBalance")
+                .unwrap()
+                .clone();
+            let vars = h7_vars(&[("accountName", json!("k:m"))]);
+            ctx.gql_native_balance(&ctx.targets["gql"], &ctx.targets["native"], &op, &vars)
+                .await
+        }
+    };
+    let o = run(true).await;
+    assert_eq!(o.class, "allowlisted", "{:?}", o.record);
+    assert!(o
+        .allowlist_ids
+        .contains(&"graphql-native-miner-skew".to_string()));
+    let rec = o.record.unwrap();
+    assert_eq!(rec.b_target, "native");
+    let o = run(false).await;
+    assert_eq!(o.class, "diff", "{:?}", o.record);
+    let rec = o.record.unwrap();
+    assert_eq!(rec.b_target, "native");
+    assert!(
+        rec.diff.iter().any(|e| e.path == "/chain0/balance"),
+        "{:?}",
+        rec.diff
+    );
+}
+
+/// R-P5P9-86 S′ with R-P5P9-87, stored: a CG-5 NodeBalance record (labelled `node`) is miner
+/// skew only when its gap is k (1 to 3) coinbases of one amount that the node's canonical
+/// blocks in the record's height window pay the account. Here the node pays k:m at heights
+/// 100 and 101 (the record's time is height 100's): a gap of one coinbase is explained; three
+/// (the node shows two), or a gap that is no multiple, stay unexplained.
+#[tokio::test]
+async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
+    use crate::report::{DiffEntry, DiffKind};
+    let dir = tempfile::tempdir().unwrap();
+    let base: u64 = 1_794_733_200;
+    let mut node = NodeMock {
+        tip: 110,
+        ..NodeMock::default()
+    };
+    for h in 85..=110u64 {
+        let t = (base as i64 + (h as i64 - 100) * 30) as u64 * 1_000_000;
+        node.headers.insert(
+            (0, h),
+            vec![json!({"hash": format!("H{h}"), "height": h, "chainId": 0,
+                "creationTime": t, "payloadHash": format!("P{h}")})],
+        );
+        let miner = if h == 100 || h == 101 { "k:m" } else { "k:o" };
+        let cb = json!({"events": [{"name": "TRANSFER", "module": {"name": "coin"},
+            "params": ["", miner, 0.904046]}]})
+        .to_string();
+        node.payloads.insert(
+            format!("P{h}"),
+            json!({"transactions": [], "coinbase": kdx_types::hash::b64url_encode(cb.as_bytes())}),
+        );
+    }
+    let nu = node_server(node).await;
+    let ops = c3_ops(dir.path());
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compare/graphql/NodeBalance.graphql"),
+        ops.join("NodeBalance.graphql"),
+    )
+    .unwrap();
+    let cfg = || {
+        c3_cfg(
+            &nu,
+            "http://127.0.0.1:9/graphql",
+            "https://oracle.invalid/graphql",
+            dir.path(),
+            &ops,
+            "",
+        )
+    };
+    let rec = |native: &str| {
+        let mut r = e2_stored(
+            "NodeBalance",
+            json!({"accountName": "k:m"}),
+            Value::Null,
+            Value::Null,
+            vec![DiffEntry {
+                path: "/chain0/balance".into(),
+                kind: DiffKind::Changed,
+                a: Some(json!("10.0")),
+                b: Some(json!(native)),
+            }],
+        );
+        r.b_target = "node".into();
+        r
+    };
+    let rep = e2_referee(cfg(), dir.path(), &[rec("10.904046")]).await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    assert_eq!(rep.by_class.get("graphql-native-miner-skew"), Some(&1));
+    for native in ["12.712138", "10.5"] {
+        let rep = e2_referee(cfg(), dir.path(), &[rec(native)]).await;
+        assert_eq!(
+            (rep.explained, rep.unexplained),
+            (0, 1),
+            "{native}: {rep:?}"
+        );
+    }
+}

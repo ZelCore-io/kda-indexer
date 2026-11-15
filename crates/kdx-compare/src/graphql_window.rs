@@ -1134,6 +1134,27 @@ fn coinbase_key(payload: &Value) -> Option<String> {
     v.get("reqKey")?.as_str().map(str::to_string)
 }
 
+/// R-P5P9-86 S′: the heights either side of a stored record's height that its window holds.
+pub const SKEW_WINDOW: u64 = 10;
+
+/// R-P5P9-86 S′: what the block's coinbase pays `account` (a coin TRANSFER from the empty
+/// account), in fixed point.
+fn coinbase_paid(payload: &Value, account: &str) -> Option<i128> {
+    let cb = payload.get("coinbase")?.as_str()?;
+    let b = kdx_types::hash::b64url_decode(cb).ok()?;
+    let v: Value = serde_json::from_slice(&b).ok()?;
+    v.get("events")?.as_array()?.iter().find_map(|e| {
+        let p = e.get("params")?.as_array()?;
+        let ok = e.get("name").and_then(Value::as_str) == Some("TRANSFER")
+            && module_name(e).as_deref() == Some("coin")
+            && p.len() == 3
+            && p[0].as_str() == Some("")
+            && p[1].as_str() == Some(account);
+        ok.then(|| text(&p[2]).as_deref().and_then(crate::rewards::fixed))
+            .flatten()
+    })
+}
+
 /// The node's `meta.creationTime` in whole seconds, as ours renders it (R-P5P9-62 H9: Pact's
 /// `ParsedInteger`, a fraction rounded half to even; `{"int": n}` unwrapped).
 fn node_secs(v: &Value) -> Option<u64> {
@@ -3848,6 +3869,97 @@ impl Ctx {
             Ok(None) => Err("no canonical header at the height on the cut's branch".into()),
             Err(w) => Err(w),
         });
+    }
+
+    /// R-P5P9-86 S′ with R-P5P9-87, the stored-record form: a stored NodeBalance record's
+    /// gap on chain `chain` (ours' GraphQL `ours`, ours' native `native`) at time `ts` (unix
+    /// seconds) is miner skew only when the node shows `account` receiving k of that chain's
+    /// coinbases (1 <= k <= 3), all of one amount, in the record's height window (the height
+    /// whose block time is nearest `ts`, ± [`SKEW_WINDOW`]) and the gap is k × that amount.
+    /// `Err`: why not.
+    pub(crate) async fn native_skew_stored(
+        &self,
+        chain: u8,
+        account: &str,
+        ours: &str,
+        native: &str,
+        ts: u64,
+    ) -> Result<Value, String> {
+        use crate::rewards::fixed;
+        let mut st = Reads::default();
+        let (Some(x), Some(y)) = (fixed(ours), fixed(native)) else {
+            return Err("a balance is not a decimal".into());
+        };
+        let gap = (y - x).abs();
+        if gap == 0 {
+            return Err("no gap".into());
+        }
+        self.h7_take(&mut st)?;
+        let tip = self
+            .node
+            .cut()
+            .await
+            .map_err(|e| format!("cut read failed: {e}"))?
+            .hashes
+            .get(&chain)
+            .map(|e| e.height)
+            .ok_or("the cut lacks the chain")?;
+        // The height whose block time is nearest `ts`, by steps of 30 s a block.
+        let mut h = tip;
+        for _ in 0..6 {
+            let hd = self
+                .h7_canonical(chain, h, &mut st)
+                .await?
+                .ok_or("no canonical header at the height")?;
+            let t = hd
+                .get("creationTime")
+                .and_then(Value::as_u64)
+                .ok_or("a header without creationTime")?
+                / 1_000_000;
+            let dh = (t as i64 - ts as i64) / 30;
+            if dh.abs() <= 1 {
+                break;
+            }
+            h = (h as i64 - dh).clamp(0, tip as i64) as u64;
+        }
+        let mut paid: Vec<(u64, i128)> = Vec::new();
+        for hh in h.saturating_sub(SKEW_WINDOW)..=(h + SKEW_WINDOW).min(tip) {
+            let Some(hd) = self.h7_canonical(chain, hh, &mut st).await? else {
+                return Err(format!("no canonical header at {hh}"));
+            };
+            let hash = hd.get("hash").and_then(Value::as_str).map(str::to_string);
+            let (_, payload) = self
+                .h7_branch_payload(chain, hh, hash.as_deref(), &mut st)
+                .await?;
+            if let Some(a) = coinbase_paid(&payload, account) {
+                paid.push((hh, a));
+            }
+        }
+        let amounts: Vec<i128> = paid.iter().map(|p| p.1).collect();
+        let one = amounts
+            .first()
+            .copied()
+            .filter(|a| amounts.iter().all(|b| b == a));
+        match one {
+            Some(r) if r > 0 && gap % r == 0 && (1..=3).contains(&(gap / r)) => {
+                let k = gap / r;
+                if (paid.len() as i128) < k {
+                    return Err(format!(
+                        "the gap is {k} coinbases, the node shows {} in the window",
+                        paid.len()
+                    ));
+                }
+                Ok(
+                    json!({"chain": chain, "k": k, "window": [h.saturating_sub(SKEW_WINDOW),
+                    h + SKEW_WINDOW], "coinbases": paid.iter().map(|p| p.0).collect::<Vec<_>>()}),
+                )
+            }
+            Some(_) => Err("the gap is not 1 to 3 of the account's coinbases".into()),
+            None if amounts.is_empty() => {
+                Err("the node shows no coinbase to the account in the window".into())
+            }
+            None => Err("the account's coinbases in the window differ in amount".into()),
+        }
     }
 
     /// Takes one node read from the compare's cap and the run's budget.

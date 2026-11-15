@@ -645,6 +645,17 @@ status = "PROPOSED"
 ruling = "R-P5P9-75 N."
 owner_note = "PROPOSED (ruling R-P5P9-75 N): new in FVH-D3; stays PROPOSED until CG-5 shows clean hits."
 
+[[entry]]
+id = "graphql-native-miner-skew"
+route = "other"
+json_path_glob = "/~graphql-native-miner-skew"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-86 S' (the native pair, gql|native): ours' GraphQL coin balance of a miner account against ours' native /api/v1 balance, read seconds apart, straddles a block. Live: on a gap the pair is re-read once in the other order (native first, then GraphQL); the record is explained only when the re-read agrees on every chain with a gap. Stored (R-P5P9-87, the referee): the gap is exactly k (1 to 3) of the chain's coinbase rewards, and the node's canonical blocks in the record's height window (the height whose block time is nearest the record's time, +/- 10) pay the account at least k coinbases of that one amount. Any other gap, a re-read that still differs, or a gap the node's coinbases do not cover stays unexplained."
+status = "PROPOSED"
+ruling = "R-P5P9-86 S'; R-P5P9-87 (the stored form)."
+owner_note = "PROPOSED (ruling R-P5P9-86 S'): new in FVH-E2; both sides are ours, the node settles the stored form."
+
 # R-P5P9-75 (P, Q): KNOWN-GAP entries. A hit is never explained: its record is class
 # `known-gap`, counted per entry and day; the FV gate reads 0 unexplained plus each entry's
 # count not above its CG-4 per-hour baseline x 1.5 over the window. The G4 package lists them.
