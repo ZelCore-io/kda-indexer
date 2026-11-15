@@ -6045,3 +6045,40 @@ async fn d1_d_multiset_identity_runs_the_ruled_matchers_and_the_duplicate_excuse
     .await;
     assert!(!only_hits(&d), "{d:?}");
 }
+
+/// R-P5P9-75 F: transfer rows that select a `requestKey` but no `orderIndex`, block or
+/// transfer field (Transfers-8c8a0f56) get their identity by request-key multiset under the
+/// `transfers` root, so H7 runs; a row ours lacks stays a diff. When `prepare` fails, the
+/// record always says "H7 not applied" with why.
+#[tokio::test]
+async fn d1_f_key_only_transfer_rows_get_a_request_key_identity_and_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("u", 101), ("v", 100), ("w", 100)] {
+        let (k, v) = h7_xfer_poll(rk, &format!("B{h}"), h, "s", "r", json!(1.5));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let r = |rk: &str| json!({"cursor": "c", "node": {"chainId": "0", "requestKey": rk}});
+    // Paired by request key; ours' v is a node-confirmed oracle gap.
+    let (d, note) = d1_settle(&ctx, vec![r("u"), r("v")], vec![r("u")], (false, false)).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_window::WINDOW_PATH),
+        "{d:?}"
+    );
+    // An oracle row the node holds inside our complete list: a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![r("u"), r("v")],
+        vec![r("v"), r("w"), r("u")],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // A row whose identity cannot be decided: H7 says so.
+    let bare = json!({"cursor": "c", "node": {"amountText": "1"}});
+    let (_, note) = d1_settle(&ctx, vec![bare, r("u")], vec![r("u")], (false, false)).await;
+    assert!(note.unwrap_or_default().starts_with("H7 not applied"));
+}

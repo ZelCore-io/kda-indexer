@@ -1860,6 +1860,13 @@ fn group<'a>(rows: &'a [Row], live: &[usize]) -> (Vec<&'a str>, HashMap<&'a str,
 /// The rows of two root connections (ours `ca`, the oracle's `cb`) with their identities.
 /// Fails when a row's identity cannot be decided.
 pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
+    prepare_in(ca, cb, "")
+}
+
+/// [`prepare`] under the root list `root`. R-P5P9-75 F: a row of the `transfers` root that
+/// selects a request key but no field naming its kind is a transfer row without an index
+/// (identity by request-key multiset).
+pub fn prepare_in(ca: &Value, cb: &Value, root: &str) -> Result<Prep, String> {
     let rows = |c: &Value, oracle: bool| -> Result<Vec<Row>, String> {
         let mut out = Vec::new();
         for e in c
@@ -1868,6 +1875,9 @@ pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
             .ok_or("a page without edges")?
         {
             let mut id = row_id(e);
+            if id.kind.is_none() && root == "transfers" && id.rk.is_some() {
+                id.kind = Some(Kind::Transfer);
+            }
             // R-P5P9-75 C: the oracle's coinbase key form, decoded for the identity.
             if oracle && id.kind != Some(Kind::Block) {
                 if let Some(k) = id.rk.as_deref().and_then(decode_coinbase_rk) {
@@ -2662,22 +2672,15 @@ impl Ctx {
                 _ => {}
             }
         }
-        let prep = match prepare(&ca, &cb) {
+        let prep = match prepare_in(&ca, &cb, root.as_deref().unwrap_or_default()) {
             Ok(mut p) => {
                 // R-P5P9-75 D: rows without an index match after the ruled value matchers.
                 p.rules = self.cfg.graphql.field_rules.clone();
                 p.root = root.clone().unwrap_or_default();
                 p
             }
-            Err(why) => {
-                let rows = |c: &Value| {
-                    c.get("edges")
-                        .and_then(Value::as_array)
-                        .is_some_and(|e| e.iter().any(|e| row_id(e).kind.is_some()))
-                };
-                let note = (rows(&ca) || rows(&cb)).then(|| format!("H7 not applied: {why}"));
-                return (Vec::new(), note);
-            }
+            // R-P5P9-75 F: always say why H7 did not run.
+            Err(why) => return (Vec::new(), Some(format!("H7 not applied: {why}"))),
         };
         let asc = root.as_deref() == Some("blocksFromHeight");
         let filter = Filter::of(query, root.as_deref().or(Some("")), vars);
