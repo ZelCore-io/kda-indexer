@@ -6219,3 +6219,25 @@ async fn d1_e_m_oracle_rows_off_the_nodes_tx_or_block() {
     .await;
     assert!(!only_hits(&d), "{d:?}");
 }
+
+/// R-P5P9-75 H: our own QTransactionsByPublicKey selects each row's block height, chain and
+/// hash, so H7 can place its rows (CG-4: 6 records had only `id hash`).
+#[test]
+fn d1_h_transactions_by_public_key_selects_the_block_to_place_rows() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/graphql");
+    let text = std::fs::read_to_string(dir.join("QTransactionsByPublicKey.graphql")).unwrap();
+    let op = crate::graphql::parse_op("QTransactionsByPublicKey", &text, false).unwrap();
+    assert!(
+        op.query.contains("block { hash height chainId }"),
+        "{}",
+        op.query
+    );
+    // A row of that shape is placed: height, chain and block.
+    let e = json!({"node": {"id": "x", "hash": "rk", "result": {"height": 7,
+        "block": {"hash": "B7", "height": 7, "chainId": 3}}}});
+    let id = crate::graphql_window::row_id(&e);
+    assert_eq!(
+        (id.height, id.chain, id.block.as_deref()),
+        (Some(7), Some(3), Some("B7"))
+    );
+}
