@@ -192,6 +192,23 @@ the compat, graphql and admin listeners to loopback plus the host's private addr
 admin port. A host that is not ready leaves the pool, and its routes fall back to
 chainweb-data. Drain the server on the balancer before a planned restart.
 
+## `/stats` freshness
+
+The compat `/stats` (and GraphQL `networkInfo`) never counts on the request. A background task
+started with the server recounts the user transactions every 2 minutes (a recount may take up
+to 60 s) and stops with it. A request answers the last count with `X-Count-Age: <seconds>`
+since that count finished, so the header is 120 or less when refreshes succeed and grows when
+they do not. There is no age after which the count is refused.
+
+- A failed or slow refresh keeps the last count and logs one `stats: count refresh failed` WARN
+  per 10 minutes. A header age that keeps growing past a few minutes with that WARN means the
+  count cannot finish: check the disk (cold pages) and the `read_threads` load.
+- Right after a start there is no count yet. A request waits up to the API deadline, then
+  answers `503` with `Retry-After: 5`; GraphQL `networkInfo` answers the same error at once.
+  Both clear after the first count, normally seconds after the listeners are up.
+- The transaction count in a `/stats` answer can be up to a refresh interval behind the
+  store; the supply is computed per request.
+
 ## Metrics and alerts
 
 `/metrics` on the admin port (OpenMetrics text); the same families are written to the

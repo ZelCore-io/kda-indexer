@@ -214,7 +214,7 @@ number open.
   defaults above (20, at most 100), not the 500 the schema text mentions.
 - `lastBlockHeight` is the highest stored tip.
 - `networkInfo`: `networkId` from `network`, `networkHost` from `graphql.network_host`,
-  `apiVersion` `"0.0"`, `transactionCount` and `coinsInCirculation` as `/stats`;
+  `apiVersion` `"0.0"`, `transactionCount` (the last background count, as `/stats`; an error before the first one) and `coinsInCirculation` as `/stats`;
   `totalDifficulty` is the sum over chains of the tip block's `weight`, `networkHashRate` the
   sum over chains of the tip block's difficulty divided by 30 s.
 - `node(id)`/`nodes(ids)` (at most 100) resolve every type; a malformed id is
