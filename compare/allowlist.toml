@@ -657,10 +657,10 @@ condition = "any"
 request_contains = "graphql:"
 request_any = ['"k:465174a5', '"k:a8ba06d2', '"b581bc62']
 a_value_contains = "request deadline exceeded"
-baseline_per_hour = 0.99
-reason = "R-P5P9-75 P (accepted heavy-account TIMEOUT, a diff by design, R-P5P9-67): ours' first- or follow-page fault whose error says \"request deadline exceeded\", only on the heavy accounts CG-2/CG-3 measured, by key (a variable value starting with): k:465174a5..., k:a8ba06d2..., b581bc62.... Any other account (CG-4 #293's k:58ddb72d... among them), another fault, or another difference in the record stays unexplained. CG-4 baseline: 4 records (#293, #322, #512, #1868) in the 00:55:00-04:58:10Z window (4.05 h) = 0.99/h; gate limit 1.48/h."
+baseline_per_hour = 0.74
+reason = "R-P5P9-75 P (accepted heavy-account TIMEOUT, a diff by design, R-P5P9-67): ours' first- or follow-page fault whose error says \"request deadline exceeded\", only on the heavy accounts CG-2/CG-3 measured, by key (a variable value starting with): k:465174a5..., k:a8ba06d2..., b581bc62.... Any other account (CG-4 #293's k:58ddb72d... among them), another fault, or another difference in the record stays unexplained. CG-4 baseline: the 3 records this entry matches (#322, #512, #1868; #293 is k:58ddb72d..., which it rules out) in the 00:55:00-04:58:10Z window (4.05 h) = 0.74/h; gate limit 1.11/h (R-P5P9-78, H2 m-1)."
 status = "KNOWN-GAP"
-ruling = "R-P5P9-75 (P, Q); R-P5P9-60; R-P5P9-67."
+ruling = "R-P5P9-75 (P, Q); R-P5P9-60; R-P5P9-67; R-P5P9-78 (H2 m-1: the baseline counts only matched records)."
 owner_note = "KNOWN-GAP (accepted for G4 by the controller, R-P5P9-60 line 595: heavy-account cold TIMEOUT): never explained; listed for the owner in the G4 package."
 
 [[entry]]

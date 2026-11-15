@@ -1152,6 +1152,37 @@ mod tests {
         assert_eq!(text.matches("GREEN").count(), 1, "{text}");
     }
 
+    /// R-P5P9-78 (H2 m-1): the shipped P baseline counts only the records P matches (3 over
+    /// 4.05 h = 0.74/h, limit 1.11/h): 3 records in 2 h are over (limit 2.2), 2 are within.
+    #[test]
+    fn the_shipped_p_baseline_counts_only_matched_records() {
+        let al = crate::allowlist::Allowlist::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+        )
+        .unwrap();
+        let p = "known-gap-p-heavy-account-deadline";
+        let b = al.baseline(p).unwrap();
+        assert_eq!(b, 0.74);
+        let gate = |n: u64| {
+            let dir = tempfile::tempdir().unwrap();
+            write_days(dir.path(), &[("2026-11-15", 12, "match", 0, b)]);
+            let mut kg = load_known_gaps(dir.path(), 0).unwrap();
+            kg.baselines = [(p.to_string(), b)].into_iter().collect();
+            kg.baselines_per_day.clear();
+            kg.per_day = [(
+                "2026-11-15".to_string(),
+                [(p.to_string(), n)].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect();
+            render_known_gaps(&kg)
+        };
+        let (text, ok) = gate(3);
+        assert!(!ok && text.contains("limit 2.2"), "{text}");
+        let (text, ok) = gate(2);
+        assert!(ok, "{text}");
+    }
+
     /// R-P5P9-78 (H2 m-8): known-gap records do not reach a route minimum; the same count
     /// of matches does.
     #[test]
