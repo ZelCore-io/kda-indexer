@@ -451,6 +451,9 @@ pub struct Verdict {
     /// R-P5P9-75 B: whether the block the node placed the row in is the canonical one at its
     /// height on the cut's branch (`None`: not read; `Err`: why it could not be read).
     pub branch: Option<Result<bool, String>>,
+    /// R-P5P9-86 U: the public keys of the signers of the node's signed command for an
+    /// ours-only tx row under a `publicKey` filter (`None`: not read; `Err`: why not).
+    pub signers: Option<Result<Vec<String>, String>>,
 }
 
 /// The check of an ours-only tx row's `cmd` fields against the node (R-P5P9-68 (2)).
@@ -484,6 +487,7 @@ impl Verdict {
             cmd: None,
             ctime: None,
             branch: None,
+            signers: None,
         }
     }
 
@@ -583,13 +587,37 @@ fn sel<'a>(n: &'a Value, k: &str) -> Option<&'a Value> {
 /// the event holds (sender, receiver, amount, module name and hash; R-P5P9-64 I-2). `oracle`:
 /// the row is the oracle's, whose f64-rounded amount is allowed (M-3).
 pub fn transfer_matches(n: &Value, ev: &Value, oracle: bool) -> bool {
-    let p = |i: usize| ev.pointer(&format!("/params/{i}"));
+    let o = transfer_offset(ev);
+    let p = |i: usize| ev.pointer(&format!("/params/{}", i + o));
     ev.get("name").and_then(Value::as_str) == Some("TRANSFER")
+        && token_is(n, ev)
         && sel(n, "senderAccount").is_none_or(|x| p(0) == Some(x))
         && sel(n, "receiverAccount").is_none_or(|x| p(1) == Some(x))
         && sel(n, "amount").is_none_or(|x| p(2).is_some_and(|y| same_amount(x, y, oracle)))
         && sel(n, "moduleName").is_none_or(|x| module_name(ev).as_deref() == x.as_str())
         && sel(n, "moduleHash").is_none_or(|x| ev.get("moduleHash") == Some(x))
+}
+
+/// R-P5P9-86 T: where a TRANSFER event's sender, receiver and amount start. A fungible
+/// TRANSFER is (sender, receiver, amount); a marmalade one (token, sender, receiver, amount).
+pub fn transfer_offset(ev: &Value) -> usize {
+    match ev.get("params").and_then(Value::as_array) {
+        Some(ps) if ps.len() == 4 && ps[0].is_string() => 1,
+        _ => 0,
+    }
+}
+
+/// R-P5P9-86 T: a transfer row's `tokenId` against the node's TRANSFER event: null for a
+/// fungible (three-parameter) event, else the marmalade event's token. Not selected: true.
+fn token_is(n: &Value, ev: &Value) -> bool {
+    let Some(t) = n.get("tokenId") else {
+        return true;
+    };
+    let ps = ev.get("params").and_then(Value::as_array);
+    match t {
+        Value::Null => ps.is_some_and(|p| p.len() == 3),
+        t => transfer_offset(ev) == 1 && ps.and_then(|p| p.first()) == Some(t),
+    }
 }
 
 /// Whether the node's event `ev` is the event row `n`: every field the row selects that the
@@ -724,6 +752,8 @@ fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
             "receiverAccount",
             "requestKey",
             "senderAccount",
+            // R-P5P9-86 T: [`token_is`], inside [`transfer_matches`].
+            "tokenId",
         ],
         // [`event_matches`] against the node's event, and the identity.
         (Kind::Event, "") => &[
@@ -760,7 +790,8 @@ fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
         ],
         (Kind::Block, "parent") => &["hash"],
         // R-P5P9-75 A: [`xchain_mismatch`] against the node's TRANSFER_XCHAIN.
-        (Kind::Transfer, "crossChainTransfer") => &["chainId", "receiverAccount"],
+        // R-P5P9-86 T: and `senderAccount`, the receiving half's sender.
+        (Kind::Transfer, "crossChainTransfer") => &["chainId", "receiverAccount", "senderAccount"],
         _ => &[],
     }
 }
@@ -884,7 +915,52 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
     if !ok("receiverAccount", 1) {
         return Some("crossChainTransfer.receiverAccount is not the node's receiver".into());
     }
+    // R-P5P9-86 T: the receiving half's sender is the sending half's receiver on the node,
+    // the empty account of coin's `transfer-crosschain`.
+    let leg = p(ev, 1).as_ref().and_then(text);
+    if sel(x, "senderAccount")
+        .is_some_and(|y| text(y).is_none() || text(y) != leg || leg.as_deref() != Some(""))
+    {
+        return Some(
+            "crossChainTransfer.senderAccount is not the node's (the sending leg's receiver)"
+                .into(),
+        );
+    }
     None
+}
+
+/// R-P5P9-86 T: why ours' `cmd.payload` `m`, which selects no field of its member (only
+/// `__typename`, or nothing), is not the node's command `node`'s, or `None`. Right only when
+/// the document's fragments (`members`: whether it selects `... on ExecutionPayload` and
+/// `... on ContinuationPayload`) select the other member alone, and `__typename` (when
+/// selected) is the node's member.
+pub fn bare_payload_mismatch(
+    m: &Map<String, Value>,
+    node: &Value,
+    members: Option<(bool, bool)>,
+) -> Option<String> {
+    let pl = node.get("payload");
+    let (exec, cont) = (
+        pl.and_then(|p| p.get("exec")).is_some(),
+        pl.and_then(|p| p.get("cont")).is_some(),
+    );
+    let Some((sel_exec, sel_cont)) = members else {
+        return Some("cmd.payload (the document's fragments are unknown)".into());
+    };
+    let (name, ok) = match (exec, cont) {
+        (true, false) => ("ExecutionPayload", !sel_exec && sel_cont),
+        (false, true) => ("ContinuationPayload", sel_exec && !sel_cont),
+        _ => return Some("cmd.payload (the node's payload has no single member)".into()),
+    };
+    if !ok {
+        return Some(format!(
+            "cmd.payload (no field of the node's {name}, which the document selects)"
+        ));
+    }
+    match m.get("__typename") {
+        Some(t) if t.as_str() != Some(name) => Some("cmd.payload.__typename".into()),
+        _ => None,
+    }
 }
 
 /// R-P5P9-70 (I-1): the first field a row's node selects that the harness does not check
@@ -897,6 +973,15 @@ pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
     fn walk(kind: Kind, v: &Value, path: &str) -> Option<String> {
         let keys = checked_keys(kind, path);
         match v {
+            // R-P5P9-86 T: a payload with no field of its member (the document's fragments
+            // select the other member's) is checked by [`bare_payload_mismatch`].
+            Value::Object(m)
+                if kind == Kind::Tx
+                    && path == "cmd.payload"
+                    && m.keys().all(|k| k == "__typename") =>
+            {
+                None
+            }
             Value::Object(m) if !m.is_empty() => m.iter().find_map(|(k, x)| {
                 let p = if path.is_empty() {
                     k.clone()
@@ -912,6 +997,9 @@ pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
                 }
                 if x.is_null() && kind == Kind::Transfer && p == "crossChainTransfer" {
                     // R-P5P9-75 A: a null link is checked by [`xchain_mismatch`].
+                    None
+                } else if x.is_null() && kind == Kind::Transfer && p == "tokenId" {
+                    // R-P5P9-86 T: a null token is checked by [`token_is`].
                     None
                 } else if !checked_keys(kind, &p).is_empty() {
                     walk(kind, x, &p)
@@ -1341,7 +1429,8 @@ pub fn poll_verdict_at(
         .iter()
         .all(|k| sel(n, k).is_some());
     let triple = |ev: &Value| {
-        let p = |i: usize| ev.pointer(&format!("/params/{i}"));
+        let o = transfer_offset(ev);
+        let p = |i: usize| ev.pointer(&format!("/params/{}", i + o));
         p(0) == sel(n, "senderAccount")
             && p(1) == sel(n, "receiverAccount")
             && p(2)
@@ -1613,6 +1702,8 @@ pub struct Filter {
     pub max_height: Option<u64>,
     pub block: Option<String>,
     pub rk: Option<String>,
+    /// R-P5P9-86 U: `publicKey`, checked against the signers of the node's command.
+    pub public_key: Option<String>,
     /// R-P5P9-67 I-C: the root's other arguments with a non-null value or a literal (`first`,
     /// `after`, `last` and `before` aside). The harness does not check them, so they refuse
     /// the ours-only excuse.
@@ -1620,7 +1711,7 @@ pub struct Filter {
 }
 
 /// The root arguments [`Filter`] reads (from variables only).
-const READ_ARGS: [&str; 12] = [
+const READ_ARGS: [&str; 13] = [
     "accountName",
     "fungibleName",
     "chainId",
@@ -1633,6 +1724,7 @@ const READ_ARGS: [&str; 12] = [
     "endHeight",
     "blockHash",
     "requestKey",
+    "publicKey",
 ];
 /// The paging arguments, which are no filter.
 const PAGE_ARGS: [&str; 4] = ["first", "after", "last", "before"];
@@ -1965,6 +2057,7 @@ impl Filter {
             max_height: h("maxHeight").or_else(|| h("endHeight")),
             block: s("blockHash"),
             rk: s("requestKey"),
+            public_key: s("publicKey"),
             unchecked: root.map_or_else(Vec::new, |_| unchecked_args(query, root, vars)),
         }
     }
@@ -2002,6 +2095,10 @@ impl Filter {
             (
                 "parametersFilter",
                 self.params.is_some() && kind != Some(Kind::Event),
+            ),
+            (
+                "publicKey",
+                self.public_key.is_some() && kind != Some(Kind::Tx),
             ),
         ];
         if let Some(name) = self
@@ -2090,6 +2187,21 @@ impl Filter {
                         }
                     }
                 }
+            }
+            Some(Kind::Tx)
+                if self.public_key.is_some() && {
+                    // R-P5P9-86 U: a signer of the node's command holds the key.
+                    let pk = self.public_key.as_ref();
+                    !matches!(&v.signers, Some(Ok(ks)) if ks.iter().any(|k| Some(k) == pk))
+                } =>
+            {
+                return match &v.signers {
+                    Some(Ok(_)) => fail("publicKey: no signer of the node's transaction holds it"),
+                    Some(Err(w)) => Some(format!(
+                        "under a publicKey filter the node did not settle ({w})"
+                    )),
+                    None => Some("under a filter the harness does not check: publicKey".into()),
+                };
             }
             Some(Kind::Tx) => {
                 // `transactions(accountName)` lists the txs the account sent (GQ-19: ours
@@ -3039,6 +3151,9 @@ pub(crate) struct Reads {
     payloads: HashMap<String, Result<Value, String>>,
     by_hash: HashMap<String, Result<Option<u64>, String>>,
     chains: HashMap<String, Option<u8>>,
+    /// R-P5P9-86 T: whether the document selects `... on ExecutionPayload` and
+    /// `... on ContinuationPayload` (`None`: no document).
+    pub(crate) payload_members: Option<(bool, bool)>,
 }
 
 impl Reads {
@@ -3124,6 +3239,14 @@ impl Ctx {
             return (Vec::new(), None);
         }
         let query = op.map(|o| o.query.as_str());
+        st.payload_members = query.map(|q| {
+            let has = |m: &str| {
+                q.split("...")
+                    .skip(1)
+                    .any(|f| f.trim_start().starts_with(m))
+            };
+            (has("on ExecutionPayload"), has("on ContinuationPayload"))
+        });
         let first_var = arg_var(query, "first");
         let root = a.body.get("data").and_then(root_name);
         // R-P5P9-64 I-3, R-P5P9-67 I-A (a): a cut page of ours shorter than first × the pages
@@ -3212,6 +3335,7 @@ impl Ctx {
                 self.h7_cmd_check(r, &mut v, st).await;
                 self.h7_ctime_check(r, &mut v, st).await;
                 self.h7_branch_check(r, &mut v, st).await;
+                self.h7_signers_check(r, &mut v, &filter, st).await;
             }
             if side == 0 {
                 va[i] = Some(v);
@@ -3598,37 +3722,59 @@ impl Ctx {
         {
             return;
         }
-        let unsettled = |w: String| Some(CmdCheck::Unsettled(w));
-        let p = match self.h7_poll(chain, rk, st).await {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                v.cmd = unsettled("the node's poll does not know the key".into());
-                return;
+        let c = n.get("cmd").unwrap_or(&Value::Null);
+        v.cmd = Some(match self.h7_node_cmd(chain, rk, st).await {
+            Err(w) => CmdCheck::Unsettled(w),
+            Ok(cmd) => {
+                // R-P5P9-86 T: a payload with no field of its member, by the document.
+                let bare = c
+                    .get("payload")
+                    .and_then(Value::as_object)
+                    .filter(|m| m.keys().all(|k| k == "__typename"))
+                    .and_then(|m| bare_payload_mismatch(m, &cmd, st.payload_members));
+                match bare.or_else(|| cmd_mismatch(c, &cmd)) {
+                    Some(f) => CmdCheck::Differs(f),
+                    None => CmdCheck::Same,
+                }
             }
-            Err(w) => {
-                v.cmd = unsettled(w);
-                return;
-            }
-        };
+        });
+    }
+
+    /// The node's signed command for key `rk` on `chain`: from the payload of the block
+    /// `/poll` placed it in, that block being the cut branch's at its height; `Err`: why it
+    /// could not be read.
+    async fn h7_node_cmd(&self, chain: u8, rk: &str, st: &mut Reads) -> Result<Value, String> {
+        let p = self
+            .h7_poll(chain, rk, st)
+            .await?
+            .ok_or("the node's poll does not know the key")?;
         let pb = p.pointer("/metaData/blockHash").and_then(Value::as_str);
-        let Some(ph) = p.pointer("/metaData/blockHeight").and_then(Value::as_u64) else {
-            v.cmd = unsettled("no block height in the poll entry".into());
+        let ph = p
+            .pointer("/metaData/blockHeight")
+            .and_then(Value::as_u64)
+            .ok_or("no block height in the poll entry")?;
+        let (_, payload) = self.h7_branch_payload(chain, ph, pb, st).await?;
+        node_cmd(&payload, rk).ok_or_else(|| "the block's payload lacks the key".into())
+    }
+
+    /// R-P5P9-86 U: an ours-only tx row the node places (`v`) under a `publicKey` filter:
+    /// the public keys of the signers of the node's signed command. Sets `v.signers`.
+    async fn h7_signers_check(&self, r: &Row, v: &mut Verdict, f: &Filter, st: &mut Reads) {
+        if f.public_key.is_none() || r.id.kind != Some(Kind::Tx) || v.canon != Canon::Yes {
+            return;
+        }
+        let (Some(chain), Some(rk)) = (v.chain, r.id.rk.as_deref()) else {
+            v.signers = Some(Err("no chain or key for the row".into()));
             return;
         };
-        let payload = match self.h7_branch_payload(chain, ph, pb, st).await {
-            Ok((_, x)) => x,
-            Err(w) => {
-                v.cmd = unsettled(w);
-                return;
-            }
-        };
-        v.cmd = Some(match node_cmd(&payload, rk) {
-            None => CmdCheck::Unsettled("the block's payload lacks the key".into()),
-            Some(cmd) => match cmd_mismatch(n.get("cmd").unwrap_or(&Value::Null), &cmd) {
-                Some(f) => CmdCheck::Differs(f),
-                None => CmdCheck::Same,
-            },
-        });
+        v.signers = Some(self.h7_node_cmd(chain, rk, st).await.map(|cmd| {
+            cmd.get("signers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.get("pubKey").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        }));
     }
 
     /// R-P5P9-70 (I-1): an ours-only transfer row that the node places (`v`, its block and
@@ -4863,6 +5009,54 @@ impl Ctx {
 #[cfg(test)]
 mod tests {
 
+    /// R-P5P9-86 T (`tokenId`): null against a fungible TRANSFER, the token against a
+    /// marmalade one (token, sender, receiver, amount); a wrong token matches no event. A
+    /// null `tokenId` is a checked field.
+    #[test]
+    fn e2_t_token_id_against_the_nodes_transfer() {
+        let coin =
+            json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "r", 1.5]});
+        let nft = json!({"name": "TRANSFER", "module": {"name": "ledger", "namespace": "marmalade-v2"},
+            "params": ["t:abc", "s", "r", 1.0]});
+        let row = |t: Value| {
+            json!({"senderAccount": "s", "receiverAccount": "r", "amount": 1.5,
+            "tokenId": t})
+        };
+        assert!(transfer_matches(&row(Value::Null), &coin, false));
+        assert!(!transfer_matches(&row(json!("t:abc")), &coin, false));
+        let nrow = |t: Value| {
+            json!({"senderAccount": "s", "receiverAccount": "r", "amount": 1.0,
+            "tokenId": t})
+        };
+        assert!(transfer_matches(&nrow(json!("t:abc")), &nft, false));
+        assert!(!transfer_matches(&nrow(json!("t:xyz")), &nft, false));
+        assert!(!transfer_matches(&nrow(Value::Null), &nft, false));
+        // Not selected: as before.
+        let plain = json!({"senderAccount": "s", "receiverAccount": "r", "amount": 1.5});
+        assert!(transfer_matches(&plain, &coin, false));
+        let n = json!({"__typename": "Transfer", "requestKey": "k", "tokenId": null,
+            "senderAccount": "s"});
+        assert_eq!(unchecked_field(Some(Kind::Transfer), &n), None);
+    }
+
+    /// R-P5P9-86 T (`crossChainTransfer.senderAccount`): the receiving half's sender is the
+    /// sending leg's receiver on the node, the empty account; any other value is refused.
+    #[test]
+    fn e2_t_cross_chain_sender_is_the_sending_legs_receiver() {
+        let mut v = Verdict::new(Canon::Yes, Some(10), Some("B".into()), "placed");
+        v.event = Some(json!({"name": "TRANSFER", "params": ["s", "", 1.0]}));
+        v.xchain = vec![json!({"name": "TRANSFER_XCHAIN", "params": ["s", "r", 1.0, "2"]})];
+        let x = |sender: &str| {
+            json!({"chainId": "2", "receiverAccount": "r",
+            "senderAccount": sender})
+        };
+        assert_eq!(xchain_mismatch(&x(""), &v), None);
+        let why = xchain_mismatch(&x("s"), &v).unwrap_or_default();
+        assert!(why.contains("senderAccount"), "{why}");
+        let n = json!({"__typename": "Transfer", "requestKey": "k", "crossChainTransfer": x("")});
+        assert_eq!(unchecked_field(Some(Kind::Transfer), &n), None);
+    }
+
     /// R-P5P9-71 (3): `cmd.payload`'s `__typename` passes only as the union member its own
     /// fields name; with neither `code` nor a continuation field it is unknown and refused.
     #[test]
@@ -4882,10 +5076,9 @@ mod tests {
                 json!({"__typename": "ContinuationPayload", "code": "(+ 1 2)"}),
                 Some("cmd.payload.__typename"),
             ),
-            (
-                json!({"__typename": "ExecutionPayload"}),
-                Some("cmd.payload.__typename"),
-            ),
+            // R-P5P9-86 T: a payload with no field of its member is checked against the
+            // node and the document by [`bare_payload_mismatch`], not here.
+            (json!({"__typename": "ExecutionPayload"}), None),
             (
                 json!({"__typename": "Signer", "code": "x"}),
                 Some("cmd.payload.__typename"),

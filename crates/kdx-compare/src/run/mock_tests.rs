@@ -3886,13 +3886,14 @@ async fn c3_root_filters_the_harness_does_not_check_refuse_the_excuse() {
         }
     };
     let txs = || (vec![tx("t1", 101), tx("t2", 100)], vec![tx("t1", 101)]);
-    // QTransactionsByPublicKey: t2 is canonical, but the harness does not check the key.
+    // QTransactionsByPublicKey: t2 is canonical; R-P5P9-86 U checks the key against the
+    // signers of the node's command, which this node cannot serve: unsettled, a diff.
     let (a, b) = txs();
     let vars = h7_vars(&[("publicKey", json!("pk")), ("first", json!(2))]);
     let (un, note) = run(by_key.clone(), "transactionsByPublicKey", a, b, vars).await;
     assert!(!un.is_empty(), "{note}");
     assert!(
-        note.contains("a filter the harness does not check: publicKey"),
+        note.contains("under a publicKey filter the node did not settle"),
         "{note}"
     );
     // The same rows with the key null, and on a list with no filter: explained.
@@ -4824,11 +4825,9 @@ async fn c5_ours_only_rows_have_every_selected_field_checked() {
             json!("L"),
             "unchecked field: result.logs",
         ),
-        (
-            "/node/cmd",
-            json!({"payload": {}}),
-            "unchecked field: cmd.payload",
-        ),
+        // R-P5P9-86 T: a payload with no field of its member is checked against the node's
+        // (here a node without the command): still a diff.
+        ("/node/cmd", json!({"payload": {}}), "cmd.payload"),
     ] {
         let mut t2 = tx("t2", 100);
         let (parent, key) = ptr.rsplit_once('/').unwrap();
@@ -8141,4 +8140,113 @@ async fn e2_pq_the_referee_reads_known_gaps_on_stored_records() {
     assert!(rep.passed(), "a known gap is no unexplained record");
     let rep = e2_referee(cfg(), dir.path(), &[other]).await;
     assert_eq!((rep.unexplained, rep.known_gap), (1, 0), "{rep:?}");
+}
+
+/// A ctx whose node holds tx `t2` at chain 0 height 100 (block B100, payload P100) with
+/// the signed command `cmd`, and tx `t1` at 101.
+async fn e2_cmd_ctx(dir: &std::path::Path, cmd: &Value) -> Ctx {
+    let mut node = NodeMock::default();
+    for (rk, h) in [("t1", 101), ("t2", 100)] {
+        let (k, v) = h7_poll(rk, &format!("B{h}"), h, json!([]));
+        node.polls.insert(k, v);
+    }
+    node.headers.insert(
+        (0, 100),
+        vec![json!({"hash": "B100", "height": 100, "chainId": 0, "payloadHash": "P100"})],
+    );
+    let w = json!({"hash": "t2", "sigs": [], "cmd": cmd.to_string()}).to_string();
+    node.payloads.insert(
+        "P100".into(),
+        json!({"transactions": [[kdx_types::hash::b64url_encode(w.as_bytes()), ""]]}),
+    );
+    let au = ours_fn_server(|_: &Value| json!({"data": {"block": {"chainId": "0"}}})).await;
+    gql_ctx_at(node, dir, &au).await
+}
+
+/// Settles ours [t1, t2 (node `n2`)] against the oracle's [t1] at root `root` with `doc`.
+async fn e2_settle_tx(
+    ctx: &Ctx,
+    doc: &str,
+    root: &str,
+    vars: &[(&str, Value)],
+    n2: Value,
+) -> (Vec<String>, String) {
+    let op = crate::graphql::parse_op("QE2", doc, false).unwrap();
+    let tx = |rk: &str, h: u64, mut n: Value| {
+        let id = crate::graphql::base64_std(format!("Transaction:[\"B{h}\",\"{rk}\"]").as_bytes());
+        n["id"] = json!(id);
+        n["hash"] = json!(rk);
+        json!({"cursor": "c", "node": n})
+    };
+    let t1 = tx("t1", 101, json!({}));
+    let mut a = h7_page(root, false, vec![t1.clone(), tx("t2", 100, n2)]);
+    let mut b = h7_page(root, false, vec![t1]);
+    let mut vs = h7_vars(&[("first", json!(2))]);
+    vs.extend(h7_vars(vars));
+    let (d, note) = ctx
+        .gql_settle_op(
+            &ctx.targets["a"],
+            Some(&op),
+            &vs,
+            &mut a,
+            &mut b,
+            7_000_000,
+            false,
+        )
+        .await;
+    (c3_unexplained(ctx, &d), note.unwrap_or_default())
+}
+
+/// R-P5P9-86 T (`cmd.payload`): a payload that selects no field of its member is the node's
+/// only when the document's fragments select the other member alone. A continuation tx
+/// under `... on ExecutionPayload { code }` is `{}`: explained; an exec tx served as `{}`
+/// there, or `{}` under both fragments: a diff.
+#[tokio::test]
+async fn e2_t_a_payload_with_no_field_of_its_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = |frags: &str| {
+        format!(
+            "query QE2($first: Int, $after: String) {{ transactions(first: $first, after: \
+             $after) {{ totalCount pageInfo {{ hasNextPage endCursor }} edges {{ cursor node {{ \
+             id hash cmd {{ nonce payload {{ {frags} }} }} }} }} }} }}"
+        )
+    };
+    let exec_only = doc("... on ExecutionPayload { code }");
+    let both = doc("... on ExecutionPayload { code } ... on ContinuationPayload { pactId }");
+    let cmd = |payload: Value| {
+        json!({"networkId": "mainnet01", "nonce": "n2", "meta": {}, "payload": payload,
+            "signers": []})
+    };
+    let cont = cmd(json!({"cont": {"pactId": "p", "step": 1, "rollback": false,
+        "data": {}, "proof": null}}));
+    let exec = cmd(json!({"exec": {"code": "(+ 1 2)", "data": {}}}));
+    let row = |p: Value| json!({"cmd": {"nonce": "n2", "payload": p}});
+    let ctx = e2_cmd_ctx(dir.path(), &cont).await;
+    let (un, note) = e2_settle_tx(&ctx, &exec_only, "transactions", &[], row(json!({}))).await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    let (un, note) = e2_settle_tx(&ctx, &both, "transactions", &[], row(json!({}))).await;
+    assert!(!un.is_empty() && note.contains("cmd.payload"), "{note}");
+    let ctx = e2_cmd_ctx(dir.path(), &exec).await;
+    let (un, note) = e2_settle_tx(&ctx, &exec_only, "transactions", &[], row(json!({}))).await;
+    assert!(!un.is_empty() && note.contains("cmd.payload"), "{note}");
+}
+
+/// R-P5P9-86 U: `transactionsByPublicKey(publicKey)` is checked against the signers of the
+/// node's command: a signer's key explains the ours-only row; a wrong key is a diff.
+#[tokio::test]
+async fn e2_u_the_public_key_filter_against_the_nodes_signers() {
+    let dir = tempfile::tempdir().unwrap();
+    let cmd = json!({"networkId": "mainnet01", "nonce": "n2", "meta": {},
+        "payload": {"exec": {"code": "(+ 1 2)", "data": {}}},
+        "signers": [{"pubKey": "pk0"}, {"pubKey": "pk1", "clist": []}]});
+    let ctx = e2_cmd_ctx(dir.path(), &cmd).await;
+    let doc = "query QE2($publicKey: String!, $first: Int, $after: String) { \
+               transactionsByPublicKey(publicKey: $publicKey, first: $first, after: $after) { \
+               totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash } } } }";
+    let root = "transactionsByPublicKey";
+    let (un, note) = e2_settle_tx(&ctx, doc, root, &[("publicKey", json!("pk1"))], json!({})).await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    let (un, note) = e2_settle_tx(&ctx, doc, root, &[("publicKey", json!("pk9"))], json!({})).await;
+    assert!(!un.is_empty(), "{note}");
+    assert!(note.contains("publicKey: no signer"), "{note}");
 }

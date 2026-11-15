@@ -679,15 +679,12 @@ mod tests {
             ("known-gap", p.clone())
         );
         assert_eq!(
-            known(&req("Transactions-bca501b0", k977), &first),
+            known(&req("Transactions", k977), &first),
             ("known-gap", p.clone())
         );
         // The full key only: a longer value that starts with it is another account.
         let longer = format!("{k977}00");
-        assert_eq!(
-            known(&req("Transactions-bca501b0", &longer), &first).0,
-            "diff"
-        );
+        assert_eq!(known(&req("Transactions", &longer), &first).0, "diff");
         // Another fault on the same account stays a diff.
         let other = fault("/~graphql-follow-page-fault", "HTTP 500");
         assert_eq!(
