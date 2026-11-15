@@ -308,6 +308,13 @@ pub fn count_flag_applies(raw: &Value) -> bool {
     raw.pointer("/extensions/totalCountLowerBound") == Some(&Value::Bool(true)) && n == 1
 }
 
+/// A connection's page is not cut: `pageInfo.hasNextPage` false and `hasPreviousPage` not
+/// true (R-P5P9-60).
+fn page_whole(c: &Value) -> bool {
+    c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(false))
+        && c.pointer("/pageInfo/hasPreviousPage") != Some(&Value::Bool(true))
+}
+
 /// R-P5P9-60 count self-consistency, on the normalised answers `a` (ours) and `b` (the
 /// oracle's): for each `count_self_consistent` rule `<root>.totalCount`, the oracle's count
 /// takes ours only when neither page is cut (`pageInfo.hasNextPage` false and
@@ -316,10 +323,6 @@ pub fn count_flag_applies(raw: &Value) -> bool {
 /// CG-A2's node = ours 4/4 against the oracle's 1). An oracle count above its edges stays a
 /// diff, since ours may be the one that undercounts. Returns whether any count was explained.
 pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> bool {
-    let whole = |c: &Value| {
-        c.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(false))
-            && c.pointer("/pageInfo/hasPreviousPage") != Some(&Value::Bool(true))
-    };
     let edges = |c: &Value| {
         c.get("edges").and_then(Value::as_array).map(|e| {
             let mut s: Vec<String> = e.iter().map(Value::to_string).collect();
@@ -344,7 +347,12 @@ pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> b
         else {
             continue;
         };
-        if whole(ca) && whole(cb) && ea == eb && na == ea.len() as u64 && nb < eb.len() as u64 {
+        if page_whole(ca)
+            && page_whole(cb)
+            && ea == eb
+            && na == ea.len() as u64
+            && nb < eb.len() as u64
+        {
             if let Some(n) = b.pointer_mut(&format!("{ptr}/totalCount")) {
                 *n = Value::from(na);
                 hit = true;
@@ -426,8 +434,11 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
 
 /// R-P5P9-75 I: for each `oracle_counts_heights` rule `<root>.totalCount`, the oracle's root
 /// count takes ours when it is below ours (the oracle counts heights). Only the root
-/// connection's own count: nested counts are never touched. Returns (ours, the oracle's) per
-/// count taken.
+/// connection's own count: nested counts are never touched. R-P5P9-78 (H2 I-4), the
+/// R-P5P9-60 bound: when ours' page is not cut (`hasNextPage` false, `hasPreviousPage` not
+/// true; so whenever neither page is), ours' count must also equal ours' own edge count, or
+/// nothing is taken (an overcount of ours stays a diff; no `edges` selected, likewise).
+/// Returns (ours, the oracle's) per count taken.
 pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     for r in rules
@@ -444,6 +455,16 @@ pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> V
         ) else {
             continue;
         };
+        let ca = a.pointer(&format!("/data/{root}"));
+        if ca.is_some_and(page_whole) {
+            let edges = ca
+                .and_then(|c| c.get("edges"))
+                .and_then(Value::as_array)
+                .map(|e| e.len() as u64);
+            if edges != Some(na) {
+                continue;
+            }
+        }
         if nb < na {
             if let Some(n) = b.pointer_mut(&ptr) {
                 *n = Value::from(na);
@@ -1551,5 +1572,46 @@ mod tests {
         assert_eq!(ok("15.100", "15.290"), None);
         // Not times: a diff.
         assert_eq!(rule_explains(&r, &json!("x"), &json!("y"), false), None);
+    }
+
+    /// R-P5P9-78 (H2 I-4), the R-P5P9-60 bound: on an uncut page of ours, the oracle's count
+    /// below ours takes ours only when ours' count equals ours' own edge count. Ours' 8 for 4
+    /// rows stays a diff; 4 for 4 is taken; a cut page of ours keeps the ruled cost.
+    #[test]
+    fn oracle_counts_heights_needs_ours_self_consistent_on_an_uncut_page() {
+        let rules = [FieldRule::new(
+            "transactions.totalCount",
+            FieldRuleKind::OracleCountsHeights,
+        )];
+        let edges = |n: usize| {
+            (0..n)
+                .map(|i| json!({"node": {"i": i}}))
+                .collect::<Vec<_>>()
+        };
+        let conn = |count: u64, rows: Option<usize>, next: bool| {
+            let mut c = json!({"totalCount": count,
+                "pageInfo": {"hasNextPage": next, "hasPreviousPage": false}});
+            if let Some(n) = rows {
+                c["edges"] = Value::Array(edges(n));
+            }
+            json!({"data": {"transactions": c}})
+        };
+        let take = |a: Value, mut b: Value| oracle_counts_heights(&rules, &a, &mut b);
+        // Ours double-counts: 8 for its 4 rows, both pages whole.
+        assert!(take(conn(8, Some(4), false), conn(1, Some(4), false)).is_empty());
+        // The oracle's page cut, ours whole: ours' own count is still checked.
+        assert!(take(conn(8, Some(4), false), conn(1, Some(2), true)).is_empty());
+        // Ours whole but no edges selected: nothing to check against, nothing taken.
+        assert!(take(conn(4, None, false), conn(1, None, false)).is_empty());
+        // The neighbour: ours 4 for 4, the oracle's 1 (it counts heights) is taken.
+        assert_eq!(
+            take(conn(4, Some(4), false), conn(1, Some(4), false)),
+            vec![(4, 1)]
+        );
+        // Ours' page cut: its count cannot be checked by its edges (the ruled cost).
+        assert_eq!(
+            take(conn(8, Some(4), true), conn(1, Some(4), true)),
+            vec![(8, 1)]
+        );
     }
 }
