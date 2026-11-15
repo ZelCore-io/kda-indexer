@@ -85,6 +85,9 @@ pub const COUNT_WALK_PATH: &str = "/~graphql-count-walk";
 /// R-P5P9-86 TC: the walk passed [`COUNT_WALK_ROWS`] rows on a side, "count walk capped"
 /// (unexplained, its own reason; never allowlisted).
 pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
+/// R-P5P9-92 (1): visible hit of the count walk's oracle that counts heights (allowlist id
+/// `graphql-r75-oracle-counts-heights`, ACCEPTED; scoped to Transactions-9e58b95d).
+pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
 /// R-P5P9-86 TC: rows a side the count walk reads at most.
 pub const COUNT_WALK_ROWS: usize = 5_000;
 
@@ -4267,6 +4270,40 @@ impl Ctx {
         let (pa, pb) = (edges(&a), edges(&b));
         let (one_a, one_b) = (la - pa, lb - pb);
         let counts = na as i64 - nb as i64;
+        // R-P5P9-92 (1): the oracle counts heights. Every walked row settled (paired, no
+        // one-sided row), ours' count = the walked rows, and the oracle's count = the
+        // distinct heights among those rows (per the ACCEPTED oracle-counts-heights rule).
+        let heights: std::collections::BTreeSet<u64> = a
+            .body
+            .pointer(&format!("/data/{root}/edges"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| prepared_id(e, root).height)
+            .collect();
+        let by_heights = pa == pb
+            && one_a == 0
+            && one_b == 0
+            && la >= 0
+            && na == la as u64
+            && nb == heights.len() as u64
+            && na != nb;
+        if by_heights {
+            let mut out = h7;
+            out.push(entry(
+                COUNT_WALK_PATH,
+                Some(json!({"count": na, "walked": la, "oneSided": 0,
+                    "bound": (ours_bound < u64::MAX).then_some(ours_bound)})),
+                Some(json!({"count": nb, "walked": lb, "oneSided": 0,
+                    "distinctHeights": heights.len(), "nodeReads": st.node})),
+            ));
+            out.push(entry(
+                ORACLE_COUNTS_HEIGHTS_PATH,
+                Some(json!(na)),
+                Some(json!(nb)),
+            ));
+            return Ok(out);
+        }
         if pa != pb || counts != one_a - one_b {
             return Err((
                 false,

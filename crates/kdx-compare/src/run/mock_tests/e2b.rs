@@ -696,3 +696,61 @@ async fn e3_g_a_cut_nested_list_is_settled_by_prefix() {
     assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
     assert_eq!(rep.by_class.get("graphql-h6-prefix"), Some(&1), "{rep:?}");
 }
+
+/// R-P5P9-92 (1): both walks reach the same rows and the oracle counts heights. Ours' 3 rows
+/// over 2 heights, each settled (paired, the node holds them), ours' count 3 = the walked
+/// rows, the oracle's 2 = the distinct heights: explained, with the oracle-counts-heights
+/// hit beside the walk's. The oracle's 1 (not the 2 heights) stays unexplained.
+#[tokio::test]
+async fn e3_tc_the_oracle_counts_the_walked_rows_heights() {
+    let mut node = tc_node();
+    let (k, v) = h7_xfer_poll("t3", "B101", 101, "s", "r", json!(1.5));
+    node.polls.insert(k, v);
+    let row101 = || {
+        let mut e = h7_xrow("t3", 101, json!(1.5), Some(("s", "r")));
+        e["node"]["blockHash"] = json!("B101");
+        e
+    };
+    let rows = || {
+        vec![
+            row101(),
+            tc_row("t2", Some("B100")),
+            tc_row("t1", Some("B100")),
+        ]
+    };
+    for (oracle_count, explained) in [(2u64, true), (1, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(node.clone()).await;
+        let au = ours_fn_server(walk_reply("transfers", rows(), 3)).await;
+        let bu = ours_fn_server(walk_reply("transfers", rows(), oracle_count)).await;
+        let ops = c3_ops(dir.path());
+        let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, ""))
+            .await
+            .unwrap();
+        let (d, note) = tc_live(&ctx, tc_page(rows(), 3), tc_page(rows(), oracle_count)).await;
+        let un = c3_unexplained(&ctx, &d);
+        let heights = d
+            .iter()
+            .any(|e| e.path == crate::graphql_window::ORACLE_COUNTS_HEIGHTS_PATH);
+        assert_eq!(heights, explained, "{d:?} {note:?}");
+        if explained {
+            // The entry is scoped to Transactions-9e58b95d: on QH7 only the hit is left.
+            assert_eq!(
+                un,
+                vec![crate::graphql_window::ORACLE_COUNTS_HEIGHTS_PATH.to_string()]
+            );
+            let (un, _) = ctx.allow.classify_request(
+                &crate::normalize::RouteKind::Other,
+                "graphql:Transactions-9e58b95d",
+                &[],
+                &d,
+            );
+            assert!(un.is_empty(), "{un:?}");
+        } else {
+            assert!(
+                un.contains(&"/data/transfers/totalCount".to_string()),
+                "{un:?}"
+            );
+        }
+    }
+}
