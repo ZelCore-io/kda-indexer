@@ -2752,7 +2752,8 @@ async fn h7_duplicates_twice_ceiling_and_undecidable_rows() {
 /// the oracle `"{}"`. Explained only in that direction, only on a continuation, and only
 /// where the node's command for the request key has `cont.data` null (single-row reads:
 /// `/poll`, the header at its height, that block's payload). An exec payload, the reverse
-/// direction and a node `cont.data` that is not null stay diffs.
+/// direction and a node `cont.data` that is not null stay diffs. (R-P5P9-75 K: an exec
+/// payload is explained when ours equals the node's `exec.data`.)
 #[tokio::test]
 async fn r62_payload_data_null_only_where_the_node_cont_data_is_null() {
     use crate::graphql_window::PAYLOAD_DATA_PATH;
@@ -2807,9 +2808,11 @@ async fn r62_payload_data_null_only_where_the_node_cont_data_is_null() {
         hit.b.as_ref().unwrap().to_string().contains("c1"),
         "{hit:?}"
     );
-    // An exec payload: a diff.
+    // An exec payload: R-P5P9-75 K extends the matcher to it (ours "null" = the node's
+    // exec.data null), so it is explained now; d2_j_k_l_tx_fields_against_the_nodes_command
+    // holds its negatives.
     let d = settle(tx("e1", "null"), tx("e1", "{}")).await;
-    assert!(!only_hits(&d), "{d:?}");
+    assert!(only_hits(&d), "{d:?}");
     // Ours "{}" against the oracle's "null": a diff.
     let d = settle(tx("c1", "{}"), tx("c1", "null")).await;
     assert!(!only_hits(&d), "{d:?}");
@@ -6291,4 +6294,260 @@ async fn d2_0_e_matches_an_f64_rounded_oracle_amount_before_calling_the_row_off_
     )
     .await;
     assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+}
+
+fn d2_answer(body: Value) -> crate::graphql::Answer {
+    crate::graphql::Answer {
+        body,
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    }
+}
+
+fn d2_shipped() -> crate::allowlist::Allowlist {
+    crate::allowlist::Allowlist::load(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+    )
+    .unwrap()
+}
+
+/// R-P5P9-75 I: `oracle_counts_heights` on Transactions-9e58b95d's root `totalCount`: the
+/// oracle's count below ours takes ours with a visible hit, which only that operation's
+/// entry explains. An oracle count at or above ours, a nested count, and the hit on another
+/// operation stay diffs.
+#[test]
+fn d2_i_oracle_counts_heights_only_below_ours_on_transactions_9e58b95d() {
+    use crate::config::{FieldRule, FieldRuleKind};
+    use crate::graphql_norm::ORACLE_COUNTS_HEIGHTS_PATH;
+    let rules = [FieldRule::new(
+        "transactions.totalCount",
+        FieldRuleKind::OracleCountsHeights,
+    )];
+    let conn = |n: u64| {
+        json!({"data": {"transactions": {"totalCount": n, "edges": [],
+            "pageInfo": {"hasNextPage": true}}}})
+    };
+    let cmp = |a: u64, b: u64| {
+        crate::graphql::compare_answers_with(
+            &mut d2_answer(conn(a)),
+            &mut d2_answer(conn(b)),
+            50,
+            10_000,
+            &rules,
+            false,
+        )
+    };
+    let al = d2_shipped();
+    let d = cmp(4, 1);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, ORACLE_COUNTS_HEIGHTS_PATH);
+    assert_eq!(
+        (d[0].a.clone(), d[0].b.clone()),
+        (Some(json!(4)), Some(json!(1)))
+    );
+    let (un, ids) = al.classify_request(
+        &crate::normalize::RouteKind::Other,
+        "graphql:Transactions-9e58b95d",
+        &[],
+        &d,
+    );
+    assert!(un.is_empty(), "{un:?}");
+    assert_eq!(ids, vec!["graphql-r75-oracle-counts-heights".to_string()]);
+    // The same hit on another operation is not explained.
+    let (un, _) = al.classify_request(
+        &crate::normalize::RouteKind::Other,
+        "graphql:QTransactionsByAccount",
+        &[],
+        &d,
+    );
+    assert_eq!(un.len(), 1);
+    // The oracle at or above ours: the count diff stays.
+    let d = cmp(4, 5);
+    assert!(
+        d.iter().any(|e| e.path == "/data/transactions/totalCount"),
+        "{d:?}"
+    );
+    assert!(cmp(4, 4).is_empty());
+    // A nested count is not the root's.
+    let nested =
+        |n: u64| json!({"data": {"block": {"transactions": {"totalCount": n, "edges": []}}}});
+    let d = crate::graphql::compare_answers_with(
+        &mut d2_answer(nested(4)),
+        &mut d2_answer(nested(1)),
+        50,
+        10_000,
+        &rules,
+        false,
+    );
+    assert!(
+        d.iter().all(|e| e.path != ORACLE_COUNTS_HEIGHTS_PATH),
+        "{d:?}"
+    );
+    assert!(!d.is_empty());
+}
+
+/// A node with one block (BJ at height 60, payload PJ) holding the commands `cmds`.
+fn d2_cmd_node(cmds: &[(&str, Value)]) -> NodeMock {
+    use kdx_types::hash::b64url_encode;
+    let mut node = NodeMock::default();
+    let txs: Vec<Value> = cmds
+        .iter()
+        .map(|(rk, cmd)| {
+            let w = json!({"hash": rk, "sigs": [], "cmd": cmd.to_string()}).to_string();
+            json!([b64url_encode(w.as_bytes()), b64url_encode(b"{}")])
+        })
+        .collect();
+    node.payloads
+        .insert("PJ".into(), json!({ "transactions": txs }));
+    node.headers.insert(
+        (0, 60),
+        vec![json!({"hash": "BJ", "height": 60, "payloadHash": "PJ"})],
+    );
+    for (rk, _) in cmds {
+        let (k, v) = h7_poll(rk, "BJ", 60, json!([]));
+        node.polls.insert(k, v);
+    }
+    node
+}
+
+/// R-P5P9-75 J, K, L: `payload.rollback`, exec `payload.data` and `signers.address` are
+/// explained only when ours equals the node's command (`cont.rollback`, `exec.data`, the
+/// signer's `addr`). Each negative neighbour (ours not the node's) stays a diff.
+#[tokio::test]
+async fn d2_j_k_l_tx_fields_against_the_nodes_command() {
+    use crate::graphql_window::{PAYLOAD_DATA_PATH, ROLLBACK_PATH, SIGNER_ADDRESS_PATH};
+    let dir = tempfile::tempdir().unwrap();
+    let cont = |rb: bool| {
+        json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": rb, "data": {},
+            "proof": null}}, "meta": {"chainId": "0"}, "signers": []})
+    };
+    let exec = |data: Value| {
+        json!({"payload": {"exec": {"code": "(+ 1 2)", "data": data}},
+            "meta": {"chainId": "0"},
+            "signers": [{"pubKey": "pk1", "addr": "6a3a7c76"}, {"pubKey": "pk2"}]})
+    };
+    let node = d2_cmd_node(&[
+        ("j1", cont(false)),
+        ("k1", exec(Value::Null)),
+        ("k2", exec(json!({"ks": ["a"]}))),
+    ]);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let tx = |rk: &str, payload: Value, signers: Value| {
+        d2_answer(json!({"data": {"transaction": {"hash": rk,
+            "cmd": {"meta": {"chainId": "0"}, "payload": payload, "signers": signers}}}}))
+    };
+    let vars = serde_json::Map::new();
+    let settle = |mut a: crate::graphql::Answer, mut b: crate::graphql::Answer| {
+        let (ctx, vars) = (&ctx, &vars);
+        async move {
+            ctx.gql_settle(&ctx.targets["a"], vars, &mut a, &mut b, 7_000_000, false)
+                .await
+                .0
+        }
+    };
+    let has = |d: &[crate::report::DiffEntry], p: &str| d.iter().any(|e| e.path == p);
+    // J: ours false = the node's cont.rollback, the oracle's true.
+    let rb = |x: bool| json!({"rollback": x});
+    let d = settle(
+        tx("j1", rb(false), json!([])),
+        tx("j1", rb(true), json!([])),
+    )
+    .await;
+    assert!(only_hits(&d) && has(&d, ROLLBACK_PATH), "{d:?}");
+    // Ours true against the node's false: a diff.
+    let d = settle(
+        tx("j1", rb(true), json!([])),
+        tx("j1", rb(false), json!([])),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // K: an exec payload, ours "null" = the node's exec.data null, the oracle's "{}".
+    let data = |x: &str| json!({ "data": x });
+    let d = settle(
+        tx("k1", data("null"), json!([])),
+        tx("k1", data("{}"), json!([])),
+    )
+    .await;
+    assert!(only_hits(&d) && has(&d, PAYLOAD_DATA_PATH), "{d:?}");
+    // By value: ours' JSON text of the node's object.
+    let d = settle(
+        tx("k2", data(r#"{"ks":["a"]}"#), json!([])),
+        tx("k2", data("{}"), json!([])),
+    )
+    .await;
+    assert!(only_hits(&d), "{d:?}");
+    // Ours "{}" where the node's exec.data is null: a diff.
+    let d = settle(
+        tx("k1", data("{}"), json!([])),
+        tx("k1", data("null"), json!([])),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // L: ours' address = the node's signer addr, the oracle's null.
+    let sg = |pk: &str, addr: Value| json!([{ "pubkey": pk, "address": addr }]);
+    let d = settle(
+        tx("k1", data("null"), sg("pk1", json!("6a3a7c76"))),
+        tx("k1", data("null"), sg("pk1", Value::Null)),
+    )
+    .await;
+    assert!(only_hits(&d) && has(&d, SIGNER_ADDRESS_PATH), "{d:?}");
+    // Ours' address is not the node's addr: a diff.
+    let d = settle(
+        tx("k1", data("null"), sg("pk1", json!("ffff0000"))),
+        tx("k1", data("null"), sg("pk1", Value::Null)),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The node's signer at that index has another public key: a diff.
+    let d = settle(
+        tx("k1", data("null"), sg("pkX", json!("6a3a7c76"))),
+        tx("k1", data("null"), sg("pkX", Value::Null)),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// R-P5P9-75 O: H8 on a transfer list nested in a transaction (QTransactionByKey): the
+/// oracle's rank among the node's TRANSFER events takes the node's event index, ours'
+/// numbering. Ours with another index stays a diff.
+#[tokio::test]
+async fn d2_o_h8_applies_to_nested_transfer_lists() {
+    use crate::graphql_window::ORDER_INDEX_PATH;
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let ev = json!([
+        {"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "k:miner", 0.01]},
+        {"name": "OTHER", "module": {"name": "coin"}, "params": []},
+        {"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "r", 1.0]}
+    ]);
+    let (k, v) = h7_poll("o1", "BO", 70, ev);
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let tx = |idx: Value| {
+        d2_answer(json!({"data": {"transaction": {"hash": "o1",
+            "cmd": {"meta": {"chainId": "0"}},
+            "result": {"transfers": {"edges": [{"node": {"orderIndex": idx,
+                "amount": 1.0, "senderAccount": "s", "receiverAccount": "r"}}]}}}}}))
+    };
+    let vars = serde_json::Map::new();
+    let settle = |mut a: crate::graphql::Answer, mut b: crate::graphql::Answer| {
+        let (ctx, vars) = (&ctx, &vars);
+        async move {
+            ctx.gql_settle(&ctx.targets["a"], vars, &mut a, &mut b, 7_000_000, false)
+                .await
+                .0
+        }
+    };
+    let d = settle(tx(json!(2)), tx(json!(1))).await;
+    assert!(
+        only_hits(&d) && d.iter().any(|e| e.path == ORDER_INDEX_PATH),
+        "{d:?}"
+    );
+    // Ours 3: not the node's event index, a diff.
+    let d = settle(tx(json!(3)), tx(json!(1))).await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The oracle's 0 is the gas transfer's rank, not this content: a diff.
+    let d = settle(tx(json!(2)), tx(json!(0))).await;
+    assert!(!only_hits(&d), "{d:?}");
 }

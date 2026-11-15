@@ -3687,6 +3687,18 @@ impl Ctx {
         rk: &str,
         st: &mut Reads,
     ) -> Result<bool, String> {
+        let cmd = self.node_cmd_for(chain, rk, st).await?;
+        Ok(cmd.pointer("/payload/cont/data") == Some(&Value::Null))
+    }
+
+    /// The node's command for `rk` on `chain` (decoded): `/poll` for its block, the headers
+    /// at its height, that block's payload (single-row reads under the compare's cap).
+    pub(crate) async fn node_cmd_for(
+        &self,
+        chain: u8,
+        rk: &str,
+        st: &mut Reads,
+    ) -> Result<Value, String> {
         let p = self
             .h7_poll(chain, rk, st)
             .await?
@@ -3707,8 +3719,304 @@ impl Ctx {
             .ok_or("no header for the block")?
             .to_string();
         let payload = self.h7_payload(chain, &ph, st).await?;
-        let cmd = node_cmd(&payload, rk).ok_or("the block's payload lacks the key")?;
-        Ok(cmd.pointer("/payload/cont/data") == Some(&Value::Null))
+        node_cmd(&payload, rk).ok_or_else(|| "the block's payload lacks the key".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-75 J, K, L: transaction fields against the node's command; O: H8 on nested lists
+
+/// Visible hit of J (`payload.rollback`, allowlist id `graphql-r75-payload-rollback`).
+pub const ROLLBACK_PATH: &str = "/~graphql-r75-payload-rollback";
+/// Visible hit of L (`signers.address`, allowlist id `graphql-r75-signer-address`).
+pub const SIGNER_ADDRESS_PATH: &str = "/~graphql-r75-signer-address";
+
+/// The transaction objects in an answer that select `cmd`: (request key, chain if selected,
+/// JSON pointer to the object).
+pub fn cmd_txs(v: &Value) -> Vec<(String, Option<u8>, String)> {
+    payload_data_txs_by(v, |m| m.get("cmd").is_some_and(Value::is_object), "")
+}
+
+fn payload_data_txs_by(
+    v: &Value,
+    pick: fn(&serde_json::Map<String, Value>) -> bool,
+    suffix: &str,
+) -> Vec<(String, Option<u8>, String)> {
+    fn walk(
+        v: &Value,
+        ptr: &mut String,
+        pick: fn(&serde_json::Map<String, Value>) -> bool,
+        suffix: &str,
+        out: &mut Vec<(String, Option<u8>, String)>,
+    ) {
+        match v {
+            Value::Object(m) => {
+                let rk = m
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        m.get("id")
+                            .and_then(Value::as_str)
+                            .and_then(crate::graphql_norm::tx_id_block)
+                            .map(|x| x.1)
+                    });
+                if let (true, Some(rk)) = (pick(m), rk) {
+                    let chain = ["/cmd/meta/chainId", "/result/block/chainId"]
+                        .iter()
+                        .find_map(|q| v.pointer(q))
+                        .and_then(text)
+                        .and_then(|c| c.parse().ok());
+                    out.push((rk, chain, format!("{ptr}{suffix}")));
+                }
+                for (k, x) in m {
+                    let n = ptr.len();
+                    ptr.push('/');
+                    ptr.push_str(&k.replace('~', "~0").replace('/', "~1"));
+                    walk(x, ptr, pick, suffix, out);
+                    ptr.truncate(n);
+                }
+            }
+            Value::Array(xs) => {
+                for (i, x) in xs.iter().enumerate() {
+                    let n = ptr.len();
+                    ptr.push_str(&format!("/{i}"));
+                    walk(x, ptr, pick, suffix, out);
+                    ptr.truncate(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, &mut String::new(), pick, suffix, &mut out);
+    out
+}
+
+/// The node's value for one field class of a tx (J: `cont.rollback`, K: `exec.data`, L: the
+/// signer's `addr`), `None` when the node's command has no such field (a continuation for K,
+/// an exec for J, no signer at that index or another public key for L).
+fn node_field(cmd: &Value, suffix: &str, ours_tx: &Value) -> Option<Value> {
+    if suffix == "/cmd/payload/rollback" {
+        return cmd.pointer("/payload/cont/rollback").cloned();
+    }
+    if suffix == "/cmd/payload/data" {
+        let exec = cmd.pointer("/payload/exec")?;
+        return Some(exec.get("data").cloned().unwrap_or(Value::Null));
+    }
+    let i = suffix
+        .strip_prefix("/cmd/signers/")?
+        .strip_suffix("/address")?;
+    let sg = cmd.pointer(&format!("/signers/{i}"))?;
+    let pk = ours_tx.pointer(&format!("/cmd/signers/{i}/pubkey"));
+    if pk.is_some_and(|k| sg.get("pubKey") != Some(k)) {
+        return None;
+    }
+    Some(sg.get("addr").cloned().unwrap_or(Value::Null))
+}
+
+impl Ctx {
+    /// R-P5P9-75 J, K and L (rule (a), exact, against the node): where ours and the oracle
+    /// differ on a tx's `cmd.payload.rollback`, its exec `cmd.payload.data` or a signer's
+    /// `address`, the oracle's value takes ours only when ours equals the node's command for
+    /// that request key (`cont.rollback`; `exec.data`, ours' JSON text by value, extending the
+    /// R-P5P9-62 matcher; the signer's `addr`, at the same index and public key). At most
+    /// [`PAYLOAD_DATA_CHECKS`] keys per compare, single-row reads. Anything else stays.
+    pub(crate) async fn gql_node_cmd_fields(
+        &self,
+        vars: &Map<String, Value>,
+        a: &Answer,
+        b: &mut Answer,
+        st: &mut Reads,
+    ) -> Vec<DiffEntry> {
+        let ours = cmd_txs(&a.body);
+        let theirs = cmd_txs(&b.body);
+        let var_chain = vars
+            .get("chainId")
+            .and_then(text)
+            .and_then(|c| c.parse::<u8>().ok());
+        let node0 = st.node;
+        let mut cmds: HashMap<String, Option<Value>> = HashMap::new();
+        let mut ev: [Vec<Value>; 3] = Default::default();
+        for (rk, chain_b, pb) in theirs {
+            let Some((_, chain_a, pa)) = ours.iter().find(|(k, _, _)| *k == rk) else {
+                continue;
+            };
+            let at = |v: &Value, p: &str, s: &str| v.pointer(&format!("{p}{s}")).cloned();
+            let mut fields = vec![
+                "/cmd/payload/rollback".to_string(),
+                "/cmd/payload/data".into(),
+            ];
+            let n = a
+                .body
+                .pointer(&format!("{pa}/cmd/signers"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            fields.extend((0..n).map(|i| format!("/cmd/signers/{i}/address")));
+            fields.retain(|s| match (at(&a.body, pa, s), at(&b.body, &pb, s)) {
+                (Some(x), Some(y)) => x != y,
+                _ => false,
+            });
+            if fields.is_empty() {
+                continue;
+            }
+            let cmd = match cmds.get(&rk) {
+                Some(c) => c.clone(),
+                None if cmds.len() >= PAYLOAD_DATA_CHECKS => continue,
+                None => {
+                    let c = match chain_a.or(chain_b).or(var_chain) {
+                        Some(c) => self.node_cmd_for(c, &rk, st).await,
+                        None => Err("no chain".into()),
+                    };
+                    if let Err(why) = &c {
+                        tracing::debug!(rk, why, "tx fields against the node: no command");
+                    }
+                    let c = c.ok();
+                    cmds.insert(rk.clone(), c.clone());
+                    c
+                }
+            };
+            let Some(cmd) = cmd else { continue };
+            let ours_tx = a.body.pointer(pa).cloned().unwrap_or(Value::Null);
+            for s in fields {
+                let mine = at(&a.body, pa, &s).unwrap_or(Value::Null);
+                let Some(node) = node_field(&cmd, &s, &ours_tx) else {
+                    continue;
+                };
+                let (class, ok) = match s.as_str() {
+                    "/cmd/payload/rollback" => (0, mine == node),
+                    "/cmd/payload/data" => (
+                        1,
+                        mine.as_str()
+                            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                            .is_some_and(|o| o == node),
+                    ),
+                    _ => (2, mine == node),
+                };
+                if !ok {
+                    continue;
+                }
+                let theirs = at(&b.body, &pb, &s);
+                if let Some(v) = b.body.pointer_mut(&format!("{pb}{s}")) {
+                    *v = mine.clone();
+                }
+                ev[class].push(json!({"requestKey": rk, "field": s, "ours": mine,
+                    "oracle": theirs, "node": node}));
+            }
+        }
+        let reads = st.node - node0;
+        [ROLLBACK_PATH, PAYLOAD_DATA_PATH, SIGNER_ADDRESS_PATH]
+            .iter()
+            .zip(ev)
+            .filter(|(_, e)| !e.is_empty())
+            .map(|(p, e)| entry(p, Some(json!({"nodeReads": reads})), Some(Value::Array(e))))
+            .collect()
+    }
+
+    /// R-P5P9-75 O: H8 on the transfer lists nested in a transaction (QTransactionByKey's
+    /// `result.transfers`). For each nested list of the oracle's whose rows ours does not hold
+    /// at the same place with the same `orderIndex` and content (at most
+    /// [`ORDER_INDEX_READS`] keys), one node `/poll` of the parent tx's request key: when every
+    /// oracle value is the rank of the node's TRANSFER event with its content, the rows take
+    /// that event's index (ours' numbering, R-P5P9-62) and the diff checks ours against it.
+    pub(crate) async fn gql_nested_transfer_order(
+        &self,
+        vars: &Map<String, Value>,
+        a: &Answer,
+        b: &mut Answer,
+        st: &mut Reads,
+    ) -> Option<DiffEntry> {
+        let lists = payload_data_txs_by(
+            &b.body,
+            |m| {
+                m.get("result")
+                    .and_then(|r| r.get("transfers"))
+                    .is_some_and(|t| t.get("edges").is_some_and(Value::is_array))
+            },
+            "/result/transfers/edges",
+        );
+        let var_chain = vars
+            .get("chainId")
+            .and_then(text)
+            .and_then(|c| c.parse::<u8>().ok());
+        let index = |n: &Value| -> Option<i64> {
+            match n.get("orderIndex")? {
+                Value::String(s) => s.parse().ok(),
+                v => v.as_i64(),
+            }
+        };
+        let mut evidence = Vec::new();
+        let mut reads = 0;
+        for (rk, chain, ptr) in lists {
+            let rows: Vec<Value> = b
+                .body
+                .pointer(&ptr)
+                .and_then(Value::as_array)
+                .map(|e| {
+                    e.iter()
+                        .map(|x| x.get("node").cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mine: Vec<Value> = a
+                .body
+                .pointer(&ptr)
+                .and_then(Value::as_array)
+                .map(|e| {
+                    e.iter()
+                        .map(|x| x.get("node").cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let held = rows.len() == mine.len()
+                && rows
+                    .iter()
+                    .zip(&mine)
+                    .all(|(x, y)| index(x) == index(y) && same_transfer(x, y));
+            if held || rows.iter().any(|r| index(r).is_none()) || reads >= ORDER_INDEX_READS {
+                continue;
+            }
+            let Some(chain) = chain
+                .or_else(|| {
+                    rows.iter()
+                        .find_map(|r| r.get("chainId").and_then(text)?.parse().ok())
+                })
+                .or(var_chain)
+            else {
+                continue;
+            };
+            reads += 1;
+            let Ok(Some(p)) = self.h7_poll(chain, &rk, st).await else {
+                continue;
+            };
+            let events: Vec<Value> = p
+                .get("events")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let ranked: Vec<(i64, &Value)> =
+                rows.iter().filter_map(|r| Some((index(r)?, r))).collect();
+            match node_rank_map(&events, &ranked) {
+                Ok(map) => {
+                    for (j, (_, i)) in map.iter().enumerate() {
+                        if let Some(n) = b.body.pointer_mut(&format!("{ptr}/{j}/node")) {
+                            reindex_transfer(n, *i);
+                        }
+                    }
+                    evidence.push(json!({"requestKey": rk, "chain": chain, "nested": ptr,
+                        "oracle": map.iter().map(|x| x.0).collect::<Vec<_>>(),
+                        "mapped": map.iter().map(|x| x.1).collect::<Vec<_>>()}));
+                }
+                Err(why) => tracing::debug!(rk, why, "nested H8 not explained"),
+            }
+        }
+        (!evidence.is_empty()).then(|| {
+            entry(
+                ORDER_INDEX_PATH,
+                Some(json!({"nodePolls": reads})),
+                Some(Value::Array(evidence)),
+            )
+        })
     }
 }
 

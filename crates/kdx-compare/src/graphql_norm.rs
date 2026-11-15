@@ -45,6 +45,9 @@ pub const BY_KEY_EXTRA_PATH: &str = "/~graphql-r58-by-key-extra-row";
 pub const STRIPS_QUOTES_PATH: &str = "/~graphql-r60-oracle-strips-quotes";
 /// Visible hit of `count_self_consistent` (allowlist id `graphql-r60-count-self-consistent`).
 pub const COUNT_SELF_CONSISTENT_PATH: &str = "/~graphql-r60-count-self-consistent";
+/// Visible hit of `oracle_counts_heights` (allowlist id `graphql-r75-oracle-counts-heights`,
+/// scoped to Transactions-9e58b95d).
+pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
 /// Visible hit of `creation_time_half_even` (allowlist id `graphql-h9-creation-time-fraction`).
 pub const H9_PATH: &str = "/~graphql-h9-creation-time-fraction";
 
@@ -265,7 +268,8 @@ pub fn rule_explains(
         }
         FieldRuleKind::OracleOrphanDupes
         | FieldRuleKind::ByKeyExtraRow
-        | FieldRuleKind::CountSelfConsistent => false,
+        | FieldRuleKind::CountSelfConsistent
+        | FieldRuleKind::OracleCountsHeights => false,
     };
     ok.then_some(match r.rule {
         FieldRuleKind::OracleEmpty => ORACLE_EMPTY_PATH,
@@ -348,6 +352,36 @@ pub fn count_self_consistent(rules: &[FieldRule], a: &Value, b: &mut Value) -> b
         }
     }
     hit
+}
+
+/// R-P5P9-75 I: for each `oracle_counts_heights` rule `<root>.totalCount`, the oracle's root
+/// count takes ours when it is below ours (the oracle counts heights). Only the root
+/// connection's own count: nested counts are never touched. Returns (ours, the oracle's) per
+/// count taken.
+pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for r in rules
+        .iter()
+        .filter(|r| r.rule == FieldRuleKind::OracleCountsHeights)
+    {
+        let Some((root, "totalCount")) = r.field.split_once('.') else {
+            continue;
+        };
+        let ptr = format!("/data/{root}/totalCount");
+        let (Some(na), Some(nb)) = (
+            a.pointer(&ptr).and_then(Value::as_u64),
+            b.pointer(&ptr).and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        if nb < na {
+            if let Some(n) = b.pointer_mut(&ptr) {
+                *n = Value::from(na);
+                out.push((na, nb));
+            }
+        }
+    }
+    out
 }
 
 /// The explainer of one oracle pair diff: per-field rules first, then F2 and F7. Returns the

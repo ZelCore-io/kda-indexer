@@ -955,6 +955,15 @@ pub fn compare_answers_with(
     if crate::graphql_norm::count_self_consistent(rules, &na, &mut nb) {
         hits.push(hit(crate::graphql_norm::COUNT_SELF_CONSISTENT_PATH));
     }
+    // R-P5P9-75 I: the oracle counts heights on Transactions-9e58b95d (scoped by the entry).
+    for (ours, oracle) in crate::graphql_norm::oracle_counts_heights(rules, &na, &mut nb) {
+        hits.push(DiffEntry {
+            path: crate::graphql_norm::ORACLE_COUNTS_HEIGHTS_PATH.into(),
+            kind: DiffKind::Changed,
+            a: Some(json!(ours)),
+            b: Some(json!(oracle)),
+        });
+    }
     if let (Some(da), Some(db)) = (na.get_mut("data"), nb.get_mut("data")) {
         if let (Some(ca), Some(cb)) = (root_connection(da), root_connection(db)) {
             if !aligned && crate::graphql_norm::cut_trailing_ties(ca, cb) {
@@ -1709,6 +1718,10 @@ impl Ctx {
         // H8 first: the oracle's transfer rows take the node's indexes, so H7 matches them.
         let h8 = self.gql_transfer_order(ta, a, b, &mut st).await;
         let data = self.gql_payload_data(vars, a, b, &mut st).await;
+        // R-P5P9-75 O: H8 on nested transfer lists; J, K, L: tx fields against the node's
+        // command.
+        let nested = self.gql_nested_transfer_order(vars, a, b, &mut st).await;
+        let cmd_fields = self.gql_node_cmd_fields(vars, a, b, &mut st).await;
         let (h7, note) = self
             .gql_window_referee(ta, op, vars, a, b, max, root_scoped, &mut st)
             .await;
@@ -1722,6 +1735,8 @@ impl Ctx {
         );
         d.extend(h8);
         d.extend(data);
+        d.extend(nested);
+        d.extend(cmd_fields);
         d.extend(h7);
         (d, note)
     }
