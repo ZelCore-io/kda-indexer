@@ -7097,3 +7097,61 @@ async fn d4a_h1_i3_key_only_rows_count_the_node_transfers_inside_the_filter() {
     let (d, note) = settle("zed", vec![r()], vec![]).await;
     assert!(!only_hits(&d), "{d:?} {note:?}");
 }
+
+/// R-P5P9-78 (H1 m-1): A judges an ambiguous row against each node event it matches. CASE4:
+/// a row selecting the amount and `crossChainTransfer: null` but no sender matches a plain
+/// TRANSFER and the TRANSFER of a cross-chain send; the events disagree, so the row is a
+/// diff. Two plain TRANSFERs of that amount agree on null: explained.
+#[tokio::test]
+async fn d4a_h1_m1_cross_chain_link_is_judged_against_every_matching_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let ev = |name: &str, p: Value| json!({"name": name, "module": {"name": "coin"}, "params": p});
+    let (k, v) = h7_xfer_poll("x0", "B100", 100, "s", "r", json!(5.0));
+    node.polls.insert(k, v);
+    let (k, v) = h7_poll(
+        "x3",
+        "B100",
+        100,
+        json!([
+            ev("TRANSFER", json!(["s2", "r2", 5.0])),
+            ev("TRANSFER", json!(["s1", "", 5.0])),
+            ev("TRANSFER_XCHAIN", json!(["s1", "r", 5.0, "1"]))
+        ]),
+    );
+    node.polls.insert(k, v);
+    let (k, v) = h7_poll(
+        "x4",
+        "B100",
+        100,
+        json!([
+            ev("TRANSFER", json!(["s2", "r2", 5.0])),
+            ev("TRANSFER", json!(["s3", "r3", 5.0]))
+        ]),
+    );
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = h7_xrow("x0", 100, json!(5.0), Some(("s", "r")));
+    let row = |rk: &str| {
+        let mut e = h7_xrow(rk, 100, json!(5.0), None);
+        e["node"]["crossChainTransfer"] = Value::Null;
+        e
+    };
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), row("x3"), row("x3")],
+        vec![x0.clone()],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "CASE4: {d:?} {note:?}");
+    assert!(note.unwrap_or_default().contains("crossChainTransfer"));
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), row("x4"), row("x4")],
+        vec![x0.clone()],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+}

@@ -709,7 +709,38 @@ fn null_is_checked(path: &str) -> bool {
 /// amount). Null iff the transaction holds neither for it; otherwise one TRANSFER_XCHAIN,
 /// whose target chain and receiver are the selected `chainId` and `receiverAccount`.
 pub fn xchain_mismatch(x: &Value, v: &Verdict) -> Option<String> {
-    let Some(ev) = v.event.as_ref() else {
+    xchain_mismatch_at(x, v.event.as_ref(), v)
+}
+
+/// R-P5P9-78 (H1 m-1): [`xchain_mismatch`] for an ours-only transfer row `n` without an index,
+/// which is any node TRANSFER with its content: the link must be right against each of them.
+/// When they disagree the row is ambiguous, and refused.
+pub fn xchain_mismatch_row(x: &Value, n: &Value, v: &Verdict) -> Option<String> {
+    let hits: Vec<&Value> = v
+        .transfers
+        .iter()
+        .filter(|e| transfer_matches(n, e, false))
+        .collect();
+    if hits.len() <= 1 {
+        return xchain_mismatch(x, v);
+    }
+    let whys: Vec<Option<String>> = hits
+        .iter()
+        .map(|e| xchain_mismatch_at(x, Some(e), v))
+        .collect();
+    match whys.iter().flatten().next() {
+        None => None,
+        Some(w) if whys.iter().all(Option::is_some) => Some(w.clone()),
+        Some(_) => Some(format!(
+            "crossChainTransfer is ambiguous: the row is {} of the node's TRANSFER events, which \
+             disagree on its link",
+            hits.len()
+        )),
+    }
+}
+
+fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<String> {
+    let Some(ev) = ev else {
         return Some("crossChainTransfer: no node event for the row".into());
     };
     let p = |e: &Value, i: usize| e.pointer(&format!("/params/{i}")).cloned();
@@ -2456,7 +2487,13 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
         if let Some(why) = n
             .get("crossChainTransfer")
             .filter(|_| ra.id.kind == Some(Kind::Transfer))
-            .and_then(|x| xchain_mismatch(x, v))
+            .and_then(|x| {
+                if ra.id.indexed() {
+                    xchain_mismatch(x, v)
+                } else {
+                    xchain_mismatch_row(x, n, v)
+                }
+            })
         {
             d.rejected.push((
                 Some(ra.edge.clone()),
