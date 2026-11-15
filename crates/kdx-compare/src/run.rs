@@ -69,6 +69,14 @@ const SEARCH_TIE_ORDER_PATH: &str = "/~search-tie-order";
 const EVENT_ORDER_PATH: &str = "/~event-order";
 /// JSON path of the visible allowlist hit for rows above a lagging oracle's tip (ruling R3E-11).
 const ORACLE_LAG_PATH: &str = "/~oracle-lag";
+/// JSON path of the diff for ours' `/stats` count older than [`STATS_COUNT_AGE_CAP`] (or an
+/// `x-count-age` that is no age), and, under it, of the visible allowlist hit for ours' supply
+/// lagging by what the heights of an honoured age minted (R-P5P9-78, H2 I-1).
+const STATS_COUNT_AGE_PATH: &str = "/~stats-count-age";
+/// The largest `x-count-age` the harness honours (R-P5P9-78, H2 I-1): the served WARN
+/// threshold, 3 x the refresher's `REFRESH_EVERY` (120 s). An older count means a stuck
+/// refresher, a defect of ours: no widening, and the record carries `/~stats-count-age`.
+const STATS_COUNT_AGE_CAP: f64 = 360.0;
 /// JSON path of the visible allowlist hit for a kda-txs answer that changed on a retry.
 const ORACLE_UNSTABLE_PATH: &str = "/~oracle-unstable";
 /// JSON path of the visible allowlist hit for the oldest height cut at a `/v1/txs` limit.
@@ -193,6 +201,9 @@ fn num_canon_text(v: &Value) -> String {
 }
 
 /// Rewrites every JSON number as its nearest f64.
+/// R-P5P9-75 (CG-4 concern 4): body bytes an allowlisted REST record keeps on each side.
+pub const ALLOWLISTED_BODY: usize = 4096;
+
 pub(crate) fn numbers_as_f64(v: &mut Value) {
     match v {
         Value::Number(n) => {
@@ -406,6 +417,52 @@ fn query_account(req: &Request) -> String {
     path.strip_prefix("/txs/account/")
         .map(crate::via_cwd::pct_decode)
         .unwrap_or_default()
+}
+
+/// Seconds per block height on every chain (Kadena's block time).
+const SECS_PER_HEIGHT: f64 = 30.0;
+
+/// Heights produced in ours' `x-count-age` (STATS-FIX, R-P5P9-75 item 4): the age over the
+/// block time, rounded up; no header (or one that is no number), no widening. An age above
+/// [`STATS_COUNT_AGE_CAP`] gives no widening either (R-P5P9-78, H2 I-1).
+fn count_age_heights(age_secs: Option<f64>) -> f64 {
+    age_secs
+        .filter(|a| a.is_finite() && *a > 0.0 && *a <= STATS_COUNT_AGE_CAP)
+        .map_or(0.0, |a| (a / SECS_PER_HEIGHT).ceil())
+}
+
+/// R-P5P9-78 (H2 I-1): ours' `x-count-age` header that is not an age the harness honours (a
+/// number from 0 to [`STATS_COUNT_AGE_CAP`]) is a diff at `/~stats-count-age`: a stuck
+/// refresher serves an ever older count. No header gives no diff (and no widening).
+fn stats_count_age_diff(header: Option<&str>) -> Option<DiffEntry> {
+    let h = header?;
+    let honoured = h
+        .trim()
+        .parse::<f64>()
+        .is_ok_and(|a| a.is_finite() && (0.0..=STATS_COUNT_AGE_CAP).contains(&a));
+    (!honoured).then(|| DiffEntry {
+        path: STATS_COUNT_AGE_PATH.into(),
+        kind: DiffKind::Changed,
+        a: Some(json!(h)),
+        b: Some(json!(STATS_COUNT_AGE_CAP)),
+    })
+}
+
+/// `/stats.coinsInCirculation` against chainweb-data, ours `x`, chainweb-data's `y`, past the
+/// relative 1e-6 (R3E-11): ours above by at most the supply minted in the tip gap (at least
+/// 240 heights: chainweb-data fills recent heights late), or, since STATS-FIX serves a count
+/// up to `x-count-age` old, ours below by at most the supply minted in the heights of that
+/// age (the same per-height maximum). Without the header ours may not be below.
+fn stats_supply_lag(x: f64, y: f64, a_tip: u64, b_tip: u64, age_secs: Option<f64>) -> bool {
+    let d = a_tip.saturating_sub(b_tip).max(240) as f64;
+    let tol = 1e-6 * x.abs().max(y.abs());
+    let aged = count_age_heights(age_secs) * SUPPLY_PER_HEIGHT;
+    (x - y).abs() > tol
+        && if x > y {
+            x - y <= d * SUPPLY_PER_HEIGHT + tol
+        } else {
+            y - x <= aged + tol
+        }
 }
 
 /// `/coins` against chainweb-data (R-P5P9-48): a difference past the relative 1e-6 of
@@ -760,11 +817,7 @@ impl Ctx {
             if let Some(rec) = &o.record {
                 {
                     let mut s = self.summary.lock().expect("summary");
-                    if let Some(ids) = &rec.allowlisted {
-                        for id in ids.split(',') {
-                            s.allowlist_hit(id);
-                        }
-                    }
+                    s.record_hits(rec, &self.allow);
                     if rec.class == "diff" {
                         s.unexplained(route, &rec.diff);
                     }
@@ -825,6 +878,7 @@ impl Ctx {
             diff,
             class: class.to_string(),
             allowlisted: (!allowlisted.is_empty()).then(|| allowlisted.join(",")),
+            known_gap: None,
             curl: format!("curl -s {} ; {}", sh_url("A", &req.path_and_query), b_curl),
             note,
             body_cap: None,
@@ -1061,9 +1115,18 @@ impl Ctx {
                 }
             }
         }
+        // STATS-FIX: ours' /stats count is up to `x-count-age` seconds old. Past the cap the
+        // refresher is stuck: a diff on every pair, and no widening (R-P5P9-78, H2 I-1).
+        let count_age = pa
+            .pages
+            .first()
+            .and_then(|c| c.header("x-count-age"))
+            .filter(|_| req.route == RouteKind::Stats && sa == 200);
+        let count_age_diff = stats_count_age_diff(count_age);
         // /stats against a lagging chainweb-data: the supply differs by what was minted in
-        // the heights between the two tips (R3E-11).
-        let mut supply_lag: Option<(Value, Value)> = None;
+        // the heights between the two tips (R3E-11), or, ours below, by what the heights of
+        // ours' honoured count age minted (reported at `/~stats-count-age/coinsInCirculation`).
+        let mut supply_lag: Option<(bool, Value, Value)> = None;
         if req.route == RouteKind::Stats
             && tb.kind == crate::config::TargetKind::ChainwebData
             && sa == 200
@@ -1076,13 +1139,11 @@ impl Ctx {
                 let b_tip = self.oracle_tip(tb).await.unwrap_or(a_tip);
                 let x = va.get("coinsInCirculation").and_then(num_value);
                 let y = vb.get("coinsInCirculation").and_then(num_value);
+                let age = count_age.and_then(|v| v.trim().parse::<f64>().ok());
                 if let (Some(x), Some(y)) = (x, y) {
-                    // chainweb-data also fills recent heights late (seen live: 5153 KDA lower
-                    // with its /txs/recent near the tip), so at least 240 heights (2 h) count.
-                    let d = a_tip.saturating_sub(b_tip).max(240) as f64;
-                    let tol = 1e-6 * x.abs().max(y.abs());
-                    if x > y && d > 0.0 && x - y > tol && x - y <= d * SUPPLY_PER_HEIGHT + tol {
+                    if stats_supply_lag(x, y, a_tip, b_tip, age) {
                         let pair = (
+                            x < y,
                             va.get("coinsInCirculation").cloned().unwrap_or(Value::Null),
                             vb.get("coinsInCirculation").cloned().unwrap_or(Value::Null),
                         );
@@ -1320,7 +1381,8 @@ impl Ctx {
         // chainweb-data keeps rows of orphaned blocks: on /txs/txs it lists them beside the
         // canonical row, and its /txs/tx answers 404 when a request key has several rows.
         // A's row must be one of B's (the node pair checks that A's block is canonical); B's
-        // other rows go under /orphans (allowlist `orphan-rows-txs`).
+        // other rows go under /orphans (allowlist `orphan-rows-txs`, whose `request_any` names
+        // /txs/txs since R-P5P9-81, I-1).
         // A B row in the node's canonical block is no orphan: it stays a row A lacks (F4, seen
         // live: genesis request keys on every chain, chainweb-data listing all 20 rows and
         // compat one).
@@ -1572,9 +1634,16 @@ impl Ctx {
             });
         }
         d.extend(coins_lag);
-        if let Some((x, y)) = supply_lag {
+        d.extend(count_age_diff);
+        if let Some((aged, x, y)) = supply_lag {
+            // Ours below is ours' count lag, not the oracle's (R-P5P9-78, H2 I-1).
+            let at = if aged {
+                STATS_COUNT_AGE_PATH
+            } else {
+                ORACLE_LAG_PATH
+            };
             d.push(DiffEntry {
-                path: format!("{ORACLE_LAG_PATH}/coinsInCirculation"),
+                path: format!("{at}/coinsInCirculation"),
                 kind: DiffKind::Changed,
                 a: Some(x),
                 b: Some(y),
@@ -1873,15 +1942,18 @@ impl Ctx {
             && self.targets.get(b_name).map(|t| t.kind)
                 == Some(crate::config::TargetKind::KdaIndexerCompat);
         let mut replica_skew = false;
-        let (unexplained, ids) = if replica_pair {
+        let all = d.clone();
+        let (unexplained, ids, known) = if replica_pair {
             let (rest, skew) = split_replica_skew(d);
             replica_skew = skew;
-            (rest, Vec::new())
+            (rest, Vec::new(), Default::default())
         } else {
             let a_headers: Vec<(String, String)> =
                 pa.pages.iter().flat_map(|c| c.headers.clone()).collect();
-            self.allow
-                .classify_request(&req.route, &req.path_and_query, &a_headers, &d)
+            let c = self
+                .allow
+                .classify_known(&req.route, &req.path_and_query, &a_headers, &d);
+            (c.unexplained.clone(), c.ids.clone(), c)
         };
         let (legacy_entries, other): (Vec<_>, Vec<_>) = if legacy {
             unexplained
@@ -1892,6 +1964,9 @@ impl Ctx {
         };
         let class = if !other.is_empty() {
             "diff"
+        } else if !known.known.is_empty() {
+            // R-P5P9-75: a KNOWN-GAP hit is never explained.
+            "known-gap"
         } else if legacy {
             // Known category: the node serves a re-encoded cmd for this tx (logged with the
             // rehash note even when every projected field agrees).
@@ -1903,18 +1978,19 @@ impl Ctx {
         } else {
             "match"
         };
-        if !ids.is_empty() {
-            let mut s = self.summary.lock().expect("summary");
-            if class == "allowlisted" || class == "match" {
-                for id in &ids {
-                    s.allowlist_hit(id);
-                }
-            }
-        }
+        // R-P5P9-75 (CG-4 concern 4): an allowlisted record is logged with its entry ids (its
+        // hits are counted from the record, as for the others); its bodies are cut to
+        // `ALLOWLISTED_BODY` bytes, since its diff entries carry the values.
         let record = match class {
-            "diff" | "legacy-cmd" => {
-                let mut entries = other;
-                entries.extend(legacy_entries);
+            "diff" | "legacy-cmd" | "known-gap" | "allowlisted" => {
+                let mut entries = match class {
+                    "known-gap" | "allowlisted" => all,
+                    _ => other,
+                };
+                if class == "diff" || class == "legacy-cmd" {
+                    entries.extend(legacy_entries);
+                    entries.extend(known.known.iter().cloned());
+                }
                 Some(self.record(
                     req,
                     ta,
@@ -1928,6 +2004,16 @@ impl Ctx {
                     curl_b,
                     note,
                 ))
+                .map(|mut r| {
+                    r.known_gap = (!known.known_ids.is_empty()).then(|| known.known_ids.join(","));
+                    if class == "allowlisted" {
+                        r.a_body_trimmed =
+                            crate::report::trim_escaped(&r.a_body_trimmed, ALLOWLISTED_BODY);
+                        r.b_body_trimmed =
+                            crate::report::trim_escaped(&r.b_body_trimmed, ALLOWLISTED_BODY);
+                    }
+                    r
+                })
             }
             _ => None,
         };
@@ -3705,6 +3791,116 @@ mod tests {
 
     /// R-P5P9-48 item 3: /coins past the relative 1e-6 is chainweb-data's tip lag only within
     /// the coinbase minted between the two tips (18.08092 KDA per height at 7.40M).
+    /// R-P5P9-75 item 4 (STATS-FIX): ours' /stats supply below chainweb-data's by what the
+    /// heights of its `x-count-age` minted is explained; by more, or with no header, a diff.
+    /// Ours above keeps the tip-gap rule.
+    #[test]
+    fn stats_supply_tolerance_widens_by_our_count_age() {
+        let y = 379_866_205.03;
+        // 1e-6 of the supply is about 380; 240 s = 8 heights = 480 at 60 per height.
+        let lag = |by: f64, age: Option<f64>| stats_supply_lag(y - by, y, 100, 100, age);
+        assert!(lag(800.0, Some(240.0)), "lags by its age");
+        assert!(!lag(900.0, Some(240.0)), "lags by more than its age");
+        assert!(!lag(800.0, None), "no header, no widening");
+        assert!(!lag(800.0, Some(f64::NAN)));
+        assert!(!lag(10.0, Some(240.0)), "inside 1e-6 is no lag");
+        assert_eq!(count_age_heights(Some(241.0)), 9.0);
+        assert_eq!(count_age_heights(Some(-5.0)), 0.0);
+        // Ours above: the tip gap (240 heights at least), as before.
+        assert!(stats_supply_lag(y + 10_000.0, y, 100, 100, None));
+        assert!(!stats_supply_lag(y + 20_000.0, y, 100, 100, None));
+    }
+
+    /// R-P5P9-78 (H2 I-1): the honoured `x-count-age` is capped at 360 s, the served WARN
+    /// threshold. A stuck refresher (age 10,000 s, 1e6 s) widens nothing, and its header is a
+    /// diff at `/~stats-count-age`; an age at the cap still widens (12 heights, 720 KDA).
+    #[test]
+    fn stats_count_age_is_capped_at_the_warn_threshold() {
+        let y = 379_866_205.03;
+        let lag = |by: f64, age: Option<f64>| stats_supply_lag(y - by, y, 100, 100, age);
+        // Review probe 1: a lag of 1,000,000 KDA under an age of 1e6 s.
+        assert!(!lag(1_000_000.0, Some(1e6)), "a stuck count widens nothing");
+        // Inside ceil(10,000 / 30) x 60 = 20,040 KDA, yet past the cap: a diff.
+        assert!(!lag(10_000.0, Some(10_000.0)));
+        assert!(!lag(1_000.0, Some(361.0)), "one second past the cap");
+        assert!(
+            lag(1_000.0, Some(360.0)),
+            "at the cap: 720 + 1e-6 of the supply"
+        );
+        assert_eq!(count_age_heights(Some(361.0)), 0.0);
+        assert_eq!(count_age_heights(Some(360.0)), 12.0);
+        // The header past the cap (or no age at all) is a diff; an honoured one, or none, not.
+        for ok in [None, Some("0"), Some("120"), Some(" 360 ")] {
+            assert!(stats_count_age_diff(ok).is_none(), "{ok:?}");
+        }
+        for bad in ["361", "10000", "-5", "inf", "NaN", "soon"] {
+            let e = stats_count_age_diff(Some(bad)).expect(bad);
+            assert_eq!(e.path, "/~stats-count-age");
+            assert_eq!(e.a, Some(json!(bad)));
+        }
+    }
+
+    /// R-P5P9-78 (H2 I-1): the aged lag is ours' and has its own PROPOSED entry; the bare
+    /// `/~stats-count-age` diff matches no entry, and the oracle's tip lag keeps its own.
+    #[test]
+    fn stats_count_age_hits_are_ours_not_the_oracles() {
+        let al = crate::allowlist::Allowlist::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+        )
+        .unwrap();
+        let classify = |path: &str| {
+            let e = DiffEntry {
+                path: path.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!(1.0)),
+                b: Some(json!(2.0)),
+            };
+            al.classify_request(&RouteKind::Stats, "/stats", &[], &[e])
+        };
+        let (left, ids) = classify("/~stats-count-age/coinsInCirculation");
+        assert!(left.is_empty() && ids == vec!["stats-count-age-lag".to_string()]);
+        let (left, ids) = classify("/~stats-count-age");
+        assert_eq!((left.len(), ids.len()), (1, 0), "a stuck count is a diff");
+        let (left, ids) = classify("/~oracle-lag/coinsInCirculation");
+        assert!(left.is_empty() && ids == vec!["oracle-tip-lag".to_string()]);
+    }
+
+    /// R-P5P9-78 (H2 m-7): `/orphans` is credited to the entry whose rule produced it, so
+    /// each orphan entry is hit: account, events and /v1/txs to the ACCEPTED
+    /// `oracle-orphan-rows`, /txs/tx (404), /txs/recent and /txs/txs (R-P5P9-81, I-1) to
+    /// `orphan-rows-txs`; a request neither covers stays a diff.
+    #[test]
+    fn orphan_entries_are_scoped_so_each_is_hit() {
+        let al = crate::allowlist::Allowlist::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+        )
+        .unwrap();
+        let orphans = [DiffEntry {
+            path: "/orphans".into(),
+            kind: DiffKind::Missing,
+            a: None,
+            b: Some(json!([{"blockHash": "x"}])),
+        }];
+        let id = |route: RouteKind, request: &str| {
+            let (left, ids) = al.classify_request(&route, request, &[], &orphans);
+            left.is_empty().then(|| ids.join(","))
+        };
+        let node_checked = Some("oracle-orphan-rows".to_string());
+        let txs = Some("orphan-rows-txs".to_string());
+        assert_eq!(
+            id(RouteKind::Account, "/txs/account/k:ab?token=coin"),
+            node_checked
+        );
+        let events = "/txs/events?modulename=coin&name=TRANSFER";
+        assert_eq!(id(RouteKind::Events, events), node_checked);
+        assert_eq!(id(RouteKind::V1Txs, "/v1/txs/k:ab/coin/250"), node_checked);
+        assert_eq!(id(RouteKind::Tx, "/txs/tx?requestkey=YbvRG1"), txs);
+        assert_eq!(id(RouteKind::Recent, "/txs/recent?limit=50"), txs);
+        assert_eq!(id(RouteKind::Search, "/txs/search?search=coin"), None);
+        // R-P5P9-81 (I-1): /txs/txs is the request this entry is named for.
+        assert_eq!(id(RouteKind::Txs, "/txs/txs?requestkey=YbvRG1"), txs);
+    }
+
     #[test]
     fn coins_tolerance_scales_with_the_tip_gap() {
         // Run 6E-3, 04:43:29Z: A - B = 2,621.7 KDA, chainweb-data ~145 heights behind.

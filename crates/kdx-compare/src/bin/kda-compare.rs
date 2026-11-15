@@ -94,8 +94,9 @@ enum Cmd {
         /// that start at or after it).
         #[arg(long)]
         since: String,
-        /// `must` (default), `should` (search, coins, balances) or `all`: the routes the
-        /// verdict covers.
+        /// `must` (default), `should` (search, coins, balances), `graphql`, `all` (must,
+        /// should and the graphql gate, which always runs) or `rest` (must and should only):
+        /// the routes the verdict covers.
         #[arg(long, default_value = "must")]
         routes: String,
         /// `small` (R3E-13: every phase gate) or `full` (500/200/50, the final validation).

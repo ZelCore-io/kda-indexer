@@ -1836,7 +1836,8 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
     .await;
     assert!(stays_diff(&d), "{d:?}");
     // The oracle's w1 and w2 pay another receiver than the node's, in the node's canonical
-    // block: never orphans by content (R-P5P9-63 (2)), so unknown: a diff.
+    // block: never orphans by content (R-P5P9-63 (2)), but off the node's chain by its
+    // transaction (R-P5P9-75 E, CG-4 #23): explained as oracle-row-not-in-node-tx.
     let (d, _) = run(
         page(vec![
             by_height("t1", 101, "r"),
@@ -1852,8 +1853,12 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
         ]),
     )
     .await;
-    assert!(stays_diff(&d), "{d:?}");
-    // One such copy in the oracle's last slot: a diff too.
+    assert!(!stays_diff(&d), "{d:?}");
+    assert!(
+        format!("{d:?}").contains(crate::graphql_window::NOT_IN_NODE_TX),
+        "{d:?}"
+    );
+    // One such copy in the oracle's last slot: off the node's transaction too (R-P5P9-75 E).
     let (d, _) = run(
         page(vec![
             by_height("t1", 101, "r"),
@@ -1869,7 +1874,7 @@ async fn h7_window_referee_accounts_for_every_row_with_node_evidence() {
         ]),
     )
     .await;
-    assert!(stays_diff(&d), "{d:?}");
+    assert!(!stays_diff(&d), "{d:?}");
     // The same rows on both pages in another order, no height selected: the order rules
     // decide, no node read.
     let before = calls.lock().unwrap().len();
@@ -2146,8 +2151,15 @@ async fn h7_rows_without_an_index_compare_as_a_multiset() {
     let (d, note) = run(vec![u("1.0"), u("1.0")], vec![u("1.0")]).await;
     assert!(!only_hits(&d), "{d:?}");
     assert!(note.unwrap_or_default().contains("holds it 1 times"));
-    // The oracle's 3.0 is not the node's: unknown, a diff.
+    // The oracle's 3.0 is not the node's: off the node's transaction (R-P5P9-75 E), while
+    // ours' 2.0 is a node-confirmed oracle gap.
     let (d, _) = run(vec![u("1.0"), u("2.0")], vec![u("1.0"), u("3.0")]).await;
+    assert!(only_hits(&d), "{d:?}");
+    assert!(format!("{d:?}").contains("oracle-row-not-in-node-tx"));
+    // Selecting the amount alone, the oracle's 3.0 cannot be placed off the node's chain
+    // (E needs the sender, receiver and amount): unknown, a diff.
+    let v = |a: &str| h7_xrow("u", 100, json!(a), None);
+    let (d, _) = run(vec![v("1.0"), v("2.0")], vec![v("1.0"), v("3.0")]).await;
     assert!(!only_hits(&d), "{d:?}");
 }
 
@@ -2740,7 +2752,8 @@ async fn h7_duplicates_twice_ceiling_and_undecidable_rows() {
 /// the oracle `"{}"`. Explained only in that direction, only on a continuation, and only
 /// where the node's command for the request key has `cont.data` null (single-row reads:
 /// `/poll`, the header at its height, that block's payload). An exec payload, the reverse
-/// direction and a node `cont.data` that is not null stay diffs.
+/// direction and a node `cont.data` that is not null stay diffs. (R-P5P9-75 K: an exec
+/// payload is explained when ours equals the node's `exec.data`.)
 #[tokio::test]
 async fn r62_payload_data_null_only_where_the_node_cont_data_is_null() {
     use crate::graphql_window::PAYLOAD_DATA_PATH;
@@ -2795,9 +2808,11 @@ async fn r62_payload_data_null_only_where_the_node_cont_data_is_null() {
         hit.b.as_ref().unwrap().to_string().contains("c1"),
         "{hit:?}"
     );
-    // An exec payload: a diff.
+    // An exec payload: R-P5P9-75 K extends the matcher to it (ours "null" = the node's
+    // exec.data null), so it is explained now; d2_j_k_l_tx_fields_against_the_nodes_command
+    // holds its negatives.
     let d = settle(tx("e1", "null"), tx("e1", "{}")).await;
-    assert!(!only_hits(&d), "{d:?}");
+    assert!(only_hits(&d), "{d:?}");
     // Ours "{}" against the oracle's "null": a diff.
     let d = settle(tx("c1", "{}"), tx("c1", "null")).await;
     assert!(!only_hits(&d), "{d:?}");
@@ -3951,6 +3966,7 @@ async fn c3_the_referee_keeps_h6_past_the_records_entry_cap() {
         diff,
         class: "diff".into(),
         allowlisted: None,
+        known_gap: None,
         curl: String::new(),
         note: None,
         body_cap: None,
@@ -4419,14 +4435,15 @@ async fn c4_a_12_mib_v1txs_pair_keeps_its_rules() {
     assert!(a.len() < crate::graphql::MERGED_BYTES_CAP);
     let ctx = v1_setup(a, b, dir.path()).await;
     let o = v1_compare(&ctx, "/v1/txs/k:big/coin/250").await;
-    // An explained answer keeps no record; a streamed compare would have kept a diff.
+    // An explained answer keeps no diff record (R-P5P9-75: its allowlisted record is logged);
+    // a streamed compare would have kept a diff.
     assert_eq!(
         o.class,
         "allowlisted",
         "{:?}",
-        o.record.map(|r| (r.note, r.diff))
+        o.record.as_ref().map(|r| (&r.note, &r.diff))
     );
-    assert!(o.record.is_none());
+    assert!(o.record.is_some_and(|r| r.class == "allowlisted"));
 }
 
 /// Item 3 (the I-6 residual of run 6E): ours' 250-row page over the 32 MiB cap (`/v1/txs/
@@ -4959,7 +4976,9 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
     let cb = |to: &str| {
         let v = json!({"result": {"status": "success"}, "events": [{"name": "TRANSFER",
             "module": {"name": "coin", "namespace": null}, "params": ["", to, 0.9]}]});
-        json!({"coinbase": kdx_types::hash::b64url_encode(v.to_string().as_bytes())})
+        // S reads the whole payload: a block's transaction list too (empty here).
+        json!({"coinbase": kdx_types::hash::b64url_encode(v.to_string().as_bytes()),
+            "transactions": []})
     };
     let hd =
         |h: &str, p: &str, c: u8| json!({"hash": h, "payloadHash": p, "height": 100, "chainId": c});
@@ -4973,6 +4992,12 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
     for p in ["p0", "p1", "p2", "q2"] {
         node.payloads.insert(p.into(), cb("k:miner"));
     }
+    // R-P5P9-78 (H2 m-6): ours' block at its tip (99) is the cut branch's header there.
+    for c in [0u8, 2] {
+        let h =
+            json!({"hash": format!("t{c}-99"), "payloadHash": "pt", "height": 99, "chainId": c});
+        node.headers.insert((c, 99), vec![h]);
+    }
     // Ours: one block below node_h on chains 0 and 2; already at node_h on chain 1.
     let au = ours_fn_server(|req: &Value| {
         let c = req["variables"]["c"][0].as_str().unwrap_or("0").to_string();
@@ -4980,7 +5005,7 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
         let tip = if c == "1" { 100 } else { 99 };
         let edges: Vec<Value> = (start..=tip)
             .take(2)
-            .map(|h| json!({"node": {"height": h, "chainId": c}}))
+            .map(|h| json!({"node": {"height": h, "chainId": c, "hash": format!("t{c}-{h}")}}))
             .collect();
         json!({"data": {"blocksFromHeight": {"pageInfo": {"hasNextPage": tip >= start + 2},
             "edges": edges}}})
@@ -4991,8 +5016,10 @@ async fn c5_n2_skew_needs_ours_one_below_and_a_single_header() {
     let skew = |c: u8| {
         let ctx = &ctx;
         async move {
-            ctx.n2_skew(ta, c, 100, "k:miner", &mut Reads::default())
+            // R-P5P9-75 S replaced N2's coinbase-only check: the same cases hold under it.
+            ctx.s_skew(ta, c, 100, "k:miner", 10.0, "10.9", &mut Reads::default())
                 .await
+                .is_ok()
         }
     };
     assert!(skew(0).await, "the true skew");
@@ -5796,5 +5823,1799 @@ async fn r74_account_oracle_cut_with_every_page_above_the_clamp_is_no_diff() {
         "{} {:?}",
         o.class,
         o.record.map(|r| (r.note, r.diff))
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-75, harness round D1 (CG-4's identity and structure classes)
+
+/// A 43-character coinbase key (a parent block hash) from a short tag.
+fn d1_key(tag: &str) -> String {
+    format!("{tag:_<43}")
+}
+
+/// The oracle's coinbase `requestKey` form (CG-4 class C): base64 of the JSON-quoted key.
+fn d1_encoded(key: &str) -> String {
+    crate::graphql::base64_std(format!("\"{key}\"").as_bytes())
+}
+
+/// A node holding block `B<h>` at height `h` on chain 0 whose parent is `parent` and whose
+/// coinbase (key `cb_key`) pays `miner` 1.5.
+fn d1_coinbase_node(h: u64, parent: &str, cb_key: &str) -> NodeMock {
+    let mut node = NodeMock::default();
+    node.headers.insert(
+        (0, h),
+        vec![json!({"hash": format!("B{h}"), "height": h, "chainId": 0,
+            "parent": parent, "payloadHash": format!("P{h}")})],
+    );
+    let cb = json!({"reqKey": cb_key, "events": [{"name": "TRANSFER",
+        "module": {"name": "coin"}, "params": ["", "miner", 1.5]}]})
+    .to_string();
+    node.payloads.insert(
+        format!("P{h}"),
+        json!({"coinbase": kdx_types::hash::b64url_encode(cb.as_bytes())}),
+    );
+    node
+}
+
+/// R-P5P9-75 C: the oracle's coinbase `requestKey` is 60 characters of base64 over the
+/// JSON-quoted key. It is decoded for the row's identity and the row is settled on the
+/// coinbase path (the block's header and its parent), never `/poll`. The served difference is
+/// explained only when the decoded key is ours and ours is the node's coinbase key (the parent
+/// hash); a key that decodes to another, or a node whose coinbase key is another, stays a diff.
+#[tokio::test]
+async fn d1_c_the_oracle_coinbase_request_key_is_decoded_and_settled_on_the_coinbase_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = d1_key("Y_oq3-w1");
+    assert_eq!(d1_encoded(&k).len(), 60);
+    let row = |rk: &str| h7_xrow(rk, 100, json!(1.5), Some(("", "miner")));
+    let run = |node: NodeMock, a: Vec<Value>, b: Vec<Value>| {
+        let dir = dir.path().to_path_buf();
+        async move {
+            let calls = node.calls.clone();
+            let ctx = gql_ctx(node, &dir).await;
+            let mut a = h7_page("transfers", false, a);
+            let mut b = h7_page("transfers", false, b);
+            let out = ctx
+                .gql_settle(
+                    &ctx.targets["a"],
+                    &serde_json::Map::new(),
+                    &mut a,
+                    &mut b,
+                    7_000_000,
+                    false,
+                )
+                .await;
+            let polls = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.contains("poll"))
+                .count();
+            (out, polls)
+        }
+    };
+    // Ours the node's key, the oracle's that key encoded: explained, without a /poll read.
+    let ((d, note), polls) = run(
+        d1_coinbase_node(100, &k, &k),
+        vec![row(&k)],
+        vec![row(&d1_encoded(&k))],
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_window::COINBASE_KEY_PATH),
+        "{d:?}"
+    );
+    assert_eq!(polls, 0, "a coinbase row is not polled");
+    // A 60-character key that decodes to a key other than ours or the node's: a diff.
+    let other = d1_key("Z_other");
+    let ((d, _), _) = run(
+        d1_coinbase_node(100, &k, &k),
+        vec![row(&k)],
+        vec![row(&d1_encoded(&other))],
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The decoded key is ours, but the node's coinbase key (the block's parent) is another.
+    let ((d, _), _) = run(
+        d1_coinbase_node(100, &other, &other),
+        vec![row(&k)],
+        vec![row(&d1_encoded(&k))],
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// Runs H7 and the diff on one pair of `transfers` pages (no variables).
+async fn d1_settle(
+    ctx: &Ctx,
+    a: Vec<Value>,
+    b: Vec<Value>,
+    cut: (bool, bool),
+) -> (Vec<crate::report::DiffEntry>, Option<String>) {
+    let mut a = h7_page("transfers", cut.0, a);
+    let mut b = h7_page("transfers", cut.1, b);
+    ctx.gql_settle(
+        &ctx.targets["a"],
+        &serde_json::Map::new(),
+        &mut a,
+        &mut b,
+        7_000_000,
+        false,
+    )
+    .await
+}
+
+/// R-P5P9-75 A: an ours-only transfer row's `crossChainTransfer` is checked against the node:
+/// null iff the node's transaction has no TRANSFER_XCHAIN for that transfer, else the target
+/// chain and receiver of that event. A TRANSFER_XCHAIN row with a null `crossChainTransfer`,
+/// or one that names another chain, stays a diff.
+#[tokio::test]
+async fn d1_a_cross_chain_transfer_is_checked_against_the_nodes_xchain_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x0", "x1"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.5));
+        node.polls.insert(k, v);
+    }
+    let ev = |name: &str, p: Value| json!({"name": name, "module": {"name": "coin"}, "params": p});
+    let (k, v) = h7_poll(
+        "x2",
+        "B100",
+        100,
+        json!([
+            ev("TRANSFER", json!(["s", "", 1.5])),
+            ev("TRANSFER_XCHAIN", json!(["s", "r", 1.5, "1"]))
+        ]),
+    );
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let row = |rk: &str, to: &str, x: Value| {
+        let mut e = h7_xrow(rk, 100, json!(1.5), Some(("s", to)));
+        e["node"]["crossChainTransfer"] = x;
+        e
+    };
+    let x0 = row("x0", "r", Value::Null);
+    let settle = |ours: Value| {
+        d1_settle(
+            &ctx,
+            vec![x0.clone(), ours],
+            vec![x0.clone()],
+            (false, false),
+        )
+    };
+    // No TRANSFER_XCHAIN in the node's transaction: ours' null is the node's.
+    let (d, note) = settle(row("x1", "r", Value::Null)).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // The transfer's TRANSFER_XCHAIN to chain 1 and r: ours names both.
+    let xc = json!({"__typename": "Transfer", "chainId": "1", "receiverAccount": "r"});
+    let (d, note) = settle(row("x2", "", xc)).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // A TRANSFER_XCHAIN row with crossChainTransfer null: a diff.
+    let (d, note) = settle(row("x2", "", Value::Null)).await;
+    assert!(!only_hits(&d), "{d:?}");
+    assert!(note.unwrap_or_default().contains("crossChainTransfer"));
+    // Another target chain: a diff.
+    let xc = json!({"chainId": "2", "receiverAccount": "r"});
+    let (d, _) = settle(row("x2", "", xc)).await;
+    assert!(!only_hits(&d), "{d:?}");
+    // A link where the node's transaction has none: a diff.
+    let xc = json!({"chainId": "1", "receiverAccount": "r"});
+    let (d, _) = settle(row("x1", "r", xc)).await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// R-P5P9-75 B: an ours-only tx row's `result.block.canonical` is accepted when it equals
+/// H7's own verdict: the node places the row in the block that is the canonical one at its
+/// height on the cut's branch. `false` against that verdict, or `true` for a block the cut's
+/// branch does not hold at the height, stays a diff.
+#[tokio::test]
+async fn d1_b_result_block_canonical_is_h7s_own_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx = |rk: &str, canonical: Value| {
+        let id = crate::graphql::base64_std(format!("Transaction:[\"B100\",\"{rk}\"]").as_bytes());
+        json!({"cursor": "c", "node": {"id": id, "hash": rk, "result": {"height": 100,
+            "block": {"hash": "B100", "chainId": 0, "height": 100, "canonical": canonical}}}})
+    };
+    let node = |branch: Option<&str>| {
+        let mut n = NodeMock::default();
+        for rk in ["t0", "t1"] {
+            let (k, v) = h7_poll(rk, "B100", 100, json!([]));
+            n.polls.insert(k, v);
+        }
+        n.headers.insert(
+            (0, 100),
+            vec![json!({"hash": "B100", "height": 100, "chainId": 0, "payloadHash": "P100"})],
+        );
+        if let Some(b) = branch {
+            n.branch.insert(
+                (0, 100),
+                json!({"hash": b, "height": 100, "chainId": 0, "payloadHash": "PX"}),
+            );
+        }
+        n
+    };
+    let run = |n: NodeMock, ours: Value| {
+        let dir = dir.path().to_path_buf();
+        async move {
+            let ctx = gql_ctx(n, &dir).await;
+            let t0 = tx("t0", json!(true));
+            let mut a = h7_page("transactions", false, vec![t0.clone(), ours]);
+            let mut b = h7_page("transactions", false, vec![t0]);
+            ctx.gql_settle(
+                &ctx.targets["a"],
+                &serde_json::Map::new(),
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await
+        }
+    };
+    let (d, note) = run(node(None), tx("t1", json!(true))).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // Ours says false where the node places the row on the cut's branch: a diff.
+    let (d, note) = run(node(None), tx("t1", json!(false))).await;
+    assert!(!only_hits(&d), "{d:?}");
+    assert!(note.unwrap_or_default().contains("canonical"));
+    // The cut's branch holds another block at 100: ours' true is not H7's verdict.
+    let (d, _) = run(node(Some("X100")), tx("t1", json!(true))).await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// [`gql_ctx`] with the oracle-pair field rule `transfers.amount = oracle_f64_rounded`.
+async fn d1_ctx_f64(node: NodeMock, out: &std::path::Path) -> Ctx {
+    let nu = node_server(node).await;
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let cfg: CompareConfig = toml::from_str(&format!(
+        r#"
+network = "mainnet01"
+pairs = [["a", "b"]]
+allowlist = {allow:?}
+out_dir = {out:?}
+[node]
+url = "{nu}"
+timeout_ms = 5000
+[graphql]
+own_ops_dir = "no-such-dir"
+field_rules = [{{ field = "transfers.amount", rule = "oracle_f64_rounded" }}]
+[targets.a]
+url = "http://127.0.0.1:9/graphql"
+kind = "kda_indexer_graphql"
+[targets.b]
+url = "https://oracle.invalid/graphql"
+kind = "graphql_oracle"
+max_height = 7000000
+"#
+    ))
+    .unwrap();
+    Ctx::new(cfg).await.unwrap()
+}
+
+/// R-P5P9-75 D: rows without an index match as a multiset after the ruled field matchers
+/// (here `oracle_f64_rounded`): ours' exact amount pairs with the oracle's f64-rounded one
+/// (CG-4 #136, #348). The node-confirmed duplicate excuse applies to rows without an index:
+/// the oracle lists a transfer twice that the node's transaction and ours hold once (#84).
+/// An amount that is not the f64 rounding, and an oracle copy the node also holds, stay diffs.
+#[tokio::test]
+async fn d1_d_multiset_identity_runs_the_ruled_matchers_and_the_duplicate_excuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let exact = "65913.172664045997";
+    let (k, v) = h7_xfer_poll("f", "B100", 100, "s", "r", json!({ "decimal": exact }));
+    node.polls.insert(k, v);
+    let (k, v) = h7_xfer_poll("u", "B100", 100, "s", "r", json!(1.0));
+    node.polls.insert(k, v);
+    let ev = json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "r", 2.0]});
+    let (k, v) = h7_poll("w", "B100", 100, json!([ev.clone(), ev]));
+    node.polls.insert(k, v);
+    let ctx = d1_ctx_f64(node, dir.path()).await;
+    let x = |rk: &str, a: &str| h7_xrow(rk, 100, json!(a), Some(("s", "r")));
+    // The oracle's amount is ours' as an f64.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x("f", exact)],
+        vec![x("f", "65913.172664046")],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // The oracle lists u twice; the node's transaction and ours hold it once.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x("u", "1.0")],
+        vec![x("u", "1.0"), x("u", "1.0")],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(format!("{d:?}").contains("duplicate"), "{d:?}");
+    // Not the f64 rounding of ours (rows selecting the amount alone, so E does not apply).
+    let y = |a: &str| h7_xrow("f", 100, json!(a), None);
+    let (d, _) = d1_settle(&ctx, vec![y(exact)], vec![y("65913.17")], (false, false)).await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The node holds w twice, ours once: the oracle's second copy is a row ours lacks.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x("w", "2.0")],
+        vec![x("w", "2.0"), x("w", "2.0")],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// R-P5P9-75 F: transfer rows that select a `requestKey` but no `orderIndex`, block or
+/// transfer field (Transfers-8c8a0f56) get their identity by request-key multiset under the
+/// `transfers` root, so H7 runs; a row ours lacks stays a diff. When `prepare` fails, the
+/// record always says "H7 not applied" with why.
+#[tokio::test]
+async fn d1_f_key_only_transfer_rows_get_a_request_key_identity_and_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("u", 101), ("v", 100), ("w", 100)] {
+        let (k, v) = h7_xfer_poll(rk, &format!("B{h}"), h, "s", "r", json!(1.5));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let r = |rk: &str| json!({"cursor": "c", "node": {"chainId": "0", "requestKey": rk}});
+    // Paired by request key; ours' v is a node-confirmed oracle gap.
+    let (d, note) = d1_settle(&ctx, vec![r("u"), r("v")], vec![r("u")], (false, false)).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_window::WINDOW_PATH),
+        "{d:?}"
+    );
+    // An oracle row the node holds inside our complete list: a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![r("u"), r("v")],
+        vec![r("v"), r("w"), r("u")],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // A row whose identity cannot be decided: H7 says so.
+    let bare = json!({"cursor": "c", "node": {"amountText": "1"}});
+    let (_, note) = d1_settle(&ctx, vec![bare, r("u")], vec![r("u")], (false, false)).await;
+    assert!(note.unwrap_or_default().starts_with("H7 not applied"));
+}
+
+/// R-P5P9-75 G: a nested list whose rows select no key (BlocksByHeight's
+/// `transactions { cmd { meta { gasPrice } } }`, here with each row's `creationTime` so the
+/// tie sort leaves the order alone) compares as a multiset of the selected values
+/// per parent, only when both sides' lists are complete with equal `totalCount`; otherwise it
+/// is `/~graphql-h6-unfinished` with why. A value one side lacks stays a diff.
+#[test]
+fn d1_g_unkeyed_nested_lists_compare_as_multisets_only_when_complete() {
+    use crate::graphql::{compare_answers_with, Answer};
+    let page = |total: u64, prices: &[&str]| {
+        let edges: Vec<Value> = prices
+            .iter()
+            .map(|p| {
+                // Each row its own creationTime, so the tie sort does not order them.
+                let ct = format!("2026-01-01T00:00:0{}Z", &p[..1]);
+                json!({"node": {"cmd": {"meta": {"creationTime": ct, "gasPrice": p}}}})
+            })
+            .collect();
+        Answer {
+            body: json!({"data": {"completedBlockHeights": {"pageInfo": {"hasNextPage": false},
+                "edges": [{"node": {"hash": "B1", "height": 1, "chainId": 0,
+                    "transactions": {"totalCount": total, "edges": edges}}}]}}}),
+            status: 200,
+            raw: String::new(),
+            ms: Vec::new(),
+        }
+    };
+    let run = |a: Answer, b: Answer| {
+        let (mut a, mut b) = (a, b);
+        compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false)
+    };
+    let unfinished = |d: &[crate::report::DiffEntry]| {
+        d.iter()
+            .any(|e| e.path == crate::graphql_scope::UNFINISHED_PATH)
+    };
+    // Complete on both sides, equal totalCount, another order: explained.
+    let d = run(page(2, &["1e-8", "2e-8"]), page(2, &["2e-8", "1e-8"]));
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_scope::NESTED_MULTISET_PATH),
+        "{d:?}"
+    );
+    // A value the oracle's block lacks: a diff.
+    let d = run(page(2, &["1e-8", "2e-8"]), page(2, &["2e-8", "3e-8"]));
+    assert!(!only_hits(&d), "{d:?}");
+    // Cut on both sides (totalCount above the rows): unfinished, with why.
+    let d = run(page(3, &["1e-8", "2e-8"]), page(3, &["2e-8", "1e-8"]));
+    assert!(unfinished(&d), "{d:?}");
+    // Unequal totalCount: unfinished.
+    let d = run(
+        page(2, &["1e-8", "2e-8"]),
+        page(3, &["2e-8", "1e-8", "3e-8"]),
+    );
+    assert!(unfinished(&d), "{d:?}");
+}
+
+/// R-P5P9-75 E and M. E: an oracle-only transfer row whose request key's canonical
+/// transaction on the node holds no TRANSFER with its (sender, receiver, amount) is off the
+/// node's chain (CG-4 #23: another miner's gas row): explained as `oracle-row-not-in-node-tx`.
+/// The node holding the transfer, or no canonical transaction for the key, stays a diff.
+/// M: an oracle row whose block is not the node's for the key, at another height, is an
+/// orphan by block; ours must place the row at the node's block.
+#[tokio::test]
+async fn d1_e_m_oracle_rows_off_the_nodes_tx_or_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, to) in [("x0", "r"), ("e", "r"), ("m", "r")] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", to, json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x = |rk: &str, to: &str, amount: f64| h7_xrow(rk, 100, json!(amount), Some(("s", to)));
+    let x0 = x("x0", "r", 1.0);
+    // E: the oracle's gas row to another miner, which the node's transaction of e lacks.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), x("e", "miner2", 0.0000323)],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        format!("{d:?}").contains("oracle-row-not-in-node-tx"),
+        "{d:?}"
+    );
+    // The node holds e's transfer: a row ours lacks, a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), x("e", "r", 1.0)],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // No canonical transaction for the key on the node: a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), x("q", "miner2", 0.5)],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // M: the oracle places m in X90 at height 90; the node's block for m is B100.
+    let at = |b: &str, h: u64| {
+        let mut e = h7_xrow("m", h, json!(1.0), Some(("s", "r")));
+        e["node"]["blockHash"] = json!(b);
+        e
+    };
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![at("B100", 100)],
+        vec![at("X90", 90)],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(format!("{d:?}").contains("orphan"), "{d:?}");
+    // Ours places m in X90 too: not the node's block, a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x0.clone(), at("X90", 90)],
+        vec![x0.clone()],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// R-P5P9-75 H: our own QTransactionsByPublicKey selects each row's block height, chain and
+/// hash, so H7 can place its rows (CG-4: 6 records had only `id hash`).
+#[test]
+fn d1_h_transactions_by_public_key_selects_the_block_to_place_rows() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/graphql");
+    let text = std::fs::read_to_string(dir.join("QTransactionsByPublicKey.graphql")).unwrap();
+    let op = crate::graphql::parse_op("QTransactionsByPublicKey", &text, false).unwrap();
+    assert!(
+        op.query.contains("block { hash height chainId }"),
+        "{}",
+        op.query
+    );
+    // A row of that shape is placed: height, chain and block.
+    let e = json!({"node": {"id": "x", "hash": "rk", "result": {"height": 7,
+        "block": {"hash": "B7", "height": 7, "chainId": 3}}}});
+    let id = crate::graphql_window::row_id(&e);
+    assert_eq!(
+        (id.height, id.chain, id.block.as_deref()),
+        (Some(7), Some(3), Some("B7"))
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// FVH-D2 (R-P5P9-75, the "Harness, FVH-D2" part)
+// ---------------------------------------------------------------------------------------
+
+/// R-P5P9-75 item 0 (E's leak, the ~06:25Z ruling): E's node match runs the ruled amount
+/// matchers first. Ours lacks a real node transfer and the oracle lists it with its
+/// f64-rounded amount: the oracle row is the node's transfer, so it stays a diff.
+#[tokio::test]
+async fn d2_0_e_matches_an_f64_rounded_oracle_amount_before_calling_the_row_off_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let exact = "65913.172664045997";
+    for (rk, amount) in [
+        ("x0", json!(1.0)),
+        ("e", json!({ "decimal": exact })),
+        ("en", serde_json::from_str::<Value>(exact).unwrap()),
+    ] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", amount);
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("s", "r")));
+    for rk in ["e", "en"] {
+        // The oracle's f64-rounded amount of the node's real transfer; ours lacks the row.
+        let rounded = h7_xrow(rk, 100, json!("65913.172664046"), Some(("s", "r")));
+        let (d, note) = d1_settle(
+            &ctx,
+            vec![x0.clone()],
+            vec![x0.clone(), rounded],
+            (false, false),
+        )
+        .await;
+        assert!(!only_hits(&d), "{rk}: {d:?} {note:?}");
+        assert!(
+            !format!("{d:?}").contains(crate::graphql_window::NOT_IN_NODE_TX),
+            "{rk}: {d:?}"
+        );
+    }
+    // Negative: an oracle amount that is no rounding of the node's (another value) is still
+    // off the node's transaction.
+    let wrong = h7_xrow("e", 100, json!("65913.1726"), Some(("s", "r")));
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), wrong],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+}
+
+fn d2_answer(body: Value) -> crate::graphql::Answer {
+    crate::graphql::Answer {
+        body,
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    }
+}
+
+fn d2_shipped() -> crate::allowlist::Allowlist {
+    crate::allowlist::Allowlist::load(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml"),
+    )
+    .unwrap()
+}
+
+/// R-P5P9-75 I: `oracle_counts_heights` on Transactions-9e58b95d's root `totalCount`: the
+/// oracle's count below ours takes ours with a visible hit, which only that operation's
+/// entry explains. An oracle count at or above ours, a nested count, and the hit on another
+/// operation stay diffs.
+#[test]
+fn d2_i_oracle_counts_heights_only_below_ours_on_transactions_9e58b95d() {
+    use crate::config::{FieldRule, FieldRuleKind};
+    use crate::graphql_norm::ORACLE_COUNTS_HEIGHTS_PATH;
+    let rules = [FieldRule::new(
+        "transactions.totalCount",
+        FieldRuleKind::OracleCountsHeights,
+    )];
+    let conn = |n: u64| {
+        json!({"data": {"transactions": {"totalCount": n, "edges": [],
+            "pageInfo": {"hasNextPage": true}}}})
+    };
+    let cmp = |a: u64, b: u64| {
+        crate::graphql::compare_answers_with(
+            &mut d2_answer(conn(a)),
+            &mut d2_answer(conn(b)),
+            50,
+            10_000,
+            &rules,
+            false,
+        )
+    };
+    let al = d2_shipped();
+    // The operation's name comes from its entry (no capture stem in the sources, M1).
+    let op = al
+        .entries
+        .iter()
+        .find(|e| e.id == "graphql-r75-oracle-counts-heights")
+        .and_then(|e| e.request_contains.clone())
+        .unwrap();
+    assert!(op.len() > "graphql:".len(), "{op}");
+    let d = cmp(4, 1);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, ORACLE_COUNTS_HEIGHTS_PATH);
+    assert_eq!(
+        (d[0].a.clone(), d[0].b.clone()),
+        (Some(json!(4)), Some(json!(1)))
+    );
+    let (un, ids) = al.classify_request(&crate::normalize::RouteKind::Other, &op, &[], &d);
+    assert!(un.is_empty(), "{un:?}");
+    assert_eq!(ids, vec!["graphql-r75-oracle-counts-heights".to_string()]);
+    // The same hit on another operation is not explained.
+    let (un, _) = al.classify_request(
+        &crate::normalize::RouteKind::Other,
+        "graphql:QTransactionsByAccount",
+        &[],
+        &d,
+    );
+    assert_eq!(un.len(), 1);
+    // The oracle at or above ours: the count diff stays.
+    let d = cmp(4, 5);
+    assert!(
+        d.iter().any(|e| e.path == "/data/transactions/totalCount"),
+        "{d:?}"
+    );
+    assert!(cmp(4, 4).is_empty());
+    // A nested count is not the root's.
+    let nested =
+        |n: u64| json!({"data": {"block": {"transactions": {"totalCount": n, "edges": []}}}});
+    let d = crate::graphql::compare_answers_with(
+        &mut d2_answer(nested(4)),
+        &mut d2_answer(nested(1)),
+        50,
+        10_000,
+        &rules,
+        false,
+    );
+    assert!(
+        d.iter().all(|e| e.path != ORACLE_COUNTS_HEIGHTS_PATH),
+        "{d:?}"
+    );
+    assert!(!d.is_empty());
+}
+
+/// A node with one block (BJ at height 60, payload PJ) holding the commands `cmds`.
+fn d2_cmd_node(cmds: &[(&str, Value)]) -> NodeMock {
+    use kdx_types::hash::b64url_encode;
+    let mut node = NodeMock::default();
+    let txs: Vec<Value> = cmds
+        .iter()
+        .map(|(rk, cmd)| {
+            let w = json!({"hash": rk, "sigs": [], "cmd": cmd.to_string()}).to_string();
+            json!([b64url_encode(w.as_bytes()), b64url_encode(b"{}")])
+        })
+        .collect();
+    node.payloads
+        .insert("PJ".into(), json!({ "transactions": txs }));
+    node.headers.insert(
+        (0, 60),
+        vec![json!({"hash": "BJ", "height": 60, "payloadHash": "PJ"})],
+    );
+    for (rk, _) in cmds {
+        let (k, v) = h7_poll(rk, "BJ", 60, json!([]));
+        node.polls.insert(k, v);
+    }
+    node
+}
+
+/// R-P5P9-75 J, K, L: `payload.rollback`, exec `payload.data` and `signers.address` are
+/// explained only when ours equals the node's command (`cont.rollback`, `exec.data`, the
+/// signer's `addr`). Each negative neighbour (ours not the node's) stays a diff.
+#[tokio::test]
+async fn d2_j_k_l_tx_fields_against_the_nodes_command() {
+    use crate::graphql_window::{EXEC_PAYLOAD_DATA_PATH, ROLLBACK_PATH, SIGNER_ADDRESS_PATH};
+    let dir = tempfile::tempdir().unwrap();
+    let cont = |rb: bool| {
+        json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": rb, "data": {},
+            "proof": null}}, "meta": {"chainId": "0"}, "signers": []})
+    };
+    let exec = |data: Value| {
+        json!({"payload": {"exec": {"code": "(+ 1 2)", "data": data}},
+            "meta": {"chainId": "0"},
+            "signers": [{"pubKey": "pk1", "addr": "6a3a7c76"}, {"pubKey": "pk2"}]})
+    };
+    let node = d2_cmd_node(&[
+        ("j1", cont(false)),
+        ("k1", exec(Value::Null)),
+        ("k2", exec(json!({"ks": ["a"]}))),
+    ]);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let tx = |rk: &str, payload: Value, signers: Value| {
+        d2_answer(json!({"data": {"transaction": {"hash": rk,
+            "cmd": {"meta": {"chainId": "0"}, "payload": payload, "signers": signers}}}}))
+    };
+    let vars = serde_json::Map::new();
+    let settle = |mut a: crate::graphql::Answer, mut b: crate::graphql::Answer| {
+        let (ctx, vars) = (&ctx, &vars);
+        async move {
+            ctx.gql_settle(&ctx.targets["a"], vars, &mut a, &mut b, 7_000_000, false)
+                .await
+                .0
+        }
+    };
+    let has = |d: &[crate::report::DiffEntry], p: &str| d.iter().any(|e| e.path == p);
+    // J: ours false = the node's cont.rollback, the oracle's true.
+    let rb = |x: bool| json!({"rollback": x});
+    let d = settle(
+        tx("j1", rb(false), json!([])),
+        tx("j1", rb(true), json!([])),
+    )
+    .await;
+    assert!(only_hits(&d) && has(&d, ROLLBACK_PATH), "{d:?}");
+    // Ours true against the node's false: a diff.
+    let d = settle(
+        tx("j1", rb(true), json!([])),
+        tx("j1", rb(false), json!([])),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // K: an exec payload, ours "null" = the node's exec.data null, the oracle's "{}".
+    let data = |x: &str| json!({ "data": x });
+    let d = settle(
+        tx("k1", data("null"), json!([])),
+        tx("k1", data("{}"), json!([])),
+    )
+    .await;
+    assert!(only_hits(&d) && has(&d, EXEC_PAYLOAD_DATA_PATH), "{d:?}");
+    // By value: ours' JSON text of the node's object.
+    let d = settle(
+        tx("k2", data(r#"{"ks":["a"]}"#), json!([])),
+        tx("k2", data("{}"), json!([])),
+    )
+    .await;
+    assert!(only_hits(&d), "{d:?}");
+    // Ours "{}" where the node's exec.data is null: a diff.
+    let d = settle(
+        tx("k1", data("{}"), json!([])),
+        tx("k1", data("null"), json!([])),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // L: ours' address = the node's signer addr, the oracle's null.
+    let sg = |pk: &str, addr: Value| json!([{ "pubkey": pk, "address": addr }]);
+    let d = settle(
+        tx("k1", data("null"), sg("pk1", json!("6a3a7c76"))),
+        tx("k1", data("null"), sg("pk1", Value::Null)),
+    )
+    .await;
+    assert!(only_hits(&d) && has(&d, SIGNER_ADDRESS_PATH), "{d:?}");
+    // Ours' address is not the node's addr: a diff.
+    let d = settle(
+        tx("k1", data("null"), sg("pk1", json!("ffff0000"))),
+        tx("k1", data("null"), sg("pk1", Value::Null)),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The node's signer at that index has another public key: a diff.
+    let d = settle(
+        tx("k1", data("null"), sg("pkX", json!("6a3a7c76"))),
+        tx("k1", data("null"), sg("pkX", Value::Null)),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// R-P5P9-75 O: H8 on a transfer list nested in a transaction (QTransactionByKey): the
+/// oracle's rank among the node's TRANSFER events takes the node's event index, ours'
+/// numbering. Ours with another index stays a diff.
+#[tokio::test]
+async fn d2_o_h8_applies_to_nested_transfer_lists() {
+    use crate::graphql_window::NESTED_ORDER_INDEX_PATH as ORDER_INDEX_PATH;
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let ev = json!([
+        {"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "k:miner", 0.01]},
+        {"name": "OTHER", "module": {"name": "coin"}, "params": []},
+        {"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "r", 1.0]}
+    ]);
+    let (k, v) = h7_poll("o1", "BO", 70, ev);
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let tx = |idx: Value| {
+        d2_answer(json!({"data": {"transaction": {"hash": "o1",
+            "cmd": {"meta": {"chainId": "0"}},
+            "result": {"transfers": {"edges": [{"node": {"orderIndex": idx,
+                "amount": 1.0, "senderAccount": "s", "receiverAccount": "r"}}]}}}}}))
+    };
+    let vars = serde_json::Map::new();
+    let settle = |mut a: crate::graphql::Answer, mut b: crate::graphql::Answer| {
+        let (ctx, vars) = (&ctx, &vars);
+        async move {
+            ctx.gql_settle(&ctx.targets["a"], vars, &mut a, &mut b, 7_000_000, false)
+                .await
+                .0
+        }
+    };
+    let d = settle(tx(json!(2)), tx(json!(1))).await;
+    assert!(
+        only_hits(&d) && d.iter().any(|e| e.path == ORDER_INDEX_PATH),
+        "{d:?}"
+    );
+    // Ours 3: not the node's event index, a diff.
+    let d = settle(tx(json!(3)), tx(json!(1))).await;
+    assert!(!only_hits(&d), "{d:?}");
+    // The oracle's 0 is the gas transfer's rank, not this content: a diff.
+    let d = settle(tx(json!(2)), tx(json!(0))).await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// R-P5P9-75 Q: ours lacks a chain row the oracle lists. The oracle's extra row leaves and
+/// one marker stays, carrying the missing key; the rows both hold still compare. A row only
+/// ours holds stays a plain diff.
+#[test]
+fn d2_q_missing_chain_rows_become_one_marker() {
+    use crate::graphql_norm::MISSING_CHAIN_ROWS_PATH;
+    let row = |c: &str, bal: &str| json!({"chainId": c, "balance": bal, "accountName": "k:a"});
+    let acct = |rows: Vec<Value>| {
+        d2_answer(
+            json!({"data": {"fungibleAccount": {"accountName": "k:a", "chainAccounts": rows}}}),
+        )
+    };
+    let cmp = |a: Vec<Value>, b: Vec<Value>| {
+        crate::graphql::compare_answers_with(&mut acct(a), &mut acct(b), 50, 10_000, &[], false)
+    };
+    let d = cmp(
+        vec![row("0", "1.5"), row("2", "3")],
+        vec![row("0", "1.5"), row("1", "0"), row("2", "3")],
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, MISSING_CHAIN_ROWS_PATH);
+    assert!(
+        d[0].b.as_ref().unwrap().to_string().contains("\"1\""),
+        "{d:?}"
+    );
+    // A row both hold with another balance still shows.
+    let d = cmp(
+        vec![row("0", "1.5"), row("2", "4")],
+        vec![row("0", "1.5"), row("1", "0"), row("2", "3")],
+    );
+    assert!(d.iter().any(|e| e.path.ends_with("/balance")), "{d:?}");
+    // A row only ours holds: no marker.
+    let d = cmp(vec![row("0", "1.5"), row("5", "1")], vec![row("0", "1.5")]);
+    assert!(d.iter().all(|e| e.path != MISSING_CHAIN_ROWS_PATH), "{d:?}");
+    assert!(!d.is_empty());
+}
+
+/// R-P5P9-75 (CG-4 concern 4): an allowlisted REST record is logged with its entry id (its
+/// hit counted once, from the record), bodies cut to `ALLOWLISTED_BODY`.
+#[tokio::test]
+async fn d2_rest_allowlisted_records_are_logged_with_the_entry_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = NodeMock {
+        tip: 7_000_000,
+        ..NodeMock::default()
+    };
+    let rows = |order: &[(&str, u64)]| {
+        Value::Array(
+            order
+                .iter()
+                .map(|(rk, h)| row(rk, 0, *h, &format!("B{h}")))
+                .collect(),
+        )
+    };
+    let ours = SideMock {
+        search: rows(&[("x", 10), ("y", 10), ("w", 10), ("z", 9)]),
+        ..SideMock::default()
+    };
+    let b = SideMock {
+        search: rows(&[("w", 10), ("x", 10), ("y", 10), ("z", 9)]),
+        ..SideMock::default()
+    };
+    let (ctx, _) = setup(node, ours, b, dir.path()).await;
+    let req = Request::new(
+        "/txs/search?search=coin.transfer&limit=10".to_string(),
+        Origin::Seed,
+        None,
+    );
+    let o = ctx.process(&req).await.remove(0);
+    assert_eq!(o.class, "allowlisted");
+    let rec = o.record.as_ref().expect("an allowlisted record");
+    assert_eq!(rec.allowlisted.as_deref(), Some("search-tie-order"));
+    assert!(rec.a_body_trimmed.len() <= crate::run::ALLOWLISTED_BODY + 64);
+    let s = ctx.summary.lock().unwrap();
+    assert_eq!(s.allowlist_hits.get("search-tie-order"), Some(&1));
+    drop(s);
+    let log: String = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("diffs-"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert!(
+        log.contains("\"class\":\"allowlisted\"") && log.contains("search-tie-order"),
+        "{log}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// FVH-D3: R-P5P9-75 N (a page cut inside one block) and S (the NodeBalance skew)
+
+/// A block of the node at (chain 0, `h`): its header (the only one at the height, so the
+/// cut's branch holds it) and a payload whose transactions are `rks` in that order.
+fn d3_block(node: &mut NodeMock, blk: &str, h: u64, rks: &[String]) {
+    let ph = format!("P{blk}");
+    node.headers.insert(
+        (0, h),
+        vec![json!({"hash": blk, "height": h, "chainId": 0, "payloadHash": ph})],
+    );
+    let txs: Vec<Value> = rks
+        .iter()
+        .map(|rk| {
+            let w = json!({"hash": rk, "sigs": [], "cmd": "{}"}).to_string();
+            json!([kdx_types::hash::b64url_encode(w.as_bytes()), ""])
+        })
+        .collect();
+    node.payloads.insert(ph, json!({"transactions": txs}));
+}
+
+/// A QTransactionsByBlock row: the relay id (block, request key) and the request key.
+fn d3_row(blk: &str, rk: &str) -> Value {
+    let id = crate::graphql::base64_std(format!("Transaction:[\"{blk}\",\"{rk}\"]").as_bytes());
+    json!({"cursor": "c", "node": {"id": id, "hash": rk}})
+}
+
+async fn d3_n_run(
+    ctx: &Ctx,
+    vars: &serde_json::Map<String, Value>,
+    ours: &[String],
+    oracle: &[String],
+) -> (
+    Vec<crate::report::DiffEntry>,
+    Option<String>,
+    crate::graphql::Answer,
+    crate::graphql::Answer,
+) {
+    let op = crate::graphql::parse_op(
+        "QTransactionsByBlock",
+        "query QTransactionsByBlock($blockHash: String, $first: Int, $after: String) { \
+         transactions(blockHash: $blockHash, first: $first, after: $after) { totalCount \
+         pageInfo { hasNextPage endCursor } edges { cursor node { id hash } } } }",
+        false,
+    )
+    .unwrap();
+    let page = |keys: &[String]| {
+        h7_page(
+            "transactions",
+            true,
+            keys.iter().map(|k| d3_row("BLK612", k)).collect(),
+        )
+    };
+    let (mut a, mut b) = (page(ours), page(oracle));
+    let (d, note) = ctx
+        .gql_window_referee(
+            &ctx.targets["a"],
+            Some(&op),
+            vars,
+            &mut a,
+            &mut b,
+            7_000_000,
+            false,
+            &mut Reads::default(),
+        )
+        .await;
+    (d, note, a, b)
+}
+
+/// R-P5P9-75 N: a page cut inside one block is explained iff ours' rows are the node's block
+/// transactions in the node's order from ours' cursor position, and every oracle row is in
+/// that node block (one cached payload read per block). CG-4 #612's shape: 233 node txs, two
+/// 200-row pages in different orders, ours in node order. Ours in another order, a row of
+/// ours or of the oracle's outside the block, or a request that starts after a cursor (ours'
+/// position unknown) stay diffs.
+#[tokio::test]
+async fn d3_n_a_single_block_cut_is_the_nodes_order_from_ours_cursor() {
+    use crate::graphql_window::{ROW_PATH, SINGLE_BLOCK_PATH, UNDECIDED_PATH};
+    let dir = tempfile::tempdir().unwrap();
+    let rks: Vec<String> = (0..233).map(|i| format!("t{i:03}")).collect();
+    let mut node = NodeMock::default();
+    d3_block(&mut node, "BLK612", 5_607_111, &rks);
+    let calls = node.calls.clone();
+    let au = ours_fn_server(|req: &Value| {
+        if req["query"].as_str().unwrap_or("").contains("block(hash") {
+            json!({"data": {"block": {"chainId": "0"}}})
+        } else {
+            json!({"data": null})
+        }
+    })
+    .await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let vars = h7_vars(&[("blockHash", json!("BLK612")), ("first", json!(200))]);
+    // Ours: the node's first 200 in its order. The oracle: 200 others of the block, reversed.
+    let ours: Vec<String> = rks[..200].to_vec();
+    let oracle: Vec<String> = rks[33..].iter().rev().cloned().collect();
+    let (d, note, a, b) = d3_n_run(&ctx, &vars, &ours, &oracle).await;
+    assert!(
+        d.iter().any(|e| e.path == SINGLE_BLOCK_PATH),
+        "{d:?} {note:?}"
+    );
+    assert!(only_hits(&d) && note.is_none(), "{d:?} {note:?}");
+    let edges = |x: &crate::graphql::Answer| x.body["data"]["transactions"]["edges"].clone();
+    let (ea, eb) = (edges(&a), edges(&b));
+    assert_eq!(
+        ea.as_array().unwrap().len(),
+        167,
+        "the rows both sides hold, paired"
+    );
+    assert_eq!(ea[0]["node"]["hash"], json!("t033"), "in ours' order");
+    assert_eq!(eb[0]["node"]["hash"], json!("t033"));
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("header-by-hash BLK612"))
+            .count(),
+        1,
+        "the block is located once"
+    );
+    let diff = |d: &[crate::report::DiffEntry], note: &Option<String>, what: &str| {
+        assert!(
+            d.iter().all(|e| e.path != SINGLE_BLOCK_PATH),
+            "{what}: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|e| e.path == UNDECIDED_PATH || e.path == ROW_PATH),
+            "{what}: {d:?}"
+        );
+        let n = note.clone().unwrap_or_default();
+        assert!(n.contains("N not explained"), "{what}: {n}");
+    };
+    // Ours in another order than the node's.
+    let mut swapped = ours.clone();
+    swapped.swap(10, 11);
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &swapped, &oracle).await;
+    diff(&d, &note, "ours out of the node's order");
+    // A row of ours the node block does not hold.
+    let mut foreign = ours.clone();
+    foreign[199] = "zzz".into();
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &foreign, &oracle).await;
+    diff(&d, &note, "ours holds a row outside the block");
+    // An oracle row the node block does not hold.
+    let mut stray = oracle.clone();
+    stray[0] = "yyy".into();
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &ours, &stray).await;
+    diff(&d, &note, "an oracle row outside the block");
+    // Ours' cursor position is not known when the request starts after a cursor.
+    let mut after = vars.clone();
+    after.insert("after".into(), json!("someCursor"));
+    let (d, note, ..) = d3_n_run(&ctx, &after, &ours, &oracle).await;
+    diff(&d, &note, "a request after a cursor");
+}
+
+/// A node payload with outputs: a coinbase whose events are `cb`, and transactions whose
+/// outputs hold these events.
+fn d3_payload(cb: Value, txs: &[Value]) -> Value {
+    let enc = |v: Value| kdx_types::hash::b64url_encode(v.to_string().as_bytes());
+    let out = |ev: &Value| json!({"result": {"status": "success"}, "events": ev});
+    let t: Vec<Value> = txs
+        .iter()
+        .enumerate()
+        .map(|(i, ev)| {
+            let w = json!({"hash": format!("rk{i}"), "sigs": [], "cmd": "{}"});
+            json!([enc(w), enc(out(ev))])
+        })
+        .collect();
+    json!({"transactions": t, "coinbase": enc(out(&cb))})
+}
+
+/// A `coin.TRANSFER` event; `amount` is the node's JSON number text.
+fn d3_xfer(from: &str, to: &str, amount: &str) -> Value {
+    json!({"name": "TRANSFER", "module": {"name": "coin", "namespace": null},
+        "params": [from, to, serde_json::from_str::<Value>(amount).unwrap()]})
+}
+
+/// Ours answering N2's tip read: chain `c`'s blocks from `h`, at most `first`, to its tip.
+async fn d3_ours_tips(tips: &'static [(u8, u64)]) -> String {
+    ours_fn_server(move |req: &Value| {
+        let v = &req["variables"];
+        let c = v["c"][0].as_str().unwrap_or("0").to_string();
+        let start = v["h"].as_u64().unwrap_or(0);
+        let first = v["first"].as_u64().unwrap_or(2);
+        let tip = tips
+            .iter()
+            .find(|(x, _)| x.to_string() == c)
+            .map_or(0, |(_, t)| *t);
+        let edges: Vec<Value> = (start..=tip)
+            .take(first as usize)
+            .map(|h| {
+                let x = (b'a' + c.parse::<u8>().unwrap_or(0)) as char;
+                json!({"node": {"height": h, "chainId": c, "hash": format!("{x}{h}")}})
+            })
+            .collect();
+        json!({"data": {"blocksFromHeight": {"pageInfo": {"hasNextPage": tip >= start + first},
+            "edges": edges}}})
+    })
+    .await
+}
+
+/// R-P5P9-75 S: the NodeBalance skew is allowed when ours' tip is 1 or 2 blocks below
+/// `node_h`, with exactly one header per height on the cut branch, and the node's balance less
+/// ours is exactly the net of the coin TRANSFER events touching the account in the node's
+/// blocks above ours' tip (gas fees and coinbase included). CG-4 #77's shape (a miner one
+/// block behind) and two blocks behind with a fee-paying tx are explained; a net one unit off,
+/// three blocks behind, a fork at a skipped height and ours at `node_h` are diffs.
+#[tokio::test]
+async fn d3_s_node_balance_skew_is_the_event_net_of_one_or_two_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let hd = |c: u8, h: u64, x: &str| json!({"hash": x, "payloadHash": format!("p-{x}"), "height": h, "chainId": c});
+    let mut node = NodeMock::default();
+    let block = |node: &mut NodeMock, c: u8, h: u64, x: &str, p: Value| {
+        node.headers.entry((c, h)).or_default().push(hd(c, h, x));
+        node.payloads.insert(format!("p-{x}"), p);
+    };
+    let cb_miner = || d3_payload(json!([d3_xfer("", "k:miner", "0.904046")]), &[]);
+    let cb_other = |txs: &[Value]| d3_payload(json!([d3_xfer("", "k:m2", "0.904046")]), txs);
+    // Chain 0 (CG-4 #77): ours one block behind; the node's block 100 paid the miner.
+    block(&mut node, 0, 100, "a100", cb_miner());
+    // Chain 1: two behind; at 99 the account pays 1.5 and its gas (0.0000123 to the miner of
+    // that block), and a non-coin TRANSFER that does not move its coin balance; at 100 a
+    // transfer between others.
+    let paid = json!([
+        d3_xfer("k:miner", "k:bob", "1.5"),
+        {"name": "TRANSFER", "module": {"name": "token", "namespace": "free"},
+            "params": ["k:miner", "k:x", 7.0]},
+        d3_xfer("k:miner", "k:m2", "0.0000123")
+    ]);
+    block(&mut node, 1, 99, "b99", cb_other(&[paid]));
+    block(
+        &mut node,
+        1,
+        100,
+        "b100",
+        cb_other(&[json!([d3_xfer("k:carol", "k:dave", "3.0")])]),
+    );
+    // Chain 2: as chain 0; the balances are one unit (1e-12) off the net.
+    block(&mut node, 2, 100, "c100", cb_miner());
+    // Chain 3: three behind, every block paying the miner.
+    for h in 98..=100 {
+        block(&mut node, 3, h, &format!("d{h}"), cb_miner());
+    }
+    // Chain 4: two behind with a fork at 99 (the branch names x99); the net would hold.
+    block(&mut node, 4, 99, "x99", cb_other(&[]));
+    block(&mut node, 4, 99, "y99", cb_miner());
+    node.canon.insert((4, 99), "x99".into());
+    block(&mut node, 4, 100, "e100", cb_miner());
+    // Chain 5: ours already at node_h.
+    block(&mut node, 5, 100, "f100", cb_miner());
+    // R-P5P9-78 (H2 m-6): ours' block at its tip is the cut branch's header there.
+    for (c, h) in [(0, 99), (1, 98), (2, 99), (3, 97), (4, 98)] {
+        let x = (b'a' + c) as char;
+        block(&mut node, c, h, &format!("{x}{h}"), cb_other(&[]));
+    }
+    // Chain 6: ours one behind on a fork at its tip (ours g99, the branch z99); the block
+    // above pays the miner, so the net would hold.
+    block(&mut node, 6, 99, "z99", cb_other(&[]));
+    block(&mut node, 6, 100, "g100", cb_miner());
+    static TIPS: [(u8, u64); 7] = [
+        (0, 99),
+        (1, 98),
+        (2, 99),
+        (3, 97),
+        (4, 98),
+        (5, 100),
+        (6, 99),
+    ];
+    let au = d3_ours_tips(&TIPS).await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let ta = &ctx.targets["a"];
+    let skew = |c: u8, ours: f64, node: &'static str| {
+        let ctx = &ctx;
+        async move {
+            ctx.s_skew(ta, c, 100, "k:miner", ours, node, &mut Reads::default())
+                .await
+        }
+    };
+    let ok = skew(0, 10.0, "10.904046").await;
+    assert!(ok.is_ok(), "CG-4 #77's shape: {ok:?}");
+    let ok = skew(1, 6.5000123, "5.0").await;
+    assert!(ok.is_ok(), "two behind with a fee-paying tx: {ok:?}");
+    assert!(
+        skew(1, 6.5, "5.0").await.is_err(),
+        "the gas fee is part of the net"
+    );
+    assert!(
+        skew(2, 10.0, "10.904046000001").await.is_err(),
+        "a net one unit off"
+    );
+    assert!(
+        skew(2, 10.000000000001, "10.904046").await.is_err(),
+        "a net one unit off, the other way"
+    );
+    assert!(
+        skew(3, 10.0, "12.712138").await.is_err(),
+        "three blocks behind"
+    );
+    let fork = skew(4, 10.0, "10.904046").await;
+    assert!(
+        fork.as_ref().is_err_and(|w| w.contains("header")),
+        "a fork at a skipped height: {fork:?}"
+    );
+    assert!(skew(5, 10.0, "10.904046").await.is_err(), "ours at node_h");
+    let fork = skew(6, 10.0, "10.904046").await;
+    assert!(
+        fork.as_ref().is_err_and(|w| w.contains("tip")),
+        "ours on a fork at its tip: {fork:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-78 D4a: the harness findings of review-fvh-h1 and review-fvh-h2 (FVH-D4a).
+
+/// A transfer row at height 100 with sender, receiver, amount and the index `i`.
+fn d4a_irow(rk: &str, to: &str, amount: f64, i: i64) -> Value {
+    let mut e = h7_xrow(rk, 100, json!(amount), Some(("s", to)));
+    e["node"]["orderIndex"] = json!(i);
+    e
+}
+
+/// R-P5P9-78 (H1 I-1): E's verdict is per row, never shared by key and index. CASE1: the
+/// oracle lists tx e twice at index 0, another miner's gas row first and the node's own event
+/// 0 second; ours lacks e. The node's own row is not explained by the gas row's class. Two
+/// copies of the gas row both take E's class.
+#[tokio::test]
+async fn d4a_h1_i1_e_verdict_is_per_row_not_per_key_and_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x0", "e"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = d4a_irow("x0", "r", 1.0, 0);
+    let gas = d4a_irow("e", "miner2", 0.0000323, 0);
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), gas.clone(), d4a_irow("e", "r", 1.0, 0)],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "CASE1: {d:?} {note:?}");
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), gas.clone(), gas],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        format!("{d:?}").contains(crate::graphql_window::NOT_IN_NODE_TX),
+        "{d:?}"
+    );
+}
+
+/// R-P5P9-78 (H1 I-2, H2 m-3): E matches only (sender, receiver, amount). CASE2: the oracle
+/// lists the node's transfer with another module name (or module hash); ours lacks it. The
+/// row is not off the node's chain, so it stays a diff. A triple the node lacks, with the
+/// module selected, stays explained.
+#[tokio::test]
+async fn d4a_h1_i2_e_matches_sender_receiver_and_amount_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x0", "e"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("s", "r")));
+    let with = |to: &str, amount: f64, k: &str, v: &str| {
+        let mut e = h7_xrow("e", 100, json!(amount), Some(("s", to)));
+        e["node"][k] = json!(v);
+        e
+    };
+    for (k, v) in [("moduleName", "n_abc.coin"), ("moduleHash", "zzz")] {
+        let (d, note) = d1_settle(
+            &ctx,
+            vec![x0.clone()],
+            vec![x0.clone(), with("r", 1.0, k, v)],
+            (false, false),
+        )
+        .await;
+        assert!(!only_hits(&d), "CASE2 {k}: {d:?} {note:?}");
+    }
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), with("miner2", 0.0000323, "moduleName", "coin")],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(
+        format!("{d:?}").contains(crate::graphql_window::NOT_IN_NODE_TX),
+        "{d:?}"
+    );
+}
+
+/// R-P5P9-78 (H1 m-2): E refuses when the node's `/poll` entry has no `events`. CASE5: the
+/// oracle row stays a diff. An entry whose `events` is an empty list is the node's word that
+/// the transaction holds no TRANSFER: E explains.
+#[tokio::test]
+async fn d4a_h1_m2_e_refuses_a_poll_entry_without_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let (k, v) = h7_xfer_poll("x0", "B100", 100, "s", "r", json!(1.0));
+    node.polls.insert(k, v);
+    let meta = json!({"blockHash": "B100", "blockHeight": 100});
+    node.polls
+        .insert("e".into(), (0, json!({"reqKey": "e", "metaData": meta})));
+    node.polls.insert(
+        "f".into(),
+        (0, json!({"reqKey": "f", "metaData": meta, "events": []})),
+    );
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x = |rk: &str| h7_xrow(rk, 100, json!(1.0), Some(("s", "r")));
+    let (d, note) = d1_settle(&ctx, vec![x("x0")], vec![x("x0"), x("e")], (false, false)).await;
+    assert!(!only_hits(&d), "CASE5: {d:?} {note:?}");
+    let (d, note) = d1_settle(&ctx, vec![x("x0")], vec![x("x0"), x("f")], (false, false)).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+}
+
+/// R-P5P9-78 (H1 I-3): F's key-only rows are checked against the node transfers the request's
+/// filter selects. CASE3: under `accountName: r`, tx k holds one TRANSFER naming r and a gas
+/// TRANSFER; ours lists k twice, the oracle once: a diff. Under `accountName: s` both
+/// TRANSFERs are inside the filter, and the same pages are explained. An account no node
+/// TRANSFER names is a diff.
+#[tokio::test]
+async fn d4a_h1_i3_key_only_rows_count_the_node_transfers_inside_the_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let ev = |from: &str, to: &str, a: f64| json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": [from, to, a]});
+    let (k, v) = h7_poll(
+        "k",
+        "B100",
+        100,
+        json!([ev("s", "r", 1.0), ev("s", "miner", 0.01)]),
+    );
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let op = h7_op("transfers");
+    let r = || json!({"cursor": "c", "node": {"chainId": "0", "requestKey": "k"}});
+    let settle = |account: &'static str, a: Vec<Value>, b: Vec<Value>| {
+        let (ctx, op) = (&ctx, &op);
+        async move {
+            let vars = h7_vars(&[("accountName", json!(account))]);
+            let (mut a, mut b) = (
+                h7_page("transfers", false, a),
+                h7_page("transfers", false, b),
+            );
+            ctx.gql_settle_op(
+                &ctx.targets["a"],
+                Some(op),
+                &vars,
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await
+        }
+    };
+    let (d, note) = settle("r", vec![r(), r()], vec![r()]).await;
+    assert!(!only_hits(&d), "CASE3: {d:?} {note:?}");
+    let (d, note) = settle("s", vec![r(), r()], vec![r()]).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    let (d, note) = settle("zed", vec![r()], vec![]).await;
+    assert!(!only_hits(&d), "{d:?} {note:?}");
+}
+
+/// R-P5P9-78 (H1 m-1): A judges an ambiguous row against each node event it matches. CASE4:
+/// a row selecting the amount and `crossChainTransfer: null` but no sender matches a plain
+/// TRANSFER and the TRANSFER of a cross-chain send; the events disagree, so the row is a
+/// diff. Two plain TRANSFERs of that amount agree on null: explained.
+#[tokio::test]
+async fn d4a_h1_m1_cross_chain_link_is_judged_against_every_matching_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    let ev = |name: &str, p: Value| json!({"name": name, "module": {"name": "coin"}, "params": p});
+    let (k, v) = h7_xfer_poll("x0", "B100", 100, "s", "r", json!(5.0));
+    node.polls.insert(k, v);
+    let (k, v) = h7_poll(
+        "x3",
+        "B100",
+        100,
+        json!([
+            ev("TRANSFER", json!(["s2", "r2", 5.0])),
+            ev("TRANSFER", json!(["s1", "", 5.0])),
+            ev("TRANSFER_XCHAIN", json!(["s1", "r", 5.0, "1"]))
+        ]),
+    );
+    node.polls.insert(k, v);
+    let (k, v) = h7_poll(
+        "x4",
+        "B100",
+        100,
+        json!([
+            ev("TRANSFER", json!(["s2", "r2", 5.0])),
+            ev("TRANSFER", json!(["s3", "r3", 5.0]))
+        ]),
+    );
+    node.polls.insert(k, v);
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = h7_xrow("x0", 100, json!(5.0), Some(("s", "r")));
+    let row = |rk: &str| {
+        let mut e = h7_xrow(rk, 100, json!(5.0), None);
+        e["node"]["crossChainTransfer"] = Value::Null;
+        e
+    };
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), row("x3"), row("x3")],
+        vec![x0.clone()],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "CASE4: {d:?} {note:?}");
+    assert!(note.unwrap_or_default().contains("crossChainTransfer"));
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), row("x4"), row("x4")],
+        vec![x0.clone()],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+}
+
+/// The settle of `transfers` pages with the document `query` and `vars`.
+async fn d4a_settle(
+    ctx: &Ctx,
+    query: &str,
+    vars: &serde_json::Map<String, Value>,
+    a: Vec<Value>,
+    b: Vec<Value>,
+) -> (Vec<crate::report::DiffEntry>, Option<String>) {
+    let op = crate::graphql::parse_op("QD4a", query, false).unwrap();
+    let mut a = h7_page("transfers", false, a);
+    let mut b = h7_page("transfers", false, b);
+    ctx.gql_settle_op(
+        &ctx.targets["a"],
+        Some(&op),
+        vars,
+        &mut a,
+        &mut b,
+        7_000_000,
+        false,
+    )
+    .await
+}
+
+/// R-P5P9-78 (H1 m-3): E and F read the selection's field names, never the aliases. A row
+/// selection with an alias (`senderAccount: receiverAccount`) makes H7 refuse, so E cannot
+/// read a swapped pair as off the node's chain; a root aliased `transfers: events(...)` is
+/// not F's `transfers`. The harness's own `kdxKey` alias and plain names stay explained.
+#[tokio::test]
+async fn d4a_h1_m3_e_and_f_read_field_names_not_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("x0", 100), ("e", 100), ("u", 101), ("v", 100)] {
+        let (k, v) = h7_xfer_poll(rk, &format!("B{h}"), h, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let vars = serde_json::Map::new();
+    // E: the oracle's row of e is the node's s -> r, under swapped aliases.
+    let swapped = "query Q($first: Int) { transfers(first: $first) { totalCount pageInfo { \
+                   hasNextPage endCursor } edges { cursor node { requestKey block { chainId \
+                   height } senderAccount: receiverAccount receiverAccount: senderAccount \
+                   amount } } } }";
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("r", "s")));
+    let e = h7_xrow("e", 100, json!(1.0), Some(("r", "s")));
+    let (d, note) = d4a_settle(&ctx, swapped, &vars, vec![x0.clone()], vec![x0.clone(), e]).await;
+    assert!(!only_hits(&d), "{d:?} {note:?}");
+    assert!(note.unwrap_or_default().contains("alias"));
+    // F: key-only rows under `transfers: events(...)`.
+    let r = |rk: &str| json!({"cursor": "c", "node": {"chainId": "0", "requestKey": rk}});
+    let q = |root: &str, key: &str| {
+        format!(
+            "query Q($first: Int) {{ {root}(first: $first) {{ totalCount pageInfo {{ \
+             hasNextPage endCursor }} edges {{ cursor node {{ chainId requestKey }} {key} }} }} }}"
+        )
+    };
+    let (d, note) = d4a_settle(
+        &ctx,
+        &q("transfers: events", ""),
+        &vars,
+        vec![r("u"), r("v")],
+        vec![r("u")],
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?} {note:?}");
+    for key in ["", "kdxKey: node { requestKey orderIndex }"] {
+        let (d, note) = d4a_settle(
+            &ctx,
+            &q("transfers", key),
+            &vars,
+            vec![r("u"), r("v")],
+            vec![r("u")],
+        )
+        .await;
+        assert!(only_hits(&d) && !d.is_empty(), "{key}: {d:?} {note:?}");
+    }
+}
+
+/// The N case of `d3_n_run` with the document `query`.
+async fn d4a_n_run(
+    ctx: &Ctx,
+    query: &str,
+    vars: &serde_json::Map<String, Value>,
+    ours: &[String],
+    oracle: &[String],
+) -> (Vec<crate::report::DiffEntry>, Option<String>) {
+    let op = crate::graphql::parse_op("QTransactionsByBlock", query, false).unwrap();
+    let page = |keys: &[String]| {
+        h7_page(
+            "transactions",
+            true,
+            keys.iter().map(|k| d3_row("BLK612", k)).collect(),
+        )
+    };
+    let (mut a, mut b) = (page(ours), page(oracle));
+    ctx.gql_window_referee(
+        &ctx.targets["a"],
+        Some(&op),
+        vars,
+        &mut a,
+        &mut b,
+        7_000_000,
+        false,
+        &mut Reads::default(),
+    )
+    .await
+}
+
+/// R-P5P9-78 (H2 m-5): N applies only when the request's filter names nothing beyond block,
+/// chain and height. With `accountName` set, ours' rows being the node block's first 200 does
+/// not show they are the account's: a diff. `chainId` with the block still takes N.
+#[tokio::test]
+async fn d4a_h2_m5_n_only_under_a_block_chain_or_height_filter() {
+    use crate::graphql_window::{ROW_PATH, SINGLE_BLOCK_PATH, UNDECIDED_PATH};
+    let dir = tempfile::tempdir().unwrap();
+    let rks: Vec<String> = (0..233).map(|i| format!("t{i:03}")).collect();
+    let mut node = NodeMock::default();
+    d3_block(&mut node, "BLK612", 5_607_111, &rks);
+    let au = ours_fn_server(|req: &Value| {
+        if req["query"].as_str().unwrap_or("").contains("block(hash") {
+            json!({"data": {"block": {"chainId": "0"}}})
+        } else {
+            json!({"data": null})
+        }
+    })
+    .await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let ours: Vec<String> = rks[..200].to_vec();
+    let oracle: Vec<String> = rks[33..].iter().rev().cloned().collect();
+    let q = |arg: &str, def: &str| {
+        format!(
+            "query QTransactionsByBlock($blockHash: String, {def} $first: Int, $after: String) \
+             {{ transactions(blockHash: $blockHash, {arg} first: $first, after: $after) {{ \
+             totalCount pageInfo {{ hasNextPage endCursor }} edges {{ cursor node {{ id hash }} \
+             }} }} }}"
+        )
+    };
+    let base = h7_vars(&[("blockHash", json!("BLK612")), ("first", json!(200))]);
+    let mut vars = base.clone();
+    vars.insert("accountName".into(), json!("k:someone"));
+    let (d, note) = d4a_n_run(
+        &ctx,
+        &q("accountName: $accountName,", "$accountName: String,"),
+        &vars,
+        &ours,
+        &oracle,
+    )
+    .await;
+    assert!(
+        d.iter().all(|e| e.path != SINGLE_BLOCK_PATH)
+            && d.iter()
+                .any(|e| e.path == UNDECIDED_PATH || e.path == ROW_PATH),
+        "{d:?} {note:?}"
+    );
+    let mut vars = base.clone();
+    vars.insert("chainId".into(), json!("0"));
+    let (d, note) = d4a_n_run(
+        &ctx,
+        &q("chainId: $chainId,", "$chainId: String,"),
+        &vars,
+        &ours,
+        &oracle,
+    )
+    .await;
+    assert!(
+        d.iter().any(|e| e.path == SINGLE_BLOCK_PATH) && only_hits(&d),
+        "{d:?} {note:?}"
+    );
+}
+
+/// R-P5P9-78 (H2 I-2; closes H1 m-5): E and M, O and K each emit a visible hit of their own,
+/// which only its own PROPOSED entry explains. A window settled without E or M emits no
+/// off-chain hit.
+#[tokio::test]
+async fn d4a_h2_i2_e_m_o_k_have_their_own_visible_hits_and_proposed_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for (rk, h) in [("x0", 100), ("e", 100), ("v", 100)] {
+        let (k, v) = h7_xfer_poll(rk, &format!("B{h}"), h, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let off = "/~graphql-r75-h7-off-chain";
+    let x = |rk: &str, to: &str, amount: f64| h7_xrow(rk, 100, json!(amount), Some(("s", to)));
+    let x0 = x("x0", "r", 1.0);
+    // E.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), x("e", "miner2", 0.0000323)],
+        (false, false),
+    )
+    .await;
+    assert!(
+        only_hits(&d) && d.iter().any(|e| e.path == off),
+        "{d:?} {note:?}"
+    );
+    // M: the oracle places e in X90 at height 90.
+    let mut m = h7_xrow("e", 90, json!(1.0), Some(("s", "r")));
+    m["node"]["blockHash"] = json!("X90");
+    let mut ours = h7_xrow("e", 100, json!(1.0), Some(("s", "r")));
+    ours["node"]["blockHash"] = json!("B100");
+    let (d, note) = d1_settle(&ctx, vec![ours], vec![m], (false, false)).await;
+    assert!(
+        only_hits(&d) && d.iter().any(|e| e.path == off),
+        "{d:?} {note:?}"
+    );
+    // A node-confirmed oracle gap only: no off-chain hit.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), x("v", "r", 1.0)],
+        vec![x0.clone()],
+        (false, false),
+    )
+    .await;
+    assert!(
+        only_hits(&d) && d.iter().all(|e| e.path != off),
+        "{d:?} {note:?}"
+    );
+    // Each new hit is explained by its own PROPOSED entry, and only by it.
+    let allow = d2_shipped();
+    for (path, id) in [
+        (off, "graphql-r75-h7-off-chain"),
+        (
+            "/~graphql-r75-nested-order-index",
+            "graphql-r75-nested-order-index",
+        ),
+        (
+            "/~graphql-r75-exec-payload-data",
+            "graphql-r75-exec-payload-data",
+        ),
+    ] {
+        let hit = crate::report::DiffEntry {
+            path: path.into(),
+            kind: crate::report::DiffKind::Changed,
+            a: None,
+            b: None,
+        };
+        let (un, ids) = allow.classify_request(
+            &crate::normalize::RouteKind::Other,
+            "graphql:QD4a",
+            &[],
+            &[hit],
+        );
+        assert!(un.is_empty() && ids == [id], "{path}: {un:?} {ids:?}");
+        let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+        assert!(
+            e.status == crate::allowlist::Status::Proposed
+                && e.owner_note.starts_with("PROPOSED")
+                && e.reason.contains("R-P5P9-78"),
+            "{id}: {e:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-81 D5: the findings of review-fvh-i (FVH-D5).
+
+/// The settle counts in the window hit's evidence, on ours' side or the oracle's.
+fn d5_settled(d: &[crate::report::DiffEntry], ours: bool) -> Value {
+    let w = d
+        .iter()
+        .find(|e| e.path == crate::graphql_window::WINDOW_PATH)
+        .expect("the window hit");
+    let side = if ours { &w.a } else { &w.b };
+    side.as_ref()
+        .and_then(|s| s.get("settled"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The four settle classes R-P5P9-81 names, with these counts.
+fn d5_counts(gap: u64, outside: u64, duplicate: u64, key_only: u64) -> Value {
+    json!({"oracle-gap": gap, "outside-oracle-window": outside, "duplicate": duplicate,
+        "key-only": key_only})
+}
+
+/// The rows the unindexed hit lists on ours' side and the oracle's.
+fn d5_unindexed(d: &[crate::report::DiffEntry], path: &str) -> Option<(usize, usize)> {
+    let e = d.iter().find(|e| e.path == path)?;
+    let n = |s: &Option<Value>| {
+        s.as_ref()
+            .and_then(|s| s.get("rows"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    Some((n(&e.a), n(&e.b)))
+}
+
+/// R-P5P9-81 (m-1): rows H7 settles without an index, D's node-confirmed duplicates and F's
+/// key-only rows, emit their own visible hit next to the window hit, which only its own
+/// PROPOSED entry explains; an indexed canonical row does not. The window hit's evidence
+/// counts each side's one-sided rows per settle class.
+#[tokio::test]
+async fn d5_m1_rows_settled_without_an_index_have_their_own_visible_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["u", "v"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let un = "/~graphql-r75-h7-unindexed";
+    // D: the oracle lists u twice; the node's transaction and ours hold it once.
+    let x = |rk: &str| h7_xrow(rk, 100, json!(1.0), Some(("s", "r")));
+    let (d, note) = d1_settle(&ctx, vec![x("u")], vec![x("u"), x("u")], (false, false)).await;
+    assert!(only_hits(&d), "D: {d:?} {note:?}");
+    assert_eq!(d5_unindexed(&d, un), Some((0, 1)), "D: {d:?}");
+    assert_eq!(d5_settled(&d, false), d5_counts(0, 0, 1, 1), "D: {d:?}");
+    assert_eq!(d5_settled(&d, true), d5_counts(0, 0, 0, 0), "D: {d:?}");
+    // F: key-only rows; ours' v is a node-confirmed oracle gap.
+    let r = |rk: &str| json!({"cursor": "c", "node": {"chainId": "0", "requestKey": rk}});
+    let (d, note) = d1_settle(&ctx, vec![r("u"), r("v")], vec![r("u")], (false, false)).await;
+    assert!(only_hits(&d), "F: {d:?} {note:?}");
+    assert_eq!(d5_unindexed(&d, un), Some((1, 0)), "F: {d:?}");
+    assert_eq!(d5_settled(&d, true), d5_counts(1, 0, 0, 1), "F: {d:?}");
+    assert_eq!(d5_settled(&d, false), d5_counts(0, 0, 0, 0), "F: {d:?}");
+    // The neighbour: an indexed canonical row settled the same way emits no unindexed hit.
+    let i = |rk: &str| d4a_irow(rk, "r", 1.0, 0);
+    let (d, note) = d1_settle(&ctx, vec![i("u"), i("v")], vec![i("u")], (false, false)).await;
+    assert!(only_hits(&d), "indexed: {d:?} {note:?}");
+    assert_eq!(d5_unindexed(&d, un), None, "indexed: {d:?}");
+    assert_eq!(
+        d5_settled(&d, true),
+        d5_counts(1, 0, 0, 0),
+        "indexed: {d:?}"
+    );
+    // The hit is explained by its own PROPOSED entry, and only by it.
+    let allow = d2_shipped();
+    let hit = crate::report::DiffEntry {
+        path: un.into(),
+        kind: crate::report::DiffKind::Changed,
+        a: None,
+        b: None,
+    };
+    let (left, ids) = allow.classify_request(
+        &crate::normalize::RouteKind::Other,
+        "graphql:QD5",
+        &[],
+        &[hit],
+    );
+    let id = "graphql-r75-h7-unindexed";
+    assert!(left.is_empty() && ids == [id], "{left:?} {ids:?}");
+    let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+    assert!(
+        e.status == crate::allowlist::Status::Proposed
+            && e.owner_note.starts_with("PROPOSED")
+            && e.reason.contains("R-P5P9-81")
+            && e.ruling.contains("R-P5P9-81"),
+        "{e:?}"
     );
 }

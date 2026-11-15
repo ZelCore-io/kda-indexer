@@ -52,7 +52,7 @@ impl Limiter {
 #[derive(Debug, Clone)]
 pub struct HttpCapture {
     pub status: u16,
-    /// Only `content-type`, `Chainweb-Next` and `x-search-truncated`.
+    /// Only `content-type`, `Chainweb-Next`, `x-search-truncated` and `x-count-age`.
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
     pub ms: u64,
@@ -101,11 +101,16 @@ pub struct StreamMeta {
     pub ms: u64,
 }
 
-/// The response headers the harness keeps: `content-type`, `Chainweb-Next` and
-/// `x-search-truncated`.
+/// The response headers the harness keeps: `content-type`, `Chainweb-Next`,
+/// `x-search-truncated` and `x-count-age` (ours' `/stats` count age in seconds, STATS-FIX).
 fn kept_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
     let mut headers = Vec::new();
-    for k in ["content-type", "chainweb-next", "x-search-truncated"] {
+    for k in [
+        "content-type",
+        "chainweb-next",
+        "x-search-truncated",
+        "x-count-age",
+    ] {
         if let Some(v) = resp.headers().get(k).and_then(|v| v.to_str().ok()) {
             let name = if k == "chainweb-next" {
                 "Chainweb-Next"

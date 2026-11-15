@@ -179,6 +179,13 @@ pub enum FieldRuleKind {
     /// the oracle's rounded half to even to whole seconds. Whole-second differences, and a
     /// fraction on our side, stay diffs. Visible hit `/~graphql-h9-creation-time-fraction`.
     CreationTimeHalfEven,
+    /// R-P5P9-75 I (Transactions-9e58b95d); `field` is `<root>.totalCount` of a root
+    /// connection. The oracle counts heights, not transactions (CG-A2, CG-3T: the node equals
+    /// ours 4/4): its root count takes ours only when it is below ours. An oracle count at
+    /// or above ours stays a diff. Visible hit `/~graphql-r75-oracle-counts-heights`, whose
+    /// allowlist entry is scoped to Transactions-9e58b95d (on another operation the hit stays
+    /// unexplained).
+    OracleCountsHeights,
 }
 
 impl FieldRuleKind {
@@ -193,7 +200,10 @@ impl FieldRuleKind {
     /// Rules on a whole root connection (its count against its edges), applied on the
     /// normalised answers before the diff.
     pub fn is_connection(self) -> bool {
-        self == FieldRuleKind::CountSelfConsistent
+        matches!(
+            self,
+            FieldRuleKind::CountSelfConsistent | FieldRuleKind::OracleCountsHeights
+        )
     }
 
     /// The exact-value matchers the rule takes: (ours, oracle).
