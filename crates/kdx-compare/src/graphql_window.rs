@@ -44,7 +44,7 @@
 //!
 //! The pure parts are here; the reads are in [`Ctx::gql_window_referee`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{json, Map, Value};
 
@@ -94,6 +94,18 @@ pub const NESTED_ORDER_INDEX_PATH: &str = "/~graphql-r75-nested-order-index";
 /// R-P5P9-78 (H2 I-2): K, a tx's exec `cmd.payload.data` against the node's command
 /// (allowlist id `graphql-r75-exec-payload-data`).
 pub const EXEC_PAYLOAD_DATA_PATH: &str = "/~graphql-r75-exec-payload-data";
+/// R-P5P9-81 (m-1): next to [`WINDOW_PATH`] when H7 settled a one-sided row whose identity
+/// has no index (R-P5P9-75 D's node-confirmed duplicates, F's key-only rows, an oracle-only
+/// row placed outside our window): it lists those rows per side (allowlist id
+/// `graphql-r75-h7-unindexed`). E's and M's rows show under [`OFF_CHAIN_PATH`] instead.
+pub const UNINDEXED_PATH: &str = "/~graphql-r75-h7-unindexed";
+/// R-P5P9-81 (m-1): the settle classes the window hit's evidence always counts, per side.
+pub const SETTLE_CLASSES: [&str; 4] = [
+    "oracle-gap",
+    "outside-oracle-window",
+    "duplicate",
+    "key-only",
+];
 const ROUTE: &str = "graphql-window-referee";
 
 fn text(v: &Value) -> Option<String> {
@@ -2300,6 +2312,9 @@ pub struct Decision {
     pub coinbase_keys: Vec<usize>,
     /// R-P5P9-78 (H2 I-2): the oracle rows settled off the node's chain by E or M.
     pub off_chain: Vec<Value>,
+    /// R-P5P9-81 (m-1): the one-sided rows settled without an index (D, F), per side.
+    pub unindexed_ours: Vec<Value>,
+    pub unindexed_oracle: Vec<Value>,
 }
 
 impl Decision {
@@ -2315,6 +2330,24 @@ fn evidence(r: &Row, v: Option<&Verdict>, why: &str) -> Value {
     }
     e["why"] = json!(why);
     e
+}
+
+/// R-P5P9-81 (m-1): a side's one-sided rows counted per settle class (their `why`):
+/// [`SETTLE_CLASSES`] always, any other class when present. `key-only` is the side's rows
+/// settled without an index (those [`UNINDEXED_PATH`] lists).
+pub fn settle_counts(rows: &[Value], key_only: usize) -> Value {
+    let mut m: BTreeMap<String, u64> = SETTLE_CLASSES
+        .iter()
+        .map(|c| ((*c).to_string(), 0))
+        .collect();
+    for w in rows
+        .iter()
+        .filter_map(|r| r.get("why").and_then(Value::as_str))
+    {
+        *m.entry(w.to_string()).or_default() += 1;
+    }
+    m.insert("key-only".into(), key_only as u64);
+    json!(m)
 }
 
 fn why_of(v: Option<&Verdict>) -> String {
@@ -2684,6 +2717,10 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
         } else {
             "oracle-gap"
         };
+        // R-P5P9-81 (m-1): a row without an index (F's key-only identity) also shows apart.
+        if !ra.id.indexed() {
+            d.unindexed_ours.push(evidence(ra, vi, why));
+        }
         d.ours.push(evidence(ra, vi, why));
     }
     // R-P5P9-75 D: per oracle row content without an index, how many of its copies the node
@@ -2704,6 +2741,8 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
             });
             if *left > 0 {
                 *left -= 1;
+                // R-P5P9-81 (m-1): D's duplicate without an index also shows apart.
+                d.unindexed_oracle.push(evidence(rb, vj, "duplicate"));
                 d.oracle.push(evidence(rb, vj, "duplicate"));
                 continue;
             }
@@ -2761,6 +2800,12 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                 };
                 match place {
                     Place::Outside(why) => {
+                        // R-P5P9-81 (m-1): rows without an index also show apart.
+                        if !rb.id.indexed() {
+                            d.unindexed_oracle.push(evidence(rb, vj, why));
+                            d.unindexed_oracle
+                                .extend(g[1..].iter().map(|&j| evidence(&p.b[j], vj, "duplicate")));
+                        }
                         d.oracle.push(evidence(rb, vj, why));
                         d.oracle
                             .extend(g[1..].iter().map(|&j| evidence(&p.b[j], vj, "duplicate")));
@@ -3035,10 +3080,12 @@ impl Ctx {
         let (nr, or) = (st.node - node0, st.ours - ours0);
         let reads = format!("{nr} node reads, {or} reads of ours");
         let ev_a = json!({"rows": prep.a.len(), "cut": prep.a_cut, "boundaryHeight": d.lowest,
-            "ascending": asc, "oneSided": d.ours});
+            "ascending": asc, "oneSided": d.ours,
+            "settled": settle_counts(&d.ours, d.unindexed_ours.len())});
         let ev_b = json!({"rows": prep.b.len(), "cut": prep.b_cut,
             "lastCreationTime": d.oracle_lowest_ctime, "nodeReads": nr,
-            "oursReads": or, "oneSided": d.oracle});
+            "oursReads": or, "oneSided": d.oracle,
+            "settled": settle_counts(&d.oracle, d.unindexed_oracle.len())});
         if !d.undecided.is_empty() || !d.grouped {
             let mut out = Vec::new();
             if !d.undecided.is_empty() {
@@ -3119,6 +3166,13 @@ impl Ctx {
                 OFF_CHAIN_PATH,
                 None,
                 Some(json!({ "rows": d.off_chain })),
+            ));
+        }
+        if !d.unindexed_ours.is_empty() || !d.unindexed_oracle.is_empty() {
+            out.push(entry(
+                UNINDEXED_PATH,
+                Some(json!({ "rows": d.unindexed_ours })),
+                Some(json!({ "rows": d.unindexed_oracle })),
             ));
         }
         if d.rejected.is_empty() {
@@ -4752,5 +4806,26 @@ mod tests {
         );
         assert!(parse_utc("2024-03-01 00:00:01Z").is_none());
         assert!(parse_utc("2024-13-01T00:00:01Z").is_none());
+    }
+
+    /// R-P5P9-81 (m-1): the settle counts list the four named classes always, any other
+    /// class present, and `key-only` as given.
+    #[test]
+    fn settle_counts_per_class() {
+        let rows = [
+            json!({"why": "outside-oracle-window"}),
+            json!({"why": "outside-oracle-window"}),
+            json!({"why": "oracle-gap"}),
+            json!({"why": "below-our-window"}),
+        ];
+        assert_eq!(
+            settle_counts(&rows, 1),
+            json!({"oracle-gap": 1, "outside-oracle-window": 2, "duplicate": 0,
+                "key-only": 1, "below-our-window": 1})
+        );
+        assert_eq!(
+            settle_counts(&[], 0),
+            json!({"oracle-gap": 0, "outside-oracle-window": 0, "duplicate": 0, "key-only": 0})
+        );
     }
 }

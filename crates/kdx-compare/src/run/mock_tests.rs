@@ -7440,3 +7440,101 @@ async fn d4a_h2_i2_e_m_o_k_have_their_own_visible_hits_and_proposed_entries() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// R-P5P9-81 D5: the findings of review-fvh-i (FVH-D5).
+
+/// The settle counts in the window hit's evidence, on ours' side or the oracle's.
+fn d5_settled(d: &[crate::report::DiffEntry], ours: bool) -> Value {
+    let w = d
+        .iter()
+        .find(|e| e.path == crate::graphql_window::WINDOW_PATH)
+        .expect("the window hit");
+    let side = if ours { &w.a } else { &w.b };
+    side.as_ref()
+        .and_then(|s| s.get("settled"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The four settle classes R-P5P9-81 names, with these counts.
+fn d5_counts(gap: u64, outside: u64, duplicate: u64, key_only: u64) -> Value {
+    json!({"oracle-gap": gap, "outside-oracle-window": outside, "duplicate": duplicate,
+        "key-only": key_only})
+}
+
+/// The rows the unindexed hit lists on ours' side and the oracle's.
+fn d5_unindexed(d: &[crate::report::DiffEntry], path: &str) -> Option<(usize, usize)> {
+    let e = d.iter().find(|e| e.path == path)?;
+    let n = |s: &Option<Value>| {
+        s.as_ref()
+            .and_then(|s| s.get("rows"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    Some((n(&e.a), n(&e.b)))
+}
+
+/// R-P5P9-81 (m-1): rows H7 settles without an index, D's node-confirmed duplicates and F's
+/// key-only rows, emit their own visible hit next to the window hit, which only its own
+/// PROPOSED entry explains; an indexed canonical row does not. The window hit's evidence
+/// counts each side's one-sided rows per settle class.
+#[tokio::test]
+async fn d5_m1_rows_settled_without_an_index_have_their_own_visible_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["u", "v"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let un = "/~graphql-r75-h7-unindexed";
+    // D: the oracle lists u twice; the node's transaction and ours hold it once.
+    let x = |rk: &str| h7_xrow(rk, 100, json!(1.0), Some(("s", "r")));
+    let (d, note) = d1_settle(&ctx, vec![x("u")], vec![x("u"), x("u")], (false, false)).await;
+    assert!(only_hits(&d), "D: {d:?} {note:?}");
+    assert_eq!(d5_unindexed(&d, un), Some((0, 1)), "D: {d:?}");
+    assert_eq!(d5_settled(&d, false), d5_counts(0, 0, 1, 1), "D: {d:?}");
+    assert_eq!(d5_settled(&d, true), d5_counts(0, 0, 0, 0), "D: {d:?}");
+    // F: key-only rows; ours' v is a node-confirmed oracle gap.
+    let r = |rk: &str| json!({"cursor": "c", "node": {"chainId": "0", "requestKey": rk}});
+    let (d, note) = d1_settle(&ctx, vec![r("u"), r("v")], vec![r("u")], (false, false)).await;
+    assert!(only_hits(&d), "F: {d:?} {note:?}");
+    assert_eq!(d5_unindexed(&d, un), Some((1, 0)), "F: {d:?}");
+    assert_eq!(d5_settled(&d, true), d5_counts(1, 0, 0, 1), "F: {d:?}");
+    assert_eq!(d5_settled(&d, false), d5_counts(0, 0, 0, 0), "F: {d:?}");
+    // The neighbour: an indexed canonical row settled the same way emits no unindexed hit.
+    let i = |rk: &str| d4a_irow(rk, "r", 1.0, 0);
+    let (d, note) = d1_settle(&ctx, vec![i("u"), i("v")], vec![i("u")], (false, false)).await;
+    assert!(only_hits(&d), "indexed: {d:?} {note:?}");
+    assert_eq!(d5_unindexed(&d, un), None, "indexed: {d:?}");
+    assert_eq!(
+        d5_settled(&d, true),
+        d5_counts(1, 0, 0, 0),
+        "indexed: {d:?}"
+    );
+    // The hit is explained by its own PROPOSED entry, and only by it.
+    let allow = d2_shipped();
+    let hit = crate::report::DiffEntry {
+        path: un.into(),
+        kind: crate::report::DiffKind::Changed,
+        a: None,
+        b: None,
+    };
+    let (left, ids) = allow.classify_request(
+        &crate::normalize::RouteKind::Other,
+        "graphql:QD5",
+        &[],
+        &[hit],
+    );
+    let id = "graphql-r75-h7-unindexed";
+    assert!(left.is_empty() && ids == [id], "{left:?} {ids:?}");
+    let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+    assert!(
+        e.status == crate::allowlist::Status::Proposed
+            && e.owner_note.starts_with("PROPOSED")
+            && e.reason.contains("R-P5P9-81")
+            && e.ruling.contains("R-P5P9-81"),
+        "{e:?}"
+    );
+}
