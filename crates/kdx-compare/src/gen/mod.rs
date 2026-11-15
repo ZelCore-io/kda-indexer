@@ -133,6 +133,12 @@ impl Tips {
         self.a_tip.load(Ordering::Relaxed)
     }
 
+    /// Sets A's tip (tests: rows inside or outside the oracle-lag window).
+    #[cfg(test)]
+    pub(crate) fn set_a_tip(&self, h: u64) {
+        self.a_tip.store(h, Ordering::Relaxed);
+    }
+
     /// The chain's cut hash (canonical branch tip).
     pub fn cut_hash(&self, chain: u8) -> Option<String> {
         self.cut

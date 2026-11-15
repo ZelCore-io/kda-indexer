@@ -86,6 +86,11 @@ pub struct GraphqlConfig {
     /// Per-field normalisers on the oracle pairs (R-P5P9-57 rules (a) and (b)), set by the
     /// controller per field after the node referee.
     pub field_rules: Vec<FieldRule>,
+    /// R-P5P9-61 H6: pages the harness reads per side and compare to finish cut lists of one
+    /// block or one tx (each page one request at that target's rate, so the oracle's share
+    /// stays inside its budget). A list it cannot finish within it stays a diff, marked as a
+    /// harness limit.
+    pub list_page_budget: usize,
 }
 
 /// One per-field normaliser (R-P5P9-57): at `field`, a difference that `rule` explains is
@@ -169,6 +174,11 @@ pub enum FieldRuleKind {
     /// parse as decimals, they parse to the same f64, and ours has at least as many
     /// significant digits as the oracle's.
     OracleF64Rounded,
+    /// R-P5P9-62 H9 (`creationTime` fraction, the tx's Pact `ParsedInteger`): the oracle's
+    /// time has a non-zero fraction of a second, ours has none (or zeros only), and ours is
+    /// the oracle's rounded half to even to whole seconds. Whole-second differences, and a
+    /// fraction on our side, stay diffs. Visible hit `/~graphql-h9-creation-time-fraction`.
+    CreationTimeHalfEven,
 }
 
 impl FieldRuleKind {
@@ -207,6 +217,7 @@ impl Default for GraphqlConfig {
             node_step_ms: 10_000,
             redraws: 4,
             field_rules: Vec::new(),
+            list_page_budget: 40,
         }
     }
 }
@@ -322,6 +333,10 @@ fn d_out_dir() -> PathBuf {
     PathBuf::from("test-runs/compare")
 }
 
+/// H7's header-by-hash reads a second (one in flight), outside the node client's limiter
+/// (R-P5P9-65 (2)).
+pub const HEADER_RPS: u32 = 1;
+
 impl CompareConfig {
     pub fn load(path: &Path) -> anyhow::Result<CompareConfig> {
         let text =
@@ -425,6 +440,17 @@ impl CompareConfig {
         })
     }
 
+    /// The node client's rate (R-P5P9-65 (2)): `node_max_rps` less the one read a second of
+    /// H7's header-by-hash reads ([`HEADER_RPS`]), which the node client does not offer, so
+    /// the two together stay within `node_max_rps`. 0 (no limit) stays 0; at 1 the node
+    /// client keeps 1.
+    pub fn node_client_rps(&self) -> u32 {
+        match self.node_max_rps {
+            0 => 0,
+            n => n.saturating_sub(HEADER_RPS).max(1),
+        }
+    }
+
     pub fn node_client(&self) -> anyhow::Result<kdx_node::NodeClient> {
         let p2p_cert_sha256 = self
             .node
@@ -437,7 +463,7 @@ impl CompareConfig {
             base: self.node.url.clone(),
             network: self.network.clone(),
             timeout: Duration::from_millis(self.node.timeout_ms),
-            max_rps: self.node_max_rps,
+            max_rps: self.node_client_rps(),
             concurrency: 8,
             p2p_url: self.node.p2p_url.clone(),
             p2p_cert_sha256,

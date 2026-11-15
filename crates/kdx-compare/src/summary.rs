@@ -302,7 +302,22 @@ pub fn render(
         s,
         "not covered by this verdict: reorg-probe failures and lag (separate gate steps)"
     );
+    s.push_str(&render_a_errors(rows));
     (s, green)
+}
+
+/// R-P5P9-67 I-A (b): the `a-error` count of every route and pair with one, required or not
+/// (read each day, not gated; a follow-page fault of ours is a diff, not an error).
+pub fn render_a_errors(rows: &[Row]) -> String {
+    let with: Vec<&Row> = rows.iter().filter(|r| r.errors_a > 0).collect();
+    if with.is_empty() {
+        return "a-error per route: none\n".into();
+    }
+    let mut s = String::from("a-error per route (read, not gated):\n");
+    for r in with {
+        let _ = writeln!(s, "  {} {}|{}: {}", r.route, r.a, r.b, r.errors_a);
+    }
+    s
 }
 
 /// Node-pair routes of the GraphQL gate and their minimums (small, full).
@@ -757,5 +772,27 @@ mod tests {
     fn route_set_graphql_parses() {
         assert_eq!(RouteSet::parse("graphql").unwrap(), RouteSet::Graphql);
         assert!(RouteSet::Graphql.required(GateSize::Small).is_empty());
+    }
+
+    /// R-P5P9-67 I-A (b): every render lists the `a-error` counts per route and pair, the
+    /// routes outside the required set included (read daily, not passed silently).
+    #[test]
+    fn a_errors_are_listed_per_route_on_every_render() {
+        let row = |route: &str, errors_a: u64| Row {
+            route: route.into(),
+            a: "a".into(),
+            b: "b".into(),
+            errors_a,
+            ..Default::default()
+        };
+        let rows = vec![row("graphql:QX", 3), row("account", 0)];
+        let (text, _) = render(&rows, MUST, false, "gate full");
+        assert!(
+            text.contains("a-error per route") && text.contains("graphql:QX a|b: 3"),
+            "{text}"
+        );
+        assert!(!text.contains("account a|b: 0"), "{text}");
+        let (text, _) = render(&[row("account", 0)], MUST, false, "gate full");
+        assert!(text.contains("a-error per route: none"), "{text}");
     }
 }
