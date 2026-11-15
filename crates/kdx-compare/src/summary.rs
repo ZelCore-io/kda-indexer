@@ -95,14 +95,9 @@ impl RouteSet {
 }
 
 /// Classes that count as a request compared (the two sides answered and were diffed).
-const COMPARED: &[&str] = &[
-    "match",
-    "diff",
-    "allowlisted",
-    "legacy-cmd",
-    "skew",
-    "known-gap",
-];
+/// R-P5P9-78 (H2 m-8): a `known-gap` record is not one: a P record is a fetch that stopped
+/// at ours' fault, so it counts toward no route minimum and no GraphQL total.
+const COMPARED: &[&str] = &["match", "diff", "allowlisted", "legacy-cmd", "skew"];
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Row {
@@ -961,6 +956,27 @@ mod tests {
         .unwrap();
     }
 
+    /// R-P5P9-78 (H2 m-8): known-gap records do not reach a route minimum; the same count
+    /// of matches does.
+    #[test]
+    fn known_gap_records_do_not_reach_a_minimum() {
+        let pairs = |last: &'static [(&'static str, u64)]| -> Vec<Row> {
+            let mut p: Vec<(String, Vec<(&str, u64)>)> = MUST_SMALL
+                .iter()
+                .map(|(r, min)| (format!("{r}|compat|cwd"), vec![("match", *min)]))
+                .collect();
+            p[0].1 = last.to_vec();
+            let refs: Vec<(&str, &[(&str, u64)])> =
+                p.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+            rows(&window(&refs))
+        };
+        let (g, why) = gate(&pairs(&[("match", 99), ("known-gap", 1)]), MUST_SMALL);
+        assert!(!g);
+        assert_eq!(why, vec!["account: 99 compared, needs 100".to_string()]);
+        let (g, why) = gate(&pairs(&[("match", 100), ("known-gap", 1)]), MUST_SMALL);
+        assert!(g, "{why:?}");
+    }
+
     /// R-P5P9-75 (CG-4 concern 3): `--routes graphql` prints no GREEN line from an empty
     /// required list; its verdict counts the oracle pairs as well as the node pairs.
     #[test]
@@ -1008,9 +1024,10 @@ mod tests {
         assert!(text.contains("oracle pairs): GREEN"), "{text}");
     }
 
-    /// R-P5P9-75: known-gap records count as compared, never as explained or unexplained;
-    /// the summary lists them per entry and day and gates each against its CG-4 baseline per
-    /// hour x 1.5 over the window (one bucket: 1/6 h). Over it, or without a baseline: RED.
+    /// R-P5P9-75: known-gap records count neither as explained nor as unexplained, and
+    /// (R-P5P9-78, H2 m-8) not as compared either; the summary lists them per entry and day
+    /// and gates each against its CG-4 baseline per hour x 1.5 over the window (one bucket:
+    /// 1/6 h). Over it, or without a baseline: RED.
     #[test]
     fn known_gaps_are_reported_apart_and_gated_by_their_baseline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1042,7 +1059,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (q.compared, q.unexplained, q.allowlisted, q.known_gap),
-            (11, 0, 0, 1)
+            (10, 0, 0, 1)
         );
         // Two records: over.
         write_day(
