@@ -456,6 +456,7 @@ pub fn run_text(
     let w = load(out_dir, since_secs)?;
     let unpaired = load_unpaired(out_dir, since_secs)?;
     let assets = load_assets(out_dir, since_secs)?;
+    let log_bytes = load_log_bytes(out_dir, since_secs)?;
     let label = format!("gate {gate}, routes {routes}");
     let all_rows = rows(&w);
     // R-P5P9-81 (I-2): under `all` the graphql gate runs whatever the window holds, so a
@@ -515,6 +516,7 @@ pub fn run_text(
         format!("routes {routes}")
     };
     text.push_str(&render_assets(&assets));
+    text.push_str(&render_log_bytes(&log_bytes));
     let _ = writeln!(
         text,
         "verdict (gate {gate}, {scope}): {} (unexplained diffs {unexplained}; {})",
@@ -700,6 +702,74 @@ fn load_assets(out_dir: &Path, since_secs: u64) -> anyhow::Result<BTreeMap<Strin
         days.sort();
     }
     Ok(out)
+}
+
+/// Per day: the diff log's (raw, zst) bytes, each when known.
+pub type LogBytes = BTreeMap<String, (Option<u64>, Option<u64>)>;
+
+/// R-P5P9-86 (diff log volume): per day since `since_secs`, the diff log's raw bytes (the
+/// rotation's record in the day's summary, else the unrotated `diffs-<date>.jsonl`) and the
+/// rotated `diffs-<date>.jsonl.zst` file's bytes.
+fn load_log_bytes(out_dir: &Path, since_secs: u64) -> anyhow::Result<LogBytes> {
+    let first_date = date_of(since_secs);
+    let mut out = LogBytes::new();
+    for e in std::fs::read_dir(out_dir)
+        .with_context(|| format!("reading {}", out_dir.display()))?
+        .filter_map(Result::ok)
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let len = || e.metadata().map(|m| m.len()).ok();
+        let (date, raw, zst) = if let Some(d) = name
+            .strip_prefix("diffs-")
+            .and_then(|n| n.strip_suffix(".jsonl.zst"))
+        {
+            (d.to_string(), None, len())
+        } else if let Some(d) = name
+            .strip_prefix("diffs-")
+            .and_then(|n| n.strip_suffix(".jsonl"))
+        {
+            (d.to_string(), len(), None)
+        } else if let Some(d) = name
+            .strip_prefix("summary-")
+            .and_then(|n| n.strip_suffix(".json"))
+        {
+            let day = std::fs::read(e.path())
+                .ok()
+                .and_then(|b| serde_json::from_slice::<DailySummary>(&b).ok());
+            let raw = day.and_then(|d| d.diff_log_bytes.get("raw").copied());
+            if raw.is_none() {
+                continue;
+            }
+            (d.to_string(), raw, None)
+        } else {
+            continue;
+        };
+        if date.len() != 10 || date < first_date {
+            continue;
+        }
+        let x = out.entry(date).or_default();
+        x.0 = x.0.or(raw);
+        x.1 = x.1.or(zst);
+    }
+    Ok(out)
+}
+
+/// R-P5P9-86: the diff log bytes per day.
+pub fn render_log_bytes(days: &LogBytes) -> String {
+    let mb = |b: Option<u64>| {
+        b.map_or("unknown".to_string(), |b| {
+            format!("{:.1} MB", b as f64 / 1e6)
+        })
+    };
+    let mut text = format!("diff logs: {} days\n", days.len());
+    for (date, (raw, zst)) in days {
+        let zst = match zst {
+            Some(_) => format!("zst {}", mb(*zst)),
+            None => "not rotated".to_string(),
+        };
+        text.push_str(&format!("  {date}: raw {}, {zst}\n", mb(*raw)));
+    }
+    text
 }
 
 /// R-P5P9-88 (3a): the harness's assets and build lines, for the FV setup to check against F.

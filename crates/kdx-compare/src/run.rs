@@ -722,9 +722,25 @@ impl Ctx {
                 fresh.graphql_unpaired = std::mem::take(&mut s.graphql_unpaired);
                 fresh.assets = std::mem::take(&mut s.assets);
                 *s = fresh;
+                // R-P5P9-86: the day rolled; the past days' diff logs are rotated.
+                self.rotate_logs();
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %e, "summary flush"),
+        }
+    }
+
+    /// R-P5P9-86: compresses the past days' diff logs ([`crate::report::rotate_logs`]) and
+    /// logs each day's bytes.
+    pub fn rotate_logs(&self) {
+        let today = crate::report::date_of(crate::report::now_secs());
+        match crate::report::rotate_logs(&self.cfg.out_dir, &today) {
+            Ok(days) => {
+                for (date, raw, zst) in days {
+                    tracing::info!(date, raw, zst, "diff log rotated");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "diff log rotation"),
         }
     }
 
@@ -3452,6 +3468,9 @@ impl Ctx {
 /// `run`: continuous loop until SIGINT/SIGTERM (or `max_secs`, when set).
 pub async fn run(cfg: CompareConfig, max_secs: Option<u64>) -> anyhow::Result<()> {
     let ctx = Arc::new(Ctx::new(cfg).await?);
+    // R-P5P9-86: the live run (never the referee, which reads the logs) rotates the past
+    // days' diff logs at start and at each day roll.
+    ctx.rotate_logs();
     if let Some(bind) = ctx.cfg.metrics_bind.clone() {
         let m = ctx.metrics.clone();
         tokio::spawn(async move {

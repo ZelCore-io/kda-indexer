@@ -409,3 +409,79 @@ async fn e3b_the_harness_records_its_assets_at_start() {
     let got = ctx.summary.lock().unwrap().assets.clone();
     assert_eq!(got.into_iter().collect::<Vec<_>>(), vec![want]);
 }
+
+/// R-P5P9-86 (diff log volume): the past days' diff logs rotate to zstd. Every record is
+/// kept (the rotated file decompresses to the raw bytes, and the referee reads all of its
+/// records), the day's bytes are recorded in its summary, today's log stays as it is, and
+/// `kda-compare summary` prints the bytes per day from the rotated files.
+#[tokio::test]
+async fn e3b_diff_logs_rotate_daily_and_keep_every_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = |i: u64| {
+        let mut r = e2_stored(
+            "QH7",
+            json!({"accountName": "s"}),
+            json!({}),
+            json!({}),
+            vec![],
+        );
+        r.request = format!("QH7 {{\"n\": {i}}}");
+        serde_json::to_string(&r.bounded()).unwrap()
+    };
+    let old: String = (0..300).map(|i| rec(i) + "\n").collect();
+    std::fs::write(dir.path().join("diffs-2026-11-14.jsonl"), &old).unwrap();
+    std::fs::write(dir.path().join("diffs-2026-11-15.jsonl"), rec(7) + "\n").unwrap();
+    let days = crate::report::rotate_logs(dir.path(), "2026-11-15").unwrap();
+    assert_eq!(days.len(), 1);
+    assert_eq!(
+        (days[0].0.as_str(), days[0].1),
+        ("2026-11-14", old.len() as u64)
+    );
+    assert!(days[0].2 < days[0].1, "{days:?}");
+    assert!(!dir.path().join("diffs-2026-11-14.jsonl").exists());
+    assert!(dir.path().join("diffs-2026-11-15.jsonl").exists());
+    let zst = dir.path().join("diffs-2026-11-14.jsonl.zst");
+    let back = zstd::decode_all(std::fs::read(&zst).unwrap().as_slice()).unwrap();
+    assert_eq!(back, old.as_bytes());
+    let day: crate::report::DailySummary =
+        serde_json::from_slice(&std::fs::read(dir.path().join("summary-2026-11-14.json")).unwrap())
+            .unwrap();
+    assert_eq!(day.diff_log_bytes["raw"], old.len() as u64);
+    assert_eq!(day.diff_log_bytes["zst"], days[0].2);
+    // The referee reads the rotated file's every record.
+    let nu = node_server(NodeMock::default()).await;
+    let ops = c3_ops(dir.path());
+    let cfg = c3_cfg(&nu, &nu, &nu, dir.path(), &ops, "");
+    for log in [zst, dir.path().join("diffs-2026-11-14.jsonl")] {
+        // The rotated file, and the raw name the re-run's command line gives.
+        let opts = crate::referee::Opts {
+            logs: vec![log],
+            max_reads: 10,
+            rps: 100,
+        };
+        let rep = crate::referee::run(cfg.clone(), &opts).await.unwrap();
+        assert_eq!(rep.records, 300, "{rep:?}");
+    }
+    // The referee's start rotates nothing (today's log is read in place).
+    assert!(dir.path().join("diffs-2026-11-15.jsonl").exists());
+    // The summary prints the bytes per day from the rotated files.
+    let (text, _) =
+        crate::summary::run_text(dir.path(), "2026-11-14T00:00:00Z", "must", "small").unwrap();
+    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1e6);
+    assert!(
+        text.contains(&format!(
+            "  2026-11-14: raw {}, zst {}",
+            mb(days[0].1),
+            mb(days[0].2)
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("  2026-11-15: raw 0.0 MB, not rotated"),
+        "{text}"
+    );
+    // Nothing more to rotate.
+    assert!(crate::report::rotate_logs(dir.path(), "2026-11-15")
+        .unwrap()
+        .is_empty());
+}

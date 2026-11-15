@@ -321,6 +321,84 @@ impl DiffLog {
     }
 }
 
+/// R-P5P9-86 (diff log volume): compresses every `diffs-<date>.jsonl` in `out_dir` dated
+/// before `today` to `diffs-<date>.jsonl.zst`, and records that day's bytes (`raw`, `zst`) in
+/// its summary file (`diff_log_bytes`). Every record is kept: the compressed file is written
+/// whole, read back and checked equal to the raw file before the raw file is removed (a
+/// failed check keeps the raw file and is an error). Returns (date, raw, zst) per rotated day.
+pub fn rotate_logs(out_dir: &Path, today: &str) -> anyhow::Result<Vec<(String, u64, u64)>> {
+    let mut days: Vec<(String, PathBuf)> = std::fs::read_dir(out_dir)
+        .with_context(|| format!("reading {}", out_dir.display()))?
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let date = name.strip_prefix("diffs-")?.strip_suffix(".jsonl")?;
+            (date.len() == 10 && date < today).then(|| (date.to_string(), e.path()))
+        })
+        .collect();
+    days.sort();
+    let mut out = Vec::new();
+    for (date, raw_path) in days {
+        let raw =
+            std::fs::read(&raw_path).with_context(|| format!("reading {}", raw_path.display()))?;
+        let zst = zstd::encode_all(raw.as_slice(), 9)?;
+        let back = zstd::decode_all(zst.as_slice())?;
+        anyhow::ensure!(
+            back == raw,
+            "{}: the compressed log does not read back",
+            date
+        );
+        let zst_path = out_dir.join(format!("diffs-{date}.jsonl.zst"));
+        let tmp = out_dir.join(format!("diffs-{date}.jsonl.zst.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&zst)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &zst_path)?;
+        anyhow::ensure!(
+            zstd::decode_all(std::fs::read(&zst_path)?.as_slice())? == raw,
+            "{}: the written compressed log does not read back",
+            zst_path.display()
+        );
+        std::fs::remove_file(&raw_path)?;
+        let sum_path = out_dir.join(format!("summary-{date}.json"));
+        let mut day: DailySummary = std::fs::read(&sum_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_else(|| DailySummary {
+                date: date.clone(),
+                ..Default::default()
+            });
+        day.diff_log_bytes = [
+            ("raw".to_string(), raw.len() as u64),
+            ("zst".to_string(), zst.len() as u64),
+        ]
+        .into_iter()
+        .collect();
+        std::fs::write(&sum_path, serde_json::to_vec_pretty(&day)?)?;
+        out.push((date, raw.len() as u64, zst.len() as u64));
+    }
+    Ok(out)
+}
+
+/// A diff log's lines, from `diffs-<date>.jsonl` or its rotated `diffs-<date>.jsonl.zst`
+/// (also when the `.jsonl` named has been rotated since).
+pub fn open_log(path: &Path) -> anyhow::Result<Box<dyn std::io::BufRead>> {
+    let rotated = PathBuf::from(format!("{}.zst", path.display()));
+    let path = if !path.exists() && rotated.exists() {
+        rotated.as_path()
+    } else {
+        path
+    };
+    let f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(if path.extension().is_some_and(|x| x == "zst") {
+        Box::new(std::io::BufReader::new(zstd::Decoder::new(f)?))
+    } else {
+        Box::new(std::io::BufReader::new(f))
+    })
+}
+
 /// Counts per route and class for one UTC day.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DailySummary {
@@ -353,6 +431,10 @@ pub struct DailySummary {
     /// ([`crate::assets::assets_line`]).
     #[serde(default)]
     pub assets: std::collections::BTreeSet<String>,
+    /// R-P5P9-86: this day's diff log bytes, `raw` and `zst`, recorded when it is rotated
+    /// ([`rotate_logs`]).
+    #[serde(default)]
+    pub diff_log_bytes: BTreeMap<String, u64>,
 }
 
 /// Seconds per `DailySummary.windows` bucket.

@@ -136,8 +136,8 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
         rep.still_unexplained.push(v);
     };
     for path in &opts.logs {
-        let f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut reader = std::io::BufReader::new(f);
+        // R-P5P9-86: a rotated log (`.jsonl.zst`) reads as its raw lines.
+        let mut reader = crate::report::open_log(path)?;
         let mut buf = Vec::new();
         let mut n = 0;
         loop {
