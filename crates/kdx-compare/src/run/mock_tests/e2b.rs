@@ -754,3 +754,50 @@ async fn e3_tc_the_oracle_counts_the_walked_rows_heights() {
         }
     }
 }
+
+/// R-P5P9-92 (9): the referee's `--max-reads` covers ours' and the oracle's reads too. #243's
+/// stored record with a cap of 2 reads (one is the chain graph at the start): the walk
+/// reads ours' page, then stops before the oracle's with its own reason, unexplained. With
+/// the default cap the same record is explained.
+#[tokio::test]
+async fn e3_tc_the_referee_walk_stops_at_the_read_cap() {
+    for (max_reads, explained) in [(2usize, false), (200, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(tc_node()).await;
+        let au = ours_fn_server(walk_reply("transfers", vec![tc_row("t2", Some("B100"))], 1)).await;
+        let walk_b = vec![tc_row("t2", Some("B100")), tc_row("q", Some("X100"))];
+        let bu = ours_fn_server(walk_reply("transfers", walk_b, 2)).await;
+        let ops = c3_ops(dir.path());
+        let cfg = c3_cfg(&nu, &au, &bu, dir.path(), &ops, "");
+        let count = DiffEntry {
+            path: "/data/transfers/totalCount".into(),
+            kind: DiffKind::Changed,
+            a: Some(json!(1)),
+            b: Some(json!(2)),
+        };
+        let rec = e2_stored(
+            "QH7",
+            json!({"accountName": "s", "first": 1}),
+            tc_page(vec![tc_row("t2", Some("B100"))], 1),
+            tc_page(vec![tc_row("t2", Some("B100"))], 2),
+            vec![count],
+        );
+        let log = dir.path().join("diffs-cap.jsonl");
+        std::fs::write(&log, serde_json::to_string(&rec.bounded()).unwrap() + "\n").unwrap();
+        let opts = crate::referee::Opts {
+            logs: vec![log],
+            max_reads,
+            rps: 10,
+        };
+        let rep = crate::referee::run(cfg, &opts).await.unwrap();
+        assert_eq!(rep.explained == 1, explained, "{rep:?}");
+        if !explained {
+            assert_eq!(rep.unexplained, 1, "{rep:?}");
+            let v = serde_json::to_string(&rep.still_unexplained).unwrap();
+            assert!(
+                v.contains("count walk stopped: the run's read cap is reached"),
+                "{v}"
+            );
+        }
+    }
+}

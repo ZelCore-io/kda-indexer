@@ -4342,6 +4342,19 @@ impl Ctx {
         let mut out: Vec<Value> = Vec::new();
         let mut after: Option<String> = None;
         loop {
+            // R-P5P9-92 (9): each page of ours' or the oracle's is one read of the run's
+            // budget (the referee's `--max-reads`; unbounded live), its own reason past it.
+            if !self.gql.take_node_read() {
+                return Err((
+                    true,
+                    format!(
+                        "count walk stopped: the run's read cap is reached before {} was \
+                         walked ({} rows read)",
+                        t.name,
+                        out.len()
+                    ),
+                ));
+            }
             let mut v = vars.clone();
             v.insert(first_var.into(), json!(OURS_PAGE_CAP));
             match &after {

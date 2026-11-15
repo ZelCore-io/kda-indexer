@@ -112,6 +112,12 @@ struct Settled {
 pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> {
     // The node client's own limiter paces every read.
     cfg.node_max_rps = opts.rps.max(1);
+    // R-P5P9-92 (9): ours' and the oracle's reads (the count walk's pages) are paced at the
+    // same rate at most, and each takes one read of `max_reads`.
+    for t in cfg.targets.values_mut() {
+        let cap = f64::from(opts.rps.max(1));
+        t.rate_rps = Some(t.rate_rps.map_or(cap, |r| r.min(cap)));
+    }
     let ctx = Ctx::new(cfg).await?;
     // `Ctx::new` read the node's chain graph: one read of the cap (R-P5P9-64 M-8).
     ctx.gql
