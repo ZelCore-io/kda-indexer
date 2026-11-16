@@ -94,3 +94,83 @@ async fn h2_m_ours_listed_at_the_nodes_height_without_a_hash() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// W #567
+
+/// W #567's node: w's transaction in B100 at 100 holds TRANSFER events at [0, 1, 4, 5]; the
+/// row is the third of them (event 4, the oracle's 2). B100 is the only block at 100, so
+/// the oracle's extra row q in X100 is an orphan by block.
+fn w_node() -> NodeMock {
+    let mut node = NodeMock::default();
+    let t = |to: &str, amount: f64| json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", to, amount]});
+    let other = json!({"name": "OTHER", "module": {"name": "coin"}, "params": []});
+    let events = json!([
+        t("g0", 0.1),
+        t("g1", 0.2),
+        other,
+        other,
+        t("r", 1.5),
+        t("g5", 0.3)
+    ]);
+    let (k, v) = h7_poll("w", "B100", 100, events);
+    node.polls.insert(k, v);
+    node.headers.insert(
+        (0, 100),
+        vec![json!({"hash": "B100", "height": 100, "payloadHash": "P100", "chainId": 0})],
+    );
+    let cb = json!({"reqKey": "cb100", "events": []}).to_string();
+    node.payloads.insert(
+        "P100".into(),
+        json!({"coinbase": kdx_types::hash::b64url_encode(cb.as_bytes())}),
+    );
+    node
+}
+
+/// An indexed transfer row (QTransfersByAccount's identity) of w, s → r 1.5, at `i`.
+fn w_row(rk: &str, block: &str, i: i64) -> Value {
+    let mut e = h7_xrow(rk, 100, json!(1.5), Some(("s", "r")));
+    e["node"]["blockHash"] = json!(block);
+    e["node"]["orderIndex"] = json!(i);
+    e
+}
+
+fn w_page(rows: Vec<Value>, count: u64) -> Value {
+    json!({"data": {"transfers": {"totalCount": count,
+        "pageInfo": {"hasNextPage": false}, "edges": rows}}})
+}
+
+/// R-P5P9-97 W #567: the count walk takes H8's mapped index. The oracle numbers w's
+/// transfer 2 (its rank among the node's TRANSFER events), ours 4 (the node's event index).
+/// H8 maps the first page's row, and now the walk's rows too, so the walk's one-sided rows
+/// are the oracle's orphan alone and the counts differ by it. When the oracle's rank does not
+/// hold the row's content on the node, the row stays unmapped and the record unexplained.
+#[tokio::test]
+async fn h2_w_the_count_walk_takes_h8s_mapped_index() {
+    for (rank, explained) in [(2, true), (3, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(w_node()).await;
+        let ours = vec![w_row("w", "B100", 4)];
+        let oracle = vec![w_row("w", "B100", rank), w_row("q", "X100", 0)];
+        let au = ours_fn_server(super::e2b::walk_reply("transfers", ours.clone(), 1)).await;
+        let bu = ours_fn_server(super::e2b::walk_reply("transfers", oracle.clone(), 2)).await;
+        let ops = c3_ops(dir.path());
+        let cfg = c3_cfg(&nu, &au, &bu, dir.path(), &ops, "");
+        let count = DiffEntry {
+            path: "/data/transfers/totalCount".into(),
+            kind: DiffKind::Changed,
+            a: Some(json!(1)),
+            b: Some(json!(2)),
+        };
+        let rec = e2_stored(
+            "QH7",
+            json!({"accountName": "s", "first": 1}),
+            w_page(ours, 1),
+            w_page(vec![oracle[0].clone()], 2),
+            vec![count],
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        let want = if explained { (1, 0) } else { (0, 1) };
+        assert_eq!((rep.explained, rep.unexplained), want, "{rank}: {rep:?}");
+    }
+}

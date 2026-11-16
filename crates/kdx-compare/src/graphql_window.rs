@@ -4463,6 +4463,9 @@ impl Ctx {
             ms: vec![0],
         };
         let (mut a, mut b) = (page(wa_below, na), page(wb, nb));
+        // R-P5P9-97 W #567: H8 first, as on the first page, so H7 matches the oracle's walked
+        // transfer rows at the node's indexes (its hit is the first page's to show).
+        let _ = self.gql_transfer_order(ta, &a, &mut b, st).await;
         let (h7, h7_note) = self
             .gql_window_referee(ta, Some(op), vars, &mut a, &mut b, max, false, st)
             .await;
