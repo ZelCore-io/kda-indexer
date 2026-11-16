@@ -81,7 +81,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     let api = {
         let store = Arc::new(kdx_api::Store::open(hot.clone(), &data_dir)?);
         let api = super::serve::api(cfg, store, tips.clone(), &data_dir)?
-            .on_bound(|| super::notify::ready("api bound, starting"));
+            .on_bound(|_| super::notify::ready("api bound, starting"));
         let binds = cfg.api.binds()?;
         let stop = token.clone();
         super::serve::spawn_tip_poll(cfg, tips.clone(), token.clone());

@@ -90,6 +90,22 @@ binds `127.0.0.1`:
 | `api.graphql` | `127.0.0.1:31363` | GraphQL (`/graphql`, Kadena graph schema); limits in `[graphql]`, see `graphql.md` |
 | `api.admin` | `127.0.0.1:31369` | `/healthz`, `/readyz`, `/status`, `/metrics`; loopback or private only |
 
+Each `api.*` listener takes one address or an array of addresses, and binds every one of
+them (all or nothing: if one address cannot be bound, the service does not start). Behind a
+load balancer, keep loopback and add the host's private LAN address, so local tools keep
+working and the balancer reaches the host over the LAN only:
+
+```toml
+[api]
+compat = ["127.0.0.1:31362", "<private-lan-ip>:31362"]
+admin = ["127.0.0.1:31369", "<private-lan-ip>:31369"]      # the balancer's /readyz check
+trusted_proxies = ["<balancer-private-ip>/32"]
+```
+
+`config check` refuses an empty list, an address listed twice, a public address on `native`
+or `admin`, and `0.0.0.0` (or `[::]`) next to another address on the same port. See
+[load-balancer.md](load-balancer.md) for the balancer side.
+
 All keys, with their defaults, are in `/usr/share/doc/kda-indexer/examples/mainnet01.toml.example`.
 The config is a conffile: `dpkg` keeps your edits on upgrade.
 
