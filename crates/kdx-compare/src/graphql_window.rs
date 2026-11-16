@@ -4605,7 +4605,7 @@ impl Ctx {
                                 // R-P5P9-105 (G): both cut at the same length: ours the
                                 // node's block's first rows in reverse (or forward) order,
                                 // the oracle's rows distinct txs of the block.
-                                if let Some(m) = c["cutBoth"].as_object() {
+                                if let Some(m) = c.get("cutBoth").and_then(Value::as_object) {
                                     let side = |s: &str| {
                                         m.get(s)
                                             .and_then(Value::as_array)

@@ -364,8 +364,8 @@ fn prefix_candidate(
     )
 }
 
-/// R-P5P9-105 (G, #70's shape): both sides cut the block's nested `transactions` at the same
-/// length, under the same `totalCount`, and every row selects only its `cmd` (or a key and
+/// R-P5P9-105 (G, #70's shape): both sides cut the block's nested `transactions` (which
+/// selects no `pageInfo`) at the same length, under the same `totalCount`, and every row selects only its `cmd` (or a key and
 /// `__typename`). The candidate (`cutBoth`) is settled on the node by
 /// [`crate::graphql_window`]'s prefix check: the block holds `totalCount` txs, ours' rows are
 /// the first rows of the node's payload in reverse order (or forward), and the oracle's rows
@@ -382,6 +382,11 @@ fn both_cut_candidate(
         c.get("totalCount")
             .and_then(crate::graphql_norm::decimal_value)
     };
+    // Only a list that selects no `pageInfo` (#70's shape): a list with a cursor is H6's to
+    // page to its end, and a page of ours that fails there stays a defect of ours.
+    if ca.get("pageInfo").is_some() || cb.get("pageInfo").is_some() {
+        return None;
+    }
     let t = total(ca)?;
     if total(cb) != Some(t.clone()) {
         return None;
@@ -412,12 +417,24 @@ fn both_cut_candidate(
     )
 }
 
+/// A raw root row and its nested list ([`raw_list`]).
+type RawList<'v> = (&'v Value, &'v Value);
+
 /// R-P5P9-88 (G): a root row's block (chainId as text, hash), read the same way on a raw and
 /// a normalized body (normalization rewrites numbers, so the height is read on the raw row).
 fn block_key(e: &Value) -> Option<(String, String)> {
     let n = e.get("node")?;
-    // R-P5P9-105: a JSON number chain is `#<digits>e<exp>` once normalized; both read as the
-    // same exact decimal.
+    let chain = match n.get("chainId")? {
+        Value::String(c) => c.clone(),
+        c => c.as_u64()?.to_string(),
+    };
+    Some((chain, n.get("hash")?.as_str()?.to_string()))
+}
+
+/// R-P5P9-105 (G): [`block_key`] with a JSON number chain, which is `#<digits>e<exp>` once
+/// normalized; both read as the same exact decimal. Used only for the `cutBoth` candidate.
+fn block_key_num(e: &Value) -> Option<(String, String)> {
+    let n = e.get("node")?;
     let chain = match crate::graphql_norm::decimal_value(n.get("chainId")?) {
         Some((neg, d, x)) => format!("{neg}:{}:{x}", d.trim_start_matches('0')),
         None => n.get("chainId")?.as_str()?.to_string(),
@@ -433,10 +450,11 @@ fn raw_list<'v>(
     parent: &str,
     p: &str,
     id: &(String, String),
+    key: fn(&Value) -> Option<(String, String)>,
 ) -> Option<(&'v Value, &'v Value)> {
     let (list, _) = parent.rsplit_once('/')?;
     let rows = raw.pointer(list)?.as_array()?;
-    let row = rows.iter().find(|e| block_key(e).as_ref() == Some(id))?;
+    let row = rows.iter().find(|e| key(e).as_ref() == Some(id))?;
     Some((row, row.pointer(p.strip_prefix(parent)?)?))
 }
 
@@ -535,15 +553,22 @@ pub fn unkeyed_nested_with(
         // R-P5P9-88 (G): the oracle's cut list is ours' complete list's prefix of the same
         // length, in order, under the same block: a candidate the node settles (ours' rows
         // against the node's payload for that block), else it stays unfinished.
-        let raw_lists = raw.and_then(|(ra, rb)| {
-            let id = a.pointer(&parent).and_then(block_key)?;
-            Some((
-                raw_list(ra, &parent, p, &id)?,
-                raw_list(rb, &parent, p, &id)?,
-            ))
+        let lists_by = |key: fn(&Value) -> Option<(String, String)>| {
+            raw.and_then(|(ra, rb)| {
+                let id = a.pointer(&parent).and_then(key)?;
+                Some((
+                    raw_list(ra, &parent, p, &id, key)?,
+                    raw_list(rb, &parent, p, &id, key)?,
+                ))
+            })
+        };
+        let cand = |rl: Option<(RawList, RawList)>| {
+            rl.and_then(|((pa, xa), (_, xb))| prefix_candidate(p, xa, xb, Some(pa), rules))
+        };
+        // R-P5P9-105 (G): a numeric chain finds the raw list for a `cutBoth` candidate only.
+        let candidate = cand(lists_by(block_key)).or_else(|| {
+            cand(lists_by(block_key_num)).filter(|c| c.pointer("/prefix/cutBoth").is_some())
         });
-        let candidate =
-            raw_lists.and_then(|((pa, xa), (_, xb))| prefix_candidate(p, xa, xb, Some(pa), rules));
         if in_scope
             && candidate
                 .as_ref()

@@ -3300,9 +3300,13 @@ rate_rps = 1000.0
     for h in ["FAIL", "REP"] {
         let (n, limit, d) = run(&ctx, &op, src, &[(h, 147)]).await;
         assert_eq!((n, limit), (0, vec![UNFINISHED_PATH.to_string()]), "{h}");
+        // R-P5P9-105 (G): both cut pages (no `pageInfo`) are now G's `cutBoth` candidate, an
+        // unfinished entry until the node settles it; H6's own unfinished entry stays.
         assert!(
-            d.iter()
-                .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")),
+            d.iter().any(|p| {
+                p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")
+                    || p == UNFINISHED_PATH
+            }),
             "{h}: {d:?}"
         );
     }
@@ -3312,9 +3316,12 @@ rate_rps = 1000.0
     for h in ["DEAD", "TW"] {
         let (n, limit, d) = run(&ctx, &op, src, &[(h, 147)]).await;
         assert_eq!((n, limit), (0, vec![UNFINISHED_PATH.to_string()]), "{h}");
+        // R-P5P9-105 (G): or G's `cutBoth` unfinished entry, as above.
         assert!(
-            d.iter()
-                .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")),
+            d.iter().any(|p| {
+                p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")
+                    || p == UNFINISHED_PATH
+            }),
             "{h}: {d:?}"
         );
     }
