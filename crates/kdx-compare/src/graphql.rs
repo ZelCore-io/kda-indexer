@@ -1858,7 +1858,14 @@ impl Ctx {
         st: &mut crate::graphql_window::Reads,
     ) -> (Vec<DiffEntry>, Option<String>) {
         // H8 first: the oracle's transfer rows take the node's indexes, so H7 matches them.
-        let h8 = self.gql_transfer_order(ta, a, b, st).await;
+        let mut h8: Vec<DiffEntry> = self
+            .gql_transfer_order(ta, a, b, st)
+            .await
+            .into_iter()
+            .collect();
+        // R-P5P9-105 (H8 in H7): H7's window pass takes H8's mapping for every oracle row,
+        // not only the keys the first pass read; rows mapped already are held and not read.
+        h8.extend(self.gql_transfer_order_keys(ta, a, b, st, usize::MAX).await);
         let data = self.gql_payload_data(vars, a, b, st).await;
         // R-P5P9-75 O: H8 on nested transfer lists; J, K, L: tx fields against the node's
         // command.

@@ -5777,6 +5777,21 @@ impl Ctx {
         b: &mut Answer,
         st: &mut Reads,
     ) -> Option<DiffEntry> {
+        self.gql_transfer_order_keys(ta, a, b, st, ORDER_INDEX_READS)
+            .await
+    }
+
+    /// [`Ctx::gql_transfer_order`] over at most `cap` request keys. R-P5P9-105 (H8 in H7):
+    /// H7's window pass maps every oracle row (`usize::MAX`), each read within the
+    /// compare's node cap and the run's budget.
+    pub(crate) async fn gql_transfer_order_keys(
+        &self,
+        ta: &Target,
+        a: &Answer,
+        b: &mut Answer,
+        st: &mut Reads,
+        cap: usize,
+    ) -> Option<DiffEntry> {
         let mut da = a.body.get("data")?.clone();
         let ca = crate::graphql::root_connection(&mut da)?;
         let transfer = |e: &Value| {
@@ -5809,7 +5824,7 @@ impl Ctx {
         }
         let mut evidence = Vec::new();
         let mut reads = 0;
-        for (rk, id) in keys.into_iter().take(ORDER_INDEX_READS) {
+        for (rk, id) in keys.into_iter().take(cap) {
             let chain = match id.chain {
                 Some(c) => Some(c),
                 None => self.h7_chain(ta, &id, st).await,

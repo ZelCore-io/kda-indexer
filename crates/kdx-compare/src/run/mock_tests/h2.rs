@@ -175,6 +175,66 @@ async fn h2_w_the_count_walk_takes_h8s_mapped_index() {
     }
 }
 
+/// R-P5P9-105 (H8 in H7, #567's shape): H8's mapping applies to every oracle row of H7's
+/// window pass, not only to the keys H8's first pass reads ([`ORDER_INDEX_READS`] of them).
+/// 21 keys, each with the node's TRANSFER indexes [0, 1, 4, 5]: ours numbers each row 4,
+/// the oracle 2 (its rank). Every row is mapped 2 → 4 → explained. When the last key's
+/// oracle rank (3) is not the node's TRANSFER with the row's content, it stays unmapped →
+/// unexplained.
+///
+/// [`ORDER_INDEX_READS`]: crate::graphql_window::ORDER_INDEX_READS
+#[tokio::test]
+async fn i_w_h8s_mapping_applies_to_every_oracle_row_in_h7() {
+    let n = crate::graphql_window::ORDER_INDEX_READS + 1;
+    let keys: Vec<String> = (0..n).map(|i| format!("w{i:02}")).collect();
+    for (last, explained) in [(2i64, true), (3, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = w_node();
+        let w = node.polls["w"].clone();
+        for k in &keys {
+            let mut p = w.clone();
+            p.1["reqKey"] = json!(k);
+            node.polls.insert(k.clone(), p);
+        }
+        let nu = node_server(node).await;
+        let ours: Vec<Value> = keys.iter().map(|k| w_row(k, "B100", 4)).collect();
+        let oracle: Vec<Value> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| w_row(k, "B100", if i == n - 1 { last } else { 2 }))
+            .collect();
+        let ops = c3_ops(dir.path());
+        let cfg = c3_cfg(
+            &nu,
+            "http://127.0.0.1:9/graphql",
+            "http://127.0.0.1:9/graphql",
+            dir.path(),
+            &ops,
+            "",
+        );
+        let diff = oracle
+            .iter()
+            .enumerate()
+            .map(|(i, o)| DiffEntry {
+                path: format!("/data/transfers/edges/{i}/node/orderIndex"),
+                kind: DiffKind::Changed,
+                a: Some(json!(4)),
+                b: Some(o["node"]["orderIndex"].clone()),
+            })
+            .collect();
+        let rec = e2_stored(
+            "QH7",
+            json!({"accountName": "s", "first": 100}),
+            w_page(ours, n as u64),
+            w_page(oracle, n as u64),
+            diff,
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        let want = if explained { (1, 0) } else { (0, 1) };
+        assert_eq!((rep.explained, rep.unexplained), want, "{last}: {rep:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // T #332
 
