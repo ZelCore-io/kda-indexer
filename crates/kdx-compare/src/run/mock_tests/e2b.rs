@@ -760,12 +760,21 @@ async fn i_g_a_height_range_root_without_first_runs_the_g_arm() {
     };
     let fwd: Vec<String> = (0..126).map(|i| format!("{i}e-8")).collect();
     let rev: Vec<String> = fwd.iter().rev().cloned().collect();
-    let ours = page(rev[..20].to_vec());
     let mut stray = fwd[..20].to_vec();
     stray[7] = "999e-8".into();
-    for (oracle, explained) in [(fwd[..20].to_vec(), 1usize), (stray, 0)] {
+    // Review M2: ours' rows out of the node's block order, and a node block of another count.
+    let mut swapped = rev[..20].to_vec();
+    swapped.swap(0, 1);
+    for (mine, oracle, node_n, explained) in [
+        (rev[..20].to_vec(), fwd[..20].to_vec(), 126, 1usize),
+        (rev[..20].to_vec(), stray, 126, 0),
+        (swapped, fwd[..20].to_vec(), 126, 0),
+        (rev[..20].to_vec(), fwd[..20].to_vec(), 127, 0),
+    ] {
+        let ours = page(mine.clone());
+        let rev = mine;
         let dir = tempfile::tempdir().unwrap();
-        let nu = node_server(g_node(126)).await;
+        let nu = node_server(g_node(node_n)).await;
         let ops = dir.path().join("ops");
         std::fs::create_dir_all(&ops).unwrap();
         std::fs::write(
@@ -794,11 +803,64 @@ async fn i_g_a_height_range_root_without_first_runs_the_g_arm() {
             diff,
         );
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!(rep.explained, explained, "{explained}: {rep:?}");
+        assert_eq!(rep.explained, explained, "{node_n} {explained}: {rep:?}");
         if explained == 1 {
             assert_eq!(rep.by_class.get("graphql-h6-prefix"), Some(&1), "{rep:?}");
         }
     }
+}
+
+/// Review B1 (R-P5P9-105 G): the `cutBoth` arm explains only rows that select neither `hash`
+/// nor `requestKey`. #70's shape with `requestKey` selected and ours' keys wrong (the node's
+/// block holds `rk{i}`) is not explained by it: it carries no node check of the keys. The
+/// keys sort as ours' rows are ordered, so the row order is the node's either way.
+#[tokio::test]
+async fn i_g_b_cut_both_rows_that_select_a_key_are_not_explained() {
+    let rows = |prices: &[String], key: &dyn Fn(usize) -> String| -> Value {
+        let txs: Vec<Value> = prices
+            .iter()
+            .enumerate()
+            .map(|(i, p)| json!({"node": {"requestKey": key(i), "cmd": {"meta": {"gasPrice": p}}}}))
+            .collect();
+        json!({"data": {"blocksFromHeight": {"edges": [{"node": {"chainId": 0,
+            "creationTime": "2026-11-15T09:00:00Z", "height": 58, "hash": "H0",
+            "canonical": true, "transactions": {"totalCount": 126, "edges": txs}}}]}}})
+    };
+    let fwd: Vec<String> = (0..126).map(|i| format!("{i}e-8")).collect();
+    let rev: Vec<String> = fwd.iter().rev().cloned().collect();
+    let ours = rows(&rev[..20], &|i| format!("w{i:03}"));
+    let oracle = rows(&fwd[..20], &|i| format!("rk{i}"));
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(g_node(126)).await;
+    let ops = dir.path().join("ops");
+    std::fs::create_dir_all(&ops).unwrap();
+    std::fs::write(
+        ops.join("QG70K.graphql"),
+        "# kdx: oracle\nquery QG70K($s: Int!, $e: Int) { blocksFromHeight(startHeight: $s, \
+         endHeight: $e) { edges { node { chainId creationTime height hash canonical \
+         transactions { totalCount edges { node { requestKey cmd { meta { gasPrice } } } } } } } } }\n",
+    )
+    .unwrap();
+    let cfg = c3_cfg(&nu, &nu, &nu, dir.path(), &ops, "");
+    let base = "/data/blocksFromHeight/edges/0/node/transactions/edges";
+    let mut diff = Vec::new();
+    for i in 0..20 {
+        diff.push(DiffEntry {
+            path: format!("{base}/{i}/node/requestKey"),
+            kind: DiffKind::Changed,
+            a: Some(json!(format!("w{i:03}"))),
+            b: Some(json!(format!("rk{i}"))),
+        });
+        diff.push(DiffEntry {
+            path: format!("{base}/{i}/node/cmd/meta/gasPrice"),
+            kind: DiffKind::Changed,
+            a: Some(json!(rev[i])),
+            b: Some(json!(fwd[i])),
+        });
+    }
+    let rec = e2_stored("QG70K", json!({"s": 58, "e": 58}), ours, oracle, diff);
+    let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
 }
 
 // R-P5P9-92 (1)'s distinct-heights form is replaced by R-P5P9-93's window form:

@@ -2243,8 +2243,9 @@ impl Ctx {
     /// R-P5P9-97 Q #37: when the oracle repeats non-fungible chain rows that ours lists once
     /// ([`crate::graphql_norm::oracle_chain_dupes`]), each repeated row is confirmed on the
     /// node: of the tokens ours lists for the account on that chain (at most 3), marmalade-v2's
-    /// `get-balance` on the node, or else marmalade v1's (R-P5P9-105 Q), is above zero for one. When every one is confirmed, the
-    /// oracle's list keeps one copy of each row, in its order. Any failed read leaves it.
+    /// `get-balance` on the node, or else marmalade v1's (R-P5P9-105 Q), is above zero for one.
+    /// When every one is confirmed, the oracle's list keeps one copy of each row, in its
+    /// order. Any failed read leaves it.
     /// Review B1: each node read is one of the run's budget (the referee's `--max-reads`;
     /// unbounded live); spent, the rows stay and the note names the cap.
     /// Returns whether the copies left, and the cap's note when it was reached.

@@ -3261,9 +3261,21 @@ rate_rps = 1000.0
         (
             n,
             entries.into_iter().map(|e| e.path).collect(),
-            d.into_iter().map(|e| e.path).collect(),
+            // Review M1: G's `cutBoth` entry (`b: None` at the unfinished path) is named, so
+            // a test can tell it from H6's own entry at the same path.
+            d.into_iter()
+                .map(|e| match e.path.as_str() {
+                    UNFINISHED_PATH
+                        if e.b.is_none() && format!("{:?}", e.a).contains("cutBoth") =>
+                    {
+                        CUT_BOTH.to_string()
+                    }
+                    _ => e.path,
+                })
+                .collect(),
         )
     }
+    const CUT_BOTH: &str = "/~graphql-h6-unfinished#cutBoth";
     let src = (&ours, &oracle);
     // The 147-tx shape in five cut blocks: every list finished, no diff.
     let five = [
@@ -3302,13 +3314,7 @@ rate_rps = 1000.0
         assert_eq!((n, limit), (0, vec![UNFINISHED_PATH.to_string()]), "{h}");
         // R-P5P9-105 (G): both cut pages (no `pageInfo`) are now G's `cutBoth` candidate, an
         // unfinished entry until the node settles it; H6's own unfinished entry stays.
-        assert!(
-            d.iter().any(|p| {
-                p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")
-                    || p == UNFINISHED_PATH
-            }),
-            "{h}: {d:?}"
-        );
+        assert!(d.iter().any(|p| p == CUT_BOTH), "{h}: {d:?}");
     }
     // The oracle cannot be paged to its end (DEAD: the retry fails too), or its paging gives
     // k3 twice (in place of k6, the same value): not finished, the cut pages stay a diff, and
@@ -3317,13 +3323,7 @@ rate_rps = 1000.0
         let (n, limit, d) = run(&ctx, &op, src, &[(h, 147)]).await;
         assert_eq!((n, limit), (0, vec![UNFINISHED_PATH.to_string()]), "{h}");
         // R-P5P9-105 (G): or G's `cutBoth` unfinished entry, as above.
-        assert!(
-            d.iter().any(|p| {
-                p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")
-                    || p == UNFINISHED_PATH
-            }),
-            "{h}: {d:?}"
-        );
+        assert!(d.iter().any(|p| p == CUT_BOTH), "{h}: {d:?}");
     }
     // Equal cut pages are no match without the full lists: the entry stays.
     let (n, limit, d) = run_with(&ctx, &op, src, &[("DEAD", 147)], true).await;
@@ -8488,6 +8488,13 @@ async fn i_s_the_gap_is_the_accounts_net_change_on_the_node() {
     no(&rep, "four blocks");
     let rep = s_referee(s_node(&[], &four), "10.0", "13.0").await;
     ok(&rep, "three of them");
+    // Review M2: credits at 98 and 101 (gap 2.0) are not consecutive blocks within 3.
+    let apart: Vec<(u64, Vec<Value>)> = [98, 101]
+        .iter()
+        .map(|h| (*h, vec![s_transfer("k:p", "k:m", json!(1.0))]))
+        .collect();
+    let rep = s_referee(s_node(&[], &apart), "10.0", "12.0").await;
+    no(&rep, "non-adjacent blocks");
 }
 
 /// R-P5P9-86 S′ with R-P5P9-87, stored: a CG-5 NodeBalance record (labelled `node`) is miner

@@ -365,8 +365,10 @@ fn prefix_candidate(
 }
 
 /// R-P5P9-105 (G, #70's shape): both sides cut the block's nested `transactions` (which
-/// selects no `pageInfo`) at the same length, under the same `totalCount`, and every row selects only its `cmd` (or a key and
-/// `__typename`). The candidate (`cutBoth`) is settled on the node by
+/// selects no `pageInfo`) at the same length, under the same `totalCount`, and every row
+/// selects only its `cmd` (and `__typename`). A row that selects `hash` or `requestKey` is no
+/// candidate (review B1): this arm checks no keys on the node, so such a list stays with the
+/// prefix arm, which does. The candidate (`cutBoth`) is settled on the node by
 /// [`crate::graphql_window`]'s prefix check: the block holds `totalCount` txs, ours' rows are
 /// the first rows of the node's payload in reverse order (or forward), and the oracle's rows
 /// are distinct txs of the block.
@@ -395,7 +397,7 @@ fn both_cut_candidate(
     let cmd_of = |e: &Value| -> Option<Value> {
         let n = e.get("node")?.as_object()?;
         let plain = n.iter().all(|(k, v)| match k.as_str() {
-            "hash" | "requestKey" | "cmd" => true,
+            "cmd" => true,
             "__typename" => v.as_str() == Some("Transaction"),
             _ => false,
         });
@@ -1313,5 +1315,39 @@ mod tests {
         // Another length: nothing is set.
         let short = json!({"data": {"blocksFromHeight": {"edges": [{"node": {"hash": "H0"}}]}}});
         assert!(put_hashes(&mut body, "blocksFromHeight", &short).is_empty());
+    }
+
+    /// Review B1 (R-P5P9-105 G): `cutBoth` takes only rows that select neither `hash` nor
+    /// `requestKey` (#70's `cmd.meta.gasPrice`). A row that selects a key is not a candidate,
+    /// since the arm checks no keys on the node.
+    #[test]
+    fn both_cut_candidate_takes_only_rows_without_a_key() {
+        let list = |rows: Vec<Value>| json!({"totalCount": 126, "edges": rows});
+        let row = |extra: Value, price: &str| {
+            let mut n = json!({"cmd": {"meta": {"gasPrice": price}}});
+            n.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json!({"node": n})
+        };
+        let parent = json!({"node": {"chainId": 0, "height": 58, "hash": "H0"}});
+        let cand = |extra: &dyn Fn(usize) -> Value| {
+            let ra: Vec<Value> = (0..2).map(|i| row(extra(i), &format!("{i}e-8"))).collect();
+            let rb: Vec<Value> = (0..2).map(|i| row(extra(i), &format!("{i}e-8"))).collect();
+            both_cut_candidate(
+                "/data/blocksFromHeight/edges/0/node/transactions",
+                &list(ra.clone()),
+                &list(rb.clone()),
+                &ra,
+                &rb,
+                Some(&parent),
+            )
+        };
+        // #70's shape: only `cmd` (and a `__typename`).
+        assert!(cand(&|_| json!({})).is_some());
+        assert!(cand(&|_| json!({"__typename": "Transaction"})).is_some());
+        // A selected `requestKey` or `hash` (here a wrong one) is no `cutBoth` row.
+        assert!(cand(&|i| json!({"requestKey": format!("wrong{i}")})).is_none());
+        assert!(cand(&|i| json!({"hash": format!("wrong{i}")})).is_none());
     }
 }
