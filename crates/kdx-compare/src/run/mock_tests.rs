@@ -8357,6 +8357,132 @@ async fn e2_s_the_native_pair_rereads_a_gap_in_the_other_order() {
     assert!(ev.a.is_some(), "{ev:?}");
 }
 
+/// R-P5P9-105 S′'s node: chain 0 at heights 85..=110, block time 30 s apart (height 100 at
+/// the record's time). Each height's coinbase pays `k:m` 0.904046 when listed in `cb`, else
+/// `k:o`; `txs` gives a height's transactions' events.
+fn s_node(cb: &[u64], txs: &[(u64, Vec<Value>)]) -> NodeMock {
+    let base: u64 = 1_794_733_200;
+    let mut node = NodeMock {
+        tip: 110,
+        ..NodeMock::default()
+    };
+    let enc = |v: Value| kdx_types::hash::b64url_encode(v.to_string().as_bytes());
+    for h in 85..=110u64 {
+        let t = (base as i64 + (h as i64 - 100) * 30) as u64 * 1_000_000;
+        node.headers.insert(
+            (0, h),
+            vec![json!({"hash": format!("H{h}"), "height": h, "chainId": 0,
+                "creationTime": t, "payloadHash": format!("P{h}")})],
+        );
+        let miner = if cb.contains(&h) { "k:m" } else { "k:o" };
+        let coinbase = json!({"events": [s_transfer("", miner, json!(0.904046))]});
+        let outs: Vec<Value> = txs
+            .iter()
+            .filter(|(x, _)| *x == h)
+            .map(|(_, evs)| json!(["", enc(json!({"events": evs}))]))
+            .collect();
+        node.payloads.insert(
+            format!("P{h}"),
+            json!({"transactions": outs, "coinbase": enc(coinbase)}),
+        );
+    }
+    node
+}
+
+fn s_transfer(from: &str, to: &str, amount: Value) -> Value {
+    json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": [from, to, amount]})
+}
+
+/// The stored referee over one NodeBalance record of k:m on chain 0: ours' GraphQL `ours`
+/// (a JSON number, as stored), native `native`.
+async fn s_referee(node: NodeMock, ours: &str, native: &str) -> crate::referee::Report {
+    use crate::report::{DiffEntry, DiffKind};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(node).await;
+    let ops = c3_ops(dir.path());
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compare/graphql/NodeBalance.graphql"),
+        ops.join("NodeBalance.graphql"),
+    )
+    .unwrap();
+    let cfg = c3_cfg(
+        &nu,
+        "http://127.0.0.1:9/graphql",
+        "https://oracle.invalid/graphql",
+        dir.path(),
+        &ops,
+        "",
+    );
+    let mut r = e2_stored(
+        "NodeBalance",
+        json!({"accountName": "k:m"}),
+        Value::Null,
+        Value::Null,
+        vec![DiffEntry {
+            path: "/chain0/balance".into(),
+            kind: DiffKind::Changed,
+            a: Some(serde_json::from_str(ours).unwrap()),
+            b: Some(json!(native)),
+        }],
+    );
+    r.b_target = "node".into();
+    e2_referee(cfg, dir.path(), &[r]).await
+}
+
+/// R-P5P9-105 S′: the gap native − GraphQL is explained when it equals the account's net
+/// change on the node: the sum of its coin TRANSFER events in 1 to 3 consecutive canonical
+/// blocks of the record's height window, exact-decimal, with half an f64 ulp on ours' number.
+#[tokio::test]
+async fn i_s_the_gap_is_the_accounts_net_change_on_the_node() {
+    let ok = |rep: &crate::referee::Report, case: &str| {
+        assert_eq!((rep.explained, rep.unexplained), (1, 0), "{case}: {rep:?}");
+    };
+    let no = |rep: &crate::referee::Report, case: &str| {
+        assert_eq!((rep.explained, rep.unexplained), (0, 1), "{case}: {rep:?}");
+    };
+    // (a) #75: one coinbase + 1e-12, the f64 rounding of ours' 60263.91224935622.
+    let rep = s_referee(
+        s_node(&[100], &[]),
+        "60263.91224935622",
+        "60264.816295356221",
+    )
+    .await;
+    ok(&rep, "a");
+    // (b) a miner block: its coinbase and a fee of 1.08e-5 paid to k:m.
+    let fee = vec![(100, vec![s_transfer("k:p", "k:m", json!(0.0000108))])];
+    let rep = s_referee(s_node(&[100], &fee), "10.0", "10.9040568").await;
+    ok(&rep, "b");
+    // A residual of 1e-6 more: unexplained.
+    let rep = s_referee(s_node(&[100], &fee), "10.0", "10.9040578").await;
+    no(&rep, "b residual");
+    // (c) #1711: 25 rows in one block (the coinbase and 24 receive legs), gap
+    // 1,667.96549197 + the f64 rounding of ours' number.
+    let mut legs: Vec<Value> = (0..23)
+        .map(|_| s_transfer("", "k:m", json!(69.5)))
+        .collect();
+    legs.push(s_transfer("", "k:m", json!({"decimal": "68.56144597"})));
+    let rep = s_referee(
+        s_node(&[100], &[(100, legs)]),
+        "60263.91224935622",
+        "61931.877741326221",
+    )
+    .await;
+    ok(&rep, "c");
+    // (d) a negative gap equal to a debit of k:m.
+    let debit = vec![(100, vec![s_transfer("k:m", "k:x", json!(2.5))])];
+    let rep = s_referee(s_node(&[], &debit), "10.0", "7.5").await;
+    ok(&rep, "d");
+    // Credits of 1.0 in four consecutive blocks and a gap of 4.0: more than 3 blocks.
+    let four: Vec<(u64, Vec<Value>)> = (98..=101)
+        .map(|h| (h, vec![s_transfer("k:p", "k:m", json!(1.0))]))
+        .collect();
+    let rep = s_referee(s_node(&[], &four), "10.0", "14.0").await;
+    no(&rep, "four blocks");
+    let rep = s_referee(s_node(&[], &four), "10.0", "13.0").await;
+    ok(&rep, "three of them");
+}
+
 /// R-P5P9-86 S′ with R-P5P9-87, stored: a CG-5 NodeBalance record (labelled `node`) is miner
 /// skew only when its gap is k (1 to 3) coinbases of one amount that the node's canonical
 /// blocks in the record's height window pay the account. Here the node pays k:m at heights

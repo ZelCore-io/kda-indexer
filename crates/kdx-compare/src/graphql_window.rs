@@ -1343,6 +1343,102 @@ fn coinbase_key(payload: &Value) -> Option<String> {
 
 /// R-P5P9-86 S′: the heights either side of a stored record's height that its window holds.
 pub const SKEW_WINDOW: u64 = 10;
+/// R-P5P9-105 S′: consecutive blocks whose net change may make up the gap, at most.
+pub const S_NET_BLOCKS: usize = 3;
+/// R-P5P9-105 S′: node reads one stored record's net-change check makes at most.
+pub const S_NET_READS: usize = 50;
+
+/// An exact decimal at 12 places (units of 1e-12), signed; `None` past 12 places.
+fn fixed12(v: &Value) -> Option<i128> {
+    let v = match v {
+        Value::Object(o) => o.get("decimal").or_else(|| o.get("int"))?,
+        v => v,
+    };
+    let (neg, d, e) = crate::graphql_norm::decimal_value(v)?;
+    let d = if d.is_empty() { "0".to_string() } else { d };
+    let shift = e.checked_add(12)?;
+    let units: i128 = if shift >= 0 {
+        d.parse::<i128>()
+            .ok()?
+            .checked_mul(10i128.checked_pow(u32::try_from(shift).ok()?)?)?
+    } else {
+        let cut = usize::try_from(-shift).ok()?;
+        if cut > d.len() {
+            if d.bytes().any(|b| b != b'0') {
+                return None;
+            }
+            0
+        } else {
+            let (keep, drop) = d.split_at(d.len() - cut);
+            if drop.bytes().any(|b| b != b'0') {
+                return None;
+            }
+            if keep.is_empty() {
+                0
+            } else {
+                keep.parse().ok()?
+            }
+        }
+    };
+    Some(if neg { -units } else { units })
+}
+
+fn fixed12_text(t: &str) -> Option<i128> {
+    fixed12(&Value::String(t.trim().to_string()))
+}
+
+/// R-P5P9-105 S′: the account's net change in one block's outputs (coinbase and every
+/// transaction): each coin TRANSFER to it adds, each from it takes away. `None` when an
+/// output or an amount touching the account does not read.
+pub(crate) fn block_net_change(payload: &Value, account: &str) -> Option<i128> {
+    let decode = |b64: &str| -> Option<Value> {
+        let b = kdx_types::hash::b64url_decode(b64).ok()?;
+        serde_json::from_slice(&b).ok()
+    };
+    let mut outs: Vec<Value> = Vec::new();
+    if let Some(cb) = payload.get("coinbase").and_then(Value::as_str) {
+        outs.push(decode(cb)?);
+    }
+    for t in payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        outs.push(decode(t.get(1)?.as_str()?)?);
+    }
+    let mut net = 0i128;
+    for o in &outs {
+        for e in o
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if e.get("name").and_then(Value::as_str) != Some("TRANSFER")
+                || module_name(e).as_deref() != Some("coin")
+            {
+                continue;
+            }
+            let Some(p) = e.get("params").and_then(Value::as_array) else {
+                continue;
+            };
+            if p.len() != 3 {
+                continue;
+            }
+            let (from, to) = (
+                p[0].as_str() == Some(account),
+                p[1].as_str() == Some(account),
+            );
+            if from == to {
+                continue;
+            }
+            let a = fixed12(&p[2])?;
+            net += if to { a } else { -a };
+        }
+    }
+    Some(net)
+}
 
 /// R-P5P9-86 S′: what the block's coinbase pays `account` (a coin TRANSFER from the empty
 /// account), in fixed point.
@@ -5126,20 +5222,26 @@ impl Ctx {
         native: &str,
         ts: u64,
     ) -> Result<Value, String> {
-        use crate::rewards::fixed;
         let mut st = Reads::default();
-        let (Some(x), Some(y)) = (fixed(ours), fixed(native)) else {
+        let (Some(x), Some(y)) = (fixed12_text(ours), fixed12_text(native)) else {
             return Err("a balance is not a decimal".into());
         };
-        // R-P5P9-95 I-4: the live pair reads GraphQL first, so a skew leaves GraphQL below
-        // native only: native − GraphQL = +k × reward.
+        // R-P5P9-105 S′: either sign; ours' GraphQL number is an f64, so the gap may be off
+        // by half an ulp of it (in units of 1e-12).
         let gap = y - x;
         if gap == 0 {
             return Err("no gap".into());
         }
-        if gap < 0 {
-            return Err("GraphQL is above native; a skew leaves it below".into());
-        }
+        let half_ulp = ours
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map_or(0.0, |f| {
+                let a = f.abs();
+                (f64::from_bits(a.to_bits() + 1) - a) / 2.0 * 1e12
+            });
+        let near = |v: i128| ((v - gap).abs() as f64) <= half_ulp;
         self.h7_take(&mut st)?;
         let tip = self
             .node
@@ -5175,7 +5277,13 @@ impl Ctx {
             return Err("the height search did not converge on the record's time".into());
         }
         let mut paid: Vec<(u64, i128)> = Vec::new();
+        // R-P5P9-105 S′: each block's net change to the account (None: an amount that does
+        // not read exactly).
+        let mut net: Vec<(u64, Option<i128>)> = Vec::new();
         for hh in h.saturating_sub(SKEW_WINDOW)..=(h + SKEW_WINDOW).min(tip) {
+            if st.node + 2 > S_NET_READS {
+                break;
+            }
             let Some(hd) = self.h7_canonical(chain, hh, &mut st).await? else {
                 return Err(format!("no canonical header at {hh}"));
             };
@@ -5186,32 +5294,39 @@ impl Ctx {
             if let Some(a) = coinbase_paid(&payload, account) {
                 paid.push((hh, a));
             }
+            net.push((hh, block_net_change(&payload, account)));
         }
+        // The 1–3 coinbases arm stays as a special case.
         let amounts: Vec<i128> = paid.iter().map(|p| p.1).collect();
         let one = amounts
             .first()
             .copied()
             .filter(|a| amounts.iter().all(|b| b == a));
-        match one {
-            Some(r) if r > 0 && gap % r == 0 && (1..=3).contains(&(gap / r)) => {
-                let k = gap / r;
-                if (paid.len() as i128) < k {
-                    return Err(format!(
-                        "the gap is {k} coinbases, the node shows {} in the window",
-                        paid.len()
-                    ));
+        if let Some(r) = one.filter(|r| *r > 0) {
+            if let Some(k) = (1..=3i128).find(|k| near(k * r)) {
+                if paid.len() as i128 >= k {
+                    return Ok(
+                        json!({"chain": chain, "k": k, "window": [h.saturating_sub(SKEW_WINDOW),
+                        h + SKEW_WINDOW], "coinbases": paid.iter().map(|p| p.0).collect::<Vec<_>>()}),
+                    );
                 }
-                Ok(
-                    json!({"chain": chain, "k": k, "window": [h.saturating_sub(SKEW_WINDOW),
-                    h + SKEW_WINDOW], "coinbases": paid.iter().map(|p| p.0).collect::<Vec<_>>()}),
-                )
             }
-            Some(_) => Err("the gap is not 1 to 3 of the account's coinbases".into()),
-            None if amounts.is_empty() => {
-                Err("the node shows no coinbase to the account in the window".into())
-            }
-            None => Err("the account's coinbases in the window differ in amount".into()),
         }
+        // R-P5P9-105 S′: the net change over 1 to 3 consecutive blocks of the window.
+        for len in 1..=S_NET_BLOCKS {
+            for run in net.windows(len) {
+                let sum = run.iter().try_fold(0i128, |acc, (_, v)| v.map(|v| acc + v));
+                if sum.is_some_and(near) {
+                    return Ok(json!({"chain": chain, "netChange": true,
+                        "heights": run.iter().map(|b| b.0).collect::<Vec<_>>(),
+                        "window": [h.saturating_sub(SKEW_WINDOW), h + SKEW_WINDOW]}));
+                }
+            }
+        }
+        Err(format!(
+            "the gap is not the account's net change over 1 to {S_NET_BLOCKS} consecutive \
+             blocks of the window (nor 1 to 3 of its coinbases)"
+        ))
     }
 
     /// Takes one node read from the compare's cap and the run's budget.
