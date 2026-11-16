@@ -363,7 +363,6 @@ async fn q_referee_capped(
     balance: Option<Value>,
     max_reads: usize,
 ) -> crate::referee::Report {
-    let dir = tempfile::tempdir().unwrap();
     let mut node = NodeMock::default();
     if let Some(b) = balance {
         for r in &ours {
@@ -371,6 +370,18 @@ async fn q_referee_capped(
             node.local.insert((c, "k:a".into()), b.clone());
         }
     }
+    q_referee_node(ours, oracle, tokens, node, max_reads).await
+}
+
+/// [`q_referee_capped`] over a given node.
+async fn q_referee_node(
+    ours: Vec<Value>,
+    oracle: Vec<Value>,
+    tokens: Vec<Value>,
+    node: NodeMock,
+    max_reads: usize,
+) -> crate::referee::Report {
+    let dir = tempfile::tempdir().unwrap();
     let nu = node_server(node).await;
     let au = ours_fn_server(move |req: &Value| {
         let q = req["query"].as_str().unwrap_or("");
@@ -466,6 +477,48 @@ async fn h2_q_oracle_duplicates_of_a_chain_row_ours_lists_once() {
     other[3]["id"] = json!("C9");
     let rep = q_referee(other, tok, Some(json!(1.0))).await;
     assert_eq!((rep.explained, rep.unexplained), (0, 1), "unlike: {rep:?}");
+}
+
+/// R-P5P9-105 Q (#37's shape): ours lists chain 8 once and the oracle repeats it 8 times.
+/// The tokens are marmalade v1's: marmalade-v2's `get-balance` answers "No value found in
+/// table marmalade-v2.ledger_ledger" and `marmalade.ledger`'s gives 1 → explained, with
+/// both reads taken from the run's budget. Both zero → unexplained.
+#[tokio::test]
+async fn i_q_the_holding_check_tries_marmalade_v1_after_v2() {
+    let dupes = vec![q_row("8"); 8];
+    let tok = vec![json!({"tokenId": "t:The Kadena Mushrooms:48", "balance": 1})];
+    let node = |v2: Value, v1: Value| {
+        let mut n = NodeMock::default();
+        n.local_by_module
+            .insert((8, "marmalade-v2.ledger".into()), v2);
+        n.local_by_module.insert((8, "marmalade.ledger".into()), v1);
+        n
+    };
+    let rep = q_referee_node(
+        vec![q_row("8")],
+        dupes.clone(),
+        tok.clone(),
+        node(Value::Null, json!(1.0)),
+        200,
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    assert_eq!(
+        rep.by_class.get("graphql-r97-oracle-chain-dupes"),
+        Some(&1),
+        "{rep:?}"
+    );
+    // The chain graph, then v2's read and v1's.
+    assert_eq!(rep.node_reads, 3, "{rep:?}");
+    let rep = q_referee_node(
+        vec![q_row("8")],
+        dupes,
+        tok,
+        node(json!(0.0), json!(0.0)),
+        200,
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "zero: {rep:?}");
 }
 
 // ---------------------------------------------------------------------------------------------

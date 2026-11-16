@@ -2236,7 +2236,7 @@ impl Ctx {
     /// R-P5P9-97 Q #37: when the oracle repeats non-fungible chain rows that ours lists once
     /// ([`crate::graphql_norm::oracle_chain_dupes`]), each repeated row is confirmed on the
     /// node: of the tokens ours lists for the account on that chain (at most 3), marmalade-v2's
-    /// `get-balance` on the node is above zero for one. When every one is confirmed, the
+    /// `get-balance` on the node, or else marmalade v1's (R-P5P9-105 Q), is above zero for one. When every one is confirmed, the
     /// oracle's list keeps one copy of each row, in its order. Any failed read leaves it.
     /// Review B1: each node read is one of the run's budget (the referee's `--max-reads`;
     /// unbounded live); spent, the rows stay and the note names the cap.
@@ -2275,7 +2275,13 @@ impl Ctx {
                 .take(3)
                 .collect();
             let mut held = false;
+            // R-P5P9-105 Q: marmalade v2's ledger first, then v1's (`marmalade.ledger`).
+            let mut reads: Vec<(&str, &str)> = Vec::new();
             for t in &tokens {
+                reads.push((t.as_str(), "marmalade-v2.ledger"));
+                reads.push((t.as_str(), "marmalade.ledger"));
+            }
+            for (t, module) in reads {
                 if !self.gql.take_node_read() {
                     return (
                         false,
@@ -2286,10 +2292,8 @@ impl Ctx {
                         ),
                     );
                 }
-                if let Ok(kdx_node::local::Local::Found { value, .. }) = self
-                    .gql_local()
-                    .get_balance(chain, "marmalade-v2.ledger", t, acct)
-                    .await
+                if let Ok(kdx_node::local::Local::Found { value, .. }) =
+                    self.gql_local().get_balance(chain, module, t, acct).await
                 {
                     if !value.starts_with('-') && value.chars().any(|ch| ('1'..='9').contains(&ch))
                     {

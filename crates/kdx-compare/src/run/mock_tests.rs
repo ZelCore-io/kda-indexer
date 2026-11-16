@@ -32,6 +32,9 @@ pub(super) struct NodeMock {
     /// `/local` answers by (chain, account): the `result.data` of a `details` read. Each
     /// call logs `local <chain> <code> <account>`.
     pub local: HashMap<(u8, String), Value>,
+    /// `/local` answers by (chain, module) for a read whose code names the module, ahead of
+    /// `local`; `null` answers "No value found in table <module>_ledger".
+    pub local_by_module: HashMap<(u8, String), Value>,
     /// `GET /header` answers by (chain, height): every header the node holds at that height
     /// (orphans included), and `payload/<hash>/outputs` answers by payload hash.
     pub headers: HashMap<(u8, u64), Vec<Value>>,
@@ -227,6 +230,18 @@ async fn node_server(n: NodeMock) -> String {
                     let acct = cmd.pointer("/payload/exec/data/a").and_then(Value::as_str).unwrap_or("");
                     n.calls.lock().unwrap().push(format!("local {c} {code} {acct}"));
                     let meta = json!({"blockHeight": n.tip + 1});
+                    let by_module = n
+                        .local_by_module
+                        .iter()
+                        .find(|((mc, m), _)| *mc == c && code.contains(&format!("({m}.")));
+                    if let Some(((_, m), d)) = by_module {
+                        return Json(if d.is_null() {
+                            json!({"result": {"status": "failure", "error": {"message":
+                                format!("No value found in table {m}_ledger")}}, "metaData": meta})
+                        } else {
+                            json!({"result": {"status": "success", "data": d}, "metaData": meta})
+                        });
+                    }
                     Json(match n.local.get(&(c, acct.to_string())) {
                         Some(d) => json!({"result": {"status": "success", "data": d}, "metaData": meta}),
                         None => json!({"result": {"status": "failure",
