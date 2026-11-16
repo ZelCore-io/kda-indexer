@@ -965,6 +965,41 @@ async fn f_m6_rest_compose_refuses_duplicates_and_the_unbounded_edge() {
     }
 }
 
+/// R-P5P9-105 (self-transfers, #1385's shape): a row with from = to, the same requestKey and
+/// idx, is listed twice by contract (as sender and as receiver; cwd does the same). The
+/// duplicate check counts it as two rows, so the stored record is explained once the node
+/// confirms the row. A true duplicate (from ≠ to) still settles nothing.
+#[tokio::test]
+async fn i_rest_a_self_transfer_listed_twice_is_two_rows() {
+    for (selfx, explained) in [(true, 1usize), (false, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = acct_pair(7_000_099);
+        let mut u1 = a[0].clone();
+        if selfx {
+            u1["fromAccount"] = json!(ACCT);
+            u1["amount"] = json!("0.000031");
+        }
+        let mut rows = vec![u1.clone(), u1];
+        rows.extend(a.as_array().unwrap()[2..].iter().cloned());
+        let a = Value::Array(rows);
+        let nu = node_server(rest_node()).await;
+        let cfg = rest_cfg(
+            &nu,
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            dir.path(),
+            "chainweb_data",
+        );
+        let rec = rest_record("account", ACCT_REQ, &a, &b);
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!(rep.explained, explained, "self {selfx}: {rep:?}");
+        if !selfx {
+            let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+            assert!(still.contains("listed more than once"), "{still}");
+        }
+    }
+}
+
 /// R-P5P9-95 m-9: the REST stored form's node polls (`node_confirms`) are reads of the run's
 /// budget. With only the chain graph's read allowed, a user row only ours lists is not
 /// confirmed; with the budget it is.

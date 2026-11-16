@@ -41,6 +41,12 @@ fn remove_rows(v: &mut Value, rows: &[Value]) {
     }
 }
 
+/// A REST account row whose sender is its receiver (a non-empty account).
+fn is_self_transfer(r: &Value) -> bool {
+    let acct = |k: &str| r.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
+    acct("fromAccount").is_some() && acct("fromAccount") == acct("toAccount")
+}
+
 fn first_keys(rows: &[Value]) -> Vec<Value> {
     rows.iter()
         .take(10)
@@ -164,13 +170,19 @@ impl Ctx {
         }
         // R-P5P9-95 m-6: a row only ours lists that ours lists more than once settles nothing
         // (each copy would pass the node check on its own).
-        let mut copies: HashMap<RowKey, usize> = HashMap::new();
+        // R-P5P9-105: a self-transfer (from = to, the same requestKey and idx) is listed
+        // twice by contract, as sender and as receiver (cwd does the same), so its two copies
+        // count as two rows. A third copy, or two of any other row, is a duplicate.
+        let mut copies: HashMap<RowKey, (usize, bool)> = HashMap::new();
         for r in va.as_array().into_iter().flatten() {
-            *copies.entry(row_key(r)).or_default() += 1;
+            let c = copies.entry(row_key(r)).or_insert((0, true));
+            c.0 += 1;
+            c.1 &= is_self_transfer(r);
         }
+        let allowed = |(n, selfx): (usize, bool)| n <= if selfx { 2 } else { 1 };
         if only_a
             .iter()
-            .any(|r| copies.get(&row_key(r)).copied() > Some(1))
+            .any(|r| copies.get(&row_key(r)).is_some_and(|&c| !allowed(c)))
         {
             return Err("a row only ours lists is listed more than once".into());
         }
