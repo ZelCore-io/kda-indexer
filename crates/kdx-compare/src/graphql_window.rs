@@ -495,6 +495,10 @@ pub struct Verdict {
     /// R-P5P9-86 U: the public keys of the signers of the node's signed command for an
     /// ours-only tx row under a `publicKey` filter (`None`: not read; `Err`: why not).
     pub signers: Option<Result<Vec<String>, String>>,
+    /// R-P5P9-97 T #332: for an ours-only receive-leg transfer row with a cross-chain link,
+    /// the source leg's chain and its events, read by `/poll` of the continuation's pact id
+    /// on the chain the node's TRANSFER_XCHAIN_RECD names (`None`: not read; `Err`: why not).
+    pub source: Option<Result<(u8, Vec<Value>), String>>,
 }
 
 /// The check of an ours-only tx row's `cmd` fields against the node (R-P5P9-68 (2)).
@@ -529,6 +533,7 @@ impl Verdict {
             ctime: None,
             branch: None,
             signers: None,
+            source: None,
         }
     }
 
@@ -956,6 +961,10 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
                 .into()
         });
     }
+    // R-P5P9-97 T #332: a receive leg holds no TRANSFER_XCHAIN; its link is the source leg's.
+    if sent.is_empty() && recd {
+        return receive_leg_mismatch(x, ev, v);
+    }
     let [e] = sent.as_slice() else {
         return Some(format!(
             "crossChainTransfer is set; the node's transaction holds {} TRANSFER_XCHAIN for the \
@@ -984,6 +993,88 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
             "crossChainTransfer.senderAccount is not the node's (the sending leg's receiver)"
                 .into(),
         );
+    }
+    None
+}
+
+/// R-P5P9-97 T #332 (R-P5P9-91 (2)): why an ours-only receive-leg row's `crossChainTransfer`
+/// (`x`) is not the node's source leg, or `None` when it is. The row is coin's receiving
+/// TRANSFER `ev` ("" to the receiver); the source leg ([`Verdict::source`]) must hold exactly
+/// one coin TRANSFER_XCHAIN to the row's receiver, of its amount, targeting the row's chain,
+/// and the TRANSFER of that sender to "" of the amount. The link is that TRANSFER: its chain
+/// (the source chain), its sender and its receiver.
+fn receive_leg_mismatch(x: &Value, ev: &Value, v: &Verdict) -> Option<String> {
+    let p = |e: &Value, i: usize| e.pointer(&format!("/params/{i}")).cloned();
+    let t = |e: &Value, i: usize| p(e, i).as_ref().and_then(text);
+    let coin = |e: &Value| module_name(e).as_deref() == Some("coin");
+    let n = |e: &Value| e.get("params").and_then(Value::as_array).map(Vec::len);
+    if !coin(ev) || transfer_offset(ev) != 0 || t(ev, 0).as_deref() != Some("") {
+        return Some(
+            "crossChainTransfer is set on a row that is not coin's receiving TRANSFER".into(),
+        );
+    }
+    let (src, evs) = match &v.source {
+        None => return Some("crossChainTransfer: the source leg was not read".into()),
+        Some(Err(w)) => return Some(format!("crossChainTransfer: the source leg: {w}")),
+        Some(Ok((c, evs))) => (*c, evs),
+    };
+    let amount = |e: &Value| {
+        p(e, 2)
+            .zip(p(ev, 2))
+            .is_some_and(|(a, b)| same_amount(&a, &b, false))
+    };
+    let name = |e: &Value| e.get("name").and_then(Value::as_str).map(str::to_string);
+    let here = v.chain.map(|c| c.to_string());
+    let sent: Vec<&Value> = evs
+        .iter()
+        .filter(|e| {
+            name(e).as_deref() == Some("TRANSFER_XCHAIN")
+                && coin(e)
+                && n(e) == Some(4)
+                && t(e, 1).is_some()
+                && t(e, 1) == t(ev, 1)
+                && here.is_some()
+                && t(e, 3) == here
+                && amount(e)
+        })
+        .collect();
+    let [e] = sent.as_slice() else {
+        return Some(format!(
+            "crossChainTransfer: the source leg holds {} TRANSFER_XCHAIN for the transfer",
+            sent.len()
+        ));
+    };
+    let from = t(e, 0);
+    let debit: Vec<&Value> = evs
+        .iter()
+        .filter(|d| {
+            name(d).as_deref() == Some("TRANSFER")
+                && coin(d)
+                && n(d) == Some(3)
+                && from.is_some()
+                && t(d, 0) == from
+                && t(d, 1).as_deref() == Some("")
+                && amount(d)
+        })
+        .collect();
+    let [d] = debit.as_slice() else {
+        return Some(format!(
+            "crossChainTransfer: the source leg holds {} TRANSFER of the sender to \"\" for the \
+             transfer",
+            debit.len()
+        ));
+    };
+    let ok = |k: &str, want: Option<String>| {
+        sel(x, k).is_none_or(|y| text(y).is_some() && want.is_some() && text(y) == want)
+    };
+    if !ok("chainId", Some(src.to_string())) {
+        return Some("crossChainTransfer.chainId is not the source leg's chain".into());
+    }
+    if !ok("senderAccount", t(d, 0)) {
+        return Some("crossChainTransfer.senderAccount is not the source leg's sender".into());
+    }
+    if !ok("receiverAccount", t(d, 1)) {
+        return Some("crossChainTransfer.receiverAccount is not the source leg's receiver".into());
     }
     None
 }
@@ -3595,6 +3686,7 @@ impl Ctx {
                 self.h7_ctime_check(r, &mut v, st).await;
                 self.h7_branch_check(r, &mut v, st).await;
                 self.h7_signers_check(r, &mut v, &filter, st).await;
+                self.h7_xchain_source_check(r, &mut v, st).await;
             }
             if side == 0 {
                 va[i] = Some(v);
@@ -4039,6 +4131,72 @@ impl Ctx {
                 .filter_map(|s| s.get("pubKey").and_then(Value::as_str).map(str::to_string))
                 .collect()
         }));
+    }
+
+    /// R-P5P9-97 T #332: an ours-only transfer row the node places (`v`) with a set
+    /// `crossChainTransfer`, whose transaction holds a TRANSFER_XCHAIN_RECD and no
+    /// TRANSFER_XCHAIN (a receive leg): the source leg, by `/poll` of the continuation's pact
+    /// id on the source chain its TRANSFER_XCHAIN_RECD names. Sets `v.source`.
+    async fn h7_xchain_source_check(&self, r: &Row, v: &mut Verdict, st: &mut Reads) {
+        let n = node_of(r);
+        let named = |e: &Value, x: &str| e.get("name").and_then(Value::as_str) == Some(x);
+        if r.id.kind != Some(Kind::Transfer)
+            || v.canon != Canon::Yes
+            || !n.get("crossChainTransfer").is_some_and(Value::is_object)
+            || v.xchain.iter().any(|e| named(e, "TRANSFER_XCHAIN"))
+        {
+            return;
+        }
+        let srcs: Vec<Option<u8>> = v
+            .xchain
+            .iter()
+            .filter(|e| named(e, "TRANSFER_XCHAIN_RECD"))
+            .map(|e| {
+                e.pointer("/params/3")
+                    .and_then(text)
+                    .and_then(|c| c.parse().ok())
+            })
+            .collect();
+        let Some(&first) = srcs.first() else {
+            return;
+        };
+        v.source = Some(self.h7_source_leg(first, &srcs, v.chain, r, st).await);
+    }
+
+    async fn h7_source_leg(
+        &self,
+        first: Option<u8>,
+        srcs: &[Option<u8>],
+        chain: Option<u8>,
+        r: &Row,
+        st: &mut Reads,
+    ) -> Result<(u8, Vec<Value>), String> {
+        let src = first.ok_or("the TRANSFER_XCHAIN_RECD names no source chain")?;
+        if srcs.iter().any(|c| *c != Some(src)) {
+            return Err("the TRANSFER_XCHAIN_RECD events name different source chains".into());
+        }
+        let (Some(chain), Some(rk)) = (chain, r.id.rk.as_deref()) else {
+            return Err("no chain or key for the row".into());
+        };
+        let p = self
+            .h7_poll(chain, rk, st)
+            .await?
+            .ok_or("the node's poll does not know the key")?;
+        let pact = p
+            .pointer("/continuation/pactId")
+            .and_then(Value::as_str)
+            .ok_or("the receive leg's poll entry holds no continuation pact id")?
+            .to_string();
+        let s = self
+            .h7_poll(src, &pact, st)
+            .await?
+            .ok_or("the node's poll on the source chain does not know the pact id")?;
+        let events = s
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or("the source leg's poll entry holds no events")?;
+        Ok((src, events))
     }
 
     /// R-P5P9-70 (I-1): an ours-only transfer row that the node places (`v`, its block and
@@ -4648,6 +4806,7 @@ impl Ctx {
             self.h7_ctime_check(r, &mut v, st).await;
             self.h7_branch_check(r, &mut v, st).await;
             self.h7_signers_check(r, &mut v, &filter, st).await;
+            self.h7_xchain_source_check(r, &mut v, st).await;
             va.push(Some(v));
         }
         let w = Window {

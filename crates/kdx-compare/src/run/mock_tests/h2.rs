@@ -174,3 +174,94 @@ async fn h2_w_the_count_walk_takes_h8s_mapped_index() {
         assert_eq!((rep.explained, rep.unexplained), want, "{rank}: {rep:?}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// T #332
+
+/// T #332's node: the receive leg k1 on chain 0 (continuation step 1 of pact P1) holds the
+/// receiving TRANSFER "" → r 1.5 and TRANSFER_XCHAIN_RECD from chain 1; the source leg P1 on
+/// chain 1 holds TRANSFER s → "" 1.5 and TRANSFER_XCHAIN s → r 1.5 to `target`.
+fn t_node(target: &str) -> NodeMock {
+    let ev = |name: &str, p: Value| json!({"name": name, "module": {"name": "coin"}, "params": p});
+    let mut node = NodeMock::default();
+    let (k, mut v) = h7_poll(
+        "k1",
+        "B100",
+        100,
+        json!([
+            ev("TRANSFER", json!(["", "r", 1.5])),
+            ev("TRANSFER_XCHAIN_RECD", json!(["", "r", 1.5, "1"]))
+        ]),
+    );
+    v.1["continuation"] = json!({"pactId": "P1", "step": 1});
+    node.polls.insert(k, v);
+    node.polls.insert(
+        "P1".into(),
+        (
+            1,
+            json!({"reqKey": "P1", "metaData": {"blockHash": "S50", "blockHeight": 50},
+                "events": [ev("TRANSFER", json!(["s", "", 1.5])),
+                    ev("TRANSFER_XCHAIN", json!(["s", "r", 1.5, target]))]}),
+        ),
+    );
+    let (k, v) = h7_xfer_poll("x0", "B100", 100, "s", "r", json!(1.0));
+    node.polls.insert(k, v);
+    node
+}
+
+/// An ours-only receive-leg row "" → r 1.5 with its link `x`.
+fn t_row(x: Value) -> Value {
+    let mut e = h7_xrow("k1", 100, json!(1.5), Some(("", "r")));
+    e["node"]["crossChainTransfer"] = x;
+    e
+}
+
+/// R-P5P9-97 T #332 (R-P5P9-91 (2)): an ours-only receive-leg transfer's
+/// `crossChainTransfer` is checked against the source leg, read by the continuation's pact
+/// id on the chain its TRANSFER_XCHAIN_RECD names: ours' link (chain 1, s → "") is the
+/// source leg's → explained, live and stored. A wrong sender, or a source leg whose
+/// TRANSFER_XCHAIN targets another chain, stays a diff.
+#[tokio::test]
+async fn h2_t_a_receive_legs_link_is_checked_against_the_source_leg() {
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("s", "r")));
+    let link = |from: &str| {
+        json!({"__typename": "Transfer", "chainId": "1", "senderAccount": from,
+            "receiverAccount": ""})
+    };
+    for (target, from, explained) in [("0", "s", true), ("0", "z", false), ("2", "s", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = gql_ctx(t_node(target), dir.path()).await;
+        let a = vec![x0.clone(), t_row(link(from))];
+        let (d, note) = d1_settle(&ctx, a.clone(), vec![x0.clone()], (false, false)).await;
+        let case = format!("{target} {from}");
+        assert_eq!(
+            only_hits(&d) && !d.is_empty(),
+            explained,
+            "live {case}: {d:?} {note:?}"
+        );
+        if !explained {
+            assert!(
+                note.unwrap_or_default().contains("crossChainTransfer"),
+                "{case}"
+            );
+        }
+        let cfg = h2_cfg(t_node(target), dir.path()).await;
+        let rec = h2_rec(
+            a.clone(),
+            vec![x0.clone()],
+            vec![DiffEntry {
+                path: "/data/transfers/edges/1".into(),
+                kind: DiffKind::Extra,
+                a: Some(a[1].clone()),
+                b: None,
+            }],
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        let want = if explained { (1, 0) } else { (0, 1) };
+        assert_eq!(
+            (rep.explained, rep.unexplained),
+            want,
+            "stored {case}: {rep:?}"
+        );
+    }
+}
