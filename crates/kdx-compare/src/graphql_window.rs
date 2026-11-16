@@ -3544,7 +3544,18 @@ impl Ctx {
         // The `pageInfo` stands in for H7 only and is taken off again after it.
         let query = op.map(|o| o.query.as_str());
         let bare = [&*a, &*b].iter().find_map(|x| bare_root(&x.body));
-        let first = bare.as_deref().and_then(|r| root_first(query, r, vars));
+        // R-P5P9-105 (G): a root list with no `first` (and no `pageInfo`) that selects a
+        // `startHeight`/`endHeight` range is uncut by construction: complete on both sides.
+        let range = |r: &str| {
+            query.and_then(|q| root_args(q, r)).is_some_and(|args| {
+                ["startHeight", "endHeight"]
+                    .iter()
+                    .all(|k| args.iter().any(|(n, _)| n == k))
+            })
+        };
+        let first = bare
+            .as_deref()
+            .and_then(|r| root_first(query, r, vars).or_else(|| range(r).then_some(u64::MAX)));
         let (Some(root), Some(f)) = (bare, first) else {
             return self
                 .gql_window_referee_conn(ta, op, vars, a, b, max, st)
@@ -4494,6 +4505,21 @@ impl Ctx {
                                 }
                                 if let Some(cmds) = c["cmds"].as_array() {
                                     prefix_cmds_match(&payload, cmds)?;
+                                }
+                                // R-P5P9-105 (G): both cut at the same length: ours the
+                                // node's block's first rows in reverse (or forward) order,
+                                // the oracle's rows distinct txs of the block.
+                                if let Some(m) = c["cutBoth"].as_object() {
+                                    let side = |s: &str| {
+                                        m.get(s)
+                                            .and_then(Value::as_array)
+                                            .cloned()
+                                            .ok_or("a cut side without its rows")
+                                    };
+                                    let ours = side("ours")?;
+                                    prefix_in_node_order(&payload, &ours)?;
+                                    prefix_cmds_match(&payload, &side("oracle")?)
+                                        .map_err(|w| format!("in any order, oracle: {w}"))?;
                                 }
                                 // R-P5P9-97 G: out of order, both sides as multisets of
                                 // the node's block: ours all of it (the count is checked
@@ -5938,6 +5964,42 @@ pub fn payload_data_txs(v: &Value) -> Vec<(String, Option<u8>, String)> {
     let mut out = Vec::new();
     walk(v, &mut String::new(), &mut out);
     out
+}
+
+/// R-P5P9-105 (G): ours' rows' `cmd` subtrees are, in order, the first commands of the
+/// node's block `payload` in reverse order, or else in its forward order. `Err`: why not.
+fn prefix_in_node_order(payload: &Value, cmds: &[Value]) -> Result<(), String> {
+    let node: Vec<Option<Value>> = payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("the payload holds no transaction list")?
+        .iter()
+        .map(|t| {
+            let raw = kdx_types::hash::b64url_decode(t.get(0)?.as_str()?).ok()?;
+            let w: Value = serde_json::from_slice(&raw).ok()?;
+            serde_json::from_str(w.get("cmd")?.as_str()?).ok()
+        })
+        .collect();
+    if let Some(f) = cmds
+        .iter()
+        .find_map(|c| unchecked_field(Some(Kind::Tx), &json!({ "cmd": c })))
+    {
+        return Err(format!(
+            "ours' rows select {f}, which the node check does not read"
+        ));
+    }
+    let in_order = |order: &mut dyn Iterator<Item = &Option<Value>>| {
+        cmds.iter()
+            .zip(order)
+            .filter(|_| true)
+            .all(|(c, n)| n.as_ref().is_some_and(|n| cmd_mismatch(c, n).is_none()))
+    };
+    if cmds.len() <= node.len() && (in_order(&mut node.iter().rev()) || in_order(&mut node.iter()))
+    {
+        Ok(())
+    } else {
+        Err("ours' rows are not the node's block's first rows in reverse or forward order".into())
+    }
 }
 
 /// R-P5P9-95 m-4: ours' rows' `cmd` subtrees `cmds` matched one to one (a multiset) with

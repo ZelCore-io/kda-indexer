@@ -741,6 +741,66 @@ async fn e3_g_a_cut_nested_list_is_settled_by_prefix() {
     assert_eq!(rep.by_class.get("graphql-h6-prefix"), Some(&1), "{rep:?}");
 }
 
+/// R-P5P9-105 (G, #70's stored shape): `blocksFromHeight(startHeight, endHeight)` with no
+/// `first` and no `pageInfo` is uncut by construction, so the G arm runs. Each block's
+/// nested `transactions` selects only `cmd.meta.gasPrice` and is cut at 20 of 126 rows: ours'
+/// 20 are the node's block in reverse order, the oracle's 20 its forward order. Explained by
+/// prefix and multiset against the node's block. An oracle row not in the node's block stays
+/// unexplained.
+#[tokio::test]
+async fn i_g_a_height_range_root_without_first_runs_the_g_arm() {
+    let page = |prices: Vec<String>| {
+        let txs: Vec<Value> = prices
+            .iter()
+            .map(|p| json!({"node": {"cmd": {"meta": {"gasPrice": p}}}}))
+            .collect();
+        json!({"data": {"blocksFromHeight": {"edges": [{"node": {"chainId": 0,
+            "creationTime": "2026-11-15T09:00:00Z", "height": 58, "hash": "H0",
+            "canonical": true, "transactions": {"totalCount": 126, "edges": txs}}}]}}})
+    };
+    let fwd: Vec<String> = (0..126).map(|i| format!("{i}e-8")).collect();
+    let rev: Vec<String> = fwd.iter().rev().cloned().collect();
+    let ours = page(rev[..20].to_vec());
+    let mut stray = fwd[..20].to_vec();
+    stray[7] = "999e-8".into();
+    for (oracle, explained) in [(fwd[..20].to_vec(), 1usize), (stray, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(g_node(126)).await;
+        let ops = dir.path().join("ops");
+        std::fs::create_dir_all(&ops).unwrap();
+        std::fs::write(
+            ops.join("QG70.graphql"),
+            "# kdx: oracle\nquery QG70($s: Int!, $e: Int) { blocksFromHeight(startHeight: $s, \
+             endHeight: $e) { edges { node { chainId creationTime height hash canonical \
+             transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }\n",
+        )
+        .unwrap();
+        let cfg = c3_cfg(&nu, &nu, &nu, dir.path(), &ops, "");
+        let diff = (0..20)
+            .map(|i| DiffEntry {
+                path: format!(
+                    "/data/blocksFromHeight/edges/0/node/transactions/edges/{i}/node/cmd/meta/gasPrice"
+                ),
+                kind: DiffKind::Changed,
+                a: Some(json!(rev[i])),
+                b: Some(json!(oracle[i])),
+            })
+            .collect();
+        let rec = e2_stored(
+            "QG70",
+            json!({"s": 58, "e": 58}),
+            ours.clone(),
+            page(oracle),
+            diff,
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!(rep.explained, explained, "{explained}: {rep:?}");
+        if explained == 1 {
+            assert_eq!(rep.by_class.get("graphql-h6-prefix"), Some(&1), "{rep:?}");
+        }
+    }
+}
+
 // R-P5P9-92 (1)'s distinct-heights form is replaced by R-P5P9-93's window form:
 // `e3b::e3b_tc_243_the_oracle_counts_the_windows_heights`.
 

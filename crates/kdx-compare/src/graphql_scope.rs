@@ -273,6 +273,9 @@ fn prefix_candidate(
     let oracle_cut = cb.pointer("/pageInfo/hasNextPage") == Some(&Value::Bool(true))
         || total(cb)
             .is_some_and(|t| crate::graphql_norm::decimal_value(&json!(rb.len())) != Some(t));
+    if !ours_complete && oracle_cut && !ra.is_empty() && ra.len() == rb.len() {
+        return both_cut_candidate(p, ca, cb, &ra, &rb, parent);
+    }
     if !ours_complete || !oracle_cut || rb.len() >= ra.len() {
         return None;
     }
@@ -361,13 +364,63 @@ fn prefix_candidate(
     )
 }
 
+/// R-P5P9-105 (G, #70's shape): both sides cut the block's nested `transactions` at the same
+/// length, under the same `totalCount`, and every row selects only its `cmd` (or a key and
+/// `__typename`). The candidate (`cutBoth`) is settled on the node by
+/// [`crate::graphql_window`]'s prefix check: the block holds `totalCount` txs, ours' rows are
+/// the first rows of the node's payload in reverse order (or forward), and the oracle's rows
+/// are distinct txs of the block.
+fn both_cut_candidate(
+    p: &str,
+    ca: &Value,
+    cb: &Value,
+    ra: &[Value],
+    rb: &[Value],
+    parent: Option<&Value>,
+) -> Option<Value> {
+    let total = |c: &Value| {
+        c.get("totalCount")
+            .and_then(crate::graphql_norm::decimal_value)
+    };
+    let t = total(ca)?;
+    if total(cb) != Some(t.clone()) {
+        return None;
+    }
+    let of = ca.get("totalCount").and_then(Value::as_u64)?;
+    let cmd_of = |e: &Value| -> Option<Value> {
+        let n = e.get("node")?.as_object()?;
+        let plain = n.iter().all(|(k, v)| match k.as_str() {
+            "hash" | "requestKey" | "cmd" => true,
+            "__typename" => v.as_str() == Some("Transaction"),
+            _ => false,
+        });
+        plain.then(|| n.get("cmd").cloned()).flatten()
+    };
+    let all = |rows: &[Value]| rows.iter().map(cmd_of).collect::<Option<Vec<Value>>>();
+    let n = parent?.get("node")?;
+    let height = n.get("height")?.as_u64()?;
+    let chain = match n.get("chainId")? {
+        Value::String(c) => c.parse::<u8>().ok()?,
+        c => u8::try_from(c.as_u64()?).ok()?,
+    };
+    let hash = n.get("hash")?.as_str()?;
+    Some(
+        json!({"list": p, "why": "a nested list both sides cut at the same length, not yet \
+        checked on the node", "prefix": {"rows": rb.len(), "of": of, "chain": chain,
+        "height": height, "hash": hash, "keys": null, "unchecked": null, "cmds": null,
+        "multiset": null, "cutBoth": {"ours": all(ra)?, "oracle": all(rb)?}}}),
+    )
+}
+
 /// R-P5P9-88 (G): a root row's block (chainId as text, hash), read the same way on a raw and
 /// a normalized body (normalization rewrites numbers, so the height is read on the raw row).
 fn block_key(e: &Value) -> Option<(String, String)> {
     let n = e.get("node")?;
-    let chain = match n.get("chainId")? {
-        Value::String(c) => c.clone(),
-        c => c.as_u64()?.to_string(),
+    // R-P5P9-105: a JSON number chain is `#<digits>e<exp>` once normalized; both read as the
+    // same exact decimal.
+    let chain = match crate::graphql_norm::decimal_value(n.get("chainId")?) {
+        Some((neg, d, x)) => format!("{neg}:{}:{x}", d.trim_start_matches('0')),
+        None => n.get("chainId")?.as_str()?.to_string(),
     };
     Some((chain, n.get("hash")?.as_str()?.to_string()))
 }
@@ -450,9 +503,9 @@ pub fn unkeyed_nested_with(
     let (mut sorted, mut left) = (false, Vec::new());
     // Deepest first, so a sort never moves a list still to visit.
     for p in lists.iter().rev() {
-        if scoped.contains(p) {
-            continue;
-        }
+        // R-P5P9-105 (G): an H2-scoped block list (under `blocksFromHeight`) is a set, except
+        // when both sides cut it at the same length: then the G arm settles it on the node.
+        let in_scope = scoped.contains(p);
         let (Some(ca), Some(cb)) = (a.pointer(p), b.pointer(p)) else {
             continue;
         };
@@ -470,6 +523,9 @@ pub fn unkeyed_nested_with(
             .unwrap_or_default();
         let pa = a.pointer(&parent).and_then(parent_id);
         if pa.is_some() && pa != b.pointer(&parent).and_then(parent_id) {
+            if in_scope {
+                continue;
+            }
             left.push(
                 json!({"list": p, "why": "a nested list without a key whose parent \
                 block (chainId, height, hash) is not the same block on both sides"}),
@@ -488,6 +544,13 @@ pub fn unkeyed_nested_with(
         });
         let candidate =
             raw_lists.and_then(|((pa, xa), (_, xb))| prefix_candidate(p, xa, xb, Some(pa), rules));
+        if in_scope
+            && !candidate
+                .as_ref()
+                .is_some_and(|c| c.pointer("/prefix/cutBoth").is_some())
+        {
+            continue;
+        }
         if let Some(c) = candidate {
             // The list's own differences are the candidate's: the oracle's cut list stands
             // as ours' whole one, and the entry stays unfinished until the node settles it.
