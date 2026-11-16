@@ -1412,6 +1412,188 @@ async fn k_rest_the_live_floor_cap_stays_50_rows() {
     }
 }
 
+/// R-P5P9-116 (REST #1854): the chainweb-data-only row at ours' floor height 7,000,100 is a
+/// coinbase row. `edit` changes the row, `node_edit` the node's coinbase for that block.
+fn cb_floor(edit: impl Fn(&mut Value)) -> (Value, Value, NodeMock) {
+    let (a, mut b) = acct_pair(7_000_100);
+    let rows = b.as_array_mut().unwrap();
+    rows.pop(); // acct_pair's `e1`
+    let mut row = acct_row("<coinbase>", 7_000_100, "0.904046");
+    edit(&mut row);
+    rows.push(row);
+    let mut node = rest_node();
+    node.headers.insert(
+        (9, 7_000_100),
+        vec![
+            json!({"hash": "c7000100", "height": 7_000_100, "chainId": 9,
+            "payloadHash": "P100"}),
+        ],
+    );
+    let cb = json!({"reqKey": "cb", "events": [{"name": "TRANSFER", "module": {"name": "coin"},
+        "params": ["", ACCT, 0.904046]}]})
+    .to_string();
+    node.payloads.insert(
+        "P100".into(),
+        json!({"coinbase": kdx_types::hash::b64url_encode(cb.as_bytes())}),
+    );
+    (a, b, node)
+}
+
+type CbEdit = Box<dyn Fn(&mut Value)>;
+
+/// The shapes of `cb_floor`: the matching row and each way a row can fail to match.
+fn cb_cases() -> Vec<(&'static str, usize, CbEdit)> {
+    vec![
+        ("matches", 1, Box::new(|_| {})),
+        (
+            "wrong amount",
+            0,
+            Box::new(|r| r["amount"] = json!("0.904047")),
+        ),
+        (
+            "amount as a number",
+            1,
+            Box::new(|r| r["amount"] = json!(0.904046)),
+        ),
+        (
+            "wrong account",
+            0,
+            Box::new(|r| r["toAccount"] = json!("k:other")),
+        ),
+        (
+            "not from the empty account",
+            0,
+            Box::new(|r| r["fromAccount"] = json!("x")),
+        ),
+    ]
+}
+
+/// R-P5P9-116 (REST #1854), referee: a coinbase row at ours' floor height is placed by the
+/// block's header (the row's block, canonical at that height) and its coinbase TRANSFER
+/// ("" -> the row's account, the row's exact amount). A wrong amount, a wrong account, a
+/// sender stays unexplained. (A row in a block that is not canonical is taken earlier by the
+/// orphan rule: the arm's own refusal is `l_rest_the_coinbase_arm_wants_the_canonical_block`.)
+#[tokio::test]
+async fn l_rest_a_coinbase_row_at_ours_floor_is_placed_by_its_block_referee() {
+    for (case, explained, edit) in cb_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, node) = cb_floor(edit);
+        let nu = node_server(node).await;
+        let cfg = rest_cfg(
+            &nu,
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            dir.path(),
+            "chainweb_data",
+        );
+        let rec = rest_record("account", ACCT_REQ, &a, &b);
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!(rep.explained, explained, "{case}: {rep:?}");
+    }
+}
+
+/// R-P5P9-116, live: the same cases through a live run (`vs_target`).
+#[tokio::test]
+async fn l_rest_a_coinbase_row_at_ours_floor_is_placed_by_its_block_live() {
+    for (case, explained, edit) in cb_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, node) = cb_floor(edit);
+        let nu = node_server(node).await;
+        let (au, bu) = (reads_server(vec![a]).await, reads_server(vec![b]).await);
+        let ctx = Ctx::new(rest_cfg(&nu, &au, &bu, dir.path(), "chainweb_data"))
+            .await
+            .unwrap();
+        let req = Request::new(ACCT_REQ.into(), Origin::Seed, None);
+        let o = ctx
+            .vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
+            .await;
+        let class = if explained == 1 {
+            "allowlisted"
+        } else {
+            "diff"
+        };
+        assert_eq!(o.class, class, "{case}: {o:?}");
+    }
+}
+
+/// R-P5P9-116: the floor arm itself refuses a coinbase row whose block is not the node's
+/// canonical one at the row's height (called directly: the orphan rule would otherwise take
+/// such a row first), and accepts the row in the canonical block; a row without its block
+/// or amount fails closed.
+#[tokio::test]
+async fn l_rest_the_coinbase_arm_wants_the_canonical_block() {
+    type Edit = Box<dyn Fn(&mut Value)>;
+    let cases: Vec<(&str, bool, Edit)> = vec![
+        ("canonical", true, Box::new(|_| {})),
+        (
+            "other block",
+            false,
+            Box::new(|r| r["blockHash"] = json!("c7000101")),
+        ),
+        (
+            "no block",
+            false,
+            Box::new(|r| {
+                r.as_object_mut().unwrap().remove("blockHash");
+            }),
+        ),
+        ("no amount", false, Box::new(|r| r["amount"] = json!(null))),
+    ];
+    for (case, ok, edit) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, node) = cb_floor(|_| {});
+        let nu = node_server(node).await;
+        let (au, bu) = (reads_server(vec![a]).await, reads_server(vec![b]).await);
+        let ctx = Ctx::new(rest_cfg(&nu, &au, &bu, dir.path(), "chainweb_data"))
+            .await
+            .unwrap();
+        let mut row = acct_row("<coinbase>", 7_000_100, "0.904046");
+        edit(&mut row);
+        let req = Request::new(ACCT_REQ.into(), Origin::Seed, None);
+        let got = ctx.node_places_at_floor(&req, &[row]).await;
+        assert_eq!(got.is_ok(), ok, "{case}: {got:?}");
+        if case == "other block" {
+            assert!(got.unwrap_err().contains("is not the row's"), "{case}");
+        }
+    }
+}
+
+/// R-P5P9-116: the coinbase arm is two counted node reads per height (the header, then the
+/// payload outputs), against one for a polled row, and it stops at the run's cap: with the
+/// budget it needs the row is explained, one read less and it is not.
+#[tokio::test]
+async fn l_rest_the_coinbase_arm_takes_two_reads_and_stops_at_the_cap() {
+    let run = |max: usize, poll: bool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, node) = if poll { floor_n(1) } else { cb_floor(|_| {}) };
+        let nu = node_server(node).await;
+        let cfg = rest_cfg(
+            &nu,
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            dir.path(),
+            "chainweb_data",
+        );
+        let rec = rest_record("account", ACCT_REQ, &a, &b);
+        e2_referee_capped(cfg, dir.path(), &[rec], max).await
+    };
+    let polled = run(1_000, true).await;
+    let cb = run(1_000, false).await;
+    assert_eq!(
+        (polled.explained, cb.explained),
+        (1, 1),
+        "{polled:?} {cb:?}"
+    );
+    // A polled floor row is one read; the coinbase is two.
+    assert_eq!(cb.node_reads, polled.node_reads + 1, "{polled:?} {cb:?}");
+    let at = run(cb.node_reads, false).await;
+    assert_eq!(at.explained, 1, "{at:?}");
+    assert_eq!(at.node_reads, cb.node_reads, "{at:?}");
+    let under = run(cb.node_reads - 1, false).await;
+    assert_eq!(under.explained, 0, "{under:?}");
+    assert!(under.node_reads < cb.node_reads, "{under:?}");
+}
+
 /// R-P5P9-95 m-9: the REST stored form's node polls (`node_confirms`) are reads of the run's
 /// budget. With only the chain graph's read allowed, a user row only ours lists is not
 /// confirmed; with the budget it is.

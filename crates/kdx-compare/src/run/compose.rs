@@ -302,8 +302,13 @@ impl Ctx {
     /// R-P5P9-105 (REST #1966): each oracle-only row at ours' floor height (at most
     /// `FLOOR_CHECKS` live, `REFEREE_FLOOR_CHECKS` in the referee, both in `graphql_window`)
     /// is canonical there on the node: its `/poll` entry is in the row's block at the row's
-    /// height. One read of the run's budget per chain chunk.
-    async fn node_places_at_floor(&self, req: &Request, rows: &[Value]) -> Result<(), String> {
+    /// height. One read of the run's budget per chain chunk; a coinbase row is placed by its
+    /// block's coinbase output instead (R-P5P9-116, two reads per height).
+    pub(super) async fn node_places_at_floor(
+        &self,
+        req: &Request,
+        rows: &[Value],
+    ) -> Result<(), String> {
         let cap = self
             .gql
             .floor_checks
@@ -312,6 +317,7 @@ impl Ctx {
             return Err(format!("{} rows, over {cap}", rows.len()));
         }
         let mut by_chain: HashMap<u8, Vec<(String, String, u64)>> = HashMap::new();
+        let mut coinbases: HashMap<(u8, u64, String), Vec<&Value>> = HashMap::new();
         for r in rows {
             let s = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
             let (Some(rk), Some(bh), Some(c), Some(h)) =
@@ -320,9 +326,22 @@ impl Ctx {
                 return Err("a row without its request key, block, chain or height".into());
             };
             if rk == "<coinbase>" {
-                return Err("a coinbase row has no /poll entry".into());
+                coinbases.entry((c, h, bh)).or_default().push(r);
+                continue;
             }
             by_chain.entry(c).or_default().push((rk, bh, h));
+        }
+        // R-P5P9-116 (REST #1854): a coinbase row has no `/poll` entry. It is placed by its
+        // block instead: the node's canonical header at the row's (chain, height) is the
+        // row's block, and that block's coinbase output has the TRANSFER "" -> the row's
+        // `toAccount` of the row's exact amount. Two counted reads per (chain, height, block);
+        // every coinbase row of that block is checked against the one payload.
+        for ((c, h, bh), group) in coinbases {
+            let payload = self.node_coinbase_payload(req, c, h, &bh).await?;
+            for r in group {
+                coinbase_row_matches(&payload, r)
+                    .map_err(|w| format!("the coinbase at chain {c} height {h}: {w}"))?;
+            }
         }
         for (c, keys) in by_chain {
             for chunk in keys.chunks(NODE_POLL_CHUNK) {
@@ -355,22 +374,16 @@ impl Ctx {
         Ok(())
     }
 
-    /// A coinbase row only ours lists: the node's canonical block at its (chain, height), on
-    /// the cut's branch, is the row's, and its coinbase output pays `account` exactly the
-    /// row's amount (two node reads, within the run's cap).
-    async fn node_pays_coinbase(
+    /// The payload outputs of the block the node holds canonical at (`chain`, `height`) on the
+    /// cut's branch, which must be `block`: the header read, then the payload read (two reads
+    /// of the run's budget).
+    async fn node_coinbase_payload(
         &self,
         req: &Request,
-        r: &Value,
-        account: &str,
-    ) -> Result<(), String> {
-        let (Some(c), Some(h), Some(bh)) = (
-            row_chain(r),
-            row_height(r),
-            r.get("blockHash").and_then(Value::as_str),
-        ) else {
-            return Err("a coinbase row without its chain, height or block".into());
-        };
+        c: u8,
+        h: u64,
+        bh: &str,
+    ) -> Result<Value, String> {
         if !self.gql.take_node_read() {
             return Err("the node read cap is reached".into());
         }
@@ -397,6 +410,26 @@ impl Ctx {
             .payload_with_outputs(c, ph)
             .await
             .map_err(|e| format!("payload read failed: {e:#}"))?;
+        Ok(payload)
+    }
+
+    /// A coinbase row only ours lists: the node's canonical block at its (chain, height), on
+    /// the cut's branch, is the row's, and its coinbase output pays `account` exactly the
+    /// row's amount (two node reads, within the run's cap).
+    async fn node_pays_coinbase(
+        &self,
+        req: &Request,
+        r: &Value,
+        account: &str,
+    ) -> Result<(), String> {
+        let (Some(c), Some(h), Some(bh)) = (
+            row_chain(r),
+            row_height(r),
+            r.get("blockHash").and_then(Value::as_str),
+        ) else {
+            return Err("a coinbase row without its chain, height or block".into());
+        };
+        let payload = self.node_coinbase_payload(req, c, h, bh).await?;
         let paid = crate::graphql_window::coinbase_paid(&payload, account).ok_or_else(|| {
             format!("the coinbase at chain {c} height {h} does not pay {account}")
         })?;
@@ -742,4 +775,30 @@ impl Ctx {
         let (un, ids) = classify(&d);
         Ok((un, ids, (!why.is_empty()).then(|| why.join("; "))))
     }
+}
+
+/// R-P5P9-116: the block's coinbase output pays the row exactly: a coin TRANSFER from the
+/// empty account to the row's `toAccount` of the row's amount (exact decimal), and the row
+/// itself is from the empty account.
+fn coinbase_row_matches(payload: &Value, r: &Value) -> Result<(), String> {
+    if r.get("fromAccount").and_then(Value::as_str) != Some("") {
+        return Err("the row is not from the empty account".into());
+    }
+    let to = r
+        .get("toAccount")
+        .and_then(Value::as_str)
+        .filter(|a| !a.is_empty())
+        .ok_or("the row has no toAccount")?;
+    let amount = match r.get("amount") {
+        Some(Value::String(s)) => crate::rewards::fixed(s),
+        Some(Value::Number(n)) => crate::rewards::fixed(&n.to_string()),
+        _ => None,
+    }
+    .ok_or("the row's amount does not read")?;
+    let paid = crate::graphql_window::coinbase_paid(payload, to)
+        .ok_or_else(|| format!("the coinbase does not pay {to}"))?;
+    if paid != amount {
+        return Err("the coinbase pays another amount".into());
+    }
+    Ok(())
 }
