@@ -310,7 +310,7 @@ mod tests {
         let al = shipped();
         assert_eq!(al.entries.len(), entries.len());
         // Only entries the owner accepted, or the controller flipped by a ruling on a run's
-        // evidence (R-P5P9-75, CG-4, or R-P5P9-86, CG-5, with its example records), are
+        // evidence (R-P5P9-75, CG-4, or R-P5P9-86 / R-P5P9-103, CG-5, with its example records), are
         // ACCEPTED.
         for e in &al.entries {
             if e.status == super::Status::Accepted {
@@ -318,7 +318,8 @@ mod tests {
                     e.owner_note.contains("by the owner")
                         || e.owner_note.contains("owner ruling")
                         || ((e.ruling.contains("R-P5P9-75, CG-4")
-                            || e.ruling.contains("R-P5P9-86, CG-5"))
+                            || e.ruling.contains("R-P5P9-86, CG-5")
+                            || e.ruling.contains("R-P5P9-103, CG-5"))
                             && (e.owner_note.contains('#') || e.owner_note.contains("zero hits"))),
                     "{} is ACCEPTED without an owner acceptance or a flip ruling with evidence",
                     e.id
