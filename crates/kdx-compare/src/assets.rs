@@ -54,7 +54,15 @@ pub fn assets_hash_with(
     h.update(assets_hash(allowlist, ops_dir)?.as_bytes());
     h.update(b"\0field_rules\0");
     h.update(serde_json::to_vec(rules)?);
-    if let Some(r) = replay {
+    if let Some(r) = replay.filter(|r| !r.exists()) {
+        // R-P5P9-105 (start hash): recorded as absent, not a refusal to start.
+        h.update(b"\0replay-absent\0");
+        h.update(
+            r.file_name()
+                .map(|n| n.as_encoded_bytes())
+                .unwrap_or_default(),
+        );
+    } else if let Some(r) = replay {
         let mut files: Vec<(String, std::path::PathBuf)> = if r.is_dir() {
             std::fs::read_dir(r)
                 .with_context(|| format!("reading {}", r.display()))?
@@ -85,8 +93,14 @@ pub fn assets_line_with(
     rules: &[crate::config::FieldRule],
     replay: Option<&Path>,
 ) -> anyhow::Result<String> {
+    // R-P5P9-105 (start hash): a configured replay file that is not there is named absent.
+    let absent = if replay.is_some_and(|r| !r.exists()) {
+        " replay absent"
+    } else {
+        ""
+    };
     Ok(format!(
-        "assets {} build {BUILD_SHA}",
+        "assets {} build {BUILD_SHA}{absent}",
         assets_hash_with(allowlist, ops_dir, rules, replay)?
     ))
 }
@@ -169,5 +183,32 @@ mod tests {
         assert_ne!(h0, h1);
         std::fs::write(replay.join("r1.txt"), "/txs/account/k:b").unwrap();
         assert_ne!(h(&[]), h0);
+    }
+
+    /// R-P5P9-105 (start hash): a replay file that is not there (a referee started from a
+    /// fresh checkout without the gitignored replay TSV) is recorded as absent in the start
+    /// line and hashed as absent, rather than refusing to start.
+    #[test]
+    fn i_r105_a_missing_replay_file_is_recorded_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (allow, ops) = (
+            dir.path().join("allowlist.toml"),
+            dir.path().join("graphql"),
+        );
+        std::fs::create_dir_all(&ops).unwrap();
+        std::fs::write(&allow, "a").unwrap();
+        let gone = dir.path().join("p3-replay.tsv");
+        let line = assets_line_with(&allow, &ops, &[], Some(gone.as_path())).unwrap();
+        assert!(line.ends_with(" replay absent"), "{line}");
+        let none = assets_line_with(&allow, &ops, &[], None).unwrap();
+        assert!(!none.contains("replay absent"), "{none}");
+        // Absent hashes apart from no replay configured, and apart from a present file.
+        let h_gone = assets_hash_with(&allow, &ops, &[], Some(gone.as_path())).unwrap();
+        assert_ne!(h_gone, assets_hash_with(&allow, &ops, &[], None).unwrap());
+        std::fs::write(&gone, "").unwrap();
+        let h_here = assets_hash_with(&allow, &ops, &[], Some(gone.as_path())).unwrap();
+        assert_ne!(h_gone, h_here);
+        let here = assets_line_with(&allow, &ops, &[], Some(gone.as_path())).unwrap();
+        assert!(!here.contains("replay absent"), "{here}");
     }
 }
