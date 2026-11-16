@@ -757,6 +757,17 @@ ruling = "R-P5P9-86 TC; R-P5P9-87 (the stored form)."
 owner_note = "PROPOSED (ruling R-P5P9-86 TC): new in FVH-E2b; CG-5 class TC (#243, #87, #866)."
 
 [[entry]]
+id = "graphql-r97-oracle-list-over-count"
+route = "other"
+json_path_glob = "/~graphql-r97-oracle-list-over-count"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-97 U (oracle self-inconsistency): a record whose root totalCount differs, where the count walk (R-P5P9-86 TC, /~graphql-count-walk beside this hit) finds the oracle's walked list one row longer than its own totalCount. Explained only when every one-sided row of the walk is settled by the H7 rules on the node, ours' count equals ours' walked rows (plus ours' node-checked rows above the oracle's height), both sides list the same number of shared rows, and the oracle's walked rows in place of its count make the count difference equal the difference in one-sided rows. The hit carries each side's count and walked rows. A list two or more rows over its count, a one-sided row H7 does not settle, or ours' count unlike ours' walked rows stays unexplained. Evidence: CG-5 re-referee #432 (3,424 listed, 3,423 counted) and #2045 (199 listed, 198 counted)."
+status = "PROPOSED"
+ruling = "R-P5P9-97 U."
+owner_note = "PROPOSED (ruling R-P5P9-97 U): new in FVH-H part 2; CG-5 class U (#432, #2045)."
+
+[[entry]]
 id = "graphql-oracle-decimal-zeros"
 route = "other"
 json_path_glob = "/~graphql-oracle-decimal-zeros"

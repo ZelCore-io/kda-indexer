@@ -82,6 +82,11 @@ pub const UNDECIDED_PATH: &str = "/~graphql-h7-undecided";
 /// R-P5P9-86 TC: visible hit of a totalCount-only difference the count walk settled
 /// (allowlist `graphql-count-walk`), with each side's count, walked rows and one-sided rows.
 pub const COUNT_WALK_PATH: &str = "/~graphql-count-walk";
+
+/// R-P5P9-97 U: the count walk's hit when the oracle's walked list holds one row more than its
+/// own totalCount and that alone accounts for the counts (allowlist id
+/// `graphql-r97-oracle-list-over-count`).
+pub const ORACLE_LIST_OVER_COUNT_PATH: &str = "/~graphql-r97-oracle-list-over-count";
 /// R-P5P9-86 TC: the walk passed [`COUNT_WALK_ROWS`] rows on a side, "count walk capped"
 /// (unexplained, its own reason; never allowlisted).
 pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
@@ -4678,6 +4683,25 @@ impl Ctx {
         } else {
             None
         };
+        // R-P5P9-97 U: the oracle's walked list holds one row more than its own count. Every
+        // one-sided row is settled (H7 above) and ours' count is ours' walked rows, so with
+        // the oracle's walked rows in place of its count the difference is the one-sided rows.
+        let over = lb - nb as i64 == 1 && na as i64 - lb == one_a - one_b;
+        if pa == pb && counts != one_a - one_b && over {
+            let mut out = h7;
+            out.push(entry(
+                COUNT_WALK_PATH,
+                Some(ev_a(one_a)),
+                Some(json!({"count": nb, "walked": lb, "oneSided": one_b,
+                    "nodeReads": st.node})),
+            ));
+            out.push(entry(
+                ORACLE_LIST_OVER_COUNT_PATH,
+                Some(json!({"count": na, "walked": la + n_above})),
+                Some(json!({"count": nb, "walked": lb})),
+            ));
+            return Ok(out);
+        }
         if pa != pb || counts != one_a - one_b {
             let heights = heights_why.map_or(String::new(), |w| {
                 format!("; the oracle does not count the window's heights: {w}")

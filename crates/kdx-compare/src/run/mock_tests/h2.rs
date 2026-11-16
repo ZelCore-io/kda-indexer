@@ -265,3 +265,69 @@ async fn h2_t_a_receive_legs_link_is_checked_against_the_source_leg() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// U #432 / #2045
+
+/// The stored referee over a QH7 record whose first pages differ by their totalCount alone
+/// (ours `na`, the oracle `nb`), ours and the oracle answering the walk with these rows.
+async fn walk_referee(
+    ours: Vec<Value>,
+    oracle: Vec<Value>,
+    (na, nb): (u64, u64),
+) -> crate::referee::Report {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(w_node()).await;
+    let au = ours_fn_server(super::e2b::walk_reply("transfers", ours.clone(), na)).await;
+    let bu = ours_fn_server(super::e2b::walk_reply("transfers", oracle.clone(), nb)).await;
+    let ops = c3_ops(dir.path());
+    let cfg = c3_cfg(&nu, &au, &bu, dir.path(), &ops, "");
+    let count = DiffEntry {
+        path: "/data/transfers/totalCount".into(),
+        kind: DiffKind::Changed,
+        a: Some(json!(na)),
+        b: Some(json!(nb)),
+    };
+    let rec = e2_stored(
+        "QH7",
+        json!({"accountName": "s", "first": 1}),
+        w_page(vec![ours[0].clone()], na),
+        w_page(vec![oracle[0].clone()], nb),
+        vec![count],
+    );
+    e2_referee(cfg, dir.path(), &[rec]).await
+}
+
+/// R-P5P9-97 U (#2045's shape): the oracle's walked list holds one row more than its own
+/// totalCount (3 rows, count 2), its two one-sided rows orphans on the node, and ours'
+/// count equals ours' walked rows. With every one-sided row settled, the count difference
+/// is the oracle's self-inconsistency → explained by its own hit. Two rows more than its
+/// count, or an oracle-only row the node does not settle, stay unexplained.
+#[tokio::test]
+async fn h2_u_the_oracles_list_one_row_over_its_own_count() {
+    let w = || w_row("w", "B100", 4);
+    let q = |rk: &str, block: Option<&str>| {
+        let mut e = h7_xrow(rk, 100, json!(1.5), Some(("s", "r")));
+        if let Some(b) = block {
+            e["node"]["blockHash"] = json!(b);
+        }
+        e
+    };
+    let orphans = vec![w(), q("q1", Some("X100")), q("q2", Some("X100"))];
+    let rep = walk_referee(vec![w()], orphans.clone(), (1, 2)).await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    assert_eq!(
+        rep.by_class.get("graphql-r97-oracle-list-over-count"),
+        Some(&1),
+        "{rep:?}"
+    );
+    // Two rows over its count: unexplained.
+    let mut over = orphans.clone();
+    over.push(q("q3", Some("X100")));
+    let rep = walk_referee(vec![w()], over, (1, 2)).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
+    // A one-sided row the node does not settle (no block): unexplained.
+    let unsettled = vec![w(), q("q1", Some("X100")), q("q2", None)];
+    let rep = walk_referee(vec![w()], unsettled, (1, 2)).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
+}
