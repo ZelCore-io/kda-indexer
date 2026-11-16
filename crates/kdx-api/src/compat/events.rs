@@ -26,6 +26,7 @@ use super::{
     check_strategy, collect_page, page_response, paging, resume_exhausted, resume_max, store_floor,
     text, Candidates, Like, Page, Paging, Params, RowSource, ScanLimits, SearchSettings,
 };
+use crate::search::ClientIp;
 use crate::server::ApiState;
 use crate::store::{PostingQuery, View};
 use crate::{ApiError, ApiResult};
@@ -72,6 +73,8 @@ impl Filter {
 struct Src {
     f: Filter,
     cache: HashMap<TxKey, Vec<Ev>>,
+    /// Render rows in the native API's shape (`/api/v1/search/events`).
+    native: bool,
 }
 
 impl Src {
@@ -102,10 +105,18 @@ impl RowSource for Src {
     }
 
     fn render(&mut self, view: &View, r: &TxRecord, b: &BlockRecord, sub: u16) -> ApiResult<Value> {
+        let native = self.native;
         let evs = self.load(view, r)?;
         let e = evs
             .get(sub as usize)
             .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("event row vanished")))?;
+        if native {
+            let mut m = crate::native::tx_context(r, b);
+            if let Value::Object(mut row) = crate::native::txs::event_json(e) {
+                m.append(&mut row);
+            }
+            return Ok(Value::Object(m));
+        }
         Ok(shapes::event_detail(r, b, e))
     }
 }
@@ -153,12 +164,29 @@ fn name_ids(view: &View, name: &str, module: Option<&str>, cap: usize) -> Option
     (!more && ids.len() <= cap).then_some(ids)
 }
 
+/// The bounded newest-first event scan for `search` alone (`/api/v1/search/events`; the
+/// compat engine, rows in the native shape when `native`).
+pub fn search_scan(
+    view: &View,
+    search: Like,
+    pg: &Paging,
+    settings: SearchSettings,
+    native: bool,
+) -> ApiResult<Page> {
+    let f = Filter {
+        search: Some(search),
+        ..Filter::default()
+    };
+    page(view, f, pg, settings, 0, native)
+}
+
 fn page(
     view: &View,
     f: Filter,
     pg: &Paging,
     search: SearchSettings,
     cap: usize,
+    native: bool,
 ) -> ApiResult<Page> {
     let empty = Page {
         rows: Vec::new(),
@@ -192,6 +220,7 @@ fn page(
     let mut src = Src {
         f,
         cache: HashMap::new(),
+        native,
     };
     if let Some(ids) = ids {
         if ids.is_empty() {
@@ -224,7 +253,7 @@ fn page(
         max_heights: search.max_scan_heights.max(1),
         until: Instant::now() + Duration::from_millis(search.timeout_ms),
     };
-    collect_page(
+    let page = collect_page(
         view,
         Candidates::Scan {
             next: Some(top),
@@ -233,62 +262,26 @@ fn page(
         &mut src,
         pg,
         Some(limits),
-    )
-}
-
-/// Longest `name`/`param`/`search` accepted (characters).
-pub const MAX_PATTERN_CHARS: usize = 256;
-/// Most unescaped `%` wildcards in one pattern (bounds the matcher's backtracking).
-pub const MAX_PATTERN_WILDCARDS: usize = 8;
-
-/// Unescaped `%` in a LIKE pattern.
-fn wildcards(s: &str) -> usize {
-    let mut n = 0;
-    let mut it = s.chars();
-    while let Some(c) = it.next() {
-        match c {
-            '\\' => {
-                it.next();
-            }
-            '%' => n += 1,
-            _ => {}
-        }
+    )?;
+    if page.truncated {
+        crate::search::rejected(if Instant::now() >= limits.until {
+            "timeout"
+        } else {
+            "cap"
+        });
     }
-    n
+    Ok(page)
 }
 
-/// Characters of a LIKE pattern other than `%` and `_` (an escaped one counts).
-fn literal_chars(s: &str) -> usize {
-    let mut n = 0;
-    let mut it = s.chars();
-    while let Some(c) = it.next() {
-        match c {
-            '\\' => {
-                it.next();
-                n += 1;
-            }
-            '%' | '_' => {}
-            _ => n += 1,
-        }
-    }
-    n
-}
+use crate::search::{check_pattern, literal_chars};
+pub use crate::search::{MAX_PATTERN_CHARS, MAX_PATTERN_WILDCARDS};
 
 /// Refuse patterns that would make a request expensive: too long, too many wildcards.
 /// `Err` is the 400 text.
 fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
     for k in ["name", "param", "search"] {
         let Some(v) = p.get(k) else { continue };
-        if v.chars().count() > MAX_PATTERN_CHARS {
-            return Err(format!(
-                "{k} must be at most {MAX_PATTERN_CHARS} characters"
-            ));
-        }
-        if wildcards(v) > MAX_PATTERN_WILDCARDS {
-            return Err(format!(
-                "{k} may contain at most {MAX_PATTERN_WILDCARDS} '%' wildcards"
-            ));
-        }
+        check_pattern(k, v)?;
     }
     // `search` has no minimum length: chainweb-data answers `search=T` (G2). A short
     // search matches often, so it fills a page fast; the scan stays bounded by
@@ -312,6 +305,8 @@ fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
 pub async fn handler(
     State(st): State<Arc<ApiState>>,
     Extension(search): Extension<SearchSettings>,
+    Extension(ctx): Extension<Arc<crate::search::SearchCtx>>,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
@@ -334,11 +329,25 @@ pub async fn handler(
         module: p.get("modulename").map(str::to_owned),
     };
     let cap = st.settings.max_event_lists;
-    // Without modulename the request may take the scan path: an expensive class.
-    let res = if f.module.is_none() {
-        st.read_heavy(move |v| page(v, f, &pg, search, cap)).await
+    let heavy = f.module.is_none();
+    // `search` is a text search: it takes a search gate slot (S-5), held by the read.
+    let permit = if f.search.is_some() {
+        match ctx.gate.try_acquire(ip) {
+            Ok(p) => Some(p),
+            Err(r) => return r,
+        }
     } else {
-        st.read(move |v| page(v, f, &pg, search, cap)).await
+        None
+    };
+    let run = move |v: &View| {
+        let _permit = permit;
+        page(v, f, &pg, search, cap, false)
+    };
+    // Without modulename the request may take the scan path: an expensive class.
+    let res = if heavy {
+        st.read_heavy(run).await
+    } else {
+        st.read(run).await
     };
     match res {
         Ok(p) => page_response(p),

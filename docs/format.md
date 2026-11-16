@@ -12,12 +12,15 @@ The data directory of one network looks like this:
   hot/            MDBX environment: dictionaries, live tail, undo, checkpoints (mutable)
   segments/       immutable range and step files + manifest.json
   etl/            temporary spool files while a range is being built (deleted afterwards)
+  search/         code search index (tantivy) + manifest.json; derived, rebuildable
+  search.new/     a `search rebuild` in progress (swapped in for search/ at the end)
   LOCK            held by the writing process
+  search.lock     held by a `search rebuild` (and briefly by the tail stage's manifest writes)
   merkle-unverified.jsonl   backfill blocks whose payload Merkle roots did not verify
 ```
 
-A snapshot directory (`kda-indexer snapshot --out DIR`) holds `hot/`, `segments/` and
-`SNAPSHOT.json` (format versions, network, frontiers, tail checkpoints, manifest blake3;
+A snapshot directory (`kda-indexer snapshot --out DIR`) holds `hot/`, `segments/`, `search/`
+(when the source has one) and `SNAPSHOT.json` (format versions, network, frontiers, tail checkpoints, manifest blake3;
 no paths).
 
 Segments refer to names (accounts, modules, event names, public keys, module hashes) by
@@ -527,6 +530,103 @@ Readers page newest first: ranges from newest to oldest, each list from its last
 - **Block (chain, height) → record**: the range by height, the slot, the `present` bit and
   its rank give the `blocks.seg` record; adjacent refs resolve through the same range.
 - **Block hash → block**: the hot tail first, then `bh.idx` of each range, newest first.
+
+## Search index (`search/`)
+
+`search/` is derived data: `search rebuild` recreates it from `hot/` and `segments/`, and
+neither of those refers to it. Its own layout version is the `format` field of
+`search/manifest.json` (1); a build that reads another version asks for a rebuild. It never
+changes the store format.
+
+```
+search/
+  manifest.json   {format, tantivy, mode, fallback_min_len, built_through_height, docs, bytes, built_at}
+  meta.json       tantivy's segment list (with .managed.json, tantivy's own files)
+  <segment uuid>.{idx,term,store,fast,fieldnorm,...}   tantivy segment files (immutable)
+```
+
+One tantivy document per distinct `exec` code body (CodeHash = blake2b-128 of `exec.code`,
+the `code` posting family's key; spec §3.8, B5). tantivy 0.27.0, doc store zstd, no field
+norms.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `hash` | bytes: indexed (raw), stored, fast | the full 16-byte CodeHash |
+| `code` | text, tokenizer `ngram3` (all 3-character n-grams, by Unicode scalar, no lowercasing), doc ids only; stored | the body |
+| `first_h` | u64 fast | height of the body's first tx |
+| `last_h` | u64 fast | the last height of the body's last range when the doc was written (tail docs: the tx's height) |
+| `module` | u64 fast | 1 when the body contains `(module ` or `(interface ` |
+
+Docs are never updated or deleted, so `last_h` is a lower bound of where the body's txs are:
+an expansion from a hash to txs reads the `code` postings in `first_h..=last_h` and above
+`built_through_height`. A body seen only in a reorged block stays (its expansion finds no
+tx).
+
+Modes (S-1): `full` indexes every body; `fallback` indexes bodies of at least
+`fallback_min_len` bytes plus every module or interface deployment, and leaves the rest to
+the bounded scan. `manifest.json` records the mode the index was built with.
+
+`built_through_height`: every exec tx at or below it on every chain has its body in the
+index (bodies of later txs may be there too). A rebuild sets it to the lowest tail
+checkpoint it saw (or the segment frontier − 1 when the freezer moved blocks during the
+rebuild); the tail stage moves it to the lowest height it has read on every chain after each
+commit. `built_at` (unix seconds) changes only with a rebuild; a process that sees it change
+reopens `search/`.
+
+**Rebuild.** Pass 0 (census) merges the entity directories of every range's `code.pst` and
+the hot `TailPostings` family 4 into the sorted list of distinct 8-byte prefixes with the
+first and last range of each (12 bytes per prefix in memory). Pass 1 decodes, per range, the
+first tx of each prefix whose first range it is, in TxNum order; the hot store is read last,
+every exec tx checked by full hash. Two bodies that share an 8-byte prefix and first appear
+in the same range give one doc (expected about n²/2⁶⁵ times for n bodies). The new index is
+written to `search.new/` and renamed over `search/` (the old one is moved aside and removed).
+A crash between the renames leaves no `search/manifest.json`; `run` then rebuilds.
+
+**Query.** A LIKE pattern's literal runs (`%`, `_` split runs; `\` escapes) of at least 3
+characters give the 3-grams the prefilter ANDs (at most 64). Every string the pattern
+matches contains every run, so the prefilter never drops a match. Each prefilter hit's
+stored code is checked with the LIKE matcher. A pattern without such a run has no index path
+(`no_index_path`).
+
+**Snapshot.** `snapshot` reads `search/manifest.json`, then `meta.json`, links the files of
+the segments `meta.json` lists, and writes both plus `.managed.json` (the linked names).
+
+## Additive tables
+
+The hot store can gain tables without a format version change (rule A-1). Such a table changes no
+stored byte of the base tables or the segments, and its rows are derived state that a rerun
+rebuilds. `HotStore::open` (read-write) creates every table, so `run` adds them on its first
+start. `open_ro` (`serve`, `inspect`, `hot stats`) opens the base tables strictly and the
+additive ones only when present; a missing additive table reads as empty, so the routes over it
+answer empty lists. Snapshots copy them like any table. They are not undone by tail undo: a
+reorg marks the affected balance rows dirty instead.
+
+| Table | Key | Value |
+|---|---|---|
+| `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node), balance text as the node printed it, guard hash [16], as_of u32 (the node tip the `/local` answer read: `metaData.blockHeight − 1`, since the node reports the pending block's height; for an absent row, the chain's tail height at the call), reconciled_at u32 (unix s) |
+| `BalanceDirty` | same | marked_height u32 (highest block height that marked it; 0 from the seed) |
+| `Guards` | guard hash [16] = blake2b-128 of the guard JSON as returned; a resolved keyset reference under blake2b-128 of `keysetref:{chain}:{name}` | guard (or keyset) JSON bytes |
+| `KeyAccounts` | blake2b-128 of the public key [16], AccountId u32 | empty |
+| `Tokens` | ModuleId u32 | first_height u32, holders u64, kind u8 (0 = fungible) |
+| `NftBalances` | AccountId u32, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 | source u8 (1 = ledger event, 2 = `/local`), ledger ModuleId u32, as_of u32, token-id length u16, token id, balance text |
+| `NftDirty` | same | marked_height u32, ledger ModuleId u32, token id |
+
+`Meta` keys of the balance seed: `balances_seeded` (u32: the highest tail height when the seed
+finished), `balances_seed_cursor` (13 bytes while a seed runs: range start u32, range end u32,
+family u8, entity index u32) and `balances_reconcile_stats` (JSON heartbeat of the reconciler).
+
+NFT rows (`nft.rs`): only events of trusted ledger modules (`[nft] ledgers`, default `marmalade.ledger` and `marmalade-v2.ledger`; a module merely named `ledger` is not trusted) count, and the ledger is part of the key. A tail block's ledger events update `NftBalances` in the block's own txn.
+A v2-shaped `RECONCILE [token-id, amount, sender, receiver]` (both `marmalade-v2.ledger` and
+`marmalade.ledger` emit it) upserts both parties' `current` balance; other ledger events of a
+module that emitted no `RECONCILE` in the tx mark the accounts they name `NftDirty`. An event
+at height `h` replaces a row unless the row is newer, so replays and the history fill never
+move a row back. Tail undo marks the rows the undone txs touched `NftDirty`; the reconciler
+reads them with `get-balance`. `Meta nft_filled` (u32: the highest tail height when the history
+fill finished) marks the one-time fill that walks the `evt` postings of every ledger event name.
+
+`KeyAccounts` is keyed by a hash of the key text, not by a `PubKey` dictionary id: the
+dictionary stays a pure function of the blocks (`hot stats --digest` replay checks), and keys
+that never signed a transaction are covered.
 
 ## Checking
 

@@ -61,10 +61,11 @@ fn utc_time(s: &str) -> Option<i64> {
 }
 
 struct Tables {
-    /// `(from height, total mined before it, reward per height from it)`, ascending.
-    rewards: Vec<(u64, i128, i128)>,
-    /// `(release time, cumulative allocation from it)`, ascending.
-    allocations: Vec<(i64, i128)>,
+    /// `(from height, total mined before it, reward per height from it, the total's places)`,
+    /// ascending. Places are Data.Decimal's digits after the point (see `circulating_text`).
+    rewards: Vec<(u64, i128, i128, u8)>,
+    /// `(release time, cumulative allocation from it, its places)`, ascending.
+    allocations: Vec<(i64, i128, u8)>,
 }
 
 fn tables() -> &'static Tables {
@@ -81,21 +82,23 @@ fn tables() -> &'static Tables {
         }
         // cumulativeRewards: reward `r` applies from the previous threshold up to `h`.
         let mut rewards = Vec::with_capacity(map.len() + 1);
-        let (mut last, mut total) = (0u64, 0i128);
+        let (mut last, mut total, mut places) = (0u64, 0i128, 0u8);
         for (h, r) in map {
-            rewards.push((last, total, r));
-            total += i128::from(h - last) * r;
+            rewards.push((last, total, r, places));
+            let p = i128::from(h - last) * r;
+            total += p;
+            places = places.max(norm_places(p));
             last = h;
         }
-        rewards.push((last, total, 0));
-        let mut m: BTreeMap<u64, (i128, i128)> = BTreeMap::new();
-        for (from, t, r) in rewards {
-            m.insert(from, (t, r));
+        rewards.push((last, total, 0, places));
+        let mut m: BTreeMap<u64, (i128, i128, u8)> = BTreeMap::new();
+        for (from, t, r, p) in rewards {
+            m.insert(from, (t, r, p));
         }
-        let rewards = m.into_iter().map(|(h, (t, r))| (h, t, r)).collect();
+        let rewards = m.into_iter().map(|(h, (t, r, p))| (h, t, r, p)).collect();
 
         // cumulativeAllocations: consecutive rows of one time form a section.
-        let mut rows: Vec<(i64, i128)> = Vec::new();
+        let mut rows: Vec<(i64, i128, u8)> = Vec::new();
         for line in TOKEN_PAYMENTS
             .lines()
             .skip(1)
@@ -106,52 +109,102 @@ fn tables() -> &'static Tables {
             rows.push((
                 utc_time(f[1]).expect("token_payments.csv time"),
                 dec(f[3]).expect("token_payments.csv amount"),
+                written_places(f[3]),
             ));
         }
-        let mut cum: BTreeMap<i64, i128> = BTreeMap::new();
-        let mut total = 0i128;
+        let mut cum: BTreeMap<i64, (i128, u8)> = BTreeMap::new();
+        let (mut total, mut places) = (0i128, 0u8);
         let mut i = 0;
         while i < rows.len() {
             let t = rows[i].0;
             while i < rows.len() && rows[i].0 == t {
                 total += rows[i].1;
+                places = places.max(rows[i].2);
                 i += 1;
             }
-            cum.insert(t, total);
+            cum.insert(t, (total, places));
         }
         Tables {
             rewards,
-            allocations: cum.into_iter().collect(),
+            allocations: cum.into_iter().map(|(t, (v, p))| (t, v, p)).collect(),
         }
     })
 }
 
-/// Coins mined up to `height` (`getTotalMiningRewards`), fixed point.
-fn mined(height: u64) -> i128 {
+/// Coins mined up to `height` (`getTotalMiningRewards`), fixed point, with its places.
+fn mined_places(height: u64) -> (i128, u8) {
     let t = &tables().rewards;
     let i = t.partition_point(|e| e.0 <= height).saturating_sub(1);
-    let (last, total, reward) = t[i];
-    total + i128::from(height - last) * reward
+    let (last, total, reward, places) = t[i];
+    let p = i128::from(height - last) * reward;
+    (total + p, places.max(norm_places(p)))
 }
 
-/// Allocations released at `unix` seconds (`getTotalAllocations`), fixed point.
-fn allocated(unix: i64) -> i128 {
+fn mined(height: u64) -> i128 {
+    mined_places(height).0
+}
+
+/// Allocations released at `unix` seconds (`getTotalAllocations`), fixed point, with its
+/// places.
+fn allocated_places(unix: i64) -> (i128, u8) {
     let t = &tables().allocations;
     let i = t.partition_point(|e| e.0 <= unix);
     if i == 0 {
-        0
+        (0, 0)
     } else {
-        t[i - 1].1
+        (t[i - 1].1, t[i - 1].2)
     }
+}
+
+fn allocated(unix: i64) -> i128 {
+    allocated_places(unix).0
+}
+
+/// Digits after the point of a CSV literal (`read` of a Data.Decimal keeps them).
+fn written_places(s: &str) -> u8 {
+    s.trim().split_once('.').map_or(0, |(_, f)| f.len() as u8)
+}
+
+/// Places of a normalized product (Data.Decimal's `*` drops trailing zeros).
+fn norm_places(mut v: i128) -> u8 {
+    if v == 0 {
+        return 0;
+    }
+    let mut p = SCALE_DIGITS as u8;
+    while p > 0 && v % 10 == 0 {
+        v /= 10;
+        p -= 1;
+    }
+    p
+}
+
+fn unix_secs(now: SystemTime) -> i64 {
+    match now.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    }
+}
+
+/// chainweb-data's `/coins` text: `show` of the Haskell `Decimal` that `getCirculatingCoins`
+/// returns (ruling C-1). Data.Decimal prints exactly its number of places: a sum keeps the
+/// larger count of its terms, a product is normalized (trailing zeros dropped), and a CSV
+/// literal keeps the places it was written with.
+pub fn circulating_text(height: u64, now: SystemTime) -> String {
+    let (m, mp) = mined_places(height);
+    let (a, ap) = allocated_places(unix_secs(now));
+    let v = m + a;
+    let p = mp.max(ap).min(SCALE_DIGITS as u8) as usize;
+    let int = v / SCALE;
+    if p == 0 {
+        return int.to_string();
+    }
+    let frac = (v % SCALE) / 10i128.pow((SCALE_DIGITS - p) as u32);
+    format!("{int}.{frac:0p$}")
 }
 
 /// Circulating supply at block `height` and time `now` (`getCirculatingCoins`).
 pub fn circulating(height: u64, now: SystemTime) -> f64 {
-    let unix = match now.duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(_) => 0,
-    };
-    let v = mined(height) + allocated(unix);
+    let v = mined(height) + allocated(unix_secs(now));
     // Exact decimal text, so the double is correctly rounded.
     format!("{}.{:012}", v / SCALE, v % SCALE)
         .parse()
@@ -177,5 +230,18 @@ mod tests {
         assert_eq!(mined(0), 0);
         assert_eq!(allocated(0), 0);
         assert!(circulating(7_000_000, SystemTime::now()) > 3.0e8);
+    }
+
+    /// chainweb-data's `/coins` answered `379699932.889` and, a minute later,
+    /// `379699987.13176` on 2026-11-11 (live): heights 7,396,275 and 7,396,278 (18.08092 per
+    /// height). The first shows the places rule (3, not the 5 of its neighbours).
+    #[test]
+    fn coins_text_matches_chainweb_data() {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1794431615);
+        assert_eq!(circulating_text(7_396_275, t), "379699932.889");
+        assert_eq!(circulating_text(7_396_278, t), "379699987.13176");
+        assert_eq!(norm_places(1_500_000_000_000), 1);
+        assert_eq!(norm_places(0), 0);
+        assert_eq!(written_places("16000.50"), 2);
     }
 }

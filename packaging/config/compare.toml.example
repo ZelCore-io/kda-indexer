@@ -37,6 +37,16 @@ kind = "chainweb_data"
 # url = "http://127.0.0.1:31362"
 # kind = "kda_indexer_compat"
 
+# P6 balances pair: kda-indexer native API (A) against the node's /local (`details` reads only,
+# at node_max_rps; the node_local url is ignored, [node] is used).
+# pairs = [..., ["native", "node_local"]]
+# [targets.native]
+# url = "http://127.0.0.1:31771"
+# kind = "kda_indexer_native"
+# [targets.node_local]
+# url = "http://127.0.0.1:1"
+# kind = "node_local"
+
 # [targets.replica]
 # url = "http://127.0.0.1:31462"
 # kind = "kda_indexer_compat"

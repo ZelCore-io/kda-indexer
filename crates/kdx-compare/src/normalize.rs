@@ -24,6 +24,8 @@ pub enum RouteKind {
     Stats,
     Search,
     Coins,
+    /// Native `/api/v1/accounts/{a}/balances` against `/local` (H-1).
+    Balances,
     V1Txs,
     Other,
 }
@@ -41,6 +43,9 @@ impl RouteKind {
             "/stats" => RouteKind::Stats,
             "/coins" => RouteKind::Coins,
             p if p.starts_with("/txs/account/") => RouteKind::Account,
+            p if p.starts_with("/api/v1/accounts/") && p.contains("/balances") => {
+                RouteKind::Balances
+            }
             p if p.starts_with("/v1/txs/") => RouteKind::V1Txs,
             _ => RouteKind::Other,
         }
@@ -56,6 +61,7 @@ impl RouteKind {
             RouteKind::Stats => "stats",
             RouteKind::Search => "search",
             RouteKind::Coins => "coins",
+            RouteKind::Balances => "balances",
             RouteKind::V1Txs => "v1txs",
             RouteKind::Other => "other",
         }

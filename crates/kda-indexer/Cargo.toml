@@ -34,6 +34,7 @@ kdx-node.workspace = true
 kdx-decode.workspace = true
 kdx-hot.workspace = true
 kdx-segment.workspace = true
+kdx-search.workspace = true
 kdx-ingest.workspace = true
 kdx-api.workspace = true
 kdx-metrics.workspace = true

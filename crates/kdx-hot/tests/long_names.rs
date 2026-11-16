@@ -86,10 +86,19 @@ fn rows(store: &HotStore) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     let ro = store.ro().unwrap();
     let mut out = Vec::new();
     for t in kdx_hot::Table::all() {
-        if t.name().starts_with("Dict") {
+        // Balance dirty marks and token rows survive an undo by design (B-3: no balance undo
+        // ops; the reconciler re-reads the rows).
+        if t.name().starts_with("Dict") || t.is_additive() {
             continue;
         }
         for (k, v) in ro.scan(t, &[], |_| true).unwrap() {
+            // The balance mark watermark (M-11) records blocks applied with marks; an unwind
+            // leaves it, like the additive tables' marks.
+            if t == kdx_hot::Table::Meta
+                && k.starts_with(kdx_hot::balances::meta::MARKED_THROUGH.as_bytes())
+            {
+                continue;
+            }
             if t == kdx_hot::Table::Counters && v.iter().all(|&x| x == 0) {
                 continue;
             }

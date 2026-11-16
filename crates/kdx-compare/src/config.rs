@@ -68,6 +68,11 @@ pub enum TargetKind {
     /// Answers `/v1/txs` by composing chainweb-data calls (the `url` is a chainweb-data
     /// instance); used when no live kda-txs is reachable.
     KdaTxsViaCwd,
+    /// kda-indexer native API: answers `/api/v1/accounts/{a}/balances` (the balances pair, A).
+    KdaIndexerNative,
+    /// The node's `/local` (H-1: `details` reads only): the balances pair's B. The `url` is
+    /// ignored; the harness uses `[node]`.
+    NodeLocal,
 }
 
 impl TargetKind {
@@ -76,9 +81,10 @@ impl TargetKind {
     pub fn serves(self, route: crate::normalize::RouteKind) -> bool {
         use crate::normalize::RouteKind;
         match self {
-            TargetKind::ChainwebData => route != RouteKind::V1Txs,
+            TargetKind::ChainwebData => !matches!(route, RouteKind::V1Txs | RouteKind::Balances),
             TargetKind::KdaTxs | TargetKind::KdaTxsViaCwd => route == RouteKind::V1Txs,
-            TargetKind::KdaIndexerCompat => true,
+            TargetKind::KdaIndexerCompat => route != RouteKind::Balances,
+            TargetKind::KdaIndexerNative | TargetKind::NodeLocal => route == RouteKind::Balances,
         }
     }
 }

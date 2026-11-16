@@ -585,24 +585,109 @@ impl View {
         })
     }
 
-    /// Every stored tx of the defpact `pact`, ascending by TxKey (hot and frozen): the exec
-    /// that started it and each `cont` step. Candidates come from the `pact` postings (an
-    /// 8-byte entity); each record is checked to hold this exact pactId, as the cmd's
-    /// `payload.cont.pactId` or the output's `continuation.pactId`.
-    pub fn pact_txs(&self, pact: &Hash32) -> ApiResult<Vec<TxKey>> {
+    /// Stored txs of the defpact `pact`, ascending by TxKey (hot and frozen): the exec that
+    /// started it (`cont` false) and each `cont` step (`cont` true). Candidates come from the
+    /// `pact` postings (an 8-byte entity); each record is checked to hold this exact pactId,
+    /// as the cmd's `payload.cont.pactId` or the output's `continuation.pactId`. At most `max`
+    /// txs, the newest ones; the flag is true when the walk stopped there (R-P5P9-3).
+    pub fn pact_txs(&self, pact: &Hash32, max: usize) -> ApiResult<(Vec<(TxKey, bool)>, bool)> {
         let mut out = Vec::new();
+        let mut capped = false;
         for k in self.postings(Family::Pact, pact_entity(pact), PostingQuery::default())? {
             let k = k?;
             if let Some(r) = self.tx(k)? {
-                if cmd_pact_id(&r) == Some(*pact)
-                    || record_pact_id(&r, &self.dict())? == Some(*pact)
-                {
-                    out.push(k);
+                let cont = cmd_pact_id(&r) == Some(*pact);
+                if cont || record_pact_id(&r, &self.dict())? == Some(*pact) {
+                    if out.len() == max {
+                        capped = true;
+                        break;
+                    }
+                    out.push((k, cont));
                 }
             }
         }
         out.reverse();
-        Ok(out)
+        Ok((out, capped))
+    }
+
+    /// First height of the upper expansion window for code-search hits: every height above
+    /// `rebuilt_through` (the last rebuild's census frontier − 1: docs are never updated, so
+    /// `last_h` is exact only up to there; `None` = 0, expand from `first_h`), and the hot part.
+    pub fn code_upper_from(&self, rebuilt_through: Option<u32>) -> u32 {
+        rebuilt_through
+            .map_or(0, |b| b.saturating_add(1))
+            .min(self.hot_floor())
+    }
+
+    /// TxKeys of the exec txs whose code may be one of `hits` (code search, plan Task 10),
+    /// newest first, deduplicated, with the query's filters. Per hit, only the `code`
+    /// postings in `first_h..=last_h` plus every height from [`View::code_upper_from`].
+    ///
+    /// The posting entity is an 8-byte prefix of the hash: the caller checks each record
+    /// with [`code_hit`] on the record it decodes anyway (one decode per row).
+    ///
+    /// Each walk is started (its first key read) here, in `hits` order (newest bodies first),
+    /// until `prime_until`; the rest are dropped and the bool says so (a truncated answer
+    /// rather than a 504 when many hits walk long windows). The deadline is checked every 64
+    /// items after that.
+    pub fn code_txs(
+        &self,
+        hits: &[CodeHit],
+        rebuilt_through: Option<u32>,
+        q: PostingQuery,
+        prime_until: Instant,
+    ) -> ApiResult<(KeyIter<'_>, bool)> {
+        // Hits sharing an entity walk its postings once, at the first hit's place.
+        let mut order: Vec<(u64, u32, u32)> = Vec::new();
+        let mut at: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for h in hits {
+            let e = kdx_decode::index::code_entity(&h.hash);
+            match at.get(&e) {
+                Some(&i) => {
+                    order[i].1 = order[i].1.min(h.first_h);
+                    order[i].2 = order[i].2.max(h.last_h);
+                }
+                None => {
+                    at.insert(e, order.len());
+                    order.push((e, h.first_h, h.last_h));
+                }
+            }
+        }
+        let upper_from = self.code_upper_from(rebuilt_through);
+        let q_min = q.min_height.unwrap_or(0);
+        let q_max = q.max_height.unwrap_or(u32::MAX);
+        let mut its: Vec<Box<dyn Iterator<Item = ApiResult<TxKey>> + '_>> = Vec::new();
+        let mut cut = false;
+        for (entity, first_h, last_h) in order {
+            if Instant::now() >= prime_until {
+                cut = true;
+                break;
+            }
+            let mut windows = Vec::with_capacity(2);
+            if first_h >= upper_from {
+                windows.push((first_h.max(q_min), q_max));
+            } else {
+                windows.push((upper_from.max(q_min), q_max));
+                windows.push((first_h.max(q_min), last_h.min(upper_from - 1).min(q_max)));
+            }
+            let mut walks: Vec<Box<dyn Iterator<Item = ApiResult<TxKey>> + '_>> = Vec::new();
+            for (lo, hi) in windows {
+                if lo > hi {
+                    continue;
+                }
+                let wq = PostingQuery {
+                    min_height: Some(lo),
+                    max_height: Some(hi),
+                    ..q
+                };
+                walks.push(self.postings(Family::Code, entity, wq)?);
+            }
+            // Windows are disjoint and the first is the higher one: chained, still newest first.
+            let mut walk = walks.into_iter().flatten().peekable();
+            walk.peek();
+            its.push(Box::new(walk));
+        }
+        Ok((Box::new(MergeDesc::new(its, self.deadline)), cut))
     }
 
     /// TxKeys of `(f, entity)`, newest first: the hot part, then the frozen part, with the
@@ -698,6 +783,105 @@ impl View {
             }
             Some(r)
         })))
+    }
+}
+
+/// A boxed newest-first TxKey stream.
+pub type KeyIter<'v> = Box<dyn Iterator<Item = ApiResult<TxKey>> + 'v>;
+
+/// The record's exec code hashes to one of `hashes` (code search: posting entities are
+/// 8-byte prefixes).
+pub fn code_hit(r: &TxRecord, hashes: &std::collections::HashSet<[u8; 16]>) -> bool {
+    kdx_search::exec_code(r).is_some_and(|c| hashes.contains(&kdx_types::blake2b_128(c.as_bytes())))
+}
+
+/// A verified code-search body: its CodeHash and the heights its txs are known to lie in
+/// (`first_h`/`last_h` of the search doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeHit {
+    pub hash: [u8; 16],
+    pub first_h: u32,
+    pub last_h: u32,
+}
+
+/// Newest-first merge of newest-first TxKey streams, duplicates dropped (a binary heap, so
+/// thousands of streams stay cheap). The first error ends it; the deadline is checked every
+/// 64 items.
+pub struct MergeDesc<'v> {
+    its: Vec<Box<dyn Iterator<Item = ApiResult<TxKey>> + 'v>>,
+    heap: std::collections::BinaryHeap<(TxKey, usize)>,
+    started: bool,
+    last: Option<TxKey>,
+    deadline: Instant,
+    n: u32,
+    done: bool,
+}
+
+impl<'v> MergeDesc<'v> {
+    pub fn new(
+        its: Vec<Box<dyn Iterator<Item = ApiResult<TxKey>> + 'v>>,
+        deadline: Instant,
+    ) -> Self {
+        MergeDesc {
+            heap: std::collections::BinaryHeap::with_capacity(its.len()),
+            its,
+            started: false,
+            last: None,
+            deadline,
+            n: 0,
+            done: false,
+        }
+    }
+
+    /// Pull the next key of stream `i` into the heap.
+    fn refill(&mut self, i: usize) -> ApiResult<()> {
+        match self.its[i].next() {
+            Some(Ok(k)) => {
+                self.heap.push((k, i));
+                Ok(())
+            }
+            Some(Err(e)) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Iterator for MergeDesc<'_> {
+    type Item = ApiResult<TxKey>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if !self.started {
+            self.started = true;
+            for i in 0..self.its.len() {
+                if i % 64 == 63 && Instant::now() >= self.deadline {
+                    self.done = true;
+                    return Some(Err(ApiError::Deadline));
+                }
+                if let Err(e) = self.refill(i) {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        loop {
+            self.n += 1;
+            if self.n.is_multiple_of(CHECK_EVERY) && Instant::now() >= self.deadline {
+                self.done = true;
+                return Some(Err(ApiError::Deadline));
+            }
+            let (k, i) = self.heap.pop()?;
+            if let Err(e) = self.refill(i) {
+                self.done = true;
+                return Some(Err(e));
+            }
+            if self.last == Some(k) {
+                continue;
+            }
+            self.last = Some(k);
+            return Some(Ok(k));
+        }
     }
 }
 
@@ -847,5 +1031,106 @@ mod genesis_rk_tests {
         assert!(keys(4).is_empty());
         // Cached after the first complete scan.
         assert!(view.genesis.shared_rks.get().is_some());
+    }
+}
+
+#[cfg(test)]
+mod code_search_tests {
+    use std::time::{Duration, Instant};
+
+    use kdx_decode::{Family, IndexedBlock, TxIndex};
+    use kdx_hot::HotDict;
+    use kdx_types::record::{BlockRecord, TxRecord};
+    use kdx_types::{blake2b_128, Hash32, TxKey};
+
+    use super::{code_hit, CodeHit, PostingQuery};
+
+    fn block(height: u32, code: &str) -> IndexedBlock {
+        let r = TxRecord {
+            key: TxKey::new(height, 0, 1),
+            request_key: Some(Hash32([height as u8; 32])),
+            cmd: Some(
+                serde_json::to_vec(&serde_json::json!({"payload": {"exec": {"code": code}}}))
+                    .unwrap(),
+            ),
+            ..TxRecord::default()
+        };
+        let h = blake2b_128(code.as_bytes());
+        IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32([height as u8; 32]),
+                chain: 0,
+                height: u64::from(height),
+                ..BlockRecord::default()
+            },
+            idx: vec![TxIndex {
+                key: r.key,
+                postings: vec![(Family::Code, kdx_decode::index::code_entity(&h))],
+                pact_id: None,
+                code_hash: Some(h),
+            }],
+            txs: vec![r],
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        }
+    }
+
+    fn hit(code: &str, first_h: u32, last_h: u32) -> CodeHit {
+        CodeHit {
+            hash: blake2b_128(code.as_bytes()),
+            first_h,
+            last_h,
+        }
+    }
+
+    /// R-P5P9-9 #4 and #3: walks start in hit order until their budget, the rest are dropped
+    /// (a truncated answer, not a deadline error); keys come newest first and are verified
+    /// on the record the route decodes.
+    #[test]
+    fn code_walks_start_within_their_budget() {
+        let (_d, store) = crate::testutil::store();
+        let hot = store.hot_for_tests();
+        let mut w = hot.rw().unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        let (a, b) = ("(free.a.call 1)", "(free.b.call 2)");
+        for h in 10..=20u32 {
+            let code = if h % 2 == 0 { a } else { b };
+            kdx_hot::tail::apply(&mut w, &block(h, code), &mut dict).unwrap();
+        }
+        w.commit().unwrap();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let hits = [hit(a, 10, 20), hit(b, 11, 19)];
+        let q = PostingQuery {
+            min_height: None,
+            max_height: None,
+            chain: None,
+            before: None,
+        };
+        let far = Instant::now() + Duration::from_secs(30);
+        let (keys, cut) = view.code_txs(&hits, Some(5), q, far).unwrap();
+        let hs: Vec<u32> = keys.map(|k| k.unwrap().height()).collect();
+        assert!(!cut);
+        assert_eq!(hs, (10..=20).rev().collect::<Vec<_>>());
+        // A spent budget starts no walk: an empty, truncated answer.
+        let past = Instant::now() - Duration::from_millis(1);
+        let (keys, cut) = view.code_txs(&hits, Some(5), q, past).unwrap();
+        assert!(cut);
+        assert_eq!(keys.count(), 0);
+        // ±2 heights near the tip.
+        let near = PostingQuery {
+            min_height: Some(18),
+            max_height: Some(20),
+            ..q
+        };
+        let (keys, _) = view.code_txs(&hits, Some(5), near, far).unwrap();
+        let hs: Vec<u32> = keys.map(|k| k.unwrap().height()).collect();
+        assert_eq!(hs, vec![20, 19, 18]);
+        // Rows are verified on the decoded record.
+        let only_a: std::collections::HashSet<[u8; 16]> = [hits[0].hash].into();
+        let r20 = view.tx(TxKey::new(20, 0, 1)).unwrap().unwrap();
+        let r19 = view.tx(TxKey::new(19, 0, 1)).unwrap().unwrap();
+        assert!(code_hit(&r20, &only_a) && !code_hit(&r19, &only_a));
     }
 }

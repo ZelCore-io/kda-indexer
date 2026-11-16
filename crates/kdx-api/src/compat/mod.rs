@@ -9,8 +9,10 @@
 //! height) are broken by chain, then event position.
 
 pub mod account;
+pub mod coins;
 pub mod events;
 pub mod recent;
+pub mod search;
 pub mod shapes;
 pub mod stats;
 pub mod tx;
@@ -35,8 +37,9 @@ use crate::store::View;
 use crate::{ApiError, ApiResult};
 
 /// Genesis-block txs are not served by the compat list routes (`/txs/account`,
-/// `/txs/events`, `/txs/recent`, `/v1/txs`). `/txs/tx` and `/txs/txs` serve them, as
-/// chainweb-data does (ruling R3E-1, G1). The native API serves them everywhere.
+/// `/txs/events`, `/txs/recent`, `/v1/txs`). `/txs/tx`, `/txs/txs` and `/txs/search` serve
+/// them, as chainweb-data does (rulings R3E-1, G1, and R-P5P9-47 for search). The native
+/// API serves them everywhere.
 pub const COMPAT_HIDE_GENESIS: bool = true;
 
 /// True for a tx the compat list routes must not show. Genesis heights come from the
@@ -53,12 +56,20 @@ pub const MAX_OFFSET: u64 = 10_000;
 /// Header marking a bounded scan that stopped before filling the page.
 pub const SEARCH_TRUNCATED: HeaderName = HeaderName::from_static("x-search-truncated");
 
-/// `[search]` keys the event scan uses.
+/// `[search]` keys the search routes use (spec §3.8, §6.5).
 #[derive(Debug, Clone, Copy)]
 pub struct SearchSettings {
     pub min_len: usize,
     pub max_scan_heights: u32,
     pub timeout_ms: u64,
+    /// Global concurrent searches (S-5, `503` beyond).
+    pub concurrency: usize,
+    /// Concurrent searches per client (S-5, `429` beyond).
+    pub per_client: usize,
+    /// Prefilter hits one code search examines.
+    pub max_candidates: usize,
+    /// Largest native search page.
+    pub max_results: usize,
 }
 
 impl Default for SearchSettings {
@@ -67,20 +78,28 @@ impl Default for SearchSettings {
             min_len: 4,
             max_scan_heights: 20_000,
             timeout_ms: 2000,
+            concurrency: 4,
+            per_client: 1,
+            max_candidates: 10_000,
+            max_results: 100,
         }
     }
 }
 
-/// The compat router (register with `Api::compat_routes`).
-pub fn router(search: SearchSettings) -> Router<Arc<ApiState>> {
+/// The compat router (register with `Api::compat_routes`). `search` is shared with the
+/// native router: one gate covers every search route (S-5).
+pub fn router(search: Arc<crate::search::SearchCtx>) -> Router<Arc<ApiState>> {
     Router::new()
         .route("/txs/tx", get(tx::tx_handler))
         .route("/txs/txs", get(tx::txs_handler))
         .route("/txs/account/{account}", get(account::handler))
         .route("/txs/events", get(events::handler))
         .route("/txs/recent", get(recent::handler))
+        .route("/txs/search", get(search::handler))
+        .route("/coins", get(coins::handler))
         .route("/stats", get(stats::handler))
         .merge(crate::v1txs::router())
+        .layer(Extension(search.settings))
         .layer(Extension(search))
 }
 
@@ -266,77 +285,7 @@ pub fn paging(p: &Params) -> Result<Paging, Response> {
 // ---------------------------------------------------------------------------------------
 // LIKE
 
-/// Postgres `LIKE '%' || needle || '%'`: `%` any run, `_` one character, `\` escapes.
-pub struct Like {
-    plain: Option<String>,
-    pat: Vec<Tok>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Tok {
-    Any,
-    One,
-    Ch(char),
-}
-
-impl Like {
-    pub fn new(needle: &str) -> Like {
-        if !needle.contains(['%', '_', '\\']) {
-            return Like {
-                plain: Some(needle.to_owned()),
-                pat: Vec::new(),
-            };
-        }
-        let mut pat = vec![Tok::Any];
-        let mut it = needle.chars();
-        while let Some(c) = it.next() {
-            pat.push(match c {
-                '%' => Tok::Any,
-                '_' => Tok::One,
-                '\\' => Tok::Ch(it.next().unwrap_or('\\')),
-                c => Tok::Ch(c),
-            });
-        }
-        pat.push(Tok::Any);
-        pat.dedup_by(|a, b| *a == Tok::Any && *b == Tok::Any);
-        Like { plain: None, pat }
-    }
-
-    pub fn matches(&self, s: &str) -> bool {
-        if let Some(p) = &self.plain {
-            return s.contains(p.as_str());
-        }
-        // Greedy match with backtracking to the last `%` (linear in practice).
-        let t: Vec<char> = s.chars().collect();
-        let (mut i, mut j) = (0usize, 0usize);
-        let mut star: Option<(usize, usize)> = None;
-        while i < t.len() {
-            match self.pat.get(j) {
-                Some(Tok::Any) => {
-                    star = Some((j, i));
-                    j += 1;
-                }
-                Some(Tok::One) => {
-                    i += 1;
-                    j += 1;
-                }
-                Some(Tok::Ch(c)) if *c == t[i] => {
-                    i += 1;
-                    j += 1;
-                }
-                _ => match star {
-                    Some((sj, si)) => {
-                        star = Some((sj, si + 1));
-                        j = sj + 1;
-                        i = si + 1;
-                    }
-                    None => return false,
-                },
-            }
-        }
-        self.pat[j..].iter().all(|t| *t == Tok::Any)
-    }
-}
+pub use kdx_types::like::Like;
 
 // ---------------------------------------------------------------------------------------
 // Row engine
@@ -393,6 +342,11 @@ pub trait RowSource {
     fn needs_block(&self) -> bool {
         true
     }
+    /// True when the route lists genesis-block txs (`/txs/search`, as chainweb-data does);
+    /// the other list routes hide them.
+    fn lists_genesis(&self) -> bool {
+        false
+    }
 }
 
 /// Where the candidate txs of a height come from.
@@ -426,6 +380,9 @@ pub fn store_floor(view: &View) -> u32 {
 }
 
 /// Collect one page: skip `offset` rows (or the rows up to the cursor), take `limit`.
+/// `scan` bounds a `Scan` walk (heights and time); on a `Keys` walk only its time applies,
+/// checked between heights once one height is done. A cut answers what it found with a
+/// height-done token and `truncated`.
 pub fn collect_page(
     view: &View,
     mut cands: Candidates<'_>,
@@ -460,13 +417,32 @@ pub fn collect_page(
         });
     }
     let mut scanned = 0u32;
+    // Heights finished in this request: a time cut on the posting path needs one first, so a
+    // resumed page always moves forward.
+    let mut progressed = false;
     let no_block = BlockRecord::default();
     let mut blocks: BTreeMap<(u8, u32), BlockRecord> = BTreeMap::new();
+    let hide = !src.lists_genesis();
     loop {
         view.check_deadline()?;
         // One height's txs.
         let (h, txs): (u32, Vec<TxRecord>) = match &mut cands {
             Candidates::Keys(it) => {
+                if let Some(l) = scan {
+                    if progressed && Instant::now() >= l.until {
+                        if let Some(Ok(k)) = it.peek() {
+                            // Cut before height `k`: every higher height is done (R7 token).
+                            let owed = u16::try_from(skip).unwrap_or(u16::MAX);
+                            let next =
+                                Cursor::height_done(view, k.height() + 1, SUB_HEIGHT_DONE, owed)?;
+                            return Ok(Page {
+                                rows: out,
+                                next: Some(next),
+                                truncated: true,
+                            });
+                        }
+                    }
+                }
                 let Some(first) = it.next() else { break };
                 let first = first?;
                 let h = first.height();
@@ -486,7 +462,7 @@ pub fn collect_page(
                 keys.dedup();
                 let mut txs = Vec::with_capacity(keys.len());
                 for k in keys {
-                    if hidden(view, k) {
+                    if hide && hidden(view, k) {
                         continue;
                     }
                     if let Some(r) = view.tx(k)? {
@@ -515,7 +491,7 @@ pub fn collect_page(
                 let mut txs = Vec::new();
                 for c in 0..kdx_segment::SLOT_WIDTH as u8 {
                     for r in view.block_txs(c, h)? {
-                        if !hidden(view, r.key) {
+                        if !(hide && hidden(view, r.key)) {
                             txs.push(r);
                         }
                     }
@@ -542,6 +518,7 @@ pub fn collect_page(
             }
         }
         rows.sort_by(|a, b| a.0.cmp_in_height(&b.0));
+        progressed = true;
         for (row, i) in rows {
             if let Some(a) = &after {
                 if a.key.height() == h && row.cmp_in_height(a) != Ordering::Greater {

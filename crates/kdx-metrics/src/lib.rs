@@ -45,6 +45,10 @@ pub struct Metrics {
     pub chain_lag_blocks: Gau,
     pub chain_halted: Gau,
     pub frozen_frontier_height: Gauge,
+    /// Docs of the code index the API serves (spec §6.7 search metrics).
+    pub search_docs: Gauge,
+    /// `built_through_height` of the code index the API serves.
+    pub search_built_through_height: Gauge,
     pub ingest_blocks: Count,
     pub ingest_txs: Count,
     pub stage_duration: Hist,
@@ -71,6 +75,12 @@ pub struct Metrics {
     /// Read views: `phase` = open (taking the txn and segment snapshot) | held (open to drop).
     pub read_view_seconds: Hist,
     pub dict_snapshot_names: Gauge,
+    /// Rows in `BalanceDirty` (spec §3.9, plan Task 9).
+    pub balance_dirty_rows: Gauge,
+    /// `/local` reconcile outcomes: `result` = ok | absent | error | skipped | parked.
+    pub balance_reconcile: Count,
+    /// Duration of one `/local` reconcile call (`result` as above).
+    pub balance_reconcile_seconds: Hist,
 }
 
 impl Metrics {
@@ -193,8 +203,18 @@ impl Metrics {
         );
         let search_rejected = reg!(
             "kdx_search_rejected",
-            "Event text searches rejected (too_short|busy|timeout|cap)",
+            "Searches refused or cut short (too_short|busy|client_busy|timeout|cap|lag)",
             Count::default()
+        );
+        let search_docs = reg!(
+            "kdx_search_docs",
+            "Docs (distinct code bodies) of the code index the API serves",
+            Gauge::default()
+        );
+        let search_built_through_height = reg!(
+            "kdx_search_built_through_height",
+            "Every exec tx at or below this height has its code body in the index",
+            Gauge::default()
         );
         let merkle_blocks = reg!(
             "kdx_merkle_blocks",
@@ -221,6 +241,21 @@ impl Metrics {
             "Names in the API dictionary snapshot",
             Gauge::default()
         );
+        let balance_dirty_rows = reg!(
+            "kdx_balance_dirty_rows",
+            "Balance rows waiting for a /local reconcile",
+            Gauge::default()
+        );
+        let balance_reconcile = reg!(
+            "kdx_balance_reconcile",
+            "Balance reconcile outcomes (result ok|absent|error|skipped|parked)",
+            Count::default()
+        );
+        let balance_reconcile_seconds = reg!(
+            "kdx_balance_reconcile_seconds",
+            "Balance reconcile call duration (result ok|absent|error|skipped)",
+            hist(seconds)
+        );
         Metrics {
             registry: r,
             build_info,
@@ -229,6 +264,8 @@ impl Metrics {
             chain_lag_blocks,
             chain_halted,
             frozen_frontier_height,
+            search_docs,
+            search_built_through_height,
             ingest_blocks,
             ingest_txs,
             stage_duration,
@@ -251,6 +288,9 @@ impl Metrics {
             freezer_seconds,
             read_view_seconds,
             dict_snapshot_names,
+            balance_dirty_rows,
+            balance_reconcile,
+            balance_reconcile_seconds,
         }
     }
 
@@ -309,6 +349,15 @@ impl Metrics {
         self.merkle_blocks
             .get_or_create(&vec![("result", result.into())])
             .inc();
+    }
+
+    /// One balance reconcile outcome (`ok|absent|error|skipped|parked`) and its duration.
+    pub fn balance_reconcile(&self, result: &'static str, secs: f64) {
+        let l: Labels = vec![("result", result.into())];
+        self.balance_reconcile.get_or_create(&l).inc();
+        self.balance_reconcile_seconds
+            .get_or_create(&l)
+            .observe(secs);
     }
 
     pub fn search_rejected(&self, reason: &'static str) {

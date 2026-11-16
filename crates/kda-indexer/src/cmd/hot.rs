@@ -45,7 +45,14 @@ pub fn stats(cfg: &Config, data_dir: &Path, digest: bool) -> anyhow::Result<()> 
     }
     println!("tables");
     for t in Table::all() {
-        if digest && t != Table::Meta {
+        if digest && t.is_additive() {
+            // Balance state comes from `/local` reads at wall-clock times: not a replay value.
+            println!(
+                "  {:<20} {:<10} (derived, no digest)",
+                t.name(),
+                txn.count(t)?
+            );
+        } else if digest && t != Table::Meta {
             // blake3 over every (key, value) row: replay checks compare two states.
             let mut h = blake3::Hasher::new();
             for (k, v) in txn.scan(t, &[], |_| true)? {

@@ -219,6 +219,11 @@ Alerts to set up in your own alerting:
 - the unit restarting (`NRestarts` or a `systemd` failed-unit alert): the watchdog restarts a
   hung process and logs which component was silent.
 
+- A `serve` fixes its table list when it opens the store: one started before a P6 `run`
+  created the additive tables (balances, keys, tokens, NFTs) keeps answering them as empty.
+  Restart `serve` (on replicas too) once after the first P6 `run` start, and after any release
+  that adds a table (M-12).
+
 ## Snapshots and replicas
 
 `kda-indexer snapshot --out DIR` writes a consistent copy of a data dir. It only reads, takes
@@ -247,7 +252,11 @@ kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
   that the final manifest no longer names are removed.
 - A refused `--out` (inside the data dir, not empty) creates nothing; after any later failure
   the command removes what it created, so the same `--out` can be used again.
-- Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`.
+- `search/` (when the source has one) comes last: its `manifest.json` and tantivy's
+  `meta.json` are read once and the files of the segments `meta.json` lists are linked (or
+  copied); a file a commit or merge removed first restarts this step (up to five reads).
+  The copy's tail stage re-reads from the copied `built_through_height`.
+- Never copied: `etl/`, `LOCK`, `merkle-unverified.jsonl`, `search.new/`, `search.lock`.
 - `DIR/SNAPSHOT.json` records the format versions, network, frozen frontier, `next_txnum`, the
   tail checkpoint per chain, the manifest's blake3, the binary version and the creation time
   (no paths).
@@ -272,6 +281,137 @@ the hard links that exist inside the copy). See "A second host from a snapshot" 
 follows the node block by block and resolves duplicate hot rows below the frozen frontier at
 start, as after a crash during a freeze. A snapshot that is older than the node's history is
 not a problem; one that is older than the tail can follow quickly is just slower to catch up.
+
+## Code search index
+
+`run` keeps `search/` (spec §3.8) itself: when `search/manifest.json` is missing and backfill
+is done it builds the index in the background (status line `search rebuild d/n`), then its
+tail stage adds the body of every new exec tx it has not indexed yet, committing every
+`[search] commit_secs`. `serve` only reads it. Search failures are logged and retried after
+a minute; they never stop ingest.
+
+```sh
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search rebuild --dry-run
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search rebuild [--mode full|fallback]
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search query 'coin.transfer'
+```
+
+- `--dry-run` measures the exact number of distinct bodies (census), samples 1% of them per
+  range (average length, module share), builds a trial index of the first 1,000,000 bodies
+  (`--trial-docs`) in `search.dryrun/` (removed afterwards) and prints the projected size and
+  the S-1 decision: `full` when the projection is at most 40 GB, else `fallback` with the
+  smallest `fallback_min_len` whose projection is at most 30 GB. Set `[search] mode` and
+  `fallback_min_len` from it.
+- `search rebuild` is read-only on `hot/` and `segments/`, so it can run beside the service
+  (as the service user, `nice -n 19 ionice -c3` on a busy host). It writes `search.new/`, then
+  swaps it in; the running `run` notices the new `built_at` and reopens. One rebuild at a
+  time (`search.lock`). It is a big write: run "Before any big write" first.
+- `[search] build_threads` and `heap_mb` set the rebuild's threads and tantivy writer heap;
+  the tail stage uses one thread and 64 MB.
+- Periodic rebuild: `run` rebuilds the index in-process when it is `rebuild_days` old or when
+  readers' upper expansion window (tip − `rebuilt_through_height` in `search/manifest.json`)
+  reaches `rebuild_window_heights`, whichever comes first (defaults 7 days, 30,000 heights;
+  checked every 10 minutes, at most one attempt an hour). It keeps the live index's mode
+  (or an explicit `mode = "full"` / `fallback` with `fallback_min_len`) and the configured
+  threads and heap, so plan for the rebuild's memory beside the service. The tail stage keeps
+  serving the live index meanwhile; the swap and every stage commit take
+  `search.swap.lock`, so they never interleave. `periodic_rebuild = false` turns it off
+  (then run `search rebuild` by hand when hits get slow).
+- Alert when `kdx_search_built_through_height` trails the tip by more than 20 heights for 15
+  minutes (a failing or backed-off tail stage; its errors are in the log). Meanwhile compat
+  `/txs/search?search=` runs the bounded scan and native `/search/code` answers
+  `partial: true` (`kdx_search_rejected_total{reason="lag"}` counts it).
+- Deleting `search/` and restarting the service rebuilds it in the background; nothing else
+  depends on it.
+
+## Balances
+
+`run` keeps the balance tables itself (spec §3.9, stage 8): when `Meta balances_seeded` is
+absent and backfill is done it runs the seed, then a reconciler reads every dirty row from the
+node's `/local` and writes the balance, guard and key rows. `serve` only reads them. Turn it off
+with `[balances] enabled = false`.
+
+- **Seed** (no node calls): marks every known `(account, module, chain)` dirty: both sides of
+  every `TRANSFER` (`xfer` postings) on each chain they touch, and every account seen in any
+  event (`acct` postings) for `coin` on each chain it touches. It walks the hot tail, then the
+  segments, and writes 100,000 rows per commit with a resume cursor, so a restart continues
+  where it stopped. Mainnet: roughly 1–2M rows.
+- **Reconcile**: up to 256 dirty rows per batch, chosen fresh for every batch: tail marks first
+  (`coin` first, then at most `[balances] module_share` keys per other module, round-robin),
+  the seed backlog (`BalanceSeed`, `coin` first) only behind them; through a node client of its
+  own at `[balances] local_rps` calls per second (default 50) with `local_concurrency` in
+  flight (default 8). Each call is `({module}.details (read-msg "a"))` with the account in the
+  request data, gas limit 150,000; keyset references are resolved with `describe-keyset`.
+  Mainnet first pass: about 6–12 h at 50/s; everything else runs meanwhile.
+- **Marks**: every tail block marks the balances it may change (`TRANSFER` sides, every account
+  of its events for `coin`), and a reorg's undo marks the unwound blocks' rows again. A row
+  that is dirty is served with `stale: true` until it is re-read.
+- **Errors**: a node error (timeout, connection, HTTP status) keeps the row dirty and moves it
+  to the back of the queue; the reconciler backs off (up to 60 s) only when node errors are at
+  least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,
+  mark dropped until its next tail mark). It never becomes a zero balance. A Pact failure (for
+  example a token module without a `details` function) or an unusable answer (not JSON, too
+  large, no decimal balance) drops the mark it read (a newer mark survives) and keeps any stored row, flagged
+  unverified (served `stale: true`), with no back-off. A module name that fails the safety
+  check is skipped without a call. A node outage parks nothing: retry counts only run in
+  batches that do not back off.
+- **Trust**: a guard adds the account to `/keys/{pk}/accounts` only for `coin` and for a module
+  whose `describe-module` lists `fungible-v2` on that chain (checked once per module and chain
+  through `/local`, re-checked every `[balances] recheck_hours`, default 24). Any other module's
+  balances are stored and served, but its guard indexes no key, and its keyset references are
+  not resolved.
+- **Not fungible**: a module whose `details` calls all fail in 3 batches in a row is marked
+  not fungible: the tail stops marking it, its dirty rows are dropped without a call
+  (`result="not_fungible"`) and `/tokens` hides it until the re-check `recheck_hours` later.
+- **Caps**: an untrusted module gets at most `[balances] module_rows` rows (default 1,000,000;
+  then the tail marks no new key of it) and an account at most `account_rows` untrusted rows
+  (default 1,000); `coin` and confirmed `fungible-v2` rows are always kept
+  (`result="capped"`).
+- **Marks off**: with `[balances] enabled = false` the tail writes no marks. Each chain keeps a
+  watermark of the last block applied with marks; when the tail applies a block past it
+  (balances were off, or an older binary ran on the store) the reconciler re-runs the seed, so
+  rows changed meanwhile are re-read (a full pass behind the tail marks).
+
+```sh
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --status
+# service stopped (both take the data dir lock):
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --seed
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --all
+```
+
+- `--status`: dirty rows, balance/absent/guard/key/token counts, seed state (`seeded_height`,
+  `seed_in_progress`), the reconciler's rate, ETA and heartbeat age. Read-only; runs beside the
+  service.
+- `--seed`: runs (or resumes) the seed walk now; the next `run` reconciles what it marked.
+- `--all`: marks every stored balance row dirty, so the next `run` re-reads them all.
+- `--nft-fill` (service stopped): runs the NFT history fill again (below), then drains the
+  marks it made with `get-balance`. `--status` also prints `nft_rows`, `nft_dirty_rows` and
+  `nft_filled_height`.
+
+### NFTs
+
+The same stage keeps `NftBalances` (spec §3.9). Once per store (`Meta nft_filled`), before the
+balance seed, it walks the `evt` postings of every event name of a trusted ledger (`[nft] ledgers`, default `marmalade.ledger` and `marmalade-v2.ledger`;
+hot tail first, then the segments) and applies each tx's events: a v2-shaped `RECONCILE` sets
+both parties' balance, other ledger events mark `NftDirty`. The fill makes no node calls and
+takes seconds. After that the tail applies the same rules to every block, a reorg's undo marks
+the rows of the unwound txs dirty, and the reconciler reads `NftDirty` rows with
+`({ledger}.get-balance (read-msg "t") (read-msg "a"))` (same `/local` budget and safety rules
+as balances) between its balance batches. `kda-indexer inspect nft-check --count 20
+--compare-node` samples stored rows and compares them with the node.
+
+- The fill records the ledger set it walked (`Meta nft_filled_ledgers`). A ledger added to
+  `[nft] ledgers` later is walked on the next `run` start: only that ledger's events, from its
+  postings (hot tail and segments), with no node calls. `reconcile-balances --nft-fill` walks
+  every trusted ledger again.
+- A failed fill (for example one undecodable record) is logged (`nft: history fill failed`)
+  and retried an hour later; the balance seed and reconciler run meanwhile.
+- `n_4e470a97222514a8662dd1219000a0431451b0ee.ledger` (a v2-shaped ledger in a principal
+  namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
+  deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked|capped|not_fungible"}`
+  and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
+  means the node is refusing `/local` calls (see the log line `balances: node errors`).
 
 ## Measured mainnet backfill
 

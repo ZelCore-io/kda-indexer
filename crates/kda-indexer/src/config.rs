@@ -31,6 +31,8 @@ pub struct Config {
     #[serde(default)]
     pub balances: BalancesConfig,
     #[serde(default)]
+    pub nft: NftConfig,
+    #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub log: LogConfig,
@@ -256,6 +258,35 @@ pub struct SearchConfig {
     pub max_candidates: u32,
     pub max_scan_heights: u32,
     pub timeout_ms: u64,
+    /// Code index mode (S-1): `auto` (decided by the projection at rebuild), `full`, `fallback`.
+    pub mode: String,
+    /// Fallback mode: bodies shorter than this many bytes (and not a module or interface) are
+    /// not indexed. 0 = derive it from the projection.
+    pub fallback_min_len: u32,
+    /// Tail stage commit period.
+    pub commit_secs: u64,
+    /// Concurrent searches (all search routes together); more answer 503.
+    pub concurrency: u32,
+    /// Concurrent searches per client; more answer 429.
+    pub per_client: u32,
+    /// `search rebuild` threads (decode and tantivy writer).
+    pub build_threads: u32,
+    /// `search rebuild` tantivy writer heap, MiB (also the periodic rebuild's).
+    pub heap_mb: u32,
+    /// Periodic in-process rebuild (keeps readers' upper expansion window short); false turns
+    /// it off.
+    pub periodic_rebuild: bool,
+    /// Rebuild when the index is this many days old (0: never by age).
+    pub rebuild_days: u32,
+    /// Rebuild when the upper expansion window (tip − `rebuilt_through_height`) reaches this
+    /// many heights (0: never by window).
+    pub rebuild_window_heights: u32,
+}
+
+impl SearchConfig {
+    pub fn mode_sel(&self) -> anyhow::Result<kdx_search::ModeSel> {
+        kdx_search::ModeSel::parse(&self.mode, self.fallback_min_len)
+    }
 }
 
 impl Default for SearchConfig {
@@ -266,6 +297,16 @@ impl Default for SearchConfig {
             max_candidates: 10_000,
             max_scan_heights: 20_000,
             timeout_ms: 2000,
+            mode: "auto".into(),
+            fallback_min_len: 0,
+            commit_secs: 60,
+            concurrency: 4,
+            per_client: 1,
+            build_threads: 2,
+            heap_mb: 512,
+            periodic_rebuild: true,
+            rebuild_days: 7,
+            rebuild_window_heights: 30_000,
         }
     }
 }
@@ -273,12 +314,80 @@ impl Default for SearchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BalancesConfig {
+    /// Run the balance seed and the `/local` reconciler inside `run` (B-5).
+    pub enabled: bool,
+    /// `/local` calls started per second (B-1; also the reconciler node client's rate).
     pub local_rps: u32,
+    /// `/local` calls in flight.
+    pub local_concurrency: u32,
+    /// Most dirty keys of one non-coin module per reconcile batch (I-7).
+    pub module_share: u32,
+    /// Most `Balances` rows of one non-coin module (I-7).
+    pub module_rows: u32,
+    /// Most `Balances` rows of one account (I-7; `coin` rows are always kept).
+    pub account_rows: u32,
+    /// Hours after which a module's fungible check and a not-fungible verdict are re-done.
+    pub recheck_hours: u32,
 }
 
 impl Default for BalancesConfig {
     fn default() -> Self {
-        Self { local_rps: 50 }
+        Self {
+            enabled: true,
+            local_rps: 50,
+            local_concurrency: 8,
+            module_share: 32,
+            module_rows: 1_000_000,
+            account_rows: 1_000,
+            recheck_hours: 24,
+        }
+    }
+}
+
+/// Most `/local` calls per second (B-1, H-1).
+pub const MAX_LOCAL_RPS: u32 = 50;
+
+impl BalancesConfig {
+    /// Value ranges (M-6): `local_rps` 0 would turn both `/local` rate limiters off.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=MAX_LOCAL_RPS).contains(&self.local_rps),
+            "balances.local_rps must be in 1..={MAX_LOCAL_RPS} (got {})",
+            self.local_rps
+        );
+        anyhow::ensure!(
+            (1..=64).contains(&self.local_concurrency),
+            "balances.local_concurrency must be in 1..=64 (got {})",
+            self.local_concurrency
+        );
+        anyhow::ensure!(
+            self.module_share >= 1
+                && self.module_rows >= 1
+                && self.account_rows >= 1
+                && self.recheck_hours >= 1,
+            "balances.module_share, module_rows, account_rows and recheck_hours must be >= 1"
+        );
+        Ok(())
+    }
+}
+
+/// `[nft]`: which ledger modules the NFT tables trust.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NftConfig {
+    /// Qualified names of the ledger modules whose events update `NftBalances`. Anyone can
+    /// deploy a module named `ledger`, so none is trusted by its name alone.
+    pub ledgers: Vec<String>,
+}
+
+impl Default for NftConfig {
+    fn default() -> Self {
+        Self {
+            ledgers: kdx_hot::nft::DEFAULT_LEDGERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        }
     }
 }
 
@@ -346,6 +455,14 @@ impl Config {
             "backfill.etl_mem_mb must be >= 16 and backfill.mem_cap_mb >= 512"
         );
         anyhow::ensure!(b.dict_samples > 0, "backfill.dict_samples must be > 0");
+        self.balances.validate()?;
+        let s = &self.search;
+        s.mode_sel()?;
+        anyhow::ensure!(
+            s.commit_secs > 0 && s.concurrency > 0 && s.per_client > 0 && s.build_threads > 0,
+            "search.commit_secs, concurrency, per_client and build_threads must be > 0"
+        );
+        anyhow::ensure!(s.heap_mb >= 16, "search.heap_mb must be at least 16");
         anyhow::ensure!(
             self.storage.mdbx_max_gb > 0 && self.storage.mdbx_growth_mb > 0,
             "storage.mdbx_max_gb and storage.mdbx_growth_mb must be > 0"
@@ -379,3 +496,35 @@ impl Config {
 
 /// The node's own cap on `payload/outputs/batch` entries.
 pub const MAX_BATCH_SIZE: u32 = 1000;
+
+#[cfg(test)]
+mod balances_tests {
+    use super::*;
+
+    /// M-6: `local_rps` 0 (no limit) or above the B-1 budget, and zero concurrency, are refused.
+    #[test]
+    fn balances_values_are_validated() {
+        let ok = BalancesConfig::default();
+        assert!(ok.validate().is_ok());
+        for bad in [
+            BalancesConfig {
+                local_rps: 0,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                local_rps: MAX_LOCAL_RPS + 1,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                local_concurrency: 0,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                account_rows: 0,
+                ..ok.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+}

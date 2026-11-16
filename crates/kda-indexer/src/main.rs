@@ -149,6 +149,32 @@ enum Command {
         #[arg(long)]
         copy: bool,
     },
+    /// Balances (B-2…B-5): rerun the seed, mark every row dirty, or print the reconcile
+    /// status. `run` seeds and reconciles by itself; `--seed` and `--all` take the data dir
+    /// lock (service stopped), `--status` only reads.
+    ReconcileBalances {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Run (or resume) the seed walk: mark every known (account, module, chain) dirty.
+        #[arg(long, conflicts_with_all = ["all", "status", "nft_fill"])]
+        seed: bool,
+        /// Run the NFT history fill again (ledger events; plan Task 11). The dirty rows it
+        /// marks are read by the next `run`.
+        #[arg(long, conflicts_with_all = ["seed", "all", "status"])]
+        nft_fill: bool,
+        /// Mark every `Balances` row dirty (the next `run` re-reads them all).
+        #[arg(long, conflicts_with_all = ["seed", "status", "nft_fill"])]
+        all: bool,
+        /// Dirty rows, rate, ETA and seed state.
+        #[arg(long, conflicts_with_all = ["seed", "all", "nft_fill"])]
+        status: bool,
+    },
+    /// Code search index (`search/`): rebuild it, or query it (dev aid).
+    Search {
+        #[command(subcommand)]
+        action: SearchAction,
+    },
     /// Frozen segments: list the manifest, check files and indexes.
     Segments {
         #[command(subcommand)]
@@ -186,6 +212,38 @@ enum HotAction {
         /// Also print a blake3 digest per table (replay checks).
         #[arg(long)]
         digest: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SearchAction {
+    /// Build the code index from the hot store and segments into `search.new/`, then swap it
+    /// in for `search/`. Read-only on the store; can run beside `run`.
+    Rebuild {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Census and S-1 projection only (distinct bodies, projected size, mode decision).
+        /// Nothing durable is written; the trial index in `search.dryrun/` is removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Index mode: auto, full or fallback (default: `[search] mode`).
+        #[arg(long)]
+        mode: Option<String>,
+        /// Docs of the projection's trial index.
+        #[arg(long, default_value_t = 1_000_000)]
+        trial_docs: u64,
+    },
+    /// Print the candidate code bodies of a LIKE pattern (dev aid).
+    Query {
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Postgres LIKE pattern, matched as `%pattern%`.
+        pattern: String,
+        /// Matches to print.
+        #[arg(long, default_value_t = 20)]
+        show: usize,
     },
 }
 
@@ -267,6 +325,16 @@ enum InspectWhat {
         #[arg(long, default_value_t = 600)]
         seconds: u64,
     },
+    /// Dev: random `NftBalances` rows; with --compare-node, each is re-read with
+    /// `get-balance` from the node (rows older than the node's tip by a changed balance are
+    /// reported as `skew`, not as mismatches, when the row is stale or its chain moved on).
+    #[command(hide = true)]
+    NftCheck {
+        #[arg(long, default_value_t = 20)]
+        count: usize,
+        #[arg(long)]
+        compare_node: bool,
+    },
     /// Random frozen and hot txs; with --compare-node, refetch each block and require
     /// byte-identical rendered tx, output, miner data and an equal header.
     Sample {
@@ -304,6 +372,8 @@ async fn main() -> anyhow::Result<()> {
     }
     let cfg = Config::load(&cli.config)?;
     init_logging(&cfg.log);
+    kdx_hot::nft::set_ledgers(cfg.nft.ledgers.clone());
+    kdx_hot::balances::set_marking(cfg.balances.enabled);
     kdx_metrics::init(&cfg.network, env!("CARGO_PKG_VERSION"), env!("KDX_GIT_SHA"));
     match cli.command {
         Command::Config {
@@ -441,6 +511,56 @@ async fn main() -> anyhow::Result<()> {
             out,
             copy,
         }),
+        Command::ReconcileBalances {
+            data_dir,
+            seed,
+            nft_fill,
+            all,
+            status,
+        } => {
+            use kda_indexer::cmd::reconcile::Mode;
+            let mode = match (seed, all, status, nft_fill) {
+                (true, _, _, _) => Mode::Seed,
+                (_, true, _, _) => Mode::All,
+                (_, _, true, _) => Mode::Status,
+                (_, _, _, true) => Mode::NftFill,
+                _ => {
+                    anyhow::bail!("reconcile-balances needs --seed, --all, --status or --nft-fill")
+                }
+            };
+            kda_indexer::cmd::reconcile::run(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                mode,
+            )
+            .await
+        }
+        Command::Search { action } => match action {
+            SearchAction::Rebuild {
+                data_dir,
+                dry_run,
+                mode,
+                trial_docs,
+            } => kda_indexer::cmd::search::rebuild(
+                &cfg,
+                kda_indexer::cmd::search::RebuildArgs {
+                    data_dir: data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+                    dry_run,
+                    mode,
+                    trial_docs,
+                },
+            ),
+            SearchAction::Query {
+                data_dir,
+                pattern,
+                show,
+            } => kda_indexer::cmd::search::query(
+                &cfg,
+                data_dir.unwrap_or_else(|| cfg.data_dir.clone()),
+                &pattern,
+                show,
+            ),
+        },
         Command::Segments { action } => match action {
             SegmentsAction::List { data_dir, json } => {
                 kda_indexer::cmd::segments::list(data_dir.as_deref().unwrap_or(&cfg.data_dir), json)
@@ -473,6 +593,10 @@ async fn main() -> anyhow::Result<()> {
                     count,
                     compare_node,
                 } => inspect::sample(&cfg, &s, count, compare_node).await,
+                InspectWhat::NftCheck {
+                    count,
+                    compare_node,
+                } => inspect::nft_check(&cfg, &s, count, compare_node).await,
                 InspectWhat::ViewCheck { .. } => unreachable!("handled above"),
             }
         }
