@@ -106,6 +106,7 @@ pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {
     let tips = TipWatch::default();
     spawn_tip_poll(cfg, tips.clone(), token.clone());
     spawn_textfile(cfg, token.clone());
+    crate::alloc::spawn_stats(token.clone());
     // `serve` has no ingest: the watchdog watches the API runtime only.
     super::notify::spawn_watchdog(&[kdx_types::heartbeat::Component::Api]);
     super::notify::spawn_api_heartbeat(token.clone());

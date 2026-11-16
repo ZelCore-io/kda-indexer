@@ -45,30 +45,15 @@ pub fn stats(cfg: &Config, data_dir: &Path, digest: bool) -> anyhow::Result<()> 
     }
     println!("tables");
     for t in Table::all() {
-        if digest && t.is_additive() {
-            // Balance state comes from `/local` reads at wall-clock times: not a replay value.
-            println!(
-                "  {:<20} {:<10} (derived, no digest)",
-                t.name(),
-                txn.count(t)?
-            );
-        } else if digest && t != Table::Meta {
-            // blake3 over every (key, value) row: replay checks compare two states.
-            let mut h = blake3::Hasher::new();
-            for (k, v) in txn.scan(t, &[], |_| true)? {
-                h.update(&(k.len() as u32).to_be_bytes());
-                h.update(&k);
-                h.update(&(v.len() as u32).to_be_bytes());
-                h.update(&v);
-            }
-            println!(
-                "  {:<20} {:<10} {}",
-                t.name(),
-                txn.count(t)?,
-                &h.finalize().to_hex()[..16]
-            );
-        } else {
-            println!("  {:<20} {}", t.name(), txn.count(t)?);
+        println!("  {:<20} {}", t.name(), txn.count(t)?);
+    }
+    if digest {
+        // Name-resolved (ruling on 9B-1): records rendered through the dictionary, postings
+        // by entity name, dictionaries as name sets; additive tables (balances, NFT, marks)
+        // come from `/local` reads at wall-clock times and have no digest.
+        println!("digest (name-resolved)");
+        for (name, (rows, h)) in kdx_ingest::content::hot_digest(&txn)? {
+            println!("  {name:<20} {rows:<10} {}", &h[..16]);
         }
     }
     let dict = HotDict::load(&txn)?;

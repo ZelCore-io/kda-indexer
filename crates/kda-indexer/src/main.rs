@@ -5,6 +5,29 @@ use clap::{Parser, Subcommand};
 use kda_indexer::config::{Config, LogConfig};
 use tracing_subscriber::EnvFilter;
 
+/// jemalloc replaces glibc malloc, whose per-thread arenas kept freed memory resident (run
+/// MEM, R-P5P9-59). Linux and macOS only; the symbols are `_rjem_` prefixed, so nothing else
+/// in the process is affected.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc's embedded configuration (read at its first allocation; no environment variable
+/// needed): a background thread returns dirty and muzzy pages to the OS within about 5 s.
+/// `malloc_conf` is a `const char *` in C, so this is a thin pointer to a NUL-terminated array.
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8; 63] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
+/// macOS (development only): jemalloc has no background threads there and prints a warning
+/// when asked for one, so the same decay times without that option.
+#[cfg(target_os = "macos")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8; 40] = b"dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
 #[derive(Parser)]
 #[command(name = "kda-indexer", version, about = "Kadena chainweb indexer")]
 struct Cli {
@@ -75,6 +98,26 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Canonical header walk: auto (cut, switching to anchors when slow), cut or anchor.
+        #[arg(long, default_value = "auto", hide = true)]
+        header_mode: kdx_ingest::HeaderMode,
+    },
+    /// Refetch one frozen range or step from the node and swap it in crash-safely (repair
+    /// or deep-reorg recovery). Compares record counts and the content digest, logs the
+    /// blake3 of every stored and rebuilt file. Takes the data dir lock.
+    RebuildRange {
+        /// Start height of the 100k range to rebuild.
+        #[arg(long, conflicts_with = "step", required_unless_present = "step")]
+        range: Option<u32>,
+        /// Start height of the step to rebuild.
+        #[arg(long)]
+        step: Option<u32>,
+        /// Build and compare, then remove the rebuilt files (no swap).
+        #[arg(long)]
+        dry_run: bool,
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Canonical header walk: auto, cut or anchor.
         #[arg(long, default_value = "auto", hide = true)]
         header_mode: kdx_ingest::HeaderMode,
     },
@@ -315,6 +358,18 @@ enum SegmentsAction {
         #[arg(long)]
         deep: bool,
     },
+    /// Digest of each range or step. `--content`: blake3 over the decoded records in
+    /// (height, chain, tx index) order with names resolved (equal for the same blocks
+    /// whatever the dictionary ids or compression); otherwise blake3 of the files.
+    Digest {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        content: bool,
+        /// Only the entry starting at this height.
+        #[arg(long)]
+        start: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -336,6 +391,10 @@ enum InspectWhat {
         module: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Oldest first: walk the frozen lists from the lowest range up, lazily (stops at
+        /// `--limit`), then the hot rows.
+        #[arg(long)]
+        oldest: bool,
     },
     /// Dev: loop read views (postings walk, request-key lookups, cursors) for N seconds
     /// beside a running indexer; reports duplicates, order breaks, lookup misses, errors.
@@ -439,6 +498,28 @@ async fn main() -> anyhow::Result<()> {
                     index,
                     merkle,
                 },
+            )
+            .await
+        }
+        Command::RebuildRange {
+            range,
+            step,
+            dry_run,
+            data_dir,
+            header_mode,
+        } => {
+            let (kind, start) = match (range, step) {
+                (Some(s), _) => (kdx_segment::RangeKind::Range, s),
+                (None, Some(s)) => (kdx_segment::RangeKind::Step, s),
+                (None, None) => anyhow::bail!("--range or --step is required"),
+            };
+            kda_indexer::cmd::rebuild::run(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                kind,
+                start,
+                header_mode,
+                dry_run,
             )
             .await
         }
@@ -599,6 +680,16 @@ async fn main() -> anyhow::Result<()> {
                 data_dir.as_deref().unwrap_or(&cfg.data_dir),
                 deep,
             ),
+            SegmentsAction::Digest {
+                data_dir,
+                content,
+                start,
+            } => kda_indexer::cmd::segments::digest(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                content,
+                start,
+            ),
         },
         Command::Inspect { data_dir, what } => {
             use kda_indexer::cmd::inspect;
@@ -618,7 +709,8 @@ async fn main() -> anyhow::Result<()> {
                     name,
                     module,
                     limit,
-                } => inspect::postings(&s, &family, &name, module.as_deref(), limit),
+                    oldest,
+                } => inspect::postings(&s, &family, &name, module.as_deref(), limit, oldest),
                 InspectWhat::Sample {
                     count,
                     compare_node,
@@ -639,5 +731,66 @@ async fn main() -> anyhow::Result<()> {
             records_b,
             out,
         }),
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod alloc_tests {
+    use tikv_jemalloc_ctl::{epoch, raw, stats};
+
+    /// The running allocator is jemalloc with the embedded configuration, and its counters
+    /// follow a large allocation up and down.
+    #[test]
+    fn jemalloc_is_configured_and_tracks_allocations() {
+        // Linux only: jemalloc has no background threads on macOS (the option stays false).
+        #[cfg(target_os = "linux")]
+        assert!(tikv_jemalloc_ctl::opt::background_thread::read().unwrap());
+        // tikv-jemalloc-ctl 0.5 has no typed `opt.*_decay_ms`; both are `ssize_t` (`isize`).
+        // SAFETY: the names are NUL-terminated and the value type matches jemalloc's.
+        unsafe {
+            assert_eq!(raw::read::<isize>(b"opt.dirty_decay_ms\0").unwrap(), 5000);
+            assert_eq!(raw::read::<isize>(b"opt.muzzy_decay_ms\0").unwrap(), 5000);
+        }
+
+        let allocated = || {
+            epoch::advance().unwrap();
+            stats::allocated::read().unwrap()
+        };
+        const MB64: usize = 64 << 20;
+        let slack = 16 << 20;
+        let before = allocated();
+        let big = std::hint::black_box(vec![1u8; MB64]);
+        let during = allocated();
+        assert!(during >= before + MB64 - slack, "{before} -> {during}");
+        drop(std::hint::black_box(big));
+        let after = allocated();
+        assert!(after + MB64 - slack <= during, "{during} -> {after}");
+    }
+
+    /// The registry's encoding carries the five gauges, resident non-zero.
+    #[test]
+    fn metrics_expose_allocator_gauges() {
+        kda_indexer::alloc::refresh().unwrap();
+        let text = kdx_metrics::encode();
+        for name in [
+            "kdx_alloc_allocated_bytes",
+            "kdx_alloc_active_bytes",
+            "kdx_alloc_resident_bytes",
+            "kdx_alloc_retained_bytes",
+            "kdx_alloc_mapped_bytes",
+        ] {
+            assert!(
+                text.lines().any(|l| l.starts_with(&format!("{name} "))),
+                "{name} missing"
+            );
+        }
+        let resident: i64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("kdx_alloc_resident_bytes "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(resident > 0, "resident {resident}");
     }
 }

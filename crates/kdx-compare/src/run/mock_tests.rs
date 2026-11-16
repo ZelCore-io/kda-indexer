@@ -16,6 +16,12 @@ use crate::config::CompareConfig;
 use crate::gen::{Origin, Request};
 use crate::graphql_window::Reads;
 
+mod e2b;
+mod e3b;
+mod g;
+mod h;
+mod h2;
+
 /// The node: every chain's cut at `tip`, the canonical hash per (chain, height) and the block
 /// `/poll` puts each request key in. Every path asked is logged.
 #[derive(Clone, Default)]
@@ -26,6 +32,9 @@ pub(super) struct NodeMock {
     /// `/local` answers by (chain, account): the `result.data` of a `details` read. Each
     /// call logs `local <chain> <code> <account>`.
     pub local: HashMap<(u8, String), Value>,
+    /// `/local` answers by (chain, module) for a read whose code names the module, ahead of
+    /// `local`; `null` answers "No value found in table <module>_ledger".
+    pub local_by_module: HashMap<(u8, String), Value>,
     /// `GET /header` answers by (chain, height): every header the node holds at that height
     /// (orphans included), and `payload/<hash>/outputs` answers by payload hash.
     pub headers: HashMap<(u8, u64), Vec<Value>>,
@@ -221,6 +230,18 @@ async fn node_server(n: NodeMock) -> String {
                     let acct = cmd.pointer("/payload/exec/data/a").and_then(Value::as_str).unwrap_or("");
                     n.calls.lock().unwrap().push(format!("local {c} {code} {acct}"));
                     let meta = json!({"blockHeight": n.tip + 1});
+                    let by_module = n
+                        .local_by_module
+                        .iter()
+                        .find(|((mc, m), _)| *mc == c && code.contains(&format!("({m}.")));
+                    if let Some(((_, m), d)) = by_module {
+                        return Json(if d.is_null() {
+                            json!({"result": {"status": "failure", "error": {"message":
+                                format!("No value found in table {m}_ledger")}}, "metaData": meta})
+                        } else {
+                            json!({"result": {"status": "success", "data": d}, "metaData": meta})
+                        });
+                    }
                     Json(match n.local.get(&(c, acct.to_string())) {
                         Some(d) => json!({"result": {"status": "success", "data": d}, "metaData": meta}),
                         None => json!({"result": {"status": "failure",
@@ -2396,7 +2417,12 @@ async fn h7_content_of_one_sided_rows_is_the_nodes() {
     )
     .await;
     assert!(!only_hits(&d), "{d:?}");
-    assert!(note.unwrap_or_default().contains("not canonical"));
+    // R-P5P9-86 NC: unsettled (the node's block for the key is the row's), not "not canonical".
+    let note = note.unwrap_or_default();
+    assert!(
+        note.contains("the node's transaction lacks the row") && !note.contains("not canonical"),
+        "{note}"
+    );
     let (d, _) = settle(
         vec![e1.clone(), ev("e5", r#"["s","r",1.50]"#)],
         vec![e1],
@@ -3235,9 +3261,21 @@ rate_rps = 1000.0
         (
             n,
             entries.into_iter().map(|e| e.path).collect(),
-            d.into_iter().map(|e| e.path).collect(),
+            // Review M1: G's `cutBoth` entry (`b: None` at the unfinished path) is named, so
+            // a test can tell it from H6's own entry at the same path.
+            d.into_iter()
+                .map(|e| match e.path.as_str() {
+                    UNFINISHED_PATH
+                        if e.b.is_none() && format!("{:?}", e.a).contains("cutBoth") =>
+                    {
+                        CUT_BOTH.to_string()
+                    }
+                    _ => e.path,
+                })
+                .collect(),
         )
     }
+    const CUT_BOTH: &str = "/~graphql-h6-unfinished#cutBoth";
     let src = (&ours, &oracle);
     // The 147-tx shape in five cut blocks: every list finished, no diff.
     let five = [
@@ -3274,11 +3312,9 @@ rate_rps = 1000.0
     for h in ["FAIL", "REP"] {
         let (n, limit, d) = run(&ctx, &op, src, &[(h, 147)]).await;
         assert_eq!((n, limit), (0, vec![UNFINISHED_PATH.to_string()]), "{h}");
-        assert!(
-            d.iter()
-                .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")),
-            "{h}: {d:?}"
-        );
+        // R-P5P9-105 (G): both cut pages (no `pageInfo`) are now G's `cutBoth` candidate, an
+        // unfinished entry until the node settles it; H6's own unfinished entry stays.
+        assert!(d.iter().any(|p| p == CUT_BOTH), "{h}: {d:?}");
     }
     // The oracle cannot be paged to its end (DEAD: the retry fails too), or its paging gives
     // k3 twice (in place of k6, the same value): not finished, the cut pages stay a diff, and
@@ -3286,11 +3322,8 @@ rate_rps = 1000.0
     for h in ["DEAD", "TW"] {
         let (n, limit, d) = run(&ctx, &op, src, &[(h, 147)]).await;
         assert_eq!((n, limit), (0, vec![UNFINISHED_PATH.to_string()]), "{h}");
-        assert!(
-            d.iter()
-                .any(|p| p.starts_with("/data/blocksFromHeight/edges/0/node/transactions")),
-            "{h}: {d:?}"
-        );
+        // R-P5P9-105 (G): or G's `cutBoth` unfinished entry, as above.
+        assert!(d.iter().any(|p| p == CUT_BOTH), "{h}: {d:?}");
     }
     // Equal cut pages are no match without the full lists: the entry stays.
     let (n, limit, d) = run_with(&ctx, &op, src, &[("DEAD", 147)], true).await;
@@ -3831,7 +3864,8 @@ async fn c3_root_filters_the_harness_does_not_check_refuse_the_excuse() {
         "QTransactionsByPublicKey",
         "query QTransactionsByPublicKey($publicKey: String, $first: Int, $after: String) { \
          transactionsByPublicKey(publicKey: $publicKey, first: $first, after: $after) { \
-         totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash } } } }",
+         totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash result { \
+         ... on TransactionResult { height block { hash height chainId } } } } } } }",
     );
     let plain = parse(
         "QTxs",
@@ -3850,7 +3884,10 @@ async fn c3_root_filters_the_harness_does_not_check_refuse_the_excuse() {
     };
     let tx = |rk: &str, h: u64| {
         let id = crate::graphql::base64_std(format!("Transaction:[\"B{h}\",\"{rk}\"]").as_bytes());
-        json!({"cursor": "c", "node": {"id": id, "hash": rk}})
+        // R-P5P9-86 W: the rows our QTransactionsByPublicKey document selects (the block's
+        // height, chain and hash), so H7 places them.
+        json!({"cursor": "c", "node": {"id": id, "hash": rk, "result": {"height": h,
+            "block": {"hash": format!("B{h}"), "height": h, "chainId": 0}}}})
     };
     let blk = |h: u64| json!({"cursor": "c", "node": {"height": h, "chainId": 0, "hash": format!("B{h}")}});
     let run = |op: crate::graphql::GqlOp,
@@ -3877,13 +3914,14 @@ async fn c3_root_filters_the_harness_does_not_check_refuse_the_excuse() {
         }
     };
     let txs = || (vec![tx("t1", 101), tx("t2", 100)], vec![tx("t1", 101)]);
-    // QTransactionsByPublicKey: t2 is canonical, but the harness does not check the key.
+    // QTransactionsByPublicKey: t2 is canonical; R-P5P9-86 U checks the key against the
+    // signers of the node's command, which this node cannot serve: unsettled, a diff.
     let (a, b) = txs();
     let vars = h7_vars(&[("publicKey", json!("pk")), ("first", json!(2))]);
     let (un, note) = run(by_key.clone(), "transactionsByPublicKey", a, b, vars).await;
     assert!(!un.is_empty(), "{note}");
     assert!(
-        note.contains("a filter the harness does not check: publicKey"),
+        note.contains("under a publicKey filter the node did not settle"),
         "{note}"
     );
     // The same rows with the key null, and on a list with no filter: explained.
@@ -3971,6 +4009,8 @@ async fn c3_the_referee_keeps_h6_past_the_records_entry_cap() {
         note: None,
         body_cap: None,
         a_pages: Some(1),
+        a_tip_height: None,
+        a_lowest_height: None,
     };
     let log = dir.path().join("diffs-cap.jsonl");
     let line = serde_json::to_string(&rec.bounded()).unwrap();
@@ -4815,11 +4855,9 @@ async fn c5_ours_only_rows_have_every_selected_field_checked() {
             json!("L"),
             "unchecked field: result.logs",
         ),
-        (
-            "/node/cmd",
-            json!({"payload": {}}),
-            "unchecked field: cmd.payload",
-        ),
+        // R-P5P9-86 T: a payload with no field of its member is checked against the node's
+        // (here a node without the command): still a diff.
+        ("/node/cmd", json!({"payload": {}}), "cmd.payload"),
     ] {
         let mut t2 = tx("t2", 100);
         let (parent, key) = ptr.rsplit_once('/').unwrap();
@@ -5746,16 +5784,92 @@ async fn c7_equal_page_cut_answers_are_allowlisted() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// 5E regression through the merged lag block (R-P5P9-74): `clamp_lists` and its unit test are
+// gone; these two cases keep what it covered.
+
+/// One `/v1/txs`-shaped row at height `h`; the same height gives the same row on both sides.
+fn row_at(h: u64) -> Value {
+    json!({"requestKey": format!("rk{h}"), "chain": h % 20, "height": h,
+        "blockHash": format!("b{h}"), "amount": 1.5, "code": "x", "events": [], "gasLimit": 600})
+}
+
+/// A kda-indexer replica: `/txs/recent` shows one row at its `tip`, every other path `rows`.
+async fn replica_server(tip: u64, rows: Vec<Value>) -> String {
+    let app = Router::new().fallback(move |uri: Uri| {
+        let body = if uri.path() == "/txs/recent" {
+            json!([row_at(tip)])
+        } else {
+            Value::Array(rows.clone())
+        };
+        async move { Json(body) }
+    });
+    serve(app).await
+}
+
+/// 5E (ac2013f's case), `/v1/txs/.../5` on a replica pair, tips 7_000_030 and 7_000_000 (clamp
+/// 6_999_995). One side's full page, 7_000_030 down to 6_999_998, lies wholly above the clamp,
+/// the other side's reaches below it. Both held their limit, so nothing below the first page's
+/// lowest row is comparable: no diff (before ac2013f the lower rows were reported as missing
+/// on the first side). Both orientations: ours as the page above the clamp, and as the one below.
+#[tokio::test]
+async fn r74_v1_txs_a_full_page_wholly_above_the_clamp_bounds_the_other_side() {
+    const B: u64 = 6_999_900;
+    let above: Vec<Value> = [130, 128, 126, 100, 98].map(|x| row_at(B + x)).to_vec();
+    let below: Vec<Value> = [100, 98, 90, 88, 86].map(|x| row_at(B + x)).to_vec();
+    for (ours_above, ours, oracle) in [
+        (false, below.clone(), above.clone()),
+        (true, above.clone(), below.clone()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(NodeMock::default()).await;
+        let (ta, tb) = if ours_above {
+            (B + 130, B + 100)
+        } else {
+            (B + 100, B + 130)
+        };
+        let (au, bu) = (
+            replica_server(ta, ours).await,
+            replica_server(tb, oracle).await,
+        );
+        let ctx = urls_pair_setup(&nu, &au, &bu, dir.path(), "kda_indexer_compat", 0).await;
+        let o = v1_compare(&ctx, "/v1/txs/k:big/coin/5").await;
+        assert!(
+            o.class != "diff" && o.class != "a-error",
+            "ours above: {ours_above}: {} {:?}",
+            o.class,
+            o.record.map(|r| (r.note, r.diff))
+        );
+    }
+}
+
+/// 5E on a paginated route: `/txs/account`, the oracle cut after four pages of three rows
+/// (7_000_000 down to 6_999_989) with every page above the clamp (6_999_985), and ours one
+/// complete page that reaches below the oracle's last page. Ours' rows below it are not
+/// diffs: the page cut covers them, and the rows above the clamp are dropped on both sides.
+#[tokio::test]
+async fn r74_account_oracle_cut_with_every_page_above_the_clamp_is_no_diff() {
+    let rows = v1_rows(20, 10);
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let au = paged_server(rows.clone(), 20, false).await;
+    let bu = paged_server(rows[..12].to_vec(), 3, true).await;
+    let ctx = urls_pair_setup(&nu, &au, &bu, dir.path(), "chainweb_data", 3).await;
+    ctx.tips.set_a_tip(6_999_985 + super::ORACLE_HORIZON);
+    let o = v1_compare(&ctx, "/txs/account/k:big?token=coin").await;
+    assert!(
+        o.class != "diff" && o.class != "a-error",
+        "{} {:?}",
+        o.class,
+        o.record.map(|r| (r.note, r.diff))
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // R-P5P9-75, harness round D1 (CG-4's identity and structure classes)
 
 /// A 43-character coinbase key (a parent block hash) from a short tag.
 fn d1_key(tag: &str) -> String {
     format!("{tag:_<43}")
-}
-
-/// The oracle's coinbase `requestKey` form (CG-4 class C): base64 of the JSON-quoted key.
-fn d1_encoded(key: &str) -> String {
-    crate::graphql::base64_std(format!("\"{key}\"").as_bytes())
 }
 
 /// A node holding block `B<h>` at height `h` on chain 0 whose parent is `parent` and whose
@@ -5777,16 +5891,28 @@ fn d1_coinbase_node(h: u64, parent: &str, cb_key: &str) -> NodeMock {
     node
 }
 
-/// R-P5P9-75 C: the oracle's coinbase `requestKey` is 60 characters of base64 over the
-/// JSON-quoted key. It is decoded for the row's identity and the row is settled on the
-/// coinbase path (the block's header and its parent), never `/poll`. The served difference is
-/// explained only when the decoded key is ours and ours is the node's coinbase key (the parent
-/// hash); a key that decodes to another, or a node whose coinbase key is another, stays a diff.
+/// R-P5P9-86 C: the node's coinbase key in its two eras: 60 characters of base64url over the
+/// JSON-quoted parent hash, or 58 characters of base64 over the bare parent hash.
+fn c86_node_key(parent: &str, era60: bool) -> String {
+    if era60 {
+        kdx_types::hash::b64url_encode(format!("\"{parent}\"").as_bytes())
+    } else {
+        crate::graphql::base64_std(parent.as_bytes())
+            .trim_end_matches('=')
+            .to_string()
+    }
+}
+
+/// R-P5P9-86 C: a row whose key is not a 43-character hash is a coinbase row, paired by its
+/// place and settled on the coinbase path only (the canonical header at its height and the
+/// payload's coinbase output reqKey), never `/poll`. Ours' key must be the node's byte for
+/// byte, in either era; the oracle's is excused only as that header's bare parent hash or as
+/// base64 of its own hash (`/~graphql-coinbase-oracle-key-form`). An oracle key that decodes
+/// to another hash, or ours differing from the node, stays a diff.
 #[tokio::test]
-async fn d1_c_the_oracle_coinbase_request_key_is_decoded_and_settled_on_the_coinbase_path() {
+async fn e1_c_coinbase_keys_in_both_node_eras_and_both_oracle_forms() {
     let dir = tempfile::tempdir().unwrap();
-    let k = d1_key("Y_oq3-w1");
-    assert_eq!(d1_encoded(&k).len(), 60);
+    let parent = d1_key("Y_oq3-w1");
     let row = |rk: &str| h7_xrow(rk, 100, json!(1.5), Some(("", "miner")));
     let run = |node: NodeMock, a: Vec<Value>, b: Vec<Value>| {
         let dir = dir.path().to_path_buf();
@@ -5814,37 +5940,52 @@ async fn d1_c_the_oracle_coinbase_request_key_is_decoded_and_settled_on_the_coin
             (out, polls)
         }
     };
-    // Ours the node's key, the oracle's that key encoded: explained, without a /poll read.
-    let ((d, note), polls) = run(
-        d1_coinbase_node(100, &k, &k),
-        vec![row(&k)],
-        vec![row(&d1_encoded(&k))],
-    )
-    .await;
-    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
-    assert!(
+    let form = |d: &[crate::report::DiffEntry]| {
         d.iter()
-            .any(|e| e.path == crate::graphql_window::COINBASE_KEY_PATH),
-        "{d:?}"
-    );
-    assert_eq!(polls, 0, "a coinbase row is not polled");
-    // A 60-character key that decodes to a key other than ours or the node's: a diff.
-    let other = d1_key("Z_other");
+            .any(|e| e.path == crate::graphql_window::COINBASE_FORM_PATH)
+    };
+    // The oracle's base64 of the block's own hash.
+    let hash = d1_key("B100_own");
+    let own = crate::graphql::base64_std(hash.as_bytes())
+        .trim_end_matches('=')
+        .to_string();
+    let node = |k: &str| {
+        let mut n = d1_coinbase_node(100, &parent, k);
+        n.headers.get_mut(&(0, 100)).unwrap()[0]["hash"] = json!(hash);
+        n
+    };
+    for era60 in [true, false] {
+        let k = c86_node_key(&parent, era60);
+        assert_eq!(k.len(), if era60 { 60 } else { 58 });
+        for oracle in [parent.clone(), own.clone()] {
+            let ((d, note), polls) = run(node(&k), vec![row(&k)], vec![row(&oracle)]).await;
+            assert!(
+                only_hits(&d) && form(&d),
+                "era60 {era60} oracle {oracle}: {d:?} {note:?}"
+            );
+            assert_eq!(polls, 0, "a coinbase row is never polled");
+        }
+    }
+    let k = c86_node_key(&parent, true);
+    // An oracle key that decodes to another hash than the header's own: a diff.
+    let other = crate::graphql::base64_std(d1_key("Z_other").as_bytes())
+        .trim_end_matches('=')
+        .to_string();
+    let ((d, _), polls) = run(node(&k), vec![row(&k)], vec![row(&other)]).await;
+    assert!(!only_hits(&d) && !form(&d), "{d:?}");
+    assert_eq!(polls, 0);
+    // A bare hash that is not the header's parent: a diff.
+    let ((d, _), _) = run(node(&k), vec![row(&k)], vec![row(&d1_key("Z_other"))]).await;
+    assert!(!only_hits(&d) && !form(&d), "{d:?}");
+    // Ours' key in the other era's encoding than the node's: a diff, though the oracle's
+    // bare parent hash is that header's.
     let ((d, _), _) = run(
-        d1_coinbase_node(100, &k, &k),
-        vec![row(&k)],
-        vec![row(&d1_encoded(&other))],
+        node(&k),
+        vec![row(&c86_node_key(&parent, false))],
+        vec![row(&parent)],
     )
     .await;
-    assert!(!only_hits(&d), "{d:?}");
-    // The decoded key is ours, but the node's coinbase key (the block's parent) is another.
-    let ((d, _), _) = run(
-        d1_coinbase_node(100, &other, &other),
-        vec![row(&k)],
-        vec![row(&d1_encoded(&k))],
-    )
-    .await;
-    assert!(!only_hits(&d), "{d:?}");
+    assert!(!only_hits(&d) && !form(&d), "{d:?}");
 }
 
 /// Runs H7 and the diff on one pair of `transfers` pages (no variables).
@@ -6324,10 +6465,9 @@ fn d2_shipped() -> crate::allowlist::Allowlist {
     .unwrap()
 }
 
-/// R-P5P9-75 I: `oracle_counts_heights` on Transactions-9e58b95d's root `totalCount`: the
-/// oracle's count below ours takes ours with a visible hit, which only that operation's
-/// entry explains. An oracle count at or above ours, a nested count, and the hit on another
-/// operation stay diffs.
+/// R-P5P9-75 I, as R-P5P9-86 TC leaves it: the operation's entry stays (no removals), but
+/// `oracle_counts_heights` no longer takes ours' count without the walk, below ours or above;
+/// a nested count is never the root's.
 #[test]
 fn d2_i_oracle_counts_heights_only_below_ours_on_transactions_9e58b95d() {
     use crate::config::{FieldRule, FieldRuleKind};
@@ -6359,30 +6499,16 @@ fn d2_i_oracle_counts_heights_only_below_ours_on_transactions_9e58b95d() {
         .and_then(|e| e.request_contains.clone())
         .unwrap();
     assert!(op.len() > "graphql:".len(), "{op}");
-    let d = cmp(4, 1);
-    assert_eq!(d.len(), 1, "{d:?}");
-    assert_eq!(d[0].path, ORACLE_COUNTS_HEIGHTS_PATH);
-    assert_eq!(
-        (d[0].a.clone(), d[0].b.clone()),
-        (Some(json!(4)), Some(json!(1)))
-    );
-    let (un, ids) = al.classify_request(&crate::normalize::RouteKind::Other, &op, &[], &d);
-    assert!(un.is_empty(), "{un:?}");
-    assert_eq!(ids, vec!["graphql-r75-oracle-counts-heights".to_string()]);
-    // The same hit on another operation is not explained.
-    let (un, _) = al.classify_request(
-        &crate::normalize::RouteKind::Other,
-        "graphql:QTransactionsByAccount",
-        &[],
-        &d,
-    );
-    assert_eq!(un.len(), 1);
-    // The oracle at or above ours: the count diff stays.
-    let d = cmp(4, 5);
-    assert!(
-        d.iter().any(|e| e.path == "/data/transactions/totalCount"),
-        "{d:?}"
-    );
+    // R-P5P9-86 TC removed I's "oracle below ours" condition: the count difference stays in
+    // the diff, above or below ours, for the count walk to settle on the node.
+    for (x, y) in [(4, 1), (4, 5)] {
+        let d = cmp(x, y);
+        assert!(
+            d.iter().any(|e| e.path == "/data/transactions/totalCount"),
+            "{d:?}"
+        );
+        assert!(d.iter().all(|e| e.path != ORACLE_COUNTS_HEIGHTS_PATH));
+    }
     assert!(cmp(4, 4).is_empty());
     // A nested count is not the root's.
     let nested =
@@ -7432,9 +7558,18 @@ async fn d4a_h2_i2_e_m_o_k_have_their_own_visible_hits_and_proposed_entries() {
         );
         assert!(un.is_empty() && ids == [id], "{path}: {un:?} {ids:?}");
         let e = allow.entries.iter().find(|e| e.id == id).unwrap();
+        // R-P5P9-86 flipped K and O to ACCEPTED on CG-5's node checks.
+        let flipped = e.status == crate::allowlist::Status::Accepted
+            && e.ruling.contains("R-P5P9-86, CG-5")
+            && [
+                "graphql-r75-exec-payload-data",
+                "graphql-r75-nested-order-index",
+            ]
+            .contains(&id);
         assert!(
-            e.status == crate::allowlist::Status::Proposed
-                && e.owner_note.starts_with("PROPOSED")
+            (flipped
+                || e.status == crate::allowlist::Status::Proposed
+                    && e.owner_note.starts_with("PROPOSED"))
                 && e.reason.contains("R-P5P9-78"),
             "{id}: {e:?}"
         );
@@ -7537,4 +7672,1036 @@ async fn d5_m1_rows_settled_without_an_index_have_their_own_visible_hit() {
             && e.ruling.contains("R-P5P9-81"),
         "{e:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// FVH-E1 (R-P5P9-86, the harness round after CG-5)
+
+/// R-P5P9-86 M (widened): `/poll` puts the key in B100 and the node does not hold the oracle
+/// row's block X9 (a header-by-hash 404, read twice): the oracle row is an orphan by block
+/// (CG-5 #226). A row with only a height, at another height than the node's for the key, is
+/// an orphan by height only when ours has the row at the node's block (#1997); otherwise it
+/// stays a diff.
+#[tokio::test]
+async fn e1_m_orphans_by_an_unknown_block_and_by_height() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["x0", "m"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.0));
+        node.polls.insert(k, v);
+    }
+    let calls = node.calls.clone();
+    let ctx = gql_ctx(node, dir.path()).await;
+    let x0 = h7_xrow("x0", 100, json!(1.0), Some(("s", "r")));
+    let at = |b: Option<&str>, h: Option<u64>| {
+        let mut e = h7_xrow("m", 0, json!(1.0), Some(("s", "r")));
+        let blk = &mut e["node"]["block"];
+        match h {
+            Some(h) => blk["height"] = json!(h),
+            None => {
+                blk.as_object_mut().unwrap().remove("height");
+            }
+        }
+        if let Some(b) = b {
+            blk["hash"] = json!(b);
+        }
+        e
+    };
+    // The unknown-block orphan: X9 is not a block the node holds; no height on the row.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), at(Some("B100"), Some(100))],
+        vec![x0.clone(), at(Some("X9"), None)],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(format!("{d:?}").contains("orphan"), "{d:?}");
+    let reads = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str() == "header-by-hash X9")
+        .count();
+    assert_eq!(reads, 2, "the 404 is read twice");
+    // The height-only orphan: the oracle's m at 99, the node's at 100 (B100), ours at B100.
+    let (d, note) = d1_settle(
+        &ctx,
+        vec![x0.clone(), at(None, Some(100))],
+        vec![x0.clone(), at(None, Some(99))],
+        (false, false),
+    )
+    .await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    assert!(format!("{d:?}").contains("orphan by height"), "{d:?}");
+    // Height-only, but ours lacks the row at the node's block: a diff.
+    let (d, _) = d1_settle(
+        &ctx,
+        vec![x0.clone()],
+        vec![x0.clone(), at(None, Some(99))],
+        (false, false),
+    )
+    .await;
+    assert!(!only_hits(&d), "{d:?}");
+}
+
+/// R-P5P9-86 N: a single-block cut where ours lists the node's block in exactly its reverse
+/// order (CG-5 #178: 219 node txs, ours' 200 are the node's 218..19) is explained; a shuffled
+/// order of the same rows is not.
+#[tokio::test]
+async fn e1_n_ours_in_the_nodes_block_order_reversed() {
+    use crate::graphql_window::SINGLE_BLOCK_PATH;
+    let dir = tempfile::tempdir().unwrap();
+    let rks: Vec<String> = (0..219).map(|i| format!("t{i:03}")).collect();
+    let mut node = NodeMock::default();
+    d3_block(&mut node, "BLK612", 4_476_191, &rks);
+    let au = ours_fn_server(|req: &Value| {
+        if req["query"].as_str().unwrap_or("").contains("block(hash") {
+            json!({"data": {"block": {"chainId": "0"}}})
+        } else {
+            json!({"data": null})
+        }
+    })
+    .await;
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let vars = h7_vars(&[("blockHash", json!("BLK612")), ("first", json!(200))]);
+    let ours: Vec<String> = rks.iter().rev().take(200).cloned().collect();
+    assert_eq!((ours[0].as_str(), ours[199].as_str()), ("t218", "t019"));
+    let oracle: Vec<String> = rks[..200].to_vec();
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &ours, &oracle).await;
+    assert!(
+        d.iter().any(|e| e.path == SINGLE_BLOCK_PATH),
+        "{d:?} {note:?}"
+    );
+    assert!(only_hits(&d) && note.is_none(), "{d:?} {note:?}");
+    // The same rows shuffled: neither the node's order nor its reverse.
+    let mut shuffled = ours.clone();
+    shuffled.swap(0, 100);
+    let (d, note, ..) = d3_n_run(&ctx, &vars, &shuffled, &oracle).await;
+    assert!(d.iter().all(|e| e.path != SINGLE_BLOCK_PATH), "{d:?}");
+    assert!(!only_hits(&d) || note.is_some(), "{d:?} {note:?}");
+    assert!(note.unwrap_or_default().contains("N not explained"));
+}
+
+/// R-P5P9-86 NC: an ours-only failed tx whose `badResult` differs from the node's error only
+/// in `info` (ours "", the node "<toplevel>:0": the ACCEPTED `failed-tx-error-info` class) is
+/// judged after that equivalence (CG-5 #1010): canonical, an oracle gap. A `badResult` that
+/// differs in another field stays a diff, and is never called "not canonical" when the
+/// node's block for the key is the row's.
+#[tokio::test]
+async fn e1_nc_failed_tx_error_info_before_judging_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["t0", "t1"] {
+        let (k, mut v) = h7_poll(rk, "B100", 100, json!([]));
+        v.1["result"] = json!({"status": "failure", "error": {"info": "<toplevel>:0",
+            "message": "boom", "type": "TxFailure"}});
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let tx = |rk: &str, info: &str, message: &str| {
+        let bad = json!({"info": info, "message": message, "type": "TxFailure"}).to_string();
+        json!({"cursor": "c", "node": {"hash": rk, "result": {"badResult": bad,
+            "block": {"hash": "B100", "height": 100, "chainId": "0"}}}})
+    };
+    let settle = |a: Vec<Value>, b: Vec<Value>| {
+        let ctx = &ctx;
+        async move {
+            let mut a = h7_page("transactions", false, a);
+            let mut b = h7_page("transactions", false, b);
+            ctx.gql_settle(
+                &ctx.targets["a"],
+                &serde_json::Map::new(),
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await
+        }
+    };
+    let t0 = tx("t0", "<toplevel>:0", "boom");
+    // Ours' t1 with info "": the accepted equivalence, so the node holds it: an oracle gap.
+    let (d, note) = settle(vec![t0.clone(), tx("t1", "", "boom")], vec![t0.clone()]).await;
+    assert!(only_hits(&d) && !d.is_empty(), "{d:?} {note:?}");
+    // Another message: a diff, but not "not canonical" (the node's block is the row's).
+    let (d, note) = settle(vec![t0.clone(), tx("t1", "", "other")], vec![t0.clone()]).await;
+    assert!(!only_hits(&d), "{d:?}");
+    let all = format!("{d:?} {note:?}");
+    assert!(!all.contains("not canonical"), "{all}");
+}
+
+/// R-P5P9-86 SK: ours' longer read pages on by `endCursor` until it passes our boundary
+/// height. CG-5 #25: ours lists 312 rows at one height; the oracle-only row sits at ours'
+/// position 200, past `first` + 50: found after our cut, explained. A tie set too long for
+/// the read's page budget is "our longer read was capped", never "a row we skipped".
+#[tokio::test]
+async fn e1_sk_the_longer_read_pages_past_the_boundary_height() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["r19", "r200", "r1500"] {
+        let (k, v) = h7_poll(rk, "B941", 941, json!([]));
+        node.polls.insert(k, v);
+    }
+    // Ours' whole list: 5 rows above 941, then `ties` rows at 941, then 3 rows at 940.
+    fn full(ties: usize) -> Vec<Value> {
+        let h = |i: usize| match i {
+            i if i < 5 => 1000 - i as u64,
+            i if i < 5 + ties => 941,
+            _ => 940,
+        };
+        (0..5 + ties + 3)
+            .map(|i| {
+                let hi = h(i);
+                let mut e = h7_tx(
+                    &format!("r{i}"),
+                    hi,
+                    &format!("B{hi}"),
+                    "2024-01-01T10:00:00Z",
+                );
+                e["cursor"] = json!(i.to_string());
+                e
+            })
+            .collect()
+    }
+    let au = ours_fn_server(|req: &Value| {
+        let ties: usize = req["variables"]["ties"].as_str().unwrap().parse().unwrap();
+        let rows = full(ties);
+        let from = req["variables"]["after"]
+            .as_str()
+            .map_or(0, |c| c.parse::<usize>().unwrap() + 1);
+        let n = (req["variables"]["first"].as_u64().unwrap_or(0) as usize).min(100);
+        let page: Vec<Value> = rows.iter().skip(from).take(n).cloned().collect();
+        let end = page
+            .last()
+            .map(|e| e["cursor"].clone())
+            .unwrap_or(Value::Null);
+        json!({"data": {"transactions": {"pageInfo": {"hasNextPage": from + n < rows.len(),
+            "endCursor": end}, "edges": page}}})
+    })
+    .await;
+    h7_back_cmds(&mut node, "2024-01-01T10:00:00Z", &[]);
+    let ctx = gql_ctx_at(node, dir.path(), &au).await;
+    let op = h7_op("transactions");
+    for (ties, x, explained) in [(312, "r200", true), (2000, "r1500", false)] {
+        let rows = full(ties);
+        let ours: Vec<Value> = rows.iter().take(20).cloned().collect();
+        // The oracle lists x in place of our last row (canonical: an oracle gap).
+        let mut oracle = ours[..19].to_vec();
+        oracle.push(
+            rows.iter()
+                .find(|e| e["node"]["hash"] == json!(x))
+                .unwrap()
+                .clone(),
+        );
+        let mut a = crate::graphql::Answer {
+            ms: vec![1],
+            ..h7_page("transactions", true, ours)
+        };
+        let mut b = h7_page("transactions", true, oracle);
+        let vars = h7_vars(&[("ties", json!(ties.to_string())), ("first", json!(20))]);
+        let (d, note) = ctx
+            .gql_settle_op(
+                &ctx.targets["a"],
+                Some(&op),
+                &vars,
+                &mut a,
+                &mut b,
+                7_000_000,
+                false,
+            )
+            .await;
+        let note = note.unwrap_or_default();
+        let un = c3_unexplained(&ctx, &d);
+        assert_eq!(un.is_empty(), explained, "ties {ties}: {un:?} {note}");
+        assert!(!note.contains("a row we skipped"), "ties {ties}: {note}");
+        if !explained {
+            assert!(note.contains("our longer read was capped"), "{note}");
+        }
+    }
+}
+
+/// R-P5P9-86 F: Transfers-8c8a0f56 selects no `pageInfo` (CG-5 #28, #58, #78), so its root
+/// list is not a connection H7 can window: the record says "H7 not applied: the root list
+/// selects no pageInfo" and stays a diff. Its rows (`requestKey`, `block { height chainId }`,
+/// no hash, no `orderIndex`) get an identity by request-key multiset.
+#[tokio::test]
+async fn e1_f_a_root_list_without_page_info_gets_the_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    for rk in ["u", "v"] {
+        let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.5));
+        node.polls.insert(k, v);
+    }
+    let ctx = gql_ctx(node, dir.path()).await;
+    let r = |rk: &str| {
+        json!({"node": {"amount": 1.5, "requestKey": rk,
+            "block": {"height": 100, "chainId": "0"}}})
+    };
+    let page = |edges: Vec<Value>| crate::graphql::Answer {
+        body: json!({"data": {"transfers": {"edges": edges}}}),
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    };
+    let (mut a, mut b) = (page(vec![r("u"), r("v")]), page(vec![r("u")]));
+    let (d, note) = ctx
+        .gql_settle(
+            &ctx.targets["a"],
+            &serde_json::Map::new(),
+            &mut a,
+            &mut b,
+            7_000_000,
+            false,
+        )
+        .await;
+    assert!(!only_hits(&d), "{d:?}");
+    assert_eq!(
+        note.as_deref(),
+        Some("H7 not applied: the root list selects no pageInfo"),
+        "{d:?}"
+    );
+    // The rows' identity: transfers by request-key multiset (no index, no block hash).
+    let conn = |rows: Vec<Value>| json!({"pageInfo": {"hasNextPage": false}, "edges": rows});
+    let p = crate::graphql_window::prepare_in(
+        &conn(vec![r("u"), r("u")]),
+        &conn(vec![r("u")]),
+        "transfers",
+    )
+    .unwrap();
+    assert!(p
+        .a
+        .iter()
+        .all(|x| x.id.kind == Some(crate::graphql_window::Kind::Transfer)
+            && x.id.index.is_none()
+            && x.id.block.is_none()));
+    assert_eq!(p.a[0].key, p.b[0].key);
+}
+
+/// R-P5P9-86 G: BlocksByHeight's root rows at one height pair by block (chainId, height,
+/// hash), not by position after the tie sort (CG-5 #70: the oracle's c0 list is cut, so the
+/// text sort put c0 and c19 in another order on each side). c19's lists, complete on both
+/// sides, compare as a multiset; c0's cut list is `/~graphql-h6-unfinished` with why.
+#[test]
+fn e1_g_nested_lists_pair_by_their_parent_block() {
+    use crate::graphql::{compare_answers_with, Answer};
+    let blk = |chain: u64, total: u64, more: bool, prices: &[&str]| {
+        let edges: Vec<Value> = prices
+            .iter()
+            .map(|p| {
+                let ct = format!("2026-01-01T00:00:0{}Z", &p[..1]);
+                json!({"node": {"cmd": {"meta": {"creationTime": ct, "gasPrice": p}}}})
+            })
+            .collect();
+        json!({"node": {"transactions": {"totalCount": total,
+            "pageInfo": {"hasNextPage": more}, "edges": edges},
+            "hash": format!("H{chain}"), "height": 58, "chainId": chain}})
+    };
+    let page = |edges: Vec<Value>| Answer {
+        body: json!({"data": {"completedBlockHeights": {"pageInfo": {"hasNextPage": false},
+            "edges": edges}}}),
+        status: 200,
+        raw: String::new(),
+        ms: Vec::new(),
+    };
+    let mut a = page(vec![
+        blk(0, 3, false, &["1e-8", "2e-8", "3e-8"]),
+        blk(19, 2, false, &["4e-8", "5e-8"]),
+    ]);
+    let mut b = page(vec![
+        blk(0, 126, true, &["1e-8"]),
+        blk(19, 2, false, &["5e-8", "4e-8"]),
+    ]);
+    let d = compare_answers_with(&mut a, &mut b, u64::MAX, 10_000, &[], false);
+    let root = |e: &crate::report::DiffEntry| {
+        e.path.ends_with("/node/chainId") || e.path.ends_with("/node/hash")
+    };
+    assert!(!d.iter().any(root), "parents paired by position: {d:?}");
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_scope::NESTED_MULTISET_PATH),
+        "{d:?}"
+    );
+    assert!(
+        d.iter()
+            .any(|e| e.path == crate::graphql_scope::UNFINISHED_PATH),
+        "{d:?}"
+    );
+}
+
+/// A stored GraphQL diff record of ours against the oracle (`a` against `b`), for the
+/// referee (R-P5P9-87: every rule settles a stored record).
+fn e2_stored(
+    stem: &str,
+    vars: Value,
+    a: Value,
+    b: Value,
+    diff: Vec<crate::report::DiffEntry>,
+) -> crate::report::DiffRecord {
+    crate::report::DiffRecord {
+        ts: "2026-11-15T09:00:00Z".into(),
+        route: format!("graphql:{stem}"),
+        request: format!("{stem} {vars}"),
+        a_target: "a".into(),
+        b_target: "b".into(),
+        a_status: Some(200),
+        b_status: Some(200),
+        a_body_trimmed: a.to_string(),
+        b_body_trimmed: b.to_string(),
+        diff,
+        class: "diff".into(),
+        allowlisted: None,
+        known_gap: None,
+        curl: String::new(),
+        note: None,
+        body_cap: None,
+        a_pages: Some(1),
+        a_tip_height: None,
+        a_lowest_height: None,
+    }
+}
+
+/// Writes `recs` as a diff log and runs the referee over it.
+async fn e2_referee(
+    cfg: CompareConfig,
+    dir: &std::path::Path,
+    recs: &[crate::report::DiffRecord],
+) -> crate::referee::Report {
+    e2_referee_capped(cfg, dir, recs, 200).await
+}
+
+/// [`e2_referee`] with the run's `--max-reads`.
+async fn e2_referee_capped(
+    cfg: CompareConfig,
+    dir: &std::path::Path,
+    recs: &[crate::report::DiffRecord],
+    max_reads: usize,
+) -> crate::referee::Report {
+    let log = dir.join(format!("diffs-e2-{}.jsonl", recs.len()));
+    let lines: Vec<String> = recs
+        .iter()
+        .map(|r| serde_json::to_string(&r.bounded()).unwrap())
+        .collect();
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let opts = crate::referee::Opts {
+        logs: vec![log],
+        max_reads,
+        rps: 10,
+    };
+    crate::referee::run(cfg, &opts).await.unwrap()
+}
+
+/// R-P5P9-86 (P, Q) with R-P5P9-87: the referee reads a stored record's KNOWN-GAP hits with
+/// the live run's request text. #520's shape (a follow-page fault on a P key) and #37's
+/// (QNonFungibleAccount, ours without the oracle's one chain row) are known gaps, never
+/// explained; the same fault on another account stays unexplained.
+#[tokio::test]
+async fn e2_pq_the_referee_reads_known_gaps_on_stored_records() {
+    use crate::report::{DiffEntry, DiffKind};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let ops = c3_ops(dir.path());
+    std::fs::write(
+        ops.join("QNonFungibleAccount.graphql"),
+        "# kdx: oracle\nquery QNonFungibleAccount($accountName: String!) { nonFungibleAccount(\
+         accountName: $accountName) { id accountName chainAccounts { id chainId accountName } } }\n",
+    )
+    .unwrap();
+    let cfg = || {
+        c3_cfg(
+            &nu,
+            "http://127.0.0.1:9/graphql",
+            "https://oracle.invalid/graphql",
+            dir.path(),
+            &ops,
+            "",
+        )
+    };
+    let fault = vec![DiffEntry {
+        path: crate::graphql::FOLLOW_PAGE_FAULT_PATH.into(),
+        kind: DiffKind::Changed,
+        a: Some(json!({"page": 2, "status": 200,
+            "why": r#"errors: [{"message":"request deadline exceeded"}]"#})),
+        b: None,
+    }];
+    let page = json!({"data": {"transfers": {"pageInfo": {"hasNextPage": false}, "edges": []}}});
+    let k520 = "af7943004d0b08fe5402c23ec317f7a8d1bdd6ce4cc52414efcf8dbfa68ca256";
+    let p = e2_stored(
+        "QH7",
+        json!({"accountName": k520, "first": 1}),
+        page.clone(),
+        page.clone(),
+        fault.clone(),
+    );
+    let other = e2_stored(
+        "QH7",
+        json!({"accountName": "k:0000", "first": 1}),
+        page.clone(),
+        page,
+        fault,
+    );
+    let nft = |rows: Value| {
+        json!({"data": {"nonFungibleAccount": {"id": "n", "accountName": "k:a",
+            "chainAccounts": rows}}})
+    };
+    let row = json!({"id": "c8", "chainId": "8", "accountName": "k:a"});
+    let q = e2_stored(
+        "QNonFungibleAccount",
+        json!({"accountName": "k:a"}),
+        nft(json!([])),
+        nft(json!([row.clone()])),
+        vec![DiffEntry {
+            path: "/data/nonFungibleAccount/chainAccounts/0".into(),
+            kind: DiffKind::Missing,
+            a: None,
+            b: Some(row),
+        }],
+    );
+    let rep = e2_referee(cfg(), dir.path(), &[p, q]).await;
+    assert_eq!(
+        (rep.explained, rep.unexplained, rep.known_gap),
+        (0, 0, 2),
+        "{rep:?}"
+    );
+    assert_eq!(
+        rep.by_class
+            .get("known-gap: known-gap-p-heavy-account-deadline"),
+        Some(&1)
+    );
+    assert_eq!(
+        rep.by_class
+            .get("known-gap: known-gap-q-missing-chain-rows"),
+        Some(&1)
+    );
+    assert!(rep.passed(), "a known gap is no unexplained record");
+    let rep = e2_referee(cfg(), dir.path(), &[other]).await;
+    assert_eq!((rep.unexplained, rep.known_gap), (1, 0), "{rep:?}");
+}
+
+/// A ctx whose node holds tx `t2` at chain 0 height 100 (block B100, payload P100) with
+/// the signed command `cmd`, and tx `t1` at 101.
+async fn e2_cmd_ctx(dir: &std::path::Path, cmd: &Value) -> Ctx {
+    let mut node = NodeMock::default();
+    for (rk, h) in [("t1", 101), ("t2", 100)] {
+        let (k, v) = h7_poll(rk, &format!("B{h}"), h, json!([]));
+        node.polls.insert(k, v);
+    }
+    node.headers.insert(
+        (0, 100),
+        vec![json!({"hash": "B100", "height": 100, "chainId": 0, "payloadHash": "P100"})],
+    );
+    let w = json!({"hash": "t2", "sigs": [], "cmd": cmd.to_string()}).to_string();
+    node.payloads.insert(
+        "P100".into(),
+        json!({"transactions": [[kdx_types::hash::b64url_encode(w.as_bytes()), ""]]}),
+    );
+    let au = ours_fn_server(|_: &Value| json!({"data": {"block": {"chainId": "0"}}})).await;
+    gql_ctx_at(node, dir, &au).await
+}
+
+/// Settles ours [t1, t2 (node `n2`)] against the oracle's [t1] at root `root` with `doc`.
+async fn e2_settle_tx(
+    ctx: &Ctx,
+    doc: &str,
+    root: &str,
+    vars: &[(&str, Value)],
+    n2: Value,
+) -> (Vec<String>, String) {
+    let op = crate::graphql::parse_op("QE2", doc, false).unwrap();
+    let tx = |rk: &str, h: u64, mut n: Value| {
+        let id = crate::graphql::base64_std(format!("Transaction:[\"B{h}\",\"{rk}\"]").as_bytes());
+        n["id"] = json!(id);
+        n["hash"] = json!(rk);
+        json!({"cursor": "c", "node": n})
+    };
+    let t1 = tx("t1", 101, json!({}));
+    let mut a = h7_page(root, false, vec![t1.clone(), tx("t2", 100, n2)]);
+    let mut b = h7_page(root, false, vec![t1]);
+    let mut vs = h7_vars(&[("first", json!(2))]);
+    vs.extend(h7_vars(vars));
+    let (d, note) = ctx
+        .gql_settle_op(
+            &ctx.targets["a"],
+            Some(&op),
+            &vs,
+            &mut a,
+            &mut b,
+            7_000_000,
+            false,
+        )
+        .await;
+    (c3_unexplained(ctx, &d), note.unwrap_or_default())
+}
+
+/// R-P5P9-86 T (`cmd.payload`): a payload that selects no field of its member is the node's
+/// only when the document's fragments select the other member alone. A continuation tx
+/// under `... on ExecutionPayload { code }` is `{}`: explained; an exec tx served as `{}`
+/// there, or `{}` under both fragments: a diff.
+#[tokio::test]
+async fn e2_t_a_payload_with_no_field_of_its_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = |frags: &str| {
+        format!(
+            "query QE2($first: Int, $after: String) {{ transactions(first: $first, after: \
+             $after) {{ totalCount pageInfo {{ hasNextPage endCursor }} edges {{ cursor node {{ \
+             id hash cmd {{ nonce payload {{ {frags} }} }} }} }} }} }}"
+        )
+    };
+    let exec_only = doc("... on ExecutionPayload { code }");
+    let both = doc("... on ExecutionPayload { code } ... on ContinuationPayload { pactId }");
+    let cmd = |payload: Value| {
+        json!({"networkId": "mainnet01", "nonce": "n2", "meta": {}, "payload": payload,
+            "signers": []})
+    };
+    let cont = cmd(json!({"cont": {"pactId": "p", "step": 1, "rollback": false,
+        "data": {}, "proof": null}}));
+    let exec = cmd(json!({"exec": {"code": "(+ 1 2)", "data": {}}}));
+    let row = |p: Value| json!({"cmd": {"nonce": "n2", "payload": p}});
+    let ctx = e2_cmd_ctx(dir.path(), &cont).await;
+    let (un, note) = e2_settle_tx(&ctx, &exec_only, "transactions", &[], row(json!({}))).await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    let (un, note) = e2_settle_tx(&ctx, &both, "transactions", &[], row(json!({}))).await;
+    assert!(!un.is_empty() && note.contains("cmd.payload"), "{note}");
+    let ctx = e2_cmd_ctx(dir.path(), &exec).await;
+    let (un, note) = e2_settle_tx(&ctx, &exec_only, "transactions", &[], row(json!({}))).await;
+    assert!(!un.is_empty() && note.contains("cmd.payload"), "{note}");
+}
+
+/// R-P5P9-86 U: `transactionsByPublicKey(publicKey)` is checked against the signers of the
+/// node's command: a signer's key explains the ours-only row; a wrong key is a diff.
+#[tokio::test]
+async fn e2_u_the_public_key_filter_against_the_nodes_signers() {
+    let dir = tempfile::tempdir().unwrap();
+    let cmd = json!({"networkId": "mainnet01", "nonce": "n2", "meta": {},
+        "payload": {"exec": {"code": "(+ 1 2)", "data": {}}},
+        "signers": [{"pubKey": "pk0"}, {"pubKey": "pk1", "clist": []}]});
+    let ctx = e2_cmd_ctx(dir.path(), &cmd).await;
+    let doc = "query QE2($publicKey: String!, $first: Int, $after: String) { \
+               transactionsByPublicKey(publicKey: $publicKey, first: $first, after: $after) { \
+               totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash } } } }";
+    let root = "transactionsByPublicKey";
+    let (un, note) = e2_settle_tx(&ctx, doc, root, &[("publicKey", json!("pk1"))], json!({})).await;
+    assert!(un.is_empty(), "{un:?} {note}");
+    let (un, note) = e2_settle_tx(&ctx, doc, root, &[("publicKey", json!("pk9"))], json!({})).await;
+    assert!(!un.is_empty(), "{note}");
+    assert!(note.contains("publicKey: no signer"), "{note}");
+}
+
+/// R-P5P9-86 S′, live: the native pair is labelled with its B target (`gql|native`), and a
+/// gap is re-read once in the other order. A re-read that agrees is miner skew; one that
+/// still differs stays a diff.
+#[tokio::test]
+async fn e2_s_the_native_pair_rereads_a_gap_in_the_other_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let native = serve(Router::new().route(
+        "/api/v1/accounts/{a}/balances",
+        get(|| async {
+            Json(json!({"items": [{"module": "coin", "chain": 0, "balance": "10.904046"}]}))
+        }),
+    ))
+    .await;
+    let run = |late: bool| {
+        let (nu, native, dir) = (nu.clone(), native.clone(), dir.path().to_path_buf());
+        async move {
+            let n = Arc::new(AtomicUsize::new(0));
+            let gql = ours_fn_server(move |_: &Value| {
+                // The first read is a block behind; the re-read (when `late`) has caught up.
+                let k = n.fetch_add(1, O::SeqCst);
+                let bal = if late && k > 0 { "10.904046" } else { "10.0" };
+                json!({"data": {"fungibleAccount": {"chainAccounts": [
+                    {"chainId": "0", "balance": bal, "guard": null}]}}})
+            })
+            .await;
+            let own =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/graphql");
+            let allow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../compare/allowlist.toml");
+            let cfg: CompareConfig = toml::from_str(&format!(
+                "network = \"mainnet01\"\npairs = [[\"gql\", \"native\"]]\nallowlist = {allow:?}\n\
+                 out_dir = {dir:?}\n[node]\nurl = \"{nu}\"\ntimeout_ms = 5000\n[graphql]\n\
+                 own_ops_dir = {own:?}\n[targets.gql]\nurl = \"{gql}\"\n\
+                 kind = \"kda_indexer_graphql\"\n[targets.native]\nurl = \"{native}\"\n\
+                 kind = \"kda_indexer_native\"\n"
+            ))
+            .unwrap();
+            let ctx = Ctx::new(cfg).await.unwrap();
+            let op = ctx
+                .gql
+                .ops
+                .iter()
+                .find(|o| o.stem == "NodeBalance")
+                .unwrap()
+                .clone();
+            let vars = h7_vars(&[("accountName", json!("k:m"))]);
+            ctx.gql_native_balance(&ctx.targets["gql"], &ctx.targets["native"], &op, &vars)
+                .await
+        }
+    };
+    let o = run(true).await;
+    assert_eq!(o.class, "allowlisted", "{:?}", o.record);
+    assert!(o
+        .allowlist_ids
+        .contains(&"graphql-native-miner-skew".to_string()));
+    let rec = o.record.unwrap();
+    assert_eq!(rec.b_target, "native");
+    let o = run(false).await;
+    assert_eq!(o.class, "diff", "{:?}", o.record);
+    let rec = o.record.unwrap();
+    assert_eq!(rec.b_target, "native");
+    assert!(
+        rec.diff.iter().any(|e| e.path == "/chain0/balance"),
+        "{:?}",
+        rec.diff
+    );
+    // R-P5P9-95 I-4: the re-read that still differs is kept as evidence.
+    let ev = rec
+        .diff
+        .iter()
+        .find(|e| e.path == "/~graphql-native-reread-differs")
+        .unwrap_or_else(|| panic!("the re-read's evidence: {:?}", rec.diff));
+    assert!(ev.a.is_some(), "{ev:?}");
+}
+
+/// R-P5P9-105 S′'s node: chain 0 at heights 85..=110, block time 30 s apart (height 100 at
+/// the record's time). Each height's coinbase pays `k:m` 0.904046 when listed in `cb`, else
+/// `k:o`; `txs` gives a height's transactions' events.
+fn s_node(cb: &[u64], txs: &[(u64, Vec<Value>)]) -> NodeMock {
+    s_node_at(cb, txs, 110, 30)
+}
+
+/// [`s_node`] with the tip at `tip` and `spacing` seconds a block (the heights 60 to `tip`).
+/// A spacing under 30 s makes the search for the record's height take more steps.
+fn s_node_at(cb: &[u64], txs: &[(u64, Vec<Value>)], tip: u64, spacing: i64) -> NodeMock {
+    let base: u64 = 1_794_733_200;
+    let mut node = NodeMock {
+        tip,
+        ..NodeMock::default()
+    };
+    let enc = |v: Value| kdx_types::hash::b64url_encode(v.to_string().as_bytes());
+    for h in 60..=tip {
+        let t = (base as i64 + (h as i64 - 100) * spacing) as u64 * 1_000_000;
+        node.headers.insert(
+            (0, h),
+            vec![json!({"hash": format!("H{h}"), "height": h, "chainId": 0,
+                "creationTime": t, "payloadHash": format!("P{h}")})],
+        );
+        let miner = if cb.contains(&h) { "k:m" } else { "k:o" };
+        let coinbase = json!({"events": [s_transfer("", miner, json!(0.904046))]});
+        let outs: Vec<Value> = txs
+            .iter()
+            .filter(|(x, _)| *x == h)
+            .map(|(_, evs)| json!(["", enc(json!({"events": evs}))]))
+            .collect();
+        node.payloads.insert(
+            format!("P{h}"),
+            json!({"transactions": outs, "coinbase": enc(coinbase)}),
+        );
+    }
+    node
+}
+
+fn s_transfer(from: &str, to: &str, amount: Value) -> Value {
+    json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": [from, to, amount]})
+}
+
+/// The stored referee over one NodeBalance record of k:m on chain 0: ours' GraphQL `ours`
+/// (a JSON number, as stored), native `native`.
+async fn s_referee(node: NodeMock, ours: &str, native: &str) -> crate::referee::Report {
+    s_referee_capped(node, ours, native, 200).await
+}
+
+/// [`s_referee`] with the run's `--max-reads`.
+async fn s_referee_capped(
+    node: NodeMock,
+    ours: &str,
+    native: &str,
+    max_reads: usize,
+) -> crate::referee::Report {
+    use crate::report::{DiffEntry, DiffKind};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(node).await;
+    let ops = c3_ops(dir.path());
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compare/graphql/NodeBalance.graphql"),
+        ops.join("NodeBalance.graphql"),
+    )
+    .unwrap();
+    let cfg = c3_cfg(
+        &nu,
+        "http://127.0.0.1:9/graphql",
+        "https://oracle.invalid/graphql",
+        dir.path(),
+        &ops,
+        "",
+    );
+    let mut r = e2_stored(
+        "NodeBalance",
+        json!({"accountName": "k:m"}),
+        Value::Null,
+        Value::Null,
+        vec![DiffEntry {
+            path: "/chain0/balance".into(),
+            kind: DiffKind::Changed,
+            a: Some(serde_json::from_str(ours).unwrap()),
+            b: Some(json!(native)),
+        }],
+    );
+    r.b_target = "node".into();
+    e2_referee_capped(cfg, dir.path(), &[r], max_reads).await
+}
+
+/// R-P5P9-105 S′: the gap native − GraphQL is explained when it equals the account's net
+/// change on the node: the sum of its coin TRANSFER events in 1 to 3 consecutive canonical
+/// blocks of the record's height window, exact-decimal, with half an f64 ulp on ours' number.
+#[tokio::test]
+async fn i_s_the_gap_is_the_accounts_net_change_on_the_node() {
+    let ok = |rep: &crate::referee::Report, case: &str| {
+        assert_eq!((rep.explained, rep.unexplained), (1, 0), "{case}: {rep:?}");
+    };
+    let no = |rep: &crate::referee::Report, case: &str| {
+        assert_eq!((rep.explained, rep.unexplained), (0, 1), "{case}: {rep:?}");
+    };
+    // (a) #75's shape: one coinbase, ours' 60263.91224935622. R-P5P9-110: the gap is measured
+    // from the f64's exact value (2.78e-12 below that text), so the native text is one
+    // coinbase above the text; it was one unit (1e-12) more under the text-based measure, a
+    // value that is 3.78e-12 from the f64, past its half ulp of 3.64e-12.
+    let rep = s_referee(
+        s_node(&[100], &[]),
+        "60263.91224935622",
+        "60264.81629535622",
+    )
+    .await;
+    ok(&rep, "a");
+    // (b) a miner block: its coinbase and a fee of 1.08e-5 paid to k:m.
+    let fee = vec![(100, vec![s_transfer("k:p", "k:m", json!(0.0000108))])];
+    let rep = s_referee(s_node(&[100], &fee), "10.0", "10.9040568").await;
+    ok(&rep, "b");
+    // A residual of 1e-6 more: unexplained.
+    let rep = s_referee(s_node(&[100], &fee), "10.0", "10.9040578").await;
+    no(&rep, "b residual");
+    // (c) #1711: 25 rows in one block (the coinbase and 24 receive legs), gap
+    // 1,667.96549197 + the f64 rounding of ours' number.
+    let mut legs: Vec<Value> = (0..23)
+        .map(|_| s_transfer("", "k:m", json!(69.5)))
+        .collect();
+    legs.push(s_transfer("", "k:m", json!({"decimal": "68.56144597"})));
+    let rep = s_referee(
+        s_node(&[100], &[(100, legs)]),
+        "60263.91224935622",
+        "61931.87774132622",
+    )
+    .await;
+    ok(&rep, "c");
+    // (d) a negative gap equal to a debit of k:m.
+    let debit = vec![(100, vec![s_transfer("k:m", "k:x", json!(2.5))])];
+    let rep = s_referee(s_node(&[], &debit), "10.0", "7.5").await;
+    ok(&rep, "d");
+    // Credits of 1.0 in four consecutive blocks and a gap of 4.0: more than 3 blocks.
+    let four: Vec<(u64, Vec<Value>)> = (98..=101)
+        .map(|h| (h, vec![s_transfer("k:p", "k:m", json!(1.0))]))
+        .collect();
+    let rep = s_referee(s_node(&[], &four), "10.0", "14.0").await;
+    no(&rep, "four blocks");
+    let rep = s_referee(s_node(&[], &four), "10.0", "13.0").await;
+    ok(&rep, "three of them");
+    // Review M2: credits at 98 and 101 (gap 2.0) are not consecutive blocks within 3.
+    let apart: Vec<(u64, Vec<Value>)> = [98, 101]
+        .iter()
+        .map(|h| (*h, vec![s_transfer("k:p", "k:m", json!(1.0))]))
+        .collect();
+    let rep = s_referee(s_node(&[], &apart), "10.0", "12.0").await;
+    no(&rep, "non-adjacent blocks");
+    // R-P5P9-108 (M2): the read stop. The record's read budget (`--max-reads`) ends the window
+    // before the credit at its far edge (113): unexplained, the cap named in the reason. With
+    // the default budget the same record is explained. (`S_NET_READS` itself, 50 for the cut,
+    // the search and the window, is never reached by the constants: at most 8 reads before the
+    // window and 42 in it, and the check stops past 50.)
+    let far = vec![(113, vec![s_transfer("k:p", "k:m", json!(1.0))])];
+    let rep = s_referee_capped(s_node_at(&[], &far, 196, 15), "10.0", "11.0", 25).await;
+    no(&rep, "far edge past the read budget");
+    assert!(rep.node_reads <= 25, "{rep:?}");
+    assert!(
+        format!("{:?}", rep.still_unexplained).contains("cap"),
+        "the cap reason: {rep:?}"
+    );
+    let rep = s_referee(s_node_at(&[], &far, 196, 15), "10.0", "11.0").await;
+    ok(&rep, "the default budget reads the window");
+}
+
+/// R-P5P9-110: the five stored S′ records of re-referee #3 (#117, #384, #524, #554, #584).
+/// The gap is measured from the exact value of ours' f64, not from ours' printed shortest
+/// text, which can itself be up to half an ulp off the f64. Each pair below is an f64 (ours'
+/// GraphQL number) and a native text built from the report's gap and matching run: the
+/// residual against the f64's exact value is 1.3 to 4.8e-12, inside its half ulp (3.64e-12,
+/// or 7.28e-12 for #384), and 4e-12 to 9e-12 against the shortest text, outside it. Each
+/// failed with the text-based measure.
+#[tokio::test]
+async fn k_s_the_gap_is_measured_from_the_exact_f64() {
+    let fee = |x: Value| vec![(100, vec![s_transfer("k:p", "k:m", x)])];
+    // #117: h280 a coinbase and 1.08e-5 of fees, h281 a coinbase (1.8081028).
+    let rep = s_referee(
+        s_node(&[100, 101], &fee(json!(0.0000108))),
+        "54284.63192951972",
+        "54286.440032319714",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#117: {rep:?}");
+    // #384: one coinbase (ours in the binade above 65,536: half an ulp 7.28e-12).
+    let rep = s_referee(
+        s_node(&[100], &[]),
+        "108658.8776613048",
+        "108659.781707304791",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#384: {rep:?}");
+    // #524: two coinbases, the node's value above (+3.2e-12 from the f64).
+    let rep = s_referee(
+        s_node(&[100, 101], &[]),
+        "50055.71773775338",
+        "50057.525829753384",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#524: {rep:?}");
+    // #554: two coinbases, the node's value below.
+    let rep = s_referee(
+        s_node(&[100, 101], &[]),
+        "51833.59778194551",
+        "51835.405873945504",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#554: {rep:?}");
+    // #584: a coinbase and 6.33e-5 of fees (0.9041093).
+    let rep = s_referee(
+        s_node(&[100], &fee(json!(0.0000633))),
+        "39715.34511975433",
+        "39716.249229054334",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#584: {rep:?}");
+}
+
+/// R-P5P9-110, fail closed: the tolerance is still half an ulp of the f64, from its exact
+/// value. With one coinbase and ours 54284.63192951972 (half an ulp 3.64e-12), a native that
+/// is 0.38 ulp from the exact value is explained; 0.58 ulp below and 0.66 ulp above (the
+/// 12-place text cannot sit at exactly 0.6) stay unexplained.
+#[tokio::test]
+async fn k_s_more_than_half_an_ulp_from_the_exact_f64_stays_unexplained() {
+    for (native, explained) in [
+        ("54285.53597551972", 1usize),
+        ("54285.535975519713", 0),
+        ("54285.535975519722", 0),
+    ] {
+        let rep = s_referee(s_node(&[100], &[]), "54284.63192951972", native).await;
+        assert_eq!(rep.explained, explained, "{native}: {rep:?}");
+        assert_eq!(rep.unexplained, 1 - explained, "{native}: {rep:?}");
+    }
+}
+
+/// R-P5P9-86 S′ with R-P5P9-87, stored: a CG-5 NodeBalance record (labelled `node`) is miner
+/// skew only when its gap is k (1 to 3) coinbases of one amount that the node's canonical
+/// blocks in the record's height window pay the account. Here the node pays k:m at heights
+/// 100 and 101 (the record's time is height 100's): a gap of one coinbase is explained; three
+/// (the node shows two), or a gap that is no multiple, stay unexplained.
+#[tokio::test]
+async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
+    use crate::report::{DiffEntry, DiffKind};
+    let dir = tempfile::tempdir().unwrap();
+    let base: u64 = 1_794_733_200;
+    let mut node = NodeMock {
+        tip: 110,
+        ..NodeMock::default()
+    };
+    for h in 85..=110u64 {
+        let t = (base as i64 + (h as i64 - 100) * 30) as u64 * 1_000_000;
+        node.headers.insert(
+            (0, h),
+            vec![json!({"hash": format!("H{h}"), "height": h, "chainId": 0,
+                "creationTime": t, "payloadHash": format!("P{h}")})],
+        );
+        let miner = if h == 100 || h == 101 { "k:m" } else { "k:o" };
+        let cb = json!({"events": [{"name": "TRANSFER", "module": {"name": "coin"},
+            "params": ["", miner, 0.904046]}]})
+        .to_string();
+        node.payloads.insert(
+            format!("P{h}"),
+            json!({"transactions": [], "coinbase": kdx_types::hash::b64url_encode(cb.as_bytes())}),
+        );
+    }
+    let nu = node_server(node).await;
+    let ops = c3_ops(dir.path());
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../compare/graphql/NodeBalance.graphql"),
+        ops.join("NodeBalance.graphql"),
+    )
+    .unwrap();
+    let cfg = || {
+        c3_cfg(
+            &nu,
+            "http://127.0.0.1:9/graphql",
+            "https://oracle.invalid/graphql",
+            dir.path(),
+            &ops,
+            "",
+        )
+    };
+    let rec = |native: &str| {
+        let mut r = e2_stored(
+            "NodeBalance",
+            json!({"accountName": "k:m"}),
+            Value::Null,
+            Value::Null,
+            vec![DiffEntry {
+                path: "/chain0/balance".into(),
+                kind: DiffKind::Changed,
+                a: Some(json!("10.0")),
+                b: Some(json!(native)),
+            }],
+        );
+        r.b_target = "node".into();
+        r
+    };
+    let rep = e2_referee(cfg(), dir.path(), &[rec("10.904046")]).await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    assert_eq!(rep.by_class.get("graphql-native-miner-skew"), Some(&1));
+    // R-P5P9-97 S′ (#117's shape): the stored GraphQL balance is a JSON number, read as an
+    // exact decimal; R-P5P9-98: native's trailing zeros past 12 places are ignored. A number
+    // whose gap is no coinbase multiple stays unexplained.
+    for (ours, native, explained) in [
+        ("10.0", "10.904046000000000", 1),
+        ("10", "10.904046", 1),
+        ("10.5", "10.904046", 0),
+    ] {
+        let mut r = rec(native);
+        r.diff[0].a = Some(serde_json::from_str(ours).unwrap());
+        let rep = e2_referee(cfg(), dir.path(), &[r]).await;
+        assert_eq!(
+            (rep.explained, rep.unexplained),
+            (explained, 1 - explained),
+            "{ours} {native}: {rep:?}"
+        );
+    }
+    // R-P5P9-95 I-4: 9.095954 is GraphQL one coinbase above native (a skew leaves GraphQL
+    // below native only).
+    for native in ["12.712138", "10.5", "9.095954"] {
+        let rep = e2_referee(cfg(), dir.path(), &[rec(native)]).await;
+        assert_eq!(
+            (rep.explained, rep.unexplained),
+            (0, 1),
+            "{native}: {rep:?}"
+        );
+    }
+    // R-P5P9-95 I-4: a record whose live re-read still differed is refused.
+    let mut r = rec("10.904046");
+    r.diff.push(DiffEntry {
+        path: "/~graphql-native-reread-differs".into(),
+        kind: DiffKind::Changed,
+        a: Some(json!({"reread": "differs"})),
+        b: None,
+    });
+    let rep = e2_referee(cfg(), dir.path(), &[r]).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
 }

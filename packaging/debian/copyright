@@ -4,11 +4,13 @@ Source: https://github.com/ZelCore-io/kda-indexer
 Comment:
  Full licence texts: /usr/share/doc/kda-indexer/LICENSE-MIT and LICENSE-APACHE (and
  /usr/share/common-licenses/Apache-2.0). Attribution notices for code that is vendored or
- statically linked: /usr/share/doc/kda-indexer/THIRD_PARTY_NOTICES, NOTICE.libmdbx and
- ptr_hash-LICENSE-MIT.
+ statically linked: /usr/share/doc/kda-indexer/THIRD_PARTY_NOTICES, NOTICE.libmdbx,
+ NOTICE.jemalloc and ptr_hash-LICENSE-MIT.
  .
  The binary statically links libmdbx (Copyright 2015-2026 Leonid Yuriev, Apache-2.0, through
- reth-libmdbx and reth-mdbx-sys; its NOTICE is shipped as NOTICE.libmdbx) and the Rust
+ reth-libmdbx and reth-mdbx-sys; its NOTICE is shipped as NOTICE.libmdbx), jemalloc
+ (Copyright Jason Evans, Mozilla Foundation and Facebook, BSD-2-Clause, through
+ tikv-jemalloc-sys; its licence is shipped as NOTICE.jemalloc) and the Rust
  dependencies of the default build, all under MIT, Apache-2.0, BSD, zlib, ISC, BSL-1.0 or
  Unicode-3.0 terms (or dual-licensed with one of them).
 

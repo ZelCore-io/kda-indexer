@@ -33,7 +33,15 @@ pub struct RangeReader {
 
 impl RangeReader {
     pub fn open(dir: &Path, e: &RangeEntry, network: &str) -> Result<RangeReader> {
-        let f = |k: FileKind| dir.join(file_name(network, k, e.start, e.end));
+        match Self::open_once(dir, e, network) {
+            // A committed swap moved a file between `resolve` and `open`: resolve again.
+            Err(_) if crate::swap::pending(dir, e.start) => Self::open_once(dir, e, network),
+            r => r,
+        }
+    }
+
+    fn open_once(dir: &Path, e: &RangeEntry, network: &str) -> Result<RangeReader> {
+        let f = |k: FileKind| crate::swap::resolve(dir, &file_name(network, k, e.start, e.end));
         let info = RangeInfo::load(&f(FileKind::Range))?;
         if info.entry() != *e {
             bail!(
@@ -384,6 +392,33 @@ impl Segments {
     pub fn txkey(&self, txnum: u64) -> Option<TxKey> {
         let r = self.range_of_txnum(txnum)?;
         r.txkey_rel(txnum - r.info.first_txnum)
+    }
+
+    /// Read-ahead for the tx and block records of `keys` (see [`BlockFile::prefetch`]),
+    /// grouped per range. Keys outside the frozen ranges are skipped. Returns the bytes
+    /// advised.
+    pub fn prefetch(&self, keys: impl IntoIterator<Item = TxKey>) -> Result<u64> {
+        let mut per: std::collections::BTreeMap<usize, (Vec<u64>, Vec<u64>)> =
+            std::collections::BTreeMap::new();
+        for k in keys {
+            let Some(i) = self.manifest.entry_of_height(k.height()) else {
+                continue;
+            };
+            let r = &self.ranges[i];
+            let e = per.entry(i).or_default();
+            if let Some(rel) = r.rel_of(k) {
+                e.0.push(rel);
+            }
+            if let Some(b) = r.slot(k.chain(), k.height()).and_then(|s| r.block_index(s)) {
+                e.1.push(b);
+            }
+        }
+        let mut bytes = 0;
+        for (i, (txs, blocks)) in per {
+            let r = &self.ranges[i];
+            bytes += r.txs.prefetch(txs)? + r.blocks.prefetch(blocks)?;
+        }
+        Ok(bytes)
     }
 
     pub fn txnum_of(&self, k: TxKey) -> Option<u64> {

@@ -26,6 +26,7 @@ tracing.workspace = true
 [dev-dependencies]
 kdx-segment.workspace = true
 libc.workspace = true
+proptest.workspace = true
 tokio-tungstenite = "0.29"
 tempfile.workspace = true
 tower.workspace = true

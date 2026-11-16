@@ -2,7 +2,7 @@
 
 ## Commands that write
 
-`run`, `backfill` and `unwind` (and the hidden `tail`) write to the data directory. Each one
+`run`, `backfill`, `rebuild-range` and `unwind` (and the hidden `tail`) write to the data directory. Each one
 takes an exclusive lock on `<data_dir>/LOCK` and exits at once with an error if another
 kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer-<network>`) before running
 `backfill` or `unwind` by hand. Read-only commands (`inspect`, `segments`, `hot stats`) do
@@ -192,6 +192,31 @@ the compat, graphql and admin listeners to loopback plus the host's private addr
 admin port. A host that is not ready leaves the pool, and its routes fall back to
 chainweb-data. Drain the server on the balancer before a planned restart.
 
+## `/stats` freshness
+
+The compat `/stats` (and GraphQL `networkInfo`) never counts on the request. A background task
+started with the server recounts the user transactions, starting each count 2 minutes after the
+previous one ended (counts never overlap), and stops with it: an in-progress count is abandoned
+on shutdown, so the exit does not wait for the walk. Otherwise a count runs to completion,
+however long it takes. A request answers the last count with `X-Count-Age: <seconds>`
+since that count started (the snapshot the count read), so the header stays under the 2 minute
+interval plus one count time when refreshes succeed and grows when they do not. There is no age after which the count is
+refused.
+
+- A refresh that takes over 60 s logs one `stats: count refresh was slow` WARN with its
+  duration when it ends; the age grows meanwhile and requests keep the last count. A refresh
+  that fails keeps the last count and logs one `stats: count refresh failed` WARN per 10
+  minutes. A repeated slow WARN means cold pages: check the disk and the `read_threads` load.
+  A request that finds the count older than 6 minutes (3 intervals) logs one
+  `stats: the count is stale` WARN per 10 minutes: a count is stuck or failing.
+- Right after a start there is no count yet. A request waits up to the API deadline, then
+  answers `503` with `Retry-After: 5`; GraphQL `networkInfo` answers the same error at once.
+  Both clear when the first count finishes, which takes as long as one walk of the hot window.
+  A failed first count is retried after 5 s (later counts after 2 minutes).
+- The transaction count in a `/stats` answer can be up to the refresh interval plus one count
+  behind the store (`X-Count-Age` measures from the start of that count); the supply is computed
+  per request.
+
 ## Metrics and alerts
 
 `/metrics` on the admin port (OpenMetrics text); the same families are written to the
@@ -235,15 +260,43 @@ Alerts to set up in your own alerting:
 
 ## Snapshots and replicas
 
-`kda-indexer snapshot --out DIR` writes a consistent copy of a data dir. It only reads, takes
-no lock and can run beside the live `run` (and beside the freezer and merges). The copy is a
-data dir: `serve --data-dir DIR` answers on it, and `run` on it resumes the tail from the
-checkpoints it holds.
+`kda-indexer snapshot --out DIR` writes a consistent copy of a data dir. It only reads the
+source, does not take the data dir lock and can run beside the live `run` (and beside the
+freezer and merges); it holds the swap locks (`segments.swap.lock`, `search.swap.lock`) only
+while it places files. The copy is a data dir: `serve --data-dir DIR` answers on it, and `run`
+on it resumes the tail from the checkpoints it holds.
 
 ```sh
-kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
+sudo install -d -o kda-indexer -g kda-indexer -m 0750 /opt/coins/data/kadena/kda-indexer/mainnet01.replica
+sudo -u kda-indexer kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
     snapshot --out /opt/coins/data/kadena/kda-indexer/mainnet01.replica [--copy]
 ```
+
+- Run it as the service user (`sudo -u kda-indexer`), the owner of the data dir. The volume
+  root is owned by root (see [install.md](install.md)), so that user cannot create `DIR`
+  there: root creates the empty `DIR` owned by `kda-indexer` first (the `install -d` line),
+  and does nothing else. The command refuses to run as root on a data dir root does not own,
+  before it opens or creates anything: as root it would read and write, by path, in a tree
+  the service user controls. Run it as root only on a data dir whose whole tree root owns:
+  as root it also refuses when `segments/`, `hot/`, `search/`, or `DIR` if it exists (even
+  empty), is not root-owned, and names each such path.
+- Every file the manifest (or `search/meta.json`) lists must be a regular file. A symbolic
+  link at a listed file's name, or anything else that is not a regular file, makes the
+  command fail: with `--copy` the file is opened with `O_NOFOLLOW` and checked on the open
+  descriptor, and the copy is created with `O_CREAT | O_EXCL | O_NOFOLLOW`; without `--copy`
+  the hard link is made without following a symlink and must be the file checked before it.
+  The swap lock files are opened with `O_NOFOLLOW` too: a symlink at `segments.swap.lock` or
+  `search.swap.lock` is never followed and makes the command fail (without the lock a swap
+  already in progress could pair files from both sides); remove it as the data dir's owner
+  and run again. Any other failure to open a lock file (a read-only data dir where it cannot
+  be created) is logged as a warning and the snapshot runs without that lock. Only the
+  symlink form is closed this way: a race that remains (a directory planted at the lock
+  path, or the lock file renamed away) needs write access as the service user, so it crosses
+  no privilege boundary, and `segments check` on restore catches a mixed set. Directories
+  above a listed file (`segments/`, `search/`, a `rebuild.<S>/` of a pending swap) are opened
+  as their paths resolve. The manifest's `network` must be a plain name (`A-Z a-z 0-9 . _ -`,
+  no leading `.`, no `..`, at most 64 characters), so a listed name never points outside
+  `segments/`.
 
 - `DIR` must not exist or be empty, and must not lie inside the source data dir. Without
   `--copy` it must be on the same filesystem as the source: the segment files are
@@ -277,9 +330,17 @@ kda-indexer --config /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml \
 A local replica:
 
 ```sh
-kda-indexer --config .../mainnet01.toml snapshot --out /opt/coins/data/kadena/kda-indexer/replica
-kda-indexer --config .../replica.toml serve        # replica.toml: data_dir of the snapshot, own api.* ports
+sudo install -d -o kda-indexer -g kda-indexer -m 0750 /opt/coins/data/kadena/kda-indexer/replica
+sudo -u kda-indexer kda-indexer --config .../mainnet01.toml snapshot --out /opt/coins/data/kadena/kda-indexer/replica
+sudo -u kda-indexer kda-indexer --config .../replica.toml segments check
+sudo -u kda-indexer kda-indexer --config .../replica.toml serve   # replica.toml: data_dir of the snapshot, own api.* ports
 ```
+
+Restoring a data dir (a snapshot, a copy on another host, a backup put back) always runs
+`segments check` on it before its first `serve` or `run`. The check verifies the manifest and
+the size and blake3 of every file each `range.toml` lists, so a copy that lost a file in
+transit, or paired the old and new files of a range that was swapped while it was taken, is
+refused before it answers anything. Start the service only when it passes.
 
 To seed another host, take a hard-linked snapshot on the source volume (no `--copy`: on the
 same volume `--copy` writes a second full copy of every segment file there; keep it for
@@ -312,7 +373,9 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml search que
   smallest `fallback_min_len` whose projection is at most 30 GB. Set `[search] mode` and
   `fallback_min_len` from it.
 - `search rebuild` is read-only on `hot/` and `segments/`, so it can run beside the service
-  (as the service user, `nice -n 19 ionice -c3` on a busy host). It writes `search.new/`, then
+  (as the service user, `nice -n 19 ionice -c3` on a busy host). It holds
+  `segments.swap.lock` shared while it runs, so a `rebuild-range` waits for it (see
+  "Rebuilding a range or step"). It writes `search.new/`, then
   swaps it in; the running `run` notices the new `built_at` and reopens. One rebuild at a
   time (`search.lock`). It is a big write: run "Before any big write" first.
 - `[search] build_threads` and `heap_mb` set the rebuild's threads and tantivy writer heap;
@@ -439,6 +502,70 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 
+## Rebuilding a range or step
+
+`kda-indexer rebuild-range --step S` (or `--range S` for a 100k range) refetches the heights of
+the manifest entry that starts at `S` from the node and swaps the rebuilt files in. Use it to
+repair a file that `segments check` reports (blake3 or size), and for deep-reorg recovery.
+Stop the service first: it takes the data dir lock.
+
+- The rebuild is built in `segments/rebuild.<S>/` with the backfill writer. A payload Merkle
+  mismatch aborts it (legacy-era mismatches are stored unverified, as in a backfill).
+- The tx and block counts and the first TxNum must equal the manifest entry, or nothing is
+  swapped. The content digest (decoded records, names resolved) of the stored and rebuilt
+  files is compared, and the blake3 of every stored and rebuilt file is logged. A store
+  rebuilt with its own dictionary gives equal bytes; across stores only the content is
+  comparable (`segments digest --content`).
+- The rebuilt range must link to its neighbours: the first block of each chain must name the
+  stored last block before the range as its parent, and the stored first block after it (the
+  next entry, or the hot store) must name the rebuilt last block. Otherwise nothing is
+  swapped; a reorg that spans two steps needs both rebuilt, starting with the later one only
+  after the earlier one links.
+- When the content differs (or the stored range was unreadable), the rebuild marks dirty the
+  balance rows of every account and module in the transfers of both the old and the new
+  content, and marks the search index stale from `S` (`stale_from_height` in
+  `search/manifest.json`). Until a search rebuild runs, native `/search/code` answers
+  `partial: true` and compat `/txs/search` scans instead of trusting the index; the periodic
+  rebuild treats the mark as due, or run `kda-indexer search rebuild`. The report's
+  `dirty_marks` and `search_marked_stale` say what was done.
+- `--dry-run` builds and compares, prints the report and removes the rebuild. It writes
+  nothing to the hot store, but like every writer start it first finishes or drops other
+  ranges' interrupted swaps.
+- The swap is crash-safe at every point: before the journal `rebuild.<S>/rebuild.json`
+  exists the old files stay; after it, readers use the rebuilt set, and the next writer start
+  (`run`, `backfill`, `rebuild-range`) finishes the swap. `segments check` passes in between.
+- Restart `serve` after every `rebuild-range` that swapped (`"swapped": true`). A running
+  `serve` keeps the files and indexes it opened before the swap and opens others lazily, so it
+  can pair an old index with a new file of the swapped range (wrong rows or decode errors).
+- `snapshot` and the swap exclude each other through `segments.swap.lock` in the data dir: a
+  snapshot waits for a swap in progress, and a swap waits for a snapshot to place its
+  segment files.
+- A `search rebuild` started by hand holds `segments.swap.lock` shared from start to end. A
+  `rebuild-range` started meanwhile blocks at its start, before it fetches anything, until
+  that search rebuild finishes, which can take hours on mainnet: run the two one after the
+  other. If a search rebuild starts while the range is being fetched and built, the
+  `rebuild-range` waits again before its dirty and stale marks and the swap. Each wait logs
+  an info line `rebuild: waiting for segments.swap.lock ...` when it begins and
+  `rebuild: got segments.swap.lock after N s` when it ends. The background search rebuild of
+  `run` does not take this lock (it cannot overlap a `rebuild-range`, which needs the data
+  dir lock).
+- `--step S` works only where the manifest still lists that 10k step. Once its steps are
+  merged into a 100k range, `rebuild-range` matches an entry by its exact start and kind, so
+  `--step` inside the range fails and `--range S` (the whole range) is the only option for
+  those heights. A range rebuild refetches 100,000 heights of 20 chains (2M blocks): at the
+  backfill rates of "Measured mainnet backfill" below, about 6 minutes in the sparse eras and
+  about 11 minutes in the dense 3.7M to 5.3M era, plus the digest compare. Until the swap, the
+  rebuilt files sit next to the old ones in `segments/rebuild.<S>/`: the largest mainnet
+  range has a 4.8 GB `txs.seg` (B10; the next is 4.3 GB), so check free space first.
+
+Compare stores with `segments digest --content` (per entry, plus a total that does not depend
+on the range/step split) and `hot stats --digest` (name-resolved: records, postings by name,
+dictionaries as name sets). Between two stores built separately, only these `hot stats
+--digest` lines must match: `records`, `TailPostings`, `TailRk`, `HeaderByHash`,
+`StageCheckpoint` and `Counters`. The `Undo` line hashes raw bytes that hold entity ids, which
+differ whenever the stores assigned ids in another order, and the `Dict*` name sets differ when
+one store interned names from blocks that were later orphaned.
+
 ## Measured mainnet backfill
 
 One full format-v2 backfill of mainnet01 (20 chains, heights 0 to 7,390,000: 139,279,460
@@ -509,3 +636,7 @@ dense eras).
 Before a backfill, a merge of many ranges, a rebuild or a replica copy on a host with shared
 storage, check the free space of the volume and, on Ceph-backed volumes, `ceph osd df`: do
 not start if any OSD of the pool is above 75%.
+
+## Fuzzing
+
+`fuzz/` holds cargo-fuzz targets for everything that parses bytes it does not control: `payload_decode` (node payload and output JSON), `record_decode`, `value_decode`, `postings_list`, `ef_keys`, `phf_open`, `manifest_parse` (`manifest.json`, `range.toml`, the search `manifest.json`), `api_tokens` (cursors and Relay ids), `like_match`, `xff_parse` and `graphql_request` (a POST body against an empty store). The crate has its own workspace and a nightly toolchain, so the default build does not see it. Build with `cd fuzz && cargo +nightly fuzz build`; `cargo run --bin gen_seeds -- DIR` writes seed corpora to `DIR/<target>/` from our own writers (nothing is fetched); then run `cargo +nightly fuzz run TARGET DIR/TARGET -- -max_len=4096 -timeout=2`. Corpora and artifacts stay out of the repository. A minimised crash input becomes a regression test in the crate it hit.

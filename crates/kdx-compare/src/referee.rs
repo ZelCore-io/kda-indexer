@@ -5,10 +5,14 @@
 //! record the run left unexplained (class `diff`). For each oracle-pair record it re-runs, on
 //! the stored answers, the live compare's own rules ([`Ctx::gql_rules`], with the document):
 //! the row rules, H8, the `payload.data` matcher, H7 and the diff with the ruled field
-//! matchers (H9 among them), then classifies with the allowlist as the run does. It never
-//! asks the oracle: H6 (finishing cut nested lists) needs it, so the stored record's H6
-//! entries (a harness limit, an unfinished list) are carried into the result and keep the
-//! record unexplained (R-P5P9-64 M-1).
+//! matchers (H9 among them), then classifies with the allowlist as the run does. It does
+//! not finish cut nested lists: H6's stored entries (a harness limit, an unfinished list)
+//! are carried into the result and keep the record unexplained (R-P5P9-64 M-1). The one
+//! oracle read is R-P5P9-86 TC's count walk over the frozen oracle (R-P5P9-87).
+//!
+//! R-P5P9-86 with R-P5P9-87, the REST records: an `account` record against chainweb-data
+//! and a `v1txs` record against kda-txs are settled by their stored forms
+//! ([`Ctx::rest_stored`]): the rules combined row by row, and the v1txs edge.
 //!
 //! Nothing is dropped from the verdict (R-P5P9-64 I-4): a line that is not a diff record,
 //! a GraphQL diff record whose B target this config does not know as an oracle, a record
@@ -56,14 +60,19 @@ pub struct Opts {
 pub struct Report {
     /// Non-empty lines read from the logs.
     pub records: usize,
-    /// GraphQL records the run left unexplained (class `diff`): the ones taken up.
+    /// GraphQL, REST account and /v1/txs records the run left unexplained (class `diff`):
+    /// the ones taken up.
     pub refereed: usize,
     pub explained: usize,
     pub unexplained: usize,
+    /// R-P5P9-86 (P, Q): records whose every difference a KNOWN-GAP entry matches. They are
+    /// never explained; the FV gate counts them per entry against its baseline.
+    pub known_gap: usize,
     /// Lines and taken-up records that could not be re-run (a line that is not a diff
     /// record, a B target that is not an oracle here, a body the log cut, an operation not
     /// loaded, the read cap spent, …); they stay unexplained, each listed with its reason.
-    /// `explained + unexplained + not_refereed` = `refereed` + the lines that did not parse.
+    /// `explained + unexplained + known_gap + not_refereed` = `refereed` + the lines that did
+    /// not parse.
     pub not_refereed: usize,
     /// Per class: each allowlist id among the explained records, `unexplained: <kind>`
     /// (`h7-row`: a row the node settles against ours; `h6-unfinished`: a cut nested list
@@ -81,6 +90,8 @@ pub struct Report {
 impl Report {
     /// The verdict: true only when every record taken up was explained and every line read
     /// (R-P5P9-64 I-4); `kda-compare referee` exits non-zero otherwise.
+    /// R-P5P9-86 (P, Q): a known gap is neither (as a live `known-gap` record, which the
+    /// referee does not take up); the FV gate reads its count against the entry's baseline.
     pub fn passed(&self) -> bool {
         self.unexplained == 0 && self.not_refereed == 0
     }
@@ -90,6 +101,8 @@ impl Report {
 struct Settled {
     unexplained: Vec<DiffEntry>,
     ids: Vec<String>,
+    /// The KNOWN-GAP entries the record hit (R-P5P9-86 P, Q).
+    known_ids: Vec<String>,
     note: Option<String>,
     /// The hits that carry evidence.
     hits: Vec<DiffEntry>,
@@ -99,11 +112,15 @@ struct Settled {
 pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> {
     // The node client's own limiter paces every read.
     cfg.node_max_rps = opts.rps.max(1);
+    // R-P5P9-92 (9): ours' and the oracle's reads (the count walk's pages) are paced at the
+    // same rate at most, and each takes one read of `max_reads`.
+    for t in cfg.targets.values_mut() {
+        let cap = f64::from(opts.rps.max(1));
+        t.rate_rps = Some(t.rate_rps.map_or(cap, |r| r.min(cap)));
+    }
     let ctx = Ctx::new(cfg).await?;
     // `Ctx::new` read the node's chain graph: one read of the cap (R-P5P9-64 M-8).
-    ctx.gql
-        .node_budget
-        .store(opts.max_reads.saturating_sub(1), Ordering::Relaxed);
+    referee_mode(&ctx, opts.max_reads);
     let mut rep = Report {
         node_read_cap: opts.max_reads,
         ..Report::default()
@@ -117,8 +134,8 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
         rep.still_unexplained.push(v);
     };
     for path in &opts.logs {
-        let f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut reader = std::io::BufReader::new(f);
+        // R-P5P9-86: a rotated log (`.jsonl.zst`) reads as its raw lines.
+        let mut reader = crate::report::open_log(path)?;
         let mut buf = Vec::new();
         let mut n = 0;
         loop {
@@ -157,12 +174,72 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
                     continue;
                 }
             };
-            if rec.class != "diff" || !rec.route.starts_with("graphql:") {
+            // R-P5P9-86 with R-P5P9-87: the REST account and /v1/txs records too.
+            let rest = matches!(rec.route.as_str(), "account" | "v1txs");
+            if rec.class != "diff" || !(rest || rec.route.starts_with("graphql:")) {
                 continue;
             }
             rep.refereed += 1;
-            let head = json!({"at": at, "ts": rec.ts, "request": rec.request,
-                "a": rec.a_target, "b": rec.b_target});
+            let head = json!({"at": at, "ts": rec.ts, "route": rec.route,
+                "request": rec.request, "a": rec.a_target, "b": rec.b_target});
+            if rest {
+                if ctx.gql.node_budget.load(Ordering::Relaxed) == 0 {
+                    let why = format!("the cap of {} node reads is spent", opts.max_reads);
+                    not_refereed(&mut rep, head, UNREAD, why);
+                    continue;
+                }
+                match ctx.rest_stored(&rec).await {
+                    Err(why) => {
+                        let class = format!("not refereed: {why}");
+                        not_refereed(&mut rep, head, &class, why);
+                    }
+                    Ok((un, ids, _)) if un.is_empty() => {
+                        rep.explained += 1;
+                        for id in ids {
+                            count(&mut rep, id);
+                        }
+                    }
+                    Ok((un, ids, note)) => {
+                        rep.unexplained += 1;
+                        count(&mut rep, format!("unexplained: rest-{}", rec.route));
+                        let mut v = head;
+                        v["class"] = json!(format!("rest-{}", rec.route));
+                        v["note"] = json!(note);
+                        v["unexplainedCount"] = json!(un.len());
+                        v["unexplained"] = json!(un.iter().take(MAX_SHOWN).collect::<Vec<_>>());
+                        v["explainedBy"] = json!(ids);
+                        rep.still_unexplained.push(v);
+                    }
+                }
+                continue;
+            }
+            // R-P5P9-86 S′ with R-P5P9-87: a NodeBalance record against ours' native API
+            // (labelled `node` before S′) is settled by its stored form.
+            if native_op(&ctx, &rec).is_some() {
+                match settle_native(&ctx, &rec).await {
+                    Err(why) => {
+                        let class = format!("not refereed: {why}");
+                        not_refereed(&mut rep, head, &class, why);
+                    }
+                    Ok((d, ids)) if d.is_empty() => {
+                        rep.explained += 1;
+                        for id in ids {
+                            count(&mut rep, id);
+                        }
+                    }
+                    Ok((d, ids)) => {
+                        rep.unexplained += 1;
+                        count(&mut rep, "unexplained: native-skew".into());
+                        let mut v = head;
+                        v["class"] = json!("native-skew");
+                        v["unexplainedCount"] = json!(d.len());
+                        v["unexplained"] = json!(d);
+                        v["explainedBy"] = json!(ids);
+                        rep.still_unexplained.push(v);
+                    }
+                }
+                continue;
+            }
             let oracle = match ctx.targets.get(&rec.b_target) {
                 None => Err(format!("B target {} is not configured here", rec.b_target)),
                 Some(t) if t.kind != TargetKind::GraphqlOracle => Err(format!(
@@ -185,6 +262,21 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
                     || e.path == crate::graphql::MERGED_BYTES_PATH
             });
             if let Some(e) = stop {
+                // R-P5P9-86 P: a fault on a heavy account P lists is a known gap, read with
+                // the live run's request text (`graphql:<operation> <variables>`).
+                let c = ctx.allow.classify_known(
+                    &RouteKind::Other,
+                    &format!("graphql:{}", rec.request),
+                    &[],
+                    &rec.diff,
+                );
+                if c.unexplained.is_empty() && !c.known_ids.is_empty() {
+                    rep.known_gap += 1;
+                    for id in c.known_ids {
+                        count(&mut rep, format!("known-gap: {id}"));
+                    }
+                    continue;
+                }
                 let kind = match e.path.as_str() {
                     crate::graphql::FOLLOW_PAGE_FAULT_PATH => "follow-page-fault",
                     crate::graphql::FIRST_PAGE_FAULT_PATH => "first-page-fault",
@@ -210,6 +302,12 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
                 Err(why) => {
                     let class = format!("not refereed: {why}");
                     not_refereed(&mut rep, head, &class, why);
+                }
+                Ok(s) if s.unexplained.is_empty() && !s.known_ids.is_empty() => {
+                    rep.known_gap += 1;
+                    for id in s.known_ids {
+                        count(&mut rep, format!("known-gap: {id}"));
+                    }
                 }
                 Ok(s) if s.unexplained.is_empty() => {
                     rep.explained += 1;
@@ -292,13 +390,56 @@ async fn settle(ctx: &Ctx, rec: &DiffRecord) -> Result<Settled, String> {
         .get(&rec.b_target)
         .and_then(|t| t.max_height)
         .unwrap_or(u64::MAX);
+    // R-P5P9-87 TC: the record's height (ours' highest stored row), before the rules pair
+    // the rows. Ours' rows above it are newer than the record.
+    let record_height = crate::graphql_window::highest_row(&a.body).unwrap_or(max);
     // The live compare's rules with the document (R-P5P9-65 (1)); H6 from the stored diff.
-    let (d, note) = ctx
-        .gql_rules(ta, H6::Stored(&rec.diff), op, &vars, &mut a, &mut b, max)
+    // R-P5P9-95 m-9: the rules and the count walk share the compare's reads and cap.
+    let mut st = crate::graphql_window::Reads::default();
+    let (mut d, mut note) = ctx
+        .gql_rules_st(
+            ta,
+            H6::Stored(&rec.diff),
+            op,
+            &vars,
+            &mut a,
+            &mut b,
+            max,
+            &mut st,
+        )
         .await;
-    let (unexplained, ids) = ctx
-        .allow
-        .classify_request(&RouteKind::Other, &rec.route, &[], &d);
+    // R-P5P9-86 TC with R-P5P9-87: a count-only record walks ours bounded at the record's
+    // height, and the oracle as it is now (frozen); ours' rows between the oracle's height
+    // and the record's are polled node-canonical (R-P5P9-92 (2)).
+    if let Some(tb) = ctx.targets.get(&rec.b_target) {
+        ctx.gql_count_walk(
+            ta,
+            tb,
+            op,
+            &vars,
+            &mut d,
+            &mut note,
+            max,
+            record_height,
+            &mut st,
+        )
+        .await;
+    }
+    // R-P5P9-86 (P, Q): the live run's request text, so the KNOWN-GAP entries scoped by
+    // operation and account read as they do live.
+    let c = ctx.allow.classify_known(
+        &RouteKind::Other,
+        &format!("graphql:{}", rec.request),
+        &[],
+        &d,
+    );
+    let (ids, known_ids) = (c.ids, c.known_ids);
+    // A KNOWN-GAP hit is never explained: with another difference it stays unexplained.
+    let unexplained = if c.unexplained.is_empty() {
+        c.unexplained
+    } else {
+        [c.unexplained, c.known].concat()
+    };
     let hits = d
         .into_iter()
         .filter(|e| e.path.starts_with("/~") && (e.a.is_some() || e.b.is_some()))
@@ -306,7 +447,125 @@ async fn settle(ctx: &Ctx, rec: &DiffRecord) -> Result<Settled, String> {
     Ok(Settled {
         unexplained,
         ids,
+        known_ids,
         note,
         hits,
     })
+}
+
+/// The NodeBalance operation of a stored record whose B is not an oracle (R-P5P9-86 S′).
+fn native_op<'a>(ctx: &'a Ctx, rec: &DiffRecord) -> Option<&'a crate::graphql::GqlOp> {
+    let stem = rec.request.split_once(' ')?.0;
+    let op = ctx.gql.ops.iter().find(|o| o.stem == stem)?;
+    let oracle = ctx
+        .targets
+        .get(&rec.b_target)
+        .is_some_and(|t| t.kind == TargetKind::GraphqlOracle);
+    (op.kind == crate::graphql::OpKind::NodeBalance && !oracle).then_some(op)
+}
+
+/// Unix seconds of a record's `ts` (`YYYY-MM-DDTHH:MM:SS[.fff]Z`).
+fn ts_secs(ts: &str) -> Option<u64> {
+    let (d, t) = ts.strip_suffix('Z')?.split_once('T')?;
+    let n = |x: &str| x.parse::<i64>().ok();
+    let mut dp = d.split('-');
+    let (y, m, dd) = (n(dp.next()?)?, n(dp.next()?)?, n(dp.next()?)?);
+    let mut tp = t.split(':');
+    let (hh, mm) = (n(tp.next()?)?, n(tp.next()?)?);
+    let ss = n(tp.next()?.split('.').next()?)?;
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + dd - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3_600 + mm * 60 + ss).ok()
+}
+
+/// The referee's caps on a fresh context: `max_reads` reads for the run (`Ctx::new` read the
+/// node's chain graph, one read of the cap, R-P5P9-64 M-8), and R-P5P9-97 TC's count walk of
+/// up to [`crate::graphql_window::REFEREE_COUNT_WALK_ROWS`] rows a side (live stays at
+/// [`crate::graphql_window::COUNT_WALK_ROWS`]).
+pub(crate) fn referee_mode(ctx: &Ctx, max_reads: usize) {
+    ctx.gql
+        .node_budget
+        .store(max_reads.saturating_sub(1), Ordering::Relaxed);
+    ctx.gql.walk_rows.store(
+        crate::graphql_window::REFEREE_COUNT_WALK_ROWS,
+        Ordering::Relaxed,
+    );
+    // R-P5P9-105 (W #2025): up to 2,000 rows above the frozen oracle's tip, each still
+    // node-canonical by `/poll` (live stays at 50).
+    ctx.gql.above_tip_rows.store(
+        crate::graphql_window::REFEREE_ABOVE_TIP_ROWS,
+        Ordering::Relaxed,
+    );
+    ctx.gql
+        .compare_reads
+        .store(crate::graphql_window::REFEREE_NODE_READS, Ordering::Relaxed);
+    // R-P5P9-110 (REST floor): up to 500 oracle-only rows at ours' floor height, each still
+    // node-canonical by `/poll` (live stays at 50).
+    ctx.gql.floor_checks.store(
+        crate::graphql_window::REFEREE_FLOOR_CHECKS,
+        Ordering::Relaxed,
+    );
+}
+
+/// R-P5P9-86 S′, the stored form: every entry is a `/chain<N>/balance` gap that
+/// [`Ctx::native_skew_stored`] settles; any other entry stays unexplained. Returns the
+/// unexplained entries and the explaining ids.
+async fn settle_native(
+    ctx: &Ctx,
+    rec: &DiffRecord,
+) -> Result<(Vec<DiffEntry>, Vec<String>), String> {
+    let vars: Map<String, Value> = rec
+        .request
+        .split_once(' ')
+        .and_then(|(_, v)| serde_json::from_str(v).ok())
+        .ok_or("the variables are not JSON")?;
+    let account = vars
+        .get("accountName")
+        .and_then(Value::as_str)
+        .ok_or("no accountName")?;
+    // R-P5P9-95 I-4: the live re-read disproved skew; nothing is settled (no read).
+    if rec
+        .diff
+        .iter()
+        .any(|e| e.path == crate::graphql::NATIVE_REREAD_DIFFERS_PATH)
+    {
+        return Ok((rec.diff.clone(), Vec::new()));
+    }
+    let ts = ts_secs(&rec.ts).ok_or("the record's time does not read")?;
+    let mut d = Vec::new();
+    for e in &rec.diff {
+        let chain = e
+            .path
+            .strip_prefix("/chain")
+            .and_then(|p| p.strip_suffix("/balance"))
+            .and_then(|c| c.parse::<u8>().ok());
+        // R-P5P9-97 S′: the stored GraphQL balance can be a JSON number (its text kept
+        // exactly, `arbitrary_precision`); R-P5P9-98: trailing zeros ignored, never a float.
+        let dec = |v: &Option<Value>| v.as_ref().and_then(crate::diff::exact_decimal_text);
+        let settled = match (chain, dec(&e.a), dec(&e.b)) {
+            (Some(c), Some(x), Some(y)) => ctx.native_skew_stored(c, account, &x, &y, ts).await,
+            _ => Err("not a balance gap".into()),
+        };
+        match settled {
+            Ok(ev) => d.push(DiffEntry {
+                path: crate::graphql::NATIVE_SKEW_PATH.into(),
+                kind: crate::report::DiffKind::Changed,
+                a: Some(json!({"stored": ev, "gap": [e.a, e.b]})),
+                b: None,
+            }),
+            Err(why) => {
+                let mut x = e.clone();
+                x.b = Some(json!({"native": e.b, "why": why}));
+                d.push(x);
+            }
+        }
+    }
+    let req = format!("graphql:{}", rec.request);
+    let (un, ids) = ctx.allow.classify_request(&RouteKind::Other, &req, &[], &d);
+    Ok((un, ids))
 }

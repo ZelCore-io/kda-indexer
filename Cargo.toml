@@ -52,6 +52,8 @@ sucds = "0.8"
 roaring = "0.11"
 blake3 = "1"
 tempfile = "3"
+# Property tests only (dev-dependency; MIT OR Apache-2.0).
+proptest = { version = "1", default-features = false, features = ["std"] }
 memmap2 = "0.9"
 # reth storage crates, pinned to the v2.10.1 release commit. reth-etl is not used: it needs
 # reth-db-api (the whole reth/alloy tree); kdx-ingest has its own small ETL collector.
@@ -64,6 +66,16 @@ hex = "0.4"
 bytes = "1"
 rayon = "1"
 libc = "0.2"
+# Global allocator for the binary (jemalloc, BSD-2-Clause, statically linked; symbols stay
+# prefixed `_rjem_`) and its stats reader. Pinned to 0.5.4 (released 2023-07-27): the
+# `rdst` 0.20.14 dependency of ptr_hash names tikv-jemallocator 0.5.4 behind `cfg(tuning)`,
+# and two jemalloc-sys versions cannot share a lockfile (`links = "jemalloc"`), so a newer
+# pair would force `rdst` down to 0.20.11 and change ptr_hash's sort dependency.
+tikv-jemallocator = { version = "=0.5.4", features = ["stats"] }
+tikv-jemalloc-ctl = "=0.5.4"
+# Safe syscalls for `snapshot` (open with O_NOFOLLOW, geteuid); already in the tree through
+# tantivy (fs4) and async-io, same version.
+rustix = { version = "1.1", features = ["fs"] }
 arc-swap = "1"
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 tower-http = { version = "0.6", features = ["cors", "limit"] }

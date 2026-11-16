@@ -122,6 +122,9 @@ pub struct ApiState {
     /// `[balances] key_modules` (M-1, SEC-2): the modules `GET /keys/{pubkey}/accounts`
     /// lists without `token`; unset means `["coin"]`.
     key_modules: std::sync::OnceLock<Vec<String>>,
+    /// The `/stats` count cache: the process-wide one (GraphQL `networkInfo` shares it); a
+    /// test injects its own (FV-6).
+    pub(crate) stats_cache: &'static crate::compat::stats::CountCache,
 }
 
 tokio::task_local! {
@@ -203,7 +206,18 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        self.read_on(None, &self.reads, f).await
+        self.read_on(None, &self.reads, self.settings.deadline, f)
+            .await
+    }
+
+    /// `read` with its own time budget instead of `settings.deadline`: the background work
+    /// that is not a request (the `/stats` count refresh).
+    pub(crate) async fn read_for<T, F>(self: &Arc<Self>, budget: Duration, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        self.read_on(None, &self.reads, budget, f).await
     }
 
     /// `read` for an expensive request class: a `heavy` slot first, then a read slot.
@@ -212,7 +226,8 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        self.read_on(Some(&self.heavy), &self.reads, f).await
+        self.read_on(Some(&self.heavy), &self.reads, self.settings.deadline, f)
+            .await
     }
 
     /// Take `n` more rate tokens for the client of this request (the guard took one): a
@@ -225,6 +240,13 @@ impl ApiState {
     /// Take `n` rate tokens for a client IP already resolved (websocket messages, GQ-9).
     pub fn allow_ip(&self, ip: std::net::IpAddr, n: u32) -> bool {
         self.limiter.allow_n(ip, n)
+    }
+
+    /// As [`ApiState::allow_ip`], but the client's bucket may go as low as `-borrow`
+    /// ([`crate::limits::RateLimiter::allow_n_borrowing`]): a websocket connection's opening
+    /// burst (R-P5P9-57).
+    pub fn allow_ip_borrowing(&self, ip: std::net::IpAddr, n: u32, borrow: u32) -> bool {
+        self.limiter.allow_n_borrowing(ip, n, borrow)
     }
 
     /// The client IP of a request (`trusted_proxies` applied, as the guard).
@@ -255,20 +277,22 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        self.read_on(None, &self.status_reads, f).await
+        self.read_on(None, &self.status_reads, self.settings.deadline, f)
+            .await
     }
 
     async fn read_on<T, F>(
         self: &Arc<Self>,
         first: Option<&Arc<Semaphore>>,
         pool: &Arc<Semaphore>,
+        budget: Duration,
         f: F,
     ) -> ApiResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        let deadline = Instant::now() + self.settings.deadline;
+        let deadline = Instant::now() + budget;
         let acquire = |s: &Arc<Semaphore>| {
             tokio::time::timeout_at(deadline.into(), s.clone().acquire_owned())
         };
@@ -482,6 +506,7 @@ impl Api {
             heavy: Arc::new(Semaphore::new((settings.read_threads / 2).max(1))),
             heavy_clients: Arc::default(),
             key_modules: std::sync::OnceLock::new(),
+            stats_cache: &crate::compat::stats::CACHE,
             in_flight: Arc::new(Semaphore::new(settings.max_in_flight.max(1))),
             limiter: RateLimiter::new(settings.rate_per_ip, settings.rate_burst),
             store,
@@ -505,6 +530,16 @@ impl Api {
 
     pub fn state(&self) -> Arc<ApiState> {
         self.state.clone()
+    }
+
+    /// The `/stats` count cache `c` instead of the process-wide one (FV-6); before
+    /// [`Api::state`] is taken.
+    #[cfg(test)]
+    pub(crate) fn with_stats_cache(mut self, c: &'static crate::compat::stats::CountCache) -> Api {
+        Arc::get_mut(&mut self.state)
+            .expect("with_stats_cache before state()")
+            .stats_cache = c;
+        self
     }
 
     /// Add native routes (Task 4).
@@ -548,7 +583,7 @@ impl Api {
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any)
-                .expose_headers([CHAINWEB_NEXT]),
+                .expose_headers([CHAINWEB_NEXT, crate::compat::stats::COUNT_AGE]),
         );
         let graphql = data(self.graphql, "graphql").layer(
             CorsLayer::new()
@@ -561,6 +596,10 @@ impl Api {
             .layer(middleware::from_fn_with_state("admin", track))
             .with_state(st.clone());
         tokio::spawn(crate::sampler::run(st.clone(), shutdown.clone()));
+        tokio::spawn(crate::compat::stats::run_refresh(
+            st.clone(),
+            shutdown.clone(),
+        ));
         // Bind every address first: one failure drops the listeners bound so far, so nothing
         // serves until all of them are up.
         let mut bound = Vec::new();

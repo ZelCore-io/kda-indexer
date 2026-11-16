@@ -29,6 +29,12 @@ pub struct SearchManifest {
     /// above this one (absent in a manifest from before this field: expand from `first_h`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebuilt_through_height: Option<u32>,
+    /// Lowest height whose content a `rebuild-range` swap changed after this index was built
+    /// (M-7): docs from there on may name bodies that are gone and miss new ones. Readers
+    /// treat the index as lagging (native `partial: true`, compat `/txs/search` scans) and a
+    /// periodic rebuild is due. A rebuild writes a manifest without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_from_height: Option<u32>,
     pub docs: u64,
     /// Index bytes on disk (at the last rebuild or tail commit).
     pub bytes: u64,
@@ -71,6 +77,17 @@ impl SearchManifest {
             _ => Mode::Full,
         }
     }
+}
+
+/// Record in `dir/manifest.json` that content from `height` on changed under the index
+/// (M-7); keeps the lowest such height. `Ok(false)` when no index is built.
+pub fn mark_stale(dir: &Path, height: u32) -> Result<bool> {
+    let Some(mut m) = SearchManifest::load(dir)? else {
+        return Ok(false);
+    };
+    m.stale_from_height = Some(m.stale_from_height.map_or(height, |h| h.min(height)));
+    m.commit(dir)?;
+    Ok(true)
 }
 
 /// Bytes of the regular files directly in `dir`.

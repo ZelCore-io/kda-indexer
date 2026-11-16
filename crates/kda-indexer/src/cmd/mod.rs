@@ -18,6 +18,7 @@ pub mod inspect;
 pub mod measure;
 pub mod notify;
 pub mod probe;
+pub mod rebuild;
 pub mod reconcile;
 pub mod run;
 pub mod search;

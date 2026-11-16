@@ -245,6 +245,8 @@ pub struct SearchIndex {
     checked: Mutex<Option<Instant>>,
     /// `built_through_height` of the manifest last read (`u64::MAX`: none).
     built_through: std::sync::atomic::AtomicU64,
+    /// `stale_from_height` of the manifest last read (`u64::MAX`: none; M-7).
+    stale_from: std::sync::atomic::AtomicU64,
 }
 
 impl SearchIndex {
@@ -255,6 +257,7 @@ impl SearchIndex {
             cur: ArcSwapOption::empty(),
             checked: Mutex::new(None),
             built_through: std::sync::atomic::AtomicU64::new(u64::MAX),
+            stale_from: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -266,6 +269,12 @@ impl SearchIndex {
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
         .ok()
+    }
+
+    /// `stale_from_height` of the manifest last read: a `rebuild-range` swap changed content
+    /// from there on after the index was built (M-7).
+    pub fn stale_from(&self) -> Option<u32> {
+        u32::try_from(self.stale_from.load(std::sync::atomic::Ordering::Relaxed)).ok()
     }
 
     /// The current searcher, None when no index is built. Blocking (file reads): call it on
@@ -285,6 +294,10 @@ impl SearchIndex {
                 Ok(Some(m)) => {
                     self.built_through.store(
                         u64::from(m.built_through_height),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.stale_from.store(
+                        m.stale_from_height.map_or(u64::MAX, u64::from),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     let metrics = kdx_metrics::get();

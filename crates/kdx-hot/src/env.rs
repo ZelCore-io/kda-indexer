@@ -219,6 +219,10 @@ impl HotStore {
         let c = std::ffi::CString::new(file.as_os_str().as_bytes()).context("dest path")?;
         let rc = txn
             .raw()
+            // SAFETY: `t` is the live read txn handle for the whole closure (`txn_execute`
+            // keeps the txn open and not shared while it runs); `c` is a NUL-terminated
+            // `CString` that outlives the call; MDBX_CP_COMPACT with a read txn is a
+            // supported copy mode of `mdbx_txn_copy2pathname`.
             .txn_execute(|t| unsafe {
                 reth_libmdbx::ffi::mdbx_txn_copy2pathname(
                     t,

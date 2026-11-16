@@ -38,7 +38,8 @@ fn defpact_bytes(keys: &[TxKey]) -> Vec<u8> {
     keys.iter().flat_map(|k| k.to_be_bytes()).collect()
 }
 
-/// Write one block (header, txs, request keys, postings, defpact steps, counters), its undo
+/// Write one block (header, txs, request keys, postings, counters; no `Defpacts` rows since
+/// T-5, the `pact` postings carry the defpact history), its undo
 /// record, the queued dictionary names, the balance dirty marks of its `xfer`/`acct` postings
 /// (B-3), the NFT ledger-event effects (`nft.rs`) and the `Tail` checkpoint, all in `txn`.
 /// The block must not already be stored at (chain, height).
@@ -102,20 +103,6 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
                 nft::apply_events(txn, &*dict, &evs, chain, height)?;
             }
         }
-        if let Some(p) = &x.pact_id {
-            let mut keys = txn
-                .get(Table::Defpacts, &p.0)?
-                .map(|v| defpact_list(&v))
-                .unwrap_or_default();
-            if let Err(pos) = keys.binary_search(&r.key) {
-                keys.insert(pos, r.key);
-                txn.put(Table::Defpacts, &p.0, &defpact_bytes(&keys))?;
-                ops.push(UndoOp::DefpactStep {
-                    pact: *p,
-                    key: r.key,
-                });
-            }
-        }
     }
 
     let n = b.txs.len() as i64;
@@ -171,6 +158,7 @@ fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
                 balances::mark_posting(txn, *family, *entity, *key, coin, false)?;
             }
         }
+        // Undo records written before T-5 still name `Defpacts` rows; drop them on undo.
         UndoOp::DefpactStep { pact, key } => {
             if let Some(v) = txn.get(Table::Defpacts, &pact.0)? {
                 let mut keys = defpact_list(&v);
@@ -268,6 +256,8 @@ mod pact_family_tests {
         let mut dict = HotDict::load(&txn).unwrap();
         super::apply(&mut txn, &ib, &mut dict).unwrap();
         assert!(txn.get(Table::TailPostings, &pk).unwrap().is_some());
+        // T-5: the defpact history is the `pact` posting; no `Defpacts` row is written.
+        assert!(txn.get(Table::Defpacts, &pact.0).unwrap().is_none());
         assert_eq!(super::unwind_to(&mut txn, 3, 99).unwrap(), 1);
         assert!(txn.get(Table::TailPostings, &pk).unwrap().is_none());
         assert!(txn.get(Table::Defpacts, &pact.0).unwrap().is_none());
@@ -338,6 +328,47 @@ mod balance_mark_tests {
             .unwrap();
         assert_eq!(super::unwind_to(&mut txn, 4, 199).unwrap(), 1);
         assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 2);
+        txn.commit().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod legacy_defpact_undo_tests {
+    use kdx_types::{Hash32, TxKey};
+
+    use super::{defpact_bytes, defpact_list, unwind_to};
+    use crate::tables::block_key;
+    use crate::undo::{self, UndoOp};
+    use crate::{Geometry, HotStore, Table, Txn};
+
+    /// m12 (T-5): an undo record written before T-5 names `Defpacts` rows; unwinding its
+    /// block drops that key from each row, and a row left without keys is deleted.
+    #[test]
+    fn unwinding_a_pre_t5_defpact_step_drops_the_rows_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let (two, one) = (Hash32([7u8; 32]), Hash32([9u8; 32]));
+        let (k1, k2, k3) = (
+            TxKey::new(5, 0, 1),
+            TxKey::new(3, 0, 2),
+            TxKey::new(5, 0, 2),
+        );
+        let mut txn = hot.rw().unwrap();
+        txn.put(Table::Defpacts, &two.0, &defpact_bytes(&[k2, k1]))
+            .unwrap();
+        txn.put(Table::Defpacts, &one.0, &defpact_bytes(&[k3]))
+            .unwrap();
+        let ops = [
+            UndoOp::DefpactStep { pact: two, key: k1 },
+            UndoOp::DefpactStep { pact: one, key: k3 },
+        ];
+        txn.put(Table::Undo, &block_key(0, 5), &undo::encode(&ops))
+            .unwrap();
+        assert_eq!(unwind_to(&mut txn, 0, 4).unwrap(), 1);
+        let left = txn.get(Table::Defpacts, &two.0).unwrap().expect("row kept");
+        assert_eq!(defpact_list(&left), vec![k2]);
+        assert!(txn.get(Table::Defpacts, &one.0).unwrap().is_none());
+        assert!(txn.get(Table::Undo, &block_key(0, 5)).unwrap().is_none());
         txn.commit().unwrap();
     }
 }

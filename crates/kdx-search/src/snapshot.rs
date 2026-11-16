@@ -121,6 +121,7 @@ mod tests {
             fallback_min_len: 0,
             built_through_height: 1,
             rebuilt_through_height: Some(1),
+            stale_from_height: None,
             docs: 1,
             bytes: 0,
             built_at,

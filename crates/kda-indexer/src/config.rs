@@ -754,6 +754,17 @@ impl Config {
                 && a.max_event_lists > 0,
             "api: deadline_ms must be >= 100 and the other limits > 0"
         );
+        let g = &self.graphql;
+        anyhow::ensure!(
+            g.ws_subs_per_conn <= g.ws_subs_per_ip.min(100)
+                && g.ws_subs_per_conn.saturating_add(2) <= a.rate_burst,
+            "graphql.ws_subs_per_conn must be <= ws_subs_per_ip (max 100), and \
+             ws_subs_per_conn + 2 (the ws opening borrow, R-P5P9-57) <= api.rate_burst"
+        );
+        anyhow::ensure!(
+            g.ws_subs_per_ip <= g.ws_subs_per_48 && g.ws_subs_per_48 <= g.ws_subs_max,
+            "graphql: ws_subs_per_ip <= ws_subs_per_48 <= ws_subs_max must hold"
+        );
         Ok(())
     }
 
@@ -955,6 +966,65 @@ graphql = "127.0.0.1:31362""#,
         for text in ["admin = 31369", "admin = [31369]", "admin = { a = 1 }"] {
             let e = api(text).unwrap_err();
             assert!(format!("{e:#}").contains("string"), "{text}: {e:#}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ws_bound_tests {
+    use super::*;
+
+    fn cfg(api: &str, graphql: &str) -> anyhow::Result<()> {
+        let text = format!(
+            "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\nurl = \"http://127.0.0.1:1848\"\n\
+             [api]\n{api}\n[graphql]\n{graphql}\n"
+        );
+        toml::from_str::<Config>(&text)?.validate()
+    }
+
+    /// The ws opening borrow is `ws_subs_per_conn + 2` (R-P5P9-57): the bound keeps it inside
+    /// `api.rate_burst`, and a connection never holds more than its client may.
+    #[test]
+    fn ws_subs_per_conn_is_bounded_by_the_burst_and_the_client_cap() {
+        cfg("", "").expect("defaults pass");
+        let burst = "rate_burst = 40";
+        cfg(burst, "ws_subs_per_conn = 38").expect("38 + 2 = rate_burst passes");
+        let e = cfg(burst, "ws_subs_per_conn = 39").expect_err("39 + 2 > rate_burst");
+        assert!(format!("{e:#}").contains("R-P5P9-57"), "{e:#}");
+        let e = cfg(burst, "ws_subs_per_conn = 41\nws_subs_per_ip = 40")
+            .expect_err("more than the client's cap");
+        assert!(format!("{e:#}").contains("ws_subs_per_conn"), "{e:#}");
+        // The hard ceiling of 100 holds even when the burst and the client cap allow more.
+        cfg(
+            "rate_burst = 500",
+            "ws_subs_per_conn = 101\nws_subs_per_ip = 200\nws_subs_per_48 = 400",
+        )
+        .expect_err("over 100");
+        cfg(
+            "rate_burst = 500",
+            "ws_subs_per_conn = 100\nws_subs_per_ip = 200\nws_subs_per_48 = 400",
+        )
+        .expect("100 passes");
+    }
+
+    /// Client caps nest: per IP <= per /48 <= per process.
+    #[test]
+    fn ws_client_caps_must_nest() {
+        cfg(
+            "",
+            "ws_subs_per_ip = 40\nws_subs_per_48 = 40\nws_subs_max = 40",
+        )
+        .expect("equal caps pass");
+        for bad in [
+            "ws_subs_per_48 = 39",
+            "ws_subs_per_48 = 3000",
+            "ws_subs_max = 100",
+        ] {
+            let e = cfg("", bad).expect_err(bad);
+            assert!(
+                format!("{e:#}").contains("ws_subs_per_ip <="),
+                "{bad}: {e:#}"
+            );
         }
     }
 }

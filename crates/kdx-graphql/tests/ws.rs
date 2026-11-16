@@ -634,3 +634,203 @@ async fn per_client_and_per_48_caps() {
     assert!(wait_for(|| active_subscriptions(&s.schema) == 121).await);
     assert!(connect_as(&s, proto, Some("192.0.2.3")).await.is_ok());
 }
+
+/// `connection_init` and `n` subscribes sent back to back: one burst, no wait for the ack.
+async fn burst(ws: &mut Ws, n: u32) {
+    send(ws, json!({"type": "connection_init", "payload": {}})).await;
+    subscribe_all(ws, 0..n).await;
+}
+
+/// True when nothing (no message, no close) arrives on `ws` for `ms`.
+async fn quiet(ws: &mut Ws, ms: u64) -> bool {
+    tokio::time::timeout(Duration::from_millis(ms), ws.next())
+        .await
+        .is_err()
+}
+
+/// R-P5P9-57, the CG soak shape with the production burst (40): one client opens two
+/// connections and fills each to `ws_subs_per_conn` (20) in one burst, 42 messages in all.
+/// Both stay open with all 40 subscriptions (before the fix one was closed 4429).
+#[tokio::test]
+async fn two_opening_bursts_fill_the_client_cap_without_a_close() {
+    let s = server(GraphqlSettings::default(), 40).await;
+    let proto = "graphql-transport-ws";
+    let mut a = connect_as(&s, proto, Some("192.0.2.10")).await.unwrap();
+    let mut b = connect_as(&s, proto, Some("192.0.2.10")).await.unwrap();
+    burst(&mut a, 20).await;
+    burst(&mut b, 20).await;
+    for w in [&mut a, &mut b] {
+        assert_eq!(recv(w).await.unwrap()["type"], "connection_ack");
+    }
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 40).await);
+    assert!(quiet(&mut a, 300).await && quiet(&mut b, 300).await);
+    assert_eq!(active_subscriptions(&s.schema), 40);
+}
+
+/// R-P5P9-57 on a bucket another connection of the client just drained: a burst of
+/// `connection_init` and exactly `ws_subs_per_conn` subscribes is accepted; subscribe
+/// `cap + 1` is refused by the cap (LIMIT `ws_subscriptions_per_connection`) and the
+/// connection stays and delivers; a flood after the opening burst is still closed 4429.
+#[tokio::test]
+async fn opening_burst_on_a_drained_bucket_then_cap_then_flood() {
+    let s = server(GraphqlSettings::default(), 40).await;
+    let proto = "graphql-transport-ws";
+    let ip = Some("192.0.2.20");
+    // The client's other connection floods and is closed: its bucket is empty.
+    let mut d = connect_as(&s, proto, ip).await.unwrap();
+    init(&mut d).await;
+    for _ in 0..60 {
+        if d.send(Message::Text(json!({"type": "ping"}).to_string().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let mut closed = None;
+    for _ in 0..70 {
+        if let Err(c) = recv(&mut d).await {
+            closed = Some(c);
+            break;
+        }
+    }
+    assert_eq!(
+        closed,
+        Some(4429),
+        "the drain connection is closed for rate"
+    );
+    // A fresh connection of the same client fills the per-connection cap in one burst.
+    let mut c = connect_as(&s, proto, ip).await.unwrap();
+    burst(&mut c, 20).await;
+    assert_eq!(recv(&mut c).await.unwrap()["type"], "connection_ack");
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 20).await);
+    // cap + 1: refused by the cap, not by a close.
+    subscribe_all(&mut c, 20..21).await;
+    refused(&mut c, "20", "ws_subscriptions_per_connection").await;
+    let e = recv(&mut c).await.unwrap();
+    assert_eq!(
+        (e["type"].as_str(), e["id"].as_str()),
+        (Some("complete"), Some("20")),
+        "{e}"
+    );
+    assert!(quiet(&mut c, 300).await);
+    assert_eq!(active_subscriptions(&s.schema), 20);
+    // The connection is open and delivers: a block reaches all 20 subscriptions.
+    s.feed.inject(block(0, 5));
+    let mut ids = Vec::new();
+    for _ in 0..20 {
+        let m = recv(&mut c).await.unwrap();
+        assert_eq!(m["type"], "next", "{m}");
+        ids.push(m["id"].as_str().unwrap().parse::<u32>().unwrap());
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (0..20).collect::<Vec<_>>());
+    // Past the opening burst nothing is borrowed: a flood is closed.
+    for _ in 0..60 {
+        if c.send(Message::Text(json!({"type": "ping"}).to_string().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let mut closed = None;
+    for _ in 0..70 {
+        if let Err(code) = recv(&mut c).await {
+            closed = Some(code);
+            break;
+        }
+    }
+    assert_eq!(closed, Some(4429));
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 0).await);
+}
+
+/// R-P5P9-57: a fresh client's flood on one connection is closed 4429 with the production
+/// burst, as is a flood spread over the client's connections (the borrow is one floor per
+/// client, not a grant per connection).
+#[tokio::test]
+async fn floods_are_still_closed_with_the_production_burst() {
+    let s = server(GraphqlSettings::default(), 40).await;
+    let proto = "graphql-transport-ws";
+    let flood = |n: usize| {
+        (0..n)
+            .map(|_| Message::Text(json!({"type": "ping"}).to_string().into()))
+            .collect::<Vec<_>>()
+    };
+    let mut a = connect_as(&s, proto, Some("192.0.2.30")).await.unwrap();
+    init(&mut a).await;
+    for m in flood(120) {
+        if a.send(m).await.is_err() {
+            break;
+        }
+    }
+    let mut closed = None;
+    for _ in 0..130 {
+        if let Err(code) = recv(&mut a).await {
+            closed = Some(code);
+            break;
+        }
+    }
+    assert_eq!(closed, Some(4429), "one-connection flood");
+    // Ten connections of one client, 10 messages each (100 > 40 + 22): every message is
+    // inside its connection's opening burst, and still the client is cut off for rate.
+    let mut conns = Vec::new();
+    for _ in 0..10 {
+        conns.push(connect_as(&s, proto, Some("192.0.2.31")).await.unwrap());
+    }
+    for w in &mut conns {
+        send(w, json!({"type": "connection_init", "payload": {}})).await;
+        for m in flood(9) {
+            let _ = w.send(m).await;
+        }
+    }
+    let mut rate_closed = 0;
+    for w in &mut conns {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), w.next()).await {
+                Ok(Some(Ok(Message::Close(Some(f))))) if u16::from(f.code) == 4429 => {
+                    rate_closed += 1;
+                    break;
+                }
+                Ok(Some(Ok(Message::Close(_)) | Err(_))) | Ok(None) | Err(_) => break,
+                Ok(Some(Ok(_))) => continue,
+            }
+        }
+    }
+    assert!(
+        rate_closed >= 3,
+        "only {rate_closed} of 10 connections closed for rate"
+    );
+}
+
+/// A flood on one connection from a full bucket is closed at exactly message `rate_burst + 1`:
+/// the opening borrow only matters once the bucket is drained, and `ws_subs_per_conn + 2` is
+/// bounded by `rate_burst` (config validation), so it never moves the cut-off. The server
+/// answers every accepted message (`connection_init` with an ack, a ping with a pong), so the
+/// replies counted before the 4429 close are the messages that took a token. Refill is 1/s and
+/// the burst takes milliseconds.
+#[tokio::test]
+async fn flood_from_a_full_bucket_is_closed_at_message_rate_burst_plus_one() {
+    const BURST: usize = 40;
+    let s = server(GraphqlSettings::default(), BURST as u32).await;
+    let mut w = connect_as(&s, "graphql-transport-ws", Some("192.0.2.40"))
+        .await
+        .unwrap();
+    send(&mut w, json!({"type": "connection_init", "payload": {}})).await;
+    for _ in 0..(BURST + 20) {
+        let ping = Message::Text(json!({"type": "ping"}).to_string().into());
+        if w.send(ping).await.is_err() {
+            break;
+        }
+    }
+    let mut accepted = 0;
+    let code = loop {
+        match recv(&mut w).await {
+            Ok(_) => accepted += 1,
+            Err(code) => break code,
+        }
+    };
+    assert_eq!(code, 4429);
+    // `rate_burst` messages (the init and 39 pings) are answered; message 41 is refused.
+    assert_eq!(accepted, BURST, "messages answered before the close");
+}

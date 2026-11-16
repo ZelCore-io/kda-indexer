@@ -3,6 +3,7 @@
 pub mod apply;
 pub mod backfill;
 pub mod canon;
+pub mod content;
 pub mod ctx;
 pub mod disk;
 pub mod etl;
@@ -12,6 +13,7 @@ pub mod heartbeat;
 pub mod nft_details;
 pub mod nft_fill;
 pub mod pipeline;
+pub mod rebuild;
 pub mod reconcile;
 pub mod reorg;
 pub mod search_stage;

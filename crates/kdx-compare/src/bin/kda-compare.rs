@@ -81,9 +81,34 @@ enum Cmd {
         /// Node reads for the whole run at most.
         #[arg(long, default_value_t = kdx_compare::referee::DEFAULT_MAX_READS)]
         max_reads: usize,
-        /// Node reads per second at most (single-row reads, one limiter).
+        /// Reads per second at most, per target: the node's limiter, and each target's
+        /// (R-P5P9-95 m-9: a cap per target, not an aggregate).
         #[arg(long, default_value_t = kdx_compare::referee::DEFAULT_RPS)]
         rps: u32,
+    },
+    /// R-P5P9-86 (the leak line): the FV memory criterion over jemalloc `allocated` samples
+    /// (`<YYYY-MM-DDTHH:MM:SSZ> <bytes>` per line). The first hour after `--start` is
+    /// warm-up; after it, any rise over 100 MB above the lowest earlier sample fails, and so
+    /// does no sample after the warm-up. R-P5P9-95 m-11: each `--restart` begins its own
+    /// warm-up and baseline; the samples must cover each run after its warm-up up to the
+    /// next start or `--end` with no gap over two `--interval-secs`, else the line was not
+    /// measured. Exit 0 iff the line holds.
+    Leak {
+        /// The process start, `YYYY-MM-DDTHH:MM:SSZ`.
+        #[arg(long)]
+        start: String,
+        /// The close, `YYYY-MM-DDTHH:MM:SSZ`.
+        #[arg(long)]
+        end: String,
+        /// A restart of the process (repeatable), `YYYY-MM-DDTHH:MM:SSZ`.
+        #[arg(long)]
+        restart: Vec<String>,
+        /// The sampler's interval in seconds.
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+        /// The samples file.
+        #[arg(long)]
+        samples: PathBuf,
     },
     /// Parse and validate the config, then print it.
     CheckConfig,
@@ -127,8 +152,39 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    // The leak line needs no config.
+    if let Cmd::Leak {
+        start,
+        end,
+        restart,
+        interval_secs,
+        samples,
+    } = &cli.cmd
+    {
+        let mut starts = vec![kdx_compare::summary::parse_since(start)?];
+        for r in restart {
+            starts.push(kdx_compare::summary::parse_since(r)?);
+        }
+        let line = kdx_compare::leak::Line {
+            starts,
+            end: kdx_compare::summary::parse_since(end)?,
+            interval: *interval_secs,
+        };
+        let text = std::fs::read_to_string(samples)?;
+        let samples = kdx_compare::leak::parse_samples(&text)?;
+        match kdx_compare::leak::verdict_line(&line, &samples) {
+            Ok(t) => println!("{t}"),
+            Err(t) => {
+                println!("{t}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let cfg = CompareConfig::load(&cli.config)?;
     match cli.cmd {
+        // Handled above, before the config.
+        Cmd::Leak { .. } => Ok(()),
         Cmd::CheckConfig => {
             println!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())
@@ -176,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
             ..
         } => {
             for o in kdx_compare::graphql::once(cfg.clone(), &stem).await? {
-                println!("class={}", o.class);
+                println!("{}", o.summary_line());
                 if let Some(r) = o.record {
                     println!("{}", serde_json::to_string_pretty(&r)?);
                 }
@@ -197,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let _ = t;
             for o in kdx_compare::run::once(cfg.clone(), &path).await? {
-                println!("class={}", o.class);
+                println!("{}", o.summary_line());
                 if let Some(r) = o.record {
                     println!("{}", serde_json::to_string_pretty(&r)?);
                 }

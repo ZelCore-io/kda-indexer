@@ -27,7 +27,7 @@ use crate::{backfill, disk, etl};
 /// Meta key: the first height of a store started with `run --start-height` (dev).
 pub const META_PARTIAL_FROM: &str = "partial_from";
 
-fn crash_at(point: &str) {
+pub(crate) fn crash_at(point: &str) {
     if std::env::var("KDX_CRASH_AT").ok().as_deref() == Some(point) {
         eprintln!("KDX_CRASH_AT={point}: aborting");
         std::process::abort();
@@ -45,6 +45,7 @@ fn sleep_at(point: &str) {
         if p == point {
             let secs: u64 = secs.parse().unwrap_or(5);
             tracing::warn!(point, secs, "KDX_DEBUG_SLEEP_AT: sleeping");
+            eprintln!("KDX_DEBUG_SLEEP_AT={point}: sleeping {secs}s");
             std::thread::sleep(std::time::Duration::from_secs(secs));
         }
     }
@@ -131,6 +132,9 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
 /// freeze that reached the manifest but not the hot store.
 pub fn reconcile(ctx: &Ctx) -> Result<()> {
     etl::clear_dir(&ctx.etl)?;
+    for l in kdx_segment::swap::recover(&ctx.segdir)? {
+        tracing::warn!("freezer: {l}");
+    }
     let m = load_manifest(ctx)?;
     let removed = backfill::remove_unlisted(ctx, &m)?;
     if !removed.is_empty() {

@@ -22,7 +22,7 @@ use kdx_decode::index::code_entity;
 use kdx_decode::Family;
 use kdx_hot::{checkpoint, HotStore, Stage, Table, Txn};
 use kdx_segment::blockfile::{row_record, BlockFile};
-use kdx_segment::files::fsync_dir;
+use kdx_segment::files::{fsync_dir, open_lock_file};
 use kdx_segment::{RangeReader, Segments};
 use kdx_types::record::decode_tx;
 use kdx_types::{blake2b_128, MemDict, TxKey};
@@ -359,15 +359,10 @@ pub fn lock(data_dir: &Path) -> Result<File> {
 /// The swap lock (`search.swap.lock`, blocking): held by [`swap_in`] around its renames, by
 /// the tail stage around every write into `search/` ([`with_current`]) and by `snapshot`
 /// while it reads and links the live files. Every holder is short (one stage commit, two
-/// renames, one set of links).
+/// renames, one set of links). A symlink at the lock path is refused, never followed.
 pub fn swap_lock(data_dir: &Path) -> Result<File> {
     let p = data_dir.join("search.swap.lock");
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&p)
-        .with_context(|| format!("open {}", p.display()))?;
+    let f = open_lock_file(&p)?;
     f.lock().with_context(|| format!("lock {}", p.display()))?;
     Ok(f)
 }
@@ -471,7 +466,8 @@ pub fn rebuilt_through(c: &Census) -> u32 {
 /// Whether a periodic rebuild is due (R-P5P9-9 #5): `every_secs` since the index's
 /// `built_at`, or readers' upper expansion window (`tip − rebuilt_through_height`, the
 /// heights every hit walks) at `window_heights` or more. 0 turns either rule off. A manifest
-/// without `rebuilt_through_height` expands from `first_h`: its window counts from 0.
+/// without `rebuilt_through_height` expands from `first_h`: its window counts from 0. A
+/// manifest marked stale by `rebuild-range` (`stale_from_height`, M-7) is always due.
 pub fn rebuild_due(
     m: &SearchManifest,
     now: u64,
@@ -484,16 +480,28 @@ pub fn rebuild_due(
         && tip.is_some_and(|t| {
             t.saturating_sub(m.rebuilt_through_height.unwrap_or(0)) >= window_heights
         });
-    age || window
+    age || window || m.stale_from_height.is_some()
 }
 
 /// Census, projection (`auto`, or `fallback` with no threshold), pass 1, hot pass, then
 /// `search.new/` replaces `search/`. `hot` is the caller's environment (`run` shares its own).
 pub fn rebuild(o: &BuildOpts, hot: &HotStore) -> Result<RebuildReport> {
+    rebuild_with(o, hot, &mut || {})
+}
+
+/// [`rebuild`], calling `after_census` between the census and pass 1 (P6 I-1: the end-to-end
+/// test commits a recurring body there, as the tail does during a long pass 1).
+#[doc(hidden)]
+pub fn rebuild_with(
+    o: &BuildOpts,
+    hot: &HotStore,
+    after_census: &mut dyn FnMut(),
+) -> Result<RebuildReport> {
     let t0 = Instant::now();
     let _lock = lock(&o.data_dir)?;
     let seg = open_segments(&o.data_dir)?;
     let c = distinct_code_keys(&seg, hot)?;
+    after_census();
     tracing::info!(
         distinct = c.len(),
         ranges = seg.ranges.len(),
@@ -530,6 +538,7 @@ pub fn rebuild(o: &BuildOpts, hot: &HotStore) -> Result<RebuildReport> {
         fallback_min_len: mode.min_len(),
         built_through_height: built_through,
         rebuilt_through_height: Some(rebuilt_through(&c)),
+        stale_from_height: None,
         docs,
         bytes: dir_bytes(&new)?,
         built_at: now_secs(),
@@ -748,6 +757,7 @@ mod tests {
             fallback_min_len: 0,
             built_through_height: built_through,
             rebuilt_through_height: Some(rt),
+            stale_from_height: None,
             docs: 0,
             bytes: 0,
             built_at: 1,
@@ -797,6 +807,7 @@ mod tests {
             fallback_min_len: 0,
             built_through_height: 1,
             rebuilt_through_height: Some(1),
+            stale_from_height: None,
             docs: codes.len() as u64,
             bytes: 0,
             built_at,
@@ -812,6 +823,16 @@ mod tests {
             .unwrap()
             .hashes
             .len()
+    }
+
+    /// A symlink planted at `search.swap.lock` is refused: its target is never created.
+    #[test]
+    fn swap_lock_never_follows_a_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("outside");
+        std::os::unix::fs::symlink(&target, d.path().join("search.swap.lock")).unwrap();
+        assert!(swap_lock(d.path()).is_err());
+        assert!(!target.exists());
     }
 
     /// I-2: a rebuild that swaps `search/` while the stage holds docs never gets the stage's
@@ -862,6 +883,35 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_marked_stale_by_rebuild_range_is_due() {
+        // M-7: `rebuild-range` swapped changed content under the index.
+        let t = tempfile::tempdir().unwrap();
+        assert!(
+            !crate::manifest::mark_stale(t.path(), 5).unwrap(),
+            "no index"
+        );
+        let m = SearchManifest {
+            format: FORMAT,
+            tantivy: "test".into(),
+            mode: "full".into(),
+            fallback_min_len: 0,
+            built_through_height: 100,
+            rebuilt_through_height: Some(100),
+            stale_from_height: None,
+            docs: 1,
+            bytes: 1,
+            built_at: 1_000,
+        };
+        m.commit(t.path()).unwrap();
+        assert!(!rebuild_due(&m, 1_001, Some(100), 0, 0));
+        assert!(crate::manifest::mark_stale(t.path(), 40).unwrap());
+        assert!(crate::manifest::mark_stale(t.path(), 60).unwrap());
+        let s = SearchManifest::load(t.path()).unwrap().unwrap();
+        assert_eq!(s.stale_from_height, Some(40));
+        assert!(rebuild_due(&s, 1_001, Some(100), 0, 0));
+    }
+
+    #[test]
     fn periodic_rebuild_is_due_by_age_or_window() {
         let m = SearchManifest {
             format: FORMAT,
@@ -870,6 +920,7 @@ mod tests {
             fallback_min_len: 0,
             built_through_height: 1_200,
             rebuilt_through_height: Some(1_000),
+            stale_from_height: None,
             docs: 0,
             bytes: 0,
             built_at: 10_000,
@@ -891,6 +942,7 @@ mod tests {
         // No field: the window counts from 0.
         let old = SearchManifest {
             rebuilt_through_height: None,
+            stale_from_height: None,
             ..m
         };
         assert!(rebuild_due(&old, 10_001, Some(30_000), week, 30_000));

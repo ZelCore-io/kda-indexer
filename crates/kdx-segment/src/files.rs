@@ -154,6 +154,20 @@ pub fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     f.finish()
 }
 
+/// Opens (creating when missing) the lock file `path` for writing, never through a symlink:
+/// `O_CREAT | O_NOFOLLOW`, so a symlink planted at `path` makes the open fail (`ELOOP`)
+/// instead of creating or opening its target. The file stays between runs, so no `O_EXCL`.
+pub fn open_lock_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open {} (not following a symlink)", path.display()))
+}
+
 /// `fsync` a directory (makes renames durable).
 pub fn fsync_dir(dir: &Path) -> Result<()> {
     File::open(dir)

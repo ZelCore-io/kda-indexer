@@ -39,6 +39,9 @@ pub const ORACLE_EMPTY_PATH: &str = "/~graphql-r58-oracle-empty";
 pub const COUNT_LOWER_BOUND_PATH: &str = "/~graphql-r58-count-lower-bound";
 /// Visible hit of `oracle_orphan_dupes` (allowlist id `graphql-r58-oracle-orphan-dupes`).
 pub const ORPHAN_DUPES_PATH: &str = "/~graphql-r58-oracle-orphan-dupes";
+/// R-P5P9-97 Q #37: visible hit of the oracle's copies of a non-fungible chain row that ours
+/// lists once and the node confirms (allowlist id `graphql-r97-oracle-chain-dupes`).
+pub const ORACLE_CHAIN_DUPES_PATH: &str = "/~graphql-r97-oracle-chain-dupes";
 /// Visible hit of `by_key_extra_row` (allowlist id `graphql-r58-by-key-extra-row`).
 pub const BY_KEY_EXTRA_PATH: &str = "/~graphql-r58-by-key-extra-row";
 /// Visible hit of `oracle_strips_quotes` (allowlist id `graphql-r60-oracle-strips-quotes`).
@@ -48,6 +51,50 @@ pub const COUNT_SELF_CONSISTENT_PATH: &str = "/~graphql-r60-count-self-consisten
 /// Visible hit of `oracle_counts_heights` (allowlist id `graphql-r75-oracle-counts-heights`,
 /// scoped to Transactions-9e58b95d).
 pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
+/// R-P5P9-86 X: visible hit of an oracle `amount` that differs from ours only by trailing
+/// zeros (equal as exact decimals), once the node's TRANSFER event shows ours' text
+/// (allowlist `graphql-oracle-decimal-zeros`).
+pub const DECIMAL_ZEROS_PATH: &str = "/~graphql-oracle-decimal-zeros";
+/// The same candidate before the node check. No entry matches it, so a candidate left
+/// unchecked (a caller without the node) stays unexplained.
+pub const DECIMAL_ZEROS_UNCHECKED_PATH: &str = "/~graphql-oracle-decimal-zeros-unchecked";
+
+/// R-P5P9-86 X: whether `ours` and `oracle` are decimal literals (`-`, digits, `.`, digits)
+/// that differ in text and are equal as exact decimals by trailing zeros of the fraction
+/// alone. Compared as text, never through floats: a float-equal but decimal-unequal pair is
+/// not.
+pub fn decimal_zeros_only(ours: &str, oracle: &str) -> bool {
+    fn lit(s: &str) -> Option<(bool, &str, &str)> {
+        let (neg, s) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        let (i, f) = s.split_once('.').unwrap_or((s, ""));
+        let digits = |x: &str| x.bytes().all(|b| b.is_ascii_digit());
+        (!i.is_empty() && digits(i) && digits(f)).then(|| (neg, i, f.trim_end_matches('0')))
+    }
+    ours != oracle && matches!((lit(ours), lit(oracle)), (Some(a), Some(b)) if a == b)
+}
+
+/// R-P5P9-86 X: each `…/amount` text difference that [`decimal_zeros_only`] allows becomes an
+/// unchecked candidate carrying ours' row (read from `na`, the normalized answer the diff
+/// ran on), for [`crate::run::Ctx::gql_decimal_zeros`] to settle on the node.
+pub fn decimal_zeros_candidates(d: &mut [crate::report::DiffEntry], na: &Value) {
+    for e in d.iter_mut() {
+        let Some(parent) = e.path.strip_suffix("/amount") else {
+            continue;
+        };
+        let (Some(Value::String(x)), Some(Value::String(y))) = (&e.a, &e.b) else {
+            continue;
+        };
+        if e.kind != crate::report::DiffKind::Changed || !decimal_zeros_only(x, y) {
+            continue;
+        }
+        let row = na.pointer(parent).cloned().unwrap_or(Value::Null);
+        e.a = Some(serde_json::json!({"amount": x, "row": row, "at": e.path}));
+        e.path = DECIMAL_ZEROS_UNCHECKED_PATH.into();
+    }
+}
 /// Visible hit of `creation_time_half_even` (allowlist id `graphql-h9-creation-time-fraction`).
 pub const H9_PATH: &str = "/~graphql-h9-creation-time-fraction";
 
@@ -373,7 +420,8 @@ pub const MISSING_CHAIN_ROWS_PATH: &str = "/~known-gap-missing-chain-rows";
 /// rest keep the oracle's own order, so the diff then compares the rows both hold, order
 /// included. Returns (pointer, the keys ours lacks) per list. A row only ours holds, a key
 /// twice, another shape, or (R-P5P9-78, H2 m-4) an empty list of ours: nothing, so an answer
-/// of ours with no chain rows at all stays a diff.
+/// of ours with no chain rows at all stays a diff. R-P5P9-86 Q: except on the non-fungible
+/// path (`nonFungibleAccount.chainAccounts`), where an empty list of ours is the marker.
 pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)> {
     fn lists(v: &Value, ptr: &mut String, parent: &str, out: &mut Vec<String>) {
         match v {
@@ -418,7 +466,10 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
         let ka: Vec<Value> = ra.iter().map(key).collect();
         let kb: Vec<Value> = rb.iter().map(key).collect();
         let once = |k: &[Value]| k.iter().enumerate().all(|(i, x)| !k[..i].contains(x));
-        if ka.is_empty()
+        // R-P5P9-86 Q (CG-5 #37): on the non-fungible path an empty list of ours is the
+        // marker too: a holder on one chain that ours misses has no chain row left.
+        let nft = p.ends_with("/nonFungibleAccount/chainAccounts");
+        if (ka.is_empty() && !nft)
             || !once(&ka)
             || !once(&kb)
             || ka.len() >= kb.len()
@@ -440,6 +491,38 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
     out
 }
 
+/// R-P5P9-97 Q #37, on the answers: the non-fungible chain rows (`nonFungibleAccount.
+/// chainAccounts`) where ours lists each chain once and every row of the oracle's is equal,
+/// field for field, to a row of ours, ours' rows all among them, and the oracle repeats at
+/// least one. Returns the repeated rows of ours (each with its chain); an empty list when the
+/// shape is any other.
+pub fn oracle_chain_dupes(a: &Value, b: &Value) -> Vec<Value> {
+    let p = "/data/nonFungibleAccount/chainAccounts";
+    let (Some(Value::Array(ra)), Some(Value::Array(rb))) = (a.pointer(p), b.pointer(p)) else {
+        return Vec::new();
+    };
+    let chain = |r: &Value| {
+        r.get("chainId")
+            .and_then(|c| c.as_str().map(str::to_string))
+    };
+    let ka: Vec<Option<String>> = ra.iter().map(chain).collect();
+    let once = ka
+        .iter()
+        .enumerate()
+        .all(|(i, k)| k.is_some() && !ka[..i].contains(k));
+    if !once
+        || rb.len() <= ra.len()
+        || !rb.iter().all(|r| ra.contains(r))
+        || !ra.iter().all(|r| rb.contains(r))
+    {
+        return Vec::new();
+    }
+    ra.iter()
+        .filter(|r| rb.iter().filter(|x| x == r).count() > 1)
+        .cloned()
+        .collect()
+}
+
 /// R-P5P9-75 I: for each `oracle_counts_heights` rule `<root>.totalCount`, the oracle's root
 /// count takes ours when it is below ours (the oracle counts heights). Only the root
 /// connection's own count: nested counts are never touched. R-P5P9-78 (H2 I-4), the
@@ -449,13 +532,7 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
 /// Returns (ours, the oracle's) per count taken.
 pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
-    for r in rules
-        .iter()
-        .filter(|r| r.rule == FieldRuleKind::OracleCountsHeights)
-    {
-        let Some((root, "totalCount")) = r.field.split_once('.') else {
-            continue;
-        };
+    for root in counts_heights_roots(rules) {
         let ptr = format!("/data/{root}/totalCount");
         let (Some(na), Some(nb)) = (
             a.pointer(&ptr).and_then(Value::as_u64),
@@ -481,6 +558,81 @@ pub fn oracle_counts_heights(rules: &[FieldRule], a: &Value, b: &mut Value) -> V
         }
     }
     out
+}
+
+/// The roots `<root>` of every configured `oracle_counts_heights` rule `<root>.totalCount`
+/// (`[graphql] field_rules`): the rule applies to these root counts only.
+pub fn counts_heights_roots(rules: &[FieldRule]) -> Vec<&str> {
+    rules
+        .iter()
+        .filter(|r| r.rule == FieldRuleKind::OracleCountsHeights)
+        .filter_map(|r| match r.field.split_once('.') {
+            Some((root, "totalCount")) => Some(root),
+            _ => None,
+        })
+        .collect()
+}
+
+/// R-P5P9-93: the predicate of the ACCEPTED `graphql-r75-oracle-counts-heights` rule as the
+/// count walk (R-P5P9-86 TC) applies it to a root count `root`, once every walked row is
+/// settled. The rule must be configured for `<root>.totalCount`, and:
+/// - the oracle's count `nb` = the number of heights in the query's height window
+///   `window` (`minHeight..=maxHeight`, both given);
+/// - ours' count `na` = ours' walked rows, each with a height inside the window
+///   (`walked`, ours' row heights);
+/// - ours' count = the node's per-height tx counts summed over the window (`node`, one per
+///   height from `minHeight` on).
+///
+/// `Err`: why not.
+pub fn oracle_counts_window_heights(
+    rules: &[FieldRule],
+    root: &str,
+    (na, nb): (u64, u64),
+    walked: &[Option<u64>],
+    window: Option<(u64, u64)>,
+    node: &[u64],
+) -> Result<(), String> {
+    if !counts_heights_roots(rules).contains(&root) {
+        return Err(format!(
+            "no oracle_counts_heights rule on {root}.totalCount"
+        ));
+    }
+    let Some((lo, hi)) = window.filter(|(lo, hi)| lo <= hi) else {
+        return Err("the query has no minHeight..maxHeight window".into());
+    };
+    let heights = hi - lo + 1;
+    if nb != heights {
+        return Err(format!(
+            "the oracle's count {nb} is not the {heights} heights of the window {lo}..={hi}"
+        ));
+    }
+    if walked.len() as u64 != na {
+        return Err(format!(
+            "ours' count {na} is not ours' {} walked rows",
+            walked.len()
+        ));
+    }
+    if let Some(h) = walked
+        .iter()
+        .find(|h| !h.is_some_and(|h| (lo..=hi).contains(&h)))
+    {
+        return Err(format!(
+            "a walked row of ours at {h:?} is outside the window {lo}..={hi}"
+        ));
+    }
+    if node.len() as u64 != heights {
+        return Err(format!(
+            "the node's counts cover {} of {heights} heights",
+            node.len()
+        ));
+    }
+    let sum: u64 = node.iter().sum();
+    if sum != na {
+        return Err(format!(
+            "ours' count {na} is not the node's {sum} txs over the window ({node:?})"
+        ));
+    }
+    Ok(())
 }
 
 /// The explainer of one oracle pair diff: per-field rules first, then F2 and F7. Returns the
@@ -635,6 +787,53 @@ pub fn skew_net_holds(ours: f64, node: &str, net: i128) -> bool {
     format!("{}.{:012}", before / unit, before % unit)
         .parse::<f64>()
         .is_ok_and(|x| x == ours)
+}
+
+/// R-P5P9-110: whether `t` (fixed point of 12 places) is within half an ulp of the exact
+/// binary value of `f`. The gap is measured from `f` itself (an exact rational `m * 2^e`),
+/// never from `f`'s printed shortest text, which can be up to half an ulp off `f`: measuring
+/// from the text and then allowing half an ulp double-counts the rounding. The ulp is the
+/// step up to the next f64. Exact integer arithmetic; any overflow answers `false`.
+pub fn f64_within_half_ulp(f: f64, t: i128) -> bool {
+    const UNIT: i128 = 1_000_000_000_000;
+    if !f.is_finite() {
+        return false;
+    }
+    let (a, t) = if f < 0.0 { (-f, -t) } else { (f, t) };
+    if a == 0.0 {
+        return t == 0;
+    }
+    let bits = a.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = (bits & ((1u64 << 52) - 1)) as i128;
+    let (m, e) = if exp == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1i128 << 52), exp - 1075)
+    };
+    if e >= 0 {
+        // |m 2^e U - t| <= 2^e U / 2, with 2^e U even for e >= 1 and U even for e = 0.
+        let Some(p) = 1i128.checked_shl(e as u32).filter(|p| *p > 0) else {
+            return false;
+        };
+        let (Some(fu), Some(h)) = (
+            m.checked_mul(p).and_then(|x| x.checked_mul(UNIT)),
+            p.checked_mul(UNIT / 2),
+        ) else {
+            return false;
+        };
+        return fu.checked_sub(t).is_some_and(|d| d.abs() <= h);
+    }
+    // e < 0, k = -e: scale |m U 2^-k - t| <= U 2^-k / 2 by 2^(k+1): |2 m U - t 2^(k+1)| <= U.
+    let Some(sc) = 1i128.checked_shl((1 - e) as u32).filter(|p| *p > 0) else {
+        return false;
+    };
+    let Some(ts) = t.checked_mul(sc) else {
+        return false;
+    };
+    (2 * m * UNIT)
+        .checked_sub(ts)
+        .is_some_and(|d| d.abs() <= UNIT)
 }
 
 /// A fixed-point amount of 12 places as decimal text (for evidence).
@@ -1161,6 +1360,28 @@ mod tests {
         assert!(!one_block_skew(0.0, "0.5", r));
     }
 
+    /// R-P5P9-110: within half an ulp of the f64's exact value, in units of 1e-12.
+    #[test]
+    fn f64_within_half_ulp_is_exact() {
+        // 0.5 is exact: ulp 1.1e-16, so only 0 units off (the 12-place grid is coarser).
+        assert!(f64_within_half_ulp(0.5, 500_000_000_000));
+        assert!(!f64_within_half_ulp(0.5, 500_000_000_001));
+        // 54284.63192951972: its exact value is 2.77e-12 below its text; half an ulp 3.64e-12.
+        let f = 54284.63192951972;
+        let text = 54_284_631_929_519_720i128;
+        assert!(f64_within_half_ulp(f, text)); // 2.77 units off
+        assert!(f64_within_half_ulp(f, text - 6)); // 3.23 units off
+        assert!(!f64_within_half_ulp(f, text - 7)); // 4.23 units off
+        assert!(!f64_within_half_ulp(f, text + 1)); // 3.77 units off
+                                                    // The sign is mirrored; zero is exact; a non-finite f64 never matches.
+        assert!(f64_within_half_ulp(-f, -text));
+        assert!(f64_within_half_ulp(0.0, 0) && !f64_within_half_ulp(0.0, 1));
+        assert!(!f64_within_half_ulp(f64::NAN, 0) && !f64_within_half_ulp(f64::INFINITY, 0));
+        // Large and tiny magnitudes answer without overflow, closed.
+        assert!(!f64_within_half_ulp(1e300, 1));
+        assert!(!f64_within_half_ulp(1e-300, 1));
+    }
+
     /// R-P5P9-75 S: the net counts every coin TRANSFER touching the account in the coinbase
     /// and the outputs (gas included) exactly; other modules' TRANSFERs are left out; an
     /// amount that is not exact, or an output that does not decode, leaves the net unknown.
@@ -1647,5 +1868,34 @@ mod tests {
         let mut b = acct(vec![row("0"), row("1"), row("2")]);
         assert_eq!(missing_chain_rows(&a, &mut b).len(), 1);
         assert_eq!(a, b);
+    }
+
+    /// R-P5P9-86 Q (CG-5 #37): on the non-fungible path an empty list of ours is the marker
+    /// too (a holder on one chain that ours misses); on the fungible path it stays a diff.
+    #[test]
+    fn e2_q_the_non_fungible_chain_accounts_path() {
+        let row = |c: &str| json!({"id": format!("x{c}"), "chainId": c, "accountName": "k:a"});
+        let nft =
+            |rows: Vec<Value>| json!({"data": {"nonFungibleAccount": {"chainAccounts": rows}}});
+        let a = nft(vec![]);
+        let mut b = nft(vec![row("8")]);
+        let m = missing_chain_rows(&a, &mut b);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].0, "/data/nonFungibleAccount/chainAccounts");
+        assert_eq!(m[0].1, vec![json!(["8", null])]);
+        assert_eq!(a, b);
+        // Ours [0], the oracle [0, 8]: the marker as on the fungible path.
+        let a = nft(vec![row("0")]);
+        let mut b = nft(vec![row("0"), row("8")]);
+        assert_eq!(missing_chain_rows(&a, &mut b).len(), 1);
+        assert_eq!(a, b);
+        // A row only ours holds stays a diff.
+        let a = nft(vec![row("1")]);
+        let mut b = nft(vec![row("0"), row("8")]);
+        assert!(missing_chain_rows(&a, &mut b).is_empty());
+        // The fungible path keeps R-P5P9-78 (H2 m-4): ours empty is no marker.
+        let fa = |rows: Vec<Value>| json!({"data": {"fungibleAccount": {"chainAccounts": rows}}});
+        let mut b = fa(vec![row("8")]);
+        assert!(missing_chain_rows(&fa(vec![]), &mut b).is_empty());
     }
 }

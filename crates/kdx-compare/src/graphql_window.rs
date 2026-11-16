@@ -16,7 +16,8 @@
 //!   node's at its height, R-P5P9-63 (2); never by content), an extra copy of a row the node
 //!   holds once (duplicate), or canonical and outside our window by our full order: beyond
 //!   our boundary height, or at it and listed after our page by our own longer read (one
-//!   read of ours, `first` = our rows + 50, no `after`; our page must be its prefix:
+//!   read of ours, `first` = our rows + 50, no `after`, paged on by `endCursor` until it
+//!   passes our boundary height, else capped (R-P5P9-86 SK); our page must be its prefix:
 //!   R-P5P9-64, I-1);
 //! - an ours-only row is canonical on the node, holds the node's content on every selected
 //!   field the node's entry has (R-P5P9-64 I-2, our amounts exact: M-3) and matches the
@@ -65,6 +66,8 @@ pub const ALIGN_KEY: &str = "kdxH7";
 pub const NODE_READS: usize = 300;
 /// Rows past our page in our longer read (R-P5P9-64, I-1).
 pub const PREFIX_EXTRA: usize = 50;
+/// R-P5P9-86 SK: the pages of ours the longer read takes at most to pass the boundary height.
+pub const PREFIX_PAGES: usize = 10;
 /// Visible hit of H8 (allowlist id `graphql-h8-transfer-order-index`); it carries the
 /// evidence per request key.
 pub const ORDER_INDEX_PATH: &str = "/~graphql-h8-transfer-order-index";
@@ -76,14 +79,78 @@ pub const SHORT_PAGE_PATH: &str = "/~graphql-h7-short-page";
 /// R-P5P9-67 m-6 (with R-P5P9-64 I-1): rows H7 identified but could not settle. No allowlist
 /// entry matches it, so the pre-H7 page and tie cuts never excuse what H7 left undecided.
 pub const UNDECIDED_PATH: &str = "/~graphql-h7-undecided";
+/// R-P5P9-86 TC: visible hit of a totalCount-only difference the count walk settled
+/// (allowlist `graphql-count-walk`), with each side's count, walked rows and one-sided rows.
+pub const COUNT_WALK_PATH: &str = "/~graphql-count-walk";
+
+/// R-P5P9-97 U: the count walk's hit when the oracle's walked list holds one row more than its
+/// own totalCount and that alone accounts for the counts (allowlist id
+/// `graphql-r97-oracle-list-over-count`).
+pub const ORACLE_LIST_OVER_COUNT_PATH: &str = "/~graphql-r97-oracle-list-over-count";
+/// R-P5P9-86 TC: the walk passed [`COUNT_WALK_ROWS`] rows on a side, "count walk capped"
+/// (unexplained, its own reason; never allowlisted).
+pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
+/// R-P5P9-92 (1): visible hit of the count walk's oracle that counts heights (allowlist id
+/// `graphql-r75-oracle-counts-heights`, ACCEPTED; scoped to Transactions-9e58b95d).
+pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
+/// R-P5P9-86 TC: rows a side the count walk reads at most, live.
+pub const COUNT_WALK_ROWS: usize = 5_000;
+/// R-P5P9-97 TC: rows a side the count walk reads at most in referee mode (the oracle is
+/// frozen and offline, so the cost is reads only, under the run's read cap).
+pub const REFEREE_COUNT_WALK_ROWS: usize = 20_000;
+/// R-P5P9-95 m-10: the count walk's byte budget a side (the rows' JSON text); past it,
+/// `count walk capped`.
+#[cfg(not(test))]
+pub const COUNT_WALK_BYTES: usize = 64 << 20;
+#[cfg(test)]
+pub const COUNT_WALK_BYTES: usize = 4 << 20;
+/// R-P5P9-92 (2): ours' rows above the oracle's height that the count walk polls at most.
+pub const ABOVE_TIP_ROWS: usize = 50;
+/// R-P5P9-105 (W #2025): the referee's cap on those rows (the oracle is frozen and offline).
+pub const REFEREE_ABOVE_TIP_ROWS: usize = 2_000;
+/// R-P5P9-105 (REST #1966): oracle-only rows at ours' floor height polled at most (live).
+pub const FLOOR_CHECKS: usize = 50;
+/// R-P5P9-110 (REST #1385, #1854, #1966): the referee's cap on those rows, as W's above-tip
+/// cap is split (R-P5P9-105, 2,000 referee / 50 live). The cap is a read budget, not a
+/// correctness rule; the run's `--max-reads` still bounds the run.
+pub const REFEREE_FLOOR_CHECKS: usize = 500;
+/// R-P5P9-105 (W #2025): the referee's per-compare node cap, so that those rows can be read
+/// (a `/poll` and a header each) on top of [`NODE_READS`]. The run's `--max-reads` still
+/// caps the run.
+pub const REFEREE_NODE_READS: usize = NODE_READS + 2 * REFEREE_ABOVE_TIP_ROWS;
+/// R-P5P9-93: the widest query window (in heights) whose node counts the walk reads.
+pub const WINDOW_HEIGHTS: u64 = 100;
+
+/// R-P5P9-87 TC: the record's height, the highest row of ours' stored page (its root list).
+pub fn highest_row(body: &Value) -> Option<u64> {
+    let data = body.get("data")?;
+    let root = root_name(data)?;
+    data.get(&root)?
+        .get("edges")?
+        .as_array()?
+        .iter()
+        .filter_map(|e| prepared_id(e, &root).height)
+        .max()
+}
+
+/// H7's entries that are never explained: a row it rejected, an undecided row, a short page.
+fn never_explained(path: &str) -> bool {
+    [ROW_PATH, UNDECIDED_PATH, SHORT_PAGE_PATH].contains(&path)
+}
 /// R-P5P9-75 N: visible hit of a page cut inside one block, explained by the node's block
 /// order (allowlist id `graphql-r75-single-block-cut`); it carries the evidence.
 pub const SINGLE_BLOCK_PATH: &str = "/~graphql-r75-single-block-cut";
 /// Ours' page size cap (Q10): a page of `first` above it holds this many rows.
 pub const OURS_PAGE_CAP: u64 = 100;
 /// R-P5P9-75 C: the oracle's base64-encoded coinbase `requestKey` that decodes to ours' key,
-/// ours being the node's coinbase key (the block's parent hash).
+/// ours being the node's coinbase key (the block's parent hash). R-P5P9-86 C replaced the
+/// premise (ours' key is the node's encoded key, not the bare parent hash): no longer written.
 pub const COINBASE_KEY_PATH: &str = "/~graphql-r75-coinbase-request-key";
+/// R-P5P9-86 C: an oracle coinbase `requestKey` in one of the oracle's forms (the bare parent
+/// hash of the node's canonical header at the row's height, or base64 of that header's own
+/// hash), paired with ours' row whose key is the node's coinbase key byte for byte (allowlist
+/// id `graphql-coinbase-oracle-key-form`).
+pub const COINBASE_FORM_PATH: &str = "/~graphql-coinbase-oracle-key-form";
 /// R-P5P9-78 (H2 I-2): next to [`WINDOW_PATH`] when a one-sided oracle row was settled off the
 /// node's chain by E ([`NOT_IN_NODE_TX`]) or as an orphan by block (M); it lists those rows
 /// (allowlist id `graphql-r75-h7-off-chain`).
@@ -210,9 +277,10 @@ pub struct RowId {
     pub index: Option<i64>,
     /// The oracle's sort key (the tx's `creationTime`), when selected.
     pub ctime: Option<String>,
-    /// R-P5P9-75 C: the oracle's coinbase `requestKey` as sent (base64 of the JSON-quoted
-    /// key), when `rk` holds its decoded key.
-    pub encoded_rk: Option<String>,
+    /// R-P5P9-86 C: a coinbase row (its key is not a 43-character hash, or is the oracle's
+    /// bare parent-hash form of ours' coinbase key). Its identity is its place (chain, block,
+    /// height, index), not its key, and it is settled on the coinbase path only, never `/poll`.
+    pub coinbase: bool,
 }
 
 impl RowId {
@@ -226,13 +294,18 @@ impl RowId {
             self.rk.as_ref()?;
         }
         let o = |x: Option<String>| x.unwrap_or_else(|| "-".into());
+        let rk = if self.coinbase {
+            Some("~coinbase".to_string())
+        } else {
+            self.rk.clone()
+        };
         Some(format!(
             "{}|{}|{}|{}|{}|{}",
             kind.as_str(),
             o(self.chain.map(|c| c.to_string())),
             o(self.block.clone()),
             o(self.height.map(|h| h.to_string())),
-            o(self.rk.clone()),
+            o(rk),
             o(self.index.map(|i| i.to_string()))
         ))
     }
@@ -246,20 +319,26 @@ impl RowId {
         let mut e = json!({"kind": self.kind.map(Kind::as_str), "chain": self.chain,
             "requestKey": self.rk, "index": self.index, "block": self.block,
             "height": self.height});
-        if let Some(x) = &self.encoded_rk {
-            e["encodedRequestKey"] = json!(x);
+        if self.coinbase {
+            e["coinbase"] = json!(true);
         }
         e
     }
 }
 
-/// R-P5P9-75 C: the key in the oracle's coinbase `requestKey` form, 60 characters of base64
-/// (either alphabet) over a JSON string; `None` for any other text.
+/// The length of a hash (a tx's request key, a block hash) in unpadded base64url.
+pub const HASH_LEN: usize = 43;
+
+/// R-P5P9-86 C: the text a coinbase key form decodes to: base64 (either alphabet, padded or
+/// not) over a JSON string (the node's 60-character era) or over bare text (the node's
+/// 58-character era, and the oracle's base64 of a block's own hash). `None` for a 43-character
+/// hash or text that does not decode.
 pub fn decode_coinbase_rk(s: &str) -> Option<String> {
-    if s.len() != 60 {
+    if s.len() == HASH_LEN {
         return None;
     }
     let url: String = s
+        .trim_end_matches('=')
         .chars()
         .map(|c| match c {
             '+' => '-',
@@ -268,7 +347,60 @@ pub fn decode_coinbase_rk(s: &str) -> Option<String> {
         })
         .collect();
     let b = kdx_types::hash::b64url_decode(&url).ok()?;
-    serde_json::from_slice::<String>(&b).ok()
+    if b.first() == Some(&b'"') {
+        return serde_json::from_slice::<String>(&b).ok();
+    }
+    String::from_utf8(b).ok()
+}
+
+/// R-P5P9-86 C: whether `k` is a coinbase key: not a 43-character hash, and base64 over a
+/// 43-character hash (bare or JSON-quoted), which covers both of the node's eras and the
+/// oracle's base64 form. A key in no such form is not settled as a coinbase: `/poll` refuses
+/// it, so it stays unexplained.
+pub fn is_coinbase_key(k: &str) -> bool {
+    decode_coinbase_rk(k).is_some_and(|t| t.len() == HASH_LEN)
+}
+
+/// R-P5P9-86 C: whether the oracle's coinbase key `k` is one of the oracle's forms for the
+/// node's canonical header `hd` at the row's height: the bare parent hash, or base64 of the
+/// header's own hash. The node's own encodings are not the oracle's forms: an oracle key that
+/// is neither stays unexplained.
+pub fn oracle_coinbase_form(k: &str, hd: &Value) -> Option<&'static str> {
+    let at = |f: &str| hd.get(f).and_then(Value::as_str);
+    if k.len() == HASH_LEN {
+        return (at("parent") == Some(k)).then_some("the bare parent hash");
+    }
+    let url: String = k
+        .trim_end_matches('=')
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect();
+    let own = kdx_types::hash::b64url_decode(&url)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok());
+    (own.is_some() && own.as_deref() == at("hash")).then_some("base64 of the block's own hash")
+}
+
+/// R-P5P9-105 (decimal chain): a chain id as text, as a JSON number's text, or as the
+/// normalized number (`#<digits>e<exp>`) a JSON number becomes in a compared body.
+fn chain_of_text(c: &str) -> Option<u8> {
+    if let Ok(n) = c.parse() {
+        return Some(n);
+    }
+    let (neg, d, e) = crate::graphql_norm::decimal_value(&Value::String(c.to_string()))?;
+    let d = d.trim_start_matches('0');
+    if d.is_empty() {
+        return Some(0);
+    }
+    if neg || e < 0 {
+        return None;
+    }
+    let exp = usize::try_from(e).ok()?;
+    format!("{d}{}", "0".repeat(exp.min(3))).parse().ok()
 }
 
 /// The identity of a root list row (`edges[i]`) in the shapes the operations select.
@@ -333,7 +465,7 @@ pub fn row_id(e: &Value) -> RowId {
         "/cmd/meta/chainId",
     ])
     .or(id_chain)
-    .and_then(|c| c.parse().ok());
+    .and_then(|c| chain_of_text(&c));
     let index = matches!(kind, Some(Kind::Transfer | Kind::Event))
         .then(|| get(&["/orderIndex"]).or(id_index))
         .flatten()
@@ -346,7 +478,7 @@ pub fn row_id(e: &Value) -> RowId {
         rk,
         index,
         ctime: get(&["/creationTime", "/cmd/meta/creationTime"]),
-        encoded_rk: None,
+        coinbase: false,
     }
 }
 
@@ -395,6 +527,13 @@ pub struct Verdict {
     /// R-P5P9-75 B: whether the block the node placed the row in is the canonical one at its
     /// height on the cut's branch (`None`: not read; `Err`: why it could not be read).
     pub branch: Option<Result<bool, String>>,
+    /// R-P5P9-86 U: the public keys of the signers of the node's signed command for an
+    /// ours-only tx row under a `publicKey` filter (`None`: not read; `Err`: why not).
+    pub signers: Option<Result<Vec<String>, String>>,
+    /// R-P5P9-97 T #332: for an ours-only receive-leg transfer row with a cross-chain link,
+    /// the source leg's chain and its events, read by `/poll` of the continuation's pact id
+    /// on the chain the node's TRANSFER_XCHAIN_RECD names (`None`: not read; `Err`: why not).
+    pub source: Option<Result<(u8, Vec<Value>), String>>,
 }
 
 /// The check of an ours-only tx row's `cmd` fields against the node (R-P5P9-68 (2)).
@@ -428,6 +567,8 @@ impl Verdict {
             cmd: None,
             ctime: None,
             branch: None,
+            signers: None,
+            source: None,
         }
     }
 
@@ -527,13 +668,37 @@ fn sel<'a>(n: &'a Value, k: &str) -> Option<&'a Value> {
 /// the event holds (sender, receiver, amount, module name and hash; R-P5P9-64 I-2). `oracle`:
 /// the row is the oracle's, whose f64-rounded amount is allowed (M-3).
 pub fn transfer_matches(n: &Value, ev: &Value, oracle: bool) -> bool {
-    let p = |i: usize| ev.pointer(&format!("/params/{i}"));
+    let o = transfer_offset(ev);
+    let p = |i: usize| ev.pointer(&format!("/params/{}", i + o));
     ev.get("name").and_then(Value::as_str) == Some("TRANSFER")
+        && token_is(n, ev)
         && sel(n, "senderAccount").is_none_or(|x| p(0) == Some(x))
         && sel(n, "receiverAccount").is_none_or(|x| p(1) == Some(x))
         && sel(n, "amount").is_none_or(|x| p(2).is_some_and(|y| same_amount(x, y, oracle)))
         && sel(n, "moduleName").is_none_or(|x| module_name(ev).as_deref() == x.as_str())
         && sel(n, "moduleHash").is_none_or(|x| ev.get("moduleHash") == Some(x))
+}
+
+/// R-P5P9-86 T: where a TRANSFER event's sender, receiver and amount start. A fungible
+/// TRANSFER is (sender, receiver, amount); a marmalade one (token, sender, receiver, amount).
+pub fn transfer_offset(ev: &Value) -> usize {
+    match ev.get("params").and_then(Value::as_array) {
+        Some(ps) if ps.len() == 4 && ps[0].is_string() => 1,
+        _ => 0,
+    }
+}
+
+/// R-P5P9-86 T: a transfer row's `tokenId` against the node's TRANSFER event: null for a
+/// fungible (three-parameter) event, else the marmalade event's token. Not selected: true.
+fn token_is(n: &Value, ev: &Value) -> bool {
+    let Some(t) = n.get("tokenId") else {
+        return true;
+    };
+    let ps = ev.get("params").and_then(Value::as_array);
+    match t {
+        Value::Null => ps.is_some_and(|p| p.len() == 3),
+        t => transfer_offset(ev) == 1 && ps.and_then(|p| p.first()) == Some(t),
+    }
 }
 
 /// Whether the node's event `ev` is the event row `n`: every field the row selects that the
@@ -587,10 +752,38 @@ pub fn tx_matches(n: &Value, p: &Value, oracle: bool) -> bool {
         })
         && r.get("badResult").is_none_or(|x| {
             (status == Some("failure")) != x.is_null()
-                && (x.is_null() || oracle || json_is(x, p.pointer("/result/error")))
+                && (x.is_null() || oracle || bad_result_is(x, p.pointer("/result/error")))
         })
         && r.get("continuation")
             .is_none_or(|x| json_is(x, p.get("continuation")))
+}
+
+/// R-P5P9-86 NC: ours' `badResult` against the node's error, after the ACCEPTED
+/// `failed-tx-error-info` equivalence (`/result/error/info`, changed: both hold an `info`
+/// text, and only the text differs). Every other field must be the node's.
+fn bad_result_is(x: &Value, node: Option<&Value>) -> bool {
+    let node = node.unwrap_or(&Value::Null);
+    let ours = json_field(x);
+    let info = |v: &Value| v.get("info").filter(|i| i.is_string()).is_some();
+    if same_value(&ours, node, false) {
+        return true;
+    }
+    if !(info(&ours) && info(node)) {
+        return false;
+    }
+    // R-P5P9-95 m-7: CG-5's evidence is ours "" against the node's text; nothing wider.
+    let oi = ours.get("info");
+    if !(oi == Some(&json!("")) || oi == node.get("info")) {
+        return false;
+    }
+    let drop = |v: &Value| {
+        let mut v = v.clone();
+        if let Some(m) = v.as_object_mut() {
+            m.shift_remove("info");
+        }
+        v
+    };
+    same_value(&drop(&ours), &drop(node), false)
 }
 
 /// The fields of a list row's node the harness checks against the node, per kind and level
@@ -645,6 +838,8 @@ fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
             "receiverAccount",
             "requestKey",
             "senderAccount",
+            // R-P5P9-86 T: [`token_is`], inside [`transfer_matches`].
+            "tokenId",
         ],
         // [`event_matches`] against the node's event, and the identity.
         (Kind::Event, "") => &[
@@ -681,7 +876,8 @@ fn checked_keys(kind: Kind, path: &str) -> &'static [&'static str] {
         ],
         (Kind::Block, "parent") => &["hash"],
         // R-P5P9-75 A: [`xchain_mismatch`] against the node's TRANSFER_XCHAIN.
-        (Kind::Transfer, "crossChainTransfer") => &["chainId", "receiverAccount"],
+        // R-P5P9-86 T: and `senderAccount`, the receiving half's sender.
+        (Kind::Transfer, "crossChainTransfer") => &["chainId", "receiverAccount", "senderAccount"],
         _ => &[],
     }
 }
@@ -766,10 +962,21 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
         return Some("crossChainTransfer: no node event for the row".into());
     };
     let p = |e: &Value, i: usize| e.pointer(&format!("/params/{i}")).cloned();
-    let same = |e: &Value, i: usize| p(e, i).is_some() && p(e, i) == p(ev, i);
+    // R-P5P9-95 m-3: a marmalade TRANSFER (token, sender, receiver, amount) and a
+    // marmalade cross-chain event (token, sender, receiver, amount, target) are read past
+    // their token, and only against an event of the same token.
+    let o = transfer_offset(ev);
+    let xo = |e: &Value| match e.get("params").and_then(Value::as_array) {
+        Some(ps) if ps.len() == 5 => 1,
+        _ => 0,
+    };
+    let pe = |e: &Value, i: usize| p(e, i + xo(e));
+    let pt = |i: usize| p(ev, i + o);
+    let token = |e: &Value| xo(e) == o && (o == 0 || p(e, 0) == p(ev, 0));
+    let same = |e: &Value, i: usize| token(e) && pe(e, i).is_some() && pe(e, i) == pt(i);
     let amount = |e: &Value| {
-        p(e, 2)
-            .zip(p(ev, 2))
+        pe(e, 2)
+            .zip(pt(2))
             .is_some_and(|(a, b)| same_amount(&a, &b, false))
     };
     let name = |e: &Value| e.get("name").and_then(Value::as_str).map(str::to_string);
@@ -789,6 +996,10 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
                 .into()
         });
     }
+    // R-P5P9-97 T #332: a receive leg holds no TRANSFER_XCHAIN; its link is the source leg's.
+    if sent.is_empty() && recd {
+        return receive_leg_mismatch(x, ev, v);
+    }
     let [e] = sent.as_slice() else {
         return Some(format!(
             "crossChainTransfer is set; the node's transaction holds {} TRANSFER_XCHAIN for the \
@@ -797,7 +1008,7 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
         ));
     };
     let ok = |k: &str, i: usize| {
-        sel(x, k).is_none_or(|y| text(y).is_some() && text(y) == p(e, i).as_ref().and_then(text))
+        sel(x, k).is_none_or(|y| text(y).is_some() && text(y) == pe(e, i).as_ref().and_then(text))
     };
     if !ok("chainId", 3) {
         return Some("crossChainTransfer.chainId is not the node's target chain".into());
@@ -805,7 +1016,164 @@ fn xchain_mismatch_at(x: &Value, ev: Option<&Value>, v: &Verdict) -> Option<Stri
     if !ok("receiverAccount", 1) {
         return Some("crossChainTransfer.receiverAccount is not the node's receiver".into());
     }
+    // R-P5P9-86 T: the receiving half's sender is the sending half's receiver on the node,
+    // the empty account of coin's `transfer-crosschain`.
+    // R-P5P9-95 m-2: that constant is coin's; another module's sender is refused.
+    let leg = pt(1).as_ref().and_then(text);
+    let coin = module_name(ev).as_deref() == Some("coin");
+    if sel(x, "senderAccount")
+        .is_some_and(|y| !coin || text(y).is_none() || text(y) != leg || leg.as_deref() != Some(""))
+    {
+        return Some(
+            "crossChainTransfer.senderAccount is not the node's (the sending leg's receiver)"
+                .into(),
+        );
+    }
     None
+}
+
+/// R-P5P9-97 T #332 (R-P5P9-91 (2)): why an ours-only receive-leg row's `crossChainTransfer`
+/// (`x`) is not the node's source leg, or `None` when it is. The row is coin's receiving
+/// TRANSFER `ev` ("" to the receiver); the source leg ([`Verdict::source`]) must hold exactly
+/// one coin TRANSFER_XCHAIN to the row's receiver, of its amount, targeting the row's chain,
+/// and the TRANSFER of that sender to "" of the amount. The link is that TRANSFER: its chain
+/// (the source chain), its sender and its receiver.
+fn receive_leg_mismatch(x: &Value, ev: &Value, v: &Verdict) -> Option<String> {
+    let p = |e: &Value, i: usize| e.pointer(&format!("/params/{i}")).cloned();
+    let t = |e: &Value, i: usize| p(e, i).as_ref().and_then(text);
+    let coin = |e: &Value| module_name(e).as_deref() == Some("coin");
+    let n = |e: &Value| e.get("params").and_then(Value::as_array).map(Vec::len);
+    if !coin(ev) || transfer_offset(ev) != 0 || t(ev, 0).as_deref() != Some("") {
+        return Some(
+            "crossChainTransfer is set on a row that is not coin's receiving TRANSFER".into(),
+        );
+    }
+    let (src, evs) = match &v.source {
+        None => return Some("crossChainTransfer: the source leg was not read".into()),
+        Some(Err(w)) => return Some(format!("crossChainTransfer: the source leg: {w}")),
+        Some(Ok((c, evs))) => (*c, evs),
+    };
+    let amount = |e: &Value| {
+        p(e, 2)
+            .zip(p(ev, 2))
+            .is_some_and(|(a, b)| same_amount(&a, &b, false))
+    };
+    let name = |e: &Value| e.get("name").and_then(Value::as_str).map(str::to_string);
+    let here = v.chain.map(|c| c.to_string());
+    let sent: Vec<&Value> = evs
+        .iter()
+        .filter(|e| {
+            name(e).as_deref() == Some("TRANSFER_XCHAIN")
+                && coin(e)
+                && n(e) == Some(4)
+                && t(e, 1).is_some()
+                && t(e, 1) == t(ev, 1)
+                && here.is_some()
+                && t(e, 3) == here
+                && amount(e)
+        })
+        .collect();
+    let [e] = sent.as_slice() else {
+        return Some(format!(
+            "crossChainTransfer: the source leg holds {} TRANSFER_XCHAIN for the transfer",
+            sent.len()
+        ));
+    };
+    let from = t(e, 0);
+    let debit: Vec<&Value> = evs
+        .iter()
+        .filter(|d| {
+            name(d).as_deref() == Some("TRANSFER")
+                && coin(d)
+                && n(d) == Some(3)
+                && from.is_some()
+                && t(d, 0) == from
+                && t(d, 1).as_deref() == Some("")
+                && amount(d)
+        })
+        .collect();
+    let [d] = debit.as_slice() else {
+        return Some(format!(
+            "crossChainTransfer: the source leg holds {} TRANSFER of the sender to \"\" for the \
+             transfer",
+            debit.len()
+        ));
+    };
+    let ok = |k: &str, want: Option<String>| {
+        sel(x, k).is_none_or(|y| text(y).is_some() && want.is_some() && text(y) == want)
+    };
+    if !ok("chainId", Some(src.to_string())) {
+        return Some("crossChainTransfer.chainId is not the source leg's chain".into());
+    }
+    if !ok("senderAccount", t(d, 0)) {
+        return Some("crossChainTransfer.senderAccount is not the source leg's sender".into());
+    }
+    if !ok("receiverAccount", t(d, 1)) {
+        return Some("crossChainTransfer.receiverAccount is not the source leg's receiver".into());
+    }
+    None
+}
+
+/// R-P5P9-86 T: whether the document `q` selects `... on ExecutionPayload` and
+/// `... on ContinuationPayload`. R-P5P9-95 m-1: `None` (unknown, so a bare payload is
+/// refused) when it holds a named spread (`...` and a name other than `on`) or a fragment
+/// on either member: the text does not show what those select.
+pub fn payload_members(q: &str) -> Option<(bool, bool)> {
+    let named = q.split("...").skip(1).any(|f| {
+        let id: String = f
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        !id.is_empty() && id != "on"
+    });
+    let on_member = q.split("fragment").skip(1).any(|f| {
+        let head = f.split('{').next().unwrap_or("");
+        head.contains("ExecutionPayload") || head.contains("ContinuationPayload")
+    });
+    if named || on_member {
+        return None;
+    }
+    let has = |m: &str| {
+        q.split("...")
+            .skip(1)
+            .any(|f| f.trim_start().starts_with(m))
+    };
+    Some((has("on ExecutionPayload"), has("on ContinuationPayload")))
+}
+
+/// R-P5P9-86 T: why ours' `cmd.payload` `m`, which selects no field of its member (only
+/// `__typename`, or nothing), is not the node's command `node`'s, or `None`. Right only when
+/// the document's fragments (`members`: whether it selects `... on ExecutionPayload` and
+/// `... on ContinuationPayload`) select the other member alone, and `__typename` (when
+/// selected) is the node's member.
+pub fn bare_payload_mismatch(
+    m: &Map<String, Value>,
+    node: &Value,
+    members: Option<(bool, bool)>,
+) -> Option<String> {
+    let pl = node.get("payload");
+    let (exec, cont) = (
+        pl.and_then(|p| p.get("exec")).is_some(),
+        pl.and_then(|p| p.get("cont")).is_some(),
+    );
+    let Some((sel_exec, sel_cont)) = members else {
+        return Some("cmd.payload (the document's fragments are unknown)".into());
+    };
+    let (name, ok) = match (exec, cont) {
+        (true, false) => ("ExecutionPayload", !sel_exec && sel_cont),
+        (false, true) => ("ContinuationPayload", sel_exec && !sel_cont),
+        _ => return Some("cmd.payload (the node's payload has no single member)".into()),
+    };
+    if !ok {
+        return Some(format!(
+            "cmd.payload (no field of the node's {name}, which the document selects)"
+        ));
+    }
+    match m.get("__typename") {
+        Some(t) if t.as_str() != Some(name) => Some("cmd.payload.__typename".into()),
+        _ => None,
+    }
 }
 
 /// R-P5P9-70 (I-1): the first field a row's node selects that the harness does not check
@@ -818,6 +1186,15 @@ pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
     fn walk(kind: Kind, v: &Value, path: &str) -> Option<String> {
         let keys = checked_keys(kind, path);
         match v {
+            // R-P5P9-86 T: a payload with no field of its member (the document's fragments
+            // select the other member's) is checked by [`bare_payload_mismatch`].
+            Value::Object(m)
+                if kind == Kind::Tx
+                    && path == "cmd.payload"
+                    && m.keys().all(|k| k == "__typename") =>
+            {
+                None
+            }
             Value::Object(m) if !m.is_empty() => m.iter().find_map(|(k, x)| {
                 let p = if path.is_empty() {
                     k.clone()
@@ -833,6 +1210,9 @@ pub fn unchecked_field(kind: Option<Kind>, n: &Value) -> Option<String> {
                 }
                 if x.is_null() && kind == Kind::Transfer && p == "crossChainTransfer" {
                     // R-P5P9-75 A: a null link is checked by [`xchain_mismatch`].
+                    None
+                } else if x.is_null() && kind == Kind::Transfer && p == "tokenId" {
+                    // R-P5P9-86 T: a null token is checked by [`token_is`].
                     None
                 } else if !checked_keys(kind, &p).is_empty() {
                     walk(kind, x, &p)
@@ -965,6 +1345,123 @@ fn coinbase_key(payload: &Value) -> Option<String> {
     let b = kdx_types::hash::b64url_decode(cb).ok()?;
     let v: Value = serde_json::from_slice(&b).ok()?;
     v.get("reqKey")?.as_str().map(str::to_string)
+}
+
+/// R-P5P9-86 S′: the heights either side of a stored record's height that its window holds.
+pub const SKEW_WINDOW: u64 = 10;
+/// R-P5P9-105 S′: consecutive blocks whose net change may make up the gap, at most.
+pub const S_NET_BLOCKS: usize = 3;
+/// R-P5P9-105 S′: node reads one stored record's net-change check makes at most.
+pub const S_NET_READS: usize = 50;
+
+/// An exact decimal at 12 places (units of 1e-12), signed; `None` past 12 places.
+fn fixed12(v: &Value) -> Option<i128> {
+    let v = match v {
+        Value::Object(o) => o.get("decimal").or_else(|| o.get("int"))?,
+        v => v,
+    };
+    let (neg, d, e) = crate::graphql_norm::decimal_value(v)?;
+    let d = if d.is_empty() { "0".to_string() } else { d };
+    let shift = e.checked_add(12)?;
+    let units: i128 = if shift >= 0 {
+        d.parse::<i128>()
+            .ok()?
+            .checked_mul(10i128.checked_pow(u32::try_from(shift).ok()?)?)?
+    } else {
+        let cut = usize::try_from(-shift).ok()?;
+        if cut > d.len() {
+            if d.bytes().any(|b| b != b'0') {
+                return None;
+            }
+            0
+        } else {
+            let (keep, drop) = d.split_at(d.len() - cut);
+            if drop.bytes().any(|b| b != b'0') {
+                return None;
+            }
+            if keep.is_empty() {
+                0
+            } else {
+                keep.parse().ok()?
+            }
+        }
+    };
+    Some(if neg { -units } else { units })
+}
+
+fn fixed12_text(t: &str) -> Option<i128> {
+    fixed12(&Value::String(t.trim().to_string()))
+}
+
+/// R-P5P9-105 S′: the account's net change in one block's outputs (coinbase and every
+/// transaction): each coin TRANSFER to it adds, each from it takes away. `None` when an
+/// output or an amount touching the account does not read.
+pub(crate) fn block_net_change(payload: &Value, account: &str) -> Option<i128> {
+    let decode = |b64: &str| -> Option<Value> {
+        let b = kdx_types::hash::b64url_decode(b64).ok()?;
+        serde_json::from_slice(&b).ok()
+    };
+    let mut outs: Vec<Value> = Vec::new();
+    if let Some(cb) = payload.get("coinbase").and_then(Value::as_str) {
+        outs.push(decode(cb)?);
+    }
+    for t in payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        outs.push(decode(t.get(1)?.as_str()?)?);
+    }
+    let mut net = 0i128;
+    for o in &outs {
+        for e in o
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if e.get("name").and_then(Value::as_str) != Some("TRANSFER")
+                || module_name(e).as_deref() != Some("coin")
+            {
+                continue;
+            }
+            let Some(p) = e.get("params").and_then(Value::as_array) else {
+                continue;
+            };
+            if p.len() != 3 {
+                continue;
+            }
+            let (from, to) = (
+                p[0].as_str() == Some(account),
+                p[1].as_str() == Some(account),
+            );
+            if from == to {
+                continue;
+            }
+            let a = fixed12(&p[2])?;
+            net += if to { a } else { -a };
+        }
+    }
+    Some(net)
+}
+
+/// R-P5P9-86 S′: what the block's coinbase pays `account` (a coin TRANSFER from the empty
+/// account), in fixed point.
+pub(crate) fn coinbase_paid(payload: &Value, account: &str) -> Option<i128> {
+    let cb = payload.get("coinbase")?.as_str()?;
+    let b = kdx_types::hash::b64url_decode(cb).ok()?;
+    let v: Value = serde_json::from_slice(&b).ok()?;
+    v.get("events")?.as_array()?.iter().find_map(|e| {
+        let p = e.get("params")?.as_array()?;
+        let ok = e.get("name").and_then(Value::as_str) == Some("TRANSFER")
+            && module_name(e).as_deref() == Some("coin")
+            && p.len() == 3
+            && p[0].as_str() == Some("")
+            && p[1].as_str() == Some(account);
+        ok.then(|| text(&p[2]).as_deref().and_then(crate::rewards::fixed))
+            .flatten()
+    })
 }
 
 /// The node's `meta.creationTime` in whole seconds, as ours renders it (R-P5P9-62 H9: Pact's
@@ -1143,8 +1640,10 @@ fn content_verdict(
             return if tx_matches(n, entry, oracle) {
                 with(v(Canon::Yes, "placed, with the row's result"), None, 1)
             } else {
+                // R-P5P9-86 NC: the node placed the key in the row's block, so a content
+                // difference is unsettled, never "not canonical".
                 with(
-                    v(not_held(oracle), "the node's result is not the row's"),
+                    v(Canon::Unknown, "the node's result is not the row's"),
                     None,
                     0,
                 )
@@ -1164,7 +1663,7 @@ fn content_verdict(
         .filter(|i| hits.contains(i));
     match (r.index, hits.first(), at) {
         (_, None, _) => with(
-            v(not_held(oracle), "the node's transaction lacks the row"),
+            v(Canon::Unknown, "the node's transaction lacks the row"),
             None,
             0,
         ),
@@ -1191,6 +1690,22 @@ fn content_verdict(
 /// block, R-P5P9-63 (2)); `bh` is the node's height of the row's block when the row selects
 /// no height (R-P5P9-63 (5)). Otherwise the row's content must be the node's.
 pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u64>) -> Verdict {
+    poll_verdict_at(r, n, p, oracle, bh, false)
+}
+
+/// [`poll_verdict`], with `gone`: the node does not hold the row's block (a header-by-hash
+/// 404, read twice). R-P5P9-86 M: the oracle's row in a block the node does not hold, while the
+/// node holds the key in another, is an orphan by block; the oracle's row with only a height,
+/// another than the node's for the key, is an orphan by height ([`decide`] then requires ours
+/// to list the row at the node's block).
+pub fn poll_verdict_at(
+    r: &RowId,
+    n: &Value,
+    p: &Value,
+    oracle: bool,
+    bh: Option<u64>,
+    gone: bool,
+) -> Verdict {
     let pb = p
         .pointer("/metaData/blockHash")
         .and_then(Value::as_str)
@@ -1214,6 +1729,11 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
                     "the row's block is not the node's for the key, at another height: an \
                      orphan by block",
                 ),
+                None if oracle && gone => v(
+                    Canon::No,
+                    "the node does not hold the row's block (a header-by-hash 404, read twice) \
+                     and holds the key in another: an orphan by block",
+                ),
                 _ => v(
                     not_held(oracle),
                     "the row's block is not the node's for the key, at another height",
@@ -1222,6 +1742,12 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
         }
     }
     if r.height.is_some_and(|h| Some(h) != ph) {
+        if oracle && r.block.is_none() && ph.is_some() {
+            return v(
+                Canon::No,
+                &format!("{HEIGHT_ORPHAN}: the row has only a height, another than the node's for the key"),
+            );
+        }
         return v(not_held(oracle), "the node's height for the key is another");
     }
     let mut out = content_verdict(r, n, p, oracle, v);
@@ -1233,7 +1759,8 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
         .iter()
         .all(|k| sel(n, k).is_some());
     let triple = |ev: &Value| {
-        let p = |i: usize| ev.pointer(&format!("/params/{i}"));
+        let o = transfer_offset(ev);
+        let p = |i: usize| ev.pointer(&format!("/params/{}", i + o));
         p(0) == sel(n, "senderAccount")
             && p(1) == sel(n, "receiverAccount")
             && p(2)
@@ -1256,6 +1783,9 @@ pub fn poll_verdict(r: &RowId, n: &Value, p: &Value, oracle: bool, bh: Option<u6
     }
     out
 }
+
+/// R-P5P9-86 M: an oracle row with only a height, another than the node's for its key.
+pub const HEIGHT_ORPHAN: &str = "an orphan by height";
 
 /// R-P5P9-75 E: the class of an oracle row off the node's chain by its transaction.
 pub const NOT_IN_NODE_TX: &str = "oracle-row-not-in-node-tx";
@@ -1286,13 +1816,6 @@ pub fn coinbase_verdict(
             "the row's block is not the node's canonical block at its height",
         );
     }
-    // R-P5P9-75 C: a decoded coinbase key is the block's parent hash.
-    if r.encoded_rk.is_some() && hd.get("parent").and_then(Value::as_str) != r.rk.as_deref() {
-        return v(
-            not_held(oracle),
-            "the decoded coinbase key is not the block's parent hash",
-        );
-    }
     let Some(cb) = payload
         .and_then(|p| p.get("coinbase"))
         .and_then(Value::as_str)
@@ -1301,11 +1824,25 @@ pub fn coinbase_verdict(
     else {
         return Verdict::unknown("coinbase: no payload");
     };
-    if cb.get("reqKey").and_then(Value::as_str) != r.rk.as_deref() {
-        return v(
-            not_held(oracle),
-            "the key is neither polled nor the block's coinbase",
-        );
+    // R-P5P9-86 C: ours' key is the node's coinbase key byte for byte (in either of the
+    // node's eras). The oracle's is excused only in one of its forms for this same header.
+    let node_key = cb.get("reqKey").and_then(Value::as_str);
+    if node_key != r.rk.as_deref() {
+        let form =
+            r.rk.as_deref()
+                .filter(|_| oracle && r.coinbase)
+                .and_then(|k| oracle_coinbase_form(k, hd));
+        let Some(form) = form else {
+            return v(
+                not_held(oracle),
+                "the key is neither polled nor the block's coinbase key",
+            );
+        };
+        let out = content_verdict(r, n, &cb, oracle, v);
+        return Verdict {
+            why: format!("{} (the oracle's coinbase key form: {form})", out.why),
+            ..out
+        };
     }
     content_verdict(r, n, &cb, oracle, v)
 }
@@ -1495,6 +2032,8 @@ pub struct Filter {
     pub max_height: Option<u64>,
     pub block: Option<String>,
     pub rk: Option<String>,
+    /// R-P5P9-86 U: `publicKey`, checked against the signers of the node's command.
+    pub public_key: Option<String>,
     /// R-P5P9-67 I-C: the root's other arguments with a non-null value or a literal (`first`,
     /// `after`, `last` and `before` aside). The harness does not check them, so they refuse
     /// the ours-only excuse.
@@ -1502,7 +2041,7 @@ pub struct Filter {
 }
 
 /// The root arguments [`Filter`] reads (from variables only).
-const READ_ARGS: [&str; 12] = [
+const READ_ARGS: [&str; 13] = [
     "accountName",
     "fungibleName",
     "chainId",
@@ -1515,6 +2054,7 @@ const READ_ARGS: [&str; 12] = [
     "endHeight",
     "blockHash",
     "requestKey",
+    "publicKey",
 ];
 /// The paging arguments, which are no filter.
 const PAGE_ARGS: [&str; 4] = ["first", "after", "last", "before"];
@@ -1847,6 +2387,7 @@ impl Filter {
             max_height: h("maxHeight").or_else(|| h("endHeight")),
             block: s("blockHash"),
             rk: s("requestKey"),
+            public_key: s("publicKey"),
             unchecked: root.map_or_else(Vec::new, |_| unchecked_args(query, root, vars)),
         }
     }
@@ -1884,6 +2425,10 @@ impl Filter {
             (
                 "parametersFilter",
                 self.params.is_some() && kind != Some(Kind::Event),
+            ),
+            (
+                "publicKey",
+                self.public_key.is_some() && kind != Some(Kind::Tx),
             ),
         ];
         if let Some(name) = self
@@ -1937,8 +2482,10 @@ impl Filter {
             }
             Some(Kind::Transfer) => {
                 if let Some(a) = &self.account {
-                    let from = field("senderAccount").or_else(|| param(0));
-                    let to = field("receiverAccount").or_else(|| param(1));
+                    // R-P5P9-95 m-3: a marmalade TRANSFER's accounts follow its token.
+                    let off = ev.map_or(0, transfer_offset);
+                    let from = field("senderAccount").or_else(|| param(off));
+                    let to = field("receiverAccount").or_else(|| param(off + 1));
                     if from.as_ref() != Some(a) && to.as_ref() != Some(a) {
                         return fail("account");
                     }
@@ -1972,6 +2519,21 @@ impl Filter {
                         }
                     }
                 }
+            }
+            Some(Kind::Tx)
+                if self.public_key.is_some() && {
+                    // R-P5P9-86 U: a signer of the node's command holds the key.
+                    let pk = self.public_key.as_ref();
+                    !matches!(&v.signers, Some(Ok(ks)) if ks.iter().any(|k| Some(k) == pk))
+                } =>
+            {
+                return match &v.signers {
+                    Some(Ok(_)) => fail("publicKey: no signer of the node's transaction holds it"),
+                    Some(Err(w)) => Some(format!(
+                        "under a publicKey filter the node did not settle ({w})"
+                    )),
+                    None => Some("under a filter the harness does not check: publicKey".into()),
+                };
             }
             Some(Kind::Tx) => {
                 // `transactions(accountName)` lists the txs the account sent (GQ-19: ours
@@ -2013,8 +2575,12 @@ impl Filter {
             .filter(|e| transfer_matches(n, e, false))
             .filter(|e| {
                 self.account.as_ref().is_none_or(|a| {
-                    field("senderAccount").or_else(|| param(e, 0)).as_ref() == Some(a)
-                        || field("receiverAccount").or_else(|| param(e, 1)).as_ref() == Some(a)
+                    let off = transfer_offset(e);
+                    field("senderAccount").or_else(|| param(e, off)).as_ref() == Some(a)
+                        || field("receiverAccount")
+                            .or_else(|| param(e, off + 1))
+                            .as_ref()
+                            == Some(a)
                 })
             })
             .filter(|e| {
@@ -2043,8 +2609,16 @@ fn node_of(r: &Row) -> &Value {
 
 /// R-P5P9-75 D: whether ours' value `x` is the oracle's `y` at `path` (a JSON pointer from
 /// the body root), exactly or, at a leaf, by a ruled value matcher of `rules`
-/// (`oracle_f64_rounded`, H9's `creation_time_half_even`).
-fn same_ruled(x: &Value, y: &Value, path: &str, rules: &[crate::config::FieldRule]) -> bool {
+/// (`oracle_f64_rounded`, H9's `creation_time_half_even`). With `dec`, an amount field
+/// ([`crate::diff::is_amount_key`]) also matches by exact decimal value (R-P5P9-98); the
+/// caller then settles ours' row on the node.
+fn same_ruled(
+    x: &Value,
+    y: &Value,
+    path: &str,
+    rules: &[crate::config::FieldRule],
+    dec: bool,
+) -> bool {
     use crate::config::FieldRuleKind as K;
     if x == y {
         return true;
@@ -2054,7 +2628,7 @@ fn same_ruled(x: &Value, y: &Value, path: &str, rules: &[crate::config::FieldRul
             a.len() == b.len()
                 && a.iter().all(|(k, v)| {
                     b.get(k)
-                        .is_some_and(|w| same_ruled(v, w, &format!("{path}/{k}"), rules))
+                        .is_some_and(|w| same_ruled(v, w, &format!("{path}/{k}"), rules, dec))
                 })
         }
         (Value::Array(a), Value::Array(b)) => {
@@ -2062,7 +2636,16 @@ fn same_ruled(x: &Value, y: &Value, path: &str, rules: &[crate::config::FieldRul
                 && a.iter()
                     .zip(b)
                     .enumerate()
-                    .all(|(i, (v, w))| same_ruled(v, w, &format!("{path}/{i}"), rules))
+                    .all(|(i, (v, w))| same_ruled(v, w, &format!("{path}/{i}"), rules, dec))
+        }
+        _ if dec
+            && path
+                .rsplit('/')
+                .next()
+                .is_some_and(crate::diff::is_amount_key)
+            && crate::diff::same_exact_decimal(x, y) =>
+        {
+            true
         }
         _ => {
             let txt = |v: &Value| match v {
@@ -2117,41 +2700,59 @@ pub fn prepare(ca: &Value, cb: &Value) -> Result<Prep, String> {
     prepare_in(ca, cb, "")
 }
 
+/// A row's identity as [`prepare_in`] reads it on its own side under the root list `root`
+/// (R-P5P9-75 F's key-only transfer rows; R-P5P9-86 C's coinbase rows).
+pub fn prepared_id(e: &Value, root: &str) -> RowId {
+    let mut id = row_id(e);
+    if id.kind.is_none() && root == "transfers" && id.rk.is_some() {
+        id.kind = Some(Kind::Transfer);
+    }
+    // R-P5P9-86 C: a key that is not a 43-character hash is a coinbase key.
+    id.coinbase = id.kind != Some(Kind::Block) && id.rk.as_deref().is_some_and(is_coinbase_key);
+    id
+}
+
 /// [`prepare`] under the root list `root`. R-P5P9-75 F: a row of the `transfers` root that
 /// selects a request key but no field naming its kind is a transfer row without an index
 /// (identity by request-key multiset).
 pub fn prepare_in(ca: &Value, cb: &Value, root: &str) -> Result<Prep, String> {
-    let rows = |c: &Value, oracle: bool| -> Result<Vec<Row>, String> {
+    let ids = |c: &Value| -> Result<Vec<(RowId, Value)>, String> {
         let mut out = Vec::new();
         for e in c
             .get("edges")
             .and_then(Value::as_array)
             .ok_or("a page without edges")?
         {
-            let mut id = row_id(e);
-            if id.kind.is_none() && root == "transfers" && id.rk.is_some() {
-                id.kind = Some(Kind::Transfer);
-            }
-            // R-P5P9-75 C: the oracle's coinbase key form, decoded for the identity.
-            if oracle && id.kind != Some(Kind::Block) {
-                if let Some(k) = id.rk.as_deref().and_then(decode_coinbase_rk) {
-                    id.encoded_rk = id.rk.replace(k);
-                }
-            }
+            out.push((prepared_id(e, root), e.clone()));
+        }
+        Ok(out)
+    };
+    let (ia, mut ib) = (ids(ca)?, ids(cb)?);
+    // R-P5P9-86 C: an oracle key that is the bare parent hash ours' coinbase key decodes to is
+    // that coinbase row in the oracle's bare-hash form (its header is checked on the node).
+    let parents: std::collections::HashSet<String> = ia
+        .iter()
+        .filter(|(id, _)| id.coinbase)
+        .filter_map(|(id, _)| id.rk.as_deref().and_then(decode_coinbase_rk))
+        .collect();
+    for (id, _) in ib.iter_mut() {
+        if id.kind != Some(Kind::Block) && id.rk.as_ref().is_some_and(|k| parents.contains(k)) {
+            id.coinbase = true;
+        }
+    }
+    let rows = |xs: Vec<(RowId, Value)>| -> Result<Vec<Row>, String> {
+        let mut out = Vec::new();
+        for (id, e) in xs {
             let key = id.key().ok_or_else(|| {
                 format!("a row whose identity cannot be decided: {}", id.evidence())
             })?;
-            out.push(Row {
-                id,
-                key,
-                edge: e.clone(),
-            });
+            out.push(Row { id, key, edge: e });
         }
         Ok(out)
     };
     Ok(Prep {
-        a: rows(ca, false)?,
-        b: rows(cb, true)?,
+        a: rows(ia)?,
+        b: rows(ib)?,
         a_cut: more(ca),
         b_cut: more(cb),
         rules: Vec::new(),
@@ -2223,22 +2824,29 @@ fn matching(p: &Prep, live_a: &[usize], live_b: &[usize]) -> Matching {
 
 impl Prep {
     /// Whether ours' row node `x` is the oracle's row `rb` in every selected field
-    /// (R-P5P9-63 (3)), after the ruled value matchers (R-P5P9-75 D); an encoded coinbase key
-    /// of the oracle's compares in its decoded form (R-P5P9-75 C).
+    /// (R-P5P9-63 (3)), after the ruled value matchers (R-P5P9-75 D). A coinbase row's key is
+    /// left out: both sides' keys are checked on the coinbase path (R-P5P9-86 C).
     fn same(&self, x: &Value, rb: &Row) -> bool {
+        self.same_by(x, rb, true)
+    }
+
+    /// R-P5P9-98: ours' row `x` is the oracle's `rb` only by an amount's exact decimal value
+    /// (its text differs): the pair is settled on the node (ours' row's TRANSFER amount).
+    fn decimal_only(&self, x: &Value, rb: &Row) -> bool {
+        self.same_by(x, rb, true) && !self.same_by(x, rb, false)
+    }
+
+    fn same_by(&self, x: &Value, rb: &Row, dec: bool) -> bool {
         let y = node_of(rb);
         let root = self.root.replace('~', "~0").replace('/', "~1");
         let path = format!("/data/{root}/edges/0/node");
-        match (
-            &rb.id.encoded_rk,
-            y.get("requestKey").and_then(Value::as_str),
-        ) {
-            (Some(enc), Some(k)) if k == enc => {
+        match (x.get("requestKey"), y.get("requestKey")) {
+            (Some(kx), Some(_)) if rb.id.coinbase => {
                 let mut y = y.clone();
-                y["requestKey"] = json!(rb.id.rk);
-                same_ruled(x, &y, &path, &self.rules)
+                y["requestKey"] = kx.clone();
+                same_ruled(x, &y, &path, &self.rules, dec)
             }
-            _ => same_ruled(x, y, &path, &self.rules),
+            _ => same_ruled(x, y, &path, &self.rules, dec),
         }
     }
 
@@ -2257,13 +2865,21 @@ impl Prep {
             }
         }
         out.extend(m.oracle.iter().map(|g| (1, g[0])));
-        // R-P5P9-75 C: a paired oracle row with an encoded coinbase key, on the node.
-        out.extend(
-            m.pairs
-                .iter()
-                .filter(|(_, j)| self.b[*j].id.encoded_rk.is_some())
-                .map(|&(_, j)| (1, j)),
-        );
+        // R-P5P9-98: a pair equal only as exact decimals: ours' row on the node.
+        for &(i, j) in &m.pairs {
+            if self.decimal_only(node_of(&self.a[i]), &self.b[j]) && !out.contains(&(0, i)) {
+                out.push((0, i));
+            }
+        }
+        // R-P5P9-86 C: a coinbase pair whose keys differ: both sides on the node.
+        for &(i, j) in &m.pairs {
+            if self.b[j].id.coinbase && self.b[j].id.rk != self.a[i].id.rk {
+                if !out.contains(&(0, i)) {
+                    out.push((0, i));
+                }
+                out.push((1, j));
+            }
+        }
         out
     }
 
@@ -2479,6 +3095,13 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
         hs.iter().min()
     }
     .copied();
+    // R-P5P9-97 W: a newest-first cut list whose every row of ours is above the oracle's
+    // ceiling (ours near the tip, the oracle frozen) still has a lowest listed row: an oracle
+    // row below it is below our window. Every such row of ours has its own height (checked
+    // above for the live ones; the others are above the ceiling by that height).
+    if d.lowest.is_none() && !w.asc && live_a.is_empty() {
+        d.lowest = ha.iter().flatten().min().copied();
+    }
     let ct = |r: &Row| r.id.ctime.as_deref().and_then(parse_utc);
     let times = live_b.iter().filter_map(|&j| ct(&p.b[j]).map(|t| (t, j)));
     let b_last = if w.asc { times.max() } else { times.min() };
@@ -2498,12 +3121,38 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
             ));
             continue;
         }
+        // R-P5P9-98: a pair equal only as exact decimals is a pair once the node holds ours'
+        // row (its TRANSFER amount equal as an exact decimal); otherwise undecided.
+        if p.decimal_only(node_of(ra), &p.b[j]) && canon(&va[i]) != Canon::Yes {
+            d.undecided.push(format!(
+                "a pair equal only as exact decimals whose row of ours the node did not \
+                 settle ({}): {}",
+                why_of(vi),
+                ra.id.evidence()
+            ));
+            continue;
+        }
         d.pairs.push((i, j));
-        // R-P5P9-75 C: the decoded key is ours (paired by it), and the node's coinbase key.
-        if p.b[j].id.encoded_rk.is_some() {
-            match vb[j].as_ref() {
-                Some(v) if v.canon == Canon::Yes => d.coinbase_keys.push(j),
-                Some(v) if v.canon == Canon::No => d.rejected.push((
+        // R-P5P9-86 C: a coinbase pair whose keys differ (paired by place): ours' key is the
+        // node's coinbase key, and the oracle's is one of its forms for that same header.
+        if p.b[j].id.coinbase && p.b[j].id.rk != ra.id.rk {
+            let same_block = |v: &Verdict, w: &Verdict| v.block.is_some() && v.block == w.block;
+            match (va[i].as_ref(), vb[j].as_ref()) {
+                (Some(x), Some(v))
+                    if x.canon == Canon::Yes && v.canon == Canon::Yes && same_block(x, v) =>
+                {
+                    d.coinbase_keys.push(j)
+                }
+                (Some(x), _) if x.canon == Canon::No => {
+                    d.rejected
+                        .push((Some(ra.edge.clone()), None, not_canonical(i)))
+                }
+                (Some(x), _) if x.canon != Canon::Yes => d.undecided.push(format!(
+                    "ours' coinbase requestKey the node did not settle ({}): {}",
+                    x.why,
+                    ra.id.evidence()
+                )),
+                (_, Some(v)) if v.canon == Canon::No => d.rejected.push((
                     None,
                     Some(p.b[j].edge.clone()),
                     format!(
@@ -2511,7 +3160,7 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                         v.why
                     ),
                 )),
-                v => d.undecided.push(format!(
+                (_, v) => d.undecided.push(format!(
                     "an oracle coinbase requestKey the node did not settle ({}): {}",
                     why_of(v),
                     p.b[j].id.evidence()
@@ -2774,6 +3423,37 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                 // the rows of the group with that content; a block verdict holds for the key.
                 let by_content = vj.is_some_and(|v| v.why.contains(NOT_IN_NODE_TX));
                 let class = if by_content { NOT_IN_NODE_TX } else { "orphan" };
+                // R-P5P9-86 M: an orphan by height only when ours lists the row at the node's
+                // block for the key.
+                let by_height = vj.is_some_and(|v| v.why.contains(HEIGHT_ORPHAN));
+                // R-P5P9-97 M #1997: ours' row that selects no block hash and was paired (so not
+                // read) lists the key at the node's block when it sits on the node's chain at
+                // the node's height for the key.
+                let ours_at_node = p.a.iter().zip(va).any(|(ra, x)| {
+                    ra.id.rk == rb.id.rk
+                        && match x {
+                            Some(x) => {
+                                x.canon == Canon::Yes
+                                    && x.block.is_some()
+                                    && x.block == vj.and_then(|v| v.block.clone())
+                            }
+                            None => vj.is_some_and(|v| {
+                                ra.id.block.is_none()
+                                    && ra.id.height.is_some()
+                                    && ra.id.height == v.height
+                                    && ra.id.chain.is_some()
+                                    && ra.id.chain == v.chain
+                            }),
+                        }
+                });
+                if by_height && !ours_at_node {
+                    d.undecided.push(format!(
+                        "an oracle row with only a height, another than the node's for the key, \
+                         that ours does not list at the node's block: {}",
+                        rb.id.evidence()
+                    ));
+                    continue;
+                }
                 for &k in g {
                     if by_content && node_of(&p.b[k]) != node_of(rb) {
                         d.undecided.push(format!(
@@ -2783,7 +3463,7 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                         ));
                     } else {
                         d.oracle.push(evidence(&p.b[k], vj, class));
-                        if by_content || vj.is_some_and(|v| v.why.contains("orphan by block")) {
+                        if by_content || vj.is_some_and(|v| v.why.contains("an orphan by")) {
                             d.off_chain.push(evidence(&p.b[k], vj, class));
                         }
                     }
@@ -2870,6 +3550,9 @@ pub(crate) struct Reads {
     payloads: HashMap<String, Result<Value, String>>,
     by_hash: HashMap<String, Result<Option<u64>, String>>,
     chains: HashMap<String, Option<u8>>,
+    /// R-P5P9-86 T: whether the document selects `... on ExecutionPayload` and
+    /// `... on ContinuationPayload` (`None`: no document).
+    pub(crate) payload_members: Option<(bool, bool)>,
 }
 
 impl Reads {
@@ -2891,6 +3574,43 @@ fn entry(path: &str, a: Option<Value>, b: Option<Value>) -> DiffEntry {
 }
 
 /// The name of the root connection field of `data`.
+/// R-P5P9-88 (F): the root list of `body` that selects `edges` but no `pageInfo`.
+fn bare_root(body: &Value) -> Option<String> {
+    body.get("data")?
+        .as_object()?
+        .iter()
+        .find(|(_, v)| v.get("edges").is_some_and(Value::is_array) && v.get("pageInfo").is_none())
+        .map(|(k, _)| k.clone())
+}
+
+/// R-P5P9-97 F: gives the root list `root` of `data` (the response's `data` object) that
+/// selects `edges` but no `pageInfo` the `pageInfo` of R-P5P9-88's rule for page size
+/// `first`: a next page when it holds min(`first`, ours' cap) rows. Anything else is left.
+fn bare_page_info(data: &mut Value, root: &str, first: u64) {
+    if let Some(c) = data.get_mut(root) {
+        if c.get("pageInfo").is_none() && c.get("edges").is_some_and(Value::is_array) {
+            let rows = c["edges"].as_array().map_or(0, Vec::len) as u64;
+            c["pageInfo"] = json!({"hasNextPage": rows >= first.min(OURS_PAGE_CAP)});
+        }
+    }
+}
+
+/// The page size `first` of root list `root`: its own argument (a literal or a set
+/// variable), else the variable the document passes to `first`.
+fn root_first(query: Option<&str>, root: &str, vars: &Map<String, Value>) -> Option<u64> {
+    match query.and_then(|q| root_args(q, root)) {
+        Some(args) => {
+            args.iter()
+                .find(|(n, _)| n == "first")
+                .and_then(|(_, v)| match v.strip_prefix('$') {
+                    Some(var) => vars.get(var).and_then(Value::as_u64),
+                    None => v.parse::<u64>().ok(),
+                })
+        }
+        None => vars.get(&arg_var(query, "first")).and_then(Value::as_u64),
+    }
+}
+
 fn root_name(data: &Value) -> Option<String> {
     data.as_object()?
         .iter()
@@ -2921,6 +3641,68 @@ impl Ctx {
         if root_scoped {
             return (Vec::new(), None);
         }
+        // R-P5P9-88 (F): a root list without `pageInfo` (Transfers-8c8a0f56) is a connection
+        // of page size `first`: cut when it holds min(first, ours' cap) rows, else complete.
+        // The `pageInfo` stands in for H7 only and is taken off again after it.
+        let query = op.map(|o| o.query.as_str());
+        let bare = [&*a, &*b].iter().find_map(|x| bare_root(&x.body));
+        // R-P5P9-105 (G): a root list with no `first` (and no `pageInfo`) that selects a
+        // `startHeight`/`endHeight` range is uncut by construction: complete on both sides.
+        let range = |r: &str| {
+            query.and_then(|q| root_args(q, r)).is_some_and(|args| {
+                ["startHeight", "endHeight"]
+                    .iter()
+                    .all(|k| args.iter().any(|(n, _)| n == k))
+            })
+        };
+        let first = bare
+            .as_deref()
+            .and_then(|r| root_first(query, r, vars).or_else(|| range(r).then_some(u64::MAX)));
+        let (Some(root), Some(f)) = (bare, first) else {
+            return self
+                .gql_window_referee_conn(ta, op, vars, a, b, max, st)
+                .await;
+        };
+        let mut added = [false, false];
+        for (x, add) in [&mut *a, &mut *b].into_iter().zip(added.iter_mut()) {
+            if let Some(c) = x.body.pointer_mut(&format!("/data/{root}")) {
+                if c.get("pageInfo").is_none() && c.get("edges").is_some_and(Value::is_array) {
+                    let rows = c["edges"].as_array().map_or(0, Vec::len) as u64;
+                    let cut = rows >= f.min(OURS_PAGE_CAP);
+                    c["pageInfo"] = json!({"hasNextPage": cut, "hasPreviousPage": false});
+                    *add = true;
+                }
+            }
+        }
+        let out = self
+            .gql_window_referee_conn(ta, op, vars, a, b, max, st)
+            .await;
+        for (x, add) in [&mut *a, &mut *b].into_iter().zip(added) {
+            if add {
+                if let Some(c) = x
+                    .body
+                    .pointer_mut(&format!("/data/{root}"))
+                    .and_then(Value::as_object_mut)
+                {
+                    c.remove("pageInfo");
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Ctx::gql_window_referee`] on a root list that is a connection.
+    #[allow(clippy::too_many_arguments)]
+    async fn gql_window_referee_conn(
+        &self,
+        ta: &Target,
+        op: Option<&GqlOp>,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        st: &mut Reads,
+    ) -> (Vec<DiffEntry>, Option<String>) {
         let conn = |ans: &mut Answer| {
             ans.body
                 .get_mut("data")
@@ -2928,7 +3710,23 @@ impl Ctx {
                 .cloned()
         };
         let (Some(ca), Some(cb)) = (conn(a), conn(b)) else {
-            return (Vec::new(), None);
+            // R-P5P9-86 F: a root list without `pageInfo` (Transfers-8c8a0f56) is no window
+            // H7 can read; say so.
+            let bare = |ans: &Answer| {
+                ans.body
+                    .get("data")
+                    .and_then(Value::as_object)
+                    .is_some_and(|d| {
+                        d.values().any(|v| {
+                            v.get("edges").is_some_and(Value::is_array)
+                                && v.get("pageInfo").is_none()
+                        })
+                    })
+            };
+            // R-P5P9-88 (F): only when `first` is missing (else it is a connection above).
+            let note = (bare(a) || bare(b))
+                .then(|| "H7 not applied: the root list selects no pageInfo".to_string());
+            return (Vec::new(), note);
         };
         // The same rows in the same order (after the tie rules): nothing to referee.
         let norm = |c: &Value| {
@@ -2940,6 +3738,7 @@ impl Ctx {
             return (Vec::new(), None);
         }
         let query = op.map(|o| o.query.as_str());
+        st.payload_members = query.and_then(payload_members);
         let first_var = arg_var(query, "first");
         let root = a.body.get("data").and_then(root_name);
         // R-P5P9-64 I-3, R-P5P9-67 I-A (a): a cut page of ours shorter than first × the pages
@@ -3028,6 +3827,8 @@ impl Ctx {
                 self.h7_cmd_check(r, &mut v, st).await;
                 self.h7_ctime_check(r, &mut v, st).await;
                 self.h7_branch_check(r, &mut v, st).await;
+                self.h7_signers_check(r, &mut v, &filter, st).await;
+                self.h7_xchain_source_check(r, &mut v, st).await;
             }
             if side == 0 {
                 va[i] = Some(v);
@@ -3046,7 +3847,7 @@ impl Ctx {
         if d.needs_prefix {
             ext = match op {
                 Some(op) => {
-                    self.h7_prefix(ta, op, vars, &first_var, prep.a.len(), st)
+                    self.h7_prefix(ta, op, vars, &first_var, prep.a.len(), &field, d.lowest, st)
                         .await
                 }
                 None => Err("no document to read it with".into()),
@@ -3057,32 +3858,11 @@ impl Ctx {
         // R-P5P9-75 N: a page cut inside one block, where H7 does not explain the pair.
         let mut n_note = String::new();
         if !d.explained() || !d.grouped {
-            match self.n_single_block(ta, query, vars, &prep, st).await {
-                Ok((pairs, ev)) => {
-                    let side = |rows: &[Row], ours: bool| -> Vec<Value> {
-                        pairs
-                            .iter()
-                            .enumerate()
-                            .map(|(n, (i, j))| tagged(&rows[if ours { *i } else { *j }].edge, n))
-                            .collect()
-                    };
-                    let (ea, eb) = (side(&prep.a, true), side(&prep.b, false));
-                    for (ans, edges) in [(&mut *a, ea), (&mut *b, eb)] {
-                        if let Some(c) = ans
-                            .body
-                            .get_mut("data")
-                            .and_then(crate::graphql::root_connection)
-                        {
-                            c["edges"] = Value::Array(edges);
-                        }
-                    }
-                    let (nr, or) = (st.node - node0, st.ours - ours0);
-                    let ours = json!({"rows": prep.a.len(), "inNodeOrder": true});
-                    let mut ev = ev;
-                    ev["nodeReads"] = json!(nr);
-                    ev["oursReads"] = json!(or);
-                    return (vec![entry(SINGLE_BLOCK_PATH, Some(ours), Some(ev))], None);
-                }
+            match self
+                .n_apply(ta, query, vars, &prep, a, b, st, (node0, ours0))
+                .await
+            {
+                Ok(hit) => return (vec![hit], None),
                 Err(Some(why)) => n_note = format!("; N not explained: {why}"),
                 Err(None) => {}
             }
@@ -3134,20 +3914,18 @@ impl Ctx {
             .enumerate()
             .map(|(n, (_, j))| tag(&prep.b[*j].edge, n))
             .collect();
-        // R-P5P9-75 C: the confirmed coinbase keys take their decoded form.
+        // R-P5P9-86 C: a confirmed oracle coinbase key form takes ours' key (the node's).
         let mut keys = Vec::new();
-        for (n, (_, j)) in d.pairs.iter().enumerate() {
-            let id = &prep.b[*j].id;
-            let (Some(enc), Some(rk)) = (&id.encoded_rk, &id.rk) else {
+        for (n, (i, j)) in d.pairs.iter().enumerate() {
+            let (Some(ours), Some(theirs)) = (&prep.a[*i].id.rk, &prep.b[*j].id.rk) else {
                 continue;
             };
             let node = eb[n].get_mut("node");
             if let Some(x) = node.and_then(|x| x.get_mut("requestKey")) {
-                if d.coinbase_keys.contains(j) && x.as_str() == Some(enc.as_str()) {
-                    *x = json!(rk);
-                    keys.push(
-                        json!({"oracle": enc, "decoded": rk, "via": why_of(vb[*j].as_ref())}),
-                    );
+                if d.coinbase_keys.contains(j) && x.as_str() == Some(theirs.as_str()) {
+                    *x = json!(ours);
+                    keys.push(json!({"oracle": theirs, "ours": ours,
+                        "via": why_of(vb[*j].as_ref())}));
                 }
             }
         }
@@ -3166,7 +3944,7 @@ impl Ctx {
         }
         if !keys.is_empty() {
             out.push(entry(
-                COINBASE_KEY_PATH,
+                COINBASE_FORM_PATH,
                 None,
                 Some(json!({ "keys": keys })),
             ));
@@ -3208,6 +3986,7 @@ impl Ctx {
     /// R-P5P9-64 (I-1): one read of ours with the same document and variables, `first` = the
     /// rows on our page + [`PREFIX_EXTRA`], one page with no `after`: each row's identity key
     /// and node.
+    #[allow(clippy::too_many_arguments)]
     async fn h7_prefix(
         &self,
         ta: &Target,
@@ -3215,39 +3994,147 @@ impl Ctx {
         vars: &Map<String, Value>,
         first_var: &str,
         n: usize,
+        root: &str,
+        bound: Option<u64>,
         st: &mut Reads,
     ) -> Result<Longer, String> {
         if !vars.get(first_var).is_some_and(Value::is_u64) {
             return Err(format!("no page size ({first_var}) to read it with"));
         }
+        let after_var = arg_var(Some(&op.query), "after");
         let mut v = vars.clone();
         v.insert(first_var.to_string(), json!(n + PREFIX_EXTRA));
-        v.remove(&arg_var(Some(&op.query), "after"));
-        st.ours += 1;
-        let mut data = self
-            .gql_read(ta, &op.query, Value::Object(v))
-            .await
-            .ok_or("the read failed")?;
-        let conn = crate::graphql::root_connection(&mut data).ok_or("the read holds no list")?;
-        let more = conn
-            .pointer("/pageInfo/hasNextPage")
-            .and_then(Value::as_bool);
-        let edges = conn
-            .get("edges")
-            .and_then(Value::as_array)
-            .ok_or("the read holds no list")?;
-        let rows: Vec<(String, Value)> = edges
-            .iter()
-            .map(|e| {
-                (
-                    row_id(e).key().unwrap_or_default(),
+        v.remove(&after_var);
+        let mut rows: Vec<(String, Value)> = Vec::new();
+        let mut last_h = None;
+        let (mut first_page, mut pages) = (true, 0);
+        let (more, short) = loop {
+            st.ours += 1;
+            pages += 1;
+            let mut data = self
+                .gql_read(ta, &op.query, Value::Object(v.clone()))
+                .await
+                .ok_or("the read failed")?;
+            // R-P5P9-97 F: a root list without `pageInfo` (Transfers-8c8a0f56) follows
+            // R-P5P9-88's rule here too: cut when it holds min(first, ours' cap) rows.
+            if crate::graphql::root_connection(&mut data).is_none() {
+                bare_page_info(&mut data, root, (n + PREFIX_EXTRA) as u64);
+            }
+            let conn =
+                crate::graphql::root_connection(&mut data).ok_or("the read holds no list")?;
+            let more = conn
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool);
+            let end = conn
+                .pointer("/pageInfo/endCursor")
+                .filter(|c| c.is_string())
+                .cloned();
+            let edges = conn
+                .get("edges")
+                .and_then(Value::as_array)
+                .ok_or("the read holds no list")?;
+            for e in edges {
+                last_h = row_id(e).height;
+                rows.push((
+                    prepared_id(e, root).key().unwrap_or_default(),
                     e.get("node").cloned().unwrap_or(Value::Null),
-                )
-            })
-            .collect();
-        // R-P5P9-67 m-6: fewer rows than asked, and a next page (or no word on one): capped.
-        let capped = rows.len() < n + PREFIX_EXTRA && more != Some(false);
+                ));
+            }
+            // R-P5P9-67 m-6: fewer rows than asked, and a next page (or no word on one).
+            let short = first_page && rows.len() < n + PREFIX_EXTRA && more != Some(false);
+            first_page = false;
+            // R-P5P9-86 SK: page on by `endCursor` until the read passes our boundary height.
+            let (Some(b), Some(end)) = (bound, end) else {
+                break (more, short);
+            };
+            let past = rows.len() > n && last_h.is_some_and(|h| h != b);
+            if past || more != Some(true) || pages >= PREFIX_PAGES || edges.is_empty() {
+                break (more, short);
+            }
+            v.insert(after_var.clone(), end);
+        };
+        let capped = match bound {
+            // Not past the boundary height while the list may go on: capped.
+            Some(b) => !(rows.len() > n && last_h.is_some_and(|h| h != b)) && more != Some(false),
+            None => short,
+        };
         Ok(Longer { rows, capped })
+    }
+
+    /// R-P5P9-75 N on prepared rows: when [`Ctx::n_single_block`] explains the pair, both
+    /// pages hold the paired rows in the node's order and the hit is returned; else why not.
+    #[allow(clippy::too_many_arguments)]
+    async fn n_apply(
+        &self,
+        ta: &Target,
+        query: Option<&str>,
+        vars: &Map<String, Value>,
+        prep: &Prep,
+        a: &mut Answer,
+        b: &mut Answer,
+        st: &mut Reads,
+        (node0, ours0): (usize, usize),
+    ) -> Result<DiffEntry, Option<String>> {
+        let (pairs, ev) = self.n_single_block(ta, query, vars, prep, st).await?;
+        let side = |rows: &[Row], ours: bool| -> Vec<Value> {
+            pairs
+                .iter()
+                .enumerate()
+                .map(|(n, (i, j))| tagged(&rows[if ours { *i } else { *j }].edge, n))
+                .collect()
+        };
+        let (ea, eb) = (side(&prep.a, true), side(&prep.b, false));
+        for (ans, edges) in [(&mut *a, ea), (&mut *b, eb)] {
+            if let Some(c) = ans
+                .body
+                .get_mut("data")
+                .and_then(crate::graphql::root_connection)
+            {
+                c["edges"] = Value::Array(edges);
+            }
+        }
+        let (nr, or) = (st.node - node0, st.ours - ours0);
+        let ours = json!({"rows": prep.a.len(), "inNodeOrder": true});
+        let mut ev = ev;
+        ev["nodeReads"] = json!(nr);
+        ev["oursReads"] = json!(or);
+        Ok(entry(SINGLE_BLOCK_PATH, Some(ours), Some(ev)))
+    }
+
+    /// R-P5P9-97 N #178: the stored form of N on a root-scoped list (a `blockHash` root,
+    /// which H7 leaves to H6; the referee does not finish H6's lists again). The root lists
+    /// are prepared as H7 prepares them and N's arm alone is applied: ours in the node's
+    /// block order or its exact reverse, every oracle row in the node's block. `None`: N does
+    /// not explain the pair, and the pages stay as they were.
+    pub(crate) async fn gql_n_stored(
+        &self,
+        ta: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        st: &mut Reads,
+    ) -> Option<DiffEntry> {
+        let conn = |ans: &mut Answer| {
+            ans.body
+                .get_mut("data")
+                .and_then(crate::graphql::root_connection)
+                .cloned()
+        };
+        let (ca, cb) = (conn(a)?, conn(b)?);
+        let query = Some(op.query.as_str());
+        let root = a.body.get("data").and_then(root_name)?;
+        let (field, aliases) = root_selection(&op.query, &root)?;
+        if !aliases.is_empty() {
+            return None;
+        }
+        let mut prep = prepare_in(&ca, &cb, &field).ok()?;
+        prep.rules = self.cfg.graphql.field_rules.clone();
+        prep.root = root;
+        let start = (st.node, st.ours);
+        self.n_apply(ta, query, vars, &prep, a, b, st, start)
+            .await
+            .ok()
     }
 
     /// One row's node verdict (single-row reads, cached per compare). `oracle`: the row is
@@ -3280,8 +4167,8 @@ impl Ctx {
         let Some(rk) = id.rk.clone() else {
             return Verdict::unknown("no request key");
         };
-        // R-P5P9-75 C: a decoded coinbase key is settled on the coinbase path, never /poll.
-        let polled = if id.encoded_rk.is_some() {
+        // R-P5P9-86 C: a coinbase row is settled on the coinbase path, never /poll.
+        let polled = if id.coinbase {
             None
         } else {
             match self.h7_poll(chain, &rk, st).await {
@@ -3293,16 +4180,26 @@ impl Ctx {
             // A row in another block than the node's, without a height: the node's height of
             // its block decides whether that block is an orphan at the key's height.
             let pb = p.pointer("/metaData/blockHash").and_then(Value::as_str);
-            let bh = match (&id.block, id.height) {
-                (Some(b), None) if pb != Some(b.as_str()) => {
+            let (mut bh, mut gone) = (None, false);
+            if let (Some(b), None) = (&id.block, id.height) {
+                if pb != Some(b.as_str()) {
                     match self.h7_block_height(chain, b, st).await {
-                        Ok(h) => h,
+                        Ok(Some(h)) => bh = Some(h),
+                        // R-P5P9-86 M: a 404 is read once more before the block counts as one
+                        // the node does not hold.
+                        Ok(None) if oracle => {
+                            st.by_hash.remove(b.as_str());
+                            match self.h7_block_height(chain, b, st).await {
+                                Ok(h) => (bh, gone) = (h, h.is_none()),
+                                Err(w) => return Verdict::unknown(w),
+                            }
+                        }
+                        Ok(None) => {}
                         Err(w) => return Verdict::unknown(w),
                     }
                 }
-                _ => None,
-            };
-            return poll_verdict(id, n, &p, oracle, bh);
+            }
+            return poll_verdict_at(id, n, &p, oracle, bh, gone);
         }
         // Unknown to /poll: a coinbase row, settled by the node's block at its height (its
         // own, or the node's height of its block: R-P5P9-63 (5)).
@@ -3378,37 +4275,125 @@ impl Ctx {
         {
             return;
         }
-        let unsettled = |w: String| Some(CmdCheck::Unsettled(w));
-        let p = match self.h7_poll(chain, rk, st).await {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                v.cmd = unsettled("the node's poll does not know the key".into());
-                return;
+        let c = n.get("cmd").unwrap_or(&Value::Null);
+        v.cmd = Some(match self.h7_node_cmd(chain, rk, st).await {
+            Err(w) => CmdCheck::Unsettled(w),
+            Ok(cmd) => {
+                // R-P5P9-86 T: a payload with no field of its member, by the document.
+                let bare = c
+                    .get("payload")
+                    .and_then(Value::as_object)
+                    .filter(|m| m.keys().all(|k| k == "__typename"))
+                    .and_then(|m| bare_payload_mismatch(m, &cmd, st.payload_members));
+                match bare.or_else(|| cmd_mismatch(c, &cmd)) {
+                    Some(f) => CmdCheck::Differs(f),
+                    None => CmdCheck::Same,
+                }
             }
-            Err(w) => {
-                v.cmd = unsettled(w);
-                return;
-            }
-        };
+        });
+    }
+
+    /// The node's signed command for key `rk` on `chain`: from the payload of the block
+    /// `/poll` placed it in, that block being the cut branch's at its height; `Err`: why it
+    /// could not be read.
+    async fn h7_node_cmd(&self, chain: u8, rk: &str, st: &mut Reads) -> Result<Value, String> {
+        let p = self
+            .h7_poll(chain, rk, st)
+            .await?
+            .ok_or("the node's poll does not know the key")?;
         let pb = p.pointer("/metaData/blockHash").and_then(Value::as_str);
-        let Some(ph) = p.pointer("/metaData/blockHeight").and_then(Value::as_u64) else {
-            v.cmd = unsettled("no block height in the poll entry".into());
+        let ph = p
+            .pointer("/metaData/blockHeight")
+            .and_then(Value::as_u64)
+            .ok_or("no block height in the poll entry")?;
+        let (_, payload) = self.h7_branch_payload(chain, ph, pb, st).await?;
+        node_cmd(&payload, rk).ok_or_else(|| "the block's payload lacks the key".into())
+    }
+
+    /// R-P5P9-86 U: an ours-only tx row the node places (`v`) under a `publicKey` filter:
+    /// the public keys of the signers of the node's signed command. Sets `v.signers`.
+    async fn h7_signers_check(&self, r: &Row, v: &mut Verdict, f: &Filter, st: &mut Reads) {
+        if f.public_key.is_none() || r.id.kind != Some(Kind::Tx) || v.canon != Canon::Yes {
+            return;
+        }
+        let (Some(chain), Some(rk)) = (v.chain, r.id.rk.as_deref()) else {
+            v.signers = Some(Err("no chain or key for the row".into()));
             return;
         };
-        let payload = match self.h7_branch_payload(chain, ph, pb, st).await {
-            Ok((_, x)) => x,
-            Err(w) => {
-                v.cmd = unsettled(w);
-                return;
-            }
+        v.signers = Some(self.h7_node_cmd(chain, rk, st).await.map(|cmd| {
+            cmd.get("signers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.get("pubKey").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        }));
+    }
+
+    /// R-P5P9-97 T #332: an ours-only transfer row the node places (`v`) with a set
+    /// `crossChainTransfer`, whose transaction holds a TRANSFER_XCHAIN_RECD and no
+    /// TRANSFER_XCHAIN (a receive leg): the source leg, by `/poll` of the continuation's pact
+    /// id on the source chain its TRANSFER_XCHAIN_RECD names. Sets `v.source`.
+    async fn h7_xchain_source_check(&self, r: &Row, v: &mut Verdict, st: &mut Reads) {
+        let n = node_of(r);
+        let named = |e: &Value, x: &str| e.get("name").and_then(Value::as_str) == Some(x);
+        if r.id.kind != Some(Kind::Transfer)
+            || v.canon != Canon::Yes
+            || !n.get("crossChainTransfer").is_some_and(Value::is_object)
+            || v.xchain.iter().any(|e| named(e, "TRANSFER_XCHAIN"))
+        {
+            return;
+        }
+        let srcs: Vec<Option<u8>> = v
+            .xchain
+            .iter()
+            .filter(|e| named(e, "TRANSFER_XCHAIN_RECD"))
+            .map(|e| {
+                e.pointer("/params/3")
+                    .and_then(text)
+                    .and_then(|c| c.parse().ok())
+            })
+            .collect();
+        let Some(&first) = srcs.first() else {
+            return;
         };
-        v.cmd = Some(match node_cmd(&payload, rk) {
-            None => CmdCheck::Unsettled("the block's payload lacks the key".into()),
-            Some(cmd) => match cmd_mismatch(n.get("cmd").unwrap_or(&Value::Null), &cmd) {
-                Some(f) => CmdCheck::Differs(f),
-                None => CmdCheck::Same,
-            },
-        });
+        v.source = Some(self.h7_source_leg(first, &srcs, v.chain, r, st).await);
+    }
+
+    async fn h7_source_leg(
+        &self,
+        first: Option<u8>,
+        srcs: &[Option<u8>],
+        chain: Option<u8>,
+        r: &Row,
+        st: &mut Reads,
+    ) -> Result<(u8, Vec<Value>), String> {
+        let src = first.ok_or("the TRANSFER_XCHAIN_RECD names no source chain")?;
+        if srcs.iter().any(|c| *c != Some(src)) {
+            return Err("the TRANSFER_XCHAIN_RECD events name different source chains".into());
+        }
+        let (Some(chain), Some(rk)) = (chain, r.id.rk.as_deref()) else {
+            return Err("no chain or key for the row".into());
+        };
+        let p = self
+            .h7_poll(chain, rk, st)
+            .await?
+            .ok_or("the node's poll does not know the key")?;
+        let pact = p
+            .pointer("/continuation/pactId")
+            .and_then(Value::as_str)
+            .ok_or("the receive leg's poll entry holds no continuation pact id")?
+            .to_string();
+        let s = self
+            .h7_poll(src, &pact, st)
+            .await?
+            .ok_or("the node's poll on the source chain does not know the pact id")?;
+        let events = s
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or("the source leg's poll entry holds no events")?;
+        Ok((src, events))
     }
 
     /// R-P5P9-70 (I-1): an ours-only transfer row that the node places (`v`, its block and
@@ -3484,11 +4469,881 @@ impl Ctx {
         });
     }
 
+    /// R-P5P9-86 X: each unchecked decimal-zeros candidate
+    /// ([`crate::graphql_norm::decimal_zeros_candidates`]) is settled on the node: ours' row
+    /// names a request key and chain, the node's `/poll` entry for it holds a TRANSFER event
+    /// that is the row (every other selected field), and that event's amount text equals
+    /// ours' text exactly. Then the hit is `/~graphql-oracle-decimal-zeros`; otherwise the
+    /// entry goes back to the amount difference, with why.
+    pub(crate) async fn gql_decimal_zeros(&self, d: &mut [DiffEntry], st: &mut Reads) {
+        use crate::graphql_norm::{DECIMAL_ZEROS_PATH, DECIMAL_ZEROS_UNCHECKED_PATH};
+        for e in d
+            .iter_mut()
+            .filter(|e| e.path == DECIMAL_ZEROS_UNCHECKED_PATH)
+        {
+            let a = e.a.clone().unwrap_or(Value::Null);
+            let ours = a["amount"].as_str().unwrap_or_default().to_string();
+            match self.decimal_zeros_node(&a["row"], &ours, st).await {
+                Ok(ev) => {
+                    e.path = DECIMAL_ZEROS_PATH.into();
+                    e.a = Some(json!({"amount": ours, "node": ev}));
+                }
+                Err(why) => {
+                    e.path = a["at"].as_str().unwrap_or("/amount").to_string();
+                    e.a = Some(json!(ours));
+                    e.b = Some(json!({"oracle": e.b, "why": why}));
+                }
+            }
+        }
+    }
+
+    async fn decimal_zeros_node(
+        &self,
+        row: &Value,
+        ours: &str,
+        st: &mut Reads,
+    ) -> Result<Value, String> {
+        // R-P5P9-97 X: the request key and chain from any field naming them, the row's relay
+        // id included (a Transfer id holds both).
+        let id = row_id(&json!({ "node": row }));
+        let rk = id.rk.as_deref().ok_or("ours' row selects no requestKey")?;
+        let chain = id.chain.ok_or("ours' row selects no chain")?;
+        let poll = self
+            .h7_poll(chain, rk, st)
+            .await?
+            .ok_or("the node does not hold the request key")?;
+        let mut other = row.clone();
+        if let Some(o) = other.as_object_mut() {
+            o.remove("amount");
+        }
+        // R-P5P9-98: the node's amount (`{"decimal": …}` or text) equals ours' as an exact
+        // decimal; this replaces R-P5P9-86 X's text equality.
+        let hit = poll
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|ev| transfer_matches(&other, ev, false))
+            .find_map(|ev| {
+                let at = format!("/params/{}", 2 + transfer_offset(ev));
+                let n = ev.pointer(&at)?;
+                crate::diff::same_exact_decimal(n, &json!(ours))
+                    .then(|| pact_text(n))
+                    .flatten()
+            });
+        match hit {
+            Some(t) => Ok(json!({"requestKey": rk, "chain": chain, "amount": t})),
+            None => Err(format!(
+                "no TRANSFER of the row on the node has ours' amount {ours} as an exact decimal"
+            )),
+        }
+    }
+
+    /// R-P5P9-88 (G): the compare's unfinished nested lists that are prefix candidates
+    /// ([`crate::graphql_scope::PREFIX_PATH`]): each block's canonical header on the cut's
+    /// branch must be the row's block, and its payload must hold ours' rows by count (and by
+    /// request key, in order of the multiset, when ours' rows select one). One payload read
+    /// per block, within the compare's cap. When every list of the entry passes, the entry
+    /// becomes the prefix hit; otherwise it stays unfinished, each failed list saying why.
+    pub(crate) async fn gql_h6_prefix(&self, d: &mut [DiffEntry], st: &mut Reads) {
+        use crate::graphql_scope::{PREFIX_PATH, UNFINISHED_PATH};
+        for e in d.iter_mut() {
+            if e.path != UNFINISHED_PATH || e.b.is_some() {
+                continue;
+            }
+            let Some(lists) =
+                e.a.as_ref()
+                    .and_then(|a| a.get("lists"))
+                    .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            if lists.is_empty() || !lists.iter().all(|l| l.get("prefix").is_some()) {
+                continue;
+            }
+            let mut out = Vec::new();
+            let mut ok = true;
+            for l in lists {
+                let mut l = l.clone();
+                let c = &l["prefix"];
+                let (chain, height, hash) = (
+                    c["chain"].as_u64().and_then(|x| u8::try_from(x).ok()),
+                    c["height"].as_u64(),
+                    c["hash"].as_str().map(str::to_string),
+                );
+                let rows = c["of"].as_u64().unwrap_or(u64::MAX);
+                let keys = c["keys"].as_array().cloned();
+                let check = match (chain, height, hash) {
+                    (Some(ch), Some(h), Some(b)) => {
+                        match self.h7_branch_payload(ch, h, Some(&b), st).await {
+                            Err(w) => Err(w),
+                            Ok((_, payload)) => block_request_keys(&payload).and_then(|nk| {
+                                if nk.len() as u64 != rows {
+                                    return Err(format!(
+                                        "ours lists {rows} rows, the node's block {} txs",
+                                        nk.len()
+                                    ));
+                                }
+                                if let Some(k) = &keys {
+                                    let mut ours: Vec<String> = k
+                                        .iter()
+                                        .filter_map(|x| x.as_str().map(str::to_string))
+                                        .collect();
+                                    let mut node = nk.clone();
+                                    ours.sort();
+                                    node.sort();
+                                    if ours != node {
+                                        return Err("ours' request keys are not the node's \
+                                            block's"
+                                            .into());
+                                    }
+                                }
+                                // R-P5P9-95 m-4: ours' rows past the prefix, by field.
+                                if let Some(f) = c["unchecked"].as_str() {
+                                    return Err(format!(
+                                        "ours' rows past the prefix select {f}, which the \
+                                         node check does not read"
+                                    ));
+                                }
+                                if let Some(cmds) = c["cmds"].as_array() {
+                                    prefix_cmds_match(&payload, cmds)?;
+                                }
+                                // R-P5P9-105 (G): both cut at the same length: ours the
+                                // node's block's first rows in reverse (or forward) order,
+                                // the oracle's rows distinct txs of the block.
+                                if let Some(m) = c.get("cutBoth").and_then(Value::as_object) {
+                                    let side = |s: &str| {
+                                        m.get(s)
+                                            .and_then(Value::as_array)
+                                            .cloned()
+                                            .ok_or("a cut side without its rows")
+                                    };
+                                    let ours = side("ours")?;
+                                    prefix_in_node_order(&payload, &ours)?;
+                                    prefix_cmds_match(&payload, &side("oracle")?)
+                                        .map_err(|w| format!("in any order, oracle: {w}"))?;
+                                }
+                                // R-P5P9-97 G: out of order, both sides as multisets of
+                                // the node's block: ours all of it (the count is checked
+                                // above), the oracle's rows each a distinct tx of it.
+                                if let Some(m) = c["multiset"].as_object() {
+                                    for side in ["ours", "oracle"] {
+                                        let cmds = m
+                                            .get(side)
+                                            .and_then(Value::as_array)
+                                            .ok_or("a multiset side without its rows")?;
+                                        prefix_cmds_match(&payload, cmds)
+                                            .map_err(|w| format!("in any order, {side}: {w}"))?;
+                                    }
+                                    if let Some(k) = m.get("oracleKeys").and_then(Value::as_array) {
+                                        if k.iter().any(|x| {
+                                            !x.as_str().is_some_and(|x| nk.iter().any(|n| n == x))
+                                        }) {
+                                            return Err("an oracle request key is not in the \
+                                                node's block"
+                                                .into());
+                                        }
+                                    }
+                                }
+                                Ok(nk.len())
+                            }),
+                        }
+                    }
+                    _ => Err("no block to read".into()),
+                };
+                match check {
+                    Ok(n) => l["node"] = json!({"txs": n}),
+                    Err(w) => {
+                        ok = false;
+                        l["why"] = json!(format!(
+                            "a cut nested list of the oracle's that is \
+                            ours' prefix, not settled on the node: {w}"
+                        ));
+                    }
+                }
+                out.push(l);
+            }
+            if ok {
+                e.path = PREFIX_PATH.into();
+                e.a = Some(json!({ "lists": out }));
+            } else {
+                e.a = Some(json!({ "lists": out }));
+            }
+        }
+    }
+
+    /// R-P5P9-86 TC: a record whose only difference outside the hits is its root
+    /// `totalCount` (and no unsettled H7 row) is settled by walking both lists to their end,
+    /// [`OURS_PAGE_CAP`] rows a page, at most [`COUNT_WALK_ROWS`] rows a side, and settling
+    /// every one-sided row by the H7 rules ([`Ctx::gql_window_referee`] on the two whole
+    /// lists, `max` the oracle's height). It is explained (`/~graphql-count-walk`, with H7's
+    /// hits) only when every one-sided row is and the difference in the counts equals the
+    /// difference in one-sided rows. Past the cap the reason is `count walk capped`
+    /// (`/~graphql-count-walk-capped`, never allowlisted). R-P5P9-87: the referee walks ours
+    /// bounded at `record_height` (the record's height: rows above it are newer than the
+    /// record and left out); live, `u64::MAX`. R-P5P9-92 (2): ours' rows above the oracle's
+    /// height `max` (up to `record_height`) are in ours' count but not the oracle's: each must
+    /// be node-canonical by `/poll` ([`Ctx::above_tip_rows`]), at most [`ABOVE_TIP_ROWS`],
+    /// and counts as a settled one-sided row of ours. R-P5P9-93: the oracle counting the
+    /// heights of the query's window is the ACCEPTED rule's predicate
+    /// ([`crate::graphql_norm::oracle_counts_window_heights`]). Anything else leaves the
+    /// count difference, with why in the note.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_count_walk(
+        &self,
+        ta: &Target,
+        tb: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        d: &mut Vec<DiffEntry>,
+        note: &mut Option<String>,
+        max: u64,
+        record_height: u64,
+        st: &mut Reads,
+    ) {
+        if d.iter().any(|e| {
+            never_explained(&e.path)
+                || crate::graphql_scope::is_h6_entry(&e.path)
+                || e.path.starts_with("/~harness-limit/")
+        }) {
+            return;
+        }
+        let raw: Vec<usize> = (0..d.len())
+            .filter(|&i| !d[i].path.starts_with("/~"))
+            .collect();
+        let [i] = raw[..] else {
+            return;
+        };
+        let Some(root) = d[i]
+            .path
+            .strip_prefix("/data/")
+            .and_then(|p| p.strip_suffix("/totalCount"))
+            .filter(|r| !r.contains('/'))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let count = |v: &Option<Value>| v.as_ref().and_then(Value::as_u64);
+        let (Some(na), Some(nb)) = (count(&d[i].a), count(&d[i].b)) else {
+            return;
+        };
+        let walked = self
+            .count_walk(ta, tb, op, vars, &root, (na, nb), max, record_height, st)
+            .await;
+        let why = match walked {
+            Ok(hits) => {
+                d.remove(i);
+                d.extend(hits);
+                return;
+            }
+            Err((true, why)) => {
+                d.push(entry(COUNT_WALK_CAPPED_PATH, Some(json!(why)), None));
+                why
+            }
+            Err((false, why)) => why,
+        };
+        *note = Some(match note.take() {
+            Some(n) => format!("{n}; {why}"),
+            None => why,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn count_walk(
+        &self,
+        ta: &Target,
+        tb: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        (na, nb): (u64, u64),
+        max: u64,
+        record_height: u64,
+        st: &mut Reads,
+    ) -> Result<Vec<DiffEntry>, (bool, String)> {
+        let q = Some(op.query.as_str());
+        let (fv, av) = (arg_var(q, "first"), arg_var(q, "after"));
+        if fv.is_empty() || av.is_empty() {
+            return Err((
+                false,
+                "count walk not applied: the document passes no first and after variables".into(),
+            ));
+        }
+        let wa = self.walk_list(ta, op, vars, root, &fv, &av).await?;
+        let wb = self.walk_list(tb, op, vars, root, &fv, &av).await?;
+        let bounded = record_height < u64::MAX;
+        let bound = record_height.min(max);
+        // Ours' rows: up to the oracle's height (walked against the oracle), above it up to
+        // the record's height (R-P5P9-92 (2)), and above the record (newer: left out).
+        let (mut wa_below, mut above) = (Vec::new(), Vec::new());
+        for e in wa {
+            match prepared_id(&e, root).height {
+                Some(h) if h > record_height => {}
+                Some(h) if h > bound => above.push((h, e)),
+                None if bounded => {
+                    return Err((
+                        false,
+                        "count walk: a row of ours has no height to bound the walk at".into(),
+                    ))
+                }
+                _ => wa_below.push(e),
+            }
+        }
+        // R-P5P9-95 m-9: the compare's reads (H7's among them), under its one cap.
+        let n_above = above.len() as i64;
+        let (la, lb) = (wa_below.len() as i64, wb.len() as i64);
+        // R-P5P9-95 m-5: ours' count is ours' walked rows (an overcount of ours stays a
+        // diff, R-P5P9-78 H2 I-4).
+        if na as i64 != la + n_above {
+            return Err((
+                false,
+                format!(
+                    "count walk: ours counts {na} and lists {la} rows plus {n_above} above the \
+                     oracle's height"
+                ),
+            ));
+        }
+        if !above.is_empty() {
+            self.above_tip_rows(ta, root, max, &above, st).await?;
+            // R-P5P9-95 I-1: and each gets the checks an ours-only row gets.
+            let rows: Vec<Value> = above.iter().map(|(_, e)| e.clone()).collect();
+            if let Err(w) = self
+                .above_tip_checks(ta, op, vars, root, &rows, &wa_below, st)
+                .await
+            {
+                return Err((
+                    false,
+                    format!(
+                        "count walk: a row of ours above the oracle's height {max} is not \
+                         settled as an ours-only row: {w}"
+                    ),
+                ));
+            }
+        }
+        let walked: Vec<Option<u64>> = wa_below
+            .iter()
+            .map(|e| prepared_id(e, root).height)
+            .collect();
+        let page = |edges: Vec<Value>, n: u64| Answer {
+            body: json!({"data": {root: {"totalCount": n,
+                "pageInfo": {"hasNextPage": false, "hasPreviousPage": false},
+                "edges": edges}}}),
+            status: 200,
+            raw: String::new(),
+            ms: vec![0],
+        };
+        let (mut a, mut b) = (page(wa_below, na), page(wb, nb));
+        // R-P5P9-97 W #567: H8 first, as on the first page, so H7 matches the oracle's walked
+        // transfer rows at the node's indexes (its hit is the first page's to show).
+        let _ = self.gql_transfer_order(ta, &a, &mut b, st).await;
+        let (h7, h7_note) = self
+            .gql_window_referee(ta, Some(op), vars, &mut a, &mut b, max, false, st)
+            .await;
+        if let Some(n) = h7_note {
+            return Err((false, format!("count walk: {n}")));
+        }
+        if h7.iter().any(|e| never_explained(&e.path)) {
+            return Err((
+                false,
+                "count walk: H7 left a one-sided row unsettled".into(),
+            ));
+        }
+        let edges = |x: &Answer| {
+            x.body
+                .pointer(&format!("/data/{root}/edges"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as i64
+        };
+        let (pa, pb) = (edges(&a), edges(&b));
+        let (one_a, one_b) = (la - pa + n_above, lb - pb);
+        let counts = na as i64 - nb as i64;
+        let ev_a = |one: i64| {
+            json!({"count": na, "walked": la, "oneSided": one, "aboveOracleTip": n_above,
+                "bound": bounded.then_some(record_height)})
+        };
+        // R-P5P9-93: every walked row is settled (H7 above); the oracle's count is the
+        // number of heights in the query's window, and ours' count the walked rows and the
+        // node's per-height counts over it: the ACCEPTED oracle-counts-heights predicate.
+        let heights_why = if na != nb && n_above == 0 {
+            match self
+                .window_heights(op, vars, root, (na, nb), &walked, st)
+                .await
+            {
+                Ok(node) => {
+                    let mut out = h7;
+                    out.push(entry(
+                        COUNT_WALK_PATH,
+                        Some(ev_a(one_a)),
+                        Some(json!({"count": nb, "walked": lb, "oneSided": one_b,
+                            "windowHeights": node.len(), "nodeTxsPerHeight": node,
+                            "nodeReads": st.node})),
+                    ));
+                    out.push(entry(
+                        ORACLE_COUNTS_HEIGHTS_PATH,
+                        Some(json!(na)),
+                        Some(json!(nb)),
+                    ));
+                    return Ok(out);
+                }
+                Err(w) => Some(w),
+            }
+        } else {
+            None
+        };
+        // R-P5P9-97 U: the oracle's walked list holds one row more than its own count. Every
+        // one-sided row is settled (H7 above) and ours' count is ours' walked rows, so with
+        // the oracle's walked rows in place of its count the difference is the one-sided rows.
+        let over = lb - nb as i64 == 1 && na as i64 - lb == one_a - one_b;
+        if pa == pb && counts != one_a - one_b && over {
+            let mut out = h7;
+            out.push(entry(
+                COUNT_WALK_PATH,
+                Some(ev_a(one_a)),
+                Some(json!({"count": nb, "walked": lb, "oneSided": one_b,
+                    "nodeReads": st.node})),
+            ));
+            out.push(entry(
+                ORACLE_LIST_OVER_COUNT_PATH,
+                Some(json!({"count": na, "walked": la + n_above})),
+                Some(json!({"count": nb, "walked": lb})),
+            ));
+            return Ok(out);
+        }
+        if pa != pb || counts != one_a - one_b {
+            let heights = heights_why.map_or(String::new(), |w| {
+                format!("; the oracle does not count the window's heights: {w}")
+            });
+            return Err((
+                false,
+                format!(
+                    "count walk: the counts differ by {counts} (ours {na}, the oracle's {nb}), \
+                     the one-sided rows by {} (ours {one_a} of {la} plus {n_above} above the \
+                     oracle's height, the oracle's {one_b} of {lb}){heights}",
+                    one_a - one_b
+                ),
+            ));
+        }
+        let mut out = h7;
+        out.push(entry(
+            COUNT_WALK_PATH,
+            Some(ev_a(one_a)),
+            Some(json!({"count": nb, "walked": lb, "oneSided": one_b,
+                "nodeReads": st.node})),
+        ));
+        Ok(out)
+    }
+
+    /// R-P5P9-93: the node's tx count at each height of the query's window
+    /// (`minHeight..=maxHeight` on its one `chainId`), from the canonical header on the
+    /// cut's branch and its payload, when [`crate::graphql_norm::oracle_counts_window_heights`]
+    /// holds for them; at most [`WINDOW_HEIGHTS`] heights. `Err`: why not.
+    async fn window_heights(
+        &self,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        counts: (u64, u64),
+        walked: &[Option<u64>],
+        st: &mut Reads,
+    ) -> Result<Vec<u64>, String> {
+        use crate::graphql_norm::oracle_counts_window_heights as holds;
+        let rules = &self.cfg.graphql.field_rules;
+        let f = Filter::of(Some(&op.query), Some(root), vars);
+        let window = f.min_height.zip(f.max_height);
+        // The predicate without the node first: no node read for a record it cannot explain.
+        if let Err(w) = holds(rules, root, counts, walked, window, &[]) {
+            if !w.starts_with("the node's counts") {
+                return Err(w);
+            }
+        }
+        let Some((lo, hi)) = window else {
+            return Err("the query has no minHeight..maxHeight window".into());
+        };
+        let chain = match f.chains.as_deref() {
+            Some([c]) => *c,
+            _ => return Err("the query names no single chainId".into()),
+        };
+        if hi - lo >= WINDOW_HEIGHTS {
+            return Err(format!("the window is wider than {WINDOW_HEIGHTS} heights"));
+        }
+        let mut node = Vec::new();
+        for h in lo..=hi {
+            let hd = self
+                .h7_canonical(chain, h, st)
+                .await?
+                .ok_or_else(|| format!("no canonical header at {h} on the cut's branch"))?;
+            let ph = hd
+                .get("payloadHash")
+                .and_then(Value::as_str)
+                .ok_or("a header without its payload hash")?;
+            let p = self.h7_payload(chain, ph, st).await?;
+            let n = p
+                .get("transactions")
+                .and_then(Value::as_array)
+                .ok_or("a payload without its transaction list")?
+                .len();
+            node.push(n as u64);
+        }
+        holds(rules, root, counts, walked, window, &node)?;
+        Ok(node)
+    }
+
+    /// R-P5P9-95 I-1: ours' rows `above` the oracle's tip are ours-only rows: each gets the
+    /// checks [`decide`] gives one (its identity, `unchecked_field`, `cmd` and
+    /// `creationTime` against the node, `result.block.canonical`, `crossChainTransfer`, the
+    /// query's filter with U's signers, and duplicates), and none shares its identity with
+    /// a row of ours `below` the tip. `Err`: why not.
+    #[allow(clippy::too_many_arguments)]
+    async fn above_tip_checks(
+        &self,
+        ta: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        above: &[Value],
+        below: &[Value],
+        st: &mut Reads,
+    ) -> Result<(), String> {
+        let q = op.query.as_str();
+        let (field, aliases) =
+            root_selection(q, root).unwrap_or_else(|| (root.to_string(), Vec::new()));
+        if !aliases.is_empty() {
+            return Err(format!(
+                "the row selection has an alias ({})",
+                aliases.join(", ")
+            ));
+        }
+        let conn = |rows: Vec<Value>| json!({"edges": rows, "pageInfo": {"hasNextPage": false}});
+        let empty = conn(Vec::new());
+        let mut all = below.to_vec();
+        all.extend(above.iter().cloned());
+        let whole = prepare_in(&conn(all), &empty, &field)?;
+        let (lo, hi) = whole.a.split_at(below.len());
+        if let Some(r) = hi.iter().find(|r| lo.iter().any(|x| x.key == r.key)) {
+            return Err(format!(
+                "ours also lists it below the oracle's height: {}",
+                r.id.evidence()
+            ));
+        }
+        let mut prep = prepare_in(&conn(above.to_vec()), &empty, &field)?;
+        prep.rules = self.cfg.graphql.field_rules.clone();
+        prep.root = root.to_string();
+        st.payload_members = payload_members(q);
+        let filter = Filter::of(Some(q), Some(root), vars);
+        let mut va = Vec::new();
+        for r in &prep.a {
+            let mut v = self.h7_verdict(ta, r, false, st).await;
+            self.h7_cmd_check(r, &mut v, st).await;
+            self.h7_ctime_check(r, &mut v, st).await;
+            self.h7_branch_check(r, &mut v, st).await;
+            self.h7_signers_check(r, &mut v, &filter, st).await;
+            self.h7_xchain_source_check(r, &mut v, st).await;
+            va.push(Some(v));
+        }
+        let w = Window {
+            max: u64::MAX,
+            asc: root == "blocksFromHeight",
+            filter: &filter,
+            prefix: None,
+        };
+        let d = decide(&prep, &va, &[], &w);
+        let mut whys = d.undecided.clone();
+        whys.extend(d.rejected.iter().map(|x| x.2.clone()));
+        if !d.grouped {
+            whys.push("its rows do not group".into());
+        }
+        if whys.is_empty() && d.ours.len() != prep.a.len() {
+            whys.push(format!(
+                "{} of its {} rows settled",
+                d.ours.len(),
+                prep.a.len()
+            ));
+        }
+        if whys.is_empty() {
+            Ok(())
+        } else {
+            Err(whys.join("; "))
+        }
+    }
+
+    /// R-P5P9-92 (2): ours' rows above the oracle's height `max` (`(height, row)`), each
+    /// node-canonical by `/poll`: the node places its key at the row's height, in the block
+    /// that is the canonical header there on the cut's branch. More than [`ABOVE_TIP_ROWS`]
+    /// is `Err((true, "rows above the oracle tip: capped …"))`; a row that is not, why.
+    async fn above_tip_rows(
+        &self,
+        ta: &Target,
+        root: &str,
+        max: u64,
+        above: &[(u64, Value)],
+        st: &mut Reads,
+    ) -> Result<(), (bool, String)> {
+        let cap = self
+            .gql
+            .above_tip_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if above.len() > cap {
+            return Err((
+                true,
+                format!(
+                    "rows above the oracle tip: capped: ours lists {} rows above the oracle's \
+                     height {max} (more than {cap})",
+                    above.len()
+                ),
+            ));
+        }
+        for (h, e) in above {
+            let id = prepared_id(e, root);
+            let what = id.evidence();
+            let r = Row {
+                id,
+                key: String::new(),
+                edge: e.clone(),
+            };
+            let v = self.h7_verdict(ta, &r, false, st).await;
+            let fail = |why: String| {
+                Err((
+                    false,
+                    format!(
+                        "count walk: a row of ours above the oracle's height {max} is not \
+                         node-canonical ({why}): {what}"
+                    ),
+                ))
+            };
+            if v.canon != Canon::Yes || v.height != Some(*h) {
+                return fail(format!("{:?} at {:?}: {}", v.canon, v.height, v.why));
+            }
+            let (Some(chain), Some(b)) = (v.chain, v.block.as_deref()) else {
+                return fail("no chain or block from the node".into());
+            };
+            match self.h7_canonical(chain, *h, st).await {
+                Ok(Some(hd)) if hd.get("hash").and_then(Value::as_str) == Some(b) => {}
+                Ok(_) => return fail("its block is not the cut branch's at its height".into()),
+                Err(w) => return fail(w),
+            }
+        }
+        Ok(())
+    }
+
+    /// One whole list by the document, `first` = [`OURS_PAGE_CAP`] and `after` = the last
+    /// page's `endCursor` (else its last row's `cursor`); `Err((true, _))` past
+    /// [`COUNT_WALK_ROWS`] rows.
+    async fn walk_list(
+        &self,
+        t: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        first_var: &str,
+        after_var: &str,
+    ) -> Result<Vec<Value>, (bool, String)> {
+        let fail = |why: &str| (false, format!("count walk: {} {why}", t.name));
+        let mut out: Vec<Value> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut bytes = 0usize;
+        loop {
+            // R-P5P9-92 (9): each page of ours' or the oracle's is one read of the run's
+            // budget (the referee's `--max-reads`; unbounded live), its own reason past it.
+            if !self.gql.take_node_read() {
+                return Err((
+                    true,
+                    format!(
+                        "count walk stopped: the run's read cap is reached before {} was \
+                         walked ({} rows read)",
+                        t.name,
+                        out.len()
+                    ),
+                ));
+            }
+            let mut v = vars.clone();
+            v.insert(first_var.into(), json!(OURS_PAGE_CAP));
+            match &after {
+                Some(c) => v.insert(after_var.into(), json!(c)),
+                None => v.remove(after_var),
+            };
+            let data = self
+                .gql_read(t, &op.query, Value::Object(v))
+                .await
+                .ok_or_else(|| fail("answered a page of the walk with no data"))?;
+            let c = data
+                .get(root)
+                .ok_or_else(|| fail("answered a page without the root list"))?;
+            let edges = c
+                .get("edges")
+                .and_then(Value::as_array)
+                .ok_or_else(|| fail("answered a page without edges"))?;
+            out.extend(edges.iter().cloned());
+            // R-P5P9-95 m-10: a byte budget a side, as the rows' JSON text.
+            bytes += edges.iter().map(|e| e.to_string().len()).sum::<usize>();
+            if bytes > COUNT_WALK_BYTES {
+                return Err((
+                    true,
+                    format!(
+                        "count walk capped: {} lists more than {COUNT_WALK_BYTES} bytes",
+                        t.name
+                    ),
+                ));
+            }
+            let cap = self
+                .gql
+                .walk_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if out.len() > cap {
+                return Err((
+                    true,
+                    format!("count walk capped: {} lists more than {cap} rows", t.name),
+                ));
+            }
+            let more = c
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| fail("answered a page without hasNextPage"))?;
+            if !more {
+                return Ok(out);
+            }
+            let next = c
+                .pointer("/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .or_else(|| edges.last()?.get("cursor")?.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| fail("answered a page with no cursor to page on"))?;
+            if edges.is_empty() || after.as_deref() == Some(next.as_str()) {
+                return Err(fail("answered a page that does not advance"));
+            }
+            after = Some(next);
+        }
+    }
+
+    /// R-P5P9-86 S′ with R-P5P9-87, the stored-record form: a stored NodeBalance record's
+    /// gap on chain `chain` (ours' GraphQL `ours`, ours' native `native`) at time `ts` (unix
+    /// seconds) is miner skew only when the node shows `account` receiving k of that chain's
+    /// coinbases (1 <= k <= 3), all of one amount, in the record's height window (the height
+    /// whose block time is nearest `ts`, ± [`SKEW_WINDOW`]) and the gap is k × that amount.
+    /// `Err`: why not.
+    pub(crate) async fn native_skew_stored(
+        &self,
+        chain: u8,
+        account: &str,
+        ours: &str,
+        native: &str,
+        ts: u64,
+    ) -> Result<Value, String> {
+        let mut st = Reads::default();
+        let (Some(x), Some(y)) = (fixed12_text(ours), fixed12_text(native)) else {
+            return Err("a balance is not a decimal".into());
+        };
+        // R-P5P9-105 S′: either sign; ours' GraphQL number is an f64, so the gap may be off
+        // by half an ulp of it. R-P5P9-110: that half ulp is measured from the exact value
+        // of the f64, not from ours' printed shortest text (which can itself be half an ulp
+        // off the f64). `v` explains the gap when the node's value less `v` is within half an
+        // ulp of the f64.
+        let gap = y - x;
+        if gap == 0 {
+            return Err("no gap".into());
+        }
+        let f = ours.trim().parse::<f64>().ok().filter(|f| f.is_finite());
+        let near = |v: i128| match f {
+            Some(f) => y
+                .checked_sub(v)
+                .is_some_and(|t| crate::graphql_norm::f64_within_half_ulp(f, t)),
+            None => v == gap,
+        };
+        self.h7_take(&mut st)?;
+        let tip = self
+            .node
+            .cut()
+            .await
+            .map_err(|e| format!("cut read failed: {e}"))?
+            .hashes
+            .get(&chain)
+            .map(|e| e.height)
+            .ok_or("the cut lacks the chain")?;
+        // The height whose block time is nearest `ts`, by steps of 30 s a block.
+        let mut h = tip;
+        // R-P5P9-95 m-8: the search must converge (within a block of `ts`).
+        let mut converged = false;
+        for _ in 0..6 {
+            let hd = self
+                .h7_canonical(chain, h, &mut st)
+                .await?
+                .ok_or("no canonical header at the height")?;
+            let t = hd
+                .get("creationTime")
+                .and_then(Value::as_u64)
+                .ok_or("a header without creationTime")?
+                / 1_000_000;
+            let dh = (t as i64 - ts as i64) / 30;
+            if dh.abs() <= 1 {
+                converged = true;
+                break;
+            }
+            h = (h as i64 - dh).clamp(0, tip as i64) as u64;
+        }
+        if !converged {
+            return Err("the height search did not converge on the record's time".into());
+        }
+        let mut paid: Vec<(u64, i128)> = Vec::new();
+        // R-P5P9-105 S′: each block's net change to the account (None: an amount that does
+        // not read exactly).
+        let mut net: Vec<(u64, Option<i128>)> = Vec::new();
+        for hh in h.saturating_sub(SKEW_WINDOW)..=(h + SKEW_WINDOW).min(tip) {
+            if st.node + 2 > S_NET_READS {
+                break;
+            }
+            let Some(hd) = self.h7_canonical(chain, hh, &mut st).await? else {
+                return Err(format!("no canonical header at {hh}"));
+            };
+            let hash = hd.get("hash").and_then(Value::as_str).map(str::to_string);
+            let (_, payload) = self
+                .h7_branch_payload(chain, hh, hash.as_deref(), &mut st)
+                .await?;
+            if let Some(a) = coinbase_paid(&payload, account) {
+                paid.push((hh, a));
+            }
+            net.push((hh, block_net_change(&payload, account)));
+        }
+        // The 1–3 coinbases arm stays as a special case.
+        let amounts: Vec<i128> = paid.iter().map(|p| p.1).collect();
+        let one = amounts
+            .first()
+            .copied()
+            .filter(|a| amounts.iter().all(|b| b == a));
+        if let Some(r) = one.filter(|r| *r > 0) {
+            if let Some(k) = (1..=3i128).find(|k| near(k * r)) {
+                if paid.len() as i128 >= k {
+                    return Ok(
+                        json!({"chain": chain, "k": k, "window": [h.saturating_sub(SKEW_WINDOW),
+                        h + SKEW_WINDOW], "coinbases": paid.iter().map(|p| p.0).collect::<Vec<_>>()}),
+                    );
+                }
+            }
+        }
+        // R-P5P9-105 S′: the net change over 1 to 3 consecutive blocks of the window.
+        for len in 1..=S_NET_BLOCKS {
+            for run in net.windows(len) {
+                let sum = run.iter().try_fold(0i128, |acc, (_, v)| v.map(|v| acc + v));
+                if sum.is_some_and(near) {
+                    return Ok(json!({"chain": chain, "netChange": true,
+                        "heights": run.iter().map(|b| b.0).collect::<Vec<_>>(),
+                        "window": [h.saturating_sub(SKEW_WINDOW), h + SKEW_WINDOW]}));
+                }
+            }
+        }
+        Err(format!(
+            "the gap is not the account's net change over 1 to {S_NET_BLOCKS} consecutive \
+             blocks of the window (nor 1 to 3 of its coinbases)"
+        ))
+    }
+
     /// Takes one node read from the compare's cap and the run's budget.
     pub(crate) fn h7_take(&self, st: &mut Reads) -> Result<(), String> {
-        if st.node >= NODE_READS {
+        let cap = self
+            .gql
+            .compare_reads
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if st.node >= cap {
             return Err(format!(
-                "the cap of {NODE_READS} node reads per compare is reached"
+                "the cap of {cap} node reads per compare is reached"
             ));
         }
         if !self.gql.take_node_read() {
@@ -3500,6 +5355,13 @@ impl Ctx {
     }
 
     async fn h7_poll(&self, chain: u8, rk: &str, st: &mut Reads) -> Result<Option<Value>, String> {
+        // R-P5P9-86 C: a coinbase key (not a hash) is never polled.
+        if is_coinbase_key(rk) {
+            return Err(format!(
+                "a coinbase key of {} characters is never polled",
+                rk.len()
+            ));
+        }
         let key = (chain, rk.to_string());
         if let Some(v) = st.polls.get(&key) {
             return v.clone();
@@ -3783,17 +5645,29 @@ pub fn single_block_cut(
             node.len().saturating_sub(start)
         )
     })?;
-    if let Some((i, (r, k))) =
+    // R-P5P9-86 N: ours in the node's block order, or in exactly its reverse (from the
+    // block's end), from ours' cursor. Any other order is not.
+    let reversed: Vec<String> = node
+        .iter()
+        .rev()
+        .skip(start)
+        .take(p.a.len())
+        .cloned()
+        .collect();
+    let differs = |want: &[String]| {
         p.a.iter()
             .zip(want)
             .enumerate()
             .find(|(_, (r, k))| rk(r) != **k)
-    {
-        return Err(format!(
-            "ours is not the node block's order from its cursor: row {i} is {} where the node \
-             has {k}",
-            rk(r)
-        ));
+            .map(|(i, (r, k))| (i, rk(r), k.clone()))
+    };
+    if let Some((i, r, k)) = differs(want) {
+        if reversed.len() != p.a.len() || differs(&reversed).is_some() {
+            return Err(format!(
+                "ours is not the node block's order from its cursor, nor its reverse: row {i} \
+                 is {r} where the node has {k}"
+            ));
+        }
     }
     let held: std::collections::HashSet<&str> = node.iter().map(String::as_str).collect();
     if let Some(r) = p.b.iter().find(|r| !held.contains(rk(r).as_str())) {
@@ -4050,6 +5924,21 @@ impl Ctx {
         b: &mut Answer,
         st: &mut Reads,
     ) -> Option<DiffEntry> {
+        self.gql_transfer_order_keys(ta, a, b, st, ORDER_INDEX_READS)
+            .await
+    }
+
+    /// [`Ctx::gql_transfer_order`] over at most `cap` request keys. R-P5P9-105 (H8 in H7):
+    /// H7's window pass maps every oracle row (`usize::MAX`), each read within the
+    /// compare's node cap and the run's budget.
+    pub(crate) async fn gql_transfer_order_keys(
+        &self,
+        ta: &Target,
+        a: &Answer,
+        b: &mut Answer,
+        st: &mut Reads,
+        cap: usize,
+    ) -> Option<DiffEntry> {
         let mut da = a.body.get("data")?.clone();
         let ca = crate::graphql::root_connection(&mut da)?;
         let transfer = |e: &Value| {
@@ -4082,7 +5971,7 @@ impl Ctx {
         }
         let mut evidence = Vec::new();
         let mut reads = 0;
-        for (rk, id) in keys.into_iter().take(ORDER_INDEX_READS) {
+        for (rk, id) in keys.into_iter().take(cap) {
             let chain = match id.chain {
                 Some(c) => Some(c),
                 None => self.h7_chain(ta, &id, st).await,
@@ -4196,6 +6085,77 @@ pub fn payload_data_txs(v: &Value) -> Vec<(String, Option<u8>, String)> {
     let mut out = Vec::new();
     walk(v, &mut String::new(), &mut out);
     out
+}
+
+/// R-P5P9-105 (G): ours' rows' `cmd` subtrees are, in order, the first commands of the
+/// node's block `payload` in reverse order, or else in its forward order. `Err`: why not.
+fn prefix_in_node_order(payload: &Value, cmds: &[Value]) -> Result<(), String> {
+    let node: Vec<Option<Value>> = payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("the payload holds no transaction list")?
+        .iter()
+        .map(|t| {
+            let raw = kdx_types::hash::b64url_decode(t.get(0)?.as_str()?).ok()?;
+            let w: Value = serde_json::from_slice(&raw).ok()?;
+            serde_json::from_str(w.get("cmd")?.as_str()?).ok()
+        })
+        .collect();
+    if let Some(f) = cmds
+        .iter()
+        .find_map(|c| unchecked_field(Some(Kind::Tx), &json!({ "cmd": c })))
+    {
+        return Err(format!(
+            "ours' rows select {f}, which the node check does not read"
+        ));
+    }
+    let in_order = |order: &mut dyn Iterator<Item = &Option<Value>>| {
+        cmds.iter()
+            .zip(order)
+            .all(|(c, n)| n.as_ref().is_some_and(|n| cmd_mismatch(c, n).is_none()))
+    };
+    if cmds.len() <= node.len() && (in_order(&mut node.iter().rev()) || in_order(&mut node.iter()))
+    {
+        Ok(())
+    } else {
+        Err("ours' rows are not the node's block's first rows in reverse or forward order".into())
+    }
+}
+
+/// R-P5P9-95 m-4: ours' rows' `cmd` subtrees `cmds` matched one to one (a multiset) with
+/// the signed commands of the node's block `payload`, each by [`cmd_mismatch`] after
+/// [`unchecked_field`]. `Err`: why not.
+fn prefix_cmds_match(payload: &Value, cmds: &[Value]) -> Result<(), String> {
+    let mut node: Vec<Option<Value>> = payload
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("the payload holds no transaction list")?
+        .iter()
+        .map(|t| {
+            let raw = kdx_types::hash::b64url_decode(t.get(0)?.as_str()?).ok()?;
+            let w: Value = serde_json::from_slice(&raw).ok()?;
+            serde_json::from_str(w.get("cmd")?.as_str()?).ok()
+        })
+        .collect();
+    for c in cmds {
+        if let Some(f) = unchecked_field(Some(Kind::Tx), &json!({ "cmd": c })) {
+            return Err(format!("a row past the prefix: unchecked field: {f}"));
+        }
+        let hit = node
+            .iter()
+            .position(|n| n.as_ref().is_some_and(|n| cmd_mismatch(c, n).is_none()));
+        match hit {
+            Some(i) => node[i] = None,
+            None => {
+                return Err(
+                    "a row past the prefix whose cmd is no unmatched command of the \
+                    node's block"
+                        .into(),
+                )
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The node's command for `rk` (decoded) from its block's payload with outputs.
@@ -4624,6 +6584,56 @@ impl Ctx {
 #[cfg(test)]
 mod tests {
 
+    /// R-P5P9-86 T (`tokenId`): null against a fungible TRANSFER, the token against a
+    /// marmalade one (token, sender, receiver, amount); a wrong token matches no event. A
+    /// null `tokenId` is a checked field.
+    #[test]
+    fn e2_t_token_id_against_the_nodes_transfer() {
+        let coin =
+            json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": ["s", "r", 1.5]});
+        let nft = json!({"name": "TRANSFER", "module": {"name": "ledger", "namespace": "marmalade-v2"},
+            "params": ["t:abc", "s", "r", 1.0]});
+        let row = |t: Value| {
+            json!({"senderAccount": "s", "receiverAccount": "r", "amount": 1.5,
+            "tokenId": t})
+        };
+        assert!(transfer_matches(&row(Value::Null), &coin, false));
+        assert!(!transfer_matches(&row(json!("t:abc")), &coin, false));
+        let nrow = |t: Value| {
+            json!({"senderAccount": "s", "receiverAccount": "r", "amount": 1.0,
+            "tokenId": t})
+        };
+        assert!(transfer_matches(&nrow(json!("t:abc")), &nft, false));
+        assert!(!transfer_matches(&nrow(json!("t:xyz")), &nft, false));
+        assert!(!transfer_matches(&nrow(Value::Null), &nft, false));
+        // Not selected: as before.
+        let plain = json!({"senderAccount": "s", "receiverAccount": "r", "amount": 1.5});
+        assert!(transfer_matches(&plain, &coin, false));
+        let n = json!({"__typename": "Transfer", "requestKey": "k", "tokenId": null,
+            "senderAccount": "s"});
+        assert_eq!(unchecked_field(Some(Kind::Transfer), &n), None);
+    }
+
+    /// R-P5P9-86 T (`crossChainTransfer.senderAccount`): the receiving half's sender is the
+    /// sending leg's receiver on the node, the empty account; any other value is refused.
+    #[test]
+    fn e2_t_cross_chain_sender_is_the_sending_legs_receiver() {
+        let mut v = Verdict::new(Canon::Yes, Some(10), Some("B".into()), "placed");
+        // R-P5P9-95 m-2: coin's transfer (the node's events name their module).
+        v.event = Some(json!({"name": "TRANSFER", "module": {"name": "coin"},
+            "params": ["s", "", 1.0]}));
+        v.xchain = vec![json!({"name": "TRANSFER_XCHAIN", "params": ["s", "r", 1.0, "2"]})];
+        let x = |sender: &str| {
+            json!({"chainId": "2", "receiverAccount": "r",
+            "senderAccount": sender})
+        };
+        assert_eq!(xchain_mismatch(&x(""), &v), None);
+        let why = xchain_mismatch(&x("s"), &v).unwrap_or_default();
+        assert!(why.contains("senderAccount"), "{why}");
+        let n = json!({"__typename": "Transfer", "requestKey": "k", "crossChainTransfer": x("")});
+        assert_eq!(unchecked_field(Some(Kind::Transfer), &n), None);
+    }
+
     /// R-P5P9-71 (3): `cmd.payload`'s `__typename` passes only as the union member its own
     /// fields name; with neither `code` nor a continuation field it is unknown and refused.
     #[test]
@@ -4643,10 +6653,9 @@ mod tests {
                 json!({"__typename": "ContinuationPayload", "code": "(+ 1 2)"}),
                 Some("cmd.payload.__typename"),
             ),
-            (
-                json!({"__typename": "ExecutionPayload"}),
-                Some("cmd.payload.__typename"),
-            ),
+            // R-P5P9-86 T: a payload with no field of its member is checked against the
+            // node and the document by [`bare_payload_mismatch`], not here.
+            (json!({"__typename": "ExecutionPayload"}), None),
             (
                 json!({"__typename": "Signer", "code": "x"}),
                 Some("cmd.payload.__typename"),
@@ -4744,7 +6753,7 @@ mod tests {
             rk: Some("k".into()),
             index,
             ctime: None,
-            encoded_rk: None,
+            coinbase: false,
         };
         let poll = |b: &str, h: u64, evs: Value| json!({"metaData": {"blockHash": b, "blockHeight": h}, "events": evs});
         let xfer = json!({"name": "TRANSFER", "params": ["s", "r", {"decimal": "1.50"}]});
@@ -4763,10 +6772,12 @@ mod tests {
             poll_verdict(&id(None, Some(9), Some(0)), &n, &p, false, None).canon,
             Canon::Unknown
         );
+        // R-P5P9-86 NC: the node's block for the key is the row's, so the node's transaction
+        // lacking the row leaves it unsettled, never "not canonical".
         let p2 = poll("B", 9, json!([other]));
         assert_eq!(
             poll_verdict(&id(None, Some(9), None), &n, &p2, false, None).canon,
-            Canon::No
+            Canon::Unknown
         );
         // A coinbase row: the only header at its height and its coinbase request key.
         let cb = |rk: &str| {
@@ -4816,6 +6827,31 @@ mod tests {
         );
         assert!(parse_utc("2024-03-01 00:00:01Z").is_none());
         assert!(parse_utc("2024-13-01T00:00:01Z").is_none());
+    }
+
+    /// R-P5P9-88 (F): a bare root list (no `pageInfo`) reads as a connection, its
+    /// `hasNextPage` from the page's fullness; another root or an own `pageInfo` is left.
+    #[test]
+    fn h_f_a_bare_root_list_reads_as_a_connection() {
+        let page = |n: usize| {
+            json!({"transfers": {"edges": (0..n).map(|i| json!({"node": {"i": i}}))
+                .collect::<Vec<_>>()}})
+        };
+        let mut full = page(60);
+        bare_page_info(&mut full, "transfers", 60);
+        let c = crate::graphql::root_connection(&mut full).expect("a connection");
+        assert_eq!(c.pointer("/pageInfo/hasNextPage"), Some(&json!(true)));
+        let mut short = page(12);
+        bare_page_info(&mut short, "transfers", 60);
+        let c = crate::graphql::root_connection(&mut short).expect("a connection");
+        assert_eq!(c.pointer("/pageInfo/hasNextPage"), Some(&json!(false)));
+        // Another root, or a list that already selects pageInfo, is left as it is.
+        let mut other = page(3);
+        bare_page_info(&mut other, "blocks", 60);
+        assert!(crate::graphql::root_connection(&mut other).is_none());
+        let mut own = json!({"transfers": {"edges": [], "pageInfo": {"hasNextPage": true}}});
+        bare_page_info(&mut own, "transfers", 60);
+        assert_eq!(own["transfers"]["pageInfo"], json!({"hasNextPage": true}));
     }
 
     /// R-P5P9-81 (m-1): the settle counts list the four named classes always, any other
@@ -4877,5 +6913,57 @@ mod tests {
             root_args("{ x: transfers(first: 1) { a } }", "transfers"),
             None
         );
+    }
+
+    /// R-P5P9-95 m-1: a named spread (or a fragment on a payload member) hides which member
+    /// the document selects: unknown, so a bare payload is refused.
+    #[test]
+    fn f_m1_named_spreads_leave_the_payload_members_unknown() {
+        let inline = "query Q { transactions { edges { node { cmd { payload { \
+                      ... on ContinuationPayload { pactId } } } } } } }";
+        assert_eq!(payload_members(inline), Some((false, true)));
+        let named = "query Q { transactions { edges { node { cmd { payload { \
+                     ... on ContinuationPayload { pactId } ...ExecFields } } } } } } \
+                     fragment ExecFields on ExecutionPayload { code }";
+        assert_eq!(payload_members(named), None);
+    }
+
+    /// R-P5P9-95 m-2: `crossChainTransfer.senderAccount` is checked only for coin's
+    /// transfer; another module's is refused.
+    #[test]
+    fn f_m2_cross_chain_sender_only_for_coin() {
+        let mut v = Verdict::new(Canon::Yes, Some(10), Some("B".into()), "placed");
+        v.event = Some(json!({"name": "TRANSFER", "module": {"name": "coin"},
+            "params": ["s", "", 1.0]}));
+        v.xchain = vec![json!({"name": "TRANSFER_XCHAIN", "params": ["s", "r", 1.0, "2"]})];
+        let x = json!({"chainId": "2", "receiverAccount": "r", "senderAccount": ""});
+        assert_eq!(xchain_mismatch(&x, &v), None);
+        v.event = Some(json!({"name": "TRANSFER", "module": {"name": "my-token"},
+            "params": ["s", "", 1.0]}));
+        let why = xchain_mismatch(&x, &v).unwrap_or_default();
+        assert!(why.contains("senderAccount"), "{why}");
+    }
+
+    /// R-P5P9-95 m-3: a marmalade TRANSFER (token, sender, receiver, amount) is read past its
+    /// token: a null `crossChainTransfer` is refused when the node's tx holds the
+    /// TRANSFER_XCHAIN for it.
+    #[test]
+    fn f_m3_marmalade_transfers_in_the_cross_chain_check() {
+        let mut v = Verdict::new(Canon::Yes, Some(10), Some("B".into()), "placed");
+        v.event = Some(json!({"name": "TRANSFER", "params": ["t:1", "s", "", 1.0]}));
+        v.xchain = vec![json!({"name": "TRANSFER_XCHAIN",
+            "params": ["t:1", "s", "r", 1.0, "2"]})];
+        let why = xchain_mismatch(&Value::Null, &v).unwrap_or_default();
+        assert!(why.contains("crossChainTransfer is null"), "{why}");
+    }
+
+    /// R-P5P9-95 m-7: NC's equivalence takes ours' `info` "" or the node's text, nothing else.
+    #[test]
+    fn f_m7_bad_result_info_is_empty_or_the_nodes() {
+        let node = json!({"message": "m", "info": "<toplevel>:0"});
+        let ours = |info: &str| json!({"message": "m", "info": info}).to_string();
+        assert!(bad_result_is(&json!(ours("")), Some(&node)));
+        assert!(bad_result_is(&json!(ours("<toplevel>:0")), Some(&node)));
+        assert!(!bad_result_is(&json!(ours("other")), Some(&node)));
     }
 }

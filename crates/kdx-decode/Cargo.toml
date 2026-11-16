@@ -15,3 +15,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+proptest.workspace = true
+zstd.workspace = true

@@ -358,3 +358,46 @@ fn report(t: &Tally, json: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tally_tests {
+    use super::Tally;
+
+    /// Review M2 (P5): every era must verify. A legacy mismatch and a verified block whose
+    /// bit is clear fail the check, like any other mismatch or error; absent and clean
+    /// blocks do not.
+    #[test]
+    fn legacy_mismatches_and_unflagged_blocks_fail() {
+        let clean = Tally {
+            blocks: 10,
+            ok: 9,
+            absent: 1,
+            ..Default::default()
+        };
+        assert!(!clean.failed());
+        for t in [
+            Tally {
+                bad_legacy: 1,
+                ..Default::default()
+            },
+            Tally {
+                ok_unflagged: 1,
+                ..Default::default()
+            },
+            Tally {
+                bad_flagged: 1,
+                ..Default::default()
+            },
+            Tally {
+                bad_other: 1,
+                ..Default::default()
+            },
+            Tally {
+                errors: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(t.failed());
+        }
+    }
+}
