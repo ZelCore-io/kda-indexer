@@ -1,0 +1,2 @@
+# kdx: oracle
+query QFungibleChainAccount($accountName: String!, $chainId: String!, $fungibleName: String) { fungibleChainAccount(accountName: $accountName, chainId: $chainId, fungibleName: $fungibleName) { id chainId accountName balance guard { __typename ... on KeysetGuard { keys predicate } } } }

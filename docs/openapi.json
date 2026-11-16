@@ -46,11 +46,31 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1..=100, default 100",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque page cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "`items` of {module, chain, balance, guard, as_of_height, stale}, `as_of`"
+            "description": "`items` of {module, chain, balance, guard, as_of_height, stale}, `next_cursor`, `as_of`"
           }
         }
       }
@@ -631,11 +651,20 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "description": "Only this module's rows, if it is a confirmed fungible-v2 on the row's chain. Without it, only the `[balances] key_modules` (default `coin`)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "`items` of {account, modules: [{module, chain, balance, as_of_height, stale}]}, `next_cursor`, `as_of`"
+            "description": "`items` of {account, modules: [{module, chain, balance, as_of_height, stale, trusted}]}, `next_cursor`, `as_of`. `trusted`: the module is one of `key_modules`. A row proves only that the account's guard holds the key, not ownership: anyone can create an account guarded by someone else's key"
           }
         }
       }
@@ -1008,11 +1037,33 @@
         "tags": [
           "tokens"
         ],
-        "summary": "Every fungible token, by module name.",
+        "summary": "Fungible tokens by module name, paged (M-5): `limit` 1..=100 (default 20), `cursor` =\n`next_cursor`. Modules marked not fungible (R-P5P9-8 #2) are left out.",
         "operationId": "list",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "1..=100, default 20",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque page cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "`items` of {module, first_height, holders, holders_approx}, `as_of`"
+            "description": "`items` of {module, first_height, holders, holders_approx}, `next_cursor`, `as_of`"
           }
         }
       }

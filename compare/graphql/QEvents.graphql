@@ -1,0 +1,2 @@
+# kdx: oracle
+query QEvents($qualifiedEventName: String!, $chainId: String, $minHeight: Int, $maxHeight: Int, $first: Int, $after: String) { events(qualifiedEventName: $qualifiedEventName, chainId: $chainId, minHeight: $minHeight, maxHeight: $maxHeight, first: $first, after: $after) { totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id name qualifiedName orderIndex parameters block { hash height } requestKey } } } }

@@ -1,0 +1,2 @@
+# kdx: tip
+query QCompletedBlockHeights($chainIds: [String!], $first: Int) { completedBlockHeights(chainIds: $chainIds, heightCount: 3, first: $first) { pageInfo { hasNextPage } edges { node { height chainId hash } } } }

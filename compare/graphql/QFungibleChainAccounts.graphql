@@ -1,0 +1,2 @@
+# kdx: oracle
+query QFungibleChainAccounts($accountName: String!, $chainIds: [String!], $fungibleName: String) { fungibleChainAccounts(accountName: $accountName, chainIds: $chainIds, fungibleName: $fungibleName) { id chainId accountName balance } }

@@ -1,0 +1,2 @@
+# kdx: node-balance
+query NodeBalance($accountName: String!, $fungibleName: String) { fungibleAccount(accountName: $accountName, fungibleName: $fungibleName) { chainAccounts { chainId balance guard { __typename ... on KeysetGuard { keys predicate } } } } }

@@ -96,7 +96,9 @@ fn cached_count(view: &View) -> ApiResult<u64> {
 /// Network whose supply tables `crate::supply` holds.
 const SUPPLY_NETWORK: &str = "mainnet01";
 
-fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
+/// `(user tx count, coins in circulation)` as `/stats` answers them (GraphQL `networkInfo`
+/// reads the same).
+pub fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
     let Some(h) = view.max_indexed_height()? else {
         return Ok(None);
     };

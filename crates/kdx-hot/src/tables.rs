@@ -15,8 +15,9 @@
 //! | `Undo` | chain u8, height u32 | encoded `Vec<UndoOp>` (`undo.rs`) |
 //! | `Counters` | name (utf-8) | u64 |
 //!
-//! Additive tables (rule A-1, P6; layouts in `balances.rs`): `Balances`, `BalanceDirty`,
-//! `BalanceSeed`, `Guards`, `KeyAccounts`, `Tokens`, `NftBalances`, `NftDirty`. `HotStore::open` creates them;
+//! Additive tables (rule A-1, P6; layouts in `balances.rs` and `nft.rs`): `Balances`,
+//! `BalanceDirty`, `BalanceSeed`, `Guards`, `KeyAccounts`, `Tokens`, `NftBalances`, `NftDirty`,
+//! and `NftDetails` (P7, GQ-15). `HotStore::open` creates them;
 //! `open_ro` opens them when present, and a missing one reads as empty. They change no stored
 //! byte of the base tables or the segments, so they need no format version.
 //!
@@ -48,6 +49,7 @@ pub enum Table {
     Tokens,
     NftBalances,
     NftDirty,
+    NftDetails,
 }
 
 fn kind_name(k: DictKind) -> &'static str {
@@ -83,7 +85,7 @@ impl Table {
 
     /// Tables added after format v2 without a version bump (rule A-1): optional on a
     /// read-only open, empty when missing.
-    pub fn additive() -> [Table; 8] {
+    pub fn additive() -> [Table; 9] {
         [
             Table::Balances,
             Table::BalanceDirty,
@@ -93,6 +95,7 @@ impl Table {
             Table::Tokens,
             Table::NftBalances,
             Table::NftDirty,
+            Table::NftDetails,
         ]
     }
 
@@ -122,6 +125,7 @@ impl Table {
             Table::Tokens => "Tokens".into(),
             Table::NftBalances => "NftBalances".into(),
             Table::NftDirty => "NftDirty".into(),
+            Table::NftDetails => "NftDetails".into(),
         }
     }
 }

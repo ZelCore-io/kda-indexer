@@ -103,6 +103,11 @@ enum Command {
     /// Print the OpenAPI document of the native API (no config needed).
     #[command(hide = true)]
     Openapi,
+    /// GraphQL schema tools (no config needed; default limits).
+    Graphql {
+        #[command(subcommand)]
+        action: GraphqlAction,
+    },
     #[command(hide = true)]
     Tail {
         #[arg(long)]
@@ -212,6 +217,20 @@ enum HotAction {
         /// Also print a blake3 digest per table (replay checks).
         #[arg(long)]
         digest: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphqlAction {
+    /// Print the served schema (SDL) to stdout.
+    PrintSchema,
+    /// Validate each `*.graphql` operation document in DIR against the served schema and
+    /// limits (validation only, no resolver runs): `in-scope`, `invalid: ...` or `limit: ...`.
+    CheckOps {
+        dir: PathBuf,
+        /// One JSON array instead of text lines.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -370,6 +389,17 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", kdx_api::openapi::json());
         return Ok(());
     }
+    if let Command::Graphql { action } = &cli.command {
+        return match action {
+            GraphqlAction::PrintSchema => {
+                print!("{}", kda_indexer::cmd::graphql::print_schema());
+                Ok(())
+            }
+            GraphqlAction::CheckOps { dir, json } => {
+                kda_indexer::cmd::graphql::check_ops(dir, *json).await
+            }
+        };
+    }
     let cfg = Config::load(&cli.config)?;
     init_logging(&cfg.log);
     kdx_hot::nft::set_ledgers(cfg.nft.ledgers.clone());
@@ -385,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Openapi => Ok(()),
+        Command::Openapi | Command::Graphql { .. } => Ok(()),
         Command::Probe { smoke, out } => kda_indexer::cmd::probe::run(&cfg, smoke, out).await,
         Command::Dump {
             from,

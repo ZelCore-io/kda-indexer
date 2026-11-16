@@ -58,6 +58,28 @@ kind = "chainweb_data"
 # url = "http://127.0.0.1:31352"
 # kind = "kda_txs_via_cwd"
 
+# GraphQL (P7). A is the adapter (a `run` instance, `api.graphql`), B is the reference server
+# (`graphql_oracle`: HTTP POST only, its own limiter of at most 1 r/s with one request in
+# flight, heights up to max_height), the node ("node": tx fields vs /poll, block fields vs
+# /header, balances and guards vs /local details) or the native balances API (the internal pair).
+# Leave the oracle unset when there is none: the node and internal pairs still run.
+# pairs = [..., ["gql", "oracle"], ["gql", "node"], ["gql", "native"]]
+# [targets.gql]
+# url = "http://127.0.0.1:31363/graphql"
+# kind = "kda_indexer_graphql"
+# [targets.oracle]
+# url = "https://oracle.example/graphql"   # set in the local config only
+# kind = "graphql_oracle"
+# max_height = 6000000      # required: the oracle's stall height minus a margin
+# rate_rps = 1.0            # at most 1.0 whatever is set
+# insecure_tls = false      # true only for a self-signed internal endpoint
+#
+# [graphql]
+# ops_dir = "/var/lib/kda-indexer/compare-mainnet01/ops"   # captured client operations, never committed
+# own_ops_dir = "/usr/share/kda-indexer/compare/graphql"   # our own operations (written from the schema)
+# skip_ops = []
+# total_count_cap = 10000
+
 [mix]
 replay = 0.5
 random = 0.4

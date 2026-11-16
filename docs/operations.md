@@ -360,6 +360,13 @@ with `[balances] enabled = false`.
   through `/local`, re-checked every `[balances] recheck_hours`, default 24). Any other module's
   balances are stored and served, but its guard indexes no key, and its keyset references are
   not resolved.
+- **By-key listing** (SEC-2): `GET /keys/{pk}/accounts` lists only the modules in
+  `[balances] key_modules` (default `["coin"]`; each entry must be `name` or
+  `namespace.name`). A confirmed `fungible-v2` module still only proves the interface: its
+  `details` can report any balance under any key. Another module's rows are listed only when
+  a client asks with `?token=<module>`, and only on chains where that module is a confirmed
+  `fungible-v2`. Each row carries `trusted` (the module is in `key_modules`). Adding a module
+  to `key_modules` takes a restart of `serve`/`run`; the stored rows do not change.
 - **Not fungible**: a module whose `details` calls all fail in 3 batches in a row is marked
   not fungible: the tail stops marking it, its dirty rows are dropped without a call
   (`result="not_fungible"`) and `/tokens` hides it until the re-check `recheck_hours` later.
@@ -399,6 +406,16 @@ the rows of the unwound txs dirty, and the reconciler reads `NftDirty` rows with
 `({ledger}.get-balance (read-msg "t") (read-msg "a"))` (same `/local` budget and safety rules
 as balances) between its balance batches. `kda-indexer inspect nft-check --count 20
 --compare-node` samples stored rows and compares them with the node.
+
+For GraphQL (GQ-15) the reconciler also fills `NftDetails`: each loop walks up to 4,096
+`NftBalances` rows from a cursor that wraps, and makes at most 32 calls in the same `/local`
+budget. The calls are `({ledger}.details (read-msg "t") (read-msg "a"))` for a positive holding's
+guard and `({ledger}.get-token-info (read-msg "t"))` for its token's info. A row is read again
+once its balance row moves. An unusable answer is stored as failed until then, with no back-off.
+A node error stores nothing and, when it is the majority of a step's calls, the cursor stays.
+`reconcile-balances --status` prints `nft_details_rows`. On a store from before P7 the first `run` creates the
+table, and the first laps fill it; until then `guard`/`info` answer `NOT_AVAILABLE`. A `serve`
+opened before that `run` sees the table only after a restart, as with the P6 tables.
 
 - The fill records the ledger set it walked (`Meta nft_filled_ledgers`). A ledger added to
   `[nft] ledgers` later is walked on the next `run` start: only that ledger's events, from its

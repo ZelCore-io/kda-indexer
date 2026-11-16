@@ -1,0 +1,2 @@
+# kdx: node-block
+query NodeBlock($hash: String!) { block(hash: $hash) { hash height chainId creationTime epoch nonce weight target payloadHash parent { hash } } }

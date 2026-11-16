@@ -2,6 +2,7 @@
 //! v1 records and re-rendering them as node JSON.
 
 pub mod build;
+pub mod header;
 pub mod index;
 pub mod json;
 pub mod merkle;

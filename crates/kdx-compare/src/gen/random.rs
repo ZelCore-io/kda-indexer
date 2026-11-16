@@ -377,6 +377,35 @@ impl RandomGen {
     }
 }
 
+impl RandomGen {
+    /// The non-empty canonical blocks of one random window on one chain, at heights up to
+    /// `cap` (and the usual tip margin). Empty when no draw found one.
+    pub async fn draw_blocks(
+        &mut self,
+        cap: Option<u64>,
+    ) -> anyhow::Result<Vec<(Value, DecodedBlock)>> {
+        let mut top = self.tips.min_tip().saturating_sub(self.min_depth);
+        if let Some(c) = cap {
+            top = top.min(c);
+        }
+        anyhow::ensure!(top > WINDOW, "tips not known yet");
+        for _ in 0..MAX_DRAWS {
+            let h = self.rng.random_range(0..=top - WINDOW + 1);
+            let chains = self.graph.chains_at(h);
+            if chains.is_empty() {
+                continue;
+            }
+            let c = chains[self.rng.random_range(0..chains.len())];
+            let hi = (h + WINDOW - 1).min(top);
+            let full = self.draw_window(c, h, hi).await?;
+            if !full.is_empty() {
+                return Ok(full);
+            }
+        }
+        Ok(Vec::new())
+    }
+}
+
 impl Generator for RandomGen {
     async fn next(&mut self) -> anyhow::Result<Vec<Request>> {
         let top = self.tips.min_tip().saturating_sub(self.min_depth);

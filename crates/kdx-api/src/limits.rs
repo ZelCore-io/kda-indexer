@@ -266,7 +266,18 @@ impl RateLimiter {
         self.allow_at(ip, Instant::now())
     }
 
+    /// Take `n` tokens at once (a GraphQL batch of N takes N); none are taken when fewer
+    /// than `n` are left.
+    pub fn allow_n(&self, ip: IpAddr, n: u32) -> bool {
+        self.allow_n_at(ip, n, Instant::now())
+    }
+
     fn allow_at(&self, ip: IpAddr, now: Instant) -> bool {
+        self.allow_n_at(ip, 1, now)
+    }
+
+    fn allow_n_at(&self, ip: IpAddr, n: u32, now: Instant) -> bool {
+        let need = n.max(1) as f64;
         let (rate, burst) = (self.rate, self.burst);
         let mut g = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         let (main, over) = &mut *g;
@@ -276,8 +287,8 @@ impl RateLimiter {
         } else {
             tokens
         };
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
+        if *tokens >= need {
+            *tokens -= need;
             true
         } else {
             false
@@ -285,9 +296,115 @@ impl RateLimiter {
     }
 }
 
+/// One counter of a [`ConnLimiter`]: the client key (tag 0) or an IPv6 /48 (tag 1). The tag
+/// keeps a /64 whose bits 48..64 are zero apart from its own /48.
+type SlotKey = (u8, IpAddr);
+
+/// The IPv6 /48 of `ip` (a typical site allocation), `None` for an IPv4 client.
+fn prefix48(ip: IpAddr) -> Option<IpAddr> {
+    match bucket_key(ip) {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(v6) => Some(IpAddr::V6(Ipv6Addr::from(mask6(v6, 48)))),
+    }
+}
+
+/// Open slots per client (GraphQL websocket connections and subscriptions, GQ-9, M-2),
+/// keyed like the rate limiter ([`bucket_key`]: an IPv4 address, or the /64 of an IPv6
+/// address), and per IPv6 /48 as well, so one site cannot rotate /64s past the per-client
+/// cap. A slot is held by a [`ConnGuard`] and released when the guard drops (close, error
+/// or task end).
+pub struct ConnLimiter {
+    per_key: usize,
+    per_prefix: usize,
+    open: std::sync::Arc<Mutex<HashMap<SlotKey, usize>>>,
+}
+
+/// One open slot in a [`ConnLimiter`].
+pub struct ConnGuard {
+    keys: [Option<SlotKey>; 2],
+    open: std::sync::Arc<Mutex<HashMap<SlotKey, usize>>>,
+}
+
+impl ConnLimiter {
+    /// At most `per_key` slots per client key and `per_prefix` per IPv6 /48.
+    pub fn new(per_key: usize, per_prefix: usize) -> ConnLimiter {
+        ConnLimiter {
+            per_key,
+            per_prefix,
+            open: Default::default(),
+        }
+    }
+
+    /// A slot for `ip`, or `None` when its client key already holds `per_key` slots or its
+    /// /48 holds `per_prefix`.
+    pub fn try_acquire(&self, ip: IpAddr) -> Option<ConnGuard> {
+        let keys = [Some((0, bucket_key(ip))), prefix48(ip).map(|p| (1, p))];
+        let cap = |k: &SlotKey| {
+            if k.0 == 0 {
+                self.per_key
+            } else {
+                self.per_prefix
+            }
+        };
+        let mut m = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if keys
+            .iter()
+            .flatten()
+            .any(|k| m.get(k).copied().unwrap_or(0) >= cap(k))
+        {
+            return None;
+        }
+        for k in keys.iter().flatten() {
+            *m.entry(*k).or_insert(0) += 1;
+        }
+        Some(ConnGuard {
+            keys,
+            open: self.open.clone(),
+        })
+    }
+
+    /// Slots open for `ip`'s client key.
+    pub fn open(&self, ip: IpAddr) -> usize {
+        let m = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(&(0, bucket_key(ip))).copied().unwrap_or(0)
+    }
+
+    /// Slots open for `ip`'s IPv6 /48 (0 for an IPv4 client).
+    pub fn open_prefix(&self, ip: IpAddr) -> usize {
+        let m = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        prefix48(ip).map_or(0, |p| m.get(&(1, p)).copied().unwrap_or(0))
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut m = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        for k in self.keys.iter().flatten() {
+            if let Some(n) = m.get_mut(k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(k);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A GraphQL batch of N takes N tokens at once; a refusal takes none.
+    #[test]
+    fn allow_n_takes_all_or_nothing() {
+        let l = RateLimiter::new(1, 5);
+        let a: IpAddr = "198.51.100.7".parse().unwrap();
+        assert!(l.allow_n(a, 5));
+        assert!(!l.allow(a));
+        let b: IpAddr = "198.51.100.8".parse().unwrap();
+        assert!(!l.allow_n(b, 6));
+        assert!(l.allow_n(b, 5), "the refused batch took no tokens");
+    }
 
     #[test]
     fn internal_and_cidr() {
@@ -467,5 +584,54 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         assert!((0..3).all(|_| r.allow(ip)));
         assert!(!r.allow(ip));
+    }
+
+    #[test]
+    fn conn_limiter_counts_per_key_and_releases_on_drop() {
+        let l = ConnLimiter::new(2, 100);
+        let a: IpAddr = "2001:db8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8::2".parse().unwrap(); // same /64
+        let c: IpAddr = "192.0.2.7".parse().unwrap();
+        let g1 = l.try_acquire(a).unwrap();
+        let g2 = l.try_acquire(b).unwrap();
+        assert!(l.try_acquire(a).is_none());
+        assert!(l.try_acquire(c).is_some());
+        drop(g1);
+        let g3 = l.try_acquire(b).unwrap();
+        drop((g2, g3));
+        assert_eq!(l.open(a), 0);
+        assert!(l.open.lock().unwrap().is_empty());
+    }
+
+    /// M-2: /64s of one /48 share the /48's cap; another /48 and IPv4 clients do not.
+    #[test]
+    fn conn_limiter_caps_each_ipv6_48() {
+        let l = ConnLimiter::new(2, 3);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let a = l.try_acquire(ip("2001:db8:1:1::1")).unwrap();
+        let b = l.try_acquire(ip("2001:db8:1:2::1")).unwrap();
+        let c = l.try_acquire(ip("2001:db8:1:3::1")).unwrap();
+        // A fresh /64 of the same /48 is refused; one of another /48 is not.
+        assert!(l.try_acquire(ip("2001:db8:1:4::1")).is_none());
+        assert_eq!(l.open_prefix(ip("2001:db8:1:ffff::9")), 3);
+        let d = l.try_acquire(ip("2001:db8:2::1")).unwrap();
+        // A /64 whose bits 48..64 are zero is counted apart from its /48.
+        let e = l.try_acquire(ip("2001:db8:3::1")).unwrap();
+        assert_eq!(
+            (
+                l.open(ip("2001:db8:3::5")),
+                l.open_prefix(ip("2001:db8:3::5"))
+            ),
+            (1, 1)
+        );
+        let v4: Vec<_> = (0..2)
+            .map(|_| l.try_acquire(ip("192.0.2.1")).unwrap())
+            .collect();
+        assert!(l.try_acquire(ip("192.0.2.1")).is_none());
+        assert!(l.try_acquire(ip("192.0.2.2")).is_some());
+        drop(b);
+        let f = l.try_acquire(ip("2001:db8:1:4::1")).unwrap();
+        drop((a, c, d, e, f, v4));
+        assert!(l.open.lock().unwrap().is_empty());
     }
 }

@@ -1,0 +1,2 @@
+# kdx: tip
+query QLastBlockHeight { lastBlockHeight }

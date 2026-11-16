@@ -909,6 +909,7 @@ pub async fn run(
     }
     let local = LocalClient::new(node, o.local);
     let mut nft_cursor: Option<Vec<u8>> = None;
+    let mut details_cursor: Option<Vec<u8>> = None;
     let mut backoff: Option<Duration> = None;
     let mut retries: HashMap<[u8; 9], u32> = HashMap::new();
     let mut fails: HashMap<u32, u32> = HashMap::new();
@@ -949,13 +950,19 @@ pub async fn run(
         if nft.rows() > 0 {
             tracing::debug!(?nft, "nft: dirty rows reconciled");
         }
+        // NFT guards and token info for GraphQL (GQ-15), in the same budget: at most
+        // `nft_details::MAX_CALLS` calls per loop.
+        let det = crate::nft_details::step(&ctx.hot, &local, &mut details_cursor).await?;
+        if det.calls() > 0 {
+            tracing::debug!(?det, "nft: details read");
+        }
         let (h, n, share) = (ctx.hot.clone(), o.batch, o.caps.module_share);
         let batch = tokio::task::spawn_blocking(move || refill(&h, n, share)).await??;
         if batch.is_empty() {
             kdx_metrics::get()
                 .balance_dirty_rows
                 .set(balances::dirty_count(&ctx.hot.ro()?)? as i64);
-            if nft.rows() > nft.node_errors {
+            if nft.rows() > nft.node_errors || det.calls() > det.node_errors {
                 continue;
             }
             tokio::select! {

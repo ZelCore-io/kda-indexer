@@ -36,8 +36,12 @@ enum Cmd {
     },
     /// One request through the pipeline.
     Once {
-        #[arg(long)]
+        /// A REST path (compat routes), or with `--graphql` ignored.
+        #[arg(long, default_value = "")]
         path: String,
+        /// One GraphQL operation (file stem, e.g. `QBlock`) through every GraphQL pair.
+        #[arg(long)]
+        graphql: Option<String>,
         /// Debug: fetch A twice and diff it against itself.
         #[arg(long, hide = true)]
         against_self: bool,
@@ -52,6 +56,35 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Hold GraphQL subscriptions open (`graphql-transport-ws`) and check `newBlocks` items
+    /// against the node: duplicates, misses and delivery delay.
+    WsSoak {
+        /// `ws://host:port/graphql` of the adapter (a `run` instance).
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value_t = 1)]
+        conns: usize,
+        /// Subscriptions per connection, spread over the subscription kinds.
+        #[arg(long, default_value_t = 3)]
+        subs: usize,
+        #[arg(long, default_value_t = 5.0)]
+        minutes: f64,
+    },
+    /// R-P5P9-62: re-run the node-refereed rules (H7, H8, H9, `payload.data`) on the GraphQL
+    /// oracle-pair records a run left unexplained, from stored diff logs, with a node read
+    /// cap and rate. Prints per-class counts and every record still unexplained with its
+    /// evidence (JSON). Never asks the oracle. Exit 0 iff none is left unexplained.
+    Referee {
+        /// A diff log (`<out_dir>/diffs-YYYY-MM-DD.jsonl`); repeat for several days.
+        #[arg(long = "log", required = true)]
+        logs: Vec<PathBuf>,
+        /// Node reads for the whole run at most.
+        #[arg(long, default_value_t = kdx_compare::referee::DEFAULT_MAX_READS)]
+        max_reads: usize,
+        /// Node reads per second at most (single-row reads, one limiter).
+        #[arg(long, default_value_t = kdx_compare::referee::DEFAULT_RPS)]
+        rps: u32,
+    },
     /// Parse and validate the config, then print it.
     CheckConfig,
     /// P3 gate: per route and pair, requests compared, unexplained diffs, allowlisted hits,
@@ -61,8 +94,9 @@ enum Cmd {
         /// that start at or after it).
         #[arg(long)]
         since: String,
-        /// `must` (default), `should` (search, coins, balances) or `all`: the routes the
-        /// verdict covers.
+        /// `must` (default), `should` (search, coins, balances), `graphql`, `all` (must,
+        /// should and the graphql gate, which always runs) or `rest` (must and should only):
+        /// the routes the verdict covers.
         #[arg(long, default_value = "must")]
         routes: String,
         /// `small` (R3E-13: every phase gate) or `full` (500/200/50, the final validation).
@@ -78,7 +112,7 @@ enum Cmd {
         count: usize,
         #[arg(long)]
         print: bool,
-        /// Only this source: random, seeds or replay (default: the configured mix).
+        /// Only this source: random, seeds, replay or graphql (default: the configured mix).
         #[arg(long)]
         source: Option<String>,
     },
@@ -109,10 +143,51 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::Referee {
+            logs,
+            max_reads,
+            rps,
+        } => {
+            let opts = kdx_compare::referee::Opts {
+                logs,
+                max_reads,
+                rps,
+            };
+            let rep = kdx_compare::referee::run(cfg, &opts).await?;
+            println!("{}", serde_json::to_string_pretty(&rep)?);
+            if !rep.passed() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::WsSoak {
+            url,
+            conns,
+            subs,
+            minutes,
+        } => {
+            if !kdx_compare::graphql_ws::soak(&cfg, &url, conns, subs, minutes).await? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Cmd::Once {
+            graphql: Some(stem),
+            ..
+        } => {
+            for o in kdx_compare::graphql::once(cfg.clone(), &stem).await? {
+                println!("class={}", o.class);
+                if let Some(r) = o.record {
+                    println!("{}", serde_json::to_string_pretty(&r)?);
+                }
+            }
+            Ok(())
+        }
         Cmd::Once {
             path,
             against_self,
             mutate,
+            ..
         } => {
             let targets = Target::all(&cfg)?;
             let name = cfg.primary_target().context("no targets configured")?;
@@ -215,6 +290,9 @@ async fn gen_debug(
     print: bool,
     source: Option<&str>,
 ) -> anyhow::Result<()> {
+    if source == Some("graphql") {
+        return kdx_compare::graphql::gen_debug(cfg, count, print).await;
+    }
     let node = cfg.node_client()?;
     let targets = Target::all(cfg)?;
     let a = cfg

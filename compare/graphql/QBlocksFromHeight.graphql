@@ -1,0 +1,2 @@
+# kdx: oracle
+query QBlocksFromHeight($startHeight: Int!, $endHeight: Int, $chainIds: [String!], $first: Int, $after: String) { blocksFromHeight(startHeight: $startHeight, endHeight: $endHeight, chainIds: $chainIds, first: $first, after: $after) { pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id hash height chainId creationTime difficulty weight nonce epoch powHash target payloadHash } } } }

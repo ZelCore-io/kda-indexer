@@ -1,0 +1,2 @@
+# kdx: oracle
+query QTransactionsByAccount($accountName: String, $first: Int, $after: String) { transactions(accountName: $accountName, first: $first, after: $after) { totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id hash result { ... on TransactionResult { height gas block { hash height chainId } } } } } } }

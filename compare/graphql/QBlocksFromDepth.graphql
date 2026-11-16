@@ -1,0 +1,2 @@
+# kdx: tip
+query QBlocksFromDepth($minimumDepth: Int!, $chainIds: [String!], $first: Int) { blocksFromDepth(minimumDepth: $minimumDepth, chainIds: $chainIds, first: $first) { pageInfo { hasNextPage } edges { node { hash height chainId } } } }
