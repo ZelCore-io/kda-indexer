@@ -493,3 +493,96 @@ async fn h2_n_the_stored_records_reverse_order_arm() {
     let rep = n_referee(shuffled).await;
     assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Part 1's F and P #977, through their calling paths
+
+/// R-P5P9-97 F, through H7 and our longer read (part 1 tested the helper alone): the stored
+/// Transfers-8c8a0f56 shape, a root list without `pageInfo` and `first` 2. The oracle's w
+/// sits at our boundary height; our longer read (also without `pageInfo`) lists it after our
+/// page → explained. When our longer read lacks w, it stays unexplained.
+#[tokio::test]
+async fn h2_f_our_longer_read_without_page_info_through_h7() {
+    let r = |rk: &str| {
+        json!({"node": {"amount": 1.5, "requestKey": rk,
+            "block": {"height": 100, "chainId": "0"}}})
+    };
+    for (longer, explained) in [(vec!["u", "v", "w"], true), (vec!["u", "v"], false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = NodeMock::default();
+        for rk in ["u", "v", "w"] {
+            let (k, v) = h7_xfer_poll(rk, "B100", 100, "s", "r", json!(1.5));
+            node.polls.insert(k, v);
+        }
+        let nu = node_server(node).await;
+        let rows: Vec<Value> = longer.iter().map(|k| r(k)).collect();
+        let au =
+            ours_fn_server(move |_: &Value| json!({"data": {"transfers": {"edges": rows}}})).await;
+        let ops = c3_ops(dir.path());
+        let cfg = c3_cfg(&nu, &au, "http://127.0.0.1:9/graphql", dir.path(), &ops, "");
+        let page = |keys: &[&str]| json!({"data": {"transfers": {"edges": keys.iter().map(|k| r(k)).collect::<Vec<_>>()}}});
+        let rec = e2_stored(
+            "QH7",
+            json!({"first": 2}),
+            page(&["u", "v"]),
+            page(&["u", "w"]),
+            vec![DiffEntry {
+                path: "/data/transfers/edges/1/node/requestKey".into(),
+                kind: DiffKind::Changed,
+                a: Some(json!("v")),
+                b: Some(json!("w")),
+            }],
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        let want = if explained { (1, 0) } else { (0, 1) };
+        assert_eq!(
+            (rep.explained, rep.unexplained),
+            want,
+            "{longer:?}: {rep:?}"
+        );
+        assert!(
+            !format!("{rep:?}").contains("the read holds no list"),
+            "{rep:?}"
+        );
+    }
+}
+
+/// R-P5P9-97 P #977, through the referee (part 1 tested the helper alone): ours' first page
+/// answered `errors` (request deadline exceeded, TIMEOUT) with no data, stored as `/data`
+/// Type and `/errors` Extra, for a ruled P key → the first-page fault marker, a KNOWN-GAP P
+/// record. The same answer for an account outside P's keys stays unexplained.
+#[tokio::test]
+async fn h2_p_a_stored_first_page_error_through_the_referee() {
+    let key = "k:22fbc926b497bf3ecc7199b923039e74cdeda12726e1dc4f443953007cf8cc43";
+    for (acct, gap) in [(key, true), ("k:other", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = h2_cfg(NodeMock::default(), dir.path()).await;
+        let ours = json!({"data": null, "errors": [{"message": "request deadline exceeded",
+            "extensions": {"code": "TIMEOUT"}}]});
+        let oracle = json!({"data": {"transfers": {"totalCount": 1,
+            "pageInfo": {"hasNextPage": false}, "edges": []}}});
+        let rec = e2_stored(
+            "QH7",
+            json!({"accountName": acct, "first": 20}),
+            ours,
+            oracle,
+            vec![
+                DiffEntry {
+                    path: "/data".into(),
+                    kind: DiffKind::Type,
+                    a: Some(Value::Null),
+                    b: Some(json!({})),
+                },
+                DiffEntry {
+                    path: "/errors".into(),
+                    kind: DiffKind::Extra,
+                    a: Some(json!([])),
+                    b: None,
+                },
+            ],
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        let want = if gap { (1, 0) } else { (0, 1) };
+        assert_eq!((rep.known_gap, rep.unexplained), want, "{acct}: {rep:?}");
+    }
+}
