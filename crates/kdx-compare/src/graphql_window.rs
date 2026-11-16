@@ -106,6 +106,12 @@ pub const COUNT_WALK_BYTES: usize = 64 << 20;
 pub const COUNT_WALK_BYTES: usize = 4 << 20;
 /// R-P5P9-92 (2): ours' rows above the oracle's height that the count walk polls at most.
 pub const ABOVE_TIP_ROWS: usize = 50;
+/// R-P5P9-105 (W #2025): the referee's cap on those rows (the oracle is frozen and offline).
+pub const REFEREE_ABOVE_TIP_ROWS: usize = 2_000;
+/// R-P5P9-105 (W #2025): the referee's per-compare node cap, so that those rows can be read
+/// (a `/poll` and a header each) on top of [`NODE_READS`]. The run's `--max-reads` still
+/// caps the run.
+pub const REFEREE_NODE_READS: usize = NODE_READS + 2 * REFEREE_ABOVE_TIP_ROWS;
 /// R-P5P9-93: the widest query window (in heights) whose node counts the walk reads.
 pub const WINDOW_HEIGHTS: u64 = 100;
 
@@ -4926,12 +4932,16 @@ impl Ctx {
         above: &[(u64, Value)],
         st: &mut Reads,
     ) -> Result<(), (bool, String)> {
-        if above.len() > ABOVE_TIP_ROWS {
+        let cap = self
+            .gql
+            .above_tip_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if above.len() > cap {
             return Err((
                 true,
                 format!(
                     "rows above the oracle tip: capped: ours lists {} rows above the oracle's \
-                     height {max} (more than {ABOVE_TIP_ROWS})",
+                     height {max} (more than {cap})",
                     above.len()
                 ),
             ));
@@ -5162,9 +5172,13 @@ impl Ctx {
 
     /// Takes one node read from the compare's cap and the run's budget.
     pub(crate) fn h7_take(&self, st: &mut Reads) -> Result<(), String> {
-        if st.node >= NODE_READS {
+        let cap = self
+            .gql
+            .compare_reads
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if st.node >= cap {
             return Err(format!(
-                "the cap of {NODE_READS} node reads per compare is reached"
+                "the cap of {cap} node reads per compare is reached"
             ));
         }
         if !self.gql.take_node_read() {

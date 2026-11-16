@@ -495,6 +495,15 @@ pub(crate) fn referee_mode(ctx: &Ctx, max_reads: usize) {
         crate::graphql_window::REFEREE_COUNT_WALK_ROWS,
         Ordering::Relaxed,
     );
+    // R-P5P9-105 (W #2025): up to 2,000 rows above the frozen oracle's tip, each still
+    // node-canonical by `/poll` (live stays at 50).
+    ctx.gql.above_tip_rows.store(
+        crate::graphql_window::REFEREE_ABOVE_TIP_ROWS,
+        Ordering::Relaxed,
+    );
+    ctx.gql
+        .compare_reads
+        .store(crate::graphql_window::REFEREE_NODE_READS, Ordering::Relaxed);
 }
 
 /// R-P5P9-86 S′, the stored form: every entry is a `/chain<N>/balance` gap that

@@ -273,6 +273,85 @@ async fn e3b_tc_rows_above_the_oracle_tip_are_node_canonical_up_to_50() {
     }
 }
 
+/// R-P5P9-105 (W #2025): in referee mode the above-tip cap is 2,000 rows (the oracle is
+/// frozen, so ours' newer rows pile up above its tip). #2025's 392 rows above the tip, every
+/// one node-canonical, are explained; live, the same 392 stay capped at 50.
+#[tokio::test]
+async fn i_w_the_referee_polls_up_to_2000_rows_above_the_oracle_tip() {
+    let top = 7_000_001u64;
+    let above = 392usize;
+    for referee in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let ups: Vec<Value> = (0..above)
+            .map(|i| xrow(&format!("u{i}"), top, &format!("B{top}")))
+            .collect();
+        let mut ours = ups.clone();
+        ours.push(xrow("t2", 100, "B100"));
+        let n = ours.len() as u64;
+        let names: Vec<String> = (0..above).map(|i| format!("u{i}")).collect();
+        let mut keys = vec![("t2", 100u64)];
+        keys.extend(names.iter().map(|k| (k.as_str(), top)));
+        let nu = node_server(node_of(&keys, 0, &[])).await;
+        let au = ours_fn_server(walk(ours.clone(), n)).await;
+        let bu = ours_fn_server(walk(vec![xrow("t2", 100, "B100")], 1)).await;
+        let ops = c3_ops(dir.path());
+        let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.gql
+                .above_tip_rows
+                .load(std::sync::atomic::Ordering::Relaxed),
+            crate::graphql_window::ABOVE_TIP_ROWS
+        );
+        assert_eq!(
+            ctx.gql
+                .compare_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            crate::graphql_window::NODE_READS
+        );
+        if referee {
+            crate::referee::referee_mode(&ctx, 1_000_000);
+            assert_eq!(
+                ctx.gql
+                    .above_tip_rows
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                2_000
+            );
+        }
+        let op = ctx.gql.ops.iter().find(|o| o.stem == "QH7").unwrap();
+        let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+        let vars = h7_vars(&[("accountName", json!("s")), ("first", json!(100))]);
+        let (mut a, mut b) = (
+            answer(page(ours, n, false)),
+            answer(page(vec![xrow("t2", 100, "B100")], 1, false)),
+        );
+        let (d, note) = ctx
+            .gql_rules(ta, H6::Live(tb), op, &vars, &mut a, &mut b, 7_000_000)
+            .await;
+        let un = c3_unexplained(&ctx, &d);
+        let case = format!("referee {referee}: {un:?} {note:?}");
+        if referee {
+            assert!(un.is_empty(), "{case}");
+            let w = d
+                .iter()
+                .find(|e| e.path == crate::graphql_window::COUNT_WALK_PATH)
+                .expect("the walk's hit");
+            assert_eq!(
+                w.a.as_ref().unwrap()["aboveOracleTip"],
+                json!(392),
+                "{case}"
+            );
+        } else {
+            assert!(
+                note.unwrap_or_default()
+                    .contains("rows above the oracle tip: capped"),
+                "{case}"
+            );
+        }
+    }
+}
+
 /// R-P5P9-92 (2) with R-P5P9-87, the stored form: the record's height (7,000,001, ours'
 /// highest stored row) is above the oracle's (7,000,000). Ours' row there was in ours'
 /// count at the time and is polled node-canonical; ours' newer row at 7,000,009 (above the

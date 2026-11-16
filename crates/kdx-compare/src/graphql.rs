@@ -554,6 +554,13 @@ pub struct GqlState {
     /// [`crate::graphql_window::COUNT_WALK_ROWS`]; the referee raises it to
     /// [`crate::graphql_window::REFEREE_COUNT_WALK_ROWS`] (the oracle is frozen and offline).
     pub walk_rows: AtomicUsize,
+    /// R-P5P9-105 (W #2025): ours' rows above the oracle's tip that the count walk polls at
+    /// most: live [`crate::graphql_window::ABOVE_TIP_ROWS`]; the referee raises it to
+    /// [`crate::graphql_window::REFEREE_ABOVE_TIP_ROWS`].
+    pub above_tip_rows: AtomicUsize,
+    /// Node reads one compare's H7 may make: live [`crate::graphql_window::NODE_READS`]; the
+    /// referee raises it to [`crate::graphql_window::REFEREE_NODE_READS`] (R-P5P9-105).
+    pub compare_reads: AtomicUsize,
     /// The client and limiter of H7's header-by-hash reads (R-P5P9-63 (5), R-P5P9-65 (2)).
     header: std::sync::OnceLock<(reqwest::Client, Arc<crate::target::Limiter>)>,
 }
@@ -586,6 +593,8 @@ impl GqlState {
             local: std::sync::OnceLock::new(),
             node_budget: AtomicUsize::new(usize::MAX),
             walk_rows: AtomicUsize::new(crate::graphql_window::COUNT_WALK_ROWS),
+            above_tip_rows: AtomicUsize::new(crate::graphql_window::ABOVE_TIP_ROWS),
+            compare_reads: AtomicUsize::new(crate::graphql_window::NODE_READS),
             header: std::sync::OnceLock::new(),
         })
     }
