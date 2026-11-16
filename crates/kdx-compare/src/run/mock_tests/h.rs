@@ -176,6 +176,72 @@ async fn h_r98_exact_decimal_equality_stored() {
     assert_eq!((rep.explained, rep.unexplained), (0, 2), "{rep:?}");
 }
 
+/// R-P5P9-105 (decimal chain): the X arm reads the row's chain from `block.chainId` or a
+/// top-level `chainId`, as a string or a JSON number. The Transfers-f3be2db0 shape (#531:
+/// `block { chainId height }`, chain a number) and the QTransfersByAccount shape (#744:
+/// top-level `chainId` 0 and a Transfer relay id) are explained on the node; a row that
+/// names no chain anywhere stays unexplained.
+#[tokio::test]
+async fn i_x_the_decimal_arm_reads_the_chain_as_a_number_or_nested() {
+    use crate::report::{DiffEntry, DiffKind};
+    let nested = |amount: &str| {
+        json!({"cursor": "c", "node": {"amount": amount,
+            "block": {"chainId": 0, "height": 100}, "requestKey": "x1",
+            "senderAccount": "s", "receiverAccount": "r"}})
+    };
+    let relay = kdx_types::hash::b64url_encode(br#"Transfer:["B100","0","0","coin","x1"]"#);
+    let top = move |amount: &str| {
+        json!({"cursor": "c", "node": {"id": relay, "amount": amount, "chainId": 0,
+            "blockHash": "B100", "orderIndex": 0, "requestKey": "x1",
+            "senderAccount": "s", "receiverAccount": "r"}})
+    };
+    let none = |amount: &str| {
+        json!({"cursor": "c", "node": {"amount": amount, "blockHash": "B100",
+            "requestKey": "x1", "senderAccount": "s", "receiverAccount": "r"}})
+    };
+    type Shape = Box<dyn Fn(&str) -> Value>;
+    let shapes: [(&str, Shape, usize); 3] = [
+        ("nested number", Box::new(nested), 1),
+        ("top-level number", Box::new(top), 1),
+        ("no chain", Box::new(none), 0),
+    ];
+    for (name, row, explained) in shapes {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(r98_node()).await;
+        let ops = c3_ops(dir.path());
+        let cfg = c3_cfg(
+            &nu,
+            "http://127.0.0.1:9/graphql",
+            "http://127.0.0.1:9/graphql",
+            dir.path(),
+            &ops,
+            "",
+        );
+        let page = |amount: &str| {
+            json!({"data": {"transfers": {"totalCount": 1, "pageInfo": {"hasNextPage": false},
+                "edges": [row(amount)]}}})
+        };
+        let rec = e2_stored(
+            "QH7",
+            json!({"first": 20}),
+            page("14988"),
+            page("14988.000000000000"),
+            vec![DiffEntry {
+                path: "/data/transfers/edges/0/node/amount".into(),
+                kind: DiffKind::Changed,
+                a: Some(json!("14988")),
+                b: Some(json!("14988.000000000000")),
+            }],
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!(rep.explained, explained, "{name}: {rep:?}");
+        if explained == 0 {
+            let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+            assert!(still.contains("selects no chain"), "{name}: {still}");
+        }
+    }
+}
+
 /// R-P5P9-97 W, M #2046 and X: our QTransfersByAccount document selects each row's chain
 /// and height (the oracle's schema has both), so the count walk can bound ours' rows and
 /// the X arm can read the node's TRANSFER.

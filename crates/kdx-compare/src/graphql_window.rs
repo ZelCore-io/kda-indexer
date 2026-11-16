@@ -379,6 +379,24 @@ pub fn oracle_coinbase_form(k: &str, hd: &Value) -> Option<&'static str> {
     (own.is_some() && own.as_deref() == at("hash")).then_some("base64 of the block's own hash")
 }
 
+/// R-P5P9-105 (decimal chain): a chain id as text, as a JSON number's text, or as the
+/// normalized number (`#<digits>e<exp>`) a JSON number becomes in a compared body.
+fn chain_of_text(c: &str) -> Option<u8> {
+    if let Ok(n) = c.parse() {
+        return Some(n);
+    }
+    let (neg, d, e) = crate::graphql_norm::decimal_value(&Value::String(c.to_string()))?;
+    let d = d.trim_start_matches('0');
+    if d.is_empty() {
+        return Some(0);
+    }
+    if neg || e < 0 {
+        return None;
+    }
+    let exp = usize::try_from(e).ok()?;
+    format!("{d}{}", "0".repeat(exp.min(3))).parse().ok()
+}
+
 /// The identity of a root list row (`edges[i]`) in the shapes the operations select.
 pub fn row_id(e: &Value) -> RowId {
     let n = e.get("node").unwrap_or(&Value::Null);
@@ -441,7 +459,7 @@ pub fn row_id(e: &Value) -> RowId {
         "/cmd/meta/chainId",
     ])
     .or(id_chain)
-    .and_then(|c| c.parse().ok());
+    .and_then(|c| chain_of_text(&c));
     let index = matches!(kind, Some(Kind::Transfer | Kind::Event))
         .then(|| get(&["/orderIndex"]).or(id_index))
         .flatten()
