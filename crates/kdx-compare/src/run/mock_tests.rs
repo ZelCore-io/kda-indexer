@@ -20,6 +20,7 @@ mod e2b;
 mod e3b;
 mod g;
 mod h;
+mod h2;
 
 /// The node: every chain's cut at `tip`, the canonical hash per (chain, height) and the block
 /// `/poll` puts each request key in. Every path asked is logged.

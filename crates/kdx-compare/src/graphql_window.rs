@@ -3204,13 +3204,25 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                 // R-P5P9-86 M: an orphan by height only when ours lists the row at the node's
                 // block for the key.
                 let by_height = vj.is_some_and(|v| v.why.contains(HEIGHT_ORPHAN));
+                // R-P5P9-97 M #1997: ours' row that selects no block hash and was paired (so not
+                // read) lists the key at the node's block when it sits on the node's chain at
+                // the node's height for the key.
                 let ours_at_node = p.a.iter().zip(va).any(|(ra, x)| {
                     ra.id.rk == rb.id.rk
-                        && x.as_ref().is_some_and(|x| {
-                            x.canon == Canon::Yes
-                                && x.block.is_some()
-                                && x.block == vj.and_then(|v| v.block.clone())
-                        })
+                        && match x {
+                            Some(x) => {
+                                x.canon == Canon::Yes
+                                    && x.block.is_some()
+                                    && x.block == vj.and_then(|v| v.block.clone())
+                            }
+                            None => vj.is_some_and(|v| {
+                                ra.id.block.is_none()
+                                    && ra.id.height.is_some()
+                                    && ra.id.height == v.height
+                                    && ra.id.chain.is_some()
+                                    && ra.id.chain == v.chain
+                            }),
+                        }
                 });
                 if by_height && !ours_at_node {
                     d.undecided.push(format!(
