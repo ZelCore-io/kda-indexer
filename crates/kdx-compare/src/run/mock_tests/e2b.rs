@@ -810,6 +810,164 @@ async fn i_g_a_height_range_root_without_first_runs_the_g_arm() {
     }
 }
 
+/// R-P5P9-108 (M1): #70's stored shape with H6's own unfinished entry (`b: Some`, as a
+/// live run records it when a list read failed) is not explained: G's `cutBoth` settles only
+/// its own entry (`b: None`), never H6's. The same record without H6's entry is explained.
+#[tokio::test]
+async fn j_m1_a_stored_h6_entry_stays_unexplained_beside_a_cut_both_hit() {
+    let page = |prices: &[String]| {
+        let txs: Vec<Value> = prices
+            .iter()
+            .map(|p| json!({"node": {"cmd": {"meta": {"gasPrice": p}}}}))
+            .collect();
+        json!({"data": {"blocksFromHeight": {"edges": [{"node": {"chainId": 0,
+            "creationTime": "2026-11-15T09:00:00Z", "height": 58, "hash": "H0",
+            "canonical": true, "transactions": {"totalCount": 126, "edges": txs}}}]}}})
+    };
+    let fwd: Vec<String> = (0..126).map(|i| format!("{i}e-8")).collect();
+    let rev: Vec<String> = fwd.iter().rev().cloned().collect();
+    let list = "/data/blocksFromHeight/edges/0/node/transactions";
+    for (with_h6, explained) in [(false, 1usize), (true, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(g_node(126)).await;
+        let ops = dir.path().join("ops");
+        std::fs::create_dir_all(&ops).unwrap();
+        std::fs::write(
+            ops.join("QG70.graphql"),
+            "# kdx: oracle\nquery QG70($s: Int!, $e: Int) { blocksFromHeight(startHeight: $s, \
+             endHeight: $e) { edges { node { chainId creationTime height hash canonical \
+             transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }\n",
+        )
+        .unwrap();
+        let cfg = c3_cfg(&nu, &nu, &nu, dir.path(), &ops, "");
+        let mut diff: Vec<DiffEntry> = (0..20)
+            .map(|i| DiffEntry {
+                path: format!("{list}/edges/{i}/node/cmd/meta/gasPrice"),
+                kind: DiffKind::Changed,
+                a: Some(json!(rev[i])),
+                b: Some(json!(fwd[i])),
+            })
+            .collect();
+        if with_h6 {
+            diff.push(DiffEntry {
+                path: crate::graphql_scope::UNFINISHED_PATH.into(),
+                kind: DiffKind::Changed,
+                a: Some(json!({"lists": [{"list": list, "why": "a page answered errors"}]})),
+                b: Some(json!({"lists": []})),
+            });
+        }
+        let rec = e2_stored(
+            "QG70",
+            json!({"s": 58, "e": 58}),
+            page(&rev[..20]),
+            page(&fwd[..20]),
+            diff,
+        );
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!(rep.explained, explained, "h6 entry {with_h6}: {rep:?}");
+    }
+}
+
+/// A server for #70's shape in the live compare: the first read answers `first` (the root
+/// list, nested lists cut at 20 of 126), the harness's own list read (`block(hash:)`) answers
+/// `list` as one page of rows with a key each, or an error when `list` is `None`.
+async fn j_live_server(first: Value, list: Option<Vec<String>>) -> String {
+    ours_fn_server(move |req: &Value| {
+        if req["query"].as_str().is_some_and(|q| q.contains("block(hash")) {
+            let Some(rows) = &list else {
+                return json!({"errors": [{"message": "cursor past the first page"}]});
+            };
+            let edges: Vec<Value> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    json!({"node": {"cmd": {"meta": {"gasPrice": p}}}, "kdxKey": {"hash": format!("k{i}")}})
+                })
+                .collect();
+            return json!({"data": {"block": {"c": {"pageInfo": {"hasNextPage": false,
+                "endCursor": null}, "edges": edges}}}});
+        }
+        first.clone()
+    })
+    .await
+}
+
+/// R-P5P9-108 (M3): #70's shape in the live compare (`gql_rules` with `H6::Live`): a root
+/// `blocksFromHeight(startHeight, endHeight)` with no `first` and no `pageInfo`, each block's
+/// nested `transactions` cut at 20 of 126 on both sides.
+/// - H6 reads both lists to the end: ours' 126 rows against the oracle's, in another order:
+///   explained.
+/// - The oracle's list read fails: H6's own unfinished entry stays (R-P5P9-106 1), so the
+///   record stays unexplained, and the G arm still ran live: its prefix hit is in the diff,
+///   made from the node's block through counted reads (live caps unchanged).
+/// - The oracle's full list holds a row not in ours': unexplained.
+#[tokio::test]
+async fn j_m3_the_live_compare_runs_the_g_range_arm() {
+    let page = |prices: &[String]| {
+        let txs: Vec<Value> = prices
+            .iter()
+            .map(|p| json!({"node": {"cmd": {"meta": {"gasPrice": p}}}}))
+            .collect();
+        json!({"data": {"blocksFromHeight": {"edges": [{"node": {"chainId": 0,
+            "creationTime": "2026-11-15T09:00:00Z", "height": 58, "hash": "H0",
+            "canonical": true, "transactions": {"totalCount": 126, "edges": txs}}}]}}})
+    };
+    let fwd: Vec<String> = (0..126).map(|i| format!("{i}e-8")).collect();
+    let rev: Vec<String> = fwd.iter().rev().cloned().collect();
+    let mut stray = fwd.clone();
+    stray[7] = "999e-8".into();
+    // (the oracle's first page, its list read, explained, H6's entry, the G hit)
+    for (case, first, oracle_list, explained, h6_entry) in [
+        ("both listed", fwd.clone(), Some(fwd.clone()), true, false),
+        ("oracle's read fails", fwd.clone(), None, false, true),
+        (
+            "a row not in ours'",
+            stray.clone(),
+            Some(stray.clone()),
+            false,
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let nu = node_server(g_node(126)).await;
+        let au = j_live_server(page(&rev[..20]), Some(rev.clone())).await;
+        let bu = j_live_server(page(&first[..20]), oracle_list).await;
+        let ops = dir.path().join("ops");
+        std::fs::create_dir_all(&ops).unwrap();
+        std::fs::write(
+            ops.join("QG70.graphql"),
+            "# kdx: oracle\nquery QG70($s: Int!, $e: Int) { blocksFromHeight(startHeight: $s, \
+             endHeight: $e) { edges { node { chainId creationTime height hash canonical \
+             transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }\n",
+        )
+        .unwrap();
+        let cfg = c3_cfg(&nu, &au, &bu, dir.path(), &ops, "");
+        let ctx = Ctx::new(cfg).await.unwrap();
+        let op = ctx.gql.ops.iter().find(|o| o.stem == "QG70").unwrap();
+        let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+        let vars = h7_vars(&[("s", json!(58)), ("e", json!(58))]);
+        let (mut a, mut b) = (answer(page(&rev[..20])), answer(page(&first[..20])));
+        let (d, note) = ctx
+            .gql_rules(ta, H6::Live(tb), op, &vars, &mut a, &mut b, 7_000_000)
+            .await;
+        let (un, _) = ctx.allow.classify_request(
+            &crate::normalize::RouteKind::Other,
+            "graphql:QG70",
+            &[],
+            &d,
+        );
+        assert_eq!(un.is_empty(), explained, "{case}: {un:?} {note:?} {d:?}");
+        let h6 = d
+            .iter()
+            .any(|e| e.path == crate::graphql_scope::UNFINISHED_PATH && e.b.is_some());
+        assert_eq!(h6, h6_entry, "{case}: {d:?}");
+        let prefix = d
+            .iter()
+            .any(|e| e.path == crate::graphql_scope::PREFIX_PATH);
+        assert_eq!(prefix, case == "oracle's read fails", "{case}: {d:?}");
+    }
+}
+
 /// Review B1 (R-P5P9-105 G): the `cutBoth` arm explains only rows that select neither `hash`
 /// nor `requestKey`. #70's shape with `requestKey` selected and ours' keys wrong (the node's
 /// block holds `rk{i}`) is not explained by it: it carries no node check of the keys. The

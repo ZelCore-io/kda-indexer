@@ -8368,14 +8368,20 @@ async fn e2_s_the_native_pair_rereads_a_gap_in_the_other_order() {
 /// the record's time). Each height's coinbase pays `k:m` 0.904046 when listed in `cb`, else
 /// `k:o`; `txs` gives a height's transactions' events.
 fn s_node(cb: &[u64], txs: &[(u64, Vec<Value>)]) -> NodeMock {
+    s_node_at(cb, txs, 110, 30)
+}
+
+/// [`s_node`] with the tip at `tip` and `spacing` seconds a block (the heights 60 to `tip`).
+/// A spacing under 30 s makes the search for the record's height take more steps.
+fn s_node_at(cb: &[u64], txs: &[(u64, Vec<Value>)], tip: u64, spacing: i64) -> NodeMock {
     let base: u64 = 1_794_733_200;
     let mut node = NodeMock {
-        tip: 110,
+        tip,
         ..NodeMock::default()
     };
     let enc = |v: Value| kdx_types::hash::b64url_encode(v.to_string().as_bytes());
-    for h in 85..=110u64 {
-        let t = (base as i64 + (h as i64 - 100) * 30) as u64 * 1_000_000;
+    for h in 60..=tip {
+        let t = (base as i64 + (h as i64 - 100) * spacing) as u64 * 1_000_000;
         node.headers.insert(
             (0, h),
             vec![json!({"hash": format!("H{h}"), "height": h, "chainId": 0,
@@ -8403,6 +8409,16 @@ fn s_transfer(from: &str, to: &str, amount: Value) -> Value {
 /// The stored referee over one NodeBalance record of k:m on chain 0: ours' GraphQL `ours`
 /// (a JSON number, as stored), native `native`.
 async fn s_referee(node: NodeMock, ours: &str, native: &str) -> crate::referee::Report {
+    s_referee_capped(node, ours, native, 200).await
+}
+
+/// [`s_referee`] with the run's `--max-reads`.
+async fn s_referee_capped(
+    node: NodeMock,
+    ours: &str,
+    native: &str,
+    max_reads: usize,
+) -> crate::referee::Report {
     use crate::report::{DiffEntry, DiffKind};
     let dir = tempfile::tempdir().unwrap();
     let nu = node_server(node).await;
@@ -8434,7 +8450,7 @@ async fn s_referee(node: NodeMock, ours: &str, native: &str) -> crate::referee::
         }],
     );
     r.b_target = "node".into();
-    e2_referee(cfg, dir.path(), &[r]).await
+    e2_referee_capped(cfg, dir.path(), &[r], max_reads).await
 }
 
 /// R-P5P9-105 S′: the gap native − GraphQL is explained when it equals the account's net
@@ -8495,6 +8511,21 @@ async fn i_s_the_gap_is_the_accounts_net_change_on_the_node() {
         .collect();
     let rep = s_referee(s_node(&[], &apart), "10.0", "12.0").await;
     no(&rep, "non-adjacent blocks");
+    // R-P5P9-108 (M2): the read stop. The record's read budget (`--max-reads`) ends the window
+    // before the credit at its far edge (113): unexplained, the cap named in the reason. With
+    // the default budget the same record is explained. (`S_NET_READS` itself, 50 for the cut,
+    // the search and the window, is never reached by the constants: at most 8 reads before the
+    // window and 42 in it, and the check stops past 50.)
+    let far = vec![(113, vec![s_transfer("k:p", "k:m", json!(1.0))])];
+    let rep = s_referee_capped(s_node_at(&[], &far, 196, 15), "10.0", "11.0", 25).await;
+    no(&rep, "far edge past the read budget");
+    assert!(rep.node_reads <= 25, "{rep:?}");
+    assert!(
+        format!("{:?}", rep.still_unexplained).contains("cap"),
+        "the cap reason: {rep:?}"
+    );
+    let rep = s_referee(s_node_at(&[], &far, 196, 15), "10.0", "11.0").await;
+    ok(&rep, "the default budget reads the window");
 }
 
 /// R-P5P9-86 S′ with R-P5P9-87, stored: a CG-5 NodeBalance record (labelled `node`) is miner
