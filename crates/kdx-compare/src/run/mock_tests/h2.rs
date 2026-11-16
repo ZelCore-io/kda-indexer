@@ -351,15 +351,30 @@ async fn q_referee(
     tokens: Vec<Value>,
     balance: Option<Value>,
 ) -> crate::referee::Report {
+    q_referee_capped(vec![q_row("8")], oracle, tokens, balance, 200).await
+}
+
+/// [`q_referee`] with ours' chain rows `ours` (the node answers `balance` on each of their
+/// chains) and the run's `--max-reads`.
+async fn q_referee_capped(
+    ours: Vec<Value>,
+    oracle: Vec<Value>,
+    tokens: Vec<Value>,
+    balance: Option<Value>,
+    max_reads: usize,
+) -> crate::referee::Report {
     let dir = tempfile::tempdir().unwrap();
     let mut node = NodeMock::default();
     if let Some(b) = balance {
-        node.local.insert((8, "k:a".into()), b);
+        for r in &ours {
+            let c: u8 = r["chainId"].as_str().unwrap().parse().unwrap();
+            node.local.insert((c, "k:a".into()), b.clone());
+        }
     }
     let nu = node_server(node).await;
     let au = ours_fn_server(move |req: &Value| {
         let q = req["query"].as_str().unwrap_or("");
-        if q.contains("nonFungibleChainAccount") && req["variables"]["c"] == json!("8") {
+        if q.contains("nonFungibleChainAccount") {
             json!({"data": {"nonFungibleChainAccount": {"nonFungibleTokenBalances": tokens}}})
         } else {
             json!({"data": null})
@@ -383,11 +398,38 @@ async fn q_referee(
     let rec = e2_stored(
         "QNonFungibleAccount",
         json!({"accountName": "k:a"}),
-        q_body(vec![q_row("8")]),
+        q_body(ours),
         q_body(oracle),
         diff,
     );
-    e2_referee(cfg, dir.path(), &[rec]).await
+    e2_referee_capped(cfg, dir.path(), &[rec], max_reads).await
+}
+
+/// R-P5P9-97 Q #37, review B1: the node reads of the repeated rows are the run's reads. Ours
+/// lists chains 8 and 9 once and the oracle repeats both, so each takes one `get-balance`
+/// (the chain graph is the run's first read). A cap of three reads leaves one for each and
+/// the record is explained, the reads counted. A cap of two spends the budget on chain 8's
+/// read: chain 9's is not made, the record stays unexplained, and its note names the cap.
+#[tokio::test]
+async fn h2_q_chain_dupes_reads_count_against_the_run_cap() {
+    let ours = vec![q_row("8"), q_row("9")];
+    let oracle: Vec<Value> = ours.iter().flat_map(|r| vec![r.clone(); 3]).collect();
+    let tok = vec![json!({"tokenId": "t:1", "balance": 1})];
+    let rep = q_referee_capped(
+        ours.clone(),
+        oracle.clone(),
+        tok.clone(),
+        Some(json!(1.0)),
+        3,
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    assert_eq!(rep.node_reads, 3, "{rep:?}");
+    let rep = q_referee_capped(ours, oracle, tok, Some(json!(1.0)), 2).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
+    assert_eq!(rep.node_reads, 2, "{rep:?}");
+    let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+    assert!(still.contains("node read cap"), "{still}");
 }
 
 /// R-P5P9-97 Q #37: the oracle repeats ours' one chain-8 row 8 times (same id). Ours lists

@@ -8045,6 +8045,16 @@ async fn e2_referee(
     dir: &std::path::Path,
     recs: &[crate::report::DiffRecord],
 ) -> crate::referee::Report {
+    e2_referee_capped(cfg, dir, recs, 200).await
+}
+
+/// [`e2_referee`] with the run's `--max-reads`.
+async fn e2_referee_capped(
+    cfg: CompareConfig,
+    dir: &std::path::Path,
+    recs: &[crate::report::DiffRecord],
+    max_reads: usize,
+) -> crate::referee::Report {
     let log = dir.join(format!("diffs-e2-{}.jsonl", recs.len()));
     let lines: Vec<String> = recs
         .iter()
@@ -8053,7 +8063,7 @@ async fn e2_referee(
     std::fs::write(&log, lines.join("\n") + "\n").unwrap();
     let opts = crate::referee::Opts {
         logs: vec![log],
-        max_reads: 200,
+        max_reads,
         rps: 10,
     };
     crate::referee::run(cfg, &opts).await.unwrap()
