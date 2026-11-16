@@ -425,3 +425,71 @@ async fn h2_q_oracle_duplicates_of_a_chain_row_ours_lists_once() {
     let rep = q_referee(other, tok, Some(json!(1.0))).await;
     assert_eq!((rep.explained, rep.unexplained), (0, 1), "unlike: {rep:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// N #178
+
+/// The stored referee over N #178's record (QTransactionsByBlock, our own document): a block
+/// of 219 txs; ours lists `ours`, the oracle the node's first 200.
+async fn n_referee(ours: Vec<String>) -> crate::referee::Report {
+    let dir = tempfile::tempdir().unwrap();
+    let rks: Vec<String> = (0..219).map(|i| format!("t{i:03}")).collect();
+    let mut node = NodeMock::default();
+    d3_block(&mut node, "BLK612", 4_476_191, &rks);
+    let nu = node_server(node).await;
+    let au = ours_fn_server(|req: &Value| {
+        if req["query"].as_str().unwrap_or("").contains("block(hash") {
+            json!({"data": {"block": {"chainId": "0"}}})
+        } else {
+            json!({"data": null})
+        }
+    })
+    .await;
+    let ops = dir.path().join("ops");
+    std::fs::create_dir_all(&ops).unwrap();
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../compare/graphql/QTransactionsByBlock.graphql");
+    std::fs::copy(doc, ops.join("QTransactionsByBlock.graphql")).unwrap();
+    let cfg = c3_cfg(&nu, &au, "http://127.0.0.1:9/graphql", dir.path(), &ops, "");
+    let page = |keys: &[String]| {
+        json!({"data": {"transactions": {"totalCount": 219,
+            "pageInfo": {"hasNextPage": true, "hasPreviousPage": false,
+                "startCursor": "s", "endCursor": "e"},
+            "edges": keys.iter().map(|k| d3_row("BLK612", k)).collect::<Vec<_>>()}}})
+    };
+    let diff = (0..200)
+        .filter(|&i| ours[i] != rks[i])
+        .map(|i| DiffEntry {
+            path: format!("/data/transactions/edges/{i}/node/hash"),
+            kind: DiffKind::Changed,
+            a: Some(json!(ours[i])),
+            b: Some(json!(rks[i])),
+        })
+        .collect();
+    let rec = e2_stored(
+        "QTransactionsByBlock",
+        json!({"blockHash": "BLK612", "first": 200}),
+        page(&ours),
+        page(&rks[..200]),
+        diff,
+    );
+    e2_referee(cfg, dir.path(), &[rec]).await
+}
+
+/// R-P5P9-97 N #178, stored: ours lists the node's block order reversed (t218..t019), every
+/// oracle row is in the node's block. The referee applies N's reverse-order arm to the stored
+/// root-scoped list → explained. A shuffled order stays unexplained.
+#[tokio::test]
+async fn h2_n_the_stored_records_reverse_order_arm() {
+    let ours: Vec<String> = (0..219)
+        .rev()
+        .take(200)
+        .map(|i| format!("t{i:03}"))
+        .collect();
+    let rep = n_referee(ours.clone()).await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    let mut shuffled = ours;
+    shuffled.swap(0, 100);
+    let rep = n_referee(shuffled).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
+}

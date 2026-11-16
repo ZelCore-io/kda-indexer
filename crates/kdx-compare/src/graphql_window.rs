@@ -3721,32 +3721,11 @@ impl Ctx {
         // R-P5P9-75 N: a page cut inside one block, where H7 does not explain the pair.
         let mut n_note = String::new();
         if !d.explained() || !d.grouped {
-            match self.n_single_block(ta, query, vars, &prep, st).await {
-                Ok((pairs, ev)) => {
-                    let side = |rows: &[Row], ours: bool| -> Vec<Value> {
-                        pairs
-                            .iter()
-                            .enumerate()
-                            .map(|(n, (i, j))| tagged(&rows[if ours { *i } else { *j }].edge, n))
-                            .collect()
-                    };
-                    let (ea, eb) = (side(&prep.a, true), side(&prep.b, false));
-                    for (ans, edges) in [(&mut *a, ea), (&mut *b, eb)] {
-                        if let Some(c) = ans
-                            .body
-                            .get_mut("data")
-                            .and_then(crate::graphql::root_connection)
-                        {
-                            c["edges"] = Value::Array(edges);
-                        }
-                    }
-                    let (nr, or) = (st.node - node0, st.ours - ours0);
-                    let ours = json!({"rows": prep.a.len(), "inNodeOrder": true});
-                    let mut ev = ev;
-                    ev["nodeReads"] = json!(nr);
-                    ev["oursReads"] = json!(or);
-                    return (vec![entry(SINGLE_BLOCK_PATH, Some(ours), Some(ev))], None);
-                }
+            match self
+                .n_apply(ta, query, vars, &prep, a, b, st, (node0, ours0))
+                .await
+            {
+                Ok(hit) => return (vec![hit], None),
                 Err(Some(why)) => n_note = format!("; N not explained: {why}"),
                 Err(None) => {}
             }
@@ -3947,6 +3926,82 @@ impl Ctx {
 
     /// One row's node verdict (single-row reads, cached per compare). `oracle`: the row is
     /// the oracle's.
+    /// R-P5P9-75 N on prepared rows: when [`Ctx::n_single_block`] explains the pair, both
+    /// pages hold the paired rows in the node's order and the hit is returned; else why not.
+    #[allow(clippy::too_many_arguments)]
+    async fn n_apply(
+        &self,
+        ta: &Target,
+        query: Option<&str>,
+        vars: &Map<String, Value>,
+        prep: &Prep,
+        a: &mut Answer,
+        b: &mut Answer,
+        st: &mut Reads,
+        (node0, ours0): (usize, usize),
+    ) -> Result<DiffEntry, Option<String>> {
+        let (pairs, ev) = self.n_single_block(ta, query, vars, prep, st).await?;
+        let side = |rows: &[Row], ours: bool| -> Vec<Value> {
+            pairs
+                .iter()
+                .enumerate()
+                .map(|(n, (i, j))| tagged(&rows[if ours { *i } else { *j }].edge, n))
+                .collect()
+        };
+        let (ea, eb) = (side(&prep.a, true), side(&prep.b, false));
+        for (ans, edges) in [(&mut *a, ea), (&mut *b, eb)] {
+            if let Some(c) = ans
+                .body
+                .get_mut("data")
+                .and_then(crate::graphql::root_connection)
+            {
+                c["edges"] = Value::Array(edges);
+            }
+        }
+        let (nr, or) = (st.node - node0, st.ours - ours0);
+        let ours = json!({"rows": prep.a.len(), "inNodeOrder": true});
+        let mut ev = ev;
+        ev["nodeReads"] = json!(nr);
+        ev["oursReads"] = json!(or);
+        Ok(entry(SINGLE_BLOCK_PATH, Some(ours), Some(ev)))
+    }
+
+    /// R-P5P9-97 N #178: the stored form of N on a root-scoped list (a `blockHash` root,
+    /// which H7 leaves to H6; the referee does not finish H6's lists again). The root lists
+    /// are prepared as H7 prepares them and N's arm alone is applied: ours in the node's
+    /// block order or its exact reverse, every oracle row in the node's block. `None`: N does
+    /// not explain the pair, and the pages stay as they were.
+    pub(crate) async fn gql_n_stored(
+        &self,
+        ta: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        st: &mut Reads,
+    ) -> Option<DiffEntry> {
+        let conn = |ans: &mut Answer| {
+            ans.body
+                .get_mut("data")
+                .and_then(crate::graphql::root_connection)
+                .cloned()
+        };
+        let (ca, cb) = (conn(a)?, conn(b)?);
+        let query = Some(op.query.as_str());
+        let root = a.body.get("data").and_then(root_name)?;
+        let (field, aliases) = root_selection(&op.query, &root)?;
+        if !aliases.is_empty() {
+            return None;
+        }
+        let mut prep = prepare_in(&ca, &cb, &field).ok()?;
+        prep.rules = self.cfg.graphql.field_rules.clone();
+        prep.root = root;
+        let start = (st.node, st.ours);
+        self.n_apply(ta, query, vars, &prep, a, b, st, start)
+            .await
+            .ok()
+    }
+
     async fn h7_verdict(&self, ta: &Target, r: &Row, oracle: bool, st: &mut Reads) -> Verdict {
         let chain = match r.id.chain {
             Some(c) => Some(c),

@@ -1762,12 +1762,20 @@ impl Ctx {
                 .cloned()
                 .collect(),
         };
+        // R-P5P9-97 N #178: stored, a root-scoped list gets N's arm (H6 does not finish it
+        // again).
+        let n_hit = if live_tb.is_none() && root_scoped {
+            self.gql_n_stored(ta, op, vars, a, b, st).await
+        } else {
+            None
+        };
         // R-P5P9-62: H7 and the diff.
         // R-P5P9-95 m-9: one compare, one node read cap: the count walk shares H7's reads.
         let (mut d, mut note) = self
             .gql_settle_op_st(ta, Some(op), vars, a, b, max, root_scoped, st)
             .await;
         d.extend(h6);
+        d.extend(n_hit);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
             path: p.into(),
             kind: DiffKind::Changed,
