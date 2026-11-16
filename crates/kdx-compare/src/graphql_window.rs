@@ -3924,8 +3924,6 @@ impl Ctx {
         Ok(Longer { rows, capped })
     }
 
-    /// One row's node verdict (single-row reads, cached per compare). `oracle`: the row is
-    /// the oracle's.
     /// R-P5P9-75 N on prepared rows: when [`Ctx::n_single_block`] explains the pair, both
     /// pages hold the paired rows in the node's order and the hit is returned; else why not.
     #[allow(clippy::too_many_arguments)]
@@ -4002,6 +4000,8 @@ impl Ctx {
             .ok()
     }
 
+    /// One row's node verdict (single-row reads, cached per compare). `oracle`: the row is
+    /// the oracle's.
     async fn h7_verdict(&self, ta: &Target, r: &Row, oracle: bool, st: &mut Reads) -> Verdict {
         let chain = match r.id.chain {
             Some(c) => Some(c),
@@ -6600,8 +6600,8 @@ mod tests {
         assert!(parse_utc("2024-13-01T00:00:01Z").is_none());
     }
 
-    /// R-P5P9-81 (m-1): the settle counts list the four named classes always, any other
-    /// class present, and `key-only` as given.
+    /// R-P5P9-88 (F): a bare root list (no `pageInfo`) reads as a connection, its
+    /// `hasNextPage` from the page's fullness; another root or an own `pageInfo` is left.
     #[test]
     fn h_f_a_bare_root_list_reads_as_a_connection() {
         let page = |n: usize| {
@@ -6625,6 +6625,8 @@ mod tests {
         assert_eq!(own["transfers"]["pageInfo"], json!({"hasNextPage": true}));
     }
 
+    /// R-P5P9-81 (m-1): the settle counts list the four named classes always, any other
+    /// class present, and `key-only` as given.
     #[test]
     fn settle_counts_per_class() {
         let rows = [
