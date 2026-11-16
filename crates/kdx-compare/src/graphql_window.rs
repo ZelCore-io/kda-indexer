@@ -6106,7 +6106,6 @@ fn prefix_in_node_order(payload: &Value, cmds: &[Value]) -> Result<(), String> {
     let in_order = |order: &mut dyn Iterator<Item = &Option<Value>>| {
         cmds.iter()
             .zip(order)
-            .filter(|_| true)
             .all(|(c, n)| n.as_ref().is_some_and(|n| cmd_mismatch(c, n).is_none()))
     };
     if cmds.len() <= node.len() && (in_order(&mut node.iter().rev()) || in_order(&mut node.iter()))

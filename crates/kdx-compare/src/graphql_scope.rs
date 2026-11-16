@@ -545,9 +545,9 @@ pub fn unkeyed_nested_with(
         let candidate =
             raw_lists.and_then(|((pa, xa), (_, xb))| prefix_candidate(p, xa, xb, Some(pa), rules));
         if in_scope
-            && !candidate
+            && candidate
                 .as_ref()
-                .is_some_and(|c| c.pointer("/prefix/cutBoth").is_some())
+                .is_none_or(|c| c.pointer("/prefix/cutBoth").is_none())
         {
             continue;
         }
