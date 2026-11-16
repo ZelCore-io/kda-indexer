@@ -120,9 +120,7 @@ pub async fn run(mut cfg: CompareConfig, opts: &Opts) -> anyhow::Result<Report> 
     }
     let ctx = Ctx::new(cfg).await?;
     // `Ctx::new` read the node's chain graph: one read of the cap (R-P5P9-64 M-8).
-    ctx.gql
-        .node_budget
-        .store(opts.max_reads.saturating_sub(1), Ordering::Relaxed);
+    referee_mode(&ctx, opts.max_reads);
     let mut rep = Report {
         node_read_cap: opts.max_reads,
         ..Report::default()
@@ -485,6 +483,20 @@ fn ts_secs(ts: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + hh * 3_600 + mm * 60 + ss).ok()
 }
 
+/// The referee's caps on a fresh context: `max_reads` reads for the run (`Ctx::new` read the
+/// node's chain graph, one read of the cap, R-P5P9-64 M-8), and R-P5P9-97 TC's count walk of
+/// up to [`crate::graphql_window::REFEREE_COUNT_WALK_ROWS`] rows a side (live stays at
+/// [`crate::graphql_window::COUNT_WALK_ROWS`]).
+pub(crate) fn referee_mode(ctx: &Ctx, max_reads: usize) {
+    ctx.gql
+        .node_budget
+        .store(max_reads.saturating_sub(1), Ordering::Relaxed);
+    ctx.gql.walk_rows.store(
+        crate::graphql_window::REFEREE_COUNT_WALK_ROWS,
+        Ordering::Relaxed,
+    );
+}
+
 /// R-P5P9-86 S′, the stored form: every entry is a `/chain<N>/balance` gap that
 /// [`Ctx::native_skew_stored`] settles; any other entry stays unexplained. Returns the
 /// unexplained entries and the explaining ids.
@@ -517,7 +529,9 @@ async fn settle_native(
             .strip_prefix("/chain")
             .and_then(|p| p.strip_suffix("/balance"))
             .and_then(|c| c.parse::<u8>().ok());
-        let dec = |v: &Option<Value>| v.as_ref().and_then(Value::as_str).map(str::to_string);
+        // R-P5P9-97 S′: the stored GraphQL balance can be a JSON number (its text kept
+        // exactly, `arbitrary_precision`); R-P5P9-98: trailing zeros ignored, never a float.
+        let dec = |v: &Option<Value>| v.as_ref().and_then(crate::diff::exact_decimal_text);
         let settled = match (chain, dec(&e.a), dec(&e.b)) {
             (Some(c), Some(x), Some(y)) => ctx.native_skew_stored(c, account, &x, &y, ts).await,
             _ => Err("not a balance gap".into()),

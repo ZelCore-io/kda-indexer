@@ -72,3 +72,7 @@ Every search route runs under one gate: at most `search.concurrency` (4) searche
 - Native `GET /api/v1/search/events?q=…`: events whose qualified name or parameter text contains `q`, the compat bounded scan in the native shape; `{items, next_cursor, truncated, as_of}`.
 - Native `GET /api/v1/txs/{request_key}/defpact`: `{pact_id, items: [{request_key, chain, height, step, rollback, success}], truncated, as_of}`, ascending, for the pact the tx starts or continues (at most 1,000 txs, the newest).
 - Native `GET /api/v1/txs/{request_key}`: a request key stored in several genesis blocks answers every copy as `{items, next_cursor: null, as_of}`.
+
+## Compat notes
+
+- **Decimal text (R-P5P9-98).** GraphQL `Decimal` amounts (`transfers.amount`, balances) print the shortest exact text: no trailing zeros of the fraction. The node gives Pact decimals as `{"decimal":"138000.000000000000"}` and the reference GraphQL server often prints that scale (`"138000.000000000000"`, and at times 30 places); kda-indexer prints `"138000"`. The values are equal as exact decimals, so a client that parses the number gets the identical value. A client that compares the raw text, or shows the trailing zeros, sees a different string. The comparison harness counts amounts as equal when they are equal as exact decimals (never through floats), on both sides and against the node; this is a documented format difference, not a value difference.

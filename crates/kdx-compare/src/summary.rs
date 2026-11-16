@@ -1405,8 +1405,9 @@ mod tests {
         assert_eq!(merge_baselines(forward), want);
     }
 
-    /// R-P5P9-78 (H2 m-1): the shipped P baseline counts only the records P matches (3 over
-    /// 4.05 h = 0.74/h, limit 1.11/h): 3 records in 2 h are over (limit 2.2), 2 are within.
+    /// R-P5P9-78 (H2 m-1): the shipped P baseline counts only the records P matches; with
+    /// R-P5P9-97 that is 2 over 4.05 h = 0.49/h (#322's key is not listed), limit 0.74/h:
+    /// 2 records in 2 h are over (limit 1.5), 1 is within.
     #[test]
     fn the_shipped_p_baseline_counts_only_matched_records() {
         let al = crate::allowlist::Allowlist::load(
@@ -1415,7 +1416,7 @@ mod tests {
         .unwrap();
         let p = "known-gap-p-heavy-account-deadline";
         let b = al.baseline(p).unwrap();
-        assert_eq!(b, 0.74);
+        assert_eq!(b, 0.49);
         let gate = |n: u64| {
             let dir = tempfile::tempdir().unwrap();
             write_days(dir.path(), &[("2026-11-15", 12, "match", 0, b)]);
@@ -1430,9 +1431,9 @@ mod tests {
             .collect();
             render_known_gaps(&kg)
         };
-        let (text, ok) = gate(3);
-        assert!(!ok && text.contains("limit 2.2"), "{text}");
         let (text, ok) = gate(2);
+        assert!(!ok && text.contains("limit 1.5"), "{text}");
+        let (text, ok) = gate(1);
         assert!(ok, "{text}");
     }
 

@@ -681,10 +681,10 @@ condition = "any"
 request_contains = "graphql:"
 request_any = ['"k:465174a5', '"k:a8ba06d2', '"b581bc62', '"af7943004d0b08fe5402c23ec317f7a8d1bdd6ce4cc52414efcf8dbfa68ca256"', '"k:22fbc926b497bf3ecc7199b923039e74cdeda12726e1dc4f443953007cf8cc43"']
 a_value_contains = "request deadline exceeded"
-baseline_per_hour = 0.74
-reason = "R-P5P9-75 P (accepted heavy-account TIMEOUT, a diff by design, R-P5P9-67): ours' first- or follow-page fault whose error says \"request deadline exceeded\", only on the heavy accounts CG-2/CG-3 measured, by key (a variable value starting with): k:465174a5..., k:a8ba06d2..., b581bc62...; and the two CG-5 measured (R-P5P9-86 P), by their full key (the whole variable value): af7943004d0b... (#520) and k:22fbc926... (#977). Any other account (CG-4 #293's k:58ddb72d... among them), another fault, or another difference in the record stays unexplained. CG-4 baseline: the 3 records this entry matches (#322, #512, #1868; #293 is k:58ddb72d..., which it rules out) in the 00:55:00-04:58:10Z window (4.05 h) = 0.74/h; gate limit 1.11/h (R-P5P9-78, H2 m-1)."
+baseline_per_hour = 0.49
+reason = "R-P5P9-75 P (accepted heavy-account TIMEOUT, a diff by design, R-P5P9-67): ours' first- or follow-page fault whose error says \"request deadline exceeded\", only on the heavy accounts CG-2/CG-3 measured, by key (a variable value starting with): k:465174a5..., k:a8ba06d2..., b581bc62...; and the two CG-5 measured (R-P5P9-86 P), by their full key (the whole variable value): af7943004d0b... (#520) and k:22fbc926... (#977). Any other account (CG-4 #293's k:58ddb72d... among them), another fault, or another difference in the record stays unexplained. CG-4 baseline: the 2 records this entry matches (#512, #1868; #293 is k:58ddb72d... and #322 is k:4d421e95..., which it rules out: R-P5P9-97, no measured heaviness for k:4d421e95...) in the 00:55:00-04:58:10Z window (4.05 h) = 0.49/h; gate limit 0.74/h (R-P5P9-78, H2 m-1)."
 status = "KNOWN-GAP"
-ruling = "R-P5P9-75 (P, Q); R-P5P9-60; R-P5P9-67; R-P5P9-78 (H2 m-1: the baseline counts only matched records); R-P5P9-86 P (the two CG-5 keys; the cap unchanged)."
+ruling = "R-P5P9-75 (P, Q); R-P5P9-60; R-P5P9-67; R-P5P9-78 (H2 m-1: the baseline counts only matched records); R-P5P9-86 P (the two CG-5 keys; the cap unchanged); R-P5P9-97 (the key list and the baseline agree: #322 out)."
 owner_note = "KNOWN-GAP (accepted for G4 by the controller, R-P5P9-60 line 595: heavy-account cold TIMEOUT): never explained; listed for the owner in the G4 package."
 
 [[entry]]

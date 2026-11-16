@@ -675,12 +675,36 @@ async fn e3_g_a_cut_nested_list_is_settled_by_prefix() {
         hit.a.as_ref().unwrap()["lists"][0]["node"]["txs"],
         json!(126)
     );
-    // The oracle's rows are not ours' prefix in order.
-    let (un, _) = settle(126, ours.clone(), oracle_bad).await;
-    assert!(
-        un.contains(&crate::graphql_scope::UNFINISHED_PATH.to_string()),
-        "{un:?}"
-    );
+    // R-P5P9-97 G: the oracle's rows are not ours' prefix in order, but every one is a
+    // distinct tx of the node's block and ours is the whole block: settled as multisets.
+    let (un, d) = settle(126, ours.clone(), oracle_bad).await;
+    assert!(un.is_empty(), "{un:?} {d:?}");
+    assert!(d
+        .iter()
+        .any(|e| e.path == crate::graphql_scope::PREFIX_PATH));
+    // #91's shape: ours the node's order reversed, the oracle another order.
+    let mut rev = prices.clone();
+    rev.reverse();
+    let ours_rev = g_page(&[(0, 126, false, rev), (19, 1, false, vec!["1e-8".into()])]);
+    let (un, d) = settle(126, ours_rev.clone(), oracle.clone()).await;
+    assert!(un.is_empty(), "{un:?} {d:?}");
+    // Out of order with an oracle row the node's block does not hold (or holds once only):
+    // unfinished.
+    let mut stray = prices[..20].to_vec();
+    stray.swap(0, 1);
+    stray[5] = "999e-8".into();
+    let mut twice = prices[..20].to_vec();
+    twice.swap(0, 1);
+    twice[5] = twice[4].clone();
+    for rows in [stray, twice] {
+        let o = g_page(&[(0, 126, true, rows), (19, 1, false, vec!["1e-8".into()])]);
+        let (un, d) = settle(126, ours_rev.clone(), o).await;
+        assert!(
+            un.contains(&crate::graphql_scope::UNFINISHED_PATH.to_string()),
+            "{un:?}"
+        );
+        assert!(format!("{d:?}").contains("in any order, oracle"), "{d:?}");
+    }
     // Ours' 126 rows against a node block of 125 txs.
     let (un, d) = settle(125, ours.clone(), oracle.clone()).await;
     assert!(
@@ -979,4 +1003,50 @@ async fn f_m9_rest_node_polls_count_in_max_reads() {
     }
     // The chain graph and u1's `/poll` (one chunk; before the fix only the chain graph).
     assert_eq!(reads[0], 2, "{reads:?}");
+}
+
+/// R-P5P9-97 TC: in referee mode the walk reads up to 20,000 rows a side (the oracle is
+/// frozen and offline), so #832's 5,001-row side is walked, not capped; live stays at 5,000
+/// (above), and the referee's cap still stops a side past 20,000.
+#[tokio::test]
+async fn h_tc_the_referee_walks_up_to_20000_rows_a_side() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = |n: usize| -> Vec<Value> {
+        (0..n)
+            .map(|i| tc_row(&format!("x{i}"), Some("X100")))
+            .collect()
+    };
+    let ctx = tc_ctx(
+        dir.path(),
+        (vec![tc_row("t2", Some("B100"))], 1),
+        (rows(5_001), 5_001),
+    )
+    .await;
+    assert_eq!(
+        ctx.gql.walk_rows.load(std::sync::atomic::Ordering::Relaxed),
+        crate::graphql_window::COUNT_WALK_ROWS
+    );
+    crate::referee::referee_mode(&ctx, 1_000_000);
+    assert_eq!(
+        ctx.gql.walk_rows.load(std::sync::atomic::Ordering::Relaxed),
+        20_000
+    );
+    let page_a = tc_page(vec![tc_row("t2", Some("B100"))], 1);
+    let page_b = tc_page(vec![tc_row("t2", Some("B100"))], 5_001);
+    let (_, note) = tc_live(&ctx, page_a.clone(), page_b).await;
+    let note = note.unwrap_or_default();
+    assert!(!note.contains("count walk capped"), "{note}");
+    // Past 20,000 rows: capped.
+    let dir2 = tempfile::tempdir().unwrap();
+    let ctx = tc_ctx(
+        dir2.path(),
+        (vec![tc_row("t2", Some("B100"))], 1),
+        (rows(20_001), 20_001),
+    )
+    .await;
+    crate::referee::referee_mode(&ctx, 1_000_000);
+    let page_b = tc_page(vec![tc_row("t2", Some("B100"))], 20_001);
+    let (_, note) = tc_live(&ctx, page_a, page_b).await;
+    let note = note.unwrap_or_default();
+    assert!(note.contains("lists more than 20000 rows"), "{note}");
 }

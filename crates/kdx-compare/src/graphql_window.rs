@@ -88,14 +88,17 @@ pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
 /// R-P5P9-92 (1): visible hit of the count walk's oracle that counts heights (allowlist id
 /// `graphql-r75-oracle-counts-heights`, ACCEPTED; scoped to Transactions-9e58b95d).
 pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
-/// R-P5P9-86 TC: rows a side the count walk reads at most.
+/// R-P5P9-86 TC: rows a side the count walk reads at most, live.
 pub const COUNT_WALK_ROWS: usize = 5_000;
+/// R-P5P9-97 TC: rows a side the count walk reads at most in referee mode (the oracle is
+/// frozen and offline, so the cost is reads only, under the run's read cap).
+pub const REFEREE_COUNT_WALK_ROWS: usize = 20_000;
 /// R-P5P9-95 m-10: the count walk's byte budget a side (the rows' JSON text); past it,
 /// `count walk capped`.
 #[cfg(not(test))]
 pub const COUNT_WALK_BYTES: usize = 64 << 20;
 #[cfg(test)]
-pub const COUNT_WALK_BYTES: usize = 256 << 10;
+pub const COUNT_WALK_BYTES: usize = 4 << 20;
 /// R-P5P9-92 (2): ours' rows above the oracle's height that the count walk polls at most.
 pub const ABOVE_TIP_ROWS: usize = 50;
 /// R-P5P9-93: the widest query window (in heights) whose node counts the walk reads.
@@ -2384,8 +2387,16 @@ fn node_of(r: &Row) -> &Value {
 
 /// R-P5P9-75 D: whether ours' value `x` is the oracle's `y` at `path` (a JSON pointer from
 /// the body root), exactly or, at a leaf, by a ruled value matcher of `rules`
-/// (`oracle_f64_rounded`, H9's `creation_time_half_even`).
-fn same_ruled(x: &Value, y: &Value, path: &str, rules: &[crate::config::FieldRule]) -> bool {
+/// (`oracle_f64_rounded`, H9's `creation_time_half_even`). With `dec`, an amount field
+/// ([`crate::diff::is_amount_key`]) also matches by exact decimal value (R-P5P9-98); the
+/// caller then settles ours' row on the node.
+fn same_ruled(
+    x: &Value,
+    y: &Value,
+    path: &str,
+    rules: &[crate::config::FieldRule],
+    dec: bool,
+) -> bool {
     use crate::config::FieldRuleKind as K;
     if x == y {
         return true;
@@ -2395,7 +2406,7 @@ fn same_ruled(x: &Value, y: &Value, path: &str, rules: &[crate::config::FieldRul
             a.len() == b.len()
                 && a.iter().all(|(k, v)| {
                     b.get(k)
-                        .is_some_and(|w| same_ruled(v, w, &format!("{path}/{k}"), rules))
+                        .is_some_and(|w| same_ruled(v, w, &format!("{path}/{k}"), rules, dec))
                 })
         }
         (Value::Array(a), Value::Array(b)) => {
@@ -2403,7 +2414,16 @@ fn same_ruled(x: &Value, y: &Value, path: &str, rules: &[crate::config::FieldRul
                 && a.iter()
                     .zip(b)
                     .enumerate()
-                    .all(|(i, (v, w))| same_ruled(v, w, &format!("{path}/{i}"), rules))
+                    .all(|(i, (v, w))| same_ruled(v, w, &format!("{path}/{i}"), rules, dec))
+        }
+        _ if dec
+            && path
+                .rsplit('/')
+                .next()
+                .is_some_and(crate::diff::is_amount_key)
+            && crate::diff::same_exact_decimal(x, y) =>
+        {
+            true
         }
         _ => {
             let txt = |v: &Value| match v {
@@ -2585,6 +2605,16 @@ impl Prep {
     /// (R-P5P9-63 (3)), after the ruled value matchers (R-P5P9-75 D). A coinbase row's key is
     /// left out: both sides' keys are checked on the coinbase path (R-P5P9-86 C).
     fn same(&self, x: &Value, rb: &Row) -> bool {
+        self.same_by(x, rb, true)
+    }
+
+    /// R-P5P9-98: ours' row `x` is the oracle's `rb` only by an amount's exact decimal value
+    /// (its text differs): the pair is settled on the node (ours' row's TRANSFER amount).
+    fn decimal_only(&self, x: &Value, rb: &Row) -> bool {
+        self.same_by(x, rb, true) && !self.same_by(x, rb, false)
+    }
+
+    fn same_by(&self, x: &Value, rb: &Row, dec: bool) -> bool {
         let y = node_of(rb);
         let root = self.root.replace('~', "~0").replace('/', "~1");
         let path = format!("/data/{root}/edges/0/node");
@@ -2592,9 +2622,9 @@ impl Prep {
             (Some(kx), Some(_)) if rb.id.coinbase => {
                 let mut y = y.clone();
                 y["requestKey"] = kx.clone();
-                same_ruled(x, &y, &path, &self.rules)
+                same_ruled(x, &y, &path, &self.rules, dec)
             }
-            _ => same_ruled(x, y, &path, &self.rules),
+            _ => same_ruled(x, y, &path, &self.rules, dec),
         }
     }
 
@@ -2613,6 +2643,12 @@ impl Prep {
             }
         }
         out.extend(m.oracle.iter().map(|g| (1, g[0])));
+        // R-P5P9-98: a pair equal only as exact decimals: ours' row on the node.
+        for &(i, j) in &m.pairs {
+            if self.decimal_only(node_of(&self.a[i]), &self.b[j]) && !out.contains(&(0, i)) {
+                out.push((0, i));
+            }
+        }
         // R-P5P9-86 C: a coinbase pair whose keys differ: both sides on the node.
         for &(i, j) in &m.pairs {
             if self.b[j].id.coinbase && self.b[j].id.rk != self.a[i].id.rk {
@@ -2837,6 +2873,13 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
         hs.iter().min()
     }
     .copied();
+    // R-P5P9-97 W: a newest-first cut list whose every row of ours is above the oracle's
+    // ceiling (ours near the tip, the oracle frozen) still has a lowest listed row: an oracle
+    // row below it is below our window. Every such row of ours has its own height (checked
+    // above for the live ones; the others are above the ceiling by that height).
+    if d.lowest.is_none() && !w.asc && live_a.is_empty() {
+        d.lowest = ha.iter().flatten().min().copied();
+    }
     let ct = |r: &Row| r.id.ctime.as_deref().and_then(parse_utc);
     let times = live_b.iter().filter_map(|&j| ct(&p.b[j]).map(|t| (t, j)));
     let b_last = if w.asc { times.max() } else { times.min() };
@@ -2853,6 +2896,17 @@ pub fn decide(p: &Prep, va: &[Option<Verdict>], vb: &[Option<Verdict>], w: &Wind
                 Some(ra.edge.clone()),
                 None,
                 "ours lists the row twice".into(),
+            ));
+            continue;
+        }
+        // R-P5P9-98: a pair equal only as exact decimals is a pair once the node holds ours'
+        // row (its TRANSFER amount equal as an exact decimal); otherwise undecided.
+        if p.decimal_only(node_of(ra), &p.b[j]) && canon(&va[i]) != Canon::Yes {
+            d.undecided.push(format!(
+                "a pair equal only as exact decimals whose row of ours the node did not \
+                 settle ({}): {}",
+                why_of(vi),
+                ra.id.evidence()
             ));
             continue;
         }
@@ -3295,6 +3349,18 @@ fn bare_root(body: &Value) -> Option<String> {
         .map(|(k, _)| k.clone())
 }
 
+/// R-P5P9-97 F: gives the root list `root` of `data` (the response's `data` object) that
+/// selects `edges` but no `pageInfo` the `pageInfo` of R-P5P9-88's rule for page size
+/// `first`: a next page when it holds min(`first`, ours' cap) rows. Anything else is left.
+fn bare_page_info(data: &mut Value, root: &str, first: u64) {
+    if let Some(c) = data.get_mut(root) {
+        if c.get("pageInfo").is_none() && c.get("edges").is_some_and(Value::is_array) {
+            let rows = c["edges"].as_array().map_or(0, Vec::len) as u64;
+            c["pageInfo"] = json!({"hasNextPage": rows >= first.min(OURS_PAGE_CAP)});
+        }
+    }
+}
+
 /// The page size `first` of root list `root`: its own argument (a literal or a set
 /// variable), else the variable the document passes to `first`.
 fn root_first(query: Option<&str>, root: &str, vars: &Map<String, Value>) -> Option<u64> {
@@ -3724,6 +3790,11 @@ impl Ctx {
                 .gql_read(ta, &op.query, Value::Object(v.clone()))
                 .await
                 .ok_or("the read failed")?;
+            // R-P5P9-97 F: a root list without `pageInfo` (Transfers-8c8a0f56) follows
+            // R-P5P9-88's rule here too: cut when it holds min(first, ours' cap) rows.
+            if crate::graphql::root_connection(&mut data).is_none() {
+                bare_page_info(&mut data, root, (n + PREFIX_EXTRA) as u64);
+            }
             let conn =
                 crate::graphql::root_connection(&mut data).ok_or("the read holds no list")?;
             let more = conn
@@ -4065,15 +4136,11 @@ impl Ctx {
         ours: &str,
         st: &mut Reads,
     ) -> Result<Value, String> {
-        let rk = row
-            .get("requestKey")
-            .and_then(Value::as_str)
-            .ok_or("ours' row selects no requestKey")?;
-        let chain = row
-            .pointer("/block/chainId")
-            .or_else(|| row.get("chainId"))
-            .and_then(|c| text(c).and_then(|t| t.parse::<u8>().ok()))
-            .ok_or("ours' row selects no chain")?;
+        // R-P5P9-97 X: the request key and chain from any field naming them, the row's relay
+        // id included (a Transfer id holds both).
+        let id = row_id(&json!({ "node": row }));
+        let rk = id.rk.as_deref().ok_or("ours' row selects no requestKey")?;
+        let chain = id.chain.ok_or("ours' row selects no chain")?;
         let poll = self
             .h7_poll(chain, rk, st)
             .await?
@@ -4082,6 +4149,8 @@ impl Ctx {
         if let Some(o) = other.as_object_mut() {
             o.remove("amount");
         }
+        // R-P5P9-98: the node's amount (`{"decimal": …}` or text) equals ours' as an exact
+        // decimal; this replaces R-P5P9-86 X's text equality.
         let hit = poll
             .get("events")
             .and_then(Value::as_array)
@@ -4090,12 +4159,15 @@ impl Ctx {
             .filter(|ev| transfer_matches(&other, ev, false))
             .find_map(|ev| {
                 let at = format!("/params/{}", 2 + transfer_offset(ev));
-                text(ev.pointer(&at)?).filter(|t| t == ours)
+                let n = ev.pointer(&at)?;
+                crate::diff::same_exact_decimal(n, &json!(ours))
+                    .then(|| pact_text(n))
+                    .flatten()
             });
         match hit {
             Some(t) => Ok(json!({"requestKey": rk, "chain": chain, "amount": t})),
             None => Err(format!(
-                "no TRANSFER of the row on the node has ours' amount text {ours}"
+                "no TRANSFER of the row on the node has ours' amount {ours} as an exact decimal"
             )),
         }
     }
@@ -4168,6 +4240,28 @@ impl Ctx {
                                 }
                                 if let Some(cmds) = c["cmds"].as_array() {
                                     prefix_cmds_match(&payload, cmds)?;
+                                }
+                                // R-P5P9-97 G: out of order, both sides as multisets of
+                                // the node's block: ours all of it (the count is checked
+                                // above), the oracle's rows each a distinct tx of it.
+                                if let Some(m) = c["multiset"].as_object() {
+                                    for side in ["ours", "oracle"] {
+                                        let cmds = m
+                                            .get(side)
+                                            .and_then(Value::as_array)
+                                            .ok_or("a multiset side without its rows")?;
+                                        prefix_cmds_match(&payload, cmds)
+                                            .map_err(|w| format!("in any order, {side}: {w}"))?;
+                                    }
+                                    if let Some(k) = m.get("oracleKeys").and_then(Value::as_array) {
+                                        if k.iter().any(|x| {
+                                            !x.as_str().is_some_and(|x| nk.iter().any(|n| n == x))
+                                        }) {
+                                            return Err("an oracle request key is not in the \
+                                                node's block"
+                                                .into());
+                                        }
+                                    }
                                 }
                                 Ok(nk.len())
                             }),
@@ -4681,13 +4775,14 @@ impl Ctx {
                     ),
                 ));
             }
-            if out.len() > COUNT_WALK_ROWS {
+            let cap = self
+                .gql
+                .walk_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if out.len() > cap {
                 return Err((
                     true,
-                    format!(
-                        "count walk capped: {} lists more than {COUNT_WALK_ROWS} rows",
-                        t.name
-                    ),
+                    format!("count walk capped: {} lists more than {cap} rows", t.name),
                 ));
             }
             let more = c
@@ -6254,6 +6349,29 @@ mod tests {
 
     /// R-P5P9-81 (m-1): the settle counts list the four named classes always, any other
     /// class present, and `key-only` as given.
+    #[test]
+    fn h_f_a_bare_root_list_reads_as_a_connection() {
+        let page = |n: usize| {
+            json!({"transfers": {"edges": (0..n).map(|i| json!({"node": {"i": i}}))
+                .collect::<Vec<_>>()}})
+        };
+        let mut full = page(60);
+        bare_page_info(&mut full, "transfers", 60);
+        let c = crate::graphql::root_connection(&mut full).expect("a connection");
+        assert_eq!(c.pointer("/pageInfo/hasNextPage"), Some(&json!(true)));
+        let mut short = page(12);
+        bare_page_info(&mut short, "transfers", 60);
+        let c = crate::graphql::root_connection(&mut short).expect("a connection");
+        assert_eq!(c.pointer("/pageInfo/hasNextPage"), Some(&json!(false)));
+        // Another root, or a list that already selects pageInfo, is left as it is.
+        let mut other = page(3);
+        bare_page_info(&mut other, "blocks", 60);
+        assert!(crate::graphql::root_connection(&mut other).is_none());
+        let mut own = json!({"transfers": {"edges": [], "pageInfo": {"hasNextPage": true}}});
+        bare_page_info(&mut own, "transfers", 60);
+        assert_eq!(own["transfers"]["pageInfo"], json!({"hasNextPage": true}));
+    }
+
     #[test]
     fn settle_counts_per_class() {
         let rows = [

@@ -550,6 +550,10 @@ pub struct GqlState {
     /// Node reads the node-refereed rules may still make in this process (R-P5P9-62: the
     /// referee's run cap; unbounded in a live run, where each compare has its own cap).
     pub node_budget: AtomicUsize,
+    /// R-P5P9-97 TC: rows a side the count walk reads at most: live
+    /// [`crate::graphql_window::COUNT_WALK_ROWS`]; the referee raises it to
+    /// [`crate::graphql_window::REFEREE_COUNT_WALK_ROWS`] (the oracle is frozen and offline).
+    pub walk_rows: AtomicUsize,
     /// The client and limiter of H7's header-by-hash reads (R-P5P9-63 (5), R-P5P9-65 (2)).
     header: std::sync::OnceLock<(reqwest::Client, Arc<crate::target::Limiter>)>,
 }
@@ -581,6 +585,7 @@ impl GqlState {
             oracle_pause_until: Mutex::new(None),
             local: std::sync::OnceLock::new(),
             node_budget: AtomicUsize::new(usize::MAX),
+            walk_rows: AtomicUsize::new(crate::graphql_window::COUNT_WALK_ROWS),
             header: std::sync::OnceLock::new(),
         })
     }
@@ -1112,6 +1117,38 @@ impl std::error::Error for MergedBytes {}
 /// server's load (R-P5P9-67 I-A (b): 5xx, timeouts and rate limits stay errors).
 fn page_fault_is_ours(status: u16) -> bool {
     status < 500 && status != 408 && status != 429
+}
+
+/// R-P5P9-97 P (#977): ours' first page that answered (status 200, or another status
+/// [`page_fault_is_ours`]) with `errors` and no `data`, where the oracle answered without
+/// errors, is the first-page fault the fetch path marks: the diff's `/data` and `/errors`
+/// entries become one [`FIRST_PAGE_FAULT_PATH`] entry whose `why` is ours' errors' text
+/// (the follow-page fault's shape), so KNOWN-GAP P reads it as it reads a fetch fault. Any
+/// other difference is kept, and the marker is never explained by itself.
+pub fn first_page_error_fault(a: &Value, status: u16, b: &Value, d: &mut Vec<DiffEntry>) {
+    let errs = a.get("errors").and_then(Value::as_array);
+    let ours_failed = errs.is_some_and(|e| !e.is_empty())
+        && a.get("data").is_none_or(Value::is_null)
+        && page_fault_is_ours(status);
+    let oracle_ok = b
+        .get("errors")
+        .is_none_or(|e| e.as_array().is_some_and(Vec::is_empty))
+        && b.get("data").is_some_and(|x| !x.is_null());
+    let ours_part = |p: &str| p == "/data" || p == "/errors" || p.starts_with("/errors/");
+    if !ours_failed || !oracle_ok || !d.iter().any(|e| ours_part(&e.path)) {
+        return;
+    }
+    d.retain(|e| !ours_part(&e.path));
+    let why = format!(
+        "errors: {}",
+        Value::Array(errs.cloned().unwrap_or_default())
+    );
+    d.push(DiffEntry {
+        path: FIRST_PAGE_FAULT_PATH.into(),
+        kind: DiffKind::Changed,
+        a: Some(json!({"page": 1, "status": status, "why": why})),
+        b: None,
+    });
 }
 
 /// The diff entry of a fetch that stopped at a first- or follow-page fault of ours or the
@@ -1739,6 +1776,8 @@ impl Ctx {
             self.gql_count_walk(ta, tb, op, vars, &mut d, &mut note, max, u64::MAX, st)
                 .await;
         }
+        // R-P5P9-97 P (#977): ours' first page answered with errors and no data.
+        first_page_error_fault(&a.body, a.status, &b.body, &mut d);
         (d, note)
     }
 
@@ -3701,6 +3740,43 @@ mod tests {
         assert!(text.contains("  tip (1): TipDoc\n"), "{text}");
         assert!(text.contains("  subscription (1): SubDoc\n"), "{text}");
         assert!(text.contains("  unsupported (1): PriceDoc\n"), "{text}");
+    }
+
+    #[test]
+    fn h_p_a_first_page_error_answer_is_the_fault_marker() {
+        use crate::report::{DiffEntry, DiffKind};
+        let a = json!({"data": null, "errors": [{"message": "request deadline exceeded",
+            "extensions": {"code": "TIMEOUT"}}]});
+        let b = json!({"data": {"transactions": {"edges": []}}});
+        let e = |p: &str, k: DiffKind| DiffEntry {
+            path: p.into(),
+            kind: k,
+            a: None,
+            b: None,
+        };
+        let stored = || vec![e("/data", DiffKind::Type), e("/errors", DiffKind::Extra)];
+        let mut d = stored();
+        first_page_error_fault(&a, 200, &b, &mut d);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].path, FIRST_PAGE_FAULT_PATH);
+        let why = d[0].a.as_ref().unwrap()["why"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(why.contains("request deadline exceeded"), "{why}");
+        // Another difference stays; a 5xx is not ours' fault; an oracle error too.
+        let mut d = stored();
+        d.push(e("/extensions", DiffKind::Extra));
+        first_page_error_fault(&a, 200, &b, &mut d);
+        assert!(d.iter().any(|x| x.path == "/extensions"), "{d:?}");
+        for (st, bb) in [
+            (503, b.clone()),
+            (200, json!({"data": null, "errors": [{}]})),
+        ] {
+            let mut d = stored();
+            first_page_error_fault(&a, st, &bb, &mut d);
+            assert!(d.iter().all(|x| x.path != FIRST_PAGE_FAULT_PATH), "{d:?}");
+        }
     }
 
     #[test]

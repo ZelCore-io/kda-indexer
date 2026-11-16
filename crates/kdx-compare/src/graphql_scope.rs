@@ -280,9 +280,33 @@ fn prefix_candidate(
     // matchers).
     let explain = crate::graphql_norm::explain(rules, false);
     let same = |x: &Value, y: &Value| crate::diff::diff_explained(x, y, &explain).0.is_empty();
-    if !ra.iter().zip(&rb).all(|(x, y)| same(x, y)) {
-        return None;
-    }
+    // R-P5P9-97 G: a block's nested `transactions` take no order argument, so the two sides
+    // may list the block's txs in different orders (ours the node's payload order reversed,
+    // N's ruling). Out of order, the lists compare as multisets: every row on both sides is
+    // checked against the node's block by its `cmd` (each row must select one, and nothing
+    // the node check does not read), and ours must be the node's block exactly.
+    let multiset = if ra.iter().zip(&rb).all(|(x, y)| same(x, y)) {
+        None
+    } else {
+        let cmd_of = |e: &Value| -> Option<Value> {
+            let n = e.get("node")?.as_object()?;
+            let plain = n.iter().all(|(k, v)| match k.as_str() {
+                "hash" | "requestKey" | "cmd" => true,
+                "__typename" => v.as_str() == Some("Transaction"),
+                _ => false,
+            });
+            plain.then(|| n.get("cmd").cloned()).flatten()
+        };
+        let all = |rows: &[Value]| rows.iter().map(cmd_of).collect::<Option<Vec<Value>>>();
+        let key = |e: &Value| {
+            e.pointer("/node/hash")
+                .or_else(|| e.pointer("/node/requestKey"))
+                .cloned()
+        };
+        let oracle_keys: Vec<Value> = rb.iter().filter_map(key).collect();
+        Some(json!({"ours": all(&ra)?, "oracle": all(&rb)?,
+            "oracleKeys": (oracle_keys.len() == rb.len()).then_some(oracle_keys)}))
+    };
     if total(cb).is_some() && total(cb) != total(ca) {
         return None;
     }
@@ -332,7 +356,8 @@ fn prefix_candidate(
         not yet checked on the node", "prefix": {"rows": rb.len(), "of": ra.len(),
         "chain": chain, "height": height, "hash": hash,
         "keys": (keys.len() == ra.len()).then_some(keys),
-        "unchecked": unchecked, "cmds": (!cmds.is_empty()).then_some(cmds)}}),
+        "unchecked": unchecked, "cmds": (!cmds.is_empty()).then_some(cmds),
+        "multiset": multiset}}),
     )
 }
 

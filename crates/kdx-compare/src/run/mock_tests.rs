@@ -19,6 +19,7 @@ use crate::graphql_window::Reads;
 mod e2b;
 mod e3b;
 mod g;
+mod h;
 
 /// The node: every chain's cut at `tip`, the canonical hash per (chain, height) and the block
 /// `/poll` puts each request key in. Every path asked is logged.
@@ -8397,6 +8398,23 @@ async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
     let rep = e2_referee(cfg(), dir.path(), &[rec("10.904046")]).await;
     assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
     assert_eq!(rep.by_class.get("graphql-native-miner-skew"), Some(&1));
+    // R-P5P9-97 S′ (#117's shape): the stored GraphQL balance is a JSON number, read as an
+    // exact decimal; R-P5P9-98: native's trailing zeros past 12 places are ignored. A number
+    // whose gap is no coinbase multiple stays unexplained.
+    for (ours, native, explained) in [
+        ("10.0", "10.904046000000000", 1),
+        ("10", "10.904046", 1),
+        ("10.5", "10.904046", 0),
+    ] {
+        let mut r = rec(native);
+        r.diff[0].a = Some(serde_json::from_str(ours).unwrap());
+        let rep = e2_referee(cfg(), dir.path(), &[r]).await;
+        assert_eq!(
+            (rep.explained, rep.unexplained),
+            (explained, 1 - explained),
+            "{ours} {native}: {rep:?}"
+        );
+    }
     // R-P5P9-95 I-4: 9.095954 is GraphQL one coinbase above native (a skew leaves GraphQL
     // below native only).
     for native in ["12.712138", "10.5", "9.095954"] {
