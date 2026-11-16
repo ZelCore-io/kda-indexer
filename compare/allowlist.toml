@@ -768,6 +768,17 @@ ruling = "R-P5P9-97 U."
 owner_note = "PROPOSED (ruling R-P5P9-97 U): new in FVH-H part 2; CG-5 class U (#432, #2045)."
 
 [[entry]]
+id = "graphql-r97-oracle-chain-dupes"
+route = "other"
+json_path_glob = "/~graphql-r97-oracle-chain-dupes"
+condition = "any"
+request_contains = "graphql:"
+reason = "R-P5P9-97 Q #37 (oracle duplicates; not the Q known gap): nonFungibleAccount.chainAccounts where ours lists each chain once, every row of the oracle's equals a row of ours field for field, ours' rows are all among them, and the oracle repeats at least one. Each repeated row is confirmed on the node: of the tokens ours lists for the account on that chain (nonFungibleChainAccount, at most 3), marmalade-v2.ledger's get-balance on the node (/local) is above zero for one. Then the oracle's list keeps one copy of each row, in its order, and the diff compares the rest. A copy that differs from ours' row, a chain ours lists twice, no token of ours, a node balance absent or zero, or a failed read stays unexplained. Evidence: CG-5 re-referee #37 (k:d53408e4..., ours one chain-8 row, the oracle 8 identical chain-8 rows with the same id)."
+status = "PROPOSED"
+ruling = "R-P5P9-97 Q #37."
+owner_note = "PROPOSED (ruling R-P5P9-97 Q #37): new in FVH-H part 2; CG-5 #37."
+
+[[entry]]
 id = "graphql-oracle-decimal-zeros"
 route = "other"
 json_path_glob = "/~graphql-oracle-decimal-zeros"

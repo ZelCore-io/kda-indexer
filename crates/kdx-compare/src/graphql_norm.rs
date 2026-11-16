@@ -39,6 +39,9 @@ pub const ORACLE_EMPTY_PATH: &str = "/~graphql-r58-oracle-empty";
 pub const COUNT_LOWER_BOUND_PATH: &str = "/~graphql-r58-count-lower-bound";
 /// Visible hit of `oracle_orphan_dupes` (allowlist id `graphql-r58-oracle-orphan-dupes`).
 pub const ORPHAN_DUPES_PATH: &str = "/~graphql-r58-oracle-orphan-dupes";
+/// R-P5P9-97 Q #37: visible hit of the oracle's copies of a non-fungible chain row that ours
+/// lists once and the node confirms (allowlist id `graphql-r97-oracle-chain-dupes`).
+pub const ORACLE_CHAIN_DUPES_PATH: &str = "/~graphql-r97-oracle-chain-dupes";
 /// Visible hit of `by_key_extra_row` (allowlist id `graphql-r58-by-key-extra-row`).
 pub const BY_KEY_EXTRA_PATH: &str = "/~graphql-r58-by-key-extra-row";
 /// Visible hit of `oracle_strips_quotes` (allowlist id `graphql-r60-oracle-strips-quotes`).
@@ -486,6 +489,38 @@ pub fn missing_chain_rows(a: &Value, b: &mut Value) -> Vec<(String, Vec<Value>)>
         }
     }
     out
+}
+
+/// R-P5P9-97 Q #37, on the answers: the non-fungible chain rows (`nonFungibleAccount.
+/// chainAccounts`) where ours lists each chain once and every row of the oracle's is equal,
+/// field for field, to a row of ours, ours' rows all among them, and the oracle repeats at
+/// least one. Returns the repeated rows of ours (each with its chain); an empty list when the
+/// shape is any other.
+pub fn oracle_chain_dupes(a: &Value, b: &Value) -> Vec<Value> {
+    let p = "/data/nonFungibleAccount/chainAccounts";
+    let (Some(Value::Array(ra)), Some(Value::Array(rb))) = (a.pointer(p), b.pointer(p)) else {
+        return Vec::new();
+    };
+    let chain = |r: &Value| {
+        r.get("chainId")
+            .and_then(|c| c.as_str().map(str::to_string))
+    };
+    let ka: Vec<Option<String>> = ra.iter().map(chain).collect();
+    let once = ka
+        .iter()
+        .enumerate()
+        .all(|(i, k)| k.is_some() && !ka[..i].contains(k));
+    if !once
+        || rb.len() <= ra.len()
+        || !rb.iter().all(|r| ra.contains(r))
+        || !ra.iter().all(|r| rb.contains(r))
+    {
+        return Vec::new();
+    }
+    ra.iter()
+        .filter(|r| rb.iter().filter(|x| x == r).count() > 1)
+        .cloned()
+        .collect()
 }
 
 /// R-P5P9-75 I: for each `oracle_counts_heights` rule `<root>.totalCount`, the oracle's root

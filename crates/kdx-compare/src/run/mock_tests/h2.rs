@@ -331,3 +331,97 @@ async fn h2_u_the_oracles_list_one_row_over_its_own_count() {
     let rep = walk_referee(vec![w()], unsettled, (1, 2)).await;
     assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Q #37
+
+fn q_body(rows: Vec<Value>) -> Value {
+    json!({"data": {"nonFungibleAccount": {"id": "N", "accountName": "k:a",
+        "chainAccounts": rows}}})
+}
+
+fn q_row(chain: &str) -> Value {
+    json!({"id": format!("C{chain}"), "chainId": chain, "accountName": "k:a"})
+}
+
+/// The stored referee over Q #37's record: ours lists chain 8 once, the oracle `oracle`;
+/// ours' chain 8 holds `tokens`, and the node's `get-balance` on chain 8 answers `balance`.
+async fn q_referee(
+    oracle: Vec<Value>,
+    tokens: Vec<Value>,
+    balance: Option<Value>,
+) -> crate::referee::Report {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = NodeMock::default();
+    if let Some(b) = balance {
+        node.local.insert((8, "k:a".into()), b);
+    }
+    let nu = node_server(node).await;
+    let au = ours_fn_server(move |req: &Value| {
+        let q = req["query"].as_str().unwrap_or("");
+        if q.contains("nonFungibleChainAccount") && req["variables"]["c"] == json!("8") {
+            json!({"data": {"nonFungibleChainAccount": {"nonFungibleTokenBalances": tokens}}})
+        } else {
+            json!({"data": null})
+        }
+    })
+    .await;
+    let ops = dir.path().join("ops");
+    std::fs::create_dir_all(&ops).unwrap();
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../compare/graphql/QNonFungibleAccount.graphql");
+    std::fs::copy(doc, ops.join("QNonFungibleAccount.graphql")).unwrap();
+    let cfg = c3_cfg(&nu, &au, "http://127.0.0.1:9/graphql", dir.path(), &ops, "");
+    let diff = (1..oracle.len())
+        .map(|i| {
+            h2_missing(
+                &format!("/data/nonFungibleAccount/chainAccounts/{i}"),
+                oracle[i].clone(),
+            )
+        })
+        .collect();
+    let rec = e2_stored(
+        "QNonFungibleAccount",
+        json!({"accountName": "k:a"}),
+        q_body(vec![q_row("8")]),
+        q_body(oracle),
+        diff,
+    );
+    e2_referee(cfg, dir.path(), &[rec]).await
+}
+
+/// R-P5P9-97 Q #37: the oracle repeats ours' one chain-8 row 8 times (same id). Ours lists
+/// it once and the node confirms it (marmalade-v2's `get-balance` of a token ours lists on
+/// chain 8 is above zero): the copies are oracle duplicates → explained by their own hit,
+/// not the Q known gap. Without the node's balance, without a token of ours, or with copies
+/// that differ from ours' row, the record stays unexplained.
+#[tokio::test]
+async fn h2_q_oracle_duplicates_of_a_chain_row_ours_lists_once() {
+    let dupes = vec![q_row("8"); 8];
+    let tok = vec![json!({"tokenId": "t:1", "balance": 1})];
+    let rep = q_referee(dupes.clone(), tok.clone(), Some(json!(1.0))).await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    assert_eq!(
+        rep.by_class.get("graphql-r97-oracle-chain-dupes"),
+        Some(&1),
+        "{rep:?}"
+    );
+    let rep = q_referee(dupes.clone(), tok.clone(), None).await;
+    assert_eq!(
+        (rep.explained, rep.unexplained),
+        (0, 1),
+        "no balance: {rep:?}"
+    );
+    let rep = q_referee(dupes.clone(), vec![], Some(json!(1.0))).await;
+    assert_eq!(
+        (rep.explained, rep.unexplained),
+        (0, 1),
+        "no token: {rep:?}"
+    );
+    let rep = q_referee(dupes.clone(), tok.clone(), Some(json!(0.0))).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "zero: {rep:?}");
+    let mut other = dupes;
+    other[3]["id"] = json!("C9");
+    let rep = q_referee(other, tok, Some(json!(1.0))).await;
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "unlike: {rep:?}");
+}

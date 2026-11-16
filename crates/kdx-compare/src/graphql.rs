@@ -1737,6 +1737,10 @@ impl Ctx {
     ) -> (Vec<DiffEntry>, Option<String>) {
         let root_scoped = crate::graphql_scope::root_scoped(&op.roots, vars);
         let mut row_hits = self.gql_row_rules(ta, vars, a, b).await;
+        // R-P5P9-97 Q #37: the oracle's copies of a chain row ours lists once.
+        if self.gql_oracle_chain_dupes(ta, a, b).await {
+            row_hits.push(crate::graphql_norm::ORACLE_CHAIN_DUPES_PATH);
+        }
         let live_tb = match &h6 {
             H6::Live(tb) => Some(*tb),
             H6::Stored(_) => None,
@@ -2208,6 +2212,76 @@ impl Ctx {
         self.gql_count(ROW_RULE_ROUTE, &ta.name, &[c.ms]);
         let v: Value = serde_json::from_slice(&c.body).ok()?;
         v.get("data").filter(|d| !d.is_null()).cloned()
+    }
+
+    /// R-P5P9-97 Q #37: when the oracle repeats non-fungible chain rows that ours lists once
+    /// ([`crate::graphql_norm::oracle_chain_dupes`]), each repeated row is confirmed on the
+    /// node: of the tokens ours lists for the account on that chain (at most 3), marmalade-v2's
+    /// `get-balance` on the node is above zero for one. When every one is confirmed, the
+    /// oracle's list keeps one copy of each row, in its order. Any failed read leaves it.
+    pub(crate) async fn gql_oracle_chain_dupes(
+        &self,
+        ta: &Target,
+        a: &Answer,
+        b: &mut Answer,
+    ) -> bool {
+        let rows = crate::graphql_norm::oracle_chain_dupes(&a.body, &b.body);
+        if rows.is_empty() {
+            return false;
+        }
+        let q = "query($a: String!, $c: String!) { nonFungibleChainAccount(accountName: $a, \
+                 chainId: $c) { nonFungibleTokenBalances { tokenId } } }";
+        for r in &rows {
+            let (Some(acct), Some(c)) = (
+                r.get("accountName").and_then(Value::as_str),
+                r.get("chainId").and_then(Value::as_str),
+            ) else {
+                return false;
+            };
+            let Ok(chain) = c.parse::<u8>() else {
+                return false;
+            };
+            let Some(d) = self.gql_read(ta, q, json!({"a": acct, "c": c})).await else {
+                return false;
+            };
+            let tokens: Vec<String> = d
+                .pointer("/nonFungibleChainAccount/nonFungibleTokenBalances")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t.get("tokenId").and_then(Value::as_str).map(str::to_string))
+                .take(3)
+                .collect();
+            let mut held = false;
+            for t in &tokens {
+                if let Ok(kdx_node::local::Local::Found { value, .. }) = self
+                    .gql_local()
+                    .get_balance(chain, "marmalade-v2.ledger", t, acct)
+                    .await
+                {
+                    if !value.starts_with('-') && value.chars().any(|ch| ('1'..='9').contains(&ch))
+                    {
+                        held = true;
+                        break;
+                    }
+                }
+            }
+            if !held {
+                return false;
+            }
+        }
+        let Some(Value::Array(rb)) = b.body.pointer_mut("/data/nonFungibleAccount/chainAccounts")
+        else {
+            return false;
+        };
+        let mut kept: Vec<Value> = Vec::new();
+        for r in rb.drain(..) {
+            if !kept.contains(&r) {
+                kept.push(r);
+            }
+        }
+        *rb = kept;
+        true
     }
 
     /// R-P5P9-58 row rules of an oracle pair (`[graphql] field_rules`), applied before the
