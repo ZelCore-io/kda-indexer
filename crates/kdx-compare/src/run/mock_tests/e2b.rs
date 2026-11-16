@@ -1060,6 +1060,52 @@ async fn i_rest_a_self_transfer_listed_twice_is_two_rows() {
     }
 }
 
+/// R-P5P9-105 (REST #1966, ours' floor height): ours is full (5 rows of limit 5, counted from
+/// ours' own page) and the oracle lists a row at ours' lowest height (7,000,100) that ours
+/// does not: the cut falls inside that height. The row counts as below the cut when the
+/// node's `/poll` places it canonical at that height → explained. Ours not full, or the row
+/// in another block on the node, stays unexplained.
+#[tokio::test]
+async fn i_rest_an_oracle_row_at_ours_floor_height_canonical_on_the_node() {
+    for (case, explained) in [("full", 1usize), ("not full", 0), ("not canonical", 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = acct_pair(7_000_100);
+        let a = if case == "not full" {
+            let mut x = a.as_array().unwrap().clone();
+            x.remove(1);
+            Value::Array(x)
+        } else {
+            a
+        };
+        let mut node = rest_node();
+        let block = if case == "not canonical" {
+            "c7000101"
+        } else {
+            "c7000100"
+        };
+        node.polls.insert(
+            "e1".into(),
+            (
+                9,
+                json!({"reqKey": "e1", "metaData": {"blockHash": block,
+                    "blockHeight": 7_000_100u64},
+                    "events": [{"name": "TRANSFER", "params": ["x", ACCT, 5.0]}]}),
+            ),
+        );
+        let nu = node_server(node).await;
+        let cfg = rest_cfg(
+            &nu,
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            dir.path(),
+            "chainweb_data",
+        );
+        let rec = rest_record("account", ACCT_REQ, &a, &b);
+        let rep = e2_referee(cfg, dir.path(), &[rec]).await;
+        assert_eq!(rep.explained, explained, "{case}: {rep:?}");
+    }
+}
+
 /// R-P5P9-95 m-9: the REST stored form's node polls (`node_confirms`) are reads of the run's
 /// budget. With only the chain graph's read allowed, a user row only ours lists is not
 /// confirmed; with the budget it is.

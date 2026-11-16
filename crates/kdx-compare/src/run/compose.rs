@@ -41,6 +41,9 @@ fn remove_rows(v: &mut Value, rows: &[Value]) {
     }
 }
 
+/// R-P5P9-105 (REST #1966): oracle-only rows at ours' floor height polled at most.
+pub const FLOOR_CHECKS: usize = 50;
+
 /// A REST account row whose sender is its receiver (a non-empty account).
 fn is_self_transfer(r: &Value) -> bool {
     let acct = |k: &str| r.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
@@ -187,6 +190,7 @@ impl Ctx {
             return Err("a row only ours lists is listed more than once".into());
         }
         let lowest = lowest_a;
+        let mut floor: Vec<Value> = Vec::new();
         for r in &only_b {
             let h = row_height(r);
             // R-P5P9-95 m-6: below ours' lowest height by position; at it, only inside the
@@ -196,6 +200,13 @@ impl Ctx {
                 (Some(h), Some(m)) if h == m => horizon.is_some_and(|f| h >= f),
                 _ => false,
             };
+            // R-P5P9-105 (#1966): at ours' own floor height, with ours full, the row counts
+            // as below the cut when the node places it canonical at that height (below).
+            let at_floor = full_a && !placed && h.is_some() && h == lowest;
+            if at_floor {
+                floor.push(r.clone());
+                continue;
+            }
             if !(full_a && placed) {
                 return Err(format!(
                     "an oracle-only row at height {h:?} is not below ours' lowest {lowest:?} \
@@ -203,6 +214,11 @@ impl Ctx {
                      ({full_a})"
                 ));
             }
+        }
+        if !floor.is_empty() {
+            self.node_places_at_floor(req, &floor)
+                .await
+                .map_err(|w| format!("an oracle-only row at ours' floor height {lowest:?}: {w}"))?;
         }
         if only_a.len() > NODE_GAP_CHECKS {
             return Err(format!(
@@ -284,6 +300,57 @@ impl Ctx {
             b: None,
         });
         Ok(out)
+    }
+
+    /// R-P5P9-105 (REST #1966): each oracle-only row at ours' floor height (at most
+    /// [`FLOOR_CHECKS`]) is canonical there on the node: its `/poll` entry is in the row's
+    /// block at the row's height. One read of the run's budget per chain chunk.
+    async fn node_places_at_floor(&self, req: &Request, rows: &[Value]) -> Result<(), String> {
+        if rows.len() > FLOOR_CHECKS {
+            return Err(format!("{} rows, over {FLOOR_CHECKS}", rows.len()));
+        }
+        let mut by_chain: HashMap<u8, Vec<(String, String, u64)>> = HashMap::new();
+        for r in rows {
+            let s = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_string);
+            let (Some(rk), Some(bh), Some(c), Some(h)) =
+                (s("requestKey"), s("blockHash"), row_chain(r), row_height(r))
+            else {
+                return Err("a row without its request key, block, chain or height".into());
+            };
+            if rk == "<coinbase>" {
+                return Err("a coinbase row has no /poll entry".into());
+            }
+            by_chain.entry(c).or_default().push((rk, bh, h));
+        }
+        for (c, keys) in by_chain {
+            for chunk in keys.chunks(NODE_POLL_CHUNK) {
+                if !self.gql.take_node_read() {
+                    return Err("the node read cap is reached".into());
+                }
+                self.count_request(req.route.as_str(), "node", 1);
+                let rks: Vec<String> = chunk.iter().map(|(rk, _, _)| rk.clone()).collect();
+                let res = self
+                    .node
+                    .poll(c, &rks)
+                    .await
+                    .map_err(|e| format!("poll failed: {e:#}"))?;
+                for (rk, bh, h) in chunk {
+                    let v = res
+                        .get(rk)
+                        .ok_or_else(|| format!("the node does not hold {rk}"))?;
+                    let at = (
+                        v.pointer("/metaData/blockHash").and_then(Value::as_str),
+                        v.pointer("/metaData/blockHeight").and_then(Value::as_u64),
+                    );
+                    if at != (Some(bh.as_str()), Some(*h)) {
+                        return Err(format!(
+                            "the node places {rk} at {at:?}, not the row's block at {h}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A coinbase row only ours lists: the node's canonical block at its (chain, height), on
