@@ -1326,6 +1326,92 @@ async fn i_rest_an_oracle_row_at_ours_floor_height_canonical_on_the_node() {
     }
 }
 
+/// Ours (full, limit 5) and chainweb-data with `n` oracle-only rows `e0..e{n-1}` at ours'
+/// floor height 7,000,100, each canonical there on the node (the shapes of #1385, #1854 and
+/// #1966: 82, 180 and 68 rows).
+fn floor_n(n: usize) -> (Value, Value, NodeMock) {
+    let (a, mut b) = acct_pair(7_000_100);
+    let rows = b.as_array_mut().unwrap();
+    rows.pop(); // acct_pair's single `e1`
+    let mut node = rest_node();
+    for i in 0..n {
+        let rk = format!("e{i}");
+        rows.push(acct_row(&rk, 7_000_100, "5.0"));
+        node.polls.insert(
+            rk.clone(),
+            (
+                9,
+                json!({"reqKey": rk, "metaData": {"blockHash": "c7000100",
+                    "blockHeight": 7_000_100u64},
+                    "events": [{"name": "TRANSFER", "params": ["x", ACCT, 5.0]}]}),
+            ),
+        );
+    }
+    (a, b, node)
+}
+
+/// R-P5P9-110 (REST #1385, #1854, #1966): the floor check's cap is 500 rows in the referee
+/// (live stays 50, as W's above-tip cap is split: 2,000 / 50). A referee record with 180
+/// oracle-only rows at ours' floor is explained when the node places every one; one with 501
+/// stays unexplained, naming the cap. Every `/poll` is a counted node read: 180 rows are
+/// 8 reads of 25 keys.
+#[tokio::test]
+async fn k_rest_the_referee_floor_cap_is_500_rows() {
+    let mut reads = Vec::new();
+    for (n, explained) in [(1usize, 1usize), (180, 1), (500, 1), (501, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, node) = floor_n(n);
+        let nu = node_server(node).await;
+        let cfg = rest_cfg(
+            &nu,
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            dir.path(),
+            "chainweb_data",
+        );
+        let rec = rest_record("account", ACCT_REQ, &a, &b);
+        let rep = e2_referee_capped(cfg, dir.path(), &[rec], 1_000).await;
+        assert_eq!(rep.explained, explained, "{n} rows: {rep:?}");
+        if explained == 0 {
+            let still = serde_json::to_string(&rep.still_unexplained).unwrap();
+            assert!(still.contains("501 rows, over 500"), "{still}");
+        }
+        reads.push(rep.node_reads);
+    }
+    // `/poll` takes 25 keys a read: 1 row is one read, 180 rows eight, 500 rows twenty; 501
+    // are refused before any read.
+    assert_eq!(reads[1], reads[0] + 7, "{reads:?}");
+    assert_eq!(reads[2], reads[0] + 19, "{reads:?}");
+    assert!(reads[3] <= reads[0], "{reads:?}");
+}
+
+/// R-P5P9-110: live keeps the 50-row floor cap: 180 oracle-only rows at ours' floor stay
+/// unexplained (the note names the cap), 50 are placed, and the referee's raise does not
+/// reach a live context.
+#[tokio::test]
+async fn k_rest_the_live_floor_cap_stays_50_rows() {
+    for (n, class) in [(180usize, "diff"), (50, "allowlisted"), (51, "diff")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, node) = floor_n(n);
+        let nu = node_server(node).await;
+        let (au, bu) = (reads_server(vec![a]).await, reads_server(vec![b]).await);
+        let ctx = Ctx::new(rest_cfg(&nu, &au, &bu, dir.path(), "chainweb_data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.gql
+                .floor_checks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            crate::graphql_window::FLOOR_CHECKS
+        );
+        let req = Request::new(ACCT_REQ.into(), Origin::Seed, None);
+        let o = ctx
+            .vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
+            .await;
+        assert_eq!(o.class, class, "{n} rows live: {o:?}");
+    }
+}
+
 /// R-P5P9-95 m-9: the REST stored form's node polls (`node_confirms`) are reads of the run's
 /// budget. With only the chain graph's read allowed, a user row only ours lists is not
 /// confirmed; with the budget it is.

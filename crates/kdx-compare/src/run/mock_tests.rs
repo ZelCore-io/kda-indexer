@@ -8464,11 +8464,14 @@ async fn i_s_the_gap_is_the_accounts_net_change_on_the_node() {
     let no = |rep: &crate::referee::Report, case: &str| {
         assert_eq!((rep.explained, rep.unexplained), (0, 1), "{case}: {rep:?}");
     };
-    // (a) #75: one coinbase + 1e-12, the f64 rounding of ours' 60263.91224935622.
+    // (a) #75's shape: one coinbase, ours' 60263.91224935622. R-P5P9-110: the gap is measured
+    // from the f64's exact value (2.78e-12 below that text), so the native text is one
+    // coinbase above the text; it was one unit (1e-12) more under the text-based measure, a
+    // value that is 3.78e-12 from the f64, past its half ulp of 3.64e-12.
     let rep = s_referee(
         s_node(&[100], &[]),
         "60263.91224935622",
-        "60264.816295356221",
+        "60264.81629535622",
     )
     .await;
     ok(&rep, "a");
@@ -8488,7 +8491,7 @@ async fn i_s_the_gap_is_the_accounts_net_change_on_the_node() {
     let rep = s_referee(
         s_node(&[100], &[(100, legs)]),
         "60263.91224935622",
-        "61931.877741326221",
+        "61931.87774132622",
     )
     .await;
     ok(&rep, "c");
@@ -8526,6 +8529,75 @@ async fn i_s_the_gap_is_the_accounts_net_change_on_the_node() {
     );
     let rep = s_referee(s_node_at(&[], &far, 196, 15), "10.0", "11.0").await;
     ok(&rep, "the default budget reads the window");
+}
+
+/// R-P5P9-110: the five stored S′ records of re-referee #3 (#117, #384, #524, #554, #584).
+/// The gap is measured from the exact value of ours' f64, not from ours' printed shortest
+/// text, which can itself be up to half an ulp off the f64. Each pair below is an f64 (ours'
+/// GraphQL number) and a native text built from the report's gap and matching run: the
+/// residual against the f64's exact value is 1.3 to 4.8e-12, inside its half ulp (3.64e-12,
+/// or 7.28e-12 for #384), and 4e-12 to 9e-12 against the shortest text, outside it. Each
+/// failed with the text-based measure.
+#[tokio::test]
+async fn k_s_the_gap_is_measured_from_the_exact_f64() {
+    let fee = |x: Value| vec![(100, vec![s_transfer("k:p", "k:m", x)])];
+    // #117: h280 a coinbase and 1.08e-5 of fees, h281 a coinbase (1.8081028).
+    let rep = s_referee(
+        s_node(&[100, 101], &fee(json!(0.0000108))),
+        "54284.63192951972",
+        "54286.440032319714",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#117: {rep:?}");
+    // #384: one coinbase (ours in the binade above 65,536: half an ulp 7.28e-12).
+    let rep = s_referee(
+        s_node(&[100], &[]),
+        "108658.8776613048",
+        "108659.781707304791",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#384: {rep:?}");
+    // #524: two coinbases, the node's value above (+3.2e-12 from the f64).
+    let rep = s_referee(
+        s_node(&[100, 101], &[]),
+        "50055.71773775338",
+        "50057.525829753384",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#524: {rep:?}");
+    // #554: two coinbases, the node's value below.
+    let rep = s_referee(
+        s_node(&[100, 101], &[]),
+        "51833.59778194551",
+        "51835.405873945504",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#554: {rep:?}");
+    // #584: a coinbase and 6.33e-5 of fees (0.9041093).
+    let rep = s_referee(
+        s_node(&[100], &fee(json!(0.0000633))),
+        "39715.34511975433",
+        "39716.249229054334",
+    )
+    .await;
+    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#584: {rep:?}");
+}
+
+/// R-P5P9-110, fail closed: the tolerance is still half an ulp of the f64, from its exact
+/// value. With one coinbase and ours 54284.63192951972 (half an ulp 3.64e-12), a native that
+/// is 0.38 ulp from the exact value is explained; 0.58 ulp below and 0.66 ulp above (the
+/// 12-place text cannot sit at exactly 0.6) stay unexplained.
+#[tokio::test]
+async fn k_s_more_than_half_an_ulp_from_the_exact_f64_stays_unexplained() {
+    for (native, explained) in [
+        ("54285.53597551972", 1usize),
+        ("54285.535975519713", 0),
+        ("54285.535975519722", 0),
+    ] {
+        let rep = s_referee(s_node(&[100], &[]), "54284.63192951972", native).await;
+        assert_eq!(rep.explained, explained, "{native}: {rep:?}");
+        assert_eq!(rep.unexplained, 1 - explained, "{native}: {rep:?}");
+    }
 }
 
 /// R-P5P9-86 S′ with R-P5P9-87, stored: a CG-5 NodeBalance record (labelled `node`) is miner

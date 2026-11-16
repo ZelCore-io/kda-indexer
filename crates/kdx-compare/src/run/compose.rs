@@ -41,9 +41,6 @@ fn remove_rows(v: &mut Value, rows: &[Value]) {
     }
 }
 
-/// R-P5P9-105 (REST #1966): oracle-only rows at ours' floor height polled at most.
-pub const FLOOR_CHECKS: usize = 50;
-
 /// A REST account row whose sender is its receiver (a non-empty account).
 fn is_self_transfer(r: &Value) -> bool {
     let acct = |k: &str| r.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
@@ -303,11 +300,16 @@ impl Ctx {
     }
 
     /// R-P5P9-105 (REST #1966): each oracle-only row at ours' floor height (at most
-    /// [`FLOOR_CHECKS`]) is canonical there on the node: its `/poll` entry is in the row's
-    /// block at the row's height. One read of the run's budget per chain chunk.
+    /// `FLOOR_CHECKS` live, `REFEREE_FLOOR_CHECKS` in the referee, both in `graphql_window`)
+    /// is canonical there on the node: its `/poll` entry is in the row's block at the row's
+    /// height. One read of the run's budget per chain chunk.
     async fn node_places_at_floor(&self, req: &Request, rows: &[Value]) -> Result<(), String> {
-        if rows.len() > FLOOR_CHECKS {
-            return Err(format!("{} rows, over {FLOOR_CHECKS}", rows.len()));
+        let cap = self
+            .gql
+            .floor_checks
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if rows.len() > cap {
+            return Err(format!("{} rows, over {cap}", rows.len()));
         }
         let mut by_chain: HashMap<u8, Vec<(String, String, u64)>> = HashMap::new();
         for r in rows {

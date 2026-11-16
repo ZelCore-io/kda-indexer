@@ -108,6 +108,12 @@ pub const COUNT_WALK_BYTES: usize = 4 << 20;
 pub const ABOVE_TIP_ROWS: usize = 50;
 /// R-P5P9-105 (W #2025): the referee's cap on those rows (the oracle is frozen and offline).
 pub const REFEREE_ABOVE_TIP_ROWS: usize = 2_000;
+/// R-P5P9-105 (REST #1966): oracle-only rows at ours' floor height polled at most (live).
+pub const FLOOR_CHECKS: usize = 50;
+/// R-P5P9-110 (REST #1385, #1854, #1966): the referee's cap on those rows, as W's above-tip
+/// cap is split (R-P5P9-105, 2,000 referee / 50 live). The cap is a read budget, not a
+/// correctness rule; the run's `--max-reads` still bounds the run.
+pub const REFEREE_FLOOR_CHECKS: usize = 500;
 /// R-P5P9-105 (W #2025): the referee's per-compare node cap, so that those rows can be read
 /// (a `/poll` and a header each) on top of [`NODE_READS`]. The run's `--max-reads` still
 /// caps the run.
@@ -5227,21 +5233,21 @@ impl Ctx {
             return Err("a balance is not a decimal".into());
         };
         // R-P5P9-105 S′: either sign; ours' GraphQL number is an f64, so the gap may be off
-        // by half an ulp of it (in units of 1e-12).
+        // by half an ulp of it. R-P5P9-110: that half ulp is measured from the exact value
+        // of the f64, not from ours' printed shortest text (which can itself be half an ulp
+        // off the f64). `v` explains the gap when the node's value less `v` is within half an
+        // ulp of the f64.
         let gap = y - x;
         if gap == 0 {
             return Err("no gap".into());
         }
-        let half_ulp = ours
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|f| f.is_finite())
-            .map_or(0.0, |f| {
-                let a = f.abs();
-                (f64::from_bits(a.to_bits() + 1) - a) / 2.0 * 1e12
-            });
-        let near = |v: i128| ((v - gap).abs() as f64) <= half_ulp;
+        let f = ours.trim().parse::<f64>().ok().filter(|f| f.is_finite());
+        let near = |v: i128| match f {
+            Some(f) => y
+                .checked_sub(v)
+                .is_some_and(|t| crate::graphql_norm::f64_within_half_ulp(f, t)),
+            None => v == gap,
+        };
         self.h7_take(&mut st)?;
         let tip = self
             .node

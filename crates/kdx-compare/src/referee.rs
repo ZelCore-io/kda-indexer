@@ -504,6 +504,12 @@ pub(crate) fn referee_mode(ctx: &Ctx, max_reads: usize) {
     ctx.gql
         .compare_reads
         .store(crate::graphql_window::REFEREE_NODE_READS, Ordering::Relaxed);
+    // R-P5P9-110 (REST floor): up to 500 oracle-only rows at ours' floor height, each still
+    // node-canonical by `/poll` (live stays at 50).
+    ctx.gql.floor_checks.store(
+        crate::graphql_window::REFEREE_FLOOR_CHECKS,
+        Ordering::Relaxed,
+    );
 }
 
 /// R-P5P9-86 S′, the stored form: every entry is a `/chain<N>/balance` gap that

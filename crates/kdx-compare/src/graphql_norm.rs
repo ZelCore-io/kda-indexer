@@ -789,6 +789,53 @@ pub fn skew_net_holds(ours: f64, node: &str, net: i128) -> bool {
         .is_ok_and(|x| x == ours)
 }
 
+/// R-P5P9-110: whether `t` (fixed point of 12 places) is within half an ulp of the exact
+/// binary value of `f`. The gap is measured from `f` itself (an exact rational `m * 2^e`),
+/// never from `f`'s printed shortest text, which can be up to half an ulp off `f`: measuring
+/// from the text and then allowing half an ulp double-counts the rounding. The ulp is the
+/// step up to the next f64. Exact integer arithmetic; any overflow answers `false`.
+pub fn f64_within_half_ulp(f: f64, t: i128) -> bool {
+    const UNIT: i128 = 1_000_000_000_000;
+    if !f.is_finite() {
+        return false;
+    }
+    let (a, t) = if f < 0.0 { (-f, -t) } else { (f, t) };
+    if a == 0.0 {
+        return t == 0;
+    }
+    let bits = a.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = (bits & ((1u64 << 52) - 1)) as i128;
+    let (m, e) = if exp == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1i128 << 52), exp - 1075)
+    };
+    if e >= 0 {
+        // |m 2^e U - t| <= 2^e U / 2, with 2^e U even for e >= 1 and U even for e = 0.
+        let Some(p) = 1i128.checked_shl(e as u32).filter(|p| *p > 0) else {
+            return false;
+        };
+        let (Some(fu), Some(h)) = (
+            m.checked_mul(p).and_then(|x| x.checked_mul(UNIT)),
+            p.checked_mul(UNIT / 2),
+        ) else {
+            return false;
+        };
+        return fu.checked_sub(t).is_some_and(|d| d.abs() <= h);
+    }
+    // e < 0, k = -e: scale |m U 2^-k - t| <= U 2^-k / 2 by 2^(k+1): |2 m U - t 2^(k+1)| <= U.
+    let Some(sc) = 1i128.checked_shl((1 - e) as u32).filter(|p| *p > 0) else {
+        return false;
+    };
+    let Some(ts) = t.checked_mul(sc) else {
+        return false;
+    };
+    (2 * m * UNIT)
+        .checked_sub(ts)
+        .is_some_and(|d| d.abs() <= UNIT)
+}
+
 /// A fixed-point amount of 12 places as decimal text (for evidence).
 pub fn fixed12_text(x: i128) -> String {
     let unit = 1_000_000_000_000i128;
@@ -1311,6 +1358,28 @@ mod tests {
         ));
         assert!(one_block_skew(0.904046, "1.808092", r));
         assert!(!one_block_skew(0.0, "0.5", r));
+    }
+
+    /// R-P5P9-110: within half an ulp of the f64's exact value, in units of 1e-12.
+    #[test]
+    fn f64_within_half_ulp_is_exact() {
+        // 0.5 is exact: ulp 1.1e-16, so only 0 units off (the 12-place grid is coarser).
+        assert!(f64_within_half_ulp(0.5, 500_000_000_000));
+        assert!(!f64_within_half_ulp(0.5, 500_000_000_001));
+        // 54284.63192951972: its exact value is 2.77e-12 below its text; half an ulp 3.64e-12.
+        let f = 54284.63192951972;
+        let text = 54_284_631_929_519_720i128;
+        assert!(f64_within_half_ulp(f, text)); // 2.77 units off
+        assert!(f64_within_half_ulp(f, text - 6)); // 3.23 units off
+        assert!(!f64_within_half_ulp(f, text - 7)); // 4.23 units off
+        assert!(!f64_within_half_ulp(f, text + 1)); // 3.77 units off
+                                                    // The sign is mirrored; zero is exact; a non-finite f64 never matches.
+        assert!(f64_within_half_ulp(-f, -text));
+        assert!(f64_within_half_ulp(0.0, 0) && !f64_within_half_ulp(0.0, 1));
+        assert!(!f64_within_half_ulp(f64::NAN, 0) && !f64_within_half_ulp(f64::INFINITY, 0));
+        // Large and tiny magnitudes answer without overflow, closed.
+        assert!(!f64_within_half_ulp(1e300, 1));
+        assert!(!f64_within_half_ulp(1e-300, 1));
     }
 
     /// R-P5P9-75 S: the net counts every coin TRANSFER touching the account in the coinbase

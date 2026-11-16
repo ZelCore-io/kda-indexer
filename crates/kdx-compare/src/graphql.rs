@@ -558,6 +558,10 @@ pub struct GqlState {
     /// most: live [`crate::graphql_window::ABOVE_TIP_ROWS`]; the referee raises it to
     /// [`crate::graphql_window::REFEREE_ABOVE_TIP_ROWS`].
     pub above_tip_rows: AtomicUsize,
+    /// R-P5P9-105 (REST #1966) with R-P5P9-110: oracle-only rows at ours' floor height that
+    /// the REST compose polls at most: live [`crate::graphql_window::FLOOR_CHECKS`]; the referee
+    /// raises it to [`crate::graphql_window::REFEREE_FLOOR_CHECKS`].
+    pub floor_checks: AtomicUsize,
     /// Node reads one compare's H7 may make: live [`crate::graphql_window::NODE_READS`]; the
     /// referee raises it to [`crate::graphql_window::REFEREE_NODE_READS`] (R-P5P9-105).
     pub compare_reads: AtomicUsize,
@@ -594,6 +598,7 @@ impl GqlState {
             node_budget: AtomicUsize::new(usize::MAX),
             walk_rows: AtomicUsize::new(crate::graphql_window::COUNT_WALK_ROWS),
             above_tip_rows: AtomicUsize::new(crate::graphql_window::ABOVE_TIP_ROWS),
+            floor_checks: AtomicUsize::new(crate::graphql_window::FLOOR_CHECKS),
             compare_reads: AtomicUsize::new(crate::graphql_window::NODE_READS),
             header: std::sync::OnceLock::new(),
         })
