@@ -310,13 +310,16 @@ mod tests {
         let al = shipped();
         assert_eq!(al.entries.len(), entries.len());
         // Only entries the owner accepted, or the controller flipped by a ruling on a run's
-        // evidence (R-P5P9-75, CG-4, with its example records), are ACCEPTED.
+        // evidence (R-P5P9-75, CG-4, or R-P5P9-86 / R-P5P9-103, CG-5, with its example records), are
+        // ACCEPTED.
         for e in &al.entries {
             if e.status == super::Status::Accepted {
                 assert!(
                     e.owner_note.contains("by the owner")
                         || e.owner_note.contains("owner ruling")
-                        || (e.ruling.contains("R-P5P9-75, CG-4")
+                        || ((e.ruling.contains("R-P5P9-75, CG-4")
+                            || e.ruling.contains("R-P5P9-86, CG-5")
+                            || e.ruling.contains("R-P5P9-103, CG-5"))
                             && (e.owner_note.contains('#') || e.owner_note.contains("zero hits"))),
                     "{} is ACCEPTED without an owner acceptance or a flip ruling with evidence",
                     e.id
@@ -326,6 +329,37 @@ mod tests {
     }
 
     /// An entry without `status` or `ruling`, with an empty one, or with a status other than
+    /// R-P5P9-86 (allowlist): the nine entries checked against the node on CG-5 are
+    /// ACCEPTED and cite the ruling; the `graphql-h7-window-referee` text names every
+    /// unindexed one-sided row except E's and M's, not only D's and F's.
+    #[test]
+    fn e3_the_r86_flips_are_accepted_and_cite_the_ruling() {
+        let al = shipped();
+        for id in [
+            "graphql-r75-exec-payload-data",
+            "graphql-r75-payload-rollback",
+            "graphql-r75-oracle-counts-heights",
+            "graphql-r75-signer-address",
+            "graphql-r75-nested-order-index",
+            "kdatxs-missing-node",
+            "kdatxs-events-node",
+            "oracle-orphan",
+            "oracle-gap",
+        ] {
+            let e = al.entries.iter().find(|e| e.id == id).expect(id);
+            assert_eq!(e.status, super::Status::Accepted, "{id}");
+            assert!(e.ruling.contains("R-P5P9-86"), "{id}: {}", e.ruling);
+            assert!(e.owner_note.contains('#'), "{id}: {}", e.owner_note);
+        }
+        let w = al
+            .entries
+            .iter()
+            .find(|e| e.id == "graphql-h7-window-referee")
+            .unwrap();
+        assert!(w.reason.contains("except E's and M's rows"), "{}", w.reason);
+        assert!(w.reason.contains("not only R-P5P9-75 D's"), "{}", w.reason);
+    }
+
     /// PROPOSED or ACCEPTED does not load.
     #[test]
     fn an_entry_without_a_status_or_ruling_is_refused() {
@@ -647,5 +681,49 @@ mod tests {
             b: Some(serde_json::json!("#2e0")),
         });
         assert_eq!(known(&req("QFungibleAccount", "k:a"), &both).0, "diff");
+    }
+
+    /// R-P5P9-86 P: the two heavy accounts CG-5 measured (#520, #977) are P's, by their full
+    /// key; a key that only starts like one of them, or another fault, stays a diff.
+    #[test]
+    fn e2_p_the_cg5_heavy_accounts_are_known_gaps() {
+        use crate::report::{DiffEntry, DiffKind};
+        let al = shipped();
+        let fault = |path: &str, why: &str| {
+            vec![DiffEntry {
+                path: path.into(),
+                kind: DiffKind::Changed,
+                a: Some(serde_json::json!({"page": 2, "status": 200, "why": why})),
+                b: None,
+            }]
+        };
+        let deadline = r#"errors: [{"message":"request deadline exceeded"}]"#;
+        let req = |stem: &str, acct: &str| format!("graphql:{stem} {{\"accountName\":\"{acct}\"}}");
+        let known = |r: &str, d: &[DiffEntry]| {
+            let c = al.classify_known(&RouteKind::Other, r, &[], d);
+            (c.class(d).0, c.known_ids)
+        };
+        let p = vec!["known-gap-p-heavy-account-deadline".to_string()];
+        let k520 = "af7943004d0b08fe5402c23ec317f7a8d1bdd6ce4cc52414efcf8dbfa68ca256";
+        let k977 = "k:22fbc926b497bf3ecc7199b923039e74cdeda12726e1dc4f443953007cf8cc43";
+        let follow = fault("/~graphql-follow-page-fault", deadline);
+        let first = fault("/~graphql-first-page-fault", deadline);
+        assert_eq!(
+            known(&req("QTransactionsByAccount", k520), &follow),
+            ("known-gap", p.clone())
+        );
+        assert_eq!(
+            known(&req("Transactions", k977), &first),
+            ("known-gap", p.clone())
+        );
+        // The full key only: a longer value that starts with it is another account.
+        let longer = format!("{k977}00");
+        assert_eq!(known(&req("Transactions", &longer), &first).0, "diff");
+        // Another fault on the same account stays a diff.
+        let other = fault("/~graphql-follow-page-fault", "HTTP 500");
+        assert_eq!(
+            known(&req("QTransactionsByAccount", k520), &other).0,
+            "diff"
+        );
     }
 }

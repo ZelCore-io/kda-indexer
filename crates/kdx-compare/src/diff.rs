@@ -377,6 +377,54 @@ pub fn decimal_canon(t: &str) -> Option<(bool, String, i64)> {
     Some((neg, trimmed.to_string(), exp))
 }
 
+/// R-P5P9-98: an amount's exact decimal value, from a JSON number (its text, kept exactly
+/// under `arbitrary_precision`), a decimal string, or Pact's `{"decimal": …}` / `{"int": …}`
+/// object. Never through floats; trailing zeros are ignored by [`decimal_canon`]. `None` for
+/// anything else (fail closed).
+pub fn exact_decimal(v: &Value) -> Option<(bool, String, i64)> {
+    match v {
+        Value::Number(n) => decimal_canon(&n.to_string()),
+        Value::String(s) => decimal_canon(s),
+        Value::Object(m) if m.len() == 1 => m
+            .get("decimal")
+            .or_else(|| m.get("int"))
+            .filter(|x| !x.is_object())
+            .and_then(exact_decimal),
+        _ => None,
+    }
+}
+
+/// R-P5P9-98: two amounts are equal when they are equal as exact decimals (ours "14988",
+/// the oracle's "14988.000000000000", the node's `{"decimal":"14988.000000000000"}`).
+pub fn same_exact_decimal(a: &Value, b: &Value) -> bool {
+    matches!((exact_decimal(a), exact_decimal(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// R-P5P9-98: the amount fields the harness compares by exact decimal value.
+pub fn is_amount_key(k: &str) -> bool {
+    matches!(k, "amount" | "balance" | "totalBalance")
+}
+
+/// R-P5P9-98: an amount as plain decimal text without trailing zeros (`"14988"` for
+/// `"14988.000000000000"`, `1.5` for `1.50`); `None` when it is not an exact decimal.
+pub fn exact_decimal_text(v: &Value) -> Option<String> {
+    let (neg, digits, exp) = exact_decimal(v)?;
+    if digits.is_empty() {
+        return Some("0".into());
+    }
+    let sign = if neg { "-" } else { "" };
+    if exp >= 0 {
+        return Some(format!("{sign}{digits}{}", "0".repeat(exp as usize)));
+    }
+    let point = digits.len() as i64 + exp;
+    Some(if point > 0 {
+        let (i, f) = digits.split_at(point as usize);
+        format!("{sign}{i}.{f}")
+    } else {
+        format!("{sign}0.{}{digits}", "0".repeat((-point) as usize))
+    })
+}
+
 /// JSON path of the visible allowlist hit for [`cut_to_common_depth`].
 pub const PAGE_CUT_PATH: &str = "/~page-cut";
 
@@ -546,6 +594,38 @@ mod harness_rule_tests {
         let mut b = json!([row(7, 1)]);
         assert!(!cut_to_common_depth(&mut a, false, &mut b, false));
         assert!(!diff_route(&RouteKind::Events, &a, &b).is_empty());
+    }
+
+    #[test]
+    fn r98_amounts_equal_as_exact_decimals() {
+        let n = json!({"decimal": "14988.000000000000"});
+        assert!(same_exact_decimal(
+            &json!("14988"),
+            &json!("14988.000000000000")
+        ));
+        assert!(same_exact_decimal(&json!("14988"), &n));
+        assert!(same_exact_decimal(&json!(14988), &n));
+        assert!(!same_exact_decimal(&json!("14988.000000000001"), &n));
+        assert!(!same_exact_decimal(&json!("14988"), &json!("14989")));
+        // Never through floats: these are the same f64 but not the same decimal.
+        assert!(!same_exact_decimal(
+            &json!("0.1000000000000000055511151231257827"),
+            &json!("0.1")
+        ));
+        assert!(!same_exact_decimal(&json!("abc"), &json!("abc")));
+        assert_eq!(
+            exact_decimal_text(&json!("14988.000000000000")).as_deref(),
+            Some("14988")
+        );
+        assert_eq!(exact_decimal_text(&n).as_deref(), Some("14988"));
+        let x: Value = serde_json::from_str("60263.91224935622").unwrap();
+        assert_eq!(exact_decimal_text(&x).as_deref(), Some("60263.91224935622"));
+        assert_eq!(
+            exact_decimal_text(&json!("0.00500")).as_deref(),
+            Some("0.005")
+        );
+        assert_eq!(exact_decimal_text(&json!("1e3")).as_deref(), Some("1000"));
+        assert_eq!(exact_decimal_text(&json!("-0.0")).as_deref(), Some("0"));
     }
 
     #[test]

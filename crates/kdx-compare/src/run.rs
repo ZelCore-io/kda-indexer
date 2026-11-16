@@ -686,6 +686,15 @@ impl Ctx {
             canon: Mutex::new(HashMap::new()),
             cfg,
         };
+        // R-P5P9-88 (3a): the `compare/` assets and the build, logged and kept in the summary.
+        let line = crate::assets::assets_line_with(
+            &ctx.cfg.allowlist,
+            &ctx.cfg.graphql.own_ops_dir,
+            &ctx.cfg.graphql.field_rules,
+            ctx.cfg.replay.as_deref(),
+        )?;
+        tracing::info!(assets = %line, "harness assets");
+        ctx.summary.lock().expect("summary").assets.insert(line);
         ctx.refresh_tips().await?;
         Ok(ctx)
     }
@@ -713,13 +722,38 @@ impl Ctx {
 
     pub fn flush_summary(&self) {
         let mut s = self.summary.lock().expect("summary");
-        match s.flush(&self.cfg.out_dir) {
+        let rolled = match s.flush(&self.cfg.out_dir) {
             Ok(Some(mut fresh)) => {
                 fresh.graphql_unpaired = std::mem::take(&mut s.graphql_unpaired);
+                fresh.assets = std::mem::take(&mut s.assets);
                 *s = fresh;
+                true
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "summary flush"),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "summary flush");
+                false
+            }
+        };
+        // R-P5P9-86: the day rolled; the past days' diff logs are rotated (R-P5P9-95 m-12:
+        // outside the summary lock).
+        drop(s);
+        if rolled {
+            self.rotate_logs();
+        }
+    }
+
+    /// R-P5P9-86: compresses the past days' diff logs ([`crate::report::rotate_logs`]) and
+    /// logs each day's bytes.
+    pub fn rotate_logs(&self) {
+        let today = crate::report::date_of(crate::report::now_secs());
+        match crate::report::rotate_logs(&self.cfg.out_dir, &today) {
+            Ok(days) => {
+                for (date, raw, zst) in days {
+                    tracing::info!(date, raw, zst, "diff log rotated");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "diff log rotation"),
         }
     }
 
@@ -883,6 +917,8 @@ impl Ctx {
             note,
             body_cap: None,
             a_pages: None,
+            a_tip_height: None,
+            a_lowest_height: None,
         }
     }
 
@@ -965,6 +1001,18 @@ impl Ctx {
             }
         };
         let (mut va, mut vb) = (rows(&mut pa), rows(&mut pb));
+        // R-P5P9-86: ours' lowest height as fetched, for the row-by-row rules.
+        let lowest_a0 = min_height(&va);
+        // R-P5P9-95 I-2: ours' own row count before any cut.
+        let len_a0 = len_of(&va);
+        // R-P5P9-86 v1txs: the two pages do not overlap in height and kda-txs' rows end lower
+        // (the first reads kept for the re-read's node check).
+        let edge_rows = (req.route == RouteKind::V1Txs
+            && tb.kind == crate::config::TargetKind::KdaTxs
+            && sa == 200
+            && sb == 200
+            && compose::edge_shape(&va, &vb))
+        .then(|| (va.clone(), vb.clone()));
         let page_cut = req.route.paginated()
             && cut_to_common_depth(&mut va, pa.truncated, &mut vb, pb.truncated);
         // chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain:
@@ -1000,10 +1048,10 @@ impl Ctx {
         }
         // Ruling R3E-11: the oracles lag A and fill recent heights late. Account, event and
         // /v1/txs rows are compared only below A's tip minus ORACLE_HORIZON; when that drops
-        // rows, a side that held its full limit (or was cut at a page) is cut at its lowest
-        // height on both sides.
-        // Whether each side held its full limit (or was cut at a page), read before any rule
-        // drops rows; used by the node-confirmed rule below.
+        // rows, a side that held its full limit (the oracle also when cut at a page) is cut at
+        // its lowest height on both sides.
+        // Whether each side held its full limit, read before any rule drops rows; used by the
+        // node-confirmed rule below too.
         let row_limit = if req.route == RouteKind::V1Txs {
             crate::via_cwd::parse(&req.path_and_query)
                 .limit
@@ -1012,7 +1060,10 @@ impl Ctx {
         } else {
             query_limit(&req.path_and_query)
         };
-        let full_a0 = pa.truncated || page_cut || row_limit.is_none_or(|l| len_of(&va) >= l);
+        // R-P5P9-96 (1): in every rule ours is full only by its own page: cut at its own
+        // depth, or holding a known limit's rows counted before any cut. `page_cut` is never
+        // evidence of it (the oracle's cut sets it too), and an unknown limit is not full.
+        let full_a_known = pa.truncated || row_limit.is_some_and(|l| len_a0 >= l);
         let full_b0 = pb.truncated || page_cut || row_limit.is_none_or(|l| len_of(&vb) >= l);
         let mut lag_rows = 0usize;
         // Replica pair (two kda-indexer targets): rows above the lower of the two tips minus
@@ -1020,14 +1071,15 @@ impl Ctx {
         // side's tip), with no allowlist hit.
         let replica = ta.kind == crate::config::TargetKind::KdaIndexerCompat
             && tb.kind == crate::config::TargetKind::KdaIndexerCompat;
+        // R-P5P9-96 (2a): ours' tip as this compare read it, also kept on the record.
+        let a_tip0 = self.tips.a_tip();
         let clamp_to = if replica {
             match (self.oracle_tip(ta).await, self.oracle_tip(tb).await) {
                 (Some(x), Some(y)) => Some(replica_clamp(x, y)),
                 _ => None,
             }
         } else {
-            let t = self.tips.a_tip();
-            (t > ORACLE_HORIZON).then(|| t - ORACLE_HORIZON)
+            (a_tip0 > ORACLE_HORIZON).then(|| a_tip0 - ORACLE_HORIZON)
         };
         if matches!(
             req.route,
@@ -1046,10 +1098,11 @@ impl Ctx {
                 query_limit(&req.path_and_query)
             };
             // R-P5P9-72 (2): only a known limit (or a cut page) makes a side partial at its
-            // lowest height; an unknown limit (`/txs/events`) is not full.
+            // lowest height; an unknown limit (`/txs/events`) is not full. R-P5P9-96 (1): for
+            // ours, only ours' own page (`full_a_known`), never the oracle's cut.
             let full = |n: usize, t: bool| t || limit.is_some_and(|l| n >= l);
             let (na, nb) = (len_of(&va), len_of(&vb));
-            let fa = full(na, pa.truncated || page_cut);
+            let fa = full_a_known;
             let fb = full(nb, pb.truncated || page_cut);
             // R-P5P9-71 (1): the window is for rows the oracle has not filled yet, which are
             // rows it lacks. A row only the oracle lists there is no lag: it stays in the
@@ -1318,7 +1371,7 @@ impl Ctx {
                 if let Value::Array(xa) = &mut va {
                     xa.retain(|r| !gap.contains(r));
                 }
-                if full_a0 && full_b0 {
+                if full_a_known && full_b0 {
                     if let Some(cut) = a_min0.max(b_min) {
                         drop_at_or_below(&mut va, cut);
                         drop_at_or_below(&mut vb, cut);
@@ -1345,7 +1398,7 @@ impl Ctx {
         );
         if node_gap_pair && sa == 200 && sb == 200 && gap_rows.is_empty() && kt_gap.is_empty() {
             let (mut ca, mut cb) = (va.clone(), vb.clone());
-            if full_a0 && full_b0 {
+            if full_a_known && full_b0 {
                 if let (Some(x), Some(y)) = (min_height(&ca), min_height(&cb)) {
                     // R-P5P9-71 (1): at the cut, only the complete side's surplus goes.
                     cut_at_limit(&mut ca, &mut cb, x.max(y), x >= y, y >= x);
@@ -1376,6 +1429,36 @@ impl Ctx {
                     vb = cb;
                     node_gap = only_a;
                 }
+            }
+        }
+        // R-P5P9-86 (REST records where several rules apply): when no single rule above took
+        // the record, its one-sided rows are settled row by row, each by one rule's check.
+        let mut composed: Vec<DiffEntry> = Vec::new();
+        if node_gap_pair
+            && sa == 200
+            && sb == 200
+            && gap_rows.is_empty()
+            && kt_gap.is_empty()
+            && node_gap.is_empty()
+            && window_cut == 0
+        {
+            let (mut ca, mut cb) = (va.clone(), vb.clone());
+            let kdatxs = tb.kind == crate::config::TargetKind::KdaTxs;
+            if let Ok(h) = self
+                .rest_compose(
+                    req,
+                    kdatxs,
+                    &mut ca,
+                    &mut cb,
+                    full_a_known,
+                    lowest_a0,
+                    clamp_to,
+                )
+                .await
+            {
+                va = ca;
+                vb = cb;
+                composed = h;
             }
         }
         // chainweb-data keeps rows of orphaned blocks: on /txs/txs it lists them beside the
@@ -1580,6 +1663,7 @@ impl Ctx {
                 b: None,
             });
         }
+        d.extend(composed);
         if !ev_gap.is_empty() {
             let first: Vec<Value> = ev_gap
                 .iter()
@@ -1712,6 +1796,23 @@ impl Ctx {
                 },
             );
         }
+        // R-P5P9-86 v1txs: a record the rules leave unexplained at the recent-window edge is
+        // re-read once, 60 s later.
+        if let Some((a0, b0)) = &edge_rows {
+            let (un, _) = self
+                .allow
+                .classify_request(&req.route, &req.path_and_query, &[], &d);
+            if !un.is_empty() {
+                if let Ok(ev) = self.v1txs_edge_live(req, ta, tb, a0, b0).await {
+                    d = vec![DiffEntry {
+                        path: compose::KDATXS_EDGE_LAG_PATH.into(),
+                        kind: DiffKind::Changed,
+                        a: Some(ev),
+                        b: None,
+                    }];
+                }
+            }
+        }
         let curl_b = format!("curl -s {}", sh_url("B", &req.path_and_query));
         let b_body = paged_body(&pb);
         let mut o = self.finish(
@@ -1726,6 +1827,11 @@ impl Ctx {
             curl_b,
             None,
         );
+        // R-P5P9-96 (2a): the stored forms bound oracle-only rows by these, as live does.
+        if let Some(r) = &mut o.record {
+            r.a_tip_height = (a_tip0 > 0).then_some(a_tip0);
+            r.a_lowest_height = lowest_a0;
+        }
         // Items on one side only (the sides read slightly different tips) are not a diff.
         if skew && o.class == "match" {
             o.class = "skew".into();
@@ -2519,6 +2625,10 @@ impl Ctx {
         }
         for (c, keys) in by_chain {
             for chunk in keys.chunks(NODE_POLL_CHUNK) {
+                // R-P5P9-95 m-9: one read of the run's budget (the referee's --max-reads).
+                if !self.gql.take_node_read() {
+                    return false;
+                }
                 let rks: Vec<String> = chunk.iter().map(|(rk, _)| rk.clone()).collect();
                 self.count_request(req.route.as_str(), "node", 1);
                 let Ok(res) = self.node.poll(c, &rks).await else {
@@ -3394,6 +3504,9 @@ impl Ctx {
 /// `run`: continuous loop until SIGINT/SIGTERM (or `max_secs`, when set).
 pub async fn run(cfg: CompareConfig, max_secs: Option<u64>) -> anyhow::Result<()> {
     let ctx = Arc::new(Ctx::new(cfg).await?);
+    // R-P5P9-86: the live run (never the referee, which reads the logs) rotates the past
+    // days' diff logs at start and at each day roll.
+    ctx.rotate_logs();
     if let Some(bind) = ctx.cfg.metrics_bind.clone() {
         let m = ctx.metrics.clone();
         tokio::spawn(async move {
@@ -3731,6 +3844,8 @@ fn same_decimal(a: &str, b: &str) -> bool {
     }
     norm(a) == norm(b)
 }
+
+mod compose;
 
 #[cfg(test)]
 mod mock_tests;

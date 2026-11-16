@@ -550,6 +550,21 @@ pub struct GqlState {
     /// Node reads the node-refereed rules may still make in this process (R-P5P9-62: the
     /// referee's run cap; unbounded in a live run, where each compare has its own cap).
     pub node_budget: AtomicUsize,
+    /// R-P5P9-97 TC: rows a side the count walk reads at most: live
+    /// [`crate::graphql_window::COUNT_WALK_ROWS`]; the referee raises it to
+    /// [`crate::graphql_window::REFEREE_COUNT_WALK_ROWS`] (the oracle is frozen and offline).
+    pub walk_rows: AtomicUsize,
+    /// R-P5P9-105 (W #2025): ours' rows above the oracle's tip that the count walk polls at
+    /// most: live [`crate::graphql_window::ABOVE_TIP_ROWS`]; the referee raises it to
+    /// [`crate::graphql_window::REFEREE_ABOVE_TIP_ROWS`].
+    pub above_tip_rows: AtomicUsize,
+    /// R-P5P9-105 (REST #1966) with R-P5P9-110: oracle-only rows at ours' floor height that
+    /// the REST compose polls at most: live [`crate::graphql_window::FLOOR_CHECKS`]; the referee
+    /// raises it to [`crate::graphql_window::REFEREE_FLOOR_CHECKS`].
+    pub floor_checks: AtomicUsize,
+    /// Node reads one compare's H7 may make: live [`crate::graphql_window::NODE_READS`]; the
+    /// referee raises it to [`crate::graphql_window::REFEREE_NODE_READS`] (R-P5P9-105).
+    pub compare_reads: AtomicUsize,
     /// The client and limiter of H7's header-by-hash reads (R-P5P9-63 (5), R-P5P9-65 (2)).
     header: std::sync::OnceLock<(reqwest::Client, Arc<crate::target::Limiter>)>,
 }
@@ -581,6 +596,10 @@ impl GqlState {
             oracle_pause_until: Mutex::new(None),
             local: std::sync::OnceLock::new(),
             node_budget: AtomicUsize::new(usize::MAX),
+            walk_rows: AtomicUsize::new(crate::graphql_window::COUNT_WALK_ROWS),
+            above_tip_rows: AtomicUsize::new(crate::graphql_window::ABOVE_TIP_ROWS),
+            floor_checks: AtomicUsize::new(crate::graphql_window::FLOOR_CHECKS),
+            compare_reads: AtomicUsize::new(crate::graphql_window::NODE_READS),
             header: std::sync::OnceLock::new(),
         })
     }
@@ -921,8 +940,19 @@ pub fn compare_answers_with(
     normalize_gql(&mut nb, cap);
     // R-P5P9-62 H7 paired the root rows: keep them paired through the tie sort.
     let mut aligned = false;
+    // R-P5P9-88 (F): a root list without `pageInfo` that H7 read as a connection too.
     for v in [&mut na, &mut nb] {
-        if let Some(c) = v.get_mut("data").and_then(root_connection) {
+        let bare = v.pointer("/data").and_then(|d| {
+            d.as_object()?
+                .iter()
+                .find(|(_, x)| x.get("edges").is_some_and(Value::is_array))
+                .map(|(k, _)| format!("/data/{}", crate::graphql_scope::esc(k)))
+        });
+        let c = match v.get_mut("data").and_then(root_connection) {
+            Some(c) => Some(c),
+            None => bare.and_then(|p| v.pointer_mut(&p)),
+        };
+        if let Some(c) = c {
             aligned |= crate::graphql_window::realign(c);
         }
     }
@@ -939,8 +969,17 @@ pub fn compare_answers_with(
             }
         }
     }
+    // R-P5P9-86 G: root rows at one height pair by block, unless H7 paired them.
+    if !aligned && !root_scoped {
+        crate::graphql_scope::align_block_parents(&mut na, &mut nb);
+    }
     // R-P5P9-75 G: nested lists without a key compare as multisets when complete.
-    let (sorted, left) = crate::graphql_scope::unkeyed_nested(&mut na, &mut nb);
+    let (sorted, left) = crate::graphql_scope::unkeyed_nested_with(
+        &mut na,
+        &mut nb,
+        Some((&a.body, &b.body)),
+        rules,
+    );
     if sorted {
         hits.push(hit(crate::graphql_scope::NESTED_MULTISET_PATH));
     }
@@ -965,15 +1004,9 @@ pub fn compare_answers_with(
             b: Some(json!({ "list": list, "missing": missing })),
         });
     }
-    // R-P5P9-75 I: the oracle counts heights on Transactions-9e58b95d (scoped by the entry).
-    for (ours, oracle) in crate::graphql_norm::oracle_counts_heights(rules, &na, &mut nb) {
-        hits.push(DiffEntry {
-            path: crate::graphql_norm::ORACLE_COUNTS_HEIGHTS_PATH.into(),
-            kind: DiffKind::Changed,
-            a: Some(json!(ours)),
-            b: Some(json!(oracle)),
-        });
-    }
+    // R-P5P9-86 TC replaces R-P5P9-75 I's "oracle below ours" condition: a root totalCount
+    // difference stays here, and the count walk ([`Ctx::gql_count_walk`]) settles it with
+    // the node, the oracle above or below ours.
     if let (Some(da), Some(db)) = (na.get_mut("data"), nb.get_mut("data")) {
         if let (Some(ca), Some(cb)) = (root_connection(da), root_connection(db)) {
             if !aligned && crate::graphql_norm::cut_trailing_ties(ca, cb) {
@@ -986,10 +1019,20 @@ pub fn compare_answers_with(
     let lower_bound = crate::graphql_norm::count_flag_applies(&a.body);
     let explain = crate::graphql_norm::explain(rules, lower_bound);
     let (mut d, fired) = diff_explained(&na, &nb, &explain);
+    // R-P5P9-86 X: an oracle amount with trailing zeros, checked on the node after.
+    crate::graphql_norm::decimal_zeros_candidates(&mut d, &na);
     d.extend(hits);
     d.extend(fired.into_iter().map(hit));
     d
 }
+
+/// R-P5P9-86 S′: ours' GraphQL balance against ours' native one differs by miner skew: live,
+/// a re-read in the other order agrees; stored, the gap is 1 to 3 of the chain's coinbase
+/// rewards and the node shows the account receiving that many in the record's height window.
+pub const NATIVE_SKEW_PATH: &str = "/~graphql-native-miner-skew";
+/// R-P5P9-95 I-4: the native pair's live re-read still differs (the re-read's values); no
+/// allowlist entry, and the referee refuses a stored record that carries it.
+pub const NATIVE_REREAD_DIFFERS_PATH: &str = "/~graphql-native-reread-differs";
 
 /// Why a follow page fails the whole fetch (R-P5P9-64 I-3): a status other than 200,
 /// GraphQL `errors`, no `data` or no root connection. Such a page is never read as a cut page.
@@ -1088,6 +1131,38 @@ impl std::error::Error for MergedBytes {}
 /// server's load (R-P5P9-67 I-A (b): 5xx, timeouts and rate limits stay errors).
 fn page_fault_is_ours(status: u16) -> bool {
     status < 500 && status != 408 && status != 429
+}
+
+/// R-P5P9-97 P (#977): ours' first page that answered (status 200, or another status
+/// [`page_fault_is_ours`]) with `errors` and no `data`, where the oracle answered without
+/// errors, is the first-page fault the fetch path marks: the diff's `/data` and `/errors`
+/// entries become one [`FIRST_PAGE_FAULT_PATH`] entry whose `why` is ours' errors' text
+/// (the follow-page fault's shape), so KNOWN-GAP P reads it as it reads a fetch fault. Any
+/// other difference is kept, and the marker is never explained by itself.
+pub fn first_page_error_fault(a: &Value, status: u16, b: &Value, d: &mut Vec<DiffEntry>) {
+    let errs = a.get("errors").and_then(Value::as_array);
+    let ours_failed = errs.is_some_and(|e| !e.is_empty())
+        && a.get("data").is_none_or(Value::is_null)
+        && page_fault_is_ours(status);
+    let oracle_ok = b
+        .get("errors")
+        .is_none_or(|e| e.as_array().is_some_and(Vec::is_empty))
+        && b.get("data").is_some_and(|x| !x.is_null());
+    let ours_part = |p: &str| p == "/data" || p == "/errors" || p.starts_with("/errors/");
+    if !ours_failed || !oracle_ok || !d.iter().any(|e| ours_part(&e.path)) {
+        return;
+    }
+    d.retain(|e| !ours_part(&e.path));
+    let why = format!(
+        "errors: {}",
+        Value::Array(errs.cloned().unwrap_or_default())
+    );
+    d.push(DiffEntry {
+        path: FIRST_PAGE_FAULT_PATH.into(),
+        kind: DiffKind::Changed,
+        a: Some(json!({"page": 1, "status": status, "why": why})),
+        b: None,
+    });
 }
 
 /// The diff entry of a fetch that stopped at a first- or follow-page fault of ours or the
@@ -1497,6 +1572,8 @@ impl Ctx {
             note,
             body_cap: None,
             a_pages: a_ans.map(|x| x.ms.len()),
+            a_tip_height: None,
+            a_lowest_height: None,
         };
         Outcome {
             allowlist_ids: allowlisted.to_vec(),
@@ -1653,8 +1730,36 @@ impl Ctx {
         b: &mut Answer,
         max: u64,
     ) -> (Vec<DiffEntry>, Option<String>) {
+        let mut st = crate::graphql_window::Reads::default();
+        self.gql_rules_st(ta, h6, op, vars, a, b, max, &mut st)
+            .await
+    }
+
+    /// [`Ctx::gql_rules`] on the compare's reads `st` (R-P5P9-95 m-9: the referee's count
+    /// walk takes the same reads).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_rules_st(
+        &self,
+        ta: &Target,
+        h6: H6<'_>,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        st: &mut crate::graphql_window::Reads,
+    ) -> (Vec<DiffEntry>, Option<String>) {
         let root_scoped = crate::graphql_scope::root_scoped(&op.roots, vars);
         let mut row_hits = self.gql_row_rules(ta, vars, a, b).await;
+        // R-P5P9-97 Q #37: the oracle's copies of a chain row ours lists once.
+        let (chain_dupes, cap_note) = self.gql_oracle_chain_dupes(ta, a, b).await;
+        if chain_dupes {
+            row_hits.push(crate::graphql_norm::ORACLE_CHAIN_DUPES_PATH);
+        }
+        let live_tb = match &h6 {
+            H6::Live(tb) => Some(*tb),
+            H6::Stored(_) => None,
+        };
         let h6 = match h6 {
             H6::Live(tb) => {
                 let (finished, entries) = self.gql_finish_lists(op, vars, ta, tb, a, b).await;
@@ -1663,23 +1768,44 @@ impl Ctx {
                 }
                 entries
             }
+            // R-P5P9-88 (G): the compare's own unfinished entry (no `b`) is made again from
+            // the stored bodies, so only H6's list reads' entries are carried.
             H6::Stored(diff) => diff
                 .iter()
                 .filter(|e| crate::graphql_scope::is_h6_entry(&e.path))
+                .filter(|e| !(e.path == crate::graphql_scope::UNFINISHED_PATH && e.b.is_none()))
                 .cloned()
                 .collect(),
         };
+        // R-P5P9-97 N #178: stored, a root-scoped list gets N's arm (H6 does not finish it
+        // again).
+        let n_hit = if live_tb.is_none() && root_scoped {
+            self.gql_n_stored(ta, op, vars, a, b, st).await
+        } else {
+            None
+        };
         // R-P5P9-62: H7 and the diff.
-        let (mut d, note) = self
-            .gql_settle_op(ta, Some(op), vars, a, b, max, root_scoped)
+        // R-P5P9-95 m-9: one compare, one node read cap: the count walk shares H7's reads.
+        let (mut d, mut note) = self
+            .gql_settle_op_st(ta, Some(op), vars, a, b, max, root_scoped, st)
             .await;
+        note = note.or(cap_note);
         d.extend(h6);
+        d.extend(n_hit);
         d.extend(row_hits.into_iter().map(|p| DiffEntry {
             path: p.into(),
             kind: DiffKind::Changed,
             a: None,
             b: None,
         }));
+        // R-P5P9-86 TC: live, both lists are walked to the end (the referee walks ours
+        // bounded, R-P5P9-87).
+        if let Some(tb) = live_tb {
+            self.gql_count_walk(ta, tb, op, vars, &mut d, &mut note, max, u64::MAX, st)
+                .await;
+        }
+        // R-P5P9-97 P (#977): ours' first page answered with errors and no data.
+        first_page_error_fault(&a.body, a.status, &b.body, &mut d);
         (d, note)
     }
 
@@ -1706,6 +1832,7 @@ impl Ctx {
     /// (R-P5P9-64, I-1) and the filter's variables (R-P5P9-63 (1)). Without it an oracle-only
     /// row at our boundary height is not excused. H8, the `payload.data` matcher and H7 share
     /// one node read cap (R-P5P9-63 (4)).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn gql_settle_op(
         &self,
@@ -1718,15 +1845,39 @@ impl Ctx {
         root_scoped: bool,
     ) -> (Vec<DiffEntry>, Option<String>) {
         let mut st = crate::graphql_window::Reads::default();
+        self.gql_settle_op_st(ta, op, vars, a, b, max, root_scoped, &mut st)
+            .await
+    }
+
+    /// [`Ctx::gql_settle_op`] on the compare's reads `st` (R-P5P9-95 m-9).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gql_settle_op_st(
+        &self,
+        ta: &Target,
+        op: Option<&GqlOp>,
+        vars: &Map<String, Value>,
+        a: &mut Answer,
+        b: &mut Answer,
+        max: u64,
+        root_scoped: bool,
+        st: &mut crate::graphql_window::Reads,
+    ) -> (Vec<DiffEntry>, Option<String>) {
         // H8 first: the oracle's transfer rows take the node's indexes, so H7 matches them.
-        let h8 = self.gql_transfer_order(ta, a, b, &mut st).await;
-        let data = self.gql_payload_data(vars, a, b, &mut st).await;
+        let mut h8: Vec<DiffEntry> = self
+            .gql_transfer_order(ta, a, b, st)
+            .await
+            .into_iter()
+            .collect();
+        // R-P5P9-105 (H8 in H7): H7's window pass takes H8's mapping for every oracle row,
+        // not only the keys the first pass read; rows mapped already are held and not read.
+        h8.extend(self.gql_transfer_order_keys(ta, a, b, st, usize::MAX).await);
+        let data = self.gql_payload_data(vars, a, b, st).await;
         // R-P5P9-75 O: H8 on nested transfer lists; J, K, L: tx fields against the node's
         // command.
-        let nested = self.gql_nested_transfer_order(vars, a, b, &mut st).await;
-        let cmd_fields = self.gql_node_cmd_fields(vars, a, b, &mut st).await;
+        let nested = self.gql_nested_transfer_order(vars, a, b, st).await;
+        let cmd_fields = self.gql_node_cmd_fields(vars, a, b, st).await;
         let (h7, note) = self
-            .gql_window_referee(ta, op, vars, a, b, max, root_scoped, &mut st)
+            .gql_window_referee(ta, op, vars, a, b, max, root_scoped, st)
             .await;
         let mut d = compare_answers_with(
             a,
@@ -1736,6 +1887,10 @@ impl Ctx {
             &self.cfg.graphql.field_rules,
             root_scoped,
         );
+        // R-P5P9-86 X: ours' amount text against the node's TRANSFER event.
+        self.gql_decimal_zeros(&mut d, st).await;
+        // R-P5P9-88 (G): cut nested lists by prefix, ours' rows against the node's payload.
+        self.gql_h6_prefix(&mut d, st).await;
         d.extend(h8);
         d.extend(data);
         d.extend(nested);
@@ -2088,6 +2243,94 @@ impl Ctx {
         self.gql_count(ROW_RULE_ROUTE, &ta.name, &[c.ms]);
         let v: Value = serde_json::from_slice(&c.body).ok()?;
         v.get("data").filter(|d| !d.is_null()).cloned()
+    }
+
+    /// R-P5P9-97 Q #37: when the oracle repeats non-fungible chain rows that ours lists once
+    /// ([`crate::graphql_norm::oracle_chain_dupes`]), each repeated row is confirmed on the
+    /// node: of the tokens ours lists for the account on that chain (at most 3), marmalade-v2's
+    /// `get-balance` on the node, or else marmalade v1's (R-P5P9-105 Q), is above zero for one.
+    /// When every one is confirmed, the oracle's list keeps one copy of each row, in its
+    /// order. Any failed read leaves it.
+    /// Review B1: each node read is one of the run's budget (the referee's `--max-reads`;
+    /// unbounded live); spent, the rows stay and the note names the cap.
+    /// Returns whether the copies left, and the cap's note when it was reached.
+    pub(crate) async fn gql_oracle_chain_dupes(
+        &self,
+        ta: &Target,
+        a: &Answer,
+        b: &mut Answer,
+    ) -> (bool, Option<String>) {
+        let rows = crate::graphql_norm::oracle_chain_dupes(&a.body, &b.body);
+        if rows.is_empty() {
+            return (false, None);
+        }
+        let q = "query($a: String!, $c: String!) { nonFungibleChainAccount(accountName: $a, \
+                 chainId: $c) { nonFungibleTokenBalances { tokenId } } }";
+        for r in &rows {
+            let (Some(acct), Some(c)) = (
+                r.get("accountName").and_then(Value::as_str),
+                r.get("chainId").and_then(Value::as_str),
+            ) else {
+                return (false, None);
+            };
+            let Ok(chain) = c.parse::<u8>() else {
+                return (false, None);
+            };
+            let Some(d) = self.gql_read(ta, q, json!({"a": acct, "c": c})).await else {
+                return (false, None);
+            };
+            let tokens: Vec<String> = d
+                .pointer("/nonFungibleChainAccount/nonFungibleTokenBalances")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t.get("tokenId").and_then(Value::as_str).map(str::to_string))
+                .take(3)
+                .collect();
+            let mut held = false;
+            // R-P5P9-105 Q: marmalade v2's ledger first, then v1's (`marmalade.ledger`).
+            let mut reads: Vec<(&str, &str)> = Vec::new();
+            for t in &tokens {
+                reads.push((t.as_str(), "marmalade-v2.ledger"));
+                reads.push((t.as_str(), "marmalade.ledger"));
+            }
+            for (t, module) in reads {
+                if !self.gql.take_node_read() {
+                    return (
+                        false,
+                        Some(
+                            "Q #37 oracle chain duplicates: the run's node read cap is \
+                             reached before the repeated rows were confirmed"
+                                .into(),
+                        ),
+                    );
+                }
+                if let Ok(kdx_node::local::Local::Found { value, .. }) =
+                    self.gql_local().get_balance(chain, module, t, acct).await
+                {
+                    if !value.starts_with('-') && value.chars().any(|ch| ('1'..='9').contains(&ch))
+                    {
+                        held = true;
+                        break;
+                    }
+                }
+            }
+            if !held {
+                return (false, None);
+            }
+        }
+        let Some(Value::Array(rb)) = b.body.pointer_mut("/data/nonFungibleAccount/chainAccounts")
+        else {
+            return (false, None);
+        };
+        let mut kept: Vec<Value> = Vec::new();
+        for r in rb.drain(..) {
+            if !kept.contains(&r) {
+                kept.push(r);
+            }
+        }
+        *rb = kept;
+        (true, None)
     }
 
     /// R-P5P9-58 row rules of an oracle pair (`[graphql] field_rules`), applied before the
@@ -2617,14 +2860,16 @@ impl Ctx {
             normalize_gql(v, u64::MAX);
         }
         let d = diff(&got, &want);
-        self.gql_node_outcome(op, vars, ta, d, &want)
+        self.gql_node_outcome(op, vars, ta, "node", d, &want)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gql_node_outcome(
         &self,
         op: &GqlOp,
         vars: &Map<String, Value>,
         ta: &Target,
+        b_name: &str,
         d: Vec<DiffEntry>,
         want: &Value,
     ) -> Outcome {
@@ -2650,7 +2895,7 @@ impl Ctx {
             op,
             vars,
             ta,
-            "node",
+            b_name,
             Some(&dummy),
             Some(200),
             &want.to_string(),
@@ -2705,7 +2950,7 @@ impl Ctx {
             normalize_gql(v, u64::MAX);
         }
         let d = diff(&got, &want);
-        self.gql_node_outcome(op, vars, ta, d, &want)
+        self.gql_node_outcome(op, vars, ta, "node", d, &want)
     }
 
     /// GraphQL chain balances and guards against `/local` `details` (H-1), retried once after a
@@ -2885,11 +3130,11 @@ impl Ctx {
         }
         // R-P5P9-58: a record with real diffs keeps its skew entries too.
         last.extend(skews);
-        self.gql_node_outcome(op, vars, ta, last, &Value::Null)
+        self.gql_node_outcome(op, vars, ta, "node", last, &Value::Null)
     }
 
     /// The internal pair: GraphQL chain balances against the native balances API.
-    async fn gql_native_balance(
+    pub(crate) async fn gql_native_balance(
         &self,
         ta: &Target,
         tb: &Target,
@@ -2992,7 +3237,79 @@ impl Ctx {
             }
         }
         d.dedup_by(|x, y| x.path == y.path && x.a.is_none() && y.a.is_none());
-        self.gql_node_outcome(op, vars, ta, d, &Value::Null)
+        // R-P5P9-86 S′: on a gap, one re-read in the other order (native, then GraphQL,
+        // within 1 s). Miner skew only when the re-read agrees on every chain with a gap.
+        let gaps: Vec<String> = d
+            .iter()
+            .filter_map(|e| e.path.strip_prefix("/chain")?.strip_suffix("/balance"))
+            .map(str::to_string)
+            .collect();
+        if !gaps.is_empty() && gaps.len() == d.len() {
+            let mut native = Vec::new();
+            for c in &gaps {
+                native.push(self.native_coin_balance(tb, account, c).await);
+            }
+            let again = self.gql_a_data(ta, op, vars).await.ok();
+            let ours = |c: &str| {
+                again
+                    .as_ref()?
+                    .pointer("/fungibleAccount/chainAccounts")?
+                    .as_array()?
+                    .iter()
+                    .find(|r| text_decimal(r.get("chainId")).as_deref() == Some(c))
+                    .and_then(|r| text_decimal(r.get("balance")))
+            };
+            let agree = gaps.iter().zip(&native).all(|(c, n)| {
+                n.as_ref()
+                    .zip(ours(c))
+                    .is_some_and(|(n, o)| same_decimal(&o, n))
+            });
+            if agree {
+                let first: Vec<Value> = d.iter().map(|e| json!([e.path, e.a, e.b])).collect();
+                d = vec![DiffEntry {
+                    path: NATIVE_SKEW_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: Some(json!({"first": first, "reread": "agrees", "chains": gaps})),
+                    b: None,
+                }];
+            } else {
+                // R-P5P9-95 I-4: the re-read that still differs is the record's evidence (no
+                // allowlist entry); the referee refuses a record that carries it.
+                let reread: Vec<Value> = gaps
+                    .iter()
+                    .zip(&native)
+                    .map(|(c, n)| json!({"chain": c, "native": n, "graphql": ours(c)}))
+                    .collect();
+                d.push(DiffEntry {
+                    path: NATIVE_REREAD_DIFFERS_PATH.into(),
+                    kind: DiffKind::Changed,
+                    a: Some(json!({ "reread": reread })),
+                    b: None,
+                });
+            }
+        }
+        // R-P5P9-86 S′: the pair's B is the native target, not the node.
+        self.gql_node_outcome(op, vars, ta, &tb.name, d, &Value::Null)
+    }
+
+    /// Ours' native coin balance of `account` on `chain` (R-P5P9-86 S′'s re-read); `None`
+    /// when it does not read.
+    async fn native_coin_balance(&self, tb: &Target, account: &str, chain: &str) -> Option<String> {
+        let path = format!(
+            "/api/v1/accounts/{}/balances?token=coin&chain={chain}",
+            crate::gen::enc_segment(account)
+        );
+        let cap = tb.get(&path).await.ok().filter(|c| c.status == 200)?;
+        let rows = cap.json()?.get("items")?.as_array()?.clone();
+        rows.into_iter()
+            .find(|x| {
+                x.get("module").and_then(Value::as_str) == Some("coin")
+                    && x.get("chain")
+                        .and_then(Value::as_u64)
+                        .map(|c| c.to_string())
+                        == Some(chain.to_string())
+            })
+            .and_then(|x| text_decimal(x.get("balance")))
     }
 }
 
@@ -3546,6 +3863,43 @@ mod tests {
         assert!(text.contains("  tip (1): TipDoc\n"), "{text}");
         assert!(text.contains("  subscription (1): SubDoc\n"), "{text}");
         assert!(text.contains("  unsupported (1): PriceDoc\n"), "{text}");
+    }
+
+    #[test]
+    fn h_p_a_first_page_error_answer_is_the_fault_marker() {
+        use crate::report::{DiffEntry, DiffKind};
+        let a = json!({"data": null, "errors": [{"message": "request deadline exceeded",
+            "extensions": {"code": "TIMEOUT"}}]});
+        let b = json!({"data": {"transactions": {"edges": []}}});
+        let e = |p: &str, k: DiffKind| DiffEntry {
+            path: p.into(),
+            kind: k,
+            a: None,
+            b: None,
+        };
+        let stored = || vec![e("/data", DiffKind::Type), e("/errors", DiffKind::Extra)];
+        let mut d = stored();
+        first_page_error_fault(&a, 200, &b, &mut d);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].path, FIRST_PAGE_FAULT_PATH);
+        let why = d[0].a.as_ref().unwrap()["why"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(why.contains("request deadline exceeded"), "{why}");
+        // Another difference stays; a 5xx is not ours' fault; an oracle error too.
+        let mut d = stored();
+        d.push(e("/extensions", DiffKind::Extra));
+        first_page_error_fault(&a, 200, &b, &mut d);
+        assert!(d.iter().any(|x| x.path == "/extensions"), "{d:?}");
+        for (st, bb) in [
+            (503, b.clone()),
+            (200, json!({"data": null, "errors": [{}]})),
+        ] {
+            let mut d = stored();
+            first_page_error_fault(&a, st, &bb, &mut d);
+            assert!(d.iter().all(|x| x.path != FIRST_PAGE_FAULT_PATH), "{d:?}");
+        }
     }
 
     #[test]

@@ -455,6 +455,8 @@ pub fn run_text(
     let since_secs = parse_since(since)?;
     let w = load(out_dir, since_secs)?;
     let unpaired = load_unpaired(out_dir, since_secs)?;
+    let assets = load_assets(out_dir, since_secs)?;
+    let log_bytes = load_log_bytes(out_dir, since_secs)?;
     let label = format!("gate {gate}, routes {routes}");
     let all_rows = rows(&w);
     // R-P5P9-81 (I-2): under `all` the graphql gate runs whatever the window holds, so a
@@ -513,6 +515,8 @@ pub fn run_text(
     } else {
         format!("routes {routes}")
     };
+    text.push_str(&render_assets(&assets));
+    text.push_str(&render_log_bytes(&log_bytes));
     let _ = writeln!(
         text,
         "verdict (gate {gate}, {scope}): {} (unexplained diffs {unexplained}; {})",
@@ -666,6 +670,118 @@ pub fn render_known_gaps(kg: &KnownGaps) -> (String, bool) {
         if ok { "within limits" } else { "OVER" }
     );
     (s, ok)
+}
+
+/// R-P5P9-88 (3a): the `assets <hash> build <sha>` lines of the summaries since
+/// `since_secs` (by day), each with the days it shows in.
+fn load_assets(out_dir: &Path, since_secs: u64) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+    let first_date = date_of(since_secs);
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for e in std::fs::read_dir(out_dir)
+        .with_context(|| format!("reading {}", out_dir.display()))?
+        .filter_map(Result::ok)
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(date) = name
+            .strip_prefix("summary-")
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if date < first_date.as_str() {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path())?;
+        if let Ok(day) = serde_json::from_str::<DailySummary>(&text) {
+            for a in day.assets {
+                out.entry(a).or_default().push(date.to_string());
+            }
+        }
+    }
+    for days in out.values_mut() {
+        days.sort();
+    }
+    Ok(out)
+}
+
+/// Per day: the diff log's (raw, zst) bytes, each when known.
+pub type LogBytes = BTreeMap<String, (Option<u64>, Option<u64>)>;
+
+/// R-P5P9-86 (diff log volume): per day since `since_secs`, the diff log's raw bytes (the
+/// rotation's record in the day's summary, else the unrotated `diffs-<date>.jsonl`) and the
+/// rotated `diffs-<date>.jsonl.zst` file's bytes.
+fn load_log_bytes(out_dir: &Path, since_secs: u64) -> anyhow::Result<LogBytes> {
+    let first_date = date_of(since_secs);
+    let mut out = LogBytes::new();
+    for e in std::fs::read_dir(out_dir)
+        .with_context(|| format!("reading {}", out_dir.display()))?
+        .filter_map(Result::ok)
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let len = || e.metadata().map(|m| m.len()).ok();
+        let (date, raw, zst) = if let Some(d) = name
+            .strip_prefix("diffs-")
+            .and_then(|n| n.strip_suffix(".jsonl.zst"))
+        {
+            (d.to_string(), None, len())
+        } else if let Some(d) = name
+            .strip_prefix("diffs-")
+            .and_then(|n| n.strip_suffix(".jsonl"))
+        {
+            (d.to_string(), len(), None)
+        } else if let Some(d) = name
+            .strip_prefix("summary-")
+            .and_then(|n| n.strip_suffix(".json"))
+        {
+            let day = std::fs::read(e.path())
+                .ok()
+                .and_then(|b| serde_json::from_slice::<DailySummary>(&b).ok());
+            let raw = day.and_then(|d| d.diff_log_bytes.get("raw").copied());
+            if raw.is_none() {
+                continue;
+            }
+            (d.to_string(), raw, None)
+        } else {
+            continue;
+        };
+        if date.len() != 10 || date < first_date {
+            continue;
+        }
+        let x = out.entry(date).or_default();
+        x.0 = x.0.or(raw);
+        x.1 = x.1.or(zst);
+    }
+    Ok(out)
+}
+
+/// R-P5P9-86: the diff log bytes per day.
+pub fn render_log_bytes(days: &LogBytes) -> String {
+    let mb = |b: Option<u64>| {
+        b.map_or("unknown".to_string(), |b| {
+            format!("{:.1} MB", b as f64 / 1e6)
+        })
+    };
+    let mut text = format!("diff logs: {} days\n", days.len());
+    for (date, (raw, zst)) in days {
+        let zst = match zst {
+            Some(_) => format!("zst {}", mb(*zst)),
+            None => "not rotated".to_string(),
+        };
+        text.push_str(&format!("  {date}: raw {}, {zst}\n", mb(*raw)));
+    }
+    text
+}
+
+/// R-P5P9-88 (3a): the harness's assets and build lines, for the FV setup to check against F.
+pub fn render_assets(assets: &BTreeMap<String, Vec<String>>) -> String {
+    if assets.is_empty() {
+        return "harness assets: none recorded\n".into();
+    }
+    let mut text = format!("harness assets: {} distinct\n", assets.len());
+    for (line, days) in assets {
+        text.push_str(&format!("  {line} ({})\n", days.join(", ")));
+    }
+    text
 }
 
 /// The union of the summaries' unpaired captured documents since `since_secs` (by day).
@@ -1034,6 +1150,39 @@ mod tests {
         .unwrap();
     }
 
+    /// R-P5P9-88 (3a): the summary prints each start's assets hash and build sha with the
+    /// days it shows in, and says so when none is recorded.
+    #[test]
+    fn the_summary_prints_the_harness_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (text, _) = run_text(dir.path(), "2026-11-15T00:00:00Z", "must", "small").unwrap();
+        assert!(text.contains("harness assets: none recorded"), "{text}");
+        for (date, line) in [
+            ("2026-11-15", "assets 0a1b build 56b34b9aaaaa"),
+            ("2026-11-16", "assets 0a1b build 56b34b9aaaaa"),
+            ("2026-11-16", "assets 9f9f build 0123456789ab"),
+        ] {
+            let path = dir.path().join(format!("summary-{date}.json"));
+            let mut day: DailySummary = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            day.date = date.into();
+            day.assets.insert(line.into());
+            std::fs::write(&path, serde_json::to_vec(&day).unwrap()).unwrap();
+        }
+        let (text, _) = run_text(dir.path(), "2026-11-15T00:00:00Z", "must", "small").unwrap();
+        assert!(text.contains("harness assets: 2 distinct"), "{text}");
+        assert!(
+            text.contains("  assets 0a1b build 56b34b9aaaaa (2026-11-15, 2026-11-16)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  assets 9f9f build 0123456789ab (2026-11-16)"),
+            "{text}"
+        );
+    }
+
     /// Writes one summary file per day: (date, buckets, its pair's class, known-gap-p records
     /// in the first bucket, known-gap-p baseline per hour).
     fn write_days(dir: &Path, days: &[(&str, u64, &str, u64, f64)]) {
@@ -1256,8 +1405,9 @@ mod tests {
         assert_eq!(merge_baselines(forward), want);
     }
 
-    /// R-P5P9-78 (H2 m-1): the shipped P baseline counts only the records P matches (3 over
-    /// 4.05 h = 0.74/h, limit 1.11/h): 3 records in 2 h are over (limit 2.2), 2 are within.
+    /// R-P5P9-78 (H2 m-1): the shipped P baseline counts only the records P matches; with
+    /// R-P5P9-97 that is 2 over 4.05 h = 0.49/h (#322's key is not listed), limit 0.74/h:
+    /// 2 records in 2 h are over (limit 1.5), 1 is within.
     #[test]
     fn the_shipped_p_baseline_counts_only_matched_records() {
         let al = crate::allowlist::Allowlist::load(
@@ -1266,7 +1416,7 @@ mod tests {
         .unwrap();
         let p = "known-gap-p-heavy-account-deadline";
         let b = al.baseline(p).unwrap();
-        assert_eq!(b, 0.74);
+        assert_eq!(b, 0.49);
         let gate = |n: u64| {
             let dir = tempfile::tempdir().unwrap();
             write_days(dir.path(), &[("2026-11-15", 12, "match", 0, b)]);
@@ -1281,9 +1431,9 @@ mod tests {
             .collect();
             render_known_gaps(&kg)
         };
-        let (text, ok) = gate(3);
-        assert!(!ok && text.contains("limit 2.2"), "{text}");
         let (text, ok) = gate(2);
+        assert!(!ok && text.contains("limit 1.5"), "{text}");
+        let (text, ok) = gate(1);
         assert!(ok, "{text}");
     }
 
