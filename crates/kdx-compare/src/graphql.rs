@@ -3083,7 +3083,17 @@ impl Ctx {
                         k
                     };
                     let pred = |v: &Value| v.get("predicate").or_else(|| v.get("pred")).cloned();
-                    if keys(g) != keys(&det.guard) || pred(g) != pred(&det.guard) {
+                    // GQ-14: ours renders a keyset reference resolved on the row's chain as a
+                    // `KeysetGuard`; the node's `details` keeps the reference, so it is
+                    // resolved with `describe-keyset` on the same chain (FV day 1).
+                    let node_guard = match keysetref_name(&det.guard) {
+                        Some(name) => match local.describe_keyset(chain, &name).await {
+                            Ok(kdx_node::Local::Found { value, .. }) => value,
+                            _ => det.guard.clone(),
+                        },
+                        None => det.guard.clone(),
+                    };
+                    if keys(g) != keys(&node_guard) || pred(g) != pred(&node_guard) {
                         d.push(DiffEntry {
                             path: format!("/chain{chain}/guard"),
                             kind: DiffKind::Changed,
@@ -3262,7 +3272,7 @@ impl Ctx {
             let agree = gaps.iter().zip(&native).all(|(c, n)| {
                 n.as_ref()
                     .zip(ours(c))
-                    .is_some_and(|(n, o)| same_decimal(&o, n))
+                    .is_some_and(|(n, o)| reread_agrees(&o, n))
             });
             if agree {
                 let first: Vec<Value> = d.iter().map(|e| json!([e.path, e.a, e.b])).collect();
@@ -3329,6 +3339,32 @@ fn text_decimal(v: Option<&Value>) -> Option<String> {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
         _ => None,
+    }
+}
+
+/// The keyset name a `{"keysetref": {"ns", "ksn"}}` guard refers to (`ns.ksn`, or `ksn`
+/// without a namespace).
+pub(crate) fn keysetref_name(g: &Value) -> Option<String> {
+    let r = g.get("keysetref")?;
+    let ksn = r.get("ksn")?.as_str().filter(|s| !s.is_empty())?;
+    match r.get("ns").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        Some(ns) => Some(format!("{ns}.{ksn}")),
+        None => Some(ksn.to_owned()),
+    }
+}
+
+/// The native pair's re-read (R-P5P9-86 S′) agrees: equal decimals, or ours' GraphQL `Float`
+/// is the native decimal rounded once to f64 (F2, R-P5P9-58; FV day 1).
+pub(crate) fn reread_agrees(graphql: &str, native: &str) -> bool {
+    if same_decimal(graphql, native) {
+        return true;
+    }
+    match (
+        graphql.trim().parse::<f64>(),
+        native.trim().parse::<f64>(),
+    ) {
+        (Ok(x), Ok(y)) => x.is_finite() && x == y,
+        _ => false,
     }
 }
 
@@ -3483,6 +3519,25 @@ pub async fn gen_debug(cfg: &CompareConfig, count: usize, print: bool) -> anyhow
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keysetref_names_and_f64_rereads() {
+        use serde_json::json;
+        assert_eq!(
+            super::keysetref_name(&json!({"keysetref": {"ns": "n_e4", "ksn": "gas"}})),
+            Some("n_e4.gas".into())
+        );
+        assert_eq!(
+            super::keysetref_name(&json!({"keysetref": {"ns": null, "ksn": "ks"}})),
+            Some("ks".into())
+        );
+        assert_eq!(super::keysetref_name(&json!({"keys": [], "pred": "keys-all"})), None);
+        assert!(super::reread_agrees(
+            "78366.18873465271",
+            "78366.188734652711000000000000000000"
+        ));
+        assert!(!super::reread_agrees("78366.1887346527", "78366.188734652711"));
+    }
+
     use super::*;
 
     fn norm(v: Value) -> Value {

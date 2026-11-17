@@ -528,17 +528,35 @@ async fn settle_native(
         .get("accountName")
         .and_then(Value::as_str)
         .ok_or("no accountName")?;
-    // R-P5P9-95 I-4: the live re-read disproved skew; nothing is settled (no read).
-    if rec
-        .diff
-        .iter()
-        .any(|e| e.path == crate::graphql::NATIVE_REREAD_DIFFERS_PATH)
-    {
+    // R-P5P9-95 I-4: the live re-read disproved skew; nothing is settled (no read). FV day 1:
+    // a re-read whose every chain agrees up to f64 (a harness before the fix marked those)
+    // disproved nothing; the marker is dropped and the gaps are settled as usual.
+    let marker = |e: &DiffEntry| e.path == crate::graphql::NATIVE_REREAD_DIFFERS_PATH;
+    let f64_agrees = |e: &DiffEntry| {
+        let rows = e
+            .a
+            .as_ref()
+            .and_then(|a| a.get("reread"))
+            .and_then(Value::as_array);
+        rows.is_some_and(|rows| {
+            !rows.is_empty()
+                && rows.iter().all(|r| {
+                    match (
+                        r.get("graphql").and_then(Value::as_str),
+                        r.get("native").and_then(Value::as_str),
+                    ) {
+                        (Some(g), Some(n)) => crate::graphql::reread_agrees(g, n),
+                        _ => false,
+                    }
+                })
+        })
+    };
+    if rec.diff.iter().any(|e| marker(e) && !f64_agrees(e)) {
         return Ok((rec.diff.clone(), Vec::new()));
     }
     let ts = ts_secs(&rec.ts).ok_or("the record's time does not read")?;
     let mut d = Vec::new();
-    for e in &rec.diff {
+    for e in rec.diff.iter().filter(|e| !marker(e)) {
         let chain = e
             .path
             .strip_prefix("/chain")
