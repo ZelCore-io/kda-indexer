@@ -12,14 +12,17 @@ validation is in progress; not yet serving production traffic.
 
 - One binary, installed as a Debian package with a systemd unit next to the node it reads. No
   Postgres, no Docker.
-- Mainnet history in <!--m:disk-total-vs-cwd-->140.2 GB<!--/m-->:
-  <!--m:disk-total-vs-cwd-->11.2× smaller (−91%)<!--/m--> than chainweb-data on the same host.
-- `/txs/account` typical response <!--m:lat-rest-account-p50-->about 16× faster (−94%)<!--/m-->
-  and slowest 1% <!--m:lat-rest-account-p99-->about 95× faster (−99%)<!--/m--> than chainweb-data.
-- <!--m:corr-unexplained-cg5-->0<!--/m--> unexplained differences from chainweb-data, the
-  GraphQL indexer and the node at the end of the CG-5 comparison gate.
+- Mainnet history in <!--m:disk-total-vs-cwd-->140.2 GB<!--/m--> (interim):
+  <!--m:disk-total-vs-cwd-->11.2× smaller (−91%)<!--/m--> (interim) than chainweb-data on the same host.
+- `/txs/account` typical response <!--m:lat-rest-account-p50-->about 16× faster (−94%)<!--/m--> (interim)
+  and slowest 1% <!--m:lat-rest-account-p99-->about 95× faster (−99%)<!--/m--> (interim) than
+  chainweb-data. chainweb-data failed or timed out on 338 more request pairs, which are excluded
+  from its latency.
+- <!--m:corr-unexplained-cg5-->0<!--/m--> unexplained differences (interim) from chainweb-data, the
+  GraphQL indexer and the node at the end of the CG-5 comparison gate (the last record was
+  accepted on node evidence).
 - Where it is slower: `/txs/search` slowest 1% is
-  <!--m:lat-rest-search-p99-->about 3.6× slower (+260%)<!--/m-->, because patterns that cannot
+  <!--m:lat-rest-search-p99-->about 3.6× slower (+260%)<!--/m--> (interim), because patterns that cannot
   use the code index run a bounded scan.
 
 All numbers are interim until the 72-hour validation ends; sources, hardware and caveats are in

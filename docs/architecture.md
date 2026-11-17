@@ -24,6 +24,7 @@ flowchart LR
     end
 
     subgraph api["APIs (one read snapshot per request)"]
+        read["Read layer<br/>one snapshot per request"]
         native["Native API<br/>/api/v1"]
         compat["Compat API<br/>chainweb-data routes, /v1/txs"]
         gql["GraphQL<br/>Kadena graph schema"]
@@ -39,14 +40,15 @@ flowchart LR
     hot --> freezer --> seg
     hot --> search
     seg --> search
-    hot --> native
-    seg --> native
-    search --> native
-    native -.- compat
-    native -.- gql
+    hot --> read
+    seg --> read
+    search --> read
+    read --> native
+    read --> compat
+    read --> gql
 ```
 
-The compat and GraphQL layers use the same read layer as the native API (dotted lines).
+The native, compat and GraphQL APIs all sit on the same read layer.
 
 ## Ingest
 
@@ -108,8 +110,9 @@ by 3-character n-grams. It is derived data: `kda-indexer search rebuild` recreat
 
 Every API request opens one MDBX read transaction and one snapshot of the segment set.
 Heights below the segment frontier come from segments, heights above it from hot rows, so a
-transaction is never listed twice or torn across a freeze or merge; it can be briefly missing
-while a block is applied. Readers never hold a read transaction longer than one request.
+transaction is never listed twice or torn across a freeze or merge. During a backfill commit,
+heights between the two frontiers (the hot store's and the manifest's) are briefly in neither,
+and a request that would see them reopens its read transaction (see [format.md](format.md)). Readers never hold a read transaction longer than one request.
 
 `kda-indexer serve` opens the same data directory read-only, so a replica or a snapshot copy
 can answer the APIs while another process writes.
@@ -126,7 +129,8 @@ reorged away answers `400 cursor invalidated by reorg` instead of pointing at a 
 transaction.
 
 A reorg deeper than `ingest.finality_depth`, or one that reaches below the frozen frontier,
-halts that chain: the other chains keep running, an ERROR is logged and the halt is exposed in
+halts that chain: the other chains keep serving, but the freezer pauses for all chains, so the
+hot store grows until the halt is cleared. An ERROR is logged and the halt is exposed in
 metrics. Recovery is a manual `unwind` described in [operations.md](operations.md#halted-chains).
 
 ## Data directory
@@ -164,6 +168,7 @@ The byte-level format of every file, the write ordering and the integrity checks
 | Crate | Role |
 |---|---|
 | `kda-indexer` | The binary and its commands (`run`, `serve`, `backfill`, `snapshot`, `unwind`, `verify`, `search`, `graphql`, …) |
+| `kdx-types` | Identifiers, hashes, name dictionaries, varints and the lossless value codec shared by every crate |
 | `kdx-node` | chainweb-node HTTP client |
 | `kdx-ingest` | Header walk, fetch, decode and index pipeline, backfill, tail, reorgs, freezer, reconciler |
 | `kdx-decode` | Payload and output decoding into typed records |
@@ -173,4 +178,5 @@ The byte-level format of every file, the write ordering and the integrity checks
 | `kdx-api` | Read layer, native and compat APIs, admin listener |
 | `kdx-graphql` | GraphQL adapter (Kadena graph schema) |
 | `kdx-metrics` | Prometheus registry |
+| `kdx-rk-bench` | Benchmark of request-key index structures (a minimal perfect hash with a slot table against a sorted prefix array) |
 | `kdx-compare` | The comparison harness used for validation (see [methodology.md](methodology.md)) |

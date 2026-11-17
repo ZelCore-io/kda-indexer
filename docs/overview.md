@@ -9,8 +9,7 @@ validation is in progress; not yet serving production traffic.
 
 ## What it indexes
 
-Everything a Kadena transaction carries is stored on the first pass, so a new API feature does
-not need a re-sync:
+Everything a Kadena transaction carries is stored on the first pass:
 
 - **Blocks**: headers, miner, coinbase, and derived header fields.
 - **Transactions**: the command (code or continuation, data, signers with capabilities,
@@ -34,8 +33,8 @@ One process, separate listeners (mainnet defaults, all on loopback unless config
 | Listener | Default | Contents |
 |---|---|---|
 | Native API | `127.0.0.1:31361` | `/api/v1/...`: blocks, transactions, account and key history, events, balances, tokens, NFTs, code search, defpacts. Binds loopback or private addresses only. See [api.md](api.md). |
-| Compat API | `127.0.0.1:31362` | chainweb-data routes `/txs/account`, `/txs/events`, `/txs/recent`, `/txs/search`, `/txs/tx`, `/txs/txs`, `/stats`, `/coins`, and the kda-txs route `/v1/txs/...`, with the same shapes and status codes. |
-| GraphQL | `127.0.0.1:31363` | `POST`/`GET /graphql` with Kadena's `@kadena/graph` schema, vendored unchanged; subscriptions over websocket. See [graphql.md](graphql.md). |
+| Compat API | `127.0.0.1:31362` | chainweb-data routes `/txs/account`, `/txs/events`, `/txs/recent`, `/txs/search`, `/txs/tx`, `/txs/txs`, `/stats`, `/coins`, and the kda-txs route `/v1/txs/...`. Compatible with chainweb-data's `/txs` routes, with documented differences (see [api.md](api.md)). |
+| GraphQL | `127.0.0.1:31363` | `POST`/`GET /graphql` with Kadena's schema, vendored, plus a few pinned extensions; subscriptions over websocket. See [graphql.md](graphql.md). |
 | Admin | `127.0.0.1:31369` | `/healthz`, `/readyz`, `/status`, `/metrics` (Prometheus). |
 
 `kda-indexer run` ingests and serves. `kda-indexer serve` serves a data directory read-only (a

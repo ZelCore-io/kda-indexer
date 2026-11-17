@@ -6,8 +6,7 @@ listener, `api.graphql` (default `127.0.0.1:31363`). `run` and `serve` both bind
 - `POST /graphql`: a JSON request `{"query", "variables", "operationName"}`, or a batch (a JSON
   array of them).
 - `GET /graphql?query=...&variables=...&operationName=...` (GraphQL over HTTP).
-- The websocket upgrade on the same path carries subscriptions. Until they are served, an
-  upgrade request answers a GraphQL error with `extensions.code = "NOT_SUPPORTED"`.
+- The websocket upgrade on the same path carries subscriptions (see [Subscriptions](#subscriptions)).
 
 The listener sits behind the same limits as the compat API (per-IP rate, in-flight cap,
 `trusted_proxies`, the request deadline and the 8 MB response cap) and answers CORS from any
