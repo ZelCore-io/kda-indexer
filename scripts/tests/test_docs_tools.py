@@ -53,7 +53,7 @@ class ChangeTests(unittest.TestCase):
         c = docs_charts.change(metric("a", 55, 709, unit="ms"))
         self.assertAlmostEqual(c["factor"], 12.9, places=1)
         self.assertEqual(c["direction"], "better")
-        self.assertEqual(c["text"], "12.9× faster (−92%)")
+        self.assertEqual(c["text"], "−654 ms (12.9× faster, −92%)")
         c = docs_charts.change(metric("b", 55, 709, unit="GB"))
         self.assertEqual(c["text"], "12.9× smaller (−92%)")
         c = docs_charts.change(metric("c", 140.2, 1568.6, unit="GB"))
@@ -63,7 +63,7 @@ class ChangeTests(unittest.TestCase):
     def test_change_regression(self):
         c = docs_charts.change(metric("a", 9.4, 4.0, unit="ms"))
         self.assertEqual(c["direction"], "worse")
-        self.assertEqual(c["text"], "2.4× slower (+135%)")
+        self.assertEqual(c["text"], "+5.4 ms (2.4× slower, +135%)")
         c = docs_charts.change(metric("b", 9.4, 4.0, unit="rows"))
         self.assertEqual(c["text"], "2.4× more (+135%)")
         c = docs_charts.change(metric("c", 1.17, 0.8, unit="GB"))
@@ -77,30 +77,75 @@ class ChangeTests(unittest.TestCase):
 
     def test_change_small_factor_is_percent_only(self):
         c = docs_charts.change(metric("a", 95, 100, unit="ms"))
-        self.assertEqual(c["text"], "5% faster")
+        self.assertEqual(c["text"], "−5 ms (5% faster)")
         c = docs_charts.change(metric("b", 108, 100, unit="ms"))
-        self.assertEqual(c["text"], "8% slower")
+        self.assertEqual(c["text"], "+8 ms (8% slower)")
 
     def test_change_boundary_at_two_percent(self):
         self.assertEqual(docs_charts.change(metric("a", 102, 100, unit="ms"))["direction"], "worse")
         self.assertEqual(docs_charts.change(metric("b", 98, 100, unit="ms"))["direction"], "better")
-        self.assertEqual(docs_charts.change(metric("c", 98, 100, unit="ms"))["text"], "2% faster")
+        self.assertEqual(docs_charts.change(metric("c", 98, 100, unit="ms"))["text"], "−2 ms (2% faster)")
         self.assertEqual(docs_charts.change(metric("d", 101.99, 100, unit="ms"))["direction"], "same")
         self.assertEqual(docs_charts.change(metric("e", 98.01, 100, unit="ms"))["direction"], "same")
 
     def test_change_histogram_edges_are_rounded_and_prefixed(self):
         src = "values are histogram bucket upper edges (about ±20%)"
         c = docs_charts.change(metric("a", 38, 709, unit="ms", source=src))
-        self.assertEqual(c["text"], "about 19× faster (−95%)")
+        self.assertEqual(c["text"], "−670 ms (about 19× faster, −95%)")
         c = docs_charts.change(metric("b", 2540, 709, unit="ms", source=src))
-        self.assertEqual(c["text"], "about 3.6× slower (+260%)")
+        self.assertEqual(c["text"], "+1.8 s (about 3.6× slower, +260%)")
         c = docs_charts.change(metric("c", 22, 5266, unit="ms", note="bucket edges"))
-        self.assertEqual(c["text"], "about 240× faster (−99%)")
+        self.assertEqual(c["text"], "−5.2 s (about 240× faster, −99%)")
         c = docs_charts.change(metric("d", 1, 5, unit="ms", source=src))
-        self.assertEqual(c["text"], "about 5× faster (−80%)")
+        self.assertEqual(c["text"], "−4 ms (about 5× faster, −80%)")
         # exact data are not rounded or prefixed
         c = docs_charts.change(metric("e", 38, 709, unit="ms"))
-        self.assertEqual(c["text"], "18.7× faster (−95%)")
+        self.assertEqual(c["text"], "−671 ms (18.7× faster, −95%)")
+
+    def test_latency_change_leads_with_absolute_time(self):
+        src = "values are histogram bucket upper edges (about ±20%)"
+        c = docs_charts.change(metric("a", 6, 95, unit="ms", source=src))
+        self.assertEqual(c["text"], "−89 ms (about 16× faster, −94%)")
+        self.assertIsNone(c["class"])
+        c = docs_charts.change(metric("b", 2540, 709, unit="ms", source=src))
+        self.assertEqual(c["text"], "+1.8 s (about 3.6× slower, +260%)")
+        c = docs_charts.change(metric("c", 492, 46956, unit="ms", source=src))
+        self.assertEqual(c["text"], "−46 s (about 95× faster, −99%)")
+        # exact data keep their precision
+        c = docs_charts.change(metric("d", 12.5, 3.5, unit="ms"))
+        self.assertEqual(c["text"], "+9 ms (3.6× slower, +257%)")
+        c = docs_charts.change(metric("e", 108, 100, unit="ms"))
+        self.assertEqual(c["text"], "+8 ms (8% slower)")
+        c = docs_charts.change(metric("f", 2.5, 1.0, unit="s"))
+        self.assertEqual(c["text"], "+1.5 s (2.5× slower, +150%)")
+        # sizes and counts are unchanged
+        c = docs_charts.change(metric("g", 140.2, 1568.6, unit="GB"))
+        self.assertEqual(c["text"], "11.2× smaller (−91%)")
+        self.assertIsNone(c["class"])
+
+    def test_latency_class(self):
+        def cls(ours, base, mid="x-p50", unit="ms"):
+            return docs_charts.change(metric(mid, ours, base, unit=unit))["class"]
+        self.assertEqual(cls(27, 15), "negligible")          # +12 ms
+        self.assertEqual(cls(34.9, 15), "negligible")        # +19.9 ms
+        self.assertEqual(cls(35, 15), "noticeable")          # +20 ms
+        self.assertEqual(cls(215, 15), "noticeable")         # +200 ms
+        self.assertEqual(cls(216, 15), "user-visible")       # +201 ms
+        self.assertEqual(cls(1.3, 1.0, unit="s"), "user-visible")  # +300 ms
+        # a p99 over 1.5 s is user-visible whatever was added
+        self.assertEqual(cls(1600, 1550, mid="x-p99"), "user-visible")
+        self.assertEqual(cls(1600, 1550, mid="x-p50"), "noticeable")
+        self.assertEqual(docs_charts.change(metric("y", 1600, 1550, label="q p99"))["class"], "user-visible")
+        # faster, same or unmeasured: no class
+        self.assertIsNone(cls(5, 15))
+        self.assertIsNone(cls(15, 15))
+        self.assertIsNone(docs_charts.change(metric("z", 15, None))["class"])
+
+    def test_render_shows_latency_class(self):
+        m = metric("slow-p99", 2540, 709, unit="ms")
+        svg = docs_charts.render({"id": "c", "title": "t", "metrics": ["slow-p99"], "scale": "auto"},
+                                 {"slow-p99": m})
+        self.assertIn("· user-visible", svg)
 
     def test_fmt_factor(self):
         self.assertEqual(docs_charts.fmt_factor(99.96), "100")
@@ -188,7 +233,7 @@ class CheckTests(unittest.TestCase):
 
     def test_clean_tree_passes(self):
         root = self.tree("[o](other.md) <!--m:lat-->55 ms<!--/m--> <!--m:lat-->55<!--/m--> "
-                         "<!--m:lat-->709 ms<!--/m--> <!--m:lat-->12.9× faster (−92%)<!--/m-->\n")
+                         "<!--m:lat-->709 ms<!--/m--> <!--m:lat-->−654 ms (12.9× faster, −92%)<!--/m-->\n")
         self.assertEqual(check(root), 0)
 
     def test_relative_links_resolve(self):
@@ -220,13 +265,17 @@ class CheckTests(unittest.TestCase):
         # wrong direction word
         self.assertNotEqual(check(self.tree("<!--m:lat-->12.9× slower (−92%)<!--/m-->\n")), 0)
         # wrong sign or percent
-        self.assertNotEqual(check(self.tree("<!--m:lat-->12.9× faster (+92%)<!--/m-->\n")), 0)
-        self.assertNotEqual(check(self.tree("<!--m:lat-->12.9× faster (−91%)<!--/m-->\n")), 0)
+        self.assertNotEqual(check(self.tree("<!--m:lat-->−654 ms (12.9× faster, +92%)<!--/m-->\n")), 0)
+        self.assertNotEqual(check(self.tree("<!--m:lat-->−654 ms (12.9× faster, −91%)<!--/m-->\n")), 0)
         # factor or percent alone are not the change text
         self.assertNotEqual(check(self.tree("<!--m:lat-->12.9×<!--/m-->\n")), 0)
         self.assertNotEqual(check(self.tree("<!--m:lat-->92%<!--/m-->\n")), 0)
         # right words, wrong number
         self.assertNotEqual(check(self.tree("<!--m:lat-->13.9× faster (−92%)<!--/m-->\n")), 0)
+        # latency needs the absolute time, and the right one
+        self.assertNotEqual(check(self.tree("<!--m:lat-->12.9× faster (−92%)<!--/m-->\n")), 0)
+        self.assertNotEqual(check(self.tree("<!--m:lat-->−650 ms (12.9× faster, −92%)<!--/m-->\n")), 0)
+        self.assertEqual(check(self.tree("<!--m:lat-->−654 ms (12.9× faster, −92%)<!--/m-->\n")), 0)
 
     def test_raw_value_units_and_bare_numbers(self):
         # wrong unit
@@ -237,6 +286,13 @@ class CheckTests(unittest.TestCase):
         self.assertNotEqual(check(self.tree("<!--m:lat-->92<!--/m-->\n")), 0)
         # a bare ours or baseline value is accepted
         self.assertEqual(check(self.tree("<!--m:lat-->709<!--/m-->\n")), 0)
+
+    def test_latency_class_tag(self):
+        metrics = [metric("lat", 55, 709), metric("slow", 2540, 709)]
+        self.assertEqual(check(self.tree("<!--m:slow-->user-visible<!--/m-->\n", metrics)), 0)
+        self.assertNotEqual(check(self.tree("<!--m:slow-->negligible<!--/m-->\n", metrics)), 0)
+        # a faster metric has no class
+        self.assertNotEqual(check(self.tree("<!--m:lat-->negligible<!--/m-->\n", metrics)), 0)
 
     def test_unpublished_metric_cannot_be_tagged(self):
         metrics = [metric("lat", 55, 709), metric("wip", 182, None, unit="records", publish=False)]

@@ -15,7 +15,9 @@ Checks
              the metric's full change text (factor, direction word and
              percent). Any other tag is a raw value: a number equal, at the
              precision shown, to ours or baseline, optionally followed by the
-             metric's unit. Metrics with "publish": false must not be tagged.
+             metric's unit. A slower latency metric may also tag its class
+             (negligible, noticeable, user-visible). Metrics with
+             "publish": false must not be tagged.
   forbidden  README.md and docs/** hold no private infrastructure strings or
              email addresses. docs/specs, docs/plans and docs/internal are
              skipped by every check.
@@ -158,6 +160,8 @@ def check_numbers(root, path, text, metrics, errors):
             continue
         c = docs_charts.change(metric)
         if shown == c["text"] or (shown == "not measured" and c["direction"] == "none"):
+            continue
+        if c.get("class") and shown == c["class"]:
             continue
         if "\u00d7" in shown or "%" in shown:
             errors.append("{}: numbers: {!r} for {} is not the change text {!r}".format(

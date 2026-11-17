@@ -38,43 +38,43 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans
 <g class="axis linear">
 <line class="grid" x1="260.0" y1="78" x2="260.0" y2="201"/>
 <text class="tick" x="260.0" y="217" text-anchor="middle">0</text>
-<line class="grid" x1="355.0" y1="78" x2="355.0" y2="201"/>
-<text class="tick" x="355.0" y="217" text-anchor="middle">500</text>
-<line class="grid" x1="450.0" y1="78" x2="450.0" y2="201"/>
-<text class="tick" x="450.0" y="217" text-anchor="middle">1,000</text>
-<line class="grid" x1="545.0" y1="78" x2="545.0" y2="201"/>
-<text class="tick" x="545.0" y="217" text-anchor="middle">1,500</text>
-<line class="grid" x1="640.0" y1="78" x2="640.0" y2="201"/>
-<text class="tick" x="640.0" y="217" text-anchor="middle">2,000</text>
+<line class="grid" x1="340.0" y1="78" x2="340.0" y2="201"/>
+<text class="tick" x="340.0" y="217" text-anchor="middle">500</text>
+<line class="grid" x1="420.0" y1="78" x2="420.0" y2="201"/>
+<text class="tick" x="420.0" y="217" text-anchor="middle">1,000</text>
+<line class="grid" x1="500.0" y1="78" x2="500.0" y2="201"/>
+<text class="tick" x="500.0" y="217" text-anchor="middle">1,500</text>
+<line class="grid" x1="580.0" y1="78" x2="580.0" y2="201"/>
+<text class="tick" x="580.0" y="217" text-anchor="middle">2,000</text>
 </g>
 <g class="metric" id="disk-total-vs-cwd">
 <text class="label" x="250" y="100" text-anchor="end">Total vs chainweb-data</text>
-<rect class="ours better" x="260" y="84" width="26.6" height="12" rx="2"/>
-<text class="val" x="292.6" y="94">140.2 GB
+<rect class="ours better" x="260" y="84" width="22.4" height="12" rx="2"/>
+<text class="val" x="288.4" y="94">140.2 GB
  <tspan class="up">▲</tspan>
  11.2× smaller (−91%)
 </text>
-<rect class="base" x="260" y="99" width="298.0" height="12" rx="2"/>
-<text class="muted" x="564.0" y="109">1,568.6 GB · chainweb-data</text>
+<rect class="base" x="260" y="99" width="251.0" height="12" rx="2"/>
+<text class="muted" x="517.0" y="109">1,568.6 GB · chainweb-data</text>
 </g>
 <g class="metric" id="disk-total-vs-graphql">
 <text class="label" x="250" y="141" text-anchor="end">Total vs GraphQL indexer (per copy)</text>
-<rect class="ours better" x="260" y="125" width="26.6" height="12" rx="2"/>
-<text class="val" x="292.6" y="135">140.2 GB
+<rect class="ours better" x="260" y="125" width="22.4" height="12" rx="2"/>
+<text class="val" x="288.4" y="135">140.2 GB
  <tspan class="up">▲</tspan>
  13.3× smaller (−93%)
 </text>
-<rect class="base" x="260" y="140" width="355.3" height="12" rx="2"/>
-<text class="muted" x="621.3" y="150">1,870 GB · GraphQL indexer</text>
+<rect class="base" x="260" y="140" width="299.2" height="12" rx="2"/>
+<text class="muted" x="565.2" y="150">1,870 GB · GraphQL indexer</text>
 </g>
 <g class="metric" id="disk-total-vs-node">
 <text class="label" x="250" y="182" text-anchor="end">Total vs node database (context)</text>
-<rect class="ours better" x="260" y="166" width="26.6" height="12" rx="2"/>
-<text class="val" x="292.6" y="176">140.2 GB
+<rect class="ours better" x="260" y="166" width="22.4" height="12" rx="2"/>
+<text class="val" x="288.4" y="176">140.2 GB
  <tspan class="up">▲</tspan>
  7.1× smaller (−86%)
 </text>
-<rect class="base" x="260" y="181" width="189.9" height="12" rx="2"/>
-<text class="muted" x="455.9" y="191">999.7 GB · node</text>
+<rect class="base" x="260" y="181" width="160.0" height="12" rx="2"/>
+<text class="muted" x="426.0" y="191">999.7 GB · node</text>
 </g>
 </svg>

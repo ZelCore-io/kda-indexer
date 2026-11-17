@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="487" viewBox="0 0 880 487" role="img" aria-labelledby="latency-rest-p99-t latency-rest-p99-d">
 <title id="latency-rest-p99-t">REST response time, tail (p99)</title>
-<desc id="latency-rest-p99-d">/txs/account p99: kda-indexer 492 ms, chainweb-data 46,956 ms, about 95× faster (−99%); /txs/events p99: kda-indexer 22 ms, chainweb-data 5,266 ms, about 240× faster (−99%); /txs/recent p99: kda-indexer 22 ms, chainweb-data 38 ms, about 1.7× faster (−42%); /txs/search p99: kda-indexer 2,540 ms, chainweb-data 709 ms, about 3.6× slower (+260%); /stats p99: kda-indexer 2 ms, chainweb-data 66 ms, about 33× faster (−97%); /txs/txs p99: kda-indexer 4 ms, chainweb-data 66 ms, about 16× faster (−94%); /txs/tx p99: kda-indexer 79 ms, chainweb-data 79 ms, about the same; /coins p99: kda-indexer 4 ms, chainweb-data 22 ms, about 5.5× faster (−82%); /v1/txs p99: kda-indexer 2,540 ms, /v1/txs service 32,609 ms, about 13× faster (−92%).</desc>
+<desc id="latency-rest-p99-d">/txs/account p99: kda-indexer 492 ms, chainweb-data 46,956 ms, −46 s (about 95× faster, −99%); /txs/events p99: kda-indexer 22 ms, chainweb-data 5,266 ms, −5.2 s (about 240× faster, −99%); /txs/recent p99: kda-indexer 22 ms, chainweb-data 38 ms, −16 ms (about 1.7× faster, −42%); /txs/search p99: kda-indexer 2,540 ms, chainweb-data 709 ms, +1.8 s (about 3.6× slower, +260%) (user-visible); /stats p99: kda-indexer 2 ms, chainweb-data 66 ms, −64 ms (about 33× faster, −97%); /txs/txs p99: kda-indexer 4 ms, chainweb-data 66 ms, −62 ms (about 16× faster, −94%); /txs/tx p99: kda-indexer 79 ms, chainweb-data 79 ms, about the same; /coins p99: kda-indexer 4 ms, chainweb-data 22 ms, −18 ms (about 5.5× faster, −82%); /v1/txs p99: kda-indexer 2,540 ms, /v1/txs service 32,609 ms, −30 s (about 13× faster, −92%).</desc>
 <style>
 svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
 .bg{fill:#ffffff}
@@ -42,104 +42,105 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans
 <g class="axis log">
 <line class="grid" x1="260.0" y1="78" x2="260.0" y2="447"/>
 <text class="tick" x="260.0" y="463" text-anchor="middle">1</text>
-<line class="grid" x1="336.0" y1="78" x2="336.0" y2="447"/>
-<text class="tick" x="336.0" y="463" text-anchor="middle">10</text>
-<line class="grid" x1="412.0" y1="78" x2="412.0" y2="447"/>
-<text class="tick" x="412.0" y="463" text-anchor="middle">100</text>
-<line class="grid" x1="488.0" y1="78" x2="488.0" y2="447"/>
-<text class="tick" x="488.0" y="463" text-anchor="middle">1,000</text>
-<line class="grid" x1="564.0" y1="78" x2="564.0" y2="447"/>
-<text class="tick" x="564.0" y="463" text-anchor="middle">10k</text>
-<line class="grid" x1="640.0" y1="78" x2="640.0" y2="447"/>
-<text class="tick" x="640.0" y="463" text-anchor="middle">100k</text>
+<line class="grid" x1="324.0" y1="78" x2="324.0" y2="447"/>
+<text class="tick" x="324.0" y="463" text-anchor="middle">10</text>
+<line class="grid" x1="388.0" y1="78" x2="388.0" y2="447"/>
+<text class="tick" x="388.0" y="463" text-anchor="middle">100</text>
+<line class="grid" x1="452.0" y1="78" x2="452.0" y2="447"/>
+<text class="tick" x="452.0" y="463" text-anchor="middle">1,000</text>
+<line class="grid" x1="516.0" y1="78" x2="516.0" y2="447"/>
+<text class="tick" x="516.0" y="463" text-anchor="middle">10k</text>
+<line class="grid" x1="580.0" y1="78" x2="580.0" y2="447"/>
+<text class="tick" x="580.0" y="463" text-anchor="middle">100k</text>
 </g>
 <g class="metric" id="lat-rest-account-p99">
 <text class="label" x="250" y="100" text-anchor="end">/txs/account p99</text>
-<rect class="ours better" x="260" y="84" width="204.6" height="12" rx="2"/>
-<text class="val" x="470.6" y="94">492 ms
+<rect class="ours better" x="260" y="84" width="172.3" height="12" rx="2"/>
+<text class="val" x="438.3" y="94">492 ms
  <tspan class="up">▲</tspan>
- about 95× faster (−99%)
+ −46 s (about 95× faster, −99%)
 </text>
-<rect class="base" x="260" y="99" width="355.0" height="12" rx="2"/>
-<text class="muted" x="621.0" y="109">46,956 ms · chainweb-data</text>
+<rect class="base" x="260" y="99" width="299.0" height="12" rx="2"/>
+<text class="muted" x="565.0" y="109">46,956 ms · chainweb-data</text>
 </g>
 <g class="metric" id="lat-rest-events-p99">
 <text class="label" x="250" y="141" text-anchor="end">/txs/events p99</text>
-<rect class="ours better" x="260" y="125" width="102.0" height="12" rx="2"/>
-<text class="val" x="368.0" y="135">22 ms
+<rect class="ours better" x="260" y="125" width="85.9" height="12" rx="2"/>
+<text class="val" x="351.9" y="135">22 ms
  <tspan class="up">▲</tspan>
- about 240× faster (−99%)
+ −5.2 s (about 240× faster, −99%)
 </text>
-<rect class="base" x="260" y="140" width="282.8" height="12" rx="2"/>
-<text class="muted" x="548.8" y="150">5,266 ms · chainweb-data</text>
+<rect class="base" x="260" y="140" width="238.2" height="12" rx="2"/>
+<text class="muted" x="504.2" y="150">5,266 ms · chainweb-data</text>
 </g>
 <g class="metric" id="lat-rest-recent-p99">
 <text class="label" x="250" y="182" text-anchor="end">/txs/recent p99</text>
-<rect class="ours better" x="260" y="166" width="102.0" height="12" rx="2"/>
-<text class="val" x="368.0" y="176">22 ms
+<rect class="ours better" x="260" y="166" width="85.9" height="12" rx="2"/>
+<text class="val" x="351.9" y="176">22 ms
  <tspan class="up">▲</tspan>
- about 1.7× faster (−42%)
+ −16 ms (about 1.7× faster, −42%)
 </text>
-<rect class="base" x="260" y="181" width="120.1" height="12" rx="2"/>
-<text class="muted" x="386.1" y="191">38 ms · chainweb-data</text>
+<rect class="base" x="260" y="181" width="101.1" height="12" rx="2"/>
+<text class="muted" x="367.1" y="191">38 ms · chainweb-data</text>
 </g>
 <g class="metric" id="lat-rest-search-p99">
 <text class="label" x="250" y="223" text-anchor="end">/txs/search p99</text>
-<rect class="ours worse" x="260" y="207" width="258.8" height="12" rx="2"/>
-<text class="val" x="524.8" y="217">2,540 ms
+<rect class="ours worse" x="260" y="207" width="217.9" height="12" rx="2"/>
+<text class="val" x="483.9" y="217">2,540 ms
  <tspan class="down">▼</tspan>
- about 3.6× slower (+260%)
+ +1.8 s (about 3.6× slower, +260%)
+ · user-visible
 </text>
-<rect class="base" x="260" y="222" width="216.6" height="12" rx="2"/>
-<text class="muted" x="482.6" y="232">709 ms · chainweb-data</text>
+<rect class="base" x="260" y="222" width="182.4" height="12" rx="2"/>
+<text class="muted" x="448.4" y="232">709 ms · chainweb-data</text>
 </g>
 <g class="metric" id="lat-rest-stats-p99">
 <text class="label" x="250" y="264" text-anchor="end">/stats p99</text>
-<rect class="ours better" x="260" y="248" width="22.9" height="12" rx="2"/>
-<text class="val" x="288.9" y="258">2 ms
+<rect class="ours better" x="260" y="248" width="19.3" height="12" rx="2"/>
+<text class="val" x="285.3" y="258">2 ms
  <tspan class="up">▲</tspan>
- about 33× faster (−97%)
+ −64 ms (about 33× faster, −97%)
 </text>
-<rect class="base" x="260" y="263" width="138.3" height="12" rx="2"/>
-<text class="muted" x="404.3" y="273">66 ms · chainweb-data</text>
+<rect class="base" x="260" y="263" width="116.5" height="12" rx="2"/>
+<text class="muted" x="382.5" y="273">66 ms · chainweb-data</text>
 </g>
 <g class="metric" id="lat-rest-txs-p99">
 <text class="label" x="250" y="305" text-anchor="end">/txs/txs p99</text>
-<rect class="ours better" x="260" y="289" width="45.8" height="12" rx="2"/>
-<text class="val" x="311.8" y="299">4 ms
+<rect class="ours better" x="260" y="289" width="38.5" height="12" rx="2"/>
+<text class="val" x="304.5" y="299">4 ms
  <tspan class="up">▲</tspan>
- about 16× faster (−94%)
+ −62 ms (about 16× faster, −94%)
 </text>
-<rect class="base" x="260" y="304" width="138.3" height="12" rx="2"/>
-<text class="muted" x="404.3" y="314">66 ms · chainweb-data</text>
+<rect class="base" x="260" y="304" width="116.5" height="12" rx="2"/>
+<text class="muted" x="382.5" y="314">66 ms · chainweb-data</text>
 </g>
 <g class="metric" id="lat-rest-tx-p99">
 <text class="label" x="250" y="346" text-anchor="end">/txs/tx p99</text>
-<rect class="ours same" x="260" y="330" width="144.2" height="12" rx="2"/>
-<text class="val" x="410.2" y="340">79 ms
+<rect class="ours same" x="260" y="330" width="121.4" height="12" rx="2"/>
+<text class="val" x="387.4" y="340">79 ms
  about the same
 </text>
-<rect class="base" x="260" y="345" width="144.2" height="12" rx="2"/>
-<text class="muted" x="410.2" y="355">79 ms · chainweb-data</text>
+<rect class="base" x="260" y="345" width="121.4" height="12" rx="2"/>
+<text class="muted" x="387.4" y="355">79 ms · chainweb-data</text>
 </g>
 <g class="metric" id="lat-rest-coins-p99">
 <text class="label" x="250" y="387" text-anchor="end">/coins p99</text>
-<rect class="ours better" x="260" y="371" width="45.8" height="12" rx="2"/>
-<text class="val" x="311.8" y="381">4 ms
+<rect class="ours better" x="260" y="371" width="38.5" height="12" rx="2"/>
+<text class="val" x="304.5" y="381">4 ms
  <tspan class="up">▲</tspan>
- about 5.5× faster (−82%)
+ −18 ms (about 5.5× faster, −82%)
 </text>
-<rect class="base" x="260" y="386" width="102.0" height="12" rx="2"/>
-<text class="muted" x="368.0" y="396">22 ms · chainweb-data</text>
+<rect class="base" x="260" y="386" width="85.9" height="12" rx="2"/>
+<text class="muted" x="351.9" y="396">22 ms · chainweb-data</text>
 </g>
 <g class="metric" id="lat-rest-v1txs-p99">
 <text class="label" x="250" y="428" text-anchor="end">/v1/txs p99</text>
-<rect class="ours better" x="260" y="412" width="258.8" height="12" rx="2"/>
-<text class="val" x="524.8" y="422">2,540 ms
+<rect class="ours better" x="260" y="412" width="217.9" height="12" rx="2"/>
+<text class="val" x="483.9" y="422">2,540 ms
  <tspan class="up">▲</tspan>
- about 13× faster (−92%)
+ −30 s (about 13× faster, −92%)
 </text>
-<rect class="base" x="260" y="427" width="343.0" height="12" rx="2"/>
-<text class="muted" x="609.0" y="437">32,609 ms · /v1/txs service</text>
+<rect class="base" x="260" y="427" width="288.9" height="12" rx="2"/>
+<text class="muted" x="554.9" y="437">32,609 ms · /v1/txs service</text>
 </g>
 </svg>

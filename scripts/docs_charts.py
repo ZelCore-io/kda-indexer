@@ -21,7 +21,7 @@ SAME_PCT = 2.0
 
 WIDTH = 880
 X0 = 260  # left edge of the plot area (labels sit to the left of it)
-PLOT_W = 380
+PLOT_W = 320
 BAR_H = 12
 BAR_GAP = 3
 GROUP_GAP = 14
@@ -117,22 +117,26 @@ def _words(unit):
 def change(metric):
     """Change of ours against the baseline.
 
-    Returns {"factor", "pct", "direction", "text"}. direction is "better",
+    Returns {"factor", "pct", "direction", "text", "class"}. direction is "better",
     "worse", "same" (|pct| < 2) or "none" (a side is not measured).
 
     text carries the factor and the percent, e.g. "11.2× smaller (−91%)" or
     "1.5× larger (+46%)"; below a factor of 1.1 just the percent, e.g.
     "5% smaller". Latency taken from histogram bucket edges is rounded to two
     significant digits and prefixed "about".
+
+    Latency (unit ms or s) leads with the absolute time added or saved, e.g.
+    "+9 ms (3.6× slower, +260%)" or "−89 ms (about 16× faster, −94%)", and a
+    slower latency gets a class (see latency_class); class is None otherwise.
     """
     ours, base = metric.get("ours"), metric.get("baseline")
     if ours is None or base is None:
-        return {"factor": None, "pct": None, "direction": "none", "text": "not measured"}
+        return {"factor": None, "pct": None, "direction": "none", "text": "not measured", "class": None}
     if base == 0:
         if ours == 0:
-            return {"factor": 1.0, "pct": 0.0, "direction": "same", "text": "same"}
+            return {"factor": 1.0, "pct": 0.0, "direction": "same", "text": "same", "class": None}
         return {"factor": None, "pct": None, "direction": "worse" if metric["better"] != "higher" else "better",
-                "text": "{} vs none".format(fmt_num(ours))}
+                "text": "{} vs none".format(fmt_num(ours)), "class": None}
     pct = (ours - base) * 100.0 / base
     lo, hi = min(ours, base), max(ours, base)
     factor = hi / lo if lo > 0 else None
@@ -152,15 +156,73 @@ def change(metric):
     approx = is_approx(metric)
     about = "about " if approx else ""
     shown_pct = fmt_pct(pct, approx)
+    sign = "−" if ours < base else "+"
+    latency = is_latency(metric)
     if direction == "same":
         text = "about the same" if ours == base else "about the same ({:.1f}% {})".format(abs(pct), word)
+    elif latency:
+        # Absolute added (or saved) time first, then the factor and percent.
+        if factor is not None and factor >= 1.1:
+            rel = "{}{}× {}, {}{}%".format(
+                about, fmt_factor_approx(factor) if approx else fmt_factor(factor), word, sign, shown_pct)
+        else:
+            rel = "{}{}% {}".format(about, shown_pct, word)
+        text = "{}{} ({})".format(sign, fmt_delta(abs(ours - base), metric["unit"], approx), rel)
     elif factor is not None and factor >= 1.1:
         text = "{}{}× {} ({}{}%)".format(
-            about, fmt_factor_approx(factor) if approx else fmt_factor(factor), word,
-            "−" if ours < base else "+", shown_pct)
+            about, fmt_factor_approx(factor) if approx else fmt_factor(factor), word, sign, shown_pct)
     else:
         text = "{}{}% {}".format(about, shown_pct, word)
-    return {"factor": factor, "pct": pct, "direction": direction, "text": text}
+    out = {"factor": factor, "pct": pct, "direction": direction, "text": text, "class": None}
+    if latency and direction == "worse":
+        out["class"] = latency_class(metric)
+    return out
+
+
+LATENCY_UNITS = {"ms": 1.0, "s": 1000.0}
+NEGLIGIBLE_MS = 20
+USER_VISIBLE_MS = 200
+USER_VISIBLE_P99_MS = 1500
+P99 = re.compile(r"(?:^|[^A-Za-z0-9])p99(?:$|[^A-Za-z0-9])")
+
+
+def is_latency(metric):
+    """Response-time metrics: unit ms or s."""
+    return metric.get("unit") in LATENCY_UNITS
+
+
+def fmt_delta(delta, unit, approx):
+    """An absolute time difference: '9 ms', '1.8 s', '46 s'.
+
+    Differences of 1 s or more are shown in seconds. Bucket-edge data are
+    rounded to two significant digits, like their factors.
+    """
+    ms = delta * LATENCY_UNITS[unit]
+    if approx:
+        ms = sig2(ms) if ms > 0 else 0.0
+    if ms >= 1000:
+        secs = ms / 1000.0
+        secs = sig2(secs) if approx else round(secs, 1)
+        return "{} s".format(fmt_num(secs))
+    return "{} ms".format(fmt_num(ms if approx else round(ms, 1)))
+
+
+def latency_class(metric):
+    """How much a slower response matters, judged by absolute added time
+    against a client round trip of about 200 ms:
+
+    negligible    under 20 ms added
+    noticeable    20 to 200 ms added
+    user-visible  over 200 ms added, or a p99 over 1.5 s
+    """
+    scale = LATENCY_UNITS[metric["unit"]]
+    added = (metric["ours"] - metric["baseline"]) * scale
+    is_p99 = bool(P99.search(metric.get("id", "")) or P99.search(metric.get("label", "")))
+    if added > USER_VISIBLE_MS or (is_p99 and metric["ours"] * scale > USER_VISIBLE_P99_MS):
+        return "user-visible"
+    if added >= NEGLIGIBLE_MS:
+        return "noticeable"
+    return "negligible"
 
 
 def published(metric):
@@ -246,9 +308,10 @@ def render(chart, metrics):
         c = change(m)
         def val(v, unit=m["unit"]):
             return "not measured" if v is None else "{} {}".format(fmt_num(v), unit)
-        desc_parts.append("{}: kda-indexer {}, {} {}{}".format(
+        desc_parts.append("{}: kda-indexer {}, {} {}{}{}".format(
             m["label"], val(m.get("ours")), m["baseline_name"], val(m.get("baseline")),
-            "" if c["direction"] == "none" else ", " + c["text"]))
+            "" if c["direction"] == "none" else ", " + c["text"],
+            " ({})".format(c["class"]) if c.get("class") else ""))
     cid = escape(chart["id"])
     a('<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
       'role="img" aria-labelledby="{c}-t {c}-d">'.format(w=WIDTH, h=height, c=cid))
@@ -299,6 +362,8 @@ def render(chart, metrics):
             if glyph:
                 a(' <tspan class="{}">{}</tspan>'.format(gcls, glyph))
             a(" {}".format(escape(c["text"])))
+            if c.get("class"):
+                a(" · {}".format(escape(c["class"])))
         a("</text>")
         # baseline
         by = y + BAR_H + BAR_GAP

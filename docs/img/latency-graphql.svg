@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="1020" viewBox="0 0 880 1020" role="img" aria-labelledby="latency-graphql-t latency-graphql-d">
 <title id="latency-graphql-t">GraphQL response time by query class (p50 and p99)</title>
-<desc id="latency-graphql-d">block by hash p50: kda-indexer 27 ms, GraphQL indexer 15 ms, about 1.8× slower (+80%); block by hash p99: kda-indexer 114 ms, GraphQL indexer 22 ms, about 5.2× slower (+420%); transaction by request key p50: kda-indexer 22 ms, GraphQL indexer 55 ms, about 2.5× faster (−60%); transaction by request key p99: kda-indexer 66 ms, GraphQL indexer 95 ms, about 1.4× faster (−31%); transactions of a block p50: kda-indexer 11 ms, GraphQL indexer 11 ms, about the same; transactions of a block p99: kda-indexer 55 ms, GraphQL indexer 46 ms, about 1.2× slower (+20%); blocks from a height p50: kda-indexer 1 ms, GraphQL indexer 18 ms, about 18× faster (−94%); blocks from a height p99: kda-indexer 4 ms, GraphQL indexer 22 ms, about 5.5× faster (−82%); events by name p50: kda-indexer 5 ms, GraphQL indexer 11 ms, about 2.2× faster (−55%); events by name p99: kda-indexer 66 ms, GraphQL indexer 95 ms, about 1.4× faster (−31%); fungible account p50: kda-indexer 2 ms, GraphQL indexer 95 ms, about 48× faster (−98%); fungible account p99: kda-indexer 7 ms, GraphQL indexer 137 ms, about 20× faster (−95%); fungible account per chain p50: kda-indexer 2 ms, GraphQL indexer 13 ms, about 6.5× faster (−85%); fungible account per chain p99: kda-indexer 6 ms, GraphQL indexer 15 ms, about 2.5× faster (−60%); transactions of an account p50: kda-indexer 2,540 ms, GraphQL indexer 79 ms, about 32× slower (+3,100%); transactions of an account p99: kda-indexer 3,048 ms, GraphQL indexer 32,609 ms, about 11× faster (−91%); transfers of an account p50: kda-indexer 2,540 ms, GraphQL indexer 46 ms, about 55× slower (+5,400%); transfers of an account p99: kda-indexer 3,048 ms, GraphQL indexer 2,116 ms, about 1.4× slower (+44%); transfers by request key p50: kda-indexer 22 ms, GraphQL indexer 18 ms, about 1.2× slower (+22%); transfers by request key p99: kda-indexer 342 ms, GraphQL indexer 55 ms, about 6.2× slower (+520%); node by id p50: kda-indexer 15 ms, GraphQL indexer 7 ms, about 2.1× slower (+110%); node by id p99: kda-indexer 55 ms, GraphQL indexer 11 ms, about 5× slower (+400%).</desc>
+<desc id="latency-graphql-d">block by hash p50: kda-indexer 27 ms, GraphQL indexer 15 ms, +12 ms (about 1.8× slower, +80%) (negligible); block by hash p99: kda-indexer 114 ms, GraphQL indexer 22 ms, +92 ms (about 5.2× slower, +420%) (noticeable); transaction by request key p50: kda-indexer 22 ms, GraphQL indexer 55 ms, −33 ms (about 2.5× faster, −60%); transaction by request key p99: kda-indexer 66 ms, GraphQL indexer 95 ms, −29 ms (about 1.4× faster, −31%); transactions of a block p50: kda-indexer 11 ms, GraphQL indexer 11 ms, about the same; transactions of a block p99: kda-indexer 55 ms, GraphQL indexer 46 ms, +9 ms (about 1.2× slower, +20%) (negligible); blocks from a height p50: kda-indexer 1 ms, GraphQL indexer 18 ms, −17 ms (about 18× faster, −94%); blocks from a height p99: kda-indexer 4 ms, GraphQL indexer 22 ms, −18 ms (about 5.5× faster, −82%); events by name p50: kda-indexer 5 ms, GraphQL indexer 11 ms, −6 ms (about 2.2× faster, −55%); events by name p99: kda-indexer 66 ms, GraphQL indexer 95 ms, −29 ms (about 1.4× faster, −31%); fungible account p50: kda-indexer 2 ms, GraphQL indexer 95 ms, −93 ms (about 48× faster, −98%); fungible account p99: kda-indexer 7 ms, GraphQL indexer 137 ms, −130 ms (about 20× faster, −95%); fungible account per chain p50: kda-indexer 2 ms, GraphQL indexer 13 ms, −11 ms (about 6.5× faster, −85%); fungible account per chain p99: kda-indexer 6 ms, GraphQL indexer 15 ms, −9 ms (about 2.5× faster, −60%); transactions of an account p50: kda-indexer 2,540 ms, GraphQL indexer 79 ms, +2.5 s (about 32× slower, +3,100%) (user-visible); transactions of an account p99: kda-indexer 3,048 ms, GraphQL indexer 32,609 ms, −30 s (about 11× faster, −91%); transfers of an account p50: kda-indexer 2,540 ms, GraphQL indexer 46 ms, +2.5 s (about 55× slower, +5,400%) (user-visible); transfers of an account p99: kda-indexer 3,048 ms, GraphQL indexer 2,116 ms, +930 ms (about 1.4× slower, +44%) (user-visible); transfers by request key p50: kda-indexer 22 ms, GraphQL indexer 18 ms, +4 ms (about 1.2× slower, +22%) (negligible); transfers by request key p99: kda-indexer 342 ms, GraphQL indexer 55 ms, +290 ms (about 6.2× slower, +520%) (user-visible); node by id p50: kda-indexer 15 ms, GraphQL indexer 7 ms, +8 ms (about 2.1× slower, +110%) (negligible); node by id p99: kda-indexer 55 ms, GraphQL indexer 11 ms, +44 ms (about 5× slower, +400%) (noticeable).</desc>
 <style>
 svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
 .bg{fill:#ffffff}
@@ -42,236 +42,246 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans
 <g class="axis log">
 <line class="grid" x1="260.0" y1="78" x2="260.0" y2="980"/>
 <text class="tick" x="260.0" y="996" text-anchor="middle">0.1</text>
-<line class="grid" x1="323.3" y1="78" x2="323.3" y2="980"/>
-<text class="tick" x="323.3" y="996" text-anchor="middle">1</text>
-<line class="grid" x1="386.7" y1="78" x2="386.7" y2="980"/>
-<text class="tick" x="386.7" y="996" text-anchor="middle">10</text>
-<line class="grid" x1="450.0" y1="78" x2="450.0" y2="980"/>
-<text class="tick" x="450.0" y="996" text-anchor="middle">100</text>
-<line class="grid" x1="513.3" y1="78" x2="513.3" y2="980"/>
-<text class="tick" x="513.3" y="996" text-anchor="middle">1,000</text>
-<line class="grid" x1="576.7" y1="78" x2="576.7" y2="980"/>
-<text class="tick" x="576.7" y="996" text-anchor="middle">10k</text>
-<line class="grid" x1="640.0" y1="78" x2="640.0" y2="980"/>
-<text class="tick" x="640.0" y="996" text-anchor="middle">100k</text>
+<line class="grid" x1="313.3" y1="78" x2="313.3" y2="980"/>
+<text class="tick" x="313.3" y="996" text-anchor="middle">1</text>
+<line class="grid" x1="366.7" y1="78" x2="366.7" y2="980"/>
+<text class="tick" x="366.7" y="996" text-anchor="middle">10</text>
+<line class="grid" x1="420.0" y1="78" x2="420.0" y2="980"/>
+<text class="tick" x="420.0" y="996" text-anchor="middle">100</text>
+<line class="grid" x1="473.3" y1="78" x2="473.3" y2="980"/>
+<text class="tick" x="473.3" y="996" text-anchor="middle">1,000</text>
+<line class="grid" x1="526.7" y1="78" x2="526.7" y2="980"/>
+<text class="tick" x="526.7" y="996" text-anchor="middle">10k</text>
+<line class="grid" x1="580.0" y1="78" x2="580.0" y2="980"/>
+<text class="tick" x="580.0" y="996" text-anchor="middle">100k</text>
 </g>
 <g class="metric" id="lat-gql-block-p50">
 <text class="label" x="250" y="100" text-anchor="end">block by hash p50</text>
-<rect class="ours worse" x="260" y="84" width="154.0" height="12" rx="2"/>
-<text class="val" x="420.0" y="94">27 ms
+<rect class="ours worse" x="260" y="84" width="129.7" height="12" rx="2"/>
+<text class="val" x="395.7" y="94">27 ms
  <tspan class="down">▼</tspan>
- about 1.8× slower (+80%)
+ +12 ms (about 1.8× slower, +80%)
+ · negligible
 </text>
-<rect class="base" x="260" y="99" width="137.8" height="12" rx="2"/>
-<text class="muted" x="403.8" y="109">15 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="99" width="116.1" height="12" rx="2"/>
+<text class="muted" x="382.1" y="109">15 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-block-p99">
 <text class="label" x="250" y="141" text-anchor="end">block by hash p99</text>
-<rect class="ours worse" x="260" y="125" width="193.6" height="12" rx="2"/>
-<text class="val" x="459.6" y="135">114 ms
+<rect class="ours worse" x="260" y="125" width="163.0" height="12" rx="2"/>
+<text class="val" x="429.0" y="135">114 ms
  <tspan class="down">▼</tspan>
- about 5.2× slower (+420%)
+ +92 ms (about 5.2× slower, +420%)
+ · noticeable
 </text>
-<rect class="base" x="260" y="140" width="148.4" height="12" rx="2"/>
-<text class="muted" x="414.4" y="150">22 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="140" width="124.9" height="12" rx="2"/>
+<text class="muted" x="390.9" y="150">22 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-tx-by-key-p50">
 <text class="label" x="250" y="182" text-anchor="end">transaction by request key p50</text>
-<rect class="ours better" x="260" y="166" width="148.4" height="12" rx="2"/>
-<text class="val" x="414.4" y="176">22 ms
+<rect class="ours better" x="260" y="166" width="124.9" height="12" rx="2"/>
+<text class="val" x="390.9" y="176">22 ms
  <tspan class="up">▲</tspan>
- about 2.5× faster (−60%)
+ −33 ms (about 2.5× faster, −60%)
 </text>
-<rect class="base" x="260" y="181" width="173.6" height="12" rx="2"/>
-<text class="muted" x="439.6" y="191">55 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="181" width="146.2" height="12" rx="2"/>
+<text class="muted" x="412.2" y="191">55 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-tx-by-key-p99">
 <text class="label" x="250" y="223" text-anchor="end">transaction by request key p99</text>
-<rect class="ours better" x="260" y="207" width="178.6" height="12" rx="2"/>
-<text class="val" x="444.6" y="217">66 ms
+<rect class="ours better" x="260" y="207" width="150.4" height="12" rx="2"/>
+<text class="val" x="416.4" y="217">66 ms
  <tspan class="up">▲</tspan>
- about 1.4× faster (−31%)
+ −29 ms (about 1.4× faster, −31%)
 </text>
-<rect class="base" x="260" y="222" width="188.6" height="12" rx="2"/>
-<text class="muted" x="454.6" y="232">95 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="222" width="158.8" height="12" rx="2"/>
+<text class="muted" x="424.8" y="232">95 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-txs-by-block-p50">
 <text class="label" x="250" y="264" text-anchor="end">transactions of a block p50</text>
-<rect class="ours same" x="260" y="248" width="129.3" height="12" rx="2"/>
-<text class="val" x="395.3" y="258">11 ms
+<rect class="ours same" x="260" y="248" width="108.9" height="12" rx="2"/>
+<text class="val" x="374.9" y="258">11 ms
  about the same
 </text>
-<rect class="base" x="260" y="263" width="129.3" height="12" rx="2"/>
-<text class="muted" x="395.3" y="273">11 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="263" width="108.9" height="12" rx="2"/>
+<text class="muted" x="374.9" y="273">11 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-txs-by-block-p99">
 <text class="label" x="250" y="305" text-anchor="end">transactions of a block p99</text>
-<rect class="ours worse" x="260" y="289" width="173.6" height="12" rx="2"/>
-<text class="val" x="439.6" y="299">55 ms
+<rect class="ours worse" x="260" y="289" width="146.2" height="12" rx="2"/>
+<text class="val" x="412.2" y="299">55 ms
  <tspan class="down">▼</tspan>
- about 1.2× slower (+20%)
+ +9 ms (about 1.2× slower, +20%)
+ · negligible
 </text>
-<rect class="base" x="260" y="304" width="168.6" height="12" rx="2"/>
-<text class="muted" x="434.6" y="314">46 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="304" width="142.0" height="12" rx="2"/>
+<text class="muted" x="408.0" y="314">46 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-blocks-from-height-p50">
 <text class="label" x="250" y="346" text-anchor="end">blocks from a height p50</text>
-<rect class="ours better" x="260" y="330" width="63.3" height="12" rx="2"/>
-<text class="val" x="329.3" y="340">1 ms
+<rect class="ours better" x="260" y="330" width="53.3" height="12" rx="2"/>
+<text class="val" x="319.3" y="340">1 ms
  <tspan class="up">▲</tspan>
- about 18× faster (−94%)
+ −17 ms (about 18× faster, −94%)
 </text>
-<rect class="base" x="260" y="345" width="142.8" height="12" rx="2"/>
-<text class="muted" x="408.8" y="355">18 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="345" width="120.3" height="12" rx="2"/>
+<text class="muted" x="386.3" y="355">18 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-blocks-from-height-p99">
 <text class="label" x="250" y="387" text-anchor="end">blocks from a height p99</text>
-<rect class="ours better" x="260" y="371" width="101.5" height="12" rx="2"/>
-<text class="val" x="367.5" y="381">4 ms
+<rect class="ours better" x="260" y="371" width="85.4" height="12" rx="2"/>
+<text class="val" x="351.4" y="381">4 ms
  <tspan class="up">▲</tspan>
- about 5.5× faster (−82%)
+ −18 ms (about 5.5× faster, −82%)
 </text>
-<rect class="base" x="260" y="386" width="148.4" height="12" rx="2"/>
-<text class="muted" x="414.4" y="396">22 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="386" width="124.9" height="12" rx="2"/>
+<text class="muted" x="390.9" y="396">22 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-events-p50">
 <text class="label" x="250" y="428" text-anchor="end">events by name p50</text>
-<rect class="ours better" x="260" y="412" width="107.6" height="12" rx="2"/>
-<text class="val" x="373.6" y="422">5 ms
+<rect class="ours better" x="260" y="412" width="90.6" height="12" rx="2"/>
+<text class="val" x="356.6" y="422">5 ms
  <tspan class="up">▲</tspan>
- about 2.2× faster (−55%)
+ −6 ms (about 2.2× faster, −55%)
 </text>
-<rect class="base" x="260" y="427" width="129.3" height="12" rx="2"/>
-<text class="muted" x="395.3" y="437">11 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="427" width="108.9" height="12" rx="2"/>
+<text class="muted" x="374.9" y="437">11 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-events-p99">
 <text class="label" x="250" y="469" text-anchor="end">events by name p99</text>
-<rect class="ours better" x="260" y="453" width="178.6" height="12" rx="2"/>
-<text class="val" x="444.6" y="463">66 ms
+<rect class="ours better" x="260" y="453" width="150.4" height="12" rx="2"/>
+<text class="val" x="416.4" y="463">66 ms
  <tspan class="up">▲</tspan>
- about 1.4× faster (−31%)
+ −29 ms (about 1.4× faster, −31%)
 </text>
-<rect class="base" x="260" y="468" width="188.6" height="12" rx="2"/>
-<text class="muted" x="454.6" y="478">95 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="468" width="158.8" height="12" rx="2"/>
+<text class="muted" x="424.8" y="478">95 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-fungible-account-p50">
 <text class="label" x="250" y="510" text-anchor="end">fungible account p50</text>
-<rect class="ours better" x="260" y="494" width="82.4" height="12" rx="2"/>
-<text class="val" x="348.4" y="504">2 ms
+<rect class="ours better" x="260" y="494" width="69.4" height="12" rx="2"/>
+<text class="val" x="335.4" y="504">2 ms
  <tspan class="up">▲</tspan>
- about 48× faster (−98%)
+ −93 ms (about 48× faster, −98%)
 </text>
-<rect class="base" x="260" y="509" width="188.6" height="12" rx="2"/>
-<text class="muted" x="454.6" y="519">95 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="509" width="158.8" height="12" rx="2"/>
+<text class="muted" x="424.8" y="519">95 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-fungible-account-p99">
 <text class="label" x="250" y="551" text-anchor="end">fungible account p99</text>
-<rect class="ours better" x="260" y="535" width="116.9" height="12" rx="2"/>
-<text class="val" x="382.9" y="545">7 ms
+<rect class="ours better" x="260" y="535" width="98.4" height="12" rx="2"/>
+<text class="val" x="364.4" y="545">7 ms
  <tspan class="up">▲</tspan>
- about 20× faster (−95%)
+ −130 ms (about 20× faster, −95%)
 </text>
-<rect class="base" x="260" y="550" width="198.7" height="12" rx="2"/>
-<text class="muted" x="464.7" y="560">137 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="550" width="167.3" height="12" rx="2"/>
+<text class="muted" x="433.3" y="560">137 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-fungible-chain-accounts-p50">
 <text class="label" x="250" y="592" text-anchor="end">fungible account per chain p50</text>
-<rect class="ours better" x="260" y="576" width="82.4" height="12" rx="2"/>
-<text class="val" x="348.4" y="586">2 ms
+<rect class="ours better" x="260" y="576" width="69.4" height="12" rx="2"/>
+<text class="val" x="335.4" y="586">2 ms
  <tspan class="up">▲</tspan>
- about 6.5× faster (−85%)
+ −11 ms (about 6.5× faster, −85%)
 </text>
-<rect class="base" x="260" y="591" width="133.9" height="12" rx="2"/>
-<text class="muted" x="399.9" y="601">13 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="591" width="112.7" height="12" rx="2"/>
+<text class="muted" x="378.7" y="601">13 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-fungible-chain-accounts-p99">
 <text class="label" x="250" y="633" text-anchor="end">fungible account per chain p99</text>
-<rect class="ours better" x="260" y="617" width="112.6" height="12" rx="2"/>
-<text class="val" x="378.6" y="627">6 ms
+<rect class="ours better" x="260" y="617" width="94.8" height="12" rx="2"/>
+<text class="val" x="360.8" y="627">6 ms
  <tspan class="up">▲</tspan>
- about 2.5× faster (−60%)
+ −9 ms (about 2.5× faster, −60%)
 </text>
-<rect class="base" x="260" y="632" width="137.8" height="12" rx="2"/>
-<text class="muted" x="403.8" y="642">15 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="632" width="116.1" height="12" rx="2"/>
+<text class="muted" x="382.1" y="642">15 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-txs-by-account-p50">
 <text class="label" x="250" y="674" text-anchor="end">transactions of an account p50</text>
-<rect class="ours worse" x="260" y="658" width="279.0" height="12" rx="2"/>
-<text class="val" x="545.0" y="668">2,540 ms
+<rect class="ours worse" x="260" y="658" width="234.9" height="12" rx="2"/>
+<text class="val" x="500.9" y="668">2,540 ms
  <tspan class="down">▼</tspan>
- about 32× slower (+3,100%)
+ +2.5 s (about 32× slower, +3,100%)
+ · user-visible
 </text>
-<rect class="base" x="260" y="673" width="183.5" height="12" rx="2"/>
-<text class="muted" x="449.5" y="683">79 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="673" width="154.5" height="12" rx="2"/>
+<text class="muted" x="420.5" y="683">79 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-txs-by-account-p99">
 <text class="label" x="250" y="715" text-anchor="end">transactions of an account p99</text>
-<rect class="ours better" x="260" y="699" width="284.0" height="12" rx="2"/>
-<text class="val" x="550.0" y="709">3,048 ms
+<rect class="ours better" x="260" y="699" width="239.1" height="12" rx="2"/>
+<text class="val" x="505.1" y="709">3,048 ms
  <tspan class="up">▲</tspan>
- about 11× faster (−91%)
+ −30 s (about 11× faster, −91%)
 </text>
-<rect class="base" x="260" y="714" width="349.2" height="12" rx="2"/>
-<text class="muted" x="615.2" y="724">32,609 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="714" width="294.0" height="12" rx="2"/>
+<text class="muted" x="560.0" y="724">32,609 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-transfers-by-account-p50">
 <text class="label" x="250" y="756" text-anchor="end">transfers of an account p50</text>
-<rect class="ours worse" x="260" y="740" width="279.0" height="12" rx="2"/>
-<text class="val" x="545.0" y="750">2,540 ms
+<rect class="ours worse" x="260" y="740" width="234.9" height="12" rx="2"/>
+<text class="val" x="500.9" y="750">2,540 ms
  <tspan class="down">▼</tspan>
- about 55× slower (+5,400%)
+ +2.5 s (about 55× slower, +5,400%)
+ · user-visible
 </text>
-<rect class="base" x="260" y="755" width="168.6" height="12" rx="2"/>
-<text class="muted" x="434.6" y="765">46 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="755" width="142.0" height="12" rx="2"/>
+<text class="muted" x="408.0" y="765">46 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-transfers-by-account-p99">
 <text class="label" x="250" y="797" text-anchor="end">transfers of an account p99</text>
-<rect class="ours worse" x="260" y="781" width="284.0" height="12" rx="2"/>
-<text class="val" x="550.0" y="791">3,048 ms
+<rect class="ours worse" x="260" y="781" width="239.1" height="12" rx="2"/>
+<text class="val" x="505.1" y="791">3,048 ms
  <tspan class="down">▼</tspan>
- about 1.4× slower (+44%)
+ +930 ms (about 1.4× slower, +44%)
+ · user-visible
 </text>
-<rect class="base" x="260" y="796" width="273.9" height="12" rx="2"/>
-<text class="muted" x="539.9" y="806">2,116 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="796" width="230.7" height="12" rx="2"/>
+<text class="muted" x="496.7" y="806">2,116 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-transfers-by-key-p50">
 <text class="label" x="250" y="838" text-anchor="end">transfers by request key p50</text>
-<rect class="ours worse" x="260" y="822" width="148.4" height="12" rx="2"/>
-<text class="val" x="414.4" y="832">22 ms
+<rect class="ours worse" x="260" y="822" width="124.9" height="12" rx="2"/>
+<text class="val" x="390.9" y="832">22 ms
  <tspan class="down">▼</tspan>
- about 1.2× slower (+22%)
+ +4 ms (about 1.2× slower, +22%)
+ · negligible
 </text>
-<rect class="base" x="260" y="837" width="142.8" height="12" rx="2"/>
-<text class="muted" x="408.8" y="847">18 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="837" width="120.3" height="12" rx="2"/>
+<text class="muted" x="386.3" y="847">18 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-transfers-by-key-p99">
 <text class="label" x="250" y="879" text-anchor="end">transfers by request key p99</text>
-<rect class="ours worse" x="260" y="863" width="223.8" height="12" rx="2"/>
-<text class="val" x="489.8" y="873">342 ms
+<rect class="ours worse" x="260" y="863" width="188.5" height="12" rx="2"/>
+<text class="val" x="454.5" y="873">342 ms
  <tspan class="down">▼</tspan>
- about 6.2× slower (+520%)
+ +290 ms (about 6.2× slower, +520%)
+ · user-visible
 </text>
-<rect class="base" x="260" y="878" width="173.6" height="12" rx="2"/>
-<text class="muted" x="439.6" y="888">55 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="878" width="146.2" height="12" rx="2"/>
+<text class="muted" x="412.2" y="888">55 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-node-p50">
 <text class="label" x="250" y="920" text-anchor="end">node by id p50</text>
-<rect class="ours worse" x="260" y="904" width="137.8" height="12" rx="2"/>
-<text class="val" x="403.8" y="914">15 ms
+<rect class="ours worse" x="260" y="904" width="116.1" height="12" rx="2"/>
+<text class="val" x="382.1" y="914">15 ms
  <tspan class="down">▼</tspan>
- about 2.1× slower (+110%)
+ +8 ms (about 2.1× slower, +110%)
+ · negligible
 </text>
-<rect class="base" x="260" y="919" width="116.9" height="12" rx="2"/>
-<text class="muted" x="382.9" y="929">7 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="919" width="98.4" height="12" rx="2"/>
+<text class="muted" x="364.4" y="929">7 ms · GraphQL indexer</text>
 </g>
 <g class="metric" id="lat-gql-node-p99">
 <text class="label" x="250" y="961" text-anchor="end">node by id p99</text>
-<rect class="ours worse" x="260" y="945" width="173.6" height="12" rx="2"/>
-<text class="val" x="439.6" y="955">55 ms
+<rect class="ours worse" x="260" y="945" width="146.2" height="12" rx="2"/>
+<text class="val" x="412.2" y="955">55 ms
  <tspan class="down">▼</tspan>
- about 5× slower (+400%)
+ +44 ms (about 5× slower, +400%)
+ · noticeable
 </text>
-<rect class="base" x="260" y="960" width="129.3" height="12" rx="2"/>
-<text class="muted" x="395.3" y="970">11 ms · GraphQL indexer</text>
+<rect class="base" x="260" y="960" width="108.9" height="12" rx="2"/>
+<text class="muted" x="374.9" y="970">11 ms · GraphQL indexer</text>
 </g>
 </svg>

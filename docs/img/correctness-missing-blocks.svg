@@ -38,16 +38,16 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans
 <g class="axis linear">
 <line class="grid" x1="260.0" y1="78" x2="260.0" y2="119"/>
 <text class="tick" x="260.0" y="135" text-anchor="middle">0</text>
-<line class="grid" x1="336.0" y1="78" x2="336.0" y2="119"/>
-<text class="tick" x="336.0" y="135" text-anchor="middle">100</text>
-<line class="grid" x1="412.0" y1="78" x2="412.0" y2="119"/>
-<text class="tick" x="412.0" y="135" text-anchor="middle">200</text>
-<line class="grid" x1="488.0" y1="78" x2="488.0" y2="119"/>
-<text class="tick" x="488.0" y="135" text-anchor="middle">300</text>
-<line class="grid" x1="564.0" y1="78" x2="564.0" y2="119"/>
-<text class="tick" x="564.0" y="135" text-anchor="middle">400</text>
-<line class="grid" x1="640.0" y1="78" x2="640.0" y2="119"/>
-<text class="tick" x="640.0" y="135" text-anchor="middle">500</text>
+<line class="grid" x1="324.0" y1="78" x2="324.0" y2="119"/>
+<text class="tick" x="324.0" y="135" text-anchor="middle">100</text>
+<line class="grid" x1="388.0" y1="78" x2="388.0" y2="119"/>
+<text class="tick" x="388.0" y="135" text-anchor="middle">200</text>
+<line class="grid" x1="452.0" y1="78" x2="452.0" y2="119"/>
+<text class="tick" x="452.0" y="135" text-anchor="middle">300</text>
+<line class="grid" x1="516.0" y1="78" x2="516.0" y2="119"/>
+<text class="tick" x="516.0" y="135" text-anchor="middle">400</text>
+<line class="grid" x1="580.0" y1="78" x2="580.0" y2="119"/>
+<text class="tick" x="580.0" y="135" text-anchor="middle">500</text>
 </g>
 <g class="metric" id="corr-missing-blocks">
 <text class="label" x="250" y="100" text-anchor="end">Canonical blocks missing (7.37–7.38M)</text>
@@ -56,7 +56,7 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans
  <tspan class="up">▲</tspan>
  100% fewer
 </text>
-<rect class="base" x="260" y="99" width="321.5" height="12" rx="2"/>
-<text class="muted" x="587.5" y="109">423 blocks · chainweb-data</text>
+<rect class="base" x="260" y="99" width="270.7" height="12" rx="2"/>
+<text class="muted" x="536.7" y="109">423 blocks · chainweb-data</text>
 </g>
 </svg>
