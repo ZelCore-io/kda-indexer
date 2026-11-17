@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="364" viewBox="0 0 880 364" role="img" aria-labelledby="sync-throughput-t sync-throughput-d">
+<title id="sync-throughput-t">Full backfill throughput by height range</title>
+<desc id="sync-throughput-d">heights 0–0.85M: kda-indexer 5,768 blocks/s, chainweb-data not measured; heights 0.85–2.0M: kda-indexer 6,208 blocks/s, chainweb-data not measured; heights 2.0–3.4M: kda-indexer 5,359 blocks/s, chainweb-data not measured; heights 3.4–3.7M: kda-indexer 4,703 blocks/s, chainweb-data not measured; heights 3.7–5.3M: kda-indexer 3,000 blocks/s, chainweb-data not measured; heights 5.3–7.39M: kda-indexer 4,609 blocks/s, chainweb-data not measured.</desc>
+<style>
+svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.bg{fill:#ffffff}
+.title{fill:#1f2328;font-size:16px;font-weight:600}
+.sub,.tick,.muted{fill:#59636e;font-size:11px}
+.label{fill:#1f2328;font-size:12px}
+.val{fill:#1f2328;font-size:11px}
+.grid{stroke:#d8dee4;stroke-width:1}
+.ours.better{fill:#1a7f37}
+.ours.worse{fill:#cf222e}
+.ours.same,.ours.none{fill:#57606a}
+.base{fill:#afb8c1}
+.up{fill:#1a7f37}
+.down{fill:#cf222e}
+@media (prefers-color-scheme: dark){
+.bg{fill:#0d1117}
+.title,.label,.val{fill:#e6edf3}
+.sub,.tick,.muted{fill:#9198a1}
+.grid{stroke:#30363d}
+.ours.better{fill:#3fb950}
+.ours.worse{fill:#f85149}
+.ours.same,.ours.none{fill:#9198a1}
+.base{fill:#484f58}
+.up{fill:#3fb950}
+.down{fill:#f85149}
+}
+</style>
+<rect class="bg" x="0" y="0" width="880" height="364" rx="6"/>
+<text class="title" x="16" y="28">Full backfill throughput by height range</text>
+<text class="sub" x="16" y="48">blocks/s · linear scale · ▲ better ▼ worse than the baseline · interim numbers</text>
+<rect class="ours none" x="16" y="62" width="10" height="10" rx="2"/>
+<text class="muted" x="30" y="71">kda-indexer, no baseline</text>
+<g class="axis linear">
+<line class="grid" x1="260.0" y1="78" x2="260.0" y2="324"/>
+<text class="tick" x="260.0" y="340" text-anchor="middle">0</text>
+<line class="grid" x1="355.0" y1="78" x2="355.0" y2="324"/>
+<text class="tick" x="355.0" y="340" text-anchor="middle">2,000</text>
+<line class="grid" x1="450.0" y1="78" x2="450.0" y2="324"/>
+<text class="tick" x="450.0" y="340" text-anchor="middle">4,000</text>
+<line class="grid" x1="545.0" y1="78" x2="545.0" y2="324"/>
+<text class="tick" x="545.0" y="340" text-anchor="middle">6,000</text>
+<line class="grid" x1="640.0" y1="78" x2="640.0" y2="324"/>
+<text class="tick" x="640.0" y="340" text-anchor="middle">8,000</text>
+</g>
+<g class="metric" id="sync-band-0-0.85M-blocks">
+<text class="label" x="250" y="100" text-anchor="end">heights 0–0.85M</text>
+<rect class="ours none" x="260" y="84" width="274.0" height="12" rx="2"/>
+<text class="val" x="540.0" y="94">5,768 blocks/s
+</text>
+<text class="muted" x="260" y="109">chainweb-data: not measured</text>
+</g>
+<g class="metric" id="sync-band-0.85-2.0M-blocks">
+<text class="label" x="250" y="141" text-anchor="end">heights 0.85–2.0M</text>
+<rect class="ours none" x="260" y="125" width="294.9" height="12" rx="2"/>
+<text class="val" x="560.9" y="135">6,208 blocks/s
+</text>
+<text class="muted" x="260" y="150">chainweb-data: not measured</text>
+</g>
+<g class="metric" id="sync-band-2.0-3.4M-blocks">
+<text class="label" x="250" y="182" text-anchor="end">heights 2.0–3.4M</text>
+<rect class="ours none" x="260" y="166" width="254.6" height="12" rx="2"/>
+<text class="val" x="520.6" y="176">5,359 blocks/s
+</text>
+<text class="muted" x="260" y="191">chainweb-data: not measured</text>
+</g>
+<g class="metric" id="sync-band-3.4-3.7M-blocks">
+<text class="label" x="250" y="223" text-anchor="end">heights 3.4–3.7M</text>
+<rect class="ours none" x="260" y="207" width="223.4" height="12" rx="2"/>
+<text class="val" x="489.4" y="217">4,703 blocks/s
+</text>
+<text class="muted" x="260" y="232">chainweb-data: not measured</text>
+</g>
+<g class="metric" id="sync-band-3.7-5.3M-blocks">
+<text class="label" x="250" y="264" text-anchor="end">heights 3.7–5.3M</text>
+<rect class="ours none" x="260" y="248" width="142.5" height="12" rx="2"/>
+<text class="val" x="408.5" y="258">3,000 blocks/s
+</text>
+<text class="muted" x="260" y="273">chainweb-data: not measured</text>
+</g>
+<g class="metric" id="sync-band-5.3-7.39M-blocks">
+<text class="label" x="250" y="305" text-anchor="end">heights 5.3–7.39M</text>
+<rect class="ours none" x="260" y="289" width="218.9" height="12" rx="2"/>
+<text class="val" x="484.9" y="299">4,609 blocks/s
+</text>
+<text class="muted" x="260" y="314">chainweb-data: not measured</text>
+</g>
+</svg>
