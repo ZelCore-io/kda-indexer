@@ -969,6 +969,80 @@ mod count_budget {
         assert_eq!(page["transfers"]["edges"].as_array().unwrap().len(), 2);
     }
 
+    /// The budget bounds an account's walk only: an event-name or public-key count with a spent
+    /// budget is exact and unflagged, as before.
+    #[tokio::test]
+    async fn a_non_account_count_ignores_the_budget() {
+        let exact = fixture();
+        let cut = fixture_with(GraphqlSettings {
+            count_budget: Duration::ZERO,
+            ..GraphqlSettings::default()
+        });
+        for q in [
+            "{ events(qualifiedEventName: \"coin.TRANSFER\", first: 1) { totalCount } }".to_string(),
+            format!(
+                "{{ transactionsByPublicKey(publicKey: \"{ALICE_KEY}\", first: 1) {{ totalCount }} }}"
+            ),
+        ] {
+            let (full, _) = total(&exact.schema, &q).await;
+            let (n, flagged) = total(&cut.schema, &q).await;
+            assert!(full > 1, "{q}: the fixture has several rows");
+            assert_eq!((n, flagged), (full, false), "{q}");
+        }
+    }
+
+    /// A cut count is never below the edges served in the same response.
+    #[tokio::test]
+    async fn a_cut_count_covers_the_edges_served() {
+        let cut = fixture_with(GraphqlSettings {
+            count_budget: Duration::ZERO,
+            ..GraphqlSettings::default()
+        });
+        for field in ["transfers", "transactions"] {
+            let d = run(
+                &cut.schema,
+                &format!(
+                    "{{ {field}(accountName: \"k:alice\", first: 3) {{ totalCount edges {{ cursor }} }} }}"
+                ),
+            )
+            .await;
+            let edges = d[field]["edges"].as_array().unwrap().len() as i64;
+            let n = d[field]["totalCount"].as_i64().unwrap();
+            assert!(edges > 1, "{field}: several edges are served");
+            assert!(n >= edges, "{field}: totalCount {n} < {edges} edges served");
+        }
+    }
+
+    /// A walk cut partway answers a count above zero and below the true one, flagged. The
+    /// account has thousands of postings and the budget is a few ms: the walk takes far longer
+    /// (debug or release) yet gets past its first records.
+    #[tokio::test]
+    async fn a_walk_cut_partway_is_a_flagged_partial_count() {
+        let n_extra = 8000;
+        let exact = fixture_big(
+            GraphqlSettings {
+                count_budget: Duration::from_secs(60),
+                ..GraphqlSettings::default()
+            },
+            n_extra,
+        );
+        let cut = fixture_big(
+            GraphqlSettings {
+                count_budget: Duration::from_millis(5),
+                ..GraphqlSettings::default()
+            },
+            n_extra,
+        );
+        for q in QUERIES {
+            let (full, flagged) = total(&exact.schema, q).await;
+            assert!(full > i64::from(n_extra), "{q}");
+            assert!(!flagged, "{q}");
+            let (n, flagged) = total(&cut.schema, q).await;
+            assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
+            assert!(n > 1 && n < full, "{q}: {n} is partway to {full}");
+        }
+    }
+
     /// A block's or a request key's list is counted with its page, exactly, whatever the budget.
     #[tokio::test]
     async fn a_block_list_ignores_the_budget() {

@@ -1001,7 +1001,10 @@ async fn list_as(
     // A block's or a request key's rows are few: counted with the page, exactly.
     let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk(_))
         && selects_direct(ctx, &["totalCount"]);
-    let count_budget = g.settings.count_budget;
+    // The time budget bounds an account's count walk only (its postings are long and decode
+    // cold); every other count keeps half of the remaining deadline.
+    let count_budget = matches!(spec.source, SourceSpec::Acct(_) | SourceSpec::Xfer { .. })
+        .then_some(g.settings.count_budget);
     let sp = spec.clone();
     let (edges, info, exact) = read_list(&state, one_block, move |view| {
         let dl = dl.min(Instant::now() + SCAN_WINDOW);
@@ -1034,18 +1037,28 @@ async fn list_as(
             total: Total::Exact(n),
         });
     }
+    let served = edges.len() as u64;
     let total = Total::Deferred(Arc::new(move || {
         let state = state.clone();
         let spec = spec.clone();
+        let called = Instant::now();
         Box::pin(async move {
-            // The budget runs from when the read gets its slot, not from the request: time
-            // queued behind other heavy reads is not spent counting.
+            // An account's budget runs from when the read gets its slot, not from the request:
+            // time queued behind other heavy reads is not spent counting. Any other count
+            // runs to half of what the deadline had left when the count was asked for.
             read_list(&state, one_block, move |view| {
-                let until = count_until(Instant::now(), dl, count_budget);
+                let until = match count_budget {
+                    Some(b) => count_until(Instant::now(), dl, b),
+                    None => count_until(called, dl, Duration::MAX),
+                };
                 count(view, &spec, until)
             })
             .await
             .map_err(from_api)
+            .map(|(n, exact)| {
+                // A cut count is never below the edges served in the same response.
+                (if exact { n } else { n.max(served) }, exact)
+            })
         })
     }));
     Ok(ListPage { edges, info, total })
