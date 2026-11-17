@@ -6,7 +6,7 @@ API, a chainweb-data compatible REST API (`/txs/*`, `/stats`, `/coins`, plus the
 `/v1/txs`) and Kadena's GraphQL schema.
 
 **Status:** validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
-validation is in progress; not yet serving production traffic.
+validation is in progress (it ends 2026-11-19 17:05Z); not yet serving production traffic.
 
 ## In short
 
@@ -23,13 +23,12 @@ validation is in progress; not yet serving production traffic.
   accepted on node evidence).
 - Where it is slower: `/txs/search` slowest 1% is
   <!--m:lat-rest-search-p99-->+1.8 s (about 3.6× slower, +260%)<!--/m--> (interim), which users can
-  notice, because patterns that cannot use the code index run a bounded scan. The worst
-  regression is GraphQL account transactions
-  (<!--m:lat-gql-txs-by-account-p50-->+2.5 s (about 32× slower, +3,100%)<!--/m--> at the median) and
-  transfers (<!--m:lat-gql-transfers-by-account-p50-->+2.5 s (about 55× slower, +5,400%)<!--/m-->), measured on 7
-  queries each (interim) against a GraphQL indexer that serves a database about five months
-  smaller. Other GraphQL queries are slower too; [docs/comparison.md](docs/comparison.md) lists
-  each one.
+  notice, because patterns that cannot use the code index run a bounded scan. On GraphQL, the
+  account Transactions and Transfers tabs of an explorer take about
+  <!--m:exp-count-active-ms-->2,500 ms<!--/m--> (interim) today because of kda-indexer's own
+  `totalCount` walk; a bounded count (default 200 ms) is fixed, not released yet.
+  The comparison against the stock GraphQL indexer is pending; see
+  [docs/explorer.md](docs/explorer.md#speed).
 
 All numbers are interim until the 72-hour validation ends; sources, hardware and caveats are in
 [docs/comparison.md](docs/comparison.md).

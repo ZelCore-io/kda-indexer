@@ -3,9 +3,9 @@
 kda-indexer stores the mainnet history in about a tenth of chainweb-data's disk, answers most
 REST routes several times faster, and matches the node where chainweb-data does not. It is
 slower on the slowest `/txs/search` requests. On GraphQL, the account Transactions and Transfers
-tabs of an explorer take about 2.5 s on kda-indexer today, and a fix is in progress; the stock
-GraphQL indexer's times are not measured yet. See [explorer.md](explorer.md#speed). Every
-slower row is listed below with what is known about the reason.
+tabs of an explorer take about 2.5 s on kda-indexer today, because of its own `totalCount` walk;
+a bounded count (default 200 ms) is fixed, not released yet. The stock GraphQL indexer's
+times are not measured yet. See [explorer.md](explorer.md#speed). Every slower row is listed below with what is known about the reason.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
 validation is in progress (it ends 2026-11-19 17:05Z); not yet serving production traffic.

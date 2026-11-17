@@ -5,7 +5,7 @@ history of all 20 Kadena chains. It serves that history through a native API, a 
 compatible with chainweb-data and the kda-txs `/v1/txs` route, and Kadena's GraphQL schema.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
-validation is in progress; not yet serving production traffic.
+validation is in progress (it ends 2026-11-19 17:05Z); not yet serving production traffic.
 
 ## What it indexes
 
@@ -76,6 +76,12 @@ places where it is slower are in [comparison.md](comparison.md).
 - **Reorgs deeper than `ingest.finality_depth`** (1,000 blocks by default) halt that chain
   for an operator to resolve; the other chains keep running
   ([operations.md](operations.md#halted-chains)).
+- **GraphQL account tabs are slow today.** The account Transactions and Transfers tabs of an
+  explorer take about 2.5 s because of the `totalCount` walk; a bounded count is fixed, not
+  released yet ([explorer.md](explorer.md#speed)).
+- **One known NFT issue.** Some early marmalade v1 tokens (ids without the `t:` prefix) are
+  missing from `nonFungibleAccount`; fixed, not released yet
+  ([explorer.md](explorer.md#what-works-what-differs-what-is-not-supported)).
 - **The native API is internal.** It refuses public bind addresses and may change until a
   public hostname is decided.
 

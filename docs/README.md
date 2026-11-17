@@ -5,7 +5,7 @@ it through a native API, a chainweb-data compatible REST API and a GraphQL API. 
 overview; the rest of this page lists every document with one line on what it covers.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
-validation is in progress; not yet serving production traffic.
+validation is in progress (it ends 2026-11-19 17:05Z); not yet serving production traffic.
 
 ## Understand it
 

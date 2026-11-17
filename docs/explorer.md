@@ -8,7 +8,7 @@ lower bound (slowly today, see [Speed](#speed)). This page gives the evidence fo
 lists where the answers differ.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
-validation is in progress; not yet serving production traffic.
+validation is in progress (it ends 2026-11-19 17:05Z); not yet serving production traffic.
 
 ![The Kadena explorer home page served by kda-indexer: network figures at the top and a grid of the latest block heights per chain](img/explorer-home.png)
 
@@ -21,7 +21,7 @@ defaults, nullability, interfaces and unions are identical.
 | | What | Details |
 |---|---|---|
 | Works | Blocks, block lists, transactions, events, transfers, fungible accounts, `networkInfo`, `node`/`nodes` ids and cursors | Same names, types and id format as Kadena graph. Answers were compared with the GraphQL indexer and the node (see [Same answers](#same-answers)) |
-| Works, with one known issue | Non-fungible accounts (`nonFungibleAccount`) | Some early marmalade v1 tokens (ids without the `t:` prefix) are missing from `nonFungibleAccount`. The fix is written and waits for a release |
+| Works, with one known issue | Non-fungible accounts (`nonFungibleAccount`) | Some early marmalade v1 tokens (ids without the `t:` prefix) are missing from `nonFungibleAccount`. Fixed, not released yet |
 | Works | Subscriptions: `newBlocks`, `newBlocksFromDepth`, `events`, `transaction` | Over a websocket on the same `/graphql` path (`graphql-transport-ws` or the older `graphql-ws`). A load test held <!--m:gql-subs-held-->500<!--/m--> live subscriptions with <!--m:gql-subs-duplicates-->0<!--/m--> duplicate and <!--m:gql-subs-misses-->0<!--/m--> missed items, and <!--m:gql-subs-headers-checked-->631<!--/m--> block headers checked against the node |
 | Works | The additions kadscan uses: `balance`, `transactionsByPactCode`, `Block.coinbase`, `Block.canonical`, `transfers(isNFT)`, the `transactions` subscription and others | Additive only: every Kadena document stays valid ([graphql.md](graphql.md#zelcore-extensions)) |
 | Differs | Page sizes | 20 items when `first`/`last` is omitted (the schema text says 500); larger values are clamped to 100, block lists and `balance` to 200. `hasNextPage` stays correct |
@@ -137,8 +137,8 @@ Fourteen of the 17 answer in under 25 ms at the median and under 200 ms at p99. 
 samples is close to the maximum, so read it as the worst case seen.
 
 **The account Transactions and Transfers tabs are slow (about 2.5 s).** The sample was 100
-distinct variable sets per operation (<!--m:exp-variable-sets-->100<!--/m-->), taken from real
-explorer traffic, and every one of these three operations sat near 2.5 s. The page of results
+distinct variable sets per operation (<!--m:exp-variable-sets-->100<!--/m-->), taken from recorded explorer requests,
+and every one of these three operations sat near 2.5 s. The page of results
 itself takes about <!--m:exp-account-page-ms-->3 ms<!--/m-->. The time goes to `totalCount`.
 Profiled on a heavy account and on an ordinary active account, the count took about
 <!--m:exp-count-heavy-ms-->2,470 ms<!--/m--> and <!--m:exp-count-active-ms-->2,500 ms<!--/m-->.
@@ -151,7 +151,7 @@ accounts reach the 10,000-row cap first, in well under a second. In this sample,
 ran out of the whole deadline (`TIMEOUT`).
 
 The fix caps the count at a short budget, 200 ms by default, and returns the same flagged lower
-bound, with the same response shape as today. It is not released yet. The new times will be
+bound, with the same response shape as today. It is fixed, not released yet. The new times will be
 published once they are measured.
 
 ## Screenshots
