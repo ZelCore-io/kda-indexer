@@ -338,6 +338,10 @@ class DataValidationTests(unittest.TestCase):
             m[key] = bad
             self.assertTrue(self.problems([m]), (key, bad))
 
+    def test_process_counts_have_no_baseline(self):
+        m = metric("a", 752, None, unit="tests", better="equal", group="process", baseline_name="none")
+        self.assertEqual(self.problems([m]), [])
+
     def test_duplicate_ids(self):
         self.assertTrue(self.problems([metric("a", 1, 2), metric("a", 3, 4)]))
 

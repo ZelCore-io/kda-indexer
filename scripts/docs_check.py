@@ -182,8 +182,8 @@ def check_numbers(root, path, text, metrics, errors):
                 where, shown, mid, metric.get("ours"), metric.get("baseline")))
 
 
-GROUPS = {"disk", "latency", "correctness", "sync", "resources", "graphql"}
-BASELINES = {"chainweb-data", "GraphQL indexer", "node", "/v1/txs service"}
+GROUPS = {"disk", "latency", "correctness", "sync", "resources", "graphql", "process"}
+BASELINES = {"chainweb-data", "GraphQL indexer", "node", "/v1/txs service", "none"}
 BETTER = {"lower", "higher", "equal"}
 SCALES = {"auto", "linear", "log"}
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")

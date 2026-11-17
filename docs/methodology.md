@@ -53,10 +53,12 @@ How each phase was run:
   manifest, and the request parsers (GraphQL requests, API tokens, forwarded-for headers,
   `LIKE` patterns).
 
-At the build under final validation (0b5cb03) the Linux test run had 752 passed, 0 failed and
-81 ignored. The ignored tests need root, Linux-only paths or a snapshot store; they were run
-with `--include-ignored` as root on Linux on the same stack before the final merge: 731 passed,
-0 failed.
+At the release build under final validation (0b5cb03) the Linux test run had
+<!--m:proc-tests-passed-->752<!--/m--> passed, <!--m:proc-tests-failed-->0<!--/m--> failed and
+<!--m:proc-tests-ignored-->81<!--/m--> ignored. The ignored tests need root, Linux-only paths or a
+snapshot store. They were run separately on an earlier validation build (83fc470) with
+`--include-ignored` as root on Linux: 731 passed, 0 failed, with one manual store-equality test
+skipped (it needs a dev store). The two counts are for different builds and are not comparable.
 
 ## Proving the answers are the same: the comparison harness
 
@@ -90,7 +92,7 @@ It is built to fail closed:
   of running a new multi-hour window. Nothing already seen is lost, and a rule change that
   would hide a real difference shows up as a record changing class.
 - **Real requests.** Read-only REST requests from production were collected, stripped of client
-  addresses and deduplicated, giving 2,307 unique requests. They are replayed against the
+  addresses and deduplicated, giving <!--m:proc-replay-unique-->2,307<!--/m--> unique requests. They are replayed against the
   baseline and kda-indexer at the same moment, once a day during the final validation. The
   request contents are not published. A GraphQL replay is being prepared the same way.
 - **The explorer's own queries.** The GraphQL operation documents of a public Kadena explorer
@@ -128,14 +130,14 @@ Five gates ran, CG-1 to CG-5. The early ones found real defects in kda-indexer, 
 fixed before merging: for example GraphQL field formats, the request key of coinbase
 transactions, the order of block lists and the sender filter of account transactions.
 
-CG-5, the gate for the full stack, compared in its 3-hour window on 2026-11-15:
+CG-5, the gate for the full stack, compared in its 3-hour window (2 h 58 m, counted as full) on 2026-11-15:
 
-- 1,503 REST request pairs against chainweb-data and kda-txs on the required routes;
-- 1,151 block, transaction and balance reads against the node;
-- 2,072 GraphQL queries over 33 operations against the GraphQL indexer;
-- 1,160 explorer operations over 18 documents.
+- <!--m:proc-cg5-rest-pairs-->1,503<!--/m--> REST request pairs against chainweb-data and kda-txs on the required routes;
+- <!--m:proc-cg5-node-reads-->1,151<!--/m--> block, transaction and balance reads against the node;
+- <!--m:proc-cg5-graphql-queries-->2,072<!--/m--> GraphQL queries over 33 operations against the GraphQL indexer;
+- <!--m:proc-cg5-explorer-ops-->1,160<!--/m--> explorer operations over 18 documents.
 
-Unexplained records then went 228 → 90 → 60 → 8 → 1 → 0 over the re-check rounds. None of
+Unexplained records then went <!--m:proc-cg5-unexplained-round-1-->228<!--/m--> → <!--m:proc-cg5-unexplained-round-2-->90<!--/m--> → <!--m:proc-cg5-unexplained-round-3-->60<!--/m--> → <!--m:proc-cg5-unexplained-round-4-->8<!--/m--> → <!--m:proc-cg5-unexplained-round-5-->1<!--/m--> → <!--m:corr-unexplained-cg5-->0<!--/m--> over the re-check rounds. None of
 the 228 was a defect in kda-indexer: they were harness rules that were too strict or missing,
 timing between reads, and baseline faults (orphan rows, missing blocks) that the node settled.
 The last record was accepted on node evidence: the node's data agreed with kda-indexer.
@@ -164,7 +166,7 @@ During the window:
   slope over the window, excluding the load-test hour.
 - **Freeze-cursor check:** paging cursors handed out before the freezer moves blocks from the
   hot store into segments must continue correctly afterwards. The one freezer step so far
-  passed: 229 cursors followed, each equal to a fresh query.
+  passed: <!--m:proc-freeze-cursors-->229<!--/m--> cursors followed, each equal to a fresh query.
 - **Load test:** one hour of REST at 50 requests/s, explorer GraphQL operations at 20 requests/s
   and 500 websocket subscriptions; error rates, response times, tail lag and memory are
   checked against limits set beforehand. Its hour is excluded from the latency figures.

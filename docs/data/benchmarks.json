@@ -402,7 +402,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression; reason not yet analysed.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression; reason not yet analysed.",
    "interim": true
   },
   {
@@ -416,7 +416,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression; reason not yet analysed.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression; reason not yet analysed.",
    "interim": true
   },
   {
@@ -430,7 +430,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "10 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "10 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -444,7 +444,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "10 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "10 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -458,7 +458,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -472,7 +472,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression; reason not yet analysed.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression; reason not yet analysed.",
    "interim": true
   },
   {
@@ -486,7 +486,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -500,7 +500,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -514,7 +514,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -528,7 +528,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -542,7 +542,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "8 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "8 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -556,7 +556,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "8 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "8 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -570,7 +570,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "9 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "9 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -584,7 +584,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "9 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "9 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like.",
    "interim": true
   },
   {
@@ -598,7 +598,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "7 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression: the sampled accounts include heavy accounts whose history walk runs close to the request deadline.",
+   "note": "7 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression: for a few very heavy accounts the history walk runs close to the request deadline. Measured cause for account transactions: each posting is decoded to apply the sender filter.",
    "interim": true
   },
   {
@@ -612,7 +612,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "7 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance.",
+   "note": "7 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Measured cause for account transactions: each posting is decoded to apply the sender filter.",
    "interim": true
   },
   {
@@ -626,7 +626,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "7 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression: the sampled accounts include heavy accounts whose history walk runs close to the request deadline.",
+   "note": "7 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression: for a few very heavy accounts the history walk runs close to the request deadline.",
    "interim": true
   },
   {
@@ -640,7 +640,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "7 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression: the sampled accounts include heavy accounts whose history walk runs close to the request deadline.",
+   "note": "7 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression: for a few very heavy accounts the history walk runs close to the request deadline.",
    "interim": true
   },
   {
@@ -654,7 +654,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression; reason not yet analysed.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression; reason not yet analysed.",
    "interim": true
   },
   {
@@ -668,7 +668,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression; reason not yet analysed.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression; reason not yet analysed.",
    "interim": true
   },
   {
@@ -682,7 +682,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression; reason not yet analysed.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression; reason not yet analysed.",
    "interim": true
   },
   {
@@ -696,7 +696,7 @@
    "better": "lower",
    "date": "2026-11-17",
    "source": "First 24 h of the 72-hour final validation (window opened 2026-11-16 17:05Z, read 2026-11-17 16:55Z). Harness latency per GraphQL query class, histogram bucket upper edges (about ±20%). kda-indexer on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; the GraphQL indexer is a production copy reached over the private network, paced and pinned to a fixed height. kda-indexer build 0b5cb03.",
-   "note": "11 compared queries; small sample. The baseline is remote and paced, so its numbers include network distance. Regression; reason not yet analysed.",
+   "note": "11 compared queries; interim: being re-measured with at least 100 samples per query against the stock GraphQL indexer; at this sample size p99 is about the maximum, so p99 is not classed. The baseline is remote and paced, so its numbers include network distance. The stock GraphQL indexer stopped ingesting in June 2026 at height about 6.95M, so it serves a database about five months smaller than ours and its times are not like-for-like. Regression; reason not yet analysed.",
    "interim": true
   },
   {
@@ -1019,8 +1019,201 @@
    "better": "lower",
    "date": "2026-11-12",
    "source": "Full format-v2 mainnet backfill from an empty store (139,279,460 blocks, 369,200,367 transactions, heights 0–7.39M), 2026-11-11 to 2026-11-12, on the validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data; one range in flight, idle IO priority, reading from the local node. Build 8813750.",
-   "note": "Peak process memory (VmHWM) in the dense 3.7–5.3M era. Plan 32 GiB RAM for a full backfill beside a node; the tail needs far less.",
+   "note": "Peak process memory (VmHWM) in the dense 3.7–5.3M era. Measured on a 24 GiB host; the tail needs far less.",
    "interim": true
+  },
+  {
+   "id": "proc-tests-passed",
+   "group": "process",
+   "label": "Tests passed (Linux, build 0b5cb03)",
+   "unit": "tests",
+   "ours": 752,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "cargo test --workspace on Linux at build 0b5cb03, 2026-11-16, before the final validation window.",
+   "interim": true,
+   "note": "Ignored tests (root-only, Linux-only paths, snapshot store) are not counted as passed."
+  },
+  {
+   "id": "proc-tests-failed",
+   "group": "process",
+   "label": "Tests failed (Linux, build 0b5cb03)",
+   "unit": "tests",
+   "ours": 0,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "cargo test --workspace on Linux at build 0b5cb03, 2026-11-16, before the final validation window.",
+   "interim": true
+  },
+  {
+   "id": "proc-tests-ignored",
+   "group": "process",
+   "label": "Tests ignored (Linux, build 0b5cb03)",
+   "unit": "tests",
+   "ours": 81,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "cargo test --workspace on Linux at build 0b5cb03, 2026-11-16, before the final validation window.",
+   "interim": true,
+   "note": "They need root, Linux-only paths or a snapshot store. An earlier validation build ran them with --include-ignored as root on Linux: 731 passed, 0 failed, with one manual store-equality test skipped."
+  },
+  {
+   "id": "proc-cg5-rest-pairs",
+   "group": "process",
+   "label": "CG-5: REST request pairs compared",
+   "unit": "requests",
+   "ours": 1503,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-15",
+   "source": "Gate CG-5: a 3-hour harness window (2 h 58 min, counted as full) on 2026-11-15 against chainweb-data, kda-txs, the GraphQL indexer and the node; validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data.",
+   "interim": true,
+   "note": "Required routes, against chainweb-data and kda-txs."
+  },
+  {
+   "id": "proc-cg5-node-reads",
+   "group": "process",
+   "label": "CG-5: block, transaction and balance reads compared with the node",
+   "unit": "reads",
+   "ours": 1151,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-15",
+   "source": "Gate CG-5: a 3-hour harness window (2 h 58 min, counted as full) on 2026-11-15 against chainweb-data, kda-txs, the GraphQL indexer and the node; validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data.",
+   "interim": true
+  },
+  {
+   "id": "proc-cg5-graphql-queries",
+   "group": "process",
+   "label": "CG-5: GraphQL queries compared",
+   "unit": "queries",
+   "ours": 2072,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-15",
+   "source": "Gate CG-5: a 3-hour harness window (2 h 58 min, counted as full) on 2026-11-15 against chainweb-data, kda-txs, the GraphQL indexer and the node; validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data.",
+   "interim": true,
+   "note": "33 operations, against the GraphQL indexer."
+  },
+  {
+   "id": "proc-cg5-explorer-ops",
+   "group": "process",
+   "label": "CG-5: explorer operations compared",
+   "unit": "operations",
+   "ours": 1160,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-15",
+   "source": "Gate CG-5: a 3-hour harness window (2 h 58 min, counted as full) on 2026-11-15 against chainweb-data, kda-txs, the GraphQL indexer and the node; validation host (8 vCPU AMD EPYC, 24 GiB RAM, virtual block storage) shared with chainweb-node 3.2.1 and chainweb-data.",
+   "interim": true,
+   "note": "18 operation documents of a public Kadena explorer."
+  },
+  {
+   "id": "proc-cg5-unexplained-round-1",
+   "group": "process",
+   "label": "CG-5: unexplained records, step 1 of 6",
+   "unit": "records",
+   "ours": 228,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "Unexplained records after each re-check round of gate CG-5 (the stored records of the 3-hour window, re-refereed after each harness fix), 2026-11-15 to 2026-11-16.",
+   "interim": true,
+   "note": "Step 1 is the count from the original window read; the final step (0) is corr-unexplained-cg5."
+  },
+  {
+   "id": "proc-cg5-unexplained-round-2",
+   "group": "process",
+   "label": "CG-5: unexplained records, step 2 of 6",
+   "unit": "records",
+   "ours": 90,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "Unexplained records after each re-check round of gate CG-5 (the stored records of the 3-hour window, re-refereed after each harness fix), 2026-11-15 to 2026-11-16.",
+   "interim": true,
+   "note": "Step 1 is the count from the original window read; the final step (0) is corr-unexplained-cg5."
+  },
+  {
+   "id": "proc-cg5-unexplained-round-3",
+   "group": "process",
+   "label": "CG-5: unexplained records, step 3 of 6",
+   "unit": "records",
+   "ours": 60,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "Unexplained records after each re-check round of gate CG-5 (the stored records of the 3-hour window, re-refereed after each harness fix), 2026-11-15 to 2026-11-16.",
+   "interim": true,
+   "note": "Step 1 is the count from the original window read; the final step (0) is corr-unexplained-cg5."
+  },
+  {
+   "id": "proc-cg5-unexplained-round-4",
+   "group": "process",
+   "label": "CG-5: unexplained records, step 4 of 6",
+   "unit": "records",
+   "ours": 8,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "Unexplained records after each re-check round of gate CG-5 (the stored records of the 3-hour window, re-refereed after each harness fix), 2026-11-15 to 2026-11-16.",
+   "interim": true,
+   "note": "Step 1 is the count from the original window read; the final step (0) is corr-unexplained-cg5."
+  },
+  {
+   "id": "proc-cg5-unexplained-round-5",
+   "group": "process",
+   "label": "CG-5: unexplained records, step 5 of 6",
+   "unit": "records",
+   "ours": 1,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "Unexplained records after each re-check round of gate CG-5 (the stored records of the 3-hour window, re-refereed after each harness fix), 2026-11-15 to 2026-11-16.",
+   "interim": true,
+   "note": "Step 1 is the count from the original window read; the final step (0) is corr-unexplained-cg5."
+  },
+  {
+   "id": "proc-replay-unique",
+   "group": "process",
+   "label": "Unique production REST requests in the daily replay",
+   "unit": "requests",
+   "ours": 2307,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-16",
+   "source": "Read-only REST requests collected from production, client addresses removed and deduplicated; replayed once a day against the baseline and kda-indexer during the final validation. The request contents are not published.",
+   "interim": true
+  },
+  {
+   "id": "proc-freeze-cursors",
+   "group": "process",
+   "label": "Paging cursors checked across the freezer step",
+   "unit": "cursors",
+   "ours": 229,
+   "baseline": null,
+   "baseline_name": "none",
+   "better": "equal",
+   "date": "2026-11-17",
+   "source": "Final validation, one freezer step on 2026-11-16: cursors taken before it were followed after it and each compared with a fresh query; checked 2026-11-17.",
+   "interim": true,
+   "note": "All 229 followed equal to a fresh query, 0 bad."
   }
  ],
  "charts": [

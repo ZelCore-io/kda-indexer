@@ -23,8 +23,13 @@ validation is in progress; not yet serving production traffic.
   accepted on node evidence).
 - Where it is slower: `/txs/search` slowest 1% is
   <!--m:lat-rest-search-p99-->+1.8 s (about 3.6× slower, +260%)<!--/m--> (interim), which users can
-  notice, because patterns that cannot use the code index run a bounded scan. Some GraphQL
-  queries are slower too; [docs/comparison.md](docs/comparison.md) lists each one.
+  notice, because patterns that cannot use the code index run a bounded scan. The worst
+  regression is GraphQL account transactions
+  (<!--m:lat-gql-txs-by-account-p50-->+2.5 s (about 32× slower, +3,100%)<!--/m--> at the median) and
+  transfers (<!--m:lat-gql-transfers-by-account-p50-->+2.5 s (about 55× slower, +5,400%)<!--/m-->), measured on 7
+  queries each (interim) against a GraphQL indexer that serves a database about five months
+  smaller. Other GraphQL queries are slower too; [docs/comparison.md](docs/comparison.md) lists
+  each one.
 
 All numbers are interim until the 72-hour validation ends; sources, hardware and caveats are in
 [docs/comparison.md](docs/comparison.md).
