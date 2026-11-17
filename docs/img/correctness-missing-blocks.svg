@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="159" viewBox="0 0 880 159" role="img" aria-labelledby="correctness-missing-blocks-t correctness-missing-blocks-d">
+<title id="correctness-missing-blocks-t">Canonical blocks missing, heights 7.37–7.38M</title>
+<desc id="correctness-missing-blocks-d">Canonical blocks missing (7.37–7.38M): kda-indexer 0 blocks, chainweb-data 423 blocks, 100% fewer.</desc>
+<style>
+svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.bg{fill:#ffffff}
+.title{fill:#1f2328;font-size:16px;font-weight:600}
+.sub,.tick,.muted{fill:#59636e;font-size:11px}
+.label{fill:#1f2328;font-size:12px}
+.val{fill:#1f2328;font-size:11px}
+.grid{stroke:#d8dee4;stroke-width:1}
+.ours.better{fill:#1a7f37}
+.ours.worse{fill:#cf222e}
+.ours.same,.ours.none{fill:#57606a}
+.base{fill:#afb8c1}
+.up{fill:#1a7f37}
+.down{fill:#cf222e}
+@media (prefers-color-scheme: dark){
+.bg{fill:#0d1117}
+.title,.label,.val{fill:#e6edf3}
+.sub,.tick,.muted{fill:#9198a1}
+.grid{stroke:#30363d}
+.ours.better{fill:#3fb950}
+.ours.worse{fill:#f85149}
+.ours.same,.ours.none{fill:#9198a1}
+.base{fill:#484f58}
+.up{fill:#3fb950}
+.down{fill:#f85149}
+}
+</style>
+<rect class="bg" x="0" y="0" width="880" height="159" rx="6"/>
+<text class="title" x="16" y="28">Canonical blocks missing, heights 7.37–7.38M</text>
+<text class="sub" x="16" y="48">blocks · linear scale · ▲ better ▼ worse than the baseline · interim numbers</text>
+<rect class="ours better" x="16" y="62" width="10" height="10" rx="2"/>
+<text class="muted" x="30" y="71">kda-indexer, better</text>
+<rect class="base" x="157" y="62" width="10" height="10" rx="2"/>
+<text class="muted" x="171" y="71">baseline</text>
+<g class="axis linear">
+<line class="grid" x1="260.0" y1="78" x2="260.0" y2="119"/>
+<text class="tick" x="260.0" y="135" text-anchor="middle">0</text>
+<line class="grid" x1="324.0" y1="78" x2="324.0" y2="119"/>
+<text class="tick" x="324.0" y="135" text-anchor="middle">100</text>
+<line class="grid" x1="388.0" y1="78" x2="388.0" y2="119"/>
+<text class="tick" x="388.0" y="135" text-anchor="middle">200</text>
+<line class="grid" x1="452.0" y1="78" x2="452.0" y2="119"/>
+<text class="tick" x="452.0" y="135" text-anchor="middle">300</text>
+<line class="grid" x1="516.0" y1="78" x2="516.0" y2="119"/>
+<text class="tick" x="516.0" y="135" text-anchor="middle">400</text>
+<line class="grid" x1="580.0" y1="78" x2="580.0" y2="119"/>
+<text class="tick" x="580.0" y="135" text-anchor="middle">500</text>
+</g>
+<g class="metric" id="corr-missing-blocks">
+<text class="label" x="250" y="100" text-anchor="end">Canonical blocks missing (7.37–7.38M)</text>
+<rect class="ours better" x="260" y="84" width="0.0" height="12" rx="2"/>
+<text class="val" x="266.0" y="94">0 blocks
+ <tspan class="up">▲</tspan>
+ 100% fewer
+</text>
+<rect class="base" x="260" y="99" width="270.7" height="12" rx="2"/>
+<text class="muted" x="536.7" y="109">423 blocks · chainweb-data</text>
+</g>
+</svg>

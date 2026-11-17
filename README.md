@@ -1,20 +1,51 @@
 # kda-indexer
 
-A compact, fast indexer for the [Kadena](https://github.com/kda-community) chainweb blockchain.
+An indexer for the [Kadena](https://github.com/kda-community) chainweb blockchain, written in
+Rust. It follows a chainweb-node and serves the full history of all 20 chains through a native
+API, a chainweb-data compatible REST API (`/txs/*`, `/stats`, `/coins`, plus the kda-txs route
+`/v1/txs`) and Kadena's GraphQL schema.
 
-It indexes all 20 chains from a chainweb-node: blocks, full transactions, results, events and transfers. It serves them through:
+**Status:** validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
+validation is in progress (it ends 2026-11-19 17:05Z); not yet serving production traffic.
 
-- a native HTTP API;
-- a REST API compatible with chainweb-data (`/txs/*`);
-- a GraphQL API on its own port.
+## In short
 
-Status: early development. Nothing here is ready for production yet.
+- One binary, installed as a Debian package with a systemd unit next to the node it reads. No
+  Postgres, no Docker.
+- Mainnet history in <!--m:disk-total-vs-cwd-->140.2 GB<!--/m--> (interim):
+  <!--m:disk-total-vs-cwd-->11.2× smaller (−91%)<!--/m--> (interim) than chainweb-data on the same host.
+- `/txs/account` typical response <!--m:lat-rest-account-p50-->−89 ms (about 16× faster, −94%)<!--/m-->
+  (interim) and slowest 1% <!--m:lat-rest-account-p99-->−46 s (about 95× faster, −99%)<!--/m--> (interim)
+  against chainweb-data. chainweb-data failed or timed out on 338 more request pairs, which are excluded
+  from its latency.
+- <!--m:corr-unexplained-cg5-->0<!--/m--> unexplained differences (interim) from chainweb-data, the
+  GraphQL indexer and the node at the end of the CG-5 comparison gate (the last record was
+  accepted on node evidence).
+- Where it is slower: `/txs/search` slowest 1% is
+  <!--m:lat-rest-search-p99-->+1.8 s (about 3.6× slower, +260%)<!--/m--> (interim), which users can
+  notice, because patterns that cannot use the code index run a bounded scan. On GraphQL, the
+  account Transactions and Transfers tabs of an explorer take about
+  <!--m:exp-count-active-ms-->2,500 ms<!--/m--> (interim) today because of kda-indexer's own
+  `totalCount` walk; a bounded count (default 200 ms) is fixed, not released yet.
+  The comparison against the stock GraphQL indexer is pending; see
+  [docs/explorer.md](docs/explorer.md#speed).
 
-## Goals
+All numbers are interim until the 72-hour validation ends; sources, hardware and caveats are in
+[docs/comparison.md](docs/comparison.md).
 
-- Full transaction history for all 20 chains, in a small fraction of the disk space today's Postgres-based indexers need.
-- Fast initial sync: chains are ingested in parallel and history is written as immutable, compressed segments.
-- Runs as a native service next to chainweb-node: a single binary installed as a Debian package with a systemd unit.
+![Disk use on mainnet: kda-indexer against chainweb-data, the GraphQL indexer and the chainweb-node database](docs/img/disk.svg)
+
+## Documentation
+
+Start at [docs/README.md](docs/README.md). The main pages:
+
+- [Overview](docs/overview.md): what it indexes and serves, who it is for, what it does not do.
+- [Architecture](docs/architecture.md): from the node to the APIs, reorgs, the data directory.
+- [Comparison](docs/comparison.md): disk, response time, correctness, sync and memory, as change rates.
+- [Methodology](docs/methodology.md): how it was built and checked.
+- [Explorer](docs/explorer.md): powering a Kadena explorer with the GraphQL API.
+- [Install](docs/install.md) and [operations](docs/operations.md): running it.
+- [Native API](docs/api.md), [GraphQL](docs/graphql.md), [on-disk format](docs/format.md): reference.
 
 ## Building
 

@@ -74,3 +74,6 @@ proptest-regressions/
 .vscode/
 *.swp
 *~
+
+# Python bytecode from scripts/
+__pycache__/
