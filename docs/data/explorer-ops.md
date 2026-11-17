@@ -34,7 +34,7 @@ kadscan's source is not public; these are the documents its web app sends.
 | `NetworkHashRate-a7d45475` | network hash rate | in-scope |  |  |  |
 | `NetworkInfo-e5e8483b` | network info | in-scope |  |  |  |
 | `NewBlocks-a61c93fc` | new blocks (subscription) | in-scope |  |  |  |
-| `NonFungibleAccount-f77b27d1` | account NFTs | in-scope | <!--m:exp-nonfungibleaccount-f77b27d1-p50-->1.1 ms<!--/m--> | <!--m:exp-nonfungibleaccount-f77b27d1-p99-->2.9 ms<!--/m--> |  |
+| `NonFungibleAccount-f77b27d1` | account NFTs | in-scope | <!--m:exp-nonfungibleaccount-f77b27d1-p50-->1.1 ms<!--/m--> | <!--m:exp-nonfungibleaccount-f77b27d1-p99-->2.9 ms<!--/m--> | works, with one known issue: some early marmalade v1 tokens (ids without the `t:` prefix) are missing from `nonFungibleAccount`; fixed, waiting for release |
 | `PactContract-504515c9` | read a contract value (`pactQuery`) | in-scope |  |  | runs, but `pactQuery` answers `NOT_SUPPORTED`: the indexer never runs Pact code |
 | `Query-3ef4ad06` | token price (`lastTokenPriceInKda`) | in-scope |  |  | runs, but `lastTokenPriceInKda` answers `NOT_SUPPORTED`: no price data |
 | `Query-63662f60` | transaction status | in-scope | <!--m:exp-query-63662f60-p50-->15.8 ms<!--/m--> | <!--m:exp-query-63662f60-p99-->41.1 ms<!--/m--> |  |

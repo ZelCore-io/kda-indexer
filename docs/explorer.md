@@ -2,8 +2,10 @@
 
 kda-indexer serves Kadena's GraphQL schema, the schema of `@kadena/graph`. An explorer built on
 that schema, such as kadscan or the Kadena explorer, can change its GraphQL URL to a kda-indexer
-endpoint and keep its own operations. This page gives the evidence for that claim and lists
-where the answers differ.
+endpoint and keep its own operations, with two documented limits: the default query-cost limit
+refuses an events query that spans all 20 chains, and `totalCount` on a long list can answer a
+lower bound (slowly today, see [Speed](#speed)). This page gives the evidence for that claim and
+lists where the answers differ.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
 validation is in progress; not yet serving production traffic.
@@ -18,12 +20,14 @@ defaults, nullability, interfaces and unions are identical.
 
 | | What | Details |
 |---|---|---|
-| Works | Blocks, block lists, transactions, events, transfers, fungible and non-fungible accounts, `networkInfo`, `node`/`nodes` ids and cursors | Same names, types and id format as Kadena graph. Answers were compared with the GraphQL indexer and the node (see [Same answers](#same-answers)) |
-| Works | Subscriptions: `newBlocks`, `newBlocksFromDepth`, `events`, `transaction` | Over a websocket on the same `/graphql` path (`graphql-transport-ws` or the older `graphql-ws`) |
+| Works | Blocks, block lists, transactions, events, transfers, fungible accounts, `networkInfo`, `node`/`nodes` ids and cursors | Same names, types and id format as Kadena graph. Answers were compared with the GraphQL indexer and the node (see [Same answers](#same-answers)) |
+| Works, with one known issue | Non-fungible accounts (`nonFungibleAccount`) | Some early marmalade v1 tokens (ids without the `t:` prefix) are missing from `nonFungibleAccount`. The fix is written and waits for a release |
+| Works | Subscriptions: `newBlocks`, `newBlocksFromDepth`, `events`, `transaction` | Over a websocket on the same `/graphql` path (`graphql-transport-ws` or the older `graphql-ws`). A load test held <!--m:gql-subs-held-->500<!--/m--> live subscriptions with <!--m:gql-subs-duplicates-->0<!--/m--> duplicate and <!--m:gql-subs-misses-->0<!--/m--> missed items, and <!--m:gql-subs-headers-checked-->631<!--/m--> block headers checked against the node |
 | Works | The additions kadscan uses: `balance`, `transactionsByPactCode`, `Block.coinbase`, `Block.canonical`, `transfers(isNFT)`, the `transactions` subscription and others | Additive only: every Kadena document stays valid ([graphql.md](graphql.md#zelcore-extensions)) |
 | Differs | Page sizes | 20 items when `first`/`last` is omitted (the schema text says 500); larger values are clamped to 100, block lists and `balance` to 200. `hasNextPage` stays correct |
-| Differs | `totalCount` on long lists | Counted up to 10,000 rows within a time budget; a count cut short answers a lower bound and the response carries `"extensions": {"totalCountLowerBound": true}` |
+| Differs | `totalCount` on long lists | Counted up to 10,000 rows within a time budget; a count cut short answers a lower bound and the response carries `"extensions": {"totalCountLowerBound": true}`. Today the budget is up to half of the 5 s request deadline; the fix caps it at 200 ms by default (see [Speed](#speed)) |
 | Differs | Resource limits | Depth 10, complexity 2,000, at most 2 count walks per operation, 10 operations per batch, a 5 s deadline. A refusal is a GraphQL error with `extensions.code = "LIMIT"` ([graphql.md](graphql.md#limits)) |
+| Differs | Events over all 20 chains | The Kadena explorer builds one `events` field per ticked chain. With all 20 chains ticked the query costs about 2,000, reaches the default complexity limit and is refused with `LIMIT`; up to 19 chains pass. Raising `max_complexity` in `[graphql]` allows it |
 | Differs | `NetworkInfo.countersOfEachChain` | `blocksCount` answers; `transactionCount` and `totalGasUsedInKda` are `null` with `NOT_AVAILABLE` (no all-time per-chain counter is kept) |
 | Not supported | `pactQuery`, `gasLimitEstimate` | `NOT_SUPPORTED`: the indexer never runs Pact code for clients. Read contract state from a chainweb-node `/local` instead |
 | Not supported | Mempool | `Transaction.result` is never a `TransactionMempoolInfo`; a transaction not yet in a block is `null` |
@@ -85,10 +89,16 @@ Validity is not the same as equal answers. During comparison gate CG-5 (a 3-hour
 mainnet on 2026-11-15), <!--m:proc-cg5-explorer-ops-->1,160<!--/m--> explorer operations
 (18 explorer operation documents) and
 <!--m:proc-cg5-graphql-queries-->2,072<!--/m--> GraphQL queries were answered by both
-kda-indexer and the GraphQL indexer and compared field by field, with the node as referee.
-After the re-check rounds, <!--m:corr-unexplained-cg5-->0<!--/m--> differences were left
-unexplained. [methodology.md](methodology.md) describes the harness and
-[comparison.md](comparison.md) the rest of the results. The 72-hour final validation runs the
+kda-indexer and the GraphQL indexer and compared field by field. Where the two disagreed on
+data the node holds, the node was the referee. After the re-check rounds,
+<!--m:corr-unexplained-cg5-->0<!--/m--> differences were left unexplained.
+
+One caveat: the stock GraphQL indexer instances used for this comparison stopped ingesting in
+June 2026, so they lack about five months of recent data that kda-indexer has. For that data
+the node, not the stock indexer, was the reference
+([comparison.md](comparison.md#response-time-graphql) has the details).
+[methodology.md](methodology.md) describes the harness and [comparison.md](comparison.md) the
+rest of the results. The 72-hour final validation runs the
 same comparison continuously. Its counts are published when it ends.
 
 ## Speed
@@ -123,20 +133,32 @@ It will be measured with the same operations and variables.
 | `Transfers` (`825fa035`) | account page, Transfers tab | ▼ <!--m:exp-transfers-825fa035-p50-->2,474.0 ms<!--/m--> | ▼ <!--m:exp-transfers-825fa035-p99-->2,578.6 ms<!--/m--> | pending |
 | `Transfers` (`f3be2db0`) | account page, Transfers tab (fungible or NFT) | ▼ <!--m:exp-transfers-f3be2db0-p50-->2,473.1 ms<!--/m--> | ▼ <!--m:exp-transfers-f3be2db0-p99-->2,560.7 ms<!--/m--> | pending |
 
-Fourteen of the 17 answer in under 25 ms at the median and under 200 ms at p99.
+Fourteen of the 17 answer in under 25 ms at the median and under 200 ms at p99. A p99 of 100
+samples is close to the maximum, so read it as the worst case seen.
 
-**The account Transactions and Transfers tabs are slow (about 2.5 s).** The page itself takes
-about 3 ms. The time goes to `totalCount`: the count walks the account's postings and decodes
-each one until it reaches 10,000 rows or half the request deadline. Any active account reaches
-the time limit first. In this sample, 3 requests of the account tab's `Transactions` operation
-also ran out of time (`TIMEOUT`). This is being fixed: the count is bounded and returned as a
-flagged lower bound (`totalCountLowerBound`), the same response shape as today. The new time will be published once it is measured. A dormant account with a few
-hundred postings answers in milliseconds today.
+**The account Transactions and Transfers tabs are slow (about 2.5 s).** The sample was 100
+distinct variable sets per operation (<!--m:exp-variable-sets-->100<!--/m-->), taken from real
+explorer traffic, and every one of these three operations sat near 2.5 s. The page of results
+itself takes about <!--m:exp-account-page-ms-->3 ms<!--/m-->. The time goes to `totalCount`.
+Profiled on a heavy account and on an ordinary active account, the count took about
+<!--m:exp-count-heavy-ms-->2,470 ms<!--/m--> and <!--m:exp-count-active-ms-->2,500 ms<!--/m-->.
+
+Why: the count walks the account's postings and decodes each one until it has 10,000 rows
+or has used its time budget. Today that budget is up to half of the 5 s request deadline,
+about 2.5 s, and then the answer is a lower bound, flagged with `totalCountLowerBound`. Some
+accounts reach the 10,000-row cap first, in well under a second. In this sample,
+<!--m:exp-account-timeouts-->3<!--/m--> requests of the account tab's `Transactions` operation
+ran out of the whole deadline (`TIMEOUT`).
+
+The fix caps the count at a short budget, 200 ms by default, and returns the same flagged lower
+bound, with the same response shape as today. It is not released yet. The new times will be
+published once they are measured.
 
 ## Screenshots
 
 The Kadena explorer running locally with its GraphQL URL set to a kda-indexer instance. Source:
-kadena.js commit `35b4c805`, run with `next dev`. The instance runs on the validation host
+kadena.js commit `35b4c805`, run as a development build (`next dev`; the small N badge in the
+corner is the framework's development indicator). The instance runs on the validation host
 (mainnet, build 0b5cb03) and was reached through a loopback tunnel, at most 5 requests/s.
 Captured 2026-11-17. The images are unedited. kadscan's front end is not public, so it was not
 run.

@@ -2,11 +2,9 @@
 
 kda-indexer stores the mainnet history in about a tenth of chainweb-data's disk, answers most
 REST routes several times faster, and matches the node where chainweb-data does not. It is
-slower on some GraphQL queries and on the slowest `/txs/search` requests. The worst regression
-is GraphQL account transactions and transfers: the median adds about
-<!--m:lat-gql-txs-by-account-p50-->+2.5 s (about 32× slower, +3,100%)<!--/m--> for transactions and
-<!--m:lat-gql-transfers-by-account-p50-->+2.5 s (about 55× slower, +5,400%)<!--/m--> for transfers, on a small
-sample against a GraphQL indexer that serves a smaller database (see the GraphQL section). Every
+slower on the slowest `/txs/search` requests. On GraphQL, the account Transactions and Transfers
+tabs of an explorer take about 2.5 s on kda-indexer today, and a fix is in progress; the stock
+GraphQL indexer's times are not measured yet. See [explorer.md](explorer.md#speed). Every
 slower row is listed below with what is known about the reason.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
@@ -23,8 +21,7 @@ benchmark will replace them.
 | `/txs/account` slowest 1% (interim) | <!--m:lat-rest-account-p99-->492 ms<!--/m--> | <!--m:lat-rest-account-p99-->46,956 ms<!--/m--> chainweb-data | ▲ <!--m:lat-rest-account-p99-->−46 s (about 95× faster, −99%)<!--/m--> |
 | Unexplained differences at the end of gate CG-5 (interim) | <!--m:corr-unexplained-cg5-->0 records<!--/m--> (last record accepted on node evidence) | – | – |
 | `/txs/search` slowest 1% (interim) | <!--m:lat-rest-search-p99-->2,540 ms<!--/m--> | <!--m:lat-rest-search-p99-->709 ms<!--/m--> chainweb-data | ▼ <!--m:lat-rest-search-p99-->+1.8 s (about 3.6× slower, +260%)<!--/m-->, <!--m:lat-rest-search-p99-->user-visible<!--/m--> |
-| GraphQL transactions of an account, median (interim, 7 samples) | <!--m:lat-gql-txs-by-account-p50-->2,540 ms<!--/m--> | <!--m:lat-gql-txs-by-account-p50-->79 ms<!--/m--> GraphQL indexer | ▼ <!--m:lat-gql-txs-by-account-p50-->+2.5 s (about 32× slower, +3,100%)<!--/m-->, <!--m:lat-gql-txs-by-account-p50-->user-visible<!--/m-->; not like-for-like |
-| GraphQL transfers of an account, median (interim, 7 samples) | <!--m:lat-gql-transfers-by-account-p50-->2,540 ms<!--/m--> | <!--m:lat-gql-transfers-by-account-p50-->46 ms<!--/m--> GraphQL indexer | ▼ <!--m:lat-gql-transfers-by-account-p50-->+2.5 s (about 55× slower, +5,400%)<!--/m-->, <!--m:lat-gql-transfers-by-account-p50-->user-visible<!--/m-->; not like-for-like |
+| GraphQL response times (interim) | measured with at least 100 samples per operation: [explorer.md](explorer.md#speed) | stock side pending | – |
 
 > **How to read these numbers**
 >
@@ -37,8 +34,7 @@ benchmark will replace them.
 >   that, we assume, already spends about 200 ms crossing the internet.
 > - **Added time** classes a slower response against an assumed client round trip of about
 >   200 ms: *negligible* under 20 ms added; *noticeable* 20–200 ms added; *user-visible* over
->   200 ms added, or a slowest-1% (p99) time over 1.5 s. GraphQL p99 rows are not classed
->   (shown as "—"): their samples are too small.
+>   200 ms added, or a slowest-1% (p99) time over 1.5 s.
 > - **p50** is the median request; **p99** is the slowest 1%.
 > - Values marked "about" come from latency histograms whose bucket edges are about ±20%
 >   apart; their factors and times are rounded to two significant digits.
@@ -141,85 +137,16 @@ All values in these tables are interim.
 
 kda-indexer serves Kadena's GraphQL schema; the baseline is the existing GraphQL indexer.
 
-![GraphQL response time by query class, p50 and p99, log scale: kda-indexer against the GraphQL indexer](img/latency-graphql.svg)
+The earlier GraphQL rows here rested on 7 to 11 samples per query class, too few to decide
+anything on, and have been removed. kda-indexer's own times, with at least 100 samples per
+operation, are in the table in [explorer.md](explorer.md#speed). The stock GraphQL indexer's side
+is pending, so there is no comparison to show yet.
 
-> **This section is being re-measured.** The GraphQL latency rows are interim: they are being
-> re-measured with at least 100 samples per query against the stock GraphQL indexer. Today each
-> query class has 7 to 11 samples, so a p99 of that few samples is about the maximum; p99 rows
-> are therefore not classed and show "—" for the class.
->
-> The stock GraphQL indexer instances we compared against stopped ingesting in June 2026 at
-> height about 6.95M (a gap above their own backfill limit), so they serve a database about
-> five months smaller than ours. Their times are not like-for-like with kda-indexer's.
-
-All values in these tables are interim.
-
-### Faster or about the same
-
-| Query class | kda-indexer | Baseline | Change |
-|---|---:|---:|---|
-| transaction by request key, p50 | <!--m:lat-gql-tx-by-key-p50-->22 ms<!--/m--> | <!--m:lat-gql-tx-by-key-p50-->55 ms<!--/m--> | ▲ <!--m:lat-gql-tx-by-key-p50-->−33 ms (about 2.5× faster, −60%)<!--/m--> |
-| transaction by request key, p99 | <!--m:lat-gql-tx-by-key-p99-->66 ms<!--/m--> | <!--m:lat-gql-tx-by-key-p99-->95 ms<!--/m--> | ▲ <!--m:lat-gql-tx-by-key-p99-->−29 ms (about 1.4× faster, −31%)<!--/m--> |
-| transactions of a block, p50 | <!--m:lat-gql-txs-by-block-p50-->11 ms<!--/m--> | <!--m:lat-gql-txs-by-block-p50-->11 ms<!--/m--> | = <!--m:lat-gql-txs-by-block-p50-->about the same<!--/m--> |
-| blocks from a height, p50 | <!--m:lat-gql-blocks-from-height-p50-->1 ms<!--/m--> | <!--m:lat-gql-blocks-from-height-p50-->18 ms<!--/m--> | ▲ <!--m:lat-gql-blocks-from-height-p50-->−17 ms (about 18× faster, −94%)<!--/m--> |
-| blocks from a height, p99 | <!--m:lat-gql-blocks-from-height-p99-->4 ms<!--/m--> | <!--m:lat-gql-blocks-from-height-p99-->22 ms<!--/m--> | ▲ <!--m:lat-gql-blocks-from-height-p99-->−18 ms (about 5.5× faster, −82%)<!--/m--> |
-| events by name, p50 | <!--m:lat-gql-events-p50-->5 ms<!--/m--> | <!--m:lat-gql-events-p50-->11 ms<!--/m--> | ▲ <!--m:lat-gql-events-p50-->−6 ms (about 2.2× faster, −55%)<!--/m--> |
-| events by name, p99 | <!--m:lat-gql-events-p99-->66 ms<!--/m--> | <!--m:lat-gql-events-p99-->95 ms<!--/m--> | ▲ <!--m:lat-gql-events-p99-->−29 ms (about 1.4× faster, −31%)<!--/m--> |
-| fungible account, p50 | <!--m:lat-gql-fungible-account-p50-->2 ms<!--/m--> | <!--m:lat-gql-fungible-account-p50-->95 ms<!--/m--> | ▲ <!--m:lat-gql-fungible-account-p50-->−93 ms (about 48× faster, −98%)<!--/m--> |
-| fungible account, p99 | <!--m:lat-gql-fungible-account-p99-->7 ms<!--/m--> | <!--m:lat-gql-fungible-account-p99-->137 ms<!--/m--> | ▲ <!--m:lat-gql-fungible-account-p99-->−130 ms (about 20× faster, −95%)<!--/m--> |
-| fungible account per chain, p50 | <!--m:lat-gql-fungible-chain-accounts-p50-->2 ms<!--/m--> | <!--m:lat-gql-fungible-chain-accounts-p50-->13 ms<!--/m--> | ▲ <!--m:lat-gql-fungible-chain-accounts-p50-->−11 ms (about 6.5× faster, −85%)<!--/m--> |
-| fungible account per chain, p99 | <!--m:lat-gql-fungible-chain-accounts-p99-->6 ms<!--/m--> | <!--m:lat-gql-fungible-chain-accounts-p99-->15 ms<!--/m--> | ▲ <!--m:lat-gql-fungible-chain-accounts-p99-->−9 ms (about 2.5× faster, −60%)<!--/m--> |
-
-### Slower
-
-| Query class | kda-indexer | Baseline | Change | Added time |
-|---|---:|---:|---|---|
-| block by hash, p50 | <!--m:lat-gql-block-p50-->27 ms<!--/m--> | <!--m:lat-gql-block-p50-->15 ms<!--/m--> | ▼ <!--m:lat-gql-block-p50-->+12 ms (about 1.8× slower, +80%)<!--/m--> | <!--m:lat-gql-block-p50-->negligible<!--/m--> |
-| block by hash, p99 | <!--m:lat-gql-block-p99-->114 ms<!--/m--> | <!--m:lat-gql-block-p99-->22 ms<!--/m--> | ▼ <!--m:lat-gql-block-p99-->+92 ms (about 5.2× slower, +420%)<!--/m--> | — |
-| transactions of a block, p99 | <!--m:lat-gql-txs-by-block-p99-->55 ms<!--/m--> | <!--m:lat-gql-txs-by-block-p99-->46 ms<!--/m--> | ▼ <!--m:lat-gql-txs-by-block-p99-->+9 ms (about 1.2× slower, +20%)<!--/m--> | — |
-| transfers by request key, p50 | <!--m:lat-gql-transfers-by-key-p50-->22 ms<!--/m--> | <!--m:lat-gql-transfers-by-key-p50-->18 ms<!--/m--> | ▼ <!--m:lat-gql-transfers-by-key-p50-->+4 ms (about 1.2× slower, +22%)<!--/m--> | <!--m:lat-gql-transfers-by-key-p50-->negligible<!--/m--> |
-| transfers by request key, p99 | <!--m:lat-gql-transfers-by-key-p99-->342 ms<!--/m--> | <!--m:lat-gql-transfers-by-key-p99-->55 ms<!--/m--> | ▼ <!--m:lat-gql-transfers-by-key-p99-->+290 ms (about 6.2× slower, +520%)<!--/m--> | — |
-| node by id, p50 | <!--m:lat-gql-node-p50-->15 ms<!--/m--> | <!--m:lat-gql-node-p50-->7 ms<!--/m--> | ▼ <!--m:lat-gql-node-p50-->+8 ms (about 2.1× slower, +110%)<!--/m--> | <!--m:lat-gql-node-p50-->negligible<!--/m--> |
-| node by id, p99 | <!--m:lat-gql-node-p99-->55 ms<!--/m--> | <!--m:lat-gql-node-p99-->11 ms<!--/m--> | ▼ <!--m:lat-gql-node-p99-->+44 ms (about 5× slower, +400%)<!--/m--> | — |
-| transactions of an account, p50 | <!--m:lat-gql-txs-by-account-p50-->2,540 ms<!--/m--> | <!--m:lat-gql-txs-by-account-p50-->79 ms<!--/m--> | ▼ <!--m:lat-gql-txs-by-account-p50-->+2.5 s (about 32× slower, +3,100%)<!--/m--> | <!--m:lat-gql-txs-by-account-p50-->user-visible<!--/m--> |
-| transactions of an account, p99 | <!--m:lat-gql-txs-by-account-p99-->3,048 ms<!--/m--> | <!--m:lat-gql-txs-by-account-p99-->32,609 ms<!--/m--> | ▲ <!--m:lat-gql-txs-by-account-p99-->−30 s (about 11× faster, −91%)<!--/m--> | — |
-| transfers of an account, p50 | <!--m:lat-gql-transfers-by-account-p50-->2,540 ms<!--/m--> | <!--m:lat-gql-transfers-by-account-p50-->46 ms<!--/m--> | ▼ <!--m:lat-gql-transfers-by-account-p50-->+2.5 s (about 55× slower, +5,400%)<!--/m--> | <!--m:lat-gql-transfers-by-account-p50-->user-visible<!--/m--> |
-| transfers of an account, p99 | <!--m:lat-gql-transfers-by-account-p99-->3,048 ms<!--/m--> | <!--m:lat-gql-transfers-by-account-p99-->2,116 ms<!--/m--> | ▼ <!--m:lat-gql-transfers-by-account-p99-->+930 ms (about 1.4× slower, +44%)<!--/m--> | — |
-
-- **Block by hash, transfers by request key, node by id, transactions of a block:** the added
-  median time is negligible. At p99 a block by hash adds <!--m:lat-gql-block-p99-->+92 ms (about 5.2× slower, +420%)<!--/m-->, a
-  node by id <!--m:lat-gql-node-p99-->+44 ms (about 5× slower, +400%)<!--/m--> and transfers by request key
-  <!--m:lat-gql-transfers-by-key-p99-->+290 ms (about 6.2× slower, +520%)<!--/m-->. These p99 rows are not classed: with 7 to 11
-  queries per class the p99 is about the maximum, so one slow query sets it. The cause has not
-  been analysed yet.
-- **Transactions and transfers of an account (known limitation):** for a few very heavy
-  accounts the history walk runs close to the request deadline; p99 is about 3 s on both
-  (transactions <!--m:lat-gql-txs-by-account-p99-->3,048 ms<!--/m-->, transfers <!--m:lat-gql-transfers-by-account-p99-->3,048 ms<!--/m-->).
-  Measured cause for account transactions: kda-indexer walks the account's posting list and
-  decodes every posting to apply the query's sender filter (`transactions(accountName)`
-  returns only the transactions the account sent). No cause has been established yet for
-  transfers. For transactions the baseline's slowest 1% is
-  <!--m:lat-gql-txs-by-account-p99-->32,609 ms<!--/m-->, so kda-indexer's p99 there is
-  <!--m:lat-gql-txs-by-account-p99-->−30 s (about 11× faster, −91%)<!--/m-->; that baseline value is the top histogram bucket,
-  so it marks the limit of what the histogram can show. For transfers the baseline's p99 is lower than
-  kda-indexer's.
-
-### How the GraphQL times were measured
-
-- **How measured:** the same 24-hour window as the REST times. The harness records the latency
-  of each GraphQL query class on both sides. kda-indexer runs on the validation host; the
-  GraphQL indexer is a production copy reached over a private network, read at a paced rate
-  and pinned to a fixed height. kda-indexer build 0b5cb03.
-- **Caveats:**
-  - Each query class has 7 to 11 compared queries. That is too few to decide anything on; a
-    decision needs at least 100 per query class. The GraphQL rows are being re-measured with at
-    least 100 samples per query; treat them as indicative until that replaces them.
-  - The stock GraphQL indexer instances stopped ingesting in June 2026 at height about 6.95M,
-    so they serve a database about five months smaller than kda-indexer's. Their times are not
-    like-for-like with ours.
-  - The baseline's numbers include the network distance to it; kda-indexer's do not. This
-    favours kda-indexer; the size of that effect was not measured.
-  - Values are histogram bucket upper edges (about ±20%).
+> **The stock GraphQL indexer is out of date.** The instances we compared against stopped
+> ingesting in June 2026 at height about 6.95M (a gap above their own backfill limit), so they
+> serve a database about five months smaller than kda-indexer's. They are being brought to the
+> chain tip. Their times are not like-for-like with kda-indexer's until that is done, and the
+> comparison will be measured with the same operations and variables afterwards.
 
 ## Correctness
 
