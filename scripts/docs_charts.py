@@ -11,6 +11,7 @@ Usage: python3 scripts/docs_charts.py [data.json] [out_dir]
 import json
 import math
 import os
+import re
 import sys
 from xml.sax.saxutils import escape
 
@@ -66,9 +67,40 @@ def fmt_num(v):
 
 
 def fmt_factor(f):
-    if f >= 100:
+    """12.94 -> '12.9'; 99.96 -> '100'; 1234.6 -> '1,235'."""
+    if round(f, 1) >= 100:
         return "{:,}".format(int(round(f)))
     return "{:.1f}".format(f)
+
+
+def sig2(x):
+    """Round to two significant digits."""
+    return float("{:.2g}".format(x))
+
+
+def fmt_factor_approx(f):
+    """Factor to two significant digits: 18.66 -> '19'; 3.58 -> '3.6'; 3130 -> '3,100'."""
+    r = sig2(f)
+    if r >= 10 or r.is_integer():
+        return "{:,}".format(int(round(r)))
+    return "{:.1f}".format(r)
+
+
+def fmt_pct(p, approx):
+    """Whole percent of |p|; two significant digits when approx; never 100 below 100."""
+    p = abs(p)
+    shown = sig2(p) if approx else p
+    if p < 100 and round(shown) >= 100:
+        return "99"
+    return "{:,.0f}".format(shown)
+
+
+APPROX = re.compile(r"bucket\s+(?:upper\s+)?edges?", re.I)
+
+
+def is_approx(metric):
+    """True when the data are histogram bucket edges (the note or source says so)."""
+    return bool(APPROX.search("{} {}".format(metric.get("note") or "", metric.get("source") or "")))
 
 
 def _words(unit):
@@ -87,6 +119,11 @@ def change(metric):
 
     Returns {"factor", "pct", "direction", "text"}. direction is "better",
     "worse", "same" (|pct| < 2) or "none" (a side is not measured).
+
+    text carries the factor and the percent, e.g. "11.2× smaller (−91%)" or
+    "1.5× larger (+46%)"; below a factor of 1.1 just the percent, e.g.
+    "5% smaller". Latency taken from histogram bucket edges is rounded to two
+    significant digits and prefixed "about".
     """
     ours, base = metric.get("ours"), metric.get("baseline")
     if ours is None or base is None:
@@ -96,7 +133,7 @@ def change(metric):
             return {"factor": 1.0, "pct": 0.0, "direction": "same", "text": "same"}
         return {"factor": None, "pct": None, "direction": "worse" if metric["better"] != "higher" else "better",
                 "text": "{} vs none".format(fmt_num(ours))}
-    pct = (ours - base) / base * 100.0
+    pct = (ours - base) * 100.0 / base
     lo, hi = min(ours, base), max(ours, base)
     factor = hi / lo if lo > 0 else None
     smaller_word, larger_word = _words(metric.get("unit", ""))
@@ -112,13 +149,23 @@ def change(metric):
     else:  # equal: any real difference counts against us
         direction = "worse"
 
+    approx = is_approx(metric)
+    about = "about " if approx else ""
+    shown_pct = fmt_pct(pct, approx)
     if direction == "same":
         text = "about the same" if ours == base else "about the same ({:.1f}% {})".format(abs(pct), word)
     elif factor is not None and factor >= 1.1:
-        text = "{}× {}".format(fmt_factor(factor), word)
+        text = "{}{}× {} ({}{}%)".format(
+            about, fmt_factor_approx(factor) if approx else fmt_factor(factor), word,
+            "−" if ours < base else "+", shown_pct)
     else:
-        text = "{:.0f}% {}".format(abs(pct), word)
+        text = "{}{}% {}".format(about, shown_pct, word)
     return {"factor": factor, "pct": pct, "direction": direction, "text": text}
+
+
+def published(metric):
+    """Metrics are published unless the data say "publish": false."""
+    return metric.get("publish", True) is not False
 
 
 def _scale(chart, values):
@@ -177,7 +224,7 @@ def _tick_label(t):
 
 def render(chart, metrics):
     """Return the SVG text for one chart."""
-    rows = [metrics[mid] for mid in chart["metrics"]]
+    rows = [metrics[mid] for mid in chart["metrics"] if published(metrics[mid])]
     values = []
     for m in rows:
         values += [m.get("ours"), m.get("baseline")]
@@ -282,6 +329,9 @@ def main(data_path, out_dir):
         missing = [mid for mid in chart["metrics"] if mid not in metrics]
         if missing:
             raise SystemExit("chart {}: unknown metrics {}".format(chart["id"], missing))
+        units = sorted({metrics[mid]["unit"] for mid in chart["metrics"] if published(metrics[mid])})
+        if len(units) > 1:
+            raise SystemExit("chart {}: mixes units {}; one unit per chart".format(chart["id"], units))
         path = os.path.join(out_dir, chart["file"])
         svg = render(chart, metrics)
         with open(path, "w", encoding="utf-8", newline="\n") as f:

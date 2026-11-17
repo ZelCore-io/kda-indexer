@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="241" viewBox="0 0 880 241" role="img" aria-labelledby="disk-t disk-d">
 <title id="disk-t">Disk used, full mainnet</title>
-<desc id="disk-d">Total vs chainweb-data: kda-indexer 140.2 GB, chainweb-data 1,568.6 GB, 11.2× smaller; Total vs GraphQL indexer (per copy): kda-indexer 140.2 GB, GraphQL indexer 1,870 GB, 13.3× smaller; Total vs node database (context): kda-indexer 140.2 GB, node 999.7 GB, 7.1× smaller.</desc>
+<desc id="disk-d">Total vs chainweb-data: kda-indexer 140.2 GB, chainweb-data 1,568.6 GB, 11.2× smaller (−91%); Total vs GraphQL indexer (per copy): kda-indexer 140.2 GB, GraphQL indexer 1,870 GB, 13.3× smaller (−93%); Total vs node database (context): kda-indexer 140.2 GB, node 999.7 GB, 7.1× smaller (−86%).</desc>
 <style>
 svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
 .bg{fill:#ffffff}
@@ -52,7 +52,7 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans
 <rect class="ours better" x="260" y="84" width="26.6" height="12" rx="2"/>
 <text class="val" x="292.6" y="94">140.2 GB
  <tspan class="up">▲</tspan>
- 11.2× smaller
+ 11.2× smaller (−91%)
 </text>
 <rect class="base" x="260" y="99" width="298.0" height="12" rx="2"/>
 <text class="muted" x="564.0" y="109">1,568.6 GB · chainweb-data</text>
@@ -62,7 +62,7 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans
 <rect class="ours better" x="260" y="125" width="26.6" height="12" rx="2"/>
 <text class="val" x="292.6" y="135">140.2 GB
  <tspan class="up">▲</tspan>
- 13.3× smaller
+ 13.3× smaller (−93%)
 </text>
 <rect class="base" x="260" y="140" width="355.3" height="12" rx="2"/>
 <text class="muted" x="621.3" y="150">1,870 GB · GraphQL indexer</text>
@@ -72,7 +72,7 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans
 <rect class="ours better" x="260" y="166" width="26.6" height="12" rx="2"/>
 <text class="val" x="292.6" y="176">140.2 GB
  <tspan class="up">▲</tspan>
- 7.1× smaller
+ 7.1× smaller (−86%)
 </text>
 <rect class="base" x="260" y="181" width="189.9" height="12" rx="2"/>
 <text class="muted" x="455.9" y="191">999.7 GB · node</text>

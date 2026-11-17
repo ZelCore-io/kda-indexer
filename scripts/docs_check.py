@@ -7,10 +7,15 @@ Checks
   links      every relative Markdown link, image and <img src>/<a href> in
              README.md and docs/**/*.md resolves to a file in the repo, with
              the exact case GitHub will use.
+  data       docs/data/benchmarks.json has every required field with the
+             right type, unique ids, charts that name real metrics and use
+             one unit each.
   numbers    every value tagged in a page as <!--m:ID-->value<!--/m--> matches
-             docs/data/benchmarks.json: the metric's change text, or a number
-             equal (at the precision shown) to ours, baseline, the change
-             factor or the change percent.
+             docs/data/benchmarks.json. A tag holding a x or a % must equal
+             the metric's full change text (factor, direction word and
+             percent). Any other tag is a raw value: a number equal, at the
+             precision shown, to ours or baseline, optionally followed by the
+             metric's unit. Metrics with "publish": false must not be tagged.
   forbidden  README.md and docs/** hold no private infrastructure strings or
              email addresses. docs/specs, docs/plans and docs/internal are
              skipped by every check.
@@ -44,9 +49,12 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-
 
 FENCE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
 INLINE_CODE = re.compile(r"`[^`\n]*`")
-MD_LINK = re.compile(r"!?\[(?:[^\[\]]|\[[^\]]*\])*\]\(\s*<?([^)\s>]+)>?(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
-REF_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)", re.M)
-HTML_REF = re.compile(r"<(?:img|a|source)\b[^>]*?\b(?:src|href|srcset)\s*=\s*\"([^\"]+)\"", re.I)
+# Each pattern puts the target in one of its groups; _target_group picks the one that matched.
+MD_LINK = re.compile(r"!?\[(?:[^\[\]]|\[[^\]]*\])*\]\(\s*(?:<([^>\n]*)>|([^)\s]+))"
+                     r"(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
+REF_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(?:<([^>\n]*)>|(\S+))", re.M)
+HTML_REF = re.compile(r"<(?:img|a|source)\b[^>]*?\b(?:src|href|srcset)\s*=\s*"
+                      r"(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'>]+))", re.I)
 TAG = re.compile(r"<!--m:([A-Za-z0-9_.-]+)-->(.*?)<!--/m-->", re.S)
 NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?|-?\.\d+")
 
@@ -102,7 +110,8 @@ def check_links(root, path, text, errors):
     targets = []
     for rx in (MD_LINK, REF_DEF, HTML_REF):
         for m in rx.finditer(body):
-            targets.append((m.start(1), m.group(1)))
+            g = next(i for i in range(1, (rx.groups or 0) + 1) if m.group(i) is not None)
+            targets.append((m.start(g), m.group(g)))
     base = os.path.dirname(path)
     for pos, target in sorted(targets):
         t = target.strip()
@@ -132,26 +141,133 @@ def _matches(shown, value):
     return abs(round(abs(value), decimals) - abs(float(s))) < 10 ** -(decimals + 6)
 
 
+RAW = re.compile(r"^(-?\d[\d,]*(?:\.\d+)?|-?\.\d+)\s*(.*)$", re.S)
+
+
 def check_numbers(root, path, text, metrics, errors):
     for m in TAG.finditer(text):
-        mid, shown = m.group(1), m.group(2).strip()
+        mid = m.group(1)
+        shown = " ".join(m.group(2).split())
         where = "{}:{}".format(_rel(root, path), _line(text, m.start()))
         metric = metrics.get(mid)
         if metric is None:
             errors.append("{}: numbers: unknown metric id {!r}".format(where, mid))
             continue
+        if not docs_charts.published(metric):
+            errors.append("{}: numbers: metric {!r} is not published (\"publish\": false)".format(where, mid))
+            continue
         c = docs_charts.change(metric)
         if shown == c["text"] or (shown == "not measured" and c["direction"] == "none"):
             continue
-        if c["text"] and c["text"] in shown:
+        if "\u00d7" in shown or "%" in shown:
+            errors.append("{}: numbers: {!r} for {} is not the change text {!r}".format(
+                where, shown, mid, c["text"]))
             continue
-        num = NUMBER.search(shown)
-        candidates = [metric.get("ours"), metric.get("baseline"), c["factor"],
-                      None if c["pct"] is None else abs(c["pct"])]
-        if num and any(_matches(num.group(0), v) for v in candidates):
+        raw = RAW.match(shown)
+        if not raw:
+            errors.append("{}: numbers: {!r} for {} is neither a raw value nor the change text {!r}".format(
+                where, shown, mid, c["text"]))
             continue
-        errors.append("{}: numbers: {!r} for {} matches none of ours={}, baseline={}, change={!r}".format(
-            where, shown, mid, metric.get("ours"), metric.get("baseline"), c["text"]))
+        number, unit = raw.group(1), raw.group(2).strip()
+        if unit and unit != metric.get("unit"):
+            errors.append("{}: numbers: {!r} for {} has unit {!r}, the data say {!r}".format(
+                where, shown, mid, unit, metric.get("unit")))
+            continue
+        if not any(_matches(number, v) for v in (metric.get("ours"), metric.get("baseline"))):
+            errors.append("{}: numbers: {!r} for {} matches neither ours={} nor baseline={}".format(
+                where, shown, mid, metric.get("ours"), metric.get("baseline")))
+
+
+GROUPS = {"disk", "latency", "correctness", "sync", "resources", "graphql"}
+BASELINES = {"chainweb-data", "GraphQL indexer", "node", "/v1/txs service"}
+BETTER = {"lower", "higher", "equal"}
+SCALES = {"auto", "linear", "log"}
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def validate_data(data):
+    """Return a list of problems in a parsed benchmarks.json (empty = valid)."""
+    errs = []
+    if not isinstance(data, dict):
+        return ["top level must be an object"]
+    metrics, charts = data.get("metrics"), data.get("charts")
+    if not isinstance(metrics, list):
+        errs.append("metrics must be a list")
+        metrics = []
+    if not isinstance(charts, list):
+        errs.append("charts must be a list")
+        charts = []
+    by_id = {}
+    for i, m in enumerate(metrics):
+        if not isinstance(m, dict):
+            errs.append("metrics[{}] must be an object".format(i))
+            continue
+        mid = m.get("id")
+        tag = "metric {!r}".format(mid) if isinstance(mid, str) and mid else "metrics[{}]".format(i)
+
+        def need(key, kind, ok=None, _m=m, _tag=tag):
+            if key not in _m:
+                errs.append("{}: missing {}".format(_tag, key))
+                return False
+            if not kind(_m[key]):
+                errs.append("{}: {} has the wrong type or value ({!r})".format(_tag, key, _m[key]))
+                return False
+            return True
+
+        text = lambda v: isinstance(v, str) and v.strip() != ""  # noqa: E731
+        need("id", text)
+        if isinstance(mid, str):
+            if mid in by_id:
+                errs.append("{}: duplicate id".format(tag))
+            by_id[mid] = m
+        if need("group", lambda v: v in GROUPS) is False:
+            pass
+        need("label", text)
+        need("unit", text)
+        for side in ("ours", "baseline"):
+            need(side, lambda v: v is None or _is_number(v))
+        need("baseline_name", lambda v: v in BASELINES)
+        need("better", lambda v: v in BETTER)
+        need("interim", lambda v: isinstance(v, bool))
+        need("source", text)
+        need("date", lambda v: isinstance(v, str) and bool(DATE.match(v)))
+        if "note" in m and not isinstance(m["note"], str):
+            errs.append("{}: note must be a string".format(tag))
+        if "publish" in m and not isinstance(m["publish"], bool):
+            errs.append("{}: publish must be a boolean".format(tag))
+    seen = set()
+    for i, c in enumerate(charts):
+        if not isinstance(c, dict):
+            errs.append("charts[{}] must be an object".format(i))
+            continue
+        cid = c.get("id")
+        tag = "chart {!r}".format(cid) if isinstance(cid, str) and cid else "charts[{}]".format(i)
+        for key in ("id", "file", "title"):
+            if not isinstance(c.get(key), str) or not c.get(key).strip():
+                errs.append("{}: missing or invalid {}".format(tag, key))
+        if isinstance(c.get("file"), str) and not c["file"].endswith(".svg"):
+            errs.append("{}: file must end in .svg".format(tag))
+        if cid in seen:
+            errs.append("{}: duplicate id".format(tag))
+        seen.add(cid)
+        if c.get("scale") not in SCALES:
+            errs.append("{}: scale must be one of auto, linear, log".format(tag))
+        ids = c.get("metrics")
+        if not isinstance(ids, list) or not ids or not all(isinstance(x, str) for x in ids):
+            errs.append("{}: metrics must be a non-empty list of ids".format(tag))
+            continue
+        unknown = [x for x in ids if x not in by_id]
+        if unknown:
+            errs.append("{}: unknown metrics {}".format(tag, unknown))
+        units = sorted({by_id[x].get("unit") for x in ids
+                        if x in by_id and docs_charts.published(by_id[x]) and isinstance(by_id[x].get("unit"), str)})
+        if len(units) > 1:
+            errs.append("{}: mixes units {}; one unit per chart".format(tag, units))
+    return errs
 
 
 def check_forbidden(root, path, text, errors):
@@ -168,12 +284,20 @@ def main(root):
     errors = []
     data_path = os.path.join(root, "docs", "data", "benchmarks.json")
     metrics = {}
-    if os.path.isfile(data_path):
+    rel_data = "docs/data/benchmarks.json"
+    if not os.path.isfile(data_path):
+        errors.append("{}: data: file is missing".format(rel_data))
+    else:
         try:
             with open(data_path, encoding="utf-8") as f:
-                metrics = {m["id"]: m for m in json.load(f)["metrics"]}
-        except (ValueError, KeyError) as e:
-            errors.append("docs/data/benchmarks.json: numbers: unreadable ({})".format(e))
+                data = json.load(f)
+        except ValueError as e:
+            errors.append("{}: data: not valid JSON ({})".format(rel_data, e))
+        else:
+            problems = validate_data(data)
+            errors.extend("{}: data: {}".format(rel_data, p) for p in problems)
+            if not problems:
+                metrics = {m["id"]: m for m in data["metrics"]}
     for path in scope_files(root):
         try:
             with open(path, encoding="utf-8") as f:
