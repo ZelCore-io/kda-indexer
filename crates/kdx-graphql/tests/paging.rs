@@ -170,6 +170,17 @@ struct Fx {
 /// them), the rest applied to the hot store by the tail writer; Alice holds coin on both
 /// chains and NFTs on chain 0, so her account nodes resolve.
 fn fixture() -> Fx {
+    fixture_with(GraphqlSettings::default())
+}
+
+/// [`fixture`] with the GraphQL settings of the test.
+fn fixture_with(gs: GraphqlSettings) -> Fx {
+    fixture_big(gs, 0)
+}
+
+/// [`fixture_with`] plus `extra` hot blocks on chain 0 above the fixture's tip, one
+/// `Shape::One` tx of Alice's each.
+fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
     let d = tempfile::tempdir().unwrap();
     let g = kdx_hot::Geometry {
         max_gb: 1,
@@ -215,6 +226,10 @@ fn fixture() -> Fx {
         let ib = index(c, h, shapes, &mut dict);
         kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
     }
+    for h in 13..13 + extra {
+        let ib = index(0, h, &[Shape::One], &mut dict);
+        kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+    }
     let alice = dict.intern(DictKind::Account, ALICE);
     let coin = dict.intern(DictKind::Module, "coin");
     let ledger = dict.intern(
@@ -254,7 +269,7 @@ fn fixture() -> Fx {
     let st = Api::new(store, settings, TipWatch::default()).state();
     Fx {
         _dir: d,
-        schema: build_schema(st, GraphqlSettings::default(), None),
+        schema: build_schema(st, gs, None),
         rks,
     }
 }
@@ -893,4 +908,118 @@ async fn crafted_well_formed_cursors_answer_at_most_a_page() {
         answered > 0 && reorged > 0,
         "{answered} answered, {reorged} reorged"
     );
+}
+
+/// The count budget (`count_budget`): a `totalCount` walk that runs out of it answers the
+/// rows counted so far, flagged in the response `extensions`; one that finishes in time is
+/// exact and unflagged.
+mod count_budget {
+    use super::*;
+
+    const QUERIES: [&str; 2] = [
+        "{ transfers(accountName: \"k:alice\", first: 1) { totalCount } }",
+        "{ transactions(accountName: \"k:alice\", first: 1) { totalCount } }",
+    ];
+
+    async fn total(s: &KdxSchema, q: &str) -> (i64, bool) {
+        let r = s.execute(q).await;
+        assert!(r.errors.is_empty(), "{q}: {:?}", r.errors);
+        let d = serde_json::to_value(&r.data).unwrap();
+        let n = d.as_object().unwrap().values().next().unwrap()["totalCount"]
+            .as_i64()
+            .unwrap();
+        (n, r.extensions.contains_key("totalCountLowerBound"))
+    }
+
+    /// An account with a few postings is counted exactly under the default budget, with no flag.
+    #[tokio::test]
+    async fn a_small_account_is_counted_exactly_and_unflagged() {
+        let fx = fixture();
+        for q in QUERIES {
+            let (n, flagged) = total(&fx.schema, q).await;
+            assert!(n > 1, "{q}: the fixture account has several rows");
+            assert!(!flagged, "{q}");
+        }
+    }
+
+    /// A budget that is spent before the walk reads a key stops it at once: a flagged lower
+    /// bound that never exceeds the true count (the page itself is still served).
+    #[tokio::test]
+    async fn a_spent_budget_answers_a_flagged_lower_bound() {
+        let exact = fixture();
+        let cut = fixture_with(GraphqlSettings {
+            count_budget: Duration::ZERO,
+            ..GraphqlSettings::default()
+        });
+        for q in QUERIES {
+            let (full, _) = total(&exact.schema, q).await;
+            let (n, flagged) = total(&cut.schema, q).await;
+            assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
+            assert!(
+                (0..=full).contains(&n),
+                "{q}: {n} is a lower bound of {full}"
+            );
+            assert!(n < full, "{q}: nothing is counted past a spent budget");
+        }
+        let page = run(
+            &cut.schema,
+            "{ transfers(accountName: \"k:alice\", first: 2) { totalCount edges { cursor } } }",
+        )
+        .await;
+        assert_eq!(page["transfers"]["edges"].as_array().unwrap().len(), 2);
+    }
+
+    /// A block's or a request key's list is counted with its page, exactly, whatever the budget.
+    #[tokio::test]
+    async fn a_block_list_ignores_the_budget() {
+        let cut = fixture_with(GraphqlSettings {
+            count_budget: Duration::ZERO,
+            ..GraphqlSettings::default()
+        });
+        let q = format!(
+            "{{ transfers(blockHash: \"{}\", first: 1) {{ totalCount }} }}",
+            block_hash(0, 6)
+        );
+        let (n, flagged) = total(&cut.schema, &q).await;
+        assert!(n > 0 && !flagged);
+    }
+
+    /// Timing of the count walk on a long account, run by hand (`--ignored --nocapture`, best
+    /// in release): `KDX_COUNT_BENCH_TXS` extra txs (default 6000). Prints the time and answer
+    /// of `totalCount` with the budget off (a minute, so half the 5 s deadline decides: the
+    /// walk as it was) and with the default 200 ms budget and a 10 ms one (the fixture's hot records decode in
+    /// microseconds, far faster than cold segment records, so only a tight budget cuts it).
+    #[tokio::test]
+    #[ignore = "timing run"]
+    async fn timing_of_the_count_walk_on_a_long_account() {
+        let n: u32 = std::env::var("KDX_COUNT_BENCH_TXS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6000);
+        let default = GraphqlSettings::default();
+        for (label, budget) in [
+            ("before (half the deadline)", Duration::from_secs(60)),
+            ("after (200 ms budget)", default.count_budget),
+            ("after (10 ms budget)", Duration::from_millis(10)),
+        ] {
+            let fx = fixture_big(
+                GraphqlSettings {
+                    count_budget: budget,
+                    ..default.clone()
+                },
+                n,
+            );
+            for q in QUERIES {
+                for round in 0..3 {
+                    let t = std::time::Instant::now();
+                    let (rows, flagged) = total(&fx.schema, q).await;
+                    println!(
+                        "{label}: {} round {round}: {:>7.1} ms, totalCount {rows}, lower bound {flagged}",
+                        &q[2..14],
+                        t.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
+        }
+    }
 }

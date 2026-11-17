@@ -24,13 +24,15 @@
 //! - `first`/`after` walks newest first. `last`/`before` first collects the keys between the
 //!   cursor and the newest end (keys only, at most [`BACK_KEYS`]), then loads from the cursor
 //!   outward. Both check the request deadline every 64 keys.
-//! - `totalCount` (GQ-10) is a count walk of at most [`COUNT_CAP`] items within half of the
-//!   remaining deadline (`COUNT_TIMEOUT` past it), run only when the field is selected.
+//! - `totalCount` (GQ-10) is a count walk of at most [`COUNT_CAP`] items, run only when the
+//!   field is selected. It stops at the sooner of `count_budget` (200 ms by default, counted
+//!   from when the read starts) and half of the remaining deadline, and then answers the items
+//!   counted so far, a lower bound flagged in the response (`COUNT_TIMEOUT`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_graphql::Context;
 use kdx_api::compat::shapes::{self, Ev};
@@ -731,6 +733,12 @@ pub fn run_page(
     Ok((edges.into_iter().map(|(_, e)| e).collect(), info))
 }
 
+/// When a count walk that starts at `now` must stop: after `budget`, or at half of what is
+/// left of the request deadline `dl`, whichever is sooner.
+pub fn count_until(now: Instant, dl: Instant, budget: Duration) -> Instant {
+    now + budget.min(dl.saturating_duration_since(now) / 2)
+}
+
 /// Items of `spec`, up to [`COUNT_CAP`], and whether the count is exact: when `until`
 /// passes first, the items counted so far (a lower bound) and `false`.
 pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bool)> {
@@ -739,8 +747,11 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bo
     let mut blocks = Blocks::default();
     let decode = spec.rows.needs_record();
     let mut n = 0u64;
+    // A decoded record costs ~1 ms cold, so the clock is read before each one; a key-only
+    // walk reads it every `CHECK_EVERY` keys.
+    let every = if decode { 1 } else { CHECK_EVERY };
     for (i, kr) in keys(view, &src, spec.filter, &caps, Bounds::default())?.enumerate() {
-        if i % CHECK_EVERY == CHECK_EVERY - 1 && Instant::now() >= until {
+        if i % every == every - 1 && Instant::now() >= until {
             return Ok((n, false));
         }
         let (k, rec) = kr?;
@@ -990,6 +1001,7 @@ async fn list_as(
     // A block's or a request key's rows are few: counted with the page, exactly.
     let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk(_))
         && selects_direct(ctx, &["totalCount"]);
+    let count_budget = g.settings.count_budget;
     let sp = spec.clone();
     let (edges, info, exact) = read_list(&state, one_block, move |view| {
         let dl = dl.min(Instant::now() + SCAN_WINDOW);
@@ -1026,11 +1038,14 @@ async fn list_as(
         let state = state.clone();
         let spec = spec.clone();
         Box::pin(async move {
-            let now = Instant::now();
-            let until = now + dl.saturating_duration_since(now) / 2;
-            read_list(&state, one_block, move |view| count(view, &spec, until))
-                .await
-                .map_err(from_api)
+            // The budget runs from when the read gets its slot, not from the request: time
+            // queued behind other heavy reads is not spent counting.
+            read_list(&state, one_block, move |view| {
+                let until = count_until(Instant::now(), dl, count_budget);
+                count(view, &spec, until)
+            })
+            .await
+            .map_err(from_api)
         })
     }));
     Ok(ListPage { edges, info, total })
@@ -1361,6 +1376,18 @@ mod xchain_tests {
             |k| Ok(Some(k)),
         );
         assert_eq!(got.unwrap(), None);
+    }
+
+    /// The count walk stops at the sooner of its budget and half the deadline left.
+    #[test]
+    fn the_count_stops_at_the_sooner_of_budget_and_half_the_deadline() {
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        assert_eq!(count_until(now, now + ms(5000), ms(200)), now + ms(200));
+        assert_eq!(count_until(now, now + ms(300), ms(200)), now + ms(150));
+        assert_eq!(count_until(now, now + ms(5000), Duration::ZERO), now);
+        // A deadline already past: stop at once.
+        assert_eq!(count_until(now + ms(10), now, ms(200)), now + ms(10));
     }
 
     /// The request deadline stops the walk before a decode.

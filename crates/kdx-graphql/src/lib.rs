@@ -79,6 +79,9 @@ pub struct GraphqlSettings {
     pub network_host: String,
     /// Automatic persisted queries (not built; the config refuses `true`).
     pub apq: bool,
+    /// Longest a `totalCount` walk may run (a lower bound is answered past it). The walk also
+    /// stops at half of the remaining request deadline, whichever comes first.
+    pub count_budget: Duration,
 }
 
 /// Request body cap (plan GQ-9: body ≤ 128 KB).
@@ -121,6 +124,7 @@ impl Default for GraphqlSettings {
             network_id: "mainnet01".into(),
             network_host: String::new(),
             apq: false,
+            count_budget: Duration::from_millis(200),
         }
     }
 }
