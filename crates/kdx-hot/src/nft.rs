@@ -12,7 +12,7 @@
 //!   deploy a module named `ledger` and emit marmalade-shaped events for a real token id, so a
 //!   name suffix proves nothing. The ledger's ModuleId is part of the row key, so one ledger can
 //!   never overwrite another's row for the same token id. Only events whose first parameter is
-//!   a token id (`t:…`) count.
+//!   a non-empty string (the token id: `t:…` in v2, free-form in early v1) count.
 //! - A v2 `RECONCILE [token-id, amount, sender {account, previous, current}, receiver {…}]`
 //!   carries the balances after the change: both parties' `current` are upserted (source 1; the
 //!   empty account of a mint or burn is skipped). Any other ledger event of a module that
@@ -482,9 +482,12 @@ fn account_name_ok(s: &str) -> bool {
     !s.is_empty() && s.len() <= kdx_decode::build::MAX_ACCOUNT_LEN
 }
 
+/// The token id of a trusted ledger's event: any non-empty string up to [`MAX_TOKEN_LEN`].
+/// v2 ids are `t:…`, but early marmalade v1 tokens have free-form ids (`sgk-gen-0:386`); the
+/// ledger allowlist, not the id's shape, is what keeps spoofed events out.
 fn token_ok(v: Option<&Value>) -> Option<&str> {
     v.and_then(Value::as_str)
-        .filter(|t| t.starts_with("t:") && t.len() <= MAX_TOKEN_LEN)
+        .filter(|t| !t.is_empty() && t.len() <= MAX_TOKEN_LEN)
 }
 
 fn reconcile(ledger: u32, p: &[Value]) -> Option<NftEvent> {
@@ -993,6 +996,45 @@ mod tests {
         .unwrap();
         assert_eq!((m.height, m.ledger), (300, ledger));
         txn.commit().unwrap();
+    }
+
+    /// Early marmalade v1 tokens have free-form ids (FV day 1: `sgk-gen-0:386` on chain 8, held
+    /// per the node's `marmalade.ledger.get-balance`); a trusted ledger's event counts whatever
+    /// the id looks like. An empty or over-long id still does not.
+    #[test]
+    fn v1_token_ids_without_t_prefix_count() {
+        let mut d = MemDict::new();
+        d.intern(DictKind::Account, "k:alice");
+        d.intern(DictKind::Account, "k:bob");
+        let mint = ev(
+            &mut d,
+            "marmalade.ledger",
+            "MINT",
+            json!(["sgk-gen-0:386", "k:alice", 1]),
+        );
+        let empty = ev(
+            &mut d,
+            "marmalade.ledger",
+            "TRANSFER",
+            json!(["", "k:alice", "k:bob", 1]),
+        );
+        let long = ev(
+            &mut d,
+            "marmalade.ledger",
+            "TRANSFER",
+            json!(["x".repeat(MAX_TOKEN_LEN + 1), "k:alice", "k:bob", 1]),
+        );
+        let got = classify(&d, &[mint, empty, long]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        match &got[0] {
+            NftEvent::Touch {
+                token_id, accounts, ..
+            } => {
+                assert_eq!(token_id, "sgk-gen-0:386");
+                assert_eq!(accounts, &["k:alice".to_owned()]);
+            }
+            e => panic!("{e:?}"),
+        }
     }
 
     /// An event from a `*.ledger` module that is not on the allowlist changes nothing.
