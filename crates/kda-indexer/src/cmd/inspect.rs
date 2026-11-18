@@ -36,7 +36,7 @@ impl Store {
         let hs = HotStore::open_ro(&hot_dir(data_dir))?;
         let txn = hs.ro()?;
         let dict = Arc::new(HotDict::load(&txn)?.mem().clone());
-        let seg = Segments::open(&segments_dir(data_dir), dict.clone())?;
+        let seg = Segments::open_without_filters(&segments_dir(data_dir), dict.clone())?;
         Ok(Store {
             _hs: hs,
             txn,

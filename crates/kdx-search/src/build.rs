@@ -220,7 +220,7 @@ fn segments_dir(data_dir: &Path) -> PathBuf {
 }
 
 fn open_segments(data_dir: &Path) -> Result<Segments> {
-    Segments::open(&segments_dir(data_dir), Arc::new(MemDict::new()))
+    Segments::open_without_filters(&segments_dir(data_dir), Arc::new(MemDict::new()))
 }
 
 /// The S-1 projection: census, 1% body sample per range, trial index of the first

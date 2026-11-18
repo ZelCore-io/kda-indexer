@@ -66,14 +66,27 @@ pub struct RangeReader {
 
 impl RangeReader {
     pub fn open(dir: &Path, e: &RangeEntry, network: &str) -> Result<RangeReader> {
-        match Self::open_once(dir, e, network) {
+        Self::open_opts(dir, e, network, true)
+    }
+
+    /// [`Self::open`]; with `filters` false the range's `kf.fil` is not read (lookups probe
+    /// the index, as without a filter).
+    pub fn open_opts(
+        dir: &Path,
+        e: &RangeEntry,
+        network: &str,
+        filters: bool,
+    ) -> Result<RangeReader> {
+        match Self::open_once(dir, e, network, filters) {
             // A committed swap moved a file between `resolve` and `open`: resolve again.
-            Err(_) if crate::swap::pending(dir, e.start) => Self::open_once(dir, e, network),
+            Err(_) if crate::swap::pending(dir, e.start) => {
+                Self::open_once(dir, e, network, filters)
+            }
             r => r,
         }
     }
 
-    fn open_once(dir: &Path, e: &RangeEntry, network: &str) -> Result<RangeReader> {
+    fn open_once(dir: &Path, e: &RangeEntry, network: &str, filters: bool) -> Result<RangeReader> {
         let f = |k: FileKind| crate::swap::resolve(dir, &file_name(network, k, e.start, e.end));
         let info = RangeInfo::load(&f(FileKind::Range))?;
         if info.entry() != *e {
@@ -123,7 +136,7 @@ impl RangeReader {
             Some((p, _)) => Some(Postings::open(&p, e.first_txnum)?),
             None => None,
         };
-        let filter = match listed(FileKind::KeyFilter) {
+        let filter = match listed(FileKind::KeyFilter).filter(|_| filters) {
             Some((p, _)) if !p.exists() => {
                 missing("kf", &p);
                 None
@@ -364,16 +377,29 @@ pub struct Segments {
     pub ranges: Vec<Arc<RangeReader>>,
     /// Dictionary the records' ids refer to (rendering is the caller's job).
     pub dict: Arc<dyn Dict + Send + Sync>,
+    /// Whether the ranges load their key filters (only then is `kdx_key_filter_bytes` set).
+    filters: bool,
 }
 
 impl Segments {
     /// Open every range listed in `dir/manifest.json` (an empty store when there is none).
     pub fn open(dir: &Path, dict: Arc<dyn Dict + Send + Sync>) -> Result<Segments> {
+        Self::open_opts(dir, dict, true)
+    }
+
+    /// [`Self::open`] without the key filters (FIX-2 fix 3): for readers that never look a
+    /// request key or block hash up, or can afford to probe (code search, nft-fill, seed,
+    /// inspect, verify). The API store holds the process's one copy (~0.4 GB on mainnet).
+    pub fn open_without_filters(dir: &Path, dict: Arc<dyn Dict + Send + Sync>) -> Result<Segments> {
+        Self::open_opts(dir, dict, false)
+    }
+
+    fn open_opts(dir: &Path, dict: Arc<dyn Dict + Send + Sync>, filters: bool) -> Result<Segments> {
         let manifest = Manifest::load(dir)?.unwrap_or_else(|| Manifest::new(""));
         let mut ranges = Vec::new();
         for e in &manifest.entries {
             ranges.push(Arc::new(
-                RangeReader::open(dir, e, &manifest.network)
+                RangeReader::open_opts(dir, e, &manifest.network, filters)
                     .with_context(|| format!("open range {}..{}", e.start, e.end))?,
             ));
         }
@@ -382,6 +408,7 @@ impl Segments {
             manifest,
             ranges,
             dict,
+            filters,
         };
         s.publish_filter_bytes();
         Ok(s)
@@ -400,7 +427,7 @@ impl Segments {
             match self.ranges.iter().find(|r| r.key() == k) {
                 Some(r) => ranges.push(r.clone()),
                 None => ranges.push(Arc::new(
-                    RangeReader::open(&self.dir, e, &manifest.network)
+                    RangeReader::open_opts(&self.dir, e, &manifest.network, self.filters)
                         .with_context(|| format!("open range {}..{}", e.start, e.end))?,
                 )),
             }
@@ -410,6 +437,7 @@ impl Segments {
             manifest,
             ranges,
             dict: self.dict.clone(),
+            filters: self.filters,
         };
         s.publish_filter_bytes();
         Ok(Some(s))
@@ -431,6 +459,9 @@ impl Segments {
     }
 
     fn publish_filter_bytes(&self) {
+        if !self.filters {
+            return;
+        }
         kdx_metrics::get()
             .key_filter_bytes
             .set(i64::try_from(self.key_filter_bytes()).unwrap_or(i64::MAX));

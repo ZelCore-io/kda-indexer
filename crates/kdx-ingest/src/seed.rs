@@ -203,7 +203,7 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<See
     }
 
     // Segment pass, in manifest order, resuming at the cursor.
-    let segs = Segments::open(segdir, Arc::new(MemDict::new()))?;
+    let segs = Segments::open_without_filters(segdir, Arc::new(MemDict::new()))?;
     for (r, e) in segs.ranges.iter().zip(&segs.manifest.entries) {
         let (fam0, idx0) = match cursor {
             Some(c) if e.end <= c.start => {

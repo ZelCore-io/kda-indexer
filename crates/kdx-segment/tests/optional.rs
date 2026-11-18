@@ -408,3 +408,49 @@ fn the_deep_check_finds_a_missing_or_wrong_sender_posting() {
         "missing under b, extra under a"
     );
 }
+
+/// FIX-2 fix 3: readers that never look keys up (code search, nft-fill, inspect, verify)
+/// open the store without its key filters: no filter bytes in memory (nor published to the
+/// API store's `kdx_key_filter_bytes` gauge), and every lookup still answered (by probing).
+#[test]
+fn segments_opened_without_filters_hold_none_and_answer_the_same() {
+    let blk = |height, hash, rk| Blk {
+        chain: 0,
+        height,
+        hash,
+        rks: vec![(rk, 1)],
+    };
+    let d = tempfile::tempdir().unwrap();
+    write_store(
+        d.path(),
+        &[
+            (0, 4, false, vec![blk(0, h(7, 1), h(9, 2))]),
+            (4, 8, false, vec![blk(4, h(7, 2), h(9, 3))]),
+        ],
+    );
+    let seg = d.path().join("segments");
+    let both = Manifest::load(&seg).unwrap().unwrap();
+    let mut first = Manifest::new(NET);
+    first.push(both.entries[0].clone()).unwrap();
+    first.commit(&seg).unwrap();
+
+    let full = open(&seg);
+    assert!(full.key_filter_bytes() > 0);
+    let bare = Segments::open_without_filters(&seg, Arc::new(MemDict::new())).unwrap();
+    assert_eq!(bare.key_filter_bytes(), 0);
+    assert!(bare
+        .ranges
+        .iter()
+        .all(|r| r.filter.is_none() && r.sndr.is_some()));
+    assert_eq!(bare.by_rk(&h(9, 2)).unwrap(), full.by_rk(&h(9, 2)).unwrap());
+    assert_eq!(
+        bare.by_block_hash(&h(7, 1)).unwrap(),
+        full.by_block_hash(&h(7, 1)).unwrap()
+    );
+    // A refresh keeps the choice for the ranges it opens.
+    both.commit(&seg).unwrap();
+    let r = bare.refresh().unwrap().expect("manifest changed");
+    assert_eq!(r.ranges.len(), 2);
+    assert_eq!(r.key_filter_bytes(), 0);
+    assert!(r.by_rk(&h(9, 3)).unwrap().is_some());
+}

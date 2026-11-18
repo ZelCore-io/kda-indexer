@@ -175,7 +175,7 @@ pub fn run(
     }
 
     // Segment pass, oldest first (TxNum order).
-    let segs = Segments::open(segdir, dict.clone())?;
+    let segs = Segments::open_without_filters(segdir, dict.clone())?;
     let mut nums: Vec<u64> = names
         .iter()
         .flat_map(|&id| segs.postings(Family::Evt, u64::from(id)))
