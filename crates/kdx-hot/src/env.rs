@@ -60,6 +60,8 @@ pub mod meta {
     pub const FROZEN_FRONTIER: &str = "frozen_frontier";
     pub const NEXT_TXNUM: &str = "next_txnum";
     pub const GEOMETRY: &str = "geometry";
+    /// u64 1 when every hot tx carries its `sndr` posting (FIX-2, `sndr::backfill`).
+    pub const SNDR_HOT: &str = "sndr_hot";
 }
 
 pub struct HotStore {
@@ -72,8 +74,8 @@ pub struct HotStore {
 
 impl HotStore {
     /// Open (or create) the hot store in `dir`. A new store gets `format_version` 2,
-    /// `frozen_frontier` 0, `next_txnum` 0 and its geometry in `Meta`; an existing store with
-    /// another format version is refused.
+    /// `frozen_frontier` 0, `next_txnum` 0, `sndr_hot` 1 and its geometry in `Meta`; an
+    /// existing store with another format version is refused.
     pub fn open(dir: &Path, g: Geometry) -> Result<HotStore> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let max = usize::try_from(g.max_gb)
@@ -108,6 +110,9 @@ impl HotStore {
                 put(meta::FORMAT_VERSION, &FORMAT_VERSION.to_be_bytes())?;
                 put(meta::FROZEN_FRONTIER, &0u32.to_be_bytes())?;
                 put(meta::NEXT_TXNUM, &0u64.to_be_bytes())?;
+                // An empty tail: every tx the tail writes from here on carries its `sndr`
+                // posting (`tail::apply`), so the freezer can take them from the hot store.
+                put(meta::SNDR_HOT, &1u64.to_be_bytes())?;
             }
             Some(v) => {
                 let v = be_u64(&v).context("Meta format_version")?;

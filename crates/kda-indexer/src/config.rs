@@ -391,6 +391,15 @@ pub struct GraphqlConfig {
     pub feed_poll_ms: u64,
     /// Byte budget (MB) of the decoded blocks the subscription feed's ring holds.
     pub feed_ring_mb: u32,
+    /// Longest a `totalCount` walk runs (ms); past it the count is a lower bound, flagged in
+    /// the response `extensions`. The walk also stops at half of the remaining
+    /// `api.deadline_ms`.
+    pub count_budget_ms: u64,
+    /// Serve sender lists (`transactions(accountName)`, `FungibleChainAccount.transactions`,
+    /// REST `role=sender`) from the `sndr` postings once the sender index is complete
+    /// (FIX-2). `false` forces the old path (the account's postings filtered on
+    /// `meta.sender`, bounded by the 1 s scan window); kept for the on-host equivalence check.
+    pub sender_index: bool,
     /// `networkInfo.networkHost`: a public name for clients, never the node URL.
     pub network_host: String,
     /// Automatic persisted queries. Not built: `true` is refused.
@@ -421,6 +430,8 @@ impl Default for GraphqlConfig {
             ws_tx_wait_secs: 3600,
             feed_poll_ms: 1000,
             feed_ring_mb: 64,
+            count_budget_ms: 200,
+            sender_index: true,
             network_host: String::new(),
             apq: false,
         }
@@ -465,6 +476,10 @@ impl GraphqlConfig {
             "graphql.feed_ring_mb must be in 8..=4096"
         );
         anyhow::ensure!(
+            (1..=60_000).contains(&self.count_budget_ms),
+            "graphql.count_budget_ms must be in 1..=60000"
+        );
+        anyhow::ensure!(
             !self.apq,
             "graphql.apq: automatic persisted queries are not built in this version"
         );
@@ -503,6 +518,7 @@ impl GraphqlConfig {
             network_id: network.to_owned(),
             network_host: self.network_host.clone(),
             apq: self.apq,
+            count_budget: Duration::from_millis(self.count_budget_ms),
         }
     }
 }
@@ -797,6 +813,11 @@ mod balances_tests {
             ),
             (20, 100, 10, 2000, 10)
         );
+        assert_eq!(
+            s.count_budget,
+            std::time::Duration::from_millis(200),
+            "the count budget defaults to 200 ms"
+        );
         for bad in [
             GraphqlConfig {
                 apq: true,
@@ -812,6 +833,14 @@ mod balances_tests {
             },
             GraphqlConfig {
                 max_query_bytes: 1 << 20,
+                ..ok.clone()
+            },
+            GraphqlConfig {
+                count_budget_ms: 0,
+                ..ok.clone()
+            },
+            GraphqlConfig {
+                count_budget_ms: 60_001,
                 ..ok.clone()
             },
         ] {
@@ -980,6 +1009,41 @@ mod ws_bound_tests {
              [api]\n{api}\n[graphql]\n{graphql}\n"
         );
         toml::from_str::<Config>(&text)?.validate()
+    }
+
+    /// `graphql.count_budget_ms` parses from the file, defaults to 200 and reaches the settings.
+    #[test]
+    fn count_budget_ms_parses_and_defaults() {
+        let parse = |g: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[graphql]\n{g}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        assert_eq!(parse("").graphql.count_budget_ms, 200);
+        let c = parse("count_budget_ms = 50");
+        c.validate().unwrap();
+        let ms = |c: &Config| c.graphql.settings("mainnet01").count_budget.as_millis();
+        assert_eq!(ms(&c), 50);
+        assert_eq!(ms(&parse("")), 200);
+        assert!(parse("count_budget_ms = 0").validate().is_err());
+    }
+
+    /// `graphql.sender_index` (FIX-2) defaults to true and parses `false`.
+    #[test]
+    fn sender_index_parses_and_defaults() {
+        let parse = |g: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[graphql]\n{g}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        assert!(parse("").graphql.sender_index);
+        let c = parse("sender_index = false");
+        c.validate().unwrap();
+        assert!(!c.graphql.sender_index);
     }
 
     /// The ws opening borrow is `ws_subs_per_conn + 2` (R-P5P9-57): the bound keeps it inside

@@ -258,11 +258,11 @@ pub fn merkle(args: MerkleArgs) -> anyhow::Result<()> {
     let (dict, stored) = {
         let txn = hs.ro()?;
         let dict = Arc::new(HotDict::load(&txn)?.mem().clone());
-        let seg = Segments::open(&segments_dir(&data_dir), dict.clone())?;
+        let seg = Segments::open_without_filters(&segments_dir(&data_dir), dict.clone())?;
         let b = bounds(&txn, &seg, &chains)?;
         (dict, b)
     };
-    let seg = Segments::open(&segments_dir(&data_dir), dict.clone())?;
+    let seg = Segments::open_without_filters(&segments_dir(&data_dir), dict.clone())?;
     let Some((slo, shi)) = stored else {
         anyhow::bail!("no stored blocks in {}", data_dir.display());
     };

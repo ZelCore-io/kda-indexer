@@ -1217,6 +1217,7 @@ mod tests {
             commit_blocks: 10,
             cut_poll_secs: 10,
             until: None,
+            legacy_segments: false,
         }
     }
 

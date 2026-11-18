@@ -12,6 +12,8 @@
 //! Pk: signer `pubKey` (interned here). Code: blake2b-128 of `exec.code`.
 //! Pact (format v2): `pact_entity` of the tx's defpact id, so an exec that starts a pact and
 //! every `cont` step of it share one posting list.
+//! Sndr (FIX-2): the AccountId of `meta.sender` ([`sender_of`]), pushed exactly where the
+//! sender's `acct` posting is (same `account_ok`), so `sndr(A) ⊆ acct(A)` for every account.
 //! Txs with `cmd_unparsed` get only output-derived postings (events, transfers, defpact).
 
 use kdx_types::record::{BlockRecord, TxRecord};
@@ -22,6 +24,7 @@ use crate::build::{
     account_ok, encode_records, event_accounts, intern_block, parse_event, transfer_accounts,
     BuildError,
 };
+use crate::json::{parse_untrusted, Unrepresentable};
 use crate::payload::DecodedBlock;
 use crate::verify::VerifyReport;
 
@@ -36,10 +39,23 @@ pub enum Family {
     Code = 4,
     /// Defpact history (store format v2): the pact's starting exec and every `cont` step.
     Pact = 5,
+    /// Txs sent by the account (`meta.sender`; FIX-2). Always a subset of `acct`.
+    Sndr = 6,
 }
 
 impl Family {
-    pub const ALL: [Family; 6] = [
+    pub const ALL: [Family; 7] = [
+        Family::Xfer,
+        Family::Acct,
+        Family::Pk,
+        Family::Evt,
+        Family::Code,
+        Family::Pact,
+        Family::Sndr,
+    ];
+    /// The families every format-v2 range stores as a required posting file (`sndr.pst` is
+    /// optional and listed in `range.toml` when present).
+    pub const REQUIRED: [Family; 6] = [
         Family::Xfer,
         Family::Acct,
         Family::Pk,
@@ -58,8 +74,30 @@ impl Family {
             Family::Evt => "evt",
             Family::Code => "code",
             Family::Pact => "pact",
+            Family::Sndr => "sndr",
         }
     }
+}
+
+/// The `meta.sender` string of a parsed cmd. The one definition of "sender" shared by
+/// `extract` (new data), the add-index pass over stored records and the query fallbacks.
+pub fn sender_of(cmd: &Value) -> Option<&str> {
+    cmd.pointer("/meta/sender").and_then(Value::as_str)
+}
+
+/// The sender a stored record is posted under in the `sndr` family: `Some` exactly when
+/// `extract` gives the tx a `(Sndr, id)` posting (a user tx whose cmd parses, a string
+/// `meta.sender`, `account_ok`). The cmd bytes are parsed as `decode_block` parses them; a
+/// record not marked `cmd_unparsed` whose cmd does not parse is an error.
+pub fn indexed_sender(r: &TxRecord) -> Result<Option<String>, Unrepresentable> {
+    let Some(cmd) = &r.cmd else {
+        return Ok(None);
+    };
+    if r.key.pos() == 0 || r.cmd_unparsed {
+        return Ok(None);
+    }
+    let v = parse_untrusted(cmd)?;
+    Ok(sender_of(&v).filter(|s| account_ok(s)).map(str::to_owned))
 }
 
 /// Entity of the `xfer` family: `(AccountId << 32) | ModuleId`.
@@ -190,8 +228,12 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
             output_postings(&t.output, dict, &mut p);
             let out_pact = t.output.get("continuation").and_then(|c| c.get("pactId"));
             if let (Some(c), false) = (&t.cmd_parsed, r.cmd_unparsed) {
-                if let Some(s) = c.pointer("/meta/sender").and_then(Value::as_str) {
-                    account_posting(s, dict, &mut p);
+                if let Some(s) = sender_of(c) {
+                    if account_ok(s) {
+                        let id = dict.intern(DictKind::Account, s) as u64;
+                        p.push((Family::Acct, id));
+                        p.push((Family::Sndr, id));
+                    }
                 }
                 for s in c
                     .get("signers")

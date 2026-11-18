@@ -62,7 +62,8 @@ pub fn local_node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
 }
 
 /// Take the exclusive lock on `<data_dir>/LOCK` for a writing command (`run`, `tail`,
-/// `backfill`, `unwind`). Held until the returned file is dropped; the OS releases it when
+/// `backfill`, `unwind`, `rebuild-range`, `reconcile-balances`, `segments add-index`,
+/// `hot drop-family`). Held until the returned file is dropped; the OS releases it when
 /// the process exits. Read-only commands do not take it.
 pub fn lock_data_dir(data_dir: &Path) -> anyhow::Result<File> {
     std::fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
@@ -76,7 +77,9 @@ pub fn lock_data_dir(data_dir: &Path) -> anyhow::Result<File> {
     match f.try_lock() {
         Ok(()) => Ok(f),
         Err(TryLockError::WouldBlock) => anyhow::bail!(
-            "{} is in use by another kda-indexer process (run, tail, backfill or unwind); stop it first",
+            "{} is in use by another kda-indexer process (run, tail, backfill, unwind, \
+             rebuild-range, reconcile-balances, segments add-index or hot drop-family); stop it \
+             first",
             data_dir.display()
         ),
         Err(TryLockError::Error(e)) => Err(e).with_context(|| format!("lock {}", p.display())),

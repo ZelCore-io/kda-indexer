@@ -18,8 +18,10 @@ use crate::adj::AdjTracker;
 use crate::blockfile::{dict_id, BlockFileWriter};
 use crate::etl::SortedU128;
 use crate::files::{
-    blake3_file, file_name, fsync_dir, range_file_names, tmp_dir, write_file, FileKind,
+    blake3_file, file_name, fsync_dir, optional_file_names, range_file_names, tmp_dir, write_file,
+    FileKind,
 };
+use crate::filter::{KeyFilter, KeyFilters};
 use crate::keys::write_keys;
 use crate::manifest::{format_refusal, RangeEntry, RangeKind, FORMAT_VERSION};
 use crate::phf::{debug_fallback_env, write_index, IndexKey};
@@ -44,8 +46,16 @@ pub struct WriteOpts {
     /// `KDX_DEBUG_RK_FALLBACK=1`).
     pub force_sorted_index: bool,
     /// Posting entries (16 B each) kept in memory per family before a sorted run is spilled
-    /// (5 families; default [`ETL_MEM_ENTRIES`]). Backfill lowers it under its memory cap.
+    /// (one buffer per family of `Family::ALL`, `sndr` included; default
+    /// [`ETL_MEM_ENTRIES`]). Backfill lowers it under its memory cap.
     pub postings_mem_entries: usize,
+    /// Write the optional files (`sndr.pst`, `kf.fil`) and list them in `range.toml`
+    /// (default). `false` writes a range the way a build before FIX-2 did: test fixtures of
+    /// `segments add-index` only.
+    pub optional_files: bool,
+    /// Make the key filter build fail (tests of the no-`kf.fil` fallback only).
+    #[doc(hidden)]
+    pub fail_key_filter: bool,
 }
 
 impl WriteOpts {
@@ -57,6 +67,8 @@ impl WriteOpts {
             dict_samples,
             force_sorted_index: false,
             postings_mem_entries: ETL_MEM_ENTRIES,
+            optional_files: true,
+            fail_key_filter: false,
         }
     }
 }
@@ -116,6 +128,10 @@ impl RangeInfo {
             );
         }
         Ok(r)
+    }
+    /// The `range.toml` text (the writer and `segments add-index` both write it this way).
+    pub fn to_toml(&self) -> Result<String> {
+        Ok(toml::to_string(self)?)
     }
     pub fn entry(&self) -> RangeEntry {
         RangeEntry {
@@ -360,7 +376,13 @@ impl RangeWriter {
             }
             self.cmd_reencoded += tx.cmd_reencoded as u64;
             for (fam, ent) in &ix.postings {
-                self.postings[*fam as usize].push((*ent as u128) << 64 | rel as u128)?;
+                // One buffer per family of `Family::ALL` (indexed by `Family as usize`), so
+                // every family has one; a miss would drop postings, so it is an error.
+                let col = self
+                    .postings
+                    .get_mut(*fam as usize)
+                    .with_context(|| format!("no posting buffer for family {fam:?}"))?;
+                col.push((*ent as u128) << 64 | rel as u128)?;
             }
         }
         Ok(())
@@ -444,11 +466,41 @@ impl RangeWriter {
 
         write_keys(&tmp.join(fname(FileKind::Keys)), SLOT_WIDTH, &counts)?;
         let (rk_keys, bh_keys) = (rk.len() as u64, bh.len() as u64);
+        // kf.fil: the filters over the same keys the indexes get. A filter that cannot be
+        // built only costs speed: the range is written without it (lookups probe, as before
+        // FIX-2; `segments add-index` can add it later), never a stalled freeze or merge.
+        let mut with_filter = false;
+        if opts.optional_files {
+            let built = if opts.fail_key_filter {
+                Err(anyhow::anyhow!("key filter: forced failure (test)"))
+            } else {
+                KeyFilter::from_index_keys(&bh).and_then(|bh| {
+                    Ok(KeyFilters {
+                        bh,
+                        rk: KeyFilter::from_index_keys(&rk)?,
+                    })
+                })
+            };
+            match built {
+                Ok(filters) => {
+                    write_file(&tmp.join(fname(FileKind::KeyFilter)), &filters.to_bytes())?;
+                    with_filter = true;
+                }
+                Err(err) => tracing::warn!(
+                    range = %format!("{start}..{end}"),
+                    error = %format!("{err:#}"),
+                    "segment: key filter not built; the range is written without kf.fil"
+                ),
+            }
+        }
         let rk_kind = write_index(&tmp.join(fname(FileKind::Rk)), rk, opts.force_sorted_index)?;
         let bh_kind = write_index(&tmp.join(fname(FileKind::Bh)), bh, opts.force_sorted_index)?;
 
         let mut pstats = BTreeMap::new();
         for (fam, col) in Family::ALL.iter().zip(postings) {
+            if *fam == Family::Sndr && !opts.optional_files {
+                continue;
+            }
             let mut pw = PostingsWriter::create(
                 &tmp.join(fname(FileKind::of_family(*fam))),
                 *fam,
@@ -481,17 +533,25 @@ impl RangeWriter {
             pstats.insert(fam.name().to_string(), PostingStat { entities, entries });
         }
 
+        // Every file but range.toml: the required set and both optional files (unless a test
+        // fixture asked for the layout before FIX-2).
+        let mut written = range_file_names(&network, start, end);
+        written.retain(|n| *n != fname(FileKind::Range));
+        if opts.optional_files {
+            written.extend(
+                optional_file_names(&network, start, end)
+                    .into_iter()
+                    .filter(|n| with_filter || *n != fname(FileKind::KeyFilter)),
+            );
+        }
         let mut files = BTreeMap::new();
-        for n in range_file_names(&network, start, end) {
-            if n == fname(FileKind::Range) {
-                continue;
-            }
-            let p = tmp.join(&n);
+        for n in &written {
+            let p = tmp.join(n);
             let bytes = fs::metadata(&p)
                 .with_context(|| format!("missing {n}"))?
                 .len();
             files.insert(
-                n,
+                n.clone(),
                 FileStat {
                     bytes,
                     blake3: blake3_file(&p)?,
@@ -524,13 +584,12 @@ impl RangeWriter {
         };
         write_file(
             &tmp.join(fname(FileKind::Range)),
-            toml::to_string(&info)?.as_bytes(),
+            info.to_toml()?.as_bytes(),
         )?;
         fsync_dir(&tmp)?;
 
         // range.toml goes last so a range with a readable range.toml is complete.
-        let mut names = range_file_names(&network, start, end);
-        names.retain(|n| *n != fname(FileKind::Range));
+        let mut names = written;
         names.push(fname(FileKind::Range));
         for n in &names {
             fs::rename(tmp.join(n), dir.join(n)).with_context(|| format!("rename {n}"))?;

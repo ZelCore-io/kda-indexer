@@ -262,7 +262,7 @@ pub fn coin_module(txn: &impl Txn) -> Result<Option<u32>> {
 
 /// Dirty mark for one posting of a tail block being applied or undone (B-3): an `xfer` posting
 /// marks `(account, module, chain)` and notes the token; an `acct` posting marks
-/// `(account, coin, chain)`. Other families are ignored. `note_tokens` is false on undo (a
+/// `(account, coin, chain)`. Other families (`pk`, `evt`, `code`, `pact`, `sndr`) are ignored. `note_tokens` is false on undo (a
 /// token's first height is never raised).
 pub fn mark_posting(
     txn: &mut RwTxn<'_>,

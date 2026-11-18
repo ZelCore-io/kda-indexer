@@ -11,6 +11,7 @@ pub mod checkpoint;
 pub mod dict;
 pub mod env;
 pub mod nft;
+pub mod sndr;
 pub mod tables;
 pub mod tail;
 pub mod undo;

@@ -261,6 +261,16 @@ enum HotAction {
         #[arg(long)]
         digest: bool,
     },
+    /// Remove an optional posting family from the hot store (offline, takes the lock):
+    /// its `TailPostings` rows, its undo ops and its readiness key. Only `sndr`. Run before
+    /// going back to a binary that does not know the family.
+    DropFamily {
+        /// Family name (`sndr`).
+        family: String,
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -369,6 +379,22 @@ enum SegmentsAction {
         /// Only the entry starting at this height.
         #[arg(long)]
         start: Option<u32>,
+    },
+    /// Add the sender index (`sndr.pst`) and the key filters (`kf.fil`) to every range and
+    /// step that lacks them, then backfill the hot store's sender postings. Offline (stop
+    /// the service), crash-safe and resumable; prints a JSON report.
+    AddIndex {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Entries built in parallel.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Build only one of the two files: `sndr` or `filter`.
+        #[arg(long)]
+        only: Option<String>,
+        /// Build and check every entry in a scratch dir, swap nothing, write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -543,6 +569,13 @@ async fn main() -> anyhow::Result<()> {
         } => {
             kda_indexer::cmd::hot::stats(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir), digest)
         }
+        Command::Hot {
+            action: HotAction::DropFamily { family, data_dir },
+        } => kda_indexer::cmd::hot::drop_family(
+            &cfg,
+            data_dir.as_deref().unwrap_or(&cfg.data_dir),
+            &family,
+        ),
         Command::Run {
             data_dir,
             start_height,
@@ -679,6 +712,18 @@ async fn main() -> anyhow::Result<()> {
             SegmentsAction::Check { data_dir, deep } => kda_indexer::cmd::segments::check(
                 data_dir.as_deref().unwrap_or(&cfg.data_dir),
                 deep,
+            ),
+            SegmentsAction::AddIndex {
+                data_dir,
+                jobs,
+                only,
+                dry_run,
+            } => kda_indexer::cmd::segments::add_index(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                jobs,
+                only.as_deref(),
+                dry_run,
             ),
             SegmentsAction::Digest {
                 data_dir,

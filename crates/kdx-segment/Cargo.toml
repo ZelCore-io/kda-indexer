@@ -23,6 +23,7 @@ libc.workspace = true
 reth-nippy-jar.workspace = true
 kdx-types.workspace = true
 kdx-decode.workspace = true
+kdx-metrics.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

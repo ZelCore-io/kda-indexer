@@ -80,6 +80,8 @@ max_event_lists = 256     # event-name lists one event query may expand to
 # ws_tx_wait_secs = 3600
 # feed_poll_ms = 1000
 # feed_ring_mb = 64          # decoded blocks the subscription feed's ring holds at most
+# count_budget_ms = 200      # longest an account's totalCount walk runs; past it a flagged lower bound
+# sender_index = true       # sender lists read the sndr postings once complete; false forces the old scan
 # network_host = ""          # networkInfo.networkHost: a public name, never the node URL
 
 [search]

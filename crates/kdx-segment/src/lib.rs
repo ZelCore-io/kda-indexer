@@ -8,6 +8,7 @@ pub mod content;
 pub mod ef;
 pub mod etl;
 pub mod files;
+pub mod filter;
 pub mod keys;
 pub mod manifest;
 pub mod phf;
@@ -16,7 +17,7 @@ pub mod reader;
 pub mod swap;
 pub mod writer;
 
-pub use check::{check, CheckReport};
+pub use check::{check, check_with, CheckReport};
 pub use manifest::{Manifest, RangeEntry, RangeKind};
 pub use phf::{Index, IndexKind, KeyIndex, PtrHashIndex, SortedIndex};
 pub use postings::{ListMemo, PostingIter, RoaringView};

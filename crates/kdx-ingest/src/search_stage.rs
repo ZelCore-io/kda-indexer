@@ -330,8 +330,11 @@ impl StageState {
         let fresh = match self.seg.take() {
             Some(s) if s.frontier() > h => s,
             Some(s) => s.refresh()?.unwrap_or(s),
-            None => Segments::open(&self.segdir, Arc::new(MemDict::new()))?,
+            None => Segments::open_without_filters(&self.segdir, Arc::new(MemDict::new()))?,
         };
+        // The search stage never looks keys up: no second copy of the API store's key
+        // filters in the `run` process (FIX-2 fix 3).
+        debug_assert_eq!(fresh.key_filter_bytes(), 0);
         anyhow::ensure!(
             fresh.frontier() > h,
             "height {h} is below the hot frozen frontier but not in the segments (frontier {})",
@@ -345,7 +348,7 @@ impl StageState {
     fn floor(&mut self, frontier: u32) -> Result<u32> {
         let s = match self.seg.take() {
             Some(s) => s.refresh()?.unwrap_or(s),
-            None => Segments::open(&self.segdir, Arc::new(MemDict::new()))?,
+            None => Segments::open_without_filters(&self.segdir, Arc::new(MemDict::new()))?,
         };
         let lo = s
             .manifest

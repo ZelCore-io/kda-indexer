@@ -8364,6 +8364,62 @@ async fn e2_s_the_native_pair_rereads_a_gap_in_the_other_order() {
     assert!(ev.a.is_some(), "{ev:?}");
 }
 
+/// FV day 1: the live re-read agrees when GraphQL's Float equals the native decimal as an
+/// f64 (`78366.18873465271` against `78366.188734652711000000000000000000`).
+#[tokio::test]
+async fn e2_s_the_native_reread_agrees_up_to_f64() {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(NodeMock::default()).await;
+    let native = serve(Router::new().route(
+        "/api/v1/accounts/{a}/balances",
+        get(|| async {
+            Json(json!({"items": [{"module": "coin", "chain": 0,
+                "balance": "78366.188734652711000000000000000000"}]}))
+        }),
+    ))
+    .await;
+    let n = Arc::new(AtomicUsize::new(0));
+    let gql = ours_fn_server(move |_: &Value| {
+        let bal = if n.fetch_add(1, O::SeqCst) > 0 {
+            json!(78366.18873465271_f64)
+        } else {
+            json!(78365.28467607271_f64)
+        };
+        json!({"data": {"fungibleAccount": {"chainAccounts": [
+            {"chainId": "0", "balance": bal, "guard": null}]}}})
+    })
+    .await;
+    let own = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/graphql");
+    let allow =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+    let dirp = dir.path();
+    let cfg: CompareConfig = toml::from_str(&format!(
+        "network = \"mainnet01\"\npairs = [[\"gql\", \"native\"]]\nallowlist = {allow:?}\n\
+         out_dir = {dirp:?}\n[node]\nurl = \"{nu}\"\ntimeout_ms = 5000\n[graphql]\n\
+         own_ops_dir = {own:?}\n[targets.gql]\nurl = \"{gql}\"\n\
+         kind = \"kda_indexer_graphql\"\n[targets.native]\nurl = \"{native}\"\n\
+         kind = \"kda_indexer_native\"\n"
+    ))
+    .unwrap();
+    let ctx = Ctx::new(cfg).await.unwrap();
+    let op = ctx
+        .gql
+        .ops
+        .iter()
+        .find(|o| o.stem == "NodeBalance")
+        .unwrap()
+        .clone();
+    let vars = h7_vars(&[("accountName", json!("k:m"))]);
+    let o = ctx
+        .gql_native_balance(&ctx.targets["gql"], &ctx.targets["native"], &op, &vars)
+        .await;
+    assert_eq!(o.class, "allowlisted", "{:?}", o.record);
+    assert!(o
+        .allowlist_ids
+        .contains(&"graphql-native-miner-skew".to_string()));
+}
+
 /// R-P5P9-105 S′'s node: chain 0 at heights 85..=110, block time 30 s apart (height 100 at
 /// the record's time). Each height's coinbase pays `k:m` 0.904046 when listed in `cb`, else
 /// `k:o`; `txs` gives a height's transactions' events.
@@ -8704,4 +8760,23 @@ async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
     });
     let rep = e2_referee(cfg(), dir.path(), &[r]).await;
     assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
+    // FV day 1: a re-read that agrees up to f64 rendering (GraphQL's Float is the native
+    // decimal rounded once) did not differ; the gap is settled like any other. A re-read
+    // that differs beyond f64 is still refused.
+    for (graphql, explained) in [("10.904046", 1), ("10.904047", 0)] {
+        let mut r = rec("10.904046000000000");
+        r.diff.push(DiffEntry {
+            path: "/~graphql-native-reread-differs".into(),
+            kind: DiffKind::Changed,
+            a: Some(json!({"reread": [
+                {"chain": "0", "native": "10.904046000000000", "graphql": graphql}]})),
+            b: None,
+        });
+        let rep = e2_referee(cfg(), dir.path(), &[r]).await;
+        assert_eq!(
+            (rep.explained, rep.unexplained),
+            (explained, 1 - explained),
+            "{graphql}: {rep:?}"
+        );
+    }
 }

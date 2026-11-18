@@ -124,14 +124,14 @@ const VECTORS: [(u8, u64, usize, &str); 20] = [
     ),
 ];
 
+/// The fixture is compiled in (as `kdx-ingest`'s backfill tests embed theirs): a test that
+/// opened it at run time failed with NotFound when the working tree was rewritten under a
+/// running `cargo test --workspace` (a checkout or stash in the same tree), although no test
+/// writes into `tests/fixtures`.
 fn fixture() -> Vec<Value> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/merkle_vectors.json.zst"
-    );
-    let f = std::fs::File::open(path).expect("fixture");
+    const ZST: &[u8] = include_bytes!("fixtures/merkle_vectors.json.zst");
     let mut s = Vec::new();
-    zstd::Decoder::new(f).unwrap().read_to_end(&mut s).unwrap();
+    zstd::Decoder::new(ZST).unwrap().read_to_end(&mut s).unwrap();
     serde_json::from_slice(&s).unwrap()
 }
 

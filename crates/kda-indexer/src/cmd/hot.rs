@@ -1,5 +1,9 @@
 //! Hidden `hot stats`: open the hot store read-only and print `Meta`, table row counts,
 //! dictionary sizes, counters and the MDBX geometry.
+//!
+//! Hidden `hot drop-family sndr` (FIX-2): offline (takes the data-dir lock), one write txn;
+//! removes the `sndr` family's `TailPostings` rows, its undo ops and `Meta sndr_hot`, so an
+//! older binary (whose freezer rejects family 6) can run on the store.
 
 use std::path::Path;
 
@@ -69,13 +73,60 @@ pub fn stats(cfg: &Config, data_dir: &Path, digest: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Parse a posting family name; only optional families can be dropped.
+fn droppable(name: &str) -> anyhow::Result<kdx_decode::Family> {
+    use kdx_decode::Family;
+    match Family::ALL.into_iter().find(|f| f.name() == name) {
+        Some(Family::Sndr) => Ok(Family::Sndr),
+        Some(f) => anyhow::bail!(
+            "posting family {} is required and cannot be dropped",
+            f.name()
+        ),
+        None => anyhow::bail!("unknown posting family {name:?} (droppable: sndr)"),
+    }
+}
+
+/// Open the existing hot store of `data_dir` for writing. A missing store is refused, never
+/// created: a maintenance command on a mistyped data dir must fail, not start an empty one.
+pub fn open_existing(cfg: &Config, data_dir: &Path) -> anyhow::Result<HotStore> {
+    let dir = hot_dir(data_dir);
+    if !dir.join("mdbx.dat").is_file() {
+        anyhow::bail!("no hot store in {} (wrong --data-dir?)", dir.display());
+    }
+    HotStore::open(&dir, geometry(cfg))
+}
+
+pub fn drop_family(cfg: &Config, data_dir: &Path, family: &str) -> anyhow::Result<()> {
+    let fam = droppable(family)?;
+    let _lock = super::lock_data_dir(data_dir)?;
+    let hs = open_existing(cfg, data_dir)?;
+    let mut txn = hs.rw()?;
+    let st = kdx_hot::sndr::drop_family(&mut txn, fam)?;
+    txn.commit()?;
+    tracing::info!(
+        family,
+        postings = st.postings,
+        undo_ops = st.undo_ops,
+        undo_rows = st.undo_rows,
+        "hot drop-family"
+    );
+    println!(
+        "dropped family {family}: {} TailPostings rows, {} undo ops in {} Undo rows, Meta {} cleared",
+        st.postings,
+        st.undo_ops,
+        st.undo_rows,
+        meta::SNDR_HOT
+    );
+    Ok(())
+}
+
 /// One `Meta` row. Known keys print as numbers; `dict_lens@<frontier>` as its five sizes;
 /// anything else as text when printable, else hex. Never raw bytes: a NUL in the output makes
 /// `grep` and friends treat the whole listing as binary and hide the counters below it.
 fn meta_line(k: &[u8], v: &[u8]) -> String {
     let name = String::from_utf8_lossy(k);
     let shown = match (name.as_ref(), v.len()) {
-        (meta::FORMAT_VERSION | meta::NEXT_TXNUM, 8) => {
+        (meta::FORMAT_VERSION | meta::NEXT_TXNUM | meta::SNDR_HOT, 8) => {
             u64::from_be_bytes(v.try_into().unwrap_or_default()).to_string()
         }
         (meta::FROZEN_FRONTIER, 4) => {
@@ -117,7 +168,20 @@ fn counter_lines(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{counter_lines, meta_line};
+    use super::{counter_lines, droppable, meta_line};
+
+    #[test]
+    fn only_sndr_can_be_dropped() {
+        assert_eq!(droppable("sndr").unwrap(), kdx_decode::Family::Sndr);
+        for f in ["acct", "xfer", "pk", "evt", "code", "pact"] {
+            let e = droppable(f).unwrap_err().to_string();
+            assert!(e.contains("required"), "{f}: {e}");
+        }
+        assert!(droppable("nope")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown"));
+    }
 
     #[test]
     fn counters_print_values() {

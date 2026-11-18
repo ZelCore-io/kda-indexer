@@ -450,7 +450,15 @@ fn snapshot_into(
         drop(txn);
         let mut missing = false;
         if let Some(m) = &m {
-            for f in m.files() {
+            // Optional files (FIX-2) a range lists but does not have are not a moving store:
+            // the copy is read without them, as the source is.
+            let optional: HashSet<PathBuf> = m
+                .entries
+                .iter()
+                .flat_map(|e| kdx_segment::files::optional_file_names(&m.network, e.start, e.end))
+                .map(PathBuf::from)
+                .collect();
+            for f in m.files_in(&src_seg) {
                 if have.contains(&f) {
                     continue;
                 }
@@ -459,6 +467,9 @@ fn snapshot_into(
                     Ok(n) => {
                         rep.segment_bytes += n;
                         have.insert(f);
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound && optional.contains(&f) => {
+                        tracing::warn!(file = %f.display(), "snapshot: listed optional segment file missing, not copied");
                     }
                     Err(e) if e.kind() == ErrorKind::NotFound => missing = true,
                     Err(e) => return Err(e).with_context(|| format!("place {}", f.display())),

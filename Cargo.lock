@@ -1831,6 +1831,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "tower",
  "tracing",
 ]
@@ -1873,6 +1874,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "toml",
  "tower",
  "tracing",
  "zstd",
@@ -1949,6 +1951,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "kdx-decode",
+ "kdx-metrics",
  "kdx-types",
  "libc",
  "memmap2",

@@ -1,5 +1,6 @@
 //! Canonical header walk, fetch, decode/index pipeline, backfill, tail, reorgs, freezer (spec §4).
 
+pub mod add_index;
 pub mod apply;
 pub mod backfill;
 pub mod canon;
