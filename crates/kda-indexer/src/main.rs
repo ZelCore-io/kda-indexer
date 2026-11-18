@@ -261,6 +261,16 @@ enum HotAction {
         #[arg(long)]
         digest: bool,
     },
+    /// Remove an optional posting family from the hot store (offline, takes the lock):
+    /// its `TailPostings` rows, its undo ops and its readiness key. Only `sndr`. Run before
+    /// going back to a binary that does not know the family.
+    DropFamily {
+        /// Family name (`sndr`).
+        family: String,
+        /// Data directory (default: `data_dir` from the config).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -543,6 +553,13 @@ async fn main() -> anyhow::Result<()> {
         } => {
             kda_indexer::cmd::hot::stats(&cfg, data_dir.as_deref().unwrap_or(&cfg.data_dir), digest)
         }
+        Command::Hot {
+            action: HotAction::DropFamily { family, data_dir },
+        } => kda_indexer::cmd::hot::drop_family(
+            &cfg,
+            data_dir.as_deref().unwrap_or(&cfg.data_dir),
+            &family,
+        ),
         Command::Run {
             data_dir,
             start_height,

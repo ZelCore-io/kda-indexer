@@ -176,7 +176,7 @@ pub fn entity(
             .with_context(|| format!("{k:?} {n:?} not in the dictionary"))
     };
     Ok(match family {
-        Family::Acct => find(DictKind::Account, name)? as u64,
+        Family::Acct | Family::Sndr => find(DictKind::Account, name)? as u64,
         Family::Pk => find(DictKind::PubKey, name)? as u64,
         Family::Xfer => {
             let m = module.context("xfer needs --module (e.g. coin)")?;
@@ -222,7 +222,7 @@ pub fn postings(
     let fam = Family::ALL
         .into_iter()
         .find(|f| f.name() == family)
-        .with_context(|| format!("family {family:?} (acct|xfer|pk|evt|code|pact)"))?;
+        .with_context(|| format!("family {family:?} (acct|xfer|pk|evt|code|pact|sndr)"))?;
     let ent = entity(s.dict.as_ref(), fam, name, module)?;
     let mut prefix = vec![fam as u8];
     prefix.extend_from_slice(&ent.to_be_bytes());

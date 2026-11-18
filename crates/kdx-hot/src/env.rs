@@ -60,6 +60,8 @@ pub mod meta {
     pub const FROZEN_FRONTIER: &str = "frozen_frontier";
     pub const NEXT_TXNUM: &str = "next_txnum";
     pub const GEOMETRY: &str = "geometry";
+    /// u64 1 when every hot tx carries its `sndr` posting (FIX-2, `sndr::backfill`).
+    pub const SNDR_HOT: &str = "sndr_hot";
 }
 
 pub struct HotStore {

@@ -2,7 +2,7 @@
 
 ## Commands that write
 
-`run`, `backfill`, `rebuild-range` and `unwind` (and the hidden `tail`) write to the data directory. Each one
+`run`, `backfill`, `rebuild-range` and `unwind` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
 takes an exclusive lock on `<data_dir>/LOCK` and exits at once with an error if another
 kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer-<network>`) before running
 `backfill` or `unwind` by hand. Read-only commands (`inspect`, `segments`, `hot stats`) do
@@ -144,6 +144,24 @@ mainnet01). Do the "Before any big write" check first.
 4. Install the new package (`dpkg -i`), which keeps the conffile.
 5. Start the unit: `systemctl start kda-indexer-mainnet01`. On the empty data dir it runs a
    full backfill, then tails; `systemctl status` shows `backfill r/n` while it runs.
+
+## Rolling back past the sender index
+
+From FIX-2 on, the tail writes the `sndr` posting family (family 6, the txs an account sent;
+see [format.md](format.md)) into the hot store. An older binary does not know family 6: its
+freezer stops with `posting family` at the first such row (nothing is written). Before
+installing an older package, remove the family with the new binary, offline:
+
+```sh
+systemctl stop kda-indexer-mainnet01
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml hot drop-family sndr
+```
+
+It takes the data-dir lock and runs one write txn: it deletes every `TailPostings` row of
+family 6, strips the matching `UndoOp::Posting` ops from the `Undo` rows (so an unwind by the
+old binary finds nothing it does not know) and deletes `Meta sndr_hot`. It prints the counts.
+Then install the old package and start the unit. Only `sndr` can be dropped; the required
+families are refused.
 
 ## Read-only `serve`
 

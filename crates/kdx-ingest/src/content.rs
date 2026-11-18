@@ -32,7 +32,7 @@ pub fn entity_name(d: &dyn Dict, family: u8, e: u64) -> String {
     };
     let lo = e & 0xffff_ffff;
     match Family::ALL.into_iter().find(|f| *f as u8 == family) {
-        Some(Family::Acct) => n(DictKind::Account, e),
+        Some(Family::Acct | Family::Sndr) => n(DictKind::Account, e),
         Some(Family::Pk) => n(DictKind::PubKey, e),
         Some(Family::Xfer) => format!(
             "{} {}",

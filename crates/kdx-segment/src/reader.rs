@@ -25,7 +25,7 @@ pub struct RangeReader {
     pub keys: Keys,
     pub rk: Index,
     pub bh: Index,
-    /// By `Family as usize`.
+    /// By `Family as usize`, the required families only (`Family::REQUIRED`).
     pub postings: Vec<Postings>,
     /// Set bits of `blocks.present` before each 64-bit word.
     rank: Vec<u32>,
@@ -64,7 +64,7 @@ impl RangeReader {
         let rk = Index::open(&f(FileKind::Rk))?;
         let bh = Index::open(&f(FileKind::Bh))?;
         let mut postings = Vec::new();
-        for fam in Family::ALL {
+        for fam in Family::REQUIRED {
             postings.push(Postings::open(&f(FileKind::of_family(fam)), e.first_txnum)?);
         }
         let p = &blocks.header.present;
@@ -218,7 +218,7 @@ impl RangeReader {
     }
 
     pub fn postings(&self, f: Family, entity: u64) -> Option<PostingIter> {
-        self.postings[f as usize].list(entity)
+        self.postings.get(f as usize)?.list(entity)
     }
 
     /// Postings of `(f, entity)` with relative TxNum `<= max_rel` (None = all), newest first.
@@ -228,7 +228,10 @@ impl RangeReader {
         entity: u64,
         max_rel: Option<u32>,
     ) -> Result<Option<PostingIter>> {
-        self.postings[f as usize].list_le(entity, max_rel)
+        match self.postings.get(f as usize) {
+            Some(p) => p.list_le(entity, max_rel),
+            None => Ok(None),
+        }
     }
 
     /// `postings_le` through a per-request memo; `range` is this reader's index in its
@@ -241,7 +244,10 @@ impl RangeReader {
         memo: &ListMemo,
         range: u32,
     ) -> Result<Option<PostingIter>> {
-        self.postings[f as usize].list_le_memo(entity, max_rel, Some((memo, range)))
+        match self.postings.get(f as usize) {
+            Some(p) => p.list_le_memo(entity, max_rel, Some((memo, range))),
+            None => Ok(None),
+        }
     }
 
     fn key(&self) -> (RangeKind, u32, u32, u64) {

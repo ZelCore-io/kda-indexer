@@ -359,7 +359,7 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         let r = RangeReader::open(&ctx.segdir, e, &o.network)?;
         // Postings per relative TxNum, from the step's posting files.
         let mut posts: Vec<Vec<(Family, u64)>> = vec![Vec::new(); e.tx_count as usize];
-        for f in Family::ALL {
+        for f in Family::REQUIRED {
             let p = &r.postings[f as usize];
             for k in 0..p.entities() {
                 let ent = p.entity_at(k);

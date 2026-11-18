@@ -29,6 +29,9 @@ pub enum FileKind {
     /// `pact` postings (format v2).
     Pact,
     Range,
+    /// `sndr` postings (FIX-2). Optional: not in [`FileKind::ALL`] (the required set); a
+    /// range has it only when its `range.toml` lists it.
+    Sndr,
 }
 
 impl FileKind {
@@ -60,6 +63,7 @@ impl FileKind {
             FileKind::Code => "code",
             FileKind::Pact => "pact",
             FileKind::Range => "range",
+            FileKind::Sndr => "sndr",
         }
     }
     pub fn ext(self) -> &'static str {
@@ -80,6 +84,7 @@ impl FileKind {
             kdx_decode::Family::Evt => FileKind::Evt,
             kdx_decode::Family::Code => FileKind::Code,
             kdx_decode::Family::Pact => FileKind::Pact,
+            kdx_decode::Family::Sndr => FileKind::Sndr,
         }
     }
 }

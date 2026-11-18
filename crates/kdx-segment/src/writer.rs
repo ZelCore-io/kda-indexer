@@ -277,7 +277,7 @@ impl RangeWriter {
             dir: dir.to_path_buf(),
             txs: Spool::create(etl.join("txs.spool"))?,
             blocks: Spool::create(etl.join("blocks.spool"))?,
-            postings: Family::ALL
+            postings: Family::REQUIRED
                 .iter()
                 .map(|f| SortedU128::new(&etl, f.name(), opts.postings_mem_entries))
                 .collect(),
@@ -360,7 +360,11 @@ impl RangeWriter {
             }
             self.cmd_reencoded += tx.cmd_reencoded as u64;
             for (fam, ent) in &ix.postings {
-                self.postings[*fam as usize].push((*ent as u128) << 64 | rel as u128)?;
+                // Only the required families have a buffer; `sndr.pst` is written by the
+                // optional-file layer (FIX-2 T3), until then its postings are not stored.
+                if let Some(col) = self.postings.get_mut(*fam as usize) {
+                    col.push((*ent as u128) << 64 | rel as u128)?;
+                }
             }
         }
         Ok(())
@@ -448,7 +452,7 @@ impl RangeWriter {
         let bh_kind = write_index(&tmp.join(fname(FileKind::Bh)), bh, opts.force_sorted_index)?;
 
         let mut pstats = BTreeMap::new();
-        for (fam, col) in Family::ALL.iter().zip(postings) {
+        for (fam, col) in Family::REQUIRED.iter().zip(postings) {
             let mut pw = PostingsWriter::create(
                 &tmp.join(fname(FileKind::of_family(*fam))),
                 *fam,

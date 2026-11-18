@@ -52,6 +52,16 @@ cannot be upgraded in place; rebuild it (`docs/operations.md`, "Format upgrade")
   the full pactId on the record. The hot `Defpacts` table is deprecated (T-5): the tail no longer
   writes it, nothing reads it, and rows left by older versions stay until an undo of their
   block removes them.
+- **`sndr` posting family** (FIX-2; family byte 6, file `sndr.pst`, `TailPostings` family 6):
+  the txs an account sent. Entity = the AccountId of `meta.sender`
+  (`kdx_decode::index::sender_of`). A tx is posted when it is a user tx whose cmd parses (not
+  `cmd_unparsed`), `meta.sender` is a string and it is an indexable account (1..=256 bytes):
+  exactly the rule that gives the sender its `acct` posting, so `sndr(A) ⊆ acct(A)`. Additive,
+  no version bump: the tail writes family-6 rows with undo ops like every family;
+  `kdx_hot::sndr::backfill` adds them to a tail written without them and sets
+  `Meta sndr_hot = 1` (u64); `hot drop-family sndr` removes them (see operations.md). In
+  segments `sndr.pst` is an optional file, listed in `range.toml` when present; the segment
+  writer does not store it yet, so frozen and backfilled ranges carry no `sndr` lists for now.
 - **Versions.** Hot `Meta format_version` 2; `manifest.json` and every `range.toml`
   `format_version` 2. Posting files keep their own version byte 1 and records keep 1.
 - **MDBX** opens with 64 named-database slots (`max_dbs`; 32 before), room for later
@@ -492,6 +502,7 @@ One file per family per range. Families and their entity keys:
 | 3 | `evt` | EventNameId, or `1 << 32 | ModuleId` for "any event of the module" |
 | 4 | `code` | first 8 bytes of the CodeHash, big-endian (verify the full hash on read) |
 | 5 | `pact` | first 8 bytes of the pactId, big-endian: the exec that starts the defpact and every `cont` step (verify the full pactId on read) |
+| 6 | `sndr` | AccountId of the tx's `meta.sender`: txs the account sent (user txs with a parsed cmd and an indexable sender; a subset of `acct`). Optional file, present when `range.toml` lists it |
 
 A transfer is an event whose qualified name ends in `TRANSFER` with exactly three params:
 `from` and `to` strings, and an amount that is a number, a string starting with a rational

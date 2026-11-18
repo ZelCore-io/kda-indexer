@@ -330,6 +330,59 @@ mod balance_mark_tests {
         assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 2);
         txn.commit().unwrap();
     }
+
+    /// FIX-2: a `sndr` posting (family 6) marks no balance row, on apply or on undo; the
+    /// sender's balance is covered by its `acct` posting.
+    #[test]
+    fn sndr_postings_mark_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        dict.intern(DictKind::Module, "coin");
+        let alice = dict.intern(DictKind::Account, "alice");
+        let key = TxKey::new(300, 5, 1);
+        let ib = IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32([3u8; 32]),
+                chain: 5,
+                height: 300,
+                ..Default::default()
+            },
+            txs: vec![TxRecord {
+                key,
+                ..Default::default()
+            }],
+            idx: vec![TxIndex {
+                key,
+                postings: vec![(Family::Sndr, alice as u64)],
+                pact_id: None,
+                code_hash: None,
+            }],
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        };
+        assert!(crate::balances::marking());
+        super::apply(&mut txn, &ib, &mut dict).unwrap();
+        assert_eq!(txn.count(Table::TailPostings).unwrap(), 1);
+        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 0);
+        assert_eq!(txn.count(Table::Tokens).unwrap(), 0);
+        // Direct calls, both directions, with a coin module and an entity that would be a
+        // valid AccountId or xfer entity.
+        let coin = crate::balances::coin_module(&txn).unwrap();
+        assert!(coin.is_some());
+        for e in [alice as u64, xfer_entity(alice, coin.unwrap())] {
+            for note in [true, false] {
+                crate::balances::mark_posting(&mut txn, Family::Sndr as u8, e, key, coin, note)
+                    .unwrap();
+            }
+        }
+        assert_eq!(super::unwind_to(&mut txn, 5, 299).unwrap(), 1);
+        assert_eq!(txn.count(Table::TailPostings).unwrap(), 0);
+        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 0);
+        assert_eq!(txn.count(Table::Tokens).unwrap(), 0);
+        txn.commit().unwrap();
+    }
 }
 
 #[cfg(test)]

@@ -216,7 +216,7 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
     }
     // Posting lists: decode, ascending, inside the range; a Roaring list's lazy walk (the
     // read path) equals its full decode from three bounds.
-    for f in Family::ALL {
+    for f in Family::REQUIRED {
         let p = &r.postings[f as usize];
         for i in 0..p.entities() {
             rep.posting_lists_checked += 1;
