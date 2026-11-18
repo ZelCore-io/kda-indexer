@@ -872,3 +872,49 @@ mod tests {
         );
     }
 }
+
+/// `scripts/stock-schema/cases.json` (FIX-3 part E, M7): the synthetic cross-check documents
+/// `scripts/stock-schema/oracle.js` runs through stock's own libraries. Each case records the
+/// verdict of this port (`depth`: refused by the depth rule; `cx`: stock's complexity), so
+/// the oracle's output can be compared line by line, and this test keeps the file true to
+/// the port.
+#[cfg(test)]
+mod cases {
+    use super::*;
+    use crate::limits::type_registry;
+
+    #[test]
+    fn the_cross_check_cases_hold() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/stock-schema/cases.json"
+        );
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(cases.len(), 21);
+        let mut got = Vec::new();
+        for c in &cases {
+            let q = c["q"].as_str().unwrap();
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            let vars = crate::http::variables(c.get("vars").cloned().unwrap_or_default())
+                .unwrap_or_default();
+            let op = c.get("op").and_then(serde_json::Value::as_str);
+            let reg = type_registry();
+            let cx = complexity(reg, &doc, op, &vars);
+            let depth = !depth_errors(reg, &doc).is_empty();
+            got.push(serde_json::json!({"name": c["name"], "depth": depth, "cx": cx}));
+            let want = c.get("expect");
+            if std::env::var_os("KDX_PRINT_CASES").is_none() {
+                assert_eq!(
+                    want,
+                    Some(&serde_json::json!({"depth": depth, "cx": cx})),
+                    "{}",
+                    c["name"]
+                );
+            }
+        }
+        if std::env::var_os("KDX_PRINT_CASES").is_some() {
+            println!("{}", serde_json::Value::Array(got));
+        }
+    }
+}

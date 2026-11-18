@@ -87,15 +87,17 @@ pub const COUNT_WALK_PATH: &str = "/~graphql-count-walk";
 /// own totalCount and that alone accounts for the counts (allowlist id
 /// `graphql-r97-oracle-list-over-count`).
 pub const ORACLE_LIST_OVER_COUNT_PATH: &str = "/~graphql-r97-oracle-list-over-count";
-/// FIX-3 (O1, class ORACLE-COUNT-SHORT): the count walk's hit when the oracle's totalCount is
-/// ours' minus one and the node confirms every row ours walked, without the oracle's list
-/// (allowlist id `graphql-oracle-count-short`).
+/// FIX-3 (O1, class ORACLE-COUNT-SHORT; part E, S2): the count walk's hit when the oracle's
+/// totalCount is ours' minus one, its walked list is ours' minus exactly one row, and the node
+/// confirms that row as sent by the account in a canonical block (allowlist id
+/// `graphql-oracle-count-short`).
 pub const ORACLE_COUNT_SHORT_PATH: &str = "/~graphql-oracle-count-short";
-/// Request keys per `/poll` read of [`Ctx::oracle_count_short`].
-pub const POLL_BATCH: usize = 50;
 /// R-P5P9-86 TC: the walk passed [`COUNT_WALK_ROWS`] rows on a side, "count walk capped"
 /// (unexplained, its own reason; never allowlisted).
 pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
+/// FIX-3 part E (M3): the count walk's ours refused a page size (complexity) the oracle's
+/// walk answered: our gate refused what stock admits (unexplained; never allowlisted).
+pub const COUNT_WALK_OURS_REFUSED_PATH: &str = "/~graphql-count-walk-ours-refused";
 /// R-P5P9-92 (1): visible hit of the count walk's oracle that counts heights (allowlist id
 /// `graphql-r75-oracle-counts-heights`, ACCEPTED; scoped to Transactions-9e58b95d).
 pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-heights";
@@ -3561,6 +3563,18 @@ pub(crate) struct Reads {
     /// R-P5P9-86 T: whether the document selects `... on ExecutionPayload` and
     /// `... on ContinuationPayload` (`None`: no document).
     pub(crate) payload_members: Option<(bool, bool)>,
+    /// FIX-3 part E (M3): page sizes each side's count walk ([ours, oracle]) had refused and
+    /// halved, and the largest it had answered.
+    pub(crate) walk_pages: [WalkPages; 2],
+}
+
+/// One side's count-walk page sizes (FIX-3 part E, M3).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WalkPages {
+    /// `first` values refused on query complexity (each then halved).
+    pub(crate) refused: Vec<u64>,
+    /// The largest `first` a page was answered at.
+    pub(crate) answered: Option<u64>,
 }
 
 impl Reads {
@@ -4735,9 +4749,31 @@ impl Ctx {
         let (Some(na), Some(nb)) = (count(&d[i].a), count(&d[i].b)) else {
             return;
         };
+        st.walk_pages = Default::default();
         let walked = self
             .count_walk(ta, tb, op, vars, &root, (na, nb), max, record_height, st)
             .await;
+        // M3: a halved walk is recorded in the record's note; ours refusing a size the
+        // oracle answered is a diff of its own.
+        let [pa, pb] = std::mem::take(&mut st.walk_pages);
+        if !pa.refused.is_empty() || !pb.refused.is_empty() {
+            let ev = json!({"oursRefused": pa.refused, "oracleRefused": pb.refused,
+                "oursAnswered": pa.answered, "oracleAnswered": pb.answered});
+            let halved = format!("count walk halved first on a complexity refusal: {ev}");
+            *note = Some(match note.take() {
+                Some(n) => format!("{n}; {halved}"),
+                None => halved,
+            });
+            if let Some(b) = pb.answered {
+                if pa.refused.iter().any(|&s| s <= b) {
+                    d.push(entry(
+                        COUNT_WALK_OURS_REFUSED_PATH,
+                        Some(json!({"refused": pa.refused})),
+                        Some(json!({"answered": b})),
+                    ));
+                }
+            }
+        }
         let why = match walked {
             Ok(hits) => {
                 d.remove(i);
@@ -4781,8 +4817,19 @@ impl Ctx {
                 "count walk not applied: the document passes no first and after variables".into(),
             ));
         }
-        let wa = self.walk_list(ta, op, vars, root, &fv, &av).await?;
-        let wb = self.walk_list(tb, op, vars, root, &fv, &av).await;
+        let mut pages = [WalkPages::default(), WalkPages::default()];
+        let wa = self
+            .walk_list(ta, op, vars, root, &fv, &av, &mut pages[0])
+            .await;
+        let wb = match &wa {
+            Ok(_) => {
+                self.walk_list(tb, op, vars, root, &fv, &av, &mut pages[1])
+                    .await
+            }
+            Err(_) => Err((false, String::new())),
+        };
+        st.walk_pages = pages;
+        let wa = wa?;
         let both = match &wb {
             Ok(wb) => {
                 self.count_walk_both(
@@ -4817,8 +4864,9 @@ impl Ctx {
                         ));
                     }
                 }
+                let walked = wb.as_ref().ok().map(Vec::as_slice);
                 match self
-                    .oracle_count_short(op, vars, root, (na, nb), &wa, record_height, st)
+                    .oracle_count_short(op, vars, root, (na, nb), (&wa, walked), record_height, st)
                     .await
                 {
                     Ok(out) => Ok(out),
@@ -5008,15 +5056,16 @@ impl Ctx {
         Ok(out)
     }
 
-    /// FIX-3 (O1, class ORACLE-COUNT-SHORT): the oracle's totalCount is ours' minus one
-    /// (`counts`), and that is explained without the oracle's list when ours' count equals
-    /// ours' walked rows `wa` (those at or below `record_height`), no request key repeats
-    /// among them, and the node confirms every one: `/poll` (batches of [`POLL_BATCH`] keys,
-    /// each one node read under the compare's cap and the run's budget) places it in the
-    /// row's own block and height, and the node's transaction lies inside the query's filter
-    /// (for `accountName`, the sender and gas payer, its first TRANSFER). Then ours lists
-    /// exactly the node-canonical txs it counts, and the oracle counts one fewer: the oracle
-    /// misses one, or holds it in a block it flags non-canonical. `Err`: why not.
+    /// FIX-3 (O1, class ORACLE-COUNT-SHORT; part E, S2): the oracle's totalCount is ours'
+    /// minus one (`counts`). Explained only when the oracle's list could be walked (`wb`), ours'
+    /// count equals ours' walked rows `wa` (those at or below `record_height`), no request key
+    /// repeats among them, and exactly one of them is missing from the oracle's list: that
+    /// row is named in the hit and confirmed on the node alone (one `/poll` under the
+    /// compare's cap and the run's budget): canonical, in the row's own block and height,
+    /// and sent by the query's `accountName` (sender and gas payer, its first TRANSFER).
+    /// Then the oracle misses that one tx, or holds it in a block it flags non-canonical.
+    /// Without the oracle's list the extra row is not known and the record stays
+    /// unexplained. `Err`: why not.
     #[allow(clippy::too_many_arguments)]
     async fn oracle_count_short(
         &self,
@@ -5024,10 +5073,15 @@ impl Ctx {
         vars: &Map<String, Value>,
         root: &str,
         (na, nb): (u64, u64),
-        wa: &[Value],
+        (wa, wb): (&[Value], Option<&[Value]>),
         record_height: u64,
         st: &mut Reads,
     ) -> Result<Vec<DiffEntry>, String> {
+        let Some(wb) = wb else {
+            return Err(
+                "the oracle's list could not be walked, so its missing row is not known".into(),
+            );
+        };
         let bounded = record_height < u64::MAX;
         let mut rows = Vec::new();
         for e in wa {
@@ -5052,7 +5106,9 @@ impl Ctx {
         let conn = |rows: Vec<Value>| json!({"edges": rows, "pageInfo": {"hasNextPage": false}});
         let prep = prepare_in(&conn(rows), &conn(Vec::new()), &field)?;
         let mut seen = std::collections::HashSet::new();
-        let mut by_chain: std::collections::BTreeMap<u8, Vec<&Row>> = Default::default();
+        let theirs: std::collections::HashSet<_> =
+            wb.iter().filter_map(|e| prepared_id(e, root).rk).collect();
+        let mut extra: Vec<&Row> = Vec::new();
         for r in &prep.a {
             if r.id.kind != Some(Kind::Tx) || r.id.coinbase {
                 return Err(format!(
@@ -5069,47 +5125,50 @@ impl Ctx {
             if !seen.insert(rk.to_string()) {
                 return Err(format!("ours lists request key {rk} twice"));
             }
-            let Some(chain) = r.id.chain else {
-                return Err(format!("a row of ours has no chain: {}", r.id.evidence()));
-            };
-            by_chain.entry(chain).or_default().push(r);
-        }
-        let filter = Filter::of(Some(q), Some(root), vars);
-        let mut polled = 0usize;
-        for (chain, rs) in by_chain {
-            for batch in rs.chunks(POLL_BATCH) {
-                self.h7_take(st)?;
-                let keys: Vec<String> = batch.iter().filter_map(|r| r.id.rk.clone()).collect();
-                let got = self
-                    .node
-                    .poll(chain, &keys)
-                    .await
-                    .map_err(|e| format!("poll failed: {e}"))?;
-                for r in batch {
-                    let rk = r.id.rk.as_deref().unwrap_or_default();
-                    let what = r.id.evidence();
-                    let p = got
-                        .get(rk)
-                        .ok_or_else(|| format!("the node does not find {what}"))?;
-                    let v = poll_verdict_at(&r.id, node_of(r), p, false, None, false);
-                    if v.canon != Canon::Yes {
-                        return Err(format!("the node does not confirm {what}: {}", v.why));
-                    }
-                    if r.id.block.is_some() && v.block != r.id.block {
-                        return Err(format!("the node places {what} in another block"));
-                    }
-                    if let Some(w) = filter.outside(r, v.height, &v) {
-                        return Err(format!("{what}: {w} on the node"));
-                    }
-                    polled += 1;
-                }
+            if !theirs.contains(rk) {
+                extra.push(r);
             }
+        }
+        let [r] = extra.as_slice() else {
+            return Err(format!(
+                "ours lists {} rows the oracle's list lacks, not exactly one",
+                extra.len()
+            ));
+        };
+        let filter = Filter::of(Some(q), Some(root), vars);
+        if filter.account.is_none() {
+            return Err("no accountName: the missing row cannot be tied to a sender".into());
+        }
+        let what = r.id.evidence();
+        let (Some(chain), Some(rk)) = (r.id.chain, r.id.rk.clone()) else {
+            return Err(format!("a row of ours has no chain: {what}"));
+        };
+        self.h7_take(st)?;
+        let got = self
+            .node
+            .poll(chain, std::slice::from_ref(&rk))
+            .await
+            .map_err(|e| format!("poll failed: {e}"))?;
+        let p = got
+            .get(&rk)
+            .ok_or_else(|| format!("the node does not find {what}"))?;
+        let v = poll_verdict_at(&r.id, node_of(r), p, false, None, false);
+        if v.canon != Canon::Yes {
+            return Err(format!("the node does not confirm {what}: {}", v.why));
+        }
+        if r.id.block.is_some() && v.block != r.id.block {
+            return Err(format!("the node places {what} in another block"));
+        }
+        if let Some(w) = filter.outside(r, v.height, &v) {
+            return Err(format!("{what}: {w} on the node"));
         }
         Ok(vec![entry(
             ORACLE_COUNT_SHORT_PATH,
-            Some(json!({"count": na, "walked": na, "nodeConfirmed": polled,
+            Some(json!({"count": na, "walked": na, "nodeConfirmed": 1,
+                "extra": {"requestKey": rk, "row": what, "chain": chain,
+                    "nodeHeight": v.height, "nodeBlock": v.block},
                 "bound": bounded.then_some(record_height), "nodeReads": st.node})),
-            Some(json!({"count": nb})),
+            Some(json!({"count": nb, "walked": wb.len()})),
         )])
     }
 
@@ -5309,8 +5368,10 @@ impl Ctx {
     /// page's `endCursor` (else its last row's `cursor`); `Err((true, _))` past
     /// [`COUNT_WALK_ROWS`] rows. FIX-3 (O1): a page refused with a complexity `LIMIT` is read
     /// again at the same `after` with `first` halved (down to 1; the rest of the walk keeps
-    /// the smaller size, each attempt one read of the budget); any other page without `data`
-    /// fails the walk with the answer's error text.
+    /// the smaller size, each attempt one read of the budget), the sizes recorded in `pages`
+    /// (part E, M3); any other page without `data` fails the walk with the answer's error
+    /// text.
+    #[allow(clippy::too_many_arguments)]
     async fn walk_list(
         &self,
         t: &Target,
@@ -5319,6 +5380,7 @@ impl Ctx {
         root: &str,
         first_var: &str,
         after_var: &str,
+        pages: &mut WalkPages,
     ) -> Result<Vec<Value>, (bool, String)> {
         let fail = |why: &str| (false, format!("count walk: {} {why}", t.name));
         let mut out: Vec<Value> = Vec::new();
@@ -5348,6 +5410,7 @@ impl Ctx {
             let data = match self.gql_read_why(t, &op.query, Value::Object(v)).await {
                 Ok(d) => d,
                 Err(e) if e.complexity && first > 1 => {
+                    pages.refused.push(first);
                     first = (first / 2).max(1);
                     continue;
                 }
@@ -5358,6 +5421,7 @@ impl Ctx {
                     )))
                 }
             };
+            pages.answered = pages.answered.max(Some(first));
             let c = data
                 .get(root)
                 .ok_or_else(|| fail("answered a page without the root list"))?;

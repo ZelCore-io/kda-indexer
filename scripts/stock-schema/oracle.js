@@ -4,7 +4,11 @@
 //   npm i graphql@16.10.0 @graphql-tools/schema@10.0.6 @graphile/depth-limit@0.3.1 \
 //     graphql-query-complexity@1.0.0
 // Usage: node oracle.js <dir holding node_modules> <schema.graphql> <cases.json>
-// where cases.json is [{"name", "q", "vars"?, "op"?}]; prints one JSON line per case.
+// where cases.json is [{"name", "q", "vars"?, "op"?, "expect"?}]; prints one JSON line per case.
+// cases.json beside this script holds synthetic cross-check documents with this indexer's
+// verdict in "expect" ({depth: refused by the depth rule, cx}); the oracle's "depth" (a
+// non-empty list is a refusal) and "cx" should match it. The Rust test
+// stock_limits::cases::the_cross_check_cases_hold keeps "expect" true to the port.
 const path=require('path');const fs=require('fs');
 const gen=process.argv[2];
 const req=m=>require(path.join(gen,'node_modules',m));

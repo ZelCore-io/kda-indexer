@@ -3608,6 +3608,11 @@ mod tests {
         let depth = json!({"errors": [{"message": "m",
             "extensions": {"code": "LIMIT", "limit": "depth"}}]});
         assert!(!super::page_data(&depth).unwrap_err().complexity);
+        // FIX-3 part E (M2): ours' count-walk bound is named `counts`, and a smaller page does
+        // not get past it, so the walk does not halve on it.
+        let counts = json!({"errors": [{"message": "more than 2 list totalCounts in one operation",
+            "extensions": {"code": "LIMIT", "limit": "counts"}}]});
+        assert!(!super::page_data(&counts).unwrap_err().complexity);
         let e = super::page_data(&json!({"data": null})).unwrap_err();
         assert_eq!(
             (e.complexity, e.text.as_str()),

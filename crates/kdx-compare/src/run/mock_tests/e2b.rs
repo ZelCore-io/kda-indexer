@@ -1703,14 +1703,23 @@ fn limit_reply(
 
 /// FIX-3 (O1): the count walk of #243's shape when ours refuses `first: 100` on complexity:
 /// it halves `first` at the same cursor until a page passes (100, 50, 25), keeps that size,
-/// and settles as before. A walk refused down to `first: 1` and a walk answered with another
-/// error stay unexplained, the note naming the answer's error instead of "no data".
+/// and settles as before. Part E (M3): the halving is recorded in the note (sizes, and which
+/// side refused); when ours refused a size the oracle's walk answered, the record carries an
+/// unexplained `count-walk-ours-refused` diff. A walk refused down to `first: 1` and a walk
+/// answered with another error stay unexplained, the note naming the answer's error instead
+/// of "no data".
 #[tokio::test]
 async fn fix3_the_count_walk_halves_first_on_a_complexity_limit() {
     let page_a = tc_page(vec![tc_row("t2", Some("B100"))], 1);
     let page_b = tc_page(vec![tc_row("t2", Some("B100"))], 2);
     let walk_b = vec![tc_row("t2", Some("B100")), tc_row("q", Some("X100"))];
-    for (max_first, explained) in [(30u64, true), (0, false)] {
+    let refused = crate::graphql_window::COUNT_WALK_OURS_REFUSED_PATH.to_string();
+    // (ours' largest page, the oracle's largest page or None for every size, explained)
+    for (max_first, oracle_max, explained) in [
+        (30u64, Some(30u64), true),
+        (30, None, false),
+        (0, Some(30), false),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let firsts = Arc::new(Mutex::new(Vec::new()));
         let nu = node_server(tc_node()).await;
@@ -1721,7 +1730,18 @@ async fn fix3_the_count_walk_halves_first_on_a_complexity_limit() {
             firsts.clone(),
         ))
         .await;
-        let bu = ours_fn_server(walk_reply("transfers", walk_b.clone(), 2)).await;
+        let bu = match oracle_max {
+            Some(m) => {
+                ours_fn_server(limit_reply(
+                    walk_b.clone(),
+                    2,
+                    m,
+                    Arc::new(Mutex::new(Vec::new())),
+                ))
+                .await
+            }
+            None => ours_fn_server(walk_reply("transfers", walk_b.clone(), 2)).await,
+        };
         let ops = c3_ops(dir.path());
         let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, ""))
             .await
@@ -1730,13 +1750,7 @@ async fn fix3_the_count_walk_halves_first_on_a_complexity_limit() {
         let un = c3_unexplained(&ctx, &d);
         let note = note.unwrap_or_default();
         let asked = firsts.lock().unwrap().clone();
-        if explained {
-            assert!(un.is_empty(), "{un:?} {d:?} {note}");
-            assert!(d
-                .iter()
-                .any(|e| e.path == crate::graphql_window::COUNT_WALK_PATH));
-            assert_eq!(asked, [100, 50, 25], "{asked:?}");
-        } else {
+        if max_first == 0 {
             assert!(
                 un.contains(&"/data/transfers/totalCount".to_string()),
                 "{un:?}"
@@ -1744,6 +1758,19 @@ async fn fix3_the_count_walk_halves_first_on_a_complexity_limit() {
             assert_eq!(asked, [100, 50, 25, 12, 6, 3, 1], "{asked:?}");
             assert!(note.contains("first 1"), "{note}");
             assert!(note.contains("query complexity 26 exceeds 2000"), "{note}");
+            continue;
+        }
+        assert_eq!(asked, [100, 50, 25], "{asked:?}");
+        assert!(note.contains("\"oursRefused\":[100,50]"), "{note}");
+        assert!(d
+            .iter()
+            .any(|e| e.path == crate::graphql_window::COUNT_WALK_PATH));
+        if explained {
+            assert!(un.is_empty(), "{un:?} {d:?} {note}");
+            assert!(note.contains("\"oracleRefused\":[100,50]"), "{note}");
+        } else {
+            assert_eq!(un, std::slice::from_ref(&refused), "{d:?} {note}");
+            assert!(note.contains("\"oracleAnswered\":100"), "{note}");
         }
     }
 
@@ -1807,8 +1834,9 @@ fn ocs_node(rows: &[(String, u64)], payer: &str) -> NodeMock {
 }
 
 /// One count walk of a `transactions(accountName: "k:s")` record: ours lists `ours` and
-/// counts `na`; the oracle counts `nb` and answers every walk page with an error (its list
-/// cannot be walked). `extra` goes into the config. Returns (unexplained, diff, note).
+/// counts `na`; the oracle counts `nb` and lists `oracle`, or (`None`) answers every walk
+/// page with an error (its list cannot be walked). `extra` goes into the config. Returns
+/// (unexplained, diff, note).
 async fn ocs_walk(
     node: NodeMock,
     ours: Vec<Value>,
@@ -1816,14 +1844,20 @@ async fn ocs_walk(
     nb: u64,
     extra: &str,
     spent: usize,
+    oracle: Option<Vec<Value>>,
 ) -> (Vec<String>, Vec<DiffEntry>, String) {
     let dir = tempfile::tempdir().unwrap();
     let nu = node_server(node).await;
     let au = ours_fn_server(walk_reply("transactions", ours, na)).await;
-    let bu = ours_fn_server(|_: &Value| {
-        json!({"data": null, "errors": [{"message": "oracle: cursor paging unavailable"}]})
-    })
-    .await;
+    let bu = match oracle {
+        Some(rows) => ours_fn_server(walk_reply("transactions", rows, nb)).await,
+        None => {
+            ours_fn_server(|_: &Value| {
+                json!({"data": null, "errors": [{"message": "oracle: cursor paging unavailable"}]})
+            })
+            .await
+        }
+    };
     let ops = ocs_ops(dir.path());
     let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, extra))
         .await
@@ -1855,11 +1889,11 @@ async fn ocs_walk(
     (c3_unexplained(&ctx, &d), d, note.unwrap_or_default())
 }
 
-/// FIX-3 (O1, class ORACLE-COUNT-SHORT): the oracle's totalCount is ours − 1, ours' count
-/// equals ours' walked rows, no request key repeats and the node places every walked row in
-/// its block with the account as gas payer (first TRANSFER): explained without the oracle's
-/// list, with node `/poll` reads in batches. Each condition broken leaves the count
-/// difference unexplained, the note saying why.
+/// FIX-3 (O1, class ORACLE-COUNT-SHORT; part E, S2): the oracle's totalCount is ours − 1 and
+/// its walked list is ours' minus exactly one row. That one row is named in the hit and
+/// confirmed on the node alone (one `/poll`): canonical, in its own block, with the account as
+/// sender and gas payer (first TRANSFER). An oracle list that cannot be walked, or any
+/// condition broken, leaves the count difference unexplained, the note saying why.
 #[tokio::test]
 async fn fix3_oracle_count_short_is_settled_on_the_node() {
     let keys: Vec<(String, u64)> = (0..120u64)
@@ -1871,17 +1905,29 @@ async fn fix3_oracle_count_short_is_settled_on_the_node() {
             .map(|(rk, h)| ocs_row(rk, *h, sender))
             .collect()
     };
+    let without = |rk: &str| -> Vec<Value> {
+        keys.iter()
+            .rev()
+            .filter(|(k, _)| k != rk)
+            .map(|(k, h)| ocs_row(k, *h, "k:s"))
+            .collect()
+    };
     let path = crate::graphql_window::ORACLE_COUNT_SHORT_PATH;
+    let total = "/data/transactions/totalCount".to_string();
 
-    // Explained: 120 rows, the oracle counts 119; 3 batched polls (50 + 50 + 20).
+    // Explained: the oracle lists ours minus rk050 and counts 119; only rk050 is polled.
     let node = ocs_node(&keys, "k:s");
     let calls = node.calls.clone();
-    let (un, d, note) = ocs_walk(node, rows("k:s"), 120, 119, "", 0).await;
+    let (un, d, note) = ocs_walk(node, rows("k:s"), 120, 119, "", 0, Some(without("rk050"))).await;
     assert!(un.is_empty(), "{un:?} {d:?} {note}");
     let hit = d.iter().find(|e| e.path == path).expect("the class hit");
-    assert_eq!(hit.a.as_ref().unwrap()["walked"], json!(120));
+    let a = hit.a.as_ref().unwrap();
+    assert_eq!(a["walked"], json!(120));
+    assert_eq!(a["extra"]["requestKey"], json!("rk050"), "{a}");
+    assert_eq!(a["extra"]["row"]["requestKey"], json!("rk050"), "{a}");
+    assert_eq!(a["extra"]["nodeHeight"], json!(150), "{a}");
     assert_eq!(hit.b.as_ref().unwrap()["count"], json!(119));
-    assert!(d.iter().all(|e| e.path != "/data/transactions/totalCount"));
+    assert!(d.iter().all(|e| e.path != total));
     let polls = calls
         .lock()
         .unwrap()
@@ -1889,14 +1935,39 @@ async fn fix3_oracle_count_short_is_settled_on_the_node() {
         .filter(|c| c.starts_with("poll "))
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(polls, ["poll 0 50", "poll 0 50", "poll 0 20"]);
-
-    // The oracle two short: not this class.
-    let (un, _, note) = ocs_walk(ocs_node(&keys, "k:s"), rows("k:s"), 120, 118, "", 0).await;
+    // The one-sided row is polled by the walk's own rules, then by this class: one key each.
     assert!(
-        un.contains(&"/data/transactions/totalCount".to_string()),
+        !polls.is_empty() && polls.len() <= 2 && polls.iter().all(|p| p == "poll 0 1"),
+        "{polls:?}"
+    );
+
+    // The oracle's list cannot be walked: unexplained, nothing polled.
+    let node = ocs_node(&keys, "k:s");
+    let calls = node.calls.clone();
+    let (un, _, note) = ocs_walk(node, rows("k:s"), 120, 119, "", 0, None).await;
+    assert!(un.contains(&total), "{note}");
+    assert!(
+        note.contains("the oracle's list could not be walked"),
         "{note}"
     );
+    assert!(calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|c| !c.starts_with("poll ")));
+
+    // The oracle two short: not this class.
+    let (un, _, note) = ocs_walk(
+        ocs_node(&keys, "k:s"),
+        rows("k:s"),
+        120,
+        118,
+        "",
+        0,
+        Some(without("rk050")),
+    )
+    .await;
+    assert!(un.contains(&total), "{note}");
 
     // Ours' count is not ours' walked rows.
     let (un, _, note) = ocs_walk(
@@ -1906,40 +1977,50 @@ async fn fix3_oracle_count_short_is_settled_on_the_node() {
         119,
         "",
         0,
+        Some(without("rk050")),
     )
     .await;
+    assert!(un.contains(&total), "{note}");
     assert!(
-        un.contains(&"/data/transactions/totalCount".to_string()),
+        note.contains("ours counts 120 and lists 119 rows"),
         "{note}"
     );
-    assert!(note.contains("ours counts 120 and lists 119 rows"), "{note}");
 
     // A repeated request key.
     let mut dup = rows("k:s");
     dup[1] = dup[0].clone();
-    let (un, _, note) = ocs_walk(ocs_node(&keys, "k:s"), dup, 120, 119, "", 0).await;
-    assert!(
-        un.contains(&"/data/transactions/totalCount".to_string()),
-        "{note}"
-    );
-    assert!(note.contains("request key"), "{note}");
+    let (un, _, note) = ocs_walk(
+        ocs_node(&keys, "k:s"),
+        dup,
+        120,
+        119,
+        "",
+        0,
+        Some(without("rk050")),
+    )
+    .await;
+    assert!(un.contains(&total), "{note}");
+    assert!(note.contains("twice"), "{note}");
 
-    // One walked row the node does not hold.
+    // The extra row is one the node does not hold.
     let mut node = ocs_node(&keys, "k:s");
     node.polls.remove("rk050");
-    let (un, _, note) = ocs_walk(node, rows("k:s"), 120, 119, "", 0).await;
-    assert!(
-        un.contains(&"/data/transactions/totalCount".to_string()),
-        "{note}"
-    );
+    let (un, _, note) = ocs_walk(node, rows("k:s"), 120, 119, "", 0, Some(without("rk050"))).await;
+    assert!(un.contains(&total), "{note}");
     assert!(note.contains("rk050"), "{note}");
 
-    // The node's gas payer (first TRANSFER) is another account.
-    let (un, _, note) = ocs_walk(ocs_node(&keys, "k:other"), rows("k:s"), 120, 119, "", 0).await;
-    assert!(
-        un.contains(&"/data/transactions/totalCount".to_string()),
-        "{note}"
-    );
+    // The extra row's gas payer on the node (first TRANSFER) is another account.
+    let (un, _, note) = ocs_walk(
+        ocs_node(&keys, "k:other"),
+        rows("k:s"),
+        120,
+        119,
+        "",
+        0,
+        Some(without("rk050")),
+    )
+    .await;
+    assert!(un.contains(&total), "{note}");
     assert!(note.contains("account (the sender)"), "{note}");
 
     // The compare's node read cap leaves it unexplained.
@@ -1949,12 +2030,10 @@ async fn fix3_oracle_count_short_is_settled_on_the_node() {
         120,
         119,
         "",
-        crate::graphql_window::NODE_READS - 1,
+        crate::graphql_window::NODE_READS,
+        Some(without("rk050")),
     )
     .await;
-    assert!(
-        un.contains(&"/data/transactions/totalCount".to_string()),
-        "{note}"
-    );
+    assert!(un.contains(&total), "{note}");
     assert!(note.contains("node reads per compare"), "{note}");
 }
