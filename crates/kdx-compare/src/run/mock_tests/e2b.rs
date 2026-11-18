@@ -1679,3 +1679,282 @@ async fn h_tc_the_referee_walks_up_to_20000_rows_a_side() {
     let note = note.unwrap_or_default();
     assert!(note.contains("lists more than 20000 rows"), "{note}");
 }
+
+/// FIX-3 (O1): ours refusing pages above `max_first` with a complexity `LIMIT` (as ours does
+/// for a document priced past 2,000), else `walk_reply`; every `first` asked is logged.
+fn limit_reply(
+    rows: Vec<Value>,
+    count: u64,
+    max_first: u64,
+    firsts: Arc<Mutex<Vec<u64>>>,
+) -> impl Fn(&Value) -> Value + Clone + Send + Sync {
+    let ok = walk_reply("transfers", rows, count);
+    move |req: &Value| {
+        let first = req["variables"]["first"].as_u64().unwrap_or(100);
+        firsts.lock().unwrap().push(first);
+        if first > max_first {
+            return json!({"data": null, "errors": [{"message":
+                format!("query complexity {} exceeds 2000", first * 20 + 6),
+                "extensions": {"code": "LIMIT", "limit": "complexity"}}]});
+        }
+        ok(req)
+    }
+}
+
+/// FIX-3 (O1): the count walk of #243's shape when ours refuses `first: 100` on complexity:
+/// it halves `first` at the same cursor until a page passes (100, 50, 25), keeps that size,
+/// and settles as before. A walk refused down to `first: 1` and a walk answered with another
+/// error stay unexplained, the note naming the answer's error instead of "no data".
+#[tokio::test]
+async fn fix3_the_count_walk_halves_first_on_a_complexity_limit() {
+    let page_a = tc_page(vec![tc_row("t2", Some("B100"))], 1);
+    let page_b = tc_page(vec![tc_row("t2", Some("B100"))], 2);
+    let walk_b = vec![tc_row("t2", Some("B100")), tc_row("q", Some("X100"))];
+    for (max_first, explained) in [(30u64, true), (0, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let firsts = Arc::new(Mutex::new(Vec::new()));
+        let nu = node_server(tc_node()).await;
+        let au = ours_fn_server(limit_reply(
+            vec![tc_row("t2", Some("B100"))],
+            1,
+            max_first,
+            firsts.clone(),
+        ))
+        .await;
+        let bu = ours_fn_server(walk_reply("transfers", walk_b.clone(), 2)).await;
+        let ops = c3_ops(dir.path());
+        let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, ""))
+            .await
+            .unwrap();
+        let (d, note) = tc_live(&ctx, page_a.clone(), page_b.clone()).await;
+        let un = c3_unexplained(&ctx, &d);
+        let note = note.unwrap_or_default();
+        let asked = firsts.lock().unwrap().clone();
+        if explained {
+            assert!(un.is_empty(), "{un:?} {d:?} {note}");
+            assert!(d
+                .iter()
+                .any(|e| e.path == crate::graphql_window::COUNT_WALK_PATH));
+            assert_eq!(asked, [100, 50, 25], "{asked:?}");
+        } else {
+            assert!(
+                un.contains(&"/data/transfers/totalCount".to_string()),
+                "{un:?}"
+            );
+            assert_eq!(asked, [100, 50, 25, 12, 6, 3, 1], "{asked:?}");
+            assert!(note.contains("first 1"), "{note}");
+            assert!(note.contains("query complexity 26 exceeds 2000"), "{note}");
+        }
+    }
+
+    // Another error: no retry, its text in the note.
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(tc_node()).await;
+    let calls = Arc::new(Mutex::new(0usize));
+    let c2 = calls.clone();
+    let au = ours_fn_server(move |_: &Value| {
+        *c2.lock().unwrap() += 1;
+        json!({"data": null, "errors": [{"message": "request deadline exceeded",
+            "extensions": {"code": "TIMEOUT"}}]})
+    })
+    .await;
+    let bu = ours_fn_server(walk_reply("transfers", walk_b, 2)).await;
+    let ops = c3_ops(dir.path());
+    let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, ""))
+        .await
+        .unwrap();
+    let (d, note) = tc_live(&ctx, page_a, page_b).await;
+    assert!(c3_unexplained(&ctx, &d).contains(&"/data/transfers/totalCount".to_string()));
+    let note = note.unwrap_or_default();
+    assert!(note.contains("request deadline exceeded"), "{note}");
+    assert_eq!(*calls.lock().unwrap(), 1);
+}
+
+/// FIX-3 (O1 settling rule): `transactions(accountName)` over a walkable document.
+fn ocs_ops(dir: &std::path::Path) -> std::path::PathBuf {
+    let ops = dir.join("ops");
+    std::fs::create_dir_all(&ops).unwrap();
+    let q = "query QH7($accountName: String, $first: Int, $after: String) { \
+             transactions(accountName: $accountName, first: $first, after: $after) { \
+             totalCount pageInfo { hasNextPage endCursor } edges { cursor node { id hash \
+             cmd { meta { chainId sender } } result { ... on TransactionResult { height \
+             block { hash chainId } } } } } } }";
+    std::fs::write(ops.join("QH7.graphql"), format!("# kdx: oracle\n{q}\n")).unwrap();
+    ops
+}
+
+/// A tx row of ours sent by `sender` at height `h` in block `B<h>` (synthetic keys).
+fn ocs_row(rk: &str, h: u64, sender: &str) -> Value {
+    let id = crate::graphql::base64_std(format!("Transaction:[\"B{h}\",\"{rk}\"]").as_bytes());
+    json!({"cursor": "c", "node": {"id": id, "hash": rk,
+        "cmd": {"meta": {"chainId": "0", "sender": sender}},
+        "result": {"height": h, "block": {"hash": format!("B{h}"), "chainId": 0}}}})
+}
+
+/// The node placing each `(rk, h)` in `B<h>` on chain 0, its first TRANSFER (the gas) paid
+/// by `payer`, followed by a cross-chain receive to it.
+fn ocs_node(rows: &[(String, u64)], payer: &str) -> NodeMock {
+    let mut node = NodeMock::default();
+    for (rk, h) in rows {
+        let ev = json!([
+            {"name": "TRANSFER", "module": {"name": "coin"}, "params": [payer, "k:miner", 0.01]},
+            {"name": "TRANSFER", "module": {"name": "coin"}, "params": ["", payer, 1.0]}
+        ]);
+        let (k, v) = h7_poll(rk, &format!("B{h}"), *h, ev);
+        node.polls.insert(k, v);
+    }
+    node
+}
+
+/// One count walk of a `transactions(accountName: "k:s")` record: ours lists `ours` and
+/// counts `na`; the oracle counts `nb` and answers every walk page with an error (its list
+/// cannot be walked). `extra` goes into the config. Returns (unexplained, diff, note).
+async fn ocs_walk(
+    node: NodeMock,
+    ours: Vec<Value>,
+    na: u64,
+    nb: u64,
+    extra: &str,
+    spent: usize,
+) -> (Vec<String>, Vec<DiffEntry>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let nu = node_server(node).await;
+    let au = ours_fn_server(walk_reply("transactions", ours, na)).await;
+    let bu = ours_fn_server(|_: &Value| {
+        json!({"data": null, "errors": [{"message": "oracle: cursor paging unavailable"}]})
+    })
+    .await;
+    let ops = ocs_ops(dir.path());
+    let ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir.path(), &ops, extra))
+        .await
+        .unwrap();
+    let op = ctx.gql.ops.iter().find(|o| o.stem == "QH7").unwrap();
+    let (ta, tb) = (&ctx.targets["a"], &ctx.targets["b"]);
+    let vars = h7_vars(&[("accountName", json!("k:s")), ("first", json!(20))]);
+    let mut d = vec![DiffEntry {
+        path: "/data/transactions/totalCount".into(),
+        kind: DiffKind::Changed,
+        a: Some(json!(na)),
+        b: Some(json!(nb)),
+    }];
+    let mut note = None;
+    let mut st = Reads::default();
+    st.node = spent;
+    ctx.gql_count_walk(
+        ta,
+        tb,
+        op,
+        &vars,
+        &mut d,
+        &mut note,
+        7_000_000,
+        u64::MAX,
+        &mut st,
+    )
+    .await;
+    (c3_unexplained(&ctx, &d), d, note.unwrap_or_default())
+}
+
+/// FIX-3 (O1, class ORACLE-COUNT-SHORT): the oracle's totalCount is ours − 1, ours' count
+/// equals ours' walked rows, no request key repeats and the node places every walked row in
+/// its block with the account as gas payer (first TRANSFER): explained without the oracle's
+/// list, with node `/poll` reads in batches. Each condition broken leaves the count
+/// difference unexplained, the note saying why.
+#[tokio::test]
+async fn fix3_oracle_count_short_is_settled_on_the_node() {
+    let keys: Vec<(String, u64)> = (0..120u64)
+        .map(|i| (format!("rk{i:03}"), 100 + i))
+        .collect();
+    let rows = |sender: &str| -> Vec<Value> {
+        keys.iter()
+            .rev()
+            .map(|(rk, h)| ocs_row(rk, *h, sender))
+            .collect()
+    };
+    let path = crate::graphql_window::ORACLE_COUNT_SHORT_PATH;
+
+    // Explained: 120 rows, the oracle counts 119; 3 batched polls (50 + 50 + 20).
+    let node = ocs_node(&keys, "k:s");
+    let calls = node.calls.clone();
+    let (un, d, note) = ocs_walk(node, rows("k:s"), 120, 119, "", 0).await;
+    assert!(un.is_empty(), "{un:?} {d:?} {note}");
+    let hit = d.iter().find(|e| e.path == path).expect("the class hit");
+    assert_eq!(hit.a.as_ref().unwrap()["walked"], json!(120));
+    assert_eq!(hit.b.as_ref().unwrap()["count"], json!(119));
+    assert!(d.iter().all(|e| e.path != "/data/transactions/totalCount"));
+    let polls = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("poll "))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(polls, ["poll 0 50", "poll 0 50", "poll 0 20"]);
+
+    // The oracle two short: not this class.
+    let (un, _, note) = ocs_walk(ocs_node(&keys, "k:s"), rows("k:s"), 120, 118, "", 0).await;
+    assert!(
+        un.contains(&"/data/transactions/totalCount".to_string()),
+        "{note}"
+    );
+
+    // Ours' count is not ours' walked rows.
+    let (un, _, note) = ocs_walk(
+        ocs_node(&keys, "k:s"),
+        rows("k:s")[1..].to_vec(),
+        120,
+        119,
+        "",
+        0,
+    )
+    .await;
+    assert!(
+        un.contains(&"/data/transactions/totalCount".to_string()),
+        "{note}"
+    );
+    assert!(note.contains("ours counts 120 and lists 119 rows"), "{note}");
+
+    // A repeated request key.
+    let mut dup = rows("k:s");
+    dup[1] = dup[0].clone();
+    let (un, _, note) = ocs_walk(ocs_node(&keys, "k:s"), dup, 120, 119, "", 0).await;
+    assert!(
+        un.contains(&"/data/transactions/totalCount".to_string()),
+        "{note}"
+    );
+    assert!(note.contains("request key"), "{note}");
+
+    // One walked row the node does not hold.
+    let mut node = ocs_node(&keys, "k:s");
+    node.polls.remove("rk050");
+    let (un, _, note) = ocs_walk(node, rows("k:s"), 120, 119, "", 0).await;
+    assert!(
+        un.contains(&"/data/transactions/totalCount".to_string()),
+        "{note}"
+    );
+    assert!(note.contains("rk050"), "{note}");
+
+    // The node's gas payer (first TRANSFER) is another account.
+    let (un, _, note) = ocs_walk(ocs_node(&keys, "k:other"), rows("k:s"), 120, 119, "", 0).await;
+    assert!(
+        un.contains(&"/data/transactions/totalCount".to_string()),
+        "{note}"
+    );
+    assert!(note.contains("account (the sender)"), "{note}");
+
+    // The compare's node read cap leaves it unexplained.
+    let (un, _, note) = ocs_walk(
+        ocs_node(&keys, "k:s"),
+        rows("k:s"),
+        120,
+        119,
+        "",
+        crate::graphql_window::NODE_READS - 1,
+    )
+    .await;
+    assert!(
+        un.contains(&"/data/transactions/totalCount".to_string()),
+        "{note}"
+    );
+    assert!(note.contains("node reads per compare"), "{note}");
+}

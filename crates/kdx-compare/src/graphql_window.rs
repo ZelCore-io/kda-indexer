@@ -87,6 +87,12 @@ pub const COUNT_WALK_PATH: &str = "/~graphql-count-walk";
 /// own totalCount and that alone accounts for the counts (allowlist id
 /// `graphql-r97-oracle-list-over-count`).
 pub const ORACLE_LIST_OVER_COUNT_PATH: &str = "/~graphql-r97-oracle-list-over-count";
+/// FIX-3 (O1, class ORACLE-COUNT-SHORT): the count walk's hit when the oracle's totalCount is
+/// ours' minus one and the node confirms every row ours walked, without the oracle's list
+/// (allowlist id `graphql-oracle-count-short`).
+pub const ORACLE_COUNT_SHORT_PATH: &str = "/~graphql-oracle-count-short";
+/// Request keys per `/poll` read of [`Ctx::oracle_count_short`].
+pub const POLL_BATCH: usize = 50;
 /// R-P5P9-86 TC: the walk passed [`COUNT_WALK_ROWS`] rows on a side, "count walk capped"
 /// (unexplained, its own reason; never allowlisted).
 pub const COUNT_WALK_CAPPED_PATH: &str = "/~graphql-count-walk-capped";
@@ -2537,15 +2543,17 @@ impl Filter {
             }
             Some(Kind::Tx) => {
                 // `transactions(accountName)` lists the txs the account sent (GQ-19: ours
-                // filters on `meta.sender`); the sender pays the gas, the transaction's last
-                // TRANSFER event. With `fungibleName`, a TRANSFER of that module names it.
+                // filters on `meta.sender`); the sender pays the gas, the transaction's first
+                // TRANSFER event on the node (FIX-3: not the last, which may be a cross-chain
+                // receive or a token transfer of the same tx). With `fungibleName`, a
+                // TRANSFER of that module names it.
                 if let Some(a) = &self.account {
                     let p = |e: &Value, i: usize| {
                         e.pointer(&format!("/params/{i}"))
                             .and_then(Value::as_str)
                             .map(str::to_string)
                     };
-                    let payer = v.transfers.last().and_then(|e| p(e, 0));
+                    let payer = v.transfers.first().and_then(|e| p(e, 0));
                     let sender = n.pointer("/cmd/meta/sender").and_then(Value::as_str);
                     if payer.as_ref() != Some(a) || sender.is_some_and(|s| s != a) {
                         return fail("account (the sender)");
@@ -4748,6 +4756,10 @@ impl Ctx {
         });
     }
 
+    /// FIX-3 (O1): ours' list is walked first; when the rules over both lists leave the
+    /// count difference and the oracle counts exactly one row fewer than ours on
+    /// `transactions`, [`Ctx::oracle_count_short`] may still settle it from ours' walk and
+    /// the node alone.
     #[allow(clippy::too_many_arguments)]
     async fn count_walk(
         &self,
@@ -4770,7 +4782,70 @@ impl Ctx {
             ));
         }
         let wa = self.walk_list(ta, op, vars, root, &fv, &av).await?;
-        let wb = self.walk_list(tb, op, vars, root, &fv, &av).await?;
+        let wb = self.walk_list(tb, op, vars, root, &fv, &av).await;
+        let both = match &wb {
+            Ok(wb) => {
+                self.count_walk_both(
+                    ta,
+                    op,
+                    vars,
+                    root,
+                    (na, nb),
+                    max,
+                    record_height,
+                    st,
+                    (wa.clone(), wb.clone()),
+                )
+                .await
+            }
+            Err(e) => Err(e.clone()),
+        };
+        match both {
+            Err((capped, why)) if root == "transactions" && nb.checked_add(1) == Some(na) => {
+                // The oracle's list, when it could be walked, holds no row ours lacks.
+                let key = |e: &Value| prepared_id(e, root).rk;
+                if let Ok(wb) = &wb {
+                    let ours: std::collections::HashSet<_> = wa.iter().map(key).collect();
+                    if let Some(e) = wb.iter().find(|e| !ours.contains(&key(e))) {
+                        return Err((
+                            capped,
+                            format!(
+                                "{why}; oracle count short (ORACLE-COUNT-SHORT) not settled: \
+                                 the oracle lists a row ours does not: {}",
+                                prepared_id(e, root).evidence()
+                            ),
+                        ));
+                    }
+                }
+                match self
+                    .oracle_count_short(op, vars, root, (na, nb), &wa, record_height, st)
+                    .await
+                {
+                    Ok(out) => Ok(out),
+                    Err(w) => Err((
+                        capped,
+                        format!("{why}; oracle count short (ORACLE-COUNT-SHORT) not settled: {w}"),
+                    )),
+                }
+            }
+            r => r,
+        }
+    }
+
+    /// [`Ctx::count_walk`] over both walked lists (ours' `wa`, the oracle's `wb`).
+    #[allow(clippy::too_many_arguments)]
+    async fn count_walk_both(
+        &self,
+        ta: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        (na, nb): (u64, u64),
+        max: u64,
+        record_height: u64,
+        st: &mut Reads,
+        (wa, wb): (Vec<Value>, Vec<Value>),
+    ) -> Result<Vec<DiffEntry>, (bool, String)> {
         let bounded = record_height < u64::MAX;
         let bound = record_height.min(max);
         // Ours' rows: up to the oracle's height (walked against the oracle), above it up to
@@ -4931,6 +5006,111 @@ impl Ctx {
                 "nodeReads": st.node})),
         ));
         Ok(out)
+    }
+
+    /// FIX-3 (O1, class ORACLE-COUNT-SHORT): the oracle's totalCount is ours' minus one
+    /// (`counts`), and that is explained without the oracle's list when ours' count equals
+    /// ours' walked rows `wa` (those at or below `record_height`), no request key repeats
+    /// among them, and the node confirms every one: `/poll` (batches of [`POLL_BATCH`] keys,
+    /// each one node read under the compare's cap and the run's budget) places it in the
+    /// row's own block and height, and the node's transaction lies inside the query's filter
+    /// (for `accountName`, the sender and gas payer, its first TRANSFER). Then ours lists
+    /// exactly the node-canonical txs it counts, and the oracle counts one fewer: the oracle
+    /// misses one, or holds it in a block it flags non-canonical. `Err`: why not.
+    #[allow(clippy::too_many_arguments)]
+    async fn oracle_count_short(
+        &self,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+        root: &str,
+        (na, nb): (u64, u64),
+        wa: &[Value],
+        record_height: u64,
+        st: &mut Reads,
+    ) -> Result<Vec<DiffEntry>, String> {
+        let bounded = record_height < u64::MAX;
+        let mut rows = Vec::new();
+        for e in wa {
+            match prepared_id(e, root).height {
+                Some(h) if h > record_height => {}
+                None if bounded => return Err("a row of ours has no height".into()),
+                _ => rows.push(e.clone()),
+            }
+        }
+        if rows.len() as u64 != na {
+            return Err(format!("ours counts {na} and lists {} rows", rows.len()));
+        }
+        let q = op.query.as_str();
+        let (field, aliases) =
+            root_selection(q, root).unwrap_or_else(|| (root.to_string(), Vec::new()));
+        if !aliases.is_empty() {
+            return Err(format!(
+                "the row selection has an alias ({})",
+                aliases.join(", ")
+            ));
+        }
+        let conn = |rows: Vec<Value>| json!({"edges": rows, "pageInfo": {"hasNextPage": false}});
+        let prep = prepare_in(&conn(rows), &conn(Vec::new()), &field)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut by_chain: std::collections::BTreeMap<u8, Vec<&Row>> = Default::default();
+        for r in &prep.a {
+            if r.id.kind != Some(Kind::Tx) || r.id.coinbase {
+                return Err(format!(
+                    "a row of ours is not a user tx: {}",
+                    r.id.evidence()
+                ));
+            }
+            let Some(rk) = r.id.rk.as_deref() else {
+                return Err(format!(
+                    "a row of ours has no request key: {}",
+                    r.id.evidence()
+                ));
+            };
+            if !seen.insert(rk.to_string()) {
+                return Err(format!("ours lists request key {rk} twice"));
+            }
+            let Some(chain) = r.id.chain else {
+                return Err(format!("a row of ours has no chain: {}", r.id.evidence()));
+            };
+            by_chain.entry(chain).or_default().push(r);
+        }
+        let filter = Filter::of(Some(q), Some(root), vars);
+        let mut polled = 0usize;
+        for (chain, rs) in by_chain {
+            for batch in rs.chunks(POLL_BATCH) {
+                self.h7_take(st)?;
+                let keys: Vec<String> = batch.iter().filter_map(|r| r.id.rk.clone()).collect();
+                let got = self
+                    .node
+                    .poll(chain, &keys)
+                    .await
+                    .map_err(|e| format!("poll failed: {e}"))?;
+                for r in batch {
+                    let rk = r.id.rk.as_deref().unwrap_or_default();
+                    let what = r.id.evidence();
+                    let p = got
+                        .get(rk)
+                        .ok_or_else(|| format!("the node does not find {what}"))?;
+                    let v = poll_verdict_at(&r.id, node_of(r), p, false, None, false);
+                    if v.canon != Canon::Yes {
+                        return Err(format!("the node does not confirm {what}: {}", v.why));
+                    }
+                    if r.id.block.is_some() && v.block != r.id.block {
+                        return Err(format!("the node places {what} in another block"));
+                    }
+                    if let Some(w) = filter.outside(r, v.height, &v) {
+                        return Err(format!("{what}: {w} on the node"));
+                    }
+                    polled += 1;
+                }
+            }
+        }
+        Ok(vec![entry(
+            ORACLE_COUNT_SHORT_PATH,
+            Some(json!({"count": na, "walked": na, "nodeConfirmed": polled,
+                "bound": bounded.then_some(record_height), "nodeReads": st.node})),
+            Some(json!({"count": nb})),
+        )])
     }
 
     /// R-P5P9-93: the node's tx count at each height of the query's window
@@ -5127,7 +5307,10 @@ impl Ctx {
 
     /// One whole list by the document, `first` = [`OURS_PAGE_CAP`] and `after` = the last
     /// page's `endCursor` (else its last row's `cursor`); `Err((true, _))` past
-    /// [`COUNT_WALK_ROWS`] rows.
+    /// [`COUNT_WALK_ROWS`] rows. FIX-3 (O1): a page refused with a complexity `LIMIT` is read
+    /// again at the same `after` with `first` halved (down to 1; the rest of the walk keeps
+    /// the smaller size, each attempt one read of the budget); any other page without `data`
+    /// fails the walk with the answer's error text.
     async fn walk_list(
         &self,
         t: &Target,
@@ -5141,6 +5324,7 @@ impl Ctx {
         let mut out: Vec<Value> = Vec::new();
         let mut after: Option<String> = None;
         let mut bytes = 0usize;
+        let mut first = OURS_PAGE_CAP;
         loop {
             // R-P5P9-92 (9): each page of ours' or the oracle's is one read of the run's
             // budget (the referee's `--max-reads`; unbounded live), its own reason past it.
@@ -5156,15 +5340,24 @@ impl Ctx {
                 ));
             }
             let mut v = vars.clone();
-            v.insert(first_var.into(), json!(OURS_PAGE_CAP));
+            v.insert(first_var.into(), json!(first));
             match &after {
                 Some(c) => v.insert(after_var.into(), json!(c)),
                 None => v.remove(after_var),
             };
-            let data = self
-                .gql_read(t, &op.query, Value::Object(v))
-                .await
-                .ok_or_else(|| fail("answered a page of the walk with no data"))?;
+            let data = match self.gql_read_why(t, &op.query, Value::Object(v)).await {
+                Ok(d) => d,
+                Err(e) if e.complexity && first > 1 => {
+                    first = (first / 2).max(1);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(fail(&format!(
+                        "answered a page of the walk (first {first}) with no data: {}",
+                        e.text
+                    )))
+                }
+            };
             let c = data
                 .get(root)
                 .ok_or_else(|| fail("answered a page without the root list"))?;
@@ -6583,6 +6776,42 @@ impl Ctx {
 
 #[cfg(test)]
 mod tests {
+
+    /// FIX-3 (H7, run0b5 triage H2): under `transactions(accountName)` the gas payer is the
+    /// node's FIRST TRANSFER event (the gas transfer), not the last: a tx that pays gas, then
+    /// receives a cross-chain transfer or moves a token, is inside the account's filter; a tx
+    /// whose first TRANSFER is someone else's is outside it.
+    #[test]
+    fn fix3_h7_gas_payer_is_the_first_transfer() {
+        let q = "query Q($accountName: String, $first: Int) { transactions(accountName: \
+                 $accountName, first: $first) { edges { node { hash cmd { meta { sender } } \
+                 result { ... on TransactionResult { height } } } } } }";
+        let mut vars = Map::new();
+        vars.insert("accountName".into(), json!("k:payer"));
+        vars.insert("first".into(), json!(10));
+        let f = Filter::of(Some(q), Some("transactions"), &vars);
+        let row = json!({"cursor": "c", "node": {"hash": "rk1",
+            "cmd": {"meta": {"sender": "k:payer"}}, "result": {"height": 10}}});
+        let conn = |rows: Vec<Value>| json!({"edges": rows, "pageInfo": {"hasNextPage": false}});
+        let prep = prepare_in(&conn(vec![row]), &conn(Vec::new()), "transactions").unwrap();
+        let r = &prep.a[0];
+        let t = |from: &str, to: &str| json!({"name": "TRANSFER", "module": {"name": "coin"}, "params": [from, to, 1.0]});
+        let mut v = Verdict::new(Canon::Yes, Some(10), Some("B".into()), "placed");
+        // Gas first, then a cross-chain receive ("" -> the account) and a token transfer.
+        v.transfers = vec![
+            t("k:payer", "k:miner"),
+            t("", "k:payer"),
+            t("k:other", "k:x"),
+        ];
+        assert_eq!(f.outside(r, Some(10), &v), None);
+        // The first TRANSFER is someone else's: outside the filter.
+        v.transfers = vec![t("k:other", "k:miner"), t("k:payer", "k:x")];
+        let why = f.outside(r, Some(10), &v).unwrap_or_default();
+        assert!(why.contains("account"), "{why}");
+        // No TRANSFER at all still fails closed.
+        v.transfers.clear();
+        assert!(f.outside(r, Some(10), &v).is_some());
+    }
 
     /// R-P5P9-86 T (`tokenId`): null against a fungible TRANSFER, the token against a
     /// marmalade one (token, sender, receiver, amount); a wrong token matches no event. A

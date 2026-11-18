@@ -757,6 +757,17 @@ ruling = "R-P5P9-86 TC; R-P5P9-87 (the stored form)."
 owner_note = "PROPOSED (ruling R-P5P9-86 TC): new in FVH-E2b; CG-5 class TC (#243, #87, #866)."
 
 [[entry]]
+id = "graphql-oracle-count-short"
+route = "other"
+json_path_glob = "/~graphql-oracle-count-short"
+condition = "any"
+request_contains = "graphql:"
+reason = "FIX-3 (O1, class ORACLE-COUNT-SHORT): a transactions record whose root totalCount is the oracle's = ours - 1 and which the count walk over both lists (graphql-count-walk, graphql-r97-oracle-list-over-count) leaves unexplained or cannot walk on the oracle's side. Explained only when ours' count equals ours' walked rows (bounded at the record's height in the stored form), no request key repeats, every walked row is a user tx the node's /poll places in the row's own block and height, and the node's transaction is inside the query's filter (accountName: the sender and gas payer, its first TRANSFER); the oracle's list, when it can be walked, holds no row ours lacks. Node reads are /poll batches of 50 keys under the compare's node read cap and the run's budget; past either, it stays unexplained. Ours then lists exactly the node-canonical txs it counts, and the oracle counts one fewer (it misses one or flags its block non-canonical). Evidence: o1o2 diagnosis, 4 accounts, 146/1890/4069/4096 rows all node-found in the same block, oracle one short each."
+status = "PROPOSED"
+ruling = "FIX-3 (owner-authorised 2026-11-18); o1o2 diagnosis O1."
+owner_note = "PROPOSED: new in FIX-3; CG class O1 (Transactions-bca501b0 count +1)."
+
+[[entry]]
 id = "graphql-r97-oracle-list-over-count"
 route = "other"
 json_path_glob = "/~graphql-r97-oracle-list-over-count"
