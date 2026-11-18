@@ -572,6 +572,9 @@ impl Caps {
 struct Bounds {
     upto: Option<TxKey>,
     min_h: Option<u32>,
+    /// When a walk that skips keys internally (the `sndr` ∩ `xfer` intersection) must give
+    /// up with [`ApiError::Deadline`]: the page's scan window or the count's budget.
+    until: Option<Instant>,
 }
 
 type KeySource<'v> = Box<dyn Iterator<Item = ApiResult<(TxKey, Option<TxRecord>)>> + 'v>;
@@ -647,7 +650,11 @@ fn keys<'v>(
                 before: b.upto.map(through_tx),
             };
             Box::new(
-                IntersectDesc::new(view.postings(*fa, *ea, q)?, view.postings(*fb, *eb, q)?)
+                IntersectDesc::with_until(
+                    view.postings(*fa, *ea, q)?,
+                    view.postings(*fb, *eb, q)?,
+                    b.until,
+                )
                     .filter(move |r| r.as_ref().map_or(true, |k| keep(*k)))
                     .map(|r| r.map(|k| (k, None))),
             )
@@ -702,17 +709,35 @@ fn keys<'v>(
     })
 }
 
+/// Input keys the intersection walk reads between two looks at the clock.
+const INTERSECT_CHECK: usize = 1024;
+
 /// The keys two newest-first (strictly descending) key streams share, newest first. The
-/// first error ends it.
+/// first error ends it. With `until`, the walk reads the clock every [`INTERSECT_CHECK`]
+/// input keys and ends with [`ApiError::Deadline`] once it has passed: a long `xfer` list
+/// with few sends is skipped inside one `next()`, so the caller's per-output-key checks
+/// cannot bound it.
 struct IntersectDesc<A, B> {
     a: A,
     b: B,
     done: bool,
+    until: Option<Instant>,
+    steps: usize,
 }
 
 impl<A, B> IntersectDesc<A, B> {
+    #[cfg(test)]
     fn new(a: A, b: B) -> Self {
-        IntersectDesc { a, b, done: false }
+        Self::with_until(a, b, None)
+    }
+    fn with_until(a: A, b: B, until: Option<Instant>) -> Self {
+        IntersectDesc {
+            a,
+            b,
+            done: false,
+            until,
+            steps: 0,
+        }
     }
 }
 
@@ -727,7 +752,7 @@ where
         if self.done {
             return None;
         }
-        let r = intersect_next(&mut self.a, &mut self.b);
+        let r = intersect_next(&mut self.a, &mut self.b, self.until, &mut self.steps);
         if !matches!(r, Some(Ok(_))) {
             self.done = true;
         }
@@ -739,7 +764,16 @@ where
 fn intersect_next(
     a: &mut impl Iterator<Item = ApiResult<TxKey>>,
     b: &mut impl Iterator<Item = ApiResult<TxKey>>,
+    until: Option<Instant>,
+    steps: &mut usize,
 ) -> Option<ApiResult<TxKey>> {
+    let mut tick = || {
+        *steps += 1;
+        (*steps).is_multiple_of(INTERSECT_CHECK) && until.is_some_and(|u| Instant::now() >= u)
+    };
+    if tick() {
+        return Some(Err(ApiError::Deadline));
+    }
     let mut x = match a.next()? {
         Ok(k) => k,
         Err(e) => return Some(Err(e)),
@@ -755,6 +789,9 @@ fn intersect_next(
             std::cmp::Ordering::Greater => (a, &mut x),
             std::cmp::Ordering::Less => (b, &mut y),
         };
+        if tick() {
+            return Some(Err(ApiError::Deadline));
+        }
         match it.next()? {
             Ok(k) => *cur = k,
             Err(e) => return Some(Err(e)),
@@ -800,6 +837,7 @@ pub fn run_page(
             let b = Bounds {
                 upto: cur.map(|c| c.key),
                 min_h: None,
+                until: Some(deadline),
             };
             'k: for (i, kr) in keys(view, &src, spec.filter, &caps, b)?.enumerate() {
                 past(deadline, i)?;
@@ -824,6 +862,7 @@ pub fn run_page(
             let b = Bounds {
                 upto: None,
                 min_h: cur.map(|c| c.key.height()),
+                until: Some(deadline),
             };
             let mut ks = Vec::new();
             for (i, kr) in keys(view, &src, spec.filter, &caps, b)?.enumerate() {
@@ -877,11 +916,19 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bo
     // A decoded record costs ~1 ms cold, so the clock is read before each one; a key-only
     // walk reads it every `CHECK_EVERY` keys.
     let every = if decode { 1 } else { CHECK_EVERY };
-    for (i, kr) in keys(view, &src, spec.filter, &caps, Bounds::default())?.enumerate() {
+    let b = Bounds {
+        until: Some(until),
+        ..Bounds::default()
+    };
+    for (i, kr) in keys(view, &src, spec.filter, &caps, b)?.enumerate() {
         if i % every == every - 1 && Instant::now() >= until {
             return Ok((n, false));
         }
-        let (k, rec) = kr?;
+        let (k, rec) = match kr {
+            // The intersection walk gave up at `until`: a lower bound, as above.
+            Err(ApiError::Deadline) if Instant::now() >= until => return Ok((n, false)),
+            r => r?,
+        };
         if decode {
             if let Some(d) = load(view, k, rec, &mut blocks)? {
                 n += rows.rows(&d).len() as u64;
@@ -1361,6 +1408,35 @@ mod intersect_tests {
         assert_eq!(r.len(), 2);
         assert_eq!(r[0], Ok(9));
         assert!(r[1].is_err());
+    }
+
+    /// FIX-2 fix 1: an account with a huge `xfer` list and few sends (a pool's account) must
+    /// not walk the whole list inside one `next()`: the walk reads the clock every
+    /// [`INTERSECT_CHECK`] input keys and ends with `Deadline` once `until` has passed.
+    #[test]
+    fn intersection_walk_stops_at_the_deadline() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let pulled = Rc::new(Cell::new(0u64));
+        let p = pulled.clone();
+        // 50 M transfer keys, none of them a send; one old send below them all.
+        let xfer = (0..50_000_000u64).rev().map(move |k| {
+            p.set(p.get() + 1);
+            Ok(TxKey(k + 10))
+        });
+        let sndr = keys(&[5]).into_iter();
+        let t0 = Instant::now();
+        let mut it = IntersectDesc::with_until(sndr, xfer, Some(Instant::now()));
+        assert!(matches!(it.next(), Some(Err(ApiError::Deadline))));
+        assert!(it.next().is_none());
+        assert!(pulled.get() <= 2 * INTERSECT_CHECK as u64, "pulled {}", pulled.get());
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        // With no deadline the same walk is exact.
+        let a = (0..1_000u64).rev().map(|k| Ok(TxKey(k + 10)));
+        let got: Vec<_> = IntersectDesc::with_until(keys(&[500, 5]).into_iter(), a, None)
+            .map(|r| r.map(|k| k.0).map_err(|e| e.to_string()))
+            .collect();
+        assert_eq!(got, vec![Ok(500)]);
     }
 }
 

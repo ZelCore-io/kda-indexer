@@ -162,6 +162,7 @@ fn decoded(c: u8, h: u32, shapes: &[Shape]) -> (DecodedBlock, Vec<String>) {
 struct Fx {
     _dir: tempfile::TempDir,
     schema: KdxSchema,
+    store: Arc<Store>,
     /// User tx request keys by block, in position order.
     rks: HashMap<(u8, u32), Vec<String>>,
 }
@@ -269,10 +270,11 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         ready_max_lag: 10,
         max_event_lists: 64,
     };
-    let st = Api::new(store, settings, TipWatch::default()).state();
+    let st = Api::new(store.clone(), settings, TipWatch::default()).state();
     Fx {
         _dir: d,
         schema: build_schema(st, gs, None),
+        store,
         rks,
     }
 }
@@ -974,6 +976,31 @@ mod count_budget {
         )
         .await;
         assert_eq!(page["transfers"]["edges"].as_array().unwrap().len(), 2);
+    }
+
+    /// FIX-2 fix 6: the old decode path (`sender_index = false`, or a store add-index has not
+    /// finished) stays live, and there a sender list decodes every record of the account's
+    /// `acct` list: a spent budget answers a flagged lower bound below the true count.
+    #[tokio::test]
+    async fn a_spent_budget_cuts_the_old_sender_path() {
+        let exact = fixture();
+        let cut = fixture_with(GraphqlSettings {
+            count_budget: Duration::ZERO,
+            ..GraphqlSettings::default()
+        });
+        let q = QUERIES[1];
+        // The sender index answers the same spent-budget count exactly (see above) ...
+        let (full, _) = total(&exact.schema, q).await;
+        assert_eq!(total(&cut.schema, q).await, (full, false));
+        // ... and the old path, switched on for both stores, is cut.
+        for fx in [&exact, &cut] {
+            fx.store.set_sender_index(false);
+        }
+        let (full, flagged) = total(&exact.schema, q).await;
+        assert!(full > 1 && !flagged, "{q}: exact on the old path with a budget");
+        let (n, flagged) = total(&cut.schema, q).await;
+        assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
+        assert!(n < full, "{q}: {n} is below {full} past a spent budget");
     }
 
     /// The budget bounds an account's walk only: an event-name or public-key count with a spent
