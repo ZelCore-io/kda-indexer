@@ -53,6 +53,9 @@ pub struct WriteOpts {
     /// (default). `false` writes a range the way a build before FIX-2 did: test fixtures of
     /// `segments add-index` only.
     pub optional_files: bool,
+    /// Make the key filter build fail (tests of the no-`kf.fil` fallback only).
+    #[doc(hidden)]
+    pub fail_key_filter: bool,
 }
 
 impl WriteOpts {
@@ -65,6 +68,7 @@ impl WriteOpts {
             force_sorted_index: false,
             postings_mem_entries: ETL_MEM_ENTRIES,
             optional_files: true,
+            fail_key_filter: false,
         }
     }
 }
@@ -462,13 +466,32 @@ impl RangeWriter {
 
         write_keys(&tmp.join(fname(FileKind::Keys)), SLOT_WIDTH, &counts)?;
         let (rk_keys, bh_keys) = (rk.len() as u64, bh.len() as u64);
-        // kf.fil: the filters over the same keys the indexes get.
+        // kf.fil: the filters over the same keys the indexes get. A filter that cannot be
+        // built only costs speed: the range is written without it (lookups probe, as before
+        // FIX-2; `segments add-index` can add it later), never a stalled freeze or merge.
+        let mut with_filter = false;
         if opts.optional_files {
-            let filters = KeyFilters {
-                bh: KeyFilter::from_index_keys(&bh)?,
-                rk: KeyFilter::from_index_keys(&rk)?,
+            let built = if opts.fail_key_filter {
+                Err(anyhow::anyhow!("key filter: forced failure (test)"))
+            } else {
+                KeyFilter::from_index_keys(&bh).and_then(|bh| {
+                    Ok(KeyFilters {
+                        bh,
+                        rk: KeyFilter::from_index_keys(&rk)?,
+                    })
+                })
             };
-            write_file(&tmp.join(fname(FileKind::KeyFilter)), &filters.to_bytes())?;
+            match built {
+                Ok(filters) => {
+                    write_file(&tmp.join(fname(FileKind::KeyFilter)), &filters.to_bytes())?;
+                    with_filter = true;
+                }
+                Err(err) => tracing::warn!(
+                    range = %format!("{start}..{end}"),
+                    error = %format!("{err:#}"),
+                    "segment: key filter not built; the range is written without kf.fil"
+                ),
+            }
         }
         let rk_kind = write_index(&tmp.join(fname(FileKind::Rk)), rk, opts.force_sorted_index)?;
         let bh_kind = write_index(&tmp.join(fname(FileKind::Bh)), bh, opts.force_sorted_index)?;
@@ -515,7 +538,11 @@ impl RangeWriter {
         let mut written = range_file_names(&network, start, end);
         written.retain(|n| *n != fname(FileKind::Range));
         if opts.optional_files {
-            written.extend(optional_file_names(&network, start, end));
+            written.extend(
+                optional_file_names(&network, start, end)
+                    .into_iter()
+                    .filter(|n| with_filter || *n != fname(FileKind::KeyFilter)),
+            );
         }
         let mut files = BTreeMap::new();
         for n in &written {

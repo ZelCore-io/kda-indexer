@@ -296,6 +296,62 @@ fn a_sender_missing_from_the_dictionary_fails_the_entry_and_swaps_nothing() {
     check_deep(&b, "filter only");
 }
 
+/// M2: an entry with a committed swap pending is refused, never rebuilt over: its rebuild
+/// dir (the new files readers already take, and the journal) stays as it is.
+#[test]
+fn an_entry_with_a_pending_swap_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let b = t.path().join("b");
+    fixture(&b, true);
+    let seg = b.join("segments");
+    let m = kdx_segment::Manifest::load(&seg).unwrap().unwrap();
+    let e = &m.entries[0];
+    let rd = kdx_segment::swap::rebuild_dir(&seg, e.start);
+    std::fs::create_dir_all(&rd).unwrap();
+    std::fs::write(rd.join("marker"), b"new files").unwrap();
+    kdx_segment::swap::commit_journal(&seg, e.start, b"{}").unwrap();
+    let dict = kdx_hot::HotDict::load(&hot(&b).ro().unwrap()).unwrap();
+    for dry_run in [false, true] {
+        let err =
+            add_index::add_entry(&seg, &m.network, e, &dict, Only::Both, dry_run).unwrap_err();
+        assert!(format!("{err:#}").contains("pending"), "{err:#}");
+        assert!(kdx_segment::swap::pending(&seg, e.start));
+        assert_eq!(std::fs::read(rd.join("marker")).unwrap(), b"new files");
+    }
+}
+
+/// M1: a swap that fails after its journal is committed is reported as committed and
+/// failed (not "nothing swapped"); recovery then completes it.
+#[test]
+fn a_swap_that_fails_after_its_commit_is_reported_as_committed() {
+    let t = tempfile::tempdir().unwrap();
+    let b = t.path().join("b");
+    fixture(&b, true);
+    let seg = b.join("segments");
+    let m = kdx_segment::Manifest::load(&seg).unwrap().unwrap();
+    let e = &m.entries[0];
+    let sndr = kdx_segment::files::file_name(
+        &m.network,
+        kdx_segment::files::FileKind::Sndr,
+        e.start,
+        e.end,
+    );
+    // A directory where `finish` hard-links the first file: the link fails.
+    let block = seg.join(format!(".swap-{sndr}"));
+    std::fs::create_dir(&block).unwrap();
+    let dict = kdx_hot::HotDict::load(&hot(&b).ro().unwrap()).unwrap();
+    let rep = add_index::add_entry(&seg, &m.network, e, &dict, Only::Both, false).unwrap();
+    assert!(rep.swapped, "{rep:?}");
+    let err = rep.error.as_deref().unwrap_or_default();
+    assert!(err.contains("swap committed"), "{rep:?}");
+    assert!(kdx_segment::swap::pending(&seg, e.start));
+    std::fs::remove_dir(&block).unwrap();
+    kdx_segment::swap::recover(&seg).unwrap();
+    assert!(!kdx_segment::swap::pending(&seg, e.start));
+    assert!(seg.join(&sndr).exists());
+    check_deep(&b, "recovered");
+}
+
 fn config(dir: &Path) -> PathBuf {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),

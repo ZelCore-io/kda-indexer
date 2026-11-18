@@ -454,3 +454,48 @@ fn segments_opened_without_filters_hold_none_and_answer_the_same() {
     assert_eq!(r.key_filter_bytes(), 0);
     assert!(r.by_rk(&h(9, 3)).unwrap().is_some());
 }
+
+/// filter.rs:249: a key filter that cannot be built never stalls a freeze or merge. The
+/// writer leaves `kf.fil` out (WARN) and the range is written, listed without it, and read
+/// with every lookup probing, as a range from before FIX-2; `sndr.pst` is still there.
+#[test]
+fn a_filter_build_failure_writes_the_range_without_kf() {
+    let d = tempfile::tempdir().unwrap();
+    let seg = d.path().join("segments");
+    let mut o = WriteOpts::new(1, 0);
+    o.fail_key_filter = true;
+    let mut w = RangeWriter::create(
+        &seg,
+        &d.path().join("etl"),
+        NET,
+        RangeKind::Step,
+        0,
+        4,
+        0,
+        o,
+    )
+    .unwrap();
+    w.push(&indexed(&Blk {
+        chain: 0,
+        height: 0,
+        hash: h(7, 1),
+        rks: vec![(h(9, 2), 1)],
+    }))
+    .unwrap();
+    let e = w.finish().unwrap();
+    let mut m = Manifest::new(NET);
+    m.push(e.clone()).unwrap();
+    m.commit(&seg).unwrap();
+    let info = RangeInfo::load(&toml_path(&seg, &e)).unwrap();
+    assert!(!info
+        .files
+        .contains_key(&file_name(NET, FileKind::KeyFilter, 0, 4)));
+    assert!(info
+        .files
+        .contains_key(&file_name(NET, FileKind::Sndr, 0, 4)));
+    assert!(!kf_path(&seg, &e).exists());
+    let s = open(&seg);
+    assert!(s.ranges[0].filter.is_none() && s.sender_ready());
+    assert_eq!(s.by_rk(&h(9, 2)).unwrap(), Some(0));
+    assert!(kdx_segment::check(&seg, true).unwrap().ok());
+}

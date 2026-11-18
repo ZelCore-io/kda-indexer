@@ -38,7 +38,12 @@ fn drop_family_sndr_removes_rows_undo_ops_and_the_ready_key() {
     // Refused while another process holds the lock, and for a required family.
     {
         let _held = kda_indexer::cmd::lock_data_dir(dir.path()).unwrap();
-        assert!(kda_indexer::cmd::hot::drop_family(&cfg(), dir.path(), "sndr").is_err());
+        let err = kda_indexer::cmd::hot::drop_family(&cfg(), dir.path(), "sndr").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("add-index") && msg.contains("drop-family"),
+            "N4: the lock message names the offline commands: {msg}"
+        );
     }
     assert!(kda_indexer::cmd::hot::drop_family(&cfg(), dir.path(), "acct").is_err());
 

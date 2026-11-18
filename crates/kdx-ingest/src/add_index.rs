@@ -343,8 +343,13 @@ pub fn add_entry(
     dry_run: bool,
 ) -> Result<EntryReport> {
     let t0 = Instant::now();
-    if dry_run && swap::pending(segdir, e.start) {
-        bail!("a committed swap of this entry is pending (a run without --dry-run finishes it)");
+    // A committed swap's rebuild dir holds the files readers already take: never rebuild
+    // over it (M2). `run` recovers pending swaps at startup, so this is a guard.
+    if swap::pending(segdir, e.start) {
+        bail!(
+            "a committed swap of this entry is pending (the next writer start or add-index \
+             run finishes it)"
+        );
     }
     remove_work(segdir, e.start, dry_run)?;
     let dir = work_dir(segdir, e.start, dry_run);
@@ -382,9 +387,22 @@ pub fn add_entry(
     crash_at("add-index-before-journal");
     rep.swapped = true;
     swap::commit_journal(segdir, e.start, &serde_json::to_vec_pretty(&rep)?)?;
-    swap::finish(segdir, e.start, &names, &|| crash_at("add-index-mid-swap"))?;
-    crash_at("add-index-before-cleanup");
-    swap::remove(segdir, e.start)?;
+    // Past the journal the swap is committed: a failure from here on is reported as such
+    // (M1), never as "nothing swapped". The next writer start or add-index run finishes it.
+    let fin = (|| -> Result<()> {
+        swap::finish(segdir, e.start, &names, &|| crash_at("add-index-mid-swap"))?;
+        crash_at("add-index-before-cleanup");
+        swap::remove(segdir, e.start)
+    })();
+    if let Err(err) = fin {
+        tracing::error!(
+            start = e.start,
+            error = %format!("{err:#}"),
+            "add-index: swap committed but not finished; the next writer start or add-index \
+             run completes it"
+        );
+        rep.error = Some(format!("swap committed, not finished: {err:#}"));
+    }
     rep.seconds = t0.elapsed().as_secs_f64();
     Ok(rep)
 }
