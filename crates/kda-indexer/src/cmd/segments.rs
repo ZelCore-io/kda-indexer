@@ -1,4 +1,5 @@
-//! `segments list` and `segments check [--deep]` over `<data_dir>/segments`.
+//! `segments list`, `segments check [--deep]`, `segments digest` and `segments add-index`
+//! over `<data_dir>/segments`.
 
 use std::path::{Path, PathBuf};
 
@@ -154,6 +155,51 @@ pub fn digest(
         );
     } else {
         println!("total files {}", files.finalize().to_hex());
+    }
+    Ok(())
+}
+
+/// `segments add-index [--jobs N] [--only sndr|filter] [--dry-run]` (FIX-2): add `sndr.pst`
+/// and `kf.fil` to every entry that lacks them, then the hot sender backfill. Offline: takes
+/// the data-dir lock (the service must be stopped). Prints the JSON report; exit 1 when an
+/// entry or the hot pass failed (the rest is kept; a rerun resumes).
+pub fn add_index(
+    cfg: &crate::config::Config,
+    data_dir: &Path,
+    jobs: usize,
+    only: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let only = kdx_ingest::add_index::Only::parse(only)?;
+    let dir = segments_dir(data_dir);
+    if !dir.join("manifest.json").is_file() {
+        bail!("no manifest.json in {}", dir.display());
+    }
+    let _lock = super::lock_data_dir(data_dir)?;
+    let hot = if dry_run {
+        kdx_hot::HotStore::open_ro(&super::hot::hot_dir(data_dir)).context("hot store")?
+    } else {
+        super::hot::open_existing(cfg, data_dir)?
+    };
+    let opts = kdx_ingest::add_index::Opts {
+        jobs: jobs.max(1),
+        only,
+        dry_run,
+    };
+    let rep = kdx_ingest::add_index::run(&dir, &hot, opts)?;
+    println!("{}", serde_json::to_string_pretty(&rep)?);
+    eprintln!(
+        "segments add-index{}: {} ({} built, {} already complete, {} failed, {:.1}s)",
+        if dry_run { " --dry-run" } else { "" },
+        if rep.ok() { "OK" } else { "FAILED" },
+        rep.totals.built,
+        rep.totals.skipped,
+        rep.totals.failed,
+        rep.totals.seconds
+    );
+    if !rep.ok() {
+        std::process::exit(1);
     }
     Ok(())
 }

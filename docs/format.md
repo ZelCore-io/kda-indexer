@@ -59,7 +59,8 @@ cannot be upgraded in place; rebuild it (`docs/operations.md`, "Format upgrade")
   exactly the rule that gives the sender its `acct` posting, so `sndr(A) ⊆ acct(A)`. Additive,
   no version bump: the tail writes family-6 rows with undo ops like every family;
   `kdx_hot::sndr::backfill` adds them to a tail written without them and sets
-  `Meta sndr_hot = 1` (u64); `hot drop-family sndr` removes them (see operations.md). In
+  `Meta sndr_hot = 1` (u64); a new hot store gets `sndr_hot = 1` at init (its tail is
+  empty); `hot drop-family sndr` removes them (see operations.md). In
   segments `sndr.pst` is an optional file (see "Optional files"). The range writer stores it
   for every new step, range, merge and rebuild. The freezer takes a step's `sndr` postings
   from the hot rows once `Meta sndr_hot = 1`; before that it derives them from the records
@@ -161,6 +162,14 @@ At range open:
   `bh_keys` / `rk_keys`, zero exactly when those are zero). Otherwise the range is read
   without a filter (WARN, `kdx_key_filter_untrusted`) and every lookup probes its index as
   before: a damaged filter can cost time, never turn a stored key into a miss.
+
+`segments add-index` adds the optional files to an existing range: it builds the files the
+reader does not have (not listed, listed but missing, or an untrusted `kf.fil`) plus a new
+`range.toml` (the old fields, `[postings.sndr]` and the new `[files]` entries) in
+`segments/rebuild.<start>/`, and swaps them in through the `rebuild-range` journal with
+`range.toml` last. The result is byte-identical to what the range writer writes for the same
+records and dictionary. The hot pass then adds family-6 `TailPostings` rows and their undo
+ops and sets `Meta sndr_hot = 1` (`kdx_hot::sndr::backfill`).
 
 `Segments::sender_ready()` is true when every range has its `sndr` lists;
 `kdx_key_filter_bytes` is the filter memory of the newest view.

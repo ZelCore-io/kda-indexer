@@ -2,10 +2,11 @@
 
 ## Commands that write
 
-`run`, `backfill`, `rebuild-range` and `unwind` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
+`run`, `backfill`, `rebuild-range`, `unwind` and `segments add-index` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
 takes an exclusive lock on `<data_dir>/LOCK` and exits at once with an error if another
 kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer-<network>`) before running
-`backfill` or `unwind` by hand. Read-only commands (`inspect`, `segments`, `hot stats`) do
+`backfill`, `unwind` or `segments add-index` by hand. Read-only commands (`inspect`,
+`segments list|check|digest`, `hot stats`) do
 not take the lock and can run next to the service.
 
 ## Halted chains
@@ -145,6 +146,69 @@ mainnet01). Do the "Before any big write" check first.
 5. Start the unit: `systemctl start kda-indexer-mainnet01`. On the empty data dir it runs a
    full backfill, then tails; `systemctl status` shows `backfill r/n` while it runs.
 
+## Adding the sender index and key filters to an existing store
+
+A store written before FIX-2 has no `sndr.pst` (the sender index) and no `kf.fil` (the
+in-memory key filters) in its ranges and steps, and its hot tail has no `sndr` rows. It runs
+as before: `transactions(accountName)` keeps today's scan with its 1 s cap and every lookup
+probes every range. `segments add-index` adds the missing pieces once, with the service
+stopped:
+
+```sh
+systemctl stop kda-indexer-mainnet01
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml segments add-index --jobs 4 > add-index.json
+systemctl start kda-indexer-mainnet01
+```
+
+- It takes the data-dir lock and `segments.swap.lock` (a snapshot placing files makes it
+  wait, with a log line). It first finishes or drops any interrupted swap, as every writer
+  start does.
+- Picked: every manifest entry whose `sndr.pst` is not listed in its `range.toml` or listed
+  but missing, and every entry whose `kf.fil` is not listed, missing or not trusted (a
+  rollback's old binary deletes both files at startup while `range.toml` keeps listing them).
+  Only the missing files are built.
+- Per entry: it walks `txs.seg` and `blocks.seg` once in order, writes the missing files and a
+  new `range.toml` into `segments/rebuild.<start>/`, checks every sender list against the
+  `acct` list of the same account and every key against the new filter, then swaps them in
+  with the `rebuild-range` swap (journal, renames, `range.toml` last). Only renames: hard
+  links to the old files (a replica, a snapshot) keep the old inodes. The bytes equal what
+  the writer would have written for the range.
+- `--jobs N` (default 4) entries run in parallel, each independent. Memory per job is about
+  8 B per sender posting plus 8 B per request key and block hash of the entry, plus the
+  filter under construction (the largest mainnet entry, 14.3 M txs, stays under 0.6 GB).
+- Then the hot pass (one write txn): a `sndr` row and its undo op for every hot tx, and
+  `Meta sndr_hot = 1`. Skipped when the key is already set.
+- The dictionary is only read. A sender that is an indexable account but has no id fails
+  that entry (nothing swapped, exit 1); the other entries still complete.
+- `--only sndr` / `--only filter` builds one of the two (`--only filter` skips the hot pass).
+  `--dry-run` builds and checks every entry in `<data_dir>/etl/add-index-dry.<start>/`,
+  removes it and reports sizes; it swaps nothing, writes nothing to the hot store and takes
+  no swap lock (it still takes the data-dir lock).
+
+**Time.** One INFO line per entry gives its txs, seconds and an ETA (the first finished
+entry's seconds per tx × the txs left ÷ jobs). Expect roughly 12.5 µs per tx of CPU, so
+`txs ÷ jobs × 12.5 µs`: for mainnet's 370 M txs about 20 min at `--jobs 4`. Reading is
+sequential and not the limit. If the first entry's rate points much higher, stop it.
+
+**Resumable.** Stopping it (Ctrl-C, kill, a crash) at any point is safe: an entry is either
+untouched, or its committed swap is finished by the next writer start (`run`,
+`rebuild-range`, `add-index` itself). Run the same command again; it skips the complete
+entries and does nothing on a finished store. The JSON report lists per entry `txs`,
+`senders`, `sndr_bytes`, `filter_bytes`, `seconds`, the hot pass and the totals; the exit
+code is 1 if an entry or the hot pass failed.
+
+Check afterwards with `segments check --deep` (it verifies `sndr ⊆ acct` and every key
+against its filter). The sender index is used for queries only once every range has its
+`sndr` lists and the hot pass has set `Meta sndr_hot` (`hot stats` shows it).
+
+## Rollback to a build without them
+
+Run `hot drop-family sndr` first (below), then install the older package. The older binary
+reads the segments as before. At its first start it deletes `sndr.pst` and `kf.fil` (its
+cleanup does not know them) while `range.toml` keeps listing them, so its `segments check`
+reports them missing. That is expected. Going forward again, run `segments add-index`: it
+rebuilds exactly those files.
+
 ## Rolling back past the sender index
 
 From FIX-2 on, the tail writes the `sndr` posting family (family 6, the txs an account sent;
@@ -161,7 +225,8 @@ It takes the data-dir lock and runs one write txn: it deletes every `TailPosting
 family 6, strips the matching `UndoOp::Posting` ops from the `Undo` rows (so an unwind by the
 old binary finds nothing it does not know) and deletes `Meta sndr_hot`. It prints the counts.
 Then install the old package and start the unit. Only `sndr` can be dropped; the required
-families are refused.
+families are refused. A data dir without a hot store is refused (exit 1); nothing is
+created.
 
 ## Read-only `serve`
 

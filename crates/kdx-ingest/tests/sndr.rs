@@ -85,6 +85,11 @@ fn linear(n: usize) -> Vec<Place> {
 /// The tail as an older binary writes it: the same blocks through `tail::apply`, with the
 /// `sndr` postings removed from the index entries.
 fn apply_without_sndr(c: &kdx_ingest::Ctx, pool: &[Value], places: &[Place]) {
+    // A build before FIX-2 never set the readiness key a fresh store now gets.
+    let mut txn = c.hot.rw().unwrap();
+    txn.del(Table::Meta, kdx_hot::env::meta::SNDR_HOT.as_bytes())
+        .unwrap();
+    txn.commit().unwrap();
     for p in places {
         let mut dict = c.dict.lock().unwrap();
         let mut txn = c.hot.rw().unwrap();
@@ -235,33 +240,8 @@ fn backfill_refuses_a_sender_missing_from_the_dictionary() {
     assert!(format!("{e:#}").contains("not in the dictionary"), "{e:#}");
 }
 
-/// A freeze moves the hot family-6 rows into the steps' `sndr` postings: the frozen
-/// (entity, TxKey) set equals the twin's hot rows below the frontier. The store here never
-/// ran the sender backfill (`Meta sndr_hot` unset), so the freezer derives the postings from
-/// the records; they must still equal what the tail wrote.
-#[test]
-fn a_freeze_moves_sndr_rows_into_the_step() {
-    let pool = pool();
-    let places = places_for(&[0], 12);
-    let base = fake_node(&pool, &places);
-    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    // Twin store, never frozen: its hot rows are the expectation.
-    let t = ctx(db.path(), 100, 1000, 100);
-    apply_linear(&t, &pool, &places[0].1, 1);
-    let hot_rows = sndr_rows(&t.hot);
-    let c = freeze_store(da.path(), &pool, &base, &places, &[0]);
-    let frontier = c.hot.ro().unwrap().frozen_frontier().unwrap();
-    assert!(frontier >= 4, "{frontier}");
-    let want: BTreeSet<_> = hot_rows
-        .iter()
-        .filter(|(_, k)| k.height() < frontier)
-        .copied()
-        .collect();
-    assert!(!want.is_empty());
-    // The frozen rows left the hot store.
-    assert!(sndr_rows(&c.hot)
-        .iter()
-        .all(|(_, k)| k.height() >= frontier));
+/// Frozen `sndr` postings of every entry as (entity, TxKey).
+fn frozen_sndr(c: &kdx_ingest::Ctx) -> BTreeSet<(u64, TxKey)> {
     let dict = c.dict.lock().unwrap().mem().clone();
     let seg = kdx_segment::Segments::open(&c.segdir, std::sync::Arc::new(dict)).unwrap();
     assert!(seg.sender_ready());
@@ -276,14 +256,105 @@ fn a_freeze_moves_sndr_rows_into_the_step() {
             }
         }
     }
-    assert_eq!(got, want);
     // The same through the reader's family accessor.
-    let n: usize = want
+    let n: usize = got
         .iter()
         .map(|(e, _)| *e)
         .collect::<BTreeSet<_>>()
         .iter()
         .flat_map(|e| seg.postings(Family::Sndr, *e))
         .count();
-    assert_eq!(n, want.len());
+    assert_eq!(n, got.len());
+    got
+}
+
+/// A freeze moves the hot family-6 rows into the steps' `sndr` postings: the frozen
+/// (entity, TxKey) set equals the twin's hot rows below the frontier. Both freezer paths:
+/// a fresh store has `Meta sndr_hot = 1` from its init, so the freezer takes the hot rows;
+/// with the key cleared (a tail that never ran the sender backfill) it derives them from
+/// the records. Both give the same postings and byte-identical step files.
+#[test]
+fn a_freeze_moves_sndr_rows_into_the_step() {
+    let pool = pool();
+    let places = places_for(&[0], 12);
+    let db = tempfile::tempdir().unwrap();
+    // Twin store, never frozen: its hot rows are the expectation.
+    let t = ctx(db.path(), 100, 1000, 100);
+    apply_linear(&t, &pool, &places[0].1, 1);
+    let hot_rows = sndr_rows(&t.hot);
+    let mut steps = Vec::new();
+    for hot_path in [true, false] {
+        let da = tempfile::tempdir().unwrap();
+        let c = ctx(da.path(), 2, 1000, 2);
+        let ready = kdx_hot::sndr::hot_ready(&c.hot.ro().unwrap()).unwrap();
+        assert!(ready, "a fresh store is ready");
+        if !hot_path {
+            let mut txn = c.hot.rw().unwrap();
+            txn.del(Table::Meta, kdx_hot::env::meta::SNDR_HOT.as_bytes())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        apply_linear(&c, &pool, &places[0].1, 1);
+        while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+        let frontier = c.hot.ro().unwrap().frozen_frontier().unwrap();
+        assert!(frontier >= 4, "{frontier}");
+        let want: BTreeSet<_> = hot_rows
+            .iter()
+            .filter(|(_, k)| k.height() < frontier)
+            .copied()
+            .collect();
+        assert!(!want.is_empty());
+        // The frozen rows left the hot store.
+        assert!(sndr_rows(&c.hot)
+            .iter()
+            .all(|(_, k)| k.height() >= frontier));
+        assert_eq!(frozen_sndr(&c), want, "hot path {hot_path}");
+        steps.push(seg_files(&c.segdir));
+    }
+    assert_eq!(
+        steps[0], steps[1],
+        "hot path and derive path write the same bytes"
+    );
+}
+
+/// With `Meta sndr_hot = 1` the freezer takes a step's `sndr` postings from the hot rows and
+/// derives nothing: a store whose family-6 rows are gone while the key says ready freezes
+/// steps with empty `sndr` files (which is why the key is only ever set when it is true).
+#[test]
+fn the_ready_freezer_reads_sndr_from_the_hot_rows() {
+    let pool = pool();
+    let places = places_for(&[0], 12);
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path(), 2, 1000, 2);
+    apply_linear(&c, &pool, &places[0].1, 1);
+    {
+        let mut txn = c.hot.rw().unwrap();
+        kdx_hot::sndr::drop_family(&mut txn, Family::Sndr).unwrap();
+        txn.set_meta_u64(kdx_hot::env::meta::SNDR_HOT, 1).unwrap();
+        txn.commit().unwrap();
+    }
+    while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+    let seg =
+        kdx_segment::Segments::open(&c.segdir, std::sync::Arc::new(kdx_types::MemDict::new()))
+            .unwrap();
+    assert!(seg.ranges.len() >= 2);
+    for r in &seg.ranges {
+        assert_eq!(r.sndr.as_ref().unwrap().entities(), 0);
+        assert!(r.postings[Family::Acct as usize].entities() > 0);
+    }
+}
+
+/// blake3 of every file in a segments dir by name.
+fn seg_files(dir: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file())
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                kdx_segment::files::blake3_file(&p).unwrap(),
+            )
+        })
+        .collect()
 }

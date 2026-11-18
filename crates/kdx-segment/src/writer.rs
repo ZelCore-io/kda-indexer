@@ -49,6 +49,10 @@ pub struct WriteOpts {
     /// (one buffer per family of `Family::ALL`, `sndr` included; default
     /// [`ETL_MEM_ENTRIES`]). Backfill lowers it under its memory cap.
     pub postings_mem_entries: usize,
+    /// Write the optional files (`sndr.pst`, `kf.fil`) and list them in `range.toml`
+    /// (default). `false` writes a range the way a build before FIX-2 did: test fixtures of
+    /// `segments add-index` only.
+    pub optional_files: bool,
 }
 
 impl WriteOpts {
@@ -60,6 +64,7 @@ impl WriteOpts {
             dict_samples,
             force_sorted_index: false,
             postings_mem_entries: ETL_MEM_ENTRIES,
+            optional_files: true,
         }
     }
 }
@@ -119,6 +124,10 @@ impl RangeInfo {
             );
         }
         Ok(r)
+    }
+    /// The `range.toml` text (the writer and `segments add-index` both write it this way).
+    pub fn to_toml(&self) -> Result<String> {
+        Ok(toml::to_string(self)?)
     }
     pub fn entry(&self) -> RangeEntry {
         RangeEntry {
@@ -454,17 +463,21 @@ impl RangeWriter {
         write_keys(&tmp.join(fname(FileKind::Keys)), SLOT_WIDTH, &counts)?;
         let (rk_keys, bh_keys) = (rk.len() as u64, bh.len() as u64);
         // kf.fil: the filters over the same keys the indexes get.
-        let filters = KeyFilters {
-            bh: KeyFilter::from_index_keys(&bh)?,
-            rk: KeyFilter::from_index_keys(&rk)?,
-        };
-        write_file(&tmp.join(fname(FileKind::KeyFilter)), &filters.to_bytes())?;
-        drop(filters);
+        if opts.optional_files {
+            let filters = KeyFilters {
+                bh: KeyFilter::from_index_keys(&bh)?,
+                rk: KeyFilter::from_index_keys(&rk)?,
+            };
+            write_file(&tmp.join(fname(FileKind::KeyFilter)), &filters.to_bytes())?;
+        }
         let rk_kind = write_index(&tmp.join(fname(FileKind::Rk)), rk, opts.force_sorted_index)?;
         let bh_kind = write_index(&tmp.join(fname(FileKind::Bh)), bh, opts.force_sorted_index)?;
 
         let mut pstats = BTreeMap::new();
         for (fam, col) in Family::ALL.iter().zip(postings) {
+            if *fam == Family::Sndr && !opts.optional_files {
+                continue;
+            }
             let mut pw = PostingsWriter::create(
                 &tmp.join(fname(FileKind::of_family(*fam))),
                 *fam,
@@ -497,11 +510,13 @@ impl RangeWriter {
             pstats.insert(fam.name().to_string(), PostingStat { entities, entries });
         }
 
-        // Every file but range.toml: the required set and both optional files (a writer
-        // always writes them).
+        // Every file but range.toml: the required set and both optional files (unless a test
+        // fixture asked for the layout before FIX-2).
         let mut written = range_file_names(&network, start, end);
         written.retain(|n| *n != fname(FileKind::Range));
-        written.extend(optional_file_names(&network, start, end));
+        if opts.optional_files {
+            written.extend(optional_file_names(&network, start, end));
+        }
         let mut files = BTreeMap::new();
         for n in &written {
             let p = tmp.join(n);
@@ -542,7 +557,7 @@ impl RangeWriter {
         };
         write_file(
             &tmp.join(fname(FileKind::Range)),
-            toml::to_string(&info)?.as_bytes(),
+            info.to_toml()?.as_bytes(),
         )?;
         fsync_dir(&tmp)?;
 

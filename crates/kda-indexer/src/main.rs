@@ -380,6 +380,22 @@ enum SegmentsAction {
         #[arg(long)]
         start: Option<u32>,
     },
+    /// Add the sender index (`sndr.pst`) and the key filters (`kf.fil`) to every range and
+    /// step that lacks them, then backfill the hot store's sender postings. Offline (stop
+    /// the service), crash-safe and resumable; prints a JSON report.
+    AddIndex {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Entries built in parallel.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Build only one of the two files: `sndr` or `filter`.
+        #[arg(long)]
+        only: Option<String>,
+        /// Build and check every entry in a scratch dir, swap nothing, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -696,6 +712,18 @@ async fn main() -> anyhow::Result<()> {
             SegmentsAction::Check { data_dir, deep } => kda_indexer::cmd::segments::check(
                 data_dir.as_deref().unwrap_or(&cfg.data_dir),
                 deep,
+            ),
+            SegmentsAction::AddIndex {
+                data_dir,
+                jobs,
+                only,
+                dry_run,
+            } => kda_indexer::cmd::segments::add_index(
+                &cfg,
+                data_dir.as_deref().unwrap_or(&cfg.data_dir),
+                jobs,
+                only.as_deref(),
+                dry_run,
             ),
             SegmentsAction::Digest {
                 data_dir,

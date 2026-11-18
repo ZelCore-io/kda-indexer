@@ -18,7 +18,7 @@ use kdx_hot::checkpoint::set_checkpoint;
 use kdx_hot::tables::{block_key, parse_txkey};
 use kdx_hot::{dict, Stage, Table, Txn};
 use kdx_segment::files::{fsync_dir, optional_file_names, range_file_names};
-use kdx_segment::{Manifest, RangeEntry, RangeKind, RangeReader, RangeWriter, WriteOpts};
+use kdx_segment::{Manifest, RangeEntry, RangeKind, RangeReader, RangeWriter};
 use kdx_types::record::{decode_block, decode_tx, TxRecord};
 use kdx_types::{Dict, DictKind, TxKey};
 
@@ -316,7 +316,7 @@ fn freeze_step(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         start,
         end,
         first_txnum,
-        WriteOpts::new(o.step_level, o.dict_samples),
+        o.write_opts(o.step_level),
     )?;
     let blocks = write_hot_step(ctx, start, end, &mut w)?;
     let entry = w.finish()?;
@@ -378,7 +378,7 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         start,
         end,
         olds[0].first_txnum,
-        WriteOpts::new(o.range_level, o.dict_samples),
+        o.write_opts(o.range_level),
     )?;
     for e in &olds {
         let r = RangeReader::open(&ctx.segdir, e, &o.network)?;

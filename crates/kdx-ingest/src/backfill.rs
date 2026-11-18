@@ -534,7 +534,7 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
         } else {
             o.step_level
         };
-        let mut wopts = WriteOpts::new(level, o.dict_samples);
+        let mut wopts = o.write_opts(level);
         wopts.postings_mem_entries = mem.postings_mem_entries;
         let link_free = fresh && u.start == start;
         let fetch_secs = fetched.secs;

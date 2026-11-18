@@ -111,7 +111,7 @@ impl RangeReader {
             tracing::warn!(
                 range = %format!("{}..{}", e.start, e.end),
                 path = %p.display(),
-                "segment: range.toml lists {file} but the file is missing; the range is read                  without it (`segments add-index` restores it)"
+                "segment: range.toml lists {file} but the file is missing; the range is read without it (`segments add-index` restores it)"
             );
             kdx_metrics::get().segment_optional_missing(file);
         };
@@ -134,7 +134,7 @@ impl RangeReader {
                     tracing::warn!(
                         range = %format!("{}..{}", e.start, e.end),
                         path = %p.display(),
-                        "segment: key filter not trusted ({err:#}); the range is probed                          without it"
+                        "segment: key filter not trusted ({err:#}); the range is probed without it"
                     );
                     kdx_metrics::get().key_filter_untrusted.inc();
                     None

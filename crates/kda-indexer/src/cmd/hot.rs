@@ -86,10 +86,20 @@ fn droppable(name: &str) -> anyhow::Result<kdx_decode::Family> {
     }
 }
 
+/// Open the existing hot store of `data_dir` for writing. A missing store is refused, never
+/// created: a maintenance command on a mistyped data dir must fail, not start an empty one.
+pub fn open_existing(cfg: &Config, data_dir: &Path) -> anyhow::Result<HotStore> {
+    let dir = hot_dir(data_dir);
+    if !dir.join("mdbx.dat").is_file() {
+        anyhow::bail!("no hot store in {} (wrong --data-dir?)", dir.display());
+    }
+    HotStore::open(&dir, geometry(cfg))
+}
+
 pub fn drop_family(cfg: &Config, data_dir: &Path, family: &str) -> anyhow::Result<()> {
     let fam = droppable(family)?;
     let _lock = super::lock_data_dir(data_dir)?;
-    let hs = HotStore::open(&hot_dir(data_dir), geometry(cfg))?;
+    let hs = open_existing(cfg, data_dir)?;
     let mut txn = hs.rw()?;
     let st = kdx_hot::sndr::drop_family(&mut txn, fam)?;
     txn.commit()?;

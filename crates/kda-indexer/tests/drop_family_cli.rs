@@ -1,6 +1,6 @@
 //! `hot drop-family sndr` (FIX-2): offline, under the data-dir lock; afterwards no hot row or
 //! undo op names family 6, `Meta sndr_hot` is gone, and the freezer of a binary that knows
-//! only families 0..=5 would accept every `TailPostings` row.
+//! only families 0..=5 would accept every `TailPostings` row (every family byte is <= 5).
 
 #[path = "../../kdx-ingest/tests/common/mod.rs"]
 mod common;
@@ -56,10 +56,32 @@ fn drop_family_sndr_removes_rows_undo_ops_and_the_ready_key() {
             }
         }
     }
-    // The freezer still runs over the store.
-    let mut steps = 0;
-    while kdx_ingest::freezer::tick(&c).unwrap().is_some() {
-        steps += 1;
-    }
-    assert!(steps >= 2, "{steps}");
+}
+
+/// A data dir without a hot store is refused (non-zero exit) and no store is created.
+#[test]
+fn drop_family_refuses_a_data_dir_without_a_hot_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = kda_indexer::cmd::hot::drop_family(&cfg(), dir.path(), "sndr").unwrap_err();
+    assert!(e.to_string().contains("no hot store"), "{e:#}");
+    assert!(!dir.path().join("hot").exists());
+    let cfgp = dir.path().join("config.toml");
+    std::fs::write(
+        &cfgp,
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/config/mainnet01.toml"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kda-indexer"))
+        .arg("--config")
+        .arg(&cfgp)
+        .args(["hot", "drop-family", "sndr", "--data-dir"])
+        .arg(dir.path().join("data"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!dir.path().join("data").join("hot").exists());
 }

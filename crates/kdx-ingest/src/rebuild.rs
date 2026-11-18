@@ -12,9 +12,7 @@ use kdx_segment::content::{self, ContentSummary};
 use kdx_segment::files::{
     blake3_file, file_name, listed_files, optional_file_names, range_file_names, FileKind,
 };
-use kdx_segment::{
-    swap, Manifest, RangeEntry, RangeInfo, RangeKind, RangeReader, RangeWriter, WriteOpts,
-};
+use kdx_segment::{swap, Manifest, RangeEntry, RangeInfo, RangeKind, RangeReader, RangeWriter};
 use kdx_types::record::decode_block;
 use kdx_types::Hash32;
 use serde::Serialize;
@@ -395,7 +393,7 @@ fn write(
         entry.start,
         entry.end,
         entry.first_txnum,
-        WriteOpts::new(level, o.dict_samples),
+        o.write_opts(level),
     )?;
     let mut dict = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());
     let mut it = coll.into_sorted()?;

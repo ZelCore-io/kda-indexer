@@ -29,6 +29,7 @@ pub fn opts(cfg: &Config, data_dir: &Path) -> IngestOpts {
         commit_blocks: cfg.tail.commit_blocks,
         cut_poll_secs: cfg.tail.cut_poll_secs,
         until: None,
+        legacy_segments: false,
     }
 }
 

@@ -36,6 +36,18 @@ pub struct IngestOpts {
     pub cut_poll_secs: u64,
     /// Dev: followers stop at this height (bounded tail runs and replay checks).
     pub until: Option<u32>,
+    /// Test fixtures only: write segments the way a build before FIX-2 did (no `sndr.pst`,
+    /// no `kf.fil`), the input of `segments add-index` tests. Always false in production.
+    pub legacy_segments: bool,
+}
+
+impl IngestOpts {
+    /// The writer options of every range/step this process writes at zstd `level`.
+    pub fn write_opts(&self, level: i32) -> kdx_segment::WriteOpts {
+        let mut w = kdx_segment::WriteOpts::new(level, self.dict_samples);
+        w.optional_files = !self.legacy_segments;
+        w
+    }
 }
 
 pub struct Ctx {

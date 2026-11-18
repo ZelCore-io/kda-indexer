@@ -107,6 +107,7 @@ pub fn opts(dir: &Path, step: u64, range: u64, finality: u64) -> IngestOpts {
         commit_blocks: 10,
         cut_poll_secs: 10,
         until: None,
+        legacy_segments: false,
     }
 }
 
