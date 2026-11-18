@@ -357,7 +357,10 @@ the oracle puts them.
 - **`transfers`** use the same sources; rows are the tx's transfers of `fungibleName` with
   `accountName` on either side when given. `crossChainTransfer` is the other half of a
   cross-chain transfer (the `cont` step of the pact, or the tx that started it), `null`
-  while that half is not indexed.
+  while that half is not indexed. The outgoing half reads the pact's steps oldest first and
+  stops at the one that succeeded, so failed retries after it cost nothing; a lookup reads
+  at most 1,000 steps, and one request at most 2,000 for all its `crossChainTransfer`
+  fields, past which a lookup answers `null`.
 - **`events`**: `qualifiedEventName` is required. `parametersFilter` accepts only
   `{"array_starts_with": <value or array>}` (the event's first parameters equal the value or
   the array's values); anything else is `UNSUPPORTED_FILTER`.

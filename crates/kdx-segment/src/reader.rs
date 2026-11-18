@@ -531,6 +531,37 @@ impl Segments {
             })
     }
 
+    /// TxNums of `(f, entity)` in the ranges that reach `min_height` or above (whole
+    /// ranges: the caller filters heights inside the first one), **oldest first** across
+    /// ranges. Each range's list is opened only when the walk gets to it. Stops with an error
+    /// item when a list does not decode.
+    pub fn postings_oldest_memo<'a>(
+        &'a self,
+        f: Family,
+        entity: u64,
+        min_height: u32,
+        memo: Option<&'a ListMemo>,
+    ) -> impl Iterator<Item = Result<u64>> + 'a {
+        self.ranges
+            .iter()
+            .enumerate()
+            .filter(move |(_, r)| r.info.end > min_height)
+            .flat_map(move |(ri, r)| {
+                let res: Box<dyn Iterator<Item = Result<u64>>> = match match memo {
+                    Some(m) => r.postings_le_memo(f, entity, None, m, ri as u32),
+                    None => r.postings_le(f, entity, None),
+                } {
+                    Ok(Some(it)) => Box::new(it.oldest_first().map(Ok)),
+                    Ok(None) => Box::new(std::iter::empty()),
+                    Err(e) => Box::new(std::iter::once(Err(e.context(format!(
+                        "postings of range {}..{}",
+                        r.info.start, r.info.end
+                    ))))),
+                };
+                res
+            })
+    }
+
     fn range_of_txnum(&self, t: u64) -> Option<&RangeReader> {
         self.manifest.entry_of_txnum(t).map(|i| &*self.ranges[i])
     }

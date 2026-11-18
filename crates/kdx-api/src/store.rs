@@ -673,6 +673,37 @@ impl View {
         Ok((out, capped))
     }
 
+    /// The steps of the defpact `pact` at `min_height` or above (the start tx's height),
+    /// **oldest first**, read lazily: each item costs one posting and one record read, so a
+    /// caller that stops at the first succeeded `cont` reads only up to it, however many
+    /// failed retries follow (FIX-3, O2). Same records and checks as [`View::pact_steps`].
+    pub fn pact_steps_oldest<'v>(
+        &'v self,
+        pact: &Hash32,
+        min_height: u32,
+    ) -> ApiResult<impl Iterator<Item = ApiResult<PactStep>> + 'v> {
+        let pact = *pact;
+        let keys = self.postings_oldest(Family::Pact, pact_entity(&pact), min_height)?;
+        Ok(keys.filter_map(move |k| {
+            let step = || -> ApiResult<Option<PactStep>> {
+                let k = k?;
+                let Some(r) = self.tx(k)? else {
+                    return Ok(None);
+                };
+                let cont = cmd_pact_id(&r) == Some(pact);
+                if cont || record_pact_id(&r, &self.dict())? == Some(pact) {
+                    return Ok(Some(PactStep {
+                        key: k,
+                        cont,
+                        ok: r.status_ok,
+                    }));
+                }
+                Ok(None)
+            };
+            step().transpose()
+        }))
+    }
+
     /// First height of the upper expansion window for code-search hits: every height above
     /// `rebuilt_through` (the last rebuild's census frontier − 1: docs are never updated, so
     /// `last_h` is exact only up to there; `None` = 0, expand from `first_h`), and the hot part.
@@ -838,24 +869,108 @@ impl View {
                 }
             };
 
-        let mut n = 0u32;
-        let deadline = self.deadline;
-        let mut failed = false;
-        Ok(Box::new(hot.chain(frozen).map_while(move |r| {
-            if failed {
-                return None;
-            }
-            n += 1;
-            if n.is_multiple_of(CHECK_EVERY) && Instant::now() >= deadline {
-                failed = true;
-                return Some(Err(ApiError::Deadline));
-            }
-            if r.is_err() {
-                failed = true;
-            }
-            Some(r)
-        })))
+        Ok(with_deadline(hot.chain(frozen), self.deadline))
     }
+
+    /// The `(f, entity)` postings at `min_height` or above, **oldest first** (frozen, then
+    /// hot), read lazily: the frozen ranges one list at a time, the hot part in chunks of
+    /// [`HOT_CHUNK`] keys. Same keys as [`View::postings`] with that `min_height`, reversed;
+    /// the deadline is checked the same way.
+    pub fn postings_oldest(
+        &self,
+        f: Family,
+        entity: u64,
+        min_height: u32,
+    ) -> ApiResult<KeyIter<'_>> {
+        let floor = self.hot_floor();
+        let seg = &self.seg;
+        let frozen: KeyIter<'_> = if self.seg_frontier == 0 || self.seg_frontier <= min_height {
+            Box::new(std::iter::empty())
+        } else {
+            let frontier = self.seg_frontier;
+            Box::new(
+                seg.postings_oldest_memo(f, entity, min_height, Some(&self.memo))
+                    .map(move |r| -> ApiResult<TxKey> {
+                        let t = r?;
+                        Ok(seg.txkey(t).context("posting TxNum without a key")?)
+                    })
+                    .take_while(move |r| r.as_ref().map_or(true, |k| k.height() < frontier))
+                    .filter(move |r| r.as_ref().map_or(true, |k| k.height() >= min_height)),
+            )
+        };
+
+        // Hot part: keys at `max(hot_floor, min_height)` and above, ascending.
+        let p9 = posting_key(f as u8, entity, TxKey::new(0, 0, 0))[..9].to_vec();
+        let mut from =
+            posting_key(f as u8, entity, TxKey::new(floor.max(min_height), 0, 0)).to_vec();
+        let mut buf = std::collections::VecDeque::new();
+        let mut done = false;
+        let hot = std::iter::from_fn(move || -> Option<ApiResult<TxKey>> {
+            loop {
+                if let Some(k) = buf.pop_front() {
+                    return Some(Ok(k));
+                }
+                if done {
+                    return None;
+                }
+                let rows = match self
+                    .txn
+                    .scan_limit(Table::TailPostings, &from, HOT_CHUNK, |k| {
+                        k.starts_with(&p9)
+                    }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        done = true;
+                        return Some(Err(e.into()));
+                    }
+                };
+                done = rows.len() < HOT_CHUNK;
+                if let Some((last, _)) = rows.last() {
+                    // The smallest key above `last`.
+                    from.clone_from(last);
+                    from.push(0);
+                }
+                for (k, _) in rows {
+                    match parse_txkey(&k[9..]).context("posting key") {
+                        Ok(t) => buf.push_back(t),
+                        Err(e) => {
+                            done = true;
+                            buf.clear();
+                            return Some(Err(e.into()));
+                        }
+                    }
+                }
+            }
+        });
+        Ok(with_deadline(frozen.chain(hot), self.deadline))
+    }
+}
+
+/// Hot posting keys [`View::postings_oldest`] reads per cursor scan.
+const HOT_CHUNK: usize = 256;
+
+/// `it` with the request deadline checked every [`CHECK_EVERY`] items; the first error (a
+/// passed deadline or the walk's own) ends it.
+fn with_deadline<'v>(
+    it: impl Iterator<Item = ApiResult<TxKey>> + 'v,
+    deadline: Instant,
+) -> KeyIter<'v> {
+    let mut n = 0u32;
+    let mut failed = false;
+    Box::new(it.map_while(move |r| {
+        if failed {
+            return None;
+        }
+        n += 1;
+        if n.is_multiple_of(CHECK_EVERY) && Instant::now() >= deadline {
+            failed = true;
+            return Some(Err(ApiError::Deadline));
+        }
+        if r.is_err() {
+            failed = true;
+        }
+        Some(r)
+    }))
 }
 
 /// A boxed newest-first TxKey stream.
@@ -1238,7 +1353,11 @@ mod pact_steps_tests {
         let txs: Vec<TxRecord> = std::iter::once(coinbase)
             .chain(oks.iter().enumerate().map(|(i, &ok)| TxRecord {
                 key: TxKey::new(height, 0, i as u16 + 1),
-                request_key: Some(Hash32([height as u8 * 10 + i as u8; 32])),
+                request_key: Some(Hash32({
+                    let mut rk = [height as u8; 32];
+                    rk[1..3].copy_from_slice(&(i as u16).to_be_bytes());
+                    rk
+                })),
                 cmd: Some(serde_json::to_vec(&cmd).unwrap()),
                 status_ok: ok,
                 ..TxRecord::default()
@@ -1346,6 +1465,94 @@ mod pact_steps_tests {
         let (steps, capped) = view.pact_steps(&PACT, 3).unwrap();
         assert!(capped);
         assert_eq!(steps[0], step(5, 2, false));
+    }
+
+    /// FIX-3 (O2): `pact_steps_oldest` walks the same steps oldest first, frozen then hot,
+    /// lazily, from `min_height` on.
+    #[test]
+    fn pact_steps_oldest_walks_oldest_first_from_a_height() {
+        let (_d, store) = frozen_and_hot();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let step = |h: u32, pos: u16, ok: bool| PactStep {
+            key: TxKey::new(h, 0, pos),
+            cont: true,
+            ok,
+        };
+        let all: Vec<PactStep> = view
+            .pact_steps_oldest(&PACT, 0)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                step(5, 1, true),
+                step(5, 2, false),
+                step(12, 1, false),
+                step(12, 2, true),
+            ]
+        );
+        // The same steps as the newest-first walk.
+        assert_eq!(all, view.pact_steps(&PACT, 16).unwrap().0);
+        let from = |h: u32| -> Vec<TxKey> {
+            view.pact_steps_oldest(&PACT, h)
+                .unwrap()
+                .map(|s| s.unwrap().key)
+                .collect()
+        };
+        assert_eq!(from(5).len(), 4);
+        assert_eq!(from(6), vec![TxKey::new(12, 0, 1), TxKey::new(12, 0, 2)]);
+        assert_eq!(from(12).len(), 2);
+        assert!(from(13).is_empty());
+        // Lazy: taking the first step reads no further.
+        let first = view.pact_steps_oldest(&PACT, 0).unwrap().next();
+        assert_eq!(first.unwrap().unwrap(), step(5, 1, true));
+        assert!(view
+            .pact_steps_oldest(&Hash32([78; 32]), 0)
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    /// The hot part is read in chunks: more steps than one chunk, in one block and across
+    /// blocks, come back complete and in order.
+    #[test]
+    fn pact_steps_oldest_reads_the_hot_part_across_chunks() {
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+        let mut t = hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let mut oks = vec![false; 600];
+        oks[299] = true;
+        kdx_hot::tail::apply(&mut t, &block(20, &oks), &mut dict).unwrap();
+        kdx_hot::tail::apply(&mut t, &block(21, &[false; 5]), &mut dict).unwrap();
+        t.commit().unwrap();
+        let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let keys: Vec<TxKey> = view
+            .pact_steps_oldest(&PACT, 0)
+            .unwrap()
+            .map(|s| s.unwrap().key)
+            .collect();
+        let want: Vec<TxKey> = (1..=600u16)
+            .map(|p| TxKey::new(20, 0, p))
+            .chain((1..=5u16).map(|p| TxKey::new(21, 0, p)))
+            .collect();
+        assert_eq!(keys, want);
+        let first_ok = view
+            .pact_steps_oldest(&PACT, 0)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|s| s.ok);
+        assert_eq!(first_ok.map(|s| s.key), Some(TxKey::new(20, 0, 300)));
     }
 
     /// R-P5P9-62: `before` keeps only keys strictly below it, frozen and hot alike, also when
