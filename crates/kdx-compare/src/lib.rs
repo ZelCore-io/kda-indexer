@@ -15,6 +15,7 @@ pub mod leak;
 pub mod metrics;
 pub mod normalize;
 pub mod oracle;
+pub mod pair;
 pub mod referee;
 pub mod report;
 pub mod rewards;

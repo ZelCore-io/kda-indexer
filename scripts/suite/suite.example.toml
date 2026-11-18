@@ -1,0 +1,61 @@
+# Endpoint suite and stress driver config. Copy to the host and fill in; the filled copy
+# names hosts and stays there (never commit it).
+
+[ours]
+graphql = "http://127.0.0.1:PORT/graphql"
+compat = "http://127.0.0.1:PORT"
+native = "http://127.0.0.1:PORT"
+# rps = 135                  # every request to ours; default: the sum of the stock rates (paired)
+timeout_s = 30
+sources = ["127.0.0.200"]    # source addresses of the comparison runner
+# search_sources = [...]     # 4 addresses for search cases (ours: 4 searches, 1 per client)
+# stress_sources = [...]     # default: 128 loopback sources 127.0.0.10..137
+# unit = "SERVICE"           # systemd unit of ours (RSS and NRestarts, read-only)
+
+[stock]
+timeout_s = 180
+insecure_tls = false         # true only for stock hosts reached by address
+
+[[stock.oracle]]             # one table per stock GraphQL host; cases are split over them
+name = "stock-a"
+url = "https://STOCK-A/graphql"
+rps = 35                     # target rate of light cases; the adaptive throttle halves it on
+                             # errors > err_limit or p99 > p99_limit_s over 60 s or a crash,
+                             # and adds ramp_step every ramp_every_s once healthy
+concurrency = 64             # light cases in flight
+heavy_concurrency = 4        # heavy cases (transactions by account, NFT accounts) in flight,
+                             # outside the rate target
+err_limit = 0.02
+p99_limit_s = 5.0
+ramp_step = 5
+ramp_every_s = 120
+max_height = 0               # the stock side's highest indexed height (0: no cap)
+
+[[stock.oracle]]
+name = "stock-b"
+url = "https://STOCK-B/graphql"
+rps = 35
+heavy_concurrency = 4
+
+[stock.cwd]                  # same throttle keys as above
+url = "http://127.0.0.1:PORT"
+rps = 30
+probe_path = "/txs/recent"     # cheap; chainweb-data /stats can take > 10 s
+
+[stock.kdatxs]
+url = "http://127.0.0.1:PORT"
+rps = 30
+probe_path = "/v1/txs/coin/coin/1"
+
+[diff]
+kda_compare = "/path/to/kda-compare"   # built from this branch (has `pair-diff`)
+config = "/path/to/compare.toml"       # its allowlist and [graphql] field_rules are used
+
+[estimate]                   # latency assumptions for `run.py estimate`
+oracle_light_s = 0.6
+oracle_heavy_s = 3.0
+cwd_light_s = 0.3
+cwd_heavy_s = 3.0
+kdatxs_light_s = 0.3
+kdatxs_heavy_s = 1.0
+ours_search_s = 1.5          # mean ours search latency (search, pactid, search/code, search/events)

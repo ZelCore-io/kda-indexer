@@ -112,6 +112,10 @@ enum Cmd {
     },
     /// Parse and validate the config, then print it.
     CheckConfig,
+    /// Endpoint suite: read stored answer pairs (JSON lines on stdin, see
+    /// `kdx_compare::pair`) and print one verdict line each, with the harness's normalisers,
+    /// `[graphql] field_rules` and allowlist. Sends no request.
+    PairDiff,
     /// P3 gate: per route and pair, requests compared, unexplained diffs, allowlisted hits,
     /// errors and p50/p99 per side over the summary files in `out_dir`. Exit 0 iff green.
     Summary {
@@ -189,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())
         }
+        Cmd::PairDiff => pair_diff(&cfg),
         Cmd::Summary {
             since,
             routes,
@@ -275,6 +280,33 @@ async fn main() -> anyhow::Result<()> {
         } => gen_debug(&cfg, count, print, source.as_deref()).await,
         Cmd::Run { duration_secs } => kdx_compare::run::run(cfg, duration_secs).await,
     }
+}
+
+/// `pair-diff`: one verdict line per input line; a line that does not parse gets an
+/// `{"id": null, "class": "bad-input"}` verdict so the caller stays in step.
+fn pair_diff(cfg: &CompareConfig) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    let allow = Allowlist::load(&cfg.allowlist)?;
+    let stdin = std::io::stdin();
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v = match serde_json::from_str::<kdx_compare::pair::PairIn>(&line) {
+            Ok(p) => serde_json::to_value(kdx_compare::pair::verdict(
+                p,
+                &allow,
+                &cfg.graphql.field_rules,
+                cfg.graphql.total_count_cap,
+            ))?,
+            Err(e) => serde_json::json!({"id": null, "class": "bad-input", "error": e.to_string()}),
+        };
+        writeln!(out, "{v}")?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
 /// Fetches A twice (following pages), normalises, diffs and classifies.
