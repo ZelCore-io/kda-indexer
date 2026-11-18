@@ -23,6 +23,10 @@ const V1: &str = "marmalade.ledger";
 /// - `t:3` (v1): guard read at 5, before the row moved (stale), and no `get-token-info`;
 /// - `t:4` (v2): the node had no ledger row, and its info call failed.
 async fn answer(q: &str) -> Value {
+    answer_with(q, GraphqlSettings::default()).await
+}
+
+async fn answer_with(q: &str, gql: GraphqlSettings) -> Value {
     let d = tempfile::tempdir().unwrap();
     let g = kdx_hot::Geometry {
         max_gb: 1,
@@ -81,7 +85,7 @@ async fn answer(q: &str) -> Value {
         max_event_lists: 64,
     };
     let st = Api::new(store, settings, TipWatch::default()).state();
-    let app = router(build_schema(st.clone(), GraphqlSettings::default(), None)).with_state(st);
+    let app = router(build_schema(st.clone(), gql, None)).with_state(st);
     let req = Request::post("/graphql")
         .header("content-type", "application/json")
         .body(Body::from(json!({ "query": q }).to_string()))
@@ -169,4 +173,23 @@ async fn nft_guard_and_info_resolve_and_missing_details_error_per_field() {
         .unwrap_or_else(|| panic!("{v}"));
     assert_eq!(items.len(), 4);
     assert_eq!(v["errors"].as_array().map(Vec::len), Some(2), "{v}");
+}
+
+/// FIX-3 part D (P4): an account's holdings are all returned, as stock returns them (up to
+/// the 1,000-row safety cap), not cut at `max_page`.
+#[tokio::test]
+async fn holdings_are_not_cut_at_max_page() {
+    let gql = GraphqlSettings {
+        max_page: 2,
+        ..GraphqlSettings::default()
+    };
+    let v = answer_with(
+        "{ nonFungibleAccount(accountName: \"k:holder\") { nonFungibleTokenBalances { tokenId } } }",
+        gql,
+    )
+    .await;
+    let items = v["data"]["nonFungibleAccount"]["nonFungibleTokenBalances"]
+        .as_array()
+        .map(Vec::len);
+    assert_eq!(items, Some(4), "{v}");
 }

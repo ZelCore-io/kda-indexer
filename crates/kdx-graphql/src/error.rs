@@ -79,6 +79,17 @@ pub fn bad_input(msg: impl Into<String>) -> async_graphql::Error {
     err(Code::BadUserInput, msg)
 }
 
+/// The message of the page safety cap's refusal ([`page_limit`]).
+pub const PAGE_LIMIT_MESSAGE: &str =
+    "a page holds at most 1000 rows (first, last and quantity above it are refused)";
+
+/// The refusal of a page over [`crate::MAX_PAGE_ROWS`] (FIX-3 part D, S3): `LIMIT`, with
+/// `extensions.limit = "page"`. Counts `kdx_graphql_rejected_total{reason = "page"}`.
+pub fn page_limit() -> async_graphql::Error {
+    kdx_metrics::get().graphql_rejected("page");
+    err(Code::Limit, PAGE_LIMIT_MESSAGE).extend_with(|_, e| e.set("limit", "page"))
+}
+
 /// A request-level `LIMIT` refusal: `extensions.code = "LIMIT"`, `extensions.limit = name`.
 /// Counts `kdx_graphql_rejected_total{reason = name}`.
 pub fn limit(name: &'static str, msg: impl Into<String>) -> ServerError {

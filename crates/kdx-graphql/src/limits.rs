@@ -20,6 +20,12 @@
 //! once per connection) by the page size it will return (clamped like the resolver: `max_page`, or
 //! `default_page` when omitted). `nodes(ids)` multiplies by the number of ids; per-chain
 //! account lists by the chain count (20 or `chainIds`).
+//!
+//! Served (FIX-3 parts C and D), this model is a read budget ([`budget`]): stock's limits
+//! ([`crate::stock_limits`]) refuse on depth and complexity, and the budget refuses only on
+//! the bounds of the walk, the introspection cost cap and more than [`MAX_COUNTS`] count
+//! walks. It prices a page as served: as asked up to [`crate::MAX_PAGE_ROWS`], absent at
+//! `default_page`.
 
 use std::sync::Arc;
 
@@ -313,7 +319,9 @@ impl<'a> Walk<'a> {
                         "totalCount" if !(wrap == Wrap::Conn && ty.is_some_and(cheap_count)) => {
                             // A count walk (GQ-10): a fixed cost, and few per operation.
                             self.counts = self.counts.saturating_add(self.outer);
-                            if self.enforce && self.counts > MAX_COUNTS {
+                            // Enforced in the served budget too (FIX-3 part D, S4): a
+                            // resource bound, not one of stock's limits.
+                            if self.counts > MAX_COUNTS {
                                 return Err(limit(
                                     "complexity",
                                     format!(
@@ -458,7 +466,12 @@ impl<'a> Walk<'a> {
         let s = self.s;
         // The wide lists clamp at `wide_page` (R-P5P9-20), everything else at `max_page`.
         let name = f.name.node.as_str();
-        let cap = if WIDE.contains(&name) {
+        // The served budget (FIX-3 part D, S5) prices a page as the resolver serves it: as
+        // asked up to the safety cap (above it the resolver refuses), and an absent
+        // `first`/`last` at `default_page`. The legacy model keeps its clamps.
+        let cap = if !self.enforce {
+            crate::MAX_PAGE_ROWS
+        } else if WIDE.contains(&name) {
             s.max_page.saturating_mul(2)
         } else {
             s.max_page
@@ -502,7 +515,7 @@ impl<'a> Walk<'a> {
             "fungibleAccountsByPublicKey" | "fungibleChainAccountsByPublicKey" => {
                 crate::types::account::MAX_KEY_ACCOUNTS as u64
             }
-            "nonFungibleTokenBalances" => s.max_page as u64,
+            "nonFungibleTokenBalances" => cap.min(crate::MAX_PAGE_ROWS) as u64,
             _ if PAGED.contains(&name) => page(None),
             _ => 1,
         }
@@ -669,10 +682,14 @@ impl Extension for LimitsExt {
         } else {
             stock_limits::depth_errors(reg, doc)
         };
-        // A document of several operations needs a name, refused later without one.
-        let several = matches!(&doc.operations, DocumentOperations::Multiple(m) if m.len() > 1);
-        let skip = (!ws && op.as_deref() == Some(stock_limits::INTROSPECTION_QUERY))
-            || (op.is_none() && several);
+        // FIX-3 part D (S1): the operation priced is the one the executor runs (none: the
+        // executor refuses the request itself), and the skip needs both stock's name and an
+        // operation of introspection fields alone, so a spoofed name carrying real fields is
+        // priced.
+        let skip = !ws
+            && op.as_deref() == Some(stock_limits::INTROSPECTION_QUERY)
+            && stock_limits::selected_operation(doc, op.as_deref())
+                .is_some_and(|o| stock_limits::pure_introspection(doc, o));
         let complexity = (!skip && stock_limits::over_complexity(reg, doc, op.as_deref(), &vars))
             .then_some(if ws {
                 stock_limits::WS_COMPLEXITY_MESSAGE
@@ -928,6 +945,51 @@ mod tests {
         );
         // A block's count is not a walk: kadscan's block list passes.
         assert!(c("{ blocksFromDepth(minimumDepth: 0, first: 25) { totalCount edges { node { transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }").unwrap() < 2000);
+    }
+
+    /// FIX-3 part D (S4, S5): the served read budget still refuses more than [`MAX_COUNTS`]
+    /// count walks (resource protection, as before part C), and prices a page as it is
+    /// served: an absent `first`/`last` at `default_page`, a given one as asked, up to the
+    /// safety cap.
+    #[test]
+    fn the_read_budget_counts_walks_and_prices_served_pages() {
+        let b = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            budget(&doc, &Variables::default(), &GraphqlSettings::default()).map_err(|e| {
+                let x = e.extensions.unwrap();
+                format!("{:?} {:?}", x.get("code"), x.get("limit"))
+            })
+        };
+        let refused = format!(
+            "{:?} {:?}",
+            Some(&Value::from("LIMIT")),
+            Some(&Value::from("complexity"))
+        );
+        let three: String = (0..3)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
+            .collect();
+        assert_eq!(b(&format!("{{ {three} }}")), Err(refused));
+        let two: String = (0..2)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
+            .collect();
+        assert!(b(&format!("{{ {two} }}")).is_ok());
+        assert!(
+            b("{ fungibleChainAccounts(accountName: \"a\") { transactions { totalCount } } }")
+                .is_err()
+        );
+        // Pages: absent is the default page (20 items, 1 each, plus the connection).
+        let page = |args: &str| {
+            b(&format!(
+                "{{ transactions{args} {{ edges {{ node {{ hash }} }} }} }}"
+            ))
+            .unwrap()
+            .complexity
+        };
+        assert_eq!(page(""), 21);
+        assert_eq!(page("(first: 500)"), 501);
+        assert_eq!(page("(last: 1000)"), 1001);
+        assert_eq!(page("(first: 5000)"), 1001);
+        assert_eq!(page("(first: -5)"), 1);
     }
 
     #[test]

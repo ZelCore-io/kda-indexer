@@ -44,7 +44,7 @@ rate_per_ip = 20
 # GraphQL limits (docs/graphql.md); the listener address is api.graphql. All optional.
 # Depth (9) and complexity (4000) refusals are the stock indexer's, fixed (docs/graphql.md).
 # default_page = 20          # page size when first/last are omitted (stock's 20)
-# max_page = 100             # cap of NFT holdings and subscription quantity; pages are not clamped
+# max_page = 100             # legacy cost model only; pages, quantity, NFT holdings cap at 1,000 (fixed)
 # max_depth = 10             # read-budget model only, not enforced
 # max_complexity = 2000      # read budget: logged above it, never refused
 # introspection = true

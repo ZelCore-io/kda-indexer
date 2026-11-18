@@ -13,7 +13,8 @@
 //!   the directive costs `(value + children) × Π multipliers`, a multiplier being the named
 //!   argument's number or list length, ignored when absent or null (no page-size default);
 //!   every other field costs its children. Over an interface or union, the most expensive
-//!   possible type counts. HTTP skips it for an operation named `IntrospectionQuery`.
+//!   possible type counts. HTTP skips it for an operation named `IntrospectionQuery`; ours
+//!   only when that operation selects introspection fields alone (FIX-3 part D, S1).
 //!
 //! The directive values are stock's, from [`crate::stock_schema`]. A field stock does not
 //! have (a ZelCore extension) is priced as if it carried `@complexity(value: 1,
@@ -23,8 +24,8 @@
 use std::collections::HashMap;
 
 use async_graphql::parser::types::{
-    Directive, DocumentOperations, ExecutableDocument, Field, FragmentDefinition, OperationType,
-    Selection, SelectionSet,
+    Directive, DocumentOperations, ExecutableDocument, Field, FragmentDefinition,
+    OperationDefinition, OperationType, Selection, SelectionSet,
 };
 use async_graphql::registry::{MetaType, Registry};
 use async_graphql::{Name, Positioned, Value, Variables};
@@ -151,10 +152,14 @@ impl<'a> Cx<'a> {
 
     /// The directive estimator; `None` when it gives no number (then `simpleEstimator`).
     fn directive(&self, d: &CxDirective, f: &Field, sf: Option<&StockField>, child: f64) -> f64 {
+        // FIX-3 part D (S2): a negative multiplier counts as 0 and the field's cost is never
+        // below 0, so a negative `first` cannot cancel an expensive sibling (stock's library
+        // multiplies the negative in). A number that is not finite falls back to the
+        // children, as the library's NaN check does.
         let mut mult = 1.0;
         for m in d.multipliers {
             match self.arg(f, m, sf) {
-                Some(Value::Number(n)) => mult *= n.as_f64().unwrap_or(f64::NAN),
+                Some(Value::Number(n)) => mult *= n.as_f64().unwrap_or(f64::NAN).max(0.0),
                 Some(Value::List(l)) => mult *= l.len() as f64,
                 _ => {}
             }
@@ -163,7 +168,7 @@ impl<'a> Cx<'a> {
         if c.is_nan() {
             child
         } else {
-            c
+            c.max(0.0)
         }
     }
 
@@ -271,15 +276,58 @@ fn root(op: OperationType) -> &'static str {
     }
 }
 
-/// Stock's `getComplexity` of `doc`: the operation named `operation_name`, or, with no name,
-/// every operation summed (a document of several operations needs a name, so that is the one
-/// operation).
+/// The operation the executor runs (async-graphql's choice): the one named
+/// `operation_name`, or the only one when no name is given. `None` when the request names
+/// no operation of the document, or names none in a document of several: the executor
+/// refuses those itself, so no price is needed.
+pub fn selected_operation<'a>(
+    doc: &'a ExecutableDocument,
+    operation_name: Option<&str>,
+) -> Option<&'a Positioned<OperationDefinition>> {
+    match (&doc.operations, operation_name) {
+        (DocumentOperations::Single(op), None) => Some(op),
+        (DocumentOperations::Single(_), Some(_)) => None,
+        (DocumentOperations::Multiple(m), Some(n)) => m.get(n),
+        (DocumentOperations::Multiple(m), None) if m.len() == 1 => m.values().next(),
+        (DocumentOperations::Multiple(_), None) => None,
+    }
+}
+
+/// Whether `op` selects introspection fields alone (`__schema`, `__type`, `__typename`),
+/// through fragments too (FIX-3 part D, S1). Only such an operation may skip the complexity
+/// check; stock skips any operation *named* `IntrospectionQuery`.
+pub fn pure_introspection(doc: &ExecutableDocument, op: &Positioned<OperationDefinition>) -> bool {
+    fn set(doc: &ExecutableDocument, s: &SelectionSet, seen: &mut Vec<String>) -> bool {
+        s.items.iter().all(|sel| match &sel.node {
+            Selection::Field(f) => f.node.name.node.starts_with("__"),
+            Selection::InlineFragment(i) => set(doc, &i.node.selection_set.node, seen),
+            Selection::FragmentSpread(sp) => {
+                let name = sp.node.fragment_name.node.as_str();
+                if seen.iter().any(|n| n == name) {
+                    return true;
+                }
+                let Some(def) = doc.fragments.get(name) else {
+                    return false;
+                };
+                seen.push(name.to_owned());
+                set(doc, &def.node.selection_set.node, seen)
+            }
+        })
+    }
+    set(doc, &op.node.selection_set.node, &mut Vec::new())
+}
+
+/// Stock's `getComplexity` of the operation the executor runs ([`selected_operation`]); 0
+/// when none is selected (the executor refuses the request).
 pub fn complexity(
     reg: &Registry,
     doc: &ExecutableDocument,
     operation_name: Option<&str>,
     vars: &Variables,
 ) -> f64 {
+    let Some(op) = selected_operation(doc, operation_name) else {
+        return 0.0;
+    };
     let mut cx = Cx {
         reg,
         doc,
@@ -287,33 +335,21 @@ pub fn complexity(
         defaults: HashMap::new(),
         stack: Vec::new(),
     };
-    let ops: Vec<(Option<&Name>, _)> = match &doc.operations {
-        DocumentOperations::Single(op) => vec![(None, op)],
-        DocumentOperations::Multiple(m) => m.iter().map(|(n, op)| (Some(n), op)).collect(),
-    };
-    let mut total = 0.0;
-    for (name, op) in ops {
-        if let Some(want) = operation_name {
-            if name.map(Name::as_str) != Some(want) {
-                continue;
-            }
-        }
-        cx.defaults = op
-            .node
-            .variable_definitions
-            .iter()
-            .filter_map(|d| {
-                d.node
-                    .default_value
-                    .as_ref()
-                    .map(|v| (d.node.name.node.clone(), v.node.clone()))
-            })
-            .collect();
-        if let Some(t) = reg.types.get(root(op.node.ty)) {
-            total += cx.node(&op.node.selection_set.node, t);
-        }
+    cx.defaults = op
+        .node
+        .variable_definitions
+        .iter()
+        .filter_map(|d| {
+            d.node
+                .default_value
+                .as_ref()
+                .map(|v| (d.node.name.node.clone(), v.node.clone()))
+        })
+        .collect();
+    match reg.types.get(root(op.node.ty)) {
+        Some(t) => cx.node(&op.node.selection_set.node, t),
+        None => 0.0,
     }
-    total
 }
 
 /// Whether stock refuses `doc` on complexity.
@@ -717,6 +753,46 @@ mod tests {
             ),
             2.0
         );
+    }
+
+    /// FIX-3 part D (S2): a negative multiplier counts as 0 and no field costs less than 0,
+    /// so a negative `first` next to an expensive field cannot lower the total.
+    #[test]
+    fn a_negative_multiplier_cannot_lower_the_cost() {
+        let q = "{ a: transactions(first: -5) { edges { node { hash } } } b: transactions(first: 4001) { edges { node { hash } } } }";
+        assert_eq!(cx(q, serde_json::json!({})), 4001.0);
+        // A negative page with an expensive child: 0, never negative.
+        let q = "{ blocksFromHeight(startHeight: 0, first: -1) { edges { node { transactions(first: 4001) { edges { node { hash } } } } } } x: transactions(first: 4001) { edges { node { hash } } } }";
+        assert_eq!(cx(q, serde_json::json!({})), 4001.0);
+        // Through a variable, and `last` too.
+        let q = "query Q($n: Int) { a: transactions(last: $n) { edges { node { hash } } } b: transactions(first: 4001) { edges { node { hash } } } }";
+        assert_eq!(cx(q, serde_json::json!({"n": -1000000})), 4001.0);
+        // A fractional or huge number is still a number: priced as stock prices it, >= 0.
+        assert!(cx(q, serde_json::json!({"n": 1e300})) > MAX_COMPLEXITY);
+    }
+
+    /// FIX-3 part D (S1): the gate prices the operation the executor runs, and is skipped
+    /// only for an operation of introspection fields alone.
+    #[test]
+    fn the_priced_operation_is_the_one_that_runs() {
+        let d = doc("query A { transactions(first: 4001) { edges { node { hash } } } } query B { lastBlockHeight }");
+        let v = Variables::default();
+        assert!(over_complexity(type_registry(), &d, Some("A"), &v));
+        assert!(!over_complexity(type_registry(), &d, Some("B"), &v));
+        assert!(selected_operation(&d, None).is_none());
+        assert!(selected_operation(&d, Some("C")).is_none());
+        let one = doc("query A { transactions(first: 4001) { edges { node { hash } } } }");
+        assert!(over_complexity(type_registry(), &one, None, &v));
+        // A spoofed name carrying real fields is not introspection.
+        let spoof = doc("query IntrospectionQuery { __schema { queryType { name } } transactions(first: 4001) { edges { node { hash } } } }");
+        let op = selected_operation(&spoof, Some(INTROSPECTION_QUERY)).unwrap();
+        assert!(!pure_introspection(&spoof, op));
+        let spoof = doc("query IntrospectionQuery { ...F } fragment F on Query { transactions(first: 4001) { edges { node { hash } } } }");
+        let op = selected_operation(&spoof, Some(INTROSPECTION_QUERY)).unwrap();
+        assert!(!pure_introspection(&spoof, op));
+        let real = doc("query IntrospectionQuery { __schema { queryType { name } } ... on Query { __type(name: \"Block\") { name } } __typename }");
+        let op = selected_operation(&real, Some(INTROSPECTION_QUERY)).unwrap();
+        assert!(pure_introspection(&real, op));
     }
 
     #[test]

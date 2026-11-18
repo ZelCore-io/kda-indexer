@@ -33,8 +33,8 @@ Differences from Kadena graph:
 - `Transaction.result` is never a `TransactionMempoolInfo`: the indexer has no mempool, and a
   transaction that is not indexed is `null`.
 - Page sizes: as in the stock indexer, a connection returns 20 items when `first`/`last` are
-  omitted, and any larger page the complexity limit admits is answered in full (no cap; see
-  Limits). `pageInfo.hasNextPage` stays correct.
+  omitted (or 0), and any larger page the complexity limit admits is answered in full up to
+  the 1,000-row safety cap (see Limits). `pageInfo.hasNextPage` stays correct.
 - The schema has no "as of height" field, so GraphQL answers do not carry one (the native API
   does).
 - Fields not served yet answer `NOT_SUPPORTED` with the rest of the operation intact.
@@ -72,13 +72,19 @@ ignored when the argument is absent or null: `transactions { … }` without `fir
 multiplied by 1 although it returns 20. Variables and their defaults count, and so do the
 schema's argument defaults (a subscription's `quantity` is 20). Every other field, leaves
 included, costs the cost of its selection (leaves 0). Over an interface or union the most
-expensive possible type counts. `@skip`/`@include` drop what they drop. Over HTTP the check is
-skipped for an operation named `IntrospectionQuery`; introspection costs 0 anyway. The values
+expensive possible type counts. `@skip`/`@include` drop what they drop. The operation priced
+is the one that runs (the named one, or the only one). Stock skips the check over HTTP for any
+operation named `IntrospectionQuery`; this indexer skips it only when that operation selects
+introspection fields alone, so `query IntrospectionQuery { transactions(first: 5000) … }` is
+refused here and answered by stock (a safety difference; introspection costs 0 anyway). A
+negative `first`/`last` multiplies by 0 here and no field costs less than 0, so a negative page
+cannot cancel an expensive sibling (stock multiplies the negative in; the negative page itself
+is refused here, see "Pages"). The values
 are stock's own, generated into `crates/kdx-graphql/src/stock_schema.rs` from stock's
 `schema.graphql` by `scripts/stock-schema/extract.js`. A ZelCore field stock does not have is
 priced as stock prices its lists, `@complexity(value: 1, multipliers: ["first", "last"])`.
-Examples: `transactions(first: 4000) { edges { node { hash } } }` costs 4000 and is answered,
-`first: 4001` is refused; the explorer's transactions-by-account page at `first: 100` costs
+Examples: four aliased `transactions(first: 1000) { edges { node { hash } } }` cost 4000 and are
+answered, a fifth page of 1 is refused; `transactions(first: 4001)` is refused; the explorer's transactions-by-account page at `first: 100` costs
 (1 + 1 for `result` + 1 for its `block`) × 100 = 300.
 
 Depth is `@graphile/depth-limit` 0.3.1 with `maxDepth: 9` and its other defaults. Only a field
@@ -89,7 +95,10 @@ coordinates have graphile's own table (`__Type.ofType` 8, `__Type.fields` 1, ...
 operation of the document is checked. The full introspection document (graphql-js 16's
 `getIntrospectionQuery()` included) reaches introspection depth 13 through
 `fields { args { type { ofType … } } }`, so stock refuses it over HTTP and so does this
-indexer. `scripts/stock-schema/oracle.js` runs stock's own libraries on stock's schema, to check
+indexer, with stock's error. Workaround (stock and ours alike): send a shallower introspection
+document. Dropping `args { ...InputValue }` from the `fields` selection, or cutting the
+`TypeRef` fragment's `ofType` chain to 7 levels, keeps it within 12; the websocket runs no depth
+rule. `scripts/stock-schema/oracle.js` runs stock's own libraries on stock's schema, to check
 a document against them.
 
 Stock's order holds: other validation errors come with the depth error; the complexity check
@@ -107,7 +116,9 @@ The other limits are this indexer's own, in `[graphql]` (defaults shown). A refu
 | fields after fragment expansion | 20,000 | `complexity` ("query has more than 20000 fields after fragment expansion") |
 | directives on one field, fragment or spread | 8 | `directives` |
 | introspection cost per operation | 100,000 | `introspection_complexity` |
-| page size | `default_page = 20` when `first`/`last` are omitted; no maximum | — |
+| deferred `totalCount` walks per operation (outer multipliers included) | 2 | `complexity` ("more than 2 list totalCounts in one operation") |
+| rows of one page: `first`/`last`, a subscription's `quantity` | 1,000 (fixed) | `page` ("a page holds at most 1000 rows (first, last and quantity above it are refused)") |
+| page size | `default_page = 20` when `first`/`last` are omitted or 0 | — |
 | request deadline | `api.deadline_ms` (5 s), shared by a batch | `TIMEOUT` code |
 | `totalCount` walk | half the remaining deadline; an account's transactions/transfers also `count_budget_ms = 200` (1..=60000) if sooner | none: a lower bound is answered (see `totalCount`) |
 
@@ -118,13 +129,36 @@ The document is parsed and walked before anything else looks at it, and that wal
 20,000 fields after fragment expansion. A fragment bomb (each fragment spreading the one before
 it twice) is refused in about a millisecond, over HTTP and over the websocket. Stock has no
 such bound (its complexity walk expands every spread), nor the directive cap nor the
-introspection cost cap: these three are the documents ours refuses and stock may answer.
+introspection cost cap.
+
+These refusals are safety, not parity: each is a document stock answers slowly, times out on,
+runs out of memory on, or that only an attack sends. Stock has none of them:
+- 20,000 fields after fragment expansion, 8 directives, the introspection cost of 100,000, the
+  parser nesting of 64, and the query, variables and body size caps (attack shapes);
+- more than 2 deferred `totalCount` walks in one operation (each walks a whole account list);
+- a page, or a subscription `quantity`, over 1,000 rows, where stock's gate passes it (any
+  `first` from 1,001 to 4,000 on a page of leaves): stock answers such a page slowly or times
+  out. An account's NFT holdings, which take no page argument, are returned in full like
+  stock's up to 1,000 and cut there;
+- `query IntrospectionQuery` carrying real fields is priced (above).
+
+### Pages
+
+Read as stock's `getPaginationParams` reads them: `first` and `last` count by truthiness, so
+`first: 0` or `last: 0` without a cursor is the default page of 20 (forward), as in stock, and
+`first: 0, last: 5` is the last 5. With a cursor, the count goes with it as given (`after` with
+`first: 0` is an empty page; stock fails on that one when rows follow). A negative `first` or
+`last` is `BAD_USER_INPUT` ("first and last must not be negative"). Stock passes it into its
+SQL limit: `-1` answers an empty page and below `-1` a database error per resolver, with no
+fixed shape to copy, so ours keeps one clear refusal. `first` with `last` (both non-zero),
+`after` with `last` and `before` with `first` are `BAD_USER_INPUT`, the cases stock refuses.
 
 The walk also prices the document with this indexer's own cost model (`max_complexity = 2000`):
-a read budget only. A document over it is logged at debug level, never refused or truncated;
-the read slots, the 1 s page scan and the request deadline bound the work. `max_depth` and
-`introspection_depth` only feed that model. `max_page` (100) still caps the two lists that
-take no page argument here: an account's NFT holdings and a subscription's `quantity`.
+a read budget. It prices a page as served (as asked up to 1,000, absent at `default_page`). A
+document over it is logged at debug level, not refused or truncated; the read slots, the 1 s
+page scan and the request deadline bound the work. Of that model only the count-walk bound
+above refuses. `max_depth`, `introspection_depth` and `max_page` only feed the legacy model
+that `check-ops` reports with.
 
 A `crossChainTransfer` inside another `crossChainTransfer` costs 10 per item, the price of the
 store read it would need. It is answered from the pair already loaded and reads nothing.
@@ -396,8 +430,8 @@ the oracle puts them.
 - `FungibleAccount.transactions`: txs with a transfer of the token on the account's side;
   `FungibleChainAccount.transactions`: txs on that chain the account sent (`meta.sender`),
   as the schema says.
-- `nonFungibleAccount`/`nonFungibleChainAccount` list positive NFT holdings (at most
-  `max_page`); `version` is `v1` (`marmalade.ledger`), `v2` (`marmalade-v2.ledger`) or the
+- `nonFungibleAccount`/`nonFungibleChainAccount` list positive NFT holdings (all of them, as
+  stock, up to the 1,000-row safety cap); `version` is `v1` (`marmalade.ledger`), `v2` (`marmalade-v2.ledger`) or the
   ledger name.
 - `NonFungibleTokenBalance.guard` and `.info` come from the `NftDetails` table. The reconciler
   fills it with `({ledger}.details (read-msg "t") (read-msg "a"))` and
@@ -433,8 +467,8 @@ relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `Strin
 address (HTTP, or the websocket's accepted connection); an operation without a known address
 is refused (`LIMIT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |
 | `lastTokenPriceInKda(moduleName): Decimal` | `NOT_SUPPORTED`: no price data |
-| `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 100, clamped to `max_page`) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
-| `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 100, clamped to `max_page`) per message; a message per feed batch that has any |
+| `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 1,000; above it the `page` refusal) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
+| `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 1,000; above it the `page` refusal) per message; a message per feed batch that has any |
 
 `pactQuery` stays `NOT_SUPPORTED`.
 

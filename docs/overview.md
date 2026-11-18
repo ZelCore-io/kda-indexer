@@ -67,8 +67,8 @@ places where it is slower are in [comparison.md](comparison.md).
   - compat API: `limit` default 10, at most 250; `offset` at most 10,000 (use `next` beyond);
   - native API: `limit` 1 to 100, default 20; filtered lists examine at most 5,000 txs per
     request and may return short pages with a cursor;
-  - GraphQL: 20 items by default and no page cap, with the stock indexer's depth and
-    complexity limits, plus batch and size limits;
+  - GraphQL: 20 items by default and a 1,000-row safety cap per page, with the stock
+    indexer's depth and complexity limits, plus batch and size limits;
   - code search: SQL `LIKE` patterns of at most 256 characters; patterns that cannot use the
     code index run a bounded newest-first scan with a 2 s timeout and may return a cut answer
     (`X-Search-Truncated: true`).

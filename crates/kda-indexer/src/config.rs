@@ -363,8 +363,8 @@ impl ApiConfig {
 pub struct GraphqlConfig {
     /// Page size when a connection gets neither `first` nor `last`.
     pub default_page: u32,
-    /// Cap of NFT holdings and subscription `quantity`; connection pages are not clamped
-    /// (stock's complexity gate bounds them, FIX-3 part C).
+    /// Page size of the legacy cost model (`check-ops`) only; served pages, subscription
+    /// `quantity` and NFT holdings have the fixed 1,000-row safety cap (FIX-3 part D).
     pub max_page: u32,
     /// Read-budget model only; stock's depth limit (9) is what refuses.
     pub max_depth: u32,

@@ -340,14 +340,15 @@ fn not_available(field: &str, status: Option<u8>) -> async_graphql::Error {
 }
 
 /// `nonFungibleAccount` / `nonFungibleChainAccount` (`chain`): `null` when the account holds
-/// no token there. At most `max_page` holdings (the cost model's multiplier).
+/// no token there. Every holding, as stock returns them, up to the safety cap
+/// [`crate::MAX_PAGE_ROWS`] (FIX-3 part D, P4).
 pub async fn non_fungible(
     ctx: &Context<'_>,
     account: &str,
     chain: Option<u8>,
 ) -> Result<Option<(String, Vec<NftItem>)>> {
     let account = crate::txlist::name_arg("accountName", account)?.to_owned();
-    let cap = gql(ctx).settings.max_page;
+    let cap = crate::MAX_PAGE_ROWS;
     let a = account.clone();
     let items = gql(ctx)
         .state()?

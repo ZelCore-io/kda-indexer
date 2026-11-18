@@ -409,7 +409,11 @@ mod stock_limits {
         let f = fixture();
         // 4000 by stock's formula passes, 4001 is refused: HTTP 500, stock's message, and
         // stock's code at the top level (ours keeps `extensions`, with the limit named).
-        let (s, v, _) = query(&f, &page(4000)).await;
+        // 4000 as four pages of 1,000 (one page of 4,000 is over the part D safety cap).
+        let four: String = (0..4)
+            .map(|i| format!("t{i}: transactions(first: 1000) {{ edges {{ node {{ hash }} }} }} "))
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {four} }}")).await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert!(v.get("errors").is_none(), "{v}");
         let (s, v, _) = query(&f, &page(4001)).await;
@@ -432,8 +436,18 @@ mod stock_limits {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert!(v.get("errors").is_none(), "{v}");
-        // Stock skips the check for an operation named IntrospectionQuery.
+        // FIX-3 part D (S1): stock skips the check for any operation named
+        // IntrospectionQuery; ours only for one of introspection fields alone, so a spoofed
+        // name carrying real fields is priced (a documented safety difference).
         let named = page(5000).replacen('{', "query IntrospectionQuery {", 1);
+        let (s, v, _) = post(
+            &f,
+            json!({"query": named, "operationName": "IntrospectionQuery"}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert_eq!(v["errors"][0]["message"], COMPLEXITY, "{v}");
+        let named = "query IntrospectionQuery { __schema { queryType { name } } }";
         let (s, v, _) = post(
             &f,
             json!({"query": named, "operationName": "IntrospectionQuery"}).to_string(),
@@ -441,10 +455,48 @@ mod stock_limits {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert!(v.get("errors").is_none(), "{v}");
+        // The operation that runs is the one priced: a cheap selected operation next to an
+        // expensive one is served, the expensive one selected is refused.
+        let two = format!(
+            "query Cheap {{ lastBlockHeight }} query Dear {}",
+            page(4001)
+        );
+        for (op, want) in [
+            ("Cheap", StatusCode::OK),
+            ("Dear", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let (s, v, _) = post(&f, json!({"query": two, "operationName": op}).to_string()).await;
+            assert_eq!(s, want, "{op}: {v}");
+        }
+        // A negative page next to an expensive one cannot lower the cost (S2).
+        let neg = "{ a: transactions(first: -4000) { edges { node { hash } } } b: transactions(first: 4001) { edges { node { hash } } } }";
+        let (s, v, _) = query(&f, neg).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert_eq!(v["errors"][0]["message"], COMPLEXITY, "{v}");
         // A validation error comes before the complexity check, as in stock.
         let bad = page(5000).replace("hash", "nope");
         let (_, v, _) = query(&f, &bad).await;
         assert_ne!(v["errors"][0]["message"], COMPLEXITY, "{v}");
+    }
+
+    /// FIX-3 part D (S3): a page over the 1,000-row safety cap that stock's gate passes is
+    /// refused by ours with a `LIMIT` named `page` (stock answers it slowly or times out).
+    #[tokio::test]
+    async fn pages_over_the_safety_cap_are_refused() {
+        let f = fixture();
+        let (s, v, _) = query(&f, &page(1000)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+        let (s, v, _) = query(&f, &page(1001)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let e = &v["errors"][0];
+        assert_eq!(e["extensions"]["code"], "LIMIT", "{v}");
+        assert_eq!(e["extensions"]["limit"], "page", "{v}");
+        assert_eq!(
+            e["message"],
+            "a page holds at most 1000 rows (first, last and quantity above it are refused)",
+            "{v}"
+        );
     }
 
     #[tokio::test]

@@ -44,8 +44,9 @@ pub type KdxSchema = Schema<schema::Query, EmptyMutation, types::subscription::S
 pub struct GraphqlSettings {
     /// Page size when a connection gets neither `first` nor `last`.
     pub default_page: usize,
-    /// Cap of the lists that take no page arguments (an account's NFT holdings) and of a
-    /// subscription's `quantity`. Connection pages are not clamped (FIX-3 part C).
+    /// Page size of the legacy cost model ([`limits::analyze`]) only. Served pages, a
+    /// subscription's `quantity` and NFT holdings are bounded by [`MAX_PAGE_ROWS`] (FIX-3
+    /// part D).
     pub max_page: usize,
     /// Depth of the read-budget model ([`limits::analyze`]); not enforced: stock's depth
     /// limit is ([`stock_limits`]).
@@ -90,6 +91,12 @@ pub struct GraphqlSettings {
     /// stops at half of the remaining request deadline, whichever comes first.
     pub count_budget: Duration,
 }
+
+/// Hard safety cap of the rows of one list page (`first`/`last`), of a subscription's
+/// `quantity` and of an account's NFT holdings (FIX-3 part D, S3). It applies after stock's
+/// complexity gate: a page above it is refused (`LIMIT`, `extensions.limit = "page"`), where
+/// stock answers it slowly or times out; holdings are cut at it.
+pub const MAX_PAGE_ROWS: usize = 1000;
 
 /// Request body cap (plan GQ-9: body ≤ 128 KB).
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
