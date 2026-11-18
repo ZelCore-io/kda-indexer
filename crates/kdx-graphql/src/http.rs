@@ -232,6 +232,21 @@ async fn execute(
                 .into_response();
         }
     }
+    // The read budget is per batch (FIX-3 part E, B1): the sum of its operations', refused
+    // as a whole above the ceiling before any of them runs. A single request is priced by
+    // the limits extension.
+    if let BatchRequest::Batch(b) = &batch {
+        let s = &crate::gql_settings(&schema);
+        let sum = b.iter().fold(0u64, |acc, r| {
+            acc.saturating_add(
+                crate::limits::request_budget(&r.query, &r.variables, s).unwrap_or(0),
+            )
+        });
+        if let Err(e) = crate::limits::over_ceiling(sum) {
+            kdx_metrics::get().graphql_request(kind, "rejected");
+            return error_body(StatusCode::OK, e);
+        }
+    }
     let budget = st.settings.deadline.saturating_sub(DEADLINE_MARGIN);
     let deadline = Instant::now() + budget;
     let mut batch = batch.data(ReqCtx { deadline });

@@ -128,18 +128,23 @@ pub async fn node(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>> {
             .map(Node::FungibleChainAccount),
         NodeKey::NonFungibleAccount { account } => super::nft::non_fungible(ctx, &account, None)
             .await?
-            .map(|(account, items)| {
-                Node::NonFungibleAccount(NonFungibleAccount { account, items })
+            .map(|(account, items, cut)| {
+                Node::NonFungibleAccount(NonFungibleAccount {
+                    account,
+                    items,
+                    cut,
+                })
             }),
         NodeKey::NonFungibleChainAccount { chain, account } => {
             let c = chain_arg(&chain)?;
             super::nft::non_fungible(ctx, &account, Some(c))
                 .await?
-                .map(|(account, items)| {
+                .map(|(account, items, cut)| {
                     Node::NonFungibleChainAccount(NonFungibleChainAccount {
                         account,
                         chain: c,
                         items,
+                        cut,
                     })
                 })
         }
@@ -149,15 +154,22 @@ pub async fn node(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>> {
             chain,
         } => {
             let c = chain_arg(&chain)?;
-            super::nft::non_fungible(ctx, &account, Some(c))
-                .await?
-                .and_then(|(account, items)| {
-                    let item = items.into_iter().find(|i| i.token_id == token_id)?;
-                    Some(Node::NonFungibleTokenBalance(NonFungibleTokenBalance {
-                        account,
-                        item,
-                    }))
-                })
+            match super::nft::non_fungible(ctx, &account, Some(c)).await? {
+                None => None,
+                Some((account, items, cut)) => {
+                    match items.into_iter().find(|i| i.token_id == token_id) {
+                        Some(item) => {
+                            Some(Node::NonFungibleTokenBalance(NonFungibleTokenBalance {
+                                account,
+                                item,
+                            }))
+                        }
+                        // Past the cap: unknown, not absent (part E, S1).
+                        None if cut => return Err(super::nft::holdings_cut()),
+                        None => None,
+                    }
+                }
+            }
         }
     })
 }

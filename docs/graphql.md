@@ -14,7 +14,8 @@ origin. There is no playground or GraphiQL; introspection is on (`graphql.intros
 
 `kda-indexer graphql print-schema` prints the served schema. `kda-indexer graphql check-ops DIR`
 validates the operation documents (`*.graphql`) in a directory against the schema and the
-limits without running them, and prints `in-scope`, `invalid: ...` or `limit: ...` for each.
+limits without running them, and prints `in-scope`, `invalid: ...` or `limit: ...` for each
+(`limit: page` for a page over 1,000 rows, which only the resolver refuses).
 Neither needs a config.
 
 ## Schema
@@ -83,6 +84,10 @@ is refused here, see "Pages"). The values
 are stock's own, generated into `crates/kdx-graphql/src/stock_schema.rs` from stock's
 `schema.graphql` by `scripts/stock-schema/extract.js`. A ZelCore field stock does not have is
 priced as stock prices its lists, `@complexity(value: 1, multipliers: ["first", "last"])`.
+Stock's own pagination serves `first: 0` (or `last: 0`) without a cursor as the default page of
+20, but its gate multiplies by the argument's value, 0: such a page and everything nested in it
+cost 0 there, at every level. This indexer keeps that price at the gate (parity) and bounds the
+rows with its read budget instead (below).
 Examples: four aliased `transactions(first: 1000) { edges { node { hash } } }` cost 4000 and are
 answered, a fifth page of 1 is refused; `transactions(first: 4001)` is refused; the explorer's transactions-by-account page at `first: 100` costs
 (1 + 1 for `result` + 1 for its `block`) × 100 = 300.
@@ -114,10 +119,12 @@ The other limits are this indexer's own, in `[graphql]` (defaults shown). A refu
 | variables (JSON) | `max_variables_bytes = 65536` | `variables_size` |
 | request body | 131072 bytes (HTTP 413) | `body_size` |
 | fields after fragment expansion | 20,000 | `complexity` ("query has more than 20000 fields after fragment expansion") |
+| read budget of a request (a batch: the sum of its operations) | 1,100,000 (fixed) | `budget` ("query reads too much: budget N exceeds 1100000") |
 | directives on one field, fragment or spread | 8 | `directives` |
 | introspection cost per operation | 100,000 | `introspection_complexity` |
-| deferred `totalCount` walks per operation (outer multipliers included) | 2 | `complexity` ("more than 2 list totalCounts in one operation") |
+| deferred `totalCount` walks per operation (outer multipliers included) | 2 | `counts` ("more than 2 list totalCounts in one operation") |
 | rows of one page: `first`/`last`, a subscription's `quantity` | 1,000 (fixed) | `page` ("a page holds at most 1000 rows (first, last and quantity above it are refused)") |
+| NFT holdings of one account | 10,000 (fixed) | `nft_holdings`: partial data, the first 10,000 are answered with this error at the list field ("holdings cut at 10000: the account holds more") |
 | page size | `default_page = 20` when `first`/`last` are omitted or 0 | — |
 | request deadline | `api.deadline_ms` (5 s), shared by a batch | `TIMEOUT` code |
 | `totalCount` walk | half the remaining deadline; an account's transactions/transfers also `count_budget_ms = 200` (1..=60000) if sooner | none: a lower bound is answered (see `totalCount`) |
@@ -136,10 +143,14 @@ runs out of memory on, or that only an attack sends. Stock has none of them:
 - 20,000 fields after fragment expansion, 8 directives, the introspection cost of 100,000, the
   parser nesting of 64, and the query, variables and body size caps (attack shapes);
 - more than 2 deferred `totalCount` walks in one operation (each walks a whole account list);
+- a request (a batch: all its operations together) whose read budget is over 1,100,000 rows,
+  for example many aliases of `transactions(first: 0) { … events(first: 0) … }`, which stock's
+  gate prices at 0 while each serves 20 × 20 rows;
 - a page, or a subscription `quantity`, over 1,000 rows, where stock's gate passes it (any
   `first` from 1,001 to 4,000 on a page of leaves): stock answers such a page slowly or times
   out. An account's NFT holdings, which take no page argument, are returned in full like
-  stock's up to 1,000 and cut there;
+  stock's up to 10,000; above that the first 10,000 come with the `nft_holdings` error, so a
+  cut list never looks complete;
 - `query IntrospectionQuery` carrying real fields is priced (above).
 
 ### Pages
@@ -153,12 +164,23 @@ SQL limit: `-1` answers an empty page and below `-1` a database error per resolv
 fixed shape to copy, so ours keeps one clear refusal. `first` with `last` (both non-zero),
 `after` with `last` and `before` with `first` are `BAD_USER_INPUT`, the cases stock refuses.
 
-The walk also prices the document with this indexer's own cost model (`max_complexity = 2000`):
-a read budget. It prices a page as served (as asked up to 1,000, absent at `default_page`). A
-document over it is logged at debug level, not refused or truncated; the read slots, the 1 s
-page scan and the request deadline bound the work. Of that model only the count-walk bound
-above refuses. `max_depth`, `introspection_depth` and `max_page` only feed the legacy model
-that `check-ops` reports with.
+The walk also prices the document with this indexer's own cost model: a read budget, about the
+rows a request reads. It prices a page as served, with the same function the resolvers size a
+page with: as asked up to 1,000; absent, `first: 0` or `last: 0` without a cursor at
+`default_page` (20), at every nesting level; with a cursor the count as given (`after` with
+`first: 0` costs 0). A page variable bound to nothing, a subscription's `quantity` and the ids
+of `nodes` are priced at the most served (1,000), an account's NFT holdings at 10,000 rows (one
+details read each). A request above the safety ceiling of 1,100,000 is refused with `budget`
+before anything runs; a batch counts the sum of its operations. The ceiling is 11 times the
+largest budget of the explorer operation documents in [data/explorer-ops.md](data/explorer-ops.md)
+and the compare suite's documents, priced with no variables bound, so every page variable at
+1,000 (the largest is kadscan's `blockTransactions-d6646ba8`, 100,101; the largest at its
+real page sizes is far below). `crates/kdx-graphql/tests/budget_ceiling.rs` checks the suite's
+documents and prices any directory of documents (`KDX_BUDGET_DOCS`). One request's text is
+also bounded (32 KB), so the ceiling binds mostly on batches and on NFT holdings. Apart from
+the ceiling, only the count-walk bound above refuses; the read slots, the 1 s page scan and the
+request deadline bound the work below it. `max_complexity`, `max_depth`,
+`introspection_depth` and `max_page` only feed the legacy model.
 
 A `crossChainTransfer` inside another `crossChainTransfer` costs 10 per item, the price of the
 store read it would need. It is answered from the pair already loaded and reads nothing.
@@ -389,7 +411,9 @@ the oracle puts them.
   while that half is not indexed. The outgoing half reads the pact's steps oldest first and
   stops at the one that succeeded, so failed retries after it cost nothing; a lookup reads
   at most 1,000 steps, and one request at most 2,000 for all its `crossChainTransfer`
-  fields, past which a lookup answers `null`.
+  fields, past which a lookup answers `null`. Anyone can post failed `cont` txs naming a
+  pending pact (it costs only gas): more than 1,000 of them before the one that succeeds make
+  the outgoing link `null` here where stock links it. Griefing only, bounded, not fixed.
 - **`events`**: `qualifiedEventName` is required. `parametersFilter` accepts only
   `{"array_starts_with": <value or array>}` (the event's first parameters equal the value or
   the array's values); anything else is `UNSUPPORTED_FILTER`.
@@ -431,7 +455,8 @@ the oracle puts them.
   `FungibleChainAccount.transactions`: txs on that chain the account sent (`meta.sender`),
   as the schema says.
 - `nonFungibleAccount`/`nonFungibleChainAccount` list positive NFT holdings (all of them, as
-  stock, up to the 1,000-row safety cap); `version` is `v1` (`marmalade.ledger`), `v2` (`marmalade-v2.ledger`) or the
+  stock, up to the 10,000-row safety cap, past which the first 10,000 come with a
+  `nft_holdings` `LIMIT` error); `version` is `v1` (`marmalade.ledger`), `v2` (`marmalade-v2.ledger`) or the
   ledger name.
 - `NonFungibleTokenBalance.guard` and `.info` come from the `NftDetails` table. The reconciler
   fills it with `({ledger}.details (read-msg "t") (read-msg "a"))` and

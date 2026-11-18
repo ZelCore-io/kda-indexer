@@ -98,6 +98,11 @@ pub struct GraphqlSettings {
 /// stock answers it slowly or times out; holdings are cut at it.
 pub const MAX_PAGE_ROWS: usize = 1000;
 
+/// Most NFT holdings of one account served (FIX-3 part E, S1). Above it the first
+/// `MAX_NFT_HOLDINGS` are served with a partial-data `LIMIT` error
+/// (`extensions.limit = "nft_holdings"`), never cut silently.
+pub const MAX_NFT_HOLDINGS: usize = 10_000;
+
 /// Request body cap (plan GQ-9: body ≤ 128 KB).
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
 

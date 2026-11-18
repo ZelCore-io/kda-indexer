@@ -526,3 +526,80 @@ mod stock_limits {
         );
     }
 }
+
+/// FIX-3 part E (B1): the read budget's safety ceiling. Stock's gate prices `first: 0` at 0
+/// while 20 rows are served; ours prices it as served and refuses a request (a batch: the
+/// sum of its operations) above `BUDGET_CEILING` with `LIMIT` named `budget`.
+mod budget_ceiling {
+    use super::*;
+    use kdx_graphql::limits::BUDGET_CEILING;
+
+    const T: &str = "fragment T on QueryTransactionsConnection { edges { node { result { ... on TransactionResult { events(first: 0) { edges { node { name parameters } } } } } } } }";
+
+    /// `n` aliases of nested zero pages (20 txs x 20 events each as served).
+    fn zero_pages(n: usize) -> String {
+        let a: String = (0..n)
+            .map(|i| format!("a{i}: transactions(first: 0) {{ ...T }} "))
+            .collect();
+        format!("{{ {a} }} {T}")
+    }
+
+    fn batch(ops: usize, aliases: usize) -> String {
+        let q = zero_pages(aliases);
+        Value::Array((0..ops).map(|_| json!({ "query": q })).collect()).to_string()
+    }
+
+    /// One alias's budget (the unit the batches below are sized in).
+    fn per_alias() -> u64 {
+        let doc = async_graphql::parser::parse_query(zero_pages(1)).unwrap();
+        let c = kdx_graphql::limits::budget(
+            &doc,
+            &async_graphql::Variables::default(),
+            &GraphqlSettings::default(),
+        )
+        .unwrap()
+        .complexity;
+        assert!(c >= 20 * 20, "{c}");
+        c
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_priced_as_the_sum_of_its_operations() {
+        let f = fixture();
+        let per_op = (BUDGET_CEILING / per_alias() / 10) as usize;
+        // Ten operations, each well under the ceiling alone, together over it: refused
+        // whole, before any of them runs.
+        let (s, v, el) = post(&f, batch(10, per_op + 1)).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        assert!(el < Duration::from_secs(2), "{el:?}");
+        // The same ten a little smaller: answered (stock's gate prices each at 0).
+        let (s, v, _) = post(&f, batch(10, per_op - 1)).await;
+        assert_eq!(s, StatusCode::OK);
+        let rs = v.as_array().expect("a batch answer");
+        assert_eq!(rs.len(), 10);
+        assert!(rs.iter().all(|r| r.get("errors").is_none()), "{}", rs[0]);
+    }
+
+    /// NFT holdings are priced per row (up to 10,000 each); stock prices them at 0.
+    #[tokio::test]
+    async fn aliased_holdings_over_the_ceiling_are_refused() {
+        let f = fixture();
+        let n = (BUDGET_CEILING / kdx_graphql::MAX_NFT_HOLDINGS as u64) as usize + 1;
+        let a: String = (0..n)
+            .map(|i| {
+                format!("a{i}: nonFungibleAccount(accountName: \"k:x\") {{ nonFungibleTokenBalances {{ tokenId }} }} ")
+            })
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        // The explorer's own document (one account) is served.
+        let one = "query NonFungibleAccount($accountName: String!) { nonFungibleAccount(accountName: $accountName) { nonFungibleTokenBalances { balance chainId tokenId info { precision supply uri } guard { ... on KeysetGuard { keys predicate } } } } }";
+        let (s, v, _) = post(
+            &f,
+            json!({"query": one, "variables": {"accountName": "k:x"}}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+    }
+}

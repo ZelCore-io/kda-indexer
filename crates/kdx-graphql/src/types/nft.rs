@@ -36,16 +36,17 @@ pub struct NftItem {
     pub info: Option<TokenDetails>,
 }
 
-/// The positive holdings of `account` (on `chain` when given), at most `cap`, in key order.
+/// The positive holdings of `account` (on `chain` when given), at most `cap`, in key order,
+/// and whether there are more (part E, S1: a cut list is never served as complete).
 pub fn nft_rows(
     view: &View,
     account: &str,
     chain: Option<u8>,
     cap: usize,
-) -> ApiResult<Vec<NftItem>> {
+) -> ApiResult<(Vec<NftItem>, bool)> {
     let d = view.dict();
     let Some(a) = d.find(DictKind::Account, account) else {
-        return Ok(vec![]);
+        return Ok((vec![], false));
     };
     let prefix = a.to_be_bytes();
     let mut from = prefix.to_vec();
@@ -66,6 +67,9 @@ pub fn nft_rows(
             if !r.positive() || chain.is_some_and(|x| x != c) {
                 continue;
             }
+            if out.len() == cap {
+                return Ok((out, true));
+            }
             let (holder, info) = nft::details(&view.txn, &key)?;
             out.push(NftItem {
                 token_id: r.token_id.clone(),
@@ -78,16 +82,13 @@ pub fn nft_rows(
                 holder,
                 info,
             });
-            if out.len() == cap {
-                return Ok(out);
-            }
         }
         match rows.last() {
             Some((k, _)) if rows.len() == 256 => {
                 from = k.clone();
                 from.push(0);
             }
-            _ => return Ok(out),
+            _ => return Ok((out, false)),
         }
     }
 }
@@ -96,6 +97,8 @@ pub fn nft_rows(
 pub struct NonFungibleAccount {
     pub account: String,
     pub items: Vec<NftItem>,
+    /// The holdings were cut at [`crate::MAX_NFT_HOLDINGS`].
+    pub cut: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +106,8 @@ pub struct NonFungibleChainAccount {
     pub account: String,
     pub chain: u8,
     pub items: Vec<NftItem>,
+    /// The account's holdings were cut at [`crate::MAX_NFT_HOLDINGS`].
+    pub cut: bool,
 }
 
 fn nft_txs_spec(account: &str, chain: Option<u8>) -> ListSpec {
@@ -160,6 +165,7 @@ impl NonFungibleAccount {
                     .filter(|i| i.chain == c)
                     .cloned()
                     .collect(),
+                cut: self.cut,
             })
             .collect()
     }
@@ -168,8 +174,8 @@ impl NonFungibleAccount {
             account: self.account.clone(),
         })))
     }
-    async fn non_fungible_token_balances(&self) -> Vec<NonFungibleTokenBalance> {
-        balances(&self.account, &self.items)
+    async fn non_fungible_token_balances(&self, ctx: &Context<'_>) -> Vec<NonFungibleTokenBalance> {
+        served_balances(ctx, &self.account, &self.items, self.cut)
     }
     /// Txs touching the account with an event of an NFT ledger.
     async fn transactions(
@@ -211,8 +217,8 @@ impl NonFungibleChainAccount {
             account: self.account.clone(),
         })))
     }
-    async fn non_fungible_token_balances(&self) -> Vec<NonFungibleTokenBalance> {
-        balances(&self.account, &self.items)
+    async fn non_fungible_token_balances(&self, ctx: &Context<'_>) -> Vec<NonFungibleTokenBalance> {
+        served_balances(ctx, &self.account, &self.items, self.cut)
     }
     async fn transactions(
         &self,
@@ -341,19 +347,48 @@ fn not_available(field: &str, status: Option<u8>) -> async_graphql::Error {
 
 /// `nonFungibleAccount` / `nonFungibleChainAccount` (`chain`): `null` when the account holds
 /// no token there. Every holding, as stock returns them, up to the safety cap
-/// [`crate::MAX_PAGE_ROWS`] (FIX-3 part D, P4).
+/// [`crate::MAX_NFT_HOLDINGS`] (FIX-3 part D, P4; part E, S1), and whether they were cut
+/// there ([`holdings_cut`] says so on the list field).
 pub async fn non_fungible(
     ctx: &Context<'_>,
     account: &str,
     chain: Option<u8>,
-) -> Result<Option<(String, Vec<NftItem>)>> {
+) -> Result<Option<(String, Vec<NftItem>, bool)>> {
     let account = crate::txlist::name_arg("accountName", account)?.to_owned();
-    let cap = crate::MAX_PAGE_ROWS;
+    let cap = crate::MAX_NFT_HOLDINGS;
     let a = account.clone();
-    let items = gql(ctx)
+    let (items, cut) = gql(ctx)
         .state()?
         .read(move |view| nft_rows(view, &a, chain, cap))
         .await
         .map_err(from_api)?;
-    Ok((!items.is_empty()).then_some((account, items)))
+    Ok((!items.is_empty()).then_some((account, items, cut)))
+}
+
+/// The partial-data error of a holdings list cut at [`crate::MAX_NFT_HOLDINGS`] (part E,
+/// S1): `LIMIT`, `extensions.limit = "nft_holdings"`.
+pub fn holdings_cut() -> async_graphql::Error {
+    use async_graphql::ErrorExtensions;
+    kdx_metrics::get().graphql_rejected("nft_holdings");
+    err(
+        Code::Limit,
+        format!(
+            "holdings cut at {}: the account holds more",
+            crate::MAX_NFT_HOLDINGS
+        ),
+    )
+    .extend_with(|_, e| e.set("limit", "nft_holdings"))
+}
+
+/// The holdings of a list field, with [`holdings_cut`] at its path when cut.
+fn served_balances(
+    ctx: &Context<'_>,
+    account: &str,
+    items: &[NftItem],
+    cut: bool,
+) -> Vec<NonFungibleTokenBalance> {
+    if cut {
+        ctx.add_error(ctx.set_error_path(holdings_cut().into_server_error(ctx.item.pos)));
+    }
+    balances(account, items)
 }

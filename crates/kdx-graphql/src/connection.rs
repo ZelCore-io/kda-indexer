@@ -99,6 +99,34 @@ pub struct PageArgs {
     pub after: Option<String>,
 }
 
+/// The direction and size of the page stock's `getPaginationParams` serves (FIX-3 part D,
+/// P4; part E, B1): `first` and `last` by truthiness, so `0` (or absent) is the default page
+/// forward without a cursor, while with a cursor the cursor's own count is taken as given
+/// (`first ?? default`, so `after` + `first: 0` serves 0 rows). The one function both
+/// [`PageArgs::parse`] and the read budget ([`crate::limits::budget`]) size a page with, so
+/// the price of a page cannot drift from what is served. Refusals (negative counts, `first`
+/// with `last`) are the caller's; a negative count here is 0 rows, and `first` with `last`
+/// the larger.
+pub fn served_page(
+    first: Option<i64>,
+    last: Option<i64>,
+    after: bool,
+    before: bool,
+    default_page: u64,
+) -> (Dir, u64) {
+    let rows = |n: i64| n.max(0) as u64;
+    let f = first.filter(|n| *n != 0);
+    let l = last.filter(|n| *n != 0);
+    match (f, l) {
+        (Some(f), Some(l)) => (Dir::Forward, rows(f.max(l))),
+        _ if after && l.is_none() => (Dir::Forward, first.map_or(default_page, rows)),
+        _ if before && !after && f.is_none() => (Dir::Backward, last.map_or(default_page, rows)),
+        (Some(f), None) => (Dir::Forward, rows(f)),
+        (None, Some(l)) => (Dir::Backward, rows(l)),
+        (None, None) => (Dir::Forward, default_page),
+    }
+}
+
 impl PageArgs {
     pub fn new(
         after: Option<String>,
@@ -125,22 +153,17 @@ impl PageArgs {
         if self.first.is_some_and(|n| n < 0) || self.last.is_some_and(|n| n < 0) {
             return Err(bad_input("first and last must not be negative"));
         }
-        let first = self.first.filter(|n| *n != 0);
-        let last = self.last.filter(|n| *n != 0);
-        let (dir, n) = match (first, last) {
-            (Some(_), Some(_)) => return Err(bad_input("pass first or last, not both")),
-            _ if self.after.is_some() && last.is_none() => (
-                Dir::Forward,
-                self.first.map_or(s.default_page, |n| n as usize),
-            ),
-            _ if self.before.is_some() && self.after.is_none() && first.is_none() => (
-                Dir::Backward,
-                self.last.map_or(s.default_page, |n| n as usize),
-            ),
-            (Some(f), None) => (Dir::Forward, f as usize),
-            (None, Some(l)) => (Dir::Backward, l as usize),
-            (None, None) => (Dir::Forward, s.default_page),
-        };
+        if self.first.is_some_and(|n| n != 0) && self.last.is_some_and(|n| n != 0) {
+            return Err(bad_input("pass first or last, not both"));
+        }
+        let (dir, n) = served_page(
+            self.first.map(i64::from),
+            self.last.map(i64::from),
+            self.after.is_some(),
+            self.before.is_some(),
+            s.default_page as u64,
+        );
+        let n = n as usize;
         if n > crate::MAX_PAGE_ROWS {
             return Err(crate::error::page_limit());
         }

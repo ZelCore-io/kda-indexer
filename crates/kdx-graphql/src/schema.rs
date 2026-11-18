@@ -315,7 +315,11 @@ impl Query {
     ) -> Result<Option<NonFungibleAccount>> {
         Ok(crate::types::nft::non_fungible(ctx, &account_name, None)
             .await?
-            .map(|(account, items)| NonFungibleAccount { account, items }))
+            .map(|(account, items, cut)| NonFungibleAccount {
+                account,
+                items,
+                cut,
+            }))
     }
 
     async fn non_fungible_chain_account(
@@ -330,10 +334,11 @@ impl Query {
             Some(crate::txlist::chain_arg(&chain_id)?),
         )
         .await?
-        .map(|(account, items)| NonFungibleChainAccount {
+        .map(|(account, items, cut)| NonFungibleChainAccount {
             account,
             chain: crate::txlist::chain_arg(&chain_id).unwrap_or(0),
             items,
+            cut,
         }))
     }
 
