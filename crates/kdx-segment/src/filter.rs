@@ -26,6 +26,9 @@
 //! could answer "no" for a key it should know.
 
 use anyhow::{bail, Result};
+use kdx_types::Hash32;
+
+use crate::phf::IndexKey;
 
 /// File magic of `kf.fil`.
 pub const MAGIC: &[u8; 4] = b"KDXF";
@@ -160,8 +163,12 @@ fn try_seed(
         .filter(|&i| t2count[i] >> 2 == 1)
         .map(|i| i as u32)
         .collect();
-    let mut order: Vec<u64> = Vec::with_capacity(hashes.len());
-    let mut found_at: Vec<u8> = Vec::with_capacity(hashes.len());
+    // The sorted hashes are not needed any more (`t2hash` holds them): their buffer becomes
+    // the peeling order, so the peak stays at about 20 bytes per key.
+    let n = hashes.len();
+    let mut order = hashes;
+    order.clear();
+    let mut found_at: Vec<u8> = Vec::with_capacity(n);
     while let Some(i) = alone.pop() {
         let i = i as usize;
         if t2count[i] >> 2 != 1 {
@@ -182,7 +189,7 @@ fn try_seed(
             }
         }
     }
-    if order.len() != hashes.len() {
+    if order.len() != n {
         return None;
     }
     drop((t2count, t2hash, alone));
@@ -252,6 +259,19 @@ impl KeyFilter {
         let h = mix64(key.wrapping_add(self.seed));
         let [a, b, c] = slots(h, self.segment_length, self.segment_count_length);
         fingerprint(h) ^ self.fingerprints[a] ^ self.fingerprints[b] ^ self.fingerprints[c] == 0
+    }
+
+    /// Builds the filter of a range's index keys (rk or bh): the key of each is its 8-byte
+    /// prefix, the same value [`key_of`] gives for the full hash.
+    pub fn from_index_keys(keys: &[IndexKey]) -> Result<Self> {
+        let mut v: Vec<u64> = keys.iter().map(|k| k.prefix).collect();
+        Self::build(&mut v)
+    }
+
+    /// [`KeyFilter::contains`] for a full 32-byte hash (request key or block hash).
+    #[inline]
+    pub fn contains_hash(&self, h: &Hash32) -> bool {
+        self.contains(key_of(h))
     }
 
     /// Distinct keys the filter was built from.
@@ -332,6 +352,10 @@ impl KeyFilter {
             if fp_len as u64 != u64::from(segment_count_length) + 2 * u64::from(segment_length) {
                 bail!("key filter: {fp_len} fingerprint bytes do not match the segment sizes");
             }
+            // Slot indices are u32 (`slots`): the whole array must be addressable by one.
+            if fp_len as u64 > u64::from(u32::MAX) {
+                bail!("key filter: {fp_len} fingerprint bytes exceed the u32 slot space");
+            }
             if n_keys == 0 || n_keys > fp_len as u64 {
                 bail!("key filter: {n_keys} keys cannot fit {fp_len} fingerprint bytes");
             }
@@ -346,6 +370,38 @@ impl KeyFilter {
             fingerprints,
         };
         Ok((f, start + fp_len))
+    }
+}
+
+/// The filter key of a 32-byte hash: its 8-byte big-endian prefix, the value the rk/bh
+/// index keys carry ([`IndexKey::new`]). Writer and lookup both go through this.
+#[inline]
+pub fn key_of(h: &Hash32) -> u64 {
+    crate::phf::prefix(h)
+}
+
+/// The two filters of one range (`kf.fil`), held in owned memory by its reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyFilters {
+    pub bh: KeyFilter,
+    pub rk: KeyFilter,
+}
+
+impl KeyFilters {
+    /// Parses a whole `kf.fil` ([`decode_pair`]).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (bh, rk) = decode_pair(bytes)?;
+        Ok(Self { bh, rk })
+    }
+
+    /// Serialises a whole `kf.fil` ([`encode_pair`]).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        encode_pair(&self.bh, &self.rk)
+    }
+
+    /// Fingerprint bytes held in memory.
+    pub fn bytes(&self) -> usize {
+        self.bh.bytes() + self.rk.bytes()
     }
 }
 
@@ -514,6 +570,36 @@ mod tests {
             assert!(keys.iter().all(|&k| f.contains(k)), "{name}");
         }
     }
+
+    /// Pins the bytes built for a fixed key set. Filters already on disk were built with the
+    /// current hash, slot math, sizing and seed sequence; a change to any of them must fail
+    /// here instead of silently missing keys in those files.
+    #[test]
+    fn golden_bytes_for_a_fixed_key_set() {
+        let mut keys: Vec<u64> = (0..10_000u64)
+            .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (i << 7))
+            .collect();
+        let f = KeyFilter::build(&mut keys).unwrap();
+        let bytes = encode_pair(&f, &KeyFilter::build(&mut vec![1, 2, 3]).unwrap());
+        assert_eq!(bytes.len(), GOLDEN_LEN);
+        assert_eq!(blake3::hash(&bytes).to_hex().as_str(), GOLDEN_BLAKE3);
+        assert_eq!(f.seed, GOLDEN_SEED);
+        assert_eq!((f.segment_length, f.segment_count_length), GOLDEN_SEGMENTS);
+        // A few answers: members, and non-members that the pinned filter rejects or admits.
+        assert!(keys.iter().all(|&k| f.contains(k)));
+        let probes: Vec<bool> = (0..2048u64).map(|i| f.contains(i << 40 | 0xabc)).collect();
+        let admitted: Vec<usize> = (0..2048).filter(|&i| probes[i]).collect();
+        assert_eq!(admitted, GOLDEN_ADMITTED.to_vec());
+        // The 32-byte wrapper uses the same key.
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&keys[17].to_be_bytes());
+        assert!(f.contains_hash(&Hash32(h)));
+    }
+    const GOLDEN_LEN: usize = 12_893;
+    const GOLDEN_BLAKE3: &str = "21dcc589d772f47689843772a32ba2182e58fe2f9f8474d03553b7a52cb15ee2";
+    const GOLDEN_SEED: u64 = 10_451_216_379_200_822_465;
+    const GOLDEN_SEGMENTS: (u32, u32) = (512, 11_776);
+    const GOLDEN_ADMITTED: [usize; 10] = [259, 867, 979, 1150, 1158, 1209, 1290, 1500, 1730, 1853];
 
     #[test]
     fn same_key_set_gives_identical_bytes() {

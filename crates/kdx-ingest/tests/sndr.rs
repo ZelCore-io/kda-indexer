@@ -235,10 +235,11 @@ fn backfill_refuses_a_sender_missing_from_the_dictionary() {
     assert!(format!("{e:#}").contains("not in the dictionary"), "{e:#}");
 }
 
-/// FIX-2 T3 enables this once the writer stores `sndr.pst`: a freeze moves the hot family-6
-/// rows into the step's `sndr` postings.
+/// A freeze moves the hot family-6 rows into the steps' `sndr` postings: the frozen
+/// (entity, TxKey) set equals the twin's hot rows below the frontier. The store here never
+/// ran the sender backfill (`Meta sndr_hot` unset), so the freezer derives the postings from
+/// the records; they must still equal what the tail wrote.
 #[test]
-#[ignore = "needs the FIX-2 T3 segment writer (sndr.pst)"]
 fn a_freeze_moves_sndr_rows_into_the_step() {
     let pool = pool();
     let places = places_for(&[0], 12);
@@ -263,14 +264,26 @@ fn a_freeze_moves_sndr_rows_into_the_step() {
         .all(|(_, k)| k.height() >= frontier));
     let dict = c.dict.lock().unwrap().mem().clone();
     let seg = kdx_segment::Segments::open(&c.segdir, std::sync::Arc::new(dict)).unwrap();
-    let entities: BTreeSet<u64> = want.iter().map(|(e, _)| *e).collect();
-    let mut n = 0usize;
+    assert!(seg.sender_ready());
+    let mut got = BTreeSet::new();
     for r in &seg.ranges {
-        for e in &entities {
-            if let Some(it) = r.postings(Family::Sndr, *e) {
-                n += it.count();
+        let p = r.sndr.as_ref().expect("every step has sndr.pst");
+        for i in 0..p.entities() {
+            let e = p.entity_at(i);
+            for rel in p.list_at(i).unwrap() {
+                let key = r.txkey_rel(u64::from(rel)).unwrap();
+                assert!(got.insert((e, key)), "duplicate {key:?}");
             }
         }
     }
+    assert_eq!(got, want);
+    // The same through the reader's family accessor.
+    let n: usize = want
+        .iter()
+        .map(|(e, _)| *e)
+        .collect::<BTreeSet<_>>()
+        .iter()
+        .flat_map(|e| seg.postings(Family::Sndr, *e))
+        .count();
     assert_eq!(n, want.len());
 }

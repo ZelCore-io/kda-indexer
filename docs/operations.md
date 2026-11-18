@@ -252,6 +252,9 @@ node_exporter textfile when `metrics.textfile` is set (see [install.md](install.
 | `kdx_reorgs_total`, `kdx_reorg_depth` | chain |
 | `kdx_node_requests_total`, `kdx_node_request_seconds` | endpoint, status |
 | `kdx_hot_store_bytes`, `kdx_segment_bytes` | kind |
+| `kdx_segment_optional_missing_total` | file (sndr, kf): a file `range.toml` lists is missing at range open |
+| `kdx_key_filter_untrusted_total` | none: a `kf.fil` failed its checks at open; the range is probed without it |
+| `kdx_key_filter_bytes` | none: key filter memory of the newest segment view |
 | `kdx_disk_free_bytes` | |
 | `kdx_mdbx_commit_seconds` | |
 | `kdx_http_requests_total`, `kdx_http_request_seconds` | api, route, status |

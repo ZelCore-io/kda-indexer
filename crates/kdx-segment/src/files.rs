@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::writer::RangeInfo;
+
 /// Write buffer for segment files (spec §3.4: 16 MB buffered writer).
 pub const WRITE_BUF: usize = 16 << 20;
 
@@ -32,6 +34,9 @@ pub enum FileKind {
     /// `sndr` postings (FIX-2). Optional: not in [`FileKind::ALL`] (the required set); a
     /// range has it only when its `range.toml` lists it.
     Sndr,
+    /// `kf.fil`, the range's block-hash and request-key filters (FIX-2). Optional like
+    /// [`FileKind::Sndr`].
+    KeyFilter,
 }
 
 impl FileKind {
@@ -49,6 +54,8 @@ impl FileKind {
         FileKind::Pact,
         FileKind::Range,
     ];
+    /// The optional kinds: a range has one exactly when its `range.toml` lists it.
+    pub const OPTIONAL: [FileKind; 2] = [FileKind::Sndr, FileKind::KeyFilter];
     pub fn name(self) -> &'static str {
         match self {
             FileKind::Txs => "txs",
@@ -64,6 +71,7 @@ impl FileKind {
             FileKind::Pact => "pact",
             FileKind::Range => "range",
             FileKind::Sndr => "sndr",
+            FileKind::KeyFilter => "kf",
         }
     }
     pub fn ext(self) -> &'static str {
@@ -72,6 +80,7 @@ impl FileKind {
             FileKind::Keys => "ef",
             FileKind::Rk | FileKind::Bh => "idx",
             FileKind::Range => "toml",
+            FileKind::KeyFilter => "fil",
             _ => "pst",
         }
     }
@@ -109,6 +118,48 @@ pub fn range_file_names(network: &str, start: u32, end: u32) -> Vec<String> {
             v.push(format!("{stem}.conf"));
         }
         v.push(n);
+    }
+    v
+}
+
+/// File names of the optional kinds of a range ([`FileKind::OPTIONAL`]), whether present or
+/// not.
+pub fn optional_file_names(network: &str, start: u32, end: u32) -> Vec<String> {
+    FileKind::OPTIONAL
+        .iter()
+        .map(|k| file_name(network, *k, start, end))
+        .collect()
+}
+
+/// Every file a range consists of according to its `range.toml`: the files it lists (the
+/// required set plus whichever optional files it has), then `range.toml` itself, last.
+pub fn listed_files(info: &RangeInfo) -> Vec<String> {
+    let mut v: Vec<String> = info.files.keys().cloned().collect();
+    v.push(file_name(
+        &info.network,
+        FileKind::Range,
+        info.start,
+        info.end,
+    ));
+    v
+}
+
+/// The files of the range `start..end` in `dir` to keep or copy: the required set plus the
+/// optional files its `range.toml` lists ([`listed_files`]; a committed swap is honoured).
+/// When `range.toml` cannot be read, every optional name is included: keeping a file that is
+/// not needed costs nothing, deleting one that is would cost an `add-index` run.
+pub fn entry_files(dir: &Path, network: &str, start: u32, end: u32) -> Vec<String> {
+    let mut v = range_file_names(network, start, end);
+    let toml = crate::swap::resolve(dir, &file_name(network, FileKind::Range, start, end));
+    match RangeInfo::load(&toml) {
+        Ok(info) => {
+            for n in optional_file_names(network, start, end) {
+                if info.files.contains_key(&n) {
+                    v.push(n);
+                }
+            }
+        }
+        Err(_) => v.extend(optional_file_names(network, start, end)),
     }
     v
 }
@@ -197,10 +248,12 @@ pub fn blake3_file(path: &Path) -> Result<String> {
     Ok(h.finalize().to_hex().to_string())
 }
 
-/// Delete every file of a range and its temp dir (used before rebuilding a range that is not
+/// Delete every file of a range (optional ones included) and its temp dir (used before rebuilding a range that is not
 /// in the manifest). Missing files are ignored.
 pub fn remove_range_files(dir: &Path, network: &str, start: u32, end: u32) -> Result<()> {
-    for n in range_file_names(network, start, end) {
+    let mut names = range_file_names(network, start, end);
+    names.extend(optional_file_names(network, start, end));
+    for n in names {
         match fs::remove_file(dir.join(&n)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

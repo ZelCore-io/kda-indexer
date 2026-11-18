@@ -18,8 +18,10 @@ use crate::adj::AdjTracker;
 use crate::blockfile::{dict_id, BlockFileWriter};
 use crate::etl::SortedU128;
 use crate::files::{
-    blake3_file, file_name, fsync_dir, range_file_names, tmp_dir, write_file, FileKind,
+    blake3_file, file_name, fsync_dir, optional_file_names, range_file_names, tmp_dir, write_file,
+    FileKind,
 };
+use crate::filter::{KeyFilter, KeyFilters};
 use crate::keys::write_keys;
 use crate::manifest::{format_refusal, RangeEntry, RangeKind, FORMAT_VERSION};
 use crate::phf::{debug_fallback_env, write_index, IndexKey};
@@ -44,7 +46,8 @@ pub struct WriteOpts {
     /// `KDX_DEBUG_RK_FALLBACK=1`).
     pub force_sorted_index: bool,
     /// Posting entries (16 B each) kept in memory per family before a sorted run is spilled
-    /// (5 families; default [`ETL_MEM_ENTRIES`]). Backfill lowers it under its memory cap.
+    /// (one buffer per family of `Family::ALL`, `sndr` included; default
+    /// [`ETL_MEM_ENTRIES`]). Backfill lowers it under its memory cap.
     pub postings_mem_entries: usize,
 }
 
@@ -277,7 +280,7 @@ impl RangeWriter {
             dir: dir.to_path_buf(),
             txs: Spool::create(etl.join("txs.spool"))?,
             blocks: Spool::create(etl.join("blocks.spool"))?,
-            postings: Family::REQUIRED
+            postings: Family::ALL
                 .iter()
                 .map(|f| SortedU128::new(&etl, f.name(), opts.postings_mem_entries))
                 .collect(),
@@ -360,11 +363,13 @@ impl RangeWriter {
             }
             self.cmd_reencoded += tx.cmd_reencoded as u64;
             for (fam, ent) in &ix.postings {
-                // Only the required families have a buffer; `sndr.pst` is written by the
-                // optional-file layer (FIX-2 T3), until then its postings are not stored.
-                if let Some(col) = self.postings.get_mut(*fam as usize) {
-                    col.push((*ent as u128) << 64 | rel as u128)?;
-                }
+                // One buffer per family of `Family::ALL` (indexed by `Family as usize`), so
+                // every family has one; a miss would drop postings, so it is an error.
+                let col = self
+                    .postings
+                    .get_mut(*fam as usize)
+                    .with_context(|| format!("no posting buffer for family {fam:?}"))?;
+                col.push((*ent as u128) << 64 | rel as u128)?;
             }
         }
         Ok(())
@@ -448,11 +453,18 @@ impl RangeWriter {
 
         write_keys(&tmp.join(fname(FileKind::Keys)), SLOT_WIDTH, &counts)?;
         let (rk_keys, bh_keys) = (rk.len() as u64, bh.len() as u64);
+        // kf.fil: the filters over the same keys the indexes get.
+        let filters = KeyFilters {
+            bh: KeyFilter::from_index_keys(&bh)?,
+            rk: KeyFilter::from_index_keys(&rk)?,
+        };
+        write_file(&tmp.join(fname(FileKind::KeyFilter)), &filters.to_bytes())?;
+        drop(filters);
         let rk_kind = write_index(&tmp.join(fname(FileKind::Rk)), rk, opts.force_sorted_index)?;
         let bh_kind = write_index(&tmp.join(fname(FileKind::Bh)), bh, opts.force_sorted_index)?;
 
         let mut pstats = BTreeMap::new();
-        for (fam, col) in Family::REQUIRED.iter().zip(postings) {
+        for (fam, col) in Family::ALL.iter().zip(postings) {
             let mut pw = PostingsWriter::create(
                 &tmp.join(fname(FileKind::of_family(*fam))),
                 *fam,
@@ -485,17 +497,19 @@ impl RangeWriter {
             pstats.insert(fam.name().to_string(), PostingStat { entities, entries });
         }
 
+        // Every file but range.toml: the required set and both optional files (a writer
+        // always writes them).
+        let mut written = range_file_names(&network, start, end);
+        written.retain(|n| *n != fname(FileKind::Range));
+        written.extend(optional_file_names(&network, start, end));
         let mut files = BTreeMap::new();
-        for n in range_file_names(&network, start, end) {
-            if n == fname(FileKind::Range) {
-                continue;
-            }
-            let p = tmp.join(&n);
+        for n in &written {
+            let p = tmp.join(n);
             let bytes = fs::metadata(&p)
                 .with_context(|| format!("missing {n}"))?
                 .len();
             files.insert(
-                n,
+                n.clone(),
                 FileStat {
                     bytes,
                     blake3: blake3_file(&p)?,
@@ -533,8 +547,7 @@ impl RangeWriter {
         fsync_dir(&tmp)?;
 
         // range.toml goes last so a range with a readable range.toml is complete.
-        let mut names = range_file_names(&network, start, end);
-        names.retain(|n| *n != fname(FileKind::Range));
+        let mut names = written;
         names.push(fname(FileKind::Range));
         for n in &names {
             fs::rename(tmp.join(n), dir.join(n)).with_context(|| format!("rename {n}"))?;

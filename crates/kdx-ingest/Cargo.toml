@@ -32,3 +32,4 @@ kdx-api.workspace = true
 axum.workspace = true
 tower.workspace = true
 tempfile.workspace = true
+toml.workspace = true

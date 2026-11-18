@@ -12,14 +12,15 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, ensure, Context, Result};
+use kdx_decode::index::indexed_sender;
 use kdx_decode::{Family, IndexedBlock, TxIndex};
 use kdx_hot::checkpoint::set_checkpoint;
 use kdx_hot::tables::{block_key, parse_txkey};
 use kdx_hot::{dict, Stage, Table, Txn};
-use kdx_segment::files::{fsync_dir, range_file_names};
+use kdx_segment::files::{fsync_dir, optional_file_names, range_file_names};
 use kdx_segment::{Manifest, RangeEntry, RangeKind, RangeReader, RangeWriter, WriteOpts};
-use kdx_types::record::{decode_block, decode_tx};
-use kdx_types::TxKey;
+use kdx_types::record::{decode_block, decode_tx, TxRecord};
+use kdx_types::{Dict, DictKind, TxKey};
 
 use crate::ctx::Ctx;
 use crate::{backfill, disk, etl};
@@ -168,8 +169,26 @@ pub fn reconcile(ctx: &Ctx) -> Result<()> {
 /// Push the step's blocks from the hot store to `w`, in (height, chain) order, one block at
 /// a time (review M4: only the step's posting keys are held in memory). Returns the number
 /// of blocks.
+/// The `sndr` posting of a stored record, derived from the record as `extract` derives it
+/// (`indexed_sender`, then the sender's AccountId). For a step or range whose `sndr` lists
+/// are not stored (an older step, or a hot tail the sender backfill has not run on yet).
+fn sender_posting(ctx: &Ctx, r: &TxRecord) -> Result<Option<(Family, u64)>> {
+    let Some(s) = indexed_sender(r).map_err(|e| anyhow::anyhow!("cmd of {:?}: {e:?}", r.key))?
+    else {
+        return Ok(None);
+    };
+    let dict = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());
+    let id = dict
+        .find(DictKind::Account, &s)
+        .with_context(|| format!("sender of {:?} is not in the dictionary", r.key))?;
+    Ok(Some((Family::Sndr, u64::from(id))))
+}
+
 fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Result<u64> {
     let txn = ctx.hot.ro()?;
+    // Until the sender backfill has run (`Meta sndr_hot`), older tail blocks have no family-6
+    // rows: the step's `sndr` postings then come from the records, never from a partial set.
+    let derive_sndr = !kdx_hot::sndr::hot_ready(&txn)?;
     let mut posts: BTreeMap<TxKey, Vec<(Family, u64)>> = BTreeMap::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
@@ -178,6 +197,9 @@ fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Resul
             let key = parse_txkey(&k[9..]).context("posting key")?;
             if key.height() >= start && key.height() < end {
                 let f = Family::from_u8(k[0]).context("posting family")?;
+                if derive_sndr && f == Family::Sndr {
+                    continue;
+                }
                 let e = u64::from_be_bytes(k[1..9].try_into()?);
                 posts.entry(key).or_default().push((f, e));
             }
@@ -205,15 +227,18 @@ fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Resul
                 .iter()
                 .map(|r| {
                     let mut p = posts.remove(&r.key).unwrap_or_default();
+                    if derive_sndr {
+                        p.extend(sender_posting(ctx, r)?);
+                    }
                     p.sort_unstable_by_key(|&(f, e)| (f as u8, e));
-                    TxIndex {
+                    Ok(TxIndex {
                         key: r.key,
                         postings: p,
                         pact_id: None,
                         code_hash: None,
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             ntx += t.len() as u64;
             let cmd_reencoded = t.iter().filter(|r| r.cmd_reencoded).count() as u32;
             w.push(&IndexedBlock {
@@ -359,8 +384,13 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
         let r = RangeReader::open(&ctx.segdir, e, &o.network)?;
         // Postings per relative TxNum, from the step's posting files.
         let mut posts: Vec<Vec<(Family, u64)>> = vec![Vec::new(); e.tx_count as usize];
-        for f in Family::REQUIRED {
-            let p = &r.postings[f as usize];
+        // A step without `sndr.pst` (written before FIX-2) gets its sender postings from the
+        // records, so the merged range never drops or lacks them.
+        let derive_sndr = r.sndr.is_none();
+        for f in Family::ALL {
+            let Some(p) = r.family(f) else {
+                continue;
+            };
             for k in 0..p.entities() {
                 let ent = p.entity_at(k);
                 for rel in p.list_at(k)? {
@@ -382,6 +412,9 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
             for rel in first..first + n {
                 let t = r.tx_rel(rel)?;
                 let mut p = std::mem::take(&mut posts[rel as usize]);
+                if derive_sndr {
+                    p.extend(sender_posting(ctx, &t)?);
+                }
                 p.sort_unstable_by_key(|&(f, e)| (f as u8, e));
                 idx.push(TxIndex {
                     key: t.key,
@@ -406,7 +439,9 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
     m.commit(&ctx.segdir)?;
     crash_at("merge-after-manifest");
     for e in &replaced {
-        for name in range_file_names(&o.network, e.start, e.end) {
+        let mut names = range_file_names(&o.network, e.start, e.end);
+        names.extend(optional_file_names(&o.network, e.start, e.end));
+        for name in names {
             let p = ctx.segdir.join(&name);
             if p.exists() {
                 std::fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;

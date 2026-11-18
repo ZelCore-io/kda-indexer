@@ -539,3 +539,128 @@ async fn rebuild_with_changed_content_marks_both_versions_dirty_and_search_stale
     let m = kdx_search::SearchManifest::load(&sdir).unwrap().unwrap();
     assert_eq!(m.stale_from_height, Some(e.start));
 }
+
+/// Turns a range into one written before FIX-2: `sndr.pst` and `kf.fil` leave the disk and
+/// its `range.toml` (`files` and `postings.sndr`).
+fn strip_optional(segdir: &Path, net: &str, e: &kdx_segment::RangeEntry) {
+    use kdx_segment::files::{file_name, optional_file_names, FileKind};
+    let toml = segdir.join(file_name(net, FileKind::Range, e.start, e.end));
+    let mut info = kdx_segment::RangeInfo::load(&toml).unwrap();
+    for n in optional_file_names(net, e.start, e.end) {
+        assert!(info.files.remove(&n).is_some(), "{n} listed");
+        std::fs::remove_file(segdir.join(&n)).unwrap();
+    }
+    assert!(info.postings.remove("sndr").is_some());
+    std::fs::write(&toml, toml::to_string(&info).unwrap()).unwrap();
+}
+
+/// Ten frozen steps (no merge yet) in a fresh store; returns its dir.
+fn ten_steps() -> tempfile::TempDir {
+    let pool = pool();
+    let all: Vec<usize> = (0..POOL_LEN).collect();
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path(), 2, 1000, 2);
+    apply_linear(&c, &pool, &branch(&all, 0, 0, 0), 5);
+    while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+    d
+}
+
+/// FIX-2 T3: a merge of steps without `sndr.pst` (some or all) derives the sender postings
+/// from the records and writes byte-for-byte the range a merge of complete steps writes;
+/// stripped steps open and pass `segments check --deep` before the merge.
+#[test]
+fn a_merge_of_steps_with_and_without_sndr_gives_the_same_bytes() {
+    let mut merged = Vec::new();
+    for strip in [0usize, 2, 1] {
+        // strip 0: none, 2: every other step, 1: every step.
+        let d = ten_steps();
+        {
+            let c = ctx(d.path(), 2, 20, 2);
+            let m = kdx_segment::Manifest::load(&c.segdir).unwrap().unwrap();
+            assert_eq!(m.entries.len(), 10);
+            if strip > 0 {
+                for e in m.entries.iter().step_by(strip) {
+                    strip_optional(&c.segdir, &m.network, e);
+                }
+                let seg =
+                    kdx_segment::Segments::open(&c.segdir, Arc::new(kdx_types::MemDict::new()))
+                        .unwrap();
+                assert!(!seg.sender_ready());
+                deep_check(&c);
+            }
+            assert!(kdx_ingest::freezer::merge(&c).unwrap().is_some());
+            deep_check(&c);
+            let seg = kdx_segment::Segments::open(&c.segdir, Arc::new(kdx_types::MemDict::new()))
+                .unwrap();
+            assert_eq!(seg.ranges.len(), 1);
+            assert!(seg.sender_ready() && seg.ranges[0].filter.is_some());
+        }
+        let f = files(&d.path().join("segments"));
+        assert!(f.keys().any(|n| n.contains("-sndr-")) && f.keys().any(|n| n.contains("-kf-")));
+        merged.push(f);
+    }
+    assert_eq!(merged[1], merged[0], "every other step stripped");
+    assert_eq!(merged[2], merged[0], "every step stripped");
+}
+
+/// FIX-2 T3: `rebuild-range` of a step written before FIX-2 adds `sndr.pst` and `kf.fil`
+/// (listed, swapped in), keeps the content, and leaves a store that passes the deep check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_of_a_step_without_optional_files_adds_them() {
+    let pool = pool();
+    let places = places_for(&[0], 24);
+    let base = fake_node(&pool, &places);
+    let d = tempfile::tempdir().unwrap();
+    let c = Arc::new(freeze_store(d.path(), &pool, &base, &places, &[0]));
+    let before = content(&c);
+    let m = kdx_segment::Manifest::load(&c.segdir).unwrap().unwrap();
+    let e = m.entries[3].clone();
+    let want = files(&c.segdir);
+    strip_optional(&c.segdir, &m.network, &e);
+    let rep = kdx_ingest::rebuild::run(
+        c.clone(),
+        e.kind,
+        e.start,
+        kdx_ingest::HeaderMode::Cut,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(rep.swapped && !rep.bytes_equal, "{rep:?}");
+    assert_eq!(rep.content_equal, Some(true));
+    let opt = kdx_segment::files::optional_file_names(&m.network, e.start, e.end);
+    for n in &opt {
+        assert_eq!(rep.old_blake3[n], "-");
+        assert_eq!(rep.new_blake3[n], want[n]);
+    }
+    assert!(!kdx_segment::swap::rebuild_dir(&c.segdir, e.start).exists());
+    // The rebuilt step is the step the freezer wrote, optional files included.
+    assert_eq!(files(&c.segdir), want);
+    deep_check(&c);
+    assert_eq!(content(&c), before);
+}
+
+/// FIX-2 T3: the startup cleanup (`remove_unlisted`, run by `freezer::reconcile`) keeps the
+/// optional files a range lists and removes optional files of a range that is not listed.
+#[test]
+fn startup_cleanup_keeps_listed_optional_files() {
+    let d = ten_steps();
+    let c = ctx(d.path(), 2, 1000, 2);
+    let net = kdx_segment::Manifest::load(&c.segdir)
+        .unwrap()
+        .unwrap()
+        .network;
+    let stray = kdx_segment::files::optional_file_names(&net, 500, 502);
+    for n in &stray {
+        std::fs::write(c.segdir.join(n), b"x").unwrap();
+    }
+    let before = files(&c.segdir);
+    kdx_ingest::freezer::reconcile(&c).unwrap();
+    let mut want = before.clone();
+    for n in &stray {
+        want.remove(n);
+    }
+    assert_eq!(files(&c.segdir), want);
+    assert_eq!(want.keys().filter(|n| n.contains("-kf-")).count(), 10);
+    assert_eq!(want.keys().filter(|n| n.contains("-sndr-")).count(), 10);
+}

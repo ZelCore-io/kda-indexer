@@ -1,5 +1,7 @@
 //! `segments check [--deep]`: manifest consistency, blake3 of every file, TxNum density,
-//! orphan files; `deep` also decodes every record and resolves every rk, bh and posting list.
+//! orphan files; `deep` also decodes every record and resolves every rk, bh and posting list,
+//! checks `sndr ⊆ acct` per entity and runs every stored rk/bh key through the range's key
+//! filter (a false negative there would be a 404 for a stored key).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -27,6 +29,10 @@ pub struct CheckReport {
     pub deep_decode_errors: u64,
     pub rk_misses: u64,
     pub bh_misses: u64,
+    /// Stored request keys / block hashes a range's `kf.fil` rules out (deep).
+    pub filter_misses: u64,
+    /// `(sndr entity, tx)` postings with no `acct` posting of the same entity (deep).
+    pub sndr_not_in_acct: u64,
     /// Files of ranges not in the manifest, and leftover temp dirs.
     pub orphan_files: Vec<String>,
     /// Other failures (missing files, unreadable headers, count mismatches), one line each.
@@ -44,6 +50,8 @@ impl CheckReport {
             && self.deep_decode_errors == 0
             && self.rk_misses == 0
             && self.bh_misses == 0
+            && self.filter_misses == 0
+            && self.sndr_not_in_acct == 0
             && self.orphan_files.is_empty()
             && self.errors.is_empty()
     }
@@ -83,6 +91,8 @@ pub fn check(dir: &Path, deep: bool) -> Result<CheckReport> {
             }
         };
         rep.files_ok += 1;
+        // The optional files it lists belong to the range too.
+        known.extend(info.files.keys().cloned());
         for (name, st) in &info.files {
             let p = crate::swap::resolve(dir, name);
             match std::fs::metadata(&p) {
@@ -120,6 +130,19 @@ pub fn check(dir: &Path, deep: bool) -> Result<CheckReport> {
 fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
     let tag = format!("{}..{}", r.info.start, r.info.end);
     let mut cand = Vec::new();
+    // A listed optional file the reader did not take (missing, or a key filter it does not
+    // trust) is a finding: the range works, but slower or without the sender view.
+    for (k, loaded) in [
+        (FileKind::Sndr, r.sndr.is_some()),
+        (FileKind::KeyFilter, r.filter.is_some()),
+    ] {
+        let n = file_name(&r.info.network, k, r.info.start, r.info.end);
+        if r.info.files.contains_key(&n) && !loaded {
+            rep.errors.push(format!(
+                "{tag}: {n} is listed but was not loaded (see the warning)"
+            ));
+        }
+    }
     // Txs: row by row; TxKey must match keys.ef; every request key must resolve.
     let mut rel = 0u64;
     for row_i in 0..r.txs.rows() {
@@ -150,6 +173,9 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
                         r.rk.candidates(rk, &mut cand);
                         if !cand.contains(&(rel as u32)) {
                             rep.rk_misses += 1;
+                        }
+                        if !r.may_have_rk(rk) {
+                            rep.filter_misses += 1;
                         }
                     }
                 }
@@ -199,6 +225,9 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
                 if !cand.contains(&(s as u32)) {
                     rep.bh_misses += 1;
                 }
+                if !r.may_have_bh(&b.hash) {
+                    rep.filter_misses += 1;
+                }
             }
             Ok(_) => {
                 rep.deep_decode_errors += 1;
@@ -216,8 +245,10 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
     }
     // Posting lists: decode, ascending, inside the range; a Roaring list's lazy walk (the
     // read path) equals its full decode from three bounds.
-    for f in Family::REQUIRED {
-        let p = &r.postings[f as usize];
+    for f in Family::ALL {
+        let Some(p) = r.family(f) else {
+            continue;
+        };
         for i in 0..p.entities() {
             rep.posting_lists_checked += 1;
             match p.list_at(i) {
@@ -250,6 +281,36 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
                     rep.errors
                         .push(format!("{tag} {}: list {i}: {e:#}", f.name()));
                 }
+            }
+        }
+    }
+    sndr_within_acct(r, &tag, rep);
+}
+
+/// Every `sndr` list is a subset of the `acct` list of the same entity (the sender of a tx
+/// always gets an `acct` posting too).
+fn sndr_within_acct(r: &RangeReader, tag: &str, rep: &mut CheckReport) {
+    let Some(sndr) = &r.sndr else {
+        return;
+    };
+    let acct = &r.postings[Family::Acct as usize];
+    for i in 0..sndr.entities() {
+        let ent = sndr.entity_at(i);
+        let Ok(list) = sndr.list_at(i) else {
+            continue; // counted above
+        };
+        let have: HashSet<u64> = acct.list(ent).map(|it| it.collect()).unwrap_or_default();
+        let first = r.info.first_txnum;
+        let out = list
+            .iter()
+            .filter(|&&rel| !have.contains(&(first + u64::from(rel))))
+            .count() as u64;
+        if out > 0 {
+            rep.sndr_not_in_acct += out;
+            if rep.errors.len() < 50 {
+                rep.errors.push(format!(
+                    "{tag} sndr: entity {ent}: {out} txs without an acct posting"
+                ));
             }
         }
     }

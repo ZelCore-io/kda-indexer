@@ -11,11 +11,37 @@ use kdx_types::{Dict, Hash32, TxKey};
 use crate::adj::record_block_hash;
 use crate::blockfile::BlockFile;
 use crate::files::{file_name, FileKind};
+use crate::filter::KeyFilters;
 use crate::keys::Keys;
 use crate::manifest::{Manifest, RangeEntry, RangeKind};
 use crate::phf::{Index, KeyIndex};
 use crate::postings::{ListMemo, PostingIter, Postings};
-use crate::writer::{RangeInfo, SLOT_WIDTH};
+use crate::writer::{FileStat, RangeInfo, SLOT_WIDTH};
+
+/// Reads `kf.fil` into memory and checks it against `range.toml`: size and blake3 as listed,
+/// a valid header, and key counts that fit the range (a filter of `n` distinct prefixes for
+/// at most `rk_keys` / `bh_keys` keys, empty exactly when the range has none). Any failure
+/// is an error; the caller then reads the range without a filter.
+fn load_filters(p: &Path, st: &FileStat, info: &RangeInfo) -> Result<KeyFilters> {
+    let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+    if bytes.len() as u64 != st.bytes {
+        bail!("{} bytes, range.toml lists {}", bytes.len(), st.bytes);
+    }
+    let h = blake3::hash(&bytes).to_hex();
+    if h.as_str() != st.blake3 {
+        bail!("blake3 {h} differs from range.toml");
+    }
+    let f = KeyFilters::from_bytes(&bytes)?;
+    for (what, n, keys) in [
+        ("bh", f.bh.len(), info.bh_keys),
+        ("rk", f.rk.len(), info.rk_keys),
+    ] {
+        if n > keys || (n == 0) != (keys == 0) {
+            bail!("{what} filter holds {n} keys for {keys} index keys");
+        }
+    }
+    Ok(f)
+}
 
 /// One opened range or step.
 pub struct RangeReader {
@@ -27,6 +53,13 @@ pub struct RangeReader {
     pub bh: Index,
     /// By `Family as usize`, the required families only (`Family::REQUIRED`).
     pub postings: Vec<Postings>,
+    /// `sndr.pst` (FIX-2): `None` when `range.toml` does not list it, or lists it but the
+    /// file is missing (a WARN and `kdx_segment_optional_missing`).
+    pub sndr: Option<Postings>,
+    /// `kf.fil` (FIX-2), in owned memory: `None` when not listed, missing, or not trusted
+    /// (size, blake3, header or key counts disagree with `range.toml`). Without it every
+    /// lookup probes the range's index, as before the filter existed.
+    pub filter: Option<KeyFilters>,
     /// Set bits of `blocks.present` before each 64-bit word.
     rank: Vec<u32>,
 }
@@ -67,6 +100,48 @@ impl RangeReader {
         for fam in Family::REQUIRED {
             postings.push(Postings::open(&f(FileKind::of_family(fam)), e.first_txnum)?);
         }
+        // Optional files: present iff listed. Listed but missing: read without it (WARN +
+        // counter). A listed `sndr.pst` with a bad header fails the open; a `kf.fil` that
+        // cannot be trusted only turns the filter off (it can never make a key unfindable).
+        let listed = |k: FileKind| {
+            let n = file_name(network, k, e.start, e.end);
+            info.files.get(&n).map(|st| (f(k), st.clone()))
+        };
+        let missing = |file: &'static str, p: &Path| {
+            tracing::warn!(
+                range = %format!("{}..{}", e.start, e.end),
+                path = %p.display(),
+                "segment: range.toml lists {file} but the file is missing; the range is read                  without it (`segments add-index` restores it)"
+            );
+            kdx_metrics::get().segment_optional_missing(file);
+        };
+        let sndr = match listed(FileKind::Sndr) {
+            Some((p, _)) if !p.exists() => {
+                missing("sndr", &p);
+                None
+            }
+            Some((p, _)) => Some(Postings::open(&p, e.first_txnum)?),
+            None => None,
+        };
+        let filter = match listed(FileKind::KeyFilter) {
+            Some((p, _)) if !p.exists() => {
+                missing("kf", &p);
+                None
+            }
+            Some((p, st)) => match load_filters(&p, &st, &info) {
+                Ok(x) => Some(x),
+                Err(err) => {
+                    tracing::warn!(
+                        range = %format!("{}..{}", e.start, e.end),
+                        path = %p.display(),
+                        "segment: key filter not trusted ({err:#}); the range is probed                          without it"
+                    );
+                    kdx_metrics::get().key_filter_untrusted.inc();
+                    None
+                }
+            },
+            None => None,
+        };
         let p = &blocks.header.present;
         let mut rank = Vec::with_capacity(p.len().div_ceil(8));
         let mut acc = 0u32;
@@ -99,8 +174,28 @@ impl RangeReader {
             rk,
             bh,
             postings,
+            sndr,
+            filter,
             rank,
         })
+    }
+
+    /// Posting file of a family: a required one, or `sndr.pst` when the range has it.
+    pub fn family(&self, f: Family) -> Option<&Postings> {
+        match f {
+            Family::Sndr => self.sndr.as_ref(),
+            _ => self.postings.get(f as usize),
+        }
+    }
+
+    /// False only when the range's filter rules the request key out; true without a filter.
+    pub fn may_have_rk(&self, rk: &Hash32) -> bool {
+        self.filter.as_ref().is_none_or(|x| x.rk.contains_hash(rk))
+    }
+
+    /// False only when the range's filter rules the block hash out; true without a filter.
+    pub fn may_have_bh(&self, h: &Hash32) -> bool {
+        self.filter.as_ref().is_none_or(|x| x.bh.contains_hash(h))
     }
 
     pub fn slots(&self) -> usize {
@@ -218,7 +313,7 @@ impl RangeReader {
     }
 
     pub fn postings(&self, f: Family, entity: u64) -> Option<PostingIter> {
-        self.postings.get(f as usize)?.list(entity)
+        self.family(f)?.list(entity)
     }
 
     /// Postings of `(f, entity)` with relative TxNum `<= max_rel` (None = all), newest first.
@@ -228,7 +323,7 @@ impl RangeReader {
         entity: u64,
         max_rel: Option<u32>,
     ) -> Result<Option<PostingIter>> {
-        match self.postings.get(f as usize) {
+        match self.family(f) {
             Some(p) => p.list_le(entity, max_rel),
             None => Ok(None),
         }
@@ -244,7 +339,7 @@ impl RangeReader {
         memo: &ListMemo,
         range: u32,
     ) -> Result<Option<PostingIter>> {
-        match self.postings.get(f as usize) {
+        match self.family(f) {
             Some(p) => p.list_le_memo(entity, max_rel, Some((memo, range))),
             None => Ok(None),
         }
@@ -282,12 +377,14 @@ impl Segments {
                     .with_context(|| format!("open range {}..{}", e.start, e.end))?,
             ));
         }
-        Ok(Segments {
+        let s = Segments {
             dir: dir.to_path_buf(),
             manifest,
             ranges,
             dict,
-        })
+        };
+        s.publish_filter_bytes();
+        Ok(s)
     }
 
     /// Reload `manifest.json`; `None` when it is unchanged. Readers whose
@@ -308,12 +405,35 @@ impl Segments {
                 )),
             }
         }
-        Ok(Some(Segments {
+        let s = Segments {
             dir: self.dir.clone(),
             manifest,
             ranges,
             dict: self.dict.clone(),
-        }))
+        };
+        s.publish_filter_bytes();
+        Ok(Some(s))
+    }
+
+    /// True when every range has its `sndr` postings, so the sender view can be served from
+    /// the segments (an empty store is ready).
+    pub fn sender_ready(&self) -> bool {
+        self.ranges.iter().all(|r| r.sndr.is_some())
+    }
+
+    /// Bytes of key filters these ranges hold in memory.
+    pub fn key_filter_bytes(&self) -> u64 {
+        self.ranges
+            .iter()
+            .filter_map(|r| r.filter.as_ref())
+            .map(|f| f.bytes() as u64)
+            .sum()
+    }
+
+    fn publish_filter_bytes(&self) {
+        kdx_metrics::get()
+            .key_filter_bytes
+            .set(i64::try_from(self.key_filter_bytes()).unwrap_or(i64::MAX));
     }
 
     /// Height below which every block is frozen.
@@ -461,9 +581,13 @@ impl Segments {
         }
     }
 
-    /// TxNum of a request key, ranges newest first.
+    /// TxNum of a request key, ranges newest first. A range whose key filter rules the key
+    /// out is skipped (no false negatives, so the answer is the same as probing it).
     pub fn by_rk(&self, rk: &Hash32) -> Result<Option<u64>> {
         for r in self.ranges.iter().rev() {
+            if !r.may_have_rk(rk) {
+                continue;
+            }
             if let Some(x) = r.rk_rel(rk)? {
                 return Ok(Some(x + r.info.first_txnum));
             }
@@ -471,9 +595,12 @@ impl Segments {
         Ok(None)
     }
 
-    /// (chain, height) of a block hash, ranges newest first.
+    /// (chain, height) of a block hash, ranges newest first; filtered like [`Self::by_rk`].
     pub fn by_block_hash(&self, h: &Hash32) -> Result<Option<(u8, u32)>> {
         for r in self.ranges.iter().rev() {
+            if !r.may_have_bh(h) {
+                continue;
+            }
             if let Some(s) = r.bh_slot(h)? {
                 return Ok(Some(r.slot_pos(s)));
             }

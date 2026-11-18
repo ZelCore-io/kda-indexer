@@ -98,6 +98,14 @@ pub struct Metrics {
     pub alloc_resident_bytes: Gauge,
     pub alloc_retained_bytes: Gauge,
     pub alloc_mapped_bytes: Gauge,
+    /// Optional range files (`file` = sndr | kf) that `range.toml` lists but that are missing
+    /// at range open (FIX-2); the range is read without them.
+    pub segment_optional_missing: Count,
+    /// `kf.fil` files present but not trusted at range open (checksum, header or key count
+    /// mismatch); the range is probed as if it had no filter.
+    pub key_filter_untrusted: Counter,
+    /// Bytes of key filters held in memory by the newest segment view.
+    pub key_filter_bytes: Gauge,
 }
 
 impl Metrics {
@@ -323,6 +331,21 @@ impl Metrics {
             "Bytes in active extents mapped by the allocator (jemalloc stats.mapped)",
             Gauge::default()
         );
+        let segment_optional_missing = reg!(
+            "kdx_segment_optional_missing",
+            "Optional range files listed in range.toml but missing at open, by file",
+            Count::default()
+        );
+        let key_filter_untrusted = reg!(
+            "kdx_key_filter_untrusted",
+            "Key filter files not trusted at range open (the range is probed without a filter)",
+            Counter::default()
+        );
+        let key_filter_bytes = reg!(
+            "kdx_key_filter_bytes",
+            "Bytes of range key filters held in memory",
+            Gauge::default()
+        );
         Metrics {
             registry: r,
             build_info,
@@ -368,10 +391,20 @@ impl Metrics {
             alloc_resident_bytes,
             alloc_retained_bytes,
             alloc_mapped_bytes,
+            segment_optional_missing,
+            key_filter_untrusted,
+            key_filter_bytes,
         }
     }
 
     // Recording helpers: one place that fixes label names.
+
+    /// A listed optional range file (`sndr` | `kf`) was missing at open.
+    pub fn segment_optional_missing(&self, file: &'static str) {
+        self.segment_optional_missing
+            .get_or_create(&vec![("file", file.to_string())])
+            .inc();
+    }
 
     pub fn http(&self, api: &'static str, route: &str, status: u16, secs: f64) {
         let l: Labels = vec![

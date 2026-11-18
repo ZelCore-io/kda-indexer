@@ -9,8 +9,12 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use kdx_hot::{Table, Txn};
 use kdx_segment::content::{self, ContentSummary};
-use kdx_segment::files::{blake3_file, range_file_names};
-use kdx_segment::{swap, Manifest, RangeEntry, RangeKind, RangeReader, RangeWriter, WriteOpts};
+use kdx_segment::files::{
+    blake3_file, file_name, listed_files, optional_file_names, range_file_names, FileKind,
+};
+use kdx_segment::{
+    swap, Manifest, RangeEntry, RangeInfo, RangeKind, RangeReader, RangeWriter, WriteOpts,
+};
 use kdx_types::record::decode_block;
 use kdx_types::Hash32;
 use serde::Serialize;
@@ -122,8 +126,12 @@ fn anchors(ctx: &Ctx, m: &Manifest, entry: &RangeEntry) -> Result<(Prev, BTreeMa
     Ok((prev, next))
 }
 
+/// blake3 of every file the range can have, optional ones included (`-` when absent or
+/// unreadable), so the old and the new set have the same names to compare.
 fn file_hashes(dir: &std::path::Path, net: &str, start: u32, end: u32) -> BTreeMap<String, String> {
-    range_file_names(net, start, end)
+    let mut names = range_file_names(net, start, end);
+    names.extend(optional_file_names(net, start, end));
+    names
         .into_iter()
         .map(|n| {
             let h = blake3_file(&dir.join(&n)).unwrap_or_else(|_| "-".into());
@@ -316,13 +324,10 @@ pub async fn run(
     rep.swapped = true;
     swap::commit_journal(&ctx.segdir, start, &serde_json::to_vec_pretty(&rep)?)?;
     crash_at("rebuild-after-rename");
-    let mut names = range_file_names(&net, entry.start, entry.end);
-    let toml = names
-        .iter()
-        .position(|n| n.ends_with(".toml"))
-        .context("no range.toml name")?;
-    let t = names.remove(toml);
-    names.push(t);
+    // The files the rebuilt range.toml lists (optional ones included), range.toml last.
+    let rebuilt = RangeInfo::load(&rdir.join(file_name(&net, FileKind::Range, start, entry.end)))
+        .context("rebuilt range.toml")?;
+    let names = listed_files(&rebuilt);
     swap::finish(&ctx.segdir, start, &names, &|| crash_at("rebuild-mid-swap"))?;
     manifest.commit(&ctx.segdir)?;
     crash_at("rebuild-before-cleanup");

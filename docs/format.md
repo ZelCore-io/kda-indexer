@@ -60,8 +60,14 @@ cannot be upgraded in place; rebuild it (`docs/operations.md`, "Format upgrade")
   no version bump: the tail writes family-6 rows with undo ops like every family;
   `kdx_hot::sndr::backfill` adds them to a tail written without them and sets
   `Meta sndr_hot = 1` (u64); `hot drop-family sndr` removes them (see operations.md). In
-  segments `sndr.pst` is an optional file, listed in `range.toml` when present; the segment
-  writer does not store it yet, so frozen and backfilled ranges carry no `sndr` lists for now.
+  segments `sndr.pst` is an optional file (see "Optional files"). The range writer stores it
+  for every new step, range, merge and rebuild. The freezer takes a step's `sndr` postings
+  from the hot rows once `Meta sndr_hot = 1`; before that it derives them from the records
+  (`indexed_sender` plus the dictionary), never from a partial set of rows. A merge reads each
+  step's `sndr.pst` and derives the postings from the records of a step without one, so the
+  merged bytes are the same either way.
+- **Key filters** (FIX-2, `kf.fil`): optional per-range Binary Fuse 8 filters over the rk/bh
+  key prefixes (see "`kf.fil`"), written by the range writer next to `sndr.pst`.
 - **Versions.** Hot `Meta format_version` 2; `manifest.json` and every `range.toml`
   `format_version` 2. Posting files keep their own version byte 1 and records keep 1.
 - **MDBX** opens with 64 named-database slots (`max_dbs`; 32 before), room for later
@@ -130,7 +136,34 @@ files of unlisted ranges are leftovers and are deleted or rebuilt.
 | `rk` | `.idx` | request key → tx |
 | `bh` | `.idx` | block hash → slot |
 | `acct`, `xfer`, `pk`, `evt`, `code`, `pact` | `.pst` | posting lists |
+| `sndr` | `.pst` | posting lists of the `sndr` family (optional) |
+| `kf` | `.fil` | block-hash and request-key filters (optional) |
 | `range` | `.toml` | range header with blake3 of every other file |
+
+### Optional files
+
+`sndr.pst` and `kf.fil` are optional: a range has one exactly when its `range.toml` lists it
+under `[files]` (with size and blake3, like every file). The required set
+(`range_file_names`) is unchanged. Everything that keeps, copies or swaps a range's files
+takes the listed set (`files::listed_files` / `files::entry_files`): the startup cleanup
+(`remove_unlisted`), `snapshot`, `rebuild-range`'s swap and `segments check`. When a
+`range.toml` cannot be read, the cleanup keeps every optional name of the range rather than
+delete one.
+
+At range open:
+
+- not listed: the range has no `sndr` lists / no filter (a range written before FIX-2);
+- listed but missing on disk: the same, with a WARN and `kdx_segment_optional_missing{file}`;
+  the range still opens (a rollback and re-upgrade still starts; `add-index` restores it);
+- a listed `sndr.pst` with a bad header fails the open (fail-closed);
+- a listed `kf.fil` is read whole into memory and used only when its size and blake3 match
+  `range.toml`, its header decodes, and each filter's `n_keys` fits the range (at most
+  `bh_keys` / `rk_keys`, zero exactly when those are zero). Otherwise the range is read
+  without a filter (WARN, `kdx_key_filter_untrusted`) and every lookup probes its index as
+  before: a damaged filter can cost time, never turn a stored key into a miss.
+
+`Segments::sender_ready()` is true when every range has its `sndr` lists;
+`kdx_key_filter_bytes` is the filter memory of the newest view.
 
 ## Write ordering
 
@@ -281,6 +314,9 @@ entries = 0
 bytes = 0
 blake3 = "<hex>"
 ```
+
+A range written since FIX-2 also has `[postings.sndr]` and the `files` entries of
+`…-sndr-….pst` and `…-kf-….fil` (see "Optional files").
 
 ## `txs.seg` and `blocks.seg`
 
@@ -495,7 +531,10 @@ of the same keys give byte-identical files.
 Key filters of one range: a Binary Fuse 8 filter over the 8-byte key prefixes (the same
 big-endian u64 prefix as `rk.idx` and `bh.idx`) of its block hashes and another of its request
 keys. A lookup skips a range whose filter says no. The file is optional (present when
-`range.toml` lists it) and is read into memory when the range is opened.
+`range.toml` lists it) and is read into memory when the range is opened, after its size and
+blake3 are checked against `range.toml` (see "Optional files" for what happens when they do
+not match). Writer and lookup derive the key with the same function (`filter::key_of`, the
+`phf::prefix` of the 32-byte hash).
 
 ```
 [4]  "KDXF"   u8 version = 1   filter (block hashes)   filter (request keys)
@@ -514,7 +553,8 @@ filter: u64 seed   u32 segment_length   u32 segment_count_length   u64 n_keys
   (segment_length - 1))`, `h2 = (h0 + 2 * segment_length) ^ (hash & (segment_length - 1))`, and
   answers yes when `fp(hash) ^ f[h0] ^ f[h1] ^ f[h2] == 0`, where `fp(hash) = (hash ^ (hash >> 32))
   as u8`.
-- Cost: 1.125 bytes per key (9.0 bits) from one million keys, a false positive rate of about
+- Cost: about 1.13 bytes per key at one million keys (1.125 asymptotically, 9.0 bits), a
+  false positive rate of about
   0.39 %, no false negatives. Construction checks every input key against the finished filter
   and fails rather than write a filter that misses one.
 - The seed comes from a fixed sequence (splitmix64 from state 1, first peelable seed wins), so
@@ -572,10 +612,12 @@ Readers page newest first: ranges from newest to oldest, each list from its last
 
 - **TxNum → record**: the manifest gives the range (binary search over `first_txnum`), then
   `txs.seg` record `TxNum − first_txnum`.
-- **Request key → tx**: the hot tail first, then `rk.idx` of each range, newest first.
+- **Request key → tx**: the hot tail first, then `rk.idx` of each range, newest first,
+  skipping a range whose `kf.fil` request-key filter rules the key out.
 - **Block (chain, height) → record**: the range by height, the slot, the `present` bit and
   its rank give the `blocks.seg` record; adjacent refs resolve through the same range.
-- **Block hash → block**: the hot tail first, then `bh.idx` of each range, newest first.
+- **Block hash → block**: the hot tail first, then `bh.idx` of each range, newest first,
+  skipping a range whose block-hash filter rules the hash out.
 
 ## Search index (`search/`)
 
@@ -702,11 +744,16 @@ that never signed a transaction are covered.
 ## Checking
 
 `kda-indexer segments check` verifies the manifest (contiguous heights and TxNums), the
-size and blake3 of every file listed in each `range.toml`, and reports orphan files.
+size and blake3 of every file listed in each `range.toml` (optional files included), and
+reports orphan files (an optional file the range does not list is one).
 `--deep` also decodes every record, checks every tx's TxKey against `keys.ef`, resolves
 every request key and block hash through the indexes, decodes every adjacent ref and every
 posting list, and walks each Roaring list the way reads do (lazily, by container) from three
-bounds, requiring the same values as its full decode.
+bounds, requiring the same values as its full decode. With FIX-2 files it also decodes
+every `sndr` list, requires every `sndr` posting to have an `acct` posting of the same entity
+(`sndr_not_in_acct`), runs every stored request key and block hash through its range's
+filter (`filter_misses`: a false negative there would be a 404), and reports a listed
+optional file that the reader did not load.
 
 `kda-indexer verify merkle [--from H] [--to H] [--chains …] [--sample N | --all] [--json]`
 re-renders each block's leaves from its stored records (hot store first, then segments),

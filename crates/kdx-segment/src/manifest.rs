@@ -140,6 +140,16 @@ impl Manifest {
             .collect()
     }
 
+    /// [`Manifest::files`] plus the optional files each range's `range.toml` in `dir` lists
+    /// ([`crate::files::entry_files`]).
+    pub fn files_in(&self, dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        self.entries
+            .iter()
+            .flat_map(|e| crate::files::entry_files(dir, &self.network, e.start, e.end))
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+
     /// `network` is a plain name ([`check_network`]); entries contiguous in heights and
     /// TxNums; frontier and next_txnum match the last entry.
     pub fn validate(&self) -> Result<()> {
