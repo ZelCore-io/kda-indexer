@@ -395,6 +395,11 @@ pub struct GraphqlConfig {
     /// the response `extensions`. The walk also stops at half of the remaining
     /// `api.deadline_ms`.
     pub count_budget_ms: u64,
+    /// Serve sender lists (`transactions(accountName)`, `FungibleChainAccount.transactions`,
+    /// REST `role=sender`) from the `sndr` postings once the sender index is complete
+    /// (FIX-2). `false` forces the old path (the account's postings filtered on
+    /// `meta.sender`, bounded by the 1 s scan window); kept for the on-host equivalence check.
+    pub sender_index: bool,
     /// `networkInfo.networkHost`: a public name for clients, never the node URL.
     pub network_host: String,
     /// Automatic persisted queries. Not built: `true` is refused.
@@ -426,6 +431,7 @@ impl Default for GraphqlConfig {
             feed_poll_ms: 1000,
             feed_ring_mb: 64,
             count_budget_ms: 200,
+            sender_index: true,
             network_host: String::new(),
             apq: false,
         }
@@ -1022,6 +1028,22 @@ mod ws_bound_tests {
         assert_eq!(ms(&c), 50);
         assert_eq!(ms(&parse("")), 200);
         assert!(parse("count_budget_ms = 0").validate().is_err());
+    }
+
+    /// `graphql.sender_index` (FIX-2) defaults to true and parses `false`.
+    #[test]
+    fn sender_index_parses_and_defaults() {
+        let parse = |g: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[graphql]\n{g}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        assert!(parse("").graphql.sender_index);
+        let c = parse("sender_index = false");
+        c.validate().unwrap();
+        assert!(!c.graphql.sender_index);
     }
 
     /// The ws opening borrow is `ws_subs_per_conn + 2` (R-P5P9-57): the bound keeps it inside

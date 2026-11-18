@@ -533,7 +533,10 @@ fn key_filter(
 }
 
 /// The list behind `transactions(...)`. GQ-19 (R-P5P9-57 M1): `accountName` lists the txs
-/// the account sent (`meta.sender`), as the oracle does, filtered on top of the postings.
+/// the account sent (`meta.sender`), as the oracle does: the account's `sndr` postings (with
+/// `fungibleName`, intersected with its `xfer` postings) when the view is sender-ready
+/// (FIX-2), else its `acct`/`xfer` postings filtered on the record's sender. With
+/// `requestKey` or `blockHash` the source is that key or block, filtered on the sender.
 fn transactions_spec(
     account_name: Option<&str>,
     block_hash: Option<&str>,
@@ -542,8 +545,13 @@ fn transactions_spec(
     (min_height, max_height, minimum_depth): (Option<i32>, Option<i32>, Option<i32>),
     request_key: Option<&str>,
 ) -> Result<ListSpec> {
+    let source = match list_source(account_name, fungible_name, block_hash, request_key)? {
+        SourceSpec::Acct(a) => SourceSpec::Sndr(a),
+        SourceSpec::Xfer { account, module } => SourceSpec::SndrXfer { account, module },
+        s => s,
+    };
     Ok(ListSpec {
-        source: list_source(account_name, fungible_name, block_hash, request_key)?,
+        source,
         filter: key_filter(chain_id, min_height, max_height, minimum_depth, true)?,
         rows: Rows::Txs {
             sender: account_name.map(str::to_owned),
@@ -1536,6 +1544,10 @@ mod cgfix_tests {
         )
         .unwrap();
         assert!(matches!(&with_token.rows, Rows::Txs { sender: Some(s), .. } if s == "k:a"));
+        // FIX-2: sender sources, so a sender-ready view reads the `sndr` postings.
+        assert!(matches!(&spec.source, SourceSpec::Sndr(a) if a == "k:a"));
+        assert!(matches!(&with_token.source,
+            SourceSpec::SndrXfer { account, module } if account == "k:a" && module == "coin"));
         let by_block = transactions_spec(
             None,
             Some("lYOEd2WyPiTx_bfiTIbwRH2N4beFtFtQuNRZA2umjyo"),

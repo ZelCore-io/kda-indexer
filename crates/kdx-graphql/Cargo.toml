@@ -29,4 +29,5 @@ libc.workspace = true
 proptest.workspace = true
 tokio-tungstenite = "0.29"
 tempfile.workspace = true
+toml.workspace = true
 tower.workspace = true

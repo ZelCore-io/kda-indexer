@@ -73,6 +73,7 @@ pub fn api(
     tips: TipWatch,
     data_dir: &Path,
 ) -> anyhow::Result<Api> {
+    store.set_sender_index(cfg.graphql.sender_index);
     let settings = kdx_api::compat::SearchSettings {
         min_len: cfg.search.min_len as usize,
         max_scan_heights: cfg.search.max_scan_heights,

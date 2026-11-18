@@ -80,6 +80,9 @@ pub struct Store {
     dict_reloading: AtomicBool,
     /// Network and genesis heights from `Meta` (empty until ingest writes the chain graph).
     genesis: ArcSwap<Genesis>,
+    /// `[graphql] sender_index` (FIX-2): serve sender lists from the `sndr` postings when
+    /// the view is sender-ready. `false` forces the old path (the on-host equivalence check).
+    sender_index: AtomicBool,
 }
 
 /// Network id and the genesis height of every chain, from the hot store's `network` and
@@ -168,7 +171,14 @@ impl Store {
             }),
             dict_reloading: AtomicBool::new(false),
             genesis: ArcSwap::from_pointee(genesis),
+            sender_index: AtomicBool::new(true),
         })
+    }
+
+    /// `[graphql] sender_index`: `false` makes every view answer sender lists by the old
+    /// path (the account's postings filtered on `meta.sender`), whatever the store holds.
+    pub fn set_sender_index(&self, on: bool) {
+        self.sender_index.store(on, Ordering::Relaxed);
     }
 
     /// The hot store (tests write fixtures through it).
@@ -260,6 +270,7 @@ impl Store {
                 dict: self.dict.load().mem.clone(),
                 born: Instant::now(),
                 memo: ListMemo::new(),
+                sender_index: self.sender_index.load(Ordering::Relaxed),
             });
         }
     }
@@ -373,6 +384,8 @@ pub struct View {
     /// view (k-way merges of event-name lists, the token then coin pass of `/v1/txs`, a
     /// resume inside a page) parse its header once. Capped at 64 MB.
     memo: ListMemo,
+    /// The store's `sender_index` switch when the view opened.
+    sender_index: bool,
 }
 
 impl Drop for View {
@@ -392,6 +405,16 @@ impl View {
     }
     fn hot(&self, h: u32) -> bool {
         h >= self.hot_floor()
+    }
+
+    /// Whether sender lists can read the `sndr` postings (FIX-2): the switch is on, every
+    /// open range has its `sndr.pst` and every hot tx carries its `sndr` posting
+    /// (`Meta sndr_hot = 1`). Otherwise a sender list is the account's `acct` (or `xfer`)
+    /// postings filtered on the record's `meta.sender`. Sets `kdx_sender_index_ready`.
+    pub fn sender_ready(&self) -> ApiResult<bool> {
+        let ready = self.seg.sender_ready() && kdx_hot::sndr::hot_ready(&self.txn)?;
+        kdx_metrics::get().sender_index_ready.set(i64::from(ready));
+        Ok(ready && self.sender_index)
     }
 
     pub fn check_deadline(&self) -> ApiResult<()> {

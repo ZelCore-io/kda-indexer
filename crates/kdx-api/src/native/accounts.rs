@@ -101,9 +101,13 @@ pub async fn txs(st: St, path: PathS, q: QueryQ) -> Response {
         let Some(a) = view.dict().account_id(account) else {
             return list_response(view, vec![], None);
         };
-        let keys = candidates(view, Family::Acct, u64::from(a), &lp)?;
+        // The sender index answers `role=sender` from its own postings (FIX-2); until it is
+        // complete, the account's postings filtered on the record's `meta.sender`.
+        let by_sndr = sender_only && view.sender_ready()?;
+        let fam = if by_sndr { Family::Sndr } else { Family::Acct };
+        let keys = candidates(view, fam, u64::from(a), &lp)?;
         let (items, next) = tx_rows(view, keys, &lp, |r| {
-            if !sender_only {
+            if !sender_only || by_sndr {
                 return true;
             }
             shapes::cmd_value(r)

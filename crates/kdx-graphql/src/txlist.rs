@@ -239,6 +239,12 @@ pub enum SourceSpec {
     Acct(String),
     /// Txs with a transfer of `module` on the account's side (`xfer` postings).
     Xfer { account: String, module: String },
+    /// Txs the account sent (`meta.sender`): its `sndr` postings when the view is
+    /// sender-ready (FIX-2), else its `acct` postings (the rows keep the sender filter).
+    Sndr(String),
+    /// Txs the account sent with a transfer of `module` on its side: the intersection of its
+    /// `sndr` and `xfer` postings when the view is sender-ready, else the `xfer` postings.
+    SndrXfer { account: String, module: String },
     /// Txs emitting a qualified event (`evt` postings of the event name).
     EvtName(String),
     /// Txs signed by a public key (`pk` postings).
@@ -438,26 +444,74 @@ pub struct ListSpec {
 
 enum Src {
     Post(Family, u64),
+    /// Keys in both posting lists (a merge-intersection of two newest-first walks).
+    And((Family, u64), (Family, u64)),
     Rk(Hash32),
     Block(u8, u32),
     Heights,
     Empty,
 }
 
-fn resolve(view: &View, s: &SourceSpec) -> ApiResult<Src> {
+/// The key source and row rule of `spec` in `view`. A sender source on a sender-ready view
+/// reads the `sndr` postings, which hold exactly the txs a sender filter keeps, so its rows
+/// drop that filter (a count is then a key-only walk). Otherwise it is the old path: the
+/// account's `acct` (or `xfer`) postings with the rows' sender filter.
+fn plan(view: &View, spec: &ListSpec) -> ApiResult<(Src, Rows)> {
+    let sender = matches!(
+        spec.source,
+        SourceSpec::Sndr(_) | SourceSpec::SndrXfer { .. }
+    );
+    if sender && view.sender_ready()? {
+        let rows = match &spec.rows {
+            Rows::Txs { sender: _, nft } => Rows::Txs {
+                sender: None,
+                nft: *nft,
+            },
+            r => r.clone(),
+        };
+        return Ok((resolve_sndr(view, &spec.source), rows));
+    }
+    Ok((resolve(view, &spec.source)?, spec.rows.clone()))
+}
+
+/// The `sndr` source of a sender spec (the view is sender-ready).
+fn resolve_sndr(view: &View, s: &SourceSpec) -> Src {
     let d = view.dict();
-    Ok(match s {
-        SourceSpec::Acct(a) => match d.find(DictKind::Account, a) {
-            Some(id) => Src::Post(Family::Acct, u64::from(id)),
+    match s {
+        SourceSpec::Sndr(a) => match d.find(DictKind::Account, a) {
+            Some(id) => Src::Post(Family::Sndr, u64::from(id)),
             None => Src::Empty,
         },
-        SourceSpec::Xfer { account, module } => match (
+        SourceSpec::SndrXfer { account, module } => match (
             d.find(DictKind::Account, account),
             d.find(DictKind::Module, module),
         ) {
-            (Some(a), Some(m)) => Src::Post(Family::Xfer, xfer_entity(a, m)),
+            (Some(a), Some(m)) => Src::And(
+                (Family::Sndr, u64::from(a)),
+                (Family::Xfer, xfer_entity(a, m)),
+            ),
             _ => Src::Empty,
         },
+        _ => Src::Empty,
+    }
+}
+
+fn resolve(view: &View, s: &SourceSpec) -> ApiResult<Src> {
+    let d = view.dict();
+    Ok(match s {
+        SourceSpec::Acct(a) | SourceSpec::Sndr(a) => match d.find(DictKind::Account, a) {
+            Some(id) => Src::Post(Family::Acct, u64::from(id)),
+            None => Src::Empty,
+        },
+        SourceSpec::Xfer { account, module } | SourceSpec::SndrXfer { account, module } => {
+            match (
+                d.find(DictKind::Account, account),
+                d.find(DictKind::Module, module),
+            ) {
+                (Some(a), Some(m)) => Src::Post(Family::Xfer, xfer_entity(a, m)),
+                _ => Src::Empty,
+            }
+        }
         SourceSpec::EvtName(q) => match d.find(DictKind::EventName, q) {
             Some(id) => Src::Post(Family::Evt, u64::from(id)),
             None => Src::Empty,
@@ -585,6 +639,19 @@ fn keys<'v>(
                     .map(|r| r.map(|k| (k, None))),
             )
         }
+        Src::And((fa, ea), (fb, eb)) => {
+            let q = PostingQuery {
+                min_height: min_h,
+                max_height: max_h,
+                chain: f.chain,
+                before: b.upto.map(through_tx),
+            };
+            Box::new(
+                IntersectDesc::new(view.postings(*fa, *ea, q)?, view.postings(*fb, *eb, q)?)
+                    .filter(move |r| r.as_ref().map_or(true, |k| keep(*k)))
+                    .map(|r| r.map(|k| (k, None))),
+            )
+        }
         Src::Rk(rk) => listed(view.txs_by_rk(rk)?),
         Src::Block(c, h) => listed(
             view.block_txs(*c, *h)?
@@ -635,6 +702,66 @@ fn keys<'v>(
     })
 }
 
+/// The keys two newest-first (strictly descending) key streams share, newest first. The
+/// first error ends it.
+struct IntersectDesc<A, B> {
+    a: A,
+    b: B,
+    done: bool,
+}
+
+impl<A, B> IntersectDesc<A, B> {
+    fn new(a: A, b: B) -> Self {
+        IntersectDesc { a, b, done: false }
+    }
+}
+
+impl<A, B> Iterator for IntersectDesc<A, B>
+where
+    A: Iterator<Item = ApiResult<TxKey>>,
+    B: Iterator<Item = ApiResult<TxKey>>,
+{
+    type Item = ApiResult<TxKey>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let r = intersect_next(&mut self.a, &mut self.b);
+        if !matches!(r, Some(Ok(_))) {
+            self.done = true;
+        }
+        r
+    }
+}
+
+/// The next key both streams hold (descending), an error, or `None` when one is exhausted.
+fn intersect_next(
+    a: &mut impl Iterator<Item = ApiResult<TxKey>>,
+    b: &mut impl Iterator<Item = ApiResult<TxKey>>,
+) -> Option<ApiResult<TxKey>> {
+    let mut x = match a.next()? {
+        Ok(k) => k,
+        Err(e) => return Some(Err(e)),
+    };
+    let mut y = match b.next()? {
+        Ok(k) => k,
+        Err(e) => return Some(Err(e)),
+    };
+    loop {
+        // Descending: the larger key cannot be in the other stream any more.
+        let (it, cur): (&mut dyn Iterator<Item = ApiResult<TxKey>>, &mut TxKey) = match x.cmp(&y) {
+            std::cmp::Ordering::Equal => return Some(Ok(x)),
+            std::cmp::Ordering::Greater => (a, &mut x),
+            std::cmp::Ordering::Less => (b, &mut y),
+        };
+        match it.next()? {
+            Ok(k) => *cur = k,
+            Err(e) => return Some(Err(e)),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Pages and counts
 
@@ -664,7 +791,7 @@ pub fn run_page(
     deadline: Instant,
 ) -> ApiResult<(Vec<(String, Item)>, PageInfo)> {
     let cur = tx_cursor(view, page)?;
-    let src = resolve(view, &spec.source)?;
+    let (src, rows) = plan(view, spec)?;
     let caps = Caps::of(view, &spec.filter)?;
     let mut blocks = Blocks::default();
     let mut walked: Vec<(String, Item)> = Vec::new();
@@ -680,7 +807,7 @@ pub fn run_page(
                 let Some(d) = load(view, k, rec, &mut blocks)? else {
                     continue;
                 };
-                let mut rs = spec.rows.rows(&d);
+                let mut rs = rows.rows(&d);
                 rs.reverse();
                 for (sub, it) in rs {
                     if cur.is_some_and(|c| c.key == k && sub >= c.sub) {
@@ -717,7 +844,7 @@ pub fn run_page(
                 let Some(d) = load(view, k, None, &mut blocks)? else {
                     continue;
                 };
-                for (sub, it) in spec.rows.rows(&d) {
+                for (sub, it) in rows.rows(&d) {
                     if cur.is_some_and(|c| c.key == k && sub <= c.sub) {
                         continue;
                     }
@@ -742,10 +869,10 @@ pub fn count_until(now: Instant, dl: Instant, budget: Duration) -> Instant {
 /// Items of `spec`, up to [`COUNT_CAP`], and whether the count is exact: when `until`
 /// passes first, the items counted so far (a lower bound) and `false`.
 pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bool)> {
-    let src = resolve(view, &spec.source)?;
+    let (src, rows) = plan(view, spec)?;
     let caps = Caps::of(view, &spec.filter)?;
     let mut blocks = Blocks::default();
-    let decode = spec.rows.needs_record();
+    let decode = rows.needs_record();
     let mut n = 0u64;
     // A decoded record costs ~1 ms cold, so the clock is read before each one; a key-only
     // walk reads it every `CHECK_EVERY` keys.
@@ -757,7 +884,7 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bo
         let (k, rec) = kr?;
         if decode {
             if let Some(d) = load(view, k, rec, &mut blocks)? {
-                n += spec.rows.rows(&d).len() as u64;
+                n += rows.rows(&d).len() as u64;
             }
         } else {
             n += 1;
@@ -1003,8 +1130,14 @@ async fn list_as(
         && selects_direct(ctx, &["totalCount"]);
     // The time budget bounds an account's count walk only (its postings are long and decode
     // cold); every other count keeps half of the remaining deadline.
-    let count_budget = matches!(spec.source, SourceSpec::Acct(_) | SourceSpec::Xfer { .. })
-        .then_some(g.settings.count_budget);
+    let count_budget = matches!(
+        spec.source,
+        SourceSpec::Acct(_)
+            | SourceSpec::Xfer { .. }
+            | SourceSpec::Sndr(_)
+            | SourceSpec::SndrXfer { .. }
+    )
+    .then_some(g.settings.count_budget);
     let sp = spec.clone();
     let (edges, info, exact) = read_list(&state, one_block, move |view| {
         let dl = dl.min(Instant::now() + SCAN_WINDOW);
@@ -1195,6 +1328,39 @@ mod tests {
         assert!(name_arg("accountName", "").is_err());
         assert!(name_arg("accountName", &"a".repeat(513)).is_err());
         assert!(hash_arg("requestKey", "short").is_err());
+    }
+}
+
+#[cfg(test)]
+mod intersect_tests {
+    use super::*;
+
+    fn keys(v: &[u64]) -> Vec<ApiResult<TxKey>> {
+        v.iter().map(|&k| Ok(TxKey(k))).collect()
+    }
+
+    fn run(a: Vec<ApiResult<TxKey>>, b: Vec<ApiResult<TxKey>>) -> Vec<Result<u64, String>> {
+        IntersectDesc::new(a.into_iter(), b.into_iter())
+            .map(|r| r.map(|k| k.0).map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    /// FIX-2: the `sndr` ∩ `xfer` walk keeps the shared keys, newest first, and stops at the
+    /// end of either stream or at the first error.
+    #[test]
+    fn intersection_of_descending_streams() {
+        let ok = |v: &[u64]| v.iter().map(|&k| Ok(k)).collect::<Vec<_>>();
+        assert_eq!(run(keys(&[9, 7, 5, 3]), keys(&[8, 7, 3, 1])), ok(&[7, 3]));
+        assert_eq!(run(keys(&[9, 7]), keys(&[6, 5])), ok(&[]));
+        assert_eq!(run(keys(&[]), keys(&[6, 5])), ok(&[]));
+        assert_eq!(run(keys(&[4, 3, 2]), keys(&[4, 3, 2])), ok(&[4, 3, 2]));
+        let mut b = keys(&[9]);
+        b.push(Err(ApiError::Deadline));
+        b.extend(keys(&[5]));
+        let r = run(keys(&[9, 5]), b);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0], Ok(9));
+        assert!(r[1].is_err());
     }
 }
 

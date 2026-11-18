@@ -342,6 +342,19 @@ the oracle puts them.
   `minimumDepth` (height ≤ the chain's tip − depth) filter any source. With `accountName`,
   only the txs the account sent (`meta.sender`) are listed and counted, as the oracle does
   (GQ-19, R-P5P9-57 M1).
+- **Sender lists and the sender index (FIX-2).** `transactions(accountName)`,
+  `transactions(accountName, fungibleName)` and `FungibleChainAccount.transactions` read the
+  account's `sndr` postings (with `fungibleName`, a merge of its `sndr` and `xfer` postings)
+  once the sender index is complete: every segment range has its `sndr.pst` and the hot
+  store has `sndr_hot = 1` (gauge `kdx_sender_index_ready`). No record is decoded to pick
+  the rows, so a receive-heavy account answers as fast as any other, and `totalCount` is a
+  key-only walk. Until then (a store before `segments add-index`) the old path serves: the
+  account's `acct` (or `xfer`) postings filtered on each record's `meta.sender`, which a
+  receive-heavy account can run past the 1 s scan window (`TIMEOUT`, no data). Both paths
+  answer the same edges, cursors, `pageInfo` and `totalCount`. `[graphql] sender_index =
+  false` forces the old path (default `true`; used to compare the two on a host); it also
+  applies to REST `role=sender`. With `requestKey` or `blockHash` the sender filter runs on
+  that key's or block's txs, as before.
 - **`transfers`** use the same sources; rows are the tx's transfers of `fungibleName` with
   `accountName` on either side when given. `crossChainTransfer` is the other half of a
   cross-chain transfer (the `cont` step of the pact, or the tx that started it), `null`
@@ -356,7 +369,7 @@ the oracle puts them.
   bounded further by `count_budget_ms` (200 ms by default, counted from when the read
   starts), whichever is sooner; other lists keep the half-deadline limit. Larger lists show 10,000. Cold records decode
   at about 1 ms each, so an account with more than a few hundred rows to decode answers a
-  lower bound. When the time share runs out, `totalCount` answers the rows counted so far (a
+  lower bound. A sender list served from the sender index counts keys only, no decode. When the time share runs out, `totalCount` answers the rows counted so far (a
   lower bound, never below the edges served), the edges are kept, and the response carries
   `"extensions": {"totalCountLowerBound": true}` (R-P5P9-14).
 - **Text forms.** `goodResult`, `badResult`, `continuation`, `metadata`, `Event.parameters`,

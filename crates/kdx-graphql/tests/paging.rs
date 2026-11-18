@@ -250,6 +250,9 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
             .unwrap();
     }
     kdx_hot::nft::upsert_event(&mut t, alice, "t:2", 0, ledger, 12, "1.0").unwrap();
+    // Every tx carries its `sndr` posting (the tail wrote them, the steps hold `sndr.pst`):
+    // sender lists read the sender index (FIX-2).
+    t.set_meta_u64(kdx_hot::env::meta::SNDR_HOT, 1).unwrap();
     t.commit().unwrap();
 
     let store = Arc::new(Store::open(hot, d.path()).unwrap());
@@ -943,7 +946,9 @@ mod count_budget {
     }
 
     /// A budget that is spent before the walk reads a key stops it at once: a flagged lower
-    /// bound that never exceeds the true count (the page itself is still served).
+    /// bound that never exceeds the true count (the page itself is still served). A sender
+    /// list read from the sender index (FIX-2) is a key-only walk that reads the clock every
+    /// 64 keys, so the fixture's few keys are counted exactly even with a spent budget.
     #[tokio::test]
     async fn a_spent_budget_answers_a_flagged_lower_bound() {
         let exact = fixture();
@@ -951,7 +956,9 @@ mod count_budget {
             count_budget: Duration::ZERO,
             ..GraphqlSettings::default()
         });
-        for q in QUERIES {
+        let (full, _) = total(&exact.schema, QUERIES[1]).await;
+        assert_eq!(total(&cut.schema, QUERIES[1]).await, (full, false));
+        for q in &QUERIES[..1] {
             let (full, _) = total(&exact.schema, q).await;
             let (n, flagged) = total(&cut.schema, q).await;
             assert!(flagged, "{q}: a cut count carries totalCountLowerBound");

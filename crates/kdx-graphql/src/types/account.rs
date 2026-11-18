@@ -457,7 +457,8 @@ impl FungibleChainAccount {
         last: Option<i32>,
     ) -> Result<FungibleChainAccountTransactionsConnection> {
         let spec = ListSpec {
-            source: SourceSpec::Acct(self.account.clone()),
+            // The `sndr` postings on a sender-ready view (FIX-2), else `acct` + the filter.
+            source: SourceSpec::Sndr(self.account.clone()),
             filter: KeyFilter {
                 chain: Some(self.row.chain),
                 user_only: true,

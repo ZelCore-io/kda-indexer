@@ -320,6 +320,7 @@ node_exporter textfile when `metrics.textfile` is set (see [install.md](install.
 | `kdx_segment_optional_missing_total` | file (sndr, kf): a file `range.toml` lists is missing at range open |
 | `kdx_key_filter_untrusted_total` | none: a `kf.fil` failed its checks at open; the range is probed without it |
 | `kdx_key_filter_bytes` | none: key filter memory of the newest segment view |
+| `kdx_sender_index_ready` | none: 1 when sender lists read the `sndr` postings (every range has `sndr.pst`, hot `sndr_hot = 1`), 0 while they use the old scan; `[graphql] sender_index = false` forces the old scan whatever this shows |
 | `kdx_disk_free_bytes` | |
 | `kdx_mdbx_commit_seconds` | |
 | `kdx_http_requests_total`, `kdx_http_request_seconds` | api, route, status |

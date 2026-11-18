@@ -106,6 +106,9 @@ pub struct Metrics {
     pub key_filter_untrusted: Counter,
     /// Bytes of key filters held in memory by the newest segment view.
     pub key_filter_bytes: Gauge,
+    /// 1 when the last sender list's view had the sender index complete (every range's
+    /// `sndr.pst` and `Meta sndr_hot = 1`), else 0 (FIX-2).
+    pub sender_index_ready: Gauge,
 }
 
 impl Metrics {
@@ -346,6 +349,11 @@ impl Metrics {
             "Bytes of range key filters held in memory",
             Gauge::default()
         );
+        let sender_index_ready = reg!(
+            "kdx_sender_index_ready",
+            "1 when sender lists read the sndr postings (index complete), else 0",
+            Gauge::default()
+        );
         Metrics {
             registry: r,
             build_info,
@@ -394,6 +402,7 @@ impl Metrics {
             segment_optional_missing,
             key_filter_untrusted,
             key_filter_bytes,
+            sender_index_ready,
         }
     }
 
