@@ -75,6 +75,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "filter_from_bytes"
+path = "fuzz_targets/filter_from_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "manifest_parse"
 path = "fuzz_targets/manifest_parse.rs"
 test = false

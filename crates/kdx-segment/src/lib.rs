@@ -8,6 +8,7 @@ pub mod content;
 pub mod ef;
 pub mod etl;
 pub mod files;
+pub mod filter;
 pub mod keys;
 pub mod manifest;
 pub mod phf;

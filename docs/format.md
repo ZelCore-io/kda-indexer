@@ -490,6 +490,36 @@ PtrHash construction is deterministic: the global seed sequence is fixed upstrea
 pilot search uses a fixed per-part seed (a change in the vendored `ptr_hash`), so two builds
 of the same keys give byte-identical files.
 
+## `kf.fil`
+
+Key filters of one range: a Binary Fuse 8 filter over the 8-byte key prefixes (the same
+big-endian u64 prefix as `rk.idx` and `bh.idx`) of its block hashes and another of its request
+keys. A lookup skips a range whose filter says no. The file is optional (present when
+`range.toml` lists it) and is read into memory when the range is opened.
+
+```
+[4]  "KDXF"   u8 version = 1   filter (block hashes)   filter (request keys)
+filter: u64 seed   u32 segment_length   u32 segment_count_length   u64 n_keys
+        u64 fp_len   [fp_len] fingerprints
+```
+
+- `n_keys` counts distinct prefixes (duplicates are removed before construction).
+- An empty key set has `n_keys = 0`, `fp_len = 0` and contains nothing.
+- Otherwise `segment_length` is a power of two up to 2^18, `segment_count_length` a non-zero
+  multiple of it, `fp_len = segment_count_length + 2 * segment_length`, and
+  `1 <= n_keys <= fp_len`. A reader rejects anything else, any truncation and any trailing
+  bytes (fail-closed).
+- A query hashes `key + seed` (wrapping) with the Murmur3 64-bit finaliser, takes
+  `h0 = (hash * segment_count_length) >> 64`, `h1 = (h0 + segment_length) ^ ((hash >> 18) &
+  (segment_length - 1))`, `h2 = (h0 + 2 * segment_length) ^ (hash & (segment_length - 1))`, and
+  answers yes when `fp(hash) ^ f[h0] ^ f[h1] ^ f[h2] == 0`, where `fp(hash) = (hash ^ (hash >> 32))
+  as u8`.
+- Cost: 1.125 bytes per key (9.0 bits) from one million keys, a false positive rate of about
+  0.39 %, no false negatives. Construction checks every input key against the finished filter
+  and fails rather than write a filter that misses one.
+- The seed comes from a fixed sequence (splitmix64 from state 1, first peelable seed wins), so
+  two builds of the same key set are byte-identical.
+
 ## Posting files (`.pst`)
 
 One file per family per range. Families and their entity keys:
