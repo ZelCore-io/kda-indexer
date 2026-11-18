@@ -592,6 +592,59 @@ mod budget_ceiling {
             .collect();
         let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
         assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        // The holdings are read when the account resolves, so the account itself is priced
+        // per row, whatever is selected of it (security pass on part E).
+        let a: String = (0..n)
+            .map(|i| format!("a{i}: nonFungibleAccount(accountName: \"k:x\") {{ accountName }} "))
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        let a: String = (0..n)
+            .map(|i| {
+                format!("a{i}: nonFungibleChainAccount(accountName: \"k:x\", chainId: \"0\") {{ chainId }} ")
+            })
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        // `node`/`nodes` with NFT ids: each id one holdings read.
+        use kdx_graphql::ids::{encode, NodeKey};
+        let nft = |i: usize| {
+            encode(&NodeKey::NonFungibleAccount {
+                account: format!("k:{i}"),
+            })
+        };
+        let ids = |r: std::ops::Range<usize>| {
+            r.map(|i| format!("\"{}\"", nft(i)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let half = n / 2 + 1;
+        let q = format!(
+            "{{ a: nodes(ids: [{}]) {{ id }} b: nodes(ids: [{}]) {{ id }} }}",
+            ids(0..half),
+            ids(half..2 * half)
+        );
+        let (s, v, _) = query(&f, &q).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        let a: String = (0..n)
+            .map(|i| format!("a{i}: node(id: \"{}\") {{ id }} ", nft(i)))
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        // Ids of other types stay cheap.
+        let blocks: Vec<String> = (0..100)
+            .map(|i| {
+                format!(
+                    "\"{}\"",
+                    encode(&NodeKey::Block {
+                        hash: format!("h{i}")
+                    })
+                )
+            })
+            .collect();
+        let q = format!("{{ nodes(ids: [{}]) {{ id }} }}", blocks.join(", "));
+        let (_, v, _) = query(&f, &q).await;
+        assert_eq!(limit_of(&v), None, "{v}");
         // The explorer's own document (one account) is served.
         let one = "query NonFungibleAccount($accountName: String!) { nonFungibleAccount(accountName: $accountName) { nonFungibleTokenBalances { balance chainId tokenId info { precision supply uri } guard { ... on KeysetGuard { keys predicate } } } } }";
         let (s, v, _) = post(

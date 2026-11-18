@@ -169,8 +169,10 @@ rows a request reads. It prices a page as served, with the same function the res
 page with: as asked up to 1,000; absent, `first: 0` or `last: 0` without a cursor at
 `default_page` (20), at every nesting level; with a cursor the count as given (`after` with
 `first: 0` costs 0). A page variable bound to nothing, a subscription's `quantity` and the ids
-of `nodes` are priced at the most served (1,000), an account's NFT holdings at 10,000 rows (one
-details read each). A request above the safety ceiling of 1,100,000 is refused with `budget`
+of `nodes` are priced at the most served (1,000). An account's NFT holdings are read when the
+account resolves, so `nonFungibleAccount`, `nonFungibleChainAccount` and every NFT id given to
+`node`/`nodes` (or an id only a variable gives) cost 10,000 rows (one details read each)
+whatever is selected, and `nonFungibleTokenBalances` 10,000 more for the rows it answers. A request above the safety ceiling of 1,100,000 is refused with `budget`
 before anything runs; a batch counts the sum of its operations. The ceiling is 11 times the
 largest budget of the explorer operation documents in [data/explorer-ops.md](data/explorer-ops.md)
 and the compare suite's documents, priced with no variables bound, so every page variable at

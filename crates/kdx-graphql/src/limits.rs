@@ -322,6 +322,12 @@ impl<'a> Walk<'a> {
                         "edges" if wrap == Wrap::Conn => 0,
                         "node" if wrap == Wrap::Edges => 0,
                         "crossChainTransfer" if self.xchain > 0 => NESTED_XCHAIN_COST,
+                        // The holdings are read when the account resolves, whatever is
+                        // selected of it: one read per row up to the cap (part E, S1).
+                        "nonFungibleAccount" | "nonFungibleChainAccount" if ty == Some("Query") => {
+                            crate::MAX_NFT_HOLDINGS as u64
+                        }
+                        "node" | "nodes" if ty == Some("Query") => self.node_reads(f),
                         "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
                             self.s.default_page.min(self.s.max_page) as u64
                         }
@@ -459,6 +465,34 @@ impl<'a> Walk<'a> {
         }) {
             Ok(v) => Arg::Val(v),
             Err(()) => Arg::Unbound,
+        }
+    }
+
+    /// What the ids of `node(id)` / `nodes(ids)` read (security pass on part E): an NFT id
+    /// (or one not known before the request runs) reads the account's holdings, up to
+    /// [`crate::MAX_NFT_HOLDINGS`] rows; any other id (or one that does not decode) 1.
+    fn node_reads(&self, f: &'a Field) -> u64 {
+        let holdings = crate::MAX_NFT_HOLDINGS as u64;
+        let one = |v: &Value| match v {
+            Value::String(id) => match crate::ids::decode(id) {
+                Ok(
+                    crate::ids::NodeKey::NonFungibleAccount { .. }
+                    | crate::ids::NodeKey::NonFungibleChainAccount { .. }
+                    | crate::ids::NodeKey::NonFungibleTokenBalance { .. },
+                ) => holdings,
+                _ => 1,
+            },
+            Value::Null => 1,
+            _ => holdings,
+        };
+        let unbound = (crate::types::node::MAX_NODES as u64).saturating_mul(holdings);
+        match (self.arg(f, "id"), self.arg(f, "ids")) {
+            (Arg::Val(v), _) => one(&v),
+            (_, Arg::Val(Value::List(l))) => l.iter().map(one).fold(0, u64::saturating_add),
+            (_, Arg::Val(v)) => one(&v),
+            (Arg::Unbound, _) => holdings,
+            (_, Arg::Unbound) => unbound,
+            _ => 1,
         }
     }
 
