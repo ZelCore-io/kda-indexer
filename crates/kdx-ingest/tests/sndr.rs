@@ -317,31 +317,42 @@ fn a_freeze_moves_sndr_rows_into_the_step() {
     );
 }
 
-/// With `Meta sndr_hot = 1` the freezer takes a step's `sndr` postings from the hot rows and
-/// derives nothing: a store whose family-6 rows are gone while the key says ready freezes
-/// steps with empty `sndr` files (which is why the key is only ever set when it is true).
+/// FIX-2 fix 2: the freezer derives every step's `sndr` postings from the records, never
+/// from the hot family-6 rows. A store whose rows are gone while `Meta sndr_hot = 1` says
+/// ready (a rollback that skipped `hot drop-family sndr`) still freezes complete `sndr`
+/// files, byte for byte those of a store whose rows are intact.
 #[test]
-fn the_ready_freezer_reads_sndr_from_the_hot_rows() {
-    let pool = pool();
-    let places = places_for(&[0], 12);
-    let d = tempfile::tempdir().unwrap();
-    let c = ctx(d.path(), 2, 1000, 2);
-    apply_linear(&c, &pool, &places[0].1, 1);
-    {
-        let mut txn = c.hot.rw().unwrap();
-        kdx_hot::sndr::drop_family(&mut txn, Family::Sndr).unwrap();
-        txn.set_meta_u64(kdx_hot::env::meta::SNDR_HOT, 1).unwrap();
-        txn.commit().unwrap();
+fn the_freezer_derives_sndr_even_when_the_hot_rows_are_gone() {
+    let mut stores = Vec::new();
+    for drop_rows in [false, true] {
+        let pool = pool();
+        let places = places_for(&[0], 12);
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path(), 2, 1000, 2);
+        apply_linear(&c, &pool, &places[0].1, 1);
+        if drop_rows {
+            let mut txn = c.hot.rw().unwrap();
+            kdx_hot::sndr::drop_family(&mut txn, Family::Sndr).unwrap();
+            txn.set_meta_u64(kdx_hot::env::meta::SNDR_HOT, 1).unwrap();
+            txn.commit().unwrap();
+        }
+        while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+        let seg =
+            kdx_segment::Segments::open(&c.segdir, std::sync::Arc::new(kdx_types::MemDict::new()))
+                .unwrap();
+        assert!(seg.ranges.len() >= 2);
+        for r in &seg.ranges {
+            assert!(
+                r.sndr.as_ref().unwrap().entities() > 0,
+                "rows dropped {drop_rows}"
+            );
+        }
+        stores.push(seg_files(&c.segdir));
     }
-    while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
-    let seg =
-        kdx_segment::Segments::open(&c.segdir, std::sync::Arc::new(kdx_types::MemDict::new()))
-            .unwrap();
-    assert!(seg.ranges.len() >= 2);
-    for r in &seg.ranges {
-        assert_eq!(r.sndr.as_ref().unwrap().entities(), 0);
-        assert!(r.postings[Family::Acct as usize].entities() > 0);
-    }
+    assert_eq!(
+        stores[0], stores[1],
+        "the hot rows do not change the frozen bytes"
+    );
 }
 
 /// blake3 of every file in a segments dir by name.

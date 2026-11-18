@@ -81,7 +81,27 @@ pub fn list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
 pub fn check(data_dir: &Path, deep: bool) -> anyhow::Result<()> {
     let dir = segments_dir(data_dir);
     let t0 = std::time::Instant::now();
-    let rep = kdx_segment::check(&dir, deep)?;
+    // `--deep` compares every `sndr` list with the txs its entity sent: that needs the hot
+    // dictionary (names to AccountIds). Without a hot store only the senders' presence is
+    // checked.
+    let dict = if deep {
+        match kdx_hot::HotStore::open_ro(&super::hot::hot_dir(data_dir))
+            .and_then(|hs| kdx_hot::HotDict::load(&hs.ro()?))
+        {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!(
+                    "segments check --deep: no hot dictionary ({e:#}): sndr lists are checked \
+                     for missing senders only"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let rep =
+        kdx_segment::check_with(&dir, deep, dict.as_ref().map(|d| d as &dyn kdx_types::Dict))?;
     println!("{}", serde_json::to_string_pretty(&rep)?);
     eprintln!(
         "segments check{}: {} ({} ranges, {:.1}s)",

@@ -170,8 +170,10 @@ pub fn reconcile(ctx: &Ctx) -> Result<()> {
 /// a time (review M4: only the step's posting keys are held in memory). Returns the number
 /// of blocks.
 /// The `sndr` posting of a stored record, derived from the record as `extract` derives it
-/// (`indexed_sender`, then the sender's AccountId). For a step or range whose `sndr` lists
-/// are not stored (an older step, or a hot tail the sender backfill has not run on yet).
+/// (`indexed_sender`, then the sender's AccountId). Every frozen step takes its `sndr`
+/// postings from here, never from the hot family-6 rows (FIX-2 fix 2): a gap in those rows
+/// (a tail written by an older binary after a rollback without `hot drop-family sndr`) would
+/// otherwise become a permanent, silent omission from the step's sender lists.
 fn sender_posting(ctx: &Ctx, r: &TxRecord) -> Result<Option<(Family, u64)>> {
     let Some(s) = indexed_sender(r).map_err(|e| anyhow::anyhow!("cmd of {:?}: {e:?}", r.key))?
     else {
@@ -186,9 +188,8 @@ fn sender_posting(ctx: &Ctx, r: &TxRecord) -> Result<Option<(Family, u64)>> {
 
 fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Result<u64> {
     let txn = ctx.hot.ro()?;
-    // Until the sender backfill has run (`Meta sndr_hot`), older tail blocks have no family-6
-    // rows: the step's `sndr` postings then come from the records, never from a partial set.
-    let derive_sndr = !kdx_hot::sndr::hot_ready(&txn)?;
+    // The step's `sndr` postings always come from the records (see `sender_posting`); the
+    // hot family-6 rows serve queries of the tail only.
     let mut posts: BTreeMap<TxKey, Vec<(Family, u64)>> = BTreeMap::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
@@ -197,7 +198,7 @@ fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Resul
             let key = parse_txkey(&k[9..]).context("posting key")?;
             if key.height() >= start && key.height() < end {
                 let f = Family::from_u8(k[0]).context("posting family")?;
-                if derive_sndr && f == Family::Sndr {
+                if f == Family::Sndr {
                     continue;
                 }
                 let e = u64::from_be_bytes(k[1..9].try_into()?);
@@ -227,9 +228,7 @@ fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Resul
                 .iter()
                 .map(|r| {
                     let mut p = posts.remove(&r.key).unwrap_or_default();
-                    if derive_sndr {
-                        p.extend(sender_posting(ctx, r)?);
-                    }
+                    p.extend(sender_posting(ctx, r)?);
                     p.sort_unstable_by_key(|&(f, e)| (f as u8, e));
                     Ok(TxIndex {
                         key: r.key,

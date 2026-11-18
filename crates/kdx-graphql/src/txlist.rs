@@ -655,8 +655,8 @@ fn keys<'v>(
                     view.postings(*fb, *eb, q)?,
                     b.until,
                 )
-                    .filter(move |r| r.as_ref().map_or(true, |k| keep(*k)))
-                    .map(|r| r.map(|k| (k, None))),
+                .filter(move |r| r.as_ref().map_or(true, |k| keep(*k)))
+                .map(|r| r.map(|k| (k, None))),
             )
         }
         Src::Rk(rk) => listed(view.txs_by_rk(rk)?),
@@ -1429,7 +1429,11 @@ mod intersect_tests {
         let mut it = IntersectDesc::with_until(sndr, xfer, Some(Instant::now()));
         assert!(matches!(it.next(), Some(Err(ApiError::Deadline))));
         assert!(it.next().is_none());
-        assert!(pulled.get() <= 2 * INTERSECT_CHECK as u64, "pulled {}", pulled.get());
+        assert!(
+            pulled.get() <= 2 * INTERSECT_CHECK as u64,
+            "pulled {}",
+            pulled.get()
+        );
         assert!(t0.elapsed() < Duration::from_secs(1));
         // With no deadline the same walk is exact.
         let a = (0..1_000u64).rev().map(|k| Ok(TxKey(k + 10)));

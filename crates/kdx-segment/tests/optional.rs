@@ -334,3 +334,77 @@ fn a_listed_sndr_file_with_a_bad_header_fails_the_open() {
     assert!(s.ranges[0].sndr.is_none() && !s.sender_ready());
     assert!(s.ranges[0].filter.is_some());
 }
+
+/// FIX-2 fix 2: the deep check proves the sender index complete, not only `sndr ⊆ acct`.
+/// Txs 1 and 2 of a block are sent by accounts 0 and 1 (`k:a`, `k:b`). A store whose `sndr`
+/// postings match passes; one where the writer dropped tx 2's posting (as a freeze of hot
+/// rows with a gap would) fails with or without the dictionary; one that posts tx 2 under
+/// the wrong sender fails given the dictionary.
+#[test]
+fn the_deep_check_finds_a_missing_or_wrong_sender_posting() {
+    use kdx_types::DictMut;
+    let mut dict = MemDict::new();
+    let (a, b) = (
+        u64::from(dict.intern(kdx_types::DictKind::Account, "k:a")),
+        u64::from(dict.intern(kdx_types::DictKind::Account, "k:b")),
+    );
+    // `sndr` of tx 2: Some(entity) or none at all.
+    let build = |dir: &Path, tx2_sndr: Option<u64>| {
+        let mut blk = indexed(&Blk {
+            chain: 0,
+            height: 1,
+            hash: h(7, 1),
+            rks: vec![(h(9, 0), a), (h(9, 1), a), (h(9, 2), b)],
+        });
+        for (i, sender) in [(1, "k:a"), (2, "k:b")] {
+            blk.txs[i].cmd = Some(format!(r#"{{"meta":{{"sender":"{sender}"}}}}"#).into_bytes());
+        }
+        // Tx 0 is the coinbase: no sender, no `sndr` posting.
+        blk.idx[0].postings = vec![(Family::Acct, a)];
+        blk.idx[2].postings = vec![(Family::Acct, a), (Family::Acct, b)];
+        blk.idx[2]
+            .postings
+            .extend(tx2_sndr.map(|e| (Family::Sndr, e)));
+        blk.idx[2]
+            .postings
+            .sort_unstable_by_key(|&(f, e)| (f as u8, e));
+        let seg = dir.join("segments");
+        let mut m = Manifest::new(NET);
+        let mut w = RangeWriter::create(
+            &seg,
+            &dir.join("etl"),
+            NET,
+            RangeKind::Step,
+            0,
+            4,
+            0,
+            WriteOpts::new(1, 0),
+        )
+        .unwrap();
+        w.push(&blk).unwrap();
+        m.push(w.finish().unwrap()).unwrap();
+        m.commit(&seg).unwrap();
+        seg
+    };
+    let check = |seg: &Path, d: Option<&dyn kdx_types::Dict>| {
+        let rep = kdx_segment::check_with(seg, true, d).unwrap();
+        (rep.ok(), rep.sndr_incomplete)
+    };
+    let good = tempfile::tempdir().unwrap();
+    let seg = build(good.path(), Some(b));
+    assert_eq!(check(&seg, None), (true, 0));
+    assert_eq!(check(&seg, Some(&dict)), (true, 0));
+
+    let gap = tempfile::tempdir().unwrap();
+    let seg = build(gap.path(), None);
+    assert_eq!(check(&seg, None), (false, 1));
+    assert_eq!(check(&seg, Some(&dict)), (false, 1));
+
+    let wrong = tempfile::tempdir().unwrap();
+    let seg = build(wrong.path(), Some(a));
+    assert_eq!(
+        check(&seg, Some(&dict)),
+        (false, 2),
+        "missing under b, extra under a"
+    );
+}

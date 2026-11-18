@@ -1,15 +1,18 @@
 //! `segments check [--deep]`: manifest consistency, blake3 of every file, TxNum density,
 //! orphan files; `deep` also decodes every record and resolves every rk, bh and posting list,
-//! checks `sndr ⊆ acct` per entity and runs every stored rk/bh key through the range's key
-//! filter (a false negative there would be a 404 for a stored key).
+//! checks `sndr ⊆ acct` per entity, checks that every tx with an indexed sender has its
+//! `sndr` posting (and, given the dictionary, that each `sndr` list is exactly the txs the
+//! entity sent), and runs every stored rk/bh key through the range's key filter (a false
+//! negative there would be a 404 for a stored key).
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
+use kdx_decode::index::indexed_sender;
 use kdx_decode::Family;
 use kdx_types::record::{decode_block_with, decode_tx};
-use kdx_types::Hash32;
+use kdx_types::{Dict, DictKind, Hash32};
 use serde::Serialize;
 
 use crate::blockfile::{row_len, row_record};
@@ -33,6 +36,10 @@ pub struct CheckReport {
     pub filter_misses: u64,
     /// `(sndr entity, tx)` postings with no `acct` posting of the same entity (deep).
     pub sndr_not_in_acct: u64,
+    /// `sndr` postings that are missing or do not belong (deep, ranges with `sndr.pst`): a tx
+    /// with an indexed sender and no `sndr` posting; given the dictionary also a posting under
+    /// another entity than the tx's sender, or of a tx without one.
+    pub sndr_incomplete: u64,
     /// Files of ranges not in the manifest, and leftover temp dirs.
     pub orphan_files: Vec<String>,
     /// Other failures (missing files, unreadable headers, count mismatches), one line each.
@@ -52,12 +59,19 @@ impl CheckReport {
             && self.bh_misses == 0
             && self.filter_misses == 0
             && self.sndr_not_in_acct == 0
+            && self.sndr_incomplete == 0
             && self.orphan_files.is_empty()
             && self.errors.is_empty()
     }
 }
 
 pub fn check(dir: &Path, deep: bool) -> Result<CheckReport> {
+    check_with(dir, deep, None)
+}
+
+/// [`check`]; with `dict` (the hot dictionary) the deep check compares every `sndr` list with
+/// the txs its entity sent, both ways. Without it, only that every sender has a posting.
+pub fn check_with(dir: &Path, deep: bool, dict: Option<&dyn Dict>) -> Result<CheckReport> {
     let mut rep = CheckReport {
         deep,
         ..Default::default()
@@ -107,7 +121,7 @@ pub fn check(dir: &Path, deep: bool) -> Result<CheckReport> {
         }
         if deep {
             match RangeReader::open(dir, e, &m.network) {
-                Ok(r) => deep_range(&r, &mut rep),
+                Ok(r) => deep_range(&r, dict, &mut rep),
                 Err(err) => rep.errors.push(format!("{}..{}: {err:#}", e.start, e.end)),
             }
         }
@@ -127,9 +141,11 @@ pub fn check(dir: &Path, deep: bool) -> Result<CheckReport> {
     Ok(rep)
 }
 
-fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
+fn deep_range(r: &RangeReader, dict: Option<&dyn Dict>, rep: &mut CheckReport) {
     let tag = format!("{}..{}", r.info.start, r.info.end);
     let mut cand = Vec::new();
+    // `(rel, sender's AccountId or u64::MAX when unknown)` of every tx with an indexed sender.
+    let mut senders: Vec<(u32, u64)> = Vec::new();
     // A listed optional file the reader did not take (missing, or a key filter it does not
     // trust) is a finding: the range works, but slower or without the sender view.
     for (k, loaded) in [
@@ -167,6 +183,33 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
                         if rep.errors.len() < 50 {
                             rep.errors
                                 .push(format!("{tag} tx {rel}: key {:?} != keys.ef", tx.key));
+                        }
+                    }
+                    if r.sndr.is_some() {
+                        match indexed_sender(&tx) {
+                            Ok(Some(name)) => {
+                                let id = dict.map_or(Some(u64::MAX), |d| {
+                                    d.find(DictKind::Account, &name).map(u64::from)
+                                });
+                                match id {
+                                    Some(id) => senders.push((rel as u32, id)),
+                                    None => {
+                                        rep.sndr_incomplete += 1;
+                                        if rep.errors.len() < 50 {
+                                            rep.errors.push(format!(
+                                                "{tag} tx {rel}: sender is not in the dictionary"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                rep.deep_decode_errors += 1;
+                                if rep.errors.len() < 50 {
+                                    rep.errors.push(format!("{tag} tx {rel}: cmd: {e:?}"));
+                                }
+                            }
                         }
                     }
                     if let Some(rk) = &tx.request_key {
@@ -285,6 +328,86 @@ fn deep_range(r: &RangeReader, rep: &mut CheckReport) {
         }
     }
     sndr_within_acct(r, &tag, rep);
+    sndr_complete(r, &tag, senders, dict.is_some(), rep);
+}
+
+/// Every tx with an indexed sender (`senders`, ascending by rel) has a `sndr` posting; with
+/// the dictionary (`exact`), under its sender's entity, and no other posting exists: each
+/// `sndr` list is exactly the txs its entity sent (`sndr` = the sender subset of `acct`).
+fn sndr_complete(
+    r: &RangeReader,
+    tag: &str,
+    mut senders: Vec<(u32, u64)>,
+    exact: bool,
+    rep: &mut CheckReport,
+) {
+    let Some(sndr) = &r.sndr else {
+        return;
+    };
+    let mut have: Vec<(u32, u64)> = Vec::new();
+    for i in 0..sndr.entities() {
+        let ent = sndr.entity_at(i);
+        let Ok(list) = sndr.list_at(i) else {
+            continue; // counted above
+        };
+        have.extend(list.into_iter().map(|rel| (rel, ent)));
+    }
+    have.sort_unstable();
+    senders.sort_unstable();
+    let (mut missing, mut extra) = (0u64, 0u64);
+    let mut first: Option<String> = None;
+    if exact {
+        let (mut i, mut j) = (0, 0);
+        while i < senders.len() || j < have.len() {
+            match (senders.get(i), have.get(j)) {
+                (Some(a), Some(b)) if a == b => {
+                    i += 1;
+                    j += 1;
+                }
+                (Some(a), None) => {
+                    first
+                        .get_or_insert(format!("tx {} of entity {} has no sndr posting", a.0, a.1));
+                    missing += 1;
+                    i += 1;
+                }
+                (Some(a), Some(b)) if a < b => {
+                    first
+                        .get_or_insert(format!("tx {} of entity {} has no sndr posting", a.0, a.1));
+                    missing += 1;
+                    i += 1;
+                }
+                (_, Some(b)) => {
+                    first.get_or_insert(format!(
+                        "sndr posting (entity {}, tx {}) is not the tx's sender",
+                        b.1, b.0
+                    ));
+                    extra += 1;
+                    j += 1;
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+    } else {
+        let mut it = have.iter().map(|p| p.0).peekable();
+        for &(rel, _) in &senders {
+            while it.peek().is_some_and(|&x| x < rel) {
+                it.next();
+            }
+            if it.peek() != Some(&rel) {
+                first.get_or_insert(format!("tx {rel} has a sender but no sndr posting"));
+                missing += 1;
+            }
+        }
+    }
+    if missing + extra > 0 {
+        rep.sndr_incomplete += missing + extra;
+        if rep.errors.len() < 50 {
+            rep.errors.push(format!(
+                "{tag} sndr: {missing} missing, {extra} not the sender's (first: {})",
+                first.unwrap_or_default()
+            ));
+        }
+    }
 }
 
 /// Every `sndr` list is a subset of the `acct` list of the same entity (the sender of a tx
@@ -299,12 +422,20 @@ fn sndr_within_acct(r: &RangeReader, tag: &str, rep: &mut CheckReport) {
         let Ok(list) = sndr.list_at(i) else {
             continue; // counted above
         };
-        let have: HashSet<u64> = acct.list(ent).map(|it| it.collect()).unwrap_or_default();
+        // `acct` lists come newest first; `list` is ascending: a merge walk.
+        let have: Vec<u64> = acct.list(ent).map(|it| it.collect()).unwrap_or_default();
+        let mut it = have.iter().rev().peekable();
         let first = r.info.first_txnum;
-        let out = list
-            .iter()
-            .filter(|&&rel| !have.contains(&(first + u64::from(rel))))
-            .count() as u64;
+        let mut out = 0u64;
+        for &rel in &list {
+            let want = first + u64::from(rel);
+            while it.peek().is_some_and(|&&x| x < want) {
+                it.next();
+            }
+            if it.peek() != Some(&&want) {
+                out += 1;
+            }
+        }
         if out > 0 {
             rep.sndr_not_in_acct += out;
             if rep.errors.len() < 50 {

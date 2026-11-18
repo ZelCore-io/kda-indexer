@@ -68,8 +68,15 @@ fn hot_digest(data: &Path) -> BTreeMap<String, (usize, String)> {
     digest(&kdx_hot::HotStore::open_ro(&data.join("hot")).unwrap())
 }
 
+/// `segments check --deep` with the hot dictionary: every `sndr` list is exactly the txs its
+/// entity sent.
 fn check_deep(data: &Path, what: &str) {
-    let rep = kdx_segment::check(&data.join("segments"), true).unwrap();
+    let dict = {
+        let hs = kdx_hot::HotStore::open_ro(&data.join("hot")).unwrap();
+        let txn = hs.ro().unwrap();
+        kdx_hot::HotDict::load(&txn).unwrap()
+    };
+    let rep = kdx_segment::check_with(&data.join("segments"), true, Some(&dict)).unwrap();
     assert!(rep.ok(), "{what}: {rep:?}");
 }
 
@@ -137,6 +144,54 @@ fn add_index_gives_the_writers_bytes_and_backfills_the_hot_store() {
     assert!(ready(&b));
 }
 
+/// FIX-2 fix 2, the rollback that skipped `hot drop-family sndr`: an older binary extended
+/// the tail without family-6 rows while `Meta sndr_hot` stayed 1. After the re-upgrade the
+/// freezer derives every step's `sndr` postings from the records (not from the gappy hot
+/// rows) and add-index runs the hot backfill although `sndr_hot` already says 1: the store
+/// ends byte for byte the writer's, with complete sender lists.
+#[test]
+fn a_rollback_without_drop_family_is_repaired_by_freeze_and_add_index() {
+    let t = tempfile::tempdir().unwrap();
+    let (a, b) = (t.path().join("a"), t.path().join("b"));
+    fixture(&a, false);
+    {
+        let pool = pool();
+        let c = ctx(&b, 2, 8, 2);
+        let all = branch(&(0..POOL_LEN).collect::<Vec<_>>(), 0, 0, 0);
+        // Blocks the older binary applied have no family-6 rows (dropped right after their
+        // apply); `sndr_hot` says 1 throughout.
+        let gap = |c: &kdx_ingest::Ctx| {
+            let mut txn = c.hot.rw().unwrap();
+            kdx_hot::sndr::drop_family(&mut txn, kdx_decode::Family::Sndr).unwrap();
+            txn.set_meta_u64(kdx_hot::env::meta::SNDR_HOT, 1).unwrap();
+            txn.commit().unwrap();
+        };
+        apply_linear(&c, &pool, &all[..10], 5);
+        gap(&c);
+        apply_linear(&c, &pool, &all[10..], 5);
+        assert!(kdx_hot::sndr::hot_ready(&c.hot.ro().unwrap()).unwrap());
+        // The re-upgraded writer freezes over the gap ...
+        while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+        // ... and the tail left in the hot store lacks its rows too.
+        gap(&c);
+    }
+    check_deep(&b, "frozen over a gappy tail");
+    assert_ne!(
+        hot_digest(&b),
+        hot_digest(&a),
+        "the hot tail still has the gap"
+    );
+
+    let rep = add_index::run(&b.join("segments"), &hot(&b), opts(2, false)).unwrap();
+    assert!(rep.ok(), "{rep:?}");
+    let h = rep.hot.as_ref().unwrap();
+    assert!(h.already_ready && h.inserted > 0, "{h:?}");
+    assert_eq!(files(&b), files(&a));
+    assert_eq!(hot_digest(&b), hot_digest(&a), "hot store = the new tail");
+    check_deep(&b, "after add-index");
+    assert!(ready(&b));
+}
+
 #[test]
 fn a_rerun_on_a_finished_store_does_nothing() {
     let t = tempfile::tempdir().unwrap();
@@ -146,7 +201,8 @@ fn a_rerun_on_a_finished_store_does_nothing() {
     assert!(rep.ok(), "{rep:?}");
     assert!(rep.entries.is_empty(), "{rep:?}");
     assert_eq!(rep.totals.skipped, rep.totals.entries);
-    assert!(rep.hot.as_ref().unwrap().already_ready);
+    let h = rep.hot.as_ref().unwrap();
+    assert!(h.already_ready && h.inserted == 0, "{h:?}");
     assert_eq!((files(&a), hot_digest(&a)), before);
 }
 

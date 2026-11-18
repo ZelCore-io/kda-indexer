@@ -997,7 +997,10 @@ mod count_budget {
             fx.store.set_sender_index(false);
         }
         let (full, flagged) = total(&exact.schema, q).await;
-        assert!(full > 1 && !flagged, "{q}: exact on the old path with a budget");
+        assert!(
+            full > 1 && !flagged,
+            "{q}: exact on the old path with a budget"
+        );
         let (n, flagged) = total(&cut.schema, q).await;
         assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
         assert!(n < full, "{q}: {n} is below {full} past a spent budget");

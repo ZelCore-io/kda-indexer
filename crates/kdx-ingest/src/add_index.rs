@@ -96,7 +96,7 @@ pub struct EntryReport {
 /// The hot sender backfill's part of the report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HotReport {
-    /// `Meta sndr_hot` was already 1: nothing to do.
+    /// `Meta sndr_hot` was already 1 (the pass still runs: `inserted` is what it repaired).
     pub already_ready: bool,
     pub txs: u64,
     pub senders: u64,
@@ -555,16 +555,15 @@ fn within_acct(acct: &Postings, ent: u64, list: &[u32], first: u64) -> Result<()
     Ok(())
 }
 
-/// The hot sender backfill (`kdx_hot::sndr::backfill`), one write txn. Nothing when
-/// `Meta sndr_hot` is already 1. A dry run only counts the tail's txs.
+/// The hot sender backfill (`kdx_hot::sndr::backfill`), one write txn. It runs even when
+/// `Meta sndr_hot` is already 1 (FIX-2 fix 2): it is idempotent and takes seconds, and a tail
+/// an older binary extended after a rollback without `hot drop-family sndr` still says 1
+/// while its newer rows lack their `sndr` postings. A dry run only counts the tail's txs.
 fn hot_pass(hot: &HotStore, dict: &kdx_hot::HotDict, dry_run: bool) -> HotReport {
     let t0 = Instant::now();
     let mut rep = HotReport::default();
     let r = (|| -> Result<()> {
-        if kdx_hot::sndr::hot_ready(&hot.ro()?)? {
-            rep.already_ready = true;
-            return Ok(());
-        }
+        rep.already_ready = kdx_hot::sndr::hot_ready(&hot.ro()?)?;
         if dry_run {
             // Read-only (the hot store may be opened read-only): the tail txs to walk.
             use kdx_hot::Txn;
