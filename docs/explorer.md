@@ -24,10 +24,11 @@ defaults, nullability, interfaces and unions are identical.
 | Works, with one known issue | Non-fungible accounts (`nonFungibleAccount`) | Some early marmalade v1 tokens (ids without the `t:` prefix) are missing from `nonFungibleAccount`. Fixed, not released yet |
 | Works | Subscriptions: `newBlocks`, `newBlocksFromDepth`, `events`, `transaction` | Over a websocket on the same `/graphql` path (`graphql-transport-ws` or the older `graphql-ws`). A load test held <!--m:gql-subs-held-->500<!--/m--> live subscriptions with <!--m:gql-subs-duplicates-->0<!--/m--> duplicate and <!--m:gql-subs-misses-->0<!--/m--> missed items, and <!--m:gql-subs-headers-checked-->631<!--/m--> block headers checked against the node |
 | Works | The additions kadscan uses: `balance`, `transactionsByPactCode`, `Block.coinbase`, `Block.canonical`, `transfers(isNFT)`, the `transactions` subscription and others | Additive only: every Kadena document stays valid ([graphql.md](graphql.md#zelcore-extensions)) |
-| Differs | Page sizes | 20 items when `first`/`last` is omitted (the schema text says 500); larger values are clamped to 100, block lists and `balance` to 200. `hasNextPage` stays correct |
+| Same | Page sizes | 20 items when `first`/`last` is omitted (the schema text says 500), as stock; any page the complexity limit admits is answered in full, up to a 1,000-row safety cap stock does not have |
 | Differs | `totalCount` on long lists | Counted up to 10,000 rows within a time budget; a count cut short answers a lower bound and the response carries `"extensions": {"totalCountLowerBound": true}`. Today the budget is up to half of the 5 s request deadline; the fix caps it at 200 ms by default (see [Speed](#speed)) |
-| Differs | Resource limits | Depth 10, complexity 2,000, at most 2 count walks per operation, 10 operations per batch, a 5 s deadline. A refusal is a GraphQL error with `extensions.code = "LIMIT"` ([graphql.md](graphql.md#limits)) |
-| Differs | Events over all 20 chains | The Kadena explorer builds one `events` field per ticked chain. With all 20 chains ticked the query costs about 2,000, reaches the default complexity limit and is refused with `LIMIT`; up to 19 chains pass. Raising `max_complexity` in `[graphql]` allows it |
+| Same | Depth and complexity | Stock's: depth 9 and complexity 4,000 counted as stock counts them, refused with stock's text, code and HTTP status ([graphql.md](graphql.md#limits)) |
+| Differs | Other resource limits | 10 operations per batch, a 5 s deadline, 20,000 fields after fragment expansion, 8 directives per field, an introspection cost cap. A refusal is a GraphQL error with `extensions.code = "LIMIT"` |
+| Same | Events over all 20 chains | The Kadena explorer builds one `events` field per ticked chain; with all 20 chains ticked it is answered or refused exactly as stock answers or refuses it |
 | Differs | `NetworkInfo.countersOfEachChain` | `blocksCount` answers; `transactionCount` and `totalGasUsedInKda` are `null` with `NOT_AVAILABLE` (no all-time per-chain counter is kept) |
 | Not supported | `pactQuery`, `gasLimitEstimate` | `NOT_SUPPORTED`: the indexer never runs Pact code for clients. Read contract state from a chainweb-node `/local` instead |
 | Not supported | Mempool | `Transaction.result` is never a `TransactionMempoolInfo`; a transaction not yet in a block is `null` |
@@ -186,8 +187,8 @@ run.
    that proxy in `trusted_proxies` so the indexer reads the client address from
    `X-Forwarded-For` ([load-balancer.md](load-balancer.md#client-ips-x-forwarded-for)).
    Otherwise every visitor shares one budget (`api.rate_per_ip`). The query limits are in
-   `[graphql]` ([graphql.md](graphql.md#limits)). If an explorer document is refused with
-   `LIMIT`, check it with `check-ops` first; raising `max_complexity` is the last resort.
+   `[graphql]` ([graphql.md](graphql.md#limits)). Depth and complexity are the stock
+   indexer's: a document refused here is refused by stock too. Check one with `check-ops`.
 5. **Subscriptions.** A websocket on the same path, with protocol `graphql-transport-ws` or
    `graphql-ws`. The balancer needs a tunnel timeout long enough for a page left open (for
    example one hour). The default caps allow 10 connections and 40 subscriptions per client IP.

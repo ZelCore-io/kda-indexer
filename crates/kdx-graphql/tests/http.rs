@@ -83,24 +83,34 @@ async fn limits_answer_limit_fast() {
         "parent { ".repeat(7),
         "}".repeat(7)
     );
-    let complex = format!(
-        "{{ blocksFromHeight(startHeight: 0, first: 100) {{ edges {{ node {{ {} }} }} }} }}",
-        fields(20)
-    );
-    let aliases: String = (0..100)
+    // Stock's limits (FIX-3 part C): `parent` nested 7 times is over graphile's limits (a
+    // coordinate nests at most twice), 41 aliased pages of 100 cost 4,100 by stock's formula.
+    let aliases: String = (0..41)
         .map(|i| format!("t{i}: transactions(blockHash: \"x\", first: 100) {{ edges {{ node {{ hash }} }} }} "))
         .collect();
     let big = format!("{{ lastBlockHeight }} #{}", "x".repeat(33 * 1024));
-    for (q, want) in [
-        (deep, "depth"),
-        (complex, "complexity"),
-        (format!("{{ {aliases} }}"), "complexity"),
-        (big, "query_size"),
+    for (q, want, status) in [
+        (deep, "depth", StatusCode::BAD_REQUEST),
+        (
+            format!("{{ {aliases} }}"),
+            "complexity",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (big, "query_size", StatusCode::OK),
     ] {
         let (s, v, el) = query(&f, &q).await;
-        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some(want)), "{v}");
+        let got = v["errors"][0]["extensions"]["limit"].as_str();
+        assert_eq!((s, got), (status, Some(want)), "{v}");
         assert!(el < Duration::from_millis(100), "{want}: {el:?}");
     }
+    // A page of 100 with 20 fields costs 100 by stock's formula (leaves are free): served.
+    let wide = format!(
+        "{{ blocksFromHeight(startHeight: 0, first: 100) {{ edges {{ node {{ {} }} }} }} }}",
+        fields(20)
+    );
+    let (s, v, _) = query(&f, &wide).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v.get("errors").is_none(), "{v}");
     let batch: Vec<Value> = (0..11)
         .map(|_| json!({"query": "{ graphConfiguration { version } }"}))
         .collect();
@@ -131,7 +141,10 @@ async fn limits_answer_limit_fast() {
 #[tokio::test]
 async fn introspection_and_unserved_fields() {
     let f = fixture();
-    let (s, v, _) = query(&f, INTROSPECTION).await;
+    // The full document is over stock's introspection depth (see `stock_limits`); without
+    // the arguments of fields it answers in full.
+    let shallow = INTROSPECTION.replace("    args { ...InputValue }\n", "");
+    let (s, v, _) = query(&f, &shallow).await;
     assert_eq!(s, StatusCode::OK);
     assert!(v.get("errors").is_none(), "{v}");
     let types = v["data"]["__schema"]["types"].as_array().unwrap();
@@ -379,4 +392,267 @@ async fn parallel_fragment_bombs_leave_other_listeners_answering() {
         assert_eq!(limit_of(&v), Some("complexity"), "{v}");
     }
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+}
+
+/// FIX-3 part C: the stock indexer's refusals, with stock's text, code and HTTP status.
+mod stock_limits {
+    use super::*;
+
+    const COMPLEXITY: &str = "[ERROR][GRAPHQL][VALID_RANGE] Sorry, too complicated query! Exceeded the maximum allowed complexity.";
+
+    fn page(n: u32) -> String {
+        format!("{{ transactions(first: {n}) {{ edges {{ node {{ hash }} }} }} }}")
+    }
+
+    #[tokio::test]
+    async fn complexity_over_4000_is_refused_as_stock_refuses_it() {
+        let f = fixture();
+        // 4000 by stock's formula passes, 4001 is refused: HTTP 500, stock's message, and
+        // stock's code at the top level (ours keeps `extensions`, with the limit named).
+        // 4000 as four pages of 1,000 (one page of 4,000 is over the part D safety cap).
+        let four: String = (0..4)
+            .map(|i| format!("t{i}: transactions(first: 1000) {{ edges {{ node {{ hash }} }} }} "))
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {four} }}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+        let (s, v, _) = query(&f, &page(4001)).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        let e = &v["errors"][0];
+        assert_eq!(e["message"], COMPLEXITY, "{v}");
+        assert_eq!(e["code"], "INTERNAL_SERVER_ERROR", "{v}");
+        assert_eq!(e["extensions"]["limit"], "complexity", "{v}");
+        assert!(
+            e.get("locations").is_none() && e.get("path").is_none(),
+            "{v}"
+        );
+        assert!(v.get("data").is_none_or(Value::is_null), "{v}");
+        // The explorer's transactions-by-account document at first: 100 costs 300.
+        let doc = include_str!("../../../compare/graphql/QTransactionsByAccount.graphql");
+        let (s, v, _) = post(
+            &f,
+            json!({"query": doc, "variables": {"accountName": "k:a", "first": 100}}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+        // FIX-3 part D (S1): stock skips the check for any operation named
+        // IntrospectionQuery; ours only for one of introspection fields alone, so a spoofed
+        // name carrying real fields is priced (a documented safety difference).
+        let named = page(5000).replacen('{', "query IntrospectionQuery {", 1);
+        let (s, v, _) = post(
+            &f,
+            json!({"query": named, "operationName": "IntrospectionQuery"}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert_eq!(v["errors"][0]["message"], COMPLEXITY, "{v}");
+        let named = "query IntrospectionQuery { __schema { queryType { name } } }";
+        let (s, v, _) = post(
+            &f,
+            json!({"query": named, "operationName": "IntrospectionQuery"}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+        // The operation that runs is the one priced: a cheap selected operation next to an
+        // expensive one is served, the expensive one selected is refused.
+        let two = format!(
+            "query Cheap {{ lastBlockHeight }} query Dear {}",
+            page(4001)
+        );
+        for (op, want) in [
+            ("Cheap", StatusCode::OK),
+            ("Dear", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let (s, v, _) = post(&f, json!({"query": two, "operationName": op}).to_string()).await;
+            assert_eq!(s, want, "{op}: {v}");
+        }
+        // A negative page next to an expensive one cannot lower the cost (S2).
+        let neg = "{ a: transactions(first: -4000) { edges { node { hash } } } b: transactions(first: 4001) { edges { node { hash } } } }";
+        let (s, v, _) = query(&f, neg).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert_eq!(v["errors"][0]["message"], COMPLEXITY, "{v}");
+        // A validation error comes before the complexity check, as in stock.
+        let bad = page(5000).replace("hash", "nope");
+        let (_, v, _) = query(&f, &bad).await;
+        assert_ne!(v["errors"][0]["message"], COMPLEXITY, "{v}");
+    }
+
+    /// FIX-3 part D (S3): a page over the 1,000-row safety cap that stock's gate passes is
+    /// refused by ours with a `LIMIT` named `page` (stock answers it slowly or times out).
+    #[tokio::test]
+    async fn pages_over_the_safety_cap_are_refused() {
+        let f = fixture();
+        let (s, v, _) = query(&f, &page(1000)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+        let (s, v, _) = query(&f, &page(1001)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let e = &v["errors"][0];
+        assert_eq!(e["extensions"]["code"], "LIMIT", "{v}");
+        assert_eq!(e["extensions"]["limit"], "page", "{v}");
+        assert_eq!(
+            e["message"],
+            "a page holds at most 1000 rows (first, last and quantity above it are refused)",
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn depth_over_9_is_refused_as_stock_refuses_it() {
+        let f = fixture();
+        let nine = "query D { transaction(requestKey: \"x\") { result { ... on TransactionResult { block { parent { minerAccount { transactions { edges { node { cmd { nonce } } } } } } } } } } }";
+        let (s, v, _) = query(&f, nine).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(
+            v["errors"][0]["extensions"]["code"] != "GRAPHQL_VALIDATION_FAILED",
+            "{v}"
+        );
+        let ten = nine.replace("cmd { nonce }", "cmd { meta { chainId } }");
+        let (s, v, _) = query(&f, &ten).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let e = &v["errors"][0];
+        assert_eq!(e["message"], "'D' exceeds operation depth limits.", "{v}");
+        assert_eq!(e["code"], "GRAPHQL_VALIDATION_FAILED", "{v}");
+        assert_eq!(e["extensions"]["limit"], "depth", "{v}");
+        // The full introspection document is over graphile's introspection depth (12) in
+        // stock too; a shallower one answers.
+        let (s, v, _) = query(&f, INTROSPECTION).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["errors"][0]["message"], "'IntrospectionQuery' exceeds operation depth limits.",
+            "{v}"
+        );
+    }
+}
+
+/// FIX-3 part E (B1): the read budget's safety ceiling. Stock's gate prices `first: 0` at 0
+/// while 20 rows are served; ours prices it as served and refuses a request (a batch: the
+/// sum of its operations) above `BUDGET_CEILING` with `LIMIT` named `budget`.
+mod budget_ceiling {
+    use super::*;
+    use kdx_graphql::limits::BUDGET_CEILING;
+
+    const T: &str = "fragment T on QueryTransactionsConnection { edges { node { result { ... on TransactionResult { events(first: 0) { edges { node { name parameters } } } } } } } }";
+
+    /// `n` aliases of nested zero pages (20 txs x 20 events each as served).
+    fn zero_pages(n: usize) -> String {
+        let a: String = (0..n)
+            .map(|i| format!("a{i}: transactions(first: 0) {{ ...T }} "))
+            .collect();
+        format!("{{ {a} }} {T}")
+    }
+
+    fn batch(ops: usize, aliases: usize) -> String {
+        let q = zero_pages(aliases);
+        Value::Array((0..ops).map(|_| json!({ "query": q })).collect()).to_string()
+    }
+
+    /// One alias's budget (the unit the batches below are sized in).
+    fn per_alias() -> u64 {
+        let doc = async_graphql::parser::parse_query(zero_pages(1)).unwrap();
+        let c = kdx_graphql::limits::budget(
+            &doc,
+            &async_graphql::Variables::default(),
+            &GraphqlSettings::default(),
+        )
+        .unwrap()
+        .complexity;
+        assert!(c >= 20 * 20, "{c}");
+        c
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_priced_as_the_sum_of_its_operations() {
+        let f = fixture();
+        let per_op = (BUDGET_CEILING / per_alias() / 10) as usize;
+        // Ten operations, each well under the ceiling alone, together over it: refused
+        // whole, before any of them runs.
+        let (s, v, el) = post(&f, batch(10, per_op + 1)).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        assert!(el < Duration::from_secs(2), "{el:?}");
+        // The same ten a little smaller: answered (stock's gate prices each at 0).
+        let (s, v, _) = post(&f, batch(10, per_op - 1)).await;
+        assert_eq!(s, StatusCode::OK);
+        let rs = v.as_array().expect("a batch answer");
+        assert_eq!(rs.len(), 10);
+        assert!(rs.iter().all(|r| r.get("errors").is_none()), "{}", rs[0]);
+    }
+
+    /// NFT holdings are priced per row (up to 10,000 each); stock prices them at 0.
+    #[tokio::test]
+    async fn aliased_holdings_over_the_ceiling_are_refused() {
+        let f = fixture();
+        let n = (BUDGET_CEILING / kdx_graphql::MAX_NFT_HOLDINGS as u64) as usize + 1;
+        let a: String = (0..n)
+            .map(|i| {
+                format!("a{i}: nonFungibleAccount(accountName: \"k:x\") {{ nonFungibleTokenBalances {{ tokenId }} }} ")
+            })
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        // The holdings are read when the account resolves, so the account itself is priced
+        // per row, whatever is selected of it (security pass on part E).
+        let a: String = (0..n)
+            .map(|i| format!("a{i}: nonFungibleAccount(accountName: \"k:x\") {{ accountName }} "))
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        let a: String = (0..n)
+            .map(|i| {
+                format!("a{i}: nonFungibleChainAccount(accountName: \"k:x\", chainId: \"0\") {{ chainId }} ")
+            })
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        // `node`/`nodes` with NFT ids: each id one holdings read.
+        use kdx_graphql::ids::{encode, NodeKey};
+        let nft = |i: usize| {
+            encode(&NodeKey::NonFungibleAccount {
+                account: format!("k:{i}"),
+            })
+        };
+        let ids = |r: std::ops::Range<usize>| {
+            r.map(|i| format!("\"{}\"", nft(i)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let half = n / 2 + 1;
+        let q = format!(
+            "{{ a: nodes(ids: [{}]) {{ id }} b: nodes(ids: [{}]) {{ id }} }}",
+            ids(0..half),
+            ids(half..2 * half)
+        );
+        let (s, v, _) = query(&f, &q).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        let a: String = (0..n)
+            .map(|i| format!("a{i}: node(id: \"{}\") {{ id }} ", nft(i)))
+            .collect();
+        let (s, v, _) = query(&f, &format!("{{ {a} }}")).await;
+        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some("budget")), "{v}");
+        // Ids of other types stay cheap.
+        let blocks: Vec<String> = (0..100)
+            .map(|i| {
+                format!(
+                    "\"{}\"",
+                    encode(&NodeKey::Block {
+                        hash: format!("h{i}")
+                    })
+                )
+            })
+            .collect();
+        let q = format!("{{ nodes(ids: [{}]) {{ id }} }}", blocks.join(", "));
+        let (_, v, _) = query(&f, &q).await;
+        assert_eq!(limit_of(&v), None, "{v}");
+        // The explorer's own document (one account) is served.
+        let one = "query NonFungibleAccount($accountName: String!) { nonFungibleAccount(accountName: $accountName) { nonFungibleTokenBalances { balance chainId tokenId info { precision supply uri } guard { ... on KeysetGuard { keys predicate } } } } }";
+        let (s, v, _) = post(
+            &f,
+            json!({"query": one, "variables": {"accountName": "k:x"}}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+    }
 }

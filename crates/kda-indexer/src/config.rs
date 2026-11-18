@@ -363,12 +363,15 @@ impl ApiConfig {
 pub struct GraphqlConfig {
     /// Page size when a connection gets neither `first` nor `last`.
     pub default_page: u32,
-    /// Larger `first`/`last` values are clamped to this.
+    /// Page size of the legacy cost model (`check-ops`) only; served pages, subscription
+    /// `quantity` and NFT holdings have the fixed 1,000-row safety cap (FIX-3 part D).
     pub max_page: u32,
+    /// Read-budget model only; stock's depth limit (9) is what refuses.
     pub max_depth: u32,
+    /// Read budget (logged above it, never refused); stock's complexity limit (4000) refuses.
     pub max_complexity: u64,
     pub introspection: bool,
-    /// Depth cap of introspection (exempt from `max_depth`).
+    /// Read-budget model only; stock's introspection depth limit (12) is what refuses.
     pub introspection_depth: u32,
     /// Operations in one batched request (a batch of N takes N rate tokens).
     pub max_batch: u32,

@@ -1,0 +1,186 @@
+[
+ {
+  "name": "page_100",
+  "q": "{ transactions(first: 100) { edges { node { hash } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 100.0
+  }
+ },
+ {
+  "name": "page_4001",
+  "q": "{ transactions(first: 4001) { edges { node { hash } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 4001.0
+  }
+ },
+ {
+  "name": "four_pages_of_1000",
+  "q": "{ t0: transactions(first: 1000) { edges { node { hash } } } t1: transactions(first: 1000) { edges { node { hash } } } t2: transactions(first: 1000) { edges { node { hash } } } t3: transactions(first: 1000) { edges { node { hash } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 4000.0
+  }
+ },
+ {
+  "name": "first_absent",
+  "q": "{ transactions { edges { node { hash result { ... on TransactionResult { height } } } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 2.0
+  }
+ },
+ {
+  "name": "first_zero_nested",
+  "q": "{ transactions(first: 0) { edges { node { result { ... on TransactionResult { events(first: 0) { edges { node { name parameters } } } } } } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 0.0
+  }
+ },
+ {
+  "name": "last_zero_nested",
+  "q": "{ transactions(last: 0) { edges { node { result { ... on TransactionResult { events(last: 0) { edges { node { name } } } } } } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 0.0
+  }
+ },
+ {
+  "name": "nested_pages",
+  "q": "{ transactions(first: 10) { edges { node { result { ... on TransactionResult { events(first: 5) { edges { node { name } } } } } } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 70.0
+  }
+ },
+ {
+  "name": "negative_beside_expensive",
+  "q": "{ a: transactions(first: -4000) { edges { node { hash } } } b: transactions(first: 4001) { edges { node { hash } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 4001.0
+  }
+ },
+ {
+  "name": "variables",
+  "q": "query Q($n: Int) { transactions(first: $n) { edges { node { hash } } } }",
+  "vars": {
+   "n": 250
+  },
+  "expect": {
+   "depth": false,
+   "cx": 250.0
+  }
+ },
+ {
+  "name": "variable_default",
+  "q": "query Q($n: Int = 30) { transactions(first: $n) { edges { node { hash } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 30.0
+  }
+ },
+ {
+  "name": "variable_null",
+  "q": "query Q($n: Int) { transactions(first: $n) { edges { node { hash } } } }",
+  "vars": {
+   "n": null
+  },
+  "expect": {
+   "depth": false,
+   "cx": 1.0
+  }
+ },
+ {
+  "name": "skip_include",
+  "q": "query Q($s: Boolean!) { a: transactions(first: 3000) @skip(if: $s) { edges { node { hash } } } b: transactions(first: 2000) @include(if: true) { edges { node { hash } } } }",
+  "vars": {
+   "s": true
+  },
+  "expect": {
+   "depth": false,
+   "cx": 2000.0
+  }
+ },
+ {
+  "name": "explorer_by_account_100",
+  "q": "query QTransactionsByAccount($accountName: String, $first: Int, $after: String) { transactions(accountName: $accountName, first: $first, after: $after) { totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id hash result { ... on TransactionResult { height gas block { hash height chainId } } } } } } }",
+  "vars": {
+   "accountName": "k:a",
+   "first": 100
+  },
+  "expect": {
+   "depth": false,
+   "cx": 300.0
+  }
+ },
+ {
+  "name": "operation_selected_cheap",
+  "q": "query Cheap { lastBlockHeight } query Dear { transactions(first: 4001) { edges { node { hash } } } }",
+  "op": "Cheap",
+  "expect": {
+   "depth": false,
+   "cx": 1.0
+  }
+ },
+ {
+  "name": "operation_selected_dear",
+  "q": "query Cheap { lastBlockHeight } query Dear { transactions(first: 4001) { edges { node { hash } } } }",
+  "op": "Dear",
+  "expect": {
+   "depth": false,
+   "cx": 4001.0
+  }
+ },
+ {
+  "name": "subscription_quantity_default",
+  "q": "subscription { transactions { hash } }",
+  "expect": {
+   "depth": false,
+   "cx": 20.0
+  }
+ },
+ {
+  "name": "block_parent_twice",
+  "q": "{ block(hash: \"x\") { parent { parent { hash } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 3.0
+  }
+ },
+ {
+  "name": "block_parent_three_times",
+  "q": "{ block(hash: \"x\") { parent { parent { parent { hash } } } } }",
+  "expect": {
+   "depth": true,
+   "cx": 4.0
+  }
+ },
+ {
+  "name": "depth_nine",
+  "q": "query D { transaction(requestKey: \"x\") { result { ... on TransactionResult { block { parent { minerAccount { transactions { edges { node { cmd { nonce } } } } } } } } } } }",
+  "expect": {
+   "depth": false,
+   "cx": 7.0
+  }
+ },
+ {
+  "name": "depth_ten",
+  "q": "query D { transaction(requestKey: \"x\") { result { ... on TransactionResult { block { parent { minerAccount { transactions { edges { node { cmd { meta { chainId } } } } } } } } } } } }",
+  "expect": {
+   "depth": true,
+   "cx": 8.0
+  }
+ },
+ {
+  "name": "introspection_shallow",
+  "q": "query IntrospectionQuery { __schema { queryType { name } types { name fields { name } } } }",
+  "op": "IntrospectionQuery",
+  "expect": {
+   "depth": false,
+   "cx": 0.0
+  }
+ }
+]

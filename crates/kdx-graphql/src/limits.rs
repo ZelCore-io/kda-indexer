@@ -1,25 +1,36 @@
-//! Query limits (GQ-9), run on every parsed document before validation and execution
-//! (HTTP and websocket alike), as an async-graphql extension:
-//! - query text ≤ `max_query_bytes`, variables ≤ `max_variables_bytes`;
-//! - depth ≤ `max_depth`; `__schema`/`__type` subtrees are exempt from it and capped at
-//!   `introspection_depth` instead;
-//! - complexity ≤ `max_complexity` (cost model below).
+//! Query limits (GQ-9; FIX-3 parts C to E), run on every parsed document before validation
+//! and execution (HTTP and websocket alike), as an async-graphql extension. See
+//! docs/graphql.md "Limits".
 //!
-//! Fragments are expanded where they are spread, so neither fragments, aliases nor inline
-//! fragments get around depth or complexity. Every operation of a document is checked (not
-//! only the one that runs). The walk itself is bounded by [`MAX_VISITS`], and it runs on the
-//! freshly parsed document before any other walk of it (C-1), counting directives too
-//! ([`MAX_DIRECTIVES`] per field, fragment or spread).
+//! Served, two models apply:
+//! - stock's depth and complexity limits ([`crate::stock_limits`]), with stock's thresholds,
+//!   text, code and HTTP status: they refuse on depth and complexity, for the operation that
+//!   runs;
+//! - this module's read budget ([`budget`]), about the rows a request reads. It refuses only
+//!   on safety bounds stock does not have: the walk itself ([`MAX_VISITS`] fields after
+//!   fragment expansion, [`MAX_DIRECTIVES`]), the introspection cost cap
+//!   ([`MAX_INTROSPECTION_COST`]), more than [`MAX_COUNTS`] count walks (`counts`) and the
+//!   safety ceiling [`BUDGET_CEILING`] (`budget`; a batch counts the sum of its operations,
+//!   see [`request_budget`]).
+//!
+//! The walk runs on the freshly parsed document before any other walk of it (C-1). Fragments
+//! are expanded where they are spread, so neither fragments, aliases nor inline fragments get
+//! around it. Every operation of the document is walked; the largest one is the budget.
 //!
 //! Cost model (field types from the schema, keyed on field names, never aliases): each field
-//! costs 1 (`__typename` 0, and a connection's `edges` and their `node` 0). A
-//! deferred `totalCount` (every one but a short list of cheap connections'; fails closed) costs `max_page`, and an operation may run at
-//! most [`MAX_COUNTS`] of them, outer multipliers included. A connection or list field that returns a page
-//! (`first`/`last` or a connection field without them) multiplies the cost of its
-//! selection (of a connection, its `edges` only: `totalCount` and `pageInfo` are answered
-//! once per connection) by the page size it will return (clamped like the resolver: `max_page`, or
-//! `default_page` when omitted). `nodes(ids)` multiplies by the number of ids; per-chain
-//! account lists by the chain count (20 or `chainIds`).
+//! costs 1 (`__typename` 0, and a connection's `edges` and their `node` 0). A deferred
+//! `totalCount` (every one but a short list of cheap connections'; fails closed) costs
+//! `max_page`. A connection or list field that returns a page multiplies the cost of its
+//! selection (of a connection, its `edges` only: `totalCount` and `pageInfo` are answered once
+//! per connection) by the rows it serves, sized by [`crate::connection::served_page`] as the
+//! resolvers size it: as asked up to [`crate::MAX_PAGE_ROWS`]; absent, or `0` without a cursor,
+//! at `default_page`. `nodes(ids)` multiplies by the number of ids, per-chain account lists by
+//! the chain count (20 or `chainIds`), NFT holdings by [`crate::MAX_NFT_HOLDINGS`] (one read
+//! per row, whatever is selected).
+//!
+//! [`analyze`] runs the same walk as the legacy model, which also refuses on `max_depth`,
+//! `introspection_depth` and `max_complexity`, with pages clamped at `max_page`. It is not
+//! served.
 
 use std::sync::Arc;
 
@@ -33,7 +44,8 @@ use async_graphql::parser::types::{
 use async_graphql::registry::Registry;
 use async_graphql::{Name, Request, ServerError, ServerResult, ValidationResult, Value, Variables};
 
-use crate::error::limit;
+use crate::error::{limit, stock_refusal, GRAPHQL_VALIDATION_FAILED, INTERNAL_SERVER_ERROR};
+use crate::stock_limits;
 use crate::{Gql, GraphqlSettings};
 
 /// Parser recursion cap (nesting of selection sets and values).
@@ -70,6 +82,9 @@ const WIDE: &[&str] = &[
 
 /// The `transactions` subscription's `quantity` when absent (its SDL default).
 const SUB_TXS_QUANTITY: i64 = 20;
+
+/// An account's NFT holdings (priced per row, part E S1).
+const NFT_HOLDINGS: &str = "nonFungibleTokenBalances";
 
 /// Deferred `totalCount`s (count walks) one operation may run, outer multipliers included.
 pub const MAX_COUNTS: u64 = 2;
@@ -127,6 +142,10 @@ pub struct Cost {
     pub depth: usize,
     pub introspection_depth: usize,
     pub complexity: u64,
+    /// The largest `first`, `last` or `quantity` given a value (before any cap): above
+    /// [`crate::MAX_PAGE_ROWS`] the resolver refuses it (`page`), which `check-ops` reports
+    /// without running the document (part E, M4).
+    pub rows_asked: u64,
 }
 
 struct Walk<'a> {
@@ -152,6 +171,9 @@ struct Walk<'a> {
     intro_cost: u64,
     /// `crossChainTransfer` fields on the current path (M-5).
     xchain: usize,
+    /// Refuse on this model's depth, complexity and count limits ([`analyze`]); off for the
+    /// served gate ([`budget`]), where stock's limits refuse instead (FIX-3 part C).
+    enforce: bool,
 }
 
 /// A `crossChainTransfer` inside another one (M-5): priced as the per-item store read it
@@ -240,7 +262,7 @@ impl<'a> Walk<'a> {
                     let d = depth + 1;
                     if intro {
                         self.cost.introspection_depth = self.cost.introspection_depth.max(d);
-                        if d > self.s.introspection_depth {
+                        if self.enforce && d > self.s.introspection_depth {
                             return Err(limit(
                                 "introspection_depth",
                                 format!(
@@ -251,7 +273,7 @@ impl<'a> Walk<'a> {
                         }
                     } else {
                         self.cost.depth = self.cost.depth.max(d);
-                        if d > self.s.max_depth {
+                        if self.enforce && d > self.s.max_depth {
                             return Err(limit(
                                 "depth",
                                 format!("query depth exceeds {}", self.s.max_depth),
@@ -264,7 +286,7 @@ impl<'a> Walk<'a> {
                         None
                     };
                     if list.is_some() {
-                        if self.intro_lists.contains(&name) {
+                        if self.enforce && self.intro_lists.contains(&name) {
                             return Err(limit(
                                 "introspection_nesting",
                                 format!("introspection field `{name}` repeats on one path"),
@@ -300,6 +322,12 @@ impl<'a> Walk<'a> {
                         "edges" if wrap == Wrap::Conn => 0,
                         "node" if wrap == Wrap::Edges => 0,
                         "crossChainTransfer" if self.xchain > 0 => NESTED_XCHAIN_COST,
+                        // The holdings are read when the account resolves, whatever is
+                        // selected of it: one read per row up to the cap (part E, S1).
+                        "nonFungibleAccount" | "nonFungibleChainAccount" if ty == Some("Query") => {
+                            crate::MAX_NFT_HOLDINGS as u64
+                        }
+                        "node" | "nodes" if ty == Some("Query") => self.node_reads(f),
                         "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
                             self.s.default_page.min(self.s.max_page) as u64
                         }
@@ -309,9 +337,11 @@ impl<'a> Walk<'a> {
                         "totalCount" if !(wrap == Wrap::Conn && ty.is_some_and(cheap_count)) => {
                             // A count walk (GQ-10): a fixed cost, and few per operation.
                             self.counts = self.counts.saturating_add(self.outer);
+                            // Enforced in the served budget too (FIX-3 part D, S4): a
+                            // resource bound, not one of stock's limits.
                             if self.counts > MAX_COUNTS {
                                 return Err(limit(
-                                    "complexity",
+                                    "counts",
                                     format!(
                                         "more than {MAX_COUNTS} list totalCounts in one operation"
                                     ),
@@ -362,6 +392,9 @@ impl<'a> Walk<'a> {
                         let per = if reads { part.max(1) } else { part };
                         own.saturating_add(all - part)
                             .saturating_add(mult.saturating_mul(per))
+                    } else if name == NFT_HOLDINGS {
+                        // One details read per holding, made whatever the selection (S1).
+                        own.saturating_add(mult)
                     } else if mult > 1 {
                         own.saturating_add(mult.saturating_mul(all.max(1)))
                     } else {
@@ -435,6 +468,34 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// What the ids of `node(id)` / `nodes(ids)` read (security pass on part E): an NFT id
+    /// (or one not known before the request runs) reads the account's holdings, up to
+    /// [`crate::MAX_NFT_HOLDINGS`] rows; any other id (or one that does not decode) 1.
+    fn node_reads(&self, f: &'a Field) -> u64 {
+        let holdings = crate::MAX_NFT_HOLDINGS as u64;
+        let one = |v: &Value| match v {
+            Value::String(id) => match crate::ids::decode(id) {
+                Ok(
+                    crate::ids::NodeKey::NonFungibleAccount { .. }
+                    | crate::ids::NodeKey::NonFungibleChainAccount { .. }
+                    | crate::ids::NodeKey::NonFungibleTokenBalance { .. },
+                ) => holdings,
+                _ => 1,
+            },
+            Value::Null => 1,
+            _ => holdings,
+        };
+        let unbound = (crate::types::node::MAX_NODES as u64).saturating_mul(holdings);
+        match (self.arg(f, "id"), self.arg(f, "ids")) {
+            (Arg::Val(v), _) => one(&v),
+            (_, Arg::Val(Value::List(l))) => l.iter().map(one).fold(0, u64::saturating_add),
+            (_, Arg::Val(v)) => one(&v),
+            (Arg::Unbound, _) => holdings,
+            (_, Arg::Unbound) => unbound,
+            _ => 1,
+        }
+    }
+
     fn int(v: &Value) -> Option<i64> {
         match v {
             Value::Number(n) => n.as_i64(),
@@ -450,12 +511,17 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn multiplier(&self, f: &'a Field, parent: Option<&str>) -> u64 {
+    fn multiplier(&mut self, f: &'a Field, parent: Option<&str>) -> u64 {
         let s = self.s;
         // The wide lists clamp at `wide_page` (R-P5P9-20), everything else at `max_page`.
         let name = f.name.node.as_str();
-        let cap = if WIDE.contains(&name) {
-            s.wide_page()
+        // The served budget (FIX-3 part D, S5) prices a page as the resolver serves it: as
+        // asked up to the safety cap (above it the resolver refuses), and an absent
+        // `first`/`last` at `default_page`. The legacy model keeps its clamps.
+        let cap = if !self.enforce {
+            crate::MAX_PAGE_ROWS
+        } else if WIDE.contains(&name) {
+            s.max_page.saturating_mul(2)
         } else {
             s.max_page
         };
@@ -469,14 +535,42 @@ impl<'a> Walk<'a> {
         }
         let first = fa.val().and_then(Self::int);
         let last = la.val().and_then(Self::int);
+        let asked = |n: Option<i64>| n.map_or(0, |n| n.max(0) as u64);
+        let q = match self.arg(f, "quantity") {
+            Arg::Val(v) => Self::int(&v),
+            _ => None,
+        };
+        self.cost.rows_asked = self
+            .cost
+            .rows_asked
+            .max(asked(first))
+            .max(asked(last))
+            .max(asked(q));
         if first.is_some() || last.is_some() {
-            return page(first.max(last));
+            // As served (part E, B1): `0` without a cursor is the default page, with one 0.
+            // A cursor bound to an unbound variable counts as absent (the higher price).
+            let cursor = |a: &str| self.arg(f, a).val().is_some_and(|v| *v != Value::Null);
+            let (_, n) = crate::connection::served_page(
+                first,
+                last,
+                cursor("after"),
+                cursor("before"),
+                s.default_page as u64,
+            );
+            return n.min(cap as u64);
         }
         // ZelCore `quantity` (subscriptions `newBlocks`, `transactions`): the list size, clamped
         // to `max_page` as the resolver clamps it. The `transactions` subscription's absent
         // `quantity` is its SDL default (M3).
+        // An unbound `quantity` or `ids` is priced at the most the resolver serves (part E,
+        // M5): the safety cap in the read budget, `max_page` in the legacy model.
+        let unbound = if self.enforce {
+            s.max_page as u64
+        } else {
+            crate::MAX_PAGE_ROWS as u64
+        };
         match self.arg(f, "quantity") {
-            Arg::Unbound => return s.max_page as u64,
+            Arg::Unbound => return unbound,
             Arg::Val(v) => return page(Self::int(&v)),
             Arg::Absent if parent == Some("Subscription") && name == "transactions" => {
                 return page(Some(SUB_TXS_QUANTITY));
@@ -489,7 +583,7 @@ impl<'a> Walk<'a> {
             Arg::Val(v) => Self::len(&v).unwrap_or(absent),
         };
         match name {
-            "nodes" => list_len("ids", 1, s.max_page as u64),
+            "nodes" => list_len("ids", 1, unbound),
             "fungibleChainAccounts" | "newBlocks" | "newBlocksFromDepth" => {
                 list_len("chainIds", CHAINS, CHAINS)
             }
@@ -498,7 +592,9 @@ impl<'a> Walk<'a> {
             "fungibleAccountsByPublicKey" | "fungibleChainAccountsByPublicKey" => {
                 crate::types::account::MAX_KEY_ACCOUNTS as u64
             }
-            "nonFungibleTokenBalances" => s.max_page as u64,
+            // Every holding up to the cap (part E, S1), each one details read: priced per
+            // row whatever is selected of it (see `set`).
+            "nonFungibleTokenBalances" => crate::MAX_NFT_HOLDINGS as u64,
             _ if PAGED.contains(&name) => page(None),
             _ => 1,
         }
@@ -506,13 +602,63 @@ impl<'a> Walk<'a> {
 }
 
 /// The cost of every operation of `doc` (the largest), or the `LIMIT` error of the first
-/// limit it passes.
+/// limit of this model it passes. Not the served gate: see [`budget`].
 pub fn analyze(
     doc: &ExecutableDocument,
     vars: &Variables,
     s: &GraphqlSettings,
 ) -> Result<Cost, ServerError> {
+    walk(doc, vars, s, true)
+}
+
+/// Safety ceiling of the read budget (FIX-3 part E, B1): a request (a batch: the sum of its
+/// operations) the budget prices above it is refused with `LIMIT`,
+/// `extensions.limit = "budget"`. Safety, not parity: stock's gate prices `first: 0` at 0
+/// while 20 rows are served, so stock's limits alone leave aliased zero-cost pages
+/// unbounded. Calibrated on the explorer operation documents and the compare suite's
+/// documents (see docs/graphql.md "Limits"). CALIB
+pub const BUDGET_CEILING: u64 = 1_100_000;
+
+/// The read budget's refusal above [`BUDGET_CEILING`].
+pub fn over_ceiling(cost: u64) -> Result<(), ServerError> {
+    if cost > BUDGET_CEILING {
+        return Err(limit(
+            "budget",
+            format!("query reads too much: budget {cost} exceeds {BUDGET_CEILING}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The read budget of one request of a batch (part E, B1: a batch's budget is the sum of its
+/// operations'). `None` when the request is refused before its budget counts (sizes, parse,
+/// the bounds of the walk): it is answered with its own error when it runs.
+pub fn request_budget(query: &str, vars: &Variables, s: &GraphqlSettings) -> Option<u64> {
+    check_sizes(query, vars, s).ok()?;
+    let doc = async_graphql::parser::parse_query(query).ok()?;
+    budget(&doc, vars, s).ok().map(|c| c.complexity)
+}
+
+/// The served pass of this model (FIX-3 part C): a read budget only. It refuses nothing
+/// stock's limits ([`crate::stock_limits`]) would serve on depth, complexity or counts; it
+/// keeps only the bounds of the walk itself ([`MAX_VISITS`] fields after fragment expansion,
+/// [`MAX_DIRECTIVES`]) and the introspection cost cap ([`MAX_INTROSPECTION_COST`]).
+pub fn budget(
+    doc: &ExecutableDocument,
+    vars: &Variables,
+    s: &GraphqlSettings,
+) -> Result<Cost, ServerError> {
+    walk(doc, vars, s, false)
+}
+
+fn walk(
+    doc: &ExecutableDocument,
+    vars: &Variables,
+    s: &GraphqlSettings,
+    enforce: bool,
+) -> Result<Cost, ServerError> {
     let mut w = Walk {
+        enforce,
         frags: &doc.fragments,
         vars,
         s,
@@ -560,7 +706,10 @@ pub fn analyze(
             Wrap::None,
         )?;
         w.cost.complexity = w.cost.complexity.max(c);
-        if c > s.max_complexity {
+        if !enforce {
+            over_ceiling(c)?;
+        }
+        if enforce && c > s.max_complexity {
             return Err(limit(
                 "complexity",
                 format!("query complexity {c} exceeds {}", s.max_complexity),
@@ -593,11 +742,22 @@ pub struct Limits;
 
 impl ExtensionFactory for Limits {
     fn create(&self) -> Arc<dyn Extension> {
-        Arc::new(LimitsExt)
+        Arc::new(LimitsExt::default())
     }
 }
 
-struct LimitsExt;
+/// Stock's verdicts on one request, made in `prepare_request` and applied after validation.
+#[derive(Default)]
+struct LimitsExt {
+    stock: std::sync::Mutex<Option<StockVerdict>>,
+}
+
+struct StockVerdict {
+    /// Depth-limit messages (HTTP only, as stock's validation rule).
+    depth: Vec<String>,
+    /// Over stock's complexity; the message to answer.
+    complexity: Option<&'static str>,
+}
 
 #[async_graphql::async_trait::async_trait]
 impl Extension for LimitsExt {
@@ -616,8 +776,79 @@ impl Extension for LimitsExt {
         let s = &ctx.data_unchecked::<Gql>().settings;
         check_sizes(&request.query, &request.variables, s)?;
         let vars = request.variables.clone();
-        analyze(request.parsed_query()?, &vars, s)?;
+        let op = request.operation_name.clone();
+        let doc = request.parsed_query()?;
+        budget(doc, &vars, s)?;
+        // Stock's limits (FIX-3 part C). Over the socket stock runs no depth rule and words
+        // the complexity refusal without its HTTP prefix; over HTTP it skips the complexity
+        // check for an operation named `IntrospectionQuery`.
+        let ws = ctx.data_opt::<crate::ws::ConnSubs>().is_some();
+        let reg = type_registry();
+        let depth = if ws {
+            Vec::new()
+        } else {
+            stock_limits::depth_errors(reg, doc)
+        };
+        // FIX-3 part D (S1): the operation priced is the one the executor runs (none: the
+        // executor refuses the request itself), and the skip needs both stock's name and an
+        // operation of introspection fields alone, so a spoofed name carrying real fields is
+        // priced.
+        let skip = !ws
+            && op.as_deref() == Some(stock_limits::INTROSPECTION_QUERY)
+            && stock_limits::selected_operation(doc, op.as_deref())
+                .is_some_and(|o| stock_limits::pure_introspection(doc, o));
+        let complexity = (!skip && stock_limits::over_complexity(reg, doc, op.as_deref(), &vars))
+            .then_some(if ws {
+                stock_limits::WS_COMPLEXITY_MESSAGE
+            } else {
+                stock_limits::COMPLEXITY_MESSAGE
+            });
+        *self.stock.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(StockVerdict { depth, complexity });
         next.run(ctx, request).await
+    }
+
+    /// Stock's order: the depth rule is one of the validation rules (its errors join the
+    /// others'); the complexity check runs only on a valid document.
+    async fn validation(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        next: NextValidation<'_>,
+    ) -> Result<ValidationResult, Vec<ServerError>> {
+        let verdict = self.stock.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let r = next.run(ctx).await;
+        let Some(v) = verdict else {
+            return r;
+        };
+        let depth: Vec<ServerError> = v
+            .depth
+            .into_iter()
+            .map(|m| stock_refusal(GRAPHQL_VALIDATION_FAILED, "depth", m))
+            .collect();
+        match r {
+            Err(mut es) => {
+                // `check-ops` answers a valid document with one marker error: still valid,
+                // so the complexity check runs as on a served request.
+                let valid = es.iter().all(|e| {
+                    e.extensions.as_ref().and_then(|x| x.get("code"))
+                        == Some(&Value::String(CHECK_PASSED.to_owned()))
+                });
+                if valid && depth.is_empty() {
+                    if let Some(m) = v.complexity {
+                        es.push(stock_refusal(INTERNAL_SERVER_ERROR, "complexity", m));
+                    }
+                }
+                es.extend(depth);
+                Err(es)
+            }
+            Ok(_) if !depth.is_empty() => Err(depth),
+            Ok(_) if v.complexity.is_some() => Err(vec![stock_refusal(
+                INTERNAL_SERVER_ERROR,
+                "complexity",
+                v.complexity.unwrap_or_default(),
+            )]),
+            ok => ok,
+        }
     }
 }
 
@@ -654,6 +885,7 @@ impl Extension for CheckOnlyExt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn cost(q: &str, vars: serde_json::Value) -> Result<Cost, String> {
         let doc = async_graphql::parser::parse_query(q).map_err(|e| e.to_string())?;
@@ -809,7 +1041,7 @@ mod tests {
         let ten: String = (0..10)
             .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
             .collect();
-        assert_eq!(c(&format!("{{ {ten} }}")), Err("\"complexity\"".into()));
+        assert_eq!(c(&format!("{{ {ten} }}")), Err("\"counts\"".into()));
         let two: String = (0..2)
             .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
             .collect();
@@ -817,16 +1049,140 @@ mod tests {
         // A count walk under a per-chain list runs once per chain: refused.
         assert_eq!(
             c("{ fungibleChainAccounts(accountName: \"a\") { transactions { totalCount } } }"),
-            Err("\"complexity\"".into())
+            Err("\"counts\"".into())
         );
         // A block's count is not a walk: kadscan's block list passes.
         assert!(c("{ blocksFromDepth(minimumDepth: 0, first: 25) { totalCount edges { node { transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }").unwrap() < 2000);
     }
 
+    /// FIX-3 part D (S4, S5): the served read budget still refuses more than [`MAX_COUNTS`]
+    /// count walks (resource protection, as before part C), and prices a page as it is
+    /// served: an absent `first`/`last` at `default_page`, a given one as asked, up to the
+    /// safety cap.
+    #[test]
+    fn the_read_budget_counts_walks_and_prices_served_pages() {
+        let b = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            budget(&doc, &Variables::default(), &GraphqlSettings::default()).map_err(|e| {
+                let x = e.extensions.unwrap();
+                format!("{:?} {:?}", x.get("code"), x.get("limit"))
+            })
+        };
+        let refused = format!(
+            "{:?} {:?}",
+            Some(&Value::from("LIMIT")),
+            Some(&Value::from("counts"))
+        );
+        let three: String = (0..3)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
+            .collect();
+        assert_eq!(b(&format!("{{ {three} }}")), Err(refused));
+        let two: String = (0..2)
+            .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
+            .collect();
+        assert!(b(&format!("{{ {two} }}")).is_ok());
+        assert!(
+            b("{ fungibleChainAccounts(accountName: \"a\") { transactions { totalCount } } }")
+                .is_err()
+        );
+        // Pages: absent is the default page (20 items, 1 each, plus the connection).
+        let page = |args: &str| {
+            b(&format!(
+                "{{ transactions{args} {{ edges {{ node {{ hash }} }} }} }}"
+            ))
+            .unwrap()
+            .complexity
+        };
+        assert_eq!(page(""), 21);
+        assert_eq!(page("(first: 500)"), 501);
+        assert_eq!(page("(last: 1000)"), 1001);
+        assert_eq!(page("(first: 5000)"), 1001);
+        assert_eq!(page("(first: -5)"), 1);
+    }
+
+    /// The B1 document: `transactions` with nested `events`, both pages given by `args`.
+    fn nested(outer: &str, inner: &str) -> String {
+        format!(
+            "transactions{outer} {{ edges {{ node {{ result {{ ... on TransactionResult {{ \
+             events{inner} {{ edges {{ node {{ name parameters }} }} }} }} }} }} }} }}"
+        )
+    }
+
+    fn served(q: &str, vars: serde_json::Value) -> Result<u64, String> {
+        let doc = async_graphql::parser::parse_query(q).unwrap();
+        let vars = crate::http::variables(vars).unwrap();
+        budget(&doc, &vars, &GraphqlSettings::default())
+            .map(|c| c.complexity)
+            .map_err(|e| format!("{:?}", e.extensions.unwrap().get("limit")))
+    }
+
+    /// FIX-3 part E (B1): `first: 0` / `last: 0` without a cursor is served as the default
+    /// page, so the read budget prices it so, at every nesting level; with a cursor it serves
+    /// (and costs) 0 rows. Stock's gate still prices it at 0 (parity unchanged).
+    #[test]
+    fn zero_pages_are_priced_as_served() {
+        let absent = served(&format!("{{ {} }}", nested("", "")), json!({})).unwrap();
+        assert!(absent >= 20 * 20, "{absent}");
+        for (o, i) in [
+            ("(first: 0)", "(first: 0)"),
+            ("(last: 0)", "(last: 0)"),
+            ("(first: 0)", "(last: 0)"),
+        ] {
+            let q = format!("{{ {} }}", nested(o, i));
+            assert_eq!(served(&q, json!({})).unwrap(), absent, "{q}");
+            let doc = async_graphql::parser::parse_query(&q).unwrap();
+            let stock =
+                stock_limits::complexity(type_registry(), &doc, None, &Variables::default());
+            assert_eq!(stock, 0.0, "{q}");
+        }
+        let q = format!(
+            "query Q($n: Int) {{ {} }}",
+            nested("(first: $n)", "(first: $n)")
+        );
+        assert_eq!(served(&q, json!({"n": 0})).unwrap(), absent);
+        // With a cursor the count is taken as given: 0 rows.
+        let page = |args: &str| {
+            served(
+                &format!("{{ transactions{args} {{ edges {{ node {{ hash }} }} }} }}"),
+                json!({}),
+            )
+            .unwrap()
+        };
+        assert_eq!(page("(after: \"c\", first: 0)"), 1);
+        assert_eq!(page("(before: \"c\", last: 0)"), 1);
+        assert_eq!(page("(after: \"c\")"), 21);
+        assert_eq!(page("(after: null, first: 0)"), 21);
+    }
+
+    /// B1: aliases of the nested `first: 0` document past the ceiling are refused by the
+    /// budget with `limit = "budget"`; the explorer's documents at real page sizes are not.
+    #[test]
+    fn the_budget_refuses_above_its_ceiling() {
+        let one = served(
+            &format!("{{ {} }}", nested("(first: 0)", "(first: 0)")),
+            json!({}),
+        )
+        .unwrap();
+        let n = (BUDGET_CEILING / one + 1) as usize;
+        let many: String = (0..n)
+            .map(|i| format!("a{i}: {} ", nested("(first: 0)", "(first: 0)")))
+            .collect();
+        assert_eq!(
+            served(&format!("{{ {many} }}"), json!({})),
+            Err(format!("{:?}", Some(&Value::from("budget"))))
+        );
+        let fewer: String = (0..n - 1)
+            .map(|i| format!("a{i}: {} ", nested("(first: 0)", "(first: 0)")))
+            .collect();
+        assert!(served(&format!("{{ {fewer} }}"), json!({})).is_ok_and(|c| c <= BUDGET_CEILING));
+        assert!(over_ceiling(BUDGET_CEILING).is_ok());
+        assert!(over_ceiling(BUDGET_CEILING + 1).is_err());
+    }
+
     #[test]
     fn sr7_3_unresolved_total_counts_fail_closed() {
         let c = |q: &str| cost(q, serde_json::json!({})).map(|c| c.complexity);
-        let over = Err("\"complexity\"".to_string());
+        let over = Err("\"counts\"".to_string());
         // Happy path: two deferred counts pass, a block's own counts are not walks (its
         // events count is priced at a default page, M2).
         assert_eq!(
@@ -871,7 +1227,10 @@ mod tests {
         );
         // An unresolved field is never free: its subtree is priced per item.
         assert!(c("{ ... on Mystery { a b c } }").unwrap() >= 300);
-        assert_eq!(c("{ ... on Mystery { a { b c } } }"), over);
+        assert_eq!(
+            c("{ ... on Mystery { a { b c } } }"),
+            Err("\"complexity\"".into())
+        );
     }
 
     #[test]

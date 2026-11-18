@@ -1134,3 +1134,40 @@ mod count_budget {
         }
     }
 }
+
+/// FIX-3 part C: no page cap (stock has none; its complexity gate bounds `first`): a page of
+/// 500 answers 500 rows, and an absent `first`/`last` is stock's 20.
+#[tokio::test]
+async fn pages_are_served_in_full_and_default_to_20() {
+    let fx = fixture_big(GraphqlSettings::default(), 600);
+    let q = |args: &str| {
+        format!(
+            "{{ transactions(accountName: \"{ALICE}\"{args}) {{ pageInfo {{ hasNextPage }} edges {{ node {{ hash }} }} }} }}"
+        )
+    };
+    let v = run(&fx.schema, &q(", first: 500")).await;
+    let c = &v["transactions"];
+    assert_eq!(c["edges"].as_array().map(Vec::len), Some(500), "{v}");
+    assert_eq!(c["pageInfo"]["hasNextPage"], true);
+    let v = run(&fx.schema, &q(", last: 500")).await;
+    assert_eq!(
+        v["transactions"]["edges"].as_array().map(Vec::len),
+        Some(500)
+    );
+    let v = run(&fx.schema, &q("")).await;
+    assert_eq!(
+        v["transactions"]["edges"].as_array().map(Vec::len),
+        Some(20)
+    );
+    // A block list too (it had a wide clamp of 200).
+    let v = run(
+        &fx.schema,
+        "{ blocksFromHeight(startHeight: 0, chainIds: [\"0\"], first: 500) { edges { node { height } } } }",
+    )
+    .await;
+    assert_eq!(
+        v["blocksFromHeight"]["edges"].as_array().map(Vec::len),
+        Some(500),
+        "{v}"
+    );
+}

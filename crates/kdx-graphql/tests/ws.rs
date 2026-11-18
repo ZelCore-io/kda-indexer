@@ -396,11 +396,12 @@ async fn sizes(ws: &mut Ws, n: usize, field: &str) -> BTreeMap<String, Vec<Vec<i
 }
 
 /// I-1, M3: a message carries at most its priced blocks: one per subscribed chain without
-/// `quantity`, and the newest `quantity` (clamped to `max_page`) with it.
+/// `quantity`, and the newest `quantity` with it (FIX-3 part D: `max_page` no longer clamps
+/// it; the safety cap is 1,000).
 #[tokio::test]
 async fn messages_carry_at_most_their_priced_blocks() {
     let settings = GraphqlSettings {
-        max_page: 2,
+        max_page: 1,
         ..GraphqlSettings::default()
     };
     let s = server(settings, 1000).await;
@@ -413,7 +414,7 @@ async fn messages_carry_at_most_their_priced_blocks() {
         ),
         (
             "2",
-            "subscription { newBlocks(chainIds: [\"0\"], quantity: 3) { height } }",
+            "subscription { newBlocks(chainIds: [\"0\"], quantity: 2) { height } }",
         ),
     ] {
         send(
@@ -833,4 +834,62 @@ async fn flood_from_a_full_bucket_is_closed_at_message_rate_burst_plus_one() {
     assert_eq!(code, 4429);
     // `rate_burst` messages (the init and 39 pings) are answered; message 41 is refused.
     assert_eq!(accepted, BURST, "messages answered before the close");
+}
+
+/// FIX-3 part C: stock's `onSubscribe` refuses a subscription over 4,000 by its formula with
+/// its websocket text (no `[ERROR]` prefix).
+#[tokio::test]
+async fn complexity_over_4000_is_refused_with_stock_s_socket_text() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let q = "subscription { transactions(quantity: 4001) { hash } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": q}}),
+    )
+    .await;
+    let m = recv(&mut a).await.unwrap();
+    let errors = if m["type"] == "error" {
+        &m["payload"]
+    } else {
+        &m["payload"]["errors"]
+    };
+    assert_eq!(
+        errors[0]["message"],
+        "Sorry, too complicated query! Exceeded the maximum allowed complexity.",
+        "{m}"
+    );
+    assert_eq!(errors[0]["extensions"]["limit"], "complexity", "{m}");
+}
+
+/// FIX-3 part D (S3, P4): a subscription `quantity` is served up to the 1,000-row safety cap
+/// (stock has no cap); above it the subscription is refused with a `LIMIT` named `page`.
+#[tokio::test]
+async fn quantity_above_the_safety_cap_is_refused() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let ok = "subscription { newBlocks(chainIds: [\"0\"], quantity: 1000) { height } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": ok}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    let over = "subscription { newBlocks(chainIds: [\"0\"], quantity: 1001) { height } }";
+    send(
+        &mut a,
+        json!({"id": "2", "type": "subscribe", "payload": {"query": over}}),
+    )
+    .await;
+    let m = recv(&mut a).await.unwrap();
+    let errors = if m["type"] == "error" {
+        &m["payload"]
+    } else {
+        &m["payload"]["errors"]
+    };
+    assert_eq!(m["id"], "2", "{m}");
+    assert_eq!(errors[0]["extensions"]["code"], "LIMIT", "{m}");
+    assert_eq!(errors[0]["extensions"]["limit"], "page", "{m}");
 }

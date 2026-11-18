@@ -76,7 +76,7 @@ impl Query {
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Depth(depth),
-            PageArgs::new(after, before, first, last).wide(),
+            PageArgs::new(after, before, first, last),
         )
         .await?;
         Ok(Some(QueryBlocksFromDepthConnection {
@@ -109,7 +109,7 @@ impl Query {
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Heights { start, end },
-            PageArgs::new(after, before, first, last).wide(),
+            PageArgs::new(after, before, first, last),
         )
         .await?;
         Ok(QueryBlocksFromHeightConnection {
@@ -146,7 +146,7 @@ impl Query {
                 count: count as u64,
                 complete: completed_heights.unwrap_or(true),
             },
-            PageArgs::new(after, before, first, last).wide(),
+            PageArgs::new(after, before, first, last),
         )
         .await?;
         Ok(QueryCompletedBlockHeightsConnection {
@@ -315,7 +315,11 @@ impl Query {
     ) -> Result<Option<NonFungibleAccount>> {
         Ok(crate::types::nft::non_fungible(ctx, &account_name, None)
             .await?
-            .map(|(account, items)| NonFungibleAccount { account, items }))
+            .map(|(account, items, cut)| NonFungibleAccount {
+                account,
+                items,
+                cut,
+            }))
     }
 
     async fn non_fungible_chain_account(
@@ -330,10 +334,11 @@ impl Query {
             Some(crate::txlist::chain_arg(&chain_id)?),
         )
         .await?
-        .map(|(account, items)| NonFungibleChainAccount {
+        .map(|(account, items, cut)| NonFungibleChainAccount {
             account,
             chain: crate::txlist::chain_arg(&chain_id).unwrap_or(0),
             items,
+            cut,
         }))
     }
 

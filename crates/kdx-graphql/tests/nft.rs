@@ -23,6 +23,10 @@ const V1: &str = "marmalade.ledger";
 /// - `t:3` (v1): guard read at 5, before the row moved (stale), and no `get-token-info`;
 /// - `t:4` (v2): the node had no ledger row, and its info call failed.
 async fn answer(q: &str) -> Value {
+    answer_with(q, GraphqlSettings::default()).await
+}
+
+async fn answer_with(q: &str, gql: GraphqlSettings) -> Value {
     let d = tempfile::tempdir().unwrap();
     let g = kdx_hot::Geometry {
         max_gb: 1,
@@ -66,6 +70,15 @@ async fn answer(q: &str) -> Value {
         nft::put_token_details(&mut txn, &nft::token_details_key_of(&k), &failed).unwrap();
         txn.commit().unwrap();
     }
+    serve(&d, hot, q, gql).await
+}
+
+async fn serve(
+    d: &tempfile::TempDir,
+    hot: Arc<kdx_hot::HotStore>,
+    q: &str,
+    gql: GraphqlSettings,
+) -> Value {
     let store = Arc::new(Store::open(hot, d.path()).unwrap());
     let settings = ApiSettings {
         network: "mainnet01".into(),
@@ -81,7 +94,7 @@ async fn answer(q: &str) -> Value {
         max_event_lists: 64,
     };
     let st = Api::new(store, settings, TipWatch::default()).state();
-    let app = router(build_schema(st.clone(), GraphqlSettings::default(), None)).with_state(st);
+    let app = router(build_schema(st.clone(), gql, None)).with_state(st);
     let req = Request::post("/graphql")
         .header("content-type", "application/json")
         .body(Body::from(json!({ "query": q }).to_string()))
@@ -169,4 +182,89 @@ async fn nft_guard_and_info_resolve_and_missing_details_error_per_field() {
         .unwrap_or_else(|| panic!("{v}"));
     assert_eq!(items.len(), 4);
     assert_eq!(v["errors"].as_array().map(Vec::len), Some(2), "{v}");
+}
+
+/// FIX-3 part D (P4): an account's holdings are all returned, as stock returns them (up to
+/// the 1,000-row safety cap), not cut at `max_page`.
+#[tokio::test]
+async fn holdings_are_not_cut_at_max_page() {
+    let gql = GraphqlSettings {
+        max_page: 2,
+        ..GraphqlSettings::default()
+    };
+    let v = answer_with(
+        "{ nonFungibleAccount(accountName: \"k:holder\") { nonFungibleTokenBalances { tokenId } } }",
+        gql,
+    )
+    .await;
+    let items = v["data"]["nonFungibleAccount"]["nonFungibleTokenBalances"]
+        .as_array()
+        .map(Vec::len);
+    assert_eq!(items, Some(4), "{v}");
+}
+
+/// `n` holdings of `k:big` on chain 0 (no details read: select `tokenId` only).
+async fn big_holder(n: usize, q: &str) -> Value {
+    let d = tempfile::tempdir().unwrap();
+    let g = kdx_hot::Geometry {
+        max_gb: 1,
+        growth_mb: 16,
+    };
+    let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+    {
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let a = dict.intern(DictKind::Account, "k:big");
+        let v2 = dict.intern(DictKind::Module, V2);
+        dict.persist(&mut txn).unwrap();
+        for i in 0..n {
+            nft::upsert_event(&mut txn, a, &format!("t:{i}"), 0, v2, 10, "1.0").unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    serve(&d, hot, q, GraphqlSettings::default()).await
+}
+
+/// FIX-3 part E (S1): holdings are served up to 10,000; above it the first 10,000 come with
+/// a partial-data `LIMIT` error named `nft_holdings` at the field, never cut silently.
+#[tokio::test]
+async fn holdings_over_the_cap_are_served_with_a_limit_error() {
+    let max = kdx_graphql::MAX_NFT_HOLDINGS;
+    assert_eq!(max, 10_000);
+    let q = "{ nonFungibleAccount(accountName: \"k:big\") { accountName \
+             nonFungibleTokenBalances { tokenId } \
+             chainAccounts { nonFungibleTokenBalances { tokenId } } } }";
+    let v = big_holder(max, q).await;
+    let acct = &v["data"]["nonFungibleAccount"];
+    assert_eq!(
+        acct["nonFungibleTokenBalances"].as_array().map(Vec::len),
+        Some(max)
+    );
+    assert!(v.get("errors").is_none(), "{}", v["errors"]);
+    let v = big_holder(max + 1, q).await;
+    let acct = &v["data"]["nonFungibleAccount"];
+    assert_eq!(acct["accountName"], "k:big");
+    assert_eq!(
+        acct["nonFungibleTokenBalances"].as_array().map(Vec::len),
+        Some(max)
+    );
+    let errs = v["errors"].as_array().expect("a limit error");
+    assert_eq!(errs.len(), 2, "{errs:?}");
+    for e in errs {
+        assert_eq!(e["extensions"]["code"], "LIMIT", "{e}");
+        assert_eq!(e["extensions"]["limit"], "nft_holdings", "{e}");
+    }
+    assert_eq!(
+        errs[0]["path"],
+        json!(["nonFungibleAccount", "nonFungibleTokenBalances"])
+    );
+    assert_eq!(
+        errs[1]["path"],
+        json!([
+            "nonFungibleAccount",
+            "chainAccounts",
+            0,
+            "nonFungibleTokenBalances"
+        ])
+    );
 }

@@ -79,6 +79,17 @@ pub fn bad_input(msg: impl Into<String>) -> async_graphql::Error {
     err(Code::BadUserInput, msg)
 }
 
+/// The message of the page safety cap's refusal ([`page_limit`]).
+pub const PAGE_LIMIT_MESSAGE: &str =
+    "a page holds at most 1000 rows (first, last and quantity above it are refused)";
+
+/// The refusal of a page over [`crate::MAX_PAGE_ROWS`] (FIX-3 part D, S3): `LIMIT`, with
+/// `extensions.limit = "page"`. Counts `kdx_graphql_rejected_total{reason = "page"}`.
+pub fn page_limit() -> async_graphql::Error {
+    kdx_metrics::get().graphql_rejected("page");
+    err(Code::Limit, PAGE_LIMIT_MESSAGE).extend_with(|_, e| e.set("limit", "page"))
+}
+
 /// A request-level `LIMIT` refusal: `extensions.code = "LIMIT"`, `extensions.limit = name`.
 /// Counts `kdx_graphql_rejected_total{reason = name}`.
 pub fn limit(name: &'static str, msg: impl Into<String>) -> ServerError {
@@ -86,6 +97,28 @@ pub fn limit(name: &'static str, msg: impl Into<String>) -> ServerError {
     let mut e = ServerError::new(msg, None);
     let mut x = async_graphql::ErrorExtensionValues::default();
     x.set("code", Code::Limit.as_str());
+    x.set("limit", name);
+    e.extensions = Some(x);
+    e
+}
+
+/// Stock's `extensions.code` of a refusal thrown in `didResolveOperation` (complexity).
+pub const INTERNAL_SERVER_ERROR: &str = "INTERNAL_SERVER_ERROR";
+/// Stock's `extensions.code` of a validation error (depth).
+pub const GRAPHQL_VALIDATION_FAILED: &str = "GRAPHQL_VALIDATION_FAILED";
+
+/// A refusal of the stock indexer's limits (FIX-3 part C): stock's message and code, and
+/// `extensions.limit = name` so ours still names the limit. Counts
+/// `kdx_graphql_rejected_total{reason = name}`.
+pub fn stock_refusal(
+    code: &'static str,
+    name: &'static str,
+    msg: impl Into<String>,
+) -> ServerError {
+    kdx_metrics::get().graphql_rejected(name);
+    let mut e = ServerError::new(msg, None);
+    let mut x = async_graphql::ErrorExtensionValues::default();
+    x.set("code", code);
     x.set("limit", name);
     e.extensions = Some(x);
     e

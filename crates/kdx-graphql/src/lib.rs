@@ -25,6 +25,8 @@ pub mod limits;
 pub mod loaders;
 pub mod scalars;
 pub mod schema;
+pub mod stock_limits;
+pub mod stock_schema;
 #[cfg(test)]
 mod testutil;
 pub mod txlist;
@@ -42,9 +44,15 @@ pub type KdxSchema = Schema<schema::Query, EmptyMutation, types::subscription::S
 pub struct GraphqlSettings {
     /// Page size when a connection gets neither `first` nor `last`.
     pub default_page: usize,
-    /// Larger `first`/`last` values are clamped to this (not refused).
+    /// Page size of the legacy cost model ([`limits::analyze`]) only. Served pages, a
+    /// subscription's `quantity` and NFT holdings are bounded by [`MAX_PAGE_ROWS`] (FIX-3
+    /// part D).
     pub max_page: usize,
+    /// Depth of the read-budget model ([`limits::analyze`]); not enforced: stock's depth
+    /// limit is ([`stock_limits`]).
     pub max_depth: usize,
+    /// Read budget of the cost model ([`limits::budget`]); over it a request is logged, not
+    /// refused: stock's complexity limit refuses ([`stock_limits`]).
     pub max_complexity: u64,
     pub introspection: bool,
     /// Depth cap of `__schema`/`__type` subtrees (exempt from `max_depth`).
@@ -84,17 +92,19 @@ pub struct GraphqlSettings {
     pub count_budget: Duration,
 }
 
+/// Hard safety cap of the rows of one list page (`first`/`last`), of a subscription's
+/// `quantity` and of an account's NFT holdings (FIX-3 part D, S3). It applies after stock's
+/// complexity gate: a page above it is refused (`LIMIT`, `extensions.limit = "page"`), where
+/// stock answers it slowly or times out; holdings are cut at it.
+pub const MAX_PAGE_ROWS: usize = 1000;
+
+/// Most NFT holdings of one account served (FIX-3 part E, S1). Above it the first
+/// `MAX_NFT_HOLDINGS` are served with a partial-data `LIMIT` error
+/// (`extensions.limit = "nft_holdings"`), never cut silently.
+pub const MAX_NFT_HOLDINGS: usize = 10_000;
+
 /// Request body cap (plan GQ-9: body ≤ 128 KB).
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
-
-impl GraphqlSettings {
-    /// The clamp of the few lists that need more than `max_page`: the block lists (the home
-    /// list asks 120) and account balances (the assets tab asks 200); twice `max_page`,
-    /// 200 by default (R-P5P9-20). The per-item cost floor still bounds them.
-    pub fn wide_page(&self) -> usize {
-        self.max_page.saturating_mul(2)
-    }
-}
 
 impl Default for GraphqlSettings {
     fn default() -> Self {

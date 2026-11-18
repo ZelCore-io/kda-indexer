@@ -943,12 +943,17 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bo
     Ok((n, true))
 }
 
-/// Steps of a pact a `crossChainTransfer` lookup reads first, and at most when the pact has
-/// more (failed retries of a continuation can push the step that succeeded out of the
-/// newest 16; R-P5P9-57, node-checked: pact `XSU4iQjQ…` has 34 steps). The larger bound is
-/// the native defpact cap.
-const XCHAIN_STEPS: usize = 16;
+/// Steps of a pact one outgoing `crossChainTransfer` lookup lists at most, oldest first
+/// (the native defpact cap). The walk stops at the step that succeeded, which a pact holds at
+/// most once per step and which comes before its failed retries ("Already used"), so this
+/// binds only on a pact with that many failed steps before the success (O2: the newest-first
+/// walk it replaces missed the success behind more than 1,000 later retries).
 const XCHAIN_STEPS_MAX: usize = 1_000;
+/// Heights below the start tx an outgoing lookup still reads. A continuation's SPV proof is
+/// checked on a later block than the start (the target chain must have the source block in
+/// its past), so none should be needed; the margin only costs opening a few more posting
+/// lists, never a record read (the pact's postings hold only its own txs).
+const XCHAIN_HEIGHT_SLACK: u32 = 1_000;
 /// Pact-step reads one request may spend on `crossChainTransfer` lookups, shared by every
 /// edge and field of the request (H-1: a page of transfers whose pacts carry many retries
 /// cannot multiply the per-item bound). Past it a lookup answers "no other half", as one
@@ -994,43 +999,55 @@ pub fn xchain_budget(ctx: &Context<'_>) -> Arc<XchainBudget> {
         .unwrap_or_default()
 }
 
-/// The first succeeded continuation step of a pact (oldest first), other than `me`, that
-/// `matches`. `steps_of(cap)` lists up to `cap` steps (the newest ones, ascending) and
-/// whether there are more. Reads [`XCHAIN_STEPS`] first and, only when the pact has more,
-/// again up to [`XCHAIN_STEPS_MAX`]; every listed step and every full decode is paid from
-/// `budget`, and `check` (the request deadline) runs before each decode. Start and failed
+/// The first succeeded continuation step of a pact, other than `me`, that `matches`.
+/// `steps` lists the pact's steps oldest first, lazily. Every listed step is paid from
+/// `budget` before it is read (at most [`XCHAIN_STEPS_MAX`] per lookup), and so is every
+/// full decode; `check` (the request deadline) runs before each decode. Start and failed
 /// steps are skipped on their stored flags, with no decode. A spent budget answers `None`.
 fn find_step<T>(
-    mut steps_of: impl FnMut(usize) -> ApiResult<(Vec<PactStep>, bool)>,
+    mut steps: impl Iterator<Item = ApiResult<PactStep>>,
     me: TxKey,
     budget: &XchainBudget,
     mut check: impl FnMut() -> ApiResult<()>,
     mut matches: impl FnMut(TxKey) -> ApiResult<Option<T>>,
 ) -> ApiResult<Option<T>> {
-    for want in [XCHAIN_STEPS, XCHAIN_STEPS_MAX] {
-        let cap = budget.take(want);
-        if cap == 0 {
+    for _ in 0..XCHAIN_STEPS_MAX {
+        if budget.take(1) == 0 {
             return Ok(None);
         }
-        let (steps, capped) = steps_of(cap)?;
-        budget.refund(cap.saturating_sub(steps.len()));
-        for st in steps {
-            if !st.cont || !st.ok || st.key == me {
-                continue;
-            }
-            check()?;
-            if budget.take(1) == 0 {
-                return Ok(None);
-            }
-            if let Some(t) = matches(st.key)? {
-                return Ok(Some(t));
-            }
+        let Some(st) = steps.next() else {
+            budget.refund(1);
+            return Ok(None);
+        };
+        let st = st?;
+        if !st.cont || !st.ok || st.key == me {
+            continue;
         }
-        if !capped || cap < want {
-            break;
+        check()?;
+        if budget.take(1) == 0 {
+            return Ok(None);
+        }
+        if let Some(t) = matches(st.key)? {
+            return Ok(Some(t));
         }
     }
     Ok(None)
+}
+
+/// The continuation step of the pact `pact` (started by `me`) that `matches`, for the
+/// outgoing half of a cross-chain transfer: the pact's steps from `me`'s height on, oldest
+/// first, stopping at the first succeeded `cont` that matches. On a normal pact that is the
+/// start and its one continuation: two listed steps and one decode.
+fn outgoing_cont<T>(
+    view: &View,
+    pact: &Hash32,
+    me: TxKey,
+    budget: &XchainBudget,
+    check: impl FnMut() -> ApiResult<()>,
+    matches: impl FnMut(TxKey) -> ApiResult<Option<T>>,
+) -> ApiResult<Option<T>> {
+    let steps = view.pact_steps_oldest(pact, me.height().saturating_sub(XCHAIN_HEIGHT_SLACK))?;
+    find_step(steps, me, budget, check, matches)
 }
 
 /// The other half of the cross-chain transfer at `trs[i]` of `d`: for an outgoing half
@@ -1053,8 +1070,9 @@ pub fn xchain_of(
         let Some(rk) = d.rec.request_key else {
             return Ok(None);
         };
-        return find_step(
-            |cap| view.pact_steps(&rk, cap),
+        return outgoing_cont(
+            view,
+            &rk,
             d.key(),
             budget,
             || view.check_deadline(),
@@ -1517,28 +1535,30 @@ mod xchain_tests {
         PactStep { key, cont, ok }
     }
 
-    /// The newest `cap` of `all` (ascending) and whether there are more, as `pact_steps`.
-    fn newest(all: &[PactStep], cap: usize) -> (Vec<PactStep>, bool) {
-        let from = all.len().saturating_sub(cap);
-        (all[from..].to_vec(), from > 0)
+    /// `all` (oldest first) as `pact_steps_oldest` streams it, counting the steps read.
+    fn stream<'a>(
+        all: &'a [PactStep],
+        read: &'a Cell<usize>,
+    ) -> impl Iterator<Item = ApiResult<PactStep>> + 'a {
+        all.iter().map(move |s| {
+            read.set(read.get() + 1);
+            Ok(*s)
+        })
     }
 
-    /// R-P5P9-57 (F10 crossChainTransfer): the step that succeeded is found even when more
-    /// than 16 later retries of the continuation follow it; failed retries are never decoded.
+    /// R-P5P9-57 and O2: the step that succeeded is found however many later retries of the
+    /// continuation follow it, and the walk stops there; failed retries are never decoded.
     #[test]
-    fn successful_step_behind_many_retries_is_found() {
+    fn successful_step_before_many_retries_is_found() {
         let me = TxKey::new(3_115_490, 2, 1);
         let ok = TxKey::new(3_115_507, 1, 1);
         let mut all = vec![step(me, false, true), step(ok, true, true)];
-        all.extend((0..32u32).map(|i| step(TxKey::new(3_115_509 + i, 1, 2), true, false)));
+        all.extend((0..1_200u32).map(|i| step(TxKey::new(3_115_509 + i, 1, 2), true, false)));
         let budget = XchainBudget::default();
-        let mut caps = Vec::new();
+        let read = Cell::new(0);
         let decoded = Cell::new(0);
         let got = find_step(
-            |cap| {
-                caps.push(cap);
-                Ok(newest(&all, cap))
-            },
+            stream(&all, &read),
             me,
             &budget,
             || Ok(()),
@@ -1549,52 +1569,74 @@ mod xchain_tests {
         )
         .unwrap();
         assert_eq!(got, Some(ok));
-        assert_eq!(caps, [XCHAIN_STEPS, XCHAIN_STEPS_MAX]);
-        assert_eq!(decoded.get(), 1, "only the succeeded step is decoded");
-        // Charged: the 16 listed, the 34 listed, one decode.
-        assert_eq!(XCHAIN_BUDGET - budget.left(), 16 + 34 + 1);
+        assert_eq!((read.get(), decoded.get()), (2, 1));
+        // Charged: the 2 listed, one decode.
+        assert_eq!(XCHAIN_BUDGET - budget.left(), 2 + 1);
     }
 
-    /// The honest case: a short pact is read once; the start itself never matches.
+    /// The honest case: a short pact costs its steps and one decode; the start itself never
+    /// matches, and an exhausted stream refunds its last grant.
     #[test]
-    fn short_pact_is_read_once() {
+    fn short_pact_costs_its_steps() {
         let me = TxKey::new(10, 0, 1);
         let ok = TxKey::new(12, 1, 1);
         let all = vec![step(me, false, true), step(ok, true, true)];
         let budget = XchainBudget::default();
-        let mut calls = 0;
-        let got = find_step(
-            |cap| {
-                calls += 1;
-                Ok(newest(&all, cap))
-            },
-            me,
-            &budget,
-            || Ok(()),
-            |k| Ok(Some(k)),
-        )
-        .unwrap();
-        assert_eq!((got, calls), (Some(ok), 1));
+        let read = Cell::new(0);
+        let got = find_step(stream(&all, &read), me, &budget, || Ok(()), |k| Ok(Some(k)));
+        assert_eq!(got.unwrap(), Some(ok));
         assert_eq!(XCHAIN_BUDGET - budget.left(), 2 + 1);
+        let budget = XchainBudget::default();
+        let only_me = [step(me, true, true)];
         let none = find_step(
-            |_| Ok((vec![step(me, true, true)], false)),
+            stream(&only_me, &read),
             me,
             &budget,
             || Ok(()),
             |k| Ok(Some(k)),
-        )
-        .unwrap();
-        assert_eq!(none, None);
+        );
+        assert_eq!(none.unwrap(), None);
+        assert_eq!(XCHAIN_BUDGET - budget.left(), 1);
     }
 
-    /// The security finding on e7da3d0: a page of N edges whose pacts each carry more than
-    /// 16 failed retries spends at most the request budget in total (not N times the
-    /// per-item bound); past it every lookup answers `None`, not an error.
+    /// A non-matching success does not stop the walk (a later step of a longer pact may
+    /// carry the transfer); one lookup lists at most `XCHAIN_STEPS_MAX` steps.
+    #[test]
+    fn the_walk_is_bounded_per_lookup() {
+        let me = TxKey::new(10, 0, 1);
+        let all: Vec<PactStep> = (0..1_500u32)
+            .map(|i| step(TxKey::new(11 + i, 1, 1), true, i == 3 || i == 1_200))
+            .collect();
+        let budget = XchainBudget::default();
+        let read = Cell::new(0);
+        let decoded = Cell::new(0);
+        let got = find_step(
+            stream(&all, &read),
+            me,
+            &budget,
+            || Ok(()),
+            |k| {
+                decoded.set(decoded.get() + 1);
+                Ok((k == all[1_200].key).then_some(k))
+            },
+        );
+        assert_eq!(
+            got.unwrap(),
+            None,
+            "the match lies past the per-lookup bound"
+        );
+        assert_eq!((read.get(), decoded.get()), (XCHAIN_STEPS_MAX, 1));
+        assert_eq!(XCHAIN_BUDGET - budget.left(), XCHAIN_STEPS_MAX + 1);
+    }
+
+    /// The security finding on e7da3d0: a page of N edges whose pacts each carry many failed
+    /// retries (and no success) spends at most the request budget in total, and reads no
+    /// step it has not paid for; past it every lookup answers `None`, not an error.
     #[test]
     fn a_page_of_retry_heavy_pacts_stays_within_the_request_budget() {
         const N: usize = 100;
         let budget = XchainBudget::default();
-        let listed = Cell::new(0usize);
+        let read = Cell::new(0usize);
         let decoded = Cell::new(0usize);
         let mut answers = Vec::new();
         for e in 0..N as u32 {
@@ -1604,11 +1646,7 @@ mod xchain_tests {
                 (0..900u32).map(|i| step(TxKey::new(2_000 + i, 1, 1 + e as u16), true, false)),
             );
             let got = find_step(
-                |cap| {
-                    let r = newest(&all, cap);
-                    listed.set(listed.get() + r.0.len());
-                    Ok(r)
-                },
+                stream(&all, &read),
                 me,
                 &budget,
                 || Ok(()),
@@ -1621,20 +1659,15 @@ mod xchain_tests {
         }
         assert!(answers.iter().all(Option::is_none));
         assert_eq!(decoded.get(), 0, "failed retries are never decoded");
-        assert!(listed.get() <= XCHAIN_BUDGET, "listed {}", listed.get());
+        assert_eq!(read.get(), XCHAIN_BUDGET, "read {}", read.get());
         assert_eq!(budget.left(), 0);
-        // An honest pact after the budget is spent answers "no other half".
+        // An honest pact after the budget is spent answers "no other half", reading nothing.
         let me = TxKey::new(5, 0, 1);
         let ok = TxKey::new(6, 1, 1);
         let all = [step(me, false, true), step(ok, true, true)];
-        let got = find_step(
-            |cap| Ok(newest(&all, cap)),
-            me,
-            &budget,
-            || Ok(()),
-            |k| Ok(Some(k)),
-        );
+        let got = find_step(stream(&all, &read), me, &budget, || Ok(()), |k| Ok(Some(k)));
         assert_eq!(got.unwrap(), None);
+        assert_eq!(read.get(), XCHAIN_BUDGET);
     }
 
     /// The count walk stops at the sooner of its budget and half the deadline left.
@@ -1659,8 +1692,9 @@ mod xchain_tests {
         ];
         let budget = XchainBudget::default();
         let decoded = Cell::new(0);
+        let read = Cell::new(0);
         let got = find_step(
-            |cap| Ok(newest(&all, cap)),
+            stream(&all, &read),
             me,
             &budget,
             || Err(ApiError::Deadline),
@@ -1671,5 +1705,189 @@ mod xchain_tests {
         );
         assert!(matches!(got, Err(ApiError::Deadline)));
         assert_eq!(decoded.get(), 0);
+    }
+}
+
+/// FIX-3 (O2): the outgoing half of a cross-chain transfer, read from a real store.
+#[cfg(test)]
+mod xchain_store_tests {
+    use std::cell::Cell;
+
+    use kdx_decode::index::pact_entity;
+    use kdx_decode::{IndexedBlock, TxIndex};
+    use kdx_types::record::BlockRecord;
+
+    use super::*;
+    use crate::testutil::{self, Fixture};
+
+    /// The start tx of every pact here (chain 2); it is not stored, the walk skips it.
+    fn start(n: u32) -> TxKey {
+        TxKey::new(100 + n, 2, 1)
+    }
+
+    /// A synthetic pact id (never a real request key).
+    fn pact(n: u8) -> Hash32 {
+        Hash32([0xA0 + n; 32])
+    }
+
+    /// Block (chain 0, `height`): its coinbase, then one `cont` step of `p` per flag.
+    fn block(height: u32, p: &Hash32, oks: &[bool]) -> IndexedBlock {
+        let cmd = serde_json::json!({"payload": {"cont": {"pactId": p.to_b64url(), "step": 1}}});
+        let coinbase = TxRecord {
+            key: TxKey::new(height, 0, 0),
+            status_ok: true,
+            ..TxRecord::default()
+        };
+        let txs: Vec<TxRecord> = std::iter::once(coinbase)
+            .chain(oks.iter().enumerate().map(|(i, &ok)| {
+                let mut rk = [0u8; 32];
+                rk[..4].copy_from_slice(&height.to_be_bytes());
+                rk[4..6].copy_from_slice(&(i as u16).to_be_bytes());
+                rk[6] = p.0[0];
+                TxRecord {
+                    key: TxKey::new(height, 0, i as u16 + 1),
+                    request_key: Some(Hash32(rk)),
+                    cmd: Some(serde_json::to_vec(&cmd).unwrap()),
+                    status_ok: ok,
+                    ..TxRecord::default()
+                }
+            }))
+            .collect();
+        let idx = txs
+            .iter()
+            .map(|r| TxIndex {
+                key: r.key,
+                postings: if r.key.is_coinbase() {
+                    Vec::new()
+                } else {
+                    vec![(Family::Pact, pact_entity(p))]
+                },
+                pact_id: None,
+                code_hash: None,
+            })
+            .collect();
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&height.to_be_bytes());
+        IndexedBlock {
+            block: BlockRecord {
+                hash: Hash32(h),
+                chain: 0,
+                height: u64::from(height),
+                ..BlockRecord::default()
+            },
+            txs,
+            idx,
+            cmd_reencoded: 0,
+            unindexed_accounts: 0,
+        }
+    }
+
+    /// Store `blocks` of pact `p` from `height` on (one block per entry), returning the next
+    /// free height.
+    fn put(f: &Fixture, mut height: u32, p: &Hash32, blocks: &[Vec<bool>]) -> u32 {
+        for oks in blocks {
+            f.apply_block(&block(height, p, oks));
+            height += 1;
+        }
+        height
+    }
+
+    fn view(f: &Fixture) -> View {
+        f.st.store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap()
+    }
+
+    /// The lookup with a matcher that accepts every step it is asked about, counting decodes.
+    fn lookup(
+        v: &View,
+        n: u8,
+        budget: &XchainBudget,
+        decoded: &Cell<usize>,
+    ) -> ApiResult<Option<TxKey>> {
+        outgoing_cont(
+            v,
+            &pact(n),
+            start(u32::from(n)),
+            budget,
+            || v.check_deadline(),
+            |k| {
+                decoded.set(decoded.get() + 1);
+                Ok(Some(k))
+            },
+        )
+    }
+
+    /// O2: one successful continuation, then 1,200 failed retries (more than the old
+    /// 1,000-step newest-first cap): the link is found, and cheaply.
+    #[test]
+    fn success_then_1200_failed_retries_is_found() {
+        let f = testutil::store();
+        let p = pact(1);
+        let mut h = put(&f, 200, &p, &[vec![true]]);
+        h = put(&f, h, &p, &vec![vec![false; 100]; 12]);
+        assert_eq!(h, 213);
+        let v = view(&f);
+        let budget = XchainBudget::default();
+        let decoded = Cell::new(0);
+        let got = lookup(&v, 1, &budget, &decoded).unwrap();
+        assert_eq!(got, Some(TxKey::new(200, 0, 1)));
+        assert_eq!(decoded.get(), 1);
+        let spent = XCHAIN_BUDGET - budget.left();
+        assert!(spent < 20, "spent {spent} reads");
+    }
+
+    /// The success is not the first step: failed retries before and after it.
+    #[test]
+    fn success_between_failed_retries_is_found() {
+        let f = testutil::store();
+        let p = pact(2);
+        let mut h = put(&f, 300, &p, &[vec![false, false, false]]);
+        h = put(&f, h, &p, &[vec![false, true, false]]);
+        put(&f, h, &p, &vec![vec![false; 100]; 11]);
+        let v = view(&f);
+        let budget = XchainBudget::default();
+        let decoded = Cell::new(0);
+        let got = lookup(&v, 2, &budget, &decoded).unwrap();
+        assert_eq!(got, Some(TxKey::new(301, 0, 2)));
+        assert_eq!(decoded.get(), 1, "failed steps are never decoded");
+        assert!(XCHAIN_BUDGET - budget.left() < 20);
+    }
+
+    /// No step succeeded: no other half, and no error.
+    #[test]
+    fn no_success_is_none() {
+        let f = testutil::store();
+        let p = pact(3);
+        put(&f, 400, &p, &[vec![false; 5], vec![false; 3]]);
+        let v = view(&f);
+        let budget = XchainBudget::default();
+        let decoded = Cell::new(0);
+        assert_eq!(lookup(&v, 3, &budget, &decoded).unwrap(), None);
+        assert_eq!(decoded.get(), 0);
+        // A pact with no stored step at all.
+        assert_eq!(lookup(&v, 9, &budget, &decoded).unwrap(), None);
+    }
+
+    /// A full page of lookups whose pacts hold only failed retries spends at most the
+    /// request budget, then every lookup (an honest one too) answers `None`, not an error.
+    #[test]
+    fn a_page_exhausting_the_budget_degrades_to_none() {
+        let f = testutil::store();
+        let mut h = 500;
+        for n in 1..=3u8 {
+            h = put(&f, h, &pact(n), &vec![vec![false; 100]; 9]);
+        }
+        put(&f, h, &pact(4), &[vec![true]]);
+        let v = view(&f);
+        let budget = XchainBudget::default();
+        let decoded = Cell::new(0);
+        for n in 1..=3u8 {
+            assert_eq!(lookup(&v, n, &budget, &decoded).unwrap(), None);
+        }
+        assert_eq!(budget.left(), 0, "the budget is spent");
+        assert_eq!(decoded.get(), 0);
+        assert_eq!(lookup(&v, 4, &budget, &decoded).unwrap(), None);
+        assert_eq!(budget.left(), 0);
     }
 }
