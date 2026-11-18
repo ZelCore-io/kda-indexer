@@ -91,6 +91,28 @@ pub fn limit(name: &'static str, msg: impl Into<String>) -> ServerError {
     e
 }
 
+/// Stock's `extensions.code` of a refusal thrown in `didResolveOperation` (complexity).
+pub const INTERNAL_SERVER_ERROR: &str = "INTERNAL_SERVER_ERROR";
+/// Stock's `extensions.code` of a validation error (depth).
+pub const GRAPHQL_VALIDATION_FAILED: &str = "GRAPHQL_VALIDATION_FAILED";
+
+/// A refusal of the stock indexer's limits (FIX-3 part C): stock's message and code, and
+/// `extensions.limit = name` so ours still names the limit. Counts
+/// `kdx_graphql_rejected_total{reason = name}`.
+pub fn stock_refusal(
+    code: &'static str,
+    name: &'static str,
+    msg: impl Into<String>,
+) -> ServerError {
+    kdx_metrics::get().graphql_rejected(name);
+    let mut e = ServerError::new(msg, None);
+    let mut x = async_graphql::ErrorExtensionValues::default();
+    x.set("code", code);
+    x.set("limit", name);
+    e.extensions = Some(x);
+    e
+}
+
 /// A request-level error with a code (no position).
 pub fn server(code: Code, msg: impl Into<String>) -> ServerError {
     let mut e = ServerError::new(msg, None);

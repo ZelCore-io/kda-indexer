@@ -253,8 +253,12 @@ async fn execute(
         BatchResponse::Batch(rs) => rs.iter().map(outcome).max().unwrap_or(Outcome::Ok),
     };
     kdx_metrics::get().graphql_request(kind, result.label());
+    let status = match &resp {
+        BatchResponse::Single(r) => stock_status(r),
+        BatchResponse::Batch(_) => StatusCode::OK,
+    };
     match crate::error::wire_json(&resp) {
-        Ok(b) => json_response(StatusCode::OK, &b),
+        Ok(b) => json_response(status, &b),
         Err(e) => {
             tracing::error!(error = %e, "graphql: response serialization");
             error_body(
@@ -265,7 +269,37 @@ async fn execute(
     }
 }
 
-/// The `result` label of a response: a `LIMIT` refusal outranks other errors.
+/// The HTTP status stock (Apollo Server 4) answers a refusal of its limits with (FIX-3 part
+/// C): 500 for the complexity check (thrown in `didResolveOperation`), 400 for a validation
+/// error such as the depth rule. Everything else keeps ours (200).
+fn stock_status(r: &Response) -> StatusCode {
+    let code = |e: &async_graphql::ServerError| {
+        e.extensions
+            .as_ref()
+            .and_then(|x| x.get("code"))
+            .and_then(|c| match c {
+                ConstValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+    };
+    let refused = |c: &str, limit: &str| {
+        r.errors.iter().any(|e| {
+            code(e).as_deref() == Some(c)
+                && e.extensions.as_ref().and_then(|x| x.get("limit"))
+                    == Some(&ConstValue::String(limit.to_owned()))
+        })
+    };
+    if refused(crate::error::GRAPHQL_VALIDATION_FAILED, "depth") {
+        StatusCode::BAD_REQUEST
+    } else if refused(crate::error::INTERNAL_SERVER_ERROR, "complexity") {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    }
+}
+
+/// The `result` label of a response: a refusal (`LIMIT`, or a stock limit) outranks other
+/// errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Outcome {
     Ok,
@@ -288,8 +322,7 @@ fn outcome(r: &Response) -> Outcome {
     if r.errors.iter().any(|e| {
         e.extensions
             .as_ref()
-            .and_then(|x| x.get("code"))
-            .is_some_and(|c| *c == limit)
+            .is_some_and(|x| x.get("code").is_some_and(|c| *c == limit) || x.get("limit").is_some())
     }) {
         Outcome::Rejected
     } else if r.is_ok() {

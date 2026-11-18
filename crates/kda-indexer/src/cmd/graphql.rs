@@ -34,7 +34,13 @@ pub async fn check_doc(schema: &kdx_graphql::KdxSchema, text: &str) -> Verdict {
     for e in &resp.errors {
         match code(e).as_deref() {
             Some(kdx_graphql::limits::CHECK_PASSED) => {}
-            Some("LIMIT") => {
+            // `LIMIT`, or a refusal of the stock indexer's limits (FIX-3 part C: stock's
+            // code, with `extensions.limit` naming it).
+            _ if e
+                .extensions
+                .as_ref()
+                .is_some_and(|x| x.get("limit").is_some()) =>
+            {
                 let name = e
                     .extensions
                     .as_ref()
@@ -128,6 +134,23 @@ mod tests {
             "}".repeat(10)
         );
         assert_eq!(check_doc(&s, &deep).await, Verdict::Limit("depth".into()));
+        // Stock's complexity limit (4000).
+        assert_eq!(
+            check_doc(
+                &s,
+                "{ transactions(first: 4001) { edges { node { hash } } } }"
+            )
+            .await,
+            Verdict::Limit("complexity".into())
+        );
+        assert_eq!(
+            check_doc(
+                &s,
+                "{ transactions(first: 4000) { edges { node { hash } } } }"
+            )
+            .await,
+            Verdict::InScope
+        );
         // Subscriptions validate too.
         assert_eq!(
             check_doc(&s, "subscription { newBlocks(chainIds: [\"0\"]) { hash } }").await,

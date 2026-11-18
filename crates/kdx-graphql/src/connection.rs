@@ -24,7 +24,7 @@ pub enum Dir {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<C> {
     pub dir: Dir,
-    /// Items to return (clamped to `max_page`; fetch `n + 1` to know if there are more).
+    /// Items to return (fetch `n + 1` to know if there are more).
     pub n: usize,
     pub cursor: Option<C>,
 }
@@ -97,8 +97,6 @@ pub struct PageArgs {
     pub last: Option<i32>,
     pub before: Option<String>,
     pub after: Option<String>,
-    /// The field takes the wide clamp (`GraphqlSettings::wide_page`).
-    pub wide: bool,
 }
 
 impl PageArgs {
@@ -113,35 +111,28 @@ impl PageArgs {
             last,
             before,
             after,
-            wide: false,
         }
     }
 
-    /// Clamp to the wide page (block lists and account balances, R-P5P9-20) instead of
-    /// `max_page`.
-    pub fn wide(mut self) -> PageArgs {
-        self.wide = true;
-        self
-    }
-
     /// The page. `first` with `last`, negative counts, `after` with `last` or `before` with
-    /// `first` are `BAD_USER_INPUT`; counts above `max_page` are clamped (GQ-9).
+    /// `first` are `BAD_USER_INPUT`. No count is clamped (FIX-3 part C): stock has no page
+    /// cap, and its complexity gate (`stock_limits`, run before any resolver) bounds `first`
+    /// and `last` instead; absent, the page is stock's 20 (`default_page`).
     pub fn parse(&self, s: &GraphqlSettings) -> async_graphql::Result<Page<PageCursor>> {
-        let cap = if self.wide { s.wide_page() } else { s.max_page };
         let clamp = |n: i32| -> async_graphql::Result<usize> {
             if n < 0 {
                 return Err(bad_input("first and last must not be negative"));
             }
-            Ok((n as usize).min(cap))
+            Ok(n as usize)
         };
         let (dir, n) = match (self.first, self.last) {
             (Some(_), Some(_)) => return Err(bad_input("pass first or last, not both")),
             (Some(f), None) => (Dir::Forward, clamp(f)?),
             (None, Some(l)) => (Dir::Backward, clamp(l)?),
             (None, None) if self.before.is_some() && self.after.is_none() => {
-                (Dir::Backward, s.default_page.min(s.max_page))
+                (Dir::Backward, s.default_page)
             }
-            (None, None) => (Dir::Forward, s.default_page.min(s.max_page)),
+            (None, None) => (Dir::Forward, s.default_page),
         };
         let cursor = match (dir, &self.after, &self.before) {
             (_, Some(_), Some(_)) => return Err(bad_input("pass after or before, not both")),
@@ -230,33 +221,20 @@ mod tests {
         GraphqlSettings::default()
     }
 
+    /// FIX-3 part C: no clamp (stock has none; its complexity gate bounds the page), and
+    /// stock's 20 when `first`/`last` are absent.
     #[test]
-    fn page_sizes_are_clamped_not_refused() {
+    fn page_sizes_are_served_as_asked() {
         let p = PageArgs::new(None, None, Some(1000), None)
             .parse(&s())
             .unwrap();
-        assert_eq!((p.dir, p.n), (Dir::Forward, 100));
+        assert_eq!((p.dir, p.n), (Dir::Forward, 1000));
         let p = PageArgs::new(None, None, None, Some(5))
             .parse(&s())
             .unwrap();
         assert_eq!((p.dir, p.n), (Dir::Backward, 5));
         let p = PageArgs::default().parse(&s()).unwrap();
         assert_eq!((p.dir, p.n), (Dir::Forward, 20));
-        // The wide clamp (block lists, account balances): up to 200, no further.
-        let p = PageArgs::new(None, None, Some(120), None)
-            .wide()
-            .parse(&s())
-            .unwrap();
-        assert_eq!(p.n, 120);
-        let p = PageArgs::new(None, None, Some(1000), None)
-            .wide()
-            .parse(&s())
-            .unwrap();
-        assert_eq!(p.n, 200);
-        let p = PageArgs::new(None, None, Some(120), None)
-            .parse(&s())
-            .unwrap();
-        assert_eq!(p.n, 100);
     }
 
     #[test]

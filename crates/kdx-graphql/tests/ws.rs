@@ -834,3 +834,30 @@ async fn flood_from_a_full_bucket_is_closed_at_message_rate_burst_plus_one() {
     // `rate_burst` messages (the init and 39 pings) are answered; message 41 is refused.
     assert_eq!(accepted, BURST, "messages answered before the close");
 }
+
+/// FIX-3 part C: stock's `onSubscribe` refuses a subscription over 4,000 by its formula with
+/// its websocket text (no `[ERROR]` prefix).
+#[tokio::test]
+async fn complexity_over_4000_is_refused_with_stock_s_socket_text() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let q = "subscription { transactions(quantity: 4001) { hash } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": q}}),
+    )
+    .await;
+    let m = recv(&mut a).await.unwrap();
+    let errors = if m["type"] == "error" {
+        &m["payload"]
+    } else {
+        &m["payload"]["errors"]
+    };
+    assert_eq!(
+        errors[0]["message"],
+        "Sorry, too complicated query! Exceeded the maximum allowed complexity.",
+        "{m}"
+    );
+    assert_eq!(errors[0]["extensions"]["limit"], "complexity", "{m}");
+}

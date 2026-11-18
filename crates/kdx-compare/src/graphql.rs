@@ -3364,7 +3364,11 @@ fn text_decimal(v: Option<&Value>) -> Option<String> {
 pub(crate) fn keysetref_name(g: &Value) -> Option<String> {
     let r = g.get("keysetref")?;
     let ksn = r.get("ksn")?.as_str().filter(|s| !s.is_empty())?;
-    match r.get("ns").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    match r
+        .get("ns")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         Some(ns) => Some(format!("{ns}.{ksn}")),
         None => Some(ksn.to_owned()),
     }
@@ -3376,10 +3380,7 @@ pub(crate) fn reread_agrees(graphql: &str, native: &str) -> bool {
     if same_decimal(graphql, native) {
         return true;
     }
-    match (
-        graphql.trim().parse::<f64>(),
-        native.trim().parse::<f64>(),
-    ) {
+    match (graphql.trim().parse::<f64>(), native.trim().parse::<f64>()) {
         (Ok(x), Ok(y)) => x.is_finite() && x == y,
         _ => false,
     }
@@ -3558,10 +3559,15 @@ pub fn page_data(v: &Value) -> Result<Value, PageError> {
             .and_then(Value::as_str)
             .map(str::to_string)
     };
+    // FIX-3 part C: ours now refuses with stock's text (`limit` still names it); stock's
+    // own refusal carries the same text and no `limit`.
     let complexity = errors.is_some_and(|es| {
         es.iter().any(|e| {
-            field(e, "code").as_deref() == Some("LIMIT")
-                && field(e, "limit").as_deref() == Some("complexity")
+            (field(e, "code").as_deref() == Some("LIMIT")
+                && field(e, "limit").as_deref() == Some("complexity"))
+                || e.get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.contains("Exceeded the maximum allowed complexity"))
         })
     });
     let text = match errors {
@@ -3594,6 +3600,10 @@ mod tests {
         let top = json!({"data": null, "errors": [{"message": "m", "code": "LIMIT",
             "limit": "complexity"}]});
         assert!(super::page_data(&top).unwrap_err().complexity);
+        // Stock's refusal text (stock's own answer, and ours since FIX-3 part C).
+        let stock = json!({"errors": [{"message": "[ERROR][GRAPHQL][VALID_RANGE] Sorry, too complicated query! Exceeded the maximum allowed complexity.",
+            "code": "INTERNAL_SERVER_ERROR"}]});
+        assert!(super::page_data(&stock).unwrap_err().complexity);
         // Another limit, or another code: not a complexity refusal.
         let depth = json!({"errors": [{"message": "m",
             "extensions": {"code": "LIMIT", "limit": "depth"}}]});
@@ -3616,12 +3626,18 @@ mod tests {
             super::keysetref_name(&json!({"keysetref": {"ns": null, "ksn": "ks"}})),
             Some("ks".into())
         );
-        assert_eq!(super::keysetref_name(&json!({"keys": [], "pred": "keys-all"})), None);
+        assert_eq!(
+            super::keysetref_name(&json!({"keys": [], "pred": "keys-all"})),
+            None
+        );
         assert!(super::reread_agrees(
             "78366.18873465271",
             "78366.188734652711000000000000000000"
         ));
-        assert!(!super::reread_agrees("78366.1887346527", "78366.188734652711"));
+        assert!(!super::reread_agrees(
+            "78366.1887346527",
+            "78366.188734652711"
+        ));
     }
 
     use super::*;

@@ -33,7 +33,8 @@ use async_graphql::parser::types::{
 use async_graphql::registry::Registry;
 use async_graphql::{Name, Request, ServerError, ServerResult, ValidationResult, Value, Variables};
 
-use crate::error::limit;
+use crate::error::{limit, stock_refusal, GRAPHQL_VALIDATION_FAILED, INTERNAL_SERVER_ERROR};
+use crate::stock_limits;
 use crate::{Gql, GraphqlSettings};
 
 /// Parser recursion cap (nesting of selection sets and values).
@@ -152,6 +153,9 @@ struct Walk<'a> {
     intro_cost: u64,
     /// `crossChainTransfer` fields on the current path (M-5).
     xchain: usize,
+    /// Refuse on this model's depth, complexity and count limits ([`analyze`]); off for the
+    /// served gate ([`budget`]), where stock's limits refuse instead (FIX-3 part C).
+    enforce: bool,
 }
 
 /// A `crossChainTransfer` inside another one (M-5): priced as the per-item store read it
@@ -240,7 +244,7 @@ impl<'a> Walk<'a> {
                     let d = depth + 1;
                     if intro {
                         self.cost.introspection_depth = self.cost.introspection_depth.max(d);
-                        if d > self.s.introspection_depth {
+                        if self.enforce && d > self.s.introspection_depth {
                             return Err(limit(
                                 "introspection_depth",
                                 format!(
@@ -251,7 +255,7 @@ impl<'a> Walk<'a> {
                         }
                     } else {
                         self.cost.depth = self.cost.depth.max(d);
-                        if d > self.s.max_depth {
+                        if self.enforce && d > self.s.max_depth {
                             return Err(limit(
                                 "depth",
                                 format!("query depth exceeds {}", self.s.max_depth),
@@ -264,7 +268,7 @@ impl<'a> Walk<'a> {
                         None
                     };
                     if list.is_some() {
-                        if self.intro_lists.contains(&name) {
+                        if self.enforce && self.intro_lists.contains(&name) {
                             return Err(limit(
                                 "introspection_nesting",
                                 format!("introspection field `{name}` repeats on one path"),
@@ -309,7 +313,7 @@ impl<'a> Walk<'a> {
                         "totalCount" if !(wrap == Wrap::Conn && ty.is_some_and(cheap_count)) => {
                             // A count walk (GQ-10): a fixed cost, and few per operation.
                             self.counts = self.counts.saturating_add(self.outer);
-                            if self.counts > MAX_COUNTS {
+                            if self.enforce && self.counts > MAX_COUNTS {
                                 return Err(limit(
                                     "complexity",
                                     format!(
@@ -455,7 +459,7 @@ impl<'a> Walk<'a> {
         // The wide lists clamp at `wide_page` (R-P5P9-20), everything else at `max_page`.
         let name = f.name.node.as_str();
         let cap = if WIDE.contains(&name) {
-            s.wide_page()
+            s.max_page.saturating_mul(2)
         } else {
             s.max_page
         };
@@ -506,13 +510,35 @@ impl<'a> Walk<'a> {
 }
 
 /// The cost of every operation of `doc` (the largest), or the `LIMIT` error of the first
-/// limit it passes.
+/// limit of this model it passes. Not the served gate: see [`budget`].
 pub fn analyze(
     doc: &ExecutableDocument,
     vars: &Variables,
     s: &GraphqlSettings,
 ) -> Result<Cost, ServerError> {
+    walk(doc, vars, s, true)
+}
+
+/// The served pass of this model (FIX-3 part C): a read budget only. It refuses nothing
+/// stock's limits ([`crate::stock_limits`]) would serve on depth, complexity or counts; it
+/// keeps only the bounds of the walk itself ([`MAX_VISITS`] fields after fragment expansion,
+/// [`MAX_DIRECTIVES`]) and the introspection cost cap ([`MAX_INTROSPECTION_COST`]).
+pub fn budget(
+    doc: &ExecutableDocument,
+    vars: &Variables,
+    s: &GraphqlSettings,
+) -> Result<Cost, ServerError> {
+    walk(doc, vars, s, false)
+}
+
+fn walk(
+    doc: &ExecutableDocument,
+    vars: &Variables,
+    s: &GraphqlSettings,
+    enforce: bool,
+) -> Result<Cost, ServerError> {
     let mut w = Walk {
+        enforce,
         frags: &doc.fragments,
         vars,
         s,
@@ -560,7 +586,7 @@ pub fn analyze(
             Wrap::None,
         )?;
         w.cost.complexity = w.cost.complexity.max(c);
-        if c > s.max_complexity {
+        if enforce && c > s.max_complexity {
             return Err(limit(
                 "complexity",
                 format!("query complexity {c} exceeds {}", s.max_complexity),
@@ -593,11 +619,22 @@ pub struct Limits;
 
 impl ExtensionFactory for Limits {
     fn create(&self) -> Arc<dyn Extension> {
-        Arc::new(LimitsExt)
+        Arc::new(LimitsExt::default())
     }
 }
 
-struct LimitsExt;
+/// Stock's verdicts on one request, made in `prepare_request` and applied after validation.
+#[derive(Default)]
+struct LimitsExt {
+    stock: std::sync::Mutex<Option<StockVerdict>>,
+}
+
+struct StockVerdict {
+    /// Depth-limit messages (HTTP only, as stock's validation rule).
+    depth: Vec<String>,
+    /// Over stock's complexity; the message to answer.
+    complexity: Option<&'static str>,
+}
 
 #[async_graphql::async_trait::async_trait]
 impl Extension for LimitsExt {
@@ -616,8 +653,78 @@ impl Extension for LimitsExt {
         let s = &ctx.data_unchecked::<Gql>().settings;
         check_sizes(&request.query, &request.variables, s)?;
         let vars = request.variables.clone();
-        analyze(request.parsed_query()?, &vars, s)?;
+        let op = request.operation_name.clone();
+        let doc = request.parsed_query()?;
+        let cost = budget(doc, &vars, s)?;
+        if cost.complexity > s.max_complexity {
+            tracing::debug!(cost = cost.complexity, "graphql: over the read budget");
+        }
+        // Stock's limits (FIX-3 part C). Over the socket stock runs no depth rule and words
+        // the complexity refusal without its HTTP prefix; over HTTP it skips the complexity
+        // check for an operation named `IntrospectionQuery`.
+        let ws = ctx.data_opt::<crate::ws::ConnSubs>().is_some();
+        let reg = type_registry();
+        let depth = if ws {
+            Vec::new()
+        } else {
+            stock_limits::depth_errors(reg, doc)
+        };
+        // A document of several operations needs a name, refused later without one.
+        let several = matches!(&doc.operations, DocumentOperations::Multiple(m) if m.len() > 1);
+        let skip = (!ws && op.as_deref() == Some(stock_limits::INTROSPECTION_QUERY))
+            || (op.is_none() && several);
+        let complexity = (!skip && stock_limits::over_complexity(reg, doc, op.as_deref(), &vars))
+            .then_some(if ws {
+                stock_limits::WS_COMPLEXITY_MESSAGE
+            } else {
+                stock_limits::COMPLEXITY_MESSAGE
+            });
+        *self.stock.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(StockVerdict { depth, complexity });
         next.run(ctx, request).await
+    }
+
+    /// Stock's order: the depth rule is one of the validation rules (its errors join the
+    /// others'); the complexity check runs only on a valid document.
+    async fn validation(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        next: NextValidation<'_>,
+    ) -> Result<ValidationResult, Vec<ServerError>> {
+        let verdict = self.stock.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let r = next.run(ctx).await;
+        let Some(v) = verdict else {
+            return r;
+        };
+        let depth: Vec<ServerError> = v
+            .depth
+            .into_iter()
+            .map(|m| stock_refusal(GRAPHQL_VALIDATION_FAILED, "depth", m))
+            .collect();
+        match r {
+            Err(mut es) => {
+                // `check-ops` answers a valid document with one marker error: still valid,
+                // so the complexity check runs as on a served request.
+                let valid = es.iter().all(|e| {
+                    e.extensions.as_ref().and_then(|x| x.get("code"))
+                        == Some(&Value::String(CHECK_PASSED.to_owned()))
+                });
+                if valid && depth.is_empty() {
+                    if let Some(m) = v.complexity {
+                        es.push(stock_refusal(INTERNAL_SERVER_ERROR, "complexity", m));
+                    }
+                }
+                es.extend(depth);
+                Err(es)
+            }
+            Ok(_) if !depth.is_empty() => Err(depth),
+            Ok(_) if v.complexity.is_some() => Err(vec![stock_refusal(
+                INTERNAL_SERVER_ERROR,
+                "complexity",
+                v.complexity.unwrap_or_default(),
+            )]),
+            ok => ok,
+        }
     }
 }
 

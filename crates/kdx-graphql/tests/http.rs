@@ -83,24 +83,34 @@ async fn limits_answer_limit_fast() {
         "parent { ".repeat(7),
         "}".repeat(7)
     );
-    let complex = format!(
-        "{{ blocksFromHeight(startHeight: 0, first: 100) {{ edges {{ node {{ {} }} }} }} }}",
-        fields(20)
-    );
-    let aliases: String = (0..100)
+    // Stock's limits (FIX-3 part C): `parent` nested 7 times is over graphile's limits (a
+    // coordinate nests at most twice), 41 aliased pages of 100 cost 4,100 by stock's formula.
+    let aliases: String = (0..41)
         .map(|i| format!("t{i}: transactions(blockHash: \"x\", first: 100) {{ edges {{ node {{ hash }} }} }} "))
         .collect();
     let big = format!("{{ lastBlockHeight }} #{}", "x".repeat(33 * 1024));
-    for (q, want) in [
-        (deep, "depth"),
-        (complex, "complexity"),
-        (format!("{{ {aliases} }}"), "complexity"),
-        (big, "query_size"),
+    for (q, want, status) in [
+        (deep, "depth", StatusCode::BAD_REQUEST),
+        (
+            format!("{{ {aliases} }}"),
+            "complexity",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (big, "query_size", StatusCode::OK),
     ] {
         let (s, v, el) = query(&f, &q).await;
-        assert_eq!((s, limit_of(&v)), (StatusCode::OK, Some(want)), "{v}");
+        let got = v["errors"][0]["extensions"]["limit"].as_str();
+        assert_eq!((s, got), (status, Some(want)), "{v}");
         assert!(el < Duration::from_millis(100), "{want}: {el:?}");
     }
+    // A page of 100 with 20 fields costs 100 by stock's formula (leaves are free): served.
+    let wide = format!(
+        "{{ blocksFromHeight(startHeight: 0, first: 100) {{ edges {{ node {{ {} }} }} }} }}",
+        fields(20)
+    );
+    let (s, v, _) = query(&f, &wide).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v.get("errors").is_none(), "{v}");
     let batch: Vec<Value> = (0..11)
         .map(|_| json!({"query": "{ graphConfiguration { version } }"}))
         .collect();
@@ -131,7 +141,10 @@ async fn limits_answer_limit_fast() {
 #[tokio::test]
 async fn introspection_and_unserved_fields() {
     let f = fixture();
-    let (s, v, _) = query(&f, INTROSPECTION).await;
+    // The full document is over stock's introspection depth (see `stock_limits`); without
+    // the arguments of fields it answers in full.
+    let shallow = INTROSPECTION.replace("    args { ...InputValue }\n", "");
+    let (s, v, _) = query(&f, &shallow).await;
     assert_eq!(s, StatusCode::OK);
     assert!(v.get("errors").is_none(), "{v}");
     let types = v["data"]["__schema"]["types"].as_array().unwrap();
@@ -379,4 +392,85 @@ async fn parallel_fragment_bombs_leave_other_listeners_answering() {
         assert_eq!(limit_of(&v), Some("complexity"), "{v}");
     }
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+}
+
+/// FIX-3 part C: the stock indexer's refusals, with stock's text, code and HTTP status.
+mod stock_limits {
+    use super::*;
+
+    const COMPLEXITY: &str = "[ERROR][GRAPHQL][VALID_RANGE] Sorry, too complicated query! Exceeded the maximum allowed complexity.";
+
+    fn page(n: u32) -> String {
+        format!("{{ transactions(first: {n}) {{ edges {{ node {{ hash }} }} }} }}")
+    }
+
+    #[tokio::test]
+    async fn complexity_over_4000_is_refused_as_stock_refuses_it() {
+        let f = fixture();
+        // 4000 by stock's formula passes, 4001 is refused: HTTP 500, stock's message, and
+        // stock's code at the top level (ours keeps `extensions`, with the limit named).
+        let (s, v, _) = query(&f, &page(4000)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+        let (s, v, _) = query(&f, &page(4001)).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        let e = &v["errors"][0];
+        assert_eq!(e["message"], COMPLEXITY, "{v}");
+        assert_eq!(e["code"], "INTERNAL_SERVER_ERROR", "{v}");
+        assert_eq!(e["extensions"]["limit"], "complexity", "{v}");
+        assert!(
+            e.get("locations").is_none() && e.get("path").is_none(),
+            "{v}"
+        );
+        assert!(v.get("data").is_none_or(Value::is_null), "{v}");
+        // The explorer's transactions-by-account document at first: 100 costs 300.
+        let doc = include_str!("../../../compare/graphql/QTransactionsByAccount.graphql");
+        let (s, v, _) = post(
+            &f,
+            json!({"query": doc, "variables": {"accountName": "k:a", "first": 100}}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+        // Stock skips the check for an operation named IntrospectionQuery.
+        let named = page(5000).replacen('{', "query IntrospectionQuery {", 1);
+        let (s, v, _) = post(
+            &f,
+            json!({"query": named, "operationName": "IntrospectionQuery"}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("errors").is_none(), "{v}");
+        // A validation error comes before the complexity check, as in stock.
+        let bad = page(5000).replace("hash", "nope");
+        let (_, v, _) = query(&f, &bad).await;
+        assert_ne!(v["errors"][0]["message"], COMPLEXITY, "{v}");
+    }
+
+    #[tokio::test]
+    async fn depth_over_9_is_refused_as_stock_refuses_it() {
+        let f = fixture();
+        let nine = "query D { transaction(requestKey: \"x\") { result { ... on TransactionResult { block { parent { minerAccount { transactions { edges { node { cmd { nonce } } } } } } } } } } }";
+        let (s, v, _) = query(&f, nine).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(
+            v["errors"][0]["extensions"]["code"] != "GRAPHQL_VALIDATION_FAILED",
+            "{v}"
+        );
+        let ten = nine.replace("cmd { nonce }", "cmd { meta { chainId } }");
+        let (s, v, _) = query(&f, &ten).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let e = &v["errors"][0];
+        assert_eq!(e["message"], "'D' exceeds operation depth limits.", "{v}");
+        assert_eq!(e["code"], "GRAPHQL_VALIDATION_FAILED", "{v}");
+        assert_eq!(e["extensions"]["limit"], "depth", "{v}");
+        // The full introspection document is over graphile's introspection depth (12) in
+        // stock too; a shallower one answers.
+        let (s, v, _) = query(&f, INTROSPECTION).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["errors"][0]["message"], "'IntrospectionQuery' exceeds operation depth limits.",
+            "{v}"
+        );
+    }
 }
