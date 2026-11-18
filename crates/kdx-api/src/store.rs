@@ -160,7 +160,7 @@ impl Store {
         let id = manifest_id(&segdir)?;
         let seg = Segments::open(&segdir, mem.clone())?;
         let genesis = load_genesis(&hot.ro()?)?;
-        Ok(Store {
+        let st = Store {
             hot,
             segdir,
             seg: ArcSwap::from_pointee(seg),
@@ -172,7 +172,18 @@ impl Store {
             dict_reloading: AtomicBool::new(false),
             genesis: ArcSwap::from_pointee(genesis),
             sender_index: AtomicBool::new(true),
-        })
+        };
+        st.publish_sender_ready()?;
+        Ok(st)
+    }
+
+    /// Set `kdx_sender_index_ready` from the current segments and the hot store: at open and
+    /// after every segment refresh, so the gauge is right before the first sender list runs
+    /// (FIX-2 fix 4). The hot side only changes offline (add-index, drop-family).
+    fn publish_sender_ready(&self) -> anyhow::Result<()> {
+        let ready = self.seg.load().sender_ready() && kdx_hot::sndr::hot_ready(&self.hot.ro()?)?;
+        kdx_metrics::get().sender_index_ready.set(i64::from(ready));
+        Ok(())
     }
 
     /// `[graphql] sender_index`: `false` makes every view answer sender lists by the old
@@ -212,7 +223,7 @@ impl Store {
                 Ok(Some(s)) => {
                     self.seg.store(Arc::new(s));
                     *cur = id;
-                    return Ok(());
+                    return self.publish_sender_ready();
                 }
                 Ok(None) => {
                     *cur = id;
