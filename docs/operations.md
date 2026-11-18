@@ -176,8 +176,10 @@ systemctl start kda-indexer-mainnet01
 - `--jobs N` (default 4) entries run in parallel, each independent. Memory per job is about
   8 B per sender posting plus 8 B per request key and block hash of the entry, plus the
   filter under construction (the largest mainnet entry, 14.3 M txs, stays under 0.6 GB).
-- Then the hot pass (one write txn): a `sndr` row and its undo op for every hot tx, and
-  `Meta sndr_hot = 1`. Skipped when the key is already set.
+- Then the hot pass (one write txn): a `sndr` row and its undo op for every hot tx that
+  lacks one, and `Meta sndr_hot = 1`. It runs even when the key is already set (it adds
+  nothing to a complete tail and takes seconds), so it also repairs a tail an older binary
+  extended (see the rollback section below).
 - The dictionary is only read. A sender that is an indexable account but has no id fails
   that entry (nothing swapped, exit 1); the other entries still complete.
 - `--only sndr` / `--only filter` builds one of the two (`--only filter` skips the hot pass).
@@ -197,24 +199,27 @@ entries and does nothing on a finished store. The JSON report lists per entry `t
 `senders`, `sndr_bytes`, `filter_bytes`, `seconds`, the hot pass and the totals; the exit
 code is 1 if an entry or the hot pass failed.
 
-Check afterwards with `segments check --deep` (it verifies `sndr ⊆ acct` and every key
-against its filter). The sender index is used for queries only once every range has its
-`sndr` lists and the hot pass has set `Meta sndr_hot` (`hot stats` shows it).
+Check afterwards with `segments check --deep`. It verifies `sndr ⊆ acct`, that the sender
+index is complete (every tx with an indexed sender has its `sndr` posting and, with the hot
+dictionary, each `sndr` list is exactly the txs its account sent), and every key against its
+filter. The sender index is used for queries only once every range has its `sndr` lists and
+the hot pass has set `Meta sndr_hot` (`hot stats` shows it; the `kdx_sender_index_ready`
+gauge is 1 from the start).
 
-## Rollback to a build without them
+**A damaged `sndr.pst`.** A listed `sndr.pst` whose header does not decode fails the whole
+store open (`run` and `serve` exit, naming the range): the sender lists must not
+silently lose a range. Recovery, with the service stopped: delete that `sndr.pst` and run
+`segments add-index` again (a listed-but-missing file is rebuilt). A damaged or missing
+`kf.fil` only turns that range's filter off (WARN, `kdx_key_filter_untrusted`); the
+same rerun rebuilds it. If the writer cannot build a filter at all, it writes the step or
+range without `kf.fil` (WARN) rather than stall the freeze or merge.
 
-Run `hot drop-family sndr` first (below), then install the older package. The older binary
-reads the segments as before. At its first start it deletes `sndr.pst` and `kf.fil` (its
-cleanup does not know them) while `range.toml` keeps listing them, so its `segments check`
-reports them missing. That is expected. Going forward again, run `segments add-index`: it
-rebuilds exactly those files.
-
-## Rolling back past the sender index
+## Rolling back to a build before FIX-2
 
 From FIX-2 on, the tail writes the `sndr` posting family (family 6, the txs an account sent;
-see [format.md](format.md)) into the hot store. An older binary does not know family 6: its
-freezer stops with `posting family` at the first such row (nothing is written). Before
-installing an older package, remove the family with the new binary, offline:
+see [format.md](format.md)) into the hot store, and every range gets `sndr.pst` and `kf.fil`.
+`hot drop-family sndr` is **required** before installing an older package. Offline, with the
+new binary:
 
 ```sh
 systemctl stop kda-indexer-mainnet01
@@ -224,9 +229,25 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml hot drop-f
 It takes the data-dir lock and runs one write txn: it deletes every `TailPostings` row of
 family 6, strips the matching `UndoOp::Posting` ops from the `Undo` rows (so an unwind by the
 old binary finds nothing it does not know) and deletes `Meta sndr_hot`. It prints the counts.
-Then install the old package and start the unit. Only `sndr` can be dropped; the required
-families are refused. A data dir without a hot store is refused (exit 1); nothing is
-created.
+Only `sndr` can be dropped; the required families are refused. A data dir without a hot
+store is refused (exit 1); nothing is created. Then install the old package and start the
+unit.
+
+The older binary reads the segments as before. At its first start it deletes `sndr.pst` and
+`kf.fil` (its cleanup does not know them) while `range.toml` keeps listing them, so its
+`segments check` reports them missing. That is expected.
+
+**If `drop-family` was skipped.** The old binary's freezer stops with `posting family` at the
+first family-6 row: nothing is frozen and the hot tail keeps growing. The tail rows it writes
+have no `sndr` postings while `Meta sndr_hot` still says 1, so the sender index has a gap. Run
+`hot drop-family sndr` with the new binary to get the old one freezing again, or upgrade
+again.
+
+**Going forward again** (either way): install the new package and run `segments add-index`
+before starting the unit. It rebuilds the deleted `sndr.pst` and `kf.fil`, and its hot pass
+(which always runs) adds the `sndr` rows any tail block lacks. The new freezer never copies
+`sndr` postings from hot rows: it derives them from the records, so a step frozen over a
+gappy tail is still complete. `segments check --deep` then proves the index complete.
 
 ## Read-only `serve`
 
