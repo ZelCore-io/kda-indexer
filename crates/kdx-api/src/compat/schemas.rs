@@ -204,18 +204,50 @@ pub enum LimitErrors {
     TooManyRequests(String),
     /// `api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`
     /// (`response larger than N MB: narrow the query`), `search.concurrency` searches are
-    /// running, or (on `/stats`) the first count is not ready. Search refusals and `/stats`
-    /// carry `Retry-After`.
+    /// running, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`
+    /// and `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one
+    /// heavy request and has others waiting is refused too (`this client already runs a heavy
+    /// request and has others waiting: retry when they are done`). Search refusals and
+    /// `/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.
     #[response(
         status = 503,
         content_type = "text/plain",
-        headers(("Retry-After" = String, description = "Seconds to wait; absent on the in-flight and body-size refusals."))
+        headers(("Retry-After" = String, description = "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."))
     )]
     Unavailable(String),
     /// A read failed; the cause is logged, the body is `internal error`.
     #[response(status = 500, content_type = "text/plain")]
     Internal(String),
     /// The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.
+    #[response(status = 504, content_type = "text/plain")]
+    Deadline(String),
+}
+
+/// Answers of `/v1/txs`: its own deadline, slot pool and body cap, so the shared
+/// `LimitErrors` text for 503 and 504 does not apply.
+#[derive(IntoResponses)]
+pub enum V1TxsLimitErrors {
+    /// The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up. Retry
+    /// after the `Retry-After` seconds.
+    #[response(
+        status = 429,
+        content_type = "text/plain",
+        headers(("Retry-After" = String, description = "Seconds to wait (1)."))
+    )]
+    TooManyRequests(String),
+    /// Refused, without `Retry-After`: `api.max_in_flight` requests are running; no
+    /// `/v1/txs` slot freed within `api.deadline_ms` (5 s by default), `too many /v1/txs
+    /// requests running: retry later`; the client already runs a heavy request and has others
+    /// waiting (`this client already runs a heavy request and has others waiting: retry when
+    /// they are done`); or the answer is larger than `api.v1txs_max_body_mb`
+    /// (`response larger than N MB: use a smaller limit`).
+    #[response(status = 503, content_type = "text/plain")]
+    Unavailable(String),
+    /// A read failed; the cause is logged, the body is `internal error`.
+    #[response(status = 500, content_type = "text/plain")]
+    Internal(String),
+    /// The read ran past `api.v1txs_deadline_ms` (30 s by default):
+    /// `request deadline exceeded`. kda-txs answers 404 at that point.
     #[response(status = 504, content_type = "text/plain")]
     Deadline(String),
 }

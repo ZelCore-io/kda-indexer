@@ -3,13 +3,17 @@
 window.addEventListener("load", function () {
   var native = "Native API (/api/v1)";
   var compat = "chainweb-data compatible API (/txs, /stats, /coins, /v1/txs)";
-  var primary = document.body.getAttribute("data-primary") === "compat" ? compat : native;
+  var isCompat = document.body.getAttribute("data-primary") === "compat";
+  // Both documents are offered, but "Try it out" calls this origin, which serves only its
+  // own routes: the other listener's document is labelled so.
+  var other = " - other listener: Try it out does not work here";
+  var own = { url: isCompat ? "/docs/openapi-compat.json" : "/docs/openapi.json",
+              name: isCompat ? compat : native };
+  var foreign = { url: isCompat ? "/docs/openapi.json" : "/docs/openapi-compat.json",
+                  name: (isCompat ? native : compat) + other };
   window.ui = SwaggerUIBundle({
-    urls: [
-      { url: "/docs/openapi.json", name: native },
-      { url: "/docs/openapi-compat.json", name: compat }
-    ],
-    "urls.primaryName": primary,
+    urls: [own, foreign],
+    "urls.primaryName": own.name,
     dom_id: "#swagger-ui",
     deepLinking: true,
     validatorUrl: null,

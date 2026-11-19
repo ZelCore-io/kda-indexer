@@ -67,7 +67,7 @@ Errors are plain text. List routes (/txs/account, /txs/events, /txs/search) take
 and answer a JSON array with the next page's token in the Chainweb-Next header. Genesis \
 transactions are hidden on the list routes. Every data route answers 429 (per-client rate), \
 503 (too many requests in flight, or an answer over api.max_body_mb) and 504 (the 5 s \
-deadline). Search routes run under a shared gate (503 when search.concurrency searches run, \
+deadline; /v1/txs has its own 30 s deadline, slot pool and body cap, see the route). Search routes run under a shared gate (503 when search.concurrency searches run, \
 429 when the client already runs search.per_client). CORS is open and Chainweb-Next and \
 X-Count-Age are exposed."
     ),
@@ -470,6 +470,193 @@ mod tests {
         assert!(n > 10, "only {n} refs");
     }
 
+    /// Line wraps of a doc comment are not part of the claim: compare on single spaces.
+    fn squash(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn description(doc: &Value, path: &str, code: &str) -> String {
+        squash(
+            op(doc, path)["responses"][code]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{path} has no {code}")),
+        )
+    }
+
+    /// S1: the per-client heavy-read refusal is a 503 of the routes that take a heavy slot.
+    #[test]
+    fn heavy_read_refusal_is_documented() {
+        let doc = parse(&compat_json());
+        for path in ["/txs/events", "/txs/search"] {
+            let d = description(&doc, path, "503");
+            assert!(d.contains(crate::server::HEAVY_BUSY), "{path}: {d}");
+            assert!(d.contains("Retry-After"), "{path}: {d}");
+        }
+    }
+
+    /// S2: `/v1/txs` has its own deadline, slot pool and refusals; they must not drift from
+    /// the handler (`server.rs`) again.
+    #[test]
+    fn v1txs_limits_are_its_own() {
+        let doc = parse(&compat_json());
+        for path in ["/v1/txs", "/v1/txs/{account}/{namespace}/{limit}"] {
+            let d504 = description(&doc, path, "504");
+            assert!(d504.contains("api.v1txs_deadline_ms"), "{path}: {d504}");
+            assert!(d504.contains("30 s"), "{path}: {d504}");
+            assert!(d504.contains("request deadline exceeded"), "{path}: {d504}");
+            assert!(!d504.contains("5 s"), "{path}: {d504}");
+            let d503 = description(&doc, path, "503");
+            for want in [
+                crate::server::V1TXS_BUSY,
+                crate::server::HEAVY_BUSY,
+                "api.deadline_ms",
+                "response larger than",
+                "api.v1txs_max_body_mb",
+                "Retry-After",
+            ] {
+                assert!(d503.contains(want), "{path} 503 lacks {want}: {d503}");
+            }
+            let all = squash(op(&doc, path)["description"].as_str().unwrap());
+            for want in ["read_threads", "40 s", "api.v1txs_deadline_ms"] {
+                assert!(all.contains(want), "{path} description lacks {want}: {all}");
+            }
+        }
+    }
+
+    /// M5: above 10,000 a value is capped before its fraction is looked at.
+    #[test]
+    fn v1txs_limit_text_matches_the_cap() {
+        let doc = parse(&compat_json());
+        let d = squash(op(&doc, "/v1/txs")["description"].as_str().unwrap());
+        assert!(
+            d.contains("A negative value, or a fractional one up to 10,000"),
+            "{d}"
+        );
+        assert!(!d.contains("negative or fractional value is"), "{d}");
+        let e = description(&doc, "/v1/txs", "404");
+        assert!(e.contains("fractional `limit` up to 10,000"), "{e}");
+    }
+
+    /// M2: every `.rs` file under `src/` is scanned for route registrations; a route in a
+    /// file the spec test does not know, or a `route_service` or `nest` it cannot follow,
+    /// fails here instead of going undocumented.
+    #[test]
+    fn no_route_is_registered_where_the_spec_test_does_not_look() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.len() > 20, "found only {} files", files.len());
+        // Files with REST routes the spec test reads, the docs router (not an API) and
+        // this file (patterns in strings).
+        let known = [
+            "native/mod.rs",
+            "server.rs",
+            "compat/mod.rs",
+            "v1txs.rs",
+            "docs.rs",
+            "openapi.rs",
+            "admin.rs",
+        ];
+        let re = Regex::new(r"\.(route|route_service|nest|nest_service)\(").unwrap();
+        for f in files {
+            let rel = f
+                .strip_prefix(&root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(&f).unwrap();
+            let prod = src.split("mod tests {").next().unwrap();
+            let hits: Vec<_> = re.find_iter(prod).map(|m| m.as_str()).collect();
+            if known.contains(&rel.as_str()) {
+                // `nest` is only used for the `/api/v1` prefix the scan hard-codes.
+                let nests = hits.iter().filter(|h| h.starts_with(".nest")).count();
+                let want = usize::from(rel == "native/mod.rs");
+                assert_eq!(
+                    nests, want,
+                    "{rel}: nest changes the paths the scan assumes"
+                );
+                assert!(
+                    !hits.iter().any(|h| h.starts_with(".route_service")),
+                    "{rel}: route_service is not scanned"
+                );
+            } else {
+                assert!(
+                    hits.is_empty(),
+                    "{rel} registers routes ({hits:?}); add it to the spec test and the specs"
+                );
+            }
+        }
+    }
+
+    /// M2: every documented path, with sample parameters, reaches a handler of the real
+    /// routers (not the fallback 404).
+    #[tokio::test]
+    async fn every_spec_path_reaches_a_handler() {
+        use axum::body::Body;
+        use axum::extract::{MatchedPath, Request};
+        use axum::http::HeaderValue;
+        use axum::middleware::{self, Next};
+        use axum::response::Response;
+        use tower::ServiceExt;
+
+        async fn mark(req: Request, next: Next) -> Response {
+            let m = req
+                .extensions()
+                .get::<MatchedPath>()
+                .map_or("unmatched".to_owned(), |m| m.as_str().to_owned());
+            let mut r = next.run(req).await;
+            r.headers_mut()
+                .insert("x-matched", HeaderValue::from_str(&m).unwrap());
+            r
+        }
+
+        let (_d, store) = crate::testutil::store();
+        let st = crate::server::Api::new(
+            store,
+            crate::server::tests::settings(4),
+            crate::server::TipWatch::default(),
+        )
+        .state();
+        let search = crate::search::SearchCtx::new(compat::SearchSettings::default(), None);
+        let app = crate::native::router(search.clone())
+            .merge(compat::router(search))
+            .layer(middleware::from_fn(mark))
+            .with_state(st);
+        let param = Regex::new(r"\{[^}]+\}").unwrap();
+        let get = |path: String| {
+            let app = app.clone();
+            async move {
+                let r = app
+                    .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                r.headers()["x-matched"].to_str().unwrap().to_owned()
+            }
+        };
+        assert_eq!(get("/no-such-route".into()).await, "unmatched", "control");
+        let mut n = 0;
+        for doc in [parse(&json()), parse(&compat_json())] {
+            for path in paths(&doc) {
+                let sample = param.replace_all(&path, "1").into_owned();
+                let m = get(sample.clone()).await;
+                assert_ne!(m, "unmatched", "{path} ({sample}) reaches no handler");
+                n += 1;
+            }
+        }
+        assert!(n >= 25, "only {n} paths checked");
+    }
+
     /// Same origin: no server entry names a host, and no document carries a URL.
     #[test]
     fn specs_name_no_host() {
@@ -482,7 +669,11 @@ mod tests {
                 !s.contains("http://") && !s.contains("https://"),
                 "a spec names a URL"
             );
-            for bad in [concat!("/Us", "ers/"), concat!("/Vol", "umes/"), concat!("/ho", "me/")] {
+            for bad in [
+                concat!("/Us", "ers/"),
+                concat!("/Vol", "umes/"),
+                concat!("/ho", "me/"),
+            ] {
                 assert!(!s.contains(bad), "{bad}");
             }
         }

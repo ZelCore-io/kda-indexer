@@ -22,7 +22,7 @@ use kdx_decode::Family;
 use kdx_types::TxKey;
 
 use crate::compat::account::Src;
-use crate::compat::schemas::{LimitErrors, TxDetail};
+use crate::compat::schemas::{TxDetail, V1TxsLimitErrors};
 use crate::compat::shapes::{self, write_aeson};
 use crate::compat::{collect_page, json_bytes, text, Candidates, Paging};
 use crate::server::ApiState;
@@ -46,10 +46,16 @@ const MAX_LIMIT: u64 = 10_000;
 /// matching rows appears once, at its first row; miner rewards count toward `limit` but
 /// produce no entry. `limit` follows JavaScript `Number()` (hex, exponent and fractions
 /// parse; an empty, zero or non-numeric value means the default 50; above 10,000 it is
-/// capped); a negative or fractional value is `404 Not Found`, as is a fourth path
-/// segment. A missing account is `400 Bad Request`. Genesis transactions are hidden. The
-/// answer is capped at `api.v1txs_max_body_mb` (32 MB by default; `503` past it, use a
-/// smaller `limit`).
+/// capped, before its fraction is looked at). A negative value, or a fractional one up to
+/// 10,000, is `404 Not Found`, as is a fourth path segment. A missing account is
+/// `400 Bad Request`. Genesis transactions are hidden. The answer is capped at
+/// `api.v1txs_max_body_mb` (32 MB by default; `503` past it, use a smaller `limit`).
+///
+/// The read has its own time budget and slot pool, apart from the other routes: it runs for
+/// up to `api.v1txs_deadline_ms` (30 s by default; `504` past it, where kda-txs answers 404)
+/// on one of a quarter of `api.read_threads` slots (at least one), and waits at most
+/// `api.deadline_ms` (5 s) for a slot (`503`). The server answers after up to 35 s, so a
+/// balancer in front needs a server timeout of 40 s or more for this route.
 #[utoipa::path(
     get,
     path = "/v1/txs",
@@ -63,8 +69,8 @@ const MAX_LIMIT: u64 = 10_000;
     responses(
         (status = 200, description = "Transactions, newest transfer first", body = Vec<TxDetail>, content_type = "application/json"),
         (status = 400, description = "No account", body = String, content_type = "text/plain"),
-        (status = 404, description = "`Not Found`: a negative or fractional `limit`, or more than three path segments", body = String, content_type = "text/plain"),
-        LimitErrors,
+        (status = 404, description = "`Not Found`: a negative `limit`, a fractional `limit` up to 10,000, or more than three path segments", body = String, content_type = "text/plain"),
+        V1TxsLimitErrors,
     )
 )]
 pub fn doc_query_form() {}
@@ -75,6 +81,11 @@ pub fn doc_query_form() {}
 /// segments may be left out (`/v1/txs/{account}` and `/v1/txs/{account}/{namespace}` are
 /// served; OpenAPI cannot describe optional path segments, so only the full form is
 /// listed). An empty segment falls back to the query parameter of the same name.
+///
+/// Limits as for `/v1/txs`: the read has its own time budget (`api.v1txs_deadline_ms`, 30 s
+/// by default; `504` past it) and slot pool (a quarter of `api.read_threads`, at least one;
+/// `503` when none frees within `api.deadline_ms`). A balancer in front needs a server
+/// timeout of 40 s or more for this route.
 #[utoipa::path(
     get,
     path = "/v1/txs/{account}/{namespace}/{limit}",
@@ -88,8 +99,8 @@ pub fn doc_query_form() {}
     responses(
         (status = 200, description = "Transactions, newest transfer first", body = Vec<TxDetail>, content_type = "application/json"),
         (status = 400, description = "No account", body = String, content_type = "text/plain"),
-        (status = 404, description = "`Not Found`: a negative or fractional `limit`, or more than three path segments", body = String, content_type = "text/plain"),
-        LimitErrors,
+        (status = 404, description = "`Not Found`: a negative `limit`, a fractional `limit` up to 10,000, or more than three path segments", body = String, content_type = "text/plain"),
+        V1TxsLimitErrors,
     )
 )]
 pub fn doc_path_form() {}

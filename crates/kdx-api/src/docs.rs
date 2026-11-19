@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use axum::body::Body;
 use axum::extract::Path;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
@@ -66,26 +66,72 @@ fn page(primary: Primary) -> Response {
     )
 }
 
-async fn file(Path(name): Path<String>) -> Response {
-    // Assets are pinned to the build: a day of caching is safe. The specs follow the
-    // binary too, but stay revalidated so an upgrade shows at once.
-    const DAY: &str = "public, max-age=86400";
-    match name.as_str() {
-        "swagger-initializer.js" => reply("text/javascript; charset=utf-8", DAY, INITIALIZER),
-        "swagger-ui-bundle.js" => reply("text/javascript; charset=utf-8", DAY, BUNDLE),
-        "swagger-ui-standalone-preset.js" => reply("text/javascript; charset=utf-8", DAY, PRESET),
-        "swagger-ui.css" => reply("text/css; charset=utf-8", DAY, CSS),
-        "favicon-32x32.png" => reply("image/png", DAY, FAVICON),
-        "swagger-ui-LICENSE.txt" => reply("text/plain; charset=utf-8", DAY, LICENSE),
-        "swagger-ui-NOTICE.txt" => reply("text/plain; charset=utf-8", DAY, NOTICE),
-        "openapi.json" => reply("application/json", "no-cache", native_spec()),
-        "openapi-compat.json" => reply("application/json", "no-cache", compat_spec()),
-        _ => {
-            let mut r = reply("text/plain; charset=utf-8", "no-store", "not found");
-            *r.status_mut() = StatusCode::NOT_FOUND;
-            r
-        }
+/// A document the router serves under `/docs/{name}`: its type and bytes.
+fn document(name: &str) -> Option<(&'static str, &'static [u8])> {
+    Some(match name {
+        "swagger-initializer.js" => ("text/javascript; charset=utf-8", INITIALIZER.as_bytes()),
+        "swagger-ui-bundle.js" => ("text/javascript; charset=utf-8", BUNDLE),
+        "swagger-ui-standalone-preset.js" => ("text/javascript; charset=utf-8", PRESET),
+        "swagger-ui.css" => ("text/css; charset=utf-8", CSS),
+        "favicon-32x32.png" => ("image/png", FAVICON),
+        "swagger-ui-LICENSE.txt" => ("text/plain; charset=utf-8", LICENSE.as_bytes()),
+        "swagger-ui-NOTICE.txt" => ("text/plain; charset=utf-8", NOTICE.as_bytes()),
+        "openapi.json" => ("application/json", native_spec().as_bytes()),
+        "openapi-compat.json" => ("application/json", compat_spec().as_bytes()),
+        _ => return None,
+    })
+}
+
+/// The entity tag of a document: FNV-1a over its bytes, computed once per name. The files
+/// are fixed by the build, so the tag changes exactly when an upgrade changes the file.
+fn etag(name: &str, bytes: &[u8]) -> String {
+    static TAGS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        OnceLock::new();
+    let mut tags = TAGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    tags.entry(name.to_owned())
+        .or_insert_with(|| {
+            let h = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+            });
+            format!("\"{h:016x}-{:x}\"", bytes.len())
+        })
+        .clone()
+}
+
+/// Whether `If-None-Match` names `tag` (or `*`).
+fn matches(headers: &HeaderMap, tag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().trim_start_matches("W/"))
+        .any(|t| t == "*" || t == tag)
+}
+
+async fn file(Path(name): Path<String>, headers: HeaderMap) -> Response {
+    // Every document is revalidated, never cached blind: the files follow the binary, so
+    // an upgrade shows at once, and an unchanged file costs a 304 and no body.
+    let Some((content_type, bytes)) = document(&name) else {
+        let mut r = reply("text/plain; charset=utf-8", "no-store", "not found");
+        *r.status_mut() = StatusCode::NOT_FOUND;
+        return r;
+    };
+    let tag = etag(&name, bytes);
+    let mut r = if matches(&headers, &tag) {
+        let mut r = reply(content_type, "no-cache", Body::empty());
+        *r.status_mut() = StatusCode::NOT_MODIFIED;
+        r
+    } else {
+        reply(content_type, "no-cache", bytes)
+    };
+    if let Ok(v) = HeaderValue::from_str(&tag) {
+        r.headers_mut().insert(header::ETAG, v);
     }
+    r
 }
 
 fn native_spec() -> &'static str {
@@ -268,6 +314,62 @@ mod tests {
         assert!(!js.contains("http://") && !js.contains("https://"), "{js}");
     }
 
+    /// M4: the spec of the other listener is offered, labelled: its "Try it out" calls this
+    /// origin, which does not serve those routes.
+    #[tokio::test]
+    async fn the_initializer_labels_the_spec_of_the_other_listener() {
+        let js = text(get(Primary::Compat, "/docs/swagger-initializer.js").await).await;
+        assert!(js.contains("other listener"), "{js}");
+        assert!(js.contains("data-primary"), "{js}");
+    }
+
+    /// M1: assets are revalidated with an `ETag` (a 304 costs no body) instead of cached
+    /// for a day, so an upgrade never leaves a browser with a mismatched bundle.
+    #[tokio::test]
+    async fn assets_revalidate_with_an_etag() {
+        for path in [
+            "/docs/swagger-ui-bundle.js",
+            "/docs/swagger-ui-standalone-preset.js",
+            "/docs/swagger-ui.css",
+            "/docs/swagger-initializer.js",
+            "/docs/favicon-32x32.png",
+            "/docs/swagger-ui-LICENSE.txt",
+            "/docs/openapi.json",
+            "/docs/openapi-compat.json",
+        ] {
+            let r = get(Primary::Native, path).await;
+            assert_eq!(header_of(&r, "cache-control"), "no-cache", "{path}");
+            let etag = header_of(&r, "etag").to_owned();
+            assert!(
+                etag.starts_with('"') && etag.ends_with('"'),
+                "{path}: {etag}"
+            );
+            let full = body(r).await;
+            let cond = |tag: &str| {
+                router::<()>(Primary::Native).oneshot(
+                    Request::get(path)
+                        .header("if-none-match", tag.to_owned())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+            };
+            let r = cond(&etag).await.unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_MODIFIED, "{path}");
+            assert_eq!(header_of(&r, "etag"), etag, "{path}");
+            assert!(header_of(&r, "content-security-policy").contains("default-src"));
+            assert!(body(r).await.is_empty(), "{path}");
+            let r = cond("\"other\"").await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert_eq!(body(r).await, full, "{path}");
+            // The same bytes, the same tag.
+            let again = get(Primary::Native, path).await;
+            assert_eq!(header_of(&again, "etag"), etag, "{path}");
+        }
+        // Unknown names carry no validator.
+        let r = get(Primary::Native, "/docs/nothing-here").await;
+        assert!(r.headers().get("etag").is_none());
+    }
+
     #[tokio::test]
     async fn served_specs_are_the_generated_ones() {
         let r = get(Primary::Native, "/docs/openapi.json").await;
@@ -348,6 +450,18 @@ mod tests {
         tokio::task::JoinHandle<anyhow::Result<()>>,
         [SocketAddr; 4],
     ) {
+        serve_with(docs, crate::server::tests::settings(4)).await
+    }
+
+    async fn serve_with(
+        docs: Option<bool>,
+        settings: crate::server::ApiSettings,
+    ) -> (
+        tempfile::TempDir,
+        CancellationToken,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        [SocketAddr; 4],
+    ) {
         let (d, store) = crate::testutil::store();
         let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let binds = Binds {
@@ -357,12 +471,7 @@ mod tests {
             admin: vec![lo],
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut api = Api::new(
-            store,
-            crate::server::tests::settings(4),
-            TipWatch::default(),
-        )
-        .on_bound(move |a| {
+        let mut api = Api::new(store, settings, TipWatch::default()).on_bound(move |a| {
             let _ = tx.send(a.to_vec());
         });
         if let Some(on) = docs {
@@ -396,6 +505,29 @@ mod tests {
             "never on the metrics port"
         );
         assert_eq!(get_status(admin, "/docs/openapi.json").await, 404);
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// S3: with `api.max_body_mb = 1` the 1.7 MB bundle is still served on a real listener.
+    #[tokio::test]
+    async fn the_bundle_is_served_under_a_one_megabyte_body_cap() {
+        let mut cfg = crate::server::tests::settings(4);
+        cfg.max_body_bytes = 1 << 20;
+        cfg.v1txs_max_body_bytes = 1 << 20;
+        assert!(
+            super::BUNDLE.len() > 1 << 20,
+            "the bundle fits under the cap: the test proves nothing"
+        );
+        let (_d, stop, task, [native, compat, ..]) = serve_with(None, cfg).await;
+        for a in [native, compat] {
+            for p in [
+                "/docs/swagger-ui-bundle.js",
+                "/docs/swagger-ui-standalone-preset.js",
+            ] {
+                assert_eq!(get_status(a, p).await, 200, "{a} {p}");
+            }
+        }
         stop.cancel();
         task.await.unwrap().unwrap();
     }
