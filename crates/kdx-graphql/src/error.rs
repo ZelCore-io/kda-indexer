@@ -249,7 +249,10 @@ mod tests {
         resolver.path = vec![async_graphql::PathSegment::Field("block".into())];
         let v = wire(&async_graphql::Response::from_errors(vec![resolver]));
         assert!(v.get("data").is_some_and(serde_json::Value::is_null), "{v}");
-        let batch = vec![refused, async_graphql::Response::new(async_graphql::Value::from(1))];
+        let batch = vec![
+            refused,
+            async_graphql::Response::new(async_graphql::Value::from(1)),
+        ];
         let v: serde_json::Value = serde_json::from_slice(&wire_json(&batch).unwrap()).unwrap();
         assert!(v[0].get("data").is_none() && v[1]["data"] == 1, "{v}");
     }

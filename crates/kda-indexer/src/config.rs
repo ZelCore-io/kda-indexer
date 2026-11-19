@@ -1033,7 +1033,10 @@ mod ws_bound_tests {
         let c = parse("");
         assert_eq!(c.api.v1txs_deadline_ms, 30_000);
         c.validate().unwrap();
-        let s = parse("v1txs_deadline_ms = 12000").api.settings("mainnet01").unwrap();
+        let s = parse("v1txs_deadline_ms = 12000")
+            .api
+            .settings("mainnet01")
+            .unwrap();
         assert_eq!(s.v1txs_deadline, std::time::Duration::from_millis(12_000));
         assert!(cfg("v1txs_deadline_ms = 100", "").is_ok());
         let e = cfg("v1txs_deadline_ms = 99", "").unwrap_err();

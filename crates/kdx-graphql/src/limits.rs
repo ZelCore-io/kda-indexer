@@ -25,8 +25,8 @@
 //! per connection) by the rows it serves, sized by [`crate::connection::served_page`] as the
 //! resolvers size it: as asked up to [`crate::MAX_PAGE_ROWS`]; absent, or `0` without a cursor,
 //! at `default_page`. `nodes(ids)` multiplies by the number of ids, per-chain account lists by
-//! the chain count (20 or `chainIds`), NFT holdings by [`crate::MAX_NFT_HOLDINGS`] (one read
-//! per row, whatever is selected).
+//! the chain count (20 for an absent or empty `chainIds`, else its length), NFT holdings by
+//! [`crate::MAX_NFT_HOLDINGS`] (one read per row, whatever is selected).
 //!
 //! [`analyze`] runs the same walk as the legacy model, which also refuses on `max_depth`,
 //! `introspection_depth` and `max_complexity`, with pages clamped at `max_page`. It is not
@@ -586,8 +586,13 @@ impl<'a> Walk<'a> {
         };
         match name {
             "nodes" => list_len("ids", 1, unbound),
+            // `chainIds: []` serves every chain, as an absent list does (`chain_set`), so it
+            // is priced at every chain, not at none (FIX-4 part C, B-1).
             "fungibleChainAccounts" | "newBlocks" | "newBlocksFromDepth" => {
-                list_len("chainIds", CHAINS, CHAINS)
+                match list_len("chainIds", CHAINS, CHAINS) {
+                    0 => CHAINS,
+                    n => n,
+                }
             }
             "chainAccounts" | "countersOfEachChain" => CHAINS,
             // Every account a key guards, up to the resolver's cap (I-3).
@@ -787,9 +792,13 @@ impl Extension for LimitsExt {
         let ws = ctx.data_opt::<crate::ws::ConnSubs>().is_some();
         // Over HTTP a document that does not parse is Apollo Server 4's
         // `GRAPHQL_PARSE_FAILED` (HTTP 400), as stock answers it (FIX-4 part B item 5).
-        let doc = request
-            .parsed_query()
-            .map_err(|e| if ws { e } else { with_code(e, GRAPHQL_PARSE_FAILED) })?;
+        let doc = request.parsed_query().map_err(|e| {
+            if ws {
+                e
+            } else {
+                with_code(e, GRAPHQL_PARSE_FAILED)
+            }
+        })?;
         budget(doc, &vars, s)?;
         // Stock's limits (FIX-3 part C). Over the socket stock runs no depth rule and words
         // the complexity refusal without its HTTP prefix; over HTTP it skips the complexity
@@ -814,7 +823,11 @@ impl Extension for LimitsExt {
             } else {
                 stock_limits::COMPLEXITY_MESSAGE
             });
-        let var_args = if ws { Vec::new() } else { var_arg_positions(doc) };
+        let var_args = if ws {
+            Vec::new()
+        } else {
+            var_arg_positions(doc)
+        };
         *self.stock.lock().unwrap_or_else(|e| e.into_inner()) = Some(StockVerdict {
             ws,
             var_args,
@@ -842,7 +855,7 @@ impl Extension for LimitsExt {
             .map(|m| stock_refusal(GRAPHQL_VALIDATION_FAILED, "depth", m))
             .collect();
         let r = match r {
-            Err(es) if !v.ws => Err(apollo_validation(es, &v.var_args)),
+            Err(es) if !v.ws => Err(apollo_validation(es, &v.var_args, !depth.is_empty())),
             r => r,
         };
         match r {
@@ -886,15 +899,24 @@ fn with_code(mut e: ServerError, code: &'static str) -> ServerError {
 /// "Invalid value" error at an argument that holds a variable is a coercion error. So: when
 /// the document itself has errors they are answered alone, coded; when only variable values
 /// fail, those stay codeless (500 `INTERNAL_SERVER_ERROR`, as FIX-4 item 3 decided). Coded
-/// errors (the depth rule, `check-ops`' marker) are left alone.
-fn apollo_validation(es: Vec<ServerError>, var_args: &[async_graphql::Pos]) -> Vec<ServerError> {
+/// errors (the depth rule, `check-ops`' marker) are left alone. A depth refusal (`deep`) is a
+/// document error too: the coercion errors are dropped beside it (FIX-4 part C, M-1).
+///
+/// A coercion is told by async-graphql's message prefix at an argument that holds a
+/// variable (pinned by a test in `tests/http.rs`). An argument mixing a variable with a bad
+/// literal (`nodes(ids: [$a, 1])`) is classed as a coercion (500, where Apollo answers 400).
+fn apollo_validation(
+    es: Vec<ServerError>,
+    var_args: &[async_graphql::Pos],
+    deep: bool,
+) -> Vec<ServerError> {
     let coded = |e: &ServerError| e.extensions.as_ref().and_then(|x| x.get("code")).is_some();
     let coercion = |e: &ServerError| {
         !coded(e)
             && e.message.starts_with("Invalid value for argument")
             && e.locations.first().is_some_and(|p| var_args.contains(p))
     };
-    if es.iter().all(|e| coded(e) || coercion(e)) {
+    if !deep && es.iter().all(|e| coded(e) || coercion(e)) {
         return es;
     }
     es.into_iter()
@@ -1155,6 +1177,24 @@ mod tests {
             c("{ fungibleChainAccounts(accountName: \"a\") { transactions { totalCount } } }"),
             Err("\"counts\"".into())
         );
+        // FIX-4 part C (B-1): `chainIds: []` serves every chain, so it is priced like no
+        // `chainIds` (20 chains), not as a list of none: refused the same way.
+        assert_eq!(
+            c("{ fungibleChainAccounts(accountName: \"a\", chainIds: []) { transactions { totalCount } } }"),
+            Err("\"counts\"".into())
+        );
+        let none = c("{ fungibleChainAccounts(accountName: \"a\") { balance } }");
+        let empty = c("{ fungibleChainAccounts(accountName: \"a\", chainIds: []) { balance } }");
+        assert_eq!(empty, none);
+        let sub = |q: &str| c(q).unwrap();
+        assert_eq!(
+            sub("subscription { newBlocks(chainIds: []) { height } }"),
+            sub("subscription { newBlocks { height } }")
+        );
+        assert_eq!(
+            sub("subscription { newBlocksFromDepth(minimumDepth: 1, chainIds: []) { height } }"),
+            sub("subscription { newBlocksFromDepth(minimumDepth: 1) { height } }")
+        );
         // A block's count is not a walk: kadscan's block list passes.
         assert!(c("{ blocksFromDepth(minimumDepth: 0, first: 25) { totalCount edges { node { transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }").unwrap() < 2000);
     }
@@ -1180,15 +1220,27 @@ mod tests {
         let three: String = (0..3)
             .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
             .collect();
-        assert_eq!(b(&format!("{{ {three} }}")), Err(refused));
+        assert_eq!(b(&format!("{{ {three} }}")), Err(refused.clone()));
         let two: String = (0..2)
             .map(|i| format!("t{i}: transactions(accountName: \"a\") {{ totalCount }} "))
             .collect();
         assert!(b(&format!("{{ {two} }}")).is_ok());
-        assert!(
-            b("{ fungibleChainAccounts(accountName: \"a\") { transactions { totalCount } } }")
-                .is_err()
+        assert_eq!(
+            b("{ fungibleChainAccounts(accountName: \"a\") { transactions { totalCount } } }"),
+            Err(refused.clone())
         );
+        // FIX-4 part C (B-1): `chainIds: []` is every chain, refused like the form without it.
+        assert_eq!(
+            b("{ fungibleChainAccounts(accountName: \"a\", chainIds: []) { transactions { totalCount } } }"),
+            Err(refused.clone())
+        );
+        let edges = |ids: &str| {
+            b(&format!(
+                "{{ fungibleChainAccounts(accountName: \"a\"{ids}) {{ transactions(first: 5) {{ edges {{ node {{ hash }} }} }} }} }}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(edges(", chainIds: []"), edges(""));
         // Pages: absent is the default page (20 items, 1 each, plus the connection).
         let page = |args: &str| {
             b(&format!(

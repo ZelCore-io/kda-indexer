@@ -40,6 +40,12 @@ Differences from Kadena graph:
 - The schema has no "as of height" field, so GraphQL answers do not carry one (the native API
   does).
 - Fields not served yet answer `NOT_SUPPORTED` with the rest of the operation intact.
+- Row order within a block (R-P5P9-151). A newest-first list that spans several blocks
+  (`transactions`, `events`, `transfers` without `blockHash`, the account connections) lists
+  the rows of one block in reverse node order, so the coinbase comes last; the stock indexer
+  orders those rows by creation time. A list of one block (`blockHash` without `requestKey`,
+  the `Block` connections) is in the node's order, coinbase first, as the node and the stock
+  indexer list it.
 
 ## Errors
 
@@ -57,7 +63,7 @@ Errors carry `extensions.code`:
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
 | `INTERNAL_SERVER_ERROR` | the stock indexer's code, kept where ours answers as stock does: the complexity refusal (Limits), and a request refused before any field runs because a variable is missing or its value does not coerce to its type. Such a request answers HTTP 500 with no `data` key, as stock answers it; in a batch the status stays 200. Also `transaction(minimumDepth:)` outside 1..=100, with stock's message (`[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.` or `… higher than 100.`), `transaction: null` and HTTP 200 |
 | `GRAPHQL_PARSE_FAILED` | the document does not parse: HTTP 400 with no `data` key, as stock (Apollo Server 4) answers it. The message is ours (async-graphql's parser), not graphql-js's |
-| `GRAPHQL_VALIDATION_FAILED` | the document fails validation (an unknown field, a literal of the wrong type, an unused variable, the depth limit): HTTP 400 with no `data` key, as stock answers it. A document error is answered alone, without the variable errors of the same request, as Apollo validates before it reads variables. Messages are async-graphql's |
+| `GRAPHQL_VALIDATION_FAILED` | the document fails validation (an unknown field, a literal of the wrong type, an unused variable, the depth limit): HTTP 400 with no `data` key, as stock answers it. A document error, the depth refusal included, is answered alone, without the variable errors of the same request, as Apollo validates before it reads variables. Messages are async-graphql's. One case differs: an argument that mixes a variable with a bad literal (`nodes(ids: [$a, 1])`) is taken as a variable error (500 `INTERNAL_SERVER_ERROR`), where Apollo answers 400 |
 
 A request refused before anything ran (a parse, validation or limit refusal, or a variable
 error) has no `data` key, as in stock and the GraphQL spec; an error a field raised keeps
@@ -286,6 +292,8 @@ number open.
 - `node(id)`/`nodes(ids)` (at most 100) resolve every type. An id that cannot be read (not
   base64 of `<Type>:<key>`, an unknown type, or a malformed key) is `null`, as the stock
   indexer answers, and so is an object not stored; `nodes` answers `null` in that id's place.
+  A well-formed id whose lookup is ambiguous (a `Signer` of a genesis tx stored on several
+  chains) keeps its `BAD_USER_INPUT` error.
   Coinbase events and transfers resolve through their block.
 
 ## Subscriptions

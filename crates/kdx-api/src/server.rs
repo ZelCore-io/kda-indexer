@@ -115,9 +115,13 @@ pub struct ApiState {
     /// Status and readiness reads (`/readyz`, `/status`, the sampler): their own slots, so
     /// a busy pool never fails health checks.
     status_reads: Arc<Semaphore>,
-    /// Expensive request classes (events scan, `/v1/txs`) take one of these before a read
-    /// slot: at most half the pool, so they cannot hold every slot.
+    /// Expensive request classes (events scan, account lists and counts) take one of these
+    /// before a read slot: at most half the pool, so they cannot hold every slot.
     heavy: Arc<Semaphore>,
+    /// `/v1/txs` reads (up to `v1txs_deadline` each) take one of these instead of a `heavy`
+    /// slot: [`v1txs_slots`] of the pool, so a long one never holds a slot of the GraphQL
+    /// or compat lists (FIX-4 part C, S-1).
+    v1txs: Arc<Semaphore>,
     /// Heavy reads per client key (H-1): one runs, [`HEAVY_WAITING_PER_CLIENT`] wait.
     heavy_clients: Arc<HeavyClients>,
     in_flight: Arc<Semaphore>,
@@ -233,15 +237,34 @@ impl ApiState {
             .await
     }
 
-    /// `read_heavy` with its own time budget instead of `settings.deadline`: `/v1/txs`
-    /// (`settings.v1txs_deadline`). The budget also bounds the waits for the slots.
-    pub async fn read_heavy_for<T, F>(self: &Arc<Self>, budget: Duration, f: F) -> ApiResult<T>
+    /// A `/v1/txs` read (FIX-4 part C, S-1): the client's heavy slot, then a slot of the
+    /// `/v1/txs` pool (not a shared `heavy` one), then a read slot. Waiting for the slots is
+    /// bounded by `settings.deadline` and answers 503 past it; the read itself has
+    /// `settings.v1txs_deadline` (kda-txs' own 30 s).
+    pub async fn read_v1txs<T, F>(self: &Arc<Self>, f: F) -> ApiResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        self.read_on(Some(&self.heavy), &self.reads, budget, f)
-            .await
+        let s = &self.settings;
+        let wait = Slots {
+            first: Some(&self.v1txs),
+            pool: &self.reads,
+            until: Instant::now() + s.deadline,
+            late: || ApiError::Unavailable(V1TXS_BUSY.into()),
+        };
+        let t = Instant::now();
+        let r = self.read_slots(wait, Some(s.v1txs_deadline), f).await;
+        // To size the pool from real traffic (S-1): the reads that took longer than any
+        // other request may.
+        if t.elapsed() > s.deadline {
+            tracing::info!(
+                ms = t.elapsed().as_millis() as u64,
+                ok = r.is_ok(),
+                "api: slow /v1/txs read"
+            );
+        }
+        r
     }
 
     /// Take `n` more rate tokens for the client of this request (the guard took one): a
@@ -295,6 +318,8 @@ impl ApiState {
             .await
     }
 
+    /// The slots in `pool` (after `first`, if any) within `budget`, which also bounds the
+    /// read: a wait past it is [`ApiError::Deadline`].
     async fn read_on<T, F>(
         self: &Arc<Self>,
         first: Option<&Arc<Semaphore>>,
@@ -306,10 +331,36 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        let deadline = Instant::now() + budget;
-        let acquire = |s: &Arc<Semaphore>| {
-            tokio::time::timeout_at(deadline.into(), s.clone().acquire_owned())
+        let wait = Slots {
+            first,
+            pool,
+            until: Instant::now() + budget,
+            late: || ApiError::Deadline,
         };
+        self.read_slots(wait, None, f).await
+    }
+
+    /// Take the slots of `wait` (`late()` past `wait.until`), then run `f` on a blocking
+    /// thread with a view whose deadline is `run` from now, or `wait.until` when `run` is
+    /// `None` (one budget for the waits and the read).
+    async fn read_slots<T, F>(
+        self: &Arc<Self>,
+        wait: Slots<'_>,
+        run: Option<Duration>,
+        f: F,
+    ) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        let Slots {
+            first,
+            pool,
+            until,
+            late,
+        } = wait;
+        let acquire =
+            |s: &Arc<Semaphore>| tokio::time::timeout_at(until.into(), s.clone().acquire_owned());
         // A heavy read of a known client first waits for that client's own slot (H-1), so
         // the shared heavy slots are held by at most one read per client.
         let own: Option<(HeavyTicket, OwnedSemaphorePermit)> = match first {
@@ -318,7 +369,7 @@ impl ApiState {
                     let t = self.heavy_clients.enter(key)?;
                     let p = acquire(&t.slot)
                         .await
-                        .map_err(|_| ApiError::Deadline)?
+                        .map_err(|_| late())?
                         .map_err(|e| ApiError::Internal(e.into()))?;
                     Some((t, p))
                 }
@@ -330,15 +381,16 @@ impl ApiState {
             Some(s) => Some(
                 acquire(s)
                     .await
-                    .map_err(|_| ApiError::Deadline)?
+                    .map_err(|_| late())?
                     .map_err(|e| ApiError::Internal(e.into()))?,
             ),
             None => None,
         };
         let permit = acquire(pool)
             .await
-            .map_err(|_| ApiError::Deadline)?
+            .map_err(|_| late())?
             .map_err(|e| ApiError::Internal(e.into()))?;
+        let deadline = run.map_or(until, |d| Instant::now() + d);
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let _p = (permit, gate, own);
@@ -349,6 +401,22 @@ impl ApiState {
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("read task: {e}")))?
     }
+}
+
+/// The slots a read waits for, until when, and the error past it.
+struct Slots<'a> {
+    first: Option<&'a Arc<Semaphore>>,
+    pool: &'a Arc<Semaphore>,
+    until: Instant,
+    late: fn() -> ApiError,
+}
+
+/// The 503 of a `/v1/txs` read that found no slot within the normal deadline.
+const V1TXS_BUSY: &str = "too many /v1/txs requests running: retry later";
+
+/// The `/v1/txs` slots for `read_threads` read threads: a quarter, at least one (S-1).
+fn v1txs_slots(read_threads: usize) -> usize {
+    (read_threads / 4).max(1)
 }
 
 impl IntoResponse for ApiError {
@@ -395,7 +463,11 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
         }
     }
     let (cap, deadline) = if req.uri().path().starts_with("/v1/txs") {
-        (st.settings.v1txs_max_body_bytes, st.settings.v1txs_deadline)
+        // The slot wait (`deadline`) plus the read (`v1txs_deadline`), as `read_v1txs`.
+        (
+            st.settings.v1txs_max_body_bytes,
+            st.settings.deadline + st.settings.v1txs_deadline,
+        )
     } else {
         (st.settings.max_body_bytes, st.settings.deadline)
     };
@@ -518,6 +590,7 @@ impl Api {
             reads: Arc::new(Semaphore::new(settings.read_threads.max(1))),
             status_reads: Arc::new(Semaphore::new(STATUS_READS)),
             heavy: Arc::new(Semaphore::new((settings.read_threads / 2).max(1))),
+            v1txs: Arc::new(Semaphore::new(v1txs_slots(settings.read_threads))),
             heavy_clients: Arc::default(),
             key_modules: std::sync::OnceLock::new(),
             stats_cache: &crate::compat::stats::CACHE,
@@ -941,26 +1014,107 @@ mod tests {
         assert_eq!(st.heavy.available_permits(), 2);
     }
 
-    /// FIX-4 part B (B1): `read_heavy_for` gives the read the budget passed in (the view's
-    /// deadline), not `settings.deadline`.
+    /// FIX-4 part B (B1), part C (S-1): `read_v1txs` reads within `v1txs_deadline` (the
+    /// view's deadline), not `settings.deadline`.
     #[tokio::test]
-    async fn read_heavy_for_reads_with_its_own_budget() {
+    async fn read_v1txs_reads_with_its_own_budget() {
         let (_d, store) = crate::testutil::store();
         // settings(): a 500 ms deadline.
-        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let mut cfg = settings(4);
+        cfg.v1txs_deadline = Duration::from_secs(5);
+        let st = Api::new(store.clone(), cfg.clone(), TipWatch::default()).state();
         let slow = |v: &View| {
             std::thread::sleep(Duration::from_millis(700));
             v.check_deadline()
         };
         assert!(matches!(st.read_heavy(slow).await, Err(ApiError::Deadline)));
-        assert!(st
-            .read_heavy_for(Duration::from_secs(5), slow)
-            .await
-            .is_ok());
-        assert!(matches!(
-            st.read_heavy_for(Duration::from_millis(100), slow).await,
-            Err(ApiError::Deadline)
-        ));
+        assert!(st.read_v1txs(slow).await.is_ok());
+        cfg.v1txs_deadline = Duration::from_millis(100);
+        let st = Api::new(store, cfg, TipWatch::default()).state();
+        assert!(matches!(st.read_v1txs(slow).await, Err(ApiError::Deadline)));
+    }
+
+    /// FIX-4 part C (S-1): `/v1/txs` reads have their own pool, `max(1, read_threads / 4)`,
+    /// not the shared heavy slots: two long `/v1/txs` reads of two clients leave every heavy
+    /// slot to the GraphQL and compat lists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn long_v1txs_reads_do_not_block_other_heavy_routes() {
+        let (_d, store) = crate::testutil::store();
+        let mut cfg = settings(4);
+        cfg.v1txs_deadline = Duration::from_secs(30);
+        let st = Api::new(store.clone(), cfg.clone(), TipWatch::default()).state();
+        assert_eq!(st.v1txs.available_permits(), 1);
+        for (threads, pool) in [(1, 1), (7, 1), (8, 2), (16, 4)] {
+            cfg.read_threads = threads;
+            let s = Api::new(store.clone(), cfg.clone(), TipWatch::default()).state();
+            assert_eq!(s.v1txs.available_permits(), pool, "read_threads {threads}");
+        }
+        let a: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let b: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let c: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let long =
+            |ip, st: Arc<ApiState>, rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>| {
+                tokio::spawn(as_client(ip, async move {
+                    st.read_v1txs(move |_| {
+                        let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                        Ok(())
+                    })
+                    .await
+                }))
+            };
+        let l1 = long(a, st.clone(), rx.clone());
+        let l2 = long(b, st.clone(), rx.clone());
+        let until = Instant::now() + Duration::from_secs(2);
+        while st.v1txs.available_permits() > 0 && Instant::now() < until {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(st.v1txs.available_permits(), 0);
+        // Every heavy slot is free: another client's heavy list answers at once.
+        assert_eq!(st.heavy.available_permits(), 2);
+        for _ in 0..2 {
+            let t = Instant::now();
+            assert!(as_client(c, st.read_heavy(|_| Ok(()))).await.is_ok());
+            assert!(
+                t.elapsed() < Duration::from_millis(300),
+                "{:?}",
+                t.elapsed()
+            );
+        }
+        for _ in 0..2 {
+            let _ = tx.send(());
+        }
+        assert!(l1.await.unwrap().is_ok());
+        // The second ran after the first or, past its 500 ms wait, was refused with 503;
+        // either way it never held a heavy slot.
+        let _ = l2.await.unwrap();
+        assert_eq!(st.heavy.available_permits(), 2);
+        assert_eq!(st.v1txs.available_permits(), 1);
+    }
+
+    /// FIX-4 part C (S-1): waiting for a `/v1/txs` slot is bounded by the normal deadline,
+    /// past which the answer is 503 (the overload answer), not the 30 s read budget.
+    #[tokio::test]
+    async fn v1txs_slot_wait_is_capped_at_the_normal_deadline() {
+        let (_d, store) = crate::testutil::store();
+        // settings(): a 500 ms deadline (5 s in production), a 30 s /v1/txs budget.
+        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let _busy = st.v1txs.clone().acquire_owned().await.unwrap();
+        let t = Instant::now();
+        let r = st.read_v1txs(|_| Ok(())).await;
+        let waited = t.elapsed();
+        assert!(matches!(r, Err(ApiError::Unavailable(_))), "{r:?}");
+        assert!(
+            waited >= Duration::from_millis(450) && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        let resp = r.unwrap_err().into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // A /v1/txs read never waits on, or holds, a shared heavy slot.
+        let _heavy = st.heavy.clone().acquire_many_owned(2).await.unwrap();
+        drop(_busy);
+        assert!(st.read_v1txs(|_| Ok(())).await.is_ok());
     }
 
     /// Block `height` on chain 0: `n` user txs of k:alice, each one `coin.TRANSFER` to k:bob.
@@ -986,8 +1140,9 @@ mod tests {
                 })
                 .to_string();
                 let rk = kdx_types::blake2b_256(cmd.as_bytes()).to_b64url();
-                let tx = serde_json::to_vec(&json!({"hash": rk, "sigs": [{"sig": "ab"}], "cmd": cmd}))
-                    .unwrap();
+                let tx =
+                    serde_json::to_vec(&json!({"hash": rk, "sigs": [{"sig": "ab"}], "cmd": cmd}))
+                        .unwrap();
                 // The node's key order (the decoder checks it).
                 let ev = json!({"params": ["k:alice", "k:bob", 1.5], "name": "TRANSFER",
                     "module": {"namespace": null, "name": "coin"},
@@ -999,9 +1154,11 @@ mod tests {
                 json!([b64url_encode(&tx), b64url_encode(&out)])
             })
             .collect();
-        let cb = serde_json::to_vec(&json!({"gas": 0, "result": {"status": "success", "data": "ok"},
+        let cb = serde_json::to_vec(
+            &json!({"gas": 0, "result": {"status": "success", "data": "ok"},
             "reqKey": b64url_encode(&h32(0xCB)), "logs": null, "events": [],
-            "metaData": null, "continuation": null, "txId": null}))
+            "metaData": null, "continuation": null, "txId": null}),
+        )
         .unwrap();
         let miner = br#"{"account":"k:miner","predicate":"keys-all","public-keys":["m"]}"#;
         let payload_hash = b64url_encode(&h32(0xA4));
@@ -1072,7 +1229,9 @@ mod tests {
         };
         let resp = get("/v1/txs/k:alice/coin/10000").await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 64 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64 << 20)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.as_array().map(Vec::len), Some(10_000));
         let resp = get("/txs/account/k:alice?limit=10000").await.unwrap();

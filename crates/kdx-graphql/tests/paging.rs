@@ -1468,17 +1468,54 @@ async fn fungible_name_is_trimmed() {
         format!("transfers(accountName: \"{ALICE}\", FN, first: 50) {{ totalCount edges {{ node {{ requestKey orderIndex amount }} }} }}"),
         "transfers(FN, first: 50) { edges { node { requestKey orderIndex } } }".to_owned(),
     ];
+    // FIX-4 part C (M-4): with `blockHash` or `requestKey` too, a name of spaces alone is
+    // still refused, not an empty list.
+    let rk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for src in [
+        format!("blockHash: \"{}\"", block_hash(0, 6)),
+        format!("requestKey: \"{rk}\""),
+    ] {
+        let r = f
+            .schema
+            .execute(format!("{{ transfers({src}, fungibleName: \"  \") {{ edges {{ node {{ requestKey }} }} }} }}"))
+            .await;
+        let code = r
+            .errors
+            .first()
+            .and_then(|e| e.extensions.as_ref()?.get("code").cloned());
+        assert_eq!(
+            code,
+            Some(async_graphql::Value::String("BAD_USER_INPUT".into())),
+            "{src}: {:?}",
+            r.errors
+        );
+    }
     for field in &fields {
-        let q = |name: &str| format!("{{ {} }}", field.replace("FN", &format!("fungibleName: \"{name}\"")));
+        let q = |name: &str| {
+            format!(
+                "{{ {} }}",
+                field.replace("FN", &format!("fungibleName: \"{name}\""))
+            )
+        };
         let want = run(&f.schema, &q("coin")).await;
-        assert!(!want.as_object().unwrap().values().any(Value::is_null), "{field}: {want}");
+        assert!(
+            !want.as_object().unwrap().values().any(Value::is_null),
+            "{field}: {want}"
+        );
         for name in ["coin ", " coin", "\tcoin  "] {
             let r = f.schema.execute(q(name)).await;
             assert!(r.errors.is_empty(), "{field} {name:?}: {:?}", r.errors);
-            assert_eq!(serde_json::to_value(&r.data).unwrap(), want, "{field} {name:?}");
+            assert_eq!(
+                serde_json::to_value(&r.data).unwrap(),
+                want,
+                "{field} {name:?}"
+            );
         }
         let r = f.schema.execute(q("  ")).await;
-        let code = r.errors.first().and_then(|e| e.extensions.as_ref()?.get("code").cloned());
+        let code = r
+            .errors
+            .first()
+            .and_then(|e| e.extensions.as_ref()?.get("code").cloned());
         assert_eq!(
             code,
             Some(async_graphql::Value::String("BAD_USER_INPUT".into())),

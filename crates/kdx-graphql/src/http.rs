@@ -309,8 +309,7 @@ fn stock_status(r: &Response) -> StatusCode {
         })
     };
     let coded = |c: &str| r.errors.iter().any(|e| code(e).as_deref() == Some(c));
-    if coded(crate::error::GRAPHQL_VALIDATION_FAILED) || coded(crate::error::GRAPHQL_PARSE_FAILED)
-    {
+    if coded(crate::error::GRAPHQL_VALIDATION_FAILED) || coded(crate::error::GRAPHQL_PARSE_FAILED) {
         StatusCode::BAD_REQUEST
     } else if refused(crate::error::INTERNAL_SERVER_ERROR, "complexity")
         || crate::error::codeless_request_error(r)

@@ -705,7 +705,6 @@ async fn request_level_errors_carry_a_code_and_stock_s_status() {
     assert!(v[1].get("errors").is_none(), "{v}");
 }
 
-
 /// FIX-4 part B (B2): a request refused before anything ran answers without a `data` key, as
 /// stock (Apollo) does and the GraphQL spec says. A resolver's error keeps `data`.
 #[tokio::test]
@@ -780,16 +779,51 @@ async fn parse_and_validation_errors_answer_as_apollo_server_4() {
         check(&v, "INTERNAL_SERVER_ERROR");
     }
     let page = "query($f: Int) { transactions(first: $f) { totalCount } }";
-    let (s, v, _) = post(&f, json!({"query": page, "variables": {"f": "x"}}).to_string()).await;
+    let (s, v, _) = post(
+        &f,
+        json!({"query": page, "variables": {"f": "x"}}).to_string(),
+    )
+    .await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
     check(&v, "INTERNAL_SERVER_ERROR");
     // Apollo validates before it coerces variables: a bad document with a bad variable value
     // answers the validation error alone.
     let both = "query($id: ID!) { node(id: $id) { id nope } }";
-    let (s, v, _) = post(&f, json!({"query": both, "variables": {"id": true}}).to_string()).await;
+    let (s, v, _) = post(
+        &f,
+        json!({"query": both, "variables": {"id": true}}).to_string(),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     check(&v, "GRAPHQL_VALIDATION_FAILED");
     assert_eq!(v["errors"].as_array().map(Vec::len), Some(1), "{v}");
+    // FIX-4 part C (M-1): the same for a document over the depth limit: the depth refusal
+    // alone, not mixed with the coercion error of a variable.
+    let deep = format!(
+        "query($id: ID!) {{ node(id: $id) {{ id }} blocksFromHeight(startHeight: 0, first: 1) {{ edges {{ node {{ {} hash {} }} }} }} }}",
+        "parent { ".repeat(7),
+        "}".repeat(7)
+    );
+    let (s, v, _) = post(
+        &f,
+        json!({"query": deep, "variables": {"id": true}}).to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    check(&v, "GRAPHQL_VALIDATION_FAILED");
+    assert_eq!(v["errors"][0]["extensions"]["limit"], "depth", "{v}");
+    assert_eq!(v["errors"].as_array().map(Vec::len), Some(1), "{v}");
+    // FIX-4 part C (M-2): a coercion error is told from a document error by async-graphql's
+    // message prefix (`limits.rs`, `apollo_validation`). Pinned here against the locked
+    // async-graphql: an upgrade that rewords it fails this test instead of silently turning
+    // every coercion into a 400.
+    let (_, v, _) = post(
+        &f,
+        json!({"query": node, "variables": {"id": true}}).to_string(),
+    )
+    .await;
+    let m = v["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(m.starts_with("Invalid value for argument"), "{v}");
     // A batch keeps 200; its items carry the codes.
     let (s, v, _) = post(
         &f,
@@ -797,7 +831,10 @@ async fn parse_and_validation_errors_answer_as_apollo_server_4() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    assert_eq!(v[0]["errors"][0]["code"], "GRAPHQL_VALIDATION_FAILED", "{v}");
+    assert_eq!(
+        v[0]["errors"][0]["code"], "GRAPHQL_VALIDATION_FAILED",
+        "{v}"
+    );
     assert_eq!(v[1]["errors"][0]["code"], "GRAPHQL_PARSE_FAILED", "{v}");
 }
 
@@ -810,7 +847,13 @@ async fn transaction_minimum_depth_outside_1_to_100_is_refused_as_stock() {
     let rk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let low = "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.";
     let high = "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be higher than 100.";
-    for (d, want) in [(0, Some(low)), (-1, Some(low)), (101, Some(high)), (1, None), (100, None)] {
+    for (d, want) in [
+        (0, Some(low)),
+        (-1, Some(low)),
+        (101, Some(high)),
+        (1, None),
+        (100, None),
+    ] {
         let q = format!("{{ transaction(requestKey: \"{rk}\", minimumDepth: {d}) {{ hash }} }}");
         let (s, v, _) = query(&f, &q).await;
         assert_eq!(s, StatusCode::OK, "{d}: {v}");

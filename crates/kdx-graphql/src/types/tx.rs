@@ -24,8 +24,8 @@ use crate::gql;
 use crate::ids::{encode, NodeKey};
 use crate::scalars::{BigInt, DateTime, FloatText};
 use crate::txlist::{
-    block_list, block_node, chain_arg, fungible_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx,
-    Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
+    block_list, block_node, chain_arg, fungible_arg, hash_arg, height_arg, list, load, name_arg,
+    page_in_tx, Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
 };
 
 /// A user transaction (coinbase txs are not listed as transactions, as in Kadena graph).
@@ -454,6 +454,9 @@ fn stock_depth_range(minimum_depth: Option<i32>) -> Result<()> {
         .extend_with(|_, e| e.set("code", crate::error::INTERNAL_SERVER_ERROR)))
 }
 
+/// The `BAD_USER_INPUT` of a request key stored more than once, without a `blockHash`.
+pub(crate) const MANY_COPIES: &str = "multiple transactions found: pass blockHash to pick one";
+
 /// `transaction(requestKey, blockHash, minimumDepth)`: `null` when not indexed; several
 /// copies (genesis, R-P5P9-5) without a `blockHash` that picks one are `BAD_USER_INPUT`.
 pub async fn query_transaction(
@@ -506,9 +509,7 @@ pub async fn query_transaction(
     match found.len() {
         0 => Ok(None),
         1 => Ok(Transaction::new(found[0].clone())),
-        _ => Err(bad_input(
-            "multiple transactions found: pass blockHash to pick one",
-        )),
+        _ => Err(bad_input(MANY_COPIES)),
     }
 }
 
@@ -519,6 +520,9 @@ fn list_source(
     block_hash: Option<&str>,
     request_key: Option<&str>,
 ) -> Result<SourceSpec> {
+    // A `fungibleName` is checked whatever the source, so a name of spaces alone is refused
+    // beside `blockHash` or `requestKey` too (FIX-4 part C, M-4).
+    let fungible = fungible.map(fungible_arg).transpose()?;
     Ok(if let Some(rk) = request_key {
         SourceSpec::Rk(hash_arg("requestKey", rk)?)
     } else if let Some(bh) = block_hash {
@@ -527,12 +531,10 @@ fn list_source(
         match (account, fungible) {
             (Some(a), Some(m)) => SourceSpec::Xfer {
                 account: name_arg("accountName", a)?.to_owned(),
-                module: fungible_arg(m)?.to_owned(),
+                module: m.to_owned(),
             },
             (Some(a), None) => SourceSpec::Acct(name_arg("accountName", a)?.to_owned()),
-            (None, Some(m)) => {
-                SourceSpec::EvtName(format!("{}.TRANSFER", fungible_arg(m)?))
-            }
+            (None, Some(m)) => SourceSpec::EvtName(format!("{m}.TRANSFER")),
             (None, None) => SourceSpec::Heights,
         }
     })
