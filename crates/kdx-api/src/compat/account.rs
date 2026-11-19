@@ -15,6 +15,7 @@ use kdx_types::record::{BlockRecord, TxRecord};
 use kdx_types::TxKey;
 use serde_json::Value;
 
+use super::schemas::{ExecutionStrategy, LimitErrors, PagingParams, TransferDetail};
 use super::shapes::{self, Ev, Transfer};
 use super::{
     check_strategy, collect_page, int_param, page_response, paging, resume_exhausted, resume_max,
@@ -159,6 +160,34 @@ fn page(
     collect_page(view, Candidates::Keys(it), &mut src, pg, None)
 }
 
+/// Transfers of an account
+///
+/// chainweb-data `accountHandler`: a JSON array of `TransferDetail`, newest first (height
+/// descending, request key descending, event index ascending), the rows of `token` (default
+/// `coin`) with the account on either side. A transfer to oneself is one row. Pages carry
+/// `Chainweb-Next` when there is more. Genesis transactions are hidden; miner rewards are
+/// listed. A chain id outside 0..=19, an unknown account or token answers an empty array.
+/// `amount` is the shortest exact decimal text, so it differs from chainweb-data's raw
+/// text (`"138000"` for `"138000.000000000000"`) while being the same decimal.
+#[utoipa::path(
+    get,
+    path = "/txs/account/{account}",
+    operation_id = "compat_account",
+    tag = "transfers",
+    params(
+        ("account" = String, Path, description = "Account name, 1 to 256 bytes."),
+        ("token" = Option<String>, Query, description = "Fungible module of the transfers (default `coin`).", example = "coin"),
+        ("chain" = Option<i64>, Query, description = "Only this chain (0 to 19); another value answers an empty page."),
+        PagingParams,
+        ("Chainweb-Execution-Strategy" = Option<ExecutionStrategy>, Header, description = "Accepted and ignored. Any other value is `400 Unknown Chainweb-Execution-Strategy: ...`."),
+    ),
+    responses(
+        (status = 200, description = "A page of transfers", body = Vec<TransferDetail>, content_type = "application/json",
+            headers(("Chainweb-Next" = String, description = "Token of the next page (pass as `next`); absent on the last page."))),
+        (status = 400, description = "A parameter does not parse (`Error parsing query parameter ...`), `offset` above 10,000, `next` with `offset`, or an invalid `next`", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
 pub async fn handler(
     State(st): State<Arc<ApiState>>,
     Path(account): Path<String>,

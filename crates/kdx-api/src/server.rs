@@ -151,6 +151,10 @@ pub async fn as_client<F: std::future::Future>(ip: std::net::IpAddr, f: F) -> F:
 /// heavy slot, so with two or more slots one client cannot stall another's lists.
 pub const HEAVY_WAITING_PER_CLIENT: usize = 3;
 
+/// The 503 text of a client whose heavy-read queue is full (no `Retry-After`).
+pub(crate) const HEAVY_BUSY: &str =
+    "this client already runs a heavy request and has others waiting: retry when they are done";
+
 /// Heavy reads in flight per client key: the client's one-slot semaphore and its users
 /// (running and waiting).
 #[derive(Default)]
@@ -173,10 +177,7 @@ impl HeavyClients {
             .or_insert_with(|| (Arc::new(Semaphore::new(1)), 0));
         if e.1 > HEAVY_WAITING_PER_CLIENT {
             tracing::debug!(client = %key, "api: heavy read refused, client queue full");
-            return Err(ApiError::Unavailable(
-                "this client already runs a heavy request and has others waiting: retry when they are done"
-                    .into(),
-            ));
+            return Err(ApiError::Unavailable(HEAVY_BUSY.into()));
         }
         e.1 += 1;
         Ok(HeavyTicket {
@@ -412,7 +413,7 @@ struct Slots<'a> {
 }
 
 /// The 503 of a `/v1/txs` read that found no slot within the normal deadline.
-const V1TXS_BUSY: &str = "too many /v1/txs requests running: retry later";
+pub(crate) const V1TXS_BUSY: &str = "too many /v1/txs requests running: retry later";
 
 /// The `/v1/txs` slots for `read_threads` read threads: a quarter, at least one (S-1).
 fn v1txs_slots(read_threads: usize) -> usize {
@@ -462,7 +463,13 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
                 .into_response();
         }
     }
-    let (cap, deadline) = if req.uri().path().starts_with("/v1/txs") {
+    let path = req.uri().path();
+    let is_docs = path == "/docs" || path.starts_with("/docs/");
+    let (cap, deadline) = if is_docs {
+        // The embedded Swagger UI bundle is larger than a small `api.max_body_mb`; it is
+        // static and fixed, so the body cap does not apply to it.
+        (usize::MAX, st.settings.deadline)
+    } else if path.starts_with("/v1/txs") {
         // The slot wait (`deadline`) plus the read (`v1txs_deadline`), as `read_v1txs`.
         (
             st.settings.v1txs_max_body_bytes,
@@ -496,6 +503,11 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
             cap >> 20
         ))
         .into_response();
+    }
+    // Fixed embedded files need no read slot: a client reading them slowly must not pin one
+    // of `max_in_flight` (the rate limit still applies).
+    if is_docs {
+        return resp;
     }
     // The in-flight slot lives in the body: released when the body is sent or dropped.
     resp.map(|b| {
@@ -576,6 +588,7 @@ pub struct Api {
     native: Router<Arc<ApiState>>,
     compat: Router<Arc<ApiState>>,
     graphql: Router<Arc<ApiState>>,
+    docs: bool,
     on_bound: Option<OnBound>,
 }
 
@@ -605,6 +618,7 @@ impl Api {
             native: Router::new().route("/status", axum::routing::get(status::handler)),
             compat: Router::new(),
             graphql: Router::new(),
+            docs: true,
             on_bound: None,
         }
     }
@@ -626,6 +640,13 @@ impl Api {
         Arc::get_mut(&mut self.state)
             .expect("with_stats_cache before state()")
             .stats_cache = c;
+        self
+    }
+
+    /// Serve Swagger UI and the OpenAPI documents under `/docs` on the native and compat
+    /// listeners (default on; `api.docs_enabled`).
+    pub fn docs_enabled(mut self, on: bool) -> Api {
+        self.docs = on;
         self
     }
 
@@ -664,8 +685,20 @@ impl Api {
                 .layer(middleware::from_fn_with_state(api, track))
                 .with_state(st.clone())
         };
-        let native = data(self.native, "native");
-        let compat = data(self.compat, "compat").layer(
+        // Swagger UI and the specs ride on the two REST listeners only (never admin, which
+        // carries /metrics, nor GraphQL), behind the same guard as their data routes.
+        let (native_routes, compat_routes) = if self.docs {
+            (
+                self.native
+                    .merge(crate::docs::router(crate::docs::Primary::Native)),
+                self.compat
+                    .merge(crate::docs::router(crate::docs::Primary::Compat)),
+            )
+        } else {
+            (self.native, self.compat)
+        };
+        let native = data(native_routes, "native");
+        let compat = data(compat_routes, "compat").layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
@@ -753,7 +786,7 @@ pub fn json(v: &serde_json::Value) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn settings(read_threads: usize) -> ApiSettings {
@@ -790,6 +823,47 @@ mod tests {
         assert_eq!(st.in_flight.available_permits(), 0, "body not sent yet");
         drop(resp);
         assert_eq!(st.in_flight.available_permits(), 1);
+    }
+
+    /// S3 and M3: the body cap does not apply to `/docs`, and a docs response does not hold
+    /// an in-flight slot while it streams; a data route and `/v1/txs` over the cap are 503.
+    #[tokio::test]
+    async fn docs_are_exempt_from_the_body_cap_and_the_slot() {
+        use tower::ServiceExt;
+        let (_d, store) = crate::testutil::store();
+        let mut cfg = settings(4);
+        cfg.max_body_bytes = 1 << 20;
+        cfg.v1txs_max_body_bytes = 1 << 20;
+        cfg.max_in_flight = 1;
+        let st = Api::new(store, cfg, TipWatch::default()).state();
+        let big = || async { vec![b'x'; 2 << 20] };
+        let app = Router::new()
+            .route("/docs/big", axum::routing::get(big))
+            .route("/big", axum::routing::get(big))
+            .route("/v1/txs/big", axum::routing::get(big))
+            .layer(middleware::from_fn_with_state(st.clone(), guard))
+            .with_state(st.clone());
+        let get = |p: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(Request::builder().uri(p).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        let r = get("/docs/big").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            st.in_flight.available_permits(),
+            1,
+            "a docs body must not hold a slot"
+        );
+        drop(r);
+        for p in ["/big", "/v1/txs/big"] {
+            let r = get(p).await;
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{p}");
+            drop(r);
+        }
     }
 
     /// A free port on `ip` (bound once and released; the tests bind it again right away).

@@ -22,6 +22,7 @@ use kdx_hot::{Table, Txn};
 use kdx_types::TxKey;
 use tokio_util::sync::CancellationToken;
 
+use super::schemas::{LimitErrors, Stats};
 use super::{shapes, text};
 use crate::server::ApiState;
 use crate::store::View;
@@ -282,6 +283,28 @@ pub fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
     Ok(Some((c.n, coins)))
 }
 
+/// Transaction count and circulating supply
+///
+/// chainweb-data `statsHandler`: `{"transactionCount": N, "coinsInCirculation": X}`, the
+/// exact user-transaction count. A background task recounts, each count starting two
+/// minutes after the previous one ended and running to completion; a request never
+/// recounts and answers the last count with `X-Count-Age` (seconds since that count
+/// started; every 200 has it). Before the first count exists the request waits up to the
+/// deadline, then answers `503` with `Retry-After: 5`. A failed recount keeps the last
+/// count and its age grows. `coinsInCirculation` is mainnet01's supply table; other
+/// networks answer `404 Server database is empty`.
+#[utoipa::path(
+    get,
+    path = "/stats",
+    operation_id = "compat_stats",
+    tag = "network",
+    responses(
+        (status = 200, description = "Counts", body = Stats, content_type = "application/json",
+            headers(("X-Count-Age" = u64, description = "Seconds since the count started; readable by browsers (CORS exposed)."))),
+        (status = 404, description = "`Server database is empty` (empty store, or a network other than mainnet01)", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
 pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
     let until = Instant::now() + st.settings.deadline;
     let cache = st.stats_cache;

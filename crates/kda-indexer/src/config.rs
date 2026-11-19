@@ -216,6 +216,9 @@ pub struct ApiConfig {
     pub deadline_ms: u64,
     /// Requests in flight over all listeners (503 past it).
     pub max_in_flight: usize,
+    /// Serve Swagger UI and the OpenAPI documents under `/docs` on the native and compat
+    /// listeners (404 when false).
+    pub docs_enabled: bool,
     /// Response body cap (503 "narrow the query" past it).
     pub max_body_mb: u64,
     /// Response body cap of `/v1/txs`.
@@ -242,6 +245,7 @@ impl Default for ApiConfig {
             rate_burst: 40,
             deadline_ms: 5000,
             max_in_flight: 512,
+            docs_enabled: true,
             max_body_mb: 8,
             v1txs_max_body_mb: 32,
             v1txs_deadline_ms: 30_000,
@@ -1060,6 +1064,49 @@ mod ws_bound_tests {
         assert_eq!(ms(&c), 50);
         assert_eq!(ms(&parse("")), 200);
         assert!(parse("count_budget_ms = 0").validate().is_err());
+    }
+
+    /// `api.docs_enabled` defaults to true (Swagger UI under `/docs`), parses `false`, and is
+    /// documented where operators look: both example configs and the API and operations docs.
+    #[test]
+    fn docs_enabled_parses_defaults_and_is_documented() {
+        let parse = |a: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[api]\n{a}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        assert!(parse("").api.docs_enabled);
+        assert!(ApiConfig::default().docs_enabled);
+        let c = parse("docs_enabled = false");
+        c.validate().unwrap();
+        assert!(!c.api.docs_enabled);
+        for (name, text) in [
+            (
+                "mainnet01.toml.example",
+                include_str!("../../../packaging/config/mainnet01.toml.example"),
+            ),
+            (
+                "testnet.toml.example",
+                include_str!("../../../packaging/config/testnet.toml.example"),
+            ),
+        ] {
+            assert!(
+                text.lines().any(|l| l.starts_with("docs_enabled = true")),
+                "{name} lacks docs_enabled"
+            );
+        }
+        for (name, text) in [
+            ("api.md", include_str!("../../../docs/api.md")),
+            ("operations.md", include_str!("../../../docs/operations.md")),
+        ] {
+            assert!(
+                text.contains("docs_enabled"),
+                "{name} does not document docs_enabled"
+            );
+            assert!(text.contains("/docs"), "{name} does not name /docs");
+        }
     }
 
     /// `graphql.sender_index` (FIX-2) defaults to true and parses `false`.

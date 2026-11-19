@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use kdx_types::Hash32;
 use serde_json::Value;
 
+use super::schemas::{LimitErrors, TxDetail};
 use super::{aeson, shapes, text, Params};
 use crate::server::ApiState;
 use crate::store::View;
@@ -61,6 +62,24 @@ async fn run(st: Arc<ApiState>, q: Vec<(String, String)>, many: bool) -> Respons
     }
 }
 
+/// One transaction by request key
+///
+/// chainweb-data `txHandler`. Answers the `TxDetail` of the request key when exactly one
+/// row has it. A request key stored on several chains (only genesis transactions repeat a
+/// key) is `404 Tx not found` here; `/txs/txs` lists every row. Genesis transactions are
+/// served (the list routes hide them), coinbase rewards are not (they have no request key).
+#[utoipa::path(
+    get,
+    path = "/txs/tx",
+    operation_id = "compat_tx",
+    tag = "transactions",
+    params(("requestkey" = Option<String>, Query, description = "The request key (base64url hash). Missing: `404 You must specify a search string`.")),
+    responses(
+        (status = 200, description = "The transaction", body = TxDetail, content_type = "application/json"),
+        (status = 404, description = "`Tx not found`, or `You must specify a search string` without `requestkey`", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
 pub async fn tx_handler(
     State(st): State<Arc<ApiState>>,
     Query(q): Query<Vec<(String, String)>>,
@@ -68,6 +87,23 @@ pub async fn tx_handler(
     run(st, q, false).await
 }
 
+/// Every transaction row of a request key
+///
+/// chainweb-data `txsHandler`: a JSON array of `TxDetail`, one per stored location of the
+/// request key (several only for genesis transactions). An unknown key is
+/// `404 Tx not found`, not an empty array.
+#[utoipa::path(
+    get,
+    path = "/txs/txs",
+    operation_id = "compat_txs",
+    tag = "transactions",
+    params(("requestkey" = Option<String>, Query, description = "The request key (base64url hash). Missing: `404 You must specify a search string`.")),
+    responses(
+        (status = 200, description = "The transaction rows", body = Vec<TxDetail>, content_type = "application/json"),
+        (status = 404, description = "`Tx not found`, or `You must specify a search string` without `requestkey`", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
 pub async fn txs_handler(
     State(st): State<Arc<ApiState>>,
     Query(q): Query<Vec<(String, String)>>,

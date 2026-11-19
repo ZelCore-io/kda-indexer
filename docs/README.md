@@ -31,6 +31,7 @@ validation is in progress (it ends 2026-11-19 17:05Z); not yet serving productio
 |---|---|
 | [api.md](api.md) | The native API (`/api/v1`): conventions, routes, objects, search and defpact routes. Internal and unstable. |
 | [openapi.json](openapi.json) | Machine-readable OpenAPI description of the native API. |
+| [openapi-compat.json](openapi-compat.json) | Machine-readable OpenAPI description of the chainweb-data compatible API. Both documents are also served by the indexer with Swagger UI at `/docs`. |
 | [graphql.md](graphql.md) | The GraphQL API: schema, errors, limits, websockets and subscriptions, differences from Kadena's graph. |
 | [format.md](format.md) | The on-disk format (version 2): segments, indexes, posting lists, record encoding, write ordering, checks. |
 

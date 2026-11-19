@@ -9,6 +9,12 @@
     },
     "version": "1"
   },
+  "servers": [
+    {
+      "url": "/",
+      "description": "This server (same origin)"
+    }
+  ],
   "paths": {
     "/api/v1/accounts/{account}/balances": {
       "get": {

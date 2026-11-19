@@ -8,6 +8,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
+use super::schemas::{LimitErrors, TxSummary};
 use super::{aeson, hidden, shapes, store_floor};
 use crate::server::ApiState;
 use crate::store::View;
@@ -79,6 +80,23 @@ fn recent(view: &View) -> ApiResult<Vec<Value>> {
     Ok(out)
 }
 
+/// The ten newest transactions
+///
+/// chainweb-data `recentTxsHandler`: a JSON array of up to ten `TxSummary`, newest height
+/// first. Inside one height chainweb-data leaves the order to Postgres; here it is request
+/// key descending. Genesis and coinbase transactions are left out. The walk looks at most
+/// 20,000 heights back, so a store whose newest heights hold no user transactions answers
+/// fewer than ten.
+#[utoipa::path(
+    get,
+    path = "/txs/recent",
+    operation_id = "compat_recent",
+    tag = "transactions",
+    responses(
+        (status = 200, description = "Up to ten transaction summaries", body = Vec<TxSummary>, content_type = "application/json"),
+        LimitErrors,
+    )
+)]
 pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
     match st.read(recent).await {
         Ok(v) => aeson(&Value::Array(v)),

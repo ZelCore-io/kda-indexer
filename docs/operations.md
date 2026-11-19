@@ -321,6 +321,19 @@ refused.
   behind the store (`X-Count-Age` measures from the start of that count); the supply is computed
   per request.
 
+## Swagger UI (`/docs`)
+
+The native and compat listeners serve Swagger UI at `/docs`, with the OpenAPI documents of both
+APIs at `/docs/openapi.json` and `/docs/openapi-compat.json`. Everything is embedded in the
+binary (no CDN, nothing fetched at runtime) and read-only. `[api] docs_enabled = false` turns it
+off: `/docs` and every file under it answer 404 (a restart is needed). The admin listener
+(`/healthz`, `/readyz`, `/metrics`) and the GraphQL listener never serve it. Behind a load
+balancer, route `/docs` the way you route the listener's other paths, or leave it unrouted so the
+public name does not expose it; the native listener is internal by rule. The page costs about
+2 MB of response bytes on the first load (cached for a day by the browser) and counts against the
+per-client rate limit like any request. The embedded UI is swagger-ui-dist 5.34.1 (Apache-2.0,
+see `THIRD_PARTY_NOTICES`).
+
 ## Metrics and alerts
 
 `/metrics` on the admin port (OpenMetrics text); the same families are written to the

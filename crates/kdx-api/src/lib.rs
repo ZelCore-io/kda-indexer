@@ -5,6 +5,7 @@ pub mod admin;
 pub mod compat;
 pub mod cursor;
 pub mod dict;
+pub mod docs;
 pub mod limits;
 pub mod native;
 pub mod openapi;
