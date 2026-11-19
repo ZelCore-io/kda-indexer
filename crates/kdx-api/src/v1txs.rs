@@ -19,8 +19,10 @@ use axum::routing::get;
 use axum::Router;
 use kdx_decode::index::xfer_entity;
 use kdx_decode::Family;
+use kdx_types::TxKey;
 
-use crate::compat::account::Src;
+use crate::compat::account::{KeepBudget, Src};
+use crate::compat::schemas::{TxDetail, V1TxsLimitErrors};
 use crate::compat::shapes::{self, write_aeson};
 use crate::compat::{collect_page, json_bytes, text, Candidates, Paging};
 use crate::server::ApiState;
@@ -29,6 +31,79 @@ use crate::{ApiError, ApiResult};
 
 const DEFAULT_LIMIT: u64 = 50;
 const MAX_LIMIT: u64 = 10_000;
+
+// The two `doc_*` functions below only carry the OpenAPI description of the route: the
+// handler is `handler`, which serves the query form and the path form.
+
+/// The transactions behind an account's newest transfers
+///
+/// The newest `limit` transfer rows of the account in `namespace` (the fungible module,
+/// default `coin`) and the transactions that made them, as `TxDetail` records (the shape of
+/// `/txs/txs`). Each path segment is optional and falls back to the query parameter of the
+/// same name: `/v1/txs/{account}/{namespace}/{limit}` equals
+/// `/v1/txs?account=...&namespace=...&limit=...`. Rows of the token come first and, for a
+/// token other than `coin`, the account's `coin` rows follow. A transaction with several
+/// matching rows appears once, at its first row; miner rewards count toward `limit` but
+/// produce no entry. `limit` follows JavaScript `Number()` (hex, exponent and fractions
+/// parse; an empty, zero or non-numeric value means the default 50; above 10,000 it is
+/// capped, before its fraction is looked at). A negative value, or a fractional one up to
+/// 10,000, is `404 Not Found`, as is a fourth path segment. A missing account is
+/// `400 Bad Request`. Genesis transactions are hidden. The answer is capped at
+/// `api.v1txs_max_body_mb` (32 MB by default; `503` past it, use a smaller `limit`).
+///
+/// The read has its own time budget and slot pool, apart from the other routes: it runs for
+/// up to `api.v1txs_deadline_ms` (30 s by default; `504` past it, where kda-txs answers 404)
+/// on one of a quarter of `api.read_threads` slots (at least one), and waits at most
+/// `api.deadline_ms` (5 s) for a slot (`503`). The server answers after up to 35 s, so a
+/// balancer in front needs a server timeout of 40 s or more for this route.
+#[utoipa::path(
+    get,
+    path = "/v1/txs",
+    operation_id = "compat_v1_txs_query",
+    tag = "transfers",
+    params(
+        ("account" = Option<String>, Query, description = "Account name (required: without it `400 Bad Request`)."),
+        ("namespace" = Option<String>, Query, description = "Fungible module.", example = "coin"),
+        ("limit" = Option<String>, Query, description = "Transfer rows to read: a JavaScript number, default 50, capped at 10,000.", example = "50"),
+    ),
+    responses(
+        (status = 200, description = "Transactions, newest transfer first", body = Vec<TxDetail>, content_type = "application/json"),
+        (status = 400, description = "No account", body = String, content_type = "text/plain"),
+        (status = 404, description = "`Not Found`: a negative `limit`, a fractional `limit` up to 10,000, or more than three path segments", body = String, content_type = "text/plain"),
+        V1TxsLimitErrors,
+    )
+)]
+pub fn doc_query_form() {}
+
+/// The transactions behind an account's newest transfers, path form
+///
+/// The same route as `/v1/txs`, with the parameters as path segments. The trailing
+/// segments may be left out (`/v1/txs/{account}` and `/v1/txs/{account}/{namespace}` are
+/// served; OpenAPI cannot describe optional path segments, so only the full form is
+/// listed). An empty segment falls back to the query parameter of the same name.
+///
+/// Limits as for `/v1/txs`: the read has its own time budget (`api.v1txs_deadline_ms`, 30 s
+/// by default; `504` past it) and slot pool (a quarter of `api.read_threads`, at least one;
+/// `503` when none frees within `api.deadline_ms`). A balancer in front needs a server
+/// timeout of 40 s or more for this route.
+#[utoipa::path(
+    get,
+    path = "/v1/txs/{account}/{namespace}/{limit}",
+    operation_id = "compat_v1_txs_path",
+    tag = "transfers",
+    params(
+        ("account" = String, Path, description = "Account name."),
+        ("namespace" = String, Path, description = "Fungible module (`coin` when empty)."),
+        ("limit" = String, Path, description = "Transfer rows to read: a JavaScript number, default 50, capped at 10,000."),
+    ),
+    responses(
+        (status = 200, description = "Transactions, newest transfer first", body = Vec<TxDetail>, content_type = "application/json"),
+        (status = 400, description = "No account", body = String, content_type = "text/plain"),
+        (status = 404, description = "`Not Found`: a negative `limit`, a fractional `limit` up to 10,000, or more than three path segments", body = String, content_type = "text/plain"),
+        V1TxsLimitErrors,
+    )
+)]
+pub fn doc_path_form() {}
 
 pub fn router() -> Router<Arc<ApiState>> {
     Router::new()
@@ -172,18 +247,24 @@ fn params(path: &str, query: &[(String, String)]) -> Option<Params> {
 }
 
 /// Tx keys of the newest `limit` transfer rows of `token` for `account`.
-fn token_rows(
+pub(crate) fn token_rows(
     view: &View,
     account: &str,
     token: &str,
     limit: usize,
+    budget: &mut KeepBudget,
 ) -> ApiResult<Vec<crate::compat::account::KeyRow>> {
     let d = view.dict();
     let (Some(a), Some(m)) = (d.account_id(account), d.module_id(token)) else {
         return Ok(Vec::new());
     };
-    let it = view.postings(Family::Xfer, xfer_entity(a, m), PostingQuery::default())?;
-    let mut src = Src::keys_only(account, token);
+    let mut it = view.postings(Family::Xfer, xfer_entity(a, m), PostingQuery::default())?;
+    // Cold pages: ask for the frozen rows of the first `limit` candidates before the walk
+    // decodes them one by one (advisory; the walk reads the rest of the postings as before).
+    let head: Vec<ApiResult<TxKey>> = it.by_ref().take(limit).collect();
+    let _ = view.prefetch(head.iter().filter_map(|k| k.as_ref().ok().copied()));
+    let it: Box<dyn Iterator<Item = ApiResult<TxKey>> + '_> = Box::new(head.into_iter().chain(it));
+    let mut src = Src::keys_only(account, token, *budget);
     let pg = Paging {
         limit,
         offset: 0,
@@ -193,7 +274,9 @@ fn token_rows(
         empty: false,
     };
     collect_page(view, Candidates::Keys(it.peekable()), &mut src, &pg, None)?;
-    Ok(src.take_keys())
+    let (rows, left) = src.take_keys();
+    *budget = left;
+    Ok(rows)
 }
 
 /// The JSON array of entries, as bytes; `cap` bounds the body.
@@ -204,9 +287,22 @@ fn entries(
     limit: usize,
     cap: usize,
 ) -> ApiResult<Vec<u8>> {
-    let mut keys = token_rows(view, account, namespace, limit)?;
+    // The kept records share one budget of the body cap (F-21).
+    entries_in(view, account, namespace, limit, cap, KeepBudget::new(cap))
+}
+
+/// [`entries`] with the keep budget `budget` (tests start it part used).
+pub(crate) fn entries_in(
+    view: &View,
+    account: &str,
+    namespace: &str,
+    limit: usize,
+    cap: usize,
+    mut budget: KeepBudget,
+) -> ApiResult<Vec<u8>> {
+    let mut keys = token_rows(view, account, namespace, limit, &mut budget)?;
     if namespace != "coin" {
-        keys.extend(token_rows(view, account, "coin", limit)?);
+        keys.extend(token_rows(view, account, "coin", limit, &mut budget)?);
     }
     // Cold pages: ask for every frozen row this page decodes before the first decode
     // (advisory: a damaged file fails on the decode below).
@@ -265,7 +361,7 @@ async fn handler(
     };
     let cap = st.settings.v1txs_max_body_bytes;
     match st
-        .read_heavy(move |v| entries(v, &p.account, &p.namespace, limit as usize, cap))
+        .read_v1txs(move |v| entries(v, &p.account, &p.namespace, limit as usize, cap))
         .await
     {
         Ok(body) => json_bytes(body),

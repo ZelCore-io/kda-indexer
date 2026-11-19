@@ -1,0 +1,1859 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "kda-indexer chainweb-data compatible API",
+    "description": "The REST routes of chainweb-data (txs, account transfers, events, search, /coins, /stats) and the /v1/txs convenience route, served by the compat listener (api.compat). Shapes, error texts and row order follow chainweb-data; documented differences are listed per route. JSON uses chainweb-data's camelCase names and aeson's number and time text. Errors are plain text. List routes (/txs/account, /txs/events, /txs/search) take limit (default 10, capped at 250), offset (up to 10,000) or a next token, minheight and maxheight, and answer a JSON array with the next page's token in the Chainweb-Next header. Genesis transactions are hidden on the list routes. Every data route answers 429 (per-client rate), 503 (too many requests in flight, or an answer over api.max_body_mb) and 504 (the 5 s deadline; /v1/txs has its own 30 s deadline, slot pool and body cap, see the route). Search routes run under a shared gate (503 when search.concurrency searches run, 429 when the client already runs search.per_client). CORS is open and Chainweb-Next and X-Count-Age are exposed.",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "1"
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "This server (same origin)"
+    }
+  ],
+  "paths": {
+    "/coins": {
+      "get": {
+        "tags": [
+          "network"
+        ],
+        "summary": "Circulating supply in plain text",
+        "description": "chainweb-data `coinsHandler`: the circulating KDA at the highest stored height and the\ncurrent time, printed as the Haskell `show` of a `Decimal` (`text/plain`, for example\n`1234567.89`). The supply tables are mainnet01's: any other network, like an empty\nstore, answers `404 Server database is empty`.",
+        "operationId": "compat_coins",
+        "responses": {
+          "200": {
+            "description": "Circulating supply, decimal text",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`Server database is empty` (empty store, or a network other than mainnet01)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a\nsearch route, the client already runs `search.per_client` searches. Retry after the\n`Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals and\n`/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stats": {
+      "get": {
+        "tags": [
+          "network"
+        ],
+        "summary": "Transaction count and circulating supply",
+        "description": "chainweb-data `statsHandler`: `{\"transactionCount\": N, \"coinsInCirculation\": X}`, the\nexact user-transaction count. A background task recounts, each count starting two\nminutes after the previous one ended and running to completion; a request never\nrecounts and answers the last count with `X-Count-Age` (seconds since that count\nstarted; every 200 has it). Before the first count exists the request waits up to the\ndeadline, then answers `503` with `Retry-After: 5`. A failed recount keeps the last\ncount and its age grows. `coinsInCirculation` is mainnet01's supply table; other\nnetworks answer `404 Server database is empty`.",
+        "operationId": "compat_stats",
+        "responses": {
+          "200": {
+            "description": "Counts",
+            "headers": {
+              "X-Count-Age": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds since the count started; readable by browsers (CORS exposed)."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stats"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`Server database is empty` (empty store, or a network other than mainnet01)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a\nsearch route, the client already runs `search.per_client` searches. Retry after the\n`Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals and\n`/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/txs/account/{account}": {
+      "get": {
+        "tags": [
+          "transfers"
+        ],
+        "summary": "Transfers of an account",
+        "description": "chainweb-data `accountHandler`: a JSON array of `TransferDetail`, newest first (height\ndescending, request key descending, event index ascending), the rows of `token` (default\n`coin`) with the account on either side. A transfer to oneself is one row. Pages carry\n`Chainweb-Next` when there is more. Genesis transactions are hidden; miner rewards are\nlisted. A chain id outside 0..=19, an unknown account or token answers an empty array; a `chain` past a 64-bit integer is a 400.\n`amount` is the shortest exact decimal text, so it differs from chainweb-data's raw\ntext (`\"138000\"` for `\"138000.000000000000\"`) while being the same decimal.",
+        "operationId": "compat_account",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Account name, 1 to 256 bytes.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "description": "Fungible module of the transfers (default `coin`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "coin"
+          },
+          {
+            "name": "chain",
+            "in": "query",
+            "description": "Only this chain (0 to 19); another whole number answers an empty page, a number beyond a 64-bit integer is a 400.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, an integer (servant's `Integer`: a sign then digits). Default 10; a value\nabove 250 is capped to 250. A negative value answers `500 Something went wrong`\n(chainweb-data passes it to SQL `LIMIT`). Anything else that is not an integer is\n`400 Error parsing query parameter limit failed: could not parse: ...`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 10
+            },
+            "example": 10
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip, default 0, at most 10,000 (more answers `400`; page further with\n`next`). A negative value counts as 0. Not allowed together with `next`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0,
+              "maximum": 10000
+            },
+            "example": 0
+          },
+          {
+            "name": "next",
+            "in": "query",
+            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors, not\nchainweb-data's; treat them as opaque. A token that does not decode is\n`400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest block height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest block height (inclusive). A negative value, or `minheight` above\n`maxheight`, answers an empty page.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "Chainweb-Execution-Strategy",
+            "in": "header",
+            "description": "Accepted and ignored. Any other value is `400 Unknown Chainweb-Execution-Strategy: ...`.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/ExecutionStrategy"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of transfers",
+            "headers": {
+              "Chainweb-Next": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Token of the next page (pass as `next`); absent on the last page."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TransferDetail"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A parameter does not parse (`Error parsing query parameter ...`), `offset` above 10,000, `next` with `offset`, or an invalid `next`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a\nsearch route, the client already runs `search.per_client` searches. Retry after the\n`Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals and\n`/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/txs/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Events",
+        "description": "chainweb-data `evHandler`: a JSON array of `EventDetail`, newest first (height\ndescending, request key descending, event index ascending). Filters combine with AND:\n`modulename` is an exact module, `name` a SQL `LIKE '%name%'` on the qualified name,\n`param` a `LIKE` on the parameters' JSON text, `search` a `LIKE` on either. Patterns\ntake `%` and `_`, `\\` escapes them, at most 256 characters and 8 `%`. Without\n`modulename`, `name` and `param` need at least `search.min_len` (4) characters other\nthan wildcards and may take a bounded newest-first scan (`search.max_scan_heights`,\n`search.timeout_ms`): a cut scan answers what it found with `X-Search-Truncated: true`\nand `Chainweb-Next`. `search` takes one slot of the search gate (`503` when\n`search.concurrency` searches run, `429` when the client already runs\n`search.per_client`). Genesis transactions are hidden.",
+        "operationId": "compat_events",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "query",
+            "description": "LIKE pattern matched against the qualified name or the parameter text.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "param",
+            "in": "query",
+            "description": "LIKE pattern matched against the parameter text (JSON).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "LIKE pattern matched against the qualified event name, for example `coin.TRANSFER`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "modulename",
+            "in": "query",
+            "description": "Exact module name, for example `coin`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, an integer (servant's `Integer`: a sign then digits). Default 10; a value\nabove 250 is capped to 250. A negative value answers `500 Something went wrong`\n(chainweb-data passes it to SQL `LIMIT`). Anything else that is not an integer is\n`400 Error parsing query parameter limit failed: could not parse: ...`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 10
+            },
+            "example": 10
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip, default 0, at most 10,000 (more answers `400`; page further with\n`next`). A negative value counts as 0. Not allowed together with `next`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0,
+              "maximum": 10000
+            },
+            "example": 0
+          },
+          {
+            "name": "next",
+            "in": "query",
+            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors, not\nchainweb-data's; treat them as opaque. A token that does not decode is\n`400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest block height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest block height (inclusive). A negative value, or `minheight` above\n`maxheight`, answers an empty page.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "Chainweb-Execution-Strategy",
+            "in": "header",
+            "description": "Accepted and ignored. Any other value is `400 Unknown Chainweb-Execution-Strategy: ...`.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/ExecutionStrategy"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of events",
+            "headers": {
+              "Chainweb-Next": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Token of the next page (pass as `next`); absent on the last page."
+              },
+              "X-Search-Truncated": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`true` when the scan deadline or a cap cut the answer short."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EventDetail"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A parameter does not parse, a pattern is too long, has too many `%`, or is too short without `modulename`; `offset` above 10,000; `next` with `offset`; an invalid `next`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a\nsearch route, the client already runs `search.per_client` searches. Retry after the\n`Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals and\n`/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/txs/recent": {
+      "get": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "The ten newest transactions",
+        "description": "chainweb-data `recentTxsHandler`: a JSON array of up to ten `TxSummary`, newest height\nfirst. Inside one height chainweb-data leaves the order to Postgres; here it is request\nkey descending. Genesis and coinbase transactions are left out. The walk looks at most\n20,000 heights back, so a store whose newest heights hold no user transactions answers\nfewer than ten.",
+        "operationId": "compat_recent",
+        "responses": {
+          "200": {
+            "description": "Up to ten transaction summaries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TxSummary"
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a\nsearch route, the client already runs `search.per_client` searches. Retry after the\n`Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals and\n`/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/txs/search": {
+      "get": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Search transactions by code, or list a defpact",
+        "description": "chainweb-data `searchTxs`. Exactly one of `search` and `pactid`: neither answers\n`404 You must specify a search string`, both `400 You should only specify a pactid or a\nsearch string, not both!`.\n\n`search`: a JSON array of `TxSummary` for the transactions whose own exec code contains\nthe pattern (a `LIKE` pattern: `%`, `_`, `\\` escapes; at most 256 characters and 8 `%`),\nheight descending then request key descending. A pattern with a literal run of 3\ncharacters uses the code index when it holds every body the pattern can match; otherwise\na bounded newest-first scan runs (`search.max_scan_heights`, `search.timeout_ms`). A cut\nanswer carries `X-Search-Truncated: true` and, when there is more, `Chainweb-Next`.\nGenesis transactions are listed here (the other list routes hide them). Difference from\nchainweb-data: its `cont` transactions also match through the initial code of their\ndefpact; here they do not. The route takes one slot of the search gate (`503` when\n`search.concurrency` searches run, `429` when the client already runs `search.per_client`).\n\n`pactid`: the `cont` transactions of the defpact (the starting transaction excluded),\nsuccessful ones first, then height descending (ties: request key ascending), at most 50.\nOnly the newest 1,000 transactions of the pact are read, so an old successful\ncontinuation of a pact with more transactions may be missing; such an answer carries\n`X-Search-Truncated: true`. Height and paging parameters are ignored and no\n`Chainweb-Next` is sent, as in chainweb-data. A value that is not a pact id matches\nnothing (an empty array).",
+        "operationId": "compat_search",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "query",
+            "description": "LIKE pattern matched against the exec code.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pactid",
+            "in": "query",
+            "description": "Defpact id (base64url hash); the `limit` is capped at 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, an integer (servant's `Integer`: a sign then digits). Default 10; a value\nabove 250 is capped to 250. A negative value answers `500 Something went wrong`\n(chainweb-data passes it to SQL `LIMIT`). Anything else that is not an integer is\n`400 Error parsing query parameter limit failed: could not parse: ...`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 10
+            },
+            "example": 10
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip, default 0, at most 10,000 (more answers `400`; page further with\n`next`). A negative value counts as 0. Not allowed together with `next`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0,
+              "maximum": 10000
+            },
+            "example": 0
+          },
+          {
+            "name": "next",
+            "in": "query",
+            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors, not\nchainweb-data's; treat them as opaque. A token that does not decode is\n`400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "minheight",
+            "in": "query",
+            "description": "Lowest block height (inclusive).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "maxheight",
+            "in": "query",
+            "description": "Highest block height (inclusive). A negative value, or `minheight` above\n`maxheight`, answers an empty page.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "Chainweb-Execution-Strategy",
+            "in": "header",
+            "description": "Accepted and ignored. Any other value is `400 Unknown Chainweb-Execution-Strategy: ...`.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/ExecutionStrategy"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transaction summaries",
+            "headers": {
+              "Chainweb-Next": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Token of the next page (`search` only); absent on the last page."
+              },
+              "X-Search-Truncated": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`true` when the scan deadline or a cap cut the answer short."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TxSummary"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Both `search` and `pactid`, a parameter that does not parse, a pattern that is too long or has too many `%`, `offset` above 10,000, `next` with `offset`, or an invalid `next`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`You must specify a search string`: neither `search` nor `pactid`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a\nsearch route, the client already runs `search.per_client` searches. Retry after the\n`Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals and\n`/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/txs/tx": {
+      "get": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "One transaction by request key",
+        "description": "chainweb-data `txHandler`. Answers the `TxDetail` of the request key when exactly one\nrow has it. A request key stored on several chains (only genesis transactions repeat a\nkey) is `404 Tx not found` here; `/txs/txs` lists every row. Genesis transactions are\nserved (the list routes hide them), coinbase rewards are not (they have no request key).",
+        "operationId": "compat_tx",
+        "parameters": [
+          {
+            "name": "requestkey",
+            "in": "query",
+            "description": "The request key (base64url hash). Missing: `404 You must specify a search string`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The transaction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TxDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`Tx not found`, or `You must specify a search string` without `requestkey`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a\nsearch route, the client already runs `search.per_client` searches. Retry after the\n`Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals and\n`/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/txs/txs": {
+      "get": {
+        "tags": [
+          "transactions"
+        ],
+        "summary": "Every transaction row of a request key",
+        "description": "chainweb-data `txsHandler`: a JSON array of `TxDetail`, one per stored location of the\nrequest key (several only for genesis transactions). An unknown key is\n`404 Tx not found`, not an empty array.",
+        "operationId": "compat_txs",
+        "parameters": [
+          {
+            "name": "requestkey",
+            "in": "query",
+            "description": "The request key (base64url hash). Missing: `404 You must specify a search string`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The transaction rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TxDetail"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`Tx not found`, or `You must specify a search string` without `requestkey`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a\nsearch route, the client already runs `search.per_client` searches. Retry after the\n`Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals and\n`/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/txs": {
+      "get": {
+        "tags": [
+          "transfers"
+        ],
+        "summary": "The transactions behind an account's newest transfers",
+        "description": "The newest `limit` transfer rows of the account in `namespace` (the fungible module,\ndefault `coin`) and the transactions that made them, as `TxDetail` records (the shape of\n`/txs/txs`). Each path segment is optional and falls back to the query parameter of the\nsame name: `/v1/txs/{account}/{namespace}/{limit}` equals\n`/v1/txs?account=...&namespace=...&limit=...`. Rows of the token come first and, for a\ntoken other than `coin`, the account's `coin` rows follow. A transaction with several\nmatching rows appears once, at its first row; miner rewards count toward `limit` but\nproduce no entry. `limit` follows JavaScript `Number()` (hex, exponent and fractions\nparse; an empty, zero or non-numeric value means the default 50; above 10,000 it is\ncapped, before its fraction is looked at). A negative value, or a fractional one up to\n10,000, is `404 Not Found`, as is a fourth path segment. A missing account is\n`400 Bad Request`. Genesis transactions are hidden. The answer is capped at\n`api.v1txs_max_body_mb` (32 MB by default; `503` past it, use a smaller `limit`).\n\nThe read has its own time budget and slot pool, apart from the other routes: it runs for\nup to `api.v1txs_deadline_ms` (30 s by default; `504` past it, where kda-txs answers 404)\non one of a quarter of `api.read_threads` slots (at least one), and waits at most\n`api.deadline_ms` (5 s) for a slot (`503`). The server answers after up to 35 s, so a\nbalancer in front needs a server timeout of 40 s or more for this route.",
+        "operationId": "compat_v1_txs_query",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "query",
+            "description": "Account name (required: without it `400 Bad Request`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "query",
+            "description": "Fungible module.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "coin"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Transfer rows to read: a JavaScript number, default 50, capped at 10,000.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "50"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transactions, newest transfer first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TxDetail"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No account",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`Not Found`: a negative `limit`, a fractional `limit` up to 10,000, or more than three path segments",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up. Retry\nafter the `Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Refused, without `Retry-After`: `api.max_in_flight` requests are running; no\n`/v1/txs` slot freed within `api.deadline_ms` (5 s by default), `too many /v1/txs\nrequests running: retry later`; the client already runs a heavy request and has others\nwaiting (`this client already runs a heavy request and has others waiting: retry when\nthey are done`); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`).",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The read ran past `api.v1txs_deadline_ms` (30 s by default):\n`request deadline exceeded`. kda-txs answers 404 at that point.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/txs/{account}/{namespace}/{limit}": {
+      "get": {
+        "tags": [
+          "transfers"
+        ],
+        "summary": "The transactions behind an account's newest transfers, path form",
+        "description": "The same route as `/v1/txs`, with the parameters as path segments. The trailing\nsegments may be left out (`/v1/txs/{account}` and `/v1/txs/{account}/{namespace}` are\nserved; OpenAPI cannot describe optional path segments, so only the full form is\nlisted). An empty segment falls back to the query parameter of the same name.\n\nLimits as for `/v1/txs`: the read has its own time budget (`api.v1txs_deadline_ms`, 30 s\nby default; `504` past it) and slot pool (a quarter of `api.read_threads`, at least one;\n`503` when none frees within `api.deadline_ms`). A balancer in front needs a server\ntimeout of 40 s or more for this route.",
+        "operationId": "compat_v1_txs_path",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "path",
+            "description": "Account name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Fungible module (`coin` when empty).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "description": "Transfer rows to read: a JavaScript number, default 50, capped at 10,000.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transactions, newest transfer first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TxDetail"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No account",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`Not Found`: a negative `limit`, a fractional `limit` up to 10,000, or more than three path segments",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up. Retry\nafter the `Retry-After` seconds.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1)."
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A read failed; the cause is logged, the body is `internal error`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Refused, without `Retry-After`: `api.max_in_flight` requests are running; no\n`/v1/txs` slot freed within `api.deadline_ms` (5 s by default), `too many /v1/txs\nrequests running: retry later`; the client already runs a heavy request and has others\nwaiting (`this client already runs a heavy request and has others waiting: retry when\nthey are done`); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`).",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The read ran past `api.v1txs_deadline_ms` (30 s by default):\n`request deadline exceeded`. kda-txs answers 404 at that point.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Capability": {
+        "type": "object",
+        "required": [
+          "name",
+          "args"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {}
+          }
+        }
+      },
+      "EventDetail": {
+        "type": "object",
+        "description": "An event row of `/txs/events` (chainweb-api `EventDetail`).",
+        "required": [
+          "name",
+          "params",
+          "moduleHash",
+          "chain",
+          "height",
+          "blockTime",
+          "blockHash",
+          "requestKey",
+          "idx"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Qualified name, `module.NAME`."
+          },
+          "params": {
+            "type": "array",
+            "items": {}
+          },
+          "moduleHash": {
+            "type": "string"
+          },
+          "chain": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "blockTime": {
+            "type": "string"
+          },
+          "blockHash": {
+            "type": "string"
+          },
+          "requestKey": {
+            "type": "string"
+          },
+          "idx": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ExecutionStrategy": {
+        "type": "string",
+        "description": "`Chainweb-Execution-Strategy`: accepted and ignored.",
+        "enum": [
+          "Bounded",
+          "Unbounded"
+        ]
+      },
+      "Sig": {
+        "type": "object",
+        "required": [
+          "sig"
+        ],
+        "properties": {
+          "sig": {
+            "type": "string"
+          }
+        }
+      },
+      "Signer": {
+        "type": "object",
+        "required": [
+          "pubKey",
+          "clist"
+        ],
+        "properties": {
+          "addr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scheme": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pubKey": {
+            "type": "string"
+          },
+          "clist": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Capability"
+            }
+          }
+        }
+      },
+      "Stats": {
+        "type": "object",
+        "description": "`/stats` (chainweb-data `statsHandler`).",
+        "required": [
+          "transactionCount"
+        ],
+        "properties": {
+          "transactionCount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exact user-transaction count, as of `X-Count-Age` seconds ago.",
+            "minimum": 0
+          },
+          "coinsInCirculation": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Circulating KDA; null when the supply table has no value for the height."
+          }
+        }
+      },
+      "TransferDetail": {
+        "type": "object",
+        "description": "A transfer row of `/txs/account/{account}` (chainweb-api `TransferDetail`).",
+        "required": [
+          "blockHash",
+          "requestKey",
+          "chain",
+          "height",
+          "idx",
+          "token",
+          "fromAccount",
+          "toAccount",
+          "amount",
+          "blockTime"
+        ],
+        "properties": {
+          "blockHash": {
+            "type": "string"
+          },
+          "requestKey": {
+            "type": "string"
+          },
+          "chain": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "idx": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Event index, ordered with the other rows of the same transaction."
+          },
+          "token": {
+            "type": "string",
+            "description": "Fungible module, for example `coin`."
+          },
+          "fromAccount": {
+            "type": "string"
+          },
+          "toAccount": {
+            "type": "string"
+          },
+          "crossChainAccount": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The other side of a cross-chain transfer, from the `TRANSFER_XCHAIN` / `X_RESUME`\nevents of the same transaction."
+          },
+          "crossChainId": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Decimal text, shortest exact form (`\"138000\"`, not `\"138000.000000000000\"`): equal\nas a decimal to chainweb-data's, different as a string."
+          },
+          "blockTime": {
+            "type": "string"
+          }
+        }
+      },
+      "TxDetail": {
+        "type": "object",
+        "description": "One transaction of `/txs/tx`, `/txs/txs` and `/v1/txs` (chainweb-api `TxDetail`).",
+        "required": [
+          "data",
+          "result",
+          "logs",
+          "metadata",
+          "continuation",
+          "txid",
+          "chain",
+          "height",
+          "blockTime",
+          "blockHash",
+          "requestKey",
+          "success",
+          "events",
+          "signers",
+          "sigs"
+        ],
+        "properties": {
+          "ttl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Transaction time-to-live in seconds."
+          },
+          "gasLimit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "gasPrice": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The gas price as a JSON number (aeson `Double`)."
+          },
+          "nonce": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pactId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Defpact id of a continuation."
+          },
+          "rollback": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "step": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "data": {
+            "description": "The payload data (exec or cont), any JSON."
+          },
+          "proof": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SPV proof of a continuation."
+          },
+          "gas": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "result": {
+            "description": "The result data on success, the error on failure."
+          },
+          "logs": {
+            "type": "string"
+          },
+          "metadata": {},
+          "continuation": {},
+          "txid": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pact transaction id (0 when the node gave none)."
+          },
+          "chain": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "blockTime": {
+            "type": "string",
+            "description": "Block creation time, `YYYY-MM-DDTHH:MM:SS[.ffffff]Z` (fraction without trailing zeros)."
+          },
+          "blockHash": {
+            "type": "string"
+          },
+          "creationTime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Transaction creation time, whole seconds, `YYYY-MM-DDTHH:MM:SSZ`."
+          },
+          "requestKey": {
+            "type": "string"
+          },
+          "sender": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exec code (null for a continuation)."
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TxEvent"
+            }
+          },
+          "initialCode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Code of the transaction that started the defpact, for a continuation."
+          },
+          "previousSteps": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Earlier steps of the defpact, for a continuation."
+          },
+          "signers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Signer"
+            }
+          },
+          "sigs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Sig"
+            }
+          }
+        }
+      },
+      "TxEvent": {
+        "type": "object",
+        "description": "An event inside a `TxDetail`.",
+        "required": [
+          "name",
+          "params"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Qualified name, `module.NAME`."
+          },
+          "params": {
+            "type": "array",
+            "items": {}
+          }
+        }
+      },
+      "TxResult": {
+        "type": "string",
+        "enum": [
+          "TxSucceeded",
+          "TxFailed"
+        ]
+      },
+      "TxSummary": {
+        "type": "object",
+        "description": "A transaction row of `/txs/recent` and `/txs/search` (chainweb-api `TxSummary`).",
+        "required": [
+          "blockHash",
+          "chain",
+          "continuation",
+          "height",
+          "requestKey",
+          "result"
+        ],
+        "properties": {
+          "blockHash": {
+            "type": "string"
+          },
+          "chain": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "continuation": {},
+          "creationTime": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "height": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "initialCode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "previousSteps": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "requestKey": {
+            "type": "string"
+          },
+          "sender": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "$ref": "#/components/schemas/TxResult"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "transactions",
+      "description": "Transactions by request key, and the newest ones"
+    },
+    {
+      "name": "transfers",
+      "description": "Transfers of an account, and the transactions behind them"
+    },
+    {
+      "name": "events",
+      "description": "Events"
+    },
+    {
+      "name": "search",
+      "description": "Code search and defpact listing"
+    },
+    {
+      "name": "network",
+      "description": "Supply and counts"
+    }
+  ]
+}

@@ -34,7 +34,13 @@ pub async fn check_doc(schema: &kdx_graphql::KdxSchema, text: &str) -> Verdict {
     for e in &resp.errors {
         match code(e).as_deref() {
             Some(kdx_graphql::limits::CHECK_PASSED) => {}
-            Some("LIMIT") => {
+            // `LIMIT`, or a refusal of the stock indexer's limits (FIX-3 part C: stock's
+            // code, with `extensions.limit` naming it).
+            _ if e
+                .extensions
+                .as_ref()
+                .is_some_and(|x| x.get("limit").is_some()) =>
+            {
                 let name = e
                     .extensions
                     .as_ref()
@@ -46,6 +52,22 @@ pub async fn check_doc(schema: &kdx_graphql::KdxSchema, text: &str) -> Verdict {
         }
     }
     if invalid.is_empty() {
+        // A page over the safety cap passes validation and stock's gate but is refused by
+        // the resolver when served (FIX-3 part E, M4).
+        let rows = async_graphql::parser::parse_query(text)
+            .ok()
+            .and_then(|d| {
+                kdx_graphql::limits::budget(
+                    &d,
+                    &async_graphql::Variables::default(),
+                    &GraphqlSettings::default(),
+                )
+                .ok()
+            })
+            .map_or(0, |c| c.rows_asked);
+        if rows > kdx_graphql::MAX_PAGE_ROWS as u64 {
+            return Verdict::Limit("page".into());
+        }
         Verdict::InScope
     } else {
         Verdict::Invalid(invalid)
@@ -128,6 +150,37 @@ mod tests {
             "}".repeat(10)
         );
         assert_eq!(check_doc(&s, &deep).await, Verdict::Limit("depth".into()));
+        // Stock's complexity limit (4000).
+        assert_eq!(
+            check_doc(
+                &s,
+                "{ transactions(first: 4001) { edges { node { hash } } } }"
+            )
+            .await,
+            Verdict::Limit("complexity".into())
+        );
+        // Stock's gate passes 4000, but a page over the 1,000-row safety cap is refused when
+        // served (`page`): check-ops says so (FIX-3 part E, M4).
+        assert_eq!(
+            check_doc(
+                &s,
+                "{ transactions(first: 4000) { edges { node { hash } } } }"
+            )
+            .await,
+            Verdict::Limit("page".into())
+        );
+        assert_eq!(
+            check_doc(
+                &s,
+                "{ a: transactions(first: 1000) { edges { node { hash } } } b: transactions(last: 1000) { edges { node { hash } } } }"
+            )
+            .await,
+            Verdict::InScope
+        );
+        assert_eq!(
+            check_doc(&s, "subscription { transactions(quantity: 1001) { hash } }").await,
+            Verdict::Limit("page".into())
+        );
         // Subscriptions validate too.
         assert_eq!(
             check_doc(&s, "subscription { newBlocks(chainIds: [\"0\"]) { hash } }").await,

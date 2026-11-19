@@ -78,6 +78,8 @@ pub struct Store {
     seg_id: Mutex<Option<ManifestId>>,
     dict: ArcSwap<DictSnap>,
     dict_reloading: AtomicBool,
+    /// When the last dictionary reload failed (retried after `DICT_RELOAD_RETRY`).
+    dict_reload_failed: std::sync::Mutex<Option<Instant>>,
     /// Network and genesis heights from `Meta` (empty until ingest writes the chain graph).
     genesis: ArcSwap<Genesis>,
     /// `[graphql] sender_index` (FIX-2): serve sender lists from the `sndr` postings when
@@ -170,6 +172,7 @@ impl Store {
                 at: Instant::now(),
             }),
             dict_reloading: AtomicBool::new(false),
+            dict_reload_failed: std::sync::Mutex::new(None),
             genesis: ArcSwap::from_pointee(genesis),
             sender_index: AtomicBool::new(true),
         };
@@ -301,12 +304,23 @@ impl Store {
         let due = ahead
             || behind >= DICT_RELOAD_NAMES
             || (behind > 0 && snap.at.elapsed() >= DICT_RELOAD_AGE);
-        if !due || self.dict_reloading.swap(true, Ordering::AcqRel) {
+        if !due {
+            return;
+        }
+        let failed_at = *self
+            .dict_reload_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if reload_paused(failed_at, Instant::now())
+            || self.dict_reloading.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let me = self.clone();
         let base = (!ahead).then(|| snap.mem.clone());
         std::thread::spawn(move || {
+            // Cleared however the worker ends, a panic included (F-49).
+            let _running = crate::ClearOnDrop(&me.dict_reloading);
             let t = Instant::now();
             match load_names(&me.hot, base.as_deref()) {
                 Ok(m) => {
@@ -319,11 +333,23 @@ impl Store {
                         at: Instant::now(),
                     }));
                 }
-                Err(e) => tracing::warn!(error = %e, "api: dictionary reload failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "api: dictionary reload failed");
+                    *me.dict_reload_failed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                }
             }
-            me.dict_reloading.store(false, Ordering::Release);
         });
     }
+}
+
+/// Pause before a failed dictionary reload is tried again.
+const DICT_RELOAD_RETRY: Duration = Duration::from_secs(5);
+
+/// True while a reload that failed at `failed_at` is still in its pause.
+fn reload_paused(failed_at: Option<Instant>, now: Instant) -> bool {
+    failed_at.is_some_and(|t| now.saturating_duration_since(t) < DICT_RELOAD_RETRY)
 }
 
 /// Every name in `DictRev`, read in chunks of short txns, appended to a copy of `base`
@@ -471,6 +497,11 @@ impl View {
     /// lists each copy on `/txs/txs`), so their other copies come from the genesis blocks.
     pub fn txs_by_rk(&self, rk: &Hash32) -> ApiResult<Vec<(TxKey, TxRecord)>> {
         let mut out: Vec<(TxKey, TxRecord)> = self.tx_by_rk(rk)?.into_iter().collect();
+        // Copies exist only of a genesis tx, and the index holds one of its locations: any
+        // other lookup skips the genesis scan (F-24: uncached while genesis is incomplete).
+        if !out.iter().any(|(k, _)| self.genesis.is_genesis(*k)) {
+            return Ok(out);
+        }
         for k in self.genesis_copies(rk)? {
             if out.iter().any(|(x, _)| *x == k) {
                 continue;
@@ -491,6 +522,7 @@ impl View {
         let mut all: HashMap<Hash32, Vec<TxKey>> = HashMap::new();
         let mut complete = true;
         for (c, h) in self.genesis.chains() {
+            self.check_deadline()?;
             if self.block_hash(c, h)?.is_none() {
                 complete = false;
                 continue;
@@ -673,6 +705,37 @@ impl View {
         Ok((out, capped))
     }
 
+    /// The steps of the defpact `pact` at `min_height` or above (the start tx's height),
+    /// **oldest first**, read lazily: each item costs one posting and one record read, so a
+    /// caller that stops at the first succeeded `cont` reads only up to it, however many
+    /// failed retries follow (FIX-3, O2). Same records and checks as [`View::pact_steps`].
+    pub fn pact_steps_oldest<'v>(
+        &'v self,
+        pact: &Hash32,
+        min_height: u32,
+    ) -> ApiResult<impl Iterator<Item = ApiResult<PactStep>> + 'v> {
+        let pact = *pact;
+        let keys = self.postings_oldest(Family::Pact, pact_entity(&pact), min_height)?;
+        Ok(keys.filter_map(move |k| {
+            let step = || -> ApiResult<Option<PactStep>> {
+                let k = k?;
+                let Some(r) = self.tx(k)? else {
+                    return Ok(None);
+                };
+                let cont = cmd_pact_id(&r) == Some(pact);
+                if cont || record_pact_id(&r, &self.dict())? == Some(pact) {
+                    return Ok(Some(PactStep {
+                        key: k,
+                        cont,
+                        ok: r.status_ok,
+                    }));
+                }
+                Ok(None)
+            };
+            step().transpose()
+        }))
+    }
+
     /// First height of the upper expansion window for code-search hits: every height above
     /// `rebuilt_through` (the last rebuild's census frontier − 1: docs are never updated, so
     /// `last_h` is exact only up to there; `None` = 0, expand from `first_h`), and the hot part.
@@ -838,24 +901,108 @@ impl View {
                 }
             };
 
-        let mut n = 0u32;
-        let deadline = self.deadline;
-        let mut failed = false;
-        Ok(Box::new(hot.chain(frozen).map_while(move |r| {
-            if failed {
-                return None;
-            }
-            n += 1;
-            if n.is_multiple_of(CHECK_EVERY) && Instant::now() >= deadline {
-                failed = true;
-                return Some(Err(ApiError::Deadline));
-            }
-            if r.is_err() {
-                failed = true;
-            }
-            Some(r)
-        })))
+        Ok(with_deadline(hot.chain(frozen), self.deadline))
     }
+
+    /// The `(f, entity)` postings at `min_height` or above, **oldest first** (frozen, then
+    /// hot), read lazily: the frozen ranges one list at a time, the hot part in chunks of
+    /// [`HOT_CHUNK`] keys. Same keys as [`View::postings`] with that `min_height`, reversed;
+    /// the deadline is checked the same way.
+    pub fn postings_oldest(
+        &self,
+        f: Family,
+        entity: u64,
+        min_height: u32,
+    ) -> ApiResult<KeyIter<'_>> {
+        let floor = self.hot_floor();
+        let seg = &self.seg;
+        let frozen: KeyIter<'_> = if self.seg_frontier == 0 || self.seg_frontier <= min_height {
+            Box::new(std::iter::empty())
+        } else {
+            let frontier = self.seg_frontier;
+            Box::new(
+                seg.postings_oldest_memo(f, entity, min_height, Some(&self.memo))
+                    .map(move |r| -> ApiResult<TxKey> {
+                        let t = r?;
+                        Ok(seg.txkey(t).context("posting TxNum without a key")?)
+                    })
+                    .take_while(move |r| r.as_ref().map_or(true, |k| k.height() < frontier))
+                    .filter(move |r| r.as_ref().map_or(true, |k| k.height() >= min_height)),
+            )
+        };
+
+        // Hot part: keys at `max(hot_floor, min_height)` and above, ascending.
+        let p9 = posting_key(f as u8, entity, TxKey::new(0, 0, 0))[..9].to_vec();
+        let mut from =
+            posting_key(f as u8, entity, TxKey::new(floor.max(min_height), 0, 0)).to_vec();
+        let mut buf = std::collections::VecDeque::new();
+        let mut done = false;
+        let hot = std::iter::from_fn(move || -> Option<ApiResult<TxKey>> {
+            loop {
+                if let Some(k) = buf.pop_front() {
+                    return Some(Ok(k));
+                }
+                if done {
+                    return None;
+                }
+                let rows = match self
+                    .txn
+                    .scan_limit(Table::TailPostings, &from, HOT_CHUNK, |k| {
+                        k.starts_with(&p9)
+                    }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        done = true;
+                        return Some(Err(e.into()));
+                    }
+                };
+                done = rows.len() < HOT_CHUNK;
+                if let Some((last, _)) = rows.last() {
+                    // The smallest key above `last`.
+                    from.clone_from(last);
+                    from.push(0);
+                }
+                for (k, _) in rows {
+                    match parse_txkey(&k[9..]).context("posting key") {
+                        Ok(t) => buf.push_back(t),
+                        Err(e) => {
+                            done = true;
+                            buf.clear();
+                            return Some(Err(e.into()));
+                        }
+                    }
+                }
+            }
+        });
+        Ok(with_deadline(frozen.chain(hot), self.deadline))
+    }
+}
+
+/// Hot posting keys [`View::postings_oldest`] reads per cursor scan.
+const HOT_CHUNK: usize = 256;
+
+/// `it` with the request deadline checked every [`CHECK_EVERY`] items; the first error (a
+/// passed deadline or the walk's own) ends it.
+fn with_deadline<'v>(
+    it: impl Iterator<Item = ApiResult<TxKey>> + 'v,
+    deadline: Instant,
+) -> KeyIter<'v> {
+    let mut n = 0u32;
+    let mut failed = false;
+    Box::new(it.map_while(move |r| {
+        if failed {
+            return None;
+        }
+        n += 1;
+        if n.is_multiple_of(CHECK_EVERY) && Instant::now() >= deadline {
+            failed = true;
+            return Some(Err(ApiError::Deadline));
+        }
+        if r.is_err() {
+            failed = true;
+        }
+        Some(r)
+    }))
 }
 
 /// A boxed newest-first TxKey stream.
@@ -1036,6 +1183,7 @@ mod genesis_rk_tests {
                 postings: Vec::new(),
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             })
             .collect();
         IndexedBlock {
@@ -1104,6 +1252,34 @@ mod genesis_rk_tests {
         // Cached after the first complete scan.
         assert!(view.genesis.shared_rks.get().is_some());
     }
+
+    /// F-24: while the genesis blocks are incomplete, a lookup of a non-genesis tx does not
+    /// scan them, and a genesis lookup's scan honours the deadline.
+    #[test]
+    fn incomplete_genesis_is_scanned_only_for_genesis_txs() {
+        let (_d, store) = crate::testutil::store();
+        let hot = store.hot_for_tests();
+        let mut w = hot.rw().unwrap();
+        w.set_meta(kdx_hot::env::meta::NETWORK, b"testnet").unwrap();
+        w.set_meta(kdx_hot::env::meta::CHAIN_GRAPH, b"[[0,[0,1]],[5,[0,1,2]]]")
+            .unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        // Chain 2's genesis block (height 5) is not stored yet.
+        for b in [block(0, 0, &[1]), block(1, 0, &[2, 1]), block(0, 6, &[3])] {
+            kdx_hot::tail::apply(&mut w, &b, &mut dict).unwrap();
+        }
+        w.commit().unwrap();
+        let late = store.view(Instant::now() - Duration::from_secs(1)).unwrap();
+        let got = late.txs_by_rk(&Hash32([3; 32])).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, TxKey::new(6, 0, 1));
+        assert!(late.txs_by_rk(&Hash32([4; 32])).unwrap().is_empty());
+        assert!(matches!(
+            late.txs_by_rk(&Hash32([1; 32])),
+            Err(crate::ApiError::Deadline)
+        ));
+        assert!(late.genesis.shared_rks.get().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1140,6 +1316,7 @@ mod code_search_tests {
                 postings: vec![(Family::Code, kdx_decode::index::code_entity(&h))],
                 pact_id: None,
                 code_hash: Some(h),
+                d3: Default::default(),
             }],
             txs: vec![r],
             cmd_reencoded: 0,
@@ -1238,7 +1415,11 @@ mod pact_steps_tests {
         let txs: Vec<TxRecord> = std::iter::once(coinbase)
             .chain(oks.iter().enumerate().map(|(i, &ok)| TxRecord {
                 key: TxKey::new(height, 0, i as u16 + 1),
-                request_key: Some(Hash32([height as u8 * 10 + i as u8; 32])),
+                request_key: Some(Hash32({
+                    let mut rk = [height as u8; 32];
+                    rk[1..3].copy_from_slice(&(i as u16).to_be_bytes());
+                    rk
+                })),
                 cmd: Some(serde_json::to_vec(&cmd).unwrap()),
                 status_ok: ok,
                 ..TxRecord::default()
@@ -1255,6 +1436,7 @@ mod pact_steps_tests {
                 },
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             })
             .collect();
         IndexedBlock {
@@ -1348,6 +1530,94 @@ mod pact_steps_tests {
         assert_eq!(steps[0], step(5, 2, false));
     }
 
+    /// FIX-3 (O2): `pact_steps_oldest` walks the same steps oldest first, frozen then hot,
+    /// lazily, from `min_height` on.
+    #[test]
+    fn pact_steps_oldest_walks_oldest_first_from_a_height() {
+        let (_d, store) = frozen_and_hot();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let step = |h: u32, pos: u16, ok: bool| PactStep {
+            key: TxKey::new(h, 0, pos),
+            cont: true,
+            ok,
+        };
+        let all: Vec<PactStep> = view
+            .pact_steps_oldest(&PACT, 0)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                step(5, 1, true),
+                step(5, 2, false),
+                step(12, 1, false),
+                step(12, 2, true),
+            ]
+        );
+        // The same steps as the newest-first walk.
+        assert_eq!(all, view.pact_steps(&PACT, 16).unwrap().0);
+        let from = |h: u32| -> Vec<TxKey> {
+            view.pact_steps_oldest(&PACT, h)
+                .unwrap()
+                .map(|s| s.unwrap().key)
+                .collect()
+        };
+        assert_eq!(from(5).len(), 4);
+        assert_eq!(from(6), vec![TxKey::new(12, 0, 1), TxKey::new(12, 0, 2)]);
+        assert_eq!(from(12).len(), 2);
+        assert!(from(13).is_empty());
+        // Lazy: taking the first step reads no further.
+        let first = view.pact_steps_oldest(&PACT, 0).unwrap().next();
+        assert_eq!(first.unwrap().unwrap(), step(5, 1, true));
+        assert!(view
+            .pact_steps_oldest(&Hash32([78; 32]), 0)
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    /// The hot part is read in chunks: more steps than one chunk, in one block and across
+    /// blocks, come back complete and in order.
+    #[test]
+    fn pact_steps_oldest_reads_the_hot_part_across_chunks() {
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+        let mut t = hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let mut oks = vec![false; 600];
+        oks[299] = true;
+        kdx_hot::tail::apply(&mut t, &block(20, &oks), &mut dict).unwrap();
+        kdx_hot::tail::apply(&mut t, &block(21, &[false; 5]), &mut dict).unwrap();
+        t.commit().unwrap();
+        let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let keys: Vec<TxKey> = view
+            .pact_steps_oldest(&PACT, 0)
+            .unwrap()
+            .map(|s| s.unwrap().key)
+            .collect();
+        let want: Vec<TxKey> = (1..=600u16)
+            .map(|p| TxKey::new(20, 0, p))
+            .chain((1..=5u16).map(|p| TxKey::new(21, 0, p)))
+            .collect();
+        assert_eq!(keys, want);
+        let first_ok = view
+            .pact_steps_oldest(&PACT, 0)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|s| s.ok);
+        assert_eq!(first_ok.map(|s| s.key), Some(TxKey::new(20, 0, 300)));
+    }
+
     /// R-P5P9-62: `before` keeps only keys strictly below it, frozen and hot alike, also when
     /// it is not a tx key (a page cursor + 1 keeps the cursor's tx, which may have rows left).
     #[test]
@@ -1378,5 +1648,22 @@ mod pact_steps_tests {
         // Hot, and the walk on into the frozen part.
         assert_eq!(walk(plus_one(k(12, 1))), [k(12, 1), k(5, 2), k(5, 1)]);
         assert_eq!(walk(k(12, 1)), [k(5, 2), k(5, 1)]);
+    }
+}
+
+#[cfg(test)]
+mod reload_pause_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{reload_paused, DICT_RELOAD_RETRY};
+
+    /// F-49: a failed dictionary reload is not retried for `DICT_RELOAD_RETRY`.
+    #[test]
+    fn a_failed_reload_pauses_retries() {
+        let now = Instant::now() + Duration::from_secs(60);
+        assert_eq!(DICT_RELOAD_RETRY, Duration::from_secs(5));
+        assert!(!reload_paused(None, now));
+        assert!(reload_paused(Some(now - Duration::from_secs(1)), now));
+        assert!(!reload_paused(Some(now - DICT_RELOAD_RETRY), now));
     }
 }

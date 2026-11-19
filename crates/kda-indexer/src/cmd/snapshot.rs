@@ -32,7 +32,7 @@
 //! is refused, never followed ([`place`]). The manifest's `network` is a plain name
 //! (`Manifest::validate`), so a listed name never leaves `segments/`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::MetadataExt;
@@ -121,10 +121,9 @@ fn snapshot_as(euid: u32, a: &SnapshotArgs) -> anyhow::Result<SnapshotReport> {
             (p == "snapshot-after-manifest").then(|| n.parse::<u64>().ok())?
         })
         .map(Duration::from_secs);
-    // Before anything is opened or created (the hot store open creates its lock file).
-    let owner = fs::metadata(&a.data_dir)
-        .with_context(|| format!("stat {}", a.data_dir.display()))?
-        .uid();
+    // Before anything is opened or created (the hot store open creates its lock file). F-43:
+    // a symlinked data dir counts with the link's owner, as `tree_owners` counts the rest.
+    let owner = owner_uid(&a.data_dir).with_context(|| format!("stat {}", a.data_dir.display()))?;
     let below = if euid == 0 {
         tree_owners(a)?
     } else {
@@ -318,8 +317,10 @@ fn remove_created(out: &Path, created: Option<&Path>) {
         Some(top) => fs::remove_dir_all(top),
         None => fs::read_dir(out).and_then(|d| {
             for e in d {
-                let p = e?.path();
-                if p.is_dir() {
+                let e = e?;
+                let p = e.path();
+                // The entry's own type: a symlink is removed as a link, never followed.
+                if e.file_type()?.is_dir() {
                     fs::remove_dir_all(&p)?;
                 } else {
                     fs::remove_file(&p)?;
@@ -403,7 +404,8 @@ fn snapshot_into(
         linked: !a.copy,
         ..Default::default()
     };
-    let mut have: HashSet<PathBuf> = HashSet::new();
+    // Every file placed so far, with the bytes `place` reported for it.
+    let mut have: HashMap<PathBuf, u64> = HashMap::new();
     let (mut merge_reads, mut name_waits) = (0usize, 0usize);
     // m14: no `rebuild-range` swap runs while segment files are placed, so a range's files
     // all come from one side of its swap (a data dir we cannot lock still gets `resolve`).
@@ -412,7 +414,7 @@ fn snapshot_into(
         "placing segment files",
     )?;
     hook(Point::SwapLocked, 0);
-    let (manifest_bytes, manifest, info) = loop {
+    let (manifest_bytes, manifest, info, listed) = loop {
         rep.attempts += 1;
         // A fresh T before every manifest read.
         let txn = hs.ro()?;
@@ -449,6 +451,8 @@ fn snapshot_into(
         let info = hot_info(&txn)?;
         drop(txn);
         let mut missing = false;
+        // F-02: every file this read lists, optional ones included; what is kept.
+        let mut listed: HashSet<PathBuf> = HashSet::new();
         if let Some(m) = &m {
             // Optional files (FIX-2) a range lists but does not have are not a moving store:
             // the copy is read without them, as the source is.
@@ -459,14 +463,14 @@ fn snapshot_into(
                 .map(PathBuf::from)
                 .collect();
             for f in m.files_in(&src_seg) {
-                if have.contains(&f) {
+                listed.insert(f.clone());
+                if have.contains_key(&f) {
                     continue;
                 }
                 let src = kdx_segment::swap::resolve(&src_seg, &f.to_string_lossy());
                 match place(&src, &out_seg.join(&f), a.copy) {
                     Ok(n) => {
-                        rep.segment_bytes += n;
-                        have.insert(f);
+                        have.insert(f, n);
                     }
                     Err(e) if e.kind() == ErrorKind::NotFound && optional.contains(&f) => {
                         tracing::warn!(file = %f.display(), "snapshot: listed optional segment file missing, not copied");
@@ -478,19 +482,23 @@ fn snapshot_into(
         }
         if !missing {
             drop(swap_guard);
-            break (bytes, m, info);
+            break (bytes, m, info, listed);
         }
         merge_reads += 1;
         if merge_reads >= MAX_ATTEMPTS {
             bail!("segment files kept changing under the snapshot ({MAX_ATTEMPTS} manifest reads)");
         }
     };
-    // Files of an earlier manifest read that the final one no longer lists.
-    let keep: HashSet<PathBuf> = manifest.iter().flat_map(Manifest::files).collect();
-    for f in have.difference(&keep) {
-        fs::remove_file(out_seg.join(f))?;
+    // Files of an earlier manifest read that the final one no longer lists (F-02: the final
+    // read's list includes the optional files its ranges have, so those stay).
+    for (f, n) in &have {
+        if listed.contains(f) {
+            rep.files += 1;
+            rep.segment_bytes += n;
+        } else {
+            fs::remove_file(out_seg.join(f))?;
+        }
     }
-    rep.files = keep.len();
     if let Some(b) = &manifest_bytes {
         replace_file(&out_seg.join("manifest.json"), b)?;
     }
@@ -848,6 +856,13 @@ mod tests {
         want.push("manifest.json".into());
         want.sort();
         assert_eq!(have, want);
+        // F-02: the files of the first read's range `a` were placed, then pruned, and are
+        // not counted.
+        assert_eq!(rep.files, want.len() - 1);
+        assert_eq!(
+            rep.segment_bytes, rep.files as u64,
+            "one byte per kept file"
+        );
         assert!(out.join("hot/mdbx.dat").is_file());
         assert!(out.join("SNAPSHOT.json").is_file());
         // A second snapshot into the non-empty dir is refused and leaves it as it was.
@@ -980,6 +995,26 @@ mod tests {
         super::refuse_root(0, 0, &[]).unwrap();
         super::refuse_root(1001, 1001, &[]).unwrap();
         super::refuse_root(1002, 1001, &[]).unwrap();
+    }
+
+    /// F-43: a data dir that is a symlink counts with the link's owner (not the root-owned
+    /// directory it points to): run as root, a link the service user owns is refused.
+    #[test]
+    fn root_is_refused_on_a_symlinked_data_dir_it_does_not_own() {
+        if rustix::process::geteuid().is_root() {
+            return; // the link would be root's own
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::os::unix::fs::symlink("/", &data).unwrap();
+        let args = SnapshotArgs {
+            data_dir: data,
+            out: tmp.path().join("out"),
+            copy: false,
+        };
+        let e = format!("{:#}", super::snapshot_as(0, &args).unwrap_err());
+        assert!(e.contains("refuses to run as root"), "{e}");
+        assert!(!tmp.path().join("out").exists());
     }
 
     /// FV-3: root on a root-owned data dir is refused when `segments/` or the existing
@@ -1147,6 +1182,32 @@ mod tests {
             copy,
         };
         (hs, args)
+    }
+
+    /// F-02: the optional files a range lists (`sndr.pst`, `kf.fil`) are placed and kept; the
+    /// report counts every kept file and its bytes.
+    #[test]
+    fn listed_optional_files_are_kept_and_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let out = tmp.path().join("out");
+        let (hs, args) = store_with_one_range(&data, &out, true);
+        let seg = data.join("segments");
+        let optional = kdx_segment::files::optional_file_names("net", 0, 20);
+        assert!(!optional.is_empty());
+        for f in &optional {
+            fs::write(seg.join(f), b"optional").unwrap();
+        }
+        let rep = snapshot_with(&args, &hs, Duration::ZERO, &mut |_, _| {}).unwrap();
+        for f in &optional {
+            assert!(out.join("segments").join(f).is_file(), "{f} not kept");
+        }
+        let required = kdx_segment::files::range_file_names("net", 0, 20);
+        assert_eq!(rep.files, required.len() + optional.len());
+        assert_eq!(
+            rep.segment_bytes,
+            (required.len() + optional.len() * b"optional".len()) as u64
+        );
     }
 
     /// Every regular file under `dir` (empty when it does not exist).

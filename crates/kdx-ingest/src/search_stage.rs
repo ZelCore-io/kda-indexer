@@ -272,6 +272,19 @@ fn tail_loop(
 struct ChainState {
     next: u32,
     ring: VecDeque<(u32, Hash32)>,
+    /// The chain had a Tail checkpoint in the last `step` (F-38: chains the network does not
+    /// have never do, and must not hold `built_through_height` back).
+    seen: bool,
+}
+
+/// The lowest height every chain with a Tail checkpoint has been read through; `None` when
+/// no chain has one yet.
+fn through_height(chains: &[ChainState]) -> Option<u32> {
+    chains
+        .iter()
+        .filter(|c| c.seen)
+        .map(|c| c.next.saturating_sub(1))
+        .min()
 }
 
 struct StageState {
@@ -298,6 +311,7 @@ impl StageState {
             .map(|_| ChainState {
                 next: start,
                 ring: VecDeque::new(),
+                seen: false,
             })
             .collect();
         Ok(StageState {
@@ -385,8 +399,10 @@ impl StageState {
         for c in 0..kdx_segment::SLOT_WIDTH as u8 {
             let txn = ctx.hot.ro()?;
             let Some((tip, _)) = checkpoint(&txn, Stage::Tail, c)? else {
+                self.chains[c as usize].seen = false;
                 continue;
             };
+            self.chains[c as usize].seen = true;
             let frontier = txn.frozen_frontier()?;
             // Reorg: drop remembered blocks the hot store no longer has.
             while let Some(&(h, hash)) = self.chains[c as usize].ring.back() {
@@ -469,12 +485,7 @@ impl StageState {
     /// been read through). False, with nothing written, when a rebuild swapped `search/`.
     fn commit(&mut self) -> Result<bool> {
         self.last_commit = Instant::now();
-        let through = self
-            .chains
-            .iter()
-            .map(|c| c.next.saturating_sub(1))
-            .min()
-            .unwrap_or(0);
+        let through = through_height(&self.chains).unwrap_or(0);
         if !self.dirty && through <= self.m.built_through_height && self.m.docs == self.w.num_docs()
         {
             return Ok(true);
@@ -491,5 +502,29 @@ impl StageState {
             self.m.commit(&self.dir)
         })?;
         Ok(done.is_some())
+    }
+}
+
+#[cfg(test)]
+mod through_tests {
+    use super::*;
+
+    fn st(next: u32, seen: bool) -> ChainState {
+        ChainState {
+            next,
+            ring: VecDeque::new(),
+            seen,
+        }
+    }
+
+    /// F-38: chains without a Tail checkpoint (a network with fewer than 20 chains) do not
+    /// hold `built_through_height` at the start height.
+    #[test]
+    fn through_ignores_chains_without_a_checkpoint() {
+        let mut v: Vec<ChainState> = (0..10).map(|i| st(50 + i, true)).collect();
+        v.extend((0..10).map(|_| st(1, false)));
+        assert_eq!(through_height(&v), Some(49));
+        assert_eq!(through_height(&[st(1, false), st(1, false)]), None);
+        assert_eq!(through_height(&[st(0, true)]), Some(0));
     }
 }

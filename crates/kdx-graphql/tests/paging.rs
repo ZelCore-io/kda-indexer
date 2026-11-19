@@ -45,6 +45,9 @@ enum Shape {
     Nft,
     /// One coin transfer.
     One,
+    /// One `coin.NOTE` event whose only param is Carol's name: not a principal and not a
+    /// transfer side, so the tx has no `acct` posting of Carol's (audit F-27).
+    Note,
 }
 
 /// The fixture's blocks: `(chain, height, user txs)`. Heights below [`FRONTIER`] are frozen.
@@ -60,6 +63,8 @@ const BLOCKS: &[(u8, u32, &[Shape])] = &[
     (0, 11, &[Shape::Many, Shape::Nft]),
     (0, 12, &[Shape::Many]),
     (1, 12, &[Shape::One, Shape::Many]),
+    // Hot: a tx naming Carol in a non-transfer event only (audit F-27).
+    (1, 11, &[Shape::Note]),
 ];
 
 fn ev(ns: Option<&str>, module: &str, name: &str, params: Value) -> Value {
@@ -93,6 +98,7 @@ fn events(s: Shape) -> Vec<Value> {
             coin(json!([BOB, ALICE, 2.5])),
         ],
         Shape::One => vec![coin(json!([ALICE, BOB, 1.5]))],
+        Shape::Note => vec![ev(None, "coin", "NOTE", json!([CAROL]))],
     }
 }
 
@@ -136,7 +142,8 @@ fn decoded(c: u8, h: u32, shapes: &[Shape]) -> (DecodedBlock, Vec<String>) {
     }
     let cb = serde_json::to_vec(
         &json!({"gas": 0, "result": {"status": "success", "data": "ok"},
-        "reqKey": b64url_encode(&hash_of(0xCB, c, h)), "logs": null, "events": [],
+        "reqKey": b64url_encode(&hash_of(0xCB, c, h)), "logs": null,
+        "events": [ev(None, "coin", "COINBASE", json!(["k:miner", 2.5]))],
         "metaData": null, "continuation": null, "txId": null}),
     )
     .unwrap();
@@ -263,6 +270,7 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         max_in_flight: 16,
         max_body_bytes: 8 << 20,
         v1txs_max_body_bytes: 8 << 20,
+        v1txs_deadline: std::time::Duration::from_secs(30),
         rate_per_ip: 20,
         rate_burst: 40,
         trusted_proxies: Vec::new(),
@@ -605,6 +613,20 @@ async fn every_tx_list_joins_its_pages_at_every_size() {
         ),
         root("transactions", &by("requestKey", frozen_rk), TX, true),
         root("transactions", "", TX, true),
+        // `isCoinbase: true` adds the coinbases to the same lists (G4 class 1).
+        root("transactions", "isCoinbase: true", TX, true),
+        root(
+            "transactions",
+            "isCoinbase: true, chainId: \"0\", minHeight: 4, maxHeight: 11",
+            TX,
+            true,
+        ),
+        root(
+            "transactions",
+            &format!("isCoinbase: true, {}", by("blockHash", &block_hash(0, 6))),
+            TX,
+            true,
+        ),
         root(
             "transactionsByPublicKey",
             &by("publicKey", ALICE_KEY),
@@ -681,6 +703,7 @@ async fn big_page_order_is_height_then_node_order_then_sub_row() {
             Shape::Many => &[0, 1, 3, 4, 5],
             Shape::Nft => &[0, 4],
             Shape::One => &[0],
+            Shape::Note => &[],
         })
     );
     // The coin.TRANSFER events.
@@ -696,6 +719,7 @@ async fn big_page_order_is_height_then_node_order_then_sub_row() {
             Shape::Many => &[0, 1, 4, 5],
             Shape::Nft => &[0, 4],
             Shape::One => &[0],
+            Shape::Note => &[],
         })
     );
 }
@@ -1132,5 +1156,1050 @@ mod count_budget {
                 }
             }
         }
+    }
+}
+
+/// FIX-3 part C: no page cap (stock has none; its complexity gate bounds `first`): a page of
+/// 500 answers 500 rows, and an absent `first`/`last` is stock's 20.
+#[tokio::test]
+async fn pages_are_served_in_full_and_default_to_20() {
+    let fx = fixture_big(GraphqlSettings::default(), 600);
+    let q = |args: &str| {
+        format!(
+            "{{ transactions(accountName: \"{ALICE}\"{args}) {{ pageInfo {{ hasNextPage }} edges {{ node {{ hash }} }} }} }}"
+        )
+    };
+    let v = run(&fx.schema, &q(", first: 500")).await;
+    let c = &v["transactions"];
+    assert_eq!(c["edges"].as_array().map(Vec::len), Some(500), "{v}");
+    assert_eq!(c["pageInfo"]["hasNextPage"], true);
+    let v = run(&fx.schema, &q(", last: 500")).await;
+    assert_eq!(
+        v["transactions"]["edges"].as_array().map(Vec::len),
+        Some(500)
+    );
+    let v = run(&fx.schema, &q("")).await;
+    assert_eq!(
+        v["transactions"]["edges"].as_array().map(Vec::len),
+        Some(20)
+    );
+    // A block list too (it had a wide clamp of 200).
+    let v = run(
+        &fx.schema,
+        "{ blocksFromHeight(startHeight: 0, chainIds: [\"0\"], first: 500) { edges { node { height } } } }",
+    )
+    .await;
+    assert_eq!(
+        v["blocksFromHeight"]["edges"].as_array().map(Vec::len),
+        Some(500),
+        "{v}"
+    );
+}
+
+/// Runs `q` with `vars` and answers the whole response (data and errors).
+async fn run_vars(s: &KdxSchema, q: &str, vars: Value) -> Value {
+    let r = s
+        .execute(
+            async_graphql::Request::new(q).variables(async_graphql::Variables::from_json(vars)),
+        )
+        .await;
+    serde_json::to_value(&r).unwrap()
+}
+
+fn chain_ids_of(v: &Value) -> Vec<String> {
+    v["data"]["fungibleChainAccounts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list: {v}"))
+        .iter()
+        .map(|r| r["chainId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// FIX-4 item 1: `fungibleChainAccounts` with `chainIds` absent (a declared variable sent
+/// without a value) or `[]` lists every chain's row, and no rows is `[]`, never `null`.
+#[tokio::test]
+async fn fungible_chain_accounts_list_every_chain_and_never_null() {
+    let fx = fixture();
+    let q = "query($a: String!, $c: [String!]) { fungibleChainAccounts(accountName: $a, chainIds: $c) { chainId balance } }";
+    for vars in [
+        json!({"a": ALICE}),
+        json!({"a": ALICE, "c": null}),
+        json!({"a": ALICE, "c": []}),
+    ] {
+        let v = run_vars(&fx.schema, q, vars.clone()).await;
+        assert!(v.get("errors").is_none(), "{vars}: {v}");
+        assert_eq!(chain_ids_of(&v), ["0", "1"], "{vars}: {v}");
+    }
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleChainAccounts(accountName: \"{ALICE}\") {{ chainId }} }}"),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccounts"].as_array().map(Vec::len), Some(2));
+    // One chain asked: its row only.
+    let v = run_vars(&fx.schema, q, json!({"a": ALICE, "c": ["1"]})).await;
+    assert_eq!(chain_ids_of(&v), ["1"], "{v}");
+    // No row on the asked chain, or an unknown account: an empty list.
+    for vars in [
+        json!({"a": ALICE, "c": ["13"]}),
+        json!({"a": "k:nobody"}),
+        json!({"a": "k:nobody", "c": []}),
+    ] {
+        let v = run_vars(&fx.schema, q, vars.clone()).await;
+        assert!(v.get("errors").is_none(), "{vars}: {v}");
+        assert_eq!(v["data"]["fungibleChainAccounts"], json!([]), "{vars}: {v}");
+    }
+    // `fungibleChainAccount` on a chain without a row stays `null`.
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"5\") {{ chainId }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccount"], Value::Null, "{v}");
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"1\") {{ chainId }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccount"]["chainId"], "1", "{v}");
+}
+
+/// FIX-4 item 2: `chainIds: []` on the block lists means every chain, as no `chainIds` does.
+#[tokio::test]
+async fn empty_chain_ids_on_block_lists_mean_every_chain() {
+    let fx = fixture();
+    for (field, args) in [
+        ("blocksFromHeight", "startHeight: 0"),
+        ("blocksFromDepth", "minimumDepth: 0"),
+        (
+            "completedBlockHeights",
+            "completedHeights: false, heightCount: 100",
+        ),
+    ] {
+        let q = |chains: &str| {
+            format!(
+                "{{ {field}({args}{chains}, first: 50) {{ edges {{ node {{ chainId height }} }} }} }}"
+            )
+        };
+        let all = run(&fx.schema, &q("")).await;
+        let empty = run(&fx.schema, &q(", chainIds: []")).await;
+        let n = all[field]["edges"].as_array().map_or(0, Vec::len);
+        assert!(n > 1, "{field}: {all}");
+        let chains: HashSet<String> = all[field]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["node"]["chainId"].to_string())
+            .collect();
+        assert!(chains.len() > 1, "{field}: {all}");
+        assert_eq!(empty, all, "{field}");
+    }
+}
+
+/// The ids of the coinbase row and the user tx rows of block `(c, h)` in node order: the
+/// coinbase first, then the user txs in payload order, each tx's rows by ascending position.
+fn node_order(
+    fx: &Fx,
+    c: u8,
+    h: u32,
+    rows: fn(Shape) -> &'static [u32],
+    coinbase: bool,
+) -> Vec<String> {
+    let shapes = BLOCKS.iter().find(|b| (b.0, b.1) == (c, h)).unwrap().2;
+    let mut out = Vec::new();
+    if coinbase {
+        out.push(format!("{}#0", b64url_encode(&hash_of(0xCB, c, h))));
+    }
+    for (i, s) in shapes.iter().enumerate() {
+        for p in rows(*s) {
+            out.push(format!("{}#{p}", fx.rks[&(c, h)][i]));
+        }
+    }
+    out
+}
+
+/// FIX-4 item 6: a list of one block (`Block.events`, `Block.transactions`, a root list with
+/// `blockHash`) is in the node's order: the coinbase (first leaf of the payload's
+/// `outputsHash`, executed first) and then the user txs in payload order, rows of a tx by
+/// ascending position. Backward pages hold the same order.
+#[tokio::test]
+async fn one_block_lists_are_in_node_order() {
+    let fx = fixture();
+    fn every_event(s: Shape) -> &'static [u32] {
+        match s {
+            Shape::Many => &[0, 1, 2, 3, 4, 5],
+            Shape::Nft => &[0, 1, 2, 3, 4],
+            Shape::One | Shape::Note => &[0],
+        }
+    }
+    fn coin_transfers(s: Shape) -> &'static [u32] {
+        match s {
+            Shape::Many => &[0, 1, 4, 5],
+            Shape::Nft => &[0, 4],
+            Shape::One => &[0],
+            Shape::Note => &[],
+        }
+    }
+    // A frozen block and a hot one.
+    for (c, h) in [(0u8, 6u32), (0, 11), (1, 12)] {
+        let bh = block_hash(c, h);
+        let hash = format!("hash: \"{bh}\"");
+        let events = list(
+            format!("block({hash}) {{ events(ARGS) SEL }}"),
+            &["block", "events"],
+            EVENT,
+            true,
+        );
+        let want = node_order(&fx, c, h, every_event, true);
+        assert_eq!(
+            ids(&big_page(&fx.schema, &events).await),
+            want,
+            "Block.events {c}/{h}"
+        );
+        // The last page of 3 is the list's last 3 rows, in the same order.
+        let v = run(&fx.schema, &events.text("last: 3")).await;
+        let tail = ids(conn(&v, &events.path)["edges"].as_array().unwrap());
+        assert_eq!(tail, want[want.len() - 3..], "Block.events last 3, {c}/{h}");
+
+        let txs = list(
+            format!("block({hash}) {{ transactions(ARGS) SEL }}"),
+            &["block", "transactions"],
+            TX,
+            true,
+        );
+        let shapes = BLOCKS.iter().find(|b| (b.0, b.1) == (c, h)).unwrap().2;
+        let got: Vec<String> = big_page(&fx.schema, &txs)
+            .await
+            .iter()
+            .map(|r| r["node"]["hash"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            got,
+            fx.rks[&(c, h)][..shapes.len()],
+            "Block.transactions {c}/{h}"
+        );
+        let got: Vec<String> = big_page(
+            &fx.schema,
+            &list(
+                format!("transactions(blockHash: \"{bh}\", ARGS) SEL"),
+                &["transactions"],
+                TX,
+                true,
+            ),
+        )
+        .await
+        .iter()
+        .map(|r| r["node"]["hash"].as_str().unwrap().to_owned())
+        .collect();
+        assert_eq!(got, fx.rks[&(c, h)], "transactions(blockHash) {c}/{h}");
+
+        let root = list(
+            format!("events(qualifiedEventName: \"coin.COINBASE\", blockHash: \"{bh}\", ARGS) SEL"),
+            &["events"],
+            EVENT,
+            true,
+        );
+        assert_eq!(
+            ids(&big_page(&fx.schema, &root).await),
+            node_order(&fx, c, h, |_| &[], true),
+            "events(coin.COINBASE, blockHash) {c}/{h}"
+        );
+        let root = list(
+            format!("events(qualifiedEventName: \"coin.TRANSFER\", blockHash: \"{bh}\", ARGS) SEL"),
+            &["events"],
+            EVENT,
+            true,
+        );
+        assert_eq!(
+            ids(&big_page(&fx.schema, &root).await),
+            node_order(&fx, c, h, coin_transfers, false),
+            "events(coin.TRANSFER, blockHash) {c}/{h}"
+        );
+        let root = list(
+            format!("transfers(blockHash: \"{bh}\", ARGS) SEL"),
+            &["transfers"],
+            TRANSFER,
+            true,
+        );
+        let got = ids(&big_page(&fx.schema, &root).await);
+        let mut sorted = got.clone();
+        let pos = |id: &String| want.iter().position(|w| w == id).unwrap();
+        sorted.sort_by_key(pos);
+        assert_eq!(got, sorted, "transfers(blockHash) {c}/{h} in node order");
+    }
+}
+
+/// FIX-4 item 5: an id that cannot be read is `null` (stock's answer), not an error; `nodes`
+/// answers `null` in its place and resolves the others.
+#[tokio::test]
+async fn unreadable_node_ids_are_null() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use kdx_graphql::ids::{encode, NodeKey};
+    let fx = fixture();
+    let good = encode(&NodeKey::Block {
+        hash: block_hash(0, 6),
+    });
+    let legacy = STANDARD.encode(format!("[\"Block\",\"{}\"]", block_hash(0, 6)));
+    for bad in ["AAAA", "not base64!", "", legacy.as_str(), "QmxvY2s6eA=="] {
+        let v = run(&fx.schema, &format!("{{ node(id: \"{bad}\") {{ id }} }}")).await;
+        assert_eq!(v, json!({"node": null}), "{bad}");
+    }
+    let v = run(
+        &fx.schema,
+        &format!("{{ nodes(ids: [\"{good}\", \"AAAA\", \"{legacy}\"]) {{ id ... on Block {{ height }} }} }}"),
+    )
+    .await;
+    assert_eq!(v, json!({"nodes": [{"id": good, "height": 6}, null, null]}),);
+}
+
+/// FIX-4 item 4: `gasLimitEstimate(input: [])` runs no Pact: an empty list, as stock answers.
+/// Any input is still `NOT_SUPPORTED`.
+#[tokio::test]
+async fn gas_limit_estimate_of_no_input_is_an_empty_list() {
+    let fx = fixture();
+    let v = run(&fx.schema, "{ gasLimitEstimate(input: []) { amount } }").await;
+    assert_eq!(v, json!({"gasLimitEstimate": []}));
+    let r = fx
+        .schema
+        .execute("{ gasLimitEstimate(input: [\"{}\"]) { amount } }")
+        .await;
+    let code = r.errors[0]
+        .extensions
+        .as_ref()
+        .and_then(|x| x.get("code"))
+        .cloned();
+    assert_eq!(code, Some(async_graphql::Value::from("NOT_SUPPORTED")));
+}
+
+/// FIX-4 part B (B3): a `fungibleName` with surrounding spaces names the same module, as in
+/// stock (`"coin "` answered the `coin` row there, `null` here); a name of spaces alone is
+/// still `BAD_USER_INPUT`.
+#[tokio::test]
+async fn fungible_name_is_trimmed() {
+    let f = fixture();
+    let fields = [
+        format!("fungibleAccount(accountName: \"{ALICE}\", FN) {{ accountName fungibleName totalBalance chainAccounts {{ chainId balance }} }}"),
+        format!("fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"0\", FN) {{ chainId balance fungibleName }}"),
+        format!("fungibleChainAccounts(accountName: \"{ALICE}\", FN) {{ chainId balance }}"),
+        format!("fungibleAccountsByPublicKey(publicKey: \"{ALICE_KEY}\", FN) {{ accountName }}"),
+        format!("fungibleChainAccountsByPublicKey(publicKey: \"{ALICE_KEY}\", chainId: \"0\", FN) {{ accountName }}"),
+        format!("transfers(accountName: \"{ALICE}\", FN, first: 50) {{ totalCount edges {{ node {{ requestKey orderIndex amount }} }} }}"),
+        "transfers(FN, first: 50) { edges { node { requestKey orderIndex } } }".to_owned(),
+    ];
+    // FIX-4 part C (M-4): with `blockHash` or `requestKey` too, a name of spaces alone is
+    // still refused, not an empty list.
+    let rk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for src in [
+        format!("blockHash: \"{}\"", block_hash(0, 6)),
+        format!("requestKey: \"{rk}\""),
+    ] {
+        let r = f
+            .schema
+            .execute(format!("{{ transfers({src}, fungibleName: \"  \") {{ edges {{ node {{ requestKey }} }} }} }}"))
+            .await;
+        let code = r
+            .errors
+            .first()
+            .and_then(|e| e.extensions.as_ref()?.get("code").cloned());
+        assert_eq!(
+            code,
+            Some(async_graphql::Value::String("BAD_USER_INPUT".into())),
+            "{src}: {:?}",
+            r.errors
+        );
+    }
+    for field in &fields {
+        let q = |name: &str| {
+            format!(
+                "{{ {} }}",
+                field.replace("FN", &format!("fungibleName: \"{name}\""))
+            )
+        };
+        let want = run(&f.schema, &q("coin")).await;
+        assert!(
+            !want.as_object().unwrap().values().any(Value::is_null),
+            "{field}: {want}"
+        );
+        for name in ["coin ", " coin", "\tcoin  "] {
+            let r = f.schema.execute(q(name)).await;
+            assert!(r.errors.is_empty(), "{field} {name:?}: {:?}", r.errors);
+            assert_eq!(
+                serde_json::to_value(&r.data).unwrap(),
+                want,
+                "{field} {name:?}"
+            );
+        }
+        let r = f.schema.execute(q("  ")).await;
+        let code = r
+            .errors
+            .first()
+            .and_then(|e| e.extensions.as_ref()?.get("code").cloned());
+        assert_eq!(
+            code,
+            Some(async_graphql::Value::String("BAD_USER_INPUT".into())),
+            "{field}: {:?}",
+            r.errors
+        );
+    }
+}
+
+/// Suite run 4: `fungibleChainAccounts` lists its rows in the order of the requested
+/// `chainIds` (stock's order), not ascending by chain; a repeated chain lists once, at its
+/// first place.
+#[tokio::test]
+async fn fungible_chain_accounts_follow_the_requested_chain_order() {
+    let fx = fixture();
+    let q = "query($a: String!, $c: [String!]) { fungibleChainAccounts(accountName: $a, chainIds: $c) { chainId } }";
+    for (c, want) in [
+        (json!(["1", "0"]), vec!["1", "0"]),
+        (json!(["0", "1"]), vec!["0", "1"]),
+        (json!(["1", "7", "0", "1"]), vec!["1", "0"]),
+    ] {
+        let v = run_vars(&fx.schema, q, json!({"a": ALICE, "c": c})).await;
+        assert!(v.get("errors").is_none(), "{c}: {v}");
+        assert_eq!(chain_ids_of(&v), want, "{c}: {v}");
+    }
+}
+
+/// Suite run 4: an integer id beyond i64 is an unreadable id like any other: `null` for
+/// `node` and a `null` entry in `nodes`, with no error (stock answers 200 `null`).
+#[tokio::test]
+async fn an_integer_id_beyond_i64_reads_as_null() {
+    let fx = fixture();
+    let big = serde_json::Number::from(9_223_372_036_854_775_808u64);
+    let q = "query($id: ID!, $ids: [ID!]!) { node(id: $id) { __typename } nodes(ids: $ids) { __typename } }";
+    for id in [
+        json!(big),
+        json!(u64::MAX),
+        json!(-5),
+        json!("9223372036854775808"),
+    ] {
+        let vars = json!({"id": id, "ids": [id, "x"]});
+        let v = run_vars(&fx.schema, q, vars.clone()).await;
+        assert!(v.get("errors").is_none(), "{vars}: {v}");
+        assert_eq!(v["data"]["node"], Value::Null, "{vars}: {v}");
+        assert_eq!(v["data"]["nodes"], json!([null, null]), "{vars}: {v}");
+    }
+    let v = run_vars(
+        &fx.schema,
+        "{ node(id: 9223372036854775808) { id } nodes(ids: [9223372036854775808, 3]) { id } }",
+        json!({}),
+    )
+    .await;
+    assert!(v.get("errors").is_none(), "{v}");
+    assert_eq!(v["data"]["nodes"], json!([null, null]), "{v}");
+    // Not an integer (a fraction, a bool): still refused.
+    for id in [json!(1.5), json!(true)] {
+        let v = run_vars(&fx.schema, q, json!({"id": id, "ids": []})).await;
+        assert!(v.get("errors").is_some(), "{id}: {v}");
+    }
+}
+
+/// Suite run 4 (decided: ours stays): an inverted range, `startHeight` = `endHeight` + 1,
+/// is an empty list on every chain, not an error (stock answers INTERNAL_SERVER_ERROR
+/// "Start height cannot be greater than end height").
+#[tokio::test]
+async fn blocks_from_height_with_an_inverted_range_is_empty() {
+    let fx = fixture();
+    for (start, end) in [(7, 6), (11, 10), (1, 0)] {
+        for chains in ["", ", chainIds: [\"0\"]", ", chainIds: [\"0\", \"1\"]"] {
+            let q = format!(
+                "{{ blocksFromHeight(startHeight: {start}, endHeight: {end}{chains}) {{ edges {{ node {{ height }} }} }} }}"
+            );
+            let v = run_vars(&fx.schema, &q, json!({})).await;
+            assert!(v.get("errors").is_none(), "{q}: {v}");
+            assert_eq!(
+                v["data"]["blocksFromHeight"]["edges"],
+                json!([]),
+                "{q}: {v}"
+            );
+        }
+    }
+    // The same heights, not inverted, hold a block (the fixture has chain 0 at height 6).
+    let v = run_vars(
+        &fx.schema,
+        "{ blocksFromHeight(startHeight: 6, endHeight: 6, chainIds: [\"0\"]) { edges { node { height } } } }",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        v["data"]["blocksFromHeight"]["edges"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+}
+
+/// Audit PR-3: GraphQL resolver fixes (F-27, F-28, F-30, F-50, F-51).
+mod audit_pr3 {
+    use super::*;
+
+    fn code(r: &async_graphql::Response) -> Option<async_graphql::Value> {
+        r.errors
+            .first()
+            .and_then(|e| e.extensions.as_ref()?.get("code").cloned())
+    }
+
+    fn bad_input() -> Option<async_graphql::Value> {
+        Some(async_graphql::Value::from("BAD_USER_INPUT"))
+    }
+
+    fn edges<'v>(v: &'v Value, field: &str) -> &'v Vec<Value> {
+        v[field]["edges"].as_array().unwrap()
+    }
+
+    /// F-27: `events(parametersFilter)` whose first value is a string in the account
+    /// dictionary but not a principal finds a non-`TRANSFER` event naming it, although the
+    /// tx has no `acct` posting of that string. A `TRANSFER` filter on the same name keeps
+    /// the account's postings (option B) and still lists its transfers.
+    #[tokio::test]
+    async fn a_non_principal_first_param_of_a_non_transfer_event_is_listed() {
+        let fx = fixture();
+        let q = |qual: &str| {
+            format!(
+                r#"{{ events(qualifiedEventName: "{qual}", parametersFilter: "{{\"array_starts_with\": \"{CAROL}\"}}", first: 50) {{ totalCount edges {{ node {{ requestKey }} }} }} }}"#
+            )
+        };
+        let v = run(&fx.schema, &q("coin.NOTE")).await;
+        let rks: Vec<&str> = edges(&v, "events")
+            .iter()
+            .map(|e| e["node"]["requestKey"].as_str().unwrap())
+            .collect();
+        assert_eq!(rks, [fx.rks[&(1, 11)][0].as_str()], "{v}");
+        assert_eq!(v["events"]["totalCount"], 1, "{v}");
+        let v = run(&fx.schema, &q("coin.TRANSFER")).await;
+        assert!(!edges(&v, "events").is_empty(), "{v}");
+    }
+
+    /// F-30 (stock ANDs every supplied filter): `requestKey` with `blockHash` lists the key's
+    /// copy in that block only; another block's hash lists nothing, and a malformed one is
+    /// `BAD_USER_INPUT`, on `transactions`, `transfers` and `events`.
+    #[tokio::test]
+    async fn request_key_and_block_hash_both_filter() {
+        let fx = fixture();
+        let rk = &fx.rks[&(0, 6)][1];
+        for (field, extra, sel) in [
+            ("transactions", "", "hash"),
+            ("transfers", "", "requestKey orderIndex"),
+            (
+                "events",
+                ", qualifiedEventName: \"coin.TRANSFER\"",
+                "requestKey orderIndex",
+            ),
+        ] {
+            let q = |bh: Option<&str>| {
+                let bh = bh.map_or(String::new(), |h| format!(", blockHash: \"{h}\""));
+                format!(
+                    "{{ {field}(requestKey: \"{rk}\"{bh}{extra}, first: 50) \
+                     {{ totalCount edges {{ node {{ {sel} }} }} }} }}"
+                )
+            };
+            let alone = run(&fx.schema, &q(None)).await;
+            assert!(!edges(&alone, field).is_empty(), "{field}: {alone}");
+            let right = run(&fx.schema, &q(Some(&block_hash(0, 6)))).await;
+            assert_eq!(right, alone, "{field}: the key's own block");
+            let wrong = run(&fx.schema, &q(Some(&block_hash(0, 11)))).await;
+            assert!(edges(&wrong, field).is_empty(), "{field}: {wrong}");
+            assert_eq!(wrong[field]["totalCount"], 0, "{field}: {wrong}");
+            let r = fx.schema.execute(q(Some("not-a-hash"))).await;
+            assert_eq!(code(&r), bad_input(), "{field}: {:?}", r.errors);
+        }
+    }
+
+    /// The hashes `transactions(<src>, fungibleName: <m>)` lists (its `totalCount` agrees).
+    async fn hashes(s: &KdxSchema, src: String, m: &str) -> Vec<String> {
+        let v = run(
+            s,
+            &format!(
+                "{{ transactions({src}, fungibleName: \"{m}\", first: 50) \
+                 {{ totalCount edges {{ node {{ hash }} }} }} }}"
+            ),
+        )
+        .await;
+        let hs: Vec<String> = edges(&v, "transactions")
+            .iter()
+            .map(|e| e["node"]["hash"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(v["transactions"]["totalCount"], hs.len(), "{v}");
+        hs
+    }
+
+    /// F-30: `transactions(fungibleName)` beside `requestKey` or `blockHash` keeps only the
+    /// txs with an event of that module (stock: `EXISTS` an event with `module` = the name).
+    #[tokio::test]
+    async fn fungible_name_filters_transactions_of_a_key_or_a_block() {
+        let fx = fixture();
+        // Block (0, 4): a `One` tx (coin only), then a `Many` tx (coin and kaddex.kdx).
+        let [one, many] = [&fx.rks[&(0, 4)][0], &fx.rks[&(0, 4)][1]];
+        let rk = |k: &str| format!("requestKey: \"{k}\"");
+        assert_eq!(hashes(&fx.schema, rk(one), "coin").await, [one.as_str()]);
+        assert!(hashes(&fx.schema, rk(one), "kaddex.kdx").await.is_empty());
+        assert_eq!(
+            hashes(&fx.schema, rk(many), "kaddex.kdx").await,
+            [many.as_str()]
+        );
+        let bh = format!("blockHash: \"{}\"", block_hash(0, 4));
+        assert_eq!(
+            hashes(&fx.schema, bh.clone(), "kaddex.kdx").await,
+            [many.as_str()]
+        );
+        assert_eq!(hashes(&fx.schema, bh.clone(), "coin").await.len(), 2);
+        assert!(hashes(&fx.schema, bh, "nobody.token").await.is_empty());
+    }
+
+    /// PR-4 (a), stock parity: `transactions(accountName | chainId, fungibleName)` keeps the
+    /// txs with ANY event of that module (stock: `EXISTS` an event with `module` = the name),
+    /// not only those with a transfer of it: block (1, 11)'s tx, sent by Alice, emits only
+    /// `coin.NOTE`.
+    #[tokio::test]
+    async fn fungible_name_keeps_txs_with_any_event_of_the_module() {
+        let fx = fixture();
+        let note = fx.rks[&(1, 11)][0].clone();
+        for src in [
+            format!("accountName: \"{ALICE}\""),
+            format!("accountName: \"{ALICE}\", chainId: \"1\""),
+        ] {
+            let hs = hashes(&fx.schema, src.clone(), "coin").await;
+            assert!(hs.contains(&note), "{src}: {hs:?}");
+            // A module the tx has no event of still drops it.
+            let hs = hashes(&fx.schema, src.clone(), "kaddex.kdx").await;
+            assert!(!hs.contains(&note), "{src}: {hs:?}");
+            assert!(!hs.is_empty(), "{src}");
+        }
+        // Without an account, key or block the source stays the full-history
+        // `<module>.TRANSFER` postings (a deliberate gap with stock, see docs/graphql.md):
+        // the NOTE-only tx is not listed there.
+        for src in ["chainId: \"1\"", "minHeight: 11, maxHeight: 11"] {
+            let hs = hashes(&fx.schema, src.to_owned(), "coin").await;
+            assert!(!hs.contains(&note), "{src}: {hs:?}");
+            assert!(!hs.is_empty(), "{src}");
+        }
+        // Over the old sender path too (`sender_index = false`).
+        fx.store.set_sender_index(false);
+        let hs = hashes(&fx.schema, format!("accountName: \"{ALICE}\""), "coin").await;
+        assert!(hs.contains(&note), "{hs:?}");
+    }
+
+    /// PR-4 (a), controller ruling: `transactions(fungibleName)` without an account, key or
+    /// block reads the full-history `<module>.TRANSFER` postings, so a transfer more than
+    /// `MAX_HEIGHTS` below the chain's tip is still listed (a heights walk would stop above
+    /// it).
+    #[tokio::test]
+    async fn fungible_name_alone_reaches_transfers_below_the_height_walk() {
+        let extra = kdx_graphql::txlist::MAX_HEIGHTS + 10;
+        let fx = fixture_big(GraphqlSettings::default(), extra);
+        let old = fx.rks[&(0, 4)][0].clone();
+        let v = run(
+            &fx.schema,
+            "{ transactions(chainId: \"0\", fungibleName: \"coin\", last: 3) { edges { node { hash } } } }",
+        )
+        .await;
+        let hs: Vec<&str> = edges(&v, "transactions")
+            .iter()
+            .map(|e| e["node"]["hash"].as_str().unwrap())
+            .collect();
+        assert!(hs.contains(&old.as_str()), "{v}");
+    }
+
+    /// F-30: the `isNFT` account path checks `fungibleName` as every other path does.
+    #[tokio::test]
+    async fn nft_transfers_check_the_fungible_name() {
+        let fx = fixture();
+        let r = fx
+            .schema
+            .execute(format!(
+                "{{ transfers(accountName: \"{ALICE}\", isNFT: true, fungibleName: \"  \") \
+                 {{ edges {{ node {{ requestKey }} }} }} }}"
+            ))
+            .await;
+        assert_eq!(code(&r), bad_input(), "{:?}", r.errors);
+    }
+
+    /// F-50: a block's `totalCount` (counted with the page) that the deadline cuts is a
+    /// flagged lower bound, as a deferred count is, not an exact 0.
+    #[tokio::test]
+    async fn a_bounded_count_cut_by_the_deadline_is_flagged() {
+        let fx = fixture();
+        let q = format!(
+            "{{ transfers(blockHash: \"{}\") {{ totalCount }} }}",
+            block_hash(0, 6)
+        );
+        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+            deadline: std::time::Instant::now(),
+        });
+        let r = fx.schema.execute(req).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            r.extensions.contains_key("totalCountLowerBound"),
+            "{:?}",
+            r.extensions
+        );
+        // With time, the same count is exact and unflagged.
+        let r = fx
+            .schema
+            .execute(format!(
+                "{{ transfers(blockHash: \"{}\") {{ totalCount }} }}",
+                block_hash(0, 6)
+            ))
+            .await;
+        assert!(!r.extensions.contains_key("totalCountLowerBound"));
+    }
+
+    /// F-51: the id of a `transfers(isNFT: true)` node resolves through `node(id)` to the
+    /// same transfer.
+    #[tokio::test]
+    async fn nft_transfer_ids_resolve_through_node() {
+        let fx = fixture();
+        let sel = "id requestKey orderIndex moduleName senderAccount receiverAccount amount";
+        let v = run(
+            &fx.schema,
+            &format!(
+                "{{ transfers(accountName: \"{ALICE}\", isNFT: true, first: 50) \
+                 {{ edges {{ node {{ {sel} }} }} }} }}"
+            ),
+        )
+        .await;
+        let list = edges(&v, "transfers");
+        assert!(!list.is_empty(), "{v}");
+        for e in list {
+            let n = run(
+                &fx.schema,
+                &format!(
+                    "{{ node(id: {}) {{ ... on Transfer {{ {sel} }} }} }}",
+                    e["node"]["id"]
+                ),
+            )
+            .await;
+            assert_eq!(n["node"], e["node"], "{n}");
+        }
+    }
+
+    /// F-28: `balance(chainIds: [])` lists every chain (as `fungibleChainAccounts` does), more
+    /// than 100 chain ids are refused, and the page follows the cursor rules of every other
+    /// connection (`after` with `first: 0` serves no row).
+    #[tokio::test]
+    async fn balance_reads_chain_ids_and_pages_as_other_connections() {
+        let fx = fixture();
+        let q = |args: &str| {
+            format!(
+                "{{ balance(accountName: \"{ALICE}\"{args}) \
+                 {{ edges {{ cursor node {{ chainId module }} }} pageInfo {{ hasNextPage }} }} }}"
+            )
+        };
+        let all = run(&fx.schema, &q("")).await;
+        assert_eq!(edges(&all, "balance").len(), 2, "{all}");
+        assert_eq!(run(&fx.schema, &q(", chainIds: []")).await, all);
+        let many = format!(", chainIds: [{}]", vec!["\"0\""; 101].join(", "));
+        let r = fx.schema.execute(q(&many)).await;
+        assert_eq!(code(&r), bad_input(), "{:?}", r.errors);
+        let first = edges(&all, "balance")[0]["cursor"].as_str().unwrap();
+        let v = run(&fx.schema, &q(&format!(", after: \"{first}\", first: 0"))).await;
+        assert!(edges(&v, "balance").is_empty(), "{v}");
+    }
+}
+
+/// The real-traffic `Transactions` operation (G4 replay corpus, case gql.transactions:1000002,
+/// 45,584 requests in two days), verbatim: one chain at one height, `isCoinbase: true`.
+const COINBASE_OP: &str = r#"
+  query Transactions(
+    $first: Int, $last: Int, $after: String, $before: String, $chainId: String,
+    $isCoinbase: Boolean, $minHeight: Int, $maxHeight: Int
+  ) {
+    transactions(
+      first: $first, last: $last, after: $after, before: $before, chainId: $chainId,
+      isCoinbase: $isCoinbase, minHeight: $minHeight, maxHeight: $maxHeight
+    ) {
+      totalCount
+      pageInfo { endCursor hasNextPage hasPreviousPage startCursor }
+      edges {
+        node {
+          hash
+          cmd {
+            meta { gasLimit chainId creationTime gasPrice sender }
+            payload { ... on ExecutionPayload { code } }
+          }
+          result {
+            ... on TransactionResult { badResult gas block { height canonical } }
+          }
+        }
+        cursor
+      }
+    }
+  }
+"#;
+
+/// G4 class 1: `transactions(isCoinbase: true)` lists the coinbase as a `Transaction`
+/// beside the user txs, as stock answers it: first in its block (stock orders by creation
+/// time, and the coinbase has the block's), then the user txs in the list's existing order
+/// (R-P5P9-151: reverse node order). The coinbase row is as stock's: the node's coinbase
+/// `reqKey` as `hash`, sender `coinbase`, gas limit, price and gas 0, code `{}`, the block's
+/// time in whole seconds. `false` keeps user txs only.
+#[tokio::test]
+async fn is_coinbase_true_lists_the_coinbase_as_stock_does() {
+    let fx = fixture();
+    let vars = |cb: Option<bool>| {
+        json!({"chainId": "0", "first": 25, "isCoinbase": cb, "last": null,
+               "minHeight": 11, "maxHeight": 11})
+    };
+    let v = run_vars(&fx.schema, COINBASE_OP, vars(Some(true))).await;
+    assert!(v.get("errors").is_none(), "{v}");
+    let t = &v["data"]["transactions"];
+    let edges = t["edges"].as_array().unwrap();
+    let users = &fx.rks[&(0, 11)];
+    assert_eq!(edges.len(), 1 + users.len(), "{t}");
+    assert_eq!(t["totalCount"], json!(1 + users.len()));
+    let cb = &edges[0]["node"];
+    assert_eq!(
+        cb,
+        &json!({
+            "hash": b64url_encode(&hash_of(0xCB, 0, 11)),
+            "cmd": {
+                "meta": {"gasLimit": 0, "chainId": 0,
+                         "creationTime": "2023-11-14T22:18:50.000Z",
+                         "gasPrice": "0", "sender": "coinbase"},
+                "payload": {"code": "{}"}
+            },
+            "result": {"badResult": null, "gas": "0",
+                       "block": {"height": 11, "canonical": true}}
+        })
+    );
+    // The user txs follow, in reverse node order, unchanged.
+    let hashes: Vec<&str> = edges[1..]
+        .iter()
+        .map(|e| e["node"]["hash"].as_str().unwrap())
+        .collect();
+    let mut want: Vec<&str> = users.iter().map(String::as_str).collect();
+    want.reverse();
+    assert_eq!(hashes, want);
+
+    for cb in [Some(false), None] {
+        let v = run_vars(&fx.schema, COINBASE_OP, vars(cb)).await;
+        assert!(v.get("errors").is_none(), "{v}");
+        let t = &v["data"]["transactions"];
+        assert_eq!(t["edges"].as_array().unwrap().len(), users.len(), "{t}");
+        assert_eq!(t["totalCount"], json!(users.len()));
+    }
+}
+
+/// A coinbase `Transaction`'s other fields: stock's defaults for a tx with no command
+/// (`transaction-schema-validator.ts`): no signers or sigs, empty nonce, the network id,
+/// data `{}`, ttl 0; its result is the stored coinbase output.
+#[tokio::test]
+async fn a_listed_coinbase_has_stock_s_command_defaults() {
+    let fx = fixture();
+    // A list of one block is in node order: the coinbase first.
+    let q = r#"{ transactions(isCoinbase: true, blockHash: "BH", first: 1) {
+        edges { node { sigs { sig } cmd { nonce networkId signers { pubkey }
+          meta { ttl } payload { ... on ExecutionPayload { data } } }
+          result { ... on TransactionResult { goodResult eventCount
+            events { edges { node { qualifiedName } } } } } } } } }"#;
+    let v = run(&fx.schema, &q.replace("BH", &block_hash(1, 9))).await;
+    assert_eq!(
+        v["transactions"]["edges"][0]["node"],
+        json!({"sigs": [],
+               "cmd": {"nonce": "", "networkId": "mainnet01", "signers": [],
+                       "meta": {"ttl": "0"}, "payload": {"data": "{}"}},
+               "result": {"goodResult": "\"ok\"", "eventCount": 1,
+                          "events": {"edges": [{"node": {"qualifiedName": "coin.COINBASE"}}]}}})
+    );
+}
+
+/// A coinbase row's `cmd.meta` as stock recorded it (G4 replay run 2, `gql.transactions:1000002`,
+/// all 5,193 `isCoinbase: true` answers have the same types). Stock sends the coinbase
+/// `gasLimit` as the JSON number `0`, while every user tx's is a string. `gasPrice` is the
+/// string `"0"` and `chainId` a number, like user rows.
+const STOCK_COINBASE_META: &str = r#"{"gasLimit": 0, "chainId": 1,
+    "creationTime": "2021-12-09T03:03:45.000Z", "gasPrice": "0", "sender": "coinbase"}"#;
+
+/// G4 run 2: a coinbase row's meta has the JSON types of stock's recorded answer (`gasLimit` is
+/// the number `0`), and user rows keep the string `gasLimit`.
+#[tokio::test]
+async fn a_listed_coinbase_meta_has_stock_s_json_types() {
+    let fx = fixture();
+    let q = r#"{ transactions(isCoinbase: true, blockHash: "BH", first: 100) {
+        edges { node { cmd { meta { chainId creationTime gasLimit gasPrice sender } } } } } }"#;
+    let v = run(&fx.schema, &q.replace("BH", &block_hash(1, 9))).await;
+    let edges = v["transactions"]["edges"].as_array().unwrap();
+    let meta = |i: usize| &edges[i]["node"]["cmd"]["meta"];
+    let stock: Value = serde_json::from_str(STOCK_COINBASE_META).unwrap();
+    assert_eq!(meta(0)["sender"], json!("coinbase"));
+    assert_eq!(meta(0)["gasLimit"], stock["gasLimit"]);
+    for (k, want) in stock.as_object().unwrap() {
+        let kind = |x: &Value| std::mem::discriminant(x);
+        assert_eq!(kind(&meta(0)[k]), kind(want), "coinbase meta.{k}");
+    }
+    // The block has user txs too: their gasLimit stays a string.
+    assert!(edges.len() > 1, "fixture block has user txs");
+    for i in 1..edges.len() {
+        assert!(meta(i)["gasLimit"].is_string(), "user row {i}");
+    }
+}
+
+/// Request keys of the G4 replay corpus (gql.transaction:1000002 and :1000003): the
+/// base64-wrapped coinbase keys stock lists as `hash` (60 characters: a JSON-quoted hash
+/// text; 58: a bare one). Neither decodes to a 32-byte hash.
+const WRAPPED_RKS: [&str; 2] = [
+    "ImZBSmFxWUlGYlhqU1RVUllQOWNrdEFnczFxUl8zbHhPREsxUEFPOHZjcUki",
+    "NHloUkNldlQ2TDQxX01oY2k1VWhHWVRxRmxOWFpWR1VycXQyR2VYcGJEYw",
+];
+
+/// G4 class 2: a request key that is no hash finds nothing, as in stock (its lookups compare
+/// the text with the stored key): `transaction` answers `null` and the lists by request key
+/// answer no rows, all without an error (stock: `{"transaction": null}`, 17,227 real
+/// requests). Other argument checks still refuse.
+#[tokio::test]
+async fn a_request_key_that_is_no_hash_finds_nothing_without_an_error() {
+    let fx = fixture();
+    let one = "query T($requestKey: String!) { transaction(requestKey: $requestKey) { hash } }";
+    for rk in WRAPPED_RKS
+        .iter()
+        .copied()
+        .chain(["short", "", &"A".repeat(200)])
+    {
+        let v = run_vars(&fx.schema, one, json!({"requestKey": rk})).await;
+        assert_eq!(v, json!({"data": {"transaction": null}}), "{rk}");
+        for q in [
+            "transactions(requestKey: $rk) { totalCount edges { node { hash } } }",
+            "transfers(requestKey: $rk) { totalCount edges { node { amount } } }",
+            "events(qualifiedEventName: \"coin.TRANSFER\", requestKey: $rk) \
+             { totalCount edges { node { requestKey } } }",
+        ] {
+            let field = &q[..q.find('(').unwrap()];
+            let v = run_vars(
+                &fx.schema,
+                &format!("query L($rk: String) {{ {q} }}"),
+                json!({"rk": rk}),
+            )
+            .await;
+            assert_eq!(
+                v,
+                json!({"data": {field: {"totalCount": 0, "edges": []}}}),
+                "{field} {rk}"
+            );
+        }
+    }
+    // A malformed `blockHash` beside it is still refused, as before.
+    let v = run_vars(
+        &fx.schema,
+        "query T($rk: String!) { transaction(requestKey: $rk, blockHash: \"x\") { hash } }",
+        json!({"rk": WRAPPED_RKS[0]}),
+    )
+    .await;
+    assert!(
+        v["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("blockHash"),
+        "{v}"
+    );
+}
+
+/// Controller ruling on PR #30 (review N1): in a `transactions(isCoinbase: true)` list the
+/// coinbase is the first row of its block, as stock orders it, so kadscan's `first: 25` page of
+/// a block with 25 or more user txs still shows it. The user rows keep the order and the cursors
+/// of the list without the flag. Every cursor resumes at the next row both ways (`after` with
+/// `first`, `before` with `last`).
+#[tokio::test]
+async fn is_coinbase_true_puts_the_coinbase_first_in_its_block() {
+    let fx = fixture();
+    let win = "chainId: \"0\", minHeight: 4, maxHeight: 11";
+    let q = |args: &str| {
+        format!(
+            "{{ transactions({args}) {{ pageInfo {{ hasNextPage hasPreviousPage }} \
+             edges {{ cursor node {{ hash }} }} }} }}"
+        )
+    };
+    let rows = |v: &Value| -> Vec<(String, String)> {
+        v["transactions"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["node"]["hash"].as_str().unwrap().to_string(),
+                    e["cursor"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    // Expected: newest block first; in each, the coinbase, then the user txs newest first.
+    let mut want = Vec::new();
+    for h in (4..=11).rev() {
+        let Some(users) = fx.rks.get(&(0, h)) else {
+            continue;
+        };
+        want.push(b64url_encode(&hash_of(0xCB, 0, h)));
+        want.extend(users.iter().rev().cloned());
+    }
+    let all = rows(
+        &run(
+            &fx.schema,
+            &q(&format!("isCoinbase: true, {win}, first: 1000")),
+        )
+        .await,
+    );
+    let hashes: Vec<String> = all.iter().map(|r| r.0.clone()).collect();
+    assert_eq!(hashes, want);
+
+    // The user rows are the list without the flag, with the same cursors.
+    let plain = rows(&run(&fx.schema, &q(&format!("{win}, first: 1000"))).await);
+    let users: Vec<(String, String)> = all
+        .iter()
+        .filter(|r| plain.iter().any(|p| p.0 == r.0))
+        .cloned()
+        .collect();
+    assert_eq!(users, plain);
+    assert!(users.len() < all.len());
+
+    // kadscan's operation on one block with a page smaller than the block: the coinbase first.
+    let one = "isCoinbase: true, chainId: \"0\", minHeight: 11, maxHeight: 11";
+    let n = fx.rks[&(0, 11)].len();
+    assert!(n >= 2, "block 0/11 needs user txs");
+    let v = run(&fx.schema, &q(&format!("{one}, first: 1"))).await;
+    assert_eq!(rows(&v)[0].0, b64url_encode(&hash_of(0xCB, 0, 11)));
+    assert_eq!(v["transactions"]["pageInfo"]["hasNextPage"], json!(true));
+    let v = run(&fx.schema, &q(&format!("{one}, last: 1"))).await;
+    assert_eq!(rows(&v)[0].0, fx.rks[&(0, 11)][0]);
+
+    // Every cursor resumes at the next row in both directions.
+    for (i, (_, c)) in all.iter().enumerate() {
+        let after = rows(
+            &run(
+                &fx.schema,
+                &q(&format!(
+                    "isCoinbase: true, {win}, first: 1000, after: \"{c}\""
+                )),
+            )
+            .await,
+        );
+        assert_eq!(after, all[i + 1..], "after row {i}");
+        let before = rows(
+            &run(
+                &fx.schema,
+                &q(&format!(
+                    "isCoinbase: true, {win}, last: 1000, before: \"{c}\""
+                )),
+            )
+            .await,
+        );
+        assert_eq!(before, all[..i], "before row {i}");
+        let v = run(
+            &fx.schema,
+            &q(&format!(
+                "isCoinbase: true, {win}, last: 1, before: \"{c}\""
+            )),
+        )
+        .await;
+        assert_eq!(
+            rows(&v),
+            all[i.saturating_sub(1)..i],
+            "last 1 before row {i}"
+        );
     }
 }

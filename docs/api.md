@@ -1,8 +1,17 @@
 # Native API v1
 
-**Internal and unstable.** The native API binds a loopback or private address only (the server refuses anything else) and may change freely until a public hostname is decided. The machine-readable form is [`openapi.json`](openapi.json); regenerate it with `kda-indexer openapi > docs/openapi.json`.
+**Internal and unstable.** The native API binds a loopback or private address only (the server refuses anything else) and may change freely until a public hostname is decided. The machine-readable form is [`openapi.json`](openapi.json); regenerate it with `kda-indexer openapi > docs/openapi.json`. The compat routes have their own document, [`openapi-compat.json`](openapi-compat.json) (`kda-indexer openapi --compat > docs/openapi-compat.json`). A test fails when either file is stale or when a served route is missing from the documents.
 
-All routes are `GET` under `/api/v1`. JSON field names are snake_case. Errors are plain text with a status code: 400 (bad parameter, bad cursor), 404, 429 (per-IP rate), 503 (too many requests in flight, or a response over the 8 MB cap), 504 (the 5 s deadline). The listener on `[api] native` has no CORS headers.
+## Swagger UI
+
+The indexer serves an interactive reference of both APIs. `GET /docs` on the native listener (`api.native`) and on the compat listener (`api.compat`) opens Swagger UI with a switcher between the native API (`/api/v1`, 19 routes) and the chainweb-data compatible API (`/txs/*`, `/coins`, `/stats`, `/v1/txs`, 10 documented paths). The page opens on the API of the listener it came from. The documents themselves are at `/docs/openapi.json` and `/docs/openapi-compat.json` (the same bytes as the files in `docs/`).
+
+- Swagger UI ([swagger-ui-dist](https://www.npmjs.com/package/swagger-ui-dist) 5.34.1, Apache-2.0) is vendored and embedded in the binary. The page loads nothing from another host, its content security policy allows scripts, connections, images and fonts from its own origin only, and the "Try it out" button sends GET requests to the same origin.
+- A request to the other API's route from the wrong listener answers 404: the native routes live on `api.native`, the compat routes on `api.compat`. Open `/docs` on the listener whose API you want to try. Both documents are offered on both listeners; the one that is not served here is labelled "other listener" in the switcher.
+- `[api] docs_enabled` (default `true`) turns it off: `/docs` and its files then answer 404. It is read-only and touches no data. `/docs` is never served on the admin listener (the metrics port) or the GraphQL listener. Requests to `/docs` pass the same per-client rate limit and in-flight cap as data routes; the `api.max_body_mb` response cap does not apply to the embedded UI files, and a `/docs` response does not hold an in-flight slot while it streams. Every `/docs` file carries an `ETag` and is revalidated (`Cache-Control: no-cache`), so an upgrade is picked up at once and an unchanged file costs a 304.
+- GraphQL has no Swagger page: its schema is `kda-indexer graphql print-schema` and introspection is on (see [graphql.md](graphql.md)).
+
+All routes are `GET` under `/api/v1`. JSON field names are snake_case. Errors are plain text with a status code: 400 (bad parameter, bad cursor), 404, 429 (per-IP rate), 503 (too many requests in flight, or a response over the 8 MB cap), 504 (the 5 s deadline). The listener on `[api] native` has no CORS headers. On every listener a connection whose response writes make no progress for 30 s (a client that stopped reading) is closed, and TCP keepalive is on.
 
 ## Conventions
 
@@ -64,7 +73,7 @@ Every request reads one snapshot of the hot store and the segment set, so a tx i
 
 Every search route runs under one gate: at most `search.concurrency` (4) searches at once (`503` beyond) and `search.per_client` (1) per client, keyed like the rate limiter (`429` beyond). Patterns are SQL `LIKE` patterns matched anywhere in the text (`%`, `_`, `\` escapes), at most 256 characters and 8 `%`. Refusals and cut answers count in `kdx_search_rejected_total{reason}` (`too_short`, `busy`, `client_busy`, `timeout`, `cap`); `kdx_search_docs` and `kdx_search_built_through_height` describe the code index served.
 
-- Compat `GET /txs/search?search=…` (chainweb-data `searchTxs`): `[TxSummary]` of txs whose own exec code contains the pattern, height desc then request key desc, `limit` 10 (max 250), `offset` up to 10,000 or `next`, `Chainweb-Next`. A pattern with a literal run of 3 characters uses the code index (when it holds every body the pattern can match); otherwise a bounded newest-first scan (`search.max_scan_heights`, `search.timeout_ms`). A cut answer carries `X-Search-Truncated: true` and, when there is more, `Chainweb-Next`. Genesis txs are listed, as chainweb-data does (the other compat list routes hide them). chainweb-data also matches `cont` txs through their initial code; kda-indexer does not.
+- Compat `GET /txs/search?search=…` (chainweb-data `searchTxs`): `[TxSummary]` of txs whose own exec code contains the pattern, height desc then request key desc, `limit` 10 (max 250), `offset` up to 10,000 or `next`, `Chainweb-Next`. A pattern with a literal run of 3 characters uses the code index (when it holds every body the pattern can match); otherwise a bounded newest-first scan (`search.max_scan_heights`, `search.timeout_ms`). A cut answer carries `X-Search-Truncated: true` (CORS exposed, so browsers can read it) and, when there is more, `Chainweb-Next`. Genesis txs are listed, as chainweb-data does (the other compat list routes hide them). chainweb-data also matches `cont` txs through their initial code; kda-indexer does not.
 - Compat `GET /txs/search?pactid=…`: the `cont` txs of the defpact, successful first, then height desc (ties request key ascending), at most 50, from the newest 1,000 txs of the pact (cap: an old successful continuation of a pact with more than 1,000 txs may not appear, while chainweb-data lists it first; such an answer carries `X-Search-Truncated: true`, an answer the cap did not cut has no such header). Neither parameter answers `404 You must specify a search string`, both `400`.
 - Compat `GET /stats` (chainweb-data `statsHandler`): `{"transactionCount":N,"coinsInCirculation":X}`, the exact user-tx count. A background task recounts, each count starting 2 minutes after the previous one ended and running to completion; a request never recounts and answers the last count with `X-Count-Age: <seconds>` since that count started (every 200; browsers can read it, it is in the CORS exposed headers). Before the first count exists it waits up to the request deadline, then answers `503` with `Retry-After: 5`. A failed recount keeps the last count, and its age grows while a count runs. See [operations.md](operations.md#stats-freshness).
 - Compat `GET /coins`: circulating KDA at the highest stored height, as chainweb-data prints it (`text/plain`); `404 Server database is empty` outside mainnet01.
@@ -75,4 +84,43 @@ Every search route runs under one gate: at most `search.concurrency` (4) searche
 
 ## Compat notes
 
+- **`/v1/txs/{account}/{namespace}/{limit}`** (the kda-txs route, on the compat listener). `limit` counts transfer rows, default 50, at most 10,000. It has its own limits, not the native ones above:
+  - **Deadline.** The read gets `api.v1txs_deadline_ms` (default 30,000, the ceiling of kda-txs), not the 5 s deadline. Waiting for a read slot is still bounded by `api.deadline_ms` (5 s); past that the answer is 503 `too many /v1/txs requests running: retry later`. A read past its 30 s answers 504, where kda-txs answers 404.
+  - **Slots.** `/v1/txs` reads have their own slots, a quarter of `api.read_threads` (at least 1; 1 with the default 4), and do not take the heavy-read slots of the GraphQL and compat lists, so a long one never stalls those. Each client (IPv4 address or IPv6 /64) still runs one heavy read at a time, `/v1/txs` included. A read over 5 s is logged (`api: slow /v1/txs read`) to size `read_threads` from real traffic.
+  - **Body cap.** `api.v1txs_max_body_mb` (default 32 MB); a larger answer is 503 `use a smaller limit`.
+  - The server answers within 35 s (5 s slot wait plus the 30 s read), so a balancer in front needs a server timeout of 40 s or more for this route (see [load-balancer.md](load-balancer.md)).
+  - **Answers that differ from kda-txs.** Ours reads every row from its own store of the
+    canonical chain; kda-txs takes its key list from a chainweb-data and its details from its
+    own database. The G4 replay of real `/v1/txs` traffic found these differences, with the
+    node on ours' side each time it was read:
+    - **Missing rows.** kda-txs leaves out transfers the node has (for example 2021
+      `transfer-create` rows, and new rows its key source had not listed yet; 4 paths with
+      7,242 requests in 48 hours). At the `limit` boundary it then fills the list with older
+      rows, so the two lists end at different heights. Every ours-only row that was checked is
+      in a canonical block on the node, with the account as a party.
+    - **Wrong details.** kda-txs can pair a request key with another transaction's
+      `blockHash`, `blockTime`, result `code` or chain (about 200 records; ours equals the
+      node in 24 of 24 reads).
+    - **Order and `_id`.** kda-txs lists the transactions in request-key order and some
+      transactions' events in another order than the node's output; ours lists the newest
+      transfer first and keeps the node's event order. kda-txs rows carry `_id`, its own
+      database id, which ours does not have. The rows are the same as a set.
+- **chainweb-data account lists without `minheight`.** `/txs/account/{account}` with no
+  `minheight` answers the account's whole history on ours, up to `limit`. chainweb-data
+  answered only recent rows in the one case that was compared in full: the public `fluxteam`
+  account, asked with `limit=200000` (about a third of the real chainweb-data traffic in 48
+  hours). chainweb-data listed 27 to 32 rows from December 2023 on (the count moved between
+  reads), and ours listed all 237 from April 2021 on: ours' full history against stock's
+  recent window. Every row of chainweb-data's is in ours' list with the same fields, and 10
+  of 10 sampled ours-only rows are on the node. That chainweb-data shows only recent rows
+  for other accounts is inferred from this one; the cause was not established. Ours keeps the
+  full history (it is what the node holds; R-G4-05); a client that relied on the short list
+  gets a longer one. With `minheight=0` chainweb-data did not answer within 60 s.
+- **`/txs/recent`.** Ours answers from its tip on every request. In the G4 replay,
+  chainweb-data served a stale cached answer: its newest row stayed at the same block for 18
+  minutes while the chain moved on by more than 30 blocks, and five reads 3 s apart gave the
+  same answer. This was seen once, on a test chainweb-data instance whose refresh queries were
+  hung, so it may not reflect a healthy
+  chainweb-data. While the cache is stale the two lists differ, and ours is the fresher one.
+- **`/txs/events` heavy reads (F-20).** A request that may walk without a selective posting list is a heavy read: one with no `modulename`, or with `modulename` plus a `param`, a `search`, or a `name` pattern (a `name` holding `%` or `_`, so `name=TRANSFER_XCHAIN` counts). Heavy reads share the heavy-read slots with the GraphQL lists and `/txs/search`. Each client (IPv4 address or IPv6 /64) runs one at a time with up to 3 more waiting; a further concurrent heavy request answers 503 `this client already runs a heavy request and has others waiting: retry when they are done` at once, with no `Retry-After`. `modulename` alone, or with a plain `name`, stays a normal read (with a plain `name` matching more than `api.max_event_lists` (64) event names in that module too). The answers themselves are unchanged.
 - **Decimal text (R-P5P9-98).** GraphQL `Decimal` values print the shortest exact text: no trailing zeros of the fraction. Only `transfers.amount` is a string; balances are JSON numbers. The node gives Pact decimals as `{"decimal":"138000.000000000000"}` and the reference GraphQL server often prints that scale (`"138000.000000000000"`, and at times 30 places); kda-indexer prints `"138000"` for `transfers.amount` and `138000` for a balance. The values are equal as exact decimals, so a client that parses the number gets the identical value. A client that compares the raw text, or shows the trailing zeros, sees a different string. The comparison harness counts amounts as equal when they are equal as exact decimals (never through floats), on both sides and against the node; this is a documented format difference, not a value difference.

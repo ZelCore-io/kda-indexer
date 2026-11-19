@@ -321,6 +321,19 @@ refused.
   behind the store (`X-Count-Age` measures from the start of that count); the supply is computed
   per request.
 
+## Swagger UI (`/docs`)
+
+The native and compat listeners serve Swagger UI at `/docs`, with the OpenAPI documents of both
+APIs at `/docs/openapi.json` and `/docs/openapi-compat.json`. Everything is embedded in the
+binary (no CDN, nothing fetched at runtime) and read-only. `[api] docs_enabled = false` turns it
+off: `/docs` and every file under it answer 404 (a restart is needed). The admin listener
+(`/healthz`, `/readyz`, `/metrics`) and the GraphQL listener never serve it. Behind a load
+balancer, route `/docs` the way you route the listener's other paths, or leave it unrouted so the
+public name does not expose it; the native listener is internal by rule. The page costs about
+2 MB of response bytes on the first load (cached for a day by the browser) and counts against the
+per-client rate limit like any request. The embedded UI is swagger-ui-dist 5.34.1 (Apache-2.0,
+see `THIRD_PARTY_NOTICES`).
+
 ## Metrics and alerts
 
 `/metrics` on the admin port (OpenMetrics text); the same families are written to the
@@ -450,6 +463,13 @@ the size and blake3 of every file each `range.toml` lists, so a copy that lost a
 transit, or paired the old and new files of a range that was swapped while it was taken, is
 refused before it answers anything. Start the service only when it passes.
 
+Snapshots taken before the audit fix F-02 (PR-5) lack the optional files of every range that
+has them (`*.sndr.pst`, the sender postings, and `*.kf.fil`, the block-hash and request-key
+filters): the snapshot placed them and then deleted them again. `segments check` on such a copy
+fails on those files. Take a new snapshot with a fixed binary, or keep the copy and rebuild the
+files there with `segments add-index` (see above), then run `segments check` again. A host
+already restored from such a snapshot serves sender lists by the slow fallback until then.
+
 To seed another host, take a hard-linked snapshot on the source volume (no `--copy`: on the
 same volume `--copy` writes a second full copy of every segment file there; keep it for
 another local filesystem), then
@@ -518,7 +538,10 @@ with `[balances] enabled = false`.
   where it stopped. Mainnet: roughly 1–2M rows.
 - **Reconcile**: up to 256 dirty rows per batch, chosen fresh for every batch: tail marks first
   (`coin` first, then at most `[balances] module_share` keys per other module, round-robin),
-  the seed backlog (`BalanceSeed`, `coin` first) only behind them; through a node client of its
+  the seed backlog (`BalanceSeed`, `coin` first, then the other modules round-robin) only
+  behind them. `module_share` shares the slots fairly; it does not shrink a batch: in the seed
+  backlog, room left after the fair pass is topped up from the rest of the window (the first
+  16 × batch keys), so a window of one module still fills the batch. Through a node client of its
   own at `[balances] local_rps` calls per second (default 50) with `local_concurrency` in
   flight (default 8). Each call is `({module}.details (read-msg "a"))` with the account in the
   request data, gas limit 150,000; keyset references are resolved with `describe-keyset`.
@@ -526,13 +549,44 @@ with `[balances] enabled = false`.
 - **Marks**: every tail block marks the balances it may change (`TRANSFER` sides, every account
   of its events for `coin`), and a reorg's undo marks the unwound blocks' rows again. A row
   that is dirty is served with `stale: true` until it is re-read.
+- **Branch check**: an answer clears a row's mark only when it was read on the block the
+  indexer holds at that height: the answer's `metaData.prevBlockHash` must equal the stored
+  header's hash at its `as_of`. Right after a quick reorg flip-and-back the node can still
+  answer from the orphan's state at the same height; such an answer (or one read above the
+  indexer's tail) is stored flagged unverified (served `stale: true`) and the row stays queued
+  at the back. When the indexer holds another header at that height (a definite other
+  branch) and already has a row, that row (balance, guard, public-key index) is kept and only
+  flagged unverified. Such answers count as `result="other_branch"` (in addition to `ok`).
+  When every answer of a batch was off-branch, the reconciler waits 2 s before the next
+  batch; it never stops re-reading. It logs a WARN when answers carry no
+  `metaData.prevBlockHash` (at most once a minute: a node or Pact change makes every row
+  unverifiable), and when off-branch answers are more than half of at least 50 `ok` answers
+  in a 60 s window (node off our cut, a balancer in front of several nodes, or a lagging
+  tail). An "absent" answer carries no block metadata and cannot be checked: a row the
+  node reports absent from an orphan's state is stored as absent until the account's next
+  posting on that chain or `reconcile-balances --all`.
+  NFT rows (`get-balance`, `NftDirty`) get the same check: an off-branch answer keeps the
+  mark (served `stale: true`) and does not replace a row already held. The NFT holding guards
+  and token info (`NftDetails`, GraphQL only) are still checked by height alone (TODO D2):
+  they are re-read whenever the balance row's `as_of` moves, and rarely differ between
+  sibling blocks.
 - **Errors**: a node error (timeout, connection, HTTP status) keeps the row dirty and moves it
   to the back of the queue; the reconciler backs off (up to 60 s) only when node errors are at
   least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,
   mark dropped until its next tail mark). It never becomes a zero balance. A Pact failure (for
-  example a token module without a `details` function) or an unusable answer (not JSON, too
-  large, no decimal balance) drops the mark it read (a newer mark survives) and keeps any stored row, flagged
-  unverified (served `stale: true`), with no back-off. A module name that fails the safety
+  example a token module without a `details` function) drops the mark it read (a newer mark
+  survives) and keeps any stored row, flagged unverified (served `stale: true`), with no
+  back-off. An unusable answer (not JSON, too large, no decimal balance) does not drop the
+  mark at once: it is logged (`balances: details answer unusable; key kept dirty`), counted
+  (`result="invalid"`) and moved to the back of the queue. After 5 in a row the key is parked
+  like a node error and listed (`parked_invalid` in `--status`, at most 100,000 keys);
+  `reconcile-balances --all` puts the listed keys back in the queue. Unusable answers count
+  as module failures: a module none of whose keys answers usably in 3 batches in a row is
+  marked not fungible, like one whose calls fail, so a hostile `details` cannot hold batch
+  slots. A batch of only unusable answers pauses the next one for 30 s (the pause also covers
+  a proxy answering HTML with status 200, which is not a node error and gets no back-off).
+  Balance text is accepted up to 1,024 bytes: Pact decimals carry up to 255 places, so a
+  full-precision balance (for example `free.wiza`, about 260 bytes) is stored exactly. A module name that fails the safety
   check is skipped without a call. A node outage parks nothing: retry counts only run in
   batches that do not back off.
 - **Trust**: a guard adds the account to `/keys/{pk}/accounts` only for `coin` and for a module
@@ -552,8 +606,17 @@ with `[balances] enabled = false`.
   (`result="not_fungible"`) and `/tokens` hides it until the re-check `recheck_hours` later.
 - **Caps**: an untrusted module gets at most `[balances] module_rows` rows (default 1,000,000;
   then the tail marks no new key of it) and an account at most `account_rows` untrusted rows
-  (default 1,000); `coin` and confirmed `fungible-v2` rows are always kept
-  (`result="capped"`).
+  (default 1,000); `coin` rows are always kept (`result="capped"`). A confirmed `fungible-v2`
+  module other than `coin` is not counted against an account's cap but has its own row cap,
+  `fungible_module_rows` (default 1,262,460: 10x the largest mainnet token, `free.finux` with
+  126,246 rows in Nov 2026), since anyone can deploy one. `--status` shows both caps,
+  `largest_module_rows` and `capped_modules`; a module at its cap is logged at WARN. As with
+  `module_rows`, the capped flag is sticky: raising the cap later does not resume the module
+  (no command clears the flag yet).
+- **Guard limits**: a `details` guard or `describe-keyset` answer over 4096 bytes of JSON is
+  stored as null (the balance row is still written) and counted in `--status`
+  `guards_capped`. A keyset of more than 64 keys, or with a key over 256 bytes, gives no
+  `KeyAccounts` rows (WebAuthn keys reach 191 bytes on mainnet).
 - **Marks off**: with `[balances] enabled = false` the tail writes no marks. Each chain keeps a
   watermark of the last block applied with marks; when the tail applies a block past it
   (balances were off, or an older binary ran on the store) the reconciler re-runs the seed, so
@@ -561,19 +624,287 @@ with `[balances] enabled = false`.
 
 ```sh
 kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --status
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --seed --dry-run
 # service stopped (both take the data dir lock):
 kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --seed
 kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --all
 ```
 
 - `--status`: dirty rows, balance/absent/guard/key/token counts, seed state (`seeded_height`,
-  `seed_in_progress`), the reconciler's rate, ETA and heartbeat age. Read-only; runs beside the
-  service.
+  `seed_in_progress`), keys parked for unusable answers (`parked_invalid`), the reconciler's
+  rate (`rate_per_s`, rows per second inside a batch; `wall_rate_per_s`, rows per second of wall
+  time since the reconciler loop started, waits and the work between batches included), ETA
+  and heartbeat age. `eta_secs` is the dirty count divided by `wall_rate_per_s` (absent until
+  the loop has reported one). Read-only; runs beside the service.
 - `--seed`: runs (or resumes) the seed walk now; the next `run` reconciles what it marked.
-- `--all`: marks every stored balance row dirty, so the next `run` re-reads them all.
+- `--all`: marks every stored balance row dirty, so the next `run` re-reads them all, and
+  re-queues the keys parked for unusable answers (`parked_invalid_requeued`).
 - `--nft-fill` (service stopped): runs the NFT history fill again (below), then drains the
   marks it made with `get-balance`. `--status` also prints `nft_rows`, `nft_dirty_rows` and
   `nft_filled_height`.
+
+#### Receivers pass (D1)
+
+Before coin v3 some KDA credits named the receiver in no event, so no posting marks its row.
+After the seed, once per store (`Meta balances_seed_receivers`), the receivers pass walks every
+stored user tx below the network's coin v3 height and marks `(receiver, coin, chain)` dirty:
+below the Pact events fork, every account-like string in `exec.data` and every string literal
+in `exec.code`; at any height, the receiver of a `coin.transfer-crosschain` finish. A key that
+already has a `Balances` row is skipped (the tail keeps it correct). Fork heights are per
+network; a network this build has no heights for uses mainnet01's and logs a warning.
+
+- **It blocks the reconcile loop while it walks the segments**: the tail's dirty rows wait until
+  it ends (minutes to a few hours on mainnet, plus one `/local` read per marked row afterwards).
+  Its progress is logged every 1M txs.
+- Count it first, read-only (no lock, beside the service):
+  `reconcile-balances --seed --dry-run` prints `candidates`, `new_accounts`, `skipped_existing`
+  and `dirty_inserted` (rows it would mark). The posting seed does not run.
+- Then run it at a quiet hour (the service runs it by itself), or with the service stopped:
+  `reconcile-balances --seed`.
+- It refuses a store with no tail yet or an incomplete backfill (the service postpones it to the
+  hourly recheck).
+- `errors` must be 0. Each unreadable tx is logged with block height, chain and request key;
+  `--seed` exits non-zero when any was found and `--status` prints `seed_receivers_errors`
+  (with `seed_receivers_height` and `seed_receivers_in_progress`).
+- To force a rerun, delete Meta `balances_seed_receivers`.
+
+#### Token receivers pass (D3)
+
+Some credits name the receiver in no TRANSFER event, for coin and for tokens alike, so no
+posting marks its row. Since fix round 1 the **tail marks them itself**, in the block's txn,
+with the same rules as the pass (one shared extraction, `kdx_decode::receivers::d3_candidates`
+then `d3_filter`): each row is marked at the tx's height through the postings' mark path, with
+no verified-row skip, and a reorg's undo marks it again like an undone posting. The tail keeps
+the per-tx caps below and allows one emitter at most 1,024 rows per block; more are dropped and
+counted (counter `d3_tail_dropped`), and the block is applied regardless. The tail interns no
+names: decode interns the event accounts (postings), a cross-chain defpact's module and account,
+and the modules a tx may put forward as tokens, so backfill and tail build the same dictionary.
+A row whose account or module is still unknown (for example a string of an `exec`) is left to
+the hourly pass, which interns it.
+
+The token receivers pass marks the same rows for stored history, with its own flag
+(`Meta balances_seed_token_receivers`), cursor and error count, and the same mechanics as D1
+(resumable, `stop` polled per chunk, refused until the backfill is complete and the tail has
+started). It walks every stored height, not only those below coin v3. Each row is marked at the
+height of the latest tx that names it, like a posting; a verified `Balances` row is skipped only
+when it was read at or above that height (`as_of`), so a row read before the credit is re-read.
+After the first walk it is pending again whenever the tail grew, and the service's hourly
+recheck walks only the new heights (a safety net now that the tail marks). Candidates:
+
+- an injected early miner account (a dictionary name holding a `"`, mainnet 2020): the
+  accounts its coinbase really credited, as coin rows on that block's chain only;
+- a cross-chain defpact of any module, matched on the defpact's own name (never a suffix):
+  `<module>.transfer-crosschain (sender receiver guard target-chain amount)`, whose step 1
+  credits `args[1]` and step 0 debits `args[0]`; and the Hyperlane bridge tokens'
+  (`n_e595….kb-*`) `<module>.transfer-create-to-crosschain (receiver guard amount
+  target-chain)`, whose step 1 credits `args[0]` (step 0 runs inside the mailbox's `handle` and
+  debits nobody; R-G4-01 a). Tokens emit no TRANSFER for either. The bridge tokens' other
+  credits are covered by the rules below: `handle` emits `RECEIVED_TRANSFER_REMOTE` (an event
+  of a tracked token), and `transfer`/`transfer-create` emit TRANSFER;
+- an `exec` below the events fork: the D1 strings plus every string of `result.data`, for coin
+  and for each tracked token the code calls; from the events fork on, the same strings for a
+  tracked token the code calls only when the tx has no event of that token. A tx that deploys
+  a module (`(module <name> ..)` after `(namespace ..)`, a literal or `(read-msg 'k)`) counts
+  as calling that module, since its init runs unqualified: its code literals without
+  whitespace (a `ROOT` or genesis account) are candidates for that module only, up to 512 per
+  tx; calls into other modules in the same tx keep the normal cap of 64;
+- a tracked token named anywhere in the code, with no event of that token in the tx
+  (R-G4-01 b): `(n_e595….mailbox.dispatch n_e595….kb-USDC 1 "<remote recipient>" 97.84)`
+  burns `meta.sender`'s kb-USDC through the token's `transfer-remote` and emits nothing of
+  kb-USDC. The tx's `meta.sender` is a candidate for every such token on that chain. A name is
+  a dotted reference (`ns.module`) anywhere in code, including a `let` binding, a dead
+  `if false` branch or a `[..]` list, or the module of a qualified call (`ns.module.fn`);
+  strings, `'symbols` and comments never are. Over-marking costs one read; a missed debit
+  serves a wrong balance. When the token is passed directly to a qualified call of another
+  module, that call's account-like string arguments are candidates too (for a bridge dispatch
+  that includes the remote EVM recipient, a harmless zero row). At most 8 tracked tokens
+  (counted after the tracked-token filter, so untracked names cannot use them up) and 16 rows
+  per tx, every sender row first, charged to the sender like other exec rows. Each dropped
+  token and row is counted once (`d3_modref_capped` in the tail's counters, `modref_capped` in
+  the pass's dropped report, with one warning per pass and a debug log per tx);
+- an event of a tracked token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
+  ...): its string params, for that token;
+- an event param holding a `fungible-v2` module reference: the event's string params, for the
+  referenced module, when the event's module is that module, a module of the same governed
+  namespace (not `free` or `user`), or a tracked token naming another tracked token.
+
+Token discovery: a cross-chain defpact's module, and a modref named by its own module or a
+module of the same governed namespace (`kaddex.skdx` is only ever minted by
+`kaddex.alchemist`, so no TRANSFER ever made it a token), are put forward as tokens, at most 4
+per tx, 16 per tail block, and per pass 8,192 with at most 4 per namespace (anyone can create
+`n_` namespaces; a flood of them must not crowd out a real token). A plain object renders exactly
+like a modref, so a name is only queued (`Meta balances_d3_discover/<ns>/<chain>/<module>`, at
+most 4 per namespace and 16,384 in all). In the open namespaces (`free`, `user`) the quota is
+per module, so junk modules there cannot starve a real one. A discovery dropped at any quota is
+counted (`d3_discover_dropped`) and kept in `Meta balances_d3_discover_pending/<chain>/<module>`
+(at most 1,000,000; beyond that only counted, `d3_discover_lost`); the next pass re-queues these
+first, so nothing is lost for good. Each re-queue scans from after the last pending key it
+scanned (`Meta balances_d3_discover_pending_from`) and wraps around, so entries the queue keeps
+refusing cannot hold back the rest. A discovered name longer than 256 bytes is dropped and
+counted (`d3_discover_too_long`, and `discovered_too_long` in the pass's dropped report): it
+could never be an MDBX key, and real module names are far shorter. The reconciler checks 4 queued names per
+round with `describe-module` on that chain; a module that lists `fungible-v2` becomes a tracked
+token, anything else is dropped. Note: a namespace whose user guard lets anyone deploy behaves
+like `free`; add it to `OPEN_NAMESPACES` if one is found.
+
+History of newly tracked tokens: when a module gets a `Tokens` row (first TRANSFER in the
+tail, a confirmed discovery, or a reconciler check) whose first height is below the D3 done
+height, it is queued in `Meta balances_d3_rewalk/<ModuleId>`: a credit below that height may
+predate its tracking. A token first seen at or above the done height is covered by the tail
+marks and the next pass, so it queues no walk. The walk reads the D3 rules for the queued tokens
+only over heights `[0, done)`. In the service it runs in slices of 50,000 txs, one per
+reconcile round, so tail marks, NFT steps and dirty rows keep flowing; each slice commits its
+marks with the walk's cursor (`Meta balances_d3_rewalk_walk`: done height, tokens, next TxNum
+or hot key, budget counters), so a restart resumes there. A new walk starts at most once a day
+(`balances_d3_rewalk_at`); tokens queued during a walk wait for the next one. The CLI walks to
+the end on every run.
+
+To re-mark and re-walk given tokens now (for example after a fix to the D3 rules or to the
+reconciler, when their rows were missed), stop the service and run:
+
+```
+kda-indexer reconcile-balances --rewalk free.wiza,kaddex.skdx
+```
+
+It takes the data dir lock and, for the listed modules only: marks every row their `xfer`
+postings name (`coin`: also its `acct` postings), as the seed does, without touching the seed's
+own state; queues each in `Meta balances_d3_rewalk/<ModuleId>`; and deletes
+`balances_d3_rewalk_at`, so the service starts the walk at its next history slice instead of a
+day after the last one. A walk in progress is restarted from height 0 with its own tokens and the
+new ones together (its tokens stay queued until a walk ends). It prints `posting_rows_marked`,
+`rewalk_queued`, `walk_in_progress_restarted` and `rewalk_pending`. An unknown module name, or
+`coin` (it would mark every coin holder; use `--seed` or `--all`), is an error and writes
+nothing. Running it again marks nothing new but restarts a walk in progress from 0 again (about
+14 h on mainnet). Start the service again; it reconciles the marks and runs the walk
+(`--status` shows `d3_rewalk_pending`). Only tracked tokens are walked; an untracked name is
+queued and silently skipped by the walk, so check `/tokens` or `--status` first.
+
+Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
+Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot read them.
+Likewise `lago.kwUSDC`, `lago.USD2` and `lago.kwBTC` (chains 0–2, R-G4-02): the live modules
+are empty stubs with no `get-balance`, so the 489 funded rows left in their old `token-table`
+cannot be read by any node API and are excluded from balances. GraphQL and the native API
+serve no row for these modules, where the stock GraphQL indexer may list one (in the G4 replay
+it listed `lago.kwUSDC` at 0); the 23 non-ASCII rows the G4 balance recheck met are treated the
+same way.
+
+After a change to these rules, rows the old rules missed in history stay missing until they are
+marked again: the tail and the hourly pass only see new blocks. Re-mark them with `--rewalk`
+for the affected tokens (below). For R-G4-01 that is every tracked `n_e595….kb-*` module.
+
+Only successful txs give candidates. The injected-miner rule reads the block's miner data of
+coinbases below the coinbase injection fix (mainnet 121,452), on that block's chain only.
+Rows from events and from an exec's token calls are capped per tx: each event may add at most
+64 rows of its own (an event that yields no row funds no other event), and a tx's events at
+most 512 (a batch tx such as a kaddex staking-migration WRAP tx credits 45 accounts in one tx);
+an exec gives at most 64 (plus 512 code literals for a module the tx deploys; events are
+taken first). Amount params (`{"decimal": ..}`,
+`{"int": ..}`, plain number strings) are never candidates. Then per pass a budget of distinct rows per tracked token (2,000,000,
+`KDX_D3_MAX_EVENT_CANDIDATES` for the CLI; a repeated row costs nothing), one shared bucket for
+all untracked emitters (2,000,000) and a global ceiling (20,000,000). Rows from an `exec`'s token
+calls are charged to the tx's sender (100,000 per sender, 2,000,000 per pass), never to the
+called token, so junk calls cannot spend a token's budget; the tail keys its per-block cap the
+same way. Over a budget the excess is
+dropped and counted for that token or bucket only, and the pass completes and advances for
+everyone: `--status` shows `seed_token_receivers_dropped` (`tokens`: drops per token,
+`untracked`, `ceiling`, `exec_sender`, `exec_ceiling`, `discovered`, `discovered_namespace`). A genuine token with drops needs a rerun with a raised
+budget (delete the flag first). The budget counters persist with the cursor, so a resumed pass
+does not grant a token its budget twice.
+
+`reconcile-balances --seed` runs D1 and then D3. `--seed --dry-run` opens the store read-only
+and prints both reports, `receivers` and `token_receivers`; `dirty_inserted` is the number of
+node reads the pass would cause. `--status` shows `seed_token_receivers_height`,
+`seed_token_receivers_in_progress`, `seed_token_receivers_errors`, `d3_discover_queued`,
+`d3_discover_pending` and `d3_rewalk_pending`. To force a rerun, delete `Meta balances_seed_token_receivers`.
+
+Run the first pass with the service stopped, or restart the service in a quiet window: the
+service runs it inline at start (about 2.4 h on mainnet) and the reconcile loop waits for it.
+After the repair, the verify scan must show 0 missing rows, including indirect token credits
+with no event of the token after the events fork (another module crediting it, review L4).
+
+#### Key listing of tracked tokens (rows no tx names)
+
+Some funded token rows are named in no transaction, so no D1/D3 rule can find them: a row a
+token writes in its own `init` code under a name that is only a literal of the module (for
+example a `ROOT` treasury account), or a row written under a name built at run time with no
+event (a fee account built from a user guard, a pool account with a hashed name). The node
+lists them: `/local` allows `(keys <module>.<table>)` on any module's table, at a flat 40,000
+gas whatever the table size (measured on mainnet01).
+
+**Node impact.** A `keys` read runs on the node, not in the indexer, and the node does not stop
+it when the client gives up. While it runs it can block that chain's cut: on mainnet01 one
+`keys` of `free.crankk01.crankk01-token-table` stood the node's chain 0 still for about 14
+minutes (the node logged `Timeout while processing cut`), and every wallet using that node
+saw a frozen chain. Run the listing against a node that is not serving wallets, or keep
+`balances.keylist_skip` current with every module whose table is known to be huge. After an
+upgrade from a build before the park (a010087), the stored per-chain failure does not say
+whether it was a timeout (it keeps only the failure count and the retry time), so such a chain
+is read once more at its retry and parked if that times out; list its module in
+`balances.keylist_skip` to stop that read.
+
+With the reconciler in seed mode, a task of its own (beside the reconcile loop, so a slow read
+never holds up dirty rows, NFTs or history slices) lists every tracked token other than `coin`,
+skipping not-fungible verdicts and tokens at their row cap. One step is one (token, chain): a
+`describe-module` read for the code, then one `keys` read per ledger table (a `deftable` whose
+`defschema` has a top-level `balance` field, at most 4). Each read is sent once, with a 90 s
+timeout (no retry inside the node client). At most one step per second, inside the shared
+`/local` limits (`balances.local_rps`, `balances.local_concurrency`: a hung read holds one
+slot). With `balances.local_concurrency = 1` the listing is off (WARN at start): a read would hold the only slot and the reconcile would wait for it. A token never listed comes first, so a newly tracked token (D3 discovery or a first
+posting) is listed within about 10 minutes plus the queue ahead of it; after that each token
+is listed again every 7 days. A first sweep takes about 20 steps per token, so about 20 s per
+token (about 6 h for 1,000 tokens, estimate) when every read is quick.
+
+Skip list: `balances.keylist_skip` (default `["free.crankk01"]`) names modules the listing never
+reads: no `describe-module` and no `keys`, on any chain, so a skipped module costs no budget and
+leaves no stored state. Why: the node itself blocks its cut while it answers a `keys` of a huge
+table. `free.crankk01.crankk01-token-table` held chain 0 for about 14 minutes per read on
+mainnet01 (Nov 2026), and the node cannot be told to stop. Parking a (token, chain) after the
+first timeout does not help a production node, because that first read already freezes its
+chain, so a module known to be huge is skipped up front. Setting `keylist_skip` replaces the
+default (keep `free.crankk01` in it). `reconcile-balances --status` shows `keylist_skipped`
+(`count`, `modules`). A skipped token's keys that no tx names are not found by the listing; the
+rest of the balance work (postings, D3 history, reconcile) covers it as before.
+
+Only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are marked, through
+the postings' mark path, at the height the node read; the reconcile then reads them like any
+dirty row. Names are interned only for keys that will be marked, and new keys of a module stop
+at the room left under its row cap (`fungible_module_rows` for confirmed `fungible-v2`
+modules, `module_rows` otherwise), counting its rows and the marks of the sweep's earlier
+chains that the reconcile has not read yet. A chain where the module is not deployed, where its
+table was never created, or whose module code has no ledger table (for example a ledger field
+not named `balance`, a known gap), lists nothing and is looked at again at the next sweep.
+
+Fail-closed, per (token, chain): a listing over 150,000 keys, an unusable answer or a refused
+`keys` read marks nothing for that chain. It
+is logged (`balances: key listing failed`, with module, chain, reason and the retry pause),
+and only that chain is listed again: after 1 hour, doubling with each failure in a row, at
+most every 7 days; the token goes to the back of the queue meanwhile. A `keys` read timeout
+also marks nothing, but parks that (token, chain) for good (logged with `parked for good`;
+`--status` `keylist_tokens.parked`): it is never listed again, by a retry, the weekly sweep
+or the unlistable period's fresh try. The node does not stop a `keys` read when the client
+gives up: on mainnet01 one `keys` read of a large table held that chain's pact service for
+about 14 minutes after each 90 s timeout (Nov 2026). Meanwhile the node logged `Timeout
+while processing cut`, its cut stood still, and so did the tail and every reconcile read on
+that chain. A parked chain costs the token's failure budget once. A connection or HTTP
+error, or a timeout of the small `describe-module` read (the node stalls, not the token), pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
+in a row. A chain already at the 7-day pause costs the budget nothing more (one table that never lists does not make its token unlistable). A token that runs up 32 chain failures with no clean round between is marked
+unlistable (logged at WARN, `--status` `keylist_tokens.unlistable`) and left alone for 30
+days, then tried once more with a fresh budget. A panic in the listing task is logged at ERROR (`balances: key listing task panicked`) and the task is restarted after 60 s; its progress is in the store. The listing waits, like the receivers pass,
+until the store has a tail and its backfill is complete.
+
+Effective limit: the 150,000-key cap and the 90 s timeout, whichever comes first. The node
+listed 9,480 keys in 4.4 s (about 2,000 keys/s, mainnet01, Nov 2026), so 150,000 keys take
+about 75 s; on a loaded node the timeout can bind below the cap, and such a table is parked as
+above. The answer also has to fit `node.max_body_bytes` (64 MB by default).
+
+State: `Meta balances_keylist/<ModuleId>` (last complete listing, next chain, failures, the
+failed chains with their retry times; a restart resumes) and `Meta balances_keylist_stats`
+(totals). `--status` shows `keylist_tokens` (`listed`: last round clean, `in_progress`,
+`failed`: a chain waits for its retry, `unlistable`, `parked`: a chain is parked) and `keylist_stats` (`tokens_listed`,
+`chain_failures`, `node_errors`, `unlistable`, `listed`, `known`, `marked`, `skipped`,
+`last_failure`). No command relists a token at once yet: a token is listed again when its
+sweep, a chain retry or its unlistable period comes due (a token whose
+`balances_keylist/<ModuleId>` entry is gone counts as never listed, but no tool deletes one).
 
 ### NFTs
 
@@ -606,9 +937,39 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 - `n_4e470a97222514a8662dd1219000a0431451b0ee.ledger` (a v2-shaped ledger in a principal
   namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
   deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
-- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked|capped|not_fungible"}`
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|invalid|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
+
+### Token swaps
+
+`TokenSwaps` holds the newest DEX swap per chain and token, for GraphQL `lastTokenPriceInKda`
+([graphql.md](graphql.md#token-price)). The tail updates it with every block and undoes its
+rows on a reorg. History comes from a one-off fill that `run` starts in the background when
+`Meta price_filled` is missing, on the first start of a binary with this table:
+
+- It walks the `evt` postings of the trusted DEX swap events (`kaddex.exchange.SWAP`,
+  `kdlaunch.kdswap-exchange.SWAP`, and Sushi's
+  `n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.SWAP`) (hot tail first, then the segments,
+  oldest first) and reads only stored records: no node calls and no resync.
+- It writes in batches of 500 txs, one write txn each, and stores its segment position
+  (`Meta price_fill_txnum`) with every batch. A stop (shutdown, crash) loses at most one batch.
+  The next `run` redoes the small hot pass and resumes the segments after that position.
+- Replaying a swap writes nothing (a row only moves to a newer swap), so a resumed or repeated
+  fill is safe.
+- Logs: `prices: swap history fill` at start; `prices: fill pass ended` with a JSON report
+  (`event_names`, `hot_txs`, `frozen_txs`, `resumed_after`, `swaps`, `rows`, `filled_height`,
+  `stopped`, `secs`); `prices: fill failed; restart resumes it` on an error. Ingest and the
+  APIs run meanwhile.
+- Until the fill ends, `lastTokenPriceInKda` answers from the swaps stored so far: the newest
+  ones (from the tail) appear first, and a token whose last swap is old answers `null` until
+  the segment pass reaches it.
+- A reorg of a block that a binary without this table applied keeps that block's swap row
+  until a newer swap replaces it (the fill writes no undo log).
+- To run the fill again, stop the service, delete `Meta price_filled` and
+  `price_fill_txnum` and start it.
+- A `serve` process opened before the first `run` that created the table sees it only after a
+  restart, as with the P6 tables.
 
 ## Rebuilding a range or step
 
@@ -642,9 +1003,20 @@ Stop the service first: it takes the data dir lock.
 - The swap is crash-safe at every point: before the journal `rebuild.<S>/rebuild.json`
   exists the old files stay; after it, readers use the rebuilt set, and the next writer start
   (`run`, `backfill`, `rebuild-range`) finishes the swap. `segments check` passes in between.
-- Restart `serve` after every `rebuild-range` that swapped (`"swapped": true`). A running
-  `serve` keeps the files and indexes it opened before the swap and opens others lazily, so it
-  can pair an old index with a new file of the swapped range (wrong rows or decode errors).
+- Restart `serve` after every `rebuild-range` that swapped (`"swapped": true`) and after every
+  `segments add-index`. A running `serve` keeps the files and indexes it opened before the
+  swap and opens others lazily, so it can pair an old index with a new file of the swapped
+  range (wrong rows or decode errors). It does not reopen a range by itself, even when the
+  manifest is unchanged. A missed restart shows in the log: once a minute `serve` compares
+  each range's `range.toml` with the one it opened and logs an ERROR
+  `serve: range swapped on disk after serve opened it (rebuild-range or segments add-index);
+  restart serve` with the range, once per range. Alert on it, or restart `serve` as part of
+  every `rebuild-range`. `run` needs no restart: it holds the data dir lock, so neither
+  command can run beside it.
+- A reader that opens a range at the moment its swap renames the files can, rarely, fail the
+  open or read a mix of old and new files of that range. The restart above covers it too: open
+  no new `serve` during a swap, and restart running ones after it. (A per-open side choice and
+  retry would close this; it is not built while the restart rule stands.)
 - `snapshot` and the swap exclude each other through `segments.swap.lock` in the data dir: a
   snapshot waits for a swap in progress, and a swap waits for a snapshot to place its
   segment files.

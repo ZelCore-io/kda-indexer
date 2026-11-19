@@ -4,7 +4,7 @@
 //!   counts in `kdx_graphql_subscriptions`; all are released when its stream drops.
 //! - A message never carries more items than the limits walker priced (I-1): `newBlocks`
 //!   and `newBlocksFromDepth` at most one block per subscribed chain (a catch-up is split
-//!   over several messages), `quantity` at most `quantity` (clamped to `max_page`), and
+//!   over several messages), `quantity` at most `quantity` (at most [`crate::MAX_PAGE_ROWS`]), and
 //!   `events` at most the default page of events (the rest follow in the next messages).
 //! - A feed gap on a subscribed chain is one `INTERNAL` error, after the blocks before it;
 //!   the stream stays open. A subscriber that falls more than the feed's capacity behind is
@@ -285,14 +285,14 @@ fn feed_stream(
     }
 }
 
-/// A `quantity` argument (ZelCore extension): 1..=[`MAX_BATCH`]; absent is 20. Clamped to
-/// `max_page`, as the limits walker prices it (M3).
-fn quantity_arg(v: Option<i32>, max_page: usize) -> Result<usize> {
+/// A `quantity` argument: absent is 20, served as asked up to the safety cap
+/// [`crate::MAX_PAGE_ROWS`] (stock has no cap; FIX-3 part D), above it the page refusal.
+/// Below 1 is `BAD_USER_INPUT`.
+fn quantity_arg(v: Option<i32>) -> Result<usize> {
     match v.unwrap_or(20) {
-        n @ 1..=100 => Ok((n as usize).min(max_page.max(1))),
-        _ => Err(bad_input(format!(
-            "quantity must be between 1 and {MAX_BATCH}"
-        ))),
+        n if n < 1 => Err(bad_input("quantity must be at least 1")),
+        n if n as usize > crate::MAX_PAGE_ROWS => Err(crate::error::page_limit()),
+        n => Ok(n as usize),
     }
 }
 
@@ -382,10 +382,7 @@ impl Subscription {
     ) -> Result<BoxStream<'static, Result<Option<Vec<Block>>>>> {
         let chains = chain_set(chain_ids.as_deref())?;
         let (cap, q) = match quantity {
-            Some(_) => (
-                MAX_BATCH,
-                quantity_arg(quantity, gql(ctx).settings.max_page)?,
-            ),
+            Some(_) => (MAX_BATCH, quantity_arg(quantity)?),
             None => (chains.len(), usize::MAX),
         };
         Ok(feed_stream(ctx, chains, None, cap, false)?
@@ -410,7 +407,7 @@ impl Subscription {
         ctx: &Context<'_>,
         #[graphql(default = 20)] quantity: Option<i32>,
     ) -> Result<BoxStream<'static, Result<Option<Vec<Transaction>>>>> {
-        let q = quantity_arg(quantity, gql(ctx).settings.max_page)?;
+        let q = quantity_arg(quantity)?;
         let s = feed_stream(ctx, chain_set(None)?, None, MAX_BATCH, true)?;
         Ok(s.filter_map(move |item| {
             let out = item.map(|blocks| newest_txs(&blocks, q));

@@ -314,6 +314,15 @@ impl Decimal {
         self
     }
 
+    /// Text sent exactly as given, as a JSON string (`lastTokenPriceInKda`: stock's
+    /// `toFixed(12)` text keeps its trailing zeros).
+    pub fn verbatim(text: String) -> Decimal {
+        Decimal {
+            text,
+            as_string: true,
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         &self.text
     }

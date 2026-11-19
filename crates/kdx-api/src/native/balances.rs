@@ -281,11 +281,7 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
         let mut last = None;
         for (k, _) in rows.iter().take(limit as usize) {
             view.check_deadline()?;
-            let a = u32::from_be_bytes(
-                k[16..20]
-                    .try_into()
-                    .map_err(|_| ApiError::Internal(anyhow::anyhow!("bad KeyAccounts key")))?,
-            );
+            let a = key_account(k)?;
             last = Some(a);
             let mut modules = Vec::new();
             for (m, c, r) in balances::account_rows(&view.txn, a)? {
@@ -325,9 +321,31 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
     .await
 }
 
+/// The account id of a `KeyAccounts` key (bytes 16..20).
+fn key_account(k: &[u8]) -> ApiResult<u32> {
+    k.get(16..20)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("bad KeyAccounts key")))
+}
+
 #[cfg(test)]
 mod cursor_parse_tests {
-    use super::parse_bal_cursor;
+    use super::{key_account, parse_bal_cursor};
+
+    /// F-49: a `KeyAccounts` key shorter than 20 bytes is a 500, not a panic.
+    #[test]
+    fn short_key_accounts_key_is_an_error() {
+        let mut k = vec![0u8; 20];
+        k[16..20].copy_from_slice(&7u32.to_be_bytes());
+        assert_eq!(key_account(&k).unwrap(), 7);
+        for n in [0, 16, 19] {
+            assert!(matches!(
+                key_account(&k[..n]),
+                Err(crate::ApiError::Internal(_))
+            ));
+        }
+    }
 
     #[test]
     fn rejects_non_hex_and_multibyte_without_panicking() {
@@ -410,6 +428,7 @@ mod key_accounts_tests {
             max_in_flight: 16,
             max_body_bytes: 8 << 20,
             v1txs_max_body_bytes: 8 << 20,
+            v1txs_deadline: std::time::Duration::from_secs(30),
             rate_per_ip: 20,
             rate_burst: 40,
             trusted_proxies: Vec::new(),

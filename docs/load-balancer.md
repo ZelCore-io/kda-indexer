@@ -92,7 +92,7 @@ backend kdx_compat
     option forwardfor
     option httpchk GET /readyz
     http-check expect status 200
-    timeout server 15s
+    timeout server 40s
     default-server check port 31369 inter 5s fall 3 rise 6 observe layer4 error-limit 3 on-error mark-down
     server kdx1 <indexer-1-private-ip>:31362
 ```
@@ -105,8 +105,16 @@ backend kdx_compat
   with a live admin port stays "up" until connection errors mark it down.
 - `rise 6` (30 s of passing checks) keeps a lag that hovers around `api.ready_max_lag` from
   flapping the routes in and out every few seconds; each flip breaks paging tokens.
-- `timeout server 15s`: the indexer's own deadline is 5 s (504 past it), so 15 s only catches
-  a hung connection.
+- `timeout server 40s`: it has to cover the longest answer, `/v1/txs` (step 3). That route
+  waits up to the normal deadline (`api.deadline_ms`, 5 s) for a read slot, 503 past it, and
+  then reads within `api.v1txs_deadline_ms` (30 s, the ceiling of the kda-txs service it
+  replaces): up to 35 s in all. Every other route answers within its 5 s deadline (504 past
+  it), so for them the timeout only catches a hung connection. With a lower timeout the
+  balancer answers its own 504 for the slow `/v1/txs` cases. If you split `/v1/txs` into a
+  backend of its own, that one needs the 40 s and `kdx_compat` can keep 15 s.
+- The indexer closes a connection whose response writes make no progress for 30 s (a client
+  that stopped reading), so a stalled client cannot keep a buffered response in memory longer
+  than that, with or without the balancer's own client timeout.
 - `observe layer4 … on-error mark-down` takes a server out after connection errors without
   waiting for three failed checks.
 
@@ -306,7 +314,7 @@ backend kdx_compat
     option forwardfor
     option httpchk GET /readyz
     http-check expect status 200
-    timeout server 15s
+    timeout server 40s
     default-server check port 31369 inter 5s fall 3 rise 6 observe layer4 error-limit 3 on-error mark-down
     server kdx1 <indexer-1-private-ip>:31362
 ```

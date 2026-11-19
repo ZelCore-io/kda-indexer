@@ -1,10 +1,11 @@
 //! The `Query` root. Root fields not served yet answer `NOT_SUPPORTED` (Tasks 3–5 fill them
 //! in); `pactQuery` and `gasLimitEstimate` stay `NOT_SUPPORTED` (GQ-3, Q9).
 
-use async_graphql::{Context, InputObject, Object, Result, SimpleObject, ID};
+use async_graphql::{Context, InputObject, Object, Result, SimpleObject};
 
 use crate::connection::PageArgs;
 use crate::scalars::{BigInt, Decimal};
+use crate::types::node::AnyId;
 use crate::types::{
     default_chain_ids, unserved, Block, FungibleAccount, FungibleChainAccount, GraphConfiguration,
     NetworkInfo, Node, NonFungibleAccount, NonFungibleChainAccount, QueryBlocksFromDepthConnection,
@@ -76,7 +77,7 @@ impl Query {
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Depth(depth),
-            PageArgs::new(after, before, first, last).wide(),
+            PageArgs::new(after, before, first, last),
         )
         .await?;
         Ok(Some(QueryBlocksFromDepthConnection {
@@ -109,7 +110,7 @@ impl Query {
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Heights { start, end },
-            PageArgs::new(after, before, first, last).wide(),
+            PageArgs::new(after, before, first, last),
         )
         .await?;
         Ok(QueryBlocksFromHeightConnection {
@@ -146,7 +147,7 @@ impl Query {
                 count: count as u64,
                 complete: completed_heights.unwrap_or(true),
             },
-            PageArgs::new(after, before, first, last).wide(),
+            PageArgs::new(after, before, first, last),
         )
         .await?;
         Ok(QueryCompletedBlockHeightsConnection {
@@ -233,11 +234,12 @@ impl Query {
         Ok(crate::types::account::fungible_chain_accounts(
             ctx,
             &account_name,
-            &[chain_id],
+            Some(&[chain_id]),
             fungible_name.as_deref(),
         )
         .await?
-        .and_then(|v| v.into_iter().next()))
+        .into_iter()
+        .next())
     }
 
     async fn fungible_chain_accounts(
@@ -250,10 +252,11 @@ impl Query {
         crate::types::account::fungible_chain_accounts(
             ctx,
             &account_name,
-            &chain_ids.unwrap_or_default(),
+            chain_ids.as_deref(),
             fungible_name.as_deref(),
         )
         .await
+        .map(Some)
     }
 
     async fn fungible_chain_accounts_by_public_key(
@@ -282,8 +285,12 @@ impl Query {
         .collect())
     }
 
-    /// Not served (Q9): the indexer does not run Pact.
+    /// Not served (Q9): the indexer does not run Pact. No input runs no Pact: an empty list,
+    /// as stock answers (FIX-4 item 4).
     async fn gas_limit_estimate(&self, input: Vec<String>) -> Result<Vec<GasLimitEstimation>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
         unserved!("Query.gasLimitEstimate")
     }
 
@@ -299,11 +306,11 @@ impl Query {
         crate::types::network::network_info(ctx).await
     }
 
-    async fn node(&self, ctx: &Context<'_>, id: ID) -> Result<Option<Sel<Node>>> {
-        Ok(crate::types::node::node(ctx, &id).await?.map(Sel))
+    async fn node(&self, ctx: &Context<'_>, id: AnyId) -> Result<Option<Sel<Node>>> {
+        Ok(crate::types::node::node(ctx, &id.0).await?.map(Sel))
     }
 
-    async fn nodes(&self, ctx: &Context<'_>, ids: Vec<ID>) -> Result<Vec<Option<Sel<Node>>>> {
+    async fn nodes(&self, ctx: &Context<'_>, ids: Vec<AnyId>) -> Result<Vec<Option<Sel<Node>>>> {
         let found = crate::types::node::nodes(ctx, &ids).await?;
         Ok(found.into_iter().map(|n| n.map(Sel)).collect())
     }
@@ -315,7 +322,11 @@ impl Query {
     ) -> Result<Option<NonFungibleAccount>> {
         Ok(crate::types::nft::non_fungible(ctx, &account_name, None)
             .await?
-            .map(|(account, items)| NonFungibleAccount { account, items }))
+            .map(|(account, items, cut)| NonFungibleAccount {
+                account,
+                items,
+                cut,
+            }))
     }
 
     async fn non_fungible_chain_account(
@@ -330,10 +341,11 @@ impl Query {
             Some(crate::txlist::chain_arg(&chain_id)?),
         )
         .await?
-        .map(|(account, items)| NonFungibleChainAccount {
+        .map(|(account, items, cut)| NonFungibleChainAccount {
             account,
             chain: crate::txlist::chain_arg(&chain_id).unwrap_or(0),
             items,
+            cut,
         }))
     }
 
@@ -430,9 +442,39 @@ impl Query {
         .await
     }
 
-    /// ZelCore extension, not served: the indexer keeps no price data.
-    async fn last_token_price_in_kda(&self, module_name: String) -> Result<Option<Decimal>> {
-        unserved!("Query.lastTokenPriceInKda")
+    /// The price in KDA of the newest DEX swap that names `moduleName` (stock semantics:
+    /// `LIKE '%moduleName%'` over the swap's tokens, `kda / token` as `toFixed(12)` text;
+    /// `kdx_hot::prices`). Null when no stored swap matches.
+    async fn last_token_price_in_kda(
+        &self,
+        ctx: &Context<'_>,
+        module_name: String,
+    ) -> Result<Option<Decimal>> {
+        // The pattern is user-controlled and the table scan costs work: a heavy read (so it
+        // cannot exhaust the general pool), a pattern capped in length and wildcards, and the
+        // request deadline checked inside the scan (`kdx_hot::prices::lookup_checked`).
+        if module_name.len() > kdx_hot::prices::MAX_LIKE_PATTERN {
+            return Ok(None);
+        }
+        let row = crate::gql(ctx)
+            .state()?
+            .read_heavy(move |view| {
+                let found = kdx_hot::prices::lookup_checked(&view.txn, &module_name, &mut || {
+                    view.check_deadline()?;
+                    Ok(())
+                });
+                match found {
+                    Ok(row) => Ok(row),
+                    // The deadline passed inside the scan: answer it as every read does.
+                    Err(e) => view.check_deadline().and(Err(e.into())),
+                }
+            })
+            .await
+            .map_err(crate::error::from_api)?;
+        Ok(row
+            .as_ref()
+            .and_then(kdx_hot::prices::price_text)
+            .map(Decimal::verbatim))
     }
 
     async fn transactions_by_public_key(

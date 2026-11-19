@@ -12,12 +12,13 @@
 //!   chain, re-checked after [`Caps::recheck_secs`]); keyset references are resolved with
 //!   `describe-keyset` only for those. Other modules' balances are stored and served, their
 //!   guards never index a key.
-//! - Not fungible (R-P5P9-8 #2): a module whose `details` calls all fail in
-//!   [`NOT_FUNGIBLE_AFTER`] batches in a row is marked; the tail stops marking it, its keys
+//! - Not fungible (R-P5P9-8 #2): a module whose `details` calls all fail or answer unusably
+//!   in [`NOT_FUNGIBLE_AFTER`] batches in a row is marked; the tail stops marking it, its keys
 //!   are dropped without a call (`result="not_fungible"`), `/tokens` hides it; after
 //!   [`Caps::recheck_secs`] it is active again.
-//! - Caps (I-7): a non-coin module stops getting new rows at [`Caps::module_rows`] (the tail
-//!   then marks no new key of it) and an account at [`Caps::account_rows`]
+//! - Caps (I-7): a non-coin module stops getting new rows at [`Caps::module_rows`], a confirmed
+//!   `fungible-v2` one at [`Caps::fungible_module_rows`] (F-14; the tail then marks no new key
+//!   of it), and an account at [`Caps::account_rows`]
 //!   (`result="capped"`).
 //! - A dirty key is deleted only when its mark, read again in the write txn, is still the exact
 //!   [`Mark`] (height and write sequence) read at refill, and its height is not above the
@@ -27,23 +28,46 @@
 //!   absent answer carries
 //!   no height, so its `as_of` is the chain's tail height read before the call (the node is at
 //!   or past it).
+//! - Branch check (D2): a height alone does not say which branch the node read. Right after a
+//!   quick reorg flip-and-back, `/local` can still answer from the orphan's state at the same
+//!   height. A success therefore clears its mark only when its `metaData.prevBlockHash` (the
+//!   hash of the tip it read) equals our stored header at `as_of` on that chain. Otherwise
+//!   (another branch, no hash, or no header of ours at that height because the node is ahead
+//!   of our tail) the row is written flagged `unverified` (served `stale: true`) and the mark
+//!   moves up to the tail height, back of the queue, with no retry count
+//!   (`BatchStats::other_branch`, `result="other_branch"`). When we hold another header at
+//!   that height (a definite other branch) and already have a row, the row is kept (balance,
+//!   guard, key index) and only flagged unverified (L1). A batch whose answers were all
+//!   off-branch pauses the loop [`OFF_BRANCH_PAUSE`] ([`off_branch_pause`]); [`BranchWatch`]
+//!   WARNs on answers without `prevBlockHash` and on an off-branch majority over a window.
+//! - Residual race (D2): an `Absent` answer carries no `metaData`, so its branch cannot be
+//!   checked. If the node answers absent from an orphan's state (a row that exists only on our
+//!   branch), the row is stored absent and its mark cleared as before; only the account's next
+//!   posting on that chain, or `reconcile-balances --all`, re-reads it. Reorgs are logged, not
+//!   kept in the store, so absent answers right after a reorg are not re-queued.
 //! - Outcomes (`kdx_balance_reconcile_total{result}`):
-//!   - `ok`, `absent`: row written.
+//!   - `ok`, `absent`: row written (`ok` from another branch: written unverified, still dirty).
+//!   - `other_branch`, counted in addition to `ok`: the answer was not read on our branch.
 //!   - `skipped`: B-1 refused the call (module name, name length); the key is dropped.
-//!   - `error`, Pact failure or unusable answer (the node evaluated the code and it failed,
-//!     e.g. a module with no `details`; or the answer is not JSON, over the body cap, or has no
-//!     decimal balance or `metaData`): the key is dropped, and an existing row keeps its
-//!     balance flagged `unverified` (served `stale: true`, I-5). The next tail mark retries
-//!     it. No back-off.
+//!   - `error`, Pact failure (the node evaluated the code and it failed, e.g. a module with no
+//!     `details`): the key is dropped, and an existing row keeps its balance flagged
+//!     `unverified` (served `stale: true`, I-5). The next tail mark retries it. No back-off.
+//!   - `invalid`, unusable answer ([`LocalError::Invalid`]: not JSON, over the body cap, no
+//!     decimal balance or `metaData`): the key stays dirty, its mark moved up to the tail
+//!     height (back of the queue), no back-off; a batch of only invalid answers pauses
+//!     [`INVALID_PAUSE`]. After [`MAX_KEY_RETRIES`] in a row it is parked like a node error
+//!     and listed in `balances_parked_invalid/` (bounded) for `reconcile-balances --status`
+//!     and the retry pass `--all`. Invalid answers count as module failures for the
+//!     not-fungible rule (H-1), so a module that never answers usably stops taking batches.
 //!   - `error`, node error (transport or HTTP): the key stays dirty and its mark moves up to
 //!     the chain's tail height (back of the queue). The loop backs off exponentially up to
 //!     [`BACKOFF_MAX`] only when node errors are at least half of a batch's calls
-//!     ([`backs_off`]). A key with [`MAX_KEY_RETRIES`] node errors in a row in batches that
-//!     did not back off is parked (`parked`: mark dropped until the next tail mark, row
-//!     flagged `unverified`). A backed-off batch counts nothing and resets the counts (SR-2):
+//!     ([`backs_off`]). A key with [`MAX_KEY_RETRIES`] node errors (or invalid answers) in a
+//!     row in batches that did not back off is parked (`parked`: mark dropped until the next
+//!     tail mark, row flagged `unverified`). A backed-off batch counts nothing and resets the counts (SR-2):
 //!     a node outage parks no key. Never read as a zero balance.
-//! - Heartbeat: `Meta balances_reconcile_stats` (JSON: unix time, rows done, rate, dirty) per
-//!   batch; not part of the systemd watchdog.
+//! - Heartbeat: `Meta balances_reconcile_stats` (JSON: unix time, rows done, in-batch `rate`,
+//!   wall-clock `wall_rate`, dirty) per batch; not part of the systemd watchdog.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -55,16 +79,18 @@ use kdx_hot::balances::{
     self, clear_mark, guard_hash, guard_keys, key_account_key, key_hash, ref_hash, set_unverified,
     stored_guard_keys, BalanceRow, GuardKeys, Mark, TokenRow, KIND_FUNGIBLE, KIND_NOT_FUNGIBLE,
 };
+use kdx_hot::tables::block_key;
 use kdx_hot::{checkpoint, HotStore, RwTxn, Stage, Table, Txn};
 use kdx_node::local::{Details, Local, LocalClient, LocalError, LocalOpts};
 use kdx_node::NodeClient;
-use kdx_types::DictKind;
+use kdx_types::record::decode_block;
+use kdx_types::{DictKind, Hash32};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::Ctx;
 
-/// Consecutive node errors after which a key is parked: its dirty mark is dropped (counted as
+/// Consecutive node errors or invalid answers after which a key is parked: its dirty mark is dropped (counted as
 /// `result="parked"`) until the next tail mark of the row.
 pub const MAX_KEY_RETRIES: u32 = 5;
 /// Keys (and modules) whose errors are counted at once (the map is cleared beyond this).
@@ -95,7 +121,17 @@ pub struct Caps {
     pub account_rows: u32,
     /// Seconds after which a module's fungible checks and a not-fungible verdict are re-done.
     pub recheck_secs: u32,
+    /// Txs per slice of the D3 history walk, one slice per loop round (re-review N2).
+    pub history_slice_txs: u64,
+    /// Most `Balances` rows of one confirmed `fungible-v2` module other than `coin` (F-14:
+    /// anyone can deploy one). Past it, a key with no row is dropped and the module flagged
+    /// like an untrusted one at [`Caps::module_rows`].
+    pub fungible_module_rows: u32,
 }
+
+/// Default of [`Caps::fungible_module_rows`] (F-14): 10x the largest non-coin module on
+/// mainnet, `free.finux` with 126,246 rows (KDA-03 hot store scan, 2026-11-22).
+pub const DEFAULT_FUNGIBLE_MODULE_ROWS: u32 = 1_262_460;
 
 impl Default for Caps {
     fn default() -> Self {
@@ -104,11 +140,13 @@ impl Default for Caps {
             module_rows: 1_000_000,
             account_rows: 1_000,
             recheck_secs: 86_400,
+            history_slice_txs: crate::seed_receivers::HISTORY_SLICE_TXS,
+            fungible_module_rows: DEFAULT_FUNGIBLE_MODULE_ROWS,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReconcileOpts {
     pub local: LocalOpts,
     /// Dirty keys per batch (one write txn).
@@ -116,6 +154,9 @@ pub struct ReconcileOpts {
     /// Run the seed first when `Meta balances_seeded` is absent (B-5).
     pub seed: bool,
     pub caps: Caps,
+    /// `balances.keylist_skip`: modules the key listing never reads (the node blocks its cut
+    /// while it answers a `keys` of a huge table).
+    pub keylist_skip: Vec<String>,
 }
 
 /// One dirty key taken for a batch: a tail mark (`BalanceDirty`) or a seed mark
@@ -152,29 +193,34 @@ fn module_of(key: &[u8; 9]) -> u32 {
 }
 
 /// Round-robin over modules, the module with the oldest key first, until `out` holds `n`.
-fn fair(out: &mut Vec<Dirty>, by_module: HashMap<u32, Heap>, n: usize, seed: bool) {
+/// Two passes over the same lists: the fair pass deals at most `share` rows per module; the
+/// top-up pass then fills the room that is left with the modules' remaining rows, one per
+/// module per round, uncapped. So `share` orders the slots and never shrinks the batch.
+fn fair(out: &mut Vec<Dirty>, by_module: HashMap<u32, Heap>, n: usize, share: usize, seed: bool) {
     let mut lists: Vec<Vec<(Mark, [u8; 9])>> = by_module
         .into_values()
         .map(BinaryHeap::into_sorted_vec)
         .filter(|l| !l.is_empty())
         .collect();
     lists.sort_by_key(|l| l[0]);
-    let mut i = 0;
-    while out.len() < n {
-        let mut any = false;
-        for l in &lists {
-            if out.len() >= n {
+    for (from, to) in [(0, share), (share, usize::MAX)] {
+        let mut i = from;
+        while i < to && out.len() < n {
+            let mut any = false;
+            for l in &lists {
+                if out.len() >= n {
+                    break;
+                }
+                if let Some(&(mark, key)) = l.get(i) {
+                    out.push(Dirty { key, mark, seed });
+                    any = true;
+                }
+            }
+            if !any {
                 break;
             }
-            if let Some(&(mark, key)) = l.get(i) {
-                out.push(Dirty { key, mark, seed });
-                any = true;
-            }
+            i += 1;
         }
-        if !any {
-            break;
-        }
-        i += 1;
     }
 }
 
@@ -182,7 +228,9 @@ fn fair(out: &mut Vec<Dirty>, by_module: HashMap<u32, Heap>, n: usize, seed: boo
 /// 1. tail marks of `coin`, oldest first;
 /// 2. tail marks of the other modules, round-robin over modules, at most `share` each;
 /// 3. only when 1 and 2 leave room, the seed backlog (the first `SEED_WINDOW × n` rows of
-///    `BalanceSeed`): `coin` first, then the other modules as in 2.
+///    `BalanceSeed`): `coin` first, then the other modules round-robin, at most `share` each
+///    in the fair pass; the room that is left is topped up from the window's remaining rows
+///    without the cap (a window of one module is a full batch, not `share` rows).
 ///
 /// Tail marks are all of `BalanceDirty` (what changed since its last reconcile); every batch
 /// takes a fresh refill, so a new `coin` mark waits at most one batch, whatever other modules
@@ -222,7 +270,7 @@ pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
             seed: false,
         })
         .collect();
-    fair(&mut out, by_module, n, false);
+    fair(&mut out, by_module, n, share, false);
     if out.len() < n {
         let rows = hot.ro()?.scan_limit(
             Table::BalanceSeed,
@@ -244,14 +292,16 @@ pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
                     });
                 }
             } else {
+                // Up to `n` per module: the fair pass uses `share` of them, the top-up pass
+                // the rest, so a window of one module still fills the batch.
                 keep(
                     by_module.entry(module_of(&key)).or_default(),
                     (mark, key),
-                    share,
+                    n,
                 );
             }
         }
-        fair(&mut out, by_module, n, true);
+        fair(&mut out, by_module, n, share, true);
     }
     Ok(out)
 }
@@ -274,11 +324,24 @@ struct Item {
     skip: Option<&'static str>,
 }
 
+/// A `details` success.
+struct Answer {
+    details: Details,
+    /// The tip height the node read.
+    as_of: u32,
+    /// The hash of the block at `as_of` the node read (`metaData.prevBlockHash`), D2.
+    prev_hash: Option<String>,
+    /// A keyset reference resolved with `describe-keyset`: (name, keyset or none).
+    resolved: Option<(String, Option<Value>)>,
+}
+
 enum Outcome {
-    Found(Details, u32, Option<(String, Option<Value>)>),
+    Found(Box<Answer>),
     Absent(u32),
     Skipped,
     Failure,
+    /// The answer arrived but is unusable here (`LocalError::Invalid`): the key stays queued.
+    Invalid,
     NodeError,
     Dropped(&'static str),
 }
@@ -290,6 +353,7 @@ impl Outcome {
             Outcome::Absent(_) => "absent",
             Outcome::Skipped => "skipped",
             Outcome::Failure | Outcome::NodeError => "error",
+            Outcome::Invalid => "invalid",
             Outcome::Dropped(l) => l,
         }
     }
@@ -327,7 +391,11 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
     };
     let (r, secs) = local.details_timed(it.chain, module, acct).await;
     let out = match r {
-        Ok(Local::Found { value, height }) => {
+        Ok(Local::Found {
+            value,
+            height,
+            prev_hash,
+        }) => {
             let as_of = u32::try_from(height).unwrap_or(u32::MAX);
             let resolved = match guard_keys(&value.guard) {
                 GuardKeys::Ref(name) if it.trusted => {
@@ -342,13 +410,28 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
                 }
                 _ => None,
             };
-            Outcome::Found(value, as_of, resolved)
+            Outcome::Found(Box::new(Answer {
+                details: value,
+                as_of,
+                prev_hash,
+                resolved,
+            }))
         }
         Ok(Local::Absent) => Outcome::Absent(it.tail),
         Err(LocalError::Skipped(_)) => Outcome::Skipped,
         Err(LocalError::Failure(m)) => {
             tracing::debug!(module = %module, chain = it.chain, message = %m, "details failed");
             Outcome::Failure
+        }
+        Err(LocalError::Invalid(m)) => {
+            // Never a silent drop (D3 gap group 2): the key stays dirty and is reported.
+            tracing::warn!(
+                module = %module,
+                chain = it.chain,
+                message = %m,
+                "balances: details answer unusable; key kept dirty"
+            );
+            Outcome::Invalid
         }
         Err(LocalError::Node(e)) => {
             tracing::debug!(error = %e, "details: node error, kept dirty");
@@ -382,27 +465,37 @@ fn account_has_key(
     Ok(false)
 }
 
-/// Whether a new row may be written (I-7). Always for a trusted row (`coin`, or a module
-/// confirmed `fungible-v2` on this chain) and for a key that has a row. An untrusted module
-/// stops at [`Caps::module_rows`] (and is flagged, so the tail stops marking new keys of it),
+/// Whether a new row may be written (I-7). Always for `coin` and for a key that has a row. A
+/// module confirmed `fungible-v2` on this chain stops at [`Caps::fungible_module_rows`]
+/// (F-14), an untrusted module at [`Caps::module_rows`] (and is flagged, so the tail stops marking new keys of it),
 /// and an account takes at most [`Caps::account_rows`] untrusted rows: absent rows, rows of
 /// not-fungible modules and trusted rows do not count, so dust from spam modules cannot fill
 /// an account's cap and keep a real token's row out (security review ruling).
 fn admit(txn: &mut RwTxn<'_>, it: &Item, coin: Option<u32>, caps: &Caps) -> Result<bool> {
-    if it.trusted || Some(it.module) == coin || txn.get(Table::Balances, &it.d.key)?.is_some() {
+    if Some(it.module) == coin || txn.get(Table::Balances, &it.d.key)?.is_some() {
         return Ok(true);
     }
     let t = balances::token_row(txn, it.module)?.unwrap_or_default();
-    if t.rows >= caps.module_rows {
+    // F-14: a confirmed fungible-v2 module has its own (higher) row cap.
+    let module_cap = if it.trusted {
+        caps.fungible_module_rows
+    } else {
+        caps.module_rows
+    };
+    if t.rows >= module_cap {
         if !t.capped() {
             balances::update_token(txn, it.module, |t| t.flags |= balances::TOKEN_CAPPED)?;
             tracing::warn!(
                 module = it.module_name.as_deref().unwrap_or(""),
                 rows = t.rows,
+                trusted = it.trusted,
                 "balances: module reached its row cap; new keys are dropped"
             );
         }
         return Ok(false);
+    }
+    if it.trusted {
+        return Ok(true);
     }
     let p = it.account.to_be_bytes();
     let cap = caps.account_rows as usize;
@@ -492,12 +585,46 @@ fn write_row(txn: &mut RwTxn<'_>, it: &Item, new: BalanceRow, coin: Option<u32>)
 }
 
 /// Delete the dirty key when it still holds the mark read at refill and that mark is not above
-/// `as_of` (SR-1, M-3).
+/// `as_of` (SR-1, M-3). Only for an answer read on our branch ([`branch_of`]); an `Absent`
+/// answer has no block identity to check (see the module docs).
 fn clear_if_covered(txn: &mut RwTxn<'_>, it: &Item, as_of: u32) -> Result<()> {
     if it.d.mark.height <= as_of {
         clear_mark(txn, it.d.table(), &it.d.key, it.d.mark)?;
     }
     Ok(())
+}
+
+/// D2: where an answer was read, relative to the block we hold at its height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Branch {
+    /// `prevBlockHash` equals our stored header at `as_of`: the node read our branch.
+    Ours,
+    /// We hold a header at `as_of` and it has another hash: the node read another branch.
+    Other,
+    /// No hash, an unreadable one, or no header of ours at `as_of` (the node is ahead of our
+    /// tail): the answer cannot be checked.
+    Unknown,
+}
+
+/// D2: whether the answer read the block we hold at `as_of` on its chain: its `prevBlockHash`
+/// (the hash of the node's tip, whose state `/local` read) against our stored header there. A
+/// height alone does not say which branch it is on: right after a quick reorg flip-and-back the
+/// node can still answer from the orphan's state at the same height. Shared by the fungible
+/// reconcile and the NFT fill (`nft_fill`).
+pub(crate) fn branch_of(
+    txn: &impl Txn,
+    chain: u8,
+    as_of: u32,
+    prev_hash: Option<&str>,
+) -> Result<Branch> {
+    let Some(prev) = prev_hash.and_then(|h| Hash32::from_b64url(h).ok()) else {
+        return Ok(Branch::Unknown);
+    };
+    Ok(match txn.get(Table::Headers, &block_key(chain, as_of))? {
+        Some(v) if decode_block(&v).context("hot header record")?.hash == prev => Branch::Ours,
+        Some(_) => Branch::Other,
+        None => Branch::Unknown,
+    })
 }
 
 /// Drop the mark of a call that gave no usable answer, only when it is still the mark read at
@@ -512,25 +639,36 @@ fn drop_mark(txn: &mut RwTxn<'_>, it: &Item) -> Result<()> {
 #[derive(Debug, Default, Clone)]
 pub struct BatchStats {
     pub ok: u64,
+    /// Of `ok`: answers read on a block other than the header we hold at their height (another
+    /// branch, or above our tail). Stored unverified; the key stays dirty (D2).
+    pub other_branch: u64,
+    /// Of `other_branch`: answers with no `metaData.prevBlockHash` at all.
+    pub no_hash: u64,
     pub absent: u64,
     pub skipped: u64,
     pub failures: u64,
+    /// Answers this build could not use (`LocalError::Invalid`): the key goes to the back of
+    /// the queue like a node error, is parked after [`MAX_KEY_RETRIES`] in a row, and its
+    /// module counts as failing in this batch unless another key of it answered (H-1).
+    pub invalid: u64,
     pub node_errors: u64,
     /// Keys dropped without a call or a row (`not_fungible`, `capped`).
     pub dropped: u64,
     /// Keys whose call hit a node (transport or HTTP) error, with the mark the batch wrote
     /// for them (moved up to the tail height); still dirty.
     pub node_error_keys: Vec<([u8; 9], Mark)>,
+    /// Keys with an invalid answer, with the mark the batch wrote for them; still dirty.
+    pub invalid_keys: Vec<([u8; 9], Mark)>,
     /// Modules with an answer (`ok` or `absent`) in this batch.
     pub answered: HashSet<u32>,
-    /// Non-coin modules with a failed `details` call in this batch.
+    /// Non-coin modules with a failed or invalid `details` call in this batch.
     pub failed_modules: HashSet<u32>,
 }
 
 impl BatchStats {
     /// Calls the node answered or failed (B-1 refusals and drops make none).
     pub fn calls(&self) -> u64 {
-        self.ok + self.absent + self.failures + self.node_errors
+        self.ok + self.absent + self.failures + self.invalid + self.node_errors
     }
 }
 
@@ -539,6 +677,81 @@ impl BatchStats {
 /// queue, and [`MAX_KEY_RETRIES`] parks them), and must not slow every other key.
 pub fn backs_off(st: &BatchStats) -> bool {
     st.node_errors > 0 && st.node_errors * 2 >= st.calls()
+}
+
+/// The pause before the next batch when every answer of this one was read off our branch.
+pub const OFF_BRANCH_PAUSE: Duration = Duration::from_secs(2);
+
+/// M1 (D2 review): when every answer of a batch was read off our branch, wait
+/// [`OFF_BRANCH_PAUSE`] before the next batch instead of re-reading the same keys at once.
+pub fn off_branch_pause(st: &BatchStats) -> Option<Duration> {
+    (st.other_branch > 0 && st.other_branch == st.ok + st.absent).then_some(OFF_BRANCH_PAUSE)
+}
+
+/// The pause before the next batch when every call of this one gave an invalid answer.
+pub const INVALID_PAUSE: Duration = Duration::from_secs(30);
+
+/// When every call of a batch gave an invalid answer, wait [`INVALID_PAUSE`]: invalid keys stay
+/// queued (never dropped), so a queue holding only them would otherwise re-read them at once,
+/// spinning the `/local` budget. Never stops re-reading, only spaces it out.
+pub fn invalid_pause(st: &BatchStats) -> Option<Duration> {
+    (st.invalid > 0 && st.invalid == st.calls()).then_some(INVALID_PAUSE)
+}
+
+/// The window [`BranchWatch`] judges off-branch answers over.
+pub const BRANCH_WINDOW: Duration = Duration::from_secs(60);
+/// The fewest `ok` answers in a window for [`BranchWatch`] to call off-branch answers dominant.
+pub const BRANCH_WARN_MIN: u64 = 50;
+
+/// What [`BranchWatch::note`] asks the loop to warn about.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BranchAlert {
+    /// Answers in this batch with no `prevBlockHash` (at most one warning per window).
+    pub no_hash: Option<u64>,
+    /// (off-branch, ok) in the window just ended, when off-branch answers were the majority.
+    pub dominant: Option<(u64, u64)>,
+}
+
+/// M1 (D2 review): watches off-branch answers over [`BRANCH_WINDOW`] windows. The caller
+/// passes the time, so tests drive it with made-up instants.
+#[derive(Debug, Default)]
+pub struct BranchWatch {
+    start: Option<Instant>,
+    ok: u64,
+    other: u64,
+    no_hash_warned: Option<Instant>,
+}
+
+impl BranchWatch {
+    /// Add one batch at `now`. A batch with answers lacking `prevBlockHash` alerts at once,
+    /// then at most once per window. When a window ends, it alerts if off-branch answers were
+    /// more than half of its `ok` answers and there were at least [`BRANCH_WARN_MIN`] of them;
+    /// then a new window starts.
+    pub fn note(&mut self, now: Instant, st: &BatchStats) -> BranchAlert {
+        let mut alert = BranchAlert::default();
+        if st.no_hash > 0
+            && self
+                .no_hash_warned
+                .is_none_or(|t| now.duration_since(t) >= BRANCH_WINDOW)
+        {
+            alert.no_hash = Some(st.no_hash);
+            self.no_hash_warned = Some(now);
+        }
+        let start = *self.start.get_or_insert(now);
+        self.ok += st.ok;
+        self.other += st.other_branch;
+        if now.duration_since(start) >= BRANCH_WINDOW {
+            if self.ok >= BRANCH_WARN_MIN && self.other * 2 > self.ok {
+                alert.dominant = Some((self.other, self.ok));
+            }
+            *self = BranchWatch {
+                start: Some(now),
+                no_hash_warned: self.no_hash_warned,
+                ..Default::default()
+            };
+        }
+        alert
+    }
 }
 
 /// Reconcile one batch of dirty keys.
@@ -626,7 +839,7 @@ pub async fn reconcile_batch(
             Ok(Local::Found { value, .. }) => {
                 verdict.insert((*m, *c), value);
             }
-            Ok(Local::Absent) | Err(LocalError::Failure(_)) => {
+            Ok(Local::Absent) | Err(LocalError::Failure(_) | LocalError::Invalid(_)) => {
                 verdict.insert((*m, *c), false);
             }
             Err(LocalError::Node(_) | LocalError::Skipped(_)) => {}
@@ -664,29 +877,82 @@ pub async fn reconcile_batch(
                 kdx_metrics::get().balance_reconcile("capped", 0.0);
                 st.dropped += 1;
             }
-            Outcome::Found(d, as_of, resolved) => {
-                let gj = serde_json::to_vec(&d.guard)?;
-                let gh = guard_hash(&gj);
-                txn.insert(Table::Guards, &gh, &gj)?;
-                if let Some((name, ks)) = resolved {
-                    let rk = ref_hash(it.chain, &name);
-                    match ks {
-                        Some(ks) => txn.put(Table::Guards, &rk, &serde_json::to_vec(&ks)?)?,
-                        None => {
-                            txn.del(Table::Guards, &rk)?;
+            Outcome::Found(a) => {
+                let Answer {
+                    details: d,
+                    as_of,
+                    prev_hash,
+                    resolved,
+                } = *a;
+                let branch = branch_of(&txn, it.chain, as_of, prev_hash.as_deref())?;
+                let ours = branch == Branch::Ours;
+                // L1 (D2 review): an answer known to come from another branch does not replace
+                // a row we hold: the row (balance, guard, key index) stays and is only flagged
+                // unverified. With no row yet, or when the answer cannot be checked (no hash,
+                // node ahead of our tail), the answer is stored unverified.
+                let keep_old =
+                    branch == Branch::Other && txn.get(Table::Balances, &it.d.key)?.is_some();
+                if keep_old {
+                    set_unverified(&mut txn, &it.d.key)?;
+                } else {
+                    if d.guard_capped {
+                        // F-14: stored as null (no key rows); counted for `--status`.
+                        let n = txn
+                            .meta(balances::meta::GUARDS_CAPPED)?
+                            .and_then(|v| v.try_into().ok().map(u64::from_be_bytes))
+                            .unwrap_or(0);
+                        txn.set_meta(
+                            balances::meta::GUARDS_CAPPED,
+                            &n.saturating_add(1).to_be_bytes(),
+                        )?;
+                        tracing::debug!(
+                            module = it.module_name.as_deref().unwrap_or(""),
+                            chain = it.chain,
+                            "details: guard over the size cap, stored as null"
+                        );
+                    }
+                    let gj = serde_json::to_vec(&d.guard)?;
+                    let gh = guard_hash(&gj);
+                    txn.insert(Table::Guards, &gh, &gj)?;
+                    if let Some((name, ks)) = resolved {
+                        let rk = ref_hash(it.chain, &name);
+                        match ks {
+                            Some(ks) => txn.put(Table::Guards, &rk, &serde_json::to_vec(&ks)?)?,
+                            None => {
+                                txn.del(Table::Guards, &rk)?;
+                            }
                         }
                     }
+                    let row = BalanceRow {
+                        absent: false,
+                        balance: d.balance,
+                        guard: gh,
+                        as_of,
+                        reconciled_at: now,
+                        unverified: !ours,
+                    };
+                    write_row(&mut txn, it, row, coin)?;
                 }
-                let row = BalanceRow {
-                    absent: false,
-                    balance: d.balance,
-                    guard: gh,
-                    as_of,
-                    reconciled_at: now,
-                    unverified: false,
-                };
-                write_row(&mut txn, it, row, coin)?;
-                clear_if_covered(&mut txn, it, as_of)?;
+                if ours {
+                    clear_if_covered(&mut txn, it, as_of)?;
+                } else {
+                    // D2: read on another branch (or above our tail). Served `stale`; the key
+                    // stays dirty and goes to the back of the queue, like a node error but
+                    // without a retry count (it is not the key's fault).
+                    tracing::debug!(
+                        chain = it.chain,
+                        as_of,
+                        prev_hash = prev_hash.as_deref().unwrap_or(""),
+                        ?branch,
+                        "details answer is not on our branch; kept dirty"
+                    );
+                    balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                    kdx_metrics::get().balance_reconcile("other_branch", 0.0);
+                    st.other_branch += 1;
+                    if prev_hash.is_none() {
+                        st.no_hash += 1;
+                    }
+                }
                 st.ok += 1;
                 st.answered.insert(it.module);
             }
@@ -711,6 +977,18 @@ pub async fn reconcile_batch(
             Outcome::Failure => {
                 drop_mark(&mut txn, it)?;
                 st.failures += 1;
+                if Some(it.module) != coin {
+                    st.failed_modules.insert(it.module);
+                }
+            }
+            Outcome::Invalid => {
+                // To the back of the queue, like a node error but without a backoff: the
+                // answer came, only this build cannot use it. The mark is not dropped here;
+                // [`MAX_KEY_RETRIES`] invalid answers in a row park the key (H-1), and a module
+                // whose every answer is unusable counts as failing (R-P5P9-8 #2).
+                let m = balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                st.invalid += 1;
+                st.invalid_keys.push((it.d.key, m));
                 if Some(it.module) != coin {
                     st.failed_modules.insert(it.module);
                 }
@@ -813,6 +1091,145 @@ async fn seed_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
     Ok(!rep.stopped)
 }
 
+/// D1: the receivers pass of the seed (`seed_receivers`), when the store has not had it, or
+/// its stored history below coin v3 grew since. Postponed (to the next recheck) while the
+/// store is not ready for it (review L3). It runs inline: tail dirty rows wait until it ends
+/// (review L4). Returns false when stopped.
+///
+/// D3 (`Rules::D3`): the token receivers pass, same mechanics over every stored height; after
+/// its first walk it is pending again whenever the tail grew, and walks only the new heights.
+use crate::seed_receivers::Rules;
+
+async fn receivers_pass(
+    ctx: &Arc<Ctx>,
+    stop: &CancellationToken,
+    rules: crate::seed_receivers::Rules,
+) -> Result<bool> {
+    let opts = crate::seed_receivers::Opts {
+        forks: crate::seed_receivers::forks_for(&ctx.opts.network),
+        rules,
+        rewalk_every_secs: crate::seed_receivers::REWALK_EVERY_SECS,
+        // Walked in slices by the loop (`history_slice`), never inline (re-review N2).
+        history_inline: false,
+        ..Default::default()
+    };
+    let Some((from, to)) = crate::seed_receivers::pending_for(&ctx.hot.ro()?, &opts)? else {
+        return Ok(true);
+    };
+    if let Err(e) = crate::seed_receivers::check_ready(&ctx.hot.ro()?, &ctx.segdir) {
+        tracing::warn!(error = %e, ?rules, "balances: receivers pass postponed");
+        return Ok(true);
+    }
+    tracing::info!(
+        from,
+        to,
+        ?rules,
+        "balances: marking receivers no event names (D1: coin below coin v3; D3: all modules)"
+    );
+    let (c, s) = (ctx.clone(), stop.clone());
+    let rep = tokio::task::spawn_blocking(move || {
+        crate::seed_receivers::run(&c.hot, &c.dict, &c.segdir, &opts, &|| s.is_cancelled())
+    })
+    .await??;
+    if rep.errors > 0 {
+        tracing::error!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended with errors");
+    } else {
+        tracing::info!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended");
+    }
+    Ok(!rep.stopped)
+}
+
+/// The loop's D3 history walk (re-review N2): the walk in progress, and when to try again
+/// after an error.
+#[derive(Default)]
+struct History {
+    walk: Option<crate::seed_receivers::HistoryWalk>,
+    retry_at: Option<Instant>,
+}
+
+/// Pause before a failed history slice is tried again.
+const HISTORY_RETRY: Duration = Duration::from_secs(60);
+
+/// Re-review N2: one bounded slice of the D3 history walk for newly tracked tokens (begun or
+/// resumed from its persisted cursor), so tail marks and NFT steps keep flowing while it runs.
+/// Returns whether it walked anything (the loop then does not idle). Errors are logged and
+/// retried after [`HISTORY_RETRY`], never fatal.
+async fn history_slice(ctx: &Arc<Ctx>, h: &mut History, slice: u64) -> Result<bool> {
+    if h.retry_at.is_some_and(|t| Instant::now() < t) {
+        return Ok(false);
+    }
+    let opts = crate::seed_receivers::Opts {
+        forks: crate::seed_receivers::forks_for(&ctx.opts.network),
+        rules: Rules::D3,
+        rewalk_every_secs: crate::seed_receivers::REWALK_EVERY_SECS,
+        ..Default::default()
+    };
+    let (c, mut walk) = (ctx.clone(), h.walk.take());
+    let (walk, r) = tokio::task::spawn_blocking(move || {
+        let r = (|| -> Result<Option<crate::seed_receivers::HistoryStep>> {
+            if walk.is_none() {
+                walk = crate::seed_receivers::history_begin(&c.hot, &c.dict, &opts)?;
+            }
+            match walk.as_mut() {
+                Some(w) => Ok(Some(w.step(&c.hot, &c.dict, &c.segdir, &opts, slice)?)),
+                None => Ok(None),
+            }
+        })();
+        (walk, r)
+    })
+    .await?;
+    match r {
+        Ok(Some(s)) => {
+            if s.done {
+                tracing::info!(tokens = s.tokens, report = %serde_json::to_string(&s.report)?,
+                    "balances: D3 history walk ended");
+            } else {
+                h.walk = walk;
+            }
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => {
+            // The next try resumes from the persisted cursor.
+            tracing::warn!(error = %e, "balances: D3 history walk slice failed; retried later");
+            h.retry_at = Some(Instant::now() + HISTORY_RETRY);
+            Ok(false)
+        }
+    }
+}
+
+/// `describe-module` reads per reconcile round for the D3 discovery queue (review M1).
+pub const DISCOVER_READS_PER_ROUND: usize = 4;
+
+/// Review M1: check a few queued discovered modules with the node; a module whose
+/// `describe-module` lists `fungible-v2` on that chain becomes a tracked token.
+async fn discovery_step(ctx: &Arc<Ctx>, local: &LocalClient) -> Result<()> {
+    let queued = kdx_hot::balances::discovered_queue(&ctx.hot.ro()?, DISCOVER_READS_PER_ROUND)?;
+    if queued.is_empty() {
+        return Ok(());
+    }
+    let answers = join_all(
+        queued
+            .iter()
+            .map(|(m, c, _)| local.implements_fungible(*c, m)),
+    )
+    .await;
+    let verdicts: Vec<Option<bool>> = answers
+        .into_iter()
+        .map(|r| match r {
+            Ok(Local::Found { value, .. }) => Some(value),
+            Ok(Local::Absent) | Err(LocalError::Failure(_) | LocalError::Invalid(_)) => Some(false),
+            Err(LocalError::Node(_) | LocalError::Skipped(_)) => None,
+        })
+        .collect();
+    let (tracked, rejected) =
+        crate::seed_receivers::check_discovered(&ctx.hot, &ctx.dict, &queued, &verdicts)?;
+    if tracked + rejected > 0 {
+        tracing::info!(tracked, rejected, "balances: D3 discovered modules checked");
+    }
+    Ok(())
+}
+
 /// M-11: the tail applied blocks without dirty marks (`[balances] enabled = false`, or an
 /// older binary on this store). Clears the gap flag and the seed's done flag and cursor, so the
 /// seed marks every known row again (behind the tail marks). Returns whether there was a gap.
@@ -870,11 +1287,27 @@ fn nft_failed(e: &anyhow::Error, retry: Duration) {
     );
 }
 
-/// Write the heartbeat and the dirty gauge.
-fn heartbeat(ctx: &Ctx, done: u64, rate: f64) -> Result<usize> {
+/// Rows cleared per second of wall-clock time since the loop started: refill, discovery, the
+/// history slice, the NFT steps and idle waits all count (unlike the in-batch `rate`, which
+/// times `reconcile_batch` alone). Zero until a second has passed, so a first fast batch does
+/// not report a huge rate.
+fn wall_rate(done: u64, elapsed: Duration) -> f64 {
+    let secs = elapsed.as_secs_f64();
+    if secs < 1.0 {
+        0.0
+    } else {
+        done as f64 / secs
+    }
+}
+
+/// Write the heartbeat and the dirty gauge. `rate` is the in-batch EWMA, `wall_rate` the
+/// wall-clock throughput of the loop ([`wall_rate`]); `--status` bases its ETA on the latter.
+fn heartbeat(ctx: &Ctx, done: u64, rate: f64, wall_rate: f64) -> Result<usize> {
     let dirty = balances::dirty_count(&ctx.hot.ro()?)?;
     kdx_metrics::get().balance_dirty_rows.set(dirty as i64);
-    let s = json!({"t": now_unix(), "done": done, "rate": rate, "dirty": dirty});
+    let s = json!({
+        "t": now_unix(), "done": done, "rate": rate, "wall_rate": wall_rate, "dirty": dirty
+    });
     let mut txn = ctx.hot.rw()?;
     txn.set_meta(META_STATS, s.to_string().as_bytes())?;
     txn.commit()?;
@@ -919,7 +1352,31 @@ async fn run_with(
     if o.seed && !crate::seed::seeded(&ctx.hot.ro()?)? && !seed_pass(&ctx, &stop).await? {
         return Ok(());
     }
-    let local = LocalClient::new(node, o.local);
+    for rules in [Rules::D1, Rules::D3] {
+        if o.seed && !receivers_pass(&ctx, &stop, rules).await? {
+            return Ok(());
+        }
+    }
+    let local = Arc::new(LocalClient::new(node, o.local));
+    // D3 gap groups 3 and 4: rows no tx names, from the node's key listing, in its own task
+    // (PR #27 H-1: a slow listing read never holds up this loop). It shares the `/local`
+    // limits and ends with this loop (the guard cancels it on every return).
+    let keylist_stop = stop.child_token();
+    let _keylist_guard = keylist_stop.clone().drop_guard();
+    if o.seed && !crate::keylist::enabled(o.local.concurrency) {
+        tracing::warn!(
+            "balances: key listing off: balances.local_concurrency = 1 would let one listing read hold the only /local slot"
+        );
+    }
+    if o.seed && crate::keylist::enabled(o.local.concurrency) {
+        tokio::spawn(crate::keylist::run(
+            ctx.clone(),
+            local.clone(),
+            o.caps,
+            o.keylist_skip.clone(),
+            keylist_stop,
+        ));
+    }
     let mut nft_cursor: Option<Vec<u8>> = None;
     let mut details_cursor: Option<Vec<u8>> = None;
     let mut backoff: Option<Duration> = None;
@@ -928,7 +1385,10 @@ async fn run_with(
     let mut last_recheck: Option<Instant> = None;
     let mut done = 0u64;
     let mut rate = 0.0f64;
+    let started = Instant::now();
     let mut last_log = Instant::now();
+    let mut watch = BranchWatch::default();
+    let mut history = History::default();
     loop {
         if stop.is_cancelled() {
             return Ok(());
@@ -950,12 +1410,25 @@ async fn run_with(
             }
         }
         if last_recheck.is_none_or(|t| t.elapsed() >= RECHECK_SCAN) {
+            // D1: a tail still below coin v3 stores new pre-v3 txs; their receivers too.
+            // D3: the new heights of the tail (credits of tokens no TRANSFER names).
+            for rules in [Rules::D1, Rules::D3] {
+                if o.seed && last_recheck.is_some() && !receivers_pass(&ctx, &stop, rules).await? {
+                    return Ok(());
+                }
+            }
             let n = recheck_not_fungible(&ctx.hot, now_unix(), o.caps.recheck_secs)?;
             if n > 0 {
                 tracing::info!(modules = n, "balances: not-fungible modules re-checked");
             }
             last_recheck = Some(Instant::now());
         }
+        if o.seed {
+            if let Err(e) = discovery_step(&ctx, &local).await {
+                tracing::warn!(error = %e, "balances: D3 discovery check failed; retried next round");
+            }
+        }
+        let walked = o.seed && history_slice(&ctx, &mut history, o.caps.history_slice_txs).await?;
         // NFT rows (plan Task 11) share the `/local` budget; the table is small, so one step
         // per loop keeps them current even behind a long balance backlog.
         let nft = crate::nft_fill::step(&ctx.hot, &local, &mut nft_cursor).await?;
@@ -974,7 +1447,11 @@ async fn run_with(
             kdx_metrics::get()
                 .balance_dirty_rows
                 .set(balances::dirty_count(&ctx.hot.ro()?)? as i64);
-            if nft.rows() > nft.node_errors || det.calls() > det.node_errors {
+            // Off-branch NFT answers (D2) are not progress either: no immediate re-loop.
+            if walked
+                || nft.rows() > nft.node_errors + nft.other_branch
+                || det.calls() > det.node_errors
+            {
                 continue;
             }
             tokio::select! {
@@ -988,29 +1465,36 @@ async fn run_with(
         done += k;
         let r = k as f64 / t0.elapsed().as_secs_f64().max(1e-3);
         rate = if rate == 0.0 { r } else { 0.8 * rate + 0.2 * r };
-        let dirty = heartbeat(&ctx, done, rate)?;
+        let wall = wall_rate(done, started.elapsed());
+        let dirty = heartbeat(&ctx, done, rate, wall)?;
         if last_log.elapsed() > Duration::from_secs(60) {
             tracing::info!(
                 done,
                 dirty,
                 rate = format!("{rate:.1}"),
+                wall_rate = format!("{wall:.1}"),
                 ?st,
                 "balances: reconcile"
             );
             last_log = Instant::now();
         }
-        let gone = note_failures(&mut fails, &st);
-        if !gone.is_empty() {
-            mark_not_fungible(&ctx.hot, &gone)?;
+        after_batch(&ctx.hot, &mut fails, &mut retries, &batch, &st)?;
+        let alert = watch.note(Instant::now(), &st);
+        if let Some(n) = alert.no_hash {
             tracing::warn!(
-                modules = ?gone,
-                "balances: modules whose details calls keep failing are marked not fungible"
+                answers = n,
+                "balances: /local answers carry no metaData.prevBlockHash; rows cannot be \
+                 verified and stay queued (D2)"
             );
         }
-        let refill_keys: Vec<([u8; 9], Mark)> = batch.iter().map(|d| (d.key, d.mark)).collect();
-        let parked = parked_after(&mut retries, &refill_keys, &st);
-        if !parked.is_empty() {
-            park(&ctx.hot, &parked)?;
+        if let Some((other, ok)) = alert.dominant {
+            tracing::warn!(
+                other_branch = other,
+                ok,
+                window_secs = BRANCH_WINDOW.as_secs(),
+                "balances: most /local answers are not on our branch; rows stay unverified \
+                 (node off our cut, behind a balancer, or our tail lagging)"
+            );
         }
         if backs_off(&st) {
             let d = backoff.map_or(Duration::from_secs(1), |d| (d * 2).min(BACKOFF_MAX));
@@ -1026,8 +1510,56 @@ async fn run_with(
             }
         } else {
             backoff = None;
+            // M1: every answer was off our branch; re-reading the same keys at once would
+            // only spin the `/local` budget. Never stops re-reading, only spaces it out.
+            if let Some(d) = off_branch_pause(&st) {
+                tracing::debug!(
+                    answers = st.other_branch,
+                    "balances: batch all off-branch, pausing"
+                );
+                tokio::select! {
+                    _ = stop.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(d) => {}
+                }
+            } else if let Some(d) = invalid_pause(&st) {
+                tracing::warn!(
+                    invalid = st.invalid,
+                    "balances: every answer of the batch was unusable; keys kept, pausing"
+                );
+                tokio::select! {
+                    _ = stop.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(d) => {}
+                }
+            }
         }
     }
+}
+
+/// The bookkeeping after a batch: modules failing [`NOT_FUNGIBLE_AFTER`] batches in a row are
+/// marked not fungible ([`note_failures`]), keys failing [`MAX_KEY_RETRIES`] batches in a row
+/// are parked ([`parked_after`]).
+pub fn after_batch(
+    hot: &HotStore,
+    fails: &mut HashMap<u32, u32>,
+    retries: &mut HashMap<[u8; 9], u32>,
+    batch: &[Dirty],
+    st: &BatchStats,
+) -> Result<()> {
+    let gone = note_failures(fails, st);
+    if !gone.is_empty() {
+        mark_not_fungible(hot, &gone)?;
+        tracing::warn!(
+            modules = ?gone,
+            "balances: modules whose details calls keep failing are marked not fungible"
+        );
+    }
+    let refill_keys: Vec<([u8; 9], Mark)> = batch.iter().map(|d| (d.key, d.mark)).collect();
+    let parked = parked_after(retries, &refill_keys, st);
+    if !parked.is_empty() {
+        let invalid: HashSet<[u8; 9]> = st.invalid_keys.iter().map(|(k, _)| *k).collect();
+        park_keys(hot, &parked, &invalid)?;
+    }
+    Ok(())
 }
 
 /// The keys to park after a batch (SR-2): none when the batch backs off (the node itself is
@@ -1041,10 +1573,16 @@ pub fn parked_after(
         retries.clear();
         return Vec::new();
     }
-    count_retries(retries, batch, &st.node_error_keys)
+    let errored: Vec<([u8; 9], Mark)> = st
+        .node_error_keys
+        .iter()
+        .chain(&st.invalid_keys)
+        .copied()
+        .collect();
+    count_retries(retries, batch, &errored)
 }
 
-/// Count consecutive node errors per key of a batch: keys that answered are forgotten; the
+/// Count consecutive node errors or invalid answers per key of a batch: keys that answered are forgotten; the
 /// keys that reached [`MAX_KEY_RETRIES`] are returned (and forgotten) for parking, with the
 /// mark the batch wrote for them.
 pub fn count_retries(
@@ -1077,18 +1615,37 @@ pub fn count_retries(
 /// when it is still the mark the failing batch wrote (SR-1): a tail mark written since
 /// survives. A parked key's row is flagged unverified (I-5).
 pub fn park(hot: &HotStore, keys: &[([u8; 9], Mark)]) -> Result<()> {
+    park_keys(hot, keys, &HashSet::new())
+}
+
+/// [`park`], and the keys in `invalid` (parked for unusable answers, H-1) also go to the
+/// parked-invalid list (`balances::parked_invalid`) for inspection and the explicit retry
+/// pass (`reconcile-balances --all`), so they are not lost when no new tail mark comes.
+pub fn park_keys(
+    hot: &HotStore,
+    keys: &[([u8; 9], Mark)],
+    invalid: &HashSet<[u8; 9]>,
+) -> Result<()> {
+    let now = now_unix();
+    let (mut parked, mut listed) = (0usize, 0usize);
     let mut txn = hot.rw()?;
     for (k, m) in keys {
         if clear_mark(&mut txn, Table::BalanceDirty, k, *m)? {
             set_unverified(&mut txn, k)?;
             kdx_metrics::get().balance_reconcile("parked", 0.0);
+            parked += 1;
+            if invalid.contains(k) && balances::record_parked_invalid(&mut txn, k, now)? {
+                listed += 1;
+            }
         }
     }
     txn.commit()?;
     tracing::warn!(
-        keys = keys.len(),
+        keys = parked,
+        invalid_listed = listed,
         retries = MAX_KEY_RETRIES,
-        "balances: parked keys that kept failing at the node until their next tail mark"
+        "balances: parked keys that kept failing at the node or answering unusably until \
+         their next tail mark (unusable ones listed for reconcile-balances --all)"
     );
     Ok(())
 }
@@ -1102,7 +1659,7 @@ pub async fn supervise(
     stop: CancellationToken,
 ) -> Result<()> {
     loop {
-        match run(ctx.clone(), node.clone(), o, stop.clone()).await {
+        match run(ctx.clone(), node.clone(), o.clone(), stop.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => tracing::error!(
                 error = format!("{e:#}"),
@@ -1118,80 +1675,154 @@ pub async fn supervise(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::sync::Mutex;
 
     use kdx_hot::{Geometry, HotDict, HotStore};
     use kdx_node::{ChainGraph, NodeClientConfig, NodeInfo};
-    use kdx_types::DictMut;
+    use kdx_types::{DictMut, Hash32};
 
     use super::*;
     use crate::IngestOpts;
 
+    /// The hash of the header [`setup`] stores at chain 0 height 10: the fake node's tip.
+    pub(crate) fn tip_hash() -> Hash32 {
+        Hash32([0x11; 32])
+    }
+
+    /// Store a header at (`chain`, `height`) with `hash`, as the tail would.
+    pub(crate) fn put_header(hot: &HotStore, chain: u8, height: u32, hash: Hash32) {
+        let br = kdx_types::record::BlockRecord {
+            hash,
+            chain,
+            height: u64::from(height),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        kdx_types::record::encode_block(&br, &mut buf);
+        let mut txn = hot.rw().unwrap();
+        txn.put(
+            Table::Headers,
+            &kdx_hot::tables::block_key(chain, height),
+            &buf,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
     /// A fake node: `/local` answers a success for every account except `bad`, whose answer
-    /// arrives but has no balance. One connection at a time (`Connection: close`).
-    fn fake_node() -> String {
+    /// arrives but has no balance (invalid), and `fails`, a pact failure; an NFT `get-balance` (data `t`) answers 2.0. Every success
+    /// reads tip height 10 (`blockHeight` 11) and names the tip's hash as `prevBlockHash`: the
+    /// text in `prev`, read per answer (empty: no `prevBlockHash` at all). One
+    /// connection at a time (`Connection: close`).
+    /// `describe-module` reads the fake node received (all tests of this module).
+    static DESCRIBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub(crate) fn fake_node(prev: Arc<Mutex<String>>) -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         std::thread::spawn(move || {
             for s in l.incoming() {
                 let Ok(mut s) = s else { return };
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 4096];
-                let (head_end, len) = loop {
-                    let n = s.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break (0, 0);
+                let prev = prev.clone();
+                // One thread per connection: a hung answer holds up no other.
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let (head_end, len) = loop {
+                        let n = s.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break (0, 0);
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (i + 4, len);
+                        }
+                    };
+                    while head_end > 0 && buf.len() < head_end + len {
+                        let n = s.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
                     }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
-                        let len = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        break (i + 4, len);
+                    let req: Value =
+                        serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                    let cmd: Value = req
+                        .get("cmd")
+                        .and_then(Value::as_str)
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or(Value::Null);
+                    let acct = cmd
+                        .pointer("/payload/exec/data/a")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let m = cmd.pointer("/payload/exec/data/m").and_then(Value::as_str);
+                    let code = cmd
+                        .pointer("/payload/exec/code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if code.starts_with("(at 'code (describe-module") {
+                        // PR #27 H-1: the key listing's read hangs (a table too big to answer).
+                        DESCRIBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_secs(30));
+                        return;
                     }
-                };
-                while head_end > 0 && buf.len() < head_end + len {
-                    let n = s.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                }
-                let req: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
-                let cmd: Value = req
-                    .get("cmd")
-                    .and_then(Value::as_str)
-                    .and_then(|c| serde_json::from_str(c).ok())
-                    .unwrap_or(Value::Null);
-                let acct = cmd
-                    .pointer("/payload/exec/data/a")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let m = cmd.pointer("/payload/exec/data/m").and_then(Value::as_str);
-                let body = if let Some(m) = m {
+                    let prev = prev.lock().unwrap().clone();
+                    let meta = if prev.is_empty() {
+                        json!({"blockHeight": 11})
+                    } else {
+                        json!({"blockHeight": 11, "prevBlockHash": prev})
+                    };
+                    let body = if let Some(m) = m {
                     // The fungible check: only `free.tok` lists fungible-v2.
                     json!({"result": {"status": "success", "data": m == "free.tok"},
-                           "metaData": {"blockHeight": 11}})
-                } else if acct == "bad" {
+                           "metaData": meta.clone()})
+                } else if cmd.pointer("/payload/exec/data/t").is_some() {
+                    // An NFT `get-balance`.
+                    json!({"result": {"status": "success", "data": 2.0}, "metaData": meta.clone()})
+                } else if acct == "huge" {
+                    // F-14: a guard over the 4096-byte cap.
+                    json!({"result": {"status": "success", "data": {"account": acct,
+                           "balance": 1.5, "guard": {"keys": ["k".repeat(5000)],
+                           "pred": "keys-all"}}}, "metaData": meta.clone()})
+                } else if acct == "wide" {
+                    // F-14: a keyset of 65 keys.
+                    let keys: Vec<String> = (0..65).map(|i| format!("w{i}")).collect();
+                    json!({"result": {"status": "success", "data": {"account": acct,
+                           "balance": 1.5, "guard": {"keys": keys, "pred": "keys-all"}}},
+                           "metaData": meta.clone()})
+                } else if acct == "wiza" {
+                    // D3 gap group 2: a full-precision Pact decimal (255 places, 257 bytes).
+                    json!({"result": {"status": "success", "data": {"account": acct,
+                           "balance": {"decimal": wiza_balance()}, "guard": null}},
+                           "metaData": meta.clone()})
+                } else if acct == "fails" {
+                    json!({"result": {"status": "failure", "error": {"message": "boom"}},
+                           "metaData": meta.clone()})
+                } else if acct.starts_with("bad") {
                     json!({"result": {"status": "success", "data": {"guard": null}},
-                           "metaData": {"blockHeight": 11}})
+                           "metaData": meta.clone()})
                 } else {
                     json!({"result": {"status": "success", "data": {"account": acct,
                            "balance": 1.5, "guard": {"keys": ["k1"], "pred": "keys-all"}}},
-                           "metaData": {"blockHeight": 11}})
+                           "metaData": meta.clone()})
                 }
                 .to_string();
-                let _ = write!(
+                    let _ = write!(
                     s,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                      Connection: close\r\n\r\n{body}",
                     body.len()
                 );
+                });
             }
         });
         format!("http://{addr}")
@@ -1236,12 +1867,23 @@ mod tests {
             balances::mark_dirty(&mut txn, a, coin, 0, 10).unwrap();
         }
         txn.commit().unwrap();
+        put_header(&hot, 0, 10, tip_hash());
         (hot, coin, ids)
     }
 
+    /// A client of a fake node whose answers name the stored tip (`tip_hash`).
     fn client(dir: &std::path::Path, hot: &Arc<HotStore>) -> (Ctx, LocalClient) {
+        client_on(dir, hot, Arc::new(Mutex::new(tip_hash().to_b64url())))
+    }
+
+    /// A client of a fake node whose answers name `prev` as `prevBlockHash`.
+    pub(crate) fn client_on(
+        dir: &std::path::Path,
+        hot: &Arc<HotStore>,
+        prev: Arc<Mutex<String>>,
+    ) -> (Ctx, LocalClient) {
         let node = NodeClient::new(&NodeClientConfig {
-            base: fake_node().parse().unwrap(),
+            base: fake_node(prev).parse().unwrap(),
             network: "mainnet01".into(),
             timeout: Duration::from_secs(5),
             max_rps: 0,
@@ -1286,23 +1928,59 @@ mod tests {
             .and_then(Mark::decode)
     }
 
-    /// One key whose answer is unusable is dropped as a failure; the other keys of the batch
-    /// reconcile, and the batch does not back off.
+    fn row_of(hot: &HotStore, k: &[u8; 9]) -> BalanceRow {
+        BalanceRow::decode(&hot.ro().unwrap().get(Table::Balances, k).unwrap().unwrap()).unwrap()
+    }
+
+    /// The `free.wiza` balance text of D3 gap group 2 (`0.0161938904166666…`, 255 places).
+    pub(crate) fn wiza_balance() -> String {
+        format!("0.0161938904166666{}8", "6".repeat(255 - 17))
+    }
+
+    /// D3 gap group 2: a 257-byte Pact decimal is a balance like any other.
+    #[tokio::test]
+    async fn a_full_precision_decimal_balance_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["wiza"]);
+        let (ctx, local) = client(dir.path(), &hot);
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.failures, st.invalid), (1, 0, 0), "{st:?}");
+        let txn = hot.ro().unwrap();
+        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 0);
+        let rows = balances::account_rows(&txn, 0).unwrap();
+        assert_eq!(rows[0].2.balance, wiza_balance());
+        assert!(rows[0].2.positive());
+    }
+
+    /// One key whose answer is unusable is counted as `invalid` and stays queued (moved to the
+    /// back, never dropped: D3 gap group 2 lost 364 rows that way); the other keys of the batch
+    /// reconcile, the batch does not back off and the module is not counted as failing.
     #[tokio::test]
     async fn one_invalid_answer_does_not_stall_the_batch() {
         let dir = tempfile::tempdir().unwrap();
-        let (hot, _, _) = setup(dir.path(), &["alice", "bad", "carol"]);
+        let (hot, coin, ids) = setup(dir.path(), &["alice", "bad", "carol"]);
         let (ctx, local) = client(dir.path(), &hot);
         let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
         assert_eq!(keys.len(), 3);
         let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
             .await
             .unwrap();
-        assert_eq!((st.ok, st.failures, st.node_errors), (2, 1, 0));
+        assert_eq!(
+            (st.ok, st.failures, st.invalid, st.node_errors),
+            (2, 0, 1, 0)
+        );
+        assert!(st.failed_modules.is_empty());
         assert!(!backs_off(&st));
+        let bad = balances::bal_key(ids[1], coin, 0);
+        assert_eq!(st.invalid_keys.len(), 1);
+        assert_eq!(st.invalid_keys[0].0, bad);
         let txn = hot.ro().unwrap();
-        // as_of = blockHeight 11 − 1 covers the marks at 10; the bad key's mark is dropped.
-        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 0);
+        // as_of = blockHeight 11 − 1 covers the marks at 10; the bad key's mark is kept.
+        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 1);
+        assert!(txn.get(Table::BalanceDirty, &bad).unwrap().is_some());
         assert_eq!(txn.count(Table::Balances).unwrap(), 2);
         assert_eq!(txn.count(Table::KeyAccounts).unwrap(), 2);
         let rows = balances::account_rows(&txn, 0).unwrap();
@@ -1315,7 +1993,8 @@ mod tests {
     #[tokio::test]
     async fn a_mark_raised_after_the_read_survives_drop_skip_and_park() {
         let dir = tempfile::tempdir().unwrap();
-        let (hot, coin, ids) = setup(dir.path(), &["bad", "parked"]);
+        // `fails`: the node answers a pact failure (a dropped mark); see `fake_node`.
+        let (hot, coin, ids) = setup(dir.path(), &["fails", "parked"]);
         let (bad, parked) = (ids[0], ids[1]);
         let skip = balances::bal_key(bad, 999, 0); // module id with no name: skipped
         let old_row = BalanceRow {
@@ -1393,8 +2072,96 @@ mod tests {
         assert!(row(&hot).unverified);
     }
 
-    /// M-3: a reorg between the read and the clear re-marks the key at the same height; the
-    /// answer still covers that height, but the newer mark is kept for the next read.
+    /// H-1 (PR #26 review): modules whose `details` answer is never usable (here every key
+    /// answers without a balance) are marked not fungible after [`NOT_FUNGIBLE_AFTER`] batches,
+    /// like failing ones. Their keys then stop taking batch slots, so the seed backlog (where
+    /// `--rewalk` puts its marks) is read again and coin keeps progressing.
+    #[tokio::test]
+    async fn modules_with_unusable_answers_stop_taking_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["carol"]);
+        let junk = intern(&hot, DictKind::Module, &["free.junk1", "free.junk2"]);
+        let names: Vec<String> = (0..12).map(|i| format!("bad{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let accts = intern(&hot, DictKind::Account, &refs);
+        for (i, a) in accts.iter().enumerate() {
+            mark(&hot, *a, junk[i % 2], 0, 10);
+        }
+        let alice = intern(&hot, DictKind::Account, &["alice"])[0];
+        let seed_key = balances::bal_key(alice, coin, 0);
+        let mut txn = hot.rw().unwrap();
+        balances::seed_mark(&mut txn, &seed_key, &Mark { height: 0, seq: 1 }.encode()).unwrap();
+        txn.commit().unwrap();
+        let (ctx, local) = client(dir.path(), &hot);
+        let (mut fails, mut retries) = (HashMap::new(), HashMap::new());
+        let mut invalid = 0;
+        for _ in 0..NOT_FUNGIBLE_AFTER + 3 {
+            let keys = refill(&hot, 8, 4).unwrap();
+            if keys.is_empty() {
+                break;
+            }
+            let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+                .await
+                .unwrap();
+            invalid += st.invalid;
+            after_batch(&hot, &mut fails, &mut retries, &keys, &st).unwrap();
+        }
+        assert!(invalid > 0);
+        let txn = hot.ro().unwrap();
+        for m in &junk {
+            let t = balances::token_row(&txn, *m).unwrap().unwrap();
+            assert_eq!(t.kind, KIND_NOT_FUNGIBLE);
+        }
+        assert_eq!(balances::dirty_count(&txn).unwrap(), 0);
+        assert!(txn.get(Table::Balances, &seed_key).unwrap().is_some());
+        assert!(txn
+            .get(Table::Balances, &balances::bal_key(ids[0], coin, 0))
+            .unwrap()
+            .is_some());
+    }
+
+    /// H-1: a key whose answer stays unusable while its module answers for others is parked
+    /// after [`MAX_KEY_RETRIES`] batches (no more batch slots), counted as invalid each time,
+    /// and kept in the parked-invalid list; the explicit pass (`reconcile-balances --all`)
+    /// puts it back in the seed backlog.
+    #[tokio::test]
+    async fn an_unusable_key_is_parked_and_kept_for_a_retry_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice", "bad"]);
+        let bad = balances::bal_key(ids[1], coin, 0);
+        let (ctx, local) = client(dir.path(), &hot);
+        let (mut fails, mut retries) = (HashMap::new(), HashMap::new());
+        for i in 0..MAX_KEY_RETRIES {
+            assert!(mark_of(&hot, &bad).is_some(), "batch {i}");
+            let keys = refill(&hot, 8, 4).unwrap();
+            let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+                .await
+                .unwrap();
+            assert_eq!(st.invalid, 1, "batch {i}");
+            after_batch(&hot, &mut fails, &mut retries, &keys, &st).unwrap();
+        }
+        assert!(mark_of(&hot, &bad).is_none());
+        assert!(refill(&hot, 8, 4).unwrap().is_empty());
+        assert_eq!(
+            balances::parked_invalid(&hot.ro().unwrap()).unwrap(),
+            vec![bad]
+        );
+        let mut txn = hot.rw().unwrap();
+        assert_eq!(balances::requeue_parked_invalid(&mut txn).unwrap(), 1);
+        txn.commit().unwrap();
+        assert!(balances::parked_invalid(&hot.ro().unwrap())
+            .unwrap()
+            .is_empty());
+        let keys = refill(&hot, 8, 4).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].key == bad && keys[0].seed);
+    }
+
+    /// M-3 and D2: a reorg between the read and the clear re-marks the key at the same height;
+    /// the newer mark is kept for the next read. That next read can still come from the orphan's
+    /// state at the same height (a quick flip-and-back): its `prevBlockHash` names the orphan,
+    /// so the mark survives and the row is stored unverified. Only an answer read on the block
+    /// we hold at that height clears it.
     #[tokio::test]
     async fn a_reorg_between_read_and_clear_keeps_the_newer_mark() {
         let dir = tempfile::tempdir().unwrap();
@@ -1410,7 +2177,11 @@ mod tests {
         }
         assert_eq!(mark_of(&hot, &k).map(|m| m.height), Some(10));
         assert_ne!(mark_of(&hot, &k), Some(keys[0].mark));
-        let (ctx, local) = client(dir.path(), &hot);
+        // The re-apply put the other branch's block at 10; the node still reads the orphan.
+        let canon = Hash32([0x22; 32]);
+        put_header(&hot, 0, 10, canon);
+        let prev = Arc::new(Mutex::new(tip_hash().to_b64url()));
+        let (ctx, local) = client_on(dir.path(), &hot, prev.clone());
         let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
             .await
             .unwrap();
@@ -1420,7 +2191,244 @@ mod tests {
         reconcile_batch(&ctx, &local, &keys, &Caps::default())
             .await
             .unwrap();
+        assert!(
+            mark_of(&hot, &k).is_some(),
+            "an answer read on the orphan must not clear the mark"
+        );
+        assert!(row_of(&hot, &k).unverified);
+        // The node moves to our branch: the next read clears the mark.
+        *prev.lock().unwrap() = canon.to_b64url();
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
         assert!(mark_of(&hot, &k).is_none());
+        assert!(!row_of(&hot, &k).unverified);
+    }
+
+    /// D2: an answer whose `prevBlockHash` is not the header we hold at its height (another
+    /// branch) is stored unverified (served `stale`) and its mark stays queued; the same read
+    /// on our branch clears the mark and verifies the row.
+    #[tokio::test]
+    async fn an_answer_from_another_branch_keeps_the_mark_and_serves_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        let k = balances::bal_key(ids[0], coin, 0);
+        let prev = Arc::new(Mutex::new(Hash32([0x33; 32]).to_b64url()));
+        let (ctx, local) = client_on(dir.path(), &hot, prev.clone());
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.other_branch), (1, 1));
+        assert!(mark_of(&hot, &k).is_some(), "mark must survive");
+        let row = row_of(&hot, &k);
+        assert!(row.unverified);
+        assert_eq!((row.balance.as_str(), row.as_of), ("1.5", 10));
+        assert!(balances::is_dirty(&hot.ro().unwrap(), ids[0], coin, 0).unwrap());
+
+        *prev.lock().unwrap() = tip_hash().to_b64url();
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        assert_eq!(keys.len(), 1, "the key is still queued");
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.other_branch), (1, 0));
+        assert!(mark_of(&hot, &k).is_none());
+        assert!(!row_of(&hot, &k).unverified);
+    }
+
+    fn other_branch_count() -> u64 {
+        kdx_metrics::get()
+            .balance_reconcile
+            .get_or_create(&vec![("result", "other_branch".into())])
+            .get()
+    }
+
+    /// M1 (D2 review): an off-branch answer is counted under its own metric label, so a
+    /// dashboard can tell it from a verified `ok`.
+    #[tokio::test]
+    async fn an_off_branch_answer_has_its_own_metric_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["alice"]);
+        let prev = Arc::new(Mutex::new(Hash32([0x33; 32]).to_b64url()));
+        let (ctx, local) = client_on(dir.path(), &hot, prev);
+        let before = other_branch_count();
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        // The registry is global and tests run in parallel: at least this test's answer.
+        assert!(other_branch_count() > before);
+    }
+
+    /// M1: an answer with no `prevBlockHash` is off-branch (unverified, kept dirty) and counted
+    /// in `no_hash` for the warning.
+    #[tokio::test]
+    async fn an_answer_without_prev_block_hash_is_counted_and_kept_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        let k = balances::bal_key(ids[0], coin, 0);
+        let (ctx, local) = client_on(dir.path(), &hot, Arc::new(Mutex::new(String::new())));
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.other_branch, st.no_hash), (1, 1, 1));
+        assert!(mark_of(&hot, &k).is_some());
+        assert!(row_of(&hot, &k).unverified);
+    }
+
+    /// M1: a batch whose answers were all off-branch pauses the loop briefly; a batch with one
+    /// verified answer, or none at all, does not.
+    #[test]
+    fn an_all_off_branch_batch_pauses_the_next() {
+        let all = BatchStats {
+            ok: 3,
+            other_branch: 3,
+            ..Default::default()
+        };
+        assert_eq!(off_branch_pause(&all), Some(OFF_BRANCH_PAUSE));
+        assert!(OFF_BRANCH_PAUSE <= Duration::from_secs(5), "bounded");
+        let one_good = BatchStats {
+            ok: 3,
+            other_branch: 2,
+            ..Default::default()
+        };
+        assert_eq!(off_branch_pause(&one_good), None);
+        let with_absent = BatchStats {
+            ok: 1,
+            other_branch: 1,
+            absent: 1,
+            ..Default::default()
+        };
+        assert_eq!(off_branch_pause(&with_absent), None);
+        assert_eq!(off_branch_pause(&BatchStats::default()), None);
+        let errors = BatchStats {
+            node_errors: 4,
+            ..Default::default()
+        };
+        assert_eq!(off_branch_pause(&errors), None);
+    }
+
+    /// Invalid answers keep their keys queued: a batch of only those pauses the next one (no
+    /// spin), a batch with any usable answer does not.
+    #[test]
+    fn an_all_invalid_batch_pauses_the_next() {
+        let all = BatchStats {
+            invalid: 3,
+            ..Default::default()
+        };
+        assert_eq!(invalid_pause(&all), Some(INVALID_PAUSE));
+        assert!(!backs_off(&all));
+        let mixed = BatchStats {
+            ok: 1,
+            invalid: 3,
+            ..Default::default()
+        };
+        assert_eq!(invalid_pause(&mixed), None);
+        assert_eq!(invalid_pause(&BatchStats::default()), None);
+    }
+
+    /// M1: off-branch answers that are the majority of `ok` over a window, with enough answers,
+    /// raise one alert at the window's end; a missing hash alerts at once, then at most once
+    /// per window.
+    #[test]
+    fn the_branch_watch_alerts_on_a_majority_and_on_missing_hashes() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let batch = |ok, other, no_hash| BatchStats {
+            ok,
+            other_branch: other,
+            no_hash,
+            ..Default::default()
+        };
+        let mut w = BranchWatch::default();
+        assert_eq!(w.note(at(0), &batch(40, 30, 0)), BranchAlert::default());
+        assert_eq!(w.note(at(30), &batch(40, 30, 0)), BranchAlert::default());
+        assert_eq!(
+            w.note(at(60), &batch(20, 10, 0)).dominant,
+            Some((70, 100)),
+            "70 of 100 in the window"
+        );
+        // A new window: a minority, then too few answers, never alert.
+        assert_eq!(w.note(at(90), &batch(100, 40, 0)).dominant, None);
+        assert_eq!(w.note(at(120), &batch(0, 0, 0)).dominant, None);
+        assert_eq!(w.note(at(150), &batch(10, 10, 0)).dominant, None);
+        assert_eq!(w.note(at(180), &batch(10, 10, 0)).dominant, None);
+        // Missing hashes: at once, then quiet within the window, then again.
+        assert_eq!(w.note(at(200), &batch(5, 5, 5)).no_hash, Some(5));
+        assert_eq!(w.note(at(230), &batch(5, 5, 5)).no_hash, None);
+        assert_eq!(w.note(at(261), &batch(5, 5, 2)).no_hash, Some(2));
+    }
+
+    /// L1 (D2 review): an answer from a definite other branch (we hold another header at its
+    /// height) keeps the previous row's balance, guard and public-key index; the row is only
+    /// flagged unverified and the mark stays.
+    #[tokio::test]
+    async fn a_definite_other_branch_answer_keeps_the_previous_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        let k = balances::bal_key(ids[0], coin, 0);
+        let old = BalanceRow {
+            absent: false,
+            balance: "7.0".into(),
+            guard: [0; 16],
+            as_of: 8,
+            reconciled_at: 1,
+            unverified: false,
+        };
+        {
+            let mut txn = hot.rw().unwrap();
+            txn.put(Table::Balances, &k, &old.encode()).unwrap();
+            txn.commit().unwrap();
+        }
+        let prev = Arc::new(Mutex::new(Hash32([0x33; 32]).to_b64url()));
+        let (ctx, local) = client_on(dir.path(), &hot, prev);
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!(st.other_branch, 1);
+        let row = row_of(&hot, &k);
+        assert_eq!(
+            (row.balance.as_str(), row.as_of, row.guard),
+            ("7.0", 8, [0; 16])
+        );
+        assert!(row.unverified);
+        assert!(mark_of(&hot, &k).is_some());
+        let idx = hot
+            .ro()
+            .unwrap()
+            .get(
+                Table::KeyAccounts,
+                &balances::key_account_key(&balances::key_hash("k1"), ids[0]),
+            )
+            .unwrap();
+        assert!(idx.is_none(), "the other branch's key is not indexed");
+    }
+
+    /// D2: an answer read at a height whose header we do not hold yet (the node is ahead of
+    /// our tail) cannot be checked: it is treated like another branch's.
+    #[tokio::test]
+    async fn an_answer_above_our_headers_keeps_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        {
+            let mut txn = hot.rw().unwrap();
+            txn.del(Table::Headers, &kdx_hot::tables::block_key(0, 10))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let k = balances::bal_key(ids[0], coin, 0);
+        let (ctx, local) = client(dir.path(), &hot);
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!(st.other_branch, 1);
+        assert!(mark_of(&hot, &k).is_some());
+        assert!(row_of(&hot, &k).unverified);
     }
 
     /// SR-2: a node outage (every call a node error) parks nothing, however long it lasts; a
@@ -1516,6 +2524,92 @@ mod tests {
         assert!(balances::is_dirty(&txn, accts[1], coin, 1).unwrap());
     }
 
+    /// The wall-clock rate counts the whole elapsed time, waits included, and stays zero
+    /// within the first second.
+    #[test]
+    fn wall_rate_counts_all_elapsed_time() {
+        assert_eq!(wall_rate(600, Duration::from_secs(60)), 10.0);
+        assert_eq!(wall_rate(600, Duration::from_secs(120)), 5.0);
+        assert_eq!(wall_rate(600, Duration::from_millis(500)), 0.0);
+    }
+
+    /// Seed `count` rows of `module` (chain 0) for accounts named `{prefix}{i}`.
+    fn seed_rows(hot: &HotStore, module: u32, prefix: &str, count: usize) {
+        let names: Vec<String> = (0..count).map(|i| format!("{prefix}{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let accts = intern(hot, DictKind::Account, &refs);
+        let mut txn = hot.rw().unwrap();
+        let sm = Mark {
+            height: 0,
+            seq: txn.txn_id().unwrap(),
+        }
+        .encode();
+        for &a in &accts {
+            balances::seed_mark(&mut txn, &balances::bal_key(a, module, 0), &sm).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// A seed window that holds one non-coin module only still fills the whole batch: the
+    /// per-module share orders the slots, it does not shrink the batch (the 2026-11 drain
+    /// slowdown: batches of ~70 rows instead of 256).
+    #[test]
+    fn a_single_module_seed_window_fills_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _coin, _ids) = setup(dir.path(), &[]);
+        let spam = intern(&hot, DictKind::Module, &["free.spam"])[0];
+        seed_rows(&hot, spam, "a", 400);
+        let b = refill(&hot, 8, 4).unwrap();
+        assert_eq!(b.len(), 8);
+        assert!(b.iter().all(|d| d.seed && module_of(&d.key) == spam));
+        let distinct: HashSet<_> = b.iter().map(|d| d.key).collect();
+        assert_eq!(distinct.len(), 8);
+    }
+
+    /// With `coin` rows in the window too, the room `coin` leaves is topped up from the one
+    /// module that has rows left, and `coin` stays uncapped.
+    #[test]
+    fn a_coin_plus_single_module_seed_window_fills_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, _ids) = setup(dir.path(), &[]);
+        let spam = intern(&hot, DictKind::Module, &["free.spam"])[0];
+        seed_rows(&hot, coin, "c", 5);
+        seed_rows(&hot, spam, "s", 400);
+        let b = refill(&hot, 16, 4).unwrap();
+        assert_eq!(b.len(), 16);
+        assert_eq!(b.iter().filter(|d| module_of(&d.key) == coin).count(), 5);
+        assert_eq!(b.iter().filter(|d| module_of(&d.key) == spam).count(), 11);
+    }
+
+    /// A mixed window still shares the slots fairly: two big modules split a small batch
+    /// evenly, and a small module is served in full before a big one takes the rest.
+    #[test]
+    fn a_mixed_seed_window_still_shares_slots_fairly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _coin, _ids) = setup(dir.path(), &[]);
+        let mods = intern(
+            &hot,
+            DictKind::Module,
+            &["free.big", "free.big2", "free.small"],
+        );
+        let (big, big2, small) = (mods[0], mods[1], mods[2]);
+        seed_rows(&hot, big, "a", 60);
+        seed_rows(&hot, big2, "b", 60);
+        let b = refill(&hot, 8, 4).unwrap();
+        assert_eq!(b.len(), 8);
+        assert_eq!(b.iter().filter(|d| module_of(&d.key) == big).count(), 4);
+        assert_eq!(b.iter().filter(|d| module_of(&d.key) == big2).count(), 4);
+        // A small module joins: it gets its two rows, the big ones split what is left.
+        seed_rows(&hot, small, "z", 2);
+        let b = refill(&hot, 16, 4).unwrap();
+        assert_eq!(b.len(), 16);
+        let count = |m| b.iter().filter(|d| module_of(&d.key) == m).count();
+        assert_eq!((count(small), count(big), count(big2)), (2, 7, 7));
+        // Slots are dealt round-robin: the first round holds one row of each module.
+        let first: HashSet<_> = b[..3].iter().map(|d| module_of(&d.key)).collect();
+        assert_eq!(first.len(), 3);
+    }
+
     /// I-6: rows of a module that did not pass the fungible check keep their balance, but their
     /// guard never reaches `KeyAccounts`; coin and a confirmed `fungible-v2` module do.
     #[tokio::test]
@@ -1550,6 +2644,61 @@ mod tests {
             .unwrap()
             .fungible_on(0));
         assert!(balances::trusted(&txn, coin, 7, Some(coin)).unwrap());
+    }
+
+    /// F-14: an over-size guard is stored as null (the balance row is still written and a
+    /// counter records it) and gives no `KeyAccounts` rows; a 65-key keyset indexes nothing; a
+    /// confirmed fungible-v2 module stops at its own row cap and is flagged.
+    #[tokio::test]
+    async fn oversize_guards_and_the_fungible_row_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["alice"]);
+        let tok = intern(&hot, DictKind::Module, &["free.tok"])[0];
+        let accts = intern(&hot, DictKind::Account, &["huge", "wide", "carol"]);
+        mark(&hot, accts[0], tok, 0, 10);
+        mark(&hot, accts[1], tok, 0, 10);
+        let (ctx, local) = client(dir.path(), &hot);
+        let keys = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.dropped), (3, 0));
+        let txn = hot.ro().unwrap();
+        let huge = row_of(&hot, &balances::bal_key(accts[0], tok, 0));
+        assert_eq!((huge.absent, huge.balance.as_str()), (false, "1.5"));
+        assert_eq!(huge.guard, guard_hash(b"null"));
+        assert!(row_of(&hot, &balances::bal_key(accts[1], tok, 0)).positive());
+        // Only alice's coin row ("k1") is in the key index.
+        assert_eq!(txn.count(Table::KeyAccounts).unwrap(), 1);
+        assert_eq!(
+            txn.meta(balances::meta::GUARDS_CAPPED)
+                .unwrap()
+                .map(|v| u64::from_be_bytes(v[..].try_into().unwrap())),
+            Some(1)
+        );
+        drop(txn);
+        // Row cap 2 for confirmed fungible-v2 modules: free.tok has 2 rows, a third is dropped.
+        let caps = Caps {
+            fungible_module_rows: 2,
+            ..Caps::default()
+        };
+        mark(&hot, accts[2], tok, 0, 10);
+        let keys = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &caps).await.unwrap();
+        assert_eq!((st.ok, st.dropped), (0, 1));
+        let txn = hot.ro().unwrap();
+        let t = balances::token_row(&txn, tok).unwrap().unwrap();
+        assert!(t.capped() && t.rows == 2);
+        assert!(txn
+            .get(Table::Balances, &balances::bal_key(accts[2], tok, 0))
+            .unwrap()
+            .is_none());
+        // A key that already has a row is still reconciled at the cap.
+        drop(txn);
+        mark(&hot, accts[0], tok, 0, 20);
+        let keys = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &caps).await.unwrap();
+        assert_eq!((st.ok, st.dropped), (1, 0));
     }
 
     /// R-P5P9-8 #2: a module whose calls fail in NOT_FUNGIBLE_AFTER batches in a row is marked
@@ -1691,6 +2840,17 @@ mod tests {
         let segdir = dir.path().join("segments");
         std::fs::create_dir_all(&segdir).unwrap();
         let k = undecodable_ledger_event(&hot);
+        // D1 L3: the receivers pass waits for a tail; this store's tail reached height 1.
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut txn,
+            kdx_hot::Stage::Tail,
+            0,
+            1,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        txn.commit().unwrap();
         let e = crate::nft_fill::run(&hot, &segdir, None, &|| false).unwrap_err();
         assert!(format!("{e:#}").contains("hot tx record"), "{e:#}");
         let (ctx, _) = client(dir.path(), &hot);
@@ -1703,6 +2863,7 @@ mod tests {
             batch: 10,
             seed: true,
             caps: Caps::default(),
+            keylist_skip: Vec::new(),
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(run_with(
@@ -1722,6 +2883,14 @@ mod tests {
             crate::seed::seeded(&hot.ro().unwrap()).unwrap()
         })
         .await;
+        // D1: `run` also runs the receivers pass once (here: nothing stored below the cutoff).
+        until("the receivers pass", || {
+            let txn = hot.ro().unwrap();
+            txn.meta(balances::meta::BALANCES_SEED_RECEIVERS)
+                .unwrap()
+                .is_some()
+        })
+        .await;
         assert!(pending() > 0, "the fill cannot have completed");
         let mut txn = hot.rw().unwrap();
         txn.del(Table::TailTxs, &k.to_be_bytes()).unwrap();
@@ -1733,6 +2902,155 @@ mod tests {
         .await;
         stop.cancel();
         task.await.unwrap().unwrap();
+    }
+
+    /// Re-review N2: a pending D3 history walk runs in slices between the loop's other steps;
+    /// dirty rows are reconciled while it is still pending, and the walk then completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_rows_are_reconciled_while_a_history_walk_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["k:a"]);
+        let segdir = dir.path().join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut txn,
+            kdx_hot::Stage::Tail,
+            0,
+            1,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        // D3 done through height 60,000; a token first seen at 5 waits for its history walk.
+        txn.set_meta(
+            balances::meta::BALANCES_SEED_TOKEN_RECEIVERS,
+            &60_000u32.to_be_bytes(),
+        )
+        .unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let tok = dict.intern(DictKind::Module, "free.t");
+        dict.persist(&mut txn).unwrap();
+        balances::note_token(&mut txn, tok, 5).unwrap();
+        // 50,000 stored txs below the done height (unreadable records count as pass errors):
+        // at one tx per slice the walk needs 50,000 slices, far longer than one batch.
+        for h in 2..50_002u32 {
+            let k = kdx_types::TxKey::new(h, 0, 1);
+            txn.put(Table::TailTxs, &k.to_be_bytes(), b"\xffnot a tx record")
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(
+            balances::rewalk_pending(&hot.ro().unwrap()).unwrap(),
+            vec![tok]
+        );
+        let (ctx, _) = client(dir.path(), &hot);
+        let node = ctx.node.clone();
+        let o = ReconcileOpts {
+            local: LocalOpts {
+                rps: 0,
+                concurrency: 4,
+            },
+            batch: 10,
+            seed: true,
+            caps: Caps {
+                history_slice_txs: 1,
+                ..Caps::default()
+            },
+            keylist_skip: Vec::new(),
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run_with(
+            Arc::new(ctx),
+            node,
+            o,
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        let walk_pending = || {
+            !balances::rewalk_pending(&hot.ro().unwrap())
+                .unwrap()
+                .is_empty()
+        };
+        until("the dirty row reconciled", || {
+            assert!(!task.is_finished(), "run ended");
+            balances::dirty_count(&hot.ro().unwrap()).unwrap() == 0
+        })
+        .await;
+        assert!(walk_pending(), "the walk ran inline before the dirty rows");
+        let end = Instant::now() + Duration::from_secs(300);
+        while walk_pending() {
+            assert!(!task.is_finished(), "run ended");
+            assert!(Instant::now() < end, "the history walk never ended");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// PR #27 H-1: the key listing runs in its own task. While its `describe-module` read of
+    /// a tracked token hangs, the loop still reconciles a dirty row, and a stop ends the run
+    /// at once (the hung read is not awaited).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_key_listing_read_does_not_hold_up_the_reconcile() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["k:a", "k:b"]);
+        let segdir = dir.path().join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut txn,
+            kdx_hot::Stage::Tail,
+            0,
+            1,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let tok = dict.intern(DictKind::Module, "free.slow");
+        dict.persist(&mut txn).unwrap();
+        balances::note_token(&mut txn, tok, 5).unwrap();
+        txn.commit().unwrap();
+        let before = DESCRIBES.load(SeqCst);
+        let (ctx, _) = client(dir.path(), &hot);
+        let node = ctx.node.clone();
+        let o = ReconcileOpts {
+            local: LocalOpts {
+                rps: 0,
+                concurrency: 4,
+            },
+            batch: 10,
+            seed: true,
+            caps: Caps::default(),
+            keylist_skip: Vec::new(),
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run_with(
+            Arc::new(ctx),
+            node,
+            o,
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        until("the key listing's read", || DESCRIBES.load(SeqCst) > before).await;
+        // A new dirty row while that read hangs (30 s, past `until`'s 20 s).
+        let mut txn = hot.rw().unwrap();
+        balances::mark_dirty(&mut txn, ids[1], coin, 0, 10).unwrap();
+        txn.commit().unwrap();
+        let t0 = Instant::now();
+        until("the dirty rows reconciled", || {
+            assert!(!task.is_finished(), "run ended");
+            balances::dirty_count(&hot.ro().unwrap()).unwrap() == 0
+        })
+        .await;
+        // Inline, the hung read (3 client tries of the 5 s timeout) would hold the loop 15 s.
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends at once on stop")
+            .unwrap()
+            .unwrap();
     }
 
     /// M-11: a block applied above a chain's mark watermark + 1 (blocks applied without marks)

@@ -18,9 +18,10 @@ use axum::Extension;
 use kdx_decode::index::evt_module_entity;
 use kdx_decode::Family;
 use kdx_types::record::{BlockRecord, TxRecord};
-use kdx_types::{Dict, DictKind, TxKey};
+use kdx_types::TxKey;
 use serde_json::Value;
 
+use super::schemas::{EventDetail, ExecutionStrategy, LimitErrors, PagingParams};
 use super::shapes::{self, Ev};
 use super::{
     check_strategy, collect_page, page_response, paging, resume_exhausted, resume_max, store_floor,
@@ -41,6 +42,27 @@ struct Filter {
 }
 
 impl Filter {
+    fn from_params(p: &Params) -> Filter {
+        Filter {
+            search: p.get("search").map(Like::new),
+            param: p.get("param").map(Like::new),
+            name: p.get("name").map(Like::new),
+            name_raw: p.get("name").map(str::to_owned),
+            module: p.get("modulename").map(str::to_owned),
+        }
+    }
+
+    /// Heavy (F-20): the request may walk without a selective posting list, so it runs on
+    /// the heavy pool under the per-client gate. Without `modulename` it may take the
+    /// scan; with it, a `param`, `search` or pattern `name` filter walks every event of the
+    /// module, rejecting rows until the deadline when nothing matches.
+    fn heavy(&self) -> bool {
+        self.module.is_none()
+            || self.param.is_some()
+            || self.search.is_some()
+            || self.name_raw.as_deref().is_some_and(is_pattern)
+    }
+
     fn matches(&self, e: &Ev) -> bool {
         if let Some(m) = &self.module {
             if &e.module != m {
@@ -143,25 +165,20 @@ impl Iterator for Merge<'_> {
     }
 }
 
+/// True when `name` uses LIKE syntax (`%`, `_` or an escape), so no event-name id lookup
+/// applies.
+fn is_pattern(name: &str) -> bool {
+    name.contains(['%', '_', '\\'])
+}
+
 /// Event-name ids for `name` (plain substring of the qualified name, within `module`),
 /// or None when they are too many (or `name` uses LIKE wildcards).
 fn name_ids(view: &View, name: &str, module: Option<&str>, cap: usize) -> Option<Vec<u32>> {
-    if name.contains(['%', '_', '\\']) {
+    if is_pattern(name) {
         return None;
     }
-    let d = view.dict();
-    let (ids, more) = d.event_names(name, usize::MAX);
-    let prefix = module.map(|m| format!("{m}."));
-    let ids: Vec<u32> = ids
-        .into_iter()
-        .filter(|id| match &prefix {
-            Some(p) => d
-                .name(DictKind::EventName, *id)
-                .is_some_and(|n| n.starts_with(p.as_str())),
-            None => true,
-        })
-        .collect();
-    (!more && ids.len() <= cap).then_some(ids)
+    let (ids, more) = view.dict().event_names(name, module, cap);
+    (!more).then_some(ids)
 }
 
 /// The bounded newest-first event scan for `search` alone (`/api/v1/search/events`; the
@@ -302,6 +319,42 @@ fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
     Ok(())
 }
 
+/// Events
+///
+/// chainweb-data `evHandler`: a JSON array of `EventDetail`, newest first (height
+/// descending, request key descending, event index ascending). Filters combine with AND:
+/// `modulename` is an exact module, `name` a SQL `LIKE '%name%'` on the qualified name,
+/// `param` a `LIKE` on the parameters' JSON text, `search` a `LIKE` on either. Patterns
+/// take `%` and `_`, `\` escapes them, at most 256 characters and 8 `%`. Without
+/// `modulename`, `name` and `param` need at least `search.min_len` (4) characters other
+/// than wildcards and may take a bounded newest-first scan (`search.max_scan_heights`,
+/// `search.timeout_ms`): a cut scan answers what it found with `X-Search-Truncated: true`
+/// and `Chainweb-Next`. `search` takes one slot of the search gate (`503` when
+/// `search.concurrency` searches run, `429` when the client already runs
+/// `search.per_client`). Genesis transactions are hidden.
+#[utoipa::path(
+    get,
+    path = "/txs/events",
+    operation_id = "compat_events",
+    tag = "events",
+    params(
+        ("search" = Option<String>, Query, description = "LIKE pattern matched against the qualified name or the parameter text."),
+        ("param" = Option<String>, Query, description = "LIKE pattern matched against the parameter text (JSON)."),
+        ("name" = Option<String>, Query, description = "LIKE pattern matched against the qualified event name, for example `coin.TRANSFER`."),
+        ("modulename" = Option<String>, Query, description = "Exact module name, for example `coin`."),
+        PagingParams,
+        ("Chainweb-Execution-Strategy" = Option<ExecutionStrategy>, Header, description = "Accepted and ignored. Any other value is `400 Unknown Chainweb-Execution-Strategy: ...`."),
+    ),
+    responses(
+        (status = 200, description = "A page of events", body = Vec<EventDetail>, content_type = "application/json",
+            headers(
+                ("Chainweb-Next" = String, description = "Token of the next page (pass as `next`); absent on the last page."),
+                ("X-Search-Truncated" = String, description = "`true` when the scan deadline or a cap cut the answer short."),
+            )),
+        (status = 400, description = "A parameter does not parse, a pattern is too long, has too many `%`, or is too short without `modulename`; `offset` above 10,000; `next` with `offset`; an invalid `next`", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
 pub async fn handler(
     State(st): State<Arc<ApiState>>,
     Extension(search): Extension<SearchSettings>,
@@ -321,15 +374,9 @@ pub async fn handler(
     if let Err(t) = check_patterns(&p, &search) {
         return text(StatusCode::BAD_REQUEST, t);
     }
-    let f = Filter {
-        search: p.get("search").map(Like::new),
-        param: p.get("param").map(Like::new),
-        name: p.get("name").map(Like::new),
-        name_raw: p.get("name").map(str::to_owned),
-        module: p.get("modulename").map(str::to_owned),
-    };
+    let f = Filter::from_params(&p);
     let cap = st.settings.max_event_lists;
-    let heavy = f.module.is_none();
+    let heavy = f.heavy();
     // `search` is a text search: it takes a search gate slot (S-5), held by the read.
     let permit = if f.search.is_some() {
         match ctx.gate.try_acquire(ip) {
@@ -358,6 +405,24 @@ pub async fn handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filter(q: &[(&str, &str)]) -> Filter {
+        Filter::from_params(&params(q))
+    }
+
+    /// F-20: a request is heavy when it may walk without a selective posting list: no
+    /// `modulename`, or a `param`, `search` or pattern `name` filtering the module's events.
+    #[test]
+    fn heavy_request_rule() {
+        assert!(filter(&[("name", "TRANSFER")]).heavy());
+        assert!(filter(&[("search", "coin")]).heavy());
+        assert!(!filter(&[("modulename", "coin")]).heavy());
+        assert!(!filter(&[("modulename", "coin"), ("name", "TRANSFER")]).heavy());
+        assert!(filter(&[("modulename", "coin"), ("param", "k:ab")]).heavy());
+        assert!(filter(&[("modulename", "coin"), ("search", "TR")]).heavy());
+        assert!(filter(&[("modulename", "coin"), ("name", "TRANS%")]).heavy());
+        assert!(filter(&[("modulename", "coin"), ("name", "TRANSFER_XCHAIN")]).heavy());
+    }
 
     /// G2: a one-character `search` is accepted, as chainweb-data does.
     #[test]

@@ -717,7 +717,7 @@ reorg marks the affected balance rows dirty instead.
 
 | Table | Key | Value |
 |---|---|---|
-| `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node), balance text as the node printed it, guard hash [16], as_of u32 (the node tip the `/local` answer read: `metaData.blockHeight − 1`, since the node reports the pending block's height; for an absent row, the chain's tail height at the call), reconciled_at u32 (unix s) |
+| `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node, b1: unverified: the last re-read failed, was parked, or was read on another branch than the stored header at `as_of`), balance text as the node printed it, guard hash [16], as_of u32 (the node tip the `/local` answer read: `metaData.blockHeight − 1`, since the node reports the pending block's height; for an absent row, the chain's tail height at the call), reconciled_at u32 (unix s) |
 | `BalanceDirty` | same | marked_height u32 (highest block height that marked it; 0 from the seed) |
 | `Guards` | guard hash [16] = blake2b-128 of the guard JSON as returned; a resolved keyset reference under blake2b-128 of `keysetref:{chain}:{name}` | guard (or keyset) JSON bytes |
 | `KeyAccounts` | blake2b-128 of the public key [16], AccountId u32 | empty |
@@ -726,6 +726,7 @@ reorg marks the affected balance rows dirty instead.
 | `NftDirty` | same | marked_height u32, seq u64 (write txn id), ledger ModuleId u32, token id |
 | `NftDetails` (P7, GQ-15) | 1, then the `NftBalances` key (a holding's guard) | status u8 (1 found, 2 absent, 3 failed), as_of u32, guard JSON |
 | `NftDetails` (P7, GQ-15) | 2, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 (a token's info) | status u8 (1 found, 2 absent, 3 failed, 4 the ledger has no `get-token-info`), as_of u32, precision i32, supply length u16, supply text, uri |
+| `TokenSwaps` (`lastTokenPriceInKda`) | token name (utf-8, at most 256 bytes), chain u8 | the newest swap naming the token on that chain: `meta.creationTime` u64, TxKey u64, then four varint-length strings: element 0's token, its amount as JSON text, element 1's token, its amount as JSON text |
 
 `Meta` keys of the balance seed: `balances_seeded` (u32: the highest tail height when the seed
 finished), `balances_seed_cursor` (13 bytes while a seed runs: range start u32, range end u32,
@@ -739,6 +740,15 @@ at height `h` replaces a row unless the row is newer, so replays and the history
 move a row back. Tail undo marks the rows the undone txs touched `NftDirty`; the reconciler
 reads them with `get-balance`. `Meta nft_filled` (u32: the highest tail height when the history
 fill finished) marks the one-time fill that walks the `evt` postings of every ledger event name.
+
+Token swap rows (`prices.rs`, [graphql.md](graphql.md#token-price)): a tail block's swaps
+replace a `TokenSwaps` row only when newer by (`meta.creationTime`, TxKey), and every row it
+replaces is logged with its old value in `Meta price_undo/{chain:02}/{height:010}` (key, flag,
+old value; beside the undo record, like the D3 marks, so older binaries still read `Undo`). An
+unwind restores the log newest first, and the freezer drops it with the block. `Meta
+price_filled` (u32: the highest tail height when the history fill finished) and
+`price_fill_txnum` (u64: the last segment TxNum the fill finished, its resume point) belong to
+the one-time fill.
 
 `NftDetails` (`nft.rs`) caches the GraphQL `NonFungibleTokenBalance.guard` and `.info`. `as_of`
 is the node tip of the answer, or, without an answer, the chain's tail (at least the balance

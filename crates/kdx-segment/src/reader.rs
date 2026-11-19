@@ -62,6 +62,18 @@ pub struct RangeReader {
     pub filter: Option<KeyFilters>,
     /// Set bits of `blocks.present` before each 64-bit word.
     rank: Vec<u32>,
+    /// Identity of the `range.toml` this reader opened (F-16): a swap renames a new one into
+    /// place, so a different identity means the files on disk are no longer these.
+    toml_id: Option<FileId>,
+}
+
+/// `(device, inode, mtime s, mtime ns)` of a file.
+type FileId = (u64, u64, i64, i64);
+
+fn file_id(p: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.dev(), m.ino(), m.mtime(), m.mtime_nsec()))
 }
 
 impl RangeReader {
@@ -88,6 +100,7 @@ impl RangeReader {
 
     fn open_once(dir: &Path, e: &RangeEntry, network: &str, filters: bool) -> Result<RangeReader> {
         let f = |k: FileKind| crate::swap::resolve(dir, &file_name(network, k, e.start, e.end));
+        let toml_id = file_id(&f(FileKind::Range));
         let info = RangeInfo::load(&f(FileKind::Range))?;
         if info.entry() != *e {
             bail!(
@@ -190,6 +203,7 @@ impl RangeReader {
             sndr,
             filter,
             rank,
+            toml_id,
         })
     }
 
@@ -414,6 +428,27 @@ impl Segments {
         Ok(s)
     }
 
+    /// Ranges whose `range.toml` on disk is no longer the one their reader opened: swapped by
+    /// `rebuild-range` or rewritten by `segments add-index` after this process opened them
+    /// (F-16). Such a reader still serves the old files, possibly paired with new ones opened
+    /// later, so the process should be restarted. One `stat` per range.
+    pub fn swapped_ranges(&self) -> Vec<(u32, u32)> {
+        self.ranges
+            .iter()
+            .filter(|r| {
+                let name = file_name(
+                    &self.manifest.network,
+                    FileKind::Range,
+                    r.info.start,
+                    r.info.end,
+                );
+                let now = file_id(&crate::swap::resolve(&self.dir, &name));
+                now.is_none() || now != r.toml_id
+            })
+            .map(|r| (r.info.start, r.info.end))
+            .collect()
+    }
+
     /// Reload `manifest.json`; `None` when it is unchanged. Readers whose
     /// `(kind, start, end, first_txnum)` is unchanged are reused, new ones are opened.
     pub fn refresh(&self) -> Result<Option<Segments>> {
@@ -521,6 +556,37 @@ impl Segments {
                     None => r.postings_le(f, entity, max_rel),
                 } {
                     Ok(Some(it)) => Box::new(it.map(Ok)),
+                    Ok(None) => Box::new(std::iter::empty()),
+                    Err(e) => Box::new(std::iter::once(Err(e.context(format!(
+                        "postings of range {}..{}",
+                        r.info.start, r.info.end
+                    ))))),
+                };
+                res
+            })
+    }
+
+    /// TxNums of `(f, entity)` in the ranges that reach `min_height` or above (whole
+    /// ranges: the caller filters heights inside the first one), **oldest first** across
+    /// ranges. Each range's list is opened only when the walk gets to it. Stops with an error
+    /// item when a list does not decode.
+    pub fn postings_oldest_memo<'a>(
+        &'a self,
+        f: Family,
+        entity: u64,
+        min_height: u32,
+        memo: Option<&'a ListMemo>,
+    ) -> impl Iterator<Item = Result<u64>> + 'a {
+        self.ranges
+            .iter()
+            .enumerate()
+            .filter(move |(_, r)| r.info.end > min_height)
+            .flat_map(move |(ri, r)| {
+                let res: Box<dyn Iterator<Item = Result<u64>>> = match match memo {
+                    Some(m) => r.postings_le_memo(f, entity, None, m, ri as u32),
+                    None => r.postings_le(f, entity, None),
+                } {
+                    Ok(Some(it)) => Box::new(it.oldest_first().map(Ok)),
                     Ok(None) => Box::new(std::iter::empty()),
                     Err(e) => Box::new(std::iter::once(Err(e.context(format!(
                         "postings of range {}..{}",

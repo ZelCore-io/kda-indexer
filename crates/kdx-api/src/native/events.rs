@@ -28,7 +28,9 @@ fn params_of(q: &Q) -> Vec<(usize, &str)> {
 }
 
 /// Events by module and name (a qualified `name` such as `coin.TRANSFER` is split at its last dot
-/// when `module` is absent). At least one of `module`, `name`, `param{N}` is required.
+/// when `module` is absent). At least one of `module`, `name`, `param{N}` is required. With
+/// only `param{N}` filters, the first given value is looked up as an account: a value that is
+/// no known account answers 200 with no items.
 #[utoipa::path(
     get,
     path = "/api/v1/events",
@@ -38,7 +40,7 @@ fn params_of(q: &Q) -> Vec<(usize, &str)> {
         ("name" = Option<String>, Query, description = "Exact event name, e.g. `TRANSFER`; needs `module`, or write it qualified (`coin.TRANSFER`)"),
         ("param0" = Option<String>, Query, description = "Exact string value of event parameter 0 (param0..param9)"),
     ),
-    responses((status = 200, description = "`items` of events with their tx context, `next_cursor`, `as_of`"))
+    responses((status = 200, description = "`items` of events with their tx context, `next_cursor`, `as_of`. With only `param{N}` filters, a value that is no known account answers 200 with no items."))
 )]
 pub async fn list(
     st: St,
@@ -76,20 +78,19 @@ pub async fn list(
                 Some(id) => (Family::Evt, u64::from(id)),
                 None => return list_response(view, vec![], None),
             }
-        } else if let Some((_, v)) = params.first().filter(|_| module.is_none()) {
-            match d.account_id(v) {
-                Some(id) => (Family::Acct, u64::from(id)),
-                None => return list_response(view, vec![], None),
-            }
         } else if let Some(m) = &module {
             match d.module_id(m) {
                 Some(id) => (Family::Evt, evt_module_entity(id)),
                 None => return list_response(view, vec![], None),
             }
         } else {
-            return Err(ApiError::BadRequest(
-                "module or name is needed with param filters on their own".into(),
-            ));
+            // Only param filters (the check above guarantees one): the candidates are the
+            // txs touching the first one's value as an account. A value that is no known
+            // account matches nothing: 200 with no items, on purpose (F-47).
+            match params.first().and_then(|(_, v)| d.account_id(v)) {
+                Some(id) => (Family::Acct, u64::from(id)),
+                None => return list_response(view, vec![], None),
+            }
         };
         let keys = candidates(view, fam, entity, &lp)?;
         let (items, next) = page_rows(view, keys, &lp, |view, r, blocks| {
@@ -133,4 +134,45 @@ pub async fn list(
         list_response(view, items, next)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// F-47: with only `param{N}` filters, a value that is no known account answers 200 with
+    /// no items (not a 400), and the spec says so.
+    #[tokio::test]
+    async fn param_only_unknown_account_is_an_empty_200() {
+        let (_d, store) = crate::testutil::store();
+        let st = crate::server::Api::new(
+            store,
+            crate::server::tests::settings(4),
+            crate::server::TipWatch::default(),
+        )
+        .state();
+        let search = crate::search::SearchCtx::new(crate::compat::SearchSettings::default(), None);
+        let app = crate::native::router(search).with_state(st);
+        for uri in [
+            "/api/v1/events?param0=nobody",
+            "/api/v1/events?param3=nobody",
+        ] {
+            let r = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{uri}");
+            let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            assert_eq!(v["items"], serde_json::json!([]), "{uri}");
+        }
+        let spec = crate::openapi::json();
+        assert!(
+            spec.contains("no known account answers 200 with no items"),
+            "the spec documents the empty answer"
+        );
+    }
 }

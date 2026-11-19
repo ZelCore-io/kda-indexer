@@ -77,7 +77,7 @@ pub struct Metrics {
     pub dict_snapshot_names: Gauge,
     /// Rows in `BalanceDirty` (spec §3.9, plan Task 9).
     pub balance_dirty_rows: Gauge,
-    /// `/local` reconcile outcomes: `result` = ok | absent | error | skipped | parked.
+    /// `/local` reconcile outcomes: `result` = ok | absent | error | invalid | skipped | parked.
     pub balance_reconcile: Count,
     /// Duration of one `/local` reconcile call (`result` as above).
     pub balance_reconcile_seconds: Hist,
@@ -276,7 +276,7 @@ impl Metrics {
         );
         let balance_reconcile = reg!(
             "kdx_balance_reconcile",
-            "Balance reconcile outcomes (result ok|absent|error|skipped|parked)",
+            "Balance reconcile outcomes (result ok|absent|error|invalid|skipped|parked)",
             Count::default()
         );
         let graphql_requests = reg!(
@@ -470,7 +470,8 @@ impl Metrics {
             .inc();
     }
 
-    /// One balance reconcile outcome (`ok|absent|error|skipped|parked`) and its duration.
+    /// One balance reconcile outcome (`ok|absent|error|invalid|skipped|parked`, and `other_branch`,
+    /// `capped`, `not_fungible` counted with no duration) and its duration.
     pub fn balance_reconcile(&self, result: &'static str, secs: f64) {
         let l: Labels = vec![("result", result.into())];
         self.balance_reconcile.get_or_create(&l).inc();
@@ -566,7 +567,12 @@ pub async fn textfile_loop(path: PathBuf, every: Duration, shutdown: Cancellatio
     let mut failed = false;
     loop {
         // The collector reads the classic text format: drop the OpenMetrics terminator.
-        match write_atomic(&path, &encode().replace("# EOF\n", "")) {
+        // The write syncs the file: off the async workers.
+        let (p, text) = (path.clone(), encode().replace("# EOF\n", ""));
+        let r = tokio::task::spawn_blocking(move || write_atomic(&p, &text))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        match r {
             Ok(()) => {
                 if failed {
                     tracing::info!(path = %path.display(), "metrics: textfile writable again");
@@ -587,15 +593,40 @@ pub async fn textfile_loop(path: PathBuf, every: Duration, shutdown: Cancellatio
     }
 }
 
-/// Write `text` to `path` through a sibling temp file and a rename.
+/// Write `text` to `path` through a sibling temp file (`<path>.tmp`) and a rename.
+///
+/// F-41: the temp file is created with `O_CREAT | O_EXCL | O_NOFOLLOW`, so a symlink planted
+/// at its name is never followed (a leftover is removed first: a link is removed as a link).
+/// F-42: the file is 0644 whatever the process umask (the unit's `UMask=0027`), so the
+/// node_exporter user, which is not in the service's group, can read it.
 pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let r = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    r
 }
 
 #[cfg(test)]
@@ -623,6 +654,29 @@ mod tests {
         ] {
             assert!(t.contains(want), "missing {want}\n{t}");
         }
+    }
+
+    /// F-41/F-42: a symlink planted at `<path>.tmp` is replaced, never followed, and the
+    /// textfile is 0644 under the service's `UMask=0027` (node_exporter runs as another user).
+    #[test]
+    fn textfile_is_0644_and_a_planted_temp_symlink_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("kda_indexer.prom");
+        let victim = d.path().join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&victim, d.path().join("kda_indexer.prom.tmp")).unwrap();
+        // SAFETY: umask is process-wide; it is restored right after the write.
+        let old = unsafe { libc::umask(0o027) };
+        let r = write_atomic(&p, "a 1\n");
+        unsafe { libc::umask(old) };
+        r.unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a 1\n");
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        assert!(m.file_type().is_file());
+        assert_eq!(m.permissions().mode() & 0o777, 0o644);
+        assert!(!d.path().join("kda_indexer.prom.tmp").exists());
     }
 
     #[test]

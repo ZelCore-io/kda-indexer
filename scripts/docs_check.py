@@ -224,6 +224,8 @@ def validate_data(data):
 
         text = lambda v: isinstance(v, str) and v.strip() != ""  # noqa: E731
         need("id", text)
+        if isinstance(mid, str) and mid and not docs_charts.plain_id(mid):
+            errs.append("{}: id must match {}".format(tag, docs_charts.PLAIN_ID.pattern))
         if isinstance(mid, str):
             if mid in by_id:
                 errs.append("{}: duplicate id".format(tag))
@@ -255,6 +257,10 @@ def validate_data(data):
                 errs.append("{}: missing or invalid {}".format(tag, key))
         if isinstance(c.get("file"), str) and not c["file"].endswith(".svg"):
             errs.append("{}: file must end in .svg".format(tag))
+        if isinstance(c.get("file"), str) and not docs_charts.plain_file(c["file"]):
+            errs.append("{}: file must be a bare file name".format(tag))
+        if isinstance(cid, str) and cid and not docs_charts.plain_id(cid):
+            errs.append("{}: id must match {}".format(tag, docs_charts.PLAIN_ID.pattern))
         if cid in seen:
             errs.append("{}: duplicate id".format(tag))
         seen.add(cid)

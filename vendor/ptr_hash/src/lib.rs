@@ -517,26 +517,8 @@ impl<
         Some(ptr_hash)
     }
 
-    /// kda-indexer addition: rebuild a PtrHash from the state saved with
-    /// [`PtrHash::saved_parts`]. `init(n, params)` is deterministic, so only the key count,
-    /// the parameters, the global seed, the pilots and the remap table need to be stored.
-    pub fn from_saved_parts(
-        n: usize,
-        params: PtrHashParams<BF>,
-        seed: u64,
-        pilots: Vec<u8>,
-        remap: F,
-    ) -> Self {
-        let mut ptr_hash = Self::init(n, params);
-        ptr_hash.seed = seed;
-        ptr_hash.pilots = pilots;
-        ptr_hash.remap = remap;
-        ptr_hash
-    }
-
     /// kda-indexer addition: the pilot count and remap length that [`PtrHash::from_saved_parts`]
-    /// needs for `(n, params)`. Lookups index both without bounds checks, so a loader must
-    /// reject saved parts of any other size.
+    /// accepts for `(n, params)` (it refuses any other size).
     pub fn saved_sizes(n: usize, params: PtrHashParams<BF>) -> (usize, usize) {
         let p = Self::init(n, params);
         (p.buckets_total, p.slots_total.saturating_sub(p.n))
@@ -545,6 +527,43 @@ impl<
     /// kda-indexer addition: `(n, seed, pilots, remap)` for [`PtrHash::from_saved_parts`].
     pub fn saved_parts(&self) -> (usize, u64, &[u8], &F) {
         (self.n, self.seed, &self.pilots, &self.remap)
+    }
+}
+
+/// kda-indexer addition: loading saved state. Lookups index `pilots` and `remap` without
+/// bounds checks, so the only way to build a PtrHash from saved parts checks them first.
+impl<Key: KeyT, BF: BucketFn, Hx: KeyHasher<Key>, const SINGLE_PART: bool, const REMAP: bool>
+    PtrHash<Key, BF, Vec<u32>, Hx, Vec<u8>, SINGLE_PART, REMAP>
+{
+    /// Rebuild a PtrHash from the state saved with [`PtrHash::saved_parts`]. `init(n, params)`
+    /// is deterministic, so only the key count, the parameters, the global seed, the pilots and
+    /// the remap table need to be stored.
+    ///
+    /// `None` unless the parts fit `(n, params)`: `n > 0` (a lookup in an empty PtrHash reads
+    /// `remap[0]`), exactly [`PtrHash::saved_sizes`] pilots and remap entries, and every remap
+    /// entry below `n`. Every later lookup then stays in bounds whatever the key; the checks
+    /// run once here, none on the lookup path.
+    pub fn from_saved_parts(
+        n: usize,
+        params: PtrHashParams<BF>,
+        seed: u64,
+        pilots: Vec<u8>,
+        remap: Vec<u32>,
+    ) -> Option<Self> {
+        if n == 0 {
+            return None;
+        }
+        let mut ptr_hash = Self::init(n, params);
+        if pilots.len() != ptr_hash.buckets_total
+            || ptr_hash.slots_total.checked_sub(n) != Some(remap.len())
+            || remap.iter().any(|&r| r as usize >= n)
+        {
+            return None;
+        }
+        ptr_hash.seed = seed;
+        ptr_hash.pilots = pilots;
+        ptr_hash.remap = remap;
+        Some(ptr_hash)
     }
 }
 

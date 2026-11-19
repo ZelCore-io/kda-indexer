@@ -24,7 +24,7 @@ pub enum Dir {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<C> {
     pub dir: Dir,
-    /// Items to return (clamped to `max_page`; fetch `n + 1` to know if there are more).
+    /// Items to return (fetch `n + 1` to know if there are more).
     pub n: usize,
     pub cursor: Option<C>,
 }
@@ -97,8 +97,34 @@ pub struct PageArgs {
     pub last: Option<i32>,
     pub before: Option<String>,
     pub after: Option<String>,
-    /// The field takes the wide clamp (`GraphqlSettings::wide_page`).
-    pub wide: bool,
+}
+
+/// The direction and size of the page stock's `getPaginationParams` serves (FIX-3 part D,
+/// P4; part E, B1): `first` and `last` by truthiness, so `0` (or absent) is the default page
+/// forward without a cursor, while with a cursor the cursor's own count is taken as given
+/// (`first ?? default`, so `after` + `first: 0` serves 0 rows). The one function both
+/// [`PageArgs::parse`] and the read budget ([`crate::limits::budget`]) size a page with, so
+/// the price of a page cannot drift from what is served. Refusals (negative counts, `first`
+/// with `last`) are the caller's; a negative count here is 0 rows, and `first` with `last`
+/// the larger.
+pub fn served_page(
+    first: Option<i64>,
+    last: Option<i64>,
+    after: bool,
+    before: bool,
+    default_page: u64,
+) -> (Dir, u64) {
+    let rows = |n: i64| n.max(0) as u64;
+    let f = first.filter(|n| *n != 0);
+    let l = last.filter(|n| *n != 0);
+    match (f, l) {
+        (Some(f), Some(l)) => (Dir::Forward, rows(f.max(l))),
+        _ if after && l.is_none() => (Dir::Forward, first.map_or(default_page, rows)),
+        _ if before && !after && f.is_none() => (Dir::Backward, last.map_or(default_page, rows)),
+        (Some(f), None) => (Dir::Forward, rows(f)),
+        (None, Some(l)) => (Dir::Backward, rows(l)),
+        (None, None) => (Dir::Forward, default_page),
+    }
 }
 
 impl PageArgs {
@@ -113,36 +139,34 @@ impl PageArgs {
             last,
             before,
             after,
-            wide: false,
         }
     }
 
-    /// Clamp to the wide page (block lists and account balances, R-P5P9-20) instead of
-    /// `max_page`.
-    pub fn wide(mut self) -> PageArgs {
-        self.wide = true;
-        self
-    }
-
-    /// The page. `first` with `last`, negative counts, `after` with `last` or `before` with
-    /// `first` are `BAD_USER_INPUT`; counts above `max_page` are clamped (GQ-9).
+    /// The page, read as stock's `getPaginationParams` reads it (FIX-3 part D, P4): `first`
+    /// and `last` by truthiness, so `0` is the default page (20, forward) without a cursor,
+    /// while with a cursor the cursor's own count is taken as given (`first ?? 20`).
+    /// `first` with `last`, negative counts, `after` with `last` or `before` with `first` are
+    /// `BAD_USER_INPUT`. No count is clamped: stock's complexity gate (`stock_limits`, run
+    /// before any resolver) bounds `first` and `last`, and a count above the safety cap
+    /// [`crate::MAX_PAGE_ROWS`] is refused ([`crate::error::page_limit`]).
     pub fn parse(&self, s: &GraphqlSettings) -> async_graphql::Result<Page<PageCursor>> {
-        let cap = if self.wide { s.wide_page() } else { s.max_page };
-        let clamp = |n: i32| -> async_graphql::Result<usize> {
-            if n < 0 {
-                return Err(bad_input("first and last must not be negative"));
-            }
-            Ok((n as usize).min(cap))
-        };
-        let (dir, n) = match (self.first, self.last) {
-            (Some(_), Some(_)) => return Err(bad_input("pass first or last, not both")),
-            (Some(f), None) => (Dir::Forward, clamp(f)?),
-            (None, Some(l)) => (Dir::Backward, clamp(l)?),
-            (None, None) if self.before.is_some() && self.after.is_none() => {
-                (Dir::Backward, s.default_page.min(s.max_page))
-            }
-            (None, None) => (Dir::Forward, s.default_page.min(s.max_page)),
-        };
+        if self.first.is_some_and(|n| n < 0) || self.last.is_some_and(|n| n < 0) {
+            return Err(bad_input("first and last must not be negative"));
+        }
+        if self.first.is_some_and(|n| n != 0) && self.last.is_some_and(|n| n != 0) {
+            return Err(bad_input("pass first or last, not both"));
+        }
+        let (dir, n) = served_page(
+            self.first.map(i64::from),
+            self.last.map(i64::from),
+            self.after.is_some(),
+            self.before.is_some(),
+            s.default_page as u64,
+        );
+        let n = n as usize;
+        if n > crate::MAX_PAGE_ROWS {
+            return Err(crate::error::page_limit());
+        }
         let cursor = match (dir, &self.after, &self.before) {
             (_, Some(_), Some(_)) => return Err(bad_input("pass after or before, not both")),
             (Dir::Forward, Some(a), None) => Some(PageCursor::decode(a)?),
@@ -202,6 +226,8 @@ pub enum Total {
     #[default]
     Unsupported,
     Exact(u64),
+    /// Counted with the page but cut by the deadline: a lower bound, flagged (audit F-50).
+    LowerBound(u64),
     Deferred(Arc<CountFn>),
 }
 
@@ -210,6 +236,10 @@ impl Total {
         let n = match self {
             Total::Unsupported => return Err(not_supported("totalCount")),
             Total::Exact(n) => *n,
+            Total::LowerBound(n) => {
+                crate::flags::mark(ctx, crate::flags::Flag::CountLowerBound);
+                *n
+            }
             Total::Deferred(f) => {
                 let (n, exact) = f().await?;
                 if !exact {
@@ -230,33 +260,83 @@ mod tests {
         GraphqlSettings::default()
     }
 
+    /// FIX-3 part C: no clamp (stock has none; its complexity gate bounds the page), and
+    /// stock's 20 when `first`/`last` are absent.
     #[test]
-    fn page_sizes_are_clamped_not_refused() {
+    fn page_sizes_are_served_as_asked() {
         let p = PageArgs::new(None, None, Some(1000), None)
             .parse(&s())
             .unwrap();
-        assert_eq!((p.dir, p.n), (Dir::Forward, 100));
+        assert_eq!((p.dir, p.n), (Dir::Forward, 1000));
         let p = PageArgs::new(None, None, None, Some(5))
             .parse(&s())
             .unwrap();
         assert_eq!((p.dir, p.n), (Dir::Backward, 5));
         let p = PageArgs::default().parse(&s()).unwrap();
         assert_eq!((p.dir, p.n), (Dir::Forward, 20));
-        // The wide clamp (block lists, account balances): up to 200, no further.
-        let p = PageArgs::new(None, None, Some(120), None)
-            .wide()
-            .parse(&s())
-            .unwrap();
-        assert_eq!(p.n, 120);
+    }
+
+    /// FIX-3 part D (S3): a hard safety cap of [`crate::MAX_PAGE_ROWS`] rows per page, after
+    /// stock's gate; above it a `LIMIT` refusal named `page` (stock answers such pages slowly
+    /// or times out).
+    #[test]
+    fn pages_above_the_safety_cap_are_refused() {
         let p = PageArgs::new(None, None, Some(1000), None)
-            .wide()
             .parse(&s())
             .unwrap();
-        assert_eq!(p.n, 200);
-        let p = PageArgs::new(None, None, Some(120), None)
+        assert_eq!(p.n, crate::MAX_PAGE_ROWS);
+        for a in [
+            PageArgs::new(None, None, Some(1001), None),
+            PageArgs::new(None, None, None, Some(1_000_000)),
+            PageArgs::new(None, None, Some(i32::MAX), None),
+        ] {
+            let e = a.parse(&s()).unwrap_err();
+            let x = e.extensions.as_ref().unwrap();
+            assert_eq!(
+                x.get("code"),
+                Some(&async_graphql::Value::from("LIMIT")),
+                "{a:?}"
+            );
+            assert_eq!(
+                x.get("limit"),
+                Some(&async_graphql::Value::from("page")),
+                "{a:?}"
+            );
+            assert!(e.message.contains("1000"), "{}", e.message);
+        }
+    }
+
+    /// FIX-3 part D (P4): stock's `getPaginationParams` reads `first`/`last` by truthiness, so
+    /// `0` is the default page of 20 (forward) without a cursor; with a cursor stock takes
+    /// `first ?? 20`, so 0 stays 0.
+    #[test]
+    fn zero_is_stock_s_default_page() {
+        let p = PageArgs::new(None, None, Some(0), None)
             .parse(&s())
             .unwrap();
-        assert_eq!(p.n, 100);
+        assert_eq!((p.dir, p.n), (Dir::Forward, 20));
+        let p = PageArgs::new(None, None, None, Some(0))
+            .parse(&s())
+            .unwrap();
+        assert_eq!((p.dir, p.n), (Dir::Forward, 20));
+        // `first: 0, last: 5`: stock's "not both" check reads truthiness too.
+        let p = PageArgs::new(None, None, Some(0), Some(5))
+            .parse(&s())
+            .unwrap();
+        assert_eq!((p.dir, p.n), (Dir::Backward, 5));
+        let c = BlockCursor {
+            height: 1,
+            chain: 0,
+        }
+        .encode();
+        let p = PageArgs::new(Some(c.clone()), None, Some(0), None)
+            .parse(&s())
+            .unwrap();
+        assert_eq!((p.dir, p.n), (Dir::Forward, 0));
+        let p = PageArgs::new(None, Some(c), None, None)
+            .parse(&s())
+            .unwrap();
+        assert_eq!((p.dir, p.n), (Dir::Backward, 20));
     }
 
     #[test]

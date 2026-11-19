@@ -95,6 +95,10 @@ fn dict_name(txn: &impl Txn, k: DictKind, id: u32) -> Result<Option<String>> {
 }
 
 /// Whether the stored details still cover a balance row at `row_as_of`.
+///
+/// TODO(D2): height-only. A details answer read on an orphan at the same height is kept until
+/// the balance row's `as_of` moves; `crate::reconcile::branch_of` on the answer's
+/// `prevBlockHash` would close it, as `nft_fill` does (see `docs/operations.md`, Branch check).
 fn covers(as_of: Option<u32>, row_as_of: u32) -> bool {
     as_of.is_some_and(|h| h >= row_as_of)
 }
@@ -182,7 +186,7 @@ async fn call(local: &LocalClient, p: &Planned) -> Outcome {
             .nft_guard(p.chain, &p.ledger, &p.token_id, account)
             .await
             .map(|r| match r {
-                Local::Found { value, height } => {
+                Local::Found { value, height, .. } => {
                     Outcome::Guard(value, u32::try_from(height).unwrap_or(u32::MAX))
                 }
                 Local::Absent => Outcome::Absent,
@@ -191,7 +195,7 @@ async fn call(local: &LocalClient, p: &Planned) -> Outcome {
             .nft_token_info(p.chain, &p.ledger, &p.token_id)
             .await
             .map(|r| match r {
-                Local::Found { value, height } => {
+                Local::Found { value, height, .. } => {
                     Outcome::Info(value, u32::try_from(height).unwrap_or(u32::MAX))
                 }
                 Local::Absent => Outcome::Absent,
@@ -205,7 +209,7 @@ async fn call(local: &LocalClient, p: &Planned) -> Outcome {
         {
             Outcome::Undefined
         }
-        Err(LocalError::Failure(m)) => {
+        Err(LocalError::Failure(m) | LocalError::Invalid(m)) => {
             tracing::debug!(ledger = %p.ledger, message = %m, "nft details: call failed");
             Outcome::Failed
         }

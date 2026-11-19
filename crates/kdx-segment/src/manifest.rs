@@ -226,13 +226,31 @@ impl Manifest {
             .iter()
             .position(|e| e.end == merged.end)
             .context("merge end not in manifest")?;
+        if i > j {
+            bail!(
+                "merge span {}..{} is inverted in the manifest",
+                merged.start,
+                merged.end
+            );
+        }
         let old: Vec<RangeEntry> = self.entries[i..=j].to_vec();
-        let txs: u64 = old.iter().map(|e| e.tx_count).sum();
-        if old[0].first_txnum != merged.first_txnum || txs != merged.tx_count {
+        let sum = |f: fn(&RangeEntry) -> u64| {
+            old.iter()
+                .try_fold(0u64, |a, e| a.checked_add(f(e)))
+                .context("merge counts overflow")
+        };
+        if old[0].first_txnum != merged.first_txnum
+            || sum(|e| e.tx_count)? != merged.tx_count
+            || sum(|e| e.block_count)? != merged.block_count
+        {
             bail!("merge counts differ from the replaced entries");
         }
-        self.entries.splice(i..=j, [merged]);
-        self.validate()?;
+        // Validate the result before it replaces anything: a refused merge leaves `self` as
+        // it was.
+        let mut next = self.clone();
+        next.entries.splice(i..=j, [merged]);
+        next.validate()?;
+        *self = next;
         Ok(old)
     }
 

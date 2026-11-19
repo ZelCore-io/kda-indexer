@@ -16,6 +16,7 @@ use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::{header, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use axum::serve::ListenerExt;
 use axum::Router;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -32,6 +33,9 @@ pub struct ApiSettings {
     pub max_in_flight: usize,
     pub max_body_bytes: usize,
     pub v1txs_max_body_bytes: usize,
+    /// Deadline of a `/v1/txs` request (kda-txs answers within 30 s); every other request
+    /// has `deadline`.
+    pub v1txs_deadline: Duration,
     pub rate_per_ip: u32,
     pub rate_burst: u32,
     pub trusted_proxies: Vec<IpNet>,
@@ -112,9 +116,13 @@ pub struct ApiState {
     /// Status and readiness reads (`/readyz`, `/status`, the sampler): their own slots, so
     /// a busy pool never fails health checks.
     status_reads: Arc<Semaphore>,
-    /// Expensive request classes (events scan, `/v1/txs`) take one of these before a read
-    /// slot: at most half the pool, so they cannot hold every slot.
+    /// Expensive request classes (events scan, account lists and counts) take one of these
+    /// before a read slot: at most half the pool, so they cannot hold every slot.
     heavy: Arc<Semaphore>,
+    /// `/v1/txs` reads (up to `v1txs_deadline` each) take one of these instead of a `heavy`
+    /// slot: [`v1txs_slots`] of the pool, so a long one never holds a slot of the GraphQL
+    /// or compat lists (FIX-4 part C, S-1).
+    v1txs: Arc<Semaphore>,
     /// Heavy reads per client key (H-1): one runs, [`HEAVY_WAITING_PER_CLIENT`] wait.
     heavy_clients: Arc<HeavyClients>,
     in_flight: Arc<Semaphore>,
@@ -144,6 +152,10 @@ pub async fn as_client<F: std::future::Future>(ip: std::net::IpAddr, f: F) -> F:
 /// heavy slot, so with two or more slots one client cannot stall another's lists.
 pub const HEAVY_WAITING_PER_CLIENT: usize = 3;
 
+/// The 503 text of a client whose heavy-read queue is full (no `Retry-After`).
+pub(crate) const HEAVY_BUSY: &str =
+    "this client already runs a heavy request and has others waiting: retry when they are done";
+
 /// Heavy reads in flight per client key: the client's one-slot semaphore and its users
 /// (running and waiting).
 #[derive(Default)]
@@ -166,10 +178,7 @@ impl HeavyClients {
             .or_insert_with(|| (Arc::new(Semaphore::new(1)), 0));
         if e.1 > HEAVY_WAITING_PER_CLIENT {
             tracing::debug!(client = %key, "api: heavy read refused, client queue full");
-            return Err(ApiError::Unavailable(
-                "this client already runs a heavy request and has others waiting: retry when they are done"
-                    .into(),
-            ));
+            return Err(ApiError::Unavailable(HEAVY_BUSY.into()));
         }
         e.1 += 1;
         Ok(HeavyTicket {
@@ -230,6 +239,36 @@ impl ApiState {
             .await
     }
 
+    /// A `/v1/txs` read (FIX-4 part C, S-1): the client's heavy slot, then a slot of the
+    /// `/v1/txs` pool (not a shared `heavy` one), then a read slot. Waiting for the slots is
+    /// bounded by `settings.deadline` and answers 503 past it; the read itself has
+    /// `settings.v1txs_deadline` (kda-txs' own 30 s).
+    pub async fn read_v1txs<T, F>(self: &Arc<Self>, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        let s = &self.settings;
+        let wait = Slots {
+            first: Some(&self.v1txs),
+            pool: &self.reads,
+            until: Instant::now() + s.deadline,
+            late: || ApiError::Unavailable(V1TXS_BUSY.into()),
+        };
+        let t = Instant::now();
+        let r = self.read_slots(wait, Some(s.v1txs_deadline), f).await;
+        // To size the pool from real traffic (S-1): the reads that took longer than any
+        // other request may.
+        if t.elapsed() > s.deadline {
+            tracing::info!(
+                ms = t.elapsed().as_millis() as u64,
+                ok = r.is_ok(),
+                "api: slow /v1/txs read"
+            );
+        }
+        r
+    }
+
     /// Take `n` more rate tokens for the client of this request (the guard took one): a
     /// GraphQL batch of N takes N. False when the client has fewer left.
     pub fn allow_extra(&self, peer: SocketAddr, headers: &axum::http::HeaderMap, n: u32) -> bool {
@@ -281,6 +320,8 @@ impl ApiState {
             .await
     }
 
+    /// The slots in `pool` (after `first`, if any) within `budget`, which also bounds the
+    /// read: a wait past it is [`ApiError::Deadline`].
     async fn read_on<T, F>(
         self: &Arc<Self>,
         first: Option<&Arc<Semaphore>>,
@@ -292,10 +333,36 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
-        let deadline = Instant::now() + budget;
-        let acquire = |s: &Arc<Semaphore>| {
-            tokio::time::timeout_at(deadline.into(), s.clone().acquire_owned())
+        let wait = Slots {
+            first,
+            pool,
+            until: Instant::now() + budget,
+            late: || ApiError::Deadline,
         };
+        self.read_slots(wait, None, f).await
+    }
+
+    /// Take the slots of `wait` (`late()` past `wait.until`), then run `f` on a blocking
+    /// thread with a view whose deadline is `run` from now, or `wait.until` when `run` is
+    /// `None` (one budget for the waits and the read).
+    async fn read_slots<T, F>(
+        self: &Arc<Self>,
+        wait: Slots<'_>,
+        run: Option<Duration>,
+        f: F,
+    ) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        let Slots {
+            first,
+            pool,
+            until,
+            late,
+        } = wait;
+        let acquire =
+            |s: &Arc<Semaphore>| tokio::time::timeout_at(until.into(), s.clone().acquire_owned());
         // A heavy read of a known client first waits for that client's own slot (H-1), so
         // the shared heavy slots are held by at most one read per client.
         let own: Option<(HeavyTicket, OwnedSemaphorePermit)> = match first {
@@ -304,7 +371,7 @@ impl ApiState {
                     let t = self.heavy_clients.enter(key)?;
                     let p = acquire(&t.slot)
                         .await
-                        .map_err(|_| ApiError::Deadline)?
+                        .map_err(|_| late())?
                         .map_err(|e| ApiError::Internal(e.into()))?;
                     Some((t, p))
                 }
@@ -316,15 +383,16 @@ impl ApiState {
             Some(s) => Some(
                 acquire(s)
                     .await
-                    .map_err(|_| ApiError::Deadline)?
+                    .map_err(|_| late())?
                     .map_err(|e| ApiError::Internal(e.into()))?,
             ),
             None => None,
         };
         let permit = acquire(pool)
             .await
-            .map_err(|_| ApiError::Deadline)?
+            .map_err(|_| late())?
             .map_err(|e| ApiError::Internal(e.into()))?;
+        let deadline = run.map_or(until, |d| Instant::now() + d);
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let _p = (permit, gate, own);
@@ -335,6 +403,22 @@ impl ApiState {
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("read task: {e}")))?
     }
+}
+
+/// The slots a read waits for, until when, and the error past it.
+struct Slots<'a> {
+    first: Option<&'a Arc<Semaphore>>,
+    pool: &'a Arc<Semaphore>,
+    until: Instant,
+    late: fn() -> ApiError,
+}
+
+/// The 503 of a `/v1/txs` read that found no slot within the normal deadline.
+pub(crate) const V1TXS_BUSY: &str = "too many /v1/txs requests running: retry later";
+
+/// The `/v1/txs` slots for `read_threads` read threads: a quarter, at least one (S-1).
+fn v1txs_slots(read_threads: usize) -> usize {
+    (read_threads / 4).max(1)
 }
 
 impl IntoResponse for ApiError {
@@ -365,7 +449,7 @@ const STATUS_READS: usize = 2;
 pub const CHAINWEB_NEXT: HeaderName = HeaderName::from_static("chainweb-next");
 
 /// Limits of a data listener: in-flight cap, per-IP rate, deadline, body cap.
-async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
+pub(crate) async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
     let Ok(slot) = st.in_flight.clone().try_acquire_owned() else {
         return ApiError::Unavailable("too many requests in flight".into()).into_response();
     };
@@ -380,10 +464,20 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
                 .into_response();
         }
     }
-    let cap = if req.uri().path().starts_with("/v1/txs") {
-        st.settings.v1txs_max_body_bytes
+    let path = req.uri().path();
+    let is_docs = path == "/docs" || path.starts_with("/docs/");
+    let (cap, deadline) = if is_docs {
+        // The embedded Swagger UI bundle is larger than a small `api.max_body_mb`; it is
+        // static and fixed, so the body cap does not apply to it.
+        (usize::MAX, st.settings.deadline)
+    } else if path.starts_with("/v1/txs") {
+        // The slot wait (`deadline`) plus the read (`v1txs_deadline`), as `read_v1txs`.
+        (
+            st.settings.v1txs_max_body_bytes,
+            st.settings.deadline + st.settings.v1txs_deadline,
+        )
     } else {
-        st.settings.max_body_bytes
+        (st.settings.max_body_bytes, st.settings.deadline)
     };
     let delay = debug_delay();
     let client = req
@@ -399,7 +493,7 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
             None => next.run(req).await,
         }
     };
-    let resp = match tokio::time::timeout(st.settings.deadline, run).await {
+    let resp = match tokio::time::timeout(deadline, run).await {
         Ok(r) => r,
         Err(_) => return ApiError::Deadline.into_response(),
     };
@@ -411,13 +505,160 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
         ))
         .into_response();
     }
-    // The in-flight slot lives in the body: released when the body is sent or dropped.
+    // Fixed embedded files need no read slot: a client reading them slowly must not pin one
+    // of `max_in_flight` (the rate limit still applies).
+    if is_docs {
+        return resp;
+    }
+    // The in-flight slot lives in the body: released when hyper has taken the body's last
+    // frame (handlers build one frame) into its write buffer, or drops the body. That is
+    // not when the client has read it: a client that stops reading holds no slot (checked
+    // by `a_stalled_client_holds_no_in_flight_slot`), only buffered bytes, and the
+    // listener's write-idle timeout cuts it (F-08).
     resp.map(|b| {
         Body::new(HoldSlot {
             inner: b,
             _slot: slot,
         })
     })
+}
+
+/// A listener whose connections are cut when a write makes no progress for `idle` (F-08):
+/// a client that stops reading cannot pin its buffered response for longer. TCP keepalive
+/// is on, so a peer that vanished is found too.
+struct IdleCutListener {
+    inner: tokio::net::TcpListener,
+    idle: Duration,
+}
+
+impl axum::serve::Listener for IdleCutListener {
+    type Io = WriteIdle<tokio::net::TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (s, a) = axum::serve::Listener::accept(&mut self.inner).await;
+        set_keepalive(&s);
+        (
+            WriteIdle {
+                inner: s,
+                idle: self.idle,
+                stalled: None,
+            },
+            a,
+        )
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+/// `SO_KEEPALIVE` on an accepted connection (best effort).
+fn set_keepalive(s: &tokio::net::TcpStream) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let on: libc::c_int = 1;
+        // SAFETY: a valid socket fd and a c_int option value of the given size.
+        unsafe {
+            libc::setsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                std::ptr::addr_of!(on).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = s;
+}
+
+/// A stream whose writes fail with `TimedOut` once they have made no progress for `idle`.
+/// The timer runs only while a write is pending and restarts on any progress, so a slow
+/// client that keeps reading is never cut.
+struct WriteIdle<S> {
+    inner: S,
+    idle: Duration,
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteIdle<S> {
+    /// After the inner stream answered `r`: progress clears the timer; `Pending` starts or
+    /// polls it, and an expired timer is the error.
+    fn watch<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        r: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future;
+        use std::task::Poll;
+        if r.is_ready() {
+            self.stalled = None;
+            return r;
+        }
+        let idle = self.idle;
+        let t = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+        match t.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client stopped reading (write idle timeout)",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteIdle<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteIdle<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.watch(cx, r)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.watch(cx, r)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.watch(cx, r)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.watch(cx, r)
+    }
 }
 
 /// A response body holding its request's in-flight slot.
@@ -490,8 +731,14 @@ pub struct Api {
     native: Router<Arc<ApiState>>,
     compat: Router<Arc<ApiState>>,
     graphql: Router<Arc<ApiState>>,
+    docs: bool,
     on_bound: Option<OnBound>,
+    write_idle: Duration,
 }
+
+/// Default write-idle timeout of a connection (F-08): a client that reads nothing of a
+/// response for this long is disconnected, so it cannot pin the buffered response.
+pub const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What `on_bound` receives: every listener name with the address it actually bound (so a
 /// test can bind port 0 and read the port back).
@@ -504,6 +751,7 @@ impl Api {
             reads: Arc::new(Semaphore::new(settings.read_threads.max(1))),
             status_reads: Arc::new(Semaphore::new(STATUS_READS)),
             heavy: Arc::new(Semaphore::new((settings.read_threads / 2).max(1))),
+            v1txs: Arc::new(Semaphore::new(v1txs_slots(settings.read_threads))),
             heavy_clients: Arc::default(),
             key_modules: std::sync::OnceLock::new(),
             stats_cache: &crate::compat::stats::CACHE,
@@ -518,7 +766,9 @@ impl Api {
             native: Router::new().route("/status", axum::routing::get(status::handler)),
             compat: Router::new(),
             graphql: Router::new(),
+            docs: true,
             on_bound: None,
+            write_idle: WRITE_IDLE_TIMEOUT,
         }
     }
 
@@ -539,6 +789,20 @@ impl Api {
         Arc::get_mut(&mut self.state)
             .expect("with_stats_cache before state()")
             .stats_cache = c;
+        self
+    }
+
+    /// Serve Swagger UI and the OpenAPI documents under `/docs` on the native and compat
+    /// listeners (default on; `api.docs_enabled`).
+    pub fn docs_enabled(mut self, on: bool) -> Api {
+        self.docs = on;
+        self
+    }
+
+    /// Cut a connection whose writes make no progress for `d` (default
+    /// [`WRITE_IDLE_TIMEOUT`]).
+    pub fn write_idle_timeout(mut self, d: Duration) -> Api {
+        self.write_idle = d;
         self
     }
 
@@ -564,6 +828,7 @@ impl Api {
     pub async fn serve(self, binds: Binds, shutdown: CancellationToken) -> anyhow::Result<()> {
         let st = self.state;
         let on_bound = self.on_bound;
+        let write_idle = self.write_idle;
         for (name, list) in [("native", &binds.native), ("admin", &binds.admin)] {
             for a in list {
                 anyhow::ensure!(
@@ -577,13 +842,29 @@ impl Api {
                 .layer(middleware::from_fn_with_state(api, track))
                 .with_state(st.clone())
         };
-        let native = data(self.native, "native");
-        let compat = data(self.compat, "compat").layer(
+        // Swagger UI and the specs ride on the two REST listeners only (never admin, which
+        // carries /metrics, nor GraphQL), behind the same guard as their data routes.
+        let (native_routes, compat_routes) = if self.docs {
+            (
+                self.native
+                    .merge(crate::docs::router(crate::docs::Primary::Native)),
+                self.compat
+                    .merge(crate::docs::router(crate::docs::Primary::Compat)),
+            )
+        } else {
+            (self.native, self.compat)
+        };
+        let native = data(native_routes, "native");
+        let compat = data(compat_routes, "compat").layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any)
-                .expose_headers([CHAINWEB_NEXT, crate::compat::stats::COUNT_AGE]),
+                .expose_headers([
+                    CHAINWEB_NEXT,
+                    crate::compat::stats::COUNT_AGE,
+                    crate::compat::SEARCH_TRUNCATED,
+                ]),
         );
         let graphql = data(self.graphql, "graphql").layer(
             CorsLayer::new()
@@ -627,6 +908,12 @@ impl Api {
             tracing::info!(listener = name, %addr, "api: listening");
             addrs.push((name, addr));
             let stop = stop.clone();
+            // `tap_io` only makes the connect info (`SocketAddr`) available for the wrapper.
+            let l = IdleCutListener {
+                inner: l,
+                idle: write_idle,
+            }
+            .tap_io(|_| {});
             tasks.spawn(async move {
                 axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>())
                     .with_graceful_shutdown(stop.cancelled_owned())
@@ -666,7 +953,7 @@ pub fn json(v: &serde_json::Value) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn settings(read_threads: usize) -> ApiSettings {
@@ -676,6 +963,7 @@ mod tests {
             max_in_flight: 16,
             max_body_bytes: 1 << 20,
             v1txs_max_body_bytes: 1 << 20,
+            v1txs_deadline: std::time::Duration::from_secs(30),
             rate_per_ip: 20,
             rate_burst: 40,
             trusted_proxies: Vec::new(),
@@ -683,6 +971,109 @@ mod tests {
             ready_max_lag: 10,
             max_event_lists: 64,
         }
+    }
+
+    /// A body larger than the loopback socket buffers, so a client that does not read
+    /// leaves most of it unsent.
+    const BIG: usize = 32 << 20;
+
+    /// A native listener serving `/big` (`BIG` bytes) with a write-idle timeout of `idle`:
+    /// (data dir, state, address, stop, serve task).
+    async fn serve_big(
+        idle: Duration,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ApiState>,
+        SocketAddr,
+        CancellationToken,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (d, store) = crate::testutil::store();
+        let mut cfg = settings(4);
+        cfg.max_in_flight = 4;
+        cfg.max_body_bytes = 64 << 20;
+        cfg.deadline = Duration::from_secs(10);
+        let big = Router::new().route("/big", axum::routing::get(|| async { vec![b'x'; BIG] }));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let api = Api::new(store, cfg, TipWatch::default())
+            .native_routes(big)
+            .write_idle_timeout(idle)
+            .on_bound(move |a| {
+                let _ = tx.send(a.to_vec());
+            });
+        let st = api.state();
+        let binds = Binds {
+            native: vec!["127.0.0.1:0".parse().unwrap()],
+            ..Binds::default()
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(api.serve(binds, stop.clone()));
+        let addr = rx.await.unwrap()[0].1;
+        (d, st, addr, stop, task)
+    }
+
+    /// Send `GET /big`, wait `stall` without reading, then read everything at `step` bytes
+    /// per `pause`: the bytes received before the connection ended.
+    async fn read_big(addr: SocketAddr, stall: Duration, step: usize, pause: Duration) -> usize {
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            c.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(stall);
+            let mut got = 0;
+            let mut buf = vec![0u8; step];
+            loop {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => return got,
+                    Ok(n) => got += n,
+                }
+                std::thread::sleep(pause);
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    /// F-08 (triage check): a client that stops reading a whole-body response does not hold
+    /// an in-flight slot: hyper takes the single frame into its write buffer and drops the
+    /// body (and the slot) at once; only the bytes stay buffered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_client_holds_no_in_flight_slot() {
+        let (_d, st, addr, stop, task) = serve_big(Duration::from_secs(60)).await;
+        let reader = tokio::spawn(read_big(
+            addr,
+            Duration::from_millis(1500),
+            1 << 20,
+            Duration::ZERO,
+        ));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            st.in_flight.available_permits(),
+            4,
+            "slot released while stalled"
+        );
+        let got = reader.await.unwrap();
+        assert!(got > BIG, "a reader that resumes gets it all ({got})");
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// F-08: a client that stops reading is disconnected once writes make no progress for
+    /// the write-idle timeout; a slow client that keeps reading is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_client_is_cut_after_the_write_idle_timeout() {
+        let (_d, _st, addr, stop, task) = serve_big(Duration::from_millis(400)).await;
+        let stalled = read_big(addr, Duration::from_millis(2500), 1 << 20, Duration::ZERO).await;
+        assert!(
+            stalled < BIG,
+            "stalled client got the whole body ({stalled})"
+        );
+        let slow = read_big(addr, Duration::ZERO, 1 << 20, Duration::from_millis(40)).await;
+        assert!(slow > BIG, "slow reader got {slow} of {BIG}+headers");
+        stop.cancel();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -702,6 +1093,47 @@ mod tests {
         assert_eq!(st.in_flight.available_permits(), 0, "body not sent yet");
         drop(resp);
         assert_eq!(st.in_flight.available_permits(), 1);
+    }
+
+    /// S3 and M3: the body cap does not apply to `/docs`, and a docs response does not hold
+    /// an in-flight slot while it streams; a data route and `/v1/txs` over the cap are 503.
+    #[tokio::test]
+    async fn docs_are_exempt_from_the_body_cap_and_the_slot() {
+        use tower::ServiceExt;
+        let (_d, store) = crate::testutil::store();
+        let mut cfg = settings(4);
+        cfg.max_body_bytes = 1 << 20;
+        cfg.v1txs_max_body_bytes = 1 << 20;
+        cfg.max_in_flight = 1;
+        let st = Api::new(store, cfg, TipWatch::default()).state();
+        let big = || async { vec![b'x'; 2 << 20] };
+        let app = Router::new()
+            .route("/docs/big", axum::routing::get(big))
+            .route("/big", axum::routing::get(big))
+            .route("/v1/txs/big", axum::routing::get(big))
+            .layer(middleware::from_fn_with_state(st.clone(), guard))
+            .with_state(st.clone());
+        let get = |p: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(Request::builder().uri(p).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        let r = get("/docs/big").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            st.in_flight.available_permits(),
+            1,
+            "a docs body must not hold a slot"
+        );
+        drop(r);
+        for p in ["/big", "/v1/txs/big"] {
+            let r = get(p).await;
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{p}");
+            drop(r);
+        }
     }
 
     /// A free port on `ip` (bound once and released; the tests bind it again right away).
@@ -924,5 +1356,343 @@ mod tests {
         }
         assert_eq!(st.heavy_clients.users(bucket_key(a)), 0);
         assert_eq!(st.heavy.available_permits(), 2);
+    }
+
+    /// FIX-4 part B (B1), part C (S-1): `read_v1txs` reads within `v1txs_deadline` (the
+    /// view's deadline), not `settings.deadline`.
+    #[tokio::test]
+    async fn read_v1txs_reads_with_its_own_budget() {
+        let (_d, store) = crate::testutil::store();
+        // settings(): a 500 ms deadline.
+        let mut cfg = settings(4);
+        cfg.v1txs_deadline = Duration::from_secs(5);
+        let st = Api::new(store.clone(), cfg.clone(), TipWatch::default()).state();
+        let slow = |v: &View| {
+            std::thread::sleep(Duration::from_millis(700));
+            v.check_deadline()
+        };
+        assert!(matches!(st.read_heavy(slow).await, Err(ApiError::Deadline)));
+        assert!(st.read_v1txs(slow).await.is_ok());
+        cfg.v1txs_deadline = Duration::from_millis(100);
+        let st = Api::new(store, cfg, TipWatch::default()).state();
+        assert!(matches!(st.read_v1txs(slow).await, Err(ApiError::Deadline)));
+    }
+
+    /// FIX-4 part C (S-1): `/v1/txs` reads have their own pool, `max(1, read_threads / 4)`,
+    /// not the shared heavy slots: two long `/v1/txs` reads of two clients leave every heavy
+    /// slot to the GraphQL and compat lists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn long_v1txs_reads_do_not_block_other_heavy_routes() {
+        let (_d, store) = crate::testutil::store();
+        let mut cfg = settings(4);
+        cfg.v1txs_deadline = Duration::from_secs(30);
+        let st = Api::new(store.clone(), cfg.clone(), TipWatch::default()).state();
+        assert_eq!(st.v1txs.available_permits(), 1);
+        for (threads, pool) in [(1, 1), (7, 1), (8, 2), (16, 4)] {
+            cfg.read_threads = threads;
+            let s = Api::new(store.clone(), cfg.clone(), TipWatch::default()).state();
+            assert_eq!(s.v1txs.available_permits(), pool, "read_threads {threads}");
+        }
+        let a: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let b: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let c: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let long =
+            |ip, st: Arc<ApiState>, rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>| {
+                tokio::spawn(as_client(ip, async move {
+                    st.read_v1txs(move |_| {
+                        let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                        Ok(())
+                    })
+                    .await
+                }))
+            };
+        let l1 = long(a, st.clone(), rx.clone());
+        let l2 = long(b, st.clone(), rx.clone());
+        let until = Instant::now() + Duration::from_secs(2);
+        while st.v1txs.available_permits() > 0 && Instant::now() < until {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(st.v1txs.available_permits(), 0);
+        // Every heavy slot is free: another client's heavy list answers at once.
+        assert_eq!(st.heavy.available_permits(), 2);
+        for _ in 0..2 {
+            let t = Instant::now();
+            assert!(as_client(c, st.read_heavy(|_| Ok(()))).await.is_ok());
+            assert!(
+                t.elapsed() < Duration::from_millis(300),
+                "{:?}",
+                t.elapsed()
+            );
+        }
+        for _ in 0..2 {
+            let _ = tx.send(());
+        }
+        assert!(l1.await.unwrap().is_ok());
+        // The second ran after the first or, past its 500 ms wait, was refused with 503;
+        // either way it never held a heavy slot.
+        let _ = l2.await.unwrap();
+        assert_eq!(st.heavy.available_permits(), 2);
+        assert_eq!(st.v1txs.available_permits(), 1);
+    }
+
+    /// FIX-4 part C (S-1): waiting for a `/v1/txs` slot is bounded by the normal deadline,
+    /// past which the answer is 503 (the overload answer), not the 30 s read budget.
+    #[tokio::test]
+    async fn v1txs_slot_wait_is_capped_at_the_normal_deadline() {
+        let (_d, store) = crate::testutil::store();
+        // settings(): a 500 ms deadline (5 s in production), a 30 s /v1/txs budget.
+        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let _busy = st.v1txs.clone().acquire_owned().await.unwrap();
+        let t = Instant::now();
+        let r = st.read_v1txs(|_| Ok(())).await;
+        let waited = t.elapsed();
+        assert!(matches!(r, Err(ApiError::Unavailable(_))), "{r:?}");
+        assert!(
+            waited >= Duration::from_millis(450) && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        let resp = r.unwrap_err().into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // A /v1/txs read never waits on, or holds, a shared heavy slot.
+        let _heavy = st.heavy.clone().acquire_many_owned(2).await.unwrap();
+        drop(_busy);
+        assert!(st.read_v1txs(|_| Ok(())).await.is_ok());
+    }
+
+    /// Block `height` on chain 0: `n` user txs of k:alice, each one `coin.TRANSFER` to k:bob.
+    fn transfer_block(height: u32, n: usize) -> kdx_decode::DecodedBlock {
+        use kdx_types::hash::b64url_encode;
+        use serde_json::json;
+        let h32 = |tag: u8| {
+            let mut b = [tag; 32];
+            b[0] = (height >> 8) as u8;
+            b[1] = height as u8;
+            b
+        };
+        let txs: Vec<_> = (0..n)
+            .map(|i| {
+                let cmd = json!({
+                    "payload": {"exec": {"data": null, "code": format!("(t {height} {i})")}},
+                    "meta": {"sender": "k:alice", "chainId": "0",
+                             "creationTime": 1_700_000_000u64 + u64::from(height),
+                             "gasLimit": 1000, "gasPrice": 1e-8, "ttl": 600},
+                    "signers": [{"pubKey": "alice-key"}],
+                    "nonce": format!("n-{height}-{i}"),
+                    "networkId": "mainnet01",
+                })
+                .to_string();
+                let rk = kdx_types::blake2b_256(cmd.as_bytes()).to_b64url();
+                let tx =
+                    serde_json::to_vec(&json!({"hash": rk, "sigs": [{"sig": "ab"}], "cmd": cmd}))
+                        .unwrap();
+                // The node's key order (the decoder checks it).
+                let ev = json!({"params": ["k:alice", "k:bob", 1.5], "name": "TRANSFER",
+                    "module": {"namespace": null, "name": "coin"},
+                    "moduleHash": b64url_encode(&[11; 32])});
+                let out = serde_json::to_vec(&json!({"gas": 1,
+                    "result": {"status": "success", "data": 1}, "reqKey": rk, "logs": null,
+                    "events": [ev], "metaData": null, "continuation": null, "txId": null}))
+                .unwrap();
+                json!([b64url_encode(&tx), b64url_encode(&out)])
+            })
+            .collect();
+        let cb = serde_json::to_vec(
+            &json!({"gas": 0, "result": {"status": "success", "data": "ok"},
+            "reqKey": b64url_encode(&h32(0xCB)), "logs": null, "events": [],
+            "metaData": null, "continuation": null, "txId": null}),
+        )
+        .unwrap();
+        let miner = br#"{"account":"k:miner","predicate":"keys-all","public-keys":["m"]}"#;
+        let payload_hash = b64url_encode(&h32(0xA4));
+        let parent = {
+            let mut b = [0xB0; 32];
+            b[0] = (height.saturating_sub(1) >> 8) as u8;
+            b[1] = height.saturating_sub(1) as u8;
+            b
+        };
+        let header = json!({
+            "nonce": "1", "creationTime": 1_700_000_000_000_000u64 + u64::from(height) * 30_000_000,
+            "parent": b64url_encode(&parent), "adjacents": {"5": b64url_encode(&h32(0xAD))},
+            "target": b64url_encode(&[0xff; 32]), "payloadHash": payload_hash, "chainId": 0,
+            "weight": b64url_encode(&[1; 32]), "height": height, "chainwebVersion": "mainnet01",
+            "epochStart": 1, "featureFlags": 0, "hash": b64url_encode(&h32(0xB0))
+        });
+        let payload = json!({
+            "transactions": txs, "minerData": b64url_encode(miner),
+            "transactionsHash": b64url_encode(&h32(0xA7)),
+            "outputsHash": b64url_encode(&h32(0xA8)),
+            "payloadHash": payload_hash, "coinbase": b64url_encode(&cb),
+        });
+        kdx_decode::decode_block(&header, &payload).expect("block decodes")
+    }
+
+    /// 100 blocks of 100 transfers each to `k:alice`, as a store. The store is opened on
+    /// the written hot store (its dictionary is read at open).
+    fn alice_store() -> (tempfile::TempDir, Arc<crate::store::Store>) {
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+        {
+            let mut w = hot.rw().unwrap();
+            let mut dict = kdx_hot::HotDict::load(&w).unwrap();
+            for h in 1..=100 {
+                let ib = kdx_decode::index_block(
+                    &transfer_block(h, 100),
+                    &kdx_decode::VerifyReport::default(),
+                    &mut dict,
+                )
+                .unwrap();
+                kdx_hot::tail::apply(&mut w, &ib, &mut dict).unwrap();
+            }
+            dict.persist(&mut w).unwrap();
+            w.commit().unwrap();
+        }
+        let store = Arc::new(crate::store::Store::open(hot, d.path()).unwrap());
+        (d, store)
+    }
+
+    /// F-21 (PR-2 review note 7): past the keep budget the walk keeps only keys and the
+    /// writer reads those rows again; the `/v1/txs` body is the same as with every row kept.
+    #[test]
+    fn v1txs_body_is_the_same_past_the_keep_budget() {
+        use crate::compat::account::KeepBudget;
+        let (_d, store) = alice_store();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let cap = 64 << 20;
+        let all = |room: usize| {
+            let mut b = KeepBudget::new(cap);
+            b.admit(cap - room).unwrap();
+            b
+        };
+        let full =
+            crate::v1txs::entries_in(&view, "k:alice", "coin", 10_000, cap, all(cap)).unwrap();
+        // Room for a few records only: the rest of the rows are keys.
+        let rows =
+            crate::v1txs::token_rows(&view, "k:alice", "coin", 10_000, &mut all(4096)).unwrap();
+        let kept = rows.iter().filter(|(_, r)| r.is_some()).count();
+        assert!(
+            kept > 0 && kept < rows.len(),
+            "kept {kept} of {}",
+            rows.len()
+        );
+        let part =
+            crate::v1txs::entries_in(&view, "k:alice", "coin", 10_000, cap, all(4096)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&full)
+                .unwrap()
+                .as_array()
+                .map(Vec::len),
+            Some(10_000)
+        );
+        assert!(part == full, "the body changed past the keep budget");
+    }
+
+    /// FIX-4 part B (B1): `/v1/txs` reads within `v1txs_deadline` (kda-txs' own 30 s), not
+    /// the per-request deadline, so `limit=10000` on a big account answers; the other routes
+    /// keep the per-request deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v1txs_has_its_own_deadline() {
+        use tower::ServiceExt;
+        let (_d, store) = alice_store();
+        let mut cfg = settings(4);
+        // Shorter than any read of this store; /v1/txs has its own budget.
+        cfg.deadline = Duration::from_millis(1);
+        cfg.v1txs_deadline = Duration::from_secs(30);
+        cfg.v1txs_max_body_bytes = 64 << 20;
+        let cfg_deadline = cfg.deadline;
+        let st = Api::new(store, cfg, TipWatch::default()).state();
+        let search = crate::search::SearchCtx::new(crate::compat::SearchSettings::default(), None);
+        let app = crate::compat::router(search)
+            .layer(middleware::from_fn_with_state(st.clone(), guard))
+            .with_state(st.clone());
+        let get = |uri: &str| {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            app.clone().oneshot(req)
+        };
+        let t0 = Instant::now();
+        let resp = get("/v1/txs/k:alice/coin/10000").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The read outlived the per-request deadline, so the 200 shows its own budget.
+        assert!(t0.elapsed() > cfg_deadline, "{:?}", t0.elapsed());
+        let body = axum::body::to_bytes(resp.into_body(), 64 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.as_array().map(Vec::len), Some(10_000));
+        // The other routes keep the per-request deadline. A read of this store takes about
+        // 1.4 ms in a release build, within the 1 ms tick of tokio's timer, so racing it
+        // against the 1 ms deadline was flaky (200 or 504). Instead every read slot is held:
+        // the request cannot finish within its deadline and must answer 504, every run.
+        let held = st
+            .reads
+            .clone()
+            .acquire_many_owned(st.settings.read_threads as u32)
+            .await
+            .unwrap();
+        // Within the per-request deadline, not the 30 s `/v1/txs` one (audit-pr5-review note
+        // 1): a route wrongly on `v1txs_deadline` would also answer 504, but after 30 s.
+        let t = Instant::now();
+        let resp = get("/txs/account/k:alice?limit=10000").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        drop(held);
+    }
+
+    /// Suite run 4: `/txs/account?chain=` beyond an i64 is chainweb-data's 400 (its `chain`
+    /// is a 64-bit `Int`); a whole number that is no chain stays an empty page.
+    #[tokio::test]
+    async fn account_chain_beyond_i64_is_a_400() {
+        use tower::ServiceExt;
+        let (_d, store) = crate::testutil::store();
+        let st = Api::new(store, settings(2), TipWatch::default()).state();
+        let search = crate::search::SearchCtx::new(crate::compat::SearchSettings::default(), None);
+        let app = crate::compat::router(search)
+            .layer(middleware::from_fn_with_state(st.clone(), guard))
+            .with_state(st.clone());
+        let get = |uri: &str| {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            app.clone().oneshot(req)
+        };
+        let body = |r: Response| async move {
+            let s = r.status();
+            let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            (s, String::from_utf8_lossy(&b).into_owned())
+        };
+        for chain in [
+            "9223372036854775808",
+            "-9223372036854775809",
+            "99999999999999999999999999999999999999999",
+        ] {
+            let (s, b) = body(
+                get(&format!(
+                    "/txs/account/k:alice?chain={chain}&limit=2&offset=10000"
+                ))
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{chain}: {b}");
+            assert!(
+                b.starts_with("Error parsing query parameter chain failed"),
+                "{chain}: {b}"
+            );
+        }
+        for chain in ["9223372036854775807", "-9223372036854775808", "20", "-1"] {
+            let (s, b) = body(
+                get(&format!("/txs/account/k:alice?chain={chain}"))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{chain}: {b}");
+            assert_eq!(b, "[]", "{chain}");
+        }
     }
 }

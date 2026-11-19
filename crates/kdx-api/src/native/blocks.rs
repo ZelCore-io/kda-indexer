@@ -279,11 +279,12 @@ fn list_in(view: &View, q: &Q) -> ApiResult<Response> {
     if let Some(cur) = &lp.cursor {
         cur.check(view)?;
     }
-    // Walk (height, chain) positions in order, from the cursor.
+    // Walk (height, chain) positions in order, from the cursor. The cursor names the last
+    // position emitted (or, after a walk cap, chain 0 or 19 of the last height walked); the
+    // walk resumes strictly past it (F-03: the strict test below does the skipping).
     let desc = lp.order == Order::Desc;
     let start = match (&lp.cursor, desc) {
-        (Some(c), true) => (c.key.height(), i32::from(c.key.chain()) - 1),
-        (Some(c), false) => (c.key.height(), i32::from(c.key.chain()) + 1),
+        (Some(c), _) => (c.key.height(), i32::from(c.key.chain())),
         (None, true) => (hi, i32::from(kdx_segment::SLOT_WIDTH as u8)),
         (None, false) => (lo, -1),
     };
@@ -334,7 +335,8 @@ fn list_in(view: &View, q: &Q) -> ApiResult<Response> {
                     },
                     0,
                 );
-                next = Some(Cursor::new(view, key, 0)?.encode());
+                // No block need exist there: a height-done token (fp 0 is accepted).
+                next = Some(Cursor::new(view, key, crate::compat::SUB_HEIGHT_DONE)?.encode());
                 if desc && h == lo || !desc && h == hi {
                     next = None;
                 }
@@ -372,5 +374,140 @@ mod tests {
             ..Q::default()
         };
         assert!(matches!(list_in(&view, &q), Err(ApiError::Deadline)));
+    }
+
+    /// Store an empty block at each `(chain, height)` and a tail checkpoint per chain.
+    fn seed(store: &crate::store::Store, at: &[(u8, u32)]) {
+        use kdx_decode::IndexedBlock;
+        use kdx_hot::{HotDict, Stage};
+        use kdx_types::Hash32;
+        let hot = store.hot_for_tests();
+        let mut w = hot.rw().unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        let mut top = [None::<u32>; 20];
+        for &(c, h) in at {
+            let mut hash = [0u8; 32];
+            hash[0] = c;
+            hash[1..5].copy_from_slice(&h.to_be_bytes());
+            let b = IndexedBlock {
+                block: BlockRecord {
+                    hash: Hash32(hash),
+                    chain: c,
+                    height: u64::from(h),
+                    ..BlockRecord::default()
+                },
+                txs: Vec::new(),
+                idx: Vec::new(),
+                cmd_reencoded: 0,
+                unindexed_accounts: 0,
+            };
+            kdx_hot::tail::apply(&mut w, &b, &mut dict).unwrap();
+            let t = &mut top[usize::from(c)];
+            *t = Some(t.map_or(h, |x| x.max(h)));
+        }
+        for (c, t) in top.iter().enumerate() {
+            if let Some(h) = t {
+                kdx_hot::set_checkpoint(&mut w, Stage::Tail, c as u8, *h, Hash32([7; 32])).unwrap();
+            }
+        }
+        w.commit().unwrap();
+    }
+
+    /// Every page of `list_in` from `q` on: the `(height, chain)` of each item, in order.
+    fn walk(view: &View, mut q: Q) -> (Vec<(u32, u8)>, usize) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut got = Vec::new();
+        let mut pages = 0;
+        loop {
+            let r = list_in(view, &q).unwrap();
+            let b = rt
+                .block_on(axum::body::to_bytes(r.into_body(), 64 << 20))
+                .unwrap();
+            let v: Value = serde_json::from_slice(&b).unwrap();
+            pages += 1;
+            for it in v["items"].as_array().unwrap() {
+                got.push((
+                    it["height"].as_u64().unwrap() as u32,
+                    it["chain"].as_u64().unwrap() as u8,
+                ));
+            }
+            match v["next_cursor"].as_str() {
+                Some(c) => q.cursor = Some(c.to_owned()),
+                None => return (got, pages),
+            }
+            assert!(pages < 100, "no end");
+        }
+    }
+
+    /// F-03: pages concatenate to the full list with no gap and no duplicate, both orders,
+    /// with and without a `chains=` subset.
+    #[test]
+    fn pages_cover_every_block_once() {
+        let (_d, store) = crate::testutil::store();
+        let mut all: Vec<(u32, u8)> = Vec::new();
+        for h in 10..13u32 {
+            for c in 0..20u8 {
+                all.push((h, c));
+            }
+        }
+        let at: Vec<(u8, u32)> = all.iter().map(|&(h, c)| (c, h)).collect();
+        seed(&store, &at);
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        for chains in [None, Some("1,3,4,9,17")] {
+            let want: Vec<(u32, u8)> = match chains {
+                None => all.clone(),
+                Some(s) => {
+                    let cs: Vec<u8> = s.split(',').map(|x| x.parse().unwrap()).collect();
+                    all.iter()
+                        .copied()
+                        .filter(|(_, c)| cs.contains(c))
+                        .collect()
+                }
+            };
+            for order in ["asc", "desc"] {
+                let q = Q {
+                    order: Some(order.into()),
+                    limit: Some(7),
+                    chains: chains.map(str::to_owned),
+                    ..Q::default()
+                };
+                let (got, _) = walk(&view, q);
+                let mut w = want.clone();
+                if order == "desc" {
+                    w.reverse();
+                }
+                assert_eq!(got, w, "order {order}, chains {chains:?}");
+            }
+        }
+    }
+
+    /// F-03: a page that ends through the walk cap resumes after the walked heights.
+    #[test]
+    fn a_page_cut_by_the_walk_cap_resumes() {
+        let (_d, store) = crate::testutil::store();
+        let far = HEIGHT_WALK_CAP + 50;
+        let at = [(0u8, 1u32), (5, 1), (3, far), (4, far), (5, far)];
+        seed(&store, &at);
+        let view = store
+            .view(Instant::now() + Duration::from_secs(600))
+            .unwrap();
+        for order in ["asc", "desc"] {
+            let q = Q {
+                order: Some(order.into()),
+                limit: Some(2),
+                ..Q::default()
+            };
+            let (got, pages) = walk(&view, q);
+            let mut w = vec![(1, 0), (1, 5), (far, 3), (far, 4), (far, 5)];
+            if order == "desc" {
+                w.reverse();
+            }
+            assert_eq!(got, w, "order {order}");
+            assert!(pages >= 3, "order {order}: {pages} pages");
+        }
     }
 }

@@ -284,6 +284,20 @@ def _tick_label(t):
     return fmt_num(round(t, 6))
 
 
+# Chart and metric ids are written into SVG attributes (`id="..."`) and chart files are
+# joined to the output dir, so both must be plain names (F-59).
+PLAIN_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def plain_id(s):
+    return isinstance(s, str) and bool(PLAIN_ID.match(s))
+
+
+def plain_file(f):
+    return (isinstance(f, str) and f == os.path.basename(f) and f not in ("", ".", "..")
+            and "\\" not in f)
+
+
 def render(chart, metrics):
     """Return the SVG text for one chart."""
     rows = [metrics[mid] for mid in chart["metrics"] if published(metrics[mid])]
@@ -390,7 +404,14 @@ def main(data_path, out_dir):
         raise SystemExit("duplicate metric id in {}".format(data_path))
     os.makedirs(out_dir, exist_ok=True)
     written = []
+    for mid in metrics:
+        if not plain_id(mid):
+            raise SystemExit("metric id {!r}: must match {}".format(mid, PLAIN_ID.pattern))
     for chart in data["charts"]:
+        if not plain_id(chart["id"]):
+            raise SystemExit("chart id {!r}: must match {}".format(chart["id"], PLAIN_ID.pattern))
+        if not plain_file(chart["file"]):
+            raise SystemExit("chart {}: file {!r} must be a bare file name".format(chart["id"], chart["file"]))
         missing = [mid for mid in chart["metrics"] if mid not in metrics]
         if missing:
             raise SystemExit("chart {}: unknown metrics {}".format(chart["id"], missing))

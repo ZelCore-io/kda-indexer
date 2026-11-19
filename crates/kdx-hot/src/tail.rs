@@ -10,6 +10,7 @@ use crate::checkpoint::{clear_checkpoint, set_checkpoint, Stage};
 use crate::dict::HotDict;
 use crate::env::{RwTxn, Txn};
 use crate::nft;
+use crate::prices;
 use crate::tables::{block_key, parse_block_key, posting_key, Table};
 use crate::undo::{self, UndoOp};
 
@@ -22,6 +23,8 @@ pub mod counters {
     pub const CMD_REENCODED: &str = "cmd_reencoded";
     /// Account strings longer than `MAX_ACCOUNT_LEN`, left unindexed.
     pub const UNINDEXED_ACCOUNTS: &str = "unindexed_accounts";
+    /// D3 rows dropped at the tail's per-block-per-emitter cap.
+    pub const D3_TAIL_DROPPED: &str = crate::balances::counters::D3_TAIL_DROPPED;
     /// Per-chain tx records: `txs.cNN`.
     pub fn txs_chain(chain: u8) -> String {
         format!("txs.c{chain:02}")
@@ -60,6 +63,9 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         balances::note_marked(txn, chain, height)?;
     }
 
+    let mut d3 = D3Block::default();
+    // `TokenSwaps` rows this block replaces, for the unwind (`prices.rs`).
+    let mut price_undo = Vec::new();
     let mut buf = Vec::new();
     encode_block(br, &mut buf);
     txn.put(Table::Headers, &bk, &buf)?;
@@ -96,11 +102,19 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
                 balances::mark_posting(txn, f as u8, e, r.key, coin, true)?;
             }
         }
+        // Ruling R-P5P9-192: credits no TRANSFER names, marked like postings (no hourly lag).
+        if marking && !x.d3.is_empty() {
+            mark_d3(txn, dict, x, r.key, coin, &mut d3)?;
+        }
         if !r.events.is_empty() {
             // Plan Task 11: NFT ledger events update `NftBalances` / mark `NftDirty`.
             let evs = nft::classify(&*dict, &r.events);
             if !evs.is_empty() {
                 nft::apply_events(txn, &*dict, &evs, chain, height)?;
+            }
+            // `lastTokenPriceInKda`: the newest DEX swap per token.
+            if let Some(s) = prices::swap_of_tx(&*dict, r) {
+                prices::upsert(txn, chain, &s, Some(&mut price_undo))?;
             }
         }
     }
@@ -116,6 +130,15 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
             b.unindexed_accounts as i64,
         ),
         (counters::txs_chain(chain), n),
+        (counters::D3_TAIL_DROPPED.to_owned(), d3.dropped as i64),
+        (
+            balances::counters::D3_DISCOVER_TOO_LONG.to_owned(),
+            d3.too_long as i64,
+        ),
+        (
+            balances::counters::D3_MODREF_CAPPED.to_owned(),
+            d3.modref_capped as i64,
+        ),
     ] {
         if delta != 0 {
             txn.add_counter(&name, delta)?;
@@ -123,8 +146,133 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         }
     }
 
+    if !d3.marked.is_empty() {
+        // Kept beside the undo record, in Meta: which D3 rows a block marks depends on the
+        // dictionary and token rows, which a reorg does not roll back, so the undo record
+        // itself stays replay-identical.
+        txn.set_meta(&balances::d3_undo_key(chain, height), &d3.marked)?;
+    }
+    if !price_undo.is_empty() {
+        // Beside the undo record like the D3 marks: older binaries can still read the record.
+        txn.set_meta(&prices::undo_key(chain, height), &price_undo)?;
+    } else {
+        // A log left at this height for a replaced block (an older binary unwound it without
+        // reading the log) must not apply to this one (PR #31 review note 3).
+        txn.del(Table::Meta, prices::undo_key(chain, height).as_bytes())?;
+    }
     txn.put(Table::Undo, &bk, &undo::encode(&ops))?;
     set_checkpoint(txn, Stage::Tail, chain, height, br.hash)?;
+    Ok(())
+}
+
+/// D3 rows one emitter may have marked per tail block (review sketch 5); more are dropped and
+/// counted ([`counters::D3_TAIL_DROPPED`]), the block is applied regardless.
+pub const D3_ROWS_PER_EMITTER_PER_BLOCK: u32 = 1024;
+/// Discovered modules one tail block may queue for their `describe-module` check.
+pub const D3_DISCOVER_PER_BLOCK: usize = 16;
+
+/// Per-block state of the tail's D3 marks.
+#[derive(Default)]
+struct D3Block {
+    per_emitter: std::collections::HashMap<String, u32>,
+    discovered: usize,
+    dropped: u64,
+    /// Discoverable names over `MAX_MODULE_LEN` (re-review N1; a pure function of the txs, so
+    /// the counter's undo op stays replay-identical).
+    too_long: u64,
+    /// Rule 2b references and rows dropped at the per-tx caps. It depends on the tracked set
+    /// at apply time, not only on the txs; the undo replays the stored delta, so a reorg
+    /// restores the counter exactly.
+    modref_capped: u64,
+    /// account u32 ‖ module u32 ‖ TxKey of each row marked (for the undo).
+    marked: Vec<u8>,
+}
+
+/// The tracked fungible tokens as the tail sees them now: a `Tokens` row that is not a
+/// not-fungible verdict (the seed pass's `tracked_tokens` rule).
+fn tail_is_token(txn: &RwTxn<'_>, dict: &HotDict, m: &str) -> bool {
+    use kdx_types::Dict;
+    dict.mem()
+        .find(kdx_types::DictKind::Module, m)
+        .and_then(|id| balances::token_row(txn, id).ok().flatten())
+        .is_some_and(|t| t.kind != balances::KIND_NOT_FUNGIBLE)
+}
+
+/// Mark the D3 rows of one tx (the same rows the seed pass marks for it:
+/// `kdx_decode::receivers::d3_filter` of the candidates `extract` computed), with the tx's
+/// height and no verified-row skip, under the per-tx caps of the filter and
+/// [`D3_ROWS_PER_EMITTER_PER_BLOCK`]; queue its discovered modules. It interns nothing.
+fn mark_d3(
+    txn: &mut RwTxn<'_>,
+    dict: &HotDict,
+    x: &kdx_decode::TxIndex,
+    key: TxKey,
+    coin: Option<u32>,
+    st: &mut D3Block,
+) -> Result<()> {
+    use kdx_types::{Dict, DictKind};
+    let r = {
+        let t = &*txn;
+        kdx_decode::receivers::d3_filter(&x.d3, &|m| tail_is_token(t, dict, m))
+    };
+    for ((a, m), em) in r.all_pairs() {
+        let used = st.per_emitter.entry(em.to_owned()).or_insert(0);
+        if *used >= D3_ROWS_PER_EMITTER_PER_BLOCK {
+            st.dropped += 1;
+            continue;
+        }
+        *used += 1;
+        // Names come from decode time (postings, `intern_d3`), so backfill and tail build the
+        // same dictionary. A row whose name is new (e.g. an exec string) waits for the hourly
+        // pass, which interns it.
+        let module = match coin.filter(|_| m == "coin") {
+            Some(c) => Some(c),
+            None => dict.mem().find(DictKind::Module, m),
+        };
+        let (Some(module), Some(account)) = (module, dict.mem().find(DictKind::Account, a)) else {
+            // Not counted: whether a name exists depends on the dictionary, which a reorg does
+            // not roll back, so a counter would differ between replays.
+            continue;
+        };
+        if balances::mark_row(txn, account, module, key.chain(), key.height(), coin)? {
+            st.marked.extend_from_slice(&account.to_be_bytes());
+            st.marked.extend_from_slice(&module.to_be_bytes());
+            st.marked.extend_from_slice(&key.to_be_bytes());
+        }
+    }
+    st.too_long += u64::from(r.discovered_too_long);
+    st.modref_capped += u64::from(r.modref_capped);
+    for m in &r.discovered {
+        if st.discovered >= D3_DISCOVER_PER_BLOCK {
+            break;
+        }
+        let tracked = dict
+            .mem()
+            .find(DictKind::Module, m)
+            .is_some_and(|id| matches!(balances::token_row(&*txn, id), Ok(Some(_))));
+        if !tracked {
+            st.discovered += 1;
+            balances::queue_discovered(txn, m, key.chain(), key.height())?;
+        }
+    }
+    Ok(())
+}
+
+/// Ruling R-P5P9-192: an undone block's D3 rows are marked again, like undone postings.
+fn undo_d3(txn: &mut RwTxn<'_>, chain: u8, height: u32, coin: Option<u32>) -> Result<()> {
+    let k = balances::d3_undo_key(chain, height);
+    let Some(v) = txn.meta(&k)? else {
+        return Ok(());
+    };
+    if balances::marking() {
+        for e in v.chunks_exact(16) {
+            let account = u32::from_be_bytes(e[..4].try_into().expect("4 bytes"));
+            let module = u32::from_be_bytes(e[4..8].try_into().expect("4 bytes"));
+            let key = TxKey::from_be_bytes(e[8..].try_into().expect("8 bytes"));
+            balances::mark_row(txn, account, module, key.chain(), key.height(), coin)?;
+        }
+    }
+    txn.del(Table::Meta, k.as_bytes())?;
     Ok(())
 }
 
@@ -195,6 +343,8 @@ pub fn unwind_to(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
             undo_op(txn, op, coin)?;
         }
         txn.del(Table::Undo, k)?;
+        undo_d3(txn, chain, h, coin)?;
+        prices::undo_block(txn, chain, h)?;
         n += 1;
     }
     match txn.get(Table::Headers, &block_key(chain, height))? {
@@ -246,6 +396,7 @@ mod pact_family_tests {
                 postings: vec![(Family::Pact, ent)],
                 pact_id: Some(pact),
                 code_hash: None,
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,
@@ -305,6 +456,7 @@ mod balance_mark_tests {
                 ],
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,
@@ -328,6 +480,96 @@ mod balance_mark_tests {
             .unwrap();
         assert_eq!(super::unwind_to(&mut txn, 4, 199).unwrap(), 1);
         assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 2);
+        txn.commit().unwrap();
+    }
+
+    /// `lastTokenPriceInKda`: a tail block's swap updates `TokenSwaps`; unwinding the block
+    /// restores the row it replaced, and the freezer-side log key is gone.
+    #[test]
+    fn swaps_apply_and_unwind() {
+        use kdx_types::record::EventRec;
+        use kdx_types::value;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        dict.intern(DictKind::Module, "coin");
+        let block = |dict: &mut HotDict, height: u32, amount: f64| {
+            let key = TxKey::new(height, 2, 1);
+            let mref = |ns: Option<&str>, name: &str| serde_json::json!({"refSpec": [], "refName": {"namespace": ns, "name": name}});
+            let params = serde_json::json!([
+                "pool",
+                "k:user",
+                amount,
+                mref(None, "coin"),
+                2.0,
+                mref(Some("kaddex"), "kdx")
+            ]);
+            let ev = EventRec {
+                module: dict.intern(DictKind::Module, "kaddex.exchange"),
+                name: dict.intern(DictKind::EventName, "kaddex.exchange.SWAP"),
+                module_hash: 0,
+                params: value::to_vec(&params, &*dict),
+            };
+            let data = serde_json::json!([
+                {"amount": amount, "token": "coin"},
+                {"amount": 2.0, "token": "kaddex.kdx"}
+            ]);
+            IndexedBlock {
+                block: BlockRecord {
+                    hash: Hash32([height as u8; 32]),
+                    chain: 2,
+                    height: u64::from(height),
+                    ..Default::default()
+                },
+                txs: vec![TxRecord {
+                    key,
+                    status_ok: true,
+                    cmd: Some(
+                        format!(
+                            r#"{{"meta":{{"creationTime":{}}}}}"#,
+                            1_700_000_000 + height
+                        )
+                        .into_bytes(),
+                    ),
+                    result: value::to_vec(&data, &*dict),
+                    events: vec![ev],
+                    ..Default::default()
+                }],
+                idx: vec![TxIndex {
+                    key,
+                    postings: vec![],
+                    pact_id: None,
+                    code_hash: None,
+                    d3: Default::default(),
+                }],
+                cmd_reencoded: 0,
+                unindexed_accounts: 0,
+            }
+        };
+        let b1 = block(&mut dict, 400, 1.0);
+        super::apply(&mut txn, &b1, &mut dict).unwrap();
+        let b2 = block(&mut dict, 401, 3.0);
+        super::apply(&mut txn, &b2, &mut dict).unwrap();
+        let price = |txn: &crate::RwTxn<'_>| {
+            crate::prices::lookup(txn, "kaddex.kdx")
+                .unwrap()
+                .and_then(|r| crate::prices::price_text(&r))
+        };
+        assert_eq!(price(&txn).as_deref(), Some("1.500000000000"));
+        assert!(txn
+            .meta(&crate::prices::undo_key(2, 401))
+            .unwrap()
+            .is_some());
+        assert_eq!(super::unwind_to(&mut txn, 2, 400).unwrap(), 1);
+        assert_eq!(price(&txn).as_deref(), Some("0.500000000000"));
+        assert!(txn
+            .meta(&crate::prices::undo_key(2, 401))
+            .unwrap()
+            .is_none());
+        assert_eq!(super::unwind_to(&mut txn, 2, 399).unwrap(), 1);
+        assert_eq!(price(&txn), None);
         txn.commit().unwrap();
     }
 
@@ -358,6 +600,7 @@ mod balance_mark_tests {
                 postings: vec![(Family::Sndr, alice as u64)],
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,

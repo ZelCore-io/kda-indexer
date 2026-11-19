@@ -12,6 +12,7 @@ pub mod account;
 pub mod coins;
 pub mod events;
 pub mod recent;
+pub mod schemas;
 pub mod search;
 pub mod shapes;
 pub mod stats;
@@ -201,6 +202,26 @@ pub fn int_param(p: &Params, name: &str) -> Result<Option<i128>, Response> {
     Ok(Some(if v.starts_with('-') { -n } else { n }))
 }
 
+/// A `chain` parameter: chainweb-data reads it as a 64-bit `Int`, so a whole number past
+/// i64 is a 400 (servant's bounds message); any other whole number parses (and is no chain,
+/// for the caller to answer empty).
+#[allow(clippy::result_large_err)] // the Err is the finished answer
+pub fn chain_param(p: &Params) -> Result<Option<i128>, Response> {
+    let n = int_param(p, "chain")?;
+    match n {
+        Some(c) if i64::try_from(c).is_err() => Err(text(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Error parsing query parameter chain failed: out of bounds: `{}' (should be between {} and {})",
+                p.get("chain").unwrap_or_default(),
+                i64::MIN,
+                i64::MAX
+            ),
+        )),
+        n => Ok(n),
+    }
+}
+
 /// `Chainweb-Execution-Strategy`: `Bounded` / `Unbounded` accepted (and ignored), other
 /// values refused as chainweb-data does.
 #[allow(clippy::result_large_err)] // the Err is the finished answer
@@ -379,6 +400,17 @@ pub fn store_floor(view: &View) -> u32 {
         .unwrap_or_else(|| view.hot_floor())
 }
 
+/// Rows of `offset` a height-done token `c` still owes (its key's pos, R7). Only a cut
+/// scan mints such a token, and only with at most `MAX_OFFSET` owed: anything else is
+/// forged (F-19), a 400.
+fn owed_offset(c: &Cursor, scan: Option<ScanLimits>) -> ApiResult<u64> {
+    let owed = u64::from(c.key.pos());
+    if scan.is_none() || owed > MAX_OFFSET {
+        return Err(ApiError::BadRequest("invalid cursor".into()));
+    }
+    Ok(owed)
+}
+
 /// Collect one page: skip `offset` rows (or the rows up to the cursor), take `limit`.
 /// `scan` bounds a `Scan` walk (heights and time); on a `Keys` walk only its time applies,
 /// checked between heights once one height is done. A cut answers what it found with a
@@ -396,7 +428,7 @@ pub fn collect_page(
     if let Some(c) = pg.next {
         if c.sub == SUB_HEIGHT_DONE {
             // Rows of `offset` a cut scan still owed (R7).
-            skip = u64::from(c.key.pos());
+            skip = owed_offset(&c, scan)?;
         } else {
             let r = view
                 .tx(c.key)?
@@ -592,6 +624,38 @@ mod tests {
         assert!(!Like::new("a\\%b").matches("xaZby"));
         assert!(Like::new("_").matches("é"));
         assert!(!Like::new("_").matches(""));
+    }
+
+    /// F-19: a height-done token owes at most `MAX_OFFSET` rows and only resumes a route
+    /// that cuts scans (only such a route mints one).
+    #[test]
+    fn height_done_owed_offset_is_bounded() {
+        let scan = Some(ScanLimits {
+            max_heights: 10,
+            until: Instant::now(),
+        });
+        let tok = |pos: u16| Cursor {
+            key: TxKey::new(100, 0, pos),
+            sub: SUB_HEIGHT_DONE,
+            fp: 0,
+        };
+        assert_eq!(owed_offset(&tok(7), scan).unwrap(), 7);
+        assert_eq!(
+            owed_offset(&tok(MAX_OFFSET as u16), scan).unwrap(),
+            MAX_OFFSET
+        );
+        assert!(matches!(
+            owed_offset(&tok(MAX_OFFSET as u16 + 1), scan),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            owed_offset(&tok(u16::MAX), scan),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            owed_offset(&tok(0), None),
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[test]

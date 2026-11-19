@@ -131,7 +131,10 @@ const VECTORS: [(u8, u64, usize, &str); 20] = [
 fn fixture() -> Vec<Value> {
     const ZST: &[u8] = include_bytes!("fixtures/merkle_vectors.json.zst");
     let mut s = Vec::new();
-    zstd::Decoder::new(ZST).unwrap().read_to_end(&mut s).unwrap();
+    zstd::Decoder::new(ZST)
+        .unwrap()
+        .read_to_end(&mut s)
+        .unwrap();
     serde_json::from_slice(&s).unwrap()
 }
 

@@ -122,6 +122,14 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
             txn.del(Table::HeaderByHash, &b.hash.0)?;
             txn.del(Table::Headers, k)?;
             txn.del(Table::Undo, k)?;
+            txn.del(
+                Table::Meta,
+                kdx_hot::balances::d3_undo_key(c, b.height as u32).as_bytes(),
+            )?;
+            txn.del(
+                Table::Meta,
+                kdx_hot::prices::undo_key(c, b.height as u32).as_bytes(),
+            )?;
             n += 1;
         }
     }
@@ -235,6 +243,7 @@ fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Resul
                         postings: p,
                         pact_id: None,
                         code_hash: None,
+                        d3: Default::default(),
                     })
                 })
                 .collect::<Result<_>>()?;
@@ -420,6 +429,7 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
                     postings: p,
                     pact_id: None,
                     code_hash: None,
+                    d3: Default::default(),
                 });
                 txs.push(t);
             }

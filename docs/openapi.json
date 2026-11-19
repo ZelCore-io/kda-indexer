@@ -9,6 +9,12 @@
     },
     "version": "1"
   },
+  "servers": [
+    {
+      "url": "/",
+      "description": "This server (same origin)"
+    }
+  ],
   "paths": {
     "/api/v1/accounts/{account}/balances": {
       "get": {
@@ -515,7 +521,7 @@
         "tags": [
           "events"
         ],
-        "summary": "Events by module and name (a qualified `name` such as `coin.TRANSFER` is split at its last dot\nwhen `module` is absent). At least one of `module`, `name`, `param{N}` is required.",
+        "summary": "Events by module and name (a qualified `name` such as `coin.TRANSFER` is split at its last dot\nwhen `module` is absent). At least one of `module`, `name`, `param{N}` is required. With\nonly `param{N}` filters, the first given value is looked up as an account: a value that is\nno known account answers 200 with no items.",
         "operationId": "list",
         "parameters": [
           {
@@ -610,7 +616,7 @@
         ],
         "responses": {
           "200": {
-            "description": "`items` of events with their tx context, `next_cursor`, `as_of`"
+            "description": "`items` of events with their tx context, `next_cursor`, `as_of`. With only `param{N}` filters, a value that is no known account answers 200 with no items."
           }
         }
       }

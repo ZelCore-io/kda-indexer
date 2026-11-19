@@ -216,6 +216,8 @@ impl Block {
             rows: Rows::Txs {
                 sender: None,
                 nft: false,
+                module: None,
+                coinbase: false,
             },
         };
         let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
@@ -247,10 +249,11 @@ fn decimal(n: u64) -> Decimal {
 // ---------------------------------------------------------------------------------------
 // Block lists
 
-/// The chains of a `chainIds` argument, ascending and distinct.
+/// The chains of a `chainIds` argument, ascending and distinct; absent or `[]` is every
+/// chain (FIX-4 item 2: stock reads `[]` as no filter).
 pub fn chain_set(ids: Option<&[String]>) -> Result<Vec<u8>> {
     let mut v = match ids {
-        None => (0..20).collect(),
+        None | Some([]) => (0..20).collect(),
         Some(ids) => {
             if ids.len() > 100 {
                 return Err(bad_input("too many chainIds"));
@@ -597,6 +600,8 @@ mod tests {
     #[test]
     fn chain_sets() {
         assert_eq!(chain_set(None).unwrap().len(), 20);
+        // FIX-4 item 2: `chainIds: []` means every chain, as no `chainIds` does.
+        assert_eq!(chain_set(Some(&[])).unwrap(), chain_set(None).unwrap());
         let ids = vec!["3".to_string(), "1".into(), "3".into()];
         assert_eq!(chain_set(Some(&ids)).unwrap(), vec![1, 3]);
         assert!(chain_set(Some(&["x".to_string()])).is_err());

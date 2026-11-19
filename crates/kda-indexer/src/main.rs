@@ -143,9 +143,14 @@ enum Command {
         data_dir: Option<PathBuf>,
     },
     /// Dev: `run` without the freezer.
-    /// Print the OpenAPI document of the native API (no config needed).
+    /// Print an OpenAPI document (no config needed): the native API, or with `--compat` the
+    /// chainweb-data compatible API.
     #[command(hide = true)]
-    Openapi,
+    Openapi {
+        /// The compat API instead of the native one.
+        #[arg(long)]
+        compat: bool,
+    },
     /// GraphQL schema tools (no config needed; default limits).
     Graphql {
         #[command(subcommand)]
@@ -204,9 +209,15 @@ enum Command {
         /// Data directory (default: `data_dir` from the config).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Run (or resume) the seed walk: mark every known (account, module, chain) dirty.
+        /// Run (or resume) the seed walk: mark every known (account, module, chain) dirty,
+        /// then the receivers pass (D1, once per store) for event-less pre-coin-v3 credits.
         #[arg(long, conflicts_with_all = ["all", "status", "nft_fill"])]
         seed: bool,
+        /// With `--seed`: only count what the receivers pass (D1) would mark (candidates,
+        /// new names, rows skipped because they exist, rows it would mark). Read-only; the
+        /// posting seed does not run.
+        #[arg(long, requires = "seed")]
+        dry_run: bool,
         /// Run the NFT history fill again (ledger events; plan Task 11). The dirty rows it
         /// marks are read by the next `run`.
         #[arg(long, conflicts_with_all = ["seed", "all", "status"])]
@@ -215,8 +226,20 @@ enum Command {
         #[arg(long, conflicts_with_all = ["seed", "status", "nft_fill"])]
         all: bool,
         /// Dirty rows, rate, ETA and seed state.
-        #[arg(long, conflicts_with_all = ["seed", "all", "nft_fill"])]
+        #[arg(long, conflicts_with_all = ["seed", "all", "nft_fill", "rewalk"])]
         status: bool,
+        /// Re-mark and re-walk these modules now (comma-separated, e.g.
+        /// `free.wiza,kaddex.skdx`): marks every row their postings name, and queues their D3
+        /// history walk with the daily spacing reset (a walk in progress restarts from 0 with
+        /// its own tokens). The service runs the walk; the marks are read by the next `run`.
+        /// `coin` is refused (use --seed or --all).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            num_args = 1..,
+            conflicts_with_all = ["seed", "all", "status", "nft_fill"]
+        )]
+        rewalk: Vec<String>,
     },
     /// Code search index (`search/`): rebuild it, or query it (dev aid).
     Search {
@@ -470,8 +493,15 @@ fn init_logging(log: &LogConfig) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Openapi) {
-        println!("{}", kdx_api::openapi::json());
+    if let Command::Openapi { compat } = cli.command {
+        println!(
+            "{}",
+            if compat {
+                kdx_api::openapi::compat_json()
+            } else {
+                kdx_api::openapi::json()
+            }
+        );
         return Ok(());
     }
     if let Command::Graphql { action } = &cli.command {
@@ -500,7 +530,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Openapi | Command::Graphql { .. } => Ok(()),
+        Command::Openapi { .. } | Command::Graphql { .. } => Ok(()),
         Command::Probe { smoke, out } => kda_indexer::cmd::probe::run(&cfg, smoke, out).await,
         Command::Dump {
             from,
@@ -658,18 +688,24 @@ async fn main() -> anyhow::Result<()> {
         Command::ReconcileBalances {
             data_dir,
             seed,
+            dry_run,
             nft_fill,
             all,
             status,
+            rewalk,
         } => {
             use kda_indexer::cmd::reconcile::Mode;
             let mode = match (seed, all, status, nft_fill) {
+                _ if !rewalk.is_empty() => Mode::Rewalk(rewalk),
+                (true, _, _, _) if dry_run => Mode::SeedDryRun,
                 (true, _, _, _) => Mode::Seed,
                 (_, true, _, _) => Mode::All,
                 (_, _, true, _) => Mode::Status,
                 (_, _, _, true) => Mode::NftFill,
                 _ => {
-                    anyhow::bail!("reconcile-balances needs --seed, --all, --status or --nft-fill")
+                    anyhow::bail!(
+                        "reconcile-balances needs --seed, --all, --status, --nft-fill or --rewalk"
+                    )
                 }
             };
             kda_indexer::cmd::reconcile::run(

@@ -1,8 +1,12 @@
 //! `node(id)` and `nodes(ids)` (Task 3): decode a Relay id (`ids.rs`) and load the object
-//! through the same paths as the root queries. An id that does not decode is
-//! `BAD_USER_INPUT`; an object that is not stored is `null`.
+//! through the same paths as the root queries. An id that cannot be read (it does not
+//! decode, or its key is not a well-formed key of its type) is `null`, as stock answers
+//! (FIX-4 item 5); so is an object that is not stored.
 
-use async_graphql::{Context, Result, ID};
+use std::borrow::Cow;
+
+use async_graphql::registry::{MetaType, Registry};
+use async_graphql::{Context, InputType, InputValueError, InputValueResult, Result, Value, ID};
 
 use super::{
     Event, NonFungibleAccount, NonFungibleChainAccount, NonFungibleTokenBalance, Signer,
@@ -12,7 +16,7 @@ use std::sync::Arc;
 
 use kdx_types::Hash32;
 
-use crate::error::{bad_input, from_api};
+use crate::error::{bad_input, from_api, Code};
 use crate::gql;
 use crate::ids::{decode, NodeKey};
 use crate::txlist::chain_arg;
@@ -21,6 +25,63 @@ use crate::types::Node;
 
 /// Most ids one `nodes` call takes.
 pub const MAX_NODES: usize = 100;
+
+/// A `node` / `nodes` id argument: the GraphQL `ID` scalar, but taking any whole number, as
+/// stock does (graphql-js: a string or an integer). async-graphql's own `ID` refuses an
+/// integer that does not fit an i64, which answered a client's `9223372036854775808` with a
+/// 500 where stock answers `null`. The schema still names the type `ID`.
+pub struct AnyId(pub ID);
+
+/// Whether `v` is an `ID` value: a string, or a whole number of any size.
+fn is_id_value(v: &Value) -> bool {
+    match v {
+        Value::String(_) => true,
+        Value::Number(n) => {
+            n.is_i64()
+                || n.is_u64()
+                || n.as_f64()
+                    .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
+        }
+        _ => false,
+    }
+}
+
+impl InputType for AnyId {
+    type RawValueType = ID;
+
+    fn type_name() -> Cow<'static, str> {
+        <ID as InputType>::type_name()
+    }
+
+    fn create_type_info(registry: &mut Registry) -> String {
+        let name = <ID as InputType>::create_type_info(registry);
+        // Widen the registered scalar's validity check (the document validation runs it on
+        // literals and on variable values).
+        if let Some(MetaType::Scalar { is_valid, .. }) = registry.types.get_mut("ID") {
+            *is_valid = Some(std::sync::Arc::new(is_id_value));
+        }
+        name
+    }
+
+    fn parse(value: Option<Value>) -> InputValueResult<Self> {
+        match value {
+            Some(Value::Number(n)) if is_id_value(&Value::Number(n.clone())) => {
+                Ok(AnyId(ID(n.to_string())))
+            }
+            v => <ID as InputType>::parse(v)
+                .map(AnyId)
+                .map_err(InputValueError::propagate),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        self.0.to_value()
+    }
+
+    fn as_raw_value(&self) -> Option<&ID> {
+        Some(&self.0)
+    }
+}
 
 async fn tx(
     ctx: &Context<'_>,
@@ -62,7 +123,30 @@ async fn row_tx(ctx: &Context<'_>, block_hash: String, rk: String) -> Result<Opt
 }
 
 pub async fn node(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>> {
-    let key = decode(id.as_str()).map_err(|_| bad_input("invalid id"))?;
+    let Ok(key) = decode(id.as_str()) else {
+        return Ok(None);
+    };
+    unreadable_is_null(lookup(ctx, key).await)
+}
+
+/// The id is the only input: a key the lookup refuses as malformed (`BAD_USER_INPUT`) is an
+/// unreadable id, `null`. A lookup that finds several copies of a tx is an answer about
+/// stored data, not about the id: it keeps its error (FIX-4 part C, M-3).
+fn unreadable_is_null<T>(r: Result<Option<T>>) -> Result<Option<T>> {
+    match r {
+        Err(e) if is_bad_input(&e) && e.message != super::tx::MANY_COPIES => Ok(None),
+        r => r,
+    }
+}
+
+fn is_bad_input(e: &async_graphql::Error) -> bool {
+    e.extensions
+        .as_ref()
+        .and_then(|x| x.get("code"))
+        .is_some_and(|c| *c == async_graphql::Value::from(Code::BadUserInput.as_str()))
+}
+
+async fn lookup(ctx: &Context<'_>, key: NodeKey) -> Result<Option<Node>> {
     Ok(match key {
         NodeKey::Block { hash } => super::block::query_block(ctx, &hash)
             .await?
@@ -90,8 +174,12 @@ pub async fn node(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>> {
             module_hash,
             request_key,
         } => row_tx(ctx, block_hash, request_key).await?.and_then(|d| {
-            (0..d.trs.len())
-                .map(|i| Transfer::new(d.clone(), i, None))
+            // Fungible transfers, then the NFT transfers `transfers(isNFT: true)` lists under
+            // the same id form (audit F-51).
+            let fungible = (0..d.trs.len()).map(|i| Transfer::new(d.clone(), i, None));
+            let nfts = (0..d.nfts.len()).map(|i| Transfer::nft(d.clone(), i));
+            fungible
+                .chain(nfts)
                 .find(|x| {
                     x.ord_idx() == order_index
                         && i64::from(x.d.key().chain()) == chain
@@ -122,24 +210,32 @@ pub async fn node(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>> {
             chain,
             fungible,
             account,
-        } => super::account::fungible_chain_accounts(ctx, &account, &[chain], Some(&fungible))
-            .await?
-            .and_then(|v| v.into_iter().next())
-            .map(Node::FungibleChainAccount),
+        } => {
+            super::account::fungible_chain_accounts(ctx, &account, Some(&[chain]), Some(&fungible))
+                .await?
+                .into_iter()
+                .next()
+                .map(Node::FungibleChainAccount)
+        }
         NodeKey::NonFungibleAccount { account } => super::nft::non_fungible(ctx, &account, None)
             .await?
-            .map(|(account, items)| {
-                Node::NonFungibleAccount(NonFungibleAccount { account, items })
+            .map(|(account, items, cut)| {
+                Node::NonFungibleAccount(NonFungibleAccount {
+                    account,
+                    items,
+                    cut,
+                })
             }),
         NodeKey::NonFungibleChainAccount { chain, account } => {
             let c = chain_arg(&chain)?;
             super::nft::non_fungible(ctx, &account, Some(c))
                 .await?
-                .map(|(account, items)| {
+                .map(|(account, items, cut)| {
                     Node::NonFungibleChainAccount(NonFungibleChainAccount {
                         account,
                         chain: c,
                         items,
+                        cut,
                     })
                 })
         }
@@ -149,33 +245,41 @@ pub async fn node(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>> {
             chain,
         } => {
             let c = chain_arg(&chain)?;
-            super::nft::non_fungible(ctx, &account, Some(c))
-                .await?
-                .and_then(|(account, items)| {
-                    let item = items.into_iter().find(|i| i.token_id == token_id)?;
-                    Some(Node::NonFungibleTokenBalance(NonFungibleTokenBalance {
-                        account,
-                        item,
-                    }))
-                })
+            match super::nft::non_fungible(ctx, &account, Some(c)).await? {
+                None => None,
+                Some((account, items, cut)) => {
+                    match items.into_iter().find(|i| i.token_id == token_id) {
+                        Some(item) => {
+                            Some(Node::NonFungibleTokenBalance(NonFungibleTokenBalance {
+                                account,
+                                item,
+                            }))
+                        }
+                        // Past the cap: unknown, not absent (part E, S1).
+                        None if cut => return Err(super::nft::holdings_cut()),
+                        None => None,
+                    }
+                }
+            }
         }
     })
 }
 
-pub async fn nodes(ctx: &Context<'_>, ids: &[ID]) -> Result<Vec<Option<Node>>> {
+pub async fn nodes(ctx: &Context<'_>, ids: &[AnyId]) -> Result<Vec<Option<Node>>> {
     if ids.len() > MAX_NODES {
         return Err(bad_input(format!("at most {MAX_NODES} ids")));
     }
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        out.push(node(ctx, id).await?);
+        out.push(node(ctx, &id.0).await?);
     }
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use async_graphql::{Request, Variables};
+    use super::{bad_input, is_bad_input, unreadable_is_null};
+    use async_graphql::{Request, Result, Variables};
     use kdx_decode::{IndexedBlock, TxIndex};
     use kdx_types::record::{BlockRecord, TxRecord};
     use kdx_types::{Hash32, TxKey};
@@ -227,6 +331,7 @@ mod tests {
                 postings: Vec::new(),
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             })
             .collect();
         f.apply_block(&IndexedBlock {
@@ -287,5 +392,21 @@ mod tests {
         assert_eq!(node_rk(&f, &event_id(&miss)).await, Value::Null);
         // An id whose text is neither a hash nor the coinbase's reqKey.
         assert_eq!(node_rk(&f, &event_id("not-a-key")).await, Value::Null);
+    }
+
+    /// FIX-4 part C (M-3): only a refused key is an unreadable id (`null`); a lookup that
+    /// finds the object ambiguous (a genesis tx stored on several chains, named by a `Signer`
+    /// id without a block) keeps its `BAD_USER_INPUT` error.
+    #[test]
+    fn only_a_refused_key_answers_null() {
+        let malformed: Result<Option<()>> = Err(bad_input("blockHash: not a hash"));
+        assert!(matches!(unreadable_is_null(malformed), Ok(None)));
+        let many: Result<Option<()>> = Err(bad_input(super::super::tx::MANY_COPIES));
+        let e = unreadable_is_null(many).unwrap_err();
+        assert_eq!(e.message, super::super::tx::MANY_COPIES);
+        assert!(is_bad_input(&e));
+        let other: Result<Option<()>> = Err(async_graphql::Error::new("internal"));
+        assert!(unreadable_is_null(other).is_err());
+        assert!(matches!(unreadable_is_null(Ok(Some(()))), Ok(Some(()))));
     }
 }

@@ -13,7 +13,10 @@
 //! - **Dirty reconcile** ([`step`], called by the reconciler loop): `NftDirty` rows are read
 //!   with `{ledger}.get-balance` through the shared [`LocalClient`] and stored as source 2.
 //!   A cursor walks the table in key order and wraps, so a row that keeps failing at the node
-//!   never blocks the others.
+//!   never blocks the others. Branch check (D2, as in `reconcile`): an answer clears its mark
+//!   only when its `metaData.prevBlockHash` equals our stored header at its height; otherwise
+//!   the mark stays (served `stale`), and a row we hold is not replaced by an answer known to
+//!   come from another branch. An absent answer carries no hash and stays height-only.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -32,6 +35,8 @@ use kdx_types::record::decode_tx;
 use kdx_types::{Dict, DictKind, MemDict, TxKey};
 use serde::Serialize;
 
+use crate::reconcile::{branch_of, Branch};
+
 /// Txs per write txn.
 pub const BATCH: usize = 500;
 /// `NftDirty` rows per reconcile step.
@@ -46,6 +51,9 @@ pub struct FillReport {
     /// Rows written or marked.
     pub effects: u64,
     pub filled_height: Option<u32>,
+    /// Events whose module or event name was not in the dictionary snapshot, so they could not
+    /// be classified (F-56). Expected 0; otherwise rerun the fill.
+    pub unresolved_events: u64,
     pub stopped: bool,
     pub secs: f64,
 }
@@ -112,6 +120,14 @@ fn apply_batch(
 ) -> Result<()> {
     let mut txn = hot.rw()?;
     for (k, r) in recs {
+        rep.unresolved_events += r
+            .events
+            .iter()
+            .filter(|e| {
+                dict.name(DictKind::Module, e.module).is_none()
+                    || dict.name(DictKind::EventName, e.name).is_none()
+            })
+            .count() as u64;
         let evs = nft::classify(dict, &r.events);
         if !evs.is_empty() {
             rep.effects += u64::from(nft::apply_events(
@@ -174,7 +190,9 @@ pub fn run(
         }
     }
 
-    // Segment pass, oldest first (TxNum order).
+    // Segment pass, oldest first (TxNum order). Fresh snapshot (F-56): names the tail
+    // interned during the hot pass resolve too.
+    let dict: Arc<MemDict> = Arc::new(HotDict::load(&hot.ro()?)?.mem().clone());
     let segs = Segments::open_without_filters(segdir, dict.clone())?;
     let mut nums: Vec<u64> = names
         .iter()
@@ -210,6 +228,12 @@ pub fn run(
     txn.commit()?;
     rep.filled_height = Some(top);
     rep.secs = t0.elapsed().as_secs_f64();
+    if rep.unresolved_events > 0 {
+        tracing::warn!(
+            unresolved_events = rep.unresolved_events,
+            "nft fill: events with names missing from the dictionary were skipped; rerun the fill"
+        );
+    }
     Ok(rep)
 }
 
@@ -223,6 +247,8 @@ pub struct StepStats {
     /// A delivered but unusable answer, or a B-1 refusal: the mark is dropped.
     pub dropped: u64,
     pub node_errors: u64,
+    /// Of `ok`: answers not read on the block we hold at their height (D2); the mark is kept.
+    pub other_branch: u64,
 }
 
 impl StepStats {
@@ -242,7 +268,8 @@ struct Item {
 }
 
 enum Outcome {
-    Found(String, u32),
+    /// Balance, the tip height read, and its hash (`metaData.prevBlockHash`, D2).
+    Found(String, u32, Option<String>),
     Absent,
     Dropped,
     NodeError,
@@ -262,12 +289,14 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
         .get_balance(it.chain, ledger, &it.mark.token_id, acct)
         .await
     {
-        Ok(Local::Found { value, height }) => {
-            Outcome::Found(value, u32::try_from(height).unwrap_or(u32::MAX))
-        }
+        Ok(Local::Found {
+            value,
+            height,
+            prev_hash,
+        }) => Outcome::Found(value, u32::try_from(height).unwrap_or(u32::MAX), prev_hash),
         Ok(Local::Absent) => Outcome::Absent,
         Err(LocalError::Skipped(_)) => Outcome::Dropped,
-        Err(LocalError::Failure(m)) => {
+        Err(LocalError::Failure(m) | LocalError::Invalid(m)) => {
             tracing::debug!(ledger = %ledger, message = %m, "nft get-balance failed");
             Outcome::Dropped
         }
@@ -355,9 +384,25 @@ pub async fn step(
     let mut txn = hot.rw()?;
     for (it, out) in items.iter().zip(outcomes) {
         match out {
-            Outcome::Found(balance, as_of) => {
-                write_local(&mut txn, it, balance, as_of)?;
-                clear_if_covered(&mut txn, it, Some(as_of))?;
+            Outcome::Found(balance, as_of, prev) => {
+                // D2 (review M2): only an answer read on the block we hold at its height
+                // clears the mark. Off our branch the mark stays (the row is served stale and
+                // re-read when the cursor comes round); an answer known to come from another
+                // branch does not replace a row we hold.
+                match branch_of(&txn, it.chain, as_of, prev.as_deref())? {
+                    Branch::Ours => {
+                        write_local(&mut txn, it, balance, as_of)?;
+                        clear_if_covered(&mut txn, it, Some(as_of))?;
+                    }
+                    b => {
+                        if b == Branch::Unknown || txn.get(Table::NftBalances, &it.key)?.is_none() {
+                            write_local(&mut txn, it, balance, as_of)?;
+                        }
+                        tracing::debug!(chain = it.chain, as_of, branch = ?b,
+                            "nft get-balance answer is not on our branch; kept dirty");
+                        st.other_branch += 1;
+                    }
+                }
                 st.ok += 1;
             }
             Outcome::Absent => {
@@ -381,6 +426,24 @@ mod tests {
     use kdx_hot::{Geometry, HotStore};
 
     use super::*;
+
+    /// F-56: an event whose module or event name is not in the dictionary snapshot is
+    /// counted, so a fill that missed names shows it.
+    #[test]
+    fn unresolved_event_names_are_counted() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut r = kdx_types::record::TxRecord::default();
+        r.events.push(kdx_types::record::EventRec {
+            module: 7,
+            name: 9,
+            ..Default::default()
+        });
+        let mut rep = FillReport::default();
+        apply_batch(&hot, &MemDict::default(), vec![(r.key, r)], &mut rep).unwrap();
+        assert_eq!(rep.unresolved_events, 1);
+        assert_eq!(rep.effects, 0);
+    }
 
     /// M-9: a ledger added to the configured set after the fill is pending (its history gets
     /// walked); a store filled before the set was stored counts the default ledgers as done.
@@ -452,5 +515,54 @@ mod tests {
         clear_if_covered(&mut txn, &it, None).unwrap();
         txn.commit().unwrap();
         assert!(read(&hot).is_none());
+    }
+
+    /// M2 (D2 review): a `get-balance` answer read on another branch than the header we hold
+    /// at its height keeps the row's dirty mark (served `stale`); the same read on our branch
+    /// clears it.
+    #[tokio::test]
+    async fn an_nft_answer_from_another_branch_keeps_the_mark() {
+        use std::sync::{Arc, Mutex};
+
+        use kdx_hot::HotDict;
+        use kdx_types::{DictMut, Hash32};
+
+        use crate::reconcile::tests::{client_on, put_header, tip_hash};
+
+        let d = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotStore::open(&d.path().join("hot"), Geometry::default()).unwrap());
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let acct = dict.intern(DictKind::Account, "alice");
+        let ledger = dict.intern(DictKind::Module, "marmalade-v2.ledger");
+        dict.persist(&mut txn).unwrap();
+        nft::mark_dirty(&mut txn, acct, "t:a", 0, ledger, 10).unwrap();
+        txn.commit().unwrap();
+        put_header(&hot, 0, 10, tip_hash());
+        let key = nft::nft_key(acct, ledger, &nft::token_hash("t:a"), 0);
+        let dirty = |hot: &HotStore| hot.ro().unwrap().get(Table::NftDirty, &key).unwrap();
+
+        let prev = Arc::new(Mutex::new(Hash32([0x33; 32]).to_b64url()));
+        let (_ctx, local) = client_on(d.path(), &hot, prev.clone());
+        let st = step(&hot, &local, &mut None).await.unwrap();
+        assert_eq!((st.ok, st.other_branch), (1, 1));
+        assert!(
+            dirty(&hot).is_some(),
+            "an off-branch answer must not clear the mark"
+        );
+
+        *prev.lock().unwrap() = tip_hash().to_b64url();
+        let st = step(&hot, &local, &mut None).await.unwrap();
+        assert_eq!((st.ok, st.other_branch), (1, 0));
+        assert!(dirty(&hot).is_none());
+        let row = NftRow::decode(
+            &hot.ro()
+                .unwrap()
+                .get(Table::NftBalances, &key)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!((row.balance.as_str(), row.as_of), ("2.0", 10));
     }
 }

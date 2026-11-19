@@ -31,6 +31,7 @@ use kdx_types::record::{BlockRecord, TxRecord};
 use kdx_types::{Hash32, TxKey};
 use serde_json::Value;
 
+use super::schemas::{ExecutionStrategy, LimitErrors, PagingParams, TxSummary};
 use super::{
     aeson, check_strategy, collect_page, int_param, page_response, paging, recent,
     resume_exhausted, resume_max, shapes, store_floor, text, Candidates, Like, Page, Paging,
@@ -46,6 +47,52 @@ pub const PACT_LIMIT: i128 = 50;
 /// Txs of one defpact read at most (R-P5P9-3): the newest ones.
 pub const PACT_CAP: usize = 1_000;
 
+/// Search transactions by code, or list a defpact
+///
+/// chainweb-data `searchTxs`. Exactly one of `search` and `pactid`: neither answers
+/// `404 You must specify a search string`, both `400 You should only specify a pactid or a
+/// search string, not both!`.
+///
+/// `search`: a JSON array of `TxSummary` for the transactions whose own exec code contains
+/// the pattern (a `LIKE` pattern: `%`, `_`, `\` escapes; at most 256 characters and 8 `%`),
+/// height descending then request key descending. A pattern with a literal run of 3
+/// characters uses the code index when it holds every body the pattern can match; otherwise
+/// a bounded newest-first scan runs (`search.max_scan_heights`, `search.timeout_ms`). A cut
+/// answer carries `X-Search-Truncated: true` and, when there is more, `Chainweb-Next`.
+/// Genesis transactions are listed here (the other list routes hide them). Difference from
+/// chainweb-data: its `cont` transactions also match through the initial code of their
+/// defpact; here they do not. The route takes one slot of the search gate (`503` when
+/// `search.concurrency` searches run, `429` when the client already runs `search.per_client`).
+///
+/// `pactid`: the `cont` transactions of the defpact (the starting transaction excluded),
+/// successful ones first, then height descending (ties: request key ascending), at most 50.
+/// Only the newest 1,000 transactions of the pact are read, so an old successful
+/// continuation of a pact with more transactions may be missing; such an answer carries
+/// `X-Search-Truncated: true`. Height and paging parameters are ignored and no
+/// `Chainweb-Next` is sent, as in chainweb-data. A value that is not a pact id matches
+/// nothing (an empty array).
+#[utoipa::path(
+    get,
+    path = "/txs/search",
+    operation_id = "compat_search",
+    tag = "search",
+    params(
+        ("search" = Option<String>, Query, description = "LIKE pattern matched against the exec code."),
+        ("pactid" = Option<String>, Query, description = "Defpact id (base64url hash); the `limit` is capped at 50."),
+        PagingParams,
+        ("Chainweb-Execution-Strategy" = Option<ExecutionStrategy>, Header, description = "Accepted and ignored. Any other value is `400 Unknown Chainweb-Execution-Strategy: ...`."),
+    ),
+    responses(
+        (status = 200, description = "Transaction summaries", body = Vec<TxSummary>, content_type = "application/json",
+            headers(
+                ("Chainweb-Next" = String, description = "Token of the next page (`search` only); absent on the last page."),
+                ("X-Search-Truncated" = String, description = "`true` when the scan deadline or a cap cut the answer short."),
+            )),
+        (status = 400, description = "Both `search` and `pactid`, a parameter that does not parse, a pattern that is too long or has too many `%`, `offset` above 10,000, `next` with `offset`, or an invalid `next`", body = String, content_type = "text/plain"),
+        (status = 404, description = "`You must specify a search string`: neither `search` nor `pactid`", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
 pub async fn handler(
     State(st): State<Arc<ApiState>>,
     Extension(ctx): Extension<Arc<SearchCtx>>,
@@ -463,6 +510,7 @@ mod tests {
                 postings: vec![(Family::Code, kdx_decode::index::code_entity(&h))],
                 pact_id: None,
                 code_hash: Some(h),
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,
@@ -497,6 +545,7 @@ mod tests {
                 postings: vec![(Family::Pact, kdx_decode::index::pact_entity(pact))],
                 pact_id: Some(*pact),
                 code_hash: None,
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,

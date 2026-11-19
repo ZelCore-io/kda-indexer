@@ -307,8 +307,8 @@ pub async fn run(
             }
         }
         txn.commit()?;
-        let sdir = kdx_search::search_dir(ctx.segdir.parent().unwrap_or(&ctx.segdir));
-        rep.search_marked_stale = kdx_search::manifest::mark_stale(&sdir, start)?;
+        let data_dir = ctx.segdir.parent().unwrap_or(&ctx.segdir);
+        rep.search_marked_stale = kdx_search::manifest::mark_stale(data_dir, start)?;
         tracing::warn!(
             start,
             dirty_marks = rep.dirty_marks,
@@ -355,7 +355,7 @@ async fn build(
         let r = write(&c, &entry, fetched.coll, link, dry_run);
         if r.is_err() || dry_run {
             let mut d = c.dict.lock().unwrap_or_else(|e| e.into_inner());
-            c.reload_dict(&mut d);
+            c.reload_dict(&mut d)?;
         }
         r
     })

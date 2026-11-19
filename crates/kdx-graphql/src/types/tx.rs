@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use async_graphql::{Context, Object, Result, SimpleObject, Union, ID};
+use async_graphql::{Context, ErrorExtensions, Object, Result, SimpleObject, Union, ID};
 use serde_json::Value;
 
 use super::{
@@ -24,11 +24,14 @@ use crate::gql;
 use crate::ids::{encode, NodeKey};
 use crate::scalars::{BigInt, DateTime, FloatText};
 use crate::txlist::{
-    block_list, block_node, chain_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx,
-    Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
+    block_list, block_node, chain_arg, fungible_arg, hash_arg, height_arg, list, load, name_arg,
+    page_in_tx, rk_arg, Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec,
+    TxData,
 };
 
-/// A user transaction (coinbase txs are not listed as transactions, as in Kadena graph).
+/// A transaction. Coinbase txs are `Transaction`s only in `transactions(isCoinbase: true)`
+/// ([`Transaction::listed`]), as stock lists them; everywhere else they are not, as in
+/// Kadena graph.
 #[derive(Debug, Clone)]
 pub struct Transaction {
     pub d: Arc<TxData>,
@@ -70,6 +73,28 @@ fn str_of(v: Option<&Value>) -> String {
 impl Transaction {
     pub fn new(d: Arc<TxData>) -> Option<Transaction> {
         (!d.is_coinbase()).then_some(Transaction { d })
+    }
+
+    /// A row of a tx list: a coinbase (only in a list that keeps them) gets the command
+    /// stock answers for a tx with no command (indexer-kadena `coinbase.ts`,
+    /// `transaction-schema-validator.ts`, `transaction-meta-schema-validator.ts`): sender
+    /// `coinbase`, the block's time in whole seconds, gas limit, gas price and ttl 0, an empty
+    /// nonce, no signers. Its payload (code and data `{}`) and network id are filled in by
+    /// [`TransactionCommand`].
+    pub fn listed(d: Arc<TxData>) -> Transaction {
+        if !d.is_coinbase() || d.cmd.is_some() {
+            return Transaction { d };
+        }
+        let secs = d.block.creation_time / 1_000_000;
+        let cmd = serde_json::json!({
+            "meta": {"chainId": d.key().chain().to_string(), "creationTime": secs,
+                     "gasLimit": 0, "gasPrice": 0, "sender": "coinbase", "ttl": 0},
+            "nonce": "",
+            "signers": [],
+        });
+        let mut c = (*d).clone();
+        c.cmd = Some(cmd);
+        Transaction { d: Arc::new(c) }
     }
 }
 
@@ -124,6 +149,13 @@ impl TransactionCommand {
     }
 
     fn payload_value(&self) -> TransactionPayload {
+        if self.d.is_coinbase() {
+            // Stock's `{}` text for the code and data of a tx with no command.
+            return TransactionPayload::ExecutionPayload(ExecutionPayload {
+                code: Some("{}".into()),
+                data: "{}".into(),
+            });
+        }
         let p = self.cmd().get("payload");
         // A JSON-null `cont` is absent: an exec payload may carry `"cont": null`
         // (R-P5P9-60 D4).
@@ -156,13 +188,23 @@ impl TransactionCommand {
         TransactionMeta {
             chain_id: BigInt::new(int_of(g("chainId"))),
             creation_time: crate::txlist::creation_time(self.cmd()).unwrap_or(DateTime(0)),
-            gas_limit: BigInt::text(int_of(g("gasLimit"))),
+            // Stock quirk (G4 run 2, all 5,193 recorded `isCoinbase` answers): a coinbase row's
+            // `gasLimit` is the JSON number 0, every user tx's a string.
+            gas_limit: if self.d.is_coinbase() {
+                BigInt::new(int_of(g("gasLimit")))
+            } else {
+                BigInt::text(int_of(g("gasLimit")))
+            },
             gas_price: FloatText(format!("{}", float_of(g("gasPrice")))),
             sender: str_of(g("sender")),
             ttl: BigInt::text(int_of(g("ttl"))),
         }
     }
-    async fn network_id(&self) -> String {
+    async fn network_id(&self, ctx: &Context<'_>) -> String {
+        if self.d.is_coinbase() {
+            // Stock answers its configured network for a coinbase (no command).
+            return gql(ctx).settings.network_id.clone();
+        }
         str_of(self.cmd().get("networkId"))
     }
     async fn nonce(&self) -> String {
@@ -431,14 +473,35 @@ fn txs(
         .edges
         .into_iter()
         .filter_map(|(c, it)| match it {
-            Item::Tx(d) => Transaction::new(d).map(|t| (c, t)),
+            // Coinbase rows reach here only from a list that keeps them (`isCoinbase: true`).
+            Item::Tx(d) => Some((c, Transaction::listed(d))),
             _ => None,
         })
         .collect();
     (edges, p.info, p.total)
 }
 
-/// `transaction(requestKey, blockHash, minimumDepth)`: `null` when not indexed; several
+/// Stock's range check of `transaction(minimumDepth:)` (indexer-kadena
+/// `transaction-query-resolver.ts`, first thing the resolver does): outside 1..=100 it throws,
+/// which answers `INTERNAL_SERVER_ERROR` with its message and `transaction: null`, HTTP 200
+/// (FIX-4 part B item 4).
+fn stock_depth_range(minimum_depth: Option<i32>) -> Result<()> {
+    let msg = match minimum_depth {
+        Some(d) if d < 1 => "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.",
+        Some(d) if d > 100 => {
+            "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be higher than 100."
+        }
+        _ => return Ok(()),
+    };
+    Err(async_graphql::Error::new(msg)
+        .extend_with(|_, e| e.set("code", crate::error::INTERNAL_SERVER_ERROR)))
+}
+
+/// The `BAD_USER_INPUT` of a request key stored more than once, without a `blockHash`.
+pub(crate) const MANY_COPIES: &str = "multiple transactions found: pass blockHash to pick one";
+
+/// `transaction(requestKey, blockHash, minimumDepth)`: `null` when not indexed (also for a
+/// key that is no hash, as stock); several
 /// copies (genesis, R-P5P9-5) without a `blockHash` that picks one are `BAD_USER_INPUT`.
 pub async fn query_transaction(
     ctx: &Context<'_>,
@@ -446,9 +509,18 @@ pub async fn query_transaction(
     minimum_depth: Option<i32>,
     request_key: String,
 ) -> Result<Option<Transaction>> {
-    let rk = hash_arg("requestKey", &request_key)?;
+    if let Err(e) = stock_depth_range(minimum_depth) {
+        // A thrown resolver error in stock leaves `transaction: null` beside it; async-graphql
+        // would null the whole `data`, so the error is added and the field answers null.
+        ctx.add_error(ctx.set_error_path(e.into_server_error(ctx.item.pos)));
+        return Ok(None);
+    }
     let bh = block_hash.map(|h| hash_arg("blockHash", &h)).transpose()?;
     let depth = height_arg("minimumDepth", minimum_depth)?;
+    // A key that is no hash finds nothing: `null` without an error, as stock (G4 class 2).
+    let Some(rk) = rk_arg(&request_key) else {
+        return Ok(None);
+    };
     let found = gql(ctx)
         .state()?
         .read(move |view| {
@@ -484,9 +556,7 @@ pub async fn query_transaction(
     match found.len() {
         0 => Ok(None),
         1 => Ok(Transaction::new(found[0].clone())),
-        _ => Err(bad_input(
-            "multiple transactions found: pass blockHash to pick one",
-        )),
+        _ => Err(bad_input(MANY_COPIES)),
     }
 }
 
@@ -497,20 +567,26 @@ fn list_source(
     block_hash: Option<&str>,
     request_key: Option<&str>,
 ) -> Result<SourceSpec> {
+    // A `fungibleName` is checked whatever the source, so a name of spaces alone is refused
+    // beside `blockHash` or `requestKey` too (FIX-4 part C, M-4); so is `blockHash` beside
+    // `requestKey`, which filters that key's copies (stock ANDs both; audit F-30).
+    let fungible = fungible.map(fungible_arg).transpose()?;
+    let block = block_hash.map(|h| hash_arg("blockHash", h)).transpose()?;
     Ok(if let Some(rk) = request_key {
-        SourceSpec::Rk(hash_arg("requestKey", rk)?)
-    } else if let Some(bh) = block_hash {
-        SourceSpec::Block(hash_arg("blockHash", bh)?)
+        SourceSpec::Rk {
+            rk: rk_arg(rk),
+            block,
+        }
+    } else if let Some(bh) = block {
+        SourceSpec::Block(bh)
     } else {
         match (account, fungible) {
             (Some(a), Some(m)) => SourceSpec::Xfer {
                 account: name_arg("accountName", a)?.to_owned(),
-                module: name_arg("fungibleName", m)?.to_owned(),
+                module: m.to_owned(),
             },
             (Some(a), None) => SourceSpec::Acct(name_arg("accountName", a)?.to_owned()),
-            (None, Some(m)) => {
-                SourceSpec::EvtName(format!("{}.TRANSFER", name_arg("fungibleName", m)?))
-            }
+            (None, Some(m)) => SourceSpec::EvtName(format!("{m}.TRANSFER")),
             (None, None) => SourceSpec::Heights,
         }
     })
@@ -533,10 +609,12 @@ fn key_filter(
 }
 
 /// The list behind `transactions(...)`. GQ-19 (R-P5P9-57 M1): `accountName` lists the txs
-/// the account sent (`meta.sender`), as the oracle does: the account's `sndr` postings (with
-/// `fungibleName`, intersected with its `xfer` postings) when the view is sender-ready
-/// (FIX-2), else its `acct`/`xfer` postings filtered on the record's sender. With
-/// `requestKey` or `blockHash` the source is that key or block, filtered on the sender.
+/// the account sent (`meta.sender`), as the oracle does: the account's `sndr` postings when
+/// the view is sender-ready (FIX-2), else its `acct` postings filtered on the record's
+/// sender. With `requestKey` or `blockHash` the source is that key or block, filtered on
+/// the sender. Beside an account, key or block `fungibleName` keeps the txs with an event
+/// of that module, as stock filters (audit F-30, PR-4 item a); alone it reads the
+/// `<module>.TRANSFER` postings (a documented gap with stock).
 fn transactions_spec(
     account_name: Option<&str>,
     block_hash: Option<&str>,
@@ -544,18 +622,32 @@ fn transactions_spec(
     fungible_name: Option<&str>,
     (min_height, max_height, minimum_depth): (Option<i32>, Option<i32>, Option<i32>),
     request_key: Option<&str>,
+    coinbase: bool,
 ) -> Result<ListSpec> {
-    let source = match list_source(account_name, fungible_name, block_hash, request_key)? {
-        SourceSpec::Acct(a) => SourceSpec::Sndr(a),
-        SourceSpec::Xfer { account, module } => SourceSpec::SndrXfer { account, module },
-        s => s,
+    // Stock keeps a tx with ANY event of the `fungibleName` module (`EXISTS` on
+    // `Events.module`), not only one with a transfer of it. Where the source is already
+    // bounded (the account's sent txs, a request key, a block) the token filters rows on an
+    // event of the module, as stock (PR-4 item a). Without one, the source stays the
+    // full-history `<module>.TRANSFER` postings: txs with a transfer of the module only, a
+    // deliberate gap with stock (no module index; docs/graphql.md).
+    let checked = fungible_name
+        .map(|m| fungible_arg(m).map(str::to_owned))
+        .transpose()?;
+    let (source, module) = match list_source(account_name, fungible_name, block_hash, request_key)?
+    {
+        SourceSpec::Acct(a) => (SourceSpec::Sndr(a), checked),
+        SourceSpec::Xfer { account, .. } => (SourceSpec::Sndr(account), checked),
+        s @ SourceSpec::EvtName(_) => (s, None),
+        s => (s, checked),
     };
     Ok(ListSpec {
         source,
-        filter: key_filter(chain_id, min_height, max_height, minimum_depth, true)?,
+        filter: key_filter(chain_id, min_height, max_height, minimum_depth, !coinbase)?,
         rows: Rows::Txs {
             sender: account_name.map(str::to_owned),
             nft: false,
+            module,
+            coinbase,
         },
     })
 }
@@ -577,12 +669,6 @@ pub async fn query_transactions(
     request_key: Option<String>,
     is_coinbase: Option<bool>,
 ) -> Result<QueryTransactionsConnection> {
-    if is_coinbase == Some(true) {
-        // Coinbase txs are not `Transaction`s here (R7D-3); `Block.coinbase` has them.
-        return Err(crate::error::not_supported(
-            "transactions(isCoinbase: true) (use Block.coinbase)",
-        ));
-    }
     let spec = transactions_spec(
         account_name.as_deref(),
         block_hash.as_deref(),
@@ -590,6 +676,9 @@ pub async fn query_transactions(
         fungible_name.as_deref(),
         (min_height, max_height, minimum_depth),
         request_key.as_deref(),
+        // `isCoinbase: true` keeps the coinbases in the list (stock drops its
+        // `sender != 'coinbase'` condition; G4 class 1). Every other rule is unchanged.
+        is_coinbase == Some(true),
     )?;
     let (edges, page_info, total) =
         txs(block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?);
@@ -620,6 +709,8 @@ pub async fn query_transactions_by_public_key(
         rows: Rows::Txs {
             sender: None,
             nft: false,
+            module: None,
+            coinbase: false,
         },
     };
     let (edges, page_info, total) =
@@ -651,7 +742,9 @@ pub async fn query_transfers(
     let nft = is_nft == Some(true);
     let source = match (nft, &account_name) {
         // NFT moves have no `xfer` postings: an account's come from its `acct` postings.
+        // `fungibleName` is checked here as `list_source` checks it (audit F-30).
         (true, Some(a)) if request_key.is_none() && block_hash.is_none() => {
+            fungible_name.as_deref().map(fungible_arg).transpose()?;
             SourceSpec::Acct(name_arg("accountName", a)?.to_owned())
         }
         _ => list_source(
@@ -665,7 +758,7 @@ pub async fn query_transfers(
         source,
         filter: key_filter(chain_id.as_deref(), None, None, None, false)?,
         rows: Rows::Transfers {
-            module: fungible_name,
+            module: fungible_name.map(|m| m.trim().to_owned()),
             account: account_name,
             nft,
         },
@@ -690,6 +783,18 @@ pub async fn query_transfers(
         page_info: p.info,
         total: p.total,
     })
+}
+
+/// Whether an account's `acct` postings hold every tx with a `qual` event whose first
+/// parameter is `a` (audit F-27, option B). A principal is posted wherever it appears; any
+/// other string only as a side of a transfer, so the account postings serve it only for a
+/// `TRANSFER` event (fast vanity-name filters on `coin.TRANSFER`). Known gap: a poly-fungible
+/// `TRANSFER (id, from, to, amount)` whose token `id` is `a` and that does not name `a` as a
+/// side is missed, as is a `TRANSFER` whose params fail the transfer shape (no sides then).
+/// Every other event name reads the event-name postings, filtered on the parameters.
+fn acct_covers(a: &str, qual: &str) -> bool {
+    kdx_decode::build::is_principal(a)
+        || qual.rsplit_once('.').is_some_and(|(_, n)| n == "TRANSFER")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -725,17 +830,25 @@ pub async fn query_events(
         .as_deref()
         .map(ParamFilter::parse)
         .transpose()?;
+    // `blockHash` is checked, and filters a `requestKey`'s copies (stock ANDs both; F-30).
+    let block = block_hash
+        .as_deref()
+        .map(|h| hash_arg("blockHash", h))
+        .transpose()?;
     let source = if let Some(rk) = &request_key {
-        SourceSpec::Rk(hash_arg("requestKey", rk)?)
-    } else if let Some(bh) = &block_hash {
-        SourceSpec::Block(hash_arg("blockHash", bh)?)
+        SourceSpec::Rk {
+            rk: rk_arg(rk),
+            block,
+        }
+    } else if let Some(bh) = block {
+        SourceSpec::Block(bh)
     } else if let Some(q) = &qual {
         match params.as_ref().and_then(|p| p.first_str()) {
-            Some(a) => SourceSpec::AcctOrEvt {
+            Some(a) if acct_covers(a, q) => SourceSpec::AcctOrEvt {
                 account: a.to_owned(),
                 qual: q.clone(),
             },
-            None => SourceSpec::EvtName(q.clone()),
+            _ => SourceSpec::EvtName(q.clone()),
         }
     } else {
         // `moduleName` alone (ZelCore extension): no module posting family, so heights are
@@ -1055,7 +1168,7 @@ mod tests {
         });
         let d = Arc::new(TxData {
             rec: kdx_types::record::TxRecord {
-                key: TxKey::new(5, 1, 0),
+                key: TxKey::new(5, 1, 1), // position 0 is the coinbase
                 request_key: Some(Hash32([9; 32])),
                 ..Default::default()
             },
@@ -1136,7 +1249,7 @@ mod tests {
         };
         assert!(dec(&v["event"]["id"]).starts_with("Event:["), "{v}");
         assert!(
-            dec(&v["event"]["id"]).contains(r#"","0","#),
+            dec(&v["event"]["id"]).contains(r#"","1","#),
             "{}",
             dec(&v["event"]["id"])
         );
@@ -1528,9 +1641,17 @@ mod cgfix_tests {
     /// M1 (GQ-19): `transactions(accountName)` keeps only the account's own txs.
     #[test]
     fn account_transactions_are_sender_rows() {
-        let spec = transactions_spec(Some("k:a"), None, Some("2"), None, (None, None, None), None)
-            .unwrap();
-        let Rows::Txs { sender, nft } = &spec.rows else {
+        let spec = transactions_spec(
+            Some("k:a"),
+            None,
+            Some("2"),
+            None,
+            (None, None, None),
+            None,
+            false,
+        )
+        .unwrap();
+        let Rows::Txs { sender, nft, .. } = &spec.rows else {
             panic!("tx rows")
         };
         assert_eq!((sender.as_deref(), *nft), (Some("k:a"), false));
@@ -1541,13 +1662,16 @@ mod cgfix_tests {
             Some("coin"),
             (None, None, None),
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(&with_token.rows, Rows::Txs { sender: Some(s), .. } if s == "k:a"));
         // FIX-2: sender sources, so a sender-ready view reads the `sndr` postings.
         assert!(matches!(&spec.source, SourceSpec::Sndr(a) if a == "k:a"));
-        assert!(matches!(&with_token.source,
-            SourceSpec::SndrXfer { account, module } if account == "k:a" && module == "coin"));
+        // PR-4 (a): the token filters rows (any event of the module), not the source.
+        assert!(matches!(&with_token.source, SourceSpec::Sndr(a) if a == "k:a"));
+        assert!(matches!(&with_token.rows,
+            Rows::Txs { module: Some(m), .. } if m == "coin"));
         let by_block = transactions_spec(
             None,
             Some("lYOEd2WyPiTx_bfiTIbwRH2N4beFtFtQuNRZA2umjyo"),
@@ -1555,6 +1679,7 @@ mod cgfix_tests {
             None,
             (None, None, None),
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(&by_block.rows, Rows::Txs { sender: None, .. }));

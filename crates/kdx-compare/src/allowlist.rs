@@ -310,8 +310,8 @@ mod tests {
         let al = shipped();
         assert_eq!(al.entries.len(), entries.len());
         // Only entries the owner accepted, or the controller flipped by a ruling on a run's
-        // evidence (R-P5P9-75, CG-4, or R-P5P9-86 / R-P5P9-103, CG-5, with its example records), are
-        // ACCEPTED.
+        // evidence (R-P5P9-75, CG-4, or R-P5P9-86 / R-P5P9-103, CG-5, with its example records, or
+        // fix3e S2 on the O1 diagnosis), are ACCEPTED.
         for e in &al.entries {
             if e.status == super::Status::Accepted {
                 assert!(
@@ -320,7 +320,9 @@ mod tests {
                         || ((e.ruling.contains("R-P5P9-75, CG-4")
                             || e.ruling.contains("R-P5P9-86, CG-5")
                             || e.ruling.contains("R-P5P9-103, CG-5"))
-                            && (e.owner_note.contains('#') || e.owner_note.contains("zero hits"))),
+                            && (e.owner_note.contains('#') || e.owner_note.contains("zero hits")))
+                        // The controller's FIX-3 part E ruling S2, on the O1 diagnosis.
+                        || (e.ruling.contains("fix3e S2") && e.reason.contains("o1o2 diagnosis")),
                     "{} is ACCEPTED without an owner acceptance or a flip ruling with evidence",
                     e.id
                 );

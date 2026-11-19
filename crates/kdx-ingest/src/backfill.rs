@@ -58,6 +58,37 @@ const POSTING_FAMILIES: u64 = kdx_decode::Family::ALL.len() as u64;
 /// How often the RSS guard samples while backfill runs.
 const RSS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Fetch tasks in flight, oldest first. Dropping the queue (an early `?` in `run`) aborts
+/// the tasks still in it, so none outlives the run (F-40).
+struct InFlight<T>(VecDeque<(Unit, tokio::task::JoinHandle<T>)>);
+
+impl<T> Default for InFlight<T> {
+    fn default() -> Self {
+        InFlight(VecDeque::new())
+    }
+}
+
+impl<T> std::ops::Deref for InFlight<T> {
+    type Target = VecDeque<(Unit, tokio::task::JoinHandle<T>)>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for InFlight<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> Drop for InFlight<T> {
+    fn drop(&mut self) {
+        for (_, h) in &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// One work unit: a range, or a step at the tail end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unit {
@@ -70,6 +101,11 @@ pub struct Unit {
 /// Ranges aligned to `range` heights; steps of `step` heights where a full range does not
 /// fit (unaligned start or the tail end). A partial step is never written.
 pub fn plan_units(start: u32, end: u32, range: u32, step: u32) -> Result<Vec<Unit>> {
+    // F-45: a zero range or step would plan empty units forever.
+    anyhow::ensure!(
+        range > 0 && step > 0,
+        "backfill.range_heights ({range}) and step_heights ({step}) must be > 0"
+    );
     if !start.is_multiple_of(step) {
         bail!("backfill start {start} is not a multiple of backfill.step_heights {step}");
     }
@@ -501,7 +537,7 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
 
     let walker = Arc::new(Walker::new(mode, cut));
     let spool_bytes = (mem.spool_mb << 20) as usize;
-    let mut pending: VecDeque<(Unit, tokio::task::JoinHandle<Result<Fetched>>)> = VecDeque::new();
+    let mut pending: InFlight<Result<Fetched>> = InFlight::default();
     let mut next = 0usize;
     let spawn = |u: Unit| tokio::spawn(fetch_unit(ctx.clone(), walker.clone(), u, spool_bytes));
     let stats_path = o.data_dir.join("backfill-stats.jsonl");
@@ -544,10 +580,11 @@ pub async fn run(ctx: Arc<Ctx>, from: u32, to: u32, mode: HeaderMode) -> Result<
         let m = manifest.clone();
         let (entry, p, timing) = tokio::task::spawn_blocking(move || {
             let r = build_and_commit(&c, u, fetched.coll, p, first_txnum, wopts, link_free, m);
-            if r.is_err() {
+            if let Err(e) = &r {
                 // Names interned for the failed range never reached MDBX (review M3).
                 let mut d = c.dict.lock().unwrap_or_else(|e| e.into_inner());
-                c.reload_dict(&mut d);
+                c.reload_dict(&mut d)
+                    .with_context(|| format!("after a failed range build: {e:#}"))?;
             }
             r
         })
@@ -956,6 +993,15 @@ mod mem_tests {
         let big = mem_plan(2, 1024, 16384);
         assert!(small.postings_mem_entries < big.postings_mem_entries);
     }
+
+    /// F-45: a zero range or step is refused (it planned empty units forever). Not seen red:
+    /// on the old code this call does not return.
+    #[test]
+    fn plan_units_refuses_zero_sizes() {
+        assert!(plan_units(0, 100, 0, 10).is_err());
+        assert!(plan_units(0, 100, 100, 0).is_err());
+        assert_eq!(plan_units(0, 100, 100, 10).unwrap().len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1010,5 +1056,35 @@ mod merkle_spool_tests {
         t.commit(dir.path(), 600);
         assert_eq!(fs::read_to_string(&path).unwrap(), s);
         assert!(!etl.join(merkle_spool_name(600)).exists());
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// F-40: dropping the in-flight queue (an early `?` in `run`) aborts its fetch tasks.
+    #[tokio::test]
+    async fn dropping_the_queue_aborts_its_tasks() {
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let u = Unit {
+            kind: RangeKind::Step,
+            start: 0,
+            end: 1,
+        };
+        let mut q = InFlight::default();
+        q.push_back((
+            u,
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                d.store(true, Ordering::SeqCst);
+            }),
+        ));
+        drop(q);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!done.load(Ordering::SeqCst), "the task outlived the queue");
     }
 }

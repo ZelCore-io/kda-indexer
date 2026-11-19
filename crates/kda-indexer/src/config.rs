@@ -216,10 +216,15 @@ pub struct ApiConfig {
     pub deadline_ms: u64,
     /// Requests in flight over all listeners (503 past it).
     pub max_in_flight: usize,
+    /// Serve Swagger UI and the OpenAPI documents under `/docs` on the native and compat
+    /// listeners (404 when false).
+    pub docs_enabled: bool,
     /// Response body cap (503 "narrow the query" past it).
     pub max_body_mb: u64,
     /// Response body cap of `/v1/txs`.
     pub v1txs_max_body_mb: u64,
+    /// Deadline of a `/v1/txs` request (default 30,000: kda-txs answers 404 at 30 s).
+    pub v1txs_deadline_ms: u64,
     /// Concurrent store reads (blocking threads).
     pub read_threads: usize,
     /// `/readyz` fails when a non-halted chain lags the node by more blocks than this.
@@ -240,8 +245,10 @@ impl Default for ApiConfig {
             rate_burst: 40,
             deadline_ms: 5000,
             max_in_flight: 512,
+            docs_enabled: true,
             max_body_mb: 8,
             v1txs_max_body_mb: 32,
+            v1txs_deadline_ms: 30_000,
             read_threads: 4,
             ready_max_lag: 20,
             max_event_lists: 256,
@@ -346,6 +353,7 @@ impl ApiConfig {
             max_in_flight: self.max_in_flight,
             max_body_bytes: (self.max_body_mb as usize) << 20,
             v1txs_max_body_bytes: (self.v1txs_max_body_mb as usize) << 20,
+            v1txs_deadline: std::time::Duration::from_millis(self.v1txs_deadline_ms),
             rate_per_ip: self.rate_per_ip,
             rate_burst: self.rate_burst,
             trusted_proxies: trusted,
@@ -363,12 +371,15 @@ impl ApiConfig {
 pub struct GraphqlConfig {
     /// Page size when a connection gets neither `first` nor `last`.
     pub default_page: u32,
-    /// Larger `first`/`last` values are clamped to this.
+    /// Page size of the legacy cost model (`check-ops`) only; served pages, subscription
+    /// `quantity` and NFT holdings have the fixed 1,000-row safety cap (FIX-3 part D).
     pub max_page: u32,
+    /// Read-budget model only; stock's depth limit (9) is what refuses.
     pub max_depth: u32,
+    /// Read budget (logged above it, never refused); stock's complexity limit (4000) refuses.
     pub max_complexity: u64,
     pub introspection: bool,
-    /// Depth cap of introspection (exempt from `max_depth`).
+    /// Read-budget model only; stock's introspection depth limit (12) is what refuses.
     pub introspection_depth: u32,
     /// Operations in one batched request (a batch of N takes N rate tokens).
     pub max_batch: u32,
@@ -512,6 +523,8 @@ impl GraphqlConfig {
             ws_conns_max: self.ws_conns_max as usize,
             ws_init: Duration::from_secs(self.ws_init_secs),
             ws_idle: Duration::from_secs(self.ws_idle_secs),
+            ws_ping: kdx_graphql::ws::WS_PING,
+            ws_silence: kdx_graphql::ws::WS_SILENCE,
             ws_tx_wait: Duration::from_secs(self.ws_tx_wait_secs),
             feed_poll: Duration::from_millis(self.feed_poll_ms),
             feed_ring_bytes: self.feed_ring_mb as usize * (1 << 20),
@@ -593,10 +606,15 @@ pub struct BalancesConfig {
     pub local_rps: u32,
     /// `/local` calls in flight.
     pub local_concurrency: u32,
-    /// Most dirty keys of one non-coin module per reconcile batch (I-7).
+    /// Dirty keys of one non-coin module that take a batch slot before the others get theirs
+    /// (I-7): the fair share. Room left in a seed batch is topped up beyond it.
     pub module_share: u32,
     /// Most `Balances` rows of one non-coin module (I-7).
     pub module_rows: u32,
+    /// Most `Balances` rows of one confirmed `fungible-v2` module other than `coin` (F-14:
+    /// anyone can deploy one). `reconcile-balances --status` shows it, the largest module's
+    /// row count and the capped modules.
+    pub fungible_module_rows: u32,
     /// Most `Balances` rows of one account (I-7; `coin` rows are always kept).
     pub account_rows: u32,
     /// Hours after which a module's fungible check and a not-fungible verdict are re-done.
@@ -605,6 +623,10 @@ pub struct BalancesConfig {
     /// can implement fungible-v2 and report a balance under any key, so only the ones listed
     /// here are governance-trusted; others appear only when asked for by `token`.
     pub key_modules: Vec<String>,
+    /// Modules the key listing never sends a `keys` (or `describe-module`) read, on any chain.
+    /// The node blocks its cut for about 14 minutes while it answers a `keys` of a huge table
+    /// (`free.crankk01.crankk01-token-table`, Nov 2026), so even a first read must not happen.
+    pub keylist_skip: Vec<String>,
 }
 
 impl Default for BalancesConfig {
@@ -615,9 +637,11 @@ impl Default for BalancesConfig {
             local_concurrency: 8,
             module_share: 32,
             module_rows: 1_000_000,
+            fungible_module_rows: kdx_ingest::reconcile::DEFAULT_FUNGIBLE_MODULE_ROWS,
             account_rows: 1_000,
             recheck_hours: 24,
             key_modules: vec!["coin".to_owned()],
+            keylist_skip: vec!["free.crankk01".to_owned()],
         }
     }
 }
@@ -641,14 +665,22 @@ impl BalancesConfig {
         anyhow::ensure!(
             self.module_share >= 1
                 && self.module_rows >= 1
+                && self.fungible_module_rows >= 1
                 && self.account_rows >= 1
                 && self.recheck_hours >= 1,
-            "balances.module_share, module_rows, account_rows and recheck_hours must be >= 1"
+            "balances.module_share, module_rows, fungible_module_rows, account_rows and \
+             recheck_hours must be >= 1"
         );
         for m in &self.key_modules {
             anyhow::ensure!(
                 kdx_node::local::valid_module(m),
                 "balances.key_modules: `{m}` is not a module name (name or namespace.name)"
+            );
+        }
+        for m in &self.keylist_skip {
+            anyhow::ensure!(
+                kdx_node::local::valid_module(m),
+                "balances.keylist_skip: `{m}` is not a module name (name or namespace.name)"
             );
         }
         Ok(())
@@ -724,6 +756,31 @@ impl Config {
             "backfill.step_heights must be at least 10 (got {})",
             b.step_heights
         );
+        // F-45: 0 is a multiple of every step (plan_units looped forever on it), and the
+        // backfill plans ranges in u32 heights.
+        anyhow::ensure!(
+            b.range_heights >= b.step_heights && u32::try_from(b.range_heights).is_ok(),
+            "backfill.range_heights must be in step_heights..=4294967295 (got {})",
+            b.range_heights
+        );
+        anyhow::ensure!(
+            b.ranges_in_flight > 0,
+            "backfill.ranges_in_flight must be > 0"
+        );
+        anyhow::ensure!(
+            self.ingest.node_concurrency > 0,
+            "ingest.node_concurrency must be > 0"
+        );
+        // Owner ruling (audit F-45): 0 is refused, not taken as "no limit".
+        anyhow::ensure!(self.ingest.max_rps > 0, "ingest.max_rps must be > 0");
+        kdx_segment::manifest::check_network(&self.network).context("network")?;
+        if let Some(pin) = &self.node.p2p_cert_sha256 {
+            kdx_node::parse_sha256_hex(pin).context("node.p2p_cert_sha256")?;
+        }
+        anyhow::ensure!(
+            self.node.p2p_url.is_none() || self.node.p2p_cert_sha256.is_some(),
+            "node.p2p_url is set but node.p2p_cert_sha256 is not"
+        );
         anyhow::ensure!(
             b.range_heights.is_multiple_of(b.step_heights),
             "backfill.range_heights ({}) must be a multiple of backfill.step_heights ({})",
@@ -761,6 +818,7 @@ impl Config {
         a.settings(&self.network)?;
         anyhow::ensure!(
             a.deadline_ms >= 100
+                && a.v1txs_deadline_ms >= 100
                 && a.max_in_flight > 0
                 && a.read_threads > 0
                 && a.rate_per_ip > 0
@@ -768,7 +826,7 @@ impl Config {
                 && a.max_body_mb > 0
                 && a.v1txs_max_body_mb > 0
                 && a.max_event_lists > 0,
-            "api: deadline_ms must be >= 100 and the other limits > 0"
+            "api: deadline_ms and v1txs_deadline_ms must be >= 100 and the other limits > 0"
         );
         let g = &self.graphql;
         anyhow::ensure!(
@@ -854,6 +912,7 @@ mod balances_tests {
         let ok = BalancesConfig::default();
         assert!(ok.validate().is_ok());
         assert_eq!(ok.key_modules, ["coin"]);
+        assert_eq!(ok.keylist_skip, ["free.crankk01"]);
         let wide = BalancesConfig {
             key_modules: vec!["coin".into(), "kaddex.kdx".into()],
             ..ok.clone()
@@ -882,6 +941,10 @@ mod balances_tests {
             },
             BalancesConfig {
                 key_modules: vec!["".into()],
+                ..ok.clone()
+            },
+            BalancesConfig {
+                keylist_skip: vec!["free.x; drop".into()],
                 ..ok.clone()
             },
         ] {
@@ -1011,6 +1074,30 @@ mod ws_bound_tests {
         toml::from_str::<Config>(&text)?.validate()
     }
 
+    /// FIX-4 part B (B1): `api.v1txs_deadline_ms` defaults to 30,000 (kda-txs' own ceiling),
+    /// reaches the settings, and below 100 is refused as `deadline_ms` is.
+    #[test]
+    fn v1txs_deadline_ms_defaults_reaches_settings_and_is_bounded() {
+        let parse = |a: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[api]\n{a}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        let c = parse("");
+        assert_eq!(c.api.v1txs_deadline_ms, 30_000);
+        c.validate().unwrap();
+        let s = parse("v1txs_deadline_ms = 12000")
+            .api
+            .settings("mainnet01")
+            .unwrap();
+        assert_eq!(s.v1txs_deadline, std::time::Duration::from_millis(12_000));
+        assert!(cfg("v1txs_deadline_ms = 100", "").is_ok());
+        let e = cfg("v1txs_deadline_ms = 99", "").unwrap_err();
+        assert!(format!("{e:#}").contains("v1txs_deadline_ms"), "{e:#}");
+    }
+
     /// `graphql.count_budget_ms` parses from the file, defaults to 200 and reaches the settings.
     #[test]
     fn count_budget_ms_parses_and_defaults() {
@@ -1028,6 +1115,49 @@ mod ws_bound_tests {
         assert_eq!(ms(&c), 50);
         assert_eq!(ms(&parse("")), 200);
         assert!(parse("count_budget_ms = 0").validate().is_err());
+    }
+
+    /// `api.docs_enabled` defaults to true (Swagger UI under `/docs`), parses `false`, and is
+    /// documented where operators look: both example configs and the API and operations docs.
+    #[test]
+    fn docs_enabled_parses_defaults_and_is_documented() {
+        let parse = |a: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[api]\n{a}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        assert!(parse("").api.docs_enabled);
+        assert!(ApiConfig::default().docs_enabled);
+        let c = parse("docs_enabled = false");
+        c.validate().unwrap();
+        assert!(!c.api.docs_enabled);
+        for (name, text) in [
+            (
+                "mainnet01.toml.example",
+                include_str!("../../../packaging/config/mainnet01.toml.example"),
+            ),
+            (
+                "testnet.toml.example",
+                include_str!("../../../packaging/config/testnet.toml.example"),
+            ),
+        ] {
+            assert!(
+                text.lines().any(|l| l.starts_with("docs_enabled = true")),
+                "{name} lacks docs_enabled"
+            );
+        }
+        for (name, text) in [
+            ("api.md", include_str!("../../../docs/api.md")),
+            ("operations.md", include_str!("../../../docs/operations.md")),
+        ] {
+            assert!(
+                text.contains("docs_enabled"),
+                "{name} does not document docs_enabled"
+            );
+            assert!(text.contains("/docs"), "{name} does not name /docs");
+        }
     }
 
     /// `graphql.sender_index` (FIX-2) defaults to true and parses `false`.
@@ -1090,5 +1220,95 @@ mod ws_bound_tests {
                 "{bad}: {e:#}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    /// A config with `head` (top-level keys), `node` (extra `[node]` keys) and `rest` (more
+    /// sections), validated.
+    fn check(head: &str, node: &str, rest: &str) -> anyhow::Result<()> {
+        let head = if head.contains("network") {
+            head.to_owned()
+        } else {
+            format!("network = \"mainnet01\"\n{head}")
+        };
+        let text = format!(
+            "{head}\ndata_dir = \"data\"\n[node]\nurl = \"http://127.0.0.1:1848\"\n{node}\n{rest}\n"
+        );
+        toml::from_str::<Config>(&text)?.validate()
+    }
+
+    fn refused(head: &str, node: &str, rest: &str, says: &str) {
+        let e = check(head, node, rest).expect_err(rest);
+        assert!(
+            format!("{e:#}").contains(says),
+            "{head} {node} {rest}: {e:#}"
+        );
+    }
+
+    /// F-45: values that `config check` passed but that hang or fail at run time.
+    #[test]
+    fn zero_and_out_of_range_values_are_refused() {
+        check("", "", "").expect("defaults pass");
+        // 0 is a multiple of every step: `plan_units` looped forever on it.
+        refused("", "", "[backfill]\nrange_heights = 0", "range_heights");
+        refused(
+            "",
+            "",
+            "[backfill]\nrange_heights = 5000000000\nstep_heights = 10",
+            "range_heights",
+        );
+        refused(
+            "",
+            "",
+            "[backfill]\nranges_in_flight = 0",
+            "ranges_in_flight",
+        );
+        refused("", "", "[ingest]\nnode_concurrency = 0", "node_concurrency");
+        // Owner ruling: 0 is refused rather than meaning "no limit".
+        refused("", "", "[ingest]\nmax_rps = 0", "ingest.max_rps");
+        check("", "", "[ingest]\nmax_rps = 1").expect("1 passes");
+    }
+
+    #[test]
+    fn network_must_be_a_plain_name() {
+        refused("network = \"../x\"", "", "", "network");
+        refused("network = \"\"", "", "", "network");
+        check("network = \"testnet04\"", "", "").expect("plain name passes");
+    }
+
+    #[test]
+    fn p2p_cert_pin_is_checked_with_the_url() {
+        let pin = "ab".repeat(32);
+        check(
+            "",
+            &format!("p2p_url = \"https://127.0.0.1:1789\"\np2p_cert_sha256 = \"{pin}\""),
+            "",
+        )
+        .expect("url plus a 64-hex pin passes");
+        refused(
+            "",
+            "p2p_url = \"https://127.0.0.1:1789\"",
+            "",
+            "p2p_cert_sha256",
+        );
+        refused(
+            "",
+            "p2p_url = \"https://127.0.0.1:1789\"\np2p_cert_sha256 = \"abcd\"",
+            "",
+            "p2p_cert_sha256",
+        );
+        refused(
+            "",
+            &format!(
+                "p2p_url = \"https://127.0.0.1:1789\"\np2p_cert_sha256 = \"{}\"",
+                "zz".repeat(32)
+            ),
+            "",
+            "p2p_cert_sha256",
+        );
     }
 }

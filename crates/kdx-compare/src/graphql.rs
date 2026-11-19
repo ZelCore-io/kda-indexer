@@ -28,10 +28,12 @@ use crate::run::{Ctx, Outcome};
 use crate::target::Target;
 
 /// Root fields the adapter answers with `NOT_SUPPORTED` (spec section 5.3; plan Q9).
-pub const NOT_SUPPORTED_ROOTS: &[&str] = &["pactQuery", "lastTokenPriceInKda", "gasLimitEstimate"];
+pub const NOT_SUPPORTED_ROOTS: &[&str] = &["pactQuery", "gasLimitEstimate"];
 /// Root fields whose answer depends on the current tip: never sent to the oracle (GQ-16).
 const TIP_ROOTS: &[&str] = &[
     "lastBlockHeight",
+    // The newest swap so far (served since 2026-11-24).
+    "lastTokenPriceInKda",
     "networkInfo",
     "completedBlockHeights",
     "blocksFromDepth",
@@ -2236,13 +2238,30 @@ impl Ctx {
 
     /// One small read of ours (A) for a row rule; `data` or `None`.
     pub(crate) async fn gql_read(&self, ta: &Target, query: &str, vars: Value) -> Option<Value> {
+        self.gql_read_why(ta, query, vars).await.ok()
+    }
+
+    /// [`Ctx::gql_read`] that keeps why there is no `data` (FIX-3, O1): the transport or
+    /// parse failure, or the answer's `errors` ([`page_data`]).
+    pub(crate) async fn gql_read_why(
+        &self,
+        ta: &Target,
+        query: &str,
+        vars: Value,
+    ) -> Result<Value, PageError> {
         let c = ta
             .post_json(&json!({ "query": query, "variables": vars }))
             .await
-            .ok()?;
+            .map_err(|e| PageError {
+                complexity: false,
+                text: format!("the read failed: {e}"),
+            })?;
         self.gql_count(ROW_RULE_ROUTE, &ta.name, &[c.ms]);
-        let v: Value = serde_json::from_slice(&c.body).ok()?;
-        v.get("data").filter(|d| !d.is_null()).cloned()
+        let v: Value = serde_json::from_slice(&c.body).map_err(|e| PageError {
+            complexity: false,
+            text: format!("the answer is not JSON: {e}"),
+        })?;
+        page_data(&v)
     }
 
     /// R-P5P9-97 Q #37: when the oracle repeats non-fungible chain rows that ours lists once
@@ -2999,7 +3018,7 @@ impl Ctx {
                     continue;
                 };
                 let (det, node_h) = match local.details(chain, "coin", &account).await {
-                    Ok(kdx_node::Local::Found { value, height }) => (value, height),
+                    Ok(kdx_node::Local::Found { value, height, .. }) => (value, height),
                     Ok(kdx_node::Local::Absent) => {
                         d.push(DiffEntry {
                             path: format!("/chain{chain}"),
@@ -3347,7 +3366,11 @@ fn text_decimal(v: Option<&Value>) -> Option<String> {
 pub(crate) fn keysetref_name(g: &Value) -> Option<String> {
     let r = g.get("keysetref")?;
     let ksn = r.get("ksn")?.as_str().filter(|s| !s.is_empty())?;
-    match r.get("ns").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    match r
+        .get("ns")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         Some(ns) => Some(format!("{ns}.{ksn}")),
         None => Some(ksn.to_owned()),
     }
@@ -3359,10 +3382,7 @@ pub(crate) fn reread_agrees(graphql: &str, native: &str) -> bool {
     if same_decimal(graphql, native) {
         return true;
     }
-    match (
-        graphql.trim().parse::<f64>(),
-        native.trim().parse::<f64>(),
-    ) {
+    match (graphql.trim().parse::<f64>(), native.trim().parse::<f64>()) {
         (Ok(x), Ok(y)) => x.is_finite() && x == y,
         _ => false,
     }
@@ -3517,8 +3537,91 @@ pub async fn gen_debug(cfg: &CompareConfig, count: usize, print: bool) -> anyhow
     Ok(())
 }
 
+/// Why a GraphQL answer has no `data` ([`page_data`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageError {
+    /// The answer is a `LIMIT` refusal on query complexity (ours: `extensions.code = "LIMIT"`,
+    /// `extensions.limit = "complexity"`; also read at the error's top level): a smaller
+    /// `first` may pass.
+    pub complexity: bool,
+    /// What the answer said (its `errors` as JSON text, or the transport failure).
+    pub text: String,
+}
+
+/// An answer's `data`, or why it has none: its `errors` (FIX-3, O1: a count walk names the
+/// error instead of "no data", and halves `first` on a complexity `LIMIT`).
+pub fn page_data(v: &Value) -> Result<Value, PageError> {
+    if let Some(d) = v.get("data").filter(|d| !d.is_null()) {
+        return Ok(d.clone());
+    }
+    let errors = v.get("errors").and_then(Value::as_array);
+    let field = |e: &Value, k: &str| {
+        e.pointer(&format!("/extensions/{k}"))
+            .or_else(|| e.get(k))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    // FIX-3 part C: ours now refuses with stock's text (`limit` still names it); stock's
+    // own refusal carries the same text and no `limit`.
+    let complexity = errors.is_some_and(|es| {
+        es.iter().any(|e| {
+            (field(e, "code").as_deref() == Some("LIMIT")
+                && field(e, "limit").as_deref() == Some("complexity"))
+                || e.get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.contains("Exceeded the maximum allowed complexity"))
+        })
+    });
+    let text = match errors {
+        Some(es) if !es.is_empty() => Value::Array(es.clone()).to_string(),
+        _ => "no data and no errors".to_string(),
+    };
+    Err(PageError { complexity, text })
+}
+
 #[cfg(test)]
 mod tests {
+    /// FIX-3 (O1): `data` when there is some; else the `errors` text, and whether one is a
+    /// complexity `LIMIT` (in `extensions`, as ours sends it, or at the error's top level).
+    #[test]
+    fn fix3_page_data_keeps_the_error_and_spots_a_complexity_limit() {
+        use serde_json::json;
+        assert_eq!(
+            super::page_data(&json!({"data": {"x": 1}})),
+            Ok(json!({"x": 1}))
+        );
+        let ext = json!({"data": null, "errors": [{"message": "query complexity 2006 exceeds 2000",
+            "extensions": {"code": "LIMIT", "limit": "complexity"}}]});
+        let e = super::page_data(&ext).unwrap_err();
+        assert!(e.complexity);
+        assert!(
+            e.text.contains("query complexity 2006 exceeds 2000"),
+            "{}",
+            e.text
+        );
+        let top = json!({"data": null, "errors": [{"message": "m", "code": "LIMIT",
+            "limit": "complexity"}]});
+        assert!(super::page_data(&top).unwrap_err().complexity);
+        // Stock's refusal text (stock's own answer, and ours since FIX-3 part C).
+        let stock = json!({"errors": [{"message": "[ERROR][GRAPHQL][VALID_RANGE] Sorry, too complicated query! Exceeded the maximum allowed complexity.",
+            "code": "INTERNAL_SERVER_ERROR"}]});
+        assert!(super::page_data(&stock).unwrap_err().complexity);
+        // Another limit, or another code: not a complexity refusal.
+        let depth = json!({"errors": [{"message": "m",
+            "extensions": {"code": "LIMIT", "limit": "depth"}}]});
+        assert!(!super::page_data(&depth).unwrap_err().complexity);
+        // FIX-3 part E (M2): ours' count-walk bound is named `counts`, and a smaller page does
+        // not get past it, so the walk does not halve on it.
+        let counts = json!({"errors": [{"message": "more than 2 list totalCounts in one operation",
+            "extensions": {"code": "LIMIT", "limit": "counts"}}]});
+        assert!(!super::page_data(&counts).unwrap_err().complexity);
+        let e = super::page_data(&json!({"data": null})).unwrap_err();
+        assert_eq!(
+            (e.complexity, e.text.as_str()),
+            (false, "no data and no errors")
+        );
+    }
+
     #[test]
     fn keysetref_names_and_f64_rereads() {
         use serde_json::json;
@@ -3530,12 +3633,18 @@ mod tests {
             super::keysetref_name(&json!({"keysetref": {"ns": null, "ksn": "ks"}})),
             Some("ks".into())
         );
-        assert_eq!(super::keysetref_name(&json!({"keys": [], "pred": "keys-all"})), None);
+        assert_eq!(
+            super::keysetref_name(&json!({"keys": [], "pred": "keys-all"})),
+            None
+        );
         assert!(super::reread_agrees(
             "78366.18873465271",
             "78366.188734652711000000000000000000"
         ));
-        assert!(!super::reread_agrees("78366.1887346527", "78366.188734652711"));
+        assert!(!super::reread_agrees(
+            "78366.1887346527",
+            "78366.188734652711"
+        ));
     }
 
     use super::*;
@@ -3903,6 +4012,7 @@ mod tests {
             doc("TipDoc", "query Query { lastBlockHeight }"),
             doc("SubDoc", "subscription NewBlocks($quantity: Int) { newBlocks(quantity: $quantity) { hash } }"),
             doc("PriceDoc", "query Query($moduleName: String!) { lastTokenPriceInKda(moduleName: $moduleName) }"),
+            doc("PactDoc", "query PactQuery($code: String!) { pactQuery(pactQuery: {code: $code}) { result } }"),
             doc("BlockDoc", "query Block($hash: String!) { block(hash: $hash) { hash } }"),
             parse_op("QLastBlockHeight", "query { lastBlockHeight }", false).unwrap(),
         ];
@@ -3911,13 +4021,18 @@ mod tests {
             u.iter()
                 .map(|(s, k)| format!("{s}={k}"))
                 .collect::<Vec<_>>(),
-            ["PriceDoc=unsupported", "SubDoc=subscription", "TipDoc=tip"]
+            [
+                "PactDoc=unsupported",
+                "PriceDoc=tip",
+                "SubDoc=subscription",
+                "TipDoc=tip"
+            ]
         );
         let text = crate::summary::render_unpaired(&u);
-        assert!(text.contains("never paired: 3"), "{text}");
-        assert!(text.contains("  tip (1): TipDoc\n"), "{text}");
+        assert!(text.contains("never paired: 4"), "{text}");
+        assert!(text.contains("  tip (2): PriceDoc TipDoc\n"), "{text}");
         assert!(text.contains("  subscription (1): SubDoc\n"), "{text}");
-        assert!(text.contains("  unsupported (1): PriceDoc\n"), "{text}");
+        assert!(text.contains("  unsupported (1): PactDoc\n"), "{text}");
     }
 
     #[test]

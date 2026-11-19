@@ -384,6 +384,8 @@ impl FungibleAccount {
         spec.rows = Rows::Txs {
             sender: None,
             nft: false,
+            module: None,
+            coinbase: false,
         };
         spec.filter.user_only = true;
         let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
@@ -467,6 +469,8 @@ impl FungibleChainAccount {
             rows: Rows::Txs {
                 sender: Some(self.account.clone()),
                 nft: false,
+                module: None,
+                coinbase: false,
             },
         };
         let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
@@ -512,7 +516,7 @@ impl FungibleChainAccount {
 
 fn names(account: &str, module: Option<&str>) -> Result<(String, String)> {
     let account = crate::txlist::name_arg("accountName", account)?.to_owned();
-    let module = crate::txlist::name_arg("fungibleName", module.unwrap_or("coin"))?.to_owned();
+    let module = crate::txlist::fungible_arg(module.unwrap_or("coin"))?.to_owned();
     Ok((account, module))
 }
 
@@ -545,35 +549,56 @@ pub async fn fungible_account(
     }))
 }
 
-/// `fungibleChainAccounts` (and `fungibleChainAccount` with one chain).
+/// `fungibleChainAccounts` (and `fungibleChainAccount` with one chain). `chain_ids` absent
+/// or empty means every chain (FIX-4 item 1: an undefined `$chainIds` reaches the resolver
+/// as absent, and stock reads `[]` as every chain too). The answer is always a list, `[]`
+/// when there are no rows, as stock answers.
 pub async fn fungible_chain_accounts(
     ctx: &Context<'_>,
     account: &str,
-    chain_ids: &[String],
+    chain_ids: Option<&[String]>,
     module: Option<&str>,
-) -> Result<Option<Vec<FungibleChainAccount>>> {
+) -> Result<Vec<FungibleChainAccount>> {
     let (account, module) = names(account, module)?;
-    let chains = chain_list(chain_ids)?;
+    let chains = match chain_ids {
+        None | Some([]) => None,
+        Some(ids) => Some(chain_list(ids)?),
+    };
+    let order = chains.clone();
     let rows = gql(ctx)
         .state()?
         .read({
             let (a, m) = (account.clone(), module.clone());
-            move |view| chain_rows(view, &a, &m, Some(&chains))
+            move |view| chain_rows(view, &a, &m, chains.as_deref())
         })
         .await
         .map_err(from_api)?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        rows.into_iter()
-            .map(|row| FungibleChainAccount {
-                account: account.clone(),
-                module: module.clone(),
-                row,
-            })
-            .collect(),
-    ))
+    // The rows come in the order of the asked chains (stock's order), each chain once.
+    let rows = match order {
+        None => rows,
+        Some(order) => {
+            let mut rows: Vec<Option<ChainRow>> = rows.into_iter().map(Some).collect();
+            let mut out = Vec::with_capacity(rows.len());
+            for c in order {
+                if let Some(row) = rows
+                    .iter_mut()
+                    .find(|r| r.as_ref().is_some_and(|r| r.chain == c))
+                    .and_then(Option::take)
+                {
+                    out.push(row);
+                }
+            }
+            out
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|row| FungibleChainAccount {
+            account: account.clone(),
+            module: module.clone(),
+            row,
+        })
+        .collect())
 }
 
 /// `fungibleAccountsByPublicKey` / `fungibleChainAccountsByPublicKey`.
@@ -584,7 +609,7 @@ pub async fn accounts_by_public_key(
     chain: Option<u8>,
 ) -> Result<Vec<FungibleAccount>> {
     let pk = crate::txlist::name_arg("publicKey", public_key)?.to_owned();
-    let module = crate::txlist::name_arg("fungibleName", module.unwrap_or("coin"))?.to_owned();
+    let module = crate::txlist::fungible_arg(module.unwrap_or("coin"))?.to_owned();
     let (out, truncated) = gql(ctx)
         .state()?
         .read(move |view| by_key(view, &pk, &module, chain))
@@ -657,26 +682,40 @@ pub async fn query_balance(
         .as_deref()
         .map(|m| crate::txlist::name_arg("module", m).map(str::to_owned))
         .transpose()?;
+    // At most 100 chain ids, each once; `[]` is every chain, as on the other chain lists
+    // (audit F-28).
     let chains: Option<Vec<u8>> = chain_ids
         .as_deref()
-        .map(|cs| cs.iter().map(|c| crate::txlist::chain_arg(c)).collect())
+        .map(|cs| super::block::chain_set(Some(cs)))
         .transpose()?;
     let g = gql(ctx);
-    // Count and the cursor rules of every connection; the cursor is our own.
+    // The count and cursor rules of every connection (`PageArgs::parse`, with the real
+    // `after`/`before` flags; audit F-28); the cursor is our own.
+    if first.is_some_and(|n| n < 0) || last.is_some_and(|n| n < 0) {
+        return Err(bad_input("first and last must not be negative"));
+    }
+    if first.is_some_and(|n| n != 0) && last.is_some_and(|n| n != 0) {
+        return Err(bad_input("pass first or last, not both"));
+    }
     if after.is_some() && before.is_some() {
         return Err(bad_input("pass after or before, not both"));
     }
-    if (first.is_some() && before.is_some()) || (last.is_some() && after.is_some()) {
-        return Err(bad_input("after goes with first, before with last"));
+    let (dir, n) = crate::connection::served_page(
+        first.map(i64::from),
+        last.map(i64::from),
+        after.is_some(),
+        before.is_some(),
+        g.settings.default_page as u64,
+    );
+    let n = n as usize;
+    if n > crate::MAX_PAGE_ROWS {
+        return Err(crate::error::page_limit());
     }
-    let probe = PageArgs::new(None, None, first, last)
-        .wide()
-        .parse(&g.settings)?;
-    let dir = if last.is_some() || (first.is_none() && before.is_some()) {
-        Dir::Backward
-    } else {
-        Dir::Forward
-    };
+    match (dir, &after, &before) {
+        (Dir::Forward, None, Some(_)) => return Err(bad_input("before goes with last")),
+        (Dir::Backward, Some(_), None) => return Err(bad_input("after goes with first")),
+        _ => {}
+    }
     let cur = after
         .as_deref()
         .or(before.as_deref())
@@ -703,6 +742,7 @@ pub async fn query_balance(
             }
             let mut out = Vec::new();
             for (k, v) in found {
+                view.check_deadline()?;
                 let (Some((_, m, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                     continue;
                 };
@@ -727,18 +767,18 @@ pub async fn query_balance(
         (Dir::Forward, _) => rows
             .into_iter()
             .filter(|r| cur.as_ref().is_none_or(|c| key(r) > *c))
-            .take(probe.n + 1)
+            .take(n + 1)
             .collect(),
         (Dir::Backward, _) => rows
             .into_iter()
             .rev()
             .filter(|r| cur.as_ref().is_none_or(|c| key(r) < *c))
-            .take(probe.n + 1)
+            .take(n + 1)
             .collect(),
     };
     let page: Page<PageCursor> = Page {
         dir,
-        n: probe.n,
+        n,
         // Only its presence is read (hasPreviousPage / hasNextPage).
         cursor: cur.as_ref().map(|_| {
             PageCursor::Block(crate::connection::BlockCursor {
@@ -874,6 +914,7 @@ mod by_key_tests {
             max_in_flight: 16,
             max_body_bytes: 8 << 20,
             v1txs_max_body_bytes: 8 << 20,
+            v1txs_deadline: std::time::Duration::from_secs(30),
             rate_per_ip: 20,
             rate_burst: 40,
             trusted_proxies: Vec::new(),
