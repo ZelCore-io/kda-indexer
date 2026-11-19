@@ -118,23 +118,35 @@ entry may accept a difference only with positive evidence; without it the record
 The harness compares with these conventions (entries of
 [compare/allowlist.toml](../compare/allowlist.toml), each with its reason and ruling):
 
-- `graphql-r57-float`: float and float-valued decimal fields, and numbers above 2^53, compare at
-  f64 precision (the reference computes them as JavaScript floats).
+- `iso-same-instant`: two texts of one timestamp (`Z` or `+00:00`, trailing fraction zeros) are
+  the same instant when every fraction digit either side gives is equal (a digit one side does
+  not write reads as zero; nothing is truncated). The record carries the visible hit.
 - `graphql-r57-json-object`: JSON texts that hold objects compare as objects (key order is no
   difference; numbers keep their text).
-- `graphql-r57-field`: a per-field normaliser from the harness config, set after the node referee.
 - `graphql-r75-nested-multiset`: a nested list whose rows select no key compares as a multiset
   per parent row.
 - `graphql-h6-prefix`: a keyless nested list the reference cut compares as a prefix of ours'
   whole list, under root rows paired by their block.
-- `graphql-count-walk`: a differing root `totalCount` is settled by walking both lists to the end.
-- `rest-compose`: on one REST record, several row rules combine, each row explained by exactly one.
-- `graphql-native-miner-skew`: ours' GraphQL and native balance of a miner, read seconds apart,
-  are re-read in the other order when they straddle a block.
+- `graphql-count-walk`: a differing root `totalCount` is settled by walking both lists to the end;
+  it explains the record only when every one-sided row is settled by its own node-checked rule
+  and the counts reconcile.
+- `rest-compose`: on one REST record, several row rules combine, each row explained by exactly one
+  node-checked rule, and the counts reconcile.
 - `graphql-r60-scoped-list`: a list bounded by one block or transaction is read to its end on both
   sides when either side cut the page.
-- `graphql-coinbase-oracle-key-form` and `graphql-r75-coinbase-request-key`: a coinbase row pairs
-  by its place (chain, block, height, index), whatever form of request key each side sends.
+
+Numbers compare as exact decimals, with no float tolerance (owner rule: exact-decimal numeric
+parity per field). The conventions that let a value differ are therefore open: their records
+are reported as differences, with both bodies kept so they can be judged again:
+
+- `graphql-r57-float`: float and float-valued decimal fields, and numbers above 2^53, at f64
+  precision (the reference computes them as JavaScript floats);
+- `graphql-r57-field`: the per-field normalisers of the harness config (f64 rounding, a null on
+  one side, decimal and JSON text forms);
+- `graphql-coinbase-oracle-key-form` and `graphql-r75-coinbase-request-key`: a coinbase row paired
+  by its place (chain, block, height, index), whatever form of request key each side sends;
+- `graphql-native-miner-skew`: ours' GraphQL and native balance of a miner, read seconds apart and
+  re-read in the other order when they straddle a block, agree only to f64 precision.
 
 ## Gates
 

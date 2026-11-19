@@ -298,7 +298,10 @@ impl Allowlist {
             .and_then(|e| e.baseline_per_hour)
     }
 
-    /// The explaining entry that matches `d` (H5 a: only those match).
+    /// The explaining entry that matches `d` (H5 a: only those match). H6 (S7): the entry
+    /// that takes `d` is the first fitting one whose glob names the path exactly, else the
+    /// first fitting one; when that entry explains nothing (open, our defect, KNOWN-GAP) `d`
+    /// stays unexplained, so a broad `/**` entry never picks up an open entry's hit.
     fn hit(
         &self,
         route: &RouteKind,
@@ -306,10 +309,24 @@ impl Allowlist {
         a_headers: &[(String, String)],
         d: &DiffEntry,
     ) -> Option<&Entry> {
+        self.taker(route, request, a_headers, d)
+            .filter(|e| e.explains())
+    }
+
+    /// The entry that takes `d`: specific (no `*` in the glob) before broad, then file order.
+    fn taker(
+        &self,
+        route: &RouteKind,
+        request: &str,
+        a_headers: &[(String, String)],
+        d: &DiffEntry,
+    ) -> Option<&Entry> {
+        let fit = |e: &&Entry| fits(e, route, request, a_headers, d);
         self.entries
             .iter()
-            .filter(|e| e.explains())
-            .find(|e| fits(e, route, request, a_headers, d))
+            .filter(|e| !e.json_path_glob.contains('*'))
+            .find(fit)
+            .or_else(|| self.entries.iter().find(fit))
     }
 
     /// The ids of the non-explaining entries (open, our-defect, KNOWN-GAP) whose pattern fits
@@ -324,10 +341,8 @@ impl Allowlist {
         let mut ids = Vec::new();
         for d in diffs {
             if let Some(e) = self
-                .entries
-                .iter()
+                .taker(route, request, a_headers, d)
                 .filter(|e| !e.explains())
-                .find(|e| fits(e, route, request, a_headers, d))
             {
                 push_id(&mut ids, &e.id);
             }
@@ -818,8 +833,9 @@ mod tests {
             .unwrap();
         assert_eq!(g.accept_class, AcceptClass::IntendedDocumented);
         let n = |pred: &dyn Fn(&Entry) -> bool| al.entries.iter().filter(|e| pred(e)).count();
-        assert_eq!(n(&|e| e.explains()), 42, "accepted");
-        assert_eq!(n(&|e| e.is_open()), 33, "open");
+        // H6: + 5 harness conventions anchored (S4, R-P5P9-171/172) + iso-same-instant (S5).
+        assert_eq!(n(&|e| e.explains()), 48, "accepted");
+        assert_eq!(n(&|e| e.is_open()), 28, "open");
         assert_eq!(n(&|e| e.status == Status::KnownGap), 2, "known gaps");
     }
 
@@ -1163,5 +1179,112 @@ mod tests {
             known(&req("QTransactionsByAccount", k520), &other).0,
             "diff"
         );
+    }
+
+    fn entry(path: &str, kind: crate::report::DiffKind, a: serde_json::Value) -> Vec<crate::report::DiffEntry> {
+        vec![crate::report::DiffEntry {
+            path: path.into(),
+            kind,
+            a: Some(a),
+            b: Some(serde_json::json!("stock")),
+        }]
+    }
+
+    /// H6 (S3): the failed-tx entries cover only the owner ruling's scope: stock holding a
+    /// callStack ours lacks, and ours answering the node's `<toplevel>:0` info.
+    #[test]
+    fn h6_failed_tx_entries_scoped_to_the_owner_ruling() {
+        use crate::report::DiffKind;
+        let al = shipped();
+        let r = RouteKind::Tx;
+        let cs = |kind, path: &str| al.classify(&r, &entry(path, kind, serde_json::json!([1]))).0.len();
+        assert_eq!(cs(DiffKind::Missing, "/result/error/callStack"), 0);
+        assert_eq!(cs(DiffKind::Extra, "/result/error/callStack"), 1);
+        assert_eq!(cs(DiffKind::Changed, "/result/error/callStack/0"), 1);
+        let info = |a: &str| {
+            al.classify(&r, &entry("/result/error/info", DiffKind::Changed, serde_json::json!(a)))
+                .0
+                .len()
+        };
+        assert_eq!(info("<toplevel>:0"), 0);
+        assert_eq!(info("<interactive>:0:5"), 1);
+        assert_eq!(info("x <toplevel>:0"), 1);
+    }
+
+    /// H6 (S6): event-search-window explains only whole rows one side lists.
+    #[test]
+    fn h6_event_search_window_explains_only_the_window() {
+        use crate::report::DiffKind;
+        let al = shipped();
+        let rq = "/txs/events?search=transfer&limit=50";
+        let row = entry("/7", DiffKind::Missing, serde_json::json!({}));
+        assert!(al.classify_known(&RouteKind::Events, rq, &[], &row).unexplained.is_empty());
+        let field = entry("/3/params/2", DiffKind::Changed, serde_json::json!(1.5));
+        assert_eq!(al.classify_known(&RouteKind::Events, rq, &[], &field).unexplained.len(), 1);
+    }
+
+    /// H6 (S7): an open entry that names a hit path exactly takes it before a broad accepted
+    /// `/**` entry, so the hit stays unexplained (and is named as open).
+    #[test]
+    fn h6_specific_open_entry_beats_broad_accepted_entry() {
+        use crate::report::DiffKind;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.toml");
+        std::fs::write(
+            &f,
+            "[[entry]]\nid = \"broad\"\nroute = \"*\"\njson_path_glob = \"/**\"\ncondition = \"any\"\n\
+             reason = \"r\"\nstatus = \"ACCEPTED\"\naccept_class = \"intended-documented\"\nruling = \"r\"\nowner_note = \"n\"\n\
+             doc = \"docs/comparison.md#intended-differences\"\n\
+             [[entry]]\nid = \"open-one\"\nroute = \"*\"\njson_path_glob = \"/~event-order\"\ncondition = \"any\"\n\
+             reason = \"r\"\nstatus = \"PROPOSED\"\naccept_class = \"stock-wrong-node-evidence\"\nruling = \"r\"\nowner_note = \"n\"\n",
+        )
+        .unwrap();
+        let al = Allowlist::load(&f).unwrap();
+        let d = entry("/~event-order", DiffKind::Changed, serde_json::json!(1));
+        let c = al.classify_known(&RouteKind::Search, "/txs/search?search=x", &[], &d);
+        assert_eq!(c.unexplained.len(), 1);
+        assert!(c.ids.is_empty());
+        assert_eq!(
+            al.unexplaining_ids(&RouteKind::Search, "", &[], &d),
+            vec!["open-one".to_string()]
+        );
+        // the broad entry still explains what no specific entry names
+        let d = entry("/0/x", DiffKind::Changed, serde_json::json!(1));
+        assert!(al.classify_known(&RouteKind::Search, "", &[], &d).unexplained.is_empty());
+    }
+
+    /// H6 (S4, S5): the harness conventions of docs/methodology.md that tolerate no value
+    /// difference have a doc anchor and explain; the ones that do (f64 floats, the per-field
+    /// normalisers, the coinbase key form) stay open.
+    #[test]
+    fn h6_conventions_anchored_unless_they_tolerate_a_value() {
+        let al = shipped();
+        let by = |id: &str| al.entries.iter().find(|e| e.id == id).unwrap();
+        for id in [
+            "graphql-r75-nested-multiset",
+            "graphql-h6-prefix",
+            "graphql-r60-scoped-list",
+            "graphql-count-walk",
+            "rest-compose",
+            "iso-same-instant",
+        ] {
+            assert!(by(id).explains(), "{id}");
+            assert_eq!(by(id).accept_class, super::AcceptClass::HarnessConvention, "{id}");
+        }
+        for id in [
+            "graphql-r57-float",
+            "graphql-r57-field",
+            "graphql-coinbase-oracle-key-form",
+            "graphql-r75-coinbase-request-key",
+            "graphql-native-miner-skew",
+        ] {
+            assert!(by(id).is_open(), "{id}");
+        }
+        let d = entry(
+            crate::diff::ISO_SAME_INSTANT_PATH,
+            crate::report::DiffKind::Changed,
+            serde_json::json!("2024-01-01T00:00:00Z"),
+        );
+        assert!(al.classify_known(&RouteKind::Tx, "", &[], &d).unexplained.is_empty());
     }
 }

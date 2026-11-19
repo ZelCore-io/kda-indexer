@@ -200,21 +200,50 @@ fn num_canon_text(v: &Value) -> String {
     walk(v).to_string()
 }
 
-/// Rewrites every JSON number as its nearest f64.
 /// R-P5P9-75 (CG-4 concern 4): body bytes an allowlisted REST record keeps on each side.
 pub const ALLOWLISTED_BODY: usize = 4096;
 
-pub(crate) fn numbers_as_f64(v: &mut Value) {
+/// H6 (S5): rewrites every JSON number as its canonical exact decimal text (`2.0` -> `2`,
+/// `1.50` -> `1.5`, `1e-7` -> `0.0000001`), so one value in two text forms compares equal and an
+/// integer reads as an integer. Never through f64 (owner rule: exact-decimal numeric parity per
+/// field): a value one side rounded stays a diff.
+pub(crate) fn numbers_exact(v: &mut Value) {
     match v {
         Value::Number(n) => {
-            if let Some(x) = n.as_f64().and_then(serde_json::Number::from_f64) {
+            if let Some(x) = crate::diff::decimal_canon(&n.to_string())
+                .and_then(|c| canon_text(&c))
+                .and_then(|t| t.parse::<serde_json::Number>().ok())
+            {
                 *n = x;
             }
         }
-        Value::Array(x) => x.iter_mut().for_each(numbers_as_f64),
-        Value::Object(m) => m.values_mut().for_each(numbers_as_f64),
+        Value::Array(x) => x.iter_mut().for_each(numbers_exact),
+        Value::Object(m) => m.values_mut().for_each(numbers_exact),
         _ => {}
     }
+}
+
+/// Plain decimal text of a [`crate::diff::decimal_canon`] value; `None` (left as written)
+/// beyond 40 integer zeros or 60 fraction digits.
+fn canon_text((neg, digits, exp): &(bool, String, i64)) -> Option<String> {
+    if digits.is_empty() {
+        return Some("0".into());
+    }
+    let body = if *exp >= 0 {
+        if *exp > 40 {
+            return None;
+        }
+        format!("{digits}{}", "0".repeat(*exp as usize))
+    } else {
+        let e = usize::try_from(-exp).ok().filter(|e| *e <= 60)?;
+        if digits.len() > e {
+            let (i, f) = digits.split_at(digits.len() - e);
+            format!("{i}.{f}")
+        } else {
+            format!("0.{}{digits}", "0".repeat(e - digits.len()))
+        }
+    };
+    Some(if *neg { format!("-{body}") } else { body })
 }
 
 fn len_of(v: &Value) -> usize {
@@ -362,8 +391,7 @@ fn row_key(r: &Value) -> RowKey {
     (s("requestKey"), s("blockHash"), idx)
 }
 
-/// A row's chain id, written as an integer or (after [`numbers_as_f64`], kda-txs pair) as a
-/// float.
+/// A row's chain id, written as an integer or (kda-txs) as a float text such as `2.0`.
 fn row_chain(r: &Value) -> Option<u8> {
     let c = r.get("chain")?;
     if let Some(n) = c.as_u64() {
@@ -1502,11 +1530,11 @@ impl Ctx {
         // The status difference is part of the explained orphan case.
         let status_explained = orphan_tx.is_some();
         // kda-txs writes decimals as JSON doubles (seen live: kdswap-gas-payer event amounts
-        // whose exact decimal has more digits than an f64 holds); compare at f64 precision
-        // (only here: the row rules above read heights and chains as integers).
+        // whose exact decimal has more digits than an f64 holds). H6 (S5): compared as exact
+        // decimals (one value in two text forms is equal); a value kda-txs rounded is a diff.
         if tb.kind == crate::config::TargetKind::KdaTxs {
-            numbers_as_f64(&mut va);
-            numbers_as_f64(&mut vb);
+            numbers_exact(&mut va);
+            numbers_exact(&mut vb);
         }
         // kda-txs answers a row's events differently from one fetch to the next (seen live:
         // d763d377.../coin/50, e4f0a329.../coin/50, the gas and main TRANSFER from/to and
@@ -3238,9 +3266,9 @@ impl Ctx {
             let in_block = n.pointer("/metaData/blockHash").and_then(Value::as_str)
                 == s(ra, "blockHash").as_deref();
             let mut ne = oracle::v1txs_events(n);
-            numbers_as_f64(&mut ne);
+            numbers_exact(&mut ne);
             let mut ae = ra.get("events").cloned().unwrap_or(Value::Null);
-            numbers_as_f64(&mut ae);
+            numbers_exact(&mut ae);
             if !in_block || !same_events(&ae, &ne) {
                 return Vec::new();
             }
@@ -3313,9 +3341,9 @@ impl Ctx {
                     return false;
                 }
                 let mut want = json!({"name": r.get("name"), "params": r.get("params")});
-                numbers_as_f64(&mut want);
+                numbers_exact(&mut want);
                 let mut evs = oracle::v1txs_events(v);
-                numbers_as_f64(&mut evs);
+                numbers_exact(&mut evs);
                 if !evs.as_array().is_some_and(|a| a.contains(&want)) {
                     return false;
                 }
@@ -4288,9 +4316,9 @@ mod tests {
         let y = json!([{"name": "coin.TRANSFER", "params": ["a", "m", 0.1]},
                        {"name": "coin.TRANSFER", "params": ["a", "b", 1.5]}]);
         assert!(same_events(&x, &y));
-        // The tie-break runs after numbers_as_f64 (seen live: chain 2.0 made it give up).
+        // The tie-break runs after numbers_exact (seen live: chain 2.0 made it give up).
         let mut f = json!({"chain": 7, "height": 5});
-        numbers_as_f64(&mut f);
+        numbers_exact(&mut f);
         assert_eq!(row_chain(&f), Some(7));
         assert_eq!(row_chain(&json!({"chain": 19})), Some(19));
         assert_eq!(row_chain(&json!({"chain": 1.5})), None);
@@ -4312,5 +4340,24 @@ mod tests {
             json!([{"name": "coin.TRANSFER", "params": ["a", "b", 1.5]},
                    {"name": "n.m.X", "params": []}])
         );
+    }
+
+    /// H6 (S5): kda-txs doubles compare as exact decimals; one value in two text forms is
+    /// equal, a value rounded to f64 is not, and integers written `2.0` read as integers.
+    #[test]
+    fn h6_numbers_exact_never_through_f64() {
+        let p = |t: &str| -> Value { serde_json::from_str(t).unwrap() };
+        let mut a = p(r#"{"chain": 2.0, "amount": 0.123456789012345678901, "x": 1.50, "e": 1e-7, "n": -3e2}"#);
+        numbers_exact(&mut a);
+        assert_eq!(a["chain"].as_u64(), Some(2));
+        assert_eq!(a["amount"].to_string(), "0.123456789012345678901");
+        assert_eq!(a["x"].to_string(), "1.5");
+        assert_eq!(a["e"].to_string(), "0.0000001");
+        assert_eq!(a["n"].to_string(), "-300");
+        let mut b = p(r#"{"chain": 2, "amount": 0.12345678901234568, "x": 1.5, "e": 0.0000001, "n": -300}"#);
+        numbers_exact(&mut b);
+        let d = crate::diff::diff(&a, &b);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].path, "/amount");
     }
 }

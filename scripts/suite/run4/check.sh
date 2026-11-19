@@ -17,5 +17,7 @@ grep -v "^throttle" $S/run4/run.log | tail -4 | cut -c1-200
 echo "throttle events: $(grep -c "^throttle" $S/run4/run.log); last: $(grep "^throttle" $S/run4/run.log | tail -2 | cut -c10-220 | tr "\n" "|")"
 echo "ours 429 rows: $(grep -c "\"st\":429" $S/run4/results.jsonl)"
 echo "rows with tip: $(grep -c "\"tip\":" $S/run4/results.jsonl) with evidence: $(grep -c "\"evidence\":" $S/run4/results.jsonl)"
+# H6 (S9): non-equal paired records without their re-referee evidence (must stay 0).
+echo "$(python3 $S/tools4/run.py evidence-gaps --out $S/run4 2>&1 | tail -1)"
 [ -n "${LEAK_FILE:-}" ] && echo "leak: $(tail -3 "$LEAK_FILE" | tr "\n" " ")"
 echo "load: $(cat /proc/loadavg)"

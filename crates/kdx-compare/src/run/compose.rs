@@ -79,8 +79,8 @@ fn reads_agree(route: &RouteKind, a: &Value, b: &Value, whole: bool) -> Result<u
             }
         }
     }
-    numbers_as_f64(&mut a);
-    numbers_as_f64(&mut b);
+    numbers_exact(&mut a);
+    numbers_exact(&mut b);
     events_as_multiset(&mut a, &mut b);
     let d = diff_route(route, &a, &b);
     if d.is_empty() {
@@ -747,8 +747,8 @@ impl Ctx {
             }
         };
         if kdatxs {
-            numbers_as_f64(&mut va);
-            numbers_as_f64(&mut vb);
+            numbers_exact(&mut va);
+            numbers_exact(&mut vb);
         }
         let order = if route == RouteKind::V1Txs {
             events_as_multiset(&mut va, &mut vb)

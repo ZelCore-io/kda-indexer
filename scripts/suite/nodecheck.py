@@ -515,7 +515,9 @@ class Node:
 
     def settle_race(self, near, first):
         """Waits `settle_s`, re-reads the cut and the branch at each near-tip mismatch, and
-        settles it (`settle`). A failed re-read leaves it `tip-race` (a failure)."""
+        settles it (`settle`). A failed re-read leaves it `tip-race` (a failure). Returns
+        (result, evidence): the evidence is this call's own (H6 B2: the Node is shared by every
+        worker thread, so nothing per record is kept on it)."""
         time.sleep(self.settle_s)
         second = {}
         res = None
@@ -530,11 +532,11 @@ class Node:
         if res is None:
             res = settle(near, first, second)
         # H5 (c): both reads are kept with the record, so `settle` can be re-applied offline.
-        self.last_settle = {"near": [[c, h, x] for c, h, x in near],
-                            "first": [[c, h, first.get((c, h))] for c, h, _ in near],
-                            "second": [[c, h, second.get((c, h))] for c, h, _ in near],
-                            "wait_s": self.settle_s, "result": res}
-        return res
+        ev = {"near": [[c, h, x] for c, h, x in near],
+              "first": [[c, h, first.get((c, h))] for c, h, _ in near],
+              "second": [[c, h, second.get((c, h))] for c, h, _ in near],
+              "wait_s": self.settle_s, "result": res}
+        return res, ev
 
     def fork_header(self, chain, block, height):
         """True when the node holds `block` as a header at `height` on `chain` (a fork block it
@@ -570,8 +572,8 @@ class Node:
                 out = {"ok": not failures(p), "why": p or None, "rows": len(rows), "canon": len(canon)}
                 if "tip-race" in p:
                     out["tip"] = max(tips.values())    # recorded with the rows' heights in the answer
-                    p[p.index("tip-race")] = self.settle_race(near_tip_mismatches(rows, canon, tips), canon)
-                    out["settle"] = self.last_settle
+                    res, out["settle"] = self.settle_race(near_tip_mismatches(rows, canon, tips), canon)
+                    p[p.index("tip-race")] = res
                     if p.count("not-canonical") > 1:
                         p.remove("not-canonical")
                     out.update(ok=not failures(p), why=p)

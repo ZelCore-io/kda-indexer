@@ -606,9 +606,15 @@ PARTIAL_HITS = {"/~graphql-page-cut", "/~graphql-totalcount-cap", "/~harness-lim
 
 
 def rule_entries(v):
-    """(entries, complete) the suite rules judge: pair-diff's full list (`all`) when it was kept,
-    else the display list, complete only when `total` says nothing was cut (H4, B3). A record
-    from before H4 (no `total`) is judged by allow.complete on its display list."""
+    """(entries, complete) the suite rules judge: what pair-diff's allowlist left, uncut (`left`,
+    H6 S1) when it was kept; else the display list, complete only when `left_total` says nothing
+    was cut. An H5 record (`all` was the left list, `total` its length) and an H4 one (`total`
+    only) are read as they were written; a record from before H4 is judged by allow.complete."""
+    if isinstance(v.get("left"), list):
+        return v["left"], len(v["left"]) == v.get("left_total", len(v["left"]))
+    if isinstance(v.get("left_total"), int):
+        ents = v.get("entries") or []
+        return ents, v["left_total"] <= len(ents)
     if isinstance(v.get("all"), list):
         return v["all"], len(v["all"]) == v.get("total", len(v["all"]))
     ents = v.get("entries") or []
@@ -622,10 +628,12 @@ def stored_verdict(v, k, ids):
     (H5 c: no cap), so a later re-referee sees every difference."""
     out = {"class": k, "ids": (v.get("ids") or []) + ids, "known": v.get("known_ids"), "open": v.get("open_ids") or [],
            "entries": (v.get("entries") or [])[:allow.MAX_SHOWN]}
-    if isinstance(v.get("total"), int):
-        out["total"] = v["total"]
-    if isinstance(v.get("all"), list):
-        out["all"] = v["all"]
+    for k in ("total", "left_total"):
+        if isinstance(v.get(k), int):
+            out[k] = v[k]
+    for k in ("all", "left"):
+        if isinstance(v.get(k), list):
+            out[k] = v[k]
     ents, done = rule_entries(out)
     out["complete"] = bool(done) if done is not None else allow.complete({"entries": ents})
     return out
@@ -684,6 +692,35 @@ def missing_evidence(row):
     v = row.get("v") or {}
     miss = [k for k in EVIDENCE_KEYS if (k in ("complete", "all") and k not in v) or (k == "tip" and k not in row)]
     return miss + [k for k in ("counts", "bodies") if k not in row]
+
+
+def needs_kept_evidence(row):
+    """A record keep_evidence had to complete: pair-diff ran on it (`rows`) and it is not equal."""
+    return "rows" in row and (row.get("v") or {}).get("class") not in (None, "equal")
+
+
+def evidence_gaps(out):
+    """H6 (S9): Counter of the missing H5 (c) fields over the non-equal pair-diffed records of
+    DIR/results.jsonl and sample.jsonl, plus `records` (how many lack any) and `checked`."""
+    c = collections.Counter()
+    for fname in ("results.jsonl", "sample.jsonl"):
+        path = os.path.join(out, fname)
+        if not os.path.exists(path):
+            continue
+        for l in open(path):
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            if not needs_kept_evidence(r):
+                continue
+            c["checked"] += 1
+            miss = missing_evidence(r)
+            if miss:
+                c["records"] += 1
+                for k in miss:
+                    c[k] += 1
+    return c
 
 
 def disk_estimate(rows, ratio=0.25):
@@ -917,7 +954,7 @@ class Runner:
                     if v.get("class") in ("diff", "status") and self.node and ep in NODE_EPS and a["status"] == 200:
                         node = row["node"] = self.node.check(ep, vars_, ab)
                     if v.get("class") in ("diff", "status") and self.node and ep in nodecheck.EVIDENCE_EPS \
-                            and a["status"] == 200 and nodecheck.needs_evidence(ep, v.get("all") or v.get("entries") or []):
+                            and a["status"] == 200 and nodecheck.needs_evidence(ep, rule_entries(v)[0]):
                         ev = self.orphan_evidence(case, vars_, self.stock_host(case, stock))
                         if ev:
                             node = row["node"] = dict(node or {}, **ev)
@@ -1244,6 +1281,12 @@ def report(out):
             lines.append("- %s: %d verdicts, %d equal (%.2f%%), %d allowlisted, %d known-gap, %d diff, %d status; "
                          "%d stock unavailable" % (cov, n, t["equal"], 100.0 * t["equal"] / max(n, 1), t["allowlisted"],
                                                    t["known-gap"], t["diff"], t["status"], t["stock-unavailable"]))
+    gaps = evidence_gaps(out)
+    lines += ["", "## Re-referee evidence (H5 c, H6 S9)", "",
+              "- non-equal paired records: %d; lacking evidence: %d%s" % (
+                  gaps["checked"], gaps["records"],
+                  " (%s)" % ", ".join("%s %d" % (k, n) for k, n in sorted(gaps.items())
+                                      if k not in ("checked", "records")) if gaps["records"] else "")]
     lines += ["", "## Rows compared (ours + stock rows of every paired answer, by verdict)", ""]
     for k, n in sorted(rows_cmp.items()):
         lines.append("- %s: %d rows" % (k, n))
@@ -1274,7 +1317,7 @@ def report(out):
         lines.append("- %s %s `%s`: %d (%s)" % (ep, k, pat, n, ", ".join(ids)))
     open(os.path.join(out, "report.md"), "w").write("\n".join(lines) + "\n")
     json.dump({"endpoints": summ, "coverage": {k: dict(v) for k, v in cov_tot.items()},
-               "allow": dict(allow_ids), "hourly": {h: dict(v) for h, v in hourly.items()},
+               "allow": dict(allow_ids), "evidence_gaps": dict(gaps), "hourly": {h: dict(v) for h, v in hourly.items()},
                "classes": [[ep, k, pat, n, ids] for (ep, k, pat), (n, ids) in classes.items()]},
               open(os.path.join(out, "summary.json"), "w"), indent=1)
     print("\n".join(lines[:6]))
@@ -1538,6 +1581,8 @@ def main():
     sm.add_argument("--settle", type=float, default=7.0, help="seconds of tip sampling before the first case")
     p = sub.add_parser("report")
     p.add_argument("--out", required=True)
+    eg = sub.add_parser("evidence-gaps", help="count the non-equal records that lack re-referee evidence")
+    eg.add_argument("--out", required=True)
     rr = sub.add_parser("rereferee")
     rr.add_argument("--out", required=True, help="a run directory (results.jsonl, sample.jsonl)")
     rr.add_argument("--cases", required=True)
@@ -1551,6 +1596,10 @@ def main():
         smoke(tomllib.load(open(a.config, "rb")), a)
     elif a.cmd == "rereferee":
         rereferee(a.out, a.cases, a.md)
+    elif a.cmd == "evidence-gaps":
+        g = evidence_gaps(a.out)
+        print("evidence gaps: %d of %d non-equal paired records %s" % (
+            g["records"], g["checked"], json.dumps({k: n for k, n in sorted(g.items()) if k not in ("checked", "records")})))
     else:
         report(a.out)
 

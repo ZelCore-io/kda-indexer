@@ -64,13 +64,20 @@ pub struct Verdict {
     pub ids: Vec<String>,
     pub known_ids: Vec<String>,
     pub entries: Vec<DiffEntry>,
-    /// Entries before the display cut.
+    /// Every diff entry of the pair, explained ones included (H6 S1).
     pub total: usize,
+    /// The entries left for the suite after the allowlist (`entries` before the display cut).
+    pub left_total: usize,
     /// Matched allowlist entries that are open (no doc anchor): the suite reports the row as a
     /// difference (owner H4 rule 3).
     pub open_ids: Vec<String>,
+    /// With `full`: every diff entry, explained ones included (H6 S1), so a later rule change
+    /// can be re-applied to the whole list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub all: Option<Vec<DiffEntry>>,
+    /// With `full`: the uncut entries left after the allowlist (unexplained, then known gaps).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<Vec<DiffEntry>>,
 }
 
 /// Error messages that are stock's contract (docs/graphql.md): where stock answers one, ours
@@ -144,11 +151,13 @@ pub fn verdict(p: PairIn, allow: &Allowlist, rules: &[FieldRule], cap: u64) -> V
     if p.ours.status != p.stock.status {
         class = "status";
     }
-    let total = shown.len();
+    let (total, left_total) = (d.len(), shown.len());
     // H5 (a): open entries match nothing; the ones whose pattern fits are named beside the
     // reported diff.
     let open_ids = allow.unexplaining_ids(&route, &p.request, &[], &d);
-    let all = full.then(|| shown.clone());
+    // H6 (S1): `all` is every entry, `left` what the allowlist left.
+    let all = full.then(|| d.clone());
+    let left = full.then(|| shown.clone());
     Verdict {
         id: p.id,
         class: class.to_string(),
@@ -156,8 +165,10 @@ pub fn verdict(p: PairIn, allow: &Allowlist, rules: &[FieldRule], cap: u64) -> V
         known_ids: c.known_ids,
         entries: shown.into_iter().take(MAX_SHOWN).collect(),
         total,
+        left_total,
         open_ids,
         all,
+        left,
     }
 }
 
@@ -351,5 +362,32 @@ mod tests {
             10_000,
         );
         assert_eq!(v.class, "equal");
+    }
+
+    /// H6 (S1): `all` keeps every entry (explained ones too) and `total` counts them; the
+    /// entries the allowlist left are `left` / `left_total`.
+    #[test]
+    fn h6_all_is_every_entry_left_is_what_the_allowlist_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.toml");
+        std::fs::write(
+            &f,
+            "[[entry]]\nid = \"x\"\nroute = \"*\"\njson_path_glob = \"/*/x\"\ncondition = \"any\"\n\
+             reason = \"r\"\nstatus = \"ACCEPTED\"\naccept_class = \"intended-documented\"\nruling = \"r\"\nowner_note = \"n\"\n\
+             doc = \"docs/comparison.md#intended-differences\"\n",
+        )
+        .unwrap();
+        let allow = Allowlist::load(&f).unwrap();
+        let a = json!([{"x": 1, "y": 1}, {"x": 1, "y": 1}, {"x": 1, "y": 1}]);
+        let b = json!([{"x": 2, "y": 1}, {"x": 2, "y": 1}, {"x": 2, "y": 2}]);
+        let mut p = pair("rest", "/txs/recent", a, b);
+        p.full = true;
+        let v = verdict(p, &allow, &[], 10_000);
+        assert_eq!(v.class, "diff");
+        assert_eq!((v.total, v.left_total), (4, 1));
+        assert_eq!(v.all.as_ref().map(Vec::len), Some(4));
+        let left = v.left.as_ref().unwrap();
+        assert_eq!((left.len(), left[0].path.as_str()), (1, "/2/y"));
+        assert_eq!(v.entries.len(), 1);
     }
 }

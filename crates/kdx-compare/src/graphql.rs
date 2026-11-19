@@ -22,7 +22,7 @@ use crate::config::{CompareConfig, FieldRule, FieldRuleKind, TargetKind};
 use crate::diff::{decimal_canon, diff, diff_explained};
 use crate::gen::random::RandomGen;
 use crate::gen::Tips;
-use crate::normalize::{iso_eq_coarse, iso_micros, parse_iso, RouteKind};
+use crate::normalize::{iso_micros, iso_same_instant, parse_iso, RouteKind};
 use crate::report::{iso_secs, now_secs, sh_quote, trim_body, DiffEntry, DiffKind, DiffRecord};
 use crate::run::{Ctx, Outcome};
 use crate::target::Target;
@@ -2948,7 +2948,7 @@ impl Ctx {
                 return false;
             };
             match (parse_iso(a), parse_iso(&iso_micros(m))) {
-                (Some(x), Some(y)) => iso_eq_coarse(&x, &y),
+                (Some(x), Some(y)) => iso_same_instant(&x, &y),
                 _ => false,
             }
         };

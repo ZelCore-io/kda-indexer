@@ -205,7 +205,7 @@ class Allowlist(unittest.TestCase):
         self.assertEqual(self.cls("gql.gasLimitEstimate", [E_("/errors/0/code", "Changed", "NOT_SUPPORTED", "INTERNAL_SERVER_ERROR")],
                                   ["NOT_SUPPORTED"])[0], "allowlisted")
         self.assertEqual(self.cls("gql.networkInfo", [E_("/data/networkInfo", "Type", "{}", "None"),
-                                                      E_("/errors", "Missing", None, "[{'code': 'INTERNAL_SERVER_ERROR'}]")])[0], "allowlisted")
+                                                      E_("/errors", "Missing", None, "[{'code': 'INTERNAL_SERVER_ERROR'}]")])[0], "stock-unavailable")
         self.assertEqual(self.cls("gql.networkInfo", [E_("/data/networkInfo/countersOfEachChain/3/totalGasUsedInKda", "Missing", None, "1.5")],
                                   ["NOT_AVAILABLE"])[0], "allowlisted")
         self.assertEqual(self.cls("gql.networkInfo", [E_("/data/networkInfo/coinsInCirculation", "Changed", "#36e1", "#37e1")])[0], "diff")
@@ -222,7 +222,8 @@ class Allowlist(unittest.TestCase):
         self.assertEqual(self.cls("gql.block", [E_("/~graphql-r57-json-object", "Changed")])[0], "allowlisted")
         # owner H4: the f64 tolerance is undocumented, so open
         self.assertEqual(self.cls("gql.block", [E_("/~graphql-r57-float", "Changed")])[0], "diff")
-        self.assertEqual(self.cls("gql.fungibleAccount", [E_("/~known-gap-missing-chain-rows", "Missing")])[0], "known-gap")
+        # H6 B1: our defect is never accepted; pair-diff classes the marker diff, so does the suite
+        self.assertEqual(self.cls("gql.fungibleAccount", [E_("/~known-gap-missing-chain-rows", "Missing")])[0], "diff")
 
     def test_node_condition(self):
         ent = [E_("/data", "Type", "{}", "None"), E_("/errors", "Missing", None, "[{'code': 'INTERNAL_SERVER_ERROR'}]")]
@@ -262,7 +263,7 @@ class Allowlist(unittest.TestCase):
         by = {x["id"]: x["accept_class"] for x in rows}
         self.assertEqual(by["pactQuery-not-supported"], "unsupported-by-design")
         self.assertEqual(by["lastBlockHeight-tip-race"], "tip-timing")
-        self.assertEqual(by["networkInfo-stock-error"], "stock-wrong-node-evidence")
+        self.assertEqual(by["networkInfo-stock-error"], "stock-unavailable")      # H6 S2
         self.assertEqual(by["ours-refuses-lenient-input"], "intended-documented")
 
     def test_transaction_min_depth_has_no_rule(self):
@@ -1202,7 +1203,7 @@ class H4Minor(unittest.TestCase):
         d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "suite", "run4")
         names = sorted(os.listdir(d))
         self.assertEqual(names, ["check.sh", "guard.sh", "kdx-suite4-guard.service", "kdx-suite4.service",
-                                 "launch.sh", "start4.sh"])
+                                 "launch.sh", "stage4.sh", "start4.sh", "verify4.sh"])
         for fn in names:
             t = open(os.path.join(d, fn)).read()
             for bad in ("/root/", "kda-indexer-mainnet01", "kdx-fv", "run3", "tools3", "cases3", "suite3",
@@ -1211,7 +1212,7 @@ class H4Minor(unittest.TestCase):
         launch = open(os.path.join(d, "launch.sh")).read()
         self.assertIn("STOCK_HEAVY_HOURS:-34", launch)
         self.assertIn("tools4/run.py run --config run4/suite4.toml --cases cases4 --out run4", launch)
-        self.assertIn('[ ! -x "$S/tools4/kda-compare-h5" ]', open(os.path.join(d, "start4.sh")).read())
+        self.assertIn('[ -x "$T/kda-compare-h5" ]', open(os.path.join(d, "verify4.sh")).read())     # H6 S8
 
 
 
@@ -1310,9 +1311,10 @@ class H5Rereferee(unittest.TestCase):
         n = N.Node.__new__(N.Node)
         n.settle_s = 0
         n.canonical = lambda c, lo, hi, fresh=False: {(c, h): "B%d" % h for h in range(lo, hi + 1)}
-        self.assertEqual(n.settle_race([(1, 10, "X")], {(1, 10): "A"}), "tip-race-settled")
-        self.assertEqual(n.last_settle, {"near": [[1, 10, "X"]], "first": [[1, 10, "A"]],
-                                         "second": [[1, 10, "B10"]], "wait_s": 0, "result": "tip-race-settled"})
+        res, ev = n.settle_race([(1, 10, "X")], {(1, 10): "A"})
+        self.assertEqual(res, "tip-race-settled")
+        self.assertEqual(ev, {"near": [[1, 10, "X"]], "first": [[1, 10, "A"]],
+                              "second": [[1, 10, "B10"]], "wait_s": 0, "result": "tip-race-settled"})
         self.assertEqual(N.settle([(1, 10, "X")], {(1, 10): "A"}, {(1, 10): "B10"}), "tip-race-settled")
 
     def test_disk_estimate(self):
@@ -1320,6 +1322,149 @@ class H5Rereferee(unittest.TestCase):
                                  {"v": {"class": "equal"}, "ours": {"b": 99}}], ratio=0.25)
         self.assertEqual(est["non_equal"], 1)
         self.assertEqual(est["body_bytes"], int(4000 * 0.25 * 4 / 3) + 1)
+
+
+
+class H6Fixes(unittest.TestCase):
+    """H6 (R-P5P9-172): the suite-h5-review findings, each with the case that failed before."""
+
+    ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    GAP = E_("/~known-gap-missing-chain-rows", "Missing")
+
+    def test_b1_our_defect_never_makes_a_row_allowlisted(self):
+        tip = {"ours": 100, "stock": 101}
+        mixed = [self.GAP, E_("/data/lastBlockHeight", "Changed", 100, 101)]
+        self.assertEqual(H4("gql.lastBlockHeight", mixed, tip=tip), ("diff", []))
+        self.assertEqual(H4("gql.fungibleAccount", [self.GAP]), ("diff", []))
+        # the other rule alone still accepts its entry
+        self.assertEqual(H4("gql.lastBlockHeight", mixed[1:], tip=tip)[0], "allowlisted")
+
+    def test_b2_settle_evidence_is_per_call_across_threads(self):
+        import threading
+        n = N.Node.__new__(N.Node)
+        n.settle_s = 0
+        gate = threading.Barrier(2)
+
+        def canonical(c, lo, hi, fresh=False):
+            gate.wait(timeout=5)            # both calls are in flight before either returns
+            return {(c, h): "C%d-%d" % (c, h) for h in range(lo, hi + 1)}
+        n.canonical = canonical
+        got = {}
+
+        def go(c):
+            got[c] = n.settle_race([(c, 10 * c, "X%d" % c)], {(c, 10 * c): "F%d" % c})
+        ts = [threading.Thread(target=go, args=(c,)) for c in (1, 2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        for c in (1, 2):
+            res, ev = got[c]
+            self.assertEqual(ev["near"], [[c, 10 * c, "X%d" % c]])
+            self.assertEqual(ev["first"], [[c, 10 * c, "F%d" % c]])
+            self.assertEqual(ev["second"], [[c, 10 * c, "C%d-%d" % (c, 10 * c)]])
+        self.assertFalse(hasattr(n, "last_settle"))
+
+    def test_s1_rules_judge_the_left_list_and_all_keeps_every_entry(self):
+        explained = E_("/result/error/callStack", "Missing", None, "[]")
+        real = E_("/data/x", "Changed", 1, 2)
+        v = {"class": "diff", "entries": [real], "total": 2, "left_total": 1, "all": [explained, real], "left": [real]}
+        self.assertEqual(run.rule_entries(v), ([real], True))
+        out = run.stored_verdict(v, "diff", [])
+        self.assertEqual((out["all"], out["left"], out["total"], out["left_total"]), ([explained, real], [real], 2, 1))
+        self.assertTrue(out["complete"])
+        # without the lists: the display list, complete only when nothing of `left` was cut
+        self.assertEqual(run.rule_entries({"entries": [real], "total": 9, "left_total": 1}), ([real], True))
+        self.assertEqual(run.rule_entries({"entries": [real], "total": 9, "left_total": 2}), ([real], False))
+        # an H5 record (`all` was the left list) reads as it was written
+        self.assertEqual(run.rule_entries({"entries": [real], "total": 1, "all": [real]}), ([real], True))
+
+    def test_s2_stock_errors_are_stock_unavailable_never_allowlisted(self):
+        ise = [E_("/data/networkInfo", "Type", "{}", "None"),
+               E_("/errors", "Missing", None, "[{'code': 'INTERNAL_SERVER_ERROR'}]")]
+        self.assertEqual(H4("gql.networkInfo", ise)[0], "stock-unavailable")
+        td = [E_("/data/networkInfo/totalDifficulty", "Changed", "#5e3", "-1")]
+        self.assertEqual(H4("gql.networkInfo", td), ("stock-unavailable", ["networkInfo-totalDifficulty"]))
+        # an entry no rule explains beside it keeps the row a diff
+        self.assertEqual(H4("gql.networkInfo", td + [E_("/data/networkInfo/networkId", "Changed", "a", "b")])[0], "diff")
+        by = {x["id"]: x["accept_class"] for x in allow.table()}
+        for i in ("networkInfo-stock-error", "networkInfo-totalDifficulty"):
+            self.assertEqual(by[i], "stock-unavailable")
+
+    def test_s2_tip_race_needs_the_recorded_node_tip(self):
+        e = [E_("/data/lastBlockHeight", "Changed", 102, 100)]          # ours ahead by 2
+        self.assertEqual(H4("gql.lastBlockHeight", e)[0], "diff")       # no tip recorded
+        self.assertEqual(H4("gql.lastBlockHeight", e, tip={"ours": 100, "stock": 100})[0], "diff")
+        self.assertEqual(H4("gql.lastBlockHeight", e, tip={"ours": 102, "stock": 101})[0], "diff")   # moved 1 < 2
+        self.assertEqual(H4("gql.lastBlockHeight", e, tip={"ours": 100, "stock": 103})[0], "diff")   # wrong way
+        self.assertEqual(H4("gql.lastBlockHeight", e, tip={"ours": 103, "stock": 101}),
+                         ("allowlisted", ["lastBlockHeight-tip-race"]))
+
+    def test_s9_report_and_check_count_records_without_evidence(self):
+        d = tempfile.mkdtemp()
+        ok = {"id": "a", "ep": "gql.block", "ours": {"st": 200, "ms": 1}, "stock": {"st": 200, "ms": 1, "host": "h"},
+              "rows": [1, 1], "tip": {"ours": 1, "stock": 1}, "counts": {}, "bodies": {},
+              "v": {"class": "diff", "complete": True, "all": []}}
+        bare = dict(ok, id="b", v={"class": "diff"})
+        del bare["tip"]
+        eq = dict(ok, id="c", v={"class": "equal"})
+        del eq["bodies"]
+        with open(os.path.join(d, "results.jsonl"), "w") as f:
+            for r in (ok, bare, eq):
+                f.write(json.dumps(r) + "\n")
+        g = run.evidence_gaps(d)
+        self.assertEqual((g["checked"], g["records"], g["tip"], g["all"], g["complete"]), (2, 1, 1, 1, 1))
+        run.report(d)
+        self.assertIn("lacking evidence: 1", open(os.path.join(d, "report.md")).read())
+        self.assertEqual(json.load(open(os.path.join(d, "summary.json")))["evidence_gaps"]["records"], 1)
+        chk = open(os.path.join(self.ROOT, "scripts", "suite", "run4", "check.sh")).read()
+        self.assertIn("tools4/run.py evidence-gaps --out $S/run4", chk)
+
+    def test_s8_start4_checks_binary_hash_and_tools_commit(self):
+        import shutil
+        import subprocess
+        r4 = os.path.join(self.ROOT, "scripts", "suite", "run4")
+        st, la, sg = (open(os.path.join(r4, f)).read() for f in ("start4.sh", "launch.sh", "stage4.sh"))
+        self.assertIn('/bin/bash "$S/run4/verify4.sh"', st)
+        self.assertIn("run4/verify4.sh", la.split("python3")[0])            # before the run starts
+        self.assertIn("cargo build --release -p kdx-compare --bin kda-compare", st)
+        self.assertIn("SHA256SUMS", sg)
+        if shutil.which("sha256sum") is None:
+            self.skipTest("no sha256sum")
+        C = "c" * 40
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "tools4"))
+        os.makedirs(os.path.join(d, "run4"))
+        v = open(os.path.join(r4, "verify4.sh")).read()
+        self.assertIn('EXPECTED_COMMIT="@COMMIT@"', v)
+        open(os.path.join(d, "run4", "suite4.toml"), "w").write('[diff]\nkda_compare = "tools4/kda-compare-h5"\n')
+        t = os.path.join(d, "tools4")
+
+        def w(name, text):
+            open(os.path.join(t, name), "w").write(text)
+
+        def verify(staged=True):
+            open(os.path.join(d, "run4", "verify4.sh"), "w").write(v.replace("@COMMIT@", C) if staged else v)
+            return subprocess.run(["/bin/bash", os.path.join(d, "run4", "verify4.sh")], env=dict(os.environ, SUITE_DIR=d),
+                                  capture_output=True, text=True).returncode
+        w("run.py", "x")
+        w("COMMIT", C + "\n")
+        subprocess.run("sha256sum run.py COMMIT > SHA256SUMS", shell=True, cwd=t, check=True)
+        w("kda-compare-h5", "bin")
+        os.chmod(os.path.join(t, "kda-compare-h5"), 0o755)
+        subprocess.run("sha256sum kda-compare-h5 > kda-compare-h5.sha256", shell=True, cwd=t, check=True)
+        w("kda-compare-h5.commit", C + "\n")
+        self.assertEqual(verify(), 0)
+        self.assertNotEqual(verify(staged=False), 0)                       # not staged: no commit
+        w("kda-compare-h5.commit", "d" * 40 + "\n")
+        self.assertNotEqual(verify(), 0)                                   # binary from another commit
+        w("kda-compare-h5.commit", C + "\n")
+        w("kda-compare-h5", "other bin")
+        self.assertNotEqual(verify(), 0)                                   # binary replaced
+        subprocess.run("sha256sum kda-compare-h5 > kda-compare-h5.sha256", shell=True, cwd=t, check=True)
+        self.assertEqual(verify(), 0)
+        w("run.py", "y")
+        self.assertNotEqual(verify(), 0)                                   # tools4 file from another commit
 
 
 if __name__ == "__main__":

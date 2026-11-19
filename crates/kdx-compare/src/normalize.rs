@@ -1,9 +1,10 @@
 //! Normaliser (spec section 7.3): applied to each side before `diff`.
 //!
 //! - Object key order is ignored: keys are sorted (the diff compares objects as maps anyway).
-//! - `gasPrice` is a float in chainweb-data, so it is rewritten to the shortest f64 text on
-//!   routes that carry it; `diff` then compares it with relative epsilon 1e-12.
-//! - ISO-8601 timestamps are compared by `diff` at the coarser precision of the two sides.
+//! - Numbers compare as exact decimals (`gasPrice` too: no float tolerance, owner rule
+//!   "exact-decimal numeric parity per field", R-P5P9-172 / H6 S5).
+//! - ISO-8601 timestamps in two text forms are equal only when they name the same instant to
+//!   every digit either side gives; `diff` then emits the visible hit `/~iso-same-instant`.
 //! - Arrays with a route sort key: inside each run of items with equal sort keys the items are
 //!   ordered by their canonical text, so ties compare as multisets. Order across different
 //!   sort keys is kept as returned (it is part of the API).
@@ -12,7 +13,7 @@
 //!   in its own internal order and the API keeps that order, so two correct sides can differ.
 
 use serde::Serialize;
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum RouteKind {
@@ -74,25 +75,11 @@ impl RouteKind {
             RouteKind::Account | RouteKind::Events | RouteKind::Search
         )
     }
-
-    /// Routes whose chainweb-data payload has a float `gasPrice`.
-    fn float_gas_price(self) -> bool {
-        matches!(
-            self,
-            RouteKind::Tx | RouteKind::Txs | RouteKind::V1Txs | RouteKind::Other
-        )
-    }
 }
-
-/// The JSON keys whose numbers are floats on the chainweb-data side.
-pub const FLOAT_KEYS: &[&str] = &["gasPrice"];
 
 pub fn normalize(route: &RouteKind, v: &mut Value) {
     sort_keys(v);
     refspec_as_set(v);
-    if route.float_gas_price() {
-        canon_floats(v);
-    }
     if let Value::Array(items) = v {
         match route {
             RouteKind::Account => tie_groups(items, account_key),
@@ -176,25 +163,6 @@ fn refspec_as_set(v: &mut Value) {
     }
 }
 
-fn canon_floats(v: &mut Value) {
-    match v {
-        Value::Object(m) => {
-            for (k, val) in m.iter_mut() {
-                if FLOAT_KEYS.contains(&k.as_str()) {
-                    if let Some(f) = number_f64(val) {
-                        if let Some(n) = Number::from_f64(f) {
-                            *val = Value::Number(n);
-                        }
-                    }
-                } else {
-                    canon_floats(val);
-                }
-            }
-        }
-        Value::Array(a) => a.iter_mut().for_each(canon_floats),
-        _ => {}
-    }
-}
 
 /// A number's value as f64 (numbers only; decimal objects are left alone).
 pub fn number_f64(v: &Value) -> Option<f64> {
@@ -297,16 +265,10 @@ pub fn parse_iso(s: &str) -> Option<IsoTime> {
     })
 }
 
-/// Equal at the coarser precision of the two (fraction truncated to the shorter length,
-/// missing digits read as zeros).
-pub fn iso_eq_coarse(a: &IsoTime, b: &IsoTime) -> bool {
-    if a.secs != b.secs {
-        return false;
-    }
-    let n = a.frac.len().min(b.frac.len());
-    let ta = a.frac[..n].trim_end_matches('0');
-    let tb = b.frac[..n].trim_end_matches('0');
-    ta == tb
+/// The same instant to the full precision both sides give (H6 S5): every fraction digit either
+/// side writes is compared, a digit one side does not write reads as zero. Never truncated.
+pub fn iso_same_instant(a: &IsoTime, b: &IsoTime) -> bool {
+    a.secs == b.secs && a.frac.trim_end_matches('0') == b.frac.trim_end_matches('0')
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.ffffffZ` from microseconds since the epoch.

@@ -141,7 +141,7 @@ pub fn norm_row(text: &[u8], f64: bool) -> Result<(String, Value), String> {
     let mut arr = Value::Array(vec![v]);
     normalize(&RouteKind::V1Txs, &mut arr);
     if f64 {
-        crate::run::numbers_as_f64(&mut arr);
+        crate::run::numbers_exact(&mut arr);
     }
     let row = match arr {
         Value::Array(mut a) => a.pop().unwrap_or(Value::Null),

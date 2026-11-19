@@ -4,13 +4,12 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::normalize::{iso_eq_coarse, number_f64, parse_iso, RouteKind, FLOAT_KEYS};
+use crate::normalize::{iso_same_instant, number_f64, parse_iso, RouteKind};
 pub use crate::report::{DiffEntry, DiffKind};
 use crate::target::{HttpCapture, Target};
 
 /// At most this many entries per diff.
 pub const MAX_ENTRIES: usize = 50;
-const FLOAT_REL_EPS: f64 = 1e-12;
 /// `/stats.transactionCount` is a Postgres estimate in chainweb-data.
 const STATS_COUNT_TOLERANCE: f64 = 0.01;
 /// `/stats.coinsInCirculation`: both sides compute the supply at their own height and time.
@@ -22,6 +21,9 @@ const COINS_SUPPLY_TOLERANCE: f64 = 1e-6;
 /// Path used to report a `/coins` difference inside the tolerance (allowlisted as
 /// `coins-supply-tolerance`, so the hit is visible); a bigger one stays a root diff.
 pub const COINS_SUPPLY_PATH: &str = "/~coins-supply-tolerance";
+/// Visible hit for two text forms of one instant (allowlisted as `iso-same-instant`, a
+/// harness convention with a doc anchor; H6 S5).
+pub const ISO_SAME_INSTANT_PATH: &str = "/~iso-same-instant";
 /// Path used to report a `/stats` count difference that is inside the tolerance (allowlisted
 /// as `stats-estimate`, so the hit is visible in the summary).
 pub const STATS_ESTIMATE_PATH: &str = "/transactionCount~estimate";
@@ -29,7 +31,7 @@ pub const STATS_ESTIMATE_PATH: &str = "/transactionCount~estimate";
 /// Diff of two (normalised) values. Objects compare as maps, arrays positionally.
 pub fn diff(a: &Value, b: &Value) -> Vec<DiffEntry> {
     let mut out = Vec::new();
-    walk(a, b, &mut String::new(), None, &mut out, &mut None);
+    walk(a, b, &mut String::new(), &mut out, &mut None);
     out
 }
 
@@ -55,7 +57,7 @@ pub fn diff_explained(
         explain,
         hits: BTreeSet::new(),
     });
-    walk(a, b, &mut String::new(), None, &mut out, &mut hook);
+    walk(a, b, &mut String::new(), &mut out, &mut hook);
     (out, hook.map(|h| h.hits).unwrap_or_default())
 }
 
@@ -249,7 +251,6 @@ fn walk(
     a: &Value,
     b: &Value,
     path: &mut String,
-    key: Option<&str>,
     out: &mut Vec<DiffEntry>,
     hook: &mut Option<Hook<'_>>,
 ) {
@@ -263,7 +264,7 @@ fn walk(
                 path.push('/');
                 path.push_str(&escape(k));
                 match mb.get(k) {
-                    Some(vb) => walk(va, vb, path, Some(k), out, hook),
+                    Some(vb) => walk(va, vb, path, out, hook),
                     None => push(out, path, DiffKind::Extra, Some(va), None),
                 }
                 path.truncate(len);
@@ -281,7 +282,7 @@ fn walk(
                 path.push('/');
                 path.push_str(&i.to_string());
                 match (xa.get(i), xb.get(i)) {
-                    (Some(va), Some(vb)) => walk(va, vb, path, None, out, hook),
+                    (Some(va), Some(vb)) => walk(va, vb, path, out, hook),
                     (Some(va), None) => push(out, path, DiffKind::Extra, Some(va), None),
                     (None, Some(vb)) => push(out, path, DiffKind::Missing, None, Some(vb)),
                     (None, None) => {}
@@ -298,21 +299,19 @@ fn walk(
             {
                 return;
             }
-            if key.is_some_and(|k| FLOAT_KEYS.contains(&k)) {
-                if let (Some(x), Some(y)) = (number_f64(a), number_f64(b)) {
-                    if x == y || (x - y).abs() <= FLOAT_REL_EPS * x.abs().max(y.abs()) {
-                        return;
-                    }
-                }
-            }
+            // H6 (S5): no float tolerance (gasPrice was equal within 1e-12 before).
             leaf(out, path, DiffKind::Changed, a, b, hook);
         }
         (Value::String(sa), Value::String(sb)) => {
             if sa == sb {
                 return;
             }
+            // H6 (S5): another text form of the same instant (to every digit either side
+            // gives) is a visible hit, never a silent equality; a fraction that differs at
+            // any digit is a diff.
             if let (Some(ta), Some(tb)) = (parse_iso(sa), parse_iso(sb)) {
-                if iso_eq_coarse(&ta, &tb) {
+                if iso_same_instant(&ta, &tb) {
+                    push(out, ISO_SAME_INSTANT_PATH, DiffKind::Changed, Some(a), Some(b));
                     return;
                 }
             }
@@ -657,5 +656,34 @@ mod explain_tests {
         assert_eq!(hits.into_iter().collect::<Vec<_>>(), ["rule-f"]);
         // Without a hook, the same as `diff`.
         assert_eq!(diff(&a, &b).len(), 4);
+    }
+
+    /// H6 (S5): no float tolerance and no truncated timestamps; another text of the same
+    /// instant is a visible hit, never a silent equality.
+    #[test]
+    fn h6_exact_numbers_and_timestamps() {
+        let d = diff(
+            &json!({"gasPrice": 1.0000000000001e-8}),
+            &json!({"gasPrice": 1e-8}),
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].path, "/gasPrice");
+        assert!(diff(&json!({"gasPrice": 1.0e-8}), &json!({"gasPrice": 0.00000001})).is_empty());
+        let t = |a: &str, b: &str| diff(&json!({"t": a}), &json!({"t": b}));
+        // the shorter fraction no longer hides the longer one's digits
+        let d = t("2024-01-01T00:00:00.123Z", "2024-01-01T00:00:00.123456Z");
+        assert_eq!((d.len(), d[0].path.as_str()), (1, "/t"));
+        let d = t("2024-01-01T00:00:00Z", "2024-01-01T00:00:00.5Z");
+        assert_eq!(d[0].path, "/t");
+        // the same instant in another form: one visible hit
+        for (a, b) in [
+            ("2024-01-01T00:00:00.120Z", "2024-01-01T00:00:00.12Z"),
+            ("2024-01-01T00:00:00Z", "2024-01-01T00:00:00.000000+00:00"),
+        ] {
+            let d = t(a, b);
+            assert_eq!(d.len(), 1);
+            assert_eq!(d[0].path, ISO_SAME_INSTANT_PATH);
+        }
+        assert!(t("2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z").is_empty());
     }
 }

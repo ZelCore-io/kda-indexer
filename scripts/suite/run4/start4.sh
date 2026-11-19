@@ -4,12 +4,10 @@
 set -e
 S="${SUITE_DIR:?set SUITE_DIR}"
 cd "$S"
-# H5: pair-diff must be this branch's build (open entries match nothing); run 3's binary is older.
-if [ ! -x "$S/tools4/kda-compare-h5" ]; then
-  echo "missing tools4/kda-compare-h5: build test/suite after run 3 ends:" >&2
-  echo "  cargo build --release -p kdx-compare --bin kda-compare, then copy it to tools4/kda-compare-h5" >&2
-  exit 1
-fi
+# H6 (S8): tools4 and the pair-diff binary must come from the reviewed fix-round commit
+# (tools4/COMMIT, tools4/SHA256SUMS, sha256sum of tools4/kda-compare-h5 and its commit stamp).
+# Build: cargo build --release -p kdx-compare --bin kda-compare at that commit (verify4.sh).
+/bin/bash "$S/run4/verify4.sh"
 systemctl stop kdx-suite4-guard 2>/dev/null || true
 systemd-run --unit=kdx-suite4 --collect -E SUITE_DIR="$S" -p Nice=10 -p MemoryMax=4G --working-directory="$S" /bin/bash "$S/run4/launch.sh"
 sleep 3

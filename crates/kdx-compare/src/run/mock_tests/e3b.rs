@@ -169,8 +169,7 @@ async fn e3b_tc_243_the_oracle_counts_the_windows_heights() {
             .await;
         let un = unexplained_on(&ctx, &op_name, &d);
         let case = format!("{txs:?} {oracle_count} {rule}: {un:?} {d:?} {note:?}");
-        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
-        assert!(!(un.is_empty()), "{case}");
+        assert_eq!(un.is_empty(), explained, "{case}");
         let hit = d
             .iter()
             .any(|e| e.path == crate::graphql_window::ORACLE_COUNTS_HEIGHTS_PATH);
@@ -190,12 +189,11 @@ async fn e3b_tc_243_the_oracle_counts_the_windows_heights() {
             vec![count_diff(2, oracle_count)],
         );
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
-        assert_eq!(rep.explained, 0, "{case} {rep:?}");
+        assert_eq!(rep.explained == 1, explained, "{case} {rep:?}");
         if explained {
             assert_eq!(
                 rep.by_class.get("graphql-r75-oracle-counts-heights"),
-                None,
+                Some(&1),
                 "{rep:?}"
             );
         }
@@ -243,12 +241,8 @@ async fn e3b_tc_rows_above_the_oracle_tip_are_node_canonical_up_to_50() {
         let case = format!("{above} {placed}: {un:?} {d:?} {note:?}");
         match want {
             "ok" => {
-                // H5 (a): only the open entries' hits stay reported.
-                assert_eq!(
-                    un,
-                    vec!["/~graphql-oracle-stall", "/~graphql-count-walk"],
-                    "{case}"
-                );
+                // H5 (a): only the open entry's hit stays reported (count-walk is anchored, H6).
+                assert_eq!(un, vec!["/~graphql-oracle-stall"], "{case}");
                 let w = d
                     .iter()
                     .find(|e| e.path == crate::graphql_window::COUNT_WALK_PATH)
@@ -339,12 +333,8 @@ async fn i_w_the_referee_polls_up_to_2000_rows_above_the_oracle_tip() {
         let un = c3_unexplained(&ctx, &d);
         let case = format!("referee {referee}: {un:?} {note:?}");
         if referee {
-            // H5 (a): only the open entries' hits stay reported.
-            assert_eq!(
-                un,
-                vec!["/~graphql-oracle-stall", "/~graphql-count-walk"],
-                "{case}"
-            );
+            // H5 (a): only the open entry's hit stays reported (count-walk is anchored, H6).
+            assert_eq!(un, vec!["/~graphql-oracle-stall"], "{case}");
             let w = d
                 .iter()
                 .find(|e| e.path == crate::graphql_window::COUNT_WALK_PATH)

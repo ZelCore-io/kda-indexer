@@ -2,8 +2,8 @@
 
 `kda-compare pair-diff` gives the first verdict with the live harness's allowlist. The
 suite then looks at the diff entries that are left: a row whose every entry is explained
-by a rule below becomes `allowlisted` (or `known-gap` when a known-gap tag explains it),
-with the rule ids. A rule never explains an entry on its own say-so where the triage used
+by a rule below becomes `allowlisted`, with the rule ids (a row an our-defect rule touches
+stays `diff`, H6 B1; one whose stock side gave nothing to compare is `stock-unavailable`, S2). A rule never explains an entry on its own say-so where the triage used
 the node as referee: those rules need the row's node check to have passed.
 
 Each rule names its verdict and reason (suite-run1-triage.md sections in brackets), and
@@ -20,7 +20,11 @@ import re
 
 # Why a rule accepts a difference (the same classes as `accept_class` in compare/allowlist.toml).
 ACCEPT_CLASSES = ("stock-wrong-node-evidence", "intended-documented", "unsupported-by-design", "tip-timing",
-                  "stock-self-inconsistent", "stock-stale", "harness-convention", "our-defect")
+                  "stock-self-inconsistent", "stock-stale", "harness-convention", "our-defect",
+                  "stock-unavailable")
+# H6 (S2): a rule of this class accepts nothing. Where it explains every difference left, stock
+# gave no value to compare (an error, a -1 sentinel) and the record is `stock-unavailable`.
+UNAVAILABLE = "stock-unavailable"
 TIP_WINDOW = 4          # heights the tip may move between ours' read and stock's (about 2 minutes)
 MAX_SHOWN = 8           # kda-compare pair-diff's display cut (crates/kdx-compare/src/pair.rs MAX_SHOWN)
 CHAINS = 20
@@ -71,8 +75,10 @@ META = {
     "pactQuery-not-supported": ("unsupported-by-design", _T1 % "1 (docs/graphql.md: NOT_SUPPORTED)"),
     "gasLimitEstimate-not-supported": ("unsupported-by-design", _T1 % "4 (docs/graphql.md: NOT_SUPPORTED)"),
     "networkInfo-totalGasUsedInKda": ("unsupported-by-design", _T1 % "2 (docs table: NOT_AVAILABLE)"),
-    "networkInfo-stock-error": ("stock-wrong-node-evidence", _T1 % "2 (stock's own INTERNAL_SERVER_ERROR)"),
-    "networkInfo-totalDifficulty": ("stock-wrong-node-evidence", _T1 % "2 (stock answers -1)"),
+    "networkInfo-stock-error": (UNAVAILABLE, _T1 % "2 (stock's own INTERNAL_SERVER_ERROR); H6 S2, R-P5P9-172: "
+                                "no node read, so the record is stock-unavailable, never allowlisted"),
+    "networkInfo-totalDifficulty": (UNAVAILABLE, _T1 % "2 (stock answers -1); H6 S2, R-P5P9-172: no node read, "
+                                    "so the record is stock-unavailable, never allowlisted"),
     "networkInfo-coins-stale": ("stock-wrong-node-evidence", _T1 % "2 (stock's value lags; H4: the node tip "
                                 "sampled at stock's answer is above stock's own lastBlockHeight)"),
     "completedBlockHeights-stock-error": ("stock-wrong-node-evidence", _T1 % "3 (node check passes on the row)"),
@@ -81,7 +87,8 @@ META = {
     "node-undecodable-id": ("intended-documented", _T1 % "1 (docs Blocks and network)"),
     "guard-keyset-reference": ("intended-documented", _T1 % "5 and 7d (docs Accounts)"),
     "known-gap-missing-chain-rows": ("our-defect", _T1 % "7d (known gap Q: OUR DEFECT, gated by the baseline)"),
-    "lastBlockHeight-tip-race": ("tip-timing", _T1 % "7d (up to 3 blocks between the two calls)"),
+    "lastBlockHeight-tip-race": ("tip-timing", _T1 % "7d (up to 3 blocks between the two calls); H6 S2: only "
+                                 "where the node tip recorded with the row moved the same way, at least as far"),
     "multi-block-order": ("intended-documented", _T2 % "order class (owner-accepted documented difference, docs/graphql.md; "
                           "H4: same rows on both pages at the same heights)"),
     "totalcount-stock-orphans": ("stock-wrong-node-evidence", _T2 % "orphan-count rule (H2 item 3; H4: every stock-only "
@@ -284,11 +291,19 @@ def _gap_tag(ctx):
 
 
 def _tip_race(ctx):
+    # H6 (S2): node tip evidence stored with the record. The node tip at ours' read (tip.ours)
+    # and at stock's (tip.stock) moved by t; the two answers differ by d with the same sign,
+    # |d| <= |t| and |d| <= 3. No recorded tip, or a tip that did not move that way: a diff.
+    t = ctx.get("tip") or {}
+    lo, hi = t.get("ours"), t.get("stock")
+    if not all(isinstance(x, int) and not isinstance(x, bool) for x in (lo, hi)) or lo == hi:
+        return set()
     out = set()
     for i, e in enumerate(ctx["entries"]):
-        if e["path"] == "/data/lastBlockHeight":
+        if e["path"] == "/data/lastBlockHeight" and e["kind"] == "Changed":
             a, b = _num(e.get("a")), _num(e.get("b"))
-            if a is not None and b is not None and abs(a - b) <= 3:
+            if a is not None and b is not None and a != b and (b > a) == (hi > lo) \
+                    and abs(b - a) <= min(3, abs(hi - lo)):
                 out.add(i)
     return out
 
@@ -560,7 +575,8 @@ RULES = [
          TIP_EPS, _tip_timing),
     Rule("lastBlockHeight-tip-race", "HARNESS",
          "Neither side is pinned for lastBlockHeight; a difference of up to 3 blocks is the tip moving "
-         "between the two calls [triage 7d].", {"gql.lastBlockHeight"}, _tip_race),
+         "between the two calls, shown by the node tip recorded at each read [triage 7d, H6 S2].",
+         {"gql.lastBlockHeight"}, _tip_race),
 ]
 
 
@@ -584,4 +600,10 @@ def classify(ctx):
             used.append(r.id)
     if left:
         return "diff", []
-    return ("known-gap" if used == ["known-gap-missing-chain-rows"] else "allowlisted"), used
+    # H6 (B1): an our-defect rule never takes part in `allowlisted` or `known-gap`: any use makes
+    # the row a diff, as pair-diff classes it (H5 a; its `open` ids name the known gap).
+    if any(META[i][0] == "our-defect" for i in used):
+        return "diff", []
+    if any(META[i][0] == UNAVAILABLE for i in used):
+        return UNAVAILABLE, used        # H6 (S2): stock gave nothing to compare; never accepted
+    return "allowlisted", used
