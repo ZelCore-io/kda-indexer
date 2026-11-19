@@ -30,7 +30,8 @@ extension line (`crates/kdx-graphql/tests/extensions.txt`). Descriptions are not
 Differences from Kadena graph:
 
 - `pactQuery` and `gasLimitEstimate` are in the schema but answer `NOT_SUPPORTED`: the indexer
-  never runs Pact code for clients.
+  never runs Pact code for clients. `gasLimitEstimate(input: [])` runs no Pact and answers
+  `[]`, as the stock indexer does.
 - `Transaction.result` is never a `TransactionMempoolInfo`: the indexer has no mempool, and a
   transaction that is not indexed is `null`.
 - Page sizes: as in the stock indexer, a connection returns 20 items when `first`/`last` are
@@ -257,7 +258,8 @@ number open.
   miner without a row is a field error.
 - Block lists are ordered by height, then chain ascending: `blocksFromHeight` ascending by
   height, as the oracle lists it (R-P5P9-57 M2a); `blocksFromDepth` and
-  `completedBlockHeights` descending. Forward and backward pages hold the same blocks. The
+  `completedBlockHeights` descending. `chainIds` absent or `[]` means every chain. Forward
+  and backward pages hold the same blocks. The
   order of blocks within one height is a contract choice (R3E-8).
   `blocksFromDepth` lists blocks at least `minimumDepth` below their chain's stored tip.
   `completedBlockHeights` takes the newest `heightCount` (at most 100) heights: with
@@ -270,9 +272,10 @@ number open.
   `apiVersion` `"0.0"`, `transactionCount` (the last background count, as `/stats`; an error before the first one) and `coinsInCirculation` as `/stats`;
   `totalDifficulty` is the sum over chains of the tip block's `weight`, `networkHashRate` the
   sum over chains of the tip block's difficulty divided by 30 s.
-- `node(id)`/`nodes(ids)` (at most 100) resolve every type; a malformed id is
-  `BAD_USER_INPUT`, an object not stored is `null`. Coinbase events and transfers resolve
-  through their block.
+- `node(id)`/`nodes(ids)` (at most 100) resolve every type. An id that cannot be read (not
+  base64 of `<Type>:<key>`, an unknown type, or a malformed key) is `null`, as the stock
+  indexer answers, and so is an object not stored; `nodes` answers `null` in that id's place.
+  Coinbase events and transfers resolve through their block.
 
 ## Subscriptions
 
@@ -438,6 +441,9 @@ the oracle puts them.
 - `fungibleAccount`, `fungibleChainAccount(s)` and `…ByPublicKey` read the reconciled
   balance rows (spec §3.9); resolvers never call the node. Stale rows are served; chains
   without a row are absent from `chainAccounts`; with no row the account is `null`.
+  `fungibleChainAccounts` with `chainIds` absent (also a declared variable sent without a
+  value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
+  `fungibleChainAccount` on a chain without a row is `null`.
 - `totalBalance` is the exact decimal sum of the chain balances; `balance` is the stored
   text as a float.
 - Guards: an inline keyset or a resolved keyset reference is a `KeysetGuard` (`raw` is the

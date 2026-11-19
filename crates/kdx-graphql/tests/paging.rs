@@ -1171,3 +1171,150 @@ async fn pages_are_served_in_full_and_default_to_20() {
         "{v}"
     );
 }
+
+/// Runs `q` with `vars` and answers the whole response (data and errors).
+async fn run_vars(s: &KdxSchema, q: &str, vars: Value) -> Value {
+    let r = s
+        .execute(
+            async_graphql::Request::new(q).variables(async_graphql::Variables::from_json(vars)),
+        )
+        .await;
+    serde_json::to_value(&r).unwrap()
+}
+
+fn chain_ids_of(v: &Value) -> Vec<String> {
+    v["data"]["fungibleChainAccounts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list: {v}"))
+        .iter()
+        .map(|r| r["chainId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// FIX-4 item 1: `fungibleChainAccounts` with `chainIds` absent (a declared variable sent
+/// without a value) or `[]` lists every chain's row, and no rows is `[]`, never `null`.
+#[tokio::test]
+async fn fungible_chain_accounts_list_every_chain_and_never_null() {
+    let fx = fixture();
+    let q = "query($a: String!, $c: [String!]) { fungibleChainAccounts(accountName: $a, chainIds: $c) { chainId balance } }";
+    for vars in [
+        json!({"a": ALICE}),
+        json!({"a": ALICE, "c": null}),
+        json!({"a": ALICE, "c": []}),
+    ] {
+        let v = run_vars(&fx.schema, q, vars.clone()).await;
+        assert!(v.get("errors").is_none(), "{vars}: {v}");
+        assert_eq!(chain_ids_of(&v), ["0", "1"], "{vars}: {v}");
+    }
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleChainAccounts(accountName: \"{ALICE}\") {{ chainId }} }}"),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccounts"].as_array().map(Vec::len), Some(2));
+    // One chain asked: its row only.
+    let v = run_vars(&fx.schema, q, json!({"a": ALICE, "c": ["1"]})).await;
+    assert_eq!(chain_ids_of(&v), ["1"], "{v}");
+    // No row on the asked chain, or an unknown account: an empty list.
+    for vars in [
+        json!({"a": ALICE, "c": ["13"]}),
+        json!({"a": "k:nobody"}),
+        json!({"a": "k:nobody", "c": []}),
+    ] {
+        let v = run_vars(&fx.schema, q, vars.clone()).await;
+        assert!(v.get("errors").is_none(), "{vars}: {v}");
+        assert_eq!(v["data"]["fungibleChainAccounts"], json!([]), "{vars}: {v}");
+    }
+    // `fungibleChainAccount` on a chain without a row stays `null`.
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"5\") {{ chainId }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccount"], Value::Null, "{v}");
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"1\") {{ chainId }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccount"]["chainId"], "1", "{v}");
+}
+
+/// FIX-4 item 2: `chainIds: []` on the block lists means every chain, as no `chainIds` does.
+#[tokio::test]
+async fn empty_chain_ids_on_block_lists_mean_every_chain() {
+    let fx = fixture();
+    for (field, args) in [
+        ("blocksFromHeight", "startHeight: 0"),
+        ("blocksFromDepth", "minimumDepth: 0"),
+        (
+            "completedBlockHeights",
+            "completedHeights: false, heightCount: 100",
+        ),
+    ] {
+        let q = |chains: &str| {
+            format!(
+                "{{ {field}({args}{chains}, first: 50) {{ edges {{ node {{ chainId height }} }} }} }}"
+            )
+        };
+        let all = run(&fx.schema, &q("")).await;
+        let empty = run(&fx.schema, &q(", chainIds: []")).await;
+        let n = all[field]["edges"].as_array().map_or(0, Vec::len);
+        assert!(n > 1, "{field}: {all}");
+        let chains: HashSet<String> = all[field]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["node"]["chainId"].to_string())
+            .collect();
+        assert!(chains.len() > 1, "{field}: {all}");
+        assert_eq!(empty, all, "{field}");
+    }
+}
+
+/// FIX-4 item 5: an id that cannot be read is `null` (stock's answer), not an error; `nodes`
+/// answers `null` in its place and resolves the others.
+#[tokio::test]
+async fn unreadable_node_ids_are_null() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use kdx_graphql::ids::{encode, NodeKey};
+    let fx = fixture();
+    let good = encode(&NodeKey::Block {
+        hash: block_hash(0, 6),
+    });
+    let legacy = STANDARD.encode(format!("[\"Block\",\"{}\"]", block_hash(0, 6)));
+    for bad in ["AAAA", "not base64!", "", legacy.as_str(), "QmxvY2s6eA=="] {
+        let v = run(&fx.schema, &format!("{{ node(id: \"{bad}\") {{ id }} }}")).await;
+        assert_eq!(v, json!({"node": null}), "{bad}");
+    }
+    let v = run(
+        &fx.schema,
+        &format!("{{ nodes(ids: [\"{good}\", \"AAAA\", \"{legacy}\"]) {{ id ... on Block {{ height }} }} }}"),
+    )
+    .await;
+    assert_eq!(v, json!({"nodes": [{"id": good, "height": 6}, null, null]}),);
+}
+
+/// FIX-4 item 4: `gasLimitEstimate(input: [])` runs no Pact: an empty list, as stock answers.
+/// Any input is still `NOT_SUPPORTED`.
+#[tokio::test]
+async fn gas_limit_estimate_of_no_input_is_an_empty_list() {
+    let fx = fixture();
+    let v = run(&fx.schema, "{ gasLimitEstimate(input: []) { amount } }").await;
+    assert_eq!(v, json!({"gasLimitEstimate": []}));
+    let r = fx
+        .schema
+        .execute("{ gasLimitEstimate(input: [\"{}\"]) { amount } }")
+        .await;
+    let code = r.errors[0]
+        .extensions
+        .as_ref()
+        .and_then(|x| x.get("code"))
+        .cloned();
+    assert_eq!(code, Some(async_graphql::Value::from("NOT_SUPPORTED")));
+}
