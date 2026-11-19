@@ -12,6 +12,7 @@ pub mod account;
 pub mod coins;
 pub mod events;
 pub mod recent;
+pub mod schemas;
 pub mod search;
 pub mod shapes;
 pub mod stats;

@@ -143,9 +143,14 @@ enum Command {
         data_dir: Option<PathBuf>,
     },
     /// Dev: `run` without the freezer.
-    /// Print the OpenAPI document of the native API (no config needed).
+    /// Print an OpenAPI document (no config needed): the native API, or with `--compat` the
+    /// chainweb-data compatible API.
     #[command(hide = true)]
-    Openapi,
+    Openapi {
+        /// The compat API instead of the native one.
+        #[arg(long)]
+        compat: bool,
+    },
     /// GraphQL schema tools (no config needed; default limits).
     Graphql {
         #[command(subcommand)]
@@ -470,8 +475,15 @@ fn init_logging(log: &LogConfig) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Openapi) {
-        println!("{}", kdx_api::openapi::json());
+    if let Command::Openapi { compat } = cli.command {
+        println!(
+            "{}",
+            if compat {
+                kdx_api::openapi::compat_json()
+            } else {
+                kdx_api::openapi::json()
+            }
+        );
         return Ok(());
     }
     if let Command::Graphql { action } = &cli.command {
@@ -500,7 +512,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Openapi | Command::Graphql { .. } => Ok(()),
+        Command::Openapi { .. } | Command::Graphql { .. } => Ok(()),
         Command::Probe { smoke, out } => kda_indexer::cmd::probe::run(&cfg, smoke, out).await,
         Command::Dump {
             from,

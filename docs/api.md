@@ -1,6 +1,15 @@
 # Native API v1
 
-**Internal and unstable.** The native API binds a loopback or private address only (the server refuses anything else) and may change freely until a public hostname is decided. The machine-readable form is [`openapi.json`](openapi.json); regenerate it with `kda-indexer openapi > docs/openapi.json`.
+**Internal and unstable.** The native API binds a loopback or private address only (the server refuses anything else) and may change freely until a public hostname is decided. The machine-readable form is [`openapi.json`](openapi.json); regenerate it with `kda-indexer openapi > docs/openapi.json`. The compat routes have their own document, [`openapi-compat.json`](openapi-compat.json) (`kda-indexer openapi --compat > docs/openapi-compat.json`). A test fails when either file is stale or when a served route is missing from the documents.
+
+## Swagger UI
+
+The indexer serves an interactive reference of both APIs. `GET /docs` on the native listener (`api.native`) and on the compat listener (`api.compat`) opens Swagger UI with a switcher between the native API (`/api/v1`, 19 routes) and the chainweb-data compatible API (`/txs/*`, `/coins`, `/stats`, `/v1/txs`, 10 documented paths). The page opens on the API of the listener it came from. The documents themselves are at `/docs/openapi.json` and `/docs/openapi-compat.json` (the same bytes as the files in `docs/`).
+
+- Swagger UI ([swagger-ui-dist](https://www.npmjs.com/package/swagger-ui-dist) 5.34.1, Apache-2.0) is vendored and embedded in the binary. The page loads nothing from another host, its content security policy allows scripts, connections, images and fonts from its own origin only, and the "Try it out" button sends GET requests to the same origin.
+- A request to the other API's route from the wrong listener answers 404: the native routes live on `api.native`, the compat routes on `api.compat`. Open `/docs` on the listener whose API you want to try.
+- `[api] docs_enabled` (default `true`) turns it off: `/docs` and its files then answer 404. It is read-only and touches no data. `/docs` is never served on the admin listener (the metrics port) or the GraphQL listener. Requests to `/docs` pass the same per-client rate limit and in-flight cap as data routes; the `api.max_body_mb` response cap does not apply to the embedded UI files.
+- GraphQL has no Swagger page: its schema is `kda-indexer graphql print-schema` and introspection is on (see [graphql.md](graphql.md)).
 
 All routes are `GET` under `/api/v1`. JSON field names are snake_case. Errors are plain text with a status code: 400 (bad parameter, bad cursor), 404, 429 (per-IP rate), 503 (too many requests in flight, or a response over the 8 MB cap), 504 (the 5 s deadline). The listener on `[api] native` has no CORS headers.
 

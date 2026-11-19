@@ -21,6 +21,7 @@ use kdx_decode::index::xfer_entity;
 use kdx_decode::Family;
 
 use crate::compat::account::Src;
+use crate::compat::schemas::{LimitErrors, TxDetail};
 use crate::compat::shapes::{self, write_aeson};
 use crate::compat::{collect_page, json_bytes, text, Candidates, Paging};
 use crate::server::ApiState;
@@ -29,6 +30,68 @@ use crate::{ApiError, ApiResult};
 
 const DEFAULT_LIMIT: u64 = 50;
 const MAX_LIMIT: u64 = 10_000;
+
+// The two `doc_*` functions below only carry the OpenAPI description of the route: the
+// handler is `handler`, which serves the query form and the path form.
+
+/// The transactions behind an account's newest transfers
+///
+/// The newest `limit` transfer rows of the account in `namespace` (the fungible module,
+/// default `coin`) and the transactions that made them, as `TxDetail` records (the shape of
+/// `/txs/txs`). Each path segment is optional and falls back to the query parameter of the
+/// same name: `/v1/txs/{account}/{namespace}/{limit}` equals
+/// `/v1/txs?account=...&namespace=...&limit=...`. Rows of the token come first and, for a
+/// token other than `coin`, the account's `coin` rows follow. A transaction with several
+/// matching rows appears once, at its first row; miner rewards count toward `limit` but
+/// produce no entry. `limit` follows JavaScript `Number()` (hex, exponent and fractions
+/// parse; an empty, zero or non-numeric value means the default 50; above 10,000 it is
+/// capped); a negative or fractional value is `404 Not Found`, as is a fourth path
+/// segment. A missing account is `400 Bad Request`. Genesis transactions are hidden. The
+/// answer is capped at `api.v1txs_max_body_mb` (32 MB by default; `503` past it, use a
+/// smaller `limit`).
+#[utoipa::path(
+    get,
+    path = "/v1/txs",
+    operation_id = "compat_v1_txs_query",
+    tag = "transfers",
+    params(
+        ("account" = Option<String>, Query, description = "Account name (required: without it `400 Bad Request`)."),
+        ("namespace" = Option<String>, Query, description = "Fungible module.", example = "coin"),
+        ("limit" = Option<String>, Query, description = "Transfer rows to read: a JavaScript number, default 50, capped at 10,000.", example = "50"),
+    ),
+    responses(
+        (status = 200, description = "Transactions, newest transfer first", body = Vec<TxDetail>, content_type = "application/json"),
+        (status = 400, description = "No account", body = String, content_type = "text/plain"),
+        (status = 404, description = "`Not Found`: a negative or fractional `limit`, or more than three path segments", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
+pub fn doc_query_form() {}
+
+/// The transactions behind an account's newest transfers, path form
+///
+/// The same route as `/v1/txs`, with the parameters as path segments. The trailing
+/// segments may be left out (`/v1/txs/{account}` and `/v1/txs/{account}/{namespace}` are
+/// served; OpenAPI cannot describe optional path segments, so only the full form is
+/// listed). An empty segment falls back to the query parameter of the same name.
+#[utoipa::path(
+    get,
+    path = "/v1/txs/{account}/{namespace}/{limit}",
+    operation_id = "compat_v1_txs_path",
+    tag = "transfers",
+    params(
+        ("account" = String, Path, description = "Account name."),
+        ("namespace" = String, Path, description = "Fungible module (`coin` when empty)."),
+        ("limit" = String, Path, description = "Transfer rows to read: a JavaScript number, default 50, capped at 10,000."),
+    ),
+    responses(
+        (status = 200, description = "Transactions, newest transfer first", body = Vec<TxDetail>, content_type = "application/json"),
+        (status = 400, description = "No account", body = String, content_type = "text/plain"),
+        (status = 404, description = "`Not Found`: a negative or fractional `limit`, or more than three path segments", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
+pub fn doc_path_form() {}
 
 pub fn router() -> Router<Arc<ApiState>> {
     Router::new()

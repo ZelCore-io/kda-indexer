@@ -380,7 +380,11 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
                 .into_response();
         }
     }
-    let cap = if req.uri().path().starts_with("/v1/txs") {
+    // The embedded Swagger UI bundle is larger than a small `api.max_body_mb`; it is static
+    // and fixed, so the cap does not apply to it.
+    let cap = if req.uri().path() == "/docs" || req.uri().path().starts_with("/docs/") {
+        usize::MAX
+    } else if req.uri().path().starts_with("/v1/txs") {
         st.settings.v1txs_max_body_bytes
     } else {
         st.settings.max_body_bytes
@@ -490,6 +494,7 @@ pub struct Api {
     native: Router<Arc<ApiState>>,
     compat: Router<Arc<ApiState>>,
     graphql: Router<Arc<ApiState>>,
+    docs: bool,
     on_bound: Option<OnBound>,
 }
 
@@ -518,6 +523,7 @@ impl Api {
             native: Router::new().route("/status", axum::routing::get(status::handler)),
             compat: Router::new(),
             graphql: Router::new(),
+            docs: true,
             on_bound: None,
         }
     }
@@ -539,6 +545,13 @@ impl Api {
         Arc::get_mut(&mut self.state)
             .expect("with_stats_cache before state()")
             .stats_cache = c;
+        self
+    }
+
+    /// Serve Swagger UI and the OpenAPI documents under `/docs` on the native and compat
+    /// listeners (default on; `api.docs_enabled`).
+    pub fn docs_enabled(mut self, on: bool) -> Api {
+        self.docs = on;
         self
     }
 
@@ -577,8 +590,20 @@ impl Api {
                 .layer(middleware::from_fn_with_state(api, track))
                 .with_state(st.clone())
         };
-        let native = data(self.native, "native");
-        let compat = data(self.compat, "compat").layer(
+        // Swagger UI and the specs ride on the two REST listeners only (never admin, which
+        // carries /metrics, nor GraphQL), behind the same guard as their data routes.
+        let (native_routes, compat_routes) = if self.docs {
+            (
+                self.native
+                    .merge(crate::docs::router(crate::docs::Primary::Native)),
+                self.compat
+                    .merge(crate::docs::router(crate::docs::Primary::Compat)),
+            )
+        } else {
+            (self.native, self.compat)
+        };
+        let native = data(native_routes, "native");
+        let compat = data(compat_routes, "compat").layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
@@ -666,7 +691,7 @@ pub fn json(v: &serde_json::Value) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn settings(read_threads: usize) -> ApiSettings {

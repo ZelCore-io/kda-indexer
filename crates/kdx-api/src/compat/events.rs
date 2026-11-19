@@ -21,6 +21,7 @@ use kdx_types::record::{BlockRecord, TxRecord};
 use kdx_types::{Dict, DictKind, TxKey};
 use serde_json::Value;
 
+use super::schemas::{EventDetail, ExecutionStrategy, LimitErrors, PagingParams};
 use super::shapes::{self, Ev};
 use super::{
     check_strategy, collect_page, page_response, paging, resume_exhausted, resume_max, store_floor,
@@ -302,6 +303,42 @@ fn check_patterns(p: &Params, s: &SearchSettings) -> Result<(), String> {
     Ok(())
 }
 
+/// Events
+///
+/// chainweb-data `evHandler`: a JSON array of `EventDetail`, newest first (height
+/// descending, request key descending, event index ascending). Filters combine with AND:
+/// `modulename` is an exact module, `name` a SQL `LIKE '%name%'` on the qualified name,
+/// `param` a `LIKE` on the parameters' JSON text, `search` a `LIKE` on either. Patterns
+/// take `%` and `_`, `\` escapes them, at most 256 characters and 8 `%`. Without
+/// `modulename`, `name` and `param` need at least `search.min_len` (4) characters other
+/// than wildcards and may take a bounded newest-first scan (`search.max_scan_heights`,
+/// `search.timeout_ms`): a cut scan answers what it found with `X-Search-Truncated: true`
+/// and `Chainweb-Next`. `search` takes one slot of the search gate (`503` when
+/// `search.concurrency` searches run, `429` when the client already runs
+/// `search.per_client`). Genesis transactions are hidden.
+#[utoipa::path(
+    get,
+    path = "/txs/events",
+    operation_id = "compat_events",
+    tag = "events",
+    params(
+        ("search" = Option<String>, Query, description = "LIKE pattern matched against the qualified name or the parameter text."),
+        ("param" = Option<String>, Query, description = "LIKE pattern matched against the parameter text (JSON)."),
+        ("name" = Option<String>, Query, description = "LIKE pattern matched against the qualified event name, for example `coin.TRANSFER`."),
+        ("modulename" = Option<String>, Query, description = "Exact module name, for example `coin`."),
+        PagingParams,
+        ("Chainweb-Execution-Strategy" = Option<ExecutionStrategy>, Header, description = "Accepted and ignored. Any other value is `400 Unknown Chainweb-Execution-Strategy: ...`."),
+    ),
+    responses(
+        (status = 200, description = "A page of events", body = Vec<EventDetail>, content_type = "application/json",
+            headers(
+                ("Chainweb-Next" = String, description = "Token of the next page (pass as `next`); absent on the last page."),
+                ("X-Search-Truncated" = String, description = "`true` when the scan deadline or a cap cut the answer short."),
+            )),
+        (status = 400, description = "A parameter does not parse, a pattern is too long, has too many `%`, or is too short without `modulename`; `offset` above 10,000; `next` with `offset`; an invalid `next`", body = String, content_type = "text/plain"),
+        LimitErrors,
+    )
+)]
 pub async fn handler(
     State(st): State<Arc<ApiState>>,
     Extension(search): Extension<SearchSettings>,

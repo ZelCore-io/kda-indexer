@@ -85,6 +85,7 @@ pub fn api(
     };
     let search = kdx_api::search::SearchCtx::new(settings, Some(kdx_search::search_dir(data_dir)));
     let api = Api::new(store, cfg.api.settings(&cfg.network)?, tips)
+        .docs_enabled(cfg.api.docs_enabled)
         .native_routes(kdx_api::native::router(search.clone()))
         .compat_routes(kdx_api::compat::router(search.clone()));
     api.state()
