@@ -120,7 +120,9 @@ The harness compares with these conventions (entries of
 
 - `iso-same-instant`: two texts of one timestamp (`Z` or `+00:00`, trailing fraction zeros) are
   the same instant when every fraction digit either side gives is equal (a digit one side does
-  not write reads as zero; nothing is truncated). The record carries the visible hit.
+  not write reads as zero; nothing is truncated), both write the same `YYYY-MM-DDTHH:MM:SS`, and
+  that is a real calendar date and time (no day past the month's end, no second 60). The record
+  carries the visible hit `/~iso-same-instant<field path>`.
 - `graphql-r57-json-object`: JSON texts that hold objects compare as objects (key order is no
   difference; numbers keep their text).
 - `graphql-r75-nested-multiset`: a nested list whose rows select no key compares as a multiset

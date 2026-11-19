@@ -6,7 +6,8 @@ S="${SUITE_DIR:?set SUITE_DIR}"
 cd "$S"
 # H6 (S8): tools4 and the pair-diff binary must come from the reviewed fix-round commit
 # (tools4/COMMIT, tools4/SHA256SUMS, sha256sum of tools4/kda-compare-h5 and its commit stamp).
-# Build: cargo build --release -p kdx-compare --bin kda-compare at that commit (verify4.sh).
+# Build: run4/build4.sh <commit> (cargo build --release -p kdx-compare --bin kda-compare from a
+# clean checkout at that commit; H7 SHOULD-4b), and fv-compare.toml must load tools4/allowlist.toml.
 /bin/bash "$S/run4/verify4.sh"
 systemctl stop kdx-suite4-guard 2>/dev/null || true
 systemd-run --unit=kdx-suite4 --collect -E SUITE_DIR="$S" -p Nice=10 -p MemoryMax=4G --working-directory="$S" /bin/bash "$S/run4/launch.sh"

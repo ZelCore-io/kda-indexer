@@ -4,7 +4,7 @@
 //! - Numbers compare as exact decimals (`gasPrice` too: no float tolerance, owner rule
 //!   "exact-decimal numeric parity per field", R-P5P9-172 / H6 S5).
 //! - ISO-8601 timestamps in two text forms are equal only when they name the same instant to
-//!   every digit either side gives; `diff` then emits the visible hit `/~iso-same-instant`.
+//!   every digit either side gives; `diff` then emits the visible hit `/~iso-same-instant<path>`.
 //! - Arrays with a route sort key: inside each run of items with equal sort keys the items are
 //!   ordered by their canonical text, so ties compare as multisets. Order across different
 //!   sort keys is kept as returned (it is part of the API).
@@ -221,6 +221,20 @@ fn tie_groups(items: &mut [Value], key: fn(&Value) -> SortKey) {
 pub struct IsoTime {
     pub secs: i64,
     pub frac: String,
+    /// The `YYYY-MM-DDTHH:MM:SS` text as written (H7 SHOULD-2).
+    pub head: String,
+    /// A real calendar date and time: no day past the month's end, no second 60. `secs` of
+    /// such a text rolls over into the next month or minute (H7 SHOULD-2).
+    pub real: bool,
+}
+
+fn days_in_month(y: i64, mo: i64) -> i64 {
+    match mo {
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// Parses `YYYY-MM-DDTHH:MM:SS[.f+]Z` (also accepts `+00:00`). Anything else is `None`.
@@ -262,13 +276,21 @@ pub fn parse_iso(s: &str) -> Option<IsoTime> {
     Some(IsoTime {
         secs: days * 86_400 + h * 3600 + mi * 60 + se,
         frac,
+        head: s[..19].to_string(),
+        real: d <= days_in_month(y, mo) && se <= 59,
     })
 }
 
 /// The same instant to the full precision both sides give (H6 S5): every fraction digit either
 /// side writes is compared, a digit one side does not write reads as zero. Never truncated.
+/// H7 (SHOULD-2, R-P5P9-173): both sides also write the same `YYYY-MM-DDTHH:MM:SS` text, and
+/// it is a real calendar date and time. With only UTC offsets parsed, that is the same instant.
 pub fn iso_same_instant(a: &IsoTime, b: &IsoTime) -> bool {
-    a.secs == b.secs && a.frac.trim_end_matches('0') == b.frac.trim_end_matches('0')
+    a.real
+        && b.real
+        && a.head == b.head
+        && a.secs == b.secs
+        && a.frac.trim_end_matches('0') == b.frac.trim_end_matches('0')
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.ffffffZ` from microseconds since the epoch.

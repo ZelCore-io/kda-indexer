@@ -1,10 +1,12 @@
 #!/bin/bash
 # H6 (S8): refuses run 4 unless tools4 and the pair-diff binary come from the reviewed fix-round
 # commit. Called by start4.sh and launch.sh (so the installed unit checks too). stage4.sh writes
-# the commit into EXPECTED_COMMIT below and stamps tools4; the binary is built separately:
-#   git checkout <EXPECTED_COMMIT> && cargo build --release -p kdx-compare --bin kda-compare
-#   cp target/release/kda-compare tools4/kda-compare-h5
-#   (cd tools4 && sha256sum kda-compare-h5 > kda-compare-h5.sha256 && echo <EXPECTED_COMMIT> > kda-compare-h5.commit)
+# the commit into EXPECTED_COMMIT below and stamps tools4; the binary is built by
+# run4/build4.sh <EXPECTED_COMMIT> (H7 SHOULD-4b): a clean checkout at that commit, with the
+# sha256 and the commit stamp written from that checkout's `git rev-parse HEAD`.
+# H7 (SHOULD-4c, R-P5P9-173): the pair-diff config named by run4/suite4.toml ([diff] config)
+# must load tools4/allowlist.toml, and the sha256 of its [graphql] field_rules is pinned in
+# run4/fv-compare.pin at the first verify; a later verify with other field_rules refuses.
 set -u
 S="${SUITE_DIR:?set SUITE_DIR}"
 EXPECTED_COMMIT="@COMMIT@"
@@ -18,4 +20,24 @@ case "$EXPECTED_COMMIT" in *@*|"") fail "run4/verify4.sh was not staged by stage
 [ "$(cat "$T/kda-compare-h5.commit" 2>/dev/null)" = "$EXPECTED_COMMIT" ] \
   || fail "tools4/kda-compare-h5.commit is not $EXPECTED_COMMIT (binary built from another commit)"
 grep -q 'kda_compare *= *"\?tools4/kda-compare-h5"\?' "$S/run4/suite4.toml" || fail "run4/suite4.toml does not use tools4/kda-compare-h5"
-echo "verify4: tools4 and kda-compare-h5 at $EXPECTED_COMMIT ($(cut -c1-16 "$T/kda-compare-h5.sha256"))"
+FV=$(python3 -c '
+import hashlib, json, os, sys, tomllib
+s = sys.argv[1]
+c = tomllib.load(open(os.path.join(s, "run4/suite4.toml"), "rb")).get("diff", {}).get("config")
+if not c:
+    sys.exit("run4/suite4.toml names no [diff] config")
+fv = tomllib.load(open(os.path.join(s, c), "rb"))
+al = fv.get("allowlist", "compare/allowlist.toml")
+if os.path.realpath(os.path.join(s, al)) != os.path.realpath(os.path.join(s, "tools4/allowlist.toml")):
+    sys.exit("%s: pair-diff would load allowlist %s, not tools4/allowlist.toml" % (c, al))
+fr = fv.get("graphql", {}).get("field_rules", [])
+h = hashlib.sha256(json.dumps(fr, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+print("%s field_rules sha256 %s (%d rules)" % (c, h, len(fr)))
+' "$S" 2>&1) || fail "$FV"
+P="$S/run4/fv-compare.pin"
+if [ -f "$P" ]; then
+  [ "$(cat "$P")" = "$FV" ] || fail "pair-diff config changed since the pin: now '$FV', pinned '$(cat "$P")'"
+else
+  echo "$FV" > "$P"
+fi
+echo "verify4: tools4 and kda-compare-h5 at $EXPECTED_COMMIT ($(cut -c1-16 "$T/kda-compare-h5.sha256")); $FV"

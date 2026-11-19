@@ -1223,6 +1223,43 @@ mod tests {
         assert_eq!(al.classify_known(&RouteKind::Events, rq, &[], &field).unexplained.len(), 1);
     }
 
+    /// H7 (SHOULD-3, R-P5P9-173): the window is ours', so it explains only rows stock lists and
+    /// ours does not; a row only ours lists, or a row null on one side, stays a diff.
+    #[test]
+    fn h7_event_search_window_explains_only_stock_extra_rows() {
+        use crate::report::{DiffEntry, DiffKind};
+        let al = shipped();
+        let rq = "/txs/events?search=transfer&limit=50";
+        let un = |d: &[DiffEntry]| al.classify_known(&RouteKind::Events, rq, &[], d).unexplained.len();
+        assert_eq!(un(&entry("/7", DiffKind::Missing, serde_json::json!({}))), 0);
+        let extra = [DiffEntry {
+            path: "/7".into(),
+            kind: DiffKind::Extra,
+            a: Some(serde_json::json!({})),
+            b: None,
+        }];
+        assert_eq!(un(&extra), 1);
+        let null_row = [DiffEntry {
+            path: "/7".into(),
+            kind: DiffKind::Type,
+            a: Some(serde_json::Value::Null),
+            b: Some(serde_json::json!({})),
+        }];
+        assert_eq!(un(&null_row), 1);
+    }
+
+    /// H7 (SHOULD-2): the iso-same-instant hit carries the field path and still explains.
+    #[test]
+    fn h7_iso_same_instant_hit_with_field_path_explains() {
+        let al = shipped();
+        let d = entry(
+            &format!("{}/data/block/creationTime", crate::diff::ISO_SAME_INSTANT_PATH),
+            crate::report::DiffKind::Changed,
+            serde_json::json!("2024-01-01T00:00:00Z"),
+        );
+        assert!(al.classify_known(&RouteKind::Tx, "", &[], &d).unexplained.is_empty());
+    }
+
     /// H6 (S7): an open entry that names a hit path exactly takes it before a broad accepted
     /// `/**` entry, so the hit stays unexplained (and is named as open).
     #[test]
@@ -1281,7 +1318,7 @@ mod tests {
             assert!(by(id).is_open(), "{id}");
         }
         let d = entry(
-            crate::diff::ISO_SAME_INSTANT_PATH,
+            &format!("{}/t", crate::diff::ISO_SAME_INSTANT_PATH),
             crate::report::DiffKind::Changed,
             serde_json::json!("2024-01-01T00:00:00Z"),
         );

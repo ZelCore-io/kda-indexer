@@ -22,7 +22,7 @@ const COINS_SUPPLY_TOLERANCE: f64 = 1e-6;
 /// `coins-supply-tolerance`, so the hit is visible); a bigger one stays a root diff.
 pub const COINS_SUPPLY_PATH: &str = "/~coins-supply-tolerance";
 /// Visible hit for two text forms of one instant (allowlisted as `iso-same-instant`, a
-/// harness convention with a doc anchor; H6 S5).
+/// harness convention with a doc anchor; H6 S5). The field path follows it (H7 SHOULD-2).
 pub const ISO_SAME_INSTANT_PATH: &str = "/~iso-same-instant";
 /// Path used to report a `/stats` count difference that is inside the tolerance (allowlisted
 /// as `stats-estimate`, so the hit is visible in the summary).
@@ -311,7 +311,9 @@ fn walk(
             // any digit is a diff.
             if let (Some(ta), Some(tb)) = (parse_iso(sa), parse_iso(sb)) {
                 if iso_same_instant(&ta, &tb) {
-                    push(out, ISO_SAME_INSTANT_PATH, DiffKind::Changed, Some(a), Some(b));
+                    // H7 (SHOULD-2): the hit names the field path.
+                    let p = format!("{ISO_SAME_INSTANT_PATH}{path}");
+                    push(out, &p, DiffKind::Changed, Some(a), Some(b));
                     return;
                 }
             }
@@ -682,8 +684,34 @@ mod explain_tests {
         ] {
             let d = t(a, b);
             assert_eq!(d.len(), 1);
-            assert_eq!(d[0].path, ISO_SAME_INSTANT_PATH);
+            assert_eq!(d[0].path, format!("{ISO_SAME_INSTANT_PATH}/t"));
         }
         assert!(t("2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z").is_empty());
+    }
+
+    /// H7 (SHOULD-2, R-P5P9-173): the convention needs the same `YYYY-MM-DDTHH:MM:SS` text on
+    /// both sides and a real calendar date (no day past the month's end, no second 60); its hit
+    /// names the field path.
+    #[test]
+    fn h7_iso_same_instant_same_second_text_real_dates_field_path() {
+        let t = |a: &str, b: &str| diff(&json!({"x": {"t": a}}), &json!({"x": {"t": b}}));
+        for (a, b) in [
+            ("2024-02-30T00:00:00Z", "2024-03-01T00:00:00Z"),       // rolls into March
+            ("2024-01-01T23:59:60Z", "2024-01-02T00:00:00Z"),       // leap second rolls over
+            ("2023-02-29T00:00:00Z", "2023-02-29T00:00:00.0Z"),     // same text, no such day
+            ("2024-04-31T00:00:00Z", "2024-04-31T00:00:00+00:00"),
+            ("2024-01-01T23:59:60Z", "2024-01-01T23:59:60.000Z"),
+        ] {
+            let d = t(a, b);
+            assert_eq!(d.len(), 1, "{a} {b} {d:?}");
+            assert_eq!(d[0].path, "/x/t", "{a} {b}");
+        }
+        let d = t("2024-02-29T12:00:00.10Z", "2024-02-29T12:00:00.1+00:00");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].path, format!("{ISO_SAME_INSTANT_PATH}/x/t"));
+        assert!(!crate::normalize::iso_same_instant(
+            &crate::normalize::parse_iso("2024-02-30T00:00:00Z").unwrap(),
+            &crate::normalize::parse_iso("2024-03-01T00:00:00Z").unwrap(),
+        ));
     }
 }

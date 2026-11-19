@@ -1202,7 +1202,7 @@ class H4Minor(unittest.TestCase):
         lanes 34 h by default; no host layout and nothing of run 3's."""
         d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "suite", "run4")
         names = sorted(os.listdir(d))
-        self.assertEqual(names, ["check.sh", "guard.sh", "kdx-suite4-guard.service", "kdx-suite4.service",
+        self.assertEqual(names, ["build4.sh", "check.sh", "guard.sh", "kdx-suite4-guard.service", "kdx-suite4.service",
                                  "launch.sh", "stage4.sh", "start4.sh", "verify4.sh"])
         for fn in names:
             t = open(os.path.join(d, fn)).read()
@@ -1437,7 +1437,9 @@ class H6Fixes(unittest.TestCase):
         os.makedirs(os.path.join(d, "run4"))
         v = open(os.path.join(r4, "verify4.sh")).read()
         self.assertIn('EXPECTED_COMMIT="@COMMIT@"', v)
-        open(os.path.join(d, "run4", "suite4.toml"), "w").write('[diff]\nkda_compare = "tools4/kda-compare-h5"\n')
+        open(os.path.join(d, "run4", "suite4.toml"), "w").write(
+            '[diff]\nkda_compare = "tools4/kda-compare-h5"\nconfig = "run4/fv.toml"\n')
+        open(os.path.join(d, "run4", "fv.toml"), "w").write('allowlist = "tools4/allowlist.toml"\n[node]\n')
         t = os.path.join(d, "tools4")
 
         def w(name, text):
@@ -1465,6 +1467,122 @@ class H6Fixes(unittest.TestCase):
         self.assertEqual(verify(), 0)
         w("run.py", "y")
         self.assertNotEqual(verify(), 0)                                   # tools4 file from another commit
+
+
+class H7Fixes(unittest.TestCase):
+    """H7 (R-P5P9-173): suite-h6-rereview SHOULD-1 and SHOULD-4 (S8 part)."""
+
+    ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    R4 = os.path.join(ROOT, "scripts", "suite", "run4")
+
+    def test_should1_partial_hit_the_rust_allowlist_explained_is_still_seen(self):
+        cap = E_("/~graphql-totalcount-cap", "Changed", 1, 2)
+        lbh = E_("/data/lastBlockHeight", "Changed", 100, 101)
+        tip = {"ours": 5, "stock": 6}
+        v = {"class": "diff", "left": [lbh], "left_total": 1, "all": [cap, lbh], "total": 2}
+        self.assertEqual(run.verdict_class("gql.lastBlockHeight", "real", v, [], {}, None, tip=tip)[0], "incomplete")
+        self.assertEqual(run.verdict_class("gql.lastBlockHeight", "real", dict(v, **{"class": "allowlisted"}), [], {},
+                                           None, tip=tip)[0], "incomplete")
+        # without the cap the same record is accepted by the tip rule, and a real diff stays a diff
+        self.assertEqual(run.verdict_class("gql.lastBlockHeight", "real", dict(v, all=[lbh], total=1), [], {}, None,
+                                           tip=tip)[0], "allowlisted")
+        real = E_("/data/x", "Changed", 1, 2)
+        self.assertEqual(run.verdict_class("gql.x", "real", {"class": "diff", "left": [real], "all": [cap, real]},
+                                           [], {}, None)[0], "diff")
+        # the oracle stall the Rust allowlist explained is seen too
+        stall = E_("/~graphql-oracle-stall", "Changed", 1, 2)
+        self.assertEqual(run.verdict_class("gql.x", "real", {"class": "diff", "left": [real], "all": [stall, real]},
+                                           [], {}, None)[0], "stock-unavailable")
+
+    def _suite(self, fv_allowlist='allowlist = "tools4/allowlist.toml"\n', rules='[{ field = "cmd.nonce", rule = "json_unquote" }]'):
+        import subprocess
+        C = "c" * 40
+        d = tempfile.mkdtemp()
+        t = os.path.join(d, "tools4")
+        os.makedirs(t)
+        os.makedirs(os.path.join(d, "run4"))
+        open(os.path.join(d, "run4", "suite4.toml"), "w").write(
+            '[diff]\nkda_compare = "tools4/kda-compare-h5"\nconfig = "run4/fv-compare.toml"\n')
+        self._fv(d, fv_allowlist, rules)
+        for n, x in (("run.py", "x"), ("allowlist.toml", "a"), ("COMMIT", C + "\n"), ("kda-compare-h5", "bin"),
+                     ("kda-compare-h5.commit", C + "\n")):
+            open(os.path.join(t, n), "w").write(x)
+        os.chmod(os.path.join(t, "kda-compare-h5"), 0o755)
+        subprocess.run("sha256sum run.py allowlist.toml COMMIT > SHA256SUMS && sha256sum kda-compare-h5 > kda-compare-h5.sha256",
+                       shell=True, cwd=t, check=True)
+        open(os.path.join(d, "run4", "verify4.sh"), "w").write(
+            open(os.path.join(self.R4, "verify4.sh")).read().replace("@COMMIT@", C))
+        return d
+
+    def _fv(self, d, fv_allowlist, rules):
+        open(os.path.join(d, "run4", "fv-compare.toml"), "w").write(
+            fv_allowlist + "[graphql]\nfield_rules = %s\n[node]\n" % rules)
+
+    def _verify(self, d):
+        import subprocess
+        return subprocess.run(["/bin/bash", os.path.join(d, "run4", "verify4.sh")], env=dict(os.environ, SUITE_DIR=d),
+                              capture_output=True, text=True)
+
+    def test_should4c_verify4_needs_the_tools4_allowlist_and_pins_field_rules(self):
+        import shutil
+        if shutil.which("sha256sum") is None:
+            self.skipTest("no sha256sum")
+        d = self._suite()
+        r = self._verify(d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("field_rules", r.stdout)
+        self.assertEqual(self._verify(d).returncode, 0)                      # pinned, unchanged
+        self._fv(d, 'allowlist = "tools4/allowlist.toml"\n', "[]")
+        self.assertNotEqual(self._verify(d).returncode, 0)                   # field_rules changed after the pin
+        for fv in ('', 'allowlist = "compare/allowlist.toml"\n', 'allowlist = "/elsewhere/allowlist.toml"\n'):
+            d = self._suite(fv_allowlist=fv)
+            r = self._verify(d)
+            self.assertNotEqual(r.returncode, 0, fv)                         # pair-diff would load another allowlist
+            self.assertIn("allowlist", r.stderr)
+        d = self._suite()
+        open(os.path.join(d, "run4", "suite4.toml"), "w").write('[diff]\nkda_compare = "tools4/kda-compare-h5"\n')
+        self.assertNotEqual(self._verify(d).returncode, 0)                   # no pair-diff config named
+
+    def test_should4b_build4_builds_from_a_clean_checkout_and_stamps_head(self):
+        import shutil
+        import subprocess
+        if shutil.which("sha256sum") is None or shutil.which("git") is None:
+            self.skipTest("no sha256sum or git")
+        b4 = os.path.join(self.R4, "build4.sh")
+        self.assertIn("nice -n 10", open(b4).read())
+        self.assertIn("build --release -p kdx-compare --bin kda-compare", open(b4).read())
+        repo = tempfile.mkdtemp()
+        g = lambda *a: subprocess.run(["git", "-C", repo] + list(a), check=True, capture_output=True, text=True).stdout.strip()
+        g("init", "-q")
+        g("config", "user.email", "t@example.invalid")
+        g("config", "user.name", "t")
+        open(os.path.join(repo, "src.txt"), "w").write("one\n")
+        g("add", "src.txt")
+        g("commit", "-qm", "one")
+        c1 = g("rev-parse", "HEAD")
+        open(os.path.join(repo, "src.txt"), "w").write("two\n")
+        g("commit", "-qam", "two")
+        open(os.path.join(repo, "src.txt"), "w").write("dirty\n")          # uncommitted change in the copy
+        fake = os.path.join(tempfile.mkdtemp(), "cargo")
+        open(fake, "w").write('#!/bin/bash\nmkdir -p target/release && cp src.txt target/release/kda-compare\n')
+        os.chmod(fake, 0o755)
+        s = tempfile.mkdtemp()
+        os.makedirs(os.path.join(s, "tools4"))
+        open(os.path.join(s, "tools4", "COMMIT"), "w").write(c1 + "\n")
+        env = dict(os.environ, REPO=repo, CARGO=fake)
+        env.pop("CARGO_TARGET_DIR", None)
+        r = subprocess.run(["/bin/bash", b4, c1[:12], s], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        t = os.path.join(s, "tools4")
+        self.assertEqual(open(os.path.join(t, "kda-compare-h5")).read(), "one\n")    # the commit, not the tree
+        self.assertEqual(open(os.path.join(t, "kda-compare-h5.commit")).read().strip(), c1)
+        self.assertEqual(subprocess.run("sha256sum -c --quiet kda-compare-h5.sha256", shell=True, cwd=t).returncode, 0)
+        self.assertEqual(g("worktree", "list").count("\n"), 0)                # the checkout is removed
+        r = subprocess.run(["/bin/bash", b4, "HEAD", s], env=env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)                                   # not the staged tools4/COMMIT
+        st, sg = (open(os.path.join(self.R4, f)).read() for f in ("start4.sh", "stage4.sh"))
+        self.assertIn("build4.sh", sg)
+        self.assertIn("run4/build4.sh", open(os.path.join(self.R4, "verify4.sh")).read())
 
 
 if __name__ == "__main__":

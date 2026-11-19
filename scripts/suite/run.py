@@ -755,9 +755,13 @@ def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx
     and stock's own lastBlockHeight; `query`: the case's GraphQL document."""
     c = v.get("class")
     ents, done = rule_entries(v)
-    if any(e.get("path") == "/~graphql-oracle-stall" for e in ents):
+    # H7 (SHOULD-1, R-P5P9-173): the partial-compare and stall hits are looked for in every
+    # entry (`all`), also the ones the Rust allowlist explained and dropped from `left`.
+    seen = v["all"] if isinstance(v.get("all"), list) else ents
+    if any(e.get("path") == "/~graphql-oracle-stall" for e in seen):
         return "stock-unavailable", []
-    if c in ("equal", "allowlisted") and any(e.get("path") in PARTIAL_HITS for e in ents):
+    partial = any(e.get("path") in PARTIAL_HITS for e in seen)
+    if c in ("equal", "allowlisted") and partial:
         return "incomplete", []         # owner H4 rule 1: only part of the list was compared
     if c == "allowlisted" and v.get("open_ids"):
         c = "diff"                      # owner H4 rule 3: an open (undocumented) entry accepts nothing
@@ -767,6 +771,8 @@ def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx
         if done is not None:
             ctx["complete"] = done
         k, ids = allow.classify(ctx)
+        if k == "allowlisted" and partial:
+            return "incomplete", []     # H7 SHOULD-1: incomplete is never accepted
         if k != "diff":
             return k, ids
     return c, []
