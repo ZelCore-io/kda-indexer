@@ -47,6 +47,41 @@ pub enum Status {
     KnownGap,
 }
 
+/// Why an entry is accepted (H2 item 6, owner R-P5P9-162): the docs list every accepted
+/// difference with this class and the ruling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcceptClass {
+    /// Stock is wrong and the node (or stock's own error) shows it.
+    StockWrongNodeEvidence,
+    /// A difference documented as intended (the docs state it).
+    IntendedDocumented,
+    /// A feature the indexer does not offer, by design.
+    UnsupportedByDesign,
+    /// The two reads saw different tips (bounded window).
+    TipTiming,
+}
+
+impl AcceptClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AcceptClass::StockWrongNodeEvidence => "stock-wrong-node-evidence",
+            AcceptClass::IntendedDocumented => "intended-documented",
+            AcceptClass::UnsupportedByDesign => "unsupported-by-design",
+            AcceptClass::TipTiming => "tip-timing",
+        }
+    }
+}
+
+/// One row of the table the docs list: id, reason, accept class, ruling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRow {
+    pub id: String,
+    pub reason: String,
+    pub accept_class: &'static str,
+    pub ruling: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -76,6 +111,8 @@ pub struct Entry {
     pub baseline_per_hour: Option<f64>,
     /// Required: PROPOSED, ACCEPTED or KNOWN-GAP.
     pub status: Status,
+    /// Required: why the entry is accepted (see [`AcceptClass`]).
+    pub accept_class: AcceptClass,
     pub reason: String,
     /// Required: the ruling (or, for an owner-accepted entry, the owner note) that admits it.
     pub ruling: String,
@@ -118,6 +155,19 @@ impl Allowlist {
             );
         }
         Ok(Allowlist { entries: f.entries })
+    }
+
+    /// Every entry as a docs row: id, reason, accept class, ruling.
+    pub fn table(&self) -> Vec<TableRow> {
+        self.entries
+            .iter()
+            .map(|e| TableRow {
+                id: e.id.clone(),
+                reason: e.reason.clone(),
+                accept_class: e.accept_class.as_str(),
+                ruling: e.ruling.clone(),
+            })
+            .collect()
     }
 
     /// Splits `diffs` into unexplained entries and the ids of the entries that matched.
@@ -372,7 +422,8 @@ mod tests {
                 &p,
                 format!(
                     "[[entry]]\nid = \"x\"\nroute = \"*\"\njson_path_glob = \"/x\"\n\
-                     condition = \"any\"\nreason = \"r\"\nowner_note = \"n\"\n{extra}"
+                     condition = \"any\"\nreason = \"r\"\nowner_note = \"n\"\n\
+                     accept_class = \"intended-documented\"\n{extra}"
                 ),
             )
             .unwrap();
@@ -390,6 +441,70 @@ mod tests {
             load("status = \"MAYBE\"\nruling = \"R-1\"\n").is_err(),
             "unknown status"
         );
+    }
+
+    /// H2 item 6 (owner R-P5P9-162): every entry carries an accept class, so the docs can
+    /// list every accepted difference with why it is accepted. A missing or unknown class
+    /// does not load.
+    #[test]
+    fn an_entry_without_an_accept_class_is_refused() {
+        use super::AcceptClass;
+        let dir = tempfile::tempdir().unwrap();
+        let load = |extra: &str| {
+            let p = dir.path().join("c.toml");
+            std::fs::write(
+                &p,
+                format!(
+                    "[[entry]]\nid = \"x\"\nroute = \"*\"\njson_path_glob = \"/x\"\n\
+                     condition = \"any\"\nreason = \"r\"\nowner_note = \"n\"\n\
+                     status = \"PROPOSED\"\nruling = \"R-1\"\n{extra}"
+                ),
+            )
+            .unwrap();
+            Allowlist::load(&p)
+        };
+        for (text, class) in [
+            (
+                "stock-wrong-node-evidence",
+                AcceptClass::StockWrongNodeEvidence,
+            ),
+            ("intended-documented", AcceptClass::IntendedDocumented),
+            ("unsupported-by-design", AcceptClass::UnsupportedByDesign),
+            ("tip-timing", AcceptClass::TipTiming),
+        ] {
+            let al = load(&format!("accept_class = \"{text}\"\n")).unwrap();
+            assert_eq!(al.entries[0].accept_class, class);
+            assert_eq!(class.as_str(), text);
+        }
+        assert!(load("").is_err(), "no accept class");
+        assert!(
+            load("accept_class = \"whatever\"\n").is_err(),
+            "unknown class"
+        );
+    }
+
+    /// The shipped file: every entry has a class, and the table the docs list has id,
+    /// reason, class and ruling for each.
+    #[test]
+    fn the_shipped_table_lists_id_reason_class_and_ruling_for_every_entry() {
+        let al = shipped();
+        let rows = al.table();
+        assert_eq!(rows.len(), al.entries.len());
+        for r in &rows {
+            assert!(
+                !r.id.is_empty() && !r.reason.trim().is_empty() && !r.ruling.trim().is_empty(),
+                "{}",
+                r.id
+            );
+        }
+        assert!(rows.iter().any(|r| r.accept_class == "tip-timing"));
+        assert!(rows
+            .iter()
+            .any(|r| r.accept_class == "unsupported-by-design"));
+        assert!(rows
+            .iter()
+            .any(|r| r.accept_class == "stock-wrong-node-evidence"));
+        assert!(rows.iter().any(|r| r.accept_class == "intended-documented"));
     }
 
     /// I-4: a `search=` diff is excused only when kda-indexer said it cut the answer.
@@ -581,7 +696,7 @@ mod tests {
                 format!(
                     "[[entry]]\nid = \"k\"\nroute = \"*\"\njson_path_glob = \"/x\"\n\
                      condition = \"any\"\nreason = \"r\"\nruling = \"R-1\"\nowner_note = \"n\"\n\
-                     {extra}"
+                     accept_class = \"intended-documented\"\n{extra}"
                 ),
             )
             .unwrap();

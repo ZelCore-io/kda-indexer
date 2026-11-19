@@ -25,6 +25,10 @@
       Request totals per backend and the expected run time, from the caps and the latency
       assumptions in the config.
 
+  run.py rereferee --out DIR --cases DIR --md FILE
+      Re-classifies the stored diff and status records of DIR with the current allowlist (no
+      request is sent) and writes the aggregate counts, unexplained before and after.
+
   run.py report --out DIR
       DIR/report.md and DIR/summary.json: per endpoint, cases run, equal / allowlisted /
       known-gap / diff / status mismatch / stock error / ours error / not run, and latency
@@ -506,15 +510,16 @@ def normalize_pair(ep, ab, sb):
     return ab, sb
 
 
-def verdict_class(ep, cls, v, ours_codes, vars_, node):
-    """Class and allowlist ids after the suite allowlist (allow.py)."""
+def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None):
+    """Class and allowlist ids after the suite allowlist (allow.py). `tip`: the node's highest
+    height at ours' read and at stock's ({"ours", "stock"}), for the tip-timing rule."""
     c = v.get("class")
     ents = v.get("entries") or []
     if any(e.get("path") == "/~graphql-oracle-stall" for e in ents):
         return "stock-unavailable", []
     if c in ("diff", "status"):
         k, ids = allow.classify({"ep": ep, "cls": cls, "ours_codes": ours_codes, "entries": ents,
-                                 "vars": vars_, "node": node})
+                                 "vars": vars_, "node": node, "tip": tip})
         if k != "diff":
             return k, ids
     return c, []
@@ -550,6 +555,8 @@ class Runner:
         self.node = nodecheck.Node(Http(nd.get("timeout_s", 30)), nd["url"], nd.get("network", "mainnet01"),
                                    min(float(nd.get("rps", 20)), 20.0),
                                    float(nd.get("max_wait_s", 30))) if nd.get("url") else None
+        if self.node:
+            self.node.sample_tips()      # the tip log behind the tip-timing rule
         self.tip = None
         import queue
         self.search_src = queue.Queue()
@@ -656,7 +663,12 @@ class Runner:
                     node = None
                     if v.get("class") in ("diff", "status") and self.node and ep in NODE_EPS and a["status"] == 200:
                         node = row["node"] = self.node.check(ep, vars_, ab)
-                    k, ids = verdict_class(ep, case["cls"], v, codes, vars_, node)
+                    tip = None
+                    if v.get("class") in ("diff", "status") and self.node and ep in allow.TIP_EPS:
+                        tip = self.node.tip_pair(row["t"] - a["ms"] / 1000.0)
+                        if tip:
+                            row["tip"] = tip
+                    k, ids = verdict_class(ep, case["cls"], v, codes, vars_, node, tip)
                     row["v"] = {"class": k, "ids": (v.get("ids") or []) + ids, "known": v.get("known_ids"),
                                 "entries": v.get("entries")}
         (self.sample if lane == "sample" else self.res).write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -944,6 +956,13 @@ def report(out):
     lines += ["", "## Allowlist hits (suite rules and harness ids)", ""]
     for k, n in allow_ids.most_common():
         lines.append("- %s: %d" % (k, n))
+    by_class = collections.Counter()
+    acc = {x["id"]: x["accept_class"] for x in allow.table()}
+    for k, n in allow_ids.items():
+        by_class[acc.get(k, "harness-id (compare/allowlist.toml)")] += n
+    lines += ["", "## Allowlist hits by accept class", ""]
+    for k, n in by_class.most_common():
+        lines.append("- %s: %d" % (k, n))
     lines += ["", "## Node checks not done or failed (endpoint, reason)", ""]
     for (ep, w), n in node_why.most_common(40):
         lines.append("- %s %s: %d" % (ep, w, n))
@@ -964,6 +983,91 @@ def report(out):
                "classes": [[ep, k, pat, n, ids] for (ep, k, pat), (n, ids) in classes.items()]},
               open(os.path.join(out, "summary.json"), "w"), indent=1)
     print("\n".join(lines[:6]))
+
+
+def rereferee_rows(rows, vars_of):
+    """Re-classifies stored records with the current allowlist (allow.py), no request sent.
+    `rows`: iterable of (source, record); `vars_of(id)`: the case's GraphQL variables or None.
+    Only records stored as diff or status are looked at; the node check and tip pair the run
+    stored on the record are the evidence. Returns the tallies (see rereferee_md)."""
+    before, after = collections.Counter(), collections.Counter()
+    moved, left = collections.Counter(), collections.Counter()
+    origin = collections.defaultdict(lambda: [0, 0])      # rows imported from run 1 vs run 2's own
+    for src, r in rows:
+        v = r.get("v") or {}
+        if v.get("class") not in ("diff", "status"):
+            continue
+        before[src] += 1
+        og = origin[r.get("from") or "run2"]
+        og[0] += 1
+        k, ids = verdict_class(r["ep"], r.get("cls"), v, (r.get("ours") or {}).get("gql_errors") or [],
+                               vars_of(r["id"]) or {}, r.get("node"), r.get("tip"))
+        if k in ("diff", "status"):
+            after[src] += 1
+            left[r["ep"]] += 1
+            og[1] += 1
+        else:
+            moved[(r["ep"], ",".join(ids), k)] += 1
+    return {"before": dict(before), "after": dict(after), "moved": dict(moved), "left": dict(left),
+            "origin": dict(origin), "total_before": sum(before.values()), "total_after": sum(after.values())}
+
+
+def rereferee_md(out, name):
+    """Aggregate counts only: endpoints and rule ids, never a case id or a request."""
+    lines = ["# Re-referee of %s with the H2 harness" % name, "",
+             "Stored records only (diff and status rows of results.jsonl and sample.jsonl); no request sent. "
+             "The rules read the node check and the tip pair stored on each record.", "",
+             "- unexplained before: %d" % out["total_before"],
+             "- unexplained after: %d" % out["total_after"], "",
+             "| source | before | after |", "|---|---|---|"]
+    for src in sorted(out["before"]):
+        lines.append("| %s | %d | %d |" % (src, out["before"][src], out["after"].get(src, 0)))
+    lines += ["", "| origin | before | after |", "|---|---|---|"]
+    for og, (b, a) in sorted(out["origin"].items()):
+        lines.append("| %s | %d | %d |" % ("imported from run 1" if og == "run1" else "run 2's own rows", b, a))
+    lines += ["", "## Moved to explained (endpoint, rule, class: rows)", ""]
+    for (ep, ids, k), n in sorted(out["moved"].items(), key=lambda x: -x[1]):
+        lines.append("- %s, %s, %s: %d" % (ep, ids, k, n))
+    if not out["moved"]:
+        lines.append("- none")
+    lines += ["", "## Still unexplained, by endpoint", ""]
+    for ep, n in sorted(out["left"].items(), key=lambda x: -x[1]):
+        lines.append("- %s: %d" % (ep, n))
+    return "\n".join(lines) + "\n"
+
+
+def rereferee(out, cases_dir, md_path):
+    """run.py rereferee: DIR/results.jsonl and DIR/sample.jsonl re-classified, written to md_path."""
+    want = collections.defaultdict(set)
+    stored = []
+    for fname, src in (("results.jsonl", "results"), ("sample.jsonl", "sample")):
+        path = os.path.join(out, fname)
+        if not os.path.exists(path):
+            continue
+        for l in open(path):
+            if '"class":"diff"' not in l and '"class":"status"' not in l:
+                continue
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            if (r.get("v") or {}).get("class") in ("diff", "status"):
+                stored.append((src, r))
+                want[r["ep"]].add(r["id"])
+    vars_by = {}
+    for ep, ids in want.items():
+        fn = os.path.join(cases_dir, ep + ".jsonl.gz")
+        if not os.path.exists(fn):
+            continue
+        for l in gzip.open(fn, "rt"):
+            c = json.loads(l)
+            if c["id"] in ids:
+                vars_by[c["id"]] = (c.get("req") or {}).get("variables") or {}
+    res = rereferee_rows(stored, vars_by.get)
+    with open(md_path, "w") as f:
+        f.write(rereferee_md(res, os.path.basename(os.path.abspath(out))))
+    json.dump({k: v for k, v in res.items() if k != "moved"}, open(md_path + ".json", "w"))
+    print("unexplained before %d after %d" % (res["total_before"], res["total_after"]))
 
 
 def estimate(cfg, cases_dir):
@@ -1029,11 +1133,17 @@ def main():
     e.add_argument("--cases", required=True)
     p = sub.add_parser("report")
     p.add_argument("--out", required=True)
+    rr = sub.add_parser("rereferee")
+    rr.add_argument("--out", required=True, help="a run directory (results.jsonl, sample.jsonl)")
+    rr.add_argument("--cases", required=True)
+    rr.add_argument("--md", required=True, help="the markdown file to write (aggregate counts only)")
     a = ap.parse_args()
     if a.cmd == "run":
         Runner(tomllib.load(open(a.config, "rb")), a).run()
     elif a.cmd == "estimate":
         estimate(tomllib.load(open(a.config, "rb")), a.cases)
+    elif a.cmd == "rereferee":
+        rereferee(a.out, a.cases, a.md)
     else:
         report(a.out)
 

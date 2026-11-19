@@ -172,4 +172,40 @@ mod tests {
         p.stock.status = 500;
         assert_eq!(verdict(p, &allow, &[], 10_000).class, "status");
     }
+
+    /// H2 item 1: `transaction(minimumDepth: > 100)`. FIX-4 refuses it exactly like stock
+    /// (same code and message, no data), so the pair is `equal` and no allowlist entry is
+    /// needed; the pre-FIX-4 answer (ours returned the transaction) stays a diff.
+    #[test]
+    fn minimum_depth_over_100_refused_like_stock_is_equal() {
+        let allow = empty_allow();
+        let refusal = json!({"data": null, "errors": [{
+            "message": "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be higher than 100.",
+            "extensions": {"code": "INTERNAL_SERVER_ERROR"}}]});
+        let v = verdict(
+            pair(
+                "graphql",
+                "QTransactionByKey {}",
+                refusal.clone(),
+                refusal.clone(),
+            ),
+            &allow,
+            &[],
+            10_000,
+        );
+        assert_eq!(v.class, "equal", "{:?}", v.entries);
+        let answered = json!({"data": {"transaction": {"hash": "h"}}});
+        let v = verdict(
+            pair("graphql", "QTransactionByKey {}", answered, refusal),
+            &allow,
+            &[],
+            10_000,
+        );
+        assert_eq!(v.class, "diff");
+        assert!(
+            v.ids.is_empty(),
+            "no allowlist entry explains it: {:?}",
+            v.ids
+        );
+    }
 }

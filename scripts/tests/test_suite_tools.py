@@ -245,6 +245,112 @@ class Allowlist(unittest.TestCase):
             self.assertIn(r.verdict, ("DOCUMENTED", "STOCK-WRONG", "HARNESS", "KNOWN"))
             self.assertTrue(len(r.reason) > 20, r.id)
 
+    def test_every_rule_has_id_reason_accept_class_and_ruling(self):
+        # H2 item 6 (owner R-P5P9-162): the docs list every accepted difference with why.
+        ids = [r.id for r in allow.RULES]
+        self.assertEqual(len(ids), len(set(ids)))
+        for r in allow.RULES:
+            self.assertIn(r.accept, allow.ACCEPT_CLASSES, r.id)
+            self.assertTrue(len(r.ruling.strip()) > 10, r.id)
+        rows = allow.table()
+        self.assertEqual([x["id"] for x in rows], ids)
+        for x in rows:
+            self.assertEqual(sorted(x), ["accept_class", "id", "reason", "ruling"])
+        self.assertEqual({x["accept_class"] for x in rows} - set(allow.ACCEPT_CLASSES), set())
+        by = {x["id"]: x["accept_class"] for x in rows}
+        self.assertEqual(by["pactQuery-not-supported"], "unsupported-by-design")
+        self.assertEqual(by["lastBlockHeight-tip-race"], "tip-timing")
+        self.assertEqual(by["networkInfo-stock-error"], "stock-wrong-node-evidence")
+        self.assertEqual(by["ours-refuses-lenient-input"], "intended-documented")
+
+    def test_transaction_min_depth_has_no_rule(self):
+        # H2 item 1: refused like stock after FIX-4 -> `equal`; nothing here explains it.
+        ent = [E_("/data/transaction", "Type", "{}", "None"), E_("/errors", "Missing", None, "[{'code': 'INTERNAL_SERVER_ERROR'}]")]
+        self.assertEqual(self.cls("gql.transaction", ent, c="edge", vars_={"minimumDepth": 101})[0], "diff")
+        self.assertFalse([r for r in allow.RULES if r.eps and "gql.transaction" in r.eps])
+
+    def order_ents(self, root="events", n=2, extra=()):
+        out = []
+        for i in range(n):
+            out += [E_("/data/%s/edges/%d/node/id" % (root, i), "Changed", "x%d" % i, "y%d" % i),
+                    E_("/data/%s/edges/%d/node/requestKey" % (root, i), "Changed", "x%d" % i, "y%d" % i)]
+        return out + list(extra)
+
+    def test_multi_block_order(self):
+        ok = {"ok": True}
+        v = {"qualifiedEventName": "coin.TRANSFER", "chainId": "19", "minHeight": 10, "maxHeight": 11, "first": 10}
+        k, ids = self.cls("gql.events", self.order_ents(), c="real", vars_=v, node=ok)
+        self.assertEqual((k, ids), ("allowlisted", ["multi-block-order"]))
+        k, ids = self.cls("gql.transactions", self.order_ents("transactions"), c="real", vars_={"first": 10}, node=ok)
+        self.assertEqual(ids, ["multi-block-order"])
+        # the node must have passed for this row
+        self.assertEqual(self.cls("gql.events", self.order_ents(), c="real", vars_=v, node=None)[0], "diff")
+        self.assertEqual(self.cls("gql.events", self.order_ents(), c="real", vars_=v, node={"ok": False})[0], "diff")
+        # a single-block list is in node order since FIX-4: a diff there stays open
+        for one in ({"blockHash": "B" * 43}, {"requestKey": "R" * 43},
+                    {"chainId": "19", "minHeight": 10, "maxHeight": 10}):
+            self.assertEqual(self.cls("gql.events", self.order_ents(), c="real", vars_=dict(v, **one), node=ok)[0], "diff")
+        # a row whose identity is the same but a field differs is a real diff
+        field = [E_("/data/events/edges/0/node/parameters", "Changed", "[1]", "[2]")]
+        self.assertEqual(self.cls("gql.events", field, c="real", vars_=v, node=ok)[0], "diff")
+        # an identity change at one edge only, with a field change at another: still open
+        mixed = self.order_ents(n=1, extra=[E_("/data/events/edges/1/node/parameters", "Changed", "[1]", "[2]")])
+        self.assertEqual(self.cls("gql.events", mixed, c="real", vars_=v, node=ok)[0], "diff")
+        # a count or a page-info difference is not an order difference
+        cnt = self.order_ents(extra=[E_("/data/events/totalCount", "Changed", 3, 4)])
+        self.assertEqual(self.cls("gql.events", cnt, c="real", vars_=v, node=ok)[0], "diff")
+        # other endpoints are not covered
+        self.assertEqual(self.cls("gql.blocksFromHeight", self.order_ents("blocksFromHeight"), c="real", vars_=v, node=ok)[0], "diff")
+
+    def test_stock_orphan_count(self):
+        ent = [E_("/data/transactionsByPublicKey/totalCount", "Changed", 1825, 1827)]
+        ep = "gql.transactionsByPublicKey"
+        self.assertEqual(self.cls(ep, ent, node={"ok": True, "stock_orphans": 2}), ("allowlisted", ["totalcount-stock-orphans"]))
+        self.assertEqual(self.cls(ep, ent, node={"ok": True, "stock_orphans": 3})[1], ["totalcount-stock-orphans"])
+        # fewer confirmed orphans than the gap, no evidence, or the node check failed: a diff
+        self.assertEqual(self.cls(ep, ent, node={"ok": True, "stock_orphans": 1})[0], "diff")
+        self.assertEqual(self.cls(ep, ent, node={"ok": True})[0], "diff")
+        self.assertEqual(self.cls(ep, ent, node=None)[0], "diff")
+        self.assertEqual(self.cls(ep, ent, node={"ok": False, "stock_orphans": 5})[0], "diff")
+        # ours above stock is never an orphan count
+        self.assertEqual(self.cls(ep, [E_("/data/transactionsByPublicKey/totalCount", "Changed", 1827, 1825)],
+                                  node={"ok": True, "stock_orphans": 9})[0], "diff")
+        # only the count is explained
+        both = ent + [E_("/data/transactionsByPublicKey/edges/0/node/hash", "Changed", "a", "b")]
+        self.assertEqual(self.cls(ep, both, node={"ok": True, "stock_orphans": 2})[0], "diff")
+
+    def test_tip_timing(self):
+        ent = [E_("/data/blocksFromDepth/edges/1/node/hash", "Changed", "a", "b"),
+               E_("/data/blocksFromDepth/edges/2/node/hash", "Changed", "b", "c")]
+
+        def go(ep, ents, tip, vars_=None):
+            return allow.classify({"ep": ep, "cls": "entity", "ours_codes": [], "entries": ents, "vars": vars_ or {},
+                                   "node": None, "tip": tip})
+        self.assertEqual(go("gql.blocksFromDepth", ent, {"ours": 100, "stock": 101}), ("allowlisted", ["tip-timing"]))
+        self.assertEqual(go("gql.blocksFromDepth", ent, {"ours": 100, "stock": 100 + allow.TIP_WINDOW})[1], ["tip-timing"])
+        # the window is bounded, and unrecorded or unmoved heights explain nothing
+        self.assertEqual(go("gql.blocksFromDepth", ent, {"ours": 100, "stock": 101 + allow.TIP_WINDOW})[0], "diff")
+        self.assertEqual(go("gql.blocksFromDepth", ent, {"ours": 100, "stock": 100})[0], "diff")
+        self.assertEqual(go("gql.blocksFromDepth", ent, {"ours": None, "stock": 101})[0], "diff")
+        self.assertEqual(go("gql.blocksFromDepth", ent, None)[0], "diff")
+        # a list pinned to a height window or a cursor does not move with the tip
+        lst = [E_("/data/transfers/edges/0/node/requestKey", "Changed", "a", "b")]
+        self.assertEqual(go("gql.transfers", lst, {"ours": 5, "stock": 6}, {"first": 1})[0], "allowlisted")
+        self.assertEqual(go("gql.transfers", lst, {"ours": 5, "stock": 6}, {"first": 1, "maxHeight": 3})[0], "diff")
+        self.assertEqual(go("gql.transfers", lst, {"ours": 5, "stock": 6}, {"first": 1, "after": "c"})[0], "diff")
+        # errors and status differences are not timing
+        err = [E_("/errors/0/code", "Changed", "A", "B")]
+        self.assertEqual(go("gql.blocksFromDepth", err, {"ours": 5, "stock": 6})[0], "diff")
+        # other endpoints are not tip-anchored
+        self.assertEqual(go("gql.fungibleAccount", ent, {"ours": 5, "stock": 6})[0], "diff")
+
+    def test_tip_pair_from_samples(self):
+        log = [(100.0, 50), (110.0, 51), (125.0, 52)]
+        self.assertEqual(allow.tip_before(log, 112.0), 51)
+        self.assertEqual(allow.tip_before(log, 99.0), None)
+        # a sample older than the freshness bound is not a reading at that time
+        self.assertEqual(allow.tip_before(log, 125.0 + allow.TIP_SAMPLE_AGE + 1), None)
+
 
 def blk(h, c, x):
     return {"node": {"hash": x, "height": h, "chainId": str(c)}}
@@ -289,10 +395,121 @@ class NodeChecks(unittest.TestCase):
         t = {"data": {"transfers": {"edges": [{"node": {"requestKey": "r1"}}, {"node": {"requestKey": "r1"}}]}}}
         self.assertEqual(N.check_tx_list("gql.transfers", {}, t, N.tx_rows("gql.transfers", t), {}), [])
 
+    def test_self_transfer_listed_twice(self):
+        # run-2 triage class 14: /txs/account lists a self-transfer as sender and as receiver
+        def row(rk, frm, to, order=3):
+            return {"node": {"requestKey": rk, "chainId": "14", "blockHash": "B", "orderIndex": order,
+                             "fromAccount": frm, "toAccount": to}}
+
+        def chk(ep, edges, v=None):
+            body = {"data": {"transfers": {"edges": edges}}} if ep == "gql.transfers" else [e["node"] for e in edges]
+            return N.check_tx_list(ep, v or {}, body, N.tx_rows(ep, body), {})
+        s = row("r1", "alice", "alice")
+        self.assertEqual(chk("gql.transfers", [s, s], {"accountName": "alice"}), [])
+        self.assertIn("duplicate", chk("gql.transfers", [s, s, s], {"accountName": "alice"}))
+        t = row("r2", "alice", "bob")
+        self.assertIn("duplicate", chk("gql.transfers", [t, t], {"accountName": "alice"}))
+        # only on the account-filtered lists
+        self.assertIn("duplicate", chk("gql.transfers", [s, s]))
+        body = [{"requestKey": "r1", "chain": 14, "blockHash": "B", "idx": 3, "fromAccount": "alice", "toAccount": "alice"}] * 2
+        self.assertEqual(N.check_tx_list("compat.account", {}, body, N.tx_rows("compat.account", body), {}), [])
+        self.assertIn("duplicate", N.check_tx_list("compat.account", {}, body * 2, N.tx_rows("compat.account", body * 2), {}))
+        body2 = [dict(body[0], toAccount="bob")] * 2
+        self.assertIn("duplicate", N.check_tx_list("compat.account", {}, body2, N.tx_rows("compat.account", body2), {}))
+
+    def test_tip_race_is_not_a_failure(self):
+        # a mismatch within TIP_DEPTH of the tip can be a reorg between the two reads
+        canon = {(2, 98): "n98", (2, 50): "n50"}
+        near = [(2, 98, "o98")]
+        p = N.check_block_range("gql.blocksFromHeight", {}, near, canon, {2: 100})
+        self.assertEqual(p, ["tip-race"])
+        self.assertEqual(N.failures(p), [])
+        far = [(2, 50, "o50")]
+        p = N.check_block_range("gql.blocksFromHeight", {}, far, canon, {2: 100})
+        self.assertEqual(p, ["not-canonical"])
+        self.assertEqual(N.failures(p), ["not-canonical"])
+        # both kinds: the deep one still fails
+        p = N.check_block_range("gql.blocksFromHeight", {}, far + near, canon, {2: 100})
+        self.assertEqual(N.failures(p), ["not-canonical"])
+
+    def test_tip_pair_reads_the_log_and_a_fresh_cut(self):
+        class Http:
+            def __init__(self):
+                self.h = 100
+
+            def call(self, base, path="", body=None, accept=None):
+                self.h += 1
+                return {"status": 200, "raw": json.dumps({"hashes": {"0": {"height": self.h, "hash": "x"},
+                                                                    "1": {"height": self.h - 1, "hash": "y"}}})}
+        n = N.Node(Http(), "http://node", "mainnet01", rps=1000)
+        n.tips()                                   # first read: logged at the current time
+        t0 = n.tip_log[-1][0]
+        self.assertEqual(n.tip_log[-1][1], 101)
+        pair = n.tip_pair(t0 + 1)                  # ours read 1 s after the sample; a fresh cut now
+        self.assertEqual(pair, {"ours": 101, "stock": 102})
+        # no fresh-enough sample before ours' read: nothing recorded
+        self.assertIsNone(n.tip_pair(t0 - 1000))
+
+    def test_orphan_evidence(self):
+        canon = {(1, 10): "good", (1, 11): "ok2"}
+        rows = [(1, 10, "orphan"), (1, 11, "ok2"), (1, 12, "x")]
+        self.assertEqual(N.orphan_evidence(rows, canon), {"stock_orphans": 1, "unresolved": 1})
+        self.assertEqual(N.orphan_evidence([], canon), {"stock_orphans": 0, "unresolved": 0})
+
     def test_tip_slack(self):
         rows = [(0, 12, None)]
         self.assertEqual(N.check_block_range("gql.completedBlockHeights", {}, rows, {}, {0: 10}), [])
         self.assertIn("above-tip", N.check_block_range("gql.completedBlockHeights", {}, rows, {}, {0: 8}))
+
+
+class Rereferee(unittest.TestCase):
+    """H2 part B: stored records re-classified with the current allowlist; no request is sent."""
+
+    def rec(self, id, ep, klass, ents, node=None, tip=None, st=200, codes=()):
+        r = {"id": id, "ep": ep, "cls": "real", "t": 1, "cov": "stock-sample",
+             "ours": {"st": 200, "ms": 1, "gql_errors": list(codes)}, "stock": {"host": "h", "st": st, "ms": 1},
+             "v": {"class": klass, "ids": [], "known": [], "entries": ents}}
+        if node is not None:
+            r["node"] = node
+        if tip is not None:
+            r["tip"] = tip
+        return r
+
+    def test_counts_before_and_after(self):
+        order = [E_("/data/events/edges/0/node/id", "Changed", "a", "b"),
+                 E_("/data/events/edges/0/node/requestKey", "Changed", "a", "b")]
+        field = [E_("/data/events/edges/0/node/parameters", "Changed", "1", "2")]
+        rows = [
+            ("sample", self.rec("gql.events:5", "gql.events", "diff", order, node={"ok": True})),
+            ("sample", self.rec("gql.events:6", "gql.events", "diff", field, node={"ok": True})),
+            ("results", self.rec("gql.events:7", "gql.events", "status", order, node={"ok": True}, st=500)),
+            ("results", self.rec("gql.events:8", "gql.events", "equal", [])),
+            ("results", self.rec("gql.events:9", "gql.events", "allowlisted", order)),
+        ]
+        vars_of = {"gql.events:5": {"first": 10}, "gql.events:6": {"first": 10}, "gql.events:7": {"first": 10},
+                   "gql.events:8": {}, "gql.events:9": {}}
+        out = run.rereferee_rows(rows, vars_of.get)
+        self.assertEqual(out["before"], {"sample": 2, "results": 1})
+        self.assertEqual(out["after"], {"sample": 1})
+        self.assertEqual(out["total_before"], 3)
+        self.assertEqual(out["total_after"], 1)
+        self.assertEqual(out["moved"], {("gql.events", "multi-block-order", "allowlisted"): 2})
+        self.assertEqual(out["left"], {"gql.events": 1})
+        self.assertEqual(out["origin"], {"run2": [3, 1]})
+        md = run.rereferee_md(out, "run2")
+        self.assertIn("unexplained before: 3", md)
+        self.assertIn("unexplained after: 1", md)
+        self.assertIn("multi-block-order", md)
+        self.assertNotIn("gql.events:5", md)       # aggregate counts only: no case ids, no request contents
+
+    def test_stored_tip_and_node_evidence_are_used(self):
+        ent = [E_("/data/blocksFromDepth/edges/1/node/hash", "Changed", "a", "b")]
+        rows = [("sample", self.rec("a:1", "gql.blocksFromDepth", "diff", ent, tip={"ours": 5, "stock": 6})),
+                ("sample", self.rec("a:2", "gql.blocksFromDepth", "diff", ent))]
+        rows[1][1]["from"] = "run1"
+        out = run.rereferee_rows(rows, lambda i: {})
+        self.assertEqual((out["total_before"], out["total_after"]), (2, 1))
+        self.assertEqual(out["origin"], {"run2": [1, 0], "run1": [1, 1]})
 
 
 class Import(unittest.TestCase):

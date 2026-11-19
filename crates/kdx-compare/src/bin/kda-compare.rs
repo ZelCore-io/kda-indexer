@@ -116,6 +116,9 @@ enum Cmd {
     /// `kdx_compare::pair`) and print one verdict line each, with the harness's normalisers,
     /// `[graphql] field_rules` and allowlist. Sends no request.
     PairDiff,
+    /// The allowlist as one JSON line per entry: id, reason, accept class, ruling (H2 item 6,
+    /// owner R-P5P9-162; the docs list every accepted difference with why). Sends no request.
+    AllowlistTable,
     /// P3 gate: per route and pair, requests compared, unexplained diffs, allowlisted hits,
     /// errors and p50/p99 per side over the summary files in `out_dir`. Exit 0 iff green.
     Summary {
@@ -194,6 +197,16 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::PairDiff => pair_diff(&cfg),
+        Cmd::AllowlistTable => {
+            for r in Allowlist::load(&cfg.allowlist)?.table() {
+                println!(
+                    "{}",
+                    serde_json::json!({"id": r.id, "reason": r.reason,
+                        "accept_class": r.accept_class, "ruling": r.ruling})
+                );
+            }
+            Ok(())
+        }
         Cmd::Summary {
             since,
             routes,
