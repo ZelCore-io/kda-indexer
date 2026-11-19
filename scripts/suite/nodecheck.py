@@ -11,6 +11,7 @@ fetches them under its own rate cap (one read per chain at most, cached).
 
 import collections
 import json
+import re
 import threading
 import time
 import urllib.parse
@@ -19,6 +20,7 @@ BRANCH_MAX = 360          # header/branch rows per read
 SAMPLE_ROWS = 10          # rows per answer checked against /poll
 MAX_CHAINS = 4            # chains per answer checked
 TIP_SLACK = 3             # blocks the tip may move between ours' answer and the node read
+RK_RE = re.compile(r"[A-Za-z0-9_-]{43}")   # a request key (pseudo keys like <coinbase> are not polled)
 
 
 def _get(d, *path):
@@ -66,7 +68,7 @@ def check_block_range(ep, v, rows, canon, tips):
         if x is not None and (c, h) in canon and canon[(c, h)] != x:
             p.append("not-canonical")
             break
-    if any(h > tips.get(c, h) + 1 for c, h, _ in rows):
+    if any(h > tips.get(c, h) + TIP_SLACK for c, h, _ in rows):
         p.append("above-tip")
     hs = [h for _, h, _ in rows]
     if ep == "gql.blocksFromHeight":
@@ -117,23 +119,27 @@ def sample_rows(rows, n=SAMPLE_ROWS):
 
 
 def check_tx_list(ep, v, body, rows, polled):
-    """Problems with a tx/transfer list. `polled`: {rk: poll metaData or None (not on node)}
-    for the rows that were checked; rows not in `polled` were not checked."""
+    """Problems with a tx/transfer list. `polled`: {(chain, rk): poll metaData or None (not
+    on node)} for the rows that were checked; rows not in `polled` were not checked. Genesis
+    request keys repeat across chains, so a height-0 answer is not compared by block."""
     p = []
     for r in rows:
-        if r["rk"] not in polled:
+        m = polled.get((r["chain"], r["rk"]), False)
+        if m is False:
             continue
-        m = polled[r["rk"]]
         if m is None:
             p.append("missing-on-node")
             break
-        if r["block"] and m.get("blockHash") and m["blockHash"] != r["block"]:
+        if r["block"] and m.get("blockHash") and m.get("blockHeight") != 0 and m["blockHash"] != r["block"]:
             p.append("block-differs")
             break
     if ep == "gql.transactions" and v.get("accountName") and not v.get("fungibleName"):
         if any(r["sender"] is not None and r["sender"] != v["accountName"] for r in rows):
             p.append("sender")
-    keys = [(r["rk"], r["block"], r["order"]) for r in rows]
+    # Duplicates only where a row is identified: a tx by (rk, block), a transfer or event by
+    # (rk, block, orderIndex). A min selection without those fields is not checked.
+    tx_list = ep in ("gql.transactions", "gql.transactionsByPublicKey", "compat.txs")
+    keys = [(r["rk"], r["block"], r["order"]) for r in rows if r["block"] and (tx_list or r["order"] is not None)]
     if len(set(keys)) != len(keys):
         p.append("duplicate")
     _, conn = _edges(ep, body)
@@ -222,7 +228,7 @@ class Node:
 
     def poll(self, chain, rks):
         ans = self._call("/chain/%d/pact/api/v1/poll" % chain, body={"requestKeys": rks})
-        return {rk: (ans[rk].get("metaData") or {}) if rk in ans else None for rk in rks}
+        return {(chain, rk): (ans[rk].get("metaData") or {}) if rk in ans else None for rk in rks}
 
     def check(self, ep, v, body):
         """{"ok", "why", "rows"} or None when the answer has nothing the node can check."""
@@ -248,7 +254,7 @@ class Node:
             polled = {}
             by = collections.defaultdict(list)
             for r in sample_rows(rows):
-                if r["chain"] is not None:
+                if r["chain"] is not None and RK_RE.fullmatch(r["rk"]):
                     by[r["chain"]].append(r["rk"])
             for c in sorted(by)[:3]:
                 polled.update(self.poll(c, sorted(set(by[c]))))

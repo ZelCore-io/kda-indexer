@@ -228,6 +228,12 @@ class Allowlist(unittest.TestCase):
         self.assertEqual(self.cls("gql.completedBlockHeights", ent, vars_={"chainIds": []}, node=None)[0], "diff")
         self.assertEqual(self.cls("gql.completedBlockHeights", ent, vars_={"chainIds": ["4"]}, node={"ok": True})[0], "diff")
 
+    def test_node_undecodable_id(self):
+        ent = [E_("/data", "Type", "None", "{'node': None}"), E_("/errors", "Extra", "[]")]
+        self.assertEqual(self.cls("gql.node", ent, ["BAD_USER_INPUT"], "entity", {"id": "AAAA"})[0], "allowlisted")
+        good = E.encode_id("Block", "abc")
+        self.assertEqual(self.cls("gql.node", ent, ["BAD_USER_INPUT"], "entity", {"id": good})[0], "diff")
+
     def test_ours_bugs_stay_open(self):
         self.assertEqual(self.cls("gql.fungibleChainAccounts", [E_("/data/fungibleChainAccounts", "Type", "None", "[]")])[0], "diff")
         self.assertEqual(self.cls("gql.gasLimitEstimate", [E_("/data", "Type", "None", "{'gasLimitEstimate': []}"),
@@ -267,14 +273,26 @@ class NodeChecks(unittest.TestCase):
         body = {"data": {"transactions": {"totalCount": 2, "pageInfo": {"hasNextPage": False, "hasPreviousPage": False},
                                           "edges": [tx("r1", "0", "alice", "B1"), tx("r2", "1", "alice", "B2")]}}}
         rows = N.tx_rows("gql.transactions", body)
-        polled = {"r1": {"blockHash": "B1"}, "r2": {"blockHash": "B2"}}
+        polled = {(0, "r1"): {"blockHash": "B1"}, (1, "r2"): {"blockHash": "B2"}}
         self.assertEqual(N.check_tx_list("gql.transactions", {"accountName": "alice"}, body, rows, polled), [])
         body["data"]["transactions"]["edges"].append(tx("r1", "0", "bob", "B1"))
-        polled2 = {"r1": {"blockHash": "B1"}, "r2": None}
+        polled2 = {(0, "r1"): {"blockHash": "B1"}, (1, "r2"): None}
         p = N.check_tx_list("gql.transactions", {"accountName": "alice"}, body, N.tx_rows("gql.transactions", body), polled2)
         for k in ("missing-on-node", "sender", "duplicate", "totalCount"):
             self.assertIn(k, p)
         self.assertEqual(N.sample_rows(list(range(40)), 10), [0, 1, 2, 3, 4, 35, 36, 37, 38, 39])
+        # genesis keys repeat across chains: a height-0 poll answer is not compared by block
+        g = {"data": {"transactions": {"edges": [tx("r1", "0", "alice", "G5")]}}}
+        self.assertEqual(N.check_tx_list("gql.transactions", {}, g, N.tx_rows("gql.transactions", g),
+                                         {(0, "r1"): {"blockHash": "G0", "blockHeight": 0}}), [])
+        # two transfers of one tx in a min selection are not duplicates
+        t = {"data": {"transfers": {"edges": [{"node": {"requestKey": "r1"}}, {"node": {"requestKey": "r1"}}]}}}
+        self.assertEqual(N.check_tx_list("gql.transfers", {}, t, N.tx_rows("gql.transfers", t), {}), [])
+
+    def test_tip_slack(self):
+        rows = [(0, 12, None)]
+        self.assertEqual(N.check_block_range("gql.completedBlockHeights", {}, rows, {}, {0: 10}), [])
+        self.assertIn("above-tip", N.check_block_range("gql.completedBlockHeights", {}, rows, {}, {0: 8}))
 
 
 class Import(unittest.TestCase):

@@ -69,9 +69,10 @@ def load_error(st):
 # Ours runs every search under one gate: `search.concurrency` (4) at once, one per client
 # (docs/api.md). Search cases hold one of `[ours] search_sources` (4 addresses) while in flight.
 # Event queries with a parameter filter go through the same gate (seen in run 2: a 429 on
-# compat /txs/events), so they hold a search source too.
+# compat /txs/events), so they hold a search source too; so does /v1/txs (ours 503 in 0 ms
+# when the gate is full).
 SEARCH_EPS = {"compat.search", "compat.pactid", "native.search_code", "native.search_events",
-              "compat.events", "native.events"}
+              "compat.events", "native.events", "compat.v1txs"}
 
 
 class Bucket:

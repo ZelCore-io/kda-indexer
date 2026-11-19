@@ -10,6 +10,7 @@ Each rule names its verdict and reason (suite-run1-triage.md sections in bracket
 OURS-BUG classes have no rule here: they stay open diffs until ours is fixed.
 """
 
+import base64
 import re
 
 
@@ -135,6 +136,23 @@ def _ours_refuses(ctx):
                 or (e["path"] == "/errors" and e["kind"] == "Extra"))
 
 
+def _undecodable(i):
+    """True when a node id is not Kadena's `<Type>:<key>` layout in standard base64."""
+    try:
+        raw = base64.b64decode(str(i), validate=True).decode()
+    except Exception:
+        return True
+    return re.fullmatch(r"[A-Za-z]+:.+", raw, re.S) is None
+
+
+def _node_bad_id(ctx):
+    v = ctx.get("vars") or {}
+    ids = v.get("ids") if ctx["ep"] == "gql.nodes" else [v.get("id")]
+    if not isinstance(ids, list) or not any(_undecodable(i) for i in ids):
+        return set()
+    return _ours_refuses(ctx)
+
+
 def _keyset_guard(ctx):
     out = set()
     ents = ctx["entries"]
@@ -206,6 +224,10 @@ RULES = [
          "cannot decode with BAD_USER_INPUT; stock coerces it (JavaScript Number()) or answers null "
          "[triage 7c, 1]. Edge and invalid classes only.",
          None, _ours_refuses, classes=BAD),
+    Rule("node-undecodable-id", "DOCUMENTED",
+         "node/nodes with an id that does not decode to <Type>:<key>: ours BAD_USER_INPUT (docs Blocks and "
+         "network), stock null; any case class, checked on the request's ids [triage 1].",
+         {"gql.node", "gql.nodes"}, _node_bad_id),
     Rule("guard-keyset-reference", "DOCUMENTED",
          "A resolved r: keyset reference is a KeysetGuard on ours, a RawGuard on stock (docs Accounts) "
          "[triage 5, 7d].", None, _keyset_guard),
