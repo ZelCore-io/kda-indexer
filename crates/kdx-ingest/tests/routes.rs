@@ -68,6 +68,7 @@ fn api_state(dir: &std::path::Path, ctx: &kdx_ingest::Ctx) -> Arc<kdx_api::ApiSt
         max_in_flight: 16,
         max_body_bytes: 8 << 20,
         v1txs_max_body_bytes: 8 << 20,
+        v1txs_deadline: std::time::Duration::from_secs(30),
         rate_per_ip: 1000,
         rate_burst: 1000,
         trusted_proxies: Vec::new(),

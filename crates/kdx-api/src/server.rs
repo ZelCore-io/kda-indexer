@@ -32,6 +32,9 @@ pub struct ApiSettings {
     pub max_in_flight: usize,
     pub max_body_bytes: usize,
     pub v1txs_max_body_bytes: usize,
+    /// Deadline of a `/v1/txs` request (kda-txs answers within 30 s); every other request
+    /// has `deadline`.
+    pub v1txs_deadline: Duration,
     pub rate_per_ip: u32,
     pub rate_burst: u32,
     pub trusted_proxies: Vec<IpNet>,
@@ -230,6 +233,17 @@ impl ApiState {
             .await
     }
 
+    /// `read_heavy` with its own time budget instead of `settings.deadline`: `/v1/txs`
+    /// (`settings.v1txs_deadline`). The budget also bounds the waits for the slots.
+    pub async fn read_heavy_for<T, F>(self: &Arc<Self>, budget: Duration, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        self.read_on(Some(&self.heavy), &self.reads, budget, f)
+            .await
+    }
+
     /// Take `n` more rate tokens for the client of this request (the guard took one): a
     /// GraphQL batch of N takes N. False when the client has fewer left.
     pub fn allow_extra(&self, peer: SocketAddr, headers: &axum::http::HeaderMap, n: u32) -> bool {
@@ -380,10 +394,10 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
                 .into_response();
         }
     }
-    let cap = if req.uri().path().starts_with("/v1/txs") {
-        st.settings.v1txs_max_body_bytes
+    let (cap, deadline) = if req.uri().path().starts_with("/v1/txs") {
+        (st.settings.v1txs_max_body_bytes, st.settings.v1txs_deadline)
     } else {
-        st.settings.max_body_bytes
+        (st.settings.max_body_bytes, st.settings.deadline)
     };
     let delay = debug_delay();
     let client = req
@@ -399,7 +413,7 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
             None => next.run(req).await,
         }
     };
-    let resp = match tokio::time::timeout(st.settings.deadline, run).await {
+    let resp = match tokio::time::timeout(deadline, run).await {
         Ok(r) => r,
         Err(_) => return ApiError::Deadline.into_response(),
     };
@@ -676,6 +690,7 @@ mod tests {
             max_in_flight: 16,
             max_body_bytes: 1 << 20,
             v1txs_max_body_bytes: 1 << 20,
+            v1txs_deadline: std::time::Duration::from_secs(30),
             rate_per_ip: 20,
             rate_burst: 40,
             trusted_proxies: Vec::new(),
@@ -924,5 +939,143 @@ mod tests {
         }
         assert_eq!(st.heavy_clients.users(bucket_key(a)), 0);
         assert_eq!(st.heavy.available_permits(), 2);
+    }
+
+    /// FIX-4 part B (B1): `read_heavy_for` gives the read the budget passed in (the view's
+    /// deadline), not `settings.deadline`.
+    #[tokio::test]
+    async fn read_heavy_for_reads_with_its_own_budget() {
+        let (_d, store) = crate::testutil::store();
+        // settings(): a 500 ms deadline.
+        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let slow = |v: &View| {
+            std::thread::sleep(Duration::from_millis(700));
+            v.check_deadline()
+        };
+        assert!(matches!(st.read_heavy(slow).await, Err(ApiError::Deadline)));
+        assert!(st
+            .read_heavy_for(Duration::from_secs(5), slow)
+            .await
+            .is_ok());
+        assert!(matches!(
+            st.read_heavy_for(Duration::from_millis(100), slow).await,
+            Err(ApiError::Deadline)
+        ));
+    }
+
+    /// Block `height` on chain 0: `n` user txs of k:alice, each one `coin.TRANSFER` to k:bob.
+    fn transfer_block(height: u32, n: usize) -> kdx_decode::DecodedBlock {
+        use kdx_types::hash::b64url_encode;
+        use serde_json::json;
+        let h32 = |tag: u8| {
+            let mut b = [tag; 32];
+            b[0] = (height >> 8) as u8;
+            b[1] = height as u8;
+            b
+        };
+        let txs: Vec<_> = (0..n)
+            .map(|i| {
+                let cmd = json!({
+                    "payload": {"exec": {"data": null, "code": format!("(t {height} {i})")}},
+                    "meta": {"sender": "k:alice", "chainId": "0",
+                             "creationTime": 1_700_000_000u64 + u64::from(height),
+                             "gasLimit": 1000, "gasPrice": 1e-8, "ttl": 600},
+                    "signers": [{"pubKey": "alice-key"}],
+                    "nonce": format!("n-{height}-{i}"),
+                    "networkId": "mainnet01",
+                })
+                .to_string();
+                let rk = kdx_types::blake2b_256(cmd.as_bytes()).to_b64url();
+                let tx = serde_json::to_vec(&json!({"hash": rk, "sigs": [{"sig": "ab"}], "cmd": cmd}))
+                    .unwrap();
+                // The node's key order (the decoder checks it).
+                let ev = json!({"params": ["k:alice", "k:bob", 1.5], "name": "TRANSFER",
+                    "module": {"namespace": null, "name": "coin"},
+                    "moduleHash": b64url_encode(&[11; 32])});
+                let out = serde_json::to_vec(&json!({"gas": 1,
+                    "result": {"status": "success", "data": 1}, "reqKey": rk, "logs": null,
+                    "events": [ev], "metaData": null, "continuation": null, "txId": null}))
+                .unwrap();
+                json!([b64url_encode(&tx), b64url_encode(&out)])
+            })
+            .collect();
+        let cb = serde_json::to_vec(&json!({"gas": 0, "result": {"status": "success", "data": "ok"},
+            "reqKey": b64url_encode(&h32(0xCB)), "logs": null, "events": [],
+            "metaData": null, "continuation": null, "txId": null}))
+        .unwrap();
+        let miner = br#"{"account":"k:miner","predicate":"keys-all","public-keys":["m"]}"#;
+        let payload_hash = b64url_encode(&h32(0xA4));
+        let parent = {
+            let mut b = [0xB0; 32];
+            b[0] = (height.saturating_sub(1) >> 8) as u8;
+            b[1] = height.saturating_sub(1) as u8;
+            b
+        };
+        let header = json!({
+            "nonce": "1", "creationTime": 1_700_000_000_000_000u64 + u64::from(height) * 30_000_000,
+            "parent": b64url_encode(&parent), "adjacents": {"5": b64url_encode(&h32(0xAD))},
+            "target": b64url_encode(&[0xff; 32]), "payloadHash": payload_hash, "chainId": 0,
+            "weight": b64url_encode(&[1; 32]), "height": height, "chainwebVersion": "mainnet01",
+            "epochStart": 1, "featureFlags": 0, "hash": b64url_encode(&h32(0xB0))
+        });
+        let payload = json!({
+            "transactions": txs, "minerData": b64url_encode(miner),
+            "transactionsHash": b64url_encode(&h32(0xA7)),
+            "outputsHash": b64url_encode(&h32(0xA8)),
+            "payloadHash": payload_hash, "coinbase": b64url_encode(&cb),
+        });
+        kdx_decode::decode_block(&header, &payload).expect("block decodes")
+    }
+
+    /// FIX-4 part B (B1): `/v1/txs` reads within `v1txs_deadline` (kda-txs' own 30 s), not
+    /// the per-request deadline, so `limit=10000` on a big account answers; the other routes
+    /// keep the per-request deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v1txs_has_its_own_deadline() {
+        use tower::ServiceExt;
+        // The store is opened on the written hot store (its dictionary is read at open).
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+        {
+            let mut w = hot.rw().unwrap();
+            let mut dict = kdx_hot::HotDict::load(&w).unwrap();
+            for h in 1..=100 {
+                let ib = kdx_decode::index_block(
+                    &transfer_block(h, 100),
+                    &kdx_decode::VerifyReport::default(),
+                    &mut dict,
+                )
+                .unwrap();
+                kdx_hot::tail::apply(&mut w, &ib, &mut dict).unwrap();
+            }
+            dict.persist(&mut w).unwrap();
+            w.commit().unwrap();
+        }
+        let store = Arc::new(crate::store::Store::open(hot, d.path()).unwrap());
+        let mut cfg = settings(4);
+        // Shorter than any read of this store; /v1/txs has its own budget.
+        cfg.deadline = Duration::from_millis(1);
+        cfg.v1txs_deadline = Duration::from_secs(30);
+        cfg.v1txs_max_body_bytes = 64 << 20;
+        let st = Api::new(store, cfg, TipWatch::default()).state();
+        let search = crate::search::SearchCtx::new(crate::compat::SearchSettings::default(), None);
+        let app = crate::compat::router(search)
+            .layer(middleware::from_fn_with_state(st.clone(), guard))
+            .with_state(st.clone());
+        let get = |uri: &str| {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            app.clone().oneshot(req)
+        };
+        let resp = get("/v1/txs/k:alice/coin/10000").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.as_array().map(Vec::len), Some(10_000));
+        let resp = get("/txs/account/k:alice?limit=10000").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 }

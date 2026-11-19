@@ -237,6 +237,7 @@ fn settings() -> ApiSettings {
         max_in_flight: 16,
         max_body_bytes: 8 << 20,
         v1txs_max_body_bytes: 8 << 20,
+        v1txs_deadline: std::time::Duration::from_secs(30),
         rate_per_ip: 1_000_000,
         rate_burst: 1_000_000,
         trusted_proxies: Vec::new(),

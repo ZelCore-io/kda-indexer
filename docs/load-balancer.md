@@ -106,7 +106,9 @@ backend kdx_compat
 - `rise 6` (30 s of passing checks) keeps a lag that hovers around `api.ready_max_lag` from
   flapping the routes in and out every few seconds; each flip breaks paging tokens.
 - `timeout server 15s`: the indexer's own deadline is 5 s (504 past it), so 15 s only catches
-  a hung connection.
+  a hung connection. `/v1/txs` has its own deadline, `api.v1txs_deadline_ms` (30 s, the
+  ceiling of the kda-txs service it replaces): give the backend that serves it a
+  `timeout server` above that, for example 35 s.
 - `observe layer4 … on-error mark-down` takes a server out after connection errors without
   waiting for three failed checks.
 
