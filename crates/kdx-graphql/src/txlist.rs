@@ -821,7 +821,45 @@ fn past(deadline: Instant, i: usize) -> ApiResult<()> {
 }
 
 /// One page of `spec`, as `(cursor, item)` edges in list order.
+///
+/// A list of one block (`Block.events`, `Block.transactions`, a root list with `blockHash`)
+/// is in the node's order (FIX-4 item 6): the coinbase first (the first leaf of the
+/// payload's `outputsHash`, executed before the user txs), then the user txs in payload
+/// order, each tx's rows by ascending position. That is the newest-first walk read from
+/// the other end: a forward page is the backward page of the walk, reversed, with
+/// `hasNextPage` and `hasPreviousPage` swapped (and the other way round). Cursors are the
+/// same tokens. Every other list stays newest first.
 pub fn run_page(
+    view: &View,
+    spec: &ListSpec,
+    page: &Page<PageCursor>,
+    deadline: Instant,
+) -> ApiResult<(Vec<(String, Item)>, PageInfo)> {
+    if !matches!(spec.source, SourceSpec::Block(_)) {
+        return run_page_desc(view, spec, page, deadline);
+    }
+    let flipped = Page {
+        dir: match page.dir {
+            Dir::Forward => Dir::Backward,
+            Dir::Backward => Dir::Forward,
+        },
+        ..page.clone()
+    };
+    let (mut edges, info) = run_page_desc(view, spec, &flipped, deadline)?;
+    edges.reverse();
+    Ok((
+        edges,
+        PageInfo {
+            start_cursor: info.end_cursor,
+            end_cursor: info.start_cursor,
+            has_next_page: info.has_previous_page,
+            has_previous_page: info.has_next_page,
+        },
+    ))
+}
+
+/// One page of `spec` in the newest-first walk.
+fn run_page_desc(
     view: &View,
     spec: &ListSpec,
     page: &Page<PageCursor>,

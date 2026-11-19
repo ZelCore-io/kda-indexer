@@ -267,7 +267,11 @@ number open.
   `completedHeights: true` (default) only heights at or below every requested chain's tip.
 - `Block.transactions` lists the block's user txs (coinbase is not a `Transaction`);
   `Block.events` lists every event of the block, coinbase included. Both page with the
-  defaults above (20, at most 100), not the 500 the schema text mentions.
+  defaults above (20, at most 100), not the 500 the schema text mentions. Both are in the
+  node's order: the coinbase first (the first leaf of the payload's `outputsHash`, executed
+  before the user txs), then the user txs in payload order, each tx's events by ascending
+  order index. Root lists with `blockHash` (and no `requestKey`) list their one block in
+  the same order.
 - `lastBlockHeight` is the highest stored tip.
 - `networkInfo`: `networkId` from `network`, `networkHost` from `graphql.network_host`,
   `apiVersion` `"0.0"`, `transactionCount` (the last background count, as `/stats`; an error before the first one) and `coinsInCirculation` as `/stats`;
@@ -379,6 +383,8 @@ the oracle puts them.
   connections walk the same posting lists as the native API. Order: newest first by
   (height, chain, position in the block); rows of one tx (events, transfers) newest first too,
   by descending event position (order index 1 before 0), as the deployed oracle lists them.
+  The exception is a list of one block (`blockHash` without `requestKey`, and the `Block`
+  connections): it is in the node's order, coinbase first (see "Blocks and network").
   `first`/`after` pages walk down from the newest row; `last`/`before` pages first collect
   the keys between the cursor and the newest row (keys only, at most 200,000, else `LIMIT`).
   Every walk checks the request deadline every 64 keys and answers `TIMEOUT` past it.

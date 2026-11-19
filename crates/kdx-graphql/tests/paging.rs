@@ -136,7 +136,8 @@ fn decoded(c: u8, h: u32, shapes: &[Shape]) -> (DecodedBlock, Vec<String>) {
     }
     let cb = serde_json::to_vec(
         &json!({"gas": 0, "result": {"status": "success", "data": "ok"},
-        "reqKey": b64url_encode(&hash_of(0xCB, c, h)), "logs": null, "events": [],
+        "reqKey": b64url_encode(&hash_of(0xCB, c, h)), "logs": null,
+        "events": [ev(None, "coin", "COINBASE", json!(["k:miner", 2.5]))],
         "metaData": null, "continuation": null, "txId": null}),
     )
     .unwrap();
@@ -1273,6 +1274,138 @@ async fn empty_chain_ids_on_block_lists_mean_every_chain() {
             .collect();
         assert!(chains.len() > 1, "{field}: {all}");
         assert_eq!(empty, all, "{field}");
+    }
+}
+
+/// The ids of the coinbase row and the user tx rows of block `(c, h)` in node order: the
+/// coinbase first, then the user txs in payload order, each tx's rows by ascending position.
+fn node_order(
+    fx: &Fx,
+    c: u8,
+    h: u32,
+    rows: fn(Shape) -> &'static [u32],
+    coinbase: bool,
+) -> Vec<String> {
+    let shapes = BLOCKS.iter().find(|b| (b.0, b.1) == (c, h)).unwrap().2;
+    let mut out = Vec::new();
+    if coinbase {
+        out.push(format!("{}#0", b64url_encode(&hash_of(0xCB, c, h))));
+    }
+    for (i, s) in shapes.iter().enumerate() {
+        for p in rows(*s) {
+            out.push(format!("{}#{p}", fx.rks[&(c, h)][i]));
+        }
+    }
+    out
+}
+
+/// FIX-4 item 6: a list of one block (`Block.events`, `Block.transactions`, a root list with
+/// `blockHash`) is in the node's order: the coinbase (first leaf of the payload's
+/// `outputsHash`, executed first) and then the user txs in payload order, rows of a tx by
+/// ascending position. Backward pages hold the same order.
+#[tokio::test]
+async fn one_block_lists_are_in_node_order() {
+    let fx = fixture();
+    fn every_event(s: Shape) -> &'static [u32] {
+        match s {
+            Shape::Many => &[0, 1, 2, 3, 4, 5],
+            Shape::Nft => &[0, 1, 2, 3, 4],
+            Shape::One => &[0],
+        }
+    }
+    fn coin_transfers(s: Shape) -> &'static [u32] {
+        match s {
+            Shape::Many => &[0, 1, 4, 5],
+            Shape::Nft => &[0, 4],
+            Shape::One => &[0],
+        }
+    }
+    // A frozen block and a hot one.
+    for (c, h) in [(0u8, 6u32), (0, 11), (1, 12)] {
+        let bh = block_hash(c, h);
+        let hash = format!("hash: \"{bh}\"");
+        let events = list(
+            format!("block({hash}) {{ events(ARGS) SEL }}"),
+            &["block", "events"],
+            EVENT,
+            true,
+        );
+        let want = node_order(&fx, c, h, every_event, true);
+        assert_eq!(
+            ids(&big_page(&fx.schema, &events).await),
+            want,
+            "Block.events {c}/{h}"
+        );
+        // The last page of 3 is the list's last 3 rows, in the same order.
+        let v = run(&fx.schema, &events.text("last: 3")).await;
+        let tail = ids(conn(&v, &events.path)["edges"].as_array().unwrap());
+        assert_eq!(tail, want[want.len() - 3..], "Block.events last 3, {c}/{h}");
+
+        let txs = list(
+            format!("block({hash}) {{ transactions(ARGS) SEL }}"),
+            &["block", "transactions"],
+            TX,
+            true,
+        );
+        let shapes = BLOCKS.iter().find(|b| (b.0, b.1) == (c, h)).unwrap().2;
+        let got: Vec<String> = big_page(&fx.schema, &txs)
+            .await
+            .iter()
+            .map(|r| r["node"]["hash"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            got,
+            fx.rks[&(c, h)][..shapes.len()],
+            "Block.transactions {c}/{h}"
+        );
+        let got: Vec<String> = big_page(
+            &fx.schema,
+            &list(
+                format!("transactions(blockHash: \"{bh}\", ARGS) SEL"),
+                &["transactions"],
+                TX,
+                true,
+            ),
+        )
+        .await
+        .iter()
+        .map(|r| r["node"]["hash"].as_str().unwrap().to_owned())
+        .collect();
+        assert_eq!(got, fx.rks[&(c, h)], "transactions(blockHash) {c}/{h}");
+
+        let root = list(
+            format!("events(qualifiedEventName: \"coin.COINBASE\", blockHash: \"{bh}\", ARGS) SEL"),
+            &["events"],
+            EVENT,
+            true,
+        );
+        assert_eq!(
+            ids(&big_page(&fx.schema, &root).await),
+            node_order(&fx, c, h, |_| &[], true),
+            "events(coin.COINBASE, blockHash) {c}/{h}"
+        );
+        let root = list(
+            format!("events(qualifiedEventName: \"coin.TRANSFER\", blockHash: \"{bh}\", ARGS) SEL"),
+            &["events"],
+            EVENT,
+            true,
+        );
+        assert_eq!(
+            ids(&big_page(&fx.schema, &root).await),
+            node_order(&fx, c, h, coin_transfers, false),
+            "events(coin.TRANSFER, blockHash) {c}/{h}"
+        );
+        let root = list(
+            format!("transfers(blockHash: \"{bh}\", ARGS) SEL"),
+            &["transfers"],
+            TRANSFER,
+            true,
+        );
+        let got = ids(&big_page(&fx.schema, &root).await);
+        let mut sorted = got.clone();
+        let pos = |id: &String| want.iter().position(|w| w == id).unwrap();
+        sorted.sort_by_key(pos);
+        assert_eq!(got, sorted, "transfers(blockHash) {c}/{h} in node order");
     }
 }
 
