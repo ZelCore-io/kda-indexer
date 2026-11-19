@@ -512,7 +512,7 @@ impl FungibleChainAccount {
 
 fn names(account: &str, module: Option<&str>) -> Result<(String, String)> {
     let account = crate::txlist::name_arg("accountName", account)?.to_owned();
-    let module = crate::txlist::name_arg("fungibleName", module.unwrap_or("coin"))?.to_owned();
+    let module = crate::txlist::fungible_arg(module.unwrap_or("coin"))?.to_owned();
     Ok((account, module))
 }
 
@@ -545,35 +545,37 @@ pub async fn fungible_account(
     }))
 }
 
-/// `fungibleChainAccounts` (and `fungibleChainAccount` with one chain).
+/// `fungibleChainAccounts` (and `fungibleChainAccount` with one chain). `chain_ids` absent
+/// or empty means every chain (FIX-4 item 1: an undefined `$chainIds` reaches the resolver
+/// as absent, and stock reads `[]` as every chain too). The answer is always a list, `[]`
+/// when there are no rows, as stock answers.
 pub async fn fungible_chain_accounts(
     ctx: &Context<'_>,
     account: &str,
-    chain_ids: &[String],
+    chain_ids: Option<&[String]>,
     module: Option<&str>,
-) -> Result<Option<Vec<FungibleChainAccount>>> {
+) -> Result<Vec<FungibleChainAccount>> {
     let (account, module) = names(account, module)?;
-    let chains = chain_list(chain_ids)?;
+    let chains = match chain_ids {
+        None | Some([]) => None,
+        Some(ids) => Some(chain_list(ids)?),
+    };
     let rows = gql(ctx)
         .state()?
         .read({
             let (a, m) = (account.clone(), module.clone());
-            move |view| chain_rows(view, &a, &m, Some(&chains))
+            move |view| chain_rows(view, &a, &m, chains.as_deref())
         })
         .await
         .map_err(from_api)?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        rows.into_iter()
-            .map(|row| FungibleChainAccount {
-                account: account.clone(),
-                module: module.clone(),
-                row,
-            })
-            .collect(),
-    ))
+    Ok(rows
+        .into_iter()
+        .map(|row| FungibleChainAccount {
+            account: account.clone(),
+            module: module.clone(),
+            row,
+        })
+        .collect())
 }
 
 /// `fungibleAccountsByPublicKey` / `fungibleChainAccountsByPublicKey`.
@@ -584,7 +586,7 @@ pub async fn accounts_by_public_key(
     chain: Option<u8>,
 ) -> Result<Vec<FungibleAccount>> {
     let pk = crate::txlist::name_arg("publicKey", public_key)?.to_owned();
-    let module = crate::txlist::name_arg("fungibleName", module.unwrap_or("coin"))?.to_owned();
+    let module = crate::txlist::fungible_arg(module.unwrap_or("coin"))?.to_owned();
     let (out, truncated) = gql(ctx)
         .state()?
         .read(move |view| by_key(view, &pk, &module, chain))
@@ -872,6 +874,7 @@ mod by_key_tests {
             max_in_flight: 16,
             max_body_bytes: 8 << 20,
             v1txs_max_body_bytes: 8 << 20,
+            v1txs_deadline: std::time::Duration::from_secs(30),
             rate_per_ip: 20,
             rate_burst: 40,
             trusted_proxies: Vec::new(),

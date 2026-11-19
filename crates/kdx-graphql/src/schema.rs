@@ -233,11 +233,12 @@ impl Query {
         Ok(crate::types::account::fungible_chain_accounts(
             ctx,
             &account_name,
-            &[chain_id],
+            Some(&[chain_id]),
             fungible_name.as_deref(),
         )
         .await?
-        .and_then(|v| v.into_iter().next()))
+        .into_iter()
+        .next())
     }
 
     async fn fungible_chain_accounts(
@@ -250,10 +251,11 @@ impl Query {
         crate::types::account::fungible_chain_accounts(
             ctx,
             &account_name,
-            &chain_ids.unwrap_or_default(),
+            chain_ids.as_deref(),
             fungible_name.as_deref(),
         )
         .await
+        .map(Some)
     }
 
     async fn fungible_chain_accounts_by_public_key(
@@ -282,8 +284,12 @@ impl Query {
         .collect())
     }
 
-    /// Not served (Q9): the indexer does not run Pact.
+    /// Not served (Q9): the indexer does not run Pact. No input runs no Pact: an empty list,
+    /// as stock answers (FIX-4 item 4).
     async fn gas_limit_estimate(&self, input: Vec<String>) -> Result<Vec<GasLimitEstimation>> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
         unserved!("Query.gasLimitEstimate")
     }
 

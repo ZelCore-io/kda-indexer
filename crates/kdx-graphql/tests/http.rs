@@ -30,6 +30,7 @@ fn fixture() -> Fixture {
         max_in_flight: 16,
         max_body_bytes: 8 << 20,
         v1txs_max_body_bytes: 8 << 20,
+        v1txs_deadline: std::time::Duration::from_secs(30),
         rate_per_ip: 20,
         rate_burst: 40,
         trusted_proxies: Vec::new(),
@@ -426,7 +427,8 @@ mod stock_limits {
             e.get("locations").is_none() && e.get("path").is_none(),
             "{v}"
         );
-        assert!(v.get("data").is_none_or(Value::is_null), "{v}");
+        // FIX-4 part B (B2): a request refused before it ran has no `data` key, as stock's.
+        assert!(v.get("data").is_none(), "{v}");
         // The explorer's transactions-by-account document at first: 100 costs 300.
         let doc = include_str!("../../../compare/graphql/QTransactionsByAccount.graphql");
         let (s, v, _) = post(
@@ -654,5 +656,216 @@ mod budget_ceiling {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert!(v.get("errors").is_none(), "{v}");
+    }
+}
+
+/// FIX-4 item 3: an error async-graphql raises for the request itself (a variable that is
+/// missing or of the wrong type) carries a code like every other error, and the status is
+/// stock's: HTTP 500 `INTERNAL_SERVER_ERROR`. Resolver errors keep their code and 200; a
+/// batch keeps 200.
+#[tokio::test]
+async fn request_level_errors_carry_a_code_and_stock_s_status() {
+    let f = fixture();
+    let node = "query($id: ID!) { node(id: $id) { id } }";
+    for vars in [json!({}), json!({"id": true}), json!({"id": {"a": 1}})] {
+        let (s, v, _) = post(&f, json!({"query": node, "variables": vars}).to_string()).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{vars}: {v}");
+        assert_eq!(v["data"], Value::Null, "{vars}: {v}");
+        let e = &v["errors"][0];
+        assert_eq!(
+            e["extensions"]["code"], "INTERNAL_SERVER_ERROR",
+            "{vars}: {v}"
+        );
+        assert_eq!(e["code"], "INTERNAL_SERVER_ERROR", "{vars}: {v}");
+    }
+    let (s, v, _) = post(
+        &f,
+        json!({"query": "query($ids: [ID!]!) { nodes(ids: $ids) { id } }", "variables": {"ids": {}}})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["errors"][0]["code"], "INTERNAL_SERVER_ERROR", "{v}");
+    // A resolver's own refusal: 200 with its code.
+    let (s, v, _) = query(&f, "{ block(hash: \"x\") { height } }").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["errors"][0]["extensions"]["code"], "BAD_USER_INPUT",
+        "{v}"
+    );
+    // A batch keeps 200; its request-level error still gets the code.
+    let (s, v, _) = post(
+        &f,
+        json!([{"query": node, "variables": {}}, {"query": "{ graphConfiguration { version } }"}])
+            .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v[0]["errors"][0]["code"], "INTERNAL_SERVER_ERROR", "{v}");
+    assert!(v[1].get("errors").is_none(), "{v}");
+}
+
+/// FIX-4 part B (B2): a request refused before anything ran answers without a `data` key, as
+/// stock (Apollo) does and the GraphQL spec says. A resolver's error keeps `data`.
+#[tokio::test]
+async fn request_level_refusals_carry_no_data_key() {
+    let f = fixture();
+    // Stock's complexity refusal: five pages of 1,000.
+    let five: String = (0..5)
+        .map(|i| format!("t{i}: transactions(first: 1000) {{ edges {{ node {{ hash }} }} }} "))
+        .collect();
+    let (s, v, _) = query(&f, &format!("{{ {five} }}")).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert!(v.get("data").is_none(), "{v}");
+    // A missing variable (async-graphql reports it with a path, but nothing ran).
+    let node = "query($id: ID!) { node(id: $id) { id } }";
+    let (s, v, _) = post(&f, json!({"query": node, "variables": {}}).to_string()).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert!(v.get("data").is_none(), "{v}");
+    // Resolver refusals keep `data`: `first` with `last`, an unreadable hash.
+    for q in [
+        "{ transactions(first: 1, last: 1) { totalCount } }",
+        "{ block(hash: \"x\") { height } }",
+    ] {
+        let (s, v, _) = query(&f, q).await;
+        assert_eq!(s, StatusCode::OK, "{q}: {v}");
+        assert!(v.get("data").is_some(), "{q}: {v}");
+        assert_eq!(v["errors"][0]["code"], "BAD_USER_INPUT", "{q}: {v}");
+    }
+    // A batch: only the refused item loses its `data`.
+    let (s, v, _) = post(
+        &f,
+        json!([{"query": node, "variables": {}}, {"query": "{ lastBlockHeight }"}]).to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v[0].get("data").is_none(), "{v}");
+    assert!(v[1].get("data").is_some(), "{v}");
+}
+
+/// FIX-4 part B item 5: stock runs Apollo Server 4.11.0, which answers a document that does
+/// not parse with HTTP 400 `GRAPHQL_PARSE_FAILED` and one that fails validation with HTTP 400
+/// `GRAPHQL_VALIDATION_FAILED`, both without `data`. A variable whose value does not coerce
+/// stays as FIX-4 item 3 decided (stock observed 500 `INTERNAL_SERVER_ERROR`).
+#[tokio::test]
+async fn parse_and_validation_errors_answer_as_apollo_server_4() {
+    let f = fixture();
+    let check = |v: &Value, code: &str| {
+        let e = &v["errors"][0];
+        assert_eq!(e["code"], code, "{v}");
+        assert_eq!(e["extensions"]["code"], code, "{v}");
+        assert!(v.get("data").is_none(), "{v}");
+    };
+    let (s, v, _) = query(&f, "{ lastBlockHeight ").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    check(&v, "GRAPHQL_PARSE_FAILED");
+    for q in [
+        // An unknown field.
+        "{ nope }",
+        // A literal of the wrong type.
+        "{ block(hash: 1) { height } }",
+        // A declared variable that is not used.
+        "query($x: Int) { lastBlockHeight }",
+    ] {
+        let (s, v, _) = query(&f, q).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{q}: {v}");
+        check(&v, "GRAPHQL_VALIDATION_FAILED");
+    }
+    // Variable values that do not coerce: 500, as item 3.
+    let node = "query($id: ID!) { node(id: $id) { id } }";
+    for vars in [json!({}), json!({"id": true}), json!({"id": [1]})] {
+        let (s, v, _) = post(&f, json!({"query": node, "variables": vars}).to_string()).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{vars}: {v}");
+        check(&v, "INTERNAL_SERVER_ERROR");
+    }
+    let page = "query($f: Int) { transactions(first: $f) { totalCount } }";
+    let (s, v, _) = post(
+        &f,
+        json!({"query": page, "variables": {"f": "x"}}).to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    check(&v, "INTERNAL_SERVER_ERROR");
+    // Apollo validates before it coerces variables: a bad document with a bad variable value
+    // answers the validation error alone.
+    let both = "query($id: ID!) { node(id: $id) { id nope } }";
+    let (s, v, _) = post(
+        &f,
+        json!({"query": both, "variables": {"id": true}}).to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    check(&v, "GRAPHQL_VALIDATION_FAILED");
+    assert_eq!(v["errors"].as_array().map(Vec::len), Some(1), "{v}");
+    // FIX-4 part C (M-1): the same for a document over the depth limit: the depth refusal
+    // alone, not mixed with the coercion error of a variable.
+    let deep = format!(
+        "query($id: ID!) {{ node(id: $id) {{ id }} blocksFromHeight(startHeight: 0, first: 1) {{ edges {{ node {{ {} hash {} }} }} }} }}",
+        "parent { ".repeat(7),
+        "}".repeat(7)
+    );
+    let (s, v, _) = post(
+        &f,
+        json!({"query": deep, "variables": {"id": true}}).to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    check(&v, "GRAPHQL_VALIDATION_FAILED");
+    assert_eq!(v["errors"][0]["extensions"]["limit"], "depth", "{v}");
+    assert_eq!(v["errors"].as_array().map(Vec::len), Some(1), "{v}");
+    // FIX-4 part C (M-2): a coercion error is told from a document error by async-graphql's
+    // message prefix (`limits.rs`, `apollo_validation`). Pinned here against the locked
+    // async-graphql: an upgrade that rewords it fails this test instead of silently turning
+    // every coercion into a 400.
+    let (_, v, _) = post(
+        &f,
+        json!({"query": node, "variables": {"id": true}}).to_string(),
+    )
+    .await;
+    let m = v["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(m.starts_with("Invalid value for argument"), "{v}");
+    // A batch keeps 200; its items carry the codes.
+    let (s, v, _) = post(
+        &f,
+        json!([{"query": "{ nope }"}, {"query": "{ lastBlockHeight "}]).to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v[0]["errors"][0]["code"], "GRAPHQL_VALIDATION_FAILED",
+        "{v}"
+    );
+    assert_eq!(v[1]["errors"][0]["code"], "GRAPHQL_PARSE_FAILED", "{v}");
+}
+
+/// FIX-4 part B item 4: `transaction(minimumDepth:)` outside stock's 1..=100 is refused with
+/// stock's resolver error: its message, `INTERNAL_SERVER_ERROR`, `data.transaction` null and
+/// HTTP 200 (stock indexer-kadena `transaction-query-resolver.ts`).
+#[tokio::test]
+async fn transaction_minimum_depth_outside_1_to_100_is_refused_as_stock() {
+    let f = fixture();
+    let rk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let low = "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.";
+    let high = "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be higher than 100.";
+    for (d, want) in [
+        (0, Some(low)),
+        (-1, Some(low)),
+        (101, Some(high)),
+        (1, None),
+        (100, None),
+    ] {
+        let q = format!("{{ transaction(requestKey: \"{rk}\", minimumDepth: {d}) {{ hash }} }}");
+        let (s, v, _) = query(&f, &q).await;
+        assert_eq!(s, StatusCode::OK, "{d}: {v}");
+        assert_eq!(v["data"], json!({"transaction": null}), "{d}: {v}");
+        match want {
+            Some(m) => {
+                let e = &v["errors"][0];
+                assert_eq!(e["message"], m, "{d}: {v}");
+                assert_eq!(e["code"], "INTERNAL_SERVER_ERROR", "{d}: {v}");
+                assert_eq!(e["extensions"]["code"], "INTERNAL_SERVER_ERROR", "{d}: {v}");
+            }
+            None => assert!(v.get("errors").is_none(), "{d}: {v}"),
+        }
     }
 }
