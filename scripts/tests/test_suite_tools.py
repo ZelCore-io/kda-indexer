@@ -1489,10 +1489,59 @@ class H7Fixes(unittest.TestCase):
         real = E_("/data/x", "Changed", 1, 2)
         self.assertEqual(run.verdict_class("gql.x", "real", {"class": "diff", "left": [real], "all": [cap, real]},
                                            [], {}, None)[0], "diff")
-        # the oracle stall the Rust allowlist explained is seen too
+        # the oracle stall the Rust allowlist explained is seen too; a real diff beside it stays a diff (H8)
         stall = E_("/~graphql-oracle-stall", "Changed", 1, 2)
         self.assertEqual(run.verdict_class("gql.x", "real", {"class": "diff", "left": [real], "all": [stall, real]},
-                                           [], {}, None)[0], "stock-unavailable")
+                                           [], {}, None)[0], "diff")
+
+    def test_h8_stall_with_a_real_diff_is_diff(self):
+        stall = E_("/~graphql-oracle-stall", None, None, None)
+        real = E_("/data/x", "Changed", 1, 2)
+        v = {"class": "diff", "left": [stall, real], "left_total": 2, "all": [stall, real], "total": 2}
+        self.assertEqual(run.verdict_class("gql.x", "real", v, [], {}, None), ("diff", []))
+        self.assertEqual(run.verdict_class("gql.x", "real", dict(v, **{"class": "status"}), [], {}, None)[0], "status")
+        # a cut left list hides what else differs: never stock-unavailable
+        cut = {"class": "diff", "left": [stall], "left_total": 5, "all": [stall], "total": 5}
+        self.assertEqual(run.verdict_class("gql.x", "real", cut, [], {}, None)[0], "diff")
+        # the stored record keeps the full list, and the bodies are kept for a diff
+        out = run.stored_verdict(v, "diff", [])
+        self.assertEqual((out["class"], out["all"], out["left"]), ("diff", [stall, real], [stall, real]))
+        row = {"v": out}
+        run.keep_evidence(row, "{}", "{}", {}, {}, None)
+        self.assertIn("bodies", row)
+
+    def test_h8_stall_alone_is_stock_unavailable(self):
+        stall = E_("/~graphql-oracle-stall", None, None, None)
+        v = {"class": "diff", "left": [stall], "left_total": 1, "all": [stall], "total": 1}
+        self.assertEqual(run.verdict_class("gql.x", "real", v, [], {}, None), ("stock-unavailable", []))
+        # a partial-compare marker beside it is not a difference
+        cap = E_("/~graphql-totalcount-cap", None, None, None)
+        v2 = {"class": "diff", "left": [stall, cap], "left_total": 2, "all": [stall, cap], "total": 2}
+        self.assertEqual(run.verdict_class("gql.x", "real", v2, [], {}, None)[0], "stock-unavailable")
+
+    def test_h8_stall_with_explained_diff_is_stock_unavailable(self):
+        stall = E_("/~graphql-oracle-stall", None, None, None)
+        lbh = E_("/data/lastBlockHeight", "Changed", 100, 101)
+        tip = {"ours": 5, "stock": 6}
+        v = {"class": "diff", "left": [stall, lbh], "left_total": 2, "all": [stall, lbh], "total": 2}
+        k, ids = run.verdict_class("gql.lastBlockHeight", "real", v, [], {}, None, tip=tip)
+        self.assertEqual(k, "stock-unavailable")
+        self.assertTrue(ids)
+        # one more, unexplained difference beside the explained one: a diff
+        real = E_("/data/x", "Changed", 1, 2)
+        v3 = {"class": "diff", "left": [stall, lbh, real], "left_total": 3, "all": [stall, lbh, real], "total": 3}
+        self.assertEqual(run.verdict_class("gql.lastBlockHeight", "real", v3, [], {}, None, tip=tip)[0], "diff")
+
+    def test_h8_rereferee_bins_stall_records_the_same_way(self):
+        stall = E_("/~graphql-oracle-stall", None, None, None)
+        real = E_("/data/x", "Changed", 1, 2)
+        def rec(i, left):
+            return ("run4", {"id": i, "ep": "gql.x", "cls": "real", "ours": {"st": 200}, "stock": {"st": 200},
+                             "v": {"class": "diff", "left": left, "left_total": len(left), "all": left,
+                                   "total": len(left)}})
+        got = run.rereferee_rows([rec("a", [stall, real]), rec("b", [stall])], lambda i: {})
+        self.assertEqual(got["left"], {"gql.x": 1})
+        self.assertEqual(got["moved"], {("gql.x", "", "stock-unavailable"): 1})
 
     def _suite(self, fv_allowlist='allowlist = "tools4/allowlist.toml"\n', rules='[{ field = "cmd.nonce", rule = "json_unquote" }]'):
         import subprocess
@@ -1514,9 +1563,9 @@ class H7Fixes(unittest.TestCase):
             open(os.path.join(self.R4, "verify4.sh")).read().replace("@COMMIT@", C))
         return d
 
-    def _fv(self, d, fv_allowlist, rules):
+    def _fv(self, d, fv_allowlist, rules, extra=""):
         open(os.path.join(d, "run4", "fv-compare.toml"), "w").write(
-            fv_allowlist + "[graphql]\nfield_rules = %s\n[node]\n" % rules)
+            fv_allowlist + "[graphql]\n%sfield_rules = %s\n[node]\n" % (extra, rules))
 
     def _verify(self, d):
         import subprocess
@@ -1542,6 +1591,29 @@ class H7Fixes(unittest.TestCase):
         d = self._suite()
         open(os.path.join(d, "run4", "suite4.toml"), "w").write('[diff]\nkda_compare = "tools4/kda-compare-h5"\n')
         self.assertNotEqual(self._verify(d).returncode, 0)                   # no pair-diff config named
+
+    def test_h8_verify4_pins_total_count_cap_with_field_rules(self):
+        import shutil
+        if shutil.which("sha256sum") is None:
+            self.skipTest("no sha256sum")
+        al, rules = 'allowlist = "tools4/allowlist.toml"\n', '[{ field = "cmd.nonce", rule = "json_unquote" }]'
+        d = self._suite()
+        r = self._verify(d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("total_count_cap default", r.stdout)
+        self._fv(d, al, rules, "total_count_cap = 500\n")
+        r = self._verify(d)
+        self.assertNotEqual(r.returncode, 0)                                 # cap set after the pin
+        self.assertIn("changed since the pin", r.stderr)
+        d = self._suite()
+        self._fv(d, al, rules, "total_count_cap = 500\n")
+        r = self._verify(d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("total_count_cap 500", r.stdout)
+        self._fv(d, al, rules, "total_count_cap = 10000\n")
+        self.assertNotEqual(self._verify(d).returncode, 0)                   # cap changed, same field_rules
+        self._fv(d, al, rules, "total_count_cap = 500\n")
+        self.assertEqual(self._verify(d).returncode, 0)                      # back to the pinned value
 
     def test_should4b_build4_builds_from_a_clean_checkout_and_stamps_head(self):
         import shutil

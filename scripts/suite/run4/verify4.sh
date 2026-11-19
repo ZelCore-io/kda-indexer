@@ -7,6 +7,7 @@
 # H7 (SHOULD-4c, R-P5P9-173): the pair-diff config named by run4/suite4.toml ([diff] config)
 # must load tools4/allowlist.toml, and the sha256 of its [graphql] field_rules is pinned in
 # run4/fv-compare.pin at the first verify; a later verify with other field_rules refuses.
+# H8 (R-P5P9-174): the pin covers [graphql] total_count_cap with field_rules (absent = default).
 set -u
 S="${SUITE_DIR:?set SUITE_DIR}"
 EXPECTED_COMMIT="@COMMIT@"
@@ -30,9 +31,13 @@ fv = tomllib.load(open(os.path.join(s, c), "rb"))
 al = fv.get("allowlist", "compare/allowlist.toml")
 if os.path.realpath(os.path.join(s, al)) != os.path.realpath(os.path.join(s, "tools4/allowlist.toml")):
     sys.exit("%s: pair-diff would load allowlist %s, not tools4/allowlist.toml" % (c, al))
-fr = fv.get("graphql", {}).get("field_rules", [])
-h = hashlib.sha256(json.dumps(fr, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-print("%s field_rules sha256 %s (%d rules)" % (c, h, len(fr)))
+g = fv.get("graphql", {})
+fr = g.get("field_rules", [])
+cap = g.get("total_count_cap")         # absent: the compiled default (config.rs)
+h = hashlib.sha256(json.dumps({"field_rules": fr, "total_count_cap": cap}, sort_keys=True,
+                              separators=(",", ":")).encode()).hexdigest()
+print("%s field_rules+total_count_cap sha256 %s (%d rules, total_count_cap %s)"
+      % (c, h, len(fr), "default" if cap is None else cap))
 ' "$S" 2>&1) || fail "$FV"
 P="$S/run4/fv-compare.pin"
 if [ -f "$P" ]; then

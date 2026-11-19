@@ -749,6 +749,28 @@ def count_rows(body):
     return 1
 
 
+STALL_HIT = "/~graphql-oracle-stall"
+
+
+def stall_class(ep, cls, c, ents, done, ours_codes, vars_, node, tip, query, idx):
+    """H8 (R-P5P9-174): the bin of a record with an oracle-stall hit. The stall hit and the
+    partial-compare markers are not differences; every other entry pair-diff left must be
+    explained by a suite rule for the record to be `stock-unavailable`. Any unexplained one (or a
+    left list that was cut) makes it `diff` (`status` where pair-diff said so): a real difference
+    is never binned as stock unavailable."""
+    full = done if done is not None else allow.complete({"entries": ents})
+    rest = [e for e in ents if e.get("path") != STALL_HIT and e.get("path") not in PARTIAL_HITS]
+    if not full:
+        return ("status" if c == "status" else "diff"), []
+    if not rest:
+        return "stock-unavailable", []
+    k, ids = allow.classify({"ep": ep, "cls": cls, "ours_codes": ours_codes, "entries": rest, "vars": vars_,
+                             "node": node, "tip": tip, "query": query, "idx": idx, "complete": True})
+    if k in ("allowlisted", allow.UNAVAILABLE):
+        return "stock-unavailable", ids
+    return ("status" if c == "status" else "diff"), []
+
+
 def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx=None):
     """Class and allowlist ids after the suite allowlist (allow.py). `tip`: the node's highest
     height at ours' read and at stock's ({"ours", "stock"}), for the tip-timing rule; `idx`: ours'
@@ -758,9 +780,9 @@ def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx
     # H7 (SHOULD-1, R-P5P9-173): the partial-compare and stall hits are looked for in every
     # entry (`all`), also the ones the Rust allowlist explained and dropped from `left`.
     seen = v["all"] if isinstance(v.get("all"), list) else ents
-    if any(e.get("path") == "/~graphql-oracle-stall" for e in seen):
-        return "stock-unavailable", []
     partial = any(e.get("path") in PARTIAL_HITS for e in seen)
+    if any(e.get("path") == STALL_HIT for e in seen):
+        return stall_class(ep, cls, c, ents, done, ours_codes, vars_, node, tip, query, idx)
     if c in ("equal", "allowlisted") and partial:
         return "incomplete", []         # owner H4 rule 1: only part of the list was compared
     if c == "allowlisted" and v.get("open_ids"):
