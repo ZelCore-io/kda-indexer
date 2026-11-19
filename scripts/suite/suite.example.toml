@@ -7,7 +7,13 @@ compat = "http://127.0.0.1:PORT"
 native = "http://127.0.0.1:PORT"
 # rps = 135                  # every request to ours; default: the sum of the stock rates (paired)
 timeout_s = 30
-sources = ["127.0.0.200"]    # source addresses of the comparison runner
+# Source addresses of the comparison runner. Ours limits each client (`rate_per_ip`); the
+# runner keeps every source under half of `per_ip_limit` and refuses a list that is too
+# short. Without `sources` it uses `source_count` loopback addresses from
+# `source_base` + `source_start` (at least 16, more when rps needs them).
+per_ip_limit = 20            # ours' rate_per_ip
+# source_count = 16
+# source_start = 150
 # search_sources = [...]     # 4 addresses for search cases (ours: 4 searches, 1 per client)
 # stress_sources = [...]     # default: 128 loopback sources 127.0.0.10..137
 # unit = "SERVICE"           # systemd unit of ours (RSS and NRestarts, read-only)
@@ -23,8 +29,11 @@ rps = 35                     # target rate of light cases; the adaptive throttle
                              # errors > err_limit or p99 > p99_limit_s over 60 s or a crash,
                              # and adds ramp_step every ramp_every_s once healthy
 concurrency = 64             # light cases in flight
-heavy_concurrency = 4        # heavy cases (transactions by account, NFT accounts) in flight,
-                             # outside the rate target
+heavy_concurrency = 4        # heavy cases (the heavy-endpoint stock sample) in flight, outside
+                             # the rate target; judged on heavy cases only:
+# heavy_err_limit = 1.0      # load-error share that halves the heavy slots (1.0: timeouts never do)
+# heavy_p99_limit_s = 0      # 0: off
+# timeout_s = 60             # per-host stock timeout (default [stock] timeout_s)
 err_limit = 0.02
 p99_limit_s = 5.0
 ramp_step = 5
@@ -46,6 +55,11 @@ probe_path = "/txs/recent"     # cheap; chainweb-data /stats can take > 10 s
 url = "http://127.0.0.1:PORT"
 rps = 30
 probe_path = "/v1/txs/coin/coin/1"
+
+[node]                       # chainweb node service API, for node-backed checks of heavy cases
+url = "http://127.0.0.1:PORT"
+network = "mainnet01"
+rps = 20                     # node reads per second (capped at 20)
 
 [diff]
 kda_compare = "/path/to/kda-compare"   # built from this branch (has `pair-diff`)

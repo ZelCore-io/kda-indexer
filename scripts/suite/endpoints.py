@@ -380,17 +380,23 @@ def g_entity(field, r, pool):
     return v
 
 
+def encode_id(type_name, key):
+    """Kadena graph's global id: standard base64 of `<Type>:<key>`. The key is the block
+    hash for `Block`, else a compact JSON array of the key fields (crates/kdx-graphql ids)."""
+    k = key if isinstance(key, str) else json.dumps(key, separators=(",", ":"))
+    return base64.b64encode(("%s:%s" % (type_name, k)).encode()).decode()
+
+
 def node_id(r, pool):
     k = r.choice(["block", "tx", "account", "bad"])
     if k == "block":
-        raw = '["Block","%s"]' % block_hash(r, pool)
-    elif k == "tx":
-        raw = '["Transaction","%s","%s"]' % (block_hash(r, pool), rk(r, pool))
-    elif k == "account":
-        raw = '["FungibleAccount","coin","%s"]' % account(r, pool)
-    else:
-        return r.choice(BAD_CURSORS)
-    return base64.b64encode(raw.encode()).decode()
+        return encode_id("Block", block_hash(r, pool))
+    if k == "tx":
+        return encode_id("Transaction", [block_hash(r, pool), rk(r, pool)])
+    if k == "account":
+        return encode_id("FungibleAccount", ["coin", account(r, pool)])
+    # Malformed ids stay in the mix: unknown layouts and garbage.
+    return r.choice(BAD_CURSORS + [base64.b64encode(('["Block","%s"]' % block_hash(r, pool)).encode()).decode()])
 
 
 PAGED_GQL = {"blocksFromDepth", "blocksFromHeight", "completedBlockHeights", "events",
@@ -692,5 +698,18 @@ for _r, _tpl in [("status", "/status"), ("stats", "/stats"), ("blocks", "/blocks
 
 # Stock-side exceptions: never sent to stock, recorded as "not run".
 STOCK_SKIP = {"gql.nonFungibleAccount": "crashes stock (known crasher QNonFungibleAccount)"}
+# Run 2 coverage split (owner decision 2026-11-19): endpoints where stock timed out in run 1.
+# All their cases run on ours with node-backed checks and cross-checks; a stratified
+# sample (`--heavy-sample` per endpoint) runs against stock, at most heavy_concurrency per host.
+HEAVY_ENDPOINTS = {
+    "gql.block", "gql.blocksFromDepth", "gql.blocksFromHeight", "gql.completedBlockHeights",
+    "gql.events", "gql.fungibleAccountsByPublicKey", "gql.fungibleChainAccountsByPublicKey",
+    "gql.nonFungibleChainAccount", "gql.transaction", "gql.transactions",
+    "gql.transactionsByPublicKey", "gql.transfers",
+    "compat.account", "compat.events", "compat.pactid", "compat.recent", "compat.search",
+    "compat.stats", "compat.tx", "compat.txs",
+}
+# Light endpoints whose stock side is still slow per request (all heavy slots, own lane).
+LANE_LIGHT = {"compat.v1txs"}
 # Native routes with a cross-check against ours' other APIs (one extra request to ours).
 NATIVE_CROSS = {"native.tx": "compat /txs/tx", "native.block_by_height": "native /blocks/{hash}"}
