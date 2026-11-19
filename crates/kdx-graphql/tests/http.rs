@@ -656,3 +656,49 @@ mod budget_ceiling {
         assert!(v.get("errors").is_none(), "{v}");
     }
 }
+
+/// FIX-4 item 3: an error async-graphql raises for the request itself (a variable that is
+/// missing or of the wrong type) carries a code like every other error, and the status is
+/// stock's: HTTP 500 `INTERNAL_SERVER_ERROR`. Resolver errors keep their code and 200; a
+/// batch keeps 200.
+#[tokio::test]
+async fn request_level_errors_carry_a_code_and_stock_s_status() {
+    let f = fixture();
+    let node = "query($id: ID!) { node(id: $id) { id } }";
+    for vars in [json!({}), json!({"id": true}), json!({"id": {"a": 1}})] {
+        let (s, v, _) = post(&f, json!({"query": node, "variables": vars}).to_string()).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{vars}: {v}");
+        assert_eq!(v["data"], Value::Null, "{vars}: {v}");
+        let e = &v["errors"][0];
+        assert_eq!(
+            e["extensions"]["code"], "INTERNAL_SERVER_ERROR",
+            "{vars}: {v}"
+        );
+        assert_eq!(e["code"], "INTERNAL_SERVER_ERROR", "{vars}: {v}");
+    }
+    let (s, v, _) = post(
+        &f,
+        json!({"query": "query($ids: [ID!]!) { nodes(ids: $ids) { id } }", "variables": {"ids": {}}})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["errors"][0]["code"], "INTERNAL_SERVER_ERROR", "{v}");
+    // A resolver's own refusal: 200 with its code.
+    let (s, v, _) = query(&f, "{ block(hash: \"x\") { height } }").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["errors"][0]["extensions"]["code"], "BAD_USER_INPUT",
+        "{v}"
+    );
+    // A batch keeps 200; its request-level error still gets the code.
+    let (s, v, _) = post(
+        &f,
+        json!([{"query": node, "variables": {}}, {"query": "{ graphConfiguration { version } }"}])
+            .to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v[0]["errors"][0]["code"], "INTERNAL_SERVER_ERROR", "{v}");
+    assert!(v[1].get("errors").is_none(), "{v}");
+}

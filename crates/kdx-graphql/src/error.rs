@@ -50,16 +50,44 @@ pub fn wire_json<T: serde::Serialize>(resp: &T) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(&v)
 }
 
+/// Copies each error's `extensions.code` to a top-level `code`. A response without data
+/// whose error has no code holds async-graphql's own request-level error (a missing or
+/// mistyped variable or argument; resolver errors always carry a code through [`err`]):
+/// it gets `INTERNAL_SERVER_ERROR`, the code stock answers it with (FIX-4 item 3).
 fn copy_codes(resp: &mut serde_json::Value) {
+    let no_data = resp.get("data").is_none_or(|d| d.is_null());
     let Some(errors) = resp.get_mut("errors").and_then(|e| e.as_array_mut()) else {
         return;
     };
     for e in errors {
-        let code = e.pointer("/extensions/code").cloned();
-        if let (Some(code), Some(o)) = (code, e.as_object_mut()) {
-            o.entry("code").or_insert(code);
+        let Some(o) = e.as_object_mut() else {
+            continue;
+        };
+        let code = o
+            .get("extensions")
+            .and_then(|x| x.get("code"))
+            .cloned()
+            .or_else(|| no_data.then(|| INTERNAL_SERVER_ERROR.into()));
+        let Some(code) = code else {
+            continue;
+        };
+        if let serde_json::Value::Object(x) = o
+            .entry("extensions")
+            .or_insert_with(|| serde_json::json!({}))
+        {
+            x.entry("code").or_insert(code.clone());
         }
+        o.entry("code").or_insert(code);
     }
+}
+
+/// Whether `r` is refused as a whole by an error that carries no code: async-graphql's own
+/// request-level error (see [`copy_codes`]).
+pub fn codeless_request_error(r: &async_graphql::Response) -> bool {
+    r.data == async_graphql::Value::Null
+        && r.errors
+            .iter()
+            .any(|e| e.extensions.as_ref().and_then(|x| x.get("code")).is_none())
 }
 
 /// A resolver error with `extensions.code`.
@@ -157,12 +185,23 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&wire_json(&one).unwrap()).unwrap();
         assert_eq!(v["errors"][0]["extensions"]["code"], "LIMIT");
         assert_eq!(v["errors"][0]["code"], "LIMIT");
-        // A batch: every response gets it; an error without a code is left alone.
+        // A batch: every response gets it. An error without a code on a response without
+        // data is async-graphql's own request-level error: it gets stock's
+        // `INTERNAL_SERVER_ERROR` (FIX-4 item 3).
         let plain = async_graphql::Response::from_errors(vec![ServerError::new("y", None)]);
         let batch = vec![one, plain];
         let v: serde_json::Value = serde_json::from_slice(&wire_json(&batch).unwrap()).unwrap();
         assert_eq!(v[0]["errors"][0]["code"], "LIMIT");
-        assert!(v[1]["errors"][0].get("code").is_none());
+        assert_eq!(v[1]["errors"][0]["code"], "INTERNAL_SERVER_ERROR");
+        assert_eq!(
+            v[1]["errors"][0]["extensions"]["code"],
+            "INTERNAL_SERVER_ERROR"
+        );
+        // A codeless error beside data is left alone.
+        let mut partial = async_graphql::Response::new(async_graphql::Value::from(1));
+        partial.errors.push(ServerError::new("z", None));
+        let v: serde_json::Value = serde_json::from_slice(&wire_json(&partial).unwrap()).unwrap();
+        assert!(v["errors"][0].get("code").is_none(), "{v}");
         // Data responses are untouched.
         let ok = async_graphql::Response::new(async_graphql::Value::Null);
         let v: serde_json::Value = serde_json::from_slice(&wire_json(&ok).unwrap()).unwrap();

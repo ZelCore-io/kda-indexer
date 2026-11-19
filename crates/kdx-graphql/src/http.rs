@@ -286,7 +286,9 @@ async fn execute(
 
 /// The HTTP status stock (Apollo Server 4) answers a refusal of its limits with (FIX-3 part
 /// C): 500 for the complexity check (thrown in `didResolveOperation`), 400 for a validation
-/// error such as the depth rule. Everything else keeps ours (200).
+/// error such as the depth rule; 500 for a request-level error async-graphql raises without
+/// a code, such as a missing or mistyped variable (FIX-4 item 3: stock answers 500
+/// `INTERNAL_SERVER_ERROR`). Everything else keeps ours (200).
 fn stock_status(r: &Response) -> StatusCode {
     let code = |e: &async_graphql::ServerError| {
         e.extensions
@@ -306,7 +308,9 @@ fn stock_status(r: &Response) -> StatusCode {
     };
     if refused(crate::error::GRAPHQL_VALIDATION_FAILED, "depth") {
         StatusCode::BAD_REQUEST
-    } else if refused(crate::error::INTERNAL_SERVER_ERROR, "complexity") {
+    } else if refused(crate::error::INTERNAL_SERVER_ERROR, "complexity")
+        || crate::error::codeless_request_error(r)
+    {
         StatusCode::INTERNAL_SERVER_ERROR
     } else {
         StatusCode::OK

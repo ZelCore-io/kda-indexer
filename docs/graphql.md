@@ -55,6 +55,7 @@ Errors carry `extensions.code`:
 | `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
 | `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
+| `INTERNAL_SERVER_ERROR` | the stock indexer's code, kept where ours answers as stock does: the complexity refusal (Limits), and a request refused before any field runs because a variable or argument is missing or of the wrong type. Such a request answers HTTP 500 and `data: null`, as stock answers it; in a batch the status stays 200 |
 
 ## Limits
 
