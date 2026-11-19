@@ -30,7 +30,8 @@ extension line (`crates/kdx-graphql/tests/extensions.txt`). Descriptions are not
 Differences from Kadena graph:
 
 - `pactQuery` and `gasLimitEstimate` are in the schema but answer `NOT_SUPPORTED`: the indexer
-  never runs Pact code for clients.
+  never runs Pact code for clients. `gasLimitEstimate(input: [])` runs no Pact and answers
+  `[]`, as the stock indexer does.
 - `Transaction.result` is never a `TransactionMempoolInfo`: the indexer has no mempool, and a
   transaction that is not indexed is `null`.
 - Page sizes: as in the stock indexer, a connection returns 20 items when `first`/`last` are
@@ -39,6 +40,12 @@ Differences from Kadena graph:
 - The schema has no "as of height" field, so GraphQL answers do not carry one (the native API
   does).
 - Fields not served yet answer `NOT_SUPPORTED` with the rest of the operation intact.
+- Row order within a block (R-P5P9-151). A newest-first list that spans several blocks
+  (`transactions`, `events`, `transfers` without `blockHash`, the account connections) lists
+  the rows of one block in reverse node order, so the coinbase comes last; the stock indexer
+  orders those rows by creation time. A list of one block (`blockHash` without `requestKey`,
+  the `Block` connections) is in the node's order, coinbase first, as the node and the stock
+  indexer list it.
 
 ## Errors
 
@@ -54,6 +61,13 @@ Errors carry `extensions.code`:
 | `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
 | `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
+| `INTERNAL_SERVER_ERROR` | the stock indexer's code, kept where ours answers as stock does: the complexity refusal (Limits), and a request refused before any field runs because a variable is missing or its value does not coerce to its type. Such a request answers HTTP 500 with no `data` key, as stock answers it; in a batch the status stays 200. Also `transaction(minimumDepth:)` outside 1..=100, with stock's message (`[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.` or `… higher than 100.`), `transaction: null` and HTTP 200 |
+| `GRAPHQL_PARSE_FAILED` | the document does not parse: HTTP 400 with no `data` key, as stock (Apollo Server 4) answers it. The message is ours (async-graphql's parser), not graphql-js's |
+| `GRAPHQL_VALIDATION_FAILED` | the document fails validation (an unknown field, a literal of the wrong type, an unused variable, the depth limit): HTTP 400 with no `data` key, as stock answers it. A document error, the depth refusal included, is answered alone, without the variable errors of the same request, as Apollo validates before it reads variables. Messages are async-graphql's. One case differs: an argument that mixes a variable with a bad literal (`nodes(ids: [$a, 1])`) is taken as a variable error (500 `INTERNAL_SERVER_ERROR`), where Apollo answers 400 |
+
+A request refused before anything ran (a parse, validation or limit refusal, or a variable
+error) has no `data` key, as in stock and the GraphQL spec; an error a field raised keeps
+`data`. In a batch each item follows this rule and the status stays 200.
 
 ## Limits
 
@@ -257,22 +271,30 @@ number open.
   miner without a row is a field error.
 - Block lists are ordered by height, then chain ascending: `blocksFromHeight` ascending by
   height, as the oracle lists it (R-P5P9-57 M2a); `blocksFromDepth` and
-  `completedBlockHeights` descending. Forward and backward pages hold the same blocks. The
+  `completedBlockHeights` descending. `chainIds` absent or `[]` means every chain. Forward
+  and backward pages hold the same blocks. The
   order of blocks within one height is a contract choice (R3E-8).
   `blocksFromDepth` lists blocks at least `minimumDepth` below their chain's stored tip.
   `completedBlockHeights` takes the newest `heightCount` (at most 100) heights: with
   `completedHeights: true` (default) only heights at or below every requested chain's tip.
 - `Block.transactions` lists the block's user txs (coinbase is not a `Transaction`);
   `Block.events` lists every event of the block, coinbase included. Both page with the
-  defaults above (20, at most 100), not the 500 the schema text mentions.
+  defaults above (20, at most 100), not the 500 the schema text mentions. Both are in the
+  node's order: the coinbase first (the first leaf of the payload's `outputsHash`, executed
+  before the user txs), then the user txs in payload order, each tx's events by ascending
+  order index. Root lists with `blockHash` (and no `requestKey`) list their one block in
+  the same order.
 - `lastBlockHeight` is the highest stored tip.
 - `networkInfo`: `networkId` from `network`, `networkHost` from `graphql.network_host`,
   `apiVersion` `"0.0"`, `transactionCount` (the last background count, as `/stats`; an error before the first one) and `coinsInCirculation` as `/stats`;
   `totalDifficulty` is the sum over chains of the tip block's `weight`, `networkHashRate` the
   sum over chains of the tip block's difficulty divided by 30 s.
-- `node(id)`/`nodes(ids)` (at most 100) resolve every type; a malformed id is
-  `BAD_USER_INPUT`, an object not stored is `null`. Coinbase events and transfers resolve
-  through their block.
+- `node(id)`/`nodes(ids)` (at most 100) resolve every type. An id that cannot be read (not
+  base64 of `<Type>:<key>`, an unknown type, or a malformed key) is `null`, as the stock
+  indexer answers, and so is an object not stored; `nodes` answers `null` in that id's place.
+  A well-formed id whose lookup is ambiguous (a `Signer` of a genesis tx stored on several
+  chains) keeps its `BAD_USER_INPUT` error.
+  Coinbase events and transfers resolve through their block.
 
 ## Subscriptions
 
@@ -375,6 +397,8 @@ the oracle puts them.
   connections walk the same posting lists as the native API. Order: newest first by
   (height, chain, position in the block); rows of one tx (events, transfers) newest first too,
   by descending event position (order index 1 before 0), as the deployed oracle lists them.
+  The exception is a list of one block (`blockHash` without `requestKey`, and the `Block`
+  connections): it is in the node's order, coinbase first (see "Blocks and network").
   `first`/`after` pages walk down from the newest row; `last`/`before` pages first collect
   the keys between the cursor and the newest row (keys only, at most 200,000, else `LIMIT`).
   Every walk checks the request deadline every 64 keys and answers `TIMEOUT` past it.
@@ -438,6 +462,11 @@ the oracle puts them.
 - `fungibleAccount`, `fungibleChainAccount(s)` and `…ByPublicKey` read the reconciled
   balance rows (spec §3.9); resolvers never call the node. Stale rows are served; chains
   without a row are absent from `chainAccounts`; with no row the account is `null`.
+  `fungibleChainAccounts` with `chainIds` absent (also a declared variable sent without a
+  value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
+  `fungibleChainAccount` on a chain without a row is `null`.
+- `fungibleName` is trimmed before use, here and on the transaction and transfer lists, as
+  stock reads it: `"coin "` names `coin`. A name of spaces alone is `BAD_USER_INPUT`.
 - `totalBalance` is the exact decimal sum of the chain balances; `balance` is the stored
   text as a float.
 - Guards: an inline keyset or a resolved keyset reference is a `KeysetGuard` (`raw` is the

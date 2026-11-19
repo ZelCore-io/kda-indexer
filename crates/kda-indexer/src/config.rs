@@ -223,6 +223,8 @@ pub struct ApiConfig {
     pub max_body_mb: u64,
     /// Response body cap of `/v1/txs`.
     pub v1txs_max_body_mb: u64,
+    /// Deadline of a `/v1/txs` request (default 30,000: kda-txs answers 404 at 30 s).
+    pub v1txs_deadline_ms: u64,
     /// Concurrent store reads (blocking threads).
     pub read_threads: usize,
     /// `/readyz` fails when a non-halted chain lags the node by more blocks than this.
@@ -246,6 +248,7 @@ impl Default for ApiConfig {
             docs_enabled: true,
             max_body_mb: 8,
             v1txs_max_body_mb: 32,
+            v1txs_deadline_ms: 30_000,
             read_threads: 4,
             ready_max_lag: 20,
             max_event_lists: 256,
@@ -350,6 +353,7 @@ impl ApiConfig {
             max_in_flight: self.max_in_flight,
             max_body_bytes: (self.max_body_mb as usize) << 20,
             v1txs_max_body_bytes: (self.v1txs_max_body_mb as usize) << 20,
+            v1txs_deadline: std::time::Duration::from_millis(self.v1txs_deadline_ms),
             rate_per_ip: self.rate_per_ip,
             rate_burst: self.rate_burst,
             trusted_proxies: trusted,
@@ -768,6 +772,7 @@ impl Config {
         a.settings(&self.network)?;
         anyhow::ensure!(
             a.deadline_ms >= 100
+                && a.v1txs_deadline_ms >= 100
                 && a.max_in_flight > 0
                 && a.read_threads > 0
                 && a.rate_per_ip > 0
@@ -775,7 +780,7 @@ impl Config {
                 && a.max_body_mb > 0
                 && a.v1txs_max_body_mb > 0
                 && a.max_event_lists > 0,
-            "api: deadline_ms must be >= 100 and the other limits > 0"
+            "api: deadline_ms and v1txs_deadline_ms must be >= 100 and the other limits > 0"
         );
         let g = &self.graphql;
         anyhow::ensure!(
@@ -1016,6 +1021,30 @@ mod ws_bound_tests {
              [api]\n{api}\n[graphql]\n{graphql}\n"
         );
         toml::from_str::<Config>(&text)?.validate()
+    }
+
+    /// FIX-4 part B (B1): `api.v1txs_deadline_ms` defaults to 30,000 (kda-txs' own ceiling),
+    /// reaches the settings, and below 100 is refused as `deadline_ms` is.
+    #[test]
+    fn v1txs_deadline_ms_defaults_reaches_settings_and_is_bounded() {
+        let parse = |a: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[api]\n{a}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        let c = parse("");
+        assert_eq!(c.api.v1txs_deadline_ms, 30_000);
+        c.validate().unwrap();
+        let s = parse("v1txs_deadline_ms = 12000")
+            .api
+            .settings("mainnet01")
+            .unwrap();
+        assert_eq!(s.v1txs_deadline, std::time::Duration::from_millis(12_000));
+        assert!(cfg("v1txs_deadline_ms = 100", "").is_ok());
+        let e = cfg("v1txs_deadline_ms = 99", "").unwrap_err();
+        assert!(format!("{e:#}").contains("v1txs_deadline_ms"), "{e:#}");
     }
 
     /// `graphql.count_budget_ms` parses from the file, defaults to 200 and reaches the settings.

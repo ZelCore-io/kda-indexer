@@ -19,6 +19,7 @@ use axum::routing::get;
 use axum::Router;
 use kdx_decode::index::xfer_entity;
 use kdx_decode::Family;
+use kdx_types::TxKey;
 
 use crate::compat::account::Src;
 use crate::compat::schemas::{LimitErrors, TxDetail};
@@ -245,7 +246,12 @@ fn token_rows(
     let (Some(a), Some(m)) = (d.account_id(account), d.module_id(token)) else {
         return Ok(Vec::new());
     };
-    let it = view.postings(Family::Xfer, xfer_entity(a, m), PostingQuery::default())?;
+    let mut it = view.postings(Family::Xfer, xfer_entity(a, m), PostingQuery::default())?;
+    // Cold pages: ask for the frozen rows of the first `limit` candidates before the walk
+    // decodes them one by one (advisory; the walk reads the rest of the postings as before).
+    let head: Vec<ApiResult<TxKey>> = it.by_ref().take(limit).collect();
+    let _ = view.prefetch(head.iter().filter_map(|k| k.as_ref().ok().copied()));
+    let it: Box<dyn Iterator<Item = ApiResult<TxKey>> + '_> = Box::new(head.into_iter().chain(it));
     let mut src = Src::keys_only(account, token);
     let pg = Paging {
         limit,
@@ -328,7 +334,7 @@ async fn handler(
     };
     let cap = st.settings.v1txs_max_body_bytes;
     match st
-        .read_heavy(move |v| entries(v, &p.account, &p.namespace, limit as usize, cap))
+        .read_v1txs(move |v| entries(v, &p.account, &p.namespace, limit as usize, cap))
         .await
     {
         Ok(body) => json_bytes(body),

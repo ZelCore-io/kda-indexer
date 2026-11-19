@@ -136,7 +136,8 @@ fn decoded(c: u8, h: u32, shapes: &[Shape]) -> (DecodedBlock, Vec<String>) {
     }
     let cb = serde_json::to_vec(
         &json!({"gas": 0, "result": {"status": "success", "data": "ok"},
-        "reqKey": b64url_encode(&hash_of(0xCB, c, h)), "logs": null, "events": [],
+        "reqKey": b64url_encode(&hash_of(0xCB, c, h)), "logs": null,
+        "events": [ev(None, "coin", "COINBASE", json!(["k:miner", 2.5]))],
         "metaData": null, "continuation": null, "txId": null}),
     )
     .unwrap();
@@ -263,6 +264,7 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         max_in_flight: 16,
         max_body_bytes: 8 << 20,
         v1txs_max_body_bytes: 8 << 20,
+        v1txs_deadline: std::time::Duration::from_secs(30),
         rate_per_ip: 20,
         rate_burst: 40,
         trusted_proxies: Vec::new(),
@@ -1170,4 +1172,355 @@ async fn pages_are_served_in_full_and_default_to_20() {
         Some(500),
         "{v}"
     );
+}
+
+/// Runs `q` with `vars` and answers the whole response (data and errors).
+async fn run_vars(s: &KdxSchema, q: &str, vars: Value) -> Value {
+    let r = s
+        .execute(
+            async_graphql::Request::new(q).variables(async_graphql::Variables::from_json(vars)),
+        )
+        .await;
+    serde_json::to_value(&r).unwrap()
+}
+
+fn chain_ids_of(v: &Value) -> Vec<String> {
+    v["data"]["fungibleChainAccounts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list: {v}"))
+        .iter()
+        .map(|r| r["chainId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// FIX-4 item 1: `fungibleChainAccounts` with `chainIds` absent (a declared variable sent
+/// without a value) or `[]` lists every chain's row, and no rows is `[]`, never `null`.
+#[tokio::test]
+async fn fungible_chain_accounts_list_every_chain_and_never_null() {
+    let fx = fixture();
+    let q = "query($a: String!, $c: [String!]) { fungibleChainAccounts(accountName: $a, chainIds: $c) { chainId balance } }";
+    for vars in [
+        json!({"a": ALICE}),
+        json!({"a": ALICE, "c": null}),
+        json!({"a": ALICE, "c": []}),
+    ] {
+        let v = run_vars(&fx.schema, q, vars.clone()).await;
+        assert!(v.get("errors").is_none(), "{vars}: {v}");
+        assert_eq!(chain_ids_of(&v), ["0", "1"], "{vars}: {v}");
+    }
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleChainAccounts(accountName: \"{ALICE}\") {{ chainId }} }}"),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccounts"].as_array().map(Vec::len), Some(2));
+    // One chain asked: its row only.
+    let v = run_vars(&fx.schema, q, json!({"a": ALICE, "c": ["1"]})).await;
+    assert_eq!(chain_ids_of(&v), ["1"], "{v}");
+    // No row on the asked chain, or an unknown account: an empty list.
+    for vars in [
+        json!({"a": ALICE, "c": ["13"]}),
+        json!({"a": "k:nobody"}),
+        json!({"a": "k:nobody", "c": []}),
+    ] {
+        let v = run_vars(&fx.schema, q, vars.clone()).await;
+        assert!(v.get("errors").is_none(), "{vars}: {v}");
+        assert_eq!(v["data"]["fungibleChainAccounts"], json!([]), "{vars}: {v}");
+    }
+    // `fungibleChainAccount` on a chain without a row stays `null`.
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"5\") {{ chainId }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccount"], Value::Null, "{v}");
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"1\") {{ chainId }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccount"]["chainId"], "1", "{v}");
+}
+
+/// FIX-4 item 2: `chainIds: []` on the block lists means every chain, as no `chainIds` does.
+#[tokio::test]
+async fn empty_chain_ids_on_block_lists_mean_every_chain() {
+    let fx = fixture();
+    for (field, args) in [
+        ("blocksFromHeight", "startHeight: 0"),
+        ("blocksFromDepth", "minimumDepth: 0"),
+        (
+            "completedBlockHeights",
+            "completedHeights: false, heightCount: 100",
+        ),
+    ] {
+        let q = |chains: &str| {
+            format!(
+                "{{ {field}({args}{chains}, first: 50) {{ edges {{ node {{ chainId height }} }} }} }}"
+            )
+        };
+        let all = run(&fx.schema, &q("")).await;
+        let empty = run(&fx.schema, &q(", chainIds: []")).await;
+        let n = all[field]["edges"].as_array().map_or(0, Vec::len);
+        assert!(n > 1, "{field}: {all}");
+        let chains: HashSet<String> = all[field]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["node"]["chainId"].to_string())
+            .collect();
+        assert!(chains.len() > 1, "{field}: {all}");
+        assert_eq!(empty, all, "{field}");
+    }
+}
+
+/// The ids of the coinbase row and the user tx rows of block `(c, h)` in node order: the
+/// coinbase first, then the user txs in payload order, each tx's rows by ascending position.
+fn node_order(
+    fx: &Fx,
+    c: u8,
+    h: u32,
+    rows: fn(Shape) -> &'static [u32],
+    coinbase: bool,
+) -> Vec<String> {
+    let shapes = BLOCKS.iter().find(|b| (b.0, b.1) == (c, h)).unwrap().2;
+    let mut out = Vec::new();
+    if coinbase {
+        out.push(format!("{}#0", b64url_encode(&hash_of(0xCB, c, h))));
+    }
+    for (i, s) in shapes.iter().enumerate() {
+        for p in rows(*s) {
+            out.push(format!("{}#{p}", fx.rks[&(c, h)][i]));
+        }
+    }
+    out
+}
+
+/// FIX-4 item 6: a list of one block (`Block.events`, `Block.transactions`, a root list with
+/// `blockHash`) is in the node's order: the coinbase (first leaf of the payload's
+/// `outputsHash`, executed first) and then the user txs in payload order, rows of a tx by
+/// ascending position. Backward pages hold the same order.
+#[tokio::test]
+async fn one_block_lists_are_in_node_order() {
+    let fx = fixture();
+    fn every_event(s: Shape) -> &'static [u32] {
+        match s {
+            Shape::Many => &[0, 1, 2, 3, 4, 5],
+            Shape::Nft => &[0, 1, 2, 3, 4],
+            Shape::One => &[0],
+        }
+    }
+    fn coin_transfers(s: Shape) -> &'static [u32] {
+        match s {
+            Shape::Many => &[0, 1, 4, 5],
+            Shape::Nft => &[0, 4],
+            Shape::One => &[0],
+        }
+    }
+    // A frozen block and a hot one.
+    for (c, h) in [(0u8, 6u32), (0, 11), (1, 12)] {
+        let bh = block_hash(c, h);
+        let hash = format!("hash: \"{bh}\"");
+        let events = list(
+            format!("block({hash}) {{ events(ARGS) SEL }}"),
+            &["block", "events"],
+            EVENT,
+            true,
+        );
+        let want = node_order(&fx, c, h, every_event, true);
+        assert_eq!(
+            ids(&big_page(&fx.schema, &events).await),
+            want,
+            "Block.events {c}/{h}"
+        );
+        // The last page of 3 is the list's last 3 rows, in the same order.
+        let v = run(&fx.schema, &events.text("last: 3")).await;
+        let tail = ids(conn(&v, &events.path)["edges"].as_array().unwrap());
+        assert_eq!(tail, want[want.len() - 3..], "Block.events last 3, {c}/{h}");
+
+        let txs = list(
+            format!("block({hash}) {{ transactions(ARGS) SEL }}"),
+            &["block", "transactions"],
+            TX,
+            true,
+        );
+        let shapes = BLOCKS.iter().find(|b| (b.0, b.1) == (c, h)).unwrap().2;
+        let got: Vec<String> = big_page(&fx.schema, &txs)
+            .await
+            .iter()
+            .map(|r| r["node"]["hash"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            got,
+            fx.rks[&(c, h)][..shapes.len()],
+            "Block.transactions {c}/{h}"
+        );
+        let got: Vec<String> = big_page(
+            &fx.schema,
+            &list(
+                format!("transactions(blockHash: \"{bh}\", ARGS) SEL"),
+                &["transactions"],
+                TX,
+                true,
+            ),
+        )
+        .await
+        .iter()
+        .map(|r| r["node"]["hash"].as_str().unwrap().to_owned())
+        .collect();
+        assert_eq!(got, fx.rks[&(c, h)], "transactions(blockHash) {c}/{h}");
+
+        let root = list(
+            format!("events(qualifiedEventName: \"coin.COINBASE\", blockHash: \"{bh}\", ARGS) SEL"),
+            &["events"],
+            EVENT,
+            true,
+        );
+        assert_eq!(
+            ids(&big_page(&fx.schema, &root).await),
+            node_order(&fx, c, h, |_| &[], true),
+            "events(coin.COINBASE, blockHash) {c}/{h}"
+        );
+        let root = list(
+            format!("events(qualifiedEventName: \"coin.TRANSFER\", blockHash: \"{bh}\", ARGS) SEL"),
+            &["events"],
+            EVENT,
+            true,
+        );
+        assert_eq!(
+            ids(&big_page(&fx.schema, &root).await),
+            node_order(&fx, c, h, coin_transfers, false),
+            "events(coin.TRANSFER, blockHash) {c}/{h}"
+        );
+        let root = list(
+            format!("transfers(blockHash: \"{bh}\", ARGS) SEL"),
+            &["transfers"],
+            TRANSFER,
+            true,
+        );
+        let got = ids(&big_page(&fx.schema, &root).await);
+        let mut sorted = got.clone();
+        let pos = |id: &String| want.iter().position(|w| w == id).unwrap();
+        sorted.sort_by_key(pos);
+        assert_eq!(got, sorted, "transfers(blockHash) {c}/{h} in node order");
+    }
+}
+
+/// FIX-4 item 5: an id that cannot be read is `null` (stock's answer), not an error; `nodes`
+/// answers `null` in its place and resolves the others.
+#[tokio::test]
+async fn unreadable_node_ids_are_null() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use kdx_graphql::ids::{encode, NodeKey};
+    let fx = fixture();
+    let good = encode(&NodeKey::Block {
+        hash: block_hash(0, 6),
+    });
+    let legacy = STANDARD.encode(format!("[\"Block\",\"{}\"]", block_hash(0, 6)));
+    for bad in ["AAAA", "not base64!", "", legacy.as_str(), "QmxvY2s6eA=="] {
+        let v = run(&fx.schema, &format!("{{ node(id: \"{bad}\") {{ id }} }}")).await;
+        assert_eq!(v, json!({"node": null}), "{bad}");
+    }
+    let v = run(
+        &fx.schema,
+        &format!("{{ nodes(ids: [\"{good}\", \"AAAA\", \"{legacy}\"]) {{ id ... on Block {{ height }} }} }}"),
+    )
+    .await;
+    assert_eq!(v, json!({"nodes": [{"id": good, "height": 6}, null, null]}),);
+}
+
+/// FIX-4 item 4: `gasLimitEstimate(input: [])` runs no Pact: an empty list, as stock answers.
+/// Any input is still `NOT_SUPPORTED`.
+#[tokio::test]
+async fn gas_limit_estimate_of_no_input_is_an_empty_list() {
+    let fx = fixture();
+    let v = run(&fx.schema, "{ gasLimitEstimate(input: []) { amount } }").await;
+    assert_eq!(v, json!({"gasLimitEstimate": []}));
+    let r = fx
+        .schema
+        .execute("{ gasLimitEstimate(input: [\"{}\"]) { amount } }")
+        .await;
+    let code = r.errors[0]
+        .extensions
+        .as_ref()
+        .and_then(|x| x.get("code"))
+        .cloned();
+    assert_eq!(code, Some(async_graphql::Value::from("NOT_SUPPORTED")));
+}
+
+/// FIX-4 part B (B3): a `fungibleName` with surrounding spaces names the same module, as in
+/// stock (`"coin "` answered the `coin` row there, `null` here); a name of spaces alone is
+/// still `BAD_USER_INPUT`.
+#[tokio::test]
+async fn fungible_name_is_trimmed() {
+    let f = fixture();
+    let fields = [
+        format!("fungibleAccount(accountName: \"{ALICE}\", FN) {{ accountName fungibleName totalBalance chainAccounts {{ chainId balance }} }}"),
+        format!("fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"0\", FN) {{ chainId balance fungibleName }}"),
+        format!("fungibleChainAccounts(accountName: \"{ALICE}\", FN) {{ chainId balance }}"),
+        format!("fungibleAccountsByPublicKey(publicKey: \"{ALICE_KEY}\", FN) {{ accountName }}"),
+        format!("fungibleChainAccountsByPublicKey(publicKey: \"{ALICE_KEY}\", chainId: \"0\", FN) {{ accountName }}"),
+        format!("transfers(accountName: \"{ALICE}\", FN, first: 50) {{ totalCount edges {{ node {{ requestKey orderIndex amount }} }} }}"),
+        "transfers(FN, first: 50) { edges { node { requestKey orderIndex } } }".to_owned(),
+    ];
+    // FIX-4 part C (M-4): with `blockHash` or `requestKey` too, a name of spaces alone is
+    // still refused, not an empty list.
+    let rk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for src in [
+        format!("blockHash: \"{}\"", block_hash(0, 6)),
+        format!("requestKey: \"{rk}\""),
+    ] {
+        let r = f
+            .schema
+            .execute(format!("{{ transfers({src}, fungibleName: \"  \") {{ edges {{ node {{ requestKey }} }} }} }}"))
+            .await;
+        let code = r
+            .errors
+            .first()
+            .and_then(|e| e.extensions.as_ref()?.get("code").cloned());
+        assert_eq!(
+            code,
+            Some(async_graphql::Value::String("BAD_USER_INPUT".into())),
+            "{src}: {:?}",
+            r.errors
+        );
+    }
+    for field in &fields {
+        let q = |name: &str| {
+            format!(
+                "{{ {} }}",
+                field.replace("FN", &format!("fungibleName: \"{name}\""))
+            )
+        };
+        let want = run(&f.schema, &q("coin")).await;
+        assert!(
+            !want.as_object().unwrap().values().any(Value::is_null),
+            "{field}: {want}"
+        );
+        for name in ["coin ", " coin", "\tcoin  "] {
+            let r = f.schema.execute(q(name)).await;
+            assert!(r.errors.is_empty(), "{field} {name:?}: {:?}", r.errors);
+            assert_eq!(
+                serde_json::to_value(&r.data).unwrap(),
+                want,
+                "{field} {name:?}"
+            );
+        }
+        let r = f.schema.execute(q("  ")).await;
+        let code = r
+            .errors
+            .first()
+            .and_then(|e| e.extensions.as_ref()?.get("code").cloned());
+        assert_eq!(
+            code,
+            Some(async_graphql::Value::String("BAD_USER_INPUT".into())),
+            "{field}: {:?}",
+            r.errors
+        );
+    }
 }

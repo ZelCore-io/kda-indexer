@@ -1,6 +1,7 @@
 //! `node(id)` and `nodes(ids)` (Task 3): decode a Relay id (`ids.rs`) and load the object
-//! through the same paths as the root queries. An id that does not decode is
-//! `BAD_USER_INPUT`; an object that is not stored is `null`.
+//! through the same paths as the root queries. An id that cannot be read (it does not
+//! decode, or its key is not a well-formed key of its type) is `null`, as stock answers
+//! (FIX-4 item 5); so is an object that is not stored.
 
 use async_graphql::{Context, Result, ID};
 
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use kdx_types::Hash32;
 
-use crate::error::{bad_input, from_api};
+use crate::error::{bad_input, from_api, Code};
 use crate::gql;
 use crate::ids::{decode, NodeKey};
 use crate::txlist::chain_arg;
@@ -62,7 +63,30 @@ async fn row_tx(ctx: &Context<'_>, block_hash: String, rk: String) -> Result<Opt
 }
 
 pub async fn node(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>> {
-    let key = decode(id.as_str()).map_err(|_| bad_input("invalid id"))?;
+    let Ok(key) = decode(id.as_str()) else {
+        return Ok(None);
+    };
+    unreadable_is_null(lookup(ctx, key).await)
+}
+
+/// The id is the only input: a key the lookup refuses as malformed (`BAD_USER_INPUT`) is an
+/// unreadable id, `null`. A lookup that finds several copies of a tx is an answer about
+/// stored data, not about the id: it keeps its error (FIX-4 part C, M-3).
+fn unreadable_is_null<T>(r: Result<Option<T>>) -> Result<Option<T>> {
+    match r {
+        Err(e) if is_bad_input(&e) && e.message != super::tx::MANY_COPIES => Ok(None),
+        r => r,
+    }
+}
+
+fn is_bad_input(e: &async_graphql::Error) -> bool {
+    e.extensions
+        .as_ref()
+        .and_then(|x| x.get("code"))
+        .is_some_and(|c| *c == async_graphql::Value::from(Code::BadUserInput.as_str()))
+}
+
+async fn lookup(ctx: &Context<'_>, key: NodeKey) -> Result<Option<Node>> {
     Ok(match key {
         NodeKey::Block { hash } => super::block::query_block(ctx, &hash)
             .await?
@@ -122,10 +146,13 @@ pub async fn node(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>> {
             chain,
             fungible,
             account,
-        } => super::account::fungible_chain_accounts(ctx, &account, &[chain], Some(&fungible))
-            .await?
-            .and_then(|v| v.into_iter().next())
-            .map(Node::FungibleChainAccount),
+        } => {
+            super::account::fungible_chain_accounts(ctx, &account, Some(&[chain]), Some(&fungible))
+                .await?
+                .into_iter()
+                .next()
+                .map(Node::FungibleChainAccount)
+        }
         NodeKey::NonFungibleAccount { account } => super::nft::non_fungible(ctx, &account, None)
             .await?
             .map(|(account, items, cut)| {
@@ -187,7 +214,8 @@ pub async fn nodes(ctx: &Context<'_>, ids: &[ID]) -> Result<Vec<Option<Node>>> {
 
 #[cfg(test)]
 mod tests {
-    use async_graphql::{Request, Variables};
+    use super::{bad_input, is_bad_input, unreadable_is_null};
+    use async_graphql::{Request, Result, Variables};
     use kdx_decode::{IndexedBlock, TxIndex};
     use kdx_types::record::{BlockRecord, TxRecord};
     use kdx_types::{Hash32, TxKey};
@@ -299,5 +327,21 @@ mod tests {
         assert_eq!(node_rk(&f, &event_id(&miss)).await, Value::Null);
         // An id whose text is neither a hash nor the coinbase's reqKey.
         assert_eq!(node_rk(&f, &event_id("not-a-key")).await, Value::Null);
+    }
+
+    /// FIX-4 part C (M-3): only a refused key is an unreadable id (`null`); a lookup that
+    /// finds the object ambiguous (a genesis tx stored on several chains, named by a `Signer`
+    /// id without a block) keeps its `BAD_USER_INPUT` error.
+    #[test]
+    fn only_a_refused_key_answers_null() {
+        let malformed: Result<Option<()>> = Err(bad_input("blockHash: not a hash"));
+        assert!(matches!(unreadable_is_null(malformed), Ok(None)));
+        let many: Result<Option<()>> = Err(bad_input(super::super::tx::MANY_COPIES));
+        let e = unreadable_is_null(many).unwrap_err();
+        assert_eq!(e.message, super::super::tx::MANY_COPIES);
+        assert!(is_bad_input(&e));
+        let other: Result<Option<()>> = Err(async_graphql::Error::new("internal"));
+        assert!(unreadable_is_null(other).is_err());
+        assert!(matches!(unreadable_is_null(Ok(Some(()))), Ok(Some(()))));
     }
 }

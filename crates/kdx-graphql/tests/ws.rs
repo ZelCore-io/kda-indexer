@@ -45,6 +45,7 @@ async fn server(settings: GraphqlSettings, rate_burst: u32) -> Server {
         max_in_flight: 16,
         max_body_bytes: 8 << 20,
         v1txs_max_body_bytes: 8 << 20,
+        v1txs_deadline: std::time::Duration::from_secs(30),
         rate_per_ip: 1,
         rate_burst,
         // Loopback is the proxy: a test client names itself in `X-Forwarded-For`.
