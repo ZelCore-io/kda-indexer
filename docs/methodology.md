@@ -99,6 +99,43 @@ It is built to fail closed:
   are compared as they are, with the variables they really send (see
   [explorer.md](explorer.md)).
 
+### Why a difference is accepted
+
+Every allowlist entry and every rule of the endpoint suite carries an accept class, and an
+entry may accept a difference only with positive evidence; without it the record stays open.
+
+| Class | Evidence |
+|---|---|
+| `stock-wrong-node-evidence` | the node (or stock's own error) shows stock is wrong |
+| `stock-self-inconsistent` | stock contradicts itself: its own paging, cursor or count, or a re-fetch |
+| `stock-stale` | stock lags or stopped indexing (a configured cut, a late fill) |
+| `intended-documented` | a difference these docs state as intended |
+| `unsupported-by-design` | a feature the indexer does not offer |
+| `tip-timing` | every differing row lies between the two tips the node showed at the two reads |
+| `harness-convention` | a comparison convention of the harness, listed below |
+| `our-defect` | a known defect of kda-indexer, tracked as a known gap with a rate gate |
+
+The harness compares with these conventions (entries of
+[compare/allowlist.toml](../compare/allowlist.toml), each with its reason and ruling):
+
+- `graphql-r57-float`: float and float-valued decimal fields, and numbers above 2^53, compare at
+  f64 precision (the reference computes them as JavaScript floats).
+- `graphql-r57-json-object`: JSON texts that hold objects compare as objects (key order is no
+  difference; numbers keep their text).
+- `graphql-r57-field`: a per-field normaliser from the harness config, set after the node referee.
+- `graphql-r75-nested-multiset`: a nested list whose rows select no key compares as a multiset
+  per parent row.
+- `graphql-h6-prefix`: a keyless nested list the reference cut compares as a prefix of ours'
+  whole list, under root rows paired by their block.
+- `graphql-count-walk`: a differing root `totalCount` is settled by walking both lists to the end.
+- `rest-compose`: on one REST record, several row rules combine, each row explained by exactly one.
+- `graphql-native-miner-skew`: ours' GraphQL and native balance of a miner, read seconds apart,
+  are re-read in the other order when they straddle a block.
+- `graphql-r60-scoped-list`: a list bounded by one block or transaction is read to its end on both
+  sides when either side cut the page.
+- `graphql-coinbase-oracle-key-form` and `graphql-r75-coinbase-request-key`: a coinbase row pairs
+  by its place (chain, block, height, index), whatever form of request key each side sends.
+
 ## Gates
 
 A phase or fix round could merge only after a comparison gate: the stack head built as a

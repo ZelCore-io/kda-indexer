@@ -6,7 +6,8 @@ Description=KDA indexer endpoint suite, run 3 (ours vs stock)
 
 [Service]
 Type=simple
-WorkingDirectory=/root/kdx-suite
+WorkingDirectory=@SUITE_DIR@
+EnvironmentFile=@SUITE_DIR@/run3/suite3.env
 Nice=10
 MemoryMax=4G
-ExecStart=/bin/bash /root/kdx-suite/run3/launch.sh
+ExecStart=/bin/bash @SUITE_DIR@/run3/launch.sh

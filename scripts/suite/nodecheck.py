@@ -27,6 +27,7 @@ MAX_CHAINS = 4            # chains per answer checked
 TIP_DEPTH = 10            # a block this close to the tip may be reorged between two reads
 TIP_SLACK = 3             # blocks the tip may move between ours' answer and the node read
 TIP_ROW_AGE = 5           # seconds: a tip sample older than this is not a reading at that time
+SETTLE_S = 30             # seconds before the re-read of a near-tip mismatch (run-2 triage class 14)
 EVIDENCE_EPS = {"gql.transactions", "gql.transactionsByPublicKey", "gql.transfers"}
 EVIDENCE_PAGE = 100       # rows per evidence page
 EVIDENCE_PAGES = 5        # pages per side: a longer list is not completed (evidence incomplete)
@@ -75,15 +76,16 @@ def check_block_range(ep, v, rows, canon, tips):
     """Problems with a block-range answer. `canon`: {(chain, height): hash} from the node;
     `tips`: {chain: node tip height} read after ours answered."""
     p = []
+    if any(c not in tips for c, _, _ in rows):
+        p.append("no-tip")                 # a chain missing from the cut: nothing to judge by
+    near = near_tip_mismatches(rows, canon, tips)
+    if near:
+        p.append("tip-race")
     for c, h, x in rows:
-        if x is not None and (c, h) in canon and canon[(c, h)] != x and h > tips.get(c, h) - TIP_DEPTH:
-            p.append("tip-race")
-            break
-    for c, h, x in rows:
-        if x is not None and (c, h) in canon and canon[(c, h)] != x and h <= tips.get(c, h) - TIP_DEPTH:
+        if c in tips and x is not None and (c, h) in canon and canon[(c, h)] != x and h <= tips[c] - TIP_DEPTH:
             p.append("not-canonical")
             break
-    if any(h > tips.get(c, h) + TIP_SLACK for c, h, _ in rows):
+    if any(c in tips and h > tips[c] + TIP_SLACK for c, h, _ in rows):
         p.append("above-tip")
     hs = [h for _, h, _ in rows]
     if ep == "gql.blocksFromHeight":
@@ -105,10 +107,32 @@ def check_block_range(ep, v, rows, canon, tips):
     return p
 
 
+def near_tip_mismatches(rows, canon, tips):
+    """[(chain, height, ours' hash)] that differ from the node within TIP_DEPTH of the tip."""
+    return [(c, h, x) for c, h, x in rows
+            if c in tips and x is not None and (c, h) in canon and canon[(c, h)] != x and h > tips[c] - TIP_DEPTH]
+
+
+def settle(near, first, second):
+    """H4 (B4, run-2 triage class 14): a near-tip mismatch is a tip race only when a fresh re-read
+    settles it: the node now holds ours' hash, or its own hash at that height changed between the
+    two reads (a reorg). `first`/`second`: {(chain, height): hash} of the two reads. Returns
+    "tip-race-settled", "not-canonical" (the node still holds the same other block) or
+    "tip-race" (the re-read did not cover it: unsettled)."""
+    out = "tip-race-settled"
+    for c, h, x in near:
+        y = second.get((c, h))
+        if y is None:
+            return "tip-race"
+        if y != x and y == first.get((c, h)):
+            out = "not-canonical"
+    return out
+
+
 def failures(p):
-    """The problems that fail a check: `tip-race` (a mismatch within TIP_DEPTH of the tip, a
-    reorg between the two reads) is recorded but is not a failure."""
-    return [x for x in p if x != "tip-race"]
+    """The problems that fail a check. Only `tip-race-settled` (a near-tip mismatch a fresh
+    re-read settled) is not one; an unsettled `tip-race` fails (H4, B4)."""
+    return [x for x in p if x != "tip-race-settled"]
 
 
 def orphan_evidence(rows, canon):
@@ -179,10 +203,14 @@ def check_tx_list(ep, v, body, rows, polled):
     # receiver (as chainweb-data does, rule R-P5P9-105): two copies of a row with from == to
     # pass there; a third copy, or two copies of any other row, fail.
     by_account = ep == "compat.account" or (ep == "gql.transfers" and v.get("accountName"))
-    seen = collections.Counter((r["rk"], r["block"], r["order"]) for r in keyed)
+    ks = [(r["rk"], r["block"], r["order"]) for r in keyed]
+    seen = collections.Counter(ks)
     selfish = {(r["rk"], r["block"], r["order"]) for r in keyed
                if by_account and r["from"] is not None and r["from"] == r["to"]}
-    if any(n > (2 if k in selfish else 1) for k, n in seen.items()):
+    # the two copies of a self-transfer sit next to each other (M5)
+    apart = {k for k in selfish if seen[k] == 2 and
+             (lambda ix: ix[1] - ix[0] != 1)([i for i, y in enumerate(ks) if y == k])}
+    if any(n > (2 if k in selfish else 1) for k, n in seen.items()) or apart:
         p.append("duplicate")
     _, conn = _edges(ep, body)
     if isinstance(conn, dict) and isinstance(conn.get("totalCount"), int):
@@ -345,10 +373,11 @@ class Bucket:
 class Node:
     """The chainweb node's service API under a read cap (`rps`, default 20)."""
 
-    def __init__(self, http, url, network, rps=20, max_wait=2.0):
+    def __init__(self, http, url, network, rps=20, max_wait=2.0, settle_s=SETTLE_S):
         self.http, self.base = http, url.rstrip("/") + "/chainweb/0.0/" + network
         self.bucket = Bucket(rps)
         self.max_wait = max_wait
+        self.settle_s = settle_s
         self.lock = threading.Lock()
         self.cut, self.cut_t = None, 0
         self.canon = collections.OrderedDict()
@@ -416,7 +445,7 @@ class Node:
         does not hold as canonical (`stock_orphans`), how many could not be resolved (`unresolved`:
         near the tip, no height, or the read bound), the rows asked and the reads used. One read
         per chain covers a height span under BRANCH_MAX; wider spans read per height."""
-        out = {"stock_orphans": 0, "unresolved": 0, "extra": len(rows), "reads": 0}
+        out = {"stock_orphans": 0, "unresolved": 0, "extra": len(rows), "reads": 0, "forks_confirmed": 0}
         canon = {}
         with self.read_cap(max_reads) as cap:
             try:
@@ -433,18 +462,30 @@ class Node:
                         canon.update(self.canonical(c, lo, hi))
             except (Budget, NodeError, ValueError, KeyError):
                 pass            # what was read stays; the rest is unresolved
+            # H4 (S1): a stock-only row counts as an orphan only when the node holds its block
+            # as a fork header at that height; otherwise it is unresolved.
+            for r in rows:
+                x = canon.get((r.get("chain"), r.get("height")))
+                if x is None or r.get("block") is None:
+                    out["unresolved"] += 1
+                elif x != r["block"]:
+                    try:
+                        ok = self.fork_header(r["chain"], r["block"], r["height"])
+                    except Budget:
+                        ok = None
+                    if ok:
+                        out["stock_orphans"] += 1
+                        out["forks_confirmed"] += 1
+                    else:
+                        out["unresolved"] += 1
             out["reads"] = cap.used
-        for r in rows:
-            x = canon.get((r.get("chain"), r.get("height")))
-            if x is None or r.get("block") is None:
-                out["unresolved"] += 1
-            elif x != r["block"]:
-                out["stock_orphans"] += 1
         return out
 
-    def canonical(self, chain, lo, hi):
-        tips, hashes = self.tips()
-        need = [h for h in range(lo, hi + 1) if (chain, h) not in self.canon]
+    def canonical(self, chain, lo, hi, fresh=False):
+        """{(chain, height): hash} on the node's current branch. `fresh`: read the node again for
+        every height (the settle re-read), with a fresh cut, and answer from that read only."""
+        tips, hashes = self.tips(fresh=fresh)
+        need = [h for h in range(lo, hi + 1) if fresh or (chain, h) not in self.canon]
         if need:
             q = urllib.parse.urlencode({"minheight": min(need), "maxheight": max(need), "limit": BRANCH_MAX})
             ans = self._call("/chain/%d/header/branch?%s" % (chain, q), body={"lower": [], "upper": [hashes[chain]]},
@@ -460,12 +501,39 @@ class Node:
                     self.recent.clear()
                 while len(self.canon) > 200000:
                     self.canon.popitem(last=False)
+        if fresh:
+            return {(chain, it["height"]): it["hash"] for it in ans.get("items") or [] if lo <= it["height"] <= hi}
         out = {}
         for h in range(lo, hi + 1):
             x = self.canon.get((chain, h)) or self.recent.get((chain, h))
             if x:
                 out[(chain, h)] = x
         return out
+
+    def settle_race(self, near, first):
+        """Waits `settle_s`, re-reads the cut and the branch at each near-tip mismatch, and
+        settles it (`settle`). A failed re-read leaves it `tip-race` (a failure)."""
+        time.sleep(self.settle_s)
+        second = {}
+        try:
+            by = collections.defaultdict(list)
+            for c, h, _ in near:
+                by[c].append(h)
+            for c, hs in by.items():
+                second.update(self.canonical(c, min(hs), max(hs), fresh=True))
+        except (Budget, NodeError, ValueError, KeyError):
+            return "tip-race"
+        return settle(near, first, second)
+
+    def fork_header(self, chain, block, height):
+        """True when the node holds `block` as a header at `height` on `chain` (a fork block it
+        saw), False when it does not know it."""
+        try:
+            h = self._call("/chain/%d/header/%s" % (chain, urllib.parse.quote(str(block), safe="")),
+                           accept="application/json;blockheader-encoding=object")
+        except NodeError:
+            return False
+        return isinstance(h, dict) and h.get("height") == height
 
     def poll(self, chain, rks):
         ans = self._call("/chain/%d/pact/api/v1/poll" % chain, body={"requestKeys": rks})
@@ -491,6 +559,10 @@ class Node:
                 out = {"ok": not failures(p), "why": p or None, "rows": len(rows), "canon": len(canon)}
                 if "tip-race" in p:
                     out["tip"] = max(tips.values())    # recorded with the rows' heights in the answer
+                    p[p.index("tip-race")] = self.settle_race(near_tip_mismatches(rows, canon, tips), canon)
+                    if p.count("not-canonical") > 1:
+                        p.remove("not-canonical")
+                    out.update(ok=not failures(p), why=p)
                 return out
             rows = tx_rows(ep, body)
             if not rows:

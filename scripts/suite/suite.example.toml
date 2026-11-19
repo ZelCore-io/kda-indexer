@@ -59,7 +59,8 @@ probe_path = "/v1/txs/coin/coin/1"
 [node]                       # chainweb node service API, for node-backed checks of heavy cases
 url = "http://127.0.0.1:PORT"
 network = "mainnet01"
-rps = 20                     # node reads per second (capped at 20)
+rps = 20                     # node reads per second (capped at 30)
+# settle_s = 30              # seconds before the re-read of a near-tip hash mismatch (H4)
 
 [diff]
 kda_compare = "/path/to/kda-compare"   # built from this branch (has `pair-diff`)

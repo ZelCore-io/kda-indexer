@@ -60,6 +60,14 @@ pub enum AcceptClass {
     UnsupportedByDesign,
     /// The two reads saw different tips (bounded window).
     TipTiming,
+    /// Stock contradicts itself (its paging, cursor or count, or a re-fetch); no node read.
+    StockSelfInconsistent,
+    /// Stock lags or stopped (a configured cut, late fill); no node read.
+    StockStale,
+    /// A comparison convention of the harness, listed in docs/methodology.md.
+    HarnessConvention,
+    /// Our own defect, tracked as a known gap (never intended).
+    OurDefect,
 }
 
 impl AcceptClass {
@@ -69,6 +77,10 @@ impl AcceptClass {
             AcceptClass::IntendedDocumented => "intended-documented",
             AcceptClass::UnsupportedByDesign => "unsupported-by-design",
             AcceptClass::TipTiming => "tip-timing",
+            AcceptClass::StockSelfInconsistent => "stock-self-inconsistent",
+            AcceptClass::StockStale => "stock-stale",
+            AcceptClass::HarnessConvention => "harness-convention",
+            AcceptClass::OurDefect => "our-defect",
         }
     }
 }
@@ -117,6 +129,46 @@ pub struct Entry {
     /// Required: the ruling (or, for an owner-accepted entry, the owner note) that admits it.
     pub ruling: String,
     pub owner_note: String,
+    /// Owner H4 rule: the doc anchor (`docs/<file>.md#<anchor>`) that documents the
+    /// difference, or the documented stock-fault class backed by per-record node evidence.
+    /// An entry without one is **open**: the endpoint suite reports its hits as differences
+    /// (`pair-diff` lists them in `open_ids`). The live harness still matches it until its
+    /// mock tests are moved to documented entries (H4 report).
+    #[serde(default)]
+    pub doc: Option<String>,
+}
+
+impl Entry {
+    /// The entry may explain a difference (it has a doc anchor). KNOWN-GAP entries are
+    /// matched apart and never explain.
+    pub fn is_open(&self) -> bool {
+        self.status != Status::KnownGap && self.doc.is_none()
+    }
+}
+
+/// `docs/<file>.md#<anchor>` and the heading slug exists in that file (GitHub slug rules).
+pub fn doc_anchor_ok(root: &Path, doc: &str) -> bool {
+    let Some((file, anchor)) = doc.split_once('#') else {
+        return false;
+    };
+    if !file.starts_with("docs/") || !file.ends_with(".md") || anchor.is_empty() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|l| l.strip_prefix('#'))
+        .map(|h| {
+            h.trim_start_matches('#')
+                .trim()
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+                .map(|c| if c == ' ' { '-' } else { c })
+                .collect::<String>()
+        })
+        .any(|slug| slug == anchor)
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +207,11 @@ impl Allowlist {
             );
         }
         Ok(Allowlist { entries: f.entries })
+    }
+
+    /// The entry `id` is open (no doc anchor, not a KNOWN-GAP).
+    pub fn is_open_id(&self, id: &str) -> bool {
+        self.entries.iter().any(|e| e.id == id && e.is_open())
     }
 
     /// Every entry as a docs row: id, reason, accept class, ruling.
@@ -505,6 +562,122 @@ mod tests {
             .iter()
             .any(|r| r.accept_class == "stock-wrong-node-evidence"));
         assert!(rows.iter().any(|r| r.accept_class == "intended-documented"));
+    }
+
+    /// H4 (review S3-S5): the class says what evidence admits an entry. Stock-wrong only with a
+    /// node read, stock contradicting itself or lagging has its own class, harness comparison
+    /// conventions are listed in docs/methodology.md, and our own defect is never "intended".
+    #[test]
+    fn h4_accept_classes_match_the_evidence() {
+        use super::{AcceptClass, Entry};
+        let al = shipped();
+        let class = |id: &str| {
+            al.entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("{id}"))
+                .accept_class
+                .as_str()
+        };
+        for id in [
+            "cwd-throttled-page",
+            "cwd-page-boundary-dup",
+            "oracle-unstable",
+            "oracle-limit-edge",
+            "cwd-cursor-coinbase-skip",
+            "graphql-r60-count-self-consistent",
+        ] {
+            assert_eq!(class(id), "stock-self-inconsistent", "{id}");
+        }
+        for id in ["graphql-oracle-stall", "oracle-tip-lag"] {
+            assert_eq!(class(id), "stock-stale", "{id}");
+        }
+        assert_eq!(class("stats-count-age-lag"), "intended-documented");
+        assert_eq!(class("known-gap-q-missing-chain-rows"), "our-defect");
+        let docs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/methodology.md"),
+        )
+        .unwrap();
+        let conventions: Vec<&Entry> = al
+            .entries
+            .iter()
+            .filter(|e| e.accept_class == AcceptClass::HarnessConvention)
+            .collect();
+        assert!(conventions.len() >= 11);
+        for e in conventions {
+            assert!(
+                docs.contains(&format!("`{}`", e.id)),
+                "{} is not listed in docs/methodology.md",
+                e.id
+            );
+        }
+        let page = al
+            .entries
+            .iter()
+            .find(|e| e.id == "graphql-page-size")
+            .unwrap();
+        assert!(
+            page.reason.contains("1,000") && !page.reason.contains("100 items"),
+            "stale: {}",
+            page.reason
+        );
+        for e in &al.entries {
+            assert!(
+                !e.ruling.starts_with("No ruling found") || e.ruling.contains("node's /poll"),
+                "{}: no ruling and no evidence",
+                e.id
+            );
+        }
+        for (text, c) in [
+            (
+                "stock-self-inconsistent",
+                AcceptClass::StockSelfInconsistent,
+            ),
+            ("stock-stale", AcceptClass::StockStale),
+            ("harness-convention", AcceptClass::HarnessConvention),
+            ("our-defect", AcceptClass::OurDefect),
+        ] {
+            assert_eq!(c.as_str(), text);
+        }
+    }
+
+    /// Owner H4 rule: an entry accepts a difference only with a valid doc anchor; any other
+    /// (non-KNOWN-GAP) entry is open and explains nothing.
+    #[test]
+    fn every_accepting_entry_has_a_valid_doc_anchor() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let al = shipped();
+        let (mut acc, mut open, mut gap) = (0, 0, 0);
+        for e in &al.entries {
+            match (&e.doc, e.status) {
+                (_, super::Status::KnownGap) => gap += 1,
+                (Some(d), _) => {
+                    assert!(
+                        super::doc_anchor_ok(&root, d),
+                        "{}: bad doc anchor {d}",
+                        e.id
+                    );
+                    acc += 1;
+                }
+                (None, _) => {
+                    assert!(e.is_open());
+                    open += 1;
+                }
+            }
+        }
+        assert_eq!(acc + open + gap, al.entries.len());
+        assert!(!super::doc_anchor_ok(
+            &root,
+            "docs/comparison.md#no-such-heading"
+        ));
+        assert!(!super::doc_anchor_ok(&root, "README.md#x"));
+        let e = al
+            .entries
+            .iter()
+            .find(|e| e.id == "oracle-unstable")
+            .unwrap();
+        assert!(e.is_open());
+        assert!(al.is_open_id("oracle-unstable") && !al.is_open_id("oracle-orphan"));
     }
 
     /// I-4: a `search=` diff is excused only when kda-indexer said it cut the answer.

@@ -22,6 +22,7 @@ status = "ACCEPTED"
 accept_class = "intended-documented"
 ruling = "Owner note: accepted by the owner (decision Q2); run 3E ruling R3E-6 for the minimum search length."
 owner_note = "Accepted by the owner. Exact module/name event queries are not covered by this entry. Also covers the minimum search length (kda-indexer 400, chainweb-data 200 on short strings): known G2, compat is to match chainweb-data in the fix round (run 3E ruling R3E-6)."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "orphan-rows-txs"
@@ -34,6 +35,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "Spec section 4.5 (builder call: orphans are not kept); R3E-9 extends it (oracle-orphan-rows); R-P5P9-78 (H2 m-7): scoped apart from oracle-orphan-rows, so each is hit; R-P5P9-81 (I-1): /txs/txs added to the scope."
 owner_note = "Builder call (spec section 4.5): orphans are not kept."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "stats-estimate"
@@ -52,10 +54,10 @@ route = "other"
 json_path_glob = "/~graphql-page-cut"
 condition = "any"
 request_contains = "graphql:"
-reason = "GraphQL pages larger than 100 items are capped in kda-indexer (decision Q10), the reference server does not clamp. The harness compares the common prefix of the two sides after following the same number of pages."
+reason = "kda-indexer answers a GraphQL page in full up to the 1,000-row safety cap (docs/graphql.md, Page sizes); the reference server does not clamp. When one side stopped at a smaller page and still had a next page, the harness compares the common prefix after following the same number of pages. Open item (H4 review S4): the hit does not check that ours stopped at the 1,000-row cap, so a regression to a smaller cap would be hidden; enforcing it changes the live harness paging and waits for the owner."
 status = "ACCEPTED"
 accept_class = "intended-documented"
-ruling = "Owner note: accepted by the owner (decision Q10)."
+ruling = "Owner note: accepted by the owner (decision Q10, superseded by the 1,000-row cap in docs/graphql.md); H4 review S4."
 owner_note = "Accepted by the owner; the visible hit /~graphql-page-cut appears only when one side stopped at a smaller page and still had a next page."
 
 [[entry]]
@@ -69,6 +71,7 @@ status = "ACCEPTED"
 accept_class = "intended-documented"
 ruling = "Owner note: accepted by the owner (GQ-10)."
 owner_note = "Accepted by the owner; the normaliser caps both sides, the visible hit records that the reference count was above the cap."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "graphql-oracle-stall"
@@ -78,8 +81,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "The reference server stopped indexing at a fixed height; rows above the configured max_height exist only on kda-indexer and are dropped from both sides before the diff."
 status = "ACCEPTED"
-accept_class = "stock-wrong-node-evidence"
-ruling = "Owner note: accepted by the owner (GQ-16)."
+accept_class = "stock-stale"
+ruling = "Owner note: accepted by the owner (GQ-16). H4: stock staleness (a configured max_height cut), no node read: class stock-stale."
 owner_note = "Accepted by the owner (GQ-16); only the visible hit is allowlisted, any other difference stays unexplained."
 
 [[entry]]
@@ -90,8 +93,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 F2: Float and float-valued Decimal fields (balance, totalBalance, gasPrice, the networkInfo floats) and any number above 2^53 compare at f64 precision. The reference server computes them as JavaScript floats (difficulty rounding, totalBalance float sum); kda-indexer's values are exact. The NodeBalance and native pairs compare our Float balance with the decimal at f64 precision."
 status = "ACCEPTED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-57 F2; R-P5P9-75, CG-4."
+accept_class = "harness-convention"
+ruling = "R-P5P9-57 F2; R-P5P9-75, CG-4. H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #12, #25, #120)."
 
 [[entry]]
@@ -102,9 +105,10 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 F7: JSON texts that hold objects (payload.data, goodResult, badResult) compare as objects, so key order is not a difference. Numbers inside keep their text, so a decimal format difference (F9) is not hidden."
 status = "ACCEPTED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-57 F7; R-P5P9-75, CG-4."
+accept_class = "harness-convention"
+ruling = "R-P5P9-57 F7; R-P5P9-75, CG-4. H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #15, #16, #107)."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "graphql-r57-height-ties"
@@ -117,6 +121,7 @@ status = "PROPOSED"
 accept_class = "intended-documented"
 ruling = "R-P5P9-57 M2b/M2c; R3E-8."
 owner_note = "Controller ruling R-P5P9-57; the order across heights (M2a) is still compared."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "graphql-r57-field"
@@ -126,8 +131,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-57 rules (a) and (b): a per-field normaliser from the harness config ([graphql] field_rules) explained the difference. The controller sets each field after the node referee (F5, F6, F8, F9, F10, Transfer.amount)."
 status = "ACCEPTED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-57 rules (a) and (b); R-P5P9-75, CG-4."
+accept_class = "harness-convention"
+ruling = "R-P5P9-57 rules (a) and (b); R-P5P9-75, CG-4. H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #16, #17, #104)."
 
 [[entry]]
@@ -141,6 +146,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-57 rule (a); R-P5P9-58 (oracle_empty, 22:40Z class table); R-P5P9-75, CG-4."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #260, #268)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r58-count-lower-bound"
@@ -153,6 +159,7 @@ status = "ACCEPTED"
 accept_class = "intended-documented"
 ruling = "R-P5P9-57; R-P5P9-58 (count_lower_bound); R-P5P9-14; R-P5P9-75, CG-4."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #10, #21, #174)."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "graphql-r58-oracle-orphan-dupes"
@@ -165,6 +172,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-57; R-P5P9-58 (oracle_orphan_dupes); R-P5P9-48."
 owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z: transactionsByPublicKey orphan duplicates are an oracle defect)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r58-by-key-extra-row"
@@ -177,6 +185,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-57; R-P5P9-58 (by_key_extra_row); R-P5P9-75, CG-4."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #863, #982)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 # --- From the first live runs (P1, chainweb-data vs node oracle) ---
 
@@ -190,6 +199,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-1 (G1) and the F4 fix (run 3E-g)."
 owner_note = "Compat behaviour by design (F4 fix, run 3E-g): matches chainweb-data. Replaces genesis-txs-not-indexed (G1 fixed: compat serves genesis txs on /txs/tx and /txs/txs, so a genesis 404 against chainweb-data is a diff again)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "failed-tx-callstack"
@@ -199,8 +209,9 @@ condition = "any"
 reason = "For failed txs chainweb-data kept the Pact error as produced at execution time, with a callStack; the node serves the stored output without callStack."
 status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "No ruling found: a P1 live-run finding (chainweb-data against the node oracle); R-P5P9-75, CG-4."
+ruling = "No ruling found: a P1 live-run finding (chainweb-data against the node oracle); R-P5P9-75, CG-4. H4: the evidence is the node's /poll output (the oracle of that run); an owner ruling is still to be recorded."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #169, #191, #192)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "failed-tx-error-info"
@@ -210,8 +221,9 @@ condition = "changed"
 reason = "For failed txs chainweb-data's error info has the source position at execution time (\"<interactive>:0:11937\"); the node serves \"<toplevel>:0\"."
 status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "No ruling found: a P1 live-run finding, as failed-tx-callstack; R-P5P9-75, CG-4."
+ruling = "No ruling found: a P1 live-run finding, as failed-tx-callstack; R-P5P9-75, CG-4. H4: the evidence is the node's /poll output (the oracle of that run); an owner ruling is still to be recorded."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #169, #191, #192)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 # --- Harness tolerances reported as visible hits (P3, Task 7) ---
 
@@ -235,8 +247,8 @@ json_path_glob = "/~page-cut"
 condition = "changed"
 reason = "chainweb-data pages hold limit x a throttling factor rows and still carry a Chainweb-Next token, so after the same number of followed pages it has fewer rows. The harness cuts both sides to the heights the shorter side covered completely and reports this visible hit; rows above the cut are compared as usual."
 status = "PROPOSED"
-accept_class = "stock-wrong-node-evidence"
-ruling = "P3 controller rulings (run 3C finding)."
+accept_class = "stock-self-inconsistent"
+ruling = "P3 controller rulings (run 3C finding). H4: stock contradicts itself (paging, cursor, count or a re-fetch), no node read: class stock-self-inconsistent."
 owner_note = "Accepted in the P3 controller rulings (run 3C finding)."
 
 [[entry]]
@@ -257,8 +269,8 @@ json_path_glob = "/~page-dup"
 condition = "changed"
 reason = "chainweb-data can start a Chainweb-Next page with the last row of the previous page (seen live on /txs/account with throttled pages: the same transfer, same chain and idx, twice in a row). The harness drops the repeated row (never a transfer to oneself, which chainweb-data lists twice on purpose) and reports this visible hit; kda-indexer pages never repeat a row."
 status = "PROPOSED"
-accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-5. R-P5P9-77 item 3 (restored)."
+accept_class = "stock-self-inconsistent"
+ruling = "R3E-5. R-P5P9-77 item 3 (restored). H4: stock contradicts itself (paging, cursor, count or a re-fetch), no node read: class stock-self-inconsistent."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Accepted (run 3E ruling R3E-5): chainweb-data paging bug."
 
 [[entry]]
@@ -271,6 +283,7 @@ status = "PROPOSED"
 accept_class = "intended-documented"
 ruling = "Ruling S-3 (P5/P6 plan)."
 owner_note = "Ruling S-3 (P5/P6 plan): about 10 requests a day on the whole route; an exact expansion needs a cont->code side index (a `contcode` file in search/, no reindex) if ever wanted."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "pactid-tie-order"
@@ -282,6 +295,7 @@ status = "PROPOSED"
 accept_class = "intended-documented"
 ruling = "R3E-8 (order within a height); run 6B finding."
 owner_note = "Run 6B finding; kda-indexer answers ties request key ascending."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "search-tie-order"
@@ -294,6 +308,7 @@ status = "PROPOSED"
 accept_class = "intended-documented"
 ruling = "R3E-8; R-P5P9-48/49; R-P5P9-64 M-7."
 owner_note = "PROPOSED (rulings R3E-8, R-P5P9-48/49 and R-P5P9-64 M-7; the FV preconditions flip it): fv-checklist harness T-item (within-height tie order on /txs/search). kda-indexer answers a height's rows in node order."
+doc = "docs/comparison.md#intended-differences"
 
 # --- Run 6E-3 oracle defects (ruling R-P5P9-47; node evidence in the run 6E-3 report) ---
 
@@ -310,6 +325,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored)."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report). R-P5P9-70 (m-4): needs a key-scoped path. The recorded hit (run 6E-3 report) is a chainweb-data 404 on the whole answer, with no visible path. Stays PROPOSED until a dedicated hit replaces this one-off."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "cwd-hole-txs-au4cjml8"
@@ -322,6 +338,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored)."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report). R-P5P9-70 (m-4): needs a key-scoped path. The recorded hit (run 6E-3 report) is chainweb-data listing no row, with no visible path. Stays PROPOSED until a dedicated hit replaces this one-off."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "cwd-hole-events-7392263"
@@ -334,6 +351,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored)."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report). R-P5P9-70 (m-4): needs a key-scoped path. The recorded hits (run 6E-3 report) are positional (A rows /23 to /25), not key-scoped. Stays PROPOSED until a dedicated hit replaces this one-off."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "kdatxs-gap-cont-d7bf62"
@@ -346,6 +364,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-15 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored)."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Oracle defect under ruling R3E-15 (node agrees with kda-indexer, kda-txs differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report). R-P5P9-70 (m-4): needs a key-scoped path. The recorded hit (run 6E-3 report) is positional (A row /9), not key-scoped. Stays PROPOSED until a dedicated hit replaces this one-off."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "oracle-orphan"
@@ -357,6 +376,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-48 item 1; R3E-14; R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node read in the rule, all allowlisted: #412, #921)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "oracle-gap"
@@ -368,6 +388,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-48 item 2; R3E-14; R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node read in the rule, all allowlisted: #670, #735)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "pactid-cap"
@@ -381,6 +402,7 @@ status = "PROPOSED"
 accept_class = "intended-documented"
 ruling = "R-P5P9-47 (documented compat limit); R-P5P9-48 item 4."
 owner_note = "ACCEPTED as a documented compat limit (ruling R-P5P9-47; docs/api.md). Made precise in R-P5P9-48: matches only answers carrying X-Search-Truncated. It comes after the pact-specific entries so those keep their own hits. FV checks whether kadscan relies on the old successful continuation."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "cwd-transfers-gap"
@@ -403,6 +425,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-9."
 owner_note = "Accepted (run 3E ruling R3E-9): kda-indexer keeps the node's order."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "oracle-orphan-rows"
@@ -415,6 +438,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-9; spec section 4.5; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence); R-P5P9-78 (H2 m-7): no longer shadowed by orphan-rows-txs."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R3E-9: the node confirms ours' block)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "oracle-tip-lag"
@@ -423,8 +447,8 @@ json_path_glob = "/~oracle-lag**"
 condition = "any"
 reason = "chainweb-data lags kda-indexer and fills recent heights late (seen live 2026-11-10: its /txs/recent at the tip while /txs/account still missed rows 1-4 h old, e.g. xwallet-xchain-gas at 7392405 and 7392384; kda-txs likewise). Account, event and /v1/txs rows of the last 1440 heights (12 h) below A's tip are dropped on both sides, then a side that held its full limit is cut at its lowest height on both sides; on /stats a supply higher on A by at most 60 KDA per height of tip difference (at least 240 heights) is not compared; on /txs/recent a continuation whose initialCode/previousSteps chainweb-data still shows null is reported here; on /txs/search a row kda-indexer lists above chainweb-data's tip (its /txs/recent) that chainweb-data lacks is reported here (seen live in run 6E-3: pacts 5unn... and WiLl..., chainweb-data's newest row 60-150 heights below kda-indexer's); on /coins a difference past the relative 1e-6 is reported at /~oracle-lag/coins when the side with the higher tip (both read on /txs/recent) has the higher supply and the difference is at most the coinbase minted between the two tips (miner reward table) plus that 1e-6 (seen live in run 6E-3: 2,621.7 KDA with chainweb-data about 145 heights behind). All leave this visible hit."
 status = "PROPOSED"
-accept_class = "tip-timing"
-ruling = "R3E-11."
+accept_class = "stock-stale"
+ruling = "R3E-11. H4: stock staleness below ours' tip, not bounded tip timing and no node read: class stock-stale."
 owner_note = "Accepted (run 3E ruling R3E-11): oracle lag, not a kda-indexer diff."
 
 [[entry]]
@@ -434,9 +458,10 @@ json_path_glob = "/~stats-count-age/coinsInCirculation"
 condition = "changed"
 reason = "kda-indexer serves /stats from a count its background refresher renews every 120 s, and states the count's age in seconds in the x-count-age header (STATS-FIX). Against chainweb-data, a coinsInCirculation lower on kda-indexer by at most 60 KDA per 30 s height of that age, rounded up, plus the relative 1e-6, is not compared and leaves this visible hit. The age is honoured only up to 360 s (the served WARN threshold, 3 x the refresh interval); an older count, or a header that is no age, gives no widening and is a diff at /~stats-count-age. This is kda-indexer's count lag, not the oracle's."
 status = "PROPOSED"
-accept_class = "tip-timing"
-ruling = "R-P5P9-75 item 4 (STATS-FIX); R-P5P9-78 (H2 I-1): its own path and entry, the age capped at 360 s."
+accept_class = "intended-documented"
+ruling = "R-P5P9-75 item 4 (STATS-FIX); R-P5P9-78 (H2 I-1): its own path and entry, the age capped at 360 s. Documented: docs/api.md (Compat notes, X-Count-Age)."
 owner_note = "PROPOSED (R-P5P9-78): CG-5 decides."
+doc = "docs/api.md#compat-notes"
 
 [[entry]]
 id = "oracle-unstable"
@@ -445,8 +470,8 @@ json_path_glob = "/~oracle-unstable"
 condition = "any"
 reason = "kda-txs is fed by its own indexer and can answer the same /v1/txs request differently moments apart (seen live: set shifts at /0 that were gone when both sides were fetched again). A /v1/txs diff against kda-txs is retried once after 30 s (seen live: a partial answer, 20 of 41 rows, that was whole minutes later); when the retry agrees, this visible hit replaces the diff."
 status = "PROPOSED"
-accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-15. R-P5P9-77 item 3 (restored)."
+accept_class = "stock-self-inconsistent"
+ruling = "R3E-15. R-P5P9-77 item 3 (restored). H4: stock contradicts itself (paging, cursor, count or a re-fetch), no node read: class stock-self-inconsistent."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c)."
 
 [[entry]]
@@ -456,8 +481,8 @@ json_path_glob = "/~limit-edge"
 condition = "any"
 reason = "kda-txs can return one row fewer than the limit (seen live: xwallet-xchain-gas/coin/250, 250 rows on kda-indexer, 249 on kda-txs, the extra row the oldest at 7385234). Only when kda-indexer holds exactly `limit` rows and kda-txs exactly one fewer (R-P5P9-70 m-4), both are cut at the higher of the two lowest heights: rows below it go, and at that height only the rows the limiting side lacks (R-P5P9-71 item 1); this visible hit is reported."
 status = "PROPOSED"
-accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-15; R-P5P9-70 (m-4); R-P5P9-71 (1)."
+accept_class = "stock-self-inconsistent"
+ruling = "R3E-15; R-P5P9-70 (m-4); R-P5P9-71 (1). H4: stock contradicts itself (paging, cursor, count or a re-fetch), no node read: class stock-self-inconsistent."
 owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c)."
 
 [[entry]]
@@ -467,8 +492,8 @@ json_path_glob = "/~cwd-cursor-skip"
 condition = "any"
 reason = "chainweb-data's Chainweb-Next cursor is (height, request key, idx) without the chain, so a page that ends on a coinbase row makes the next page skip the coinbase rows of the other chains at that height (seen live: /txs/events?modulename=coin&name=TRANSFER&minheight=3293727&maxheight=3293927, cursor ((3293927,\"cb\",0),0), chainweb-data 13 rows at 3293927 over three pages, kda-indexer all 23). The harness drops that height on both sides and reports this visible hit."
 status = "PROPOSED"
-accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-15."
+accept_class = "stock-self-inconsistent"
+ruling = "R3E-15. H4: stock contradicts itself (paging, cursor, count or a re-fetch), no node read: class stock-self-inconsistent."
 owner_note = "ACCEPTED (ruling R3E-15; PROPOSED in run 3E-c): chainweb-data pagination defect; compat lists every row."
 
 [[entry]]
@@ -492,6 +517,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "Owner note: ACCEPTED by owner ruling R3E-14 (run 3E-d)."
 owner_note = "ACCEPTED (owner ruling R3E-14, run 3E-d): node agrees with kda-indexer, so chainweb-data's missing rows and short pages without a next-page token are chainweb-data defects."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "kdatxs-missing-node"
@@ -503,6 +529,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-15 (run 3E-d); R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node read in the rule, 71 hits all allowlisted: #34, #108, #131)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "kdatxs-events-node"
@@ -514,6 +541,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-15 (run 3E-g); R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node read in the rule, all allowlisted: #108, #615)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "cwd-events-missing-node"
@@ -525,6 +553,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-14 (run 3E-g); R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R3E-14: the node as referee)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "search-window"
@@ -538,6 +567,7 @@ status = "PROPOSED"
 accept_class = "intended-documented"
 ruling = "Plan Task 12 (S-4); R-P5P9-48 item 4 (X-Search-Truncated). R-P5P9-77 item 3 (restored)."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Plan Task 12 (S-4), like event-search-window."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "coins-supply-tolerance"
@@ -561,6 +591,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-60; R-P5P9-75, CG-4."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #40, #339)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r60-count-self-consistent"
@@ -570,8 +601,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-60 rule (a), kind count_self_consistent (Transactions-9e58b95d; CG-A2 node counts = ours 4/4): neither page is cut, the two edge sets match, our totalCount equals our edge count, and the reference server's totalCount is below its own edge count (an oracle count above its edges stays a diff, R-P5P9-60 round 2). Any other count difference stays unexplained."
 status = "ACCEPTED"
-accept_class = "stock-wrong-node-evidence"
-ruling = "R-P5P9-60; R-P5P9-75, CG-4."
+accept_class = "stock-self-inconsistent"
+ruling = "R-P5P9-60; R-P5P9-75, CG-4. H4: stock contradicts itself (paging, cursor, count or a re-fetch), no node read: class stock-self-inconsistent."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #199, #309)."
 
 [[entry]]
@@ -582,8 +613,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-60 H2: a list bounded by one block or one transaction (a block's transactions or events, a transaction's transfers or events) had its page cut on either side; the harness read that list to its end on both sides (at each target's own rate, at most 20 pages per list and list_page_budget pages per side and compare, with each row's key read so a row twice on one side leaves the list unfinished; R-P5P9-61 H6) and compared the full sets with their totalCount. A list whose cursor page fails (the oracle's Block.events) is read again once in one page of its totalCount (R-P5P9-64 I-5). A row only one side's full list holds stays a diff, and a list it could not finish keeps its cut pages and a /~graphql-h6-unfinished or /~harness-limit/ entry, which no entry matches, so the record stays unexplained."
 status = "ACCEPTED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-60 H2; R-P5P9-61 H6; R-P5P9-64 I-5/M-5/M-7; R-P5P9-75, CG-4."
+accept_class = "harness-convention"
+ruling = "R-P5P9-60 H2; R-P5P9-61 H6; R-P5P9-64 I-5/M-5/M-7; R-P5P9-75, CG-4. H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #24, #28, #101)."
 
 [[entry]]
@@ -597,6 +628,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-62; R-P5P9-75, CG-4; R-P5P9-86 (text)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #10, #21, #151)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-h8-transfer-order-index"
@@ -609,6 +641,7 @@ status = "ACCEPTED"
 accept_class = "intended-documented"
 ruling = "R-P5P9-62; R-P5P9-75, CG-4."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #36, #74, #264)."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "graphql-r62-payload-data"
@@ -621,6 +654,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-62; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R-P5P9-62: the node's cont.data null = ours (CG-3T))."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r75-coinbase-request-key"
@@ -630,8 +664,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-75 C (oracle convention): the reference server sends a coinbase row's requestKey as 60 characters of base64 over the JSON-quoted key. H7 decodes it for the row's identity and settles the row on the coinbase path (the canonical header at the row's height on the cut's branch, its parent hash and its payload's coinbase output), never /poll. Explained only when the decoded key is ours (the rows pair by it) and the node's coinbase key, the block's parent hash. A key that decodes to another, or a node whose coinbase key is another, stays unexplained."
 status = "PROPOSED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-75."
+accept_class = "harness-convention"
+ruling = "R-P5P9-75. H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "PROPOSED (ruling R-P5P9-75 C; evidence CG-4 #30, #69, #88): a G4 compat note; ours sends the coinbase key as the node does."
 
 [[entry]]
@@ -642,8 +676,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-86 C (oracle convention): a row whose requestKey is not a 43-character hash is a coinbase row; it pairs by its place (chain, block, height, index) and is settled on the coinbase path only (the canonical header at the row's height on the cut's branch and its payload's coinbase output reqKey), never /poll. Ours' key must equal the node's coinbase key byte for byte, in either of the node's eras (60 characters of base64url over the JSON-quoted parent hash, or 58 characters of base64 over the bare parent hash). The oracle's key is excused only when it is that same header's bare parent hash or base64 of that header's own hash; the record lists each pair with ours' and the oracle's keys. Any other oracle key, or ours differing from the node, stays unexplained."
 status = "PROPOSED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-86."
+accept_class = "harness-convention"
+ruling = "R-P5P9-86. H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "PROPOSED (ruling R-P5P9-86 C; evidence CG-5 #35, #63, #83): a G4 compat note; the oracle sends coinbase keys in its own forms, ours sends the node's."
 
 [[entry]]
@@ -654,8 +688,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-75 G: a nested list below a root list's rows whose rows select no key (BlocksByHeight's transactions { cmd { meta { gasPrice } } }), outside H2's scope, compared as a multiset of the selected values per parent: only when both sides' lists are complete (no next page, totalCount equal to the rows) with equal totalCount. A value one side lacks stays a diff; a list not complete on both sides, or with another totalCount, keeps its order and a /~graphql-h6-unfinished entry with why, which no entry matches."
 status = "PROPOSED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-75."
+accept_class = "harness-convention"
+ruling = "R-P5P9-75. H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "PROPOSED (ruling R-P5P9-75 G; CG-4 #54, #75, #196): the order within a block is a contract choice (R3E-8)."
 
 [[entry]]
@@ -669,6 +703,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 I; R-P5P9-86, CG-5; R-P5P9-92 (1); R-P5P9-93."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked 3/3, the node's tx count = ours: #48, #73, #121)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r75-payload-rollback"
@@ -681,6 +716,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 J; R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked 3/3, the node's cont rollback = ours: #149, #372, #528)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r75-signer-address"
@@ -693,6 +729,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 L; R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked, the node's signer addr = ours: #838)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r75-single-block-cut"
@@ -705,6 +742,7 @@ status = "PROPOSED"
 accept_class = "intended-documented"
 ruling = "R-P5P9-75 N."
 owner_note = "PROPOSED (ruling R-P5P9-75 N): new in FVH-D3; stays PROPOSED until CG-5 shows clean hits."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "graphql-native-miner-skew"
@@ -714,8 +752,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-86 S' (the native pair, gql|native): ours' GraphQL coin balance of a miner account against ours' native /api/v1 balance, read seconds apart, straddles a block. Live: on a gap the pair is re-read once in the other order (native first, then GraphQL); the record is explained only when the re-read agrees on every chain with a gap. Stored (R-P5P9-87, the referee): the gap is exactly k (1 to 3) of the chain's coinbase rewards, and the node's canonical blocks in the record's height window (the height whose block time is nearest the record's time, +/- 10) pay the account at least k coinbases of that one amount. Any other gap, a re-read that still differs, or a gap the node's coinbases do not cover stays unexplained."
 status = "PROPOSED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-86 S'; R-P5P9-87 (the stored form)."
+accept_class = "harness-convention"
+ruling = "R-P5P9-86 S'; R-P5P9-87 (the stored form). H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "PROPOSED (ruling R-P5P9-86 S'): new in FVH-E2; both sides are ours, the node settles the stored form."
 
 # R-P5P9-75 (P, Q): KNOWN-GAP entries. A hit is never explained: its record is class
@@ -732,8 +770,8 @@ request_any = ["graphql:QFungibleAccount ", "graphql:FungibleAccount-78665e6d ",
 baseline_per_hour = 2.22
 reason = "R-P5P9-75 Q (OUR DEFECT, stored bytes; on the post-G4 gap list, R-P5P9-60): an ours-side chain row missing. The harness's marker: a plain chain-row list where ours' (chainId, tokenId) keys are a strict subset of the oracle's; the oracle's extra rows leave and the rows both hold still compare field by field. On the non-fungible path (`nonFungibleAccount.chainAccounts`, R-P5P9-86 Q, CG-5 #37) an empty list of ours is the marker too (every oracle chain row missing); on the fungible path it stays a diff. Scoped to QFungibleAccount, FungibleAccount-78665e6d, NonFungibleAccount-f77b27d1 and QNonFungibleAccount; on any other operation the marker is a plain diff. A row only ours holds, or any other difference in the record, stays unexplained. CG-4 baseline: 9 records (QFungibleAccount 5, FungibleAccount-78665e6d 2, NonFungibleAccount-f77b27d1 1, QNonFungibleAccount 1) in the 00:55:00-04:58:10Z window (4.05 h) = 2.22/h; gate limit 3.33/h."
 status = "KNOWN-GAP"
-accept_class = "intended-documented"
-ruling = "R-P5P9-75 (P, Q); R-P5P9-60; R-P5P9-86 Q (the non-fungible chainAccounts path; the cap unchanged)."
+accept_class = "our-defect"
+ruling = "R-P5P9-75 (P, Q); R-P5P9-60; R-P5P9-86 Q (the non-fungible chainAccounts path; the cap unchanged). H4: OUR DEFECT, class our-defect (not intended)."
 owner_note = "KNOWN-GAP (accepted for G4 by the controller, R-P5P9-60 line 595): never explained; listed for the owner in the G4 package."
 
 [[entry]]
@@ -762,6 +800,7 @@ status = "ACCEPTED"
 accept_class = "intended-documented"
 ruling = "R-P5P9-62; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R-P5P9-62: ours = the node's Pact ParsedInteger, round half to even; a judgment call for the controller)."
+doc = "docs/comparison.md#intended-differences"
 
 # R-P5P9-78 D4a (H2 I-2): the classes D1 and D2 added under ACCEPTED entries each emit a
 # visible hit of their own, PROPOSED until CG-5 samples them.
@@ -777,6 +816,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 (E, M); R-P5P9-78 (H2 I-2)."
 owner_note = "PROPOSED (ruling R-P5P9-78 H2 I-2; evidence CG-4 #23 for E): stays PROPOSED until CG-5 shows clean hits of E and M."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r75-nested-order-index"
@@ -789,6 +829,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 (O); R-P5P9-78 (H2 I-2); R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked, the node's TRANSFER indexes: #38)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r75-exec-payload-data"
@@ -801,6 +842,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 (K); R-P5P9-78 (H2 I-2); R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked 3/3, ours = the node's exec data: #21, #24, #46)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r75-h7-unindexed"
@@ -813,6 +855,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 (D, F); R-P5P9-81 (m-1)."
 owner_note = "PROPOSED (ruling R-P5P9-81 m-1): stays PROPOSED until CG-5 shows clean hits of D and F."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-count-walk"
@@ -822,8 +865,8 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-86 TC (replaces R-P5P9-75 I's 'oracle below ours' condition): a record whose only difference outside the visible hits is its root totalCount, the oracle above or below ours. Both lists are walked to the end by the operation's own document (100 rows a page, at most 5,000 rows a side, at the harness rate), and every one-sided row is settled by the H7 rules on the node (H7's own hits stay beside this one, each with its entry). Explained only when every one-sided row is and the difference in the counts equals the difference in one-sided rows; the hit carries each side's count, walked rows and one-sided rows. Stored (R-P5P9-87, the referee): ours is walked bounded at the record's height (its highest stored row) or the oracle's frozen height, whichever is lower, and the frozen oracle as it is now. A side past 5,000 rows is /~graphql-count-walk-capped ('count walk capped', which no entry matches); a failed page, a row H7 does not settle or counts the rows do not account for leave the count difference unexplained."
 status = "PROPOSED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-86 TC; R-P5P9-87 (the stored form)."
+accept_class = "harness-convention"
+ruling = "R-P5P9-86 TC; R-P5P9-87 (the stored form). H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "PROPOSED (ruling R-P5P9-86 TC): new in FVH-E2b; CG-5 class TC (#243, #87, #866)."
 
 [[entry]]
@@ -837,6 +880,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "FIX-3 (owner-authorised 2026-11-18); o1o2 diagnosis O1; fix3e S2: ACCEPTED on the condition that the single extra row is identified on a walkable oracle list and node-confirmed as sent by the account in a canonical block."
 owner_note = "ACCEPTED (fix3e S2): CG class O1 (Transactions-bca501b0 count +1), narrowed to a named, node-confirmed extra row."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r97-oracle-list-over-count"
@@ -849,6 +893,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-97 U; R-P5P9-103, CG-5."
 owner_note = "ACCEPTED (ruling R-P5P9-103): reviewed narrow in review-fvh-h; CG-5 class U (#432, #2045)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r97-oracle-chain-dupes"
@@ -861,6 +906,7 @@ status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-97 Q #37; R-P5P9-103, CG-5."
 owner_note = "ACCEPTED (ruling R-P5P9-103): reviewed narrow in review-fvh-h; reads counted under --max-reads (review B1); CG-5 #37."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-oracle-decimal-zeros"
@@ -873,6 +919,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-86 X."
 owner_note = "PROPOSED (ruling R-P5P9-86 X): new in FVH-E2b; CG-5 class X (#744)."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "rest-compose"
@@ -881,8 +928,8 @@ json_path_glob = "/~rest-compose"
 condition = "any"
 reason = "R-P5P9-86 (REST account records where several rules apply; CG-5 #1385, #1854, #1966): on an account pair against chainweb-data or a /v1/txs pair against kda-txs, rules combine on one record row by row. Each one-sided row is explained by exactly one rule's own check: a row only ours lists by the node (cwd-missing-node / kdatxs-missing-node: a user tx in ours' block on the node's /poll with an event naming the account; cwd-missing-node-coinbase: the node's canonical block at the row's height is the row's and its coinbase pays the account the row's amount), a row only the oracle lists by ours' limit (ours-limit-edge). Field differences of shared rows stay diffs for their own rules. This hit lists each rule and its row count; the record is explained only when every row and every field is. Stored (R-P5P9-87, the referee): the same on the stored rows, without the live window drop (a recent row the oracle lacks must then pass the node check)."
 status = "PROPOSED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-86 (REST composition); R-P5P9-87 (the stored form)."
+accept_class = "harness-convention"
+ruling = "R-P5P9-86 (REST composition); R-P5P9-87 (the stored form). H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b; CG-5 REST account (#1385, #1854, #1966)."
 
 [[entry]]
@@ -895,6 +942,7 @@ status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-86 (REST composition)."
 owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b."
+doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "ours-limit-edge"
@@ -906,6 +954,7 @@ status = "PROPOSED"
 accept_class = "intended-documented"
 ruling = "R-P5P9-86 (REST composition); R-P5P9-72 (1)."
 owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b."
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "kdatxs-edge-lag"
@@ -926,6 +975,6 @@ condition = "any"
 request_contains = "graphql:"
 reason = "R-P5P9-88 (G, on R-P5P9-86 G): a nested transactions list without a key that the oracle cut (BlocksByHeight: 20 of 126 edges) and ours lists whole, under root rows that pair by their block (chainId, height, hash). Explained only when the oracle's cut list equals ours' prefix of the same length, in order, with the same totalCount, and ours' whole list is the node's payload for that block (the canonical header on the cut's branch at the row's height is the row's block) by count, and by request key when ours' rows select one; one payload read per block, within the compare's cap. Anything else stays /~graphql-h6-unfinished, which no entry matches. Live and in the referee alike; the hit lists each block and the node's tx count. R-P5P9-95 (m-4): ours' rows past the oracle's prefix select only their key, cmd and __typename, and their cmd subtrees match the block's signed commands one to one; else the list stays unfinished."
 status = "PROPOSED"
-accept_class = "intended-documented"
-ruling = "R-P5P9-88 (G); R-P5P9-86 G."
+accept_class = "harness-convention"
+ruling = "R-P5P9-88 (G); R-P5P9-86 G. H4: a comparison convention of the harness, listed in docs/methodology.md: class harness-convention."
 owner_note = "PROPOSED (ruling R-P5P9-88 concern 4): new in FVH-E3; CG-5 class G (#70, #91, #147)."

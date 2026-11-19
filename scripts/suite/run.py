@@ -292,6 +292,24 @@ def native_check(ep, cls, path, st, body):
 
 # ---------------------------------------------------------------------------------------
 
+class OnePerKey:
+    """At most one task in flight per key (the tip sampler's reads, one per host)."""
+
+    def __init__(self):
+        self.busy, self.lock = set(), threading.Lock()
+
+    def start(self, k):
+        with self.lock:
+            if k in self.busy:
+                return False
+            self.busy.add(k)
+            return True
+
+    def done(self, k):
+        with self.lock:
+            self.busy.discard(k)
+
+
 class PairDiff:
     def __init__(self, binary, config):
         self.p = subprocess.Popen([binary, "--config", config, "pair-diff"], stdin=subprocess.PIPE,
@@ -578,16 +596,72 @@ def tip_fields(node, idx, host, t0, t1):
     return out
 
 
-def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None):
-    """Class and allowlist ids after the suite allowlist (allow.py). `tip`: the node's highest
-    height at ours' read and at stock's ({"ours", "stock"}), for the tip-timing rule."""
-    c = v.get("class")
+# Harness hits that mean only part of a list was compared (a common prefix after a page cut,
+# a capped count, a size limit): such a record is `incomplete`, never equal or accepted.
+PARTIAL_HITS = {"/~graphql-page-cut", "/~graphql-totalcount-cap", "/~harness-limit/graphql-merged-bytes",
+                "/~graphql-short-page"}
+KEEP_ALL = 200      # a record keeps the full diff list up to this many entries (re-referee input)
+
+
+def rule_entries(v):
+    """(entries, complete) the suite rules judge: pair-diff's full list (`all`) when it was kept,
+    else the display list, complete only when `total` says nothing was cut (H4, B3). A record
+    from before H4 (no `total`) is judged by allow.complete on its display list."""
+    if isinstance(v.get("all"), list):
+        return v["all"], len(v["all"]) == v.get("total", len(v["all"]))
     ents = v.get("entries") or []
+    if isinstance(v.get("total"), int):
+        return ents, v["total"] <= len(ents)
+    return ents, None
+
+
+def stored_verdict(v, k, ids):
+    """The `v` a record stores: display entries (at most MAX_SHOWN), the total, and the full list
+    when it has at most KEEP_ALL entries, so a later re-referee sees every difference."""
+    out = {"class": k, "ids": (v.get("ids") or []) + ids, "known": v.get("known_ids"), "open": v.get("open_ids") or [],
+           "entries": (v.get("entries") or [])[:allow.MAX_SHOWN]}
+    if isinstance(v.get("total"), int):
+        out["total"] = v["total"]
+    if isinstance(v.get("all"), list) and len(v["all"]) <= KEEP_ALL:
+        out["all"] = v["all"]
+    ents, done = rule_entries(out)
+    out["complete"] = bool(done) if done is not None else allow.complete({"entries": ents})
+    return out
+
+
+def count_rows(body):
+    """Rows of a list answer (GraphQL connection edges, a REST list or `items`), else 1."""
+    if isinstance(body, list):
+        return len(body)
+    if isinstance(body, dict):
+        if isinstance(body.get("items"), list):
+            return len(body["items"])
+        for x in (body.get("data") or {}).values() if isinstance(body.get("data"), dict) else []:
+            if isinstance(x, dict) and isinstance(x.get("edges"), list):
+                return len(x["edges"])
+    return 1
+
+
+def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx=None):
+    """Class and allowlist ids after the suite allowlist (allow.py). `tip`: the node's highest
+    height at ours' read and at stock's ({"ours", "stock"}), for the tip-timing rule; `idx`: ours'
+    and stock's own lastBlockHeight; `query`: the case's GraphQL document."""
+    c = v.get("class")
+    ents, done = rule_entries(v)
+    if isinstance(v.get("all"), list) and len(v["all"]) > KEEP_ALL:
+        done = False                    # the record cannot keep this list: judge as a re-referee would
     if any(e.get("path") == "/~graphql-oracle-stall" for e in ents):
         return "stock-unavailable", []
+    if c in ("equal", "allowlisted") and any(e.get("path") in PARTIAL_HITS for e in ents):
+        return "incomplete", []         # owner H4 rule 1: only part of the list was compared
+    if c == "allowlisted" and v.get("open_ids"):
+        c = "diff"                      # owner H4 rule 3: an open (undocumented) entry accepts nothing
     if c in ("diff", "status"):
-        k, ids = allow.classify({"ep": ep, "cls": cls, "ours_codes": ours_codes, "entries": ents,
-                                 "vars": vars_, "node": node, "tip": tip})
+        ctx = {"ep": ep, "cls": cls, "ours_codes": ours_codes, "entries": ents, "vars": vars_, "node": node,
+               "tip": tip, "query": query, "idx": idx}
+        if done is not None:
+            ctx["complete"] = done
+        k, ids = allow.classify(ctx)
         if k != "diff":
             return k, ids
     return c, []
@@ -622,9 +696,11 @@ class Runner:
         nd = cfg.get("node") or {}
         self.node = nodecheck.Node(Http(nd.get("timeout_s", 30)), nd["url"], nd.get("network", "mainnet01"),
                                    min(float(nd.get("rps", 20)), 30.0),
-                                   float(nd.get("max_wait_s", 30))) if nd.get("url") else None
+                                   float(nd.get("max_wait_s", 30)),
+                                   float(nd.get("settle_s", nodecheck.SETTLE_S))) if nd.get("url") else None
         self.tip_period = float(getattr(a, "tip_period", 1.0) or 1.0)
         self.idx = {"ours": nodecheck.TipLog()}
+        self.tip_reads = OnePerKey()
         for h in self.oracles:
             self.idx[h.name] = nodecheck.TipLog()
         if self.node:
@@ -655,6 +731,8 @@ class Runner:
         hosts = [("ours", None)] + [(h.name, h) for h in self.oracles]
 
         def one_read(name, h):
+            if not self.tip_reads.start(name):
+                return                      # the previous read of this host is still in flight (M1)
             try:
                 if h is None:
                     r = self.ours_call("graphql", q)
@@ -669,6 +747,8 @@ class Runner:
                 raise
             except Exception:  # noqa: BLE001 - tip evidence only
                 pass
+            finally:
+                self.tip_reads.done(name)
         while True:
             for name, h in hosts:
                 threading.Thread(target=one_read, args=(name, h), daemon=True).start()
@@ -759,23 +839,23 @@ class Runner:
                     row["v"] = {"class": "stock-unavailable"}
                 elif s["status"] and a["status"]:
                     ab, sb = normalize_pair(ep, ab, sb)
+                    row["rows"] = [count_rows(ab), count_rows(sb)]      # rows compared (ours, stock)
                     rq = req["path"] if fam != "graphql" else "%s %s" % (req.get("op", "op"), json.dumps(req["variables"]))
                     v = self.pd({"id": case["id"], "kind": "graphql" if fam == "graphql" else "rest",
-                                 "request": rq, "max": maxh,
+                                 "request": rq, "max": maxh, "full": True,
                                  "ours": {"status": a["status"], "body": ab},
                                  "stock": {"status": s["status"], "body": sb}})
                     node = None
                     if v.get("class") in ("diff", "status") and self.node and ep in NODE_EPS and a["status"] == 200:
                         node = row["node"] = self.node.check(ep, vars_, ab)
                     if v.get("class") in ("diff", "status") and self.node and ep in nodecheck.EVIDENCE_EPS \
-                            and a["status"] == 200 and nodecheck.needs_evidence(ep, v.get("entries") or []):
+                            and a["status"] == 200 and nodecheck.needs_evidence(ep, v.get("all") or v.get("entries") or []):
                         ev = self.orphan_evidence(case, vars_, self.stock_host(case, stock))
                         if ev:
                             node = row["node"] = dict(node or {}, **ev)
-                    tip = row.get("tip")
-                    k, ids = verdict_class(ep, case["cls"], v, codes, vars_, node, tip)
-                    row["v"] = {"class": k, "ids": (v.get("ids") or []) + ids, "known": v.get("known_ids"),
-                                "entries": v.get("entries")}
+                    k, ids = verdict_class(ep, case["cls"], v, codes, vars_, node, row.get("tip"),
+                                           req.get("query"), row.get("idx"))
+                    row["v"] = stored_verdict(v, k, ids)
         (self.sample if lane == "sample" else self.res).write(json.dumps(row, separators=(",", ":")) + "\n")
         return row
 
@@ -806,9 +886,10 @@ class Runner:
         if not (o_done and s_done):
             return dict(info, evidence="incomplete")
         extra = nodecheck.extra_rows(o_rows, s_rows)
+        ours_only = len(nodecheck.extra_rows(s_rows, o_rows))       # rows only ours lists (H4, S1)
         if not extra:
-            return dict(info, evidence="no-extra-rows", extra=0)
-        return dict(info, evidence="node", **self.node.evidence(extra, nodecheck.EVIDENCE_READS))
+            return dict(info, evidence="no-extra-rows", extra=0, ours_only=ours_only)
+        return dict(info, evidence="node", ours_only=ours_only, **self.node.evidence(extra, nodecheck.EVIDENCE_READS))
 
     def cross(self, ep, req, st, body):
         """Cross-check of an answer against ours' other APIs (same fact, one more request)."""
@@ -981,6 +1062,7 @@ def report(out):
     lat = collections.defaultdict(lambda: {"ours": [], "stock": []})
     classes = collections.defaultdict(lambda: [0, []])
     allow_ids = collections.Counter()
+    rows_cmp = collections.Counter()      # rows compared (ours + stock), per verdict class
     probs = collections.defaultdict(collections.Counter)
     hourly = collections.defaultdict(collections.Counter)
     node_why = collections.Counter()
@@ -1048,6 +1130,7 @@ def report(out):
                 k = v["class"]
                 c[k] += 1
                 cov_tot[cov][k] += 1
+                rows_cmp[k] += sum(x for x in (r.get("rows") or []) if isinstance(x, int))
                 for i in v.get("ids") or []:
                     allow_ids[i] += 1
                 if k in ("diff", "status"):
@@ -1057,7 +1140,7 @@ def report(out):
                     classes[ck][0] += 1
                     if len(classes[ck][1]) < 3:
                         classes[ck][1].append(r["id"])
-    cols = ["run", "equal", "allowlisted", "known-gap", "diff", "status", "stock-unavailable",
+    cols = ["run", "equal", "allowlisted", "known-gap", "diff", "status", "incomplete", "stock-unavailable",
             "stock_err", "ours_err", "ours_429", "not_run", "node_ok", "node_bad", "node_skip",
             "cross_ok", "cross_bad", "inv_clean"]
     lines = ["# Endpoint suite report", "",
@@ -1092,6 +1175,10 @@ def report(out):
             lines.append("- %s: %d verdicts, %d equal (%.2f%%), %d allowlisted, %d known-gap, %d diff, %d status; "
                          "%d stock unavailable" % (cov, n, t["equal"], 100.0 * t["equal"] / max(n, 1), t["allowlisted"],
                                                    t["known-gap"], t["diff"], t["status"], t["stock-unavailable"]))
+    lines += ["", "## Rows compared (ours + stock rows of every paired answer, by verdict)", ""]
+    for k, n in sorted(rows_cmp.items()):
+        lines.append("- %s: %d rows" % (k, n))
+    lines.append("- total: %d rows" % sum(rows_cmp.values()))
     lines += ["", "## Allowlist hits (suite rules and harness ids)", ""]
     for k, n in allow_ids.most_common():
         lines.append("- %s: %d" % (k, n))
@@ -1124,23 +1211,42 @@ def report(out):
     print("\n".join(lines[:6]))
 
 
-def rereferee_rows(rows, vars_of):
+SUITE_RULE_IDS = {r.id for r in allow.RULES} | {"accepted-tags"}    # and the H2 id the tag rules replaced
+
+
+def rereferee_rows(rows, vars_of, query_of=None):
     """Re-classifies stored records with the current allowlist (allow.py), no request sent.
-    `rows`: iterable of (source, record); `vars_of(id)`: the case's GraphQL variables or None.
-    Only records stored as diff or status are looked at; the node check and tip pair the run
-    stored on the record are the evidence. Returns the tallies (see rereferee_md)."""
+    `rows`: iterable of (source, record); `vars_of(id)`: the case's GraphQL variables or None;
+    `query_of(id)`: its GraphQL document or None. Records stored as diff or status are judged,
+    and so are records a suite rule accepted (their ids name one): the rule may be stricter now
+    (H4), so they are judged again from pair-diff's own class (`status` where the HTTP statuses
+    differ, else `diff`) and counted in `reopened` when no rule accepts them any more. The node
+    check, tip pair and indexer heights the run stored on the record are the evidence."""
+    query_of = query_of or (lambda i: None)
     before, after = collections.Counter(), collections.Counter()
-    moved, left = collections.Counter(), collections.Counter()
+    moved, left, reopened = collections.Counter(), collections.Counter(), collections.Counter()
     origin = collections.defaultdict(lambda: [0, 0])      # rows imported from run 1 vs run 2's own
     for src, r in rows:
-        v = r.get("v") or {}
-        if v.get("class") not in ("diff", "status"):
+        v = dict(r.get("v") or {})
+        suite_ids = [i for i in v.get("ids") or [] if i in SUITE_RULE_IDS]
+        was = v.get("class")
+        if was in ("allowlisted", "known-gap") and suite_ids:
+            same = (r.get("ours") or {}).get("st") == (r.get("stock") or {}).get("st")
+            v["class"] = "diff" if same else "status"
+            v["ids"] = [i for i in v.get("ids") or [] if i not in SUITE_RULE_IDS]
+        elif was not in ("diff", "status"):
+            continue
+        k, ids = verdict_class(r["ep"], r.get("cls"), v, (r.get("ours") or {}).get("gql_errors") or [],
+                               vars_of(r["id"]) or {}, r.get("node"), r.get("tip"), query_of(r["id"]), r.get("idx"))
+        if was not in ("diff", "status"):
+            if k in ("diff", "status"):
+                reopened[(r["ep"], ",".join(suite_ids))] += 1
+                after[src] += 1
+                left[r["ep"]] += 1
             continue
         before[src] += 1
         og = origin[r.get("from") or "run2"]
         og[0] += 1
-        k, ids = verdict_class(r["ep"], r.get("cls"), v, (r.get("ours") or {}).get("gql_errors") or [],
-                               vars_of(r["id"]) or {}, r.get("node"), r.get("tip"))
         if k in ("diff", "status"):
             after[src] += 1
             left[r["ep"]] += 1
@@ -1148,12 +1254,13 @@ def rereferee_rows(rows, vars_of):
         else:
             moved[(r["ep"], ",".join(ids), k)] += 1
     return {"before": dict(before), "after": dict(after), "moved": dict(moved), "left": dict(left),
-            "origin": dict(origin), "total_before": sum(before.values()), "total_after": sum(after.values())}
+            "origin": dict(origin), "reopened": dict(reopened), "total_before": sum(before.values()),
+            "total_after": sum(after.values())}
 
 
 def rereferee_md(out, name):
     """Aggregate counts only: endpoints and rule ids, never a case id or a request."""
-    lines = ["# Re-referee of %s with the H2 harness" % name, "",
+    lines = ["# Re-referee of %s with the current harness rules" % name, "",
              "Stored records only (diff and status rows of results.jsonl and sample.jsonl); no request sent. "
              "The rules read the node check and the tip pair stored on each record.", "",
              "- unexplained before: %d" % out["total_before"],
@@ -1168,6 +1275,11 @@ def rereferee_md(out, name):
     for (ep, ids, k), n in sorted(out["moved"].items(), key=lambda x: -x[1]):
         lines.append("- %s, %s, %s: %d" % (ep, ids, k, n))
     if not out["moved"]:
+        lines.append("- none")
+    lines += ["", "## Accepted before, open under the current rules (endpoint, rule: rows)", ""]
+    for (ep, ids), n in sorted(out.get("reopened", {}).items(), key=lambda x: -x[1]):
+        lines.append("- %s, %s: %d" % (ep, ids, n))
+    if not out.get("reopened"):
         lines.append("- none")
     lines += ["", "## Still unexplained, by endpoint", ""]
     for ep, n in sorted(out["left"].items(), key=lambda x: -x[1]):
@@ -1184,16 +1296,18 @@ def rereferee(out, cases_dir, md_path):
         if not os.path.exists(path):
             continue
         for l in open(path):
-            if '"class":"diff"' not in l and '"class":"status"' not in l:
+            if not any(x in l for x in ('"class":"diff"', '"class":"status"', '"class":"allowlisted"',
+                                        '"class":"known-gap"')):
                 continue
             try:
                 r = json.loads(l)
             except Exception:
                 continue
-            if (r.get("v") or {}).get("class") in ("diff", "status"):
+            v = r.get("v") or {}
+            if v.get("class") in ("diff", "status") or any(i in SUITE_RULE_IDS for i in v.get("ids") or []):
                 stored.append((src, r))
                 want[r["ep"]].add(r["id"])
-    vars_by = {}
+    vars_by, query_by = {}, {}
     for ep, ids in want.items():
         fn = os.path.join(cases_dir, ep + ".jsonl.gz")
         if not os.path.exists(fn):
@@ -1202,10 +1316,11 @@ def rereferee(out, cases_dir, md_path):
             c = json.loads(l)
             if c["id"] in ids:
                 vars_by[c["id"]] = (c.get("req") or {}).get("variables") or {}
-    res = rereferee_rows(stored, vars_by.get)
+                query_by[c["id"]] = (c.get("req") or {}).get("query")
+    res = rereferee_rows(stored, vars_by.get, query_by.get)
     with open(md_path, "w") as f:
         f.write(rereferee_md(res, os.path.basename(os.path.abspath(out))))
-    json.dump({k: v for k, v in res.items() if k != "moved"}, open(md_path + ".json", "w"))
+    json.dump({k: v for k, v in res.items() if k not in ("moved", "reopened")}, open(md_path + ".json", "w"))
     print("unexplained before %d after %d" % (res["total_before"], res["total_after"]))
 
 

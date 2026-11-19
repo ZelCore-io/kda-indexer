@@ -14,13 +14,17 @@ OURS-BUG classes have no rule here: they stay open diffs until ours is fixed.
 
 import base64
 import collections
+import decimal
+import json
 import re
 
-# Why a rule accepts a difference (the same four classes as `accept_class` in
-# compare/allowlist.toml).
-ACCEPT_CLASSES = ("stock-wrong-node-evidence", "intended-documented", "unsupported-by-design", "tip-timing")
+# Why a rule accepts a difference (the same classes as `accept_class` in compare/allowlist.toml).
+ACCEPT_CLASSES = ("stock-wrong-node-evidence", "intended-documented", "unsupported-by-design", "tip-timing",
+                  "stock-self-inconsistent", "stock-stale", "harness-convention", "our-defect")
 TIP_WINDOW = 4          # heights the tip may move between ours' read and stock's (about 2 minutes)
-TIP_SAMPLE_AGE = 30     # seconds: a tip sample older than this is not a reading at that time
+MAX_SHOWN = 8           # kda-compare pair-diff's display cut (crates/kdx-compare/src/pair.rs MAX_SHOWN)
+CHAINS = 20
+MAX_BLOCK_REWARD = 2.5  # KDA a block can mint at most (above the highest reward of the emission schedule)
 
 
 class Rule:
@@ -29,6 +33,7 @@ class Rule:
         self.node, self.classes = node, classes
         self.accept, self.ruling = META[id]       # a rule without META is refused at import
         assert self.accept in ACCEPT_CLASSES, id
+        self.doc = DOC.get(id, _DIFF % "intended-differences" if id.startswith("tag:") else None)
 
     def explains(self, ctx):
         """Indices of the entries this rule explains (empty: none)."""
@@ -36,9 +41,27 @@ class Rule:
             return set()
         if self.classes and ctx["cls"] not in self.classes:
             return set()
-        if self.node and not (ctx.get("node") or {}).get("ok"):
+        if self.node and not node_passed(ctx.get("node")):
             return set()
+        if self.doc is None and self.id != "known-gap-missing-chain-rows":
+            return set()                      # owner H4 rule 3: undocumented, never accepted
         return self.fn(ctx) or set()
+
+
+def node_passed(node):
+    """The row's node check passed. A near-tip mismatch that no fresh re-read settled (`tip-race`,
+    every record before H4) is a failed check, whatever `ok` says."""
+    node = node or {}
+    return node.get("ok") is True and "tip-race" not in (node.get("why") or [])
+
+
+def complete(ctx):
+    """Every difference of the row is in ctx["entries"]. A stored record without the flag holds
+    pair-diff's display list: MAX_SHOWN entries there may be a cut list."""
+    c = ctx.get("complete")
+    if c is not None:
+        return bool(c)
+    return len(ctx.get("entries") or []) < MAX_SHOWN
 
 
 # id -> (accept class, ruling). The ruling names where the difference was accepted.
@@ -50,18 +73,42 @@ META = {
     "networkInfo-totalGasUsedInKda": ("unsupported-by-design", _T1 % "2 (docs table: NOT_AVAILABLE)"),
     "networkInfo-stock-error": ("stock-wrong-node-evidence", _T1 % "2 (stock's own INTERNAL_SERVER_ERROR)"),
     "networkInfo-totalDifficulty": ("stock-wrong-node-evidence", _T1 % "2 (stock answers -1)"),
-    "networkInfo-coins-stale": ("stock-wrong-node-evidence", _T1 % "2 (stock's value lags)"),
+    "networkInfo-coins-stale": ("stock-wrong-node-evidence", _T1 % "2 (stock's value lags; H4: the node tip "
+                                "sampled at stock's answer is above stock's own lastBlockHeight)"),
     "completedBlockHeights-stock-error": ("stock-wrong-node-evidence", _T1 % "3 (node check passes on the row)"),
     "bad-input-vs-stock-error": ("intended-documented", _T1 % "7b (docs Pages)"),
     "ours-refuses-lenient-input": ("intended-documented", _T1 % "7c and 1 (docs: lenient input is refused)"),
     "node-undecodable-id": ("intended-documented", _T1 % "1 (docs Blocks and network)"),
     "guard-keyset-reference": ("intended-documented", _T1 % "5 and 7d (docs Accounts)"),
-    "accepted-tags": ("intended-documented", _T1 % "7d (tags already accepted in compare/allowlist.toml)"),
-    "known-gap-missing-chain-rows": ("intended-documented", _T1 % "7d (known gap Q, gated by the baseline)"),
+    "known-gap-missing-chain-rows": ("our-defect", _T1 % "7d (known gap Q: OUR DEFECT, gated by the baseline)"),
     "lastBlockHeight-tip-race": ("tip-timing", _T1 % "7d (up to 3 blocks between the two calls)"),
-    "multi-block-order": ("intended-documented", _T2 % "order class (owner-accepted documented difference, docs/graphql.md)"),
-    "totalcount-stock-orphans": ("stock-wrong-node-evidence", _T2 % "orphan-count rule (H2 item 3, node confirms the orphans)"),
-    "tip-timing": ("tip-timing", _T2 % "tip-staleness timing (H2 item 5, bounded window, both heights recorded)"),
+    "multi-block-order": ("intended-documented", _T2 % "order class (owner-accepted documented difference, docs/graphql.md; "
+                          "H4: same rows on both pages at the same heights)"),
+    "totalcount-stock-orphans": ("stock-wrong-node-evidence", _T2 % "orphan-count rule (H2 item 3; H4: every stock-only "
+                                 "row is a fork header the node holds, exactly the gap)"),
+    "tip-timing": ("tip-timing", _T2 % "tip-staleness timing (H2 item 5; H4: every differing row lies between the two "
+                   "observed tips)"),
+}
+
+
+_DIFF = "docs/comparison.md#%s"
+DOC = {
+    "pactQuery-not-supported": "docs/graphql.md#errors",
+    "gasLimitEstimate-not-supported": "docs/graphql.md#errors",
+    "networkInfo-totalGasUsedInKda": "docs/graphql.md#errors",
+    "bad-input-vs-stock-error": "docs/graphql.md#errors",
+    "ours-refuses-lenient-input": "docs/graphql.md#errors",
+    "node-undecodable-id": "docs/graphql.md#errors",
+    "guard-keyset-reference": "docs/graphql.md#accounts",
+    "multi-block-order": _DIFF % "endpoint-suite-rules",
+    "tip-timing": _DIFF % "endpoint-suite-rules",
+    "lastBlockHeight-tip-race": _DIFF % "endpoint-suite-rules",
+    "networkInfo-stock-error": _DIFF % "stock-faults-the-node-disproves",
+    "networkInfo-totalDifficulty": _DIFF % "stock-faults-the-node-disproves",
+    "networkInfo-coins-stale": _DIFF % "stock-faults-the-node-disproves",
+    "completedBlockHeights-stock-error": _DIFF % "stock-faults-the-node-disproves",
+    "totalcount-stock-orphans": _DIFF % "stock-faults-the-node-disproves",
+    "known-gap-missing-chain-rows": None,          # our defect: a known gap, never accepted
 }
 
 
@@ -84,11 +131,15 @@ def _data_or_errors(e):
 
 
 def _num(s):
-    """The diff's number text (`#<digits>e<exp>` or plain) as a float."""
-    try:
-        return float(str(s).lstrip("#"))
-    except ValueError:
+    """The diff's number text (`#<digits>e<exp>` or plain) as an exact decimal (never a float:
+    owner H4 rule, number parity)."""
+    if isinstance(s, bool):
         return None
+    try:
+        d = decimal.Decimal(str(s).lstrip("#"))
+    except (decimal.InvalidOperation, ValueError):
+        return None
+    return d if d.is_finite() else None
 
 
 def _not_supported(ctx):
@@ -128,13 +179,20 @@ def _total_difficulty(ctx):
 
 
 def _coins_stale(ctx):
-    # Stock's value lags (about 3 KDA per 108 s against the ~0.6 KDA/s mining rate):
-    # explained only where ours is ahead.
+    # Stock's value lags. Explained only where the node shows stock behind: the node tip sampled
+    # at stock's answer (tip.stock) is above stock's own lastBlockHeight (idx.stock), ours' own
+    # height is ahead of stock's, and ours' excess is at most what the missing heights can mint
+    # (CHAINS blocks per height, MAX_BLOCK_REWARD each).
+    t, x = ctx.get("tip") or {}, ctx.get("idx") or {}
+    ns, so, oo = t.get("stock"), x.get("stock"), x.get("ours")
+    if not all(isinstance(v, int) for v in (ns, so, oo)) or not (ns > so and oo > so):
+        return set()
+    bound = (oo - so) * CHAINS * decimal.Decimal(str(MAX_BLOCK_REWARD))
     out = set()
     for i, e in enumerate(ctx["entries"]):
         if e["path"] == "/data/networkInfo/coinsInCirculation" and e["kind"] == "Changed":
             a, b = _num(e.get("a")), _num(e.get("b"))
-            if a is not None and b is not None and a > b:
+            if a is not None and b is not None and 0 < a - b <= bound:
                 out.add(i)
     return out
 
@@ -202,12 +260,23 @@ def _keyset_guard(ctx):
     return out
 
 
-TAGS_ALLOWED = ("graphql-r57-float", "graphql-r57-json-object", "graphql-r58-count-lower-bound",
-                "graphql-totalcount-cap", "graphql-r57-height-tie-cut", "graphql-r57-height-ties")
+# Visible harness hits already accepted in compare/allowlist.toml, relayed with that entry's own
+# accept class (the test reads the TOML file and compares).
+TAG_CLASS = {
+    "graphql-r57-json-object": "harness-convention",
+    "graphql-r58-count-lower-bound": "intended-documented",
+    "graphql-totalcount-cap": "intended-documented",
+    "graphql-r57-height-ties": "intended-documented",
+}
+TAGS_ALLOWED = tuple(TAG_CLASS)
+for _t, _c in TAG_CLASS.items():
+    META["tag:" + _t] = (_c, _T1 % "7d (tag accepted in compare/allowlist.toml as %s, relayed with its class)" % _t)
 
 
-def _tags(ctx):
-    return {i for i, e in enumerate(ctx["entries"]) if e["path"].lstrip("/~") in TAGS_ALLOWED}
+def _tag(tag):
+    def fn(ctx):
+        return {i for i, e in enumerate(ctx["entries"]) if e["path"].lstrip("/~") == tag}
+    return fn
 
 
 def _gap_tag(ctx):
@@ -226,6 +295,7 @@ def _tip_race(ctx):
 
 ORDER_EPS = {"gql.events": "events", "gql.transactions": "transactions", "gql.transfers": "transfers"}
 ORDER_ID_FIELDS = {"id", "hash", "requestKey", "cursor"}
+HEIGHT_SEL = re.compile(r"\bheight\b")
 
 
 def _single_block(v):
@@ -236,40 +306,92 @@ def _single_block(v):
     return bool(v.get("chainId")) and lo is not None and lo == hi
 
 
-def _multi_block_order(ctx):
-    # Multi-block newest-first lists keep node order inside a block (coinbase last); stock orders
-    # by tx creationTime. The page then holds different rows at the same positions. Explained
-    # only where the node passed ours' rows, the list spans blocks, and at every changed edge
-    # the row itself differs (id, hash, request key or cursor), nothing else: a field that
-    # differs on the same row, a count, or a page-info change keeps the row open.
-    root = ORDER_EPS.get(ctx["ep"])
-    if root is None or _single_block(ctx.get("vars") or {}):
-        return set()
-    pat = re.compile(r"/data/%s/edges/(\d+)/(?:node/(.+)|(cursor))" % root)
-    seen = collections.defaultdict(set)
+def _leaf(field):
+    return field.rsplit("/", 1)[-1]
+
+
+def edge_table(ctx, root):
+    """Positional list entries of the row: ({pos: {field: entry}}, {pos: whole-edge entry},
+    [other entries]). `field` is the path below `edges/<pos>/` (`node/requestKey`, `cursor`)."""
+    pat = re.compile(r"/data/%s/edges/(\d+)(?:/(.+))?" % re.escape(root))
+    fields, whole, other = collections.defaultdict(dict), {}, []
     for e in ctx["entries"]:
         m = pat.fullmatch(e["path"])
-        if not m or e["kind"] != "Changed":
-            return set()
-        seen[m.group(1)].add(m.group(3) or m.group(2))
-    if not seen or any(not (ORDER_ID_FIELDS & f) for f in seen.values()):
+        if not m:
+            other.append(e)
+        elif m.group(2) is None:
+            whole[int(m.group(1))] = e
+        else:
+            fields[int(m.group(1))][m.group(2)] = e
+    return fields, whole, other
+
+
+def _multi_block_order(ctx):
+    # Multi-block newest-first lists keep node order inside a block (coinbase last); stock orders
+    # by tx creationTime. Explained only where (H4, B2) the entries are all the differences, the
+    # query selects the height, and the two pages hold the same rows at the same heights: no
+    # height or chain differs at any position, the changed positions hold the same multiset of
+    # row ids on both sides, and every field that differs on a moved row has the same value on
+    # the row's other position. A count, a page-info change or a whole edge keeps the row open.
+    # Pages cut inside their last block (different rows of that block) stay open: the stored
+    # entries do not carry the unchanged heights that would locate the cut.
+    root = ORDER_EPS.get(ctx["ep"])
+    if root is None or _single_block(ctx.get("vars") or {}) or not complete(ctx):
         return set()
+    if not HEIGHT_SEL.search(ctx.get("query") or ""):
+        return set()
+    fields, whole, other = edge_table(ctx, root)
+    if other or whole or not fields:
+        return set()
+    for f in fields.values():
+        for k, e in f.items():
+            if e["kind"] != "Changed" or _leaf(k) in ("height", "chainId"):
+                return set()
+    keys = sorted(set.intersection(*(set(k for k in f if _leaf(k) in ORDER_ID_FIELDS) for f in fields.values())))
+    if not keys:
+        return set()
+
+    def ident(pos, side):
+        return tuple(json.dumps(fields[pos][k].get(side), sort_keys=True) for k in keys)
+    a_at = {pos: ident(pos, "a") for pos in fields}
+    b_at = {pos: ident(pos, "b") for pos in fields}
+    if collections.Counter(a_at.values()) != collections.Counter(b_at.values()):
+        return set()
+    if len(set(a_at.values())) != len(a_at):
+        return set()                     # a row twice on one page: no one-to-one match
+    where_b = {v: pos for pos, v in b_at.items()}
+    for i, ident_a in a_at.items():
+        j = where_b[ident_a]
+        for k in set(fields[i]) | set(fields[j]):
+            if k not in fields[i] or k not in fields[j] or fields[i][k].get("a") != fields[j][k].get("b"):
+                return set()
     return set(range(len(ctx["entries"])))
 
 
+def _int_field(ctx, k):
+    v = (ctx.get("node") or {}).get(k)
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
 def _totalcount_stock_orphans(ctx):
-    # Stock counts orphan copies. Explained only where the node confirmed that many of the
-    # extra rows sit in non-canonical blocks (`node.stock_orphans`, nodecheck.orphan_evidence);
-    # without that evidence the count stays a diff.
-    n = (ctx.get("node") or {}).get("stock_orphans")
-    if not isinstance(n, int):
+    # Stock counts orphan copies. Explained only on exact accounting (H4, S1): the evidence lists
+    # were complete, every row only stock lists (`extra`) is a row in a non-canonical block
+    # whose fork header the node holds (`stock_orphans` == `forks_confirmed`), none is
+    # unresolved, ours lists no row stock lacks, and the count gap is exactly that number.
+    n = _int_field(ctx, "stock_orphans")
+    if n is None or n <= 0:
+        return set()
+    if _int_field(ctx, "extra") != n or _int_field(ctx, "forks_confirmed") != n or _int_field(ctx, "unresolved") != 0:
+        return set()
+    oo = (ctx.get("node") or {}).get("ours_only")
+    if oo not in (None, 0):
         return set()
     out = set()
     for i, e in enumerate(ctx["entries"]):
         if e["kind"] != "Changed" or not re.fullmatch(r"/data/\w+/totalCount", e["path"]):
             return set()
         a, b = _num(e.get("a")), _num(e.get("b"))
-        if a is None or b is None or not 0 < b - a <= n:
+        if a is None or b is None or b - a != n:
             return set()
         out.add(i)
     return out
@@ -278,30 +400,100 @@ def _totalcount_stock_orphans(ctx):
 TIP_EPS = {"gql.blocksFromDepth", "gql.blocksFromHeight", "gql.transfers", "gql.transactions", "gql.events",
            "gql.lastBlockHeight"}
 TIP_ANCHORS = ("blockHash", "requestKey", "maxHeight", "endHeight", "after", "before")
+NEWEST_FIRST = {"gql.blocksFromDepth", "gql.transfers", "gql.transactions", "gql.events"}
 
 
-def tip_before(log, t):
-    """The newest tip sample `(time, height)` at or before `t`, if it is fresh enough."""
-    best = None
-    for ts, h in log:
-        if ts <= t and (best is None or ts >= best[0]):
-            best = (ts, h)
-    return best[1] if best and t - best[0] <= TIP_SAMPLE_AGE else None
+def _height_in(v):
+    """The `height` found in an edge object (any depth), as a number."""
+    if isinstance(v, dict):
+        for k, x in v.items():
+            if k == "height":
+                return _num(x)
+        for x in v.values():
+            h = _height_in(x)
+            if h is not None:
+                return h
+    return None
 
 
 def _tip_timing(ctx):
-    # The node's tip moved by 1..TIP_WINDOW heights between ours' read and stock's
-    # (ctx["tip"] = {"ours": h, "stock": h}, both recorded in the row), on a list that follows
-    # the tip (no height bound, cursor or block pin). Only /data entries; an error or a status
-    # difference is not timing.
+    # H4 (B1): the node tip moved by 1..TIP_WINDOW heights between ours' read and stock's
+    # (ctx["tip"] = {"ours": lo, "stock": hi}, recorded in the row), on a list that follows the
+    # tip, and every difference is a row between the two tips:
+    # - lastBlockHeight: stock higher than ours by at most hi - lo;
+    # - newest-first lists: stock's first k rows are new (their height in (lo, hi], minus
+    #   minimumDepth for blocksFromDepth; ours' row there not above lo), every later position
+    #   holds ours' row k places up (each differing field equals ours' value there), at least
+    #   one such shifted row proves it, and a totalCount gap is exactly k;
+    # - blocksFromHeight (ascending): only rows stock appends at the end, each between the tips.
+    # Only with every difference known (`complete`).
     t = ctx.get("tip") or {}
-    a, b = t.get("ours"), t.get("stock")
-    if ctx["ep"] not in TIP_EPS or not isinstance(a, int) or not isinstance(b, int) or not 1 <= b - a <= TIP_WINDOW:
+    lo, hi = t.get("ours"), t.get("stock")
+    if ctx["ep"] not in TIP_EPS or not isinstance(lo, int) or not isinstance(hi, int) or not 1 <= hi - lo <= TIP_WINDOW:
+        return set()
+    if not complete(ctx):
         return set()
     v = ctx.get("vars") or {}
+    ents = ctx["entries"]
+    if ctx["ep"] == "gql.lastBlockHeight":
+        out = set()
+        for i, e in enumerate(ents):
+            a, b = _num(e.get("a")), _num(e.get("b"))
+            if e["path"] != "/data/lastBlockHeight" or e["kind"] != "Changed" or a is None or b is None \
+                    or not 0 < b - a <= hi - lo:
+                return set()
+            out.add(i)
+        return out
     if ctx["ep"] != "gql.blocksFromDepth" and any(v.get(k) not in (None, "") for k in TIP_ANCHORS):
         return set()
-    return _all(ctx, lambda e: e["path"].startswith("/data"))
+    d = v.get("minimumDepth") if ctx["ep"] == "gql.blocksFromDepth" else 0
+    d = d if isinstance(d, int) and d >= 0 else 0
+    lo, hi = lo - d, hi - d
+    root = ctx["ep"].split(".", 1)[1]
+    fields, whole, other = edge_table(ctx, root)
+    count = None
+    for e in other:
+        if e["path"] == "/data/%s/totalCount" % root and e["kind"] == "Changed":
+            a, b = _num(e.get("a")), _num(e.get("b"))
+            if a is None or b is None:
+                return set()
+            count = b - a
+        elif not (re.fullmatch(r"/data/%s/pageInfo/(startCursor|endCursor)" % root, e["path"]) and e["kind"] == "Changed"):
+            return set()
+    if ctx["ep"] == "gql.blocksFromHeight":
+        if fields or not whole:
+            return set()
+        for e in whole.values():
+            h = _height_in(e.get("b"))
+            if e["kind"] != "Missing" or h is None or not lo < h <= hi:
+                return set()
+        if count is not None and count != len(whole):
+            return set()
+        return set(range(len(ents)))
+    if ctx["ep"] not in NEWEST_FIRST or whole or not fields:
+        return set()
+    k = 0
+    while k in fields:
+        he = next((e for f, e in fields[k].items() if _leaf(f) == "height"), None)
+        hb = _num(he.get("b")) if he is not None and he["kind"] == "Changed" else None
+        ha = _num(he.get("a")) if he is not None else None
+        if hb is None or not lo < hb <= hi or (ha is not None and ha > lo):
+            break
+        k += 1
+    last = max(fields)
+    if k == 0 or last < k:
+        return set()
+    for j in range(k, last + 1):
+        f = fields.get(j)
+        if not f or not any(_leaf(x) in ORDER_ID_FIELDS for x in f):
+            return set()
+        for x, e in f.items():
+            up = fields.get(j - k, {}).get(x)
+            if e["kind"] != "Changed" or up is None or up.get("a") != e.get("b"):
+                return set()
+    if count is not None and count != k:
+        return set()
+    return set(range(len(ents)))
 
 
 BAD = ("edge", "invalid")
@@ -346,12 +538,11 @@ RULES = [
     Rule("guard-keyset-reference", "DOCUMENTED",
          "A resolved r: keyset reference is a KeysetGuard on ours, a RawGuard on stock (docs Accounts) "
          "[triage 5, 7d].", None, _keyset_guard),
-    Rule("accepted-tags", "KNOWN",
-         "Already-accepted harness classes: r57 float and JSON-object text, r58 count lower bound, the "
-         "totalCount cap and the height-tie cut [triage 7d].", None, _tags),
     Rule("known-gap-missing-chain-rows", "KNOWN",
          "Zero-balance chain rows the node holds but ours never saw a TRANSFER for (known gap) [triage 7d].",
          None, _gap_tag),
+] + [Rule("tag:" + t, "KNOWN", "Harness hit already accepted in compare/allowlist.toml (entry %s), with that entry's "
+              "accept class %s [triage 7d]." % (t, c), None, _tag(t)) for t, c in TAG_CLASS.items()] + [
     Rule("multi-block-order", "DOCUMENTED",
          "Multi-block newest-first lists (events, transactions, transfers) list a block's rows in node "
          "order, a coinbase after its block's txs; stock orders by tx creationTime. A page then holds other "
@@ -375,15 +566,15 @@ RULES = [
 
 def table():
     """Every rule as a docs row: id, reason, accept class, ruling."""
-    return [{"id": r.id, "reason": r.reason, "accept_class": r.accept, "ruling": r.ruling} for r in RULES]
+    return [{"id": r.id, "reason": r.reason, "accept_class": r.accept, "ruling": r.ruling, "doc": r.doc} for r in RULES]
 
 
 def classify(ctx):
     """(class, rule ids) for a row with entries left after pair-diff. ctx: ep, cls,
     ours_codes, entries, vars, node, tip."""
     ents = ctx.get("entries") or []
-    if not ents:
-        return "diff", []
+    if not ents or not complete(ctx):
+        return "diff", []          # H4 (B3): a row whose differences are not all known is never accepted
     left = set(range(len(ents)))
     used = []
     for r in RULES:

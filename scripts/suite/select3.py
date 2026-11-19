@@ -9,16 +9,18 @@ Builds DIR/<endpoint>.jsonl.gz for `run.py run` from three sources, in this orde
   1. every case of run 2 (DIR2/results.jsonl, sample.jsonl; cases2 files) whose verdict was
      `diff`, `status` or `stock-unavailable` on a light endpoint, and `diff` or `status` in the
      stock sample of a heavy endpoint (flagged `sample`: it runs against stock again; the stock
-     timeouts of the heavy sample are not repeated). Ids stay run 2's, so a record compares to
-     its run-2 verdict by id.
+     timeouts of the heavy sample are not repeated), and every case whose node check failed
+     (`node.ok` false, any endpoint: sel run2-node-fail; H4 S2). Ids stay run 2's, so a record
+     compares to its run-2 verdict by id. A picked id missing from the cases2 file is an error.
   2. a fresh sample from `gen.py cases --seed N` (FRESH_PER_EP per endpoint) for the endpoints
      where FIX-4 changed behaviour (FRESH_FULL), ids renumbered from FRESH_BASE;
   3. for the other GraphQL endpoints, the fresh `invalid` and `edge` cases (error
      mapping, FIX-4 item 3), ERR_MAP_EPS.
 
 Heavy endpoints run on ours with the node-backed checks for every case; the cases flagged
-`sample` also run against stock (`run.py run --sample-flag`). Each line carries `sel`
-(run2-diff, run2-status, run2-stock-unavailable, fresh). DIR/manifest.json holds counts only.
+`sample` also run against stock (`run.py run --sample-flag`); every fresh gql.transaction case
+with a minimumDepth is flagged, none is dropped by the per-endpoint cap. Each line carries `sel`
+(run2-diff, run2-status, run2-stock-unavailable, run2-node-fail, fresh). DIR/manifest.json holds counts only.
 """
 
 import argparse
@@ -34,7 +36,6 @@ import endpoints as E  # noqa: E402
 FRESH_PER_EP = 20000
 FRESH_BASE = 1000000          # fresh case numbers start here: no clash with run 2's ids
 SAMPLE_PER_EP = 650           # stock sample per heavy endpoint's fresh cases (run 2's size)
-MIN_DEPTH_CAP = 1500          # fresh transaction cases with a minimumDepth that all go to stock, at most
 FRESH_FULL = {
     "gql.fungibleChainAccounts", "gql.gasLimitEstimate", "gql.node", "gql.nodes", "gql.transaction",
     "compat.v1txs", "gql.blocksFromDepth", "gql.blocksFromHeight", "gql.completedBlockHeights",
@@ -51,19 +52,23 @@ def pick(rows, heavy):
     """{ep: [(id, why, sample)]} in first-seen order. `rows`: (source, row), source "results" or
     "sample". A heavy endpoint contributes its stock-sample diffs and status rows only (the
     results rows of a heavy endpoint are ours-only); a light endpoint any diff, status or
-    stock-unavailable row. A later row of the same case replaces an earlier one."""
+    stock-unavailable row. Any row whose node check failed is picked as `node-fail` (not flagged
+    for stock when it is a heavy endpoint's ours-only row). A later row of the same case replaces
+    an earlier one."""
     last = collections.OrderedDict()
     for src, r in rows:
         ep, c = r.get("ep"), (r.get("v") or {}).get("class")
-        if ep is None or c is None:
+        if ep is None:
             continue
-        if ep in heavy:
-            if src != "sample":
-                continue
-            ok = c in HEAVY_CLASSES
-        else:
-            ok = c in RUN2_CLASSES
-        last[r["id"]] = (ep, c, ok, ep in heavy)
+        nf = (r.get("node") or {}).get("ok") is False
+        if ep in heavy and src == "sample" and c in HEAVY_CLASSES:
+            last[r["id"]] = (ep, c, True, True)
+        elif ep not in heavy and c in RUN2_CLASSES:
+            last[r["id"]] = (ep, c, True, False)
+        elif nf:
+            last[r["id"]] = (ep, "node-fail", True, ep in heavy and src == "sample")
+        elif c is not None and (src == "sample" or ep not in heavy):
+            last[r["id"]] = (ep, c, False, ep in heavy)
     out = collections.OrderedDict()
     for i, (ep, c, ok, hv) in last.items():
         if ok:
@@ -92,26 +97,32 @@ def build(picks, cases2, fresh, out, fresh_full=None, err_eps=None, sample_per_e
         n = collections.Counter()
         lines = []
         want = {i: (why, sample) for i, why, sample in picks.get(ep, [])}
+        found = set()
         for c in _read(os.path.join(cases2, ep + ".jsonl.gz")):       # case order, not verdict order
             if c["id"] in want:
+                found.add(c["id"])
                 why, sample = want[c["id"]]
                 c["sel"] = "run2-" + why
                 if sample:
                     c["sample"] = True
                 lines.append(c)
                 n[c["sel"]] += 1
+        if len(found) != len(want):
+            raise ValueError("%s: %d picked case(s) not in the cases2 file" % (ep, len(want) - len(found)))
         fc = list(_read(os.path.join(fresh, ep + ".jsonl.gz"))) if (ep in fresh_full or ep in err_eps) else []
         if ep in err_eps and ep not in fresh_full:
             fc = [c for c in fc if c["cls"] in ERR_CLASSES]
         heavy = ep in E.HEAVY_ENDPOINTS
-        flagged = set()
+        flagged, deep = set(), set()
+        if ep == "gql.transaction":
+            deep = {i for i, c in enumerate(fc) if (c["req"].get("variables") or {}).get("minimumDepth") is not None}
         if heavy and fc:
             step = max(1, len(fc) // max(1, sample_per_ep))
-            flagged = set(range(0, len(fc), step)[:sample_per_ep]) if sample_per_ep else set()
-            if ep == "gql.transaction":
-                deep = [i for i, c in enumerate(fc) if (c["req"].get("variables") or {}).get("minimumDepth") is not None]
-                flagged |= set(deep[:MIN_DEPTH_CAP])
-        for k, c in enumerate(fc[:FRESH_PER_EP]):
+            flagged = set(range(0, min(len(fc), FRESH_PER_EP), step)[:sample_per_ep]) if sample_per_ep else set()
+            flagged |= deep
+        keep = [k for k in range(len(fc)) if k < FRESH_PER_EP or k in deep]
+        for k in keep:
+            c = fc[k]
             c["id"] = "%s:%d" % (ep, FRESH_BASE + _num(c["id"]))
             c["sel"] = "fresh"
             if k in flagged:

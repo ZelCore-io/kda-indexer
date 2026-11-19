@@ -13,9 +13,13 @@
 //! `body` is the parsed JSON answer, or a string when the answer was not JSON. `max`: the
 //! stock side's highest indexed height (rows above it exist only on ours).
 //!
-//! Output, one line per input: `{"id", "class", "ids", "known_ids", "entries"}` where
-//! `class` is `equal`, `allowlisted`, `known-gap`, `diff` or `status` (the HTTP statuses
-//! differ; bodies are still diffed and shown), `entries` at most [`MAX_SHOWN`].
+//! `full: true` (optional) adds every entry as `all`.
+//!
+//! Output, one line per input: `{"id", "class", "ids", "known_ids", "entries", "total", "all"?}`
+//! where `class` is `equal`, `allowlisted`, `known-gap`, `diff` or `status` (the HTTP statuses
+//! differ; bodies are still diffed and shown), `entries` at most [`MAX_SHOWN`] (display),
+//! `total` the number of entries before that cut, and `all` every entry when `full` was asked:
+//! the suite's rules judge `all`, never the display list.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,7 +29,7 @@ use crate::config::FieldRule;
 use crate::diff::diff_route;
 use crate::graphql::{compare_answers, Answer};
 use crate::normalize::{normalize, RouteKind};
-use crate::report::DiffEntry;
+use crate::report::{DiffEntry, DiffKind};
 
 /// Entries kept in one output line.
 pub const MAX_SHOWN: usize = 8;
@@ -46,6 +50,9 @@ pub struct PairIn {
     pub request: String,
     #[serde(default)]
     pub max: Option<u64>,
+    /// Return every entry as `all` (the suite rules' input).
+    #[serde(default)]
+    pub full: bool,
     pub ours: Side,
     pub stock: Side,
 }
@@ -57,12 +64,54 @@ pub struct Verdict {
     pub ids: Vec<String>,
     pub known_ids: Vec<String>,
     pub entries: Vec<DiffEntry>,
+    /// Entries before the display cut.
+    pub total: usize,
+    /// Matched allowlist entries that are open (no doc anchor): the suite reports the row as a
+    /// difference (owner H4 rule 3).
+    pub open_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all: Option<Vec<DiffEntry>>,
+}
+
+/// Error messages that are stock's contract (docs/graphql.md): where stock answers one, ours
+/// must answer the same text (H4, S7).
+pub const CONTRACT_MESSAGES: &[&str] = &[
+    "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.",
+    "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be higher than 100.",
+];
+
+fn messages(body: &Value) -> Vec<String> {
+    body.get("errors")
+        .and_then(Value::as_array)
+        .map(|es| {
+            es.iter()
+                .filter_map(|e| e.get("message").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A diff entry per contract message stock answered that ours did not answer verbatim.
+fn contract_message_diffs(ours: &Value, stock: &Value) -> Vec<DiffEntry> {
+    let (a, b) = (messages(ours), messages(stock));
+    b.iter()
+        .enumerate()
+        .filter(|(_, m)| CONTRACT_MESSAGES.contains(&m.as_str()) && !a.contains(m))
+        .map(|(i, m)| DiffEntry {
+            path: format!("/errors/{i}/message"),
+            kind: DiffKind::Changed,
+            a: a.get(i).map(|x| Value::String(x.clone())),
+            b: Some(Value::String(m.clone())),
+        })
+        .collect()
 }
 
 /// The verdict on one pair. `rules` and `cap`: `[graphql] field_rules` and
 /// `total_count_cap` of the config.
 pub fn verdict(p: PairIn, allow: &Allowlist, rules: &[FieldRule], cap: u64) -> Verdict {
+    let full = p.full;
     let (route, d) = if p.kind == "graphql" {
+        let contract = contract_message_diffs(&p.ours.body, &p.stock.body);
         let mut a = Answer {
             body: p.ours.body,
             status: p.ours.status,
@@ -75,7 +124,8 @@ pub fn verdict(p: PairIn, allow: &Allowlist, rules: &[FieldRule], cap: u64) -> V
             raw: String::new(),
             ms: Vec::new(),
         };
-        let d = compare_answers(&mut a, &mut b, p.max.unwrap_or(u64::MAX), cap, rules);
+        let mut d = compare_answers(&mut a, &mut b, p.max.unwrap_or(u64::MAX), cap, rules);
+        d.extend(contract);
         (RouteKind::Other, d)
     } else {
         let route = RouteKind::from_path(&p.request);
@@ -94,12 +144,23 @@ pub fn verdict(p: PairIn, allow: &Allowlist, rules: &[FieldRule], cap: u64) -> V
     if p.ours.status != p.stock.status {
         class = "status";
     }
+    let total = shown.len();
+    let open_ids: Vec<String> = c
+        .ids
+        .iter()
+        .filter(|i| allow.is_open_id(i))
+        .cloned()
+        .collect();
+    let all = full.then(|| shown.clone());
     Verdict {
         id: p.id,
         class: class.to_string(),
         ids: c.ids,
         known_ids: c.known_ids,
         entries: shown.into_iter().take(MAX_SHOWN).collect(),
+        total,
+        open_ids,
+        all,
     }
 }
 
@@ -121,6 +182,7 @@ mod tests {
             kind: kind.into(),
             request: req.into(),
             max: None,
+            full: false,
             ours: Side {
                 status: 200,
                 body: a,
@@ -235,5 +297,62 @@ mod tests {
         let v = verdict(p, &allow, &[], 10_000);
         assert_eq!(v.class, "status");
         assert!(v.ids.is_empty(), "{:?}", v.ids);
+    }
+
+    /// H4 (B3): the display list is cut at MAX_SHOWN, `total` counts every entry, and `all`
+    /// (asked with `full`) carries them all for the suite rules.
+    #[test]
+    fn total_and_full_list_beside_the_display_cut() {
+        let allow = empty_allow();
+        let a: Vec<Value> = (0..20).map(|i| json!({"a": i})).collect();
+        let b: Vec<Value> = (0..20).map(|i| json!({"a": i + 100})).collect();
+        let v = verdict(
+            pair("rest", "/txs/recent", json!(a.clone()), json!(b.clone())),
+            &allow,
+            &[],
+            10_000,
+        );
+        assert_eq!(v.entries.len(), MAX_SHOWN);
+        assert_eq!(v.total, 20);
+        assert!(v.all.is_none());
+        let mut p = pair("rest", "/txs/recent", json!(a), json!(b));
+        p.full = true;
+        let v = verdict(p, &allow, &[], 10_000);
+        assert_eq!(v.entries.len(), MAX_SHOWN);
+        assert_eq!(v.all.as_ref().map(Vec::len), Some(20));
+        let out = serde_json::to_value(&v).unwrap();
+        assert_eq!(out["total"], 20);
+    }
+
+    /// H4 (S7): where stock's message is the contract (minimumDepth outside 1..=100, docs
+    /// graphql.md), ours must answer the same text; a refusal with another message is a diff.
+    #[test]
+    fn minimum_depth_message_is_compared() {
+        let allow = empty_allow();
+        let stock = json!({"data": {"transaction": null}, "errors": [{
+            "message": "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be higher than 100.",
+            "extensions": {"code": "INTERNAL_SERVER_ERROR"}}]});
+        let other = json!({"data": {"transaction": null}, "errors": [{
+            "message": "internal error",
+            "extensions": {"code": "INTERNAL_SERVER_ERROR"}}]});
+        let v = verdict(
+            pair("graphql", "QTransactionByKey {}", other, stock.clone()),
+            &allow,
+            &[],
+            10_000,
+        );
+        assert_eq!(v.class, "diff");
+        assert!(
+            v.entries.iter().any(|e| e.path.ends_with("/message")),
+            "{:?}",
+            v.entries
+        );
+        let v = verdict(
+            pair("graphql", "QTransactionByKey {}", stock.clone(), stock),
+            &allow,
+            &[],
+            10_000,
+        );
+        assert_eq!(v.class, "equal");
     }
 }
