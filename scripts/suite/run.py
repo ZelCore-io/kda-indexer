@@ -68,7 +68,10 @@ def load_error(st):
     return st in LOAD_ERR
 # Ours runs every search under one gate: `search.concurrency` (4) at once, one per client
 # (docs/api.md). Search cases hold one of `[ours] search_sources` (4 addresses) while in flight.
-SEARCH_EPS = {"compat.search", "compat.pactid", "native.search_code", "native.search_events"}
+# Event queries with a parameter filter go through the same gate (seen in run 2: a 429 on
+# compat /txs/events), so they hold a search source too.
+SEARCH_EPS = {"compat.search", "compat.pactid", "native.search_code", "native.search_events",
+              "compat.events", "native.events"}
 
 
 class Bucket:
@@ -746,6 +749,10 @@ class Runner:
                 hv = [e for e in heavy if e.startswith("gql.")]
                 cs = host_cases(load_cases(self.a.cases, hv, self.a.heavy_sample), i, len(self.oracles), sdone)
                 lanes.append((h, cs, "sample", deadline))
+                lt = [e for e in eps if e in E.LANE_LIGHT and e.startswith("gql.")]
+                if lt:
+                    cs2 = host_cases(load_cases(self.a.cases, lt, self.a.per_endpoint), i, len(self.oracles), done)
+                    lanes.append((h, cs2, "light", deadline))
             for k, h in self.rest_stock.items():
                 hv = [e for e in heavy if e.startswith("compat.") and dict((x[0], x[2]) for x in E.ENDPOINTS)[e] == k]
                 cs = (c for c in load_cases(self.a.cases, hv, self.a.heavy_sample) if c["id"] not in sdone)
@@ -753,7 +760,7 @@ class Runner:
                 lt = [e for e in eps if e in E.LANE_LIGHT and dict((x[0], x[2]) for x in E.ENDPOINTS)[e] == k]
                 if lt:
                     cs2 = (c for c in load_cases(self.a.cases, lt, self.a.per_endpoint) if c["id"] not in done)
-                    lanes.append((h, cs2, "light", None))
+                    lanes.append((h, cs2, "light", deadline))
         threads = []
         for h, cs, kind, dl in lanes:
             t = threading.Thread(target=self.pool, args=(cs, h.heavy_target, kind, dl, "%s-%s" % (h.name, kind)))

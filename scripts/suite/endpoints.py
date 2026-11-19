@@ -709,7 +709,9 @@ HEAVY_ENDPOINTS = {
     "compat.account", "compat.events", "compat.pactid", "compat.recent", "compat.search",
     "compat.stats", "compat.tx", "compat.txs",
 }
-# Light endpoints whose stock side is still slow per request (all heavy slots, own lane).
-LANE_LIGHT = {"compat.v1txs"}
+# Light endpoints (every case against stock) whose stock side is slow per request: they run
+# in the per-host heavy lane, so their timeouts count against the heavy class only.
+# node/nodes joined in run 2: with valid ids (node_id fix) stock times out on 10-20% of them.
+LANE_LIGHT = {"compat.v1txs", "gql.node", "gql.nodes"}
 # Native routes with a cross-check against ours' other APIs (one extra request to ours).
 NATIVE_CROSS = {"native.tx": "compat /txs/tx", "native.block_by_height": "native /blocks/{hash}"}
