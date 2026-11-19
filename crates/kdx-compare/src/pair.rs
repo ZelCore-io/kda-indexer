@@ -208,4 +208,32 @@ mod tests {
             v.ids
         );
     }
+    /// H3 item 2: `pactQuery(pactQuery: true)`, `gasLimitEstimate(input: -1)` and an absent
+    /// variable are variable-coercion refusals. FIX-4 answers them as stock does (HTTP 500,
+    /// `INTERNAL_SERVER_ERROR`, no `data`), with its own message text: equal. The pre-FIX-4
+    /// build answered HTTP 200 with the codeless variable error (code `ERROR`) and `data`:
+    /// that is a `status` row, and no NOT_SUPPORTED rule applies (the call never reached the
+    /// resolver).
+    #[test]
+    fn variable_refusals_are_equal_with_fix4_and_a_status_row_before() {
+        let allow = empty_allow();
+        let ours_now = json!({"errors": [{
+            "message": "Expected input type \"PactQuery\", found true.",
+            "extensions": {"code": "INTERNAL_SERVER_ERROR"}}]});
+        let stock = json!({"errors": [{
+            "message": "Variable \"$pactQuery\" got invalid value true; Expected type \"PactQuery\" to be an object.",
+            "extensions": {"code": "INTERNAL_SERVER_ERROR"}}]});
+        let mut p = pair("graphql", "S_pactQuery {}", ours_now, stock.clone());
+        p.ours.status = 500;
+        p.stock.status = 500;
+        let v = verdict(p, &allow, &[], 10_000);
+        assert_eq!(v.class, "equal", "{:?}", v.entries);
+        let ours_before = json!({"data": {"pactQuery": null}, "errors": [{
+            "message": "Expected input type", "extensions": {"code": "ERROR"}}]});
+        let mut p = pair("graphql", "S_pactQuery {}", ours_before, stock);
+        p.stock.status = 500;
+        let v = verdict(p, &allow, &[], 10_000);
+        assert_eq!(v.class, "status");
+        assert!(v.ids.is_empty(), "{:?}", v.ids);
+    }
 }

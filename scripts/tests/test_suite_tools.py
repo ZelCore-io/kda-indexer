@@ -16,6 +16,7 @@ import gen  # noqa: E402
 import run  # noqa: E402
 import allow  # noqa: E402
 import nodecheck as N  # noqa: E402
+import select3  # noqa: E402
 import base64  # noqa: E402
 import random  # noqa: E402
 
@@ -432,23 +433,39 @@ class NodeChecks(unittest.TestCase):
         p = N.check_block_range("gql.blocksFromHeight", {}, far + near, canon, {2: 100})
         self.assertEqual(N.failures(p), ["not-canonical"])
 
-    def test_tip_pair_reads_the_log_and_a_fresh_cut(self):
+    def test_tip_pair_reads_the_log_only(self):
         class Http:
             def __init__(self):
-                self.h = 100
+                self.calls = 0
 
             def call(self, base, path="", body=None, accept=None):
-                self.h += 1
-                return {"status": 200, "raw": json.dumps({"hashes": {"0": {"height": self.h, "hash": "x"},
-                                                                    "1": {"height": self.h - 1, "hash": "y"}}})}
-        n = N.Node(Http(), "http://node", "mainnet01", rps=1000)
-        n.tips()                                   # first read: logged at the current time
+                self.calls += 1
+                return {"status": 200, "raw": json.dumps({"hashes": {"0": {"height": 100 + self.calls, "hash": "x"}}})}
+        h = Http()
+        n = N.Node(h, "http://node", "mainnet01", rps=1000)
+        n.tips(fresh=True)                          # a sample: logged at the current time
         t0 = n.tip_log[-1][0]
         self.assertEqual(n.tip_log[-1][1], 101)
-        pair = n.tip_pair(t0 + 1)                  # ours read 1 s after the sample; a fresh cut now
-        self.assertEqual(pair, {"ours": 101, "stock": 102})
-        # no fresh-enough sample before ours' read: nothing recorded
-        self.assertIsNone(n.tip_pair(t0 - 1000))
+        n.tip_log.add(t0 + 1.0, 102)
+        n.tip_log.add(t0 + 2.0, 104)
+        calls = h.calls
+        self.assertEqual(n.tip_pair(t0 + 0.5, t0 + 2.5), {"ours": 101, "stock": 104})
+        self.assertEqual(h.calls, calls)            # per request: no node read
+        # no sample before ours' read, or none fresh enough: nothing recorded
+        self.assertIsNone(n.tip_pair(t0 - 1000, t0 + 2.5))
+        self.assertIsNone(n.tip_pair(t0 + 0.5, t0 + 2.0 + N.TIP_ROW_AGE + 1))
+
+    def test_tip_log_lookup(self):
+        lg = N.TipLog(maxlen=3)
+        for t, h in [(100.0, 50), (101.0, 51), (103.0, 52)]:
+            lg.add(t, h)
+        self.assertEqual(lg.at(101.5, 5), 51)
+        self.assertEqual(lg.at(103.0, 5), 52)
+        self.assertIsNone(lg.at(99.0, 5))
+        self.assertIsNone(lg.at(110.0, 5))
+        lg.add(104.0, 53)                           # the oldest sample falls out
+        self.assertEqual(len(lg), 3)
+        self.assertIsNone(lg.at(100.5, 5))
 
     def test_orphan_evidence(self):
         canon = {(1, 10): "good", (1, 11): "ok2"}
@@ -547,6 +564,354 @@ class Import(unittest.TestCase):
         a, b = run.normalize_pair("gql.fungibleChainAccounts", a, b)
         self.assertEqual(a, b)
 
+
+class FakeNodeHttp:
+    """A chainweb node: /cut and header/branch for chains whose blocks are 'canon<height>'."""
+
+    def __init__(self, tip=1000, chains=(1, 2)):
+        self.tip, self.chains, self.calls = tip, chains, []
+
+    def call(self, base, path="", body=None, accept=None):
+        self.calls.append(path)
+        if path.startswith("/cut"):
+            return {"status": 200, "raw": json.dumps({"hashes": {str(c): {"height": self.tip, "hash": "tip%d" % c}
+                                                                 for c in self.chains}})}
+        if "/header/branch" in path:
+            q = dict(x.split("=") for x in path.split("?")[1].split("&"))
+            lo, hi = int(q["minheight"]), int(q["maxheight"])
+            return {"status": 200, "raw": json.dumps({"items": [{"height": h, "hash": "canon%d" % h}
+                                                                for h in range(lo, hi + 1)]})}
+        return {"status": 404, "raw": b""}
+
+
+class Evidence(unittest.TestCase):
+    """H3 item 1: the runner records the tip at both reads for every stock-paired call and
+    fetches the node evidence for rows only stock lists, within a read bound per case."""
+
+    def test_tip_fields_for_every_paired_row(self):
+        node = N.Node(FakeNodeHttp(), "http://node", "mainnet01", rps=1000)
+        for t, h in [(100.0, 50), (101.0, 51), (102.0, 53)]:
+            node.tip_log.add(t, h)
+        idx = {"ours": N.TipLog(), "h1": N.TipLog()}
+        idx["ours"].add(100.0, 49)
+        idx["h1"].add(101.0, 48)
+        got = run.tip_fields(node, idx, "h1", 100.5, 102.5)
+        self.assertEqual(got, {"tip": {"ours": 50, "stock": 53}, "idx": {"ours": 49, "stock": 48}})
+        # indexer samples are evidence too: missing ones are left out, the node tip stays
+        self.assertEqual(run.tip_fields(node, {}, "h1", 100.5, 102.5), {"tip": {"ours": 50, "stock": 53}})
+        # no node sample in range: only the indexer heights
+        self.assertEqual(run.tip_fields(node, idx, "h1", 10.0, 102.5), {"idx": {"stock": 48}})
+        self.assertEqual(run.tip_fields(None, idx, "h1", 100.5, 102.5), {"idx": {"ours": 49, "stock": 48}})
+
+    def test_trigger_is_a_count_gap_with_stock_ahead(self):
+        ep = "gql.transactionsByPublicKey"
+        gap = E_("/data/transactionsByPublicKey/totalCount", "Changed", 5, 7)
+        self.assertTrue(N.needs_evidence(ep, [gap]))
+        self.assertTrue(N.needs_evidence(ep, [E_("/data/transactionsByPublicKey/edges/3", "Missing", None, "{}")]))
+        self.assertFalse(N.needs_evidence(ep, [E_("/data/transactionsByPublicKey/totalCount", "Changed", 7, 5)]))
+        self.assertFalse(N.needs_evidence(ep, [E_("/data/transactionsByPublicKey/edges/0/node/hash", "Changed", "a", "b")]))
+        self.assertFalse(N.needs_evidence("gql.fungibleAccount", [gap]))
+        self.assertFalse(N.needs_evidence(ep, []))
+
+    def test_evidence_query_and_rows(self):
+        v = N.evidence_vars({"publicKey": "k", "first": 20, "after": "c", "last": 1, "before": "d", "chainId": "3"})
+        self.assertEqual(v, {"publicKey": "k", "chainId": "3", "first": N.EVIDENCE_PAGE})
+        for ep in ("gql.transactions", "gql.transactionsByPublicKey", "gql.transfers"):
+            doc = N.evidence_doc(ep)
+            self.assertIn("$first: Int", doc)
+            self.assertIn("$after: String", doc)
+            self.assertIn("pageInfo", doc)
+            self.assertIn("block", doc.lower())
+        body = {"data": {"transactions": {"edges": [
+            {"cursor": "c1", "node": {"hash": "H1", "cmd": {"meta": {"chainId": "7"}},
+                                       "result": {"height": 90, "block": {"hash": "B1"}}}}]}}}
+        self.assertEqual(N.evidence_rows("gql.transactions", body),
+                         [{"key": ("H1", "B1", None), "chain": 7, "height": 90, "block": "B1"}])
+        body = {"data": {"transfers": {"edges": [
+            {"node": {"requestKey": "R", "orderIndex": 2, "chainId": "4", "height": 80, "blockHash": "B2"}}]}}}
+        self.assertEqual(N.evidence_rows("gql.transfers", body),
+                         [{"key": ("R", "B2", 2), "chain": 4, "height": 80, "block": "B2"}])
+
+    def test_extra_rows_are_a_multiset_difference(self):
+        r = lambda k, b: {"key": (k, b, None), "chain": 1, "height": 5, "block": b}  # noqa: E731
+        ours = [r("a", "B1"), r("b", "B2")]
+        stock = [r("a", "B1"), r("b", "B2"), r("b", "B2x"), r("a", "B1")]
+        self.assertEqual([x["key"] for x in N.extra_rows(ours, stock)], [("b", "B2x", None), ("a", "B1", None)])
+        self.assertEqual(N.extra_rows(stock, ours), [])
+
+    def test_paging_stops_at_the_cap(self):
+        def fetch(vars_):
+            after = vars_.get("after")
+            row = {None: "a", "c1": "b", "c2": "c"}[after]
+            nxt = {None: "c1", "c1": "c2", "c2": None}[after]
+            return {"data": {"transactions": {"pageInfo": {"hasNextPage": nxt is not None, "endCursor": nxt},
+                                              "edges": [{"cursor": row, "node": {"hash": row, "cmd": {"meta": {"chainId": "1"}},
+                                                         "result": {"height": 1, "block": {"hash": "B" + row}}}}]}}}
+        rows, complete, n = N.page_rows(fetch, "gql.transactions", {"first": 3}, max_pages=5)
+        self.assertEqual((len(rows), complete, n), (3, True, 3))
+        rows, complete, n = N.page_rows(fetch, "gql.transactions", {"first": 3}, max_pages=2)
+        self.assertEqual((len(rows), complete, n), (2, False, 2))
+        # a failing page is incomplete, never a guess
+        rows, complete, n = N.page_rows(lambda v: None, "gql.transactions", {}, max_pages=2)
+        self.assertEqual((rows, complete), ([], False))
+
+    def test_node_evidence_counts_orphans_within_the_read_bound(self):
+        h = FakeNodeHttp(tip=1000, chains=(1, 2, 3))
+        n = N.Node(h, "http://node", "mainnet01", rps=1000)
+        rows = [{"key": ("r1", "canon500", None), "chain": 1, "height": 500, "block": "canon500"},   # canonical
+                {"key": ("r2", "orphanX", None), "chain": 1, "height": 501, "block": "orphanX"},      # orphan
+                {"key": ("r3", "orphanY", None), "chain": 2, "height": 700, "block": "orphanY"},      # orphan
+                {"key": ("r4", "tipblk", None), "chain": 3, "height": 995, "block": "tipblk"}]        # near the tip
+        ev = n.evidence(rows, max_reads=20)
+        self.assertEqual((ev["stock_orphans"], ev["unresolved"], ev["extra"]), (2, 1, 4))
+        self.assertLessEqual(ev["reads"], 20)
+        self.assertEqual(ev["reads"], len([c for c in h.calls if "/header/branch" in c or c.startswith("/cut")]))
+
+    def test_node_evidence_never_exceeds_the_cap(self):
+        h = FakeNodeHttp(tip=100000, chains=tuple(range(20)))
+        n = N.Node(h, "http://node", "mainnet01", rps=1000)
+        # 30 rows on 20 chains, far apart: one read per chain at most, and the cap stops the rest
+        rows = [{"key": ("r%d" % i, "bad", None), "chain": i % 20, "height": 1000 + 1000 * i, "block": "bad"}
+                for i in range(30)]
+        ev = n.evidence(rows, max_reads=5)
+        self.assertLessEqual(ev["reads"], 5)
+        self.assertEqual(ev["stock_orphans"] + ev["unresolved"], 30)
+        self.assertGreater(ev["unresolved"], 0)
+
+    def test_the_orphan_rule_fires_on_collected_evidence(self):
+        n = N.Node(FakeNodeHttp(tip=1000), "http://node", "mainnet01", rps=1000)
+        rows = [{"key": ("r%d" % i, "bad", None), "chain": 1, "height": 500 + i, "block": "bad"} for i in range(2)]
+        ev = n.evidence(rows)
+        ent = [E_("/data/transactionsByPublicKey/totalCount", "Changed", 1825, 1827)]
+        ctx = {"ep": "gql.transactionsByPublicKey", "cls": "entity", "ours_codes": [], "entries": ent, "vars": {},
+               "node": dict({"ok": True}, **ev)}
+        self.assertEqual(allow.classify(ctx), ("allowlisted", ["totalcount-stock-orphans"]))
+        ctx["node"] = dict({"ok": True}, **n.evidence(rows[:1]))      # the gap is 2, one orphan found
+        self.assertEqual(allow.classify(ctx)[0], "diff")
+
+
+class OrphanEvidenceFlow(unittest.TestCase):
+    """The runner's evidence step end to end, with ours, stock and the node stubbed."""
+
+    def page(self, rows, more=False):
+        edges = [{"cursor": "c", "node": {"hash": h, "cmd": {"meta": {"chainId": "1"}},
+                                          "result": {"height": ht, "block": {"hash": b}}}} for h, ht, b in rows]
+        return {"status": 200, "raw": json.dumps({"data": {"transactionsByPublicKey": {
+            "pageInfo": {"hasNextPage": more, "endCursor": "e"}, "edges": edges}}}).encode()}
+
+    def go(self, ours_rows, stock_rows):
+        sent = []
+        stub = type("R", (), {})()
+        stub.node = N.Node(FakeNodeHttp(tip=1000), "http://node", "mainnet01", rps=1000)
+        stub.ours_call = lambda fam, req: sent.append(("ours", req["variables"])) or self.page(ours_rows)
+        host = type("H", (), {"call": lambda h, cid, req, heavy: sent.append(("stock", req["variables"])) or self.page(stock_rows)})()
+        case = {"id": "gql.transactionsByPublicKey:7", "ep": "gql.transactionsByPublicKey"}
+        ev = run.Runner.orphan_evidence(stub, case, {"publicKey": "k", "first": 20}, host)
+        return ev, sent
+
+    def test_extra_stock_rows_in_orphan_blocks_are_counted(self):
+        ours = [("t1", 500, "canon500"), ("t2", 600, "canon600")]
+        stock = ours + [("t1", 500, "orphan1"), ("t2", 600, "orphan2")]
+        ev, sent = self.go(ours, stock)
+        self.assertEqual((ev["evidence"], ev["stock_orphans"], ev["unresolved"], ev["extra"]), ("node", 2, 0, 2))
+        self.assertLessEqual(ev["reads"], nodecheck_reads())
+        self.assertEqual(sent[0], ("ours", {"publicKey": "k", "first": N.EVIDENCE_PAGE}))
+        self.assertEqual({w for w, _ in sent}, {"ours", "stock"})
+
+    def test_equal_lists_have_no_extra_rows(self):
+        rows = [("t1", 500, "canon500")]
+        ev, _ = self.go(rows, rows)
+        self.assertEqual((ev["evidence"], ev["extra"]), ("no-extra-rows", 0))
+        self.assertNotIn("stock_orphans", ev)
+
+    def test_an_incomplete_list_gives_no_orphan_count(self):
+        stub = type("R", (), {})()
+        stub.node = N.Node(FakeNodeHttp(), "http://node", "mainnet01", rps=1000)
+        stub.ours_call = lambda fam, req: self.page([("t1", 500, "canon500")], more=True)   # never ends
+        host = type("H", (), {"call": lambda h, cid, req, heavy: self.page([])})()
+        ev = run.Runner.orphan_evidence(stub, {"id": "x:1", "ep": "gql.transactionsByPublicKey"}, {}, host)
+        self.assertEqual(ev["evidence"], "incomplete")
+        self.assertNotIn("stock_orphans", ev)
+
+
+def nodecheck_reads():
+    return N.EVIDENCE_READS
+
+
+class PactAndGasStatus(unittest.TestCase):
+    """H3 item 2: the 4,476 run-2 status rows are variable-coercion refusals (`pactQuery: true`,
+    `input: -1`, an absent variable). The pre-FIX-4 build answered HTTP 200 with the codeless
+    variable error (code ERROR) and `data`; stock answers HTTP 500 INTERNAL_SERVER_ERROR. The
+    NOT_SUPPORTED rules are about a call that reached the resolver, so they correctly do not
+    cover the old shape; FIX-4 item 3 gives the 500 shape, which the pair-diff calls equal."""
+
+    ent = [E_("/data", "Extra", None, None), E_("/errors/0/code", "Type", None, "INTERNAL_SERVER_ERROR")]
+
+    def test_pre_fix4_shape_stays_open(self):
+        for ep in ("gql.pactQuery", "gql.gasLimitEstimate"):
+            got = allow.classify({"ep": ep, "cls": "invalid", "ours_codes": ["ERROR"], "entries": self.ent,
+                                  "vars": {}, "node": None})
+            self.assertEqual(got, ("diff", []), ep)
+
+    def test_not_supported_rules_still_cover_a_call_that_reached_the_resolver(self):
+        ent = [E_("/data", "Type", "None", "{}"), E_("/errors", "Extra", "[]")]
+        self.assertEqual(allow.classify({"ep": "gql.pactQuery", "cls": "real", "ours_codes": ["NOT_SUPPORTED"],
+                                         "entries": ent, "vars": {}, "node": None})[0], "allowlisted")
+
+    def test_gas_limit_empty_input_is_not_allowlisted(self):
+        # `input: []`: stock answers [], and with FIX-4 ours does too, so a row left over with
+        # NOT_SUPPORTED on ours stays open (no stock error to explain it).
+        ent = [E_("/data", "Type", "None", "{}"), E_("/errors", "Extra", "[]")]
+        self.assertEqual(allow.classify({"ep": "gql.gasLimitEstimate", "cls": "invalid", "ours_codes": ["NOT_SUPPORTED"],
+                                         "entries": ent, "vars": {"input": []}, "node": None})[0], "diff")
+
+    def test_status_rows_are_selected_for_run_3(self):
+        rows = [("results", {"id": "gql.pactQuery:134", "ep": "gql.pactQuery", "v": {"class": "status"}})]
+        got = select3.pick(rows, heavy=set())
+        self.assertEqual(got["gql.pactQuery"], [("gql.pactQuery:134", "status", False)])
+
+
+class Select3(unittest.TestCase):
+    """H3 item 3: the run-3 case list."""
+
+    def rows(self):
+        def r(i, ep, c):
+            return {"id": i, "ep": ep, "v": {"class": c}}
+        return [
+            ("results", r("gql.node:1", "gql.node", "diff")),
+            ("results", r("gql.node:2", "gql.node", "equal")),
+            ("results", r("gql.node:3", "gql.node", "stock-unavailable")),
+            ("results", r("gql.node:4", "gql.node", "allowlisted")),
+            ("results", r("gql.node:5", "gql.node", "known-gap")),
+            ("results", r("gql.pactQuery:9", "gql.pactQuery", "status")),
+            ("results", r("gql.node:1", "gql.node", "diff")),                       # a row twice: one case
+            ("results", {"id": "native.tx:1", "ep": "native.tx", "cov": "native"}),   # no verdict
+            ("sample", r("gql.transfers:7", "gql.transfers", "diff")),
+            ("sample", r("gql.transfers:8", "gql.transfers", "stock-unavailable")),   # heavy timeout: not selected
+            ("sample", r("gql.transfers:9", "gql.transfers", "status")),
+            ("results", r("gql.transfers:10", "gql.transfers", "diff")),              # heavy ep in results: ours-only row
+        ]
+
+    def test_pick_by_verdict_and_coverage(self):
+        got = select3.pick(self.rows(), heavy={"gql.transfers"})
+        self.assertEqual(got["gql.node"], [("gql.node:1", "diff", False), ("gql.node:3", "stock-unavailable", False)])
+        self.assertEqual(got["gql.pactQuery"], [("gql.pactQuery:9", "status", False)])
+        # a heavy endpoint: only the stock-sample diffs and status rows, run again against stock
+        self.assertEqual(got["gql.transfers"], [("gql.transfers:7", "diff", True), ("gql.transfers:9", "status", True)])
+        self.assertNotIn("native.tx", got)
+
+    def mk(self, d, ep, n, cls="real", extra=None):
+        os.makedirs(d, exist_ok=True)
+        with gzip.open(os.path.join(d, ep + ".jsonl.gz"), "wt") as f:
+            for i in range(n):
+                req = {"variables": dict(extra(i) if extra else {})}
+                f.write(json.dumps({"id": "%s:%d" % (ep, i), "ep": ep, "cls": cls(i) if callable(cls) else cls,
+                                    "req": req}) + "\n")
+
+    def test_build_orders_run2_cases_first_and_renumbers_fresh(self):
+        with tempfile.TemporaryDirectory() as d:
+            run2, fresh, out = (os.path.join(d, x) for x in ("run2", "fresh", "out"))
+            self.mk(run2, "gql.node", 6)
+            self.mk(fresh, "gql.node", 4)
+            picks = {"gql.node": [("gql.node:4", "diff", False), ("gql.node:1", "stock-unavailable", False)]}
+            man = select3.build(picks, run2, fresh, out, fresh_full={"gql.node"}, err_eps=set())
+            cs = [json.loads(l) for l in gzip.open(os.path.join(out, "gql.node.jsonl.gz"), "rt")]
+        self.assertEqual([c["id"] for c in cs[:2]], ["gql.node:1", "gql.node:4"])           # case order, not verdict order
+        self.assertEqual([c["sel"] for c in cs[:2]], ["run2-stock-unavailable", "run2-diff"])
+        fresh_ids = [c["id"] for c in cs[2:]]
+        self.assertEqual(fresh_ids, ["gql.node:%d" % (select3.FRESH_BASE + i) for i in range(4)])
+        self.assertTrue(all(c["sel"] == "fresh" for c in cs[2:]))
+        self.assertEqual(len(set(c["id"] for c in cs)), 6)
+        self.assertEqual(man["endpoints"]["gql.node"], {"run2-diff": 1, "run2-stock-unavailable": 1, "fresh": 4})
+
+    def test_fresh_error_mapping_takes_invalid_and_edge_classes_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            run2, fresh, out = (os.path.join(d, x) for x in ("run2", "fresh", "out"))
+            cl = ["real", "invalid", "edge", "entity", "shape", "invalid"]
+            self.mk(fresh, "gql.networkInfo", 6, cls=lambda i: cl[i])
+            man = select3.build({}, run2, fresh, out, fresh_full=set(), err_eps={"gql.networkInfo"})
+            cs = [json.loads(l) for l in gzip.open(os.path.join(out, "gql.networkInfo.jsonl.gz"), "rt")]
+        self.assertEqual([c["cls"] for c in cs], ["invalid", "edge", "invalid"])
+        self.assertEqual(man["endpoints"]["gql.networkInfo"], {"fresh": 3})
+
+    def test_heavy_fresh_cases_flag_a_stock_sample(self):
+        with tempfile.TemporaryDirectory() as d:
+            run2, fresh, out = (os.path.join(d, x) for x in ("run2", "fresh", "out"))
+            self.mk(fresh, "gql.blocksFromDepth", 100)
+            select3.build({}, run2, fresh, out, fresh_full={"gql.blocksFromDepth"}, err_eps=set(), sample_per_ep=10)
+            cs = [json.loads(l) for l in gzip.open(os.path.join(out, "gql.blocksFromDepth.jsonl.gz"), "rt")]
+        self.assertEqual(len(cs), 100)
+        flagged = [c for c in cs if c.get("sample")]
+        self.assertEqual(len(flagged), 10)
+        self.assertEqual([c["id"] for c in flagged][:3], ["gql.blocksFromDepth:%d" % (select3.FRESH_BASE + i) for i in (0, 10, 20)])
+
+    def test_transaction_minimum_depth_cases_are_always_sampled(self):
+        with tempfile.TemporaryDirectory() as d:
+            run2, fresh, out = (os.path.join(d, x) for x in ("run2", "fresh", "out"))
+            self.mk(fresh, "gql.transaction", 50, extra=lambda i: {"minimumDepth": 101} if i in (7, 33) else {})
+            select3.build({}, run2, fresh, out, fresh_full={"gql.transaction"}, err_eps=set(), sample_per_ep=4)
+            cs = [json.loads(l) for l in gzip.open(os.path.join(out, "gql.transaction.jsonl.gz"), "rt")]
+        flagged = {c["id"] for c in cs if c.get("sample")}
+        self.assertTrue({"gql.transaction:%d" % (select3.FRESH_BASE + i) for i in (7, 33)} <= flagged)
+
+    def test_run_plan_covers_every_fix4_group(self):
+        eps = select3.FRESH_FULL
+        for ep in ("gql.fungibleChainAccounts", "gql.gasLimitEstimate", "gql.node", "gql.nodes", "gql.transaction",
+                   "compat.v1txs", "gql.blocksFromDepth", "gql.blocksFromHeight", "gql.completedBlockHeights"):
+            self.assertIn(ep, eps)
+        self.assertEqual(select3.FRESH_PER_EP, 20000)
+        for ep in select3.ERR_MAP_EPS:                  # error mapping: the other GraphQL endpoints
+            self.assertTrue(ep.startswith("gql."))
+            self.assertNotIn(ep, eps)
+
+
+class SampleLane(unittest.TestCase):
+    def test_sample_flag_selects_the_stock_lane(self):
+        with tempfile.TemporaryDirectory() as d:
+            with gzip.open(os.path.join(d, "gql.transfers.jsonl.gz"), "wt") as f:
+                for i in range(6):
+                    f.write(json.dumps({"id": "gql.transfers:%d" % i, "ep": "gql.transfers", "cls": "real",
+                                        "req": {}, "sample": i % 3 == 0}) + "\n")
+            every = [c["id"] for c in run.load_cases(d, ["gql.transfers"], 0)]
+            flagged = [c["id"] for c in run.load_cases(d, ["gql.transfers"], 0, only_flag="sample")]
+        self.assertEqual(len(every), 6)
+        self.assertEqual(flagged, ["gql.transfers:0", "gql.transfers:3"])
+
+
+class Budget(unittest.TestCase):
+    def test_smoke_budget_is_cumulative_and_hard(self):
+        with tempfile.TemporaryDirectory() as d:
+            fn = os.path.join(d, "count")
+            b = run.RequestBudget(3, fn)
+            b.take()
+            b.take()
+            self.assertEqual(run.RequestBudget(3, fn).used, 2)       # a second invocation sees the first's count
+            b2 = run.RequestBudget(3, fn)
+            b2.take()
+            with self.assertRaises(run.BudgetExhausted):
+                b2.take()
+            self.assertEqual(int(open(fn).read()), 3)               # the refused call is not counted
+
+    def test_no_budget_means_no_limit(self):
+        b = run.RequestBudget(None, None)
+        for _ in range(100):
+            b.take()
+
+
+class Estimate(unittest.TestCase):
+    def test_per_endpoint_latency_drives_the_stock_lanes(self):
+        cfg = {"stock": {"oracle": [{"rps": 35, "concurrency": 64, "heavy_concurrency": 4},
+                                    {"rps": 35, "concurrency": 64, "heavy_concurrency": 4}]},
+               "ours": {"rps": 130}, "estimate": {"oracle_light_s": 0.6, "oracle_heavy_s": 3.0,
+                                                  "ep": {"gql.nodes": 15.0}}}
+        counts = {"gql.nodes": {"n": 8000, "stock": 8000}, "gql.pactQuery": {"n": 7000, "stock": 7000},
+                  "gql.transfers": {"n": 20000, "stock": 600}}
+        out = run.estimate_model(cfg, counts)
+        # nodes is a heavy-lane endpoint: 8000 * 15 s over 2 hosts * 4 slots; transfers' sample too
+        self.assertAlmostEqual(out["lane_hours"]["oracle-heavy"], (8000 * 15.0 + 600 * 3.0) / 8 / 3600, places=2)
+        # ours carries every case at its rate
+        self.assertAlmostEqual(out["lane_hours"]["ours"], 35000 / 130 / 3600, places=2)
+        self.assertEqual(out["wall_hours"], max(out["lane_hours"].values()))
 
 if __name__ == "__main__":
     unittest.main()

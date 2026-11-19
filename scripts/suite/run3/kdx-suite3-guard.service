@@ -1,0 +1,8 @@
+[Unit]
+Description=Guard for the suite run 3 (stops kdx-suite3 only)
+BindsTo=kdx-suite3.service
+After=kdx-suite3.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /root/kdx-suite/run3/guard.sh

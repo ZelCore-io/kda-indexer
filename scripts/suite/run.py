@@ -21,9 +21,21 @@
       DIR/stock-events.jsonl and that endpoint and class are skipped on that host from then
       on. `--ours-only` is the dry run: no stock request, no verdict, invariants only.
 
-  run.py estimate --config suite.toml --cases DIR
-      Request totals per backend and the expected run time, from the caps and the latency
-      assumptions in the config.
+  run.py estimate --config suite.toml --cases DIR [--heavy-sample N | --sample-flag]
+      Request totals per backend and the expected hours per lane, from the caps and the latency
+      assumptions in the config ([estimate], and [estimate.ep] per endpoint in seconds).
+
+  Run 3 (H3): the case list comes from select3.py (run-2 differences first, then a fresh sample);
+      `run --sample-flag` sends a heavy endpoint's flagged cases only to stock. Every stock-paired
+      row carries `tip` (the node's tip at ours' read and at stock's answer, for the tip-timing
+      rule) and `idx` (ours' and the stock host's own lastBlockHeight), read from logs filled once
+      per `--tip-period` seconds, never per request. A list diff where stock has more rows
+      (totalCount or edges) gets node evidence for the extra rows (`node.stock_orphans`, at most
+      20 node reads per case; orphan rule). `smoke` runs named cases under a hard request budget.
+
+  run.py smoke --config suite.toml --cases DIR --out DIR --ids ID ... --budget N --budget-file F
+      Real cases through the real runner, every request (ours, stock, node, tip samplers)
+      counted against N across invocations; stops at N.
 
   run.py rereferee --out DIR --cases DIR --md FILE
       Re-classifies the stored diff and status records of DIR with the current allowlist (no
@@ -96,6 +108,39 @@ class Bucket:
             time.sleep(t - now)
 
 
+class BudgetExhausted(Exception):
+    pass
+
+
+class RequestBudget:
+    """A hard cap on the requests this process sends to anything (smoke runs): `limit` in all,
+    counted across invocations through `fn` (a file holding the count). No limit: no check."""
+
+    def __init__(self, limit, fn):
+        self.limit, self.fn = limit, fn
+        self.lock = threading.Lock()
+        self.used = 0
+        if fn and os.path.exists(fn):
+            try:
+                self.used = int(open(fn).read().strip() or 0)
+            except ValueError:
+                self.used = 0
+
+    def take(self):
+        if self.limit is None:
+            return
+        with self.lock:
+            if self.used >= self.limit:
+                raise BudgetExhausted("request budget %d used" % self.limit)
+            self.used += 1
+            if self.fn:
+                with open(self.fn, "w") as f:
+                    f.write(str(self.used))
+
+
+REQ_BUDGET = RequestBudget(None, None)
+
+
 class Http:
     def __init__(self, timeout, sources=None, insecure=False):
         self.timeout = timeout
@@ -105,6 +150,7 @@ class Http:
         self.ctx = ssl._create_unverified_context() if insecure else None
 
     def call(self, url, path=None, body=None, src=None, accept=ACCEPT):
+        REQ_BUDGET.take()
         u = urllib.parse.urlsplit(url)
         with self.lock:
             if src is None:
@@ -259,8 +305,9 @@ class PairDiff:
             return json.loads(self.p.stdout.readline())
 
 
-def load_cases(cases_dir, eps, per):
-    """Round-robin over endpoints so a partial run covers every endpoint evenly."""
+def load_cases(cases_dir, eps, per, only_flag=None):
+    """Round-robin over endpoints so a partial run covers every endpoint evenly. `only_flag`: only
+    the cases that carry that flag (run 3: `sample` marks the cases that also go to stock)."""
     its = []
     for ep in eps:
         fn = os.path.join(cases_dir, ep + ".jsonl.gz")
@@ -274,6 +321,8 @@ def load_cases(cases_dir, eps, per):
                 its.remove(f)
                 continue
             c = json.loads(l)
+            if only_flag and not c.get(only_flag):
+                continue
             if per and n[c["ep"]] >= per:
                 its.remove(f)
                 continue
@@ -510,6 +559,25 @@ def normalize_pair(ep, ab, sb):
     return ab, sb
 
 
+def tip_fields(node, idx, host, t0, t1):
+    """The tip evidence of one stock-paired call, read from the sampled logs (no request): `tip`
+    is the node's highest chain height at ours' read (`t0`) and at stock's answer (`t1`) for the
+    tip-timing rule; `idx` is ours' and the stock host's own lastBlockHeight at those times."""
+    out = {}
+    p = node.tip_pair(t0, t1) if node else None
+    if p:
+        out["tip"] = p
+    i = {}
+    for key, name, t in (("ours", "ours", t0), ("stock", host, t1)):
+        lg = idx.get(name)
+        h = lg.at(t, nodecheck.TIP_ROW_AGE) if lg is not None else None
+        if h is not None:
+            i[key] = h
+    if i:
+        out["idx"] = i
+    return out
+
+
 def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None):
     """Class and allowlist ids after the suite allowlist (allow.py). `tip`: the node's highest
     height at ours' read and at stock's ({"ours", "stock"}), for the tip-timing rule."""
@@ -553,10 +621,16 @@ class Runner:
         self.pd = None if a.ours_only else PairDiff(cfg["diff"]["kda_compare"], cfg["diff"]["config"])
         nd = cfg.get("node") or {}
         self.node = nodecheck.Node(Http(nd.get("timeout_s", 30)), nd["url"], nd.get("network", "mainnet01"),
-                                   min(float(nd.get("rps", 20)), 20.0),
+                                   min(float(nd.get("rps", 20)), 30.0),
                                    float(nd.get("max_wait_s", 30))) if nd.get("url") else None
+        self.tip_period = float(getattr(a, "tip_period", 1.0) or 1.0)
+        self.idx = {"ours": nodecheck.TipLog()}
+        for h in self.oracles:
+            self.idx[h.name] = nodecheck.TipLog()
         if self.node:
-            self.node.sample_tips()      # the tip log behind the tip-timing rule
+            self.node.sample_tips(self.tip_period)      # the node tip log: tip-timing rule, every paired row
+        if not a.ours_only:
+            threading.Thread(target=self.sample_indexer_tips, daemon=True).start()
         self.tip = None
         import queue
         self.search_src = queue.Queue()
@@ -572,6 +646,33 @@ class Runner:
             return self.ours.call(o["graphql"], body={"query": req["query"], "variables": req["variables"]}, src=src)
         base = o["native"] if fam == "native" else o["compat"]
         return self.ours.call(base, path=req["path"], src=src)
+
+    def sample_indexer_tips(self):
+        """ours' and each stock GraphQL host's own lastBlockHeight, one read per `tip_period` each,
+        through the same rate buckets (a read takes a slot); the logs back `tip_fields`. Never
+        feeds the throttle windows. A failed read leaves a gap."""
+        q = {"query": "{ lastBlockHeight }", "variables": {}}
+        hosts = [("ours", None)] + [(h.name, h) for h in self.oracles]
+
+        def one_read(name, h):
+            try:
+                if h is None:
+                    r = self.ours_call("graphql", q)
+                else:
+                    if not h.healthy.is_set():
+                        return
+                    h.bucket.take()
+                    r = h.send(q)
+                if r["status"] == 200:
+                    self.idx[name].add(time.time(), int(json.loads(r["raw"])["data"]["lastBlockHeight"]))
+            except BudgetExhausted:
+                raise
+            except Exception:  # noqa: BLE001 - tip evidence only
+                pass
+        while True:
+            for name, h in hosts:
+                threading.Thread(target=one_read, args=(name, h), daemon=True).start()
+            time.sleep(self.tip_period)
 
     def ours_tip(self):
         r = self.ours.call(self.cfg["ours"]["graphql"], body={"query": "{ lastBlockHeight }"})
@@ -603,6 +704,7 @@ class Runner:
             maxh = min((x.max_height or tip) for x in self.oracles)
             tip = min(tip, maxh)
         req = resolve(case["req"], tip)
+        t_ours = time.time()
         if ep in SEARCH_EPS:
             src = self.search_src.get()
             try:
@@ -641,9 +743,11 @@ class Runner:
             if s is None:
                 row["stock"] = {"not_run": why}
             else:
+                t_stock = time.time()
                 sb = parse(s["raw"])
                 row["stock"] = {"host": s["host"], "st": s["status"], "ms": s["ms"], "err": s.get("err"),
                                 "retry": s.get("attempt", 0)}
+                row.update(tip_fields(self.node, self.idx, s["host"], t_ours, t_stock))
                 if fam == "graphql":
                     row["stock"]["gql_errors"] = gql_error_codes(sb)[:3]
                 sm = side_msgs(s["status"], s["raw"], sb)
@@ -663,16 +767,48 @@ class Runner:
                     node = None
                     if v.get("class") in ("diff", "status") and self.node and ep in NODE_EPS and a["status"] == 200:
                         node = row["node"] = self.node.check(ep, vars_, ab)
-                    tip = None
-                    if v.get("class") in ("diff", "status") and self.node and ep in allow.TIP_EPS:
-                        tip = self.node.tip_pair(row["t"] - a["ms"] / 1000.0)
-                        if tip:
-                            row["tip"] = tip
+                    if v.get("class") in ("diff", "status") and self.node and ep in nodecheck.EVIDENCE_EPS \
+                            and a["status"] == 200 and nodecheck.needs_evidence(ep, v.get("entries") or []):
+                        ev = self.orphan_evidence(case, vars_, self.stock_host(case, stock))
+                        if ev:
+                            node = row["node"] = dict(node or {}, **ev)
+                    tip = row.get("tip")
                     k, ids = verdict_class(ep, case["cls"], v, codes, vars_, node, tip)
                     row["v"] = {"class": k, "ids": (v.get("ids") or []) + ids, "known": v.get("known_ids"),
                                 "entries": v.get("entries")}
         (self.sample if lane == "sample" else self.res).write(json.dumps(row, separators=(",", ":")) + "\n")
         return row
+
+    def orphan_evidence(self, case, vars_, host):
+        """For a list where stock counts or lists more than ours: page both sides with the evidence
+        query (rows with their block), take the rows only stock lists and ask the node about them
+        (nodecheck.Node.evidence, at most EVIDENCE_READS reads). Without both lists complete (the
+        page cap, a failed page) there is no `stock_orphans` and the rule does not fire."""
+        ep = case["ep"]
+        doc = nodecheck.evidence_doc(ep)
+        v = nodecheck.evidence_vars(vars_)
+
+        def fetch_ours(vv):
+            r = self.ours_call("graphql", {"query": doc, "variables": vv})
+            return parse(r["raw"]) if r["status"] == 200 else None
+
+        def fetch_stock(vv):
+            r = host.call(case["id"] + ":evidence", {"query": doc, "variables": vv}, True)
+            return parse(r["raw"]) if r["status"] == 200 else None
+        try:
+            o_rows, o_done, o_pages = nodecheck.page_rows(fetch_ours, ep, v)
+            s_rows, s_done, s_pages = nodecheck.page_rows(fetch_stock, ep, v) if host and o_done else ([], False, 0)
+        except BudgetExhausted:
+            raise
+        except Exception as e:  # noqa: BLE001 - evidence only; the verdict stays what pair-diff gave
+            return {"evidence": "error:" + type(e).__name__}
+        info = {"ev_pages": [o_pages, s_pages]}
+        if not (o_done and s_done):
+            return dict(info, evidence="incomplete")
+        extra = nodecheck.extra_rows(o_rows, s_rows)
+        if not extra:
+            return dict(info, evidence="no-extra-rows", extra=0)
+        return dict(info, evidence="node", **self.node.evidence(extra, nodecheck.EVIDENCE_READS))
 
     def cross(self, ep, req, st, body):
         """Cross-check of an answer against ours' other APIs (same fact, one more request)."""
@@ -720,6 +856,9 @@ class Runner:
             return {"ok": ok, "with": "native /blocks", "why": None if ok else "native block differs (%d)" % r["status"]}
         return None
 
+    def flag(self):
+        return "sample" if getattr(self.a, "sample_flag", False) else None
+
     def done_ids(self, name):
         done = set()
         fn = os.path.join(self.a.out, name)
@@ -760,7 +899,7 @@ class Runner:
             heavy = [e for e in eps if e in E.HEAVY_ENDPOINTS and e not in E.STOCK_SKIP]
             for i, h in enumerate(self.oracles):
                 hv = [e for e in heavy if e.startswith("gql.")]
-                cs = host_cases(load_cases(self.a.cases, hv, self.a.heavy_sample), i, len(self.oracles), sdone)
+                cs = host_cases(load_cases(self.a.cases, hv, self.a.heavy_sample, self.flag()), i, len(self.oracles), sdone)
                 lanes.append((h, cs, "sample", deadline))
                 lt = [e for e in eps if e in E.LANE_LIGHT and e.startswith("gql.")]
                 if lt:
@@ -768,7 +907,7 @@ class Runner:
                     lanes.append((h, cs2, "light", deadline))
             for k, h in self.rest_stock.items():
                 hv = [e for e in heavy if e.startswith("compat.") and dict((x[0], x[2]) for x in E.ENDPOINTS)[e] == k]
-                cs = (c for c in load_cases(self.a.cases, hv, self.a.heavy_sample) if c["id"] not in sdone)
+                cs = (c for c in load_cases(self.a.cases, hv, self.a.heavy_sample, self.flag()) if c["id"] not in sdone)
                 lanes.append((h, cs, "sample", deadline))
                 lt = [e for e in eps if e in E.LANE_LIGHT and dict((x[0], x[2]) for x in E.ENDPOINTS)[e] == k]
                 if lt:
@@ -1070,47 +1209,115 @@ def rereferee(out, cases_dir, md_path):
     print("unexplained before %d after %d" % (res["total_before"], res["total_after"]))
 
 
-def estimate(cfg, cases_dir):
-    """Requests per backend and hours at the configured rates. Light stock cases run at
-    min(rps, concurrency / latency) per host; heavy ones at heavy_concurrency / latency per
-    host, beside the light ones. Ours carries every case (plus native cross-checks) at its
-    paired rate. Latencies come from `[estimate]`."""
-    req, heavy = collections.Counter(), collections.Counter()
+def count_cases(cases_dir, heavy_sample=2000, sample_flag=False):
+    """{ep: {"n": cases, "stock": cases sent to stock}}: light endpoints send every case; a heavy
+    endpoint its flagged cases (`sample_flag`) or the first `heavy_sample`."""
+    out = {}
     for ep in E.ENDPOINTS:
         fn = os.path.join(cases_dir, ep[0] + ".jsonl.gz")
         if not os.path.exists(fn):
             continue
+        n = flagged = 0
         for l in gzip.open(fn, "rt"):
-            c = json.loads(l)
-            req["ours"] += 1 + (ep[0] in E.NATIVE_CROSS)
-            req["ours_search"] += ep[0] in SEARCH_EPS
-            if ep[2] in ("oracle", "cwd", "kdatxs") and ep[0] not in E.STOCK_SKIP:
-                req[ep[2]] += 1
-                heavy[ep[2]] += heavy_case(ep[0], c["req"])
+            n += 1
+            if sample_flag and '"sample":true' in l:
+                flagged += 1
+        if ep[2] not in ("oracle", "cwd", "kdatxs") or ep[0] in E.STOCK_SKIP:
+            s = 0
+        elif ep[0] in E.HEAVY_ENDPOINTS:
+            s = flagged if sample_flag else min(n, heavy_sample)
+        else:
+            s = n
+        out[ep[0]] = {"n": n, "stock": s}
+    return out
+
+
+def estimate_model(cfg, counts):
+    """Hours per lane from `{ep: {"n", "stock"}}`. Light stock cases run at min(rps, concurrency /
+    latency) per host; heavy-lane cases (heavy endpoints' sample, LANE_LIGHT endpoints) at
+    heavy_concurrency / latency per host, beside the light ones; ours carries every case (plus
+    native cross-checks) at its rate. Latencies: `[estimate]` per backend, `[estimate.ep]` per
+    endpoint (seconds, e.g. observed in run 2). Wall time is the slowest lane."""
     st, lat = cfg.get("stock", {}), cfg.get("estimate", {})
-    o = st.get("oracle", [])
-    tables = {"oracle": o, "cwd": [st["cwd"]] if "cwd" in st else [], "kdatxs": [st["kdatxs"]] if "kdatxs" in st else []}
-    secs = {}
-    for b, hosts in tables.items():
-        if not req[b]:
+    per_ep = lat.get("ep", {})
+    tables = {"oracle": st.get("oracle", []), "cwd": [st["cwd"]] if "cwd" in st else [],
+              "kdatxs": [st["kdatxs"]] if "kdatxs" in st else []}
+    host_of = {e[0]: e[2] for e in E.ENDPOINTS}
+    work = collections.defaultdict(lambda: {"n": 0, "secs": 0.0})
+    ours_n = search_n = 0
+    for ep, c in counts.items():
+        ours_n += c["n"] * (1 + (ep in E.NATIVE_CROSS))
+        search_n += c["n"] * (ep in SEARCH_EPS)
+        b = host_of.get(ep)
+        if not c["stock"] or b not in tables:
             continue
-        hosts = hosts or [{}]
-        ls, hs = lat.get(b + "_light_s", lat.get(b + "_s", 0.6)), lat.get(b + "_heavy_s", 3.0)
-        light = sum(min(h.get("rps", 35), h.get("concurrency", 64) / ls) for h in hosts)
-        hv = sum(h.get("heavy_concurrency", 4) / hs for h in hosts)
-        secs[b] = max((req[b] - heavy[b]) / light, heavy[b] / hv)
-    paired = sum(x.get("rps", 35) for x in o) + sum(st[k].get("rps", 30) for k in ("cwd", "kdatxs") if k in st)
+        heavy = ep in E.HEAVY_ENDPOINTS or ep in E.LANE_LIGHT
+        ls = per_ep.get(ep, lat.get(b + "_heavy_s", 3.0) if heavy else lat.get(b + "_light_s", lat.get(b + "_s", 0.6)))
+        w = work[(b, "heavy" if heavy else "light")]
+        w["n"] += c["stock"]
+        w["secs"] += c["stock"] * ls
+    lanes = {}
+    for (b, kind), w in work.items():
+        hosts = tables[b] or [{}]
+        if kind == "light":
+            conc = sum(h.get("concurrency", 64) for h in hosts)
+            rps = sum(h.get("rps", 35) for h in hosts)
+            lanes["%s-light" % b] = max(w["secs"] / conc, w["n"] / rps)
+        else:
+            lanes["%s-heavy" % b] = w["secs"] / sum(h.get("heavy_concurrency", 4) for h in hosts)
+    paired = sum(x.get("rps", 35) for x in tables["oracle"]) + sum(st[k].get("rps", 30) for k in ("cwd", "kdatxs") if k in st)
     ours_rps = cfg["ours"].get("rps") or paired or 100
-    secs["ours"] = req["ours"] / ours_rps
-    srch = sum(1 for e in E.ENDPOINTS if e[0] in SEARCH_EPS) and req["ours_search"]
-    secs["ours_search"] = srch * lat.get("ours_search_s", 1.5) / 4
-    total_stock_rps = {b: round((req[b] - heavy[b]) / secs[b], 1) for b in tables if b in secs}
-    out = {"requests": dict(req), "heavy": dict(heavy), "ours_rps": ours_rps,
-           "hours": {k: round(v / 3600, 2) for k, v in secs.items()},
-           "wall_hours_min": round(max(secs.values()) / 3600, 2),
-           "light_rps_per_backend": total_stock_rps}
+    lanes["ours"] = ours_n / ours_rps
+    lanes["ours-search"] = search_n * lat.get("ours_search_s", 1.5) / 4
+    hours = {k: round(v / 3600, 3) for k, v in lanes.items()}
+    return {"requests": {"ours": ours_n, "stock": {k: sum(c["stock"] for e, c in counts.items() if host_of.get(e) == k)
+                                                   for k in tables}},
+            "ours_rps": ours_rps, "lane_hours": hours, "wall_hours": max(hours.values())}
+
+
+def estimate(cfg, cases_dir, heavy_sample=2000, sample_flag=False):
+    out = estimate_model(cfg, count_cases(cases_dir, heavy_sample, sample_flag))
     print(json.dumps(out, indent=1))
     return out
+
+
+def lane_of(ep):
+    """The lane `one()` runs an endpoint in when it is sent to stock."""
+    if ep in E.HEAVY_ENDPOINTS:
+        return "sample"
+    return "light" if ep in E.LANE_LIGHT else None
+
+
+def smoke(cfg, a):
+    """A handful of cases through the real runner under a hard request budget (all requests to
+    ours, stock and the node count, across invocations): validates the tip and evidence
+    fetching. Prints one summary line per case; rows go to DIR/results.jsonl and sample.jsonl."""
+    global REQ_BUDGET
+    REQ_BUDGET = RequestBudget(a.budget, a.budget_file)
+    a.ours_only = False
+    want = list(a.ids)
+    cases = {}
+    for ep in sorted({i.rsplit(":", 1)[0] for i in want}):
+        for l in gzip.open(os.path.join(a.cases, ep + ".jsonl.gz"), "rt"):
+            c = json.loads(l)
+            if c["id"] in want:
+                cases[c["id"]] = c
+    rn = Runner(cfg, a)
+    try:
+        rn.tip = rn.ours_tip()
+        time.sleep(a.settle)
+        for i in want:
+            c = cases[i]
+            row = rn.one(c, lane_of(c["ep"]))
+            v, nd = row.get("v") or {}, row.get("node") or {}
+            print(json.dumps({"id": i, "class": v.get("class"), "ids": v.get("ids"), "ours": row["ours"].get("st"),
+                              "stock": (row.get("stock") or {}).get("st"), "tip": row.get("tip"), "idx": row.get("idx"),
+                              "node": {k: nd[k] for k in ("ok", "evidence", "stock_orphans", "unresolved", "extra",
+                                                          "reads", "ev_pages") if k in nd}}), flush=True)
+    except BudgetExhausted as e:
+        print("STOPPED: %s" % e, flush=True)
+    print("requests used: %d of %s" % (REQ_BUDGET.used, a.budget), flush=True)
+    os._exit(0)
 
 
 def main():
@@ -1128,9 +1335,23 @@ def main():
     r.add_argument("--stock-heavy-hours", type=float, default=10.5,
                    help="stop sending new heavy sample cases to stock after this many hours")
     r.add_argument("--import-from", help="results.jsonl of an earlier run (see import_rows)")
+    r.add_argument("--sample-flag", action="store_true",
+                   help="heavy endpoints: only the cases flagged `sample` go to stock (run 3 case list)")
+    r.add_argument("--tip-period", type=float, default=1.0, help="seconds between tip reads (node, ours, stock)")
     e = sub.add_parser("estimate")
     e.add_argument("--config", required=True)
     e.add_argument("--cases", required=True)
+    e.add_argument("--heavy-sample", type=int, default=2000)
+    e.add_argument("--sample-flag", action="store_true")
+    sm = sub.add_parser("smoke")
+    sm.add_argument("--config", required=True)
+    sm.add_argument("--cases", required=True)
+    sm.add_argument("--out", required=True)
+    sm.add_argument("--ids", nargs="+", required=True)
+    sm.add_argument("--budget", type=int, required=True, help="hard cap on all requests, across invocations")
+    sm.add_argument("--budget-file", required=True)
+    sm.add_argument("--tip-period", type=float, default=5.0)
+    sm.add_argument("--settle", type=float, default=7.0, help="seconds of tip sampling before the first case")
     p = sub.add_parser("report")
     p.add_argument("--out", required=True)
     rr = sub.add_parser("rereferee")
@@ -1141,7 +1362,9 @@ def main():
     if a.cmd == "run":
         Runner(tomllib.load(open(a.config, "rb")), a).run()
     elif a.cmd == "estimate":
-        estimate(tomllib.load(open(a.config, "rb")), a.cases)
+        estimate(tomllib.load(open(a.config, "rb")), a.cases, a.heavy_sample, a.sample_flag)
+    elif a.cmd == "smoke":
+        smoke(tomllib.load(open(a.config, "rb")), a)
     elif a.cmd == "rereferee":
         rereferee(a.out, a.cases, a.md)
     else:

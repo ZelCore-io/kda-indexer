@@ -1,0 +1,12 @@
+# The same unit as start3.sh's transient one, for a host that wants it installed:
+#   cp kdx-suite3.service kdx-suite3-guard.service /etc/systemd/system/ && systemctl daemon-reload
+# Do not enable; start by hand: systemctl start kdx-suite3 kdx-suite3-guard
+[Unit]
+Description=KDA indexer endpoint suite, run 3 (ours vs stock)
+
+[Service]
+Type=simple
+WorkingDirectory=/root/kdx-suite
+Nice=10
+MemoryMax=4G
+ExecStart=/bin/bash /root/kdx-suite/run3/launch.sh

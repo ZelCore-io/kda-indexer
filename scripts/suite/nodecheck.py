@@ -9,7 +9,9 @@ holds the whole list. The pure functions take the node's answers as arguments; `
 fetches them under its own rate cap (one read per chain at most, cached).
 """
 
+import bisect
 import collections
+import contextlib
 import json
 import re
 import threading
@@ -17,12 +19,18 @@ import time
 import urllib.parse
 
 import allow
+import endpoints
 
 BRANCH_MAX = 360          # header/branch rows per read
 SAMPLE_ROWS = 10          # rows per answer checked against /poll
 MAX_CHAINS = 4            # chains per answer checked
 TIP_DEPTH = 10            # a block this close to the tip may be reorged between two reads
 TIP_SLACK = 3             # blocks the tip may move between ours' answer and the node read
+TIP_ROW_AGE = 5           # seconds: a tip sample older than this is not a reading at that time
+EVIDENCE_EPS = {"gql.transactions", "gql.transactionsByPublicKey", "gql.transfers"}
+EVIDENCE_PAGE = 100       # rows per evidence page
+EVIDENCE_PAGES = 5        # pages per side: a longer list is not completed (evidence incomplete)
+EVIDENCE_READS = 20       # node reads per case for the extra rows
 RK_RE = re.compile(r"[A-Za-z0-9_-]{43}")   # a request key (pseudo keys like <coinbase> are not polled)
 
 
@@ -186,6 +194,136 @@ def check_tx_list(ep, v, body, rows, polled):
     return p
 
 
+class TipLog:
+    """Time-ordered `(wall time, height)` samples, bounded; `at(t)` is the newest sample at or
+    before `t` when it is fresh enough. One cut (or lastBlockHeight) read per second fills it, so
+    the runner reads the tip for a request from here and never per request."""
+
+    def __init__(self, maxlen=900):
+        self.maxlen = maxlen
+        self.ts, self.hs = [], []
+        self.lock = threading.Lock()
+
+    def add(self, t, h):
+        with self.lock:
+            i = bisect.bisect_right(self.ts, t)
+            self.ts.insert(i, t)
+            self.hs.insert(i, h)
+            while len(self.ts) > self.maxlen:
+                self.ts.pop(0)
+                self.hs.pop(0)
+
+    def at(self, t, max_age=TIP_ROW_AGE):
+        with self.lock:
+            i = bisect.bisect_right(self.ts, t)
+            if i == 0 or t - self.ts[i - 1] > max_age:
+                return None
+            return self.hs[i - 1]
+
+    def __len__(self):
+        return len(self.ts)
+
+    def __getitem__(self, i):
+        with self.lock:
+            return (self.ts[i], self.hs[i])
+
+    def __iter__(self):
+        with self.lock:
+            return iter(list(zip(self.ts, self.hs)))
+
+
+def needs_evidence(ep, entries):
+    """A list diff where stock has more rows than ours: a `totalCount` that is higher on stock
+    or edges only stock has (kind Missing)."""
+    if ep not in EVIDENCE_EPS:
+        return False
+    root = ep.split(".", 1)[1]
+    for e in entries or []:
+        if e.get("path") == "/data/%s/totalCount" % root and e.get("kind") == "Changed":
+            a, b = allow._num(e.get("a")), allow._num(e.get("b"))
+            if a is not None and b is not None and b > a:
+                return True
+        elif e.get("kind") == "Missing" and re.fullmatch(r"/data/%s/edges/\d+" % root, e.get("path", "")):
+            return True
+    return False
+
+
+# The selection that carries a row's block: where it sits is what the node is asked about.
+EVIDENCE_SEL = {
+    "transactions": "hash cmd { meta { chainId } } result { ... on TransactionResult { height block { hash } } }",
+    "transactionsByPublicKey": "hash cmd { meta { chainId } } result { ... on TransactionResult { height block { hash } } }",
+    "transfers": "requestKey orderIndex chainId height blockHash",
+}
+
+
+def evidence_doc(ep):
+    field = ep.split(".", 1)[1]
+    vdefs, args = endpoints.GQL[field][0], endpoints.GQL[field][1]
+    return ("query E_%s(%s) { %s(%s) { pageInfo { hasNextPage endCursor } edges { cursor node { %s } } } }"
+            % (field, vdefs, field, args, EVIDENCE_SEL[field]))
+
+
+def evidence_vars(v):
+    """The case's filters with the paging replaced by one full page."""
+    out = {k: x for k, x in (v or {}).items() if k not in ("first", "last", "after", "before")}
+    out["first"] = EVIDENCE_PAGE
+    return out
+
+
+def evidence_rows(ep, body):
+    """[{key, chain, height, block}] of an evidence page: `key` identifies the row (request key or
+    hash, block, order index)."""
+    nodes, _ = _edges(ep, body)
+    out = []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        if ep == "gql.transfers":
+            rk, block, order = n.get("requestKey"), n.get("blockHash"), n.get("orderIndex")
+            chain, height = _chain(n.get("chainId")), n.get("height")
+        else:
+            res = n.get("result") if isinstance(n.get("result"), dict) else {}
+            rk, block, order = n.get("hash"), _get(res, "block", "hash"), None
+            chain, height = _chain(_get(n, "cmd", "meta", "chainId")), res.get("height")
+        out.append({"key": (rk, block, order), "chain": chain, "height": height, "block": block})
+    return out
+
+
+def page_rows(fetch, ep, vars_, max_pages=EVIDENCE_PAGES):
+    """Pages `fetch(vars)` (an answer body or None) from the first page: (rows, complete, pages).
+    Complete means the last page said there is no next one; a failing page or the page cap leaves
+    it incomplete."""
+    v = dict(vars_)
+    rows, pages = [], 0
+    field = ep.split(".", 1)[1]
+    while pages < max_pages:
+        body = fetch(dict(v))
+        conn = _get(body, "data", field) if isinstance(body, dict) else None
+        if not isinstance(conn, dict):
+            return rows, False, pages
+        pages += 1
+        rows += evidence_rows(ep, body)
+        pi = conn.get("pageInfo") or {}
+        if not pi.get("hasNextPage"):
+            return rows, True, pages
+        if not pi.get("endCursor"):
+            return rows, False, pages
+        v["after"] = pi["endCursor"]
+    return rows, False, pages
+
+
+def extra_rows(ours, stock):
+    """The rows only stock lists (a multiset difference by row key)."""
+    have = collections.Counter(r["key"] for r in ours)
+    out = []
+    for r in stock:
+        if have[r["key"]] > 0:
+            have[r["key"]] -= 1
+        else:
+            out.append(r)
+    return out
+
+
 class Bucket:
     def __init__(self, rps):
         self.gap = 1.0 / rps
@@ -216,11 +354,17 @@ class Node:
         self.canon = collections.OrderedDict()
         self.recent = {}
         self.reads = 0
-        self.tip_log = collections.deque(maxlen=4000)   # (wall time, highest chain height)
+        self.tip_log = TipLog()          # (wall time, highest chain height), one cut read a second
+        self.tl = threading.local()      # the per-case read cap of `read_cap`
 
     def _call(self, path, body=None, accept="application/json"):
+        cap = getattr(self.tl, "cap", None)
+        if cap is not None and self.tl.used >= cap:
+            raise Budget()
         if not self.bucket.try_take(self.max_wait):
             raise Budget()
+        if cap is not None:
+            self.tl.used += 1
         self.reads += 1
         r = self.http.call(self.base, path=path, body=body, accept=accept)
         if r["status"] != 200:
@@ -234,24 +378,19 @@ class Node:
             c = self._call("/cut")
             with self.lock:
                 self.cut, self.cut_t = c["hashes"], time.monotonic()
-                self.tip_log.append((time.time(), max(v["height"] for v in c["hashes"].values())))
+                self.tip_log.add(time.time(), max(v["height"] for v in c["hashes"].values()))
         return {int(k): v["height"] for k, v in self.cut.items()}, {int(k): v["hash"] for k, v in self.cut.items()}
 
-    def tip_pair(self, t0):
-        """{"ours", "stock"}: the highest chain height at about `t0` (ours' read, from the log of
-        cut reads, at most TIP_SAMPLE_AGE old) and now, from a fresh cut (stock's answer has
-        just come back). None when either is missing; recorded in the row for the tip-timing
-        rule."""
-        try:
-            h0 = allow.tip_before(list(self.tip_log), t0)
-            if h0 is None:
-                return None
-            tips, _ = self.tips(fresh=True)
-            return {"ours": h0, "stock": max(tips.values())}
-        except Exception:  # noqa: BLE001 - the tip is evidence only; no budget, no record
-            return None
+    def tip_pair(self, t0, t1=None):
+        """{"ours", "stock"}: the highest chain height at `t0` (ours' read) and at `t1` (stock's
+        answer, default now), from the log of cut reads, each at most TIP_ROW_AGE old. No node
+        read: the sampler keeps the log. None when either is missing; recorded in the row for
+        the tip-timing rule."""
+        h0 = self.tip_log.at(t0, TIP_ROW_AGE)
+        h1 = self.tip_log.at(time.time() if t1 is None else t1, TIP_ROW_AGE)
+        return None if h0 is None or h1 is None else {"ours": h0, "stock": h1}
 
-    def sample_tips(self, period=10.0):
+    def sample_tips(self, period=1.0):
         """Keeps the tip log fresh: one cut read per `period` seconds, in a daemon thread."""
         def loop():
             while True:
@@ -261,6 +400,47 @@ class Node:
                     pass
                 time.sleep(period)
         threading.Thread(target=loop, daemon=True).start()
+
+    @contextlib.contextmanager
+    def read_cap(self, n):
+        """At most `n` node reads from this thread inside the block (cache hits are free); the
+        next one raises Budget. Yields the counter (`.used`)."""
+        self.tl.cap, self.tl.used = n, 0
+        try:
+            yield self.tl
+        finally:
+            self.tl.cap = None
+
+    def evidence(self, rows, max_reads=EVIDENCE_READS):
+        """Node evidence for rows only stock lists (`extra_rows`): how many sit in a block the node
+        does not hold as canonical (`stock_orphans`), how many could not be resolved (`unresolved`:
+        near the tip, no height, or the read bound), the rows asked and the reads used. One read
+        per chain covers a height span under BRANCH_MAX; wider spans read per height."""
+        out = {"stock_orphans": 0, "unresolved": 0, "extra": len(rows), "reads": 0}
+        canon = {}
+        with self.read_cap(max_reads) as cap:
+            try:
+                tips, _ = self.tips()
+                by = collections.defaultdict(set)
+                for r in rows:
+                    c, h = r.get("chain"), r.get("height")
+                    if c is not None and isinstance(h, int) and h <= tips.get(c, -1) - TIP_DEPTH:
+                        by[c].add(h)
+                for c in sorted(by):
+                    hs = sorted(by[c])
+                    spans = [(hs[0], hs[-1])] if hs[-1] - hs[0] < BRANCH_MAX else [(h, h) for h in hs]
+                    for lo, hi in spans:
+                        canon.update(self.canonical(c, lo, hi))
+            except (Budget, NodeError, ValueError, KeyError):
+                pass            # what was read stays; the rest is unresolved
+            out["reads"] = cap.used
+        for r in rows:
+            x = canon.get((r.get("chain"), r.get("height")))
+            if x is None or r.get("block") is None:
+                out["unresolved"] += 1
+            elif x != r["block"]:
+                out["stock_orphans"] += 1
+        return out
 
     def canonical(self, chain, lo, hi):
         tips, hashes = self.tips()
