@@ -56,6 +56,11 @@ pub fn wire_json<T: serde::Serialize>(resp: &T) -> serde_json::Result<Vec<u8>> {
 /// it gets `INTERNAL_SERVER_ERROR`, the code stock answers it with (FIX-4 item 3).
 fn copy_codes(resp: &mut serde_json::Value) {
     let no_data = resp.get("data").is_none_or(|d| d.is_null());
+    if no_data && unexecuted(resp) {
+        if let Some(o) = resp.as_object_mut() {
+            o.remove("data");
+        }
+    }
     let Some(errors) = resp.get_mut("errors").and_then(|e| e.as_array_mut()) else {
         return;
     };
@@ -79,6 +84,22 @@ fn copy_codes(resp: &mut serde_json::Value) {
         }
         o.entry("code").or_insert(code);
     }
+}
+
+/// Whether a response's errors all come from before execution: each has no `path` (a parse,
+/// validation or limit refusal) or no code (async-graphql's own variable errors, which carry
+/// the field's path; resolver errors always carry a code). Such a response has no `data` key
+/// in stock (Apollo) and per the GraphQL spec (FIX-4 part B, B2).
+fn unexecuted(resp: &serde_json::Value) -> bool {
+    let Some(errors) = resp.get("errors").and_then(|e| e.as_array()) else {
+        return false;
+    };
+    !errors.is_empty()
+        && errors.iter().all(|e| {
+            e.get("path")
+                .is_none_or(|p| p.as_array().is_some_and(Vec::is_empty))
+                || e.get("extensions").and_then(|x| x.get("code")).is_none()
+        })
 }
 
 /// Whether `r` is refused as a whole by an error that carries no code: async-graphql's own
@@ -132,8 +153,11 @@ pub fn limit(name: &'static str, msg: impl Into<String>) -> ServerError {
 
 /// Stock's `extensions.code` of a refusal thrown in `didResolveOperation` (complexity).
 pub const INTERNAL_SERVER_ERROR: &str = "INTERNAL_SERVER_ERROR";
-/// Stock's `extensions.code` of a validation error (depth).
+/// Stock's `extensions.code` of a validation error (depth, and every other validation rule:
+/// Apollo Server 4, HTTP 400).
 pub const GRAPHQL_VALIDATION_FAILED: &str = "GRAPHQL_VALIDATION_FAILED";
+/// Stock's `extensions.code` of a document that does not parse (Apollo Server 4, HTTP 400).
+pub const GRAPHQL_PARSE_FAILED: &str = "GRAPHQL_PARSE_FAILED";
 
 /// A refusal of the stock indexer's limits (FIX-3 part C): stock's message and code, and
 /// `extensions.limit = name` so ours still names the limit. Counts
@@ -206,5 +230,27 @@ mod tests {
         let ok = async_graphql::Response::new(async_graphql::Value::Null);
         let v: serde_json::Value = serde_json::from_slice(&wire_json(&ok).unwrap()).unwrap();
         assert!(v.get("errors").is_none());
+    }
+
+    /// FIX-4 part B (B2): `data` is dropped when nothing ran (every error path-less or
+    /// codeless) and kept beside a resolver error (a path and a code) or real data.
+    #[test]
+    fn data_is_absent_when_nothing_ran() {
+        let wire = |r: &async_graphql::Response| -> serde_json::Value {
+            serde_json::from_slice(&wire_json(r).unwrap()).unwrap()
+        };
+        let refused = async_graphql::Response::from_errors(vec![server(Code::Limit, "x")]);
+        assert!(wire(&refused).get("data").is_none());
+        let mut var = ServerError::new("Variable id is not defined.", None);
+        var.path = vec![async_graphql::PathSegment::Field("node".into())];
+        let unbound = async_graphql::Response::from_errors(vec![var]);
+        assert!(wire(&unbound).get("data").is_none());
+        let mut resolver = server(Code::BadUserInput, "bad");
+        resolver.path = vec![async_graphql::PathSegment::Field("block".into())];
+        let v = wire(&async_graphql::Response::from_errors(vec![resolver]));
+        assert!(v.get("data").is_some_and(serde_json::Value::is_null), "{v}");
+        let batch = vec![refused, async_graphql::Response::new(async_graphql::Value::from(1))];
+        let v: serde_json::Value = serde_json::from_slice(&wire_json(&batch).unwrap()).unwrap();
+        assert!(v[0].get("data").is_none() && v[1]["data"] == 1, "{v}");
     }
 }

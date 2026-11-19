@@ -55,7 +55,13 @@ Errors carry `extensions.code`:
 | `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
 | `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
-| `INTERNAL_SERVER_ERROR` | the stock indexer's code, kept where ours answers as stock does: the complexity refusal (Limits), and a request refused before any field runs because a variable or argument is missing or of the wrong type. Such a request answers HTTP 500 and `data: null`, as stock answers it; in a batch the status stays 200 |
+| `INTERNAL_SERVER_ERROR` | the stock indexer's code, kept where ours answers as stock does: the complexity refusal (Limits), and a request refused before any field runs because a variable is missing or its value does not coerce to its type. Such a request answers HTTP 500 with no `data` key, as stock answers it; in a batch the status stays 200. Also `transaction(minimumDepth:)` outside 1..=100, with stock's message (`[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.` or `… higher than 100.`), `transaction: null` and HTTP 200 |
+| `GRAPHQL_PARSE_FAILED` | the document does not parse: HTTP 400 with no `data` key, as stock (Apollo Server 4) answers it. The message is ours (async-graphql's parser), not graphql-js's |
+| `GRAPHQL_VALIDATION_FAILED` | the document fails validation (an unknown field, a literal of the wrong type, an unused variable, the depth limit): HTTP 400 with no `data` key, as stock answers it. A document error is answered alone, without the variable errors of the same request, as Apollo validates before it reads variables. Messages are async-graphql's |
+
+A request refused before anything ran (a parse, validation or limit refusal, or a variable
+error) has no `data` key, as in stock and the GraphQL spec; an error a field raised keeps
+`data`. In a batch each item follows this rule and the status stays 200.
 
 ## Limits
 
@@ -451,6 +457,8 @@ the oracle puts them.
   `fungibleChainAccounts` with `chainIds` absent (also a declared variable sent without a
   value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
   `fungibleChainAccount` on a chain without a row is `null`.
+- `fungibleName` is trimmed before use, here and on the transaction and transfer lists, as
+  stock reads it: `"coin "` names `coin`. A name of spaces alone is `BAD_USER_INPUT`.
 - `totalBalance` is the exact decimal sum of the chain balances; `balance` is the stored
   text as a float.
 - Guards: an inline keyset or a resolved keyset reference is a `KeysetGuard` (`raw` is the

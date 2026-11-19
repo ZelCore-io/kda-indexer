@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use async_graphql::{Context, Object, Result, SimpleObject, Union, ID};
+use async_graphql::{Context, ErrorExtensions, Object, Result, SimpleObject, Union, ID};
 use serde_json::Value;
 
 use super::{
@@ -24,7 +24,7 @@ use crate::gql;
 use crate::ids::{encode, NodeKey};
 use crate::scalars::{BigInt, DateTime, FloatText};
 use crate::txlist::{
-    block_list, block_node, chain_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx,
+    block_list, block_node, chain_arg, fungible_arg, hash_arg, height_arg, list, load, name_arg, page_in_tx,
     Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
 };
 
@@ -438,6 +438,22 @@ fn txs(
     (edges, p.info, p.total)
 }
 
+/// Stock's range check of `transaction(minimumDepth:)` (indexer-kadena
+/// `transaction-query-resolver.ts`, first thing the resolver does): outside 1..=100 it throws,
+/// which answers `INTERNAL_SERVER_ERROR` with its message and `transaction: null`, HTTP 200
+/// (FIX-4 part B item 4).
+fn stock_depth_range(minimum_depth: Option<i32>) -> Result<()> {
+    let msg = match minimum_depth {
+        Some(d) if d < 1 => "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.",
+        Some(d) if d > 100 => {
+            "[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be higher than 100."
+        }
+        _ => return Ok(()),
+    };
+    Err(async_graphql::Error::new(msg)
+        .extend_with(|_, e| e.set("code", crate::error::INTERNAL_SERVER_ERROR)))
+}
+
 /// `transaction(requestKey, blockHash, minimumDepth)`: `null` when not indexed; several
 /// copies (genesis, R-P5P9-5) without a `blockHash` that picks one are `BAD_USER_INPUT`.
 pub async fn query_transaction(
@@ -446,6 +462,12 @@ pub async fn query_transaction(
     minimum_depth: Option<i32>,
     request_key: String,
 ) -> Result<Option<Transaction>> {
+    if let Err(e) = stock_depth_range(minimum_depth) {
+        // A thrown resolver error in stock leaves `transaction: null` beside it; async-graphql
+        // would null the whole `data`, so the error is added and the field answers null.
+        ctx.add_error(ctx.set_error_path(e.into_server_error(ctx.item.pos)));
+        return Ok(None);
+    }
     let rk = hash_arg("requestKey", &request_key)?;
     let bh = block_hash.map(|h| hash_arg("blockHash", &h)).transpose()?;
     let depth = height_arg("minimumDepth", minimum_depth)?;
@@ -505,11 +527,11 @@ fn list_source(
         match (account, fungible) {
             (Some(a), Some(m)) => SourceSpec::Xfer {
                 account: name_arg("accountName", a)?.to_owned(),
-                module: name_arg("fungibleName", m)?.to_owned(),
+                module: fungible_arg(m)?.to_owned(),
             },
             (Some(a), None) => SourceSpec::Acct(name_arg("accountName", a)?.to_owned()),
             (None, Some(m)) => {
-                SourceSpec::EvtName(format!("{}.TRANSFER", name_arg("fungibleName", m)?))
+                SourceSpec::EvtName(format!("{}.TRANSFER", fungible_arg(m)?))
             }
             (None, None) => SourceSpec::Heights,
         }
@@ -665,7 +687,7 @@ pub async fn query_transfers(
         source,
         filter: key_filter(chain_id.as_deref(), None, None, None, false)?,
         rows: Rows::Transfers {
-            module: fungible_name,
+            module: fungible_name.map(|m| m.trim().to_owned()),
             account: account_name,
             nft,
         },

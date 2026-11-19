@@ -1367,6 +1367,12 @@ pub fn hash_arg(name: &str, s: &str) -> async_graphql::Result<Hash32> {
     Hash32::from_b64url(s).map_err(|_| bad_input(format!("{name} is not a hash")))
 }
 
+/// A `fungibleName` argument: trimmed first, as stock reads it (`"coin "` is `coin`, FIX-4
+/// part B); a name of spaces alone is refused as an empty one.
+pub fn fungible_arg(s: &str) -> async_graphql::Result<&str> {
+    name_arg("fungibleName", s.trim())
+}
+
 /// A name argument (account, module, event name, public key).
 pub fn name_arg<'a>(name: &str, s: &'a str) -> async_graphql::Result<&'a str> {
     if s.is_empty() || s.len() > MAX_NAME {

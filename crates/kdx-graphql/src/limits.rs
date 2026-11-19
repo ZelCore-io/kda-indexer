@@ -44,7 +44,9 @@ use async_graphql::parser::types::{
 use async_graphql::registry::Registry;
 use async_graphql::{Name, Request, ServerError, ServerResult, ValidationResult, Value, Variables};
 
-use crate::error::{limit, stock_refusal, GRAPHQL_VALIDATION_FAILED, INTERNAL_SERVER_ERROR};
+use crate::error::{
+    limit, stock_refusal, GRAPHQL_PARSE_FAILED, GRAPHQL_VALIDATION_FAILED, INTERNAL_SERVER_ERROR,
+};
 use crate::stock_limits;
 use crate::{Gql, GraphqlSettings};
 
@@ -753,6 +755,11 @@ struct LimitsExt {
 }
 
 struct StockVerdict {
+    /// Over the socket (stock's HTTP codes do not apply).
+    ws: bool,
+    /// Positions of the arguments whose value holds a variable: async-graphql reports a
+    /// variable value that does not coerce at them, during validation (FIX-4 part B item 5).
+    var_args: Vec<async_graphql::Pos>,
     /// Depth-limit messages (HTTP only, as stock's validation rule).
     depth: Vec<String>,
     /// Over stock's complexity; the message to answer.
@@ -777,12 +784,16 @@ impl Extension for LimitsExt {
         check_sizes(&request.query, &request.variables, s)?;
         let vars = request.variables.clone();
         let op = request.operation_name.clone();
-        let doc = request.parsed_query()?;
+        let ws = ctx.data_opt::<crate::ws::ConnSubs>().is_some();
+        // Over HTTP a document that does not parse is Apollo Server 4's
+        // `GRAPHQL_PARSE_FAILED` (HTTP 400), as stock answers it (FIX-4 part B item 5).
+        let doc = request
+            .parsed_query()
+            .map_err(|e| if ws { e } else { with_code(e, GRAPHQL_PARSE_FAILED) })?;
         budget(doc, &vars, s)?;
         // Stock's limits (FIX-3 part C). Over the socket stock runs no depth rule and words
         // the complexity refusal without its HTTP prefix; over HTTP it skips the complexity
         // check for an operation named `IntrospectionQuery`.
-        let ws = ctx.data_opt::<crate::ws::ConnSubs>().is_some();
         let reg = type_registry();
         let depth = if ws {
             Vec::new()
@@ -803,8 +814,13 @@ impl Extension for LimitsExt {
             } else {
                 stock_limits::COMPLEXITY_MESSAGE
             });
-        *self.stock.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(StockVerdict { depth, complexity });
+        let var_args = if ws { Vec::new() } else { var_arg_positions(doc) };
+        *self.stock.lock().unwrap_or_else(|e| e.into_inner()) = Some(StockVerdict {
+            ws,
+            var_args,
+            depth,
+            complexity,
+        });
         next.run(ctx, request).await
     }
 
@@ -825,6 +841,10 @@ impl Extension for LimitsExt {
             .into_iter()
             .map(|m| stock_refusal(GRAPHQL_VALIDATION_FAILED, "depth", m))
             .collect();
+        let r = match r {
+            Err(es) if !v.ws => Err(apollo_validation(es, &v.var_args)),
+            r => r,
+        };
         match r {
             Err(mut es) => {
                 // `check-ops` answers a valid document with one marker error: still valid,
@@ -850,6 +870,90 @@ impl Extension for LimitsExt {
             ok => ok,
         }
     }
+}
+
+/// `e` with `extensions.code = code`.
+fn with_code(mut e: ServerError, code: &'static str) -> ServerError {
+    e.extensions
+        .get_or_insert_with(Default::default)
+        .set("code", code);
+    e
+}
+
+/// Apollo Server 4's answer to async-graphql's validation errors (FIX-4 part B item 5).
+/// Apollo validates the document first, with `GRAPHQL_VALIDATION_FAILED` (HTTP 400), and
+/// coerces variable values only after that. async-graphql checks both in one pass: an
+/// "Invalid value" error at an argument that holds a variable is a coercion error. So: when
+/// the document itself has errors they are answered alone, coded; when only variable values
+/// fail, those stay codeless (500 `INTERNAL_SERVER_ERROR`, as FIX-4 item 3 decided). Coded
+/// errors (the depth rule, `check-ops`' marker) are left alone.
+fn apollo_validation(es: Vec<ServerError>, var_args: &[async_graphql::Pos]) -> Vec<ServerError> {
+    let coded = |e: &ServerError| e.extensions.as_ref().and_then(|x| x.get("code")).is_some();
+    let coercion = |e: &ServerError| {
+        !coded(e)
+            && e.message.starts_with("Invalid value for argument")
+            && e.locations.first().is_some_and(|p| var_args.contains(p))
+    };
+    if es.iter().all(|e| coded(e) || coercion(e)) {
+        return es;
+    }
+    es.into_iter()
+        .filter(|e| !coercion(e))
+        .map(|e| {
+            if coded(&e) {
+                e
+            } else {
+                with_code(e, GRAPHQL_VALIDATION_FAILED)
+            }
+        })
+        .collect()
+}
+
+/// Positions of the field and directive arguments of `doc` whose value holds a variable.
+fn var_arg_positions(doc: &ExecutableDocument) -> Vec<async_graphql::Pos> {
+    use async_graphql::parser::types::Directive;
+    use async_graphql::Positioned;
+    // An argument value holds a variable iff it cannot be made constant without one.
+    macro_rules! args {
+        ($a:expr, $out:expr) => {
+            for (n, v) in $a {
+                if v.node.clone().into_const_with(|_| Err(())).is_err() {
+                    $out.push(n.pos);
+                }
+            }
+        };
+    }
+    fn dirs(d: &[Positioned<Directive>], out: &mut Vec<async_graphql::Pos>) {
+        for d in d {
+            args!(&d.node.arguments, out);
+        }
+    }
+    fn set(s: &SelectionSet, out: &mut Vec<async_graphql::Pos>) {
+        for sel in &s.items {
+            match &sel.node {
+                Selection::Field(f) => {
+                    args!(&f.node.arguments, out);
+                    dirs(&f.node.directives, out);
+                    set(&f.node.selection_set.node, out);
+                }
+                Selection::FragmentSpread(f) => dirs(&f.node.directives, out),
+                Selection::InlineFragment(f) => {
+                    dirs(&f.node.directives, out);
+                    set(&f.node.selection_set.node, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (_, op) in doc.operations.iter() {
+        dirs(&op.node.directives, &mut out);
+        set(&op.node.selection_set.node, &mut out);
+    }
+    for f in doc.fragments.values() {
+        dirs(&f.node.directives, &mut out);
+        set(&f.node.selection_set.node, &mut out);
+    }
+    out
 }
 
 /// `extensions.code` of the marker error `check-ops` gets for a valid document.

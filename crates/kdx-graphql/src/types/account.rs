@@ -512,7 +512,7 @@ impl FungibleChainAccount {
 
 fn names(account: &str, module: Option<&str>) -> Result<(String, String)> {
     let account = crate::txlist::name_arg("accountName", account)?.to_owned();
-    let module = crate::txlist::name_arg("fungibleName", module.unwrap_or("coin"))?.to_owned();
+    let module = crate::txlist::fungible_arg(module.unwrap_or("coin"))?.to_owned();
     Ok((account, module))
 }
 
@@ -586,7 +586,7 @@ pub async fn accounts_by_public_key(
     chain: Option<u8>,
 ) -> Result<Vec<FungibleAccount>> {
     let pk = crate::txlist::name_arg("publicKey", public_key)?.to_owned();
-    let module = crate::txlist::name_arg("fungibleName", module.unwrap_or("coin"))?.to_owned();
+    let module = crate::txlist::fungible_arg(module.unwrap_or("coin"))?.to_owned();
     let (out, truncated) = gql(ctx)
         .state()?
         .read(move |view| by_key(view, &pk, &module, chain))
