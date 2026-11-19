@@ -301,6 +301,11 @@ class Import(unittest.TestCase):
         self.assertEqual(got["gql.fungibleAccount:6"]["v"]["class"], "stock-unavailable")
         self.assertEqual(got["native.blocks:7"]["cov"], "native")
 
+    def test_host_split(self):
+        cs = [{"id": "gql.block:%d" % i} for i in range(6)]
+        lanes = [[c["id"] for c in run.host_cases(iter(cs), i, 2, {"gql.block:4"})] for i in (0, 1)]
+        self.assertEqual(lanes, [["gql.block:0", "gql.block:2"], ["gql.block:1", "gql.block:3", "gql.block:5"]])
+
     def test_chain_accounts_as_set(self):
         a = {"data": {"fungibleChainAccounts": [{"chainId": "10"}, {"chainId": "2"}]}}
         b = {"data": {"fungibleChainAccounts": [{"chainId": "2"}, {"chainId": "10"}]}}

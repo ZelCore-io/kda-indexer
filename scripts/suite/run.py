@@ -544,7 +544,8 @@ class Runner:
         self.pd = None if a.ours_only else PairDiff(cfg["diff"]["kda_compare"], cfg["diff"]["config"])
         nd = cfg.get("node") or {}
         self.node = nodecheck.Node(Http(nd.get("timeout_s", 30)), nd["url"], nd.get("network", "mainnet01"),
-                                   min(float(nd.get("rps", 20)), 20.0)) if nd.get("url") else None
+                                   min(float(nd.get("rps", 20)), 20.0),
+                                   float(nd.get("max_wait_s", 30))) if nd.get("url") else None
         self.tip = None
         import queue
         self.search_src = queue.Queue()
@@ -743,8 +744,7 @@ class Runner:
             heavy = [e for e in eps if e in E.HEAVY_ENDPOINTS and e not in E.STOCK_SKIP]
             for i, h in enumerate(self.oracles):
                 hv = [e for e in heavy if e.startswith("gql.")]
-                cs = (c for c in load_cases(self.a.cases, hv, self.a.heavy_sample)
-                      if c["id"] not in sdone and int(c["id"].rsplit(":", 1)[1]) % len(self.oracles) == i)
+                cs = host_cases(load_cases(self.a.cases, hv, self.a.heavy_sample), i, len(self.oracles), sdone)
                 lanes.append((h, cs, "sample", deadline))
             for k, h in self.rest_stock.items():
                 hv = [e for e in heavy if e.startswith("compat.") and dict((x[0], x[2]) for x in E.ENDPOINTS)[e] == k]
@@ -765,6 +765,13 @@ class Runner:
         for t in threads:
             t.join()
         print("all done", flush=True)
+
+
+def host_cases(cases, i, n, done):
+    """The cases of stock host `i` of `n` (split by case number), minus `done`."""
+    for c in cases:
+        if c["id"] not in done and int(c["id"].rsplit(":", 1)[1]) % n == i:
+            yield c
 
 
 def import_rows(src, dst):
