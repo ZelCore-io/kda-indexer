@@ -1,0 +1,13 @@
+# The same unit as start4.sh's transient one, for a host that wants it installed:
+#   cp kdx-suite4.service kdx-suite4-guard.service /etc/systemd/system/ && systemctl daemon-reload
+# Do not enable; start by hand: systemctl start kdx-suite4 kdx-suite4-guard
+[Unit]
+Description=KDA indexer endpoint suite, run 4 (ours vs stock)
+
+[Service]
+Type=simple
+WorkingDirectory=@SUITE_DIR@
+EnvironmentFile=@SUITE_DIR@/run4/suite4.env
+Nice=10
+MemoryMax=4G
+ExecStart=/bin/bash @SUITE_DIR@/run4/launch.sh

@@ -918,9 +918,11 @@ class H4Complete(unittest.TestCase):
         self.assertEqual(len(st["entries"]), 8)
         self.assertEqual(st["total"], 12)
         self.assertEqual(len(st["all"]), 12)
-        huge = [E_("/x/%d" % i, "Changed") for i in range(run.KEEP_ALL + 1)]
+        # H5 (c): no cap; a long list is kept whole and the record stays complete.
+        huge = [E_("/x/%d" % i, "Changed") for i in range(201)]
         st = run.stored_verdict({"class": "diff", "entries": huge[:8], "total": len(huge), "all": huge}, "diff", [])
-        self.assertNotIn("all", st)
+        self.assertEqual(len(st["all"]), 201)
+        self.assertTrue(st["complete"])
 
 
 class H4TipTiming(unittest.TestCase):
@@ -1194,6 +1196,23 @@ class H4Minor(unittest.TestCase):
             for bad in ("/root/", "kda-indexer-mainnet01", "kdx-fv"):
                 self.assertNotIn(bad, t, fn)
 
+    def test_run4_scripts_use_run4_paths_and_34_heavy_hours(self):
+        """H5 (d): run 4 runs tools4 on cases4 into run4, its config inside run4/, stock heavy
+        lanes 34 h by default; no host layout and nothing of run 3's."""
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "suite", "run4")
+        names = sorted(os.listdir(d))
+        self.assertEqual(names, ["check.sh", "guard.sh", "kdx-suite4-guard.service", "kdx-suite4.service",
+                                 "launch.sh", "start4.sh"])
+        for fn in names:
+            t = open(os.path.join(d, fn)).read()
+            for bad in ("/root/", "kda-indexer-mainnet01", "kdx-fv", "run3", "tools3", "cases3", "suite3",
+                        "pkill", "pgrep"):
+                self.assertNotIn(bad, t, fn)
+        launch = open(os.path.join(d, "launch.sh")).read()
+        self.assertIn("STOCK_HEAVY_HOURS:-34", launch)
+        self.assertIn("tools4/run.py run --config run4/suite4.toml --cases cases4 --out run4", launch)
+        self.assertIn('[ ! -x "$S/tools4/kda-compare-h5" ]', open(os.path.join(d, "start4.sh")).read())
+
 
 
 def _slugs(path):
@@ -1242,6 +1261,65 @@ class H4OwnerRules(unittest.TestCase):
         self.assertEqual(run.count_rows({"data": {"transfers": {"edges": [{}, {}, {}]}}}), 3)
         self.assertEqual(run.count_rows([1, 2]), 2)
         self.assertEqual(run.count_rows({"data": {"block": {}}}), 1)
+
+
+class H5Rereferee(unittest.TestCase):
+    """H5 (c): a stock-paired record that is not equal keeps everything a later rule change needs
+    to re-judge it offline: the full diff list (no cap), row counts per side, the completeness
+    flag, the tip, settle and fork-header evidence, and both response bodies."""
+
+    def test_full_list_is_kept_without_a_cap(self):
+        ents = [{"path": "/x/%d" % i, "kind": "changed", "a": i, "b": i + 1} for i in range(450)]
+        v = {"class": "diff", "entries": ents[:8], "total": 450, "all": ents}
+        out = run.stored_verdict(v, "diff", [])
+        self.assertEqual(len(out["all"]), 450)
+        self.assertTrue(out["complete"])
+        self.assertEqual(run.verdict_class("gql.x", "valid", v, [], {}, None)[0], "diff")
+
+    def test_side_counts(self):
+        ours = {"data": {"transactions": {"totalCount": 7, "edges": [{}, {}, {}]}}}
+        stock = {"data": {"transactions": {"totalCount": 9, "edges": [{}, {}]}}}
+        c = run.side_counts(ours, stock, None)
+        self.assertEqual(c, {"ours": {"rows": 3, "totalCount": 7, "pages": 1},
+                             "stock": {"rows": 2, "totalCount": 9, "pages": 1}})
+        c = run.side_counts([1, 2], [1], {"ev_pages": [3, 4]})
+        self.assertEqual(c["ours"], {"rows": 2, "totalCount": None, "pages": 1, "evidence_pages": 3})
+        self.assertEqual(c["stock"]["evidence_pages"], 4)
+
+    def test_bodies_round_trip(self):
+        a, s = '{"data":{"x":1}}', '{"data":{"x":"2"}}' * 50
+        b = run.pack_bodies(a, s)
+        self.assertEqual(b["enc"], "zlib+base64")
+        self.assertEqual(run.unpack_bodies(b), (a, s))
+        self.assertEqual(run.unpack_bodies(run.pack_bodies(None, "")), ("", ""))
+
+    def test_keep_evidence_only_for_non_equal_paired_records(self):
+        row = {"v": {"class": "equal"}, "rows": [1, 1]}
+        run.keep_evidence(row, "a", "b", {}, {}, None)
+        self.assertNotIn("bodies", row)
+        row = {"v": {"class": "diff", "complete": True, "all": []}, "tip": {"ours": 1, "stock": 2},
+               "node": {"settle": {"near": []}, "forks": []}}
+        run.keep_evidence(row, '{"a":1}', '{"a":2}', {"a": 1}, {"a": 2}, None)
+        self.assertEqual(run.unpack_bodies(row["bodies"]), ('{"a":1}', '{"a":2}'))
+        self.assertEqual(row["counts"]["ours"]["rows"], 1)
+        self.assertEqual(run.missing_evidence(row), [])
+        bare = {"v": {"class": "diff"}, "bodies": row["bodies"], "counts": row["counts"]}
+        self.assertEqual(run.missing_evidence(bare), ["complete", "all", "tip"])
+
+    def test_settle_and_fork_reads_are_recorded(self):
+        n = N.Node.__new__(N.Node)
+        n.settle_s = 0
+        n.canonical = lambda c, lo, hi, fresh=False: {(c, h): "B%d" % h for h in range(lo, hi + 1)}
+        self.assertEqual(n.settle_race([(1, 10, "X")], {(1, 10): "A"}), "tip-race-settled")
+        self.assertEqual(n.last_settle, {"near": [[1, 10, "X"]], "first": [[1, 10, "A"]],
+                                         "second": [[1, 10, "B10"]], "wait_s": 0, "result": "tip-race-settled"})
+        self.assertEqual(N.settle([(1, 10, "X")], {(1, 10): "A"}, {(1, 10): "B10"}), "tip-race-settled")
+
+    def test_disk_estimate(self):
+        est = run.disk_estimate([{"v": {"class": "diff"}, "ours": {"b": 1000}, "stock": {"b": 3000}},
+                                 {"v": {"class": "equal"}, "ours": {"b": 99}}], ratio=0.25)
+        self.assertEqual(est["non_equal"], 1)
+        self.assertEqual(est["body_bytes"], int(4000 * 0.25 * 4 / 3) + 1)
 
 
 if __name__ == "__main__":

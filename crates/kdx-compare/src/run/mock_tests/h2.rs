@@ -170,8 +170,9 @@ async fn h2_w_the_count_walk_takes_h8s_mapped_index() {
             vec![count],
         );
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        let want = if explained { (1, 0) } else { (0, 1) };
-        assert_eq!((rep.explained, rep.unexplained), want, "{rank}: {rep:?}");
+        let _want = if explained { (1, 0) } else { (0, 1) };
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rank}: {rep:?}");
     }
 }
 
@@ -375,10 +376,11 @@ async fn h2_u_the_oracles_list_one_row_over_its_own_count() {
     };
     let orphans = vec![w(), q("q1", Some("X100")), q("q2", Some("X100"))];
     let rep = walk_referee(vec![w()], orphans.clone(), (1, 2)).await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
     assert_eq!(
         rep.by_class.get("graphql-r97-oracle-list-over-count"),
-        Some(&1),
+        None,
         "{rep:?}"
     );
     // Two rows over its count: unexplained.
@@ -737,7 +739,8 @@ async fn h2_p_a_stored_first_page_error_through_the_referee() {
             ],
         );
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        let want = if gap { (1, 0) } else { (0, 1) };
-        assert_eq!((rep.known_gap, rep.unexplained), want, "{acct}: {rep:?}");
+        let _want = if gap { (1, 0) } else { (0, 1) };
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!((rep.known_gap, rep.unexplained), (0, 1), "{acct}: {rep:?}");
     }
 }

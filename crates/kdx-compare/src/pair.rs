@@ -145,12 +145,9 @@ pub fn verdict(p: PairIn, allow: &Allowlist, rules: &[FieldRule], cap: u64) -> V
         class = "status";
     }
     let total = shown.len();
-    let open_ids: Vec<String> = c
-        .ids
-        .iter()
-        .filter(|i| allow.is_open_id(i))
-        .cloned()
-        .collect();
+    // H5 (a): open entries match nothing; the ones whose pattern fits are named beside the
+    // reported diff.
+    let open_ids = allow.unexplaining_ids(&route, &p.request, &[], &d);
     let all = full.then(|| shown.clone());
     Verdict {
         id: p.id,

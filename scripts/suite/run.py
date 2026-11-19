@@ -52,11 +52,13 @@ kda-compare binary and config.
 """
 
 import argparse
+import base64
 import collections
 import concurrent.futures as cf
 import gzip
 import http.client
 import json
+import math
 import os
 import re
 import ssl
@@ -66,6 +68,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import allow  # noqa: E402
@@ -600,7 +603,6 @@ def tip_fields(node, idx, host, t0, t1):
 # a capped count, a size limit): such a record is `incomplete`, never equal or accepted.
 PARTIAL_HITS = {"/~graphql-page-cut", "/~graphql-totalcount-cap", "/~harness-limit/graphql-merged-bytes",
                 "/~graphql-short-page"}
-KEEP_ALL = 200      # a record keeps the full diff list up to this many entries (re-referee input)
 
 
 def rule_entries(v):
@@ -617,16 +619,84 @@ def rule_entries(v):
 
 def stored_verdict(v, k, ids):
     """The `v` a record stores: display entries (at most MAX_SHOWN), the total, and the full list
-    when it has at most KEEP_ALL entries, so a later re-referee sees every difference."""
+    (H5 c: no cap), so a later re-referee sees every difference."""
     out = {"class": k, "ids": (v.get("ids") or []) + ids, "known": v.get("known_ids"), "open": v.get("open_ids") or [],
            "entries": (v.get("entries") or [])[:allow.MAX_SHOWN]}
     if isinstance(v.get("total"), int):
         out["total"] = v["total"]
-    if isinstance(v.get("all"), list) and len(v["all"]) <= KEEP_ALL:
+    if isinstance(v.get("all"), list):
         out["all"] = v["all"]
     ents, done = rule_entries(out)
     out["complete"] = bool(done) if done is not None else allow.complete({"entries": ents})
     return out
+
+
+def total_count(body):
+    """The first connection's totalCount of a GraphQL answer, else None."""
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        for x in body["data"].values():
+            if isinstance(x, dict) and isinstance(x.get("totalCount"), int):
+                return x["totalCount"]
+    return None
+
+
+def side_counts(ab, sb, ev):
+    """H5 (c): per side, the rows compared, the answer's totalCount and the pages fetched (one per
+    side for the compared answer; the orphan-evidence paging adds `evidence_pages`)."""
+    out = {}
+    for i, (k, body) in enumerate((("ours", ab), ("stock", sb))):
+        out[k] = {"rows": count_rows(body), "totalCount": total_count(body), "pages": 1}
+        if ev and isinstance(ev.get("ev_pages"), list):
+            out[k]["evidence_pages"] = ev["ev_pages"][i]
+    return out
+
+
+def pack_bodies(ours_raw, stock_raw):
+    """Both raw response bodies, zlib-compressed and base64 text (H5 c: re-referee input)."""
+    def enc(t):
+        return base64.b64encode(zlib.compress((t or "").encode("utf-8"), 9)).decode("ascii")
+    return {"enc": "zlib+base64", "ours": enc(ours_raw), "stock": enc(stock_raw)}
+
+
+def unpack_bodies(b):
+    """(ours_raw, stock_raw) of pack_bodies."""
+    def dec(t):
+        return zlib.decompress(base64.b64decode(t)).decode("utf-8")
+    return dec(b["ours"]), dec(b["stock"])
+
+
+# H5 (c): what a non-equal stock-paired record must hold to be re-refereed offline.
+EVIDENCE_KEYS = ("complete", "all", "tip")
+
+
+def keep_evidence(row, ours_raw, stock_raw, ab, sb, ev):
+    """Adds the re-referee evidence to a stock-paired record that is not `equal`: both raw bodies
+    and the per-side counts (the full list, `complete`, tip, settle and fork reads are already in
+    `v`, `tip` and `node`)."""
+    if (row.get("v") or {}).get("class") in (None, "equal"):
+        return
+    row["counts"] = side_counts(ab, sb, ev)
+    row["bodies"] = pack_bodies(ours_raw, stock_raw)
+
+
+def missing_evidence(row):
+    """The H5 (c) fields a non-equal stock-paired record lacks (empty: re-refereeable)."""
+    v = row.get("v") or {}
+    miss = [k for k in EVIDENCE_KEYS if (k in ("complete", "all") and k not in v) or (k == "tip" and k not in row)]
+    return miss + [k for k in ("counts", "bodies") if k not in row]
+
+
+def disk_estimate(rows, ratio=0.25):
+    """Bytes run 4 adds for the H5 (c) bodies: every non-equal stock-paired record keeps both
+    bodies, compressed at `ratio` and base64'd (4/3)."""
+    raw = n = 0
+    for r in rows:
+        if (r.get("v") or {}).get("class") in (None, "equal") or "stock" not in r:
+            continue
+        n += 1
+        raw += (r.get("ours") or {}).get("b") or 0
+        raw += (r.get("stock") or {}).get("b") or 0
+    return {"non_equal": n, "raw_bytes": raw, "body_bytes": math.ceil(raw * ratio * 4 / 3)}
 
 
 def count_rows(body):
@@ -648,8 +718,6 @@ def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx
     and stock's own lastBlockHeight; `query`: the case's GraphQL document."""
     c = v.get("class")
     ents, done = rule_entries(v)
-    if isinstance(v.get("all"), list) and len(v["all"]) > KEEP_ALL:
-        done = False                    # the record cannot keep this list: judge as a re-referee would
     if any(e.get("path") == "/~graphql-oracle-stall" for e in ents):
         return "stock-unavailable", []
     if c in ("equal", "allowlisted") and any(e.get("path") in PARTIAL_HITS for e in ents):
@@ -826,7 +894,7 @@ class Runner:
                 t_stock = time.time()
                 sb = parse(s["raw"])
                 row["stock"] = {"host": s["host"], "st": s["status"], "ms": s["ms"], "err": s.get("err"),
-                                "retry": s.get("attempt", 0)}
+                                "retry": s.get("attempt", 0), "b": len(s["raw"] or "")}
                 row.update(tip_fields(self.node, self.idx, s["host"], t_ours, t_stock))
                 if fam == "graphql":
                     row["stock"]["gql_errors"] = gql_error_codes(sb)[:3]
@@ -856,6 +924,7 @@ class Runner:
                     k, ids = verdict_class(ep, case["cls"], v, codes, vars_, node, row.get("tip"),
                                            req.get("query"), row.get("idx"))
                     row["v"] = stored_verdict(v, k, ids)
+                    keep_evidence(row, a["raw"], s["raw"], ab, sb, node)
         (self.sample if lane == "sample" else self.res).write(json.dumps(row, separators=(",", ":")) + "\n")
         return row
 

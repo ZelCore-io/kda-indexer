@@ -4370,8 +4370,17 @@ mod tests {
         ]
         .map(|p| entry(p, DiffKind::Changed));
         let (un, ids) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &hits);
-        assert!(un.is_empty(), "{un:?}");
-        assert_eq!(ids.len(), 18);
+        // H5 (a): the hits of open entries stay reported; each fits a non-explaining entry.
+        assert_eq!(ids.len() + un.len(), 18, "{un:?}");
+        for d in &un {
+            let open = allow.unexplaining_ids(
+                &RouteKind::Other,
+                "graphql:QBlock",
+                &[],
+                std::slice::from_ref(d),
+            );
+            assert!(!open.is_empty(), "{d:?}");
+        }
         // R-P5P9-62: one entry per new rule, PROPOSED until the FV preconditions flip it.
         for id in [
             "graphql-h7-window-referee",
@@ -4456,7 +4465,9 @@ mod tests {
             "graphql-r58-oracle-orphan-dupes",
             "graphql-r58-by-key-extra-row",
         ] {
-            assert!(ids.iter().any(|i| i == id), "{id} not hit: {ids:?}");
+            // H5 (a): an open entry matches nothing.
+            let hit = ids.iter().any(|i| i == id);
+            assert_eq!(hit, !allow.is_open_id(id), "{id}: {ids:?}");
         }
         // A real difference on a GraphQL request is not allowlisted.
         let real = [entry("/data/block/hash", DiffKind::Changed)];

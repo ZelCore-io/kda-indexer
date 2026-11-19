@@ -489,8 +489,9 @@ async fn search_rows_above_oracle_tip_are_oracle_lag() {
     let (ctx, calls) = setup(node, a, b, out.path()).await;
     let req = "/txs/search?search=5unn&minheight=7400000&maxheight=7400400&limit=10";
     let (class, ids, paths) = compare(&ctx, req).await;
-    assert_eq!(class, "allowlisted", "unexplained: {paths:?}");
-    assert_eq!(ids, vec!["oracle-tip-lag".to_string()]);
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(class, "diff", "unexplained: {paths:?}");
+    assert_eq!(ids, Vec::<String>::new());
     assert!(!calls.lock().unwrap().iter().any(|c| c.contains("/poll")));
 }
 
@@ -590,8 +591,9 @@ async fn coins_lag_scales_with_the_tip_gap() {
     )
     .await;
     let (class, ids, paths) = compare(&ctx, "/coins").await;
-    assert_eq!(class, "allowlisted", "unexplained: {paths:?}");
-    assert_eq!(ids, vec!["oracle-tip-lag".to_string()]);
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(class, "diff", "unexplained: {paths:?}");
+    assert_eq!(ids, Vec::<String>::new());
     let out = tempfile::tempdir().unwrap();
     let (ctx, _) = setup(
         canon_node(&[], 0..0),
@@ -4477,13 +4479,14 @@ async fn c4_a_12_mib_v1txs_pair_keeps_its_rules() {
     let o = v1_compare(&ctx, "/v1/txs/k:big/coin/250").await;
     // An explained answer keeps no diff record (R-P5P9-75: its allowlisted record is logged);
     // a streamed compare would have kept a diff.
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
     assert_eq!(
         o.class,
-        "allowlisted",
+        "diff",
         "{:?}",
         o.record.as_ref().map(|r| (&r.note, &r.diff))
     );
-    assert!(o.record.is_some_and(|r| r.class == "allowlisted"));
+    assert!(o.record.is_some_and(|r| r.class == "diff"));
 }
 
 /// Item 3 (the I-6 residual of run 6E): ours' 250-row page over the 32 MiB cap (`/v1/txs/
@@ -5144,9 +5147,10 @@ async fn c5_the_limit_edge_needs_the_oracle_one_short_at_the_limit() {
         // Every row below the oracle-lag window (R3E-11), so the limit edge alone decides.
         ctx.tips.set_a_tip(7_000_000 + 2 * super::ORACLE_HORIZON);
         let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
         assert_eq!(
             o.class,
-            class,
+            "diff",
             "ours {na}, kda-txs {nb}, class {class}: {:?}",
             o.record.map(|r| (r.note, r.diff))
         );
@@ -5199,7 +5203,7 @@ async fn c5b_the_lag_window_explains_only_rows_the_oracle_lacks() {
             "allowlisted",
         ),
     ];
-    for (name, a, b, class) in cases {
+    for (name, a, b, _class) in cases {
         let dir = tempfile::tempdir().unwrap();
         let tip = a.iter().filter_map(|r| r["height"].as_u64()).max().unwrap();
         let ctx = v1_setup_node(
@@ -5211,9 +5215,10 @@ async fn c5b_the_lag_window_explains_only_rows_the_oracle_lacks() {
         .await;
         ctx.tips.set_a_tip(tip.max(7_000_000));
         let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
         assert_eq!(
             o.class,
-            class,
+            "diff",
             "{name}: {:?}",
             o.record.map(|r| (r.note, r.diff))
         );
@@ -5241,7 +5246,7 @@ async fn c5b_the_lag_cut_keeps_a_row_only_the_limiting_side_has() {
             "allowlisted",
         ),
     ];
-    for (name, a, b, class) in cases {
+    for (name, a, b, _class) in cases {
         let dir = tempfile::tempdir().unwrap();
         let ctx = v1_setup(
             serde_json::to_vec(&a).unwrap(),
@@ -5252,9 +5257,10 @@ async fn c5b_the_lag_cut_keeps_a_row_only_the_limiting_side_has() {
         // Only height 7_000_000 is in the window, far from A's tip.
         ctx.tips.set_a_tip(7_000_000 + super::ORACLE_HORIZON - 1);
         let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
         assert_eq!(
             o.class,
-            class,
+            "diff",
             "{name}: {:?}",
             o.record.map(|r| (r.note, r.diff))
         );
@@ -5455,7 +5461,7 @@ async fn c6_the_lag_window_floor_is_ours_lowest_height_at_its_limit() {
             "diff",
         ),
     ];
-    for (name, a, b, tip, class) in cases {
+    for (name, a, b, tip, _class) in cases {
         let dir = tempfile::tempdir().unwrap();
         let ctx = v1_setup_node(
             serde_json::to_vec(&a).unwrap(),
@@ -5466,9 +5472,10 @@ async fn c6_the_lag_window_floor_is_ours_lowest_height_at_its_limit() {
         .await;
         ctx.tips.set_a_tip(tip);
         let o = v1_compare(&ctx, "/v1/txs/k:big/coin/10").await;
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
         assert_eq!(
             o.class,
-            class,
+            "diff",
             "{name}: {:?}",
             o.record.map(|r| (r.note, r.diff))
         );
@@ -5741,7 +5748,8 @@ async fn c7_oracle_one_block_behind_both_truncated_is_allowlisted() {
         None,
     )
     .await;
-    assert_eq!(class, "allowlisted", "{note}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(class, "diff", "{note}");
 }
 
 /// P4: the oracle one block behind, both complete at `limit=3`.
@@ -5754,7 +5762,8 @@ async fn c7_oracle_one_block_behind_both_complete_is_allowlisted() {
         Some(3),
     )
     .await;
-    assert_eq!(class, "allowlisted", "{note}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(class, "diff", "{note}");
 }
 
 /// P5: ours cut after four pages, the oracle complete.
@@ -5767,7 +5776,8 @@ async fn c7_ours_truncated_oracle_complete_is_allowlisted() {
         None,
     )
     .await;
-    assert_eq!(class, "allowlisted", "{note}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(class, "diff", "{note}");
 }
 
 /// P0: equal answers, both cut after four pages (the page cut alone is allowlisted).
@@ -5780,7 +5790,8 @@ async fn c7_equal_page_cut_answers_are_allowlisted() {
         None,
     )
     .await;
-    assert_eq!(class, "allowlisted", "{note}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(class, "diff", "{note}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5857,7 +5868,7 @@ async fn r74_account_oracle_cut_with_every_page_above_the_clamp_is_no_diff() {
     ctx.tips.set_a_tip(6_999_985 + super::ORACLE_HORIZON);
     let o = v1_compare(&ctx, "/txs/account/k:big?token=coin").await;
     assert!(
-        o.class != "diff" && o.class != "a-error",
+        o.class == "diff", // H5 (a): oracle-tip-lag and page-cut are open
         "{} {:?}",
         o.class,
         o.record.map(|r| (r.note, r.diff))
@@ -8158,22 +8169,26 @@ async fn e2_pq_the_referee_reads_known_gaps_on_stored_records() {
         }],
     );
     let rep = e2_referee(cfg(), dir.path(), &[p, q]).await;
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
     assert_eq!(
         (rep.explained, rep.unexplained, rep.known_gap),
-        (0, 0, 2),
+        (0, 2, 0),
         "{rep:?}"
     );
     assert_eq!(
         rep.by_class
             .get("known-gap: known-gap-p-heavy-account-deadline"),
-        Some(&1)
+        None
     );
     assert_eq!(
         rep.by_class
             .get("known-gap: known-gap-q-missing-chain-rows"),
-        Some(&1)
+        None
     );
-    assert!(rep.passed(), "a known gap is no unexplained record");
+    assert!(
+        !rep.passed(),
+        "H5 (a): a known gap is an unexplained record"
+    );
     let rep = e2_referee(cfg(), dir.path(), &[other]).await;
     assert_eq!((rep.unexplained, rep.known_gap), (1, 0), "{rep:?}");
 }
@@ -8340,8 +8355,9 @@ async fn e2_s_the_native_pair_rereads_a_gap_in_the_other_order() {
         }
     };
     let o = run(true).await;
-    assert_eq!(o.class, "allowlisted", "{:?}", o.record);
-    assert!(o
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(o.class, "diff", "{:?}", o.record);
+    assert!(!o
         .allowlist_ids
         .contains(&"graphql-native-miner-skew".to_string()));
     let rec = o.record.unwrap();
@@ -8414,8 +8430,9 @@ async fn e2_s_the_native_reread_agrees_up_to_f64() {
     let o = ctx
         .gql_native_balance(&ctx.targets["gql"], &ctx.targets["native"], &op, &vars)
         .await;
-    assert_eq!(o.class, "allowlisted", "{:?}", o.record);
-    assert!(o
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(o.class, "diff", "{:?}", o.record);
+    assert!(!o
         .allowlist_ids
         .contains(&"graphql-native-miner-skew".to_string()));
 }
@@ -8515,7 +8532,8 @@ async fn s_referee_capped(
 #[tokio::test]
 async fn i_s_the_gap_is_the_accounts_net_change_on_the_node() {
     let ok = |rep: &crate::referee::Report, case: &str| {
-        assert_eq!((rep.explained, rep.unexplained), (1, 0), "{case}: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!((rep.explained, rep.unexplained), (0, 1), "{case}: {rep:?}");
     };
     let no = |rep: &crate::referee::Report, case: &str| {
         assert_eq!((rep.explained, rep.unexplained), (0, 1), "{case}: {rep:?}");
@@ -8604,7 +8622,8 @@ async fn k_s_the_gap_is_measured_from_the_exact_f64() {
         "54286.440032319714",
     )
     .await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#117: {rep:?}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "#117: {rep:?}");
     // #384: one coinbase (ours in the binade above 65,536: half an ulp 7.28e-12).
     let rep = s_referee(
         s_node(&[100], &[]),
@@ -8612,7 +8631,8 @@ async fn k_s_the_gap_is_measured_from_the_exact_f64() {
         "108659.781707304791",
     )
     .await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#384: {rep:?}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "#384: {rep:?}");
     // #524: two coinbases, the node's value above (+3.2e-12 from the f64).
     let rep = s_referee(
         s_node(&[100, 101], &[]),
@@ -8620,7 +8640,8 @@ async fn k_s_the_gap_is_measured_from_the_exact_f64() {
         "50057.525829753384",
     )
     .await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#524: {rep:?}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "#524: {rep:?}");
     // #554: two coinbases, the node's value below.
     let rep = s_referee(
         s_node(&[100, 101], &[]),
@@ -8628,7 +8649,8 @@ async fn k_s_the_gap_is_measured_from_the_exact_f64() {
         "51835.405873945504",
     )
     .await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#554: {rep:?}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "#554: {rep:?}");
     // #584: a coinbase and 6.33e-5 of fees (0.9041093).
     let rep = s_referee(
         s_node(&[100], &fee(json!(0.0000633))),
@@ -8636,7 +8658,7 @@ async fn k_s_the_gap_is_measured_from_the_exact_f64() {
         "39716.249229054334",
     )
     .await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "#584: {rep:?}");
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "#584: {rep:?}"); // H5 (a): an open entry (rest-compose, graphql-h6-prefix, the native skew) matches nothing; the diff is reported.
 }
 
 /// R-P5P9-110, fail closed: the tolerance is still half an ulp of the f64, from its exact
@@ -8645,14 +8667,15 @@ async fn k_s_the_gap_is_measured_from_the_exact_f64() {
 /// 12-place text cannot sit at exactly 0.6) stay unexplained.
 #[tokio::test]
 async fn k_s_more_than_half_an_ulp_from_the_exact_f64_stays_unexplained() {
-    for (native, explained) in [
+    for (native, _explained) in [
         ("54285.53597551972", 1usize),
         ("54285.535975519713", 0),
         ("54285.535975519722", 0),
     ] {
         let rep = s_referee(s_node(&[100], &[]), "54284.63192951972", native).await;
-        assert_eq!(rep.explained, explained, "{native}: {rep:?}");
-        assert_eq!(rep.unexplained, 1 - explained, "{native}: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "{native}: {rep:?}");
+        assert_eq!(rep.unexplained, 1, "{native}: {rep:?}");
     }
 }
 
@@ -8721,12 +8744,13 @@ async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
         r
     };
     let rep = e2_referee(cfg(), dir.path(), &[rec("10.904046")]).await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
-    assert_eq!(rep.by_class.get("graphql-native-miner-skew"), Some(&1));
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
+    assert_eq!(rep.by_class.get("graphql-native-miner-skew"), None);
     // R-P5P9-97 S′ (#117's shape): the stored GraphQL balance is a JSON number, read as an
     // exact decimal; R-P5P9-98: native's trailing zeros past 12 places are ignored. A number
     // whose gap is no coinbase multiple stays unexplained.
-    for (ours, native, explained) in [
+    for (ours, native, _explained) in [
         ("10.0", "10.904046000000000", 1),
         ("10", "10.904046", 1),
         ("10.5", "10.904046", 0),
@@ -8736,7 +8760,7 @@ async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
         let rep = e2_referee(cfg(), dir.path(), &[r]).await;
         assert_eq!(
             (rep.explained, rep.unexplained),
-            (explained, 1 - explained),
+            (0, 1),
             "{ours} {native}: {rep:?}"
         );
     }
@@ -8763,7 +8787,7 @@ async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
     // FV day 1: a re-read that agrees up to f64 rendering (GraphQL's Float is the native
     // decimal rounded once) did not differ; the gap is settled like any other. A re-read
     // that differs beyond f64 is still refused.
-    for (graphql, explained) in [("10.904046", 1), ("10.904047", 0)] {
+    for (graphql, _explained) in [("10.904046", 1), ("10.904047", 0)] {
         let mut r = rec("10.904046000000000");
         r.diff.push(DiffEntry {
             path: "/~graphql-native-reread-differs".into(),
@@ -8775,7 +8799,7 @@ async fn e2_s_the_referee_settles_a_stored_native_gap_by_the_nodes_coinbases() {
         let rep = e2_referee(cfg(), dir.path(), &[r]).await;
         assert_eq!(
             (rep.explained, rep.unexplained),
-            (explained, 1 - explained),
+            (0, 1),
             "{graphql}: {rep:?}"
         );
     }

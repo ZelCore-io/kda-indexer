@@ -1,0 +1,9 @@
+[Unit]
+Description=Guard for the suite run 4 (stops kdx-suite4 only)
+BindsTo=kdx-suite4.service
+After=kdx-suite4.service
+
+[Service]
+Type=simple
+EnvironmentFile=@SUITE_DIR@/run4/suite4.env
+ExecStart=/bin/bash @SUITE_DIR@/run4/guard.sh

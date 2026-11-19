@@ -9,7 +9,12 @@
 # PROPOSED, citing its ruling, until the controller flips it by a ruling at the FV
 # preconditions (once CG-4 shows its hits are explained by its rule and nothing more).
 # accept_class (H2, owner R-P5P9-162): why the entry is accepted, one of
-# stock-wrong-node-evidence, intended-documented, unsupported-by-design, tip-timing.
+# stock-wrong-node-evidence, intended-documented, unsupported-by-design, tip-timing,
+# stock-self-inconsistent, stock-stale, harness-convention, our-defect.
+# doc (owner H4/H5 rule): the docs anchor of a documented difference. Only an entry with one
+# that is not our-defect or KNOWN-GAP explains anything; every other entry matches nothing.
+# node_read (H5): an accepted stock-wrong-node-evidence entry names the harness function and
+# the per-record node read that gate its hit.
 
 [[entry]]
 id = "event-search-window"
@@ -36,6 +41,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "Spec section 4.5 (builder call: orphans are not kept); R3E-9 extends it (oracle-orphan-rows); R-P5P9-78 (H2 m-7): scoped apart from oracle-orphan-rows, so each is hit; R-P5P9-81 (I-1): /txs/txs added to the scope."
 owner_note = "Builder call (spec section 4.5): orphans are not kept."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::split_by_node and run::oracle_orphans: node canonical header at each stock row's (chain, height) on the cut's branch"
 
 [[entry]]
 id = "stats-estimate"
@@ -144,9 +150,8 @@ request_contains = "graphql:"
 reason = "R-P5P9-57 rule (a), R-P5P9-58 kind oracle_empty: at a field listed in [graphql] field_rules, the reference server's empty string against a non-null value of ours (F8 signers.scheme present: the node's command carries the scheme ours serves). Our null against its empty string is not explained, and an optional ours matcher narrows it to one value."
 status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "R-P5P9-57 rule (a); R-P5P9-58 (oracle_empty, 22:40Z class table); R-P5P9-75, CG-4."
+ruling = "R-P5P9-57 rule (a); R-P5P9-58 (oracle_empty, 22:40Z class table); R-P5P9-75, CG-4. H5 audit: open, no per-record node read: graphql_norm::rule_explains is a pure value rule."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #260, #268)."
-doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r58-count-lower-bound"
@@ -173,6 +178,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-57; R-P5P9-58 (oracle_orphan_dupes); R-P5P9-48."
 owner_note = "Controller rulings R-P5P9-57 and R-P5P9-58 (22:40Z: transactionsByPublicKey orphan duplicates are an oracle defect)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql::oracle_orphan_dupes via run::oracle_orphans: node canonical header at our copy's (chain, height)"
 
 [[entry]]
 id = "graphql-r58-by-key-extra-row"
@@ -186,6 +192,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-57; R-P5P9-58 (by_key_extra_row); R-P5P9-75, CG-4."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #863, #982)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql::by_key_extra_rows: node /local (coin.details account) guard on the key's chain, one read per row"
 
 # --- From the first live runs (P1, chainweb-data vs node oracle) ---
 
@@ -196,10 +203,10 @@ json_path_glob = "/~genesis-multi-chain"
 condition = "b_extra"
 reason = "Some genesis txs repeat their request key across chains (seen live: 48T0LjAn... in the genesis blocks of all 20 chains, xJHaykvaH... on chains 10-19). chainweb-data's /txs/txs lists every row and its /txs/tx answers 404 for a request key with several rows; compat does the same (F4). Against the node's /poll on one chain, compat's /txs/tx 404 moves here only when compat's /txs/txs lists the request key in that chain's canonical genesis block and in at least one other genesis block."
 status = "PROPOSED"
-accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-1 (G1) and the F4 fix (run 3E-g)."
+accept_class = "intended-documented"
+ruling = "R3E-1 (G1) and the F4 fix (run 3E-g). H5 audit: our compat answer (404, as chainweb-data) against the node pair, not a stock fault; intended-documented."
 owner_note = "Compat behaviour by design (F4 fix, run 3E-g): matches chainweb-data. Replaces genesis-txs-not-indexed (G1 fixed: compat serves genesis txs on /txs/tx and /txs/txs, so a genesis 404 against chainweb-data is a diff again)."
-doc = "docs/comparison.md#stock-faults-the-node-disproves"
+doc = "docs/comparison.md#intended-differences"
 
 [[entry]]
 id = "failed-tx-callstack"
@@ -209,9 +216,10 @@ condition = "any"
 reason = "For failed txs chainweb-data kept the Pact error as produced at execution time, with a callStack; the node serves the stored output without callStack."
 status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "No ruling found: a P1 live-run finding (chainweb-data against the node oracle); R-P5P9-75, CG-4. H4: the evidence is the node's /poll output (the oracle of that run); an owner ruling is still to be recorded."
-owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #169, #191, #192)."
+ruling = "No ruling found: a P1 live-run finding (chainweb-data against the node oracle); R-P5P9-75, CG-4. H4: the evidence is the node's /poll output (the oracle of that run); an owner ruling is still to be recorded. Owner 2026-11-19: accepted as stock fault (node is the reference)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "none per record in code; owner ruling 2026-11-19: the node's stored /poll output is the reference"
+owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #169, #191, #192)."
 
 [[entry]]
 id = "failed-tx-error-info"
@@ -221,9 +229,10 @@ condition = "changed"
 reason = "For failed txs chainweb-data's error info has the source position at execution time (\"<interactive>:0:11937\"); the node serves \"<toplevel>:0\"."
 status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "No ruling found: a P1 live-run finding, as failed-tx-callstack; R-P5P9-75, CG-4. H4: the evidence is the node's /poll output (the oracle of that run); an owner ruling is still to be recorded."
-owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #169, #191, #192)."
+ruling = "No ruling found: a P1 live-run finding, as failed-tx-callstack; R-P5P9-75, CG-4. H4: the evidence is the node's /poll output (the oracle of that run); an owner ruling is still to be recorded. Owner 2026-11-19: accepted as stock fault (node is the reference)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "none per record in code; owner ruling 2026-11-19: the node's stored /poll output is the reference"
+owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #169, #191, #192)."
 
 # --- Harness tolerances reported as visible hits (P3, Task 7) ---
 
@@ -323,9 +332,8 @@ request_contains = "Au4cjML8"
 reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): /txs/tx for request key Au4cjML8... answers 404 on chainweb-data. The node's /poll on chain 4 has the tx in block 7TUVaPeB..., which is canonical at height 7392363 (the block kda-indexer lists). Seen live 2026-11-13 02:34Z. The harness checks behind cwd-events-missing-node and kdatxs-missing-node do not cover a chainweb-data 404 on a canonical tx (FV item T-3), so this entry is tied to one request key."
 status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored)."
+ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored). H5 audit: open, no per-record node read in code: pinned to one request key from a 2026-11-13 live read."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report). R-P5P9-70 (m-4): needs a key-scoped path. The recorded hit (run 6E-3 report) is a chainweb-data 404 on the whole answer, with no visible path. Stays PROPOSED until a dedicated hit replaces this one-off."
-doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "cwd-hole-txs-au4cjml8"
@@ -336,9 +344,8 @@ request_contains = "Au4cjML8"
 reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): /txs/txs for request key Au4cjML8... lists no row on chainweb-data; the node holds the tx in canonical block 7TUVaPeB... (chain 4, height 7392363), the block kda-indexer lists. Seen live 2026-11-13 02:34Z. Tied to one request key until the harness gets a node check for chainweb-data 404/empty answers (FV item T-3)."
 status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored)."
+ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored). H5 audit: open, no per-record node read in code: pinned to one request key from a 2026-11-13 live read."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report). R-P5P9-70 (m-4): needs a key-scoped path. The recorded hit (run 6E-3 report) is chainweb-data listing no row, with no visible path. Stays PROPOSED until a dedicated hit replaces this one-off."
-doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "cwd-hole-events-7392263"
@@ -349,9 +356,8 @@ request_contains = "minheight=7392263"
 reason = "chainweb-data hole of 2026-11-10 at heights about 7392051-7392417 (below the hole that cwd-events-missing-node covers, 7392632-7392963): the coin.TRANSFER_XCHAIN window 7392263-7392463 lacks three rows on chainweb-data that kda-indexer lists (chain 15 height 7392417 VBgVmfxK..., chain 8 height 7392417 hACgFo2g..., chain 1 height 7392416 qnXrjXqA...). The node's /poll has each in the block kda-indexer lists, which is canonical, with 4 events. Seen live 2026-11-13 02:34Z. The per-row events check of cwd-events-missing-node did not fire here (FV item T-3), so this entry is tied to the window's minheight."
 status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored)."
+ruling = "R3E-14 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored). H5 audit: open, no per-record node read in code: pinned to one height window from a live read."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Oracle defect under ruling R3E-14 (node agrees with kda-indexer, chainweb-data differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report). R-P5P9-70 (m-4): needs a key-scoped path. The recorded hits (run 6E-3 report) are positional (A rows /23 to /25), not key-scoped. Stays PROPOSED until a dedicated hit replaces this one-off."
-doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "kdatxs-gap-cont-d7bf62"
@@ -362,9 +368,8 @@ request_contains = "d7bf62"
 reason = "kda-txs lists no row for a transfer-crosschain continuation (request key 4GTkBWgc..., chain 2, height 7124688, code null) that kda-indexer lists at /9 of k:d7bf62.../coin/250. The node's /poll has it in block ljtUuFCZ..., which is canonical, with 4 events and 3 of them naming the account. Seen live 2026-11-13 02:00Z. The kdatxs-gap and kdatxs-missing-node checks did not fire (FV item T-3), so this entry is tied to one account."
 status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-15 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored)."
+ruling = "R3E-15 (oracle defect class); R-P5P9-47. R-P5P9-77 item 3 (restored). H5 audit: open, no per-record node read in code: pinned to one account from a 2026-11-13 live read."
 owner_note = "PROPOSED (R-P5P9-77 item 3): restored; FVH-D2 had removed it for zero hits in CG-4. CG-4 could not log REST hits; CG-5 decides. Earlier note: Oracle defect under ruling R3E-15 (node agrees with kda-indexer, kda-txs differs); allowlisted by ruling R-P5P9-47 (run 6E-3 report). R-P5P9-70 (m-4): needs a key-scoped path. The recorded hit (run 6E-3 report) is positional (A row /9), not key-scoped. Stays PROPOSED until a dedicated hit replaces this one-off."
-doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "oracle-orphan"
@@ -377,6 +382,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-48 item 1; R3E-14; R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node read in the rule, all allowlisted: #412, #921)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::search_rows (canon_cached): node canonical header at the stock row's (chain, height)"
 
 [[entry]]
 id = "oracle-gap"
@@ -389,6 +395,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-48 item 2; R3E-14; R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node read in the rule, all allowlisted: #670, #735)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::search_rows (node_in_canonical_block): node /poll puts the row in our canonical block below stock's tip"
 
 [[entry]]
 id = "pactid-cap"
@@ -423,9 +430,8 @@ condition = "changed"
 reason = "chainweb-data (/txs/tx, /txs/txs) and kda-txs (/v1/txs) list some txs' events in another order than the node's output (seen live: 5xNbYLRE... and vjUp8NVn..., chain 2; node and kda-indexer [coin.TRANSFER, coin.TRANSFER_XCHAIN, coin.TRANSFER, pact.X_YIELD], both oracles [coin.TRANSFER, coin.TRANSFER, coin.TRANSFER_XCHAIN, pact.X_YIELD]). Against these oracles a tx's events compare as a multiset and this visible hit is reported; the node pair still checks the order."
 status = "PROPOSED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "R3E-9."
+ruling = "R3E-9. H5 audit: open, no per-record node read: run::events_as_multiset reorders without asking the node."
 owner_note = "Accepted (run 3E ruling R3E-9): kda-indexer keeps the node's order."
-doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "oracle-orphan-rows"
@@ -439,6 +445,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-9; spec section 4.5; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence); R-P5P9-78 (H2 m-7): no longer shadowed by orphan-rows-txs."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R3E-9: the node confirms ours' block)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::oracle_orphans: node canonical header at each stock row's (chain, height), at most ORPHAN_CHECKS per compare"
 
 [[entry]]
 id = "oracle-tip-lag"
@@ -518,6 +525,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "Owner note: ACCEPTED by owner ruling R3E-14 (run 3E-d)."
 owner_note = "ACCEPTED (owner ruling R3E-14, run 3E-d): node agrees with kda-indexer, so chainweb-data's missing rows and short pages without a next-page token are chainweb-data defects."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::vs_target and run::compose::rest_compose: node /poll of each A-only row in its canonical block"
 
 [[entry]]
 id = "kdatxs-missing-node"
@@ -530,6 +538,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-15 (run 3E-d); R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node read in the rule, 71 hits all allowlisted: #34, #108, #131)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::vs_target and run::compose::rest_compose: node /poll of each A-only row in its canonical block"
 
 [[entry]]
 id = "kdatxs-events-node"
@@ -542,6 +551,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-15 (run 3E-g); R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node read in the rule, all allowlisted: #108, #615)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::vs_target: node /poll of each row whose events differ (at most 25 per compare)"
 
 [[entry]]
 id = "cwd-events-missing-node"
@@ -554,6 +564,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R3E-14 (run 3E-g); R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R3E-14: the node as referee)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::vs_target: node /poll of every A row in the heights stock lacks"
 
 [[entry]]
 id = "search-window"
@@ -589,9 +600,8 @@ request_contains = "graphql:"
 reason = "R-P5P9-60 rule (a), kind oracle_strips_quotes (cmd.nonce with inner quotes; CG-2 node = ours 3/3): our value decodes, one JSON string layer, to a string that contains a double quote, and the reference server's value is that string with every double quote removed. Any other pair stays unexplained."
 status = "ACCEPTED"
 accept_class = "stock-wrong-node-evidence"
-ruling = "R-P5P9-60; R-P5P9-75, CG-4."
+ruling = "R-P5P9-60; R-P5P9-75, CG-4. H5 audit: open, no per-record node read: graphql_norm::rule_explains is a pure value rule (CG-2 sampled 3 records)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #40, #339)."
-doc = "docs/comparison.md#stock-faults-the-node-disproves"
 
 [[entry]]
 id = "graphql-r60-count-self-consistent"
@@ -629,6 +639,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-62; R-P5P9-75, CG-4; R-P5P9-86 (text)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: sampled hits explained by the rule and nothing more; examples #10, #21, #151)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_window_referee_conn: node /poll and canonical header on the cut's branch per one-sided row"
 
 [[entry]]
 id = "graphql-h8-transfer-order-index"
@@ -655,6 +666,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-62; R-P5P9-75, CG-4 (zero hits; its originating ruling cites node evidence)."
 owner_note = "ACCEPTED (R-P5P9-75, CG-4: zero hits in CG-4; flipped on its originating ruling's node evidence, R-P5P9-62: the node's cont.data null = ours (CG-3T))."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_payload_data: node /poll, header and payload of the request key (cont.data)"
 
 [[entry]]
 id = "graphql-r75-coinbase-request-key"
@@ -704,6 +716,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 I; R-P5P9-86, CG-5; R-P5P9-92 (1); R-P5P9-93."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked 3/3, the node's tx count = ours: #48, #73, #121)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::count_walk_both (window_heights): node per-height tx counts over the query window"
 
 [[entry]]
 id = "graphql-r75-payload-rollback"
@@ -717,6 +730,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 J; R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked 3/3, the node's cont rollback = ours: #149, #372, #528)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_node_cmd_fields: node /poll, header and payload of the request key (cont.rollback)"
 
 [[entry]]
 id = "graphql-r75-signer-address"
@@ -730,6 +744,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 L; R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked, the node's signer addr = ours: #838)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_node_cmd_fields: node /poll, header and payload of the request key (signer addr)"
 
 [[entry]]
 id = "graphql-r75-single-block-cut"
@@ -817,6 +832,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 (E, M); R-P5P9-78 (H2 I-2)."
 owner_note = "PROPOSED (ruling R-P5P9-78 H2 I-2; evidence CG-4 #23 for E): stays PROPOSED until CG-5 shows clean hits of E and M."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_window_referee_conn: node /poll per oracle row settled off the node's chain"
 
 [[entry]]
 id = "graphql-r75-nested-order-index"
@@ -830,6 +846,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 (O); R-P5P9-78 (H2 I-2); R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked, the node's TRANSFER indexes: #38)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_nested_transfer_order: node /poll of the parent tx (TRANSFER event ranks)"
 
 [[entry]]
 id = "graphql-r75-exec-payload-data"
@@ -843,6 +860,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 (K); R-P5P9-78 (H2 I-2); R-P5P9-86, CG-5."
 owner_note = "ACCEPTED (R-P5P9-86, CG-5: node-checked 3/3, ours = the node's exec data: #21, #24, #46)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_node_cmd_fields: node /poll, header and payload of the request key (exec.data)"
 
 [[entry]]
 id = "graphql-r75-h7-unindexed"
@@ -856,6 +874,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-75 (D, F); R-P5P9-81 (m-1)."
 owner_note = "PROPOSED (ruling R-P5P9-81 m-1): stays PROPOSED until CG-5 shows clean hits of D and F."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_window_referee_conn: node /poll per one-sided unindexed row"
 
 [[entry]]
 id = "graphql-count-walk"
@@ -881,6 +900,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "FIX-3 (owner-authorised 2026-11-18); o1o2 diagnosis O1; fix3e S2: ACCEPTED on the condition that the single extra row is identified on a walkable oracle list and node-confirmed as sent by the account in a canonical block."
 owner_note = "ACCEPTED (fix3e S2): CG class O1 (Transactions-bca501b0 count +1), narrowed to a named, node-confirmed extra row."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::oracle_count_short: node /poll and canonical header of the one extra row"
 
 [[entry]]
 id = "graphql-r97-oracle-list-over-count"
@@ -894,6 +914,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-97 U; R-P5P9-103, CG-5."
 owner_note = "ACCEPTED (ruling R-P5P9-103): reviewed narrow in review-fvh-h; CG-5 class U (#432, #2045)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::count_walk_both: node /poll of every one-sided walked row (H7 rules)"
 
 [[entry]]
 id = "graphql-r97-oracle-chain-dupes"
@@ -907,6 +928,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-97 Q #37; R-P5P9-103, CG-5."
 owner_note = "ACCEPTED (ruling R-P5P9-103): reviewed narrow in review-fvh-h; reads counted under --max-reads (review B1); CG-5 #37."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql::gql_oracle_chain_dupes: node /local marmalade balance read per repeated chain row"
 
 [[entry]]
 id = "graphql-oracle-decimal-zeros"
@@ -920,6 +942,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-86 X."
 owner_note = "PROPOSED (ruling R-P5P9-86 X): new in FVH-E2b; CG-5 class X (#744)."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "graphql_window::gql_decimal_zeros: node /poll TRANSFER event amount of the row's request key"
 
 [[entry]]
 id = "rest-compose"
@@ -943,6 +966,7 @@ accept_class = "stock-wrong-node-evidence"
 ruling = "R-P5P9-86 (REST composition)."
 owner_note = "PROPOSED (ruling R-P5P9-86): new in FVH-E2b."
 doc = "docs/comparison.md#stock-faults-the-node-disproves"
+node_read = "run::compose::rest_compose: node canonical header on the cut's branch and that block's coinbase output"
 
 [[entry]]
 id = "ours-limit-edge"

@@ -3979,7 +3979,8 @@ mod tests {
         let (left, ids) = classify("/~stats-count-age");
         assert_eq!((left.len(), ids.len()), (1, 0), "a stuck count is a diff");
         let (left, ids) = classify("/~oracle-lag/coinsInCirculation");
-        assert!(left.is_empty() && ids == vec!["oracle-tip-lag".to_string()]);
+        // H5 (a): oracle-tip-lag is open; it matches nothing.
+        assert!(left.len() == 1 && ids.is_empty());
     }
 
     /// R-P5P9-78 (H2 m-7): `/orphans` is credited to the entry whose rule produced it, so
@@ -4030,7 +4031,8 @@ mod tests {
         )
         .unwrap()
         .classify_request(&RouteKind::Coins, "/coins", &[], &[hit]);
-        assert!(left.is_empty() && ids == vec!["oracle-tip-lag".to_string()]);
+        // H5 (a): oracle-tip-lag is open; it matches nothing.
+        assert!(left.len() == 1 && ids.is_empty());
         // No gap, or a gap whose coinbase (10 heights, 181 KDA) is too small: a diff.
         assert!(coins_tip_lag(&a, &b, 7_400_100, 7_400_100).is_none());
         assert!(coins_tip_lag(&a, &b, 7_400_100, 7_400_090).is_none());

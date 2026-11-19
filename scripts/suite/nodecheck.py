@@ -445,7 +445,8 @@ class Node:
         does not hold as canonical (`stock_orphans`), how many could not be resolved (`unresolved`:
         near the tip, no height, or the read bound), the rows asked and the reads used. One read
         per chain covers a height span under BRANCH_MAX; wider spans read per height."""
-        out = {"stock_orphans": 0, "unresolved": 0, "extra": len(rows), "reads": 0, "forks_confirmed": 0}
+        out = {"stock_orphans": 0, "unresolved": 0, "extra": len(rows), "reads": 0, "forks_confirmed": 0,
+               "forks": []}
         canon = {}
         with self.read_cap(max_reads) as cap:
             try:
@@ -473,6 +474,8 @@ class Node:
                         ok = self.fork_header(r["chain"], r["block"], r["height"])
                     except Budget:
                         ok = None
+                    # H5 (c): each fork-header read, kept for an offline re-referee.
+                    out["forks"].append([r["chain"], r["height"], r["block"], x, ok])
                     if ok:
                         out["stock_orphans"] += 1
                         out["forks_confirmed"] += 1
@@ -515,6 +518,7 @@ class Node:
         settles it (`settle`). A failed re-read leaves it `tip-race` (a failure)."""
         time.sleep(self.settle_s)
         second = {}
+        res = None
         try:
             by = collections.defaultdict(list)
             for c, h, _ in near:
@@ -522,8 +526,15 @@ class Node:
             for c, hs in by.items():
                 second.update(self.canonical(c, min(hs), max(hs), fresh=True))
         except (Budget, NodeError, ValueError, KeyError):
-            return "tip-race"
-        return settle(near, first, second)
+            res = "tip-race"
+        if res is None:
+            res = settle(near, first, second)
+        # H5 (c): both reads are kept with the record, so `settle` can be re-applied offline.
+        self.last_settle = {"near": [[c, h, x] for c, h, x in near],
+                            "first": [[c, h, first.get((c, h))] for c, h, _ in near],
+                            "second": [[c, h, second.get((c, h))] for c, h, _ in near],
+                            "wait_s": self.settle_s, "result": res}
+        return res
 
     def fork_header(self, chain, block, height):
         """True when the node holds `block` as a header at `height` on `chain` (a fork block it
@@ -560,6 +571,7 @@ class Node:
                 if "tip-race" in p:
                     out["tip"] = max(tips.values())    # recorded with the rows' heights in the answer
                     p[p.index("tip-race")] = self.settle_race(near_tip_mismatches(rows, canon, tips), canon)
+                    out["settle"] = self.last_settle
                     if p.count("not-canonical") > 1:
                         p.remove("not-canonical")
                     out.update(ok=not failures(p), why=p)

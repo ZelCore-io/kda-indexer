@@ -116,10 +116,11 @@ async fn g_2_stored_rest_records_bound_the_edge_by_ours_tip() {
         rec.a_lowest_height = lowest;
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
         let case = format!("{tip:?} {lowest:?}: {rep:?}");
-        assert_eq!((rep.refereed, rep.explained), (1, explained), "{case}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!((rep.refereed, rep.explained), (1, 0), "{case}");
         if explained == 1 {
             for id in ["ours-limit-edge", "rest-compose", "cwd-missing-node"] {
-                assert_eq!(rep.by_class.get(id), Some(&1), "{id} {case}");
+                assert_eq!(rep.by_class.get(id), None, "{id} {case}");
             }
         }
     }
@@ -213,7 +214,8 @@ async fn g_i1_an_above_tip_tx_outside_the_public_key_is_unexplained() {
         .await;
         let un = c3_unexplained(&ctx, &d);
         let case = format!("{signer}: {un:?} {d:?} {note:?}");
-        assert_eq!(un.is_empty(), explained, "{case}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert!(!(un.is_empty()), "{case}");
         if !explained {
             assert!(un.contains(&count), "{case}");
             assert!(note.unwrap_or_default().contains("publicKey"), "{case}");
@@ -292,7 +294,8 @@ async fn g_m9_the_count_walk_shares_the_compares_read_cap() {
         .await;
         let un = c3_unexplained(&ctx, &d);
         let case = format!("walk {spent}: {un:?} {d:?} {note:?}");
-        assert_eq!(un.is_empty(), explained, "{case}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert!(!(un.is_empty()), "{case}");
         assert_eq!(walk_hit(&d), explained, "{case}");
         if !explained {
             assert!(

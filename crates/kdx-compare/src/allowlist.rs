@@ -131,11 +131,14 @@ pub struct Entry {
     pub owner_note: String,
     /// Owner H4 rule: the doc anchor (`docs/<file>.md#<anchor>`) that documents the
     /// difference, or the documented stock-fault class backed by per-record node evidence.
-    /// An entry without one is **open**: the endpoint suite reports its hits as differences
-    /// (`pair-diff` lists them in `open_ids`). The live harness still matches it until its
-    /// mock tests are moved to documented entries (H4 report).
+    /// An entry without one is **open**: it matches nothing, in the live and oracle harness
+    /// as in the endpoint suite (H5 a), so its differences are reported.
     #[serde(default)]
     pub doc: Option<String>,
+    /// H5 (b): for an accepted `stock-wrong-node-evidence` entry, the harness function and the
+    /// per-record node read that gate its hit (`<module>::<fn>: <read>`).
+    #[serde(default)]
+    pub node_read: Option<String>,
 }
 
 impl Entry {
@@ -143,6 +146,14 @@ impl Entry {
     /// matched apart and never explain.
     pub fn is_open(&self) -> bool {
         self.status != Status::KnownGap && self.doc.is_none()
+    }
+
+    /// Owner rule (H5 a): the entry may explain a difference. An open entry, our own defect
+    /// and a KNOWN-GAP entry explain nothing, so they match nothing either.
+    pub fn explains(&self) -> bool {
+        !self.is_open()
+            && self.status != Status::KnownGap
+            && self.accept_class != AcceptClass::OurDefect
     }
 }
 
@@ -287,7 +298,7 @@ impl Allowlist {
             .and_then(|e| e.baseline_per_hour)
     }
 
-    /// The entry that matches `d`: an explaining entry first, else a KNOWN-GAP one.
+    /// The explaining entry that matches `d` (H5 a: only those match).
     fn hit(
         &self,
         route: &RouteKind,
@@ -295,36 +306,65 @@ impl Allowlist {
         a_headers: &[(String, String)],
         d: &DiffEntry,
     ) -> Option<&Entry> {
-        // A streamed `/v1/txs` hash or row difference is a diff whatever the allowlist
-        // says (R-P5P9-52 concern 5): a request-scoped `/**` entry must not explain it.
-        let never = [crate::streamed::HASH_PATH, crate::streamed::ROW_PATH]
-            .iter()
-            .any(|p| d.path.starts_with(p));
-        if never {
-            return None;
-        }
-        let fits = |e: &&Entry| {
-            (e.route == "*" || e.route == route.as_str())
-                && e.condition.matches(d.kind)
-                && e.request_contains
-                    .as_deref()
-                    .is_none_or(|s| request.contains(s))
-                && (e.request_any.is_empty() || e.request_any.iter().any(|s| request.contains(s)))
-                && e.a_value_contains
-                    .as_deref()
-                    .is_none_or(|t| d.a.as_ref().is_some_and(|v| v.to_string().contains(t)))
-                && e.a_header
-                    .as_deref()
-                    .is_none_or(|h| a_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h)))
-                && glob(&e.json_path_glob, &d.path)
-        };
-        let known = |e: &&Entry| e.status == Status::KnownGap;
         self.entries
             .iter()
-            .filter(|e| !known(e))
-            .find(fits)
-            .or_else(|| self.entries.iter().filter(known).find(fits))
+            .filter(|e| e.explains())
+            .find(|e| fits(e, route, request, a_headers, d))
     }
+
+    /// The ids of the non-explaining entries (open, our-defect, KNOWN-GAP) whose pattern fits
+    /// a difference of `diffs`: shown beside a reported diff, never explaining it.
+    pub fn unexplaining_ids(
+        &self,
+        route: &RouteKind,
+        request: &str,
+        a_headers: &[(String, String)],
+        diffs: &[DiffEntry],
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        for d in diffs {
+            if let Some(e) = self
+                .entries
+                .iter()
+                .filter(|e| !e.explains())
+                .find(|e| fits(e, route, request, a_headers, d))
+            {
+                push_id(&mut ids, &e.id);
+            }
+        }
+        ids
+    }
+}
+
+/// `e`'s pattern fits `d` (route, condition, request texts, A value and header, path glob).
+fn fits(
+    e: &Entry,
+    route: &RouteKind,
+    request: &str,
+    a_headers: &[(String, String)],
+    d: &DiffEntry,
+) -> bool {
+    // A streamed `/v1/txs` hash or row difference is a diff whatever the allowlist
+    // says (R-P5P9-52 concern 5): a request-scoped `/**` entry must not explain it.
+    if [crate::streamed::HASH_PATH, crate::streamed::ROW_PATH]
+        .iter()
+        .any(|p| d.path.starts_with(p))
+    {
+        return false;
+    }
+    (e.route == "*" || e.route == route.as_str())
+        && e.condition.matches(d.kind)
+        && e.request_contains
+            .as_deref()
+            .is_none_or(|s| request.contains(s))
+        && (e.request_any.is_empty() || e.request_any.iter().any(|s| request.contains(s)))
+        && e.a_value_contains
+            .as_deref()
+            .is_none_or(|t| d.a.as_ref().is_some_and(|v| v.to_string().contains(t)))
+        && e.a_header
+            .as_deref()
+            .is_none_or(|h| a_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h)))
+        && glob(&e.json_path_glob, &d.path)
 }
 
 fn push_id(ids: &mut Vec<String>, id: &str) {
@@ -680,6 +720,109 @@ mod tests {
         assert!(al.is_open_id("oracle-unstable") && !al.is_open_id("oracle-orphan"));
     }
 
+    /// Owner rule (H5 a): an open entry, an our-defect entry and a KNOWN-GAP entry match
+    /// nothing in the live and oracle harness either; their diffs stay reported diffs.
+    #[test]
+    fn h5_open_our_defect_and_known_gap_entries_match_nothing() {
+        use super::{AcceptClass, Status};
+        use crate::report::{DiffEntry, DiffKind};
+        let al = shipped();
+        let one = |path: &str, kind: DiffKind| {
+            vec![DiffEntry {
+                path: path.into(),
+                kind,
+                a: Some(serde_json::json!(1)),
+                b: Some(serde_json::json!(2)),
+            }]
+        };
+        // oracle-unstable (open), known-gap-q (our-defect, KNOWN-GAP), known-gap-p (KNOWN-GAP).
+        for (route, path, req) in [
+            (RouteKind::V1Txs, "/~oracle-unstable", ""),
+            (
+                RouteKind::Other,
+                "/~known-gap-missing-chain-rows",
+                "graphql:QFungibleAccount {}",
+            ),
+            (
+                RouteKind::Other,
+                "/~graphql-follow-page-fault",
+                "graphql:Q {\"a\":\"k:465174a5\"}",
+            ),
+        ] {
+            let mut d = one(path, DiffKind::Changed);
+            d[0].a = Some(serde_json::json!({"why": "request deadline exceeded"}));
+            let c = al.classify_known(&route, req, &[], &d);
+            assert_eq!(c.unexplained.len(), 1, "{path}");
+            assert!(c.ids.is_empty() && c.known.is_empty(), "{path}");
+            assert_eq!(c.class(&d).0, "diff", "{path}");
+        }
+        for e in &al.entries {
+            if e.is_open()
+                || e.accept_class == AcceptClass::OurDefect
+                || e.status == Status::KnownGap
+            {
+                assert!(!e.explains(), "{}", e.id);
+            } else {
+                assert!(e.explains(), "{}", e.id);
+            }
+        }
+        // A documented entry still explains.
+        let d = one("/~oracle-orphan", DiffKind::Missing);
+        let (left, ids) = al.classify(&RouteKind::Search, &d);
+        assert!(left.is_empty() && ids == vec!["oracle-orphan".to_string()]);
+    }
+
+    /// H5 (b): a stock fault is accepted only with per-record node evidence in code. Each
+    /// accepted `stock-wrong-node-evidence` entry names the node read in `node_read` (the
+    /// harness function and the read), and the audit's unconfirmable entries are open.
+    #[test]
+    fn h5_stock_faults_name_their_per_record_node_read() {
+        use super::{AcceptClass, Entry, Status};
+        let al = shipped();
+        let mut accepted = 0;
+        for e in &al.entries {
+            if e.accept_class == AcceptClass::StockWrongNodeEvidence && !e.is_open() {
+                let n = e.node_read.as_deref().unwrap_or("");
+                // Owner ruling 2026-11-19: the two failed-tx entries are accepted on the node
+                // as the reference, without a per-record read in code.
+                let owner = e
+                    .ruling
+                    .contains("Owner 2026-11-19: accepted as stock fault");
+                assert!(
+                    owner || (n.contains("node") && n.contains("::")),
+                    "{}: no node read cited",
+                    e.id
+                );
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 26);
+        for id in ["failed-tx-callstack", "failed-tx-error-info"] {
+            assert!(!al.is_open_id(id), "{id}: owner ruling 2026-11-19");
+        }
+        for id in [
+            "cwd-hole-tx-au4cjml8",
+            "cwd-hole-txs-au4cjml8",
+            "cwd-hole-events-7392263",
+            "kdatxs-gap-cont-d7bf62",
+            "oracle-event-order",
+            "graphql-r58-oracle-empty",
+            "graphql-r60-oracle-strips-quotes",
+        ] {
+            assert!(al.is_open_id(id), "{id} has no per-record node read");
+        }
+        let g = al
+            .entries
+            .iter()
+            .find(|e| e.id == "genesis-multi-chain-tx")
+            .unwrap();
+        assert_eq!(g.accept_class, AcceptClass::IntendedDocumented);
+        let n = |pred: &dyn Fn(&Entry) -> bool| al.entries.iter().filter(|e| pred(e)).count();
+        assert_eq!(n(&|e| e.explains()), 42, "accepted");
+        assert_eq!(n(&|e| e.is_open()), 33, "open");
+        assert_eq!(n(&|e| e.status == Status::KnownGap), 2, "known gaps");
+    }
+
     /// I-4: a `search=` diff is excused only when kda-indexer said it cut the answer.
     #[test]
     fn search_window_needs_a_truncated_answer() {
@@ -734,7 +877,8 @@ mod tests {
         let far: serde_json::Value = serde_json::from_str("379690000.0").unwrap();
         let d = diff_route(&RouteKind::Coins, &a, &near);
         let (left, ids) = al.classify_request(&RouteKind::Coins, "/coins", &[], &d);
-        assert!(left.is_empty() && ids == vec!["coins-supply-tolerance".to_string()]);
+        // H5 (a): coins-supply-tolerance is open; it matches nothing.
+        assert!(left.len() == 1 && ids.is_empty());
         let d = diff_route(&RouteKind::Coins, &a, &far);
         let (left, ids) = al.classify_request(&RouteKind::Coins, "/coins", &[], &d);
         assert_eq!(left.len(), 1);
@@ -763,7 +907,11 @@ mod tests {
             let (left, ids) = class(route, req);
             assert_eq!(
                 (left, ids),
-                (0, vec![id.to_string()]),
+                if al.is_open_id(id) {
+                    (1, vec![])
+                } else {
+                    (0, vec![id.to_string()])
+                },
                 "{req} should be {id}"
             );
         };
@@ -850,8 +998,9 @@ mod tests {
         let near = serde_json::json!({"transactionCount": 1010});
         let d = diff_route(&RouteKind::Stats, &a, &near);
         let (left, ids) = al.classify_request(&RouteKind::Stats, "/stats", &[], &d);
-        assert!(left.is_empty(), "{d:?}");
-        assert_eq!(ids, vec!["stats-estimate".to_string()]);
+        // H5 (a): stats-estimate (a 1 % tolerance) is open; it matches nothing.
+        assert_eq!(left.len(), 1, "{d:?}");
+        assert!(ids.is_empty());
     }
 
     /// R-P5P9-75 (P, Q): a KNOWN-GAP entry loads only with `baseline_per_hour`, and only it
@@ -889,9 +1038,14 @@ mod tests {
         let (un, ids) = k.classify_request(&RouteKind::Other, "graphql:Q {}", &[], &d);
         assert_eq!((un.len(), ids.len()), (1, 0), "never explained");
         let c = k.classify_known(&RouteKind::Other, "graphql:Q {}", &[], &d);
-        assert!(c.unexplained.is_empty() && c.ids.is_empty());
-        assert_eq!(c.known_ids, vec!["k".to_string()]);
-        assert_eq!(c.class(&d).0, "known-gap");
+        // H5 (a): a KNOWN-GAP entry matches nothing; its record is a plain diff.
+        assert!(c.unexplained.len() == 1 && c.ids.is_empty());
+        assert!(c.known_ids.is_empty());
+        assert_eq!(c.class(&d).0, "diff");
+        assert_eq!(
+            k.unexplaining_ids(&RouteKind::Other, "graphql:Q {}", &[], &d),
+            vec!["k"]
+        );
         assert_eq!(k.baseline("k"), Some(2.0));
     }
 
@@ -915,18 +1069,15 @@ mod tests {
             let c = al.classify_known(&RouteKind::Other, r, &[], d);
             (c.class(d).0, c.known_ids)
         };
-        let p = "known-gap-p-heavy-account-deadline".to_string();
         let d = fault("/~graphql-follow-page-fault", deadline);
         let full = format!("k:465174a5{}", "0".repeat(56));
         assert_eq!(
             known(&req("QTransactionsByAccount", &full), &d),
-            ("known-gap", vec![p.clone()])
+            ("diff", vec![])
         );
         let d1 = fault("/~graphql-first-page-fault", deadline);
-        assert_eq!(
-            known(&req("Transactions", "b581bc62ff"), &d1).0,
-            "known-gap"
-        );
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(known(&req("Transactions", "b581bc62ff"), &d1).0, "diff");
         // Another account (CG-4 #293's), another fault text: diffs.
         assert_eq!(known(&req("Transactions", "k:58ddb72d00"), &d1).0, "diff");
         let other = fault("/~graphql-follow-page-fault", "HTTP 500");
@@ -955,7 +1106,8 @@ mod tests {
         assert_eq!(qe.request_any.len(), 4);
         for r in &qe.request_any {
             let stem = r.trim_start_matches("graphql:").trim_end();
-            assert_eq!(known(&req(stem, "k:a"), &q).0, "known-gap", "{stem}");
+            // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+            assert_eq!(known(&req(stem, "k:a"), &q).0, "diff", "{stem}");
         }
         assert_eq!(
             known(&req("QFungibleAccountsByPublicKey", "k:a"), &q).0,
@@ -993,19 +1145,15 @@ mod tests {
             let c = al.classify_known(&RouteKind::Other, r, &[], d);
             (c.class(d).0, c.known_ids)
         };
-        let p = vec!["known-gap-p-heavy-account-deadline".to_string()];
         let k520 = "af7943004d0b08fe5402c23ec317f7a8d1bdd6ce4cc52414efcf8dbfa68ca256";
         let k977 = "k:22fbc926b497bf3ecc7199b923039e74cdeda12726e1dc4f443953007cf8cc43";
         let follow = fault("/~graphql-follow-page-fault", deadline);
         let first = fault("/~graphql-first-page-fault", deadline);
         assert_eq!(
             known(&req("QTransactionsByAccount", k520), &follow),
-            ("known-gap", p.clone())
+            ("diff", vec![])
         );
-        assert_eq!(
-            known(&req("Transactions", k977), &first),
-            ("known-gap", p.clone())
-        );
+        assert_eq!(known(&req("Transactions", k977), &first), ("diff", vec![]));
         // The full key only: a longer value that starts with it is another account.
         let longer = format!("{k977}00");
         assert_eq!(known(&req("Transactions", &longer), &first).0, "diff");

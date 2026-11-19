@@ -105,7 +105,8 @@ async fn e2b_tc_the_count_walk_settles_every_one_sided_row() {
     .await;
     let (d, note) = tc_live(&ctx, page_a.clone(), page_b.clone()).await;
     let un = c3_unexplained(&ctx, &d);
-    assert!(un.is_empty(), "{un:?} {d:?} {note:?}");
+    // H5 (a): only the open entries' hits stay reported.
+    assert_eq!(un, vec!["/~graphql-count-walk"], "{un:?} {d:?} {note:?}");
     let walk = d
         .iter()
         .find(|e| e.path == crate::graphql_window::COUNT_WALK_PATH)
@@ -201,8 +202,9 @@ async fn e2b_tc_the_referee_walks_ours_bounded_at_the_records_height() {
         vec![count],
     );
     let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
-    assert_eq!(rep.by_class.get("graphql-count-walk"), Some(&1), "{rep:?}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}");
+    assert_eq!(rep.by_class.get("graphql-count-walk"), None, "{rep:?}");
 }
 
 /// R-P5P9-86 X: ours' amount equals the node's TRANSFER text and the oracle's differs only
@@ -404,15 +406,17 @@ async fn e2b_rest_rules_combine_row_by_row() {
             .vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
             .await;
         if explained {
-            assert_eq!(o.class, "allowlisted", "{o:?}");
+            // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+            assert_eq!(o.class, "diff", "{o:?}");
             for id in [
                 "cwd-missing-node",
                 "cwd-missing-node-coinbase",
                 "ours-limit-edge",
-                "rest-compose",
             ] {
                 assert!(o.allowlist_ids.contains(&id.to_string()), "{id} {o:?}");
             }
+            // H5 (a): rest-compose is open; it matches nothing.
+            assert!(!o.allowlist_ids.contains(&"rest-compose".to_string()));
         } else {
             assert_eq!(o.class, "diff", "{o:?}");
         }
@@ -473,8 +477,9 @@ async fn e2b_v1txs_edge_rereads_once() {
             .unwrap();
         let o = v1_compare(&ctx, V1_REQ).await;
         if explained {
-            assert_eq!(o.class, "allowlisted", "{o:?}");
-            assert_eq!(o.allowlist_ids, vec!["kdatxs-edge-lag".to_string()]);
+            // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+            assert_eq!(o.class, "diff", "{o:?}");
+            assert_eq!(o.allowlist_ids, Vec::<String>::new());
         } else {
             assert_eq!(o.class, "diff", "{o:?}");
         }
@@ -532,10 +537,11 @@ async fn e2b_the_referee_settles_stored_rest_records() {
         );
         let rec = rest_record("account", ACCT_REQ, &a, &b);
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!((rep.refereed, rep.explained), (1, explained), "{rep:?}");
-        assert_eq!(rep.unexplained, 1 - explained, "{rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!((rep.refereed, rep.explained), (1, 0), "{rep:?}");
+        assert_eq!(rep.unexplained, 1, "{rep:?}");
         if explained == 1 {
-            assert_eq!(rep.by_class.get("rest-compose"), Some(&1), "{rep:?}");
+            assert_eq!(rep.by_class.get("rest-compose"), None, "{rep:?}");
         }
     }
     let (a0, b0) = v1_first();
@@ -551,9 +557,9 @@ async fn e2b_the_referee_settles_stored_rest_records() {
         let cfg = rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs");
         let rec = rest_record("v1txs", V1_REQ, &a0, &b0);
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!((rep.refereed, rep.explained), (1, explained), "{rep:?}");
+        assert_eq!((rep.refereed, rep.explained), (1, 0), "{rep:?}"); // H5 (a): an open entry (rest-compose, graphql-h6-prefix, the native skew) matches nothing; the diff is reported.
         if explained == 1 {
-            assert_eq!(rep.by_class.get("kdatxs-edge-lag"), Some(&1), "{rep:?}");
+            assert_eq!(rep.by_class.get("kdatxs-edge-lag"), None, "{rep:?}");
         }
     }
 }
@@ -666,7 +672,8 @@ async fn e3_g_a_cut_nested_list_is_settled_by_prefix() {
         (c3_unexplained(&ctx, &d), d)
     };
     let (un, d) = settle(126, ours.clone(), oracle.clone()).await;
-    assert!(un.is_empty(), "{un:?} {d:?}");
+    // H5 (a): only the open entries' hits stay reported.
+    assert_eq!(un, vec!["/~graphql-h6-prefix"], "{un:?} {d:?}");
     let hit = d
         .iter()
         .find(|e| e.path == crate::graphql_scope::PREFIX_PATH)
@@ -678,7 +685,7 @@ async fn e3_g_a_cut_nested_list_is_settled_by_prefix() {
     // R-P5P9-97 G: the oracle's rows are not ours' prefix in order, but every one is a
     // distinct tx of the node's block and ours is the whole block: settled as multisets.
     let (un, d) = settle(126, ours.clone(), oracle_bad).await;
-    assert!(un.is_empty(), "{un:?} {d:?}");
+    assert_eq!(un, vec!["/~graphql-h6-prefix"], "{d:?}");
     assert!(d
         .iter()
         .any(|e| e.path == crate::graphql_scope::PREFIX_PATH));
@@ -687,7 +694,7 @@ async fn e3_g_a_cut_nested_list_is_settled_by_prefix() {
     rev.reverse();
     let ours_rev = g_page(&[(0, 126, false, rev), (19, 1, false, vec!["1e-8".into()])]);
     let (un, d) = settle(126, ours_rev.clone(), oracle.clone()).await;
-    assert!(un.is_empty(), "{un:?} {d:?}");
+    assert_eq!(un, vec!["/~graphql-h6-prefix"], "{d:?}");
     // Out of order with an oracle row the node's block does not hold (or holds once only):
     // unfinished.
     let mut stray = prices[..20].to_vec();
@@ -737,8 +744,8 @@ async fn e3_g_a_cut_nested_list_is_settled_by_prefix() {
     };
     let rec = e2_stored("QG", json!({}), ours, oracle, vec![pos]);
     let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-    assert_eq!((rep.explained, rep.unexplained), (1, 0), "{rep:?}");
-    assert_eq!(rep.by_class.get("graphql-h6-prefix"), Some(&1), "{rep:?}");
+    assert_eq!((rep.explained, rep.unexplained), (0, 1), "{rep:?}"); // H5 (a): an open entry (rest-compose, graphql-h6-prefix, the native skew) matches nothing; the diff is reported.
+    assert_eq!(rep.by_class.get("graphql-h6-prefix"), None, "{rep:?}");
 }
 
 /// R-P5P9-105 (G, #70's stored shape): `blocksFromHeight(startHeight, endHeight)` with no
@@ -803,9 +810,10 @@ async fn i_g_a_height_range_root_without_first_runs_the_g_arm() {
             diff,
         );
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!(rep.explained, explained, "{node_n} {explained}: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "{node_n} {explained}: {rep:?}");
         if explained == 1 {
-            assert_eq!(rep.by_class.get("graphql-h6-prefix"), Some(&1), "{rep:?}");
+            assert_eq!(rep.by_class.get("graphql-h6-prefix"), None, "{rep:?}");
         }
     }
 }
@@ -827,7 +835,7 @@ async fn j_m1_a_stored_h6_entry_stays_unexplained_beside_a_cut_both_hit() {
     let fwd: Vec<String> = (0..126).map(|i| format!("{i}e-8")).collect();
     let rev: Vec<String> = fwd.iter().rev().cloned().collect();
     let list = "/data/blocksFromHeight/edges/0/node/transactions";
-    for (with_h6, explained) in [(false, 1usize), (true, 0)] {
+    for (with_h6, _explained) in [(false, 1usize), (true, 0)] {
         let dir = tempfile::tempdir().unwrap();
         let nu = node_server(g_node(126)).await;
         let ops = dir.path().join("ops");
@@ -864,7 +872,8 @@ async fn j_m1_a_stored_h6_entry_stays_unexplained_beside_a_cut_both_hit() {
             diff,
         );
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!(rep.explained, explained, "h6 entry {with_h6}: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "h6 entry {with_h6}: {rep:?}");
     }
 }
 
@@ -917,7 +926,7 @@ async fn j_m3_the_live_compare_runs_the_g_range_arm() {
     let mut stray = fwd.clone();
     stray[7] = "999e-8".into();
     // (the oracle's first page, its list read, explained, H6's entry, the G hit)
-    for (case, first, oracle_list, explained, h6_entry) in [
+    for (case, first, oracle_list, _explained, h6_entry) in [
         ("both listed", fwd.clone(), Some(fwd.clone()), true, false),
         ("oracle's read fails", fwd.clone(), None, false, true),
         (
@@ -956,7 +965,8 @@ async fn j_m3_the_live_compare_runs_the_g_range_arm() {
             &[],
             &d,
         );
-        assert_eq!(un.is_empty(), explained, "{case}: {un:?} {note:?} {d:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert!(!(un.is_empty()), "{case}: {un:?} {note:?} {d:?}");
         let h6 = d
             .iter()
             .any(|e| e.path == crate::graphql_scope::UNFINISHED_PATH && e.b.is_some());
@@ -1059,7 +1069,8 @@ async fn e3_tc_the_referee_walk_stops_at_the_read_cap() {
             rps: 10,
         };
         let rep = crate::referee::run(cfg, &opts).await.unwrap();
-        assert_eq!(rep.explained == 1, explained, "{rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "{rep:?}");
         if !explained {
             assert_eq!(rep.unexplained, 1, "{rep:?}");
             let v = serde_json::to_string(&rep.still_unexplained).unwrap();
@@ -1204,7 +1215,7 @@ async fn f_i3_the_stored_form_reads_ours_window_floor() {
     let all: Vec<Value> = std::iter::once(v1_row("r546", 7_006_546))
         .chain(b0.as_array().unwrap().iter().cloned())
         .collect();
-    for (floor, explained) in [
+    for (floor, _explained) in [
         (floor_rows(7_006_546, 10), 1),
         (floor_rows(7_006_527, 10), 0),
         (floor_rows(7_006_546, 9), 0),
@@ -1216,7 +1227,8 @@ async fn f_i3_the_stored_form_reads_ours_window_floor() {
         let cfg = rest_cfg(&nu, &au, &bu, dir.path(), "kda_txs");
         let rec = rest_record("v1txs", V1_REQ, &a0, &b0);
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!((rep.refereed, rep.explained), (1, explained), "{rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!((rep.refereed, rep.explained), (1, 0), "{rep:?}");
     }
 }
 
@@ -1251,7 +1263,7 @@ async fn f_m6_rest_compose_refuses_duplicates_and_the_unbounded_edge() {
 /// confirms the row. A true duplicate (from ≠ to) still settles nothing.
 #[tokio::test]
 async fn i_rest_a_self_transfer_listed_twice_is_two_rows() {
-    for (selfx, explained) in [(true, 1usize), (false, 0)] {
+    for (selfx, _explained) in [(true, 1usize), (false, 0)] {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = acct_pair(7_000_099);
         let mut u1 = a[0].clone();
@@ -1272,7 +1284,8 @@ async fn i_rest_a_self_transfer_listed_twice_is_two_rows() {
         );
         let rec = rest_record("account", ACCT_REQ, &a, &b);
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!(rep.explained, explained, "self {selfx}: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "self {selfx}: {rep:?}");
         if !selfx {
             let still = serde_json::to_string(&rep.still_unexplained).unwrap();
             assert!(still.contains("listed more than once"), "{still}");
@@ -1287,7 +1300,7 @@ async fn i_rest_a_self_transfer_listed_twice_is_two_rows() {
 /// in another block on the node, stays unexplained.
 #[tokio::test]
 async fn i_rest_an_oracle_row_at_ours_floor_height_canonical_on_the_node() {
-    for (case, explained) in [("full", 1usize), ("not full", 0), ("not canonical", 0)] {
+    for (case, _explained) in [("full", 1usize), ("not full", 0), ("not canonical", 0)] {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = acct_pair(7_000_100);
         let a = if case == "not full" {
@@ -1322,7 +1335,8 @@ async fn i_rest_an_oracle_row_at_ours_floor_height_canonical_on_the_node() {
         );
         let rec = rest_record("account", ACCT_REQ, &a, &b);
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!(rep.explained, explained, "{case}: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "{case}: {rep:?}");
     }
 }
 
@@ -1371,7 +1385,8 @@ async fn k_rest_the_referee_floor_cap_is_500_rows() {
         );
         let rec = rest_record("account", ACCT_REQ, &a, &b);
         let rep = e2_referee_capped(cfg, dir.path(), &[rec], 1_000).await;
-        assert_eq!(rep.explained, explained, "{n} rows: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "{n} rows: {rep:?}");
         if explained == 0 {
             let still = serde_json::to_string(&rep.still_unexplained).unwrap();
             assert!(still.contains("501 rows, over 500"), "{still}");
@@ -1390,7 +1405,7 @@ async fn k_rest_the_referee_floor_cap_is_500_rows() {
 /// reach a live context.
 #[tokio::test]
 async fn k_rest_the_live_floor_cap_stays_50_rows() {
-    for (n, class) in [(180usize, "diff"), (50, "allowlisted"), (51, "diff")] {
+    for (n, _class) in [(180usize, "diff"), (50, "allowlisted"), (51, "diff")] {
         let dir = tempfile::tempdir().unwrap();
         let (a, b, node) = floor_n(n);
         let nu = node_server(node).await;
@@ -1408,7 +1423,8 @@ async fn k_rest_the_live_floor_cap_stays_50_rows() {
         let o = ctx
             .vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
             .await;
-        assert_eq!(o.class, class, "{n} rows live: {o:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(o.class, "diff", "{n} rows live: {o:?}");
     }
 }
 
@@ -1475,7 +1491,7 @@ fn cb_cases() -> Vec<(&'static str, usize, CbEdit)> {
 /// orphan rule: the arm's own refusal is `l_rest_the_coinbase_arm_wants_the_canonical_block`.)
 #[tokio::test]
 async fn l_rest_a_coinbase_row_at_ours_floor_is_placed_by_its_block_referee() {
-    for (case, explained, edit) in cb_cases() {
+    for (case, _explained, edit) in cb_cases() {
         let dir = tempfile::tempdir().unwrap();
         let (a, b, node) = cb_floor(edit);
         let nu = node_server(node).await;
@@ -1488,7 +1504,8 @@ async fn l_rest_a_coinbase_row_at_ours_floor_is_placed_by_its_block_referee() {
         );
         let rec = rest_record("account", ACCT_REQ, &a, &b);
         let rep = e2_referee(cfg, dir.path(), &[rec]).await;
-        assert_eq!(rep.explained, explained, "{case}: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "{case}: {rep:?}");
     }
 }
 
@@ -1507,12 +1524,13 @@ async fn l_rest_a_coinbase_row_at_ours_floor_is_placed_by_its_block_live() {
         let o = ctx
             .vs_target(&req, &ctx.targets["a"], &ctx.targets["b"], None)
             .await;
-        let class = if explained == 1 {
+        let _class = if explained == 1 {
             "allowlisted"
         } else {
             "diff"
         };
-        assert_eq!(o.class, class, "{case}: {o:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(o.class, "diff", "{case}: {o:?}");
     }
 }
 
@@ -1579,15 +1597,17 @@ async fn l_rest_the_coinbase_arm_takes_two_reads_and_stops_at_the_cap() {
     };
     let polled = run(1_000, true).await;
     let cb = run(1_000, false).await;
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
     assert_eq!(
         (polled.explained, cb.explained),
-        (1, 1),
+        (0, 0),
         "{polled:?} {cb:?}"
     );
     // A polled floor row is one read; the coinbase is two.
     assert_eq!(cb.node_reads, polled.node_reads + 1, "{polled:?} {cb:?}");
     let at = run(cb.node_reads, false).await;
-    assert_eq!(at.explained, 1, "{at:?}");
+    // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+    assert_eq!(at.explained, 0, "{at:?}");
     assert_eq!(at.node_reads, cb.node_reads, "{at:?}");
     let under = run(cb.node_reads - 1, false).await;
     assert_eq!(under.explained, 0, "{under:?}");
@@ -1608,7 +1628,7 @@ async fn f_m9_rest_node_polls_count_in_max_reads() {
     a.extend(shared.iter().cloned());
     let (a, b) = (Value::Array(a), Value::Array(shared.to_vec()));
     let mut reads = Vec::new();
-    for (max_reads, explained) in [(200usize, 1usize), (1, 0)] {
+    for (max_reads, _explained) in [(200usize, 1usize), (1, 0)] {
         let dir = tempfile::tempdir().unwrap();
         let nu = node_server(rest_node()).await;
         let cfg = rest_cfg(
@@ -1627,7 +1647,8 @@ async fn f_m9_rest_node_polls_count_in_max_reads() {
             rps: 100,
         };
         let rep = crate::referee::run(cfg, &opts).await.unwrap();
-        assert_eq!(rep.explained, explained, "{max_reads}: {rep:?}");
+        // H5 (a): an open, our-defect or KNOWN-GAP entry matches nothing; the diff is reported.
+        assert_eq!(rep.explained, 0, "{max_reads}: {rep:?}");
         reads.push(rep.node_reads);
     }
     // The chain graph and u1's `/poll` (one chunk; before the fix only the chain graph).
@@ -1766,10 +1787,11 @@ async fn fix3_the_count_walk_halves_first_on_a_complexity_limit() {
             .iter()
             .any(|e| e.path == crate::graphql_window::COUNT_WALK_PATH));
         if explained {
-            assert!(un.is_empty(), "{un:?} {d:?} {note}");
+            // H5 (a): only the open entries' hits stay reported.
+            assert_eq!(un, vec!["/~graphql-count-walk"], "{un:?} {d:?} {note}");
             assert!(note.contains("\"oracleRefused\":[100,50]"), "{note}");
         } else {
-            assert_eq!(un, std::slice::from_ref(&refused), "{d:?} {note}");
+            assert!(un.contains(&refused), "{un:?} {d:?} {note}");
             assert!(note.contains("\"oracleAnswered\":100"), "{note}");
         }
     }
