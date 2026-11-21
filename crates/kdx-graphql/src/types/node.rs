@@ -3,7 +3,10 @@
 //! decode, or its key is not a well-formed key of its type) is `null`, as stock answers
 //! (FIX-4 item 5); so is an object that is not stored.
 
-use async_graphql::{Context, Result, ID};
+use std::borrow::Cow;
+
+use async_graphql::registry::{MetaType, Registry};
+use async_graphql::{Context, InputType, InputValueError, InputValueResult, Result, Value, ID};
 
 use super::{
     Event, NonFungibleAccount, NonFungibleChainAccount, NonFungibleTokenBalance, Signer,
@@ -22,6 +25,63 @@ use crate::types::Node;
 
 /// Most ids one `nodes` call takes.
 pub const MAX_NODES: usize = 100;
+
+/// A `node` / `nodes` id argument: the GraphQL `ID` scalar, but taking any whole number, as
+/// stock does (graphql-js: a string or an integer). async-graphql's own `ID` refuses an
+/// integer that does not fit an i64, which answered a client's `9223372036854775808` with a
+/// 500 where stock answers `null`. The schema still names the type `ID`.
+pub struct AnyId(pub ID);
+
+/// Whether `v` is an `ID` value: a string, or a whole number of any size.
+fn is_id_value(v: &Value) -> bool {
+    match v {
+        Value::String(_) => true,
+        Value::Number(n) => {
+            n.is_i64()
+                || n.is_u64()
+                || n.as_f64()
+                    .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
+        }
+        _ => false,
+    }
+}
+
+impl InputType for AnyId {
+    type RawValueType = ID;
+
+    fn type_name() -> Cow<'static, str> {
+        <ID as InputType>::type_name()
+    }
+
+    fn create_type_info(registry: &mut Registry) -> String {
+        let name = <ID as InputType>::create_type_info(registry);
+        // Widen the registered scalar's validity check (the document validation runs it on
+        // literals and on variable values).
+        if let Some(MetaType::Scalar { is_valid, .. }) = registry.types.get_mut("ID") {
+            *is_valid = Some(std::sync::Arc::new(is_id_value));
+        }
+        name
+    }
+
+    fn parse(value: Option<Value>) -> InputValueResult<Self> {
+        match value {
+            Some(Value::Number(n)) if is_id_value(&Value::Number(n.clone())) => {
+                Ok(AnyId(ID(n.to_string())))
+            }
+            v => <ID as InputType>::parse(v)
+                .map(AnyId)
+                .map_err(InputValueError::propagate),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        self.0.to_value()
+    }
+
+    fn as_raw_value(&self) -> Option<&ID> {
+        Some(&self.0)
+    }
+}
 
 async fn tx(
     ctx: &Context<'_>,
@@ -201,13 +261,13 @@ async fn lookup(ctx: &Context<'_>, key: NodeKey) -> Result<Option<Node>> {
     })
 }
 
-pub async fn nodes(ctx: &Context<'_>, ids: &[ID]) -> Result<Vec<Option<Node>>> {
+pub async fn nodes(ctx: &Context<'_>, ids: &[AnyId]) -> Result<Vec<Option<Node>>> {
     if ids.len() > MAX_NODES {
         return Err(bad_input(format!("at most {MAX_NODES} ids")));
     }
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        out.push(node(ctx, id).await?);
+        out.push(node(ctx, &id.0).await?);
     }
     Ok(out)
 }

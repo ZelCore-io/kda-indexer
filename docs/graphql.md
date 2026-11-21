@@ -269,6 +269,7 @@ number open.
 - `neighbors` lists the adjacent blocks ascending by chain id. `parent` is `null` for a
   genesis block. `minerAccount` is the miner's current `coin` row on the block's chain; a
   miner without a row is a field error.
+- `blocksFromHeight` with `startHeight` above `endHeight` is an empty list (stock errors).
 - Block lists are ordered by height, then chain ascending: `blocksFromHeight` ascending by
   height, as the oracle lists it (R-P5P9-57 M2a); `blocksFromDepth` and
   `completedBlockHeights` descending. `chainIds` absent or `[]` means every chain. Forward
@@ -293,7 +294,8 @@ number open.
   base64 of `<Type>:<key>`, an unknown type, or a malformed key) is `null`, as the stock
   indexer answers, and so is an object not stored; `nodes` answers `null` in that id's place.
   A well-formed id whose lookup is ambiguous (a `Signer` of a genesis tx stored on several
-  chains) keeps its `BAD_USER_INPUT` error.
+  chains) keeps its `BAD_USER_INPUT` error. An integer id of any size is an id like a string
+  (so `9223372036854775808` is `null`, not an error); a fraction or a boolean is refused.
   Coinbase events and transfers resolve through their block.
 
 ## Subscriptions
@@ -464,6 +466,7 @@ the oracle puts them.
   without a row are absent from `chainAccounts`; with no row the account is `null`.
   `fungibleChainAccounts` with `chainIds` absent (also a declared variable sent without a
   value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
+  with `chainIds` set the rows come in the order asked (each chain once), as stock lists them;
   `fungibleChainAccount` on a chain without a row is `null`.
 - `fungibleName` is trimmed before use, here and on the transaction and transfer lists, as
   stock reads it: `"coin "` names `coin`. A name of spaces alone is `BAD_USER_INPUT`.
