@@ -1,7 +1,7 @@
 //! `kda-indexer reconcile-balances`: manual reruns of the balance seed and full re-reads, and
 //! the reconcile status (plan Task 9). `run` seeds and reconciles by itself (B-5); `--seed`
-//! and `--all` take the data dir lock, so they run while the service is stopped. `--status`
-//! only reads.
+//! and `--all` take the data dir lock, so they run while the service is stopped. `--seed`
+//! also runs the receivers pass (D1) when the store has not had it. `--status` only reads.
 
 use std::path::Path;
 
@@ -36,6 +36,10 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
             let segdir = kdx_ingest::ctx::segments_dir(data_dir);
             let rep = kdx_ingest::seed::run(&hs, &segdir, &|| false)?;
             println!("{}", serde_json::to_string_pretty(&rep)?);
+            // D1: the receivers pass, once per store (`Meta balances_seed_receivers`).
+            let dict = std::sync::Mutex::new(kdx_hot::HotDict::load(&hs.ro()?)?);
+            let rep = kdx_ingest::seed_receivers::run(&hs, &dict, &segdir, &|| false)?;
+            println!("{}", json!({ "receivers": rep }));
             Ok(())
         }
         Mode::NftFill => {
@@ -149,6 +153,12 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
             .and_then(|v| v.try_into().ok().map(u32::from_be_bytes)),
         "seeded_height": seeded,
         "seed_in_progress": txn.meta(meta::BALANCES_SEED_CURSOR)?.is_some(),
+        "seed_receivers_height": txn
+            .meta(meta::BALANCES_SEED_RECEIVERS)?
+            .and_then(|v| v.try_into().ok().map(u32::from_be_bytes)),
+        "seed_receivers_in_progress": txn
+            .meta(meta::BALANCES_SEED_RECEIVERS_CURSOR)?
+            .is_some(),
         "rate_per_s": rate,
         "eta_secs": (rate > 0.0).then(|| (dirty as f64 / rate).round() as u64),
         "heartbeat_age_secs": stats.get("t").and_then(Value::as_u64).map(|t| now.saturating_sub(t)),

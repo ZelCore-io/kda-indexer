@@ -209,7 +209,8 @@ enum Command {
         /// Data directory (default: `data_dir` from the config).
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Run (or resume) the seed walk: mark every known (account, module, chain) dirty.
+        /// Run (or resume) the seed walk: mark every known (account, module, chain) dirty,
+        /// then the receivers pass (D1, once per store) for event-less pre-coin-v3 credits.
         #[arg(long, conflicts_with_all = ["all", "status", "nft_fill"])]
         seed: bool,
         /// Run the NFT history fill again (ledger events; plan Task 11). The dirty rows it

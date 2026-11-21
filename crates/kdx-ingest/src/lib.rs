@@ -19,6 +19,7 @@ pub mod reconcile;
 pub mod reorg;
 pub mod search_stage;
 pub mod seed;
+pub mod seed_receivers;
 pub mod tail;
 
 pub use canon::{HeaderMode, Walker};

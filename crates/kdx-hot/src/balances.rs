@@ -45,6 +45,11 @@ pub mod meta {
     /// no marks (`[balances] enabled = false`, or an older binary). The reconciler re-runs the
     /// seed and clears it.
     pub const MARK_GAP: &str = "balances_mark_gap";
+    /// u32: the receivers pass (D1, `kdx_ingest::seed_receivers`) has marked the event-less
+    /// receivers of every stored tx below this height. Absent: the pass never ran.
+    pub const BALANCES_SEED_RECEIVERS: &str = "balances_seed_receivers";
+    /// Resume cursor of a running receivers pass: start height u32 ‖ next frozen TxNum u64.
+    pub const BALANCES_SEED_RECEIVERS_CURSOR: &str = "balances_seed_receivers_cursor";
 }
 
 static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
