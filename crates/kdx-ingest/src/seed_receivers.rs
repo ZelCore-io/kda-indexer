@@ -190,8 +190,9 @@ impl Pending {
         let mut skipped = 0u64;
         for (a, c) in &self.rows {
             let k = bal_key(d.intern(DictKind::Account, a), coin, *c);
-            // A key with a row is kept fresh by the tail: correct, no re-read (review M2).
-            if txn.get(Table::Balances, &k)?.is_some() {
+            // A key with a verified row is kept fresh by the tail: correct, no re-read (review
+            // M2). An unverified row (its last re-read failed) is marked like an absent key.
+            if verified_row(txn.get(Table::Balances, &k)?.as_deref()) {
                 skipped += 1;
             } else {
                 rows.push(k);
@@ -234,7 +235,11 @@ impl Pending {
                     }
                     true
                 }
-                Some(id) if txn.get(Table::Balances, &bal_key(id, coin, c))?.is_some() => {
+                Some(id)
+                    if verified_row(
+                        txn.get(Table::Balances, &bal_key(id, coin, c))?.as_deref(),
+                    ) =>
+                {
                     rep.skipped_existing += 1;
                     false
                 }
@@ -247,6 +252,12 @@ impl Pending {
         }
         Ok(())
     }
+}
+
+/// A `Balances` row the pass may leave to the tail: it decodes and is not `unverified`.
+fn verified_row(v: Option<&[u8]>) -> bool {
+    v.and_then(balances::BalanceRow::decode)
+        .is_some_and(|r| !r.unverified)
 }
 
 fn add(
@@ -425,9 +436,21 @@ pub fn run(
     for t in start..end {
         if let Some(key) = segs.txkey(t) {
             if !key.is_coinbase() && (from..to).contains(&key.height()) {
-                if let Some(r) = segs.tx(t)? {
-                    add(&mut p, key, &r, &snap, o.forks, &mut rep);
-                    rep.frozen_txs += 1;
+                match segs.tx(t)? {
+                    Some(r) => {
+                        add(&mut p, key, &r, &snap, o.forks, &mut rep);
+                        rep.frozen_txs += 1;
+                    }
+                    None => {
+                        rep.errors += 1;
+                        tracing::error!(
+                            height = key.height(),
+                            chain = key.chain(),
+                            position = key.pos(),
+                            txnum = t,
+                            "balances: frozen tx has a key but no record (D1 pass error)"
+                        );
+                    }
                 }
             }
         }

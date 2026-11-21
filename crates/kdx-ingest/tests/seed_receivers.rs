@@ -228,8 +228,13 @@ fn a_stopped_pass_resumes_and_marks_the_same_rows() {
     assert_eq!(rows(&c), rows(&full));
 }
 
-/// Give `name` a `Balances` row on chain 0 (interning it as a posting would have).
+/// Give `name` a verified `Balances` row on chain 0 (interning it as a posting would have).
 fn put_row(c: &kdx_ingest::Ctx, name: &str) {
+    put_row_with(c, name, false);
+}
+
+/// Like [`put_row`], with the row's `unverified` flag (I-5) set as given.
+fn put_row_with(c: &kdx_ingest::Ctx, name: &str, unverified: bool) {
     let mut d = c.dict.lock().unwrap();
     let mut txn = c.hot.rw().unwrap();
     let a = d.intern(DictKind::Account, name);
@@ -241,7 +246,7 @@ fn put_row(c: &kdx_ingest::Ctx, name: &str) {
         guard: [1; 16],
         as_of: 24,
         reconciled_at: 24,
-        unverified: false,
+        unverified,
     };
     txn.put(
         Table::Balances,
@@ -261,6 +266,57 @@ fn keys_that_already_have_a_balances_row_are_not_marked() {
     assert!(!dirty(&c, LEGACY), "LEGACY has a row: not re-read");
     assert!(dirty(&c, XRECV), "XRECV has no row: marked");
     assert_eq!(rep.skipped_existing, 1, "{rep:?}");
+}
+
+#[test]
+fn absent_keys_are_marked() {
+    // N2: no Balances row at all: both receivers are marked, nothing is skipped.
+    let (_d, c) = store();
+    let rep = run(&c);
+    assert!(dirty(&c, LEGACY) && dirty(&c, XRECV));
+    assert_eq!(rep.skipped_existing, 0, "{rep:?}");
+}
+
+#[test]
+fn an_unverified_row_is_marked_like_an_absent_key() {
+    // N1/N2: the last re-read of an unverified row failed; the tail will not refresh it, so
+    // the pass marks it. A verified row is still skipped.
+    let (_d, c) = store();
+    put_row_with(&c, LEGACY, true);
+    put_row(&c, XRECV);
+    let rep = run(&c);
+    assert!(dirty(&c, LEGACY), "unverified row: marked");
+    assert!(!dirty(&c, XRECV), "verified row: skipped");
+    assert_eq!(rep.skipped_existing, 1, "{rep:?}");
+}
+
+#[test]
+fn a_dry_run_counts_skipped_keys_like_a_real_run() {
+    // N2: a verified row is `skipped_existing`, an unverified one is a would-be mark.
+    let setup = || {
+        let (d, c) = store();
+        put_row(&c, LEGACY);
+        put_row_with(&c, XRECV, true);
+        (d, c)
+    };
+    let (_d, real) = setup();
+    let want = run(&real);
+    assert_eq!(want.skipped_existing, 1, "{want:?}");
+
+    let (_d2, c) = setup();
+    let rows0 = dirty_rows(&c);
+    let o = Opts {
+        dry_run: true,
+        ..Opts::default()
+    };
+    let got = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    assert!(got.dry_run);
+    assert_eq!(got.skipped_existing, 1, "{got:?}");
+    assert_eq!(
+        got.dirty_inserted, want.dirty_inserted,
+        "{got:?} vs {want:?}"
+    );
+    assert_eq!(dirty_rows(&c), rows0, "a dry run writes no marks");
 }
 
 fn dirty_rows(c: &kdx_ingest::Ctx) -> usize {
