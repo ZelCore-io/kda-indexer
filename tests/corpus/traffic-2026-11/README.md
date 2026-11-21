@@ -35,16 +35,16 @@ POST other than GraphQL (no body logged).
 
 | Class | Raw requests | Kept | Distinct (deduplicated) |
 |---|---:|---:|---:|
-| `graphql` | 302,212 | 236,683 | 91,721 |
+| `graphql` | 302,212 | 236,682 | 91,720 |
 | `cwdata-rest` | 106,527 | 106,515 | 88 |
 | `kda-txs` | 74,379 | 28,322 | 1,598 |
-| **Total** | **483,118** | **371,520** | **93,407** |
+| **Total** | **483,118** | **371,519** | **93,406** |
 
 Dropped, by reason:
 
 | Reason | Requests |
 |---|---:|
-| GraphQL from internal sources (our own comparison and suite runs), identified by joining each captured body to its load-balancer log line | 65,480 |
+| GraphQL from internal sources (our own comparison and suite runs), identified by joining each captured body to its load-balancer log line | 65,481 |
 | kda-txs uptime monitor (health checks) | 38,784 |
 | kda-txs scanner probes and non-`/v1/txs` paths | 7,261 |
 | GraphQL documents with inline string literals (ad-hoc Pact code and account names written into the query text) | 20 |
@@ -59,9 +59,10 @@ Distinct requests per endpoint (requests in parentheses):
 
 - GraphQL: `blocksFromHeight` 67,965 (77,853), `transaction` 16,845 (34,399), `transactions` 5,207
   (45,596), `transfers` 554 (619), `nonFungibleAccount` 354 (374), `fungibleAccount` 353 (373),
-  `lastBlockHeight` 352 (77,064), `lastTokenPriceInKda` 49 (242), `pactQuery` 26 (97, all
+  `lastBlockHeight` 352 (77,064; includes 350 account `balance(...)` queries, because the document's
+  first root field is `lastBlockHeight`, so the bucket name is a naming quirk only), `lastTokenPriceInKda` 49 (242), `pactQuery` 26 (97, all
   `describe-module`), `blocksFromDepth` 5, `__schema` 4 (15), `networkInfo` 4 (24),
-  `completedBlockHeights` 1 (17), `events` 1 (4), `fungibleChainAccount` 1.
+  `completedBlockHeights` 1 (17), `events` 1 (4).
 - chainweb-data: `account` 52 (69,725), `recent` 1 (36,720; a fixed poller), `search` 22 (40),
   `stats`/`stats.json` 3 (20), plus 10 single requests to other paths (`/txs/health`,
   `/txs/docs`, ...), kept as real client behaviour (they return 404).
@@ -89,6 +90,15 @@ is not in this repository.
   - block hashes and `Block:` node ids.
 - Kept as is: chain ids, heights, limits, offsets, numeric block-list cursors, module and token
   names (`coin`, `runonflux.flux`, ...), event names, GraphQL documents and operation names.
+  - The `after` cursors on the 57 kept `blocksFromHeight` requests are base64 of
+    `<block/tx unix time>:<row id>` (for example `1751903244:17432546`). They are chain times and
+    internal database row ids, not request times, and they appear only in block-range queries
+    with no account. So the corpus holds no request timestamps.
+- Account-scoped `minheight` values on `/txs/account/...` requests are 0 or 1 only. Three
+  distinct requests (9 in total) carried larger values and were reset to `minheight=0`, because a
+  client's height comes from its own account history and could narrow the original account down.
+- One GraphQL request that was a byte-for-byte copy of our own comparison query
+  (`QFungibleChainAccount`) was dropped as internal traffic, so the corpus holds client traffic only.
 - Requests carrying anything that could not be classified (free text, inline literals in the
   GraphQL document, credential-like query parameters, opaque cursors) were dropped, not edited.
 - Substitutes exclude every identifier-shaped token that appears anywhere in the raw logs, so no

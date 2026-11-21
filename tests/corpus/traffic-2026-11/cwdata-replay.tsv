@@ -1,11 +1,11 @@
 # chainweb-data REST, real traffic 2026-11-14..21, anonymized. Columns (tab-separated): count, method, path?query.
 35594	GET	/txs/account/607152fb187d1e6b20da65fe?limit=200000&token=coin
 34038	GET	/txs/account/617fc69d46309d767cd25f3d?token=runonflux.flux
-4	GET	/txs/account/309034f066ace601a0deef73d2a663b00d820ae97ddc63d5438cee8383243d74?minheight=4480867&offset=0&limit=50
+4	GET	/txs/account/309034f066ace601a0deef73d2a663b00d820ae97ddc63d5438cee8383243d74?minheight=0&offset=0&limit=50
 4	GET	/txs/account/ab3bef23c94d67806c1472c475f8970dc4b2d79e8af1ef8c9730b7d36ac5f365?minheight=0&offset=0&limit=50
 4	GET	/txs/account/b395d119c44521c893e087a95685cddf3b59464d910865b81f696372775e86ac?minheight=0&offset=0&limit=50
 4	GET	/txs/account/d2e69edd6042e0f071d1b2d30a5f215c0c592328fe690b8cb8d90bb8e8deb16a?minheight=0&offset=0&limit=50
-4	GET	/txs/account/k:309034f066ace601a0deef73d2a663b00d820ae97ddc63d5438cee8383243d74?minheight=4480867&offset=0&limit=50
+4	GET	/txs/account/k:309034f066ace601a0deef73d2a663b00d820ae97ddc63d5438cee8383243d74?minheight=0&offset=0&limit=50
 4	GET	/txs/account/k:ab3bef23c94d67806c1472c475f8970dc4b2d79e8af1ef8c9730b7d36ac5f365?minheight=0&offset=0&limit=50
 4	GET	/txs/account/k:b395d119c44521c893e087a95685cddf3b59464d910865b81f696372775e86ac?minheight=0&offset=0&limit=50
 4	GET	/txs/account/k:d2e69edd6042e0f071d1b2d30a5f215c0c592328fe690b8cb8d90bb8e8deb16a?minheight=0&offset=0&limit=50
@@ -48,7 +48,7 @@
 1	GET	/txs/account/k:6f87e0f53d92dc313d29c559009961730c293b3a772991cd700489f8b3cdc04f?minheight=1&offset=0&limit=50
 1	GET	/txs/account/k:81b447b8cab7f3256133b313e1d1438da2caab28b66129ec5690b1091b31c71a?minheight=0&offset=0&limit=50
 1	GET	/txs/account/k:931ec7c3acdece52b021bb336d6519f62fc3f151ef9ba89a5719290be480089e?minheight=0&offset=0&limit=50
-1	GET	/txs/account/k:b036068c2fa76dd9eba7fc69e19ccface5acb22e538898510f256a4a997de748?minheight=7347664&offset=0&limit=50
+1	GET	/txs/account/k:b036068c2fa76dd9eba7fc69e19ccface5acb22e538898510f256a4a997de748?minheight=0&offset=0&limit=50
 1	GET	/txs/account/k:e68edcc5c06d1ca6832f2208c2c6e12613bf459f09feddcfa14fd6ad0bf30f0d?minheight=0&offset=0&limit=50
 1	GET	/txs/account/k:fd73e02c1f4dd7075e9abce3c651208d0001d22e202fcaeb7f0ea3fa27984572?minheight=0&offset=0&limit=50
 1	GET	/txs/accounts
