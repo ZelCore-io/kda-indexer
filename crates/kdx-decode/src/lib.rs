@@ -7,6 +7,7 @@ pub mod index;
 pub mod json;
 pub mod merkle;
 pub mod payload;
+pub mod receivers;
 pub mod render;
 pub mod verify;
 

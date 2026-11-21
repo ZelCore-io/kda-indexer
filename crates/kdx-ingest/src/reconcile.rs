@@ -994,6 +994,41 @@ async fn seed_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
     Ok(!rep.stopped)
 }
 
+/// D1: the receivers pass of the seed (`seed_receivers`), when the store has not had it, or
+/// its stored history below coin v3 grew since. Postponed (to the next recheck) while the
+/// store is not ready for it (review L3). It runs inline: tail dirty rows wait until it ends
+/// (review L4). Returns false when stopped.
+async fn receivers_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
+    let forks = crate::seed_receivers::forks_for(&ctx.opts.network);
+    let Some((from, to)) = crate::seed_receivers::pending(&ctx.hot.ro()?, forks)? else {
+        return Ok(true);
+    };
+    if let Err(e) = crate::seed_receivers::check_ready(&ctx.hot.ro()?, &ctx.segdir) {
+        tracing::warn!(error = %e, "balances: receivers pass (D1) postponed");
+        return Ok(true);
+    }
+    tracing::info!(
+        from,
+        to,
+        "balances: marking event-less receivers below coin v3 (D1)"
+    );
+    let (c, s) = (ctx.clone(), stop.clone());
+    let opts = crate::seed_receivers::Opts {
+        forks,
+        ..Default::default()
+    };
+    let rep = tokio::task::spawn_blocking(move || {
+        crate::seed_receivers::run(&c.hot, &c.dict, &c.segdir, &opts, &|| s.is_cancelled())
+    })
+    .await??;
+    if rep.errors > 0 {
+        tracing::error!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended with errors");
+    } else {
+        tracing::info!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended");
+    }
+    Ok(!rep.stopped)
+}
+
 /// M-11: the tail applied blocks without dirty marks (`[balances] enabled = false`, or an
 /// older binary on this store). Clears the gap flag and the seed's done flag and cursor, so the
 /// seed marks every known row again (behind the tail marks). Returns whether there was a gap.
@@ -1100,6 +1135,9 @@ async fn run_with(
     if o.seed && !crate::seed::seeded(&ctx.hot.ro()?)? && !seed_pass(&ctx, &stop).await? {
         return Ok(());
     }
+    if o.seed && !receivers_pass(&ctx, &stop).await? {
+        return Ok(());
+    }
     let local = LocalClient::new(node, o.local);
     let mut nft_cursor: Option<Vec<u8>> = None;
     let mut details_cursor: Option<Vec<u8>> = None;
@@ -1132,6 +1170,10 @@ async fn run_with(
             }
         }
         if last_recheck.is_none_or(|t| t.elapsed() >= RECHECK_SCAN) {
+            // D1: a tail still below coin v3 stores new pre-v3 txs; their receivers too.
+            if o.seed && last_recheck.is_some() && !receivers_pass(&ctx, &stop).await? {
+                return Ok(());
+            }
             let n = recheck_not_fungible(&ctx.hot, now_unix(), o.caps.recheck_secs)?;
             if n > 0 {
                 tracing::info!(modules = n, "balances: not-fungible modules re-checked");
@@ -2180,6 +2222,17 @@ pub(crate) mod tests {
         let segdir = dir.path().join("segments");
         std::fs::create_dir_all(&segdir).unwrap();
         let k = undecodable_ledger_event(&hot);
+        // D1 L3: the receivers pass waits for a tail; this store's tail reached height 1.
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut txn,
+            kdx_hot::Stage::Tail,
+            0,
+            1,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        txn.commit().unwrap();
         let e = crate::nft_fill::run(&hot, &segdir, None, &|| false).unwrap_err();
         assert!(format!("{e:#}").contains("hot tx record"), "{e:#}");
         let (ctx, _) = client(dir.path(), &hot);
@@ -2209,6 +2262,14 @@ pub(crate) mod tests {
         until("the balance seed", || {
             assert!(!task.is_finished(), "run ended on the fill error");
             crate::seed::seeded(&hot.ro().unwrap()).unwrap()
+        })
+        .await;
+        // D1: `run` also runs the receivers pass once (here: nothing stored below the cutoff).
+        until("the receivers pass", || {
+            let txn = hot.ro().unwrap();
+            txn.meta(balances::meta::BALANCES_SEED_RECEIVERS)
+                .unwrap()
+                .is_some()
         })
         .await;
         assert!(pending() > 0, "the fill cannot have completed");
