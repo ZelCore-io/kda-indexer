@@ -202,6 +202,26 @@ pub fn int_param(p: &Params, name: &str) -> Result<Option<i128>, Response> {
     Ok(Some(if v.starts_with('-') { -n } else { n }))
 }
 
+/// A `chain` parameter: chainweb-data reads it as a 64-bit `Int`, so a whole number past
+/// i64 is a 400 (servant's bounds message); any other whole number parses (and is no chain,
+/// for the caller to answer empty).
+#[allow(clippy::result_large_err)] // the Err is the finished answer
+pub fn chain_param(p: &Params) -> Result<Option<i128>, Response> {
+    let n = int_param(p, "chain")?;
+    match n {
+        Some(c) if i64::try_from(c).is_err() => Err(text(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Error parsing query parameter chain failed: out of bounds: `{}' (should be between {} and {})",
+                p.get("chain").unwrap_or_default(),
+                i64::MIN,
+                i64::MAX
+            ),
+        )),
+        n => Ok(n),
+    }
+}
+
 /// `Chainweb-Execution-Strategy`: `Bounded` / `Unbounded` accepted (and ignored), other
 /// values refused as chainweb-data does.
 #[allow(clippy::result_large_err)] // the Err is the finished answer

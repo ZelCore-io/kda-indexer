@@ -869,3 +869,32 @@ async fn transaction_minimum_depth_outside_1_to_100_is_refused_as_stock() {
         }
     }
 }
+
+/// Suite run 4: an integer id beyond i64 answers 200 with `null`, never a 500 (stock:
+/// `node: null`). A boolean id is still a coercion error.
+#[tokio::test]
+async fn an_integer_id_beyond_i64_is_a_200_null() {
+    let f = fixture();
+    let q = "query($id: ID!, $ids: [ID!]!) { node(id: $id) { id } nodes(ids: $ids) { id } }";
+    for id in [
+        json!(9_223_372_036_854_775_808u64),
+        json!(u64::MAX),
+        json!(1e30),
+    ] {
+        let (s, v, _) = post(
+            &f,
+            json!({"query": q, "variables": {"id": id, "ids": [id]}}).to_string(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{id}: {v}");
+        assert_eq!(v["data"]["node"], Value::Null, "{id}: {v}");
+        assert_eq!(v["data"]["nodes"], json!([null]), "{id}: {v}");
+        assert!(v.get("errors").is_none(), "{id}: {v}");
+    }
+    let (s, _, _) = post(
+        &f,
+        json!({"query": q, "variables": {"id": true, "ids": []}}).to_string(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+}

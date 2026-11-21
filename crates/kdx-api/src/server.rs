@@ -1311,4 +1311,55 @@ pub(crate) mod tests {
         let resp = get("/txs/account/k:alice?limit=10000").await.unwrap();
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
     }
+
+    /// Suite run 4: `/txs/account?chain=` beyond an i64 is chainweb-data's 400 (its `chain`
+    /// is a 64-bit `Int`); a whole number that is no chain stays an empty page.
+    #[tokio::test]
+    async fn account_chain_beyond_i64_is_a_400() {
+        use tower::ServiceExt;
+        let (_d, store) = crate::testutil::store();
+        let st = Api::new(store, settings(2), TipWatch::default()).state();
+        let search = crate::search::SearchCtx::new(crate::compat::SearchSettings::default(), None);
+        let app = crate::compat::router(search)
+            .layer(middleware::from_fn_with_state(st.clone(), guard))
+            .with_state(st.clone());
+        let get = |uri: &str| {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            app.clone().oneshot(req)
+        };
+        let body = |r: Response| async move {
+            let s = r.status();
+            let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            (s, String::from_utf8_lossy(&b).into_owned())
+        };
+        for chain in [
+            "9223372036854775808",
+            "-9223372036854775809",
+            "99999999999999999999999999999999999999999",
+        ] {
+            let (s, b) = body(
+                get(&format!(
+                    "/txs/account/k:alice?chain={chain}&limit=2&offset=10000"
+                ))
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{chain}: {b}");
+            assert!(
+                b.starts_with("Error parsing query parameter chain failed"),
+                "{chain}: {b}"
+            );
+        }
+        for chain in ["9223372036854775807", "-9223372036854775808", "20", "-1"] {
+            let (s, b) = body(
+                get(&format!("/txs/account/k:alice?chain={chain}"))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{chain}: {b}");
+            assert_eq!(b, "[]", "{chain}");
+        }
+    }
 }

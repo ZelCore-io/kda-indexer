@@ -560,6 +560,7 @@ pub async fn fungible_chain_accounts(
         None | Some([]) => None,
         Some(ids) => Some(chain_list(ids)?),
     };
+    let order = chains.clone();
     let rows = gql(ctx)
         .state()?
         .read({
@@ -568,6 +569,24 @@ pub async fn fungible_chain_accounts(
         })
         .await
         .map_err(from_api)?;
+    // The rows come in the order of the asked chains (stock's order), each chain once.
+    let rows = match order {
+        None => rows,
+        Some(order) => {
+            let mut rows: Vec<Option<ChainRow>> = rows.into_iter().map(Some).collect();
+            let mut out = Vec::with_capacity(rows.len());
+            for c in order {
+                if let Some(row) = rows
+                    .iter_mut()
+                    .find(|r| r.as_ref().is_some_and(|r| r.chain == c))
+                    .and_then(Option::take)
+                {
+                    out.push(row);
+                }
+            }
+            out
+        }
+    };
     Ok(rows
         .into_iter()
         .map(|row| FungibleChainAccount {

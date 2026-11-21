@@ -18,7 +18,7 @@ use serde_json::Value;
 use super::schemas::{ExecutionStrategy, LimitErrors, PagingParams, TransferDetail};
 use super::shapes::{self, Ev, Transfer};
 use super::{
-    check_strategy, collect_page, int_param, page_response, paging, resume_exhausted, resume_max,
+    chain_param, check_strategy, collect_page, page_response, paging, resume_exhausted, resume_max,
     Candidates, Page, Paging, Params, RowSource,
 };
 use crate::server::ApiState;
@@ -166,7 +166,7 @@ fn page(
 /// descending, request key descending, event index ascending), the rows of `token` (default
 /// `coin`) with the account on either side. A transfer to oneself is one row. Pages carry
 /// `Chainweb-Next` when there is more. Genesis transactions are hidden; miner rewards are
-/// listed. A chain id outside 0..=19, an unknown account or token answers an empty array.
+/// listed. A chain id outside 0..=19, an unknown account or token answers an empty array; a `chain` past a 64-bit integer is a 400.
 /// `amount` is the shortest exact decimal text, so it differs from chainweb-data's raw
 /// text (`"138000"` for `"138000.000000000000"`) while being the same decimal.
 #[utoipa::path(
@@ -177,7 +177,7 @@ fn page(
     params(
         ("account" = String, Path, description = "Account name, 1 to 256 bytes."),
         ("token" = Option<String>, Query, description = "Fungible module of the transfers (default `coin`).", example = "coin"),
-        ("chain" = Option<i64>, Query, description = "Only this chain (0 to 19); another value answers an empty page."),
+        ("chain" = Option<i64>, Query, description = "Only this chain (0 to 19); another whole number answers an empty page, a number beyond a 64-bit integer is a 400."),
         PagingParams,
         ("Chainweb-Execution-Strategy" = Option<ExecutionStrategy>, Header, description = "Accepted and ignored. Any other value is `400 Unknown Chainweb-Execution-Strategy: ...`."),
     ),
@@ -195,7 +195,7 @@ pub async fn handler(
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
     let p = Params::new(q);
-    let chain = match int_param(&p, "chain") {
+    let chain = match chain_param(&p) {
         Ok(c) => c,
         Err(r) => return r,
     };

@@ -1,10 +1,11 @@
 //! The `Query` root. Root fields not served yet answer `NOT_SUPPORTED` (Tasks 3–5 fill them
 //! in); `pactQuery` and `gasLimitEstimate` stay `NOT_SUPPORTED` (GQ-3, Q9).
 
-use async_graphql::{Context, InputObject, Object, Result, SimpleObject, ID};
+use async_graphql::{Context, InputObject, Object, Result, SimpleObject};
 
 use crate::connection::PageArgs;
 use crate::scalars::{BigInt, Decimal};
+use crate::types::node::AnyId;
 use crate::types::{
     default_chain_ids, unserved, Block, FungibleAccount, FungibleChainAccount, GraphConfiguration,
     NetworkInfo, Node, NonFungibleAccount, NonFungibleChainAccount, QueryBlocksFromDepthConnection,
@@ -305,11 +306,11 @@ impl Query {
         crate::types::network::network_info(ctx).await
     }
 
-    async fn node(&self, ctx: &Context<'_>, id: ID) -> Result<Option<Sel<Node>>> {
-        Ok(crate::types::node::node(ctx, &id).await?.map(Sel))
+    async fn node(&self, ctx: &Context<'_>, id: AnyId) -> Result<Option<Sel<Node>>> {
+        Ok(crate::types::node::node(ctx, &id.0).await?.map(Sel))
     }
 
-    async fn nodes(&self, ctx: &Context<'_>, ids: Vec<ID>) -> Result<Vec<Option<Sel<Node>>>> {
+    async fn nodes(&self, ctx: &Context<'_>, ids: Vec<AnyId>) -> Result<Vec<Option<Sel<Node>>>> {
         let found = crate::types::node::nodes(ctx, &ids).await?;
         Ok(found.into_iter().map(|n| n.map(Sel)).collect())
     }

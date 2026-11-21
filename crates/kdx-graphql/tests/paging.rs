@@ -1524,3 +1524,91 @@ async fn fungible_name_is_trimmed() {
         );
     }
 }
+
+/// Suite run 4: `fungibleChainAccounts` lists its rows in the order of the requested
+/// `chainIds` (stock's order), not ascending by chain; a repeated chain lists once, at its
+/// first place.
+#[tokio::test]
+async fn fungible_chain_accounts_follow_the_requested_chain_order() {
+    let fx = fixture();
+    let q = "query($a: String!, $c: [String!]) { fungibleChainAccounts(accountName: $a, chainIds: $c) { chainId } }";
+    for (c, want) in [
+        (json!(["1", "0"]), vec!["1", "0"]),
+        (json!(["0", "1"]), vec!["0", "1"]),
+        (json!(["1", "7", "0", "1"]), vec!["1", "0"]),
+    ] {
+        let v = run_vars(&fx.schema, q, json!({"a": ALICE, "c": c})).await;
+        assert!(v.get("errors").is_none(), "{c}: {v}");
+        assert_eq!(chain_ids_of(&v), want, "{c}: {v}");
+    }
+}
+
+/// Suite run 4: an integer id beyond i64 is an unreadable id like any other: `null` for
+/// `node` and a `null` entry in `nodes`, with no error (stock answers 200 `null`).
+#[tokio::test]
+async fn an_integer_id_beyond_i64_reads_as_null() {
+    let fx = fixture();
+    let big = serde_json::Number::from(9_223_372_036_854_775_808u64);
+    let q = "query($id: ID!, $ids: [ID!]!) { node(id: $id) { __typename } nodes(ids: $ids) { __typename } }";
+    for id in [
+        json!(big),
+        json!(u64::MAX),
+        json!(-5),
+        json!("9223372036854775808"),
+    ] {
+        let vars = json!({"id": id, "ids": [id, "x"]});
+        let v = run_vars(&fx.schema, q, vars.clone()).await;
+        assert!(v.get("errors").is_none(), "{vars}: {v}");
+        assert_eq!(v["data"]["node"], Value::Null, "{vars}: {v}");
+        assert_eq!(v["data"]["nodes"], json!([null, null]), "{vars}: {v}");
+    }
+    let v = run_vars(
+        &fx.schema,
+        "{ node(id: 9223372036854775808) { id } nodes(ids: [9223372036854775808, 3]) { id } }",
+        json!({}),
+    )
+    .await;
+    assert!(v.get("errors").is_none(), "{v}");
+    assert_eq!(v["data"]["nodes"], json!([null, null]), "{v}");
+    // Not an integer (a fraction, a bool): still refused.
+    for id in [json!(1.5), json!(true)] {
+        let v = run_vars(&fx.schema, q, json!({"id": id, "ids": []})).await;
+        assert!(v.get("errors").is_some(), "{id}: {v}");
+    }
+}
+
+/// Suite run 4 (decided: ours stays): an inverted range, `startHeight` = `endHeight` + 1,
+/// is an empty list on every chain, not an error (stock answers INTERNAL_SERVER_ERROR
+/// "Start height cannot be greater than end height").
+#[tokio::test]
+async fn blocks_from_height_with_an_inverted_range_is_empty() {
+    let fx = fixture();
+    for (start, end) in [(7, 6), (11, 10), (1, 0)] {
+        for chains in ["", ", chainIds: [\"0\"]", ", chainIds: [\"0\", \"1\"]"] {
+            let q = format!(
+                "{{ blocksFromHeight(startHeight: {start}, endHeight: {end}{chains}) {{ edges {{ node {{ height }} }} }} }}"
+            );
+            let v = run_vars(&fx.schema, &q, json!({})).await;
+            assert!(v.get("errors").is_none(), "{q}: {v}");
+            assert_eq!(
+                v["data"]["blocksFromHeight"]["edges"],
+                json!([]),
+                "{q}: {v}"
+            );
+        }
+    }
+    // The same heights, not inverted, hold a block (the fixture has chain 0 at height 6).
+    let v = run_vars(
+        &fx.schema,
+        "{ blocksFromHeight(startHeight: 6, endHeight: 6, chainIds: [\"0\"]) { edges { node { height } } } }",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        v["data"]["blocksFromHeight"]["edges"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+}
