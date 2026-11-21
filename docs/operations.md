@@ -539,6 +539,14 @@ with `[balances] enabled = false`.
 - **Marks**: every tail block marks the balances it may change (`TRANSFER` sides, every account
   of its events for `coin`), and a reorg's undo marks the unwound blocks' rows again. A row
   that is dirty is served with `stale: true` until it is re-read.
+- **Branch check**: an answer clears a row's mark only when it was read on the block the
+  indexer holds at that height: the answer's `metaData.prevBlockHash` must equal the stored
+  header's hash at its `as_of`. Right after a quick reorg flip-and-back the node can still
+  answer from the orphan's state at the same height; such an answer (or one read above the
+  indexer's tail) is stored flagged unverified (served `stale: true`) and the row stays queued
+  at the back. An "absent" answer carries no block metadata and cannot be checked: a row the
+  node reports absent from an orphan's state is stored as absent until the account's next
+  posting on that chain or `reconcile-balances --all`.
 - **Errors**: a node error (timeout, connection, HTTP status) keeps the row dirty and moves it
   to the back of the queue; the reconciler backs off (up to 60 s) only when node errors are at
   least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,

@@ -497,7 +497,7 @@ pub async fn nft_check(
                 .get_balance(*chain, &ledger, &row.token_id, &acct)
                 .await
             {
-                Ok(kdx_node::Local::Found { value, height }) => {
+                Ok(kdx_node::Local::Found { value, height, .. }) => {
                     let eq = same_decimal(&value, &row.balance);
                     item["node_balance"] = json!(value);
                     item["node_height"] = json!(height);

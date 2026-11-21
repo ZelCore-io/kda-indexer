@@ -19,7 +19,8 @@
 //!   A mark keeps the highest height and takes the writing txn's id as its `seq`; the
 //!   reconciler deletes it only when it is still the exact mark it read and not above the
 //!   answer's `as_of` (SR-1, I-5, M-3).
-//! - `unverified`: the row's last re-read failed or was parked; the route serves it `stale`.
+//! - `unverified`: the row's last re-read failed or was parked, or its answer was read on a block
+//!   other than our header at its `as_of` (another branch, D2); the route serves it `stale`.
 //! - `holders` counts rows with a balance above zero; it is approximate (reorgs, rows not yet
 //!   reconciled).
 

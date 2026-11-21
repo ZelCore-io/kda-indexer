@@ -15,8 +15,11 @@
 //! - Calls pass a token bucket (`rps`) and a concurrency cap of their own, then the node
 //!   client's limits. Nothing is ever signed or sent to `/send`.
 //!
-//! Answers: a success gives the value and the tip height it was read at
-//! (`metaData.blockHeight − 1`). A failure whose message says
+//! Answers: a success gives the value, the tip height it was read at
+//! (`metaData.blockHeight − 1`) and that tip's block hash (`metaData.prevBlockHash`: the
+//! pending block's parent), which says which branch the state was read on (D2: after a quick
+//! reorg flip-and-back the node can still answer from the orphan's state at the same height).
+//! `/local` sends no hash of the pending block itself. A failure whose message says
 //! the row or keyset does not exist is [`Local::Absent`] (the node sends no `metaData` then).
 //! Any other Pact failure, and any delivered answer that cannot be used, is
 //! [`LocalError::Failure`]; only transport and HTTP errors are [`LocalError::Node`]. Neither is
@@ -50,9 +53,15 @@ pub struct LocalOpts {
 /// A `/local` answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Local<T> {
-    /// The value, and the height of the block whose state the node read: its tip,
-    /// `metaData.blockHeight − 1` (`blockHeight` is the pending block's height).
-    Found { value: T, height: u64 },
+    /// The value, and the block whose state the node read: its tip, at height
+    /// `metaData.blockHeight − 1` (`blockHeight` is the pending block's height), with hash
+    /// `metaData.prevBlockHash` (base64url as the node sent it; `None` when the answer has
+    /// none). The hash tells which branch the height belongs to (D2).
+    Found {
+        value: T,
+        height: u64,
+        prev_hash: Option<String>,
+    },
     /// The node has no such row or keyset.
     Absent,
 }
@@ -263,35 +272,51 @@ impl LocalClient {
             }
             Err(e) => return Err(e.into()),
         };
-        let result = r.get("result").ok_or_else(|| invalid("no result"))?;
-        match result.get("status").and_then(Value::as_str) {
-            Some("success") => {
-                // `metaData.blockHeight` is the height of the block the node would build
-                // next (its tip + 1, measured on mainnet01); the state read is the tip's.
-                let height = r
-                    .pointer("/metaData/blockHeight")
-                    .and_then(Value::as_u64)
-                    .and_then(|h| h.checked_sub(1))
-                    .ok_or_else(|| invalid("no metaData.blockHeight"))?;
-                let value = result.get("data").cloned().unwrap_or(Value::Null);
-                Ok(Local::Found { value, height })
-            }
-            Some("failure") => {
-                let msg = result
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if is_absent_message(msg) {
-                    Ok(Local::Absent)
-                } else {
-                    let cut: String = msg.chars().take(200).collect();
-                    Err(LocalError::Failure(cut))
-                }
-            }
-            _ => Err(invalid("result has no status")),
-        }
+        classify(&r)
     }
+}
 
+/// Classify one `/local` answer body.
+fn classify(r: &Value) -> LocalResult<Value> {
+    let result = r.get("result").ok_or_else(|| invalid("no result"))?;
+    match result.get("status").and_then(Value::as_str) {
+        Some("success") => {
+            // `metaData.blockHeight` is the height of the block the node would build
+            // next (its tip + 1, measured on mainnet01); the state read is the tip's,
+            // and `prevBlockHash` is the tip's hash.
+            let height = r
+                .pointer("/metaData/blockHeight")
+                .and_then(Value::as_u64)
+                .and_then(|h| h.checked_sub(1))
+                .ok_or_else(|| invalid("no metaData.blockHeight"))?;
+            let prev_hash = r
+                .pointer("/metaData/prevBlockHash")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let value = result.get("data").cloned().unwrap_or(Value::Null);
+            Ok(Local::Found {
+                value,
+                height,
+                prev_hash,
+            })
+        }
+        Some("failure") => {
+            let msg = result
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if is_absent_message(msg) {
+                Ok(Local::Absent)
+            } else {
+                let cut: String = msg.chars().take(200).collect();
+                Err(LocalError::Failure(cut))
+            }
+        }
+        _ => Err(invalid("result has no status")),
+    }
+}
+
+impl LocalClient {
     /// `({module}.details (read-msg "a"))` with `data {"a": account}`.
     pub async fn details(&self, chain: u8, module: &str, account: &str) -> LocalResult<Details> {
         self.details_timed(chain, module, account).await.0
@@ -317,7 +342,11 @@ fn details_of(r: Local<Value>) -> LocalResult<Details> {
     {
         match r {
             Local::Absent => Ok(Local::Absent),
-            Local::Found { value, height } => {
+            Local::Found {
+                value,
+                height,
+                prev_hash,
+            } => {
                 let balance = value
                     .get("balance")
                     .and_then(decimal_text)
@@ -326,6 +355,7 @@ fn details_of(r: Local<Value>) -> LocalResult<Details> {
                 Ok(Local::Found {
                     value: Details { balance, guard },
                     height,
+                    prev_hash,
                 })
             }
         }
@@ -346,8 +376,16 @@ impl LocalClient {
             )
             .await?
         {
-            Local::Found { value, height } => match value.as_bool() {
-                Some(b) => Ok(Local::Found { value: b, height }),
+            Local::Found {
+                value,
+                height,
+                prev_hash,
+            } => match value.as_bool() {
+                Some(b) => Ok(Local::Found {
+                    value: b,
+                    height,
+                    prev_hash,
+                }),
                 None => Err(invalid("describe-module: not a boolean")),
             },
             Local::Absent => Ok(Local::Absent),
@@ -383,9 +421,14 @@ impl LocalClient {
             .await?
         {
             Local::Absent => Ok(Local::Absent),
-            Local::Found { value, height } => Ok(Local::Found {
+            Local::Found {
+                value,
+                height,
+                prev_hash,
+            } => Ok(Local::Found {
                 value: decimal_text(&value).ok_or_else(|| invalid("get-balance: not a decimal"))?,
                 height,
+                prev_hash,
             }),
         }
     }
@@ -435,9 +478,13 @@ fn echoes(v: &Value, field: &str, want: &str) -> bool {
 }
 
 fn nft_guard_of(r: Local<Value>, token_id: &str, account: &str) -> LocalResult<String> {
-    let (value, height) = match r {
+    let (value, height, prev_hash) = match r {
         Local::Absent => return Ok(Local::Absent),
-        Local::Found { value, height } => (value, height),
+        Local::Found {
+            value,
+            height,
+            prev_hash,
+        } => (value, height, prev_hash),
     };
     if !echoes(&value, "id", token_id) || !echoes(&value, "account", account) {
         return Err(invalid("nft details: another token or account"));
@@ -452,13 +499,18 @@ fn nft_guard_of(r: Local<Value>, token_id: &str, account: &str) -> LocalResult<S
     Ok(Local::Found {
         value: guard,
         height,
+        prev_hash,
     })
 }
 
 fn token_info_of(r: Local<Value>, token_id: &str) -> LocalResult<TokenInfo> {
-    let (value, height) = match r {
+    let (value, height, prev_hash) = match r {
         Local::Absent => return Ok(Local::Absent),
-        Local::Found { value, height } => (value, height),
+        Local::Found {
+            value,
+            height,
+            prev_hash,
+        } => (value, height, prev_hash),
     };
     if !echoes(&value, "id", token_id) {
         return Err(invalid("token info: another token"));
@@ -486,6 +538,7 @@ fn token_info_of(r: Local<Value>, token_id: &str) -> LocalResult<TokenInfo> {
             uri,
         },
         height,
+        prev_hash,
     })
 }
 
@@ -509,6 +562,7 @@ mod tests {
         let found = |v: Value| Local::Found {
             value: v,
             height: 9,
+            prev_hash: Some("P".into()),
         };
         let g = json!({"keys": ["ab"], "pred": "keys-all"});
         assert_eq!(
@@ -520,7 +574,8 @@ mod tests {
             .unwrap(),
             Local::Found {
                 value: r#"{"keys":["ab"],"pred":"keys-all"}"#.into(),
-                height: 9
+                height: 9,
+                prev_hash: Some("P".into()),
             }
         );
         for bad in [
@@ -552,7 +607,8 @@ mod tests {
                     supply: "1.0".into(),
                     uri: "ipfs://x".into()
                 },
-                height: 9
+                height: 9,
+                prev_hash: Some("P".into()),
             }
         );
         assert!(token_info_of(
@@ -647,8 +703,37 @@ mod tests {
         assert!(details_of(Local::Found {
             value: json!({"balance": "lots", "guard": null}),
             height: 1,
+            prev_hash: None,
         })
         .is_err());
+    }
+
+    /// D2: a success carries the tip's height and hash (`prevBlockHash`); an answer without
+    /// the hash still reads (`None`), and an absent answer carries neither.
+    #[test]
+    fn a_success_names_the_block_it_read() {
+        let ok =
+            |meta: Value| json!({"result": {"status": "success", "data": 1}, "metaData": meta});
+        assert_eq!(
+            classify(&ok(json!({"blockHeight": 11, "prevBlockHash": "H10"}))).unwrap(),
+            Local::Found {
+                value: json!(1),
+                height: 10,
+                prev_hash: Some("H10".into()),
+            }
+        );
+        assert!(matches!(
+            classify(&ok(json!({"blockHeight": 11}))).unwrap(),
+            Local::Found {
+                height: 10,
+                prev_hash: None,
+                ..
+            }
+        ));
+        assert!(classify(&ok(json!({"prevBlockHash": "H10"}))).is_err());
+        let absent = json!({"result": {"status": "failure",
+            "error": {"message": "No value found in table coin_coin-table for key: x"}}});
+        assert_eq!(classify(&absent).unwrap(), Local::Absent);
     }
 
     #[test]

@@ -2247,7 +2247,7 @@ impl Ctx {
             });
             let b = local.details(chain, token, &account).await;
             let b_text = match &b {
-                Ok(kdx_node::Local::Found { value, height }) => {
+                Ok(kdx_node::Local::Found { value, height, .. }) => {
                     format!("{{\"balance\":{:?},\"height\":{height}}}", value.balance)
                 }
                 Ok(kdx_node::Local::Absent) => "absent".to_string(),
@@ -3757,7 +3757,7 @@ fn balance_diff(
         });
     };
     match b {
-        kdx_node::Local::Found { value, height } => match row {
+        kdx_node::Local::Found { value, height, .. } => match row {
             None => {
                 push("/row", None, Some(Value::String(value.balance.clone())));
                 uncertain = true;
@@ -3865,6 +3865,7 @@ mod tests {
                 guard: guard.clone(),
             },
             height,
+            prev_hash: None,
         };
         let row = |bal: &str, as_of: u64, stale: bool| {
             serde_json::json!({"module": "coin", "chain": 1, "balance": bal,
@@ -4057,6 +4058,7 @@ mod tests {
                 guard: guard.clone(),
             },
             height,
+            prev_hash: None,
         };
         let ours = |module: &str, bal: &str, as_of: u64| {
             serde_json::json!({"module": module, "chain": 12, "balance": bal,

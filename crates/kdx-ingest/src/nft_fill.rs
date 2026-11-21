@@ -262,7 +262,7 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
         .get_balance(it.chain, ledger, &it.mark.token_id, acct)
         .await
     {
-        Ok(Local::Found { value, height }) => {
+        Ok(Local::Found { value, height, .. }) => {
             Outcome::Found(value, u32::try_from(height).unwrap_or(u32::MAX))
         }
         Ok(Local::Absent) => Outcome::Absent,

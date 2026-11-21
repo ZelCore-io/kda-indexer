@@ -182,7 +182,7 @@ async fn call(local: &LocalClient, p: &Planned) -> Outcome {
             .nft_guard(p.chain, &p.ledger, &p.token_id, account)
             .await
             .map(|r| match r {
-                Local::Found { value, height } => {
+                Local::Found { value, height, .. } => {
                     Outcome::Guard(value, u32::try_from(height).unwrap_or(u32::MAX))
                 }
                 Local::Absent => Outcome::Absent,
@@ -191,7 +191,7 @@ async fn call(local: &LocalClient, p: &Planned) -> Outcome {
             .nft_token_info(p.chain, &p.ledger, &p.token_id)
             .await
             .map(|r| match r {
-                Local::Found { value, height } => {
+                Local::Found { value, height, .. } => {
                     Outcome::Info(value, u32::try_from(height).unwrap_or(u32::MAX))
                 }
                 Local::Absent => Outcome::Absent,

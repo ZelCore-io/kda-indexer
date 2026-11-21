@@ -717,7 +717,7 @@ reorg marks the affected balance rows dirty instead.
 
 | Table | Key | Value |
 |---|---|---|
-| `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node), balance text as the node printed it, guard hash [16], as_of u32 (the node tip the `/local` answer read: `metaData.blockHeight − 1`, since the node reports the pending block's height; for an absent row, the chain's tail height at the call), reconciled_at u32 (unix s) |
+| `Balances` | AccountId u32, ModuleId u32, chain u8 | flags u8 (b0: absent at the node, b1: unverified: the last re-read failed, was parked, or was read on another branch than the stored header at `as_of`), balance text as the node printed it, guard hash [16], as_of u32 (the node tip the `/local` answer read: `metaData.blockHeight − 1`, since the node reports the pending block's height; for an absent row, the chain's tail height at the call), reconciled_at u32 (unix s) |
 | `BalanceDirty` | same | marked_height u32 (highest block height that marked it; 0 from the seed) |
 | `Guards` | guard hash [16] = blake2b-128 of the guard JSON as returned; a resolved keyset reference under blake2b-128 of `keysetref:{chain}:{name}` | guard (or keyset) JSON bytes |
 | `KeyAccounts` | blake2b-128 of the public key [16], AccountId u32 | empty |
