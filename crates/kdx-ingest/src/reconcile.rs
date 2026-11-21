@@ -27,8 +27,26 @@
 //!   absent answer carries
 //!   no height, so its `as_of` is the chain's tail height read before the call (the node is at
 //!   or past it).
+//! - Branch check (D2): a height alone does not say which branch the node read. Right after a
+//!   quick reorg flip-and-back, `/local` can still answer from the orphan's state at the same
+//!   height. A success therefore clears its mark only when its `metaData.prevBlockHash` (the
+//!   hash of the tip it read) equals our stored header at `as_of` on that chain. Otherwise
+//!   (another branch, no hash, or no header of ours at that height because the node is ahead
+//!   of our tail) the row is written flagged `unverified` (served `stale: true`) and the mark
+//!   moves up to the tail height, back of the queue, with no retry count
+//!   (`BatchStats::other_branch`, `result="other_branch"`). When we hold another header at
+//!   that height (a definite other branch) and already have a row, the row is kept (balance,
+//!   guard, key index) and only flagged unverified (L1). A batch whose answers were all
+//!   off-branch pauses the loop [`OFF_BRANCH_PAUSE`] ([`off_branch_pause`]); [`BranchWatch`]
+//!   WARNs on answers without `prevBlockHash` and on an off-branch majority over a window.
+//! - Residual race (D2): an `Absent` answer carries no `metaData`, so its branch cannot be
+//!   checked. If the node answers absent from an orphan's state (a row that exists only on our
+//!   branch), the row is stored absent and its mark cleared as before; only the account's next
+//!   posting on that chain, or `reconcile-balances --all`, re-reads it. Reorgs are logged, not
+//!   kept in the store, so absent answers right after a reorg are not re-queued.
 //! - Outcomes (`kdx_balance_reconcile_total{result}`):
-//!   - `ok`, `absent`: row written.
+//!   - `ok`, `absent`: row written (`ok` from another branch: written unverified, still dirty).
+//!   - `other_branch`, counted in addition to `ok`: the answer was not read on our branch.
 //!   - `skipped`: B-1 refused the call (module name, name length); the key is dropped.
 //!   - `error`, Pact failure or unusable answer (the node evaluated the code and it failed,
 //!     e.g. a module with no `details`; or the answer is not JSON, over the body cap, or has no
@@ -55,10 +73,12 @@ use kdx_hot::balances::{
     self, clear_mark, guard_hash, guard_keys, key_account_key, key_hash, ref_hash, set_unverified,
     stored_guard_keys, BalanceRow, GuardKeys, Mark, TokenRow, KIND_FUNGIBLE, KIND_NOT_FUNGIBLE,
 };
+use kdx_hot::tables::block_key;
 use kdx_hot::{checkpoint, HotStore, RwTxn, Stage, Table, Txn};
 use kdx_node::local::{Details, Local, LocalClient, LocalError, LocalOpts};
 use kdx_node::NodeClient;
-use kdx_types::DictKind;
+use kdx_types::record::decode_block;
+use kdx_types::{DictKind, Hash32};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -274,8 +294,19 @@ struct Item {
     skip: Option<&'static str>,
 }
 
+/// A `details` success.
+struct Answer {
+    details: Details,
+    /// The tip height the node read.
+    as_of: u32,
+    /// The hash of the block at `as_of` the node read (`metaData.prevBlockHash`), D2.
+    prev_hash: Option<String>,
+    /// A keyset reference resolved with `describe-keyset`: (name, keyset or none).
+    resolved: Option<(String, Option<Value>)>,
+}
+
 enum Outcome {
-    Found(Details, u32, Option<(String, Option<Value>)>),
+    Found(Box<Answer>),
     Absent(u32),
     Skipped,
     Failure,
@@ -327,7 +358,11 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
     };
     let (r, secs) = local.details_timed(it.chain, module, acct).await;
     let out = match r {
-        Ok(Local::Found { value, height }) => {
+        Ok(Local::Found {
+            value,
+            height,
+            prev_hash,
+        }) => {
             let as_of = u32::try_from(height).unwrap_or(u32::MAX);
             let resolved = match guard_keys(&value.guard) {
                 GuardKeys::Ref(name) if it.trusted => {
@@ -342,7 +377,12 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
                 }
                 _ => None,
             };
-            Outcome::Found(value, as_of, resolved)
+            Outcome::Found(Box::new(Answer {
+                details: value,
+                as_of,
+                prev_hash,
+                resolved,
+            }))
         }
         Ok(Local::Absent) => Outcome::Absent(it.tail),
         Err(LocalError::Skipped(_)) => Outcome::Skipped,
@@ -492,12 +532,46 @@ fn write_row(txn: &mut RwTxn<'_>, it: &Item, new: BalanceRow, coin: Option<u32>)
 }
 
 /// Delete the dirty key when it still holds the mark read at refill and that mark is not above
-/// `as_of` (SR-1, M-3).
+/// `as_of` (SR-1, M-3). Only for an answer read on our branch ([`branch_of`]); an `Absent`
+/// answer has no block identity to check (see the module docs).
 fn clear_if_covered(txn: &mut RwTxn<'_>, it: &Item, as_of: u32) -> Result<()> {
     if it.d.mark.height <= as_of {
         clear_mark(txn, it.d.table(), &it.d.key, it.d.mark)?;
     }
     Ok(())
+}
+
+/// D2: where an answer was read, relative to the block we hold at its height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Branch {
+    /// `prevBlockHash` equals our stored header at `as_of`: the node read our branch.
+    Ours,
+    /// We hold a header at `as_of` and it has another hash: the node read another branch.
+    Other,
+    /// No hash, an unreadable one, or no header of ours at `as_of` (the node is ahead of our
+    /// tail): the answer cannot be checked.
+    Unknown,
+}
+
+/// D2: whether the answer read the block we hold at `as_of` on its chain: its `prevBlockHash`
+/// (the hash of the node's tip, whose state `/local` read) against our stored header there. A
+/// height alone does not say which branch it is on: right after a quick reorg flip-and-back the
+/// node can still answer from the orphan's state at the same height. Shared by the fungible
+/// reconcile and the NFT fill (`nft_fill`).
+pub(crate) fn branch_of(
+    txn: &impl Txn,
+    chain: u8,
+    as_of: u32,
+    prev_hash: Option<&str>,
+) -> Result<Branch> {
+    let Some(prev) = prev_hash.and_then(|h| Hash32::from_b64url(h).ok()) else {
+        return Ok(Branch::Unknown);
+    };
+    Ok(match txn.get(Table::Headers, &block_key(chain, as_of))? {
+        Some(v) if decode_block(&v).context("hot header record")?.hash == prev => Branch::Ours,
+        Some(_) => Branch::Other,
+        None => Branch::Unknown,
+    })
 }
 
 /// Drop the mark of a call that gave no usable answer, only when it is still the mark read at
@@ -512,6 +586,11 @@ fn drop_mark(txn: &mut RwTxn<'_>, it: &Item) -> Result<()> {
 #[derive(Debug, Default, Clone)]
 pub struct BatchStats {
     pub ok: u64,
+    /// Of `ok`: answers read on a block other than the header we hold at their height (another
+    /// branch, or above our tail). Stored unverified; the key stays dirty (D2).
+    pub other_branch: u64,
+    /// Of `other_branch`: answers with no `metaData.prevBlockHash` at all.
+    pub no_hash: u64,
     pub absent: u64,
     pub skipped: u64,
     pub failures: u64,
@@ -539,6 +618,71 @@ impl BatchStats {
 /// queue, and [`MAX_KEY_RETRIES`] parks them), and must not slow every other key.
 pub fn backs_off(st: &BatchStats) -> bool {
     st.node_errors > 0 && st.node_errors * 2 >= st.calls()
+}
+
+/// The pause before the next batch when every answer of this one was read off our branch.
+pub const OFF_BRANCH_PAUSE: Duration = Duration::from_secs(2);
+
+/// M1 (D2 review): when every answer of a batch was read off our branch, wait
+/// [`OFF_BRANCH_PAUSE`] before the next batch instead of re-reading the same keys at once.
+pub fn off_branch_pause(st: &BatchStats) -> Option<Duration> {
+    (st.other_branch > 0 && st.other_branch == st.ok + st.absent).then_some(OFF_BRANCH_PAUSE)
+}
+
+/// The window [`BranchWatch`] judges off-branch answers over.
+pub const BRANCH_WINDOW: Duration = Duration::from_secs(60);
+/// The fewest `ok` answers in a window for [`BranchWatch`] to call off-branch answers dominant.
+pub const BRANCH_WARN_MIN: u64 = 50;
+
+/// What [`BranchWatch::note`] asks the loop to warn about.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BranchAlert {
+    /// Answers in this batch with no `prevBlockHash` (at most one warning per window).
+    pub no_hash: Option<u64>,
+    /// (off-branch, ok) in the window just ended, when off-branch answers were the majority.
+    pub dominant: Option<(u64, u64)>,
+}
+
+/// M1 (D2 review): watches off-branch answers over [`BRANCH_WINDOW`] windows. The caller
+/// passes the time, so tests drive it with made-up instants.
+#[derive(Debug, Default)]
+pub struct BranchWatch {
+    start: Option<Instant>,
+    ok: u64,
+    other: u64,
+    no_hash_warned: Option<Instant>,
+}
+
+impl BranchWatch {
+    /// Add one batch at `now`. A batch with answers lacking `prevBlockHash` alerts at once,
+    /// then at most once per window. When a window ends, it alerts if off-branch answers were
+    /// more than half of its `ok` answers and there were at least [`BRANCH_WARN_MIN`] of them;
+    /// then a new window starts.
+    pub fn note(&mut self, now: Instant, st: &BatchStats) -> BranchAlert {
+        let mut alert = BranchAlert::default();
+        if st.no_hash > 0
+            && self
+                .no_hash_warned
+                .is_none_or(|t| now.duration_since(t) >= BRANCH_WINDOW)
+        {
+            alert.no_hash = Some(st.no_hash);
+            self.no_hash_warned = Some(now);
+        }
+        let start = *self.start.get_or_insert(now);
+        self.ok += st.ok;
+        self.other += st.other_branch;
+        if now.duration_since(start) >= BRANCH_WINDOW {
+            if self.ok >= BRANCH_WARN_MIN && self.other * 2 > self.ok {
+                alert.dominant = Some((self.other, self.ok));
+            }
+            *self = BranchWatch {
+                start: Some(now),
+                no_hash_warned: self.no_hash_warned,
+                ..Default::default()
+            };
+        }
+        alert
+    }
 }
 
 /// Reconcile one batch of dirty keys.
@@ -664,29 +808,66 @@ pub async fn reconcile_batch(
                 kdx_metrics::get().balance_reconcile("capped", 0.0);
                 st.dropped += 1;
             }
-            Outcome::Found(d, as_of, resolved) => {
-                let gj = serde_json::to_vec(&d.guard)?;
-                let gh = guard_hash(&gj);
-                txn.insert(Table::Guards, &gh, &gj)?;
-                if let Some((name, ks)) = resolved {
-                    let rk = ref_hash(it.chain, &name);
-                    match ks {
-                        Some(ks) => txn.put(Table::Guards, &rk, &serde_json::to_vec(&ks)?)?,
-                        None => {
-                            txn.del(Table::Guards, &rk)?;
+            Outcome::Found(a) => {
+                let Answer {
+                    details: d,
+                    as_of,
+                    prev_hash,
+                    resolved,
+                } = *a;
+                let branch = branch_of(&txn, it.chain, as_of, prev_hash.as_deref())?;
+                let ours = branch == Branch::Ours;
+                // L1 (D2 review): an answer known to come from another branch does not replace
+                // a row we hold: the row (balance, guard, key index) stays and is only flagged
+                // unverified. With no row yet, or when the answer cannot be checked (no hash,
+                // node ahead of our tail), the answer is stored unverified.
+                let keep_old =
+                    branch == Branch::Other && txn.get(Table::Balances, &it.d.key)?.is_some();
+                if keep_old {
+                    set_unverified(&mut txn, &it.d.key)?;
+                } else {
+                    let gj = serde_json::to_vec(&d.guard)?;
+                    let gh = guard_hash(&gj);
+                    txn.insert(Table::Guards, &gh, &gj)?;
+                    if let Some((name, ks)) = resolved {
+                        let rk = ref_hash(it.chain, &name);
+                        match ks {
+                            Some(ks) => txn.put(Table::Guards, &rk, &serde_json::to_vec(&ks)?)?,
+                            None => {
+                                txn.del(Table::Guards, &rk)?;
+                            }
                         }
                     }
+                    let row = BalanceRow {
+                        absent: false,
+                        balance: d.balance,
+                        guard: gh,
+                        as_of,
+                        reconciled_at: now,
+                        unverified: !ours,
+                    };
+                    write_row(&mut txn, it, row, coin)?;
                 }
-                let row = BalanceRow {
-                    absent: false,
-                    balance: d.balance,
-                    guard: gh,
-                    as_of,
-                    reconciled_at: now,
-                    unverified: false,
-                };
-                write_row(&mut txn, it, row, coin)?;
-                clear_if_covered(&mut txn, it, as_of)?;
+                if ours {
+                    clear_if_covered(&mut txn, it, as_of)?;
+                } else {
+                    // D2: read on another branch (or above our tail). Served `stale`; the key
+                    // stays dirty and goes to the back of the queue, like a node error but
+                    // without a retry count (it is not the key's fault).
+                    tracing::debug!(
+                        chain = it.chain,
+                        as_of,
+                        prev_hash = prev_hash.as_deref().unwrap_or(""),
+                        ?branch,
+                        "details answer is not on our branch; kept dirty"
+                    );
+                    balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                    kdx_metrics::get().balance_reconcile("other_branch", 0.0);
+                    st.other_branch += 1;
+                    if prev_hash.is_none() {
+                        st.no_hash += 1;
+                    }
+                }
                 st.ok += 1;
                 st.answered.insert(it.module);
             }
@@ -929,6 +1110,7 @@ async fn run_with(
     let mut done = 0u64;
     let mut rate = 0.0f64;
     let mut last_log = Instant::now();
+    let mut watch = BranchWatch::default();
     loop {
         if stop.is_cancelled() {
             return Ok(());
@@ -974,7 +1156,8 @@ async fn run_with(
             kdx_metrics::get()
                 .balance_dirty_rows
                 .set(balances::dirty_count(&ctx.hot.ro()?)? as i64);
-            if nft.rows() > nft.node_errors || det.calls() > det.node_errors {
+            // Off-branch NFT answers (D2) are not progress either: no immediate re-loop.
+            if nft.rows() > nft.node_errors + nft.other_branch || det.calls() > det.node_errors {
                 continue;
             }
             tokio::select! {
@@ -1012,6 +1195,23 @@ async fn run_with(
         if !parked.is_empty() {
             park(&ctx.hot, &parked)?;
         }
+        let alert = watch.note(Instant::now(), &st);
+        if let Some(n) = alert.no_hash {
+            tracing::warn!(
+                answers = n,
+                "balances: /local answers carry no metaData.prevBlockHash; rows cannot be \
+                 verified and stay queued (D2)"
+            );
+        }
+        if let Some((other, ok)) = alert.dominant {
+            tracing::warn!(
+                other_branch = other,
+                ok,
+                window_secs = BRANCH_WINDOW.as_secs(),
+                "balances: most /local answers are not on our branch; rows stay unverified \
+                 (node off our cut, behind a balancer, or our tail lagging)"
+            );
+        }
         if backs_off(&st) {
             let d = backoff.map_or(Duration::from_secs(1), |d| (d * 2).min(BACKOFF_MAX));
             backoff = Some(d);
@@ -1026,6 +1226,18 @@ async fn run_with(
             }
         } else {
             backoff = None;
+            // M1: every answer was off our branch; re-reading the same keys at once would
+            // only spin the `/local` budget. Never stops re-reading, only spaces it out.
+            if let Some(d) = off_branch_pause(&st) {
+                tracing::debug!(
+                    answers = st.other_branch,
+                    "balances: batch all off-branch, pausing"
+                );
+                tokio::select! {
+                    _ = stop.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(d) => {}
+                }
+            }
         }
     }
 }
@@ -1118,20 +1330,48 @@ pub async fn supervise(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::sync::Mutex;
 
     use kdx_hot::{Geometry, HotDict, HotStore};
     use kdx_node::{ChainGraph, NodeClientConfig, NodeInfo};
-    use kdx_types::DictMut;
+    use kdx_types::{DictMut, Hash32};
 
     use super::*;
     use crate::IngestOpts;
 
+    /// The hash of the header [`setup`] stores at chain 0 height 10: the fake node's tip.
+    pub(crate) fn tip_hash() -> Hash32 {
+        Hash32([0x11; 32])
+    }
+
+    /// Store a header at (`chain`, `height`) with `hash`, as the tail would.
+    pub(crate) fn put_header(hot: &HotStore, chain: u8, height: u32, hash: Hash32) {
+        let br = kdx_types::record::BlockRecord {
+            hash,
+            chain,
+            height: u64::from(height),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        kdx_types::record::encode_block(&br, &mut buf);
+        let mut txn = hot.rw().unwrap();
+        txn.put(
+            Table::Headers,
+            &kdx_hot::tables::block_key(chain, height),
+            &buf,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
     /// A fake node: `/local` answers a success for every account except `bad`, whose answer
-    /// arrives but has no balance. One connection at a time (`Connection: close`).
-    fn fake_node() -> String {
+    /// arrives but has no balance; an NFT `get-balance` (data `t`) answers 2.0. Every success
+    /// reads tip height 10 (`blockHeight` 11) and names the tip's hash as `prevBlockHash`: the
+    /// text in `prev`, read per answer (empty: no `prevBlockHash` at all). One
+    /// connection at a time (`Connection: close`).
+    pub(crate) fn fake_node(prev: Arc<Mutex<String>>) -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1173,17 +1413,26 @@ mod tests {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let m = cmd.pointer("/payload/exec/data/m").and_then(Value::as_str);
+                let prev = prev.lock().unwrap().clone();
+                let meta = if prev.is_empty() {
+                    json!({"blockHeight": 11})
+                } else {
+                    json!({"blockHeight": 11, "prevBlockHash": prev})
+                };
                 let body = if let Some(m) = m {
                     // The fungible check: only `free.tok` lists fungible-v2.
                     json!({"result": {"status": "success", "data": m == "free.tok"},
-                           "metaData": {"blockHeight": 11}})
+                           "metaData": meta.clone()})
+                } else if cmd.pointer("/payload/exec/data/t").is_some() {
+                    // An NFT `get-balance`.
+                    json!({"result": {"status": "success", "data": 2.0}, "metaData": meta.clone()})
                 } else if acct == "bad" {
                     json!({"result": {"status": "success", "data": {"guard": null}},
-                           "metaData": {"blockHeight": 11}})
+                           "metaData": meta.clone()})
                 } else {
                     json!({"result": {"status": "success", "data": {"account": acct,
                            "balance": 1.5, "guard": {"keys": ["k1"], "pred": "keys-all"}}},
-                           "metaData": {"blockHeight": 11}})
+                           "metaData": meta.clone()})
                 }
                 .to_string();
                 let _ = write!(
@@ -1236,12 +1485,23 @@ mod tests {
             balances::mark_dirty(&mut txn, a, coin, 0, 10).unwrap();
         }
         txn.commit().unwrap();
+        put_header(&hot, 0, 10, tip_hash());
         (hot, coin, ids)
     }
 
+    /// A client of a fake node whose answers name the stored tip (`tip_hash`).
     fn client(dir: &std::path::Path, hot: &Arc<HotStore>) -> (Ctx, LocalClient) {
+        client_on(dir, hot, Arc::new(Mutex::new(tip_hash().to_b64url())))
+    }
+
+    /// A client of a fake node whose answers name `prev` as `prevBlockHash`.
+    pub(crate) fn client_on(
+        dir: &std::path::Path,
+        hot: &Arc<HotStore>,
+        prev: Arc<Mutex<String>>,
+    ) -> (Ctx, LocalClient) {
         let node = NodeClient::new(&NodeClientConfig {
-            base: fake_node().parse().unwrap(),
+            base: fake_node(prev).parse().unwrap(),
             network: "mainnet01".into(),
             timeout: Duration::from_secs(5),
             max_rps: 0,
@@ -1284,6 +1544,10 @@ mod tests {
             .unwrap()
             .as_deref()
             .and_then(Mark::decode)
+    }
+
+    fn row_of(hot: &HotStore, k: &[u8; 9]) -> BalanceRow {
+        BalanceRow::decode(&hot.ro().unwrap().get(Table::Balances, k).unwrap().unwrap()).unwrap()
     }
 
     /// One key whose answer is unusable is dropped as a failure; the other keys of the batch
@@ -1393,8 +1657,11 @@ mod tests {
         assert!(row(&hot).unverified);
     }
 
-    /// M-3: a reorg between the read and the clear re-marks the key at the same height; the
-    /// answer still covers that height, but the newer mark is kept for the next read.
+    /// M-3 and D2: a reorg between the read and the clear re-marks the key at the same height;
+    /// the newer mark is kept for the next read. That next read can still come from the orphan's
+    /// state at the same height (a quick flip-and-back): its `prevBlockHash` names the orphan,
+    /// so the mark survives and the row is stored unverified. Only an answer read on the block
+    /// we hold at that height clears it.
     #[tokio::test]
     async fn a_reorg_between_read_and_clear_keeps_the_newer_mark() {
         let dir = tempfile::tempdir().unwrap();
@@ -1410,7 +1677,11 @@ mod tests {
         }
         assert_eq!(mark_of(&hot, &k).map(|m| m.height), Some(10));
         assert_ne!(mark_of(&hot, &k), Some(keys[0].mark));
-        let (ctx, local) = client(dir.path(), &hot);
+        // The re-apply put the other branch's block at 10; the node still reads the orphan.
+        let canon = Hash32([0x22; 32]);
+        put_header(&hot, 0, 10, canon);
+        let prev = Arc::new(Mutex::new(tip_hash().to_b64url()));
+        let (ctx, local) = client_on(dir.path(), &hot, prev.clone());
         let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
             .await
             .unwrap();
@@ -1420,7 +1691,225 @@ mod tests {
         reconcile_batch(&ctx, &local, &keys, &Caps::default())
             .await
             .unwrap();
+        assert!(
+            mark_of(&hot, &k).is_some(),
+            "an answer read on the orphan must not clear the mark"
+        );
+        assert!(row_of(&hot, &k).unverified);
+        // The node moves to our branch: the next read clears the mark.
+        *prev.lock().unwrap() = canon.to_b64url();
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
         assert!(mark_of(&hot, &k).is_none());
+        assert!(!row_of(&hot, &k).unverified);
+    }
+
+    /// D2: an answer whose `prevBlockHash` is not the header we hold at its height (another
+    /// branch) is stored unverified (served `stale`) and its mark stays queued; the same read
+    /// on our branch clears the mark and verifies the row.
+    #[tokio::test]
+    async fn an_answer_from_another_branch_keeps_the_mark_and_serves_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        let k = balances::bal_key(ids[0], coin, 0);
+        let prev = Arc::new(Mutex::new(Hash32([0x33; 32]).to_b64url()));
+        let (ctx, local) = client_on(dir.path(), &hot, prev.clone());
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.other_branch), (1, 1));
+        assert!(mark_of(&hot, &k).is_some(), "mark must survive");
+        let row = row_of(&hot, &k);
+        assert!(row.unverified);
+        assert_eq!((row.balance.as_str(), row.as_of), ("1.5", 10));
+        assert!(balances::is_dirty(&hot.ro().unwrap(), ids[0], coin, 0).unwrap());
+
+        *prev.lock().unwrap() = tip_hash().to_b64url();
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        assert_eq!(keys.len(), 1, "the key is still queued");
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.other_branch), (1, 0));
+        assert!(mark_of(&hot, &k).is_none());
+        assert!(!row_of(&hot, &k).unverified);
+    }
+
+    fn other_branch_count() -> u64 {
+        kdx_metrics::get()
+            .balance_reconcile
+            .get_or_create(&vec![("result", "other_branch".into())])
+            .get()
+    }
+
+    /// M1 (D2 review): an off-branch answer is counted under its own metric label, so a
+    /// dashboard can tell it from a verified `ok`.
+    #[tokio::test]
+    async fn an_off_branch_answer_has_its_own_metric_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["alice"]);
+        let prev = Arc::new(Mutex::new(Hash32([0x33; 32]).to_b64url()));
+        let (ctx, local) = client_on(dir.path(), &hot, prev);
+        let before = other_branch_count();
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        // The registry is global and tests run in parallel: at least this test's answer.
+        assert!(other_branch_count() > before);
+    }
+
+    /// M1: an answer with no `prevBlockHash` is off-branch (unverified, kept dirty) and counted
+    /// in `no_hash` for the warning.
+    #[tokio::test]
+    async fn an_answer_without_prev_block_hash_is_counted_and_kept_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        let k = balances::bal_key(ids[0], coin, 0);
+        let (ctx, local) = client_on(dir.path(), &hot, Arc::new(Mutex::new(String::new())));
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.other_branch, st.no_hash), (1, 1, 1));
+        assert!(mark_of(&hot, &k).is_some());
+        assert!(row_of(&hot, &k).unverified);
+    }
+
+    /// M1: a batch whose answers were all off-branch pauses the loop briefly; a batch with one
+    /// verified answer, or none at all, does not.
+    #[test]
+    fn an_all_off_branch_batch_pauses_the_next() {
+        let all = BatchStats {
+            ok: 3,
+            other_branch: 3,
+            ..Default::default()
+        };
+        assert_eq!(off_branch_pause(&all), Some(OFF_BRANCH_PAUSE));
+        assert!(OFF_BRANCH_PAUSE <= Duration::from_secs(5), "bounded");
+        let one_good = BatchStats {
+            ok: 3,
+            other_branch: 2,
+            ..Default::default()
+        };
+        assert_eq!(off_branch_pause(&one_good), None);
+        let with_absent = BatchStats {
+            ok: 1,
+            other_branch: 1,
+            absent: 1,
+            ..Default::default()
+        };
+        assert_eq!(off_branch_pause(&with_absent), None);
+        assert_eq!(off_branch_pause(&BatchStats::default()), None);
+        let errors = BatchStats {
+            node_errors: 4,
+            ..Default::default()
+        };
+        assert_eq!(off_branch_pause(&errors), None);
+    }
+
+    /// M1: off-branch answers that are the majority of `ok` over a window, with enough answers,
+    /// raise one alert at the window's end; a missing hash alerts at once, then at most once
+    /// per window.
+    #[test]
+    fn the_branch_watch_alerts_on_a_majority_and_on_missing_hashes() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let batch = |ok, other, no_hash| BatchStats {
+            ok,
+            other_branch: other,
+            no_hash,
+            ..Default::default()
+        };
+        let mut w = BranchWatch::default();
+        assert_eq!(w.note(at(0), &batch(40, 30, 0)), BranchAlert::default());
+        assert_eq!(w.note(at(30), &batch(40, 30, 0)), BranchAlert::default());
+        assert_eq!(
+            w.note(at(60), &batch(20, 10, 0)).dominant,
+            Some((70, 100)),
+            "70 of 100 in the window"
+        );
+        // A new window: a minority, then too few answers, never alert.
+        assert_eq!(w.note(at(90), &batch(100, 40, 0)).dominant, None);
+        assert_eq!(w.note(at(120), &batch(0, 0, 0)).dominant, None);
+        assert_eq!(w.note(at(150), &batch(10, 10, 0)).dominant, None);
+        assert_eq!(w.note(at(180), &batch(10, 10, 0)).dominant, None);
+        // Missing hashes: at once, then quiet within the window, then again.
+        assert_eq!(w.note(at(200), &batch(5, 5, 5)).no_hash, Some(5));
+        assert_eq!(w.note(at(230), &batch(5, 5, 5)).no_hash, None);
+        assert_eq!(w.note(at(261), &batch(5, 5, 2)).no_hash, Some(2));
+    }
+
+    /// L1 (D2 review): an answer from a definite other branch (we hold another header at its
+    /// height) keeps the previous row's balance, guard and public-key index; the row is only
+    /// flagged unverified and the mark stays.
+    #[tokio::test]
+    async fn a_definite_other_branch_answer_keeps_the_previous_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        let k = balances::bal_key(ids[0], coin, 0);
+        let old = BalanceRow {
+            absent: false,
+            balance: "7.0".into(),
+            guard: [0; 16],
+            as_of: 8,
+            reconciled_at: 1,
+            unverified: false,
+        };
+        {
+            let mut txn = hot.rw().unwrap();
+            txn.put(Table::Balances, &k, &old.encode()).unwrap();
+            txn.commit().unwrap();
+        }
+        let prev = Arc::new(Mutex::new(Hash32([0x33; 32]).to_b64url()));
+        let (ctx, local) = client_on(dir.path(), &hot, prev);
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!(st.other_branch, 1);
+        let row = row_of(&hot, &k);
+        assert_eq!(
+            (row.balance.as_str(), row.as_of, row.guard),
+            ("7.0", 8, [0; 16])
+        );
+        assert!(row.unverified);
+        assert!(mark_of(&hot, &k).is_some());
+        let idx = hot
+            .ro()
+            .unwrap()
+            .get(
+                Table::KeyAccounts,
+                &balances::key_account_key(&balances::key_hash("k1"), ids[0]),
+            )
+            .unwrap();
+        assert!(idx.is_none(), "the other branch's key is not indexed");
+    }
+
+    /// D2: an answer read at a height whose header we do not hold yet (the node is ahead of
+    /// our tail) cannot be checked: it is treated like another branch's.
+    #[tokio::test]
+    async fn an_answer_above_our_headers_keeps_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice"]);
+        {
+            let mut txn = hot.rw().unwrap();
+            txn.del(Table::Headers, &kdx_hot::tables::block_key(0, 10))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let k = balances::bal_key(ids[0], coin, 0);
+        let (ctx, local) = client(dir.path(), &hot);
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!(st.other_branch, 1);
+        assert!(mark_of(&hot, &k).is_some());
+        assert!(row_of(&hot, &k).unverified);
     }
 
     /// SR-2: a node outage (every call a node error) parks nothing, however long it lasts; a

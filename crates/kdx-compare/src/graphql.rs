@@ -3016,7 +3016,7 @@ impl Ctx {
                     continue;
                 };
                 let (det, node_h) = match local.details(chain, "coin", &account).await {
-                    Ok(kdx_node::Local::Found { value, height }) => (value, height),
+                    Ok(kdx_node::Local::Found { value, height, .. }) => (value, height),
                     Ok(kdx_node::Local::Absent) => {
                         d.push(DiffEntry {
                             path: format!("/chain{chain}"),

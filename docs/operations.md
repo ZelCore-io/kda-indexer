@@ -539,6 +539,27 @@ with `[balances] enabled = false`.
 - **Marks**: every tail block marks the balances it may change (`TRANSFER` sides, every account
   of its events for `coin`), and a reorg's undo marks the unwound blocks' rows again. A row
   that is dirty is served with `stale: true` until it is re-read.
+- **Branch check**: an answer clears a row's mark only when it was read on the block the
+  indexer holds at that height: the answer's `metaData.prevBlockHash` must equal the stored
+  header's hash at its `as_of`. Right after a quick reorg flip-and-back the node can still
+  answer from the orphan's state at the same height; such an answer (or one read above the
+  indexer's tail) is stored flagged unverified (served `stale: true`) and the row stays queued
+  at the back. When the indexer holds another header at that height (a definite other
+  branch) and already has a row, that row (balance, guard, public-key index) is kept and only
+  flagged unverified. Such answers count as `result="other_branch"` (in addition to `ok`).
+  When every answer of a batch was off-branch, the reconciler waits 2 s before the next
+  batch; it never stops re-reading. It logs a WARN when answers carry no
+  `metaData.prevBlockHash` (at most once a minute: a node or Pact change makes every row
+  unverifiable), and when off-branch answers are more than half of at least 50 `ok` answers
+  in a 60 s window (node off our cut, a balancer in front of several nodes, or a lagging
+  tail). An "absent" answer carries no block metadata and cannot be checked: a row the
+  node reports absent from an orphan's state is stored as absent until the account's next
+  posting on that chain or `reconcile-balances --all`.
+  NFT rows (`get-balance`, `NftDirty`) get the same check: an off-branch answer keeps the
+  mark (served `stale: true`) and does not replace a row already held. The NFT holding guards
+  and token info (`NftDetails`, GraphQL only) are still checked by height alone (TODO D2):
+  they are re-read whenever the balance row's `as_of` moves, and rarely differ between
+  sibling blocks.
 - **Errors**: a node error (timeout, connection, HTTP status) keeps the row dirty and moves it
   to the back of the queue; the reconciler backs off (up to 60 s) only when node errors are at
   least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,
@@ -619,7 +640,7 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 - `n_4e470a97222514a8662dd1219000a0431451b0ee.ledger` (a v2-shaped ledger in a principal
   namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
   deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
-- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|absent|error|skipped|parked|capped|not_fungible"}`
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 
