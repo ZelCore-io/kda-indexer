@@ -814,22 +814,37 @@ async fn seed_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
 }
 
 /// D1: the receivers pass of the seed (`seed_receivers`), when the store has not had it, or
-/// its stored history below coin v3 grew since. Returns false when stopped.
+/// its stored history below coin v3 grew since. Postponed (to the next recheck) while the
+/// store is not ready for it (review L3). It runs inline: tail dirty rows wait until it ends
+/// (review L4). Returns false when stopped.
 async fn receivers_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
-    let Some((from, to)) = crate::seed_receivers::pending(&ctx.hot.ro()?)? else {
+    let forks = crate::seed_receivers::forks_for(&ctx.opts.network);
+    let Some((from, to)) = crate::seed_receivers::pending(&ctx.hot.ro()?, forks)? else {
         return Ok(true);
     };
+    if let Err(e) = crate::seed_receivers::check_ready(&ctx.hot.ro()?, &ctx.segdir) {
+        tracing::warn!(error = %e, "balances: receivers pass (D1) postponed");
+        return Ok(true);
+    }
     tracing::info!(
         from,
         to,
         "balances: marking event-less receivers below coin v3 (D1)"
     );
     let (c, s) = (ctx.clone(), stop.clone());
+    let opts = crate::seed_receivers::Opts {
+        forks,
+        ..Default::default()
+    };
     let rep = tokio::task::spawn_blocking(move || {
-        crate::seed_receivers::run(&c.hot, &c.dict, &c.segdir, &|| s.is_cancelled())
+        crate::seed_receivers::run(&c.hot, &c.dict, &c.segdir, &opts, &|| s.is_cancelled())
     })
     .await??;
-    tracing::info!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended");
+    if rep.errors > 0 {
+        tracing::error!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended with errors");
+    } else {
+        tracing::info!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended");
+    }
     Ok(!rep.stopped)
 }
 
@@ -1718,6 +1733,17 @@ mod tests {
         let segdir = dir.path().join("segments");
         std::fs::create_dir_all(&segdir).unwrap();
         let k = undecodable_ledger_event(&hot);
+        // D1 L3: the receivers pass waits for a tail; this store's tail reached height 1.
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut txn,
+            kdx_hot::Stage::Tail,
+            0,
+            1,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        txn.commit().unwrap();
         let e = crate::nft_fill::run(&hot, &segdir, None, &|| false).unwrap_err();
         assert!(format!("{e:#}").contains("hot tx record"), "{e:#}");
         let (ctx, _) = client(dir.path(), &hot);

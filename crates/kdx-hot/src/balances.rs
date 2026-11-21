@@ -50,6 +50,9 @@ pub mod meta {
     pub const BALANCES_SEED_RECEIVERS: &str = "balances_seed_receivers";
     /// Resume cursor of a running receivers pass: start height u32 ‖ next frozen TxNum u64.
     pub const BALANCES_SEED_RECEIVERS_CURSOR: &str = "balances_seed_receivers_cursor";
+    /// Txs the receivers pass could not read (u64), over the pass and its resumes (D1 L1).
+    /// Kept after the pass ends so `--status` shows it; non-zero needs a look at the logs.
+    pub const BALANCES_SEED_RECEIVERS_ERRORS: &str = "balances_seed_receivers_errors";
 }
 
 static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);

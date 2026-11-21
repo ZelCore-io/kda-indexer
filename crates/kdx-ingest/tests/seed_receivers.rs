@@ -9,14 +9,15 @@ use std::sync::Arc;
 
 use common::*;
 use kdx_decode::receivers::record_receivers;
+use kdx_decode::receivers::MAINNET01;
 use kdx_decode::{decode_block, verify_block, VerifyReport};
 use kdx_hot::balances::{self, meta};
 use kdx_hot::{Table, Txn};
 use kdx_ingest::apply::{self, Batch};
-use kdx_ingest::seed_receivers::{self, pending};
+use kdx_ingest::seed_receivers::{self, Opts};
 use kdx_segment::Segments;
 use kdx_types::hash::b64url_encode;
-use kdx_types::{blake2b_256, Dict, DictKind, MemDict};
+use kdx_types::{blake2b_256, Dict, DictKind, DictMut, MemDict};
 use serde_json::{json, Value};
 
 fn h(n: u8) -> String {
@@ -108,6 +109,21 @@ fn store() -> (tempfile::TempDir, kdx_ingest::Ctx) {
     (d, c)
 }
 
+fn pending(txn: &impl Txn) -> anyhow::Result<Option<(u32, u32)>> {
+    seed_receivers::pending(txn, MAINNET01)
+}
+
+fn opts(chunk: usize) -> Opts {
+    Opts {
+        chunk,
+        ..Opts::default()
+    }
+}
+
+fn run(c: &kdx_ingest::Ctx) -> seed_receivers::ReceiversReport {
+    seed_receivers::run(&c.hot, &c.dict, &c.segdir, &Opts::default(), &|| false).unwrap()
+}
+
 fn dirty(c: &kdx_ingest::Ctx, name: &str) -> bool {
     let txn = c.hot.ro().unwrap();
     let coin = balances::coin_module(&txn).unwrap().unwrap();
@@ -130,7 +146,7 @@ fn frozen_receivers(c: &kdx_ingest::Ctx) -> Vec<String> {
     let mut v = Vec::new();
     for t in 0..segs.manifest.next_txnum {
         if let Some(r) = segs.tx(t).unwrap() {
-            v.extend(record_receivers(&r, &*dict).unwrap());
+            v.extend(record_receivers(&r, &*dict, MAINNET01).unwrap());
         }
     }
     v
@@ -144,7 +160,7 @@ fn the_pass_marks_event_less_receivers_once() {
     let expected = frozen_receivers(&c);
     assert!(!expected.is_empty(), "the pool's coin txs name accounts");
 
-    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &|| false).unwrap();
+    let rep = run(&c);
     assert!(!rep.stopped);
     assert!(rep.frozen_txs > 0 && rep.hot_txs >= 2, "{rep:?}");
     assert!(dirty(&c, LEGACY), "pre-event transfer-create receiver");
@@ -161,27 +177,27 @@ fn the_pass_marks_event_less_receivers_once() {
     drop(txn);
 
     // Gated: a second call walks nothing.
-    let again = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &|| false).unwrap();
+    let again = run(&c);
     assert_eq!((again.hot_txs, again.frozen_txs), (0, 0), "{again:?}");
 
     // A block stored below the cutoff afterwards (a tail behind coin v3) is walked alone.
     apply_repro(&c, 25);
     assert_eq!(pending(&c.hot.ro().unwrap()).unwrap(), Some((25, 26)));
-    let more = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &|| false).unwrap();
+    let more = run(&c);
     assert_eq!((more.hot_txs, more.frozen_txs), (2, 0), "{more:?}");
 }
 
 #[test]
 fn a_stopped_pass_resumes_and_marks_the_same_rows() {
     let (_d, full) = store();
-    seed_receivers::run(&full.hot, &full.dict, &full.segdir, &|| false).unwrap();
+    run(&full);
 
     let (_d2, c) = store();
     let mut stops = 0;
     loop {
         let calls = std::cell::Cell::new(0);
         // Stop at the second poll: each run makes a little progress.
-        let rep = seed_receivers::run_with(&c.hot, &c.dict, &c.segdir, 7, &|| {
+        let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &opts(7), &|| {
             calls.set(calls.get() + 1);
             calls.get() > 1
         })
@@ -210,4 +226,140 @@ fn a_stopped_pass_resumes_and_marks_the_same_rows() {
         v
     };
     assert_eq!(rows(&c), rows(&full));
+}
+
+/// Give `name` a `Balances` row on chain 0 (interning it as a posting would have).
+fn put_row(c: &kdx_ingest::Ctx, name: &str) {
+    let mut d = c.dict.lock().unwrap();
+    let mut txn = c.hot.rw().unwrap();
+    let a = d.intern(DictKind::Account, name);
+    d.persist(&mut txn).unwrap();
+    let coin = balances::coin_module(&txn).unwrap().unwrap();
+    let row = balances::BalanceRow {
+        absent: false,
+        balance: "2.0".into(),
+        guard: [1; 16],
+        as_of: 24,
+        reconciled_at: 24,
+        unverified: false,
+    };
+    txn.put(
+        Table::Balances,
+        &balances::bal_key(a, coin, 0),
+        &row.encode(),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+}
+
+#[test]
+fn keys_that_already_have_a_balances_row_are_not_marked() {
+    // M2 (b): a row the tail keeps fresh is correct; only absent keys are marked.
+    let (_d, c) = store();
+    put_row(&c, LEGACY);
+    let rep = run(&c);
+    assert!(!dirty(&c, LEGACY), "LEGACY has a row: not re-read");
+    assert!(dirty(&c, XRECV), "XRECV has no row: marked");
+    assert_eq!(rep.skipped_existing, 1, "{rep:?}");
+}
+
+fn dirty_rows(c: &kdx_ingest::Ctx) -> usize {
+    balances::dirty_count(&c.hot.ro().unwrap()).unwrap()
+}
+
+#[test]
+fn a_dry_run_counts_without_writing() {
+    let (_d, real) = store();
+    let want = run(&real);
+    assert!(want.dirty_inserted > 0 && want.new_accounts > 0, "{want:?}");
+
+    let (_d2, c) = store();
+    let accounts = |c: &kdx_ingest::Ctx| {
+        kdx_hot::HotDict::load(&c.hot.ro().unwrap())
+            .unwrap()
+            .len(DictKind::Account)
+    };
+    let (rows0, names0) = (dirty_rows(&c), accounts(&c));
+    let o = Opts {
+        dry_run: true,
+        ..Opts::default()
+    };
+    let got = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    assert!(got.dry_run);
+    assert_eq!(
+        got.dirty_inserted, want.dirty_inserted,
+        "{got:?} vs {want:?}"
+    );
+    assert_eq!(got.new_accounts, want.new_accounts, "{got:?} vs {want:?}");
+    assert_eq!(got.skipped_existing, want.skipped_existing);
+    // Nothing written: no marks, no names, no flag or cursor; the pass is still pending.
+    assert_eq!((dirty_rows(&c), accounts(&c)), (rows0, names0));
+    assert_eq!(c.dict.lock().unwrap().len(DictKind::Account), names0);
+    let txn = c.hot.ro().unwrap();
+    assert!(txn.meta(meta::BALANCES_SEED_RECEIVERS).unwrap().is_none());
+    assert!(txn
+        .meta(meta::BALANCES_SEED_RECEIVERS_CURSOR)
+        .unwrap()
+        .is_none());
+    assert!(pending(&txn).unwrap().is_some());
+}
+
+#[test]
+fn the_pass_refuses_a_store_without_a_tail() {
+    // L3: names interned before a backfill resume could be truncated and their ids reused.
+    let (_d, c) = store();
+    let mut txn = c.hot.rw().unwrap();
+    for ch in 0..kdx_segment::SLOT_WIDTH as u8 {
+        kdx_hot::checkpoint::clear_checkpoint(&mut txn, kdx_hot::Stage::Tail, ch).unwrap();
+    }
+    txn.commit().unwrap();
+    let rows0 = dirty_rows(&c);
+    let e = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &Opts::default(), &|| false)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("no tail"), "{e}");
+    assert_eq!(dirty_rows(&c), rows0, "nothing marked");
+    assert!(!dirty(&c, LEGACY));
+}
+
+#[test]
+fn the_pass_refuses_a_store_whose_backfill_is_incomplete() {
+    // L3: MDBX ahead of the segment manifest (a range committed, its manifest not).
+    let (_d, c) = store();
+    let mut txn = c.hot.rw().unwrap();
+    let f = txn.frozen_frontier().unwrap();
+    txn.set_frozen_frontier(f + 1).unwrap();
+    txn.commit().unwrap();
+    let e = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &Opts::default(), &|| false)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("backfill"), "{e}");
+}
+
+#[test]
+fn a_tx_whose_cmd_is_not_json_is_counted_and_kept_in_meta() {
+    // L1: never silent; `--status` shows the stored count.
+    let (_d, c) = store();
+    let mut txn = c.hot.rw().unwrap();
+    let (k, v) = txn
+        .scan(Table::TailTxs, &[], |_| true)
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| !kdx_types::TxKey::from_be_bytes(k[..8].try_into().unwrap()).is_coinbase())
+        .unwrap();
+    let mut r = kdx_types::record::decode_tx(&v).unwrap();
+    r.cmd = Some(b"{not json".to_vec());
+    let mut buf = Vec::new();
+    kdx_types::record::encode_tx(&r, &mut buf);
+    txn.put(Table::TailTxs, &k, &buf).unwrap();
+    txn.commit().unwrap();
+    let rep = run(&c);
+    assert_eq!(rep.errors, 1, "{rep:?}");
+    let txn = c.hot.ro().unwrap();
+    assert_eq!(
+        txn.meta(meta::BALANCES_SEED_RECEIVERS_ERRORS)
+            .unwrap()
+            .as_deref(),
+        Some(&1u64.to_be_bytes()[..])
+    );
 }

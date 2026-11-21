@@ -213,6 +213,11 @@ enum Command {
         /// then the receivers pass (D1, once per store) for event-less pre-coin-v3 credits.
         #[arg(long, conflicts_with_all = ["all", "status", "nft_fill"])]
         seed: bool,
+        /// With `--seed`: only count what the receivers pass (D1) would mark (candidates,
+        /// new names, rows skipped because they exist, rows it would mark). Read-only; the
+        /// posting seed does not run.
+        #[arg(long, requires = "seed")]
+        dry_run: bool,
         /// Run the NFT history fill again (ledger events; plan Task 11). The dirty rows it
         /// marks are read by the next `run`.
         #[arg(long, conflicts_with_all = ["seed", "all", "status"])]
@@ -671,12 +676,14 @@ async fn main() -> anyhow::Result<()> {
         Command::ReconcileBalances {
             data_dir,
             seed,
+            dry_run,
             nft_fill,
             all,
             status,
         } => {
             use kda_indexer::cmd::reconcile::Mode;
             let mode = match (seed, all, status, nft_fill) {
+                (true, _, _, _) if dry_run => Mode::SeedDryRun,
                 (true, _, _, _) => Mode::Seed,
                 (_, true, _, _) => Mode::All,
                 (_, _, true, _) => Mode::Status,

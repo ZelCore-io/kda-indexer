@@ -1,7 +1,7 @@
 //! Balance receivers no event names (D1). Used only by the balance seed's receivers pass
 //! (`kdx_ingest::seed_receivers`); postings, transfers and tx lists never see them.
 //!
-//! Before coin v3 (mainnet01 height [`COIN_V3_HEIGHT`]) KDA could reach an account with no
+//! Before coin v3 ([`Forks::coin_v3`]) KDA could reach an account with no
 //! event naming it: every credit below the Pact events fork (1,138,000) and every cross-chain
 //! credit (`coin.transfer-crosschain` step 1) up to 1,722,499. Such an account has no posting
 //! on that chain, so the posting-based seed never marks its `(account, coin, chain)` row.
@@ -10,10 +10,11 @@
 //! - **Cross-chain finish** (any height): a `cont` tx whose output continuation is step 1 of
 //!   `coin.transfer-crosschain` gives `continuation.args[1]`, the receiver (structured field).
 //!   From coin v3 on the same tx carries a TRANSFER naming it, so marking it again is harmless.
-//! - **`exec` below [`COIN_V3_HEIGHT`]**: every [`account_like`] string value in `exec.data`
-//!   (any depth; object keys are not values and are skipped) and every string literal
-//!   (`"..."`, or a `'symbol`) inside the s-expression of a call whose head starts with
-//!   `coin.` in `exec.code` (nested forms included; comments skipped).
+//! - **`exec` below the events fork** ([`Forks::events`]): every [`account_like`] string
+//!   value in `exec.data` (any depth; object keys are not values and are skipped) and every
+//!   string literal (`"..."`, or a `'symbol`) anywhere in `exec.code` (comments skipped).
+//!   From the events fork on, every `exec` credit has an event naming the account, so
+//!   `exec` txs there give nothing (review M2).
 //!
 //! Over-inclusion only costs one `/local` read per extra `(account, chain)`: the answer is
 //! "no row", stored absent and never served. Under-inclusion leaves money missing, so the rule
@@ -26,9 +27,33 @@ use serde_json::Value;
 use crate::build::account_ok;
 use crate::render::{render_output, RenderError};
 
-/// Mainnet01 coin v3 fork height: from here on every coin credit emits a TRANSFER event
-/// naming the receiver, cross-chain finishes included.
-pub const COIN_V3_HEIGHT: u32 = 1_722_500;
+/// The two fork heights the rule depends on, per network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forks {
+    /// Pact events fork: from here on every `exec` coin credit emits an event naming the
+    /// account (TRANSFER, RELEASE_ALLOCATION), so only cross-chain finishes lack one.
+    pub events: u32,
+    /// Coin v3 fork: from here on every coin credit emits a TRANSFER naming the receiver,
+    /// cross-chain finishes included.
+    pub coin_v3: u32,
+}
+
+/// Mainnet01 fork heights.
+pub const MAINNET01: Forks = Forks {
+    events: 1_138_000,
+    coin_v3: 1_722_500,
+};
+
+/// The fork heights of `network`, or `None` when this build does not know them.
+// TODO(D1): testnet04's events and coin v3 heights (chainweb's testnet04 version tables);
+// the repo has none, so callers fall back to [`MAINNET01`] and warn. Both are below mainnet's,
+// so the fallback only scans more txs; it never misses a receiver.
+pub fn network_forks(network: &str) -> Option<Forks> {
+    match network {
+        "mainnet01" => Some(MAINNET01),
+        _ => None,
+    }
+}
 
 /// `coin.transfer-crosschain`, the defpact whose step 1 credits the receiver.
 const XCHAIN_DEF: &str = "coin.transfer-crosschain";
@@ -44,7 +69,12 @@ pub fn account_like(s: &str) -> bool {
 
 /// Candidate receivers of a tx at `height` with parsed `cmd` and output `continuation`
 /// (the CommandResult's `continuation` field, when present). Deduplicated, first-seen order.
-pub fn balance_receivers(cmd: &Value, continuation: Option<&Value>, height: u32) -> Vec<String> {
+pub fn balance_receivers(
+    cmd: &Value,
+    continuation: Option<&Value>,
+    height: u32,
+    forks: Forks,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |s: &str| {
         if account_like(s) && !out.iter().any(|x| x == s) {
@@ -61,12 +91,12 @@ pub fn balance_receivers(cmd: &Value, continuation: Option<&Value>, height: u32)
                 }
             }
         }
-    } else if height < COIN_V3_HEIGHT {
+    } else if height < forks.events {
         if let Some(data) = cmd.pointer("/payload/exec/data") {
             data_strings(data, &mut push);
         }
         if let Some(code) = cmd.pointer("/payload/exec/code").and_then(Value::as_str) {
-            for s in coin_call_literals(code) {
+            for s in code_literals(code) {
                 push(&s);
             }
         }
@@ -74,15 +104,20 @@ pub fn balance_receivers(cmd: &Value, continuation: Option<&Value>, height: u32)
     out
 }
 
-/// [`balance_receivers`] of a stored record (none for the coinbase or a cmd that is not JSON).
-pub fn record_receivers(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<String>, RenderError> {
+/// [`balance_receivers`] of a stored record (none for the coinbase; an error for a cmd that
+/// is not JSON).
+pub fn record_receivers(
+    r: &TxRecord,
+    dict: &dyn Dict,
+    forks: Forks,
+) -> Result<Vec<String>, RenderError> {
     let Some(cmd) = r.cmd.as_deref().filter(|_| r.key.pos() != 0) else {
         return Ok(Vec::new());
     };
-    // Lenient parse: only string values are read, a faithful copy is not needed.
-    let Ok(cmd) = serde_json::from_slice::<Value>(cmd) else {
-        return Ok(Vec::new());
-    };
+    // Lenient parse: only string values are read, a faithful copy is not needed. A cmd that
+    // does not parse is an error (counted and logged by the pass), never a silent skip (L1).
+    let cmd = serde_json::from_slice::<Value>(cmd)
+        .map_err(|e| RenderError::Shape(format!("cmd is not JSON: {e}")))?;
     let cont = if cmd.pointer("/payload/cont").is_some() {
         if r.raw_output.is_some() {
             render_output(r, dict)?.get("continuation").cloned()
@@ -98,7 +133,12 @@ pub fn record_receivers(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<String>, Re
     } else {
         None
     };
-    Ok(balance_receivers(&cmd, cont.as_ref(), r.key.height()))
+    Ok(balance_receivers(
+        &cmd,
+        cont.as_ref(),
+        r.key.height(),
+        forks,
+    ))
 }
 
 fn data_strings(v: &Value, f: &mut impl FnMut(&str)) {
@@ -110,14 +150,12 @@ fn data_strings(v: &Value, f: &mut impl FnMut(&str)) {
     }
 }
 
-/// String literals (`"..."` with `\"`/`\\` unescaped, and `'symbols`) inside every call
-/// whose head starts with `coin.`, nested forms included. `;` comments are skipped.
-fn coin_call_literals(code: &str) -> Vec<String> {
+/// Every string literal (`"..."` with `\"`/`\\` unescaped) and `'symbol` in `code`, wherever
+/// it sits: a `(use coin)` then bare `transfer`, a `let` binding or another module's call can
+/// carry the receiver (review M1). `;` comments are skipped.
+fn code_literals(code: &str) -> Vec<String> {
     let b = code.as_bytes();
     let mut out = Vec::new();
-    // One entry per open paren: whether it opened a `coin.` call.
-    let mut stack: Vec<bool> = Vec::new();
-    let mut inside = 0usize;
     let mut i = 0;
     while i < b.len() {
         match b[i] {
@@ -136,9 +174,7 @@ fn coin_call_literals(code: &str) -> Vec<String> {
                     s.push(b[i]);
                     i += 1;
                 }
-                if inside > 0 {
-                    out.push(String::from_utf8_lossy(&s).into_owned());
-                }
+                out.push(String::from_utf8_lossy(&s).into_owned());
             }
             b'\'' => {
                 let start = i + 1;
@@ -146,22 +182,10 @@ fn coin_call_literals(code: &str) -> Vec<String> {
                 while j < b.len() && !is_delim(b[j]) {
                     j += 1;
                 }
-                if inside > 0 {
-                    out.push(String::from_utf8_lossy(&b[start..j]).into_owned());
-                }
+                out.push(String::from_utf8_lossy(&b[start..j]).into_owned());
                 i = j;
                 continue;
             }
-            b'(' => {
-                let mut j = i + 1;
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                let coin = b[j..].starts_with(b"coin.");
-                stack.push(coin);
-                inside += usize::from(coin);
-            }
-            b')' if stack.pop() == Some(true) => inside -= 1,
             _ => {}
         }
         i += 1;

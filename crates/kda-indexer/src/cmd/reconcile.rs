@@ -1,7 +1,8 @@
 //! `kda-indexer reconcile-balances`: manual reruns of the balance seed and full re-reads, and
 //! the reconcile status (plan Task 9). `run` seeds and reconciles by itself (B-5); `--seed`
 //! and `--all` take the data dir lock, so they run while the service is stopped. `--seed`
-//! also runs the receivers pass (D1) when the store has not had it. `--status` only reads.
+//! also runs the receivers pass (D1) when the store has not had it; `--seed --dry-run` only
+//! counts what that pass would mark (read-only, no lock). `--status` only reads.
 
 use std::path::Path;
 
@@ -15,6 +16,9 @@ use crate::config::Config;
 pub enum Mode {
     /// Run (or resume) the seed walk (B-2). Marks rows dirty; the next `run` reads them.
     Seed,
+    /// The receivers pass (D1) as a count only: candidates and would-be-marked rows; writes
+    /// nothing (read-only store, no data dir lock).
+    SeedDryRun,
     /// Mark every `Balances` row dirty (height 0; a tail mark is kept).
     All,
     /// Run the NFT history fill again (plan Task 11).
@@ -37,10 +41,12 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
             let rep = kdx_ingest::seed::run(&hs, &segdir, &|| false)?;
             println!("{}", serde_json::to_string_pretty(&rep)?);
             // D1: the receivers pass, once per store (`Meta balances_seed_receivers`).
-            let dict = std::sync::Mutex::new(kdx_hot::HotDict::load(&hs.ro()?)?);
-            let rep = kdx_ingest::seed_receivers::run(&hs, &dict, &segdir, &|| false)?;
-            println!("{}", json!({ "receivers": rep }));
-            Ok(())
+            receivers(cfg, &hs, &segdir, false)
+        }
+        Mode::SeedDryRun => {
+            let hs = HotStore::open_ro(&hot_dir)?;
+            let segdir = kdx_ingest::ctx::segments_dir(data_dir);
+            receivers(cfg, &hs, &segdir, true)
         }
         Mode::NftFill => {
             let _lock = super::lock_data_dir(data_dir)?;
@@ -105,6 +111,26 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
     }
 }
 
+/// The receivers pass (D1), or its dry run; fails when it could not read some txs (L1).
+fn receivers(cfg: &Config, hs: &HotStore, segdir: &Path, dry_run: bool) -> anyhow::Result<()> {
+    let dict = std::sync::Mutex::new(kdx_hot::HotDict::load(&hs.ro()?)?);
+    let opts = kdx_ingest::seed_receivers::Opts {
+        forks: kdx_ingest::seed_receivers::forks_for(&cfg.network),
+        dry_run,
+        ..Default::default()
+    };
+    let rep = kdx_ingest::seed_receivers::run(hs, &dict, segdir, &opts, &|| false)?;
+    println!("{}", json!({ "receivers": rep }));
+    if rep.errors > 0 {
+        anyhow::bail!(
+            "receivers pass: {} txs could not be read (logged with block, chain and request \
+             key); their receivers may be missing",
+            rep.errors
+        );
+    }
+    Ok(())
+}
+
 fn status(hs: &HotStore) -> anyhow::Result<()> {
     let txn = hs.ro()?;
     let dirty = kdx_hot::balances::dirty_count(&txn)?;
@@ -159,6 +185,10 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
         "seed_receivers_in_progress": txn
             .meta(meta::BALANCES_SEED_RECEIVERS_CURSOR)?
             .is_some(),
+        // D1 L1: txs the receivers pass could not read; must be 0 (see its logs otherwise).
+        "seed_receivers_errors": txn
+            .meta(meta::BALANCES_SEED_RECEIVERS_ERRORS)?
+            .and_then(|v| v.try_into().ok().map(u64::from_be_bytes)),
         "rate_per_s": rate,
         "eta_secs": (rate > 0.0).then(|| (dirty as f64 / rate).round() as u64),
         "heartbeat_age_secs": stats.get("t").and_then(Value::as_u64).map(|t| now.saturating_sub(t)),

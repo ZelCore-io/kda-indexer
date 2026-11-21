@@ -574,6 +574,7 @@ with `[balances] enabled = false`.
 
 ```sh
 kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --status
+kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --seed --dry-run
 # service stopped (both take the data dir lock):
 kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --seed
 kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-balances --all
@@ -587,6 +588,31 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-
 - `--nft-fill` (service stopped): runs the NFT history fill again (below), then drains the
   marks it made with `get-balance`. `--status` also prints `nft_rows`, `nft_dirty_rows` and
   `nft_filled_height`.
+
+#### Receivers pass (D1)
+
+Before coin v3 some KDA credits named the receiver in no event, so no posting marks its row.
+After the seed, once per store (`Meta balances_seed_receivers`), the receivers pass walks every
+stored user tx below the network's coin v3 height and marks `(receiver, coin, chain)` dirty:
+below the Pact events fork, every account-like string in `exec.data` and every string literal
+in `exec.code`; at any height, the receiver of a `coin.transfer-crosschain` finish. A key that
+already has a `Balances` row is skipped (the tail keeps it correct). Fork heights are per
+network; a network this build has no heights for uses mainnet01's and logs a warning.
+
+- **It blocks the reconcile loop while it walks the segments**: the tail's dirty rows wait until
+  it ends (minutes to a few hours on mainnet, plus one `/local` read per marked row afterwards).
+  Its progress is logged every 1M txs.
+- Count it first, read-only (no lock, beside the service):
+  `reconcile-balances --seed --dry-run` prints `candidates`, `new_accounts`, `skipped_existing`
+  and `dirty_inserted` (rows it would mark). The posting seed does not run.
+- Then run it at a quiet hour (the service runs it by itself), or with the service stopped:
+  `reconcile-balances --seed`.
+- It refuses a store with no tail yet or an incomplete backfill (the service postpones it to the
+  hourly recheck).
+- `errors` must be 0. Each unreadable tx is logged with block height, chain and request key;
+  `--seed` exits non-zero when any was found and `--status` prints `seed_receivers_errors`
+  (with `seed_receivers_height` and `seed_receivers_in_progress`).
+- To force a rerun, delete Meta `balances_seed_receivers`.
 
 ### NFTs
 
