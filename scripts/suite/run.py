@@ -21,6 +21,12 @@
       DIR/stock-events.jsonl and that endpoint and class are skipped on that host from then
       on. `--ours-only` is the dry run: no stock request, no verdict, invariants only.
 
+      Worker errors (R-P5P9-180): a case whose worker raises is written as a record with verdict
+      `harness-error` (id, ep, exception type and message), logged, and counted; resume runs it
+      again. More than 1% of a lane's cases in harness-error (rolling window of 200, from 100
+      cases, or over the whole lane) stops the run (exit 2). Each lane prints and appends to
+      DIR/lanes.jsonl `submitted = written + harness-error`; `report` reconciles them.
+
   run.py estimate --config suite.toml --cases DIR [--heavy-sample N | --sample-flag]
       Request totals per backend and the expected hours per lane, from the caps and the latency
       assumptions in the config ([estimate], and [estimate.ep] per endpoint in seconds).
@@ -660,16 +666,21 @@ def side_counts(ab, sb, ev):
 
 
 def pack_bodies(ours_raw, stock_raw):
-    """Both raw response bodies, zlib-compressed and base64 text (H5 c: re-referee input)."""
+    """Both raw response bodies, zlib-compressed and base64 text (H5 c: re-referee input).
+    A body is bytes (what Http.call returns), str or None (R-P5P9-180: bytes used to raise here)."""
     def enc(t):
-        return base64.b64encode(zlib.compress((t or "").encode("utf-8"), 9)).decode("ascii")
+        if t is None:
+            t = b""
+        elif isinstance(t, str):
+            t = t.encode("utf-8")
+        return base64.b64encode(zlib.compress(bytes(t), 9)).decode("ascii")
     return {"enc": "zlib+base64", "ours": enc(ours_raw), "stock": enc(stock_raw)}
 
 
 def unpack_bodies(b):
-    """(ours_raw, stock_raw) of pack_bodies."""
+    """(ours_raw, stock_raw) of pack_bodies, as text (bytes that are not UTF-8 decode with U+FFFD)."""
     def dec(t):
-        return zlib.decompress(base64.b64decode(t)).decode("utf-8")
+        return zlib.decompress(base64.b64decode(t)).decode("utf-8", "replace")
     return dec(b["ours"]), dec(b["stock"])
 
 
@@ -800,9 +811,109 @@ def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx
     return c, []
 
 
+# R-P5P9-180: a worker exception is a recorded outcome, never a silent drop.
+HARNESS_ERR_LIMIT = 0.01        # stop the run above this share of a lane's cases ...
+HARNESS_ERR_WINDOW = 200        # ... over the last this many completed cases of the lane ...
+HARNESS_ERR_MIN = 100           # ... once at least this many are in the window
+HARNESS_ERR_CLASS = "harness-error"
+
+
+def is_harness_error(r):
+    return (r.get("v") or {}).get("class") == HARNESS_ERR_CLASS
+
+
+def case_cov(ep, lane, ours_only=False):
+    """The coverage label Runner.one gives a case (None: it sets none, ours-only light case)."""
+    if ep.split(".")[0] == "native":
+        return "native"
+    if ep in E.HEAVY_ENDPOINTS and lane is None:
+        return "node"
+    if not ours_only:
+        return "stock-sample" if lane == "sample" else "stock"
+    return None
+
+
+def harness_error_row(case, lane, exc, ours_only=False):
+    """The record of a case whose worker raised: id, endpoint, class, the exception type and
+    message (cut at 300 chars). No request, no response."""
+    ep = case.get("ep") or "?"
+    row = {"id": case.get("id"), "ep": ep, "cls": case.get("cls"), "t": int(time.time()),
+           "lane": lane or "main", "v": {"class": HARNESS_ERR_CLASS},
+           "harness_error": {"type": type(exc).__name__, "msg": str(exc)[:300]}}
+    cov = case_cov(ep, lane, ours_only)
+    if cov:
+        row["cov"] = cov
+    return row
+
+
+class LaneTally:
+    """Per-lane count of cases submitted, written and failed in the worker, with the rolling
+    window the harness-error stop rule reads. Thread-safe."""
+
+    def __init__(self, name, limit=HARNESS_ERR_LIMIT, window=HARNESS_ERR_WINDOW, min_window=HARNESS_ERR_MIN):
+        self.name, self.limit, self.min_window = name, limit, min_window
+        self.lock = threading.Lock()
+        self.submitted = self.written = self.errors = self.lost = 0
+        self.recent = collections.deque(maxlen=window)
+
+    def submit(self):
+        with self.lock:
+            self.submitted += 1
+
+    def finish(self, ok):
+        """A worker ended (`ok`: its record was written as a result). The stop message when the
+        window rate is over the limit, else None."""
+        with self.lock:
+            if ok:
+                self.written += 1
+            else:
+                self.errors += 1
+            self.recent.append(0 if ok else 1)
+            n, bad = len(self.recent), sum(self.recent)
+            if n >= self.min_window and bad / n > self.limit:
+                return ("lane %s: %d harness errors in the last %d cases (%.1f%% > %.0f%%)"
+                        % (self.name, bad, n, 100.0 * bad / n, 100.0 * self.limit))
+        return None
+
+    def lose(self):
+        """A worker raised and its error record could not be written either (or the future carried
+        an exception that escaped the handler)."""
+        with self.lock:
+            self.lost += 1
+
+    def reconciles(self):
+        with self.lock:
+            return self.submitted == self.written + self.errors + self.lost
+
+    def final(self):
+        """The stop message when the lane as a whole is over the limit or has a case unaccounted for."""
+        with self.lock:
+            if self.lost or self.submitted != self.written + self.errors + self.lost:
+                return "lane %s: %d cases unaccounted for (submitted %d, written %d, harness-error %d)" % (
+                    self.name, self.submitted - self.written - self.errors, self.submitted, self.written,
+                    self.errors)
+            if self.submitted and self.errors / self.submitted > self.limit:
+                return "lane %s: %d of %d cases ended in harness-error (%.1f%% > %.0f%%)" % (
+                    self.name, self.errors, self.submitted, 100.0 * self.errors / self.submitted,
+                    100.0 * self.limit)
+        return None
+
+    def line(self):
+        with self.lock:
+            return "lane %s: submitted %d = written %d + harness-error %d + lost %d%s" % (
+                self.name, self.submitted, self.written, self.errors, self.lost,
+                "" if self.submitted == self.written + self.errors + self.lost else "  RECONCILIATION FAILED")
+
+    def as_json(self):
+        with self.lock:
+            return {"lane": self.name, "submitted": self.submitted, "written": self.written,
+                    "harness_error": self.errors, "lost": self.lost, "t": int(time.time())}
+
+
 class Runner:
     def __init__(self, cfg, a):
         self.cfg, self.a = cfg, a
+        self.abort, self.abort_msg = threading.Event(), None
         o = cfg["ours"]
         st = cfg.get("stock", {})
         # Ours is paired with stock: by default it carries the stock side's total rate.
@@ -1075,32 +1186,92 @@ class Runner:
         return "sample" if getattr(self.a, "sample_flag", False) else None
 
     def done_ids(self, name):
+        """Ids with a written result. A harness-error record is not a result: resume runs it again."""
         done = set()
         fn = os.path.join(self.a.out, name)
         if os.path.exists(fn):
             for l in open(fn):
                 try:
-                    done.add(json.loads(l)["id"])
+                    r = json.loads(l)
+                    if not is_harness_error(r):
+                        done.add(r["id"])
                 except Exception:
                     pass
         return done
 
+    def stop_run(self, msg):
+        """Ends the run: no further case is submitted, the message is printed and run() returns 2."""
+        if not self.abort.is_set():
+            self.abort_msg = msg
+            print("STOPPING THE RUN: %s" % msg, flush=True)
+        self.abort.set()
+
+    def safe_one(self, case, lane, tally):
+        """`one` for a pool worker: an exception becomes a harness-error record (results.jsonl, or
+        sample.jsonl for the sample lane), a line in the log and a count in the lane tally."""
+        ok = True
+        try:
+            self.one(case, lane)
+        except Exception as e:  # noqa: BLE001 - every worker failure is a recorded outcome
+            ok = False
+            print("HARNESS-ERROR %s %s lane=%s %s: %s" % (case.get("id"), case.get("ep"), lane or "main",
+                                                          type(e).__name__, str(e)[:300]), flush=True)
+            try:
+                row = harness_error_row(case, lane, e, getattr(self.a, "ours_only", False))
+                (self.sample if lane == "sample" else self.res).write(json.dumps(row, separators=(",", ":")) + "\n")
+            except Exception as we:  # noqa: BLE001
+                tally.lose()
+                print("HARNESS-ERROR-UNRECORDED %s: %s: %s" % (case.get("id"), type(we).__name__, str(we)[:200]),
+                      flush=True)
+        msg = tally.finish(ok)
+        if msg:
+            self.stop_run(msg)
+
+    def landed(self, f, tally, gate):
+        """Done callback of every submitted case: frees the gate and reads the future, so an
+        exception that escaped safe_one is counted and stops the run instead of vanishing."""
+        gate.release()
+        e = f.exception()
+        if e is not None:
+            tally.lose()
+            print("HARNESS-ERROR-ESCAPED %s: %s" % (type(e).__name__, str(e)[:300]), flush=True)
+            self.stop_run("lane %s: a worker exception escaped the handler (%s)" % (tally.name, type(e).__name__))
+
     def pool(self, cases, workers, lane, deadline=None, name="main"):
-        """Run `cases` on `workers` threads; stops submitting at `deadline` (monotonic)."""
+        """Run `cases` on `workers` threads; stops submitting at `deadline` (monotonic) or when the
+        run is stopped. Prints and appends (DIR/lanes.jsonl) the lane's reconciliation: submitted
+        = written + harness-error. A failure of the lane itself stops the run."""
+        tally = LaneTally(name)
         n = skipped = 0
-        gate = threading.Semaphore(workers * 2)
-        with cf.ThreadPoolExecutor(workers) as ex:
-            for c in cases:
-                if deadline and time.monotonic() > deadline:
-                    skipped += 1
-                    continue
-                gate.acquire()
-                f = ex.submit(self.one, c, lane)
-                f.add_done_callback(lambda _f: gate.release())
-                n += 1
-                if n % 1000 == 0:
-                    print("%s submitted %d" % (name, n), flush=True)
-        print("%s done %d (past deadline: %d)" % (name, n, skipped), flush=True)
+        try:
+            gate = threading.Semaphore(workers * 2)
+            with cf.ThreadPoolExecutor(workers) as ex:
+                for c in cases:
+                    if self.abort.is_set():
+                        break
+                    if deadline and time.monotonic() > deadline:
+                        skipped += 1
+                        continue
+                    gate.acquire()
+                    tally.submit()
+                    f = ex.submit(self.safe_one, c, lane, tally)
+                    f.add_done_callback(lambda _f: self.landed(_f, tally, gate))
+                    n += 1
+                    if n % 1000 == 0:
+                        print("%s submitted %d" % (name, n), flush=True)
+        except Exception as e:  # noqa: BLE001 - the lane itself (case source, executor) failed
+            self.stop_run("lane %s failed: %s: %s" % (name, type(e).__name__, str(e)[:300]))
+        fin = tally.final()
+        if fin:
+            self.stop_run(fin)
+        print("%s done %d (past deadline: %d%s)" % (name, n, skipped, ", run stopped" if self.abort.is_set() else ""),
+              flush=True)
+        print(tally.line(), flush=True)
+        try:
+            with open(os.path.join(self.a.out, "lanes.jsonl"), "a") as lf:
+                lf.write(json.dumps(tally.as_json(), separators=(",", ":")) + "\n")
+        except OSError as e:
+            print("lanes.jsonl not written: %s" % e, flush=True)
 
     def run(self):
         done = self.done_ids("results.jsonl")
@@ -1138,7 +1309,11 @@ class Runner:
                   self.a.workers, None, None, "main")
         for t in threads:
             t.join()
+        if self.abort.is_set():
+            print("STOPPED: %s" % self.abort_msg, flush=True)
+            return 2
         print("all done", flush=True)
+        return 0
 
 
 def host_cases(cases, i, n, done):
@@ -1187,6 +1362,29 @@ def pct(xs, q):
     return xs[min(len(xs) - 1, int(q * len(xs)))]
 
 
+def read_lanes(out):
+    """The per-lane counts DIR/lanes.jsonl holds (one line per lane per invocation)."""
+    fn = os.path.join(out, "lanes.jsonl")
+    rows = []
+    if os.path.exists(fn):
+        for l in open(fn):
+            try:
+                rows.append(json.loads(l))
+            except Exception:
+                pass
+    return rows
+
+
+def reconciles(ln):
+    return ln.get("submitted", 0) == ln.get("written", 0) + ln.get("harness_error", 0) + ln.get("lost", 0)
+
+
+def reconcile_line(ln):
+    return "%s: submitted %d = written %d + harness-error %d + lost %d%s" % (
+        ln.get("lane"), ln.get("submitted", 0), ln.get("written", 0), ln.get("harness_error", 0),
+        ln.get("lost", 0), "" if reconciles(ln) else "  RECONCILIATION FAILED")
+
+
 def report(out):
     """DIR/report.md and DIR/summary.json from results.jsonl (main pass) and sample.jsonl
     (heavy endpoints against stock). Per endpoint and coverage source: cases, equal,
@@ -1201,6 +1399,7 @@ def report(out):
     hourly = collections.defaultdict(collections.Counter)
     node_why = collections.Counter()
     cov_tot = collections.defaultdict(collections.Counter)
+    herr, good_ids, written = [], collections.defaultdict(set), collections.Counter()
     for fname in ("results.jsonl", "sample.jsonl"):
         path = os.path.join(out, fname)
         if not os.path.exists(path):
@@ -1213,6 +1412,11 @@ def report(out):
             ep = r["ep"]
             cov = r.get("cov") or ("native" if ep.startswith("native.") else "stock")
             key = (ep, cov)
+            if is_harness_error(r):
+                herr.append((fname, key, r))        # counted below, once its id is known to have no result
+                continue
+            good_ids[fname].add(r["id"])
+            written[fname] += 1
             hr = time.strftime("%Y-%m-%dT%H", time.gmtime(r.get("t", 0)))
             if r.get("from") is None:
                 hourly[hr]["ours"] += 1 + (r.get("cross") is not None)
@@ -1274,8 +1478,20 @@ def report(out):
                     classes[ck][0] += 1
                     if len(classes[ck][1]) < 3:
                         classes[ck][1].append(r["id"])
+    # R-P5P9-180: a harness-error record is a case that has no result; a later result for the same id
+    # (a resumed run) settles it, and it is then counted as resolved, not open.
+    open_err, resolved_err = {}, 0
+    for fname, key, r in herr:
+        if r["id"] in good_ids[fname]:
+            resolved_err += 1
+        else:
+            open_err[(fname, r["id"])] = (key, r)
+    err_by_ep = collections.Counter()
+    for (fname, _), (key, r) in open_err.items():
+        agg[key]["harness-error"] += 1
+        err_by_ep[(r["ep"], (r.get("harness_error") or {}).get("type", "?"))] += 1
     cols = ["run", "equal", "allowlisted", "known-gap", "diff", "status", "incomplete", "stock-unavailable",
-            "stock_err", "ours_err", "ours_429", "not_run", "node_ok", "node_bad", "node_skip",
+            "harness-error", "stock_err", "ours_err", "ours_429", "not_run", "node_ok", "node_bad", "node_skip",
             "cross_ok", "cross_bad", "inv_clean"]
     lines = ["# Endpoint suite report", "",
              "Coverage: `stock` = paired with stock (light endpoints, all cases), `stock-sample` = heavy "
@@ -1309,6 +1525,24 @@ def report(out):
             lines.append("- %s: %d verdicts, %d equal (%.2f%%), %d allowlisted, %d known-gap, %d diff, %d status; "
                          "%d stock unavailable" % (cov, n, t["equal"], 100.0 * t["equal"] / max(n, 1), t["allowlisted"],
                                                    t["known-gap"], t["diff"], t["status"], t["stock-unavailable"]))
+    lanes = read_lanes(out)
+    lines += ["", "## Harness errors and reconciliation (R-P5P9-180)", "",
+              "- open harness-error cases (no result written): %d; resolved by a later result: %d" % (
+                  len(open_err), resolved_err),
+              "- records written: results.jsonl %d, sample.jsonl %d" % (written["results.jsonl"], written["sample.jsonl"])]
+    for (ep, typ), n in sorted(err_by_ep.items()):
+        lines.append("- harness-error %s %s: %d" % (ep, typ, n))
+    lines += ["", "Per lane, last runs (submitted = written + harness-error):", ""]
+    for ln in lanes:
+        lines.append("- " + reconcile_line(ln))
+    if not lanes:
+        lines.append("- no lanes.jsonl: this run did not record per-lane counts")
+    tot = collections.Counter()
+    for ln in lanes:
+        for k in ("submitted", "written", "harness_error", "lost"):
+            tot[k] += ln.get(k, 0)
+    if lanes:
+        lines.append("- total: " + reconcile_line(dict(tot, lane="all lanes")))
     gaps = evidence_gaps(out)
     lines += ["", "## Re-referee evidence (H5 c, H6 S9)", "",
               "- non-equal paired records: %d; lacking evidence: %d%s" % (
@@ -1345,10 +1579,16 @@ def report(out):
         lines.append("- %s %s `%s`: %d (%s)" % (ep, k, pat, n, ", ".join(ids)))
     open(os.path.join(out, "report.md"), "w").write("\n".join(lines) + "\n")
     json.dump({"endpoints": summ, "coverage": {k: dict(v) for k, v in cov_tot.items()},
-               "allow": dict(allow_ids), "evidence_gaps": dict(gaps), "hourly": {h: dict(v) for h, v in hourly.items()},
+               "allow": dict(allow_ids),
+               "harness_errors": {"open": len(open_err), "resolved": resolved_err,
+                                  "by_endpoint": {"%s|%s" % k: n for k, n in err_by_ep.items()},
+                                  "lanes": lanes, "reconciled": all(reconciles(x) for x in lanes)},
+               "evidence_gaps": dict(gaps), "hourly": {h: dict(v) for h, v in hourly.items()},
                "classes": [[ep, k, pat, n, ids] for (ep, k, pat), (n, ids) in classes.items()]},
               open(os.path.join(out, "summary.json"), "w"), indent=1)
     print("\n".join(lines[:6]))
+    print("harness-error open %d, resolved %d; lanes reconciled: %s" % (
+        len(open_err), resolved_err, "yes" if all(reconciles(x) for x in lanes) else "NO"))
 
 
 SUITE_RULE_IDS = {r.id for r in allow.RULES} | {"accepted-tags"}    # and the H2 id the tag rules replaced
@@ -1617,7 +1857,7 @@ def main():
     rr.add_argument("--md", required=True, help="the markdown file to write (aggregate counts only)")
     a = ap.parse_args()
     if a.cmd == "run":
-        Runner(tomllib.load(open(a.config, "rb")), a).run()
+        sys.exit(Runner(tomllib.load(open(a.config, "rb")), a).run())
     elif a.cmd == "estimate":
         estimate(tomllib.load(open(a.config, "rb")), a.cases, a.heavy_sample, a.sample_flag)
     elif a.cmd == "smoke":

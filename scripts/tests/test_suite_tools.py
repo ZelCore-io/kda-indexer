@@ -1657,5 +1657,210 @@ class H7Fixes(unittest.TestCase):
         self.assertIn("run4/build4.sh", open(os.path.join(self.R4, "verify4.sh")).read())
 
 
+class H9Fixes(unittest.TestCase):
+    """H9 (R-P5P9-180): run 4 wrote no non-equal stock-paired record (pack_bodies called .encode()
+    on bytes) and the pool never read its futures. Bytes and str bodies pack; every worker
+    exception is a harness-error record, a log line and a count; the lane totals reconcile."""
+
+    def runner(self, one=None, ours_only=False):
+        d = tempfile.mkdtemp()
+
+        class Fake(run.Runner):
+            def __init__(self):
+                self.a = type("A", (), {"out": d, "ours_only": ours_only})()
+                self.abort, self.abort_msg = run.threading.Event(), None
+                self.res = open(os.path.join(d, "results.jsonl"), "a", buffering=1)
+                self.sample = open(os.path.join(d, "sample.jsonl"), "a", buffering=1)
+                if one:
+                    self.one = one
+
+        return Fake(), d
+
+    def recs(self, d, name="results.jsonl"):
+        fn = os.path.join(d, name)
+        return [json.loads(x) for x in open(fn)] if os.path.exists(fn) else []
+
+    def paired(self, verdict, ours_raw, stock_raw):
+        """Runner.one for a light REST case against a fake stock; `verdict` is pair-diff's answer."""
+        rn, d = self.runner()
+        rn.tip, rn.oracles, rn.node, rn.idx = 100, [], None, {}
+        rn.ours_call = lambda fam, req, src=None: {"status": 200, "raw": ours_raw, "ms": 1}
+        rn.stock_call = lambda case, fam, stock, req, heavy: (
+            {"host": "h", "status": 200, "raw": stock_raw, "ms": 2}, None)
+        rn.pd = lambda req: verdict
+        case = {"id": "compat.coins:1", "ep": "compat.coins", "cls": "entity", "req": {"path": "/coins"}}
+        row = rn.one(case, None)
+        self.assertEqual(self.recs(d), [row])          # written, not only returned
+        return row
+
+    def test_pack_bodies_takes_bytes_str_and_none(self):
+        b = run.pack_bodies(b'{"a":1}', b'{"a":"\xc3\xa9"}')
+        self.assertEqual(run.unpack_bodies(b), ('{"a":1}', '{"a":"\u00e9"}'))
+        self.assertEqual(run.pack_bodies(b"x", b"y"), run.pack_bodies("x", "y"))      # same text either way
+        self.assertEqual(run.unpack_bodies(run.pack_bodies(b"x", "y")), ("x", "y"))
+        self.assertEqual(run.unpack_bodies(run.pack_bodies(None, b"")), ("", ""))
+        self.assertEqual(run.unpack_bodies(run.pack_bodies(bytearray(b"z"), "")), ("z", ""))
+        run.unpack_bodies(run.pack_bodies(b"\xff\xfe", b"\xff"))          # not UTF-8: no exception
+
+    def test_non_equal_paths_keep_bodies_from_bytes_and_str(self):
+        ent = [{"path": "/x", "kind": "changed", "a": 1, "b": 2}]
+        for cls in ("diff", "status", "allowlisted", "known-gap"):
+            for ours, stock in ((b'{"x":1}', b'{"x":2}'), ('{"x":1}', '{"x":2}')):
+                v = {"class": cls, "entries": ent, "total": 1, "all": ent, "ids": ["rule-x"]}
+                row = self.paired(v, ours, stock)
+                self.assertNotIn(row["v"]["class"], (None, "equal"), cls)
+                self.assertEqual(run.unpack_bodies(row["bodies"]), ('{"x":1}', '{"x":2}'), (cls, type(ours)))
+                self.assertEqual(run.missing_evidence(dict(row, tip={})), [])     # re-refereeable
+
+    def test_equal_path_is_unchanged(self):
+        row = self.paired({"class": "equal"}, b'{"x":1}', b'{"x":1}')
+        self.assertEqual(row["v"]["class"], "equal")
+        self.assertNotIn("bodies", row)
+        self.assertNotIn("counts", row)
+
+    def test_stock_unavailable_with_bytes_is_recorded(self):
+        rn, d = self.runner()
+        rn.tip, rn.oracles, rn.node, rn.idx = 100, [], None, {}
+        rn.ours_call = lambda fam, req, src=None: {"status": 200, "raw": b"{}", "ms": 1}
+        rn.stock_call = lambda case, fam, stock, req, heavy: (
+            {"host": "h", "status": 503, "raw": b"busy", "ms": 2}, None)
+        rn.one({"id": "compat.coins:2", "ep": "compat.coins", "cls": "entity", "req": {"path": "/c"}}, None)
+        self.assertEqual(self.recs(d)[0]["v"], {"class": "stock-unavailable"})
+
+    def case(self, i, ep="compat.coins"):
+        return {"id": "%s:%d" % (ep, i), "ep": ep, "cls": "entity", "req": {}}
+
+    def test_worker_exception_is_a_harness_error_record(self):
+        def boom(case, lane):
+            raise AttributeError("'bytes' object has no attribute 'encode'")
+        rn, d = self.runner(one=boom)
+        t = run.LaneTally("t")
+        t.submit()
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rn.safe_one(self.case(1), None, t)                 # does not raise
+        (r,) = self.recs(d)
+        self.assertEqual((r["id"], r["ep"], r["cls"], r["v"], r["cov"]),
+                         ("compat.coins:1", "compat.coins", "entity", {"class": "harness-error"}, "stock"))
+        self.assertEqual(r["harness_error"]["type"], "AttributeError")
+        self.assertIn("no attribute 'encode'", r["harness_error"]["msg"])
+        self.assertNotIn("req", r)                             # no request payload
+        self.assertIn("HARNESS-ERROR compat.coins:1 compat.coins", buf.getvalue())
+        self.assertEqual((t.written, t.errors, t.reconciles()), (0, 1, True))
+        t2 = run.LaneTally("s")
+        t2.submit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            rn.safe_one(self.case(2, "gql.transactions"), "sample", t2)
+        self.assertEqual(self.recs(d, "sample.jsonl")[0]["cov"], "stock-sample")      # the sample lane's file
+        self.assertEqual(len(self.recs(d)), 1)
+
+    def test_harness_error_row_coverage_labels(self):
+        e = RuntimeError("x")
+        self.assertEqual(run.harness_error_row({"id": "i", "ep": "native.tx"}, None, e)["cov"], "native")
+        heavy = sorted(E.HEAVY_ENDPOINTS)[0]
+        self.assertEqual(run.harness_error_row({"id": "i", "ep": heavy}, None, e)["cov"], "node")
+        self.assertNotIn("cov", run.harness_error_row({"id": "i", "ep": "compat.coins"}, None, e, True))
+        self.assertEqual(len(run.harness_error_row({"id": "i", "ep": "x"}, None, RuntimeError("m" * 999))
+                             ["harness_error"]["msg"]), 300)
+
+    def pool(self, n, bad, workers=4):
+        """A pool of n cases; those whose number is in `bad` raise. (runner, dir, printed text)"""
+        def one(case, lane):
+            if int(case["id"].rsplit(":", 1)[1]) in bad:
+                raise ValueError("bad case")
+            rn.res.write(json.dumps({"id": case["id"], "ep": case["ep"], "ours": {"st": 200, "ms": 1}}) + "\n")
+        rn, d = self.runner(one=one)
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rn.pool((self.case(i) for i in range(n)), workers, None, None, "main")
+        return rn, d, buf.getvalue()
+
+    def test_pool_reconciles_written_plus_errors_to_submitted(self):
+        rn, d, out = self.pool(500, {7})                        # 0.2%: under the limit, the run goes on
+        self.assertFalse(rn.abort.is_set())
+        recs = self.recs(d)
+        self.assertEqual(len(recs), 500)
+        self.assertEqual(sum(run.is_harness_error(r) for r in recs), 1)
+        (ln,) = self.recs(d, "lanes.jsonl")
+        self.assertEqual((ln["lane"], ln["submitted"], ln["written"], ln["harness_error"], ln["lost"]),
+                         ("main", 500, 499, 1, 0))
+        self.assertIn("lane main: submitted 500 = written 499 + harness-error 1 + lost 0", out)
+        self.assertIn("HARNESS-ERROR compat.coins:7", out)
+        self.assertEqual(rn.done_ids("results.jsonl"), {"compat.coins:%d" % i for i in range(500) if i != 7})
+
+    def test_pool_stops_the_run_above_one_percent(self):
+        rn, d, out = self.pool(1000, set(range(1000)), workers=1)   # every case fails
+        self.assertTrue(rn.abort.is_set())
+        self.assertIn("harness errors in the last", rn.abort_msg)
+        self.assertIn("STOPPING THE RUN", out)
+        (ln,) = self.recs(d, "lanes.jsonl")
+        self.assertLess(ln["submitted"], 1000)
+        self.assertEqual(ln["submitted"], ln["written"] + ln["harness_error"] + ln["lost"])
+        self.assertEqual(len(self.recs(d)), ln["harness_error"])      # none dropped, all recorded
+
+    def test_small_lane_over_the_limit_fails_at_its_end(self):
+        rn, d, out = self.pool(40, {3, 4})                      # 5% of a lane too short for the window
+        self.assertTrue(rn.abort.is_set())
+        self.assertIn("2 of 40 cases ended in harness-error", rn.abort_msg)
+
+    def test_a_future_that_escapes_the_handler_is_counted_and_stops_the_run(self):
+        rn, d = self.runner()
+        def escape(case, lane, tally):
+            raise KeyError("escaped")
+        rn.safe_one = escape
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            rn.pool((self.case(i) for i in range(5)), 2, None, None, "main")
+        self.assertTrue(rn.abort.is_set())
+        (ln,) = self.recs(d, "lanes.jsonl")
+        self.assertEqual((ln["submitted"], ln["lost"]), (ln["submitted"], ln["submitted"]))
+        self.assertGreaterEqual(ln["lost"], 1)
+
+    def test_a_failing_case_source_stops_the_run(self):
+        rn, d = self.runner(one=lambda c, lane: None)
+        def src():
+            yield self.case(1)
+            raise OSError("cases gone")
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            rn.pool(src(), 1, None, None, "lane-x")
+        self.assertIn("lane lane-x failed: OSError: cases gone", rn.abort_msg)
+
+    def test_report_counts_harness_errors_and_reconciles(self):
+        d = tempfile.mkdtemp()
+        ok = {"id": "compat.coins:1", "ep": "compat.coins", "cls": "entity", "cov": "stock", "t": 0,
+              "ours": {"st": 200, "ms": 1}, "stock": {"st": 200, "ms": 1, "host": "h"}, "v": {"class": "equal"}}
+        err = lambda i: {"id": "compat.coins:%d" % i, "ep": "compat.coins", "cls": "entity", "cov": "stock", "t": 0,
+                         "v": {"class": "harness-error"}, "harness_error": {"type": "AttributeError", "msg": "m"}}
+        with open(os.path.join(d, "results.jsonl"), "w") as f:
+            for r in (ok, err(2), err(3), dict(ok, id="compat.coins:3")):        # 3 failed, then resumed and written
+                f.write(json.dumps(r) + "\n")
+        with open(os.path.join(d, "lanes.jsonl"), "w") as f:
+            f.write(json.dumps({"lane": "main", "submitted": 3, "written": 1, "harness_error": 2, "lost": 0}) + "\n")
+            f.write(json.dumps({"lane": "x", "submitted": 5, "written": 1, "harness_error": 1, "lost": 0}) + "\n")
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            run.report(d)
+        md = open(os.path.join(d, "report.md")).read()
+        header = [x for x in md.split("\n") if x.startswith("| endpoint")][0]
+        self.assertIn("| harness-error |", header)                                  # a column of the table
+        self.assertIn("open harness-error cases (no result written): 1; resolved by a later result: 1", md)
+        self.assertIn("- harness-error compat.coins AttributeError: 1", md)
+        self.assertIn("- main: submitted 3 = written 1 + harness-error 2 + lost 0\n", md)
+        self.assertIn("- x: submitted 5 = written 1 + harness-error 1 + lost 0  RECONCILIATION FAILED", md)
+        sm = json.load(open(os.path.join(d, "summary.json")))
+        self.assertEqual((sm["harness_errors"]["open"], sm["harness_errors"]["resolved"],
+                          sm["harness_errors"]["reconciled"]), (1, 1, False))
+        self.assertEqual(sm["endpoints"]["compat.coins|stock"]["harness-error"], 1)
+        self.assertEqual(sm["endpoints"]["compat.coins|stock"]["run"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
