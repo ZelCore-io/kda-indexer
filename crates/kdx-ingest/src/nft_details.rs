@@ -95,6 +95,10 @@ fn dict_name(txn: &impl Txn, k: DictKind, id: u32) -> Result<Option<String>> {
 }
 
 /// Whether the stored details still cover a balance row at `row_as_of`.
+///
+/// TODO(D2): height-only. A details answer read on an orphan at the same height is kept until
+/// the balance row's `as_of` moves; `crate::reconcile::branch_of` on the answer's
+/// `prevBlockHash` would close it, as `nft_fill` does (see `docs/operations.md`, Branch check).
 fn covers(as_of: Option<u32>, row_as_of: u32) -> bool {
     as_of.is_some_and(|h| h >= row_as_of)
 }

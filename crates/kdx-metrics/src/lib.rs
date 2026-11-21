@@ -470,7 +470,8 @@ impl Metrics {
             .inc();
     }
 
-    /// One balance reconcile outcome (`ok|absent|error|skipped|parked`) and its duration.
+    /// One balance reconcile outcome (`ok|absent|error|skipped|parked`, and `other_branch`,
+    /// `capped`, `not_fungible` counted with no duration) and its duration.
     pub fn balance_reconcile(&self, result: &'static str, secs: f64) {
         let l: Labels = vec![("result", result.into())];
         self.balance_reconcile.get_or_create(&l).inc();
