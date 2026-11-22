@@ -41,35 +41,21 @@ impl Like {
         if let Some(p) = &self.plain {
             return s.contains(p.as_str());
         }
-        // Greedy match with backtracking to the last `%` (linear in practice).
-        let t: Vec<char> = s.chars().collect();
-        let (mut i, mut j) = (0usize, 0usize);
-        let mut star: Option<(usize, usize)> = None;
-        while i < t.len() {
-            match self.pat.get(j) {
-                Some(Tok::Any) => {
-                    star = Some((j, i));
-                    j += 1;
-                }
-                Some(Tok::One) => {
-                    i += 1;
-                    j += 1;
-                }
-                Some(Tok::Ch(c)) if *c == t[i] => {
-                    i += 1;
-                    j += 1;
-                }
-                _ => match star {
-                    Some((sj, si)) => {
-                        star = Some((sj, si + 1));
-                        j = sj + 1;
-                        i = si + 1;
-                    }
-                    None => return false,
-                },
+        // The pattern is `%`-separated pieces with `%` at both ends (`new` adds them), so
+        // matching each piece at its leftmost place after the previous one is exact: a later
+        // place never leaves more room for the rest. A piece of literals only is found with a
+        // substring search; one with `_` is tried at each character (F-53).
+        let mut at = 0;
+        for piece in self.pat.split(|t| *t == Tok::Any) {
+            if piece.is_empty() {
+                continue;
+            }
+            match find_piece(&s[at..], piece) {
+                Some(end) => at += end,
+                None => return false,
             }
         }
-        self.pat[j..].iter().all(|t| *t == Tok::Any)
+        true
     }
 
     /// Maximal runs of literal characters, in pattern order (wildcards split runs; an escaped
@@ -102,9 +88,56 @@ impl Like {
     }
 }
 
+/// End (byte offset in `s`) of the leftmost match of `piece` (no `Tok::Any`) in `s`.
+fn find_piece(s: &str, piece: &[Tok]) -> Option<usize> {
+    if piece.iter().all(|t| matches!(t, Tok::Ch(_))) {
+        let lit: String = piece
+            .iter()
+            .map(|t| match t {
+                Tok::Ch(c) => *c,
+                _ => unreachable!(),
+            })
+            .collect();
+        return s.find(lit.as_str()).map(|i| i + lit.len());
+    }
+    let mut start = 0;
+    loop {
+        let mut it = s[start..].chars();
+        let mut len = 0;
+        let ok = piece.iter().all(|t| match (t, it.next()) {
+            (Tok::One, Some(c)) => {
+                len += c.len_utf8();
+                true
+            }
+            (Tok::Ch(p), Some(c)) if *p == c => {
+                len += c.len_utf8();
+                true
+            }
+            _ => false,
+        });
+        if ok {
+            return Some(start + len);
+        }
+        start += s[start..].chars().next()?.len_utf8();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Like;
+
+    /// F-53: a long literal run before a `%` is found with a substring search, not by
+    /// retrying the run at every character (O(N×M)): 4 MiB of `a` against `a{200}b%c` would
+    /// be ~800M character steps that way.
+    #[test]
+    fn long_literal_runs_match_in_linear_time() {
+        let s = "a".repeat(4 << 20);
+        let like = Like::new(&format!("{}b%c", "a".repeat(200)));
+        let t0 = std::time::Instant::now();
+        assert!(!like.matches(&s));
+        let took = t0.elapsed();
+        assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+    }
 
     #[test]
     fn literal_runs_split_at_wildcards() {
