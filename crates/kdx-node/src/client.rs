@@ -131,10 +131,11 @@ fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T> {
         .map_err(|e| NodeError::Decode(format!("{e}; body starts: {}", body_prefix(body))))
 }
 
-/// F-10: a payload hash goes into a URL path, so it must be what a hash looks like: 43 chars
-/// of unpadded base64url (32 bytes).
+/// F-10: a payload hash goes into a URL path, so it may only hold unpadded base64url
+/// characters, 1 to 43 of them (a real hash is 43; nothing here can leave the path segment).
+/// The ingest checks the full `Hash32` form before it calls the client.
 fn check_payload_hash(h: &str) -> Result<()> {
-    if h.len() == 43
+    if (1..=43).contains(&h.len())
         && h.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
@@ -906,7 +907,7 @@ mod tests {
     async fn payload_hash_is_checked_before_the_url() {
         let (base, n) = mock(|_, _| Reply::Json("{}".into()));
         let c = client(base);
-        for bad in ["../../info", "a?b", "x", &"A".repeat(44)] {
+        for bad in ["../../info", "a?b", "", "a%2Fb", &"A".repeat(44)] {
             assert!(
                 matches!(
                     within(c.payload_with_outputs(0, bad)).await,
