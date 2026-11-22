@@ -77,6 +77,11 @@ pub struct GraphqlSettings {
     pub ws_conns_max: usize,
     pub ws_init: Duration,
     pub ws_idle: Duration,
+    /// How often the server pings a websocket peer (audit F-25), [`ws::WS_PING`].
+    pub ws_ping: Duration,
+    /// A websocket peer that sends no frame (not even a pong) this long is closed (audit
+    /// F-25), [`ws::WS_SILENCE`].
+    pub ws_silence: Duration,
     pub ws_tx_wait: Duration,
     pub feed_poll: Duration,
     /// Byte budget of the decoded blocks the feed's broadcast ring holds (M-3).
@@ -128,6 +133,8 @@ impl Default for GraphqlSettings {
             ws_conns_max: 1000,
             ws_init: Duration::from_secs(10),
             ws_idle: Duration::from_secs(600),
+            ws_ping: ws::WS_PING,
+            ws_silence: ws::WS_SILENCE,
             ws_tx_wait: Duration::from_secs(3600),
             feed_poll: Duration::from_millis(1000),
             feed_ring_bytes: crate::feed::RING_BYTES,

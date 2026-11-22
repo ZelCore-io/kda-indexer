@@ -523,6 +523,8 @@ impl GraphqlConfig {
             ws_conns_max: self.ws_conns_max as usize,
             ws_init: Duration::from_secs(self.ws_init_secs),
             ws_idle: Duration::from_secs(self.ws_idle_secs),
+            ws_ping: kdx_graphql::ws::WS_PING,
+            ws_silence: kdx_graphql::ws::WS_SILENCE,
             ws_tx_wait: Duration::from_secs(self.ws_tx_wait_secs),
             feed_poll: Duration::from_millis(self.feed_poll_ms),
             feed_ring_bytes: self.feed_ring_mb as usize * (1 << 20),

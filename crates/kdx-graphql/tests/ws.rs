@@ -928,3 +928,134 @@ async fn depth_over_9_is_refused_over_the_socket() {
     .await;
     assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
 }
+
+/// Connect offering `proto` as one header value; the subprotocol the server answers with.
+async fn connect_with_protocol(s: &Server, proto: &str) -> Result<(Ws, Option<String>), u16> {
+    let mut req = format!("ws://{}/graphql", s.addr)
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", proto.parse().unwrap());
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, r)) => {
+            let p = r
+                .headers()
+                .get("sec-websocket-protocol")
+                .map(|v| v.to_str().unwrap().to_owned());
+            Ok((ws, p))
+        }
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Audit F-26: the subprotocol is chosen once, in the server's order and exact case, over
+/// every offered value, so the wire and the session agree in both offer orders; an
+/// upper-case offer is refused with 400.
+#[tokio::test]
+async fn subprotocol_is_chosen_once_in_server_order() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    for offer in [
+        "graphql-ws, graphql-transport-ws",
+        "graphql-transport-ws, graphql-ws",
+    ] {
+        let (mut a, p) = connect_with_protocol(&s, offer).await.unwrap();
+        assert_eq!(p.as_deref(), Some("graphql-transport-ws"), "{offer}");
+        init(&mut a).await;
+        send(
+            &mut a,
+            json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+        )
+        .await;
+        assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+        s.feed.inject(block(0, 3));
+        // graphql-transport-ws delivers `next` (the legacy protocol says `data`).
+        let m = recv(&mut a).await.unwrap();
+        assert_eq!(m["type"], "next", "{offer}: {m}");
+        drop(a);
+        assert!(wait_for(|| active_subscriptions(&s.schema) == 0).await);
+    }
+    let (_, p) = connect_with_protocol(&s, "graphql-ws").await.unwrap();
+    assert_eq!(p.as_deref(), Some("graphql-ws"));
+    assert_eq!(connect(&s, "GRAPHQL-WS").await.err(), Some(400));
+    assert_eq!(connect(&s, "Graphql-Transport-Ws").await.err(), Some(400));
+}
+
+fn pinging() -> GraphqlSettings {
+    GraphqlSettings {
+        ws_ping: Duration::from_millis(100),
+        ws_silence: Duration::from_millis(400),
+        ws_idle: Duration::from_millis(200),
+        ..GraphqlSettings::default()
+    }
+}
+
+/// Audit F-25: a peer that stops answering (sends no frame, not even a pong) is closed after
+/// `ws_silence` although its subscription is active, and its slots return.
+#[tokio::test]
+async fn a_silent_peer_is_closed_and_its_slots_return() {
+    let s = server(pinging(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    // `a` is no longer polled: it answers no ping.
+    let t = Instant::now();
+    let until = t + Duration::from_secs(6);
+    while active_subscriptions(&s.schema) != 0 && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(active_subscriptions(&s.schema), 0);
+    assert!(t.elapsed() >= Duration::from_millis(300), "{:?}", t.elapsed());
+    drop(a);
+}
+
+/// Audit F-25: a peer that answers the server's pings stays open with an active
+/// subscription, past `ws_silence` and `ws_idle`.
+#[tokio::test]
+async fn a_peer_answering_pings_stays_open() {
+    let s = server(pinging(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    // Reading answers pings (tungstenite queues the pong and flushes it on the next read).
+    let mut pings = 0;
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        match tokio::time::timeout(Duration::from_millis(50), a.next()).await {
+            Err(_) => {}
+            Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
+            Ok(Some(Ok(Message::Close(f)))) => panic!("closed: {f:?}"),
+            Ok(m) => panic!("unexpected: {m:?}"),
+        }
+    }
+    assert!(pings >= 5, "{pings} pings");
+    assert_eq!(active_subscriptions(&s.schema), 1);
+}
+
+/// Audit F-25: the client's own Ping and Pong frames take no rate token.
+#[tokio::test]
+async fn ping_and_pong_frames_take_no_rate_token() {
+    let s = server(GraphqlSettings::default(), 10).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    for i in 0..60u8 {
+        a.send(Message::Ping(vec![i].into())).await.unwrap();
+        a.send(Message::Pong(vec![i].into())).await.unwrap();
+    }
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+}

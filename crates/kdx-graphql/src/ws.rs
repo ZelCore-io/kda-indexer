@@ -57,6 +57,11 @@ pub const MAX_MESSAGE: usize = 64 * 1024;
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Client messages buffered between the socket reader and the protocol handler.
 const INBOX: usize = 16;
+/// The server pings each websocket peer this often (audit F-25), each Ping sent under
+/// [`SEND_TIMEOUT`].
+pub const WS_PING: Duration = Duration::from_secs(30);
+/// A peer that sends no frame for this long (three missed pings) is closed (audit F-25).
+pub const WS_SILENCE: Duration = Duration::from_secs(90);
 
 /// Process-wide websocket state (in [`Gql`]).
 pub struct WsState {
@@ -251,11 +256,22 @@ fn refuse(status: StatusCode, code: Code, msg: &str) -> Response {
         .into_response()
 }
 
-fn protocol_of(headers: &HeaderMap) -> Option<WebSocketProtocols> {
-    let v = headers.get(header::SEC_WEBSOCKET_PROTOCOL)?.to_str().ok()?;
-    v.split(',')
-        .map(str::trim)
-        .find_map(|p| p.parse::<WebSocketProtocols>().ok())
+/// The subprotocols served, in the server's order of preference.
+const PROTOCOLS: [&str; 2] = ["graphql-transport-ws", "graphql-ws"];
+
+/// The subprotocol, chosen once (audit F-26): the first of [`PROTOCOLS`], in the server's
+/// order and exact case, that any `Sec-WebSocket-Protocol` value offers. axum's
+/// `WebSocketUpgrade::protocols` chooses by the same rule; it is given only this name, so
+/// the name on the wire is the one the session speaks.
+fn protocol_of(headers: &HeaderMap) -> Option<(&'static str, WebSocketProtocols)> {
+    let offered: Vec<&str> = headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(',').map(str::trim))
+        .collect();
+    let name = PROTOCOLS.into_iter().find(|p| offered.contains(p))?;
+    Some((name, name.parse().ok()?))
 }
 
 /// Answer a websocket upgrade on `/graphql`.
@@ -275,7 +291,7 @@ pub async fn upgrade(schema: Arc<KdxSchema>, st: Arc<ApiState>, req: HttpRequest
             "subscriptions are not served (no block feed)",
         );
     }
-    let Some(protocol) = protocol_of(req.headers()) else {
+    let Some((protocol_name, protocol)) = protocol_of(req.headers()) else {
         m.graphql_rejected("ws_protocol");
         return refuse(
             StatusCode::BAD_REQUEST,
@@ -309,12 +325,21 @@ pub async fn upgrade(schema: Arc<KdxSchema>, st: Arc<ApiState>, req: HttpRequest
         Ok(ws) => ws,
         Err(e) => return e.into_response(),
     };
-    ws.protocols(["graphql-transport-ws", "graphql-ws"])
+    ws.protocols([protocol_name])
         .max_message_size(MAX_MESSAGE)
         .max_frame_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| async move {
-            drive(socket, schema, st, ip, protocol, (ip_slot, conn_slot)).await;
+        .on_upgrade(move |socket| {
+            in_session(
+                ip,
+                drive(socket, schema, st, ip, protocol, (ip_slot, conn_slot)),
+            )
         })
+}
+
+/// Run a socket session as a request of client `ip`, so the heavy reads of every operation
+/// over it count against that client's share, as an HTTP request's do (audit F-06).
+async fn in_session<F: std::future::Future>(ip: IpAddr, f: F) -> F::Output {
+    kdx_api::server::as_client(ip, f).await
 }
 
 async fn drive(
@@ -351,12 +376,23 @@ async fn drive(
         .saturating_add(2);
     let rate = over_rate.clone();
     let stop = stop_code.clone();
+    // Audit F-25: the time of the last inbound frame, in ms since `started`.
+    let started = Instant::now();
+    let last_in = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let heard = last_in.clone();
     let mut reader = tokio::spawn(async move {
         let mut fwd = Some(in_tx);
         let mut seen: u32 = 0;
         while let Some(msg) = source.next().await {
+            if msg.is_ok() {
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                heard.store(ms, Ordering::Release);
+            }
             let msg = match msg {
                 Ok(Message::Close(_)) => break,
+                // Audit F-25: pings and pongs take no rate token (the server's own pings
+                // are answered with pongs; axum answers the client's pings).
+                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
                 Ok(_) if fwd.is_none() => continue,
                 Ok(m) => m,
                 Err(e) => {
@@ -412,9 +448,12 @@ async fn drive(
         });
     let mut gql_ws = std::pin::pin!(gql_ws);
 
-    let started = Instant::now();
     let mut idle_since = Some(Instant::now());
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + settings.ws_ping,
+        settings.ws_ping,
+    );
     let close: Option<(u16, String)> = loop {
         tokio::select! {
             out = gql_ws.next() => match out {
@@ -439,7 +478,23 @@ async fn drive(
                     };
                 }
             },
+            _ = ping.tick() => {
+                // Audit F-25: a ping under the same send timeout as any server message.
+                match tokio::time::timeout(SEND_TIMEOUT, sink.send(Message::Ping(Default::default()))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break None,
+                    Err(_) => {
+                        m.graphql_rejected("ws_slow_reader");
+                        break Some((4008, "client is not reading".into()));
+                    }
+                }
+            }
             _ = tick.tick() => {
+                let heard = Duration::from_millis(last_in.load(Ordering::Acquire));
+                if started.elapsed().saturating_sub(heard) > settings.ws_silence {
+                    m.graphql_rejected("ws_silent");
+                    break Some((4000, "no frame from the client".into()));
+                }
                 if !inited.load(Ordering::Acquire) && started.elapsed() > settings.ws_init {
                     m.graphql_rejected("ws_init_timeout");
                     break Some((4408, "Connection initialisation timeout".into()));
@@ -536,6 +591,43 @@ mod tests {
     }
 
     /// I-2: every subscription message runs under one deadline of its own.
+    /// Audit F-06: heavy reads inside a socket session take the client's own heavy slot
+    /// first: with that client's queue full (one running, the rest waiting), a heavy read
+    /// in its session is refused at once instead of taking a shared heavy slot.
+    #[tokio::test]
+    async fn a_socket_session_is_gated_per_client() {
+        let f = crate::testutil::store();
+        let st = f.st.clone();
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut held = Vec::new();
+        for _ in 0..=kdx_api::server::HEAVY_WAITING_PER_CLIENT {
+            let (st, mut rx) = (st.clone(), rx.clone());
+            held.push(tokio::spawn(kdx_api::server::as_client(ip, async move {
+                st.read_heavy(move |_| {
+                    // Until released, or until the test ends (the sender drops).
+                    while !*rx.borrow_and_update() && rx.has_changed().is_ok() {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(())
+                })
+                .await
+            })));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let t = Instant::now();
+        let r = in_session(ip, st.read_heavy(|_| Ok(()))).await;
+        assert!(
+            matches!(r, Err(kdx_api::ApiError::Unavailable(_))),
+            "{r:?}"
+        );
+        assert!(t.elapsed() < Duration::from_millis(100));
+        let _ = tx.send(true);
+        for h in held {
+            assert!(h.await.unwrap().is_ok());
+        }
+    }
+
     #[tokio::test]
     async fn every_subscription_message_has_a_deadline() {
         let schema = Schema::build(Q, EmptyMutation, S).extension(WsOps).finish();
