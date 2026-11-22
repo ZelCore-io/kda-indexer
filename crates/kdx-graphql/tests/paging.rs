@@ -1739,6 +1739,60 @@ mod audit_pr3 {
         assert!(hashes(&fx.schema, bh, "nobody.token").await.is_empty());
     }
 
+    /// PR-4 (a), stock parity: `transactions(accountName | chainId, fungibleName)` keeps the
+    /// txs with ANY event of that module (stock: `EXISTS` an event with `module` = the name),
+    /// not only those with a transfer of it: block (1, 11)'s tx, sent by Alice, emits only
+    /// `coin.NOTE`.
+    #[tokio::test]
+    async fn fungible_name_keeps_txs_with_any_event_of_the_module() {
+        let fx = fixture();
+        let note = fx.rks[&(1, 11)][0].clone();
+        for src in [
+            format!("accountName: \"{ALICE}\""),
+            format!("accountName: \"{ALICE}\", chainId: \"1\""),
+        ] {
+            let hs = hashes(&fx.schema, src.clone(), "coin").await;
+            assert!(hs.contains(&note), "{src}: {hs:?}");
+            // A module the tx has no event of still drops it.
+            let hs = hashes(&fx.schema, src.clone(), "kaddex.kdx").await;
+            assert!(!hs.contains(&note), "{src}: {hs:?}");
+            assert!(!hs.is_empty(), "{src}");
+        }
+        // Without an account, key or block the source stays the full-history
+        // `<module>.TRANSFER` postings (a deliberate gap with stock, see docs/graphql.md):
+        // the NOTE-only tx is not listed there.
+        for src in ["chainId: \"1\"", "minHeight: 11, maxHeight: 11"] {
+            let hs = hashes(&fx.schema, src.to_owned(), "coin").await;
+            assert!(!hs.contains(&note), "{src}: {hs:?}");
+            assert!(!hs.is_empty(), "{src}");
+        }
+        // Over the old sender path too (`sender_index = false`).
+        fx.store.set_sender_index(false);
+        let hs = hashes(&fx.schema, format!("accountName: \"{ALICE}\""), "coin").await;
+        assert!(hs.contains(&note), "{hs:?}");
+    }
+
+    /// PR-4 (a), controller ruling: `transactions(fungibleName)` without an account, key or
+    /// block reads the full-history `<module>.TRANSFER` postings, so a transfer more than
+    /// `MAX_HEIGHTS` below the chain's tip is still listed (a heights walk would stop above
+    /// it).
+    #[tokio::test]
+    async fn fungible_name_alone_reaches_transfers_below_the_height_walk() {
+        let extra = kdx_graphql::txlist::MAX_HEIGHTS + 10;
+        let fx = fixture_big(GraphqlSettings::default(), extra);
+        let old = fx.rks[&(0, 4)][0].clone();
+        let v = run(
+            &fx.schema,
+            "{ transactions(chainId: \"0\", fungibleName: \"coin\", last: 3) { edges { node { hash } } } }",
+        )
+        .await;
+        let hs: Vec<&str> = edges(&v, "transactions")
+            .iter()
+            .map(|e| e["node"]["hash"].as_str().unwrap())
+            .collect();
+        assert!(hs.contains(&old.as_str()), "{v}");
+    }
+
     /// F-30: the `isNFT` account path checks `fungibleName` as every other path does.
     #[tokio::test]
     async fn nft_transfers_check_the_fungible_name() {

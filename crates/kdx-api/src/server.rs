@@ -1636,8 +1636,12 @@ pub(crate) mod tests {
             .acquire_many_owned(st.settings.read_threads as u32)
             .await
             .unwrap();
+        // Within the per-request deadline, not the 30 s `/v1/txs` one (audit-pr5-review note
+        // 1): a route wrongly on `v1txs_deadline` would also answer 504, but after 30 s.
+        let t = Instant::now();
         let resp = get("/txs/account/k:alice?limit=10000").await.unwrap();
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         drop(held);
     }
 

@@ -78,7 +78,7 @@ same counting and the same refusal text, code and HTTP status. They are fixed, n
 | Limit | Value | Refusal (message; top-level `code`; HTTP) | `extensions.limit` |
 |---|---|---|---|
 | complexity (HTTP and websocket) | 4000 | `[ERROR][GRAPHQL][VALID_RANGE] Sorry, too complicated query! Exceeded the maximum allowed complexity.`; `INTERNAL_SERVER_ERROR`; 500. Over the websocket: `Sorry, too complicated query! Exceeded the maximum allowed complexity.` | `complexity` |
-| depth (HTTP only, as stock) | 9 | `'<operation name or (anonymous)>' exceeds operation depth limits.`; `GRAPHQL_VALIDATION_FAILED`; 400 | `depth` |
+| depth (HTTP and websocket; stock: HTTP only) | 9 | `'<operation name or (anonymous)>' exceeds operation depth limits.`; `GRAPHQL_VALIDATION_FAILED`; 400. Over the websocket the same message comes as the subscription's error | `depth` |
 
 Complexity is `graphql-query-complexity` 1.0.0 as stock configures it. A field with stock's
 `@complexity(value, multipliers)` directive costs `(value + cost of its selection) × Π
@@ -101,7 +101,11 @@ priced as stock prices its lists, `@complexity(value: 1, multipliers: ["first", 
 Stock's own pagination serves `first: 0` (or `last: 0`) without a cursor as the default page of
 20, but its gate multiplies by the argument's value, 0: such a page and everything nested in it
 cost 0 there, at every level. This indexer keeps that price at the gate (parity) and bounds the
-rows with its read budget instead (below).
+rows with its read budget instead (below). One case differs (audit F-04): a zero multiplier
+next to a non-zero one of the same field is ignored, so `first: 1000, last: 0` (served as
+1,000 rows) is priced at 1,000, not 0 as stock prices it; such a page nested under another
+page can now be refused with the complexity error where stock answers it. `first: 0` alone,
+or both zero, is still 0.
 Examples: four aliased `transactions(first: 1000) { edges { node { hash } } }` cost 4000 and are
 answered, a fifth page of 1 is refused; `transactions(first: 4001)` is refused; the explorer's transactions-by-account page at `first: 100` costs
 (1 + 1 for `result` + 1 for its `block`) × 100 = 300.
@@ -116,8 +120,9 @@ operation of the document is checked. The full introspection document (graphql-j
 `fields { args { type { ofType … } } }`, so stock refuses it over HTTP and so does this
 indexer, with stock's error. Workaround (stock and ours alike): send a shallower introspection
 document. Dropping `args { ...InputValue }` from the `fields` selection, or cutting the
-`TypeRef` fragment's `ofType` chain to 7 levels, keeps it within 12; the websocket runs no depth
-rule. `scripts/stock-schema/oracle.js` runs stock's own libraries on stock's schema, to check
+`TypeRef` fragment's `ofType` chain to 7 levels, keeps it within 12. Stock runs no depth rule
+over the websocket; this indexer runs the same rule there (audit F-07), since a subscription
+re-runs for every block, so a subscription stock opens at depth 10 or more is refused here. `scripts/stock-schema/oracle.js` runs stock's own libraries on stock's schema, to check
 a document against them.
 
 Stock's order holds: other validation errors come with the depth error; the complexity check
@@ -186,7 +191,9 @@ page with: as asked up to 1,000; absent, `first: 0` or `last: 0` without a curso
 of `nodes` are priced at the most served (1,000). An account's NFT holdings are read when the
 account resolves, so `nonFungibleAccount`, `nonFungibleChainAccount` and every NFT id given to
 `node`/`nodes` (or an id only a variable gives) cost 10,000 rows (one details read each)
-whatever is selected, and `nonFungibleTokenBalances` 10,000 more for the rows it answers. A request above the safety ceiling of 1,100,000 is refused with `budget`
+whatever is selected, and `nonFungibleTokenBalances` 10,000 times its selection's cost (each
+row at least 1) for the rows it answers (audit F-05: about 110 selected fields per holding
+fit under the ceiling). A request above the safety ceiling of 1,100,000 is refused with `budget`
 before anything runs; a batch counts the sum of its operations. The ceiling is 11 times the
 largest budget of the explorer operation documents in [data/explorer-ops.md](data/explorer-ops.md)
 and the compare suite's documents, priced with no variables bound, so every page variable at
@@ -216,7 +223,10 @@ transaction already loaded.
 ### Websockets
 
 `GET /graphql` with `Upgrade: websocket` and `Sec-WebSocket-Protocol: graphql-transport-ws`
-(or the legacy `graphql-ws`). Each limit below closes or refuses as shown and counts
+(or the legacy `graphql-ws`). The subprotocol is chosen once, over every offered value, in the
+server's order (`graphql-transport-ws` first) and exact case; the answer's
+`Sec-WebSocket-Protocol` names the one the session speaks (audit F-26). An offer of neither
+name in that case (`GRAPHQL-WS` included) answers 400. Each limit below closes or refuses as shown and counts
 `kdx_graphql_rejected_total{reason}`:
 
 | Limit | Default | On refusal |
@@ -230,9 +240,10 @@ transaction already loaded.
 | subscriptions per process | `ws_subs_max = 2000` | `LIMIT` error (`ws_subscriptions`) |
 | `connection_init` | within `ws_init_secs = 10` | close 4408 (`ws_init_timeout`) |
 | no subscription open | for `ws_idle_secs = 600` | close 4000 (`ws_idle`) |
+| no frame from the client (the server pings every 30 s; a pong counts) | 90 s (fixed) | close 4000 (`ws_silent`) |
 | client message or frame | 64 KB | close 1009 (`ws_message`); a malformed frame closes 1002 |
-| client messages | one per-IP rate token each (pings too); the opening burst below may borrow | close 4429 (`ws_rate`) |
-| a client that does not read | 30 s per server message | close 4008 (`ws_slow_reader`) |
+| client messages | one per-IP rate token each (protocol `ping` messages and the client's websocket Ping frames too; a Pong answering a server ping takes none, any other Pong takes one); the opening burst below may borrow | close 4429 (`ws_rate`) |
+| a client that does not read | 30 s per server message or ping | close 4008 (`ws_slow_reader`) |
 | a chain whose feed read fails | 30 ticks in a row | that chain alone is skipped each tick (a WARN line with the chain and its failure count; the other chains keep delivering), then resumes from its tip with a gap |
 | a subscriber behind the feed | 1,024 feed items, or behind blocks the ring had to drop to stay within `feed_ring_mb = 64` MB of decoded blocks | one `INTERNAL` error; the subscription goes on from the feed's newest item |
 | a query or mutation over the socket | subscriptions only | `NOT_SUPPORTED` error, nothing runs (`ws_query`); send queries over HTTP |
@@ -253,7 +264,9 @@ kadscan page holds a handful of subscriptions on one connection, so one client f
 open pages under `ws_subs_per_ip`. An IPv4 client is capped per address only; an IPv6 client
 by its /64 and, with the other /64s of its /48, by the /48 caps.
 
-Depth, complexity and the size limits apply to subscription documents as to queries. Every
+Depth, complexity and the size limits apply to subscription documents as to queries. A
+socket's operations run as requests of its client, so their heavy reads count against that
+client's one heavy slot as its HTTP requests' do (audit F-06). Every
 slot is released when its subscription or connection ends; `kdx_graphql_subscriptions` is the
 number open.
 
@@ -413,22 +426,28 @@ the oracle puts them.
   Their events and transfers are listed with order index 0 and the node's coinbase request
   key (the `reqKey` of the stored coinbase output, as the oracle lists it; R-P5P9-57 F4).
   Event and Transfer ids carry that key; `node(id)` still accepts ids with `<coinbase>`.
-- **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` with
-  `fungibleName` (txs with a transfer of that token on the account's side), `accountName`
-  alone (txs touching the account), `fungibleName` alone (txs with a `<token>.TRANSFER`
-  event); with none of them, every user tx from the tip down (at most 20,000 heights), as
-  a latest-transactions list asks. `chainId`, `minHeight`, `maxHeight` and
+- **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` (txs
+  touching the account), else `fungibleName` (txs with a `<token>.TRANSFER` event, all
+  history); with none of them, every user tx from the tip down (at most 20,000 heights), as
+  a latest-transactions list asks. Beside `accountName`, `requestKey` or `blockHash`,
+  `fungibleName` keeps the txs with any event of that module, as stock does (`EXISTS` on
+  `Events.module`, indexer-kadena `90a4be1`). **Known difference (deliberate):**
+  `fungibleName` without those (alone, or with `chainId`, heights or `minimumDepth`) lists
+  the txs with a transfer of the module, where stock lists the txs with any event of it.
+  Matching stock there would need a per-module posting index; until one exists, a walk
+  over every tx would lose full-history coverage, so the transfer postings stay. `chainId`, `minHeight`, `maxHeight` and
   `minimumDepth` (height ≤ the chain's tip − depth) filter any source. With `accountName`,
   only the txs the account sent (`meta.sender`) are listed and counted, as the oracle does
   (GQ-19, R-P5P9-57 M1).
 - **Sender lists and the sender index (FIX-2).** `transactions(accountName)`,
   `transactions(accountName, fungibleName)` and `FungibleChainAccount.transactions` read the
-  account's `sndr` postings (with `fungibleName`, a merge of its `sndr` and `xfer` postings)
+  account's `sndr` postings (`transactions` with `fungibleName` keeps those with an event of
+  that module; `FungibleChainAccount.transactions` is unchanged by this)
   once the sender index is complete: every segment range has its `sndr.pst` and the hot
   store has `sndr_hot = 1` (gauge `kdx_sender_index_ready`). No record is decoded to pick
   the rows, so a receive-heavy account answers as fast as any other, and `totalCount` is a
   key-only walk. Until then (a store before `segments add-index`) the old path serves: the
-  account's `acct` (or `xfer`) postings filtered on each record's `meta.sender`, which a
+  account's `acct` postings filtered on each record's `meta.sender`, which a
   receive-heavy account can run past the 1 s scan window (`TIMEOUT`, no data). Both paths
   answer the same edges, cursors, `pageInfo` and `totalCount`. `[graphql] sender_index =
   false` forces the old path (default `true`; used to compare the two on a host); it also
@@ -439,9 +458,10 @@ the oracle puts them.
   `transfer-db-repository.ts`, `event-query-builder.ts`). `requestKey` picks the source,
   and a `blockHash` beside it keeps only the key's copy in that block (another block's hash
   lists nothing; a malformed one is `BAD_USER_INPUT`), on `transactions`, `transfers` and
-  `events`. On `transactions`, `fungibleName` beside `requestKey` or `blockHash` keeps the
-  txs with an event of that module (stock's `EXISTS` on `Events.module`); with any other
-  source the posting list already holds only that token's txs. `transfers(isNFT: true,
+  `events`. On `transactions`, `fungibleName` keeps the txs with an event of that module
+  (stock's `EXISTS` on `Events.module`) when the source is `accountName`, `requestKey` or
+  `blockHash`; with `fungibleName` as the only source it keeps txs with a transfer of that
+  module (see the known difference above). `transfers(isNFT: true,
   accountName)` checks `fungibleName` as every other path does.
 - **`transfers`** use the same sources; rows are the tx's transfers of `fungibleName` with
   `accountName` on either side when given. `crossChainTransfer` is the other half of a

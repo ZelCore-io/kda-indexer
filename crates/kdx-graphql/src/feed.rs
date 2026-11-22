@@ -125,18 +125,28 @@ impl Ring {
 
     /// Room for `need` more bytes: pads until the oldest held blocks leave the ring (the
     /// channel overwrites position `p` when it sends `p + CAPACITY`). At most [`CAPACITY`]
-    /// pads in all, so a receiver that has read every block sent so far never lags; a block
-    /// over the whole budget leaves the ring holding only itself.
+    /// pads in all, with the block's own send evicting the last block that must go, so a
+    /// receiver that has read every block sent so far never lags (audit F-29); a block over
+    /// the whole budget leaves the ring holding only itself.
     fn make_room(&mut self, tx: &broadcast::Sender<FeedItem>, need: usize) {
         loop {
             self.prune();
             if self.bytes + need <= self.budget {
                 return;
             }
-            let Some(&(oldest, ..)) = self.held.front() else {
+            let Some(&(oldest, _, n)) = self.held.front() else {
                 return;
             };
-            let pads = (oldest + CAPACITY as u64 + 1).saturating_sub(self.sent);
+            // Audit F-29: the block's own send, which follows, overwrites position
+            // `sent - CAPACITY`. When `oldest` is the last block that must go, pad only up to
+            // it and let that send evict it; one pad more would make a receiver that has read
+            // everything lag.
+            let last = self.held.len() == 1 || self.bytes - n + need <= self.budget;
+            let pads = if last {
+                (oldest + CAPACITY as u64).saturating_sub(self.sent)
+            } else {
+                (oldest + CAPACITY as u64 + 1).saturating_sub(self.sent)
+            };
             for _ in 0..pads {
                 if tx.send(FeedItem::Pad).is_err() {
                     // No receiver: the channel holds nothing.
@@ -145,6 +155,11 @@ impl Ring {
                     return;
                 }
                 self.sent += 1;
+            }
+            if last {
+                self.held.pop_front();
+                self.bytes -= n;
+                return;
             }
         }
     }
@@ -641,6 +656,42 @@ mod tests {
         drop((stalled, live));
         feed.inject(FeedItem::Block(big_block(3, 101, MB)));
         assert_eq!(feed.ring_bytes(), 0);
+    }
+
+    /// Audit F-29: when the one held block is the newest and it plus the next block exceed
+    /// the budget, the next block's own send evicts it, so a caught-up receiver never lags.
+    #[test]
+    fn a_caught_up_receiver_never_lags_on_over_budget_blocks() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        const MB: usize = 1 << 20;
+        let feed = BlockFeed::detached_with(3 * MB);
+        let mut live = feed.subscribe();
+        // `slow` reads each block one round late, so the ring holds exactly the newest block
+        // (sent last) when the next one comes: the case of the off-by-one.
+        let mut slow = feed.subscribe();
+        let mut got = Vec::new();
+        for h in 0..4u64 {
+            feed.inject(FeedItem::Block(big_block(3, h, 2 * MB)));
+            loop {
+                match live.try_recv() {
+                    Ok(FeedItem::Block(b)) => got.push(b.height),
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(e) => panic!("the caught-up receiver lagged at {h}: {e:?}"),
+                }
+            }
+            if h > 0 {
+                loop {
+                    match slow.try_recv() {
+                        Ok(FeedItem::Block(b)) if b.height + 1 >= h => break,
+                        Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            assert!(feed.ring_bytes() <= 3 * MB);
+        }
+        assert_eq!(got, [0, 1, 2, 3]);
     }
 
     /// I-5: a subscriber woken by one chain's new block never sees another chain's new tip

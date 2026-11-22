@@ -894,3 +894,177 @@ async fn quantity_above_the_safety_cap_is_refused() {
     assert_eq!(errors[0]["extensions"]["code"], "LIMIT", "{m}");
     assert_eq!(errors[0]["extensions"]["limit"], "page", "{m}");
 }
+
+/// Audit F-07 (option B): the depth rule runs over the socket too (stock runs none there), so
+/// a subscription deeper than 9 is refused with the depth error; a shallow one still opens.
+#[tokio::test]
+async fn depth_over_9_is_refused_over_the_socket() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let deep = "subscription D { newBlocks(chainIds: [\"0\"]) { transactions { edges { node { result { ... on TransactionResult { block { parent { minerAccount { transactions { edges { node { hash } } } } } } } } } } } } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": deep}}),
+    )
+    .await;
+    let m = recv(&mut a).await.unwrap();
+    let errors = if m["type"] == "error" {
+        &m["payload"]
+    } else {
+        &m["payload"]["errors"]
+    };
+    assert_eq!(m["id"], "1", "{m}");
+    assert_eq!(
+        errors[0]["message"], "'D' exceeds operation depth limits.",
+        "{m}"
+    );
+    assert_eq!(errors[0]["extensions"]["limit"], "depth", "{m}");
+    assert_eq!(active_subscriptions(&s.schema), 0);
+    send(
+        &mut a,
+        json!({"id": "2", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+}
+
+/// Connect offering `proto` as one header value; the subprotocol the server answers with.
+async fn connect_with_protocol(s: &Server, proto: &str) -> Result<(Ws, Option<String>), u16> {
+    let mut req = format!("ws://{}/graphql", s.addr)
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", proto.parse().unwrap());
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, r)) => {
+            let p = r
+                .headers()
+                .get("sec-websocket-protocol")
+                .map(|v| v.to_str().unwrap().to_owned());
+            Ok((ws, p))
+        }
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Audit F-26: the subprotocol is chosen once, in the server's order and exact case, over
+/// every offered value, so the wire and the session agree in both offer orders; an
+/// upper-case offer is refused with 400.
+#[tokio::test]
+async fn subprotocol_is_chosen_once_in_server_order() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    for offer in [
+        "graphql-ws, graphql-transport-ws",
+        "graphql-transport-ws, graphql-ws",
+    ] {
+        let (mut a, p) = connect_with_protocol(&s, offer).await.unwrap();
+        assert_eq!(p.as_deref(), Some("graphql-transport-ws"), "{offer}");
+        init(&mut a).await;
+        send(
+            &mut a,
+            json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+        )
+        .await;
+        assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+        s.feed.inject(block(0, 3));
+        // graphql-transport-ws delivers `next` (the legacy protocol says `data`).
+        let m = recv(&mut a).await.unwrap();
+        assert_eq!(m["type"], "next", "{offer}: {m}");
+        drop(a);
+        assert!(wait_for(|| active_subscriptions(&s.schema) == 0).await);
+    }
+    let (_, p) = connect_with_protocol(&s, "graphql-ws").await.unwrap();
+    assert_eq!(p.as_deref(), Some("graphql-ws"));
+    assert_eq!(connect(&s, "GRAPHQL-WS").await.err(), Some(400));
+    assert_eq!(connect(&s, "Graphql-Transport-Ws").await.err(), Some(400));
+}
+
+fn pinging() -> GraphqlSettings {
+    GraphqlSettings {
+        ws_ping: Duration::from_millis(100),
+        ws_silence: Duration::from_millis(400),
+        ws_idle: Duration::from_millis(200),
+        ..GraphqlSettings::default()
+    }
+}
+
+/// Audit F-25: a peer that stops answering (sends no frame, not even a pong) is closed after
+/// `ws_silence` although its subscription is active, and its slots return.
+#[tokio::test]
+async fn a_silent_peer_is_closed_and_its_slots_return() {
+    let s = server(pinging(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    // `a` is no longer polled: it answers no ping.
+    let t = Instant::now();
+    let until = t + Duration::from_secs(6);
+    while active_subscriptions(&s.schema) != 0 && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(active_subscriptions(&s.schema), 0);
+    assert!(
+        t.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        t.elapsed()
+    );
+    drop(a);
+}
+
+/// Audit F-25: a peer that answers the server's pings stays open with an active
+/// subscription, past `ws_silence` and `ws_idle`.
+#[tokio::test]
+async fn a_peer_answering_pings_stays_open() {
+    // A bucket of 2 at 1 token/s: the ~15 pongs below would close it if they were charged.
+    let s = server(pinging(), 2).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+    // Reading answers pings (tungstenite queues the pong and flushes it on the next read).
+    let mut pings = 0;
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        match tokio::time::timeout(Duration::from_millis(50), a.next()).await {
+            Err(_) => {}
+            Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
+            Ok(Some(Ok(Message::Close(f)))) => panic!("closed: {f:?}"),
+            Ok(m) => panic!("unexpected: {m:?}"),
+        }
+    }
+    assert!(pings >= 5, "{pings} pings");
+    assert_eq!(active_subscriptions(&s.schema), 1);
+}
+
+/// Audit F-25 (controller ruling): a client Ping makes the server queue a Pong, so client
+/// Pings (and Pongs no server ping asked for) are charged: a flood of them is closed 4429.
+#[tokio::test]
+async fn a_client_ping_or_pong_flood_is_closed_for_rate() {
+    for pong in [false, true] {
+        let s = server(GraphqlSettings::default(), 10).await;
+        let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+        init(&mut a).await;
+        for i in 0..80u8 {
+            let m = if pong {
+                Message::Pong(vec![i].into())
+            } else {
+                Message::Ping(vec![i].into())
+            };
+            if a.send(m).await.is_err() {
+                break;
+            }
+        }
+        assert_eq!(recv(&mut a).await.err(), Some(4429), "pong: {pong}");
+    }
+}

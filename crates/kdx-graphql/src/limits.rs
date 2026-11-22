@@ -26,7 +26,8 @@
 //! resolvers size it: as asked up to [`crate::MAX_PAGE_ROWS`]; absent, or `0` without a cursor,
 //! at `default_page`. `nodes(ids)` multiplies by the number of ids, per-chain account lists by
 //! the chain count (20 for an absent or empty `chainIds`, else its length), NFT holdings by
-//! [`crate::MAX_NFT_HOLDINGS`] (one read per row, whatever is selected).
+//! [`crate::MAX_NFT_HOLDINGS`] times their selection, each row at least 1 (one read per row,
+//! whatever is selected; audit F-05).
 //!
 //! [`analyze`] runs the same walk as the legacy model, which also refuses on `max_depth`,
 //! `introspection_depth` and `max_complexity`, with pages clamped at `max_page`. It is not
@@ -395,8 +396,10 @@ impl<'a> Walk<'a> {
                         own.saturating_add(all - part)
                             .saturating_add(mult.saturating_mul(per))
                     } else if name == NFT_HOLDINGS {
-                        // One details read per holding, made whatever the selection (S1).
-                        own.saturating_add(mult)
+                        // One details read per holding, made whatever the selection (S1);
+                        // the resolver work and response size grow with holdings x the
+                        // selection, so each holding is priced at least 1 (audit F-05).
+                        own.saturating_add(mult.saturating_mul(all.max(1)))
                     } else if mult > 1 {
                         own.saturating_add(mult.saturating_mul(all.max(1)))
                     } else {
@@ -765,7 +768,7 @@ struct StockVerdict {
     /// Positions of the arguments whose value holds a variable: async-graphql reports a
     /// variable value that does not coerce at them, during validation (FIX-4 part B item 5).
     var_args: Vec<async_graphql::Pos>,
-    /// Depth-limit messages (HTTP only, as stock's validation rule).
+    /// Depth-limit messages (stock's validation rule; over the socket too, audit F-07).
     depth: Vec<String>,
     /// Over stock's complexity; the message to answer.
     complexity: Option<&'static str>,
@@ -800,15 +803,12 @@ impl Extension for LimitsExt {
             }
         })?;
         budget(doc, &vars, s)?;
-        // Stock's limits (FIX-3 part C). Over the socket stock runs no depth rule and words
-        // the complexity refusal without its HTTP prefix; over HTTP it skips the complexity
-        // check for an operation named `IntrospectionQuery`.
+        // Stock's limits (FIX-3 part C). Over the socket stock words the complexity refusal
+        // without its HTTP prefix; over HTTP it skips the complexity check for an operation
+        // named `IntrospectionQuery`. Stock runs no depth rule over the socket; this indexer
+        // does (audit F-07 option B: a subscription re-runs per block, real ones are shallow).
         let reg = type_registry();
-        let depth = if ws {
-            Vec::new()
-        } else {
-            stock_limits::depth_errors(reg, doc)
-        };
+        let depth = stock_limits::depth_errors(reg, doc);
         // FIX-3 part D (S1): the operation priced is the one the executor runs (none: the
         // executor refuses the request itself), and the skip needs both stock's name and an
         // operation of introspection fields alone, so a spoofed name carrying real fields is
@@ -1197,6 +1197,31 @@ mod tests {
         );
         // A block's count is not a walk: kadscan's block list passes.
         assert!(c("{ blocksFromDepth(minimumDepth: 0, first: 25) { totalCount edges { node { transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }").unwrap() < 2000);
+    }
+
+    /// Audit F-05: the selection under `nonFungibleTokenBalances` is priced per holding
+    /// (resolver work and response size grow with holdings x fields), so 200 aliased
+    /// `guard { raw }` per holding is over the ceiling; an explorer selection passes.
+    #[test]
+    fn nft_holdings_price_their_selection() {
+        let b = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            budget(&doc, &Variables::default(), &GraphqlSettings::default())
+                .and_then(|c| over_ceiling(c.complexity).map(|_| c.complexity))
+                .map_err(|e| format!("{:?}", e.extensions.unwrap().get("code")))
+        };
+        let many: String = (0..200)
+            .map(|i| format!("g{i}: guard {{ raw }} "))
+            .collect();
+        let q = format!(
+            "{{ nonFungibleAccount(accountName: \"k:a\") {{ nonFungibleTokenBalances {{ {many} }} }} }}"
+        );
+        assert_eq!(b(&q), Err(format!("{:?}", Some(&Value::from("LIMIT")))));
+        let normal = "{ nonFungibleAccount(accountName: \"k:a\") { accountName \
+            nonFungibleTokenBalances { tokenId version balance \
+              guard { raw ... on KeysetGuard { keys predicate } } \
+              info { precision supply uri } } } }";
+        assert!(b(normal).is_ok(), "{:?}", b(normal));
     }
 
     /// FIX-3 part D (S4, S5): the served read budget still refuses more than [`MAX_COUNTS`]
