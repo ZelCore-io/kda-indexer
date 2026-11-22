@@ -401,15 +401,16 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
             ))
         })
     });
+    // F-58: the index's round-trip failures count before the summary is written.
+    if let Some(ix) = &sum.index {
+        sum.round_trip_failures += ix.adj_ref_round_trip_failures;
+        eprintln!("index: {}", serde_json::to_string_pretty(ix)?);
+    }
     if let Some(p) = &summary_out {
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
         }
         std::fs::write(p, serde_json::to_vec_pretty(&sum)?)?;
-    }
-    if let Some(ix) = &sum.index {
-        sum.round_trip_failures += ix.adj_ref_round_trip_failures;
-        eprintln!("index: {}", serde_json::to_string_pretty(ix)?);
     }
     let mut merkle_failures = 0;
     if let Some(m) = &sum.merkle {
