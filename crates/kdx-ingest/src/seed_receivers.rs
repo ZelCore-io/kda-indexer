@@ -253,7 +253,7 @@ impl Pending {
         hot: &HotStore,
         dict: &Mutex<HotDict>,
         (coin, keys): (u32, &str),
-        cursor: Option<[u8; 20]>,
+        cursor: Option<[u8; CURSOR_LEN]>,
         rep: &mut ReceiversReport,
     ) -> Result<()> {
         let mut d = dict.lock().unwrap_or_else(|e| e.into_inner());
@@ -273,7 +273,7 @@ impl Pending {
         hot: &HotStore,
         d: &mut HotDict,
         (coin, cursor_key): (u32, &str),
-        cursor: Option<[u8; 20]>,
+        cursor: Option<[u8; CURSOR_LEN]>,
         rep: &mut ReceiversReport,
     ) -> Result<()> {
         let mut txn = hot.rw()?;
@@ -463,15 +463,11 @@ fn add(
 /// Budget one capped candidate charged to emitter `em` (final cap design):
 /// - a tracked token has its own budget (`max_event_candidates`); a hit is listed in
 ///   `cap_hit` and keeps the pass pending (visible, rerun with a raised cap);
-/// - every untracked emitter shares one bucket (`max_untracked_candidates`), and all of them
-///   sit under a global ceiling (`max_total_candidates`); a hit there drops the excess,
+/// - every untracked emitter shares one bucket (`max_untracked_candidates`) under a global
+///   ceiling for untracked candidates (`max_total_candidates`); a hit there drops the excess,
 ///   counts it (`dropped_untracked`, `dropped_ceiling`) and the pass still completes, so no
 ///   emitter can stall it.
 fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str) -> bool {
-    if rep.event_candidates >= w.max_total_candidates {
-        rep.dropped_ceiling += 1;
-        return false;
-    }
     if w.tokens.contains(em) {
         let n = p.emitters.entry(em.to_owned()).or_insert(0);
         if *n >= w.max_event_candidates {
@@ -482,6 +478,12 @@ fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str) -> bool 
         }
         *n += 1;
     } else {
+        // The global ceiling bounds untracked candidates only (review round 4): a tracked
+        // token is bounded by its own budget and never dropped.
+        if p.untracked >= w.max_total_candidates {
+            rep.dropped_ceiling += 1;
+            return false;
+        }
         if p.untracked >= w.max_untracked_candidates {
             rep.dropped_untracked += 1;
             return false;
@@ -529,24 +531,79 @@ fn miner_rows(
     }
 }
 
-/// Resume cursor: start height ‖ next frozen TxNum ‖ frozen-walk errors so far.
-fn cursor(from: u32, next: u64, errors: u64) -> [u8; 20] {
-    let mut v = [0u8; 20];
+/// Counters of the frozen walk that a resume adds back (the hot part is redone).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Carry {
+    errors: u64,
+    dropped_untracked: u64,
+    dropped_ceiling: u64,
+    /// Capped candidates of untracked emitters taken (shared bucket and ceiling).
+    untracked: u64,
+    event_candidates: u64,
+}
+
+impl Carry {
+    fn now(rep: &ReceiversReport, p: &Pending) -> Carry {
+        Carry {
+            errors: rep.errors,
+            dropped_untracked: rep.dropped_untracked,
+            dropped_ceiling: rep.dropped_ceiling,
+            untracked: p.untracked,
+            event_candidates: rep.event_candidates,
+        }
+    }
+    fn minus(self, o: Carry) -> Carry {
+        Carry {
+            errors: self.errors - o.errors,
+            dropped_untracked: self.dropped_untracked - o.dropped_untracked,
+            dropped_ceiling: self.dropped_ceiling - o.dropped_ceiling,
+            untracked: self.untracked - o.untracked,
+            event_candidates: self.event_candidates - o.event_candidates,
+        }
+    }
+}
+
+const CURSOR_LEN: usize = 52;
+
+/// Resume cursor: start height ‖ next frozen TxNum ‖ the frozen walk's [`Carry`] counters
+/// (errors, dropped untracked, dropped at the ceiling, untracked taken, capped taken).
+fn cursor(from: u32, next: u64, c: Carry) -> [u8; CURSOR_LEN] {
+    let mut v = [0u8; CURSOR_LEN];
     v[..4].copy_from_slice(&from.to_be_bytes());
     v[4..12].copy_from_slice(&next.to_be_bytes());
-    v[12..].copy_from_slice(&errors.to_be_bytes());
+    let n = [
+        c.errors,
+        c.dropped_untracked,
+        c.dropped_ceiling,
+        c.untracked,
+        c.event_candidates,
+    ];
+    for (i, x) in n.iter().enumerate() {
+        v[12 + 8 * i..20 + 8 * i].copy_from_slice(&x.to_be_bytes());
+    }
     v
 }
 
-fn parse_cursor(v: &[u8]) -> Option<(u32, u64, u64)> {
+fn parse_cursor(v: &[u8]) -> Option<(u32, u64, Carry)> {
     let from = be_u32(v.get(..4)?)?;
     let next = u64::from_be_bytes(v.get(4..12)?.try_into().ok()?);
-    // A 12-byte cursor (before the error count was kept) resumes with 0 errors.
-    let errors = match v.get(12..20) {
-        Some(b) => u64::from_be_bytes(b.try_into().ok()?),
-        None => 0,
+    // Older, shorter cursors (12 bytes: no counters; 20: errors only) resume with zeros.
+    let at = |i: usize| {
+        v.get(12 + 8 * i..20 + 8 * i)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u64::from_be_bytes)
     };
-    Some((from, next, errors))
+    Some((
+        from,
+        next,
+        Carry {
+            errors: at(0),
+            dropped_untracked: at(1),
+            dropped_ceiling: at(2),
+            untracked: at(3),
+            event_candidates: at(4),
+        },
+    ))
 }
 
 /// Pass options: the network's forks, txs per write txn, and whether to write at all.
@@ -700,8 +757,8 @@ pub fn run(
         }
     }
     p.flush(hot, dict, ck, None, &mut rep)?;
-    // The hot part is redone on resume; the frozen walk's errors resume with the cursor.
-    let hot_errors = rep.errors;
+    // The hot part is redone on resume; the frozen walk's counters resume with the cursor.
+    let hot_part = Carry::now(&rep, &p);
 
     // Segment pass, TxNum order, resuming at the cursor of a pass with the same start.
     let segs = Segments::open_without_filters(segdir, snap.clone())?;
@@ -710,8 +767,24 @@ pub fn run(
         None => segs.manifest.entries.first().map_or(0, |e| e.first_txnum),
     };
     let start = match resume {
-        Some((f, next, errors)) if f == from && !o.dry_run => {
-            rep.errors += errors;
+        Some((f, next, c)) if f == from && !o.dry_run => {
+            rep.errors += c.errors;
+            rep.dropped_untracked += c.dropped_untracked;
+            rep.dropped_ceiling += c.dropped_ceiling;
+            rep.event_candidates += c.event_candidates;
+            p.untracked += c.untracked;
+            // A tracked token's cap hit before the stop keeps the pass pending.
+            if let Some(why) = hot
+                .ro()?
+                .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT)?
+            {
+                let v: serde_json::Value = serde_json::from_slice(&why).unwrap_or_default();
+                for e in v["emitters"].as_array().into_iter().flatten() {
+                    if let Some(e) = e.as_str().filter(|e| !rep.cap_hit.iter().any(|x| x == e)) {
+                        rep.cap_hit.push(e.to_owned());
+                    }
+                }
+            }
             start.max(next)
         }
         _ => start,
@@ -746,8 +819,19 @@ pub fn run(
         }
         n += 1;
         if n.is_multiple_of(chunk) {
-            let c = cursor(from, t + 1, rep.errors - hot_errors);
+            let c = cursor(from, t + 1, Carry::now(&rep, &p).minus(hot_part));
             p.flush(hot, dict, ck, Some(c), &mut rep)?;
+            if !o.dry_run && !rep.cap_hit.is_empty() {
+                // Kept across a stop, so a resumed pass is not marked done by mistake.
+                let why =
+                    serde_json::json!({"cap": o.max_event_candidates, "emitters": rep.cap_hit});
+                let mut txn = hot.rw()?;
+                txn.set_meta(
+                    meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT,
+                    why.to_string().as_bytes(),
+                )?;
+                txn.commit()?;
+            }
             if n.is_multiple_of(chunk * 20) {
                 tracing::info!(
                     txnum = t,

@@ -14,7 +14,7 @@ use kdx_decode::{decode_block, verify_block, VerifyReport};
 use kdx_hot::balances::{self, meta};
 use kdx_hot::{Table, Txn};
 use kdx_ingest::apply::{self, Batch};
-use kdx_ingest::seed_receivers::{self, Opts};
+use kdx_ingest::seed_receivers::{self, Opts, TX_CHUNK};
 use kdx_segment::Segments;
 use kdx_types::hash::b64url_encode;
 use kdx_types::{blake2b_256, Dict, DictKind, DictMut, MemDict};
@@ -717,7 +717,7 @@ fn a_full_untracked_bucket_drops_counts_and_still_completes() {
 }
 
 #[test]
-fn the_global_ceiling_drops_and_completes() {
+fn the_global_ceiling_drops_only_untracked_candidates_and_completes() {
     let (_d, c) = d3_store();
     let o = Opts {
         max_total_candidates: 0,
@@ -728,9 +728,62 @@ fn the_global_ceiling_drops_and_completes() {
         rep.dropped_ceiling >= 1 && rep.cap_hit.is_empty(),
         "{rep:?}"
     );
+    // The untracked emitter's row is dropped; a tracked token's row never is.
+    assert!(!dirty_in(&c, SKDX_ACC, "kaddex.skdx"));
+    assert!(dirty_in(&c, UNWRAP_ACC, "kaddex.kdx"), "{rep:?}");
     let txn = c.hot.ro().unwrap();
     assert!(txn
         .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)
         .unwrap()
         .is_some());
+}
+
+#[test]
+fn a_resumed_token_pass_keeps_its_cumulative_drop_counts() {
+    let o = |chunk| Opts {
+        chunk,
+        max_untracked_candidates: 0,
+        ..d3_opts(false)
+    };
+    let (_d, full) = d3_store();
+    let whole =
+        seed_receivers::run(&full.hot, &full.dict, &full.segdir, &o(TX_CHUNK), &|| false).unwrap();
+    let (_d2, c) = d3_store();
+    let mut stops = 0;
+    let last = loop {
+        let calls = std::cell::Cell::new(0);
+        let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o(7), &|| {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        })
+        .unwrap();
+        if !rep.stopped {
+            break rep;
+        }
+        stops += 1;
+        assert!(stops < 1000);
+    };
+    assert!(stops > 1, "the pass must have been stopped and resumed");
+    assert!(whole.dropped_untracked >= 1, "{whole:?}");
+    assert_eq!(
+        (
+            last.dropped_untracked,
+            last.dropped_ceiling,
+            last.event_candidates
+        ),
+        (
+            whole.dropped_untracked,
+            whole.dropped_ceiling,
+            whole.event_candidates
+        ),
+        "resumed {last:?} whole {whole:?}"
+    );
+    let d = |c: &kdx_ingest::Ctx| {
+        c.hot
+            .ro()
+            .unwrap()
+            .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED)
+            .unwrap()
+    };
+    assert_eq!(d(&c), d(&full));
 }
