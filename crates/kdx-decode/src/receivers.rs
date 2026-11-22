@@ -246,6 +246,11 @@ pub struct TokenReceivers {
     /// budget, and filled after the events, so exec strings never starve a tx's events.
     pub exec_pairs: Vec<(String, String)>,
     pub exec_emitters: Vec<String>,
+    /// Modules that may be fungible tokens, at most [`MAX_DISCOVERED_PER_TX`]: the module of
+    /// a cross-chain defpact, and a `fungible-v2` modref named by its own module or a module of
+    /// the same governed namespace (review M1). A name here is only a claim (a plain object
+    /// renders like a modref): it becomes a tracked token only after the node's
+    /// `describe-module` lists `fungible-v2` on that chain (`seed_receivers` discovery queue).
     pub discovered: Vec<String>,
 }
 
@@ -254,21 +259,43 @@ pub struct TokenReceivers {
 pub const MAX_EVENT_PAIRS_PER_TX: usize = 64;
 /// Exec-derived token candidates kept per tx (own budget, see [`TokenReceivers::exec_pairs`]).
 pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
+/// Modules one tx may put forward as tokens (review M1).
+pub const MAX_DISCOVERED_PER_TX: usize = 4;
+/// Module references kept per event (each one with a string uses a pair slot of the tx, so
+/// more can never add a pair).
+const MAX_REFS_PER_EVENT: usize = MAX_EVENT_PAIRS_PER_TX;
 
-/// Whether an event of `emitter` may name rows of `referenced` through a module reference: the
-/// module itself, a tracked token, or a module of the same governed namespace (only the
-/// namespace owner deploys there; `free` and `user` are open to anyone and do not count).
-fn may_reference(emitter: &str, referenced: &str, is_token: &dyn Fn(&str) -> bool) -> bool {
+/// Namespaces where anyone may deploy: a module there proves nothing about its neighbours
+/// (review L3: add any other namespace whose user guard is open).
+pub const OPEN_NAMESPACES: &[&str] = &["free", "user"];
+
+/// `emitter` and `referenced` sit in the same governed namespace (only its owner deploys there).
+fn same_governed_namespace(emitter: &str, referenced: &str) -> bool {
     let ns = |m: &str| m.split_once('.').map(|(n, _)| n.to_owned());
-    emitter == referenced
-        || is_token(emitter)
-        || matches!((ns(emitter), ns(referenced)),
-            (Some(a), Some(b)) if a == b && a != "free" && a != "user")
+    matches!((ns(emitter), ns(referenced)),
+        (Some(a), Some(b)) if a == b && !OPEN_NAMESPACES.contains(&a.as_str()))
+}
+
+/// A module whose rows `/local` can read (B-1): `coin`, or `ident` / `ns.ident` with ASCII
+/// identifiers (the rule of `kdx_node::local::valid_module`; e.g. a non-ASCII name Pact 5
+/// cannot parse is never read, marked or tracked).
+pub fn readable_module(m: &str) -> bool {
+    fn ident(s: &str) -> bool {
+        let mut b = s.bytes();
+        matches!(b.next(), Some(c) if c.is_ascii_alphabetic() || c == b'_')
+            && b.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    }
+    let mut parts = m.splitn(2, '.');
+    let first = parts.next().unwrap_or("");
+    m == "coin" || (ident(first) && parts.next().is_none_or(ident))
 }
 
 impl TokenReceivers {
     fn push(&mut self, account: &str, module: &str) {
-        if account_like(account) && !self.pairs.iter().any(|(a, m)| a == account && m == module) {
+        if account_like(account)
+            && readable_module(module)
+            && !self.pairs.iter().any(|(a, m)| a == account && m == module)
+        {
             self.pairs.push((account.to_owned(), module.to_owned()));
         }
     }
@@ -276,6 +303,7 @@ impl TokenReceivers {
     fn push_event(&mut self, account: &str, module: &str, emitter: &str) {
         if module != "coin"
             && account_like(account)
+            && readable_module(module)
             && self.event_pairs.len() < MAX_EVENT_PAIRS_PER_TX
             && !self
                 .event_pairs
@@ -290,6 +318,7 @@ impl TokenReceivers {
     fn push_exec(&mut self, account: &str, module: &str) {
         if module != "coin"
             && account_like(account)
+            && readable_module(module)
             && self.exec_pairs.len() < MAX_EXEC_PAIRS_PER_TX
             && !self
                 .exec_pairs
@@ -302,64 +331,115 @@ impl TokenReceivers {
         }
     }
     fn discover(&mut self, module: &str) {
-        if module != "coin" && !self.discovered.iter().any(|m| m == module) {
+        if module != "coin"
+            && readable_module(module)
+            && self.discovered.len() < MAX_DISCOVERED_PER_TX
+            && !self.discovered.iter().any(|m| m == module)
+        {
             self.discovered.push(module.to_owned());
         }
+    }
+    /// Every `(account, module)` of the tx: pairs, then capped event and exec rows.
+    pub fn all_pairs(&self) -> impl Iterator<Item = (&(String, String), &str)> {
+        self.pairs
+            .iter()
+            .map(|p| (p, p.1.as_str()))
+            .chain(
+                self.event_pairs
+                    .iter()
+                    .zip(self.event_emitters.iter().map(String::as_str)),
+            )
+            .chain(
+                self.exec_pairs
+                    .iter()
+                    .zip(self.exec_emitters.iter().map(String::as_str)),
+            )
     }
 }
 
 const XCHAIN_SUFFIX: &str = ".transfer-crosschain";
 
-/// D3 candidates of a tx with parsed `cmd` (None when it is not JSON) and rendered `output`
-/// (the CommandResult) at `height`. `is_token` says whether a module is a tracked fungible
-/// token (coin is always one). Rules:
-///
-/// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain`, any height): step 1
-///    credits `args[1]` and step 0 debits `args[0]`. Tokens emit no TRANSFER for either
-///    (only `pact.X_YIELD` / `X_RESUME`); coin did not before coin v3. `<m>` is discovered.
-/// 2. **`exec`**: the D1 strings (`exec.data` values, `exec.code` literals) plus every string
-///    of `result.data` (a receiver built at run time and returned, D3 b), for every tracked
-///    token `<m>` the code calls (`<m>.fn`; some token credits emit no event of the token at
-///    all), and for coin below the events fork.
-/// 3. **Events** (any height, into `event_pairs`, capped at [`MAX_EVENT_PAIRS_PER_TX`], never
-///    coin): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
-///    …) gives its [`account_like`] params for that token; an event whose params hold a
-///    `fungible-v2` module reference gives them for the referenced module, which is
-///    discovered (D3 d: `kaddex.skdx` is only ever minted that way, by `kaddex.alchemist`),
-///    when the emitter may name it ([`may_reference`]). Strings inside a module reference
-///    are not accounts.
-///
-/// Over-inclusion costs one `/local` read per extra row (answered absent, stored, never
-/// served); a missing candidate leaves a funded row missing.
-pub fn token_receivers(
+/// One event of a tx as D3 needs it (no tracked-token knowledge yet).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct D3Event {
+    /// The emitting module.
+    pub module: String,
+    /// A well-formed TRANSFER (its accounts are postings already).
+    pub transfer: bool,
+    /// `fungible-v2` modref targets in the params (coin excluded), at most 64.
+    pub refs: Vec<String>,
+    /// Distinct [`account_like`] string params outside modrefs, at most
+    /// [`MAX_EVENT_PAIRS_PER_TX`] (the tx's event rows are capped at that anyway).
+    pub strings: Vec<String>,
+}
+
+/// The `exec` part of a tx as D3 needs it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct D3Exec {
+    /// Below the events fork: the strings count for coin too (uncapped).
+    pub coin: bool,
+    /// Modules the code calls (`<m>.fn`), minus those that emitted an event in the tx from the
+    /// events fork on; the filter keeps the tracked tokens.
+    pub called: Vec<String>,
+    /// Distinct [`account_like`] strings of `exec.data`, `exec.code` literals and
+    /// `result.data`, first-seen order; capped at [`MAX_EXEC_PAIRS_PER_TX`] unless `coin`.
+    pub strings: Vec<String>,
+}
+
+/// D3 raw candidates of one tx: everything [`d3_filter`] needs, without knowing which modules
+/// are tracked. Computed once per tx at decode time for the tail (`TxIndex::d3`), and by the
+/// seed pass from stored records, so both mark the same rows (ruling R-P5P9-192).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct D3Candidates {
+    /// Rule 1: the module of a cross-chain defpact step of this tx, and the account it credits
+    /// (step 1) or debits (step 0), when that argument is a string.
+    pub xchain: Option<(String, Option<String>)>,
+    /// Rule 3.
+    pub events: Vec<D3Event>,
+    /// Rule 2 (an `exec` tx with a parsed cmd).
+    pub exec: Option<D3Exec>,
+}
+
+impl D3Candidates {
+    pub fn is_empty(&self) -> bool {
+        self.xchain.is_none() && self.events.is_empty() && self.exec.is_none()
+    }
+}
+
+fn push_distinct(v: &mut Vec<String>, s: &str, cap: usize) {
+    if v.len() < cap && account_like(s) && !v.iter().any(|x| x == s) {
+        v.push(s.to_owned());
+    }
+}
+
+/// The raw D3 candidates of a tx with parsed `cmd` (None when it is not JSON) and `output`
+/// (the CommandResult) at `height` (pure: no tracked-token knowledge). A failed tx gives none.
+pub fn d3_candidates(
     cmd: Option<&Value>,
     output: &Value,
     height: u32,
     forks: Forks,
-    is_token: &dyn Fn(&str) -> bool,
-) -> TokenReceivers {
-    let mut r = TokenReceivers::default();
+) -> D3Candidates {
+    let mut c = D3Candidates::default();
     // A failed tx credits nothing (security review).
     if output.pointer("/result/status").and_then(Value::as_str) != Some("success") {
-        return r;
+        return c;
     }
     let is_cont = cmd.is_some_and(|c| c.pointer("/payload/cont").is_some());
-    if let Some(c) = output.get("continuation").filter(|c| !c.is_null()) {
-        let def = c.pointer("/continuation/def").and_then(Value::as_str);
+    if let Some(k) = output.get("continuation").filter(|k| !k.is_null()) {
+        let def = k.pointer("/continuation/def").and_then(Value::as_str);
         if let Some(m) = def.and_then(|d| d.strip_suffix(XCHAIN_SUFFIX)) {
-            let side = match c.get("step").and_then(Value::as_u64) {
+            let side = match k.get("step").and_then(Value::as_u64) {
                 Some(1) if is_cont => Some(1),
                 Some(0) if !is_cont => Some(0),
                 _ => None,
             };
-            if let Some(a) = side.and_then(|i| c.pointer(&format!("/continuation/args/{i}"))) {
-                if let Some(a) = a.as_str() {
-                    r.push(a, m);
-                }
-                r.discover(m);
+            if let Some(a) = side.and_then(|i| k.pointer(&format!("/continuation/args/{i}"))) {
+                c.xchain = Some((m.to_owned(), a.as_str().map(str::to_owned)));
             }
         }
     }
+    let mut emitted: Vec<String> = Vec::new();
     for e in output
         .get("events")
         .and_then(Value::as_array)
@@ -369,75 +449,135 @@ pub fn token_receivers(
         let Some(ev) = crate::build::parse_event(e) else {
             continue;
         };
-        let mut targets: Vec<String> = Vec::new();
+        if !emitted.contains(&ev.module) {
+            emitted.push(ev.module.clone());
+        }
+        let mut d = D3Event {
+            module: ev.module.clone(),
+            transfer: crate::build::transfer_accounts(&ev).is_some(),
+            ..D3Event::default()
+        };
         modrefs(ev.params, &mut |m| {
-            if m != "coin"
-                && may_reference(&ev.module, m, is_token)
-                && !targets.iter().any(|t| t == m)
-            {
-                targets.push(m.to_owned());
+            if m != "coin" && d.refs.len() < MAX_REFS_PER_EVENT && !d.refs.iter().any(|t| t == m) {
+                d.refs.push(m.to_owned());
             }
         });
-        targets.iter().for_each(|m| r.discover(m));
-        if ev.module != "coin"
-            && is_token(&ev.module)
-            && crate::build::transfer_accounts(&ev).is_none()
-            && !targets.contains(&ev.module)
-        {
-            targets.push(ev.module.clone());
-        }
-        if targets.is_empty() {
-            continue;
-        }
         let mut strings = Vec::new();
         param_strings(ev.params, &mut strings);
-        for m in &targets {
-            for s in &strings {
-                r.push_event(s, m, &ev.module);
-            }
+        for s in &strings {
+            push_distinct(&mut d.strings, s, MAX_EVENT_PAIRS_PER_TX);
+        }
+        // An event with no string can give no row; one with no ref and a TRANSFER neither.
+        if !d.strings.is_empty() || !d.refs.is_empty() {
+            c.events.push(d);
         }
     }
-    if let (Some(c), false) = (cmd, is_cont) {
-        let code = c
+    if let (Some(cmd), false) = (cmd, is_cont) {
+        let code = cmd
             .pointer("/payload/exec/code")
             .and_then(Value::as_str)
             .unwrap_or("");
-        // Coin only below the events fork (from there on every exec coin credit has an event).
-        let mut modules = Vec::new();
-        if height < forks.events {
-            modules.push("coin".to_owned());
-        }
+        let coin = height < forks.events;
         // From the events fork on, a token whose own events appear in the tx already has its
         // accounts named there (TRANSFER marks them; rule 3 the rest): only a token call that
         // emitted nothing of the token at all needs the exec strings (dry run on KDA-03: without
         // this, millions of extra reads).
-        let emitted: Vec<String> = output
-            .get("events")
-            .and_then(Value::as_array)
+        let called: Vec<String> = called_modules(code)
             .into_iter()
-            .flatten()
-            .filter_map(crate::build::parse_event)
-            .map(|e| e.module)
+            .filter(|m| m != "coin" && (coin || !emitted.contains(m)))
             .collect();
-        for m in called_modules(code) {
-            if height >= forks.events && emitted.contains(&m) {
-                continue;
+        if coin || !called.is_empty() {
+            let cap = if coin {
+                usize::MAX
+            } else {
+                MAX_EXEC_PAIRS_PER_TX
+            };
+            let mut strings = Vec::new();
+            let mut add = |s: &str| push_distinct(&mut strings, s, cap);
+            if let Some(d) = cmd.pointer("/payload/exec/data") {
+                data_strings(d, &mut add);
             }
-            if is_token(&m) && !modules.contains(&m) {
+            for s in code_literals(code) {
+                add(&s);
+            }
+            if let Some(d) = output.pointer("/result/data") {
+                data_strings(d, &mut add);
+            }
+            c.exec = Some(D3Exec {
+                coin,
+                called,
+                strings,
+            });
+        }
+    }
+    c
+}
+
+/// The rows of `c` given which modules are tracked fungible tokens (`is_token`; coin is always
+/// one). Rules:
+///
+/// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain`, any height): step 1
+///    credits `args[1]` and step 0 debits `args[0]`. Tokens emit no TRANSFER for either
+///    (only `pact.X_YIELD` / `X_RESUME`); coin did not before coin v3. `<m>` is discovered.
+/// 2. **`exec`**: the D1 strings (`exec.data` values, `exec.code` literals) plus every string
+///    of `result.data` (a receiver built at run time and returned, D3 b), for every tracked
+///    token `<m>` the code calls (`<m>.fn`; from the events fork on only one that emitted
+///    nothing in the tx), and for coin below the events fork.
+/// 3. **Events** (any height, into `event_pairs`, capped at [`MAX_EVENT_PAIRS_PER_TX`], never
+///    coin): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
+///    …) gives its [`account_like`] params for that token; an event whose params hold a
+///    `fungible-v2` module reference gives them for the referenced module when the emitter is
+///    that module, a module of the same governed namespace (D3 d: `kaddex.skdx` is only ever
+///    minted that way, by `kaddex.alchemist`), or a tracked token naming another tracked
+///    token. Only the first two discover the referenced module (review M1). Strings inside a
+///    module reference are not accounts.
+///
+/// Rows and discoveries of a module `/local` cannot read ([`readable_module`]) are dropped.
+pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenReceivers {
+    let mut r = TokenReceivers::default();
+    if let Some((m, a)) = &c.xchain {
+        if let Some(a) = a {
+            r.push(a, m);
+        }
+        r.discover(m);
+    }
+    for ev in &c.events {
+        let mut targets: Vec<&str> = Vec::new();
+        for m in &ev.refs {
+            let own = ev.module == *m || same_governed_namespace(&ev.module, m);
+            if own {
+                r.discover(m);
+            }
+            if (own || (is_token(&ev.module) && is_token(m))) && !targets.contains(&m.as_str()) {
+                targets.push(m);
+            }
+        }
+        if ev.module != "coin"
+            && is_token(&ev.module)
+            && !ev.transfer
+            && !targets.contains(&ev.module.as_str())
+        {
+            targets.push(&ev.module);
+        }
+        for m in targets {
+            for s in &ev.strings {
+                r.push_event(s, m, &ev.module);
+            }
+        }
+    }
+    if let Some(x) = &c.exec {
+        let mut modules: Vec<&str> = Vec::new();
+        if x.coin {
+            modules.push("coin");
+        }
+        for m in &x.called {
+            if is_token(m) && !modules.contains(&m.as_str()) {
                 modules.push(m);
             }
         }
-        let mut strings = Vec::new();
-        if let Some(d) = c.pointer("/payload/exec/data") {
-            data_strings(d, &mut |s| strings.push(s.to_owned()));
-        }
-        strings.extend(code_literals(code));
-        if let Some(d) = output.pointer("/result/data") {
-            data_strings(d, &mut |s| strings.push(s.to_owned()));
-        }
         // Coin rows (below the events fork) as in D1; token rows are capped like events.
-        for m in &modules {
-            for s in &strings {
+        for m in modules {
+            for s in &x.strings {
                 if m == "coin" {
                     r.push(s, m);
                 } else {
@@ -447,6 +587,17 @@ pub fn token_receivers(
         }
     }
     r
+}
+
+/// [`d3_filter`] of [`d3_candidates`]: the D3 rows of one tx.
+pub fn token_receivers(
+    cmd: Option<&Value>,
+    output: &Value,
+    height: u32,
+    forks: Forks,
+    is_token: &dyn Fn(&str) -> bool,
+) -> TokenReceivers {
+    d3_filter(&d3_candidates(cmd, output, height, forks), is_token)
 }
 
 /// The modules `code` calls as `<module>.<fn>` (`ns.mod.fn` → `ns.mod`, `mod.fn` → `mod`),
@@ -539,6 +690,22 @@ fn param_strings(v: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// [`d3_candidates`] of a stored record (none for the coinbase; an error for a cmd that is
+/// not JSON or an output that does not render).
+pub fn record_d3_candidates(
+    r: &TxRecord,
+    dict: &dyn Dict,
+    forks: Forks,
+) -> Result<D3Candidates, RenderError> {
+    let Some(cmd) = r.cmd.as_deref().filter(|_| r.key.pos() != 0) else {
+        return Ok(D3Candidates::default());
+    };
+    let cmd = serde_json::from_slice::<Value>(cmd)
+        .map_err(|e| RenderError::Shape(format!("cmd is not JSON: {e}")))?;
+    let out = render_output(r, dict)?;
+    Ok(d3_candidates(Some(&cmd), &out, r.key.height(), forks))
+}
+
 /// [`token_receivers`] of a stored record (none for the coinbase; an error for a cmd that is
 /// not JSON or an output that does not render).
 pub fn record_token_receivers(
@@ -547,17 +714,5 @@ pub fn record_token_receivers(
     forks: Forks,
     is_token: &dyn Fn(&str) -> bool,
 ) -> Result<TokenReceivers, RenderError> {
-    let Some(cmd) = r.cmd.as_deref().filter(|_| r.key.pos() != 0) else {
-        return Ok(TokenReceivers::default());
-    };
-    let cmd = serde_json::from_slice::<Value>(cmd)
-        .map_err(|e| RenderError::Shape(format!("cmd is not JSON: {e}")))?;
-    let out = render_output(r, dict)?;
-    Ok(token_receivers(
-        Some(&cmd),
-        &out,
-        r.key.height(),
-        forks,
-        is_token,
-    ))
+    Ok(d3_filter(&record_d3_candidates(r, dict, forks)?, is_token))
 }

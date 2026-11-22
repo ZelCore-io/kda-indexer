@@ -16,6 +16,8 @@
 //!   reports the pending block's height); `reconciled_at` is unix seconds.
 //! - Dirty marks (B-3): tail apply and tail undo mark every `xfer` posting's `(account, module,
 //!   chain)` and every `acct` posting's `(account, coin, chain)` in the same txn as the block.
+//!   They also mark the D3 rows of each tx (receivers no TRANSFER names, ruling R-P5P9-192)
+//!   through [`mark_row`], the same path the seed pass uses.
 //!   A mark keeps the highest height and takes the writing txn's id as its `seq`; the
 //!   reconciler deletes it only when it is still the exact mark it read and not above the
 //!   answer's `as_of` (SR-1, I-5, M-3).
@@ -62,14 +64,106 @@ pub mod meta {
     pub const BALANCES_SEED_TOKEN_RECEIVERS_CURSOR: &str = "balances_seed_token_receivers_cursor";
     /// Txs the D3 pass could not read (u64), like [`BALANCES_SEED_RECEIVERS_ERRORS`].
     pub const BALANCES_SEED_TOKEN_RECEIVERS_ERRORS: &str = "balances_seed_token_receivers_errors";
-    /// JSON `{"cap", "emitters"}`: the last D3 pass hit its per-emitter cap for these modules,
-    /// so it was not marked done. The service does not rerun it by itself; an operator reruns
-    /// `reconcile-balances --seed` with a raised cap.
+    /// Legacy (builds before fix round 1 withheld the D3 pass on a budget hit and listed the
+    /// tokens here). A D3 pass deletes it; nothing reads it (review H2, M3).
     pub const BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT: &str = "balances_seed_token_receivers_cap_hit";
-    /// JSON `{"untracked", "ceiling", "tracked_bound"}`: capped candidates the last D3 pass
-    /// dropped (shared bucket of untracked emitters, global ceiling; the pass completes
-    /// regardless) and the bound on its tracked-token candidates (tokens × budget).
+    /// JSON `{"untracked", "ceiling", "tokens", "discovered", "tracked_bound"}`: capped
+    /// candidates the last D3 pass dropped (shared bucket of untracked emitters, global
+    /// ceiling, per tracked token at its budget of distinct rows; the pass completes
+    /// regardless), discovered modules over the per-pass cap, and the bound on its
+    /// tracked-token candidates (tokens × budget).
     pub const BALANCES_SEED_TOKEN_RECEIVERS_DROPPED: &str = "balances_seed_token_receivers_dropped";
+    /// JSON: the per-token budget counters of a running D3 pass's frozen walk, written with
+    /// its cursor so a resume does not grant a token its budget twice (review L1).
+    pub const BALANCES_SEED_TOKEN_RECEIVERS_BUDGET: &str = "balances_seed_token_receivers_budget";
+    /// Prefix of the D3 discovery queue `balances_d3_discover/{chain:02}/{module}` (u32: the
+    /// lowest height that named it): modules a tx put forward as tokens (cross-chain defpact,
+    /// own or same-namespace `fungible-v2` modref). The reconciler checks each with
+    /// `describe-module` on that chain, a few reads per round, and tracks it only when it
+    /// lists `fungible-v2` (review M1). At most [`super::D3_DISCOVER_QUEUE_MAX`] entries.
+    pub const D3_DISCOVER: &str = "balances_d3_discover/";
+    /// Prefix of `balances_d3_rewalk/{ModuleId:010}` (empty): tokens tracked since the last
+    /// D3 pass walked history. The next pass walks the D3 rules for them from height 0 up to
+    /// its done height (review M2).
+    pub const D3_REWALK: &str = "balances_d3_rewalk/";
+    /// u32 unix seconds: when a D3 pass last walked history for newly tracked tokens.
+    pub const D3_REWALK_AT: &str = "balances_d3_rewalk_at";
+}
+
+/// Entries the D3 discovery queue holds at most; more are dropped and counted
+/// ([`counters::D3_DISCOVER_DROPPED`]).
+pub const D3_DISCOVER_QUEUE_MAX: usize = 1024;
+
+/// Counters of the D3 marks outside the seed pass.
+pub mod counters {
+    /// D3 rows the tail dropped at its per-tx or per-block-per-emitter caps.
+    pub const D3_TAIL_DROPPED: &str = "d3_tail_dropped";
+    /// D3 rows the tail left to the hourly pass because a name was not in the dictionary.
+    pub const D3_TAIL_DEFERRED: &str = "d3_tail_deferred";
+    /// Discovered modules dropped at a full discovery queue.
+    pub const D3_DISCOVER_DROPPED: &str = "d3_discover_dropped";
+}
+
+/// Queue `module` (a discovered name, not tracked yet) for its `describe-module` check on
+/// `chain` (review M1). Returns false when the queue is full (dropped and counted).
+pub fn queue_discovered(txn: &mut RwTxn<'_>, module: &str, chain: u8, height: u32) -> Result<bool> {
+    let k = format!("{}{chain:02}/{module}", meta::D3_DISCOVER);
+    if let Some(h) = txn.meta(&k)?.as_deref().and_then(be_u32) {
+        if height < h {
+            txn.set_meta(&k, &height.to_be_bytes())?;
+        }
+        return Ok(true);
+    }
+    let p = meta::D3_DISCOVER.as_bytes();
+    let n = txn
+        .scan_limit(Table::Meta, p, D3_DISCOVER_QUEUE_MAX, |k| k.starts_with(p))?
+        .len();
+    if n >= D3_DISCOVER_QUEUE_MAX {
+        txn.add_counter(counters::D3_DISCOVER_DROPPED, 1)?;
+        return Ok(false);
+    }
+    txn.set_meta(&k, &height.to_be_bytes())?;
+    Ok(true)
+}
+
+/// Up to `n` entries of the discovery queue: `(module, chain, height)`.
+pub fn discovered_queue(txn: &impl Txn, n: usize) -> Result<Vec<(String, u8, u32)>> {
+    let p = meta::D3_DISCOVER.as_bytes();
+    Ok(txn
+        .scan_limit(Table::Meta, p, n, |k| k.starts_with(p))?
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let rest = std::str::from_utf8(k.get(p.len()..)?).ok()?;
+            let (c, m) = rest.split_once('/')?;
+            Some((m.to_owned(), c.parse().ok()?, be_u32(&v)?))
+        })
+        .collect())
+}
+
+/// Remove one discovery queue entry.
+pub fn unqueue_discovered(txn: &mut RwTxn<'_>, module: &str, chain: u8) -> Result<()> {
+    let k = format!("{}{chain:02}/{module}", meta::D3_DISCOVER);
+    txn.del(Table::Meta, k.as_bytes())?;
+    Ok(())
+}
+
+/// Tokens waiting for their D3 history walk (review M2).
+pub fn rewalk_pending(txn: &impl Txn) -> Result<Vec<u32>> {
+    let p = meta::D3_REWALK.as_bytes();
+    Ok(txn
+        .scan(Table::Meta, p, |k| k.starts_with(p))?
+        .into_iter()
+        .filter_map(|(k, _)| std::str::from_utf8(k.get(p.len()..)?).ok()?.parse().ok())
+        .collect())
+}
+
+/// Done: `module`'s history was walked.
+pub fn clear_rewalk(txn: &mut RwTxn<'_>, module: u32) -> Result<()> {
+    txn.del(
+        Table::Meta,
+        format!("{}{module:010}", meta::D3_REWALK).as_bytes(),
+    )?;
+    Ok(())
 }
 
 static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -300,21 +394,9 @@ pub fn mark_posting(
     let (chain, height) = (key.chain(), key.height());
     if family == Family::Xfer as u8 {
         let (account, module) = ((entity >> 32) as u32, entity as u32);
-        if Some(module) != coin {
-            if let Some(t) = token_row(txn, module)? {
-                // R-P5P9-8 #2 and I-7: no marks for a not-fungible module, nor for a new key
-                // of a module at its row cap.
-                if t.kind == KIND_NOT_FUNGIBLE
-                    || (t.capped()
-                        && txn
-                            .get(Table::Balances, &bal_key(account, module, chain))?
-                            .is_none())
-                {
-                    return Ok(());
-                }
-            }
+        if !mark_row(txn, account, module, chain, height, coin)? {
+            return Ok(());
         }
-        mark_dirty(txn, account, module, chain, height)?;
         if note_tokens {
             note_token(txn, module, height)?;
         }
@@ -324,6 +406,33 @@ pub fn mark_posting(
         }
     }
     Ok(())
+}
+
+/// Mark `(account, module, chain)` dirty at `height` (B-3), the one mark path of postings and
+/// D3 rows (tail and seed pass): no mark for a not-fungible module (R-P5P9-8 #2), nor for a
+/// new key of a module at its row cap (I-7). Returns whether it marked.
+pub fn mark_row(
+    txn: &mut RwTxn<'_>,
+    account: u32,
+    module: u32,
+    chain: u8,
+    height: u32,
+    coin: Option<u32>,
+) -> Result<bool> {
+    if Some(module) != coin {
+        if let Some(t) = token_row(txn, module)? {
+            if t.kind == KIND_NOT_FUNGIBLE
+                || (t.capped()
+                    && txn
+                        .get(Table::Balances, &bal_key(account, module, chain))?
+                        .is_none())
+            {
+                return Ok(false);
+            }
+        }
+    }
+    mark_dirty(txn, account, module, chain, height)?;
+    Ok(true)
 }
 
 /// One `Tokens` value.
@@ -396,7 +505,7 @@ pub fn token_row(txn: &impl Txn, module: u32) -> Result<Option<TokenRow>> {
 }
 
 /// Change a token row in place; a module with no row gets one with `first_height` u32::MAX
-/// until a posting lowers it.
+/// until a posting lowers it, and is queued for its D3 history walk ([`meta::D3_REWALK`]).
 pub fn update_token(txn: &mut RwTxn<'_>, module: u32, f: impl FnOnce(&mut TokenRow)) -> Result<()> {
     let mut r = token_row(txn, module)?.unwrap_or(TokenRow {
         first_height: u32::MAX,
@@ -404,8 +513,13 @@ pub fn update_token(txn: &mut RwTxn<'_>, module: u32, f: impl FnOnce(&mut TokenR
     });
     let before = r;
     f(&mut r);
-    if r != before || txn.get(Table::Tokens, &module.to_be_bytes())?.is_none() {
+    let new = txn.get(Table::Tokens, &module.to_be_bytes())?.is_none();
+    if r != before || new {
         txn.put(Table::Tokens, &module.to_be_bytes(), &r.encode())?;
+    }
+    if new && coin_module(txn)? != Some(module) {
+        // Newly tracked: the next D3 pass walks its history (review M2).
+        txn.set_meta(&format!("{}{module:010}", meta::D3_REWALK), &[])?;
     }
     Ok(())
 }

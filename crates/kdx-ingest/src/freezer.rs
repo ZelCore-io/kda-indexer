@@ -235,6 +235,7 @@ fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Resul
                         postings: p,
                         pact_id: None,
                         code_hash: None,
+                        d3: Default::default(),
                     })
                 })
                 .collect::<Result<_>>()?;
@@ -420,6 +421,7 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
                     postings: p,
                     pact_id: None,
                     code_hash: None,
+                    d3: Default::default(),
                 });
                 txs.push(t);
             }

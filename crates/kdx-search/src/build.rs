@@ -679,6 +679,7 @@ mod tests {
                     postings: vec![(Family::Code, kdx_decode::index::code_entity(&h))],
                     pact_id: None,
                     code_hash: Some(h),
+                    d3: Default::default(),
                 }
             })
             .collect();

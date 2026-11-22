@@ -970,6 +970,7 @@ mod tests {
                 postings: vec![],
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,

@@ -22,6 +22,10 @@ pub mod counters {
     pub const CMD_REENCODED: &str = "cmd_reencoded";
     /// Account strings longer than `MAX_ACCOUNT_LEN`, left unindexed.
     pub const UNINDEXED_ACCOUNTS: &str = "unindexed_accounts";
+    /// D3 rows dropped at the tail's per-block-per-emitter cap.
+    pub const D3_TAIL_DROPPED: &str = crate::balances::counters::D3_TAIL_DROPPED;
+    /// D3 rows the tail left to the hourly pass: a name the dictionary does not hold yet.
+    pub const D3_TAIL_DEFERRED: &str = crate::balances::counters::D3_TAIL_DEFERRED;
     /// Per-chain tx records: `txs.cNN`.
     pub fn txs_chain(chain: u8) -> String {
         format!("txs.c{chain:02}")
@@ -60,6 +64,7 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         balances::note_marked(txn, chain, height)?;
     }
 
+    let mut d3 = D3Block::default();
     let mut buf = Vec::new();
     encode_block(br, &mut buf);
     txn.put(Table::Headers, &bk, &buf)?;
@@ -96,6 +101,10 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
                 balances::mark_posting(txn, f as u8, e, r.key, coin, true)?;
             }
         }
+        // Ruling R-P5P9-192: credits no TRANSFER names, marked like postings (no hourly lag).
+        if marking && !x.d3.is_empty() {
+            mark_d3(txn, dict, x, r.key, coin, &mut d3, &mut ops)?;
+        }
         if !r.events.is_empty() {
             // Plan Task 11: NFT ledger events update `NftBalances` / mark `NftDirty`.
             let evs = nft::classify(&*dict, &r.events);
@@ -116,6 +125,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
             b.unindexed_accounts as i64,
         ),
         (counters::txs_chain(chain), n),
+        (counters::D3_TAIL_DROPPED.to_owned(), d3.dropped as i64),
+        (counters::D3_TAIL_DEFERRED.to_owned(), d3.deferred as i64),
     ] {
         if delta != 0 {
             txn.add_counter(&name, delta)?;
@@ -125,6 +136,91 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
 
     txn.put(Table::Undo, &bk, &undo::encode(&ops))?;
     set_checkpoint(txn, Stage::Tail, chain, height, br.hash)?;
+    Ok(())
+}
+
+/// D3 rows one emitter may have marked per tail block (review sketch 5); more are dropped and
+/// counted ([`counters::D3_TAIL_DROPPED`]), the block is applied regardless.
+pub const D3_ROWS_PER_EMITTER_PER_BLOCK: u32 = 1024;
+/// Discovered modules one tail block may queue for their `describe-module` check.
+pub const D3_DISCOVER_PER_BLOCK: usize = 16;
+
+/// Per-block state of the tail's D3 marks.
+#[derive(Default)]
+struct D3Block {
+    per_emitter: std::collections::HashMap<String, u32>,
+    discovered: usize,
+    dropped: u64,
+    deferred: u64,
+}
+
+/// The tracked fungible tokens as the tail sees them now: a `Tokens` row that is not a
+/// not-fungible verdict (the seed pass's `tracked_tokens` rule).
+fn tail_is_token(txn: &RwTxn<'_>, dict: &HotDict, m: &str) -> bool {
+    use kdx_types::Dict;
+    dict.mem()
+        .find(kdx_types::DictKind::Module, m)
+        .and_then(|id| balances::token_row(txn, id).ok().flatten())
+        .is_some_and(|t| t.kind != balances::KIND_NOT_FUNGIBLE)
+}
+
+/// Mark the D3 rows of one tx (the same rows the seed pass marks for it:
+/// `kdx_decode::receivers::d3_filter` of the candidates `extract` computed), with the tx's
+/// height and no verified-row skip, under the per-tx caps of the filter and
+/// [`D3_ROWS_PER_EMITTER_PER_BLOCK`]; queue its discovered modules. It interns nothing.
+fn mark_d3(
+    txn: &mut RwTxn<'_>,
+    dict: &HotDict,
+    x: &kdx_decode::TxIndex,
+    key: TxKey,
+    coin: Option<u32>,
+    st: &mut D3Block,
+    ops: &mut Vec<UndoOp>,
+) -> Result<()> {
+    use kdx_types::{Dict, DictKind};
+    let r = {
+        let t = &*txn;
+        kdx_decode::receivers::d3_filter(&x.d3, &|m| tail_is_token(t, dict, m))
+    };
+    for ((a, m), em) in r.all_pairs() {
+        let used = st.per_emitter.entry(em.to_owned()).or_insert(0);
+        if *used >= D3_ROWS_PER_EMITTER_PER_BLOCK {
+            st.dropped += 1;
+            continue;
+        }
+        *used += 1;
+        // Names come from decode time (postings, `intern_d3`), so backfill and tail build the
+        // same dictionary. A row whose name is new (e.g. an exec string) waits for the hourly
+        // pass, which interns it.
+        let module = match coin.filter(|_| m == "coin") {
+            Some(c) => Some(c),
+            None => dict.mem().find(DictKind::Module, m),
+        };
+        let (Some(module), Some(account)) = (module, dict.mem().find(DictKind::Account, a)) else {
+            st.deferred += 1;
+            continue;
+        };
+        if balances::mark_row(txn, account, module, key.chain(), key.height(), coin)? {
+            ops.push(UndoOp::BalanceMark {
+                account,
+                module,
+                key,
+            });
+        }
+    }
+    for m in &r.discovered {
+        if st.discovered >= D3_DISCOVER_PER_BLOCK {
+            break;
+        }
+        let tracked = dict
+            .mem()
+            .find(DictKind::Module, m)
+            .is_some_and(|id| matches!(balances::token_row(&*txn, id), Ok(Some(_))));
+        if !tracked {
+            st.discovered += 1;
+            balances::queue_discovered(txn, m, key.chain(), key.height())?;
+        }
+    }
     Ok(())
 }
 
@@ -172,6 +268,16 @@ fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
         }
         UndoOp::Counter { name, delta } => {
             txn.add_counter(name, delta.checked_neg().unwrap_or(i64::MAX))?;
+        }
+        UndoOp::BalanceMark {
+            account,
+            module,
+            key,
+        } => {
+            // Ruling R-P5P9-192: an undone D3 credit is re-read like an undone posting.
+            if balances::marking() {
+                balances::mark_row(txn, *account, *module, key.chain(), key.height(), coin)?;
+            }
         }
     }
     Ok(())
@@ -246,6 +352,7 @@ mod pact_family_tests {
                 postings: vec![(Family::Pact, ent)],
                 pact_id: Some(pact),
                 code_hash: None,
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,
@@ -305,6 +412,7 @@ mod balance_mark_tests {
                 ],
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,
@@ -358,6 +466,7 @@ mod balance_mark_tests {
                 postings: vec![(Family::Sndr, alice as u64)],
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,

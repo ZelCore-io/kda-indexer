@@ -1808,6 +1808,7 @@ mod xchain_store_tests {
                 },
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             })
             .collect();
         let mut h = [0u8; 32];

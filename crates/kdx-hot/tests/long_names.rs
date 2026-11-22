@@ -94,8 +94,15 @@ fn rows(store: &HotStore) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         for (k, v) in ro.scan(t, &[], |_| true).unwrap() {
             // The balance mark watermark (M-11) records blocks applied with marks; an unwind
             // leaves it, like the additive tables' marks.
+            // So do the D3 history-walk and discovery queues (a token row's companions).
             if t == kdx_hot::Table::Meta
-                && k.starts_with(kdx_hot::balances::meta::MARKED_THROUGH.as_bytes())
+                && [
+                    kdx_hot::balances::meta::MARKED_THROUGH,
+                    kdx_hot::balances::meta::D3_REWALK,
+                    kdx_hot::balances::meta::D3_DISCOVER,
+                ]
+                .iter()
+                .any(|p| k.starts_with(p.as_bytes()))
             {
                 continue;
             }

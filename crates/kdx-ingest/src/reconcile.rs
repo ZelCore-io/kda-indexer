@@ -1011,22 +1011,12 @@ async fn receivers_pass(
     let opts = crate::seed_receivers::Opts {
         forks: crate::seed_receivers::forks_for(&ctx.opts.network),
         rules,
+        rewalk_every_secs: crate::seed_receivers::REWALK_EVERY_SECS,
         ..Default::default()
     };
     let Some((from, to)) = crate::seed_receivers::pending_for(&ctx.hot.ro()?, &opts)? else {
         return Ok(true);
     };
-    // A D3 pass that hit its cap stays pending; rerunning it hourly would walk all history
-    // again for the same result. It waits for an operator (`reconcile-balances --seed`).
-    if let Some(why) = ctx
-        .hot
-        .ro()?
-        .meta(kdx_hot::balances::meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT)?
-        .filter(|_| rules == Rules::D3)
-    {
-        tracing::error!(cap_hit = %String::from_utf8_lossy(&why), "balances: token receivers pass (D3) hit its cap; not rerun by the service");
-        return Ok(true);
-    }
     if let Err(e) = crate::seed_receivers::check_ready(&ctx.hot.ro()?, &ctx.segdir) {
         tracing::warn!(error = %e, ?rules, "balances: receivers pass postponed");
         return Ok(true);
@@ -1048,6 +1038,38 @@ async fn receivers_pass(
         tracing::info!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended");
     }
     Ok(!rep.stopped)
+}
+
+/// `describe-module` reads per reconcile round for the D3 discovery queue (review M1).
+pub const DISCOVER_READS_PER_ROUND: usize = 4;
+
+/// Review M1: check a few queued discovered modules with the node; a module whose
+/// `describe-module` lists `fungible-v2` on that chain becomes a tracked token.
+async fn discovery_step(ctx: &Arc<Ctx>, local: &LocalClient) -> Result<()> {
+    let queued = kdx_hot::balances::discovered_queue(&ctx.hot.ro()?, DISCOVER_READS_PER_ROUND)?;
+    if queued.is_empty() {
+        return Ok(());
+    }
+    let answers = join_all(
+        queued
+            .iter()
+            .map(|(m, c, _)| local.implements_fungible(*c, m)),
+    )
+    .await;
+    let verdicts: Vec<Option<bool>> = answers
+        .into_iter()
+        .map(|r| match r {
+            Ok(Local::Found { value, .. }) => Some(value),
+            Ok(Local::Absent) | Err(LocalError::Failure(_)) => Some(false),
+            Err(LocalError::Node(_) | LocalError::Skipped(_)) => None,
+        })
+        .collect();
+    let (tracked, rejected) =
+        crate::seed_receivers::check_discovered(&ctx.hot, &ctx.dict, &queued, &verdicts)?;
+    if tracked + rejected > 0 {
+        tracing::info!(tracked, rejected, "balances: D3 discovered modules checked");
+    }
+    Ok(())
 }
 
 /// M-11: the tail applied blocks without dirty marks (`[balances] enabled = false`, or an
@@ -1205,6 +1227,11 @@ async fn run_with(
                 tracing::info!(modules = n, "balances: not-fungible modules re-checked");
             }
             last_recheck = Some(Instant::now());
+        }
+        if o.seed {
+            if let Err(e) = discovery_step(&ctx, &local).await {
+                tracing::warn!(error = %e, "balances: D3 discovery check failed; retried next round");
+            }
         }
         // NFT rows (plan Task 11) share the `/local` budget; the table is small, so one step
         // per loop keeps them current even behind a long balance backlog.

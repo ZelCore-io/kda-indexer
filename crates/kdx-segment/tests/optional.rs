@@ -45,6 +45,7 @@ fn indexed(b: &Blk) -> IndexedBlock {
             postings: vec![(Family::Acct, *ent), (Family::Sndr, *ent)],
             pact_id: None,
             code_hash: None,
+            d3: Default::default(),
         })
         .collect();
     IndexedBlock {

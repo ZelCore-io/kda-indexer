@@ -136,6 +136,9 @@ pub struct TxIndex {
     pub pact_id: Option<Hash32>,
     /// blake2b-128 of `exec.code`.
     pub code_hash: Option<[u8; 16]>,
+    /// D3 raw candidates (receivers no TRANSFER names), for the tail's marks (ruling
+    /// R-P5P9-192); empty for the coinbase and wherever the tail does not apply the block.
+    pub d3: crate::receivers::D3Candidates,
 }
 
 /// One block ready for storage: records plus their index entries (Tasks 4, 6, 7).
@@ -211,6 +214,27 @@ fn account_posting(a: &str, dict: &mut impl DictMut, p: &mut Vec<(Family, u64)>)
     }
 }
 
+/// Names the tail's D3 marks need that no posting interns: a cross-chain defpact's module and
+/// account, and the modules a tx may put forward as tokens (at most
+/// [`crate::receivers::MAX_DISCOVERED_PER_TX`]). Interned here, at decode time, so backfill and
+/// tail build the same dictionary; event params and emitters are interned already.
+fn intern_d3(d3: &crate::receivers::D3Candidates, dict: &mut impl DictMut) {
+    use crate::receivers::{account_like, d3_filter, readable_module};
+    if let Some((m, a)) = &d3.xchain {
+        if m != "coin" && readable_module(m) {
+            dict.intern(DictKind::Module, m);
+        }
+        if let Some(a) = a.as_deref().filter(|a| account_like(a)) {
+            dict.intern(DictKind::Account, a);
+        }
+    }
+    if !d3.events.is_empty() {
+        for m in d3_filter(d3, &|_| false).discovered {
+            dict.intern(DictKind::Module, &m);
+        }
+    }
+}
+
 /// Index entries for every record of the block (`txs` from `build_records(b, ..)`).
 pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> Vec<TxIndex> {
     let mut out = Vec::with_capacity(txs.len());
@@ -219,6 +243,7 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
         let mut p = Vec::new();
         let mut pact_id = None;
         let mut code_hash = None;
+        let mut d3 = crate::receivers::D3Candidates::default();
         if pos == 0 {
             if let Some(a) = b.miner.get("account").and_then(Value::as_str) {
                 account_posting(a, dict, &mut p);
@@ -226,6 +251,16 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
             output_postings(&b.coinbase, dict, &mut p);
         } else if let Some(t) = b.txs.get(pos - 1) {
             output_postings(&t.output, dict, &mut p);
+            // Fork heights: mainnet01's on every network (like the seed pass's fallback; on a
+            // network with earlier forks this only adds candidates).
+            let cmd = t.cmd_parsed.as_ref().filter(|_| !r.cmd_unparsed);
+            d3 = crate::receivers::d3_candidates(
+                cmd,
+                &t.output,
+                r.key.height(),
+                crate::receivers::MAINNET01,
+            );
+            intern_d3(&d3, dict);
             let out_pact = t.output.get("continuation").and_then(|c| c.get("pactId"));
             if let (Some(c), false) = (&t.cmd_parsed, r.cmd_unparsed) {
                 if let Some(s) = sender_of(c) {
@@ -271,6 +306,7 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
             postings: p,
             pact_id,
             code_hash,
+            d3,
         });
     }
     out

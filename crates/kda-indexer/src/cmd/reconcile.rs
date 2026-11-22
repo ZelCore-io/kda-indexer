@@ -128,7 +128,7 @@ fn receivers(
         forks: kdx_ingest::seed_receivers::forks_for(&cfg.network),
         dry_run,
         rules,
-        // Raise after a cap hit (`--status` shows `seed_token_receivers_cap_hit`).
+        // Per-token budget of distinct rows; drops show in `seed_token_receivers_dropped`.
         max_event_candidates: std::env::var("KDX_D3_MAX_EVENT_CANDIDATES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -141,13 +141,6 @@ fn receivers(
         Rules::D3 => "token_receivers",
     };
     println!("{}", json!({ key: rep }));
-    if !rep.cap_hit.is_empty() {
-        anyhow::bail!(
-            "token receivers pass: per-emitter cap reached for {:?}; the pass stays pending, \
-             rerun with KDX_D3_MAX_EVENT_CANDIDATES raised",
-            rep.cap_hit
-        );
-    }
     if rep.errors > 0 {
         anyhow::bail!(
             "receivers pass: {} txs could not be read (logged with block, chain and request \
@@ -223,9 +216,8 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
         "seed_token_receivers_in_progress": txn
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CURSOR)?
             .is_some(),
-        "seed_token_receivers_cap_hit": txn
-            .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT)?
-            .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
+        "d3_discover_queued": kdx_hot::balances::discovered_queue(&txn, kdx_hot::balances::D3_DISCOVER_QUEUE_MAX)?.len(),
+        "d3_rewalk_pending": kdx_hot::balances::rewalk_pending(&txn)?.len(),
         "seed_token_receivers_dropped": txn
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED)?
             .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),

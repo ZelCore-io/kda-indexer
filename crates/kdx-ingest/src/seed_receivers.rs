@@ -14,12 +14,13 @@
 //!   TxNum order (opened after the hot pass, so a block the freezer moves meanwhile is seen
 //!   in one of the two).
 //! - Writes: names are interned in the shared dictionary (lock order: dictionary, then the
-//!   MDBX writer; an account no posting named gets its first id here) and marked with
-//!   `seed_mark` (height 0, never overwrites a tail mark), every [`TX_CHUNK`] txs with the
-//!   resume cursor `Meta balances_seed_receivers_cursor` (start height, next TxNum, errors so
-//!   far). A key that already has a `Balances` row is not marked: the tail keeps it fresh, so
-//!   it is correct (review M2). The end sets `balances_seed_receivers` to `to`, stores the
-//!   error count (`balances_seed_receivers_errors`, shown by `--status`) and removes the
+//!   MDBX writer; an account no posting named gets its first id here). D1 rows are marked like
+//!   D3 rows: through `balances::mark_row` (the postings' mark path) at the height of the
+//!   latest tx naming them, every [`TX_CHUNK`] txs with the resume cursor
+//!   `Meta balances_seed_receivers_cursor` (start height, next TxNum, errors so far). A key
+//!   whose verified `Balances` row was read at or above that height is not marked (review H1:
+//!   an older row predates the credit). The end sets `balances_seed_receivers` to `to`, stores
+//!   the error count (`balances_seed_receivers_errors`, shown by `--status`) and removes the
 //!   cursor. Idempotent: a rerun marks the same rows.
 //! - Refused (review L3) while the store has no tail yet or its backfill is incomplete (MDBX
 //!   frontier ≠ segment manifest frontier): a backfill resume truncates names interned after
@@ -29,16 +30,18 @@
 //!
 //! D3 ([`Rules::D3`], its own flag `balances_seed_token_receivers`, cursor and error count):
 //! the same walk over **all** stored heights (no coin v3 cap), with the rules of
-//! `kdx_decode::receivers::token_receivers`: cross-chain defpacts of any module (token
-//! finishes and starts emit no TRANSFER), pre-event execs for coin and the tokens their code
-//! calls (incl. receivers only in `result.data`), non-TRANSFER events of tracked tokens and
-//! `fungible-v2` module references (which also discover the referenced token, e.g.
-//! `kaddex.skdx`), capped per tx and per pass. A coinbase below the injection fix whose
-//! block's miner account holds a `"` gives the accounts it really credited, on its chain. Rows of a module whose name fails the `/local` module check (B-1; e.g. a non-ASCII
-//! name Pact 5 cannot parse) are never marked or noted. As the tail grows the pass is
-//! pending again and walks only the new heights (hourly in the service).
+//! `kdx_decode::receivers::d3_filter` (the tail marks the same rows live, ruling R-P5P9-192):
+//! cross-chain defpacts of any module, pre-event execs for coin and the tokens their code calls
+//! (incl. receivers only in `result.data`), token execs that emitted nothing of the token,
+//! non-TRANSFER events of tracked tokens and `fungible-v2` module references, capped per tx and
+//! per pass (a budget of distinct rows per token; a hit drops and counts that token's excess,
+//! the pass completes, review H2). A coinbase below the injection fix whose block's miner
+//! account holds a `"` gives the accounts it really credited, on its chain. Discovered modules
+//! are queued for the reconciler's `describe-module` check ([`check_discovered`], review M1),
+//! and tokens tracked since the last pass get their history walked (review M2). As the tail
+//! grows the pass is pending again and walks only the new heights (hourly in the service).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -112,16 +115,24 @@ pub struct ReceiversReport {
     pub skipped_existing: u64,
     /// D3: candidates of a not-fungible module, or new keys of a module at its row cap.
     pub skipped_module: u64,
-    /// D3: modules the pass starts tracking (`Tokens`), e.g. found by a `fungible-v2` modref.
+    /// D3: discovered modules the pass queued for their `describe-module` check (review M1;
+    /// e.g. found by a `fungible-v2` modref); tracked once the node confirms them.
     pub tokens_noted: u64,
     /// D3: coinbases below the injection fix whose miner account holds a `"`.
     pub injected_miners: u64,
-    /// D3: capped candidates taken (events, token rows of execs).
+    /// D3: distinct capped candidates taken (events, token rows of execs).
     pub event_candidates: u64,
-    /// D3: emitters that reached `Opts::max_event_candidates`. Non-empty: the pass is not
-    /// marked done (Meta `balances_seed_token_receivers_cap_hit` names them); rerun it with a
-    /// raised cap.
-    pub cap_hit: Vec<String>,
+    /// D3: capped candidates dropped per tracked token at its per-pass budget of distinct rows
+    /// (`Opts::max_event_candidates`, review H2); counted per take (a repeat of a dropped row
+    /// counts again: a distinct count would need memory the chain data controls). The pass completes regardless; Meta
+    /// `balances_seed_token_receivers_dropped` keeps them for `--status`.
+    pub dropped_tokens: BTreeMap<String, u64>,
+    /// D3: discovered modules not queued because the pass reached
+    /// [`MAX_DISCOVERED_PER_PASS`] (review M1).
+    pub discovered_dropped: u64,
+    /// D3: newly tracked tokens whose history this run walked (review M2); a dry run: would
+    /// walk.
+    pub rewalk_tokens: u64,
     /// D3: the bound on tracked-token candidates of this pass: tracked tokens × the
     /// per-token budget (review round 5: tracked candidates have no global ceiling; their
     /// total is bounded by this product, and a token at its budget keeps the pass pending).
@@ -225,18 +236,29 @@ pub fn check_ready(txn: &impl Txn, segdir: &Path) -> Result<()> {
 /// Pending marks of one write txn, plus a dry run's pass-wide sets.
 #[derive(Default)]
 struct Pending {
-    /// `(account, module, chain)`.
-    rows: BTreeSet<(String, String, u8)>,
-    /// D3: modules to note as tokens, with the lowest height seen.
-    tokens: HashMap<String, u32>,
+    /// `(account, module, chain)` with the highest height of a tx that names it (review H1).
+    rows: BTreeMap<(String, String, u8), u32>,
+    /// D3: discovered modules to queue for their `describe-module` check, per chain, with the
+    /// lowest height seen.
+    tokens: HashMap<(String, u8), u32>,
     /// Dry run: rows that would be marked, names and tokens that would be new, over the pass.
     dry_marked: HashSet<(String, String, u8)>,
     dry_new: HashSet<String>,
     dry_tokens: HashSet<String>,
-    /// D3: capped candidates taken per tracked token, and by all untracked emitters.
+    /// D3: distinct capped rows taken per tracked token over the pass, and by all untracked
+    /// emitters (review H2: distinct rows, not raw takes).
     emitters: HashMap<String, u64>,
     untracked: u64,
+    /// D3: hashes of the capped rows taken so far in this pass (a repeat is free).
+    seen: HashSet<u64>,
+    /// D3: modules queued by this pass so far (the per-pass discovery cap).
+    queued: usize,
+    /// JSON for `BALANCES_SEED_TOKEN_RECEIVERS_BUDGET`, written with the next cursor.
+    budget: Option<Vec<u8>>,
 }
+
+/// Modules the pass may queue for their `describe-module` check per pass (review M1).
+pub const MAX_DISCOVERED_PER_PASS: usize = 256;
 
 /// Why a module's candidate is not marked (D3): a not-fungible verdict, or the row cap (I-7)
 /// for a key without a row. `None`: mark it.
@@ -249,6 +271,13 @@ fn module_skip(txn: &impl Txn, module: u32, coin: u32, key: &[u8; 9]) -> Result<
         Some(t) => t.capped() && txn.get(Table::Balances, key)?.is_none(),
         None => false,
     })
+}
+
+/// A verified `Balances` row read at or above `height`: it already reflects the credit, so it
+/// needs no re-read (review H1). Older or unverified rows are marked like absent keys.
+fn fresh_row(v: Option<&[u8]>, height: u32) -> bool {
+    v.and_then(balances::BalanceRow::decode)
+        .is_some_and(|r| !r.unverified && r.as_of >= height)
 }
 
 impl Pending {
@@ -281,54 +310,48 @@ impl Pending {
         rep: &mut ReceiversReport,
     ) -> Result<()> {
         let mut txn = hot.rw()?;
-        let mark = balances::Mark {
-            height: 0,
-            seq: txn.txn_id()?,
-        }
-        .encode();
         let before = d.len(DictKind::Account);
-        let mut rows: Vec<[u8; 9]> = Vec::with_capacity(self.rows.len());
+        let mut rows: Vec<([u8; 9], u32)> = Vec::with_capacity(self.rows.len());
         let (mut skipped, mut skipped_module) = (0u64, 0u64);
-        for (a, m, c) in &self.rows {
+        for ((a, m, c), h) in &self.rows {
             let mid = if m == "coin" {
                 coin
             } else {
                 d.intern(DictKind::Module, m)
             };
             let k = bal_key(d.intern(DictKind::Account, a), mid, *c);
-            // A key with a verified row is kept fresh by the tail: correct, no re-read (review
-            // M2). An unverified row (its last re-read failed) is marked like an absent key.
             if module_skip(&txn, mid, coin, &k)? {
                 skipped_module += 1;
-            } else if verified_row(txn.get(Table::Balances, &k)?.as_deref()) {
+            } else if fresh_row(txn.get(Table::Balances, &k)?.as_deref(), *h) {
                 skipped += 1;
             } else {
-                rows.push(k);
+                rows.push((k, *h));
             }
         }
-        let tokens: Vec<(u32, u32)> = self
-            .tokens
-            .drain()
-            .map(|(m, h)| (d.intern(DictKind::Module, &m), h))
-            .collect();
         let new = (d.len(DictKind::Account) - before) as u64;
         d.persist(&mut txn)?;
         let mut inserted = 0u64;
-        for k in &rows {
-            if balances::seed_mark(&mut txn, k, &mark)? {
+        for (k, h) in &rows {
+            // The postings' mark path, at the credit's height (review H1).
+            let (a, m, c) = balances::parse_bal_key(k).context("bal key")?;
+            let new = txn.get(Table::BalanceDirty, k)?.is_none();
+            if balances::mark_row(&mut txn, a, m, c, *h, Some(coin))? && new {
                 inserted += 1;
             }
         }
-        for (m, h) in tokens {
-            if m != coin && balances::token_row(&txn, m)?.is_none() {
+        for ((m, c), h) in self.tokens.drain() {
+            let tracked = d.find(DictKind::Module, &m).is_some_and(|id| {
+                id == coin || matches!(balances::token_row(&txn, id), Ok(Some(_)))
+            });
+            if !tracked && balances::queue_discovered(&mut txn, &m, c, h)? {
                 rep.tokens_noted += 1;
-            }
-            if m != coin {
-                balances::note_token(&mut txn, m, h)?;
             }
         }
         if let Some(c) = cursor {
             txn.set_meta(cursor_key, &c)?;
+            if let Some(b) = self.budget.take() {
+                txn.set_meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_BUDGET, &b)?;
+            }
         }
         txn.commit()?;
         rep.new_accounts += new;
@@ -349,7 +372,7 @@ impl Pending {
         rep: &mut ReceiversReport,
     ) -> Result<()> {
         let txn = hot.ro()?;
-        for (a, m, c) in std::mem::take(&mut self.rows) {
+        for ((a, m, c), h) in std::mem::take(&mut self.rows) {
             let mid = if m == "coin" {
                 Some(coin)
             } else {
@@ -365,11 +388,11 @@ impl Pending {
                     if module_skip(&txn, mid, coin, &k)? {
                         rep.skipped_module += 1;
                         false
-                    } else if verified_row(txn.get(Table::Balances, &k)?.as_deref()) {
+                    } else if fresh_row(txn.get(Table::Balances, &k)?.as_deref(), h) {
                         rep.skipped_existing += 1;
                         false
                     } else {
-                        !balances::is_dirty(&txn, id, mid, c)?
+                        txn.get(Table::BalanceDirty, &k)?.is_none()
                     }
                 }
                 _ => true,
@@ -379,7 +402,7 @@ impl Pending {
                 rep.dirty_inserted += 1;
             }
         }
-        for (m, _) in std::mem::take(&mut self.tokens) {
+        for ((m, _), _) in std::mem::take(&mut self.tokens) {
             let tracked = match d.find(DictKind::Module, &m) {
                 Some(id) => id == coin || balances::token_row(&txn, id)?.is_some(),
                 None => false,
@@ -392,17 +415,14 @@ impl Pending {
     }
 }
 
-/// A `Balances` row the pass may leave to the tail: it decodes and is not `unverified`.
-fn verified_row(v: Option<&[u8]>) -> bool {
-    v.and_then(balances::BalanceRow::decode)
-        .is_some_and(|r| !r.unverified)
-}
-
 /// What the walk needs per tx: the rules, the forks and (D3) the tracked tokens.
 struct Walk {
     rules: Rules,
     forks: Forks,
     tokens: HashSet<String>,
+    /// A history walk for newly tracked tokens (review M2): only rows of these modules, no
+    /// injected miners, no discovery.
+    only: Option<HashSet<String>>,
     max_event_candidates: u64,
     max_untracked_candidates: u64,
     max_total_candidates: u64,
@@ -410,7 +430,14 @@ struct Walk {
 
 /// A module whose rows the pass may mark: coin, or a name `/local` can call (B-1).
 fn readable(m: &str) -> bool {
-    m == "coin" || kdx_node::local::valid_module(m)
+    kdx_decode::receivers::readable_module(m)
+}
+
+fn row_hash(a: &str, m: &str, chain: u8) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (a, m, chain).hash(&mut h);
+    h.finish()
 }
 
 fn add(
@@ -427,16 +454,27 @@ fn add(
         Rules::D3 => {
             let is_token = |m: &str| w.tokens.contains(m);
             record_token_receivers(r, dict, w.forks, &is_token).map(|t| {
-                for m in t.discovered.into_iter().filter(|m| readable(m)) {
-                    let e = p.tokens.entry(m).or_insert(k.height());
-                    *e = (*e).min(k.height());
+                if w.only.is_none() {
+                    for m in t.discovered.iter().filter(|m| !w.tokens.contains(*m)) {
+                        let key = (m.clone(), k.chain());
+                        if let Some(e) = p.tokens.get_mut(&key) {
+                            *e = (*e).min(k.height());
+                        } else if p.queued < MAX_DISCOVERED_PER_PASS {
+                            p.queued += 1;
+                            p.tokens.insert(key, k.height());
+                        } else {
+                            rep.discovered_dropped += 1;
+                        }
+                    }
                 }
+                let keep = |m: &str| w.only.as_ref().is_none_or(|o| o.contains(m));
                 // Security review: budgets per tracked token, one shared bucket for untracked
                 // emitters, a global ceiling; events first, then exec rows.
-                let mut v = t.pairs;
+                let mut v: Vec<(String, String)> =
+                    t.pairs.into_iter().filter(|(_, m)| keep(m)).collect();
                 let capped = t.event_pairs.into_iter().zip(t.event_emitters);
                 for (x, em) in capped.chain(t.exec_pairs.into_iter().zip(t.exec_emitters)) {
-                    if take(p, w, rep, &em) {
+                    if keep(&x.1) && take(p, w, rep, &em, row_hash(&x.0, &x.1, k.chain())) {
                         v.push(x);
                     }
                 }
@@ -445,11 +483,12 @@ fn add(
         }
     };
     match res {
-        Ok(v) => p.rows.extend(
-            v.into_iter()
-                .filter(|(_, m)| readable(m))
-                .map(|(a, m)| (a, m, k.chain())),
-        ),
+        Ok(v) => {
+            for (a, m) in v.into_iter().filter(|(_, m)| readable(m)) {
+                let e = p.rows.entry((a, m, k.chain())).or_insert(0);
+                *e = (*e).max(k.height());
+            }
+        }
         Err(e) => {
             rep.errors += 1;
             tracing::error!(
@@ -464,27 +503,28 @@ fn add(
     }
 }
 
-/// Budget one capped candidate charged to emitter `em` (final cap design):
-/// - a tracked token has its own budget (`max_event_candidates`); a hit is listed in
-///   `cap_hit` and keeps the pass pending (visible, rerun with a raised cap);
+/// Budget one capped candidate (row hash `row`) charged to emitter `em` (review H2):
+/// - a row this pass already took is free (repeating strings costs nothing);
+/// - a tracked token has its own budget of distinct rows (`max_event_candidates`); over it the
+///   row is dropped and counted for that token only (`dropped_tokens`), the pass completes;
 /// - every untracked emitter shares one bucket (`max_untracked_candidates`) under a global
 ///   ceiling for untracked candidates (`max_total_candidates`); a hit there drops the excess,
-///   counts it (`dropped_untracked`, `dropped_ceiling`) and the pass still completes, so no
-///   emitter can stall it.
-fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str) -> bool {
+///   counts it (`dropped_untracked`, `dropped_ceiling`) and the pass still completes.
+fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str, row: u64) -> bool {
+    if p.seen.contains(&row) {
+        return true;
+    }
     if w.tokens.contains(em) {
         let n = p.emitters.entry(em.to_owned()).or_insert(0);
         if *n >= w.max_event_candidates {
-            if !rep.cap_hit.iter().any(|x| x == em) {
-                rep.cap_hit.push(em.to_owned());
-            }
+            *rep.dropped_tokens.entry(em.to_owned()).or_insert(0) += 1;
             return false;
         }
         *n += 1;
     } else {
         // One check: the shared bucket and the global ceiling (review round 4: the ceiling
         // bounds untracked candidates only) count the same thing; the lower one binds and
-        // names the drop. A tracked token is bounded by its own budget and never dropped.
+        // names the drop.
         let limit = w.max_untracked_candidates.min(w.max_total_candidates);
         if p.untracked >= limit {
             if w.max_total_candidates < w.max_untracked_candidates {
@@ -496,6 +536,7 @@ fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str) -> bool 
         }
         p.untracked += 1;
     }
+    p.seen.insert(row);
     rep.event_candidates += 1;
     true
 }
@@ -522,7 +563,7 @@ fn tracked_tokens(txn: &impl Txn, dict: &MemDict) -> Result<HashSet<String>> {
 fn miner_rows(
     p: &mut Pending,
     br: &kdx_types::record::BlockRecord,
-    chain: u8,
+    key: TxKey,
     dict: &MemDict,
     rep: &mut ReceiversReport,
 ) {
@@ -532,13 +573,18 @@ fn miner_rows(
     let v = injected_miner_receivers(name);
     if !v.is_empty() {
         rep.injected_miners += 1;
-        p.rows
-            .extend(v.into_iter().map(|a| (a, "coin".to_owned(), chain)));
+        for a in v {
+            let e = p
+                .rows
+                .entry((a, "coin".to_owned(), key.chain()))
+                .or_insert(0);
+            *e = (*e).max(key.height());
+        }
     }
 }
 
 /// Counters of the frozen walk that a resume adds back (the hot part is redone).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Carry {
     errors: u64,
     dropped_untracked: u64,
@@ -546,6 +592,16 @@ struct Carry {
     /// Capped candidates of untracked emitters taken (shared bucket and ceiling).
     untracked: u64,
     event_candidates: u64,
+    /// Distinct rows taken per tracked token, and dropped per token (review L1, H2).
+    taken: BTreeMap<String, u64>,
+    dropped: BTreeMap<String, u64>,
+}
+
+fn map_minus(a: &BTreeMap<String, u64>, b: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    a.iter()
+        .map(|(k, v)| (k.clone(), v - b.get(k).copied().unwrap_or(0)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
 }
 
 impl Carry {
@@ -556,24 +612,37 @@ impl Carry {
             dropped_ceiling: rep.dropped_ceiling,
             untracked: p.untracked,
             event_candidates: rep.event_candidates,
+            taken: p.emitters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            dropped: rep.dropped_tokens.clone(),
         }
     }
-    fn minus(self, o: Carry) -> Carry {
+    fn minus(&self, o: &Carry) -> Carry {
         Carry {
             errors: self.errors - o.errors,
             dropped_untracked: self.dropped_untracked - o.dropped_untracked,
             dropped_ceiling: self.dropped_ceiling - o.dropped_ceiling,
             untracked: self.untracked - o.untracked,
             event_candidates: self.event_candidates - o.event_candidates,
+            taken: map_minus(&self.taken, &o.taken),
+            dropped: map_minus(&self.dropped, &o.dropped),
         }
+    }
+    /// The per-token maps, for `BALANCES_SEED_TOKEN_RECEIVERS_BUDGET` (keyed by the cursor's
+    /// start height and next TxNum, so a stale one is never added).
+    fn budget_json(&self, from: u32, next: u64) -> Vec<u8> {
+        serde_json::json!({"from": from, "next": next, "taken": self.taken,
+            "dropped": self.dropped})
+        .to_string()
+        .into_bytes()
     }
 }
 
 const CURSOR_LEN: usize = 52;
 
 /// Resume cursor: start height ‖ next frozen TxNum ‖ the frozen walk's [`Carry`] counters
-/// (errors, dropped untracked, dropped at the ceiling, untracked taken, capped taken).
-fn cursor(from: u32, next: u64, c: Carry) -> [u8; CURSOR_LEN] {
+/// (errors, dropped untracked, dropped at the ceiling, untracked taken, capped taken). The
+/// per-token maps go to `BALANCES_SEED_TOKEN_RECEIVERS_BUDGET` in the same txn.
+fn cursor(from: u32, next: u64, c: &Carry) -> [u8; CURSOR_LEN] {
     let mut v = [0u8; CURSOR_LEN];
     v[..4].copy_from_slice(&from.to_be_bytes());
     v[4..12].copy_from_slice(&next.to_be_bytes());
@@ -608,8 +677,31 @@ fn parse_cursor(v: &[u8]) -> Option<(u32, u64, Carry)> {
             dropped_ceiling: at(2),
             untracked: at(3),
             event_candidates: at(4),
+            ..Carry::default()
         },
     ))
+}
+
+/// The per-token maps stored with the cursor `(from, next)`; empty when absent or stale.
+fn parse_budget(
+    v: Option<&[u8]>,
+    from: u32,
+    next: u64,
+) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+    let Some(v) = v.and_then(|v| serde_json::from_slice::<serde_json::Value>(v).ok()) else {
+        return Default::default();
+    };
+    if v["from"].as_u64() != Some(u64::from(from)) || v["next"].as_u64() != Some(next) {
+        return Default::default();
+    }
+    let map = |x: &serde_json::Value| -> BTreeMap<String, u64> {
+        x.as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_u64()?)))
+            .collect()
+    };
+    (map(&v["taken"]), map(&v["dropped"]))
 }
 
 /// Pass options: the network's forks, txs per write txn, and whether to write at all.
@@ -622,21 +714,27 @@ pub struct Opts {
     pub dry_run: bool,
     /// D1 (default) or D3.
     pub rules: Rules,
-    /// D3: capped candidates (events, token rows of execs) per emitter module per pass
-    /// (security review).
+    /// D3: distinct capped rows (events, token rows of execs) per tracked token per pass
+    /// (security review; review H2: over it that token's rows are dropped and counted).
     pub max_event_candidates: u64,
     /// D3: capped candidates shared by all untracked emitters per pass.
     pub max_untracked_candidates: u64,
     /// D3: global ceiling on capped candidates per pass.
     pub max_total_candidates: u64,
+    /// D3: the history walk of newly tracked tokens (review M2) runs at most this often
+    /// (seconds; 0 = whenever some are pending). The service passes [`REWALK_EVERY_SECS`].
+    pub rewalk_every_secs: u32,
 }
 
-/// Default per-emitter, per-pass cap on D3 capped candidates.
+/// Default per-token, per-pass budget of distinct D3 capped rows.
 pub const MAX_EVENT_CANDIDATES: u64 = 2_000_000;
 /// Default shared bucket of untracked emitters.
 pub const MAX_UNTRACKED_CANDIDATES: u64 = 2_000_000;
 /// Default global ceiling on D3 capped candidates.
 pub const MAX_TOTAL_CANDIDATES: u64 = 20_000_000;
+/// The service's interval between history walks for newly tracked tokens (a walk reads all
+/// stored history, about as long as the first D3 pass).
+pub const REWALK_EVERY_SECS: u32 = 24 * 3600;
 
 impl Default for Opts {
     fn default() -> Opts {
@@ -648,73 +746,44 @@ impl Default for Opts {
             max_event_candidates: MAX_EVENT_CANDIDATES,
             max_untracked_candidates: MAX_UNTRACKED_CANDIDATES,
             max_total_candidates: MAX_TOTAL_CANDIDATES,
+            rewalk_every_secs: 0,
         }
     }
 }
 
-/// Run (or resume) the pass when [`pending`]; otherwise return an empty report. Errors when
-/// the store is not ready ([`check_ready`]). `stop` is polled after each segment chunk; a
-/// stopped pass commits its chunk and cursor and returns with `stopped`.
-pub fn run(
-    hot: &HotStore,
-    dict: &Mutex<HotDict>,
-    segdir: &Path,
-    o: &Opts,
+fn now_unix() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as u32)
+}
+
+/// What one walk over `[from, to)` shares.
+struct Env<'a> {
+    hot: &'a HotStore,
+    dict: &'a Mutex<HotDict>,
+    segdir: &'a Path,
+    snap: Arc<MemDict>,
+    o: &'a Opts,
+    ck: (u32, &'a str),
+}
+
+/// Walk the stored txs at heights `[from, to)`: hot `TailTxs`, then the segments in TxNum
+/// order. `resume` (the main walk only): the cursor of this pass, `Some(None)` for a fresh
+/// main walk that writes cursors, `None` for a walk that writes none (history walk). Returns
+/// whether it was stopped.
+fn walk(
+    e: &Env,
+    w: &Walk,
+    p: &mut Pending,
+    rep: &mut ReceiversReport,
+    (from, to): (u32, u32),
+    resume: Option<Option<(u64, Carry)>>,
     stop: &dyn Fn() -> bool,
-) -> Result<ReceiversReport> {
-    let t0 = Instant::now();
-    let mut rep = ReceiversReport {
-        dry_run: o.dry_run,
-        rules: o.rules,
-        ..ReceiversReport::default()
+) -> Result<bool> {
+    let (hot, snap, o) = (e.hot, &e.snap, e.o);
+    let miners = |key: TxKey| {
+        o.rules == Rules::D3 && w.only.is_none() && key.height() < o.forks.coinbase_fix
     };
-    let (flag_key, cursor_key, errors_key) = o.rules.keys();
-    let (coin, span, resume, prior_errors) = {
-        let txn = hot.ro()?;
-        let resume = txn.meta(cursor_key)?.as_deref().and_then(parse_cursor);
-        let prior = txn
-            .meta(errors_key)?
-            .as_deref()
-            .and_then(|v| Some(u64::from_be_bytes(v.try_into().ok()?)))
-            .unwrap_or(0);
-        let span = pending_for(&txn, o)?;
-        if span.is_some() {
-            check_ready(&txn, segdir)?;
-        }
-        (balances::coin_module(&txn)?, span, resume, prior)
-    };
-    let Some((from, to)) = span else {
-        return Ok(rep);
-    };
-    (rep.from, rep.to) = (from, to);
-    let Some(coin) = coin else {
-        rep.no_coin = true;
-        tracing::warn!(rules = ?o.rules, "balances: no coin module yet; receivers pass postponed");
-        return Ok(rep);
-    };
-    tracing::info!(
-        from,
-        to,
-        dry_run = o.dry_run,
-        rules = ?o.rules,
-        "balances: receivers pass started"
-    );
-    let snap: Arc<MemDict> = Arc::new(dict.lock().unwrap_or_else(|e| e.into_inner()).mem().clone());
-    let mut p = Pending::default();
-    let w = Walk {
-        rules: o.rules,
-        forks: o.forks,
-        tokens: match o.rules {
-            Rules::D1 => HashSet::new(),
-            Rules::D3 => tracked_tokens(&hot.ro()?, &snap)?,
-        },
-        max_event_candidates: o.max_event_candidates,
-        max_untracked_candidates: o.max_untracked_candidates,
-        max_total_candidates: o.max_total_candidates,
-    };
-    rep.tracked_bound = (w.tokens.len() as u64).saturating_mul(o.max_event_candidates);
-    let miners = |key: TxKey| o.rules == Rules::D3 && key.height() < o.forks.coinbase_fix;
-    let ck = (coin, cursor_key);
 
     // Hot pass: TailTxs at heights [from, to), key order.
     let mut after: Option<Vec<u8>> = None;
@@ -739,13 +808,13 @@ pub fn run(
                     let bk = kdx_hot::tables::block_key(key.chain(), key.height());
                     if let Some(v) = hot.ro()?.get(Table::Headers, &bk)? {
                         let br = kdx_types::record::decode_block(&v)?;
-                        miner_rows(&mut p, &br, key.chain(), &snap, &mut rep);
+                        miner_rows(p, &br, key, snap, rep);
                     }
                 }
                 continue;
             }
             match decode_tx(v) {
-                Ok(r) => add(&mut p, key, &r, &snap, &w, &mut rep),
+                Ok(r) => add(p, key, &r, snap, w, rep),
                 Err(e) => {
                     rep.errors += 1;
                     tracing::error!(
@@ -763,36 +832,30 @@ pub fn run(
             _ => break,
         }
     }
-    p.flush(hot, dict, ck, None, &mut rep)?;
+    p.flush(hot, e.dict, e.ck, None, rep)?;
     // The hot part is redone on resume; the frozen walk's counters resume with the cursor.
-    let hot_part = Carry::now(&rep, &p);
+    let hot_part = Carry::now(rep, p);
 
     // Segment pass, TxNum order, resuming at the cursor of a pass with the same start.
-    let segs = Segments::open_without_filters(segdir, snap.clone())?;
+    let segs = Segments::open_without_filters(e.segdir, snap.clone())?;
     let start = match segs.last_txnum_below_height(from) {
         Some(t) => t + 1,
         None => segs.manifest.entries.first().map_or(0, |e| e.first_txnum),
     };
-    let start = match resume {
-        Some((f, next, c)) if f == from && !o.dry_run => {
+    let start = match &resume {
+        Some(Some((next, c))) => {
             rep.errors += c.errors;
             rep.dropped_untracked += c.dropped_untracked;
             rep.dropped_ceiling += c.dropped_ceiling;
             rep.event_candidates += c.event_candidates;
             p.untracked += c.untracked;
-            // A tracked token's cap hit before the stop keeps the pass pending.
-            if let Some(why) = hot
-                .ro()?
-                .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT)?
-            {
-                let v: serde_json::Value = serde_json::from_slice(&why).unwrap_or_default();
-                for e in v["emitters"].as_array().into_iter().flatten() {
-                    if let Some(e) = e.as_str().filter(|e| !rep.cap_hit.iter().any(|x| x == e)) {
-                        rep.cap_hit.push(e.to_owned());
-                    }
-                }
+            for (k, v) in &c.taken {
+                *p.emitters.entry(k.clone()).or_insert(0) += v;
             }
-            start.max(next)
+            for (k, v) in &c.dropped {
+                *rep.dropped_tokens.entry(k.clone()).or_insert(0) += v;
+            }
+            start.max(*next)
         }
         _ => start,
     };
@@ -803,12 +866,12 @@ pub fn run(
         if let Some(key) = segs.txkey(t) {
             if key.is_coinbase() && miners(key) && (from..to).contains(&key.height()) {
                 if let Some(br) = segs.block(key.chain(), key.height())? {
-                    miner_rows(&mut p, &br, key.chain(), &snap, &mut rep);
+                    miner_rows(p, &br, key, snap, rep);
                 }
             } else if !key.is_coinbase() && (from..to).contains(&key.height()) {
                 match segs.tx(t)? {
                     Some(r) => {
-                        add(&mut p, key, &r, &snap, &w, &mut rep);
+                        add(p, key, &r, snap, w, rep);
                         rep.frozen_txs += 1;
                     }
                     None => {
@@ -826,19 +889,12 @@ pub fn run(
         }
         n += 1;
         if n.is_multiple_of(chunk) {
-            let c = cursor(from, t + 1, Carry::now(&rep, &p).minus(hot_part));
-            p.flush(hot, dict, ck, Some(c), &mut rep)?;
-            if !o.dry_run && !rep.cap_hit.is_empty() {
-                // Kept across a stop, so a resumed pass is not marked done by mistake.
-                let why =
-                    serde_json::json!({"cap": o.max_event_candidates, "emitters": rep.cap_hit});
-                let mut txn = hot.rw()?;
-                txn.set_meta(
-                    meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT,
-                    why.to_string().as_bytes(),
-                )?;
-                txn.commit()?;
-            }
+            let c = resume.as_ref().map(|_| {
+                let carry = Carry::now(rep, p).minus(&hot_part);
+                p.budget = Some(carry.budget_json(from, t + 1));
+                cursor(from, t + 1, &carry)
+            });
+            p.flush(hot, e.dict, e.ck, c, rep)?;
             if n.is_multiple_of(chunk * 20) {
                 tracing::info!(
                     txnum = t,
@@ -851,21 +907,110 @@ pub fn run(
                 );
             }
             if stop() {
-                rep.stopped = true;
-                rep.secs = t0.elapsed().as_secs_f64();
-                return Ok(rep);
+                return Ok(true);
             }
         }
     }
-    p.flush(hot, dict, ck, None, &mut rep)?;
-    rep.secs = t0.elapsed().as_secs_f64();
-    if !rep.cap_hit.is_empty() {
-        tracing::error!(
-            cap = o.max_event_candidates,
-            emitters = ?rep.cap_hit,
-            "balances: D3 candidates of some emitters reached the per-pass cap; the pass stays \
-             pending (rerun `reconcile-balances --seed` with KDX_D3_MAX_EVENT_CANDIDATES raised)"
-        );
+    p.flush(hot, e.dict, e.ck, None, rep)?;
+    Ok(false)
+}
+
+/// Run (or resume) the pass when [`pending`]; otherwise return an empty report. Errors when
+/// the store is not ready ([`check_ready`]). `stop` is polled after each segment chunk; a
+/// stopped pass commits its chunk and cursor and returns with `stopped`.
+///
+/// D3, after the walk of `[from, to)`: the tokens tracked since the last pass (review M2,
+/// [`meta::D3_REWALK`]) get their history walked over `[0, from)` (rules for those tokens
+/// only), at most every [`Opts::rewalk_every_secs`]; a pass from 0 covers them already.
+pub fn run(
+    hot: &HotStore,
+    dict: &Mutex<HotDict>,
+    segdir: &Path,
+    o: &Opts,
+    stop: &dyn Fn() -> bool,
+) -> Result<ReceiversReport> {
+    let t0 = Instant::now();
+    let mut rep = ReceiversReport {
+        dry_run: o.dry_run,
+        rules: o.rules,
+        ..ReceiversReport::default()
+    };
+    let (flag_key, cursor_key, errors_key) = o.rules.keys();
+    let (coin, span, resume, budget, prior_errors) = {
+        let txn = hot.ro()?;
+        let resume = txn.meta(cursor_key)?.as_deref().and_then(parse_cursor);
+        let budget = txn.meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_BUDGET)?;
+        let prior = txn
+            .meta(errors_key)?
+            .as_deref()
+            .and_then(|v| Some(u64::from_be_bytes(v.try_into().ok()?)))
+            .unwrap_or(0);
+        let span = pending_for(&txn, o)?;
+        if span.is_some() {
+            check_ready(&txn, segdir)?;
+        }
+        (balances::coin_module(&txn)?, span, resume, budget, prior)
+    };
+    let Some((from, to)) = span else {
+        return Ok(rep);
+    };
+    (rep.from, rep.to) = (from, to);
+    let Some(coin) = coin else {
+        rep.no_coin = true;
+        tracing::warn!(rules = ?o.rules, "balances: no coin module yet; receivers pass postponed");
+        return Ok(rep);
+    };
+    tracing::info!(
+        from,
+        to,
+        dry_run = o.dry_run,
+        rules = ?o.rules,
+        "balances: receivers pass started"
+    );
+    let snap: Arc<MemDict> = Arc::new(dict.lock().unwrap_or_else(|e| e.into_inner()).mem().clone());
+    let (tokens, rewalk) = match o.rules {
+        Rules::D1 => (HashSet::new(), Vec::new()),
+        Rules::D3 => {
+            let txn = hot.ro()?;
+            (
+                tracked_tokens(&txn, &snap)?,
+                balances::rewalk_pending(&txn)?,
+            )
+        }
+    };
+    let w = Walk {
+        rules: o.rules,
+        forks: o.forks,
+        tokens,
+        only: None,
+        max_event_candidates: o.max_event_candidates,
+        max_untracked_candidates: o.max_untracked_candidates,
+        max_total_candidates: o.max_total_candidates,
+    };
+    rep.tracked_bound = (w.tokens.len() as u64).saturating_mul(o.max_event_candidates);
+    let env = Env {
+        hot,
+        dict,
+        segdir,
+        snap: snap.clone(),
+        o,
+        ck: (coin, cursor_key),
+    };
+    // A resume continues the cursor of a pass with the same start, with its budget counters
+    // (review L1). No cap-hit list is reloaded: a budget hit no longer withholds the pass
+    // (review H2, M3).
+    let resume = match resume {
+        Some((f, next, mut c)) if f == from && !o.dry_run => {
+            (c.taken, c.dropped) = parse_budget(budget.as_deref(), from, next);
+            Some((next, c))
+        }
+        _ => None,
+    };
+    let mut p = Pending::default();
+    if walk(&env, &w, &mut p, &mut rep, (from, to), Some(resume), stop)? {
+        rep.stopped = true;
+        rep.secs = t0.elapsed().as_secs_f64();
+        return Ok(rep);
     }
     if rep.errors > 0 {
         tracing::error!(
@@ -874,7 +1019,20 @@ pub fn run(
              missing (see the errors logged above)"
         );
     }
+    if !rep.dropped_tokens.is_empty() {
+        tracing::warn!(
+            budget = o.max_event_candidates,
+            tokens = ?rep.dropped_tokens,
+            "balances: D3 dropped rows of tokens over their per-pass budget of distinct rows \
+             (the pass completes; rerun `reconcile-balances --seed` after deleting the D3 flag \
+             with KDX_D3_MAX_EVENT_CANDIDATES raised if a token is genuine)"
+        );
+    }
     if o.dry_run {
+        if o.rules == Rules::D3 && from > 0 {
+            rep.rewalk_tokens = rewalk.len() as u64;
+        }
+        rep.secs = t0.elapsed().as_secs_f64();
         return Ok(rep);
     }
 
@@ -891,29 +1049,155 @@ pub fn run(
     if o.rules == Rules::D3 {
         let dropped = serde_json::json!({
             "untracked": rep.dropped_untracked, "ceiling": rep.dropped_ceiling,
+            "tokens": rep.dropped_tokens, "discovered": rep.discovered_dropped,
             "tracked_bound": rep.tracked_bound});
         txn.set_meta(
             meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED,
             dropped.to_string().as_bytes(),
         )?;
-        if rep.cap_hit.is_empty() {
-            txn.del(
-                Table::Meta,
-                meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT.as_bytes(),
-            )?;
-        } else {
-            let why = serde_json::json!({"cap": o.max_event_candidates, "emitters": rep.cap_hit});
-            txn.set_meta(
-                meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT,
-                why.to_string().as_bytes(),
-            )?;
+        // Written by earlier builds, which withheld the pass on a budget hit (review M3).
+        txn.del(
+            Table::Meta,
+            meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT.as_bytes(),
+        )?;
+        txn.del(
+            Table::Meta,
+            meta::BALANCES_SEED_TOKEN_RECEIVERS_BUDGET.as_bytes(),
+        )?;
+        if from == 0 {
+            // The walk from 0 covered every token tracked when it started.
+            for m in &rewalk {
+                balances::clear_rewalk(&mut txn, *m)?;
+            }
         }
     }
-    if rep.cap_hit.is_empty() {
-        txn.set_meta(flag_key, &to.to_be_bytes())?;
-    }
+    txn.set_meta(flag_key, &to.to_be_bytes())?;
     txn.set_meta(errors_key, &total.to_be_bytes())?;
     txn.del(Table::Meta, cursor_key.as_bytes())?;
     txn.commit()?;
+
+    if o.rules == Rules::D3 && from > 0 && !rewalk.is_empty() {
+        let last = hot
+            .ro()?
+            .meta(meta::D3_REWALK_AT)?
+            .as_deref()
+            .and_then(be_u32)
+            .unwrap_or(0);
+        let now = now_unix();
+        if now >= last.saturating_add(o.rewalk_every_secs)
+            && history_walk(&env, &w, &rewalk, from, &mut rep, stop)?
+        {
+            rep.stopped = true;
+        }
+    }
+    rep.secs = t0.elapsed().as_secs_f64();
     Ok(rep)
+}
+
+/// Review M2: walk `[0, upto)` with the D3 rules for the newly tracked tokens `ids` only, then
+/// clear them from [`meta::D3_REWALK`]. Returns whether it was stopped (they stay pending).
+fn history_walk(
+    env: &Env,
+    main: &Walk,
+    ids: &[u32],
+    upto: u32,
+    rep: &mut ReceiversReport,
+    stop: &dyn Fn() -> bool,
+) -> Result<bool> {
+    let names: HashSet<String> = ids
+        .iter()
+        .filter_map(|id| env.snap.name(DictKind::Module, *id).map(str::to_owned))
+        .filter(|m| main.tokens.contains(m))
+        .collect();
+    tracing::info!(tokens = ?names, upto, "balances: D3 history walk of newly tracked tokens");
+    let w = Walk {
+        rules: Rules::D3,
+        forks: main.forks,
+        tokens: main.tokens.clone(),
+        only: Some(names),
+        max_event_candidates: main.max_event_candidates,
+        max_untracked_candidates: main.max_untracked_candidates,
+        max_total_candidates: main.max_total_candidates,
+    };
+    let mut p = Pending::default();
+    if walk(env, &w, &mut p, rep, (0, upto), None, stop)? {
+        return Ok(true);
+    }
+    rep.rewalk_tokens = ids.len() as u64;
+    let mut txn = env.hot.rw()?;
+    for m in ids {
+        balances::clear_rewalk(&mut txn, *m)?;
+    }
+    txn.set_meta(meta::D3_REWALK_AT, &now_unix().to_be_bytes())?;
+    txn.commit()?;
+    Ok(false)
+}
+
+/// Review M1: check up to `n` queued discovered modules with `check(chain, module)` (the
+/// node's `describe-module` lists `fungible-v2`: `Some(true)`; not a fungible module or no
+/// such module: `Some(false)`; node unreachable: `None`, kept for later). A confirmed module
+/// becomes a tracked token (`note_token` at the lowest height that named it, which also queues
+/// its history walk, review M2); a rejected one is dropped. Returns `(tracked, rejected)`.
+pub fn check_discovered(
+    hot: &HotStore,
+    dict: &Mutex<HotDict>,
+    queued: &[(String, u8, u32)],
+    verdicts: &[Option<bool>],
+) -> Result<(u64, u64)> {
+    let mut d = dict.lock().unwrap_or_else(|e| e.into_inner());
+    let mut txn = hot.rw()?;
+    let (mut tracked, mut rejected) = (0u64, 0u64);
+    for ((m, c, h), v) in queued.iter().zip(verdicts) {
+        match v {
+            Some(true) => {
+                let id = d.intern(DictKind::Module, m);
+                d.persist(&mut txn)?;
+                balances::note_token(&mut txn, id, *h)?;
+                balances::unqueue_discovered(&mut txn, m, *c)?;
+                tracked += 1;
+            }
+            Some(false) => {
+                balances::unqueue_discovered(&mut txn, m, *c)?;
+                rejected += 1;
+            }
+            None => {}
+        }
+    }
+    let r = txn.commit();
+    if r.is_err() {
+        *d = HotDict::load(&hot.ro()?)?;
+    }
+    r?;
+    Ok((tracked, rejected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_token_budget_counters_resume_with_their_cursor_only() {
+        let mut c = Carry {
+            errors: 1,
+            ..Carry::default()
+        };
+        c.taken.insert("free.spam".into(), 7);
+        c.dropped.insert("free.spam".into(), 3);
+        let hot = Carry {
+            taken: [("free.spam".to_owned(), 2)].into(),
+            ..Carry::default()
+        };
+        let frozen = c.minus(&hot);
+        assert_eq!(frozen.taken.get("free.spam"), Some(&5));
+        let j = frozen.budget_json(10, 99);
+        let (taken, dropped) = parse_budget(Some(&j), 10, 99);
+        assert_eq!(
+            (taken, dropped),
+            (frozen.taken.clone(), frozen.dropped.clone())
+        );
+        // Stored with another cursor (an older pass, or a stop before the next cursor): ignored.
+        assert_eq!(parse_budget(Some(&j), 10, 100), Default::default());
+        assert_eq!(parse_budget(Some(&j), 0, 99), Default::default());
+        assert_eq!(parse_budget(None, 10, 99), Default::default());
+    }
 }

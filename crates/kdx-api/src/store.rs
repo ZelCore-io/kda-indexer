@@ -1151,6 +1151,7 @@ mod genesis_rk_tests {
                 postings: Vec::new(),
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             })
             .collect();
         IndexedBlock {
@@ -1255,6 +1256,7 @@ mod code_search_tests {
                 postings: vec![(Family::Code, kdx_decode::index::code_entity(&h))],
                 pact_id: None,
                 code_hash: Some(h),
+                d3: Default::default(),
             }],
             txs: vec![r],
             cmd_reencoded: 0,
@@ -1374,6 +1376,7 @@ mod pact_steps_tests {
                 },
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             })
             .collect();
         IndexedBlock {

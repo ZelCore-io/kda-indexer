@@ -363,3 +363,43 @@ fn a_post_fork_exec_counts_only_for_tokens_that_emitted_nothing() {
     );
     assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
 }
+
+#[test]
+fn modref_discovery_is_capped_and_only_from_its_module_or_governed_namespace() {
+    use kdx_decode::receivers::MAX_DISCOVERED_PER_TX;
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(x)"}}});
+    let refs = |ns: &str| -> Vec<Value> {
+        (0..100)
+            .map(|i| modref(Some(ns), &format!("tok{i}")))
+            .collect()
+    };
+    let run = |emitter: &str, refs: Vec<Value>| {
+        let evs = json!([ev(emitter, "SPAM", json!([refs, ACC]))]);
+        token_receivers(
+            Some(&cmd),
+            &out(json!("ok"), evs, Value::Null),
+            5_000_000,
+            MAINNET01,
+            &tokens,
+        )
+    };
+    // 100 modrefs from a governed namespace's own module: at most the per-tx cap.
+    let r = run("kaddex.alchemist", refs("kaddex"));
+    assert_eq!(
+        r.discovered.len(),
+        MAX_DISCOVERED_PER_TX,
+        "{:?}",
+        r.discovered
+    );
+    // A tracked token naming 100 modules of an open namespace discovers none (it still names
+    // its own rows: a non-TRANSFER event of a token).
+    let r = run("free.wiza", refs("free"));
+    assert!(r.discovered.is_empty(), "{:?}", r.discovered);
+    // Nor of another governed namespace.
+    let r = run("free.wiza", refs("kaddex"));
+    assert!(r.discovered.is_empty(), "{:?}", r.discovered);
+    assert!(
+        !r.event_pairs.iter().any(|(_, m)| m.starts_with("kaddex.")),
+        "{r:?}"
+    );
+}
