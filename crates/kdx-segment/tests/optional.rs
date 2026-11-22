@@ -500,3 +500,81 @@ fn a_filter_build_failure_writes_the_range_without_kf() {
     assert_eq!(s.by_rk(&h(9, 2)).unwrap(), Some(0));
     assert!(kdx_segment::check(&seg, true).unwrap().ok());
 }
+
+/// F-31: `range.toml` is checked on load. A `files` key that is not one of the range's own
+/// file names (a path such as `../x`, or another range's file) and a network that is not a
+/// plain name are refused, so `segments check` never resolves, stats or hashes a file
+/// outside the range.
+#[test]
+fn range_toml_with_a_foreign_file_name_or_network_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    write_store(dir.path(), &[(0, 4, false, Vec::new())]);
+    let seg = dir.path().join("segments");
+    let m = Manifest::load(&seg).unwrap().unwrap();
+    let e = m.entries[0].clone();
+    let good = RangeInfo::load(&toml_path(&seg, &e)).unwrap();
+    let st = good.files.values().next().unwrap().clone();
+    for bad in [
+        "../x",
+        "/etc/passwd",
+        "mainnet01-txs-000000004-000000008.seg",
+    ] {
+        let mut info = good.clone();
+        info.files.insert(bad.into(), st.clone());
+        std::fs::write(toml_path(&seg, &e), info.to_toml().unwrap()).unwrap();
+        let err = RangeInfo::load(&toml_path(&seg, &e)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a file of range"),
+            "{bad}: {err:#}"
+        );
+        assert!(!kdx_segment::check(&seg, false).unwrap().ok(), "{bad}");
+    }
+    let mut info = good.clone();
+    info.network = "../x".into();
+    std::fs::write(toml_path(&seg, &e), info.to_toml().unwrap()).unwrap();
+    assert!(RangeInfo::load(&toml_path(&seg, &e)).is_err());
+    std::fs::write(toml_path(&seg, &e), good.to_toml().unwrap()).unwrap();
+    assert!(kdx_segment::check(&seg, false).unwrap().ok());
+}
+
+/// F-31: the shallow `segments check` compares `range.toml` with the manifest entry and
+/// network, and requires every required file to be listed.
+#[test]
+fn shallow_check_finds_a_range_toml_that_disagrees_with_the_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    write_store(dir.path(), &[(0, 4, false, Vec::new())]);
+    let seg = dir.path().join("segments");
+    let m = Manifest::load(&seg).unwrap().unwrap();
+    let e = m.entries[0].clone();
+    let good = RangeInfo::load(&toml_path(&seg, &e)).unwrap();
+    let txs = file_name(NET, FileKind::Txs, e.start, e.end);
+    let damaged: Vec<(&str, RangeInfo)> = vec![
+        ("tx count", {
+            let mut i = good.clone();
+            i.tx_count += 1;
+            i
+        }),
+        ("block count", {
+            let mut i = good.clone();
+            i.block_count += 1;
+            i
+        }),
+        ("network", {
+            let mut i = good.clone();
+            i.network = "testnet04".into();
+            i
+        }),
+        ("required file not listed", {
+            let mut i = good.clone();
+            i.files.remove(&txs).unwrap();
+            i
+        }),
+    ];
+    for (what, info) in damaged {
+        std::fs::write(toml_path(&seg, &e), info.to_toml().unwrap()).unwrap();
+        let rep = kdx_segment::check(&seg, false).unwrap();
+        assert!(!rep.ok(), "{what}: {rep:?}");
+    }
+    std::fs::write(toml_path(&seg, &e), good.to_toml().unwrap()).unwrap();
+    assert!(kdx_segment::check(&seg, false).unwrap().ok());
+}
