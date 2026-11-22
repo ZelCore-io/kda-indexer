@@ -121,6 +121,7 @@ fn nft_txs_spec(account: &str, chain: Option<u8>) -> ListSpec {
         rows: Rows::Txs {
             sender: None,
             nft: true,
+            module: None,
         },
     }
 }

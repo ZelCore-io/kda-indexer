@@ -521,12 +521,17 @@ fn list_source(
     request_key: Option<&str>,
 ) -> Result<SourceSpec> {
     // A `fungibleName` is checked whatever the source, so a name of spaces alone is refused
-    // beside `blockHash` or `requestKey` too (FIX-4 part C, M-4).
+    // beside `blockHash` or `requestKey` too (FIX-4 part C, M-4); so is `blockHash` beside
+    // `requestKey`, which filters that key's copies (stock ANDs both; audit F-30).
     let fungible = fungible.map(fungible_arg).transpose()?;
+    let block = block_hash.map(|h| hash_arg("blockHash", h)).transpose()?;
     Ok(if let Some(rk) = request_key {
-        SourceSpec::Rk(hash_arg("requestKey", rk)?)
-    } else if let Some(bh) = block_hash {
-        SourceSpec::Block(hash_arg("blockHash", bh)?)
+        SourceSpec::Rk {
+            rk: hash_arg("requestKey", rk)?,
+            block,
+        }
+    } else if let Some(bh) = block {
+        SourceSpec::Block(bh)
     } else {
         match (account, fungible) {
             (Some(a), Some(m)) => SourceSpec::Xfer {
@@ -560,7 +565,8 @@ fn key_filter(
 /// the account sent (`meta.sender`), as the oracle does: the account's `sndr` postings (with
 /// `fungibleName`, intersected with its `xfer` postings) when the view is sender-ready
 /// (FIX-2), else its `acct`/`xfer` postings filtered on the record's sender. With
-/// `requestKey` or `blockHash` the source is that key or block, filtered on the sender.
+/// `requestKey` or `blockHash` the source is that key or block, filtered on the sender and,
+/// with `fungibleName`, on an event of that module, as stock filters (audit F-30).
 fn transactions_spec(
     account_name: Option<&str>,
     block_hash: Option<&str>,
@@ -574,12 +580,18 @@ fn transactions_spec(
         SourceSpec::Xfer { account, module } => SourceSpec::SndrXfer { account, module },
         s => s,
     };
+    // The posting sources already hold only txs of the token; a key or a block does not.
+    let module = match source {
+        SourceSpec::Rk { .. } | SourceSpec::Block(_) => fungible_name.map(|m| m.trim().to_owned()),
+        _ => None,
+    };
     Ok(ListSpec {
         source,
         filter: key_filter(chain_id, min_height, max_height, minimum_depth, true)?,
         rows: Rows::Txs {
             sender: account_name.map(str::to_owned),
             nft: false,
+            module,
         },
     })
 }
@@ -644,6 +656,7 @@ pub async fn query_transactions_by_public_key(
         rows: Rows::Txs {
             sender: None,
             nft: false,
+            module: None,
         },
     };
     let (edges, page_info, total) =
@@ -675,7 +688,9 @@ pub async fn query_transfers(
     let nft = is_nft == Some(true);
     let source = match (nft, &account_name) {
         // NFT moves have no `xfer` postings: an account's come from its `acct` postings.
+        // `fungibleName` is checked here as `list_source` checks it (audit F-30).
         (true, Some(a)) if request_key.is_none() && block_hash.is_none() => {
+            fungible_name.as_deref().map(fungible_arg).transpose()?;
             SourceSpec::Acct(name_arg("accountName", a)?.to_owned())
         }
         _ => list_source(
@@ -716,6 +731,18 @@ pub async fn query_transfers(
     })
 }
 
+/// Whether an account's `acct` postings hold every tx with a `qual` event whose first
+/// parameter is `a` (audit F-27, option B). A principal is posted wherever it appears; any
+/// other string only as a side of a transfer, so the account postings serve it only for a
+/// `TRANSFER` event (fast vanity-name filters on `coin.TRANSFER`). Known gap: a poly-fungible
+/// `TRANSFER (id, from, to, amount)` whose token `id` is `a` and that does not name `a` as a
+/// side is missed, as is a `TRANSFER` whose params fail the transfer shape (no sides then).
+/// Every other event name reads the event-name postings, filtered on the parameters.
+fn acct_covers(a: &str, qual: &str) -> bool {
+    kdx_decode::build::is_principal(a)
+        || qual.rsplit_once('.').is_some_and(|(_, n)| n == "TRANSFER")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn query_events(
     ctx: &Context<'_>,
@@ -749,17 +776,25 @@ pub async fn query_events(
         .as_deref()
         .map(ParamFilter::parse)
         .transpose()?;
+    // `blockHash` is checked, and filters a `requestKey`'s copies (stock ANDs both; F-30).
+    let block = block_hash
+        .as_deref()
+        .map(|h| hash_arg("blockHash", h))
+        .transpose()?;
     let source = if let Some(rk) = &request_key {
-        SourceSpec::Rk(hash_arg("requestKey", rk)?)
-    } else if let Some(bh) = &block_hash {
-        SourceSpec::Block(hash_arg("blockHash", bh)?)
+        SourceSpec::Rk {
+            rk: hash_arg("requestKey", rk)?,
+            block,
+        }
+    } else if let Some(bh) = block {
+        SourceSpec::Block(bh)
     } else if let Some(q) = &qual {
         match params.as_ref().and_then(|p| p.first_str()) {
-            Some(a) => SourceSpec::AcctOrEvt {
+            Some(a) if acct_covers(a, q) => SourceSpec::AcctOrEvt {
                 account: a.to_owned(),
                 qual: q.clone(),
             },
-            None => SourceSpec::EvtName(q.clone()),
+            _ => SourceSpec::EvtName(q.clone()),
         }
     } else {
         // `moduleName` alone (ZelCore extension): no module posting family, so heights are
@@ -1554,7 +1589,7 @@ mod cgfix_tests {
     fn account_transactions_are_sender_rows() {
         let spec = transactions_spec(Some("k:a"), None, Some("2"), None, (None, None, None), None)
             .unwrap();
-        let Rows::Txs { sender, nft } = &spec.rows else {
+        let Rows::Txs { sender, nft, .. } = &spec.rows else {
             panic!("tx rows")
         };
         assert_eq!((sender.as_deref(), *nft), (Some("k:a"), false));

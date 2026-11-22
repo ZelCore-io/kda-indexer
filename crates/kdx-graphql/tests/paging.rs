@@ -45,6 +45,9 @@ enum Shape {
     Nft,
     /// One coin transfer.
     One,
+    /// One `coin.NOTE` event whose only param is Carol's name: not a principal and not a
+    /// transfer side, so the tx has no `acct` posting of Carol's (audit F-27).
+    Note,
 }
 
 /// The fixture's blocks: `(chain, height, user txs)`. Heights below [`FRONTIER`] are frozen.
@@ -60,6 +63,8 @@ const BLOCKS: &[(u8, u32, &[Shape])] = &[
     (0, 11, &[Shape::Many, Shape::Nft]),
     (0, 12, &[Shape::Many]),
     (1, 12, &[Shape::One, Shape::Many]),
+    // Hot: a tx naming Carol in a non-transfer event only (audit F-27).
+    (1, 11, &[Shape::Note]),
 ];
 
 fn ev(ns: Option<&str>, module: &str, name: &str, params: Value) -> Value {
@@ -93,6 +98,7 @@ fn events(s: Shape) -> Vec<Value> {
             coin(json!([BOB, ALICE, 2.5])),
         ],
         Shape::One => vec![coin(json!([ALICE, BOB, 1.5]))],
+        Shape::Note => vec![ev(None, "coin", "NOTE", json!([CAROL]))],
     }
 }
 
@@ -683,6 +689,7 @@ async fn big_page_order_is_height_then_node_order_then_sub_row() {
             Shape::Many => &[0, 1, 3, 4, 5],
             Shape::Nft => &[0, 4],
             Shape::One => &[0],
+            Shape::Note => &[],
         })
     );
     // The coin.TRANSFER events.
@@ -698,6 +705,7 @@ async fn big_page_order_is_height_then_node_order_then_sub_row() {
             Shape::Many => &[0, 1, 4, 5],
             Shape::Nft => &[0, 4],
             Shape::One => &[0],
+            Shape::Note => &[],
         })
     );
 }
@@ -1311,7 +1319,7 @@ async fn one_block_lists_are_in_node_order() {
         match s {
             Shape::Many => &[0, 1, 2, 3, 4, 5],
             Shape::Nft => &[0, 1, 2, 3, 4],
-            Shape::One => &[0],
+            Shape::One | Shape::Note => &[0],
         }
     }
     fn coin_transfers(s: Shape) -> &'static [u32] {
@@ -1319,6 +1327,7 @@ async fn one_block_lists_are_in_node_order() {
             Shape::Many => &[0, 1, 4, 5],
             Shape::Nft => &[0, 4],
             Shape::One => &[0],
+            Shape::Note => &[],
         }
     }
     // A frozen block and a hot one.
@@ -1611,4 +1620,218 @@ async fn blocks_from_height_with_an_inverted_range_is_empty() {
         Some(1),
         "{v}"
     );
+}
+
+/// Audit PR-3: GraphQL resolver fixes (F-27, F-28, F-30, F-50, F-51).
+mod audit_pr3 {
+    use super::*;
+
+    fn code(r: &async_graphql::Response) -> Option<async_graphql::Value> {
+        r.errors
+            .first()
+            .and_then(|e| e.extensions.as_ref()?.get("code").cloned())
+    }
+
+    fn bad_input() -> Option<async_graphql::Value> {
+        Some(async_graphql::Value::from("BAD_USER_INPUT"))
+    }
+
+    fn edges<'v>(v: &'v Value, field: &str) -> &'v Vec<Value> {
+        v[field]["edges"].as_array().unwrap()
+    }
+
+    /// F-27: `events(parametersFilter)` whose first value is a string in the account
+    /// dictionary but not a principal finds a non-`TRANSFER` event naming it, although the
+    /// tx has no `acct` posting of that string. A `TRANSFER` filter on the same name keeps
+    /// the account's postings (option B) and still lists its transfers.
+    #[tokio::test]
+    async fn a_non_principal_first_param_of_a_non_transfer_event_is_listed() {
+        let fx = fixture();
+        let q = |qual: &str| {
+            format!(
+                r#"{{ events(qualifiedEventName: "{qual}", parametersFilter: "{{\"array_starts_with\": \"{CAROL}\"}}", first: 50) {{ totalCount edges {{ node {{ requestKey }} }} }} }}"#
+            )
+        };
+        let v = run(&fx.schema, &q("coin.NOTE")).await;
+        let rks: Vec<&str> = edges(&v, "events")
+            .iter()
+            .map(|e| e["node"]["requestKey"].as_str().unwrap())
+            .collect();
+        assert_eq!(rks, [fx.rks[&(1, 11)][0].as_str()], "{v}");
+        assert_eq!(v["events"]["totalCount"], 1, "{v}");
+        let v = run(&fx.schema, &q("coin.TRANSFER")).await;
+        assert!(!edges(&v, "events").is_empty(), "{v}");
+    }
+
+    /// F-30 (stock ANDs every supplied filter): `requestKey` with `blockHash` lists the key's
+    /// copy in that block only; another block's hash lists nothing, and a malformed one is
+    /// `BAD_USER_INPUT`, on `transactions`, `transfers` and `events`.
+    #[tokio::test]
+    async fn request_key_and_block_hash_both_filter() {
+        let fx = fixture();
+        let rk = &fx.rks[&(0, 6)][1];
+        for (field, extra, sel) in [
+            ("transactions", "", "hash"),
+            ("transfers", "", "requestKey orderIndex"),
+            (
+                "events",
+                ", qualifiedEventName: \"coin.TRANSFER\"",
+                "requestKey orderIndex",
+            ),
+        ] {
+            let q = |bh: Option<&str>| {
+                let bh = bh.map_or(String::new(), |h| format!(", blockHash: \"{h}\""));
+                format!(
+                    "{{ {field}(requestKey: \"{rk}\"{bh}{extra}, first: 50) \
+                     {{ totalCount edges {{ node {{ {sel} }} }} }} }}"
+                )
+            };
+            let alone = run(&fx.schema, &q(None)).await;
+            assert!(!edges(&alone, field).is_empty(), "{field}: {alone}");
+            let right = run(&fx.schema, &q(Some(&block_hash(0, 6)))).await;
+            assert_eq!(right, alone, "{field}: the key's own block");
+            let wrong = run(&fx.schema, &q(Some(&block_hash(0, 11)))).await;
+            assert!(edges(&wrong, field).is_empty(), "{field}: {wrong}");
+            assert_eq!(wrong[field]["totalCount"], 0, "{field}: {wrong}");
+            let r = fx.schema.execute(q(Some("not-a-hash"))).await;
+            assert_eq!(code(&r), bad_input(), "{field}: {:?}", r.errors);
+        }
+    }
+
+    /// The hashes `transactions(<src>, fungibleName: <m>)` lists (its `totalCount` agrees).
+    async fn hashes(s: &KdxSchema, src: String, m: &str) -> Vec<String> {
+        let v = run(
+            s,
+            &format!(
+                "{{ transactions({src}, fungibleName: \"{m}\", first: 50) \
+                 {{ totalCount edges {{ node {{ hash }} }} }} }}"
+            ),
+        )
+        .await;
+        let hs: Vec<String> = edges(&v, "transactions")
+            .iter()
+            .map(|e| e["node"]["hash"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(v["transactions"]["totalCount"], hs.len(), "{v}");
+        hs
+    }
+
+    /// F-30: `transactions(fungibleName)` beside `requestKey` or `blockHash` keeps only the
+    /// txs with an event of that module (stock: `EXISTS` an event with `module` = the name).
+    #[tokio::test]
+    async fn fungible_name_filters_transactions_of_a_key_or_a_block() {
+        let fx = fixture();
+        // Block (0, 4): a `One` tx (coin only), then a `Many` tx (coin and kaddex.kdx).
+        let [one, many] = [&fx.rks[&(0, 4)][0], &fx.rks[&(0, 4)][1]];
+        let rk = |k: &str| format!("requestKey: \"{k}\"");
+        assert_eq!(hashes(&fx.schema, rk(one), "coin").await, [one.as_str()]);
+        assert!(hashes(&fx.schema, rk(one), "kaddex.kdx").await.is_empty());
+        assert_eq!(
+            hashes(&fx.schema, rk(many), "kaddex.kdx").await,
+            [many.as_str()]
+        );
+        let bh = format!("blockHash: \"{}\"", block_hash(0, 4));
+        assert_eq!(
+            hashes(&fx.schema, bh.clone(), "kaddex.kdx").await,
+            [many.as_str()]
+        );
+        assert_eq!(hashes(&fx.schema, bh.clone(), "coin").await.len(), 2);
+        assert!(hashes(&fx.schema, bh, "nobody.token").await.is_empty());
+    }
+
+    /// F-30: the `isNFT` account path checks `fungibleName` as every other path does.
+    #[tokio::test]
+    async fn nft_transfers_check_the_fungible_name() {
+        let fx = fixture();
+        let r = fx
+            .schema
+            .execute(format!(
+                "{{ transfers(accountName: \"{ALICE}\", isNFT: true, fungibleName: \"  \") \
+                 {{ edges {{ node {{ requestKey }} }} }} }}"
+            ))
+            .await;
+        assert_eq!(code(&r), bad_input(), "{:?}", r.errors);
+    }
+
+    /// F-50: a block's `totalCount` (counted with the page) that the deadline cuts is a
+    /// flagged lower bound, as a deferred count is, not an exact 0.
+    #[tokio::test]
+    async fn a_bounded_count_cut_by_the_deadline_is_flagged() {
+        let fx = fixture();
+        let q = format!(
+            "{{ transfers(blockHash: \"{}\") {{ totalCount }} }}",
+            block_hash(0, 6)
+        );
+        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+            deadline: std::time::Instant::now(),
+        });
+        let r = fx.schema.execute(req).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            r.extensions.contains_key("totalCountLowerBound"),
+            "{:?}",
+            r.extensions
+        );
+        // With time, the same count is exact and unflagged.
+        let r = fx
+            .schema
+            .execute(format!(
+                "{{ transfers(blockHash: \"{}\") {{ totalCount }} }}",
+                block_hash(0, 6)
+            ))
+            .await;
+        assert!(!r.extensions.contains_key("totalCountLowerBound"));
+    }
+
+    /// F-51: the id of a `transfers(isNFT: true)` node resolves through `node(id)` to the
+    /// same transfer.
+    #[tokio::test]
+    async fn nft_transfer_ids_resolve_through_node() {
+        let fx = fixture();
+        let sel = "id requestKey orderIndex moduleName senderAccount receiverAccount amount";
+        let v = run(
+            &fx.schema,
+            &format!(
+                "{{ transfers(accountName: \"{ALICE}\", isNFT: true, first: 50) \
+                 {{ edges {{ node {{ {sel} }} }} }} }}"
+            ),
+        )
+        .await;
+        let list = edges(&v, "transfers");
+        assert!(!list.is_empty(), "{v}");
+        for e in list {
+            let n = run(
+                &fx.schema,
+                &format!(
+                    "{{ node(id: {}) {{ ... on Transfer {{ {sel} }} }} }}",
+                    e["node"]["id"]
+                ),
+            )
+            .await;
+            assert_eq!(n["node"], e["node"], "{n}");
+        }
+    }
+
+    /// F-28: `balance(chainIds: [])` lists every chain (as `fungibleChainAccounts` does), more
+    /// than 100 chain ids are refused, and the page follows the cursor rules of every other
+    /// connection (`after` with `first: 0` serves no row).
+    #[tokio::test]
+    async fn balance_reads_chain_ids_and_pages_as_other_connections() {
+        let fx = fixture();
+        let q = |args: &str| {
+            format!(
+                "{{ balance(accountName: \"{ALICE}\"{args}) \
+                 {{ edges {{ cursor node {{ chainId module }} }} pageInfo {{ hasNextPage }} }} }}"
+            )
+        };
+        let all = run(&fx.schema, &q("")).await;
+        assert_eq!(edges(&all, "balance").len(), 2, "{all}");
+        assert_eq!(run(&fx.schema, &q(", chainIds: []")).await, all);
+        let many = format!(", chainIds: [{}]", vec!["\"0\""; 101].join(", "));
+        let r = fx.schema.execute(q(&many)).await;
+        assert_eq!(code(&r), bad_input(), "{:?}", r.errors);
+        let first = edges(&all, "balance")[0]["cursor"].as_str().unwrap();
+        let v = run(&fx.schema, &q(&format!(", after: \"{first}\", first: 0"))).await;
+        assert!(edges(&v, "balance").is_empty(), "{v}");
+    }
 }

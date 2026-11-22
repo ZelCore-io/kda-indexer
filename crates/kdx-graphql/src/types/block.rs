@@ -216,6 +216,7 @@ impl Block {
             rows: Rows::Txs {
                 sender: None,
                 nft: false,
+                module: None,
             },
         };
         let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
