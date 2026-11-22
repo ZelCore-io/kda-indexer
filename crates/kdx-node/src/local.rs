@@ -70,7 +70,10 @@ pub enum Local<T> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Details {
     pub balance: String,
+    /// The guard, or null when its JSON is over [`MAX_GUARD_JSON`] bytes (F-14).
     pub guard: Value,
+    /// The node's guard was over [`MAX_GUARD_JSON`] bytes and is replaced by null.
+    pub guard_capped: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -143,6 +146,9 @@ pub fn is_no_member_message(msg: &str, module: &str, member: &str) -> bool {
 
 /// Longest guard JSON and token uri accepted from an NFT ledger answer (bytes, GQ-15).
 pub const MAX_NFT_TEXT: usize = 4096;
+/// Largest serialized guard or keyset stored from a `details` / `describe-keyset` answer
+/// (F-14, the limit NFT guards use); a larger one is stored as null.
+pub const MAX_GUARD_JSON: usize = MAX_NFT_TEXT;
 
 /// `{ledger}.get-token-info` of one token (GQ-15): `precision`, `supply` (decimal text) and `uri`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +186,8 @@ pub fn is_decimal(s: &str) -> bool {
 /// A string must be a decimal text ([`is_decimal`]); anything else is no decimal.
 pub fn decimal_text(v: &Value) -> Option<String> {
     match v {
-        Value::Number(n) => Some(n.to_string()),
+        // F-13: a bare number's text gets the same check as a string's.
+        Value::Number(n) => Some(n.to_string()).filter(|t| is_decimal(t)),
         Value::String(s) => is_decimal(s).then(|| s.clone()),
         Value::Object(o) => o
             .get("decimal")
@@ -351,9 +358,14 @@ fn details_of(r: Local<Value>) -> LocalResult<Details> {
                     .get("balance")
                     .and_then(decimal_text)
                     .ok_or_else(|| invalid("details: no decimal balance"))?;
-                let guard = value.get("guard").cloned().unwrap_or(Value::Null);
+                let (guard, guard_capped) =
+                    capped_guard(value.get("guard").cloned().unwrap_or(Value::Null));
                 Ok(Local::Found {
-                    value: Details { balance, guard },
+                    value: Details {
+                        balance,
+                        guard,
+                        guard_capped,
+                    },
                     height,
                     prev_hash,
                 })
@@ -392,15 +404,18 @@ impl LocalClient {
         }
     }
 
-    /// `(describe-keyset (read-msg "k"))` with `data {"k": name}`: the keyset JSON.
+    /// `(describe-keyset (read-msg "k"))` with `data {"k": name}`: the keyset JSON, or null
+    /// when it is over [`MAX_GUARD_JSON`] bytes (F-14).
     pub async fn describe_keyset(&self, chain: u8, name: &str) -> LocalResult<Value> {
         check_name("keyset", name)?;
-        self.call(
-            chain,
-            "(describe-keyset (read-msg \"k\"))",
-            json!({ "k": name }),
-        )
-        .await
+        let r = self
+            .call(
+                chain,
+                "(describe-keyset (read-msg \"k\"))",
+                json!({ "k": name }),
+            )
+            .await?;
+        keyset_of(r)
     }
 
     /// `({module}.get-balance (read-msg "t") (read-msg "a"))` with `data {"t": token, "a":
@@ -471,6 +486,31 @@ impl LocalClient {
         let r = self.call(chain, &code, json!({ "t": token_id })).await?;
         token_info_of(r, token_id)
     }
+}
+
+/// F-14: a guard whose JSON is over [`MAX_GUARD_JSON`] bytes becomes null; true when it did.
+fn capped_guard(g: Value) -> (Value, bool) {
+    if g.to_string().len() > MAX_GUARD_JSON {
+        (Value::Null, true)
+    } else {
+        (g, false)
+    }
+}
+
+/// A `describe-keyset` answer, null when over [`MAX_GUARD_JSON`] bytes (F-14).
+fn keyset_of(r: Local<Value>) -> LocalResult<Value> {
+    Ok(match r {
+        Local::Found {
+            value,
+            height,
+            prev_hash,
+        } => Local::Found {
+            value: capped_guard(value).0,
+            height,
+            prev_hash,
+        },
+        Local::Absent => Local::Absent,
+    })
 }
 
 fn echoes(v: &Value, field: &str, want: &str) -> bool {
@@ -706,6 +746,67 @@ mod tests {
             prev_hash: None,
         })
         .is_err());
+    }
+
+    /// F-13: a bare JSON number is checked like a decimal string (a hostile node could send
+    /// one of any length).
+    #[test]
+    fn a_long_bare_number_is_no_decimal() {
+        let long = "9".repeat(MAX_DECIMAL_LEN + 1);
+        let v: Value = serde_json::from_str(&long).unwrap();
+        assert_eq!(decimal_text(&v), None);
+        assert_eq!(decimal_text(&json!({ "decimal": v })), None);
+        assert_eq!(decimal_text(&json!(12)), Some("12".into()));
+    }
+
+    /// F-14: a guard over [`MAX_GUARD_JSON`] bytes is stored as null and flagged; the balance
+    /// still reads. One at the cap is kept.
+    #[test]
+    fn an_over_size_guard_reads_as_null() {
+        let at = |n: usize| {
+            // `{"keys":["…"],"pred":"keys-all"}` serializes to n bytes.
+            let pad = n - r#"{"keys":[""],"pred":"keys-all"}"#.len();
+            json!({"keys": ["a".repeat(pad)], "pred": "keys-all"})
+        };
+        assert_eq!(at(MAX_GUARD_JSON).to_string().len(), MAX_GUARD_JSON);
+        let read = |g: Value| match details_of(Local::Found {
+            value: json!({"balance": 1.5, "guard": g}),
+            height: 1,
+            prev_hash: None,
+        }) {
+            Ok(Local::Found { value, .. }) => value,
+            other => panic!("{other:?}"),
+        };
+        let d = read(at(MAX_GUARD_JSON + 1));
+        assert_eq!(
+            (d.balance.as_str(), &d.guard, d.guard_capped),
+            ("1.5", &Value::Null, true)
+        );
+        let d = read(at(MAX_GUARD_JSON));
+        assert!(!d.guard_capped && d.guard == at(MAX_GUARD_JSON));
+        // A `describe-keyset` answer over the cap reads as null too.
+        let ks = |g: Value| {
+            keyset_of(Local::Found {
+                value: g,
+                height: 1,
+                prev_hash: None,
+            })
+            .unwrap()
+        };
+        assert!(matches!(
+            ks(at(MAX_GUARD_JSON + 1)),
+            Local::Found {
+                value: Value::Null,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ks(at(MAX_GUARD_JSON)),
+            Local::Found {
+                value: Value::Object(_),
+                ..
+            }
+        ));
     }
 
     /// D2: a success carries the tip's height and hash (`prevBlockHash`); an answer without

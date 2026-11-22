@@ -16,8 +16,9 @@
 //!   [`NOT_FUNGIBLE_AFTER`] batches in a row is marked; the tail stops marking it, its keys
 //!   are dropped without a call (`result="not_fungible"`), `/tokens` hides it; after
 //!   [`Caps::recheck_secs`] it is active again.
-//! - Caps (I-7): a non-coin module stops getting new rows at [`Caps::module_rows`] (the tail
-//!   then marks no new key of it) and an account at [`Caps::account_rows`]
+//! - Caps (I-7): a non-coin module stops getting new rows at [`Caps::module_rows`], a confirmed
+//!   `fungible-v2` one at [`Caps::fungible_module_rows`] (F-14; the tail then marks no new key
+//!   of it), and an account at [`Caps::account_rows`]
 //!   (`result="capped"`).
 //! - A dirty key is deleted only when its mark, read again in the write txn, is still the exact
 //!   [`Mark`] (height and write sequence) read at refill, and its height is not above the
@@ -117,7 +118,15 @@ pub struct Caps {
     pub recheck_secs: u32,
     /// Txs per slice of the D3 history walk, one slice per loop round (re-review N2).
     pub history_slice_txs: u64,
+    /// Most `Balances` rows of one confirmed `fungible-v2` module other than `coin` (F-14:
+    /// anyone can deploy one). Past it, a key with no row is dropped and the module flagged
+    /// like an untrusted one at [`Caps::module_rows`].
+    pub fungible_module_rows: u32,
 }
+
+/// Default of [`Caps::fungible_module_rows`] (F-14): 10x the largest non-coin module on
+/// mainnet, `free.finux` with 126,246 rows (KDA-03 hot store scan, 2026-11-22).
+pub const DEFAULT_FUNGIBLE_MODULE_ROWS: u32 = 1_262_460;
 
 impl Default for Caps {
     fn default() -> Self {
@@ -127,6 +136,7 @@ impl Default for Caps {
             account_rows: 1_000,
             recheck_secs: 86_400,
             history_slice_txs: crate::seed_receivers::HISTORY_SLICE_TXS,
+            fungible_module_rows: DEFAULT_FUNGIBLE_MODULE_ROWS,
         }
     }
 }
@@ -425,27 +435,37 @@ fn account_has_key(
     Ok(false)
 }
 
-/// Whether a new row may be written (I-7). Always for a trusted row (`coin`, or a module
-/// confirmed `fungible-v2` on this chain) and for a key that has a row. An untrusted module
-/// stops at [`Caps::module_rows`] (and is flagged, so the tail stops marking new keys of it),
+/// Whether a new row may be written (I-7). Always for `coin` and for a key that has a row. A
+/// module confirmed `fungible-v2` on this chain stops at [`Caps::fungible_module_rows`]
+/// (F-14), an untrusted module at [`Caps::module_rows`] (and is flagged, so the tail stops marking new keys of it),
 /// and an account takes at most [`Caps::account_rows`] untrusted rows: absent rows, rows of
 /// not-fungible modules and trusted rows do not count, so dust from spam modules cannot fill
 /// an account's cap and keep a real token's row out (security review ruling).
 fn admit(txn: &mut RwTxn<'_>, it: &Item, coin: Option<u32>, caps: &Caps) -> Result<bool> {
-    if it.trusted || Some(it.module) == coin || txn.get(Table::Balances, &it.d.key)?.is_some() {
+    if Some(it.module) == coin || txn.get(Table::Balances, &it.d.key)?.is_some() {
         return Ok(true);
     }
     let t = balances::token_row(txn, it.module)?.unwrap_or_default();
-    if t.rows >= caps.module_rows {
+    // F-14: a confirmed fungible-v2 module has its own (higher) row cap.
+    let module_cap = if it.trusted {
+        caps.fungible_module_rows
+    } else {
+        caps.module_rows
+    };
+    if t.rows >= module_cap {
         if !t.capped() {
             balances::update_token(txn, it.module, |t| t.flags |= balances::TOKEN_CAPPED)?;
             tracing::warn!(
                 module = it.module_name.as_deref().unwrap_or(""),
                 rows = t.rows,
+                trusted = it.trusted,
                 "balances: module reached its row cap; new keys are dropped"
             );
         }
         return Ok(false);
+    }
+    if it.trusted {
+        return Ok(true);
     }
     let p = it.account.to_be_bytes();
     let cap = caps.account_rows as usize;
@@ -829,6 +849,22 @@ pub async fn reconcile_batch(
                 if keep_old {
                     set_unverified(&mut txn, &it.d.key)?;
                 } else {
+                    if d.guard_capped {
+                        // F-14: stored as null (no key rows); counted for `--status`.
+                        let n = txn
+                            .meta(balances::meta::GUARDS_CAPPED)?
+                            .and_then(|v| v.try_into().ok().map(u64::from_be_bytes))
+                            .unwrap_or(0);
+                        txn.set_meta(
+                            balances::meta::GUARDS_CAPPED,
+                            &n.saturating_add(1).to_be_bytes(),
+                        )?;
+                        tracing::debug!(
+                            module = it.module_name.as_deref().unwrap_or(""),
+                            chain = it.chain,
+                            "details: guard over the size cap, stored as null"
+                        );
+                    }
                     let gj = serde_json::to_vec(&d.guard)?;
                     let gh = guard_hash(&gj);
                     txn.insert(Table::Guards, &gh, &gj)?;
@@ -1590,6 +1626,17 @@ pub(crate) mod tests {
                 } else if cmd.pointer("/payload/exec/data/t").is_some() {
                     // An NFT `get-balance`.
                     json!({"result": {"status": "success", "data": 2.0}, "metaData": meta.clone()})
+                } else if acct == "huge" {
+                    // F-14: a guard over the 4096-byte cap.
+                    json!({"result": {"status": "success", "data": {"account": acct,
+                           "balance": 1.5, "guard": {"keys": ["k".repeat(5000)],
+                           "pred": "keys-all"}}}, "metaData": meta.clone()})
+                } else if acct == "wide" {
+                    // F-14: a keyset of 65 keys.
+                    let keys: Vec<String> = (0..65).map(|i| format!("w{i}")).collect();
+                    json!({"result": {"status": "success", "data": {"account": acct,
+                           "balance": 1.5, "guard": {"keys": keys, "pred": "keys-all"}}},
+                           "metaData": meta.clone()})
                 } else if acct == "bad" {
                     json!({"result": {"status": "success", "data": {"guard": null}},
                            "metaData": meta.clone()})
@@ -2203,6 +2250,61 @@ pub(crate) mod tests {
             .unwrap()
             .fungible_on(0));
         assert!(balances::trusted(&txn, coin, 7, Some(coin)).unwrap());
+    }
+
+    /// F-14: an over-size guard is stored as null (the balance row is still written and a
+    /// counter records it) and gives no `KeyAccounts` rows; a 65-key keyset indexes nothing; a
+    /// confirmed fungible-v2 module stops at its own row cap and is flagged.
+    #[tokio::test]
+    async fn oversize_guards_and_the_fungible_row_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["alice"]);
+        let tok = intern(&hot, DictKind::Module, &["free.tok"])[0];
+        let accts = intern(&hot, DictKind::Account, &["huge", "wide", "carol"]);
+        mark(&hot, accts[0], tok, 0, 10);
+        mark(&hot, accts[1], tok, 0, 10);
+        let (ctx, local) = client(dir.path(), &hot);
+        let keys = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.dropped), (3, 0));
+        let txn = hot.ro().unwrap();
+        let huge = row_of(&hot, &balances::bal_key(accts[0], tok, 0));
+        assert_eq!((huge.absent, huge.balance.as_str()), (false, "1.5"));
+        assert_eq!(huge.guard, guard_hash(b"null"));
+        assert!(row_of(&hot, &balances::bal_key(accts[1], tok, 0)).positive());
+        // Only alice's coin row ("k1") is in the key index.
+        assert_eq!(txn.count(Table::KeyAccounts).unwrap(), 1);
+        assert_eq!(
+            txn.meta(balances::meta::GUARDS_CAPPED)
+                .unwrap()
+                .map(|v| u64::from_be_bytes(v[..].try_into().unwrap())),
+            Some(1)
+        );
+        drop(txn);
+        // Row cap 2 for confirmed fungible-v2 modules: free.tok has 2 rows, a third is dropped.
+        let caps = Caps {
+            fungible_module_rows: 2,
+            ..Caps::default()
+        };
+        mark(&hot, accts[2], tok, 0, 10);
+        let keys = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &caps).await.unwrap();
+        assert_eq!((st.ok, st.dropped), (0, 1));
+        let txn = hot.ro().unwrap();
+        let t = balances::token_row(&txn, tok).unwrap().unwrap();
+        assert!(t.capped() && t.rows == 2);
+        assert!(txn
+            .get(Table::Balances, &balances::bal_key(accts[2], tok, 0))
+            .unwrap()
+            .is_none());
+        // A key that already has a row is still reconciled at the cap.
+        drop(txn);
+        mark(&hot, accts[0], tok, 0, 20);
+        let keys = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &caps).await.unwrap();
+        assert_eq!((st.ok, st.dropped), (1, 0));
     }
 
     /// R-P5P9-8 #2: a module whose calls fail in NOT_FUNGIBLE_AFTER batches in a row is marked

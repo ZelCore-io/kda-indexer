@@ -232,10 +232,20 @@ pub fn event_accounts<'a>(e: &'a Value, out: &mut Vec<&'a str>) {
     if let (Some(ev), Some(p)) = (parse_event(e), params.as_array()) {
         if let Some((from, to)) = acct_transfer_accounts(&ev) {
             out.extend([from, to]);
-        } else if p.len() == 4 && matches!(p[3], Value::Number(_) | Value::Object(_)) {
+        } else if p.len() == 4 {
+            // Each arm checks its own shape: the poly-fungible amount is `p[3]`; the
+            // cross-chain amount is `p[2]` and its `p[3]` is the target chain id string.
             let sides = match ev.name {
-                "TRANSFER" if p[0].is_string() => Some((&p[1], &p[2])),
-                "TRANSFER_XCHAIN" | "TRANSFER_XCHAIN_RECD" => Some((&p[0], &p[1])),
+                "TRANSFER"
+                    if p[0].is_string() && matches!(p[3], Value::Number(_) | Value::Object(_)) =>
+                {
+                    Some((&p[1], &p[2]))
+                }
+                "TRANSFER_XCHAIN" | "TRANSFER_XCHAIN_RECD"
+                    if transfer_amount_ok(&p[2]) && p[3].is_string() =>
+                {
+                    Some((&p[0], &p[1]))
+                }
                 _ => None,
             };
             if let Some((Some(a), Some(b))) = sides.map(|(a, b)| (a.as_str(), b.as_str())) {
@@ -645,5 +655,37 @@ mod transfer_rule_tests {
         let mut acc = Vec::new();
         event_accounts(&t, &mut acc);
         assert_eq!(acc[..2], ["alice", "bob"]);
+    }
+
+    /// F-01: a cross-chain event's chain id is a string in `p[3]`; those arms must still run,
+    /// and only when `p[2]` is an amount.
+    #[test]
+    fn xchain_sides_need_an_amount_and_a_string_chain() {
+        let sides = |name: &str, p: serde_json::Value| {
+            let e = json!({"params": p, "name": name,
+                "module": {"namespace": null, "name": "coin"}, "moduleHash": "h"});
+            let mut acc = Vec::new();
+            event_accounts(&e, &mut acc);
+            acc.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            sides("TRANSFER_XCHAIN", json!(["alice", "bob", 1.5, "2"])),
+            ["alice", "bob"]
+        );
+        assert_eq!(
+            sides(
+                "TRANSFER_XCHAIN_RECD",
+                json!(["", "bob", {"decimal": "1.5"}, "1"])
+            ),
+            ["", "bob"]
+        );
+        assert!(sides("TRANSFER_XCHAIN", json!(["alice", "bob", "x", "2"])).is_empty());
+        assert!(sides("TRANSFER_XCHAIN", json!(["alice", "bob", 1.5, 2])).is_empty());
+        // The poly-fungible arm keeps its number-or-object `p[3]`.
+        assert_eq!(
+            sides("TRANSFER", json!(["t:id", "bob", "carol", 1.0])),
+            ["bob", "carol"]
+        );
+        assert!(sides("TRANSFER", json!(["t:id", "bob", "carol", "1"])).is_empty());
     }
 }
