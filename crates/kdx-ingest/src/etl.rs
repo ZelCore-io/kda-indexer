@@ -147,12 +147,22 @@ struct RunReader {
 
 impl RunReader {
     fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        // F-57: only 0 bytes before a record header is the end of the run. A header cut short,
+        // or a read error (a cut zstd stream included), is an error.
         let mut lens = [0u8; 8];
-        match self.z.read_exact(&mut lens) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let first = loop {
+            match self.z.read(&mut lens) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(anyhow::Error::from(e).context("etl run: read")),
+            }
+        };
+        if first == 0 {
+            return Ok(None);
         }
+        self.z
+            .read_exact(&mut lens[first..])
+            .context("etl run: truncated record header")?;
         let kl = u32::from_le_bytes(lens[..4].try_into().unwrap()) as usize;
         let vl = u32::from_le_bytes(lens[4..].try_into().unwrap()) as usize;
         let mut k = vec![0u8; kl];
@@ -249,4 +259,40 @@ pub fn clear_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("remove {}", p.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reader(path: &Path, plain: &[u8]) -> RunReader {
+        let mut w = zstd::Encoder::new(File::create(path).unwrap(), 1).unwrap();
+        w.write_all(plain).unwrap();
+        w.finish().unwrap();
+        RunReader {
+            z: zstd::Decoder::with_buffer(BufReader::new(File::open(path).unwrap())).unwrap(),
+        }
+    }
+
+    /// F-57: only a clean end between records is the end of a run; a record header cut after
+    /// 3 of its 8 bytes is an error.
+    #[test]
+    fn truncated_record_header_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&1u32.to_le_bytes());
+        plain.extend_from_slice(&2u32.to_le_bytes());
+        plain.extend_from_slice(b"kvv");
+        let mut r = reader(&d.path().join("ok"), &plain);
+        assert_eq!(r.next().unwrap(), Some((b"k".to_vec(), b"vv".to_vec())));
+        assert_eq!(r.next().unwrap(), None);
+        plain.extend_from_slice(&[1, 0, 0]);
+        let mut r = reader(&d.path().join("cut"), &plain);
+        assert!(r.next().unwrap().is_some());
+        let e = r.next().unwrap_err();
+        assert!(
+            format!("{e:#}").contains("truncated record header"),
+            "{e:#}"
+        );
+    }
 }

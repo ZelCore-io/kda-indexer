@@ -136,11 +136,15 @@ impl Ctx {
 
     /// Replace the in-memory dictionary with the persisted one. Called after a write txn that
     /// may have run `HotDict::persist` failed: the names it drained from `pending` never
-    /// reached MDBX, so ids must not be handed out from memory (review M3).
-    pub fn reload_dict(&self, dict: &mut HotDict) {
-        match self.hot.ro().and_then(|t| HotDict::load(&t)) {
-            Ok(d) => *dict = d,
-            Err(e) => tracing::error!(error = %e, "reloading the dictionary failed"),
-        }
+    /// reached MDBX, so ids must not be handed out from memory (review M3). A failed reload is
+    /// an error the caller returns (F-52): going on with the drained in-memory dictionary
+    /// would hand out ids that are not in `DictRev`.
+    pub fn reload_dict(&self, dict: &mut HotDict) -> Result<()> {
+        *dict = self
+            .hot
+            .ro()
+            .and_then(|t| HotDict::load(&t))
+            .context("reloading the dictionary after a failed write txn")?;
+        Ok(())
     }
 }

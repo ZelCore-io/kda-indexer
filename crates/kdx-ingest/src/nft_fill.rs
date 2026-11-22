@@ -51,6 +51,9 @@ pub struct FillReport {
     /// Rows written or marked.
     pub effects: u64,
     pub filled_height: Option<u32>,
+    /// Events whose module or event name was not in the dictionary snapshot, so they could not
+    /// be classified (F-56). Expected 0; otherwise rerun the fill.
+    pub unresolved_events: u64,
     pub stopped: bool,
     pub secs: f64,
 }
@@ -117,6 +120,14 @@ fn apply_batch(
 ) -> Result<()> {
     let mut txn = hot.rw()?;
     for (k, r) in recs {
+        rep.unresolved_events += r
+            .events
+            .iter()
+            .filter(|e| {
+                dict.name(DictKind::Module, e.module).is_none()
+                    || dict.name(DictKind::EventName, e.name).is_none()
+            })
+            .count() as u64;
         let evs = nft::classify(dict, &r.events);
         if !evs.is_empty() {
             rep.effects += u64::from(nft::apply_events(
@@ -179,7 +190,9 @@ pub fn run(
         }
     }
 
-    // Segment pass, oldest first (TxNum order).
+    // Segment pass, oldest first (TxNum order). Fresh snapshot (F-56): names the tail
+    // interned during the hot pass resolve too.
+    let dict: Arc<MemDict> = Arc::new(HotDict::load(&hot.ro()?)?.mem().clone());
     let segs = Segments::open_without_filters(segdir, dict.clone())?;
     let mut nums: Vec<u64> = names
         .iter()
@@ -215,6 +228,12 @@ pub fn run(
     txn.commit()?;
     rep.filled_height = Some(top);
     rep.secs = t0.elapsed().as_secs_f64();
+    if rep.unresolved_events > 0 {
+        tracing::warn!(
+            unresolved_events = rep.unresolved_events,
+            "nft fill: events with names missing from the dictionary were skipped; rerun the fill"
+        );
+    }
     Ok(rep)
 }
 
@@ -407,6 +426,24 @@ mod tests {
     use kdx_hot::{Geometry, HotStore};
 
     use super::*;
+
+    /// F-56: an event whose module or event name is not in the dictionary snapshot is
+    /// counted, so a fill that missed names shows it.
+    #[test]
+    fn unresolved_event_names_are_counted() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut r = kdx_types::record::TxRecord::default();
+        r.events.push(kdx_types::record::EventRec {
+            module: 7,
+            name: 9,
+            ..Default::default()
+        });
+        let mut rep = FillReport::default();
+        apply_batch(&hot, &MemDict::default(), vec![(r.key, r)], &mut rep).unwrap();
+        assert_eq!(rep.unresolved_events, 1);
+        assert_eq!(rep.effects, 0);
+    }
 
     /// M-9: a ledger added to the configured set after the fill is pending (its history gets
     /// walked); a store filled before the set was stored counts the default ledgers as done.

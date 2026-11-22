@@ -355,7 +355,7 @@ async fn build(
         let r = write(&c, &entry, fetched.coll, link, dry_run);
         if r.is_err() || dry_run {
             let mut d = c.dict.lock().unwrap_or_else(|e| e.into_inner());
-            c.reload_dict(&mut d);
+            c.reload_dict(&mut d)?;
         }
         r
     })
