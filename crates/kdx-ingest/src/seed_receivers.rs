@@ -122,6 +122,10 @@ pub struct ReceiversReport {
     /// marked done (Meta `balances_seed_token_receivers_cap_hit` names them); rerun it with a
     /// raised cap.
     pub cap_hit: Vec<String>,
+    /// D3: the bound on tracked-token candidates of this pass: tracked tokens × the
+    /// per-token budget (review round 5: tracked candidates have no global ceiling; their
+    /// total is bounded by this product, and a token at its budget keeps the pass pending).
+    pub tracked_bound: u64,
     /// D3: capped candidates of untracked emitters dropped at the shared bucket's limit.
     pub dropped_untracked: u64,
     /// D3: capped candidates dropped at the global ceiling.
@@ -478,14 +482,16 @@ fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str) -> bool 
         }
         *n += 1;
     } else {
-        // The global ceiling bounds untracked candidates only (review round 4): a tracked
-        // token is bounded by its own budget and never dropped.
-        if p.untracked >= w.max_total_candidates {
-            rep.dropped_ceiling += 1;
-            return false;
-        }
-        if p.untracked >= w.max_untracked_candidates {
-            rep.dropped_untracked += 1;
+        // One check: the shared bucket and the global ceiling (review round 4: the ceiling
+        // bounds untracked candidates only) count the same thing; the lower one binds and
+        // names the drop. A tracked token is bounded by its own budget and never dropped.
+        let limit = w.max_untracked_candidates.min(w.max_total_candidates);
+        if p.untracked >= limit {
+            if w.max_total_candidates < w.max_untracked_candidates {
+                rep.dropped_ceiling += 1;
+            } else {
+                rep.dropped_untracked += 1;
+            }
             return false;
         }
         p.untracked += 1;
@@ -706,6 +712,7 @@ pub fn run(
         max_untracked_candidates: o.max_untracked_candidates,
         max_total_candidates: o.max_total_candidates,
     };
+    rep.tracked_bound = (w.tokens.len() as u64).saturating_mul(o.max_event_candidates);
     let miners = |key: TxKey| o.rules == Rules::D3 && key.height() < o.forks.coinbase_fix;
     let ck = (coin, cursor_key);
 
@@ -883,7 +890,8 @@ pub fn run(
     }
     if o.rules == Rules::D3 {
         let dropped = serde_json::json!({
-            "untracked": rep.dropped_untracked, "ceiling": rep.dropped_ceiling});
+            "untracked": rep.dropped_untracked, "ceiling": rep.dropped_ceiling,
+            "tracked_bound": rep.tracked_bound});
         txn.set_meta(
             meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED,
             dropped.to_string().as_bytes(),

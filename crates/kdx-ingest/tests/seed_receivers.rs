@@ -778,12 +778,18 @@ fn a_resumed_token_pass_keeps_its_cumulative_drop_counts() {
         ),
         "resumed {last:?} whole {whole:?}"
     );
+    // The stored drop counts match (`tracked_bound` may differ: a resumed run starts with the
+    // tokens earlier chunks noted).
     let d = |c: &kdx_ingest::Ctx| {
-        c.hot
+        let v = c
+            .hot
             .ro()
             .unwrap()
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED)
             .unwrap()
+            .expect("drops recorded");
+        let v: Value = serde_json::from_slice(&v).unwrap();
+        (v["untracked"].as_u64(), v["ceiling"].as_u64())
     };
     assert_eq!(d(&c), d(&full));
 }
