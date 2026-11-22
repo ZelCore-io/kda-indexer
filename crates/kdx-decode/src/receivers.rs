@@ -196,3 +196,239 @@ fn code_literals(code: &str) -> Vec<String> {
 fn is_delim(c: u8) -> bool {
     c.is_ascii_whitespace() || matches!(c, b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"' | b',')
 }
+
+// ---------------------------------------------------------------------------------------------
+// D3: receivers of every fungible module (coin included) that no TRANSFER event names.
+// ---------------------------------------------------------------------------------------------
+
+/// The coinbase code chainweb built from the miner account before the injection fix, by
+/// string interpolation (`(coin.coinbase "<account>" (read-keyset "miner-keyset") <reward>)`).
+const COINBASE_HEAD: &str = "(coin.coinbase \"";
+const COINBASE_TAIL: &str = "\" (read-keyset \"miner-keyset\") 0.0)";
+
+/// D3 (a): the accounts an early coinbase really credited when the block's miner account
+/// carries a `"`. Early mainnet built the coinbase code by interpolating the miner account, so
+/// an account such as `<key>" (read-keyset "miner-keyset") 23045.23)(coin.coinbase "<key>`
+/// ran as code and credited `<key>`, a name no posting ever states on its own. Returns the
+/// [`account_like`] string literals of the interpolated code; empty for a plain account (its
+/// own `acct` posting already marks it).
+pub fn injected_miner_receivers(miner: &str) -> Vec<String> {
+    if !miner.contains('"') {
+        return Vec::new();
+    }
+    let code = format!("{COINBASE_HEAD}{miner}{COINBASE_TAIL}");
+    let mut out: Vec<String> = Vec::new();
+    for s in code_literals(&code) {
+        if account_like(&s) && s != "miner-keyset" && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// D3 candidates of one tx: `(account, module)` pairs to re-read, and the modules the tx shows
+/// to be fungible (`discovered`, for token discovery).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TokenReceivers {
+    pub pairs: Vec<(String, String)>,
+    pub discovered: Vec<String>,
+}
+
+impl TokenReceivers {
+    fn push(&mut self, account: &str, module: &str) {
+        if account_like(account) && !self.pairs.iter().any(|(a, m)| a == account && m == module) {
+            self.pairs.push((account.to_owned(), module.to_owned()));
+        }
+    }
+    fn discover(&mut self, module: &str) {
+        if module != "coin" && !self.discovered.iter().any(|m| m == module) {
+            self.discovered.push(module.to_owned());
+        }
+    }
+}
+
+const XCHAIN_SUFFIX: &str = ".transfer-crosschain";
+
+/// D3 candidates of a tx with parsed `cmd` (None when it is not JSON) and rendered `output`
+/// (the CommandResult) at `height`. `is_token` says whether a module is a tracked fungible
+/// token (coin is always one). Rules:
+///
+/// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain`, any height): step 1
+///    credits `args[1]` and step 0 debits `args[0]`. Tokens emit no TRANSFER for either
+///    (only `pact.X_YIELD` / `X_RESUME`); coin did not before coin v3. `<m>` is discovered.
+/// 2. **`exec` below the events fork**: the D1 strings (`exec.data` values, `exec.code`
+///    literals) plus every string of `result.data` (a receiver built at run time and
+///    returned, D3 b), for coin and for every token `<m>` the code calls (`<m>.fn`).
+/// 3. **Events** (any height): an event of a token (not coin) that is not a well-formed
+///    TRANSFER (`WRAP`, `UNWRAP`, `MINT`, …) gives its [`account_like`] params for that token;
+///    an event whose params hold a `fungible-v2` module reference gives them for the
+///    referenced module, which is discovered (D3 d: `kaddex.skdx` is only ever minted that
+///    way). Strings inside a module reference are not accounts.
+///
+/// Over-inclusion costs one `/local` read per extra row (answered absent, stored, never
+/// served); a missing candidate leaves a funded row missing.
+pub fn token_receivers(
+    cmd: Option<&Value>,
+    output: &Value,
+    height: u32,
+    forks: Forks,
+    is_token: &dyn Fn(&str) -> bool,
+) -> TokenReceivers {
+    let mut r = TokenReceivers::default();
+    let is_cont = cmd.is_some_and(|c| c.pointer("/payload/cont").is_some());
+    if let Some(c) = output.get("continuation").filter(|c| !c.is_null()) {
+        let def = c.pointer("/continuation/def").and_then(Value::as_str);
+        if let Some(m) = def.and_then(|d| d.strip_suffix(XCHAIN_SUFFIX)) {
+            let side = match c.get("step").and_then(Value::as_u64) {
+                Some(1) if is_cont => Some(1),
+                Some(0) if !is_cont => Some(0),
+                _ => None,
+            };
+            if let Some(a) = side.and_then(|i| c.pointer(&format!("/continuation/args/{i}"))) {
+                if let Some(a) = a.as_str() {
+                    r.push(a, m);
+                }
+                r.discover(m);
+            }
+        }
+    }
+    if let (Some(c), false, true) = (cmd, is_cont, height < forks.events) {
+        let code = c
+            .pointer("/payload/exec/code")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let mut modules = vec!["coin".to_owned()];
+        for m in called_modules(code) {
+            if is_token(&m) && !modules.contains(&m) {
+                modules.push(m);
+            }
+        }
+        let mut strings = Vec::new();
+        if let Some(d) = c.pointer("/payload/exec/data") {
+            data_strings(d, &mut |s| strings.push(s.to_owned()));
+        }
+        strings.extend(code_literals(code));
+        if let Some(d) = output.pointer("/result/data") {
+            data_strings(d, &mut |s| strings.push(s.to_owned()));
+        }
+        for m in &modules {
+            for s in &strings {
+                r.push(s, m);
+            }
+        }
+    }
+    for e in output
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(ev) = crate::build::parse_event(e) else {
+            continue;
+        };
+        let mut targets: Vec<String> = Vec::new();
+        modrefs(ev.params, &mut |m| {
+            if !targets.iter().any(|t| t == m) {
+                targets.push(m.to_owned());
+            }
+        });
+        targets.iter().for_each(|m| r.discover(m));
+        if ev.module != "coin"
+            && is_token(&ev.module)
+            && crate::build::transfer_accounts(&ev).is_none()
+            && !targets.contains(&ev.module)
+        {
+            targets.push(ev.module.clone());
+        }
+        if targets.is_empty() {
+            continue;
+        }
+        let mut strings = Vec::new();
+        param_strings(ev.params, &mut strings);
+        for m in &targets {
+            for s in &strings {
+                r.push(s, m);
+            }
+        }
+    }
+    r
+}
+
+/// The modules `code` calls as `<module>.<fn>` (`ns.mod.fn` → `ns.mod`, `mod.fn` → `mod`).
+fn called_modules(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in code.split(|c: char| is_delim(c as u8) || c == '\'' || !c.is_ascii()) {
+        if let Some((m, f)) = w.rsplit_once('.') {
+            if !m.is_empty() && !f.is_empty() && !out.iter().any(|x: &String| x == m) {
+                out.push(m.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// A `fungible-v2` module reference (`{"refSpec": [.. {"name": "fungible-v2"} ..],
+/// "refName": {"namespace", "name"}}`) gives its qualified module name.
+fn fungible_modref(v: &serde_json::Map<String, Value>) -> Option<String> {
+    let spec = v.get("refSpec")?.as_array()?;
+    let fungible = spec.iter().any(|s| {
+        s.get("name").and_then(Value::as_str) == Some("fungible-v2")
+            && s.get("namespace").is_none_or(Value::is_null)
+    });
+    let n = v.get("refName")?;
+    let name = n.get("name")?.as_str()?;
+    if !fungible || name.is_empty() {
+        return None;
+    }
+    Some(match n.get("namespace").and_then(Value::as_str) {
+        Some(ns) if !ns.is_empty() => format!("{ns}.{name}"),
+        _ => name.to_owned(),
+    })
+}
+
+fn modrefs(v: &Value, f: &mut impl FnMut(&str)) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| modrefs(x, f)),
+        Value::Object(m) if m.contains_key("refSpec") => {
+            if let Some(n) = fungible_modref(m) {
+                f(&n);
+            }
+        }
+        Value::Object(m) => m.values().for_each(|x| modrefs(x, f)),
+        _ => {}
+    }
+}
+
+/// String params at any depth, module references skipped.
+fn param_strings(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| param_strings(x, out)),
+        Value::Object(m) if m.contains_key("refSpec") => {}
+        Value::Object(m) => m.values().for_each(|x| param_strings(x, out)),
+        _ => {}
+    }
+}
+
+/// [`token_receivers`] of a stored record (none for the coinbase; an error for a cmd that is
+/// not JSON or an output that does not render).
+pub fn record_token_receivers(
+    r: &TxRecord,
+    dict: &dyn Dict,
+    forks: Forks,
+    is_token: &dyn Fn(&str) -> bool,
+) -> Result<TokenReceivers, RenderError> {
+    let Some(cmd) = r.cmd.as_deref().filter(|_| r.key.pos() != 0) else {
+        return Ok(TokenReceivers::default());
+    };
+    let cmd = serde_json::from_slice::<Value>(cmd)
+        .map_err(|e| RenderError::Shape(format!("cmd is not JSON: {e}")))?;
+    let out = render_output(r, dict)?;
+    Ok(token_receivers(
+        Some(&cmd),
+        &out,
+        r.key.height(),
+        forks,
+        is_token,
+    ))
+}

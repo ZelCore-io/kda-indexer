@@ -26,15 +26,30 @@
 //!   its frontier, and the pass's `BalanceSeed` keys would then point at reused ids.
 //! - `dry_run` ([`Opts`]): reads only, and reports `candidates`, `new_accounts`,
 //!   `skipped_existing` and the would-be-marked `dirty_inserted`.
+//!
+//! D3 ([`Rules::D3`], its own flag `balances_seed_token_receivers`, cursor and error count):
+//! the same walk over **all** stored heights (no coin v3 cap), with the rules of
+//! `kdx_decode::receivers::token_receivers`: cross-chain defpacts of any module (token
+//! finishes and starts emit no TRANSFER), pre-event execs for coin and the tokens their code
+//! calls (incl. receivers only in `result.data`), non-TRANSFER events of tracked tokens and
+//! `fungible-v2` module references (which also discover the referenced token, e.g.
+//! `kaddex.skdx`). Before the walk, every dictionary account holding a `"` (an injected early
+//! miner account) gives the accounts its coinbase really credited, on every chain with a
+//! tail. Rows of a module whose name fails the `/local` module check (B-1; e.g. a non-ASCII
+//! name Pact 5 cannot parse) are never marked or noted. As the tail grows the pass is
+//! pending again and walks only the new heights (hourly in the service).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use kdx_decode::receivers::{network_forks, record_receivers, Forks, MAINNET01};
-use kdx_hot::balances::{self, bal_key, meta};
+use kdx_decode::receivers::{
+    injected_miner_receivers, network_forks, record_receivers, record_token_receivers, Forks,
+    MAINNET01,
+};
+use kdx_hot::balances::{self, bal_key, meta, TokenRow, KIND_NOT_FUNGIBLE};
 use kdx_hot::{checkpoint, HotDict, HotStore, Stage, Table, Txn};
 use kdx_segment::{Manifest, Segments};
 use kdx_types::record::decode_tx;
@@ -46,8 +61,43 @@ pub const TX_CHUNK: usize = 50_000;
 /// Hot `TailTxs` rows per read txn.
 const HOT_CHUNK: usize = 10_000;
 
+/// Which receivers the pass marks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Rules {
+    /// Event-less coin receivers below coin v3 (D1).
+    #[default]
+    D1,
+    /// Receivers no TRANSFER names, of coin and every token, at every height (D3).
+    D3,
+}
+
+impl Rules {
+    /// Meta keys: done-through height, resume cursor, error count.
+    fn keys(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Rules::D1 => (
+                meta::BALANCES_SEED_RECEIVERS,
+                meta::BALANCES_SEED_RECEIVERS_CURSOR,
+                meta::BALANCES_SEED_RECEIVERS_ERRORS,
+            ),
+            Rules::D3 => (
+                meta::BALANCES_SEED_TOKEN_RECEIVERS,
+                meta::BALANCES_SEED_TOKEN_RECEIVERS_CURSOR,
+                meta::BALANCES_SEED_TOKEN_RECEIVERS_ERRORS,
+            ),
+        }
+    }
+    fn cap(self, forks: Forks) -> u32 {
+        match self {
+            Rules::D1 => forks.coin_v3,
+            Rules::D3 => u32::MAX,
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct ReceiversReport {
+    pub rules: Rules,
     pub from: u32,
     pub to: u32,
     pub hot_txs: u64,
@@ -61,6 +111,12 @@ pub struct ReceiversReport {
     /// Candidates not marked because their key already has a `Balances` row (per write txn,
     /// like `candidates`).
     pub skipped_existing: u64,
+    /// D3: candidates of a not-fungible module, or new keys of a module at its row cap.
+    pub skipped_module: u64,
+    /// D3: modules the pass starts tracking (`Tokens`), e.g. found by a `fungible-v2` modref.
+    pub tokens_noted: u64,
+    /// D3: injected miner accounts (holding a `"`) in the dictionary.
+    pub injected_miners: u64,
     /// Records whose cmd or continuation could not be read (logged with block, chain and
     /// request key), over the pass and its resumes. Must be 0; also in Meta for `--status`.
     pub errors: u64,
@@ -75,6 +131,10 @@ pub struct ReceiversReport {
 /// The height below which every chain's blocks are stored (frozen, or hot up to the chain's
 /// tail checkpoint), capped at [`COIN_V3_HEIGHT`]. Chains without a checkpoint are ignored.
 pub fn target(txn: &impl Txn, forks: Forks) -> Result<u32> {
+    target_capped(txn, forks.coin_v3)
+}
+
+fn target_capped(txn: &impl Txn, cap: u32) -> Result<u32> {
     let f = txn.frozen_frontier()?;
     let mut low: Option<u32> = None;
     for c in 0..kdx_segment::SLOT_WIDTH as u8 {
@@ -83,17 +143,25 @@ pub fn target(txn: &impl Txn, forks: Forks) -> Result<u32> {
             low = Some(low.map_or(top, |l| l.min(top)));
         }
     }
-    Ok(low.unwrap_or(f).min(forks.coin_v3))
+    Ok(low.unwrap_or(f).min(cap))
 }
 
 /// `Some((from, to))` when the pass has work: it never finished on this store, or the stored
 /// history below the cutoff grew since it did.
 pub fn pending(txn: &impl Txn, forks: Forks) -> Result<Option<(u32, u32)>> {
-    let done = txn
-        .meta(meta::BALANCES_SEED_RECEIVERS)?
-        .as_deref()
-        .and_then(be_u32);
-    let to = target(txn, forks)?;
+    pending_for(
+        txn,
+        &Opts {
+            forks,
+            ..Opts::default()
+        },
+    )
+}
+
+/// [`pending`] for the pass `o` describes (its rules' flag and height cap).
+pub fn pending_for(txn: &impl Txn, o: &Opts) -> Result<Option<(u32, u32)>> {
+    let done = txn.meta(o.rules.keys().0)?.as_deref().and_then(be_u32);
+    let to = target_capped(txn, o.rules.cap(o.forks))?;
     let from = done.unwrap_or(0);
     Ok((done.is_none() || to > from).then_some((from, to.max(from))))
 }
@@ -144,10 +212,27 @@ pub fn check_ready(txn: &impl Txn, segdir: &Path) -> Result<()> {
 /// Pending marks of one write txn, plus a dry run's pass-wide sets.
 #[derive(Default)]
 struct Pending {
-    rows: BTreeSet<(String, u8)>,
-    /// Dry run: pairs that would be marked and names that would be new, over the pass.
-    dry_marked: HashSet<(String, u8)>,
+    /// `(account, module, chain)`.
+    rows: BTreeSet<(String, String, u8)>,
+    /// D3: modules to note as tokens, with the lowest height seen.
+    tokens: HashMap<String, u32>,
+    /// Dry run: rows that would be marked, names and tokens that would be new, over the pass.
+    dry_marked: HashSet<(String, String, u8)>,
     dry_new: HashSet<String>,
+    dry_tokens: HashSet<String>,
+}
+
+/// Why a module's candidate is not marked (D3): a not-fungible verdict, or the row cap (I-7)
+/// for a key without a row. `None`: mark it.
+fn module_skip(txn: &impl Txn, module: u32, coin: u32, key: &[u8; 9]) -> Result<bool> {
+    if module == coin {
+        return Ok(false);
+    }
+    Ok(match balances::token_row(txn, module)? {
+        Some(t) if t.kind == KIND_NOT_FUNGIBLE => true,
+        Some(t) => t.capped() && txn.get(Table::Balances, key)?.is_none(),
+        None => false,
+    })
 }
 
 impl Pending {
@@ -155,7 +240,7 @@ impl Pending {
         &mut self,
         hot: &HotStore,
         dict: &Mutex<HotDict>,
-        coin: u32,
+        (coin, keys): (u32, &str),
         cursor: Option<[u8; 20]>,
         rep: &mut ReceiversReport,
     ) -> Result<()> {
@@ -163,7 +248,7 @@ impl Pending {
         if rep.dry_run {
             return self.count(hot, &d, coin, rep);
         }
-        let r = self.write(hot, &mut d, coin, cursor, rep);
+        let r = self.write(hot, &mut d, (coin, keys), cursor, rep);
         if r.is_err() {
             // Names drained from `pending` never reached MDBX: forget them (review M3).
             *d = HotDict::load(&hot.ro()?)?;
@@ -175,7 +260,7 @@ impl Pending {
         &mut self,
         hot: &HotStore,
         d: &mut HotDict,
-        coin: u32,
+        (coin, cursor_key): (u32, &str),
         cursor: Option<[u8; 20]>,
         rep: &mut ReceiversReport,
     ) -> Result<()> {
@@ -187,17 +272,29 @@ impl Pending {
         .encode();
         let before = d.len(DictKind::Account);
         let mut rows: Vec<[u8; 9]> = Vec::with_capacity(self.rows.len());
-        let mut skipped = 0u64;
-        for (a, c) in &self.rows {
-            let k = bal_key(d.intern(DictKind::Account, a), coin, *c);
+        let (mut skipped, mut skipped_module) = (0u64, 0u64);
+        for (a, m, c) in &self.rows {
+            let mid = if m == "coin" {
+                coin
+            } else {
+                d.intern(DictKind::Module, m)
+            };
+            let k = bal_key(d.intern(DictKind::Account, a), mid, *c);
             // A key with a verified row is kept fresh by the tail: correct, no re-read (review
             // M2). An unverified row (its last re-read failed) is marked like an absent key.
-            if verified_row(txn.get(Table::Balances, &k)?.as_deref()) {
+            if module_skip(&txn, mid, coin, &k)? {
+                skipped_module += 1;
+            } else if verified_row(txn.get(Table::Balances, &k)?.as_deref()) {
                 skipped += 1;
             } else {
                 rows.push(k);
             }
         }
+        let tokens: Vec<(u32, u32)> = self
+            .tokens
+            .drain()
+            .map(|(m, h)| (d.intern(DictKind::Module, &m), h))
+            .collect();
         let new = (d.len(DictKind::Account) - before) as u64;
         d.persist(&mut txn)?;
         let mut inserted = 0u64;
@@ -206,12 +303,21 @@ impl Pending {
                 inserted += 1;
             }
         }
+        for (m, h) in tokens {
+            if m != coin && balances::token_row(&txn, m)?.is_none() {
+                rep.tokens_noted += 1;
+            }
+            if m != coin {
+                balances::note_token(&mut txn, m, h)?;
+            }
+        }
         if let Some(c) = cursor {
-            txn.set_meta(meta::BALANCES_SEED_RECEIVERS_CURSOR, &c)?;
+            txn.set_meta(cursor_key, &c)?;
         }
         txn.commit()?;
         rep.new_accounts += new;
         rep.skipped_existing += skipped;
+        rep.skipped_module += skipped_module;
         rep.dirty_inserted += inserted;
         rep.candidates += self.rows.len() as u64;
         self.rows.clear();
@@ -227,27 +333,43 @@ impl Pending {
         rep: &mut ReceiversReport,
     ) -> Result<()> {
         let txn = hot.ro()?;
-        for (a, c) in std::mem::take(&mut self.rows) {
-            let would = match d.find(DictKind::Account, &a) {
-                None => {
-                    if self.dry_new.insert(a.clone()) {
-                        rep.new_accounts += 1;
+        for (a, m, c) in std::mem::take(&mut self.rows) {
+            let mid = if m == "coin" {
+                Some(coin)
+            } else {
+                d.find(DictKind::Module, &m)
+            };
+            let aid = d.find(DictKind::Account, &a);
+            if aid.is_none() && self.dry_new.insert(a.clone()) {
+                rep.new_accounts += 1;
+            }
+            let would = match (aid, mid) {
+                (Some(id), Some(mid)) => {
+                    let k = bal_key(id, mid, c);
+                    if module_skip(&txn, mid, coin, &k)? {
+                        rep.skipped_module += 1;
+                        false
+                    } else if verified_row(txn.get(Table::Balances, &k)?.as_deref()) {
+                        rep.skipped_existing += 1;
+                        false
+                    } else {
+                        !balances::is_dirty(&txn, id, mid, c)?
                     }
-                    true
                 }
-                Some(id)
-                    if verified_row(
-                        txn.get(Table::Balances, &bal_key(id, coin, c))?.as_deref(),
-                    ) =>
-                {
-                    rep.skipped_existing += 1;
-                    false
-                }
-                Some(id) => !balances::is_dirty(&txn, id, coin, c)?,
+                _ => true,
             };
             rep.candidates += 1;
-            if would && self.dry_marked.insert((a, c)) {
+            if would && self.dry_marked.insert((a, m, c)) {
                 rep.dirty_inserted += 1;
+            }
+        }
+        for (m, _) in std::mem::take(&mut self.tokens) {
+            let tracked = match d.find(DictKind::Module, &m) {
+                Some(id) => id == coin || balances::token_row(&txn, id)?.is_some(),
+                None => false,
+            };
+            if !tracked && self.dry_tokens.insert(m) {
+                rep.tokens_noted += 1;
             }
         }
         Ok(())
@@ -260,27 +382,100 @@ fn verified_row(v: Option<&[u8]>) -> bool {
         .is_some_and(|r| !r.unverified)
 }
 
+/// What the walk needs per tx: the rules, the forks and (D3) the tracked tokens.
+struct Walk {
+    rules: Rules,
+    forks: Forks,
+    tokens: HashSet<String>,
+}
+
+/// A module whose rows the pass may mark: coin, or a name `/local` can call (B-1).
+fn readable(m: &str) -> bool {
+    m == "coin" || kdx_node::local::valid_module(m)
+}
+
 fn add(
     p: &mut Pending,
     k: TxKey,
     r: &kdx_types::record::TxRecord,
     dict: &MemDict,
-    forks: Forks,
+    w: &Walk,
     rep: &mut ReceiversReport,
 ) {
-    match record_receivers(r, dict, forks) {
-        Ok(v) => p.rows.extend(v.into_iter().map(|a| (a, k.chain()))),
+    let res = match w.rules {
+        Rules::D1 => record_receivers(r, dict, w.forks)
+            .map(|v| v.into_iter().map(|a| (a, "coin".to_owned())).collect()),
+        Rules::D3 => {
+            let is_token = |m: &str| w.tokens.contains(m);
+            record_token_receivers(r, dict, w.forks, &is_token).map(|t| {
+                for m in t.discovered.into_iter().filter(|m| readable(m)) {
+                    let e = p.tokens.entry(m).or_insert(k.height());
+                    *e = (*e).min(k.height());
+                }
+                t.pairs
+            })
+        }
+    };
+    match res {
+        Ok(v) => p.rows.extend(
+            v.into_iter()
+                .filter(|(_, m)| readable(m))
+                .map(|(a, m)| (a, m, k.chain())),
+        ),
         Err(e) => {
             rep.errors += 1;
             tracing::error!(
                 height = k.height(),
                 chain = k.chain(),
                 request_key = %r.request_key.map(|h| h.to_b64url()).unwrap_or_default(),
+                rules = ?w.rules,
                 error = %e,
-                "balances: receivers of a tx not readable (D1 pass error)"
+                "balances: receivers of a tx not readable (receivers pass error)"
             );
         }
     }
+}
+
+/// D3: the tracked fungible tokens (`Tokens`, not-fungible verdicts excluded) by name.
+fn tracked_tokens(txn: &impl Txn, dict: &MemDict) -> Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    for (k, v) in txn.scan(Table::Tokens, &[], |_| true)? {
+        let (Ok(id), Some(t)) = (<[u8; 4]>::try_from(k.as_slice()), TokenRow::decode(&v)) else {
+            continue;
+        };
+        if t.kind == KIND_NOT_FUNGIBLE {
+            continue;
+        }
+        if let Some(n) = dict.name(DictKind::Module, u32::from_be_bytes(id)) {
+            out.insert(n.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// D3 (a): `(account, coin, chain)` for every account an injected early miner account really
+/// credited, on every chain with a tail checkpoint. Returns how many injected names there are.
+fn injected_miners(p: &mut Pending, txn: &impl Txn, dict: &MemDict) -> Result<u64> {
+    let mut chains = Vec::new();
+    for c in 0..kdx_segment::SLOT_WIDTH as u8 {
+        if checkpoint(txn, Stage::Tail, c)?.is_some() {
+            chains.push(c);
+        }
+    }
+    let mut n = 0;
+    for name in dict.names(DictKind::Account) {
+        let v = injected_miner_receivers(name);
+        if v.is_empty() {
+            continue;
+        }
+        n += 1;
+        for a in v {
+            for &c in &chains {
+                p.rows.insert((a.clone(), "coin".to_owned(), c));
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// Resume cursor: start height ‖ next frozen TxNum ‖ frozen-walk errors so far.
@@ -311,6 +506,8 @@ pub struct Opts {
     pub chunk: usize,
     /// Count only: no marks, names, cursor or flag are written.
     pub dry_run: bool,
+    /// D1 (default) or D3.
+    pub rules: Rules,
 }
 
 impl Default for Opts {
@@ -319,6 +516,7 @@ impl Default for Opts {
             forks: MAINNET01,
             chunk: TX_CHUNK,
             dry_run: false,
+            rules: Rules::D1,
         }
     }
 }
@@ -336,20 +534,19 @@ pub fn run(
     let t0 = Instant::now();
     let mut rep = ReceiversReport {
         dry_run: o.dry_run,
+        rules: o.rules,
         ..ReceiversReport::default()
     };
+    let (flag_key, cursor_key, errors_key) = o.rules.keys();
     let (coin, span, resume, prior_errors) = {
         let txn = hot.ro()?;
-        let resume = txn
-            .meta(meta::BALANCES_SEED_RECEIVERS_CURSOR)?
-            .as_deref()
-            .and_then(parse_cursor);
+        let resume = txn.meta(cursor_key)?.as_deref().and_then(parse_cursor);
         let prior = txn
-            .meta(meta::BALANCES_SEED_RECEIVERS_ERRORS)?
+            .meta(errors_key)?
             .as_deref()
             .and_then(|v| Some(u64::from_be_bytes(v.try_into().ok()?)))
             .unwrap_or(0);
-        let span = pending(&txn, o.forks)?;
+        let span = pending_for(&txn, o)?;
         if span.is_some() {
             check_ready(&txn, segdir)?;
         }
@@ -361,17 +558,30 @@ pub fn run(
     (rep.from, rep.to) = (from, to);
     let Some(coin) = coin else {
         rep.no_coin = true;
-        tracing::warn!("balances: no coin module yet; receivers pass postponed (D1)");
+        tracing::warn!(rules = ?o.rules, "balances: no coin module yet; receivers pass postponed");
         return Ok(rep);
     };
     tracing::info!(
         from,
         to,
         dry_run = o.dry_run,
-        "balances: receivers pass (D1) started"
+        rules = ?o.rules,
+        "balances: receivers pass started"
     );
     let snap: Arc<MemDict> = Arc::new(dict.lock().unwrap_or_else(|e| e.into_inner()).mem().clone());
     let mut p = Pending::default();
+    let w = Walk {
+        rules: o.rules,
+        forks: o.forks,
+        tokens: match o.rules {
+            Rules::D1 => HashSet::new(),
+            Rules::D3 => tracked_tokens(&hot.ro()?, &snap)?,
+        },
+    };
+    if o.rules == Rules::D3 {
+        rep.injected_miners = injected_miners(&mut p, &hot.ro()?, &snap)?;
+    }
+    let ck = (coin, cursor_key);
 
     // Hot pass: TailTxs at heights [from, to), key order.
     let mut after: Option<Vec<u8>> = None;
@@ -395,14 +605,14 @@ pub fn run(
                 continue;
             }
             match decode_tx(v) {
-                Ok(r) => add(&mut p, key, &r, &snap, o.forks, &mut rep),
+                Ok(r) => add(&mut p, key, &r, &snap, &w, &mut rep),
                 Err(e) => {
                     rep.errors += 1;
                     tracing::error!(
                         height = key.height(),
                         chain = key.chain(),
                         error = %e,
-                        "balances: hot tx record not readable (D1 pass error)"
+                        "balances: hot tx record not readable (receivers pass error)"
                     );
                 }
             }
@@ -413,7 +623,7 @@ pub fn run(
             _ => break,
         }
     }
-    p.flush(hot, dict, coin, None, &mut rep)?;
+    p.flush(hot, dict, ck, None, &mut rep)?;
     // The hot part is redone on resume; the frozen walk's errors resume with the cursor.
     let hot_errors = rep.errors;
 
@@ -438,7 +648,7 @@ pub fn run(
             if !key.is_coinbase() && (from..to).contains(&key.height()) {
                 match segs.tx(t)? {
                     Some(r) => {
-                        add(&mut p, key, &r, &snap, o.forks, &mut rep);
+                        add(&mut p, key, &r, &snap, &w, &mut rep);
                         rep.frozen_txs += 1;
                     }
                     None => {
@@ -448,7 +658,7 @@ pub fn run(
                             chain = key.chain(),
                             position = key.pos(),
                             txnum = t,
-                            "balances: frozen tx has a key but no record (D1 pass error)"
+                            "balances: frozen tx has a key but no record (receivers pass error)"
                         );
                     }
                 }
@@ -457,7 +667,7 @@ pub fn run(
         n += 1;
         if n.is_multiple_of(chunk) {
             let c = cursor(from, t + 1, rep.errors - hot_errors);
-            p.flush(hot, dict, coin, Some(c), &mut rep)?;
+            p.flush(hot, dict, ck, Some(c), &mut rep)?;
             if n.is_multiple_of(chunk * 20) {
                 tracing::info!(
                     txnum = t,
@@ -476,12 +686,12 @@ pub fn run(
             }
         }
     }
-    p.flush(hot, dict, coin, None, &mut rep)?;
+    p.flush(hot, dict, ck, None, &mut rep)?;
     rep.secs = t0.elapsed().as_secs_f64();
     if rep.errors > 0 {
         tracing::error!(
             errors = rep.errors,
-            "balances: receivers pass (D1) could not read some txs; their receivers may be \
+            "balances: receivers pass could not read some txs; their receivers may be \
              missing (see the errors logged above)"
         );
     }
@@ -492,9 +702,9 @@ pub fn run(
     // Errors of earlier finished passes on this store add up; a pass from 0 starts over.
     let total = if from == 0 { 0 } else { prior_errors } + rep.errors;
     let mut txn = hot.rw()?;
-    txn.set_meta(meta::BALANCES_SEED_RECEIVERS, &to.to_be_bytes())?;
-    txn.set_meta(meta::BALANCES_SEED_RECEIVERS_ERRORS, &total.to_be_bytes())?;
-    txn.del(Table::Meta, meta::BALANCES_SEED_RECEIVERS_CURSOR.as_bytes())?;
+    txn.set_meta(flag_key, &to.to_be_bytes())?;
+    txn.set_meta(errors_key, &total.to_be_bytes())?;
+    txn.del(Table::Meta, cursor_key.as_bytes())?;
     txn.commit()?;
     Ok(rep)
 }

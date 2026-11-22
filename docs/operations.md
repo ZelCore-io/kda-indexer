@@ -635,6 +635,37 @@ network; a network this build has no heights for uses mainnet01's and logs a war
   (with `seed_receivers_height` and `seed_receivers_in_progress`).
 - To force a rerun, delete Meta `balances_seed_receivers`.
 
+#### Token receivers pass (D3)
+
+Some credits name the receiver in no TRANSFER event, for coin and for tokens alike, so no
+posting marks its row. The token receivers pass marks them, with its own flag
+(`Meta balances_seed_token_receivers`), cursor and error count, and the same mechanics as D1
+(resumable, `stop` polled per chunk, verified rows skipped, refused until the backfill is
+complete and the tail has started). It walks every stored height, not only those below coin v3.
+After the first walk it is pending again whenever the tail grew, and the service's hourly
+recheck walks only the new heights. Candidates:
+
+- an injected early miner account (a dictionary name holding a `"`, mainnet 2020): the
+  accounts its coinbase really credited, as coin rows on every chain with a tail;
+- a cross-chain defpact of any module (`<module>.transfer-crosschain`): step 1 credits
+  `args[1]`, step 0 debits `args[0]`. Tokens emit no TRANSFER for either;
+- an `exec` below the events fork: the D1 strings plus every string of `result.data`, for coin
+  and for each tracked token the code calls;
+- an event of a tracked token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
+  ...): its string params, for that token;
+- an event param holding a `fungible-v2` module reference: the event's string params, for the
+  referenced module. The pass also starts tracking that module in `Tokens` (`kaddex.skdx` is
+  only ever minted this way, so no TRANSFER ever made it a token).
+
+Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
+Pact 5 cannot parse) are never marked or noted: the node API cannot read them.
+
+`reconcile-balances --seed` runs D1 and then D3. `--seed --dry-run` opens the store read-only
+and prints both reports, `receivers` and `token_receivers`; `dirty_inserted` is the number of
+node reads the pass would cause. `--status` shows `seed_token_receivers_height`,
+`seed_token_receivers_in_progress` and `seed_token_receivers_errors`. To force a rerun, delete
+`Meta balances_seed_token_receivers`.
+
 ### NFTs
 
 The same stage keeps `NftBalances` (spec §3.9). Once per store (`Meta nft_filled`), before the

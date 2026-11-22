@@ -54,6 +54,14 @@ pub mod meta {
     /// Txs the receivers pass could not read (u64), over the pass and its resumes (D1 L1).
     /// Kept after the pass ends so `--status` shows it; non-zero needs a look at the logs.
     pub const BALANCES_SEED_RECEIVERS_ERRORS: &str = "balances_seed_receivers_errors";
+    /// u32: the token receivers pass (D3, `kdx_ingest::seed_receivers` with `Rules::D3`) has
+    /// marked the receivers no TRANSFER names, of coin and every token, for every stored tx
+    /// below this height. Absent: the pass never ran.
+    pub const BALANCES_SEED_TOKEN_RECEIVERS: &str = "balances_seed_token_receivers";
+    /// Resume cursor of a running D3 pass (same layout as the D1 cursor).
+    pub const BALANCES_SEED_TOKEN_RECEIVERS_CURSOR: &str = "balances_seed_token_receivers_cursor";
+    /// Txs the D3 pass could not read (u64), like [`BALANCES_SEED_RECEIVERS_ERRORS`].
+    pub const BALANCES_SEED_TOKEN_RECEIVERS_ERRORS: &str = "balances_seed_token_receivers_errors";
 }
 
 static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);

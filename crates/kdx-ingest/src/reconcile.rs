@@ -998,25 +998,35 @@ async fn seed_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
 /// its stored history below coin v3 grew since. Postponed (to the next recheck) while the
 /// store is not ready for it (review L3). It runs inline: tail dirty rows wait until it ends
 /// (review L4). Returns false when stopped.
-async fn receivers_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
-    let forks = crate::seed_receivers::forks_for(&ctx.opts.network);
-    let Some((from, to)) = crate::seed_receivers::pending(&ctx.hot.ro()?, forks)? else {
+///
+/// D3 (`Rules::D3`): the token receivers pass, same mechanics over every stored height; after
+/// its first walk it is pending again whenever the tail grew, and walks only the new heights.
+use crate::seed_receivers::Rules;
+
+async fn receivers_pass(
+    ctx: &Arc<Ctx>,
+    stop: &CancellationToken,
+    rules: crate::seed_receivers::Rules,
+) -> Result<bool> {
+    let opts = crate::seed_receivers::Opts {
+        forks: crate::seed_receivers::forks_for(&ctx.opts.network),
+        rules,
+        ..Default::default()
+    };
+    let Some((from, to)) = crate::seed_receivers::pending_for(&ctx.hot.ro()?, &opts)? else {
         return Ok(true);
     };
     if let Err(e) = crate::seed_receivers::check_ready(&ctx.hot.ro()?, &ctx.segdir) {
-        tracing::warn!(error = %e, "balances: receivers pass (D1) postponed");
+        tracing::warn!(error = %e, ?rules, "balances: receivers pass postponed");
         return Ok(true);
     }
     tracing::info!(
         from,
         to,
-        "balances: marking event-less receivers below coin v3 (D1)"
+        ?rules,
+        "balances: marking receivers no event names (D1: coin below coin v3; D3: all modules)"
     );
     let (c, s) = (ctx.clone(), stop.clone());
-    let opts = crate::seed_receivers::Opts {
-        forks,
-        ..Default::default()
-    };
     let rep = tokio::task::spawn_blocking(move || {
         crate::seed_receivers::run(&c.hot, &c.dict, &c.segdir, &opts, &|| s.is_cancelled())
     })
@@ -1135,8 +1145,10 @@ async fn run_with(
     if o.seed && !crate::seed::seeded(&ctx.hot.ro()?)? && !seed_pass(&ctx, &stop).await? {
         return Ok(());
     }
-    if o.seed && !receivers_pass(&ctx, &stop).await? {
-        return Ok(());
+    for rules in [Rules::D1, Rules::D3] {
+        if o.seed && !receivers_pass(&ctx, &stop, rules).await? {
+            return Ok(());
+        }
     }
     let local = LocalClient::new(node, o.local);
     let mut nft_cursor: Option<Vec<u8>> = None;
@@ -1171,8 +1183,11 @@ async fn run_with(
         }
         if last_recheck.is_none_or(|t| t.elapsed() >= RECHECK_SCAN) {
             // D1: a tail still below coin v3 stores new pre-v3 txs; their receivers too.
-            if o.seed && last_recheck.is_some() && !receivers_pass(&ctx, &stop).await? {
-                return Ok(());
+            // D3: the new heights of the tail (credits of tokens no TRANSFER names).
+            for rules in [Rules::D1, Rules::D3] {
+                if o.seed && last_recheck.is_some() && !receivers_pass(&ctx, &stop, rules).await? {
+                    return Ok(());
+                }
             }
             let n = recheck_not_fungible(&ctx.hot, now_unix(), o.caps.recheck_secs)?;
             if n > 0 {

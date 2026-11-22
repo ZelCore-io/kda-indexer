@@ -1,13 +1,14 @@
 //! `kda-indexer reconcile-balances`: manual reruns of the balance seed and full re-reads, and
 //! the reconcile status (plan Task 9). `run` seeds and reconciles by itself (B-5); `--seed`
 //! and `--all` take the data dir lock, so they run while the service is stopped. `--seed`
-//! also runs the receivers pass (D1) when the store has not had it; `--seed --dry-run` only
-//! counts what that pass would mark (read-only, no lock). `--status` only reads.
+//! also runs the receivers passes when pending (D1, then the token receivers pass D3);
+//! `--seed --dry-run` only counts what they would mark (read-only, no lock). `--status` only reads.
 
 use std::path::Path;
 
 use kdx_hot::balances::{meta, BalanceRow};
 use kdx_hot::{HotStore, Table, Txn};
+use kdx_ingest::seed_receivers::Rules;
 use serde_json::{json, Value};
 
 use crate::config::Config;
@@ -40,13 +41,16 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
             let segdir = kdx_ingest::ctx::segments_dir(data_dir);
             let rep = kdx_ingest::seed::run(&hs, &segdir, &|| false)?;
             println!("{}", serde_json::to_string_pretty(&rep)?);
-            // D1: the receivers pass, once per store (`Meta balances_seed_receivers`).
-            receivers(cfg, &hs, &segdir, false)
+            // D1: the receivers pass, once per store (`Meta balances_seed_receivers`); D3: the
+            // token receivers pass (`Meta balances_seed_token_receivers`), up to the tail.
+            receivers(cfg, &hs, &segdir, false, Rules::D1)?;
+            receivers(cfg, &hs, &segdir, false, Rules::D3)
         }
         Mode::SeedDryRun => {
             let hs = HotStore::open_ro(&hot_dir)?;
             let segdir = kdx_ingest::ctx::segments_dir(data_dir);
-            receivers(cfg, &hs, &segdir, true)
+            receivers(cfg, &hs, &segdir, true, Rules::D1)?;
+            receivers(cfg, &hs, &segdir, true, Rules::D3)
         }
         Mode::NftFill => {
             let _lock = super::lock_data_dir(data_dir)?;
@@ -111,16 +115,27 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
     }
 }
 
-/// The receivers pass (D1), or its dry run; fails when it could not read some txs (L1).
-fn receivers(cfg: &Config, hs: &HotStore, segdir: &Path, dry_run: bool) -> anyhow::Result<()> {
+/// A receivers pass (D1 or D3), or its dry run; fails when it could not read some txs (L1).
+fn receivers(
+    cfg: &Config,
+    hs: &HotStore,
+    segdir: &Path,
+    dry_run: bool,
+    rules: Rules,
+) -> anyhow::Result<()> {
     let dict = std::sync::Mutex::new(kdx_hot::HotDict::load(&hs.ro()?)?);
     let opts = kdx_ingest::seed_receivers::Opts {
         forks: kdx_ingest::seed_receivers::forks_for(&cfg.network),
         dry_run,
+        rules,
         ..Default::default()
     };
     let rep = kdx_ingest::seed_receivers::run(hs, &dict, segdir, &opts, &|| false)?;
-    println!("{}", json!({ "receivers": rep }));
+    let key = match rules {
+        Rules::D1 => "receivers",
+        Rules::D3 => "token_receivers",
+    };
+    println!("{}", json!({ key: rep }));
     if rep.errors > 0 {
         anyhow::bail!(
             "receivers pass: {} txs could not be read (logged with block, chain and request \
@@ -188,6 +203,16 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
         // D1 L1: txs the receivers pass could not read; must be 0 (see its logs otherwise).
         "seed_receivers_errors": txn
             .meta(meta::BALANCES_SEED_RECEIVERS_ERRORS)?
+            .and_then(|v| v.try_into().ok().map(u64::from_be_bytes)),
+        // D3: the token receivers pass (done-through height, running, unreadable txs).
+        "seed_token_receivers_height": txn
+            .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)?
+            .and_then(|v| v.try_into().ok().map(u32::from_be_bytes)),
+        "seed_token_receivers_in_progress": txn
+            .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CURSOR)?
+            .is_some(),
+        "seed_token_receivers_errors": txn
+            .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_ERRORS)?
             .and_then(|v| v.try_into().ok().map(u64::from_be_bytes)),
         "rate_per_s": rate,
         "eta_secs": (rate > 0.0).then(|| (dirty as f64 / rate).round() as u64),

@@ -419,3 +419,215 @@ fn a_tx_whose_cmd_is_not_json_is_counted_and_kept_in_meta() {
         Some(&1u64.to_be_bytes()[..])
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// D3: the token receivers pass (`Rules::D3`).
+// ---------------------------------------------------------------------------------------------
+
+const INJ: &str = "4069e72f62deb9dde8ee0686ee2908580131128b0a350e23890e9b46e61f166d";
+const WRECV: &str = "ZELCORE WIZA-KDA";
+const UNWRAP_ACC: &str = "k:5555555555555555555555555555555555555555555555555555555555555555";
+const SKDX_ACC: &str = "k:6666666666666666666666666666666666666666666666666666666666666666";
+const OZIL: &str = "n_95d7fe012aa7e05c187b3fc8c605ff3b1a2c521d.MesutÖzilDönerKebabMerkel42Inu";
+
+fn event(module: &str, name: &str, params: Value) -> Value {
+    let (ns, n) = module
+        .split_once('.')
+        .map_or((Value::Null, module), |(a, b)| (a.into(), b));
+    json!({"params": params, "name": name, "module": {"namespace": ns, "name": n},
+        "moduleHash": h(40)})
+}
+
+fn d3_tx(n: u32, cmd: Value, events: Value, cont: Value) -> Value {
+    let mut cmd = cmd;
+    cmd["nonce"] = json!(format!("d3-{n}"));
+    cmd["signers"] = json!([]);
+    let cmd = cmd.to_string();
+    let rk = blake2b_256(cmd.as_bytes()).to_b64url();
+    let tx = serde_json::to_vec(&json!({"hash": rk, "sigs": [], "cmd": cmd})).unwrap();
+    let out = serde_json::to_vec(
+        &json!({"gas": 1, "result": {"status": "success", "data": "Write succeeded"},
+        "reqKey": rk, "logs": h(12), "events": events, "metaData": null,
+        "continuation": cont, "txId": 7}),
+    )
+    .unwrap();
+    json!([b64url_encode(&tx), b64url_encode(&out)])
+}
+
+fn xchain_finish(n: u32, module: &str, receiver: &str) -> Value {
+    let cmd = json!({"payload": {"cont": {"pactId": h(50 + n as u8), "step": 1,
+        "rollback": false, "data": {}, "proof": "cHJvb2Y"}}, "meta": {"sender": "gas-station"}});
+    let cont = json!({"pactId": h(50 + n as u8), "step": 1, "stepCount": 2, "executed": null,
+        "stepHasRollback": false, "yield": null,
+        "continuation": {"def": format!("{module}.transfer-crosschain"),
+            "args": [SENDER, receiver, {"keys": [PK], "pred": "keys-all"}, "0", 1.0]}});
+    d3_tx(n, cmd, json!([]), cont)
+}
+
+/// A chain-0 block at `height`: an injected miner account (credits [`INJ`]), a `free.wiza`
+/// cross-chain finish to [`WRECV`], a `kaddex.kdx` TRANSFER (so the token is tracked) with an
+/// UNWRAP to [`UNWRAP_ACC`], an alchemist WRAP minting `kaddex.skdx` to [`SKDX_ACC`], and a
+/// cross-chain finish of a module whose name `/local` cannot parse ([`OZIL`]).
+fn d3_block(height: u32) -> (kdx_decode::DecodedBlock, VerifyReport) {
+    let skdx = json!({"refSpec": [{"namespace": null, "name": "fungible-v2"}],
+        "refName": {"namespace": "kaddex", "name": "skdx"}});
+    let staking = json!({"payload": {"exec": {"code": "(kaddex.staking.claim)", "data": {}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([
+        event("kaddex.kdx", "TRANSFER", json!([SENDER, "k:kdx-pool", 1.0])),
+        event(
+            "kaddex.kdx",
+            "UNWRAP",
+            json!(["kdx-staking", UNWRAP_ACC, 2.0])
+        ),
+        event(
+            "kaddex.alchemist",
+            "WRAP",
+            json!([skdx, 1.0, SKDX_ACC, SKDX_ACC])
+        ),
+    ]);
+    let txs = vec![
+        xchain_finish(1, "free.wiza", WRECV),
+        d3_tx(2, staking, evs, Value::Null),
+        xchain_finish(3, OZIL, SKDX_ACC),
+    ];
+    let cb = serde_json::to_vec(
+        &json!({"gas": 0, "result": {"status": "success", "data": "ok"},
+        "reqKey": h(9), "logs": null, "events": [], "metaData": null,
+        "continuation": null, "txId": null}),
+    )
+    .unwrap();
+    let account = format!(r#"k:m" (read-keyset "miner-keyset") 1.0)(coin.coinbase "{INJ}"#);
+    let miner = serde_json::to_vec(
+        &json!({"account": account, "predicate": "keys-all", "public-keys": ["m"]}),
+    )
+    .unwrap();
+    let header = json!({
+        "nonce": "1", "creationTime": 1, "parent": hh(height - 1, 0), "adjacents": {},
+        "target": h(3), "payloadHash": h(4), "chainId": 0, "weight": h(5), "height": height,
+        "chainwebVersion": "mainnet01", "epochStart": 1, "featureFlags": 0,
+        "hash": hh(height, 0)
+    });
+    let payload = json!({
+        "transactions": txs, "minerData": b64url_encode(&miner),
+        "transactionsHash": h(7), "outputsHash": h(8), "payloadHash": h(4),
+        "coinbase": b64url_encode(&cb),
+    });
+    let b = decode_block(&header, &payload).expect("block decodes");
+    verify_block(&b, &b.header.payload_hash).expect("consistency checks");
+    (b, VerifyReport::default())
+}
+
+fn d3_store() -> (tempfile::TempDir, kdx_ingest::Ctx) {
+    let (d, c) = store();
+    apply::commit(
+        &c,
+        &[Batch {
+            chain: 0,
+            fork: None,
+            blocks: vec![d3_block(25)],
+            halted: false,
+            halt_reason: "",
+        }],
+    )
+    .unwrap();
+    (d, c)
+}
+
+fn d3_opts(dry_run: bool) -> Opts {
+    Opts {
+        rules: seed_receivers::Rules::D3,
+        dry_run,
+        ..Opts::default()
+    }
+}
+
+fn dirty_in(c: &kdx_ingest::Ctx, name: &str, module: &str) -> bool {
+    let txn = c.hot.ro().unwrap();
+    let d = kdx_hot::HotDict::load(&txn).unwrap();
+    let (Some(a), Some(m)) = (
+        d.find(DictKind::Account, name),
+        d.find(DictKind::Module, module),
+    ) else {
+        return false;
+    };
+    balances::is_dirty(&txn, a, m, 0).unwrap()
+}
+
+fn tracked(c: &kdx_ingest::Ctx, module: &str) -> bool {
+    let txn = c.hot.ro().unwrap();
+    let d = kdx_hot::HotDict::load(&txn).unwrap();
+    d.find(DictKind::Module, module)
+        .is_some_and(|m| balances::token_row(&txn, m).unwrap().is_some())
+}
+
+#[test]
+fn the_token_pass_marks_credits_no_transfer_names_and_discovers_tokens() {
+    let (_d, c) = d3_store();
+    let rows = [
+        (INJ, "coin"),
+        (WRECV, "free.wiza"),
+        (UNWRAP_ACC, "kaddex.kdx"),
+        (SKDX_ACC, "kaddex.skdx"),
+    ];
+    for (a, m) in rows {
+        assert!(!dirty_in(&c, a, m), "{a} {m} dirty before the pass");
+    }
+    assert!(tracked(&c, "kaddex.kdx") && !tracked(&c, "kaddex.skdx"));
+
+    // The dry run counts what the real run marks, and writes nothing.
+    let dry = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(true), &|| false).unwrap();
+    for (a, m) in rows {
+        assert!(!dirty_in(&c, a, m), "dry run marked {a} {m}");
+    }
+    assert!(!tracked(&c, "kaddex.skdx"));
+    assert!(c
+        .hot
+        .ro()
+        .unwrap()
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)
+        .unwrap()
+        .is_none());
+
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    assert_eq!(rep.errors, 0, "{rep:?}");
+    for (a, m) in rows {
+        assert!(dirty_in(&c, a, m), "{a} {m} not marked: {rep:?}");
+    }
+    assert!(
+        tracked(&c, "kaddex.skdx"),
+        "fungible-v2 modref discovers the token"
+    );
+    assert!(
+        tracked(&c, "free.wiza"),
+        "a token's cross-chain defpact discovers it"
+    );
+    assert!(
+        !tracked(&c, OZIL),
+        "a module name /local cannot parse is never read"
+    );
+    assert!(!dirty_in(&c, SKDX_ACC, OZIL));
+    assert_eq!(
+        (dry.dirty_inserted, dry.new_accounts, dry.tokens_noted),
+        (rep.dirty_inserted, rep.new_accounts, rep.tokens_noted),
+        "dry {dry:?} real {rep:?}"
+    );
+    assert!(rep.injected_miners >= 1, "{rep:?}");
+
+    let txn = c.hot.ro().unwrap();
+    assert_eq!(
+        txn.meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)
+            .unwrap()
+            .as_deref(),
+        Some(&26u32.to_be_bytes()[..])
+    );
+    assert!(seed_receivers::pending_for(&txn, &d3_opts(false))
+        .unwrap()
+        .is_none());
+    // The D1 flag is separate: D3 does not mark D1 done, nor the reverse.
+    assert!(txn.meta(meta::BALANCES_SEED_RECEIVERS).unwrap().is_none());
+    drop(txn);
+    let again =
+        seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    assert_eq!((again.hot_txs, again.frozen_txs), (0, 0), "{again:?}");
+}
