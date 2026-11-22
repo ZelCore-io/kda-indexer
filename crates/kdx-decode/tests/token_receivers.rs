@@ -9,7 +9,9 @@
 //!   `pact.X_RESUME` event), `kaddex.kdx.UNWRAP` credits with no TRANSFER;
 //! - (d) `kaddex.alchemist.WRAP` minting `kaddex.skdx`, named only by a `fungible-v2` modref.
 
-use kdx_decode::receivers::{injected_miner_receivers, token_receivers, MAINNET01};
+use kdx_decode::receivers::{
+    injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_PER_TX,
+};
 use serde_json::{json, Value};
 
 const KEY: &str = "4069e72f62deb9dde8ee0686ee2908580131128b0a350e23890e9b46e61f166d";
@@ -152,7 +154,7 @@ fn non_transfer_events_of_a_token_name_its_credited_accounts() {
         MAINNET01,
         &tokens,
     );
-    let p = pairs(&r.pairs);
+    let p = pairs(&r.event_pairs);
     assert!(
         p.contains(&(ACC, "kaddex.kdx")) && p.contains(&("kdx-staking", "kaddex.kdx")),
         "{p:?}"
@@ -185,6 +187,89 @@ fn a_fungible_modref_in_an_event_names_and_discovers_its_module() {
         MAINNET01,
         &tokens,
     );
-    assert_eq!(pairs(&r.pairs), vec![(ACC, "kaddex.skdx")]);
+    assert_eq!(pairs(&r.event_pairs), vec![(ACC, "kaddex.skdx")]);
     assert_eq!(r.discovered, vec!["kaddex.skdx".to_owned()]);
+}
+
+#[test]
+fn an_exec_calling_a_token_counts_for_it_at_any_height() {
+    // A token credit with no event of the token at all (only the gas TRANSFER), after the
+    // events fork: the code calls the token, the receiver is a literal.
+    let cmd = json!({"payload": {"exec": {"data": {"r": SRC},
+        "code": format!(r#"(free.anedak.mint "{ACC}" 10.0)"#)}}});
+    let evs = json!([ev("coin", "TRANSFER", json!([SRC, "miner", 0.0001]))]);
+    let o = out(json!("Write succeeded"), evs, Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 4_000_000, MAINNET01, &tokens);
+    let p = pairs(&r.pairs);
+    assert!(
+        p.contains(&(ACC, "free.anedak")) && p.contains(&(SRC, "free.anedak")),
+        "{p:?}"
+    );
+    // Above the events fork coin credits have events: no coin candidates from an exec.
+    assert!(!p.iter().any(|(_, m)| *m == "coin"), "{p:?}");
+}
+
+fn modref(ns: Option<&str>, name: &str) -> Value {
+    json!({"refSpec": [{"namespace": null, "name": "fungible-v2"}],
+        "refName": {"namespace": ns, "name": name}})
+}
+
+#[test]
+fn a_hostile_event_is_capped_and_never_gives_coin_rows() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(free.evil.go)"}}});
+    let strings: Vec<Value> = (0..1000)
+        .map(|i| json!(format!("k:victim-{i:04}")))
+        .collect();
+    let mut refs: Vec<Value> = (0..100)
+        .map(|i| modref(Some("free"), &format!("tok{i}")))
+        .collect();
+    refs.push(modref(None, "coin"));
+    // An untracked module in an open namespace referencing other modules: nothing at all.
+    let evs = json!([ev("free.evil", "SPAM", json!([refs, strings]))]);
+    let o = out(json!("ok"), evs, Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
+    assert!(
+        r.pairs.is_empty() && r.event_pairs.is_empty() && r.discovered.is_empty(),
+        "{r:?}"
+    );
+    // A tracked token's event: at most the per-tx cap, and a coin modref gives no coin rows.
+    let evs = json!([ev("free.wiza", "SPAM", json!([refs, strings]))]);
+    let o = out(json!("ok"), evs, Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
+    assert_eq!(
+        r.event_pairs.len(),
+        MAX_EVENT_PAIRS_PER_TX,
+        "{}",
+        r.event_pairs.len()
+    );
+    assert!(!r.event_pairs.iter().any(|(_, m)| m == "coin"));
+    assert!(!r.discovered.iter().any(|m| m == "coin"));
+}
+
+#[test]
+fn a_modref_counts_only_from_its_module_a_token_or_its_governed_namespace() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(x)"}}});
+    let run = |emitter: &str, (ns, n): (Option<&str>, &str)| {
+        let evs = json!([ev(emitter, "WRAP", json!([modref(ns, n), 1.0, ACC]))]);
+        token_receivers(
+            Some(&cmd),
+            &out(json!("ok"), evs, Value::Null),
+            5_000_000,
+            MAINNET01,
+            &tokens,
+        )
+    };
+    // kaddex.alchemist mints kaddex.skdx: same governed namespace.
+    assert_eq!(
+        pairs(&run("kaddex.alchemist", (Some("kaddex"), "skdx")).event_pairs),
+        vec![(ACC, "kaddex.skdx")]
+    );
+    // The referenced module itself.
+    assert_eq!(
+        run("free.gold", (Some("free"), "gold")).event_pairs.len(),
+        1
+    );
+    // Anyone in `free` naming another `free` token: nothing.
+    let r = run("free.evil", (Some("free"), "gold"));
+    assert!(r.event_pairs.is_empty() && r.discovered.is_empty(), "{r:?}");
 }

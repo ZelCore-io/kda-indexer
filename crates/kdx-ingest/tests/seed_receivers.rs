@@ -428,6 +428,8 @@ const INJ: &str = "4069e72f62deb9dde8ee0686ee2908580131128b0a350e23890e9b46e61f1
 const WRECV: &str = "ZELCORE WIZA-KDA";
 const UNWRAP_ACC: &str = "k:5555555555555555555555555555555555555555555555555555555555555555";
 const SKDX_ACC: &str = "k:6666666666666666666666666666666666666666666666666666666666666666";
+/// Shaped like an injected miner account, but only ever a tx sender: never a coinbase miner.
+const FAKE_KEY: &str = "7777777777777777777777777777777777777777777777777777777777777777";
 const OZIL: &str = "n_95d7fe012aa7e05c187b3fc8c605ff3b1a2c521d.MesutÖzilDönerKebabMerkel42Inu";
 
 fn event(module: &str, name: &str, params: Value) -> Value {
@@ -471,8 +473,9 @@ fn xchain_finish(n: u32, module: &str, receiver: &str) -> Value {
 fn d3_block(height: u32) -> (kdx_decode::DecodedBlock, VerifyReport) {
     let skdx = json!({"refSpec": [{"namespace": null, "name": "fungible-v2"}],
         "refName": {"namespace": "kaddex", "name": "skdx"}});
+    let fake = format!(r#"k:f" (read-keyset "miner-keyset") 1.0)(coin.coinbase "{FAKE_KEY}"#);
     let staking = json!({"payload": {"exec": {"code": "(kaddex.staking.claim)", "data": {}}},
-        "meta": {"sender": SENDER}});
+        "meta": {"sender": fake}});
     let evs = json!([
         event("kaddex.kdx", "TRANSFER", json!([SENDER, "k:kdx-pool", 1.0])),
         event(
@@ -543,6 +546,10 @@ fn d3_opts(dry_run: bool) -> Opts {
 }
 
 fn dirty_in(c: &kdx_ingest::Ctx, name: &str, module: &str) -> bool {
+    dirty_on(c, name, module, 0)
+}
+
+fn dirty_on(c: &kdx_ingest::Ctx, name: &str, module: &str, chain: u8) -> bool {
     let txn = c.hot.ro().unwrap();
     let d = kdx_hot::HotDict::load(&txn).unwrap();
     let (Some(a), Some(m)) = (
@@ -551,7 +558,7 @@ fn dirty_in(c: &kdx_ingest::Ctx, name: &str, module: &str) -> bool {
     ) else {
         return false;
     };
-    balances::is_dirty(&txn, a, m, 0).unwrap()
+    balances::is_dirty(&txn, a, m, chain).unwrap()
 }
 
 fn tracked(c: &kdx_ingest::Ctx, module: &str) -> bool {
@@ -612,7 +619,13 @@ fn the_token_pass_marks_credits_no_transfer_names_and_discovers_tokens() {
         (rep.dirty_inserted, rep.new_accounts, rep.tokens_noted),
         "dry {dry:?} real {rep:?}"
     );
-    assert!(rep.injected_miners >= 1, "{rep:?}");
+    assert_eq!(rep.injected_miners, 1, "{rep:?}");
+    // The miner's credit is marked on its block's chain only; a non-miner name of the same
+    // shape gives nothing.
+    for ch in 1..20u8 {
+        assert!(!dirty_on(&c, INJ, "coin", ch), "chain {ch}");
+    }
+    assert!(!dirty_in(&c, FAKE_KEY, "coin"));
 
     let txn = c.hot.ro().unwrap();
     assert_eq!(
@@ -630,4 +643,18 @@ fn the_token_pass_marks_credits_no_transfer_names_and_discovers_tokens() {
     let again =
         seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
     assert_eq!((again.hot_txs, again.frozen_txs), (0, 0), "{again:?}");
+}
+
+#[test]
+fn the_token_pass_caps_event_candidates_per_pass() {
+    let (_d, c) = d3_store();
+    let o = Opts {
+        max_event_candidates: 1,
+        ..d3_opts(false)
+    };
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    assert_eq!(rep.event_candidates, 1, "{rep:?}");
+    assert!(rep.event_cap_hit, "{rep:?}");
+    // Non-event rules are not capped.
+    assert!(dirty_in(&c, WRECV, "free.wiza") && dirty_in(&c, INJ, "coin"));
 }

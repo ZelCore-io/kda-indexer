@@ -33,9 +33,8 @@
 //! finishes and starts emit no TRANSFER), pre-event execs for coin and the tokens their code
 //! calls (incl. receivers only in `result.data`), non-TRANSFER events of tracked tokens and
 //! `fungible-v2` module references (which also discover the referenced token, e.g.
-//! `kaddex.skdx`). Before the walk, every dictionary account holding a `"` (an injected early
-//! miner account) gives the accounts its coinbase really credited, on every chain with a
-//! tail. Rows of a module whose name fails the `/local` module check (B-1; e.g. a non-ASCII
+//! `kaddex.skdx`), capped per tx and per pass. A coinbase below the injection fix whose
+//! block's miner account holds a `"` gives the accounts it really credited, on its chain. Rows of a module whose name fails the `/local` module check (B-1; e.g. a non-ASCII
 //! name Pact 5 cannot parse) are never marked or noted. As the tail grows the pass is
 //! pending again and walks only the new heights (hourly in the service).
 
@@ -115,8 +114,12 @@ pub struct ReceiversReport {
     pub skipped_module: u64,
     /// D3: modules the pass starts tracking (`Tokens`), e.g. found by a `fungible-v2` modref.
     pub tokens_noted: u64,
-    /// D3: injected miner accounts (holding a `"`) in the dictionary.
+    /// D3: coinbases below the injection fix whose miner account holds a `"`.
     pub injected_miners: u64,
+    /// D3: event-derived candidates taken (capped by `Opts::max_event_candidates`).
+    pub event_candidates: u64,
+    /// D3: the event-derived cap was reached; later event candidates were dropped (logged).
+    pub event_cap_hit: bool,
     /// Records whose cmd or continuation could not be read (logged with block, chain and
     /// request key), over the pass and its resumes. Must be 0; also in Meta for `--status`.
     pub errors: u64,
@@ -387,6 +390,7 @@ struct Walk {
     rules: Rules,
     forks: Forks,
     tokens: HashSet<String>,
+    max_event_candidates: u64,
 }
 
 /// A module whose rows the pass may mark: coin, or a name `/local` can call (B-1).
@@ -412,7 +416,17 @@ fn add(
                     let e = p.tokens.entry(m).or_insert(k.height());
                     *e = (*e).min(k.height());
                 }
-                t.pairs
+                // Security review: a per-pass cap on event-derived candidates.
+                let mut v = t.pairs;
+                for x in t.event_pairs {
+                    if rep.event_candidates >= w.max_event_candidates {
+                        rep.event_cap_hit = true;
+                        break;
+                    }
+                    rep.event_candidates += 1;
+                    v.push(x);
+                }
+                v
             })
         }
     };
@@ -453,29 +467,24 @@ fn tracked_tokens(txn: &impl Txn, dict: &MemDict) -> Result<HashSet<String>> {
     Ok(out)
 }
 
-/// D3 (a): `(account, coin, chain)` for every account an injected early miner account really
-/// credited, on every chain with a tail checkpoint. Returns how many injected names there are.
-fn injected_miners(p: &mut Pending, txn: &impl Txn, dict: &MemDict) -> Result<u64> {
-    let mut chains = Vec::new();
-    for c in 0..kdx_segment::SLOT_WIDTH as u8 {
-        if checkpoint(txn, Stage::Tail, c)?.is_some() {
-            chains.push(c);
-        }
+/// D3 (a): `(account, coin, chain)` for the accounts an injected miner account of a block
+/// below the coinbase injection fix really credited, on that block's chain only.
+fn miner_rows(
+    p: &mut Pending,
+    br: &kdx_types::record::BlockRecord,
+    chain: u8,
+    dict: &MemDict,
+    rep: &mut ReceiversReport,
+) {
+    let Some(name) = dict.name(DictKind::Account, br.miner_account) else {
+        return;
+    };
+    let v = injected_miner_receivers(name);
+    if !v.is_empty() {
+        rep.injected_miners += 1;
+        p.rows
+            .extend(v.into_iter().map(|a| (a, "coin".to_owned(), chain)));
     }
-    let mut n = 0;
-    for name in dict.names(DictKind::Account) {
-        let v = injected_miner_receivers(name);
-        if v.is_empty() {
-            continue;
-        }
-        n += 1;
-        for a in v {
-            for &c in &chains {
-                p.rows.insert((a.clone(), "coin".to_owned(), c));
-            }
-        }
-    }
-    Ok(n)
 }
 
 /// Resume cursor: start height ‖ next frozen TxNum ‖ frozen-walk errors so far.
@@ -508,7 +517,12 @@ pub struct Opts {
     pub dry_run: bool,
     /// D1 (default) or D3.
     pub rules: Rules,
+    /// D3: event-derived candidates per pass (security review cap).
+    pub max_event_candidates: u64,
 }
+
+/// Default per-pass cap on D3 event-derived candidates.
+pub const MAX_EVENT_CANDIDATES: u64 = 5_000_000;
 
 impl Default for Opts {
     fn default() -> Opts {
@@ -517,6 +531,7 @@ impl Default for Opts {
             chunk: TX_CHUNK,
             dry_run: false,
             rules: Rules::D1,
+            max_event_candidates: MAX_EVENT_CANDIDATES,
         }
     }
 }
@@ -577,10 +592,9 @@ pub fn run(
             Rules::D1 => HashSet::new(),
             Rules::D3 => tracked_tokens(&hot.ro()?, &snap)?,
         },
+        max_event_candidates: o.max_event_candidates,
     };
-    if o.rules == Rules::D3 {
-        rep.injected_miners = injected_miners(&mut p, &hot.ro()?, &snap)?;
-    }
+    let miners = |key: TxKey| o.rules == Rules::D3 && key.height() < o.forks.coinbase_fix;
     let ck = (coin, cursor_key);
 
     // Hot pass: TailTxs at heights [from, to), key order.
@@ -602,6 +616,13 @@ pub fn run(
         for (k, v) in &rows {
             let key = TxKey::from_be_bytes(k[..8].try_into().context("TailTxs key")?);
             if key.is_coinbase() {
+                if miners(key) {
+                    let bk = kdx_hot::tables::block_key(key.chain(), key.height());
+                    if let Some(v) = hot.ro()?.get(Table::Headers, &bk)? {
+                        let br = kdx_types::record::decode_block(&v)?;
+                        miner_rows(&mut p, &br, key.chain(), &snap, &mut rep);
+                    }
+                }
                 continue;
             }
             match decode_tx(v) {
@@ -645,7 +666,11 @@ pub fn run(
     let mut n = 0usize;
     for t in start..end {
         if let Some(key) = segs.txkey(t) {
-            if !key.is_coinbase() && (from..to).contains(&key.height()) {
+            if key.is_coinbase() && miners(key) && (from..to).contains(&key.height()) {
+                if let Some(br) = segs.block(key.chain(), key.height())? {
+                    miner_rows(&mut p, &br, key.chain(), &snap, &mut rep);
+                }
+            } else if !key.is_coinbase() && (from..to).contains(&key.height()) {
                 match segs.tx(t)? {
                     Some(r) => {
                         add(&mut p, key, &r, &snap, &w, &mut rep);
@@ -688,6 +713,12 @@ pub fn run(
     }
     p.flush(hot, dict, ck, None, &mut rep)?;
     rep.secs = t0.elapsed().as_secs_f64();
+    if rep.event_cap_hit {
+        tracing::warn!(
+            cap = o.max_event_candidates,
+            "balances: D3 event-derived candidates reached the per-pass cap; the rest were dropped"
+        );
+    }
     if rep.errors > 0 {
         tracing::error!(
             errors = rep.errors,

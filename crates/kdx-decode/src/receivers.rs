@@ -36,12 +36,16 @@ pub struct Forks {
     /// Coin v3 fork: from here on every coin credit emits a TRANSFER naming the receiver,
     /// cross-chain finishes included.
     pub coin_v3: u32,
+    /// Coinbase injection fix (chainweb `vuln797Fix`): below it the coinbase code was built by
+    /// interpolating the miner account, so an account holding a `"` ran as code (D3 a).
+    pub coinbase_fix: u32,
 }
 
 /// Mainnet01 fork heights.
 pub const MAINNET01: Forks = Forks {
     events: 1_138_000,
     coin_v3: 1_722_500,
+    coinbase_fix: 121_452,
 };
 
 /// The fork heights of `network`, or `None` when this build does not know them.
@@ -230,14 +234,45 @@ pub fn injected_miner_receivers(miner: &str) -> Vec<String> {
 /// to be fungible (`discovered`, for token discovery).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TokenReceivers {
+    /// From the cross-chain and `exec` rules.
     pub pairs: Vec<(String, String)>,
+    /// From events (rule 3), at most [`MAX_EVENT_PAIRS_PER_TX`]; never coin.
+    pub event_pairs: Vec<(String, String)>,
     pub discovered: Vec<String>,
+}
+
+/// Event-derived candidates kept per tx (security review: chain data must not amplify the
+/// pass). Real credits name a handful of accounts per tx.
+pub const MAX_EVENT_PAIRS_PER_TX: usize = 64;
+
+/// Whether an event of `emitter` may name rows of `referenced` through a module reference: the
+/// module itself, a tracked token, or a module of the same governed namespace (only the
+/// namespace owner deploys there; `free` and `user` are open to anyone and do not count).
+fn may_reference(emitter: &str, referenced: &str, is_token: &dyn Fn(&str) -> bool) -> bool {
+    let ns = |m: &str| m.split_once('.').map(|(n, _)| n.to_owned());
+    emitter == referenced
+        || is_token(emitter)
+        || matches!((ns(emitter), ns(referenced)),
+            (Some(a), Some(b)) if a == b && a != "free" && a != "user")
 }
 
 impl TokenReceivers {
     fn push(&mut self, account: &str, module: &str) {
         if account_like(account) && !self.pairs.iter().any(|(a, m)| a == account && m == module) {
             self.pairs.push((account.to_owned(), module.to_owned()));
+        }
+    }
+    fn push_event(&mut self, account: &str, module: &str) {
+        if module != "coin"
+            && account_like(account)
+            && self.event_pairs.len() < MAX_EVENT_PAIRS_PER_TX
+            && !self
+                .event_pairs
+                .iter()
+                .any(|(a, m)| a == account && m == module)
+        {
+            self.event_pairs
+                .push((account.to_owned(), module.to_owned()));
         }
     }
     fn discover(&mut self, module: &str) {
@@ -256,14 +291,17 @@ const XCHAIN_SUFFIX: &str = ".transfer-crosschain";
 /// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain`, any height): step 1
 ///    credits `args[1]` and step 0 debits `args[0]`. Tokens emit no TRANSFER for either
 ///    (only `pact.X_YIELD` / `X_RESUME`); coin did not before coin v3. `<m>` is discovered.
-/// 2. **`exec` below the events fork**: the D1 strings (`exec.data` values, `exec.code`
-///    literals) plus every string of `result.data` (a receiver built at run time and
-///    returned, D3 b), for coin and for every token `<m>` the code calls (`<m>.fn`).
-/// 3. **Events** (any height): an event of a token (not coin) that is not a well-formed
-///    TRANSFER (`WRAP`, `UNWRAP`, `MINT`, …) gives its [`account_like`] params for that token;
-///    an event whose params hold a `fungible-v2` module reference gives them for the
-///    referenced module, which is discovered (D3 d: `kaddex.skdx` is only ever minted that
-///    way). Strings inside a module reference are not accounts.
+/// 2. **`exec`**: the D1 strings (`exec.data` values, `exec.code` literals) plus every string
+///    of `result.data` (a receiver built at run time and returned, D3 b), for every tracked
+///    token `<m>` the code calls (`<m>.fn`; some token credits emit no event of the token at
+///    all), and for coin below the events fork.
+/// 3. **Events** (any height, into `event_pairs`, capped at [`MAX_EVENT_PAIRS_PER_TX`], never
+///    coin): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
+///    …) gives its [`account_like`] params for that token; an event whose params hold a
+///    `fungible-v2` module reference gives them for the referenced module, which is
+///    discovered (D3 d: `kaddex.skdx` is only ever minted that way, by `kaddex.alchemist`),
+///    when the emitter may name it ([`may_reference`]). Strings inside a module reference
+///    are not accounts.
 ///
 /// Over-inclusion costs one `/local` read per extra row (answered absent, stored, never
 /// served); a missing candidate leaves a funded row missing.
@@ -292,12 +330,16 @@ pub fn token_receivers(
             }
         }
     }
-    if let (Some(c), false, true) = (cmd, is_cont, height < forks.events) {
+    if let (Some(c), false) = (cmd, is_cont) {
         let code = c
             .pointer("/payload/exec/code")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let mut modules = vec!["coin".to_owned()];
+        // Coin only below the events fork (from there on every exec coin credit has an event).
+        let mut modules = Vec::new();
+        if height < forks.events {
+            modules.push("coin".to_owned());
+        }
         for m in called_modules(code) {
             if is_token(&m) && !modules.contains(&m) {
                 modules.push(m);
@@ -328,7 +370,10 @@ pub fn token_receivers(
         };
         let mut targets: Vec<String> = Vec::new();
         modrefs(ev.params, &mut |m| {
-            if !targets.iter().any(|t| t == m) {
+            if m != "coin"
+                && may_reference(&ev.module, m, is_token)
+                && !targets.iter().any(|t| t == m)
+            {
                 targets.push(m.to_owned());
             }
         });
@@ -347,7 +392,7 @@ pub fn token_receivers(
         param_strings(ev.params, &mut strings);
         for m in &targets {
             for s in &strings {
-                r.push(s, m);
+                r.push_event(s, m);
             }
         }
     }
