@@ -152,14 +152,19 @@ fn receivers(
 }
 
 fn status(hs: &HotStore) -> anyhow::Result<()> {
-    let txn = hs.ro()?;
-    let dirty = kdx_hot::balances::dirty_count(&txn)?;
-    let stats: Value = txn
-        .meta(kdx_ingest::reconcile::META_STATS)?
-        .and_then(|v| serde_json::from_slice(&v).ok())
-        .unwrap_or(Value::Null);
+    // F-46: no read txn spans the Balances scan (it pins MDBX pages while `run` writes).
+    // The first short txn reads the progress counters, the scan pages in its own short txns,
+    // and a second short txn reads the rest.
+    let (dirty, stats, rows) = {
+        let txn = hs.ro()?;
+        let dirty = kdx_hot::balances::dirty_count(&txn)?;
+        let stats: Value = txn
+            .meta(kdx_ingest::reconcile::META_STATS)?
+            .and_then(|v| serde_json::from_slice(&v).ok())
+            .unwrap_or(Value::Null);
+        (dirty, stats, txn.count(Table::Balances)?)
+    };
     let rate = stats.get("rate").and_then(Value::as_f64).unwrap_or(0.0);
-    let rows = txn.count(Table::Balances)?;
     let mut absent = 0u64;
     let mut after: Option<Vec<u8>> = None;
     loop {
@@ -176,6 +181,7 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
             _ => break,
         }
     }
+    let txn = hs.ro()?;
     let seeded = txn
         .meta(meta::BALANCES_SEEDED)?
         .and_then(|v| v.try_into().ok().map(u32::from_be_bytes));
