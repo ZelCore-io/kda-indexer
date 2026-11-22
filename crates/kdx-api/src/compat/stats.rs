@@ -283,6 +283,14 @@ pub fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
     Ok(Some((c.n, coins)))
 }
 
+/// When a `/stats` request stops waiting for the first count: a margin (250 ms, or a
+/// tenth of a short deadline) before the request guard's own timeout of the same length,
+/// so the answer is this handler's 503 with `Retry-After`, not the guard's 504 (F-22).
+fn wait_until(start: Instant, deadline: Duration) -> Instant {
+    let margin = Duration::from_millis(250).min(deadline / 10);
+    start + deadline - margin
+}
+
 /// Transaction count and circulating supply
 ///
 /// chainweb-data `statsHandler`: `{"transactionCount": N, "coinsInCirculation": X}`, the
@@ -306,7 +314,7 @@ pub fn stats(view: &View) -> ApiResult<Option<(u64, Option<f64>)>> {
     )
 )]
 pub async fn handler(State(st): State<Arc<ApiState>>) -> Response {
-    let until = Instant::now() + st.settings.deadline;
+    let until = wait_until(Instant::now(), st.settings.deadline);
     let cache = st.stats_cache;
     let coins = match st.read(supply).await {
         Ok(Some(coins)) => coins,
@@ -656,6 +664,42 @@ mod tests {
         assert!(took < Duration::from_millis(1200), "{took:?}");
     }
 
+    /// F-22: behind the request guard (whose timeout is the same deadline) the not-ready
+    /// answer is still the handler's 503 with `Retry-After`, not the guard's 504.
+    #[tokio::test]
+    async fn startup_503_is_not_overtaken_by_the_guard() {
+        let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(slow_count)));
+        let (_d, store) = seeded_store();
+        let st = crate::Api::new(store, test_settings(), crate::TipWatch::default())
+            .with_stats_cache(cache)
+            .state();
+        let search = crate::search::SearchCtx::new(super::super::SearchSettings::default(), None);
+        let app = super::super::router(search)
+            .layer(axum::middleware::from_fn_with_state(
+                st.clone(),
+                crate::server::guard,
+            ))
+            .with_state(st.clone());
+        let (r, _) = get(&app).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    /// F-22: the wait ends a margin before the guard's deadline: 250 ms, or a tenth of a
+    /// short deadline.
+    #[test]
+    fn the_wait_ends_before_the_deadline() {
+        let t = Instant::now();
+        assert_eq!(
+            wait_until(t, Duration::from_secs(10)),
+            t + Duration::from_millis(9_750)
+        );
+        assert_eq!(
+            wait_until(t, Duration::from_millis(300)),
+            t + Duration::from_millis(270)
+        );
+    }
+
     /// A counter that honours the deadline like the real one and needs 300 ms.
     fn long_count(v: &View, _: &CancellationToken) -> ApiResult<u64> {
         let t = Instant::now();
@@ -790,7 +834,7 @@ mod tests {
     }
 
     /// M-3b, M-6: `Api::serve` starts the refresh task (so `/stats` reaches 200) and the
-    /// compat CORS layer exposes `x-count-age`.
+    /// compat CORS layer exposes `x-count-age` (and, F-48, the next and truncation headers).
     #[tokio::test]
     async fn serve_starts_the_refresh_and_exposes_the_age() {
         let cache: &'static CountCache = Box::leak(Box::new(CountCache::with_counter(counted)));
@@ -833,6 +877,12 @@ mod tests {
             .find(|l| l.starts_with("access-control-expose-headers:"))
             .unwrap_or_default();
         assert!(expose.contains("x-count-age"), "{out}");
+        // F-48: a browser also needs to see that a search was cut short.
+        assert!(
+            expose.contains(super::super::SEARCH_TRUNCATED.as_str()),
+            "{out}"
+        );
+        assert!(expose.contains("chainweb-next"), "{out}");
         stop.cancel();
         task.await.unwrap().unwrap();
     }

@@ -21,7 +21,7 @@ use kdx_decode::index::xfer_entity;
 use kdx_decode::Family;
 use kdx_types::TxKey;
 
-use crate::compat::account::Src;
+use crate::compat::account::{KeepBudget, Src};
 use crate::compat::schemas::{TxDetail, V1TxsLimitErrors};
 use crate::compat::shapes::{self, write_aeson};
 use crate::compat::{collect_page, json_bytes, text, Candidates, Paging};
@@ -252,6 +252,7 @@ fn token_rows(
     account: &str,
     token: &str,
     limit: usize,
+    budget: &mut KeepBudget,
 ) -> ApiResult<Vec<crate::compat::account::KeyRow>> {
     let d = view.dict();
     let (Some(a), Some(m)) = (d.account_id(account), d.module_id(token)) else {
@@ -263,7 +264,7 @@ fn token_rows(
     let head: Vec<ApiResult<TxKey>> = it.by_ref().take(limit).collect();
     let _ = view.prefetch(head.iter().filter_map(|k| k.as_ref().ok().copied()));
     let it: Box<dyn Iterator<Item = ApiResult<TxKey>> + '_> = Box::new(head.into_iter().chain(it));
-    let mut src = Src::keys_only(account, token);
+    let mut src = Src::keys_only(account, token, *budget);
     let pg = Paging {
         limit,
         offset: 0,
@@ -273,7 +274,9 @@ fn token_rows(
         empty: false,
     };
     collect_page(view, Candidates::Keys(it.peekable()), &mut src, &pg, None)?;
-    Ok(src.take_keys())
+    let (rows, left) = src.take_keys();
+    *budget = left;
+    Ok(rows)
 }
 
 /// The JSON array of entries, as bytes; `cap` bounds the body.
@@ -284,9 +287,11 @@ fn entries(
     limit: usize,
     cap: usize,
 ) -> ApiResult<Vec<u8>> {
-    let mut keys = token_rows(view, account, namespace, limit)?;
+    // The kept records share one budget of the body cap (F-21).
+    let mut budget = KeepBudget::new(cap);
+    let mut keys = token_rows(view, account, namespace, limit, &mut budget)?;
     if namespace != "coin" {
-        keys.extend(token_rows(view, account, "coin", limit)?);
+        keys.extend(token_rows(view, account, "coin", limit, &mut budget)?);
     }
     // Cold pages: ask for every frozen row this page decodes before the first decode
     // (advisory: a damaged file fails on the decode below).

@@ -78,6 +78,8 @@ pub struct Store {
     seg_id: Mutex<Option<ManifestId>>,
     dict: ArcSwap<DictSnap>,
     dict_reloading: AtomicBool,
+    /// When the last dictionary reload failed (retried after `DICT_RELOAD_RETRY`).
+    dict_reload_failed: std::sync::Mutex<Option<Instant>>,
     /// Network and genesis heights from `Meta` (empty until ingest writes the chain graph).
     genesis: ArcSwap<Genesis>,
     /// `[graphql] sender_index` (FIX-2): serve sender lists from the `sndr` postings when
@@ -170,6 +172,7 @@ impl Store {
                 at: Instant::now(),
             }),
             dict_reloading: AtomicBool::new(false),
+            dict_reload_failed: std::sync::Mutex::new(None),
             genesis: ArcSwap::from_pointee(genesis),
             sender_index: AtomicBool::new(true),
         };
@@ -301,12 +304,23 @@ impl Store {
         let due = ahead
             || behind >= DICT_RELOAD_NAMES
             || (behind > 0 && snap.at.elapsed() >= DICT_RELOAD_AGE);
-        if !due || self.dict_reloading.swap(true, Ordering::AcqRel) {
+        if !due {
+            return;
+        }
+        let failed_at = *self
+            .dict_reload_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if reload_paused(failed_at, Instant::now())
+            || self.dict_reloading.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let me = self.clone();
         let base = (!ahead).then(|| snap.mem.clone());
         std::thread::spawn(move || {
+            // Cleared however the worker ends, a panic included (F-49).
+            let _running = crate::ClearOnDrop(&me.dict_reloading);
             let t = Instant::now();
             match load_names(&me.hot, base.as_deref()) {
                 Ok(m) => {
@@ -319,11 +333,23 @@ impl Store {
                         at: Instant::now(),
                     }));
                 }
-                Err(e) => tracing::warn!(error = %e, "api: dictionary reload failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "api: dictionary reload failed");
+                    *me.dict_reload_failed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                }
             }
-            me.dict_reloading.store(false, Ordering::Release);
         });
     }
+}
+
+/// Pause before a failed dictionary reload is tried again.
+const DICT_RELOAD_RETRY: Duration = Duration::from_secs(5);
+
+/// True while a reload that failed at `failed_at` is still in its pause.
+fn reload_paused(failed_at: Option<Instant>, now: Instant) -> bool {
+    failed_at.is_some_and(|t| now.saturating_duration_since(t) < DICT_RELOAD_RETRY)
 }
 
 /// Every name in `DictRev`, read in chunks of short txns, appended to a copy of `base`
@@ -471,6 +497,11 @@ impl View {
     /// lists each copy on `/txs/txs`), so their other copies come from the genesis blocks.
     pub fn txs_by_rk(&self, rk: &Hash32) -> ApiResult<Vec<(TxKey, TxRecord)>> {
         let mut out: Vec<(TxKey, TxRecord)> = self.tx_by_rk(rk)?.into_iter().collect();
+        // Copies exist only of a genesis tx, and the index holds one of its locations: any
+        // other lookup skips the genesis scan (F-24: uncached while genesis is incomplete).
+        if !out.iter().any(|(k, _)| self.genesis.is_genesis(*k)) {
+            return Ok(out);
+        }
         for k in self.genesis_copies(rk)? {
             if out.iter().any(|(x, _)| *x == k) {
                 continue;
@@ -491,6 +522,7 @@ impl View {
         let mut all: HashMap<Hash32, Vec<TxKey>> = HashMap::new();
         let mut complete = true;
         for (c, h) in self.genesis.chains() {
+            self.check_deadline()?;
             if self.block_hash(c, h)?.is_none() {
                 complete = false;
                 continue;
@@ -1220,6 +1252,34 @@ mod genesis_rk_tests {
         // Cached after the first complete scan.
         assert!(view.genesis.shared_rks.get().is_some());
     }
+
+    /// F-24: while the genesis blocks are incomplete, a lookup of a non-genesis tx does not
+    /// scan them, and a genesis lookup's scan honours the deadline.
+    #[test]
+    fn incomplete_genesis_is_scanned_only_for_genesis_txs() {
+        let (_d, store) = crate::testutil::store();
+        let hot = store.hot_for_tests();
+        let mut w = hot.rw().unwrap();
+        w.set_meta(kdx_hot::env::meta::NETWORK, b"testnet").unwrap();
+        w.set_meta(kdx_hot::env::meta::CHAIN_GRAPH, b"[[0,[0,1]],[5,[0,1,2]]]")
+            .unwrap();
+        let mut dict = HotDict::load(&w).unwrap();
+        // Chain 2's genesis block (height 5) is not stored yet.
+        for b in [block(0, 0, &[1]), block(1, 0, &[2, 1]), block(0, 6, &[3])] {
+            kdx_hot::tail::apply(&mut w, &b, &mut dict).unwrap();
+        }
+        w.commit().unwrap();
+        let late = store.view(Instant::now() - Duration::from_secs(1)).unwrap();
+        let got = late.txs_by_rk(&Hash32([3; 32])).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, TxKey::new(6, 0, 1));
+        assert!(late.txs_by_rk(&Hash32([4; 32])).unwrap().is_empty());
+        assert!(matches!(
+            late.txs_by_rk(&Hash32([1; 32])),
+            Err(crate::ApiError::Deadline)
+        ));
+        assert!(late.genesis.shared_rks.get().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1588,5 +1648,22 @@ mod pact_steps_tests {
         // Hot, and the walk on into the frozen part.
         assert_eq!(walk(plus_one(k(12, 1))), [k(12, 1), k(5, 2), k(5, 1)]);
         assert_eq!(walk(k(12, 1)), [k(5, 2), k(5, 1)]);
+    }
+}
+
+#[cfg(test)]
+mod reload_pause_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{reload_paused, DICT_RELOAD_RETRY};
+
+    /// F-49: a failed dictionary reload is not retried for `DICT_RELOAD_RETRY`.
+    #[test]
+    fn a_failed_reload_pauses_retries() {
+        let now = Instant::now() + Duration::from_secs(60);
+        assert_eq!(DICT_RELOAD_RETRY, Duration::from_secs(5));
+        assert!(!reload_paused(None, now));
+        assert!(reload_paused(Some(now - Duration::from_secs(1)), now));
+        assert!(!reload_paused(Some(now - DICT_RELOAD_RETRY), now));
     }
 }
