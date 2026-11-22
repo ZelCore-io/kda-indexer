@@ -407,7 +407,22 @@ pub fn token_receivers(
         if height < forks.events {
             modules.push("coin".to_owned());
         }
+        // From the events fork on, a token whose own events appear in the tx already has its
+        // accounts named there (TRANSFER marks them; rule 3 the rest): only a token call that
+        // emitted nothing of the token at all needs the exec strings (dry run on KDA-03: without
+        // this, millions of extra reads).
+        let emitted: Vec<String> = output
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(crate::build::parse_event)
+            .map(|e| e.module)
+            .collect();
         for m in called_modules(code) {
+            if height >= forks.events && emitted.contains(&m) {
+                continue;
+            }
             if is_token(&m) && !modules.contains(&m) {
                 modules.push(m);
             }

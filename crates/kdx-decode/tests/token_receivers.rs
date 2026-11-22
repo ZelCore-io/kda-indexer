@@ -329,7 +329,7 @@ fn a_hostile_exec_stays_within_the_cap_and_failed_txs_give_nothing() {
 fn many_exec_strings_do_not_starve_the_events_of_the_tx() {
     let mut code = String::new();
     for i in 0..500 {
-        code.push_str(&format!(r#"(kaddex.kdx.f "k:noise-{i:04}") "#));
+        code.push_str(&format!(r#"(free.wiza.f "k:noise-{i:04}") "#));
     }
     let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}});
     let evs = json!([ev("kaddex.kdx", "UNWRAP", json!(["kdx-staking", ACC, 2.0]))]);
@@ -346,4 +346,20 @@ fn many_exec_strings_do_not_starve_the_events_of_the_tx() {
         r.event_pairs
     );
     assert_eq!(r.exec_pairs.len(), MAX_EXEC_PAIRS_PER_TX);
+}
+
+#[test]
+fn a_post_fork_exec_counts_only_for_tokens_that_emitted_nothing() {
+    // The token's own events already name (and mark) its accounts: no exec rows for it.
+    let cmd = json!({"payload": {"exec": {"data": {},
+        "code": format!(r#"(free.anedak.transfer "{SRC}" "{ACC}" 1.0)"#)}}});
+    let evs = json!([ev("free.anedak", "TRANSFER", json!([SRC, ACC, 1.0]))]);
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!("ok"), evs, Value::Null),
+        4_000_000,
+        MAINNET01,
+        &tokens,
+    );
+    assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
 }
