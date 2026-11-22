@@ -814,9 +814,20 @@ Stop the service first: it takes the data dir lock.
 - The swap is crash-safe at every point: before the journal `rebuild.<S>/rebuild.json`
   exists the old files stay; after it, readers use the rebuilt set, and the next writer start
   (`run`, `backfill`, `rebuild-range`) finishes the swap. `segments check` passes in between.
-- Restart `serve` after every `rebuild-range` that swapped (`"swapped": true`). A running
-  `serve` keeps the files and indexes it opened before the swap and opens others lazily, so it
-  can pair an old index with a new file of the swapped range (wrong rows or decode errors).
+- Restart `serve` after every `rebuild-range` that swapped (`"swapped": true`) and after every
+  `segments add-index`. A running `serve` keeps the files and indexes it opened before the
+  swap and opens others lazily, so it can pair an old index with a new file of the swapped
+  range (wrong rows or decode errors). It does not reopen a range by itself, even when the
+  manifest is unchanged. A missed restart shows in the log: once a minute `serve` compares
+  each range's `range.toml` with the one it opened and logs an ERROR
+  `serve: range swapped on disk after serve opened it (rebuild-range or segments add-index);
+  restart serve` with the range, once per range. Alert on it, or restart `serve` as part of
+  every `rebuild-range`. `run` needs no restart: it holds the data dir lock, so neither
+  command can run beside it.
+- A reader that opens a range at the moment its swap renames the files can, rarely, fail the
+  open or read a mix of old and new files of that range. The restart above covers it too: open
+  no new `serve` during a swap, and restart running ones after it. (A per-open side choice and
+  retry would close this; it is not built while the restart rule stands.)
 - `snapshot` and the swap exclude each other through `segments.swap.lock` in the data dir: a
   snapshot waits for a swap in progress, and a swap waits for a snapshot to place its
   segment files.

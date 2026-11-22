@@ -65,6 +65,44 @@ pub fn spawn_textfile(cfg: &Config, stop: CancellationToken) {
     }
 }
 
+/// How often `serve` looks for ranges swapped under it.
+pub const SWAP_WATCH: Duration = Duration::from_secs(60);
+
+/// F-16: `serve` keeps the segment files it opened. After a `rebuild-range` swap or a
+/// `segments add-index` it can pair an old index with a new file, so the operator must
+/// restart it (docs/operations.md). This makes a missed restart visible: once a minute it
+/// stats each range's `range.toml` and logs an error, once per range, for every range in the
+/// on-disk manifest whose file is no longer the one it opened.
+pub fn spawn_swap_watch(store: Arc<Store>, stop: CancellationToken) {
+    tokio::spawn(async move {
+        let mut warned = std::collections::HashSet::new();
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => break,
+                _ = tokio::time::sleep(SWAP_WATCH) => {}
+            }
+            let seg = store.segments();
+            let swapped = seg.swapped_ranges();
+            if swapped.is_empty() {
+                continue;
+            }
+            // A merge deletes its steps' files: those leave the manifest, not a swap.
+            let Ok(Some(m)) = kdx_segment::Manifest::load(&seg.dir) else {
+                continue;
+            };
+            for r in swapped {
+                let listed = m.entries.iter().any(|e| (e.start, e.end) == r);
+                if listed && warned.insert(r) {
+                    tracing::error!(
+                        range = %format!("{}..{}", r.0, r.1),
+                        "serve: range swapped on disk after serve opened it (rebuild-range or segments add-index); restart serve"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Build the API over a store (shared by `serve` and `run`). The search routes read the code
 /// index in `data_dir/search/` and share one search gate (S-5).
 pub fn api(
@@ -108,6 +146,7 @@ pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {
     let tips = TipWatch::default();
     spawn_tip_poll(cfg, tips.clone(), token.clone());
     spawn_textfile(cfg, token.clone());
+    spawn_swap_watch(store.clone(), token.clone());
     crate::alloc::spawn_stats(token.clone());
     // `serve` has no ingest: the watchdog watches the API runtime only.
     super::notify::spawn_watchdog(&[kdx_types::heartbeat::Component::Api]);
