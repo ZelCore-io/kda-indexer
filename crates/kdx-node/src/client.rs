@@ -19,6 +19,12 @@ use crate::types::{Cut, CutEntry, NodeError, NodeInfo, Page, Result, StatRow};
 pub const USER_AGENT: &str = "kda-indexer/0.1";
 const HEADER_ACCEPT: &str = "application/json;blockheader-encoding=object";
 const DEFAULT_BATCH_LIMIT: u32 = 50;
+/// Most pages one paginated header walk follows (F-36).
+const MAX_PAGES: usize = 10_000;
+/// Most headers `header_branch_since` accepts; it has no lower height to derive a bound from.
+const MAX_SINCE_HEADERS: u64 = 1_000_000;
+/// Most bytes of a `header/updates` error body read (F-12).
+const MAX_ERROR_BODY: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct NodeClientConfig {
@@ -40,6 +46,9 @@ pub struct NodeClientConfig {
 
 struct Route {
     base: Url,
+    /// The request timeout; `stream_http` applies it to connecting and to the response
+    /// headers only.
+    timeout: Duration,
     http: reqwest::Client,
     /// Same TLS settings but no overall timeout, for SSE.
     stream_http: reqwest::Client,
@@ -84,6 +93,7 @@ fn build_route(base: Url, timeout: Duration, tls: Option<rustls::ClientConfig>) 
     let ct = timeout.min(Duration::from_secs(10));
     Ok(Route {
         base,
+        timeout,
         http: build_http(Some(timeout), ct, tls.clone())?,
         stream_http: build_http(None, ct, tls)?,
     })
@@ -119,6 +129,22 @@ enum ReadError {
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T> {
     serde_json::from_slice(body)
         .map_err(|e| NodeError::Decode(format!("{e}; body starts: {}", body_prefix(body))))
+}
+
+/// F-10: a payload hash goes into a URL path, so it must be what a hash looks like: 43 chars
+/// of unpadded base64url (32 bytes).
+fn check_payload_hash(h: &str) -> Result<()> {
+    if h.len() == 43
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        Ok(())
+    } else {
+        Err(NodeError::Decode(format!(
+            "invalid payload hash {:?}",
+            body_prefix(h.as_bytes())
+        )))
+    }
 }
 
 fn parse_page(v: Value) -> Result<Page<Value>> {
@@ -221,15 +247,19 @@ impl NodeClient {
         e.1 += secs;
     }
 
-    fn root_url(&self, path: &str) -> Url {
-        self.route.base.join(path).expect("valid path")
+    /// F-10: an error, not a panic, when `path` does not join.
+    fn root_url(&self, path: &str) -> Result<Url> {
+        self.route
+            .base
+            .join(path)
+            .map_err(|e| NodeError::Config(format!("url path {path:?}: {e}")))
     }
 
-    fn net_url(&self, path: &str) -> Url {
+    fn net_url(&self, path: &str) -> Result<Url> {
         self.root_url(&format!("chainweb/0.0/{}/{}", self.shared.network, path))
     }
 
-    fn chain_url(&self, chain: u8, path: &str) -> Url {
+    fn chain_url(&self, chain: u8, path: &str) -> Result<Url> {
         self.net_url(&format!("chain/{chain}/{path}"))
     }
 
@@ -321,7 +351,7 @@ impl NodeClient {
 
     /// `GET /info` (root path, not under the network prefix).
     pub async fn info(&self) -> Result<NodeInfo> {
-        let url = self.root_url("info");
+        let url = self.root_url("info")?;
         let raw = self.json("info", |h| h.get(url.clone())).await?;
         let s = |k: &str| raw.get(k).and_then(Value::as_str).map(str::to_owned);
         let chainweb_version =
@@ -361,7 +391,7 @@ impl NodeClient {
 
     /// `GET /cut`.
     pub async fn cut(&self) -> Result<Cut> {
-        let url = self.net_url("cut");
+        let url = self.net_url("cut")?;
         let v = self.json("cut", |h| h.get(url.clone())).await?;
         let hashes_v = v
             .get("hashes")
@@ -405,7 +435,7 @@ impl NodeClient {
         limit: Option<u32>,
         next: Option<&str>,
     ) -> Result<Page<Value>> {
-        let url = self.chain_url(chain, "header");
+        let url = self.chain_url(chain, "header")?;
         let mut q: Vec<(&str, String)> = vec![
             ("minheight", min.to_string()),
             ("maxheight", max.to_string()),
@@ -430,16 +460,12 @@ impl NodeClient {
     /// those heights, canonical or not. Probe use only; height walks of the chain must use
     /// [`NodeClient::header_branch_all`].
     pub async fn headers_all(&self, chain: u8, min: u64, max: u64) -> Result<Vec<Value>> {
-        let mut out = Vec::new();
-        let mut next: Option<String> = None;
-        loop {
-            let page = self.headers(chain, min, max, None, next.as_deref()).await?;
-            out.extend(page.items);
-            match page.next {
-                Some(n) => next = Some(n),
-                None => return Ok(out),
-            }
-        }
+        // Orphans included: up to two headers per height.
+        let cap = span(min, max).saturating_mul(2);
+        paginate("header", cap, |next| async move {
+            self.headers(chain, min, max, None, next.as_deref()).await
+        })
+        .await
     }
 
     /// `POST /chain/{c}/header/branch` (one page).
@@ -466,23 +492,12 @@ impl NodeClient {
         max: u64,
     ) -> Result<Vec<Value>> {
         let upper = [upper.to_owned()];
-        let mut out = Vec::new();
-        let mut next: Option<String> = None;
-        loop {
-            let page = self
-                .header_branch_page(chain, &[], &upper, Some(min), Some(max), next.as_deref())
-                .await?;
-            out.extend(page.items);
-            match page.next {
-                Some(n) if Some(&n) != next.as_ref() => next = Some(n),
-                Some(_) => {
-                    return Err(NodeError::Decode(
-                        "header/branch: next token did not advance".into(),
-                    ))
-                }
-                None => break,
-            }
-        }
+        let upper = &upper;
+        let mut out = paginate("header/branch", span(min, max), |next| async move {
+            self.header_branch_page(chain, &[], upper, Some(min), Some(max), next.as_deref())
+                .await
+        })
+        .await?;
         out.sort_by_key(|h| h.get("height").and_then(Value::as_u64).unwrap_or(u64::MAX));
         let heights: Vec<Option<u64>> = out
             .iter()
@@ -509,23 +524,12 @@ impl NodeClient {
         max: Option<u64>,
     ) -> Result<Vec<Value>> {
         let upper = [upper.to_owned()];
-        let mut out = Vec::new();
-        let mut next: Option<String> = None;
-        loop {
-            let page = self
-                .header_branch_page(chain, lower, &upper, None, max, next.as_deref())
-                .await?;
-            out.extend(page.items);
-            match page.next {
-                Some(n) if Some(&n) != next.as_ref() => next = Some(n),
-                Some(_) => {
-                    return Err(NodeError::Decode(
-                        "header/branch: next token did not advance".into(),
-                    ))
-                }
-                None => break,
-            }
-        }
+        let upper = &upper;
+        let mut out = paginate("header/branch", MAX_SINCE_HEADERS, |next| async move {
+            self.header_branch_page(chain, lower, upper, None, max, next.as_deref())
+                .await
+        })
+        .await?;
         out.sort_by_key(|h| h.get("height").and_then(Value::as_u64).unwrap_or(u64::MAX));
         Ok(out)
     }
@@ -539,7 +543,7 @@ impl NodeClient {
         max: Option<u64>,
         next: Option<&str>,
     ) -> Result<Page<Value>> {
-        let url = self.chain_url(chain, "header/branch");
+        let url = self.chain_url(chain, "header/branch")?;
         let mut q: Vec<(&str, String)> = Vec::new();
         if let Some(m) = min {
             q.push(("minheight", m.to_string()));
@@ -565,7 +569,7 @@ impl NodeClient {
     /// One raw `payload/outputs/batch` call (no dedupe, no chunking). Entries can be
     /// fewer than requested; callers map by `payloadHash`.
     pub async fn payload_batch_raw(&self, chain: u8, hashes: &[String]) -> Result<Vec<Value>> {
-        let url = self.chain_url(chain, "payload/outputs/batch");
+        let url = self.chain_url(chain, "payload/outputs/batch")?;
         let v = self
             .json("payload_batch", |h| h.post(url.clone()).json(&hashes))
             .await?;
@@ -577,7 +581,8 @@ impl NodeClient {
 
     /// `GET /chain/{c}/payload/{hash}/outputs`.
     pub async fn payload_with_outputs(&self, chain: u8, hash: &str) -> Result<Value> {
-        let url = self.chain_url(chain, &format!("payload/{hash}/outputs"));
+        check_payload_hash(hash)?;
+        let url = self.chain_url(chain, &format!("payload/{hash}/outputs"))?;
         self.json("payload", |h| h.get(url.clone())).await
     }
 
@@ -588,6 +593,9 @@ impl NodeClient {
         chain: u8,
         hashes: &[String],
     ) -> Result<HashMap<String, Value>> {
+        for h in hashes {
+            check_payload_hash(h)?;
+        }
         let mut seen = HashSet::new();
         let uniq: Vec<String> = hashes
             .iter()
@@ -618,7 +626,7 @@ impl NodeClient {
 
     /// `GET /chain/{c}/block?minheight&maxheight` (header and payload in one call). `None` on 404.
     pub async fn block(&self, chain: u8, min: u64, max: u64) -> Result<Option<Page<Value>>> {
-        let url = self.chain_url(chain, "block");
+        let url = self.chain_url(chain, "block")?;
         let q = [
             ("minheight", min.to_string()),
             ("maxheight", max.to_string()),
@@ -644,7 +652,7 @@ impl NodeClient {
 
     /// `POST /chain/{c}/pact/api/v1/poll`.
     pub async fn poll(&self, chain: u8, request_keys: &[String]) -> Result<Map<String, Value>> {
-        let url = self.chain_url(chain, "pact/api/v1/poll");
+        let url = self.chain_url(chain, "pact/api/v1/poll")?;
         let body = json!({ "requestKeys": request_keys });
         match self
             .json("poll", |h| h.post(url.clone()).json(&body))
@@ -657,7 +665,7 @@ impl NodeClient {
 
     /// `POST /chain/{c}/pact/api/v1/local` with `cmd` passed through unchanged.
     pub async fn local(&self, chain: u8, cmd: &Value) -> Result<Value> {
-        let url = self.chain_url(chain, "pact/api/v1/local");
+        let url = self.chain_url(chain, "pact/api/v1/local")?;
         self.json("local", |h| h.post(url.clone()).json(cmd)).await
     }
 
@@ -666,7 +674,7 @@ impl NodeClient {
     pub async fn header_updates(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Value>> + Send>>> {
-        let url = self.net_url("header/updates");
+        let url = self.net_url("header/updates")?;
         let _p = self
             .shared
             .sem
@@ -675,24 +683,38 @@ impl NodeClient {
             .map_err(|_| NodeError::Transport("semaphore closed".into()))?;
         self.shared.limiter.acquire().await;
         let t0 = Instant::now();
-        let resp = self
+        // F-12: the stream client has no overall timeout; connecting and the response
+        // headers get the request timeout.
+        let send = self
             .route
             .stream_http
             .get(url)
             .header("Accept", "text/event-stream")
-            .send()
-            .await
-            .map_err(|e| {
+            .send();
+        let resp = match tokio::time::timeout(self.route.timeout, send).await {
+            Ok(r) => r.map_err(|e| {
                 if e.is_timeout() {
                     NodeError::Timeout
                 } else {
                     NodeError::Transport(e.to_string())
                 }
-            })?;
+            })?,
+            Err(_) => {
+                self.record("header_updates", 0, t0.elapsed().as_secs_f64());
+                return Err(NodeError::Timeout);
+            }
+        };
         let status = resp.status().as_u16();
         self.record("header_updates", status, t0.elapsed().as_secs_f64());
         if !resp.status().is_success() {
-            let b = resp.bytes().await.unwrap_or_default();
+            // Capped and timed: the semaphore permit is still held.
+            let b =
+                match tokio::time::timeout(self.route.timeout, read_capped(resp, MAX_ERROR_BODY))
+                    .await
+                {
+                    Ok(Ok(b)) => b,
+                    _ => Bytes::new(),
+                };
             return Err(NodeError::Http {
                 status,
                 body_prefix: body_prefix(&b),
@@ -702,5 +724,227 @@ impl NodeClient {
             Box::pin(resp.bytes_stream()),
             self.shared.max_sse_event_bytes,
         ))
+    }
+}
+
+/// Heights in `min..=max`.
+fn span(min: u64, max: u64) -> u64 {
+    max.saturating_sub(min).saturating_add(1)
+}
+
+/// Follow `next` tokens (F-36): at most [`MAX_PAGES`] pages and `max_items` items; a repeated
+/// token or an empty page that still has a `next` token is an error.
+async fn paginate<F, Fut>(what: &str, max_items: u64, mut page: F) -> Result<Vec<Value>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Page<Value>>>,
+{
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut next: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let p = page(next.take()).await?;
+        let empty = p.items.is_empty();
+        out.extend(p.items);
+        if out.len() as u64 > max_items {
+            return Err(NodeError::Decode(format!(
+                "{what}: more than {max_items} headers"
+            )));
+        }
+        let Some(n) = p.next else {
+            return Ok(out);
+        };
+        if empty {
+            return Err(NodeError::Decode(format!(
+                "{what}: empty page with a next token"
+            )));
+        }
+        if !seen.insert(n.clone()) {
+            return Err(NodeError::Decode(format!("{what}: next token repeats")));
+        }
+        next = Some(n);
+    }
+    Err(NodeError::Decode(format!(
+        "{what}: more than {MAX_PAGES} pages"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicUsize;
+
+    /// What the mock node does with one request.
+    enum Reply {
+        Json(String),
+        /// Raw bytes, then the connection stays open and silent.
+        RawThenHang(Vec<u8>),
+        /// Read the request, never answer.
+        Hang,
+    }
+
+    /// One-request-per-connection HTTP mock; `f` gets the request line's target
+    /// (path and query) and the request count so far.
+    fn mock(f: impl Fn(&str, usize) -> Reply + Send + Sync + 'static) -> (Url, Arc<AtomicUsize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let n = Arc::new(AtomicUsize::new(0));
+        let (f, n2) = (Arc::new(f), n.clone());
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let (f, n) = (f.clone(), n2.clone());
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head = loop {
+                        let k = s.read(&mut tmp).unwrap_or(0);
+                        if k == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..k]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break String::from_utf8_lossy(&buf[..i]).into_owned();
+                        }
+                    };
+                    let target = head.split(' ').nth(1).unwrap_or("").to_owned();
+                    let i = n.fetch_add(1, Ordering::SeqCst);
+                    match f(&target, i) {
+                        Reply::Json(b) => {
+                            let _ = write!(
+                                s,
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                                b.len()
+                            );
+                        }
+                        Reply::RawThenHang(b) => {
+                            let _ = s.write_all(&b);
+                            std::thread::sleep(Duration::from_secs(30));
+                        }
+                        Reply::Hang => std::thread::sleep(Duration::from_secs(30)),
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/").parse().unwrap(), n)
+    }
+
+    fn client(base: Url) -> NodeClient {
+        NodeClient::new(&NodeClientConfig {
+            base,
+            network: "mainnet01".into(),
+            timeout: Duration::from_millis(300),
+            max_rps: 0,
+            concurrency: 4,
+            p2p_url: None,
+            p2p_cert_sha256: None,
+            max_body_bytes: 1 << 20,
+            max_sse_event_bytes: 1 << 16,
+        })
+        .unwrap()
+    }
+
+    fn hdr(height: u64) -> Value {
+        json!({ "height": height, "hash": format!("h{height}") })
+    }
+
+    fn page(items: Vec<Value>, next: Option<&str>) -> Reply {
+        Reply::Json(json!({ "items": items, "limit": items.len(), "next": next }).to_string())
+    }
+
+    async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), f)
+            .await
+            .expect("call did not finish in 10 s")
+    }
+
+    /// F-36: an A→B→A token cycle ends with a decode error in all three walkers.
+    #[tokio::test]
+    async fn pagination_token_cycle_is_an_error() {
+        let (base, _) = mock(|_, i| {
+            let tok = if i % 2 == 0 { "A" } else { "B" };
+            page(vec![hdr(i as u64 % 3)], Some(tok))
+        });
+        let c = client(base);
+        assert!(matches!(
+            within(c.headers_all(0, 0, 1_000)).await,
+            Err(NodeError::Decode(_))
+        ));
+        assert!(matches!(
+            within(c.header_branch_all(0, "u", 0, 1_000)).await,
+            Err(NodeError::Decode(_))
+        ));
+        assert!(matches!(
+            within(c.header_branch_since(0, &[], "u", None)).await,
+            Err(NodeError::Decode(_))
+        ));
+    }
+
+    /// F-36: an endless stream of distinct tokens stops at the item bound of the range, and
+    /// an empty page that still has a `next` token is an error.
+    #[tokio::test]
+    async fn pagination_is_bounded() {
+        let (base, n) = mock(|_, i| page(vec![hdr(i as u64)], Some(&format!("t{i}"))));
+        let c = client(base);
+        assert!(matches!(
+            within(c.headers_all(0, 0, 9)).await,
+            Err(NodeError::Decode(_))
+        ));
+        // The plain header range includes orphans: the bound is 2 × the heights asked for.
+        assert!(n.load(Ordering::SeqCst) <= 22, "{n:?} requests");
+        let (base, _) = mock(|_, i| page(Vec::new(), Some(&format!("t{i}"))));
+        let c = client(base);
+        assert!(matches!(
+            within(c.header_branch_since(0, &[], "u", None)).await,
+            Err(NodeError::Decode(_))
+        ));
+    }
+
+    /// F-10: a payload hash that is not 32 bytes of unpadded base64url never reaches a URL.
+    #[tokio::test]
+    async fn payload_hash_is_checked_before_the_url() {
+        let (base, n) = mock(|_, _| Reply::Json("{}".into()));
+        let c = client(base);
+        for bad in ["../../info", "a?b", "x", &"A".repeat(44)] {
+            assert!(
+                matches!(
+                    within(c.payload_with_outputs(0, bad)).await,
+                    Err(NodeError::Decode(_))
+                ),
+                "{bad}"
+            );
+            assert!(within(c.payloads_with_outputs(0, &[bad.to_string()]))
+                .await
+                .is_err());
+        }
+        assert_eq!(n.load(Ordering::SeqCst), 0, "no request may be sent");
+    }
+
+    /// F-12: a node that accepts the SSE connection but sends no headers times out.
+    #[tokio::test]
+    async fn header_updates_connect_times_out() {
+        let (base, _) = mock(|_, _| Reply::Hang);
+        let c = client(base);
+        assert!(matches!(
+            within(c.header_updates()).await,
+            Err(NodeError::Timeout)
+        ));
+    }
+
+    /// F-12: an error answer's body is read capped and under the timeout.
+    #[tokio::test]
+    async fn header_updates_error_body_is_capped() {
+        let (base, _) = mock(|_, _| {
+            let mut b =
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100000000\r\n\r\n".to_vec();
+            b.extend_from_slice(&[b'x'; 8192]);
+            Reply::RawThenHang(b)
+        });
+        let c = client(base);
+        assert!(matches!(
+            within(c.header_updates()).await,
+            Err(NodeError::Http { status: 500, .. })
+        ));
     }
 }

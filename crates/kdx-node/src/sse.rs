@@ -45,6 +45,10 @@ impl SseParser {
                 }
                 return Ok(out);
             };
+            // F-11: a delimited event is held to the same cap as an undelimited one.
+            if end > self.max_event {
+                return Err(EventTooLarge);
+            }
             self.scanned = 0;
             let block: Vec<u8> = self.buf.drain(..end + sep_len).take(end).collect();
             let text = String::from_utf8_lossy(&block);
@@ -154,5 +158,22 @@ mod tests {
             vec![("x".to_string(), String::new())]
         );
         assert_eq!(p.push(&[b'a'; 65]), Err(EventTooLarge));
+    }
+
+    /// F-11: an oversized event that arrives with its separator in the same chunk is refused,
+    /// not parsed; events up to the cap still pass.
+    #[test]
+    fn oversized_delimited_event_in_one_chunk() {
+        let mut p = SseParser::new(64);
+        let mut big = b"event: BlockHeader\ndata: ".to_vec();
+        big.extend_from_slice(&[b'a'; 100]);
+        big.extend_from_slice(b"\n\n");
+        assert_eq!(p.push(&big), Err(EventTooLarge));
+        let mut p = SseParser::new(64);
+        let mut ok = b"data: ".to_vec();
+        ok.extend_from_slice(&[b'b'; 58]);
+        assert_eq!(ok.len(), 64);
+        ok.extend_from_slice(b"\n\n");
+        assert_eq!(p.push(&ok).unwrap().len(), 1);
     }
 }
