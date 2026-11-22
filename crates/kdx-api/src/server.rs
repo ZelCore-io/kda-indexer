@@ -799,7 +799,6 @@ impl Api {
         self
     }
 
-    /// Add native routes (Task 4).
     /// Cut a connection whose writes make no progress for `d` (default
     /// [`WRITE_IDLE_TIMEOUT`]).
     pub fn write_idle_timeout(mut self, d: Duration) -> Api {
@@ -807,6 +806,7 @@ impl Api {
         self
     }
 
+    /// Add native routes (Task 4).
     pub fn native_routes(mut self, r: Router<Arc<ApiState>>) -> Api {
         self.native = self.native.merge(r);
         self
@@ -1528,13 +1528,9 @@ pub(crate) mod tests {
         kdx_decode::decode_block(&header, &payload).expect("block decodes")
     }
 
-    /// FIX-4 part B (B1): `/v1/txs` reads within `v1txs_deadline` (kda-txs' own 30 s), not
-    /// the per-request deadline, so `limit=10000` on a big account answers; the other routes
-    /// keep the per-request deadline.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn v1txs_has_its_own_deadline() {
-        use tower::ServiceExt;
-        // The store is opened on the written hot store (its dictionary is read at open).
+    /// 100 blocks of 100 transfers each to `k:alice`, as a store. The store is opened on
+    /// the written hot store (its dictionary is read at open).
+    fn alice_store() -> (tempfile::TempDir, Arc<crate::store::Store>) {
         let d = tempfile::tempdir().unwrap();
         let g = kdx_hot::Geometry {
             max_gb: 1,
@@ -1557,11 +1553,60 @@ pub(crate) mod tests {
             w.commit().unwrap();
         }
         let store = Arc::new(crate::store::Store::open(hot, d.path()).unwrap());
+        (d, store)
+    }
+
+    /// F-21 (PR-2 review note 7): past the keep budget the walk keeps only keys and the
+    /// writer reads those rows again; the `/v1/txs` body is the same as with every row kept.
+    #[test]
+    fn v1txs_body_is_the_same_past_the_keep_budget() {
+        use crate::compat::account::KeepBudget;
+        let (_d, store) = alice_store();
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let cap = 64 << 20;
+        let all = |room: usize| {
+            let mut b = KeepBudget::new(cap);
+            b.admit(cap - room).unwrap();
+            b
+        };
+        let full =
+            crate::v1txs::entries_in(&view, "k:alice", "coin", 10_000, cap, all(cap)).unwrap();
+        // Room for a few records only: the rest of the rows are keys.
+        let rows =
+            crate::v1txs::token_rows(&view, "k:alice", "coin", 10_000, &mut all(4096)).unwrap();
+        let kept = rows.iter().filter(|(_, r)| r.is_some()).count();
+        assert!(
+            kept > 0 && kept < rows.len(),
+            "kept {kept} of {}",
+            rows.len()
+        );
+        let part =
+            crate::v1txs::entries_in(&view, "k:alice", "coin", 10_000, cap, all(4096)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&full)
+                .unwrap()
+                .as_array()
+                .map(Vec::len),
+            Some(10_000)
+        );
+        assert!(part == full, "the body changed past the keep budget");
+    }
+
+    /// FIX-4 part B (B1): `/v1/txs` reads within `v1txs_deadline` (kda-txs' own 30 s), not
+    /// the per-request deadline, so `limit=10000` on a big account answers; the other routes
+    /// keep the per-request deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v1txs_has_its_own_deadline() {
+        use tower::ServiceExt;
+        let (_d, store) = alice_store();
         let mut cfg = settings(4);
         // Shorter than any read of this store; /v1/txs has its own budget.
         cfg.deadline = Duration::from_millis(1);
         cfg.v1txs_deadline = Duration::from_secs(30);
         cfg.v1txs_max_body_bytes = 64 << 20;
+        let cfg_deadline = cfg.deadline;
         let st = Api::new(store, cfg, TipWatch::default()).state();
         let search = crate::search::SearchCtx::new(crate::compat::SearchSettings::default(), None);
         let app = crate::compat::router(search)
@@ -1571,15 +1616,29 @@ pub(crate) mod tests {
             let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
             app.clone().oneshot(req)
         };
+        let t0 = Instant::now();
         let resp = get("/v1/txs/k:alice/coin/10000").await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        // The read outlived the per-request deadline, so the 200 shows its own budget.
+        assert!(t0.elapsed() > cfg_deadline, "{:?}", t0.elapsed());
         let body = axum::body::to_bytes(resp.into_body(), 64 << 20)
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.as_array().map(Vec::len), Some(10_000));
+        // The other routes keep the per-request deadline. A read of this store takes about
+        // 1.4 ms in a release build, within the 1 ms tick of tokio's timer, so racing it
+        // against the 1 ms deadline was flaky (200 or 504). Instead every read slot is held:
+        // the request cannot finish within its deadline and must answer 504, every run.
+        let held = st
+            .reads
+            .clone()
+            .acquire_many_owned(st.settings.read_threads as u32)
+            .await
+            .unwrap();
         let resp = get("/txs/account/k:alice?limit=10000").await.unwrap();
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        drop(held);
     }
 
     /// Suite run 4: `/txs/account?chain=` beyond an i64 is chainweb-data's 400 (its `chain`

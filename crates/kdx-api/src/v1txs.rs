@@ -247,7 +247,7 @@ fn params(path: &str, query: &[(String, String)]) -> Option<Params> {
 }
 
 /// Tx keys of the newest `limit` transfer rows of `token` for `account`.
-fn token_rows(
+pub(crate) fn token_rows(
     view: &View,
     account: &str,
     token: &str,
@@ -288,7 +288,18 @@ fn entries(
     cap: usize,
 ) -> ApiResult<Vec<u8>> {
     // The kept records share one budget of the body cap (F-21).
-    let mut budget = KeepBudget::new(cap);
+    entries_in(view, account, namespace, limit, cap, KeepBudget::new(cap))
+}
+
+/// [`entries`] with the keep budget `budget` (tests start it part used).
+pub(crate) fn entries_in(
+    view: &View,
+    account: &str,
+    namespace: &str,
+    limit: usize,
+    cap: usize,
+    mut budget: KeepBudget,
+) -> ApiResult<Vec<u8>> {
     let mut keys = token_rows(view, account, namespace, limit, &mut budget)?;
     if namespace != "coin" {
         keys.extend(token_rows(view, account, "coin", limit, &mut budget)?);
