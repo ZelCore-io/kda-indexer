@@ -62,6 +62,10 @@ pub mod meta {
     pub const BALANCES_SEED_TOKEN_RECEIVERS_CURSOR: &str = "balances_seed_token_receivers_cursor";
     /// Txs the D3 pass could not read (u64), like [`BALANCES_SEED_RECEIVERS_ERRORS`].
     pub const BALANCES_SEED_TOKEN_RECEIVERS_ERRORS: &str = "balances_seed_token_receivers_errors";
+    /// JSON `{"cap", "emitters"}`: the last D3 pass hit its per-emitter cap for these modules,
+    /// so it was not marked done. The service does not rerun it by itself; an operator reruns
+    /// `reconcile-balances --seed` with a raised cap.
+    pub const BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT: &str = "balances_seed_token_receivers_cap_hit";
 }
 
 static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);

@@ -116,10 +116,12 @@ pub struct ReceiversReport {
     pub tokens_noted: u64,
     /// D3: coinbases below the injection fix whose miner account holds a `"`.
     pub injected_miners: u64,
-    /// D3: event-derived candidates taken (capped by `Opts::max_event_candidates`).
+    /// D3: capped candidates taken (events, token rows of execs).
     pub event_candidates: u64,
-    /// D3: the event-derived cap was reached; later event candidates were dropped (logged).
-    pub event_cap_hit: bool,
+    /// D3: emitters that reached `Opts::max_event_candidates`. Non-empty: the pass is not
+    /// marked done (Meta `balances_seed_token_receivers_cap_hit` names them); rerun it with a
+    /// raised cap.
+    pub cap_hit: Vec<String>,
     /// Records whose cmd or continuation could not be read (logged with block, chain and
     /// request key), over the pass and its resumes. Must be 0; also in Meta for `--status`.
     pub errors: u64,
@@ -223,6 +225,8 @@ struct Pending {
     dry_marked: HashSet<(String, String, u8)>,
     dry_new: HashSet<String>,
     dry_tokens: HashSet<String>,
+    /// D3: capped candidates taken per emitter, over the pass.
+    emitters: HashMap<String, u64>,
 }
 
 /// Why a module's candidate is not marked (D3): a not-fungible verdict, or the row cap (I-7)
@@ -416,13 +420,18 @@ fn add(
                     let e = p.tokens.entry(m).or_insert(k.height());
                     *e = (*e).min(k.height());
                 }
-                // Security review: a per-pass cap on event-derived candidates.
+                // Security review: capped candidates are budgeted per emitter, so one hostile
+                // module cannot starve the others; a hit is reported and keeps the pass pending.
                 let mut v = t.pairs;
-                for x in t.event_pairs {
-                    if rep.event_candidates >= w.max_event_candidates {
-                        rep.event_cap_hit = true;
-                        break;
+                for (x, em) in t.event_pairs.into_iter().zip(t.event_emitters) {
+                    let n = p.emitters.entry(em.clone()).or_insert(0);
+                    if *n >= w.max_event_candidates {
+                        if !rep.cap_hit.contains(&em) {
+                            rep.cap_hit.push(em);
+                        }
+                        continue;
                     }
+                    *n += 1;
                     rep.event_candidates += 1;
                     v.push(x);
                 }
@@ -517,12 +526,13 @@ pub struct Opts {
     pub dry_run: bool,
     /// D1 (default) or D3.
     pub rules: Rules,
-    /// D3: event-derived candidates per pass (security review cap).
+    /// D3: capped candidates (events, token rows of execs) per emitter module per pass
+    /// (security review).
     pub max_event_candidates: u64,
 }
 
-/// Default per-pass cap on D3 event-derived candidates.
-pub const MAX_EVENT_CANDIDATES: u64 = 5_000_000;
+/// Default per-emitter, per-pass cap on D3 capped candidates.
+pub const MAX_EVENT_CANDIDATES: u64 = 2_000_000;
 
 impl Default for Opts {
     fn default() -> Opts {
@@ -713,10 +723,12 @@ pub fn run(
     }
     p.flush(hot, dict, ck, None, &mut rep)?;
     rep.secs = t0.elapsed().as_secs_f64();
-    if rep.event_cap_hit {
-        tracing::warn!(
+    if !rep.cap_hit.is_empty() {
+        tracing::error!(
             cap = o.max_event_candidates,
-            "balances: D3 event-derived candidates reached the per-pass cap; the rest were dropped"
+            emitters = ?rep.cap_hit,
+            "balances: D3 candidates of some emitters reached the per-pass cap; the pass stays \
+             pending (rerun `reconcile-balances --seed` with KDX_D3_MAX_EVENT_CANDIDATES raised)"
         );
     }
     if rep.errors > 0 {
@@ -733,7 +745,23 @@ pub fn run(
     // Errors of earlier finished passes on this store add up; a pass from 0 starts over.
     let total = if from == 0 { 0 } else { prior_errors } + rep.errors;
     let mut txn = hot.rw()?;
-    txn.set_meta(flag_key, &to.to_be_bytes())?;
+    if o.rules == Rules::D3 {
+        if rep.cap_hit.is_empty() {
+            txn.del(
+                Table::Meta,
+                meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT.as_bytes(),
+            )?;
+        } else {
+            let why = serde_json::json!({"cap": o.max_event_candidates, "emitters": rep.cap_hit});
+            txn.set_meta(
+                meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT,
+                why.to_string().as_bytes(),
+            )?;
+        }
+    }
+    if rep.cap_hit.is_empty() {
+        txn.set_meta(flag_key, &to.to_be_bytes())?;
+    }
     txn.set_meta(errors_key, &total.to_be_bytes())?;
     txn.del(Table::Meta, cursor_key.as_bytes())?;
     txn.commit()?;

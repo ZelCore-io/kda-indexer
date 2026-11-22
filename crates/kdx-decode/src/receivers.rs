@@ -238,6 +238,9 @@ pub struct TokenReceivers {
     pub pairs: Vec<(String, String)>,
     /// From events (rule 3), at most [`MAX_EVENT_PAIRS_PER_TX`]; never coin.
     pub event_pairs: Vec<(String, String)>,
+    /// The module each `event_pairs` entry is charged to (same index): the event's emitter, or
+    /// the token an `exec` calls. The pass budgets its per-pass cap per emitter.
+    pub event_emitters: Vec<String>,
     pub discovered: Vec<String>,
 }
 
@@ -262,7 +265,8 @@ impl TokenReceivers {
             self.pairs.push((account.to_owned(), module.to_owned()));
         }
     }
-    fn push_event(&mut self, account: &str, module: &str) {
+    /// A capped candidate (events, and token rows of an `exec`), charged to `emitter`.
+    fn push_event(&mut self, account: &str, module: &str, emitter: &str) {
         if module != "coin"
             && account_like(account)
             && self.event_pairs.len() < MAX_EVENT_PAIRS_PER_TX
@@ -273,6 +277,7 @@ impl TokenReceivers {
         {
             self.event_pairs
                 .push((account.to_owned(), module.to_owned()));
+            self.event_emitters.push(emitter.to_owned());
         }
     }
     fn discover(&mut self, module: &str) {
@@ -313,6 +318,10 @@ pub fn token_receivers(
     is_token: &dyn Fn(&str) -> bool,
 ) -> TokenReceivers {
     let mut r = TokenReceivers::default();
+    // A failed tx credits nothing (security review).
+    if output.pointer("/result/status").and_then(Value::as_str) != Some("success") {
+        return r;
+    }
     let is_cont = cmd.is_some_and(|c| c.pointer("/payload/cont").is_some());
     if let Some(c) = output.get("continuation").filter(|c| !c.is_null()) {
         let def = c.pointer("/continuation/def").and_then(Value::as_str);
@@ -353,9 +362,14 @@ pub fn token_receivers(
         if let Some(d) = output.pointer("/result/data") {
             data_strings(d, &mut |s| strings.push(s.to_owned()));
         }
+        // Coin rows (below the events fork) as in D1; token rows are capped like events.
         for m in &modules {
             for s in &strings {
-                r.push(s, m);
+                if m == "coin" {
+                    r.push(s, m);
+                } else {
+                    r.push_event(s, m, m);
+                }
             }
         }
     }
@@ -392,17 +406,51 @@ pub fn token_receivers(
         param_strings(ev.params, &mut strings);
         for m in &targets {
             for s in &strings {
-                r.push_event(s, m);
+                r.push_event(s, m, &ev.module);
             }
         }
     }
     r
 }
 
-/// The modules `code` calls as `<module>.<fn>` (`ns.mod.fn` → `ns.mod`, `mod.fn` → `mod`).
+/// The modules `code` calls as `<module>.<fn>` (`ns.mod.fn` → `ns.mod`, `mod.fn` → `mod`),
+/// outside string literals, `'symbols` and `;` comments (security review: a literal is data,
+/// not a call).
 fn called_modules(code: &str) -> Vec<String> {
+    let b = code.as_bytes();
+    let mut bare = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b';' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'\'' => {
+                i += 1;
+                while i < b.len() && !is_delim(b[i]) {
+                    i += 1;
+                }
+            }
+            c => {
+                bare.push(c);
+                i += 1;
+                continue;
+            }
+        }
+        bare.push(b' ');
+    }
+    let bare = String::from_utf8_lossy(&bare);
     let mut out = Vec::new();
-    for w in code.split(|c: char| is_delim(c as u8) || c == '\'' || !c.is_ascii()) {
+    for w in bare.split(|c: char| is_delim(c as u8) || !c.is_ascii()) {
         if let Some((m, f)) = w.rsplit_once('.') {
             if !m.is_empty() && !f.is_empty() && !out.iter().any(|x: &String| x == m) {
                 out.push(m.to_owned());

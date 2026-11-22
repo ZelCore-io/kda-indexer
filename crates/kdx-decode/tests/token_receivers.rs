@@ -75,7 +75,8 @@ fn a_pre_event_exec_counts_for_the_tokens_its_code_calls() {
         "code": format!(r#"(free.anedak.transfer-create "{SRC}" "{ACC}" (read-keyset "ks") 1.0)"#)}}});
     let o = out(json!("Write succeeded"), json!([]), Value::Null);
     let r = token_receivers(Some(&cmd), &o, 927_225, MAINNET01, &tokens);
-    let p = pairs(&r.pairs);
+    let all: Vec<(String, String)> = r.pairs.iter().chain(&r.event_pairs).cloned().collect();
+    let p = pairs(&all);
     assert!(
         p.contains(&(ACC, "free.anedak")) && p.contains(&(ACC, "coin")),
         "{p:?}"
@@ -200,7 +201,8 @@ fn an_exec_calling_a_token_counts_for_it_at_any_height() {
     let evs = json!([ev("coin", "TRANSFER", json!([SRC, "miner", 0.0001]))]);
     let o = out(json!("Write succeeded"), evs, Value::Null);
     let r = token_receivers(Some(&cmd), &o, 4_000_000, MAINNET01, &tokens);
-    let p = pairs(&r.pairs);
+    let all: Vec<(String, String)> = r.pairs.iter().chain(&r.event_pairs).cloned().collect();
+    let p = pairs(&all);
     assert!(
         p.contains(&(ACC, "free.anedak")) && p.contains(&(SRC, "free.anedak")),
         "{p:?}"
@@ -272,4 +274,37 @@ fn a_modref_counts_only_from_its_module_a_token_or_its_governed_namespace() {
     // Anyone in `free` naming another `free` token: nothing.
     let r = run("free.evil", (Some("free"), "gold"));
     assert!(r.event_pairs.is_empty() && r.discovered.is_empty(), "{r:?}");
+}
+
+#[test]
+fn a_hostile_exec_stays_within_the_cap_and_failed_txs_give_nothing() {
+    // Many token calls and strings in one exec: at most the per-tx cap of token rows.
+    let mut code = String::new();
+    for i in 0..200 {
+        code.push_str(&format!(
+            r#"(free.wiza.f "k:victim-{i:04}") (kaddex.kdx.f "k:other-{i:04}") "#
+        ));
+    }
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}});
+    let o = out(json!("ok"), json!([]), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
+    assert_eq!(r.event_pairs.len(), MAX_EVENT_PAIRS_PER_TX);
+    assert_eq!(r.event_emitters.len(), r.event_pairs.len());
+    assert!(
+        r.pairs.is_empty(),
+        "token exec rows are all capped: {:?}",
+        r.pairs.len()
+    );
+    // A module named only inside a literal or a comment is not a call.
+    let cmd = json!({"payload": {"exec": {"data": {},
+        "code": format!("(user.f \"free.wiza.x\" \"{ACC}\") ; free.wiza.y\n")}}});
+    let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
+    assert!(r.event_pairs.is_empty(), "{:?}", r.event_pairs);
+    // A failed tx gives nothing, whatever it holds.
+    let cmd =
+        json!({"payload": {"exec": {"data": {}, "code": format!(r#"(free.wiza.mint "{ACC}")"#)}}});
+    let mut failed = out(json!({"message": "boom"}), json!([]), Value::Null);
+    failed["result"]["status"] = json!("failure");
+    let r = token_receivers(Some(&cmd), &failed, 900_000, MAINNET01, &tokens);
+    assert!(r.pairs.is_empty() && r.event_pairs.is_empty(), "{r:?}");
 }

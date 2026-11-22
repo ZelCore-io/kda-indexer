@@ -646,15 +646,45 @@ fn the_token_pass_marks_credits_no_transfer_names_and_discovers_tokens() {
 }
 
 #[test]
-fn the_token_pass_caps_event_candidates_per_pass() {
+fn the_token_pass_budgets_the_cap_per_emitter_and_stays_pending_on_a_hit() {
     let (_d, c) = d3_store();
     let o = Opts {
         max_event_candidates: 1,
         ..d3_opts(false)
     };
     let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
-    assert_eq!(rep.event_candidates, 1, "{rep:?}");
-    assert!(rep.event_cap_hit, "{rep:?}");
-    // Non-event rules are not capped.
+    // kaddex.kdx's UNWRAP names two strings: its budget of 1 is hit.
+    assert!(rep.cap_hit.contains(&"kaddex.kdx".to_owned()), "{rep:?}");
+    assert!(
+        !rep.cap_hit.contains(&"kaddex.alchemist".to_owned()),
+        "{rep:?}"
+    );
+    // Emitter B (kaddex.alchemist) is not starved by A, and uncapped rules still run.
+    assert!(dirty_in(&c, SKDX_ACC, "kaddex.skdx"), "{rep:?}");
     assert!(dirty_in(&c, WRECV, "free.wiza") && dirty_in(&c, INJ, "coin"));
+    // Not done: no flag, still pending, the reason in Meta for `--status`.
+    let txn = c.hot.ro().unwrap();
+    assert!(txn
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)
+        .unwrap()
+        .is_none());
+    assert!(seed_receivers::pending_for(&txn, &o).unwrap().is_some());
+    let why = txn
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT)
+        .unwrap()
+        .expect("cap hit recorded");
+    assert!(String::from_utf8_lossy(&why).contains("kaddex.kdx"));
+    drop(txn);
+    // A rerun with a raised cap completes and clears the reason.
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    assert!(rep.cap_hit.is_empty(), "{rep:?}");
+    let txn = c.hot.ro().unwrap();
+    assert!(txn
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)
+        .unwrap()
+        .is_some());
+    assert!(txn
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT)
+        .unwrap()
+        .is_none());
 }

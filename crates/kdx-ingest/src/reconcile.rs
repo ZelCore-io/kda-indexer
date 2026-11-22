@@ -1016,6 +1016,17 @@ async fn receivers_pass(
     let Some((from, to)) = crate::seed_receivers::pending_for(&ctx.hot.ro()?, &opts)? else {
         return Ok(true);
     };
+    // A D3 pass that hit its cap stays pending; rerunning it hourly would walk all history
+    // again for the same result. It waits for an operator (`reconcile-balances --seed`).
+    if let Some(why) = ctx
+        .hot
+        .ro()?
+        .meta(kdx_hot::balances::meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT)?
+        .filter(|_| rules == Rules::D3)
+    {
+        tracing::error!(cap_hit = %String::from_utf8_lossy(&why), "balances: token receivers pass (D3) hit its cap; not rerun by the service");
+        return Ok(true);
+    }
     if let Err(e) = crate::seed_receivers::check_ready(&ctx.hot.ro()?, &ctx.segdir) {
         tracing::warn!(error = %e, ?rules, "balances: receivers pass postponed");
         return Ok(true);
