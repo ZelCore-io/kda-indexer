@@ -226,6 +226,9 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
         "seed_token_receivers_cap_hit": txn
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT)?
             .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
+        "seed_token_receivers_dropped": txn
+            .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED)?
+            .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
         "seed_token_receivers_errors": txn
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_ERRORS)?
             .and_then(|v| v.try_into().ok().map(u64::from_be_bytes)),

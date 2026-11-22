@@ -660,6 +660,16 @@ recheck walks only the new heights. Candidates:
 Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
 Pact 5 cannot parse) are never marked or noted: the node API cannot read them.
 
+Only successful txs give candidates. The injected-miner rule reads the block's miner data of
+coinbases below the coinbase injection fix (mainnet 121,452), on that block's chain only.
+Rows from events and from an exec's token calls are capped: 64 of each per tx (events are
+taken first), then per pass a budget per tracked token (2,000,000, `KDX_D3_MAX_EVENT_CANDIDATES`
+for the CLI), one shared bucket for all untracked emitters (2,000,000) and a global ceiling
+(20,000,000). A tracked token at its budget leaves the pass pending: `--status` shows
+`seed_token_receivers_cap_hit`, the service does not rerun it, and `--seed` fails until it
+is rerun with a raised budget. Drops in the shared bucket or at the ceiling are logged and
+counted (`seed_token_receivers_dropped`), and the pass still completes.
+
 `reconcile-balances --seed` runs D1 and then D3. `--seed --dry-run` opens the store read-only
 and prints both reports, `receivers` and `token_receivers`; `dirty_inserted` is the number of
 node reads the pass would cause. `--status` shows `seed_token_receivers_height`,

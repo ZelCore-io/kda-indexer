@@ -241,12 +241,19 @@ pub struct TokenReceivers {
     /// The module each `event_pairs` entry is charged to (same index): the event's emitter, or
     /// the token an `exec` calls. The pass budgets its per-pass cap per emitter.
     pub event_emitters: Vec<String>,
+    /// Token rows of an `exec` (rule 2 for tokens), at most [`MAX_EXEC_PAIRS_PER_TX`], with
+    /// the called token as emitter (same index in `exec_emitters`). Separate from the event
+    /// budget, and filled after the events, so exec strings never starve a tx's events.
+    pub exec_pairs: Vec<(String, String)>,
+    pub exec_emitters: Vec<String>,
     pub discovered: Vec<String>,
 }
 
 /// Event-derived candidates kept per tx (security review: chain data must not amplify the
 /// pass). Real credits name a handful of accounts per tx.
 pub const MAX_EVENT_PAIRS_PER_TX: usize = 64;
+/// Exec-derived token candidates kept per tx (own budget, see [`TokenReceivers::exec_pairs`]).
+pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
 
 /// Whether an event of `emitter` may name rows of `referenced` through a module reference: the
 /// module itself, a tracked token, or a module of the same governed namespace (only the
@@ -278,6 +285,20 @@ impl TokenReceivers {
             self.event_pairs
                 .push((account.to_owned(), module.to_owned()));
             self.event_emitters.push(emitter.to_owned());
+        }
+    }
+    fn push_exec(&mut self, account: &str, module: &str) {
+        if module != "coin"
+            && account_like(account)
+            && self.exec_pairs.len() < MAX_EXEC_PAIRS_PER_TX
+            && !self
+                .exec_pairs
+                .iter()
+                .any(|(a, m)| a == account && m == module)
+        {
+            self.exec_pairs
+                .push((account.to_owned(), module.to_owned()));
+            self.exec_emitters.push(module.to_owned());
         }
     }
     fn discover(&mut self, module: &str) {
@@ -339,40 +360,6 @@ pub fn token_receivers(
             }
         }
     }
-    if let (Some(c), false) = (cmd, is_cont) {
-        let code = c
-            .pointer("/payload/exec/code")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        // Coin only below the events fork (from there on every exec coin credit has an event).
-        let mut modules = Vec::new();
-        if height < forks.events {
-            modules.push("coin".to_owned());
-        }
-        for m in called_modules(code) {
-            if is_token(&m) && !modules.contains(&m) {
-                modules.push(m);
-            }
-        }
-        let mut strings = Vec::new();
-        if let Some(d) = c.pointer("/payload/exec/data") {
-            data_strings(d, &mut |s| strings.push(s.to_owned()));
-        }
-        strings.extend(code_literals(code));
-        if let Some(d) = output.pointer("/result/data") {
-            data_strings(d, &mut |s| strings.push(s.to_owned()));
-        }
-        // Coin rows (below the events fork) as in D1; token rows are capped like events.
-        for m in &modules {
-            for s in &strings {
-                if m == "coin" {
-                    r.push(s, m);
-                } else {
-                    r.push_event(s, m, m);
-                }
-            }
-        }
-    }
     for e in output
         .get("events")
         .and_then(Value::as_array)
@@ -407,6 +394,40 @@ pub fn token_receivers(
         for m in &targets {
             for s in &strings {
                 r.push_event(s, m, &ev.module);
+            }
+        }
+    }
+    if let (Some(c), false) = (cmd, is_cont) {
+        let code = c
+            .pointer("/payload/exec/code")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // Coin only below the events fork (from there on every exec coin credit has an event).
+        let mut modules = Vec::new();
+        if height < forks.events {
+            modules.push("coin".to_owned());
+        }
+        for m in called_modules(code) {
+            if is_token(&m) && !modules.contains(&m) {
+                modules.push(m);
+            }
+        }
+        let mut strings = Vec::new();
+        if let Some(d) = c.pointer("/payload/exec/data") {
+            data_strings(d, &mut |s| strings.push(s.to_owned()));
+        }
+        strings.extend(code_literals(code));
+        if let Some(d) = output.pointer("/result/data") {
+            data_strings(d, &mut |s| strings.push(s.to_owned()));
+        }
+        // Coin rows (below the events fork) as in D1; token rows are capped like events.
+        for m in &modules {
+            for s in &strings {
+                if m == "coin" {
+                    r.push(s, m);
+                } else {
+                    r.push_exec(s, m);
+                }
             }
         }
     }

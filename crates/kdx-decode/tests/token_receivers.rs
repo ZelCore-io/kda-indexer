@@ -11,6 +11,7 @@
 
 use kdx_decode::receivers::{
     injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_PER_TX,
+    MAX_EXEC_PAIRS_PER_TX,
 };
 use serde_json::{json, Value};
 
@@ -75,7 +76,13 @@ fn a_pre_event_exec_counts_for_the_tokens_its_code_calls() {
         "code": format!(r#"(free.anedak.transfer-create "{SRC}" "{ACC}" (read-keyset "ks") 1.0)"#)}}});
     let o = out(json!("Write succeeded"), json!([]), Value::Null);
     let r = token_receivers(Some(&cmd), &o, 927_225, MAINNET01, &tokens);
-    let all: Vec<(String, String)> = r.pairs.iter().chain(&r.event_pairs).cloned().collect();
+    let all: Vec<(String, String)> = r
+        .pairs
+        .iter()
+        .chain(&r.event_pairs)
+        .chain(&r.exec_pairs)
+        .cloned()
+        .collect();
     let p = pairs(&all);
     assert!(
         p.contains(&(ACC, "free.anedak")) && p.contains(&(ACC, "coin")),
@@ -201,7 +208,13 @@ fn an_exec_calling_a_token_counts_for_it_at_any_height() {
     let evs = json!([ev("coin", "TRANSFER", json!([SRC, "miner", 0.0001]))]);
     let o = out(json!("Write succeeded"), evs, Value::Null);
     let r = token_receivers(Some(&cmd), &o, 4_000_000, MAINNET01, &tokens);
-    let all: Vec<(String, String)> = r.pairs.iter().chain(&r.event_pairs).cloned().collect();
+    let all: Vec<(String, String)> = r
+        .pairs
+        .iter()
+        .chain(&r.event_pairs)
+        .chain(&r.exec_pairs)
+        .cloned()
+        .collect();
     let p = pairs(&all);
     assert!(
         p.contains(&(ACC, "free.anedak")) && p.contains(&(SRC, "free.anedak")),
@@ -288,8 +301,8 @@ fn a_hostile_exec_stays_within_the_cap_and_failed_txs_give_nothing() {
     let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}});
     let o = out(json!("ok"), json!([]), Value::Null);
     let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
-    assert_eq!(r.event_pairs.len(), MAX_EVENT_PAIRS_PER_TX);
-    assert_eq!(r.event_emitters.len(), r.event_pairs.len());
+    assert_eq!(r.exec_pairs.len(), MAX_EXEC_PAIRS_PER_TX);
+    assert_eq!(r.exec_emitters.len(), r.exec_pairs.len());
     assert!(
         r.pairs.is_empty(),
         "token exec rows are all capped: {:?}",
@@ -299,12 +312,38 @@ fn a_hostile_exec_stays_within_the_cap_and_failed_txs_give_nothing() {
     let cmd = json!({"payload": {"exec": {"data": {},
         "code": format!("(user.f \"free.wiza.x\" \"{ACC}\") ; free.wiza.y\n")}}});
     let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
-    assert!(r.event_pairs.is_empty(), "{:?}", r.event_pairs);
+    assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
     // A failed tx gives nothing, whatever it holds.
     let cmd =
         json!({"payload": {"exec": {"data": {}, "code": format!(r#"(free.wiza.mint "{ACC}")"#)}}});
     let mut failed = out(json!({"message": "boom"}), json!([]), Value::Null);
     failed["result"]["status"] = json!("failure");
     let r = token_receivers(Some(&cmd), &failed, 900_000, MAINNET01, &tokens);
-    assert!(r.pairs.is_empty() && r.event_pairs.is_empty(), "{r:?}");
+    assert!(
+        r.pairs.is_empty() && r.event_pairs.is_empty() && r.exec_pairs.is_empty(),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn many_exec_strings_do_not_starve_the_events_of_the_tx() {
+    let mut code = String::new();
+    for i in 0..500 {
+        code.push_str(&format!(r#"(kaddex.kdx.f "k:noise-{i:04}") "#));
+    }
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}});
+    let evs = json!([ev("kaddex.kdx", "UNWRAP", json!(["kdx-staking", ACC, 2.0]))]);
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(true), evs, Value::Null),
+        3_635_131,
+        MAINNET01,
+        &tokens,
+    );
+    assert!(
+        pairs(&r.event_pairs).contains(&(ACC, "kaddex.kdx")),
+        "{:?}",
+        r.event_pairs
+    );
+    assert_eq!(r.exec_pairs.len(), MAX_EXEC_PAIRS_PER_TX);
 }

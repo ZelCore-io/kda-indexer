@@ -688,3 +688,49 @@ fn the_token_pass_budgets_the_cap_per_emitter_and_stays_pending_on_a_hit() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn a_full_untracked_bucket_drops_counts_and_still_completes() {
+    let (_d, c) = d3_store();
+    let o = Opts {
+        max_untracked_candidates: 0,
+        ..d3_opts(false)
+    };
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    // kaddex.alchemist (untracked) names kaddex.skdx rows: dropped, counted.
+    assert!(rep.dropped_untracked >= 1, "{rep:?}");
+    assert!(!dirty_in(&c, SKDX_ACC, "kaddex.skdx"));
+    // Tracked tokens are unaffected, and the pass is done.
+    assert!(rep.cap_hit.is_empty(), "{rep:?}");
+    assert!(dirty_in(&c, UNWRAP_ACC, "kaddex.kdx"));
+    let txn = c.hot.ro().unwrap();
+    assert!(txn
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)
+        .unwrap()
+        .is_some());
+    let d = txn
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED)
+        .unwrap()
+        .expect("drops recorded");
+    let d: Value = serde_json::from_slice(&d).unwrap();
+    assert_eq!(d["untracked"].as_u64(), Some(rep.dropped_untracked));
+}
+
+#[test]
+fn the_global_ceiling_drops_and_completes() {
+    let (_d, c) = d3_store();
+    let o = Opts {
+        max_total_candidates: 0,
+        ..d3_opts(false)
+    };
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    assert!(
+        rep.dropped_ceiling >= 1 && rep.cap_hit.is_empty(),
+        "{rep:?}"
+    );
+    let txn = c.hot.ro().unwrap();
+    assert!(txn
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)
+        .unwrap()
+        .is_some());
+}

@@ -122,6 +122,10 @@ pub struct ReceiversReport {
     /// marked done (Meta `balances_seed_token_receivers_cap_hit` names them); rerun it with a
     /// raised cap.
     pub cap_hit: Vec<String>,
+    /// D3: capped candidates of untracked emitters dropped at the shared bucket's limit.
+    pub dropped_untracked: u64,
+    /// D3: capped candidates dropped at the global ceiling.
+    pub dropped_ceiling: u64,
     /// Records whose cmd or continuation could not be read (logged with block, chain and
     /// request key), over the pass and its resumes. Must be 0; also in Meta for `--status`.
     pub errors: u64,
@@ -225,8 +229,9 @@ struct Pending {
     dry_marked: HashSet<(String, String, u8)>,
     dry_new: HashSet<String>,
     dry_tokens: HashSet<String>,
-    /// D3: capped candidates taken per emitter, over the pass.
+    /// D3: capped candidates taken per tracked token, and by all untracked emitters.
     emitters: HashMap<String, u64>,
+    untracked: u64,
 }
 
 /// Why a module's candidate is not marked (D3): a not-fungible verdict, or the row cap (I-7)
@@ -395,6 +400,8 @@ struct Walk {
     forks: Forks,
     tokens: HashSet<String>,
     max_event_candidates: u64,
+    max_untracked_candidates: u64,
+    max_total_candidates: u64,
 }
 
 /// A module whose rows the pass may mark: coin, or a name `/local` can call (B-1).
@@ -420,20 +427,14 @@ fn add(
                     let e = p.tokens.entry(m).or_insert(k.height());
                     *e = (*e).min(k.height());
                 }
-                // Security review: capped candidates are budgeted per emitter, so one hostile
-                // module cannot starve the others; a hit is reported and keeps the pass pending.
+                // Security review: budgets per tracked token, one shared bucket for untracked
+                // emitters, a global ceiling; events first, then exec rows.
                 let mut v = t.pairs;
-                for (x, em) in t.event_pairs.into_iter().zip(t.event_emitters) {
-                    let n = p.emitters.entry(em.clone()).or_insert(0);
-                    if *n >= w.max_event_candidates {
-                        if !rep.cap_hit.contains(&em) {
-                            rep.cap_hit.push(em);
-                        }
-                        continue;
+                let capped = t.event_pairs.into_iter().zip(t.event_emitters);
+                for (x, em) in capped.chain(t.exec_pairs.into_iter().zip(t.exec_emitters)) {
+                    if take(p, w, rep, &em) {
+                        v.push(x);
                     }
-                    *n += 1;
-                    rep.event_candidates += 1;
-                    v.push(x);
                 }
                 v
             })
@@ -457,6 +458,38 @@ fn add(
             );
         }
     }
+}
+
+/// Budget one capped candidate charged to emitter `em` (final cap design):
+/// - a tracked token has its own budget (`max_event_candidates`); a hit is listed in
+///   `cap_hit` and keeps the pass pending (visible, rerun with a raised cap);
+/// - every untracked emitter shares one bucket (`max_untracked_candidates`), and all of them
+///   sit under a global ceiling (`max_total_candidates`); a hit there drops the excess,
+///   counts it (`dropped_untracked`, `dropped_ceiling`) and the pass still completes, so no
+///   emitter can stall it.
+fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str) -> bool {
+    if rep.event_candidates >= w.max_total_candidates {
+        rep.dropped_ceiling += 1;
+        return false;
+    }
+    if w.tokens.contains(em) {
+        let n = p.emitters.entry(em.to_owned()).or_insert(0);
+        if *n >= w.max_event_candidates {
+            if !rep.cap_hit.iter().any(|x| x == em) {
+                rep.cap_hit.push(em.to_owned());
+            }
+            return false;
+        }
+        *n += 1;
+    } else {
+        if p.untracked >= w.max_untracked_candidates {
+            rep.dropped_untracked += 1;
+            return false;
+        }
+        p.untracked += 1;
+    }
+    rep.event_candidates += 1;
+    true
 }
 
 /// D3: the tracked fungible tokens (`Tokens`, not-fungible verdicts excluded) by name.
@@ -529,10 +562,18 @@ pub struct Opts {
     /// D3: capped candidates (events, token rows of execs) per emitter module per pass
     /// (security review).
     pub max_event_candidates: u64,
+    /// D3: capped candidates shared by all untracked emitters per pass.
+    pub max_untracked_candidates: u64,
+    /// D3: global ceiling on capped candidates per pass.
+    pub max_total_candidates: u64,
 }
 
 /// Default per-emitter, per-pass cap on D3 capped candidates.
 pub const MAX_EVENT_CANDIDATES: u64 = 2_000_000;
+/// Default shared bucket of untracked emitters.
+pub const MAX_UNTRACKED_CANDIDATES: u64 = 2_000_000;
+/// Default global ceiling on D3 capped candidates.
+pub const MAX_TOTAL_CANDIDATES: u64 = 20_000_000;
 
 impl Default for Opts {
     fn default() -> Opts {
@@ -542,6 +583,8 @@ impl Default for Opts {
             dry_run: false,
             rules: Rules::D1,
             max_event_candidates: MAX_EVENT_CANDIDATES,
+            max_untracked_candidates: MAX_UNTRACKED_CANDIDATES,
+            max_total_candidates: MAX_TOTAL_CANDIDATES,
         }
     }
 }
@@ -603,6 +646,8 @@ pub fn run(
             Rules::D3 => tracked_tokens(&hot.ro()?, &snap)?,
         },
         max_event_candidates: o.max_event_candidates,
+        max_untracked_candidates: o.max_untracked_candidates,
+        max_total_candidates: o.max_total_candidates,
     };
     let miners = |key: TxKey| o.rules == Rules::D3 && key.height() < o.forks.coinbase_fix;
     let ck = (coin, cursor_key);
@@ -745,7 +790,20 @@ pub fn run(
     // Errors of earlier finished passes on this store add up; a pass from 0 starts over.
     let total = if from == 0 { 0 } else { prior_errors } + rep.errors;
     let mut txn = hot.rw()?;
+    if rep.dropped_untracked + rep.dropped_ceiling > 0 {
+        tracing::warn!(
+            dropped_untracked = rep.dropped_untracked,
+            dropped_ceiling = rep.dropped_ceiling,
+            "balances: D3 dropped candidates of untracked emitters / over the global ceiling"
+        );
+    }
     if o.rules == Rules::D3 {
+        let dropped = serde_json::json!({
+            "untracked": rep.dropped_untracked, "ceiling": rep.dropped_ceiling});
+        txn.set_meta(
+            meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED,
+            dropped.to_string().as_bytes(),
+        )?;
         if rep.cap_hit.is_empty() {
             txn.del(
                 Table::Meta,

@@ -66,6 +66,9 @@ pub mod meta {
     /// so it was not marked done. The service does not rerun it by itself; an operator reruns
     /// `reconcile-balances --seed` with a raised cap.
     pub const BALANCES_SEED_TOKEN_RECEIVERS_CAP_HIT: &str = "balances_seed_token_receivers_cap_hit";
+    /// JSON `{"untracked", "ceiling"}`: capped candidates the last D3 pass dropped (shared
+    /// bucket of untracked emitters, global ceiling). The pass completes regardless.
+    pub const BALANCES_SEED_TOKEN_RECEIVERS_DROPPED: &str = "balances_seed_token_receivers_dropped";
 }
 
 static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
