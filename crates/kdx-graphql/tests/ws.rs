@@ -1010,7 +1010,11 @@ async fn a_silent_peer_is_closed_and_its_slots_return() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(active_subscriptions(&s.schema), 0);
-    assert!(t.elapsed() >= Duration::from_millis(300), "{:?}", t.elapsed());
+    assert!(
+        t.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        t.elapsed()
+    );
     drop(a);
 }
 

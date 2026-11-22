@@ -791,16 +791,23 @@ mod tests {
         };
         assert!(cx(&nested("first: 1000, last: 0"), serde_json::json!({})) > MAX_COMPLEXITY);
         assert!(cx(&nested("first: 0, last: 1000"), serde_json::json!({})) > MAX_COMPLEXITY);
-        assert_eq!(cx(&nested("first: 1000, last: 0"), serde_json::json!({})), 51.0 * 1000.0);
+        assert_eq!(
+            cx(&nested("first: 1000, last: 0"), serde_json::json!({})),
+            51.0 * 1000.0
+        );
         // Through a variable too.
-        let q = "query Q($z: Int) { transactions(first: 4001, last: $z) { edges { node { hash } } } }";
+        let q =
+            "query Q($z: Int) { transactions(first: 4001, last: $z) { edges { node { hash } } } }";
         assert_eq!(cx(q, serde_json::json!({"z": 0})), 4001.0);
         // `first: 0` alone is unchanged (stock: 0), and so are both zero.
         assert_eq!(cx(&nested("first: 0"), serde_json::json!({})), 0.0);
         assert_eq!(cx(&nested("first: 0, last: 0"), serde_json::json!({})), 0.0);
         // Two non-zero multipliers still multiply.
         assert_eq!(
-            cx("{ transactions(first: 10, last: 3) { edges { node { hash } } } }", serde_json::json!({})),
+            cx(
+                "{ transactions(first: 10, last: 3) { edges { node { hash } } } }",
+                serde_json::json!({})
+            ),
             30.0
         );
     }

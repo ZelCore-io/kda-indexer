@@ -1210,7 +1210,9 @@ mod tests {
                 .and_then(|c| over_ceiling(c.complexity).map(|_| c.complexity))
                 .map_err(|e| format!("{:?}", e.extensions.unwrap().get("code")))
         };
-        let many: String = (0..200).map(|i| format!("g{i}: guard {{ raw }} ")).collect();
+        let many: String = (0..200)
+            .map(|i| format!("g{i}: guard {{ raw }} "))
+            .collect();
         let q = format!(
             "{{ nonFungibleAccount(accountName: \"k:a\") {{ nonFungibleTokenBalances {{ {many} }} }} }}"
         );
