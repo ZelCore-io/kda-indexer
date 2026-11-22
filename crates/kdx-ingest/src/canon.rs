@@ -156,8 +156,12 @@ impl Walker {
 /// Hash of the canonical header of `chain` at `at`, found by walking parent links down from
 /// the highest header in `at..=at+63`.
 pub async fn anchor(node: &NodeClient, chain: u8, at: u64) -> Result<String> {
+    // F-39: heights come from the node; never wrap.
+    let top_at = at
+        .checked_add(ANCHOR_SPAN - 1)
+        .with_context(|| format!("anchor chain {chain}: height {at} out of range"))?;
     let hs = node
-        .headers_all(chain, at, at + ANCHOR_SPAN - 1)
+        .headers_all(chain, at, top_at)
         .await
         .with_context(|| format!("anchor headers chain {chain} at {at}"))?;
     let mut by_hash: HashMap<&str, (u64, &str)> = HashMap::with_capacity(hs.len());
@@ -182,7 +186,7 @@ pub async fn anchor(node: &NodeClient, chain: u8, at: u64) -> Result<String> {
     }
     let (mut height, mut hash) =
         top.with_context(|| format!("no headers at {at}.. on chain {chain}"))?;
-    if height < at + ANCHOR_SPAN / 2 {
+    if height < at.saturating_add(ANCHOR_SPAN / 2) {
         bail!(
             "anchor chain {chain}: highest header at {height}, need at least {} above {at}",
             ANCHOR_SPAN / 2
@@ -193,7 +197,7 @@ pub async fn anchor(node: &NodeClient, chain: u8, at: u64) -> Result<String> {
         let (ph, _) = *by_hash
             .get(parent)
             .with_context(|| format!("anchor chain {chain}: parent of height {height} missing"))?;
-        if ph + 1 != height {
+        if ph.checked_add(1) != Some(height) {
             bail!("anchor chain {chain}: parent height {ph} below {height}");
         }
         height = ph;

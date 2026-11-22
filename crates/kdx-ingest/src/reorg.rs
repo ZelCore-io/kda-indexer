@@ -145,7 +145,7 @@ impl ChainView {
             );
         }
         let depth = self.tip.0 - fork;
-        if depth > f || fork + 1 < frontier {
+        if depth > f || u64::from(fork) + 1 < u64::from(frontier) {
             return Ok(ReorgOutcome::ChainHalted {
                 fork_height: fork,
                 depth,
@@ -170,6 +170,19 @@ impl ChainView {
 
 /// Fetch the branch ending in `upper` above the stored chain (at most `max` height) and
 /// classify it against `view`. An empty branch means `upper` is already stored.
+/// Linkage inside a `header/branch` answer: each header's parent is the previous hash and its
+/// height the previous height + 1 (checked, F-39: `u32::MAX` does not wrap to 0).
+fn check_linked(chain: u8, headers: &[Value]) -> Result<()> {
+    for w in headers.windows(2) {
+        if header_hash(&w[1], "parent")? != header_hash(&w[0], "hash")?
+            || header_height(&w[0])?.checked_add(1) != Some(header_height(&w[1])?)
+        {
+            bail!("chain {chain}: header/branch answer is not a linked chain");
+        }
+    }
+    Ok(())
+}
+
 pub async fn handle(ctx: &Ctx, view: &ChainView, upper: &str, max: Option<u64>) -> Result<Branch> {
     let chain = view.chain;
     let lower = [view.tip.1.to_b64url()];
@@ -196,14 +209,7 @@ pub async fn handle(ctx: &Ctx, view: &ChainView, upper: &str, max: Option<u64>) 
     let p0 = header_hash(first, "parent")?;
     let frontier = ctx.hot.ro()?.frozen_frontier()?;
     let f = u32::try_from(ctx.opts.finality_depth)?;
-    // Linkage inside the branch.
-    for w in headers.windows(2) {
-        if header_hash(&w[1], "parent")? != header_hash(&w[0], "hash")?
-            || header_height(&w[1])? != header_height(&w[0])? + 1
-        {
-            bail!("chain {chain}: header/branch answer is not a linked chain");
-        }
-    }
+    check_linked(chain, &headers)?;
     let outcome = view.classify(h0, &p0, frontier, f)?;
     Ok(Branch { outcome, headers })
 }
@@ -252,5 +258,26 @@ mod tests {
                 recent: self.recent.clone(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod linkage_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn hv(n: u8) -> String {
+        Hash32([n; 32]).to_b64url()
+    }
+
+    /// F-39: a branch from `u32::MAX` to 0 is not linked, even with matching hashes.
+    #[test]
+    fn branch_linkage_at_the_height_limit() {
+        let a = json!({"height": 5, "hash": hv(1), "parent": hv(0)});
+        let b = json!({"height": 6, "hash": hv(2), "parent": hv(1)});
+        assert!(check_linked(0, &[a, b]).is_ok());
+        let a = json!({"height": u32::MAX, "hash": hv(1), "parent": hv(0)});
+        let b = json!({"height": 0, "hash": hv(2), "parent": hv(1)});
+        assert!(check_linked(0, &[a, b]).is_err());
     }
 }
