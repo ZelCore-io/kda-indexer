@@ -78,7 +78,7 @@ same counting and the same refusal text, code and HTTP status. They are fixed, n
 | Limit | Value | Refusal (message; top-level `code`; HTTP) | `extensions.limit` |
 |---|---|---|---|
 | complexity (HTTP and websocket) | 4000 | `[ERROR][GRAPHQL][VALID_RANGE] Sorry, too complicated query! Exceeded the maximum allowed complexity.`; `INTERNAL_SERVER_ERROR`; 500. Over the websocket: `Sorry, too complicated query! Exceeded the maximum allowed complexity.` | `complexity` |
-| depth (HTTP only, as stock) | 9 | `'<operation name or (anonymous)>' exceeds operation depth limits.`; `GRAPHQL_VALIDATION_FAILED`; 400 | `depth` |
+| depth (HTTP and websocket; stock: HTTP only) | 9 | `'<operation name or (anonymous)>' exceeds operation depth limits.`; `GRAPHQL_VALIDATION_FAILED`; 400. Over the websocket the same message comes as the subscription's error | `depth` |
 
 Complexity is `graphql-query-complexity` 1.0.0 as stock configures it. A field with stock's
 `@complexity(value, multipliers)` directive costs `(value + cost of its selection) × Π
@@ -120,8 +120,9 @@ operation of the document is checked. The full introspection document (graphql-j
 `fields { args { type { ofType … } } }`, so stock refuses it over HTTP and so does this
 indexer, with stock's error. Workaround (stock and ours alike): send a shallower introspection
 document. Dropping `args { ...InputValue }` from the `fields` selection, or cutting the
-`TypeRef` fragment's `ofType` chain to 7 levels, keeps it within 12; the websocket runs no depth
-rule. `scripts/stock-schema/oracle.js` runs stock's own libraries on stock's schema, to check
+`TypeRef` fragment's `ofType` chain to 7 levels, keeps it within 12. Stock runs no depth rule
+over the websocket; this indexer runs the same rule there (audit F-07), since a subscription
+re-runs for every block, so a subscription stock opens at depth 10 or more is refused here. `scripts/stock-schema/oracle.js` runs stock's own libraries on stock's schema, to check
 a document against them.
 
 Stock's order holds: other validation errors come with the depth error; the complexity check

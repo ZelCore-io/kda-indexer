@@ -894,3 +894,37 @@ async fn quantity_above_the_safety_cap_is_refused() {
     assert_eq!(errors[0]["extensions"]["code"], "LIMIT", "{m}");
     assert_eq!(errors[0]["extensions"]["limit"], "page", "{m}");
 }
+
+/// Audit F-07 (option B): the depth rule runs over the socket too (stock runs none there), so
+/// a subscription deeper than 9 is refused with the depth error; a shallow one still opens.
+#[tokio::test]
+async fn depth_over_9_is_refused_over_the_socket() {
+    let s = server(GraphqlSettings::default(), 1000).await;
+    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+    init(&mut a).await;
+    let deep = "subscription D { newBlocks(chainIds: [\"0\"]) { transactions { edges { node { result { ... on TransactionResult { block { parent { minerAccount { transactions { edges { node { hash } } } } } } } } } } } } }";
+    send(
+        &mut a,
+        json!({"id": "1", "type": "subscribe", "payload": {"query": deep}}),
+    )
+    .await;
+    let m = recv(&mut a).await.unwrap();
+    let errors = if m["type"] == "error" {
+        &m["payload"]
+    } else {
+        &m["payload"]["errors"]
+    };
+    assert_eq!(m["id"], "1", "{m}");
+    assert_eq!(
+        errors[0]["message"], "'D' exceeds operation depth limits.",
+        "{m}"
+    );
+    assert_eq!(errors[0]["extensions"]["limit"], "depth", "{m}");
+    assert_eq!(active_subscriptions(&s.schema), 0);
+    send(
+        &mut a,
+        json!({"id": "2", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
+    )
+    .await;
+    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
+}

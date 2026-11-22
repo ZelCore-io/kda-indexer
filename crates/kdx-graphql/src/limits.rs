@@ -768,7 +768,7 @@ struct StockVerdict {
     /// Positions of the arguments whose value holds a variable: async-graphql reports a
     /// variable value that does not coerce at them, during validation (FIX-4 part B item 5).
     var_args: Vec<async_graphql::Pos>,
-    /// Depth-limit messages (HTTP only, as stock's validation rule).
+    /// Depth-limit messages (stock's validation rule; over the socket too, audit F-07).
     depth: Vec<String>,
     /// Over stock's complexity; the message to answer.
     complexity: Option<&'static str>,
@@ -803,15 +803,12 @@ impl Extension for LimitsExt {
             }
         })?;
         budget(doc, &vars, s)?;
-        // Stock's limits (FIX-3 part C). Over the socket stock runs no depth rule and words
-        // the complexity refusal without its HTTP prefix; over HTTP it skips the complexity
-        // check for an operation named `IntrospectionQuery`.
+        // Stock's limits (FIX-3 part C). Over the socket stock words the complexity refusal
+        // without its HTTP prefix; over HTTP it skips the complexity check for an operation
+        // named `IntrospectionQuery`. Stock runs no depth rule over the socket; this indexer
+        // does (audit F-07 option B: a subscription re-runs per block, real ones are shallow).
         let reg = type_registry();
-        let depth = if ws {
-            Vec::new()
-        } else {
-            stock_limits::depth_errors(reg, doc)
-        };
+        let depth = stock_limits::depth_errors(reg, doc);
         // FIX-3 part D (S1): the operation priced is the one the executor runs (none: the
         // executor refuses the request itself), and the skip needs both stock's name and an
         // operation of introspection fields alone, so a spoofed name carrying real fields is
