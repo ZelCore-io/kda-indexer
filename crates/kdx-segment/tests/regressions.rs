@@ -154,3 +154,70 @@ fn keys_with_slot_count_u64_max_is_refused_not_an_overflow_panic() {
     std::fs::write(&p, &bytes).unwrap();
     assert!(kdx_segment::keys::Keys::open(&p).is_err());
 }
+
+/// Replaces the one little-endian u64 `from` in the block file's nippy-jar config (where the
+/// user header lives) with `to`.
+fn patch_header_u64(p: &std::path::Path, from: u64, to: u64) {
+    let conf = p.with_extension("conf");
+    let mut b = std::fs::read(&conf).unwrap();
+    let pat = from.to_le_bytes();
+    let at: Vec<usize> = (0..=b.len() - 8).filter(|&i| b[i..i + 8] == pat).collect();
+    assert_eq!(
+        at.len(),
+        1,
+        "{from} occurs {} times in the config",
+        at.len()
+    );
+    b[at[0]..at[0] + 8].copy_from_slice(&to.to_le_bytes());
+    std::fs::write(&conf, &b).unwrap();
+}
+
+/// F-32: a damaged header is refused by `open`: a `max_raw_row` far above any real row
+/// (each `row()` reserves that much) and a record count the rows cannot hold.
+#[test]
+fn block_file_with_a_damaged_header_is_refused_by_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let p = dir.path().join(name);
+        let mut w = BlockFileWriter::create(&p, "txs", Vec::new(), 3, 1000).unwrap();
+        for i in 0..1001u32 {
+            w.push(vec![(i % 251) as u8; 997]).unwrap();
+        }
+        w.finish(Vec::new(), 0).unwrap();
+        p
+    };
+    let p = mk("raw.seg");
+    let f = BlockFile::open(&p).unwrap();
+    let raw = f.header.max_raw_row;
+    assert_eq!(f.records(), 1001);
+    drop(f);
+    patch_header_u64(&p, raw, u64::MAX);
+    let e = BlockFile::open(&p).err().expect("refused");
+    assert!(format!("{e:#}").contains("max_raw_row"), "{e:#}");
+
+    let p = mk("records.seg");
+    patch_header_u64(&p, 1001, 2001);
+    let e = BlockFile::open(&p).err().expect("refused");
+    assert!(format!("{e:#}").contains("records"), "{e:#}");
+}
+
+/// F-33: with a universe of 2^63 or more and one value, `low_len` is 63, so a high part of 2
+/// shifted left would drop its top bit and decode to a small, in-universe value. Such
+/// damaged high bits are refused.
+#[test]
+fn elias_fano_high_part_that_overflows_the_shift_is_refused() {
+    use kdx_segment::ef::values;
+    let u = (1usize << 63) + 10;
+    let mut good = Vec::new();
+    let mut b = sucds::mii_sequences::EliasFanoBuilder::new(u, 1).unwrap();
+    b.push(5).unwrap();
+    sucds::Serializable::serialize_into(&b.build(), &mut good).unwrap();
+    assert_eq!(values(&good).unwrap().values, vec![5]);
+    // High bits: word count (8 bytes), then the first word. One value at bit p = hi + 0.
+    assert_eq!(u64::from_le_bytes(good[8..16].try_into().unwrap()), 1);
+    let mut b = good.clone();
+    b[8..16].copy_from_slice(&(1u64 << 1).to_le_bytes());
+    assert_eq!(values(&b).unwrap().values, vec![(1u64 << 63) + 5]);
+    b[8..16].copy_from_slice(&(1u64 << 2).to_le_bytes());
+    assert!(values(&b).is_err(), "{:?}", values(&b).map(|d| d.values));
+}
