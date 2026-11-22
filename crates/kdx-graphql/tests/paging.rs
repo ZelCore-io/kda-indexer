@@ -1739,6 +1739,33 @@ mod audit_pr3 {
         assert!(hashes(&fx.schema, bh, "nobody.token").await.is_empty());
     }
 
+    /// PR-4 (a), stock parity: `transactions(accountName | chainId, fungibleName)` keeps the
+    /// txs with ANY event of that module (stock: `EXISTS` an event with `module` = the name),
+    /// not only those with a transfer of it: block (1, 11)'s tx, sent by Alice, emits only
+    /// `coin.NOTE`.
+    #[tokio::test]
+    async fn fungible_name_keeps_txs_with_any_event_of_the_module() {
+        let fx = fixture();
+        let note = fx.rks[&(1, 11)][0].clone();
+        for src in [
+            format!("accountName: \"{ALICE}\""),
+            format!("accountName: \"{ALICE}\", chainId: \"1\""),
+            "chainId: \"1\"".to_owned(),
+            "minHeight: 11, maxHeight: 11".to_owned(),
+        ] {
+            let hs = hashes(&fx.schema, src.clone(), "coin").await;
+            assert!(hs.contains(&note), "{src}: {hs:?}");
+            // A module the tx has no event of still drops it.
+            let hs = hashes(&fx.schema, src.clone(), "kaddex.kdx").await;
+            assert!(!hs.contains(&note), "{src}: {hs:?}");
+            assert!(!hs.is_empty() || src.contains("11"), "{src}");
+        }
+        // Over the old sender path too (`sender_index = false`).
+        fx.store.set_sender_index(false);
+        let hs = hashes(&fx.schema, format!("accountName: \"{ALICE}\""), "coin").await;
+        assert!(hs.contains(&note), "{hs:?}");
+    }
+
     /// F-30: the `isNFT` account path checks `fungibleName` as every other path does.
     #[tokio::test]
     async fn nft_transfers_check_the_fungible_name() {

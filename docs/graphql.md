@@ -426,22 +426,26 @@ the oracle puts them.
   Their events and transfers are listed with order index 0 and the node's coinbase request
   key (the `reqKey` of the stored coinbase output, as the oracle lists it; R-P5P9-57 F4).
   Event and Transfer ids carry that key; `node(id)` still accepts ids with `<coinbase>`.
-- **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` with
-  `fungibleName` (txs with a transfer of that token on the account's side), `accountName`
-  alone (txs touching the account), `fungibleName` alone (txs with a `<token>.TRANSFER`
-  event); with none of them, every user tx from the tip down (at most 20,000 heights), as
-  a latest-transactions list asks. `chainId`, `minHeight`, `maxHeight` and
+- **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` (txs
+  touching the account); with none of them, every user tx from the tip down (at most 20,000
+  heights), as a latest-transactions list asks. `fungibleName` picks no source: on every
+  source it keeps the txs with any event of that module, as stock does (`EXISTS` on
+  `Events.module`, indexer-kadena `90a4be1`), not only those with a transfer of it. Without
+  `accountName`, `requestKey` or `blockHash` it walks the heights from the tip, so a page of
+  a rare token can end at the 1 s page scan window (`TIMEOUT`) or the 20,000-height bound
+  where an index lookup would have answered; the walk is a heavy read (one per client). `chainId`, `minHeight`, `maxHeight` and
   `minimumDepth` (height ≤ the chain's tip − depth) filter any source. With `accountName`,
   only the txs the account sent (`meta.sender`) are listed and counted, as the oracle does
   (GQ-19, R-P5P9-57 M1).
 - **Sender lists and the sender index (FIX-2).** `transactions(accountName)`,
   `transactions(accountName, fungibleName)` and `FungibleChainAccount.transactions` read the
-  account's `sndr` postings (with `fungibleName`, a merge of its `sndr` and `xfer` postings)
+  account's `sndr` postings (`transactions` with `fungibleName` keeps those with an event of
+  that module; `FungibleChainAccount.transactions` is unchanged by this)
   once the sender index is complete: every segment range has its `sndr.pst` and the hot
   store has `sndr_hot = 1` (gauge `kdx_sender_index_ready`). No record is decoded to pick
   the rows, so a receive-heavy account answers as fast as any other, and `totalCount` is a
   key-only walk. Until then (a store before `segments add-index`) the old path serves: the
-  account's `acct` (or `xfer`) postings filtered on each record's `meta.sender`, which a
+  account's `acct` postings filtered on each record's `meta.sender`, which a
   receive-heavy account can run past the 1 s scan window (`TIMEOUT`, no data). Both paths
   answer the same edges, cursors, `pageInfo` and `totalCount`. `[graphql] sender_index =
   false` forces the old path (default `true`; used to compare the two on a host); it also
@@ -452,9 +456,8 @@ the oracle puts them.
   `transfer-db-repository.ts`, `event-query-builder.ts`). `requestKey` picks the source,
   and a `blockHash` beside it keeps only the key's copy in that block (another block's hash
   lists nothing; a malformed one is `BAD_USER_INPUT`), on `transactions`, `transfers` and
-  `events`. On `transactions`, `fungibleName` beside `requestKey` or `blockHash` keeps the
-  txs with an event of that module (stock's `EXISTS` on `Events.module`); with any other
-  source the posting list already holds only that token's txs. `transfers(isNFT: true,
+  `events`. On `transactions`, `fungibleName` keeps the txs with an event of that module
+  (stock's `EXISTS` on `Events.module`) on every source. `transfers(isNFT: true,
   accountName)` checks `fungibleName` as every other path does.
 - **`transfers`** use the same sources; rows are the tx's transfers of `fungibleName` with
   `accountName` on either side when given. `crossChainTransfer` is the other half of a
