@@ -459,7 +459,9 @@ the oracle puts them.
   and a `blockHash` beside it keeps only the key's copy in that block (another block's hash
   lists nothing; a malformed one is `BAD_USER_INPUT`), on `transactions`, `transfers` and
   `events`. On `transactions`, `fungibleName` keeps the txs with an event of that module
-  (stock's `EXISTS` on `Events.module`) on every source. `transfers(isNFT: true,
+  (stock's `EXISTS` on `Events.module`) when the source is `accountName`, `requestKey` or
+  `blockHash`; with `fungibleName` as the only source it keeps txs with a transfer of that
+  module (see the known difference above). `transfers(isNFT: true,
   accountName)` checks `fungibleName` as every other path does.
 - **`transfers`** use the same sources; rows are the tx's transfers of `fungibleName` with
   `accountName` on either side when given. `crossChainTransfer` is the other half of a
