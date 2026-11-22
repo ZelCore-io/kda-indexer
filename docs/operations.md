@@ -681,17 +681,26 @@ most 4 per namespace and 16,384 in all). In the open namespaces (`free`, `user`)
 per module, so junk modules there cannot starve a real one. A discovery dropped at any quota is
 counted (`d3_discover_dropped`) and kept in `Meta balances_d3_discover_pending/<chain>/<module>`
 (at most 1,000,000; beyond that only counted, `d3_discover_lost`); the next pass re-queues these
-first, so nothing is lost for good. The reconciler checks 4 queued names per
+first, so nothing is lost for good. Each re-queue scans from after the last pending key it
+scanned (`Meta balances_d3_discover_pending_from`) and wraps around, so entries the queue keeps
+refusing cannot hold back the rest. A discovered name longer than 256 bytes is dropped and
+counted (`d3_discover_too_long`, and `discovered_too_long` in the pass's dropped report): it
+could never be an MDBX key, and real module names are far shorter. The reconciler checks 4 queued names per
 round with `describe-module` on that chain; a module that lists `fungible-v2` becomes a tracked
 token, anything else is dropped. Note: a namespace whose user guard lets anyone deploy behaves
 like `free`; add it to `OPEN_NAMESPACES` if one is found.
 
-History of newly tracked tokens: when a module first gets a `Tokens` row (first TRANSFER in the
-tail, a confirmed discovery, or a reconciler check), it is queued in `Meta
-balances_d3_rewalk/<ModuleId>`. After its walk of new heights, the next pass walks the D3 rules
-for those tokens only over heights `[0, done)`, then clears them. The service does this at most
-once a day (`balances_d3_rewalk_at`), because the walk reads all stored history (about as long
-as the first pass, and it blocks the reconcile loop like it); the CLI does it on every run.
+History of newly tracked tokens: when a module gets a `Tokens` row (first TRANSFER in the
+tail, a confirmed discovery, or a reconciler check) whose first height is below the D3 done
+height, it is queued in `Meta balances_d3_rewalk/<ModuleId>`: a credit below that height may
+predate its tracking. A token first seen at or above the done height is covered by the tail
+marks and the next pass, so it queues no walk. The walk reads the D3 rules for the queued tokens
+only over heights `[0, done)`. In the service it runs in slices of 50,000 txs, one per
+reconcile round, so tail marks, NFT steps and dirty rows keep flowing; each slice commits its
+marks with the walk's cursor (`Meta balances_d3_rewalk_walk`: done height, tokens, next TxNum
+or hot key, budget counters), so a restart resumes there. A new walk starts at most once a day
+(`balances_d3_rewalk_at`); tokens queued during a walk wait for the next one. The CLI walks to
+the end on every run.
 
 Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
 Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot read them.
