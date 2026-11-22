@@ -683,10 +683,29 @@ props! {
         prop_assert_eq!(m.entries.len(), es.len() - (b - a));
         // A merge with the wrong tx count is refused and leaves the manifest as it was.
         let mut m2 = manifest_of(&es);
-        let mut wrong = merged;
+        let mut wrong = merged.clone();
         wrong.tx_count += 1;
         prop_assert!(m2.replace_span(wrong).is_err());
         prop_assert_eq!(m2, manifest_of(&es));
+        // So is one with the wrong block count (F-54).
+        let mut m3 = manifest_of(&es);
+        let mut wrong = merged.clone();
+        wrong.block_count += 1;
+        prop_assert!(m3.replace_span(wrong).is_err());
+        prop_assert_eq!(m3, manifest_of(&es));
+        // An inverted span (a later entry's start, an earlier entry's end) is an error, not
+        // a slice panic, and leaves the manifest as it was (F-54).
+        if a < b {
+            let mut m4 = manifest_of(&es);
+            let inv = RangeEntry {
+                start: es[b].start,
+                end: es[a].end,
+                first_txnum: es[b].first_txnum,
+                ..merged
+            };
+            prop_assert!(m4.replace_span(inv).is_err());
+            prop_assert_eq!(m4, manifest_of(&es));
+        }
     }
 
     fn manifest_hostile_numbers_never_panic(
