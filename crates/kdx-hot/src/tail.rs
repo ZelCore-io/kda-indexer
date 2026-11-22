@@ -24,8 +24,6 @@ pub mod counters {
     pub const UNINDEXED_ACCOUNTS: &str = "unindexed_accounts";
     /// D3 rows dropped at the tail's per-block-per-emitter cap.
     pub const D3_TAIL_DROPPED: &str = crate::balances::counters::D3_TAIL_DROPPED;
-    /// D3 rows the tail left to the hourly pass: a name the dictionary does not hold yet.
-    pub const D3_TAIL_DEFERRED: &str = crate::balances::counters::D3_TAIL_DEFERRED;
     /// Per-chain tx records: `txs.cNN`.
     pub fn txs_chain(chain: u8) -> String {
         format!("txs.c{chain:02}")
@@ -103,7 +101,7 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         }
         // Ruling R-P5P9-192: credits no TRANSFER names, marked like postings (no hourly lag).
         if marking && !x.d3.is_empty() {
-            mark_d3(txn, dict, x, r.key, coin, &mut d3, &mut ops)?;
+            mark_d3(txn, dict, x, r.key, coin, &mut d3)?;
         }
         if !r.events.is_empty() {
             // Plan Task 11: NFT ledger events update `NftBalances` / mark `NftDirty`.
@@ -126,7 +124,6 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         ),
         (counters::txs_chain(chain), n),
         (counters::D3_TAIL_DROPPED.to_owned(), d3.dropped as i64),
-        (counters::D3_TAIL_DEFERRED.to_owned(), d3.deferred as i64),
     ] {
         if delta != 0 {
             txn.add_counter(&name, delta)?;
@@ -134,6 +131,12 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         }
     }
 
+    if !d3.marked.is_empty() {
+        // Kept beside the undo record, in Meta: which D3 rows a block marks depends on the
+        // dictionary and token rows, which a reorg does not roll back, so the undo record
+        // itself stays replay-identical.
+        txn.set_meta(&balances::d3_undo_key(chain, height), &d3.marked)?;
+    }
     txn.put(Table::Undo, &bk, &undo::encode(&ops))?;
     set_checkpoint(txn, Stage::Tail, chain, height, br.hash)?;
     Ok(())
@@ -151,7 +154,8 @@ struct D3Block {
     per_emitter: std::collections::HashMap<String, u32>,
     discovered: usize,
     dropped: u64,
-    deferred: u64,
+    /// account u32 ‖ module u32 ‖ TxKey of each row marked (for the undo).
+    marked: Vec<u8>,
 }
 
 /// The tracked fungible tokens as the tail sees them now: a `Tokens` row that is not a
@@ -175,7 +179,6 @@ fn mark_d3(
     key: TxKey,
     coin: Option<u32>,
     st: &mut D3Block,
-    ops: &mut Vec<UndoOp>,
 ) -> Result<()> {
     use kdx_types::{Dict, DictKind};
     let r = {
@@ -197,15 +200,14 @@ fn mark_d3(
             None => dict.mem().find(DictKind::Module, m),
         };
         let (Some(module), Some(account)) = (module, dict.mem().find(DictKind::Account, a)) else {
-            st.deferred += 1;
+            // Not counted: whether a name exists depends on the dictionary, which a reorg does
+            // not roll back, so a counter would differ between replays.
             continue;
         };
         if balances::mark_row(txn, account, module, key.chain(), key.height(), coin)? {
-            ops.push(UndoOp::BalanceMark {
-                account,
-                module,
-                key,
-            });
+            st.marked.extend_from_slice(&account.to_be_bytes());
+            st.marked.extend_from_slice(&module.to_be_bytes());
+            st.marked.extend_from_slice(&key.to_be_bytes());
         }
     }
     for m in &r.discovered {
@@ -221,6 +223,24 @@ fn mark_d3(
             balances::queue_discovered(txn, m, key.chain(), key.height())?;
         }
     }
+    Ok(())
+}
+
+/// Ruling R-P5P9-192: an undone block's D3 rows are marked again, like undone postings.
+fn undo_d3(txn: &mut RwTxn<'_>, chain: u8, height: u32, coin: Option<u32>) -> Result<()> {
+    let k = balances::d3_undo_key(chain, height);
+    let Some(v) = txn.meta(&k)? else {
+        return Ok(());
+    };
+    if balances::marking() {
+        for e in v.chunks_exact(16) {
+            let account = u32::from_be_bytes(e[..4].try_into().expect("4 bytes"));
+            let module = u32::from_be_bytes(e[4..8].try_into().expect("4 bytes"));
+            let key = TxKey::from_be_bytes(e[8..].try_into().expect("8 bytes"));
+            balances::mark_row(txn, account, module, key.chain(), key.height(), coin)?;
+        }
+    }
+    txn.del(Table::Meta, k.as_bytes())?;
     Ok(())
 }
 
@@ -269,16 +289,6 @@ fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
         UndoOp::Counter { name, delta } => {
             txn.add_counter(name, delta.checked_neg().unwrap_or(i64::MAX))?;
         }
-        UndoOp::BalanceMark {
-            account,
-            module,
-            key,
-        } => {
-            // Ruling R-P5P9-192: an undone D3 credit is re-read like an undone posting.
-            if balances::marking() {
-                balances::mark_row(txn, *account, *module, key.chain(), key.height(), coin)?;
-            }
-        }
     }
     Ok(())
 }
@@ -301,6 +311,7 @@ pub fn unwind_to(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
             undo_op(txn, op, coin)?;
         }
         txn.del(Table::Undo, k)?;
+        undo_d3(txn, chain, h, coin)?;
         n += 1;
     }
     match txn.get(Table::Headers, &block_key(chain, height))? {

@@ -122,6 +122,10 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
             txn.del(Table::HeaderByHash, &b.hash.0)?;
             txn.del(Table::Headers, k)?;
             txn.del(Table::Undo, k)?;
+            txn.del(
+                Table::Meta,
+                kdx_hot::balances::d3_undo_key(c, b.height as u32).as_bytes(),
+            )?;
             n += 1;
         }
     }

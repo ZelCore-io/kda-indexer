@@ -76,53 +76,182 @@ pub mod meta {
     /// JSON: the per-token budget counters of a running D3 pass's frozen walk, written with
     /// its cursor so a resume does not grant a token its budget twice (review L1).
     pub const BALANCES_SEED_TOKEN_RECEIVERS_BUDGET: &str = "balances_seed_token_receivers_budget";
-    /// Prefix of the D3 discovery queue `balances_d3_discover/{chain:02}/{module}` (u32: the
+    /// Prefix of the D3 discovery queue `balances_d3_discover/{ns}/{chain:02}/{module}` (u32: the
     /// lowest height that named it): modules a tx put forward as tokens (cross-chain defpact,
     /// own or same-namespace `fungible-v2` modref). The reconciler checks each with
     /// `describe-module` on that chain, a few reads per round, and tracks it only when it
-    /// lists `fungible-v2` (review M1). At most [`super::D3_DISCOVER_QUEUE_MAX`] entries.
+    /// lists `fungible-v2` (review M1). At most [`super::D3_DISCOVER_QUEUE_MAX`] entries, and
+    /// [`super::D3_DISCOVER_PER_NAMESPACE`] per namespace.
     pub const D3_DISCOVER: &str = "balances_d3_discover/";
+    /// u32: entries in the discovery queue.
+    pub const D3_DISCOVER_LEN: &str = "balances_d3_discover_len";
+    /// Prefix of `balances_d3_discover_pending/{chain:02}/{module}` (u32 height): discoveries
+    /// dropped at a quota or a full queue; the next pass re-queues them first.
+    pub const D3_DISCOVER_PENDING: &str = "balances_d3_discover_pending/";
+    /// u32: entries in the pending list.
+    pub const D3_DISCOVER_PENDING_LEN: &str = "balances_d3_discover_pending_len";
     /// Prefix of `balances_d3_rewalk/{ModuleId:010}` (empty): tokens tracked since the last
     /// D3 pass walked history. The next pass walks the D3 rules for them from height 0 up to
     /// its done height (review M2).
     pub const D3_REWALK: &str = "balances_d3_rewalk/";
+    /// Prefix of [`super::d3_undo_key`]: D3 rows a hot block marked (removed by its undo, or
+    /// when the freezer moves the block out of the hot store).
+    pub const D3_UNDO: &str = "balances_d3_undo/";
     /// u32 unix seconds: when a D3 pass last walked history for newly tracked tokens.
     pub const D3_REWALK_AT: &str = "balances_d3_rewalk_at";
 }
 
 /// Entries the D3 discovery queue holds at most; more are dropped and counted
 /// ([`counters::D3_DISCOVER_DROPPED`]).
-pub const D3_DISCOVER_QUEUE_MAX: usize = 1024;
+pub const D3_DISCOVER_QUEUE_MAX: usize = 16_384;
+/// Dropped discoveries kept for a later pass at most.
+pub const D3_DISCOVER_PENDING_MAX: usize = 1_000_000;
+/// Entries one namespace may hold in the discovery queue (security review).
+pub const D3_DISCOVER_PER_NAMESPACE: usize = 4;
 
 /// Counters of the D3 marks outside the seed pass.
 pub mod counters {
     /// D3 rows the tail dropped at its per-tx or per-block-per-emitter caps.
     pub const D3_TAIL_DROPPED: &str = "d3_tail_dropped";
-    /// D3 rows the tail left to the hourly pass because a name was not in the dictionary.
-    pub const D3_TAIL_DEFERRED: &str = "d3_tail_deferred";
     /// Discovered modules dropped at a full discovery queue.
     pub const D3_DISCOVER_DROPPED: &str = "d3_discover_dropped";
+    /// Dropped discoveries not kept because the pending list was full.
+    pub const D3_DISCOVER_LOST: &str = "d3_discover_lost";
+}
+
+/// The key a discovered module's quota counts against (security review): its namespace
+/// (`ns` of `ns.module`; `-` for root modules), or in an open namespace (`free`, `user`: anyone
+/// deploys there) the module itself, so junk modules there cannot starve a real one.
+pub fn discover_namespace(module: &str) -> &str {
+    match module.split_once('.') {
+        Some((n, _)) if kdx_decode::receivers::OPEN_NAMESPACES.contains(&n) => module,
+        Some((n, _)) => n,
+        None => "-",
+    }
+}
+
+fn discover_key(module: &str, chain: u8) -> String {
+    format!(
+        "{}{}/{chain:02}/{module}",
+        meta::D3_DISCOVER,
+        discover_namespace(module)
+    )
 }
 
 /// Queue `module` (a discovered name, not tracked yet) for its `describe-module` check on
-/// `chain` (review M1). Returns false when the queue is full (dropped and counted).
+/// `chain` (review M1). Returns false when it is dropped and counted: its namespace already has
+/// [`D3_DISCOVER_PER_NAMESPACE`] entries queued (security review: junk namespaces cannot crowd
+/// out a real token), or the queue is full.
 pub fn queue_discovered(txn: &mut RwTxn<'_>, module: &str, chain: u8, height: u32) -> Result<bool> {
-    let k = format!("{}{chain:02}/{module}", meta::D3_DISCOVER);
+    if try_queue(txn, module, chain, height)? {
+        return Ok(true);
+    }
+    txn.add_counter(counters::D3_DISCOVER_DROPPED, 1)?;
+    pend_discovered(txn, module, chain, height)?;
+    Ok(false)
+}
+
+fn pending_key(module: &str, chain: u8) -> String {
+    format!("{}{chain:02}/{module}", meta::D3_DISCOVER_PENDING)
+}
+
+/// Keep a dropped discovery for the next pass, which re-queues it first (nothing is lost for
+/// good). At most [`D3_DISCOVER_PENDING_MAX`] entries; beyond that it is only counted.
+pub fn pend_discovered(txn: &mut RwTxn<'_>, module: &str, chain: u8, height: u32) -> Result<()> {
+    let k = pending_key(module, chain);
+    if let Some(h) = txn.meta(&k)?.as_deref().and_then(be_u32) {
+        if height < h {
+            txn.set_meta(&k, &height.to_be_bytes())?;
+        }
+        return Ok(());
+    }
+    let len = txn
+        .meta(meta::D3_DISCOVER_PENDING_LEN)?
+        .as_deref()
+        .and_then(be_u32)
+        .unwrap_or(0);
+    if len as usize >= D3_DISCOVER_PENDING_MAX {
+        txn.add_counter(counters::D3_DISCOVER_LOST, 1)?;
+        return Ok(());
+    }
+    txn.set_meta(&k, &height.to_be_bytes())?;
+    txn.set_meta(meta::D3_DISCOVER_PENDING_LEN, &(len + 1).to_be_bytes())
+}
+
+/// Move up to `n` pending discoveries into the queue (those it refuses stay pending). Returns
+/// how many moved.
+pub fn requeue_pending(txn: &mut RwTxn<'_>, n: usize) -> Result<usize> {
+    let p = meta::D3_DISCOVER_PENDING.as_bytes();
+    let rows = txn.scan_limit(Table::Meta, p, n, |k| k.starts_with(p))?;
+    let mut moved = 0;
+    for (k, v) in rows {
+        let Some((c, m)) = std::str::from_utf8(&k[p.len()..])
+            .ok()
+            .and_then(|r| r.split_once('/'))
+        else {
+            continue;
+        };
+        let (Ok(c), Some(h)) = (c.parse::<u8>(), be_u32(&v)) else {
+            continue;
+        };
+        let m = m.to_owned();
+        if try_queue(txn, &m, c, h)? {
+            txn.del(Table::Meta, &k)?;
+            let len = txn
+                .meta(meta::D3_DISCOVER_PENDING_LEN)?
+                .as_deref()
+                .and_then(be_u32)
+                .unwrap_or(0);
+            txn.set_meta(
+                meta::D3_DISCOVER_PENDING_LEN,
+                &len.saturating_sub(1).to_be_bytes(),
+            )?;
+            moved += 1;
+        }
+    }
+    Ok(moved)
+}
+
+/// Pending discoveries: `(module, chain)`.
+pub fn discover_pending(txn: &impl Txn, n: usize) -> Result<Vec<(String, u8)>> {
+    let p = meta::D3_DISCOVER_PENDING.as_bytes();
+    Ok(txn
+        .scan_limit(Table::Meta, p, n, |k| k.starts_with(p))?
+        .into_iter()
+        .filter_map(|(k, _)| {
+            let (c, m) = std::str::from_utf8(k.get(p.len()..)?)
+                .ok()?
+                .split_once('/')?;
+            Some((m.to_owned(), c.parse().ok()?))
+        })
+        .collect())
+}
+
+/// Queue `module` unless its quota or the queue is full.
+fn try_queue(txn: &mut RwTxn<'_>, module: &str, chain: u8, height: u32) -> Result<bool> {
+    let k = discover_key(module, chain);
     if let Some(h) = txn.meta(&k)?.as_deref().and_then(be_u32) {
         if height < h {
             txn.set_meta(&k, &height.to_be_bytes())?;
         }
         return Ok(true);
     }
-    let p = meta::D3_DISCOVER.as_bytes();
-    let n = txn
-        .scan_limit(Table::Meta, p, D3_DISCOVER_QUEUE_MAX, |k| k.starts_with(p))?
+    let ns = format!("{}{}/", meta::D3_DISCOVER, discover_namespace(module));
+    let in_ns = txn
+        .scan_limit(Table::Meta, ns.as_bytes(), D3_DISCOVER_PER_NAMESPACE, |k| {
+            k.starts_with(ns.as_bytes())
+        })?
         .len();
-    if n >= D3_DISCOVER_QUEUE_MAX {
-        txn.add_counter(counters::D3_DISCOVER_DROPPED, 1)?;
+    let len = txn
+        .meta(meta::D3_DISCOVER_LEN)?
+        .as_deref()
+        .and_then(be_u32)
+        .unwrap_or(0);
+    if in_ns >= D3_DISCOVER_PER_NAMESPACE || len as usize >= D3_DISCOVER_QUEUE_MAX {
         return Ok(false);
     }
     txn.set_meta(&k, &height.to_be_bytes())?;
+    txn.set_meta(meta::D3_DISCOVER_LEN, &(len + 1).to_be_bytes())?;
     Ok(true)
 }
 
@@ -134,7 +263,8 @@ pub fn discovered_queue(txn: &impl Txn, n: usize) -> Result<Vec<(String, u8, u32
         .into_iter()
         .filter_map(|(k, v)| {
             let rest = std::str::from_utf8(k.get(p.len()..)?).ok()?;
-            let (c, m) = rest.split_once('/')?;
+            let mut it = rest.splitn(3, '/');
+            let (_, c, m) = (it.next()?, it.next()?, it.next()?);
             Some((m.to_owned(), c.parse().ok()?, be_u32(&v)?))
         })
         .collect())
@@ -142,9 +272,21 @@ pub fn discovered_queue(txn: &impl Txn, n: usize) -> Result<Vec<(String, u8, u32
 
 /// Remove one discovery queue entry.
 pub fn unqueue_discovered(txn: &mut RwTxn<'_>, module: &str, chain: u8) -> Result<()> {
-    let k = format!("{}{chain:02}/{module}", meta::D3_DISCOVER);
-    txn.del(Table::Meta, k.as_bytes())?;
+    if txn.del(Table::Meta, discover_key(module, chain).as_bytes())? {
+        let len = txn
+            .meta(meta::D3_DISCOVER_LEN)?
+            .as_deref()
+            .and_then(be_u32)
+            .unwrap_or(0);
+        txn.set_meta(meta::D3_DISCOVER_LEN, &len.saturating_sub(1).to_be_bytes())?;
+    }
     Ok(())
+}
+
+/// `Meta` key of the D3 rows the tail marked for block (chain, height): account u32 ‖ module
+/// u32 ‖ TxKey per row; a reorg's undo marks them again (ruling R-P5P9-192).
+pub fn d3_undo_key(chain: u8, height: u32) -> String {
+    format!("{}{chain:02}/{height:010}", meta::D3_UNDO)
 }
 
 /// Tokens waiting for their D3 history walk (review M2).

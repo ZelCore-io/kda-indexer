@@ -33,13 +33,6 @@ pub enum UndoOp {
         name: String,
         delta: i64,
     },
-    /// A D3 row the tail marked (receivers no TRANSFER names, ruling R-P5P9-192): on undo it
-    /// is marked again at `key`'s height, like an undone posting.
-    BalanceMark {
-        account: u32,
-        module: u32,
-        key: TxKey,
-    },
 }
 
 pub fn encode(ops: &[UndoOp]) -> Vec<u8> {
@@ -85,16 +78,6 @@ pub fn encode(ops: &[UndoOp]) -> Vec<u8> {
                 put_bytes(&mut out, name.as_bytes());
                 out.extend_from_slice(&delta.to_be_bytes());
             }
-            UndoOp::BalanceMark {
-                account,
-                module,
-                key,
-            } => {
-                out.push(6);
-                out.extend_from_slice(&account.to_be_bytes());
-                out.extend_from_slice(&module.to_be_bytes());
-                out.extend_from_slice(&key.to_be_bytes());
-            }
         }
     }
     out
@@ -125,11 +108,6 @@ pub fn decode(mut b: &[u8]) -> Result<Vec<UndoOp>> {
             5 => UndoOp::Counter {
                 name: String::from_utf8(get_bytes(buf)?.to_vec()).context("counter name")?,
                 delta: i64::from_be_bytes(take_array(buf)?),
-            },
-            6 => UndoOp::BalanceMark {
-                account: u32::from_be_bytes(take_array(buf)?),
-                module: u32::from_be_bytes(take_array(buf)?),
-                key: TxKey::from_be_bytes(take_array(buf)?),
             },
             t => bail!("unknown undo op tag {t}"),
         });

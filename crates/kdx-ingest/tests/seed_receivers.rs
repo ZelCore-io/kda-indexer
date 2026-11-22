@@ -960,9 +960,9 @@ fn a_token_over_its_distinct_row_budget_is_dropped_alone_and_the_pass_completes(
         .expect("drops recorded");
     let d: Value = serde_json::from_slice(&d).unwrap();
     // Drops count takes (a repeat of a dropped row counts again; keeping them distinct would
-    // need memory an attacker controls): per tx 54 MINT names and the exec's result string
-    // (below the events fork) over the 10 taken.
-    assert_eq!(d["tokens"]["free.spam"].as_u64(), Some(3 * 55), "{d}");
+    // need memory an attacker controls): per tx the 54 MINT names over the 10 taken. The exec's
+    // strings are charged to the tx sender, not to free.spam.
+    assert_eq!(d["tokens"]["free.spam"].as_u64(), Some(3 * 54), "{d}");
     assert!(d["tokens"].get("kaddex.kdx").is_none(), "{d}");
 }
 
@@ -1042,21 +1042,19 @@ fn commit_block(c: &kdx_ingest::Ctx, b: (kdx_decode::DecodedBlock, VerifyReport)
     .unwrap();
 }
 
-/// The D3 rows the tail marked for block (0, `height`), from its undo record.
+/// The D3 rows the tail marked for block (0, `height`), from the record its undo reads.
 fn tail_d3_rows(c: &kdx_ingest::Ctx, height: u32) -> std::collections::BTreeSet<(u32, u32)> {
     let txn = c.hot.ro().unwrap();
     let v = txn
-        .get(Table::Undo, &kdx_hot::tables::block_key(0, height))
+        .meta(&balances::d3_undo_key(0, height))
         .unwrap()
-        .expect("undo record");
-    kdx_hot::undo::decode(&v)
-        .unwrap()
-        .into_iter()
-        .filter_map(|op| match op {
-            kdx_hot::UndoOp::BalanceMark {
-                account, module, ..
-            } => Some((account, module)),
-            _ => None,
+        .unwrap_or_default();
+    v.chunks_exact(16)
+        .map(|e| {
+            (
+                u32::from_be_bytes(e[..4].try_into().unwrap()),
+                u32::from_be_bytes(e[4..8].try_into().unwrap()),
+            )
         })
         .collect()
 }
@@ -1106,25 +1104,13 @@ fn pass_d3_rows(c: &kdx_ingest::Ctx, height: u32) -> (std::collections::BTreeSet
 #[test]
 fn the_tail_marks_the_same_d3_rows_as_the_pass_and_a_reorg_marks_them_again() {
     let (_d, c) = store();
-    let deferred_before = c
-        .hot
-        .ro()
-        .unwrap()
-        .counter(kdx_hot::balances::counters::D3_TAIL_DEFERRED)
-        .unwrap();
     commit_block(&c, d3_block(25));
     let tail = tail_d3_rows(&c, 25);
     let (pass, unknown) = pass_d3_rows(&c, 25);
     assert!(!tail.is_empty());
     assert_eq!(tail, pass);
     // Rows with a name no posting interned (here the pre-fork exec strings) wait for the pass.
-    let deferred = c
-        .hot
-        .ro()
-        .unwrap()
-        .counter(kdx_hot::balances::counters::D3_TAIL_DEFERRED)
-        .unwrap();
-    assert_eq!(deferred - deferred_before, unknown);
+    assert!(unknown > 0);
     // The credits of the fixture, marked at the block's height with no verified-row skip.
     for (a, m) in [
         (WRECV, "free.wiza"),
@@ -1166,8 +1152,7 @@ fn the_tail_caps_one_emitter_per_block_and_still_applies_it() {
         })
         .collect();
     commit_block(&c, block_of(25, txs));
-    // Each tx charges free.spam 65 rows: 64 MINT names and, below the events fork, the
-    // exec's result string ("Write succeeded", the same row in every tx).
+    // Each tx charges free.spam its 64 MINT names (the exec's strings go to the sender's key).
     let cap = kdx_hot::tail::D3_ROWS_PER_EMITTER_PER_BLOCK as usize;
     let rows = tail_d3_rows(&c, 25);
     assert!(
@@ -1181,7 +1166,7 @@ fn the_tail_caps_one_emitter_per_block_and_still_applies_it() {
         .unwrap()
         .counter(kdx_hot::balances::counters::D3_TAIL_DROPPED)
         .unwrap();
-    assert_eq!(dropped as usize, 40 * 65 - cap);
+    assert_eq!(dropped as usize, 40 * 64 - cap);
     assert!(c
         .hot
         .ro()
@@ -1192,7 +1177,7 @@ fn the_tail_caps_one_emitter_per_block_and_still_applies_it() {
 }
 
 #[test]
-fn a_spoofed_modref_is_never_tracked_and_discovery_is_capped_per_pass() {
+fn a_spoofed_modref_is_never_tracked_and_discovery_is_capped_per_namespace() {
     let (_d, c) = store();
     // 100 txs: kaddex.alchemist events naming 4 modules each (kaddex.f<i>-<j>), none real.
     let txs: Vec<Value> = (0..100u32)
@@ -1213,19 +1198,20 @@ fn a_spoofed_modref_is_never_tracked_and_discovery_is_capped_per_pass() {
     let after_tail = balances::discovered_queue(&c.hot.ro().unwrap(), 10_000)
         .unwrap()
         .len();
-    assert_eq!(after_tail, kdx_hot::tail::D3_DISCOVER_PER_BLOCK);
+    // One namespace holds at most a few queue entries (security review).
+    assert_eq!(after_tail, balances::D3_DISCOVER_PER_NAMESPACE);
     let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
     assert!(
-        rep.tokens_noted as usize <= seed_receivers::MAX_DISCOVERED_PER_PASS,
+        rep.tokens_noted as usize <= seed_receivers::MAX_DISCOVERED_PER_NAMESPACE,
         "{rep:?}"
     );
-    assert_eq!(rep.discovered_dropped, 400 - 256, "{rep:?}");
-    let q = balances::discovered_queue(&c.hot.ro().unwrap(), 10_000).unwrap();
-    assert!(
-        q.len() <= seed_receivers::MAX_DISCOVERED_PER_PASS,
-        "{}",
-        q.len()
+    assert_eq!(
+        rep.discovered_namespace_dropped as usize,
+        400 - seed_receivers::MAX_DISCOVERED_PER_NAMESPACE,
+        "{rep:?}"
     );
+    let q = balances::discovered_queue(&c.hot.ro().unwrap(), 10_000).unwrap();
+    assert_eq!(q.len(), balances::D3_DISCOVER_PER_NAMESPACE);
     // The node says none of them is a module: nothing is tracked and the queue empties.
     let no = vec![Some(false); q.len()];
     let (t, r) = seed_receivers::check_discovered(&c.hot, &c.dict, &q, &no).unwrap();
@@ -1264,6 +1250,149 @@ fn a_token_tracked_after_the_pass_gets_its_history_walked() {
     assert_eq!((rep.from, rep.rewalk_tokens), (27, 1), "{rep:?}");
     assert!(dirty_in(&c, LATE_ACC, "free.late"), "{rep:?}");
     assert!(balances::rewalk_pending(&c.hot.ro().unwrap())
+        .unwrap()
+        .is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1, security review: exec rows are charged to the sender; discovery per namespace.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn junk_execs_calling_a_token_do_not_spend_its_event_budget() {
+    let (_d, c) = d3_store();
+    // 20 txs call free.wiza with 64 junk literals each and emit nothing of it; then a tx
+    // where free.wiza mints to LATE_ACC (non-TRANSFER event, charged to free.wiza).
+    let mut txs: Vec<Value> = (0..20u32)
+        .map(|i| {
+            let lits: Vec<String> = (0..64)
+                .map(|j| format!("\"k:{:064x}\"", i * 64 + j))
+                .collect();
+            let code = format!("(free.wiza.details {})", lits.join(" "));
+            let cmd = json!({"payload": {"exec": {"code": code, "data": {}}},
+                "meta": {"sender": "k:attacker"}});
+            d3_tx(6000 + i, cmd, json!([]), Value::Null)
+        })
+        .collect();
+    let cmd = json!({"payload": {"exec": {"code": "(free.wiza.mint)", "data": {}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([
+        event("free.wiza", "TRANSFER", json!([SENDER, "k:wiza-pool", 1.0])),
+        event("free.wiza", "MINT", json!([LATE_ACC, 5.0])),
+    ]);
+    txs.push(d3_tx(6100, cmd, evs, Value::Null));
+    commit_block(&c, block_of(26, txs));
+    clear_marks(&c);
+    let o = Opts {
+        max_event_candidates: 10,
+        ..d3_opts(false)
+    };
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    assert!(dirty_in(&c, LATE_ACC, "free.wiza"), "{rep:?}");
+    assert!(!rep.dropped_tokens.contains_key("free.wiza"), "{rep:?}");
+}
+
+#[test]
+fn a_thousand_junk_namespaces_cannot_stop_a_real_tokens_discovery() {
+    let (_d, c) = store();
+    let modref = |ns: &str, n: &str| {
+        json!({"refSpec": [{"namespace": null, "name": "fungible-v2"}],
+            "refName": {"namespace": ns, "name": n}})
+    };
+    let mut txs: Vec<Value> = (0..1000u32)
+        .map(|i| {
+            let ns = format!("n_{i:040x}");
+            let cmd = json!({"payload": {"exec": {"code": "(x)", "data": {}}},
+                "meta": {"sender": SENDER}});
+            let evs = json!([event(
+                &format!("{ns}.junk"),
+                "WRAP",
+                json!([modref(&ns, "tok"), modref(&ns, "tok2"), SKDX_ACC])
+            )]);
+            d3_tx(7000 + i, cmd, evs, Value::Null)
+        })
+        .collect();
+    let cmd = json!({"payload": {"exec": {"code": "(kaddex.alchemist.wrap)", "data": {}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([event(
+        "kaddex.alchemist",
+        "WRAP",
+        json!([modref("kaddex", "skdx"), 1.0, SKDX_ACC])
+    )]);
+    txs.push(d3_tx(8000, cmd, evs, Value::Null));
+    commit_block(&c, block_of(25, txs));
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    let q = balances::discovered_queue(&c.hot.ro().unwrap(), 100_000).unwrap();
+    assert!(q.iter().any(|(m, _, _)| m == "kaddex.skdx"), "{rep:?}");
+}
+
+/// A tx whose `emitter` event names `fungible-v2` modrefs to `targets` (and [`SKDX_ACC`]).
+fn modref_tx(n: u32, emitter: &str, targets: &[&str]) -> Value {
+    let refs: Vec<Value> = targets
+        .iter()
+        .map(|t| {
+            let (ns, name) = t.split_once('.').unwrap();
+            json!({"refSpec": [{"namespace": null, "name": "fungible-v2"}],
+                "refName": {"namespace": ns, "name": name}})
+        })
+        .collect();
+    let cmd = json!({"payload": {"exec": {"code": "(x)", "data": {}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([event(emitter, "WRAP", json!([refs, SKDX_ACC]))]);
+    d3_tx(n, cmd, evs, Value::Null)
+}
+
+#[test]
+fn junk_free_modules_cannot_starve_a_real_free_token() {
+    let (_d, c) = store();
+    // Ten junk free.* modules each name themselves, then free.real does.
+    let mut txs: Vec<Value> = (0..10u32)
+        .map(|i| {
+            let m = format!("free.junk{i}");
+            modref_tx(9000 + i, &m, &[&m])
+        })
+        .collect();
+    txs.push(modref_tx(9100, "free.real", &["free.real"]));
+    commit_block(&c, block_of(25, txs));
+    seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    let q = balances::discovered_queue(&c.hot.ro().unwrap(), 10_000).unwrap();
+    assert!(q.iter().any(|(m, _, _)| m == "free.real"), "{q:?}");
+}
+
+#[test]
+fn a_discovery_dropped_at_a_quota_is_requeued_by_the_next_pass() {
+    let (_d, c) = store();
+    // Six kaddex modules in one block: four fit the namespace quota, two are kept pending.
+    let names: Vec<String> = (0..6).map(|i| format!("kaddex.f{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    commit_block(
+        &c,
+        block_of(
+            25,
+            vec![
+                modref_tx(9200, "kaddex.alchemist", &refs[..3]),
+                modref_tx(9201, "kaddex.alchemist", &refs[3..]),
+            ],
+        ),
+    );
+    seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    let q = balances::discovered_queue(&c.hot.ro().unwrap(), 100).unwrap();
+    assert_eq!(q.len(), balances::D3_DISCOVER_PER_NAMESPACE);
+    let pending = balances::discover_pending(&c.hot.ro().unwrap(), 100).unwrap();
+    assert_eq!(pending.len(), 2, "{pending:?}");
+    // The node rejects the four; the next pass re-queues the two first.
+    let no = vec![Some(false); q.len()];
+    seed_receivers::check_discovered(&c.hot, &c.dict, &q, &no).unwrap();
+    commit_block(&c, block_of(26, vec![xchain_finish(9, "coin", SENDER)]));
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    assert_eq!(rep.discovered_requeued, 2, "{rep:?}");
+    let q = balances::discovered_queue(&c.hot.ro().unwrap(), 100).unwrap();
+    let mut got: Vec<&str> = q.iter().map(|(m, _, _)| m.as_str()).collect();
+    got.sort();
+    let mut want: Vec<&str> = pending.iter().map(|(m, _)| m.as_str()).collect();
+    want.sort();
+    assert_eq!(got, want);
+    assert!(balances::discover_pending(&c.hot.ro().unwrap(), 100)
         .unwrap()
         .is_empty());
 }

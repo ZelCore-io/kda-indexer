@@ -218,6 +218,7 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
             .is_some(),
         "d3_discover_queued": kdx_hot::balances::discovered_queue(&txn, kdx_hot::balances::D3_DISCOVER_QUEUE_MAX)?.len(),
         "d3_rewalk_pending": kdx_hot::balances::rewalk_pending(&txn)?.len(),
+        "d3_discover_pending": kdx_hot::balances::discover_pending(&txn, kdx_hot::balances::D3_DISCOVER_PENDING_MAX)?.len(),
         "seed_token_receivers_dropped": txn
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED)?
             .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),

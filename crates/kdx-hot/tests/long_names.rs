@@ -99,7 +99,8 @@ fn rows(store: &HotStore) -> Vec<(String, Vec<u8>, Vec<u8>)> {
                 && [
                     kdx_hot::balances::meta::MARKED_THROUGH,
                     kdx_hot::balances::meta::D3_REWALK,
-                    kdx_hot::balances::meta::D3_DISCOVER,
+                    // every `balances_d3_discover*` key: queue, its length, pending list
+                    "balances_d3_discover",
                 ]
                 .iter()
                 .any(|p| k.starts_with(p.as_bytes()))

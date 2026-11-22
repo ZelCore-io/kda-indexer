@@ -130,6 +130,14 @@ pub struct ReceiversReport {
     /// D3: discovered modules not queued because the pass reached
     /// [`MAX_DISCOVERED_PER_PASS`] (review M1).
     pub discovered_dropped: u64,
+    /// D3: discovered modules not queued because their namespace reached
+    /// [`MAX_DISCOVERED_PER_NAMESPACE`] in this pass (security review).
+    pub discovered_namespace_dropped: u64,
+    /// D3: pending discoveries (dropped earlier at a quota) re-queued at the start.
+    pub discovered_requeued: u64,
+    /// D3: exec-derived rows dropped at a sender's budget, and at the exec ceiling.
+    pub dropped_exec_sender: u64,
+    pub dropped_exec_ceiling: u64,
     /// D3: newly tracked tokens whose history this run walked (review M2); a dry run: would
     /// walk.
     pub rewalk_tokens: u64,
@@ -251,14 +259,25 @@ struct Pending {
     untracked: u64,
     /// D3: hashes of the capped rows taken so far in this pass (a repeat is free).
     seen: HashSet<u64>,
-    /// D3: modules queued by this pass so far (the per-pass discovery cap).
+    /// D3: modules queued by this pass so far (the per-pass discovery cap), and per namespace
+    /// (security review: junk namespaces must not fill the cap).
     queued: usize,
+    queued_ns: HashMap<String, usize>,
+    /// D3: discoveries dropped at the per-pass quotas, kept pending for the next pass.
+    dropped_disc: HashMap<(String, u8), u32>,
+    /// D3: exec-derived rows taken per sender, and in all (security review: charged to the
+    /// sender, never to the called token).
+    exec_senders: HashMap<String, u64>,
+    exec_total: u64,
     /// JSON for `BALANCES_SEED_TOKEN_RECEIVERS_BUDGET`, written with the next cursor.
     budget: Option<Vec<u8>>,
 }
 
 /// Modules the pass may queue for their `describe-module` check per pass (review M1).
-pub const MAX_DISCOVERED_PER_PASS: usize = 256;
+pub const MAX_DISCOVERED_PER_PASS: usize = 8192;
+/// Of those, per namespace (`ns` of `ns.module`; root modules share one), so a flood of junk
+/// namespaces cannot crowd out a real token (security review).
+pub const MAX_DISCOVERED_PER_NAMESPACE: usize = 4;
 
 /// Why a module's candidate is not marked (D3): a not-fungible verdict, or the row cap (I-7)
 /// for a key without a row. `None`: mark it.
@@ -347,6 +366,9 @@ impl Pending {
                 rep.tokens_noted += 1;
             }
         }
+        for ((m, c), h) in self.dropped_disc.drain() {
+            balances::pend_discovered(&mut txn, &m, c, h)?;
+        }
         if let Some(c) = cursor {
             txn.set_meta(cursor_key, &c)?;
             if let Some(b) = self.budget.take() {
@@ -402,6 +424,7 @@ impl Pending {
                 rep.dirty_inserted += 1;
             }
         }
+        self.dropped_disc.clear();
         for ((m, _), _) in std::mem::take(&mut self.tokens) {
             let tracked = match d.find(DictKind::Module, &m) {
                 Some(id) => id == coin || balances::token_row(&txn, id)?.is_some(),
@@ -426,6 +449,8 @@ struct Walk {
     max_event_candidates: u64,
     max_untracked_candidates: u64,
     max_total_candidates: u64,
+    max_exec_per_sender: u64,
+    max_exec_candidates: u64,
 }
 
 /// A module whose rows the pass may mark: coin, or a name `/local` can call (B-1).
@@ -457,13 +482,21 @@ fn add(
                 if w.only.is_none() {
                     for m in t.discovered.iter().filter(|m| !w.tokens.contains(*m)) {
                         let key = (m.clone(), k.chain());
+                        let ns = balances::discover_namespace(m).to_owned();
                         if let Some(e) = p.tokens.get_mut(&key) {
                             *e = (*e).min(k.height());
+                        } else if p.queued_ns.get(&ns).copied().unwrap_or(0)
+                            >= MAX_DISCOVERED_PER_NAMESPACE
+                        {
+                            rep.discovered_namespace_dropped += 1;
+                            p.dropped_disc.entry(key).or_insert(k.height());
                         } else if p.queued < MAX_DISCOVERED_PER_PASS {
                             p.queued += 1;
+                            *p.queued_ns.entry(ns).or_insert(0) += 1;
                             p.tokens.insert(key, k.height());
                         } else {
                             rep.discovered_dropped += 1;
+                            p.dropped_disc.entry(key).or_insert(k.height());
                         }
                     }
                 }
@@ -505,6 +538,9 @@ fn add(
 
 /// Budget one capped candidate (row hash `row`) charged to emitter `em` (review H2):
 /// - a row this pass already took is free (repeating strings costs nothing);
+/// - an exec-derived row (`exec:<sender>`) is charged to its tx's sender
+///   (`max_exec_per_sender`) under one exec ceiling (`max_exec_candidates`), never to the
+///   called token; drops are counted (`dropped_exec_sender`, `dropped_exec_ceiling`);
 /// - a tracked token has its own budget of distinct rows (`max_event_candidates`); over it the
 ///   row is dropped and counted for that token only (`dropped_tokens`), the pass completes;
 /// - every untracked emitter shares one bucket (`max_untracked_candidates`) under a global
@@ -514,7 +550,20 @@ fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str, row: u64
     if p.seen.contains(&row) {
         return true;
     }
-    if w.tokens.contains(em) {
+    if let Some(sender) = em.strip_prefix(kdx_decode::receivers::EXEC_BUCKET) {
+        // Exec-derived rows: per sender, under one exec ceiling (security review).
+        if p.exec_total >= w.max_exec_candidates {
+            rep.dropped_exec_ceiling += 1;
+            return false;
+        }
+        let n = p.exec_senders.entry(sender.to_owned()).or_insert(0);
+        if *n >= w.max_exec_per_sender {
+            rep.dropped_exec_sender += 1;
+            return false;
+        }
+        *n += 1;
+        p.exec_total += 1;
+    } else if w.tokens.contains(em) {
         let n = p.emitters.entry(em.to_owned()).or_insert(0);
         if *n >= w.max_event_candidates {
             *rep.dropped_tokens.entry(em.to_owned()).or_insert(0) += 1;
@@ -595,6 +644,10 @@ struct Carry {
     /// Distinct rows taken per tracked token, and dropped per token (review L1, H2).
     taken: BTreeMap<String, u64>,
     dropped: BTreeMap<String, u64>,
+    /// Exec-derived rows taken, and dropped at a sender's budget / the exec ceiling (the
+    /// per-sender counts are not carried: a resume may grant a sender its budget again, the
+    /// ceiling still binds).
+    exec: [u64; 3],
 }
 
 fn map_minus(a: &BTreeMap<String, u64>, b: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
@@ -614,6 +667,11 @@ impl Carry {
             event_candidates: rep.event_candidates,
             taken: p.emitters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             dropped: rep.dropped_tokens.clone(),
+            exec: [
+                p.exec_total,
+                rep.dropped_exec_sender,
+                rep.dropped_exec_ceiling,
+            ],
         }
     }
     fn minus(&self, o: &Carry) -> Carry {
@@ -625,13 +683,14 @@ impl Carry {
             event_candidates: self.event_candidates - o.event_candidates,
             taken: map_minus(&self.taken, &o.taken),
             dropped: map_minus(&self.dropped, &o.dropped),
+            exec: [0, 1, 2].map(|i| self.exec[i] - o.exec[i]),
         }
     }
     /// The per-token maps, for `BALANCES_SEED_TOKEN_RECEIVERS_BUDGET` (keyed by the cursor's
     /// start height and next TxNum, so a stale one is never added).
     fn budget_json(&self, from: u32, next: u64) -> Vec<u8> {
         serde_json::json!({"from": from, "next": next, "taken": self.taken,
-            "dropped": self.dropped})
+            "dropped": self.dropped, "exec": self.exec})
         .to_string()
         .into_bytes()
     }
@@ -683,11 +742,9 @@ fn parse_cursor(v: &[u8]) -> Option<(u32, u64, Carry)> {
 }
 
 /// The per-token maps stored with the cursor `(from, next)`; empty when absent or stale.
-fn parse_budget(
-    v: Option<&[u8]>,
-    from: u32,
-    next: u64,
-) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+type Budget = (BTreeMap<String, u64>, BTreeMap<String, u64>, [u64; 3]);
+
+fn parse_budget(v: Option<&[u8]>, from: u32, next: u64) -> Budget {
     let Some(v) = v.and_then(|v| serde_json::from_slice::<serde_json::Value>(v).ok()) else {
         return Default::default();
     };
@@ -701,7 +758,8 @@ fn parse_budget(
             .filter_map(|(k, v)| Some((k.clone(), v.as_u64()?)))
             .collect()
     };
-    (map(&v["taken"]), map(&v["dropped"]))
+    let e = |i: usize| v["exec"][i].as_u64().unwrap_or(0);
+    (map(&v["taken"]), map(&v["dropped"]), [e(0), e(1), e(2)])
 }
 
 /// Pass options: the network's forks, txs per write txn, and whether to write at all.
@@ -724,10 +782,18 @@ pub struct Opts {
     /// D3: the history walk of newly tracked tokens (review M2) runs at most this often
     /// (seconds; 0 = whenever some are pending). The service passes [`REWALK_EVERY_SECS`].
     pub rewalk_every_secs: u32,
+    /// D3: distinct exec-derived token rows per tx sender per pass (security review).
+    pub max_exec_per_sender: u64,
+    /// D3: distinct exec-derived token rows per pass, all senders.
+    pub max_exec_candidates: u64,
 }
 
 /// Default per-token, per-pass budget of distinct D3 capped rows.
 pub const MAX_EVENT_CANDIDATES: u64 = 2_000_000;
+/// Default per-sender budget of exec-derived D3 rows.
+pub const MAX_EXEC_PER_SENDER: u64 = 100_000;
+/// Default ceiling on exec-derived D3 rows per pass.
+pub const MAX_EXEC_CANDIDATES: u64 = 2_000_000;
 /// Default shared bucket of untracked emitters.
 pub const MAX_UNTRACKED_CANDIDATES: u64 = 2_000_000;
 /// Default global ceiling on D3 capped candidates.
@@ -747,6 +813,8 @@ impl Default for Opts {
             max_untracked_candidates: MAX_UNTRACKED_CANDIDATES,
             max_total_candidates: MAX_TOTAL_CANDIDATES,
             rewalk_every_secs: 0,
+            max_exec_per_sender: MAX_EXEC_PER_SENDER,
+            max_exec_candidates: MAX_EXEC_CANDIDATES,
         }
     }
 }
@@ -855,6 +923,9 @@ fn walk(
             for (k, v) in &c.dropped {
                 *rep.dropped_tokens.entry(k.clone()).or_insert(0) += v;
             }
+            p.exec_total += c.exec[0];
+            rep.dropped_exec_sender += c.exec[1];
+            rep.dropped_exec_ceiling += c.exec[2];
             start.max(*next)
         }
         _ => start,
@@ -986,6 +1057,8 @@ pub fn run(
         max_event_candidates: o.max_event_candidates,
         max_untracked_candidates: o.max_untracked_candidates,
         max_total_candidates: o.max_total_candidates,
+        max_exec_per_sender: o.max_exec_per_sender,
+        max_exec_candidates: o.max_exec_candidates,
     };
     rep.tracked_bound = (w.tokens.len() as u64).saturating_mul(o.max_event_candidates);
     let env = Env {
@@ -1001,11 +1074,19 @@ pub fn run(
     // (review H2, M3).
     let resume = match resume {
         Some((f, next, mut c)) if f == from && !o.dry_run => {
-            (c.taken, c.dropped) = parse_budget(budget.as_deref(), from, next);
+            (c.taken, c.dropped, c.exec) = parse_budget(budget.as_deref(), from, next);
             Some((next, c))
         }
         _ => None,
     };
+    if o.rules == Rules::D3 && !o.dry_run {
+        // Discoveries an earlier pass or the tail dropped at a quota go first (security
+        // review: nothing is lost for good).
+        let mut txn = hot.rw()?;
+        rep.discovered_requeued =
+            balances::requeue_pending(&mut txn, MAX_DISCOVERED_PER_PASS)? as u64;
+        txn.commit()?;
+    }
     let mut p = Pending::default();
     if walk(&env, &w, &mut p, &mut rep, (from, to), Some(resume), stop)? {
         rep.stopped = true;
@@ -1050,6 +1131,8 @@ pub fn run(
         let dropped = serde_json::json!({
             "untracked": rep.dropped_untracked, "ceiling": rep.dropped_ceiling,
             "tokens": rep.dropped_tokens, "discovered": rep.discovered_dropped,
+            "discovered_namespace": rep.discovered_namespace_dropped,
+            "exec_sender": rep.dropped_exec_sender, "exec_ceiling": rep.dropped_exec_ceiling,
             "tracked_bound": rep.tracked_bound});
         txn.set_meta(
             meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED,
@@ -1118,6 +1201,8 @@ fn history_walk(
         max_event_candidates: main.max_event_candidates,
         max_untracked_candidates: main.max_untracked_candidates,
         max_total_candidates: main.max_total_candidates,
+        max_exec_per_sender: main.max_exec_per_sender,
+        max_exec_candidates: main.max_exec_candidates,
     };
     let mut p = Pending::default();
     if walk(env, &w, &mut p, rep, (0, upto), None, stop)? {
@@ -1190,11 +1275,12 @@ mod tests {
         let frozen = c.minus(&hot);
         assert_eq!(frozen.taken.get("free.spam"), Some(&5));
         let j = frozen.budget_json(10, 99);
-        let (taken, dropped) = parse_budget(Some(&j), 10, 99);
+        let (taken, dropped, exec) = parse_budget(Some(&j), 10, 99);
         assert_eq!(
             (taken, dropped),
             (frozen.taken.clone(), frozen.dropped.clone())
         );
+        assert_eq!(exec, frozen.exec);
         // Stored with another cursor (an older pass, or a stop before the next cursor): ignored.
         assert_eq!(parse_budget(Some(&j), 10, 100), Default::default());
         assert_eq!(parse_budget(Some(&j), 0, 99), Default::default());

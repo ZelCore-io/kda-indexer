@@ -647,7 +647,7 @@ counted (counter `d3_tail_dropped`), and the block is applied regardless. The ta
 names: decode interns the event accounts (postings), a cross-chain defpact's module and account,
 and the modules a tx may put forward as tokens, so backfill and tail build the same dictionary.
 A row whose account or module is still unknown (for example a string of an `exec`) is left to
-the hourly pass, which interns it (counter `d3_tail_deferred`).
+the hourly pass, which interns it.
 
 The token receivers pass marks the same rows for stored history, with its own flag
 (`Meta balances_seed_token_receivers`), cursor and error count, and the same mechanics as D1
@@ -674,9 +674,14 @@ recheck walks only the new heights (a safety net now that the tail marks). Candi
 Token discovery: a cross-chain defpact's module, and a modref named by its own module or a
 module of the same governed namespace (`kaddex.skdx` is only ever minted by
 `kaddex.alchemist`, so no TRANSFER ever made it a token), are put forward as tokens, at most 4
-per tx, 16 per tail block and 256 per pass. A plain object renders exactly like a modref, so a
-name is only queued (`Meta balances_d3_discover/<chain>/<module>`, at most 1,024 entries; more
-are dropped and counted in `d3_discover_dropped`). The reconciler checks 4 queued names per
+per tx, 16 per tail block, and per pass 8,192 with at most 4 per namespace (anyone can create
+`n_` namespaces; a flood of them must not crowd out a real token). A plain object renders exactly
+like a modref, so a name is only queued (`Meta balances_d3_discover/<ns>/<chain>/<module>`, at
+most 4 per namespace and 16,384 in all). In the open namespaces (`free`, `user`) the quota is
+per module, so junk modules there cannot starve a real one. A discovery dropped at any quota is
+counted (`d3_discover_dropped`) and kept in `Meta balances_d3_discover_pending/<chain>/<module>`
+(at most 1,000,000; beyond that only counted, `d3_discover_lost`); the next pass re-queues these
+first, so nothing is lost for good. The reconciler checks 4 queued names per
 round with `describe-module` on that chain; a module that lists `fungible-v2` becomes a tracked
 token, anything else is dropped. Note: a namespace whose user guard lets anyone deploy behaves
 like `free`; add it to `OPEN_NAMESPACES` if one is found.
@@ -696,18 +701,21 @@ coinbases below the coinbase injection fix (mainnet 121,452), on that block's ch
 Rows from events and from an exec's token calls are capped: 64 of each per tx (events are
 taken first), then per pass a budget of distinct rows per tracked token (2,000,000,
 `KDX_D3_MAX_EVENT_CANDIDATES` for the CLI; a repeated row costs nothing), one shared bucket for
-all untracked emitters (2,000,000) and a global ceiling (20,000,000). Over a budget the excess is
+all untracked emitters (2,000,000) and a global ceiling (20,000,000). Rows from an `exec`'s token
+calls are charged to the tx's sender (100,000 per sender, 2,000,000 per pass), never to the
+called token, so junk calls cannot spend a token's budget; the tail keys its per-block cap the
+same way. Over a budget the excess is
 dropped and counted for that token or bucket only, and the pass completes and advances for
 everyone: `--status` shows `seed_token_receivers_dropped` (`tokens`: drops per token,
-`untracked`, `ceiling`, `discovered`). A genuine token with drops needs a rerun with a raised
+`untracked`, `ceiling`, `exec_sender`, `exec_ceiling`, `discovered`, `discovered_namespace`). A genuine token with drops needs a rerun with a raised
 budget (delete the flag first). The budget counters persist with the cursor, so a resumed pass
 does not grant a token its budget twice.
 
 `reconcile-balances --seed` runs D1 and then D3. `--seed --dry-run` opens the store read-only
 and prints both reports, `receivers` and `token_receivers`; `dirty_inserted` is the number of
 node reads the pass would cause. `--status` shows `seed_token_receivers_height`,
-`seed_token_receivers_in_progress`, `seed_token_receivers_errors`, `d3_discover_queued` and
-`d3_rewalk_pending`. To force a rerun, delete `Meta balances_seed_token_receivers`.
+`seed_token_receivers_in_progress`, `seed_token_receivers_errors`, `d3_discover_queued`,
+`d3_discover_pending` and `d3_rewalk_pending`. To force a rerun, delete `Meta balances_seed_token_receivers`.
 
 Run the first pass with the service stopped, or restart the service in a quiet window: the
 service runs it inline at start (about 2.4 h on mainnet) and the reconcile loop waits for it.

@@ -241,9 +241,11 @@ pub struct TokenReceivers {
     /// The module each `event_pairs` entry is charged to (same index): the event's emitter, or
     /// the token an `exec` calls. The pass budgets its per-pass cap per emitter.
     pub event_emitters: Vec<String>,
-    /// Token rows of an `exec` (rule 2 for tokens), at most [`MAX_EXEC_PAIRS_PER_TX`], with
-    /// the called token as emitter (same index in `exec_emitters`). Separate from the event
-    /// budget, and filled after the events, so exec strings never starve a tx's events.
+    /// Token rows of an `exec` (rule 2 for tokens), at most [`MAX_EXEC_PAIRS_PER_TX`], charged
+    /// to the tx's sender (`exec_emitters`: [`EXEC_BUCKET`] + sender, same index), never to the
+    /// called token: anyone can call a token with junk strings, and that must not spend the
+    /// token's own budget (security review). Filled after the events, so exec strings never
+    /// starve a tx's events.
     pub exec_pairs: Vec<(String, String)>,
     pub exec_emitters: Vec<String>,
     /// Modules that may be fungible tokens, at most [`MAX_DISCOVERED_PER_TX`]: the module of
@@ -259,6 +261,8 @@ pub struct TokenReceivers {
 pub const MAX_EVENT_PAIRS_PER_TX: usize = 64;
 /// Exec-derived token candidates kept per tx (own budget, see [`TokenReceivers::exec_pairs`]).
 pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
+/// Prefix of the budget key of exec-derived rows: `exec:<sender>` (a module name holds no `:`).
+pub const EXEC_BUCKET: &str = "exec:";
 /// Modules one tx may put forward as tokens (review M1).
 pub const MAX_DISCOVERED_PER_TX: usize = 4;
 /// Module references kept per event (each one with a string uses a pair slot of the tx, so
@@ -315,7 +319,7 @@ impl TokenReceivers {
             self.event_emitters.push(emitter.to_owned());
         }
     }
-    fn push_exec(&mut self, account: &str, module: &str) {
+    fn push_exec(&mut self, account: &str, module: &str, sender: &str) {
         if module != "coin"
             && account_like(account)
             && readable_module(module)
@@ -327,7 +331,7 @@ impl TokenReceivers {
         {
             self.exec_pairs
                 .push((account.to_owned(), module.to_owned()));
-            self.exec_emitters.push(module.to_owned());
+            self.exec_emitters.push(format!("{EXEC_BUCKET}{sender}"));
         }
     }
     fn discover(&mut self, module: &str) {
@@ -384,6 +388,8 @@ pub struct D3Exec {
     /// Distinct [`account_like`] strings of `exec.data`, `exec.code` literals and
     /// `result.data`, first-seen order; capped at [`MAX_EXEC_PAIRS_PER_TX`] unless `coin`.
     pub strings: Vec<String>,
+    /// `meta.sender` of the cmd (empty when absent): the budget key of the token rows.
+    pub sender: String,
 }
 
 /// D3 raw candidates of one tx: everything [`d3_filter`] needs, without knowing which modules
@@ -503,10 +509,16 @@ pub fn d3_candidates(
             if let Some(d) = output.pointer("/result/data") {
                 data_strings(d, &mut add);
             }
+            let sender = cmd
+                .pointer("/meta/sender")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
             c.exec = Some(D3Exec {
                 coin,
                 called,
                 strings,
+                sender,
             });
         }
     }
@@ -581,7 +593,7 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
                 if m == "coin" {
                     r.push(s, m);
                 } else {
-                    r.push_exec(s, m);
+                    r.push_exec(s, m, &x.sender);
                 }
             }
         }
