@@ -565,8 +565,9 @@ fn key_filter(
 /// the account sent (`meta.sender`), as the oracle does: the account's `sndr` postings when
 /// the view is sender-ready (FIX-2), else its `acct` postings filtered on the record's
 /// sender. With `requestKey` or `blockHash` the source is that key or block, filtered on
-/// the sender. `fungibleName` keeps the txs with an event of that module on every source,
-/// as stock filters (audit F-30, PR-4 item a).
+/// the sender. Beside an account, key or block `fungibleName` keeps the txs with an event
+/// of that module, as stock filters (audit F-30, PR-4 item a); alone it reads the
+/// `<module>.TRANSFER` postings (a documented gap with stock).
 fn transactions_spec(
     account_name: Option<&str>,
     block_hash: Option<&str>,
@@ -576,18 +577,20 @@ fn transactions_spec(
     request_key: Option<&str>,
 ) -> Result<ListSpec> {
     // Stock keeps a tx with ANY event of the `fungibleName` module (`EXISTS` on
-    // `Events.module`), not only one with a transfer of it, so the token never picks the
-    // source here: the account's sent txs (or, without an account, every user tx from the
-    // tip down, at most `MAX_HEIGHTS`) filtered on an event of the module. Both are heavy
-    // reads bounded by the 1 s page scan window and the request deadline, and the count by
-    // its own time budget (PR-4 item a).
-    // Checked first, as `list_source` checks it (spaces alone are refused on every source).
-    let module = fungible_name
+    // `Events.module`), not only one with a transfer of it. Where the source is already
+    // bounded (the account's sent txs, a request key, a block) the token filters rows on an
+    // event of the module, as stock (PR-4 item a). Without one, the source stays the
+    // full-history `<module>.TRANSFER` postings: txs with a transfer of the module only, a
+    // deliberate gap with stock (no module index; docs/graphql.md).
+    let checked = fungible_name
         .map(|m| fungible_arg(m).map(str::to_owned))
         .transpose()?;
-    let source = match list_source(account_name, None, block_hash, request_key)? {
-        SourceSpec::Acct(a) => SourceSpec::Sndr(a),
-        s => s,
+    let (source, module) = match list_source(account_name, fungible_name, block_hash, request_key)?
+    {
+        SourceSpec::Acct(a) => (SourceSpec::Sndr(a), checked),
+        SourceSpec::Xfer { account, .. } => (SourceSpec::Sndr(account), checked),
+        s @ SourceSpec::EvtName(_) => (s, None),
+        s => (s, checked),
     };
     Ok(ListSpec {
         source,

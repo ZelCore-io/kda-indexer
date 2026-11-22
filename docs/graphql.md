@@ -427,13 +427,15 @@ the oracle puts them.
   key (the `reqKey` of the stored coinbase output, as the oracle lists it; R-P5P9-57 F4).
   Event and Transfer ids carry that key; `node(id)` still accepts ids with `<coinbase>`.
 - **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` (txs
-  touching the account); with none of them, every user tx from the tip down (at most 20,000
-  heights), as a latest-transactions list asks. `fungibleName` picks no source: on every
-  source it keeps the txs with any event of that module, as stock does (`EXISTS` on
-  `Events.module`, indexer-kadena `90a4be1`), not only those with a transfer of it. Without
-  `accountName`, `requestKey` or `blockHash` it walks the heights from the tip, so a page of
-  a rare token can end at the 1 s page scan window (`TIMEOUT`) or the 20,000-height bound
-  where an index lookup would have answered; the walk is a heavy read (one per client). `chainId`, `minHeight`, `maxHeight` and
+  touching the account), else `fungibleName` (txs with a `<token>.TRANSFER` event, all
+  history); with none of them, every user tx from the tip down (at most 20,000 heights), as
+  a latest-transactions list asks. Beside `accountName`, `requestKey` or `blockHash`,
+  `fungibleName` keeps the txs with any event of that module, as stock does (`EXISTS` on
+  `Events.module`, indexer-kadena `90a4be1`). **Known difference (deliberate):**
+  `fungibleName` without those (alone, or with `chainId`, heights or `minimumDepth`) lists
+  the txs with a transfer of the module, where stock lists the txs with any event of it.
+  Matching stock there would need a per-module posting index; until one exists, a walk
+  over every tx would lose full-history coverage, so the transfer postings stay. `chainId`, `minHeight`, `maxHeight` and
   `minimumDepth` (height ≤ the chain's tip − depth) filter any source. With `accountName`,
   only the txs the account sent (`meta.sender`) are listed and counted, as the oracle does
   (GQ-19, R-P5P9-57 M1).
