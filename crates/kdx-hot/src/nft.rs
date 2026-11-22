@@ -373,16 +373,18 @@ impl TokenDetails {
         }
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    /// The stored form; None when the supply text does not fit its u16 length (F-13).
+    pub fn encode(&self) -> Option<Vec<u8>> {
         let s = self.supply.as_bytes();
+        let n = u16::try_from(s.len()).ok()?;
         let mut v = Vec::with_capacity(11 + s.len() + self.uri.len());
         v.push(self.status);
         v.extend_from_slice(&self.as_of.to_be_bytes());
         v.extend_from_slice(&self.precision.to_be_bytes());
-        v.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        v.extend_from_slice(&n.to_be_bytes());
         v.extend_from_slice(s);
         v.extend_from_slice(self.uri.as_bytes());
-        v
+        Some(v)
     }
 
     pub fn decode(v: &[u8]) -> Option<TokenDetails> {
@@ -429,7 +431,8 @@ pub fn put_holder_details(txn: &mut RwTxn<'_>, key: &[u8; 25], d: &HolderDetails
     txn.put(Table::NftDetails, &k, &d.encode())
 }
 
-/// Store a token answer unless the stored one is newer.
+/// Store a token answer unless the stored one is newer. One whose supply text is over the
+/// row's u16 length is stored as a failed answer (F-13).
 pub fn put_token_details(txn: &mut RwTxn<'_>, key: &[u8; 22], d: &TokenDetails) -> Result<()> {
     if let Some(old) = txn
         .get(Table::NftDetails, key)?
@@ -439,7 +442,14 @@ pub fn put_token_details(txn: &mut RwTxn<'_>, key: &[u8; 22], d: &TokenDetails) 
             return Ok(());
         }
     }
-    txn.put(Table::NftDetails, key, &d.encode())
+    // F-13: an answer that does not fit the row is refused and kept as a failed answer.
+    let v = match d.encode() {
+        Some(v) => v,
+        None => TokenDetails::empty(DETAIL_FAILED, d.as_of)
+            .encode()
+            .expect("an empty row fits"),
+    };
+    txn.put(Table::NftDetails, key, &v)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -807,6 +817,30 @@ mod tests {
         }
     }
 
+    /// F-13: a supply text longer than the u16 length field is refused, never truncated
+    /// into a row that decodes as something else; the store keeps a failed answer instead.
+    #[test]
+    fn an_over_long_supply_is_refused() {
+        let t = TokenDetails {
+            status: DETAIL_FOUND,
+            as_of: 9,
+            precision: 0,
+            supply: "9".repeat(usize::from(u16::MAX) + 1),
+            uri: String::new(),
+        };
+        assert_eq!(t.encode(), None);
+        let d = tempfile::tempdir().unwrap();
+        let hot = crate::HotStore::open(d.path(), crate::Geometry::default()).unwrap();
+        let key = token_details_key(1, &token_hash("t:a"), 0);
+        let mut txn = hot.rw().unwrap();
+        put_token_details(&mut txn, &key, &t).unwrap();
+        let got = txn.get(Table::NftDetails, &key).unwrap().unwrap();
+        assert_eq!(
+            TokenDetails::decode(&got),
+            Some(TokenDetails::empty(DETAIL_FAILED, 9))
+        );
+    }
+
     #[test]
     fn row_and_mark_codecs() {
         let r = NftRow {
@@ -1111,9 +1145,9 @@ mod tests {
             supply: "1.0".into(),
             uri: "ipfs://x".into(),
         };
-        assert_eq!(TokenDetails::decode(&t.encode()), Some(t.clone()));
+        assert_eq!(TokenDetails::decode(&t.encode().unwrap()), Some(t.clone()));
         let e = TokenDetails::empty(DETAIL_UNDEFINED, 4);
-        assert_eq!(TokenDetails::decode(&e.encode()), Some(e));
+        assert_eq!(TokenDetails::decode(&e.encode().unwrap()), Some(e));
         assert_eq!(HolderDetails::decode(&[1, 0, 0]), None);
         assert_eq!(
             TokenDetails::decode(&[1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 9]),
