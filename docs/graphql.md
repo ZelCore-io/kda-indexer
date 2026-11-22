@@ -242,7 +242,7 @@ name in that case (`GRAPHQL-WS` included) answers 400. Each limit below closes o
 | no subscription open | for `ws_idle_secs = 600` | close 4000 (`ws_idle`) |
 | no frame from the client (the server pings every 30 s; a pong counts) | 90 s (fixed) | close 4000 (`ws_silent`) |
 | client message or frame | 64 KB | close 1009 (`ws_message`); a malformed frame closes 1002 |
-| client messages | one per-IP rate token each (protocol `ping` messages too; websocket Ping and Pong frames take none); the opening burst below may borrow | close 4429 (`ws_rate`) |
+| client messages | one per-IP rate token each (protocol `ping` messages and the client's websocket Ping frames too; a Pong answering a server ping takes none, any other Pong takes one); the opening burst below may borrow | close 4429 (`ws_rate`) |
 | a client that does not read | 30 s per server message or ping | close 4008 (`ws_slow_reader`) |
 | a chain whose feed read fails | 30 ticks in a row | that chain alone is skipped each tick (a WARN line with the chain and its failure count; the other chains keep delivering), then resumes from its tip with a gap |
 | a subscriber behind the feed | 1,024 feed items, or behind blocks the ring had to drop to stay within `feed_ring_mb = 64` MB of decoded blocks | one `INTERNAL` error; the subscription goes on from the feed's newest item |

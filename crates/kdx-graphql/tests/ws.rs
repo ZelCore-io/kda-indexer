@@ -1018,7 +1018,8 @@ async fn a_silent_peer_is_closed_and_its_slots_return() {
 /// subscription, past `ws_silence` and `ws_idle`.
 #[tokio::test]
 async fn a_peer_answering_pings_stays_open() {
-    let s = server(pinging(), 1000).await;
+    // A bucket of 2 at 1 token/s: the ~15 pongs below would close it if they were charged.
+    let s = server(pinging(), 2).await;
     let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
     init(&mut a).await;
     send(
@@ -1042,20 +1043,24 @@ async fn a_peer_answering_pings_stays_open() {
     assert_eq!(active_subscriptions(&s.schema), 1);
 }
 
-/// Audit F-25: the client's own Ping and Pong frames take no rate token.
+/// Audit F-25 (controller ruling): a client Ping makes the server queue a Pong, so client
+/// Pings (and Pongs no server ping asked for) are charged: a flood of them is closed 4429.
 #[tokio::test]
-async fn ping_and_pong_frames_take_no_rate_token() {
-    let s = server(GraphqlSettings::default(), 10).await;
-    let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
-    for i in 0..60u8 {
-        a.send(Message::Ping(vec![i].into())).await.unwrap();
-        a.send(Message::Pong(vec![i].into())).await.unwrap();
+async fn a_client_ping_or_pong_flood_is_closed_for_rate() {
+    for pong in [false, true] {
+        let s = server(GraphqlSettings::default(), 10).await;
+        let mut a = connect(&s, "graphql-transport-ws").await.unwrap();
+        init(&mut a).await;
+        for i in 0..80u8 {
+            let m = if pong {
+                Message::Pong(vec![i].into())
+            } else {
+                Message::Ping(vec![i].into())
+            };
+            if a.send(m).await.is_err() {
+                break;
+            }
+        }
+        assert_eq!(recv(&mut a).await.err(), Some(4429), "pong: {pong}");
     }
-    init(&mut a).await;
-    send(
-        &mut a,
-        json!({"id": "1", "type": "subscribe", "payload": {"query": NEW_BLOCKS}}),
-    )
-    .await;
-    assert!(wait_for(|| active_subscriptions(&s.schema) == 1).await);
 }

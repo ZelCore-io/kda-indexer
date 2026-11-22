@@ -380,6 +380,9 @@ async fn drive(
     let started = Instant::now();
     let last_in = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let heard = last_in.clone();
+    // Server pings not answered yet: that many pongs are free, any other pong is charged.
+    let outstanding = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let answered = outstanding.clone();
     let mut reader = tokio::spawn(async move {
         let mut fwd = Some(in_tx);
         let mut seen: u32 = 0;
@@ -390,9 +393,16 @@ async fn drive(
             }
             let msg = match msg {
                 Ok(Message::Close(_)) => break,
-                // Audit F-25: pings and pongs take no rate token (the server's own pings
-                // are answered with pongs; axum answers the client's pings).
-                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                // Audit F-25: the pong answering a server ping takes no rate token. A
+                // client Ping (the server queues a Pong for it) and any extra Pong are
+                // charged like any message, so a flood of them is closed 4429.
+                Ok(Message::Pong(_))
+                    if answered
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok() =>
+                {
+                    continue
+                }
                 Ok(_) if fwd.is_none() => continue,
                 Ok(m) => m,
                 Err(e) => {
@@ -480,6 +490,8 @@ async fn drive(
             },
             _ = ping.tick() => {
                 // Audit F-25: a ping under the same send timeout as any server message.
+                // Counted before the send, so a quick pong is never charged.
+                outstanding.fetch_add(1, Ordering::AcqRel);
                 match tokio::time::timeout(SEND_TIMEOUT, sink.send(Message::Ping(Default::default()))).await {
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => break None,
