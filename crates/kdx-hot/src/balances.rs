@@ -90,6 +90,9 @@ pub mod meta {
     pub const D3_DISCOVER_PENDING: &str = "balances_d3_discover_pending/";
     /// u32: entries in the pending list.
     pub const D3_DISCOVER_PENDING_LEN: &str = "balances_d3_discover_pending_len";
+    /// The last pending key `requeue_pending` scanned: the next call starts after it and wraps
+    /// around (review (a): entries the queue keeps refusing cannot freeze the rest).
+    pub const D3_DISCOVER_PENDING_FROM: &str = "balances_d3_discover_pending_from";
     /// Prefix of `balances_d3_rewalk/{ModuleId:010}` (empty): tokens tracked since the last
     /// D3 pass walked history. The next pass walks the D3 rules for them from height 0 up to
     /// its done height (review M2).
@@ -97,8 +100,12 @@ pub mod meta {
     /// Prefix of [`super::d3_undo_key`]: D3 rows a hot block marked (removed by its undo, or
     /// when the freezer moves the block out of the hot store).
     pub const D3_UNDO: &str = "balances_d3_undo/";
-    /// u32 unix seconds: when a D3 pass last walked history for newly tracked tokens.
+    /// u32 unix seconds: when the last history walk for newly tracked tokens ended.
     pub const D3_REWALK_AT: &str = "balances_d3_rewalk_at";
+    /// JSON: the running history walk (re-review N2): the done height it walks below, its
+    /// tokens, the next slice's start and its budget counters; written with each slice's
+    /// marks, deleted when it ends.
+    pub const D3_REWALK_WALK: &str = "balances_d3_rewalk_walk";
 }
 
 /// Entries the D3 discovery queue holds at most; more are dropped and counted
@@ -117,6 +124,9 @@ pub mod counters {
     pub const D3_DISCOVER_DROPPED: &str = "d3_discover_dropped";
     /// Dropped discoveries not kept because the pending list was full.
     pub const D3_DISCOVER_LOST: &str = "d3_discover_lost";
+    /// Discovered module names over `kdx_decode::receivers::MAX_MODULE_LEN` bytes, dropped
+    /// (re-review N1: such a name can never be a Meta key).
+    pub const D3_DISCOVER_TOO_LONG: &str = "d3_discover_too_long";
 }
 
 /// The key a discovered module's quota counts against (security review): its namespace
@@ -143,12 +153,25 @@ fn discover_key(module: &str, chain: u8) -> String {
 /// [`D3_DISCOVER_PER_NAMESPACE`] entries queued (security review: junk namespaces cannot crowd
 /// out a real token), or the queue is full.
 pub fn queue_discovered(txn: &mut RwTxn<'_>, module: &str, chain: u8, height: u32) -> Result<bool> {
+    if too_long(txn, module)? {
+        return Ok(false);
+    }
     if try_queue(txn, module, chain, height)? {
         return Ok(true);
     }
     txn.add_counter(counters::D3_DISCOVER_DROPPED, 1)?;
     pend_discovered(txn, module, chain, height)?;
     Ok(false)
+}
+
+/// Re-review N1: a discovered name longer than `MAX_MODULE_LEN` is dropped and counted here
+/// (a backstop of the cap in `receivers::discover`), never made a key.
+fn too_long(txn: &mut RwTxn<'_>, module: &str) -> Result<bool> {
+    if module.len() <= kdx_decode::receivers::MAX_MODULE_LEN {
+        return Ok(false);
+    }
+    txn.add_counter(counters::D3_DISCOVER_TOO_LONG, 1)?;
+    Ok(true)
 }
 
 fn pending_key(module: &str, chain: u8) -> String {
@@ -158,6 +181,9 @@ fn pending_key(module: &str, chain: u8) -> String {
 /// Keep a dropped discovery for the next pass, which re-queues it first (nothing is lost for
 /// good). At most [`D3_DISCOVER_PENDING_MAX`] entries; beyond that it is only counted.
 pub fn pend_discovered(txn: &mut RwTxn<'_>, module: &str, chain: u8, height: u32) -> Result<()> {
+    if too_long(txn, module)? {
+        return Ok(());
+    }
     let k = pending_key(module, chain);
     if let Some(h) = txn.meta(&k)?.as_deref().and_then(be_u32) {
         if height < h {
@@ -179,10 +205,29 @@ pub fn pend_discovered(txn: &mut RwTxn<'_>, module: &str, chain: u8, height: u32
 }
 
 /// Move up to `n` pending discoveries into the queue (those it refuses stay pending). Returns
-/// how many moved.
+/// how many moved. Each call scans from after the last key the previous call scanned
+/// ([`meta::D3_DISCOVER_PENDING_FROM`]) and wraps around, so refused entries sorting first
+/// cannot hold back the rest (review (a)).
 pub fn requeue_pending(txn: &mut RwTxn<'_>, n: usize) -> Result<usize> {
     let p = meta::D3_DISCOVER_PENDING.as_bytes();
-    let rows = txn.scan_limit(Table::Meta, p, n, |k| k.starts_with(p))?;
+    let from = txn
+        .meta(meta::D3_DISCOVER_PENDING_FROM)?
+        .filter(|a| a.starts_with(p));
+    let mut rows = txn.scan_chunk(Table::Meta, from.as_deref().or(Some(p)), n, |k| {
+        k.starts_with(p)
+    })?;
+    if let Some(a) = from.as_deref().filter(|_| rows.len() < n) {
+        // Wrap around: the keys up to and including the last one scanned.
+        rows.extend(txn.scan_limit(Table::Meta, p, n - rows.len(), |k| {
+            k.starts_with(p) && k <= a
+        })?);
+    }
+    match rows.last() {
+        Some((k, _)) => txn.set_meta(meta::D3_DISCOVER_PENDING_FROM, k)?,
+        None => {
+            txn.del(Table::Meta, meta::D3_DISCOVER_PENDING_FROM.as_bytes())?;
+        }
+    }
     let mut moved = 0;
     for (k, v) in rows {
         let Some((c, m)) = std::str::from_utf8(&k[p.len()..])
@@ -229,6 +274,9 @@ pub fn discover_pending(txn: &impl Txn, n: usize) -> Result<Vec<(String, u8)>> {
 
 /// Queue `module` unless its quota or the queue is full.
 fn try_queue(txn: &mut RwTxn<'_>, module: &str, chain: u8, height: u32) -> Result<bool> {
+    if module.len() > kdx_decode::receivers::MAX_MODULE_LEN {
+        return Ok(false);
+    }
     let k = discover_key(module, chain);
     if let Some(h) = txn.meta(&k)?.as_deref().and_then(be_u32) {
         if height < h {
@@ -647,7 +695,8 @@ pub fn token_row(txn: &impl Txn, module: u32) -> Result<Option<TokenRow>> {
 }
 
 /// Change a token row in place; a module with no row gets one with `first_height` u32::MAX
-/// until a posting lowers it, and is queued for its D3 history walk ([`meta::D3_REWALK`]).
+/// until a posting lowers it. It is queued for its D3 history walk ([`meta::D3_REWALK`])
+/// when its `first_height` becomes lower than the D3 done height.
 pub fn update_token(txn: &mut RwTxn<'_>, module: u32, f: impl FnOnce(&mut TokenRow)) -> Result<()> {
     let mut r = token_row(txn, module)?.unwrap_or(TokenRow {
         first_height: u32::MAX,
@@ -659,8 +708,19 @@ pub fn update_token(txn: &mut RwTxn<'_>, module: u32, f: impl FnOnce(&mut TokenR
     if r != before || new {
         txn.put(Table::Tokens, &module.to_be_bytes(), &r.encode())?;
     }
-    if new && coin_module(txn)? != Some(module) {
-        // Newly tracked: the next D3 pass walks its history (review M2).
+    // Newly tracked, or first seen lower: a credit below the D3 done height may predate the
+    // token's tracking, so its history is walked (review M2). A token first seen at or above
+    // that height is covered by the tail and the next pass (re-review N2). No done height
+    // yet: the first pass (from 0) covers it, and clears the tokens it started with.
+    let done = txn
+        .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)?
+        .as_deref()
+        .and_then(be_u32)
+        .unwrap_or(u32::MAX);
+    if r.first_height < done
+        && (new || before.first_height >= done)
+        && coin_module(txn)? != Some(module)
+    {
         txn.set_meta(&format!("{}{module:010}", meta::D3_REWALK), &[])?;
     }
     Ok(())

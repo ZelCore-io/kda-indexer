@@ -143,3 +143,70 @@ fn apply_then_unwind_restores_every_table() {
     txn.commit().unwrap();
     assert_eq!(rows(&store), before);
 }
+
+/// Re-review N1: an event of `n_x.tok` naming a 3,000-char module of its own governed
+/// namespace in a modref-shaped object is discoverable; its name must never become an MDBX
+/// key. The tail applies the block, drops the name and counts it.
+#[test]
+fn a_long_discovered_module_name_does_not_halt_the_tail() {
+    let long = "a".repeat(3000);
+    let modref = json!({"refSpec": [{"namespace": null, "name": "fungible-v2"}],
+        "refName": {"namespace": "n_x", "name": long}});
+    let b = block(json!({"params": [modref, "k:ok", 1.0], "name": "MINT",
+        "module": {"namespace": "n_x", "name": "tok"}, "moduleHash": h(11)}));
+    let dir = tempfile::tempdir().unwrap();
+    let store = HotStore::open(
+        dir.path(),
+        Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        },
+    )
+    .unwrap();
+    let mut dict = HotDict::load(&store.ro().unwrap()).unwrap();
+    let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+    let mut txn = store.rw().unwrap();
+    kdx_hot::tail::apply(&mut txn, &ib, &mut dict).expect("apply must not fail");
+    txn.commit().expect("commit must not fail");
+    let ro = store.ro().unwrap();
+    assert!(kdx_hot::balances::discovered_queue(&ro, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        ro.counter(kdx_hot::balances::counters::D3_DISCOVER_TOO_LONG)
+            .unwrap(),
+        1
+    );
+}
+
+/// Re-review N1 backstop: the queue and the pending list drop and count an over-long name
+/// whatever path hands it to them (the seed pass's `flush` uses these two).
+#[test]
+fn the_discovery_queue_and_pending_list_drop_over_long_names() {
+    let long = format!("n_x.{}", "a".repeat(3000));
+    let dir = tempfile::tempdir().unwrap();
+    let store = HotStore::open(
+        dir.path(),
+        Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        },
+    )
+    .unwrap();
+    let mut txn = store.rw().unwrap();
+    assert!(!kdx_hot::balances::queue_discovered(&mut txn, &long, 0, 5).expect("no error"));
+    kdx_hot::balances::pend_discovered(&mut txn, &long, 0, 5).expect("no error");
+    txn.commit().expect("commit must not fail");
+    let ro = store.ro().unwrap();
+    assert!(kdx_hot::balances::discovered_queue(&ro, 10)
+        .unwrap()
+        .is_empty());
+    assert!(kdx_hot::balances::discover_pending(&ro, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        ro.counter(kdx_hot::balances::counters::D3_DISCOVER_TOO_LONG)
+            .unwrap(),
+        2
+    );
+}

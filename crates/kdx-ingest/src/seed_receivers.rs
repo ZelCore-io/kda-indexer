@@ -38,7 +38,8 @@
 //! the pass completes, review H2). A coinbase below the injection fix whose block's miner
 //! account holds a `"` gives the accounts it really credited, on its chain. Discovered modules
 //! are queued for the reconciler's `describe-module` check ([`check_discovered`], review M1),
-//! and tokens tracked since the last pass get their history walked (review M2). As the tail
+//! and tokens tracked below the done height get their history walked (review M2; in the
+//! service in resumable slices, [`history_begin`], re-review N2). As the tail
 //! grows the pass is pending again and walks only the new heights (hourly in the service).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -133,6 +134,8 @@ pub struct ReceiversReport {
     /// D3: discovered modules not queued because their namespace reached
     /// [`MAX_DISCOVERED_PER_NAMESPACE`] in this pass (security review).
     pub discovered_namespace_dropped: u64,
+    /// D3: discoverable module names over `MAX_MODULE_LEN` bytes, dropped (re-review N1).
+    pub discovered_too_long: u64,
     /// D3: pending discoveries (dropped earlier at a quota) re-queued at the start.
     pub discovered_requeued: u64,
     /// D3: exec-derived rows dropped at a sender's budget, and at the exec ceiling.
@@ -271,6 +274,8 @@ struct Pending {
     exec_total: u64,
     /// JSON for `BALANCES_SEED_TOKEN_RECEIVERS_BUDGET`, written with the next cursor.
     budget: Option<Vec<u8>>,
+    /// A history walk's state ([`meta::D3_REWALK_WALK`]), written with its slice's marks.
+    state: Option<Vec<u8>>,
 }
 
 /// Modules the pass may queue for their `describe-module` check per pass (review M1).
@@ -368,6 +373,9 @@ impl Pending {
         }
         for ((m, c), h) in self.dropped_disc.drain() {
             balances::pend_discovered(&mut txn, &m, c, h)?;
+        }
+        if let Some(v) = self.state.take() {
+            txn.set_meta(meta::D3_REWALK_WALK, &v)?;
         }
         if let Some(c) = cursor {
             txn.set_meta(cursor_key, &c)?;
@@ -480,6 +488,7 @@ fn add(
             let is_token = |m: &str| w.tokens.contains(m);
             record_token_receivers(r, dict, w.forks, &is_token).map(|t| {
                 if w.only.is_none() {
+                    rep.discovered_too_long += u64::from(t.discovered_too_long);
                     for m in t.discovered.iter().filter(|m| !w.tokens.contains(*m)) {
                         let key = (m.clone(), k.chain());
                         let ns = balances::discover_namespace(m).to_owned();
@@ -782,6 +791,9 @@ pub struct Opts {
     /// D3: the history walk of newly tracked tokens (review M2) runs at most this often
     /// (seconds; 0 = whenever some are pending). The service passes [`REWALK_EVERY_SECS`].
     pub rewalk_every_secs: u32,
+    /// D3: `run` walks the history of newly tracked tokens to the end itself (the CLI). The
+    /// service sets false and runs it in slices between its other steps (re-review N2).
+    pub history_inline: bool,
     /// D3: distinct exec-derived token rows per tx sender per pass (security review).
     pub max_exec_per_sender: u64,
     /// D3: distinct exec-derived token rows per pass, all senders.
@@ -798,8 +810,8 @@ pub const MAX_EXEC_CANDIDATES: u64 = 2_000_000;
 pub const MAX_UNTRACKED_CANDIDATES: u64 = 2_000_000;
 /// Default global ceiling on D3 capped candidates.
 pub const MAX_TOTAL_CANDIDATES: u64 = 20_000_000;
-/// The service's interval between history walks for newly tracked tokens (a walk reads all
-/// stored history, about as long as the first D3 pass).
+/// The least interval between the starts of two history walks for newly tracked tokens (a
+/// walk reads all stored history; the service runs it in slices, re-review N2).
 pub const REWALK_EVERY_SECS: u32 = 24 * 3600;
 
 impl Default for Opts {
@@ -813,6 +825,7 @@ impl Default for Opts {
             max_untracked_candidates: MAX_UNTRACKED_CANDIDATES,
             max_total_candidates: MAX_TOTAL_CANDIDATES,
             rewalk_every_secs: 0,
+            history_inline: true,
             max_exec_per_sender: MAX_EXEC_PER_SENDER,
             max_exec_candidates: MAX_EXEC_CANDIDATES,
         }
@@ -849,51 +862,13 @@ fn walk(
     stop: &dyn Fn() -> bool,
 ) -> Result<bool> {
     let (hot, snap, o) = (e.hot, &e.snap, e.o);
-    let miners = |key: TxKey| {
-        o.rules == Rules::D3 && w.only.is_none() && key.height() < o.forks.coinbase_fix
-    };
 
     // Hot pass: TailTxs at heights [from, to), key order.
     let mut after: Option<Vec<u8>> = None;
-    let first = TxKey::new(from, 0, 0).to_be_bytes();
     loop {
-        let rows = {
-            let txn = hot.ro()?;
-            let keep = |k: &[u8]| {
-                k.get(..8)
-                    .and_then(|b| b.try_into().ok())
-                    .is_some_and(|b| TxKey::from_be_bytes(b).height() < to)
-            };
-            match &after {
-                None => txn.scan_limit(Table::TailTxs, &first, HOT_CHUNK, keep)?,
-                Some(a) => txn.scan_chunk(Table::TailTxs, Some(a), HOT_CHUNK, keep)?,
-            }
-        };
+        let rows = hot_rows(hot, after.as_deref(), (from, to), HOT_CHUNK)?;
         for (k, v) in &rows {
-            let key = TxKey::from_be_bytes(k[..8].try_into().context("TailTxs key")?);
-            if key.is_coinbase() {
-                if miners(key) {
-                    let bk = kdx_hot::tables::block_key(key.chain(), key.height());
-                    if let Some(v) = hot.ro()?.get(Table::Headers, &bk)? {
-                        let br = kdx_types::record::decode_block(&v)?;
-                        miner_rows(p, &br, key, snap, rep);
-                    }
-                }
-                continue;
-            }
-            match decode_tx(v) {
-                Ok(r) => add(p, key, &r, snap, w, rep),
-                Err(e) => {
-                    rep.errors += 1;
-                    tracing::error!(
-                        height = key.height(),
-                        chain = key.chain(),
-                        error = %e,
-                        "balances: hot tx record not readable (receivers pass error)"
-                    );
-                }
-            }
-            rep.hot_txs += 1;
+            visit_hot(e, w, p, rep, k, v)?;
         }
         match rows.last() {
             Some((k, _)) if rows.len() == HOT_CHUNK => after = Some(k.clone()),
@@ -906,10 +881,7 @@ fn walk(
 
     // Segment pass, TxNum order, resuming at the cursor of a pass with the same start.
     let segs = Segments::open_without_filters(e.segdir, snap.clone())?;
-    let start = match segs.last_txnum_below_height(from) {
-        Some(t) => t + 1,
-        None => segs.manifest.entries.first().map_or(0, |e| e.first_txnum),
-    };
+    let start = frozen_start(&segs, from);
     let start = match &resume {
         Some(Some((next, c))) => {
             rep.errors += c.errors;
@@ -934,30 +906,7 @@ fn walk(
     let chunk = o.chunk.max(1);
     let mut n = 0usize;
     for t in start..end {
-        if let Some(key) = segs.txkey(t) {
-            if key.is_coinbase() && miners(key) && (from..to).contains(&key.height()) {
-                if let Some(br) = segs.block(key.chain(), key.height())? {
-                    miner_rows(p, &br, key, snap, rep);
-                }
-            } else if !key.is_coinbase() && (from..to).contains(&key.height()) {
-                match segs.tx(t)? {
-                    Some(r) => {
-                        add(p, key, &r, snap, w, rep);
-                        rep.frozen_txs += 1;
-                    }
-                    None => {
-                        rep.errors += 1;
-                        tracing::error!(
-                            height = key.height(),
-                            chain = key.chain(),
-                            position = key.pos(),
-                            txnum = t,
-                            "balances: frozen tx has a key but no record (receivers pass error)"
-                        );
-                    }
-                }
-            }
-        }
+        visit_frozen(e, &segs, w, p, rep, t, (from, to))?;
         n += 1;
         if n.is_multiple_of(chunk) {
             let c = resume.as_ref().map(|_| {
@@ -986,13 +935,131 @@ fn walk(
     Ok(false)
 }
 
+/// Up to `n` hot `TailTxs` rows at heights `[from, to)`, after key `after` (`None`: from the
+/// first one).
+fn hot_rows(
+    hot: &HotStore,
+    after: Option<&[u8]>,
+    (from, to): (u32, u32),
+    n: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let txn = hot.ro()?;
+    let keep = |k: &[u8]| {
+        k.get(..8)
+            .and_then(|b| b.try_into().ok())
+            .is_some_and(|b| TxKey::from_be_bytes(b).height() < to)
+    };
+    match after {
+        None => txn.scan_limit(
+            Table::TailTxs,
+            &TxKey::new(from, 0, 0).to_be_bytes(),
+            n,
+            keep,
+        ),
+        Some(a) => txn.scan_chunk(Table::TailTxs, Some(a), n, keep),
+    }
+}
+
+/// The first frozen TxNum at or above height `from`.
+fn frozen_start(segs: &Segments, from: u32) -> u64 {
+    match segs.last_txnum_below_height(from) {
+        Some(t) => t + 1,
+        None => segs.manifest.entries.first().map_or(0, |e| e.first_txnum),
+    }
+}
+
+/// Injected miner accounts are walked (D3, main walk, below the injection fix).
+fn miners(o: &Opts, w: &Walk, key: TxKey) -> bool {
+    o.rules == Rules::D3 && w.only.is_none() && key.height() < o.forks.coinbase_fix
+}
+
+/// One hot `TailTxs` row of a walk.
+fn visit_hot(
+    e: &Env,
+    w: &Walk,
+    p: &mut Pending,
+    rep: &mut ReceiversReport,
+    k: &[u8],
+    v: &[u8],
+) -> Result<()> {
+    let key = TxKey::from_be_bytes(k.get(..8).context("TailTxs key")?.try_into()?);
+    if key.is_coinbase() {
+        if miners(e.o, w, key) {
+            let bk = kdx_hot::tables::block_key(key.chain(), key.height());
+            if let Some(v) = e.hot.ro()?.get(Table::Headers, &bk)? {
+                let br = kdx_types::record::decode_block(&v)?;
+                miner_rows(p, &br, key, &e.snap, rep);
+            }
+        }
+        return Ok(());
+    }
+    match decode_tx(v) {
+        Ok(r) => add(p, key, &r, &e.snap, w, rep),
+        Err(err) => {
+            rep.errors += 1;
+            tracing::error!(
+                height = key.height(),
+                chain = key.chain(),
+                error = %err,
+                "balances: hot tx record not readable (receivers pass error)"
+            );
+        }
+    }
+    rep.hot_txs += 1;
+    Ok(())
+}
+
+/// Frozen TxNum `t` of a walk over heights `[from, to)`.
+fn visit_frozen(
+    e: &Env,
+    segs: &Segments,
+    w: &Walk,
+    p: &mut Pending,
+    rep: &mut ReceiversReport,
+    t: u64,
+    (from, to): (u32, u32),
+) -> Result<()> {
+    let Some(key) = segs.txkey(t) else {
+        return Ok(());
+    };
+    if !(from..to).contains(&key.height()) {
+        return Ok(());
+    }
+    if key.is_coinbase() {
+        if miners(e.o, w, key) {
+            if let Some(br) = segs.block(key.chain(), key.height())? {
+                miner_rows(p, &br, key, &e.snap, rep);
+            }
+        }
+        return Ok(());
+    }
+    match segs.tx(t)? {
+        Some(r) => {
+            add(p, key, &r, &e.snap, w, rep);
+            rep.frozen_txs += 1;
+        }
+        None => {
+            rep.errors += 1;
+            tracing::error!(
+                height = key.height(),
+                chain = key.chain(),
+                position = key.pos(),
+                txnum = t,
+                "balances: frozen tx has a key but no record (receivers pass error)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run (or resume) the pass when [`pending`]; otherwise return an empty report. Errors when
 /// the store is not ready ([`check_ready`]). `stop` is polled after each segment chunk; a
 /// stopped pass commits its chunk and cursor and returns with `stopped`.
 ///
-/// D3, after the walk of `[from, to)`: the tokens tracked since the last pass (review M2,
-/// [`meta::D3_REWALK`]) get their history walked over `[0, from)` (rules for those tokens
-/// only), at most every [`Opts::rewalk_every_secs`]; a pass from 0 covers them already.
+/// D3, after the walk of `[from, to)`, with [`Opts::history_inline`] (the CLI): the queued
+/// tokens ([`meta::D3_REWALK`], review M2) get their history walked to the end, in the same
+/// slices the service runs between its other steps ([`history_begin`]); a pass from 0 covers
+/// them already.
 pub fn run(
     hot: &HotStore,
     dict: &Mutex<HotDict>,
@@ -1132,6 +1199,7 @@ pub fn run(
             "untracked": rep.dropped_untracked, "ceiling": rep.dropped_ceiling,
             "tokens": rep.dropped_tokens, "discovered": rep.discovered_dropped,
             "discovered_namespace": rep.discovered_namespace_dropped,
+            "discovered_too_long": rep.discovered_too_long,
             "exec_sender": rep.dropped_exec_sender, "exec_ceiling": rep.dropped_exec_ceiling,
             "tracked_bound": rep.tracked_bound});
         txn.set_meta(
@@ -1159,63 +1227,237 @@ pub fn run(
     txn.del(Table::Meta, cursor_key.as_bytes())?;
     txn.commit()?;
 
-    if o.rules == Rules::D3 && from > 0 && !rewalk.is_empty() {
-        let last = hot
-            .ro()?
-            .meta(meta::D3_REWALK_AT)?
-            .as_deref()
-            .and_then(be_u32)
-            .unwrap_or(0);
-        let now = now_unix();
-        if now >= last.saturating_add(o.rewalk_every_secs)
-            && history_walk(&env, &w, &rewalk, from, &mut rep, stop)?
-        {
-            rep.stopped = true;
+    if o.rules == Rules::D3 && from > 0 && o.history_inline {
+        // The CLI walks the history of newly tracked tokens to the end here; the service
+        // runs it in slices between its other steps (re-review N2, [`history_begin`]).
+        if let Some(mut hw) = history_begin(hot, dict, o)? {
+            loop {
+                let s = hw.step(hot, dict, segdir, o, HISTORY_SLICE_TXS)?;
+                if s.done {
+                    rep.rewalk_tokens = s.tokens;
+                    break;
+                }
+                if stop() {
+                    rep.stopped = true;
+                    break;
+                }
+            }
         }
     }
     rep.secs = t0.elapsed().as_secs_f64();
     Ok(rep)
 }
 
-/// Review M2: walk `[0, upto)` with the D3 rules for the newly tracked tokens `ids` only, then
-/// clear them from [`meta::D3_REWALK`]. Returns whether it was stopped (they stay pending).
-fn history_walk(
-    env: &Env,
-    main: &Walk,
-    ids: &[u32],
+/// Txs per slice of the history walk in the service (re-review N2): a slice is one write
+/// txn, a few seconds at most, between the reconcile loop's other steps.
+pub const HISTORY_SLICE_TXS: u64 = TX_CHUNK as u64;
+
+/// The persisted state of a running history walk ([`meta::D3_REWALK_WALK`]): the done height
+/// it walks below, the tokens it walks, where the next slice starts (frozen TxNum, then hot
+/// keys) and the budget counters so far.
+#[derive(Debug, Default, Clone, Serialize, serde::Deserialize)]
+struct HistState {
     upto: u32,
-    rep: &mut ReceiversReport,
-    stop: &dyn Fn() -> bool,
-) -> Result<bool> {
-    let names: HashSet<String> = ids
-        .iter()
-        .filter_map(|id| env.snap.name(DictKind::Module, *id).map(str::to_owned))
-        .filter(|m| main.tokens.contains(m))
-        .collect();
-    tracing::info!(tokens = ?names, upto, "balances: D3 history walk of newly tracked tokens");
-    let w = Walk {
-        rules: Rules::D3,
-        forks: main.forks,
-        tokens: main.tokens.clone(),
-        only: Some(names),
-        max_event_candidates: main.max_event_candidates,
-        max_untracked_candidates: main.max_untracked_candidates,
-        max_total_candidates: main.max_total_candidates,
-        max_exec_per_sender: main.max_exec_per_sender,
-        max_exec_candidates: main.max_exec_candidates,
+    ids: Vec<u32>,
+    next: u64,
+    hot: bool,
+    hot_after: Option<Vec<u8>>,
+    taken: BTreeMap<String, u64>,
+    untracked: u64,
+    exec_total: u64,
+}
+
+/// A history walk for newly tracked tokens (review M2, re-review N2), begun or resumed by
+/// [`history_begin`] and advanced one bounded slice at a time by [`HistoryWalk::step`].
+pub struct HistoryWalk {
+    snap: Arc<MemDict>,
+    tokens: HashSet<String>,
+    names: HashSet<String>,
+    coin: u32,
+    st: HistState,
+}
+
+/// What one [`HistoryWalk::step`] did.
+#[derive(Debug, Default)]
+pub struct HistoryStep {
+    /// Txs (frozen TxNums and hot rows) this slice visited.
+    pub txs: u64,
+    /// The walk ended: its tokens are cleared from [`meta::D3_REWALK`].
+    pub done: bool,
+    /// Tokens the walk covered.
+    pub tokens: u64,
+    pub report: ReceiversReport,
+}
+
+/// Resume the persisted history walk, or begin one when tokens wait for it
+/// ([`balances::rewalk_pending`]), the D3 pass has a done height to walk below, and the last
+/// walk ended at least [`Opts::rewalk_every_secs`] ago. `None`: nothing to walk now.
+pub fn history_begin(
+    hot: &HotStore,
+    dict: &Mutex<HotDict>,
+    o: &Opts,
+) -> Result<Option<HistoryWalk>> {
+    let txn = hot.ro()?;
+    let Some(coin) = balances::coin_module(&txn)? else {
+        return Ok(None);
     };
-    let mut p = Pending::default();
-    if walk(env, &w, &mut p, rep, (0, upto), None, stop)? {
-        return Ok(true);
+    let st = match txn
+        .meta(meta::D3_REWALK_WALK)?
+        .and_then(|v| serde_json::from_slice::<HistState>(&v).ok())
+    {
+        Some(st) => st,
+        None => {
+            let ids = balances::rewalk_pending(&txn)?;
+            let Some(upto) = txn
+                .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS)?
+                .as_deref()
+                .and_then(be_u32)
+            else {
+                // The first pass (from 0) covers them.
+                return Ok(None);
+            };
+            let last = txn
+                .meta(meta::D3_REWALK_AT)?
+                .as_deref()
+                .and_then(be_u32)
+                .unwrap_or(0);
+            if ids.is_empty() || now_unix() < last.saturating_add(o.rewalk_every_secs) {
+                return Ok(None);
+            }
+            HistState {
+                upto,
+                ids,
+                ..HistState::default()
+            }
+        }
+    };
+    drop(txn);
+    let snap: Arc<MemDict> = Arc::new(dict.lock().unwrap_or_else(|e| e.into_inner()).mem().clone());
+    let tokens = tracked_tokens(&hot.ro()?, &snap)?;
+    let names: HashSet<String> = st
+        .ids
+        .iter()
+        .filter_map(|id| snap.name(DictKind::Module, *id).map(str::to_owned))
+        .filter(|m| tokens.contains(m))
+        .collect();
+    tracing::info!(tokens = ?names, upto = st.upto, next = st.next, hot = st.hot,
+        "balances: D3 history walk of newly tracked tokens (begun or resumed)");
+    Ok(Some(HistoryWalk {
+        snap,
+        tokens,
+        names,
+        coin,
+        st,
+    }))
+}
+
+impl HistoryWalk {
+    /// Where the next slice starts: (frozen TxNum, in the hot part).
+    pub fn position(&self) -> (u64, bool) {
+        (self.st.next, self.st.hot)
     }
-    rep.rewalk_tokens = ids.len() as u64;
-    let mut txn = env.hot.rw()?;
-    for m in ids {
-        balances::clear_rewalk(&mut txn, *m)?;
+
+    /// Walk at most `max_txs` more txs below the done height, marking with the D3 rules for
+    /// this walk's tokens only; the marks and the new position commit in one txn. The last
+    /// slice clears the tokens from [`meta::D3_REWALK`].
+    pub fn step(
+        &mut self,
+        hot: &HotStore,
+        dict: &Mutex<HotDict>,
+        segdir: &Path,
+        o: &Opts,
+        max_txs: u64,
+    ) -> Result<HistoryStep> {
+        let max = max_txs.max(1);
+        let env = Env {
+            hot,
+            dict,
+            segdir,
+            snap: self.snap.clone(),
+            o,
+            ck: (self.coin, meta::D3_REWALK_WALK),
+        };
+        let w = Walk {
+            rules: Rules::D3,
+            forks: o.forks,
+            tokens: self.tokens.clone(),
+            only: Some(self.names.clone()),
+            max_event_candidates: o.max_event_candidates,
+            max_untracked_candidates: o.max_untracked_candidates,
+            max_total_candidates: o.max_total_candidates,
+            max_exec_per_sender: o.max_exec_per_sender,
+            max_exec_candidates: o.max_exec_candidates,
+        };
+        let mut rep = ReceiversReport {
+            rules: Rules::D3,
+            from: 0,
+            to: self.st.upto,
+            ..ReceiversReport::default()
+        };
+        let mut p = Pending {
+            emitters: self.st.taken.clone().into_iter().collect(),
+            untracked: self.st.untracked,
+            exec_total: self.st.exec_total,
+            ..Pending::default()
+        };
+        let span = (0, self.st.upto);
+        let mut txs = 0u64;
+        let mut done = self.names.is_empty();
+        if !done && !self.st.hot {
+            let segs = Segments::open_without_filters(segdir, self.snap.clone())?;
+            let start = self.st.next.max(frozen_start(&segs, 0));
+            let end = segs
+                .last_txnum_below_height(self.st.upto)
+                .map_or(start, |t| t + 1);
+            let stop_at = end.min(start.saturating_add(max));
+            for t in start..stop_at {
+                visit_frozen(&env, &segs, &w, &mut p, &mut rep, t, span)?;
+            }
+            txs = stop_at.saturating_sub(start);
+            self.st.next = stop_at.max(start);
+            self.st.hot = stop_at >= end;
+        } else if !done {
+            let rows = hot_rows(hot, self.st.hot_after.as_deref(), span, max as usize)?;
+            for (k, v) in &rows {
+                visit_hot(&env, &w, &mut p, &mut rep, k, v)?;
+            }
+            txs = rows.len() as u64;
+            if let Some((k, _)) = rows.last() {
+                self.st.hot_after = Some(k.clone());
+            }
+            if (rows.len() as u64) < max {
+                // Blocks the freezer moved out of the hot store since the frozen part ended
+                // are walked there first; the walk ends when both parts are through.
+                let segs = Segments::open_without_filters(segdir, self.snap.clone())?;
+                let end = segs
+                    .last_txnum_below_height(self.st.upto)
+                    .map_or(0, |t| t + 1);
+                done = end <= self.st.next;
+                self.st.hot = done;
+            }
+        }
+        self.st.taken = p.emitters.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        self.st.untracked = p.untracked;
+        self.st.exec_total = p.exec_total;
+        p.state = Some(serde_json::to_vec(&self.st)?);
+        p.flush(hot, dict, env.ck, None, &mut rep)?;
+        if done {
+            let mut txn = hot.rw()?;
+            for m in &self.st.ids {
+                balances::clear_rewalk(&mut txn, *m)?;
+            }
+            txn.del(Table::Meta, meta::D3_REWALK_WALK.as_bytes())?;
+            txn.set_meta(meta::D3_REWALK_AT, &now_unix().to_be_bytes())?;
+            txn.commit()?;
+            tracing::info!(tokens = ?self.names, "balances: D3 history walk done");
+        }
+        Ok(HistoryStep {
+            txs,
+            done,
+            tokens: self.st.ids.len() as u64,
+            report: rep,
+        })
     }
-    txn.set_meta(meta::D3_REWALK_AT, &now_unix().to_be_bytes())?;
-    txn.commit()?;
-    Ok(false)
 }
 
 /// Review M1: check up to `n` queued discovered modules with `check(chain, module)` (the

@@ -1396,3 +1396,131 @@ fn a_discovery_dropped_at_a_quota_is_requeued_by_the_next_pass() {
         .unwrap()
         .is_empty());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 2 (ruling R-P5P9-195).
+// ---------------------------------------------------------------------------------------------
+
+/// Re-review N1: a discovered module name past the key limit (an `n_x.tok` event naming a
+/// 3,000-char `n_x` module in a modref-shaped object) neither halts the tail nor the pass: it
+/// is dropped and counted.
+#[test]
+fn a_long_discovered_module_name_halts_neither_the_tail_nor_the_pass() {
+    let (_d, c) = d3_store();
+    let modref = json!({"refSpec": [{"namespace": null, "name": "fungible-v2"}],
+        "refName": {"namespace": "n_x", "name": "a".repeat(3000)}});
+    let cmd = json!({"payload": {"exec": {"code": "(n_x.tok.mint)", "data": {}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([event("n_x.tok", "MINT", json!([modref, LATE_ACC, 1.0]))]);
+    commit_block(&c, block_of(26, vec![d3_tx(6000, cmd, evs, Value::Null)]));
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false)
+        .expect("the pass must not fail");
+    assert_eq!(rep.to, 27, "{rep:?}");
+    assert!(rep.discovered_too_long >= 1, "{rep:?}");
+    let txn = c.hot.ro().unwrap();
+    assert!(balances::discovered_queue(&txn, 100)
+        .unwrap()
+        .iter()
+        .all(|(m, _, _)| m.len() <= kdx_decode::receivers::MAX_MODULE_LEN));
+}
+
+/// Review (a): `requeue_pending` resumes after the last key it scanned, so entries the queue
+/// keeps refusing (one namespace over its quota, sorting first) cannot freeze the rest.
+#[test]
+fn refused_pending_entries_cannot_freeze_the_rest_of_the_list() {
+    let (_d, c) = d3_store();
+    let mut txn = c.hot.rw().unwrap();
+    // 12 entries of one attacker namespace on chain 00 sort before the real one on chain 01.
+    for i in 0..12 {
+        balances::pend_discovered(&mut txn, &format!("n_a.junk{i:02}"), 0, 5).unwrap();
+    }
+    balances::pend_discovered(&mut txn, "n_real.tok", 1, 5).unwrap();
+    txn.commit().unwrap();
+    let mut moved_real = false;
+    for _ in 0..5 {
+        let mut txn = c.hot.rw().unwrap();
+        balances::requeue_pending(&mut txn, 4).unwrap();
+        txn.commit().unwrap();
+        moved_real |= balances::discovered_queue(&c.hot.ro().unwrap(), 100)
+            .unwrap()
+            .iter()
+            .any(|(m, _, _)| m == "n_real.tok");
+    }
+    assert!(moved_real, "the real entry never left the pending list");
+}
+
+/// Re-review N2: the history walk of a newly tracked token runs in bounded slices whose
+/// cursor is persisted with their marks; a new walker resumes at that cursor, not at 0.
+#[test]
+fn a_queued_history_walk_progresses_in_slices_and_resumes_from_its_cursor() {
+    let (_d, c) = d3_store();
+    let cmd = json!({"payload": {"exec": {"code": "(free.late.mint)", "data": {}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([event("free.late", "MINT", json!([LATE_ACC, 5.0]))]);
+    commit_block(&c, block_of(26, vec![d3_tx(5000, cmd, evs, Value::Null)]));
+    let mut o = d3_opts(false);
+    o.history_inline = false;
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    assert_eq!(rep.to, 27, "{rep:?}");
+    let q = vec![("free.late".to_owned(), 0u8, 26u32)];
+    seed_receivers::check_discovered(&c.hot, &c.dict, &q, &[Some(true)]).unwrap();
+    assert_eq!(
+        balances::rewalk_pending(&c.hot.ro().unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &o)
+        .unwrap()
+        .expect("a walk is pending");
+    let s = w.step(&c.hot, &c.dict, &c.segdir, &o, 1).unwrap();
+    assert!(!s.done && s.txs <= 1, "{s:?}");
+    let at = w.position();
+    drop(w);
+    // A new walker (e.g. after a restart) resumes where the last slice left off.
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &o)
+        .unwrap()
+        .expect("still pending");
+    assert_eq!(w.position(), at);
+    let mut slices = 1;
+    loop {
+        let s = w.step(&c.hot, &c.dict, &c.segdir, &o, 1).unwrap();
+        slices += 1;
+        assert!(s.txs <= 1, "{s:?}");
+        if s.done {
+            break;
+        }
+        assert!(slices < 10_000, "the walk never ends");
+    }
+    assert!(slices > 2, "{slices}");
+    assert!(dirty_in(&c, LATE_ACC, "free.late"));
+    assert!(balances::rewalk_pending(&c.hot.ro().unwrap())
+        .unwrap()
+        .is_empty());
+    assert!(seed_receivers::history_begin(&c.hot, &c.dict, &o)
+        .unwrap()
+        .is_none());
+}
+
+/// Re-review N2 / review M2: only a token first seen below the D3 done height needs a
+/// history walk; one first seen at or above it is covered by the tail and the next pass.
+#[test]
+fn a_token_first_seen_above_the_d3_flag_queues_no_walk() {
+    let (_d, c) = d3_store();
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    let done = rep.to;
+    let q = vec![("free.above".to_owned(), 0u8, done)];
+    seed_receivers::check_discovered(&c.hot, &c.dict, &q, &[Some(true)]).unwrap();
+    assert!(balances::rewalk_pending(&c.hot.ro().unwrap())
+        .unwrap()
+        .is_empty());
+    let q = vec![("free.below".to_owned(), 0u8, done - 1)];
+    seed_receivers::check_discovered(&c.hot, &c.dict, &q, &[Some(true)]).unwrap();
+    assert_eq!(
+        balances::rewalk_pending(&c.hot.ro().unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
+}

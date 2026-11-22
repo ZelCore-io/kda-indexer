@@ -115,6 +115,8 @@ pub struct Caps {
     pub account_rows: u32,
     /// Seconds after which a module's fungible checks and a not-fungible verdict are re-done.
     pub recheck_secs: u32,
+    /// Txs per slice of the D3 history walk, one slice per loop round (re-review N2).
+    pub history_slice_txs: u64,
 }
 
 impl Default for Caps {
@@ -124,6 +126,7 @@ impl Default for Caps {
             module_rows: 1_000_000,
             account_rows: 1_000,
             recheck_secs: 86_400,
+            history_slice_txs: crate::seed_receivers::HISTORY_SLICE_TXS,
         }
     }
 }
@@ -1012,6 +1015,8 @@ async fn receivers_pass(
         forks: crate::seed_receivers::forks_for(&ctx.opts.network),
         rules,
         rewalk_every_secs: crate::seed_receivers::REWALK_EVERY_SECS,
+        // Walked in slices by the loop (`history_slice`), never inline (re-review N2).
+        history_inline: false,
         ..Default::default()
     };
     let Some((from, to)) = crate::seed_receivers::pending_for(&ctx.hot.ro()?, &opts)? else {
@@ -1038,6 +1043,65 @@ async fn receivers_pass(
         tracing::info!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended");
     }
     Ok(!rep.stopped)
+}
+
+/// The loop's D3 history walk (re-review N2): the walk in progress, and when to try again
+/// after an error.
+#[derive(Default)]
+struct History {
+    walk: Option<crate::seed_receivers::HistoryWalk>,
+    retry_at: Option<Instant>,
+}
+
+/// Pause before a failed history slice is tried again.
+const HISTORY_RETRY: Duration = Duration::from_secs(60);
+
+/// Re-review N2: one bounded slice of the D3 history walk for newly tracked tokens (begun or
+/// resumed from its persisted cursor), so tail marks and NFT steps keep flowing while it runs.
+/// Returns whether it walked anything (the loop then does not idle). Errors are logged and
+/// retried after [`HISTORY_RETRY`], never fatal.
+async fn history_slice(ctx: &Arc<Ctx>, h: &mut History, slice: u64) -> Result<bool> {
+    if h.retry_at.is_some_and(|t| Instant::now() < t) {
+        return Ok(false);
+    }
+    let opts = crate::seed_receivers::Opts {
+        forks: crate::seed_receivers::forks_for(&ctx.opts.network),
+        rules: Rules::D3,
+        rewalk_every_secs: crate::seed_receivers::REWALK_EVERY_SECS,
+        ..Default::default()
+    };
+    let (c, mut walk) = (ctx.clone(), h.walk.take());
+    let (walk, r) = tokio::task::spawn_blocking(move || {
+        let r = (|| -> Result<Option<crate::seed_receivers::HistoryStep>> {
+            if walk.is_none() {
+                walk = crate::seed_receivers::history_begin(&c.hot, &c.dict, &opts)?;
+            }
+            match walk.as_mut() {
+                Some(w) => Ok(Some(w.step(&c.hot, &c.dict, &c.segdir, &opts, slice)?)),
+                None => Ok(None),
+            }
+        })();
+        (walk, r)
+    })
+    .await?;
+    match r {
+        Ok(Some(s)) => {
+            if s.done {
+                tracing::info!(tokens = s.tokens, report = %serde_json::to_string(&s.report)?,
+                    "balances: D3 history walk ended");
+            } else {
+                h.walk = walk;
+            }
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => {
+            // The next try resumes from the persisted cursor.
+            tracing::warn!(error = %e, "balances: D3 history walk slice failed; retried later");
+            h.retry_at = Some(Instant::now() + HISTORY_RETRY);
+            Ok(false)
+        }
+    }
 }
 
 /// `describe-module` reads per reconcile round for the D3 discovery queue (review M1).
@@ -1194,6 +1258,7 @@ async fn run_with(
     let mut rate = 0.0f64;
     let mut last_log = Instant::now();
     let mut watch = BranchWatch::default();
+    let mut history = History::default();
     loop {
         if stop.is_cancelled() {
             return Ok(());
@@ -1233,6 +1298,7 @@ async fn run_with(
                 tracing::warn!(error = %e, "balances: D3 discovery check failed; retried next round");
             }
         }
+        let walked = o.seed && history_slice(&ctx, &mut history, o.caps.history_slice_txs).await?;
         // NFT rows (plan Task 11) share the `/local` budget; the table is small, so one step
         // per loop keeps them current even behind a long balance backlog.
         let nft = crate::nft_fill::step(&ctx.hot, &local, &mut nft_cursor).await?;
@@ -1252,7 +1318,10 @@ async fn run_with(
                 .balance_dirty_rows
                 .set(balances::dirty_count(&ctx.hot.ro()?)? as i64);
             // Off-branch NFT answers (D2) are not progress either: no immediate re-loop.
-            if nft.rows() > nft.node_errors + nft.other_branch || det.calls() > det.node_errors {
+            if walked
+                || nft.rows() > nft.node_errors + nft.other_branch
+                || det.calls() > det.node_errors
+            {
                 continue;
             }
             tokio::select! {
@@ -2334,6 +2403,88 @@ pub(crate) mod tests {
             pending() == 0
         })
         .await;
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// Re-review N2: a pending D3 history walk runs in slices between the loop's other steps;
+    /// dirty rows are reconciled while it is still pending, and the walk then completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_rows_are_reconciled_while_a_history_walk_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["k:a"]);
+        let segdir = dir.path().join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut txn,
+            kdx_hot::Stage::Tail,
+            0,
+            1,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        // D3 done through height 60,000; a token first seen at 5 waits for its history walk.
+        txn.set_meta(
+            balances::meta::BALANCES_SEED_TOKEN_RECEIVERS,
+            &60_000u32.to_be_bytes(),
+        )
+        .unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let tok = dict.intern(DictKind::Module, "free.t");
+        dict.persist(&mut txn).unwrap();
+        balances::note_token(&mut txn, tok, 5).unwrap();
+        // 50,000 stored txs below the done height (unreadable records count as pass errors):
+        // at one tx per slice the walk needs 50,000 slices, far longer than one batch.
+        for h in 2..50_002u32 {
+            let k = kdx_types::TxKey::new(h, 0, 1);
+            txn.put(Table::TailTxs, &k.to_be_bytes(), b"\xffnot a tx record")
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(
+            balances::rewalk_pending(&hot.ro().unwrap()).unwrap(),
+            vec![tok]
+        );
+        let (ctx, _) = client(dir.path(), &hot);
+        let node = ctx.node.clone();
+        let o = ReconcileOpts {
+            local: LocalOpts {
+                rps: 0,
+                concurrency: 4,
+            },
+            batch: 10,
+            seed: true,
+            caps: Caps {
+                history_slice_txs: 1,
+                ..Caps::default()
+            },
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run_with(
+            Arc::new(ctx),
+            node,
+            o,
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        let walk_pending = || {
+            !balances::rewalk_pending(&hot.ro().unwrap())
+                .unwrap()
+                .is_empty()
+        };
+        until("the dirty row reconciled", || {
+            assert!(!task.is_finished(), "run ended");
+            balances::dirty_count(&hot.ro().unwrap()).unwrap() == 0
+        })
+        .await;
+        assert!(walk_pending(), "the walk ran inline before the dirty rows");
+        let end = Instant::now() + Duration::from_secs(300);
+        while walk_pending() {
+            assert!(!task.is_finished(), "run ended");
+            assert!(Instant::now() < end, "the history walk never ended");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         stop.cancel();
         task.await.unwrap().unwrap();
     }

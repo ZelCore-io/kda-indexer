@@ -124,6 +124,10 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         ),
         (counters::txs_chain(chain), n),
         (counters::D3_TAIL_DROPPED.to_owned(), d3.dropped as i64),
+        (
+            balances::counters::D3_DISCOVER_TOO_LONG.to_owned(),
+            d3.too_long as i64,
+        ),
     ] {
         if delta != 0 {
             txn.add_counter(&name, delta)?;
@@ -154,6 +158,9 @@ struct D3Block {
     per_emitter: std::collections::HashMap<String, u32>,
     discovered: usize,
     dropped: u64,
+    /// Discoverable names over `MAX_MODULE_LEN` (re-review N1; a pure function of the txs, so
+    /// the counter's undo op stays replay-identical).
+    too_long: u64,
     /// account u32 ‖ module u32 ‖ TxKey of each row marked (for the undo).
     marked: Vec<u8>,
 }
@@ -210,6 +217,7 @@ fn mark_d3(
             st.marked.extend_from_slice(&key.to_be_bytes());
         }
     }
+    st.too_long += u64::from(r.discovered_too_long);
     for m in &r.discovered {
         if st.discovered >= D3_DISCOVER_PER_BLOCK {
             break;

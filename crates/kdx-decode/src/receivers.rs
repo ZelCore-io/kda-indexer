@@ -254,6 +254,8 @@ pub struct TokenReceivers {
     /// renders like a modref): it becomes a tracked token only after the node's
     /// `describe-module` lists `fungible-v2` on that chain (`seed_receivers` discovery queue).
     pub discovered: Vec<String>,
+    /// Discoverable names over [`MAX_MODULE_LEN`] bytes, dropped (re-review N1).
+    pub discovered_too_long: u32,
 }
 
 /// Event-derived candidates kept per tx (security review: chain data must not amplify the
@@ -265,6 +267,11 @@ pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
 pub const EXEC_BUCKET: &str = "exec:";
 /// Modules one tx may put forward as tokens (review M1).
 pub const MAX_DISCOVERED_PER_TX: usize = 4;
+/// Longest discovered module name kept (bytes; re-review N1): a discovered name becomes an
+/// MDBX key (the discovery queue and pending list), whose limit is about 2 KB. Real module
+/// names are far shorter; a longer one is dropped and counted
+/// ([`TokenReceivers::discovered_too_long`]), never an error.
+pub const MAX_MODULE_LEN: usize = 256;
 /// Module references kept per event (each one with a string uses a pair slot of the tx, so
 /// more can never add a pair).
 const MAX_REFS_PER_EVENT: usize = MAX_EVENT_PAIRS_PER_TX;
@@ -335,6 +342,12 @@ impl TokenReceivers {
         }
     }
     fn discover(&mut self, module: &str) {
+        if module.len() > MAX_MODULE_LEN {
+            if readable_module(module) {
+                self.discovered_too_long += 1;
+            }
+            return;
+        }
         if module != "coin"
             && readable_module(module)
             && self.discovered.len() < MAX_DISCOVERED_PER_TX
