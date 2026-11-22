@@ -101,7 +101,11 @@ priced as stock prices its lists, `@complexity(value: 1, multipliers: ["first", 
 Stock's own pagination serves `first: 0` (or `last: 0`) without a cursor as the default page of
 20, but its gate multiplies by the argument's value, 0: such a page and everything nested in it
 cost 0 there, at every level. This indexer keeps that price at the gate (parity) and bounds the
-rows with its read budget instead (below).
+rows with its read budget instead (below). One case differs (audit F-04): a zero multiplier
+next to a non-zero one of the same field is ignored, so `first: 1000, last: 0` (served as
+1,000 rows) is priced at 1,000, not 0 as stock prices it; such a page nested under another
+page can now be refused with the complexity error where stock answers it. `first: 0` alone,
+or both zero, is still 0.
 Examples: four aliased `transactions(first: 1000) { edges { node { hash } } }` cost 4000 and are
 answered, a fifth page of 1 is refused; `transactions(first: 4001)` is refused; the explorer's transactions-by-account page at `first: 100` costs
 (1 + 1 for `result` + 1 for its `block`) × 100 = 300.
@@ -186,7 +190,9 @@ page with: as asked up to 1,000; absent, `first: 0` or `last: 0` without a curso
 of `nodes` are priced at the most served (1,000). An account's NFT holdings are read when the
 account resolves, so `nonFungibleAccount`, `nonFungibleChainAccount` and every NFT id given to
 `node`/`nodes` (or an id only a variable gives) cost 10,000 rows (one details read each)
-whatever is selected, and `nonFungibleTokenBalances` 10,000 more for the rows it answers. A request above the safety ceiling of 1,100,000 is refused with `budget`
+whatever is selected, and `nonFungibleTokenBalances` 10,000 times its selection's cost (each
+row at least 1) for the rows it answers (audit F-05: about 110 selected fields per holding
+fit under the ceiling). A request above the safety ceiling of 1,100,000 is refused with `budget`
 before anything runs; a batch counts the sum of its operations. The ceiling is 11 times the
 largest budget of the explorer operation documents in [data/explorer-ops.md](data/explorer-ops.md)
 and the compare suite's documents, priced with no variables bound, so every page variable at

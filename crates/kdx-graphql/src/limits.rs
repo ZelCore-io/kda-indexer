@@ -26,7 +26,8 @@
 //! resolvers size it: as asked up to [`crate::MAX_PAGE_ROWS`]; absent, or `0` without a cursor,
 //! at `default_page`. `nodes(ids)` multiplies by the number of ids, per-chain account lists by
 //! the chain count (20 for an absent or empty `chainIds`, else its length), NFT holdings by
-//! [`crate::MAX_NFT_HOLDINGS`] (one read per row, whatever is selected).
+//! [`crate::MAX_NFT_HOLDINGS`] times their selection, each row at least 1 (one read per row,
+//! whatever is selected; audit F-05).
 //!
 //! [`analyze`] runs the same walk as the legacy model, which also refuses on `max_depth`,
 //! `introspection_depth` and `max_complexity`, with pages clamped at `max_page`. It is not
@@ -395,8 +396,10 @@ impl<'a> Walk<'a> {
                         own.saturating_add(all - part)
                             .saturating_add(mult.saturating_mul(per))
                     } else if name == NFT_HOLDINGS {
-                        // One details read per holding, made whatever the selection (S1).
-                        own.saturating_add(mult)
+                        // One details read per holding, made whatever the selection (S1);
+                        // the resolver work and response size grow with holdings x the
+                        // selection, so each holding is priced at least 1 (audit F-05).
+                        own.saturating_add(mult.saturating_mul(all.max(1)))
                     } else if mult > 1 {
                         own.saturating_add(mult.saturating_mul(all.max(1)))
                     } else {
@@ -1197,6 +1200,29 @@ mod tests {
         );
         // A block's count is not a walk: kadscan's block list passes.
         assert!(c("{ blocksFromDepth(minimumDepth: 0, first: 25) { totalCount edges { node { transactions { totalCount edges { node { cmd { meta { gasPrice } } } } } } } } }").unwrap() < 2000);
+    }
+
+    /// Audit F-05: the selection under `nonFungibleTokenBalances` is priced per holding
+    /// (resolver work and response size grow with holdings x fields), so 200 aliased
+    /// `guard { raw }` per holding is over the ceiling; an explorer selection passes.
+    #[test]
+    fn nft_holdings_price_their_selection() {
+        let b = |q: &str| {
+            let doc = async_graphql::parser::parse_query(q).unwrap();
+            budget(&doc, &Variables::default(), &GraphqlSettings::default())
+                .and_then(|c| over_ceiling(c.complexity).map(|_| c.complexity))
+                .map_err(|e| format!("{:?}", e.extensions.unwrap().get("code")))
+        };
+        let many: String = (0..200).map(|i| format!("g{i}: guard {{ raw }} ")).collect();
+        let q = format!(
+            "{{ nonFungibleAccount(accountName: \"k:a\") {{ nonFungibleTokenBalances {{ {many} }} }} }}"
+        );
+        assert_eq!(b(&q), Err(format!("{:?}", Some(&Value::from("LIMIT")))));
+        let normal = "{ nonFungibleAccount(accountName: \"k:a\") { accountName \
+            nonFungibleTokenBalances { tokenId version balance \
+              guard { raw ... on KeysetGuard { keys predicate } } \
+              info { precision supply uri } } } }";
+        assert!(b(normal).is_ok(), "{:?}", b(normal));
     }
 
     /// FIX-3 part D (S4, S5): the served read budget still refuses more than [`MAX_COUNTS`]

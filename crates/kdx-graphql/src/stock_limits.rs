@@ -156,14 +156,24 @@ impl<'a> Cx<'a> {
         // below 0, so a negative `first` cannot cancel an expensive sibling (stock's library
         // multiplies the negative in). A number that is not finite falls back to the
         // children, as the library's NaN check does.
-        let mut mult = 1.0;
-        for m in d.multipliers {
-            match self.arg(f, m, sf) {
-                Some(Value::Number(n)) => mult *= n.as_f64().unwrap_or(f64::NAN).max(0.0),
-                Some(Value::List(l)) => mult *= l.len() as f64,
-                _ => {}
-            }
-        }
+        //
+        // Audit F-04 (option A): a zero multiplier is ignored when a sibling multiplier of
+        // the same directive is non-zero, so `first: 1000, last: 0` is priced as the 1000
+        // rows it serves (stock gives 0). Zero alone, or all zero, still gives 0, as stock.
+        let factors: Vec<f64> = d
+            .multipliers
+            .iter()
+            .filter_map(|m| match self.arg(f, m, sf) {
+                Some(Value::Number(n)) => Some(n.as_f64().unwrap_or(f64::NAN).max(0.0)),
+                Some(Value::List(l)) => Some(l.len() as f64),
+                _ => None,
+            })
+            .collect();
+        let any_non_zero = factors.iter().any(|x| *x != 0.0);
+        let mult: f64 = factors
+            .iter()
+            .filter(|x| !any_non_zero || **x != 0.0)
+            .product();
         let c = (d.value as f64 + child) * mult;
         if c.is_nan() {
             child
@@ -769,6 +779,30 @@ mod tests {
         assert_eq!(cx(q, serde_json::json!({"n": -1000000})), 4001.0);
         // A fractional or huge number is still a number: priced as stock prices it, >= 0.
         assert!(cx(q, serde_json::json!({"n": 1e300})) > MAX_COMPLEXITY);
+    }
+
+    /// Audit F-04 (option A): a zero multiplier next to a non-zero sibling of the same
+    /// directive is ignored, so `first: N, last: 0` is priced as the N rows it serves.
+    /// `first: 0` alone stays 0, as stock prices it.
+    #[test]
+    fn a_zero_multiplier_beside_a_non_zero_one_is_ignored() {
+        let nested = |a: &str| {
+            format!("{{ blocksFromHeight(startHeight: 0, {a}) {{ edges {{ node {{ transactions(first: 50) {{ edges {{ node {{ hash }} }} }} }} }} }} }}")
+        };
+        assert!(cx(&nested("first: 1000, last: 0"), serde_json::json!({})) > MAX_COMPLEXITY);
+        assert!(cx(&nested("first: 0, last: 1000"), serde_json::json!({})) > MAX_COMPLEXITY);
+        assert_eq!(cx(&nested("first: 1000, last: 0"), serde_json::json!({})), 51.0 * 1000.0);
+        // Through a variable too.
+        let q = "query Q($z: Int) { transactions(first: 4001, last: $z) { edges { node { hash } } } }";
+        assert_eq!(cx(q, serde_json::json!({"z": 0})), 4001.0);
+        // `first: 0` alone is unchanged (stock: 0), and so are both zero.
+        assert_eq!(cx(&nested("first: 0"), serde_json::json!({})), 0.0);
+        assert_eq!(cx(&nested("first: 0, last: 0"), serde_json::json!({})), 0.0);
+        // Two non-zero multipliers still multiply.
+        assert_eq!(
+            cx("{ transactions(first: 10, last: 3) { edges { node { hash } } } }", serde_json::json!({})),
+            30.0
+        );
     }
 
     /// FIX-3 part D (S1): the gate prices the operation the executor runs, and is skipped
