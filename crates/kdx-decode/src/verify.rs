@@ -154,7 +154,8 @@ pub fn verify_linkage(prev: &Header, next: &Header) -> Result<(), VerifyError> {
             prev.chain_id, next.chain_id
         )));
     }
-    if prev.height + 1 != next.height {
+    // F-39: checked; a node height of `u64::MAX` must not wrap to 0.
+    if prev.height.checked_add(1) != Some(next.height) {
         return Err(VerifyError::Linkage(format!(
             "chain {}: height {} does not follow {}",
             next.chain_id, next.height, prev.height
@@ -167,4 +168,38 @@ pub fn verify_linkage(prev: &Header, next: &Header) -> Result<(), VerifyError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(height: u64, hash: u8, parent: u8) -> Header {
+        Header {
+            hash: Hash32([hash; 32]),
+            parent: Hash32([parent; 32]),
+            adjacents: Default::default(),
+            adjacents_order: Vec::new(),
+            chain_id: 0,
+            height,
+            weight: [0; 32],
+            target: [0; 32],
+            nonce: 0,
+            creation_time: 0,
+            epoch_start: 0,
+            feature_flags: 0,
+            payload_hash: Hash32([0; 32]),
+            chainweb_version: "mainnet01".into(),
+        }
+    }
+
+    /// F-39: a height of `u64::MAX` does not wrap to 0 and pass as linked.
+    #[test]
+    fn linkage_at_the_height_limit() {
+        assert!(verify_linkage(&header(5, 1, 0), &header(6, 2, 1)).is_ok());
+        assert!(matches!(
+            verify_linkage(&header(u64::MAX, 1, 0), &header(0, 2, 1)),
+            Err(VerifyError::Linkage(_))
+        ));
+    }
 }

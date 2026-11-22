@@ -39,9 +39,43 @@ fn header_of(ev: &Value) -> Option<(u8, u64, String)> {
     ))
 }
 
-fn offer(tx: &watch::Sender<Target>, height: u64, hash: String) {
+/// Highest an SSE event may name above the current target (F-37). The target is the
+/// node's last `/cut` entry or a newer SSE header, so a real event is a few heights above it;
+/// one far above is ignored (the next `/cut` poll still moves the target).
+const SSE_MAX_AHEAD: u64 = CATCHUP_HEIGHTS as u64;
+
+/// A `header/updates` event: moves the target up (or to another hash at the same height),
+/// never down and never more than [`SSE_MAX_AHEAD`] above it.
+fn offer_sse(tx: &watch::Sender<Target>, height: u64, hash: String) {
     tx.send_if_modified(|t| match t {
-        Some((h, x)) if *h > height || (*h == height && *x == hash) => false,
+        Some((h, x))
+            if *h > height
+                || (*h == height && *x == hash)
+                || height > h.saturating_add(SSE_MAX_AHEAD) =>
+        {
+            false
+        }
+        _ => {
+            *t = Some((height, hash));
+            true
+        }
+    });
+}
+
+/// A `/cut` entry (F-37). At or above the target it replaces it (unless identical). Below
+/// it, it replaces it only when the previous poll of this chain gave the same entry: the
+/// node's cut really is lower (its chain moved down, or the target came from an SSE header
+/// the node never adopted), not a poll that raced a new block. `last` is this chain's entry
+/// from the previous poll. The follower still never moves below its stored tip on a lower
+/// target; it only stops waiting for an unreachable one.
+fn offer_cut(tx: &watch::Sender<Target>, last: &mut Target, height: u64, hash: String) {
+    let confirmed = last
+        .as_ref()
+        .is_some_and(|(h, x)| *h == height && *x == hash);
+    *last = Some((height, hash.clone()));
+    tx.send_if_modified(|t| match t {
+        Some((h, x)) if *h == height && *x == hash => false,
+        Some((h, _)) if *h > height && !confirmed => false,
         _ => {
             *t = Some((height, hash));
             true
@@ -69,7 +103,7 @@ async fn sse_task(
                         Some(Ok(v)) => {
                             if let Some((c, h, x)) = header_of(&v) {
                                 if let Some(t) = targets.get(&c) {
-                                    offer(t, h, x);
+                                    offer_sse(t, h, x);
                                 }
                             }
                         }
@@ -100,12 +134,13 @@ async fn cut_task(
     stop: CancellationToken,
 ) {
     let every = Duration::from_secs(ctx.opts.cut_poll_secs.max(1));
+    let mut last: BTreeMap<u8, Target> = BTreeMap::new();
     loop {
         match ctx.node.cut().await {
             Ok(cut) => {
                 for (c, e) in cut.hashes {
                     if let Some(t) = targets.get(&c) {
-                        offer(t, e.height, e.hash);
+                        offer_cut(t, last.entry(c).or_default(), e.height, e.hash);
                     }
                 }
             }
@@ -607,5 +642,57 @@ pub async fn run(ctx: Arc<Ctx>, shutdown: CancellationToken) -> Result<()> {
     match err {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(tx: &watch::Sender<Target>) -> Target {
+        tx.borrow().clone()
+    }
+
+    /// F-37: SSE offers only move the target up, and never further than `SSE_MAX_AHEAD`
+    /// above it, so one absurd event cannot park the chain on an unreachable height.
+    #[test]
+    fn sse_offers_are_monotonic_and_bounded() {
+        let (tx, _rx) = watch::channel(Some((100u64, "a".to_string())));
+        offer_sse(&tx, 100 + SSE_MAX_AHEAD + 1, "far".into());
+        assert_eq!(target(&tx), Some((100, "a".into())));
+        offer_sse(&tx, 101, "b".into());
+        assert_eq!(target(&tx), Some((101, "b".into())));
+        offer_sse(&tx, 100, "c".into());
+        assert_eq!(target(&tx), Some((101, "b".into())));
+        offer_sse(&tx, 101, "d".into());
+        assert_eq!(target(&tx), Some((101, "d".into())));
+        offer_sse(&tx, 101 + SSE_MAX_AHEAD, "e".into());
+        assert_eq!(target(&tx), Some((101 + SSE_MAX_AHEAD, "e".into())));
+        let (tx, _rx) = watch::channel(None);
+        offer_sse(&tx, 7, "x".into());
+        assert_eq!(target(&tx), Some((7, "x".into())));
+    }
+
+    /// F-37: a `/cut` entry at or above the target replaces it at once; a lower one (the
+    /// node's chain moved down, or an SSE event named a header the node never adopted)
+    /// replaces it when two consecutive polls agree, so one stale cut does not rewind it.
+    #[test]
+    fn cut_can_move_the_target_down() {
+        let (tx, _rx) = watch::channel(Some((101u64, "bad".to_string())));
+        let mut last = None;
+        offer_cut(&tx, &mut last, 100, "y".into());
+        assert_eq!(target(&tx), Some((101, "bad".into())));
+        offer_cut(&tx, &mut last, 100, "y".into());
+        assert_eq!(target(&tx), Some((100, "y".into())));
+        offer_cut(&tx, &mut last, 102, "z".into());
+        assert_eq!(target(&tx), Some((102, "z".into())));
+        offer_cut(&tx, &mut last, 102, "w".into());
+        assert_eq!(target(&tx), Some((102, "w".into())));
+        // A lower entry that changes between polls is not confirmed.
+        offer_cut(&tx, &mut last, 101, "p".into());
+        offer_cut(&tx, &mut last, 101, "q".into());
+        assert_eq!(target(&tx), Some((102, "w".into())));
+        offer_cut(&tx, &mut last, 101, "q".into());
+        assert_eq!(target(&tx), Some((101, "q".into())));
     }
 }

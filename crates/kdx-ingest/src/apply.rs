@@ -102,8 +102,9 @@ pub fn commit(ctx: &Ctx, batches: &[Batch]) -> Result<CommitStats> {
     // Lock order everywhere: dictionary, then the MDBX writer.
     let mut dict = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());
     let r = commit_locked(ctx, batches, &mut dict);
-    if r.is_err() {
-        ctx.reload_dict(&mut dict);
+    if let Err(e) = &r {
+        ctx.reload_dict(&mut dict)
+            .with_context(|| format!("after a failed commit: {e:#}"))?;
     }
     r
 }
@@ -124,7 +125,7 @@ fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<Com
         if let Some(f) = b.fork {
             let frontier = txn.frozen_frontier()?;
             anyhow::ensure!(
-                f.height + 1 >= frontier,
+                u64::from(f.height) + 1 >= u64::from(frontier),
                 "chain {}: fork at {} is below the frozen frontier {frontier}",
                 b.chain,
                 f.height

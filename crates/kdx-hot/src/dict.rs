@@ -59,6 +59,11 @@ impl HotDict {
     }
 
     /// Write the queued names (forward and reverse rows) in `txn`.
+    ///
+    /// Clears the queue inside the open txn. Contract (F-52): when that txn then aborts or
+    /// fails to commit, the caller must reload the dictionary from MDBX
+    /// (`kdx_ingest::Ctx::reload_dict`) and stop on a failed reload, because the drained
+    /// names' ids are no longer queued and never reached `DictRev`.
     pub fn persist(&mut self, txn: &mut RwTxn<'_>) -> Result<()> {
         for &(k, id) in &self.pending {
             let name = self.mem.name(k, id).expect("pending id was interned");
