@@ -170,6 +170,20 @@ class ChangeTests(unittest.TestCase):
         self.assertIn('id="a"', svg)
         self.assertNotIn('id="b"', svg)
 
+    def test_main_refuses_unplain_ids_and_file_names(self):
+        # F-59: a quote in an id would break out of the SVG attribute; a path in `file`
+        # would write outside the output dir.
+        root = tempfile.mkdtemp()
+        for chart, mid in (({"id": 'c" onload="x', "file": "c.svg"}, "a"),
+                           ({"id": "c", "file": "../escape.svg"}, "a"),
+                           ({"id": "c", "file": "c.svg"}, 'a"b')):
+            chart.update({"title": "C", "metrics": [mid], "scale": "linear"})
+            data = {"metrics": [metric(mid, 1, 2)], "charts": [chart]}
+            write(os.path.join(root, "d.json"), json.dumps(data))
+            with self.assertRaises(SystemExit):
+                docs_charts.main(os.path.join(root, "d.json"), os.path.join(root, "out"))
+        self.assertFalse(os.path.exists(os.path.join(root, "escape.svg")))
+
     def test_main_rejects_mixed_units(self):
         root = tempfile.mkdtemp()
         data = {"metrics": [metric("a", 1, 2, unit="rows"), metric("b", 1, 2, unit="blocks")],
@@ -353,6 +367,14 @@ class DataValidationTests(unittest.TestCase):
         self.assertTrue(self.problems(ms, [self.chart(["a"], scale="cubic")]))
         self.assertTrue(self.problems(ms, [self.chart(["a"], file="c.png")]))
         self.assertTrue(self.problems(ms, [self.chart([])]))
+
+    def test_ids_and_file_names_are_plain(self):
+        # F-59: ids land in SVG attributes and `file` is joined to the output dir.
+        for bad in ('a"b', "a b", "<x>", "a'b"):
+            self.assertTrue(self.problems([metric("a", 1, 2)], [self.chart(["a"], id=bad)]), bad)
+            self.assertTrue(self.problems([metric(bad, 1, 2)]), bad)
+        for bad in ("../x.svg", "sub/x.svg", "/tmp/x.svg"):
+            self.assertTrue(self.problems([metric("a", 1, 2)], [self.chart(["a"], file=bad)]), bad)
 
     def test_unpublished_metric_does_not_count_for_units(self):
         ms = [metric("a", 1, 2, unit="rows"), metric("b", 1, 2, unit="blocks", publish=False)]
