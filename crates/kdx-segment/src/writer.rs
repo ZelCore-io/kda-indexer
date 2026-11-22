@@ -127,6 +127,25 @@ impl RangeInfo {
                 format_refusal(u64::from(r.format_version))
             );
         }
+        // F-31: `files` keys are joined to the segments dir by `segments check` (stat and
+        // blake3) and by the rebuild swap: only the range's own file names are allowed.
+        crate::manifest::check_network(&r.network)
+            .with_context(|| format!("{}", path.display()))?;
+        let own: std::collections::HashSet<String> =
+            crate::files::range_file_names(&r.network, r.start, r.end)
+                .into_iter()
+                .chain(crate::files::optional_file_names(
+                    &r.network, r.start, r.end,
+                ))
+                .collect();
+        if let Some(bad) = r.files.keys().find(|k| !own.contains(*k)) {
+            bail!(
+                "{}: {bad:?} is not a file of range {}..{}",
+                path.display(),
+                r.start,
+                r.end
+            );
+        }
         Ok(r)
     }
     /// The `range.toml` text (the writer and `segments add-index` both write it this way).

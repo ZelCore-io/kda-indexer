@@ -146,6 +146,39 @@ pub fn values(b: &[u8]) -> Result<Decoded> {
     );
     // `ones < high.len`, and `high.len` is backed by stored words: the capacity is bounded.
     let mut values = Vec::with_capacity(ones);
+    // F-33: `hi << low_len` drops bits once `hi > u64::MAX >> low_len`. The largest high part
+    // the bits can spell is `high.len - ones` (the last value at the last bit); only a
+    // universe near 2^64 lets it reach that bound, and only then does each value pay for the
+    // check.
+    let hi_max = u64::MAX >> low_len;
+    if (high.len - ones) as u64 > hi_max {
+        decode_high::<true>(&high, &low, low_len, ones, universe, &mut values)?;
+    } else {
+        decode_high::<false>(&high, &low, low_len, ones, universe, &mut values)?;
+    }
+    ensure!(
+        values.len() == ones,
+        "Elias-Fano high bits hold {} values, the index says {ones}",
+        values.len()
+    );
+    Ok(Decoded {
+        values,
+        universe,
+        used: c.at,
+    })
+}
+
+/// The values of `high`/`low` into `values`. With `CHECK`, each high part is checked to
+/// survive the shift (F-33); without it the caller has shown none can overflow.
+fn decode_high<const CHECK: bool>(
+    high: &Bits<'_>,
+    low: &Bits<'_>,
+    low_len: usize,
+    ones: usize,
+    universe: usize,
+    values: &mut Vec<u64>,
+) -> Result<()> {
+    let hi_max = u64::MAX >> low_len;
     let mut prev = 0u64;
     let words = high.words.len() / 8;
     for w in 0..words {
@@ -164,6 +197,12 @@ pub fn values(b: &[u8]) -> Result<Decoded> {
             );
             // Set bits are distinct and ascending, so `p >= i`.
             let hi = (p - i) as u64;
+            if CHECK {
+                ensure!(
+                    hi <= hi_max,
+                    "Elias-Fano high part {hi} overflows a {low_len}-bit shift"
+                );
+            }
             let v = (hi << low_len) | low.get(i * low_len, low_len);
             ensure!(
                 v >= prev && v < universe as u64,
@@ -173,16 +212,7 @@ pub fn values(b: &[u8]) -> Result<Decoded> {
             values.push(v);
         }
     }
-    ensure!(
-        values.len() == ones,
-        "Elias-Fano high bits hold {} values, the index says {ones}",
-        values.len()
-    );
-    Ok(Decoded {
-        values,
-        universe,
-        used: c.at,
-    })
+    Ok(())
 }
 
 /// A sucds `EliasFano` for the sequence serialized at the start of `b`, and the bytes it took.

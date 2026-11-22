@@ -1,6 +1,11 @@
 //! kdx-types: identifiers, hashes, dictionaries, varints and the lossless
 //! value codec shared by every kda-indexer crate (spec §3.2, §2.2, §3.4).
 
+// F-55: the binary decoders (here, in kdx-hot and in kdx-segment) cast stored u64 lengths
+// and offsets with `as usize`. That is lossless only on a 64-bit target, the only one the
+// indexer is built and deployed for; refuse to build anywhere else.
+const _: () = assert!(usize::BITS >= 64, "kda-indexer needs a 64-bit target");
+
 pub mod dict;
 pub mod hash;
 pub mod heartbeat;

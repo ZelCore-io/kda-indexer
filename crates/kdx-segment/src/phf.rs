@@ -155,7 +155,8 @@ pub enum Index {
 }
 
 pub struct PtrHashIndex {
-    phf: Phf,
+    /// `None` for an empty index (key count 0).
+    phf: Option<Phf>,
     map: Mmap,
     slots_at: usize,
     n: usize,
@@ -220,10 +221,16 @@ impl Index {
                 let mut params = PtrHashParams::default_fast();
                 params.alpha = alpha;
                 params.lambda = lambda;
-                if n > 0 && Phf::saved_sizes(n, params) != (pilots.len(), remap.len()) {
-                    return Err(bad("pilot or remap count does not match the key count"));
-                }
-                let phf = Phf::from_saved_parts(n, params, seed, pilots, remap);
+                // An empty index has no PtrHash: its lookups answer nothing without one.
+                let phf = if n == 0 {
+                    None
+                } else {
+                    Some(
+                        Phf::from_saved_parts(n, params, seed, pilots, remap).ok_or_else(|| {
+                            bad("pilot or remap count does not match the key count")
+                        })?,
+                    )
+                };
                 Ok(Index::PtrHash(Box::new(PtrHashIndex {
                     phf,
                     map,
@@ -278,10 +285,10 @@ impl KeyIndex for Index {
 impl KeyIndex for PtrHashIndex {
     fn candidates(&self, key: &Hash32, out: &mut Vec<u32>) {
         out.clear();
-        if self.n == 0 {
+        let Some(phf) = &self.phf else {
             return;
-        }
-        let i = self.phf.index(&prefix(key));
+        };
+        let i = phf.index(&prefix(key));
         if i >= self.n {
             return;
         }
@@ -367,6 +374,52 @@ mod tests {
             assert_eq!(idx.get(k), Some(i as u32));
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// F-15: the vendored constructor itself refuses saved parts that do not fit `(n,
+    /// params)`, so no caller can build a PtrHash whose lookups read past `pilots` or
+    /// `remap` (both are indexed without bounds checks). An empty one is refused too: its
+    /// lookups would read `remap[0]` of an empty remap.
+    #[test]
+    fn ptrhash_from_saved_parts_refuses_parts_of_the_wrong_size() {
+        let params = PtrHashParams::default_fast();
+        let n = 5000;
+        let (pl, rl) = Phf::saved_sizes(n, params);
+        assert!(rl > 0);
+        let ok = |p: usize, r: usize| Phf::from_saved_parts(n, params, 7, vec![0; p], vec![0; r]);
+        assert!(ok(pl, rl).is_some());
+        assert!(ok(pl - 1, rl).is_none());
+        assert!(ok(pl + 1, rl).is_none());
+        assert!(ok(pl, rl - 1).is_none());
+        assert!(ok(0, 0).is_none());
+        // A remap value past the key count would hand callers a slot index >= n.
+        let mut remap = vec![0u32; rl];
+        remap[rl - 1] = n as u32;
+        assert!(Phf::from_saved_parts(n, params, 7, vec![0; pl], remap).is_none());
+        let (pl0, rl0) = Phf::saved_sizes(0, params);
+        assert!(Phf::from_saved_parts(0, params, 7, vec![0; pl0], vec![0; rl0]).is_none());
+    }
+
+    /// An empty PtrHash-form file (key count 0, no pilots, no remap) still opens and answers
+    /// nothing, without building a PtrHash.
+    #[test]
+    fn empty_ptrhash_file_opens_and_finds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("e.idx");
+        let params = PtrHashParams::default_fast();
+        let mut b = MAGIC.to_vec();
+        b.extend_from_slice(&[1, 0]);
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&params.alpha.to_le_bytes());
+        b.extend_from_slice(&params.lambda.to_le_bytes());
+        b.extend_from_slice(&9u64.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // no pilots
+        b.extend_from_slice(&0u64.to_le_bytes()); // no remap
+        b.resize(b.len() + (4 - b.len() % 4) % 4, 0);
+        std::fs::write(&p, &b).unwrap();
+        let idx = Index::open(&p).unwrap();
+        assert_eq!((idx.kind(), idx.len()), (IndexKind::PtrHash, 0));
+        assert_eq!(idx.get(&kdx_types::blake2b_256(b"x")), None);
     }
 
     /// Corrupt PtrHash files fail `open` with an error (review M5): pilot/remap counts that

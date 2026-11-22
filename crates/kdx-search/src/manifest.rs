@@ -79,14 +79,18 @@ impl SearchManifest {
     }
 }
 
-/// Record in `dir/manifest.json` that content from `height` on changed under the index
-/// (M-7); keeps the lowest such height. `Ok(false)` when no index is built.
-pub fn mark_stale(dir: &Path, height: u32) -> Result<bool> {
-    let Some(mut m) = SearchManifest::load(dir)? else {
+/// Record in `<data_dir>/search/manifest.json` that content from `height` on changed under
+/// the index (M-7); keeps the lowest such height. `Ok(false)` when no index is built. Holds
+/// the swap lock (F-34), so a `search rebuild` swap cannot rename another manifest over the
+/// mark half-way.
+pub fn mark_stale(data_dir: &Path, height: u32) -> Result<bool> {
+    let _g = crate::build::swap_lock(data_dir)?;
+    let dir = crate::search_dir(data_dir);
+    let Some(mut m) = SearchManifest::load(&dir)? else {
         return Ok(false);
     };
     m.stale_from_height = Some(m.stale_from_height.map_or(height, |h| h.min(height)));
-    m.commit(dir)?;
+    m.commit(&dir)?;
     Ok(true)
 }
 

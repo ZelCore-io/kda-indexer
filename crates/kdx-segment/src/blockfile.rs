@@ -216,6 +216,10 @@ fn page_size() -> usize {
     })
 }
 
+/// Largest `max_raw_row` a block file may declare (far above any real row: a row is at most
+/// `block_records` records).
+pub const MAX_RAW_ROW: u64 = 256 << 20;
+
 /// Read side: mmapped data + offsets, prepared decoder dictionary.
 pub struct BlockFile {
     data: DataReader,
@@ -234,6 +238,27 @@ impl BlockFile {
         let ddict = (!header.dict.is_empty()).then(|| DecoderDictionary::copy(&header.dict));
         if header.block_records == 0 {
             bail!("{}: block_records 0", path.display());
+        }
+        // F-32: checked once here so `row()` and `record_spans` need no checks of their own.
+        // Every `row()` reserves `max_raw_row` bytes; a damaged header must not ask for more
+        // than any real row holds.
+        if header.max_raw_row > MAX_RAW_ROW {
+            bail!(
+                "{}: max_raw_row {} over the {MAX_RAW_ROW}-byte cap",
+                path.display(),
+                header.max_raw_row
+            );
+        }
+        // Every record must sit in a stored row (`record_spans` maps record i to row
+        // i / block_records).
+        let room = (rows as u64).checked_mul(u64::from(header.block_records));
+        if room.is_none_or(|room| header.records > room) {
+            bail!(
+                "{}: {} records do not fit {rows} rows of {}",
+                path.display(),
+                header.records,
+                header.block_records
+            );
         }
         Ok(BlockFile {
             data,

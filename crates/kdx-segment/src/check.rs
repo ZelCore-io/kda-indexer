@@ -105,6 +105,23 @@ pub fn check_with(dir: &Path, deep: bool, dict: Option<&dyn Dict>) -> Result<Che
             }
         };
         rep.files_ok += 1;
+        // F-31: `range.toml` must describe this manifest entry and list every required file
+        // (the shallow check hashes only what it lists).
+        if info.entry() != *e || info.network != m.network {
+            rep.errors.push(format!(
+                "{}..{}: range.toml disagrees with the manifest",
+                e.start, e.end
+            ));
+        }
+        let range_toml = file_name(&m.network, FileKind::Range, e.start, e.end);
+        for n in range_file_names(&m.network, e.start, e.end) {
+            if n != range_toml && !info.files.contains_key(&n) {
+                rep.errors.push(format!(
+                    "{}..{}: range.toml does not list {n}",
+                    e.start, e.end
+                ));
+            }
+        }
         // The optional files it lists belong to the range too.
         known.extend(info.files.keys().cloned());
         for (name, st) in &info.files {

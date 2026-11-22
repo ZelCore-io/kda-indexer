@@ -8,10 +8,10 @@
 //! tx of the range, except that two bodies sharing an 8-byte prefix and first seen in the same
 //! range yield one doc (about n²/2⁶⁵ for n bodies). The hot store goes last, every exec tx
 //! checked (per-pass `HashSet` of full hashes). Read-only on hot and segments, with a fresh
-//! hot read txn per chunk; it writes only `search.new/` (and `search.dryrun/` for the trial).
+//! hot read txn per chunk; it writes only `search.new/` (and a private `search.dryrun-*` temp dir for the trial).
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -224,7 +224,7 @@ fn open_segments(data_dir: &Path) -> Result<Segments> {
 }
 
 /// The S-1 projection: census, 1% body sample per range, trial index of the first
-/// `trial_docs` bodies (in `search.dryrun/`, removed afterwards).
+/// `trial_docs` bodies (in a private `search.dryrun-*` temp dir, removed afterwards).
 pub fn estimate(data_dir: &Path, seg: &Segments, c: &Census, o: &BuildOpts) -> Result<Estimate> {
     let t0 = Instant::now();
     // 1% sample of distinct bodies per range.
@@ -240,11 +240,13 @@ pub fn estimate(data_dir: &Path, seg: &Segments, c: &Census, o: &BuildOpts) -> R
             Ok(true)
         })?;
     }
-    // Trial index.
-    let dir = data_dir.join("search.dryrun");
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-    }
+    // Trial index, in a private temp dir (F-34): two dry runs at once never remove each
+    // other's trial; it is removed when `tmp` drops.
+    let tmp = tempfile::Builder::new()
+        .prefix("search.dryrun-")
+        .tempdir_in(data_dir)
+        .with_context(|| format!("trial dir in {}", data_dir.display()))?;
+    let dir = tmp.path().to_path_buf();
     let trial = (|| -> Result<(u64, u64, u64)> {
         let (index, f) = create(&dir)?;
         let w = writer(&index, o.threads, o.heap_mb)?;
@@ -341,12 +343,7 @@ pub fn estimate(data_dir: &Path, seg: &Segments, c: &Census, o: &BuildOpts) -> R
 /// whole rebuild.
 pub fn lock(data_dir: &Path) -> Result<File> {
     let p = data_dir.join("search.lock");
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&p)
-        .with_context(|| format!("open {}", p.display()))?;
+    let f = open_lock_file(&p)?;
     match f.try_lock() {
         Ok(()) => Ok(f),
         Err(TryLockError::WouldBlock) => {
@@ -826,6 +823,69 @@ mod tests {
             .len()
     }
 
+    /// F-34: a symlink planted at `search.lock` is refused too.
+    #[test]
+    fn rebuild_lock_never_follows_a_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("outside");
+        std::os::unix::fs::symlink(&target, d.path().join("search.lock")).unwrap();
+        assert!(super::lock(d.path()).is_err());
+        assert!(!target.exists());
+    }
+
+    /// F-34: `mark_stale` waits for the swap lock, so a swap in progress cannot drop the mark
+    /// (it would rename another manifest over the one just marked).
+    #[test]
+    fn mark_stale_waits_for_the_swap_lock() {
+        let d = tempfile::tempdir().unwrap();
+        let data = d.path().to_path_buf();
+        build_index(&search_dir(&data), &["(a.one)"], 1);
+        let g = swap_lock(&data).unwrap();
+        let data2 = data.clone();
+        let t = std::thread::spawn(move || crate::manifest::mark_stale(&data2, 7).unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        let m = SearchManifest::load(&search_dir(&data)).unwrap().unwrap();
+        assert_eq!(
+            m.stale_from_height, None,
+            "marked while the swap lock was held"
+        );
+        drop(g);
+        assert!(t.join().unwrap());
+        let m = SearchManifest::load(&search_dir(&data)).unwrap().unwrap();
+        assert_eq!(m.stale_from_height, Some(7));
+    }
+
+    /// F-34: the dry run's trial index is a private temp dir: a second dry run (or anything
+    /// else) at `search.dryrun/` is left alone, and the trial leaves nothing behind.
+    #[test]
+    fn dry_run_trial_dir_is_private() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = hot_store(d.path());
+        apply(&hot, &[exec_block(0, 10, &["(a.one)", "(a.two)"])]);
+        let other = d.path().join("search.dryrun");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("keep"), b"x").unwrap();
+        let o = BuildOpts {
+            data_dir: d.path().to_path_buf(),
+            mode: ModeSel::Full,
+            threads: 1,
+            heap_mb: 32,
+            trial_docs: 10,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        super::dry_run(&o, &hot).unwrap();
+        assert!(
+            other.join("keep").exists(),
+            "the dry run removed search.dryrun/"
+        );
+        let left: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains("dryrun") && n != "search.dryrun")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
     /// A symlink planted at `search.swap.lock` is refused: its target is never created.
     #[test]
     fn swap_lock_never_follows_a_symlink() {
@@ -886,9 +946,11 @@ mod tests {
     #[test]
     fn a_manifest_marked_stale_by_rebuild_range_is_due() {
         // M-7: `rebuild-range` swapped changed content under the index.
-        let t = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let t = search_dir(d.path());
+        std::fs::create_dir_all(&t).unwrap();
         assert!(
-            !crate::manifest::mark_stale(t.path(), 5).unwrap(),
+            !crate::manifest::mark_stale(d.path(), 5).unwrap(),
             "no index"
         );
         let m = SearchManifest {
@@ -903,11 +965,11 @@ mod tests {
             bytes: 1,
             built_at: 1_000,
         };
-        m.commit(t.path()).unwrap();
+        m.commit(&t).unwrap();
         assert!(!rebuild_due(&m, 1_001, Some(100), 0, 0));
-        assert!(crate::manifest::mark_stale(t.path(), 40).unwrap());
-        assert!(crate::manifest::mark_stale(t.path(), 60).unwrap());
-        let s = SearchManifest::load(t.path()).unwrap().unwrap();
+        assert!(crate::manifest::mark_stale(d.path(), 40).unwrap());
+        assert!(crate::manifest::mark_stale(d.path(), 60).unwrap());
+        let s = SearchManifest::load(&t).unwrap().unwrap();
         assert_eq!(s.stale_from_height, Some(40));
         assert!(rebuild_due(&s, 1_001, Some(100), 0, 0));
     }

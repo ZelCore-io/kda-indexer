@@ -18,6 +18,4 @@ kdx-types.workspace = true
 kdx-decode.workspace = true
 kdx-hot.workspace = true
 kdx-segment.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

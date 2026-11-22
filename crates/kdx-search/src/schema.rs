@@ -209,11 +209,24 @@ impl SearchWriter {
     }
 
     /// The buffered docs into the index, commit, then merge small segments and wait.
+    /// On an error the buffered docs and the pending set stay (F-35) and the writer is
+    /// rolled back, so a retry on the same writer adds them again.
     pub fn commit(&mut self) -> Result<()> {
-        for d in self.docs.drain(..) {
-            self.writer.add_document(to_doc(&self.fields, &d))?;
+        let added = (|| -> Result<()> {
+            for d in &self.docs {
+                self.writer.add_document(to_doc(&self.fields, d))?;
+            }
+            self.writer.commit()?;
+            Ok(())
+        })();
+        if let Err(e) = added {
+            let _ = self.writer.rollback();
+            return Err(e);
         }
-        self.writer.commit()?;
+        // Committed: the docs are in the index. `pending` stays until the reader sees them,
+        // so `contains` never misses one in between.
+        self.docs.clear();
+        self.bytes = 0;
         let mut p = LogMergePolicy::default();
         p.set_max_docs_before_merge(MERGE_MAX_DOCS);
         for c in p.compute_merge_candidates(&self.index.searchable_segment_metas()?) {
@@ -221,11 +234,38 @@ impl SearchWriter {
         }
         self.reader.reload()?;
         self.pending.clear();
-        self.bytes = 0;
         Ok(())
     }
 
     pub fn num_docs(&self) -> u64 {
         self.reader.searcher().num_docs()
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+
+    /// F-35: a commit that fails keeps the buffered docs (and the pending set), so a caller
+    /// that retries on the same writer loses nothing.
+    #[test]
+    fn a_failed_commit_keeps_the_buffered_docs() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("idx");
+        let (index, _) = create(&dir).unwrap();
+        drop(index);
+        let mut w = SearchWriter::open(&dir, 16).unwrap();
+        let doc = Doc {
+            hash: kdx_types::blake2b_128(b"(a.one)"),
+            code: "(a.one)".into(),
+            first_h: 1,
+            last_h: 1,
+        };
+        assert!(w.add(&doc).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(w.commit().is_err());
+        assert_eq!(w.pending(), 1);
+        assert_eq!(w.docs.len(), 1);
+        assert!(w.pending_bytes() > 0);
     }
 }
