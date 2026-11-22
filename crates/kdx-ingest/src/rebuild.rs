@@ -307,8 +307,8 @@ pub async fn run(
             }
         }
         txn.commit()?;
-        let sdir = kdx_search::search_dir(ctx.segdir.parent().unwrap_or(&ctx.segdir));
-        rep.search_marked_stale = kdx_search::manifest::mark_stale(&sdir, start)?;
+        let data_dir = ctx.segdir.parent().unwrap_or(&ctx.segdir);
+        rep.search_marked_stale = kdx_search::manifest::mark_stale(data_dir, start)?;
         tracing::warn!(
             start,
             dirty_marks = rep.dirty_marks,
