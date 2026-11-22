@@ -463,6 +463,13 @@ the size and blake3 of every file each `range.toml` lists, so a copy that lost a
 transit, or paired the old and new files of a range that was swapped while it was taken, is
 refused before it answers anything. Start the service only when it passes.
 
+Snapshots taken before the audit fix F-02 (PR-5) lack the optional files of every range that
+has them (`*.sndr.pst`, the sender postings, and `*.kf.fil`, the block-hash and request-key
+filters): the snapshot placed them and then deleted them again. `segments check` on such a copy
+fails on those files. Take a new snapshot with a fixed binary, or keep the copy and rebuild the
+files there with `segments add-index` (see above), then run `segments check` again. A host
+already restored from such a snapshot serves sender lists by the slow fallback until then.
+
 To seed another host, take a hard-linked snapshot on the source volume (no `--copy`: on the
 same volume `--copy` writes a second full copy of every segment file there; keep it for
 another local filesystem), then
