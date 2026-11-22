@@ -85,6 +85,40 @@ fn crosschain_receiver_seen_only_as_event_param_is_posted() {
     assert_eq!(acct_names(&b, &mut warm), names);
 }
 
+/// F-01: non-principal names on both cross-chain legs are posted and interned; the empty
+/// side of the receive leg is not.
+#[test]
+fn crosschain_non_principal_sides_are_posted() {
+    for (name, params, want) in [
+        (
+            "TRANSFER_XCHAIN",
+            json!(["alice", "bob", 1.5, "2"]),
+            vec!["alice", "bob"],
+        ),
+        (
+            "TRANSFER_XCHAIN_RECD",
+            json!(["", "bob", 1.5, "1"]),
+            vec!["bob"],
+        ),
+    ] {
+        let b = block(json!([event("coin", name, params)]));
+        let mut dict = MemDict::new();
+        let names = acct_names(&b, &mut dict);
+        for w in &want {
+            assert!(
+                names.contains(&(*w).to_owned()),
+                "{name}: {w} not posted: {names:?}"
+            );
+            assert!(
+                dict.names(DictKind::Account).iter().any(|n| n == w),
+                "{w} not interned"
+            );
+        }
+        assert!(!dict.names(DictKind::Account).iter().any(String::is_empty));
+        assert!(!names.contains(&String::new()));
+    }
+}
+
 #[test]
 fn principals_at_any_depth_and_poly_fungible_sides_are_posted() {
     let w = format!("w:{}:keys-all", "A".repeat(43));
