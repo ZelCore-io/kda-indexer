@@ -174,8 +174,12 @@ async fn lookup(ctx: &Context<'_>, key: NodeKey) -> Result<Option<Node>> {
             module_hash,
             request_key,
         } => row_tx(ctx, block_hash, request_key).await?.and_then(|d| {
-            (0..d.trs.len())
-                .map(|i| Transfer::new(d.clone(), i, None))
+            // Fungible transfers, then the NFT transfers `transfers(isNFT: true)` lists under
+            // the same id form (audit F-51).
+            let fungible = (0..d.trs.len()).map(|i| Transfer::new(d.clone(), i, None));
+            let nfts = (0..d.nfts.len()).map(|i| Transfer::nft(d.clone(), i));
+            fungible
+                .chain(nfts)
                 .find(|x| {
                     x.ord_idx() == order_index
                         && i64::from(x.d.key().chain()) == chain

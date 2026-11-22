@@ -384,6 +384,7 @@ impl FungibleAccount {
         spec.rows = Rows::Txs {
             sender: None,
             nft: false,
+            module: None,
         };
         spec.filter.user_only = true;
         let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
@@ -467,6 +468,7 @@ impl FungibleChainAccount {
             rows: Rows::Txs {
                 sender: Some(self.account.clone()),
                 nft: false,
+                module: None,
             },
         };
         let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
@@ -678,24 +680,40 @@ pub async fn query_balance(
         .as_deref()
         .map(|m| crate::txlist::name_arg("module", m).map(str::to_owned))
         .transpose()?;
+    // At most 100 chain ids, each once; `[]` is every chain, as on the other chain lists
+    // (audit F-28).
     let chains: Option<Vec<u8>> = chain_ids
         .as_deref()
-        .map(|cs| cs.iter().map(|c| crate::txlist::chain_arg(c)).collect())
+        .map(|cs| super::block::chain_set(Some(cs)))
         .transpose()?;
     let g = gql(ctx);
-    // Count and the cursor rules of every connection; the cursor is our own.
+    // The count and cursor rules of every connection (`PageArgs::parse`, with the real
+    // `after`/`before` flags; audit F-28); the cursor is our own.
+    if first.is_some_and(|n| n < 0) || last.is_some_and(|n| n < 0) {
+        return Err(bad_input("first and last must not be negative"));
+    }
+    if first.is_some_and(|n| n != 0) && last.is_some_and(|n| n != 0) {
+        return Err(bad_input("pass first or last, not both"));
+    }
     if after.is_some() && before.is_some() {
         return Err(bad_input("pass after or before, not both"));
     }
-    if (first.is_some() && before.is_some()) || (last.is_some() && after.is_some()) {
-        return Err(bad_input("after goes with first, before with last"));
+    let (dir, n) = crate::connection::served_page(
+        first.map(i64::from),
+        last.map(i64::from),
+        after.is_some(),
+        before.is_some(),
+        g.settings.default_page as u64,
+    );
+    let n = n as usize;
+    if n > crate::MAX_PAGE_ROWS {
+        return Err(crate::error::page_limit());
     }
-    let probe = PageArgs::new(None, None, first, last).parse(&g.settings)?;
-    let dir = if last.is_some() || (first.is_none() && before.is_some()) {
-        Dir::Backward
-    } else {
-        Dir::Forward
-    };
+    match (dir, &after, &before) {
+        (Dir::Forward, None, Some(_)) => return Err(bad_input("before goes with last")),
+        (Dir::Backward, Some(_), None) => return Err(bad_input("after goes with first")),
+        _ => {}
+    }
     let cur = after
         .as_deref()
         .or(before.as_deref())
@@ -722,6 +740,7 @@ pub async fn query_balance(
             }
             let mut out = Vec::new();
             for (k, v) in found {
+                view.check_deadline()?;
                 let (Some((_, m, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                     continue;
                 };
@@ -746,18 +765,18 @@ pub async fn query_balance(
         (Dir::Forward, _) => rows
             .into_iter()
             .filter(|r| cur.as_ref().is_none_or(|c| key(r) > *c))
-            .take(probe.n + 1)
+            .take(n + 1)
             .collect(),
         (Dir::Backward, _) => rows
             .into_iter()
             .rev()
             .filter(|r| cur.as_ref().is_none_or(|c| key(r) < *c))
-            .take(probe.n + 1)
+            .take(n + 1)
             .collect(),
     };
     let page: Page<PageCursor> = Page {
         dir,
-        n: probe.n,
+        n,
         // Only its presence is read (hasPreviousPage / hasNextPage).
         cursor: cur.as_ref().map(|_| {
             PageCursor::Block(crate::connection::BlockCursor {

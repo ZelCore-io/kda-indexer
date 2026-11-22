@@ -252,8 +252,9 @@ pub enum SourceSpec {
     /// `acct` postings of the account when the dictionary has it, else the `evt` postings
     /// of the event name (an `events.parametersFilter` whose first value is a string).
     AcctOrEvt { account: String, qual: String },
-    /// Every stored copy of a request key.
-    Rk(Hash32),
+    /// Every stored copy of a request key; with `block`, only the copy in that block (stock
+    /// ANDs `requestKey` and `blockHash`; audit F-30).
+    Rk { rk: Hash32, block: Option<Hash32> },
     /// The txs of one block.
     Block(Hash32),
     /// Every user tx, heights walked down from the tip (GQ-20 exception).
@@ -318,8 +319,13 @@ impl ParamFilter {
 #[derive(Debug, Clone)]
 pub enum Rows {
     /// The tx itself; `sender` keeps only txs whose `meta.sender` is it; `nft` keeps only txs
-    /// with an event of an NFT ledger.
-    Txs { sender: Option<String>, nft: bool },
+    /// with an event of an NFT ledger; `module` keeps only txs with an event of that module
+    /// (stock's `fungibleName` rule beside `requestKey` or `blockHash`; audit F-30).
+    Txs {
+        sender: Option<String>,
+        nft: bool,
+        module: Option<String>,
+    },
     /// Its events (named `qual` when given: `Block.events` lists them all; of `module` when
     /// given, the ZelCore `events(moduleName)` extension), with the optional `orderIndex` and
     /// parameter filters.
@@ -363,14 +369,19 @@ impl Rows {
             self,
             Rows::Txs {
                 sender: None,
-                nft: false
+                nft: false,
+                module: None,
             }
         )
     }
 
     pub fn rows(&self, d: &Arc<TxData>) -> Vec<(u16, Item)> {
         match self {
-            Rows::Txs { sender, nft } => {
+            Rows::Txs {
+                sender,
+                nft,
+                module,
+            } => {
                 if d.is_coinbase() {
                     return vec![];
                 }
@@ -378,6 +389,12 @@ impl Rows {
                     return vec![];
                 }
                 if *nft && !d.evs.iter().any(|e| kdx_hot::nft::is_ledger(&e.module)) {
+                    return vec![];
+                }
+                if module
+                    .as_deref()
+                    .is_some_and(|m| !d.evs.iter().any(|e| e.module == m))
+                {
                     return vec![];
                 }
                 vec![(0, Item::Tx(d.clone()))]
@@ -446,7 +463,8 @@ enum Src {
     Post(Family, u64),
     /// Keys in both posting lists (a merge-intersection of two newest-first walks).
     And((Family, u64), (Family, u64)),
-    Rk(Hash32),
+    /// The copies of a request key, only the one at `(chain, height)` when given.
+    Rk(Hash32, Option<(u8, u32)>),
     Block(u8, u32),
     Heights,
     Empty,
@@ -463,9 +481,14 @@ fn plan(view: &View, spec: &ListSpec) -> ApiResult<(Src, Rows)> {
     );
     if sender && view.sender_ready()? {
         let rows = match &spec.rows {
-            Rows::Txs { sender: _, nft } => Rows::Txs {
+            Rows::Txs {
+                sender: _,
+                nft,
+                module,
+            } => Rows::Txs {
                 sender: None,
                 nft: *nft,
+                module: module.clone(),
             },
             r => r.clone(),
         };
@@ -527,7 +550,12 @@ fn resolve(view: &View, s: &SourceSpec) -> ApiResult<Src> {
                 None => Src::Empty,
             },
         },
-        SourceSpec::Rk(rk) => Src::Rk(*rk),
+        SourceSpec::Rk { rk, block: None } => Src::Rk(*rk, None),
+        // The store keeps the canonical chain only: a hash names one (chain, height).
+        SourceSpec::Rk { rk, block: Some(h) } => match view.block_by_hash(h)? {
+            Some((c, height, _)) => Src::Rk(*rk, Some((c, height))),
+            None => Src::Empty,
+        },
         SourceSpec::Block(h) => match view.block_by_hash(h)? {
             Some((c, height, _)) => Src::Block(c, height),
             None => Src::Empty,
@@ -659,7 +687,12 @@ fn keys<'v>(
                 .map(|r| r.map(|k| (k, None))),
             )
         }
-        Src::Rk(rk) => listed(view.txs_by_rk(rk)?),
+        Src::Rk(rk, at) => listed(
+            view.txs_by_rk(rk)?
+                .into_iter()
+                .filter(|(k, _)| at.is_none_or(|(c, h)| k.chain() == c && k.height() == h))
+                .collect(),
+        ),
         Src::Block(c, h) => listed(
             view.block_txs(*c, *h)?
                 .into_iter()
@@ -1186,9 +1219,9 @@ pub async fn list(
 /// chain and height; `chainId`, `minHeight` and `maxHeight` only filter those keys in memory),
 /// the cursor's block fingerprint, and each tx's block record and output; its `totalCount`
 /// walks the same txs. Anything that could read past the block stays a heavy read: another
-/// source (an account, a posting, a height walk, a request key, which wins over `blockHash`),
-/// a `minimumDepth` filter (it reads the chain tips), and, for transfers, a selected
-/// `crossChainTransfer` (it reads the pact's other chain).
+/// source (an account, a posting, a height walk, a request key, which a `blockHash` beside
+/// it only filters), a `minimumDepth` filter (it reads the chain tips), and, for transfers,
+/// a selected `crossChainTransfer` (it reads the pact's other chain).
 pub async fn block_list(
     ctx: &Context<'_>,
     spec: ListSpec,
@@ -1229,7 +1262,7 @@ async fn list_as(
     // The page is read only when its items or page info are selected.
     let reads = selects_direct(ctx, &["edges", "pageInfo"]);
     // A block's or a request key's rows are few: counted with the page, exactly.
-    let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk(_))
+    let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk { .. })
         && selects_direct(ctx, &["totalCount"]);
     // The time budget bounds an account's count walk only (its postings are long and decode
     // cold); every other count keeps half of the remaining deadline.
@@ -1244,8 +1277,9 @@ async fn list_as(
     let sp = spec.clone();
     let (edges, info, exact) = read_list(&state, one_block, move |view| {
         let dl = dl.min(Instant::now() + SCAN_WINDOW);
+        // The count keeps its exactness: the deadline can cut it too (audit F-50).
         let exact = if bounded {
-            Some(count(view, &sp, dl)?.0)
+            Some(count(view, &sp, dl)?)
         } else {
             None
         };
@@ -1266,12 +1300,15 @@ async fn list_as(
     })
     .await
     .map_err(from_api)?;
-    if let Some(n) = exact {
-        return Ok(ListPage {
-            edges,
-            info,
-            total: Total::Exact(n),
-        });
+    if let Some((n, exact)) = exact {
+        // A cut count is a flagged lower bound, never below the edges served (as the
+        // deferred count below).
+        let total = if exact {
+            Total::Exact(n)
+        } else {
+            Total::LowerBound(n.max(edges.len() as u64))
+        };
+        return Ok(ListPage { edges, info, total });
     }
     let served = edges.len() as u64;
     let total = Total::Deferred(Arc::new(move || {

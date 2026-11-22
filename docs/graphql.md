@@ -296,7 +296,8 @@ number open.
   A well-formed id whose lookup is ambiguous (a `Signer` of a genesis tx stored on several
   chains) keeps its `BAD_USER_INPUT` error. An integer id of any size is an id like a string
   (so `9223372036854775808` is `null`, not an error); a fraction or a boolean is refused.
-  Coinbase events and transfers resolve through their block.
+  Coinbase events and transfers resolve through their block. The id of an NFT transfer
+  (`transfers(isNFT: true)`) resolves to that transfer (audit F-51).
 
 ## Subscriptions
 
@@ -433,6 +434,15 @@ the oracle puts them.
   false` forces the old path (default `true`; used to compare the two on a host); it also
   applies to REST `role=sender`. With `requestKey` or `blockHash` the sender filter runs on
   that key's or block's txs, as before.
+- **Combined filters (audit F-30).** Every supplied filter applies, as stock ANDs them in
+  its SQL (indexer-kadena `90a4be1`: `transaction-query-builder.ts`,
+  `transfer-db-repository.ts`, `event-query-builder.ts`). `requestKey` picks the source,
+  and a `blockHash` beside it keeps only the key's copy in that block (another block's hash
+  lists nothing; a malformed one is `BAD_USER_INPUT`), on `transactions`, `transfers` and
+  `events`. On `transactions`, `fungibleName` beside `requestKey` or `blockHash` keeps the
+  txs with an event of that module (stock's `EXISTS` on `Events.module`); with any other
+  source the posting list already holds only that token's txs. `transfers(isNFT: true,
+  accountName)` checks `fungibleName` as every other path does.
 - **`transfers`** use the same sources; rows are the tx's transfers of `fungibleName` with
   `accountName` on either side when given. `crossChainTransfer` is the other half of a
   cross-chain transfer (the `cont` step of the pact, or the tx that started it), `null`
@@ -444,7 +454,13 @@ the oracle puts them.
   the outgoing link `null` here where stock links it. Griefing only, bounded, not fixed.
 - **`events`**: `qualifiedEventName` is required. `parametersFilter` accepts only
   `{"array_starts_with": <value or array>}` (the event's first parameters equal the value or
-  the array's values); anything else is `UNSUPPORTED_FILTER`.
+  the array's values); anything else is `UNSUPPORTED_FILTER`. When the first value is a
+  string, the account's `acct` postings are walked (fast) only if they hold every match: the
+  string is a Pact principal (posted wherever it appears), or the event is named `TRANSFER`
+  (a non-principal name is posted as a transfer side). Otherwise the event name's postings
+  are walked and filtered on the parameters (audit F-27, option B). Known gap: a
+  poly-fungible `TRANSFER (id, from, to, amount)` whose token `id` equals a non-principal
+  string, and does not also name it as a side, is not listed for that string.
 - **`transaction(requestKey)`**: `null` when not indexed; a request key stored in several
   genesis blocks answers `BAD_USER_INPUT` unless `blockHash` picks one copy.
 - **`totalCount`** is computed only when selected: a count walk of at most 10,000 rows
@@ -454,7 +470,9 @@ the oracle puts them.
   at about 1 ms each, so an account with more than a few hundred rows to decode answers a
   lower bound. A sender list served from the sender index counts keys only, no decode. When the time share runs out, `totalCount` answers the rows counted so far (a
   lower bound, never below the edges served), the edges are kept, and the response carries
-  `"extensions": {"totalCountLowerBound": true}` (R-P5P9-14).
+  `"extensions": {"totalCountLowerBound": true}` (R-P5P9-14). A block's or a request key's
+  list counts with its page within the scan window; when the deadline cuts that count it is
+  flagged the same way, never below the edges served (audit F-50).
 - **Text forms.** `goodResult`, `badResult`, `continuation`, `metadata`, `Event.parameters`,
   payload `data` and capability `args` are compact JSON text of the node's values (numbers
   keep their exact text). `Transfer.amount` is the decimal of the event's amount parameter.
@@ -521,7 +539,7 @@ relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `Strin
 | `Transfer.tokenId: String` | the NFT transfer's token id; `null` for a fungible transfer |
 | `events(moduleName: String)` | events of that module. `qualifiedEventName` or `moduleName` is required (`BAD_USER_INPUT` otherwise); with both, both filter. `moduleName` alone has no posting list: unless `blockHash` or `requestKey` picks the txs, heights are walked down from the tip (at most 20,000 heights, within the deadline) |
 | `NetworkInfo.countersOfEachChain: [CountersOfEachChain!]!` | per chain, ascending: `chainId`, `blocksCount` (genesis to stored tip). `transactionCount: Int` and `totalGasUsedInKda: String` answer `null` with `NOT_AVAILABLE`: the store keeps no all-time per-chain tx or gas counter |
-| `balance(accountName, module, chainIds, first/last/after/before): QueryBalanceConnection!` | an account's present fungible balances, one `BalanceNode {accountName module chainId balance}` per module and chain, listed by module name then chain, filtered by `module` and `chainIds`; at most 4,096 rows per account (`LIMIT` above). Without `accountName` (a module's holders): `NOT_SUPPORTED`, as the store keeps no holders index |
+| `balance(accountName, module, chainIds, first/last/after/before): QueryBalanceConnection!` | an account's present fungible balances, one `BalanceNode {accountName module chainId balance}` per module and chain, listed by module name then chain, filtered by `module` and `chainIds` (at most 100, each once; `[]` means every chain); pages as every other connection (`first: 0` with `after` serves no row); at most 4,096 rows per account (`LIMIT` above). Without `accountName` (a module's holders): `NOT_SUPPORTED`, as the store keeps no holders index |
 | `transactionsByPactCode(pactCode, first/after): QueryTransactionsByPactCodeConnection!` | txs whose own exec code contains `pactCode` (`%`/`_` wildcards), newest first, through the `/txs/search` engine: its pattern checks, per-client search gate, code index or bounded newest-first scan, caps and time budget. Rows are `TransactionSummary {requestKey height chainId canonical creationTime badResult sender gas gasLimit gasPrice code}`. Forward paging only (`last`/`before`: `BAD_USER_INPUT`). The search gate counts per client
 address (HTTP, or the websocket's accepted connection); an operation without a known address
 is refused (`LIMIT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |

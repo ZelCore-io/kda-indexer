@@ -226,6 +226,8 @@ pub enum Total {
     #[default]
     Unsupported,
     Exact(u64),
+    /// Counted with the page but cut by the deadline: a lower bound, flagged (audit F-50).
+    LowerBound(u64),
     Deferred(Arc<CountFn>),
 }
 
@@ -234,6 +236,10 @@ impl Total {
         let n = match self {
             Total::Unsupported => return Err(not_supported("totalCount")),
             Total::Exact(n) => *n,
+            Total::LowerBound(n) => {
+                crate::flags::mark(ctx, crate::flags::Flag::CountLowerBound);
+                *n
+            }
             Total::Deferred(f) => {
                 let (n, exact) = f().await?;
                 if !exact {
