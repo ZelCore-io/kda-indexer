@@ -34,7 +34,7 @@ const ALL_CHUNK: usize = 100_000;
 pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()> {
     let hot_dir = super::hot::hot_dir(data_dir);
     match mode {
-        Mode::Status => status(&HotStore::open_ro(&hot_dir)?),
+        Mode::Status => status(cfg, &HotStore::open_ro(&hot_dir)?),
         Mode::Seed => {
             let _lock = super::lock_data_dir(data_dir)?;
             let hs = HotStore::open(&hot_dir, super::hot::geometry(cfg))?;
@@ -151,7 +151,68 @@ fn receivers(
     Ok(())
 }
 
-fn status(hs: &HotStore) -> anyhow::Result<()> {
+/// F-14 status: the non-coin module with the most `Balances` rows (`coin` has no cap) and the modules flagged at
+/// their row cap (`Tokens` rows, read in chunks of short txns).
+#[derive(Default)]
+struct ModuleCaps {
+    largest: Value,
+    capped: Vec<String>,
+}
+
+fn module_caps(hs: &HotStore) -> anyhow::Result<ModuleCaps> {
+    let name = |m: u32| -> anyhow::Result<String> {
+        Ok(hs
+            .ro()?
+            .get(
+                Table::DictRev(kdx_types::DictKind::Module),
+                &m.to_be_bytes(),
+            )?
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_else(|| format!("#{m}")))
+    };
+    let mut rows: Vec<(u32, u32)> = Vec::new();
+    let mut capped = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let chunk = hs
+            .ro()?
+            .scan_chunk(Table::Tokens, after.as_deref(), ALL_CHUNK, |_| true)?;
+        for (k, v) in &chunk {
+            let (Some(m), Some(t)) = (
+                k.as_slice().try_into().ok().map(u32::from_be_bytes),
+                kdx_hot::balances::TokenRow::decode(v),
+            ) else {
+                continue;
+            };
+            if t.capped() {
+                capped.push(m);
+            }
+            rows.push((t.rows, m));
+        }
+        match chunk.last() {
+            Some((k, _)) if chunk.len() == ALL_CHUNK => after = Some(k.clone()),
+            _ => break,
+        }
+    }
+    rows.sort_unstable_by(|a, b| b.cmp(a));
+    let mut largest = Value::Null;
+    for (n, m) in rows {
+        let module = name(m)?;
+        if module != "coin" {
+            largest = json!({ "module": module, "rows": n });
+            break;
+        }
+    }
+    Ok(ModuleCaps {
+        largest,
+        capped: capped
+            .into_iter()
+            .map(name)
+            .collect::<anyhow::Result<_>>()?,
+    })
+}
+
+fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
     // F-46: no read txn spans the Balances scan (it pins MDBX pages while `run` writes).
     // The first short txn reads the progress counters, the scan pages in its own short txns,
     // and a second short txn reads the rest.
@@ -181,6 +242,7 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
             _ => break,
         }
     }
+    let caps = module_caps(hs)?;
     let txn = hs.ro()?;
     let seeded = txn
         .meta(meta::BALANCES_SEEDED)?
@@ -230,6 +292,14 @@ fn status(hs: &HotStore) -> anyhow::Result<()> {
             .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
         "seed_token_receivers_errors": txn
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_ERRORS)?
+            .and_then(|v| v.try_into().ok().map(u64::from_be_bytes)),
+        // F-14: row caps per module and over-size guards (stored as null).
+        "fungible_module_rows_cap": cfg.balances.fungible_module_rows,
+        "untrusted_module_rows_cap": cfg.balances.module_rows,
+        "largest_module_rows": caps.largest,
+        "capped_modules": caps.capped,
+        "guards_capped": txn
+            .meta(meta::GUARDS_CAPPED)?
             .and_then(|v| v.try_into().ok().map(u64::from_be_bytes)),
         "rate_per_s": rate,
         "eta_secs": (rate > 0.0).then(|| (dirty as f64 / rate).round() as u64),

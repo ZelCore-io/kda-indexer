@@ -586,8 +586,17 @@ with `[balances] enabled = false`.
   (`result="not_fungible"`) and `/tokens` hides it until the re-check `recheck_hours` later.
 - **Caps**: an untrusted module gets at most `[balances] module_rows` rows (default 1,000,000;
   then the tail marks no new key of it) and an account at most `account_rows` untrusted rows
-  (default 1,000); `coin` and confirmed `fungible-v2` rows are always kept
-  (`result="capped"`).
+  (default 1,000); `coin` rows are always kept (`result="capped"`). A confirmed `fungible-v2`
+  module other than `coin` is not counted against an account's cap but has its own row cap,
+  `fungible_module_rows` (default 1,262,460: 10x the largest mainnet token, `free.finux` with
+  126,246 rows in Nov 2026), since anyone can deploy one. `--status` shows both caps,
+  `largest_module_rows` and `capped_modules`; a module at its cap is logged at WARN. As with
+  `module_rows`, the capped flag is sticky: raising the cap later does not resume the module
+  (no command clears the flag yet).
+- **Guard limits**: a `details` guard or `describe-keyset` answer over 4096 bytes of JSON is
+  stored as null (the balance row is still written) and counted in `--status`
+  `guards_capped`. A keyset of more than 64 keys, or with a key over 256 bytes, gives no
+  `KeyAccounts` rows (WebAuthn keys reach 191 bytes on mainnet).
 - **Marks off**: with `[balances] enabled = false` the tail writes no marks. Each chain keeps a
   watermark of the last block applied with marks; when the tail applies a block past it
   (balances were off, or an older binary ran on the store) the reconciler re-runs the seed, so

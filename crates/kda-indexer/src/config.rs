@@ -608,6 +608,10 @@ pub struct BalancesConfig {
     pub module_share: u32,
     /// Most `Balances` rows of one non-coin module (I-7).
     pub module_rows: u32,
+    /// Most `Balances` rows of one confirmed `fungible-v2` module other than `coin` (F-14:
+    /// anyone can deploy one). `reconcile-balances --status` shows it, the largest module's
+    /// row count and the capped modules.
+    pub fungible_module_rows: u32,
     /// Most `Balances` rows of one account (I-7; `coin` rows are always kept).
     pub account_rows: u32,
     /// Hours after which a module's fungible check and a not-fungible verdict are re-done.
@@ -626,6 +630,7 @@ impl Default for BalancesConfig {
             local_concurrency: 8,
             module_share: 32,
             module_rows: 1_000_000,
+            fungible_module_rows: kdx_ingest::reconcile::DEFAULT_FUNGIBLE_MODULE_ROWS,
             account_rows: 1_000,
             recheck_hours: 24,
             key_modules: vec!["coin".to_owned()],
@@ -652,9 +657,11 @@ impl BalancesConfig {
         anyhow::ensure!(
             self.module_share >= 1
                 && self.module_rows >= 1
+                && self.fungible_module_rows >= 1
                 && self.account_rows >= 1
                 && self.recheck_hours >= 1,
-            "balances.module_share, module_rows, account_rows and recheck_hours must be >= 1"
+            "balances.module_share, module_rows, fungible_module_rows, account_rows and \
+             recheck_hours must be >= 1"
         );
         for m in &self.key_modules {
             anyhow::ensure!(

@@ -37,6 +37,8 @@ use crate::tables::Table;
 
 /// `Meta` keys of the balance seed (B-2).
 pub mod meta {
+    /// u64: `details` answers whose guard was over the size cap and stored as null (F-14).
+    pub const GUARDS_CAPPED: &str = "balances_guards_capped";
     /// u32: the max tail height when the seed finished.
     pub const BALANCES_SEEDED: &str = "balances_seeded";
     /// Resume cursor of a running seed (see `kdx_ingest::seed`).
@@ -782,9 +784,25 @@ pub enum GuardKeys {
     Other,
 }
 
+/// Most keys of an inline keyset that `KeyAccounts` indexes (F-14); a larger one is `Other`.
+pub const MAX_KEYSET_KEYS: usize = 64;
+/// Longest key, in bytes, of an indexed keyset (F-14); a keyset with a longer one is `Other`.
+/// Not 128: mainnet holds 9,372 guards with `WEBAUTHN-` keys of 160 to 191 bytes (KDA-03 hot
+/// store scan, 2026-11-22), and those must stay in the key index.
+pub const MAX_KEY_LEN: usize = 256;
+
 /// Classify a guard as the node returns it (Pact 4 and Pact 5 JSON forms).
 pub fn guard_keys(g: &Value) -> GuardKeys {
     if let (Some(Value::Array(keys)), true) = (g.get("keys"), g.get("pred").is_some()) {
+        // F-14: a keyset too large to be a real one gives no rows (it would write one
+        // `KeyAccounts` row per key).
+        if keys.len() > MAX_KEYSET_KEYS
+            || keys
+                .iter()
+                .any(|k| k.as_str().is_some_and(|k| k.len() > MAX_KEY_LEN))
+        {
+            return GuardKeys::Other;
+        }
         return GuardKeys::Keys(
             keys.iter()
                 .filter_map(Value::as_str)
@@ -853,6 +871,30 @@ pub fn is_dirty(txn: &impl Txn, account: u32, module: u32, chain: u8) -> Result<
 mod tests {
     use super::*;
     use crate::{Geometry, HotStore};
+
+    /// F-14: a keyset of more than [`MAX_KEYSET_KEYS`] keys, or with a key longer than
+    /// [`MAX_KEY_LEN`] bytes, indexes nothing.
+    #[test]
+    fn oversize_keysets_index_nothing() {
+        let ks = |keys: Vec<String>| serde_json::json!({"keys": keys, "pred": "keys-all"});
+        let n = |n: usize| (0..n).map(|i| format!("{i:064x}")).collect::<Vec<_>>();
+        assert!(matches!(guard_keys(&ks(n(MAX_KEYSET_KEYS))), GuardKeys::Keys(k) if k.len() == 64));
+        assert_eq!(guard_keys(&ks(n(MAX_KEYSET_KEYS + 1))), GuardKeys::Other);
+        assert!(matches!(
+            guard_keys(&ks(vec!["a".repeat(MAX_KEY_LEN)])),
+            GuardKeys::Keys(_)
+        ));
+        assert_eq!(
+            guard_keys(&ks(vec!["a".repeat(MAX_KEY_LEN + 1)])),
+            GuardKeys::Other
+        );
+        // A WebAuthn key as long as the longest one on mainnet (191 bytes) stays indexed.
+        let webauthn = format!("WEBAUTHN-{}", "a5".repeat(91));
+        assert!(matches!(
+            guard_keys(&ks(vec![webauthn])),
+            GuardKeys::Keys(_)
+        ));
+    }
 
     #[test]
     fn row_codec_and_marks() {

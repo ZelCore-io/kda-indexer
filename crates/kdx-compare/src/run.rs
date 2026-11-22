@@ -3863,6 +3863,7 @@ mod tests {
             value: Details {
                 balance: bal.into(),
                 guard: guard.clone(),
+                guard_capped: false,
             },
             height,
             prev_hash: None,
@@ -4056,6 +4057,7 @@ mod tests {
             value: Details {
                 balance: bal.into(),
                 guard: guard.clone(),
+                guard_capped: false,
             },
             height,
             prev_hash: None,

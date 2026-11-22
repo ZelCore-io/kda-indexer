@@ -262,6 +262,7 @@ fn balances_opts(
         caps: kdx_ingest::reconcile::Caps {
             module_share: b.module_share as usize,
             module_rows: b.module_rows,
+            fungible_module_rows: b.fungible_module_rows,
             account_rows: b.account_rows,
             recheck_secs: b.recheck_hours.saturating_mul(3600),
             history_slice_txs: kdx_ingest::seed_receivers::HISTORY_SLICE_TXS,
