@@ -86,8 +86,9 @@ impl Cursor {
         match fingerprint(view, self.key)? {
             Some(fp) if fp == self.fp => Ok(()),
             // A height-done token minted where no chain had a block (see `height_done`).
-            // Row cursors always point into a stored block, so they never mint fp 0.
-            None if self.fp == 0 => Ok(()),
+            // Row cursors always point into a stored block, so they never mint fp 0: a row
+            // cursor with fp 0 at an absent block is forged (F-19).
+            None if self.fp == 0 && self.sub == crate::compat::SUB_HEIGHT_DONE => Ok(()),
             _ => Err(ApiError::BadRequest(REORGED.into())),
         }
     }
@@ -157,5 +158,13 @@ mod tests {
             fp: 5,
         };
         assert!(gone.check(&view).is_err());
+        // F-19: fp 0 at an absent block is a height-done token only; a row cursor with fp 0
+        // is refused.
+        let forged = Cursor {
+            key: TxKey::new(200, 0, 0),
+            sub: 0,
+            fp: 0,
+        };
+        assert!(forged.check(&view).is_err());
     }
 }

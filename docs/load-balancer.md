@@ -112,6 +112,9 @@ backend kdx_compat
   it), so for them the timeout only catches a hung connection. With a lower timeout the
   balancer answers its own 504 for the slow `/v1/txs` cases. If you split `/v1/txs` into a
   backend of its own, that one needs the 40 s and `kdx_compat` can keep 15 s.
+- The indexer closes a connection whose response writes make no progress for 30 s (a client
+  that stopped reading), so a stalled client cannot keep a buffered response in memory longer
+  than that, with or without the balancer's own client timeout.
 - `observe layer4 … on-error mark-down` takes a server out after connection errors without
   waiting for three failed checks.
 

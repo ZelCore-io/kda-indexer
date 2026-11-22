@@ -50,6 +50,15 @@ impl From<kdx_types::Error> for ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// Clears a "worker running" flag when the worker ends, a panic included.
+pub(crate) struct ClearOnDrop<'a>(pub &'a std::sync::atomic::AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::sync::Arc;
@@ -66,5 +75,29 @@ pub(crate) mod testutil {
         let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).expect("hot store"));
         let s = Arc::new(Store::open(hot, d.path()).expect("store"));
         (d, s)
+    }
+}
+
+#[cfg(test)]
+mod clear_on_drop_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::ClearOnDrop;
+
+    /// F-49: the flag clears when the worker ends, a panic included.
+    #[test]
+    fn clears_on_panic_and_on_return() {
+        let f = AtomicBool::new(true);
+        {
+            let _g = ClearOnDrop(&f);
+        }
+        assert!(!f.load(Ordering::Acquire));
+        f.store(true, Ordering::Release);
+        let r = std::panic::catch_unwind(|| {
+            let _g = ClearOnDrop(&f);
+            panic!("worker died");
+        });
+        assert!(r.is_err());
+        assert!(!f.load(Ordering::Acquire));
     }
 }

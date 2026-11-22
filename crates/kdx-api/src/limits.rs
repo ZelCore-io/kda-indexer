@@ -40,6 +40,16 @@ impl IpNet {
             Some(p) => p.trim().parse::<u8>().ok().filter(|&p| p <= max)?,
             None => max,
         };
+        // An IPv4-mapped entry (`::ffff:a.b.c.d/p`) is its IPv4 network, as `contains`
+        // unmaps the address it tests (F-49); one wider than the mapped space is refused.
+        if let IpAddr::V6(v6) = addr {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return (prefix >= 96).then(|| IpNet {
+                    addr: IpAddr::V4(v4),
+                    prefix: prefix - 96,
+                });
+            }
+        }
         Some(IpNet { addr, prefix })
     }
 
@@ -100,16 +110,18 @@ pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted: &[IpNet]) -> Ip
     if trusted.is_empty() || !is_trusted(peer_ip) {
         return peer_ip;
     }
-    let mut lines = Vec::new();
-    for v in headers.get_all("x-forwarded-for") {
-        match v.to_str() {
-            Ok(l) => lines.push(l),
-            Err(_) => return peer_ip, // non-visible-ASCII: unparsable
-        }
-    }
+    // Raw bytes, one entry at a time from the right (F-09): bytes left of the first
+    // untrusted entry are client-controlled and never read, so junk there (obs-text
+    // included) cannot turn the answer into the peer.
+    let lines: Vec<&[u8]> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|v| v.as_bytes())
+        .collect();
     let mut leftmost = None;
-    for entry in lines.iter().rev().flat_map(|l| l.rsplit(',')) {
-        let Some(ip) = parse_forwarded(entry) else {
+    for entry in lines.iter().rev().flat_map(|l| l.rsplit(|&b| b == b',')) {
+        // Non-visible-ASCII in an entry the walk reaches: unparsable.
+        let Some(ip) = std::str::from_utf8(entry).ok().and_then(parse_forwarded) else {
             return peer_ip;
         };
         if !is_trusted(ip) {
@@ -605,6 +617,56 @@ mod tests {
         assert!(!n.contains("11.0.0.1".parse().unwrap()));
         assert!(IpNet::parse("10.0.0.0/33").is_none());
         assert!(IpNet::parse("nope").is_none());
+    }
+
+    /// F-09: bytes that are not visible ASCII left of the trusted entries are never read;
+    /// the walk still stops at the first untrusted entry from the right.
+    #[test]
+    fn obs_text_left_of_the_proxy_entry_is_not_read() {
+        use axum::http::HeaderValue;
+        let trusted = vec![IpNet::parse("127.0.0.1").unwrap()];
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let junk = |s: &[u8]| HeaderValue::from_bytes(s).unwrap();
+        // Same line.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", junk(b"\xff\xfe, 2.2.2.2, 127.0.0.1"));
+        assert_eq!(
+            client_ip(local, &h, &trusted),
+            "2.2.2.2".parse::<IpAddr>().unwrap()
+        );
+        // Junk on an earlier header line.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", junk(b"\xff1.1.1.1"));
+        h.append("x-forwarded-for", junk(b"2.2.2.2, 127.0.0.1"));
+        assert_eq!(
+            client_ip(local, &h, &trusted),
+            "2.2.2.2".parse::<IpAddr>().unwrap()
+        );
+        // Junk as the right-most entry: the peer, as today.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", junk(b"2.2.2.2, \xff"));
+        assert_eq!(client_ip(local, &h, &trusted), local.ip());
+        // Junk in the middle of the trusted run, reached by the walk: the peer.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", junk(b"2.2.2.2, \xff, 127.0.0.1"));
+        assert_eq!(client_ip(local, &h, &trusted), local.ip());
+        // All trusted: the left-most.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "127.0.0.1, 127.0.0.1".parse().unwrap());
+        assert_eq!(client_ip(local, &h, &trusted), local.ip());
+    }
+
+    /// F-49: a trusted entry written as an IPv4-mapped IPv6 address matches the IPv4 peer;
+    /// a mapped network wider than the mapped space is refused.
+    #[test]
+    fn mapped_trusted_entries_match() {
+        let n = IpNet::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(n.contains("10.1.2.3".parse().unwrap()));
+        assert!(n.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!n.contains("11.1.2.3".parse().unwrap()));
+        let one = IpNet::parse("::ffff:127.0.0.1").unwrap();
+        assert!(one.contains("127.0.0.1".parse().unwrap()));
+        assert!(IpNet::parse("::ffff:0.0.0.0/95").is_none());
     }
 
     #[test]

@@ -33,6 +33,15 @@ fn cache() -> &'static Cache {
     })
 }
 
+/// Drop counts of ranges not in `live` (ranges replaced since they were counted).
+fn prune_done(
+    done: &mut HashMap<(u32, u32, u64), PerChain>,
+    live: impl Iterator<Item = (u32, u32, u64)>,
+) {
+    let live: std::collections::HashSet<_> = live.collect();
+    done.retain(|k, _| live.contains(k));
+}
+
 /// (records, blocks) per chain of one range.
 fn count_range(r: &RangeReader) -> PerChain {
     let mut out: PerChain = Default::default();
@@ -62,6 +71,8 @@ fn frozen_per_chain(seg: &Arc<Segments>) -> Option<PerChain> {
         if !c.running.swap(true, Ordering::AcqRel) {
             let seg = seg.clone();
             std::thread::spawn(move || {
+                // Cleared however the pass ends, a panic included (F-49).
+                let _running = crate::ClearOnDrop(&cache().running);
                 for r in &seg.ranges {
                     let k = key_of(r);
                     if cache()
@@ -79,7 +90,10 @@ fn frozen_per_chain(seg: &Arc<Segments>) -> Option<PerChain> {
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(k, v);
                 }
-                cache().running.store(false, Ordering::Release);
+                prune_done(
+                    &mut cache().done.lock().unwrap_or_else(|e| e.into_inner()),
+                    seg.ranges.iter().map(|r| key_of(r)),
+                );
             });
         }
         return None;
@@ -147,4 +161,27 @@ pub async fn stats(st: St) -> Response {
         )
     })
     .await
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use std::collections::HashMap;
+
+    use super::{prune_done, PerChain};
+
+    /// F-49: counts of ranges no longer in the segment set are dropped after a pass.
+    #[test]
+    fn counts_of_gone_ranges_are_dropped() {
+        let mut done: HashMap<(u32, u32, u64), PerChain> = HashMap::new();
+        for k in [(0, 10, 0), (10, 20, 5), (20, 30, 9)] {
+            done.insert(k, PerChain::default());
+        }
+        prune_done(
+            &mut done,
+            [(10, 20, 5), (20, 30, 9), (30, 40, 11)].into_iter(),
+        );
+        let mut left: Vec<_> = done.keys().copied().collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![(10, 20, 5), (20, 30, 9)]);
+    }
 }

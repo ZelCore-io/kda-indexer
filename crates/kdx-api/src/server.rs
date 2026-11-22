@@ -16,6 +16,7 @@ use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::{header, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use axum::serve::ListenerExt;
 use axum::Router;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -448,7 +449,7 @@ const STATUS_READS: usize = 2;
 pub const CHAINWEB_NEXT: HeaderName = HeaderName::from_static("chainweb-next");
 
 /// Limits of a data listener: in-flight cap, per-IP rate, deadline, body cap.
-async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
+pub(crate) async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
     let Ok(slot) = st.in_flight.clone().try_acquire_owned() else {
         return ApiError::Unavailable("too many requests in flight".into()).into_response();
     };
@@ -509,13 +510,155 @@ async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Res
     if is_docs {
         return resp;
     }
-    // The in-flight slot lives in the body: released when the body is sent or dropped.
+    // The in-flight slot lives in the body: released when hyper has taken the body's last
+    // frame (handlers build one frame) into its write buffer, or drops the body. That is
+    // not when the client has read it: a client that stops reading holds no slot (checked
+    // by `a_stalled_client_holds_no_in_flight_slot`), only buffered bytes, and the
+    // listener's write-idle timeout cuts it (F-08).
     resp.map(|b| {
         Body::new(HoldSlot {
             inner: b,
             _slot: slot,
         })
     })
+}
+
+/// A listener whose connections are cut when a write makes no progress for `idle` (F-08):
+/// a client that stops reading cannot pin its buffered response for longer. TCP keepalive
+/// is on, so a peer that vanished is found too.
+struct IdleCutListener {
+    inner: tokio::net::TcpListener,
+    idle: Duration,
+}
+
+impl axum::serve::Listener for IdleCutListener {
+    type Io = WriteIdle<tokio::net::TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (s, a) = axum::serve::Listener::accept(&mut self.inner).await;
+        set_keepalive(&s);
+        (
+            WriteIdle {
+                inner: s,
+                idle: self.idle,
+                stalled: None,
+            },
+            a,
+        )
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+/// `SO_KEEPALIVE` on an accepted connection (best effort).
+fn set_keepalive(s: &tokio::net::TcpStream) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let on: libc::c_int = 1;
+        // SAFETY: a valid socket fd and a c_int option value of the given size.
+        unsafe {
+            libc::setsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                std::ptr::addr_of!(on).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = s;
+}
+
+/// A stream whose writes fail with `TimedOut` once they have made no progress for `idle`.
+/// The timer runs only while a write is pending and restarts on any progress, so a slow
+/// client that keeps reading is never cut.
+struct WriteIdle<S> {
+    inner: S,
+    idle: Duration,
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteIdle<S> {
+    /// After the inner stream answered `r`: progress clears the timer; `Pending` starts or
+    /// polls it, and an expired timer is the error.
+    fn watch<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        r: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future;
+        use std::task::Poll;
+        if r.is_ready() {
+            self.stalled = None;
+            return r;
+        }
+        let idle = self.idle;
+        let t = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+        match t.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client stopped reading (write idle timeout)",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteIdle<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteIdle<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.watch(cx, r)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.watch(cx, r)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.watch(cx, r)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.watch(cx, r)
+    }
 }
 
 /// A response body holding its request's in-flight slot.
@@ -590,7 +733,12 @@ pub struct Api {
     graphql: Router<Arc<ApiState>>,
     docs: bool,
     on_bound: Option<OnBound>,
+    write_idle: Duration,
 }
+
+/// Default write-idle timeout of a connection (F-08): a client that reads nothing of a
+/// response for this long is disconnected, so it cannot pin the buffered response.
+pub const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What `on_bound` receives: every listener name with the address it actually bound (so a
 /// test can bind port 0 and read the port back).
@@ -620,6 +768,7 @@ impl Api {
             graphql: Router::new(),
             docs: true,
             on_bound: None,
+            write_idle: WRITE_IDLE_TIMEOUT,
         }
     }
 
@@ -651,6 +800,13 @@ impl Api {
     }
 
     /// Add native routes (Task 4).
+    /// Cut a connection whose writes make no progress for `d` (default
+    /// [`WRITE_IDLE_TIMEOUT`]).
+    pub fn write_idle_timeout(mut self, d: Duration) -> Api {
+        self.write_idle = d;
+        self
+    }
+
     pub fn native_routes(mut self, r: Router<Arc<ApiState>>) -> Api {
         self.native = self.native.merge(r);
         self
@@ -672,6 +828,7 @@ impl Api {
     pub async fn serve(self, binds: Binds, shutdown: CancellationToken) -> anyhow::Result<()> {
         let st = self.state;
         let on_bound = self.on_bound;
+        let write_idle = self.write_idle;
         for (name, list) in [("native", &binds.native), ("admin", &binds.admin)] {
             for a in list {
                 anyhow::ensure!(
@@ -703,7 +860,11 @@ impl Api {
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any)
-                .expose_headers([CHAINWEB_NEXT, crate::compat::stats::COUNT_AGE]),
+                .expose_headers([
+                    CHAINWEB_NEXT,
+                    crate::compat::stats::COUNT_AGE,
+                    crate::compat::SEARCH_TRUNCATED,
+                ]),
         );
         let graphql = data(self.graphql, "graphql").layer(
             CorsLayer::new()
@@ -747,6 +908,12 @@ impl Api {
             tracing::info!(listener = name, %addr, "api: listening");
             addrs.push((name, addr));
             let stop = stop.clone();
+            // `tap_io` only makes the connect info (`SocketAddr`) available for the wrapper.
+            let l = IdleCutListener {
+                inner: l,
+                idle: write_idle,
+            }
+            .tap_io(|_| {});
             tasks.spawn(async move {
                 axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>())
                     .with_graceful_shutdown(stop.cancelled_owned())
@@ -804,6 +971,109 @@ pub(crate) mod tests {
             ready_max_lag: 10,
             max_event_lists: 64,
         }
+    }
+
+    /// A body larger than the loopback socket buffers, so a client that does not read
+    /// leaves most of it unsent.
+    const BIG: usize = 32 << 20;
+
+    /// A native listener serving `/big` (`BIG` bytes) with a write-idle timeout of `idle`:
+    /// (data dir, state, address, stop, serve task).
+    async fn serve_big(
+        idle: Duration,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ApiState>,
+        SocketAddr,
+        CancellationToken,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (d, store) = crate::testutil::store();
+        let mut cfg = settings(4);
+        cfg.max_in_flight = 4;
+        cfg.max_body_bytes = 64 << 20;
+        cfg.deadline = Duration::from_secs(10);
+        let big = Router::new().route("/big", axum::routing::get(|| async { vec![b'x'; BIG] }));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let api = Api::new(store, cfg, TipWatch::default())
+            .native_routes(big)
+            .write_idle_timeout(idle)
+            .on_bound(move |a| {
+                let _ = tx.send(a.to_vec());
+            });
+        let st = api.state();
+        let binds = Binds {
+            native: vec!["127.0.0.1:0".parse().unwrap()],
+            ..Binds::default()
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(api.serve(binds, stop.clone()));
+        let addr = rx.await.unwrap()[0].1;
+        (d, st, addr, stop, task)
+    }
+
+    /// Send `GET /big`, wait `stall` without reading, then read everything at `step` bytes
+    /// per `pause`: the bytes received before the connection ended.
+    async fn read_big(addr: SocketAddr, stall: Duration, step: usize, pause: Duration) -> usize {
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            c.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(stall);
+            let mut got = 0;
+            let mut buf = vec![0u8; step];
+            loop {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => return got,
+                    Ok(n) => got += n,
+                }
+                std::thread::sleep(pause);
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    /// F-08 (triage check): a client that stops reading a whole-body response does not hold
+    /// an in-flight slot: hyper takes the single frame into its write buffer and drops the
+    /// body (and the slot) at once; only the bytes stay buffered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_client_holds_no_in_flight_slot() {
+        let (_d, st, addr, stop, task) = serve_big(Duration::from_secs(60)).await;
+        let reader = tokio::spawn(read_big(
+            addr,
+            Duration::from_millis(1500),
+            1 << 20,
+            Duration::ZERO,
+        ));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            st.in_flight.available_permits(),
+            4,
+            "slot released while stalled"
+        );
+        let got = reader.await.unwrap();
+        assert!(got > BIG, "a reader that resumes gets it all ({got})");
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// F-08: a client that stops reading is disconnected once writes make no progress for
+    /// the write-idle timeout; a slow client that keeps reading is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_client_is_cut_after_the_write_idle_timeout() {
+        let (_d, _st, addr, stop, task) = serve_big(Duration::from_millis(400)).await;
+        let stalled = read_big(addr, Duration::from_millis(2500), 1 << 20, Duration::ZERO).await;
+        assert!(
+            stalled < BIG,
+            "stalled client got the whole body ({stalled})"
+        );
+        let slow = read_big(addr, Duration::ZERO, 1 << 20, Duration::from_millis(40)).await;
+        assert!(slow > BIG, "slow reader got {slow} of {BIG}+headers");
+        stop.cancel();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
