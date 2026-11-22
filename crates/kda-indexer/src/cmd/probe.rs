@@ -125,7 +125,7 @@ pub async fn run(cfg: &Config, smoke: bool, out: Option<PathBuf>) -> anyhow::Res
 
     // header/branch: expect 10 items between tip-10 (lower) and tip (upper).
     let seg = client
-        .headers_all(0, tip - 10, tip)
+        .headers_all(0, tip.saturating_sub(10), tip)
         .await
         .context("branch sample")?;
     let branch_items = match (seg.first(), seg.last()) {
@@ -141,7 +141,10 @@ pub async fn run(cfg: &Config, smoke: bool, out: Option<PathBuf>) -> anyhow::Res
         _ => 0,
     };
 
-    let (block_page_items, block_page_has_next) = match client.block(0, tip - 1001, tip - 1).await {
+    let (block_page_items, block_page_has_next) = match client
+        .block(0, tip.saturating_sub(1001), tip.saturating_sub(1))
+        .await
+    {
         Ok(Some(p)) => (p.items.len(), p.next.is_some()),
         _ => (0, false),
     };
@@ -231,7 +234,15 @@ async fn probe_routes(
     let r = c.cut().await;
     out.push(route("cut", base, status_of(&r), r.is_ok(), t));
     let t = Instant::now();
-    let hdrs = c.headers(0, tip - 12, tip - 2, Some(10), None).await;
+    let hdrs = c
+        .headers(
+            0,
+            tip.saturating_sub(12),
+            tip.saturating_sub(2),
+            Some(10),
+            None,
+        )
+        .await;
     out.push(route("header", base, status_of(&hdrs), hdrs.is_ok(), t));
     if let Ok(p) = &hdrs {
         if let (Some(l), Some(u)) = (p.items.first(), p.items.last()) {
@@ -267,7 +278,9 @@ async fn probe_routes(
         t,
     ));
     let t = Instant::now();
-    let blk = c.block(0, tip - 5, tip - 4).await;
+    let blk = c
+        .block(0, tip.saturating_sub(5), tip.saturating_sub(4))
+        .await;
     let (st, ok) = match &blk {
         Ok(Some(_)) => (200, true),
         Ok(None) => (404, false),
@@ -490,7 +503,13 @@ async fn smoke_run(cfg: &Config) -> anyhow::Result<()> {
         tip
     );
     let page = client
-        .headers(0, tip - 20, tip - 10, Some(10), None)
+        .headers(
+            0,
+            tip.saturating_sub(20),
+            tip.saturating_sub(10),
+            Some(10),
+            None,
+        )
         .await
         .context("headers")?;
     println!(

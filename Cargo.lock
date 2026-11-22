@@ -1884,7 +1884,9 @@ dependencies = [
 name = "kdx-metrics"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "prometheus-client",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

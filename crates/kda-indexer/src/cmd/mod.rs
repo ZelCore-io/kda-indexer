@@ -1,6 +1,6 @@
 //! CLI subcommand implementations.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::time::Duration;
 
@@ -68,12 +68,9 @@ pub fn local_node_client(cfg: &Config) -> anyhow::Result<NodeClient> {
 pub fn lock_data_dir(data_dir: &Path) -> anyhow::Result<File> {
     std::fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
     let p = data_dir.join("LOCK");
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&p)
-        .with_context(|| format!("open {}", p.display()))?;
+    // F-44: a symlink planted at `LOCK` is not followed (a root-run command would otherwise
+    // create or lock its target).
+    let f = kdx_segment::files::open_lock_file(&p)?;
     match f.try_lock() {
         Ok(()) => Ok(f),
         Err(TryLockError::WouldBlock) => anyhow::bail!(
@@ -83,5 +80,32 @@ pub fn lock_data_dir(data_dir: &Path) -> anyhow::Result<File> {
             data_dir.display()
         ),
         Err(TryLockError::Error(e)) => Err(e).with_context(|| format!("lock {}", p.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock_data_dir;
+
+    /// F-44: a symlink planted at `<data_dir>/LOCK` is not followed (its target is neither
+    /// created nor locked); the command fails instead.
+    #[test]
+    fn a_symlinked_lock_file_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::os::unix::fs::symlink(&target, data.join("LOCK")).unwrap();
+        assert!(lock_data_dir(&data).is_err());
+        assert!(!target.exists(), "the symlink target was created");
+    }
+
+    #[test]
+    fn a_plain_lock_file_is_taken_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = lock_data_dir(tmp.path()).unwrap();
+        assert!(lock_data_dir(tmp.path()).is_err());
+        drop(l);
+        assert!(lock_data_dir(tmp.path()).is_ok());
     }
 }

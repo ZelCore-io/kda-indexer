@@ -208,16 +208,10 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         let to = u32::try_from(final_tip)?;
         let bf = kdx_ingest::backfill::run(bctx, u32::try_from(bf_from)?, to, a.header_mode);
         tips.set_backfill(true);
-        tokio::select! {
-            r = bf => {
-                let s = r?;
-                tracing::info!(summary = %serde_json::to_string(&s)?, "run: backfill done");
-            }
-            _ = token.cancelled() => {
-                tracing::warn!("run: stopped during backfill (the next start resumes at the manifest frontier)");
-                return Ok(());
-            }
-        }
+        let Some((s, api)) = backfill_with_api(bf, &token, api).await? else {
+            return Ok(());
+        };
+        tracing::info!(summary = %serde_json::to_string(&s)?, "run: backfill done");
         tips.set_backfill(false);
         let node = super::node_client(cfg)?;
         node.set_batch_limit(cfg.ingest.batch_size);
@@ -332,6 +326,27 @@ async fn stop_api(
     token.cancel();
     let a = api.await.map_err(anyhow::Error::from).and_then(|x| x);
     r.and(a.context("api"))
+}
+
+/// Runs the backfill `bf` while the API task `api` serves. `Some`: the backfill finished and
+/// the API still serves. `None`: stopped by a signal during the backfill. F-18: when the run
+/// ends here the API task is joined first, so an API that failed (it cancels the token: a
+/// bind or serve error) makes the run fail and systemd (`Restart=on-failure`) restarts it.
+async fn backfill_with_api<T>(
+    bf: impl std::future::Future<Output = anyhow::Result<T>>,
+    token: &CancellationToken,
+    api: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<Option<(T, tokio::task::JoinHandle<anyhow::Result<()>>)>> {
+    tokio::select! {
+        r = bf => match r {
+            Ok(s) => Ok(Some((s, api))),
+            Err(e) => stop_api(api, token.clone(), Err(e)).await.map(|()| None),
+        },
+        _ = token.cancelled() => {
+            tracing::warn!("run: stopped during backfill (the next start resumes at the manifest frontier)");
+            stop_api(api, token.clone(), Ok(())).await.map(|()| None)
+        }
+    }
 }
 
 /// Dev `--start-height`: the empty store starts at `h` (frontier, `Headers` checkpoints at
@@ -473,4 +488,63 @@ async fn follow(
         "run: stopped"
     );
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::backfill_with_api;
+
+    /// F-18: the API fails (say, its address is taken) while the backfill runs. The API task
+    /// cancels the token; `run` must end with that error, so systemd restarts it.
+    #[tokio::test]
+    async fn an_api_failure_during_backfill_is_an_error() {
+        let token = CancellationToken::new();
+        let stop = token.clone();
+        let api = tokio::spawn(async move {
+            stop.cancel();
+            Err(anyhow::anyhow!("bind 127.0.0.1:1: address in use"))
+        });
+        let r = backfill_with_api(pending::<anyhow::Result<()>>(), &token, api).await;
+        let e = r.expect_err("an API failure during backfill must fail the run");
+        assert!(format!("{e:#}").contains("address in use"), "{e:#}");
+    }
+
+    /// A signal during the backfill stops the run cleanly once the API has stopped.
+    #[tokio::test]
+    async fn a_signal_during_backfill_is_a_clean_stop() {
+        let token = CancellationToken::new();
+        let stop = token.clone();
+        let api = tokio::spawn(async move {
+            stop.cancelled().await;
+            Ok(())
+        });
+        token.cancel();
+        let r = backfill_with_api(pending::<anyhow::Result<()>>(), &token, api).await;
+        assert!(r.unwrap().is_none());
+    }
+
+    /// A backfill error is returned after the API task has been joined.
+    #[tokio::test]
+    async fn a_backfill_error_joins_the_api() {
+        let token = CancellationToken::new();
+        let stop = token.clone();
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let j = joined.clone();
+        let api = tokio::spawn(async move {
+            stop.cancelled().await;
+            j.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let bf = async { Err::<(), _>(anyhow::anyhow!("node gone")) };
+        let e = backfill_with_api(bf, &token, api).await.unwrap_err();
+        assert!(format!("{e:#}").contains("node gone"));
+        assert!(
+            joined.load(std::sync::atomic::Ordering::SeqCst),
+            "API not joined"
+        );
+    }
 }

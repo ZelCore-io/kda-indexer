@@ -735,6 +735,31 @@ impl Config {
             "backfill.step_heights must be at least 10 (got {})",
             b.step_heights
         );
+        // F-45: 0 is a multiple of every step (plan_units looped forever on it), and the
+        // backfill plans ranges in u32 heights.
+        anyhow::ensure!(
+            b.range_heights >= b.step_heights && u32::try_from(b.range_heights).is_ok(),
+            "backfill.range_heights must be in step_heights..=4294967295 (got {})",
+            b.range_heights
+        );
+        anyhow::ensure!(
+            b.ranges_in_flight > 0,
+            "backfill.ranges_in_flight must be > 0"
+        );
+        anyhow::ensure!(
+            self.ingest.node_concurrency > 0,
+            "ingest.node_concurrency must be > 0"
+        );
+        // Owner ruling (audit F-45): 0 is refused, not taken as "no limit".
+        anyhow::ensure!(self.ingest.max_rps > 0, "ingest.max_rps must be > 0");
+        kdx_segment::manifest::check_network(&self.network).context("network")?;
+        if let Some(pin) = &self.node.p2p_cert_sha256 {
+            kdx_node::parse_sha256_hex(pin).context("node.p2p_cert_sha256")?;
+        }
+        anyhow::ensure!(
+            self.node.p2p_url.is_none() || self.node.p2p_cert_sha256.is_some(),
+            "node.p2p_url is set but node.p2p_cert_sha256 is not"
+        );
         anyhow::ensure!(
             b.range_heights.is_multiple_of(b.step_heights),
             "backfill.range_heights ({}) must be a multiple of backfill.step_heights ({})",
@@ -1169,5 +1194,95 @@ mod ws_bound_tests {
                 "{bad}: {e:#}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    /// A config with `head` (top-level keys), `node` (extra `[node]` keys) and `rest` (more
+    /// sections), validated.
+    fn check(head: &str, node: &str, rest: &str) -> anyhow::Result<()> {
+        let head = if head.contains("network") {
+            head.to_owned()
+        } else {
+            format!("network = \"mainnet01\"\n{head}")
+        };
+        let text = format!(
+            "{head}\ndata_dir = \"data\"\n[node]\nurl = \"http://127.0.0.1:1848\"\n{node}\n{rest}\n"
+        );
+        toml::from_str::<Config>(&text)?.validate()
+    }
+
+    fn refused(head: &str, node: &str, rest: &str, says: &str) {
+        let e = check(head, node, rest).expect_err(rest);
+        assert!(
+            format!("{e:#}").contains(says),
+            "{head} {node} {rest}: {e:#}"
+        );
+    }
+
+    /// F-45: values that `config check` passed but that hang or fail at run time.
+    #[test]
+    fn zero_and_out_of_range_values_are_refused() {
+        check("", "", "").expect("defaults pass");
+        // 0 is a multiple of every step: `plan_units` looped forever on it.
+        refused("", "", "[backfill]\nrange_heights = 0", "range_heights");
+        refused(
+            "",
+            "",
+            "[backfill]\nrange_heights = 5000000000\nstep_heights = 10",
+            "range_heights",
+        );
+        refused(
+            "",
+            "",
+            "[backfill]\nranges_in_flight = 0",
+            "ranges_in_flight",
+        );
+        refused("", "", "[ingest]\nnode_concurrency = 0", "node_concurrency");
+        // Owner ruling: 0 is refused rather than meaning "no limit".
+        refused("", "", "[ingest]\nmax_rps = 0", "ingest.max_rps");
+        check("", "", "[ingest]\nmax_rps = 1").expect("1 passes");
+    }
+
+    #[test]
+    fn network_must_be_a_plain_name() {
+        refused("network = \"../x\"", "", "", "network");
+        refused("network = \"\"", "", "", "network");
+        check("network = \"testnet04\"", "", "").expect("plain name passes");
+    }
+
+    #[test]
+    fn p2p_cert_pin_is_checked_with_the_url() {
+        let pin = "ab".repeat(32);
+        check(
+            "",
+            &format!("p2p_url = \"https://127.0.0.1:1789\"\np2p_cert_sha256 = \"{pin}\""),
+            "",
+        )
+        .expect("url plus a 64-hex pin passes");
+        refused(
+            "",
+            "p2p_url = \"https://127.0.0.1:1789\"",
+            "",
+            "p2p_cert_sha256",
+        );
+        refused(
+            "",
+            "p2p_url = \"https://127.0.0.1:1789\"\np2p_cert_sha256 = \"abcd\"",
+            "",
+            "p2p_cert_sha256",
+        );
+        refused(
+            "",
+            &format!(
+                "p2p_url = \"https://127.0.0.1:1789\"\np2p_cert_sha256 = \"{}\"",
+                "zz".repeat(32)
+            ),
+            "",
+            "p2p_cert_sha256",
+        );
     }
 }

@@ -204,8 +204,13 @@ it, so node_exporter never sees a partial file):
 
 ```sh
 sudo chgrp kda-indexer /var/lib/node_exporter/textfile_collector
-sudo chmod g+w /var/lib/node_exporter/textfile_collector
+sudo chmod g+w,+t /var/lib/node_exporter/textfile_collector
 ```
+
+The file is written `0644` whatever the service's `UMask=0027`, so node_exporter reads it
+without joining group `kda-indexer`. The temporary file (`kda_indexer.prom.tmp`, which the
+collector ignores) is created fresh each time and a symlink at its name is never followed.
+The sticky bit (`+t`) keeps other members of the group from replacing the service's files.
 
 If the directory is not writable the indexer logs once and keeps serving `/metrics` on the
 admin port. See [operations.md](operations.md) for the metric list and suggested alerts.

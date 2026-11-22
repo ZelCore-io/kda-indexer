@@ -70,6 +70,11 @@ pub struct Unit {
 /// Ranges aligned to `range` heights; steps of `step` heights where a full range does not
 /// fit (unaligned start or the tail end). A partial step is never written.
 pub fn plan_units(start: u32, end: u32, range: u32, step: u32) -> Result<Vec<Unit>> {
+    // F-45: a zero range or step would plan empty units forever.
+    anyhow::ensure!(
+        range > 0 && step > 0,
+        "backfill.range_heights ({range}) and step_heights ({step}) must be > 0"
+    );
     if !start.is_multiple_of(step) {
         bail!("backfill start {start} is not a multiple of backfill.step_heights {step}");
     }
@@ -955,6 +960,15 @@ mod mem_tests {
         let small = mem_plan(2, 1024, 3072);
         let big = mem_plan(2, 1024, 16384);
         assert!(small.postings_mem_entries < big.postings_mem_entries);
+    }
+
+    /// F-45: a zero range or step is refused (it planned empty units forever). Not seen red:
+    /// on the old code this call does not return.
+    #[test]
+    fn plan_units_refuses_zero_sizes() {
+        assert!(plan_units(0, 100, 0, 10).is_err());
+        assert!(plan_units(0, 100, 100, 0).is_err());
+        assert_eq!(plan_units(0, 100, 100, 10).unwrap().len(), 1);
     }
 }
 
