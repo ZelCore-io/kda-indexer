@@ -264,6 +264,7 @@ fn balances_opts(
             module_rows: b.module_rows,
             account_rows: b.account_rows,
             recheck_secs: b.recheck_hours.saturating_mul(3600),
+            history_slice_txs: kdx_ingest::seed_receivers::HISTORY_SLICE_TXS,
         },
     };
     Ok(Some((super::local_node_client(cfg)?, o)))

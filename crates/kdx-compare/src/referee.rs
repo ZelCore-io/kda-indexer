@@ -533,11 +533,10 @@ async fn settle_native(
     // disproved nothing; the marker is dropped and the gaps are settled as usual.
     let marker = |e: &DiffEntry| e.path == crate::graphql::NATIVE_REREAD_DIFFERS_PATH;
     let f64_agrees = |e: &DiffEntry| {
-        let rows = e
-            .a
-            .as_ref()
-            .and_then(|a| a.get("reread"))
-            .and_then(Value::as_array);
+        let rows =
+            e.a.as_ref()
+                .and_then(|a| a.get("reread"))
+                .and_then(Value::as_array);
         rows.is_some_and(|rows| {
             !rows.is_empty()
                 && rows.iter().all(|r| {

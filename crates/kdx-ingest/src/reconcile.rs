@@ -115,6 +115,8 @@ pub struct Caps {
     pub account_rows: u32,
     /// Seconds after which a module's fungible checks and a not-fungible verdict are re-done.
     pub recheck_secs: u32,
+    /// Txs per slice of the D3 history walk, one slice per loop round (re-review N2).
+    pub history_slice_txs: u64,
 }
 
 impl Default for Caps {
@@ -124,6 +126,7 @@ impl Default for Caps {
             module_rows: 1_000_000,
             account_rows: 1_000,
             recheck_secs: 86_400,
+            history_slice_txs: crate::seed_receivers::HISTORY_SLICE_TXS,
         }
     }
 }
@@ -998,25 +1001,38 @@ async fn seed_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
 /// its stored history below coin v3 grew since. Postponed (to the next recheck) while the
 /// store is not ready for it (review L3). It runs inline: tail dirty rows wait until it ends
 /// (review L4). Returns false when stopped.
-async fn receivers_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
-    let forks = crate::seed_receivers::forks_for(&ctx.opts.network);
-    let Some((from, to)) = crate::seed_receivers::pending(&ctx.hot.ro()?, forks)? else {
+///
+/// D3 (`Rules::D3`): the token receivers pass, same mechanics over every stored height; after
+/// its first walk it is pending again whenever the tail grew, and walks only the new heights.
+use crate::seed_receivers::Rules;
+
+async fn receivers_pass(
+    ctx: &Arc<Ctx>,
+    stop: &CancellationToken,
+    rules: crate::seed_receivers::Rules,
+) -> Result<bool> {
+    let opts = crate::seed_receivers::Opts {
+        forks: crate::seed_receivers::forks_for(&ctx.opts.network),
+        rules,
+        rewalk_every_secs: crate::seed_receivers::REWALK_EVERY_SECS,
+        // Walked in slices by the loop (`history_slice`), never inline (re-review N2).
+        history_inline: false,
+        ..Default::default()
+    };
+    let Some((from, to)) = crate::seed_receivers::pending_for(&ctx.hot.ro()?, &opts)? else {
         return Ok(true);
     };
     if let Err(e) = crate::seed_receivers::check_ready(&ctx.hot.ro()?, &ctx.segdir) {
-        tracing::warn!(error = %e, "balances: receivers pass (D1) postponed");
+        tracing::warn!(error = %e, ?rules, "balances: receivers pass postponed");
         return Ok(true);
     }
     tracing::info!(
         from,
         to,
-        "balances: marking event-less receivers below coin v3 (D1)"
+        ?rules,
+        "balances: marking receivers no event names (D1: coin below coin v3; D3: all modules)"
     );
     let (c, s) = (ctx.clone(), stop.clone());
-    let opts = crate::seed_receivers::Opts {
-        forks,
-        ..Default::default()
-    };
     let rep = tokio::task::spawn_blocking(move || {
         crate::seed_receivers::run(&c.hot, &c.dict, &c.segdir, &opts, &|| s.is_cancelled())
     })
@@ -1027,6 +1043,97 @@ async fn receivers_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool
         tracing::info!(report = %serde_json::to_string(&rep)?, "balances: receivers pass ended");
     }
     Ok(!rep.stopped)
+}
+
+/// The loop's D3 history walk (re-review N2): the walk in progress, and when to try again
+/// after an error.
+#[derive(Default)]
+struct History {
+    walk: Option<crate::seed_receivers::HistoryWalk>,
+    retry_at: Option<Instant>,
+}
+
+/// Pause before a failed history slice is tried again.
+const HISTORY_RETRY: Duration = Duration::from_secs(60);
+
+/// Re-review N2: one bounded slice of the D3 history walk for newly tracked tokens (begun or
+/// resumed from its persisted cursor), so tail marks and NFT steps keep flowing while it runs.
+/// Returns whether it walked anything (the loop then does not idle). Errors are logged and
+/// retried after [`HISTORY_RETRY`], never fatal.
+async fn history_slice(ctx: &Arc<Ctx>, h: &mut History, slice: u64) -> Result<bool> {
+    if h.retry_at.is_some_and(|t| Instant::now() < t) {
+        return Ok(false);
+    }
+    let opts = crate::seed_receivers::Opts {
+        forks: crate::seed_receivers::forks_for(&ctx.opts.network),
+        rules: Rules::D3,
+        rewalk_every_secs: crate::seed_receivers::REWALK_EVERY_SECS,
+        ..Default::default()
+    };
+    let (c, mut walk) = (ctx.clone(), h.walk.take());
+    let (walk, r) = tokio::task::spawn_blocking(move || {
+        let r = (|| -> Result<Option<crate::seed_receivers::HistoryStep>> {
+            if walk.is_none() {
+                walk = crate::seed_receivers::history_begin(&c.hot, &c.dict, &opts)?;
+            }
+            match walk.as_mut() {
+                Some(w) => Ok(Some(w.step(&c.hot, &c.dict, &c.segdir, &opts, slice)?)),
+                None => Ok(None),
+            }
+        })();
+        (walk, r)
+    })
+    .await?;
+    match r {
+        Ok(Some(s)) => {
+            if s.done {
+                tracing::info!(tokens = s.tokens, report = %serde_json::to_string(&s.report)?,
+                    "balances: D3 history walk ended");
+            } else {
+                h.walk = walk;
+            }
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => {
+            // The next try resumes from the persisted cursor.
+            tracing::warn!(error = %e, "balances: D3 history walk slice failed; retried later");
+            h.retry_at = Some(Instant::now() + HISTORY_RETRY);
+            Ok(false)
+        }
+    }
+}
+
+/// `describe-module` reads per reconcile round for the D3 discovery queue (review M1).
+pub const DISCOVER_READS_PER_ROUND: usize = 4;
+
+/// Review M1: check a few queued discovered modules with the node; a module whose
+/// `describe-module` lists `fungible-v2` on that chain becomes a tracked token.
+async fn discovery_step(ctx: &Arc<Ctx>, local: &LocalClient) -> Result<()> {
+    let queued = kdx_hot::balances::discovered_queue(&ctx.hot.ro()?, DISCOVER_READS_PER_ROUND)?;
+    if queued.is_empty() {
+        return Ok(());
+    }
+    let answers = join_all(
+        queued
+            .iter()
+            .map(|(m, c, _)| local.implements_fungible(*c, m)),
+    )
+    .await;
+    let verdicts: Vec<Option<bool>> = answers
+        .into_iter()
+        .map(|r| match r {
+            Ok(Local::Found { value, .. }) => Some(value),
+            Ok(Local::Absent) | Err(LocalError::Failure(_)) => Some(false),
+            Err(LocalError::Node(_) | LocalError::Skipped(_)) => None,
+        })
+        .collect();
+    let (tracked, rejected) =
+        crate::seed_receivers::check_discovered(&ctx.hot, &ctx.dict, &queued, &verdicts)?;
+    if tracked + rejected > 0 {
+        tracing::info!(tracked, rejected, "balances: D3 discovered modules checked");
+    }
+    Ok(())
 }
 
 /// M-11: the tail applied blocks without dirty marks (`[balances] enabled = false`, or an
@@ -1135,8 +1242,10 @@ async fn run_with(
     if o.seed && !crate::seed::seeded(&ctx.hot.ro()?)? && !seed_pass(&ctx, &stop).await? {
         return Ok(());
     }
-    if o.seed && !receivers_pass(&ctx, &stop).await? {
-        return Ok(());
+    for rules in [Rules::D1, Rules::D3] {
+        if o.seed && !receivers_pass(&ctx, &stop, rules).await? {
+            return Ok(());
+        }
     }
     let local = LocalClient::new(node, o.local);
     let mut nft_cursor: Option<Vec<u8>> = None;
@@ -1149,6 +1258,7 @@ async fn run_with(
     let mut rate = 0.0f64;
     let mut last_log = Instant::now();
     let mut watch = BranchWatch::default();
+    let mut history = History::default();
     loop {
         if stop.is_cancelled() {
             return Ok(());
@@ -1171,8 +1281,11 @@ async fn run_with(
         }
         if last_recheck.is_none_or(|t| t.elapsed() >= RECHECK_SCAN) {
             // D1: a tail still below coin v3 stores new pre-v3 txs; their receivers too.
-            if o.seed && last_recheck.is_some() && !receivers_pass(&ctx, &stop).await? {
-                return Ok(());
+            // D3: the new heights of the tail (credits of tokens no TRANSFER names).
+            for rules in [Rules::D1, Rules::D3] {
+                if o.seed && last_recheck.is_some() && !receivers_pass(&ctx, &stop, rules).await? {
+                    return Ok(());
+                }
             }
             let n = recheck_not_fungible(&ctx.hot, now_unix(), o.caps.recheck_secs)?;
             if n > 0 {
@@ -1180,6 +1293,12 @@ async fn run_with(
             }
             last_recheck = Some(Instant::now());
         }
+        if o.seed {
+            if let Err(e) = discovery_step(&ctx, &local).await {
+                tracing::warn!(error = %e, "balances: D3 discovery check failed; retried next round");
+            }
+        }
+        let walked = o.seed && history_slice(&ctx, &mut history, o.caps.history_slice_txs).await?;
         // NFT rows (plan Task 11) share the `/local` budget; the table is small, so one step
         // per loop keeps them current even behind a long balance backlog.
         let nft = crate::nft_fill::step(&ctx.hot, &local, &mut nft_cursor).await?;
@@ -1199,7 +1318,10 @@ async fn run_with(
                 .balance_dirty_rows
                 .set(balances::dirty_count(&ctx.hot.ro()?)? as i64);
             // Off-branch NFT answers (D2) are not progress either: no immediate re-loop.
-            if nft.rows() > nft.node_errors + nft.other_branch || det.calls() > det.node_errors {
+            if walked
+                || nft.rows() > nft.node_errors + nft.other_branch
+                || det.calls() > det.node_errors
+            {
                 continue;
             }
             tokio::select! {
@@ -2281,6 +2403,88 @@ pub(crate) mod tests {
             pending() == 0
         })
         .await;
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// Re-review N2: a pending D3 history walk runs in slices between the loop's other steps;
+    /// dirty rows are reconciled while it is still pending, and the walk then completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_rows_are_reconciled_while_a_history_walk_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["k:a"]);
+        let segdir = dir.path().join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut txn,
+            kdx_hot::Stage::Tail,
+            0,
+            1,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        // D3 done through height 60,000; a token first seen at 5 waits for its history walk.
+        txn.set_meta(
+            balances::meta::BALANCES_SEED_TOKEN_RECEIVERS,
+            &60_000u32.to_be_bytes(),
+        )
+        .unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let tok = dict.intern(DictKind::Module, "free.t");
+        dict.persist(&mut txn).unwrap();
+        balances::note_token(&mut txn, tok, 5).unwrap();
+        // 50,000 stored txs below the done height (unreadable records count as pass errors):
+        // at one tx per slice the walk needs 50,000 slices, far longer than one batch.
+        for h in 2..50_002u32 {
+            let k = kdx_types::TxKey::new(h, 0, 1);
+            txn.put(Table::TailTxs, &k.to_be_bytes(), b"\xffnot a tx record")
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(
+            balances::rewalk_pending(&hot.ro().unwrap()).unwrap(),
+            vec![tok]
+        );
+        let (ctx, _) = client(dir.path(), &hot);
+        let node = ctx.node.clone();
+        let o = ReconcileOpts {
+            local: LocalOpts {
+                rps: 0,
+                concurrency: 4,
+            },
+            batch: 10,
+            seed: true,
+            caps: Caps {
+                history_slice_txs: 1,
+                ..Caps::default()
+            },
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run_with(
+            Arc::new(ctx),
+            node,
+            o,
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        let walk_pending = || {
+            !balances::rewalk_pending(&hot.ro().unwrap())
+                .unwrap()
+                .is_empty()
+        };
+        until("the dirty row reconciled", || {
+            assert!(!task.is_finished(), "run ended");
+            balances::dirty_count(&hot.ro().unwrap()).unwrap() == 0
+        })
+        .await;
+        assert!(walk_pending(), "the walk ran inline before the dirty rows");
+        let end = Instant::now() + Duration::from_secs(300);
+        while walk_pending() {
+            assert!(!task.is_finished(), "run ended");
+            assert!(Instant::now() < end, "the history walk never ended");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         stop.cancel();
         task.await.unwrap().unwrap();
     }

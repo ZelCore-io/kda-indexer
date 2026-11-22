@@ -635,6 +635,102 @@ network; a network this build has no heights for uses mainnet01's and logs a war
   (with `seed_receivers_height` and `seed_receivers_in_progress`).
 - To force a rerun, delete Meta `balances_seed_receivers`.
 
+#### Token receivers pass (D3)
+
+Some credits name the receiver in no TRANSFER event, for coin and for tokens alike, so no
+posting marks its row. Since fix round 1 the **tail marks them itself**, in the block's txn,
+with the same rules as the pass (one shared extraction, `kdx_decode::receivers::d3_candidates`
+then `d3_filter`): each row is marked at the tx's height through the postings' mark path, with
+no verified-row skip, and a reorg's undo marks it again like an undone posting. The tail keeps
+the per-tx caps below and allows one emitter at most 1,024 rows per block; more are dropped and
+counted (counter `d3_tail_dropped`), and the block is applied regardless. The tail interns no
+names: decode interns the event accounts (postings), a cross-chain defpact's module and account,
+and the modules a tx may put forward as tokens, so backfill and tail build the same dictionary.
+A row whose account or module is still unknown (for example a string of an `exec`) is left to
+the hourly pass, which interns it.
+
+The token receivers pass marks the same rows for stored history, with its own flag
+(`Meta balances_seed_token_receivers`), cursor and error count, and the same mechanics as D1
+(resumable, `stop` polled per chunk, refused until the backfill is complete and the tail has
+started). It walks every stored height, not only those below coin v3. Each row is marked at the
+height of the latest tx that names it, like a posting; a verified `Balances` row is skipped only
+when it was read at or above that height (`as_of`), so a row read before the credit is re-read.
+After the first walk it is pending again whenever the tail grew, and the service's hourly
+recheck walks only the new heights (a safety net now that the tail marks). Candidates:
+
+- an injected early miner account (a dictionary name holding a `"`, mainnet 2020): the
+  accounts its coinbase really credited, as coin rows on that block's chain only;
+- a cross-chain defpact of any module (`<module>.transfer-crosschain`): step 1 credits
+  `args[1]`, step 0 debits `args[0]`. Tokens emit no TRANSFER for either;
+- an `exec` below the events fork: the D1 strings plus every string of `result.data`, for coin
+  and for each tracked token the code calls; from the events fork on, the same strings for a
+  tracked token the code calls only when the tx has no event of that token;
+- an event of a tracked token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
+  ...): its string params, for that token;
+- an event param holding a `fungible-v2` module reference: the event's string params, for the
+  referenced module, when the event's module is that module, a module of the same governed
+  namespace (not `free` or `user`), or a tracked token naming another tracked token.
+
+Token discovery: a cross-chain defpact's module, and a modref named by its own module or a
+module of the same governed namespace (`kaddex.skdx` is only ever minted by
+`kaddex.alchemist`, so no TRANSFER ever made it a token), are put forward as tokens, at most 4
+per tx, 16 per tail block, and per pass 8,192 with at most 4 per namespace (anyone can create
+`n_` namespaces; a flood of them must not crowd out a real token). A plain object renders exactly
+like a modref, so a name is only queued (`Meta balances_d3_discover/<ns>/<chain>/<module>`, at
+most 4 per namespace and 16,384 in all). In the open namespaces (`free`, `user`) the quota is
+per module, so junk modules there cannot starve a real one. A discovery dropped at any quota is
+counted (`d3_discover_dropped`) and kept in `Meta balances_d3_discover_pending/<chain>/<module>`
+(at most 1,000,000; beyond that only counted, `d3_discover_lost`); the next pass re-queues these
+first, so nothing is lost for good. Each re-queue scans from after the last pending key it
+scanned (`Meta balances_d3_discover_pending_from`) and wraps around, so entries the queue keeps
+refusing cannot hold back the rest. A discovered name longer than 256 bytes is dropped and
+counted (`d3_discover_too_long`, and `discovered_too_long` in the pass's dropped report): it
+could never be an MDBX key, and real module names are far shorter. The reconciler checks 4 queued names per
+round with `describe-module` on that chain; a module that lists `fungible-v2` becomes a tracked
+token, anything else is dropped. Note: a namespace whose user guard lets anyone deploy behaves
+like `free`; add it to `OPEN_NAMESPACES` if one is found.
+
+History of newly tracked tokens: when a module gets a `Tokens` row (first TRANSFER in the
+tail, a confirmed discovery, or a reconciler check) whose first height is below the D3 done
+height, it is queued in `Meta balances_d3_rewalk/<ModuleId>`: a credit below that height may
+predate its tracking. A token first seen at or above the done height is covered by the tail
+marks and the next pass, so it queues no walk. The walk reads the D3 rules for the queued tokens
+only over heights `[0, done)`. In the service it runs in slices of 50,000 txs, one per
+reconcile round, so tail marks, NFT steps and dirty rows keep flowing; each slice commits its
+marks with the walk's cursor (`Meta balances_d3_rewalk_walk`: done height, tokens, next TxNum
+or hot key, budget counters), so a restart resumes there. A new walk starts at most once a day
+(`balances_d3_rewalk_at`); tokens queued during a walk wait for the next one. The CLI walks to
+the end on every run.
+
+Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
+Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot read them.
+
+Only successful txs give candidates. The injected-miner rule reads the block's miner data of
+coinbases below the coinbase injection fix (mainnet 121,452), on that block's chain only.
+Rows from events and from an exec's token calls are capped: 64 of each per tx (events are
+taken first), then per pass a budget of distinct rows per tracked token (2,000,000,
+`KDX_D3_MAX_EVENT_CANDIDATES` for the CLI; a repeated row costs nothing), one shared bucket for
+all untracked emitters (2,000,000) and a global ceiling (20,000,000). Rows from an `exec`'s token
+calls are charged to the tx's sender (100,000 per sender, 2,000,000 per pass), never to the
+called token, so junk calls cannot spend a token's budget; the tail keys its per-block cap the
+same way. Over a budget the excess is
+dropped and counted for that token or bucket only, and the pass completes and advances for
+everyone: `--status` shows `seed_token_receivers_dropped` (`tokens`: drops per token,
+`untracked`, `ceiling`, `exec_sender`, `exec_ceiling`, `discovered`, `discovered_namespace`). A genuine token with drops needs a rerun with a raised
+budget (delete the flag first). The budget counters persist with the cursor, so a resumed pass
+does not grant a token its budget twice.
+
+`reconcile-balances --seed` runs D1 and then D3. `--seed --dry-run` opens the store read-only
+and prints both reports, `receivers` and `token_receivers`; `dirty_inserted` is the number of
+node reads the pass would cause. `--status` shows `seed_token_receivers_height`,
+`seed_token_receivers_in_progress`, `seed_token_receivers_errors`, `d3_discover_queued`,
+`d3_discover_pending` and `d3_rewalk_pending`. To force a rerun, delete `Meta balances_seed_token_receivers`.
+
+Run the first pass with the service stopped, or restart the service in a quiet window: the
+service runs it inline at start (about 2.4 h on mainnet) and the reconcile loop waits for it.
+After the repair, the verify scan must show 0 missing rows, including indirect token credits
+with no event of the token after the events fork (another module crediting it, review L4).
+
 ### NFTs
 
 The same stage keeps `NftBalances` (spec §3.9). Once per store (`Meta nft_filled`), before the

@@ -327,6 +327,7 @@ mod tests {
                 postings: Vec::new(),
                 pact_id: None,
                 code_hash: None,
+                d3: Default::default(),
             })
             .collect();
         f.apply_block(&IndexedBlock {
