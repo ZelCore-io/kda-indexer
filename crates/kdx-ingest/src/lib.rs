@@ -11,6 +11,7 @@ pub mod etl;
 pub mod fetch;
 pub mod freezer;
 pub mod heartbeat;
+pub mod keylist;
 pub mod nft_details;
 pub mod nft_fill;
 pub mod pipeline;

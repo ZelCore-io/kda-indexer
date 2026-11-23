@@ -313,6 +313,7 @@ fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let kl = kdx_ingest::keylist::summary(&txn)?;
     let out = json!({
         "tables_present": txn.has_table(Table::Balances),
         "dirty_rows": dirty,
@@ -365,6 +366,13 @@ fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
         "guards_capped": txn
             .meta(meta::GUARDS_CAPPED)?
             .and_then(|v| v.try_into().ok().map(u64::from_be_bytes)),
+        // D3 gap groups 3 and 4: the key listing of tracked tokens (tokens listed clean, in
+        // progress, with a failed chain waiting for its retry, given up over their failure
+        // budget; totals of keys listed and marked, failures, last failure).
+        "keylist_tokens": kl,
+        "keylist_stats": txn
+            .meta(meta::KEYLIST_STATS)?
+            .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
         "rate_per_s": rate,
         "eta_secs": (rate > 0.0).then(|| (dirty as f64 / rate).round() as u64),
         "heartbeat_age_secs": stats.get("t").and_then(Value::as_u64).map(|t| now.saturating_sub(t)),

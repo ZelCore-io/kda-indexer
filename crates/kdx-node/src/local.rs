@@ -26,7 +26,7 @@
 //! is [`LocalError::Invalid`]; only transport and HTTP errors are [`LocalError::Node`]. None
 //! is ever read as a zero balance.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use blake2::{Blake2b, Digest};
@@ -101,14 +101,37 @@ pub type LocalResult<T> = std::result::Result<Local<T>, LocalError>;
 
 /// The B-1 module name check: `name` or `namespace.name`, identifier characters only.
 pub fn valid_module(m: &str) -> bool {
-    fn ident(s: &str) -> bool {
-        let mut b = s.bytes();
-        matches!(b.next(), Some(c) if c.is_ascii_alphabetic() || c == b'_')
-            && b.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-    }
     let mut parts = m.splitn(2, '.');
     let first = parts.next().unwrap_or("");
-    ident(first) && parts.next().is_none_or(ident)
+    valid_ident(first) && parts.next().is_none_or(valid_ident)
+}
+
+/// One Pact identifier (a namespace, module or table name): identifier characters only, so
+/// it can be written into code as text.
+pub fn valid_ident(s: &str) -> bool {
+    let mut b = s.bytes();
+    matches!(b.next(), Some(c) if c.is_ascii_alphabetic() || c == b'_')
+        && b.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+/// Most keys one `keys` listing may answer ([`LocalClient::table_keys`]); a bigger table is
+/// refused whole (about 70 bytes a key: 250,000 keys is about 17 MB of answer). The largest
+/// token table measured on mainnet01 (`kaddex.kdx` chain 2, 2026-11-23) has 9,480 keys.
+pub const MAX_LISTED_KEYS: usize = 250_000;
+
+/// The failure message means the module is not deployed on this chain (Pact 5, measured on
+/// mainnet01: `Cannot find module: free.ba-t1`).
+pub fn is_no_module_message(msg: &str) -> bool {
+    msg.starts_with("Cannot find module: ")
+}
+
+/// The failure message means the module is on this chain but its table was never created
+/// there (Pact 5, measured on mainnet01: `(keys free.KAYC.token-table)` on chain 4 answers
+/// `Error during database operation: Table access failed because table
+/// free.KAYC_token-table was not found.`): the table has no keys.
+pub fn is_no_table_message(msg: &str) -> bool {
+    msg.starts_with("Error during database operation: Table access failed because table ")
+        && msg.ends_with(" was not found.")
 }
 
 /// The failure message means "no such row" (Pact 5 `No value found in table …`, Pact 4
@@ -258,6 +281,24 @@ impl LocalClient {
         self.call_timed(chain, code, data).await.0
     }
 
+    /// [`Self::call`] sent once, with its own `timeout` (the key listing, PR #27 H-1: no
+    /// retry inside the client; a timeout is [`NodeError::Timeout`]).
+    async fn call_once(
+        &self,
+        chain: u8,
+        code: &str,
+        data: Value,
+        timeout: Duration,
+    ) -> LocalResult<Value> {
+        let _p = self
+            .sem
+            .acquire()
+            .await
+            .map_err(|_| NodeError::Transport("local semaphore closed".into()))?;
+        self.limiter.acquire().await;
+        self.exchange(chain, code, data, Some(timeout)).await
+    }
+
     /// [`Self::call`] plus the seconds from the send (after the rate and concurrency waits)
     /// to the answer.
     async fn call_timed(&self, chain: u8, code: &str, data: Value) -> (LocalResult<Value>, f64) {
@@ -272,13 +313,24 @@ impl LocalClient {
         };
         self.limiter.acquire().await;
         let t0 = std::time::Instant::now();
-        let r = self.exchange(chain, code, data).await;
+        let r = self.exchange(chain, code, data, None).await;
         (r, t0.elapsed().as_secs_f64())
     }
 
-    async fn exchange(&self, chain: u8, code: &str, data: Value) -> LocalResult<Value> {
+    /// One exchange; `once`: a single attempt with that timeout.
+    async fn exchange(
+        &self,
+        chain: u8,
+        code: &str,
+        data: Value,
+        once: Option<Duration>,
+    ) -> LocalResult<Value> {
         let body = command(self.node.network(), chain, code, &data, now_secs());
-        let r = match self.node.local(chain, &body).await {
+        let sent = match once {
+            Some(t) => self.node.local_once(chain, &body, t).await,
+            None => self.node.local(chain, &body).await,
+        };
+        let r = match sent {
             Ok(r) => r,
             // An answer arrived but is not usable (not JSON, over the body cap): a property of
             // this call, not of the node's health.
@@ -412,6 +464,60 @@ impl LocalClient {
         }
     }
 
+    /// `(at 'code (describe-module (read-msg "m")))` with `data {"m": module}`: the module's
+    /// code on `chain`, absent when the module is not deployed there. Sent once, with
+    /// `timeout` (no retry inside the client: the caller paces its own retries).
+    pub async fn module_code(
+        &self,
+        chain: u8,
+        module: &str,
+        timeout: Duration,
+    ) -> LocalResult<String> {
+        check_module(module)?;
+        code_of(
+            self.call_once(
+                chain,
+                "(at 'code (describe-module (read-msg \"m\")))",
+                json!({ "m": module }),
+                timeout,
+            )
+            .await,
+        )
+    }
+
+    /// `(keys {module}.{table})`: every row key of a module's table on `chain`, at most
+    /// `max` (D3 gap groups 3 and 4: rows no tx names). The node allows it in `/local` for
+    /// any module's table and charges a flat 40,000 gas whatever the table's size (measured
+    /// on mainnet01, 2026-11-23: 4 keys and 9,480 keys alike), but the time grows with the
+    /// table (about 2,000 keys/s measured), so the read is sent once, with `timeout`: a table
+    /// the node cannot list in time is a [`NodeError::Timeout`], never retried here.
+    pub async fn table_keys(
+        &self,
+        chain: u8,
+        module: &str,
+        table: &str,
+        max: usize,
+        timeout: Duration,
+    ) -> LocalResult<Vec<String>> {
+        check_module(module)?;
+        if !valid_ident(table) {
+            return Err(LocalError::Skipped("table name fails the B-1 check".into()));
+        }
+        match self
+            .call_once(
+                chain,
+                &format!("(keys {module}.{table})"),
+                json!({}),
+                timeout,
+            )
+            .await
+        {
+            Ok(r) => keys_of(r, max),
+            Err(LocalError::Failure(m)) if is_no_table_message(&m) => Ok(Local::Absent),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `(describe-keyset (read-msg "k"))` with `data {"k": name}`: the keyset JSON, or null
     /// when it is over [`MAX_GUARD_JSON`] bytes (F-14).
     pub async fn describe_keyset(&self, chain: u8, name: &str) -> LocalResult<Value> {
@@ -494,6 +600,57 @@ impl LocalClient {
         let r = self.call(chain, &code, json!({ "t": token_id })).await?;
         token_info_of(r, token_id)
     }
+}
+
+/// A `describe-module` code answer: the code text; a module not on the chain is absent.
+fn code_of(r: LocalResult<Value>) -> LocalResult<String> {
+    match r {
+        Ok(Local::Found {
+            value: Value::String(code),
+            height,
+            prev_hash,
+        }) => Ok(Local::Found {
+            value: code,
+            height,
+            prev_hash,
+        }),
+        Ok(Local::Found { .. }) => Err(invalid("describe-module: code is not a string")),
+        Ok(Local::Absent) => Ok(Local::Absent),
+        Err(LocalError::Failure(m)) if is_no_module_message(&m) => Ok(Local::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+/// A `keys` answer: every key a string, at most `max` of them (else the whole answer is
+/// unusable: a partial listing would look complete).
+fn keys_of(r: Local<Value>, max: usize) -> LocalResult<Vec<String>> {
+    let (value, height, prev_hash) = match r {
+        Local::Absent => return Ok(Local::Absent),
+        Local::Found {
+            value,
+            height,
+            prev_hash,
+        } => (value, height, prev_hash),
+    };
+    let Value::Array(items) = value else {
+        return Err(invalid("keys: not a list"));
+    };
+    if items.len() > max {
+        return Err(invalid(&format!("keys: {} keys, over {max}", items.len())));
+    }
+    let keys = items
+        .into_iter()
+        .map(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| invalid("keys: a key is not a string"))?;
+    Ok(Local::Found {
+        value: keys,
+        height,
+        prev_hash,
+    })
 }
 
 /// F-14: a guard whose JSON is over [`MAX_GUARD_JSON`] bytes becomes null; true when it did.
@@ -871,6 +1028,82 @@ mod tests {
         let absent = json!({"result": {"status": "failure",
             "error": {"message": "No value found in table coin_coin-table for key: x"}}});
         assert_eq!(classify(&absent).unwrap(), Local::Absent);
+    }
+
+    /// D3 gap groups 3 and 4 (KDA-03 node, 2026-11-23): `describe-module` answers the code;
+    /// a module not deployed on the chain is absent, not a failure.
+    #[test]
+    fn module_code_answers() {
+        let meta = json!({"blockHeight": 11, "prevBlockHash": "H10"});
+        let ok = json!({"result": {"status": "success",
+            "data": "(module KAYC GOVERNANCE (deftable token-table:{token-schema}))"},
+            "metaData": meta});
+        let Local::Found { value, height, .. } = code_of(classify(&ok)).unwrap() else {
+            panic!("found")
+        };
+        assert!(value.starts_with("(module KAYC"));
+        assert_eq!(height, 10);
+        let gone = json!({"result": {"status": "failure", "error": {"callStack": [],
+            "type": "EvalError", "message": "Cannot find module: free.ba-t1",
+            "info": "<toplevel>:0"}}});
+        assert_eq!(code_of(classify(&gone)).unwrap(), Local::Absent);
+        let num =
+            json!({"result": {"status": "success", "data": 1}, "metaData": {"blockHeight": 2}});
+        assert!(matches!(
+            code_of(classify(&num)),
+            Err(LocalError::Invalid(_))
+        ));
+    }
+
+    /// `(keys free.shatter.token-table)` on chain 0 answered these four keys (gas 40003); a
+    /// non-string key or a listing over the cap is unusable, never cut short.
+    #[test]
+    fn table_keys_answers() {
+        let meta = json!({"blockHeight": 11, "prevBlockHash": "H10"});
+        let four = [
+            "GeorgePublish",
+            "ROOT",
+            "k:0d39e69d5a71e4abf926c84cc12fcef7eb7e993ce062a77dc692c9715b3b7ad4",
+            "k:acca57aef1ef1f99e9948fa811c3c8c187af18f9424071a6cec956ea5d3737c6",
+        ];
+        let ok = json!({"result": {"status": "success", "data": four}, "metaData": meta});
+        let Local::Found { value, .. } = keys_of(classify(&ok).unwrap(), 4).unwrap() else {
+            panic!("found")
+        };
+        assert_eq!(value, four);
+        assert!(matches!(
+            keys_of(classify(&ok).unwrap(), 3),
+            Err(LocalError::Invalid(m)) if m.contains("over 3")
+        ));
+        let mixed = json!({"result": {"status": "success", "data": ["a", 1]}, "metaData": meta});
+        assert!(matches!(
+            keys_of(classify(&mixed).unwrap(), 4),
+            Err(LocalError::Invalid(_))
+        ));
+    }
+
+    /// `free.KAYC` is deployed on chain 4 but its table was never created there.
+    #[test]
+    fn a_table_never_created_has_no_keys() {
+        assert!(is_no_table_message(
+            "Error during database operation: Table access failed because table \
+             free.KAYC_token-table was not found."
+        ));
+        assert!(!is_no_table_message(
+            "Error during database operation: Table access failed because table x was locked"
+        ));
+        assert!(!is_no_table_message("Module admin necessary for operation"));
+    }
+
+    /// The table name goes into the code as text: identifier characters only.
+    #[test]
+    fn table_names_are_checked() {
+        assert!(valid_ident("token-table"));
+        assert!(valid_ident("coin_table2"));
+        assert!(!valid_ident("t) (coin.transfer"));
+        assert!(!valid_ident("ns.t"));
+        assert!(!valid_ident(""));
+        assert!(!valid_ident("1t"));
     }
 
     #[test]

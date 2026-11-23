@@ -271,8 +271,18 @@ impl NodeClient {
         endpoint: &'static str,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<(u16, Bytes)> {
+        self.send_tries(endpoint, 3, build).await
+    }
+
+    /// [`Self::send`] with at most `tries` attempts (1: no retry).
+    async fn send_tries(
+        &self,
+        endpoint: &'static str,
+        tries: u32,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<(u16, Bytes)> {
         let mut last: Option<NodeError> = None;
-        for attempt in 0..3u32 {
+        for attempt in 0..tries.max(1) {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 << (attempt - 1))).await;
             }
@@ -322,7 +332,7 @@ impl NodeClient {
                 }
             };
             self.record(endpoint, status, t0.elapsed().as_secs_f64());
-            if status >= 500 && attempt < 2 {
+            if status >= 500 && attempt + 1 < tries {
                 last = Some(NodeError::Http {
                     status,
                     body_prefix: body_prefix(&body),
@@ -340,7 +350,17 @@ impl NodeClient {
         endpoint: &'static str,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<Value> {
-        let (status, body) = self.send(endpoint, build).await?;
+        self.json_tries(endpoint, 3, build).await
+    }
+
+    /// [`Self::json`] with at most `tries` attempts.
+    async fn json_tries(
+        &self,
+        endpoint: &'static str,
+        tries: u32,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Value> {
+        let (status, body) = self.send_tries(endpoint, tries, build).await?;
         if !(200..300).contains(&status) {
             return Err(NodeError::Http {
                 status,
@@ -670,6 +690,17 @@ impl NodeClient {
         self.json("local", |h| h.post(url.clone()).json(cmd)).await
     }
 
+    /// [`Self::local`] sent once (no retry), with `timeout` for this request in place of the
+    /// client's (PR #27 H-1: a heavy read the node cannot answer in time must cost one request,
+    /// not three, and the caller decides when to try again).
+    pub async fn local_once(&self, chain: u8, cmd: &Value, timeout: Duration) -> Result<Value> {
+        let url = self.chain_url(chain, "pact/api/v1/local")?;
+        self.json_tries("local", 1, |h| {
+            h.post(url.clone()).json(cmd).timeout(timeout)
+        })
+        .await
+    }
+
     /// `GET /header/updates` (SSE). Yields the JSON payload of each `BlockHeader` event and
     /// ends when the connection drops; the caller reconnects.
     pub async fn header_updates(
@@ -783,6 +814,8 @@ mod tests {
         RawThenHang(Vec<u8>),
         /// Read the request, never answer.
         Hang,
+        /// Answer after a pause.
+        Slow(Duration, String),
     }
 
     /// One-request-per-connection HTTP mock; `f` gets the request line's target
@@ -824,6 +857,14 @@ mod tests {
                             std::thread::sleep(Duration::from_secs(30));
                         }
                         Reply::Hang => std::thread::sleep(Duration::from_secs(30)),
+                        Reply::Slow(d, b) => {
+                            std::thread::sleep(d);
+                            let _ = write!(
+                                s,
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                                b.len()
+                            );
+                        }
                     }
                 });
             }
@@ -947,5 +988,27 @@ mod tests {
             within(c.header_updates()).await,
             Err(NodeError::Http { status: 500, .. })
         ));
+    }
+
+    /// PR #27 H-1: the key listing's `/local` read is sent once, with its own timeout: a node
+    /// that never answers costs one request and that timeout (the generic `local` retries a
+    /// timeout three times), and a slow answer inside it is taken even past the client's
+    /// default timeout (300 ms here).
+    #[tokio::test]
+    async fn local_once_sends_once_with_its_own_timeout() {
+        let (base, n) = mock(|_, _| Reply::Hang);
+        let c = client(base);
+        let t0 = Instant::now();
+        let r = within(c.local_once(0, &json!({}), Duration::from_millis(200))).await;
+        assert!(matches!(r, Err(NodeError::Timeout)), "{r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        let (base, n) = mock(|_, _| Reply::Slow(Duration::from_millis(600), "{\"a\":1}".into()));
+        let c = client(base);
+        let v = within(c.local_once(0, &json!({}), Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(v, json!({"a": 1}));
+        assert_eq!(n.load(Ordering::SeqCst), 1);
     }
 }

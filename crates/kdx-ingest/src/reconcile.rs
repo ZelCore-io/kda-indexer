@@ -1329,7 +1329,20 @@ async fn run_with(
             return Ok(());
         }
     }
-    let local = LocalClient::new(node, o.local);
+    let local = Arc::new(LocalClient::new(node, o.local));
+    // D3 gap groups 3 and 4: rows no tx names, from the node's key listing, in its own task
+    // (PR #27 H-1: a slow listing read never holds up this loop). It shares the `/local`
+    // limits and ends with this loop (the guard cancels it on every return).
+    let keylist_stop = stop.child_token();
+    let _keylist_guard = keylist_stop.clone().drop_guard();
+    if o.seed {
+        tokio::spawn(crate::keylist::run(
+            ctx.clone(),
+            local.clone(),
+            o.caps,
+            keylist_stop,
+        ));
+    }
     let mut nft_cursor: Option<Vec<u8>> = None;
     let mut details_cursor: Option<Vec<u8>> = None;
     let mut backoff: Option<Duration> = None;
@@ -1666,55 +1679,72 @@ pub(crate) mod tests {
     /// reads tip height 10 (`blockHeight` 11) and names the tip's hash as `prevBlockHash`: the
     /// text in `prev`, read per answer (empty: no `prevBlockHash` at all). One
     /// connection at a time (`Connection: close`).
+    /// `describe-module` reads the fake node received (all tests of this module).
+    static DESCRIBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     pub(crate) fn fake_node(prev: Arc<Mutex<String>>) -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         std::thread::spawn(move || {
             for s in l.incoming() {
                 let Ok(mut s) = s else { return };
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 4096];
-                let (head_end, len) = loop {
-                    let n = s.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break (0, 0);
+                let prev = prev.clone();
+                // One thread per connection: a hung answer holds up no other.
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let (head_end, len) = loop {
+                        let n = s.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break (0, 0);
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (i + 4, len);
+                        }
+                    };
+                    while head_end > 0 && buf.len() < head_end + len {
+                        let n = s.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
                     }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
-                        let len = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        break (i + 4, len);
+                    let req: Value =
+                        serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                    let cmd: Value = req
+                        .get("cmd")
+                        .and_then(Value::as_str)
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or(Value::Null);
+                    let acct = cmd
+                        .pointer("/payload/exec/data/a")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let m = cmd.pointer("/payload/exec/data/m").and_then(Value::as_str);
+                    let code = cmd
+                        .pointer("/payload/exec/code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if code.starts_with("(at 'code (describe-module") {
+                        // PR #27 H-1: the key listing's read hangs (a table too big to answer).
+                        DESCRIBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_secs(30));
+                        return;
                     }
-                };
-                while head_end > 0 && buf.len() < head_end + len {
-                    let n = s.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                }
-                let req: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
-                let cmd: Value = req
-                    .get("cmd")
-                    .and_then(Value::as_str)
-                    .and_then(|c| serde_json::from_str(c).ok())
-                    .unwrap_or(Value::Null);
-                let acct = cmd
-                    .pointer("/payload/exec/data/a")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let m = cmd.pointer("/payload/exec/data/m").and_then(Value::as_str);
-                let prev = prev.lock().unwrap().clone();
-                let meta = if prev.is_empty() {
-                    json!({"blockHeight": 11})
-                } else {
-                    json!({"blockHeight": 11, "prevBlockHash": prev})
-                };
-                let body = if let Some(m) = m {
+                    let prev = prev.lock().unwrap().clone();
+                    let meta = if prev.is_empty() {
+                        json!({"blockHeight": 11})
+                    } else {
+                        json!({"blockHeight": 11, "prevBlockHash": prev})
+                    };
+                    let body = if let Some(m) = m {
                     // The fungible check: only `free.tok` lists fungible-v2.
                     json!({"result": {"status": "success", "data": m == "free.tok"},
                            "metaData": meta.clone()})
@@ -1749,12 +1779,13 @@ pub(crate) mod tests {
                            "metaData": meta.clone()})
                 }
                 .to_string();
-                let _ = write!(
+                    let _ = write!(
                     s,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                      Connection: close\r\n\r\n{body}",
                     body.len()
                 );
+                });
             }
         });
         format!("http://{addr}")
@@ -2829,6 +2860,71 @@ pub(crate) mod tests {
         }
         stop.cancel();
         task.await.unwrap().unwrap();
+    }
+
+    /// PR #27 H-1: the key listing runs in its own task. While its `describe-module` read of
+    /// a tracked token hangs, the loop still reconciles a dirty row, and a stop ends the run
+    /// at once (the hung read is not awaited).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_key_listing_read_does_not_hold_up_the_reconcile() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["k:a", "k:b"]);
+        let segdir = dir.path().join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut txn,
+            kdx_hot::Stage::Tail,
+            0,
+            1,
+            kdx_types::Hash32([1; 32]),
+        )
+        .unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let tok = dict.intern(DictKind::Module, "free.slow");
+        dict.persist(&mut txn).unwrap();
+        balances::note_token(&mut txn, tok, 5).unwrap();
+        txn.commit().unwrap();
+        let before = DESCRIBES.load(SeqCst);
+        let (ctx, _) = client(dir.path(), &hot);
+        let node = ctx.node.clone();
+        let o = ReconcileOpts {
+            local: LocalOpts {
+                rps: 0,
+                concurrency: 4,
+            },
+            batch: 10,
+            seed: true,
+            caps: Caps::default(),
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run_with(
+            Arc::new(ctx),
+            node,
+            o,
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        until("the key listing's read", || DESCRIBES.load(SeqCst) > before).await;
+        // A new dirty row while that read hangs (30 s, past `until`'s 20 s).
+        let mut txn = hot.rw().unwrap();
+        balances::mark_dirty(&mut txn, ids[1], coin, 0, 10).unwrap();
+        txn.commit().unwrap();
+        let t0 = Instant::now();
+        until("the dirty rows reconciled", || {
+            assert!(!task.is_finished(), "run ended");
+            balances::dirty_count(&hot.ro().unwrap()).unwrap() == 0
+        })
+        .await;
+        // Inline, the hung read (3 client tries of the 5 s timeout) would hold the loop 15 s.
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends at once on stop")
+            .unwrap()
+            .unwrap();
     }
 
     /// M-11: a block applied above a chain's mark watermark + 1 (blocks applied without marks)
