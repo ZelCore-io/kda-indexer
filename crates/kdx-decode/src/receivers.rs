@@ -236,7 +236,7 @@ pub fn injected_miner_receivers(miner: &str) -> Vec<String> {
 pub struct TokenReceivers {
     /// From the cross-chain and `exec` rules.
     pub pairs: Vec<(String, String)>,
-    /// From events (rule 3), at most [`MAX_EVENT_PAIRS_PER_TX`]; never coin.
+    /// From events (rule 3), at most [`event_pair_cap`] of the tx's events; never coin.
     pub event_pairs: Vec<(String, String)>,
     /// The module each `event_pairs` entry is charged to (same index): the event's emitter, or
     /// the token an `exec` calls. The pass budgets its per-pass cap per emitter.
@@ -258,9 +258,25 @@ pub struct TokenReceivers {
     pub discovered_too_long: u32,
 }
 
-/// Event-derived candidates kept per tx (security review: chain data must not amplify the
-/// pass). Real credits name a handful of accounts per tx.
+/// Event-derived candidates kept per tx, before the per-event allowance (security review:
+/// chain data must not amplify the pass). Also the most strings kept from one event.
 pub const MAX_EVENT_PAIRS_PER_TX: usize = 64;
+/// Extra event-derived candidates each event with a candidate adds to its tx's cap. A batch
+/// tx (D3 gap group 1: a kaddex migration WRAP tx credits 45 accounts in 90 events, two rows
+/// each) names a few accounts per event; a hostile tx pays gas for every event it emits.
+pub const EVENT_PAIRS_PER_EVENT: usize = 4;
+/// Hard ceiling of event-derived candidates per tx, whatever its event count.
+pub const MAX_EVENT_PAIRS_CEILING: usize = 1024;
+
+/// The event-derived candidates a tx with `events` candidate-bearing events may keep:
+/// [`MAX_EVENT_PAIRS_PER_TX`] plus [`EVENT_PAIRS_PER_EVENT`] per event, at most
+/// [`MAX_EVENT_PAIRS_CEILING`]. One event's strings alone never raise it.
+pub fn event_pair_cap(events: usize) -> usize {
+    events
+        .saturating_mul(EVENT_PAIRS_PER_EVENT)
+        .saturating_add(MAX_EVENT_PAIRS_PER_TX)
+        .min(MAX_EVENT_PAIRS_CEILING)
+}
 /// Exec-derived token candidates kept per tx (own budget, see [`TokenReceivers::exec_pairs`]).
 pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
 /// Prefix of the budget key of exec-derived rows: `exec:<sender>` (a module name holds no `:`).
@@ -311,11 +327,11 @@ impl TokenReceivers {
         }
     }
     /// A capped candidate (events, and token rows of an `exec`), charged to `emitter`.
-    fn push_event(&mut self, account: &str, module: &str, emitter: &str) {
+    fn push_event(&mut self, account: &str, module: &str, emitter: &str, cap: usize) {
         if module != "coin"
             && account_like(account)
             && readable_module(module)
-            && self.event_pairs.len() < MAX_EVENT_PAIRS_PER_TX
+            && self.event_pairs.len() < cap
             && !self
                 .event_pairs
                 .iter()
@@ -385,8 +401,8 @@ pub struct D3Event {
     pub transfer: bool,
     /// `fungible-v2` modref targets in the params (coin excluded), at most 64.
     pub refs: Vec<String>,
-    /// Distinct [`account_like`] string params outside modrefs, at most
-    /// [`MAX_EVENT_PAIRS_PER_TX`] (the tx's event rows are capped at that anyway).
+    /// Distinct [`account_like`] string params outside modrefs and amounts, at most
+    /// [`MAX_EVENT_PAIRS_PER_TX`].
     pub strings: Vec<String>,
 }
 
@@ -483,7 +499,7 @@ pub fn d3_candidates(
         });
         let mut strings = Vec::new();
         param_strings(ev.params, &mut strings);
-        for s in &strings {
+        for s in strings.iter().filter(|s| !amount_text(s)) {
             push_distinct(&mut d.strings, s, MAX_EVENT_PAIRS_PER_TX);
         }
         // An event with no string can give no row; one with no ref and a TRANSFER neither.
@@ -548,8 +564,8 @@ pub fn d3_candidates(
 ///    of `result.data` (a receiver built at run time and returned, D3 b), for every tracked
 ///    token `<m>` the code calls (`<m>.fn`; from the events fork on only one that emitted
 ///    nothing in the tx), and for coin below the events fork.
-/// 3. **Events** (any height, into `event_pairs`, capped at [`MAX_EVENT_PAIRS_PER_TX`], never
-///    coin): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
+/// 3. **Events** (any height, into `event_pairs`, capped at [`event_pair_cap`] of the tx's
+///    candidate events, never coin; amounts are never candidates): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
 ///    …) gives its [`account_like`] params for that token; an event whose params hold a
 ///    `fungible-v2` module reference gives them for the referenced module when the emitter is
 ///    that module, a module of the same governed namespace (D3 d: `kaddex.skdx` is only ever
@@ -560,6 +576,7 @@ pub fn d3_candidates(
 /// Rows and discoveries of a module `/local` cannot read ([`readable_module`]) are dropped.
 pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenReceivers {
     let mut r = TokenReceivers::default();
+    let cap = event_pair_cap(c.events.len());
     if let Some((m, a)) = &c.xchain {
         if let Some(a) = a {
             r.push(a, m);
@@ -586,7 +603,7 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
         }
         for m in targets {
             for s in &ev.strings {
-                r.push_event(s, m, &ev.module);
+                r.push_event(s, m, &ev.module, cap);
             }
         }
     }
@@ -704,15 +721,28 @@ fn modrefs(v: &Value, f: &mut impl FnMut(&str)) {
     }
 }
 
-/// String params at any depth, module references skipped.
+/// String params at any depth, module references and Pact numbers (`{"decimal": ..}`,
+/// `{"int": ..}`) skipped.
 fn param_strings(v: &Value, out: &mut Vec<String>) {
     match v {
         Value::String(s) => out.push(s.clone()),
         Value::Array(a) => a.iter().for_each(|x| param_strings(x, out)),
         Value::Object(m) if m.contains_key("refSpec") => {}
+        Value::Object(m)
+            if m.len() == 1 && (m.contains_key("decimal") || m.contains_key("int")) => {}
         Value::Object(m) => m.values().for_each(|x| param_strings(x, out)),
         _ => {}
     }
+}
+
+/// A plain number text (`-`? digits, `.` digits?), as an amount param prints: never an account
+/// name in an event (D3 gap group 1: amounts used up the per-tx cap). A legacy account named
+/// only by digits is still marked by its TRANSFER postings and the exec rule.
+fn amount_text(s: &str) -> bool {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let (i, f) = s.split_once('.').unwrap_or((s, "0"));
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    digits(i) && digits(f)
 }
 
 /// [`d3_candidates`] of a stored record (none for the coinbase; an error for a cmd that is

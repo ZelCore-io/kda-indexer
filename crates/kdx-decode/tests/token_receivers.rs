@@ -10,8 +10,8 @@
 //! - (d) `kaddex.alchemist.WRAP` minting `kaddex.skdx`, named only by a `fungible-v2` modref.
 
 use kdx_decode::receivers::{
-    injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_PER_TX,
-    MAX_EXEC_PAIRS_PER_TX,
+    event_pair_cap, injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_CEILING,
+    MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX,
 };
 use serde_json::{json, Value};
 
@@ -247,7 +247,8 @@ fn a_hostile_event_is_capped_and_never_gives_coin_rows() {
         r.pairs.is_empty() && r.event_pairs.is_empty() && r.discovered.is_empty(),
         "{r:?}"
     );
-    // A tracked token's event: at most the per-tx cap, and a coin modref gives no coin rows.
+    // A tracked token's event: at most one event's strings (within the tx's cap), and a coin
+    // modref gives no coin rows.
     let evs = json!([ev("free.wiza", "SPAM", json!([refs, strings]))]);
     let o = out(json!("ok"), evs, Value::Null);
     let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
@@ -257,6 +258,7 @@ fn a_hostile_event_is_capped_and_never_gives_coin_rows() {
         "{}",
         r.event_pairs.len()
     );
+    assert!(r.event_pairs.len() <= event_pair_cap(1));
     assert!(!r.event_pairs.iter().any(|(_, m)| m == "coin"));
     assert!(!r.discovered.iter().any(|m| m == "coin"));
 }
@@ -402,4 +404,88 @@ fn modref_discovery_is_capped_and_only_from_its_module_or_governed_namespace() {
         !r.event_pairs.iter().any(|(_, m)| m.starts_with("kaddex.")),
         "{r:?}"
     );
+}
+
+/// D3 gap group 1: a kaddex staking-migration batch tx (chain 2, height 2,895,667, 136
+/// events): the gas `coin.TRANSFER`, then 45 × (`kaddex.alchemist.WRAP` [skdx modref, amount,
+/// "kdx-bank", account], `kaddex.kdx.WRAP` ["kaddex.skdx", "kdx-bank", account, amount]), then
+/// 45 × `aggregator.PRIVILEGE-GUARD`. Amounts are `{"decimal": ..}` objects. The old per-tx cap
+/// of 64 pairs, with each amount counted as an account, kept only the first 21 accounts.
+#[test]
+fn a_batch_wrap_tx_keeps_every_account() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(kaddex.aggregator.migrate)"}}});
+    let accts: Vec<String> = (0..45).map(|i| format!("k:{i:064x}")).collect();
+    let mut evs = vec![ev("coin", "TRANSFER", json!([SRC, "k:miner", 0.0001]))];
+    for (i, a) in accts.iter().enumerate() {
+        let amt = json!({"decimal": format!("{}.000811139005", 100 + i)});
+        evs.push(ev(
+            "kaddex.alchemist",
+            "WRAP",
+            json!([modref(Some("kaddex"), "skdx"), amt, "kdx-bank", a]),
+        ));
+        evs.push(ev(
+            "kaddex.kdx",
+            "WRAP",
+            json!(["kaddex.skdx", "kdx-bank", a, amt]),
+        ));
+    }
+    for a in &accts {
+        evs.push(ev("kaddex.aggregator", "PRIVILEGE-GUARD", json!([a, true])));
+    }
+    assert_eq!(evs.len(), 136);
+    let o = out(json!("ok"), Value::Array(evs), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 2_895_667, MAINNET01, &tokens);
+    let p = pairs(&r.event_pairs);
+    for a in &accts {
+        assert!(p.contains(&(a.as_str(), "kaddex.skdx")), "skdx {a}");
+        assert!(p.contains(&(a.as_str(), "kaddex.kdx")), "kdx {a}");
+    }
+    // Amounts are not account names.
+    assert!(
+        !p.iter().any(|(a, _)| a.ends_with(".000811139005")),
+        "{p:?}"
+    );
+    assert!(p.len() <= 45 * 2 + 4, "{}", p.len());
+}
+
+/// Amount params, as `{"decimal"}`/`{"int"}` objects or numeric strings, are never candidates.
+#[test]
+fn event_amounts_are_not_accounts() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(x)"}}});
+    let evs = json!([ev(
+        "kaddex.kdx",
+        "UNWRAP",
+        json!(["kdx-staking", ACC, {"decimal": "123.5"}, {"int": 12345}, "1000.25", "-42"])
+    )]);
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!("ok"), evs, Value::Null),
+        5_000_000,
+        MAINNET01,
+        &tokens,
+    );
+    assert_eq!(
+        pairs(&r.event_pairs),
+        vec![("kdx-staking", "kaddex.kdx"), (ACC, "kaddex.kdx")]
+    );
+}
+
+/// A hostile tx with many events of junk strings stays under the hard ceiling; the cap grows
+/// only with the tx's events (each costs gas), never with one event's strings.
+#[test]
+fn many_hostile_events_stay_under_the_ceiling() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(free.evil.go)"}}});
+    let evs: Vec<Value> = (0..2000)
+        .map(|e| {
+            let strings: Vec<Value> = (0..64)
+                .map(|i| json!(format!("k:victim-{e:04}-{i:02}")))
+                .collect();
+            ev("free.wiza", "SPAM", json!(strings))
+        })
+        .collect();
+    let o = out(json!("ok"), Value::Array(evs), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
+    assert_eq!(r.event_pairs.len(), MAX_EVENT_PAIRS_CEILING);
+    assert_eq!(event_pair_cap(2000), MAX_EVENT_PAIRS_CEILING);
+    assert!(event_pair_cap(1) < 100);
 }

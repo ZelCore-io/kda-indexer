@@ -728,8 +728,11 @@ Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot re
 
 Only successful txs give candidates. The injected-miner rule reads the block's miner data of
 coinbases below the coinbase injection fix (mainnet 121,452), on that block's chain only.
-Rows from events and from an exec's token calls are capped: 64 of each per tx (events are
-taken first), then per pass a budget of distinct rows per tracked token (2,000,000,
+Rows from events and from an exec's token calls are capped per tx: events give at most 64
+rows plus 4 for each event with a candidate, never more than 1,024 (a batch tx such as a
+kaddex staking-migration WRAP tx credits 45 accounts in one tx), at most 64 strings from one
+event; an exec gives at most 64 (events are taken first). Amount params (`{"decimal": ..}`,
+`{"int": ..}`, plain number strings) are never candidates. Then per pass a budget of distinct rows per tracked token (2,000,000,
 `KDX_D3_MAX_EVENT_CANDIDATES` for the CLI; a repeated row costs nothing), one shared bucket for
 all untracked emitters (2,000,000) and a global ceiling (20,000,000). Rows from an `exec`'s token
 calls are charged to the tx's sender (100,000 per sender, 2,000,000 per pass), never to the
