@@ -817,12 +817,12 @@ chains that the reconcile has not read yet. A chain where the module is not depl
 table was never created, or whose module code has no ledger table (for example a ledger field
 not named `balance`, a known gap), lists nothing and is looked at again at the next sweep.
 
-Fail-closed, per (token, chain): a read timeout, a listing over 150,000 keys, an unusable
+Fail-closed, per (token, chain): a `keys` read timeout, a listing over 150,000 keys, an unusable
 answer or a refused `keys` read marks nothing for that chain. It
 is logged (`balances: key listing failed`, with module, chain, reason and the retry pause),
 and only that chain is listed again: after 1 hour, doubling with each failure in a row, at
 most every 7 days; the token goes to the back of the queue meanwhile. A connection or HTTP
-error pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
+error, or a timeout of the small `describe-module` read (the node stalls, not the token), pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
 in a row. A token that runs up 32 chain failures with no clean round between is marked
 unlistable (logged at WARN, `--status` `keylist_tokens.unlistable`) and left alone for 30
 days, then tried once more with a fresh budget. The listing waits, like the receivers pass,

@@ -21,10 +21,11 @@
 //!   balances_keylist/<module>`) is kept per step, so a restart resumes.
 //! - A module with no ledger table on a chain lists nothing there, like a module not deployed
 //!   (no failure; looked at again at the next sweep).
-//! - Failures are per `(token, chain)`: a timeout, an unusable or over-cap answer or a pact
+//! - Failures are per `(token, chain)`: a `keys` timeout, an unusable or over-cap answer or a pact
 //!   failure marks nothing for that chain, is logged and counted, and only that chain is
 //!   listed again, after [`RETRY_BASE_SECS`] doubling with each failure in a row up to
-//!   [`RETRY_CAP_SECS`]. A connection or HTTP error pauses the whole listing ([`NODE_PAUSE`],
+//!   [`RETRY_CAP_SECS`]. A connection or HTTP error, or a `describe-module` timeout (small code: the node is
+//!   stalling, not the token), pauses the whole listing ([`NODE_PAUSE`],
 //!   doubling to [`NODE_PAUSE_MAX`]) and counts against the chain after [`NODE_TRIES`] in a
 //!   row. A failed token goes to the back of the queue, so one token cannot hold it.
 //! - Budget: a token that runs up [`FAIL_BUDGET`] chain failures with no clean round between
@@ -596,11 +597,13 @@ fn now_unix() -> u32 {
         .map_or(0, |d| d.as_secs() as u32)
 }
 
-/// A node error of a listing read: a timeout is the token's (its table may be too big to
-/// list in time, H-1); any other is the node's.
-fn node_result(what: &str, e: NodeError) -> ChainResult {
+/// A node error of a listing read. `token_slow`: a timeout of a `keys` read is the token's (its
+/// table may be too big to list in time, H-1). A `describe-module` timeout (the module code is
+/// small and bounded) and any other error are the node's, so a node that hangs pauses the
+/// listing instead of burning the budgets of the tokens (PR #27 R-1).
+fn node_result(what: &str, e: NodeError, token_slow: bool) -> ChainResult {
     match e {
-        NodeError::Timeout => ChainResult::Failed(format!("{what}: timeout")),
+        NodeError::Timeout if token_slow => ChainResult::Failed(format!("{what}: timeout")),
         e => ChainResult::Node(format!("{what}: {e}")),
     }
 }
@@ -619,7 +622,7 @@ async fn list_chain(
     let code = match local.module_code(chain, name, timeout).await {
         Ok(Local::Absent) => return Ok(ChainResult::Done(Marked::default())),
         Ok(Local::Found { value, .. }) => value,
-        Err(LocalError::Node(e)) => return Ok(node_result("describe-module", e)),
+        Err(LocalError::Node(e)) => return Ok(node_result("describe-module", e, false)),
         Err(e) => return Ok(ChainResult::Failed(format!("describe-module: {e}"))),
     };
     let tables = ledger_tables(&code);
@@ -637,7 +640,7 @@ async fn list_chain(
                 lists.push((value, u32::try_from(height).unwrap_or(u32::MAX)))
             }
             Ok(Local::Absent) => {}
-            Err(LocalError::Node(e)) => return Ok(node_result(&format!("keys {t}"), e)),
+            Err(LocalError::Node(e)) => return Ok(node_result(&format!("keys {t}"), e, true)),
             Err(e) => return Ok(ChainResult::Failed(format!("keys {t}: {e}"))),
         }
     }
@@ -990,6 +993,16 @@ mod tests {
         tokens: &[&str],
         answer: Arc<Answer>,
     ) -> (Ctx, LocalClient, Vec<u32>, Arc<AtomicUsize>) {
+        setup_chains(dir, tokens, answer, 2)
+    }
+
+    /// [`setup`] with a graph of chains `0..chains`.
+    fn setup_chains(
+        dir: &std::path::Path,
+        tokens: &[&str],
+        answer: Arc<Answer>,
+        chains: u8,
+    ) -> (Ctx, LocalClient, Vec<u32>, Arc<AtomicUsize>) {
         let hot = Arc::new(HotStore::open(&dir.join("hot"), Geometry::default()).unwrap());
         let mut txn = hot.rw().unwrap();
         let mut d = HotDict::load(&txn).unwrap();
@@ -1020,7 +1033,7 @@ mod tests {
         let info = NodeInfo {
             node_version: String::new(),
             chainweb_version: "mainnet01".into(),
-            graph_history: vec![(0, vec![0, 1])],
+            graph_history: vec![(0, (0..chains).collect())],
             raw: Value::Null,
         };
         let ctx = Ctx {
@@ -1507,7 +1520,8 @@ mod tests {
             (1, 0, 1)
         );
         let first = st.chains[0].retry_at;
-        assert!(first >= st.listed_at + RETRY_BASE_SECS);
+        // (`listed_at` is read a moment after the failure's `now`: allow a second tick.)
+        assert!(first + 2 >= st.listed_at + RETRY_BASE_SECS);
         // Not due again before its pause; then a retry round reads chain 0 only.
         kl.refreshed = None;
         kl.next_at = None;
@@ -1530,7 +1544,7 @@ mod tests {
         assert_eq!(st.listed_at, back.listed_at, "a retry round is no sweep");
     }
 
-    /// H-1: a junk token (every read times out) goes to the back of the queue after each
+    /// H-1: a junk token (every `keys` read times out) goes to the back of the queue after each
     /// failure, so a good token behind it is listed first; once over its budget it is
     /// unlistable, shown by `--status`, and not due again for `UNLISTABLE_SECS`.
     #[tokio::test]
@@ -1539,11 +1553,9 @@ mod tests {
         let answer: Arc<Answer> = Arc::new(move |_, code, data| {
             let m = data.get("m").and_then(Value::as_str).unwrap_or("");
             match (code, m) {
-                (c, "free.junk") if c.contains("describe-module") => {
-                    Some(json!({"sleep_ms": 2_000}))
-                }
                 (c, _) if c.contains("describe-module") => ok(json!(KAYC)),
                 ("(keys free.good.token-table)", _) => ok(json!(["ROOT"])),
+                ("(keys free.junk.token-table)", _) => Some(json!({"sleep_ms": 2_000})),
                 _ => panic!("unexpected call {code}"),
             }
         });
@@ -1590,6 +1602,38 @@ mod tests {
         kl.refreshed = None;
         kl.next_at = None;
         assert!(!step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap());
+    }
+
+    /// R-1: a node that hangs instead of refusing connections must not burn the failure
+    /// budget of a token on 20 chains. A `describe-module` timeout is a node error (the pause
+    /// and the slow charge after `NODE_TRIES`), not the token's; two hours of such a stall
+    /// (90 s per read plus the pauses, simulated) leave the token far from `FAIL_BUDGET`.
+    #[tokio::test]
+    async fn a_hung_node_for_two_hours_does_not_make_a_token_unlistable() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |_, _, _| Some(json!({"sleep_ms": 2_000})));
+        let (ctx, local, ids, _) = setup_chains(dir.path(), &["free.wide"], answer, 20);
+        let mut kl = KeyList {
+            read_timeout: Duration::from_millis(50),
+            ..KeyList::default()
+        };
+        let (mut sim, two_hours) = (Duration::ZERO, Duration::from_secs(2 * 3600));
+        let mut steps = 0;
+        while sim < two_hours {
+            kl.next_at = None;
+            step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap();
+            // The simulated clock: the read ran into READ_TIMEOUT, then the listing waited.
+            sim += READ_TIMEOUT;
+            sim += kl.next_at.map_or(Duration::ZERO, |t| {
+                t.saturating_duration_since(Instant::now())
+            });
+            steps += 1;
+            assert!(steps < 500, "the simulated clock did not advance");
+        }
+        let ro = ctx.hot.ro().unwrap();
+        let st = state(&ro, ids[0]).unwrap();
+        assert!(!st.unlistable(), "{st:?}");
+        assert!(st.fail_total < FAIL_BUDGET / 2, "{st:?}");
     }
 
     /// `free.KAYC` (chain 0, D3 gap group 3), as `describe-module` answered it.
