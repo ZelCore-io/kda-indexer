@@ -389,7 +389,10 @@ impl TokenReceivers {
     }
 }
 
-const XCHAIN_SUFFIX: &str = ".transfer-crosschain";
+/// Cross-chain defpacts whose step 1 credits `args[1]` and step 0 debits `args[0]`:
+/// `fungible-xchain-v1`'s `transfer-crosschain`, and the bridge tokens' (`kb-*`)
+/// `transfer-create-to-crosschain` (D3 gap group 6).
+const XCHAIN_SUFFIXES: &[&str] = &[".transfer-crosschain", ".transfer-create-to-crosschain"];
 
 /// One event of a tx as D3 needs it (no tracked-token knowledge yet).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -467,7 +470,9 @@ pub fn d3_candidates(
     let is_cont = cmd.is_some_and(|c| c.pointer("/payload/cont").is_some());
     if let Some(k) = output.get("continuation").filter(|k| !k.is_null()) {
         let def = k.pointer("/continuation/def").and_then(Value::as_str);
-        if let Some(m) = def.and_then(|d| d.strip_suffix(XCHAIN_SUFFIX)) {
+        let xchain_module =
+            def.and_then(|d| XCHAIN_SUFFIXES.iter().find_map(|x| d.strip_suffix(x)));
+        if let Some(m) = xchain_module {
             let side = match k.get("step").and_then(Value::as_u64) {
                 Some(1) if is_cont => Some(1),
                 Some(0) if !is_cont => Some(0),
@@ -571,7 +576,8 @@ pub fn d3_candidates(
 /// The rows of `c` given which modules are tracked fungible tokens (`is_token`; coin is always
 /// one). Rules:
 ///
-/// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain`, any height): step 1
+/// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain` or
+///    `<m>.transfer-create-to-crosschain`, any height): step 1
 ///    credits `args[1]` and step 0 debits `args[0]`. Tokens emit no TRANSFER for either
 ///    (only `pact.X_YIELD` / `X_RESUME`); coin did not before coin v3. `<m>` is discovered.
 /// 2. **`exec`**: the D1 strings (`exec.data` values, `exec.code` literals) plus every string

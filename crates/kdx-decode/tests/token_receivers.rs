@@ -561,3 +561,40 @@ fn a_deploy_tx_counts_as_calling_its_own_module() {
     let r = token_receivers(Some(&cmd), &o, 3_700_000, MAINNET01, &tokens);
     assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
 }
+
+/// D3 gap group 6: the bridge tokens (`kb-ETH`, `kb-USDC`, chain 4) move cross-chain with the
+/// defpact `<m>.transfer-create-to-crosschain`; step 1 credits `args[1]` like
+/// `transfer-crosschain`.
+#[test]
+fn a_bridge_token_transfer_create_to_crosschain_finish_names_its_receiver() {
+    // Namespace hash replaced; the shape is the real `n_e595….kb-ETH`.
+    const KB: &str = "n_e5950000000000000000000000000000000000ab.kb-ETH";
+    let tokens = |m: &str| m == KB;
+    let cmd = json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": false,
+        "data": {}, "proof": "x"}}});
+    let def = format!("{KB}.transfer-create-to-crosschain");
+    let cont = |step: u64| {
+        json!({"pactId": "p", "step": step, "stepCount": 2, "executed": null,
+        "stepHasRollback": false, "yield": null,
+        "continuation": {"def": def,
+            "args": [SRC, ACC, {"pred": "keys-all", "keys": ["ba55"]}, "4", 0.5]}})
+    };
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!("ok"), json!([]), cont(1)),
+        5_706_420,
+        MAINNET01,
+        &tokens,
+    );
+    assert_eq!(pairs(&r.pairs), vec![(ACC, KB)]);
+    assert_eq!(r.discovered, vec![KB.to_owned()]);
+    let start = json!({"payload": {"exec": {"data": {}, "code": format!("({def} ..)")}}});
+    let r = token_receivers(
+        Some(&start),
+        &out(json!("ok"), json!([]), cont(0)),
+        5_706_400,
+        MAINNET01,
+        &tokens,
+    );
+    assert!(pairs(&r.pairs).contains(&(SRC, KB)), "{:?}", r.pairs);
+}

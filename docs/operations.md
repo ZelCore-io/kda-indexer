@@ -681,7 +681,8 @@ recheck walks only the new heights (a safety net now that the tail marks). Candi
 
 - an injected early miner account (a dictionary name holding a `"`, mainnet 2020): the
   accounts its coinbase really credited, as coin rows on that block's chain only;
-- a cross-chain defpact of any module (`<module>.transfer-crosschain`): step 1 credits
+- a cross-chain defpact of any module (`<module>.transfer-crosschain`, or the bridge tokens'
+  `<module>.transfer-create-to-crosschain`): step 1 credits
   `args[1]`, step 0 debits `args[0]`. Tokens emit no TRANSFER for either;
 - an `exec` below the events fork: the D1 strings plus every string of `result.data`, for coin
   and for each tracked token the code calls; from the events fork on, the same strings for a
