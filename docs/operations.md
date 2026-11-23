@@ -787,6 +787,43 @@ service runs it inline at start (about 2.4 h on mainnet) and the reconcile loop 
 After the repair, the verify scan must show 0 missing rows, including indirect token credits
 with no event of the token after the events fork (another module crediting it, review L4).
 
+#### Key listing of tracked tokens (rows no tx names)
+
+Some funded token rows are named in no transaction, so no D1/D3 rule can find them: a row a
+token writes in its own `init` code under a name that is only a literal of the module (for
+example a `ROOT` treasury account), or a row written under a name built at run time with no
+event (a fee account built from a user guard, a pool account with a hashed name). The node
+lists them: `/local` allows `(keys <module>.<table>)` on any module's table, at a flat 40,000
+gas whatever the table size (measured on mainnet01).
+
+The reconcile loop (seed mode) lists every tracked token other than `coin`, skipping
+not-fungible verdicts and tokens at their row cap. One step is one (token, chain): a
+`describe-module` read for the code, then one `keys` read per ledger table (a `deftable` whose
+`defschema` has a top-level `balance` field, at most 4). At most one step per second, inside
+the shared `/local` rate limit (`balances.local_rps`). A token never listed comes first, so a
+newly tracked token (D3 discovery or a first posting) is listed within about 10 minutes plus
+the queue ahead of it; after that each token is listed again every 7 days.
+
+Only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are marked, through
+the postings' mark path, at the height the node read; the reconcile then reads them like any
+dirty row. Names are interned only for keys that will be marked, and new keys of a module stop
+at the room left under its row cap (`fungible_module_rows` for confirmed `fungible-v2`
+modules, `module_rows` otherwise). A chain where the module is not deployed, or where its
+table was never created, lists nothing.
+
+Fail-closed: a listing over 150,000 keys, an unusable answer, a refused `keys` read, a module
+with no ledger table, or a node error 3 times in a row marks nothing for that chain. It is
+logged (`balances: key listing failed`, with module, chain and reason) and the token is listed
+again after a day. The listing waits, like the receivers pass, until the store has a tail and
+its backfill is complete.
+
+State: `Meta balances_keylist/<ModuleId>` (last complete listing, next chain, failed chains;
+a restart resumes) and `Meta balances_keylist_stats` (totals). `--status` shows
+`keylist_tokens` (`listed`, `in_progress`, `failed`) and `keylist_stats` (`tokens_listed`,
+`chain_failures`, `listed`, `known`, `marked`, `skipped`, `last_failure`). To list a token
+again at once, delete its `balances_keylist/<ModuleId>` entry; it is picked up at the next
+refresh.
+
 ### NFTs
 
 The same stage keeps `NftBalances` (spec §3.9). Once per store (`Meta nft_filled`), before the
