@@ -728,6 +728,23 @@ or hot key, budget counters), so a restart resumes there. A new walk starts at m
 (`balances_d3_rewalk_at`); tokens queued during a walk wait for the next one. The CLI walks to
 the end on every run.
 
+To re-mark and re-walk given tokens now (for example after a fix to the D3 rules or to the
+reconciler, when their rows were missed), stop the service and run:
+
+```
+kda-indexer reconcile-balances --rewalk free.wiza,kaddex.skdx
+```
+
+It takes the data dir lock and, for the listed modules only: marks every row their `xfer`
+postings name (`coin`: also its `acct` postings), as the seed does, without touching the seed's
+own state; queues each in `Meta balances_d3_rewalk/<ModuleId>`; and deletes
+`balances_d3_rewalk_at`, so the service starts the walk at its next history slice instead of a
+day after the last one. A walk in progress is restarted from height 0 with its own tokens and the
+new ones together (its tokens stay queued until a walk ends). It prints `posting_rows_marked`,
+`rewalk_queued`, `walk_in_progress_restarted` and `rewalk_pending`. An unknown module name is an
+error and writes nothing. Start the service again; it reconciles the marks and runs the walk
+(`--status` shows `d3_rewalk_pending`). Only tracked tokens are walked.
+
 Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
 Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot read them.
 

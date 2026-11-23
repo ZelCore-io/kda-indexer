@@ -358,6 +358,24 @@ pub fn clear_rewalk(txn: &mut RwTxn<'_>, module: u32) -> Result<()> {
     Ok(())
 }
 
+/// Queue a D3 history walk of `modules` now (`reconcile-balances --rewalk`): each joins the
+/// pending set, and the daily spacing is reset (`balances_d3_rewalk_at` deleted), so the
+/// service starts the walk at its next history slice instead of a day after the last walk.
+/// A walk in progress is abandoned (its state deleted): its own tokens are still pending
+/// until a walk ends, so the new walk covers them and `modules` together, from height 0.
+/// Returns whether a walk in progress was restarted.
+pub fn queue_rewalk(txn: &mut RwTxn<'_>, modules: &[u32]) -> Result<bool> {
+    for m in modules {
+        txn.put(
+            Table::Meta,
+            format!("{}{m:010}", meta::D3_REWALK).as_bytes(),
+            &[],
+        )?;
+    }
+    txn.del(Table::Meta, meta::D3_REWALK_AT.as_bytes())?;
+    txn.del(Table::Meta, meta::D3_REWALK_WALK.as_bytes())
+}
+
 static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether the tail writes balance dirty marks: `[balances] enabled` (M-11), set at startup.
@@ -894,6 +912,31 @@ mod tests {
             guard_keys(&ks(vec![webauthn])),
             GuardKeys::Keys(_)
         ));
+    }
+
+    /// `--rewalk`: listed modules join the pending set, a running walk restarts with its own
+    /// tokens still pending, and the daily spacing is reset.
+    #[test]
+    fn queue_rewalk_restarts_with_every_pending_token() {
+        let d = tempfile::tempdir().unwrap();
+        let hs = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hs.rw().unwrap();
+        txn.put(
+            Table::Meta,
+            format!("{}{:010}", meta::D3_REWALK, 479).as_bytes(),
+            &[],
+        )
+        .unwrap();
+        txn.set_meta(meta::D3_REWALK_WALK, b"{}").unwrap();
+        txn.set_meta(meta::D3_REWALK_AT, &5u32.to_be_bytes())
+            .unwrap();
+        assert!(queue_rewalk(&mut txn, &[12, 479]).unwrap());
+        let mut p = rewalk_pending(&txn).unwrap();
+        p.sort_unstable();
+        assert_eq!(p, vec![12, 479]);
+        assert!(txn.meta(meta::D3_REWALK_WALK).unwrap().is_none());
+        assert!(txn.meta(meta::D3_REWALK_AT).unwrap().is_none());
+        assert!(!queue_rewalk(&mut txn, &[12]).unwrap());
     }
 
     #[test]

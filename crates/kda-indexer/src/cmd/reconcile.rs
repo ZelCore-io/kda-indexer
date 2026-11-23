@@ -13,8 +13,11 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
+    /// Re-mark the posting holders of these modules and queue their D3 history walk now
+    /// (D3 gaps: tokens whose rows a fixed rule missed).
+    Rewalk(Vec<String>),
     /// Run (or resume) the seed walk (B-2). Marks rows dirty; the next `run` reads them.
     Seed,
     /// The receivers pass (D1) as a count only: candidates and would-be-marked rows; writes
@@ -35,6 +38,28 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
     let hot_dir = super::hot::hot_dir(data_dir);
     match mode {
         Mode::Status => status(cfg, &HotStore::open_ro(&hot_dir)?),
+        Mode::Rewalk(names) => {
+            let _lock = super::lock_data_dir(data_dir)?;
+            let hs = HotStore::open(&hot_dir, super::hot::geometry(cfg))?;
+            let segdir = kdx_ingest::ctx::segments_dir(data_dir);
+            let ids = module_ids(&hs, &names)?;
+            let set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+            let rep = kdx_ingest::seed::mark_modules(&hs, &segdir, &set, &|| false)?;
+            let mut txn = hs.rw()?;
+            let restarted = kdx_hot::balances::queue_rewalk(&mut txn, &ids)?;
+            txn.commit()?;
+            println!(
+                "{}",
+                json!({
+                    "modules": names,
+                    "posting_rows_marked": rep.dirty_inserted,
+                    "rewalk_queued": ids.len(),
+                    "walk_in_progress_restarted": restarted,
+                    "rewalk_pending": kdx_hot::balances::rewalk_pending(&hs.ro()?)?.len(),
+                })
+            );
+            Ok(())
+        }
         Mode::Seed => {
             let _lock = super::lock_data_dir(data_dir)?;
             let hs = HotStore::open(&hot_dir, super::hot::geometry(cfg))?;
@@ -113,6 +138,27 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
             Ok(())
         }
     }
+}
+
+/// The module ids of `names`; an unknown name is an error (nothing is written).
+fn module_ids(hs: &HotStore, names: &[String]) -> anyhow::Result<Vec<u32>> {
+    let txn = hs.ro()?;
+    let mut out = Vec::new();
+    for n in names {
+        let n = n.trim();
+        let id = txn
+            .get(
+                Table::DictFwd(kdx_types::DictKind::Module),
+                &kdx_hot::dict::fwd_key(n.as_bytes()),
+            )?
+            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
+            .map(u32::from_be_bytes)
+            .ok_or_else(|| anyhow::anyhow!("unknown module: {n}"))?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// A receivers pass (D1 or D3), or its dry run; fails when it could not read some txs (L1).
