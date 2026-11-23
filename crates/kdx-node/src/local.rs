@@ -125,6 +125,15 @@ pub fn is_no_module_message(msg: &str) -> bool {
     msg.starts_with("Cannot find module: ")
 }
 
+/// The failure message means the module is on this chain but its table was never created
+/// there (Pact 5, measured on mainnet01: `(keys free.KAYC.token-table)` on chain 4 answers
+/// `Error during database operation: Table access failed because table
+/// free.KAYC_token-table was not found.`): the table has no keys.
+pub fn is_no_table_message(msg: &str) -> bool {
+    msg.starts_with("Error during database operation: Table access failed because table ")
+        && msg.ends_with(" was not found.")
+}
+
 /// The failure message means "no such row" (Pact 5 `No value found in table …`, Pact 4
 /// `with-read: row not found …`) or "no such keyset".
 pub fn is_absent_message(msg: &str) -> bool {
@@ -455,10 +464,14 @@ impl LocalClient {
         if !valid_ident(table) {
             return Err(LocalError::Skipped("table name fails the B-1 check".into()));
         }
-        let r = self
+        match self
             .call(chain, &format!("(keys {module}.{table})"), json!({}))
-            .await?;
-        keys_of(r, max)
+            .await
+        {
+            Ok(r) => keys_of(r, max),
+            Err(LocalError::Failure(m)) if is_no_table_message(&m) => Ok(Local::Absent),
+            Err(e) => Err(e),
+        }
     }
 
     /// `(describe-keyset (read-msg "k"))` with `data {"k": name}`: the keyset JSON, or null
@@ -1023,6 +1036,19 @@ mod tests {
             keys_of(classify(&mixed).unwrap(), 4),
             Err(LocalError::Invalid(_))
         ));
+    }
+
+    /// `free.KAYC` is deployed on chain 4 but its table was never created there.
+    #[test]
+    fn a_table_never_created_has_no_keys() {
+        assert!(is_no_table_message(
+            "Error during database operation: Table access failed because table \
+             free.KAYC_token-table was not found."
+        ));
+        assert!(!is_no_table_message(
+            "Error during database operation: Table access failed because table x was locked"
+        ));
+        assert!(!is_no_table_message("Module admin necessary for operation"));
     }
 
     /// The table name goes into the code as text: identifier characters only.
