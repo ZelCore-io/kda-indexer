@@ -19,6 +19,8 @@
 //!   sent once with [`READ_TIMEOUT`] (no retry inside the client). At most one step per
 //!   [`STEP_EVERY`], inside the shared `/local` rate limit. Progress (`Meta
 //!   balances_keylist/<module>`) is kept per step, so a restart resumes.
+//! - A module with no ledger table on a chain lists nothing there, like a module not deployed
+//!   (no failure; looked at again at the next sweep).
 //! - Failures are per `(token, chain)`: a timeout, an unusable or over-cap answer or a pact
 //!   failure marks nothing for that chain, is logged and counted, and only that chain is
 //!   listed again, after [`RETRY_BASE_SECS`] doubling with each failure in a row up to
@@ -619,7 +621,10 @@ async fn list_chain(
     };
     let tables = ledger_tables(&code);
     if tables.is_empty() {
-        return Ok(ChainResult::Failed("no table with a balance field".into()));
+        // Nothing this rule can list (review note 6): done until the next sweep, not a failure
+        // retried and logged forever. A ledger whose field is not `balance` is a known gap.
+        tracing::debug!(module = %name, chain, "balances: key listing: no table with a balance field");
+        return Ok(ChainResult::Done(Marked::default()));
     }
     let mut lists = Vec::with_capacity(tables.len());
     for t in &tables {
@@ -1371,9 +1376,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 6);
     }
 
-    /// Fail-closed: a refused `keys` read, a module with no ledger table and a node that stays
-    /// down mark nothing, are logged and counted, and leave the chain failed (retried after
-    /// `RETRY_BASE_SECS`); the other chain of the same token still lists.
+    /// Fail-closed: a refused `keys` read and a node that stays down mark nothing, are logged
+    /// and counted, and leave the chain failed (retried after `RETRY_BASE_SECS`); the other
+    /// chain of the same token still lists. A module with no ledger table (review note 6) is
+    /// no failure: nothing to list, done until the next sweep.
     #[tokio::test]
     async fn failures_mark_nothing_and_are_retried() {
         let dir = tempfile::tempdir().unwrap();
@@ -1403,20 +1409,21 @@ mod tests {
         let failed = |s: &ListState| s.chains.iter().map(|c| c.chain).collect::<Vec<_>>();
         assert_eq!(
             st.iter().map(failed).collect::<Vec<_>>(),
-            [vec![0], vec![0, 1], vec![0, 1]]
+            [vec![0], vec![], vec![0, 1]]
         );
         assert!(st.iter().all(|s| s.listed_at > 0));
         let retry = st[0].chains[0].retry_at;
         assert!(!st[0].due(retry - 1) && st[0].due(retry));
         let stats: Stats =
             serde_json::from_slice(&ro.meta(meta::KEYLIST_STATS).unwrap().unwrap()).unwrap();
-        assert_eq!(stats.chain_failures, 5);
+        assert_eq!(stats.chain_failures, 3);
         // free.down: one request per try, NODE_TRIES tries per chain (no client retries).
         assert_eq!(stats.node_errors, 2 * u64::from(NODE_TRIES));
         assert_eq!(
             summary(&ro).unwrap(),
             Summary {
-                failed: 3,
+                listed: 1,
+                failed: 2,
                 ..Summary::default()
             }
         );

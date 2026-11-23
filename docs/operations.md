@@ -813,11 +813,12 @@ the postings' mark path, at the height the node read; the reconcile then reads t
 dirty row. Names are interned only for keys that will be marked, and new keys of a module stop
 at the room left under its row cap (`fungible_module_rows` for confirmed `fungible-v2`
 modules, `module_rows` otherwise), counting its rows and the marks of the sweep's earlier
-chains that the reconcile has not read yet. A chain where the module is not deployed, or where its
-table was never created, lists nothing.
+chains that the reconcile has not read yet. A chain where the module is not deployed, where its
+table was never created, or whose module code has no ledger table (for example a ledger field
+not named `balance`, a known gap), lists nothing and is looked at again at the next sweep.
 
 Fail-closed, per (token, chain): a read timeout, a listing over 150,000 keys, an unusable
-answer, a refused `keys` read or a module with no ledger table marks nothing for that chain. It
+answer or a refused `keys` read marks nothing for that chain. It
 is logged (`balances: key listing failed`, with module, chain, reason and the retry pause),
 and only that chain is listed again: after 1 hour, doubling with each failure in a row, at
 most every 7 days; the token goes to the back of the queue meanwhile. A connection or HTTP
