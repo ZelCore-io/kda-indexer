@@ -803,7 +803,7 @@ skipping not-fungible verdicts and tokens at their row cap. One step is one (tok
 `defschema` has a top-level `balance` field, at most 4). Each read is sent once, with a 90 s
 timeout (no retry inside the node client). At most one step per second, inside the shared
 `/local` limits (`balances.local_rps`, `balances.local_concurrency`: a hung read holds one
-slot). A token never listed comes first, so a newly tracked token (D3 discovery or a first
+slot). With `balances.local_concurrency = 1` the listing is off (WARN at start): a read would hold the only slot and the reconcile would wait for it. A token never listed comes first, so a newly tracked token (D3 discovery or a first
 posting) is listed within about 10 minutes plus the queue ahead of it; after that each token
 is listed again every 7 days. A first sweep takes about 20 steps per token, so about 20 s per
 token (about 6 h for 1,000 tokens, estimate) when every read is quick.
@@ -817,15 +817,15 @@ chains that the reconcile has not read yet. A chain where the module is not depl
 table was never created, or whose module code has no ledger table (for example a ledger field
 not named `balance`, a known gap), lists nothing and is looked at again at the next sweep.
 
-Fail-closed, per (token, chain): a read timeout, a listing over 150,000 keys, an unusable
+Fail-closed, per (token, chain): a `keys` read timeout, a listing over 150,000 keys, an unusable
 answer or a refused `keys` read marks nothing for that chain. It
 is logged (`balances: key listing failed`, with module, chain, reason and the retry pause),
 and only that chain is listed again: after 1 hour, doubling with each failure in a row, at
 most every 7 days; the token goes to the back of the queue meanwhile. A connection or HTTP
-error pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
-in a row. A token that runs up 32 chain failures with no clean round between is marked
+error, or a timeout of the small `describe-module` read (the node stalls, not the token), pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
+in a row. A chain already at the 7-day pause costs the budget nothing more (one table that never lists does not make its token unlistable). A token that runs up 32 chain failures with no clean round between is marked
 unlistable (logged at WARN, `--status` `keylist_tokens.unlistable`) and left alone for 30
-days, then tried once more with a fresh budget. The listing waits, like the receivers pass,
+days, then tried once more with a fresh budget. A panic in the listing task is logged at ERROR (`balances: key listing task panicked`) and the task is restarted after 60 s; its progress is in the store. The listing waits, like the receivers pass,
 until the store has a tail and its backfill is complete.
 
 Effective limit: the 150,000-key cap and the 90 s timeout, whichever comes first. The node

@@ -17,17 +17,21 @@
 //!   a slow node read cannot hold up dirty rows, NFTs or history slices. One step, one
 //!   `(token, chain)`: one `describe-module` read, then one `keys` read per ledger table, each
 //!   sent once with [`READ_TIMEOUT`] (no retry inside the client). At most one step per
-//!   [`STEP_EVERY`], inside the shared `/local` rate limit. Progress (`Meta
+//!   [`STEP_EVERY`], inside the shared `/local` rate limit. A panic in the task is logged at
+//!   ERROR and the task restarted after [`PANIC_PAUSE`] (R-4). With `balances.local_concurrency`
+//!   = 1 the listing is off ([`enabled`], R-3): a read would hold the only slot. Progress (`Meta
 //!   balances_keylist/<module>`) is kept per step, so a restart resumes.
 //! - A module with no ledger table on a chain lists nothing there, like a module not deployed
 //!   (no failure; looked at again at the next sweep).
-//! - Failures are per `(token, chain)`: a timeout, an unusable or over-cap answer or a pact
+//! - Failures are per `(token, chain)`: a `keys` timeout, an unusable or over-cap answer or a pact
 //!   failure marks nothing for that chain, is logged and counted, and only that chain is
 //!   listed again, after [`RETRY_BASE_SECS`] doubling with each failure in a row up to
-//!   [`RETRY_CAP_SECS`]. A connection or HTTP error pauses the whole listing ([`NODE_PAUSE`],
+//!   [`RETRY_CAP_SECS`]. A connection or HTTP error, or a `describe-module` timeout (small code: the node is
+//!   stalling, not the token), pauses the whole listing ([`NODE_PAUSE`],
 //!   doubling to [`NODE_PAUSE_MAX`]) and counts against the chain after [`NODE_TRIES`] in a
 //!   row. A failed token goes to the back of the queue, so one token cannot hold it.
-//! - Budget: a token that runs up [`FAIL_BUDGET`] chain failures with no clean round between
+//! - Budget: a token that runs up [`FAIL_BUDGET`] chain failures (a chain already at
+//!   [`RETRY_CAP_SECS`] adds none, R-2) with no clean round between
 //!   is marked unlistable (logged, counted, `reconcile-balances --status`) and left alone for
 //!   [`UNLISTABLE_SECS`], then tried once more with a fresh budget.
 //! - Marks: only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are marked,
@@ -82,6 +86,8 @@ pub const NODE_PAUSE: Duration = Duration::from_secs(30);
 pub const NODE_PAUSE_MAX: Duration = Duration::from_secs(600);
 /// Pause after an error of the store.
 const STORE_PAUSE: Duration = Duration::from_secs(60);
+/// Pause before the listing task is started again after a panic.
+const PANIC_PAUSE: Duration = Duration::from_secs(60);
 /// Most ledger tables listed per module and chain.
 pub const MAX_TABLES: usize = 4;
 /// Most keys one `(token, table, chain)` listing may answer; a bigger one is refused whole
@@ -356,9 +362,15 @@ impl ListState {
             }
         };
         let c = &mut self.chains[i];
+        // A chain already at the longest pause costs the token's budget no more (PR #27 R-2): one
+        // table that never lists (over the key cap) must not, a few times a month, make the
+        // healthy chains of its token unlistable after months.
+        let at_cap = c.fails > 0 && retry_after(c.fails) >= RETRY_CAP_SECS;
         c.fails = c.fails.saturating_add(1);
         c.retry_at = now.saturating_add(retry_after(c.fails));
-        self.fail_total = self.fail_total.saturating_add(1);
+        if !at_cap {
+            self.fail_total = self.fail_total.saturating_add(1);
+        }
     }
     /// `chain` listed: no longer failed.
     fn cleared(&mut self, chain: u8) {
@@ -596,11 +608,13 @@ fn now_unix() -> u32 {
         .map_or(0, |d| d.as_secs() as u32)
 }
 
-/// A node error of a listing read: a timeout is the token's (its table may be too big to
-/// list in time, H-1); any other is the node's.
-fn node_result(what: &str, e: NodeError) -> ChainResult {
+/// A node error of a listing read. `token_slow`: a timeout of a `keys` read is the token's (its
+/// table may be too big to list in time, H-1). A `describe-module` timeout (the module code is
+/// small and bounded) and any other error are the node's, so a node that hangs pauses the
+/// listing instead of burning the budgets of the tokens (PR #27 R-1).
+fn node_result(what: &str, e: NodeError, token_slow: bool) -> ChainResult {
     match e {
-        NodeError::Timeout => ChainResult::Failed(format!("{what}: timeout")),
+        NodeError::Timeout if token_slow => ChainResult::Failed(format!("{what}: timeout")),
         e => ChainResult::Node(format!("{what}: {e}")),
     }
 }
@@ -619,7 +633,7 @@ async fn list_chain(
     let code = match local.module_code(chain, name, timeout).await {
         Ok(Local::Absent) => return Ok(ChainResult::Done(Marked::default())),
         Ok(Local::Found { value, .. }) => value,
-        Err(LocalError::Node(e)) => return Ok(node_result("describe-module", e)),
+        Err(LocalError::Node(e)) => return Ok(node_result("describe-module", e, false)),
         Err(e) => return Ok(ChainResult::Failed(format!("describe-module: {e}"))),
     };
     let tables = ledger_tables(&code);
@@ -637,7 +651,7 @@ async fn list_chain(
                 lists.push((value, u32::try_from(height).unwrap_or(u32::MAX)))
             }
             Ok(Local::Absent) => {}
-            Err(LocalError::Node(e)) => return Ok(node_result(&format!("keys {t}"), e)),
+            Err(LocalError::Node(e)) => return Ok(node_result(&format!("keys {t}"), e, true)),
             Err(e) => return Ok(ChainResult::Failed(format!("keys {t}: {e}"))),
         }
     }
@@ -850,10 +864,56 @@ fn fail(
     .context("key listing stats")
 }
 
-/// The key listing as its own task (PR #27 H-1): steps paced by [`STEP_EVERY`] (and the node
-/// pauses), apart from the reconcile loop, until `stop`. A store error is logged and the task
-/// pauses; it never ends the reconcile.
+/// Whether the listing may run with `local_concurrency` `/local` slots. With one slot a listing
+/// read (up to [`READ_TIMEOUT`]) would hold the reconcile's only slot (PR #27 R-3), so the
+/// listing is off then; the shipped configs use 8.
+pub fn enabled(local_concurrency: usize) -> bool {
+    local_concurrency > 1
+}
+
+/// The key listing as its own task (PR #27 H-1), kept alive: a panic in it is logged at ERROR
+/// and the task restarted after [`PANIC_PAUSE`] (R-4; its progress is in the store, so it
+/// resumes), until `stop`.
 pub async fn run(
+    ctx: Arc<Ctx>,
+    local: Arc<LocalClient>,
+    caps: crate::reconcile::Caps,
+    stop: CancellationToken,
+) {
+    supervise(&stop, PANIC_PAUSE, || {
+        tokio::spawn(run_task(ctx.clone(), local.clone(), caps, stop.clone()))
+    })
+    .await;
+}
+
+/// Run the task `start` makes until it ends by itself (`stop`); when it panics, log at ERROR,
+/// wait `pause` and start it again.
+async fn supervise(
+    stop: &CancellationToken,
+    pause: Duration,
+    mut start: impl FnMut() -> tokio::task::JoinHandle<()>,
+) {
+    loop {
+        match start().await {
+            Ok(()) => return,
+            Err(e) if e.is_panic() => {
+                tracing::error!(error = %e, pause_s = pause.as_secs(),
+                    "balances: key listing task panicked; restarting after a pause");
+            }
+            // Cancelled by a runtime shutdown.
+            Err(_) => return,
+        }
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
+}
+
+/// The listing loop: steps paced by [`STEP_EVERY`] (and the node pauses), apart from the
+/// reconcile loop, until `stop`. A store error is logged and the loop pauses; it never ends the
+/// reconcile.
+async fn run_task(
     ctx: Arc<Ctx>,
     local: Arc<LocalClient>,
     caps: crate::reconcile::Caps,
@@ -990,6 +1050,16 @@ mod tests {
         tokens: &[&str],
         answer: Arc<Answer>,
     ) -> (Ctx, LocalClient, Vec<u32>, Arc<AtomicUsize>) {
+        setup_chains(dir, tokens, answer, 2)
+    }
+
+    /// [`setup`] with a graph of chains `0..chains`.
+    fn setup_chains(
+        dir: &std::path::Path,
+        tokens: &[&str],
+        answer: Arc<Answer>,
+        chains: u8,
+    ) -> (Ctx, LocalClient, Vec<u32>, Arc<AtomicUsize>) {
         let hot = Arc::new(HotStore::open(&dir.join("hot"), Geometry::default()).unwrap());
         let mut txn = hot.rw().unwrap();
         let mut d = HotDict::load(&txn).unwrap();
@@ -1020,7 +1090,7 @@ mod tests {
         let info = NodeInfo {
             node_version: String::new(),
             chainweb_version: "mainnet01".into(),
-            graph_history: vec![(0, vec![0, 1])],
+            graph_history: vec![(0, (0..chains).collect())],
             raw: Value::Null,
         };
         let ctx = Ctx {
@@ -1147,6 +1217,31 @@ mod tests {
     }
 
     /// H-1: the pause of a failing `(token, chain)` doubles per failure in a row, capped.
+    /// R-2: a chain that keeps failing at the longest pause stops costing the token's budget.
+    #[test]
+    fn a_chain_at_the_longest_pause_costs_no_more_budget() {
+        let mut st = ListState::default();
+        for _ in 0..40 {
+            st.failed(7, 1_000);
+        }
+        // Charged until its pause reached the cap (9 failures), then free.
+        assert_eq!(st.fail_total, 9);
+        assert_eq!(st.chains[0].fails, 40);
+        assert!(
+            st.fail_total < FAIL_BUDGET,
+            "a lone big chain is never unlistable"
+        );
+        st.failed(8, 1_000);
+        assert_eq!(st.fail_total, 10, "another chain is charged as before");
+    }
+
+    /// R-3: the listing needs a second `/local` slot, so the reconcile is never blocked.
+    #[test]
+    fn the_listing_needs_a_second_local_slot() {
+        assert!(!enabled(1));
+        assert!(enabled(2) && enabled(8));
+    }
+
     #[test]
     fn retry_backoff_grows_and_is_capped() {
         assert_eq!(retry_after(1), RETRY_BASE_SECS);
@@ -1507,7 +1602,8 @@ mod tests {
             (1, 0, 1)
         );
         let first = st.chains[0].retry_at;
-        assert!(first >= st.listed_at + RETRY_BASE_SECS);
+        // (`listed_at` is read a moment after the failure's `now`: allow a second tick.)
+        assert!(first + 2 >= st.listed_at + RETRY_BASE_SECS);
         // Not due again before its pause; then a retry round reads chain 0 only.
         kl.refreshed = None;
         kl.next_at = None;
@@ -1530,7 +1626,7 @@ mod tests {
         assert_eq!(st.listed_at, back.listed_at, "a retry round is no sweep");
     }
 
-    /// H-1: a junk token (every read times out) goes to the back of the queue after each
+    /// H-1: a junk token (every `keys` read times out) goes to the back of the queue after each
     /// failure, so a good token behind it is listed first; once over its budget it is
     /// unlistable, shown by `--status`, and not due again for `UNLISTABLE_SECS`.
     #[tokio::test]
@@ -1539,11 +1635,9 @@ mod tests {
         let answer: Arc<Answer> = Arc::new(move |_, code, data| {
             let m = data.get("m").and_then(Value::as_str).unwrap_or("");
             match (code, m) {
-                (c, "free.junk") if c.contains("describe-module") => {
-                    Some(json!({"sleep_ms": 2_000}))
-                }
                 (c, _) if c.contains("describe-module") => ok(json!(KAYC)),
                 ("(keys free.good.token-table)", _) => ok(json!(["ROOT"])),
+                ("(keys free.junk.token-table)", _) => Some(json!({"sleep_ms": 2_000})),
                 _ => panic!("unexpected call {code}"),
             }
         });
@@ -1590,6 +1684,75 @@ mod tests {
         kl.refreshed = None;
         kl.next_at = None;
         assert!(!step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap());
+    }
+
+    /// R-1: a node that hangs instead of refusing connections must not burn the failure
+    /// budget of a token on 20 chains. A `describe-module` timeout is a node error (the pause
+    /// and the slow charge after `NODE_TRIES`), not the token's; two hours of such a stall
+    /// (90 s per read plus the pauses, simulated) leave the token far from `FAIL_BUDGET`.
+    #[tokio::test]
+    async fn a_hung_node_for_two_hours_does_not_make_a_token_unlistable() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |_, _, _| Some(json!({"sleep_ms": 2_000})));
+        let (ctx, local, ids, _) = setup_chains(dir.path(), &["free.wide"], answer, 20);
+        let mut kl = KeyList {
+            read_timeout: Duration::from_millis(50),
+            ..KeyList::default()
+        };
+        let (mut sim, two_hours) = (Duration::ZERO, Duration::from_secs(2 * 3600));
+        let mut steps = 0;
+        while sim < two_hours {
+            kl.next_at = None;
+            step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap();
+            // The simulated clock: the read ran into READ_TIMEOUT, then the listing waited.
+            sim += READ_TIMEOUT;
+            sim += kl.next_at.map_or(Duration::ZERO, |t| {
+                t.saturating_duration_since(Instant::now())
+            });
+            steps += 1;
+            assert!(steps < 500, "the simulated clock did not advance");
+        }
+        let ro = ctx.hot.ro().unwrap();
+        let st = state(&ro, ids[0]).unwrap();
+        assert!(!st.unlistable(), "{st:?}");
+        assert!(st.fail_total < FAIL_BUDGET / 2, "{st:?}");
+    }
+
+    /// R-4: a panic in the listing task is not lost: the supervisor restarts the task after
+    /// the pause (and logs it at ERROR), and a clean end by `stop` ends the supervisor.
+    #[tokio::test]
+    async fn a_panic_in_the_listing_task_restarts_it() {
+        let stop = CancellationToken::new();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (s2, st2) = (starts.clone(), stop.clone());
+        let sup = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                supervise(&stop, Duration::from_millis(20), move || {
+                    let n = s2.fetch_add(1, Ordering::SeqCst);
+                    let stop = st2.clone();
+                    tokio::spawn(async move {
+                        if n < 2 {
+                            panic!("injected panic {n}");
+                        }
+                        stop.cancelled().await;
+                    })
+                })
+                .await
+            }
+        });
+        let t0 = Instant::now();
+        while starts.load(Ordering::SeqCst) < 3 {
+            assert!(t0.elapsed() < Duration::from_secs(5), "not restarted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!sup.is_finished(), "the third run is alive");
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), sup)
+            .await
+            .expect("supervisor ends on stop")
+            .unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 3);
     }
 
     /// `free.KAYC` (chain 0, D3 gap group 3), as `describe-module` answered it.
