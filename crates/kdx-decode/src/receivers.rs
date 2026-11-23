@@ -236,7 +236,8 @@ pub fn injected_miner_receivers(miner: &str) -> Vec<String> {
 pub struct TokenReceivers {
     /// From the cross-chain and `exec` rules.
     pub pairs: Vec<(String, String)>,
-    /// From events (rule 3), at most [`event_pair_cap`] of the tx's events; never coin.
+    /// From events (rule 3), at most [`MAX_EVENT_PAIRS_PER_EVENT`] new rows per event and
+    /// [`MAX_EVENT_PAIRS_PER_TX`] per tx; never coin.
     pub event_pairs: Vec<(String, String)>,
     /// The module each `event_pairs` entry is charged to (same index): the event's emitter, or
     /// the token an `exec` calls. The pass budgets its per-pass cap per emitter.
@@ -258,25 +259,16 @@ pub struct TokenReceivers {
     pub discovered_too_long: u32,
 }
 
-/// Event-derived candidates kept per tx, before the per-event allowance (security review:
-/// chain data must not amplify the pass). Also the most strings kept from one event.
-pub const MAX_EVENT_PAIRS_PER_TX: usize = 64;
-/// Extra event-derived candidates each event with a candidate adds to its tx's cap. A batch
-/// tx (D3 gap group 1: a kaddex migration WRAP tx credits 45 accounts in 90 events, two rows
-/// each) names a few accounts per event; a hostile tx pays gas for every event it emits.
-pub const EVENT_PAIRS_PER_EVENT: usize = 4;
-/// Hard ceiling of event-derived candidates per tx, whatever its event count.
-pub const MAX_EVENT_PAIRS_CEILING: usize = 1024;
-
-/// The event-derived candidates a tx with `events` candidate-bearing events may keep:
-/// [`MAX_EVENT_PAIRS_PER_TX`] plus [`EVENT_PAIRS_PER_EVENT`] per event, at most
-/// [`MAX_EVENT_PAIRS_CEILING`]. One event's strings alone never raise it.
-pub fn event_pair_cap(events: usize) -> usize {
-    events
-        .saturating_mul(EVENT_PAIRS_PER_EVENT)
-        .saturating_add(MAX_EVENT_PAIRS_PER_TX)
-        .min(MAX_EVENT_PAIRS_CEILING)
-}
+/// Event-derived candidates one event may add for itself (security review: chain data must not
+/// amplify the pass). Also the most strings and module references kept from one event. The
+/// allowance is per event and spent only by that event's own rows: an event that yields no row
+/// (junk) funds nothing, so it cannot raise another event's budget.
+pub const MAX_EVENT_PAIRS_PER_EVENT: usize = 64;
+/// Ceiling of event-derived candidates per tx, whatever its event count: half of the tail's
+/// per-emitter block budget (`kdx_hot::tail::D3_ROWS_PER_EMITTER_PER_BLOCK`, 1,024). A batch tx
+/// (D3 gap group 1: a kaddex migration WRAP tx credits 45 accounts in 90 events, about two
+/// rows each) needs about 94; the old fixed 64 per tx kept only its first 21 accounts.
+pub const MAX_EVENT_PAIRS_PER_TX: usize = 512;
 /// Exec-derived token candidates kept per tx (own budget, see [`TokenReceivers::exec_pairs`]).
 pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
 /// Prefix of the budget key of exec-derived rows: `exec:<sender>` (a module name holds no `:`).
@@ -290,7 +282,7 @@ pub const MAX_DISCOVERED_PER_TX: usize = 4;
 pub const MAX_MODULE_LEN: usize = 256;
 /// Module references kept per event (each one with a string uses a pair slot of the tx, so
 /// more can never add a pair).
-const MAX_REFS_PER_EVENT: usize = MAX_EVENT_PAIRS_PER_TX;
+const MAX_REFS_PER_EVENT: usize = MAX_EVENT_PAIRS_PER_EVENT;
 
 /// Namespaces where anyone may deploy: a module there proves nothing about its neighbours
 /// (review L3: add any other namespace whose user guard is open).
@@ -402,7 +394,7 @@ pub struct D3Event {
     /// `fungible-v2` modref targets in the params (coin excluded), at most 64.
     pub refs: Vec<String>,
     /// Distinct [`account_like`] string params outside modrefs and amounts, at most
-    /// [`MAX_EVENT_PAIRS_PER_TX`].
+    /// [`MAX_EVENT_PAIRS_PER_EVENT`].
     pub strings: Vec<String>,
 }
 
@@ -500,7 +492,7 @@ pub fn d3_candidates(
         let mut strings = Vec::new();
         param_strings(ev.params, &mut strings);
         for s in strings.iter().filter(|s| !amount_text(s)) {
-            push_distinct(&mut d.strings, s, MAX_EVENT_PAIRS_PER_TX);
+            push_distinct(&mut d.strings, s, MAX_EVENT_PAIRS_PER_EVENT);
         }
         // An event with no string can give no row; one with no ref and a TRANSFER neither.
         if !d.strings.is_empty() || !d.refs.is_empty() {
@@ -564,8 +556,9 @@ pub fn d3_candidates(
 ///    of `result.data` (a receiver built at run time and returned, D3 b), for every tracked
 ///    token `<m>` the code calls (`<m>.fn`; from the events fork on only one that emitted
 ///    nothing in the tx), and for coin below the events fork.
-/// 3. **Events** (any height, into `event_pairs`, capped at [`event_pair_cap`] of the tx's
-///    candidate events, never coin; amounts are never candidates): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
+/// 3. **Events** (any height, into `event_pairs`, at most [`MAX_EVENT_PAIRS_PER_EVENT`] new
+///    rows earned by each event for itself and [`MAX_EVENT_PAIRS_PER_TX`] per tx, never coin;
+///    amounts are never candidates): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
 ///    …) gives its [`account_like`] params for that token; an event whose params hold a
 ///    `fungible-v2` module reference gives them for the referenced module when the emitter is
 ///    that module, a module of the same governed namespace (D3 d: `kaddex.skdx` is only ever
@@ -576,7 +569,6 @@ pub fn d3_candidates(
 /// Rows and discoveries of a module `/local` cannot read ([`readable_module`]) are dropped.
 pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenReceivers {
     let mut r = TokenReceivers::default();
-    let cap = event_pair_cap(c.events.len());
     if let Some((m, a)) = &c.xchain {
         if let Some(a) = a {
             r.push(a, m);
@@ -601,6 +593,8 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
         {
             targets.push(&ev.module);
         }
+        // This event's own allowance: it can only spend what it earns, never another's.
+        let cap = (r.event_pairs.len() + MAX_EVENT_PAIRS_PER_EVENT).min(MAX_EVENT_PAIRS_PER_TX);
         for m in targets {
             for s in &ev.strings {
                 r.push_event(s, m, &ev.module, cap);

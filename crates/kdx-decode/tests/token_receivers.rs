@@ -10,7 +10,7 @@
 //! - (d) `kaddex.alchemist.WRAP` minting `kaddex.skdx`, named only by a `fungible-v2` modref.
 
 use kdx_decode::receivers::{
-    event_pair_cap, injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_CEILING,
+    injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_PER_EVENT,
     MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX,
 };
 use serde_json::{json, Value};
@@ -247,18 +247,17 @@ fn a_hostile_event_is_capped_and_never_gives_coin_rows() {
         r.pairs.is_empty() && r.event_pairs.is_empty() && r.discovered.is_empty(),
         "{r:?}"
     );
-    // A tracked token's event: at most one event's strings (within the tx's cap), and a coin
-    // modref gives no coin rows.
+    // A tracked token's event: at most one event's allowance, and a coin modref gives no coin
+    // rows.
     let evs = json!([ev("free.wiza", "SPAM", json!([refs, strings]))]);
     let o = out(json!("ok"), evs, Value::Null);
     let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
     assert_eq!(
         r.event_pairs.len(),
-        MAX_EVENT_PAIRS_PER_TX,
+        MAX_EVENT_PAIRS_PER_EVENT,
         "{}",
         r.event_pairs.len()
     );
-    assert!(r.event_pairs.len() <= event_pair_cap(1));
     assert!(!r.event_pairs.iter().any(|(_, m)| m == "coin"));
     assert!(!r.discovered.iter().any(|m| m == "coin"));
 }
@@ -470,8 +469,8 @@ fn event_amounts_are_not_accounts() {
     );
 }
 
-/// A hostile tx with many events of junk strings stays under the hard ceiling; the cap grows
-/// only with the tx's events (each costs gas), never with one event's strings.
+/// A hostile tx with many events of junk strings stays under the per-tx ceiling (each event
+/// costs gas and earns at most its own allowance).
 #[test]
 fn many_hostile_events_stay_under_the_ceiling() {
     let cmd = json!({"payload": {"exec": {"data": {}, "code": "(free.evil.go)"}}});
@@ -485,7 +484,36 @@ fn many_hostile_events_stay_under_the_ceiling() {
         .collect();
     let o = out(json!("ok"), Value::Array(evs), Value::Null);
     let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
-    assert_eq!(r.event_pairs.len(), MAX_EVENT_PAIRS_CEILING);
-    assert_eq!(event_pair_cap(2000), MAX_EVENT_PAIRS_CEILING);
-    assert!(event_pair_cap(1) < 100);
+    assert_eq!(r.event_pairs.len(), MAX_EVENT_PAIRS_PER_TX);
+}
+
+// Well below the tail's per-emitter block cap (1,024).
+const _: () = assert!(MAX_EVENT_PAIRS_PER_TX <= 1024 / 2);
+
+/// Security review: events that yield no row (junk of an untracked emitter, TRANSFERs, events
+/// with nothing but amounts) cannot fund another event. One event naming many accounts keeps
+/// only its own allowance, however many junk events the tx carries.
+#[test]
+fn junk_events_do_not_raise_another_events_allowance() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(free.evil.go)"}}});
+    let mut evs: Vec<Value> = (0..1000)
+        .map(|i| ev("free.evil", "JUNK", json!([format!("k:junk-{i:04}")])))
+        .collect();
+    evs.extend((0..500).map(|_| ev("free.wiza", "NOTE", json!([{"decimal": "1.0"}, "7"]))));
+    let many: Vec<Value> = (0..200)
+        .map(|i| json!(format!("k:victim-{i:04}")))
+        .collect();
+    evs.push(ev("free.wiza", "SPAM", json!(many)));
+    let o = out(json!("ok"), Value::Array(evs), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
+    assert_eq!(
+        r.event_pairs.len(),
+        MAX_EVENT_PAIRS_PER_EVENT,
+        "{}",
+        r.event_pairs.len()
+    );
+    assert!(r
+        .event_pairs
+        .iter()
+        .all(|(a, _)| a.starts_with("k:victim-")));
 }
