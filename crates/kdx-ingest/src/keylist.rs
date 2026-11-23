@@ -17,7 +17,8 @@
 //!   a slow node read cannot hold up dirty rows, NFTs or history slices. One step, one
 //!   `(token, chain)`: one `describe-module` read, then one `keys` read per ledger table, each
 //!   sent once with [`READ_TIMEOUT`] (no retry inside the client). At most one step per
-//!   [`STEP_EVERY`], inside the shared `/local` rate limit. Progress (`Meta
+//!   [`STEP_EVERY`], inside the shared `/local` rate limit. A panic in the task is logged at
+//!   ERROR and the task restarted after [`PANIC_PAUSE`] (R-4). Progress (`Meta
 //!   balances_keylist/<module>`) is kept per step, so a restart resumes.
 //! - A module with no ledger table on a chain lists nothing there, like a module not deployed
 //!   (no failure; looked at again at the next sweep).
@@ -83,6 +84,8 @@ pub const NODE_PAUSE: Duration = Duration::from_secs(30);
 pub const NODE_PAUSE_MAX: Duration = Duration::from_secs(600);
 /// Pause after an error of the store.
 const STORE_PAUSE: Duration = Duration::from_secs(60);
+/// Pause before the listing task is started again after a panic.
+const PANIC_PAUSE: Duration = Duration::from_secs(60);
 /// Most ledger tables listed per module and chain.
 pub const MAX_TABLES: usize = 4;
 /// Most keys one `(token, table, chain)` listing may answer; a bigger one is refused whole
@@ -853,10 +856,49 @@ fn fail(
     .context("key listing stats")
 }
 
-/// The key listing as its own task (PR #27 H-1): steps paced by [`STEP_EVERY`] (and the node
-/// pauses), apart from the reconcile loop, until `stop`. A store error is logged and the task
-/// pauses; it never ends the reconcile.
+/// The key listing as its own task (PR #27 H-1), kept alive: a panic in it is logged at ERROR
+/// and the task restarted after [`PANIC_PAUSE`] (R-4; its progress is in the store, so it
+/// resumes), until `stop`.
 pub async fn run(
+    ctx: Arc<Ctx>,
+    local: Arc<LocalClient>,
+    caps: crate::reconcile::Caps,
+    stop: CancellationToken,
+) {
+    supervise(&stop, PANIC_PAUSE, || {
+        tokio::spawn(run_task(ctx.clone(), local.clone(), caps, stop.clone()))
+    })
+    .await;
+}
+
+/// Run the task `start` makes until it ends by itself (`stop`); when it panics, log at ERROR,
+/// wait `pause` and start it again.
+async fn supervise(
+    stop: &CancellationToken,
+    pause: Duration,
+    mut start: impl FnMut() -> tokio::task::JoinHandle<()>,
+) {
+    loop {
+        match start().await {
+            Ok(()) => return,
+            Err(e) if e.is_panic() => {
+                tracing::error!(error = %e, pause_s = pause.as_secs(),
+                    "balances: key listing task panicked; restarting after a pause");
+            }
+            // Cancelled by a runtime shutdown.
+            Err(_) => return,
+        }
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
+}
+
+/// The listing loop: steps paced by [`STEP_EVERY`] (and the node pauses), apart from the
+/// reconcile loop, until `stop`. A store error is logged and the loop pauses; it never ends the
+/// reconcile.
+async fn run_task(
     ctx: Arc<Ctx>,
     local: Arc<LocalClient>,
     caps: crate::reconcile::Caps,
@@ -1634,6 +1676,43 @@ mod tests {
         let st = state(&ro, ids[0]).unwrap();
         assert!(!st.unlistable(), "{st:?}");
         assert!(st.fail_total < FAIL_BUDGET / 2, "{st:?}");
+    }
+
+    /// R-4: a panic in the listing task is not lost: the supervisor restarts the task after
+    /// the pause (and logs it at ERROR), and a clean end by `stop` ends the supervisor.
+    #[tokio::test]
+    async fn a_panic_in_the_listing_task_restarts_it() {
+        let stop = CancellationToken::new();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (s2, st2) = (starts.clone(), stop.clone());
+        let sup = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                supervise(&stop, Duration::from_millis(20), move || {
+                    let n = s2.fetch_add(1, Ordering::SeqCst);
+                    let stop = st2.clone();
+                    tokio::spawn(async move {
+                        if n < 2 {
+                            panic!("injected panic {n}");
+                        }
+                        stop.cancelled().await;
+                    })
+                })
+                .await
+            }
+        });
+        let t0 = Instant::now();
+        while starts.load(Ordering::SeqCst) < 3 {
+            assert!(t0.elapsed() < Duration::from_secs(5), "not restarted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!sup.is_finished(), "the third run is alive");
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), sup)
+            .await
+            .expect("supervisor ends on stop")
+            .unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 3);
     }
 
     /// `free.KAYC` (chain 0, D3 gap group 3), as `describe-module` answered it.

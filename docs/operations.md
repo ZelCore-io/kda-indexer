@@ -825,7 +825,7 @@ most every 7 days; the token goes to the back of the queue meanwhile. A connecti
 error, or a timeout of the small `describe-module` read (the node stalls, not the token), pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
 in a row. A token that runs up 32 chain failures with no clean round between is marked
 unlistable (logged at WARN, `--status` `keylist_tokens.unlistable`) and left alone for 30
-days, then tried once more with a fresh budget. The listing waits, like the receivers pass,
+days, then tried once more with a fresh budget. A panic in the listing task is logged at ERROR (`balances: key listing task panicked`) and the task is restarted after 60 s; its progress is in the store. The listing waits, like the receivers pass,
 until the store has a tail and its backfill is complete.
 
 Effective limit: the 150,000-key cap and the 90 s timeout, whichever comes first. The node
