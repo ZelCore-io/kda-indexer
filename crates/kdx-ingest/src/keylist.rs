@@ -1285,6 +1285,47 @@ mod tests {
         assert_eq!(hot.count(Table::BalanceDirty).unwrap(), 2);
     }
 
+    /// PR #27 review note 13: a listing answer over the node client's body cap (1 MB here) is
+    /// refused through the real client after one request, fails only that chain and marks
+    /// nothing.
+    #[tokio::test]
+    async fn an_answer_over_the_body_cap_fails_the_chain_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |chain, code, _| {
+            if code.contains("describe-module") {
+                return ok(json!(KAYC));
+            }
+            if chain == 1 {
+                return ok(json!(["ROOT"]));
+            }
+            let keys: Vec<String> = (0..20_000).map(|i| format!("k:{i:062}")).collect();
+            ok(json!(keys))
+        });
+        let (ctx, local, ids, calls) = setup(dir.path(), &["free.big"], answer);
+        let mut kl = KeyList::default();
+        run_steps(&ctx, &local, &mut kl, 5).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "2 describe + 2 keys, no retry"
+        );
+        let ro = ctx.hot.ro().unwrap();
+        assert_eq!(
+            ro.count(Table::BalanceDirty).unwrap(),
+            1,
+            "chain 1 ROOT only"
+        );
+        let st = state(&ro, ids[0]).unwrap();
+        assert_eq!(st.chains.iter().map(|c| c.chain).collect::<Vec<_>>(), [0]);
+        let stats: Stats =
+            serde_json::from_slice(&ro.meta(meta::KEYLIST_STATS).unwrap().unwrap()).unwrap();
+        let why = stats.last_failure.unwrap();
+        assert!(
+            why.contains("invalid answer") && why.contains("exceeds"),
+            "{why}"
+        );
+    }
+
     /// PR #27 review note 1: the room under the row cap counts the marks this round already
     /// made (the module's `rows` grow only when the reconcile reads them), so listings on
     /// several chains together stay under the cap.
