@@ -1341,6 +1341,7 @@ async fn run_with(
     let mut last_log = Instant::now();
     let mut watch = BranchWatch::default();
     let mut history = History::default();
+    let mut keylist = crate::keylist::KeyList::default();
     loop {
         if stop.is_cancelled() {
             return Ok(());
@@ -1381,6 +1382,14 @@ async fn run_with(
             }
         }
         let walked = o.seed && history_slice(&ctx, &mut history, o.caps.history_slice_txs).await?;
+        // D3 gap groups 3 and 4: rows no tx names, from the node's key listing (paced).
+        let listed = o.seed
+            && crate::keylist::step(&ctx, &local, &o.caps, &mut keylist)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "balances: key listing step failed; retried later");
+                    false
+                });
         // NFT rows (plan Task 11) share the `/local` budget; the table is small, so one step
         // per loop keeps them current even behind a long balance backlog.
         let nft = crate::nft_fill::step(&ctx.hot, &local, &mut nft_cursor).await?;
@@ -1401,6 +1410,7 @@ async fn run_with(
                 .set(balances::dirty_count(&ctx.hot.ro()?)? as i64);
             // Off-branch NFT answers (D2) are not progress either: no immediate re-loop.
             if walked
+                || listed
                 || nft.rows() > nft.node_errors + nft.other_branch
                 || det.calls() > det.node_errors
             {

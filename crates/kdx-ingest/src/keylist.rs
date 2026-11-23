@@ -57,6 +57,10 @@ pub const NODE_TRIES: u32 = 3;
 pub const NODE_RETRY: Duration = Duration::from_secs(30);
 /// Most ledger tables listed per module and chain.
 pub const MAX_TABLES: usize = 4;
+/// Most keys one `(token, table, chain)` listing may answer; a bigger one is refused whole
+/// (fail-closed). Lower than the node client's [`MAX_LISTED_KEYS`]: the largest non-coin
+/// token on mainnet (`free.finux`, 126,246 rows in all, 2026-11-22) fits.
+pub const MAX_KEYS_PER_LISTING: usize = 150_000;
 
 /// Replace string literals by `""` and drop `;` comments, so the scan below sees only code.
 /// A Pact string may span lines (`\` continuations); an unterminated one runs to the end.
@@ -265,6 +269,21 @@ pub fn due(txn: &impl Txn, dict: &impl Dict, now: u32) -> Result<Vec<(u32, Strin
     Ok(out)
 }
 
+/// `(listed, in progress, with a failed chain)` token counts of the key listing (`--status`).
+pub fn summary(txn: &impl Txn) -> Result<(u64, u64, u64)> {
+    let p = meta::KEYLIST.as_bytes();
+    let (mut listed, mut running, mut failed) = (0, 0, 0);
+    for (_, v) in txn.scan(Table::Meta, p, |k| k.starts_with(p))? {
+        let Some(st) = ListState::decode(&v) else {
+            continue;
+        };
+        listed += u64::from(st.listed_at > 0);
+        running += u64::from(st.next_chain > 0);
+        failed += u64::from(st.failed != 0);
+    }
+    Ok((listed, running, failed))
+}
+
 /// What one listing marked.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marked {
@@ -280,7 +299,10 @@ pub struct Marked {
 
 /// Mark the listed `keys` of `module` on `chain` that we hold nothing for, at `height` (the
 /// block the node read), through the postings' mark path. Names are interned (lock order:
-/// dictionary, then the MDBX writer).
+/// dictionary, then the MDBX writer), but only for keys that will be marked: a module with a
+/// not-fungible verdict or at its row cap interns and marks nothing, and new keys stop at the
+/// room left under `row_cap` (I-7: its `Balances` rows plus this listing's marks), so a hostile
+/// token's long listing cannot grow the dictionary past what the cap allows.
 pub fn mark_keys(
     hot: &HotStore,
     dict: &Mutex<HotDict>,
@@ -288,6 +310,7 @@ pub fn mark_keys(
     chain: u8,
     keys: &[String],
     height: u32,
+    row_cap: u32,
 ) -> Result<Marked> {
     let mut d = dict.lock().unwrap_or_else(|e| e.into_inner());
     let r = (|| -> Result<Marked> {
@@ -297,6 +320,12 @@ pub fn mark_keys(
             listed: keys.len() as u64,
             ..Marked::default()
         };
+        let t = balances::token_row(&txn, module)?.unwrap_or_default();
+        if t.kind == KIND_NOT_FUNGIBLE || t.capped() {
+            m.skipped = m.listed;
+            return Ok(m);
+        }
+        let mut room = u64::from(row_cap.saturating_sub(t.rows));
         for a in keys {
             if a.is_empty() || a.len() > MAX_NAME_LEN {
                 m.skipped += 1;
@@ -312,9 +341,14 @@ pub fn mark_keys(
                     continue;
                 }
             }
+            if room == 0 {
+                m.skipped += 1;
+                continue;
+            }
             let id = d.intern(DictKind::Account, a);
             if balances::mark_row(&mut txn, id, module, chain, height, coin)? {
                 m.marked += 1;
+                room -= 1;
             } else {
                 m.skipped += 1;
             }
@@ -380,6 +414,7 @@ fn now_unix() -> u32 {
 async fn list_chain(
     ctx: &Ctx,
     local: &LocalClient,
+    caps: &crate::reconcile::Caps,
     module: u32,
     name: &str,
     chain: u8,
@@ -396,7 +431,10 @@ async fn list_chain(
     }
     let mut lists = Vec::with_capacity(tables.len());
     for t in &tables {
-        match local.table_keys(chain, name, t, MAX_LISTED_KEYS).await {
+        match local
+            .table_keys(chain, name, t, MAX_KEYS_PER_LISTING.min(MAX_LISTED_KEYS))
+            .await
+        {
             Ok(Local::Found { value, height, .. }) => {
                 lists.push((value, u32::try_from(height).unwrap_or(u32::MAX)))
             }
@@ -405,11 +443,20 @@ async fn list_chain(
             Err(e) => return Ok(ChainResult::Failed(format!("keys {t}: {e}"))),
         }
     }
+    // The I-7 cap the reconcile applies to this module: confirmed `fungible-v2` modules get
+    // the larger one (F-14).
+    let trusted =
+        balances::token_row(&ctx.hot.ro()?, module)?.is_some_and(|t| t.fungible_chains != 0);
+    let row_cap = if trusted {
+        caps.fungible_module_rows
+    } else {
+        caps.module_rows
+    };
     let (hot, dict) = (ctx.hot.clone(), ctx.dict.clone());
     let total = tokio::task::spawn_blocking(move || -> Result<Marked> {
         let mut total = Marked::default();
         for (keys, height) in lists {
-            let m = mark_keys(&hot, &dict, module, chain, &keys, height)?;
+            let m = mark_keys(&hot, &dict, module, chain, &keys, height, row_cap)?;
             total.listed += m.listed;
             total.known += m.known;
             total.marked += m.marked;
@@ -423,7 +470,12 @@ async fn list_chain(
 
 /// One paced step of the key listing (see the module doc): returns whether it read the node.
 /// Errors of the store are returned; node trouble never is.
-pub async fn step(ctx: &Ctx, local: &LocalClient, kl: &mut KeyList) -> Result<bool> {
+pub async fn step(
+    ctx: &Ctx,
+    local: &LocalClient,
+    caps: &crate::reconcile::Caps,
+    kl: &mut KeyList,
+) -> Result<bool> {
     let now = Instant::now();
     if kl.next_at.is_some_and(|t| now < t) {
         return Ok(false);
@@ -461,7 +513,7 @@ pub async fn step(ctx: &Ctx, local: &LocalClient, kl: &mut KeyList) -> Result<bo
         st.next_chain = 0;
         return finish(ctx, kl, module, st);
     };
-    let res = list_chain(ctx, local, module, &name, chain).await?;
+    let res = list_chain(ctx, local, caps, module, &name, chain).await?;
     let mut txn = ctx.hot.rw()?;
     match res {
         ChainResult::Retry(e) => {
@@ -545,6 +597,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::reconcile::Caps;
     use crate::IngestOpts;
 
     type Answer = dyn Fn(u8, &str, &Value) -> Option<Value> + Send + Sync;
@@ -728,7 +781,7 @@ mod tests {
     async fn run_steps(ctx: &Ctx, local: &LocalClient, kl: &mut KeyList, n: usize) {
         for _ in 0..n {
             kl.next_at = None;
-            step(ctx, local, kl).await.unwrap();
+            step(ctx, local, &Caps::default(), kl).await.unwrap();
             if kl.queue.is_empty() && kl.refreshed.is_some() {
                 return;
             }
@@ -828,7 +881,7 @@ mod tests {
             .map(String::from)
             .chain([format!("k:{}", "a".repeat(MAX_NAME_LEN))])
             .collect();
-        let m = mark_keys(&ctx.hot, &ctx.dict, shatter, 0, &keys, 7_429_654).unwrap();
+        let m = mark_keys(&ctx.hot, &ctx.dict, shatter, 0, &keys, 7_429_654, 100).unwrap();
         assert_eq!(
             m,
             Marked {
@@ -847,8 +900,35 @@ mod tests {
         );
         assert_eq!(dirty(&ctx, have, shatter, 0), None);
         // A second listing marks nothing new.
-        let again = mark_keys(&ctx.hot, &ctx.dict, shatter, 0, &keys[..4], 7_429_700).unwrap();
+        let again = mark_keys(&ctx.hot, &ctx.dict, shatter, 0, &keys[..4], 7_429_700, 100).unwrap();
         assert_eq!(again.marked, 0);
+    }
+
+    /// Security review: a long listing of a module near its I-7 row cap interns and marks only
+    /// the room left; a module at its cap or with a not-fungible verdict interns nothing.
+    #[test]
+    fn a_long_listing_stops_at_the_row_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let toks = ["free.spam", "free.full", "free.notfung"];
+        let (ctx, _, ids, _) = setup(dir.path(), &toks, Arc::new(|_, _, _| None));
+        let mut txn = ctx.hot.rw().unwrap();
+        balances::update_token(&mut txn, ids[0], |t| t.rows = 98).unwrap();
+        balances::update_token(&mut txn, ids[1], |t| t.flags |= balances::TOKEN_CAPPED).unwrap();
+        balances::update_token(&mut txn, ids[2], |t| t.kind = KIND_NOT_FUNGIBLE).unwrap();
+        txn.commit().unwrap();
+        let keys: Vec<String> = (0..10_000).map(|i| format!("junk-{i}")).collect();
+        let accounts = || ctx.dict.lock().unwrap().len(DictKind::Account);
+        let before = accounts();
+        let m = mark_keys(&ctx.hot, &ctx.dict, ids[0], 0, &keys, 10, 100).unwrap();
+        assert_eq!((m.marked, m.skipped), (2, 9_998));
+        assert_eq!(accounts(), before + 2);
+        for &full in &ids[1..] {
+            let m = mark_keys(&ctx.hot, &ctx.dict, full, 0, &keys, 10, 100).unwrap();
+            assert_eq!((m.marked, m.skipped), (0, 10_000));
+        }
+        assert_eq!(accounts(), before + 2);
+        let hot = ctx.hot.ro().unwrap();
+        assert_eq!(hot.count(Table::BalanceDirty).unwrap(), 2);
     }
 
     /// D3 gap groups 3 and 4 end to end: `free.KAYC` `ROOT` (only in its code, written by
@@ -895,11 +975,12 @@ mod tests {
             ),
             (2, 3, 0)
         );
+        assert_eq!(summary(&ro).unwrap(), (2, 0, 0));
         // Listed: not due again before the sweep.
         drop(ro);
         kl.refreshed = None;
         kl.next_at = None;
-        assert!(!step(&ctx, &local, &mut kl).await.unwrap());
+        assert!(!step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 6);
     }
 
@@ -942,6 +1023,7 @@ mod tests {
         let stats: Stats =
             serde_json::from_slice(&ro.meta(meta::KEYLIST_STATS).unwrap().unwrap()).unwrap();
         assert_eq!(stats.chain_failures, 5);
+        assert_eq!(summary(&ro).unwrap(), (3, 0, 3));
         assert!(stats
             .last_failure
             .unwrap()
