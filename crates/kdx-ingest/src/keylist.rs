@@ -234,6 +234,8 @@ const FULL: u8 = 1;
 const UNLISTABLE: u8 = 2;
 /// Layout version of [`ListState::encode`].
 const STATE_V: u8 = 2;
+/// Bytes before the failed chains in that layout.
+const HEAD: usize = 14;
 
 /// One token's listing progress ([`meta::KEYLIST`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -247,20 +249,24 @@ pub struct ListState {
     pub flags: u8,
     /// Chain failures since the token's last round that ended with no failed chain.
     pub fail_total: u16,
+    /// Rows marked since the last full round began: the room under the row cap counts them,
+    /// as the module's `rows` grow only when the reconcile reads the marks (review note 1).
+    pub marked_round: u32,
     /// The chains whose last listing failed.
     pub chains: Vec<ChainFail>,
 }
 
 impl ListState {
-    /// Version, listed_at u32, next_chain, flags, fail_total u16, count, then per failed
-    /// chain: chain, fails, retry_at u32.
+    /// Version, listed_at u32, next_chain, flags, fail_total u16, marked_round u32, count,
+    /// then per failed chain: chain, fails, retry_at u32.
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(10 + 6 * self.chains.len());
+        let mut v = Vec::with_capacity(HEAD + 6 * self.chains.len());
         v.push(STATE_V);
         v.extend_from_slice(&self.listed_at.to_be_bytes());
         v.push(self.next_chain);
         v.push(self.flags);
         v.extend_from_slice(&self.fail_total.to_be_bytes());
+        v.extend_from_slice(&self.marked_round.to_be_bytes());
         v.push(self.chains.len().min(255) as u8);
         for c in self.chains.iter().take(255) {
             v.push(c.chain);
@@ -271,18 +277,18 @@ impl ListState {
     }
     /// None for another layout (the token is then listed as never listed).
     pub fn decode(v: &[u8]) -> Option<ListState> {
-        if v.len() < 10 || v[0] != STATE_V {
+        if v.len() < HEAD || v[0] != STATE_V {
             return None;
         }
-        let n = usize::from(v[9]);
-        if v.len() != 10 + 6 * n {
+        let n = usize::from(v[HEAD - 1]);
+        if v.len() != HEAD + 6 * n {
             return None;
         }
         let u32_at =
             |i: usize| -> Option<u32> { Some(u32::from_be_bytes(v[i..i + 4].try_into().ok()?)) };
         let chains = (0..n)
             .map(|i| {
-                let o = 10 + 6 * i;
+                let o = HEAD + 6 * i;
                 Some(ChainFail {
                     chain: v[o],
                     fails: v[o + 1],
@@ -295,6 +301,7 @@ impl ListState {
             next_chain: v[5],
             flags: v[6],
             fail_total: u16::from_be_bytes([v[7], v[8]]),
+            marked_round: u32_at(9)?,
             chains,
         })
     }
@@ -322,6 +329,9 @@ impl ListState {
         }
         let full = self.listed_at == 0 || now.saturating_sub(self.listed_at) >= SWEEP_SECS;
         self.flags = if full { FULL } else { 0 };
+        if full {
+            self.marked_round = 0;
+        }
     }
     /// Whether this round lists `chain` at `now`.
     fn selected(&self, chain: u8, now: u32) -> bool {
@@ -445,8 +455,10 @@ pub struct Marked {
 /// block the node read), through the postings' mark path. Names are interned (lock order:
 /// dictionary, then the MDBX writer), but only for keys that will be marked: a module with a
 /// not-fungible verdict or at its row cap interns and marks nothing, and new keys stop at the
-/// room left under `row_cap` (I-7: its `Balances` rows plus this listing's marks), so a hostile
-/// token's long listing cannot grow the dictionary past what the cap allows.
+/// room left under `row_cap` (I-7: its `Balances` rows, the `already` marks of this round's
+/// earlier listings not read yet, and this listing's marks), so a hostile token's long
+/// listings cannot grow the dictionary past what the cap allows.
+#[allow(clippy::too_many_arguments)]
 pub fn mark_keys(
     hot: &HotStore,
     dict: &Mutex<HotDict>,
@@ -455,6 +467,7 @@ pub fn mark_keys(
     keys: &[String],
     height: u32,
     row_cap: u32,
+    already: u64,
 ) -> Result<Marked> {
     let mut d = dict.lock().unwrap_or_else(|e| e.into_inner());
     let r = (|| -> Result<Marked> {
@@ -469,7 +482,7 @@ pub fn mark_keys(
             m.skipped = m.listed;
             return Ok(m);
         }
-        let mut room = u64::from(row_cap.saturating_sub(t.rows));
+        let mut room = u64::from(row_cap.saturating_sub(t.rows)).saturating_sub(already);
         for a in keys {
             if a.is_empty() || a.len() > MAX_NAME_LEN {
                 m.skipped += 1;
@@ -587,6 +600,7 @@ fn node_result(what: &str, e: NodeError) -> ChainResult {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn list_chain(
     ctx: &Ctx,
     local: &LocalClient,
@@ -595,6 +609,7 @@ async fn list_chain(
     module: u32,
     name: &str,
     chain: u8,
+    already: u64,
 ) -> Result<ChainResult> {
     let code = match local.module_code(chain, name, timeout).await {
         Ok(Local::Absent) => return Ok(ChainResult::Done(Marked::default())),
@@ -631,7 +646,8 @@ async fn list_chain(
     let total = tokio::task::spawn_blocking(move || -> Result<Marked> {
         let mut total = Marked::default();
         for (keys, height) in lists {
-            let m = mark_keys(&hot, &dict, module, chain, &keys, height, row_cap)?;
+            let before = already + total.marked;
+            let m = mark_keys(&hot, &dict, module, chain, &keys, height, row_cap, before)?;
             total.listed += m.listed;
             total.known += m.known;
             total.marked += m.marked;
@@ -696,7 +712,18 @@ pub async fn step(
         txn.commit()?;
         return Ok(false);
     };
-    let res = list_chain(ctx, local, caps, kl.read_timeout, module, &name, chain).await?;
+    let already = u64::from(st.marked_round);
+    let res = list_chain(
+        ctx,
+        local,
+        caps,
+        kl.read_timeout,
+        module,
+        &name,
+        chain,
+        already,
+    )
+    .await?;
     let mut txn = ctx.hot.rw()?;
     let mut failed = false;
     match res {
@@ -722,6 +749,9 @@ pub async fn step(
         ChainResult::Done(m) => {
             kl.pause = Duration::ZERO;
             st.cleared(chain);
+            st.marked_round = st
+                .marked_round
+                .saturating_add(u32::try_from(m.marked).unwrap_or(u32::MAX));
             if m.marked > 0 {
                 tracing::info!(module = %name, chain, listed = m.listed, marked = m.marked,
                     "balances: key listing marked rows no tx names");
@@ -1068,6 +1098,7 @@ mod tests {
             next_chain: 3,
             flags: FULL,
             fail_total: 7,
+            marked_round: 9,
             chains: vec![ChainFail {
                 chain: 19,
                 fails: 2,
@@ -1189,7 +1220,7 @@ mod tests {
             .map(String::from)
             .chain([format!("k:{}", "a".repeat(MAX_NAME_LEN))])
             .collect();
-        let m = mark_keys(&ctx.hot, &ctx.dict, shatter, 0, &keys, 7_429_654, 100).unwrap();
+        let m = mark_keys(&ctx.hot, &ctx.dict, shatter, 0, &keys, 7_429_654, 100, 0).unwrap();
         assert_eq!(
             m,
             Marked {
@@ -1208,7 +1239,17 @@ mod tests {
         );
         assert_eq!(dirty(&ctx, have, shatter, 0), None);
         // A second listing marks nothing new.
-        let again = mark_keys(&ctx.hot, &ctx.dict, shatter, 0, &keys[..4], 7_429_700, 100).unwrap();
+        let again = mark_keys(
+            &ctx.hot,
+            &ctx.dict,
+            shatter,
+            0,
+            &keys[..4],
+            7_429_700,
+            100,
+            0,
+        )
+        .unwrap();
         assert_eq!(again.marked, 0);
     }
 
@@ -1227,16 +1268,48 @@ mod tests {
         let keys: Vec<String> = (0..10_000).map(|i| format!("junk-{i}")).collect();
         let accounts = || ctx.dict.lock().unwrap().len(DictKind::Account);
         let before = accounts();
-        let m = mark_keys(&ctx.hot, &ctx.dict, ids[0], 0, &keys, 10, 100).unwrap();
+        let m = mark_keys(&ctx.hot, &ctx.dict, ids[0], 0, &keys, 10, 100, 0).unwrap();
         assert_eq!((m.marked, m.skipped), (2, 9_998));
         assert_eq!(accounts(), before + 2);
         for &full in &ids[1..] {
-            let m = mark_keys(&ctx.hot, &ctx.dict, full, 0, &keys, 10, 100).unwrap();
+            let m = mark_keys(&ctx.hot, &ctx.dict, full, 0, &keys, 10, 100, 0).unwrap();
             assert_eq!((m.marked, m.skipped), (0, 10_000));
         }
         assert_eq!(accounts(), before + 2);
         let hot = ctx.hot.ro().unwrap();
         assert_eq!(hot.count(Table::BalanceDirty).unwrap(), 2);
+    }
+
+    /// PR #27 review note 1: the room under the row cap counts the marks this round already
+    /// made (the module's `rows` grow only when the reconcile reads them), so listings on
+    /// several chains together stay under the cap.
+    #[tokio::test]
+    async fn the_row_cap_holds_across_the_listings_of_a_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |_, code, _| {
+            if code.contains("describe-module") {
+                return ok(json!(KAYC));
+            }
+            let keys: Vec<String> = (0..5).map(|i| format!("junk-{i}")).collect();
+            ok(json!(keys))
+        });
+        let (ctx, local, ids, _) = setup(dir.path(), &["free.spam"], answer);
+        let caps = Caps {
+            module_rows: 7,
+            ..Caps::default()
+        };
+        let mut kl = KeyList::default();
+        for _ in 0..3 {
+            kl.next_at = None;
+            step(&ctx, &local, &caps, &mut kl).await.unwrap();
+        }
+        let ro = ctx.hot.ro().unwrap();
+        assert_eq!(
+            ro.count(Table::BalanceDirty).unwrap(),
+            7,
+            "5 on chain 0, 2 on chain 1"
+        );
+        assert_eq!(state(&ro, ids[0]).unwrap().marked_round, 7);
     }
 
     /// D3 gap groups 3 and 4 end to end: `free.KAYC` `ROOT` (only in its code, written by

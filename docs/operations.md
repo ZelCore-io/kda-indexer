@@ -812,7 +812,8 @@ Only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are mar
 the postings' mark path, at the height the node read; the reconcile then reads them like any
 dirty row. Names are interned only for keys that will be marked, and new keys of a module stop
 at the room left under its row cap (`fungible_module_rows` for confirmed `fungible-v2`
-modules, `module_rows` otherwise). A chain where the module is not deployed, or where its
+modules, `module_rows` otherwise), counting its rows and the marks of the sweep's earlier
+chains that the reconcile has not read yet. A chain where the module is not deployed, or where its
 table was never created, lists nothing.
 
 Fail-closed, per (token, chain): a read timeout, a listing over 150,000 keys, an unusable
