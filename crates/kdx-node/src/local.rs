@@ -101,14 +101,28 @@ pub type LocalResult<T> = std::result::Result<Local<T>, LocalError>;
 
 /// The B-1 module name check: `name` or `namespace.name`, identifier characters only.
 pub fn valid_module(m: &str) -> bool {
-    fn ident(s: &str) -> bool {
-        let mut b = s.bytes();
-        matches!(b.next(), Some(c) if c.is_ascii_alphabetic() || c == b'_')
-            && b.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-    }
     let mut parts = m.splitn(2, '.');
     let first = parts.next().unwrap_or("");
-    ident(first) && parts.next().is_none_or(ident)
+    valid_ident(first) && parts.next().is_none_or(valid_ident)
+}
+
+/// One Pact identifier (a namespace, module or table name): identifier characters only, so
+/// it can be written into code as text.
+pub fn valid_ident(s: &str) -> bool {
+    let mut b = s.bytes();
+    matches!(b.next(), Some(c) if c.is_ascii_alphabetic() || c == b'_')
+        && b.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+/// Most keys one `keys` listing may answer ([`LocalClient::table_keys`]); a bigger table is
+/// refused whole (about 70 bytes a key: 250,000 keys is about 17 MB of answer). The largest
+/// token table measured on mainnet01 (`kaddex.kdx` chain 2, 2026-11-23) has 9,480 keys.
+pub const MAX_LISTED_KEYS: usize = 250_000;
+
+/// The failure message means the module is not deployed on this chain (Pact 5, measured on
+/// mainnet01: `Cannot find module: free.ba-t1`).
+pub fn is_no_module_message(msg: &str) -> bool {
+    msg.starts_with("Cannot find module: ")
 }
 
 /// The failure message means "no such row" (Pact 5 `No value found in table …`, Pact 4
@@ -412,6 +426,41 @@ impl LocalClient {
         }
     }
 
+    /// `(at 'code (describe-module (read-msg "m")))` with `data {"m": module}`: the module's
+    /// code on `chain`, absent when the module is not deployed there.
+    pub async fn module_code(&self, chain: u8, module: &str) -> LocalResult<String> {
+        check_module(module)?;
+        code_of(
+            self.call(
+                chain,
+                "(at 'code (describe-module (read-msg \"m\")))",
+                json!({ "m": module }),
+            )
+            .await,
+        )
+    }
+
+    /// `(keys {module}.{table})`: every row key of a module's table on `chain`, at most
+    /// `max` (D3 gap groups 3 and 4: rows no tx names). The node allows it in `/local` for
+    /// any module's table and charges a flat 40,000 gas whatever the table's size (measured
+    /// on mainnet01, 2026-11-23: 4 keys and 9,480 keys alike).
+    pub async fn table_keys(
+        &self,
+        chain: u8,
+        module: &str,
+        table: &str,
+        max: usize,
+    ) -> LocalResult<Vec<String>> {
+        check_module(module)?;
+        if !valid_ident(table) {
+            return Err(LocalError::Skipped("table name fails the B-1 check".into()));
+        }
+        let r = self
+            .call(chain, &format!("(keys {module}.{table})"), json!({}))
+            .await?;
+        keys_of(r, max)
+    }
+
     /// `(describe-keyset (read-msg "k"))` with `data {"k": name}`: the keyset JSON, or null
     /// when it is over [`MAX_GUARD_JSON`] bytes (F-14).
     pub async fn describe_keyset(&self, chain: u8, name: &str) -> LocalResult<Value> {
@@ -497,6 +546,57 @@ impl LocalClient {
 }
 
 /// F-14: a guard whose JSON is over [`MAX_GUARD_JSON`] bytes becomes null; true when it did.
+/// A `describe-module` code answer: the code text; a module not on the chain is absent.
+fn code_of(r: LocalResult<Value>) -> LocalResult<String> {
+    match r {
+        Ok(Local::Found {
+            value: Value::String(code),
+            height,
+            prev_hash,
+        }) => Ok(Local::Found {
+            value: code,
+            height,
+            prev_hash,
+        }),
+        Ok(Local::Found { .. }) => Err(invalid("describe-module: code is not a string")),
+        Ok(Local::Absent) => Ok(Local::Absent),
+        Err(LocalError::Failure(m)) if is_no_module_message(&m) => Ok(Local::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+/// A `keys` answer: every key a string, at most `max` of them (else the whole answer is
+/// unusable: a partial listing would look complete).
+fn keys_of(r: Local<Value>, max: usize) -> LocalResult<Vec<String>> {
+    let (value, height, prev_hash) = match r {
+        Local::Absent => return Ok(Local::Absent),
+        Local::Found {
+            value,
+            height,
+            prev_hash,
+        } => (value, height, prev_hash),
+    };
+    let Value::Array(items) = value else {
+        return Err(invalid("keys: not a list"));
+    };
+    if items.len() > max {
+        return Err(invalid(&format!("keys: {} keys, over {max}", items.len())));
+    }
+    let keys = items
+        .into_iter()
+        .map(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| invalid("keys: a key is not a string"))?;
+    Ok(Local::Found {
+        value: keys,
+        height,
+        prev_hash,
+    })
+}
+
 fn capped_guard(g: Value) -> (Value, bool) {
     if g.to_string().len() > MAX_GUARD_JSON {
         (Value::Null, true)
@@ -871,6 +971,69 @@ mod tests {
         let absent = json!({"result": {"status": "failure",
             "error": {"message": "No value found in table coin_coin-table for key: x"}}});
         assert_eq!(classify(&absent).unwrap(), Local::Absent);
+    }
+
+    /// D3 gap groups 3 and 4 (KDA-03 node, 2026-11-23): `describe-module` answers the code;
+    /// a module not deployed on the chain is absent, not a failure.
+    #[test]
+    fn module_code_answers() {
+        let meta = json!({"blockHeight": 11, "prevBlockHash": "H10"});
+        let ok = json!({"result": {"status": "success",
+            "data": "(module KAYC GOVERNANCE (deftable token-table:{token-schema}))"},
+            "metaData": meta});
+        let Local::Found { value, height, .. } = code_of(classify(&ok)).unwrap() else {
+            panic!("found")
+        };
+        assert!(value.starts_with("(module KAYC"));
+        assert_eq!(height, 10);
+        let gone = json!({"result": {"status": "failure", "error": {"callStack": [],
+            "type": "EvalError", "message": "Cannot find module: free.ba-t1",
+            "info": "<toplevel>:0"}}});
+        assert_eq!(code_of(classify(&gone)).unwrap(), Local::Absent);
+        let num =
+            json!({"result": {"status": "success", "data": 1}, "metaData": {"blockHeight": 2}});
+        assert!(matches!(
+            code_of(classify(&num)),
+            Err(LocalError::Invalid(_))
+        ));
+    }
+
+    /// `(keys free.shatter.token-table)` on chain 0 answered these four keys (gas 40003); a
+    /// non-string key or a listing over the cap is unusable, never cut short.
+    #[test]
+    fn table_keys_answers() {
+        let meta = json!({"blockHeight": 11, "prevBlockHash": "H10"});
+        let four = [
+            "GeorgePublish",
+            "ROOT",
+            "k:0d39e69d5a71e4abf926c84cc12fcef7eb7e993ce062a77dc692c9715b3b7ad4",
+            "k:acca57aef1ef1f99e9948fa811c3c8c187af18f9424071a6cec956ea5d3737c6",
+        ];
+        let ok = json!({"result": {"status": "success", "data": four}, "metaData": meta});
+        let Local::Found { value, .. } = keys_of(classify(&ok).unwrap(), 4).unwrap() else {
+            panic!("found")
+        };
+        assert_eq!(value, four);
+        assert!(matches!(
+            keys_of(classify(&ok).unwrap(), 3),
+            Err(LocalError::Invalid(m)) if m.contains("over 3")
+        ));
+        let mixed = json!({"result": {"status": "success", "data": ["a", 1]}, "metaData": meta});
+        assert!(matches!(
+            keys_of(classify(&mixed).unwrap(), 4),
+            Err(LocalError::Invalid(_))
+        ));
+    }
+
+    /// The table name goes into the code as text: identifier characters only.
+    #[test]
+    fn table_names_are_checked() {
+        assert!(valid_ident("token-table"));
+        assert!(valid_ident("coin_table2"));
+        assert!(!valid_ident("t) (coin.transfer"));
+        assert!(!valid_ident("ns.t"));
+        assert!(!valid_ident(""));
+        assert!(!valid_ident("1t"));
     }
 
     #[test]
