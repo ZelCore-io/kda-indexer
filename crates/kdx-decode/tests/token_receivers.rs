@@ -555,6 +555,22 @@ fn a_deploy_tx_counts_as_calling_its_own_module() {
         "{:?}",
         r.exec_pairs
     );
+    // Security review: deploying a throwaway module gives no bigger cap to calls into another
+    // tracked token; that token keeps the normal exec cap.
+    let mut lits = String::new();
+    for i in 0..300 {
+        lits.push_str(&format!(" \"k:victim-{i:04}\""));
+    }
+    let code = format!("(namespace 'free) (module junk G (defun f () 1)) (free.hype-coin.f{lits})");
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}});
+    let r = token_receivers(Some(&cmd), &o, 3_700_000, MAINNET01, &tokens);
+    let hype = r
+        .exec_pairs
+        .iter()
+        .filter(|(_, m)| m == "free.hype-coin")
+        .count();
+    assert_eq!(hype, MAX_EXEC_PAIRS_PER_TX, "{hype}");
+    assert_eq!(r.exec_pairs.len(), MAX_EXEC_PAIRS_PER_TX);
     // `module` inside a string or comment is no deploy.
     let code = "; (module kpepe G)\n(user.f \"(module kpepe G)\" \"ROOT\")";
     let cmd = json!({"payload": {"exec": {"data": {"ns": "free"}, "code": code}}});

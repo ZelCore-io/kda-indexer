@@ -341,11 +341,19 @@ impl TokenReceivers {
             self.event_emitters.push(emitter.to_owned());
         }
     }
-    fn push_exec(&mut self, account: &str, module: &str, sender: &str, cap: usize) {
+    /// An exec row, counted in `used` (its own budget: normal calls or a deployed module).
+    fn push_exec(
+        &mut self,
+        account: &str,
+        module: &str,
+        sender: &str,
+        used: &mut usize,
+        cap: usize,
+    ) {
         if module != "coin"
             && account_like(account)
             && readable_module(module)
-            && self.exec_pairs.len() < cap
+            && *used < cap
             && !self
                 .exec_pairs
                 .iter()
@@ -354,6 +362,7 @@ impl TokenReceivers {
             self.exec_pairs
                 .push((account.to_owned(), module.to_owned()));
             self.exec_emitters.push(format!("{EXEC_BUCKET}{sender}"));
+            *used += 1;
         }
     }
     fn discover(&mut self, module: &str) {
@@ -413,17 +422,18 @@ pub struct D3Event {
 pub struct D3Exec {
     /// Below the events fork: the strings count for coin too (uncapped).
     pub coin: bool,
-    /// Modules the code calls (`<m>.fn`) or deploys (`(module <m> ..)`, which then runs its
-    /// own functions unqualified), minus those that emitted an event in the tx from the events
-    /// fork on; the filter keeps the tracked tokens.
+    /// Modules the code calls (`<m>.fn`) and does not deploy, minus those that emitted an
+    /// event in the tx from the events fork on; the filter keeps the tracked tokens.
     pub called: Vec<String>,
-    /// The code deploys a module ([`MAX_DEPLOY_EXEC_PAIRS`] applies).
-    pub deploy: bool,
+    /// Modules the code deploys (`(module <m> ..)`, which then runs its own functions
+    /// unqualified), same event rule. Only they get [`Self::deploy_strings`].
+    pub deployed: Vec<String>,
     /// Distinct [`account_like`] strings of `exec.data`, `exec.code` literals and
-    /// `result.data`, first-seen order; capped at [`MAX_EXEC_PAIRS_PER_TX`]
-    /// ([`MAX_DEPLOY_EXEC_PAIRS`] for a deploy, whose code literals with whitespace are
-    /// skipped) unless `coin`.
+    /// `result.data`, first-seen order; capped at [`MAX_EXEC_PAIRS_PER_TX`] unless `coin`.
     pub strings: Vec<String>,
+    /// For the deployed modules only: distinct code literals without whitespace, at most
+    /// [`MAX_DEPLOY_EXEC_PAIRS`] (data and result strings never get the deploy allowance).
+    pub deploy_strings: Vec<String>,
     /// `meta.sender` of the cmd (empty when absent): the budget key of the token rows.
     pub sender: String,
 }
@@ -527,34 +537,40 @@ pub fn d3_candidates(
         // emitted nothing of the token at all needs the exec strings (dry run on KDA-03: without
         // this, millions of extra reads).
         let data = cmd.pointer("/payload/exec/data");
-        let deployed = deployed_modules(code, data);
-        let deploy = !deployed.is_empty();
+        let keep = |m: &String| m != "coin" && (coin || !emitted.contains(m));
+        let deployed: Vec<String> = deployed_modules(code, data)
+            .into_iter()
+            .filter(keep)
+            .collect();
         let mut called: Vec<String> = Vec::new();
-        for m in called_modules(code).into_iter().chain(deployed) {
-            if m != "coin" && (coin || !emitted.contains(&m)) && !called.contains(&m) {
+        for m in called_modules(code).into_iter().filter(keep) {
+            if !called.contains(&m) && !deployed.contains(&m) {
                 called.push(m);
             }
         }
-        if coin || !called.is_empty() {
+        if coin || !called.is_empty() || !deployed.is_empty() {
             let cap = if coin {
                 usize::MAX
-            } else if deploy {
-                MAX_DEPLOY_EXEC_PAIRS
             } else {
                 MAX_EXEC_PAIRS_PER_TX
             };
             let mut strings = Vec::new();
+            let mut deploy_strings = Vec::new();
             let mut add = |s: &str| push_distinct(&mut strings, s, cap);
             if let Some(d) = data {
                 data_strings(d, &mut add);
             }
-            for s in code_literals(code) {
-                if !(deploy && !coin && s.contains(char::is_whitespace)) {
-                    add(&s);
-                }
+            let literals = code_literals(code);
+            for s in &literals {
+                add(s);
             }
             if let Some(d) = output.pointer("/result/data") {
                 data_strings(d, &mut add);
+            }
+            if !deployed.is_empty() {
+                for s in literals.iter().filter(|s| !s.contains(char::is_whitespace)) {
+                    push_distinct(&mut deploy_strings, s, MAX_DEPLOY_EXEC_PAIRS);
+                }
             }
             let sender = cmd
                 .pointer("/meta/sender")
@@ -564,8 +580,9 @@ pub fn d3_candidates(
             c.exec = Some(D3Exec {
                 coin,
                 called,
-                deploy,
+                deployed,
                 strings,
+                deploy_strings,
                 sender,
             });
         }
@@ -640,18 +657,21 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
             }
         }
         // Coin rows (below the events fork) as in D1; token rows are capped like events.
+        let mut used = 0;
         for m in modules {
             for s in &x.strings {
                 if m == "coin" {
                     r.push(s, m);
                 } else {
-                    let cap = if x.deploy {
-                        MAX_DEPLOY_EXEC_PAIRS
-                    } else {
-                        MAX_EXEC_PAIRS_PER_TX
-                    };
-                    r.push_exec(s, m, &x.sender, cap);
+                    r.push_exec(s, m, &x.sender, &mut used, MAX_EXEC_PAIRS_PER_TX);
                 }
+            }
+        }
+        // A deployed tracked token: its own literal budget, never shared with other calls.
+        let mut used = 0;
+        for m in x.deployed.iter().filter(|m| is_token(m)) {
+            for s in &x.deploy_strings {
+                r.push_exec(s, m, &x.sender, &mut used, MAX_DEPLOY_EXEC_PAIRS);
             }
         }
     }
