@@ -747,9 +747,12 @@ own state; queues each in `Meta balances_d3_rewalk/<ModuleId>`; and deletes
 `balances_d3_rewalk_at`, so the service starts the walk at its next history slice instead of a
 day after the last one. A walk in progress is restarted from height 0 with its own tokens and the
 new ones together (its tokens stay queued until a walk ends). It prints `posting_rows_marked`,
-`rewalk_queued`, `walk_in_progress_restarted` and `rewalk_pending`. An unknown module name is an
-error and writes nothing. Start the service again; it reconciles the marks and runs the walk
-(`--status` shows `d3_rewalk_pending`). Only tracked tokens are walked.
+`rewalk_queued`, `walk_in_progress_restarted` and `rewalk_pending`. An unknown module name, or
+`coin` (it would mark every coin holder; use `--seed` or `--all`), is an error and writes
+nothing. Running it again marks nothing new but restarts a walk in progress from 0 again (about
+14 h on mainnet). Start the service again; it reconciles the marks and runs the walk
+(`--status` shows `d3_rewalk_pending`). Only tracked tokens are walked; an untracked name is
+queued and silently skipped by the walk, so check `/tokens` or `--status` first.
 
 Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
 Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot read them.

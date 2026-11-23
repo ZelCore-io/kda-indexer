@@ -232,6 +232,7 @@ enum Command {
         /// `free.wiza,kaddex.skdx`): marks every row their postings name, and queues their D3
         /// history walk with the daily spacing reset (a walk in progress restarts from 0 with
         /// its own tokens). The service runs the walk; the marks are read by the next `run`.
+        /// `coin` is refused (use --seed or --all).
         #[arg(
             long,
             value_delimiter = ',',
