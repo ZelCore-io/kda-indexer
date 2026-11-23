@@ -296,7 +296,7 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
         }) => Outcome::Found(value, u32::try_from(height).unwrap_or(u32::MAX), prev_hash),
         Ok(Local::Absent) => Outcome::Absent,
         Err(LocalError::Skipped(_)) => Outcome::Dropped,
-        Err(LocalError::Failure(m)) => {
+        Err(LocalError::Failure(m) | LocalError::Invalid(m)) => {
             tracing::debug!(ledger = %ledger, message = %m, "nft get-balance failed");
             Outcome::Dropped
         }

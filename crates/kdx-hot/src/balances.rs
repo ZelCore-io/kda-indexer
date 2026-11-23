@@ -102,6 +102,14 @@ pub mod meta {
     /// Prefix of [`super::d3_undo_key`]: D3 rows a hot block marked (removed by its undo, or
     /// when the freezer moves the block out of the hot store).
     pub const D3_UNDO: &str = "balances_d3_undo/";
+    /// Prefix of `balances_parked_invalid/{key hex}` (u32 unix seconds): keys the reconciler
+    /// parked after [`super::PARKED_INVALID_MAX`]-bounded retries of unusable `details`
+    /// answers (`LocalError::Invalid`, PR #26 review H-1). Kept for inspection
+    /// (`reconcile-balances --status`); `reconcile-balances --all` puts them back in the seed
+    /// backlog and clears the list.
+    pub const PARKED_INVALID: &str = "balances_parked_invalid/";
+    /// u32: entries in the parked-invalid list.
+    pub const PARKED_INVALID_LEN: &str = "balances_parked_invalid_len";
     /// u32 unix seconds: when the last history walk for newly tracked tokens ended.
     pub const D3_REWALK_AT: &str = "balances_d3_rewalk_at";
     /// JSON: the running history walk (re-review N2): the done height it walks below, its
@@ -356,6 +364,99 @@ pub fn clear_rewalk(txn: &mut RwTxn<'_>, module: u32) -> Result<()> {
         format!("{}{module:010}", meta::D3_REWALK).as_bytes(),
     )?;
     Ok(())
+}
+
+/// Queue a D3 history walk of `modules` now (`reconcile-balances --rewalk`): each joins the
+/// pending set, and the daily spacing is reset (`balances_d3_rewalk_at` deleted), so the
+/// service starts the walk at its next history slice instead of a day after the last walk.
+/// A walk in progress is abandoned (its state deleted): its own tokens are still pending
+/// until a walk ends, so the new walk covers them and `modules` together, from height 0.
+/// Returns whether a walk in progress was restarted.
+pub fn queue_rewalk(txn: &mut RwTxn<'_>, modules: &[u32]) -> Result<bool> {
+    for m in modules {
+        txn.put(
+            Table::Meta,
+            format!("{}{m:010}", meta::D3_REWALK).as_bytes(),
+            &[],
+        )?;
+    }
+    txn.del(Table::Meta, meta::D3_REWALK_AT.as_bytes())?;
+    txn.del(Table::Meta, meta::D3_REWALK_WALK.as_bytes())
+}
+
+/// Most entries in the parked-invalid list ([`meta::PARKED_INVALID`]); keys parked beyond it
+/// are only counted (`result="parked"`), like a node-error park.
+pub const PARKED_INVALID_MAX: u32 = 100_000;
+
+fn parked_invalid_key(k: &[u8; 9]) -> Vec<u8> {
+    let mut out = meta::PARKED_INVALID.as_bytes().to_vec();
+    for b in k {
+        out.extend_from_slice(format!("{b:02x}").as_bytes());
+    }
+    out
+}
+
+fn parked_invalid_len(txn: &impl Txn) -> Result<u32> {
+    Ok(txn
+        .meta(meta::PARKED_INVALID_LEN)?
+        .as_deref()
+        .and_then(|v| <[u8; 4]>::try_from(v).ok())
+        .map_or(0, u32::from_be_bytes))
+}
+
+/// Record a key parked for unusable answers (H-1). Returns whether it is in the list now
+/// (false only when the list is full).
+pub fn record_parked_invalid(txn: &mut RwTxn<'_>, k: &[u8; 9], now: u32) -> Result<bool> {
+    let key = parked_invalid_key(k);
+    if txn.get(Table::Meta, &key)?.is_some() {
+        txn.put(Table::Meta, &key, &now.to_be_bytes())?;
+        return Ok(true);
+    }
+    let len = parked_invalid_len(txn)?;
+    if len >= PARKED_INVALID_MAX {
+        return Ok(false);
+    }
+    txn.put(Table::Meta, &key, &now.to_be_bytes())?;
+    txn.set_meta(meta::PARKED_INVALID_LEN, &(len + 1).to_be_bytes())?;
+    Ok(true)
+}
+
+/// The keys in the parked-invalid list.
+pub fn parked_invalid(txn: &impl Txn) -> Result<Vec<[u8; 9]>> {
+    let p = meta::PARKED_INVALID.as_bytes();
+    Ok(txn
+        .scan(Table::Meta, p, |k| k.starts_with(p))?
+        .into_iter()
+        .filter_map(|(k, _)| {
+            let hex = k.get(p.len()..)?;
+            let mut out = [0u8; 9];
+            if hex.len() != 18 {
+                return None;
+            }
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(std::str::from_utf8(&hex[2 * i..2 * i + 2]).ok()?, 16)
+                    .ok()?;
+            }
+            Some(out)
+        })
+        .collect())
+}
+
+/// Put every parked-invalid key back in the seed backlog (height 0; a key with a tail mark
+/// keeps it) and clear the list. Returns how many keys the list held.
+pub fn requeue_parked_invalid(txn: &mut RwTxn<'_>) -> Result<usize> {
+    let keys = parked_invalid(txn)?;
+    let mark = Mark {
+        height: 0,
+        seq: txn.txn_id()?,
+    }
+    .encode();
+    for k in &keys {
+        seed_mark(txn, k, &mark)?;
+        txn.del(Table::Meta, &parked_invalid_key(k))?;
+    }
+    txn.del(Table::Meta, meta::PARKED_INVALID_LEN.as_bytes())?;
+    Ok(keys.len())
 }
 
 static MARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -894,6 +995,57 @@ mod tests {
             guard_keys(&ks(vec![webauthn])),
             GuardKeys::Keys(_)
         ));
+    }
+
+    /// `--rewalk`: listed modules join the pending set, a running walk restarts with its own
+    /// tokens still pending, and the daily spacing is reset.
+    #[test]
+    fn queue_rewalk_restarts_with_every_pending_token() {
+        let d = tempfile::tempdir().unwrap();
+        let hs = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hs.rw().unwrap();
+        txn.put(
+            Table::Meta,
+            format!("{}{:010}", meta::D3_REWALK, 479).as_bytes(),
+            &[],
+        )
+        .unwrap();
+        txn.set_meta(meta::D3_REWALK_WALK, b"{}").unwrap();
+        txn.set_meta(meta::D3_REWALK_AT, &5u32.to_be_bytes())
+            .unwrap();
+        assert!(queue_rewalk(&mut txn, &[12, 479]).unwrap());
+        let mut p = rewalk_pending(&txn).unwrap();
+        p.sort_unstable();
+        assert_eq!(p, vec![12, 479]);
+        assert!(txn.meta(meta::D3_REWALK_WALK).unwrap().is_none());
+        assert!(txn.meta(meta::D3_REWALK_AT).unwrap().is_none());
+        assert!(!queue_rewalk(&mut txn, &[12]).unwrap());
+    }
+
+    /// H-1: parked-invalid keys are listed once, bounded, and the retry pass seeds them back.
+    #[test]
+    fn parked_invalid_list_records_and_requeues() {
+        let d = tempfile::tempdir().unwrap();
+        let hs = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let (a, b) = (bal_key(1, 2, 3), bal_key(4, 5, 6));
+        let mut txn = hs.rw().unwrap();
+        assert!(record_parked_invalid(&mut txn, &a, 10).unwrap());
+        assert!(record_parked_invalid(&mut txn, &a, 11).unwrap());
+        assert!(record_parked_invalid(&mut txn, &b, 12).unwrap());
+        assert_eq!(parked_invalid_len(&txn).unwrap(), 2);
+        let mut l = parked_invalid(&txn).unwrap();
+        l.sort_unstable();
+        assert_eq!(l, vec![a, b]);
+        txn.set_meta(meta::PARKED_INVALID_LEN, &PARKED_INVALID_MAX.to_be_bytes())
+            .unwrap();
+        assert!(!record_parked_invalid(&mut txn, &bal_key(7, 8, 9), 13).unwrap());
+        // `b` has a tail mark: it keeps it and gets no seed mark.
+        mark_dirty(&mut txn, 4, 5, 6, 20).unwrap();
+        assert_eq!(requeue_parked_invalid(&mut txn).unwrap(), 2);
+        assert!(parked_invalid(&txn).unwrap().is_empty());
+        assert_eq!(parked_invalid_len(&txn).unwrap(), 0);
+        assert!(txn.get(Table::BalanceSeed, &a).unwrap().is_some());
+        assert!(txn.get(Table::BalanceSeed, &b).unwrap().is_none());
     }
 
     #[test]

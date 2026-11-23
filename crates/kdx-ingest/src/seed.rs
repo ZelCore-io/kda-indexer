@@ -17,7 +17,7 @@
 //!   height) and removes the cursor.
 //! - Reads: a fresh hot read txn per chunk; segment readers are mmaps (no txn).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -147,6 +147,28 @@ fn push_rows(p: &mut Pending, family: u8, entity: u64, coin: Option<u32>, chains
 /// Run (or resume) the seed. `stop` is polled between entities; a stopped seed commits its
 /// batch and cursor and returns with `stopped`.
 pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<SeedReport> {
+    walk(hot, segdir, None, stop)
+}
+
+/// The posting seed for `modules` only (`reconcile-balances --rewalk`): marks every
+/// `(account, module, chain)` their `xfer` postings name, `coin` also its `acct` postings. It
+/// keeps no cursor and leaves the seed's own state (`balances_seeded`, its cursor) alone; a
+/// stopped run is simply run again (marks are idempotent).
+pub fn mark_modules(
+    hot: &HotStore,
+    segdir: &Path,
+    modules: &HashSet<u32>,
+    stop: &dyn Fn() -> bool,
+) -> Result<SeedReport> {
+    walk(hot, segdir, Some(modules), stop)
+}
+
+fn walk(
+    hot: &HotStore,
+    segdir: &Path,
+    only: Option<&HashSet<u32>>,
+    stop: &dyn Fn() -> bool,
+) -> Result<SeedReport> {
     let t0 = Instant::now();
     let mut rep = SeedReport::default();
     let (coin, cursor) = {
@@ -155,9 +177,18 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<See
             balances::coin_module(&txn)?,
             txn.meta(meta::BALANCES_SEED_CURSOR)?
                 .as_deref()
-                .and_then(Cursor::decode),
+                .and_then(Cursor::decode)
+                .filter(|_| only.is_none()),
         )
     };
+    // The postings of one entity count (`only`: its module is listed).
+    let wanted = |fam: u8, entity: u64| match only {
+        None => true,
+        Some(set) if fam == Family::Xfer as u8 => set.contains(&(entity as u32)),
+        Some(set) => coin.is_some_and(|c| set.contains(&c)),
+    };
+    // A module-limited run never writes the seed's cursor.
+    let cur = |c: Cursor| only.is_none().then_some(c);
     let mut p = Pending::default();
 
     // Hot pass: TailPostings of `xfer` (0) and `acct` (1).
@@ -180,6 +211,9 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<See
             after = Some(last.clone());
             for (k, _) in &rows {
                 let entity = u64::from_be_bytes(k[1..9].try_into().context("posting key")?);
+                if !wanted(fam, entity) {
+                    continue;
+                }
                 let key = parse_txkey(&k[9..17]).context("posting key")?;
                 push_rows(&mut p, fam, entity, coin, 1 << key.chain());
                 if fam == Family::Xfer as u8 {
@@ -229,12 +263,15 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<See
                         family: f,
                         idx: i as u32,
                     };
-                    p.flush(hot, Some(c), &mut rep)?;
+                    p.flush(hot, cur(c), &mut rep)?;
                     rep.stopped = true;
                     rep.secs = t0.elapsed().as_secs_f64();
                     return Ok(rep);
                 }
                 let entity = post.entity_at(i);
+                if !wanted(f, entity) {
+                    continue;
+                }
                 let list = post.list_at(i)?;
                 let mut chains = 0u32;
                 for &rel in &list {
@@ -259,7 +296,7 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<See
                         family: f,
                         idx: (i + 1) as u32,
                     };
-                    p.flush(hot, Some(c), &mut rep)?;
+                    p.flush(hot, cur(c), &mut rep)?;
                 }
             }
         }
@@ -270,7 +307,11 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<See
             family: Family::Xfer as u8,
             idx: 0,
         };
-        p.flush(hot, Some(c), &mut rep)?;
+        p.flush(hot, cur(c), &mut rep)?;
+    }
+    if only.is_some() {
+        rep.secs = t0.elapsed().as_secs_f64();
+        return Ok(rep);
     }
 
     // Done: the highest tail height marks the seed point.
@@ -310,5 +351,51 @@ mod tests {
             p.rows,
             vec![bal_key(5, 9, 0), bal_key(5, 9, 2), bal_key(5, 3, 1)]
         );
+    }
+    /// `reconcile-balances --rewalk` re-marks the posting holders of the listed modules only
+    /// (D3 gap group 2: `free.wiza` keys whose marks were dropped), and leaves the seed's own
+    /// state alone.
+    #[test]
+    fn mark_modules_marks_only_the_listed_modules() {
+        use kdx_hot::Geometry;
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(&dir.path().join("hot"), Geometry::default()).unwrap();
+        let segdir = dir.path().join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+        let (wiza, other) = (7u32, 8u32);
+        let posting = |account: u32, module: u32, chain: u8| {
+            let mut k = vec![Family::Xfer as u8];
+            k.extend_from_slice(&((u64::from(account) << 32) | u64::from(module)).to_be_bytes());
+            k.extend_from_slice(&kdx_types::TxKey::new(100, chain, 1).to_be_bytes());
+            k
+        };
+        {
+            let mut txn = hot.rw().unwrap();
+            for k in [
+                posting(1, wiza, 1),
+                posting(2, wiza, 1),
+                posting(1, other, 0),
+            ] {
+                txn.put(Table::TailPostings, &k, &[]).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let rep = mark_modules(&hot, &segdir, &HashSet::from([wiza]), &|| false).unwrap();
+        assert_eq!(rep.dirty_inserted, 2);
+        let txn = hot.ro().unwrap();
+        assert!(txn
+            .get(Table::BalanceSeed, &bal_key(1, wiza, 1))
+            .unwrap()
+            .is_some());
+        assert!(txn
+            .get(Table::BalanceSeed, &bal_key(2, wiza, 1))
+            .unwrap()
+            .is_some());
+        assert!(txn
+            .get(Table::BalanceSeed, &bal_key(1, other, 0))
+            .unwrap()
+            .is_none());
+        assert!(txn.meta(meta::BALANCES_SEEDED).unwrap().is_none());
+        assert!(txn.meta(meta::BALANCES_SEED_CURSOR).unwrap().is_none());
     }
 }

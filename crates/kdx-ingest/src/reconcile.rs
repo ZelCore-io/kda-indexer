@@ -12,8 +12,8 @@
 //!   chain, re-checked after [`Caps::recheck_secs`]); keyset references are resolved with
 //!   `describe-keyset` only for those. Other modules' balances are stored and served, their
 //!   guards never index a key.
-//! - Not fungible (R-P5P9-8 #2): a module whose `details` calls all fail in
-//!   [`NOT_FUNGIBLE_AFTER`] batches in a row is marked; the tail stops marking it, its keys
+//! - Not fungible (R-P5P9-8 #2): a module whose `details` calls all fail or answer unusably
+//!   in [`NOT_FUNGIBLE_AFTER`] batches in a row is marked; the tail stops marking it, its keys
 //!   are dropped without a call (`result="not_fungible"`), `/tokens` hides it; after
 //!   [`Caps::recheck_secs`] it is active again.
 //! - Caps (I-7): a non-coin module stops getting new rows at [`Caps::module_rows`], a confirmed
@@ -49,17 +49,22 @@
 //!   - `ok`, `absent`: row written (`ok` from another branch: written unverified, still dirty).
 //!   - `other_branch`, counted in addition to `ok`: the answer was not read on our branch.
 //!   - `skipped`: B-1 refused the call (module name, name length); the key is dropped.
-//!   - `error`, Pact failure or unusable answer (the node evaluated the code and it failed,
-//!     e.g. a module with no `details`; or the answer is not JSON, over the body cap, or has no
-//!     decimal balance or `metaData`): the key is dropped, and an existing row keeps its
-//!     balance flagged `unverified` (served `stale: true`, I-5). The next tail mark retries
-//!     it. No back-off.
+//!   - `error`, Pact failure (the node evaluated the code and it failed, e.g. a module with no
+//!     `details`): the key is dropped, and an existing row keeps its balance flagged
+//!     `unverified` (served `stale: true`, I-5). The next tail mark retries it. No back-off.
+//!   - `invalid`, unusable answer ([`LocalError::Invalid`]: not JSON, over the body cap, no
+//!     decimal balance or `metaData`): the key stays dirty, its mark moved up to the tail
+//!     height (back of the queue), no back-off; a batch of only invalid answers pauses
+//!     [`INVALID_PAUSE`]. After [`MAX_KEY_RETRIES`] in a row it is parked like a node error
+//!     and listed in `balances_parked_invalid/` (bounded) for `reconcile-balances --status`
+//!     and the retry pass `--all`. Invalid answers count as module failures for the
+//!     not-fungible rule (H-1), so a module that never answers usably stops taking batches.
 //!   - `error`, node error (transport or HTTP): the key stays dirty and its mark moves up to
 //!     the chain's tail height (back of the queue). The loop backs off exponentially up to
 //!     [`BACKOFF_MAX`] only when node errors are at least half of a batch's calls
-//!     ([`backs_off`]). A key with [`MAX_KEY_RETRIES`] node errors in a row in batches that
-//!     did not back off is parked (`parked`: mark dropped until the next tail mark, row
-//!     flagged `unverified`). A backed-off batch counts nothing and resets the counts (SR-2):
+//!     ([`backs_off`]). A key with [`MAX_KEY_RETRIES`] node errors (or invalid answers) in a
+//!     row in batches that did not back off is parked (`parked`: mark dropped until the next
+//!     tail mark, row flagged `unverified`). A backed-off batch counts nothing and resets the counts (SR-2):
 //!     a node outage parks no key. Never read as a zero balance.
 //! - Heartbeat: `Meta balances_reconcile_stats` (JSON: unix time, rows done, rate, dirty) per
 //!   batch; not part of the systemd watchdog.
@@ -85,7 +90,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Ctx;
 
-/// Consecutive node errors after which a key is parked: its dirty mark is dropped (counted as
+/// Consecutive node errors or invalid answers after which a key is parked: its dirty mark is dropped (counted as
 /// `result="parked"`) until the next tail mark of the row.
 pub const MAX_KEY_RETRIES: u32 = 5;
 /// Keys (and modules) whose errors are counted at once (the map is cleared beyond this).
@@ -323,6 +328,8 @@ enum Outcome {
     Absent(u32),
     Skipped,
     Failure,
+    /// The answer arrived but is unusable here (`LocalError::Invalid`): the key stays queued.
+    Invalid,
     NodeError,
     Dropped(&'static str),
 }
@@ -334,6 +341,7 @@ impl Outcome {
             Outcome::Absent(_) => "absent",
             Outcome::Skipped => "skipped",
             Outcome::Failure | Outcome::NodeError => "error",
+            Outcome::Invalid => "invalid",
             Outcome::Dropped(l) => l,
         }
     }
@@ -402,6 +410,16 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
         Err(LocalError::Failure(m)) => {
             tracing::debug!(module = %module, chain = it.chain, message = %m, "details failed");
             Outcome::Failure
+        }
+        Err(LocalError::Invalid(m)) => {
+            // Never a silent drop (D3 gap group 2): the key stays dirty and is reported.
+            tracing::warn!(
+                module = %module,
+                chain = it.chain,
+                message = %m,
+                "balances: details answer unusable; key kept dirty"
+            );
+            Outcome::Invalid
         }
         Err(LocalError::Node(e)) => {
             tracing::debug!(error = %e, "details: node error, kept dirty");
@@ -617,22 +635,28 @@ pub struct BatchStats {
     pub absent: u64,
     pub skipped: u64,
     pub failures: u64,
+    /// Answers this build could not use (`LocalError::Invalid`): the key goes to the back of
+    /// the queue like a node error, is parked after [`MAX_KEY_RETRIES`] in a row, and its
+    /// module counts as failing in this batch unless another key of it answered (H-1).
+    pub invalid: u64,
     pub node_errors: u64,
     /// Keys dropped without a call or a row (`not_fungible`, `capped`).
     pub dropped: u64,
     /// Keys whose call hit a node (transport or HTTP) error, with the mark the batch wrote
     /// for them (moved up to the tail height); still dirty.
     pub node_error_keys: Vec<([u8; 9], Mark)>,
+    /// Keys with an invalid answer, with the mark the batch wrote for them; still dirty.
+    pub invalid_keys: Vec<([u8; 9], Mark)>,
     /// Modules with an answer (`ok` or `absent`) in this batch.
     pub answered: HashSet<u32>,
-    /// Non-coin modules with a failed `details` call in this batch.
+    /// Non-coin modules with a failed or invalid `details` call in this batch.
     pub failed_modules: HashSet<u32>,
 }
 
 impl BatchStats {
     /// Calls the node answered or failed (B-1 refusals and drops make none).
     pub fn calls(&self) -> u64 {
-        self.ok + self.absent + self.failures + self.node_errors
+        self.ok + self.absent + self.failures + self.invalid + self.node_errors
     }
 }
 
@@ -650,6 +674,16 @@ pub const OFF_BRANCH_PAUSE: Duration = Duration::from_secs(2);
 /// [`OFF_BRANCH_PAUSE`] before the next batch instead of re-reading the same keys at once.
 pub fn off_branch_pause(st: &BatchStats) -> Option<Duration> {
     (st.other_branch > 0 && st.other_branch == st.ok + st.absent).then_some(OFF_BRANCH_PAUSE)
+}
+
+/// The pause before the next batch when every call of this one gave an invalid answer.
+pub const INVALID_PAUSE: Duration = Duration::from_secs(30);
+
+/// When every call of a batch gave an invalid answer, wait [`INVALID_PAUSE`]: invalid keys stay
+/// queued (never dropped), so a queue holding only them would otherwise re-read them at once,
+/// spinning the `/local` budget. Never stops re-reading, only spaces it out.
+pub fn invalid_pause(st: &BatchStats) -> Option<Duration> {
+    (st.invalid > 0 && st.invalid == st.calls()).then_some(INVALID_PAUSE)
 }
 
 /// The window [`BranchWatch`] judges off-branch answers over.
@@ -793,7 +827,7 @@ pub async fn reconcile_batch(
             Ok(Local::Found { value, .. }) => {
                 verdict.insert((*m, *c), value);
             }
-            Ok(Local::Absent) | Err(LocalError::Failure(_)) => {
+            Ok(Local::Absent) | Err(LocalError::Failure(_) | LocalError::Invalid(_)) => {
                 verdict.insert((*m, *c), false);
             }
             Err(LocalError::Node(_) | LocalError::Skipped(_)) => {}
@@ -931,6 +965,18 @@ pub async fn reconcile_batch(
             Outcome::Failure => {
                 drop_mark(&mut txn, it)?;
                 st.failures += 1;
+                if Some(it.module) != coin {
+                    st.failed_modules.insert(it.module);
+                }
+            }
+            Outcome::Invalid => {
+                // To the back of the queue, like a node error but without a backoff: the
+                // answer came, only this build cannot use it. The mark is not dropped here;
+                // [`MAX_KEY_RETRIES`] invalid answers in a row park the key (H-1), and a module
+                // whose every answer is unusable counts as failing (R-P5P9-8 #2).
+                let m = balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                st.invalid += 1;
+                st.invalid_keys.push((it.d.key, m));
                 if Some(it.module) != coin {
                     st.failed_modules.insert(it.module);
                 }
@@ -1160,7 +1206,7 @@ async fn discovery_step(ctx: &Arc<Ctx>, local: &LocalClient) -> Result<()> {
         .into_iter()
         .map(|r| match r {
             Ok(Local::Found { value, .. }) => Some(value),
-            Ok(Local::Absent) | Err(LocalError::Failure(_)) => Some(false),
+            Ok(Local::Absent) | Err(LocalError::Failure(_) | LocalError::Invalid(_)) => Some(false),
             Err(LocalError::Node(_) | LocalError::Skipped(_)) => None,
         })
         .collect();
@@ -1382,19 +1428,7 @@ async fn run_with(
             );
             last_log = Instant::now();
         }
-        let gone = note_failures(&mut fails, &st);
-        if !gone.is_empty() {
-            mark_not_fungible(&ctx.hot, &gone)?;
-            tracing::warn!(
-                modules = ?gone,
-                "balances: modules whose details calls keep failing are marked not fungible"
-            );
-        }
-        let refill_keys: Vec<([u8; 9], Mark)> = batch.iter().map(|d| (d.key, d.mark)).collect();
-        let parked = parked_after(&mut retries, &refill_keys, &st);
-        if !parked.is_empty() {
-            park(&ctx.hot, &parked)?;
-        }
+        after_batch(&ctx.hot, &mut fails, &mut retries, &batch, &st)?;
         let alert = watch.note(Instant::now(), &st);
         if let Some(n) = alert.no_hash {
             tracing::warn!(
@@ -1437,9 +1471,45 @@ async fn run_with(
                     _ = stop.cancelled() => return Ok(()),
                     _ = tokio::time::sleep(d) => {}
                 }
+            } else if let Some(d) = invalid_pause(&st) {
+                tracing::warn!(
+                    invalid = st.invalid,
+                    "balances: every answer of the batch was unusable; keys kept, pausing"
+                );
+                tokio::select! {
+                    _ = stop.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(d) => {}
+                }
             }
         }
     }
+}
+
+/// The bookkeeping after a batch: modules failing [`NOT_FUNGIBLE_AFTER`] batches in a row are
+/// marked not fungible ([`note_failures`]), keys failing [`MAX_KEY_RETRIES`] batches in a row
+/// are parked ([`parked_after`]).
+pub fn after_batch(
+    hot: &HotStore,
+    fails: &mut HashMap<u32, u32>,
+    retries: &mut HashMap<[u8; 9], u32>,
+    batch: &[Dirty],
+    st: &BatchStats,
+) -> Result<()> {
+    let gone = note_failures(fails, st);
+    if !gone.is_empty() {
+        mark_not_fungible(hot, &gone)?;
+        tracing::warn!(
+            modules = ?gone,
+            "balances: modules whose details calls keep failing are marked not fungible"
+        );
+    }
+    let refill_keys: Vec<([u8; 9], Mark)> = batch.iter().map(|d| (d.key, d.mark)).collect();
+    let parked = parked_after(retries, &refill_keys, st);
+    if !parked.is_empty() {
+        let invalid: HashSet<[u8; 9]> = st.invalid_keys.iter().map(|(k, _)| *k).collect();
+        park_keys(hot, &parked, &invalid)?;
+    }
+    Ok(())
 }
 
 /// The keys to park after a batch (SR-2): none when the batch backs off (the node itself is
@@ -1453,10 +1523,16 @@ pub fn parked_after(
         retries.clear();
         return Vec::new();
     }
-    count_retries(retries, batch, &st.node_error_keys)
+    let errored: Vec<([u8; 9], Mark)> = st
+        .node_error_keys
+        .iter()
+        .chain(&st.invalid_keys)
+        .copied()
+        .collect();
+    count_retries(retries, batch, &errored)
 }
 
-/// Count consecutive node errors per key of a batch: keys that answered are forgotten; the
+/// Count consecutive node errors or invalid answers per key of a batch: keys that answered are forgotten; the
 /// keys that reached [`MAX_KEY_RETRIES`] are returned (and forgotten) for parking, with the
 /// mark the batch wrote for them.
 pub fn count_retries(
@@ -1489,18 +1565,37 @@ pub fn count_retries(
 /// when it is still the mark the failing batch wrote (SR-1): a tail mark written since
 /// survives. A parked key's row is flagged unverified (I-5).
 pub fn park(hot: &HotStore, keys: &[([u8; 9], Mark)]) -> Result<()> {
+    park_keys(hot, keys, &HashSet::new())
+}
+
+/// [`park`], and the keys in `invalid` (parked for unusable answers, H-1) also go to the
+/// parked-invalid list (`balances::parked_invalid`) for inspection and the explicit retry
+/// pass (`reconcile-balances --all`), so they are not lost when no new tail mark comes.
+pub fn park_keys(
+    hot: &HotStore,
+    keys: &[([u8; 9], Mark)],
+    invalid: &HashSet<[u8; 9]>,
+) -> Result<()> {
+    let now = now_unix();
+    let (mut parked, mut listed) = (0usize, 0usize);
     let mut txn = hot.rw()?;
     for (k, m) in keys {
         if clear_mark(&mut txn, Table::BalanceDirty, k, *m)? {
             set_unverified(&mut txn, k)?;
             kdx_metrics::get().balance_reconcile("parked", 0.0);
+            parked += 1;
+            if invalid.contains(k) && balances::record_parked_invalid(&mut txn, k, now)? {
+                listed += 1;
+            }
         }
     }
     txn.commit()?;
     tracing::warn!(
-        keys = keys.len(),
+        keys = parked,
+        invalid_listed = listed,
         retries = MAX_KEY_RETRIES,
-        "balances: parked keys that kept failing at the node until their next tail mark"
+        "balances: parked keys that kept failing at the node or answering unusably until \
+         their next tail mark (unusable ones listed for reconcile-balances --all)"
     );
     Ok(())
 }
@@ -1567,7 +1662,7 @@ pub(crate) mod tests {
     }
 
     /// A fake node: `/local` answers a success for every account except `bad`, whose answer
-    /// arrives but has no balance; an NFT `get-balance` (data `t`) answers 2.0. Every success
+    /// arrives but has no balance (invalid), and `fails`, a pact failure; an NFT `get-balance` (data `t`) answers 2.0. Every success
     /// reads tip height 10 (`blockHeight` 11) and names the tip's hash as `prevBlockHash`: the
     /// text in `prev`, read per answer (empty: no `prevBlockHash` at all). One
     /// connection at a time (`Connection: close`).
@@ -1637,7 +1732,15 @@ pub(crate) mod tests {
                     json!({"result": {"status": "success", "data": {"account": acct,
                            "balance": 1.5, "guard": {"keys": keys, "pred": "keys-all"}}},
                            "metaData": meta.clone()})
-                } else if acct == "bad" {
+                } else if acct == "wiza" {
+                    // D3 gap group 2: a full-precision Pact decimal (255 places, 257 bytes).
+                    json!({"result": {"status": "success", "data": {"account": acct,
+                           "balance": {"decimal": wiza_balance()}, "guard": null}},
+                           "metaData": meta.clone()})
+                } else if acct == "fails" {
+                    json!({"result": {"status": "failure", "error": {"message": "boom"}},
+                           "metaData": meta.clone()})
+                } else if acct.starts_with("bad") {
                     json!({"result": {"status": "success", "data": {"guard": null}},
                            "metaData": meta.clone()})
                 } else {
@@ -1761,23 +1864,55 @@ pub(crate) mod tests {
         BalanceRow::decode(&hot.ro().unwrap().get(Table::Balances, k).unwrap().unwrap()).unwrap()
     }
 
-    /// One key whose answer is unusable is dropped as a failure; the other keys of the batch
-    /// reconcile, and the batch does not back off.
+    /// The `free.wiza` balance text of D3 gap group 2 (`0.0161938904166666…`, 255 places).
+    pub(crate) fn wiza_balance() -> String {
+        format!("0.0161938904166666{}8", "6".repeat(255 - 17))
+    }
+
+    /// D3 gap group 2: a 257-byte Pact decimal is a balance like any other.
+    #[tokio::test]
+    async fn a_full_precision_decimal_balance_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &["wiza"]);
+        let (ctx, local) = client(dir.path(), &hot);
+        let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
+        let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!((st.ok, st.failures, st.invalid), (1, 0, 0), "{st:?}");
+        let txn = hot.ro().unwrap();
+        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 0);
+        let rows = balances::account_rows(&txn, 0).unwrap();
+        assert_eq!(rows[0].2.balance, wiza_balance());
+        assert!(rows[0].2.positive());
+    }
+
+    /// One key whose answer is unusable is counted as `invalid` and stays queued (moved to the
+    /// back, never dropped: D3 gap group 2 lost 364 rows that way); the other keys of the batch
+    /// reconcile, the batch does not back off and the module is not counted as failing.
     #[tokio::test]
     async fn one_invalid_answer_does_not_stall_the_batch() {
         let dir = tempfile::tempdir().unwrap();
-        let (hot, _, _) = setup(dir.path(), &["alice", "bad", "carol"]);
+        let (hot, coin, ids) = setup(dir.path(), &["alice", "bad", "carol"]);
         let (ctx, local) = client(dir.path(), &hot);
         let keys: Vec<_> = refill(&hot, 64, 32).unwrap();
         assert_eq!(keys.len(), 3);
         let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
             .await
             .unwrap();
-        assert_eq!((st.ok, st.failures, st.node_errors), (2, 1, 0));
+        assert_eq!(
+            (st.ok, st.failures, st.invalid, st.node_errors),
+            (2, 0, 1, 0)
+        );
+        assert!(st.failed_modules.is_empty());
         assert!(!backs_off(&st));
+        let bad = balances::bal_key(ids[1], coin, 0);
+        assert_eq!(st.invalid_keys.len(), 1);
+        assert_eq!(st.invalid_keys[0].0, bad);
         let txn = hot.ro().unwrap();
-        // as_of = blockHeight 11 − 1 covers the marks at 10; the bad key's mark is dropped.
-        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 0);
+        // as_of = blockHeight 11 − 1 covers the marks at 10; the bad key's mark is kept.
+        assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 1);
+        assert!(txn.get(Table::BalanceDirty, &bad).unwrap().is_some());
         assert_eq!(txn.count(Table::Balances).unwrap(), 2);
         assert_eq!(txn.count(Table::KeyAccounts).unwrap(), 2);
         let rows = balances::account_rows(&txn, 0).unwrap();
@@ -1790,7 +1925,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_mark_raised_after_the_read_survives_drop_skip_and_park() {
         let dir = tempfile::tempdir().unwrap();
-        let (hot, coin, ids) = setup(dir.path(), &["bad", "parked"]);
+        // `fails`: the node answers a pact failure (a dropped mark); see `fake_node`.
+        let (hot, coin, ids) = setup(dir.path(), &["fails", "parked"]);
         let (bad, parked) = (ids[0], ids[1]);
         let skip = balances::bal_key(bad, 999, 0); // module id with no name: skipped
         let old_row = BalanceRow {
@@ -1866,6 +2002,91 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(hot.ro().unwrap().count(Table::BalanceDirty).unwrap(), 0);
         assert!(row(&hot).unverified);
+    }
+
+    /// H-1 (PR #26 review): modules whose `details` answer is never usable (here every key
+    /// answers without a balance) are marked not fungible after [`NOT_FUNGIBLE_AFTER`] batches,
+    /// like failing ones. Their keys then stop taking batch slots, so the seed backlog (where
+    /// `--rewalk` puts its marks) is read again and coin keeps progressing.
+    #[tokio::test]
+    async fn modules_with_unusable_answers_stop_taking_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["carol"]);
+        let junk = intern(&hot, DictKind::Module, &["free.junk1", "free.junk2"]);
+        let names: Vec<String> = (0..12).map(|i| format!("bad{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let accts = intern(&hot, DictKind::Account, &refs);
+        for (i, a) in accts.iter().enumerate() {
+            mark(&hot, *a, junk[i % 2], 0, 10);
+        }
+        let alice = intern(&hot, DictKind::Account, &["alice"])[0];
+        let seed_key = balances::bal_key(alice, coin, 0);
+        let mut txn = hot.rw().unwrap();
+        balances::seed_mark(&mut txn, &seed_key, &Mark { height: 0, seq: 1 }.encode()).unwrap();
+        txn.commit().unwrap();
+        let (ctx, local) = client(dir.path(), &hot);
+        let (mut fails, mut retries) = (HashMap::new(), HashMap::new());
+        let mut invalid = 0;
+        for _ in 0..NOT_FUNGIBLE_AFTER + 3 {
+            let keys = refill(&hot, 8, 4).unwrap();
+            if keys.is_empty() {
+                break;
+            }
+            let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+                .await
+                .unwrap();
+            invalid += st.invalid;
+            after_batch(&hot, &mut fails, &mut retries, &keys, &st).unwrap();
+        }
+        assert!(invalid > 0);
+        let txn = hot.ro().unwrap();
+        for m in &junk {
+            let t = balances::token_row(&txn, *m).unwrap().unwrap();
+            assert_eq!(t.kind, KIND_NOT_FUNGIBLE);
+        }
+        assert_eq!(balances::dirty_count(&txn).unwrap(), 0);
+        assert!(txn.get(Table::Balances, &seed_key).unwrap().is_some());
+        assert!(txn
+            .get(Table::Balances, &balances::bal_key(ids[0], coin, 0))
+            .unwrap()
+            .is_some());
+    }
+
+    /// H-1: a key whose answer stays unusable while its module answers for others is parked
+    /// after [`MAX_KEY_RETRIES`] batches (no more batch slots), counted as invalid each time,
+    /// and kept in the parked-invalid list; the explicit pass (`reconcile-balances --all`)
+    /// puts it back in the seed backlog.
+    #[tokio::test]
+    async fn an_unusable_key_is_parked_and_kept_for_a_retry_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, ids) = setup(dir.path(), &["alice", "bad"]);
+        let bad = balances::bal_key(ids[1], coin, 0);
+        let (ctx, local) = client(dir.path(), &hot);
+        let (mut fails, mut retries) = (HashMap::new(), HashMap::new());
+        for i in 0..MAX_KEY_RETRIES {
+            assert!(mark_of(&hot, &bad).is_some(), "batch {i}");
+            let keys = refill(&hot, 8, 4).unwrap();
+            let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+                .await
+                .unwrap();
+            assert_eq!(st.invalid, 1, "batch {i}");
+            after_batch(&hot, &mut fails, &mut retries, &keys, &st).unwrap();
+        }
+        assert!(mark_of(&hot, &bad).is_none());
+        assert!(refill(&hot, 8, 4).unwrap().is_empty());
+        assert_eq!(
+            balances::parked_invalid(&hot.ro().unwrap()).unwrap(),
+            vec![bad]
+        );
+        let mut txn = hot.rw().unwrap();
+        assert_eq!(balances::requeue_parked_invalid(&mut txn).unwrap(), 1);
+        txn.commit().unwrap();
+        assert!(balances::parked_invalid(&hot.ro().unwrap())
+            .unwrap()
+            .is_empty());
+        let keys = refill(&hot, 8, 4).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].key == bad && keys[0].seed);
     }
 
     /// M-3 and D2: a reorg between the read and the clear re-marks the key at the same height;
@@ -2020,6 +2241,25 @@ pub(crate) mod tests {
             ..Default::default()
         };
         assert_eq!(off_branch_pause(&errors), None);
+    }
+
+    /// Invalid answers keep their keys queued: a batch of only those pauses the next one (no
+    /// spin), a batch with any usable answer does not.
+    #[test]
+    fn an_all_invalid_batch_pauses_the_next() {
+        let all = BatchStats {
+            invalid: 3,
+            ..Default::default()
+        };
+        assert_eq!(invalid_pause(&all), Some(INVALID_PAUSE));
+        assert!(!backs_off(&all));
+        let mixed = BatchStats {
+            ok: 1,
+            invalid: 3,
+            ..Default::default()
+        };
+        assert_eq!(invalid_pause(&mixed), None);
+        assert_eq!(invalid_pause(&BatchStats::default()), None);
     }
 
     /// M1: off-branch answers that are the majority of `ok` over a window, with enough answers,

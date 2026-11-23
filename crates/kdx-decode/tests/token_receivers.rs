@@ -10,8 +10,8 @@
 //! - (d) `kaddex.alchemist.WRAP` minting `kaddex.skdx`, named only by a `fungible-v2` modref.
 
 use kdx_decode::receivers::{
-    injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_PER_TX,
-    MAX_EXEC_PAIRS_PER_TX,
+    injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_PER_EVENT,
+    MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX,
 };
 use serde_json::{json, Value};
 
@@ -247,13 +247,14 @@ fn a_hostile_event_is_capped_and_never_gives_coin_rows() {
         r.pairs.is_empty() && r.event_pairs.is_empty() && r.discovered.is_empty(),
         "{r:?}"
     );
-    // A tracked token's event: at most the per-tx cap, and a coin modref gives no coin rows.
+    // A tracked token's event: at most one event's allowance, and a coin modref gives no coin
+    // rows.
     let evs = json!([ev("free.wiza", "SPAM", json!([refs, strings]))]);
     let o = out(json!("ok"), evs, Value::Null);
     let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
     assert_eq!(
         r.event_pairs.len(),
-        MAX_EVENT_PAIRS_PER_TX,
+        MAX_EVENT_PAIRS_PER_EVENT,
         "{}",
         r.event_pairs.len()
     );
@@ -402,4 +403,214 @@ fn modref_discovery_is_capped_and_only_from_its_module_or_governed_namespace() {
         !r.event_pairs.iter().any(|(_, m)| m.starts_with("kaddex.")),
         "{r:?}"
     );
+}
+
+/// D3 gap group 1: a kaddex staking-migration batch tx (chain 2, height 2,895,667, 136
+/// events): the gas `coin.TRANSFER`, then 45 × (`kaddex.alchemist.WRAP` [skdx modref, amount,
+/// "kdx-bank", account], `kaddex.kdx.WRAP` ["kaddex.skdx", "kdx-bank", account, amount]), then
+/// 45 × `aggregator.PRIVILEGE-GUARD`. Amounts are `{"decimal": ..}` objects. The old per-tx cap
+/// of 64 pairs, with each amount counted as an account, kept only the first 21 accounts.
+#[test]
+fn a_batch_wrap_tx_keeps_every_account() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(kaddex.aggregator.migrate)"}}});
+    let accts: Vec<String> = (0..45).map(|i| format!("k:{i:064x}")).collect();
+    let mut evs = vec![ev("coin", "TRANSFER", json!([SRC, "k:miner", 0.0001]))];
+    for (i, a) in accts.iter().enumerate() {
+        let amt = json!({"decimal": format!("{}.000811139005", 100 + i)});
+        evs.push(ev(
+            "kaddex.alchemist",
+            "WRAP",
+            json!([modref(Some("kaddex"), "skdx"), amt, "kdx-bank", a]),
+        ));
+        evs.push(ev(
+            "kaddex.kdx",
+            "WRAP",
+            json!(["kaddex.skdx", "kdx-bank", a, amt]),
+        ));
+    }
+    for a in &accts {
+        evs.push(ev("kaddex.aggregator", "PRIVILEGE-GUARD", json!([a, true])));
+    }
+    assert_eq!(evs.len(), 136);
+    let o = out(json!("ok"), Value::Array(evs), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 2_895_667, MAINNET01, &tokens);
+    let p = pairs(&r.event_pairs);
+    for a in &accts {
+        assert!(p.contains(&(a.as_str(), "kaddex.skdx")), "skdx {a}");
+        assert!(p.contains(&(a.as_str(), "kaddex.kdx")), "kdx {a}");
+    }
+    // Amounts are not account names.
+    assert!(
+        !p.iter().any(|(a, _)| a.ends_with(".000811139005")),
+        "{p:?}"
+    );
+    assert!(p.len() <= 45 * 2 + 4, "{}", p.len());
+}
+
+/// Amount params, as `{"decimal"}`/`{"int"}` objects or numeric strings, are never candidates.
+#[test]
+fn event_amounts_are_not_accounts() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(x)"}}});
+    let evs = json!([ev(
+        "kaddex.kdx",
+        "UNWRAP",
+        json!(["kdx-staking", ACC, {"decimal": "123.5"}, {"int": 12345}, "1000.25", "-42"])
+    )]);
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!("ok"), evs, Value::Null),
+        5_000_000,
+        MAINNET01,
+        &tokens,
+    );
+    assert_eq!(
+        pairs(&r.event_pairs),
+        vec![("kdx-staking", "kaddex.kdx"), (ACC, "kaddex.kdx")]
+    );
+}
+
+/// A hostile tx with many events of junk strings stays under the per-tx ceiling (each event
+/// costs gas and earns at most its own allowance).
+#[test]
+fn many_hostile_events_stay_under_the_ceiling() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(free.evil.go)"}}});
+    let evs: Vec<Value> = (0..2000)
+        .map(|e| {
+            let strings: Vec<Value> = (0..64)
+                .map(|i| json!(format!("k:victim-{e:04}-{i:02}")))
+                .collect();
+            ev("free.wiza", "SPAM", json!(strings))
+        })
+        .collect();
+    let o = out(json!("ok"), Value::Array(evs), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
+    assert_eq!(r.event_pairs.len(), MAX_EVENT_PAIRS_PER_TX);
+}
+
+// Well below the tail's per-emitter block cap (1,024).
+const _: () = assert!(MAX_EVENT_PAIRS_PER_TX <= 1024 / 2);
+
+/// Security review: events that yield no row (junk of an untracked emitter, TRANSFERs, events
+/// with nothing but amounts) cannot fund another event. One event naming many accounts keeps
+/// only its own allowance, however many junk events the tx carries.
+#[test]
+fn junk_events_do_not_raise_another_events_allowance() {
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": "(free.evil.go)"}}});
+    let mut evs: Vec<Value> = (0..1000)
+        .map(|i| ev("free.evil", "JUNK", json!([format!("k:junk-{i:04}")])))
+        .collect();
+    evs.extend((0..500).map(|_| ev("free.wiza", "NOTE", json!([{"decimal": "1.0"}, "7"]))));
+    let many: Vec<Value> = (0..200)
+        .map(|i| json!(format!("k:victim-{i:04}")))
+        .collect();
+    evs.push(ev("free.wiza", "SPAM", json!(many)));
+    let o = out(json!("ok"), Value::Array(evs), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 5_000_000, MAINNET01, &tokens);
+    assert_eq!(
+        r.event_pairs.len(),
+        MAX_EVENT_PAIRS_PER_EVENT,
+        "{}",
+        r.event_pairs.len()
+    );
+    assert!(r
+        .event_pairs
+        .iter()
+        .all(|(a, _)| a.starts_with("k:victim-")));
+}
+
+/// D3 gap group 5: `free.kpepe` (chain 0, height 3,657,409). The deploy tx defines the module
+/// (namespace from `(read-msg 'ns)`) and runs its init unqualified, crediting `ROOT`, a literal
+/// of the code; the only event is the gas TRANSFER. A deploy counts as calling its own module.
+#[test]
+fn a_deploy_tx_counts_as_calling_its_own_module() {
+    let tokens = |m: &str| matches!(m, "free.kpepe" | "free.hype-coin");
+    let mut body = String::new();
+    // A real module carries many doc strings and messages before the account literal.
+    for i in 0..120 {
+        body.push_str(&format!(
+            "  (defun f{i} () @doc \"Function number {i} of the module\" (enforce false \"Not allowed here {i}\"))\n"
+        ));
+    }
+    let code = format!(
+        "(namespace (read-msg 'ns))\n(module kpepe GOVERNANCE\n  (implements fungible-v2)\n{body}\
+         (defconst ROOT_ACCOUNT \"ROOT\")\n  (defun init () (create-account ROOT_ACCOUNT (read-keyset 'ks)))\n)\n\
+         (create-table ledger)\n(init)\n"
+    );
+    let cmd = json!({"payload": {"exec": {"data": {"ns": "free", "ks": {"keys": ["k1"]}},
+        "code": code}}, "meta": {"sender": SRC}});
+    let gas = ev("coin", "TRANSFER", json!([SRC, "k:miner", 0.01]));
+    let o = out(json!("TableCreated"), json!([gas]), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 3_657_409, MAINNET01, &tokens);
+    assert!(
+        pairs(&r.exec_pairs).contains(&("ROOT", "free.kpepe")),
+        "{:?}",
+        r.exec_pairs
+    );
+    // A literal namespace works too (`free.hype-coin`, `GENESIS_ACCT`).
+    let code = "(namespace 'free) (module hype-coin GOV (defconst G \"GENESIS_ACCT\")) (init)";
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}});
+    let r = token_receivers(Some(&cmd), &o, 3_700_000, MAINNET01, &tokens);
+    assert!(
+        pairs(&r.exec_pairs).contains(&("GENESIS_ACCT", "free.hype-coin")),
+        "{:?}",
+        r.exec_pairs
+    );
+    // Security review: deploying a throwaway module gives no bigger cap to calls into another
+    // tracked token; that token keeps the normal exec cap.
+    let mut lits = String::new();
+    for i in 0..300 {
+        lits.push_str(&format!(" \"k:victim-{i:04}\""));
+    }
+    let code = format!("(namespace 'free) (module junk G (defun f () 1)) (free.hype-coin.f{lits})");
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}});
+    let r = token_receivers(Some(&cmd), &o, 3_700_000, MAINNET01, &tokens);
+    let hype = r
+        .exec_pairs
+        .iter()
+        .filter(|(_, m)| m == "free.hype-coin")
+        .count();
+    assert_eq!(hype, MAX_EXEC_PAIRS_PER_TX, "{hype}");
+    assert_eq!(r.exec_pairs.len(), MAX_EXEC_PAIRS_PER_TX);
+    // `module` inside a string or comment is no deploy.
+    let code = "; (module kpepe G)\n(user.f \"(module kpepe G)\" \"ROOT\")";
+    let cmd = json!({"payload": {"exec": {"data": {"ns": "free"}, "code": code}}});
+    let r = token_receivers(Some(&cmd), &o, 3_700_000, MAINNET01, &tokens);
+    assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
+}
+
+/// D3 gap group 6: the bridge tokens (`kb-ETH`, `kb-USDC`, chain 4) move cross-chain with the
+/// defpact `<m>.transfer-create-to-crosschain`; step 1 credits `args[1]` like
+/// `transfer-crosschain`.
+#[test]
+fn a_bridge_token_transfer_create_to_crosschain_finish_names_its_receiver() {
+    // Namespace hash replaced; the shape is the real `n_e595….kb-ETH`.
+    const KB: &str = "n_e5950000000000000000000000000000000000ab.kb-ETH";
+    let tokens = |m: &str| m == KB;
+    let cmd = json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": false,
+        "data": {}, "proof": "x"}}});
+    let def = format!("{KB}.transfer-create-to-crosschain");
+    let cont = |step: u64| {
+        json!({"pactId": "p", "step": step, "stepCount": 2, "executed": null,
+        "stepHasRollback": false, "yield": null,
+        "continuation": {"def": def,
+            "args": [SRC, ACC, {"pred": "keys-all", "keys": ["ba55"]}, "4", 0.5]}})
+    };
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!("ok"), json!([]), cont(1)),
+        5_706_420,
+        MAINNET01,
+        &tokens,
+    );
+    assert_eq!(pairs(&r.pairs), vec![(ACC, KB)]);
+    assert_eq!(r.discovered, vec![KB.to_owned()]);
+    let start = json!({"payload": {"exec": {"data": {}, "code": format!("({def} ..)")}}});
+    let r = token_receivers(
+        Some(&start),
+        &out(json!("ok"), json!([]), cont(0)),
+        5_706_400,
+        MAINNET01,
+        &tokens,
+    );
+    assert!(pairs(&r.pairs).contains(&(SRC, KB)), "{:?}", r.pairs);
 }

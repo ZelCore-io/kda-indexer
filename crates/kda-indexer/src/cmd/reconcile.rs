@@ -13,14 +13,18 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
+    /// Re-mark the posting holders of these modules and queue their D3 history walk now
+    /// (D3 gaps: tokens whose rows a fixed rule missed).
+    Rewalk(Vec<String>),
     /// Run (or resume) the seed walk (B-2). Marks rows dirty; the next `run` reads them.
     Seed,
     /// The receivers pass (D1) as a count only: candidates and would-be-marked rows; writes
     /// nothing (read-only store, no data dir lock).
     SeedDryRun,
-    /// Mark every `Balances` row dirty (height 0; a tail mark is kept).
+    /// Mark every `Balances` row dirty (height 0; a tail mark is kept), and put the keys
+    /// parked for unusable answers (`balances_parked_invalid/`, H-1) back in the seed backlog.
     All,
     /// Run the NFT history fill again (plan Task 11).
     NftFill,
@@ -35,6 +39,10 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
     let hot_dir = super::hot::hot_dir(data_dir);
     match mode {
         Mode::Status => status(cfg, &HotStore::open_ro(&hot_dir)?),
+        Mode::Rewalk(names) => {
+            println!("{}", rewalk(cfg, data_dir, &names)?);
+            Ok(())
+        }
         Mode::Seed => {
             let _lock = super::lock_data_dir(data_dir)?;
             let hs = HotStore::open(&hot_dir, super::hot::geometry(cfg))?;
@@ -109,10 +117,64 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
                     _ => break,
                 }
             }
-            println!("{}", json!({ "marked_dirty": marked }));
+            let mut txn = hs.rw()?;
+            let parked_invalid = kdx_hot::balances::requeue_parked_invalid(&mut txn)?;
+            txn.commit()?;
+            println!(
+                "{}",
+                json!({ "marked_dirty": marked, "parked_invalid_requeued": parked_invalid })
+            );
             Ok(())
         }
     }
+}
+
+/// `--rewalk`: under the data-dir lock, mark every row the listed modules' `xfer` postings
+/// name and queue their D3 history walk now. `coin` and unknown names are refused before
+/// anything is written. Returns the JSON report the command prints.
+pub fn rewalk(cfg: &Config, data_dir: &Path, names: &[String]) -> anyhow::Result<Value> {
+    // N-6: `coin` would mark every coin holder (millions) into the seed backlog; its rows are
+    // kept by the tail and `--seed`/`--all`, not by the token walk.
+    if names.iter().any(|n| n.trim() == "coin") {
+        anyhow::bail!("--rewalk does not take coin (use --seed or --all)");
+    }
+    let _lock = super::lock_data_dir(data_dir)?;
+    let hs = HotStore::open(&super::hot::hot_dir(data_dir), super::hot::geometry(cfg))?;
+    let segdir = kdx_ingest::ctx::segments_dir(data_dir);
+    let ids = module_ids(&hs, names)?;
+    let set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    let rep = kdx_ingest::seed::mark_modules(&hs, &segdir, &set, &|| false)?;
+    let mut txn = hs.rw()?;
+    let restarted = kdx_hot::balances::queue_rewalk(&mut txn, &ids)?;
+    txn.commit()?;
+    Ok(json!({
+        "modules": names,
+        "posting_rows_marked": rep.dirty_inserted,
+        "rewalk_queued": ids.len(),
+        "walk_in_progress_restarted": restarted,
+        "rewalk_pending": kdx_hot::balances::rewalk_pending(&hs.ro()?)?.len(),
+    }))
+}
+
+/// The module ids of `names`; an unknown name is an error (nothing is written).
+fn module_ids(hs: &HotStore, names: &[String]) -> anyhow::Result<Vec<u32>> {
+    let txn = hs.ro()?;
+    let mut out = Vec::new();
+    for n in names {
+        let n = n.trim();
+        let id = txn
+            .get(
+                Table::DictFwd(kdx_types::DictKind::Module),
+                &kdx_hot::dict::fwd_key(n.as_bytes()),
+            )?
+            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
+            .map(u32::from_be_bytes)
+            .ok_or_else(|| anyhow::anyhow!("unknown module: {n}"))?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// A receivers pass (D1 or D3), or its dry run; fails when it could not read some txs (L1).
@@ -286,6 +348,8 @@ fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
             .is_some(),
         "d3_discover_queued": kdx_hot::balances::discovered_queue(&txn, kdx_hot::balances::D3_DISCOVER_QUEUE_MAX)?.len(),
         "d3_rewalk_pending": kdx_hot::balances::rewalk_pending(&txn)?.len(),
+        // H-1: keys parked after repeated unusable `details` answers; `--all` re-queues them.
+        "parked_invalid": kdx_hot::balances::parked_invalid(&txn)?.len(),
         "d3_discover_pending": kdx_hot::balances::discover_pending(&txn, kdx_hot::balances::D3_DISCOVER_PENDING_MAX)?.len(),
         "seed_token_receivers_dropped": txn
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED)?

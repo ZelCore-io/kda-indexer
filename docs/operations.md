@@ -571,9 +571,19 @@ with `[balances] enabled = false`.
   to the back of the queue; the reconciler backs off (up to 60 s) only when node errors are at
   least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,
   mark dropped until its next tail mark). It never becomes a zero balance. A Pact failure (for
-  example a token module without a `details` function) or an unusable answer (not JSON, too
-  large, no decimal balance) drops the mark it read (a newer mark survives) and keeps any stored row, flagged
-  unverified (served `stale: true`), with no back-off. A module name that fails the safety
+  example a token module without a `details` function) drops the mark it read (a newer mark
+  survives) and keeps any stored row, flagged unverified (served `stale: true`), with no
+  back-off. An unusable answer (not JSON, too large, no decimal balance) does not drop the
+  mark at once: it is logged (`balances: details answer unusable; key kept dirty`), counted
+  (`result="invalid"`) and moved to the back of the queue. After 5 in a row the key is parked
+  like a node error and listed (`parked_invalid` in `--status`, at most 100,000 keys);
+  `reconcile-balances --all` puts the listed keys back in the queue. Unusable answers count
+  as module failures: a module none of whose keys answers usably in 3 batches in a row is
+  marked not fungible, like one whose calls fail, so a hostile `details` cannot hold batch
+  slots. A batch of only unusable answers pauses the next one for 30 s (the pause also covers
+  a proxy answering HTML with status 200, which is not a node error and gets no back-off).
+  Balance text is accepted up to 1,024 bytes: Pact decimals carry up to 255 places, so a
+  full-precision balance (for example `free.wiza`, about 260 bytes) is stored exactly. A module name that fails the safety
   check is skipped without a call. A node outage parks nothing: retry counts only run in
   batches that do not back off.
 - **Trust**: a guard adds the account to `/keys/{pk}/accounts` only for `coin` and for a module
@@ -618,10 +628,11 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-
 ```
 
 - `--status`: dirty rows, balance/absent/guard/key/token counts, seed state (`seeded_height`,
-  `seed_in_progress`), the reconciler's rate, ETA and heartbeat age. Read-only; runs beside the
-  service.
+  `seed_in_progress`), keys parked for unusable answers (`parked_invalid`), the reconciler's
+  rate, ETA and heartbeat age. Read-only; runs beside the service.
 - `--seed`: runs (or resumes) the seed walk now; the next `run` reconciles what it marked.
-- `--all`: marks every stored balance row dirty, so the next `run` re-reads them all.
+- `--all`: marks every stored balance row dirty, so the next `run` re-reads them all, and
+  re-queues the keys parked for unusable answers (`parked_invalid_requeued`).
 - `--nft-fill` (service stopped): runs the NFT history fill again (below), then drains the
   marks it made with `get-balance`. `--status` also prints `nft_rows`, `nft_dirty_rows` and
   `nft_filled_height`.
@@ -676,11 +687,16 @@ recheck walks only the new heights (a safety net now that the tail marks). Candi
 
 - an injected early miner account (a dictionary name holding a `"`, mainnet 2020): the
   accounts its coinbase really credited, as coin rows on that block's chain only;
-- a cross-chain defpact of any module (`<module>.transfer-crosschain`): step 1 credits
+- a cross-chain defpact of any module (`<module>.transfer-crosschain`, or the bridge tokens'
+  `<module>.transfer-create-to-crosschain`): step 1 credits
   `args[1]`, step 0 debits `args[0]`. Tokens emit no TRANSFER for either;
 - an `exec` below the events fork: the D1 strings plus every string of `result.data`, for coin
   and for each tracked token the code calls; from the events fork on, the same strings for a
-  tracked token the code calls only when the tx has no event of that token;
+  tracked token the code calls only when the tx has no event of that token. A tx that deploys
+  a module (`(module <name> ..)` after `(namespace ..)`, a literal or `(read-msg 'k)`) counts
+  as calling that module, since its init runs unqualified: its code literals without
+  whitespace (a `ROOT` or genesis account) are candidates for that module only, up to 512 per
+  tx; calls into other modules in the same tx keep the normal cap of 64;
 - an event of a tracked token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
   ...): its string params, for that token;
 - an event param holding a `fungible-v2` module reference: the event's string params, for the
@@ -718,13 +734,37 @@ or hot key, budget counters), so a restart resumes there. A new walk starts at m
 (`balances_d3_rewalk_at`); tokens queued during a walk wait for the next one. The CLI walks to
 the end on every run.
 
+To re-mark and re-walk given tokens now (for example after a fix to the D3 rules or to the
+reconciler, when their rows were missed), stop the service and run:
+
+```
+kda-indexer reconcile-balances --rewalk free.wiza,kaddex.skdx
+```
+
+It takes the data dir lock and, for the listed modules only: marks every row their `xfer`
+postings name (`coin`: also its `acct` postings), as the seed does, without touching the seed's
+own state; queues each in `Meta balances_d3_rewalk/<ModuleId>`; and deletes
+`balances_d3_rewalk_at`, so the service starts the walk at its next history slice instead of a
+day after the last one. A walk in progress is restarted from height 0 with its own tokens and the
+new ones together (its tokens stay queued until a walk ends). It prints `posting_rows_marked`,
+`rewalk_queued`, `walk_in_progress_restarted` and `rewalk_pending`. An unknown module name, or
+`coin` (it would mark every coin holder; use `--seed` or `--all`), is an error and writes
+nothing. Running it again marks nothing new but restarts a walk in progress from 0 again (about
+14 h on mainnet). Start the service again; it reconciles the marks and runs the walk
+(`--status` shows `d3_rewalk_pending`). Only tracked tokens are walked; an untracked name is
+queued and silently skipped by the walk, so check `/tokens` or `--status` first.
+
 Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
 Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot read them.
 
 Only successful txs give candidates. The injected-miner rule reads the block's miner data of
 coinbases below the coinbase injection fix (mainnet 121,452), on that block's chain only.
-Rows from events and from an exec's token calls are capped: 64 of each per tx (events are
-taken first), then per pass a budget of distinct rows per tracked token (2,000,000,
+Rows from events and from an exec's token calls are capped per tx: each event may add at most
+64 rows of its own (an event that yields no row funds no other event), and a tx's events at
+most 512 (a batch tx such as a kaddex staking-migration WRAP tx credits 45 accounts in one tx);
+an exec gives at most 64 (plus 512 code literals for a module the tx deploys; events are
+taken first). Amount params (`{"decimal": ..}`,
+`{"int": ..}`, plain number strings) are never candidates. Then per pass a budget of distinct rows per tracked token (2,000,000,
 `KDX_D3_MAX_EVENT_CANDIDATES` for the CLI; a repeated row costs nothing), one shared bucket for
 all untracked emitters (2,000,000) and a global ceiling (20,000,000). Rows from an `exec`'s token
 calls are charged to the tx's sender (100,000 per sender, 2,000,000 per pass), never to the
@@ -778,7 +818,7 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 - `n_4e470a97222514a8662dd1219000a0431451b0ee.ledger` (a v2-shaped ledger in a principal
   namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
   deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
-- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|skipped|parked|capped|not_fungible"}`
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|invalid|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 

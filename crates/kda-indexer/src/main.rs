@@ -226,8 +226,20 @@ enum Command {
         #[arg(long, conflicts_with_all = ["seed", "status", "nft_fill"])]
         all: bool,
         /// Dirty rows, rate, ETA and seed state.
-        #[arg(long, conflicts_with_all = ["seed", "all", "nft_fill"])]
+        #[arg(long, conflicts_with_all = ["seed", "all", "nft_fill", "rewalk"])]
         status: bool,
+        /// Re-mark and re-walk these modules now (comma-separated, e.g.
+        /// `free.wiza,kaddex.skdx`): marks every row their postings name, and queues their D3
+        /// history walk with the daily spacing reset (a walk in progress restarts from 0 with
+        /// its own tokens). The service runs the walk; the marks are read by the next `run`.
+        /// `coin` is refused (use --seed or --all).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            num_args = 1..,
+            conflicts_with_all = ["seed", "all", "status", "nft_fill"]
+        )]
+        rewalk: Vec<String>,
     },
     /// Code search index (`search/`): rebuild it, or query it (dev aid).
     Search {
@@ -680,16 +692,20 @@ async fn main() -> anyhow::Result<()> {
             nft_fill,
             all,
             status,
+            rewalk,
         } => {
             use kda_indexer::cmd::reconcile::Mode;
             let mode = match (seed, all, status, nft_fill) {
+                _ if !rewalk.is_empty() => Mode::Rewalk(rewalk),
                 (true, _, _, _) if dry_run => Mode::SeedDryRun,
                 (true, _, _, _) => Mode::Seed,
                 (_, true, _, _) => Mode::All,
                 (_, _, true, _) => Mode::Status,
                 (_, _, _, true) => Mode::NftFill,
                 _ => {
-                    anyhow::bail!("reconcile-balances needs --seed, --all, --status or --nft-fill")
+                    anyhow::bail!(
+                        "reconcile-balances needs --seed, --all, --status, --nft-fill or --rewalk"
+                    )
                 }
             };
             kda_indexer::cmd::reconcile::run(

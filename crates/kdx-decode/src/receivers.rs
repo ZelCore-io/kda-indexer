@@ -236,7 +236,8 @@ pub fn injected_miner_receivers(miner: &str) -> Vec<String> {
 pub struct TokenReceivers {
     /// From the cross-chain and `exec` rules.
     pub pairs: Vec<(String, String)>,
-    /// From events (rule 3), at most [`MAX_EVENT_PAIRS_PER_TX`]; never coin.
+    /// From events (rule 3), at most [`MAX_EVENT_PAIRS_PER_EVENT`] new rows per event and
+    /// [`MAX_EVENT_PAIRS_PER_TX`] per tx; never coin.
     pub event_pairs: Vec<(String, String)>,
     /// The module each `event_pairs` entry is charged to (same index): the event's emitter, or
     /// the token an `exec` calls. The pass budgets its per-pass cap per emitter.
@@ -258,11 +259,25 @@ pub struct TokenReceivers {
     pub discovered_too_long: u32,
 }
 
-/// Event-derived candidates kept per tx (security review: chain data must not amplify the
-/// pass). Real credits name a handful of accounts per tx.
-pub const MAX_EVENT_PAIRS_PER_TX: usize = 64;
+/// Event-derived candidates one event may add for itself (security review: chain data must not
+/// amplify the pass). Also the most strings and module references kept from one event. The
+/// allowance is per event and spent only by that event's own rows: an event that yields no row
+/// (junk) funds nothing, so it cannot raise another event's budget.
+pub const MAX_EVENT_PAIRS_PER_EVENT: usize = 64;
+/// Ceiling of event-derived candidates per tx, whatever its event count: half of the tail's
+/// per-emitter block budget (`kdx_hot::tail::D3_ROWS_PER_EMITTER_PER_BLOCK`, 1,024). A batch tx
+/// (D3 gap group 1: a kaddex migration WRAP tx credits 45 accounts in 90 events, about two
+/// rows each) needs about 94; the old fixed 64 per tx kept only its first 21 accounts.
+pub const MAX_EVENT_PAIRS_PER_TX: usize = 512;
 /// Exec-derived token candidates kept per tx (own budget, see [`TokenReceivers::exec_pairs`]).
 pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
+/// Exec-derived token candidates kept from a module-deploy tx (D3 gap group 5): its code holds
+/// the module's own constants (a `ROOT` or genesis account its init credits) among many other
+/// literals. Literals with whitespace (doc strings, messages) are skipped there; the rest are
+/// charged to the sender like any exec row.
+pub const MAX_DEPLOY_EXEC_PAIRS: usize = 512;
+/// Modules one deploy tx may count as called.
+const MAX_DEPLOYED_PER_TX: usize = 4;
 /// Prefix of the budget key of exec-derived rows: `exec:<sender>` (a module name holds no `:`).
 pub const EXEC_BUCKET: &str = "exec:";
 /// Modules one tx may put forward as tokens (review M1).
@@ -274,7 +289,7 @@ pub const MAX_DISCOVERED_PER_TX: usize = 4;
 pub const MAX_MODULE_LEN: usize = 256;
 /// Module references kept per event (each one with a string uses a pair slot of the tx, so
 /// more can never add a pair).
-const MAX_REFS_PER_EVENT: usize = MAX_EVENT_PAIRS_PER_TX;
+const MAX_REFS_PER_EVENT: usize = MAX_EVENT_PAIRS_PER_EVENT;
 
 /// Namespaces where anyone may deploy: a module there proves nothing about its neighbours
 /// (review L3: add any other namespace whose user guard is open).
@@ -311,11 +326,11 @@ impl TokenReceivers {
         }
     }
     /// A capped candidate (events, and token rows of an `exec`), charged to `emitter`.
-    fn push_event(&mut self, account: &str, module: &str, emitter: &str) {
+    fn push_event(&mut self, account: &str, module: &str, emitter: &str, cap: usize) {
         if module != "coin"
             && account_like(account)
             && readable_module(module)
-            && self.event_pairs.len() < MAX_EVENT_PAIRS_PER_TX
+            && self.event_pairs.len() < cap
             && !self
                 .event_pairs
                 .iter()
@@ -326,11 +341,19 @@ impl TokenReceivers {
             self.event_emitters.push(emitter.to_owned());
         }
     }
-    fn push_exec(&mut self, account: &str, module: &str, sender: &str) {
+    /// An exec row, counted in `used` (its own budget: normal calls or a deployed module).
+    fn push_exec(
+        &mut self,
+        account: &str,
+        module: &str,
+        sender: &str,
+        used: &mut usize,
+        cap: usize,
+    ) {
         if module != "coin"
             && account_like(account)
             && readable_module(module)
-            && self.exec_pairs.len() < MAX_EXEC_PAIRS_PER_TX
+            && *used < cap
             && !self
                 .exec_pairs
                 .iter()
@@ -339,6 +362,7 @@ impl TokenReceivers {
             self.exec_pairs
                 .push((account.to_owned(), module.to_owned()));
             self.exec_emitters.push(format!("{EXEC_BUCKET}{sender}"));
+            *used += 1;
         }
     }
     fn discover(&mut self, module: &str) {
@@ -374,7 +398,10 @@ impl TokenReceivers {
     }
 }
 
-const XCHAIN_SUFFIX: &str = ".transfer-crosschain";
+/// Cross-chain defpacts whose step 1 credits `args[1]` and step 0 debits `args[0]`:
+/// `fungible-xchain-v1`'s `transfer-crosschain`, and the bridge tokens' (`kb-*`)
+/// `transfer-create-to-crosschain` (D3 gap group 6).
+const XCHAIN_SUFFIXES: &[&str] = &[".transfer-crosschain", ".transfer-create-to-crosschain"];
 
 /// One event of a tx as D3 needs it (no tracked-token knowledge yet).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -385,8 +412,8 @@ pub struct D3Event {
     pub transfer: bool,
     /// `fungible-v2` modref targets in the params (coin excluded), at most 64.
     pub refs: Vec<String>,
-    /// Distinct [`account_like`] string params outside modrefs, at most
-    /// [`MAX_EVENT_PAIRS_PER_TX`] (the tx's event rows are capped at that anyway).
+    /// Distinct [`account_like`] string params outside modrefs and amounts, at most
+    /// [`MAX_EVENT_PAIRS_PER_EVENT`].
     pub strings: Vec<String>,
 }
 
@@ -395,12 +422,18 @@ pub struct D3Event {
 pub struct D3Exec {
     /// Below the events fork: the strings count for coin too (uncapped).
     pub coin: bool,
-    /// Modules the code calls (`<m>.fn`), minus those that emitted an event in the tx from the
-    /// events fork on; the filter keeps the tracked tokens.
+    /// Modules the code calls (`<m>.fn`) and does not deploy, minus those that emitted an
+    /// event in the tx from the events fork on; the filter keeps the tracked tokens.
     pub called: Vec<String>,
+    /// Modules the code deploys (`(module <m> ..)`, which then runs its own functions
+    /// unqualified), same event rule. Only they get [`Self::deploy_strings`].
+    pub deployed: Vec<String>,
     /// Distinct [`account_like`] strings of `exec.data`, `exec.code` literals and
     /// `result.data`, first-seen order; capped at [`MAX_EXEC_PAIRS_PER_TX`] unless `coin`.
     pub strings: Vec<String>,
+    /// For the deployed modules only: distinct code literals without whitespace, at most
+    /// [`MAX_DEPLOY_EXEC_PAIRS`] (data and result strings never get the deploy allowance).
+    pub deploy_strings: Vec<String>,
     /// `meta.sender` of the cmd (empty when absent): the budget key of the token rows.
     pub sender: String,
 }
@@ -447,7 +480,9 @@ pub fn d3_candidates(
     let is_cont = cmd.is_some_and(|c| c.pointer("/payload/cont").is_some());
     if let Some(k) = output.get("continuation").filter(|k| !k.is_null()) {
         let def = k.pointer("/continuation/def").and_then(Value::as_str);
-        if let Some(m) = def.and_then(|d| d.strip_suffix(XCHAIN_SUFFIX)) {
+        let xchain_module =
+            def.and_then(|d| XCHAIN_SUFFIXES.iter().find_map(|x| d.strip_suffix(x)));
+        if let Some(m) = xchain_module {
             let side = match k.get("step").and_then(Value::as_u64) {
                 Some(1) if is_cont => Some(1),
                 Some(0) if !is_cont => Some(0),
@@ -483,8 +518,8 @@ pub fn d3_candidates(
         });
         let mut strings = Vec::new();
         param_strings(ev.params, &mut strings);
-        for s in &strings {
-            push_distinct(&mut d.strings, s, MAX_EVENT_PAIRS_PER_TX);
+        for s in strings.iter().filter(|s| !amount_text(s)) {
+            push_distinct(&mut d.strings, s, MAX_EVENT_PAIRS_PER_EVENT);
         }
         // An event with no string can give no row; one with no ref and a TRANSFER neither.
         if !d.strings.is_empty() || !d.refs.is_empty() {
@@ -501,26 +536,41 @@ pub fn d3_candidates(
         // accounts named there (TRANSFER marks them; rule 3 the rest): only a token call that
         // emitted nothing of the token at all needs the exec strings (dry run on KDA-03: without
         // this, millions of extra reads).
-        let called: Vec<String> = called_modules(code)
+        let data = cmd.pointer("/payload/exec/data");
+        let keep = |m: &String| m != "coin" && (coin || !emitted.contains(m));
+        let deployed: Vec<String> = deployed_modules(code, data)
             .into_iter()
-            .filter(|m| m != "coin" && (coin || !emitted.contains(m)))
+            .filter(keep)
             .collect();
-        if coin || !called.is_empty() {
+        let mut called: Vec<String> = Vec::new();
+        for m in called_modules(code).into_iter().filter(keep) {
+            if !called.contains(&m) && !deployed.contains(&m) {
+                called.push(m);
+            }
+        }
+        if coin || !called.is_empty() || !deployed.is_empty() {
             let cap = if coin {
                 usize::MAX
             } else {
                 MAX_EXEC_PAIRS_PER_TX
             };
             let mut strings = Vec::new();
+            let mut deploy_strings = Vec::new();
             let mut add = |s: &str| push_distinct(&mut strings, s, cap);
-            if let Some(d) = cmd.pointer("/payload/exec/data") {
+            if let Some(d) = data {
                 data_strings(d, &mut add);
             }
-            for s in code_literals(code) {
-                add(&s);
+            let literals = code_literals(code);
+            for s in &literals {
+                add(s);
             }
             if let Some(d) = output.pointer("/result/data") {
                 data_strings(d, &mut add);
+            }
+            if !deployed.is_empty() {
+                for s in literals.iter().filter(|s| !s.contains(char::is_whitespace)) {
+                    push_distinct(&mut deploy_strings, s, MAX_DEPLOY_EXEC_PAIRS);
+                }
             }
             let sender = cmd
                 .pointer("/meta/sender")
@@ -530,7 +580,9 @@ pub fn d3_candidates(
             c.exec = Some(D3Exec {
                 coin,
                 called,
+                deployed,
                 strings,
+                deploy_strings,
                 sender,
             });
         }
@@ -541,15 +593,17 @@ pub fn d3_candidates(
 /// The rows of `c` given which modules are tracked fungible tokens (`is_token`; coin is always
 /// one). Rules:
 ///
-/// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain`, any height): step 1
+/// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain` or
+///    `<m>.transfer-create-to-crosschain`, any height): step 1
 ///    credits `args[1]` and step 0 debits `args[0]`. Tokens emit no TRANSFER for either
 ///    (only `pact.X_YIELD` / `X_RESUME`); coin did not before coin v3. `<m>` is discovered.
 /// 2. **`exec`**: the D1 strings (`exec.data` values, `exec.code` literals) plus every string
 ///    of `result.data` (a receiver built at run time and returned, D3 b), for every tracked
 ///    token `<m>` the code calls (`<m>.fn`; from the events fork on only one that emitted
 ///    nothing in the tx), and for coin below the events fork.
-/// 3. **Events** (any height, into `event_pairs`, capped at [`MAX_EVENT_PAIRS_PER_TX`], never
-///    coin): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
+/// 3. **Events** (any height, into `event_pairs`, at most [`MAX_EVENT_PAIRS_PER_EVENT`] new
+///    rows earned by each event for itself and [`MAX_EVENT_PAIRS_PER_TX`] per tx, never coin;
+///    amounts are never candidates): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
 ///    …) gives its [`account_like`] params for that token; an event whose params hold a
 ///    `fungible-v2` module reference gives them for the referenced module when the emitter is
 ///    that module, a module of the same governed namespace (D3 d: `kaddex.skdx` is only ever
@@ -584,9 +638,11 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
         {
             targets.push(&ev.module);
         }
+        // This event's own allowance: it can only spend what it earns, never another's.
+        let cap = (r.event_pairs.len() + MAX_EVENT_PAIRS_PER_EVENT).min(MAX_EVENT_PAIRS_PER_TX);
         for m in targets {
             for s in &ev.strings {
-                r.push_event(s, m, &ev.module);
+                r.push_event(s, m, &ev.module, cap);
             }
         }
     }
@@ -601,13 +657,21 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
             }
         }
         // Coin rows (below the events fork) as in D1; token rows are capped like events.
+        let mut used = 0;
         for m in modules {
             for s in &x.strings {
                 if m == "coin" {
                     r.push(s, m);
                 } else {
-                    r.push_exec(s, m, &x.sender);
+                    r.push_exec(s, m, &x.sender, &mut used, MAX_EXEC_PAIRS_PER_TX);
                 }
+            }
+        }
+        // A deployed tracked token: its own literal budget, never shared with other calls.
+        let mut used = 0;
+        for m in x.deployed.iter().filter(|m| is_token(m)) {
+            for s in &x.deploy_strings {
+                r.push_exec(s, m, &x.sender, &mut used, MAX_DEPLOY_EXEC_PAIRS);
             }
         }
     }
@@ -672,6 +736,111 @@ fn called_modules(code: &str) -> Vec<String> {
     out
 }
 
+/// The modules `code` deploys (`(module <name> ..)`, qualified by the last `(namespace ..)`
+/// before it: a `"literal"`, a `'symbol` or `(read-msg 'k)` / `(read-string 'k)` of `data`),
+/// at most [`MAX_DEPLOYED_PER_TX`]. Strings and `;` comments are never code. A deploy runs its
+/// own functions unqualified (`(init)`), so [`called_modules`] cannot see them (D3 gap group 5).
+fn deployed_modules(code: &str, data: Option<&Value>) -> Vec<String> {
+    enum Tok {
+        Open,
+        Close,
+        Str(String),
+        Word(String),
+    }
+    let b = code.as_bytes();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b';' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                toks.push(Tok::Open);
+                i += 1;
+            }
+            b')' => {
+                toks.push(Tok::Close);
+                i += 1;
+            }
+            b'"' => {
+                let mut s = Vec::new();
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        i += 1;
+                    }
+                    s.push(b[i]);
+                    i += 1;
+                }
+                i += 1;
+                toks.push(Tok::Str(String::from_utf8_lossy(&s).into_owned()));
+            }
+            b'\'' => {
+                let start = i + 1;
+                i = start;
+                while i < b.len() && !is_delim(b[i]) {
+                    i += 1;
+                }
+                toks.push(Tok::Str(String::from_utf8_lossy(&b[start..i]).into_owned()));
+            }
+            c if is_delim(c) => i += 1,
+            _ => {
+                let start = i;
+                while i < b.len() && !is_delim(b[i]) && b[i] != b';' {
+                    i += 1;
+                }
+                toks.push(Tok::Word(
+                    String::from_utf8_lossy(&b[start..i]).into_owned(),
+                ));
+            }
+        }
+    }
+    let word = |j: usize| match toks.get(j) {
+        Some(Tok::Word(w)) => Some(w.as_str()),
+        _ => None,
+    };
+    let mut ns: Option<String> = None;
+    let mut out: Vec<String> = Vec::new();
+    for j in 0..toks.len() {
+        if !matches!(toks[j], Tok::Open) {
+            continue;
+        }
+        match word(j + 1) {
+            Some("namespace") => {
+                ns = match (toks.get(j + 2), toks.get(j + 3), word(j + 3)) {
+                    (Some(Tok::Str(n)), _, _) => Some(n.clone()),
+                    (Some(Tok::Open), _, Some("read-msg" | "read-string")) => {
+                        match toks.get(j + 4) {
+                            Some(Tok::Str(k)) => data
+                                .and_then(|d| d.get(k))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            }
+            Some("module") => {
+                if let Some(name) = word(j + 2) {
+                    let m = match ns.as_deref() {
+                        Some(n) if !n.is_empty() => format!("{n}.{name}"),
+                        _ => name.to_owned(),
+                    };
+                    if out.len() < MAX_DEPLOYED_PER_TX && !out.contains(&m) {
+                        out.push(m);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// A `fungible-v2` module reference (`{"refSpec": [.. {"name": "fungible-v2"} ..],
 /// "refName": {"namespace", "name"}}`) gives its qualified module name.
 fn fungible_modref(v: &serde_json::Map<String, Value>) -> Option<String> {
@@ -704,15 +873,28 @@ fn modrefs(v: &Value, f: &mut impl FnMut(&str)) {
     }
 }
 
-/// String params at any depth, module references skipped.
+/// String params at any depth, module references and Pact numbers (`{"decimal": ..}`,
+/// `{"int": ..}`) skipped.
 fn param_strings(v: &Value, out: &mut Vec<String>) {
     match v {
         Value::String(s) => out.push(s.clone()),
         Value::Array(a) => a.iter().for_each(|x| param_strings(x, out)),
         Value::Object(m) if m.contains_key("refSpec") => {}
+        Value::Object(m)
+            if m.len() == 1 && (m.contains_key("decimal") || m.contains_key("int")) => {}
         Value::Object(m) => m.values().for_each(|x| param_strings(x, out)),
         _ => {}
     }
+}
+
+/// A plain number text (`-`? digits, `.` digits?), as an amount param prints: never an account
+/// name in an event (D3 gap group 1: amounts used up the per-tx cap). A legacy account named
+/// only by digits is still marked by its TRANSFER postings and the exec rule.
+fn amount_text(s: &str) -> bool {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let (i, f) = s.split_once('.').unwrap_or((s, "0"));
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    digits(i) && digits(f)
 }
 
 /// [`d3_candidates`] of a stored record (none for the coinbase; an error for a cmd that is
