@@ -271,6 +271,13 @@ pub const MAX_EVENT_PAIRS_PER_EVENT: usize = 64;
 pub const MAX_EVENT_PAIRS_PER_TX: usize = 512;
 /// Exec-derived token candidates kept per tx (own budget, see [`TokenReceivers::exec_pairs`]).
 pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
+/// Exec-derived token candidates kept from a module-deploy tx (D3 gap group 5): its code holds
+/// the module's own constants (a `ROOT` or genesis account its init credits) among many other
+/// literals. Literals with whitespace (doc strings, messages) are skipped there; the rest are
+/// charged to the sender like any exec row.
+pub const MAX_DEPLOY_EXEC_PAIRS: usize = 512;
+/// Modules one deploy tx may count as called.
+const MAX_DEPLOYED_PER_TX: usize = 4;
 /// Prefix of the budget key of exec-derived rows: `exec:<sender>` (a module name holds no `:`).
 pub const EXEC_BUCKET: &str = "exec:";
 /// Modules one tx may put forward as tokens (review M1).
@@ -334,11 +341,11 @@ impl TokenReceivers {
             self.event_emitters.push(emitter.to_owned());
         }
     }
-    fn push_exec(&mut self, account: &str, module: &str, sender: &str) {
+    fn push_exec(&mut self, account: &str, module: &str, sender: &str, cap: usize) {
         if module != "coin"
             && account_like(account)
             && readable_module(module)
-            && self.exec_pairs.len() < MAX_EXEC_PAIRS_PER_TX
+            && self.exec_pairs.len() < cap
             && !self
                 .exec_pairs
                 .iter()
@@ -403,11 +410,16 @@ pub struct D3Event {
 pub struct D3Exec {
     /// Below the events fork: the strings count for coin too (uncapped).
     pub coin: bool,
-    /// Modules the code calls (`<m>.fn`), minus those that emitted an event in the tx from the
-    /// events fork on; the filter keeps the tracked tokens.
+    /// Modules the code calls (`<m>.fn`) or deploys (`(module <m> ..)`, which then runs its
+    /// own functions unqualified), minus those that emitted an event in the tx from the events
+    /// fork on; the filter keeps the tracked tokens.
     pub called: Vec<String>,
+    /// The code deploys a module ([`MAX_DEPLOY_EXEC_PAIRS`] applies).
+    pub deploy: bool,
     /// Distinct [`account_like`] strings of `exec.data`, `exec.code` literals and
-    /// `result.data`, first-seen order; capped at [`MAX_EXEC_PAIRS_PER_TX`] unless `coin`.
+    /// `result.data`, first-seen order; capped at [`MAX_EXEC_PAIRS_PER_TX`]
+    /// ([`MAX_DEPLOY_EXEC_PAIRS`] for a deploy, whose code literals with whitespace are
+    /// skipped) unless `coin`.
     pub strings: Vec<String>,
     /// `meta.sender` of the cmd (empty when absent): the budget key of the token rows.
     pub sender: String,
@@ -509,23 +521,32 @@ pub fn d3_candidates(
         // accounts named there (TRANSFER marks them; rule 3 the rest): only a token call that
         // emitted nothing of the token at all needs the exec strings (dry run on KDA-03: without
         // this, millions of extra reads).
-        let called: Vec<String> = called_modules(code)
-            .into_iter()
-            .filter(|m| m != "coin" && (coin || !emitted.contains(m)))
-            .collect();
+        let data = cmd.pointer("/payload/exec/data");
+        let deployed = deployed_modules(code, data);
+        let deploy = !deployed.is_empty();
+        let mut called: Vec<String> = Vec::new();
+        for m in called_modules(code).into_iter().chain(deployed) {
+            if m != "coin" && (coin || !emitted.contains(&m)) && !called.contains(&m) {
+                called.push(m);
+            }
+        }
         if coin || !called.is_empty() {
             let cap = if coin {
                 usize::MAX
+            } else if deploy {
+                MAX_DEPLOY_EXEC_PAIRS
             } else {
                 MAX_EXEC_PAIRS_PER_TX
             };
             let mut strings = Vec::new();
             let mut add = |s: &str| push_distinct(&mut strings, s, cap);
-            if let Some(d) = cmd.pointer("/payload/exec/data") {
+            if let Some(d) = data {
                 data_strings(d, &mut add);
             }
             for s in code_literals(code) {
-                add(&s);
+                if !(deploy && !coin && s.contains(char::is_whitespace)) {
+                    add(&s);
+                }
             }
             if let Some(d) = output.pointer("/result/data") {
                 data_strings(d, &mut add);
@@ -538,6 +559,7 @@ pub fn d3_candidates(
             c.exec = Some(D3Exec {
                 coin,
                 called,
+                deploy,
                 strings,
                 sender,
             });
@@ -617,7 +639,12 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
                 if m == "coin" {
                     r.push(s, m);
                 } else {
-                    r.push_exec(s, m, &x.sender);
+                    let cap = if x.deploy {
+                        MAX_DEPLOY_EXEC_PAIRS
+                    } else {
+                        MAX_EXEC_PAIRS_PER_TX
+                    };
+                    r.push_exec(s, m, &x.sender, cap);
                 }
             }
         }
@@ -678,6 +705,111 @@ fn called_modules(code: &str) -> Vec<String> {
             if !m.is_empty() && !f.is_empty() && !out.iter().any(|x: &String| x == m) {
                 out.push(m.to_owned());
             }
+        }
+    }
+    out
+}
+
+/// The modules `code` deploys (`(module <name> ..)`, qualified by the last `(namespace ..)`
+/// before it: a `"literal"`, a `'symbol` or `(read-msg 'k)` / `(read-string 'k)` of `data`),
+/// at most [`MAX_DEPLOYED_PER_TX`]. Strings and `;` comments are never code. A deploy runs its
+/// own functions unqualified (`(init)`), so [`called_modules`] cannot see them (D3 gap group 5).
+fn deployed_modules(code: &str, data: Option<&Value>) -> Vec<String> {
+    enum Tok {
+        Open,
+        Close,
+        Str(String),
+        Word(String),
+    }
+    let b = code.as_bytes();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b';' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                toks.push(Tok::Open);
+                i += 1;
+            }
+            b')' => {
+                toks.push(Tok::Close);
+                i += 1;
+            }
+            b'"' => {
+                let mut s = Vec::new();
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        i += 1;
+                    }
+                    s.push(b[i]);
+                    i += 1;
+                }
+                i += 1;
+                toks.push(Tok::Str(String::from_utf8_lossy(&s).into_owned()));
+            }
+            b'\'' => {
+                let start = i + 1;
+                i = start;
+                while i < b.len() && !is_delim(b[i]) {
+                    i += 1;
+                }
+                toks.push(Tok::Str(String::from_utf8_lossy(&b[start..i]).into_owned()));
+            }
+            c if is_delim(c) => i += 1,
+            _ => {
+                let start = i;
+                while i < b.len() && !is_delim(b[i]) && b[i] != b';' {
+                    i += 1;
+                }
+                toks.push(Tok::Word(
+                    String::from_utf8_lossy(&b[start..i]).into_owned(),
+                ));
+            }
+        }
+    }
+    let word = |j: usize| match toks.get(j) {
+        Some(Tok::Word(w)) => Some(w.as_str()),
+        _ => None,
+    };
+    let mut ns: Option<String> = None;
+    let mut out: Vec<String> = Vec::new();
+    for j in 0..toks.len() {
+        if !matches!(toks[j], Tok::Open) {
+            continue;
+        }
+        match word(j + 1) {
+            Some("namespace") => {
+                ns = match (toks.get(j + 2), toks.get(j + 3), word(j + 3)) {
+                    (Some(Tok::Str(n)), _, _) => Some(n.clone()),
+                    (Some(Tok::Open), _, Some("read-msg" | "read-string")) => {
+                        match toks.get(j + 4) {
+                            Some(Tok::Str(k)) => data
+                                .and_then(|d| d.get(k))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            }
+            Some("module") => {
+                if let Some(name) = word(j + 2) {
+                    let m = match ns.as_deref() {
+                        Some(n) if !n.is_empty() => format!("{n}.{name}"),
+                        _ => name.to_owned(),
+                    };
+                    if out.len() < MAX_DEPLOYED_PER_TX && !out.contains(&m) {
+                        out.push(m);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out

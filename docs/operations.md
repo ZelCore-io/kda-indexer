@@ -685,7 +685,10 @@ recheck walks only the new heights (a safety net now that the tail marks). Candi
   `args[1]`, step 0 debits `args[0]`. Tokens emit no TRANSFER for either;
 - an `exec` below the events fork: the D1 strings plus every string of `result.data`, for coin
   and for each tracked token the code calls; from the events fork on, the same strings for a
-  tracked token the code calls only when the tx has no event of that token;
+  tracked token the code calls only when the tx has no event of that token. A tx that deploys
+  a module (`(module <name> ..)` after `(namespace ..)`, a literal or `(read-msg 'k)`) counts
+  as calling that module, since its init runs unqualified: its code literals without
+  whitespace (a `ROOT` or genesis account) are candidates for it, up to 512 per tx;
 - an event of a tracked token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
   ...): its string params, for that token;
 - an event param holding a `fungible-v2` module reference: the event's string params, for the
@@ -731,7 +734,7 @@ coinbases below the coinbase injection fix (mainnet 121,452), on that block's ch
 Rows from events and from an exec's token calls are capped per tx: each event may add at most
 64 rows of its own (an event that yields no row funds no other event), and a tx's events at
 most 512 (a batch tx such as a kaddex staking-migration WRAP tx credits 45 accounts in one tx);
-an exec gives at most 64 (events are taken first). Amount params (`{"decimal": ..}`,
+an exec gives at most 64 (512 for a module deploy; events are taken first). Amount params (`{"decimal": ..}`,
 `{"int": ..}`, plain number strings) are never candidates. Then per pass a budget of distinct rows per tracked token (2,000,000,
 `KDX_D3_MAX_EVENT_CANDIDATES` for the CLI; a repeated row costs nothing), one shared bucket for
 all untracked emitters (2,000,000) and a global ceiling (20,000,000). Rows from an `exec`'s token

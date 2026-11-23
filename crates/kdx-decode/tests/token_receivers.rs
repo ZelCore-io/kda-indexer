@@ -517,3 +517,47 @@ fn junk_events_do_not_raise_another_events_allowance() {
         .iter()
         .all(|(a, _)| a.starts_with("k:victim-")));
 }
+
+/// D3 gap group 5: `free.kpepe` (chain 0, height 3,657,409). The deploy tx defines the module
+/// (namespace from `(read-msg 'ns)`) and runs its init unqualified, crediting `ROOT`, a literal
+/// of the code; the only event is the gas TRANSFER. A deploy counts as calling its own module.
+#[test]
+fn a_deploy_tx_counts_as_calling_its_own_module() {
+    let tokens = |m: &str| matches!(m, "free.kpepe" | "free.hype-coin");
+    let mut body = String::new();
+    // A real module carries many doc strings and messages before the account literal.
+    for i in 0..120 {
+        body.push_str(&format!(
+            "  (defun f{i} () @doc \"Function number {i} of the module\" (enforce false \"Not allowed here {i}\"))\n"
+        ));
+    }
+    let code = format!(
+        "(namespace (read-msg 'ns))\n(module kpepe GOVERNANCE\n  (implements fungible-v2)\n{body}\
+         (defconst ROOT_ACCOUNT \"ROOT\")\n  (defun init () (create-account ROOT_ACCOUNT (read-keyset 'ks)))\n)\n\
+         (create-table ledger)\n(init)\n"
+    );
+    let cmd = json!({"payload": {"exec": {"data": {"ns": "free", "ks": {"keys": ["k1"]}},
+        "code": code}}, "meta": {"sender": SRC}});
+    let gas = ev("coin", "TRANSFER", json!([SRC, "k:miner", 0.01]));
+    let o = out(json!("TableCreated"), json!([gas]), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 3_657_409, MAINNET01, &tokens);
+    assert!(
+        pairs(&r.exec_pairs).contains(&("ROOT", "free.kpepe")),
+        "{:?}",
+        r.exec_pairs
+    );
+    // A literal namespace works too (`free.hype-coin`, `GENESIS_ACCT`).
+    let code = "(namespace 'free) (module hype-coin GOV (defconst G \"GENESIS_ACCT\")) (init)";
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}});
+    let r = token_receivers(Some(&cmd), &o, 3_700_000, MAINNET01, &tokens);
+    assert!(
+        pairs(&r.exec_pairs).contains(&("GENESIS_ACCT", "free.hype-coin")),
+        "{:?}",
+        r.exec_pairs
+    );
+    // `module` inside a string or comment is no deploy.
+    let code = "; (module kpepe G)\n(user.f \"(module kpepe G)\" \"ROOT\")";
+    let cmd = json!({"payload": {"exec": {"data": {"ns": "free"}, "code": code}}});
+    let r = token_receivers(Some(&cmd), &o, 3_700_000, MAINNET01, &tokens);
+    assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
+}
