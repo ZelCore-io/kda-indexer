@@ -26,7 +26,7 @@
 //! is [`LocalError::Invalid`]; only transport and HTTP errors are [`LocalError::Node`]. None
 //! is ever read as a zero balance.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use blake2::{Blake2b, Digest};
@@ -281,6 +281,24 @@ impl LocalClient {
         self.call_timed(chain, code, data).await.0
     }
 
+    /// [`Self::call`] sent once, with its own `timeout` (the key listing, PR #27 H-1: no
+    /// retry inside the client; a timeout is [`NodeError::Timeout`]).
+    async fn call_once(
+        &self,
+        chain: u8,
+        code: &str,
+        data: Value,
+        timeout: Duration,
+    ) -> LocalResult<Value> {
+        let _p = self
+            .sem
+            .acquire()
+            .await
+            .map_err(|_| NodeError::Transport("local semaphore closed".into()))?;
+        self.limiter.acquire().await;
+        self.exchange(chain, code, data, Some(timeout)).await
+    }
+
     /// [`Self::call`] plus the seconds from the send (after the rate and concurrency waits)
     /// to the answer.
     async fn call_timed(&self, chain: u8, code: &str, data: Value) -> (LocalResult<Value>, f64) {
@@ -295,13 +313,24 @@ impl LocalClient {
         };
         self.limiter.acquire().await;
         let t0 = std::time::Instant::now();
-        let r = self.exchange(chain, code, data).await;
+        let r = self.exchange(chain, code, data, None).await;
         (r, t0.elapsed().as_secs_f64())
     }
 
-    async fn exchange(&self, chain: u8, code: &str, data: Value) -> LocalResult<Value> {
+    /// One exchange; `once`: a single attempt with that timeout.
+    async fn exchange(
+        &self,
+        chain: u8,
+        code: &str,
+        data: Value,
+        once: Option<Duration>,
+    ) -> LocalResult<Value> {
         let body = command(self.node.network(), chain, code, &data, now_secs());
-        let r = match self.node.local(chain, &body).await {
+        let sent = match once {
+            Some(t) => self.node.local_once(chain, &body, t).await,
+            None => self.node.local(chain, &body).await,
+        };
+        let r = match sent {
             Ok(r) => r,
             // An answer arrived but is not usable (not JSON, over the body cap): a property of
             // this call, not of the node's health.
@@ -436,14 +465,21 @@ impl LocalClient {
     }
 
     /// `(at 'code (describe-module (read-msg "m")))` with `data {"m": module}`: the module's
-    /// code on `chain`, absent when the module is not deployed there.
-    pub async fn module_code(&self, chain: u8, module: &str) -> LocalResult<String> {
+    /// code on `chain`, absent when the module is not deployed there. Sent once, with
+    /// `timeout` (no retry inside the client: the caller paces its own retries).
+    pub async fn module_code(
+        &self,
+        chain: u8,
+        module: &str,
+        timeout: Duration,
+    ) -> LocalResult<String> {
         check_module(module)?;
         code_of(
-            self.call(
+            self.call_once(
                 chain,
                 "(at 'code (describe-module (read-msg \"m\")))",
                 json!({ "m": module }),
+                timeout,
             )
             .await,
         )
@@ -452,20 +488,28 @@ impl LocalClient {
     /// `(keys {module}.{table})`: every row key of a module's table on `chain`, at most
     /// `max` (D3 gap groups 3 and 4: rows no tx names). The node allows it in `/local` for
     /// any module's table and charges a flat 40,000 gas whatever the table's size (measured
-    /// on mainnet01, 2026-11-23: 4 keys and 9,480 keys alike).
+    /// on mainnet01, 2026-11-23: 4 keys and 9,480 keys alike), but the time grows with the
+    /// table (about 2,000 keys/s measured), so the read is sent once, with `timeout`: a table
+    /// the node cannot list in time is a [`NodeError::Timeout`], never retried here.
     pub async fn table_keys(
         &self,
         chain: u8,
         module: &str,
         table: &str,
         max: usize,
+        timeout: Duration,
     ) -> LocalResult<Vec<String>> {
         check_module(module)?;
         if !valid_ident(table) {
             return Err(LocalError::Skipped("table name fails the B-1 check".into()));
         }
         match self
-            .call(chain, &format!("(keys {module}.{table})"), json!({}))
+            .call_once(
+                chain,
+                &format!("(keys {module}.{table})"),
+                json!({}),
+                timeout,
+            )
             .await
         {
             Ok(r) => keys_of(r, max),

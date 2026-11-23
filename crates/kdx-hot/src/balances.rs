@@ -116,9 +116,10 @@ pub mod meta {
     /// tokens, the next slice's start and its budget counters; written with each slice's
     /// marks, deleted when it ends.
     pub const D3_REWALK_WALK: &str = "balances_d3_rewalk_walk";
-    /// Prefix + 10-digit ModuleId: the token's key listing (D3 gap groups 3 and 4): 9 bytes,
-    /// u32 unix seconds of the last complete listing (0: never), the index of the next chain,
-    /// u32 bitmask of the chains whose listing failed in the current or last round.
+    /// Prefix + 10-digit ModuleId: the token's key listing (D3 gap groups 3 and 4): layout
+    /// version 2, u32 unix seconds of the last complete listing (0: never), the index of the
+    /// next chain, flags, u16 failures, then per failed chain its id, failures in a row and
+    /// u32 retry time (`kdx_ingest::keylist::ListState`).
     pub const KEYLIST: &str = "balances_keylist/";
     /// JSON: running totals of the key listing (shown by `reconcile-balances --status`).
     pub const KEYLIST_STATS: &str = "balances_keylist_stats";

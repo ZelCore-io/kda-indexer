@@ -12,24 +12,33 @@
 //! - Which tokens: every tracked token (`Tokens` row, not a not-fungible verdict, not at its
 //!   row cap, not `coin`). A token never listed comes first, so a newly tracked one (D3
 //!   discovery, first posting) is listed within a refresh; then each again after
-//!   [`SWEEP_SECS`], and a token whose last listing failed on some chain after [`RETRY_SECS`].
-//! - Per step, one `(token, chain)`: one `describe-module` read, then one `keys` read per
-//!   ledger table. At most one step per [`STEP_EVERY`], inside the shared `/local` rate limit.
-//!   Progress (`Meta balances_keylist/<module>`: when last listed, next chain, chains that
-//!   failed) is kept per step, so a restart resumes.
+//!   [`SWEEP_SECS`].
+//! - Its own task ([`run`], PR #27 H-1): the listing never runs inside the reconcile loop, so
+//!   a slow node read cannot hold up dirty rows, NFTs or history slices. One step, one
+//!   `(token, chain)`: one `describe-module` read, then one `keys` read per ledger table, each
+//!   sent once with [`READ_TIMEOUT`] (no retry inside the client). At most one step per
+//!   [`STEP_EVERY`], inside the shared `/local` rate limit. Progress (`Meta
+//!   balances_keylist/<module>`) is kept per step, so a restart resumes.
+//! - Failures are per `(token, chain)`: a timeout, an unusable or over-cap answer or a pact
+//!   failure marks nothing for that chain, is logged and counted, and only that chain is
+//!   listed again, after [`RETRY_BASE_SECS`] doubling with each failure in a row up to
+//!   [`RETRY_CAP_SECS`]. A connection or HTTP error pauses the whole listing ([`NODE_PAUSE`],
+//!   doubling to [`NODE_PAUSE_MAX`]) and counts against the chain after [`NODE_TRIES`] in a
+//!   row. A failed token goes to the back of the queue, so one token cannot hold it.
+//! - Budget: a token that runs up [`FAIL_BUDGET`] chain failures with no clean round between
+//!   is marked unlistable (logged, counted, `reconcile-balances --status`) and left alone for
+//!   [`UNLISTABLE_SECS`], then tried once more with a fresh budget.
 //! - Marks: only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are marked,
 //!   through `balances::mark_row` (the postings' mark path, so the row caps apply) at the height
 //!   the node read. The normal reconcile then reads them like any dirty row.
-//! - Fail-closed: a listing over [`kdx_node::local::MAX_LISTED_KEYS`], an unusable answer, a
-//!   module with no ledger table or a node error that repeats [`NODE_TRIES`] times marks nothing
-//!   for that chain, is logged with the module and chain, and counts as failed (retried after
-//!   [`RETRY_SECS`]). Totals are in `Meta balances_keylist_stats` (`reconcile-balances
-//!   --status`).
+//! - Limits: a listing over [`MAX_KEYS_PER_LISTING`] keys is refused whole. The read timeout
+//!   binds first on a slow node: at the measured ~2,000 keys/s, 150,000 keys take ~75 s of the
+//!   90 s; a table the node cannot list within [`READ_TIMEOUT`] fails like any other read.
 //! - Refused (like the receivers pass, review L3) while the store has no tail yet or its
 //!   backfill is incomplete: the listing interns account names.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -38,23 +47,39 @@ use kdx_hot::{HotDict, HotStore, Table, Txn};
 use kdx_node::local::{
     valid_ident, valid_module, Local, LocalClient, LocalError, MAX_LISTED_KEYS, MAX_NAME_LEN,
 };
+use kdx_node::NodeError;
 use kdx_types::{Dict, DictKind, DictMut};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::Ctx;
 
 /// Seconds after which a listed token is listed again (the periodic sweep).
 pub const SWEEP_SECS: u32 = 7 * 86_400;
-/// Seconds after which a token whose last listing failed on some chain is listed again.
-pub const RETRY_SECS: u32 = 86_400;
+/// Seconds before a `(token, chain)` whose listing failed once is listed again; each further
+/// failure in a row doubles it, up to [`RETRY_CAP_SECS`].
+pub const RETRY_BASE_SECS: u32 = 3_600;
+/// Longest pause before a failed `(token, chain)` is listed again.
+pub const RETRY_CAP_SECS: u32 = SWEEP_SECS;
+/// Chain failures a token may run up with no clean round between before it is unlistable.
+pub const FAIL_BUDGET: u16 = 32;
+/// Seconds an unlistable token is left alone before one more try with a fresh budget.
+pub const UNLISTABLE_SECS: u32 = 30 * 86_400;
 /// Least time between two steps (one `(token, chain)` each: 1 + tables `/local` reads).
 pub const STEP_EVERY: Duration = Duration::from_secs(1);
 /// How often the queue of due tokens is rebuilt from the store (newly tracked tokens join).
 pub const REFRESH: Duration = Duration::from_secs(600);
-/// Node errors in a row on one `(token, chain)` before it is given up as failed.
+/// Timeout of one listing read, sent once. Sized to the key cap: the node listed 9,480 keys
+/// in 4.4 s (about 2,000 keys/s, mainnet01, 2026-11-23), so 150,000 keys take about 75 s.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// Connection or HTTP errors in a row on one `(token, chain)` before it counts as failed.
 pub const NODE_TRIES: u32 = 3;
-/// Pause after a node error before the same step is tried again.
-pub const NODE_RETRY: Duration = Duration::from_secs(30);
+/// Pause of the whole listing after a connection or HTTP error; doubles with each in a row.
+pub const NODE_PAUSE: Duration = Duration::from_secs(30);
+/// Longest such pause.
+pub const NODE_PAUSE_MAX: Duration = Duration::from_secs(600);
+/// Pause after an error of the store.
+const STORE_PAUSE: Duration = Duration::from_secs(60);
 /// Most ledger tables listed per module and chain.
 pub const MAX_TABLES: usize = 4;
 /// Most keys one `(token, table, chain)` listing may answer; a bigger one is refused whole
@@ -187,43 +212,145 @@ pub fn ledger_tables(code: &str) -> Vec<String> {
     out
 }
 
+/// A chain whose listing failed: failures in a row, and when it is listed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainFail {
+    pub chain: u8,
+    pub fails: u8,
+    /// Unix seconds.
+    pub retry_at: u32,
+}
+
+/// The pause before a `(token, chain)` that failed `fails` times in a row is listed again.
+pub fn retry_after(fails: u8) -> u32 {
+    let shift = u32::from(fails.max(1) - 1).min(16);
+    (u64::from(RETRY_BASE_SECS) << shift).min(u64::from(RETRY_CAP_SECS)) as u32
+}
+
+/// A full round lists every chain not waiting out a failure; a retry round only the failed
+/// chains that are due.
+const FULL: u8 = 1;
+/// Over its failure budget: left alone until [`UNLISTABLE_SECS`] after `listed_at`.
+const UNLISTABLE: u8 = 2;
+/// Layout version of [`ListState::encode`].
+const STATE_V: u8 = 2;
+
 /// One token's listing progress ([`meta::KEYLIST`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListState {
-    /// Unix seconds of the last complete listing; 0: never.
+    /// Unix seconds of the last complete full round (unlistable: when it was given up); 0:
+    /// never.
     pub listed_at: u32,
-    /// Index (into the network's chains) of the next chain to list.
+    /// Index (into the network's chains) of the next chain of the round in progress.
     pub next_chain: u8,
-    /// Chains whose listing failed in this round (or the last, when between rounds).
-    pub failed: u32,
+    /// [`FULL`], [`UNLISTABLE`].
+    pub flags: u8,
+    /// Chain failures since the token's last round that ended with no failed chain.
+    pub fail_total: u16,
+    /// The chains whose last listing failed.
+    pub chains: Vec<ChainFail>,
 }
 
 impl ListState {
-    pub fn encode(&self) -> [u8; 9] {
-        let mut v = [0u8; 9];
-        v[..4].copy_from_slice(&self.listed_at.to_be_bytes());
-        v[4] = self.next_chain;
-        v[5..].copy_from_slice(&self.failed.to_be_bytes());
+    /// Version, listed_at u32, next_chain, flags, fail_total u16, count, then per failed
+    /// chain: chain, fails, retry_at u32.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(10 + 6 * self.chains.len());
+        v.push(STATE_V);
+        v.extend_from_slice(&self.listed_at.to_be_bytes());
+        v.push(self.next_chain);
+        v.push(self.flags);
+        v.extend_from_slice(&self.fail_total.to_be_bytes());
+        v.push(self.chains.len().min(255) as u8);
+        for c in self.chains.iter().take(255) {
+            v.push(c.chain);
+            v.push(c.fails);
+            v.extend_from_slice(&c.retry_at.to_be_bytes());
+        }
         v
     }
+    /// None for another layout (the token is then listed as never listed).
     pub fn decode(v: &[u8]) -> Option<ListState> {
-        if v.len() != 9 {
+        if v.len() < 10 || v[0] != STATE_V {
             return None;
         }
+        let n = usize::from(v[9]);
+        if v.len() != 10 + 6 * n {
+            return None;
+        }
+        let u32_at =
+            |i: usize| -> Option<u32> { Some(u32::from_be_bytes(v[i..i + 4].try_into().ok()?)) };
+        let chains = (0..n)
+            .map(|i| {
+                let o = 10 + 6 * i;
+                Some(ChainFail {
+                    chain: v[o],
+                    fails: v[o + 1],
+                    retry_at: u32_at(o + 2)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
         Some(ListState {
-            listed_at: u32::from_be_bytes(v[..4].try_into().ok()?),
-            next_chain: v[4],
-            failed: u32::from_be_bytes(v[5..].try_into().ok()?),
+            listed_at: u32_at(1)?,
+            next_chain: v[5],
+            flags: v[6],
+            fail_total: u16::from_be_bytes([v[7], v[8]]),
+            chains,
         })
     }
-    /// Due for a listing at `now`: never listed, a round in progress, or older than
-    /// [`SWEEP_SECS`] ([`RETRY_SECS`] when a chain failed).
+    pub fn unlistable(&self) -> bool {
+        self.flags & UNLISTABLE != 0
+    }
+    /// Due for a listing at `now`: never listed, a round in progress, older than
+    /// [`SWEEP_SECS`], or a failed chain whose pause is over; an unlistable token only after
+    /// [`UNLISTABLE_SECS`].
     pub fn due(&self, now: u32) -> bool {
         let age = now.saturating_sub(self.listed_at);
+        if self.unlistable() {
+            return age >= UNLISTABLE_SECS;
+        }
         self.listed_at == 0
             || self.next_chain > 0
             || age >= SWEEP_SECS
-            || (self.failed != 0 && age >= RETRY_SECS)
+            || self.chains.iter().any(|c| c.retry_at <= now)
+    }
+    /// Start a round at `now` (full, or a retry of the failed chains that are due).
+    fn begin(&mut self, now: u32) {
+        if self.unlistable() {
+            // Given up long enough: one more try, with a fresh budget.
+            *self = ListState::default();
+        }
+        let full = self.listed_at == 0 || now.saturating_sub(self.listed_at) >= SWEEP_SECS;
+        self.flags = if full { FULL } else { 0 };
+    }
+    /// Whether this round lists `chain` at `now`.
+    fn selected(&self, chain: u8, now: u32) -> bool {
+        match self.chains.iter().find(|c| c.chain == chain) {
+            Some(c) => c.retry_at <= now,
+            None => self.flags & FULL != 0,
+        }
+    }
+    /// `chain` failed at `now`: its pause grows, and the token's budget shrinks.
+    fn failed(&mut self, chain: u8, now: u32) {
+        let i = match self.chains.iter().position(|c| c.chain == chain) {
+            Some(i) => i,
+            None => {
+                self.chains.push(ChainFail {
+                    chain,
+                    fails: 0,
+                    retry_at: 0,
+                });
+                self.chains.len() - 1
+            }
+        };
+        let c = &mut self.chains[i];
+        c.fails = c.fails.saturating_add(1);
+        c.retry_at = now.saturating_add(retry_after(c.fails));
+        self.fail_total = self.fail_total.saturating_add(1);
+    }
+    /// `chain` listed: no longer failed.
+    fn cleared(&mut self, chain: u8) {
+        self.chains.retain(|c| c.chain != chain);
     }
 }
 
@@ -269,19 +396,36 @@ pub fn due(txn: &impl Txn, dict: &impl Dict, now: u32) -> Result<Vec<(u32, Strin
     Ok(out)
 }
 
-/// `(listed, in progress, with a failed chain)` token counts of the key listing (`--status`).
-pub fn summary(txn: &impl Txn) -> Result<(u64, u64, u64)> {
+/// Token counts of the key listing (`--status`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Summary {
+    /// Last round ended with no failed chain.
+    pub listed: u64,
+    /// A round in progress.
+    pub in_progress: u64,
+    /// Some chain failed and waits for its retry.
+    pub failed: u64,
+    /// Over the failure budget, left alone.
+    pub unlistable: u64,
+}
+
+/// The [`Summary`] of the stored listing states.
+pub fn summary(txn: &impl Txn) -> Result<Summary> {
     let p = meta::KEYLIST.as_bytes();
-    let (mut listed, mut running, mut failed) = (0, 0, 0);
+    let mut s = Summary::default();
     for (_, v) in txn.scan(Table::Meta, p, |k| k.starts_with(p))? {
         let Some(st) = ListState::decode(&v) else {
             continue;
         };
-        listed += u64::from(st.listed_at > 0);
-        running += u64::from(st.next_chain > 0);
-        failed += u64::from(st.failed != 0);
+        if st.unlistable() {
+            s.unlistable += 1;
+            continue;
+        }
+        s.listed += u64::from(st.listed_at > 0 && st.chains.is_empty());
+        s.in_progress += u64::from(st.next_chain > 0);
+        s.failed += u64::from(!st.chains.is_empty());
     }
-    Ok((listed, running, failed))
+    Ok(s)
 }
 
 /// What one listing marked.
@@ -371,6 +515,12 @@ pub struct Stats {
     pub tokens_listed: u64,
     /// `(token, chain)` listings that failed (logged).
     pub chain_failures: u64,
+    /// Connection or HTTP errors of the node (each paused the listing).
+    #[serde(default)]
+    pub node_errors: u64,
+    /// Tokens given up over their failure budget.
+    #[serde(default)]
+    pub unlistable: u64,
     #[serde(flatten)]
     pub marked: Marked,
     /// The last failure: module, chain, reason.
@@ -386,23 +536,40 @@ fn add_stats(txn: &mut kdx_hot::RwTxn<'_>, f: impl FnOnce(&mut Stats)) -> Result
     txn.set_meta(meta::KEYLIST_STATS, &serde_json::to_vec(&s)?)
 }
 
-/// The loop's key listing: the queue of due tokens and the pacing.
-#[derive(Default)]
+/// The listing task's queue of due tokens and its pacing.
 pub struct KeyList {
     queue: VecDeque<(u32, String, ListState)>,
     refreshed: Option<Instant>,
     next_at: Option<Instant>,
+    /// Connection or HTTP errors in a row on the step at the front of the queue.
     node_errors: u32,
+    /// The current pause of the whole listing after such errors.
+    pause: Duration,
+    /// Timeout of one read ([`READ_TIMEOUT`]; tests shorten it).
+    read_timeout: Duration,
+}
+
+impl Default for KeyList {
+    fn default() -> KeyList {
+        KeyList {
+            queue: VecDeque::new(),
+            refreshed: None,
+            next_at: None,
+            node_errors: 0,
+            pause: Duration::ZERO,
+            read_timeout: READ_TIMEOUT,
+        }
+    }
 }
 
 /// How one `(token, chain)` went.
 enum ChainResult {
     /// Listed (or the module is not on the chain).
     Done(Marked),
-    /// Marked nothing; logged; the chain counts as failed.
+    /// Marked nothing; logged; the chain counts as failed (a timeout among them).
     Failed(String),
-    /// Node unreachable: try the same step again later.
-    Retry(String),
+    /// A connection or HTTP error: the node, not the token, may be the trouble.
+    Node(String),
 }
 
 fn now_unix() -> u32 {
@@ -411,18 +578,28 @@ fn now_unix() -> u32 {
         .map_or(0, |d| d.as_secs() as u32)
 }
 
+/// A node error of a listing read: a timeout is the token's (its table may be too big to
+/// list in time, H-1); any other is the node's.
+fn node_result(what: &str, e: NodeError) -> ChainResult {
+    match e {
+        NodeError::Timeout => ChainResult::Failed(format!("{what}: timeout")),
+        e => ChainResult::Node(format!("{what}: {e}")),
+    }
+}
+
 async fn list_chain(
     ctx: &Ctx,
     local: &LocalClient,
     caps: &crate::reconcile::Caps,
+    timeout: Duration,
     module: u32,
     name: &str,
     chain: u8,
 ) -> Result<ChainResult> {
-    let code = match local.module_code(chain, name).await {
+    let code = match local.module_code(chain, name, timeout).await {
         Ok(Local::Absent) => return Ok(ChainResult::Done(Marked::default())),
         Ok(Local::Found { value, .. }) => value,
-        Err(LocalError::Node(e)) => return Ok(ChainResult::Retry(e.to_string())),
+        Err(LocalError::Node(e)) => return Ok(node_result("describe-module", e)),
         Err(e) => return Ok(ChainResult::Failed(format!("describe-module: {e}"))),
     };
     let tables = ledger_tables(&code);
@@ -431,15 +608,13 @@ async fn list_chain(
     }
     let mut lists = Vec::with_capacity(tables.len());
     for t in &tables {
-        match local
-            .table_keys(chain, name, t, MAX_KEYS_PER_LISTING.min(MAX_LISTED_KEYS))
-            .await
-        {
+        let max = MAX_KEYS_PER_LISTING.min(MAX_LISTED_KEYS);
+        match local.table_keys(chain, name, t, max, timeout).await {
             Ok(Local::Found { value, height, .. }) => {
                 lists.push((value, u32::try_from(height).unwrap_or(u32::MAX)))
             }
             Ok(Local::Absent) => {}
-            Err(LocalError::Node(e)) => return Ok(ChainResult::Retry(e.to_string())),
+            Err(LocalError::Node(e)) => return Ok(node_result(&format!("keys {t}"), e)),
             Err(e) => return Ok(ChainResult::Failed(format!("keys {t}: {e}"))),
         }
     }
@@ -505,28 +680,48 @@ pub async fn step(
         return Ok(false);
     };
     let chains = ctx.graph.chains_at(u64::MAX).to_vec();
+    let t = now_unix();
     if st.next_chain == 0 {
-        st.failed = 0;
+        st.begin(t);
     }
-    let idx = usize::from(st.next_chain);
+    // Chains this round does not list (waiting out a failure, or not failed in a retry
+    // round) cost nothing.
+    let mut idx = usize::from(st.next_chain);
+    while chains.get(idx).is_some_and(|&c| !st.selected(c, t)) {
+        idx += 1;
+    }
     let Some(&chain) = chains.get(idx) else {
-        st.next_chain = 0;
-        return finish(ctx, kl, module, st);
+        let mut txn = ctx.hot.rw()?;
+        end_round(&mut txn, kl, module, &mut st, t)?;
+        txn.commit()?;
+        return Ok(false);
     };
-    let res = list_chain(ctx, local, caps, module, &name, chain).await?;
+    let res = list_chain(ctx, local, caps, kl.read_timeout, module, &name, chain).await?;
     let mut txn = ctx.hot.rw()?;
+    let mut failed = false;
     match res {
-        ChainResult::Retry(e) => {
+        ChainResult::Node(e) => {
             kl.node_errors += 1;
+            add_stats(&mut txn, |s| s.node_errors += 1)?;
             if kl.node_errors < NODE_TRIES {
-                tracing::debug!(module = %name, chain, error = %e, "balances: key listing: node error, retried");
-                kl.next_at = Some(now + NODE_RETRY);
+                kl.pause = (kl.pause * 2).clamp(NODE_PAUSE, NODE_PAUSE_MAX);
+                tracing::debug!(module = %name, chain, error = %e, pause_s = kl.pause.as_secs(),
+                    "balances: key listing: node error, listing paused");
+                kl.next_at = Some(now + kl.pause);
+                txn.commit()?;
                 return Ok(true);
             }
-            fail(&mut txn, &mut st, &name, chain, &format!("node: {e}"))?;
+            kl.next_at = Some(now + kl.pause);
+            fail(&mut txn, &mut st, &name, chain, t, &format!("node: {e}"))?;
+            failed = true;
         }
-        ChainResult::Failed(e) => fail(&mut txn, &mut st, &name, chain, &e)?,
+        ChainResult::Failed(e) => {
+            fail(&mut txn, &mut st, &name, chain, t, &e)?;
+            failed = true;
+        }
         ChainResult::Done(m) => {
+            kl.pause = Duration::ZERO;
+            st.cleared(chain);
             if m.marked > 0 {
                 tracing::info!(module = %name, chain, listed = m.listed, marked = m.marked,
                     "balances: key listing marked rows no tx names");
@@ -540,28 +735,56 @@ pub async fn step(
         }
     }
     kl.node_errors = 0;
-    st.next_chain = st.next_chain.saturating_add(1);
-    if usize::from(st.next_chain) >= chains.len() {
-        st.next_chain = 0;
-        st.listed_at = now_unix();
-        add_stats(&mut txn, |s| s.tokens_listed += 1)?;
+    st.next_chain = u8::try_from(idx + 1).unwrap_or(u8::MAX);
+    if st.fail_total >= FAIL_BUDGET {
+        // Given up (H-1: a token of junk tables must not take the listing's time forever).
+        tracing::warn!(module = %name, failures = st.fail_total,
+            "balances: key listing: token over its failure budget, unlistable for {} days",
+            UNLISTABLE_SECS / 86_400);
+        st = ListState {
+            listed_at: t,
+            flags: UNLISTABLE,
+            fail_total: st.fail_total,
+            chains: st.chains,
+            ..ListState::default()
+        };
+        add_stats(&mut txn, |s| s.unlistable += 1)?;
         kl.queue.pop_front();
+    } else if usize::from(st.next_chain) >= chains.len() {
+        end_round(&mut txn, kl, module, &mut st, t)?;
+    } else if failed {
+        // To the back: one failing token cannot hold the queue.
+        if let Some(mut f) = kl.queue.pop_front() {
+            f.2 = st.clone();
+            kl.queue.push_back(f);
+        }
     } else if let Some(f) = kl.queue.front_mut() {
-        f.2 = st;
+        f.2 = st.clone();
     }
     txn.set_meta(&state_key(module), &st.encode())?;
     txn.commit()?;
     Ok(true)
 }
 
-/// A round with no chain left (the network's chains shrank): close it.
-fn finish(ctx: &Ctx, kl: &mut KeyList, module: u32, mut st: ListState) -> Result<bool> {
-    st.listed_at = now_unix();
-    let mut txn = ctx.hot.rw()?;
-    txn.set_meta(&state_key(module), &st.encode())?;
-    txn.commit()?;
+/// Close the round at the front of the queue at `now` (stored by the caller's `txn`).
+fn end_round(
+    txn: &mut kdx_hot::RwTxn<'_>,
+    kl: &mut KeyList,
+    module: u32,
+    st: &mut ListState,
+    now: u32,
+) -> Result<()> {
+    if st.flags & FULL != 0 {
+        st.listed_at = now;
+        add_stats(txn, |s| s.tokens_listed += 1)?;
+    }
+    st.next_chain = 0;
+    st.flags = 0;
+    if st.chains.is_empty() {
+        st.fail_total = 0;
+    }
     kl.queue.pop_front();
-    Ok(false)
+    txn.set_meta(&state_key(module), &st.encode())
 }
 
 fn fail(
@@ -569,19 +792,53 @@ fn fail(
     st: &mut ListState,
     name: &str,
     chain: u8,
+    now: u32,
     why: &str,
 ) -> Result<()> {
-    tracing::warn!(module = %name, chain, reason = %why,
+    st.failed(chain, now);
+    let fails = st
+        .chains
+        .iter()
+        .find(|c| c.chain == chain)
+        .map_or(0, |c| c.fails);
+    tracing::warn!(module = %name, chain, reason = %why, fails,
+        retry_in_s = retry_after(fails),
         "balances: key listing failed; nothing marked for this chain, retried later");
-    if chain < 32 {
-        st.failed |= 1 << chain;
-    }
     let cut: String = why.chars().take(200).collect();
     add_stats(txn, |s| {
         s.chain_failures += 1;
         s.last_failure = Some(format!("{name} chain {chain}: {cut}"));
     })
     .context("key listing stats")
+}
+
+/// The key listing as its own task (PR #27 H-1): steps paced by [`STEP_EVERY`] (and the node
+/// pauses), apart from the reconcile loop, until `stop`. A store error is logged and the task
+/// pauses; it never ends the reconcile.
+pub async fn run(
+    ctx: Arc<Ctx>,
+    local: Arc<LocalClient>,
+    caps: crate::reconcile::Caps,
+    stop: CancellationToken,
+) {
+    let mut kl = KeyList::default();
+    loop {
+        let r = tokio::select! {
+            _ = stop.cancelled() => return,
+            r = step(&ctx, &local, &caps, &mut kl) => r,
+        };
+        if let Err(e) = r {
+            tracing::warn!(error = %e, "balances: key listing step failed; retried later");
+            kl.next_at = Some(Instant::now() + STORE_PAUSE);
+        }
+        let wait = kl
+            .next_at
+            .map_or(STEP_EVERY, |t| t.saturating_duration_since(Instant::now()));
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(wait.max(Duration::from_millis(10))) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -603,72 +860,86 @@ mod tests {
     type Answer = dyn Fn(u8, &str, &Value) -> Option<Value> + Send + Sync;
 
     /// A fake node: `answer(chain, code, data)` gives `result` (with tip height 10), or None
-    /// for an HTTP 500. Counts the `/local` calls.
+    /// for an HTTP 500; `{"sleep_ms": n}` answers nothing for `n` ms, then closes. Counts the
+    /// `/local` calls. One thread per connection, so a slow answer holds up no other.
     fn fake_node(answer: Arc<Answer>, calls: Arc<AtomicUsize>) -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         std::thread::spawn(move || {
             for s in l.incoming() {
                 let Ok(mut s) = s else { continue };
-                let (mut buf, mut tmp) = (Vec::new(), [0u8; 8192]);
-                let (head_end, len) = loop {
-                    let n = s.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break (0, 0);
+                let (answer, calls) = (answer.clone(), calls.clone());
+                std::thread::spawn(move || {
+                    let (mut buf, mut tmp) = (Vec::new(), [0u8; 8192]);
+                    let (head_end, len) = loop {
+                        let n = s.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break (0, 0);
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (i + 4, len);
+                        }
+                    };
+                    while head_end > 0 && buf.len() < head_end + len {
+                        let n = s.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
                     }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
-                        let len = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        break (i + 4, len);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let req: Value =
+                        serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                    let cmd: Value = req
+                        .get("cmd")
+                        .and_then(Value::as_str)
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or(Value::Null);
+                    let chain: u8 = cmd
+                        .pointer("/meta/chainId")
+                        .and_then(Value::as_str)
+                        .and_then(|c| c.parse().ok())
+                        .unwrap_or(0);
+                    let code = cmd
+                        .pointer("/payload/exec/code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let data = cmd
+                        .pointer("/payload/exec/data")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let r = answer(chain, code, &data);
+                    if let Some(ms) = r
+                        .as_ref()
+                        .and_then(|r| r.get("sleep_ms"))
+                        .and_then(Value::as_u64)
+                    {
+                        std::thread::sleep(Duration::from_millis(ms));
+                        return;
                     }
-                };
-                while head_end > 0 && buf.len() < head_end + len {
-                    let n = s.read(&mut tmp).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                }
-                calls.fetch_add(1, Ordering::SeqCst);
-                let req: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
-                let cmd: Value = req
-                    .get("cmd")
-                    .and_then(Value::as_str)
-                    .and_then(|c| serde_json::from_str(c).ok())
-                    .unwrap_or(Value::Null);
-                let chain: u8 = cmd
-                    .pointer("/meta/chainId")
-                    .and_then(Value::as_str)
-                    .and_then(|c| c.parse().ok())
-                    .unwrap_or(0);
-                let code = cmd
-                    .pointer("/payload/exec/code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let data = cmd
-                    .pointer("/payload/exec/data")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let (status, body) = match answer(chain, code, &data) {
-                    Some(r) => (
-                        "200 OK",
-                        json!({"result": r,
+                    let (status, body) = match r {
+                        Some(r) => (
+                            "200 OK",
+                            json!({"result": r,
                         "metaData": {"blockHeight": 11, "prevBlockHash": "H"}})
-                        .to_string(),
-                    ),
-                    None => ("500 Internal Server Error", "down".to_owned()),
-                };
-                let _ = write!(
+                            .to_string(),
+                        ),
+                        None => ("500 Internal Server Error", "down".to_owned()),
+                    };
+                    let _ = write!(
                     s,
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                      Connection: close\r\n\r\n{body}",
                     body.len()
                 );
+                });
             }
         });
         format!("http://{addr}")
@@ -791,35 +1062,73 @@ mod tests {
 
     #[test]
     fn list_state_round_trip_and_due() {
+        let now = 2_000_000;
         let st = ListState {
             listed_at: 1_000_000,
             next_chain: 3,
-            failed: 1 << 19,
+            flags: FULL,
+            fail_total: 7,
+            chains: vec![ChainFail {
+                chain: 19,
+                fails: 2,
+                retry_at: now + 5,
+            }],
         };
-        assert_eq!(ListState::decode(&st.encode()), Some(st));
-        assert_eq!(ListState::decode(&[0; 8]), None);
-        let now = 2_000_000;
+        assert_eq!(ListState::decode(&st.encode()), Some(st.clone()));
+        assert_eq!(ListState::decode(&[0; 9]), None, "the first layout");
+        assert_eq!(ListState::decode(&st.encode()[..15]), None);
         assert!(ListState::default().due(now), "never listed");
-        let done = |at, failed| ListState {
+        let done = |at| ListState {
             listed_at: at,
-            next_chain: 0,
-            failed,
+            ..ListState::default()
         };
-        assert!(!done(now - 10, 0).due(now));
-        assert!(done(now - SWEEP_SECS, 0).due(now), "the periodic sweep");
-        assert!(!done(now - RETRY_SECS + 1, 1).due(now));
+        assert!(!done(now - 10).due(now));
+        assert!(done(now - SWEEP_SECS).due(now), "the periodic sweep");
+        let mut f = done(now - 10);
+        f.failed(4, now);
+        assert!(!f.due(now + RETRY_BASE_SECS - 1));
         assert!(
-            done(now - RETRY_SECS, 1).due(now),
+            f.due(now + RETRY_BASE_SECS),
             "a failed chain is retried sooner"
         );
         assert!(
             ListState {
                 next_chain: 1,
-                ..done(now - 10, 0)
+                ..done(now - 10)
             }
             .due(now),
             "round in progress"
         );
+        let gone = ListState {
+            listed_at: now,
+            flags: UNLISTABLE,
+            ..ListState::default()
+        };
+        assert!(!gone.due(now + SWEEP_SECS) && gone.due(now + UNLISTABLE_SECS));
+    }
+
+    /// H-1: the pause of a failing `(token, chain)` doubles per failure in a row, capped.
+    #[test]
+    fn retry_backoff_grows_and_is_capped() {
+        assert_eq!(retry_after(1), RETRY_BASE_SECS);
+        assert_eq!(retry_after(2), 2 * RETRY_BASE_SECS);
+        assert_eq!(retry_after(4), 8 * RETRY_BASE_SECS);
+        assert_eq!(retry_after(9), RETRY_CAP_SECS);
+        assert_eq!(retry_after(255), RETRY_CAP_SECS);
+        // A retry round lists only the failed chains that are due; a full round skips a
+        // chain still waiting out its pause.
+        let mut st = ListState {
+            listed_at: 100,
+            ..ListState::default()
+        };
+        st.failed(2, 1_000);
+        st.failed(2, 1_000 + RETRY_BASE_SECS);
+        assert_eq!(st.chains[0].retry_at, 1_000 + 3 * RETRY_BASE_SECS);
+        st.begin(1_000 + 3 * RETRY_BASE_SECS);
+        assert!(st.selected(2, 1_000 + 3 * RETRY_BASE_SECS) && !st.selected(0, 1_000));
+        st.begin(100 + SWEEP_SECS);
+        assert!(st.selected(0, 100 + SWEEP_SECS));
+        assert!(!st.selected(2, 1_000), "still waiting");
     }
 
     /// Never-listed tokens first; `coin`, not-fungible verdicts and capped tokens never.
@@ -839,8 +1148,7 @@ mod tests {
         balances::update_token(&mut txn, ids[3], |t| t.flags |= balances::TOKEN_CAPPED).unwrap();
         let old = ListState {
             listed_at: 100,
-            next_chain: 0,
-            failed: 0,
+            ..ListState::default()
         };
         txn.set_meta(&state_key(ids[0]), &old.encode()).unwrap();
         txn.commit().unwrap();
@@ -961,7 +1269,7 @@ mod tests {
         for &m in &ids {
             let st = state(&ro, m).unwrap();
             assert!(
-                st.listed_at > 0 && st.next_chain == 0 && st.failed == 0,
+                st.listed_at > 0 && st.next_chain == 0 && st.chains.is_empty(),
                 "{st:?}"
             );
         }
@@ -975,7 +1283,13 @@ mod tests {
             ),
             (2, 3, 0)
         );
-        assert_eq!(summary(&ro).unwrap(), (2, 0, 0));
+        assert_eq!(
+            summary(&ro).unwrap(),
+            Summary {
+                listed: 2,
+                ..Summary::default()
+            }
+        );
         // Listed: not due again before the sweep.
         drop(ro);
         kl.refreshed = None;
@@ -986,7 +1300,7 @@ mod tests {
 
     /// Fail-closed: a refused `keys` read, a module with no ledger table and a node that stays
     /// down mark nothing, are logged and counted, and leave the chain failed (retried after
-    /// `RETRY_SECS`); the other chain of the same token still lists.
+    /// `RETRY_BASE_SECS`); the other chain of the same token still lists.
     #[tokio::test]
     async fn failures_mark_nothing_and_are_retried() {
         let dir = tempfile::tempdir().unwrap();
@@ -1013,21 +1327,145 @@ mod tests {
         assert_eq!(dirty(&ctx, "ROOT", ids[0], 1), Some(10));
         let ro = ctx.hot.ro().unwrap();
         let st: Vec<ListState> = ids.iter().map(|&m| state(&ro, m).unwrap()).collect();
+        let failed = |s: &ListState| s.chains.iter().map(|c| c.chain).collect::<Vec<_>>();
         assert_eq!(
-            st.iter().map(|s| s.failed).collect::<Vec<_>>(),
-            [0b01, 0b11, 0b11]
+            st.iter().map(failed).collect::<Vec<_>>(),
+            [vec![0], vec![0, 1], vec![0, 1]]
         );
         assert!(st.iter().all(|s| s.listed_at > 0));
-        let now = st[0].listed_at;
-        assert!(!st[0].due(now + RETRY_SECS - 1) && st[0].due(now + RETRY_SECS));
+        let retry = st[0].chains[0].retry_at;
+        assert!(!st[0].due(retry - 1) && st[0].due(retry));
         let stats: Stats =
             serde_json::from_slice(&ro.meta(meta::KEYLIST_STATS).unwrap().unwrap()).unwrap();
         assert_eq!(stats.chain_failures, 5);
-        assert_eq!(summary(&ro).unwrap(), (3, 0, 3));
+        // free.down: one request per try, NODE_TRIES tries per chain (no client retries).
+        assert_eq!(stats.node_errors, 2 * u64::from(NODE_TRIES));
+        assert_eq!(
+            summary(&ro).unwrap(),
+            Summary {
+                failed: 3,
+                ..Summary::default()
+            }
+        );
         assert!(stats
             .last_failure
             .unwrap()
             .starts_with("free.down chain 1: node"));
+    }
+
+    /// PR #27 H-1: a `keys` read the node cannot answer in time costs one request and the
+    /// read timeout (no client or step retries), fails only that chain, and that chain alone
+    /// is listed again, after a pause that doubles; the other chain lists at once.
+    #[tokio::test]
+    async fn a_slow_read_fails_once_and_only_that_chain_backs_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |chain, code, _| match (chain, code) {
+            (_, c) if c.contains("describe-module") => ok(json!(KAYC)),
+            (0, _) => Some(json!({"sleep_ms": 3_000})),
+            (1, _) => ok(json!(["ROOT"])),
+            _ => panic!("unexpected call {chain} {code}"),
+        });
+        let (ctx, local, ids, calls) = setup(dir.path(), &["free.slow"], answer);
+        let mut kl = KeyList {
+            read_timeout: Duration::from_millis(300),
+            ..KeyList::default()
+        };
+        let t0 = Instant::now();
+        assert!(step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap());
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "describe + one keys read");
+        run_steps(&ctx, &local, &mut kl, 5).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(dirty(&ctx, "ROOT", ids[0], 1), Some(10));
+        let st = state(&ctx.hot.ro().unwrap(), ids[0]).unwrap();
+        assert_eq!(
+            (st.chains.len(), st.chains[0].chain, st.chains[0].fails),
+            (1, 0, 1)
+        );
+        let first = st.chains[0].retry_at;
+        assert!(first >= st.listed_at + RETRY_BASE_SECS);
+        // Not due again before its pause; then a retry round reads chain 0 only.
+        kl.refreshed = None;
+        kl.next_at = None;
+        assert!(!step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap());
+        let mut txn = ctx.hot.rw().unwrap();
+        let mut back = st.clone();
+        back.chains[0].retry_at = 1;
+        txn.set_meta(&state_key(ids[0]), &back.encode()).unwrap();
+        txn.commit().unwrap();
+        kl.refreshed = None;
+        run_steps(&ctx, &local, &mut kl, 5).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "chain 1 is not listed again"
+        );
+        let st = state(&ctx.hot.ro().unwrap(), ids[0]).unwrap();
+        assert_eq!(st.chains[0].fails, 2);
+        assert!(st.chains[0].retry_at >= now_unix() + 2 * RETRY_BASE_SECS - 5);
+        assert_eq!(st.listed_at, back.listed_at, "a retry round is no sweep");
+    }
+
+    /// H-1: a junk token (every read times out) goes to the back of the queue after each
+    /// failure, so a good token behind it is listed first; once over its budget it is
+    /// unlistable, shown by `--status`, and not due again for `UNLISTABLE_SECS`.
+    #[tokio::test]
+    async fn junk_tokens_cannot_hold_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |_, code, data| {
+            let m = data.get("m").and_then(Value::as_str).unwrap_or("");
+            match (code, m) {
+                (c, "free.junk") if c.contains("describe-module") => {
+                    Some(json!({"sleep_ms": 2_000}))
+                }
+                (c, _) if c.contains("describe-module") => ok(json!(KAYC)),
+                ("(keys free.good.token-table)", _) => ok(json!(["ROOT"])),
+                _ => panic!("unexpected call {code}"),
+            }
+        });
+        let (ctx, local, ids, _) = setup(dir.path(), &["free.junk", "free.good"], answer);
+        // The junk token is one failure from its budget.
+        let mut txn = ctx.hot.rw().unwrap();
+        let near = ListState {
+            listed_at: 1,
+            fail_total: FAIL_BUDGET - 2,
+            ..ListState::default()
+        };
+        txn.set_meta(&state_key(ids[0]), &near.encode()).unwrap();
+        txn.commit().unwrap();
+        let mut kl = KeyList {
+            read_timeout: Duration::from_millis(200),
+            ..KeyList::default()
+        };
+        // Step 1: junk chain 0 times out, junk to the back; steps 2-3: the good token.
+        for _ in 0..3 {
+            kl.next_at = None;
+            step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap();
+        }
+        assert_eq!(dirty(&ctx, "ROOT", ids[1], 0), Some(10));
+        assert_eq!(dirty(&ctx, "ROOT", ids[1], 1), Some(10));
+        run_steps(&ctx, &local, &mut kl, 3).await;
+        let ro = ctx.hot.ro().unwrap();
+        let st = state(&ro, ids[0]).unwrap();
+        assert!(st.unlistable(), "{st:?}");
+        assert!(!st.due(now_unix() + SWEEP_SECS));
+        assert!(st.due(st.listed_at + UNLISTABLE_SECS));
+        assert_eq!(
+            summary(&ro).unwrap(),
+            Summary {
+                listed: 1,
+                unlistable: 1,
+                ..Summary::default()
+            }
+        );
+        let stats: Stats =
+            serde_json::from_slice(&ro.meta(meta::KEYLIST_STATS).unwrap().unwrap()).unwrap();
+        assert_eq!((stats.unlistable, stats.chain_failures), (1, 2));
+        drop(ro);
+        // Given up: no longer due, so no more reads.
+        kl.refreshed = None;
+        kl.next_at = None;
+        assert!(!step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap());
     }
 
     /// `free.KAYC` (chain 0, D3 gap group 3), as `describe-module` answered it.

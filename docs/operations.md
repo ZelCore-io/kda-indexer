@@ -796,13 +796,17 @@ event (a fee account built from a user guard, a pool account with a hashed name)
 lists them: `/local` allows `(keys <module>.<table>)` on any module's table, at a flat 40,000
 gas whatever the table size (measured on mainnet01).
 
-The reconcile loop (seed mode) lists every tracked token other than `coin`, skipping
-not-fungible verdicts and tokens at their row cap. One step is one (token, chain): a
+With the reconciler in seed mode, a task of its own (beside the reconcile loop, so a slow read
+never holds up dirty rows, NFTs or history slices) lists every tracked token other than `coin`,
+skipping not-fungible verdicts and tokens at their row cap. One step is one (token, chain): a
 `describe-module` read for the code, then one `keys` read per ledger table (a `deftable` whose
-`defschema` has a top-level `balance` field, at most 4). At most one step per second, inside
-the shared `/local` rate limit (`balances.local_rps`). A token never listed comes first, so a
-newly tracked token (D3 discovery or a first posting) is listed within about 10 minutes plus
-the queue ahead of it; after that each token is listed again every 7 days.
+`defschema` has a top-level `balance` field, at most 4). Each read is sent once, with a 90 s
+timeout (no retry inside the node client). At most one step per second, inside the shared
+`/local` limits (`balances.local_rps`, `balances.local_concurrency`: a hung read holds one
+slot). A token never listed comes first, so a newly tracked token (D3 discovery or a first
+posting) is listed within about 10 minutes plus the queue ahead of it; after that each token
+is listed again every 7 days. A first sweep takes about 20 steps per token, so about 20 s per
+token (about 6 h for 1,000 tokens, estimate) when every read is quick.
 
 Only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are marked, through
 the postings' mark path, at the height the node read; the reconcile then reads them like any
@@ -811,18 +815,30 @@ at the room left under its row cap (`fungible_module_rows` for confirmed `fungib
 modules, `module_rows` otherwise). A chain where the module is not deployed, or where its
 table was never created, lists nothing.
 
-Fail-closed: a listing over 150,000 keys, an unusable answer, a refused `keys` read, a module
-with no ledger table, or a node error 3 times in a row marks nothing for that chain. It is
-logged (`balances: key listing failed`, with module, chain and reason) and the token is listed
-again after a day. The listing waits, like the receivers pass, until the store has a tail and
-its backfill is complete.
+Fail-closed, per (token, chain): a read timeout, a listing over 150,000 keys, an unusable
+answer, a refused `keys` read or a module with no ledger table marks nothing for that chain. It
+is logged (`balances: key listing failed`, with module, chain, reason and the retry pause),
+and only that chain is listed again: after 1 hour, doubling with each failure in a row, at
+most every 7 days; the token goes to the back of the queue meanwhile. A connection or HTTP
+error pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
+in a row. A token that runs up 32 chain failures with no clean round between is marked
+unlistable (logged at WARN, `--status` `keylist_tokens.unlistable`) and left alone for 30
+days, then tried once more with a fresh budget. The listing waits, like the receivers pass,
+until the store has a tail and its backfill is complete.
 
-State: `Meta balances_keylist/<ModuleId>` (last complete listing, next chain, failed chains;
-a restart resumes) and `Meta balances_keylist_stats` (totals). `--status` shows
-`keylist_tokens` (`listed`, `in_progress`, `failed`) and `keylist_stats` (`tokens_listed`,
-`chain_failures`, `listed`, `known`, `marked`, `skipped`, `last_failure`). To list a token
-again at once, delete its `balances_keylist/<ModuleId>` entry; it is picked up at the next
-refresh.
+Effective limit: the 150,000-key cap and the 90 s timeout, whichever comes first. The node
+listed 9,480 keys in 4.4 s (about 2,000 keys/s, mainnet01, Nov 2026), so 150,000 keys take
+about 75 s; on a loaded node the timeout can bind below the cap, and such a table fails as
+above. The answer also has to fit `node.max_body_bytes` (64 MB by default).
+
+State: `Meta balances_keylist/<ModuleId>` (last complete listing, next chain, failures, the
+failed chains with their retry times; a restart resumes) and `Meta balances_keylist_stats`
+(totals). `--status` shows `keylist_tokens` (`listed`: last round clean, `in_progress`,
+`failed`: a chain waits for its retry, `unlistable`) and `keylist_stats` (`tokens_listed`,
+`chain_failures`, `node_errors`, `unlistable`, `listed`, `known`, `marked`, `skipped`,
+`last_failure`). No command relists a token at once yet: a token is listed again when its
+sweep, a chain retry or its unlistable period comes due (a token whose
+`balances_keylist/<ModuleId>` entry is gone counts as never listed, but no tool deletes one).
 
 ### NFTs
 

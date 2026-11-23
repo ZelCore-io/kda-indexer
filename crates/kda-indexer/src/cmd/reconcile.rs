@@ -366,9 +366,10 @@ fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
         "guards_capped": txn
             .meta(meta::GUARDS_CAPPED)?
             .and_then(|v| v.try_into().ok().map(u64::from_be_bytes)),
-        // D3 gap groups 3 and 4: the key listing of tracked tokens (tokens listed, in
-        // progress, with a failed chain; totals of keys listed and marked, last failure).
-        "keylist_tokens": {"listed": kl.0, "in_progress": kl.1, "failed": kl.2},
+        // D3 gap groups 3 and 4: the key listing of tracked tokens (tokens listed clean, in
+        // progress, with a failed chain waiting for its retry, given up over their failure
+        // budget; totals of keys listed and marked, failures, last failure).
+        "keylist_tokens": kl,
         "keylist_stats": txn
             .meta(meta::KEYLIST_STATS)?
             .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
