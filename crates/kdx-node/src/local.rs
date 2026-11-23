@@ -21,9 +21,10 @@
 //! reorg flip-and-back the node can still answer from the orphan's state at the same height).
 //! `/local` sends no hash of the pending block itself. A failure whose message says
 //! the row or keyset does not exist is [`Local::Absent`] (the node sends no `metaData` then).
-//! Any other Pact failure, and any delivered answer that cannot be used, is
-//! [`LocalError::Failure`]; only transport and HTTP errors are [`LocalError::Node`]. Neither is
-//! ever read as a zero balance.
+//! Any other Pact failure is [`LocalError::Failure`]; a delivered answer that cannot be used
+//! (not JSON, over the body cap, no `result` or `metaData.blockHeight`, no decimal balance)
+//! is [`LocalError::Invalid`]; only transport and HTTP errors are [`LocalError::Node`]. None
+//! is ever read as a zero balance.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -87,8 +88,8 @@ pub enum LocalError {
     Failure(String),
     /// The answer arrived but this build cannot use it (not JSON, over the body cap, no
     /// `result`, no `metaData.blockHeight`, no decimal balance). Says nothing about the row:
-    /// callers keep their work queued and report it (D3 gap group 2: valid long decimals were
-    /// read as failures and their marks dropped).
+    /// callers keep their work queued for a few retries and report it (D3 gap group 2: valid
+    /// long decimals were read as failures and their marks dropped at once).
     #[error("invalid answer: {0}")]
     Invalid(String),
     /// Transport or HTTP error (timeout, connection, non-2xx status): retry later.
@@ -212,7 +213,7 @@ pub struct LocalClient {
     sem: Semaphore,
 }
 
-/// A delivered answer that cannot be used: a per-call [`LocalError::Failure`], never a node
+/// A delivered answer that cannot be used: a per-call [`LocalError::Invalid`], never a node
 /// error (one odd answer must not make the caller back off for every key).
 fn invalid(what: &str) -> LocalError {
     LocalError::Invalid(what.chars().take(200).collect())
@@ -774,7 +775,7 @@ mod tests {
             prev_hash: None,
         });
         assert!(matches!(&r, Ok(Local::Found { value, .. }) if value.balance == wiza));
-        // An unusable answer is `Invalid`, not a pact `Failure`: the reconciler keeps the mark.
+        // An unusable answer is `Invalid`, not a pact `Failure`: the reconciler retries the key.
         let r = details_of(Local::Found {
             value: json!({"balance": "lots", "guard": null}),
             height: 1,

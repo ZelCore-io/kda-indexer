@@ -23,7 +23,8 @@ pub enum Mode {
     /// The receivers pass (D1) as a count only: candidates and would-be-marked rows; writes
     /// nothing (read-only store, no data dir lock).
     SeedDryRun,
-    /// Mark every `Balances` row dirty (height 0; a tail mark is kept).
+    /// Mark every `Balances` row dirty (height 0; a tail mark is kept), and put the keys
+    /// parked for unusable answers (`balances_parked_invalid/`, H-1) back in the seed backlog.
     All,
     /// Run the NFT history fill again (plan Task 11).
     NftFill,
@@ -134,7 +135,13 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
                     _ => break,
                 }
             }
-            println!("{}", json!({ "marked_dirty": marked }));
+            let mut txn = hs.rw()?;
+            let parked_invalid = kdx_hot::balances::requeue_parked_invalid(&mut txn)?;
+            txn.commit()?;
+            println!(
+                "{}",
+                json!({ "marked_dirty": marked, "parked_invalid_requeued": parked_invalid })
+            );
             Ok(())
         }
     }
@@ -332,6 +339,8 @@ fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
             .is_some(),
         "d3_discover_queued": kdx_hot::balances::discovered_queue(&txn, kdx_hot::balances::D3_DISCOVER_QUEUE_MAX)?.len(),
         "d3_rewalk_pending": kdx_hot::balances::rewalk_pending(&txn)?.len(),
+        // H-1: keys parked after repeated unusable `details` answers; `--all` re-queues them.
+        "parked_invalid": kdx_hot::balances::parked_invalid(&txn)?.len(),
         "d3_discover_pending": kdx_hot::balances::discover_pending(&txn, kdx_hot::balances::D3_DISCOVER_PENDING_MAX)?.len(),
         "seed_token_receivers_dropped": txn
             .meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_DROPPED)?

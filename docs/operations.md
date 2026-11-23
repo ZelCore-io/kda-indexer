@@ -573,10 +573,15 @@ with `[balances] enabled = false`.
   mark dropped until its next tail mark). It never becomes a zero balance. A Pact failure (for
   example a token module without a `details` function) drops the mark it read (a newer mark
   survives) and keeps any stored row, flagged unverified (served `stale: true`), with no
-  back-off. An unusable answer (not JSON, too large, no decimal balance) never drops the mark:
-  it is logged (`balances: details answer unusable; key kept dirty`), counted
-  (`result="invalid"`) and moved to the back of the queue, and it does not count against the
-  module's fungible check. A batch of only unusable answers pauses the next one for 30 s.
+  back-off. An unusable answer (not JSON, too large, no decimal balance) does not drop the
+  mark at once: it is logged (`balances: details answer unusable; key kept dirty`), counted
+  (`result="invalid"`) and moved to the back of the queue. After 5 in a row the key is parked
+  like a node error and listed (`parked_invalid` in `--status`, at most 100,000 keys);
+  `reconcile-balances --all` puts the listed keys back in the queue. Unusable answers count
+  as module failures: a module none of whose keys answers usably in 3 batches in a row is
+  marked not fungible, like one whose calls fail, so a hostile `details` cannot hold batch
+  slots. A batch of only unusable answers pauses the next one for 30 s (the pause also covers
+  a proxy answering HTML with status 200, which is not a node error and gets no back-off).
   Balance text is accepted up to 1,024 bytes: Pact decimals carry up to 255 places, so a
   full-precision balance (for example `free.wiza`, about 260 bytes) is stored exactly. A module name that fails the safety
   check is skipped without a call. A node outage parks nothing: retry counts only run in
@@ -623,10 +628,11 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-
 ```
 
 - `--status`: dirty rows, balance/absent/guard/key/token counts, seed state (`seeded_height`,
-  `seed_in_progress`), the reconciler's rate, ETA and heartbeat age. Read-only; runs beside the
-  service.
+  `seed_in_progress`), keys parked for unusable answers (`parked_invalid`), the reconciler's
+  rate, ETA and heartbeat age. Read-only; runs beside the service.
 - `--seed`: runs (or resumes) the seed walk now; the next `run` reconciles what it marked.
-- `--all`: marks every stored balance row dirty, so the next `run` re-reads them all.
+- `--all`: marks every stored balance row dirty, so the next `run` re-reads them all, and
+  re-queues the keys parked for unusable answers (`parked_invalid_requeued`).
 - `--nft-fill` (service stopped): runs the NFT history fill again (below), then drains the
   marks it made with `get-balance`. `--status` also prints `nft_rows`, `nft_dirty_rows` and
   `nft_filled_height`.
