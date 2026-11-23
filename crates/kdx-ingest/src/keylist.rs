@@ -471,6 +471,9 @@ pub fn mark_keys(
     row_cap: u32,
     already: u64,
 ) -> Result<Marked> {
+    // The dictionary lock is held across the write txn (up to 150,000 x 3 lookups); ingest
+    // interns under the same lock, so a big listing can pause it for a fraction of a second
+    // (review note 5). Fine at the measured sizes; a two-phase lookup is parked.
     let mut d = dict.lock().unwrap_or_else(|e| e.into_inner());
     let r = (|| -> Result<Marked> {
         let mut txn = hot.rw()?;

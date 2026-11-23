@@ -602,7 +602,6 @@ impl LocalClient {
     }
 }
 
-/// F-14: a guard whose JSON is over [`MAX_GUARD_JSON`] bytes becomes null; true when it did.
 /// A `describe-module` code answer: the code text; a module not on the chain is absent.
 fn code_of(r: LocalResult<Value>) -> LocalResult<String> {
     match r {
@@ -654,6 +653,7 @@ fn keys_of(r: Local<Value>, max: usize) -> LocalResult<Vec<String>> {
     })
 }
 
+/// F-14: a guard whose JSON is over [`MAX_GUARD_JSON`] bytes becomes null; true when it did.
 fn capped_guard(g: Value) -> (Value, bool) {
     if g.to_string().len() > MAX_GUARD_JSON {
         (Value::Null, true)
