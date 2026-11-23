@@ -30,7 +30,8 @@
 //!   stalling, not the token), pauses the whole listing ([`NODE_PAUSE`],
 //!   doubling to [`NODE_PAUSE_MAX`]) and counts against the chain after [`NODE_TRIES`] in a
 //!   row. A failed token goes to the back of the queue, so one token cannot hold it.
-//! - Budget: a token that runs up [`FAIL_BUDGET`] chain failures with no clean round between
+//! - Budget: a token that runs up [`FAIL_BUDGET`] chain failures (a chain already at
+//!   [`RETRY_CAP_SECS`] adds none, R-2) with no clean round between
 //!   is marked unlistable (logged, counted, `reconcile-balances --status`) and left alone for
 //!   [`UNLISTABLE_SECS`], then tried once more with a fresh budget.
 //! - Marks: only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are marked,
@@ -361,9 +362,15 @@ impl ListState {
             }
         };
         let c = &mut self.chains[i];
+        // A chain already at the longest pause costs the token's budget no more (PR #27 R-2): one
+        // table that never lists (over the key cap) must not, a few times a month, make the
+        // healthy chains of its token unlistable after months.
+        let at_cap = c.fails > 0 && retry_after(c.fails) >= RETRY_CAP_SECS;
         c.fails = c.fails.saturating_add(1);
         c.retry_at = now.saturating_add(retry_after(c.fails));
-        self.fail_total = self.fail_total.saturating_add(1);
+        if !at_cap {
+            self.fail_total = self.fail_total.saturating_add(1);
+        }
     }
     /// `chain` listed: no longer failed.
     fn cleared(&mut self, chain: u8) {
@@ -1210,6 +1217,24 @@ mod tests {
     }
 
     /// H-1: the pause of a failing `(token, chain)` doubles per failure in a row, capped.
+    /// R-2: a chain that keeps failing at the longest pause stops costing the token's budget.
+    #[test]
+    fn a_chain_at_the_longest_pause_costs_no_more_budget() {
+        let mut st = ListState::default();
+        for _ in 0..40 {
+            st.failed(7, 1_000);
+        }
+        // Charged until its pause reached the cap (9 failures), then free.
+        assert_eq!(st.fail_total, 9);
+        assert_eq!(st.chains[0].fails, 40);
+        assert!(
+            st.fail_total < FAIL_BUDGET,
+            "a lone big chain is never unlistable"
+        );
+        st.failed(8, 1_000);
+        assert_eq!(st.fail_total, 10, "another chain is charged as before");
+    }
+
     /// R-3: the listing needs a second `/local` slot, so the reconcile is never blocked.
     #[test]
     fn the_listing_needs_a_second_local_slot() {

@@ -823,7 +823,7 @@ is logged (`balances: key listing failed`, with module, chain, reason and the re
 and only that chain is listed again: after 1 hour, doubling with each failure in a row, at
 most every 7 days; the token goes to the back of the queue meanwhile. A connection or HTTP
 error, or a timeout of the small `describe-module` read (the node stalls, not the token), pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
-in a row. A token that runs up 32 chain failures with no clean round between is marked
+in a row. A chain already at the 7-day pause costs the budget nothing more (one table that never lists does not make its token unlistable). A token that runs up 32 chain failures with no clean round between is marked
 unlistable (logged at WARN, `--status` `keylist_tokens.unlistable`) and left alone for 30
 days, then tried once more with a fresh budget. A panic in the listing task is logged at ERROR (`balances: key listing task panicked`) and the task is restarted after 60 s; its progress is in the store. The listing waits, like the receivers pass,
 until the store has a tail and its backfill is complete.
