@@ -1335,7 +1335,12 @@ async fn run_with(
     // limits and ends with this loop (the guard cancels it on every return).
     let keylist_stop = stop.child_token();
     let _keylist_guard = keylist_stop.clone().drop_guard();
-    if o.seed {
+    if o.seed && !crate::keylist::enabled(o.local.concurrency) {
+        tracing::warn!(
+            "balances: key listing off: balances.local_concurrency = 1 would let one listing read hold the only /local slot"
+        );
+    }
+    if o.seed && crate::keylist::enabled(o.local.concurrency) {
         tokio::spawn(crate::keylist::run(
             ctx.clone(),
             local.clone(),

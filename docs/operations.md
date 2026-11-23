@@ -803,7 +803,7 @@ skipping not-fungible verdicts and tokens at their row cap. One step is one (tok
 `defschema` has a top-level `balance` field, at most 4). Each read is sent once, with a 90 s
 timeout (no retry inside the node client). At most one step per second, inside the shared
 `/local` limits (`balances.local_rps`, `balances.local_concurrency`: a hung read holds one
-slot). A token never listed comes first, so a newly tracked token (D3 discovery or a first
+slot). With `balances.local_concurrency = 1` the listing is off (WARN at start): a read would hold the only slot and the reconcile would wait for it. A token never listed comes first, so a newly tracked token (D3 discovery or a first
 posting) is listed within about 10 minutes plus the queue ahead of it; after that each token
 is listed again every 7 days. A first sweep takes about 20 steps per token, so about 20 s per
 token (about 6 h for 1,000 tokens, estimate) when every read is quick.

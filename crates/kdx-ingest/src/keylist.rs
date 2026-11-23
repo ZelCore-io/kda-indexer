@@ -18,7 +18,8 @@
 //!   `(token, chain)`: one `describe-module` read, then one `keys` read per ledger table, each
 //!   sent once with [`READ_TIMEOUT`] (no retry inside the client). At most one step per
 //!   [`STEP_EVERY`], inside the shared `/local` rate limit. A panic in the task is logged at
-//!   ERROR and the task restarted after [`PANIC_PAUSE`] (R-4). Progress (`Meta
+//!   ERROR and the task restarted after [`PANIC_PAUSE`] (R-4). With `balances.local_concurrency`
+//!   = 1 the listing is off ([`enabled`], R-3): a read would hold the only slot. Progress (`Meta
 //!   balances_keylist/<module>`) is kept per step, so a restart resumes.
 //! - A module with no ledger table on a chain lists nothing there, like a module not deployed
 //!   (no failure; looked at again at the next sweep).
@@ -856,6 +857,13 @@ fn fail(
     .context("key listing stats")
 }
 
+/// Whether the listing may run with `local_concurrency` `/local` slots. With one slot a listing
+/// read (up to [`READ_TIMEOUT`]) would hold the reconcile's only slot (PR #27 R-3), so the
+/// listing is off then; the shipped configs use 8.
+pub fn enabled(local_concurrency: usize) -> bool {
+    local_concurrency > 1
+}
+
 /// The key listing as its own task (PR #27 H-1), kept alive: a panic in it is logged at ERROR
 /// and the task restarted after [`PANIC_PAUSE`] (R-4; its progress is in the store, so it
 /// resumes), until `stop`.
@@ -1202,6 +1210,13 @@ mod tests {
     }
 
     /// H-1: the pause of a failing `(token, chain)` doubles per failure in a row, capped.
+    /// R-3: the listing needs a second `/local` slot, so the reconcile is never blocked.
+    #[test]
+    fn the_listing_needs_a_second_local_slot() {
+        assert!(!enabled(1));
+        assert!(enabled(2) && enabled(8));
+    }
+
     #[test]
     fn retry_backoff_grows_and_is_capped() {
         assert_eq!(retry_after(1), RETRY_BASE_SECS);
