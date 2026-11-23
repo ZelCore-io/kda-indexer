@@ -81,11 +81,16 @@ pub enum LocalError {
     /// B-1 refused the call (bad module name, over-long name): nothing was sent.
     #[error("skipped: {0}")]
     Skipped(String),
-    /// The node evaluated the code and it failed for another reason than a missing row, or
-    /// its answer arrived but is unusable (not JSON, over the body cap, no `result`, no
-    /// `metaData.blockHeight`, no decimal balance). A property of this call.
+    /// The node evaluated the code and it failed for another reason than a missing row. A
+    /// property of this call.
     #[error("pact failure: {0}")]
     Failure(String),
+    /// The answer arrived but this build cannot use it (not JSON, over the body cap, no
+    /// `result`, no `metaData.blockHeight`, no decimal balance). Says nothing about the row:
+    /// callers keep their work queued and report it (D3 gap group 2: valid long decimals were
+    /// read as failures and their marks dropped).
+    #[error("invalid answer: {0}")]
+    Invalid(String),
     /// Transport or HTTP error (timeout, connection, non-2xx status): retry later.
     #[error("node: {0}")]
     Node(#[from] NodeError),
@@ -158,8 +163,11 @@ pub struct TokenInfo {
     pub uri: String,
 }
 
-/// Longest decimal text accepted from a node answer (bytes).
-pub const MAX_DECIMAL_LEN: usize = 128;
+/// Longest decimal text accepted from a node answer (bytes). Pact decimals have at most 255
+/// decimal places (`Data.Decimal`, `Word8` places) and an unbounded integer mantissa; real
+/// balances print at most about 260 bytes (`free.wiza`). 1,024 bytes covers every place plus
+/// a 760-digit integer part, and still bounds garbage from a hostile node (M-7).
+pub const MAX_DECIMAL_LEN: usize = 1024;
 
 /// A decimal text (M-7): optional `-`, digits, optional `.` and digits, optional exponent; at
 /// most [`MAX_DECIMAL_LEN`] bytes.
@@ -207,8 +215,7 @@ pub struct LocalClient {
 /// A delivered answer that cannot be used: a per-call [`LocalError::Failure`], never a node
 /// error (one odd answer must not make the caller back off for every key).
 fn invalid(what: &str) -> LocalError {
-    let cut: String = what.chars().take(200).collect();
-    LocalError::Failure(format!("invalid answer: {cut}"))
+    LocalError::Invalid(what.chars().take(200).collect())
 }
 
 fn now_secs() -> u64 {
@@ -746,6 +753,34 @@ mod tests {
             prev_hash: None,
         })
         .is_err());
+    }
+
+    /// D3 gap group 2: `free.wiza` balances carry Pact's full 255 decimal places (about 260
+    /// bytes, e.g. `0.0161938904166666…`). They are valid decimals and must read; only absurd
+    /// lengths are refused.
+    #[test]
+    fn a_full_precision_pact_decimal_reads() {
+        let wiza = format!("0.0161938904166666{}8", "6".repeat(255 - 17));
+        assert_eq!(wiza.len(), 257);
+        assert_eq!(
+            decimal_text(&json!({ "decimal": wiza })).as_deref(),
+            Some(wiza.as_str())
+        );
+        let big = format!("242.{}", "3".repeat(255));
+        assert_eq!(decimal_text(&json!(big)).as_deref(), Some(big.as_str()));
+        let r = details_of(Local::Found {
+            value: json!({"account": "k:a", "balance": {"decimal": wiza}, "guard": null}),
+            height: 1,
+            prev_hash: None,
+        });
+        assert!(matches!(&r, Ok(Local::Found { value, .. }) if value.balance == wiza));
+        // An unusable answer is `Invalid`, not a pact `Failure`: the reconciler keeps the mark.
+        let r = details_of(Local::Found {
+            value: json!({"balance": "lots", "guard": null}),
+            height: 1,
+            prev_hash: None,
+        });
+        assert!(matches!(r, Err(LocalError::Invalid(_))), "{r:?}");
     }
 
     /// F-13: a bare JSON number is checked like a decimal string (a hostile node could send

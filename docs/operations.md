@@ -571,9 +571,14 @@ with `[balances] enabled = false`.
   to the back of the queue; the reconciler backs off (up to 60 s) only when node errors are at
   least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,
   mark dropped until its next tail mark). It never becomes a zero balance. A Pact failure (for
-  example a token module without a `details` function) or an unusable answer (not JSON, too
-  large, no decimal balance) drops the mark it read (a newer mark survives) and keeps any stored row, flagged
-  unverified (served `stale: true`), with no back-off. A module name that fails the safety
+  example a token module without a `details` function) drops the mark it read (a newer mark
+  survives) and keeps any stored row, flagged unverified (served `stale: true`), with no
+  back-off. An unusable answer (not JSON, too large, no decimal balance) never drops the mark:
+  it is logged (`balances: details answer unusable; key kept dirty`), counted
+  (`result="invalid"`) and moved to the back of the queue, and it does not count against the
+  module's fungible check. A batch of only unusable answers pauses the next one for 30 s.
+  Balance text is accepted up to 1,024 bytes: Pact decimals carry up to 255 places, so a
+  full-precision balance (for example `free.wiza`, about 260 bytes) is stored exactly. A module name that fails the safety
   check is skipped without a call. A node outage parks nothing: retry counts only run in
   batches that do not back off.
 - **Trust**: a guard adds the account to `/keys/{pk}/accounts` only for `coin` and for a module
@@ -778,7 +783,7 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 - `n_4e470a97222514a8662dd1219000a0431451b0ee.ledger` (a v2-shaped ledger in a principal
   namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
   deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
-- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|skipped|parked|capped|not_fungible"}`
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|invalid|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 

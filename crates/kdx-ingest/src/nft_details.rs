@@ -209,7 +209,7 @@ async fn call(local: &LocalClient, p: &Planned) -> Outcome {
         {
             Outcome::Undefined
         }
-        Err(LocalError::Failure(m)) => {
+        Err(LocalError::Failure(m) | LocalError::Invalid(m)) => {
             tracing::debug!(ledger = %p.ledger, message = %m, "nft details: call failed");
             Outcome::Failed
         }
