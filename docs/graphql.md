@@ -42,10 +42,14 @@ Differences from Kadena graph:
 - Fields not served yet answer `NOT_SUPPORTED` with the rest of the operation intact.
 - Row order within a block (R-P5P9-151). A newest-first list that spans several blocks
   (`transactions`, `events`, `transfers` without `blockHash`, the account connections) lists
-  the rows of one block in reverse node order, so the coinbase comes last; the stock indexer
-  orders those rows by creation time. A list of one block (`blockHash` without `requestKey`,
-  the `Block` connections) is in the node's order, coinbase first, as the node and the stock
-  indexer list it.
+  the rows of one block in reverse node order; the stock indexer orders those rows by creation
+  time. Such lists have no coinbase rows, except `transactions(isCoinbase: true)`: there the
+  coinbase is the first row of its block, as stock lists it (its creation time is the
+  block's), then the user txs in reverse node order. So a page of one block that is smaller
+  than the block (kadscan asks `first: 25`) still shows the coinbase. A coinbase row's cursor
+  sorts above every user tx of its block; user rows keep the cursors of the list without the
+  flag. A list of one block (`blockHash` without `requestKey`, the `Block` connections) is in
+  the node's order, coinbase first, as the node and the stock indexer list it.
 
 ## Errors
 
@@ -416,6 +420,8 @@ the oracle puts them.
   by descending event position (order index 1 before 0), as the deployed oracle lists them.
   The exception is a list of one block (`blockHash` without `requestKey`, and the `Block`
   connections): it is in the node's order, coinbase first (see "Blocks and network").
+  `transactions(isCoinbase: true)` lists each block's coinbase before the block's user txs
+  (see Row order).
   `first`/`after` pages walk down from the newest row; `last`/`before` pages first collect
   the keys between the cursor and the newest row (keys only, at most 200,000, else `LIMIT`).
   Every walk checks the request deadline every 64 keys and answers `TIMEOUT` past it.
@@ -423,7 +429,10 @@ the oracle puts them.
   row's block): portable between instances, refused with `BAD_USER_INPUT` after a reorg of
   that block.
 - **Coinbase.** Coinbase txs are not `Transaction`s (as in Kadena graph): transaction lists
-  leave them out, and `Event.transaction`/`Transfer.transaction` of a coinbase row is `null`.
+  leave them out, except `transactions(isCoinbase: true)` (see the extensions table).
+  `Event.transaction`/`Transfer.transaction` of a coinbase row is `null`, also when reached
+  from a listed coinbase's `result.events` or `result.transfers`, and `node(id)` with a listed
+  coinbase's `Transaction` id answers `null` (stock most likely resolves both).
   Their events and transfers are listed with order index 0 and the node's coinbase request
   key (the `reqKey` of the stored coinbase output, as the oracle lists it; R-P5P9-57 F4).
   Event and Transfer ids carry that key; `node(id)` still accepts ids with `<coinbase>`.
@@ -561,7 +570,7 @@ relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `Strin
 | `Transaction.orphanedTransactions: [Transaction]` | always `[]`: the store keeps no orphaned blocks |
 | `QueryBlocksFromDepthConnection.totalCount` | blocks in the whole list, from the per-chain height ranges (store floor to tip minus `minimumDepth`); exact without a walk, since blocks are dense |
 | `TransactionResultTransfersConnection.totalCount` | the tx's transfer count |
-| `transactions(isCoinbase: Boolean)` | `false` or absent: user txs (as without it). `true`: the same list with the coinbases added, as stock (it drops its `sender != 'coinbase'` filter; nothing else changes, so beside `accountName` it lists the account's txs only). A coinbase row answers as stock's: `hash` is the node's coinbase `reqKey` text, `meta.sender` `coinbase`, `chainId` its chain, `creationTime` its block's time in whole seconds, `gasLimit`, `gasPrice`, `ttl` and `gas` 0, `nonce` empty, no signers or sigs, payload code and data `{}`, `networkId` the configured network; its result, events and transfers are the stored coinbase output. Paging, order (a coinbase is the last row of its block in a newest-first list, see Row order), `totalCount` (an exact count, coinbases included; stock's is an estimate from its height counters) and cost caps are those of the list without it |
+| `transactions(isCoinbase: Boolean)` | `false` or absent: user txs (as without it). `true`: the same list with the coinbases added, as stock (it drops its `sender != 'coinbase'` filter; nothing else changes, so beside `accountName` it lists the account's txs only). A coinbase row answers as stock's: `hash` is the node's coinbase `reqKey` text, `meta.sender` `coinbase`, `chainId` its chain, `creationTime` its block's time in whole seconds, `gasLimit`, `gasPrice`, `ttl` and `gas` 0, `nonce` empty, no signers or sigs, payload code and data `{}`, `networkId` the configured network; its result, events and transfers are the stored coinbase output. Order: the coinbase is the first row of its block (see Row order), so kadscan's `first: 25` page of one block shows it even when the block has 25 or more user txs; user rows keep the order and cursors of the list without the flag. Paging, `totalCount` (an exact count, coinbases included; stock's is an estimate from its height counters) and cost caps are those of the list without it |
 | `transfers(isNFT: Boolean)` | `true`: NFT transfers instead of fungible ones, the four-parameter `TRANSFER (id sender receiver amount)` events of the NFT ledgers (`[nft] ledgers`). An account's come from its `acct` postings; with neither account, module, block nor request key, heights are walked down from the tip (as `transactions` without a selective argument). `crossChainTransfer` is `null` for them |
 | `Transfer.tokenId: String` | the NFT transfer's token id; `null` for a fungible transfer |
 | `events(moduleName: String)` | events of that module. `qualifiedEventName` or `moduleName` is required (`BAD_USER_INPUT` otherwise); with both, both filter. `moduleName` alone has no posting list: unless `blockHash` or `requestKey` picks the txs, heights are walked down from the tip (at most 20,000 heights, within the deadline) |

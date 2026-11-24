@@ -1935,10 +1935,11 @@ const COINBASE_OP: &str = r#"
 "#;
 
 /// G4 class 1: `transactions(isCoinbase: true)` lists the coinbase as a `Transaction`
-/// beside the user txs, as stock answers it, in the list's existing order (R-P5P9-151: a
-/// newest-first list has a block's rows in reverse node order, so the coinbase comes last;
-/// stock orders by creation time, which puts it first). The coinbase row is as stock's: the node's coinbase `reqKey` as `hash`, sender `coinbase`, gas limit, price
-/// and gas 0, code `{}`, the block's time in whole seconds. `false` keeps user txs only.
+/// beside the user txs, as stock answers it: first in its block (stock orders by creation
+/// time, and the coinbase has the block's), then the user txs in the list's existing order
+/// (R-P5P9-151: reverse node order). The coinbase row is as stock's: the node's coinbase
+/// `reqKey` as `hash`, sender `coinbase`, gas limit, price and gas 0, code `{}`, the block's
+/// time in whole seconds. `false` keeps user txs only.
 #[tokio::test]
 async fn is_coinbase_true_lists_the_coinbase_as_stock_does() {
     let fx = fixture();
@@ -1953,7 +1954,7 @@ async fn is_coinbase_true_lists_the_coinbase_as_stock_does() {
     let users = &fx.rks[&(0, 11)];
     assert_eq!(edges.len(), 1 + users.len(), "{t}");
     assert_eq!(t["totalCount"], json!(1 + users.len()));
-    let cb = &edges[users.len()]["node"];
+    let cb = &edges[0]["node"];
     assert_eq!(
         cb,
         &json!({
@@ -1968,8 +1969,8 @@ async fn is_coinbase_true_lists_the_coinbase_as_stock_does() {
                        "block": {"height": 11, "canonical": true}}
         })
     );
-    // The user txs come first, in reverse node order, unchanged.
-    let hashes: Vec<&str> = edges[..users.len()]
+    // The user txs follow, in reverse node order, unchanged.
+    let hashes: Vec<&str> = edges[1..]
         .iter()
         .map(|e| e["node"]["hash"].as_str().unwrap())
         .collect();
@@ -2066,4 +2067,108 @@ async fn a_request_key_that_is_no_hash_finds_nothing_without_an_error() {
             .contains("blockHash"),
         "{v}"
     );
+}
+
+/// Controller ruling on PR #30 (review N1): in a `transactions(isCoinbase: true)` list the
+/// coinbase is the first row of its block, as stock orders it, so kadscan's `first: 25` page of
+/// a block with 25 or more user txs still shows it. The user rows keep the order and the cursors
+/// of the list without the flag. Every cursor resumes at the next row both ways (`after` with
+/// `first`, `before` with `last`).
+#[tokio::test]
+async fn is_coinbase_true_puts_the_coinbase_first_in_its_block() {
+    let fx = fixture();
+    let win = "chainId: \"0\", minHeight: 4, maxHeight: 11";
+    let q = |args: &str| {
+        format!(
+            "{{ transactions({args}) {{ pageInfo {{ hasNextPage hasPreviousPage }} \
+             edges {{ cursor node {{ hash }} }} }} }}"
+        )
+    };
+    let rows = |v: &Value| -> Vec<(String, String)> {
+        v["transactions"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["node"]["hash"].as_str().unwrap().to_string(),
+                    e["cursor"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    // Expected: newest block first; in each, the coinbase, then the user txs newest first.
+    let mut want = Vec::new();
+    for h in (4..=11).rev() {
+        let Some(users) = fx.rks.get(&(0, h)) else {
+            continue;
+        };
+        want.push(b64url_encode(&hash_of(0xCB, 0, h)));
+        want.extend(users.iter().rev().cloned());
+    }
+    let all = rows(
+        &run(
+            &fx.schema,
+            &q(&format!("isCoinbase: true, {win}, first: 1000")),
+        )
+        .await,
+    );
+    let hashes: Vec<String> = all.iter().map(|r| r.0.clone()).collect();
+    assert_eq!(hashes, want);
+
+    // The user rows are the list without the flag, with the same cursors.
+    let plain = rows(&run(&fx.schema, &q(&format!("{win}, first: 1000"))).await);
+    let users: Vec<(String, String)> = all
+        .iter()
+        .filter(|r| plain.iter().any(|p| p.0 == r.0))
+        .cloned()
+        .collect();
+    assert_eq!(users, plain);
+    assert!(users.len() < all.len());
+
+    // kadscan's operation on one block with a page smaller than the block: the coinbase first.
+    let one = "isCoinbase: true, chainId: \"0\", minHeight: 11, maxHeight: 11";
+    let n = fx.rks[&(0, 11)].len();
+    assert!(n >= 2, "block 0/11 needs user txs");
+    let v = run(&fx.schema, &q(&format!("{one}, first: 1"))).await;
+    assert_eq!(rows(&v)[0].0, b64url_encode(&hash_of(0xCB, 0, 11)));
+    assert_eq!(v["transactions"]["pageInfo"]["hasNextPage"], json!(true));
+    let v = run(&fx.schema, &q(&format!("{one}, last: 1"))).await;
+    assert_eq!(rows(&v)[0].0, fx.rks[&(0, 11)][0]);
+
+    // Every cursor resumes at the next row in both directions.
+    for (i, (_, c)) in all.iter().enumerate() {
+        let after = rows(
+            &run(
+                &fx.schema,
+                &q(&format!(
+                    "isCoinbase: true, {win}, first: 1000, after: \"{c}\""
+                )),
+            )
+            .await,
+        );
+        assert_eq!(after, all[i + 1..], "after row {i}");
+        let before = rows(
+            &run(
+                &fx.schema,
+                &q(&format!(
+                    "isCoinbase: true, {win}, last: 1000, before: \"{c}\""
+                )),
+            )
+            .await,
+        );
+        assert_eq!(before, all[..i], "before row {i}");
+        let v = run(
+            &fx.schema,
+            &q(&format!(
+                "isCoinbase: true, {win}, last: 1, before: \"{c}\""
+            )),
+        )
+        .await;
+        assert_eq!(
+            rows(&v),
+            all[i.saturating_sub(1)..i],
+            "last 1 before row {i}"
+        );
+    }
 }
