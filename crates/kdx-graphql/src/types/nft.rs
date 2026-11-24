@@ -122,6 +122,7 @@ fn nft_txs_spec(account: &str, chain: Option<u8>) -> ListSpec {
             sender: None,
             nft: true,
             module: None,
+            coinbase: false,
         },
     }
 }

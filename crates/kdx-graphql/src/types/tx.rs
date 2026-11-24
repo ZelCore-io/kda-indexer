@@ -25,10 +25,13 @@ use crate::ids::{encode, NodeKey};
 use crate::scalars::{BigInt, DateTime, FloatText};
 use crate::txlist::{
     block_list, block_node, chain_arg, fungible_arg, hash_arg, height_arg, list, load, name_arg,
-    page_in_tx, Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec, TxData,
+    page_in_tx, rk_arg, Blocks, Item, KeyFilter, ListPage, ListSpec, ParamFilter, Rows, SourceSpec,
+    TxData,
 };
 
-/// A user transaction (coinbase txs are not listed as transactions, as in Kadena graph).
+/// A transaction. Coinbase txs are `Transaction`s only in `transactions(isCoinbase: true)`
+/// ([`Transaction::listed`]), as stock lists them; everywhere else they are not, as in
+/// Kadena graph.
 #[derive(Debug, Clone)]
 pub struct Transaction {
     pub d: Arc<TxData>,
@@ -70,6 +73,28 @@ fn str_of(v: Option<&Value>) -> String {
 impl Transaction {
     pub fn new(d: Arc<TxData>) -> Option<Transaction> {
         (!d.is_coinbase()).then_some(Transaction { d })
+    }
+
+    /// A row of a tx list: a coinbase (only in a list that keeps them) gets the command
+    /// stock answers for a tx with no command (indexer-kadena `coinbase.ts`,
+    /// `transaction-schema-validator.ts`, `transaction-meta-schema-validator.ts`): sender
+    /// `coinbase`, the block's time in whole seconds, gas limit, gas price and ttl 0, an empty
+    /// nonce, no signers. Its payload (code and data `{}`) and network id are filled in by
+    /// [`TransactionCommand`].
+    pub fn listed(d: Arc<TxData>) -> Transaction {
+        if !d.is_coinbase() || d.cmd.is_some() {
+            return Transaction { d };
+        }
+        let secs = d.block.creation_time / 1_000_000;
+        let cmd = serde_json::json!({
+            "meta": {"chainId": d.key().chain().to_string(), "creationTime": secs,
+                     "gasLimit": 0, "gasPrice": 0, "sender": "coinbase", "ttl": 0},
+            "nonce": "",
+            "signers": [],
+        });
+        let mut c = (*d).clone();
+        c.cmd = Some(cmd);
+        Transaction { d: Arc::new(c) }
     }
 }
 
@@ -124,6 +149,13 @@ impl TransactionCommand {
     }
 
     fn payload_value(&self) -> TransactionPayload {
+        if self.d.is_coinbase() {
+            // Stock's `{}` text for the code and data of a tx with no command.
+            return TransactionPayload::ExecutionPayload(ExecutionPayload {
+                code: Some("{}".into()),
+                data: "{}".into(),
+            });
+        }
         let p = self.cmd().get("payload");
         // A JSON-null `cont` is absent: an exec payload may carry `"cont": null`
         // (R-P5P9-60 D4).
@@ -162,7 +194,11 @@ impl TransactionCommand {
             ttl: BigInt::text(int_of(g("ttl"))),
         }
     }
-    async fn network_id(&self) -> String {
+    async fn network_id(&self, ctx: &Context<'_>) -> String {
+        if self.d.is_coinbase() {
+            // Stock answers its configured network for a coinbase (no command).
+            return gql(ctx).settings.network_id.clone();
+        }
         str_of(self.cmd().get("networkId"))
     }
     async fn nonce(&self) -> String {
@@ -431,7 +467,8 @@ fn txs(
         .edges
         .into_iter()
         .filter_map(|(c, it)| match it {
-            Item::Tx(d) => Transaction::new(d).map(|t| (c, t)),
+            // Coinbase rows reach here only from a list that keeps them (`isCoinbase: true`).
+            Item::Tx(d) => Some((c, Transaction::listed(d))),
             _ => None,
         })
         .collect();
@@ -457,7 +494,8 @@ fn stock_depth_range(minimum_depth: Option<i32>) -> Result<()> {
 /// The `BAD_USER_INPUT` of a request key stored more than once, without a `blockHash`.
 pub(crate) const MANY_COPIES: &str = "multiple transactions found: pass blockHash to pick one";
 
-/// `transaction(requestKey, blockHash, minimumDepth)`: `null` when not indexed; several
+/// `transaction(requestKey, blockHash, minimumDepth)`: `null` when not indexed (also for a
+/// key that is no hash, as stock); several
 /// copies (genesis, R-P5P9-5) without a `blockHash` that picks one are `BAD_USER_INPUT`.
 pub async fn query_transaction(
     ctx: &Context<'_>,
@@ -471,9 +509,12 @@ pub async fn query_transaction(
         ctx.add_error(ctx.set_error_path(e.into_server_error(ctx.item.pos)));
         return Ok(None);
     }
-    let rk = hash_arg("requestKey", &request_key)?;
     let bh = block_hash.map(|h| hash_arg("blockHash", &h)).transpose()?;
     let depth = height_arg("minimumDepth", minimum_depth)?;
+    // A key that is no hash finds nothing: `null` without an error, as stock (G4 class 2).
+    let Some(rk) = rk_arg(&request_key) else {
+        return Ok(None);
+    };
     let found = gql(ctx)
         .state()?
         .read(move |view| {
@@ -527,7 +568,7 @@ fn list_source(
     let block = block_hash.map(|h| hash_arg("blockHash", h)).transpose()?;
     Ok(if let Some(rk) = request_key {
         SourceSpec::Rk {
-            rk: hash_arg("requestKey", rk)?,
+            rk: rk_arg(rk),
             block,
         }
     } else if let Some(bh) = block {
@@ -575,6 +616,7 @@ fn transactions_spec(
     fungible_name: Option<&str>,
     (min_height, max_height, minimum_depth): (Option<i32>, Option<i32>, Option<i32>),
     request_key: Option<&str>,
+    coinbase: bool,
 ) -> Result<ListSpec> {
     // Stock keeps a tx with ANY event of the `fungibleName` module (`EXISTS` on
     // `Events.module`), not only one with a transfer of it. Where the source is already
@@ -594,11 +636,12 @@ fn transactions_spec(
     };
     Ok(ListSpec {
         source,
-        filter: key_filter(chain_id, min_height, max_height, minimum_depth, true)?,
+        filter: key_filter(chain_id, min_height, max_height, minimum_depth, !coinbase)?,
         rows: Rows::Txs {
             sender: account_name.map(str::to_owned),
             nft: false,
             module,
+            coinbase,
         },
     })
 }
@@ -620,12 +663,6 @@ pub async fn query_transactions(
     request_key: Option<String>,
     is_coinbase: Option<bool>,
 ) -> Result<QueryTransactionsConnection> {
-    if is_coinbase == Some(true) {
-        // Coinbase txs are not `Transaction`s here (R7D-3); `Block.coinbase` has them.
-        return Err(crate::error::not_supported(
-            "transactions(isCoinbase: true) (use Block.coinbase)",
-        ));
-    }
     let spec = transactions_spec(
         account_name.as_deref(),
         block_hash.as_deref(),
@@ -633,6 +670,9 @@ pub async fn query_transactions(
         fungible_name.as_deref(),
         (min_height, max_height, minimum_depth),
         request_key.as_deref(),
+        // `isCoinbase: true` keeps the coinbases in the list (stock drops its
+        // `sender != 'coinbase'` condition; G4 class 1). Every other rule is unchanged.
+        is_coinbase == Some(true),
     )?;
     let (edges, page_info, total) =
         txs(block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?);
@@ -664,6 +704,7 @@ pub async fn query_transactions_by_public_key(
             sender: None,
             nft: false,
             module: None,
+            coinbase: false,
         },
     };
     let (edges, page_info, total) =
@@ -790,7 +831,7 @@ pub async fn query_events(
         .transpose()?;
     let source = if let Some(rk) = &request_key {
         SourceSpec::Rk {
-            rk: hash_arg("requestKey", rk)?,
+            rk: rk_arg(rk),
             block,
         }
     } else if let Some(bh) = block {
@@ -1594,8 +1635,16 @@ mod cgfix_tests {
     /// M1 (GQ-19): `transactions(accountName)` keeps only the account's own txs.
     #[test]
     fn account_transactions_are_sender_rows() {
-        let spec = transactions_spec(Some("k:a"), None, Some("2"), None, (None, None, None), None)
-            .unwrap();
+        let spec = transactions_spec(
+            Some("k:a"),
+            None,
+            Some("2"),
+            None,
+            (None, None, None),
+            None,
+            false,
+        )
+        .unwrap();
         let Rows::Txs { sender, nft, .. } = &spec.rows else {
             panic!("tx rows")
         };
@@ -1607,6 +1656,7 @@ mod cgfix_tests {
             Some("coin"),
             (None, None, None),
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(&with_token.rows, Rows::Txs { sender: Some(s), .. } if s == "k:a"));
@@ -1623,6 +1673,7 @@ mod cgfix_tests {
             None,
             (None, None, None),
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(&by_block.rows, Rows::Txs { sender: None, .. }));

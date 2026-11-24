@@ -68,7 +68,7 @@ pub const SCAN_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A tx with everything its GraphQL fields read: the record, its block, the rendered output,
 /// the parsed command, events and transfers (chainweb-data rules, as compat).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TxData {
     pub rec: TxRecord,
     pub block: Arc<BlockRecord>,
@@ -253,8 +253,12 @@ pub enum SourceSpec {
     /// of the event name (an `events.parametersFilter` whose first value is a string).
     AcctOrEvt { account: String, qual: String },
     /// Every stored copy of a request key; with `block`, only the copy in that block (stock
-    /// ANDs `requestKey` and `blockHash`; audit F-30).
-    Rk { rk: Hash32, block: Option<Hash32> },
+    /// ANDs `requestKey` and `blockHash`; audit F-30). `rk` is `None` for a key that is no
+    /// hash: no copies ([`rk_arg`]).
+    Rk {
+        rk: Option<Hash32>,
+        block: Option<Hash32>,
+    },
     /// The txs of one block.
     Block(Hash32),
     /// Every user tx, heights walked down from the tip (GQ-20 exception).
@@ -325,6 +329,9 @@ pub enum Rows {
         sender: Option<String>,
         nft: bool,
         module: Option<String>,
+        /// Keep coinbase txs too (`transactions(isCoinbase: true)`, as stock: its
+        /// `t.sender != 'coinbase'` condition is dropped, nothing else changes).
+        coinbase: bool,
     },
     /// Its events (named `qual` when given: `Block.events` lists them all; of `module` when
     /// given, the ZelCore `events(moduleName)` extension), with the optional `orderIndex` and
@@ -371,6 +378,7 @@ impl Rows {
                 sender: None,
                 nft: false,
                 module: None,
+                coinbase: _,
             }
         )
     }
@@ -381,8 +389,9 @@ impl Rows {
                 sender,
                 nft,
                 module,
+                coinbase,
             } => {
-                if d.is_coinbase() {
+                if d.is_coinbase() && !coinbase {
                     return vec![];
                 }
                 if sender.as_deref().is_some_and(|s| d.sender() != Some(s)) {
@@ -485,10 +494,12 @@ fn plan(view: &View, spec: &ListSpec) -> ApiResult<(Src, Rows)> {
                 sender: _,
                 nft,
                 module,
+                coinbase,
             } => Rows::Txs {
                 sender: None,
                 nft: *nft,
                 module: module.clone(),
+                coinbase: *coinbase,
             },
             r => r.clone(),
         };
@@ -550,9 +561,16 @@ fn resolve(view: &View, s: &SourceSpec) -> ApiResult<Src> {
                 None => Src::Empty,
             },
         },
-        SourceSpec::Rk { rk, block: None } => Src::Rk(*rk, None),
+        SourceSpec::Rk { rk: None, .. } => Src::Empty,
+        SourceSpec::Rk {
+            rk: Some(rk),
+            block: None,
+        } => Src::Rk(*rk, None),
         // The store keeps the canonical chain only: a hash names one (chain, height).
-        SourceSpec::Rk { rk, block: Some(h) } => match view.block_by_hash(h)? {
+        SourceSpec::Rk {
+            rk: Some(rk),
+            block: Some(h),
+        } => match view.block_by_hash(h)? {
             Some((c, height, _)) => Src::Rk(*rk, Some((c, height))),
             None => Src::Empty,
         },
@@ -1394,6 +1412,13 @@ pub fn height_arg(name: &str, v: Option<i32>) -> async_graphql::Result<Option<u3
         Some(x) if x >= 0 => Ok(Some(x as u32)),
         Some(_) => Err(bad_input(format!("{name} must not be negative"))),
     }
+}
+
+/// A request key argument used as a lookup: `None` when it is no hash, which finds nothing.
+/// Stock compares the text with its stored keys, so such a key (a base64-wrapped coinbase key
+/// from its own lists, any other text) answers `null` or no rows, never an error (G4 class 2).
+pub fn rk_arg(s: &str) -> Option<Hash32> {
+    hash_arg("requestKey", s).ok()
 }
 
 /// A request key or block hash argument (43-char base64url).

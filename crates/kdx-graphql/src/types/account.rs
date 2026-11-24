@@ -385,6 +385,7 @@ impl FungibleAccount {
             sender: None,
             nft: false,
             module: None,
+            coinbase: false,
         };
         spec.filter.user_only = true;
         let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
@@ -469,6 +470,7 @@ impl FungibleChainAccount {
                 sender: Some(self.account.clone()),
                 nft: false,
                 module: None,
+                coinbase: false,
             },
         };
         let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;

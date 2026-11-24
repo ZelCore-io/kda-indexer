@@ -613,6 +613,20 @@ async fn every_tx_list_joins_its_pages_at_every_size() {
         ),
         root("transactions", &by("requestKey", frozen_rk), TX, true),
         root("transactions", "", TX, true),
+        // `isCoinbase: true` adds the coinbases to the same lists (G4 class 1).
+        root("transactions", "isCoinbase: true", TX, true),
+        root(
+            "transactions",
+            "isCoinbase: true, chainId: \"0\", minHeight: 4, maxHeight: 11",
+            TX,
+            true,
+        ),
+        root(
+            "transactions",
+            &format!("isCoinbase: true, {}", by("blockHash", &block_hash(0, 6))),
+            TX,
+            true,
+        ),
         root(
             "transactionsByPublicKey",
             &by("publicKey", ALICE_KEY),
@@ -1888,4 +1902,168 @@ mod audit_pr3 {
         let v = run(&fx.schema, &q(&format!(", after: \"{first}\", first: 0"))).await;
         assert!(edges(&v, "balance").is_empty(), "{v}");
     }
+}
+
+/// The real-traffic `Transactions` operation (G4 replay corpus, case gql.transactions:1000002,
+/// 45,584 requests in two days), verbatim: one chain at one height, `isCoinbase: true`.
+const COINBASE_OP: &str = r#"
+  query Transactions(
+    $first: Int, $last: Int, $after: String, $before: String, $chainId: String,
+    $isCoinbase: Boolean, $minHeight: Int, $maxHeight: Int
+  ) {
+    transactions(
+      first: $first, last: $last, after: $after, before: $before, chainId: $chainId,
+      isCoinbase: $isCoinbase, minHeight: $minHeight, maxHeight: $maxHeight
+    ) {
+      totalCount
+      pageInfo { endCursor hasNextPage hasPreviousPage startCursor }
+      edges {
+        node {
+          hash
+          cmd {
+            meta { gasLimit chainId creationTime gasPrice sender }
+            payload { ... on ExecutionPayload { code } }
+          }
+          result {
+            ... on TransactionResult { badResult gas block { height canonical } }
+          }
+        }
+        cursor
+      }
+    }
+  }
+"#;
+
+/// G4 class 1: `transactions(isCoinbase: true)` lists the coinbase as a `Transaction`
+/// beside the user txs, as stock answers it, in the list's existing order (R-P5P9-151: a
+/// newest-first list has a block's rows in reverse node order, so the coinbase comes last;
+/// stock orders by creation time, which puts it first). The coinbase row is as stock's: the node's coinbase `reqKey` as `hash`, sender `coinbase`, gas limit, price
+/// and gas 0, code `{}`, the block's time in whole seconds. `false` keeps user txs only.
+#[tokio::test]
+async fn is_coinbase_true_lists_the_coinbase_as_stock_does() {
+    let fx = fixture();
+    let vars = |cb: Option<bool>| {
+        json!({"chainId": "0", "first": 25, "isCoinbase": cb, "last": null,
+               "minHeight": 11, "maxHeight": 11})
+    };
+    let v = run_vars(&fx.schema, COINBASE_OP, vars(Some(true))).await;
+    assert!(v.get("errors").is_none(), "{v}");
+    let t = &v["data"]["transactions"];
+    let edges = t["edges"].as_array().unwrap();
+    let users = &fx.rks[&(0, 11)];
+    assert_eq!(edges.len(), 1 + users.len(), "{t}");
+    assert_eq!(t["totalCount"], json!(1 + users.len()));
+    let cb = &edges[users.len()]["node"];
+    assert_eq!(
+        cb,
+        &json!({
+            "hash": b64url_encode(&hash_of(0xCB, 0, 11)),
+            "cmd": {
+                "meta": {"gasLimit": "0", "chainId": 0,
+                         "creationTime": "2023-11-14T22:18:50.000Z",
+                         "gasPrice": "0", "sender": "coinbase"},
+                "payload": {"code": "{}"}
+            },
+            "result": {"badResult": null, "gas": "0",
+                       "block": {"height": 11, "canonical": true}}
+        })
+    );
+    // The user txs come first, in reverse node order, unchanged.
+    let hashes: Vec<&str> = edges[..users.len()]
+        .iter()
+        .map(|e| e["node"]["hash"].as_str().unwrap())
+        .collect();
+    let mut want: Vec<&str> = users.iter().map(String::as_str).collect();
+    want.reverse();
+    assert_eq!(hashes, want);
+
+    for cb in [Some(false), None] {
+        let v = run_vars(&fx.schema, COINBASE_OP, vars(cb)).await;
+        assert!(v.get("errors").is_none(), "{v}");
+        let t = &v["data"]["transactions"];
+        assert_eq!(t["edges"].as_array().unwrap().len(), users.len(), "{t}");
+        assert_eq!(t["totalCount"], json!(users.len()));
+    }
+}
+
+/// A coinbase `Transaction`'s other fields: stock's defaults for a tx with no command
+/// (`transaction-schema-validator.ts`): no signers or sigs, empty nonce, the network id,
+/// data `{}`, ttl 0; its result is the stored coinbase output.
+#[tokio::test]
+async fn a_listed_coinbase_has_stock_s_command_defaults() {
+    let fx = fixture();
+    // A list of one block is in node order: the coinbase first.
+    let q = r#"{ transactions(isCoinbase: true, blockHash: "BH", first: 1) {
+        edges { node { sigs { sig } cmd { nonce networkId signers { pubkey }
+          meta { ttl } payload { ... on ExecutionPayload { data } } }
+          result { ... on TransactionResult { goodResult eventCount
+            events { edges { node { qualifiedName } } } } } } } } }"#;
+    let v = run(&fx.schema, &q.replace("BH", &block_hash(1, 9))).await;
+    assert_eq!(
+        v["transactions"]["edges"][0]["node"],
+        json!({"sigs": [],
+               "cmd": {"nonce": "", "networkId": "mainnet01", "signers": [],
+                       "meta": {"ttl": "0"}, "payload": {"data": "{}"}},
+               "result": {"goodResult": "\"ok\"", "eventCount": 1,
+                          "events": {"edges": [{"node": {"qualifiedName": "coin.COINBASE"}}]}}})
+    );
+}
+
+/// Request keys of the G4 replay corpus (gql.transaction:1000002 and :1000003): the
+/// base64-wrapped coinbase keys stock lists as `hash` (60 characters: a JSON-quoted hash
+/// text; 58: a bare one). Neither decodes to a 32-byte hash.
+const WRAPPED_RKS: [&str; 2] = [
+    "ImZBSmFxWUlGYlhqU1RVUllQOWNrdEFnczFxUl8zbHhPREsxUEFPOHZjcUki",
+    "NHloUkNldlQ2TDQxX01oY2k1VWhHWVRxRmxOWFpWR1VycXQyR2VYcGJEYw",
+];
+
+/// G4 class 2: a request key that is no hash finds nothing, as in stock (its lookups compare
+/// the text with the stored key): `transaction` answers `null` and the lists by request key
+/// answer no rows, all without an error (stock: `{"transaction": null}`, 17,227 real
+/// requests). Other argument checks still refuse.
+#[tokio::test]
+async fn a_request_key_that_is_no_hash_finds_nothing_without_an_error() {
+    let fx = fixture();
+    let one = "query T($requestKey: String!) { transaction(requestKey: $requestKey) { hash } }";
+    for rk in WRAPPED_RKS
+        .iter()
+        .copied()
+        .chain(["short", "", &"A".repeat(200)])
+    {
+        let v = run_vars(&fx.schema, one, json!({"requestKey": rk})).await;
+        assert_eq!(v, json!({"data": {"transaction": null}}), "{rk}");
+        for q in [
+            "transactions(requestKey: $rk) { totalCount edges { node { hash } } }",
+            "transfers(requestKey: $rk) { totalCount edges { node { amount } } }",
+            "events(qualifiedEventName: \"coin.TRANSFER\", requestKey: $rk) \
+             { totalCount edges { node { requestKey } } }",
+        ] {
+            let field = &q[..q.find('(').unwrap()];
+            let v = run_vars(
+                &fx.schema,
+                &format!("query L($rk: String) {{ {q} }}"),
+                json!({"rk": rk}),
+            )
+            .await;
+            assert_eq!(
+                v,
+                json!({"data": {field: {"totalCount": 0, "edges": []}}}),
+                "{field} {rk}"
+            );
+        }
+    }
+    // A malformed `blockHash` beside it is still refused, as before.
+    let v = run_vars(
+        &fx.schema,
+        "query T($rk: String!) { transaction(requestKey: $rk, blockHash: \"x\") { hash } }",
+        json!({"rk": WRAPPED_RKS[0]}),
+    )
+    .await;
+    assert!(
+        v["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("blockHash"),
+        "{v}"
+    );
 }
