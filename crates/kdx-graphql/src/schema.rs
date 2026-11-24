@@ -450,13 +450,25 @@ impl Query {
         ctx: &Context<'_>,
         module_name: String,
     ) -> Result<Option<Decimal>> {
-        // No token name is longer; the table scan stays bounded either way.
-        if module_name.len() > 512 {
+        // The pattern is user-controlled and the table scan costs work: a heavy read (so it
+        // cannot exhaust the general pool), a pattern capped in length and wildcards, and the
+        // request deadline checked inside the scan (`kdx_hot::prices::lookup_checked`).
+        if module_name.len() > kdx_hot::prices::MAX_LIKE_PATTERN {
             return Ok(None);
         }
         let row = crate::gql(ctx)
             .state()?
-            .read(move |view| Ok(kdx_hot::prices::lookup(&view.txn, &module_name)?))
+            .read_heavy(move |view| {
+                let found = kdx_hot::prices::lookup_checked(&view.txn, &module_name, &mut || {
+                    view.check_deadline()?;
+                    Ok(())
+                });
+                match found {
+                    Ok(row) => Ok(row),
+                    // The deadline passed inside the scan: answer it as every read does.
+                    Err(e) => view.check_deadline().and(Err(e.into())),
+                }
+            })
             .await
             .map_err(crate::error::from_api)?;
         Ok(row

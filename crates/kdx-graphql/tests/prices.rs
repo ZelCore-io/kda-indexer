@@ -106,8 +106,8 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
 
     // free.wiza: the tx is an arbitrage (kaddex.exchange swap-exact-in, then
     // n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange swap-exact-in); its result is
-    // the second, untrusted DEX's swap, which no trusted SWAP event backs. Stock priced it.
-    assert_eq!(unauthenticated, ["free.wiza"]);
+    // the sushi hop, which the trusted sushi SWAP event backs. Every row authenticates.
+    assert!(unauthenticated.is_empty(), "{unauthenticated:?}");
     let (mut compared, mut matched, mut priced) = (0, 0, 0);
     let mut differ: Vec<&str> = Vec::new();
     for r in &rows {
@@ -132,8 +132,8 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
     eprintln!(
         "lastTokenPriceInKda: {priced} of 49 priced; {matched} of {compared} stock answers matched"
     );
-    assert_eq!((compared, matched), (14, 13));
-    assert_eq!(differ, ["free.wiza"]);
+    assert_eq!((compared, matched), (14, 14));
+    assert!(differ.is_empty(), "{differ:?}");
 
     // Stock's LIKE: `_` is a wildcard and a part of a name matches; no match is null.
     let v = ask(&app, "kaddex_kdx").await;

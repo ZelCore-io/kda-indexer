@@ -10,18 +10,24 @@
 //!
 //! What we keep instead of scanning every result (rulings in `docs/graphql.md`):
 //! - a **swap** is a successful tx with a [`DEX_SWAP_EVENTS`] event (Kaddex/eckoDEX
-//!   `kaddex.exchange.SWAP`, KDSwap `kdlaunch.kdswap-exchange.SWAP`) whose `result.data` is a
+//!   `kaddex.exchange.SWAP`, KDSwap `kdlaunch.kdswap-exchange.SWAP`, Sushi
+//!   `n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.SWAP`) whose `result.data` is a
 //!   list where elements 0 and 1 equal one such event's `(token-in, in)` and `(token-out, out)`
 //!   (tokens by the module reference's qualified name, amounts as numbers). The result is
 //!   written by the sender, the event only by the DEX module, so the event authenticates the
-//!   legs (fix round 1 of PR #31);
-//! - one row per (chain, token) for every string `token` in the list that a trusted SWAP event
-//!   of the tx also names (a routed swap names 3+ tokens; stock matches all of them by text):
-//!   the swap's order key and elements 0 and 1;
+//!   legs (fix round 1 of PR #31). Exactly one leg must be `coin`: a token-to-token swap has
+//!   no price in KDA and stores nothing;
+//! - one row per (chain, token) for the non-`coin` token and for every further string `token`
+//!   in the list that a trusted SWAP event of the tx names on a hop with a `coin` side (a
+//!   routed swap names 3+ tokens; stock matches all of them by text): the swap's order key and
+//!   elements 0 and 1. `coin` itself is never a key;
 //! - order key `(meta.creationTime, height, chain, position)`, newest wins;
 //! - a lookup matches `moduleName` against the stored token names as stock's `LIKE` pattern
-//!   (`%` and `_` wildcards, `\` escape) and takes the newest matching row; it reads at most
-//!   [`LIKE_SCAN_ROWS`] rows, and on a larger table reads the exact name on each chain.
+//!   (`%` and `_` wildcards, `\` escape) and takes the newest matching row. It is bounded:
+//!   a pattern over [`MAX_LIKE_PATTERN`] bytes or with more than [`MAX_LIKE_WILDCARDS`]
+//!   wildcards matches nothing; it reads at most [`LIKE_SCAN_ROWS`] rows and does at most
+//!   [`LIKE_WORK_CELLS`] of matching work over the whole lookup, and past either reads the exact
+//!   name on each chain; the caller's deadline is checked inside the scan.
 //!
 //! | Table | Key | Value |
 //! |---|---|---|
@@ -58,8 +64,16 @@ pub fn row_key(chain: u8, token: &str) -> Vec<u8> {
 }
 
 /// The DEX swap events we trust (security review: swap events are written by anyone's
-/// module, so only these exchanges feed `TokenSwaps`). Kaddex/eckoDEX and KDSwap.
-pub const DEX_SWAP_EVENTS: &[&str] = &["kaddex.exchange.SWAP", "kdlaunch.kdswap-exchange.SWAP"];
+/// module, so only these exchanges feed `TokenSwaps`). Kaddex/eckoDEX, KDSwap and the
+/// namespaced Sushi exchange (`n_` principal namespace; Pact lets only that module emit events
+/// under its name, so trust is scoped to that one module).
+pub const DEX_SWAP_EVENTS: &[&str] = &[
+    "kaddex.exchange.SWAP",
+    "kdlaunch.kdswap-exchange.SWAP",
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.SWAP",
+];
+/// The KDA token.
+const COIN: &str = "coin";
 /// Longest token name stored (longer names are skipped; Pact module names are far shorter).
 pub const MAX_TOKEN_LEN: usize = 256;
 /// Most tokens one swap may update (a routed swap names one per hop).
@@ -217,6 +231,11 @@ pub fn swap_of(key: TxKey, ctime: u64, data: &Value, swap_events: &[Value]) -> O
     let (t0, t1) = (token_of(e0)?, token_of(e1)?);
     let (a0, a1) = (e0.get("amount")?, e1.get("amount")?);
     let (d0, d1) = (amount_of(a0)?, amount_of(a1)?);
+    // Only a KDA pair has a price in KDA: exactly one leg is `coin`; the row is keyed under the
+    // other token. A token-to-token swap would otherwise store a nonsense price.
+    if (t0 == COIN) == (t1 == COIN) {
+        return None;
+    }
     let authentic = hops.iter().any(|h| {
         h.token_in == t0
             && h.token_out == t1
@@ -226,9 +245,18 @@ pub fn swap_of(key: TxKey, ctime: u64, data: &Value, swap_events: &[Value]) -> O
     if !authentic {
         return None;
     }
-    let named = |t: &str| hops.iter().any(|h| h.token_in == t || h.token_out == t);
+    // A routed token needs a trusted hop that names it and has a `coin` side.
+    let named = |t: &str| {
+        hops.iter().any(|h| {
+            (h.token_in == t || h.token_out == t) && (h.token_in == COIN || h.token_out == COIN)
+        })
+    };
     let mut tokens: Vec<String> = Vec::new();
-    for t in list.iter().filter_map(token_of).filter(|t| named(t)) {
+    for t in list
+        .iter()
+        .filter_map(token_of)
+        .filter(|t| *t != COIN && named(t))
+    {
         if tokens.len() == MAX_TOKENS_PER_SWAP {
             break;
         }
@@ -327,88 +355,162 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
     Ok(n)
 }
 
+/// Longest `LIKE` pattern a lookup accepts (bytes); a longer one answers no match.
+pub const MAX_LIKE_PATTERN: usize = 256;
+/// Most `%` / `_` wildcards (unescaped) a pattern may hold; more answers no match.
+pub const MAX_LIKE_WILDCARDS: usize = 8;
+/// Matching work one lookup may do, in pattern-by-text cells summed over every row it tests;
+/// past it the lookup stops matching and reads the exact name on each chain instead.
+pub const LIKE_WORK_CELLS: u64 = 20_000_000;
+/// Rows between two deadline checks in the table scan.
+const DEADLINE_EVERY: usize = 256;
+
 /// The newest stored swap whose token matches `module` as stock's `LIKE '%module%'`.
 /// Bounded: reads at most [`LIKE_SCAN_ROWS`] + 1 rows; when the table is larger, only the
-/// exact name is looked up, with one point read per chain ([`MAX_CHAINS`]).
+/// exact name is looked up, with one point read per chain ([`MAX_CHAINS`]). The pattern is
+/// limited ([`MAX_LIKE_PATTERN`], [`MAX_LIKE_WILDCARDS`]) and the matching work of the whole
+/// lookup is capped ([`LIKE_WORK_CELLS`]).
 pub fn lookup(txn: &impl Txn, module: &str) -> Result<Option<SwapRow>> {
+    lookup_checked(txn, module, &mut || Ok(()))
+}
+
+/// [`lookup`] that calls `check` every [`DEADLINE_EVERY`] rows (the request deadline); an error
+/// from it ends the lookup with that error.
+pub fn lookup_checked(
+    txn: &impl Txn,
+    module: &str,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<SwapRow>> {
+    let Some(mut pattern) = LikePattern::new(module) else {
+        return Ok(None);
+    };
     let all = txn.scan_limit(Table::TokenSwaps, &[], LIKE_SCAN_ROWS + 1, |_| true)?;
     let mut best: Option<SwapRow> = None;
-    let mut keep = |v: &[u8]| {
+    fn keep(best: &mut Option<SwapRow>, v: &[u8]) {
         if let Some(row) = SwapRow::decode(v) {
             if best.as_ref().is_none_or(|b| row.order() > b.order()) {
-                best = Some(row);
+                *best = Some(row);
             }
         }
-    };
-    if all.len() <= LIKE_SCAN_ROWS {
+    }
+    let mut scanned = all.len() <= LIKE_SCAN_ROWS;
+    if scanned {
         // Keys are token ‖ chain, so one token's rows are adjacent: match each name once.
         let mut last: Option<(&[u8], bool)> = None;
-        for (k, v) in &all {
+        for (i, (k, v)) in all.iter().enumerate() {
+            if i % DEADLINE_EVERY == 0 {
+                check()?;
+            }
             let Some((_, token)) = k.split_last() else {
                 continue;
             };
             let hit = match last {
                 Some((t, hit)) if t == token => hit,
                 _ => {
-                    let hit = std::str::from_utf8(token).is_ok_and(|t| like_contains(t, module));
+                    if pattern.work > LIKE_WORK_CELLS {
+                        scanned = false;
+                        break;
+                    }
+                    let hit = std::str::from_utf8(token).is_ok_and(|t| pattern.matches(t));
                     last = Some((token, hit));
                     hit
                 }
             };
             if hit {
-                keep(v);
+                keep(&mut best, v);
             }
         }
-    } else if valid_token(module) {
-        for c in 0..MAX_CHAINS {
-            if let Some(v) = txn.get(Table::TokenSwaps, &row_key(c, module))? {
-                keep(&v);
+    }
+    if !scanned {
+        // A larger table, or the work cap: the exact name only (drop any partial scan result).
+        best = None;
+        if valid_token(module) {
+            for c in 0..MAX_CHAINS {
+                if let Some(v) = txn.get(Table::TokenSwaps, &row_key(c, module))? {
+                    keep(&mut best, &v);
+                }
             }
         }
     }
     Ok(best)
 }
 
-/// SQL `text LIKE '%' || pattern || '%'` (PostgreSQL: `%` any run, `_` one character,
-/// `\` escapes the next character; case-sensitive).
-pub fn like_contains(text: &str, pattern: &str) -> bool {
-    // Tokens: Some(c) a literal, None `_`; `%` splits; leading and trailing `%` are implied.
-    #[derive(Clone, Copy, PartialEq)]
-    enum P {
-        Lit(char),
-        One,
-        Any,
-    }
-    let mut p = vec![P::Any];
-    let mut it = pattern.chars();
-    while let Some(c) = it.next() {
-        p.push(match c {
-            '%' => P::Any,
-            '_' => P::One,
-            '\\' => P::Lit(it.next().unwrap_or('\\')),
-            c => P::Lit(c),
-        });
-    }
-    p.push(P::Any);
-    let t: Vec<char> = text.chars().collect();
-    // dp[j]: pattern prefix of length j matches the text prefix seen so far.
-    let mut dp = vec![false; p.len() + 1];
-    dp[0] = true;
-    for j in 1..=p.len() {
-        dp[j] = dp[j - 1] && p[j - 1] == P::Any;
-    }
-    for &c in &t {
-        let mut next = vec![false; p.len() + 1];
-        for j in 1..=p.len() {
-            next[j] = match p[j - 1] {
-                P::Any => next[j - 1] || dp[j],
-                P::One => dp[j - 1],
-                P::Lit(l) => dp[j - 1] && l == c,
-            };
+#[derive(Clone, Copy, PartialEq)]
+enum P {
+    Lit(char),
+    One,
+    Any,
+}
+
+/// A compiled SQL `text LIKE '%' || pattern || '%'` (PostgreSQL: `%` any run, `_` one
+/// character, `\` escapes the next character; case-sensitive). The two DP rows are reused for
+/// every text, and `work` counts the cells filled so far.
+struct LikePattern {
+    p: Vec<P>,
+    cur: Vec<bool>,
+    next: Vec<bool>,
+    work: u64,
+}
+
+impl LikePattern {
+    /// `None` when the pattern is longer than [`MAX_LIKE_PATTERN`] bytes or holds more than
+    /// [`MAX_LIKE_WILDCARDS`] unescaped wildcards.
+    fn new(pattern: &str) -> Option<LikePattern> {
+        if pattern.len() > MAX_LIKE_PATTERN {
+            return None;
         }
-        dp = next;
+        // Leading and trailing `%` are implied.
+        let mut p = vec![P::Any];
+        let mut wild = 0;
+        let mut it = pattern.chars();
+        while let Some(c) = it.next() {
+            p.push(match c {
+                '%' => P::Any,
+                '_' => P::One,
+                '\\' => P::Lit(it.next().unwrap_or('\\')),
+                c => P::Lit(c),
+            });
+            wild += usize::from(matches!(p.last(), Some(P::Any | P::One)));
+        }
+        if wild > MAX_LIKE_WILDCARDS {
+            return None;
+        }
+        p.push(P::Any);
+        let n = p.len() + 1;
+        Some(LikePattern {
+            p,
+            cur: vec![false; n],
+            next: vec![false; n],
+            work: 0,
+        })
     }
-    dp[p.len()]
+
+    fn matches(&mut self, text: &str) -> bool {
+        let n = self.p.len();
+        // cur[j]: pattern prefix of length j matches the text prefix seen so far.
+        self.cur[0] = true;
+        for j in 1..=n {
+            self.cur[j] = self.cur[j - 1] && self.p[j - 1] == P::Any;
+        }
+        for c in text.chars() {
+            self.work += n as u64;
+            self.next[0] = false;
+            for j in 1..=n {
+                self.next[j] = match self.p[j - 1] {
+                    P::Any => self.next[j - 1] || self.cur[j],
+                    P::One => self.cur[j - 1],
+                    P::Lit(l) => self.cur[j - 1] && l == c,
+                };
+            }
+            std::mem::swap(&mut self.cur, &mut self.next);
+        }
+        self.cur[n]
+    }
+}
+
+/// SQL `text LIKE '%' || pattern || '%'`; false for a pattern [`LikePattern::new`] refuses.
+pub fn like_contains(text: &str, pattern: &str) -> bool {
+    LikePattern::new(pattern).is_some_and(|mut p| p.matches(text))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -672,14 +774,15 @@ fn amount_of(a: &Value) -> Option<Dec> {
 }
 
 /// The stock answer for a stored swap: `kda / token` as `toFixed(12)` text, where `kda` is
-/// leg 0 when leg 0's token is `coin`, else leg 1. `None` when an amount is unreadable.
+/// the amount of the leg whose token is `coin`. `None` when neither leg is `coin` or an amount
+/// is unreadable.
 /// A zero token amount gives decimal.js's `Infinity` / `NaN` text, as stock sends.
 pub fn price_text(row: &SwapRow) -> Option<String> {
-    let first_is_kda = row.legs[0].0 == "coin";
-    let (kda, tok) = if first_is_kda {
-        (&row.legs[0].1, &row.legs[1].1)
-    } else {
-        (&row.legs[1].1, &row.legs[0].1)
+    let (kda, tok) = match (row.legs[0].0 == COIN, row.legs[1].0 == COIN) {
+        (true, false) => (&row.legs[0].1, &row.legs[1].1),
+        (false, true) => (&row.legs[1].1, &row.legs[0].1),
+        // Not a KDA pair (the ingest never stores one): no price.
+        _ => return None,
     };
     let (k, t) = (amount_dec(kda)?, amount_dec(tok)?);
     if t.is_zero() {
@@ -751,11 +854,9 @@ mod tests {
             price(("coin", "1"), ("free.t", "4")).as_deref(),
             Some("0.250000000000")
         );
-        // Neither leg is coin: leg 1 / leg 0, as stock.
-        assert_eq!(
-            price(("a.x", "2"), ("b.y", "3")).as_deref(),
-            Some("1.500000000000")
-        );
+        // Neither leg is coin (or both are): no price in KDA, whatever is stored.
+        assert_eq!(price(("a.x", "2"), ("b.y", "3")), None);
+        assert_eq!(price(("coin", "2"), ("coin", "3")), None);
     }
 
     #[test]
@@ -836,7 +937,8 @@ mod tests {
             ),
         ];
         let s = swap_of(k, 1764000000, &data, &evs).unwrap();
-        assert_eq!(s.tokens, ["runonflux.flux", "coin", "n_e5.kb-USDC"]);
+        // `coin` itself is never a key; the routed token has a trusted hop with a coin side.
+        assert_eq!(s.tokens, ["runonflux.flux", "n_e5.kb-USDC"]);
         assert_eq!(
             s.row,
             row(
@@ -848,7 +950,20 @@ mod tests {
         );
         // A token the events do not name is not stored (the first hop alone: no USDC row).
         let s = swap_of(k, 1764000000, &data, &evs[..1]).unwrap();
-        assert_eq!(s.tokens, ["runonflux.flux", "coin"]);
+        assert_eq!(s.tokens, ["runonflux.flux"]);
+        // A routed token named only by a hop without a coin side is not stored.
+        let mut via = evs.clone();
+        via[1] = ev("n_e5.kb-USDC", json!(3.444274), "free.other", json!(9));
+        let s = swap_of(k, 1764000000, &data, &via).unwrap();
+        assert_eq!(s.tokens, ["runonflux.flux"]);
+        // Token-to-token swap: not a KDA pair, nothing is stored.
+        let tt = [ev("free.a", json!(2), "free.b", json!(3))];
+        let ab = json!([{"token": "free.a", "amount": 2}, {"token": "free.b", "amount": 3}]);
+        assert_eq!(swap_of(k, 0, &ab, &tt), None);
+        // Neither is it when both legs are coin.
+        let cc = [ev("coin", json!(2), "coin", json!(3))];
+        let both = json!([{"token": "coin", "amount": 2}, {"token": "coin", "amount": 3}]);
+        assert_eq!(swap_of(k, 0, &both, &cc), None);
         // Amounts compare as numbers: a `{"decimal"}` leg matches the same number.
         let s = swap_of(
             k,
@@ -966,18 +1081,10 @@ mod tests {
         assert!(valid_token(
             "n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC"
         ));
-        let many: Vec<Value> = (0..50)
-            .map(|i| json!({"token": format!("free.t{i}"), "amount": 1}))
-            .collect();
+        let mut many = vec![json!({"token": "coin", "amount": 1})];
+        many.extend((0..49).map(|i| json!({"token": format!("free.t{i}"), "amount": 1})));
         let evs: Vec<Value> = (0..49)
-            .map(|i| {
-                ev(
-                    &format!("free.t{i}"),
-                    json!(1),
-                    &format!("free.t{}", i + 1),
-                    json!(1),
-                )
-            })
+            .map(|i| ev("coin", json!(1), &format!("free.t{i}"), json!(1)))
             .collect();
         let s = swap_of(k, 0, &Value::Array(many), &evs).unwrap();
         assert_eq!(s.tokens.len(), MAX_TOKENS_PER_SWAP);
@@ -1007,7 +1114,7 @@ mod tests {
             {"token": "free.victim", "amount": 1}
         ]);
         let s = swap_of(k, 0, &honest, &genuine).unwrap();
-        assert_eq!(s.tokens, ["coin", "kaddex.kdx"]);
+        assert_eq!(s.tokens, ["kaddex.kdx"]);
         // Through a stored tx: only trusted DEX events count.
         use kdx_types::DictMut;
         let mut dict = kdx_types::MemDict::default();
@@ -1024,10 +1131,7 @@ mod tests {
             ..Default::default()
         };
         let r = rec(&mut dict, "kaddex.exchange.SWAP", &honest);
-        assert_eq!(
-            swap_of_tx(&dict, &r).unwrap().tokens,
-            ["coin", "kaddex.kdx"]
-        );
+        assert_eq!(swap_of_tx(&dict, &r).unwrap().tokens, ["kaddex.kdx"]);
         let r = rec(&mut dict, "free.fake-dex.SWAP", &honest);
         assert_eq!(swap_of_tx(&dict, &r), None);
         let crafted =
@@ -1082,6 +1186,68 @@ mod tests {
         );
         // A name a Pact module cannot have is not looked up.
         assert_eq!(lookup(&txn, "free.tok000007\n").unwrap(), None);
+    }
+
+    /// PR #31 review: the `LIKE` pattern is user input. A long pattern, many wildcards or a
+    /// lookup past its work cap cannot burn the scan; the deadline check runs inside it.
+    #[test]
+    fn like_lookup_is_bounded() {
+        // Pattern limits: answered as no match.
+        assert!(like_contains("free.tok", "free.tok"));
+        assert!(!like_contains("a", &"a".repeat(MAX_LIKE_PATTERN + 1)));
+        assert!(like_contains("a", &"%".repeat(MAX_LIKE_WILDCARDS)));
+        assert!(!like_contains("a", &"%".repeat(MAX_LIKE_WILDCARDS + 1)));
+        assert!(!like_contains("a", &"_".repeat(MAX_LIKE_WILDCARDS + 1)));
+        // An escaped wildcard is a literal and does not count.
+        assert!(like_contains("a_b", "\\_"));
+        assert!(LikePattern::new(&"\\%".repeat(MAX_LIKE_WILDCARDS + 1)).is_some());
+        // The DP rows are reused: many texts, one allocation, work counted across all of them.
+        let mut p = LikePattern::new("a_c").unwrap();
+        assert!(p.matches("xabcx") && !p.matches("xac") && p.matches("abc"));
+        assert_eq!(p.work, (5 + 3 + 3) * 5);
+
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        for i in 0..3000u32 {
+            let name = format!("free.{}{i:06}", "t".repeat(200));
+            let s = Swap {
+                row: row(1, TxKey::new(i + 1, 0, 1), ("coin", "1"), (&name, "2")),
+                tokens: vec![name],
+            };
+            upsert(&mut txn, 0, &s, None).unwrap();
+        }
+        // An over-long pattern or too many wildcards: null, without reading the table.
+        let mut calls = 0;
+        let long = "t".repeat(MAX_LIKE_PATTERN + 1);
+        assert_eq!(
+            lookup_checked(&txn, &long, &mut || {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap(),
+            None
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(lookup(&txn, "%%%%%%%%%").unwrap(), None);
+        // The deadline is checked inside the scan (every DEADLINE_EVERY rows) and its error
+        // ends the lookup.
+        let mut calls = 0;
+        let r = lookup_checked(&txn, "free.t", &mut || {
+            calls += 1;
+            anyhow::ensure!(calls < 3, "deadline");
+            Ok(())
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 3);
+        // Work cap: 3000 names of 207 chars against a 200-char pattern with a wildcard cost
+        // past LIKE_WORK_CELLS, so the lookup falls back to the exact name (here a miss) rather
+        // than finishing the scan.
+        let pat = format!("{}%x", "t".repeat(198));
+        assert_eq!(lookup(&txn, &pat).unwrap(), None);
+        // A cheap pattern still scans everything: the newest of the matches wins.
+        let got = lookup(&txn, "free.ttt").unwrap().unwrap();
+        assert_eq!(got.key.height(), 3000);
     }
 
     #[test]

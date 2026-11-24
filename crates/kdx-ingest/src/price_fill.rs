@@ -239,7 +239,8 @@ mod tests {
         txn.commit().unwrap();
 
         let rep = run(&hot, &segdir, &|| false).unwrap();
-        assert_eq!((rep.hot_txs, rep.swaps, rep.rows), (2, 2, 4));
+        // One row per swap: the non-coin token (`coin` is never a key).
+        assert_eq!((rep.hot_txs, rep.swaps, rep.rows), (2, 2, 2));
         assert!(filled(&hot.ro().unwrap()).unwrap());
         let row = prices::lookup(&hot.ro().unwrap(), "free.t")
             .unwrap()

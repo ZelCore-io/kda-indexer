@@ -601,33 +601,52 @@ gives `"Infinity"` or `"NaN"`, as stock does.
 
 We keep the newest swap per chain and token in the hot table `TokenSwaps`
 ([format.md](format.md)) instead of scanning every result. A swap is a successful tx that
-emits a trusted DEX swap event (Kaddex/eckoDEX `kaddex.exchange.SWAP` or KDSwap
-`kdlaunch.kdswap-exchange.SWAP`, params `[sender, receiver, in, token-in, out, token-out]`)
+emits a trusted DEX swap event (Kaddex/eckoDEX `kaddex.exchange.SWAP`, KDSwap
+`kdlaunch.kdswap-exchange.SWAP` or Sushi
+`n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.SWAP`, params
+`[sender, receiver, in, token-in, out, token-out]`)
 and whose `result.data` elements 0 and 1 equal one of those events' `(token-in, in)` and
 `(token-out, out)`: tokens compared by the module reference's qualified name, amounts as
 numbers. The result is the value of the tx's last expression, which the sender writes; the
 event can only be emitted by the DEX module, so it is what authenticates the two legs. Token
 names must be valid Pact qualified names (at most 256 bytes, ASCII letters, digits and
-`%#+-_&$@<>=^?*!|/~.`). Each further token of the list (at most 8) gets the swap only when a
-trusted SWAP event of the same tx names it: a routed swap names three or more tokens, one per
-hop, and stock matches all of them by text. The tail keeps the
+`%#+-_&$@<>=^?*!|/~.`). Exactly one of the two legs must be `coin`, and the row is keyed under
+the other token: a token-to-token swap has no price in KDA and stores nothing, and `coin` is
+never a key. Each further token of the list (at most 8) gets the swap only when a trusted SWAP
+event of the same tx names it on a hop with a `coin` side: a routed swap names three or more
+tokens, one per hop, and stock matches all of them by text.
+Sushi is trusted because it is a live DEX with the same event layout, and Pact lets only that
+module emit events under its name, so trust stays scoped to that one namespaced module. It is
+needed for parity: a tx such as the newest `free.wiza` arbitrage (a Kaddex hop, then a Sushi
+hop) has the Sushi hop as its result, which only the Sushi event backs. The tail keeps the
 table current, and a one-off fill reads the history ([operations.md](operations.md#token-swaps)).
 A lookup applies stock's `LIKE` pattern (`%` and `_` wildcards, `\` escape, case-sensitive) to
 the stored token names and takes the newest match by (`meta.creationTime`, height, chain,
-position). A lookup reads at most 20,000 rows; on a larger table it matches the exact name
-only, with one point read per chain (20). Amounts with more than 80 significant digits or an
+position). The pattern is user input, so the lookup is bounded: a pattern longer than 256
+bytes, or with more than 8 unescaped wildcards, answers `null`; it reads at most 20,000 rows;
+the matching work of the whole lookup (not per row) is capped, and past the row or work cap
+the lookup matches the exact name only, with one point read per chain (20); the request
+deadline is checked inside the scan. The resolver runs as a heavy read, so it shares the
+heavy-read slots and cannot exhaust the general read pool. Amounts with more than 80 significant digits or an
 exponent beyond ±1000, and prices with more than 400 integer digits, answer `null`.
 
 Rulings, where stock's text scan cannot be kept exactly:
 
 - **Trusted DEXes only, legs checked against their events.** Stock reads the price from any
   result text, which the tx sender writes, so anyone could set a price. We count a swap only
-  when the result's first two legs repeat a Kaddex/eckoDEX or KDSwap `SWAP` event of the same
-  tx (event names are namespaced by the emitting module, and only that module can emit them).
-  Adding a DEX is a code change (`DEX_SWAP_EVENTS`). One of the 14 recorded stock answers
-  differs: `free.wiza`'s newest swap tx was an arbitrage whose result is a second swap on
-  `n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange`, a DEX we do not trust; we
-  answer from the newest trusted swap instead.
+  when the result's first two legs repeat a `SWAP` event of the same tx from one of three
+  trusted modules: Kaddex/eckoDEX (`kaddex.exchange`), KDSwap (`kdlaunch.kdswap-exchange`) and
+  Sushi (`n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange`). Event names are
+  namespaced by the emitting module, and only that module can emit them. Sushi is included
+  because it is a live DEX with the same event layout and the newest `free.wiza` swap tx is an
+  arbitrage (a Kaddex hop, then a Sushi hop) whose result is the Sushi hop; without it we could
+  not match stock there. Trust is scoped to that one namespaced module. Adding a DEX is a code
+  change (`DEX_SWAP_EVENTS`).
+- **Only KDA pairs.** Stock treats element 1 as KDA when element 0 is not `coin`, so a
+  token-to-token swap gets a nonsense price. We store a swap only when exactly one of its two
+  legs is `coin`, keyed under the other token (and under routed tokens named on a trusted hop
+  with a `coin` side); any other swap stores nothing, and a stored row with no `coin` leg
+  answers `null`.
 - **A genuine swap can still move the price.** The answer is the last trade, as in stock; a
   trade in a thin pool on a trusted DEX sets it like any other.
 - **Swaps only.** Stock matches any result text. If a newer non-swap tx mentions the module
@@ -644,9 +663,9 @@ Rulings, where stock's text scan cannot be kept exactly:
   swap's price, as stock's text match would when that swap is the newest matching tx.
 
 Checked against the 2026-11-24 G4 replay: stock answered 14 of the 49 distinct corpus requests
-(the other 35 timed out at its load balancer). We match 13 to the last digit; `free.wiza` is
-the untrusted-DEX case above (`crates/kdx-graphql/tests/prices.rs`, with the newest swaps and
-their SWAP events read from mainnet in `tests/data/token-swaps-2026-11-24.jsonl`).
+(the other 35 timed out at its load balancer). We match all 14 to the last digit, `free.wiza` included through the Sushi event
+(`crates/kdx-graphql/tests/prices.rs`, with the newest swaps and their SWAP events read from
+mainnet in `tests/data/token-swaps-2026-11-24.jsonl`); all 14 are `coin` pairs.
 
 ## Fields compared with the node, not an oracle
 
