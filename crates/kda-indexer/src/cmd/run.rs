@@ -410,6 +410,32 @@ async fn follow(
         search,
         search_stop.clone(),
     ));
+    // `lastTokenPriceInKda`: the one-off swap history fill (resumable; new blocks update the
+    // table themselves). Its errors are logged; ingest goes on without it.
+    let price_stop = token.child_token();
+    {
+        let (c, s) = (ctx.clone(), price_stop.clone());
+        tokio::spawn(async move {
+            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                if kdx_ingest::price_fill::filled(&c.hot.ro()?)? {
+                    return Ok(());
+                }
+                tracing::info!("prices: swap history fill");
+                let rep = kdx_ingest::price_fill::run(&c.hot, &c.segdir, &|| s.is_cancelled())?;
+                tracing::info!(report = %serde_json::to_string(&rep)?, "prices: fill pass ended");
+                Ok(())
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!(
+                    error = format!("{e:#}"),
+                    "prices: fill failed; restart resumes it"
+                ),
+                Err(e) => tracing::error!(error = %e, "prices: fill task"),
+            }
+        });
+    }
     // Stage 8: balance seed (when absent) and `/local` reconciler (B-5). Its errors are
     // logged; ingest goes on without it.
     let bal_stop = token.child_token();
@@ -470,6 +496,7 @@ async fn follow(
         }
         None => tail.await?,
     };
+    price_stop.cancel();
     search_stop.cancel();
     if let Err(e) = search.await.map_err(anyhow::Error::from).and_then(|x| x) {
         tracing::error!(error = format!("{e:#}"), "search stage");

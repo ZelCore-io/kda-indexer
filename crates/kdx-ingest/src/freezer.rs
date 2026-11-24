@@ -126,6 +126,10 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
                 Table::Meta,
                 kdx_hot::balances::d3_undo_key(c, b.height as u32).as_bytes(),
             )?;
+            txn.del(
+                Table::Meta,
+                kdx_hot::prices::undo_key(c, b.height as u32).as_bytes(),
+            )?;
             n += 1;
         }
     }

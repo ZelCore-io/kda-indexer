@@ -28,10 +28,12 @@ use crate::run::{Ctx, Outcome};
 use crate::target::Target;
 
 /// Root fields the adapter answers with `NOT_SUPPORTED` (spec section 5.3; plan Q9).
-pub const NOT_SUPPORTED_ROOTS: &[&str] = &["pactQuery", "lastTokenPriceInKda", "gasLimitEstimate"];
+pub const NOT_SUPPORTED_ROOTS: &[&str] = &["pactQuery", "gasLimitEstimate"];
 /// Root fields whose answer depends on the current tip: never sent to the oracle (GQ-16).
 const TIP_ROOTS: &[&str] = &[
     "lastBlockHeight",
+    // The newest swap so far (served since 2026-11-24).
+    "lastTokenPriceInKda",
     "networkInfo",
     "completedBlockHeights",
     "blocksFromDepth",
@@ -4010,6 +4012,7 @@ mod tests {
             doc("TipDoc", "query Query { lastBlockHeight }"),
             doc("SubDoc", "subscription NewBlocks($quantity: Int) { newBlocks(quantity: $quantity) { hash } }"),
             doc("PriceDoc", "query Query($moduleName: String!) { lastTokenPriceInKda(moduleName: $moduleName) }"),
+            doc("PactDoc", "query PactQuery($code: String!) { pactQuery(pactQuery: {code: $code}) { result } }"),
             doc("BlockDoc", "query Block($hash: String!) { block(hash: $hash) { hash } }"),
             parse_op("QLastBlockHeight", "query { lastBlockHeight }", false).unwrap(),
         ];
@@ -4018,13 +4021,18 @@ mod tests {
             u.iter()
                 .map(|(s, k)| format!("{s}={k}"))
                 .collect::<Vec<_>>(),
-            ["PriceDoc=unsupported", "SubDoc=subscription", "TipDoc=tip"]
+            [
+                "PactDoc=unsupported",
+                "PriceDoc=tip",
+                "SubDoc=subscription",
+                "TipDoc=tip"
+            ]
         );
         let text = crate::summary::render_unpaired(&u);
-        assert!(text.contains("never paired: 3"), "{text}");
-        assert!(text.contains("  tip (1): TipDoc\n"), "{text}");
+        assert!(text.contains("never paired: 4"), "{text}");
+        assert!(text.contains("  tip (2): PriceDoc TipDoc\n"), "{text}");
         assert!(text.contains("  subscription (1): SubDoc\n"), "{text}");
-        assert!(text.contains("  unsupported (1): PriceDoc\n"), "{text}");
+        assert!(text.contains("  unsupported (1): PactDoc\n"), "{text}");
     }
 
     #[test]

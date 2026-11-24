@@ -580,11 +580,54 @@ relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `Strin
 | `transactionsByPactCode(pactCode, first/after): QueryTransactionsByPactCodeConnection!` | txs whose own exec code contains `pactCode` (`%`/`_` wildcards), newest first, through the `/txs/search` engine: its pattern checks, per-client search gate, code index or bounded newest-first scan, caps and time budget. Rows are `TransactionSummary {requestKey height chainId canonical creationTime badResult sender gas gasLimit gasPrice code}`. Forward paging only (`last`/`before`: `BAD_USER_INPUT`). The search gate counts per client
 address (HTTP, or the websocket's accepted connection); an operation without a known address
 is refused (`LIMIT`). A page the search cut short carries `"extensions": {"searchTruncated": true}` and `pageInfo.endCursor` resumes it. `NOT_SUPPORTED` when the server has no search context |
-| `lastTokenPriceInKda(moduleName): Decimal` | `NOT_SUPPORTED`: no price data |
+| `lastTokenPriceInKda(moduleName): Decimal` | the price in KDA of the newest DEX swap that names `moduleName`, as stock computes it (see [Token price](#token-price)); `null` when no stored swap matches |
 | `Subscription.newBlocks(quantity: Int)` | at most `quantity` (1 to 1,000; above it the `page` refusal) blocks per message, the newest of the batch; absent keeps Kadena's behaviour |
 | `Subscription.transactions(quantity: Int = 20): [Transaction!]` | the user txs of newly committed blocks on every chain, newest first, at most `quantity` (1 to 1,000; above it the `page` refusal) per message; a message per feed batch that has any |
 
 `pactQuery` stays `NOT_SUPPORTED`.
+
+### Token price
+
+`lastTokenPriceInKda(moduleName)` follows stock (indexer-kadena `90a4be1`,
+`last-token-price-in-kda-resolver.ts`). Stock takes the newest transaction
+(`ORDER BY creationtime DESC, id DESC`) whose result text contains `moduleName`
+(`LIKE '%' || moduleName || '%'`). When `result.data[0].token` and `result.data[1].token` are
+set, it answers `kda / token`: `kda` is the amount of element 0 if element 0's token is `coin`,
+otherwise the amount of element 1, and `token` is the other one. Otherwise it answers `null`.
+The division is decimal.js `div` (20 significant digits, half up) and then `toFixed(12)` (half
+up), sent as a string with its trailing zeros (`"0.042190643290"`). A JSON-number amount goes
+through a JavaScript double first; a `{"decimal": "..."}` amount is exact. A zero token amount
+gives `"Infinity"` or `"NaN"`, as stock does.
+
+We keep the newest swap per chain and token in the hot table `TokenSwaps`
+([format.md](format.md)) instead of scanning every result. A swap is a successful tx that
+emits an event named `*.SWAP` (Kaddex/eckoDEX `kaddex.exchange.SWAP`, KDSwap
+`kdlaunch.kdswap-exchange.SWAP`, any fork) and whose `result.data` is a list with a non-empty
+string `token` in elements 0 and 1. Each string `token` of the list gets the swap (a routed
+swap names three or more tokens, and stock matches all of them by text). The tail keeps the
+table current, and a one-off fill reads the history ([operations.md](operations.md#token-swaps)).
+A lookup applies stock's `LIKE` pattern (`%` and `_` wildcards, `\` escape, case-sensitive) to
+the stored token names and takes the newest match by (`meta.creationTime`, height, chain,
+position).
+
+Rulings, where stock's text scan cannot be kept exactly:
+
+- **Swaps only.** Stock matches any result text. If a newer non-swap tx mentions the module
+  (a failed swap's error, a `create-pair` result), stock answers `null` and we answer the
+  last swap's price. Our answer is the more useful one, and stock's full-table scan timed out on
+  35 of the 49 corpus requests.
+- **Tie order.** Stock breaks equal `creationtime` values by its row id (insertion order). We
+  use height, then chain, then position.
+- **Canonical blocks only.** Stock keeps orphaned blocks' txs in its scan; we do not.
+- **Unreadable amounts.** An amount decimal.js would refuse (an object such as `{"int": 5}`)
+  makes stock fail the request; we answer `null`.
+- **`coin` gets no special case.** It matches every swap with KDA, so it answers the newest
+  swap's price, as stock's text match would when that swap is the newest matching tx.
+
+Checked against the 2026-11-24 G4 replay: stock answered 14 of the 49 distinct corpus requests
+(the other 35 timed out at its load balancer). We match all 14 to the last digit
+(`crates/kdx-graphql/tests/prices.rs`, with the newest swaps read from mainnet in
+`tests/data/token-swaps-2026-11-24.jsonl`).
 
 ## Fields compared with the node, not an oracle
 

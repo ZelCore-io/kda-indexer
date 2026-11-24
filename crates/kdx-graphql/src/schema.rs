@@ -442,9 +442,27 @@ impl Query {
         .await
     }
 
-    /// ZelCore extension, not served: the indexer keeps no price data.
-    async fn last_token_price_in_kda(&self, module_name: String) -> Result<Option<Decimal>> {
-        unserved!("Query.lastTokenPriceInKda")
+    /// The price in KDA of the newest DEX swap that names `moduleName` (stock semantics:
+    /// `LIKE '%moduleName%'` over the swap's tokens, `kda / token` as `toFixed(12)` text;
+    /// `kdx_hot::prices`). Null when no stored swap matches.
+    async fn last_token_price_in_kda(
+        &self,
+        ctx: &Context<'_>,
+        module_name: String,
+    ) -> Result<Option<Decimal>> {
+        // No token name is longer; the table scan stays bounded either way.
+        if module_name.len() > 512 {
+            return Ok(None);
+        }
+        let row = crate::gql(ctx)
+            .state()?
+            .read(move |view| Ok(kdx_hot::prices::lookup(&view.txn, &module_name)?))
+            .await
+            .map_err(crate::error::from_api)?;
+        Ok(row
+            .as_ref()
+            .and_then(kdx_hot::prices::price_text)
+            .map(Decimal::verbatim))
     }
 
     async fn transactions_by_public_key(

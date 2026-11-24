@@ -906,6 +906,34 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 
+### Token swaps
+
+`TokenSwaps` holds the newest DEX swap per chain and token, for GraphQL `lastTokenPriceInKda`
+([graphql.md](graphql.md#token-price)). The tail updates it with every block and undoes its
+rows on a reorg. History comes from a one-off fill that `run` starts in the background when
+`Meta price_filled` is missing, on the first start of a binary with this table:
+
+- It walks the `evt` postings of every `*.SWAP` event name (hot tail first, then the segments,
+  oldest first) and reads only stored records: no node calls and no resync.
+- It writes in batches of 500 txs, one write txn each, and stores its segment position
+  (`Meta price_fill_txnum`) with every batch. A stop (shutdown, crash) loses at most one batch.
+  The next `run` redoes the small hot pass and resumes the segments after that position.
+- Replaying a swap writes nothing (a row only moves to a newer swap), so a resumed or repeated
+  fill is safe.
+- Logs: `prices: swap history fill` at start; `prices: fill pass ended` with a JSON report
+  (`event_names`, `hot_txs`, `frozen_txs`, `resumed_after`, `swaps`, `rows`, `filled_height`,
+  `stopped`, `secs`); `prices: fill failed; restart resumes it` on an error. Ingest and the
+  APIs run meanwhile.
+- Until the fill ends, `lastTokenPriceInKda` answers from the swaps stored so far: the newest
+  ones (from the tail) appear first, and a token whose last swap is old answers `null` until
+  the segment pass reaches it.
+- A reorg of a block that a binary without this table applied keeps that block's swap row
+  until a newer swap replaces it (the fill writes no undo log).
+- To run the fill again, stop the service, delete `Meta price_filled` and
+  `price_fill_txnum` and start it.
+- A `serve` process opened before the first `run` that created the table sees it only after a
+  restart, as with the P6 tables.
+
 ## Rebuilding a range or step
 
 `kda-indexer rebuild-range --step S` (or `--range S` for a 100k range) refetches the heights of
