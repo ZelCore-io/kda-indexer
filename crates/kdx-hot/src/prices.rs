@@ -130,11 +130,15 @@ impl SwapRow {
     }
 }
 
-/// A swap found in a tx: the row to store and every token its result names.
+/// A swap found in a tx: the row stored under `tokens` (the result's legs) and the rows of the
+/// routed tokens, each with the legs of its own trusted hop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Swap {
     pub row: SwapRow,
     pub tokens: Vec<String>,
+    /// A further token the result names and a trusted `SWAP` event of the tx trades against
+    /// `coin`, with that event's own legs (never the result's).
+    pub routed: Vec<(String, SwapRow)>,
 }
 
 /// An event name (`<module>.<NAME>`) of a trusted DEX swap ([`DEX_SWAP_EVENTS`]).
@@ -190,16 +194,21 @@ fn module_ref_name(v: &Value) -> Option<String> {
 struct Hop {
     token_in: String,
     amount_in: Dec,
+    /// The amounts as the event wrote them (JSON text), as a stored leg keeps them.
+    raw_in: String,
     token_out: String,
     amount_out: Dec,
+    raw_out: String,
 }
 
 fn hop_of(params: &Value) -> Option<Hop> {
     let p = params.as_array().filter(|p| p.len() == 6)?;
     Some(Hop {
         amount_in: amount_of(&p[2])?,
+        raw_in: p[2].to_string(),
         token_in: module_ref_name(&p[3])?,
         amount_out: amount_of(&p[4])?,
+        raw_out: p[4].to_string(),
         token_out: module_ref_name(&p[5])?,
     })
 }
@@ -219,8 +228,9 @@ pub fn swap_event_params(dict: &dyn Dict, events: &[EventRec]) -> Vec<Value> {
 
 /// The swap in a successful tx's `result.data`, given the params of the tx's trusted DEX
 /// `SWAP` events: elements 0 and 1 must carry a token, and equal `(token-in, in)` and
-/// `(token-out, out)` of one of those events. Further tokens of the list are kept only when a
-/// trusted event of the tx names them.
+/// `(token-out, out)` of one of those events. Further tokens of the list are kept only with the
+/// legs of a trusted event of the tx that trades them against `coin` (never the result's legs:
+/// the result is the sender's, so a dust swap in one pair must not price another token).
 pub fn swap_of(key: TxKey, ctime: u64, data: &Value, swap_events: &[Value]) -> Option<Swap> {
     let hops: Vec<Hop> = swap_events.iter().filter_map(hop_of).collect();
     if hops.is_empty() {
@@ -245,35 +255,52 @@ pub fn swap_of(key: TxKey, ctime: u64, data: &Value, swap_events: &[Value]) -> O
     if !authentic {
         return None;
     }
-    // A routed token needs a trusted hop that names it and has a `coin` side.
-    let named = |t: &str| {
-        hops.iter().any(|h| {
-            (h.token_in == t || h.token_out == t) && (h.token_in == COIN || h.token_out == COIN)
-        })
+    let row = SwapRow {
+        ctime,
+        key,
+        legs: [
+            (t0.to_owned(), a0.to_string()),
+            (t1.to_owned(), a1.to_string()),
+        ],
     };
-    let mut tokens: Vec<String> = Vec::new();
+    let main = if t0 == COIN { t1 } else { t0 };
+    let tokens = vec![main.to_owned()];
+    let mut routed: Vec<(String, SwapRow)> = Vec::new();
+    // A routed token is priced by its own hop: the first trusted event that trades it against
+    // `coin`, with that event's token and amount legs.
     for t in list
         .iter()
+        .skip(2)
         .filter_map(token_of)
-        .filter(|t| *t != COIN && named(t))
+        .filter(|t| *t != COIN && *t != main)
     {
-        if tokens.len() == MAX_TOKENS_PER_SWAP {
+        if tokens.len() + routed.len() == MAX_TOKENS_PER_SWAP {
             break;
         }
-        if !tokens.iter().any(|x| x == t) {
-            tokens.push(t.to_owned());
+        if routed.iter().any(|(x, _)| x == t) {
+            continue;
+        }
+        let own = hops.iter().find(|h| {
+            (h.token_in == t && h.token_out == COIN) || (h.token_in == COIN && h.token_out == t)
+        });
+        if let Some(h) = own {
+            routed.push((
+                t.to_owned(),
+                SwapRow {
+                    ctime,
+                    key,
+                    legs: [
+                        (h.token_in.clone(), h.raw_in.clone()),
+                        (h.token_out.clone(), h.raw_out.clone()),
+                    ],
+                },
+            ));
         }
     }
     Some(Swap {
-        row: SwapRow {
-            ctime,
-            key,
-            legs: [
-                (t0.to_owned(), a0.to_string()),
-                (t1.to_owned(), a1.to_string()),
-            ],
-        },
+        row,
         tokens,
+        routed,
     })
 }
 
@@ -300,13 +327,15 @@ pub fn upsert(
     swap: &Swap,
     mut undo: Option<&mut Vec<u8>>,
 ) -> Result<u32> {
-    let val = swap.row.encode();
+    let rows =
+        (swap.tokens.iter().map(|t| (t, &swap.row))).chain(swap.routed.iter().map(|(t, r)| (t, r)));
     let mut n = 0;
-    for t in &swap.tokens {
+    for (t, row) in rows {
+        let val = row.encode();
         let k = row_key(chain, t);
         let prev = txn.get(Table::TokenSwaps, &k)?;
         if let Some(p) = prev.as_deref().and_then(SwapRow::decode) {
-            if p.order() >= swap.row.order() {
+            if p.order() >= row.order() {
                 continue;
             }
         }
@@ -937,8 +966,18 @@ mod tests {
             ),
         ];
         let s = swap_of(k, 1764000000, &data, &evs).unwrap();
-        // `coin` itself is never a key; the routed token has a trusted hop with a coin side.
-        assert_eq!(s.tokens, ["runonflux.flux", "n_e5.kb-USDC"]);
+        // `coin` itself is never a key; the routed token has a trusted hop with a coin side and
+        // is stored with that hop's legs, not the result's.
+        assert_eq!(s.tokens, ["runonflux.flux"]);
+        assert_eq!(s.routed.len(), 1);
+        assert_eq!(s.routed[0].0, "n_e5.kb-USDC");
+        assert_eq!(
+            s.routed[0].1.legs,
+            [
+                ("coin".to_owned(), "689.006542078688".to_owned()),
+                ("n_e5.kb-USDC".to_owned(), "3.444274".to_owned())
+            ]
+        );
         assert_eq!(
             s.row,
             row(
@@ -1087,7 +1126,7 @@ mod tests {
             .map(|i| ev("coin", json!(1), &format!("free.t{i}"), json!(1)))
             .collect();
         let s = swap_of(k, 0, &Value::Array(many), &evs).unwrap();
-        assert_eq!(s.tokens.len(), MAX_TOKENS_PER_SWAP);
+        assert_eq!(s.tokens.len() + s.routed.len(), MAX_TOKENS_PER_SWAP);
     }
 
     /// PR #31 review H1: the result is written by the sender. A genuine trusted `SWAP` event
@@ -1140,6 +1179,52 @@ mod tests {
         assert_eq!(swap_of_tx(&dict, &r), None);
     }
 
+    /// PR #31 review H2: a routed token is priced with the legs of its own coin-side hop, not
+    /// with the result's legs 0/1. A dust `free.junk -> coin` swap paired with a dust
+    /// `coin -> kaddex.kdx` swap in one tx cannot set kaddex.kdx's price from the junk pair.
+    #[test]
+    fn a_routed_token_gets_its_own_hops_price() {
+        let k = TxKey::new(1, 3, 1);
+        let junk_hop = ev("free.junk", json!(1000), "coin", json!(0.001));
+        let kdx_hop = ev("coin", json!(2.0), "kaddex.kdx", json!(4.0));
+        // Attack: the result is the sender's, `[junk, coin, kdx]`; legs 0/1 are the junk hop.
+        let crafted = json!([
+            {"token": "free.junk", "amount": 1000},
+            {"token": "coin", "amount": 0.001},
+            {"token": "kaddex.kdx", "amount": 1}
+        ]);
+        let s = swap_of(k, 7, &crafted, &[junk_hop.clone(), kdx_hop.clone()]).unwrap();
+        assert_eq!(s.tokens, ["free.junk"]);
+        assert_eq!(price_text(&s.row).as_deref(), Some("0.000001000000"));
+        // kaddex.kdx is stored with its own hop (0.5 KDA per KDX), never the junk ratio.
+        assert_eq!(s.routed.len(), 1);
+        let (t, r) = &s.routed[0];
+        assert_eq!(t, "kaddex.kdx");
+        assert_eq!(price_text(r).as_deref(), Some("0.500000000000"));
+        assert_eq!(r.legs[0], ("coin".to_owned(), "2.0".to_owned()));
+        assert_eq!(r.legs[1], ("kaddex.kdx".to_owned(), "4.0".to_owned()));
+        assert_eq!((r.ctime, r.key), (7, k));
+        // Without a trusted hop of its own the routed token gets no row at all.
+        let s = swap_of(k, 7, &crafted, std::slice::from_ref(&junk_hop)).unwrap();
+        assert!(s.routed.is_empty());
+        // A hop of another token, or a token-to-token hop (no coin side), does not price it.
+        let other = ev("coin", json!(1), "free.other", json!(1));
+        let tok_tok = ev("free.junk", json!(1), "kaddex.kdx", json!(1));
+        let s = swap_of(k, 7, &crafted, &[junk_hop.clone(), other, tok_tok]).unwrap();
+        assert!(s.routed.is_empty());
+        // Honest routed swap, `coin -> A -> B` shaped as `[A, coin, B]`: B has its own hop.
+        let s = swap_of(k, 7, &crafted, &[junk_hop, kdx_hop]).unwrap();
+        // Stored through the table: each token reads back its own price.
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        assert_eq!(upsert(&mut txn, 3, &s, None).unwrap(), 2);
+        let kdx = lookup(&txn, "kaddex.kdx").unwrap().unwrap();
+        assert_eq!(price_text(&kdx).as_deref(), Some("0.500000000000"));
+        let junk = lookup(&txn, "free.junk").unwrap().unwrap();
+        assert_eq!(price_text(&junk).as_deref(), Some("0.000001000000"));
+    }
+
     /// Security review: a table larger than the scan budget answers exact names from one key
     /// range instead of reading every row.
     #[test]
@@ -1151,12 +1236,14 @@ mod tests {
             let s = Swap {
                 row: row(1, TxKey::new(1, 0, 1), ("coin", "1"), ("free.t", "2")),
                 tokens: vec![format!("free.tok{i:06}")],
+                routed: vec![],
             };
             upsert(&mut txn, 0, &s, None).unwrap();
         }
         let s = Swap {
             row: row(9, TxKey::new(2, 1, 1), ("coin", "3"), ("free.t", "1")),
             tokens: vec!["free.tok000007".into()],
+            routed: vec![],
         };
         upsert(&mut txn, 1, &s, None).unwrap();
         // Exact: the newest of its rows (chain 1).
@@ -1172,12 +1259,14 @@ mod tests {
                 tokens: vec![
                     format!("free.tok000007{}", char::from((i % 8 + 1) as u8)) + &i.to_string(),
                 ],
+                routed: vec![],
             };
             upsert(&mut txn, 0, &s, None).unwrap();
         }
         let s = Swap {
             row: row(20, TxKey::new(3, 19, 1), ("coin", "5"), ("free.t", "1")),
             tokens: vec!["free.tok000007".into()],
+            routed: vec![],
         };
         upsert(&mut txn, 19, &s, None).unwrap();
         assert_eq!(
@@ -1214,6 +1303,7 @@ mod tests {
             let s = Swap {
                 row: row(1, TxKey::new(i + 1, 0, 1), ("coin", "1"), (&name, "2")),
                 tokens: vec![name],
+                routed: vec![],
             };
             upsert(&mut txn, 0, &s, None).unwrap();
         }
@@ -1284,6 +1374,7 @@ mod tests {
         let swap = |ctime, k: TxKey, amt: &str| Swap {
             row: row(ctime, k, ("coin", amt), ("free.t", "1")),
             tokens: vec!["coin".into(), "free.t".into()],
+            routed: vec![],
         };
         let mut txn = hot.rw().unwrap();
         // History (fill): no undo log.
@@ -1348,6 +1439,7 @@ mod tests {
         let s = Swap {
             row: row(300, TxKey::new(30, 5, 1), ("coin", "1"), ("free.new", "2")),
             tokens: vec!["free.new".into()],
+            routed: vec![],
         };
         upsert(&mut txn, 5, &s, Some(&mut log)).unwrap();
         txn.set_meta(&undo_key(5, 30), &log).unwrap();

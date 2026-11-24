@@ -612,9 +612,12 @@ event can only be emitted by the DEX module, so it is what authenticates the two
 names must be valid Pact qualified names (at most 256 bytes, ASCII letters, digits and
 `%#+-_&$@<>=^?*!|/~.`). Exactly one of the two legs must be `coin`, and the row is keyed under
 the other token: a token-to-token swap has no price in KDA and stores nothing, and `coin` is
-never a key. Each further token of the list (at most 8) gets the swap only when a trusted SWAP
-event of the same tx names it on a hop with a `coin` side: a routed swap names three or more
-tokens, one per hop, and stock matches all of them by text.
+never a key. Each further token of the list (at most 8 tokens in all) is stored only when a trusted
+SWAP event of the same tx trades it against `coin`, and then with the legs of that event
+(its token-in, amount-in, token-out, amount-out), never the result's legs: a routed swap names
+three or more tokens, one per hop, and each routed token is priced by its own hop. Stock keys
+the first hop's row under every token by text, so a routed token (such as `kb-USDC`) can differ
+from stock's answer; no compared module is served from a routed row.
 Sushi is trusted because it is a live DEX with the same event layout, and Pact lets only that
 module emit events under its name, so trust stays scoped to that one namespaced module. It is
 needed for parity: a tx such as the newest `free.wiza` arbitrage (a Kaddex hop, then a Sushi
@@ -644,8 +647,8 @@ Rulings, where stock's text scan cannot be kept exactly:
   change (`DEX_SWAP_EVENTS`).
 - **Only KDA pairs.** Stock treats element 1 as KDA when element 0 is not `coin`, so a
   token-to-token swap gets a nonsense price. We store a swap only when exactly one of its two
-  legs is `coin`, keyed under the other token (and under routed tokens named on a trusted hop
-  with a `coin` side); any other swap stores nothing, and a stored row with no `coin` leg
+  legs is `coin`, keyed under the other token (a routed token is stored only with the legs of its own
+  trusted `coin` hop); any other swap stores nothing, and a stored row with no `coin` leg
   answers `null`.
 - **A genuine swap can still move the price.** The answer is the last trade, as in stock; a
   trade in a thin pool on a trusted DEX sets it like any other.
