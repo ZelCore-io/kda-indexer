@@ -796,6 +796,17 @@ event (a fee account built from a user guard, a pool account with a hashed name)
 lists them: `/local` allows `(keys <module>.<table>)` on any module's table, at a flat 40,000
 gas whatever the table size (measured on mainnet01).
 
+**Node impact.** A `keys` read runs on the node, not in the indexer, and the node does not stop
+it when the client gives up. While it runs it can block that chain's cut: on mainnet01 one
+`keys` of `free.crankk01.crankk01-token-table` stood the node's chain 0 still for about 14
+minutes (the node logged `Timeout while processing cut`), and every wallet using that node
+saw a frozen chain. Run the listing against a node that is not serving wallets, or keep
+`balances.keylist_skip` current with every module whose table is known to be huge. After an
+upgrade from a build before the park (a010087), the stored per-chain failure does not say
+whether it was a timeout (it keeps only the failure count and the retry time), so such a chain
+is read once more at its retry and parked if that times out; list its module in
+`balances.keylist_skip` to stop that read.
+
 With the reconciler in seed mode, a task of its own (beside the reconcile loop, so a slow read
 never holds up dirty rows, NFTs or history slices) lists every tracked token other than `coin`,
 skipping not-fungible verdicts and tokens at their row cap. One step is one (token, chain): a
