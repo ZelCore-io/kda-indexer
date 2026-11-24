@@ -151,6 +151,10 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     if !price_undo.is_empty() {
         // Beside the undo record like the D3 marks: older binaries can still read the record.
         txn.set_meta(&prices::undo_key(chain, height), &price_undo)?;
+    } else {
+        // A log left at this height for a replaced block (an older binary unwound it without
+        // reading the log) must not apply to this one (PR #31 review note 3).
+        txn.del(Table::Meta, prices::undo_key(chain, height).as_bytes())?;
     }
     txn.put(Table::Undo, &bk, &undo::encode(&ops))?;
     set_checkpoint(txn, Stage::Tail, chain, height, br.hash)?;
@@ -484,11 +488,20 @@ mod balance_mark_tests {
         dict.intern(DictKind::Module, "coin");
         let block = |dict: &mut HotDict, height: u32, amount: f64| {
             let key = TxKey::new(height, 2, 1);
+            let mref = |ns: Option<&str>, name: &str| serde_json::json!({"refSpec": [], "refName": {"namespace": ns, "name": name}});
+            let params = serde_json::json!([
+                "pool",
+                "k:user",
+                amount,
+                mref(None, "coin"),
+                2.0,
+                mref(Some("kaddex"), "kdx")
+            ]);
             let ev = EventRec {
                 module: dict.intern(DictKind::Module, "kaddex.exchange"),
                 name: dict.intern(DictKind::EventName, "kaddex.exchange.SWAP"),
                 module_hash: 0,
-                params: value::to_vec(&serde_json::json!([]), &*dict),
+                params: value::to_vec(&params, &*dict),
             };
             let data = serde_json::json!([
                 {"amount": amount, "token": "coin"},

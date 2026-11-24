@@ -602,22 +602,34 @@ gives `"Infinity"` or `"NaN"`, as stock does.
 We keep the newest swap per chain and token in the hot table `TokenSwaps`
 ([format.md](format.md)) instead of scanning every result. A swap is a successful tx that
 emits a trusted DEX swap event (Kaddex/eckoDEX `kaddex.exchange.SWAP` or KDSwap
-`kdlaunch.kdswap-exchange.SWAP`) and whose `result.data` is a list with a non-empty string
-`token` of at most 256 bytes in elements 0 and 1. Each string `token` of the list (at most 8;
-longer names are skipped) gets the swap: a routed swap names three or more tokens, and stock
-matches all of them by text. The tail keeps the
+`kdlaunch.kdswap-exchange.SWAP`, params `[sender, receiver, in, token-in, out, token-out]`)
+and whose `result.data` elements 0 and 1 equal one of those events' `(token-in, in)` and
+`(token-out, out)`: tokens compared by the module reference's qualified name, amounts as
+numbers. The result is the value of the tx's last expression, which the sender writes; the
+event can only be emitted by the DEX module, so it is what authenticates the two legs. Token
+names must be valid Pact qualified names (at most 256 bytes, ASCII letters, digits and
+`%#+-_&$@<>=^?*!|/~.`). Each further token of the list (at most 8) gets the swap only when a
+trusted SWAP event of the same tx names it: a routed swap names three or more tokens, one per
+hop, and stock matches all of them by text. The tail keeps the
 table current, and a one-off fill reads the history ([operations.md](operations.md#token-swaps)).
 A lookup applies stock's `LIKE` pattern (`%` and `_` wildcards, `\` escape, case-sensitive) to
 the stored token names and takes the newest match by (`meta.creationTime`, height, chain,
 position). A lookup reads at most 20,000 rows; on a larger table it matches the exact name
-only, from one key range. Amounts with more than 80 significant digits or an exponent beyond
-±1000, and prices with more than 400 integer digits, answer `null`.
+only, with one point read per chain (20). Amounts with more than 80 significant digits or an
+exponent beyond ±1000, and prices with more than 400 integer digits, answer `null`.
 
 Rulings, where stock's text scan cannot be kept exactly:
 
-- **Trusted DEXes only.** Stock matches any result text, so a contract anyone deploys could
-  set a price. We read only the Kaddex/eckoDEX and KDSwap swap events, the DEXes behind all 14
-  recorded stock answers. Adding a DEX is a code change (`DEX_SWAP_EVENTS`).
+- **Trusted DEXes only, legs checked against their events.** Stock reads the price from any
+  result text, which the tx sender writes, so anyone could set a price. We count a swap only
+  when the result's first two legs repeat a Kaddex/eckoDEX or KDSwap `SWAP` event of the same
+  tx (event names are namespaced by the emitting module, and only that module can emit them).
+  Adding a DEX is a code change (`DEX_SWAP_EVENTS`). One of the 14 recorded stock answers
+  differs: `free.wiza`'s newest swap tx was an arbitrage whose result is a second swap on
+  `n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange`, a DEX we do not trust; we
+  answer from the newest trusted swap instead.
+- **A genuine swap can still move the price.** The answer is the last trade, as in stock; a
+  trade in a thin pool on a trusted DEX sets it like any other.
 - **Swaps only.** Stock matches any result text. If a newer non-swap tx mentions the module
   (a failed swap's error, a `create-pair` result), stock answers `null` and we answer the
   last swap's price. Our answer is the more useful one, and stock's full-table scan timed out on
@@ -626,14 +638,15 @@ Rulings, where stock's text scan cannot be kept exactly:
   use height, then chain, then position.
 - **Canonical blocks only.** Stock keeps orphaned blocks' txs in its scan; we do not.
 - **Unreadable amounts.** An amount decimal.js would refuse (an object such as `{"int": 5}`)
-  makes stock fail the request; we answer `null`.
+  makes stock fail the request; we store no swap for it (its legs cannot be checked), so the
+  answer comes from an older swap or is `null`.
 - **`coin` gets no special case.** It matches every swap with KDA, so it answers the newest
   swap's price, as stock's text match would when that swap is the newest matching tx.
 
 Checked against the 2026-11-24 G4 replay: stock answered 14 of the 49 distinct corpus requests
-(the other 35 timed out at its load balancer). We match all 14 to the last digit
-(`crates/kdx-graphql/tests/prices.rs`, with the newest swaps read from mainnet in
-`tests/data/token-swaps-2026-11-24.jsonl`).
+(the other 35 timed out at its load balancer). We match 13 to the last digit; `free.wiza` is
+the untrusted-DEX case above (`crates/kdx-graphql/tests/prices.rs`, with the newest swaps and
+their SWAP events read from mainnet in `tests/data/token-swaps-2026-11-24.jsonl`).
 
 ## Fields compared with the node, not an oracle
 

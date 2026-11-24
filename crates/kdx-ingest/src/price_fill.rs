@@ -213,7 +213,15 @@ mod tests {
                     module,
                     name: ev,
                     module_hash: 0,
-                    params: value::to_vec(&serde_json::json!([]), &dict),
+                    params: value::to_vec(
+                        &serde_json::json!([
+                            "pool", "k:user", amt,
+                            {"refName": {"namespace": null, "name": "coin"}},
+                            2.0,
+                            {"refName": {"namespace": "free", "name": "t"}}
+                        ]),
+                        &dict,
+                    ),
                 }],
                 ..Default::default()
             };

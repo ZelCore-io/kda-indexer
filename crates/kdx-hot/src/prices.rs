@@ -10,14 +10,18 @@
 //!
 //! What we keep instead of scanning every result (rulings in `docs/graphql.md`):
 //! - a **swap** is a successful tx with a [`DEX_SWAP_EVENTS`] event (Kaddex/eckoDEX
-//!   `kaddex.exchange.SWAP`, KDSwap `kdlaunch.kdswap-exchange.SWAP`) whose
-//!   `result.data` is a list with a non-empty string `token` in elements 0 and 1;
-//! - one row per (chain, token) for every string `token` in the list (a routed swap names 3+
-//!   tokens; stock matches all of them by text): the swap's order key and elements 0 and 1;
+//!   `kaddex.exchange.SWAP`, KDSwap `kdlaunch.kdswap-exchange.SWAP`) whose `result.data` is a
+//!   list where elements 0 and 1 equal one such event's `(token-in, in)` and `(token-out, out)`
+//!   (tokens by the module reference's qualified name, amounts as numbers). The result is
+//!   written by the sender, the event only by the DEX module, so the event authenticates the
+//!   legs (fix round 1 of PR #31);
+//! - one row per (chain, token) for every string `token` in the list that a trusted SWAP event
+//!   of the tx also names (a routed swap names 3+ tokens; stock matches all of them by text):
+//!   the swap's order key and elements 0 and 1;
 //! - order key `(meta.creationTime, height, chain, position)`, newest wins;
 //! - a lookup matches `moduleName` against the stored token names as stock's `LIKE` pattern
 //!   (`%` and `_` wildcards, `\` escape) and takes the newest matching row; it reads at most
-//!   [`LIKE_SCAN_ROWS`] rows, and on a larger table matches the exact name (a prefix range).
+//!   [`LIKE_SCAN_ROWS`] rows, and on a larger table reads the exact name on each chain.
 //!
 //! | Table | Key | Value |
 //! |---|---|---|
@@ -60,6 +64,8 @@ pub const DEX_SWAP_EVENTS: &[&str] = &["kaddex.exchange.SWAP", "kdlaunch.kdswap-
 pub const MAX_TOKEN_LEN: usize = 256;
 /// Most tokens one swap may update (a routed swap names one per hop).
 pub const MAX_TOKENS_PER_SWAP: usize = 8;
+/// Chains an exact-name lookup reads (one point read per chain).
+pub const MAX_CHAINS: u8 = 20;
 /// Rows a `LIKE` lookup may read; above it the lookup matches the exact name only.
 pub const LIKE_SCAN_ROWS: usize = 20_000;
 
@@ -122,13 +128,6 @@ pub fn is_swap_event_name(name: &str) -> bool {
     DEX_SWAP_EVENTS.contains(&name)
 }
 
-pub fn has_swap_event(dict: &dyn Dict, events: &[EventRec]) -> bool {
-    events.iter().any(|e| {
-        dict.name(DictKind::EventName, e.name)
-            .is_some_and(is_swap_event_name)
-    })
-}
-
 /// `meta.creationTime` of a signed `cmd` (0 when missing or not a number).
 pub fn creation_time(cmd: Option<&[u8]>) -> u64 {
     let Some(v) = cmd.and_then(|c| serde_json::from_slice::<Value>(c).ok()) else {
@@ -142,20 +141,94 @@ pub fn creation_time(cmd: Option<&[u8]>) -> u64 {
         .unwrap_or(0)
 }
 
-fn token_of(e: &Value) -> Option<&str> {
-    e.get("token")?
-        .as_str()
-        .filter(|s| !s.is_empty() && s.len() <= MAX_TOKEN_LEN)
+/// Characters of a Pact qualified name besides ASCII letters and digits (Pact identifiers
+/// allow these symbols; `.` separates namespace, module and member).
+const NAME_SYMBOLS: &str = "%#+-_&$@<>=^?*!|/~.";
+
+/// A token name we store: non-empty, at most [`MAX_TOKEN_LEN`] bytes, and only characters
+/// valid in a Pact qualified name (no whitespace or control characters).
+pub fn valid_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= MAX_TOKEN_LEN
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || NAME_SYMBOLS.contains(c))
 }
 
-/// The swap in a successful tx's `result.data`, when elements 0 and 1 carry a token.
-pub fn swap_of(key: TxKey, ctime: u64, data: &Value) -> Option<Swap> {
+fn token_of(e: &Value) -> Option<&str> {
+    e.get("token")?.as_str().filter(|s| valid_token(s))
+}
+
+/// The qualified name of a Pact module reference
+/// (`{"refName":{"namespace":ns|null,"name":n},"refSpec":[..]}`).
+fn module_ref_name(v: &Value) -> Option<String> {
+    let r = v.get("refName")?;
+    let name = r.get("name")?.as_str()?;
+    let q = match r.get("namespace") {
+        Some(Value::String(ns)) => format!("{ns}.{name}"),
+        None | Some(Value::Null) => name.to_owned(),
+        _ => return None,
+    };
+    valid_token(&q).then_some(q)
+}
+
+/// One hop of a trusted DEX swap, from its `SWAP` event params
+/// `[sender, receiver, in, token-in, out, token-out]` (Kaddex and KDSwap share the layout).
+struct Hop {
+    token_in: String,
+    amount_in: Dec,
+    token_out: String,
+    amount_out: Dec,
+}
+
+fn hop_of(params: &Value) -> Option<Hop> {
+    let p = params.as_array().filter(|p| p.len() == 6)?;
+    Some(Hop {
+        amount_in: amount_of(&p[2])?,
+        token_in: module_ref_name(&p[3])?,
+        amount_out: amount_of(&p[4])?,
+        token_out: module_ref_name(&p[5])?,
+    })
+}
+
+/// The params of each trusted DEX `SWAP` event of a tx ([`DEX_SWAP_EVENTS`]); unreadable
+/// params are left out.
+pub fn swap_event_params(dict: &dyn Dict, events: &[EventRec]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|e| {
+            dict.name(DictKind::EventName, e.name)
+                .is_some_and(is_swap_event_name)
+        })
+        .filter_map(|e| value::from_slice(&e.params, dict).ok())
+        .collect()
+}
+
+/// The swap in a successful tx's `result.data`, given the params of the tx's trusted DEX
+/// `SWAP` events: elements 0 and 1 must carry a token, and equal `(token-in, in)` and
+/// `(token-out, out)` of one of those events. Further tokens of the list are kept only when a
+/// trusted event of the tx names them.
+pub fn swap_of(key: TxKey, ctime: u64, data: &Value, swap_events: &[Value]) -> Option<Swap> {
+    let hops: Vec<Hop> = swap_events.iter().filter_map(hop_of).collect();
+    if hops.is_empty() {
+        return None;
+    }
     let list = data.as_array()?;
     let (e0, e1) = (list.first()?, list.get(1)?);
     let (t0, t1) = (token_of(e0)?, token_of(e1)?);
-    let amount = |e: &Value| e.get("amount").map(|a| a.to_string()).unwrap_or_default();
+    let (a0, a1) = (e0.get("amount")?, e1.get("amount")?);
+    let (d0, d1) = (amount_of(a0)?, amount_of(a1)?);
+    let authentic = hops.iter().any(|h| {
+        h.token_in == t0
+            && h.token_out == t1
+            && same_amount(&h.amount_in, &d0)
+            && same_amount(&h.amount_out, &d1)
+    });
+    if !authentic {
+        return None;
+    }
+    let named = |t: &str| hops.iter().any(|h| h.token_in == t || h.token_out == t);
     let mut tokens: Vec<String> = Vec::new();
-    for t in list.iter().filter_map(token_of) {
+    for t in list.iter().filter_map(token_of).filter(|t| named(t)) {
         if tokens.len() == MAX_TOKENS_PER_SWAP {
             break;
         }
@@ -167,19 +240,27 @@ pub fn swap_of(key: TxKey, ctime: u64, data: &Value) -> Option<Swap> {
         row: SwapRow {
             ctime,
             key,
-            legs: [(t0.to_owned(), amount(e0)), (t1.to_owned(), amount(e1))],
+            legs: [
+                (t0.to_owned(), a0.to_string()),
+                (t1.to_owned(), a1.to_string()),
+            ],
         },
         tokens,
     })
 }
 
-/// The swap in a stored tx: successful, with a `*.SWAP` event, and a swap-shaped result.
+/// The swap in a stored tx: successful, not coinbase, with a trusted DEX `SWAP` event whose
+/// legs its result repeats (see [`swap_of`]).
 pub fn swap_of_tx(dict: &dyn Dict, r: &TxRecord) -> Option<Swap> {
-    if !r.status_ok || r.key.is_coinbase() || !has_swap_event(dict, &r.events) {
+    if !r.status_ok || r.key.is_coinbase() {
+        return None;
+    }
+    let events = swap_event_params(dict, &r.events);
+    if events.is_empty() {
         return None;
     }
     let data = value::from_slice(&r.result, dict).ok()?;
-    swap_of(r.key, creation_time(r.cmd.as_deref()), &data)
+    swap_of(r.key, creation_time(r.cmd.as_deref()), &data, &events)
 }
 
 /// Store `swap` for each of its tokens on `chain` where it is newer than the stored row.
@@ -247,38 +328,42 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
 }
 
 /// The newest stored swap whose token matches `module` as stock's `LIKE '%module%'`.
-/// Bounded: reads at most [`LIKE_SCAN_ROWS`] + 1 rows; when the table is larger, only rows
-/// whose token equals `module` (one key range) are considered.
+/// Bounded: reads at most [`LIKE_SCAN_ROWS`] + 1 rows; when the table is larger, only the
+/// exact name is looked up, with one point read per chain ([`MAX_CHAINS`]).
 pub fn lookup(txn: &impl Txn, module: &str) -> Result<Option<SwapRow>> {
     let all = txn.scan_limit(Table::TokenSwaps, &[], LIKE_SCAN_ROWS + 1, |_| true)?;
-    let (rows, exact) = if all.len() <= LIKE_SCAN_ROWS {
-        (all, false)
-    } else {
-        let p = module.as_bytes().to_vec();
-        let rows = txn.scan_limit(Table::TokenSwaps, &p, 256, |k| k.starts_with(&p))?;
-        (rows, true)
-    };
     let mut best: Option<SwapRow> = None;
-    for (k, v) in rows {
-        let Some(token) = k
-            .split_last()
-            .and_then(|(_, t)| std::str::from_utf8(t).ok())
-        else {
-            continue;
-        };
-        let hit = if exact {
-            token == module
-        } else {
-            like_contains(token, module)
-        };
-        if !hit {
-            continue;
+    let mut keep = |v: &[u8]| {
+        if let Some(row) = SwapRow::decode(v) {
+            if best.as_ref().is_none_or(|b| row.order() > b.order()) {
+                best = Some(row);
+            }
         }
-        let Some(row) = SwapRow::decode(&v) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|b| row.order() > b.order()) {
-            best = Some(row);
+    };
+    if all.len() <= LIKE_SCAN_ROWS {
+        // Keys are token ‖ chain, so one token's rows are adjacent: match each name once.
+        let mut last: Option<(&[u8], bool)> = None;
+        for (k, v) in &all {
+            let Some((_, token)) = k.split_last() else {
+                continue;
+            };
+            let hit = match last {
+                Some((t, hit)) if t == token => hit,
+                _ => {
+                    let hit = std::str::from_utf8(token).is_ok_and(|t| like_contains(t, module));
+                    last = Some((token, hit));
+                    hit
+                }
+            };
+            if hit {
+                keep(v);
+            }
+        }
+    } else if valid_token(module) {
+        for c in 0..MAX_CHAINS {
+            if let Some(v) = txn.get(Table::TokenSwaps, &row_key(c, module))? {
+                keep(&v);
+            }
         }
     }
     Ok(best)
@@ -557,23 +642,31 @@ fn sub_digits(a: &mut [u8], b: &[u8]) {
 /// where a JSON number went through JavaScript (`JSON.parse`, so an IEEE double, then
 /// `Number#toString`) and a string is exact. `None` for anything decimal.js would refuse.
 fn amount_dec(json: &str) -> Option<Dec> {
-    let a: Value = serde_json::from_str(json).ok()?;
+    amount_of(&serde_json::from_str(json).ok()?)
+}
+
+/// Two amounts are the same number (zero of either sign included).
+fn same_amount(a: &Dec, b: &Dec) -> bool {
+    (a.is_zero() && b.is_zero()) || a == b
+}
+
+/// [`amount_dec`] of a parsed JSON value.
+fn amount_of(a: &Value) -> Option<Dec> {
     fn pick<'a>(o: &'a serde_json::Map<String, Value>, f: &str) -> Option<&'a Value> {
         o.get(f).filter(|v| !v.is_null())
     }
-    let v = match &a {
+    let v = match a {
         Value::Object(o) => pick(o, "decimal")
             .or_else(|| pick(o, "integer"))
-            .unwrap_or(&a)
-            .clone(),
-        _ => a.clone(),
+            .unwrap_or(a),
+        _ => a,
     };
     match v {
         Value::Number(n) => {
             let f: f64 = n.to_string().parse().ok()?;
             f.is_finite().then(|| Dec::parse(&format!("{f}")))?
         }
-        Value::String(s) => Dec::parse(&s),
+        Value::String(s) => Dec::parse(s),
         _ => None,
     }
 }
@@ -616,6 +709,21 @@ mod tests {
 
     fn price(l0: (&str, &str), l1: (&str, &str)) -> Option<String> {
         price_text(&row(1, TxKey::new(1, 0, 1), l0, l1))
+    }
+
+    /// A Pact module reference as event params carry it.
+    fn mref(q: &str) -> Value {
+        let (ns, name) = match q.rsplit_once('.') {
+            Some((ns, n)) => (json!(ns), n),
+            None => (Value::Null, q),
+        };
+        json!({"refSpec": [{"namespace": null, "name": "fungible-v2"}],
+               "refName": {"namespace": ns, "name": name}})
+    }
+
+    /// `SWAP` event params `[sender, receiver, in, token-in, out, token-out]`.
+    fn ev(tin: &str, ain: Value, tout: &str, aout: Value) -> Value {
+        json!(["pool", "k:user", ain, mref(tin), aout, mref(tout)])
     }
 
     #[test]
@@ -712,7 +820,22 @@ mod tests {
             {"amount": 689.006542078688, "token": "coin"},
             {"amount": 3.444274, "token": "n_e5.kb-USDC"}
         ]);
-        let s = swap_of(k, 1764000000, &data).unwrap();
+        // A routed swap: one event per hop.
+        let evs = [
+            ev(
+                "runonflux.flux",
+                json!(67.0),
+                "coin",
+                json!(689.006542078688),
+            ),
+            ev(
+                "coin",
+                json!(689.006542078688),
+                "n_e5.kb-USDC",
+                json!(3.444274),
+            ),
+        ];
+        let s = swap_of(k, 1764000000, &data, &evs).unwrap();
         assert_eq!(s.tokens, ["runonflux.flux", "coin", "n_e5.kb-USDC"]);
         assert_eq!(
             s.row,
@@ -723,17 +846,31 @@ mod tests {
                 ("coin", "689.006542078688")
             )
         );
-        // Not swaps: a string, one element, a missing or empty token.
-        assert_eq!(swap_of(k, 0, &json!("Write succeeded")), None);
+        // A token the events do not name is not stored (the first hop alone: no USDC row).
+        let s = swap_of(k, 1764000000, &data, &evs[..1]).unwrap();
+        assert_eq!(s.tokens, ["runonflux.flux", "coin"]);
+        // Amounts compare as numbers: a `{"decimal"}` leg matches the same number.
+        let s = swap_of(
+            k,
+            0,
+            &json!([{"amount": {"decimal": "67.0"}, "token": "runonflux.flux"},
+                    {"amount": 689.006542078688, "token": "coin"}]),
+            &evs,
+        );
+        assert!(s.is_some());
+        // Not swaps: a string, one element, a missing or empty token, no event.
+        let one = [ev("coin", json!(1), "a", json!(2))];
+        assert_eq!(swap_of(k, 0, &json!("Write succeeded"), &one), None);
         assert_eq!(
-            swap_of(k, 0, &json!([{"token": "coin", "amount": 1}])),
+            swap_of(k, 0, &json!([{"token": "coin", "amount": 1}]), &one),
             None
         );
         assert_eq!(
             swap_of(
                 k,
                 0,
-                &json!([{"token": "coin", "amount": 1}, {"amount": 2}])
+                &json!([{"token": "coin", "amount": 1}, {"amount": 2}]),
+                &one
             ),
             None
         );
@@ -741,10 +878,14 @@ mod tests {
             swap_of(
                 k,
                 0,
-                &json!([{"token": "", "amount": 1}, {"token": "a", "amount": 2}])
+                &json!([{"token": "", "amount": 1}, {"token": "a", "amount": 2}]),
+                &one
             ),
             None
         );
+        let ok = json!([{"token": "coin", "amount": 1}, {"token": "a", "amount": 2}]);
+        assert!(swap_of(k, 0, &ok, &one).is_some());
+        assert_eq!(swap_of(k, 0, &ok, &[]), None);
         assert!(is_swap_event_name("kaddex.exchange.SWAP"));
         assert!(is_swap_event_name("kdlaunch.kdswap-exchange.SWAP"));
         // Only the trusted DEX modules count; anyone can deploy a module with a SWAP event.
@@ -801,22 +942,98 @@ mod tests {
             price(("coin", &big), ("t", &big)).as_deref(),
             Some("1.000000000000")
         );
-        // Token caps: names over 256 bytes are skipped (elements 0/1: no swap); at most 8.
-        let long = "x".repeat(MAX_TOKEN_LEN + 1);
+        // Token caps: names over 256 bytes, or with characters a Pact name cannot hold, are
+        // skipped (elements 0/1: no swap); at most 8.
         let k = TxKey::new(1, 0, 1);
-        assert_eq!(
-            swap_of(
-                k,
-                0,
-                &json!([{"token": long, "amount": 1}, {"token": "coin", "amount": 1}])
-            ),
-            None
-        );
+        for bad in [
+            "x".repeat(MAX_TOKEN_LEN + 1),
+            "free.t\u{5}x".into(),
+            "free.t x".into(),
+            "free.t\n".into(),
+            "free.tök".into(),
+        ] {
+            assert!(!valid_token(&bad), "{bad:?}");
+            assert_eq!(
+                swap_of(
+                    k,
+                    0,
+                    &json!([{"token": bad, "amount": 1}, {"token": "coin", "amount": 1}]),
+                    &[ev(&bad, json!(1), "coin", json!(1))]
+                ),
+                None
+            );
+        }
+        assert!(valid_token(
+            "n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC"
+        ));
         let many: Vec<Value> = (0..50)
             .map(|i| json!({"token": format!("free.t{i}"), "amount": 1}))
             .collect();
-        let s = swap_of(k, 0, &Value::Array(many)).unwrap();
+        let evs: Vec<Value> = (0..49)
+            .map(|i| {
+                ev(
+                    &format!("free.t{i}"),
+                    json!(1),
+                    &format!("free.t{}", i + 1),
+                    json!(1),
+                )
+            })
+            .collect();
+        let s = swap_of(k, 0, &Value::Array(many), &evs).unwrap();
         assert_eq!(s.tokens.len(), MAX_TOKENS_PER_SWAP);
+    }
+
+    /// PR #31 review H1: the result is written by the sender. A genuine trusted `SWAP` event
+    /// with a crafted result stores no row, and a crafted extra token is not stored.
+    #[test]
+    fn a_crafted_result_beside_a_genuine_event_stores_nothing() {
+        let k = TxKey::new(1, 2, 1);
+        // Dust swap of 0.001 KDA for 3 KDX; the result claims 1,000,000 KDA for 1 KDX.
+        let genuine = [ev("coin", json!(0.001), "kaddex.kdx", json!(3.0))];
+        for crafted in [
+            json!([{"token": "coin", "amount": 1000000}, {"token": "kaddex.kdx", "amount": 1}]),
+            json!([{"token": "coin", "amount": 0.001}, {"token": "kaddex.kdx", "amount": 1}]),
+            json!([{"token": "coin", "amount": 1000000}, {"token": "kaddex.kdx", "amount": 3}]),
+            // Legs swapped, or a token the event does not name.
+            json!([{"token": "kaddex.kdx", "amount": 3}, {"token": "coin", "amount": 0.001}]),
+            json!([{"token": "coin", "amount": 0.001}, {"token": "free.fake", "amount": 3}]),
+        ] {
+            assert_eq!(swap_of(k, 0, &crafted, &genuine), None, "{crafted}");
+        }
+        // The honest result passes; an appended token the events do not name is dropped.
+        let honest = json!([
+            {"token": "coin", "amount": 0.001},
+            {"token": "kaddex.kdx", "amount": 3},
+            {"token": "free.victim", "amount": 1}
+        ]);
+        let s = swap_of(k, 0, &honest, &genuine).unwrap();
+        assert_eq!(s.tokens, ["coin", "kaddex.kdx"]);
+        // Through a stored tx: only trusted DEX events count.
+        use kdx_types::DictMut;
+        let mut dict = kdx_types::MemDict::default();
+        let rec = |dict: &mut kdx_types::MemDict, name: &str, data: &Value| TxRecord {
+            key: k,
+            status_ok: true,
+            result: value::to_vec(data, &*dict),
+            events: vec![EventRec {
+                module: 0,
+                name: dict.intern(DictKind::EventName, name),
+                module_hash: 0,
+                params: value::to_vec(&genuine[0], &*dict),
+            }],
+            ..Default::default()
+        };
+        let r = rec(&mut dict, "kaddex.exchange.SWAP", &honest);
+        assert_eq!(
+            swap_of_tx(&dict, &r).unwrap().tokens,
+            ["coin", "kaddex.kdx"]
+        );
+        let r = rec(&mut dict, "free.fake-dex.SWAP", &honest);
+        assert_eq!(swap_of_tx(&dict, &r), None);
+        let crafted =
+            json!([{"token": "coin", "amount": 1000000}, {"token": "kaddex.kdx", "amount": 1}]);
+        let r = rec(&mut dict, "kaddex.exchange.SWAP", &crafted);
+        assert_eq!(swap_of_tx(&dict, &r), None);
     }
 
     /// Security review: a table larger than the scan budget answers exact names from one key
@@ -843,6 +1060,28 @@ mod tests {
         assert_eq!(got.legs[0].1, "3");
         // A part of a name no longer matches on a table this large.
         assert_eq!(lookup(&txn, "tok000007").unwrap(), None);
+        // Exact reads per chain: rows of names that extend the module's key (review M1:
+        // `module` + a low byte sorted between the module's chain rows) cannot hide chain 19.
+        for i in 0..300u32 {
+            let s = Swap {
+                row: row(1, TxKey::new(1, 0, 1), ("coin", "1"), ("free.t", "2")),
+                tokens: vec![
+                    format!("free.tok000007{}", char::from((i % 8 + 1) as u8)) + &i.to_string(),
+                ],
+            };
+            upsert(&mut txn, 0, &s, None).unwrap();
+        }
+        let s = Swap {
+            row: row(20, TxKey::new(3, 19, 1), ("coin", "5"), ("free.t", "1")),
+            tokens: vec!["free.tok000007".into()],
+        };
+        upsert(&mut txn, 19, &s, None).unwrap();
+        assert_eq!(
+            lookup(&txn, "free.tok000007").unwrap().unwrap().legs[0].1,
+            "5"
+        );
+        // A name a Pact module cannot have is not looked up.
+        assert_eq!(lookup(&txn, "free.tok000007\n").unwrap(), None);
     }
 
     #[test]

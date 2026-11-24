@@ -3,6 +3,8 @@
 //! of each requested token as of the G4 replay (2026-11-24, 06:42 UTC), read from mainnet.
 //! The stock indexer answered 14 of these requests in that replay (the rest timed out at the
 //! load balancer); `stock` in `tests/data/token-swaps-2026-11-24.jsonl` is its answer.
+//! Each swap carries its tx's `requestKey` and trusted DEX `SWAP` events (name and params, read
+//! from mainnet with the result), which authenticate the result's legs.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +54,7 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
         growth_mb: 16,
     };
     let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+    let mut unauthenticated: Vec<&str> = Vec::new();
     {
         let mut txn = hot.rw().unwrap();
         for r in &rows {
@@ -60,9 +63,26 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
             };
             let chain = s["chain"].as_u64().unwrap() as u8;
             let key = TxKey::new(s["height"].as_u64().unwrap() as u32, chain, 1);
-            let swap = prices::swap_of(key, s["creationTime"].as_u64().unwrap(), &s["data"])
-                .expect("a swap-shaped result");
-            prices::upsert(&mut txn, chain, &swap, None).unwrap();
+            // The tx's trusted DEX SWAP events (read from mainnet with the result).
+            let events: Vec<Value> = s["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| prices::is_swap_event_name(e["name"].as_str().unwrap()))
+                .map(|e| e["params"].clone())
+                .collect();
+            assert!(!events.is_empty(), "{}", r["module"]);
+            match prices::swap_of(
+                key,
+                s["creationTime"].as_u64().unwrap(),
+                &s["data"],
+                &events,
+            ) {
+                Some(swap) => {
+                    prices::upsert(&mut txn, chain, &swap, None).unwrap();
+                }
+                None => unauthenticated.push(r["module"].as_str().unwrap()),
+            }
         }
         txn.commit().unwrap();
     }
@@ -84,14 +104,20 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
     let st = Api::new(store, settings, TipWatch::default()).state();
     let app = router(build_schema(st.clone(), GraphqlSettings::default(), None)).with_state(st);
 
+    // free.wiza: the tx is an arbitrage (kaddex.exchange swap-exact-in, then
+    // n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange swap-exact-in); its result is
+    // the second, untrusted DEX's swap, which no trusted SWAP event backs. Stock priced it.
+    assert_eq!(unauthenticated, ["free.wiza"]);
     let (mut compared, mut matched, mut priced) = (0, 0, 0);
+    let mut differ: Vec<&str> = Vec::new();
     for r in &rows {
         let module = r["module"].as_str().unwrap();
         let v = ask(&app, module).await;
         assert!(v.get("errors").is_none(), "{module}: {v}");
         let got = &v["data"]["lastTokenPriceInKda"];
         // A string (stock's `toFixed(12)` text) when a swap is stored, else null.
-        assert_eq!(got.is_string(), r["swap"].is_object(), "{module}: {v}");
+        let stored = r["swap"].is_object() && !unauthenticated.contains(&module);
+        assert_eq!(got.is_string(), stored, "{module}: {v}");
         priced += usize::from(got.is_string());
         if let Some(stock) = r["stock"].as_str() {
             compared += 1;
@@ -99,13 +125,15 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
                 matched += 1;
             } else {
                 eprintln!("{module}: ours {got}, stock {stock}");
+                differ.push(module);
             }
         }
     }
     eprintln!(
         "lastTokenPriceInKda: {priced} of 49 priced; {matched} of {compared} stock answers matched"
     );
-    assert_eq!((compared, matched), (14, 14));
+    assert_eq!((compared, matched), (14, 13));
+    assert_eq!(differ, ["free.wiza"]);
 
     // Stock's LIKE: `_` is a wildcard and a part of a name matches; no match is null.
     let v = ask(&app, "kaddex_kdx").await;
