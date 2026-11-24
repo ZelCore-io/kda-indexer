@@ -1960,7 +1960,7 @@ async fn is_coinbase_true_lists_the_coinbase_as_stock_does() {
         &json!({
             "hash": b64url_encode(&hash_of(0xCB, 0, 11)),
             "cmd": {
-                "meta": {"gasLimit": "0", "chainId": 0,
+                "meta": {"gasLimit": 0, "chainId": 0,
                          "creationTime": "2023-11-14T22:18:50.000Z",
                          "gasPrice": "0", "sender": "coinbase"},
                 "payload": {"code": "{}"}
@@ -2008,6 +2008,37 @@ async fn a_listed_coinbase_has_stock_s_command_defaults() {
                "result": {"goodResult": "\"ok\"", "eventCount": 1,
                           "events": {"edges": [{"node": {"qualifiedName": "coin.COINBASE"}}]}}})
     );
+}
+
+/// A coinbase row's `cmd.meta` as stock recorded it (G4 replay run 2, `gql.transactions:1000002`,
+/// all 5,193 `isCoinbase: true` answers have the same types). Stock sends the coinbase
+/// `gasLimit` as the JSON number `0`, while every user tx's is a string. `gasPrice` is the
+/// string `"0"` and `chainId` a number, like user rows.
+const STOCK_COINBASE_META: &str = r#"{"gasLimit": 0, "chainId": 1,
+    "creationTime": "2021-12-09T03:03:45.000Z", "gasPrice": "0", "sender": "coinbase"}"#;
+
+/// G4 run 2: a coinbase row's meta has the JSON types of stock's recorded answer (`gasLimit` is
+/// the number `0`), and user rows keep the string `gasLimit`.
+#[tokio::test]
+async fn a_listed_coinbase_meta_has_stock_s_json_types() {
+    let fx = fixture();
+    let q = r#"{ transactions(isCoinbase: true, blockHash: "BH", first: 100) {
+        edges { node { cmd { meta { chainId creationTime gasLimit gasPrice sender } } } } } }"#;
+    let v = run(&fx.schema, &q.replace("BH", &block_hash(1, 9))).await;
+    let edges = v["transactions"]["edges"].as_array().unwrap();
+    let meta = |i: usize| &edges[i]["node"]["cmd"]["meta"];
+    let stock: Value = serde_json::from_str(STOCK_COINBASE_META).unwrap();
+    assert_eq!(meta(0)["sender"], json!("coinbase"));
+    assert_eq!(meta(0)["gasLimit"], stock["gasLimit"]);
+    for (k, want) in stock.as_object().unwrap() {
+        let kind = |x: &Value| std::mem::discriminant(x);
+        assert_eq!(kind(&meta(0)[k]), kind(want), "coinbase meta.{k}");
+    }
+    // The block has user txs too: their gasLimit stays a string.
+    assert!(edges.len() > 1, "fixture block has user txs");
+    for i in 1..edges.len() {
+        assert!(meta(i)["gasLimit"].is_string(), "user row {i}");
+    }
 }
 
 /// Request keys of the G4 replay corpus (gql.transaction:1000002 and :1000003): the

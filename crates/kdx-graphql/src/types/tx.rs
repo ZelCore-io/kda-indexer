@@ -188,7 +188,13 @@ impl TransactionCommand {
         TransactionMeta {
             chain_id: BigInt::new(int_of(g("chainId"))),
             creation_time: crate::txlist::creation_time(self.cmd()).unwrap_or(DateTime(0)),
-            gas_limit: BigInt::text(int_of(g("gasLimit"))),
+            // Stock quirk (G4 run 2, all 5,193 recorded `isCoinbase` answers): a coinbase row's
+            // `gasLimit` is the JSON number 0, every user tx's a string.
+            gas_limit: if self.d.is_coinbase() {
+                BigInt::new(int_of(g("gasLimit")))
+            } else {
+                BigInt::text(int_of(g("gasLimit")))
+            },
             gas_price: FloatText(format!("{}", float_of(g("gasPrice")))),
             sender: str_of(g("sender")),
             ttl: BigInt::text(int_of(g("ttl"))),
@@ -1162,7 +1168,7 @@ mod tests {
         });
         let d = Arc::new(TxData {
             rec: kdx_types::record::TxRecord {
-                key: TxKey::new(5, 1, 0),
+                key: TxKey::new(5, 1, 1), // position 0 is the coinbase
                 request_key: Some(Hash32([9; 32])),
                 ..Default::default()
             },
@@ -1243,7 +1249,7 @@ mod tests {
         };
         assert!(dec(&v["event"]["id"]).starts_with("Event:["), "{v}");
         assert!(
-            dec(&v["event"]["id"]).contains(r#"","0","#),
+            dec(&v["event"]["id"]).contains(r#"","1","#),
             "{}",
             dec(&v["event"]["id"])
         );
