@@ -808,6 +808,17 @@ posting) is listed within about 10 minutes plus the queue ahead of it; after tha
 is listed again every 7 days. A first sweep takes about 20 steps per token, so about 20 s per
 token (about 6 h for 1,000 tokens, estimate) when every read is quick.
 
+Skip list: `balances.keylist_skip` (default `["free.crankk01"]`) names modules the listing never
+reads: no `describe-module` and no `keys`, on any chain, so a skipped module costs no budget and
+leaves no stored state. Why: the node itself blocks its cut while it answers a `keys` of a huge
+table. `free.crankk01.crankk01-token-table` held chain 0 for about 14 minutes per read on
+mainnet01 (Nov 2026), and the node cannot be told to stop. Parking a (token, chain) after the
+first timeout does not help a production node, because that first read already freezes its
+chain, so a module known to be huge is skipped up front. Setting `keylist_skip` replaces the
+default (keep `free.crankk01` in it). `reconcile-balances --status` shows `keylist_skipped`
+(`count`, `modules`). A skipped token's keys that no tx names are not found by the listing; the
+rest of the balance work (postings, D3 history, reconcile) covers it as before.
+
 Only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are marked, through
 the postings' mark path, at the height the node read; the reconcile then reads them like any
 dirty row. Names are interned only for keys that will be marked, and new keys of a module stop

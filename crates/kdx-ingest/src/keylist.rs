@@ -21,6 +21,8 @@
 //!   ERROR and the task restarted after [`PANIC_PAUSE`] (R-4). With `balances.local_concurrency`
 //!   = 1 the listing is off ([`enabled`], R-3): a read would hold the only slot. Progress (`Meta
 //!   balances_keylist/<module>`) is kept per step, so a restart resumes.
+//! - `balances.keylist_skip`: modules never read on any chain (the first `keys` of a huge table
+//!   already blocks the node's cut, so parking after a timeout is too late); `due` leaves them out.
 //! - A module with no ledger table on a chain lists nothing there, like a module not deployed
 //!   (no failure; looked at again at the next sweep).
 //! - Failures are per `(token, chain)`: an unusable or over-cap answer or a pact failure marks
@@ -427,8 +429,13 @@ pub fn state(txn: &impl Txn, module: u32) -> Result<ListState> {
 
 /// The tokens due for a listing at `now`, by name, oldest listing first (never listed
 /// first): tracked tokens other than `coin`, not-fungible verdicts and capped tokens, whose
-/// names pass the B-1 check.
-pub fn due(txn: &impl Txn, dict: &impl Dict, now: u32) -> Result<Vec<(u32, String, ListState)>> {
+/// names pass the B-1 check, and that are not in `skip` (`balances.keylist_skip`: never read).
+pub fn due(
+    txn: &impl Txn,
+    dict: &impl Dict,
+    now: u32,
+    skip: &[String],
+) -> Result<Vec<(u32, String, ListState)>> {
     let coin = balances::coin_module(txn)?;
     let mut out = Vec::new();
     for (k, v) in txn.scan(Table::Tokens, &[], |_| true)? {
@@ -442,7 +449,7 @@ pub fn due(txn: &impl Txn, dict: &impl Dict, now: u32) -> Result<Vec<(u32, Strin
         let Some(name) = dict.name(DictKind::Module, id) else {
             continue;
         };
-        if !valid_module(name) {
+        if !valid_module(name) || skip.iter().any(|s| s == name) {
             continue;
         }
         let st = state(txn, id)?;
@@ -614,6 +621,8 @@ pub struct KeyList {
     pause: Duration,
     /// Timeout of one read ([`READ_TIMEOUT`]; tests shorten it).
     read_timeout: Duration,
+    /// `balances.keylist_skip`: modules never sent a read on any chain.
+    skip: Vec<String>,
 }
 
 impl Default for KeyList {
@@ -625,6 +634,7 @@ impl Default for KeyList {
             node_errors: 0,
             pause: Duration::ZERO,
             read_timeout: READ_TIMEOUT,
+            skip: Vec::new(),
         }
     }
 }
@@ -745,7 +755,7 @@ pub async fn step(
             return Ok(false);
         }
         let d = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());
-        kl.queue = due(&ro, &*d, now_unix())?.into();
+        kl.queue = due(&ro, &*d, now_unix(), &kl.skip)?.into();
         if !kl.queue.is_empty() {
             tracing::info!(
                 tokens = kl.queue.len(),
@@ -937,10 +947,17 @@ pub async fn run(
     ctx: Arc<Ctx>,
     local: Arc<LocalClient>,
     caps: crate::reconcile::Caps,
+    skip: Vec<String>,
     stop: CancellationToken,
 ) {
     supervise(&stop, PANIC_PAUSE, || {
-        tokio::spawn(run_task(ctx.clone(), local.clone(), caps, stop.clone()))
+        tokio::spawn(run_task(
+            ctx.clone(),
+            local.clone(),
+            caps,
+            skip.clone(),
+            stop.clone(),
+        ))
     })
     .await;
 }
@@ -976,9 +993,13 @@ async fn run_task(
     ctx: Arc<Ctx>,
     local: Arc<LocalClient>,
     caps: crate::reconcile::Caps,
+    skip: Vec<String>,
     stop: CancellationToken,
 ) {
-    let mut kl = KeyList::default();
+    let mut kl = KeyList {
+        skip,
+        ..KeyList::default()
+    };
     loop {
         let r = tokio::select! {
             _ = stop.cancelled() => return,
@@ -1346,7 +1367,7 @@ mod tests {
         txn.set_meta(&state_key(ids[0]), &old.encode()).unwrap();
         txn.commit().unwrap();
         let d = ctx.dict.lock().unwrap();
-        let names: Vec<String> = due(&ctx.hot.ro().unwrap(), &*d, 100 + SWEEP_SECS)
+        let names: Vec<String> = due(&ctx.hot.ro().unwrap(), &*d, 100 + SWEEP_SECS, &[])
             .unwrap()
             .into_iter()
             .map(|(_, n, _)| n)
@@ -1700,6 +1721,65 @@ mod tests {
         gone.begin(1 + UNLISTABLE_SECS);
         assert!(gone.chains[0].parked() && !gone.selected(0, u32::MAX - 1));
         assert!(gone.selected(1, 1 + UNLISTABLE_SECS) && gone.fail_total == 0);
+    }
+
+    /// `balances.keylist_skip`: a skipped module is never sent a read (`describe-module` or
+    /// `keys`) on any chain, costs no budget and leaves no stored state; other tokens list as
+    /// before. The node blocks its cut while it answers a `keys` of a huge table, so even the
+    /// first read must not happen.
+    #[tokio::test]
+    async fn a_skipped_module_is_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let skipped_reads = Arc::new(AtomicUsize::new(0));
+        let seen = skipped_reads.clone();
+        let answer: Arc<Answer> = Arc::new(move |_, code, _| {
+            if code.contains("crankk01") {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+            if code.contains("describe-module") {
+                ok(json!(KAYC))
+            } else {
+                ok(json!(["ROOT"]))
+            }
+        });
+        let (ctx, local, ids, calls) = setup(dir.path(), &["free.crankk01", "free.fine"], answer);
+        let mut kl = KeyList {
+            skip: vec!["free.crankk01".into()],
+            ..KeyList::default()
+        };
+        run_steps(&ctx, &local, &mut kl, 10).await;
+        assert_eq!(
+            skipped_reads.load(Ordering::SeqCst),
+            0,
+            "no read of a skipped module"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "free.fine: 2 chains x (describe + keys)"
+        );
+        let ro = ctx.hot.ro().unwrap();
+        assert_eq!(
+            state(&ro, ids[0]).unwrap(),
+            ListState::default(),
+            "no state, no budget"
+        );
+        assert!(state(&ro, ids[1]).unwrap().listed_at > 0);
+        assert_eq!(dirty(&ctx, "ROOT", ids[0], 0), None);
+        assert_eq!(
+            summary(&ro).unwrap(),
+            Summary {
+                listed: 1,
+                ..Summary::default()
+            }
+        );
+        // Even a due token of the list is refused by `due`, the sweep included.
+        let d = ctx.dict.lock().unwrap();
+        let all = due(&ro, &*d, now_unix() + 10 * SWEEP_SECS, &kl.skip).unwrap();
+        assert_eq!(
+            all.iter().map(|t| t.1.as_str()).collect::<Vec<_>>(),
+            ["free.fine"]
+        );
     }
 
     /// H-1: a junk token (every `keys` read times out) goes to the back of the queue after each
