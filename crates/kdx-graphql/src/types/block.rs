@@ -217,6 +217,7 @@ impl Block {
                 sender: None,
                 nft: false,
                 module: None,
+                coinbase: false,
             },
         };
         let p = block_list(ctx, spec, PageArgs::new(after, before, first, last)).await?;

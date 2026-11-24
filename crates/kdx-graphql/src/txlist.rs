@@ -5,7 +5,9 @@
 //!   and a row rule that turns each tx into zero or more items.
 //! - List order is TxKey descending (height, then chain, then position in the block) and,
 //!   inside one tx, descending by event position (the oracle's order, R-P5P9-19: order
-//!   index 1 before 0). Cursors are `kdx_api::Cursor` (TxKey +
+//!   index 1 before 0). `transactions(isCoinbase: true)` puts each block's coinbase before
+//!   the block's user txs, as stock orders it ([`coinbase_first`]). Cursors are
+//!   `kdx_api::Cursor` (TxKey +
 //!   position + block fingerprint), so they are portable across instances and refused after
 //!   a reorg of their block.
 //! - A cursor names a row: its tx and the row's position in the tx (`sub`: the event
@@ -68,7 +70,7 @@ pub const SCAN_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A tx with everything its GraphQL fields read: the record, its block, the rendered output,
 /// the parsed command, events and transfers (chainweb-data rules, as compat).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TxData {
     pub rec: TxRecord,
     pub block: Arc<BlockRecord>,
@@ -253,8 +255,12 @@ pub enum SourceSpec {
     /// of the event name (an `events.parametersFilter` whose first value is a string).
     AcctOrEvt { account: String, qual: String },
     /// Every stored copy of a request key; with `block`, only the copy in that block (stock
-    /// ANDs `requestKey` and `blockHash`; audit F-30).
-    Rk { rk: Hash32, block: Option<Hash32> },
+    /// ANDs `requestKey` and `blockHash`; audit F-30). `rk` is `None` for a key that is no
+    /// hash: no copies ([`rk_arg`]).
+    Rk {
+        rk: Option<Hash32>,
+        block: Option<Hash32>,
+    },
     /// The txs of one block.
     Block(Hash32),
     /// Every user tx, heights walked down from the tip (GQ-20 exception).
@@ -325,6 +331,9 @@ pub enum Rows {
         sender: Option<String>,
         nft: bool,
         module: Option<String>,
+        /// Keep coinbase txs too (`transactions(isCoinbase: true)`, as stock: its
+        /// `t.sender != 'coinbase'` condition is dropped, nothing else changes).
+        coinbase: bool,
     },
     /// Its events (named `qual` when given: `Block.events` lists them all; of `module` when
     /// given, the ZelCore `events(moduleName)` extension), with the optional `orderIndex` and
@@ -371,6 +380,7 @@ impl Rows {
                 sender: None,
                 nft: false,
                 module: None,
+                coinbase: _,
             }
         )
     }
@@ -381,8 +391,9 @@ impl Rows {
                 sender,
                 nft,
                 module,
+                coinbase,
             } => {
-                if d.is_coinbase() {
+                if d.is_coinbase() && !coinbase {
                     return vec![];
                 }
                 if sender.as_deref().is_some_and(|s| d.sender() != Some(s)) {
@@ -485,10 +496,12 @@ fn plan(view: &View, spec: &ListSpec) -> ApiResult<(Src, Rows)> {
                 sender: _,
                 nft,
                 module,
+                coinbase,
             } => Rows::Txs {
                 sender: None,
                 nft: *nft,
                 module: module.clone(),
+                coinbase: *coinbase,
             },
             r => r.clone(),
         };
@@ -550,9 +563,16 @@ fn resolve(view: &View, s: &SourceSpec) -> ApiResult<Src> {
                 None => Src::Empty,
             },
         },
-        SourceSpec::Rk { rk, block: None } => Src::Rk(*rk, None),
+        SourceSpec::Rk { rk: None, .. } => Src::Empty,
+        SourceSpec::Rk {
+            rk: Some(rk),
+            block: None,
+        } => Src::Rk(*rk, None),
         // The store keeps the canonical chain only: a hash names one (chain, height).
-        SourceSpec::Rk { rk, block: Some(h) } => match view.block_by_hash(h)? {
+        SourceSpec::Rk {
+            rk: Some(rk),
+            block: Some(h),
+        } => match view.block_by_hash(h)? {
             Some((c, height, _)) => Src::Rk(*rk, Some((c, height))),
             None => Src::Empty,
         },
@@ -603,6 +623,76 @@ struct Bounds {
     /// When a walk that skips keys internally (the `sndr` ∩ `xfer` intersection) must give
     /// up with [`ApiError::Deadline`]: the page's scan window or the count's budget.
     until: Option<Instant>,
+    /// The coinbase is the first row of its block ([`coinbase_first`]): keys compare by
+    /// [`rank`] and the walk yields each block's coinbase before its user txs.
+    cb_first: bool,
+}
+
+/// Whether `spec`'s newest-first walk puts each block's coinbase before its user txs:
+/// `transactions(isCoinbase: true)`, as stock orders by creation time and the coinbase has the
+/// block's (controller ruling on PR #30). A list of one block is already in node order, the
+/// coinbase first ([`run_page`]), and lists without the flag have no coinbase rows, so both keep
+/// the TxKey order and their cursors.
+fn coinbase_first(spec: &ListSpec) -> bool {
+    matches!(spec.rows, Rows::Txs { coinbase: true, .. })
+        && !matches!(spec.source, SourceSpec::Block(_))
+}
+
+/// Position a coinbase row takes in a [`coinbase_first`] walk: above every user tx of its block
+/// (no block holds `u16::MAX` txs). Its page cursor carries this key, so `after` and `before`
+/// compare it in the walk's order; the cursor's block fingerprint reads only height and chain.
+/// User txs keep their own key, so their cursors are the ones the list without the flag gives.
+fn rank(k: TxKey, cb_first: bool) -> TxKey {
+    if cb_first && k.is_coinbase() {
+        TxKey::new(k.height(), k.chain(), u16::MAX)
+    } else {
+        k
+    }
+}
+
+/// A newest-first key walk with each block's coinbase moved before the block's user txs. The
+/// source yields a block's keys together and its coinbase (position 0) last, so this holds back
+/// at most one block's user keys. An error passes through after the keys held back.
+struct CoinbaseFirst<'v> {
+    inner: KeySource<'v>,
+    held: Vec<(TxKey, Option<TxRecord>)>,
+    out: std::collections::VecDeque<ApiResult<(TxKey, Option<TxRecord>)>>,
+}
+
+impl Iterator for CoinbaseFirst<'_> {
+    type Item = ApiResult<(TxKey, Option<TxRecord>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let block = |k: TxKey| (k.height(), k.chain());
+        while self.out.is_empty() {
+            match self.inner.next() {
+                None => {
+                    self.out.extend(self.held.drain(..).map(Ok));
+                    break;
+                }
+                Some(Err(e)) => {
+                    self.out.extend(self.held.drain(..).map(Ok));
+                    self.out.push_back(Err(e));
+                }
+                Some(Ok((k, r))) => {
+                    if self
+                        .held
+                        .first()
+                        .is_some_and(|(h, _)| block(*h) != block(k))
+                    {
+                        self.out.extend(self.held.drain(..).map(Ok));
+                    }
+                    if k.is_coinbase() {
+                        self.out.push_back(Ok((k, r)));
+                        self.out.extend(self.held.drain(..).map(Ok));
+                    } else {
+                        self.held.push((k, r));
+                    }
+                }
+            }
+        }
+        self.out.pop_front()
+    }
 }
 
 type KeySource<'v> = Box<dyn Iterator<Item = ApiResult<(TxKey, Option<TxRecord>)>> + 'v>;
@@ -647,7 +737,7 @@ fn keys<'v>(
             && f.chain.is_none_or(|c| k.chain() == c)
             && min_h.is_none_or(|m| k.height() >= m)
             && max_h.is_none_or(|m| k.height() <= m)
-            && b.upto.is_none_or(|u| k <= u)
+            && b.upto.is_none_or(|u| rank(k, b.cb_first) <= u)
             && caps.allows(k)
     };
     let listed = |mut v: Vec<(TxKey, TxRecord)>| -> KeySource<'v> {
@@ -655,7 +745,7 @@ fn keys<'v>(
         v.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
         Box::new(v.into_iter().map(|(k, r)| Ok((k, Some(r)))))
     };
-    Ok(match src {
+    let walk: KeySource<'v> = match src {
         Src::Empty => Box::new(std::iter::empty()),
         Src::Post(fam, entity) => {
             let q = PostingQuery {
@@ -739,6 +829,15 @@ fn keys<'v>(
                 buf = v.into_iter();
             }))
         }
+    };
+    Ok(if b.cb_first {
+        Box::new(CoinbaseFirst {
+            inner: walk,
+            held: Vec::new(),
+            out: Default::default(),
+        })
+    } else {
+        walk
     })
 }
 
@@ -861,7 +960,7 @@ fn past(deadline: Instant, i: usize) -> ApiResult<()> {
 /// order, each tx's rows by ascending position. That is the newest-first walk read from
 /// the other end: a forward page is the backward page of the walk, reversed, with
 /// `hasNextPage` and `hasPreviousPage` swapped (and the other way round). Cursors are the
-/// same tokens. Every other list stays newest first.
+/// same tokens. Every other list stays newest first ([`coinbase_first`] for the coinbase).
 pub fn run_page(
     view: &View,
     spec: &ListSpec,
@@ -899,6 +998,12 @@ fn run_page_desc(
     deadline: Instant,
 ) -> ApiResult<(Vec<(String, Item)>, PageInfo)> {
     let cur = tx_cursor(view, page)?;
+    let cb_first = coinbase_first(spec);
+    let cursor = |d: &TxData, sub: u16| {
+        let mut c = d.cursor(sub);
+        c.key = rank(c.key, cb_first);
+        c.encode()
+    };
     let (src, rows) = plan(view, spec)?;
     let caps = Caps::of(view, &spec.filter)?;
     let mut blocks = Blocks::default();
@@ -909,6 +1014,7 @@ fn run_page_desc(
                 upto: cur.map(|c| c.key),
                 min_h: None,
                 until: Some(deadline),
+                cb_first,
             };
             'k: for (i, kr) in keys(view, &src, spec.filter, &caps, b)?.enumerate() {
                 past(deadline, i)?;
@@ -919,10 +1025,10 @@ fn run_page_desc(
                 let mut rs = rows.rows(&d);
                 rs.reverse();
                 for (sub, it) in rs {
-                    if cur.is_some_and(|c| c.key == k && sub >= c.sub) {
+                    if cur.is_some_and(|c| c.key == rank(k, cb_first) && sub >= c.sub) {
                         continue;
                     }
-                    walked.push((d.cursor(sub).encode(), it));
+                    walked.push((cursor(&d, sub), it));
                     if walked.len() > page.n {
                         break 'k;
                     }
@@ -934,12 +1040,13 @@ fn run_page_desc(
                 upto: None,
                 min_h: cur.map(|c| c.key.height()),
                 until: Some(deadline),
+                cb_first,
             };
             let mut ks = Vec::new();
             for (i, kr) in keys(view, &src, spec.filter, &caps, b)?.enumerate() {
                 past(deadline, i)?;
                 let (k, _) = kr?;
-                if cur.is_some_and(|c| k < c.key) {
+                if cur.is_some_and(|c| rank(k, cb_first) < c.key) {
                     break;
                 }
                 ks.push(k);
@@ -955,10 +1062,10 @@ fn run_page_desc(
                     continue;
                 };
                 for (sub, it) in rows.rows(&d) {
-                    if cur.is_some_and(|c| c.key == k && sub <= c.sub) {
+                    if cur.is_some_and(|c| c.key == rank(k, cb_first) && sub <= c.sub) {
                         continue;
                     }
-                    walked.push((d.cursor(sub).encode(), it));
+                    walked.push((cursor(&d, sub), it));
                     if walked.len() > page.n {
                         break 'b;
                     }
@@ -1394,6 +1501,13 @@ pub fn height_arg(name: &str, v: Option<i32>) -> async_graphql::Result<Option<u3
         Some(x) if x >= 0 => Ok(Some(x as u32)),
         Some(_) => Err(bad_input(format!("{name} must not be negative"))),
     }
+}
+
+/// A request key argument used as a lookup: `None` when it is no hash, which finds nothing.
+/// Stock compares the text with its stored keys, so such a key (a base64-wrapped coinbase key
+/// from its own lists, any other text) answers `null` or no rows, never an error (G4 class 2).
+pub fn rk_arg(s: &str) -> Option<Hash32> {
+    hash_arg("requestKey", s).ok()
 }
 
 /// A request key or block hash argument (43-char base64url).
