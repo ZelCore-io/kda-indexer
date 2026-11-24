@@ -66,8 +66,8 @@
 //!     row in batches that did not back off is parked (`parked`: mark dropped until the next
 //!     tail mark, row flagged `unverified`). A backed-off batch counts nothing and resets the counts (SR-2):
 //!     a node outage parks no key. Never read as a zero balance.
-//! - Heartbeat: `Meta balances_reconcile_stats` (JSON: unix time, rows done, rate, dirty) per
-//!   batch; not part of the systemd watchdog.
+//! - Heartbeat: `Meta balances_reconcile_stats` (JSON: unix time, rows done, in-batch `rate`,
+//!   wall-clock `wall_rate`, dirty) per batch; not part of the systemd watchdog.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -193,29 +193,34 @@ fn module_of(key: &[u8; 9]) -> u32 {
 }
 
 /// Round-robin over modules, the module with the oldest key first, until `out` holds `n`.
-fn fair(out: &mut Vec<Dirty>, by_module: HashMap<u32, Heap>, n: usize, seed: bool) {
+/// Two passes over the same lists: the fair pass deals at most `share` rows per module; the
+/// top-up pass then fills the room that is left with the modules' remaining rows, one per
+/// module per round, uncapped. So `share` orders the slots and never shrinks the batch.
+fn fair(out: &mut Vec<Dirty>, by_module: HashMap<u32, Heap>, n: usize, share: usize, seed: bool) {
     let mut lists: Vec<Vec<(Mark, [u8; 9])>> = by_module
         .into_values()
         .map(BinaryHeap::into_sorted_vec)
         .filter(|l| !l.is_empty())
         .collect();
     lists.sort_by_key(|l| l[0]);
-    let mut i = 0;
-    while out.len() < n {
-        let mut any = false;
-        for l in &lists {
-            if out.len() >= n {
+    for (from, to) in [(0, share), (share, usize::MAX)] {
+        let mut i = from;
+        while i < to && out.len() < n {
+            let mut any = false;
+            for l in &lists {
+                if out.len() >= n {
+                    break;
+                }
+                if let Some(&(mark, key)) = l.get(i) {
+                    out.push(Dirty { key, mark, seed });
+                    any = true;
+                }
+            }
+            if !any {
                 break;
             }
-            if let Some(&(mark, key)) = l.get(i) {
-                out.push(Dirty { key, mark, seed });
-                any = true;
-            }
+            i += 1;
         }
-        if !any {
-            break;
-        }
-        i += 1;
     }
 }
 
@@ -223,7 +228,9 @@ fn fair(out: &mut Vec<Dirty>, by_module: HashMap<u32, Heap>, n: usize, seed: boo
 /// 1. tail marks of `coin`, oldest first;
 /// 2. tail marks of the other modules, round-robin over modules, at most `share` each;
 /// 3. only when 1 and 2 leave room, the seed backlog (the first `SEED_WINDOW × n` rows of
-///    `BalanceSeed`): `coin` first, then the other modules as in 2.
+///    `BalanceSeed`): `coin` first, then the other modules round-robin, at most `share` each
+///    in the fair pass; the room that is left is topped up from the window's remaining rows
+///    without the cap (a window of one module is a full batch, not `share` rows).
 ///
 /// Tail marks are all of `BalanceDirty` (what changed since its last reconcile); every batch
 /// takes a fresh refill, so a new `coin` mark waits at most one batch, whatever other modules
@@ -263,7 +270,7 @@ pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
             seed: false,
         })
         .collect();
-    fair(&mut out, by_module, n, false);
+    fair(&mut out, by_module, n, share, false);
     if out.len() < n {
         let rows = hot.ro()?.scan_limit(
             Table::BalanceSeed,
@@ -285,14 +292,16 @@ pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
                     });
                 }
             } else {
+                // Up to `n` per module: the fair pass uses `share` of them, the top-up pass
+                // the rest, so a window of one module still fills the batch.
                 keep(
                     by_module.entry(module_of(&key)).or_default(),
                     (mark, key),
-                    share,
+                    n,
                 );
             }
         }
-        fair(&mut out, by_module, n, true);
+        fair(&mut out, by_module, n, share, true);
     }
     Ok(out)
 }
@@ -1278,11 +1287,27 @@ fn nft_failed(e: &anyhow::Error, retry: Duration) {
     );
 }
 
-/// Write the heartbeat and the dirty gauge.
-fn heartbeat(ctx: &Ctx, done: u64, rate: f64) -> Result<usize> {
+/// Rows cleared per second of wall-clock time since the loop started: refill, discovery, the
+/// history slice, the NFT steps and idle waits all count (unlike the in-batch `rate`, which
+/// times `reconcile_batch` alone). Zero until a second has passed, so a first fast batch does
+/// not report a huge rate.
+fn wall_rate(done: u64, elapsed: Duration) -> f64 {
+    let secs = elapsed.as_secs_f64();
+    if secs < 1.0 {
+        0.0
+    } else {
+        done as f64 / secs
+    }
+}
+
+/// Write the heartbeat and the dirty gauge. `rate` is the in-batch EWMA, `wall_rate` the
+/// wall-clock throughput of the loop ([`wall_rate`]); `--status` bases its ETA on the latter.
+fn heartbeat(ctx: &Ctx, done: u64, rate: f64, wall_rate: f64) -> Result<usize> {
     let dirty = balances::dirty_count(&ctx.hot.ro()?)?;
     kdx_metrics::get().balance_dirty_rows.set(dirty as i64);
-    let s = json!({"t": now_unix(), "done": done, "rate": rate, "dirty": dirty});
+    let s = json!({
+        "t": now_unix(), "done": done, "rate": rate, "wall_rate": wall_rate, "dirty": dirty
+    });
     let mut txn = ctx.hot.rw()?;
     txn.set_meta(META_STATS, s.to_string().as_bytes())?;
     txn.commit()?;
@@ -1360,6 +1385,7 @@ async fn run_with(
     let mut last_recheck: Option<Instant> = None;
     let mut done = 0u64;
     let mut rate = 0.0f64;
+    let started = Instant::now();
     let mut last_log = Instant::now();
     let mut watch = BranchWatch::default();
     let mut history = History::default();
@@ -1439,12 +1465,14 @@ async fn run_with(
         done += k;
         let r = k as f64 / t0.elapsed().as_secs_f64().max(1e-3);
         rate = if rate == 0.0 { r } else { 0.8 * rate + 0.2 * r };
-        let dirty = heartbeat(&ctx, done, rate)?;
+        let wall = wall_rate(done, started.elapsed());
+        let dirty = heartbeat(&ctx, done, rate, wall)?;
         if last_log.elapsed() > Duration::from_secs(60) {
             tracing::info!(
                 done,
                 dirty,
                 rate = format!("{rate:.1}"),
+                wall_rate = format!("{wall:.1}"),
                 ?st,
                 "balances: reconcile"
             );
@@ -2494,6 +2522,92 @@ pub(crate) mod tests {
         assert_eq!(txn.count(Table::BalanceSeed).unwrap(), 299);
         assert_eq!(balances::dirty_count(&txn).unwrap(), 1 + 300 + 1 + 299 + 1);
         assert!(balances::is_dirty(&txn, accts[1], coin, 1).unwrap());
+    }
+
+    /// The wall-clock rate counts the whole elapsed time, waits included, and stays zero
+    /// within the first second.
+    #[test]
+    fn wall_rate_counts_all_elapsed_time() {
+        assert_eq!(wall_rate(600, Duration::from_secs(60)), 10.0);
+        assert_eq!(wall_rate(600, Duration::from_secs(120)), 5.0);
+        assert_eq!(wall_rate(600, Duration::from_millis(500)), 0.0);
+    }
+
+    /// Seed `count` rows of `module` (chain 0) for accounts named `{prefix}{i}`.
+    fn seed_rows(hot: &HotStore, module: u32, prefix: &str, count: usize) {
+        let names: Vec<String> = (0..count).map(|i| format!("{prefix}{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let accts = intern(hot, DictKind::Account, &refs);
+        let mut txn = hot.rw().unwrap();
+        let sm = Mark {
+            height: 0,
+            seq: txn.txn_id().unwrap(),
+        }
+        .encode();
+        for &a in &accts {
+            balances::seed_mark(&mut txn, &balances::bal_key(a, module, 0), &sm).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// A seed window that holds one non-coin module only still fills the whole batch: the
+    /// per-module share orders the slots, it does not shrink the batch (the 2026-11 drain
+    /// slowdown: batches of ~70 rows instead of 256).
+    #[test]
+    fn a_single_module_seed_window_fills_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _coin, _ids) = setup(dir.path(), &[]);
+        let spam = intern(&hot, DictKind::Module, &["free.spam"])[0];
+        seed_rows(&hot, spam, "a", 400);
+        let b = refill(&hot, 8, 4).unwrap();
+        assert_eq!(b.len(), 8);
+        assert!(b.iter().all(|d| d.seed && module_of(&d.key) == spam));
+        let distinct: HashSet<_> = b.iter().map(|d| d.key).collect();
+        assert_eq!(distinct.len(), 8);
+    }
+
+    /// With `coin` rows in the window too, the room `coin` leaves is topped up from the one
+    /// module that has rows left, and `coin` stays uncapped.
+    #[test]
+    fn a_coin_plus_single_module_seed_window_fills_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, _ids) = setup(dir.path(), &[]);
+        let spam = intern(&hot, DictKind::Module, &["free.spam"])[0];
+        seed_rows(&hot, coin, "c", 5);
+        seed_rows(&hot, spam, "s", 400);
+        let b = refill(&hot, 16, 4).unwrap();
+        assert_eq!(b.len(), 16);
+        assert_eq!(b.iter().filter(|d| module_of(&d.key) == coin).count(), 5);
+        assert_eq!(b.iter().filter(|d| module_of(&d.key) == spam).count(), 11);
+    }
+
+    /// A mixed window still shares the slots fairly: two big modules split a small batch
+    /// evenly, and a small module is served in full before a big one takes the rest.
+    #[test]
+    fn a_mixed_seed_window_still_shares_slots_fairly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _coin, _ids) = setup(dir.path(), &[]);
+        let mods = intern(
+            &hot,
+            DictKind::Module,
+            &["free.big", "free.big2", "free.small"],
+        );
+        let (big, big2, small) = (mods[0], mods[1], mods[2]);
+        seed_rows(&hot, big, "a", 60);
+        seed_rows(&hot, big2, "b", 60);
+        let b = refill(&hot, 8, 4).unwrap();
+        assert_eq!(b.len(), 8);
+        assert_eq!(b.iter().filter(|d| module_of(&d.key) == big).count(), 4);
+        assert_eq!(b.iter().filter(|d| module_of(&d.key) == big2).count(), 4);
+        // A small module joins: it gets its two rows, the big ones split what is left.
+        seed_rows(&hot, small, "z", 2);
+        let b = refill(&hot, 16, 4).unwrap();
+        assert_eq!(b.len(), 16);
+        let count = |m| b.iter().filter(|d| module_of(&d.key) == m).count();
+        assert_eq!((count(small), count(big), count(big2)), (2, 7, 7));
+        // Slots are dealt round-robin: the first round holds one row of each module.
+        let first: HashSet<_> = b[..3].iter().map(|d| module_of(&d.key)).collect();
+        assert_eq!(first.len(), 3);
     }
 
     /// I-6: rows of a module that did not pass the fungible check keep their balance, but their
