@@ -9,18 +9,19 @@
 //! as a string. Otherwise the answer is null.
 //!
 //! What we keep instead of scanning every result (rulings in `docs/graphql.md`):
-//! - a **swap** is a successful tx with an event named `*.SWAP` (Kaddex/eckoDEX
-//!   `kaddex.exchange.SWAP`, KDSwap `kdlaunch.kdswap-exchange.SWAP`, any fork) whose
+//! - a **swap** is a successful tx with a [`DEX_SWAP_EVENTS`] event (Kaddex/eckoDEX
+//!   `kaddex.exchange.SWAP`, KDSwap `kdlaunch.kdswap-exchange.SWAP`) whose
 //!   `result.data` is a list with a non-empty string `token` in elements 0 and 1;
 //! - one row per (chain, token) for every string `token` in the list (a routed swap names 3+
 //!   tokens; stock matches all of them by text): the swap's order key and elements 0 and 1;
 //! - order key `(meta.creationTime, height, chain, position)`, newest wins;
 //! - a lookup matches `moduleName` against the stored token names as stock's `LIKE` pattern
-//!   (`%` and `_` wildcards, `\` escape) and takes the newest matching row.
+//!   (`%` and `_` wildcards, `\` escape) and takes the newest matching row; it reads at most
+//!   [`LIKE_SCAN_ROWS`] rows, and on a larger table matches the exact name (a prefix range).
 //!
 //! | Table | Key | Value |
 //! |---|---|---|
-//! | `TokenSwaps` | chain u8, token (utf-8) | creationTime u64, TxKey u64, then 4 × varint-length bytes: token 0, amount 0 JSON, token 1, amount 1 JSON |
+//! | `TokenSwaps` | token (utf-8), chain u8 | creationTime u64, TxKey u64, then 4 × varint-length bytes: token 0, amount 0 JSON, token 1, amount 1 JSON |
 //!
 //! Reorgs: every row a tail block writes is logged with its previous value in
 //! `Meta price_undo/{chain}/{height}` (like the D3 marks); an unwind restores them newest first,
@@ -46,11 +47,21 @@ pub mod meta {
 
 /// `TokenSwaps` key.
 pub fn row_key(chain: u8, token: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(1 + token.len());
-    k.push(chain);
+    let mut k = Vec::with_capacity(token.len() + 1);
     k.extend_from_slice(token.as_bytes());
+    k.push(chain);
     k
 }
+
+/// The DEX swap events we trust (security review: swap events are written by anyone's
+/// module, so only these exchanges feed `TokenSwaps`). Kaddex/eckoDEX and KDSwap.
+pub const DEX_SWAP_EVENTS: &[&str] = &["kaddex.exchange.SWAP", "kdlaunch.kdswap-exchange.SWAP"];
+/// Longest token name stored (longer names are skipped; Pact module names are far shorter).
+pub const MAX_TOKEN_LEN: usize = 256;
+/// Most tokens one swap may update (a routed swap names one per hop).
+pub const MAX_TOKENS_PER_SWAP: usize = 8;
+/// Rows a `LIKE` lookup may read; above it the lookup matches the exact name only.
+pub const LIKE_SCAN_ROWS: usize = 20_000;
 
 pub fn undo_key(chain: u8, height: u32) -> String {
     format!("{}{chain:02}/{height:010}", meta::PRICE_UNDO)
@@ -106,9 +117,9 @@ pub struct Swap {
     pub tokens: Vec<String>,
 }
 
-/// An event name (`<module>.<NAME>`) a DEX emits for a swap.
+/// An event name (`<module>.<NAME>`) of a trusted DEX swap ([`DEX_SWAP_EVENTS`]).
 pub fn is_swap_event_name(name: &str) -> bool {
-    name.rsplit_once('.').is_some_and(|(_, n)| n == "SWAP")
+    DEX_SWAP_EVENTS.contains(&name)
 }
 
 pub fn has_swap_event(dict: &dyn Dict, events: &[EventRec]) -> bool {
@@ -132,7 +143,9 @@ pub fn creation_time(cmd: Option<&[u8]>) -> u64 {
 }
 
 fn token_of(e: &Value) -> Option<&str> {
-    e.get("token")?.as_str().filter(|s| !s.is_empty())
+    e.get("token")?
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= MAX_TOKEN_LEN)
 }
 
 /// The swap in a successful tx's `result.data`, when elements 0 and 1 carry a token.
@@ -143,6 +156,9 @@ pub fn swap_of(key: TxKey, ctime: u64, data: &Value) -> Option<Swap> {
     let amount = |e: &Value| e.get("amount").map(|a| a.to_string()).unwrap_or_default();
     let mut tokens: Vec<String> = Vec::new();
     for t in list.iter().filter_map(token_of) {
+        if tokens.len() == MAX_TOKENS_PER_SWAP {
+            break;
+        }
         if !tokens.iter().any(|x| x == t) {
             tokens.push(t.to_owned());
         }
@@ -231,13 +247,31 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
 }
 
 /// The newest stored swap whose token matches `module` as stock's `LIKE '%module%'`.
+/// Bounded: reads at most [`LIKE_SCAN_ROWS`] + 1 rows; when the table is larger, only rows
+/// whose token equals `module` (one key range) are considered.
 pub fn lookup(txn: &impl Txn, module: &str) -> Result<Option<SwapRow>> {
+    let all = txn.scan_limit(Table::TokenSwaps, &[], LIKE_SCAN_ROWS + 1, |_| true)?;
+    let (rows, exact) = if all.len() <= LIKE_SCAN_ROWS {
+        (all, false)
+    } else {
+        let p = module.as_bytes().to_vec();
+        let rows = txn.scan_limit(Table::TokenSwaps, &p, 256, |k| k.starts_with(&p))?;
+        (rows, true)
+    };
     let mut best: Option<SwapRow> = None;
-    for (k, v) in txn.scan(Table::TokenSwaps, &[], |_| true)? {
-        let Some(token) = k.get(1..).and_then(|t| std::str::from_utf8(t).ok()) else {
+    for (k, v) in rows {
+        let Some(token) = k
+            .split_last()
+            .and_then(|(_, t)| std::str::from_utf8(t).ok())
+        else {
             continue;
         };
-        if !like_contains(token, module) {
+        let hit = if exact {
+            token == module
+        } else {
+            like_contains(token, module)
+        };
+        if !hit {
             continue;
         }
         let Some(row) = SwapRow::decode(&v) else {
@@ -295,6 +329,15 @@ pub fn like_contains(text: &str, pattern: &str) -> bool {
 // ---------------------------------------------------------------------------------------
 // Price arithmetic: decimal.js as the stock resolver uses it.
 
+/// Longest amount text read (a JS double prints at most ~330 characters).
+const MAX_AMOUNT_TEXT: usize = 1024;
+/// Most significant digits an amount may have (decimal.js divides at 20).
+const MAX_SIG_DIGITS: usize = 80;
+/// Largest decimal exponent of an amount, either way.
+const MAX_EXP: i64 = 1000;
+/// Most integer digits a price may print; a larger one is answered `null`.
+const MAX_INT_DIGITS: i64 = 400;
+
 /// A decimal `digits × 10^exp` (digits most significant first, no leading zeros; empty = 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Dec {
@@ -304,14 +347,25 @@ struct Dec {
 }
 
 impl Dec {
+    /// `None` beyond [`MAX_AMOUNT_TEXT`], [`MAX_SIG_DIGITS`] or [`MAX_EXP`] (security
+    /// review: an unbounded exponent or digit string made division and rendering unbounded).
     fn parse(s: &str) -> Option<Dec> {
+        if s.len() > MAX_AMOUNT_TEXT {
+            return None;
+        }
         let s = s.trim();
         let (neg, s) = match s.strip_prefix('-') {
             Some(r) => (true, r),
             None => (false, s.strip_prefix('+').unwrap_or(s)),
         };
         let (mant, e) = match s.find(['e', 'E']) {
-            Some(i) => (&s[..i], s[i + 1..].parse::<i64>().ok()?),
+            Some(i) => (
+                &s[..i],
+                s[i + 1..]
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|e| e.abs() <= 4 * MAX_EXP)?,
+            ),
             None => (s, 0),
         };
         let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
@@ -328,7 +382,7 @@ impl Dec {
             exp: e.checked_sub(frac.len() as i64)?,
         };
         d.normalize();
-        Some(d)
+        (d.digits.len() <= MAX_SIG_DIGITS && d.exp.abs() <= MAX_EXP).then_some(d)
     }
 
     fn normalize(&mut self) {
@@ -421,8 +475,11 @@ impl Dec {
         out
     }
 
-    /// decimal.js `toFixed(dp)` (half up).
-    fn to_fixed(&self, dp: u32) -> String {
+    /// decimal.js `toFixed(dp)` (half up); `None` past [`MAX_INT_DIGITS`] integer digits.
+    fn to_fixed(&self, dp: u32) -> Option<String> {
+        if self.digits.len() as i64 + self.exp > MAX_INT_DIGITS {
+            return None;
+        }
         let mut r = self.clone();
         let min_exp = -(dp as i64);
         if r.exp < min_exp {
@@ -462,11 +519,11 @@ impl Dec {
                 (frac_len as usize).saturating_sub(have),
             ));
         }
-        if self.neg && !self.is_zero() {
+        Some(if self.neg && !self.is_zero() {
             format!("-{s}")
         } else {
             s
-        }
+        })
     }
 }
 
@@ -539,7 +596,7 @@ pub fn price_text(row: &SwapRow) -> Option<String> {
             (false, true) => "-Infinity".into(),
         });
     }
-    Some(k.div(&t, 20).to_fixed(12))
+    k.div(&t, 20).to_fixed(12)
 }
 
 #[cfg(test)]
@@ -690,6 +747,8 @@ mod tests {
         );
         assert!(is_swap_event_name("kaddex.exchange.SWAP"));
         assert!(is_swap_event_name("kdlaunch.kdswap-exchange.SWAP"));
+        // Only the trusted DEX modules count; anyone can deploy a module with a SWAP event.
+        assert!(!is_swap_event_name("free.fake-dex.SWAP"));
         assert!(!is_swap_event_name("kaddex.exchange.SWAPPED"));
         assert!(!is_swap_event_name("coin.TRANSFER"));
         assert_eq!(
@@ -697,6 +756,93 @@ mod tests {
             1764000000
         );
         assert_eq!(creation_time(Some(b"{}")), 0);
+    }
+
+    /// Security review: amounts, exponents and token lists are bounded.
+    #[test]
+    fn hostile_inputs_are_bounded() {
+        // Exponents and digit counts past the limits are unreadable (null), and fast.
+        assert_eq!(amount_dec(r#"{"decimal":"1e999999999"}"#), None);
+        assert_eq!(amount_dec(r#"{"decimal":"1e-1001"}"#), None);
+        assert_eq!(
+            amount_dec(&format!(r#"{{"decimal":"{}"}}"#, "7".repeat(81))),
+            None
+        );
+        assert_eq!(
+            amount_dec(&format!(r#"{{"decimal":"0.{}1"}}"#, "0".repeat(2000))),
+            None
+        );
+        assert!(amount_dec(&format!(r#"{{"decimal":"{}"}}"#, "7".repeat(80))).is_some());
+        assert_eq!(
+            price(("coin", r#"{"decimal":"1e999999999"}"#), ("t", "1")),
+            None
+        );
+        // A price with more than 400 integer digits is null, not a huge string.
+        assert_eq!(
+            price(
+                ("coin", r#"{"decimal":"1e500"}"#),
+                ("t", r#"{"decimal":"1e-500"}"#)
+            ),
+            None
+        );
+        // A tiny one is zero; the largest allowed one renders.
+        assert_eq!(
+            price(
+                ("coin", r#"{"decimal":"1e-1000"}"#),
+                ("t", r#"{"decimal":"1e1000"}"#)
+            )
+            .as_deref(),
+            Some("0.000000000000")
+        );
+        assert!(price(("coin", r#"{"decimal":"1e300"}"#), ("t", "1")).is_some());
+        // 80-digit operands divide quickly.
+        let big = format!(r#"{{"decimal":"{}"}}"#, "9".repeat(80));
+        assert_eq!(
+            price(("coin", &big), ("t", &big)).as_deref(),
+            Some("1.000000000000")
+        );
+        // Token caps: names over 256 bytes are skipped (elements 0/1: no swap); at most 8.
+        let long = "x".repeat(MAX_TOKEN_LEN + 1);
+        let k = TxKey::new(1, 0, 1);
+        assert_eq!(
+            swap_of(
+                k,
+                0,
+                &json!([{"token": long, "amount": 1}, {"token": "coin", "amount": 1}])
+            ),
+            None
+        );
+        let many: Vec<Value> = (0..50)
+            .map(|i| json!({"token": format!("free.t{i}"), "amount": 1}))
+            .collect();
+        let s = swap_of(k, 0, &Value::Array(many)).unwrap();
+        assert_eq!(s.tokens.len(), MAX_TOKENS_PER_SWAP);
+    }
+
+    /// Security review: a table larger than the scan budget answers exact names from one key
+    /// range instead of reading every row.
+    #[test]
+    fn lookup_is_bounded_on_a_large_table() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        for i in 0..=LIKE_SCAN_ROWS {
+            let s = Swap {
+                row: row(1, TxKey::new(1, 0, 1), ("coin", "1"), ("free.t", "2")),
+                tokens: vec![format!("free.tok{i:06}")],
+            };
+            upsert(&mut txn, 0, &s, None).unwrap();
+        }
+        let s = Swap {
+            row: row(9, TxKey::new(2, 1, 1), ("coin", "3"), ("free.t", "1")),
+            tokens: vec!["free.tok000007".into()],
+        };
+        upsert(&mut txn, 1, &s, None).unwrap();
+        // Exact: the newest of its rows (chain 1).
+        let got = lookup(&txn, "free.tok000007").unwrap().unwrap();
+        assert_eq!(got.legs[0].1, "3");
+        // A part of a name no longer matches on a table this large.
+        assert_eq!(lookup(&txn, "tok000007").unwrap(), None);
     }
 
     #[test]

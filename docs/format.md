@@ -726,7 +726,7 @@ reorg marks the affected balance rows dirty instead.
 | `NftDirty` | same | marked_height u32, seq u64 (write txn id), ledger ModuleId u32, token id |
 | `NftDetails` (P7, GQ-15) | 1, then the `NftBalances` key (a holding's guard) | status u8 (1 found, 2 absent, 3 failed), as_of u32, guard JSON |
 | `NftDetails` (P7, GQ-15) | 2, ledger ModuleId u32, blake2b-128(token id) [16], chain u8 (a token's info) | status u8 (1 found, 2 absent, 3 failed, 4 the ledger has no `get-token-info`), as_of u32, precision i32, supply length u16, supply text, uri |
-| `TokenSwaps` (`lastTokenPriceInKda`) | chain u8, token name (utf-8) | the newest swap naming the token on that chain: `meta.creationTime` u64, TxKey u64, then four varint-length strings: element 0's token, its amount as JSON text, element 1's token, its amount as JSON text |
+| `TokenSwaps` (`lastTokenPriceInKda`) | token name (utf-8, at most 256 bytes), chain u8 | the newest swap naming the token on that chain: `meta.creationTime` u64, TxKey u64, then four varint-length strings: element 0's token, its amount as JSON text, element 1's token, its amount as JSON text |
 
 `Meta` keys of the balance seed: `balances_seeded` (u32: the highest tail height when the seed
 finished), `balances_seed_cursor` (13 bytes while a seed runs: range start u32, range end u32,

@@ -913,7 +913,8 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 rows on a reorg. History comes from a one-off fill that `run` starts in the background when
 `Meta price_filled` is missing, on the first start of a binary with this table:
 
-- It walks the `evt` postings of every `*.SWAP` event name (hot tail first, then the segments,
+- It walks the `evt` postings of the trusted DEX swap events (`kaddex.exchange.SWAP`,
+  `kdlaunch.kdswap-exchange.SWAP`) (hot tail first, then the segments,
   oldest first) and reads only stored records: no node calls and no resync.
 - It writes in batches of 500 txs, one write txn each, and stores its segment position
   (`Meta price_fill_txnum`) with every batch. A stop (shutdown, crash) loses at most one batch.

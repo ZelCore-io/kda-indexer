@@ -1,7 +1,8 @@
 //! Token swap history fill (`lastTokenPriceInKda`, `kdx_hot::prices`).
 //!
-//! Once per store (`Meta price_filled`), `run` walks the `evt` postings of every `*.SWAP`
-//! event name, hot tail first and then the segments (oldest first), and stores each swap with
+//! Once per store (`Meta price_filled`), `run` walks the `evt` postings of the trusted DEX swap
+//! events (`kdx_hot::prices::DEX_SWAP_EVENTS`), hot tail first and then the segments (oldest
+//! first), and stores each swap with
 //! `kdx_hot::prices::upsert` (newest per (chain, token) wins, so replaying a tx or seeing a
 //! block in both the tail and the segments is harmless). No node calls and no resync: only
 //! stored records are read.
@@ -34,7 +35,7 @@ pub const BATCH: usize = 500;
 
 #[derive(Debug, Default, Serialize)]
 pub struct FillReport {
-    /// `*.SWAP` event names walked.
+    /// Trusted DEX swap event names walked.
     pub event_names: u64,
     pub hot_txs: u64,
     pub frozen_txs: u64,
@@ -53,7 +54,7 @@ pub fn filled(txn: &impl Txn) -> Result<bool> {
     Ok(txn.meta(meta::PRICE_FILLED)?.is_some())
 }
 
-/// EventName ids whose name is `<module>.SWAP`.
+/// EventName ids of the trusted DEX swap events.
 fn swap_names(dict: &MemDict) -> Vec<u32> {
     (0..dict.len(DictKind::EventName) as u32)
         .filter(|&id| {

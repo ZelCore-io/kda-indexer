@@ -601,17 +601,23 @@ gives `"Infinity"` or `"NaN"`, as stock does.
 
 We keep the newest swap per chain and token in the hot table `TokenSwaps`
 ([format.md](format.md)) instead of scanning every result. A swap is a successful tx that
-emits an event named `*.SWAP` (Kaddex/eckoDEX `kaddex.exchange.SWAP`, KDSwap
-`kdlaunch.kdswap-exchange.SWAP`, any fork) and whose `result.data` is a list with a non-empty
-string `token` in elements 0 and 1. Each string `token` of the list gets the swap (a routed
-swap names three or more tokens, and stock matches all of them by text). The tail keeps the
+emits a trusted DEX swap event (Kaddex/eckoDEX `kaddex.exchange.SWAP` or KDSwap
+`kdlaunch.kdswap-exchange.SWAP`) and whose `result.data` is a list with a non-empty string
+`token` of at most 256 bytes in elements 0 and 1. Each string `token` of the list (at most 8;
+longer names are skipped) gets the swap: a routed swap names three or more tokens, and stock
+matches all of them by text. The tail keeps the
 table current, and a one-off fill reads the history ([operations.md](operations.md#token-swaps)).
 A lookup applies stock's `LIKE` pattern (`%` and `_` wildcards, `\` escape, case-sensitive) to
 the stored token names and takes the newest match by (`meta.creationTime`, height, chain,
-position).
+position). A lookup reads at most 20,000 rows; on a larger table it matches the exact name
+only, from one key range. Amounts with more than 80 significant digits or an exponent beyond
+±1000, and prices with more than 400 integer digits, answer `null`.
 
 Rulings, where stock's text scan cannot be kept exactly:
 
+- **Trusted DEXes only.** Stock matches any result text, so a contract anyone deploys could
+  set a price. We read only the Kaddex/eckoDEX and KDSwap swap events, the DEXes behind all 14
+  recorded stock answers. Adding a DEX is a code change (`DEX_SWAP_EVENTS`).
 - **Swaps only.** Stock matches any result text. If a newer non-swap tx mentions the module
   (a failed swap's error, a `create-pair` result), stock answers `null` and we answer the
   last swap's price. Our answer is the more useful one, and stock's full-table scan timed out on
