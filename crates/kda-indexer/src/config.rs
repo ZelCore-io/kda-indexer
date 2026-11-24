@@ -606,7 +606,8 @@ pub struct BalancesConfig {
     pub local_rps: u32,
     /// `/local` calls in flight.
     pub local_concurrency: u32,
-    /// Most dirty keys of one non-coin module per reconcile batch (I-7).
+    /// Dirty keys of one non-coin module that take a batch slot before the others get theirs
+    /// (I-7): the fair share. Room left in a seed batch is topped up beyond it.
     pub module_share: u32,
     /// Most `Balances` rows of one non-coin module (I-7).
     pub module_rows: u32,

@@ -274,6 +274,22 @@ fn module_caps(hs: &HotStore) -> anyhow::Result<ModuleCaps> {
     })
 }
 
+/// The heartbeat's wall-clock throughput (rows per second), 0 when it has none yet.
+fn wall_rate_of(stats: &Value) -> f64 {
+    stats
+        .get("wall_rate")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+/// Seconds to clear `dirty` rows at the wall-clock throughput of the reconciler loop. The
+/// in-batch `rate` leaves out the time between batches, so it would promise far too early a
+/// finish; `None` until the loop has reported a wall-clock rate.
+fn eta_secs(dirty: u64, stats: &Value) -> Option<u64> {
+    let wall = wall_rate_of(stats);
+    (wall > 0.0).then(|| (dirty as f64 / wall).round() as u64)
+}
+
 fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
     // F-46: no read txn spans the Balances scan (it pins MDBX pages while `run` writes).
     // The first short txn reads the progress counters, the scan pages in its own short txns,
@@ -288,6 +304,7 @@ fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
         (dirty, stats, txn.count(Table::Balances)?)
     };
     let rate = stats.get("rate").and_then(Value::as_f64).unwrap_or(0.0);
+    let wall_rate = wall_rate_of(&stats);
     let mut absent = 0u64;
     let mut after: Option<Vec<u8>> = None;
     loop {
@@ -379,10 +396,38 @@ fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
             .meta(meta::KEYLIST_STATS)?
             .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
         "rate_per_s": rate,
-        "eta_secs": (rate > 0.0).then(|| (dirty as f64 / rate).round() as u64),
+        "wall_rate_per_s": wall_rate,
+        "eta_secs": eta_secs(dirty as u64, &stats),
         "heartbeat_age_secs": stats.get("t").and_then(Value::as_u64).map(|t| now.saturating_sub(t)),
         "done_since_start": stats.get("done"),
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eta_secs;
+    use serde_json::json;
+
+    /// The ETA divides by the wall-clock throughput, never by the in-batch rate: 490,000 rows
+    /// at 8.6 rows/s of wall time is ~15.8 h, where the in-batch 49/s would say 2.8 h.
+    #[test]
+    fn eta_uses_wall_clock_throughput() {
+        let stats = json!({"rate": 49.0, "wall_rate": 8.6, "dirty": 490_000});
+        assert_eq!(eta_secs(490_000, &stats), Some(56_977));
+        assert_eq!(eta_secs(0, &stats), Some(0));
+    }
+
+    /// A heartbeat without a wall-clock rate (written by an older build, or before the loop
+    /// has run a second) gives no ETA instead of the in-batch estimate.
+    #[test]
+    fn eta_is_absent_without_a_wall_clock_rate() {
+        assert_eq!(eta_secs(1_000, &json!({"rate": 49.0})), None);
+        assert_eq!(
+            eta_secs(1_000, &json!({"rate": 49.0, "wall_rate": 0.0})),
+            None
+        );
+        assert_eq!(eta_secs(1_000, &serde_json::Value::Null), None);
+    }
 }

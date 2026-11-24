@@ -538,7 +538,10 @@ with `[balances] enabled = false`.
   where it stopped. Mainnet: roughly 1–2M rows.
 - **Reconcile**: up to 256 dirty rows per batch, chosen fresh for every batch: tail marks first
   (`coin` first, then at most `[balances] module_share` keys per other module, round-robin),
-  the seed backlog (`BalanceSeed`, `coin` first) only behind them; through a node client of its
+  the seed backlog (`BalanceSeed`, `coin` first, then the other modules round-robin) only
+  behind them. `module_share` shares the slots fairly; it does not shrink a batch: in the seed
+  backlog, room left after the fair pass is topped up from the rest of the window (the first
+  16 × batch keys), so a window of one module still fills the batch. Through a node client of its
   own at `[balances] local_rps` calls per second (default 50) with `local_concurrency` in
   flight (default 8). Each call is `({module}.details (read-msg "a"))` with the account in the
   request data, gas limit 150,000; keyset references are resolved with `describe-keyset`.
@@ -629,7 +632,10 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-
 
 - `--status`: dirty rows, balance/absent/guard/key/token counts, seed state (`seeded_height`,
   `seed_in_progress`), keys parked for unusable answers (`parked_invalid`), the reconciler's
-  rate, ETA and heartbeat age. Read-only; runs beside the service.
+  rate (`rate_per_s`, rows per second inside a batch; `wall_rate_per_s`, rows per second of wall
+  time since the reconciler loop started, waits and the work between batches included), ETA
+  and heartbeat age. `eta_secs` is the dirty count divided by `wall_rate_per_s` (absent until
+  the loop has reported one). Read-only; runs beside the service.
 - `--seed`: runs (or resumes) the seed walk now; the next `run` reconciles what it marked.
 - `--all`: marks every stored balance row dirty, so the next `run` re-reads them all, and
   re-queues the keys parked for unusable answers (`parked_invalid_requeued`).
