@@ -442,9 +442,39 @@ impl Query {
         .await
     }
 
-    /// ZelCore extension, not served: the indexer keeps no price data.
-    async fn last_token_price_in_kda(&self, module_name: String) -> Result<Option<Decimal>> {
-        unserved!("Query.lastTokenPriceInKda")
+    /// The price in KDA of the newest DEX swap that names `moduleName` (stock semantics:
+    /// `LIKE '%moduleName%'` over the swap's tokens, `kda / token` as `toFixed(12)` text;
+    /// `kdx_hot::prices`). Null when no stored swap matches.
+    async fn last_token_price_in_kda(
+        &self,
+        ctx: &Context<'_>,
+        module_name: String,
+    ) -> Result<Option<Decimal>> {
+        // The pattern is user-controlled and the table scan costs work: a heavy read (so it
+        // cannot exhaust the general pool), a pattern capped in length and wildcards, and the
+        // request deadline checked inside the scan (`kdx_hot::prices::lookup_checked`).
+        if module_name.len() > kdx_hot::prices::MAX_LIKE_PATTERN {
+            return Ok(None);
+        }
+        let row = crate::gql(ctx)
+            .state()?
+            .read_heavy(move |view| {
+                let found = kdx_hot::prices::lookup_checked(&view.txn, &module_name, &mut || {
+                    view.check_deadline()?;
+                    Ok(())
+                });
+                match found {
+                    Ok(row) => Ok(row),
+                    // The deadline passed inside the scan: answer it as every read does.
+                    Err(e) => view.check_deadline().and(Err(e.into())),
+                }
+            })
+            .await
+            .map_err(crate::error::from_api)?;
+        Ok(row
+            .as_ref()
+            .and_then(kdx_hot::prices::price_text)
+            .map(Decimal::verbatim))
     }
 
     async fn transactions_by_public_key(

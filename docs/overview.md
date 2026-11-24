@@ -72,7 +72,8 @@ places where it is slower are in [comparison.md](comparison.md).
   - code search: SQL `LIKE` patterns of at most 256 characters; patterns that cannot use the
     code index run a bounded newest-first scan with a 2 s timeout and may return a cut answer
     (`X-Search-Truncated: true`).
-- **No price data or analytics.** GraphQL `lastTokenPriceInKda` answers `NOT_SUPPORTED`.
+- **No price history or analytics.** GraphQL `lastTokenPriceInKda` answers stock's last-swap
+  price ([graphql.md](graphql.md#token-price)); no other price data is kept.
 - **Reorgs deeper than `ingest.finality_depth`** (1,000 blocks by default) halt that chain
   for an operator to resolve; the other chains keep running
   ([operations.md](operations.md#halted-chains)).

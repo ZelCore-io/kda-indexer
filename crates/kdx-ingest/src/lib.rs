@@ -15,6 +15,7 @@ pub mod keylist;
 pub mod nft_details;
 pub mod nft_fill;
 pub mod pipeline;
+pub mod price_fill;
 pub mod rebuild;
 pub mod reconcile;
 pub mod reorg;

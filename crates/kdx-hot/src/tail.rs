@@ -10,6 +10,7 @@ use crate::checkpoint::{clear_checkpoint, set_checkpoint, Stage};
 use crate::dict::HotDict;
 use crate::env::{RwTxn, Txn};
 use crate::nft;
+use crate::prices;
 use crate::tables::{block_key, parse_block_key, posting_key, Table};
 use crate::undo::{self, UndoOp};
 
@@ -63,6 +64,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     }
 
     let mut d3 = D3Block::default();
+    // `TokenSwaps` rows this block replaces, for the unwind (`prices.rs`).
+    let mut price_undo = Vec::new();
     let mut buf = Vec::new();
     encode_block(br, &mut buf);
     txn.put(Table::Headers, &bk, &buf)?;
@@ -109,6 +112,10 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
             if !evs.is_empty() {
                 nft::apply_events(txn, &*dict, &evs, chain, height)?;
             }
+            // `lastTokenPriceInKda`: the newest DEX swap per token.
+            if let Some(s) = prices::swap_of_tx(&*dict, r) {
+                prices::upsert(txn, chain, &s, Some(&mut price_undo))?;
+            }
         }
     }
 
@@ -140,6 +147,14 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         // dictionary and token rows, which a reorg does not roll back, so the undo record
         // itself stays replay-identical.
         txn.set_meta(&balances::d3_undo_key(chain, height), &d3.marked)?;
+    }
+    if !price_undo.is_empty() {
+        // Beside the undo record like the D3 marks: older binaries can still read the record.
+        txn.set_meta(&prices::undo_key(chain, height), &price_undo)?;
+    } else {
+        // A log left at this height for a replaced block (an older binary unwound it without
+        // reading the log) must not apply to this one (PR #31 review note 3).
+        txn.del(Table::Meta, prices::undo_key(chain, height).as_bytes())?;
     }
     txn.put(Table::Undo, &bk, &undo::encode(&ops))?;
     set_checkpoint(txn, Stage::Tail, chain, height, br.hash)?;
@@ -320,6 +335,7 @@ pub fn unwind_to(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
         }
         txn.del(Table::Undo, k)?;
         undo_d3(txn, chain, h, coin)?;
+        prices::undo_block(txn, chain, h)?;
         n += 1;
     }
     match txn.get(Table::Headers, &block_key(chain, height))? {
@@ -455,6 +471,96 @@ mod balance_mark_tests {
             .unwrap();
         assert_eq!(super::unwind_to(&mut txn, 4, 199).unwrap(), 1);
         assert_eq!(txn.count(Table::BalanceDirty).unwrap(), 2);
+        txn.commit().unwrap();
+    }
+
+    /// `lastTokenPriceInKda`: a tail block's swap updates `TokenSwaps`; unwinding the block
+    /// restores the row it replaced, and the freezer-side log key is gone.
+    #[test]
+    fn swaps_apply_and_unwind() {
+        use kdx_types::record::EventRec;
+        use kdx_types::value;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        dict.intern(DictKind::Module, "coin");
+        let block = |dict: &mut HotDict, height: u32, amount: f64| {
+            let key = TxKey::new(height, 2, 1);
+            let mref = |ns: Option<&str>, name: &str| serde_json::json!({"refSpec": [], "refName": {"namespace": ns, "name": name}});
+            let params = serde_json::json!([
+                "pool",
+                "k:user",
+                amount,
+                mref(None, "coin"),
+                2.0,
+                mref(Some("kaddex"), "kdx")
+            ]);
+            let ev = EventRec {
+                module: dict.intern(DictKind::Module, "kaddex.exchange"),
+                name: dict.intern(DictKind::EventName, "kaddex.exchange.SWAP"),
+                module_hash: 0,
+                params: value::to_vec(&params, &*dict),
+            };
+            let data = serde_json::json!([
+                {"amount": amount, "token": "coin"},
+                {"amount": 2.0, "token": "kaddex.kdx"}
+            ]);
+            IndexedBlock {
+                block: BlockRecord {
+                    hash: Hash32([height as u8; 32]),
+                    chain: 2,
+                    height: u64::from(height),
+                    ..Default::default()
+                },
+                txs: vec![TxRecord {
+                    key,
+                    status_ok: true,
+                    cmd: Some(
+                        format!(
+                            r#"{{"meta":{{"creationTime":{}}}}}"#,
+                            1_700_000_000 + height
+                        )
+                        .into_bytes(),
+                    ),
+                    result: value::to_vec(&data, &*dict),
+                    events: vec![ev],
+                    ..Default::default()
+                }],
+                idx: vec![TxIndex {
+                    key,
+                    postings: vec![],
+                    pact_id: None,
+                    code_hash: None,
+                    d3: Default::default(),
+                }],
+                cmd_reencoded: 0,
+                unindexed_accounts: 0,
+            }
+        };
+        let b1 = block(&mut dict, 400, 1.0);
+        super::apply(&mut txn, &b1, &mut dict).unwrap();
+        let b2 = block(&mut dict, 401, 3.0);
+        super::apply(&mut txn, &b2, &mut dict).unwrap();
+        let price = |txn: &crate::RwTxn<'_>| {
+            crate::prices::lookup(txn, "kaddex.kdx")
+                .unwrap()
+                .and_then(|r| crate::prices::price_text(&r))
+        };
+        assert_eq!(price(&txn).as_deref(), Some("1.500000000000"));
+        assert!(txn
+            .meta(&crate::prices::undo_key(2, 401))
+            .unwrap()
+            .is_some());
+        assert_eq!(super::unwind_to(&mut txn, 2, 400).unwrap(), 1);
+        assert_eq!(price(&txn).as_deref(), Some("0.500000000000"));
+        assert!(txn
+            .meta(&crate::prices::undo_key(2, 401))
+            .unwrap()
+            .is_none());
+        assert_eq!(super::unwind_to(&mut txn, 2, 399).unwrap(), 1);
+        assert_eq!(price(&txn), None);
         txn.commit().unwrap();
     }
 
