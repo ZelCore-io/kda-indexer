@@ -370,6 +370,11 @@ fn status(cfg: &Config, hs: &HotStore) -> anyhow::Result<()> {
         // progress, with a failed chain waiting for its retry, given up over their failure
         // budget; totals of keys listed and marked, failures, last failure).
         "keylist_tokens": kl,
+        // `balances.keylist_skip`: modules the listing never reads (count and names).
+        "keylist_skipped": {
+            "count": cfg.balances.keylist_skip.len(),
+            "modules": cfg.balances.keylist_skip,
+        },
         "keylist_stats": txn
             .meta(meta::KEYLIST_STATS)?
             .and_then(|v| serde_json::from_slice::<Value>(&v).ok()),

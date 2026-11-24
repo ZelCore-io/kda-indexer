@@ -115,6 +115,9 @@ local_concurrency = 8      # /local calls in flight
 # Modules GET /keys/{pk}/accounts lists without ?token= (SEC-2). Any module can implement
 # fungible-v2 and report a balance under any key: list only modules you trust.
 # key_modules = ["coin"]
+# Modules the key listing never reads, on any chain: the node blocks its cut while it answers a
+# `keys` of a huge table. Default ["free.crankk01"]; setting it replaces the default.
+# keylist_skip = ["free.crankk01"]
 
 [metrics]
 textfile = "/var/lib/node_exporter/textfile_collector/kda_indexer_testnet.prom"   # optional

@@ -146,7 +146,7 @@ impl Default for Caps {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReconcileOpts {
     pub local: LocalOpts,
     /// Dirty keys per batch (one write txn).
@@ -154,6 +154,9 @@ pub struct ReconcileOpts {
     /// Run the seed first when `Meta balances_seeded` is absent (B-5).
     pub seed: bool,
     pub caps: Caps,
+    /// `balances.keylist_skip`: modules the key listing never reads (the node blocks its cut
+    /// while it answers a `keys` of a huge table).
+    pub keylist_skip: Vec<String>,
 }
 
 /// One dirty key taken for a batch: a tail mark (`BalanceDirty`) or a seed mark
@@ -1345,6 +1348,7 @@ async fn run_with(
             ctx.clone(),
             local.clone(),
             o.caps,
+            o.keylist_skip.clone(),
             keylist_stop,
         ));
     }
@@ -1627,7 +1631,7 @@ pub async fn supervise(
     stop: CancellationToken,
 ) -> Result<()> {
     loop {
-        match run(ctx.clone(), node.clone(), o, stop.clone()).await {
+        match run(ctx.clone(), node.clone(), o.clone(), stop.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => tracing::error!(
                 error = format!("{e:#}"),
@@ -2745,6 +2749,7 @@ pub(crate) mod tests {
             batch: 10,
             seed: true,
             caps: Caps::default(),
+            keylist_skip: Vec::new(),
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(run_with(
@@ -2837,6 +2842,7 @@ pub(crate) mod tests {
                 history_slice_txs: 1,
                 ..Caps::default()
             },
+            keylist_skip: Vec::new(),
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(run_with(
@@ -2902,6 +2908,7 @@ pub(crate) mod tests {
             batch: 10,
             seed: true,
             caps: Caps::default(),
+            keylist_skip: Vec::new(),
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(run_with(

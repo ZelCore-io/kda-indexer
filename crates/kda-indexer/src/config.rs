@@ -622,6 +622,10 @@ pub struct BalancesConfig {
     /// can implement fungible-v2 and report a balance under any key, so only the ones listed
     /// here are governance-trusted; others appear only when asked for by `token`.
     pub key_modules: Vec<String>,
+    /// Modules the key listing never sends a `keys` (or `describe-module`) read, on any chain.
+    /// The node blocks its cut for about 14 minutes while it answers a `keys` of a huge table
+    /// (`free.crankk01.crankk01-token-table`, Nov 2026), so even a first read must not happen.
+    pub keylist_skip: Vec<String>,
 }
 
 impl Default for BalancesConfig {
@@ -636,6 +640,7 @@ impl Default for BalancesConfig {
             account_rows: 1_000,
             recheck_hours: 24,
             key_modules: vec!["coin".to_owned()],
+            keylist_skip: vec!["free.crankk01".to_owned()],
         }
     }
 }
@@ -669,6 +674,12 @@ impl BalancesConfig {
             anyhow::ensure!(
                 kdx_node::local::valid_module(m),
                 "balances.key_modules: `{m}` is not a module name (name or namespace.name)"
+            );
+        }
+        for m in &self.keylist_skip {
+            anyhow::ensure!(
+                kdx_node::local::valid_module(m),
+                "balances.keylist_skip: `{m}` is not a module name (name or namespace.name)"
             );
         }
         Ok(())
@@ -900,6 +911,7 @@ mod balances_tests {
         let ok = BalancesConfig::default();
         assert!(ok.validate().is_ok());
         assert_eq!(ok.key_modules, ["coin"]);
+        assert_eq!(ok.keylist_skip, ["free.crankk01"]);
         let wide = BalancesConfig {
             key_modules: vec!["coin".into(), "kaddex.kdx".into()],
             ..ok.clone()
@@ -928,6 +940,10 @@ mod balances_tests {
             },
             BalancesConfig {
                 key_modules: vec!["".into()],
+                ..ok.clone()
+            },
+            BalancesConfig {
+                keylist_skip: vec!["free.x; drop".into()],
                 ..ok.clone()
             },
         ] {

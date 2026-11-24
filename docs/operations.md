@@ -796,6 +796,17 @@ event (a fee account built from a user guard, a pool account with a hashed name)
 lists them: `/local` allows `(keys <module>.<table>)` on any module's table, at a flat 40,000
 gas whatever the table size (measured on mainnet01).
 
+**Node impact.** A `keys` read runs on the node, not in the indexer, and the node does not stop
+it when the client gives up. While it runs it can block that chain's cut: on mainnet01 one
+`keys` of `free.crankk01.crankk01-token-table` stood the node's chain 0 still for about 14
+minutes (the node logged `Timeout while processing cut`), and every wallet using that node
+saw a frozen chain. Run the listing against a node that is not serving wallets, or keep
+`balances.keylist_skip` current with every module whose table is known to be huge. After an
+upgrade from a build before the park (a010087), the stored per-chain failure does not say
+whether it was a timeout (it keeps only the failure count and the retry time), so such a chain
+is read once more at its retry and parked if that times out; list its module in
+`balances.keylist_skip` to stop that read.
+
 With the reconciler in seed mode, a task of its own (beside the reconcile loop, so a slow read
 never holds up dirty rows, NFTs or history slices) lists every tracked token other than `coin`,
 skipping not-fungible verdicts and tokens at their row cap. One step is one (token, chain): a
@@ -808,6 +819,17 @@ posting) is listed within about 10 minutes plus the queue ahead of it; after tha
 is listed again every 7 days. A first sweep takes about 20 steps per token, so about 20 s per
 token (about 6 h for 1,000 tokens, estimate) when every read is quick.
 
+Skip list: `balances.keylist_skip` (default `["free.crankk01"]`) names modules the listing never
+reads: no `describe-module` and no `keys`, on any chain, so a skipped module costs no budget and
+leaves no stored state. Why: the node itself blocks its cut while it answers a `keys` of a huge
+table. `free.crankk01.crankk01-token-table` held chain 0 for about 14 minutes per read on
+mainnet01 (Nov 2026), and the node cannot be told to stop. Parking a (token, chain) after the
+first timeout does not help a production node, because that first read already freezes its
+chain, so a module known to be huge is skipped up front. Setting `keylist_skip` replaces the
+default (keep `free.crankk01` in it). `reconcile-balances --status` shows `keylist_skipped`
+(`count`, `modules`). A skipped token's keys that no tx names are not found by the listing; the
+rest of the balance work (postings, D3 history, reconcile) covers it as before.
+
 Only keys we hold nothing for (no `Balances` row, no dirty or seed mark) are marked, through
 the postings' mark path, at the height the node read; the reconcile then reads them like any
 dirty row. Names are interned only for keys that will be marked, and new keys of a module stop
@@ -817,11 +839,18 @@ chains that the reconcile has not read yet. A chain where the module is not depl
 table was never created, or whose module code has no ledger table (for example a ledger field
 not named `balance`, a known gap), lists nothing and is looked at again at the next sweep.
 
-Fail-closed, per (token, chain): a `keys` read timeout, a listing over 150,000 keys, an unusable
-answer or a refused `keys` read marks nothing for that chain. It
+Fail-closed, per (token, chain): a listing over 150,000 keys, an unusable answer or a refused
+`keys` read marks nothing for that chain. It
 is logged (`balances: key listing failed`, with module, chain, reason and the retry pause),
 and only that chain is listed again: after 1 hour, doubling with each failure in a row, at
-most every 7 days; the token goes to the back of the queue meanwhile. A connection or HTTP
+most every 7 days; the token goes to the back of the queue meanwhile. A `keys` read timeout
+also marks nothing, but parks that (token, chain) for good (logged with `parked for good`;
+`--status` `keylist_tokens.parked`): it is never listed again, by a retry, the weekly sweep
+or the unlistable period's fresh try. The node does not stop a `keys` read when the client
+gives up: on mainnet01 one `keys` read of a large table held that chain's pact service for
+about 14 minutes after each 90 s timeout (Nov 2026). Meanwhile the node logged `Timeout
+while processing cut`, its cut stood still, and so did the tail and every reconcile read on
+that chain. A parked chain costs the token's failure budget once. A connection or HTTP
 error, or a timeout of the small `describe-module` read (the node stalls, not the token), pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
 in a row. A chain already at the 7-day pause costs the budget nothing more (one table that never lists does not make its token unlistable). A token that runs up 32 chain failures with no clean round between is marked
 unlistable (logged at WARN, `--status` `keylist_tokens.unlistable`) and left alone for 30
@@ -830,13 +859,13 @@ until the store has a tail and its backfill is complete.
 
 Effective limit: the 150,000-key cap and the 90 s timeout, whichever comes first. The node
 listed 9,480 keys in 4.4 s (about 2,000 keys/s, mainnet01, Nov 2026), so 150,000 keys take
-about 75 s; on a loaded node the timeout can bind below the cap, and such a table fails as
+about 75 s; on a loaded node the timeout can bind below the cap, and such a table is parked as
 above. The answer also has to fit `node.max_body_bytes` (64 MB by default).
 
 State: `Meta balances_keylist/<ModuleId>` (last complete listing, next chain, failures, the
 failed chains with their retry times; a restart resumes) and `Meta balances_keylist_stats`
 (totals). `--status` shows `keylist_tokens` (`listed`: last round clean, `in_progress`,
-`failed`: a chain waits for its retry, `unlistable`) and `keylist_stats` (`tokens_listed`,
+`failed`: a chain waits for its retry, `unlistable`, `parked`: a chain is parked) and `keylist_stats` (`tokens_listed`,
 `chain_failures`, `node_errors`, `unlistable`, `listed`, `known`, `marked`, `skipped`,
 `last_failure`). No command relists a token at once yet: a token is listed again when its
 sweep, a chain retry or its unlistable period comes due (a token whose

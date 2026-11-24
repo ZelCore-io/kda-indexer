@@ -261,6 +261,7 @@ fn balances_opts(
             recheck_secs: b.recheck_hours.saturating_mul(3600),
             history_slice_txs: kdx_ingest::seed_receivers::HISTORY_SLICE_TXS,
         },
+        keylist_skip: b.keylist_skip.clone(),
     };
     Ok(Some((super::local_node_client(cfg)?, o)))
 }
