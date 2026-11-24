@@ -23,10 +23,13 @@
 //!   balances_keylist/<module>`) is kept per step, so a restart resumes.
 //! - A module with no ledger table on a chain lists nothing there, like a module not deployed
 //!   (no failure; looked at again at the next sweep).
-//! - Failures are per `(token, chain)`: a `keys` timeout, an unusable or over-cap answer or a pact
-//!   failure marks nothing for that chain, is logged and counted, and only that chain is
-//!   listed again, after [`RETRY_BASE_SECS`] doubling with each failure in a row up to
-//!   [`RETRY_CAP_SECS`]. A connection or HTTP error, or a `describe-module` timeout (small code: the node is
+//! - Failures are per `(token, chain)`: an unusable or over-cap answer or a pact failure marks
+//!   nothing for that chain, is logged and counted, and only that chain is listed again, after
+//!   [`RETRY_BASE_SECS`] doubling with each failure in a row up to [`RETRY_CAP_SECS`]. A `keys`
+//!   timeout parks that `(token, chain)` for good ([`PARKED`]): the node does not stop the
+//!   read when the client gives up, and on mainnet01 one such read held the chain's pact
+//!   service (and so the node's cut, the tail and the reconcile's reads on that chain) for
+//!   about 14 minutes after every 90 s timeout. A connection or HTTP error, or a `describe-module` timeout (small code: the node is
 //!   stalling, not the token), pauses the whole listing ([`NODE_PAUSE`],
 //!   doubling to [`NODE_PAUSE_MAX`]) and counts against the chain after [`NODE_TRIES`] in a
 //!   row. A failed token goes to the back of the queue, so one token cannot hold it.
@@ -225,8 +228,20 @@ pub fn ledger_tables(code: &str) -> Vec<String> {
 pub struct ChainFail {
     pub chain: u8,
     pub fails: u8,
-    /// Unix seconds.
+    /// Unix seconds; [`PARKED`]: never.
     pub retry_at: u32,
+}
+
+/// `retry_at` of a parked `(token, chain)`: its `keys` read timed out, and the node keeps
+/// listing after the client gives up (on mainnet01 about 14 minutes of a chain's pact
+/// service, during which the node's cut stood still), so it is never sent again.
+pub const PARKED: u32 = u32::MAX;
+
+impl ChainFail {
+    /// Never listed again (a `keys` read timed out).
+    pub fn parked(&self) -> bool {
+        self.retry_at == PARKED
+    }
 }
 
 /// The pause before a `(token, chain)` that failed `fails` times in a row is listed again.
@@ -332,8 +347,13 @@ impl ListState {
     /// Start a round at `now` (full, or a retry of the failed chains that are due).
     fn begin(&mut self, now: u32) {
         if self.unlistable() {
-            // Given up long enough: one more try, with a fresh budget.
-            *self = ListState::default();
+            // Given up long enough: one more try, with a fresh budget. Parked chains stay
+            // parked: a fresh budget does not make a table the node cannot list quick.
+            let parked = self.chains.iter().filter(|c| c.parked()).copied().collect();
+            *self = ListState {
+                chains: parked,
+                ..ListState::default()
+            };
         }
         let full = self.listed_at == 0 || now.saturating_sub(self.listed_at) >= SWEEP_SECS;
         self.flags = if full { FULL } else { 0 };
@@ -371,6 +391,20 @@ impl ListState {
         if !at_cap {
             self.fail_total = self.fail_total.saturating_add(1);
         }
+    }
+    /// `chain`'s `keys` read timed out: parked for good (charged to the budget once).
+    fn park(&mut self, chain: u8) {
+        self.chains.retain(|c| c.chain != chain);
+        self.chains.push(ChainFail {
+            chain,
+            fails: 1,
+            retry_at: PARKED,
+        });
+        self.fail_total = self.fail_total.saturating_add(1);
+    }
+    /// No chain waits for a retry (parked chains never do).
+    fn clean(&self) -> bool {
+        self.chains.iter().all(ChainFail::parked)
     }
     /// `chain` listed: no longer failed.
     fn cleared(&mut self, chain: u8) {
@@ -431,6 +465,8 @@ pub struct Summary {
     pub failed: u64,
     /// Over the failure budget, left alone.
     pub unlistable: u64,
+    /// Some chain is parked: its `keys` read timed out, never sent again.
+    pub parked: u64,
 }
 
 /// The [`Summary`] of the stored listing states.
@@ -445,9 +481,10 @@ pub fn summary(txn: &impl Txn) -> Result<Summary> {
             s.unlistable += 1;
             continue;
         }
-        s.listed += u64::from(st.listed_at > 0 && st.chains.is_empty());
+        s.listed += u64::from(st.listed_at > 0 && st.clean());
         s.in_progress += u64::from(st.next_chain > 0);
-        s.failed += u64::from(!st.chains.is_empty());
+        s.failed += u64::from(!st.clean());
+        s.parked += u64::from(st.chains.iter().any(ChainFail::parked));
     }
     Ok(s)
 }
@@ -596,8 +633,10 @@ impl Default for KeyList {
 enum ChainResult {
     /// Listed (or the module is not on the chain).
     Done(Marked),
-    /// Marked nothing; logged; the chain counts as failed (a timeout among them).
+    /// Marked nothing; logged; the chain counts as failed.
     Failed(String),
+    /// A `keys` read timed out: marked nothing; logged; the chain is parked.
+    TooSlow(String),
     /// A connection or HTTP error: the node, not the token, may be the trouble.
     Node(String),
 }
@@ -614,7 +653,7 @@ fn now_unix() -> u32 {
 /// listing instead of burning the budgets of the tokens (PR #27 R-1).
 fn node_result(what: &str, e: NodeError, token_slow: bool) -> ChainResult {
     match e {
-        NodeError::Timeout if token_slow => ChainResult::Failed(format!("{what}: timeout")),
+        NodeError::Timeout if token_slow => ChainResult::TooSlow(format!("{what}: timeout")),
         e => ChainResult::Node(format!("{what}: {e}")),
     }
 }
@@ -761,11 +800,23 @@ pub async fn step(
                 return Ok(true);
             }
             kl.next_at = Some(now + kl.pause);
-            fail(&mut txn, &mut st, &name, chain, t, &format!("node: {e}"))?;
+            fail(
+                &mut txn,
+                &mut st,
+                &name,
+                chain,
+                t,
+                &format!("node: {e}"),
+                false,
+            )?;
             failed = true;
         }
         ChainResult::Failed(e) => {
-            fail(&mut txn, &mut st, &name, chain, t, &e)?;
+            fail(&mut txn, &mut st, &name, chain, t, &e, false)?;
+            failed = true;
+        }
+        ChainResult::TooSlow(e) => {
+            fail(&mut txn, &mut st, &name, chain, t, &e, true)?;
             failed = true;
         }
         ChainResult::Done(m) => {
@@ -832,7 +883,7 @@ fn end_round(
     }
     st.next_chain = 0;
     st.flags = 0;
-    if st.chains.is_empty() {
+    if st.clean() {
         st.fail_total = 0;
     }
     kl.queue.pop_front();
@@ -846,16 +897,24 @@ fn fail(
     chain: u8,
     now: u32,
     why: &str,
+    park: bool,
 ) -> Result<()> {
-    st.failed(chain, now);
-    let fails = st
-        .chains
-        .iter()
-        .find(|c| c.chain == chain)
-        .map_or(0, |c| c.fails);
-    tracing::warn!(module = %name, chain, reason = %why, fails,
-        retry_in_s = retry_after(fails),
-        "balances: key listing failed; nothing marked for this chain, retried later");
+    if park {
+        st.park(chain);
+        tracing::warn!(module = %name, chain, reason = %why,
+            "balances: key listing failed; nothing marked for this chain, parked for good \
+             (the node may still be listing the table, holding that chain)");
+    } else {
+        st.failed(chain, now);
+        let fails = st
+            .chains
+            .iter()
+            .find(|c| c.chain == chain)
+            .map_or(0, |c| c.fails);
+        tracing::warn!(module = %name, chain, reason = %why, fails,
+            retry_in_s = retry_after(fails),
+            "balances: key listing failed; nothing marked for this chain, retried later");
+    }
     let cut: String = why.chars().take(200).collect();
     add_stats(txn, |s| {
         s.chain_failures += 1;
@@ -1572,11 +1631,14 @@ mod tests {
             .starts_with("free.down chain 1: node"));
     }
 
-    /// PR #27 H-1: a `keys` read the node cannot answer in time costs one request and the
-    /// read timeout (no client or step retries), fails only that chain, and that chain alone
-    /// is listed again, after a pause that doubles; the other chain lists at once.
+    /// The node does not stop a `keys` read when the client times out: on mainnet01 one
+    /// `(keys free.crankk01.crankk01-token-table)` on chain 0 held that chain's pact service for
+    /// about 14 minutes after each 90 s timeout (the node logged `Timeout while processing cut`
+    /// throughout; its cut, the tail and every chain-0 `/local` of the reconcile stood still).
+    /// So a `keys` timeout parks that `(token, chain)` for good: no retry, no sweep, and not
+    /// after the token's unlistable period either; the token's other chains list as before.
     #[tokio::test]
-    async fn a_slow_read_fails_once_and_only_that_chain_backs_off() {
+    async fn a_keys_timeout_parks_the_chain_for_good() {
         let dir = tempfile::tempdir().unwrap();
         let answer: Arc<Answer> = Arc::new(move |chain, code, _| match (chain, code) {
             (_, c) if c.contains("describe-module") => ok(json!(KAYC)),
@@ -1584,7 +1646,7 @@ mod tests {
             (1, _) => ok(json!(["ROOT"])),
             _ => panic!("unexpected call {chain} {code}"),
         });
-        let (ctx, local, ids, calls) = setup(dir.path(), &["free.slow"], answer);
+        let (ctx, local, ids, calls) = setup(dir.path(), &["free.huge"], answer);
         let mut kl = KeyList {
             read_timeout: Duration::from_millis(300),
             ..KeyList::default()
@@ -1594,36 +1656,50 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
         assert_eq!(calls.load(Ordering::SeqCst), 2, "describe + one keys read");
         run_steps(&ctx, &local, &mut kl, 5).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "chain 0 timed out once");
         assert_eq!(dirty(&ctx, "ROOT", ids[0], 1), Some(10));
         let st = state(&ctx.hot.ro().unwrap(), ids[0]).unwrap();
-        assert_eq!(
-            (st.chains.len(), st.chains[0].chain, st.chains[0].fails),
-            (1, 0, 1)
+        assert_eq!((st.chains.len(), st.chains[0].chain), (1, 0));
+        assert!(st.chains[0].parked(), "{st:?}");
+        for later in [RETRY_CAP_SECS, SWEEP_SECS - 1, 10 * UNLISTABLE_SECS] {
+            let now = now_unix() + later;
+            assert!(!st.selected(0, now), "chain 0 is never listed again");
+        }
+        assert!(
+            !st.due(now_unix() + SWEEP_SECS - 10),
+            "no retry round before the sweep"
         );
-        let first = st.chains[0].retry_at;
-        // (`listed_at` is read a moment after the failure's `now`: allow a second tick.)
-        assert!(first + 2 >= st.listed_at + RETRY_BASE_SECS);
-        // Not due again before its pause; then a retry round reads chain 0 only.
-        kl.refreshed = None;
-        kl.next_at = None;
-        assert!(!step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap());
+        assert_eq!(
+            summary(&ctx.hot.ro().unwrap()).unwrap(),
+            Summary {
+                listed: 1,
+                parked: 1,
+                ..Summary::default()
+            }
+        );
+        // The weekly sweep lists chain 1 again and leaves chain 0 alone.
         let mut txn = ctx.hot.rw().unwrap();
-        let mut back = st.clone();
-        back.chains[0].retry_at = 1;
-        txn.set_meta(&state_key(ids[0]), &back.encode()).unwrap();
+        let old = ListState {
+            listed_at: 1,
+            ..st.clone()
+        };
+        txn.set_meta(&state_key(ids[0]), &old.encode()).unwrap();
         txn.commit().unwrap();
         kl.refreshed = None;
         run_steps(&ctx, &local, &mut kl, 5).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            6,
-            "chain 1 is not listed again"
-        );
+        assert_eq!(calls.load(Ordering::SeqCst), 6, "chain 1 only");
         let st = state(&ctx.hot.ro().unwrap(), ids[0]).unwrap();
-        assert_eq!(st.chains[0].fails, 2);
-        assert!(st.chains[0].retry_at >= now_unix() + 2 * RETRY_BASE_SECS - 5);
-        assert_eq!(st.listed_at, back.listed_at, "a retry round is no sweep");
+        assert!(st.listed_at > 1 && st.chains[0].parked(), "{st:?}");
+        // Given up and tried again after the unlistable period: the parked chain stays parked.
+        let mut gone = ListState {
+            listed_at: 1,
+            flags: UNLISTABLE,
+            fail_total: FAIL_BUDGET,
+            ..st.clone()
+        };
+        gone.begin(1 + UNLISTABLE_SECS);
+        assert!(gone.chains[0].parked() && !gone.selected(0, u32::MAX - 1));
+        assert!(gone.selected(1, 1 + UNLISTABLE_SECS) && gone.fail_total == 0);
     }
 
     /// H-1: a junk token (every `keys` read times out) goes to the back of the queue after each

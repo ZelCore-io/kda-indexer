@@ -817,11 +817,18 @@ chains that the reconcile has not read yet. A chain where the module is not depl
 table was never created, or whose module code has no ledger table (for example a ledger field
 not named `balance`, a known gap), lists nothing and is looked at again at the next sweep.
 
-Fail-closed, per (token, chain): a `keys` read timeout, a listing over 150,000 keys, an unusable
-answer or a refused `keys` read marks nothing for that chain. It
+Fail-closed, per (token, chain): a listing over 150,000 keys, an unusable answer or a refused
+`keys` read marks nothing for that chain. It
 is logged (`balances: key listing failed`, with module, chain, reason and the retry pause),
 and only that chain is listed again: after 1 hour, doubling with each failure in a row, at
-most every 7 days; the token goes to the back of the queue meanwhile. A connection or HTTP
+most every 7 days; the token goes to the back of the queue meanwhile. A `keys` read timeout
+also marks nothing, but parks that (token, chain) for good (logged with `parked for good`;
+`--status` `keylist_tokens.parked`): it is never listed again, by a retry, the weekly sweep
+or the unlistable period's fresh try. The node does not stop a `keys` read when the client
+gives up: on mainnet01 one `keys` read of a large table held that chain's pact service for
+about 14 minutes after each 90 s timeout (Nov 2026). Meanwhile the node logged `Timeout
+while processing cut`, its cut stood still, and so did the tail and every reconcile read on
+that chain. A parked chain costs the token's failure budget once. A connection or HTTP
 error, or a timeout of the small `describe-module` read (the node stalls, not the token), pauses the whole listing (30 s, doubling to 10 min) and counts against the chain after 3
 in a row. A chain already at the 7-day pause costs the budget nothing more (one table that never lists does not make its token unlistable). A token that runs up 32 chain failures with no clean round between is marked
 unlistable (logged at WARN, `--status` `keylist_tokens.unlistable`) and left alone for 30
@@ -830,13 +837,13 @@ until the store has a tail and its backfill is complete.
 
 Effective limit: the 150,000-key cap and the 90 s timeout, whichever comes first. The node
 listed 9,480 keys in 4.4 s (about 2,000 keys/s, mainnet01, Nov 2026), so 150,000 keys take
-about 75 s; on a loaded node the timeout can bind below the cap, and such a table fails as
+about 75 s; on a loaded node the timeout can bind below the cap, and such a table is parked as
 above. The answer also has to fit `node.max_body_bytes` (64 MB by default).
 
 State: `Meta balances_keylist/<ModuleId>` (last complete listing, next chain, failures, the
 failed chains with their retry times; a restart resumes) and `Meta balances_keylist_stats`
 (totals). `--status` shows `keylist_tokens` (`listed`: last round clean, `in_progress`,
-`failed`: a chain waits for its retry, `unlistable`) and `keylist_stats` (`tokens_listed`,
+`failed`: a chain waits for its retry, `unlistable`, `parked`: a chain is parked) and `keylist_stats` (`tokens_listed`,
 `chain_failures`, `node_errors`, `unlistable`, `listed`, `known`, `marked`, `skipped`,
 `last_failure`). No command relists a token at once yet: a token is listed again when its
 sweep, a chain retry or its unlistable period comes due (a token whose
