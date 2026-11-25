@@ -1385,8 +1385,8 @@ pub fn history_begin(
         let segs = Segments::open_without_filters(segdir, snap.clone())?;
         st.next = height.map_or(0, |h| frozen_start(&segs, h));
         tracing::info!(tokens = ?names, start_height = ?height, start_txnum = st.next,
-            "balances: D3 history walk starts at the earliest deploy of its tokens \
-            (start_height None: unknown, from TxNum 0)");
+            "balances: D3 history walk start (start_height None means the deploy is unknown \
+            and the walk begins at TxNum 0)");
     }
     tracing::info!(tokens = ?names, upto = st.upto, next = st.next, hot = st.hot,
         "balances: D3 history walk of newly tracked tokens (begun or resumed)");
