@@ -5,10 +5,12 @@
 //! `search`: `[TxSummary]`, height desc then requestKey desc, limit 10 (max 250), offset up
 //! to 10,000 or `next`, `Chainweb-Next`. Candidates come from the code index (3-gram
 //! prefilter, verified by the LIKE matcher, expanded through the `code` postings) when the
-//! pattern has a literal run of 3 or more characters and the index holds every body it can
-//! match; otherwise from the bounded newest-first scan (`search.max_scan_heights`,
-//! `search.timeout_ms`). Either path answers what it found with `X-Search-Truncated: true`
-//! when the deadline or a cap cut it, plus `Chainweb-Next` when there is more to read.
+//! pattern has a literal run of 3 or more characters. When the index cannot vouch for every
+//! match (fallback mode below its threshold, lag, a stale mark) its hits are served marked
+//! truncated; with no hit, or no 3-character run, the bounded newest-first scan runs
+//! (`search.max_scan_heights`, `search.timeout_ms`). Either path answers what it found with
+//! `X-Search-Truncated: true` when the deadline or a cap cut it, plus `Chainweb-Next` when
+//! there is more to read.
 //! Genesis-block txs are listed, as chainweb-data does (6E-F); the other compat list routes
 //! hide them. chainweb-data also matches `cont` txs through their initial tx's code; this route does
 //! not (S-3, allowlist class `search-cont-history`).
@@ -56,8 +58,10 @@ pub const PACT_CAP: usize = 1_000;
 /// `search`: a JSON array of `TxSummary` for the transactions whose own exec code contains
 /// the pattern (a `LIKE` pattern: `%`, `_`, `\` escapes; at most 256 characters and 8 `%`),
 /// height descending then request key descending. A pattern with a literal run of 3
-/// characters uses the code index when it holds every body the pattern can match; otherwise
-/// a bounded newest-first scan runs (`search.max_scan_heights`, `search.timeout_ms`). A cut
+/// characters uses the code index; when the index may miss matches (fallback mode below its
+/// length threshold, or it trails the tip) its verified hits are served with
+/// `X-Search-Truncated: true`. With no index hit, or no 3-character run, a bounded
+/// newest-first scan runs (`search.max_scan_heights`, `search.timeout_ms`). A cut
 /// answer carries `X-Search-Truncated: true` and, when there is more, `Chainweb-Next`.
 /// Genesis transactions are listed here (the other list routes hide them). Difference from
 /// chainweb-data: its `cont` transactions also match through the initial code of their
@@ -86,7 +90,7 @@ pub const PACT_CAP: usize = 1_000;
         (status = 200, description = "Transaction summaries", body = Vec<TxSummary>, content_type = "application/json",
             headers(
                 ("Chainweb-Next" = String, description = "Token of the next page (`search` only); absent on the last page."),
-                ("X-Search-Truncated" = String, description = "`true` when the scan deadline or a cap cut the answer short."),
+                ("X-Search-Truncated" = String, description = "`true` when the scan deadline or a cap cut the answer short, or the code index served hits that may not be every match (fallback mode, lag)."),
             )),
         (status = 400, description = "Both `search` and `pactid`, a parameter that does not parse, a pattern that is too long or has too many `%`, `offset` above 10,000, `next` with `offset`, or an invalid `next`", body = String, content_type = "text/plain"),
         (status = 404, description = "`You must specify a search string`: neither `search` nor `pactid`", body = String, content_type = "text/plain"),
@@ -205,7 +209,7 @@ pub enum IndexPath {
         hits: Vec<CodeHit>,
         rebuilt_through: Option<u32>,
         capped: bool,
-        /// The index trails the tip (only when not `complete`; see `search::lagging`).
+        /// The index trails the tip or is marked stale (see `search::lagging`).
         lagging: bool,
     },
     /// The candidate query ran out of time.
@@ -214,22 +218,19 @@ pub enum IndexPath {
     None,
 }
 
-/// Ask the code index for `raw` with heights `min..=max` (`complete`: refuse a fallback-mode
-/// index that may miss short bodies).
+/// Ask the code index for `raw` with heights `min..=max`. The hits are verified; whether
+/// they are every match is the caller's call (`lagging`, and `search::index_covers` for a
+/// fallback-mode index that leaves short bodies out).
 pub fn index_path(
     view: &View,
     ctx: &SearchCtx,
     raw: &str,
     (min, max): (Option<u32>, Option<u32>),
     until: Instant,
-    complete: bool,
 ) -> IndexPath {
     let Some(s) = ctx.index.get() else {
         return IndexPath::None;
     };
-    if complete && !index_covers(&s.manifest, raw) {
-        return IndexPath::None;
-    }
     let tip = view.max_data_height().ok().flatten();
     let built_through = ctx
         .index
@@ -243,10 +244,6 @@ pub fn index_path(
         .or(s.manifest.stale_from_height)
         .is_some();
     let lagging = lagging(tip, built_through) || stale;
-    if complete && lagging {
-        rejected("lag");
-        return IndexPath::None;
-    }
     let w = kdx_search::Window {
         lo: u64::from(min.unwrap_or(0)),
         hi: max.map_or(u64::MAX, u64::from),
@@ -315,7 +312,32 @@ pub fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiR
         max_heights: set.max_scan_heights.max(1),
         until,
     };
-    match index_path(view, ctx, raw, (pg.min_height, max_h), until, true) {
+    // The index is asked whether or not it can answer completely. When it cannot (fallback
+    // mode and a pattern below its threshold, or an index that trails the tip or is marked
+    // stale), its verified hits are still served if there are any, marked truncated (WP-L
+    // concern 1): on a large store the bounded scan rarely reaches them within its budget and
+    // answered an empty list. With no hits the scan runs as before (it finds the short bodies
+    // a fallback index leaves out).
+    let covers = ctx
+        .index
+        .get()
+        .is_some_and(|s| index_covers(&s.manifest, raw));
+    let path = index_path(view, ctx, raw, (pg.min_height, max_h), until);
+    let (partial, no_hits) = match &path {
+        IndexPath::Hits { hits, lagging, .. } => {
+            if *lagging {
+                rejected("lag");
+            }
+            (*lagging || !covers, hits.is_empty())
+        }
+        _ => (false, false),
+    };
+    let path = if partial && no_hits {
+        IndexPath::None
+    } else {
+        path
+    };
+    match path {
         IndexPath::Hits {
             hits,
             rebuilt_through,
@@ -349,7 +371,7 @@ pub fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiR
             if page.truncated || cut {
                 rejected("timeout");
             }
-            page.truncated |= capped || cut;
+            page.truncated |= capped || cut || partial;
             Ok(page)
         }
         // Nothing found in time: no token (it would repeat the same query).

@@ -261,6 +261,70 @@ async fn search_code_is_partial_while_the_index_is_marked_stale() {
     assert!(ask("marked stale").await);
 }
 
+/// WP-L concern 1: the index is in fallback mode and the pattern is shorter than its
+/// threshold, so it cannot answer completely, and the bounded scan is too small to reach the
+/// matching tx. `/txs/search` serves the index's verified hits (not the scan's empty list),
+/// marked `X-Search-Truncated: true`, as native `/search/code` lists them with `partial`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_serves_fallback_index_hits_marked_truncated() {
+    let pool = pool();
+    let all: Vec<usize> = (0..POOL_LEN).collect();
+    let (dir, state, ctx) = store(&branch(&all, 0, 0, 0));
+    let (r, rk, pat) = exec_pattern(&pool, 0..POOL_LEN - 2);
+    let (_, code) = first_exec(&pool, r).unwrap();
+    // Bodies of at least `min_len` bytes are indexed: the tx's body is, the pattern is
+    // shorter than the threshold, so the index cannot vouch for every match.
+    let min_len = pat.len() as u32 + 1;
+    assert!(code.len() >= min_len as usize, "{code}");
+    let o = kdx_search::BuildOpts {
+        data_dir: dir.path().to_path_buf(),
+        mode: kdx_search::ModeSel::Fallback(min_len),
+        threads: 1,
+        heap_mb: 64,
+        trial_docs: 0,
+        stop: Default::default(),
+    };
+    kdx_search::rebuild(&o, &ctx.hot).unwrap();
+    // The scan reads the newest height only.
+    let settings = SearchSettings {
+        max_scan_heights: 1,
+        ..SearchSettings::default()
+    };
+    let app = routers(
+        &state,
+        SearchCtx::new(settings, Some(kdx_search::search_dir(dir.path()))),
+    );
+    let mut req = Request::get(format!("/txs/search?search={pat}&limit=250"))
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            1,
+        ))));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let truncated = resp
+        .headers()
+        .get("x-search-truncated")
+        .map(|v| v.as_bytes().to_vec());
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 << 20)
+        .await
+        .unwrap();
+    let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+    let hit: Vec<u64> = rows
+        .iter()
+        .filter(|t| t["requestKey"] == rk.as_str())
+        .map(|t| t["height"].as_u64().unwrap())
+        .collect();
+    assert_eq!(hit, [r as u64], "{pat}: {rows:?}");
+    // Every row served really carries the pattern in its own code.
+    for t in &rows {
+        assert!(t["code"].as_str().unwrap().contains(pat.as_str()), "{t}");
+    }
+    assert_eq!(truncated.as_deref(), Some(&b"true"[..]));
+}
+
 /// S-3 (T-3): a captured mainnet block (chain 0, height 4,500,122: two `exec` txs of
 /// `free.radio02` and two `cont` txs, step 1 of cross-chain coin transfers with SPV
 /// proofs), served at height 3 after three pool blocks. `pactid` lists exactly the cont tx

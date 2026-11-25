@@ -125,7 +125,7 @@ pub async fn code(
             };
             let window = (lp.min_height, max_h);
             let (hits, rebuilt_through, capped, lagging) =
-                match index_path(view, &ctx, &pat, window, until, false) {
+                match index_path(view, &ctx, &pat, window, until) {
                     IndexPath::Hits {
                         hits,
                         rebuilt_through,
