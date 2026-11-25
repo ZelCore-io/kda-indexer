@@ -391,7 +391,6 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         sum.dict_sizes.insert(format!("{k:?}"), dict.len(k));
     }
     sum.requests = nc.stats().iter().map(|r| r.count).sum();
-    print_summary(&sum, args.json);
     // `--merkle` always leaves a summary file (Task 1 probe evidence).
     let summary_out = args.summary_out.clone().or_else(|| {
         args.merkle.then(|| {
@@ -406,6 +405,8 @@ pub async fn run(cfg: &Config, args: DumpArgs) -> anyhow::Result<()> {
         sum.round_trip_failures += ix.adj_ref_round_trip_failures;
         eprintln!("index: {}", serde_json::to_string_pretty(ix)?);
     }
+    // After the index count above, so the printed summary matches the file (F-58).
+    print_summary(&sum, args.json);
     if let Some(p) = &summary_out {
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
