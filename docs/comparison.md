@@ -237,6 +237,224 @@ All values in this table are interim.
   range, at <!--m:res-backfill-peak-->9.8 GiB<!--/m--> on a 24 GiB host; the tail needs far less.
   chainweb-data's backfill memory was not measured.
 
+## Differences from the stock indexers
+
+The comparison accepts a difference only when it is listed here (or in [api.md](api.md) and
+[graphql.md](graphql.md)), or when it is a stock fault of a class listed below and the node
+shows it for that record. Every other difference is reported. Each entry of
+[compare/allowlist.toml](../compare/allowlist.toml) carries the id named in brackets here.
+The G4 replay of real traffic (below) met most of these classes again; its
+[difference catalogue](#difference-catalogue) links each class it found to its doc.
+
+### Intended differences
+
+- Event text search covers a bounded recent window; chainweb-data scans further back
+  (`event-search-window`). Only whole rows stock lists and kda-indexer does not are explained;
+  a row only kda-indexer lists, or a field that differs on a row both sides list, is reported.
+- A `search=` or `pactid=` answer cut by its scan window or the 1,000-tx pact cap carries
+  `X-Search-Truncated` (`search-window`, `pactid-cap`).
+- `/txs/search?search=` matches a tx's own code, not the code of a continuation's first step
+  (`search-cont-history`).
+- Rows of one height have no defined order in `/txs/search` (`search-tie-order`,
+  `pactid-tie-order`) or in GraphQL lists (`graphql-r57-height-ties`); a page cut inside one block
+  lists the node's order (`graphql-r75-single-block-cut`). The stock GraphQL indexer orders a
+  block's transactions otherwise, so the first page of a block larger than the page holds
+  other rows on stock (G4 class 7, see [graphql.md](graphql.md#schema), Row order).
+- GraphQL `totalCount` above 10,000 answers 10,000 (`graphql-totalcount-cap`); a count that ran out
+  of its deadline is a lower bound flagged in `extensions.totalCountLowerBound`
+  (`graphql-r58-count-lower-bound`).
+- `Transfer.orderIndex` is the TRANSFER event's index in the transaction
+  (`graphql-h8-transfer-order-index`).
+- `creationTime` has whole seconds, as the node's command; stock adds a fraction
+  (`graphql-h9-creation-time-fraction`).
+- JSON texts that hold objects (`payload.data`, results) may order keys differently
+  (`graphql-r57-json-object`).
+- An account or `/v1/txs` answer at its row limit ends at a different height
+  (`ours-limit-edge`).
+- A genesis request key stored on several chains answers 404 on `/txs/tx`, as chainweb-data
+  does; `/txs/txs` lists every copy (`genesis-multi-chain-tx`).
+- A stock-issued cursor or `next` token is refused once at the cutover; the client restarts
+  from the first page ([graphql.md](graphql.md#ids-and-cursors),
+  [load-balancer.md](load-balancer.md#4-apply-check-roll-back)).
+- Stock root fields outside Kadena's schema (`pools`, `dexMetrics`, `tokenPrices`) are not
+  served, so introspection answers differ ([graphql.md](graphql.md#schema)).
+- `balance(...)` lists fungible balances only; stock also lists marmalade ledger rows at 0
+  (R-G4-03, [graphql.md](graphql.md#schema)).
+- Rows the node holds at 0 are not listed in balances (known gap Q,
+  [graphql.md](graphql.md#accounts)).
+- chainweb-data account lists without `minheight` show only recent rows; ours answers the
+  whole history ([api.md](api.md#compat-notes)).
+
+### Stock faults the node disproves
+
+Accepted only where the harness reads the node for that record and the node's data shows stock
+wrong. Each entry names the function and the read in `node_read`:
+
+- orphan rows: stock lists rows or counts from non-canonical blocks; the node's canonical header
+  at the row's chain and height says another block (`orphan-rows-txs`, `oracle-orphan`,
+  `oracle-orphan-rows`, `graphql-r58-oracle-orphan-dupes`, `graphql-r97-oracle-chain-dupes`).
+  G4 met them in `blocksFromHeight` ([graphql.md](graphql.md#blocks-and-network));
+- missing rows: stock lacks rows the node's `/poll` puts in a canonical block
+  (`cwd-missing-node`, `cwd-missing-node-coinbase`, `cwd-events-missing-node`,
+  `kdatxs-missing-node`, `kdatxs-events-node`, `oracle-gap`, `graphql-r75-h7-unindexed`,
+  `graphql-r75-h7-off-chain`, `graphql-h7-window-referee`). G4 met them in `/v1/txs`
+  ([api.md](api.md#compat-notes)) and as funded balance rows stock lacks
+  ([graphql.md](graphql.md#accounts));
+- wrong counts: stock's `totalCount` disagrees with the rows the node holds
+  (`graphql-oracle-count-short`, `graphql-r97-oracle-list-over-count`,
+  `graphql-r75-oracle-counts-heights`, `graphql-r58-by-key-extra-row`);
+- wrong values: stock's field differs from the node's command or output for that request key
+  (`graphql-r62-payload-data`, `graphql-r75-exec-payload-data`, `graphql-r75-payload-rollback`,
+  `graphql-r75-signer-address`, `graphql-r75-nested-order-index`,
+  `graphql-oracle-decimal-zeros`). The fields are listed in
+  [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node); in `/v1/txs`,
+  kda-txs also pairs a request key with another transaction's details
+  ([api.md](api.md#compat-notes));
+- failed transactions: stock keeps the Pact error as produced at execution time (a `callStack`,
+  a source position in `info`), while the node serves the stored output. Accepted by owner
+  ruling of 2026-11-19, with the node as the reference; the harness does not read the node per
+  record for these (`failed-tx-callstack`, `failed-tx-error-info`). Only a `callStack` stock has
+  and ours lacks, and an `info` where ours answers the node's `<toplevel>:0`, are accepted;
+  ours having a `callStack`, or any other `info` of ours, is reported;
+- stale supply: stock's `networkInfo.coinsInCirculation` is lower while the node's tip is above
+  stock's own `lastBlockHeight` (suite rule `networkInfo-coins-stale`).
+
+Accepted on node samples taken when the rule was made, not on a per-record read: the signer
+`scheme` stock answers as `""` (`graphql-r58-oracle-empty`) and the nonce whose inner quotes
+stock strips (`graphql-r60-oracle-strips-quotes`); see
+[graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node).
+
+Not accepted: entries without a node read are open and their differences are reported
+(`cwd-hole-tx-au4cjml8`, `cwd-hole-txs-au4cjml8`, `cwd-hole-events-7392263`,
+`kdatxs-gap-cont-d7bf62`, `oracle-event-order`). Open entries, our own defects and known gaps
+match nothing.
+
+## G4 real-traffic replay
+
+**Numbers as of 2026-11-25; refreshed after the final G4 checks.** The same results as a
+standalone page: [g4-comparison.html](g4-comparison.html).
+
+### Method
+
+Real production requests were captured (GraphQL from 16 to 18 November, REST from 14 to 21
+November), and each distinct request was replayed exactly as the client sent it to both
+sides: kda-indexer and the stock indexer of that route (the Kadena GraphQL indexer,
+chainweb-data or kda-txs). The comparison is a paired compare of the full JSON answers: every
+field, every row, the status code and the GraphQL `errors` array. It fails closed: an answer
+is equal only when the two bodies are equal after the documented normalizations (float
+tolerance, decimal text, key order inside JSON texts), so a shorter list shows as missing
+rows and a list in another order shows as a difference. Every remaining difference was then
+settled against the node (its canonical headers, `/poll` and `/local` reads) or by a written
+ruling. Requests the stock side could not answer were replayed on ours alone, and ours' rows
+were checked on the node. Balances were checked separately: every balance row of all 1.21
+million accounts against the node.
+
+Weights: "distinct" counts distinct requests; "7 days" counts the real requests they stand
+for.
+
+### Coverage by family
+
+| Family | Distinct / 7-day requests | Compared with stock | Checked on node | Not compared |
+|---|---:|---|---|---|
+| `blocksFromHeight` | 67,965 / 77,853 | all | 63,582 ok, 0 bad | nested lists in 515 records |
+| `transaction` | 16,845 / 34,399 | all | – | ~327 run-1 diffs not itemized |
+| `transactions` | 5,207 / 45,596 | all; isCoinbase re-run live | – | gasLimit fix not replayed |
+| `transfers` | 554 / 619 | all | – | 44 diffs never classified |
+| `balance(...)` | 350 / 371 | all, by position | all accounts | – |
+| `fungibleAccount` | 353 / 373 | all | all accounts, and the pending records | – |
+| `nonFungibleAccount` | 354 / 374 | none (stock crashes) | none | **never** |
+| `lastTokenPriceInKda` | 49 / 242 | 15 (34 stock 504) | – | served version not replayed |
+| `pactQuery`, `__schema`, `networkInfo` | 34 / 136 | all | tip rule | – |
+| `blocksFromDepth`, `completedBlockHeights`, `events` | 7 / 26 | all | – | 5 diffs never classified |
+| REST `/v1/txs` | 1,598 / 28,322 | all (48 h by key; the rest by position) | one-side rows (15) | 336 diffs only matched by pattern |
+| chainweb-data `/txs/account` | 52 / 69,725 | the pollers that carry the traffic | `fluxteam` 10/10 | ~46 small accounts |
+| chainweb-data `/txs/recent` | 1 / 36,720 | stale stock cache | – | **rows never compared** |
+| chainweb-data `/txs/search` | 22 / 40 | stock hangs | – | **never** |
+| chainweb-data stats | 3 / 20 | stock unavailable | – | not in G4 |
+| GraphQL subscriptions | not captured | – | – | volume unknown |
+
+### What is and isn't compared
+
+Each request was replayed as sent, so the comparison covers exactly the page the client asked
+for, and nothing beyond it.
+
+| Pattern | Where it happens | Real requests (7 days) | Status | What it means |
+|---|---|---:|---|---|
+| Only page 1 compared | every paged list: `transactions`, `transfers`, `events`, `balance(...)`, account lists | all list traffic | gap | Clients ask for page 2 and later with a stock-issued cursor, which ours cannot read, so a page-2 request cannot be paired. Only 57 such requests were in the corpus, all nested inside `blocksFromHeight`, and ours answered `invalid cursor`. Ours' own paging to the end was never compared with stock's. |
+| Block transactions cut at page 1 | nested `blocksFromHeight → transactions` when a block has more transactions than the page | 41,693 | gap | 515 records: 464 never completed and 51 with a different page 1 because of order. The rest of each block's list was never compared. |
+| List length vs content | all lists | – | compared | The whole body is compared, so a shorter list shows as missing or extra rows; count and content are checked together. |
+| `totalCount` / `hasNextPage` | wherever the query selects them (`balance`, `transactions`) | – | partly | Compared. One rule accepts stock's count when it is below its own row count. Stock's `totalCount: 1` while listing 2 or more rows (580 cases) was closed by hand. |
+| Lists compared by position | `balance(...)` edges, `/v1/txs`, nested block transactions | 371 + 28,322 + 41,693 | harness gap | Order differences show as content differences. They were re-matched by key afterwards: `balance` 270 records, and the 48-hour `/v1/txs` set (219 paths). The 336 `/v1/txs` corpus differences (13,196 requests) were closed by pattern. |
+| Per-token limit window | kda-txs `/v1/txs` (25 rows per token) | 2,803 (48 h) | checked | Compared inside the window. In one case stock missed 2 new rows and filled its 25 with older ones; the node confirmed ours. |
+| Big limits | chainweb-data `/txs/account?limit=200000` (`fluxteam`) | 35,594 | full list | Compared in full: ours 237 rows, stock 27–32; the node confirmed ours. |
+| "Incomplete" never reported | all per-family tables | – | gap | The harness flags answers that hit a page limit as incomplete, but no G4 table has that column. |
+| Ours only, no stock pair | `nonFungibleAccount` (stock crashes), `/txs/search` (stock hangs), `/txs/recent` (stale stock cache) | 374 + 40 + 36,720 | not compared | No stock answer and no node check in G4. |
+| Changed after the replay | coinbase `gasLimit`, `lastTokenPriceInKda` | 45,584 + 242 | offline only | Fixed after the replay and checked against the stored answers only. |
+| Values compared in full | all balances | 1.21 M accounts | full | Every balance row was checked against the node. Only the 7 bridge rows and the zero-row gap remain. |
+
+Planned before G4 closes: a page-walk check (each side walked to its last page with its own
+cursors, rows compared as sets plus `totalCount`, one-side rows read on the node), including
+the 515 blocks; a set-based compare for `balance` and `/v1/txs` in the harness, with an
+incomplete column; a live replay of the fixed families on the release build; node checks of
+`nonFungibleAccount`, `/txs/recent` and `/txs/search`.
+
+### Difference catalogue
+
+All 43 classes the G4 replay found. Counts are distinct cases, with the 7-day weight in
+brackets where known; "48 h" marks the REST 48-hour lists. Verdicts: **ours** (ours is right,
+the node agrees), **stock** (stock was right; ours was fixed), **both** (both acceptable, a
+documented difference), **unknown** (not settled yet).
+
+| # | Difference | Count | Verdict | Documented in |
+|---:|---|---|---|---|
+| 1 | `transactions(isCoinbase: true)` refused by ours | 5,193 (45,584) | stock; fixed | [graphql.md](graphql.md#zelcore-extensions) |
+| 2 | malformed request key: ours `BAD_USER_INPUT`, stock `null` | 8,475 (17,443) | stock; fixed | [graphql.md](graphql.md#transactions-events-and-transfers) |
+| 3 | coinbase `meta.gasLimit`: stock the number `0`, ours `"0"` | 5,193 (45,584) | both; matched (not replayed live) | [graphql.md](graphql.md#wire-formats-that-follow-the-oracle-r-p5p9-19) |
+| 4 | `lastTokenPriceInKda` not served | 49 (242) | stock; fixed (offline check) | [graphql.md](graphql.md#token-price) |
+| 5 | isCoinbase: stock `totalCount` 1 while listing 2 or more rows | 580 | ours | [graphql.md](graphql.md#zelcore-extensions) |
+| 6 | order of user transactions inside a block on multi-block lists | 273 | both | [graphql.md](graphql.md#schema) (Row order) |
+| 7 | nested `Block.transactions` of a paged block: another page 1 on stock; 464 records never completed | 42 + 9 + 464 (exposure 41,693) | unknown (sets not compared yet); order documented | [graphql.md](graphql.md#schema) (Row order), [Blocks and network](graphql.md#blocks-and-network) |
+| 8 | stock-issued cursor in nested `transactions(after:)`: ours `invalid cursor` | 57 (70) | both (cutover transient) | [graphql.md](graphql.md#ids-and-cursors) |
+| 9 | stock lists orphan blocks in `blocksFromHeight` | 25 + 8 + 27 | ours | [graphql.md](graphql.md#blocks-and-network) |
+| 10 | stock crash `base64url.replace is not a function` | 7 | ours | [graphql.md](graphql.md#blocks-and-network) |
+| 11 | stock rounds through JS floats (difficulty, balances, gas price) | 25,621 + 705 + 75 + 8 + 17 keys | ours | [graphql.md](graphql.md#scalars) |
+| 12 | key order inside JSON texts | inside 11 and 3 | both | [graphql.md](graphql.md#transactions-events-and-transfers) (Text forms) |
+| 13 | stock field quirks: nonce quoting, `pactId` null, `transactionId` `"0"`, `goodResult` null, number text | part of ~4,700 + 2,540 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node), [api.md](api.md#compat-notes) (decimal text) |
+| 14 | `signers.scheme`: stock `""` | part of ~4,700 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 15 | `cmd.nonce`: stock strips inner quotes | part of ~4,700 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 16 | `payload.rollback` | 196 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 17 | exec `payload.data` | 71 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 18 | `signers[].address`: stock `null` | 51 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 19 | signer order | 1 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 20 | `crossChainTransfer.creationTime` in whole seconds | 2 | both | [graphql.md](graphql.md#wire-formats-that-follow-the-oracle-r-p5p9-19) |
+| 21 | failed tx `badResult`: `callStack` and `info` | 117 | ours (= node, owner ruling) | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 22 | zero-balance rows and missing chain rows (gap Q) | 42 + 16 + 38 + 61 keys + 5 | stock lists rows the node holds at 0; ours omits them | [graphql.md](graphql.md#accounts) |
+| 23 | `balance` edge order | 82 | both | [graphql.md](graphql.md#zelcore-extensions) |
+| 24 | stock lacks funded balance rows | 5 + 12 | ours | [graphql.md](graphql.md#accounts) |
+| 25 | ours' rows read before the queue drained, now equal to the node | 216 | both (transient) | [graphql.md](graphql.md#accounts) |
+| 26 | `lastBlockHeight` +1 and balance tip races | ~30 + 16 | both | [graphql.md](graphql.md#fields-compared-with-the-node-not-an-oracle) |
+| 27 | `__schema` differs; stock-only DEX fields | 4 + 1 (15 + 4) | both | [graphql.md](graphql.md#schema) |
+| 28 | `networkInfo` `coinsInCirculation` / `totalGasUsedInKda` | 2 | both | [graphql.md](graphql.md#zelcore-extensions) |
+| 29 | `pactQuery` answers `NOT_SUPPORTED` | 26 (97) | both | [graphql.md](graphql.md#schema) |
+| 30 | `blocksFromHeight` with an inverted range | 1 | ours | [graphql.md](graphql.md#blocks-and-network) |
+| 31 | kda-txs pairs a request key with another tx's block, time, code or chain | ~200 | ours (node 24/24) | [api.md](api.md#compat-notes) |
+| 32 | kda-txs event order, and its `_id` | ~120 + 3 | ours (node order) | [api.md](api.md#compat-notes) |
+| 33 | kda-txs answers 404 after 30 s, ours 504 | 4 | ours | [api.md](api.md#compat-notes) |
+| 34 | kda-txs lacks rows the node has | 4 paths (7,242 in 48 h) | ours | [api.md](api.md#compat-notes) |
+| 35 | chainweb-data `/txs/account` without `minheight`: stock shows recent rows only | 1 (35,594; 10,175 in 48 h) | ours (node 10/10) | [api.md](api.md#compat-notes) |
+| 36 | chainweb-data `/txs/recent`: stale stock cache | 1 (36,720; 10,182 in 48 h) | ours (fresher) | [api.md](api.md#compat-notes) |
+| 37 | `/txs/search`: ours `[]` in about 2 s, stock hangs | 4–22 (40) | unknown | latency: [Where REST is slower](#where-rest-is-slower); content not checked yet |
+| 38 | `transfers` differences never classified | 44 (65) | unknown | not classified yet |
+| 39 | `blocksFromDepth`, `completedBlockHeights`, `events` differences never classified | 5 | unknown | not classified yet |
+| 40 | non-ASCII module rows the node cannot read, and the `free.kDOGE` collision | 23 + 1 | both | [operations.md](operations.md#token-receivers-pass-d3) |
+| 41 | `lago.kwUSDC`, `lago.USD2`, `lago.kwBTC` stub rows: no `get-balance` on the node | 489 rows | neither verifiable; excluded (R-G4-02) | [graphql.md](graphql.md#schema), [operations.md](operations.md#token-receivers-pass-d3) |
+| 42 | stock lists marmalade ledger rows at 0 in `balance(...)` | 11 keys | both; ours stays fungible-only (R-G4-03) | [graphql.md](graphql.md#schema) |
+| 43 | Hyperlane bridge (`kb-*`) balances: 6 rows missing, 1 wrong | 7 rows | stock and node (ours was wrong); fix merged, recheck pending | [operations.md](operations.md#token-receivers-pass-d3) |
+
+Totals: 43 classes. 4 fixed in ours (1–4); 2 open on ours' side (22, and 43 until its recheck
+passes); 4 not settled (7, 37, 38, 39); the rest are documented differences where ours
+follows the node or both answers are acceptable.
+
 ## What is not compared
 
 - **chainweb-data backfill time, CPU and disk IO:** not measured.

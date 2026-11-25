@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KDA Indexer vs Stock</title>
+<style>
+/* Layout: one reading column; wide tables scroll inside their own frames; state shown as chips */
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --fg:#17202b; --muted:#5b6675; --line:#dde2e9;
+  --accent:#2f5bd3; --ok:#1d7a4a; --ok-bg:#e3f3ea; --warn:#9a6200; --warn-bg:#fbf0d9;
+  --bad:#b4232c; --bad-bg:#fbe4e5; --info:#3d4f6b; --info-bg:#e8edf5;
+  --f-display:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif; --f-body:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif; --f-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#11161d; --panel:#18202a; --fg:#e4e9f0; --muted:#97a3b3; --line:#2a3542;
+  --accent:#7d9cf0; --ok:#6fd19c; --ok-bg:#16352a; --warn:#f0bd5c; --warn-bg:#3a2e14;
+  --bad:#f08a90; --bad-bg:#3d1c20; --info:#b3c2da; --info-bg:#222e3e; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#11161d; --panel:#18202a; --fg:#e4e9f0; --muted:#97a3b3; --line:#2a3542;
+  --accent:#7d9cf0; --ok:#6fd19c; --ok-bg:#16352a; --warn:#f0bd5c; --warn-bg:#3a2e14;
+  --bad:#f08a90; --bad-bg:#3d1c20; --info:#b3c2da; --info-bg:#222e3e; color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 var(--f-body)}
+.wrap{max-width:1080px;margin:0 auto;padding-block:28px 56px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:grid;gap:28px}
+h1,h2,h3{font-family:var(--f-display);text-wrap:balance;margin:0;line-height:1.2}
+h1{font-size:1.9rem}
+h2{font-size:1.3rem;padding-top:8px;border-top:1px solid var(--line)}
+h3{font-size:1.02rem}
+p{margin:0;max-width:72ch}
+.sub{color:var(--muted)}
+section{display:grid;gap:12px;min-width:0}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;display:grid;gap:2px}
+.kpi b{font:600 1.6rem/1.1 var(--f-display);font-variant-numeric:tabular-nums}
+.kpi span{font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.verdict{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--warn);border-radius:8px;padding:14px 16px;display:grid;gap:8px}
+.tbl{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:.88rem}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{font-weight:600;color:var(--muted);font-size:.76rem;text-transform:uppercase;letter-spacing:.05em;background:var(--bg);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.n{font-variant-numeric:tabular-nums;white-space:nowrap;font-family:var(--f-mono);font-size:.82rem}
+code{font-family:var(--f-mono);font-size:.84em;background:var(--info-bg);padding:1px 4px;border-radius:3px}
+.chip{display:inline-block;font-size:.72rem;font-weight:600;padding:2px 7px;border-radius:99px;white-space:nowrap;letter-spacing:.02em}
+.ok{background:var(--ok-bg);color:var(--ok)} .warn{background:var(--warn-bg);color:var(--warn)}
+.bad{background:var(--bad-bg);color:var(--bad)} .info{background:var(--info-bg);color:var(--info)}
+ul{margin:0;padding-left:20px;display:grid;gap:4px;max-width:78ch}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;display:grid;gap:8px;min-width:0}
+.legend{display:flex;flex-wrap:wrap;gap:8px;font-size:.82rem;color:var(--muted);align-items:center}
+footer{color:var(--muted);font-size:.82rem}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<header style="display:grid;gap:8px">
+  <h1>KDA Indexer vs Stock</h1>
+  <p class="sub">An independent audit of the G4 replay of real production requests: what was compared, how it was compared, and every difference found between ours and stock (the Kadena GraphQL indexer, chainweb-data and kda-txs). Audit of 25 Nov 2026; doc status updated with the G4 docs change. Numbers as of 25 Nov 2026, refreshed after the final G4 checks.</p>
+</header>
+
+<section>
+  <div class="kpis">
+    <div class="kpi"><span>Difference kinds</span><b>43</b></div>
+    <div class="kpi"><span>Fixed in ours</span><b>4</b></div>
+    <div class="kpi"><span>Documented</span><b>37</b></div>
+    <div class="kpi"><span>Not documented</span><b>2</b></div>
+    <div class="kpi"><span>Ours wrong, open</span><b>2</b></div>
+    <div class="kpi"><span>Not settled</span><b>4</b></div>
+  </div>
+  <div class="verdict">
+    <h3>Verdict</h3>
+    <p><b>Detecting differences is sound.</b> Every response is compared as full JSON, fail-closed. Comparing by position can over-report differences but can't hide one.</p>
+    <p><b>Explaining and closing them is not sound yet.</b> Most remaining differences were closed by scripts that live only on the test server and were never reviewed. A few labels contradict the harness's own rules. Two kinds of check were never done: <b>pages after the first</b>, and <b>sets inside paged block lists</b>. At the audit, 24 of the 43 kinds weren't in the public docs; the docs now cover all of them except the 2 not yet classified (#38, #39).</p>
+  </div>
+</section>
+
+<section>
+  <h2>First page only, counts only: what the comparison actually covers</h2>
+  <p>Each real request was replayed exactly as the client sent it, and both full answers were compared. So the comparison covers exactly the page the client asked for, and nothing beyond it.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Pattern</th><th>Where it happens</th><th>Real requests (7 days)</th><th>Status</th><th>What it means</th></tr></thead>
+    <tbody>
+    <tr><td><b>Only page 1 compared</b></td><td>Every paged list: <code>transactions</code>, <code>transfers</code>, <code>events</code>, <code>balance(...)</code>, account lists</td><td class="n">all list traffic</td><td><span class="chip bad">gap</span></td><td>Clients ask for page 2 and later with a <b>stock-issued cursor</b>. Ours can't read stock's cursors (both sides treat cursors as private), so a page-2 request can't be paired. Only 57 such requests were in the corpus, all nested inside <code>blocksFromHeight</code>, and ours answered "invalid cursor". <b>Ours' own paging (walking to the end with its own cursors) was never compared with stock's.</b></td></tr>
+    <tr><td><b>Block transactions cut at page 1</b></td><td>Nested <code>blocksFromHeight → transactions</code> when a block has more transactions than the page size</td><td class="n">41,693</td><td><span class="chip bad">gap</span></td><td>515 records: 464 were never completed (h6-unfinished) and 51 had a different page 1 because of order. They were counted as "known", but the rest of each block's list was never compared. The doc said the order matches stock's; G4 shows it doesn't, and the doc now says so.</td></tr>
+    <tr><td><b>List length vs content</b></td><td>All lists</td><td class="n">–</td><td><span class="chip ok">compared</span></td><td>The whole body is compared, so a shorter list shows as missing or extra rows. Row counts are never compared on their own: count and content are checked together.</td></tr>
+    <tr><td><b>totalCount / hasNextPage</b></td><td>Wherever the query selects them (<code>balance</code>, <code>transactions</code>)</td><td class="n">–</td><td><span class="chip warn">partly</span></td><td>Compared. One rule accepts stock's count when it's below its own row count. Stock's <code>totalCount: 1</code> while listing 2 or more rows (580 cases) was closed by hand, not by a rule.</td></tr>
+    <tr><td><b>Lists compared by position</b></td><td><code>balance(...)</code> edges, <code>/v1/txs</code>, nested block transactions</td><td class="n">371 + 28,322 + 41,693</td><td><span class="chip warn">harness gap</span></td><td>The harness reports order differences as content differences. They were later re-matched by key with scripts outside the repo: <code>balance</code> 270 records, and only the 48-hour <code>/v1/txs</code> set (219 paths). The 336 <code>/v1/txs</code> corpus differences (13,196 requests) were closed by pattern, never matched by key.</td></tr>
+    <tr><td><b>Per-token limit window</b></td><td>kda-txs <code>/v1/txs</code> (25 rows per token)</td><td class="n">2,803 (48 h)</td><td><span class="chip ok">checked</span></td><td>Compared inside the window only. In one case stock was missing 2 new rows, so it filled its 25 with older ones. The node confirmed ours.</td></tr>
+    <tr><td><b>Big limits</b></td><td>chainweb-data <code>/txs/account?limit=200000</code> (fluxteam)</td><td class="n">35,594</td><td><span class="chip ok">full list</span></td><td>Compared in full: ours 237 rows, stock 27–32. The node confirmed ours. Documented.</td></tr>
+    <tr><td><b>"Incomplete" never reported</b></td><td>All per-family tables</td><td class="n">–</td><td><span class="chip warn">gap</span></td><td>The harness flags answers that hit a page limit as "incomplete", but no G4 table has that column. So we can't tell whether any were folded into "known".</td></tr>
+    <tr><td><b>Ours only, no stock pair</b></td><td><code>nonFungibleAccount</code> (stock crashes), <code>/txs/search</code> (stock hangs), <code>/txs/recent</code> (stock serves a stale cache)</td><td class="n">374 + 40 + 36,720</td><td><span class="chip bad">not compared</span></td><td>No stock answer and no node check in G4. <code>nonFungibleAccount</code> is also missing from the node-check tool.</td></tr>
+    <tr><td><b>Changed after the replay</b></td><td>Coinbase <code>gasLimit</code>, <code>lastTokenPriceInKda</code></td><td class="n">45,584 + 242</td><td><span class="chip warn">offline only</span></td><td>Fixed after run 2 and checked against stored answers only. Never replayed live on the release build.</td></tr>
+    <tr><td><b>Values compared in full</b></td><td>All balances (Task A)</td><td class="n">1.21 M accounts</td><td><span class="chip ok">full</span></td><td>Every balance row was checked against the node. Only the 7 bridge rows (PR #34) and the known zero-row gap remain.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="card">
+    <h3>Planned fixes for these gaps</h3>
+    <ul>
+      <li><b>Page-walk check:</b> for a sample of every paged query shape, walk each side to its last page with its own cursors. Compare the combined rows as sets, plus <code>totalCount</code>, and check rows found on only one side against the node.</li>
+      <li><b>Paged block transactions:</b> walk all 515 blocks to the end on both sides and check them against the node payload. Fix the doc line.</li>
+      <li><b>Harness:</b> set-based compare for <code>balance</code> and <code>/v1/txs</code>, an "incomplete" column in every table, and the closure scripts moved into the repo and reviewed.</li>
+      <li><b>Live replay on the release build:</b> isCoinbase (5,193), token price (49) and a 2,000-case sample, at no more than 4 parallel requests to production.</li>
+      <li><b>Ours-only families:</b> check <code>nonFungibleAccount</code>, <code>/txs/recent</code> and <code>/txs/search</code> against the node.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>What was compared, by family</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Family</th><th>Distinct / 7-day requests</th><th>Compared with stock</th><th>Checked on node</th><th>Not compared</th></tr></thead>
+    <tbody>
+    <tr><td><code>blocksFromHeight</code></td><td class="n">67,965 / 77,853</td><td>all</td><td>63,582 ok, 0 bad</td><td>nested lists in 515 records</td></tr>
+    <tr><td><code>transaction</code></td><td class="n">16,845 / 34,399</td><td>all</td><td>–</td><td>~327 run-1 diffs not itemized</td></tr>
+    <tr><td><code>transactions</code></td><td class="n">5,207 / 45,596</td><td>all; isCoinbase re-run live</td><td>–</td><td>gasLimit fix not replayed</td></tr>
+    <tr><td><code>transfers</code></td><td class="n">554 / 619</td><td>all</td><td>–</td><td>44 diffs never classified</td></tr>
+    <tr><td><code>balance(...)</code></td><td class="n">350 / 371</td><td>all, by position</td><td>all accounts (Task A)</td><td>–</td></tr>
+    <tr><td><code>fungibleAccount</code></td><td class="n">353 / 373</td><td>all</td><td>Task A / B</td><td>–</td></tr>
+    <tr><td><code>nonFungibleAccount</code></td><td class="n">354 / 374</td><td>none (stock crashes)</td><td>none</td><td><b>never</b></td></tr>
+    <tr><td><code>lastTokenPriceInKda</code></td><td class="n">49 / 242</td><td>15 (34 stock 504)</td><td>–</td><td>served version not replayed</td></tr>
+    <tr><td><code>pactQuery</code>, <code>__schema</code>, <code>networkInfo</code></td><td class="n">34 / 136</td><td>all</td><td>tip rule</td><td>–</td></tr>
+    <tr><td><code>blocksFromDepth</code>, <code>completedBlockHeights</code>, <code>events</code></td><td class="n">7 / 26</td><td>all</td><td>–</td><td>5 diffs never classified</td></tr>
+    <tr><td>REST <code>/v1/txs</code></td><td class="n">1,598 / 28,322</td><td>all (48 h by key; the rest by position)</td><td>one-side rows (15)</td><td>336 diffs only matched by pattern</td></tr>
+    <tr><td>cwd <code>/txs/account</code></td><td class="n">52 / 69,725</td><td>the pollers that carry the traffic</td><td>fluxteam 10/10</td><td>~46 small accounts</td></tr>
+    <tr><td>cwd <code>/txs/recent</code></td><td class="n">1 / 36,720</td><td>stale stock cache</td><td>–</td><td><b>rows never compared</b></td></tr>
+    <tr><td>cwd <code>/txs/search</code></td><td class="n">22 / 40</td><td>stock hangs</td><td>–</td><td><b>never</b></td></tr>
+    <tr><td>cwd stats</td><td class="n">3 / 20</td><td>stock unavailable</td><td>–</td><td>not in G4</td></tr>
+    <tr><td>GraphQL subscriptions</td><td class="n">not captured</td><td>–</td><td>–</td><td>volume unknown</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>All 43 differences</h2>
+  <div class="legend">
+    <span class="chip ok">fixed</span> <span class="chip info">documented</span> <span class="chip warn">not documented</span> <span class="chip bad">ours wrong or unknown</span>
+  </div>
+
+  <h3>Fixed in ours (we now match stock)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>#</th><th>Difference</th><th>Count</th><th>Status</th></tr></thead>
+    <tbody>
+    <tr><td class="n">1</td><td><code>transactions(isCoinbase:true)</code>: ours refused the query</td><td class="n">5,193 (45.6k)</td><td><span class="chip ok">fixed</span> re-run: same rows 5,090/5,090</td></tr>
+    <tr><td class="n">2</td><td>Malformed request key: ours returned an error, stock returns <code>null</code></td><td class="n">8,475 (17.4k)</td><td><span class="chip ok">fixed</span> 100% equal</td></tr>
+    <tr><td class="n">3</td><td>Coinbase <code>gasLimit</code> was <code>"0"</code> on ours, the number <code>0</code> on stock</td><td class="n">5,193</td><td><span class="chip ok">fixed</span> not replayed live</td></tr>
+    <tr><td class="n">4</td><td><code>lastTokenPriceInKda</code> was not served</td><td class="n">49 (242)</td><td><span class="chip ok">fixed</span> offline check only</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Stock is wrong, ours is right</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>#</th><th>Difference</th><th>Count</th><th>Docs</th></tr></thead>
+    <tbody>
+    <tr><td class="n">5</td><td>Stock's <code>totalCount</code> is 1 while it lists 2 or more rows</td><td class="n">580</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">9</td><td>Stock lists orphan blocks: duplicate rows, a chain dropped from the page</td><td class="n">60</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">10</td><td>Stock crashes: "base64url.replace is not a function"</td><td class="n">7</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">11</td><td>Stock rounds through JS floats (difficulty, balances, gas price)</td><td class="n">~25.6k</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">13</td><td>Stock field quirks: quoted nonce, <code>pactId</code>, <code>transactionId</code> "0", <code>goodResult</code></td><td class="n">~7k</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">14</td><td>Signer <code>scheme</code> is <code>""</code> on stock</td><td class="n">in #3</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">15</td><td>Stock strips the quotes inside <code>cmd.nonce</code></td><td class="n">in #3</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">16</td><td><code>payload.rollback</code>: ours = node</td><td class="n">196</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">17</td><td>Exec <code>payload.data</code>: ours = node</td><td class="n">71</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">18</td><td><code>signers[].address</code>: stock <code>null</code>, ours = node</td><td class="n">51</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">19</td><td>Stock lists signers out of order</td><td class="n">1</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">21</td><td>Failed tx <code>badResult</code> shape: ours = node</td><td class="n">117</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">24</td><td>Stock is missing funded balance rows (<code>kaddex.skdx</code>, <code>kdlaunch.token</code>, …)</td><td class="n">17</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">31</td><td>kda-txs pairs a key with the wrong block, time or chain</td><td class="n">~200</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">32</td><td>kda-txs event order, and its Mongo <code>_id</code></td><td class="n">~123</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">33</td><td>kda-txs answers 404 after 30 s; ours answers 504</td><td class="n">4</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">34</td><td>kda-txs is missing rows the node has</td><td class="n">4 paths (7.2k in 48 h)</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">35</td><td>chainweb-data account lists: stock shows only recent rows (fluxteam 27–32 vs 237)</td><td class="n">1 (35.6k)</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">36</td><td>chainweb-data <code>/txs/recent</code>: stale stock cache</td><td class="n">1 (36.7k)</td><td><span class="chip info">yes</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Both acceptable (intended or by design)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>#</th><th>Difference</th><th>Count</th><th>Docs</th></tr></thead>
+    <tbody>
+    <tr><td class="n">6</td><td>Order of user transactions inside a block</td><td class="n">273</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">8</td><td>A stock cursor gives "invalid cursor" on ours, once, at the switch</td><td class="n">57 (70)</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">12</td><td>Key order inside JSON text</td><td class="n">in 25.6k</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">20</td><td><code>crossChainTransfer.creationTime</code> in whole seconds</td><td class="n">2</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">23</td><td>Order of <code>balance</code> rows</td><td class="n">82</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">25</td><td>Stale rows before the queue drained; they now equal the node</td><td class="n">216</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">26</td><td>Tip races: stock one block ahead or behind</td><td class="n">~46</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">27</td><td><code>__schema</code>, and stock's extra DEX fields</td><td class="n">5 (19)</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">28</td><td><code>networkInfo</code>: two fields <code>null</code></td><td class="n">2</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">29</td><td><code>pactQuery</code> answers NOT_SUPPORTED</td><td class="n">26 (97)</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">30</td><td>Inverted height range: ours returns an empty list, stock errors</td><td class="n">–</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">40</td><td>Module names the node can't read (non-ASCII)</td><td class="n">23 rows</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">42</td><td><code>balance(...)</code>: stock lists marmalade NFT rows at 0, one per token id; <b>ours stays fungible-only</b> (owner decision)</td><td class="n">11 keys</td><td><span class="chip info">yes (PR #34)</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Gaps in ours, and unsettled differences</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>#</th><th>Difference</th><th>Count</th><th>Status</th></tr></thead>
+    <tbody>
+    <tr><td class="n">43</td><td><b>kb-* bridge balances:</b> 6 rows missing, 1 wrong</td><td class="n">7 rows</td><td><span class="chip warn">fix merged</span> PR #34 merged 25 Nov; deploying to the test server, then a ~14 h re-walk and a recheck of the 7 rows</td></tr>
+    <tr><td class="n">22</td><td>Zero-balance rows: ours leaves out rows the node holds at 0</td><td class="n">~160</td><td><span class="chip bad">known gap</span> documented</td></tr>
+    <tr><td class="n">41</td><td>lago stub rows: no balance on the node to check against</td><td class="n">489 rows</td><td><span class="chip info">documented</span> R-G4-02, excluded (PR #34)</td></tr>
+    <tr><td class="n">7</td><td>Paged block transactions: only page 1 compared; the doc is wrong</td><td class="n">515 (41.7k)</td><td><span class="chip bad">unknown</span> page-walk planned; order difference documented</td></tr>
+    <tr><td class="n">37</td><td><code>/txs/search</code>: ours answers <code>[]</code> in about 2 s, stock hangs</td><td class="n">4 (40)</td><td><span class="chip bad">unknown</span> node check planned</td></tr>
+    <tr><td class="n">38</td><td><code>transfers</code> differences never classified</td><td class="n">44 (65)</td><td><span class="chip bad">unknown</span> re-check</td></tr>
+    <tr><td class="n">39</td><td><code>blocksFromDepth</code>, <code>completedBlockHeights</code> and <code>events</code> differences never classified</td><td class="n">5</td><td><span class="chip bad">unknown</span> re-check</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Updates</h2>
+  <div class="card"><ul>
+    <li><b>25 Nov:</b> PR #34 merged. It fixes the bridge-token balance marking (#43), documents the lago exclusion (#41), and documents that <code>balance(...)</code> stays fungible-only (#42). A memory problem the review found is fixed too: a crafted transaction of 0.5 MB used to cost 968 MB, and now costs 0.7 MB. Deployment and the re-walk are in progress.</li>
+    <li><b>25 Nov:</b> Security re-check of the 10 open audit items. 2 were real but low impact (R-01, F-52) and are fixed in PR #35, merged together with an F-58 hardening. The other 8 don't apply in our setup, because they need our own trusted node to misbehave or can't be reached on our install.</li>
+  </ul></div>
+  <h2>Before G4</h2>
+  <div class="cols">
+    <div class="card"><h3>Docs</h3><ul><li>Done: the sections "Intended differences" and "Stock faults the node disproves" are in the docs.</li><li>Done: every kind found is documented, except #38 and #39, which are not classified yet.</li><li>Done: the line about stock's block order is fixed.</li><li>Open: the final stats after the remaining checks.</li></ul></div>
+    <div class="card"><h3>Harness</h3><ul><li>Set-based compare for lists.</li><li>An "incomplete" column in every table.</li><li>Move the closure scripts into the repo and get them reviewed.</li><li>Correct the mislabelled records.</li><li>Classify #38 and #39.</li></ul></div>
+    <div class="card"><h3>Live checks</h3><ul><li>Page-walk compare, including the 515 blocks.</li><li>Live replay of the fixed families on the release build.</li><li><code>nonFungibleAccount</code>, <code>/txs/recent</code> and <code>/txs/search</code> against the node.</li></ul></div>
+  </div>
+</section>
+
+<footer>Sources: the G4 replay report (runs 1–3), the final checks report and an independent audit, kept with the project's G4 notes. Counts from the stored results are the reports' own counts. "7 days" is the real-traffic corpus: GraphQL 16–18 Nov, REST 14–21 Nov.</footer>
+</div>
+</body>
+</html>

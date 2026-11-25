@@ -58,7 +58,19 @@ Differences from Kadena graph:
   than the block (kadscan asks `first: 25`) still shows the coinbase. A coinbase row's cursor
   sorts above every user tx of its block; user rows keep the cursors of the list without the
   flag. A list of one block (`blockHash` without `requestKey`, the `Block` connections) is in
-  the node's order, coinbase first, as the node and the stock indexer list it.
+  the node's order, coinbase first, as the node lists it. The stock indexer's order there is
+  not the node's: in the G4 replay of real traffic, a nested `Block.transactions` page of a
+  block with more transactions than the page held a different subset of the block on stock
+  than on ours (51 records), while a block that fits on one page held the same rows. So the
+  first page of a large block, and the cursors that walk on from it, differ between the two;
+  ours follows the node.
+- Root fields of the stock indexer that are not in Kadena's schema are not served: the DEX
+  fields `pools`, `dexMetrics` and `tokenPrices` (one real request asked for them in the G4
+  replay) are unknown fields: the document answers `GRAPHQL_VALIDATION_FAILED` (HTTP 400, see
+  [Errors](#errors)), where stock answers them. Introspection
+  (`__schema`) lists Kadena's schema plus the ZelCore extensions below, so its answer differs
+  from stock's, whose type list has those fields and lacks ours. The DEX price that kadscan
+  reads is served as `lastTokenPriceInKda` (see [Token price](#token-price)).
 
 ## Errors
 
@@ -311,7 +323,18 @@ number open.
   node's order: the coinbase first (the first leaf of the payload's `outputsHash`, executed
   before the user txs), then the user txs in payload order, each tx's events by ascending
   order index. Root lists with `blockHash` (and no `requestKey`) list their one block in
-  the same order.
+  the same order. The stock indexer orders a block's transactions otherwise, so the first
+  page of a block larger than the page holds other rows there (see Row order under
+  [Schema](#schema)).
+- **Orphan blocks.** `blocksFromHeight` lists the canonical blocks only (the store keeps no
+  others, and every block in the G4 replay matched the node's canonical header). The stock
+  indexer also lists non-canonical blocks (60 records in the G4 replay): the same chain and
+  height twice (an orphan next to the canonical block), or an orphan that takes a slot of a
+  20-row page so that another chain's block drops out of it. Its `canonical: false` rows are
+  not in ours' answer.
+- **Stock crash.** Some `blocksFromHeight` documents make the stock indexer answer
+  `INTERNAL_SERVER_ERROR` with `base64url.replace is not a function` (7 records in the G4
+  replay). Ours answers them with the blocks.
 - `lastBlockHeight` is the highest stored tip.
 - `networkInfo`: `networkId` from `network`, `networkHost` from `graphql.network_host`,
   `apiVersion` `"0.0"`, `transactionCount` (the last background count, as `/stats`; an error before the first one) and `coinsInCirculation` as `/stats`;
@@ -381,6 +404,14 @@ form resolve.
 Cursors are opaque. Transaction, event and transfer cursors are the same tokens as the native
 API's (a transaction position plus a block fingerprint), so a cursor taken from one instance
 pages on another, and a cursor whose block was reorged away is refused.
+
+**At the cutover from the stock indexer.** Stock's cursors are another format
+(`base64("<creationTime>:<id>")`), and ours cannot read them. A client that holds a stock
+cursor when its traffic moves to kda-indexer sends it once in `after`/`before` and gets
+`BAD_USER_INPUT` `invalid cursor` (57 such requests in the G4 replay, all in a nested
+`Block.transactions(after:)`); it restarts from the first page and pages on with ours'
+cursors. The REST `next` tokens have the same one-time transient (see
+[load-balancer.md](load-balancer.md#4-apply-check-roll-back)).
 
 ## Scalars
 
@@ -522,6 +553,35 @@ the oracle puts them.
 - **Text forms.** `goodResult`, `badResult`, `continuation`, `metadata`, `Event.parameters`,
   payload `data` and capability `args` are compact JSON text of the node's values (numbers
   keep their exact text). `Transfer.amount` is the decimal of the event's amount parameter.
+  The keys of a JSON object inside these texts may come in another order than in the stock
+  indexer's text; the values are the same.
+
+### Transaction fields where stock differs from the node
+
+Ours serves a transaction's command and result as the node holds them. The G4 replay of real
+`transaction` and `blocksFromHeight` requests found these fields where the stock indexer's
+value is not the node's. Each class was checked against the node's command or output for
+sampled request keys (most of them per record by the comparison harness), and the node
+agreed with ours every time:
+
+| Field | Ours (the node's value) | Stock indexer |
+|---|---|---|
+| `cmd.nonce` holding double quotes | the command's nonce as it is | one layer of JSON quoting removed from the whole nonce, or every double quote inside it removed |
+| `cmd.signers[].scheme` | `""` when the signer names no scheme, else the command's scheme | `""` also when the command names one |
+| `cmd.signers[].address` | the signer's `addr` from the command | `null` (51 records) |
+| `cmd.signers` order | the command's order (`orderIndex` 0, 1, …) | at times another order (1 record listed 1, 0); the same signers as a set |
+| `payload.pactId` of a continuation | the command's pact id | `null` |
+| `payload.rollback` of a continuation | the command's `rollback` | another value (196 records) |
+| exec `payload.data` | the command's data | another value (71 records) |
+| continuation `payload.data` that the node holds as `null` | `"null"` | `"{}"` |
+| `result.transactionId` of a failed tx | `null` (the node has no tx id for it) | `"0"` |
+| `result.goodResult` when the node's result data is the empty string | `"\"\""` | `null` |
+| numbers inside `goodResult`, `continuation`, `Event.parameters` and capability `args` | the node's decimal text | another text for the same value (more or fewer fraction digits); equal as decimals |
+| `result.badResult` of a failed tx | the node's stored error: no `callStack`, `info` as the node serves it (`<toplevel>:0`) | the error as produced at execution time: with a `callStack`, and a source position in `info` (117 records) |
+
+The failed-tx class is accepted by owner ruling with the node as the reference; the others
+were read on the node per record or on samples when each rule was made. Floats are listed
+under [Scalars](#scalars), and decimal text under the compat notes of [api.md](api.md#compat-notes).
 
 ## Accounts
 
@@ -532,6 +592,17 @@ the oracle puts them.
   value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
   with `chainIds` set the rows come in the order asked (each chain once), as stock lists them;
   `fungibleChainAccount` on a chain without a row is `null`.
+- **Rows the node holds at 0 are not listed** (known gap Q). An account that exists on a chain
+  with balance 0 may have no row here, so it is absent from `chainAccounts`, from
+  `fungibleChainAccounts` and from `balance(...)`, and an account whose rows are all at 0 can
+  answer `fungibleAccount: null`. The stock indexer lists such zero rows. The G4 replay found
+  this in about 160 cases (records and account keys) of real `fungibleAccount` and
+  `balance(...)` requests; every non-zero row matched the node.
+- **Funded rows stock lacks.** The stock indexer misses some non-zero balance rows that the
+  node holds and ours lists, mostly token credits that no TRANSFER event names (for example
+  `kaddex.skdx`, `kdlaunch.token`, `mok.token`, `free.kishu-ken`; 17 records in the G4 replay,
+  each sampled row read on the node with `get-balance` and equal to ours). See
+  [operations.md](operations.md#token-receivers-pass-d3) for how ours finds those receivers.
 - `fungibleName` is trimmed before use, here and on the transaction and transfer lists, as
   stock reads it: `"coin "` names `coin`. A name of spaces alone is `BAD_USER_INPUT`.
 - `totalBalance` is the exact decimal sum of the chain balances; `balance` is the stored

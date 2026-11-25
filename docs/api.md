@@ -89,5 +89,34 @@ Every search route runs under one gate: at most `search.concurrency` (4) searche
   - **Slots.** `/v1/txs` reads have their own slots, a quarter of `api.read_threads` (at least 1; 1 with the default 4), and do not take the heavy-read slots of the GraphQL and compat lists, so a long one never stalls those. Each client (IPv4 address or IPv6 /64) still runs one heavy read at a time, `/v1/txs` included. A read over 5 s is logged (`api: slow /v1/txs read`) to size `read_threads` from real traffic.
   - **Body cap.** `api.v1txs_max_body_mb` (default 32 MB); a larger answer is 503 `use a smaller limit`.
   - The server answers within 35 s (5 s slot wait plus the 30 s read), so a balancer in front needs a server timeout of 40 s or more for this route (see [load-balancer.md](load-balancer.md)).
+  - **Answers that differ from kda-txs.** Ours reads every row from its own store of the
+    canonical chain; kda-txs takes its key list from a chainweb-data and its details from its
+    own database. The G4 replay of real `/v1/txs` traffic found these differences, with the
+    node on ours' side each time it was read:
+    - **Missing rows.** kda-txs leaves out transfers the node has (for example 2021
+      `transfer-create` rows, and new rows its key source had not listed yet; 4 paths with
+      7,242 requests in 48 hours). At the `limit` boundary it then fills the list with older
+      rows, so the two lists end at different heights. Every ours-only row that was checked is
+      in a canonical block on the node, with the account as a party.
+    - **Wrong details.** kda-txs can pair a request key with another transaction's
+      `blockHash`, `blockTime`, result `code` or chain (about 200 records; ours equals the
+      node in 24 of 24 reads).
+    - **Order and `_id`.** kda-txs lists the transactions in request-key order and some
+      transactions' events in another order than the node's output; ours lists the newest
+      transfer first and keeps the node's event order. kda-txs rows carry `_id`, its own
+      database id, which ours does not have. The rows are the same as a set.
+- **chainweb-data account lists without `minheight`.** `/txs/account/{account}` with no
+  `minheight` answers the account's whole history on ours, up to `limit`. chainweb-data
+  answers only recent rows then: for the public `fluxteam` account, asked with
+  `limit=200000` (about a third of the real chainweb-data traffic in 48 hours), chainweb-data
+  listed 27 to 32 rows from December 2023 on, and ours lists all 237 from April 2021 on. Every
+  row of chainweb-data's is in ours' list with the same fields, and 10 of 10 sampled
+  ours-only rows are on the node. Ours keeps the full history (it is what the node holds); a
+  client that relied on the short list gets a longer one. With `minheight=0` chainweb-data
+  did not answer within 60 s.
+- **`/txs/recent`.** Ours answers from its tip on every request. chainweb-data can serve a
+  stale cached answer: in the G4 replay its newest row stayed at the same block for 18
+  minutes while the chain moved on by more than 30 blocks, and five reads 3 s apart gave the
+  same answer. So the two lists can differ at any moment, and ours is the fresher one.
 - **`/txs/events` heavy reads (F-20).** A request that may walk without a selective posting list is a heavy read: one with no `modulename`, or with `modulename` plus a `param`, a `search`, or a `name` pattern (a `name` holding `%` or `_`, so `name=TRANSFER_XCHAIN` counts). Heavy reads share the heavy-read slots with the GraphQL lists and `/txs/search`. Each client (IPv4 address or IPv6 /64) runs one at a time with up to 3 more waiting; a further concurrent heavy request answers 503 `this client already runs a heavy request and has others waiting: retry when they are done` at once, with no `Retry-After`. `modulename` alone, or with a plain `name`, stays a normal read (with a plain `name` matching more than `api.max_event_lists` (64) event names in that module too). The answers themselves are unchanged.
 - **Decimal text (R-P5P9-98).** GraphQL `Decimal` values print the shortest exact text: no trailing zeros of the fraction. Only `transfers.amount` is a string; balances are JSON numbers. The node gives Pact decimals as `{"decimal":"138000.000000000000"}` and the reference GraphQL server often prints that scale (`"138000.000000000000"`, and at times 30 places); kda-indexer prints `"138000"` for `transfers.amount` and `138000` for a balance. The values are equal as exact decimals, so a client that parses the number gets the identical value. A client that compares the raw text, or shows the trailing zeros, sees a different string. The comparison harness counts amounts as equal when they are equal as exact decimals (never through floats), on both sides and against the node; this is a documented format difference, not a value difference.
