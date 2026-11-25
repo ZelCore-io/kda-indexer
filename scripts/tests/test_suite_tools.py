@@ -18,6 +18,7 @@ import allow  # noqa: E402
 import nodecheck as N  # noqa: E402
 import select3  # noqa: E402
 import pagewalk  # noqa: E402
+import rebody  # noqa: E402
 import base64  # noqa: E402
 import random  # noqa: E402
 
@@ -2357,6 +2358,97 @@ class WPH1Fix1PageWalkGuard(unittest.TestCase):
             ts = times[side]
             self.assertEqual(len(ts), 20)
             self.assertTrue(all(b - a >= 0.5 - 1e-9 for a, b in zip(ts, ts[1:])), (side, ts))
+
+
+def _leaf_diff(a, b, path=""):
+    """A stand-in for kda-compare pair-diff: one Changed entry per differing leaf."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = []
+        for k in sorted(set(a) | set(b)):
+            out += _leaf_diff(a.get(k), b.get(k), "%s/%s" % (path, k))
+        return out
+    if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+        return [e for i, (x, y) in enumerate(zip(a, b)) for e in _leaf_diff(x, y, "%s/%d" % (path, i))]
+    return [] if a == b else [{"path": path, "kind": "Changed"}]
+
+
+def _fake_pd(p):
+    ents = _leaf_diff(p["ours"]["body"], p["stock"]["body"])
+    if p["ours"]["status"] != p["stock"]["status"]:
+        return {"class": "status", "entries": ents, "all": ents, "left": ents, "left_total": len(ents)}
+    if not ents:
+        return {"class": "equal", "entries": [], "all": [], "left": [], "left_total": 0}
+    return {"class": "diff", "entries": ents, "all": ents, "left": ents, "left_total": len(ents)}
+
+
+def _stored(ep, ours, stock, old="diff", st=(200, 200)):
+    return {"id": ep + ":1", "ep": ep, "cls": "real", "ours": {"st": st[0]}, "stock": {"st": st[1]},
+            "tip": {"ours": 100, "stock": 100}, "v": {"class": old},
+            "bodies": run.pack_bodies(json.dumps(ours).encode(), json.dumps(stock).encode())}
+
+
+class WPH2Rebody(unittest.TestCase):
+    """WP-H2: stored records re-run from their kept bodies through normalize_pair and pair-diff."""
+
+    GQL_CASE = {"req": {"query": "query Q { balance }", "variables": {"a": "@tip"}, "op": "Q"}}
+
+    def run_one(self, rec, case=None):
+        got = rebody.rejudge(rec, case or self.GQL_CASE, _fake_pd)
+        return None if got is None else rebody.out_line(rec, *got)
+
+    def test_balance_order_only_was_diff_now_equal(self):
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "1.5"), ("1", "coin", "2")),
+                                  _bal(("1", "coin", "2"), ("0", "coin", "1.5"))))
+        self.assertEqual((ln["old_bucket"], ln["new_bucket"]), ("diff", "equal"))
+        self.assertIn("balance", ln["shapes"])
+
+    def test_balance_text_only_is_its_own_bucket(self):
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "2")), _bal(("0", "coin", 2))))
+        self.assertEqual(ln["new"], "diff")
+        self.assertEqual(ln["new_bucket"], "balance-text")
+        self.assertEqual(ln["labels"], ["balance-text:0|coin"])
+        # a value difference beside it stays a real diff
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "2"), ("1", "coin", "3")),
+                                  _bal(("0", "coin", 2), ("1", "coin", "4"))))
+        self.assertEqual(ln["new_bucket"], "diff")
+
+    def test_missing_balance_row_names_one_side(self):
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "1")),
+                                  _bal(("0", "coin", "1"), ("2", "coin", "0"))))
+        self.assertEqual(ln["new_bucket"], "diff")
+        self.assertEqual(ln["one_side"], ["one-side:2|coin"])
+
+    def test_v1txs_reordered_is_equal(self):
+        rows = [{"requestKey": "A", "_id": 1, "x": 1}, {"requestKey": "B", "_id": 2, "x": 2}]
+        case = {"req": {"path": "/v1/txs/coin/k:x/1"}}
+        ln = self.run_one(_stored("compat.v1txs", rows, [dict(rows[1], _id=9), dict(rows[0], _id=8)]), case)
+        self.assertEqual((ln["old_bucket"], ln["new_bucket"], ln["shapes"]), ("diff", "equal", ["v1txs"]))
+
+    def test_equal_on_a_cut_page_is_incomplete(self):
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "1"), nxt=True),
+                                  _bal(("0", "coin", "1"), nxt=True)))
+        self.assertEqual(ln["new_bucket"], "incomplete")
+
+    def test_records_not_rerun(self):
+        rec = _stored("gql.lastBlockHeight", _bal(("0", "coin", "1")), _bal(("0", "coin", "1")))
+        self.assertIsNone(rebody.rejudge(dict(rec, bodies=None), self.GQL_CASE, _fake_pd))
+        self.assertIsNone(rebody.rejudge(rec, None, _fake_pd))
+        self.assertIsNone(rebody.rejudge(_stored("gql.x", {}, {}, st=(200, 504)), self.GQL_CASE, _fake_pd))
+
+    def test_tip_is_resolved_and_status_kept(self):
+        seen = []
+        rec = _stored("gql.lastBlockHeight", _bal(("0", "coin", "1")), {"errors": []}, st=(200, 500))
+        rebody.rejudge(rec, self.GQL_CASE, lambda p: seen.append(p) or _fake_pd(p))
+        self.assertEqual(seen[0]["request"], 'Q {"a": 100}')
+        self.assertEqual(seen[0]["max"], 100)
+
+    def test_summary_lists_equal_to_diff(self):
+        lines = [{"id": "x:1", "ep": "x", "old_bucket": "equal", "new_bucket": "diff", "shapes": []},
+                 {"id": "x:2", "ep": "x", "old_bucket": "diff", "new_bucket": "equal", "shapes": ["balance"]}]
+        s = rebody.summarize(lines, {})
+        self.assertEqual(s["equal_to_diff"], ["x:1"])
+        self.assertEqual(s["endpoints"]["x"]["moves"], {"equal->diff": 1, "diff->equal": 1})
+        self.assertEqual(s["shapes"]["balance"], {"diff->equal": 1})
 
 
 if __name__ == "__main__":
