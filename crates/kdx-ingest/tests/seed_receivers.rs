@@ -1776,3 +1776,251 @@ fn a_bridge_dispatch_marks_the_sender_in_the_tail_and_the_pass_and_counts_the_ca
     let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
     assert_eq!(rep.modref_capped, 41 - cap, "pass {rep:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Parallel history walk: frozen slices decoded on worker threads, applied in TxNum order.
+// ---------------------------------------------------------------------------------------------
+
+/// Pool blocks 0..24, then `blocks` blocks of `per` txs each that credit `free.par` (MINT
+/// events to overlapping names, and exec literals from three senders), all frozen but the last
+/// few; D3 done above them and `free.par` tracked with its history walk queued.
+fn par_store(blocks: u32, per: u32) -> (tempfile::TempDir, kdx_ingest::Ctx, Opts) {
+    let pool = pool();
+    let all: Vec<usize> = (0..24).collect();
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path(), 2, 1000, 2);
+    apply_linear(&c, &pool, &branch(&all, 0, 0, 0), 5);
+    for b in 0..blocks {
+        let txs = (0..per)
+            .map(|i| {
+                let lits: Vec<String> = (0..6)
+                    .map(|j| format!("\"k:x{:061x}\"", (b * 31 + i * 7 + j) % 97))
+                    .collect();
+                let code = format!("(free.par.go {})", lits.join(" "));
+                let cmd = json!({"payload": {"exec": {"code": code, "data": {}}},
+                    "meta": {"sender": format!("k:sender-{}", i % 3)}});
+                let names: Vec<Value> = (0..5)
+                    .map(|j| json!(format!("k:m-{:03}", (b * 13 + i * 5 + j) % 150)))
+                    .collect();
+                // No TRANSFER: the tail must not track the token before it is discovered.
+                let evs = json!([event("free.par", "MINT", json!(names))]);
+                d3_tx(b * 1000 + i, cmd, evs, Value::Null)
+            })
+            .collect();
+        commit_block(&c, block_of(24 + b, txs));
+    }
+    while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+    let mut o = d3_opts(false);
+    o.history_inline = false;
+    seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    let q = vec![("free.par".to_owned(), 0u8, 24u32)];
+    seed_receivers::check_discovered(&c.hot, &c.dict, &q, &[Some(true)]).unwrap();
+    clear_marks(&c);
+    // Small budgets so every kind of cap is hit along the walk.
+    o.max_event_candidates = 60;
+    o.max_exec_per_sender = 8;
+    o.max_exec_candidates = 400;
+    (d, c, o)
+}
+
+/// Every `BalanceDirty` row, and the walk's summed counters that depend on the budgets.
+type WalkOut = (Vec<(Vec<u8>, Vec<u8>)>, String);
+
+fn walk_out(c: &kdx_ingest::Ctx, reps: &[seed_receivers::ReceiversReport]) -> WalkOut {
+    let rows = c
+        .hot
+        .ro()
+        .unwrap()
+        .scan(Table::BalanceDirty, &[], |_| true)
+        .unwrap();
+    let mut dropped = std::collections::BTreeMap::<String, u64>::new();
+    let (mut ev, mut sender, mut ceil, mut frozen, mut ins, mut cand) = (0, 0, 0, 0, 0, 0);
+    for r in reps {
+        for (k, v) in &r.dropped_tokens {
+            *dropped.entry(k.clone()).or_insert(0) += v;
+        }
+        ev += r.event_candidates;
+        sender += r.dropped_exec_sender;
+        ceil += r.dropped_exec_ceiling;
+        frozen += r.frozen_txs;
+        ins += r.dirty_inserted;
+        cand += r.candidates;
+    }
+    let counters = format!(
+        "dropped_tokens={dropped:?} event_candidates={ev} dropped_exec_sender={sender} \
+         dropped_exec_ceiling={ceil} frozen_txs={frozen} dirty_inserted={ins} candidates={cand}"
+    );
+    (rows, counters)
+}
+
+fn seq_walk(c: &kdx_ingest::Ctx, o: &Opts, slice: u64) -> Vec<seed_receivers::ReceiversReport> {
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, o)
+        .unwrap()
+        .expect("a walk is pending");
+    let mut reps = Vec::new();
+    for _ in 0..100_000 {
+        let s = w.step(&c.hot, &c.dict, &c.segdir, o, slice).unwrap();
+        reps.push(s.report);
+        if s.done {
+            return reps;
+        }
+    }
+    panic!("the walk never ends");
+}
+
+fn par_walk(
+    c: &kdx_ingest::Ctx,
+    o: &Opts,
+    slice: u64,
+    threads: usize,
+) -> Vec<seed_receivers::ReceiversReport> {
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, o)
+        .unwrap()
+        .expect("a walk is pending");
+    let mut reps = Vec::new();
+    for _ in 0..100_000 {
+        let s = w
+            .step_par(&c.hot, &c.dict, &c.segdir, o, slice, threads, &|| false)
+            .unwrap();
+        reps.push(s.report);
+        if s.done {
+            return reps;
+        }
+    }
+    panic!("the walk never ends");
+}
+
+/// The parallel walk marks the same rows and spends the same budgets as the sequential one,
+/// with every cap hit (per token, per exec sender, exec ceiling).
+#[test]
+fn a_parallel_history_walk_equals_the_sequential_one_with_caps_hit() {
+    let (_d1, c1, o) = par_store(24, 6);
+    let (start, next_txnum) = frozen_txnum_at(&c1, 24);
+    assert!(
+        next_txnum - start > 100,
+        "frozen txs: {start}..{next_txnum}"
+    );
+    let seq = walk_out(&c1, &seq_walk(&c1, &o, 7));
+    assert!(
+        seq.1.contains("free.par"),
+        "the token budget is hit: {}",
+        seq.1
+    );
+    assert!(!seq.1.contains("dropped_exec_sender=0 "), "{}", seq.1);
+    assert!(!seq.1.contains("dropped_exec_ceiling=0 "), "{}", seq.1);
+    assert!(!seq.0.is_empty());
+    for threads in [2, 3, 8] {
+        let (_d2, c2, o2) = par_store(24, 6);
+        let par = walk_out(&c2, &par_walk(&c2, &o2, 7, threads));
+        assert_eq!(par.1, seq.1, "threads {threads}");
+        assert!(par.0 == seq.0, "threads {threads}: the marks differ");
+        assert!(balances::rewalk_pending(&c2.hot.ro().unwrap())
+            .unwrap()
+            .is_empty());
+    }
+}
+
+/// A walk begun by the sequential walker (an older binary) and stopped mid-way resumes in
+/// parallel from its persisted cursor, and a parallel walk stopped after one slice resumes at
+/// a slice boundary; both end with the sequential walk's marks.
+#[test]
+fn a_parallel_history_walk_resumes_from_a_mid_walk_cursor() {
+    let (_d1, c1, o) = par_store(24, 6);
+    let seq = walk_out(&c1, &seq_walk(&c1, &o, 7)).0;
+
+    let (_d2, c2, o2) = par_store(24, 6);
+    let mut w = seed_receivers::history_begin(&c2.hot, &c2.dict, &c2.segdir, &o2)
+        .unwrap()
+        .unwrap();
+    for _ in 0..3 {
+        w.step(&c2.hot, &c2.dict, &c2.segdir, &o2, 7).unwrap();
+    }
+    let at = w.position();
+    assert!(at.0 > 0 && !at.1, "{at:?}");
+    drop(w);
+    let w = seed_receivers::history_begin(&c2.hot, &c2.dict, &c2.segdir, &o2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(w.position(), at);
+    drop(w);
+    par_walk(&c2, &o2, 7, 4);
+    assert!(
+        walk_out(&c2, &[]).0 == seq,
+        "resumed from a sequential cursor"
+    );
+
+    let (_d3, c3, o3) = par_store(24, 6);
+    let mut w = seed_receivers::history_begin(&c3.hot, &c3.dict, &c3.segdir, &o3)
+        .unwrap()
+        .unwrap();
+    let start = w.position().0;
+    // Stop once the first slice is committed (the persisted cursor moved).
+    let hot = c3.hot.clone();
+    let moved = move || {
+        hot.ro()
+            .unwrap()
+            .meta(meta::D3_REWALK_WALK)
+            .unwrap()
+            .and_then(|v| serde_json::from_slice::<Value>(&v).ok())
+            .and_then(|v| v["next"].as_u64())
+            .is_some_and(|n| n > start)
+    };
+    let s = w
+        .step_par(&c3.hot, &c3.dict, &c3.segdir, &o3, 7, 4, &moved)
+        .unwrap();
+    assert!(!s.done);
+    assert_eq!(s.txs, 7, "{s:?}");
+    drop(w);
+    let w = seed_receivers::history_begin(&c3.hot, &c3.dict, &c3.segdir, &o3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(w.position(), (start + 7, false));
+    drop(w);
+    par_walk(&c3, &o3, 7, 4);
+    assert!(
+        walk_out(&c3, &[]).0 == seq,
+        "resumed from a parallel cursor"
+    );
+}
+
+/// A stop already raised: the parallel step commits nothing and moves no cursor.
+#[test]
+fn a_stopped_parallel_history_step_returns_at_once() {
+    let (_d, c, o) = par_store(24, 6);
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &o)
+        .unwrap()
+        .unwrap();
+    let at = w.position();
+    let t0 = std::time::Instant::now();
+    let s = w
+        .step_par(&c.hot, &c.dict, &c.segdir, &o, 7, 4, &|| true)
+        .unwrap();
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!((s.txs, s.done), (0, false));
+    assert_eq!(w.position(), at);
+    assert!(walk_out(&c, &[]).0.is_empty());
+}
+
+/// Threads versus throughput of the frozen history walk (run with `--ignored --nocapture`).
+#[test]
+#[ignore]
+fn bench_parallel_history_walk() {
+    let (blocks, per) = (100u32, 200u32);
+    for threads in [1usize, 2, 4, 8, 12] {
+        let (_d, c, o) = par_store(blocks, per);
+        let o = Opts {
+            max_event_candidates: seed_receivers::MAX_EVENT_CANDIDATES,
+            max_exec_per_sender: seed_receivers::MAX_EXEC_PER_SENDER,
+            max_exec_candidates: seed_receivers::MAX_EXEC_CANDIDATES,
+            ..o
+        };
+        let t0 = std::time::Instant::now();
+        let reps = par_walk(&c, &o, 2_000, threads);
+        let secs = t0.elapsed().as_secs_f64();
+        let frozen: u64 = reps.iter().map(|r| r.frozen_txs).sum();
+        println!(
+            "threads={threads} frozen_txs={frozen} secs={secs:.2} txs_per_sec={:.0}",
+            frozen as f64 / secs
+        );
+    }
+}

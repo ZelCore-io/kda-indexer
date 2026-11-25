@@ -627,6 +627,9 @@ pub struct BalancesConfig {
     /// The node blocks its cut for about 14 minutes while it answers a `keys` of a huge table
     /// (`free.crankk01.crankk01-token-table`, Nov 2026), so even a first read must not happen.
     pub keylist_skip: Vec<String>,
+    /// Worker threads that read and decode the D3 history walk's frozen slices (marks are
+    /// still applied in TxNum order, one write txn per slice). 0: the cores less 2, at least 1.
+    pub history_walk_threads: u32,
 }
 
 impl Default for BalancesConfig {
@@ -642,6 +645,7 @@ impl Default for BalancesConfig {
             recheck_hours: 24,
             key_modules: vec!["coin".to_owned()],
             keylist_skip: vec!["free.crankk01".to_owned()],
+            history_walk_threads: 0,
         }
     }
 }
@@ -670,6 +674,11 @@ impl BalancesConfig {
                 && self.recheck_hours >= 1,
             "balances.module_share, module_rows, fungible_module_rows, account_rows and \
              recheck_hours must be >= 1"
+        );
+        anyhow::ensure!(
+            self.history_walk_threads <= 256,
+            "balances.history_walk_threads must be in 0..=256 (got {})",
+            self.history_walk_threads
         );
         for m in &self.key_modules {
             anyhow::ensure!(
