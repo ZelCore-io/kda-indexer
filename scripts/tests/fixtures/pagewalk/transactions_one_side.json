@@ -1,0 +1,273 @@
+{
+ "query": "query Q($accountName: String!, $first: Int, $after: String) { transactions(accountName: $accountName, first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } edges { cursor node { hash cmd { meta { chainId } } result { ... on TransactionResult { height block { hash } } } } } } }",
+ "variables": {
+  "accountName": "k:example",
+  "first": 2
+ },
+ "ours": {
+  "cursors": [
+   null,
+   "o1",
+   "o2"
+  ],
+  "pages": [
+   {
+    "data": {
+     "transactions": {
+      "totalCount": 5,
+      "pageInfo": {
+       "hasNextPage": true,
+       "endCursor": "o1"
+      },
+      "edges": [
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1000,
+          "block": {
+           "hash": "blk0"
+          }
+         }
+        }
+       },
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk01xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1001,
+          "block": {
+           "hash": "blk1"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   },
+   {
+    "data": {
+     "transactions": {
+      "totalCount": 5,
+      "pageInfo": {
+       "hasNextPage": true,
+       "endCursor": "o2"
+      },
+      "edges": [
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk02xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1002,
+          "block": {
+           "hash": "blk2"
+          }
+         }
+        }
+       },
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk03xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1003,
+          "block": {
+           "hash": "blk3"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   },
+   {
+    "data": {
+     "transactions": {
+      "totalCount": 5,
+      "pageInfo": {
+       "hasNextPage": false,
+       "endCursor": "o3"
+      },
+      "edges": [
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk04xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1004,
+          "block": {
+           "hash": "blk4"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "stock": {
+  "cursors": [
+   null,
+   "s1",
+   "s2"
+  ],
+  "pages": [
+   {
+    "data": {
+     "transactions": {
+      "totalCount": 5,
+      "pageInfo": {
+       "hasNextPage": true,
+       "endCursor": "s1"
+      },
+      "edges": [
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk01xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1001,
+          "block": {
+           "hash": "blk1"
+          }
+         }
+        }
+       },
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1000,
+          "block": {
+           "hash": "blk0"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   },
+   {
+    "data": {
+     "transactions": {
+      "totalCount": 5,
+      "pageInfo": {
+       "hasNextPage": true,
+       "endCursor": "s2"
+      },
+      "edges": [
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk03xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1003,
+          "block": {
+           "hash": "blk3"
+          }
+         }
+        }
+       },
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk02xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1002,
+          "block": {
+           "hash": "blk2"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   },
+   {
+    "data": {
+     "transactions": {
+      "totalCount": 5,
+      "pageInfo": {
+       "hasNextPage": false,
+       "endCursor": "s3"
+      },
+      "edges": [
+       {
+        "cursor": "c",
+        "node": {
+         "hash": "rk09xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "cmd": {
+          "meta": {
+           "chainId": "0"
+          }
+         },
+         "result": {
+          "height": 1009,
+          "block": {
+           "hash": "blk9"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   }
+  ]
+ }
+}

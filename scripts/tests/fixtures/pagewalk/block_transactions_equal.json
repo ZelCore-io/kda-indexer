@@ -1,0 +1,148 @@
+{
+ "query": "query B($hash: String!, $first: Int, $after: String) { block(hash: $hash) { hash transactions(first: $first, after: $after) { totalCount pageInfo { hasNextPage endCursor } edges { cursor node { hash } } } } }",
+ "variables": {
+  "hash": "B",
+  "first": 3
+ },
+ "path": "block.transactions",
+ "ours": {
+  "cursors": [
+   null,
+   "oa"
+  ],
+  "pages": [
+   {
+    "data": {
+     "block": {
+      "hash": "B",
+      "transactions": {
+       "totalCount": 5,
+       "pageInfo": {
+        "hasNextPage": true,
+        "endCursor": "oa"
+       },
+       "edges": [
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        },
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk01xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        },
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk02xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        }
+       ]
+      }
+     }
+    }
+   },
+   {
+    "data": {
+     "block": {
+      "hash": "B",
+      "transactions": {
+       "totalCount": 5,
+       "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "ob"
+       },
+       "edges": [
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk03xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        },
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk04xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  ]
+ },
+ "stock": {
+  "cursors": [
+   null,
+   "sa"
+  ],
+  "pages": [
+   {
+    "data": {
+     "block": {
+      "hash": "B",
+      "transactions": {
+       "totalCount": 5,
+       "pageInfo": {
+        "hasNextPage": true,
+        "endCursor": "sa"
+       },
+       "edges": [
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk04xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        },
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk03xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        },
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk02xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        }
+       ]
+      }
+     }
+    }
+   },
+   {
+    "data": {
+     "block": {
+      "hash": "B",
+      "transactions": {
+       "totalCount": 5,
+       "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "sb"
+       },
+       "edges": [
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk01xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        },
+        {
+         "cursor": "c",
+         "node": {
+          "hash": "rk00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  ]
+ }
+}

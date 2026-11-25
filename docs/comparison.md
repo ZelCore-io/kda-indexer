@@ -330,6 +330,40 @@ Not accepted: entries without a node read are open and their differences are rep
 `kdatxs-gap-cont-d7bf62`, `oracle-event-order`). Open entries, our own defects and known gaps
 match nothing.
 
+### Endpoint suite rules
+
+The suite's own rules ([scripts/suite/allow.py](../scripts/suite/allow.py)) accept only:
+
+- the not-supported and not-available answers of [graphql.md](graphql.md) and its refusals of
+  malformed or lenient input;
+- multi-block lists that hold the same rows at the same heights in another order inside a block;
+- two reads at different tips: every differing row lies between the tips the node showed at the
+  two reads (`tip-timing`, `lastBlockHeight-tip-race`);
+- a failed transaction's GraphQL `badResult` where stock holds a `callStack` ours lacks, and
+  where the only other difference is an `info` that ours answers as the node's `<toplevel>:0`
+  (`failed-tx-callstack`, owner ruling of 2026-11-19; see the stock faults above);
+- the stock faults above, each with its node evidence on the record.
+
+Where stock answers an error or a sentinel instead of a value (`networkInfo` null with
+INTERNAL_SERVER_ERROR, `totalDifficulty` -1: `networkInfo-stock-error`,
+`networkInfo-totalDifficulty`), there is nothing to compare: the record is `stock-unavailable`,
+never accepted. A record an our-defect rule touches stays a diff.
+
+Before the diff, the suite aligns lists whose order carries no meaning:
+
+- `balance(...)` edges compare as a map from (chainId, module) to the exact decimal balance, so
+  only a missing, extra or different row is a difference, named by its key;
+- `/v1/txs` lists compare row by row, aligned by request key; a row only one side lists is
+  named `one-side:<requestKey>`;
+- a block's nested `transactions` list compares as a multiset keyed by request key, but only
+  when both sides list the whole block.
+
+A record is `incomplete`, never equal or accepted, when only part of a list was compared: a page
+cut, `hasNextPage` true on either side, a `totalCount` above the rows listed, or a nested list
+that stays `/~graphql-h6-unfinished`. Every per-endpoint table counts it in its own column. The
+page-walk mode of `scripts/suite/run.py` (`run.py page-walk`) walks such lists to their end on
+each side and compares the rows as sets.
+
 ## G4 real-traffic replay
 
 **Numbers as of 2026-11-25; to be refreshed after the final G4 checks.** The same results as a

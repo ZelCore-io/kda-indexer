@@ -803,17 +803,25 @@ mod tests {
                 let owner = e
                     .ruling
                     .contains("Owner 2026-11-19: accepted as stock fault");
+                // WP-H1: r58/r60 are accepted on node samples taken when the rule was made, as
+                // docs/comparison.md says, not on a per-record read.
+                let sampled = n.contains("accepted on node samples");
                 assert!(
-                    owner || (n.contains("node") && n.contains("::")),
+                    owner || sampled || (n.contains("node") && n.contains("::")),
                     "{}: no node read cited",
                     e.id
                 );
                 accepted += 1;
             }
         }
-        assert_eq!(accepted, 26);
-        for id in ["failed-tx-callstack", "failed-tx-error-info"] {
-            assert!(!al.is_open_id(id), "{id}: owner ruling 2026-11-19");
+        assert_eq!(accepted, 28);
+        for id in [
+            "failed-tx-callstack",
+            "failed-tx-error-info",
+            "graphql-r58-oracle-empty",
+            "graphql-r60-oracle-strips-quotes",
+        ] {
+            assert!(!al.is_open_id(id), "{id}: accepted by ruling");
         }
         for id in [
             "cwd-hole-tx-au4cjml8",
@@ -821,8 +829,6 @@ mod tests {
             "cwd-hole-events-7392263",
             "kdatxs-gap-cont-d7bf62",
             "oracle-event-order",
-            "graphql-r58-oracle-empty",
-            "graphql-r60-oracle-strips-quotes",
         ] {
             assert!(al.is_open_id(id), "{id} has no per-record node read");
         }
@@ -834,8 +840,9 @@ mod tests {
         assert_eq!(g.accept_class, AcceptClass::IntendedDocumented);
         let n = |pred: &dyn Fn(&Entry) -> bool| al.entries.iter().filter(|e| pred(e)).count();
         // H6: + 5 harness conventions anchored (S4, R-P5P9-171/172) + iso-same-instant (S5).
-        assert_eq!(n(&|e| e.explains()), 48, "accepted");
-        assert_eq!(n(&|e| e.is_open()), 28, "open");
+        // WP-H1: + r58/r60 accepted on node samples.
+        assert_eq!(n(&|e| e.explains()), 50, "accepted");
+        assert_eq!(n(&|e| e.is_open()), 26, "open");
         assert_eq!(n(&|e| e.status == Status::KnownGap), 2, "known gaps");
     }
 
@@ -1181,7 +1188,11 @@ mod tests {
         );
     }
 
-    fn entry(path: &str, kind: crate::report::DiffKind, a: serde_json::Value) -> Vec<crate::report::DiffEntry> {
+    fn entry(
+        path: &str,
+        kind: crate::report::DiffKind,
+        a: serde_json::Value,
+    ) -> Vec<crate::report::DiffEntry> {
         vec![crate::report::DiffEntry {
             path: path.into(),
             kind,
@@ -1197,14 +1208,25 @@ mod tests {
         use crate::report::DiffKind;
         let al = shipped();
         let r = RouteKind::Tx;
-        let cs = |kind, path: &str| al.classify(&r, &entry(path, kind, serde_json::json!([1]))).0.len();
+        let cs = |kind, path: &str| {
+            al.classify(&r, &entry(path, kind, serde_json::json!([1])))
+                .0
+                .len()
+        };
         assert_eq!(cs(DiffKind::Missing, "/result/error/callStack"), 0);
         assert_eq!(cs(DiffKind::Extra, "/result/error/callStack"), 1);
         assert_eq!(cs(DiffKind::Changed, "/result/error/callStack/0"), 1);
         let info = |a: &str| {
-            al.classify(&r, &entry("/result/error/info", DiffKind::Changed, serde_json::json!(a)))
-                .0
-                .len()
+            al.classify(
+                &r,
+                &entry(
+                    "/result/error/info",
+                    DiffKind::Changed,
+                    serde_json::json!(a),
+                ),
+            )
+            .0
+            .len()
         };
         assert_eq!(info("<toplevel>:0"), 0);
         assert_eq!(info("<interactive>:0:5"), 1);
@@ -1218,9 +1240,17 @@ mod tests {
         let al = shipped();
         let rq = "/txs/events?search=transfer&limit=50";
         let row = entry("/7", DiffKind::Missing, serde_json::json!({}));
-        assert!(al.classify_known(&RouteKind::Events, rq, &[], &row).unexplained.is_empty());
+        assert!(al
+            .classify_known(&RouteKind::Events, rq, &[], &row)
+            .unexplained
+            .is_empty());
         let field = entry("/3/params/2", DiffKind::Changed, serde_json::json!(1.5));
-        assert_eq!(al.classify_known(&RouteKind::Events, rq, &[], &field).unexplained.len(), 1);
+        assert_eq!(
+            al.classify_known(&RouteKind::Events, rq, &[], &field)
+                .unexplained
+                .len(),
+            1
+        );
     }
 
     /// H7 (SHOULD-3, R-P5P9-173): the window is ours', so it explains only rows stock lists and
@@ -1230,8 +1260,15 @@ mod tests {
         use crate::report::{DiffEntry, DiffKind};
         let al = shipped();
         let rq = "/txs/events?search=transfer&limit=50";
-        let un = |d: &[DiffEntry]| al.classify_known(&RouteKind::Events, rq, &[], d).unexplained.len();
-        assert_eq!(un(&entry("/7", DiffKind::Missing, serde_json::json!({}))), 0);
+        let un = |d: &[DiffEntry]| {
+            al.classify_known(&RouteKind::Events, rq, &[], d)
+                .unexplained
+                .len()
+        };
+        assert_eq!(
+            un(&entry("/7", DiffKind::Missing, serde_json::json!({}))),
+            0
+        );
         let extra = [DiffEntry {
             path: "/7".into(),
             kind: DiffKind::Extra,
@@ -1253,11 +1290,17 @@ mod tests {
     fn h7_iso_same_instant_hit_with_field_path_explains() {
         let al = shipped();
         let d = entry(
-            &format!("{}/data/block/creationTime", crate::diff::ISO_SAME_INSTANT_PATH),
+            &format!(
+                "{}/data/block/creationTime",
+                crate::diff::ISO_SAME_INSTANT_PATH
+            ),
             crate::report::DiffKind::Changed,
             serde_json::json!("2024-01-01T00:00:00Z"),
         );
-        assert!(al.classify_known(&RouteKind::Tx, "", &[], &d).unexplained.is_empty());
+        assert!(al
+            .classify_known(&RouteKind::Tx, "", &[], &d)
+            .unexplained
+            .is_empty());
     }
 
     /// H6 (S7): an open entry that names a hit path exactly takes it before a broad accepted
@@ -1287,7 +1330,10 @@ mod tests {
         );
         // the broad entry still explains what no specific entry names
         let d = entry("/0/x", DiffKind::Changed, serde_json::json!(1));
-        assert!(al.classify_known(&RouteKind::Search, "", &[], &d).unexplained.is_empty());
+        assert!(al
+            .classify_known(&RouteKind::Search, "", &[], &d)
+            .unexplained
+            .is_empty());
     }
 
     /// H6 (S4, S5): the harness conventions of docs/methodology.md that tolerate no value
@@ -1306,7 +1352,11 @@ mod tests {
             "iso-same-instant",
         ] {
             assert!(by(id).explains(), "{id}");
-            assert_eq!(by(id).accept_class, super::AcceptClass::HarnessConvention, "{id}");
+            assert_eq!(
+                by(id).accept_class,
+                super::AcceptClass::HarnessConvention,
+                "{id}"
+            );
         }
         for id in [
             "graphql-r57-float",
@@ -1322,6 +1372,9 @@ mod tests {
             crate::report::DiffKind::Changed,
             serde_json::json!("2024-01-01T00:00:00Z"),
         );
-        assert!(al.classify_known(&RouteKind::Tx, "", &[], &d).unexplained.is_empty());
+        assert!(al
+            .classify_known(&RouteKind::Tx, "", &[], &d)
+            .unexplained
+            .is_empty());
     }
 }

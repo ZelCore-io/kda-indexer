@@ -47,7 +47,8 @@ impl RouteKind {
             p if p.starts_with("/api/v1/accounts/") && p.contains("/balances") => {
                 RouteKind::Balances
             }
-            p if p.starts_with("/v1/txs/") => RouteKind::V1Txs,
+            // WP-H1: the query form `/v1/txs?account=` is the same route as the path form.
+            p if p == "/v1/txs" || p.starts_with("/v1/txs/") => RouteKind::V1Txs,
             _ => RouteKind::Other,
         }
     }
@@ -162,7 +163,6 @@ fn refspec_as_set(v: &mut Value) {
         _ => {}
     }
 }
-
 
 /// A number's value as f64 (numbers only; decimal objects are left alone).
 pub fn number_f64(v: &Value) -> Option<f64> {
@@ -306,6 +306,18 @@ mod refspec_tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn v1txs_query_form_is_the_v1txs_route() {
+        for p in [
+            "/v1/txs?account=k:a&namespace=coin&limit=5",
+            "/v1/txs/k:a/coin/5",
+            "/v1/txs/",
+        ] {
+            assert_eq!(RouteKind::from_path(p), RouteKind::V1Txs, "{p}");
+        }
+        assert_eq!(RouteKind::from_path("/v1/txsx"), RouteKind::Other);
+    }
 
     #[test]
     fn refspec_compares_as_set() {

@@ -670,7 +670,11 @@ mod explain_tests {
         );
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].path, "/gasPrice");
-        assert!(diff(&json!({"gasPrice": 1.0e-8}), &json!({"gasPrice": 0.00000001})).is_empty());
+        assert!(diff(
+            &json!({"gasPrice": 1.0e-8}),
+            &json!({"gasPrice": 0.00000001})
+        )
+        .is_empty());
         let t = |a: &str, b: &str| diff(&json!({"t": a}), &json!({"t": b}));
         // the shorter fraction no longer hides the longer one's digits
         let d = t("2024-01-01T00:00:00.123Z", "2024-01-01T00:00:00.123456Z");
@@ -696,9 +700,9 @@ mod explain_tests {
     fn h7_iso_same_instant_same_second_text_real_dates_field_path() {
         let t = |a: &str, b: &str| diff(&json!({"x": {"t": a}}), &json!({"x": {"t": b}}));
         for (a, b) in [
-            ("2024-02-30T00:00:00Z", "2024-03-01T00:00:00Z"),       // rolls into March
-            ("2024-01-01T23:59:60Z", "2024-01-02T00:00:00Z"),       // leap second rolls over
-            ("2023-02-29T00:00:00Z", "2023-02-29T00:00:00.0Z"),     // same text, no such day
+            ("2024-02-30T00:00:00Z", "2024-03-01T00:00:00Z"), // rolls into March
+            ("2024-01-01T23:59:60Z", "2024-01-02T00:00:00Z"), // leap second rolls over
+            ("2023-02-29T00:00:00Z", "2023-02-29T00:00:00.0Z"), // same text, no such day
             ("2024-04-31T00:00:00Z", "2024-04-31T00:00:00+00:00"),
             ("2024-01-01T23:59:60Z", "2024-01-01T23:59:60.000Z"),
         ] {
