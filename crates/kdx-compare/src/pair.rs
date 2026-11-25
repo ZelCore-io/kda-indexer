@@ -390,4 +390,66 @@ mod tests {
         assert_eq!((left.len(), left[0].path.as_str()), (1, "/2/y"));
         assert_eq!(v.entries.len(), 1);
     }
+
+    /// H3 (#38): the stored H2 transfers shapes (a stock-float amount, an h9 creationTime
+    /// fraction, a zero-padded amount with no node read) are explained by the shipped
+    /// allowlist once the request reads `graphql:<op> <vars>`; a near-miss amount is not.
+    #[test]
+    fn h3_transfers_stock_float_h9_and_zeros_are_explained() {
+        use crate::config::{FieldRule, FieldRuleKind};
+        let p =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compare/allowlist.toml");
+        let allow = Allowlist::load(&p).unwrap();
+        let rules = [
+            FieldRule::new("transfers.amount", FieldRuleKind::OracleF64Rounded),
+            FieldRule::new(
+                "transfers.creationTime",
+                FieldRuleKind::CreationTimeHalfEven,
+            ),
+        ];
+        let row = |amount: &str, t: &str| json!({"node": {"amount": amount, "creationTime": t, "requestKey": "rk", "chainId": 0}});
+        let body = |rows: Vec<Value>| json!({"data": {"transfers": {"edges": rows}}});
+        let ours = body(vec![
+            row("982.05249349845854", "2025-11-11T23:49:37.000Z"),
+            row("716188.4804229848", "2025-11-11T23:49:36.000Z"),
+        ]);
+        let stock = |first: &str| {
+            body(vec![
+                row(first, "2025-11-11T23:49:36.512Z"),
+                row("716188.480422984800", "2025-11-11T23:49:36.000Z"),
+            ])
+        };
+        let req = "graphql:Q {\"accountName\":\"k:example\"}";
+        let v = verdict(
+            pair("graphql", req, ours.clone(), stock("982.0524934984585")),
+            &allow,
+            &rules,
+            10_000,
+        );
+        assert_eq!(v.class, "allowlisted", "{:?}", v.entries);
+        for id in [
+            "graphql-stock-float",
+            "graphql-h9-creation-time-fraction",
+            "graphql-oracle-decimal-zeros-unchecked",
+        ] {
+            assert!(v.ids.iter().any(|i| i == id), "{id}: {:?}", v.ids);
+        }
+        // Near miss: stock one unit off in the last digit stays a diff.
+        let v = verdict(
+            pair("graphql", req, ours.clone(), stock("982.0524934984586")),
+            &allow,
+            &rules,
+            10_000,
+        );
+        assert_eq!(v.class, "diff");
+        // The request without the `graphql:` prefix (the suite's form before H3) matches no
+        // GraphQL-scoped entry.
+        let v = verdict(
+            pair("graphql", "Q {}", ours, stock("982.0524934984585")),
+            &allow,
+            &rules,
+            10_000,
+        );
+        assert_eq!(v.class, "diff");
+    }
 }

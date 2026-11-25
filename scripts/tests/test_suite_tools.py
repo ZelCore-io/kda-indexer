@@ -18,6 +18,7 @@ import allow  # noqa: E402
 import nodecheck as N  # noqa: E402
 import select3  # noqa: E402
 import pagewalk  # noqa: E402
+import rebody  # noqa: E402
 import base64  # noqa: E402
 import random  # noqa: E402
 
@@ -2357,6 +2358,247 @@ class WPH1Fix1PageWalkGuard(unittest.TestCase):
             ts = times[side]
             self.assertEqual(len(ts), 20)
             self.assertTrue(all(b - a >= 0.5 - 1e-9 for a, b in zip(ts, ts[1:])), (side, ts))
+
+
+def _leaf_diff(a, b, path=""):
+    """A stand-in for kda-compare pair-diff: one Changed entry per differing leaf."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = []
+        for k in sorted(set(a) | set(b)):
+            out += _leaf_diff(a.get(k), b.get(k), "%s/%s" % (path, k))
+        return out
+    if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+        return [e for i, (x, y) in enumerate(zip(a, b)) for e in _leaf_diff(x, y, "%s/%d" % (path, i))]
+    return [] if a == b else [{"path": path, "kind": "Changed"}]
+
+
+def _fake_pd(p):
+    ents = _leaf_diff(p["ours"]["body"], p["stock"]["body"])
+    if p["ours"]["status"] != p["stock"]["status"]:
+        return {"class": "status", "entries": ents, "all": ents, "left": ents, "left_total": len(ents)}
+    if not ents:
+        return {"class": "equal", "entries": [], "all": [], "left": [], "left_total": 0}
+    return {"class": "diff", "entries": ents, "all": ents, "left": ents, "left_total": len(ents)}
+
+
+def _stored(ep, ours, stock, old="diff", st=(200, 200)):
+    return {"id": ep + ":1", "ep": ep, "cls": "real", "ours": {"st": st[0]}, "stock": {"st": st[1]},
+            "tip": {"ours": 100, "stock": 100}, "v": {"class": old},
+            "bodies": run.pack_bodies(json.dumps(ours).encode(), json.dumps(stock).encode())}
+
+
+class WPH2Rebody(unittest.TestCase):
+    """WP-H2: stored records re-run from their kept bodies through normalize_pair and pair-diff."""
+
+    GQL_CASE = {"req": {"query": "query Q { balance }", "variables": {"a": "@tip"}, "op": "Q"}}
+
+    def run_one(self, rec, case=None):
+        got = rebody.rejudge(rec, case or self.GQL_CASE, _fake_pd)
+        return None if got is None else rebody.out_line(rec, *got)
+
+    def test_balance_order_only_was_diff_now_equal(self):
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "1.5"), ("1", "coin", "2")),
+                                  _bal(("1", "coin", "2"), ("0", "coin", "1.5"))))
+        self.assertEqual((ln["old_bucket"], ln["new_bucket"]), ("diff", "equal"))
+        self.assertIn("balance", ln["shapes"])
+
+    def test_balance_text_only_is_its_own_bucket(self):
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "2")), _bal(("0", "coin", 2))))
+        self.assertEqual(ln["new"], "diff")
+        self.assertEqual(ln["new_bucket"], "balance-text")
+        self.assertEqual(ln["labels"], ["balance-text:0|coin"])
+        # a value difference beside it stays a real diff
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "2"), ("1", "coin", "3")),
+                                  _bal(("0", "coin", 2), ("1", "coin", "4"))))
+        self.assertEqual(ln["new_bucket"], "diff")
+
+    def test_missing_balance_row_names_one_side(self):
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "1")),
+                                  _bal(("0", "coin", "1"), ("2", "coin", "0"))))
+        self.assertEqual(ln["new_bucket"], "diff")
+        self.assertEqual(ln["one_side"], ["one-side:2|coin"])
+
+    def test_v1txs_reordered_is_equal(self):
+        rows = [{"requestKey": "A", "_id": 1, "x": 1}, {"requestKey": "B", "_id": 2, "x": 2}]
+        case = {"req": {"path": "/v1/txs/coin/k:x/1"}}
+        ln = self.run_one(_stored("compat.v1txs", rows, [dict(rows[1], _id=9), dict(rows[0], _id=8)]), case)
+        self.assertEqual((ln["old_bucket"], ln["new_bucket"], ln["shapes"]), ("diff", "equal", ["v1txs"]))
+
+    def test_equal_on_a_cut_page_is_incomplete(self):
+        ln = self.run_one(_stored("gql.lastBlockHeight", _bal(("0", "coin", "1"), nxt=True),
+                                  _bal(("0", "coin", "1"), nxt=True)))
+        self.assertEqual(ln["new_bucket"], "incomplete")
+
+    def test_records_not_rerun(self):
+        rec = _stored("gql.lastBlockHeight", _bal(("0", "coin", "1")), _bal(("0", "coin", "1")))
+        self.assertIsNone(rebody.rejudge(dict(rec, bodies=None), self.GQL_CASE, _fake_pd))
+        self.assertIsNone(rebody.rejudge(rec, None, _fake_pd))
+        self.assertIsNone(rebody.rejudge(_stored("gql.x", {}, {}, st=(200, 504)), self.GQL_CASE, _fake_pd))
+
+    def test_tip_is_resolved_and_status_kept(self):
+        seen = []
+        rec = _stored("gql.lastBlockHeight", _bal(("0", "coin", "1")), {"errors": []}, st=(200, 500))
+        rebody.rejudge(rec, self.GQL_CASE, lambda p: seen.append(p) or _fake_pd(p))
+        self.assertEqual(seen[0]["request"], 'graphql:Q {"a": 100}')     # H3: the allowlist's form
+        self.assertEqual(seen[0]["max"], 100)
+
+    def test_summary_lists_equal_to_diff(self):
+        lines = [{"id": "x:1", "ep": "x", "old_bucket": "equal", "new_bucket": "diff", "shapes": []},
+                 {"id": "x:2", "ep": "x", "old_bucket": "diff", "new_bucket": "equal", "shapes": ["balance"]}]
+        s = rebody.summarize(lines, {})
+        self.assertEqual(s["equal_to_diff"], ["x:1"])
+        self.assertEqual(s["endpoints"]["x"]["moves"], {"equal->diff": 1, "diff->equal": 1})
+        self.assertEqual(s["shapes"]["balance"], {"diff->equal": 1})
+
+
+def _rows(n, start=0):
+    return [{"requestKey": "R%d" % i, "x": i} for i in range(start, start + n)]
+
+
+class H3Harness(unittest.TestCase):
+    """H3: the GraphQL request form, the tie cut as a partial compare, page-limit cuts of root
+    balance and /v1/txs lists, and the stock-float inputs pair-diff sees."""
+
+    def test_gql_request_reads_as_the_allowlist_expects(self):
+        self.assertEqual(run.gql_request({"op": "Q", "variables": {"a": 1}}), 'graphql:Q {"a": 1}')
+        self.assertEqual(run.gql_request({}), "graphql:op {}")
+
+    def test_page_limit(self):
+        self.assertEqual(run.page_limit("compat.v1txs", {"path": "/v1/txs/k:example/coin/50"}), 50)
+        self.assertEqual(run.page_limit("compat.v1txs", {"path": "/v1/txs/k:example/coin/10"}), 10)
+        self.assertEqual(run.page_limit("compat.v1txs", {"path": "/v1/txs/k:example/coin/0"}), 50)
+        self.assertEqual(run.page_limit("compat.v1txs", {"path": "/v1/txs/k:example/coin"}), 50)
+        self.assertEqual(run.page_limit("gql.lastBlockHeight", {"variables": {"first": 200}}), 200)
+        self.assertEqual(run.page_limit("gql.lastBlockHeight", {"variables": {"first": None, "last": 7}}), 7)
+        self.assertEqual(run.page_limit("gql.lastBlockHeight", {"variables": {"first": 0}}), 20)
+        self.assertEqual(run.page_limit("gql.lastBlockHeight", {}), 20)
+
+    def test_page_limit_reads_limit_as_the_server_does(self):
+        # Fix round 1: the query form, JavaScript Number() (hex, exponent, whole fractions), the
+        # 10,000 cap; a negative or fractional limit is a 404 (no list, no cut).
+        pl = lambda p: run.page_limit("compat.v1txs", {"path": p})  # noqa: E731
+        self.assertEqual(pl("/v1/txs?account=k:example&limit=1"), 1)
+        self.assertEqual(pl("/v1/txs/k:example/coin?limit=7"), 7)
+        self.assertEqual(pl("/v1/txs/k:example/coin/9?limit=7"), 9)     # the path segment wins
+        self.assertEqual(pl("/v1/txs/k:example/coin/0x10"), 16)
+        self.assertEqual(pl("/v1/txs/k:example/coin/2.0"), 2)
+        self.assertEqual(pl("/v1/txs/k:example/coin/1e2"), 100)
+        self.assertEqual(pl("/v1/txs/k:example/coin/20000"), 10000)
+        self.assertEqual(pl("/v1/txs/k:example/coin/Infinity"), 10000)
+        self.assertEqual(pl("/v1/txs/k:example/coin/%2010%20"), 10)
+        self.assertEqual(pl("/v1/txs/k:example/coin/abc"), 50)           # NaN: the default
+        self.assertEqual(pl("/v1/txs/k:example/coin/-0"), 50)
+        self.assertIsNone(pl("/v1/txs/k:example/coin/2.5"))
+        self.assertIsNone(pl("/v1/txs/k:example/coin/-1"))
+        self.assertEqual(pl("/v1/txs/k:example/coin/0x"), 50)             # "0x" alone: NaN
+
+    def test_v1txs_at_the_limit_is_cut_and_not_set_diffed(self):
+        a, b = _rows(50, 1), _rows(50)              # one-side rows R0 (stock) and R50 (ours)
+        a2, b2, info = run.normalize_pair("compat.v1txs", a, b, 50)
+        self.assertEqual(info["cut"], ["ours: 50 rows = page limit", "stock: 50 rows = page limit"])
+        self.assertEqual(info["one_side"], [])
+        self.assertEqual(a2, b2)                   # the 49 rows both list compare, and agree
+        # one side at the limit is enough; below it the set compare stays
+        _, _, info = run.normalize_pair("compat.v1txs", _rows(50), _rows(12), 50)
+        self.assertEqual(info["cut"], ["ours: 50 rows = page limit"])
+        _, _, info = run.normalize_pair("compat.v1txs", _rows(49), _rows(12), 50)
+        self.assertEqual(info["cut"], [])
+        self.assertEqual(len(info["one_side"]), 37)
+        # a value difference on a row both list is still compared
+        b = _rows(50)
+        b[3]["x"] = "other"
+        a2, b2, _ = run.normalize_pair("compat.v1txs", _rows(50), b, 50)
+        self.assertNotEqual(a2, b2)
+
+    def test_v1txs_one_side_cut_keeps_the_other_sides_rows(self):
+        # Fix round 1 (I-1): stock at the limit, ours short (whole): stock-only rows are real
+        # "ours lacks a row" candidates and stay one-side; ours-only rows go (stock is cut).
+        a, b = _rows(12) + [{"requestKey": "OURS", "x": 0}], _rows(50)
+        a2, b2, info = run.normalize_pair("compat.v1txs", a, b, 50)
+        self.assertEqual(info["cut"], ["stock: 50 rows = page limit"])
+        self.assertEqual(info["one_side"], sorted("one-side:R%d" % i for i in range(12, 50)))
+        self.assertNotIn("OURS", a2)
+        self.assertIn("R49", b2)
+        # the reverse: ours at the limit, stock short
+        a2, b2, info = run.normalize_pair("compat.v1txs", _rows(50), _rows(12) + [{"requestKey": "STOCK"}], 50)
+        self.assertEqual(info["cut"], ["ours: 50 rows = page limit"])
+        self.assertEqual(info["one_side"], sorted("one-side:R%d" % i for i in range(12, 50)))
+        self.assertNotIn("STOCK", b2)
+        self.assertIn("R49", a2)
+        # both cut: neither side's one-side rows stay
+        a2, b2, info = run.normalize_pair("compat.v1txs", _rows(50, 1), _rows(50), 50)
+        self.assertEqual((info["one_side"], a2 == b2), ([], True))
+
+    def test_balance_one_side_cut_and_hasnextpage_false_is_whole(self):
+        # Fix round 1 (I-1), the shape of gql.lastBlockHeight:1000102: stock at the limit
+        # (hasNextPage true), ours short and whole (hasNextPage false).
+        srows = [(str(c), "m%d" % c, "1") for c in range(200)]
+        a = _bal(("0", "m0", "1"), ("0", "ours-only", "3"), nxt=False)
+        b = _bal(*srows, nxt=True)
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", a, b, 200)
+        self.assertIn("stock:/data/balance 200 rows = page limit", info["cut"])
+        self.assertFalse(any(c.startswith("ours:") for c in info["cut"]))
+        self.assertEqual(len(info["one_side"]), 199)                   # stock-only rows stay
+        self.assertNotIn("one-side:0|ours-only", info["one_side"])
+        self.assertNotIn("0|ours-only", a2["data"]["balance"]["edges"])
+        self.assertIn("199|m199", b2["data"]["balance"]["edges"])
+        # the reverse: ours at the limit (no pageInfo proof), stock short and whole
+        a = _bal(*srows, nxt=None)
+        b = _bal(("0", "m0", "1"), ("0", "stock-only", "3"), nxt=False)
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", a, b, 200)
+        self.assertEqual(info["cut"], ["ours:/data/balance 200 rows = page limit"])
+        self.assertEqual(len(info["one_side"]), 199)                   # ours-only rows stay
+        self.assertNotIn("0|stock-only", b2["data"]["balance"]["edges"])
+        # at the limit with hasNextPage false on both sides: whole, a plain set compare
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", _bal(*srows), _bal(*srows[1:], ("0", "x", "1")), 200)
+        self.assertEqual((info["cut"], info["one_side"]), ([], ["one-side:0|m0", "one-side:0|x"]))
+        # both cut: only the rows both list compare
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", _bal(*srows, nxt=True),
+                                          _bal(*srows[1:], ("0", "x", "1"), nxt=True), 200)
+        self.assertEqual(info["one_side"], [])
+        self.assertEqual(set(a2["data"]["balance"]["edges"]), set(b2["data"]["balance"]["edges"]))
+
+    def test_balance_at_the_default_limit_is_cut(self):
+        rows = [(str(c), "coin", "1") for c in range(20)]
+        a, b = _bal(*rows, nxt=None), _bal(*rows[1:], ("0", "other", "2"), nxt=None)
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", a, b, 20)
+        self.assertEqual(info["cut"], ["ours:/data/balance 20 rows = page limit",
+                                       "stock:/data/balance 20 rows = page limit"])
+        self.assertEqual(info["one_side"], [])
+        self.assertEqual(a2, b2)
+        # 20 rows under first: 200 are a whole list (20 chains), set-diffed as before
+        _, _, info = run.normalize_pair("gql.lastBlockHeight", _bal(*rows), _bal(*rows[1:]), 200)
+        self.assertEqual((info["cut"], info["one_side"]), ([], ["one-side:0|coin"]))
+
+    def test_rebody_marks_a_limit_cut_incomplete(self):
+        case = {"req": {"path": "/v1/txs/k:example/coin/50"}}
+        rec = _stored("compat.v1txs", _rows(50, 1), _rows(50))
+        ln = rebody.out_line(rec, *rebody.rejudge(rec, case, _fake_pd))
+        self.assertEqual(ln["new_bucket"], "incomplete")
+        self.assertEqual(ln["one_side"], [])
+
+    def test_balance_stock_float_reaches_pair_diff_as_exact_texts(self):
+        # Stored H2 shape: ours the exact decimal string, stock a JSON number (JS double).
+        a, b = _bal(("0", "coin", "982.05249349845854")), _bal(("0", "coin", 982.0524934984585))
+        a, b, _ = run.normalize_pair("gql.lastBlockHeight", a, b, 200)
+        na, nb = a["data"]["balance"]["edges"]["0|coin"]["node"], b["data"]["balance"]["edges"]["0|coin"]["node"]
+        self.assertEqual((na["balanceExact"], nb["balanceExact"]), ("982.05249349845854", "982.0524934984585"))
+        self.assertNotIn("balanceText", na)        # a value difference, not a text one
+
+    def test_tie_cut_is_partial(self):
+        tie = {"path": "/~graphql-r57-height-tie-cut", "kind": "Changed"}
+        v = {"class": "allowlisted", "entries": [tie], "all": [tie], "left": [], "left_total": 0,
+             "ids": ["graphql-r57-height-ties"]}
+        self.assertEqual(run.verdict_class("gql.blocksFromDepth", "real", v, [], {}, None)[0], "incomplete")
+        # A stored record from before H3 (the Rust entry did not match; the hit is left): the
+        # suite tag now names the hit, and the record is incomplete, never accepted.
+        obj = {"path": "/~graphql-r57-json-object", "kind": "Changed"}
+        v = {"class": "diff", "entries": [tie, obj], "all": [tie, obj], "left": [tie, obj], "left_total": 2}
+        self.assertEqual(run.verdict_class("gql.blocksFromDepth", "real", v, [], {}, None)[0], "incomplete")
+        # with a real difference beside it, a diff
+        real = {"path": "/data/blocksFromDepth/edges/0/node/hash", "kind": "Changed", "a": "x", "b": "y"}
+        v = {"class": "diff", "entries": [tie, real], "all": [tie, real], "left": [tie, real], "left_total": 2}
+        self.assertEqual(run.verdict_class("gql.blocksFromDepth", "real", v, [], {}, None)[0], "diff")
 
 
 if __name__ == "__main__":

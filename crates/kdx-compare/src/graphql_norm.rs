@@ -55,8 +55,9 @@ pub const ORACLE_COUNTS_HEIGHTS_PATH: &str = "/~graphql-r75-oracle-counts-height
 /// zeros (equal as exact decimals), once the node's TRANSFER event shows ours' text
 /// (allowlist `graphql-oracle-decimal-zeros`).
 pub const DECIMAL_ZEROS_PATH: &str = "/~graphql-oracle-decimal-zeros";
-/// The same candidate before the node check. No entry matches it, so a candidate left
-/// unchecked (a caller without the node) stays unexplained.
+/// The same candidate before the node check. H3: a candidate left unchecked (a caller without
+/// the node, the endpoint suite's pair-diff) is explained on its two texts by the allowlist
+/// entry of the same name (stock-number-format); the live harness settles it on the node.
 pub const DECIMAL_ZEROS_UNCHECKED_PATH: &str = "/~graphql-oracle-decimal-zeros-unchecked";
 
 /// R-P5P9-86 X: whether `ours` and `oracle` are decimal literals (`-`, digits, `.`, digits)
@@ -95,6 +96,73 @@ pub fn decimal_zeros_candidates(d: &mut [crate::report::DiffEntry], na: &Value) 
         e.path = DECIMAL_ZEROS_UNCHECKED_PATH.into();
     }
 }
+/// H3: visible hit of a stock float (allowlist id `graphql-stock-float`), see [`stock_float`].
+pub const STOCK_FLOAT_PATH: &str = "/~graphql-stock-float";
+
+/// The text JavaScript's `String(x)` gives for the finite double `f`: the shortest digits
+/// that round-trip, in plain decimal for exponents -7 < e < 21, else `d.ddde±k`.
+pub fn js_number_text(f: f64) -> String {
+    let e = format!("{f:e}");
+    let k: i32 = e
+        .rsplit_once('e')
+        .and_then(|(_, k)| k.parse().ok())
+        .unwrap_or(0);
+    if (-7 < k) && (k < 21) {
+        format!("{f}")
+    } else {
+        e.replacen('e', if k >= 0 { "e+" } else { "e" }, 1)
+    }
+}
+
+/// Fields where ours' whole number at or above 2^53 may face stock's JS double
+/// (`Block.difficulty` is a BigInt stock serves as a double; `amount` and the Float/Decimal
+/// fields hold any decimal). Another integer field that large is exact on both sides.
+pub const STOCK_FLOAT_WHOLE_FIELDS: &[&str] = &[
+    "difficulty",
+    "amount",
+    "balanceExact",
+    "balance",
+    "totalBalance",
+    "coinsInCirculation",
+    "networkHashRate",
+    "totalDifficulty",
+    "gasPrice",
+];
+
+/// A whole number (no fractional digits other than zeros) whose size is at or above 2^53.
+fn big_whole(v: &Value) -> bool {
+    let Some((_, d, e)) = decimal_value(v) else {
+        return false;
+    };
+    let whole = e >= 0 || {
+        let k = e.unsigned_abs() as usize;
+        d.len() > k && d.bytes().skip(d.len() - k).all(|c| c == b'0')
+    };
+    whole && num_f64(v).is_some_and(|f| f.abs() >= BIG)
+}
+
+/// H3 stock-float rule (#38): stock's text is exactly the shortest round-trip text of the f64
+/// nearest ours' exact decimal value, and ours' value differs from it (ours is exact, stock
+/// went through a JavaScript double). A stock JSON number compares by its value against that
+/// text (its own text is gone once parsed). Anything else, a value one digit off, stock with
+/// more digits than the double holds, equal values in another form, is not a stock float.
+pub fn stock_float(ours: &Value, stock: &Value) -> bool {
+    let (Some(x), Some(y)) = (decimal_value(ours), decimal_value(stock)) else {
+        return false;
+    };
+    let Some(f) = num_f64(ours).filter(|f| f.is_finite()) else {
+        return false;
+    };
+    if x == y {
+        return false;
+    }
+    let js = js_number_text(f);
+    match stock {
+        Value::String(t) if !t.starts_with('#') => *t == js || *t == format!("{f}"),
+        _ => decimal_canon(&js) == Some(y),
+    }
+}
+
 /// Visible hit of `creation_time_half_even` (allowlist id `graphql-h9-creation-time-fraction`).
 pub const H9_PATH: &str = "/~graphql-h9-creation-time-fraction";
 
@@ -323,6 +391,9 @@ pub fn rule_explains(
         FieldRuleKind::OracleStripsQuotes => STRIPS_QUOTES_PATH,
         FieldRuleKind::CountLowerBound => COUNT_LOWER_BOUND_PATH,
         FieldRuleKind::CreationTimeHalfEven => H9_PATH,
+        // H3: the strict stock float has its own hit; the looser same-f64 match stays the
+        // open per-field hit.
+        FieldRuleKind::OracleF64Rounded if stock_float(a, b) => STOCK_FLOAT_PATH,
         _ => FIELD_PATH,
     })
 }
@@ -653,6 +724,20 @@ pub fn explain<'r>(
             .find_map(|r| rule_explains(r, a, b, lower_bound));
         if hit.is_some() {
             return hit;
+        }
+        // H3: a stock float on any other numeric field (ours exact, stock its JS double's
+        // text): a Float/Decimal field, the suite's exact `balanceExact`, or a JSON number of
+        // ours. `nonce` stays exact (R-P5P9-58).
+        // Fix round 1: ours' whole numbers at or above 2^53 only on the listed fields (an
+        // integer count or limit there is exact, never a JS double).
+        let key = path.rsplit('/').next().unwrap_or("");
+        let numeric = FLOAT_FIELDS.contains(&key)
+            || key == "balanceExact"
+            || matches!(a, Value::Number(_))
+            || a.as_str().is_some_and(|s| s.starts_with('#'));
+        let big_whole_ok = !big_whole(a) || STOCK_FLOAT_WHOLE_FIELDS.contains(&key);
+        if numeric && key != "nonce" && big_whole_ok && stock_float(a, b) {
+            return Some(STOCK_FLOAT_PATH);
         }
         if let (Some(x), Some(y)) = (num_f64(a), num_f64(b)) {
             let key = path.rsplit('/').next().unwrap_or("");
@@ -1060,7 +1145,11 @@ mod tests {
         let ex = explain(&[], false);
         // CG-A: difficulty above 2^53 (the oracle's JS rounding), totalBalance float sum.
         let d = ("/data/block/difficulty", json!("#1308071046363245969e0"));
-        assert_eq!(ex(d.0, &d.1, &json!("#1308071046363246e3")), Some(F2_PATH));
+        // H3: stock's value is exactly the double's shortest text: the stock-float hit.
+        assert_eq!(
+            ex(d.0, &d.1, &json!("#1308071046363246e3")),
+            Some(STOCK_FLOAT_PATH)
+        );
         assert_eq!(
             ex(
                 "/data/fungibleAccount/totalBalance",
@@ -1711,6 +1800,120 @@ mod tests {
         assert_eq!(e(other, &s("[1.0]"), &s("[1]")), None);
     }
 
+    /// H3 stock float (#38): stock's text is the shortest round-trip text of the double
+    /// nearest ours' exact value. Stored H2 example: ours `982.05249349845854`, stock
+    /// `982.0524934984585`. A near miss (one unit off in the last digit) is not.
+    #[test]
+    fn h3_stock_float_is_exact_text_of_the_double() {
+        let s = |x: &str| Value::String(x.into());
+        assert!(stock_float(
+            &s("982.05249349845854"),
+            &s("982.0524934984585")
+        ));
+        assert!(stock_float(
+            &s("123456789.123456789012"),
+            &s("123456789.12345679")
+        ));
+        // The same as a JSON number (compared by value) and as a canonical number.
+        assert!(stock_float(
+            &s("982.05249349845854"),
+            &json!(982.0524934984585)
+        ));
+        // Near misses: last digit one off either way, one digit short, stock longer than
+        // ours, equal values in another form, the sides swapped.
+        assert!(!stock_float(
+            &s("982.05249349845854"),
+            &s("982.0524934984586")
+        ));
+        assert!(!stock_float(
+            &s("982.05249349845854"),
+            &s("982.0524934984584")
+        ));
+        assert!(!stock_float(
+            &s("982.05249349845854"),
+            &s("982.052493498458")
+        ));
+        assert!(!stock_float(
+            &s("982.0524934984585"),
+            &s("982.05249349845854")
+        ));
+        assert!(!stock_float(&s("2.50"), &s("2.5")));
+        assert!(!stock_float(
+            &s("982.0524934984585"),
+            &s("982.0524934984585")
+        ));
+        assert!(!stock_float(&s("1.5x"), &s("1.5")));
+        // JavaScript's exponent form below 1e-6 and from 1e21.
+        assert_eq!(js_number_text(1e-7), "1e-7");
+        assert_eq!(js_number_text(0.000001), "0.000001");
+        assert_eq!(js_number_text(1.5e21), "1.5e+21");
+        assert_eq!(js_number_text(1e20), "100000000000000000000");
+        assert!(stock_float(&s("0.000000100000000000000001"), &s("1e-7")));
+        assert!(stock_float(
+            &s("0.000000100000000000000001"),
+            &s("0.0000001")
+        ));
+        // Through `explain`, on a field without a rule (`balance` exact text) and on
+        // `transfers.amount` (oracle_f64_rounded): the stock-float hit, not F2 or r57-field.
+        let none: [FieldRule; 0] = [];
+        let e = explain(&none, false);
+        let bp = "/data/balance/edges/0|coin/node/balanceExact";
+        assert_eq!(
+            e(bp, &s("982.05249349845854"), &s("982.0524934984585")),
+            Some(STOCK_FLOAT_PATH)
+        );
+        assert_eq!(
+            e(bp, &s("982.05249349845854"), &s("982.0524934984586")),
+            None
+        );
+        let r = [rule("transfers.amount", FieldRuleKind::OracleF64Rounded)];
+        let e = explain(&r, false);
+        let p = "/data/transfers/edges/0/node/amount";
+        assert_eq!(
+            e(p, &s("982.05249349845854"), &s("982.0524934984585")),
+            Some(STOCK_FLOAT_PATH)
+        );
+    }
+
+    /// H3 fix round 1 (minor): ours' whole numbers at or above 2^53 are a stock float only on
+    /// the fields listed in [`STOCK_FLOAT_WHOLE_FIELDS`] (`difficulty`, the Float/Decimal
+    /// fields); any other integer field (a count, a gas limit) and `nonce` are not.
+    #[test]
+    fn h3_stock_float_big_whole_numbers_only_on_listed_fields() {
+        let none: [FieldRule; 0] = [];
+        let e = explain(&none, false);
+        let (ours, stock) = (
+            json!("#1308071046363245969e0"),
+            json!("#1308071046363246e3"),
+        );
+        for p in [
+            "/data/block/difficulty",
+            "/data/x/totalDifficulty",
+            "/data/x/edges/0/node/amount",
+        ] {
+            assert_eq!(e(p, &ours, &stock), Some(STOCK_FLOAT_PATH), "{p}");
+        }
+        for p in [
+            "/data/x/gasLimit",
+            "/data/x/totalCount",
+            "/data/block/nonce",
+        ] {
+            assert_ne!(e(p, &ours, &stock), Some(STOCK_FLOAT_PATH), "{p}");
+        }
+        // The same whole value written with a zero fraction is still whole.
+        let ours2 = json!("#13080710463632459690e-1");
+        assert_ne!(
+            e("/data/x/gasLimit", &ours2, &stock),
+            Some(STOCK_FLOAT_PATH)
+        );
+        // A fractional JSON number of ours on an unlisted field still is a stock float.
+        let (f, g) = (
+            json!("#98205249349845854e-14"),
+            json!("#9820524934984585e-13"),
+        );
+        assert_eq!(e("/data/x/someFloat", &f, &g), Some(STOCK_FLOAT_PATH));
+    }
+
     /// R-P5P9-60 amendment 2: `transfers.amount`, the oracle's f64-rounded string against
     /// ours, the exact Pact decimal.
     #[test]
@@ -1719,13 +1922,19 @@ mod tests {
         let e = explain(&r, false);
         let p = "/data/transfers/edges/0/node/amount";
         let s = |x: &str| Value::String(x.into());
-        // The ruled class: same f64, ours the longer exact decimal.
+        // The ruled class: same f64, ours the longer exact decimal. H3: where stock's text is
+        // the double's shortest text, the stock-float hit; a longer same-f64 text stays the
+        // open per-field hit.
         assert_eq!(
             e(p, &s("123456789.123456789012"), &s("123456789.12345679")),
-            Some(FIELD_PATH)
+            Some(STOCK_FLOAT_PATH)
         );
         assert_eq!(
             e(p, &s("540796.439262685228"), &s("540796.4392626852")),
+            Some(STOCK_FLOAT_PATH)
+        );
+        assert_eq!(
+            e(p, &s("540796.439262685228"), &s("540796.43926268522")),
             Some(FIELD_PATH)
         );
         // Equal values in another text form (trailing zeros) are a format diff, not rounding.

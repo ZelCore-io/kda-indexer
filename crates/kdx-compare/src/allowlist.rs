@@ -64,6 +64,10 @@ pub enum AcceptClass {
     StockSelfInconsistent,
     /// Stock lags or stopped (a configured cut, late fill); no node read.
     StockStale,
+    /// Stock's text of a value ours holds exactly is a lossy or padded rendering of it (the
+    /// shortest round-trip text of the nearest f64, zero padding); checked on the two texts
+    /// alone, no node read (H3).
+    StockNumberFormat,
     /// A comparison convention of the harness, listed in docs/methodology.md.
     HarnessConvention,
     /// Our own defect, tracked as a known gap (never intended).
@@ -79,6 +83,7 @@ impl AcceptClass {
             AcceptClass::TipTiming => "tip-timing",
             AcceptClass::StockSelfInconsistent => "stock-self-inconsistent",
             AcceptClass::StockStale => "stock-stale",
+            AcceptClass::StockNumberFormat => "stock-number-format",
             AcceptClass::HarnessConvention => "harness-convention",
             AcceptClass::OurDefect => "our-defect",
         }
@@ -689,6 +694,7 @@ mod tests {
                 AcceptClass::StockSelfInconsistent,
             ),
             ("stock-stale", AcceptClass::StockStale),
+            ("stock-number-format", AcceptClass::StockNumberFormat),
             ("harness-convention", AcceptClass::HarnessConvention),
             ("our-defect", AcceptClass::OurDefect),
         ] {
@@ -790,9 +796,11 @@ mod tests {
     /// WP-H1: r58/r60 are accepted on node samples taken when the rule was made, as
     /// docs/comparison.md says, not on a per-record read. Fix round 1 (M5): the ids are listed
     /// here, so a new entry cannot accept itself by copying the note text.
-    const NODE_SAMPLED: [&str; 2] = [
+    /// H3 fix round 1 (I-2): + graphql-stock-float.
+    const NODE_SAMPLED: [&str; 3] = [
         "graphql-r58-oracle-empty",
         "graphql-r60-oracle-strips-quotes",
+        "graphql-stock-float",
     ];
 
     fn node_sampled(e: &super::Entry) -> bool {
@@ -816,6 +824,38 @@ mod tests {
             .unwrap_or("")
             .contains("accepted on node samples"));
         assert!(!node_sampled(&copy), "note text alone must not accept");
+    }
+
+    /// H3 fix round 1 (I-2): `graphql-stock-float` assumes ours is exact, so like r58/r60 it
+    /// names the node samples it is accepted on (the PR #43 review's 7 reads, node = ours) and
+    /// says the live harness is to settle it on the node.
+    #[test]
+    fn stock_float_names_its_node_samples() {
+        let al = shipped();
+        let e = al
+            .entries
+            .iter()
+            .find(|e| e.id == "graphql-stock-float")
+            .expect("stock-float shipped");
+        assert!(node_sampled(e));
+        let n = e.node_read.as_deref().unwrap_or("");
+        assert!(
+            n.starts_with("none per record: accepted on node samples"),
+            "{n}"
+        );
+        for id in [
+            "1000102",
+            "1000307",
+            "1000233",
+            "1000132",
+            "685388947356166987",
+            "29046884679448214",
+            "761416373318673587",
+        ] {
+            assert!(n.contains(id), "{id} missing: {n}");
+        }
+        assert!(n.contains("live harness"), "{n}");
+        assert!(e.reason.contains("plain float text"), "{}", e.reason);
     }
 
     /// H5 (b): a stock fault is accepted only with per-record node evidence in code. Each
@@ -868,8 +908,9 @@ mod tests {
         assert_eq!(g.accept_class, AcceptClass::IntendedDocumented);
         let n = |pred: &dyn Fn(&Entry) -> bool| al.entries.iter().filter(|e| pred(e)).count();
         // H6: + 5 harness conventions anchored (S4, R-P5P9-171/172) + iso-same-instant (S5).
-        // WP-H1: + r58/r60 accepted on node samples.
-        assert_eq!(n(&|e| e.explains()), 50, "accepted");
+        // WP-H1: + r58/r60 accepted on node samples. H3: + graphql-stock-float and
+        // graphql-oracle-decimal-zeros-unchecked (stock-number-format, no node read).
+        assert_eq!(n(&|e| e.explains()), 52, "accepted");
         assert_eq!(n(&|e| e.is_open()), 26, "open");
         assert_eq!(n(&|e| e.status == Status::KnownGap), 2, "known gaps");
     }

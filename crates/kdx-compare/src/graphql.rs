@@ -3791,7 +3791,7 @@ mod tests {
     #[test]
     fn oracle_pairs_apply_the_r57_normalisers_as_visible_hits() {
         use crate::config::{FieldRule, FieldRuleKind};
-        use crate::graphql_norm::{F2_PATH, F7_PATH, FIELD_PATH, TIE_CUT_PATH};
+        use crate::graphql_norm::{F7_PATH, FIELD_PATH, TIE_CUT_PATH};
         let ans = |body: Value| Answer {
             body,
             status: 200,
@@ -3816,9 +3816,14 @@ mod tests {
         b.body = serde_json::from_str(&rounded).unwrap();
         let d = compare_answers(&mut a, &mut b, u64::MAX, 10_000, &[]);
         let paths: Vec<&str> = d.iter().map(|e| e.path.as_str()).collect();
+        // H3: stock's difficulty is exactly the double's shortest text, so the visible hit is
+        // the stock float's (F2 keeps the looser f64 matches).
         assert_eq!(
             paths,
-            ["/data/blocksFromHeight/edges/60/node/hash", F2_PATH]
+            [
+                "/data/blocksFromHeight/edges/60/node/hash",
+                crate::graphql_norm::STOCK_FLOAT_PATH
+            ]
         );
         // F7 and a per-field rule on a transaction; F5 without its rule stays a diff.
         let tx = |nonce: &str, data: &str| json!({"data": {"transaction": {"cmd": {"nonce": nonce, "payload": {"data": data}}}}});

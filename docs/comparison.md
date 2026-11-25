@@ -330,6 +330,28 @@ Not accepted: entries without a node read are open and their differences are rep
 `kdatxs-gap-cont-d7bf62`, `oracle-event-order`). Open entries, our own defects and known gaps
 match nothing.
 
+### Stock number text
+
+Accepted on the two texts, with no node read per record (accept class `stock-number-format`). Ours keeps
+the exact Pact decimal; stock's text is a lossy or padded rendering of that same value:
+
+- stock float: stock's text is exactly the shortest text that round-trips the IEEE 754 double
+  nearest ours' exact value (what JavaScript's `String(Number(x))` gives, or the same double's
+  plain text without an exponent), and that differs from ours' value (`graphql-stock-float`;
+  any numeric field: `Transfer.amount`, the `balance(...)` balances, `Block.difficulty`). A
+  stock value one digit off that text, or with more digits than ours, is reported, and so is a
+  whole number of ours at or above 2^53 on a field other than `difficulty`, `amount` and the
+  Float/Decimal fields (an exact integer on both sides). The rule takes ours as exact, so like
+  r58/r60 it is accepted on node samples taken when it was made: 7 node reads (4 balance keys,
+  3 block difficulties as 2^256 / target of the header), node = ours in every one; they are
+  listed in the entry's `node_read`. The live harness is to settle it on the node where it has
+  one, as it does for zero padding below; it has no per-record node check for this hit yet (a
+  follow-up), so there it is accepted on the same samples. Class 11 in the catalogue below; see
+  [graphql.md](graphql.md#scalars);
+- zero padding: stock's amount is ours' text with zeros appended to the fraction, where the
+  harness has no node read for the record (`graphql-oracle-decimal-zeros-unchecked`; with a
+  node read it is `graphql-oracle-decimal-zeros` above).
+
 ### Endpoint suite rules
 
 The suite's own rules ([scripts/suite/allow.py](../scripts/suite/allow.py)) accept only:
