@@ -10,8 +10,9 @@
 //! - (d) `kaddex.alchemist.WRAP` minting `kaddex.skdx`, named only by a `fungible-v2` modref.
 
 use kdx_decode::receivers::{
-    injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_PER_EVENT,
-    MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX, MAX_MODREF_PAIRS_PER_TX,
+    d3_candidates, d3_filter, injected_miner_receivers, token_receivers, MAINNET01,
+    MAX_EVENT_PAIRS_PER_EVENT, MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX,
+    MAX_MODREF_PAIRS_PER_TX,
 };
 use serde_json::{json, Value};
 
@@ -933,4 +934,49 @@ fn only_a_code_reference_counts_for_rule_2b() {
         );
         assert!(r.exec_pairs.is_empty(), "{code}: {:?}", r.exec_pairs);
     }
+}
+
+/// Review I2: one call passing thousands of distinct names plus 64 long strings must not copy
+/// the strings once per name. The stored strings stay within calls x 64, whatever the number
+/// of names; the rows are unchanged (the tracked token still gets its sender and strings).
+#[test]
+fn many_names_in_one_call_do_not_copy_its_strings_per_name() {
+    const NAMES: usize = 5_000;
+    let mut code = format!("({KBNS}.mailbox.dispatch");
+    for i in 0..NAMES {
+        code.push_str(&format!(" a.m{i}"));
+    }
+    code.push_str(&format!(" {KBNS}.kb-USDC"));
+    let long: Vec<String> = (0..64)
+        .map(|j| format!("k:{j:03}{}", "x".repeat(251)))
+        .collect();
+    for s in &long {
+        assert_eq!(s.len(), 256);
+        code.push_str(&format!(" \"{s}\""));
+    }
+    code.push(')');
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+    let output = out(json!(1), json!([]), Value::Null);
+    let c = d3_candidates(Some(&cmd), &output, 7_432_682, MAINNET01);
+    let x = c.exec.as_ref().expect("exec candidates");
+    // The names, the token, and the head's own module.
+    assert_eq!(x.refs.len(), NAMES + 2);
+    let stored: usize = x.ref_calls.iter().map(Vec::len).sum();
+    assert!(
+        stored <= x.ref_calls.len() * 64,
+        "stored {stored} for {} calls",
+        x.ref_calls.len()
+    );
+    assert_eq!(x.ref_calls.len(), 1);
+    assert_eq!(stored, 64);
+    // Rows are as before: the sender, then 15 of the call's strings.
+    let usdc = format!("{KBNS}.kb-USDC");
+    let r = d3_filter(&c, &|m| m == usdc);
+    let got = pairs(&r.exec_pairs);
+    assert_eq!(got.len(), MAX_MODREF_PAIRS_PER_TX, "{got:?}");
+    assert_eq!(got[0], (SRC, usdc.as_str()));
+    for (k, s) in long.iter().take(MAX_MODREF_PAIRS_PER_TX - 1).enumerate() {
+        assert_eq!(got[k + 1], (s.as_str(), usdc.as_str()));
+    }
+    assert_eq!(r.modref_capped, 64 - 15);
 }

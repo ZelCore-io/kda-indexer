@@ -463,10 +463,18 @@ pub struct D3Exec {
     /// Rule 2b: every module named in the code (a dotted reference anywhere, or the module of
     /// a qualified function; see `modref_args`), same event rule as `called`, each with the
     /// direct [`account_like`] string arguments of the qualified calls of another module that
-    /// pass it (`(ns.mailbox.dispatch ns.kb-USDC 1 "<to>" 1.0)`), at most
-    /// [`MAX_MODREF_STRINGS_PER_CALL`] each. Not capped: [`d3_filter`] caps the tracked ones.
-    pub refs: Vec<(String, Vec<String>)>,
+    /// pass it (`(ns.mailbox.dispatch ns.kb-USDC 1 "<to>" 1.0)`), given as indices into
+    /// [`Self::ref_calls`], first-seen order. Not capped: [`d3_filter`] caps the tracked ones
+    /// and attaches their strings (at most [`MAX_MODREF_STRINGS_PER_CALL`] each) only then.
+    pub refs: Vec<ModRef>,
+    /// Rule 2b: the direct [`account_like`] string arguments of each qualified call of another
+    /// module that passes a name, at most [`MAX_MODREF_STRINGS_PER_CALL`] per call, stored once
+    /// per call however many names it passes (review I2), so the size stays linear in the code.
+    pub ref_calls: Vec<Vec<String>>,
 }
+
+/// A module named in code with the indices of the [`D3Exec::ref_calls`] that pass it.
+pub type ModRef = (String, Vec<u32>);
 
 /// D3 raw candidates of one tx: everything [`d3_filter`] needs, without knowing which modules
 /// are tracked. Computed once per tx at decode time for the tail (`TxIndex::d3`), and by the
@@ -586,10 +594,8 @@ pub fn d3_candidates(
                 called.push(m);
             }
         }
-        let refs: Vec<(String, Vec<String>)> = modref_args(code)
-            .into_iter()
-            .filter(|(m, _)| keep(m))
-            .collect();
+        let (refs, ref_calls) = modref_args(code);
+        let refs: Vec<ModRef> = refs.into_iter().filter(|(m, _)| keep(m)).collect();
         if coin || !called.is_empty() || !deployed.is_empty() || !refs.is_empty() {
             let cap = if coin {
                 usize::MAX
@@ -627,6 +633,7 @@ pub fn d3_candidates(
                 deploy_strings,
                 sender,
                 refs,
+                ref_calls,
             });
         }
     }
@@ -728,23 +735,41 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
         // Rule 2b (review I1): a tracked token named anywhere in the code with no event of its
         // own in the tx may have debited `meta.sender` (a bridge `transfer-remote` burn). Only
         // tracked names count toward the reference cap; each dropped reference and row is
-        // counted once. Every kept token's sender row comes before any string row.
-        let tracked: Vec<&(String, Vec<String>)> =
-            x.refs.iter().filter(|(m, _)| is_token(m)).collect();
+        // counted once. Every kept token's sender row comes before any string row. Strings are
+        // attached here, for the kept tokens only (review I2).
+        let tracked: Vec<&ModRef> = x.refs.iter().filter(|(m, _)| is_token(m)).collect();
         let kept = tracked.len().min(MAX_MODREFS_PER_TX);
         r.modref_capped = r
             .modref_capped
             .saturating_add(u32::try_from(tracked.len() - kept).unwrap_or(u32::MAX));
-        let tracked = &tracked[..kept];
+        let tracked: Vec<(&String, Vec<&String>)> = tracked[..kept]
+            .iter()
+            .map(|(m, calls)| {
+                let mut strings: Vec<&String> = Vec::new();
+                let all = calls
+                    .iter()
+                    .filter_map(|&k| x.ref_calls.get(k as usize))
+                    .flatten();
+                for s in all {
+                    if strings.len() >= MAX_MODREF_STRINGS_PER_CALL {
+                        break;
+                    }
+                    if !strings.contains(&s) {
+                        strings.push(s);
+                    }
+                }
+                (m, strings)
+            })
+            .collect();
         let mut used = 0;
         let rows = tracked
             .iter()
-            .map(|(m, _)| (&x.sender, m))
+            .map(|(m, _)| (&x.sender, *m))
             .chain(tracked.iter().flat_map(|(m, strings)| {
                 strings
                     .iter()
-                    .filter(|s| **s != x.sender)
-                    .map(move |s| (s, m))
+                    .filter(|s| ***s != x.sender)
+                    .map(move |s| (*s, *m))
             }));
         for (s, m) in rows {
             let new = account_like(s) && !r.exec_pairs.iter().any(|(a, b)| a == s && b == m);
@@ -768,10 +793,12 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
 /// applies to tracked tokens only ([`d3_filter`]), so untracked names cannot use it up. The
 /// list is bounded by the code length.
 ///
-/// Strings are attached only to a name passed as a direct argument of a call whose head is a
-/// qualified function of another module (`(ns.mailbox.dispatch ns.kb-USDC 1 "<to>" 1.0)`), at
-/// most [`MAX_MODREF_STRINGS_PER_CALL`] per name.
-fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
+/// Strings belong only to a name passed as a direct argument of a call whose head is a
+/// qualified function of another module (`(ns.mailbox.dispatch ns.kb-USDC 1 "<to>" 1.0)`).
+/// Such a call is stored once in the second list, with at most
+/// [`MAX_MODREF_STRINGS_PER_CALL`] strings, and each name it passes records the call's index
+/// (review I2: never a copy of the strings per name).
+fn modref_args(code: &str) -> (Vec<ModRef>, Vec<Vec<String>>) {
     struct Frame {
         head: Option<String>,
         items: usize,
@@ -781,9 +808,10 @@ fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
     }
     let b = code.as_bytes();
     let mut stack: Vec<Frame> = Vec::new();
-    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut out: Vec<ModRef> = Vec::new();
+    let mut calls: Vec<Vec<String>> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut name = |m: &str, out: &mut Vec<(String, Vec<String>)>| -> Option<usize> {
+    let mut name = |m: &str, out: &mut Vec<ModRef>| -> Option<usize> {
         if m.starts_with("coin.") || !readable_module(m) {
             return None;
         }
@@ -792,7 +820,7 @@ fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
             out.len() - 1
         }))
     };
-    let close = |f: Frame, out: &mut Vec<(String, Vec<String>)>| {
+    let close = |f: Frame, out: &mut Vec<ModRef>, calls: &mut Vec<Vec<String>>| {
         let Some(head) = f.head.filter(|h| h.contains('.')) else {
             return;
         };
@@ -803,19 +831,16 @@ fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
         let mut ids = f.idents;
         ids.sort_unstable();
         ids.dedup();
+        ids.retain(|&id| out[id].0 != head_module);
+        if ids.is_empty() {
+            return;
+        }
+        let Ok(k) = u32::try_from(calls.len()) else {
+            return;
+        };
+        calls.push(f.strings);
         for id in ids {
-            let (m, strings) = &mut out[id];
-            if m == head_module {
-                continue;
-            }
-            for s in &f.strings {
-                if strings.len() >= MAX_MODREF_STRINGS_PER_CALL {
-                    break;
-                }
-                if !strings.contains(s) {
-                    strings.push(s.clone());
-                }
-            }
+            out[id].1.push(k);
         }
     };
     let mut i = 0;
@@ -845,7 +870,7 @@ fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
             }
             b')' | b']' | b'}' => {
                 if let Some(f) = stack.pop() {
-                    close(f, &mut out);
+                    close(f, &mut out, &mut calls);
                 }
                 i += 1;
             }
@@ -903,7 +928,7 @@ fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
             }
         }
     }
-    out
+    (out, calls)
 }
 
 /// [`d3_filter`] of [`d3_candidates`]: the D3 rows of one tx.

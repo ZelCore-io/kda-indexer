@@ -137,7 +137,8 @@ pub struct ReceiversReport {
     /// D3: discoverable module names over `MAX_MODULE_LEN` bytes, dropped (re-review N1).
     pub discovered_too_long: u64,
     /// D3: rule 2b references and rows (a tracked token named in code) dropped at the per-tx
-    /// caps (`kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX` rows; 8 tracked references),
+    /// caps (`kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX` rows,
+    /// `kdx_decode::receivers::MAX_MODREFS_PER_TX` tracked references),
     /// each counted once; a debug log per tx and one warning per pass.
     pub modref_capped: u64,
     /// D3: pending discoveries (dropped earlier at a quota) re-queued at the start.

@@ -145,8 +145,8 @@ pub mod counters {
     /// (re-review N1: such a name can never be a Meta key).
     pub const D3_DISCOVER_TOO_LONG: &str = "d3_discover_too_long";
     /// D3 rule 2b references and rows (a tracked token named in code) the tail dropped at the
-    /// per-tx caps (`kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX` rows, 8 tracked
-    /// references), each counted once.
+    /// per-tx caps (`kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX` rows,
+    /// `kdx_decode::receivers::MAX_MODREFS_PER_TX` tracked references), each counted once.
     pub const D3_MODREF_CAPPED: &str = "d3_modref_capped";
 }
 

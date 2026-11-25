@@ -1154,11 +1154,23 @@ fn the_tail_caps_one_emitter_per_block_and_still_applies_it() {
     commit_block(&c, block_of(25, txs));
     // Each tx charges free.spam its 64 MINT names (the exec's strings go to the sender's key).
     // Below the events fork the code naming free.spam also marks (sender, free.spam) by rule
-    // 2b, once per block, charged to the sender's key: one row beyond the emitter's cap.
+    // 2b, once per block, charged to the sender's key: exactly one row beyond the emitter's
+    // cap, (SENDER, free.spam).
     let cap = kdx_hot::tail::D3_ROWS_PER_EMITTER_PER_BLOCK as usize;
-    let rows = tail_d3_rows(&c, 25);
+    let mut rows = tail_d3_rows(&c, 25);
+    let (sender, spam) = {
+        let txn = c.hot.ro().unwrap();
+        let d = kdx_hot::HotDict::load(&txn).unwrap();
+        (
+            d.find(DictKind::Account, SENDER).unwrap(),
+            d.find(DictKind::Module, "free.spam").unwrap(),
+        )
+    };
+    assert!(rows.remove(&(sender, spam)), "no (SENDER, free.spam) row");
+    // The rest are the emitter's own rows: free.spam only, within its cap.
+    assert!(rows.iter().all(|&(_, m)| m == spam));
     assert!(
-        rows.len() <= cap + 1 && rows.len() >= cap - 32,
+        rows.len() <= cap && rows.len() >= cap - 32,
         "{}",
         rows.len()
     );
