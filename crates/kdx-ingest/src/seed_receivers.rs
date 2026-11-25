@@ -136,6 +136,9 @@ pub struct ReceiversReport {
     pub discovered_namespace_dropped: u64,
     /// D3: discoverable module names over `MAX_MODULE_LEN` bytes, dropped (re-review N1).
     pub discovered_too_long: u64,
+    /// D3: rule 2b rows (a tracked token passed by module reference) dropped at the per-tx
+    /// cap `kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX` (logged as a warning per tx).
+    pub modref_capped: u64,
     /// D3: pending discoveries (dropped earlier at a quota) re-queued at the start.
     pub discovered_requeued: u64,
     /// D3: exec-derived rows dropped at a sender's budget, and at the exec ceiling.
@@ -487,6 +490,15 @@ fn add(
         Rules::D3 => {
             let is_token = |m: &str| w.tokens.contains(m);
             record_token_receivers(r, dict, w.forks, &is_token).map(|t| {
+                if t.modref_capped > 0 {
+                    rep.modref_capped += u64::from(t.modref_capped);
+                    tracing::warn!(
+                        height = k.height(),
+                        chain = k.chain(),
+                        dropped = t.modref_capped,
+                        "balances: D3 module-reference rows over the per-tx cap dropped"
+                    );
+                }
                 if w.only.is_none() {
                     rep.discovered_too_long += u64::from(t.discovered_too_long);
                     for m in t.discovered.iter().filter(|m| !w.tokens.contains(*m)) {
@@ -1200,6 +1212,7 @@ pub fn run(
             "tokens": rep.dropped_tokens, "discovered": rep.discovered_dropped,
             "discovered_namespace": rep.discovered_namespace_dropped,
             "discovered_too_long": rep.discovered_too_long,
+            "modref_capped": rep.modref_capped,
             "exec_sender": rep.dropped_exec_sender, "exec_ceiling": rep.dropped_exec_ceiling,
             "tracked_bound": rep.tracked_bound});
         txn.set_meta(

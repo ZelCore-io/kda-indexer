@@ -257,6 +257,9 @@ pub struct TokenReceivers {
     pub discovered: Vec<String>,
     /// Discoverable names over [`MAX_MODULE_LEN`] bytes, dropped (re-review N1).
     pub discovered_too_long: u32,
+    /// Rule 2b candidates dropped at [`MAX_MODREF_PAIRS_PER_TX`] (counted by the tail and the
+    /// pass, never an error).
+    pub modref_capped: u32,
 }
 
 /// Event-derived candidates one event may add for itself (security review: chain data must not
@@ -276,6 +279,15 @@ pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
 /// literals. Literals with whitespace (doc strings, messages) are skipped there; the rest are
 /// charged to the sender like any exec row.
 pub const MAX_DEPLOY_EXEC_PAIRS: usize = 512;
+/// Rule 2b rows (a tracked token passed as a bare module reference) kept per tx: the sender
+/// and the call's account-like string arguments, over every referenced token. The excess is
+/// dropped and counted ([`TokenReceivers::modref_capped`]).
+pub const MAX_MODREF_PAIRS_PER_TX: usize = 16;
+/// Bare module references kept per tx for rule 2b (each with its call's strings).
+const MAX_MODREFS_PER_TX: usize = 8;
+/// Account-like strings read from one call for rule 2b (a memory bound only: rows over
+/// [`MAX_MODREF_PAIRS_PER_TX`] are counted in [`TokenReceivers::modref_capped`]).
+const MAX_MODREF_STRINGS_PER_CALL: usize = 64;
 /// Modules one deploy tx may count as called.
 const MAX_DEPLOYED_PER_TX: usize = 4;
 /// Prefix of the budget key of exec-derived rows: `exec:<sender>` (a module name holds no `:`).
@@ -398,10 +410,19 @@ impl TokenReceivers {
     }
 }
 
-/// Cross-chain defpacts whose step 1 credits `args[1]` and step 0 debits `args[0]`:
-/// `fungible-xchain-v1`'s `transfer-crosschain`, and the bridge tokens' (`kb-*`)
-/// `transfer-create-to-crosschain` (D3 gap group 6).
-const XCHAIN_SUFFIXES: &[&str] = &[".transfer-crosschain", ".transfer-create-to-crosschain"];
+/// Cross-chain defpacts by their own name (the part after the module's last `.`, matched
+/// exactly): `(name, argument step 0 debits, argument step 1 credits)`.
+/// - `fungible-xchain-v1`'s `(transfer-crosschain sender receiver guard target-chain amount)`;
+/// - the Hyperlane bridge tokens' (`kb-*`, Kadena-ISS `syn-template.pact` /
+///   `col-template.pact`) `(transfer-create-to-crosschain receiver guard amount target-chain)`:
+///   its step 0 runs inside the mailbox's `handle` and debits nobody, its step 1 credits
+///   `args[0]` (D3 gap group 6, G4 rows #4–#7). Their other credits are covered elsewhere:
+///   `transfer`/`transfer-create` emit TRANSFER, `handle` emits `RECEIVED_TRANSFER_REMOTE`
+///   (rule 3), and `transfer-remote` burns the sender of a `mailbox.dispatch` (rule 2b).
+const XCHAIN_DEFPACTS: &[(&str, Option<usize>, Option<usize>)] = &[
+    ("transfer-crosschain", Some(0), Some(1)),
+    ("transfer-create-to-crosschain", None, Some(0)),
+];
 
 /// One event of a tx as D3 needs it (no tracked-token knowledge yet).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -436,6 +457,11 @@ pub struct D3Exec {
     pub deploy_strings: Vec<String>,
     /// `meta.sender` of the cmd (empty when absent): the budget key of the token rows.
     pub sender: String,
+    /// Rule 2b: modules passed as a bare reference argument to another module's call
+    /// (`(ns.mailbox.dispatch ns.kb-USDC 1 "<to>" 1.0)`), same event rule as `called`, each
+    /// with that call's direct [`account_like`] string arguments; at most
+    /// [`MAX_MODREFS_PER_TX`] references and [`MAX_MODREF_STRINGS_PER_CALL`] strings each.
+    pub refs: Vec<(String, Vec<String>)>,
 }
 
 /// D3 raw candidates of one tx: everything [`d3_filter`] needs, without knowing which modules
@@ -480,16 +506,24 @@ pub fn d3_candidates(
     let is_cont = cmd.is_some_and(|c| c.pointer("/payload/cont").is_some());
     if let Some(k) = output.get("continuation").filter(|k| !k.is_null()) {
         let def = k.pointer("/continuation/def").and_then(Value::as_str);
-        let xchain_module =
-            def.and_then(|d| XCHAIN_SUFFIXES.iter().find_map(|x| d.strip_suffix(x)));
-        if let Some(m) = xchain_module {
+        let xchain = def.and_then(|d| d.rsplit_once('.')).and_then(|(m, name)| {
+            XCHAIN_DEFPACTS
+                .iter()
+                .find(|x| x.0 == name)
+                .map(|&(_, debit, credit)| (m, debit, credit))
+        });
+        if let Some((m, debit, credit)) = xchain.filter(|x| !x.0.is_empty()) {
             let side = match k.get("step").and_then(Value::as_u64) {
-                Some(1) if is_cont => Some(1),
-                Some(0) if !is_cont => Some(0),
+                Some(1) if is_cont => Some(credit),
+                Some(0) if !is_cont => Some(debit),
                 _ => None,
             };
-            if let Some(a) = side.and_then(|i| k.pointer(&format!("/continuation/args/{i}"))) {
-                c.xchain = Some((m.to_owned(), a.as_str().map(str::to_owned)));
+            if let Some(arg) = side {
+                let a = arg
+                    .and_then(|i| k.pointer(&format!("/continuation/args/{i}")))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                c.xchain = Some((m.to_owned(), a));
             }
         }
     }
@@ -548,7 +582,11 @@ pub fn d3_candidates(
                 called.push(m);
             }
         }
-        if coin || !called.is_empty() || !deployed.is_empty() {
+        let refs: Vec<(String, Vec<String>)> = modref_args(code)
+            .into_iter()
+            .filter(|(m, _)| keep(m))
+            .collect();
+        if coin || !called.is_empty() || !deployed.is_empty() || !refs.is_empty() {
             let cap = if coin {
                 usize::MAX
             } else {
@@ -584,6 +622,7 @@ pub fn d3_candidates(
                 strings,
                 deploy_strings,
                 sender,
+                refs,
             });
         }
     }
@@ -674,8 +713,128 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
                 r.push_exec(s, m, &x.sender, &mut used, MAX_DEPLOY_EXEC_PAIRS);
             }
         }
+        // Rule 2b: a tracked token passed by reference (it may debit `meta.sender`, e.g. a
+        // bridge `transfer-remote` burn) and the call's account strings; own budget, counted.
+        let mut used = 0;
+        for (m, strings) in x.refs.iter().filter(|(m, _)| is_token(m)) {
+            for s in std::iter::once(&x.sender).chain(strings) {
+                let new = account_like(s) && !r.exec_pairs.iter().any(|(a, b)| a == s && b == m);
+                if new && used >= MAX_MODREF_PAIRS_PER_TX {
+                    r.modref_capped += 1;
+                } else {
+                    r.push_exec(s, m, &x.sender, &mut used, MAX_MODREF_PAIRS_PER_TX);
+                }
+            }
+        }
     }
     r
+}
+
+/// Rule 2b: every dotted identifier (`ns.mod`) in argument position of a call whose head is a
+/// qualified function of another module (`(a.b.fn ..)` / `(a.fn ..)`), with the call's direct
+/// string arguments that are [`account_like`]. Strings, `'symbols` and `;` comments are never
+/// references; nested lists are their own calls. At most [`MAX_MODREFS_PER_TX`] distinct
+/// references (first seen) and [`MAX_MODREF_STRINGS_PER_CALL`] strings per call.
+fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
+    struct Frame {
+        head: Option<String>,
+        items: usize,
+        idents: Vec<String>,
+        strings: Vec<String>,
+    }
+    let b = code.as_bytes();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let close = |f: Frame, out: &mut Vec<(String, Vec<String>)>| {
+        let Some(head) = f.head.filter(|h| h.contains('.')) else {
+            return;
+        };
+        let head_module = head.rsplit_once('.').map_or("", |(m, _)| m);
+        for id in f.idents {
+            if out.len() >= MAX_MODREFS_PER_TX {
+                return;
+            }
+            if id != head_module && !out.iter().any(|(m, _)| *m == id) {
+                out.push((id, f.strings.clone()));
+            }
+        }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b';' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                if let Some(f) = stack.last_mut() {
+                    f.items += 1;
+                }
+                // Only `(` opens a call; `[`/`{` hold data, never a head.
+                stack.push(Frame {
+                    head: if b[i] == b'(' {
+                        None
+                    } else {
+                        Some(String::new())
+                    },
+                    items: 0,
+                    idents: Vec::new(),
+                    strings: Vec::new(),
+                });
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                if let Some(f) = stack.pop() {
+                    close(f, &mut out);
+                }
+                i += 1;
+            }
+            b'"' => {
+                let mut s = Vec::new();
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        i += 1;
+                    }
+                    s.push(b[i]);
+                    i += 1;
+                }
+                i += 1;
+                if let Some(f) = stack.last_mut() {
+                    f.items += 1;
+                    let s = String::from_utf8_lossy(&s);
+                    if f.strings.len() < MAX_MODREF_STRINGS_PER_CALL
+                        && account_like(&s)
+                        && !f.strings.iter().any(|x| *x == s)
+                    {
+                        f.strings.push(s.into_owned());
+                    }
+                }
+            }
+            c if is_delim(c) => i += 1,
+            _ => {
+                let start = i;
+                while i < b.len() && !is_delim(b[i]) && !matches!(b[i], b'"' | b';') {
+                    i += 1;
+                }
+                let w = String::from_utf8_lossy(&b[start..i]);
+                if let Some(f) = stack.last_mut() {
+                    if f.items == 0 && f.head.is_none() {
+                        f.head = Some(w.into_owned());
+                    } else if !w.starts_with('\'')
+                        && w.matches('.').count() == 1
+                        && readable_module(&w)
+                        && f.idents.len() < MAX_MODREFS_PER_TX
+                    {
+                        f.idents.push(w.into_owned());
+                    }
+                    f.items += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// [`d3_filter`] of [`d3_candidates`]: the D3 rows of one tx.

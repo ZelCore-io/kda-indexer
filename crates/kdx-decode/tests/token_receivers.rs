@@ -11,7 +11,7 @@
 
 use kdx_decode::receivers::{
     injected_miner_receivers, token_receivers, MAINNET01, MAX_EVENT_PAIRS_PER_EVENT,
-    MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX,
+    MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX, MAX_MODREF_PAIRS_PER_TX,
 };
 use serde_json::{json, Value};
 
@@ -578,22 +578,24 @@ fn a_deploy_tx_counts_as_calling_its_own_module() {
     assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
 }
 
-/// D3 gap group 6: the bridge tokens (`kb-ETH`, `kb-USDC`, chain 4) move cross-chain with the
-/// defpact `<m>.transfer-create-to-crosschain`; step 1 credits `args[1]` like
-/// `transfer-crosschain`.
+/// D3 gap group 6 / G4 rows #4–#7: the Hyperlane bridge tokens (`kb-ETH`, `kb-USDC`,
+/// `kb-TONCOIN`, chain 4) finish a bridge-in on another chain with the defpact
+/// `(transfer-create-to-crosschain receiver receiver-guard amount target-chain)`
+/// (Kadena-ISS `syn-template.pact`): step 1 credits `args[0]`, not `args[1]` (the guard).
+/// Step 0 runs inside the mailbox's `process` and debits nobody.
 #[test]
 fn a_bridge_token_transfer_create_to_crosschain_finish_names_its_receiver() {
-    // Namespace hash replaced; the shape is the real `n_e595….kb-ETH`.
+    // Namespace hash replaced; the shape is the real `n_e595….kb-ETH` (G4 row #4, 5,706,420).
     const KB: &str = "n_e5950000000000000000000000000000000000ab.kb-ETH";
     let tokens = |m: &str| m == KB;
     let cmd = json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": false,
         "data": {}, "proof": "x"}}});
     let def = format!("{KB}.transfer-create-to-crosschain");
+    let guard = json!({"pred": "keys-all", "keys": ["ba55"]});
     let cont = |step: u64| {
         json!({"pactId": "p", "step": step, "stepCount": 2, "executed": null,
         "stepHasRollback": false, "yield": null,
-        "continuation": {"def": def,
-            "args": [SRC, ACC, {"pred": "keys-all", "keys": ["ba55"]}, "4", 0.5]}})
+        "continuation": {"def": def, "args": [ACC, guard, 0.001, "4"]}})
     };
     let r = token_receivers(
         Some(&cmd),
@@ -604,13 +606,215 @@ fn a_bridge_token_transfer_create_to_crosschain_finish_names_its_receiver() {
     );
     assert_eq!(pairs(&r.pairs), vec![(ACC, KB)]);
     assert_eq!(r.discovered, vec![KB.to_owned()]);
-    let start = json!({"payload": {"exec": {"data": {}, "code": format!("({def} ..)")}}});
+    // Step 0 (on the mailbox chain): no debit, only the discovery.
+    let start = json!({"payload": {"exec": {"data": {},
+        "code": "(n_e5950000000000000000000000000000000000ab.mailbox.process \"id\" {})"}}});
     let r = token_receivers(
         Some(&start),
-        &out(json!("ok"), json!([]), cont(0)),
+        &out(json!(true), json!([]), cont(0)),
         5_706_400,
         MAINNET01,
         &tokens,
     );
-    assert!(pairs(&r.pairs).contains(&(SRC, KB)), "{:?}", r.pairs);
+    assert!(pairs(&r.pairs).is_empty(), "{:?}", r.pairs);
+    assert_eq!(r.discovered, vec![KB.to_owned()]);
+}
+
+/// The match is on the defpact's own name, never a suffix: a defpact
+/// `my-transfer-crosschain` of some module is not a cross-chain transfer.
+#[test]
+fn only_the_exact_defpact_names_are_cross_chain_transfers() {
+    const M: &str = "free.foo";
+    let cmd = json!({"payload": {"cont": {"pactId": "p", "step": 1, "rollback": false,
+        "data": {}, "proof": "x"}}});
+    for name in [
+        "my-transfer-crosschain",
+        "transfer-create-to-crosschain-v2",
+        "x",
+    ] {
+        let cont = json!({"pactId": "p", "step": 1, "stepCount": 2, "executed": null,
+            "stepHasRollback": false, "yield": null,
+            "continuation": {"def": format!("{M}.{name}"), "args": [SRC, ACC, "1", 1.0]}});
+        let r = token_receivers(
+            Some(&cmd),
+            &out(json!("ok"), json!([]), cont),
+            5_706_420,
+            MAINNET01,
+            &|m| m == M,
+        );
+        assert!(r.pairs.is_empty(), "{name}: {:?}", r.pairs);
+        assert!(r.discovered.is_empty(), "{name}: {:?}", r.discovered);
+    }
+}
+
+const KBNS: &str = "n_e5950000000000000000000000000000000000ab";
+
+/// G4 row #1 (chain 2, 7,432,682): `(n_e595….mailbox.dispatch n_e595….kb-USDC 1
+/// "<remote recipient>" 97.841352)` burns the sender's kb-USDC (`transfer-remote` debits
+/// `(at "sender" (chain-data))`). The token is a bare module reference, never called, and emits
+/// no event; the sender is only `meta.sender`. Rule 2b marks (sender, kb-USDC) and the call's
+/// account-like string arguments.
+#[test]
+fn a_bridge_dispatch_marks_the_sender_of_a_token_passed_by_reference() {
+    let usdc = format!("{KBNS}.kb-USDC");
+    let mailbox = format!("{KBNS}.mailbox");
+    let recipient = "0x000000000000000000000000c0ffee00000000000000000000000000000000aa";
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": format!(
+        "({mailbox}.dispatch {usdc} 1 \"{recipient}\" 97.841352)")}},
+        "meta": {"sender": SRC, "chainId": "2"}});
+    let events = json!([
+        ev("coin", "TRANSFER", json!([SRC, "k:gas", 0.0005])),
+        ev("coin", "TRANSFER", json!([SRC, "k:igp", 0.01])),
+        ev(
+            &format!("{KBNS}.igp"),
+            "GAS_PAYMENT",
+            json!(["id", 1, 10000, 0.01])
+        ),
+        ev(&mailbox, "DISPATCH", json!([1, "router", 1, recipient])),
+        ev(&mailbox, "DISPATCH-ID", json!(["id"])),
+        ev(
+            &format!("{KBNS}.merkle-tree-hook"),
+            "INSERTED_INTO_TREE",
+            json!(["id", 7])
+        ),
+    ]);
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!("0xid"), events, Value::Null),
+        7_432_682,
+        MAINNET01,
+        &|m| m == usdc,
+    );
+    let got = pairs(&r.exec_pairs);
+    assert!(got.contains(&(SRC, usdc.as_str())), "{got:?}");
+    assert!(got.contains(&(recipient, usdc.as_str())), "{got:?}");
+    assert_eq!(r.modref_capped, 0);
+    // Untracked reference: nothing.
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!("0xid"), json!([]), Value::Null),
+        7_432_682,
+        MAINNET01,
+        &|_| false,
+    );
+    assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
+}
+
+/// Rule 2b skips a token that emitted an event in the tx (its accounts are named there), a
+/// reference in a call to the token's own module, and the call head itself.
+#[test]
+fn a_referenced_token_with_its_own_events_or_own_call_gets_no_reference_rows() {
+    let usdc = format!("{KBNS}.kb-USDC");
+    let is = |m: &str| m == usdc;
+    let code = format!("({KBNS}.mailbox.dispatch {usdc} 1 \"k:dest\" 1.0)");
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+    let events = json!([ev(&usdc, "TRANSFER", json!([SRC, "", 1.0]))]);
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(1), events, Value::Null),
+        7_432_682,
+        MAINNET01,
+        &is,
+    );
+    assert!(r.exec_pairs.is_empty(), "{:?}", r.exec_pairs);
+    let own = format!("({usdc}.transfer-remote 1 \"{SRC}\" \"0xabc\" 1.0)");
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": own}}, "meta": {"sender": SRC}});
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(1), json!([]), Value::Null),
+        7_432_682,
+        MAINNET01,
+        &is,
+    );
+    // Rule 2 (a call of the token) names the code's strings; no reference row is added.
+    assert_eq!(r.modref_capped, 0);
+    assert_eq!(
+        pairs(&r.exec_pairs),
+        vec![(SRC, usdc.as_str()), ("0xabc", usdc.as_str())]
+    );
+}
+
+/// Rule 2b is bounded: a crafted tx passing many tracked tokens by reference with many
+/// account-like strings marks at most `MAX_MODREF_PAIRS_PER_TX` rows and counts the rest.
+#[test]
+fn reference_rows_are_capped_per_tx_and_the_excess_is_counted() {
+    let toks: Vec<String> = (0..8).map(|i| format!("{KBNS}.kb-T{i}")).collect();
+    let mut code = String::new();
+    for t in &toks {
+        code.push_str(&format!("({KBNS}.mailbox.dispatch {t}"));
+        for j in 0..40 {
+            code.push_str(&format!(" \"k:{j:04}\""));
+        }
+        code.push_str(" 1.0)\n");
+    }
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+    let is = |m: &str| m.starts_with(KBNS) && m.contains("kb-T");
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(1), json!([]), Value::Null),
+        7_432_682,
+        MAINNET01,
+        &is,
+    );
+    assert_eq!(
+        r.exec_pairs.len(),
+        MAX_MODREF_PAIRS_PER_TX,
+        "{:?}",
+        r.exec_pairs.len()
+    );
+    assert!(r.modref_capped > 0);
+    // The sender of the first referenced token comes first.
+    assert_eq!(pairs(&r.exec_pairs)[0], (SRC, toks[0].as_str()));
+}
+
+/// G4 rows #2–#3 (`kb-USDT`, chain 2): the bridge-in `handle` emits
+/// `RECEIVED_TRANSFER_REMOTE [origin, recipient, amount]` and no TRANSFER. Rule 3 names the
+/// recipient once the token is tracked (the pending history walk).
+#[test]
+fn a_bridge_token_received_transfer_remote_names_its_recipient() {
+    let usdt = format!("{KBNS}.kb-USDT");
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": format!(
+        "({KBNS}.mailbox.process \"id\" {{}})")}}, "meta": {"sender": "relayer"}});
+    let events = json!([ev(&usdt, "RECEIVED_TRANSFER_REMOTE", json!([1, ACC, 2.0]))]);
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(true), events.clone(), Value::Null),
+        6_286_615,
+        MAINNET01,
+        &|m| m == usdt,
+    );
+    assert_eq!(pairs(&r.event_pairs), vec![(ACC, usdt.as_str())]);
+    // Untracked (before the token's history walk): nothing.
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(true), events, Value::Null),
+        6_286_615,
+        MAINNET01,
+        &|_| false,
+    );
+    assert!(r.event_pairs.is_empty());
+}
+
+/// Rule 2b reads code only: a token name in a string, a comment, a `'symbol` or a data list is
+/// never a reference, and neither is a call with an unqualified head.
+#[test]
+fn only_a_code_reference_in_a_qualified_call_counts_for_rule_2b() {
+    let usdc = format!("{KBNS}.kb-USDC");
+    for code in [
+        format!("({KBNS}.mailbox.dispatch \"{usdc}\" 1 \"k:dest\" 1.0)"),
+        format!("; ({KBNS}.mailbox.dispatch {usdc} 1 \"k:dest\" 1.0)\n(+ 1 2)"),
+        format!("({KBNS}.mailbox.dispatch '{usdc} 1 \"k:dest\" 1.0)"),
+        format!("({KBNS}.mailbox.dispatch [{usdc}] 1 \"k:dest\" 1.0)"),
+        format!("(dispatch {usdc} 1 \"k:dest\" 1.0)"),
+    ] {
+        let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+        let r = token_receivers(
+            Some(&cmd),
+            &out(json!(1), json!([]), Value::Null),
+            7_432_682,
+            MAINNET01,
+            &|m| m == usdc,
+        );
+        assert!(r.exec_pairs.is_empty(), "{code}: {:?}", r.exec_pairs);
+    }
 }

@@ -135,6 +135,10 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
             balances::counters::D3_DISCOVER_TOO_LONG.to_owned(),
             d3.too_long as i64,
         ),
+        (
+            balances::counters::D3_MODREF_CAPPED.to_owned(),
+            d3.modref_capped as i64,
+        ),
     ] {
         if delta != 0 {
             txn.add_counter(&name, delta)?;
@@ -176,6 +180,8 @@ struct D3Block {
     /// Discoverable names over `MAX_MODULE_LEN` (re-review N1; a pure function of the txs, so
     /// the counter's undo op stays replay-identical).
     too_long: u64,
+    /// Rule 2b rows dropped at the per-tx cap (a pure function of the txs, like `too_long`).
+    modref_capped: u64,
     /// account u32 ‖ module u32 ‖ TxKey of each row marked (for the undo).
     marked: Vec<u8>,
 }
@@ -233,6 +239,7 @@ fn mark_d3(
         }
     }
     st.too_long += u64::from(r.discovered_too_long);
+    st.modref_capped += u64::from(r.modref_capped);
     for m in &r.discovered {
         if st.discovered >= D3_DISCOVER_PER_BLOCK {
             break;
