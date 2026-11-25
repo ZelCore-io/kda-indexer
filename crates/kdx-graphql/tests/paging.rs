@@ -1894,6 +1894,17 @@ mod audit_pr3 {
         };
         let all = run(&fx.schema, &q("")).await;
         assert_eq!(edges(&all, "balance").len(), 2, "{all}");
+        // The stored text `1.0` is served in stock's layout (`balance_text`): `"1"`.
+        let texts = run(
+            &fx.schema,
+            &format!(
+                "{{ balance(accountName: \"{ALICE}\") {{ edges {{ node {{ balance }} }} }} }}"
+            ),
+        )
+        .await;
+        for e in edges(&texts, "balance") {
+            assert_eq!(e["node"]["balance"], "1", "{texts}");
+        }
         assert_eq!(run(&fx.schema, &q(", chainIds: []")).await, all);
         let many = format!(", chainIds: [{}]", vec!["\"0\""; 101].join(", "));
         let r = fx.schema.execute(q(&many)).await;
