@@ -4347,14 +4347,18 @@ mod tests {
     #[test]
     fn h6_numbers_exact_never_through_f64() {
         let p = |t: &str| -> Value { serde_json::from_str(t).unwrap() };
-        let mut a = p(r#"{"chain": 2.0, "amount": 0.123456789012345678901, "x": 1.50, "e": 1e-7, "n": -3e2}"#);
+        let mut a = p(
+            r#"{"chain": 2.0, "amount": 0.123456789012345678901, "x": 1.50, "e": 1e-7, "n": -3e2}"#,
+        );
         numbers_exact(&mut a);
         assert_eq!(a["chain"].as_u64(), Some(2));
         assert_eq!(a["amount"].to_string(), "0.123456789012345678901");
         assert_eq!(a["x"].to_string(), "1.5");
         assert_eq!(a["e"].to_string(), "0.0000001");
         assert_eq!(a["n"].to_string(), "-300");
-        let mut b = p(r#"{"chain": 2, "amount": 0.12345678901234568, "x": 1.5, "e": 0.0000001, "n": -300}"#);
+        let mut b = p(
+            r#"{"chain": 2, "amount": 0.12345678901234568, "x": 1.5, "e": 0.0000001, "n": -300}"#,
+        );
         numbers_exact(&mut b);
         let d = crate::diff::diff(&a, &b);
         assert_eq!(d.len(), 1, "{d:?}");

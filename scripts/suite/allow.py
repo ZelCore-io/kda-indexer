@@ -93,6 +93,10 @@ META = {
                           "H4: same rows on both pages at the same heights)"),
     "totalcount-stock-orphans": ("stock-wrong-node-evidence", _T2 % "orphan-count rule (H2 item 3; H4: every stock-only "
                                  "row is a fork header the node holds, exactly the gap)"),
+    "failed-tx-callstack": ("stock-wrong-node-evidence",
+                            "Owner ruling 2026-11-19 (R-P5P9-170): accepted as a stock fault, the node's stored "
+                            "/poll output is the reference; same id as compare/allowlist.toml failed-tx-callstack. "
+                            "WP-H1: the GraphQL badResult form, no longer filed under graphql-r57-json-object."),
     "tip-timing": ("tip-timing", _T2 % "tip-staleness timing (H2 item 5; H4: every differing row lies between the two "
                    "observed tips)"),
 }
@@ -115,6 +119,7 @@ DOC = {
     "networkInfo-coins-stale": _DIFF % "stock-faults-the-node-disproves",
     "completedBlockHeights-stock-error": _DIFF % "stock-faults-the-node-disproves",
     "totalcount-stock-orphans": _DIFF % "stock-faults-the-node-disproves",
+    "failed-tx-callstack": _DIFF % "endpoint-suite-rules",
     "known-gap-missing-chain-rows": None,          # our defect: a known gap, never accepted
 }
 
@@ -288,6 +293,41 @@ def _tag(tag):
 
 def _gap_tag(ctx):
     return {i for i, e in enumerate(ctx["entries"]) if e["path"] == "/~known-gap-missing-chain-rows"}
+
+
+NODE_INFO = "<toplevel>:0"      # the node's stored `info` of a failed tx
+
+
+def _json_obj(x):
+    if not isinstance(x, str) or not x.lstrip().startswith("{"):
+        return None
+    try:
+        v = json.loads(x, parse_float=decimal.Decimal)
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def _failed_tx_callstack(ctx):
+    """WP-H1: a failed tx's GraphQL `badResult` (a JSON text) where stock holds a `callStack` ours
+    lacks; an `info` difference is part of it only where ours answers the node form exactly. Every
+    other key must be equal. Ours holding a callStack, or any other difference, stays a diff."""
+    out = set()
+    for i, e in enumerate(ctx["entries"]):
+        if not e["path"].endswith("/badResult") or e.get("kind") != "Changed":
+            continue
+        a, b = _json_obj(e.get("a")), _json_obj(e.get("b"))
+        if a is None or b is None or "callStack" in a or "callStack" not in b:
+            continue
+        b = {k: x for k, x in b.items() if k != "callStack"}
+        if a.get("info") != b.get("info"):
+            if a.get("info") != NODE_INFO or "info" not in b:
+                continue
+            a = {k: x for k, x in a.items() if k != "info"}
+            b = {k: x for k, x in b.items() if k != "info"}
+        if a == b:
+            out.add(i)
+    return out
 
 
 def _tip_race(ctx):
@@ -569,6 +609,12 @@ RULES = [
          "only where the node confirms that at least as many of the extra rows are in non-canonical blocks "
          "as the gap; otherwise a diff [H2 item 3].",
          None, _totalcount_stock_orphans, node=True),
+    Rule("failed-tx-callstack", "STOCK-WRONG",
+         "A failed tx's badResult: stock keeps the Pact error as produced at execution time (a callStack, a "
+         "source position in info); the node serves the stored output, which ours answers. Only a callStack "
+         "stock has and ours lacks, and an info where ours answers the node's <toplevel>:0, are accepted "
+         "[owner ruling 2026-11-19; G4 audit 2.3].",
+         None, _failed_tx_callstack),
     Rule("tip-timing", "HARNESS",
          "The node tip moved by 1 to TIP_WINDOW heights between ours' read and stock's read, on a list that "
          "follows the tip; both heights are recorded in the row [H2 item 5].",

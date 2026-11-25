@@ -60,6 +60,7 @@ kda-compare binary and config.
 import argparse
 import base64
 import collections
+import decimal
 import concurrent.futures as cf
 import gzip
 import http.client
@@ -80,6 +81,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import allow  # noqa: E402
 import endpoints as E  # noqa: E402
 import nodecheck  # noqa: E402
+import pagewalk  # noqa: E402
 
 CRASH_STATUS = {502, 503}
 # Load signals for the throttle: no answer, or a gateway/overload status. A fast 500 with a
@@ -409,6 +411,11 @@ def judge(win, err_limit, p99_limit):
     return er > err_limit or (p99_limit > 0 and p99 > p99_limit), er, p99
 
 
+# Fix round 1 (I1): the 504 guard's defaults; it is on unless a host sets guard_504_max = 0.
+G504_DEFAULTS = {"guard_504_max": 5, "guard_504_window_s": 60, "guard_504_action": "backoff",
+                 "guard_504_backoff_s": 300, "guard_504_max_trips": 3}
+
+
 class StockHost:
     """One stock backend with an adaptive throttle per class.
 
@@ -451,6 +458,23 @@ class StockHost:
         self.ramp_step = c.get("ramp_step", 5)
         self.max_height = c.get("max_height") or None
         self.timeout = c.get("timeout_s")
+        # WP-H1 504 guard (replaces the manual watcher), on by default: `guard_504_max` 504s within
+        # `guard_504_window_s` either stop the run ("stop") or pause this host for
+        # `guard_504_backoff_s` ("backoff"); the `guard_504_max_trips`-th trip stops the run.
+        # An explicit guard_504_max = 0 turns it off.
+        self.g504_max = int(c.get("guard_504_max", G504_DEFAULTS["guard_504_max"]))
+        self.g504_window = float(c.get("guard_504_window_s", G504_DEFAULTS["guard_504_window_s"]))
+        self.g504_action = c.get("guard_504_action", G504_DEFAULTS["guard_504_action"])
+        self.g504_backoff = float(c.get("guard_504_backoff_s", G504_DEFAULTS["guard_504_backoff_s"]))
+        self.g504_max_trips = int(c.get("guard_504_max_trips", G504_DEFAULTS["guard_504_max_trips"]))
+        if self.g504_action not in ("stop", "backoff"):
+            raise ValueError("%s: guard_504_action must be stop or backoff" % name)
+        self.g504 = collections.deque()
+        self.g504_trips = 0
+        # Re-review I6: 504s that land while this host is backing off are answers to requests
+        # sent before the trip; they are not counted, so one burst is one trip.
+        self.g504_until = float("-inf")
+        self.on_stop = None             # set by the Runner: ends the run with a message
         if start:
             threading.Thread(target=self.judge_loop, daemon=True).start()
 
@@ -485,6 +509,42 @@ class StockHost:
             self.win[cls].append((t, load_error(status), ms))
             if status in CRASH_STATUS:
                 self.crashed[cls] = True
+        self.guard_504(t, status)
+
+    def guard_504(self, t, status):
+        """WP-H1: counts stock 504s in a sliding window; returns the action taken ("stop",
+        "backoff") or None."""
+        if not self.g504_max:
+            return None
+        with self.lock:
+            while self.g504 and self.g504[0] < t - self.g504_window:
+                self.g504.popleft()
+            if status != 504 or t < self.g504_until:
+                return None
+            self.g504.append(t)
+            if len(self.g504) < self.g504_max:
+                return None
+            n = len(self.g504)
+            self.g504.clear()
+            self.g504_trips += 1
+            stop = self.g504_action == "stop" or self.g504_trips >= self.g504_max_trips
+            if not stop:
+                self.g504_until = t + self.g504_backoff
+        msg = "%s: %d stock 504s within %ds (guard_504_max %d)" % (self.name, n, self.g504_window, self.g504_max)
+        if stop:
+            self.note("504-guard-stop", n=n)
+            if self.on_stop:
+                self.on_stop(msg)
+            return "stop"
+        self.note("504-guard-backoff", n=n, trip=self.g504_trips, pause_s=self.g504_backoff)
+        self.healthy.clear()
+
+        def resume():
+            time.sleep(self.g504_backoff)
+            self.note("504-guard-resume")
+            self.healthy.set()
+        threading.Thread(target=resume, daemon=True).start()
+        return "backoff"
 
     def call(self, cid, req, heavy):
         cls = "heavy" if heavy else "light"
@@ -575,15 +635,167 @@ NODE_EPS = {"gql.blocksFromHeight", "gql.blocksFromDepth", "gql.completedBlockHe
             "compat.account", "compat.txs", "compat.events"}
 
 
+def _data(b):
+    return b.get("data") if isinstance(b, dict) and isinstance(b.get("data"), dict) else None
+
+
+def _exact(x):
+    """The exact decimal text of a balance (a JSON number or a decimal string); else the value."""
+    if isinstance(x, bool) or x is None:
+        return x
+    try:
+        d = decimal.Decimal(str(x))
+    except (decimal.InvalidOperation, ValueError):
+        return x
+    if not d.is_finite():
+        return x
+    t = format(d.normalize(), "f")
+    return "0" if t in ("-0", "0") else t
+
+
+def _keyed(rows, key):
+    """{key: row} of a list; a repeated key gets `#2`, `#3`... so no row is lost."""
+    out, seen = {}, collections.Counter()
+    for r in rows:
+        k = key(r)
+        seen[k] += 1
+        out[k if seen[k] == 1 else "%s#%d" % (k, seen[k])] = r
+    return out
+
+
+def _balance_map(b):
+    """WP-H1: `balance(...)` edges as {"chainId|module": node}, the balance as exact decimal text in
+    `balanceExact`."""
+    conn = (_data(b) or {}).get("balance")
+    if not isinstance(conn, dict) or not isinstance(conn.get("edges"), list):
+        return None
+    if not all(isinstance(e, dict) and isinstance(e.get("node"), dict) for e in conn["edges"]):
+        return None
+    for e in conn["edges"]:
+        # Renamed so the f64 tolerance pair-diff gives a `balance` leaf (r57-float) cannot apply.
+        if "balance" in e["node"]:
+            raw = e["node"].pop("balance")
+            e["node"]["balanceExact"] = _exact(raw)
+            e["_raw"] = raw
+    conn["edges"] = _keyed(conn["edges"], lambda e: "%s|%s" % (e["node"].get("chainId"), e["node"].get("module")))
+    return set(conn["edges"])
+
+
+def _balance_text(ab, sb):
+    """Fix round 1 (M1): where both sides give the same exact balance in other text ("1.10" and
+    "1.1", a number and a string), both keep the raw value in `balanceText`, so the record shows
+    the difference a client sees; returns its `balance-text:<chainId|module>` labels (unaccepted)."""
+    ea = ab["data"]["balance"]["edges"] if ab is not None else {}
+    eb = sb["data"]["balance"]["edges"] if sb is not None else {}
+    labels = []
+    for k in sorted(set(ea) & set(eb)):
+        xa, xb = ea[k], eb[k]
+        if "_raw" in xa and "_raw" in xb and xa["node"].get("balanceExact") == xb["node"].get("balanceExact") \
+                and json.dumps(xa["_raw"]) != json.dumps(xb["_raw"]):
+            xa["node"]["balanceText"], xb["node"]["balanceText"] = xa["_raw"], xb["_raw"]
+            labels.append("balance-text:%s" % k)
+    for e in list(ea.values()) + list(eb.values()):
+        e.pop("_raw", None)
+    return labels
+
+
+def _v1txs_map(b):
+    """WP-H1: a `/v1/txs` list as {requestKey: row} (the service's cache `_id` dropped)."""
+    if not isinstance(b, list) or not all(isinstance(r, dict) for r in b):
+        return None
+    for r in b:
+        r.pop("_id", None)
+    return _keyed(b, lambda r: str(r.get("requestKey")))
+
+
+def _connections(v, path=""):
+    """(path, connection) for every GraphQL connection (a dict with an `edges` list) in a body."""
+    if isinstance(v, dict):
+        if isinstance(v.get("edges"), list):
+            yield path, v
+        for k, x in v.items():
+            yield from _connections(x, path + "/" + str(k))
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            yield from _connections(x, "%s/%d" % (path, i))
+
+
+def page_cut(body, side):
+    """WP-H1: where only part of a list was answered: a connection with `hasNextPage` true, or a
+    `totalCount` above the rows it lists. Each item names the side and the connection's path."""
+    out = []
+    for path, c in _connections(body):
+        pi = c.get("pageInfo") if isinstance(c.get("pageInfo"), dict) else {}
+        tc = c.get("totalCount")
+        if pi.get("hasNextPage") is True:
+            out.append("%s:%s hasNextPage" % (side, path))
+        elif isinstance(tc, int) and not isinstance(tc, bool) and tc > len(c["edges"]):
+            out.append("%s:%s totalCount %d > %d rows" % (side, path, tc, len(c["edges"])))
+    return out
+
+
+def _tx_key(e):
+    n = e.get("node") if isinstance(e, dict) else None
+    rk = n.get("hash", n.get("requestKey")) if isinstance(n, dict) else None
+    return (str(rk), json.dumps(e, sort_keys=True))
+
+
+def _proven_whole(c):
+    """A connection that shows it lists every row: `hasNextPage` false, or a `totalCount` equal to
+    its rows."""
+    pi = c.get("pageInfo") if isinstance(c.get("pageInfo"), dict) else {}
+    tc = c.get("totalCount")
+    return pi.get("hasNextPage") is False or \
+        (isinstance(tc, int) and not isinstance(tc, bool) and tc == len(c["edges"]))
+
+
+def _nested_block_txs(b):
+    """The nested `transactions` connections of the blocks in a GraphQL answer (not a root list)."""
+    return [(p, c) for p, c in _connections(b) if p.endswith("/transactions") and p != "/data/transactions"]
+
+
 def normalize_pair(ep, ab, sb):
-    """Harness-side normalisation before the diff: fungibleChainAccounts compares as a set
-    (ours lists chains ascending, stock's order is unspecified; triage 5)."""
+    """Harness-side alignment before the diff; returns (ours, stock, info). info["cut"] names every
+    list answered in part (the record is then `incomplete` at best); info["one_side"] names rows only
+    one side lists (`one-side:<key>`), for the node check.
+    - fungibleChainAccounts compares as a set (ours lists chains ascending, stock's order is
+      unspecified; triage 5);
+    - `balance(...)` edges compare as a map (chainId, module) -> exact decimal (WP-H1);
+    - `/v1/txs` lists compare row by row, aligned by request key (WP-H1);
+    - a block's nested `transactions` compares as a multiset by request key when both sides list
+      the whole block; a cut one is left as it is and the record is incomplete (WP-H1)."""
+    info = {"cut": [], "one_side": [], "labels": []}
     if ep == "gql.fungibleChainAccounts":
         for b in (ab, sb):
-            xs = ((b or {}).get("data") or {}).get("fungibleChainAccounts") if isinstance(b, dict) else None
+            xs = (_data(b) or {}).get("fungibleChainAccounts")
             if isinstance(xs, list):
                 xs.sort(key=lambda x: str((x or {}).get("chainId", "")).zfill(3) if isinstance(x, dict) else "")
-    return ab, sb
+    info["cut"] = page_cut(ab, "ours") + page_cut(sb, "stock")
+    one = None
+    if ep == "compat.v1txs":
+        ka, kb = _v1txs_map(ab), _v1txs_map(sb)
+        if ka is not None and kb is not None:
+            ab, sb, one = ka, kb, (set(ka), set(kb))
+    elif isinstance(_data(ab), dict) and isinstance(_data(sb), dict) and \
+            "balance" in _data(ab) and "balance" in _data(sb):
+        ka, kb = _balance_map(ab), _balance_map(sb)
+        if ka is not None and kb is not None:
+            one = (ka, kb)
+        info["labels"] = _balance_text(ab if ka is not None else None, sb if kb is not None else None)
+    if one:
+        info["one_side"] = ["one-side:%s" % k for k in sorted(one[0] ^ one[1])]
+    # Fix round 1 (I3): a nested list compares as a multiset only when both sides prove it whole;
+    # one that may be a first page (no hasNextPage false, no totalCount equal to its rows) is cut.
+    na, nb = dict(_nested_block_txs(ab)), dict(_nested_block_txs(sb))
+    for side, n in (("ours", na), ("stock", nb)):
+        for path in sorted(n):
+            if not _proven_whole(n[path]) and not any(c.startswith("%s:%s " % (side, path)) for c in info["cut"]):
+                info["cut"].append("%s:%s unproven" % (side, path))
+    for path in set(na) & set(nb):
+        if _proven_whole(na[path]) and _proven_whole(nb[path]):
+            na[path]["edges"].sort(key=_tx_key)
+            nb[path]["edges"].sort(key=_tx_key)
+    return ab, sb, info
 
 
 def tip_fields(node, idx, host, t0, t1):
@@ -609,6 +821,14 @@ def tip_fields(node, idx, host, t0, t1):
 # a capped count, a size limit): such a record is `incomplete`, never equal or accepted.
 PARTIAL_HITS = {"/~graphql-page-cut", "/~graphql-totalcount-cap", "/~harness-limit/graphql-merged-bytes",
                 "/~graphql-short-page"}
+# WP-H1: a nested list pair-diff could not finish (graphql_scope UNFINISHED_PATH, with a `#why`
+# suffix). Never known or accepted: alone it makes the record `incomplete`, never `diff`-free.
+UNFINISHED_HIT = "/~graphql-h6-unfinished"
+
+
+def _unfinished(e):
+    p = e.get("path") or ""
+    return p == UNFINISHED_HIT or p.startswith(UNFINISHED_HIT + "#")
 
 
 def rule_entries(v):
@@ -634,6 +854,9 @@ def stored_verdict(v, k, ids):
     (H5 c: no cap), so a later re-referee sees every difference."""
     out = {"class": k, "ids": (v.get("ids") or []) + ids, "known": v.get("known_ids"), "open": v.get("open_ids") or [],
            "entries": (v.get("entries") or [])[:allow.MAX_SHOWN]}
+    for k2 in ("cut", "one_side", "labels"):    # WP-H1: why incomplete; rows one side lists; text labels
+        if v.get(k2):
+            out[k2] = v[k2]
     for k in ("total", "left_total"):
         if isinstance(v.get(k), int):
             out[k] = v[k]
@@ -782,19 +1005,32 @@ def stall_class(ep, cls, c, ents, done, ours_codes, vars_, node, tip, query, idx
     return ("status" if c == "status" else "diff"), []
 
 
-def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx=None):
+def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx=None, cut=None):
     """Class and allowlist ids after the suite allowlist (allow.py). `tip`: the node's highest
     height at ours' read and at stock's ({"ours", "stock"}), for the tip-timing rule; `idx`: ours'
-    and stock's own lastBlockHeight; `query`: the case's GraphQL document."""
+    and stock's own lastBlockHeight; `query`: the case's GraphQL document; `cut`: the lists
+    normalize_pair found answered in part (else the record's stored `cut`)."""
     c = v.get("class")
     ents, done = rule_entries(v)
     # H7 (SHOULD-1, R-P5P9-173): the partial-compare and stall hits are looked for in every
     # entry (`all`), also the ones the Rust allowlist explained and dropped from `left`.
     seen = v["all"] if isinstance(v.get("all"), list) else ents
-    partial = any(e.get("path") in PARTIAL_HITS for e in seen)
+    # WP-H1: a page cut, hasNextPage on either side, or an unfinished nested list: incomplete.
+    partial = bool(cut if cut is not None else v.get("cut")) or \
+        any(e.get("path") in PARTIAL_HITS or _unfinished(e) for e in seen)
+    unfinished = [e for e in ents if _unfinished(e)]
+    # Fix round 1 (I2): differing HTTP statuses stay `status`, whatever else the entries say.
+    if c == "diff" and unfinished and done is not False:
+        rest = [e for e in ents if not _unfinished(e) and e.get("path") not in PARTIAL_HITS]
+        if not rest:
+            return "incomplete", []
+        sub = dict(v, entries=rest, left=rest, left_total=len(rest))
+        sub.pop("all", None)
+        k, ids = verdict_class(ep, cls, sub, ours_codes, vars_, node, tip, query, idx, cut=["unfinished"])
+        return ("incomplete", []) if k in ("incomplete", "allowlisted", "known-gap", "equal") else (k, ids)
     if any(e.get("path") == STALL_HIT for e in seen):
         return stall_class(ep, cls, c, ents, done, ours_codes, vars_, node, tip, query, idx)
-    if c in ("equal", "allowlisted") and partial:
+    if c in ("equal", "allowlisted", "known-gap") and partial:
         return "incomplete", []         # owner H4 rule 1: only part of the list was compared
     if c == "allowlisted" and v.get("open_ids"):
         c = "diff"                      # owner H4 rule 3: an open (undocumented) entry accepts nothing
@@ -804,7 +1040,7 @@ def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx
         if done is not None:
             ctx["complete"] = done
         k, ids = allow.classify(ctx)
-        if k == "allowlisted" and partial:
+        if k in ("allowlisted", "known-gap") and partial:
             return "incomplete", []     # H7 SHOULD-1: incomplete is never accepted
         if k != "diff":
             return k, ids
@@ -936,6 +1172,8 @@ class Runner:
                                                for x in st.get("oracle", [])]
         self.rest_stock = {} if a.ours_only else {k: StockHost(k, "rest", st[k], http, self.events)
                                                   for k in ("cwd", "kdatxs") if k in st}
+        for h in self.oracles + list(self.rest_stock.values()):
+            h.on_stop = self.stop_run
         self.pd = None if a.ours_only else PairDiff(cfg["diff"]["kda_compare"], cfg["diff"]["config"])
         nd = cfg.get("node") or {}
         self.node = nodecheck.Node(Http(nd.get("timeout_s", 30)), nd["url"], nd.get("network", "mainnet01"),
@@ -1082,7 +1320,7 @@ class Runner:
                 elif load_error(s["status"]):
                     row["v"] = {"class": "stock-unavailable"}
                 elif s["status"] and a["status"]:
-                    ab, sb = normalize_pair(ep, ab, sb)
+                    ab, sb, aligned = normalize_pair(ep, ab, sb)
                     row["rows"] = [count_rows(ab), count_rows(sb)]      # rows compared (ours, stock)
                     rq = req["path"] if fam != "graphql" else "%s %s" % (req.get("op", "op"), json.dumps(req["variables"]))
                     v = self.pd({"id": case["id"], "kind": "graphql" if fam == "graphql" else "rest",
@@ -1098,8 +1336,9 @@ class Runner:
                         if ev:
                             node = row["node"] = dict(node or {}, **ev)
                     k, ids = verdict_class(ep, case["cls"], v, codes, vars_, node, row.get("tip"),
-                                           req.get("query"), row.get("idx"))
-                    row["v"] = stored_verdict(v, k, ids)
+                                           req.get("query"), row.get("idx"), cut=aligned["cut"])
+                    row["v"] = stored_verdict(dict(v, **{x: aligned[x] for x in ("cut", "one_side", "labels") if aligned[x]}),
+                                              k, ids)
                     keep_evidence(row, a["raw"], s["raw"], ab, sb, node)
         (self.sample if lane == "sample" else self.res).write(json.dumps(row, separators=(",", ":")) + "\n")
         return row
@@ -1521,10 +1760,11 @@ def report(out):
             n = t["ok"] + t["bad"]
             lines.append("- cross-check: %d, %d ok (%.2f%%), %d bad" % (n, t["ok"], 100.0 * t["ok"] / max(n, 1), t["bad"]))
         else:
-            n = sum(t[k] for k in ("equal", "allowlisted", "known-gap", "diff", "status"))
-            lines.append("- %s: %d verdicts, %d equal (%.2f%%), %d allowlisted, %d known-gap, %d diff, %d status; "
-                         "%d stock unavailable" % (cov, n, t["equal"], 100.0 * t["equal"] / max(n, 1), t["allowlisted"],
-                                                   t["known-gap"], t["diff"], t["status"], t["stock-unavailable"]))
+            n = sum(t[k] for k in ("equal", "allowlisted", "known-gap", "diff", "status", "incomplete"))
+            lines.append("- %s: %d verdicts, %d equal (%.2f%%), %d allowlisted, %d known-gap, %d diff, %d status, "
+                         "%d incomplete; %d stock unavailable" % (
+                             cov, n, t["equal"], 100.0 * t["equal"] / max(n, 1), t["allowlisted"], t["known-gap"],
+                             t["diff"], t["status"], t["incomplete"], t["stock-unavailable"]))
     lanes = read_lanes(out)
     lines += ["", "## Harness errors and reconciliation (R-P5P9-180)", "",
               "- open harness-error cases (no result written): %d; resolved by a later result: %d" % (
@@ -1605,12 +1845,15 @@ def rereferee_rows(rows, vars_of, query_of=None):
     query_of = query_of or (lambda i: None)
     before, after = collections.Counter(), collections.Counter()
     moved, left, reopened = collections.Counter(), collections.Counter(), collections.Counter()
+    incomplete = collections.Counter()      # WP-H1: only part compared; never counted as explained
     origin = collections.defaultdict(lambda: [0, 0])      # rows imported from run 1 vs run 2's own
     for src, r in rows:
         v = dict(r.get("v") or {})
         suite_ids = [i for i in v.get("ids") or [] if i in SUITE_RULE_IDS]
         was = v.get("class")
         if was in ("allowlisted", "known-gap") and suite_ids:
+            if not rule_entries(v)[0]:
+                continue            # pair-diff's allowlist explained it all (an id both lists share)
             same = (r.get("ours") or {}).get("st") == (r.get("stock") or {}).get("st")
             v["class"] = "diff" if same else "status"
             v["ids"] = [i for i in v.get("ids") or [] if i not in SUITE_RULE_IDS]
@@ -1623,6 +1866,8 @@ def rereferee_rows(rows, vars_of, query_of=None):
                 reopened[(r["ep"], ",".join(suite_ids))] += 1
                 after[src] += 1
                 left[r["ep"]] += 1
+            elif k == "incomplete":
+                incomplete[r["ep"]] += 1
             continue
         before[src] += 1
         og = origin[r.get("from") or "run2"]
@@ -1631,9 +1876,12 @@ def rereferee_rows(rows, vars_of, query_of=None):
             after[src] += 1
             left[r["ep"]] += 1
             og[1] += 1
+        elif k == "incomplete":
+            incomplete[r["ep"]] += 1
         else:
             moved[(r["ep"], ",".join(ids), k)] += 1
     return {"before": dict(before), "after": dict(after), "moved": dict(moved), "left": dict(left),
+            "incomplete": dict(incomplete), "total_incomplete": sum(incomplete.values()),
             "origin": dict(origin), "reopened": dict(reopened), "total_before": sum(before.values()),
             "total_after": sum(after.values())}
 
@@ -1644,7 +1892,9 @@ def rereferee_md(out, name):
              "Stored records only (diff and status rows of results.jsonl and sample.jsonl); no request sent. "
              "The rules read the node check and the tip pair stored on each record.", "",
              "- unexplained before: %d" % out["total_before"],
-             "- unexplained after: %d" % out["total_after"], "",
+             "- unexplained after: %d" % out["total_after"],
+             "- incomplete (only part compared; neither explained nor unexplained): %d" % out.get("total_incomplete", 0),
+             "",
              "| source | before | after |", "|---|---|---|"]
     for src in sorted(out["before"]):
         lines.append("| %s | %d | %d |" % (src, out["before"][src], out["after"].get(src, 0)))
@@ -1660,6 +1910,11 @@ def rereferee_md(out, name):
     for (ep, ids), n in sorted(out.get("reopened", {}).items(), key=lambda x: -x[1]):
         lines.append("- %s, %s: %d" % (ep, ids, n))
     if not out.get("reopened"):
+        lines.append("- none")
+    lines += ["", "## Incomplete, by endpoint (a page cut, hasNextPage, an unfinished nested list)", ""]
+    for ep, n in sorted(out.get("incomplete", {}).items(), key=lambda x: -x[1]):
+        lines.append("- %s: %d" % (ep, n))
+    if not out.get("incomplete"):
         lines.append("- none")
     lines += ["", "## Still unexplained, by endpoint", ""]
     for ep, n in sorted(out["left"].items(), key=lambda x: -x[1]):
@@ -1701,7 +1956,8 @@ def rereferee(out, cases_dir, md_path):
     with open(md_path, "w") as f:
         f.write(rereferee_md(res, os.path.basename(os.path.abspath(out))))
     json.dump({k: v for k, v in res.items() if k not in ("moved", "reopened")}, open(md_path + ".json", "w"))
-    print("unexplained before %d after %d" % (res["total_before"], res["total_after"]))
+    print("unexplained before %d after %d; incomplete %d" % (res["total_before"], res["total_after"],
+                                                            res["total_incomplete"]))
 
 
 def count_cases(cases_dir, heavy_sample=2000, sample_flag=False):
@@ -1815,6 +2071,105 @@ def smoke(cfg, a):
     os._exit(0)
 
 
+def read_walk_cases(path, ids=None):
+    """Page-walk cases: a .jsonl or .jsonl.gz of suite cases ({"id", "ep", "req": {"query",
+    "variables"}}, optional "walk": {"path", "cursor_var"}), GraphQL only; `ids` keeps those."""
+    op = gzip.open if path.endswith(".gz") else open
+    out = []
+    for line in op(path, "rt"):
+        if not line.strip():
+            continue
+        c = json.loads(line)
+        if ids and c["id"] not in ids:
+            continue
+        if not c.get("ep", "").startswith("gql.") or not (c.get("req") or {}).get("query"):
+            raise ValueError("page-walk takes GraphQL cases only: %s" % c.get("id"))
+        out.append(c)
+    return out
+
+
+def page_walk(cfg, a):
+    """run.py page-walk: each case walked to its end on ours and on its stock host with each side's own
+    cursors (pagewalk.py), at most --max-pages pages and --rps requests per second per side; rows
+    compared as sets plus totalCount; one-side rows read on the node when [node] is configured.
+    Writes DIR/pagewalk.jsonl (one record per case, row keys only) and prints the status counts.
+    The stock host's 504 guard applies: a stop ends the walk."""
+    global REQ_BUDGET
+    if a.budget:
+        if not a.budget_file:
+            raise SystemExit("page-walk: --budget needs --budget-file")
+        REQ_BUDGET = RequestBudget(a.budget, a.budget_file)
+    cases = read_walk_cases(a.cases, set(a.ids or []))
+    o, st, nd = cfg["ours"], cfg.get("stock", {}), cfg.get("node") or {}
+    ours = Http(o.get("timeout_s", 30))
+    os.makedirs(a.out, exist_ok=True)
+    log = open(os.path.join(a.out, "stock-events.jsonl"), "a", buffering=1)
+    http = Http(st.get("timeout_s", 180), insecure=st.get("insecure_tls", False))
+    hosts = [StockHost(x["name"], "gql", x, http, log, start=False) for x in st.get("oracle", [])]
+    if not hosts:
+        raise SystemExit("page-walk: no [[stock.oracle]] host in the config")
+    stop = threading.Event()
+    for h in hosts:
+        h.on_stop = lambda msg: (print("STOPPING THE WALK: %s" % msg, flush=True), stop.set())
+    node = nodecheck.Node(Http(nd.get("timeout_s", 30)), nd["url"], nd.get("network", "mainnet01"),
+                          min(float(nd.get("rps", 20)), 30.0), float(nd.get("max_wait_s", 30))) if nd.get("url") else None
+
+    def fetch_ours(q, v):
+        r = ours.call(o["graphql"], body={"query": q, "variables": v})
+        return r["status"], parse(r["raw"])
+
+    # Fix round 1 (I4): one pacer per side for the whole walk, so the per-side rate holds across cases.
+    pacers = (pagewalk.Pacer(a.rps), pagewalk.Pacer(a.rps))
+    with open(os.path.join(a.out, "pagewalk.jsonl"), "a", buffering=1) as f:
+        counts = walk_cases(cases, hosts, fetch_ours, lambda h: walk_stock_fetch(h, stop), node, a.max_pages,
+                            pacers, stop, lambda rec: f.write(json.dumps(rec, separators=(",", ":")) + "\n"))
+    print("page-walk: %s" % json.dumps(dict(counts), sort_keys=True), flush=True)
+    return 2 if stop.is_set() else 0
+
+
+def walk_stock_fetch(h, stop, poll_s=1.0):
+    """The page-walk's stock fetch for host `h` (Fix round 1, I5): it waits while the host's 504
+    guard backs off (`healthy` cleared), sends nothing once the walk is stopped (0, None), and
+    feeds every answer to the guard."""
+    def fetch(q, v):
+        while not h.healthy.wait(poll_s):
+            if stop.is_set():
+                return 0, None
+        if stop.is_set():
+            return 0, None
+        r = h.send({"query": q, "variables": v})
+        h.guard_504(time.monotonic(), r["status"])
+        return r["status"], parse(r["raw"])
+    return fetch
+
+
+def walk_cases(cases, hosts, fetch_ours, fetch_stock_of, node, max_pages, pacers, stop, write):
+    """Walks each case (pagewalk.run_case) with the same two pacers, case `gql.X:<n>` on host
+    `n % hosts`; `write(rec)` each record. Ends at a stop or an exhausted budget. Returns the
+    status counts."""
+    counts = collections.Counter()
+    for i, c in enumerate(cases):
+        if stop.is_set():
+            break
+        try:
+            n = int(c["id"].rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            n = i
+        h = hosts[n % len(hosts)]
+        try:
+            rec = pagewalk.run_case(c, fetch_ours, fetch_stock_of(h), node, max_pages, pacers)
+        except BudgetExhausted as e:
+            print("STOPPED: %s" % e, flush=True)
+            break
+        rec["host"] = h.name
+        write(rec)
+        counts[rec["status"]] += 1
+        print(json.dumps({"id": rec["id"], "status": rec["status"], "pages": rec["pages"], "rows": rec["rows"],
+                          "totalCount": rec["totalCount"],
+                          "one_side": [len(rec["one_side"]["ours"]), len(rec["one_side"]["stock"])]}), flush=True)
+    return counts
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1855,8 +2210,19 @@ def main():
     rr.add_argument("--out", required=True, help="a run directory (results.jsonl, sample.jsonl)")
     rr.add_argument("--cases", required=True)
     rr.add_argument("--md", required=True, help="the markdown file to write (aggregate counts only)")
+    pw = sub.add_parser("page-walk", help="walk GraphQL lists to their end on both sides (WP-H1)")
+    pw.add_argument("--config", required=True)
+    pw.add_argument("--cases", required=True, help=".jsonl or .jsonl.gz of GraphQL suite cases")
+    pw.add_argument("--out", required=True)
+    pw.add_argument("--ids", nargs="*", help="only these case ids")
+    pw.add_argument("--max-pages", type=int, default=pagewalk.MAX_PAGES, help="pages per side (at most 50)")
+    pw.add_argument("--rps", type=float, default=pagewalk.RPS, help="requests per second per side (at most 2)")
+    pw.add_argument("--budget", type=int, default=0, help="hard cap on all requests (0: none)")
+    pw.add_argument("--budget-file", default=None)
     a = ap.parse_args()
-    if a.cmd == "run":
+    if a.cmd == "page-walk":
+        sys.exit(page_walk(tomllib.load(open(a.config, "rb")), a))
+    elif a.cmd == "run":
         sys.exit(Runner(tomllib.load(open(a.config, "rb")), a).run())
     elif a.cmd == "estimate":
         estimate(tomllib.load(open(a.config, "rb")), a.cases, a.heavy_sample, a.sample_flag)
