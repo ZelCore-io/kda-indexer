@@ -40,6 +40,15 @@ Differences from Kadena graph:
 - The schema has no "as of height" field, so GraphQL answers do not carry one (the native API
   does).
 - Fields not served yet answer `NOT_SUPPORTED` with the rest of the operation intact.
+- Balances of `lago.kwUSDC`, `lago.USD2` and `lago.kwBTC` (R-G4-02). The 489 funded rows on
+  chains 0–2 sit in the modules' old `token-table`, but the live modules are empty stubs with
+  no `get-balance`, so no node API can read them. They are excluded from balances, as are the
+  modules whose name the node cannot parse (non-ASCII): no row is served for them, where stock
+  may list one (it listed `lago.kwUSDC` at 0).
+- `balance(...)` lists fungible balances only (R-G4-03). Stock's `balance(...)` with no
+  `module` also lists marmalade ledger rows with balance `"0"`, one per token id. Ours lists
+  fungible balances only; NFT holdings come from `nonFungibleAccount` and
+  `nonFungibleChainAccount`.
 - Row order within a block (R-P5P9-151). A newest-first list that spans several blocks
   (`transactions`, `events`, `transfers` without `blockHash`, the account connections) lists
   the rows of one block in reverse node order; the stock indexer orders those rows by creation

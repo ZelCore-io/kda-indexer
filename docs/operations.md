@@ -693,9 +693,14 @@ recheck walks only the new heights (a safety net now that the tail marks). Candi
 
 - an injected early miner account (a dictionary name holding a `"`, mainnet 2020): the
   accounts its coinbase really credited, as coin rows on that block's chain only;
-- a cross-chain defpact of any module (`<module>.transfer-crosschain`, or the bridge tokens'
-  `<module>.transfer-create-to-crosschain`): step 1 credits
-  `args[1]`, step 0 debits `args[0]`. Tokens emit no TRANSFER for either;
+- a cross-chain defpact of any module, matched on the defpact's own name (never a suffix):
+  `<module>.transfer-crosschain (sender receiver guard target-chain amount)`, whose step 1
+  credits `args[1]` and step 0 debits `args[0]`; and the Hyperlane bridge tokens'
+  (`n_e595….kb-*`) `<module>.transfer-create-to-crosschain (receiver guard amount
+  target-chain)`, whose step 1 credits `args[0]` (step 0 runs inside the mailbox's `handle` and
+  debits nobody; R-G4-01 a). Tokens emit no TRANSFER for either. The bridge tokens' other
+  credits are covered by the rules below: `handle` emits `RECEIVED_TRANSFER_REMOTE` (an event
+  of a tracked token), and `transfer`/`transfer-create` emit TRANSFER;
 - an `exec` below the events fork: the D1 strings plus every string of `result.data`, for coin
   and for each tracked token the code calls; from the events fork on, the same strings for a
   tracked token the code calls only when the tx has no event of that token. A tx that deploys
@@ -703,6 +708,20 @@ recheck walks only the new heights (a safety net now that the tail marks). Candi
   as calling that module, since its init runs unqualified: its code literals without
   whitespace (a `ROOT` or genesis account) are candidates for that module only, up to 512 per
   tx; calls into other modules in the same tx keep the normal cap of 64;
+- a tracked token named anywhere in the code, with no event of that token in the tx
+  (R-G4-01 b): `(n_e595….mailbox.dispatch n_e595….kb-USDC 1 "<remote recipient>" 97.84)`
+  burns `meta.sender`'s kb-USDC through the token's `transfer-remote` and emits nothing of
+  kb-USDC. The tx's `meta.sender` is a candidate for every such token on that chain. A name is
+  a dotted reference (`ns.module`) anywhere in code, including a `let` binding, a dead
+  `if false` branch or a `[..]` list, or the module of a qualified call (`ns.module.fn`);
+  strings, `'symbols` and comments never are. Over-marking costs one read; a missed debit
+  serves a wrong balance. When the token is passed directly to a qualified call of another
+  module, that call's account-like string arguments are candidates too (for a bridge dispatch
+  that includes the remote EVM recipient, a harmless zero row). At most 8 tracked tokens
+  (counted after the tracked-token filter, so untracked names cannot use them up) and 16 rows
+  per tx, every sender row first, charged to the sender like other exec rows. Each dropped
+  token and row is counted once (`d3_modref_capped` in the tail's counters, `modref_capped` in
+  the pass's dropped report, with one warning per pass and a debug log per tx);
 - an event of a tracked token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
   ...): its string params, for that token;
 - an event param holding a `fungible-v2` module reference: the event's string params, for the
@@ -762,6 +781,13 @@ queued and silently skipped by the walk, so check `/tokens` or `--status` first.
 
 Modules whose name fails the `/local` module check (B-1, for example a non-ASCII name that
 Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot read them.
+Likewise `lago.kwUSDC`, `lago.USD2` and `lago.kwBTC` (chains 0–2, R-G4-02): the live modules
+are empty stubs with no `get-balance`, so the 489 funded rows left in their old `token-table`
+cannot be read by any node API and are excluded from balances.
+
+After a change to these rules, rows the old rules missed in history stay missing until they are
+marked again: the tail and the hourly pass only see new blocks. Re-mark them with `--rewalk`
+for the affected tokens (below). For R-G4-01 that is every tracked `n_e595….kb-*` module.
 
 Only successful txs give candidates. The injected-miner rule reads the block's miner data of
 coinbases below the coinbase injection fix (mainnet 121,452), on that block's chain only.

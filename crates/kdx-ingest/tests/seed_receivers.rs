@@ -1153,8 +1153,22 @@ fn the_tail_caps_one_emitter_per_block_and_still_applies_it() {
         .collect();
     commit_block(&c, block_of(25, txs));
     // Each tx charges free.spam its 64 MINT names (the exec's strings go to the sender's key).
+    // Below the events fork the code naming free.spam also marks (sender, free.spam) by rule
+    // 2b, once per block, charged to the sender's key: exactly one row beyond the emitter's
+    // cap, (SENDER, free.spam).
     let cap = kdx_hot::tail::D3_ROWS_PER_EMITTER_PER_BLOCK as usize;
-    let rows = tail_d3_rows(&c, 25);
+    let mut rows = tail_d3_rows(&c, 25);
+    let (sender, spam) = {
+        let txn = c.hot.ro().unwrap();
+        let d = kdx_hot::HotDict::load(&txn).unwrap();
+        (
+            d.find(DictKind::Account, SENDER).unwrap(),
+            d.find(DictKind::Module, "free.spam").unwrap(),
+        )
+    };
+    assert!(rows.remove(&(sender, spam)), "no (SENDER, free.spam) row");
+    // The rest are the emitter's own rows: free.spam only, within its cap.
+    assert!(rows.iter().all(|&(_, m)| m == spam));
     assert!(
         rows.len() <= cap && rows.len() >= cap - 32,
         "{}",
@@ -1553,4 +1567,69 @@ fn a_token_first_seen_above_the_d3_flag_queues_no_walk() {
             .len(),
         1
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// R-G4-01 (b): a tracked token passed as a bare module reference (Hyperlane `mailbox.dispatch`).
+// ---------------------------------------------------------------------------------------------
+
+const KBNS: &str = "n_e5950000000000000000000000000000000000ab";
+
+/// G4 row #1 (chain 2, 7,432,682, here chain 0): `(<ns>.mailbox.dispatch <ns>.kb-USDC 1
+/// "<remote recipient>" 97.841352)` burns the sender's kb-USDC with no kb-USDC event. The tail
+/// and the hourly pass mark (sender, kb-USDC); a crafted tx over the per-tx cap is counted.
+#[test]
+fn a_bridge_dispatch_marks_the_sender_in_the_tail_and_the_pass_and_counts_the_cap() {
+    let (_d, c) = store();
+    let usdc = format!("{KBNS}.kb-USDC");
+    // Height 25: a kb-USDC TRANSFER tracks the token and names the sender.
+    let cmd = json!({"payload": {"exec": {"code": format!("({usdc}.transfer \"{SENDER}\" \"k:pool\" 1.0)"),
+        "data": {}}}, "meta": {"sender": SENDER}});
+    let evs = json!([event(&usdc, "TRANSFER", json!([SENDER, "k:pool", 1.0]))]);
+    commit_block(&c, block_of(25, vec![d3_tx(7000, cmd, evs, Value::Null)]));
+    assert!(tracked(&c, &usdc));
+    clear_marks(&c);
+    // Height 26: the dispatch (events of coin and the mailbox only).
+    let code = format!(
+        "({KBNS}.mailbox.dispatch {usdc} 1 \"0x00000000000000000000000000c0ffee00000000000000000000000000aa\" 97.841352)"
+    );
+    let cmd = json!({"payload": {"exec": {"code": code, "data": {}}}, "meta": {"sender": SENDER}});
+    let evs = json!([
+        event("coin", "TRANSFER", json!([SENDER, "k:gas", 0.01])),
+        event(
+            &format!("{KBNS}.mailbox"),
+            "DISPATCH",
+            json!([1, "router", 1, "0xaa"])
+        ),
+    ]);
+    commit_block(&c, block_of(26, vec![d3_tx(7001, cmd, evs, Value::Null)]));
+    assert!(dirty_in(&c, SENDER, &usdc), "tail");
+    // The hourly pass derives the same row from the stored record.
+    clear_marks(&c);
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    assert!(dirty_in(&c, SENDER, &usdc), "pass {rep:?}");
+    assert_eq!(rep.modref_capped, 0);
+    // Height 27: a crafted tx naming the token by reference with 40 strings: capped, counted.
+    let mut code = format!("({KBNS}.mailbox.dispatch {usdc}");
+    for j in 0..40 {
+        code.push_str(&format!(" \"k:{j:04}\""));
+    }
+    code.push(')');
+    let cmd = json!({"payload": {"exec": {"code": code, "data": {}}}, "meta": {"sender": SENDER}});
+    commit_block(
+        &c,
+        block_of(27, vec![d3_tx(7002, cmd, json!([]), Value::Null)]),
+    );
+    let capped = c
+        .hot
+        .ro()
+        .unwrap()
+        .counter(kdx_hot::balances::counters::D3_MODREF_CAPPED)
+        .unwrap();
+    let cap = kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX as u64;
+    assert_eq!(capped, 41 - cap, "sender + 40 strings over a cap of {cap}");
+    // The pass counts the same rows for the same tx (review M5).
+    clear_marks(&c);
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    assert_eq!(rep.modref_capped, 41 - cap, "pass {rep:?}");
 }
