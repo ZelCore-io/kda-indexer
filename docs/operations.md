@@ -783,7 +783,10 @@ Modules whose name fails the `/local` module check (B-1, for example a non-ASCII
 Pact 5 cannot parse) are never marked, queued or tracked: the node API cannot read them.
 Likewise `lago.kwUSDC`, `lago.USD2` and `lago.kwBTC` (chains 0–2, R-G4-02): the live modules
 are empty stubs with no `get-balance`, so the 489 funded rows left in their old `token-table`
-cannot be read by any node API and are excluded from balances.
+cannot be read by any node API and are excluded from balances. GraphQL and the native API
+serve no row for these modules, where the stock GraphQL indexer may list one (in the G4 replay
+it listed `lago.kwUSDC` at 0); the 23 non-ASCII rows the G4 balance recheck met are treated the
+same way.
 
 After a change to these rules, rows the old rules missed in history stay missing until they are
 marked again: the tail and the hourly pass only see new blocks. Re-mark them with `--rewalk`
