@@ -1960,10 +1960,13 @@ async fn ours_fn_server<F>(f: F) -> String
 where
     F: Fn(&Value) -> Value + Clone + Send + Sync + 'static,
 {
+    // One shared handler: cloning `f` per request would copy every row a walk's reply closure
+    // holds (20,000 rows x 200 pages for the referee's walk), which is quadratic in the rows.
+    let f = Arc::new(f);
     let app = Router::new().route(
         "/graphql",
         post(move |Json(req): Json<Value>| {
-            let f = f.clone();
+            let f = Arc::clone(&f);
             async move { Json(f(&req)) }
         }),
     );

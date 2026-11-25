@@ -215,18 +215,43 @@ mod tests {
 
     /// F-53 review: a piece mixing `_` with literals is matched by Shift-And in one pass,
     /// not re-checked from every start: `a{200}_b%c` over 4 MiB of `a` would be ~800M steps.
+    /// Not one wall-clock number on its own (a debug build runs several times slower than the
+    /// release one the bound was first set in): the time must scale linearly from 2 MiB to
+    /// 4 MiB of input (about 2x; 3x allowed, quadratic would be 4x), and stay under a bound
+    /// set per build profile that the per-start re-check (seconds, even in release) misses
+    /// by a wide margin. Each time is the best of three runs, so a busy machine does not
+    /// fail it.
     #[test]
     fn long_pieces_with_underscore_match_in_linear_time() {
-        let s = "a".repeat(4 << 20);
+        use std::time::{Duration, Instant};
+        let best = |like: &Like, s: &str| {
+            (0..3)
+                .map(|_| {
+                    let t0 = Instant::now();
+                    assert!(!like.matches(s));
+                    t0.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let bound = if cfg!(debug_assertions) {
+            Duration::from_millis(3000)
+        } else {
+            Duration::from_millis(250)
+        };
+        let (n, double) = ("a".repeat(2 << 20), "a".repeat(4 << 20));
         for pat in [
             format!("{}_b%c", "a".repeat(200)),
             format!("_{}b", "a".repeat(250)),
         ] {
             let like = Like::new(&pat);
-            let t0 = std::time::Instant::now();
-            assert!(!like.matches(&s));
-            let took = t0.elapsed();
-            assert!(took < std::time::Duration::from_millis(250), "{took:?}");
+            let (t1, t2) = (best(&like, &n), best(&like, &double));
+            assert!(t2 < bound, "{t2:?} over 4 MiB, bound {bound:?}");
+            // 20 ms of slack for the timer and scheduler on a fast machine.
+            assert!(
+                t2 <= t1 * 3 + Duration::from_millis(20),
+                "not linear: {t1:?} over 2 MiB, {t2:?} over 4 MiB"
+            );
         }
     }
 
