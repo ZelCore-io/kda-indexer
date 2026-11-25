@@ -28,6 +28,8 @@ const FRONTIER: u32 = 10;
 /// `[FIRST_RANGE_END, FRONTIER)`.
 const FIRST_RANGE_END: u32 = 5;
 const ALICE: &str = "k:alice";
+/// An account whose every `coin` row the node holds at 0.
+const DRAINED: &str = "k:drained";
 const BOB: &str = "k:bob";
 const CAROL: &str = "k:carol";
 const ALICE_KEY: &str = "alice-key";
@@ -255,6 +257,31 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
             unverified: false,
         };
         t.put(Table::Balances, &bal_key(alice, coin, c), &row.encode())
+            .unwrap();
+    }
+    // Rows the node holds at 0 (an account drained after it was funded): alice's coin on
+    // chain 2, every row of `DRAINED`, Bob's coin on chain 0 (Bob has transfers) and the
+    // miner's coin on chain 0. They are never listed; the accounts stay resolvable.
+    let drained = dict.intern(DictKind::Account, DRAINED);
+    let bob = dict.intern(DictKind::Account, BOB);
+    let miner = dict.intern(DictKind::Account, "k:miner");
+    dict.persist(&mut t).unwrap();
+    for (a, c, bal) in [
+        (alice, 2u8, "0.0"),
+        (drained, 0, "0.000000000000"),
+        (drained, 1, "0"),
+        (bob, 0, "0.0"),
+        (miner, 0, "0.0"),
+    ] {
+        let row = BalanceRow {
+            absent: false,
+            balance: bal.into(),
+            guard: [0; 16],
+            as_of: 12,
+            reconciled_at: 12,
+            unverified: false,
+        };
+        t.put(Table::Balances, &bal_key(a, coin, c), &row.encode())
             .unwrap();
     }
     kdx_hot::nft::upsert_event(&mut t, alice, "t:2", 0, ledger, 12, "1.0").unwrap();
@@ -1266,6 +1293,180 @@ async fn fungible_chain_accounts_list_every_chain_and_never_null() {
     )
     .await;
     assert_eq!(v["fungibleChainAccount"]["chainId"], "1", "{v}");
+}
+
+/// WP-L concern 3: a row the node holds at 0 is never listed, whether it was funded once or
+/// not: not in `chainAccounts`, `fungibleChainAccounts`, `fungibleChainAccount` or
+/// `balance(...)`, and an account whose rows are all at 0 is `fungibleAccount: null`.
+#[tokio::test]
+async fn rows_the_node_holds_at_zero_are_not_listed() {
+    let fx = fixture();
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleAccount(accountName: \"{ALICE}\") {{ totalBalance chainAccounts {{ chainId }} }} }}"
+        ),
+    )
+    .await;
+    let chains: Vec<&str> = v["fungibleAccount"]["chainAccounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["chainId"].as_str().unwrap())
+        .collect();
+    assert_eq!(chains, ["0", "1"], "{v}");
+    assert_eq!(v["fungibleAccount"]["totalBalance"], json!(2), "{v}");
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleChainAccounts(accountName: \"{ALICE}\") {{ chainId }} }}"),
+    )
+    .await;
+    assert_eq!(
+        v["fungibleChainAccounts"].as_array().map(Vec::len),
+        Some(2),
+        "{v}"
+    );
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"2\") {{ chainId }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccount"], Value::Null, "{v}");
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ balance(accountName: \"{ALICE}\") {{ edges {{ node {{ module chainId }} }} }} }}"
+        ),
+    )
+    .await;
+    let rows: Vec<String> = v["balance"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            format!(
+                "{}:{}",
+                e["node"]["module"].as_str().unwrap(),
+                e["node"]["chainId"]
+            )
+        })
+        .collect();
+    assert_eq!(rows, ["coin:\"0\"", "coin:\"1\""], "{v}");
+    // Every row at 0: no chain rows, no balances, but the account still resolves (I-1).
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleAccount(accountName: \"{DRAINED}\") {{ accountName totalBalance chainAccounts {{ chainId }} }} }}"),
+    )
+    .await;
+    assert_eq!(v["fungibleAccount"]["chainAccounts"], json!([]), "{v}");
+    assert_eq!(v["fungibleAccount"]["totalBalance"], json!(0), "{v}");
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleChainAccounts(accountName: \"{DRAINED}\") {{ chainId }} }}"),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccounts"], json!([]), "{v}");
+    let v = run(
+        &fx.schema,
+        &format!("{{ balance(accountName: \"{DRAINED}\") {{ edges {{ cursor }} }} }}"),
+    )
+    .await;
+    assert_eq!(v["balance"]["edges"], json!([]), "{v}");
+}
+
+/// I-1 (PR #44 review): an account drained to 0 everywhere lists no row, but
+/// `fungibleAccount` and `node(id:)` (`FungibleAccount` and `FungibleChainAccount` ids) still
+/// resolve while it has a stored row, so its `transfers` and `transactions` stay reachable.
+/// An account with no stored row at all is still `null`.
+#[tokio::test]
+async fn a_drained_account_keeps_its_history() {
+    let fx = fixture();
+    let sel = "accountName totalBalance chainAccounts { chainId } transfers(first: 50) { edges { cursor } } transactions(first: 50) { edges { cursor } }";
+    let check = |v: &Value, label: &str| {
+        assert_eq!(v["chainAccounts"], json!([]), "{label}: {v}");
+        assert_eq!(v["totalBalance"], json!(0), "{label}: {v}");
+        let transfers = v["transfers"]["edges"].as_array().expect(label);
+        assert!(!transfers.is_empty(), "{label}: {v}");
+        assert!(v["transactions"]["edges"].is_array(), "{label}: {v}");
+    };
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleAccount(accountName: \"{BOB}\") {{ {sel} }} }}"),
+    )
+    .await;
+    check(&v["fungibleAccount"], "fungibleAccount");
+    let id = kdx_graphql::ids::encode(&kdx_graphql::ids::NodeKey::FungibleAccount {
+        fungible: "coin".into(),
+        account: BOB.into(),
+    });
+    let v = run(
+        &fx.schema,
+        &format!("{{ node(id: \"{id}\") {{ ... on FungibleAccount {{ {sel} }} }} }}"),
+    )
+    .await;
+    check(&v["node"], "node FungibleAccount");
+    // The chain account at 0 resolves by id, with its transfers.
+    let id = kdx_graphql::ids::encode(&kdx_graphql::ids::NodeKey::FungibleChainAccount {
+        chain: "0".into(),
+        fungible: "coin".into(),
+        account: BOB.into(),
+    });
+    let v = run(
+        &fx.schema,
+        &format!("{{ node(id: \"{id}\") {{ ... on FungibleChainAccount {{ chainId balance transfers(first: 50) {{ edges {{ cursor }} }} transactions(first: 50) {{ edges {{ cursor }} }} }} }} }}"),
+    )
+    .await;
+    assert_eq!(v["node"]["chainId"], "0", "{v}");
+    assert_eq!(v["node"]["balance"], json!(0.0), "{v}");
+    assert!(
+        !v["node"]["transfers"]["edges"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{v}"
+    );
+    assert!(v["node"]["transactions"]["edges"].is_array(), "{v}");
+    // No stored row on that chain, or none at all: `null`.
+    for (chain, account) in [("1", BOB), ("0", "k:nobody")] {
+        let id = kdx_graphql::ids::encode(&kdx_graphql::ids::NodeKey::FungibleChainAccount {
+            chain: chain.into(),
+            fungible: "coin".into(),
+            account: account.into(),
+        });
+        let v = run(
+            &fx.schema,
+            &format!("{{ node(id: \"{id}\") {{ ... on FungibleChainAccount {{ chainId }} }} }}"),
+        )
+        .await;
+        assert_eq!(v["node"], Value::Null, "{chain} {account}: {v}");
+    }
+    let v = run(
+        &fx.schema,
+        "{ fungibleAccount(accountName: \"k:nobody\") { accountName } }",
+    )
+    .await;
+    assert_eq!(v["fungibleAccount"], Value::Null, "{v}");
+}
+
+/// The review's minor 6: `Block.minerAccount` serves the miner's row though it is at 0.
+#[tokio::test]
+async fn miner_account_is_served_at_zero() {
+    let fx = fixture();
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ block(hash: \"{}\") {{ minerAccount {{ accountName chainId balance }} }} }}",
+            block_hash(0, 12)
+        ),
+    )
+    .await;
+    assert_eq!(
+        v["block"]["minerAccount"],
+        json!({"accountName": "k:miner", "chainId": "0", "balance": 0.0}),
+        "{v}"
+    );
 }
 
 /// FIX-4 item 2: `chainIds: []` on the block lists means every chain, as no `chainIds` does.

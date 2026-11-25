@@ -660,8 +660,8 @@ an expansion from a hash to txs reads the `code` postings in `first_h..=last_h` 
 tx).
 
 Modes (S-1): `full` indexes every body; `fallback` indexes bodies of at least
-`fallback_min_len` bytes plus every module or interface deployment, and leaves the rest to
-the bounded scan. `manifest.json` records the mode the index was built with.
+`fallback_min_len` bytes plus every module or interface deployment. Compat `/txs/search` serves its hits for a
+pattern below the threshold marked truncated, and runs the bounded scan only when it has none. `manifest.json` records the mode the index was built with.
 
 `built_through_height`: every exec tx at or below it on every chain has its body in the
 index (bodies of later txs may be there too). A rebuild sets it to the lowest tail

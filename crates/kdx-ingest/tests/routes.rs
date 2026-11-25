@@ -261,6 +261,120 @@ async fn search_code_is_partial_while_the_index_is_marked_stale() {
     assert!(ask("marked stale").await);
 }
 
+/// Build the code index in `mode` over every pool block (marked stale from height 3 when
+/// `stale`), then ask compat `/txs/search?search={pat}` with a bounded scan of
+/// `max_scan_heights`: the rows and the `X-Search-Truncated` header.
+async fn compat_search(
+    mode: kdx_search::ModeSel,
+    stale: bool,
+    pat: &str,
+    max_scan_heights: u32,
+) -> (Vec<Value>, Option<Vec<u8>>) {
+    let all: Vec<usize> = (0..POOL_LEN).collect();
+    let (dir, state, ctx) = store(&branch(&all, 0, 0, 0));
+    let o = kdx_search::BuildOpts {
+        data_dir: dir.path().to_path_buf(),
+        mode,
+        threads: 1,
+        heap_mb: 64,
+        trial_docs: 0,
+        stop: Default::default(),
+    };
+    kdx_search::rebuild(&o, &ctx.hot).unwrap();
+    if stale {
+        assert!(kdx_search::manifest::mark_stale(dir.path(), 3).unwrap());
+    }
+    let settings = SearchSettings {
+        max_scan_heights,
+        ..SearchSettings::default()
+    };
+    let app = routers(
+        &state,
+        SearchCtx::new(settings, Some(kdx_search::search_dir(dir.path()))),
+    );
+    let mut req = Request::get(format!("/txs/search?search={pat}&limit=250"))
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            1,
+        ))));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let truncated = resp
+        .headers()
+        .get("x-search-truncated")
+        .map(|v| v.as_bytes().to_vec());
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 << 20)
+        .await
+        .unwrap();
+    (serde_json::from_slice(&bytes).unwrap(), truncated)
+}
+
+/// The heights of the rows of request key `rk`, after checking every row really carries
+/// `pat` in its own code.
+fn hit_heights(rows: &[Value], rk: &str, pat: &str) -> Vec<u64> {
+    for t in rows {
+        assert!(t["code"].as_str().unwrap().contains(pat), "{t}");
+    }
+    rows.iter()
+        .filter(|t| t["requestKey"] == rk)
+        .map(|t| t["height"].as_u64().unwrap())
+        .collect()
+}
+
+/// WP-L concern 1: the index is in fallback mode and the pattern is shorter than its
+/// threshold, so it cannot answer completely, and the bounded scan is too small to reach the
+/// matching tx. `/txs/search` serves the index's verified hits (not the scan's empty list),
+/// marked `X-Search-Truncated: true`, as native `/search/code` lists them with `partial`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_serves_fallback_index_hits_marked_truncated() {
+    let pool = pool();
+    let (r, rk, pat) = exec_pattern(&pool, 0..POOL_LEN - 2);
+    let (_, code) = first_exec(&pool, r).unwrap();
+    // Bodies of at least `min_len` bytes are indexed: the tx's body is, the pattern is
+    // shorter than the threshold, so the index cannot vouch for every match.
+    let min_len = pat.len() as u32 + 1;
+    assert!(code.len() >= min_len as usize, "{code}");
+    // The scan reads the newest height only.
+    let (rows, truncated) =
+        compat_search(kdx_search::ModeSel::Fallback(min_len), false, &pat, 1).await;
+    assert_eq!(hit_heights(&rows, &rk, &pat), [r as u64], "{pat}: {rows:?}");
+    assert_eq!(truncated.as_deref(), Some(&b"true"[..]));
+}
+
+/// The review's minor 6: a full, current index answers completely, with no truncated
+/// header; the same index marked stale still serves its hits, marked truncated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_full_index_header_absent_and_stale_index_serves_hits() {
+    let pool = pool();
+    let (r, rk, pat) = exec_pattern(&pool, 0..POOL_LEN - 2);
+    let (rows, truncated) = compat_search(kdx_search::ModeSel::Full, false, &pat, 1).await;
+    assert_eq!(hit_heights(&rows, &rk, &pat), [r as u64], "{pat}: {rows:?}");
+    assert_eq!(truncated, None, "full and current: no header");
+    let (rows, truncated) = compat_search(kdx_search::ModeSel::Full, true, &pat, 1).await;
+    assert_eq!(hit_heights(&rows, &rk, &pat), [r as u64], "{pat}: {rows:?}");
+    assert_eq!(truncated.as_deref(), Some(&b"true"[..]), "stale: marked");
+}
+
+/// The review's minor 6: a fallback index that leaves the tx's body out has no hit for the
+/// pattern, so the bounded scan runs and finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_without_index_hits_falls_back_to_the_scan() {
+    let pool = pool();
+    let (r, rk, pat) = exec_pattern(&pool, 0..POOL_LEN - 2);
+    // Every body below 1 MiB is left out of the index (deployments aside).
+    let (rows, _) = compat_search(
+        kdx_search::ModeSel::Fallback(1 << 20),
+        false,
+        &pat,
+        SearchSettings::default().max_scan_heights,
+    )
+    .await;
+    assert_eq!(hit_heights(&rows, &rk, &pat), [r as u64], "{pat}: {rows:?}");
+}
+
 /// S-3 (T-3): a captured mainnet block (chain 0, height 4,500,122: two `exec` txs of
 /// `free.radio02` and two `cont` txs, step 1 of cross-chain coin transfers with SPV
 /// proofs), served at height 3 after three pool blocks. `pactid` lists exactly the cont tx

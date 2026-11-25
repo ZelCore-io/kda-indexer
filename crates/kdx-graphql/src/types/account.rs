@@ -2,7 +2,9 @@
 //! `KeyAccounts` rows. Resolvers never call the node.
 //!
 //! - Rows marked stale are served; a chain with no row (or a row the node reported absent)
-//!   is missing from `chainAccounts`; with no row on any chain the account is `null`.
+//!   is missing from `chainAccounts`, and so is a row at 0; with no row on any chain the
+//!   account is `null`. An account whose rows are all at 0 still resolves (empty
+//!   `chainAccounts`, `totalBalance` 0), so its history stays reachable.
 //! - Rows of a module marked not fungible are never served (as native).
 //! - `…ByPublicKey` lists only rows whose guard holds the key, of `coin` (the default
 //!   `fungibleName`, SEC-2) or of a module confirmed `fungible-v2` on the row's chain (I-6).
@@ -71,12 +73,26 @@ fn hidden(view: &View, m: u32) -> ApiResult<bool> {
     Ok(balances::token_row(&view.txn, m)?.is_some_and(|t| t.kind == balances::KIND_NOT_FUNGIBLE))
 }
 
-/// The present rows of `(account, module)`, by chain, optionally on `chains` only.
+/// The listed rows of `(account, module)`, by chain, optionally on `chains` only: a row the
+/// node holds at 0 is left out like an absent one (WP-L concern 3; one rule on every balance
+/// list, native and GraphQL).
 pub fn chain_rows(
     view: &View,
     account: &str,
     module: &str,
     chains: Option<&[u8]>,
+) -> ApiResult<Vec<ChainRow>> {
+    listed_rows(view, account, module, chains, false)
+}
+
+/// `chain_rows`, keeping rows at 0 when `keep_zero` (a single known row, as
+/// `Block.minerAccount`, is served whatever its balance).
+fn listed_rows(
+    view: &View,
+    account: &str,
+    module: &str,
+    chains: Option<&[u8]>,
+    keep_zero: bool,
 ) -> ApiResult<Vec<ChainRow>> {
     let d = view.dict();
     let (Some(a), Some(m)) = (
@@ -98,7 +114,8 @@ pub fn chain_rows(
         let (Some((_, _, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
             continue;
         };
-        if r.absent || chains.is_some_and(|cs| !cs.contains(&c)) {
+        let listed = if keep_zero { !r.absent } else { r.positive() };
+        if !listed || chains.is_some_and(|cs| !cs.contains(&c)) {
             continue;
         }
         out.push(ChainRow {
@@ -110,14 +127,28 @@ pub fn chain_rows(
     Ok(out)
 }
 
-/// `Block.minerAccount` and other single chain-account lookups inside a read.
+/// The rows `fungibleAccount` serves: `None` when the account has no stored row the node did
+/// not report absent; otherwise its rows above 0, possibly none (an account drained to 0
+/// everywhere still resolves, so its `transfers` and `transactions` stay reachable; PR #44
+/// review I-1).
+fn account_rows(view: &View, account: &str, module: &str) -> ApiResult<Option<Vec<ChainRow>>> {
+    let rows = listed_rows(view, account, module, None, true)?;
+    Ok((!rows.is_empty()).then(|| {
+        rows.into_iter()
+            .filter(|r| balances::decimal_positive(&r.balance))
+            .collect()
+    }))
+}
+
+/// `Block.minerAccount`, the `FungibleChainAccount` node and other single chain-account
+/// lookups inside a read (a row at 0 is served).
 pub fn chain_account_in(
     view: &View,
     account: &str,
     chain: u8,
     module: &str,
 ) -> ApiResult<Option<FungibleChainAccount>> {
-    Ok(chain_rows(view, account, module, Some(&[chain]))?
+    Ok(listed_rows(view, account, module, Some(&[chain]), true)?
         .into_iter()
         .next()
         .map(|row| FungibleChainAccount {
@@ -154,7 +185,7 @@ fn by_key(
     let mut out = Vec::new();
     let mut truncated = false;
     let mut failed = None;
-    // One account's rows of `m`, kept when present, on `chain`, trusted and guarded by `pk`.
+    // One account's rows of `m`, kept when above 0, on `chain`, trusted and guarded by `pk`.
     let rows_of = |a: u32| -> ApiResult<Vec<ChainRow>> {
         let mut prefix = a.to_be_bytes().to_vec();
         prefix.extend_from_slice(&m.to_be_bytes());
@@ -166,7 +197,7 @@ fn by_key(
             let (Some((_, _, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                 continue;
             };
-            if r.absent
+            if !r.positive()
                 || chain.is_some_and(|x| x != c)
                 || !balances::trusted(&view.txn, m, c, coin)?
                 || !balances::stored_guard_keys(&view.txn, &r.guard, c)?
@@ -538,15 +569,32 @@ pub async fn fungible_account(
         .state()?
         .read({
             let (a, m) = (account.clone(), module.clone());
-            move |view| chain_rows(view, &a, &m, None)
+            move |view| account_rows(view, &a, &m)
         })
         .await
         .map_err(from_api)?;
-    Ok((!rows.is_empty()).then_some(FungibleAccount {
+    Ok(rows.map(|rows| FungibleAccount {
         account,
         module,
         rows,
     }))
+}
+
+/// The `FungibleChainAccount` node: the stored row of the chain, served at 0 too (an id
+/// handed out before the account was drained still resolves, with its history; I-1).
+pub async fn fungible_chain_account_node(
+    ctx: &Context<'_>,
+    account: &str,
+    chain: &str,
+    module: &str,
+) -> Result<Option<FungibleChainAccount>> {
+    let (account, module) = names(account, Some(module))?;
+    let c = crate::txlist::chain_arg(chain)?;
+    gql(ctx)
+        .state()?
+        .read(move |view| chain_account_in(view, &account, c, &module))
+        .await
+        .map_err(from_api)
 }
 
 /// `fungibleChainAccounts` (and `fungibleChainAccount` with one chain). `chain_ids` absent
@@ -668,7 +716,7 @@ pub fn decode_balance_cursor(s: &str) -> Result<(String, u8)> {
     Ok((m.to_owned(), c.parse::<u8>().map_err(|_| bad())?))
 }
 
-/// `balance(accountName, module, chainIds)`: an account's present fungible rows (the
+/// `balance(accountName, module, chainIds)`: an account's fungible rows above 0 (the
 /// reconciled balances), listed by module name then chain, filtered by `module` and
 /// `chainIds`. Without `accountName` (a module's holders) it is `NOT_SUPPORTED`: the store
 /// keeps no holders-by-module index, and a scan of every balance row is not bounded (R7I-5).
@@ -758,7 +806,7 @@ pub async fn query_balance(
                 let (Some((_, m, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                     continue;
                 };
-                if r.absent || chains.as_ref().is_some_and(|cs| !cs.contains(&c)) {
+                if !r.positive() || chains.as_ref().is_some_and(|cs| !cs.contains(&c)) {
                     continue;
                 }
                 let Some(name) = d.name(DictKind::Module, m).map(str::to_owned) else {
@@ -987,20 +1035,33 @@ mod by_key_tests {
         for i in 0..101 {
             rows.push(("k2", dict.intern(DictKind::Account, &format!("c{i}")), coin));
         }
+        // `k3` guards `drained` (every row at 0) and `mixed` (1 on chain 0, 0 on chain 1).
+        let drained = dict.intern(DictKind::Account, "drained");
+        let mixed = dict.intern(DictKind::Account, "mixed");
         dict.persist(&mut w).unwrap();
-        for (pk, acct, m) in rows {
+        let mut balance_rows: Vec<(&str, u32, u32, u8, &str)> = rows
+            .into_iter()
+            .map(|(pk, a, m)| (pk, a, m, 0, "1"))
+            .collect();
+        balance_rows.extend([
+            ("k3", drained, coin, 0, "0.0"),
+            ("k3", drained, coin, 1, "0"),
+            ("k3", mixed, coin, 0, "1"),
+            ("k3", mixed, coin, 1, "0.000"),
+        ]);
+        for (pk, acct, m, c, bal) in balance_rows {
             let guard = format!(r#"{{"keys":["{pk}"],"pred":"keys-all"}}"#);
             let gh = guard_hash(guard.as_bytes());
             w.put(Table::Guards, &gh, guard.as_bytes()).unwrap();
             let row = BalanceRow {
                 absent: false,
-                balance: "1".into(),
+                balance: bal.into(),
                 guard: gh,
                 as_of: 1,
                 reconciled_at: 1,
                 unverified: false,
             };
-            w.put(Table::Balances, &bal_key(acct, m, 0), &row.encode())
+            w.put(Table::Balances, &bal_key(acct, m, c), &row.encode())
                 .unwrap();
             w.put(
                 Table::KeyAccounts,
@@ -1044,5 +1105,22 @@ mod by_key_tests {
         assert_eq!(names(&st, "k1").await, (vec!["victim".to_owned()], false));
         let (k2, cut) = names(&st, "k2").await;
         assert_eq!((k2.len(), cut), (super::MAX_KEY_ACCOUNTS, true));
+    }
+
+    /// The review's minor 6: the `…ByPublicKey` lists leave rows at 0 out, and an account
+    /// with every row at 0 is not listed.
+    #[tokio::test]
+    async fn rows_at_zero_are_left_out_by_key() {
+        let (_d, st) = fixture();
+        let accts = st
+            .read(|view| by_key(view, "k3", "coin", None))
+            .await
+            .unwrap()
+            .0;
+        let got: Vec<(String, Vec<u8>)> = accts
+            .into_iter()
+            .map(|a| (a.account, a.rows.iter().map(|r| r.chain).collect()))
+            .collect();
+        assert_eq!(got, [("mixed".to_owned(), vec![0])]);
     }
 }

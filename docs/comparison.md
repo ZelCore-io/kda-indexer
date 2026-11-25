@@ -280,8 +280,8 @@ The G4 replay of real traffic (below) met most of these classes again; its
   served, so introspection answers differ ([graphql.md](graphql.md#schema)).
 - `balance(...)` lists fungible balances only; stock also lists marmalade ledger rows at 0
   (R-G4-03, [graphql.md](graphql.md#schema)).
-- Rows the node holds at 0 are not listed in balances (a known gap,
-  [graphql.md](graphql.md#accounts)).
+- Rows the node holds at 0 are not listed in balances, native or GraphQL; stock lists some
+  of them and not others ([graphql.md](graphql.md#accounts)).
 - chainweb-data answered the `fluxteam` account list (`limit=200000`, no `minheight`) with
   recent rows only, 27 to 32 against ours' 237; ours answers the whole history (R-G4-05). The
   general cause is inferred from this one account ([api.md](api.md#compat-notes)).
@@ -397,7 +397,7 @@ for, and nothing beyond it.
 | "Incomplete" never reported | all per-family tables | – | gap | The harness flags answers that hit a page limit as incomplete, but no G4 table has that column. |
 | Ours only, no stock pair | `nonFungibleAccount` (stock crashes), `/txs/search` (stock hangs), `/txs/recent` (stale cache on the test stock, whose refresh queries were hung) | 374 + 40 + 36,720 | not compared | No stock answer and no node check in G4. |
 | Changed after the replay | coinbase `gasLimit`, `lastTokenPriceInKda` | 45,584 + 242 | offline only | Fixed after the replay and checked against the stored answers only. |
-| Values compared in full | all balances | 1.21 M accounts | full, with exceptions | Every account was scanned against the node. Not checked: the 489 `lago` rows and the 23 non-ASCII rows, which the node cannot read. Still open: the 7 bridge rows and the zero-row gap. The 16 tip races were closed weakly (see Method). |
+| Values compared in full | all balances | 1.21 M accounts | full, with exceptions | Every account was scanned against the node. Not checked: the 489 `lago` rows and the 23 non-ASCII rows, which the node cannot read. Still open: the 7 bridge rows. Zero rows are never listed (one rule since the WP-L fix). The 16 tip races were closed weakly (see Method). |
 
 Planned before G4 closes: a page-walk check (each side walked to its last page with its own
 cursors, rows compared as sets plus `totalCount`, one-side rows read on the node), including
@@ -435,7 +435,7 @@ documented difference), **unknown** (not settled yet).
 | 19 | signer order | 1 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
 | 20 | `crossChainTransfer.creationTime` in whole seconds | 2 | both | [graphql.md](graphql.md#wire-formats-that-follow-the-oracle-r-p5p9-19) |
 | 21 | failed tx `badResult`: `callStack` and `info` | 117 | ours (= node, owner ruling) | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
-| 22 | zero-balance rows and missing chain rows (a known gap) | 42 + 16 + 38 + 61 keys + 5 | stock lists rows the node holds at 0; ours omits them | [graphql.md](graphql.md#accounts) |
+| 22 | zero-balance rows and missing chain rows | 42 + 16 + 38 + 61 keys + 5 | stock lists some rows the node holds at 0; ours never lists them | [graphql.md](graphql.md#accounts) |
 | 23 | `balance` edge order | 82 | both | [graphql.md](graphql.md#zelcore-extensions) |
 | 24 | stock lacks funded balance rows | 5 + 12 | ours | [graphql.md](graphql.md#accounts) |
 | 25 | ours' rows read before the queue drained, now equal to the node | 216 | both (transient) | [graphql.md](graphql.md#accounts) |

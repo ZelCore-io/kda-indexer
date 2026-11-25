@@ -224,8 +224,8 @@ const RECHECK: Duration = Duration::from_secs(5);
 
 /// Heights the index's `built_through_height` may trail the data tip before the routes stop
 /// trusting it alone (the stage commits every `commit_secs`; blocks come every ~30 s per
-/// chain). Past it, compat `/txs/search` runs the bounded scan (exact) and native
-/// `/search/code` answers `partial: true` (M-1).
+/// chain). Past it, compat `/txs/search` serves the index hits marked truncated (the bounded
+/// scan only when there is none) and native `/search/code` answers `partial: true` (M-1).
 pub const LAG_MARGIN: u32 = 20;
 
 /// The index trails the data tip by more than [`LAG_MARGIN`]: bodies first seen above

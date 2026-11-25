@@ -210,13 +210,9 @@ async fn lookup(ctx: &Context<'_>, key: NodeKey) -> Result<Option<Node>> {
             chain,
             fungible,
             account,
-        } => {
-            super::account::fungible_chain_accounts(ctx, &account, Some(&[chain]), Some(&fungible))
-                .await?
-                .into_iter()
-                .next()
-                .map(Node::FungibleChainAccount)
-        }
+        } => super::account::fungible_chain_account_node(ctx, &account, &chain, &fungible)
+            .await?
+            .map(Node::FungibleChainAccount),
         NodeKey::NonFungibleAccount { account } => super::nft::non_fungible(ctx, &account, None)
             .await?
             .map(|(account, items, cut)| {
