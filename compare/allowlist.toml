@@ -953,6 +953,32 @@ doc = "docs/comparison.md#stock-faults-the-node-disproves"
 node_read = "graphql_window::gql_decimal_zeros: node /poll TRANSFER event amount of the row's request key"
 
 [[entry]]
+id = "graphql-oracle-decimal-zeros-unchecked"
+route = "other"
+json_path_glob = "/~graphql-oracle-decimal-zeros-unchecked"
+condition = "any"
+request_contains = "graphql:"
+reason = "H3 (#38): a shared row's amount where stock's text is ours' text with zeros appended to the fraction (equal as exact decimals, compared as text, never through floats), and the harness made no node read for the record (the endpoint suite's offline pair-diff). With a node read the candidate is settled as graphql-oracle-decimal-zeros or goes back to the amount difference. A float-equal but decimal-unequal pair, or any other text, stays unexplained."
+status = "PROPOSED"
+accept_class = "stock-number-format"
+ruling = "WP-H2 report (#38); controller ruling 2026-11-25 14:39Z, harness H3 (allowlist entry for decimal-zeros-unchecked)."
+owner_note = "PROPOSED (controller ruling 2026-11-25 14:39Z, H3): stock pads the exact amount with zeros; checked on the two texts."
+doc = "docs/comparison.md#stock-number-text"
+
+[[entry]]
+id = "graphql-stock-float"
+route = "other"
+json_path_glob = "/~graphql-stock-float"
+condition = "any"
+request_contains = "graphql:"
+reason = "H3 (#38): stock's text of a numeric field (Transfer.amount, the balance(...) balances, any Float or Decimal field, a JSON number) is exactly the shortest text that round-trips the IEEE 754 double nearest ours' exact value (JavaScript's String(Number(x))), and differs from ours' value. Ours keeps the exact Pact decimal. A stock value one digit off that text, stock with more digits than ours, equal values in another form, and Block.nonce stay unexplained."
+status = "PROPOSED"
+accept_class = "stock-number-format"
+ruling = "WP-H2 report (#38: 26 transfers amounts, 19 balance keys); controller ruling 2026-11-25 14:39Z, harness H3 (stock-float rule)."
+owner_note = "PROPOSED (controller ruling 2026-11-25 14:39Z, H3): a stock fault (JS float), class 11 of the G4 catalogue; checked on the two texts."
+doc = "docs/comparison.md#stock-number-text"
+
+[[entry]]
 id = "rest-compose"
 route = "*"
 json_path_glob = "/~rest-compose"

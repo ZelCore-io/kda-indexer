@@ -80,8 +80,8 @@ def rejudge(rec, case, pd):
     ab, sb = _parse(ours_raw), _parse(stock_raw)
     codes = run.gql_error_codes(ab) if fam == "graphql" else []
     sh = shapes(ep, ab, sb)
-    ab, sb, aligned = run.normalize_pair(ep, ab, sb)
-    rq = req["path"] if fam != "graphql" else "%s %s" % (req.get("op", "op"), json.dumps(req.get("variables") or {}))
+    ab, sb, aligned = run.normalize_pair(ep, ab, sb, run.page_limit(ep, req))
+    rq = req["path"] if fam != "graphql" else run.gql_request(req)
     v = pd({"id": rec["id"], "kind": fam, "request": rq, "max": tip, "full": True,
             "ours": {"status": ours["st"], "body": ab}, "stock": {"status": stock["st"], "body": sb}})
     k, ids = run.verdict_class(ep, rec.get("cls"), v, codes, req.get("variables") or {}, rec.get("node"),

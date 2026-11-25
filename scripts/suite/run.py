@@ -754,7 +754,53 @@ def _nested_block_txs(b):
     return [(p, c) for p, c in _connections(b) if p.endswith("/transactions") and p != "/data/transactions"]
 
 
-def normalize_pair(ep, ab, sb):
+def gql_request(req):
+    """The request text pair-diff's allowlist reads for a GraphQL case: `graphql:<op> <variables>`
+    (the live harness's form, graphql.rs `gql_request`). H3: without the prefix no entry scoped
+    `request_contains = "graphql:"` matched (h9, r58, r57-json-object, the tie cut...)."""
+    return "graphql:%s %s" % (req.get("op", "op"), json.dumps(req.get("variables") or {}))
+
+
+GQL_DEFAULT_PAGE = 20       # docs/graphql.md: first/last omitted or 0
+V1TXS_DEFAULT_LIMIT = 50    # docs/api.md: /v1/txs/{account}/{namespace}/{limit}, default 50
+
+
+def page_limit(ep, req):
+    """H3: the page size the request asked for: `/v1/txs` its `{limit}` segment (0 or absent: the
+    default 50), a GraphQL list its `first` or `last` (absent or 0: the default 20)."""
+    if ep == "compat.v1txs":
+        segs = (req.get("path") or "").split("?")[0].split("/")[3:]
+        n = int(segs[2]) if len(segs) >= 3 and segs[2].isdigit() else 0
+        return n or V1TXS_DEFAULT_LIMIT
+    vars_ = req.get("variables") or {}
+    for k in ("first", "last"):
+        v = vars_.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+    return GQL_DEFAULT_PAGE
+
+
+def _at_limit(rows, limit, side, path):
+    """H3: a root list (no pageInfo or totalCount to prove it whole) as long as the page limit may
+    be cut there: its cut item, else None."""
+    if limit and isinstance(rows, (list, dict)) and len(rows) == limit:
+        return "%s:%s %d rows = page limit" % (side, path, limit)
+    return None
+
+
+def _common_only(ka, kb):
+    """H3: a cut keyed list compares only the rows both sides list; one-side rows of a cut page
+    are page artefacts, never set-diffed."""
+    both = set(ka) & set(kb)
+    for k in list(ka):
+        if k not in both:
+            del ka[k]
+    for k in list(kb):
+        if k not in both:
+            del kb[k]
+
+
+def normalize_pair(ep, ab, sb, limit=None):
     """Harness-side alignment before the diff; returns (ours, stock, info). info["cut"] names every
     list answered in part (the record is then `incomplete` at best); info["one_side"] names rows only
     one side lists (`one-side:<key>`), for the node check.
@@ -763,7 +809,9 @@ def normalize_pair(ep, ab, sb):
     - `balance(...)` edges compare as a map (chainId, module) -> exact decimal (WP-H1);
     - `/v1/txs` lists compare row by row, aligned by request key (WP-H1);
     - a block's nested `transactions` compares as a multiset by request key when both sides list
-      the whole block; a cut one is left as it is and the record is incomplete (WP-H1)."""
+      the whole block; a cut one is left as it is and the record is incomplete (WP-H1);
+    - H3: `limit` is the request's page size. A root `balance(...)` or `/v1/txs` list that long on
+      either side may be cut: the record is incomplete and only the rows both sides list compare."""
     info = {"cut": [], "one_side": [], "labels": []}
     if ep == "gql.fungibleChainAccounts":
         for b in (ab, sb):
@@ -772,17 +820,27 @@ def normalize_pair(ep, ab, sb):
                 xs.sort(key=lambda x: str((x or {}).get("chainId", "")).zfill(3) if isinstance(x, dict) else "")
     info["cut"] = page_cut(ab, "ours") + page_cut(sb, "stock")
     one = None
+    lim_cut = []
     if ep == "compat.v1txs":
+        lim_cut = [c for c in (_at_limit(ab, limit, "ours", ""), _at_limit(sb, limit, "stock", "")) if c]
         ka, kb = _v1txs_map(ab), _v1txs_map(sb)
         if ka is not None and kb is not None:
             ab, sb, one = ka, kb, (set(ka), set(kb))
+            if lim_cut:
+                _common_only(ka, kb)
     elif isinstance(_data(ab), dict) and isinstance(_data(sb), dict) and \
             "balance" in _data(ab) and "balance" in _data(sb):
+        lim_cut = [c for c in (_at_limit(((_data(ab)["balance"] or {}).get("edges")), limit, "ours", "/data/balance"),
+                               _at_limit(((_data(sb)["balance"] or {}).get("edges")), limit, "stock", "/data/balance"))
+                   if c] if isinstance(_data(ab)["balance"], dict) and isinstance(_data(sb)["balance"], dict) else []
         ka, kb = _balance_map(ab), _balance_map(sb)
         if ka is not None and kb is not None:
             one = (ka, kb)
+            if lim_cut:
+                _common_only(ab["data"]["balance"]["edges"], sb["data"]["balance"]["edges"])
         info["labels"] = _balance_text(ab if ka is not None else None, sb if kb is not None else None)
-    if one:
+    info["cut"] += lim_cut
+    if one and not lim_cut:
         info["one_side"] = ["one-side:%s" % k for k in sorted(one[0] ^ one[1])]
     # Fix round 1 (I3): a nested list compares as a multiset only when both sides prove it whole;
     # one that may be a first page (no hasNextPage false, no totalCount equal to its rows) is cut.
@@ -819,8 +877,9 @@ def tip_fields(node, idx, host, t0, t1):
 
 # Harness hits that mean only part of a list was compared (a common prefix after a page cut,
 # a capped count, a size limit): such a record is `incomplete`, never equal or accepted.
+# H3 ruling: a height tie cut at the page end (`graphql-r57-height-ties`) is a partial compare too.
 PARTIAL_HITS = {"/~graphql-page-cut", "/~graphql-totalcount-cap", "/~harness-limit/graphql-merged-bytes",
-                "/~graphql-short-page"}
+                "/~graphql-short-page", "/~graphql-r57-height-tie-cut"}
 # WP-H1: a nested list pair-diff could not finish (graphql_scope UNFINISHED_PATH, with a `#why`
 # suffix). Never known or accepted: alone it makes the record `incomplete`, never `diff`-free.
 UNFINISHED_HIT = "/~graphql-h6-unfinished"
@@ -1320,9 +1379,9 @@ class Runner:
                 elif load_error(s["status"]):
                     row["v"] = {"class": "stock-unavailable"}
                 elif s["status"] and a["status"]:
-                    ab, sb, aligned = normalize_pair(ep, ab, sb)
+                    ab, sb, aligned = normalize_pair(ep, ab, sb, page_limit(ep, req))
                     row["rows"] = [count_rows(ab), count_rows(sb)]      # rows compared (ours, stock)
-                    rq = req["path"] if fam != "graphql" else "%s %s" % (req.get("op", "op"), json.dumps(req["variables"]))
+                    rq = req["path"] if fam != "graphql" else gql_request(req)
                     v = self.pd({"id": case["id"], "kind": "graphql" if fam == "graphql" else "rest",
                                  "request": rq, "max": maxh, "full": True,
                                  "ours": {"status": a["status"], "body": ab},

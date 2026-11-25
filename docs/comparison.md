@@ -330,6 +330,20 @@ Not accepted: entries without a node read are open and their differences are rep
 `kdatxs-gap-cont-d7bf62`, `oracle-event-order`). Open entries, our own defects and known gaps
 match nothing.
 
+### Stock number text
+
+Accepted on the two texts alone, no node read (accept class `stock-number-format`). Ours keeps
+the exact Pact decimal; stock's text is a lossy or padded rendering of that same value:
+
+- stock float: stock's text is exactly the shortest text that round-trips the IEEE 754 double
+  nearest ours' exact value (what JavaScript's `String(Number(x))` gives), and that differs from
+  ours' value (`graphql-stock-float`; any numeric field: `Transfer.amount`, the `balance(...)`
+  balances). A stock value one digit off that text, or with more digits than ours, is reported.
+  Class 11 in the catalogue below; see [graphql.md](graphql.md#scalars);
+- zero padding: stock's amount is ours' text with zeros appended to the fraction, where the
+  harness has no node read for the record (`graphql-oracle-decimal-zeros-unchecked`; with a
+  node read it is `graphql-oracle-decimal-zeros` above).
+
 ### Endpoint suite rules
 
 The suite's own rules ([scripts/suite/allow.py](../scripts/suite/allow.py)) accept only:

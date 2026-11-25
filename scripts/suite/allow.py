@@ -281,6 +281,9 @@ TAG_CLASS = {
     "graphql-r57-height-ties": "intended-documented",
 }
 TAGS_ALLOWED = tuple(TAG_CLASS)
+# H3: the visible hit an entry's glob names where it is not the entry id (the tie-cut hit of
+# graphql-r57-height-ties never matched its tag before).
+TAG_HIT = {"graphql-r57-height-ties": "graphql-r57-height-tie-cut"}
 for _t, _c in TAG_CLASS.items():
     META["tag:" + _t] = (_c, _T1 % "7d (tag accepted in compare/allowlist.toml as %s, relayed with its class)" % _t)
 
@@ -597,7 +600,7 @@ RULES = [
          "Zero-balance chain rows the node holds but ours never saw a TRANSFER for (known gap) [triage 7d].",
          None, _gap_tag),
 ] + [Rule("tag:" + t, "KNOWN", "Harness hit already accepted in compare/allowlist.toml (entry %s), with that entry's "
-              "accept class %s [triage 7d]." % (t, c), None, _tag(t)) for t, c in TAG_CLASS.items()] + [
+              "accept class %s [triage 7d]." % (t, c), None, _tag(TAG_HIT.get(t, t))) for t, c in TAG_CLASS.items()] + [
     Rule("multi-block-order", "DOCUMENTED",
          "Multi-block newest-first lists (events, transactions, transfers) list a block's rows in node "
          "order, a coinbase after its block's txs; stock orders by tx creationTime. A page then holds other "

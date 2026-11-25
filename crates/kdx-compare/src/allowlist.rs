@@ -64,6 +64,10 @@ pub enum AcceptClass {
     StockSelfInconsistent,
     /// Stock lags or stopped (a configured cut, late fill); no node read.
     StockStale,
+    /// Stock's text of a value ours holds exactly is a lossy or padded rendering of it (the
+    /// shortest round-trip text of the nearest f64, zero padding); checked on the two texts
+    /// alone, no node read (H3).
+    StockNumberFormat,
     /// A comparison convention of the harness, listed in docs/methodology.md.
     HarnessConvention,
     /// Our own defect, tracked as a known gap (never intended).
@@ -79,6 +83,7 @@ impl AcceptClass {
             AcceptClass::TipTiming => "tip-timing",
             AcceptClass::StockSelfInconsistent => "stock-self-inconsistent",
             AcceptClass::StockStale => "stock-stale",
+            AcceptClass::StockNumberFormat => "stock-number-format",
             AcceptClass::HarnessConvention => "harness-convention",
             AcceptClass::OurDefect => "our-defect",
         }
@@ -689,6 +694,7 @@ mod tests {
                 AcceptClass::StockSelfInconsistent,
             ),
             ("stock-stale", AcceptClass::StockStale),
+            ("stock-number-format", AcceptClass::StockNumberFormat),
             ("harness-convention", AcceptClass::HarnessConvention),
             ("our-defect", AcceptClass::OurDefect),
         ] {
@@ -868,8 +874,9 @@ mod tests {
         assert_eq!(g.accept_class, AcceptClass::IntendedDocumented);
         let n = |pred: &dyn Fn(&Entry) -> bool| al.entries.iter().filter(|e| pred(e)).count();
         // H6: + 5 harness conventions anchored (S4, R-P5P9-171/172) + iso-same-instant (S5).
-        // WP-H1: + r58/r60 accepted on node samples.
-        assert_eq!(n(&|e| e.explains()), 50, "accepted");
+        // WP-H1: + r58/r60 accepted on node samples. H3: + graphql-stock-float and
+        // graphql-oracle-decimal-zeros-unchecked (stock-number-format, no node read).
+        assert_eq!(n(&|e| e.explains()), 52, "accepted");
         assert_eq!(n(&|e| e.is_open()), 26, "open");
         assert_eq!(n(&|e| e.status == Status::KnownGap), 2, "known gaps");
     }

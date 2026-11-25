@@ -65,6 +65,12 @@ Differences from Kadena graph:
   blocks with more transactions than one page, only the first page was compared in G4 (515
   records: the 51 above, and 464 whose lists never finished); the rest of those lists was not
   compared with stock. A full page-walk comparison is planned.
+- Row order across blocks (R-P5P9-151). Rows of different blocks are ordered by height, then
+  chain, then position in the block, newest first. The stock indexer orders them by the
+  transaction's `creationTime`. When a sender sets a `creationTime` older than another
+  transaction's in a lower block, the two lists order those rows differently, so `first: 1`
+  or `last: 1` can name another row on each side (both rows are canonical transfers of the
+  account).
 - Root fields of the stock indexer that are not in Kadena's schema are not served: the DEX
   fields `pools`, `dexMetrics` and `tokenPrices` (one real request asked for them in the G4
   replay) are unknown fields: the document answers `GRAPHQL_VALIDATION_FAILED` (HTTP 400, see

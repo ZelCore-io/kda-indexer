@@ -109,6 +109,7 @@ entry may accept a difference only with positive evidence; without it the record
 | `stock-wrong-node-evidence` | the node (or stock's own error) shows stock is wrong |
 | `stock-self-inconsistent` | stock contradicts itself: its own paging, cursor or count, or a re-fetch |
 | `stock-stale` | stock lags or stopped indexing (a configured cut, a late fill) |
+| `stock-number-format` | stock's text of a value ours holds exactly is its JavaScript double rounding or zero-padded; checked on the two texts |
 | `intended-documented` | a difference these docs state as intended |
 | `unsupported-by-design` | a feature the indexer does not offer |
 | `tip-timing` | every differing row lies between the two tips the node showed at the two reads |
