@@ -637,6 +637,18 @@ pub struct BalanceNode {
     pub balance: String,
 }
 
+/// The text `BalanceNode.balance` serves for a stored balance (the node's text, e.g.
+/// `2.101e-3` or `6184.514948000000000000000000000000`): the layout of JavaScript's
+/// `Number.prototype.toString`, as stock serves it, over the exact digits (never through
+/// f64). No trailing fraction zeros and no `.0` (`110970.000000000000` is `110970`, `0.0` is
+/// `0`); plain notation for 1e-6 <= |x| < 1e21 (`2.101e-3` is `0.002101`); exponent notation
+/// outside it (`1e-12`, `2.7397e-8`, `1.5e+21`). Every digit the node gave is kept, so a value
+/// with more than 17 significant digits differs from stock's float-rounded text in value, not
+/// in layout. A text that is not a plain decimal is served as stored.
+pub fn balance_text(stored: &str) -> String {
+    crate::scalars::js_number(stored)
+}
+
 /// A `balance` cursor: the `(module, chain)` of a row, as `bal1:<chain>:<module>` in
 /// base64url (rows are listed by module name, then chain).
 pub fn balance_cursor(module: &str, chain: u8) -> String {
@@ -755,7 +767,7 @@ pub async fn query_balance(
                 if module.as_ref().is_some_and(|x| *x != name) || hidden(view, m)? {
                     continue;
                 }
-                out.push((name, c, r.balance.clone()));
+                out.push((name, c, balance_text(&r.balance)));
             }
             Ok(out)
         })
@@ -807,7 +819,98 @@ pub async fn query_balance(
 
 #[cfg(test)]
 mod tests {
-    use super::decimal_sum;
+    use super::{balance_text, decimal_sum};
+
+    #[test]
+    fn balance_text_follows_stock_layout() {
+        for (stored, served) in [
+            // zero and whole numbers: no fraction, no `.0`
+            ("0", "0"),
+            ("0.0", "0"),
+            ("0.000000000000", "0"),
+            ("-0.0", "0"),
+            ("2", "2"),
+            ("2.0", "2"),
+            ("110970.000000000000", "110970"),
+            ("47500095.000000000000", "47500095"),
+            ("20000000000", "20000000000"),
+            // trailing fraction zeros dropped
+            ("6184.514948000000000000000000000000", "6184.514948"),
+            ("1.424282260000000000000000000000", "1.42428226"),
+            ("0.000021690000000000000000000000", "0.00002169"),
+            ("50075.391537750000", "50075.39153775"),
+            // scientific notation expanded inside 1e-7 < x < 1e21
+            ("2.101e-3", "0.002101"),
+            ("2.53e-6", "0.00000253"),
+            ("3.7e-5", "0.000037"),
+            ("9.40000001e-3", "0.00940000001"),
+            ("1e-6", "0.000001"),
+            ("9.9e-7", "9.9e-7"),
+            ("2.7026800518384e+7", "27026800.518384"),
+            ("5.499517958445245e+9", "5499517958.445245"),
+            ("1E2", "100"),
+            // very small: exponent notation, as stock (`1e-7` and below)
+            ("1e-7", "1e-7"),
+            ("0.0000001", "1e-7"),
+            ("1e-12", "1e-12"),
+            ("0.000000000001", "1e-12"),
+            ("0.000000000000000000000000000001", "1e-30"),
+            ("2.7397e-8", "2.7397e-8"),
+            ("0.000000027397000", "2.7397e-8"),
+            // every digit kept (no f64): 18+ significant digits, small and large
+            (
+                "0.000000000000481481481481481481481",
+                "4.81481481481481481481e-13",
+            ),
+            ("999999501272.013588926082", "999999501272.013588926082"),
+            ("1534374.999999999999", "1534374.999999999999"),
+            (
+                "1234567890.123456789012345678901234",
+                "1234567890.123456789012345678901234",
+            ),
+            (
+                "1234567890123456789012345678901234.5",
+                "1.2345678901234567890123456789012345e+33",
+            ),
+            ("123456789012345678901", "123456789012345678901"),
+            ("1234567890123456789012", "1.234567890123456789012e+21"),
+            ("1.5e21", "1.5e+21"),
+            // not a plain decimal: served as stored
+            ("", ""),
+            ("abc", "abc"),
+        ] {
+            assert_eq!(balance_text(stored), served, "{stored}");
+        }
+    }
+
+    /// Stored (ours, stock) text pairs of equal value from the G4 replay's `balance(...)`
+    /// records: ours' stored text now renders as stock's.
+    #[test]
+    fn balance_text_matches_stored_stock_pairs() {
+        for (ours, stock) in [
+            ("2.101e-3", "0.002101"),
+            ("2.277e-3", "0.002277"),
+            ("5.62e-3", "0.00562"),
+            ("1.1482e-3", "0.0011482"),
+            ("4.0532e-3", "0.0040532"),
+            ("9.743201e-2", "0.09743201"),
+            ("2.05e-4", "0.000205"),
+            ("6184.514948000000000000000000000000", "6184.514948"),
+            ("321.291985000000000000000000000000", "321.291985"),
+            ("940.129019906250000000000000000000", "940.12901990625"),
+            ("0.000994370000000000000000000000", "0.00099437"),
+            ("28202.257352331260", "28202.25735233126"),
+            ("110843.240113370000000000000000000000", "110843.24011337"),
+            ("110970.000000000000", "110970"),
+            ("10310.862583436989", "10310.862583436989"),
+            ("8400", "8400"),
+            ("0", "0"),
+            ("1e-12", "1e-12"),
+            ("2.7397e-8", "2.7397e-8"),
+        ] {
+            assert_eq!(balance_text(ours), stock, "{ours}");
+        }
+    }
 
     #[test]
     fn exact_decimal_sums() {
