@@ -1421,7 +1421,10 @@ const DEPLOY_LOOKUP_CANDIDATES: usize = 10_000;
 /// the height the index is built through or at or above a height a `rebuild-range` changed
 /// under it, or a module whose `first_height` lies below the deploy the index shows.
 pub fn walk_start_height(search_dir: &Path, modules: &[(String, u32)]) -> Option<u32> {
+    tracing::info!(dir = %search_dir.display(), modules = ?modules,
+        "balances: D3 walk start: deploy lookup");
     if modules.is_empty() {
+        tracing::warn!("balances: D3 walk start: no modules to look up");
         return None;
     }
     let s = match kdx_search::Searcher::open(search_dir, DEPLOY_LOOKUP_CANDIDATES) {
@@ -1472,6 +1475,8 @@ pub fn walk_start_height(search_dir: &Path, modules: &[(String, u32)]) -> Option
                 "balances: D3 walk start: deploy height not provable");
             return None;
         }
+        tracing::info!(module = %m, deploy, matches = c.hashes.len(),
+            "balances: D3 walk start: deploy found");
         floor = floor.min(deploy);
     }
     Some(floor)
