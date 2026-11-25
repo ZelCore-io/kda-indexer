@@ -598,10 +598,15 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
   reconciled balance is 0 is left out like a row the node reports absent, whether the
   account was funded once and drained or never funded on that chain. It is absent from
   `chainAccounts`, `fungibleChainAccounts`, `fungibleChainAccount`, the `…ByPublicKey` lists
-  and `balance(...)`, and an account whose rows are all at 0 answers `fungibleAccount: null`.
+  and `balance(...)`. The account itself still resolves: while it has any stored row the
+  node did not report absent, `fungibleAccount` and `node(id:)` for its `FungibleAccount` id
+  are non-null, with empty `chainAccounts` and `totalBalance` 0 when every row is at 0, so
+  its `transfers` and `transactions` stay reachable after it is drained. `node(id:)` for a
+  `FungibleChainAccount` id serves the stored row of that chain at 0 too (an id handed out
+  before the drain still resolves). With no stored row, both answer `null`.
   The native `/accounts/{account}/balances` and `/keys/{pubkey}/accounts` follow the same
-  rule ([api.md](api.md)). `Block.minerAccount` is the one exception: it serves the miner's
-  row whatever its balance. A row at 0 that a later block changed is listed again once its
+  rule ([api.md](api.md)). `Block.minerAccount` and the `FungibleChainAccount` node are the
+  exceptions: they serve the one stored row whatever its balance. A row at 0 that a later block changed is listed again once its
   re-read finds a balance above 0. The stock indexer has no single rule: in the G4 and WP-L
   replays it listed many zero rows that ours leaves out and left out some that an earlier
   build of ours listed (rows drained after they were funded), so either side can differ from

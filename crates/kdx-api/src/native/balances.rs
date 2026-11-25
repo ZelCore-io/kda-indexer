@@ -13,7 +13,8 @@
 //!   `as_of_height` null and `stale: true`.
 //! - Rows of a module marked not fungible (R-P5P9-8 #2) are left out.
 //! - `/accounts/{a}/balances` is paged by (module id, chain): `limit` 1..=100 (default 100),
-//!   `cursor` = `next_cursor`; a page may hold fewer items than `limit` (filtered keys).
+//!   `cursor` = `next_cursor`; rows left out are skipped before `limit`, so a page with a
+//!   `next_cursor` is full (unless the walk hit [`MAX_BALANCE_WALK`] keys).
 //! - `/keys/{pk}/accounts` lists only rows of `coin` and of modules confirmed `fungible-v2`
 //!   on the row's chain (I-6): another module's guard is the module's word, not the chain's.
 
@@ -63,6 +64,9 @@ fn row_json(
 }
 
 /// A dirty key with no usable row (M-4).
+/// Keys one `/accounts/{a}/balances` page reads at most (listed or not).
+const MAX_BALANCE_WALK: usize = 10_000;
+
 fn pending_json(module: &str, c: u8, r: Option<&BalanceRow>) -> Value {
     json!({
         "module": module,
@@ -130,62 +134,90 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
                 None => return list_response(view, vec![], None),
             }
         }
-        let from = match after {
+        let mut from = match after {
             // The smallest key above the cursor's (all keys are 9 bytes).
             Some((m, c)) => [&bal_key(a, m, c)[..], &[0]].concat(),
             None => prefix.clone(),
         };
-        // The first `limit + 1` keys of each table: their union holds the first `limit + 1`
-        // keys of the account in rows and marks together.
+        // Keys are walked in batches until `limit` items are listed and one more listed item
+        // is seen (it sets `next_cursor`), so rows left out (absent, at 0, other chain,
+        // hidden module) never make a page short while it carries a cursor (review minor 1).
+        // The walk stops after `MAX_BALANCE_WALK` keys; that page carries a cursor at the
+        // last key read.
         let n = limit as usize + 1;
-        let mut keys: BTreeMap<Vec<u8>, (Option<BalanceRow>, bool)> = BTreeMap::new();
-        for (k, v) in view
-            .txn
-            .scan_limit(Table::Balances, &from, n, |k| k.starts_with(&prefix))?
-        {
-            keys.entry(k).or_default().0 = BalanceRow::decode(&v);
-        }
-        for t in [Table::BalanceDirty, Table::BalanceSeed] {
-            for (k, _) in view
-                .txn
-                .scan_limit(t, &from, n, |k| k.starts_with(&prefix))?
-            {
-                keys.entry(k).or_default().1 = true;
-            }
-        }
         let mut hidden: HashMap<u32, bool> = HashMap::new();
         let mut items = Vec::new();
         let mut last = None;
-        for (k, (row, dirty)) in keys.iter().take(limit as usize) {
-            view.check_deadline()?;
-            let Some((_, m, c)) = balances::parse_bal_key(k) else {
-                continue;
-            };
-            last = Some((m, c));
-            if q.chain.is_some_and(|x| x != c) {
-                continue;
+        let mut more = false;
+        let mut walked = 0usize;
+        'walk: loop {
+            // The first `n` keys of each table: their union holds the first `n` keys of the
+            // account in rows and marks together.
+            let mut keys: BTreeMap<Vec<u8>, (Option<BalanceRow>, bool)> = BTreeMap::new();
+            for (k, v) in view
+                .txn
+                .scan_limit(Table::Balances, &from, n, |k| k.starts_with(&prefix))?
+            {
+                keys.entry(k).or_default().0 = BalanceRow::decode(&v);
             }
-            let hide = match hidden.get(&m) {
-                Some(&h) => h,
-                None => {
-                    let h = balances::token_row(&view.txn, m)?
-                        .is_some_and(|t| t.kind == KIND_NOT_FUNGIBLE);
-                    hidden.insert(m, h);
-                    h
+            for t in [Table::BalanceDirty, Table::BalanceSeed] {
+                for (k, _) in view
+                    .txn
+                    .scan_limit(t, &from, n, |k| k.starts_with(&prefix))?
+                {
+                    keys.entry(k).or_default().1 = true;
                 }
-            };
-            if hide {
-                continue;
             }
-            let module = d.name(DictKind::Module, m).unwrap_or_default().to_owned();
-            match row {
-                // A row the node holds at 0 is left out like an absent one (WP-L).
-                Some(r) if r.positive() => items.push(row_json(view, &module, a, m, c, r)?),
-                r if *dirty => items.push(pending_json(&module, c, r.as_ref())),
-                _ => {}
+            let end = keys.len() < n;
+            for (k, (row, dirty)) in keys.iter().take(n) {
+                view.check_deadline()?;
+                if walked >= MAX_BALANCE_WALK {
+                    more = true;
+                    break 'walk;
+                }
+                walked += 1;
+                from = [&k[..], &[0]].concat();
+                let Some((_, m, c)) = balances::parse_bal_key(k) else {
+                    continue;
+                };
+                if q.chain.is_some_and(|x| x != c) {
+                    continue;
+                }
+                let hide = match hidden.get(&m) {
+                    Some(&h) => h,
+                    None => {
+                        let h = balances::token_row(&view.txn, m)?
+                            .is_some_and(|t| t.kind == KIND_NOT_FUNGIBLE);
+                        hidden.insert(m, h);
+                        h
+                    }
+                };
+                // A row the node holds at 0 is left out like an absent one (WP-L), unless a
+                // later block touched it (then it waits for its read).
+                let listed = !hide && (row.as_ref().is_some_and(BalanceRow::positive) || *dirty);
+                if !listed {
+                    continue;
+                }
+                if items.len() == limit as usize {
+                    more = true;
+                    break 'walk;
+                }
+                let module = d.name(DictKind::Module, m).unwrap_or_default().to_owned();
+                items.push(match row {
+                    Some(r) if r.positive() => row_json(view, &module, a, m, c, r)?,
+                    r => pending_json(&module, c, r.as_ref()),
+                });
+                last = Some((m, c));
+            }
+            if end {
+                break;
             }
         }
-        let next = (keys.len() > limit as usize)
+        // At the walk cap with fewer than `limit` items, resume after the last key read.
+        if more && items.len() < limit as usize {
+            last = balances::parse_bal_key(&from[..from.len() - 1]).map(|(_, m, c)| (m, c));
+        }
+        let next = more
             .then_some(last)
             .flatten()
             .map(|(m, c)| format!("{m:08x}{c:02x}"));
@@ -290,7 +322,11 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
                 let Some(&(_, key_module)) = wanted.iter().find(|w| w.0 == m) else {
                     continue;
                 };
-                if !r.positive()
+                // One rule with `/accounts/{a}/balances`: a row absent or at 0 is left out
+                // unless a later block touched it; then it is listed waiting for its read
+                // (balance null, `stale: true`).
+                let dirty = balances::is_dirty(&view.txn, a, m, c)?;
+                if !(r.positive() || dirty)
                     || !balances::trusted(&view.txn, m, c, coin)?
                     || !balances::stored_guard_keys(&view.txn, &r.guard, c)?.contains(&pk)
                 {
@@ -299,9 +335,9 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
                 modules.push(json!({
                     "module": d.name(DictKind::Module, m).unwrap_or_default(),
                     "chain": c,
-                    "balance": r.balance,
+                    "balance": if r.positive() { Value::from(r.balance.as_str()) } else { Value::Null },
                     "as_of_height": r.as_of,
-                    "stale": r.unverified || balances::is_dirty(&view.txn, a, m, c)?,
+                    "stale": r.unverified || dirty,
                     "trusted": key_module,
                 }));
             }
@@ -392,6 +428,8 @@ mod key_accounts_tests {
         let evil = dict.intern(DictKind::Module, "free.evil");
         let a = dict.intern(DictKind::Account, "alice");
         let b = dict.intern(DictKind::Account, "bob");
+        let carol = dict.intern(DictKind::Account, "carol");
+        let dave = dict.intern(DictKind::Account, "dave");
         dict.persist(&mut w).unwrap();
         let guard = br#"{"keys":["k1"],"pred":"keys-all"}"#;
         let gh = guard_hash(guard);
@@ -426,6 +464,35 @@ mod key_accounts_tests {
         // never listed (WP-L concern 3).
         w.put(Table::Balances, &bal_key(a, coin, 1), &row("0.0").encode())
             .unwrap();
+        // carol: coin at 0 on chains 0..=5, 3 on chain 6 (paging skips the zero rows).
+        for c in 0..=6u8 {
+            let bal = if c == 6 { "3" } else { "0" };
+            w.put(
+                Table::Balances,
+                &bal_key(carol, coin, c),
+                &row(bal).encode(),
+            )
+            .unwrap();
+        }
+        // dave (guarded by `k2`): coin at 0 on chain 0 that a later block touched (dirty), so a
+        // re-read is queued.
+        let guard2 = br#"{"keys":["k2"],"pred":"keys-all"}"#;
+        let gh2 = guard_hash(guard2);
+        w.put(Table::Guards, &gh2, guard2).unwrap();
+        let dave_row = BalanceRow {
+            guard: gh2,
+            ..row("0.0")
+        };
+        w.put(Table::Balances, &bal_key(dave, coin, 0), &dave_row.encode())
+            .unwrap();
+        w.put(Table::BalanceDirty, &bal_key(dave, coin, 0), &[1])
+            .unwrap();
+        w.put(
+            Table::KeyAccounts,
+            &key_account_key(&key_hash("k2"), dave),
+            &[],
+        )
+        .unwrap();
         w.commit().unwrap();
         let store = Arc::new(Store::open(hot, d.path()).unwrap());
         let settings = ApiSettings {
@@ -534,6 +601,71 @@ mod key_accounts_tests {
             .map(|m| m["chain"].as_u64().unwrap())
             .collect();
         assert_eq!(chains, [0], "{v}");
+    }
+
+    async fn balances(st: &Arc<crate::ApiState>, account: &str, q: super::Q) -> Value {
+        let r = super::account_balances(State(st.clone()), Ok(Path(account.into())), Ok(Query(q)))
+            .await;
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The review's minor 1: rows at 0 are dropped before `limit`, so a page is never short
+    /// while it carries `next_cursor`, and the last listed row ends the walk.
+    #[tokio::test]
+    async fn balances_pages_skip_zero_rows_before_the_limit() {
+        let (_d, st) = fixture();
+        let q = |cursor: Option<String>| super::Q {
+            limit: Some(1),
+            cursor,
+            ..super::Q::default()
+        };
+        let v = balances(&st, "carol", q(None)).await;
+        let chains: Vec<u64> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["chain"].as_u64().unwrap())
+            .collect();
+        assert_eq!(chains, [6], "{v}");
+        assert_eq!(v["next_cursor"], Value::Null, "{v}");
+        // alice: coin on chain 0, free.evil on chain 0; her coin row at 0 on chain 1 sits
+        // between them and never makes a page short.
+        let v = balances(&st, "alice", q(None)).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["items"][0]["module"], "coin", "{v}");
+        let next = v["next_cursor"].as_str().expect("a next page").to_owned();
+        let v = balances(&st, "alice", q(Some(next))).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["items"][0]["module"], "free.evil", "{v}");
+        assert_eq!(v["next_cursor"], Value::Null, "{v}");
+    }
+
+    /// The review's minor 2: a row at 0 that a later block touched is listed as waiting for
+    /// its read (balance null, `stale: true`) on both routes, as api.md's one rule says.
+    #[tokio::test]
+    async fn a_dirty_zero_row_is_pending_on_both_routes() {
+        let (_d, st) = fixture();
+        let v = balances(&st, "dave", super::Q::default()).await;
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{v}");
+        assert_eq!(items[0]["balance"], Value::Null, "{v}");
+        assert_eq!(items[0]["stale"], true, "{v}");
+        let r = super::key_accounts(
+            State(st.clone()),
+            Ok(Path("k2".into())),
+            Ok(Query(super::Q::default())),
+        )
+        .await;
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{v}");
+        assert_eq!(items[0]["account"], "dave", "{v}");
+        let m = &items[0]["modules"][0];
+        assert_eq!(m["chain"], 0, "{v}");
+        assert_eq!(m["balance"], Value::Null, "{v}");
+        assert_eq!(m["stale"], true, "{v}");
     }
 
     #[tokio::test]
