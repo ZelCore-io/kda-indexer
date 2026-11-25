@@ -118,6 +118,8 @@ local_concurrency = 8      # /local calls in flight
 # Modules the key listing never reads, on any chain: the node blocks its cut while it answers a
 # `keys` of a huge table. Default ["free.crankk01"]; setting it replaces the default.
 # keylist_skip = ["free.crankk01"]
+# Threads that decode the D3 history walk of newly tracked tokens; 0 = cores less 2.
+# history_walk_threads = 0
 
 [metrics]
 textfile = "/var/lib/node_exporter/textfile_collector/kda_indexer_testnet.prom"   # optional

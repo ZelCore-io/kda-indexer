@@ -260,6 +260,7 @@ fn balances_opts(
             account_rows: b.account_rows,
             recheck_secs: b.recheck_hours.saturating_mul(3600),
             history_slice_txs: kdx_ingest::seed_receivers::HISTORY_SLICE_TXS,
+            history_walk_threads: b.history_walk_threads as usize,
         },
         keylist_skip: b.keylist_skip.clone(),
     };

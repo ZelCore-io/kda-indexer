@@ -478,6 +478,17 @@ fn row_hash(a: &str, m: &str, chain: u8) -> u64 {
     h.finish()
 }
 
+/// What one tx yields for a walk before any budget is applied: the uncapped rows, the capped
+/// candidates with their emitters (both filtered to the walk's modules), and (D3 main walk)
+/// the discovered modules. Reading it needs no [`Pending`], so the history walk extracts on
+/// worker threads and applies in TxNum order ([`apply`]).
+#[derive(Debug, Default)]
+struct Extracted {
+    pairs: Vec<(String, String)>,
+    capped: Vec<((String, String), String)>,
+    discovered: Vec<String>,
+}
+
 fn add(
     p: &mut Pending,
     k: TxKey,
@@ -486,9 +497,26 @@ fn add(
     w: &Walk,
     rep: &mut ReceiversReport,
 ) {
+    if let Some(x) = extract(k, r, dict, w, rep) {
+        apply(p, k, x, w, rep);
+    }
+}
+
+/// The rows and candidates of tx `k` ([`Extracted`]); `None` (counted and logged) when its
+/// record cannot be read. Touches only order-independent counters of `rep` (`modref_capped`,
+/// `discovered_too_long`, `errors`).
+fn extract(
+    k: TxKey,
+    r: &kdx_types::record::TxRecord,
+    dict: &MemDict,
+    w: &Walk,
+    rep: &mut ReceiversReport,
+) -> Option<Extracted> {
     let res = match w.rules {
-        Rules::D1 => record_receivers(r, dict, w.forks)
-            .map(|v| v.into_iter().map(|a| (a, "coin".to_owned())).collect()),
+        Rules::D1 => record_receivers(r, dict, w.forks).map(|v| Extracted {
+            pairs: v.into_iter().map(|a| (a, "coin".to_owned())).collect(),
+            ..Extracted::default()
+        }),
         Rules::D3 => {
             let is_token = |m: &str| w.tokens.contains(m);
             record_token_receivers(r, dict, w.forks, &is_token).map(|t| {
@@ -503,50 +531,28 @@ fn add(
                         "balances: D3 module-reference rows over the per-tx cap dropped"
                     );
                 }
+                let mut x = Extracted::default();
                 if w.only.is_none() {
                     rep.discovered_too_long += u64::from(t.discovered_too_long);
-                    for m in t.discovered.iter().filter(|m| !w.tokens.contains(*m)) {
-                        let key = (m.clone(), k.chain());
-                        let ns = balances::discover_namespace(m).to_owned();
-                        if let Some(e) = p.tokens.get_mut(&key) {
-                            *e = (*e).min(k.height());
-                        } else if p.queued_ns.get(&ns).copied().unwrap_or(0)
-                            >= MAX_DISCOVERED_PER_NAMESPACE
-                        {
-                            rep.discovered_namespace_dropped += 1;
-                            p.dropped_disc.entry(key).or_insert(k.height());
-                        } else if p.queued < MAX_DISCOVERED_PER_PASS {
-                            p.queued += 1;
-                            *p.queued_ns.entry(ns).or_insert(0) += 1;
-                            p.tokens.insert(key, k.height());
-                        } else {
-                            rep.discovered_dropped += 1;
-                            p.dropped_disc.entry(key).or_insert(k.height());
-                        }
-                    }
+                    x.discovered = t
+                        .discovered
+                        .into_iter()
+                        .filter(|m| !w.tokens.contains(m))
+                        .collect();
                 }
                 let keep = |m: &str| w.only.as_ref().is_none_or(|o| o.contains(m));
-                // Security review: budgets per tracked token, one shared bucket for untracked
-                // emitters, a global ceiling; events first, then exec rows.
-                let mut v: Vec<(String, String)> =
-                    t.pairs.into_iter().filter(|(_, m)| keep(m)).collect();
+                x.pairs = t.pairs.into_iter().filter(|(_, m)| keep(m)).collect();
                 let capped = t.event_pairs.into_iter().zip(t.event_emitters);
-                for (x, em) in capped.chain(t.exec_pairs.into_iter().zip(t.exec_emitters)) {
-                    if keep(&x.1) && take(p, w, rep, &em, row_hash(&x.0, &x.1, k.chain())) {
-                        v.push(x);
-                    }
-                }
-                v
+                x.capped = capped
+                    .chain(t.exec_pairs.into_iter().zip(t.exec_emitters))
+                    .filter(|(x, _)| keep(&x.1))
+                    .collect();
+                x
             })
         }
     };
     match res {
-        Ok(v) => {
-            for (a, m) in v.into_iter().filter(|(_, m)| readable(m)) {
-                let e = p.rows.entry((a, m, k.chain())).or_insert(0);
-                *e = (*e).max(k.height());
-            }
-        }
+        Ok(x) => Some(x),
         Err(e) => {
             rep.errors += 1;
             tracing::error!(
@@ -557,7 +563,42 @@ fn add(
                 error = %e,
                 "balances: receivers of a tx not readable (receivers pass error)"
             );
+            None
         }
+    }
+}
+
+/// Apply tx `k`'s [`Extracted`] to `p`: queue its discoveries, budget its capped candidates
+/// ([`take`], order-dependent: callers apply txs in walk order) and note its rows.
+fn apply(p: &mut Pending, k: TxKey, x: Extracted, w: &Walk, rep: &mut ReceiversReport) {
+    for m in x.discovered {
+        let key = (m, k.chain());
+        let ns = balances::discover_namespace(&key.0).to_owned();
+        if let Some(e) = p.tokens.get_mut(&key) {
+            *e = (*e).min(k.height());
+        } else if p.queued_ns.get(&ns).copied().unwrap_or(0) >= MAX_DISCOVERED_PER_NAMESPACE {
+            rep.discovered_namespace_dropped += 1;
+            p.dropped_disc.entry(key).or_insert(k.height());
+        } else if p.queued < MAX_DISCOVERED_PER_PASS {
+            p.queued += 1;
+            *p.queued_ns.entry(ns).or_insert(0) += 1;
+            p.tokens.insert(key, k.height());
+        } else {
+            rep.discovered_dropped += 1;
+            p.dropped_disc.entry(key).or_insert(k.height());
+        }
+    }
+    // Security review: budgets per tracked token, one shared bucket for untracked emitters, a
+    // global ceiling; events first, then exec rows.
+    let mut v = x.pairs;
+    for (x, em) in x.capped {
+        if take(p, w, rep, &em, row_hash(&x.0, &x.1, k.chain())) {
+            v.push(x);
+        }
+    }
+    for (a, m) in v.into_iter().filter(|(_, m)| readable(m)) {
+        let e = p.rows.entry((a, m, k.chain())).or_insert(0);
+        *e = (*e).max(k.height());
     }
 }
 
@@ -1488,6 +1529,69 @@ impl HistoryWalk {
         (self.st.next, self.st.hot)
     }
 
+    /// The D3 rules of this walk: its tokens' rows only, no miners, no discovery.
+    fn rules(&self, o: &Opts) -> Walk {
+        Walk {
+            rules: Rules::D3,
+            forks: o.forks,
+            tokens: self.tokens.clone(),
+            only: Some(self.names.clone()),
+            max_event_candidates: o.max_event_candidates,
+            max_untracked_candidates: o.max_untracked_candidates,
+            max_total_candidates: o.max_total_candidates,
+            max_exec_per_sender: o.max_exec_per_sender,
+            max_exec_candidates: o.max_exec_candidates,
+        }
+    }
+
+    fn report(&self) -> ReceiversReport {
+        ReceiversReport {
+            rules: Rules::D3,
+            from: 0,
+            to: self.st.upto,
+            ..ReceiversReport::default()
+        }
+    }
+
+    /// A slice's [`Pending`]: the walk's budget counters so far. The per-slice sets (`seen`,
+    /// `exec_senders`) start empty in every slice, sequential or parallel alike.
+    fn pending(&self) -> Pending {
+        Pending {
+            emitters: self.st.taken.clone().into_iter().collect(),
+            untracked: self.st.untracked,
+            exec_total: self.st.exec_total,
+            ..Pending::default()
+        }
+    }
+
+    /// Commit one slice: its marks and the walk's new state in one write txn; when `done`,
+    /// clear the walk's tokens from [`meta::D3_REWALK`].
+    fn commit(
+        &mut self,
+        hot: &HotStore,
+        dict: &Mutex<HotDict>,
+        mut p: Pending,
+        rep: &mut ReceiversReport,
+        done: bool,
+    ) -> Result<()> {
+        self.st.taken = p.emitters.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        self.st.untracked = p.untracked;
+        self.st.exec_total = p.exec_total;
+        p.state = Some(serde_json::to_vec(&self.st)?);
+        p.flush(hot, dict, (self.coin, meta::D3_REWALK_WALK), None, rep)?;
+        if done {
+            let mut txn = hot.rw()?;
+            for m in &self.st.ids {
+                balances::clear_rewalk(&mut txn, *m)?;
+            }
+            txn.del(Table::Meta, meta::D3_REWALK_WALK.as_bytes())?;
+            txn.set_meta(meta::D3_REWALK_AT, &now_unix().to_be_bytes())?;
+            txn.commit()?;
+            tracing::info!(tokens = ?self.names, "balances: D3 history walk done");
+        }
+        Ok(())
+    }
+
     /// Walk at most `max_txs` more txs below the done height, marking with the D3 rules for
     /// this walk's tokens only; the marks and the new position commit in one txn. The last
     /// slice clears the tokens from [`meta::D3_REWALK`].
@@ -1508,29 +1612,9 @@ impl HistoryWalk {
             o,
             ck: (self.coin, meta::D3_REWALK_WALK),
         };
-        let w = Walk {
-            rules: Rules::D3,
-            forks: o.forks,
-            tokens: self.tokens.clone(),
-            only: Some(self.names.clone()),
-            max_event_candidates: o.max_event_candidates,
-            max_untracked_candidates: o.max_untracked_candidates,
-            max_total_candidates: o.max_total_candidates,
-            max_exec_per_sender: o.max_exec_per_sender,
-            max_exec_candidates: o.max_exec_candidates,
-        };
-        let mut rep = ReceiversReport {
-            rules: Rules::D3,
-            from: 0,
-            to: self.st.upto,
-            ..ReceiversReport::default()
-        };
-        let mut p = Pending {
-            emitters: self.st.taken.clone().into_iter().collect(),
-            untracked: self.st.untracked,
-            exec_total: self.st.exec_total,
-            ..Pending::default()
-        };
+        let w = self.rules(o);
+        let mut rep = self.report();
+        let mut p = self.pending();
         let span = (0, self.st.upto);
         let mut txs = 0u64;
         let mut done = self.names.is_empty();
@@ -1567,27 +1651,217 @@ impl HistoryWalk {
                 self.st.hot = done;
             }
         }
-        self.st.taken = p.emitters.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        self.st.untracked = p.untracked;
-        self.st.exec_total = p.exec_total;
-        p.state = Some(serde_json::to_vec(&self.st)?);
-        p.flush(hot, dict, env.ck, None, &mut rep)?;
-        if done {
-            let mut txn = hot.rw()?;
-            for m in &self.st.ids {
-                balances::clear_rewalk(&mut txn, *m)?;
-            }
-            txn.del(Table::Meta, meta::D3_REWALK_WALK.as_bytes())?;
-            txn.set_meta(meta::D3_REWALK_AT, &now_unix().to_be_bytes())?;
-            txn.commit()?;
-            tracing::info!(tokens = ?self.names, "balances: D3 history walk done");
-        }
+        self.commit(hot, dict, p, &mut rep, done)?;
         Ok(HistoryStep {
             txs,
             done,
             tokens: self.st.ids.len() as u64,
             report: rep,
         })
+    }
+
+    /// [`HistoryWalk::step`] over up to [`HISTORY_ROUND_SLICES`] × `threads` frozen slices of
+    /// `max_txs` txs: `threads` workers read and decode slices in parallel, and this thread
+    /// applies them strictly in TxNum order, one write txn per slice (the same boundaries,
+    /// budgets and marks as that many sequential steps). The persisted cursor never passes an
+    /// unapplied slice. `stop` is polled by the workers every [`STOP_POLL_TXS`] txs and here
+    /// after each commit; a stopped round keeps the slices committed so far. The hot part, and
+    /// `threads` <= 1, run [`HistoryWalk::step`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_par(
+        &mut self,
+        hot: &HotStore,
+        dict: &Mutex<HotDict>,
+        segdir: &Path,
+        o: &Opts,
+        max_txs: u64,
+        threads: usize,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<HistoryStep> {
+        if threads <= 1 || self.names.is_empty() || self.st.hot {
+            return self.step(hot, dict, segdir, o, max_txs);
+        }
+        let max = max_txs.max(1);
+        let segs = Segments::open_without_filters(segdir, self.snap.clone())?;
+        let start = self.st.next.max(frozen_start(&segs, 0));
+        let end = segs
+            .last_txnum_below_height(self.st.upto)
+            .map_or(start, |t| t + 1);
+        if start >= end {
+            return self.step(hot, dict, segdir, o, max_txs);
+        }
+        let n = (end - start)
+            .div_ceil(max)
+            .min((threads * HISTORY_ROUND_SLICES) as u64) as usize;
+        let slice = |i: usize| {
+            let a = start + i as u64 * max;
+            (a, end.min(a + max))
+        };
+        let w = self.rules(o);
+        let span = (0, self.st.upto);
+        let mut total = HistoryStep {
+            tokens: self.st.ids.len() as u64,
+            report: self.report(),
+            ..HistoryStep::default()
+        };
+        let halt = std::sync::atomic::AtomicBool::new(false);
+        let halted = || stop() || halt.load(std::sync::atomic::Ordering::Relaxed);
+        let next_slice = std::sync::atomic::AtomicUsize::new(0);
+        let snap = self.snap.clone();
+        let r = std::thread::scope(|sc| -> Result<()> {
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Option<SliceOut>>)>();
+            for _ in 0..threads.min(n) {
+                let tx = tx.clone();
+                let (segs, snap, w, halted, next_slice) = (&segs, &*snap, &w, &halted, &next_slice);
+                sc.spawn(move || loop {
+                    let i = next_slice.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n || halted() {
+                        return;
+                    }
+                    let out = extract_slice(segs, snap, w, o, slice(i), span, halted);
+                    if tx.send((i, out)).is_err() {
+                        return;
+                    }
+                });
+            }
+            drop(tx);
+            // Applied in slice order; out-of-order results wait here (at most `n`).
+            let mut ready: BTreeMap<usize, Result<Option<SliceOut>>> = BTreeMap::new();
+            let mut want = 0usize;
+            let res = (|| -> Result<()> {
+                for (i, out) in rx.iter() {
+                    ready.insert(i, out);
+                    while let Some(out) = ready.remove(&want) {
+                        let Some(out) = out? else {
+                            return Ok(());
+                        };
+                        let mut p = self.pending();
+                        let mut rep = self.report();
+                        rep.absorb(&out.rep);
+                        for (k, x) in out.txs {
+                            apply(&mut p, k, x, &w, &mut rep);
+                        }
+                        let (_, b) = slice(want);
+                        self.st.next = b;
+                        self.st.hot = b >= end;
+                        self.commit(hot, dict, p, &mut rep, false)?;
+                        total.txs += b - slice(want).0;
+                        total.report.absorb(&rep);
+                        want += 1;
+                        if stop() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            // Stopped, failed or through: the workers end at their next poll.
+            halt.store(true, std::sync::atomic::Ordering::Relaxed);
+            res
+        });
+        r?;
+        Ok(total)
+    }
+}
+
+/// Slices per worker thread in one [`HistoryWalk::step_par`] round (bounds the decoded
+/// slices held in memory while an earlier one is still being applied).
+pub const HISTORY_ROUND_SLICES: usize = 4;
+/// Txs between two `stop` polls of a history walk worker.
+pub const STOP_POLL_TXS: u64 = 4096;
+
+/// The default worker threads of the history walk: the cores less 2 (ingest and the API keep
+/// theirs), at least 1.
+pub fn default_history_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .saturating_sub(2)
+        .max(1)
+}
+
+/// One frozen slice of a history walk, read and decoded by a worker: the txs that yield
+/// anything (in TxNum order), and the order-independent counters.
+struct SliceOut {
+    txs: Vec<(TxKey, Extracted)>,
+    rep: ReceiversReport,
+}
+
+/// Read and decode frozen TxNums `[a, b)` of a history walk (no [`Pending`]: budgets are
+/// applied later, in order). `None` when `halted` said stop.
+fn extract_slice(
+    segs: &Segments,
+    snap: &MemDict,
+    w: &Walk,
+    o: &Opts,
+    (a, b): (u64, u64),
+    (from, to): (u32, u32),
+    halted: &dyn Fn() -> bool,
+) -> Result<Option<SliceOut>> {
+    let mut out = SliceOut {
+        txs: Vec::new(),
+        rep: ReceiversReport::default(),
+    };
+    for t in a..b {
+        if (t - a).is_multiple_of(STOP_POLL_TXS) && halted() {
+            return Ok(None);
+        }
+        let Some(key) = segs.txkey(t) else {
+            continue;
+        };
+        if !(from..to).contains(&key.height()) {
+            continue;
+        }
+        if key.is_coinbase() {
+            // A history walk (`only` set) never injects miners.
+            debug_assert!(!miners(o, w, key));
+            continue;
+        }
+        match segs.tx(t)? {
+            Some(r) => {
+                if let Some(x) = extract(key, &r, snap, w, &mut out.rep) {
+                    if !(x.pairs.is_empty() && x.capped.is_empty() && x.discovered.is_empty()) {
+                        out.txs.push((key, x));
+                    }
+                }
+                out.rep.frozen_txs += 1;
+            }
+            None => {
+                out.rep.errors += 1;
+                tracing::error!(
+                    height = key.height(),
+                    chain = key.chain(),
+                    position = key.pos(),
+                    txnum = t,
+                    "balances: frozen tx has a key but no record (receivers pass error)"
+                );
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+impl ReceiversReport {
+    /// Add `o`'s counters (the ones a walk slice moves) to these.
+    fn absorb(&mut self, o: &ReceiversReport) {
+        self.hot_txs += o.hot_txs;
+        self.frozen_txs += o.frozen_txs;
+        self.candidates += o.candidates;
+        self.new_accounts += o.new_accounts;
+        self.dirty_inserted += o.dirty_inserted;
+        self.skipped_existing += o.skipped_existing;
+        self.skipped_module += o.skipped_module;
+        self.tokens_noted += o.tokens_noted;
+        self.event_candidates += o.event_candidates;
+        for (k, v) in &o.dropped_tokens {
+            *self.dropped_tokens.entry(k.clone()).or_insert(0) += v;
+        }
+        self.discovered_too_long += o.discovered_too_long;
+        self.modref_capped += o.modref_capped;
+        self.dropped_exec_sender += o.dropped_exec_sender;
+        self.dropped_exec_ceiling += o.dropped_exec_ceiling;
+        self.dropped_untracked += o.dropped_untracked;
+        self.dropped_ceiling += o.dropped_ceiling;
+        self.errors += o.errors;
     }
 }
 
