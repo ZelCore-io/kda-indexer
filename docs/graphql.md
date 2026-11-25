@@ -325,7 +325,8 @@ number open.
   before the user txs), then the user txs in payload order, each tx's events by ascending
   order index. Root lists with `blockHash` (and no `requestKey`) list their one block in
   the same order. The stock indexer orders a block's transactions otherwise, so the first
-  page of a block larger than the page holds other rows there (see Row order under
+  page of a block larger than the page can hold other rows there (seen in the 51
+  paged blocks compared in G4) (see Row order under
   [Schema](#schema)).
 - **Orphan blocks.** `blocksFromHeight` lists the canonical blocks only (the store keeps no
   others, and every block checked in the G4 replay matched the node's canonical header: 63,582 ok, 0 bad). The stock

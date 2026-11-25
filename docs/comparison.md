@@ -395,7 +395,7 @@ for, and nothing beyond it.
 | Per-token limit window | kda-txs `/v1/txs` (25 rows per token) | 2,803 (48 h) | checked | Compared inside the window. In one case stock missed 2 new rows and filled its 25 with older ones; the node confirmed ours. |
 | Big limits | chainweb-data `/txs/account?limit=200000` (`fluxteam`) | 35,594 | one account | Ours' full history (237 rows) against stock's recent window (27–32 rows); the node confirmed 10 of 10 sampled ours-only rows. Other accounts were not compared this way. |
 | "Incomplete" never reported | all per-family tables | – | gap | The harness flags answers that hit a page limit as incomplete, but no G4 table has that column. |
-| Ours only, no stock pair | `nonFungibleAccount` (stock crashes), `/txs/search` (stock hangs), `/txs/recent` (stale stock cache) | 374 + 40 + 36,720 | not compared | No stock answer and no node check in G4. |
+| Ours only, no stock pair | `nonFungibleAccount` (stock crashes), `/txs/search` (stock hangs), `/txs/recent` (stale cache on the test stock, whose refresh queries were hung) | 374 + 40 + 36,720 | not compared | No stock answer and no node check in G4. |
 | Changed after the replay | coinbase `gasLimit`, `lastTokenPriceInKda` | 45,584 + 242 | offline only | Fixed after the replay and checked against the stored answers only. |
 | Values compared in full | all balances | 1.21 M accounts | full, with exceptions | Every account was scanned against the node. Not checked: the 489 `lago` rows and the 23 non-ASCII rows, which the node cannot read. Still open: the 7 bridge rows and the zero-row gap. The 16 tip races were closed weakly (see Method). |
 
