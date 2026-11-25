@@ -2473,6 +2473,25 @@ class H3Harness(unittest.TestCase):
         self.assertEqual(run.page_limit("gql.lastBlockHeight", {"variables": {"first": 0}}), 20)
         self.assertEqual(run.page_limit("gql.lastBlockHeight", {}), 20)
 
+    def test_page_limit_reads_limit_as_the_server_does(self):
+        # Fix round 1: the query form, JavaScript Number() (hex, exponent, whole fractions), the
+        # 10,000 cap; a negative or fractional limit is a 404 (no list, no cut).
+        pl = lambda p: run.page_limit("compat.v1txs", {"path": p})  # noqa: E731
+        self.assertEqual(pl("/v1/txs?account=k:example&limit=1"), 1)
+        self.assertEqual(pl("/v1/txs/k:example/coin?limit=7"), 7)
+        self.assertEqual(pl("/v1/txs/k:example/coin/9?limit=7"), 9)     # the path segment wins
+        self.assertEqual(pl("/v1/txs/k:example/coin/0x10"), 16)
+        self.assertEqual(pl("/v1/txs/k:example/coin/2.0"), 2)
+        self.assertEqual(pl("/v1/txs/k:example/coin/1e2"), 100)
+        self.assertEqual(pl("/v1/txs/k:example/coin/20000"), 10000)
+        self.assertEqual(pl("/v1/txs/k:example/coin/Infinity"), 10000)
+        self.assertEqual(pl("/v1/txs/k:example/coin/%2010%20"), 10)
+        self.assertEqual(pl("/v1/txs/k:example/coin/abc"), 50)           # NaN: the default
+        self.assertEqual(pl("/v1/txs/k:example/coin/-0"), 50)
+        self.assertIsNone(pl("/v1/txs/k:example/coin/2.5"))
+        self.assertIsNone(pl("/v1/txs/k:example/coin/-1"))
+        self.assertEqual(pl("/v1/txs/k:example/coin/0x"), 50)             # "0x" alone: NaN
+
     def test_v1txs_at_the_limit_is_cut_and_not_set_diffed(self):
         a, b = _rows(50, 1), _rows(50)              # one-side rows R0 (stock) and R50 (ours)
         a2, b2, info = run.normalize_pair("compat.v1txs", a, b, 50)
@@ -2491,9 +2510,57 @@ class H3Harness(unittest.TestCase):
         a2, b2, _ = run.normalize_pair("compat.v1txs", _rows(50), b, 50)
         self.assertNotEqual(a2, b2)
 
+    def test_v1txs_one_side_cut_keeps_the_other_sides_rows(self):
+        # Fix round 1 (I-1): stock at the limit, ours short (whole): stock-only rows are real
+        # "ours lacks a row" candidates and stay one-side; ours-only rows go (stock is cut).
+        a, b = _rows(12) + [{"requestKey": "OURS", "x": 0}], _rows(50)
+        a2, b2, info = run.normalize_pair("compat.v1txs", a, b, 50)
+        self.assertEqual(info["cut"], ["stock: 50 rows = page limit"])
+        self.assertEqual(info["one_side"], sorted("one-side:R%d" % i for i in range(12, 50)))
+        self.assertNotIn("OURS", a2)
+        self.assertIn("R49", b2)
+        # the reverse: ours at the limit, stock short
+        a2, b2, info = run.normalize_pair("compat.v1txs", _rows(50), _rows(12) + [{"requestKey": "STOCK"}], 50)
+        self.assertEqual(info["cut"], ["ours: 50 rows = page limit"])
+        self.assertEqual(info["one_side"], sorted("one-side:R%d" % i for i in range(12, 50)))
+        self.assertNotIn("STOCK", b2)
+        self.assertIn("R49", a2)
+        # both cut: neither side's one-side rows stay
+        a2, b2, info = run.normalize_pair("compat.v1txs", _rows(50, 1), _rows(50), 50)
+        self.assertEqual((info["one_side"], a2 == b2), ([], True))
+
+    def test_balance_one_side_cut_and_hasnextpage_false_is_whole(self):
+        # Fix round 1 (I-1), the shape of gql.lastBlockHeight:1000102: stock at the limit
+        # (hasNextPage true), ours short and whole (hasNextPage false).
+        srows = [(str(c), "m%d" % c, "1") for c in range(200)]
+        a = _bal(("0", "m0", "1"), ("0", "ours-only", "3"), nxt=False)
+        b = _bal(*srows, nxt=True)
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", a, b, 200)
+        self.assertIn("stock:/data/balance 200 rows = page limit", info["cut"])
+        self.assertFalse(any(c.startswith("ours:") for c in info["cut"]))
+        self.assertEqual(len(info["one_side"]), 199)                   # stock-only rows stay
+        self.assertNotIn("one-side:0|ours-only", info["one_side"])
+        self.assertNotIn("0|ours-only", a2["data"]["balance"]["edges"])
+        self.assertIn("199|m199", b2["data"]["balance"]["edges"])
+        # the reverse: ours at the limit (no pageInfo proof), stock short and whole
+        a = _bal(*srows, nxt=None)
+        b = _bal(("0", "m0", "1"), ("0", "stock-only", "3"), nxt=False)
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", a, b, 200)
+        self.assertEqual(info["cut"], ["ours:/data/balance 200 rows = page limit"])
+        self.assertEqual(len(info["one_side"]), 199)                   # ours-only rows stay
+        self.assertNotIn("0|stock-only", b2["data"]["balance"]["edges"])
+        # at the limit with hasNextPage false on both sides: whole, a plain set compare
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", _bal(*srows), _bal(*srows[1:], ("0", "x", "1")), 200)
+        self.assertEqual((info["cut"], info["one_side"]), ([], ["one-side:0|m0", "one-side:0|x"]))
+        # both cut: only the rows both list compare
+        a2, b2, info = run.normalize_pair("gql.lastBlockHeight", _bal(*srows, nxt=True),
+                                          _bal(*srows[1:], ("0", "x", "1"), nxt=True), 200)
+        self.assertEqual(info["one_side"], [])
+        self.assertEqual(set(a2["data"]["balance"]["edges"]), set(b2["data"]["balance"]["edges"]))
+
     def test_balance_at_the_default_limit_is_cut(self):
         rows = [(str(c), "coin", "1") for c in range(20)]
-        a, b = _bal(*rows), _bal(*rows[1:], ("0", "other", "2"))
+        a, b = _bal(*rows, nxt=None), _bal(*rows[1:], ("0", "other", "2"), nxt=None)
         a2, b2, info = run.normalize_pair("gql.lastBlockHeight", a, b, 20)
         self.assertEqual(info["cut"], ["ours:/data/balance 20 rows = page limit",
                                        "stock:/data/balance 20 rows = page limit"])

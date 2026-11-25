@@ -114,6 +114,33 @@ pub fn js_number_text(f: f64) -> String {
     }
 }
 
+/// Fields where ours' whole number at or above 2^53 may face stock's JS double
+/// (`Block.difficulty` is a BigInt stock serves as a double; `amount` and the Float/Decimal
+/// fields hold any decimal). Another integer field that large is exact on both sides.
+pub const STOCK_FLOAT_WHOLE_FIELDS: &[&str] = &[
+    "difficulty",
+    "amount",
+    "balanceExact",
+    "balance",
+    "totalBalance",
+    "coinsInCirculation",
+    "networkHashRate",
+    "totalDifficulty",
+    "gasPrice",
+];
+
+/// A whole number (no fractional digits other than zeros) whose size is at or above 2^53.
+fn big_whole(v: &Value) -> bool {
+    let Some((_, d, e)) = decimal_value(v) else {
+        return false;
+    };
+    let whole = e >= 0 || {
+        let k = e.unsigned_abs() as usize;
+        d.len() > k && d.bytes().skip(d.len() - k).all(|c| c == b'0')
+    };
+    whole && num_f64(v).is_some_and(|f| f.abs() >= BIG)
+}
+
 /// H3 stock-float rule (#38): stock's text is exactly the shortest round-trip text of the f64
 /// nearest ours' exact decimal value, and ours' value differs from it (ours is exact, stock
 /// went through a JavaScript double). A stock JSON number compares by its value against that
@@ -701,12 +728,15 @@ pub fn explain<'r>(
         // H3: a stock float on any other numeric field (ours exact, stock its JS double's
         // text): a Float/Decimal field, the suite's exact `balanceExact`, or a JSON number of
         // ours. `nonce` stays exact (R-P5P9-58).
+        // Fix round 1: ours' whole numbers at or above 2^53 only on the listed fields (an
+        // integer count or limit there is exact, never a JS double).
         let key = path.rsplit('/').next().unwrap_or("");
         let numeric = FLOAT_FIELDS.contains(&key)
             || key == "balanceExact"
             || matches!(a, Value::Number(_))
             || a.as_str().is_some_and(|s| s.starts_with('#'));
-        if numeric && key != "nonce" && stock_float(a, b) {
+        let big_whole_ok = !big_whole(a) || STOCK_FLOAT_WHOLE_FIELDS.contains(&key);
+        if numeric && key != "nonce" && big_whole_ok && stock_float(a, b) {
             return Some(STOCK_FLOAT_PATH);
         }
         if let (Some(x), Some(y)) = (num_f64(a), num_f64(b)) {
@@ -1843,6 +1873,45 @@ mod tests {
             e(p, &s("982.05249349845854"), &s("982.0524934984585")),
             Some(STOCK_FLOAT_PATH)
         );
+    }
+
+    /// H3 fix round 1 (minor): ours' whole numbers at or above 2^53 are a stock float only on
+    /// the fields listed in [`STOCK_FLOAT_WHOLE_FIELDS`] (`difficulty`, the Float/Decimal
+    /// fields); any other integer field (a count, a gas limit) and `nonce` are not.
+    #[test]
+    fn h3_stock_float_big_whole_numbers_only_on_listed_fields() {
+        let none: [FieldRule; 0] = [];
+        let e = explain(&none, false);
+        let (ours, stock) = (
+            json!("#1308071046363245969e0"),
+            json!("#1308071046363246e3"),
+        );
+        for p in [
+            "/data/block/difficulty",
+            "/data/x/totalDifficulty",
+            "/data/x/edges/0/node/amount",
+        ] {
+            assert_eq!(e(p, &ours, &stock), Some(STOCK_FLOAT_PATH), "{p}");
+        }
+        for p in [
+            "/data/x/gasLimit",
+            "/data/x/totalCount",
+            "/data/block/nonce",
+        ] {
+            assert_ne!(e(p, &ours, &stock), Some(STOCK_FLOAT_PATH), "{p}");
+        }
+        // The same whole value written with a zero fraction is still whole.
+        let ours2 = json!("#13080710463632459690e-1");
+        assert_ne!(
+            e("/data/x/gasLimit", &ours2, &stock),
+            Some(STOCK_FLOAT_PATH)
+        );
+        // A fractional JSON number of ours on an unlisted field still is a stock float.
+        let (f, g) = (
+            json!("#98205249349845854e-14"),
+            json!("#9820524934984585e-13"),
+        );
+        assert_eq!(e("/data/x/someFloat", &f, &g), Some(STOCK_FLOAT_PATH));
     }
 
     /// R-P5P9-60 amendment 2: `transfers.amount`, the oracle's f64-rounded string against

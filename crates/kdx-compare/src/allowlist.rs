@@ -796,9 +796,11 @@ mod tests {
     /// WP-H1: r58/r60 are accepted on node samples taken when the rule was made, as
     /// docs/comparison.md says, not on a per-record read. Fix round 1 (M5): the ids are listed
     /// here, so a new entry cannot accept itself by copying the note text.
-    const NODE_SAMPLED: [&str; 2] = [
+    /// H3 fix round 1 (I-2): + graphql-stock-float.
+    const NODE_SAMPLED: [&str; 3] = [
         "graphql-r58-oracle-empty",
         "graphql-r60-oracle-strips-quotes",
+        "graphql-stock-float",
     ];
 
     fn node_sampled(e: &super::Entry) -> bool {
@@ -822,6 +824,38 @@ mod tests {
             .unwrap_or("")
             .contains("accepted on node samples"));
         assert!(!node_sampled(&copy), "note text alone must not accept");
+    }
+
+    /// H3 fix round 1 (I-2): `graphql-stock-float` assumes ours is exact, so like r58/r60 it
+    /// names the node samples it is accepted on (the PR #43 review's 7 reads, node = ours) and
+    /// says the live harness is to settle it on the node.
+    #[test]
+    fn stock_float_names_its_node_samples() {
+        let al = shipped();
+        let e = al
+            .entries
+            .iter()
+            .find(|e| e.id == "graphql-stock-float")
+            .expect("stock-float shipped");
+        assert!(node_sampled(e));
+        let n = e.node_read.as_deref().unwrap_or("");
+        assert!(
+            n.starts_with("none per record: accepted on node samples"),
+            "{n}"
+        );
+        for id in [
+            "1000102",
+            "1000307",
+            "1000233",
+            "1000132",
+            "685388947356166987",
+            "29046884679448214",
+            "761416373318673587",
+        ] {
+            assert!(n.contains(id), "{id} missing: {n}");
+        }
+        assert!(n.contains("live harness"), "{n}");
+        assert!(e.reason.contains("plain float text"), "{}", e.reason);
     }
 
     /// H5 (b): a stock fault is accepted only with per-record node evidence in code. Each

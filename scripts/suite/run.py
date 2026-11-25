@@ -765,13 +765,54 @@ GQL_DEFAULT_PAGE = 20       # docs/graphql.md: first/last omitted or 0
 V1TXS_DEFAULT_LIMIT = 50    # docs/api.md: /v1/txs/{account}/{namespace}/{limit}, default 50
 
 
+V1TXS_MAX_LIMIT = 10_000   # docs/api.md: capped at 10,000
+_JS_DEC_RE = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\Z")
+_JS_RADIX = {"x": (16, "0123456789abcdefABCDEF"), "o": (8, "01234567"), "b": (2, "01")}
+
+
+def _js_number(s):
+    """JavaScript `Number(s)` as the server reads `limit` (kdx-api v1txs.rs `js_number`)."""
+    t = s.strip()
+    if not t:
+        return 0.0
+    r = _JS_RADIX.get(t[1:2].lower()) if len(t) > 2 and t[0] == "0" else None
+    if r:
+        if not all(c in r[1] for c in t[2:]):
+            return math.nan
+        try:
+            return float(int(t[2:], r[0]))
+        except OverflowError:
+            return math.inf
+    if t in ("Infinity", "+Infinity"):
+        return math.inf
+    if t == "-Infinity":
+        return -math.inf
+    return float(t) if _JS_DEC_RE.match(t) else math.nan
+
+
+def _resolve_limit(n):
+    """kdx-api v1txs.rs `resolve_limit`: NaN or 0 -> 50, capped at 10,000; a negative or
+    fractional value is a 404 (None: no list, so no cut)."""
+    if math.isnan(n) or n == 0:
+        return V1TXS_DEFAULT_LIMIT
+    n = min(n, V1TXS_MAX_LIMIT)
+    if n < 0 or n != int(n):
+        return None
+    return int(n)
+
+
 def page_limit(ep, req):
-    """H3: the page size the request asked for: `/v1/txs` its `{limit}` segment (0 or absent: the
-    default 50), a GraphQL list its `first` or `last` (absent or 0: the default 20)."""
+    """H3: the page size the request asked for: `/v1/txs` its `limit` read as the server reads it
+    (fix round 1: the path segment, else the `?limit=` query value; JavaScript `Number()`; NaN or 0
+    the default 50; capped at 10,000; None where the server answers 404), a GraphQL list its
+    `first` or `last` (absent or 0: the default 20)."""
     if ep == "compat.v1txs":
-        segs = (req.get("path") or "").split("?")[0].split("/")[3:]
-        n = int(segs[2]) if len(segs) >= 3 and segs[2].isdigit() else 0
-        return n or V1TXS_DEFAULT_LIMIT
+        path, _, query = (req.get("path") or "").partition("?")
+        segs = path.split("/")[3:]
+        seg = urllib.parse.unquote(segs[2]) if len(segs) >= 3 else ""
+        if not seg:
+            seg = next((v for k, v in urllib.parse.parse_qsl(query, keep_blank_values=True) if k == "limit"), "")
+        return _resolve_limit(_js_number(seg))
     vars_ = req.get("variables") or {}
     for k in ("first", "last"):
         v = vars_.get(k)
@@ -780,24 +821,23 @@ def page_limit(ep, req):
     return GQL_DEFAULT_PAGE
 
 
-def _at_limit(rows, limit, side, path):
-    """H3: a root list (no pageInfo or totalCount to prove it whole) as long as the page limit may
-    be cut there: its cut item, else None."""
-    if limit and isinstance(rows, (list, dict)) and len(rows) == limit:
+def _at_limit(rows, limit, side, path, whole=False):
+    """H3: a root list as long as the page limit may be cut there: its cut item, else None. Fix
+    round 1 (I-1): a list that proves itself whole (`hasNextPage` false) is never cut."""
+    if limit and not whole and isinstance(rows, (list, dict)) and len(rows) == limit:
         return "%s:%s %d rows = page limit" % (side, path, limit)
     return None
 
 
-def _common_only(ka, kb):
-    """H3: a cut keyed list compares only the rows both sides list; one-side rows of a cut page
-    are page artefacts, never set-diffed."""
+def _drop_one_side(ka, kb, ours_cut, stock_cut):
+    """Fix round 1 (I-1): rows one side lists may be page artefacts only when the OTHER side is
+    cut: ours-only rows go when stock is cut, stock-only rows when ours is cut. A one-side row
+    facing a whole list stays, a real "lacks a row" candidate."""
     both = set(ka) & set(kb)
-    for k in list(ka):
-        if k not in both:
-            del ka[k]
-    for k in list(kb):
-        if k not in both:
-            del kb[k]
+    for m, other_cut in ((ka, stock_cut), (kb, ours_cut)):
+        if other_cut:
+            for k in [k for k in m if k not in both]:
+                del m[k]
 
 
 def normalize_pair(ep, ab, sb, limit=None):
@@ -811,7 +851,10 @@ def normalize_pair(ep, ab, sb, limit=None):
     - a block's nested `transactions` compares as a multiset by request key when both sides list
       the whole block; a cut one is left as it is and the record is incomplete (WP-H1);
     - H3: `limit` is the request's page size. A root `balance(...)` or `/v1/txs` list that long on
-      either side may be cut: the record is incomplete and only the rows both sides list compare."""
+      either side may be cut, and the record is incomplete. Fix round 1 (I-1): a `balance(...)`
+      side with `hasNextPage` false is whole (never cut; true is cut at any length), and only the
+      OTHER side's one-side rows are dropped: ours-only rows when stock is cut, stock-only rows
+      when ours is cut. One-side rows facing a whole list stay in `one_side`."""
     info = {"cut": [], "one_side": [], "labels": []}
     if ep == "gql.fungibleChainAccounts":
         for b in (ab, sb):
@@ -825,22 +868,29 @@ def normalize_pair(ep, ab, sb, limit=None):
         lim_cut = [c for c in (_at_limit(ab, limit, "ours", ""), _at_limit(sb, limit, "stock", "")) if c]
         ka, kb = _v1txs_map(ab), _v1txs_map(sb)
         if ka is not None and kb is not None:
-            ab, sb, one = ka, kb, (set(ka), set(kb))
-            if lim_cut:
-                _common_only(ka, kb)
+            ab, sb = ka, kb
+            _drop_one_side(ka, kb, any(c.startswith("ours:") for c in lim_cut),
+                           any(c.startswith("stock:") for c in lim_cut))
+            one = (set(ka), set(kb))
     elif isinstance(_data(ab), dict) and isinstance(_data(sb), dict) and \
             "balance" in _data(ab) and "balance" in _data(sb):
-        lim_cut = [c for c in (_at_limit(((_data(ab)["balance"] or {}).get("edges")), limit, "ours", "/data/balance"),
-                               _at_limit(((_data(sb)["balance"] or {}).get("edges")), limit, "stock", "/data/balance"))
-                   if c] if isinstance(_data(ab)["balance"], dict) and isinstance(_data(sb)["balance"], dict) else []
+        ca, cb = _data(ab)["balance"], _data(sb)["balance"]
+        if isinstance(ca, dict) and isinstance(cb, dict):
+            # Fix round 1 (I-1): `hasNextPage` false proves a side whole; true makes it cut.
+            nxt = [(c.get("pageInfo") or {}).get("hasNextPage") if isinstance(c.get("pageInfo"), dict) else None
+                   for c in (ca, cb)]
+            lim_cut = [c for c in (_at_limit(ca.get("edges"), limit, "ours", "/data/balance", nxt[0] is False),
+                                   _at_limit(cb.get("edges"), limit, "stock", "/data/balance", nxt[1] is False)) if c]
+            cut_side = [nxt[0] is True or any(c.startswith("ours:") for c in lim_cut),
+                        nxt[1] is True or any(c.startswith("stock:") for c in lim_cut)]
         ka, kb = _balance_map(ab), _balance_map(sb)
         if ka is not None and kb is not None:
-            one = (ka, kb)
-            if lim_cut:
-                _common_only(ab["data"]["balance"]["edges"], sb["data"]["balance"]["edges"])
+            ea, eb = ab["data"]["balance"]["edges"], sb["data"]["balance"]["edges"]
+            _drop_one_side(ea, eb, *cut_side)
+            one = (set(ea), set(eb))
         info["labels"] = _balance_text(ab if ka is not None else None, sb if kb is not None else None)
     info["cut"] += lim_cut
-    if one and not lim_cut:
+    if one:
         info["one_side"] = ["one-side:%s" % k for k in sorted(one[0] ^ one[1])]
     # Fix round 1 (I3): a nested list compares as a multiset only when both sides prove it whole;
     # one that may be a first page (no hasNextPage false, no totalCount equal to its rows) is cut.
