@@ -1426,7 +1426,11 @@ pub fn walk_start_height(search_dir: &Path, modules: &[(String, u32)]) -> Option
     }
     let s = match kdx_search::Searcher::open(search_dir, DEPLOY_LOOKUP_CANDIDATES) {
         Ok(Some(s)) => s,
-        Ok(None) => return None,
+        Ok(None) => {
+            tracing::warn!(dir = %search_dir.display(),
+                "balances: D3 walk start: no code search index (no manifest)");
+            return None;
+        }
         Err(e) => {
             tracing::warn!(error = %e, "balances: D3 walk start: code search index unreadable");
             return None;
@@ -1449,8 +1453,15 @@ pub fn walk_start_height(search_dir: &Path, modules: &[(String, u32)]) -> Option
                 "balances: D3 walk start: deploy lookup truncated");
             return None;
         }
-        let deploy = c.hashes.iter().map(|(_, f, _)| *f).min()?;
-        let deploy = u32::try_from(deploy).ok()?;
+        let Some(deploy) = c.hashes.iter().map(|(_, f, _)| *f).min() else {
+            tracing::warn!(module = %m, examined = c.examined,
+                "balances: D3 walk start: no deploy body matches");
+            return None;
+        };
+        let Ok(deploy) = u32::try_from(deploy) else {
+            tracing::warn!(module = %m, deploy, "balances: D3 walk start: deploy height out of range");
+            return None;
+        };
         let built = s.manifest.built_through_height;
         if deploy > built
             || s.manifest.stale_from_height.is_some_and(|h| deploy >= h)
