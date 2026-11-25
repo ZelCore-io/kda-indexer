@@ -211,6 +211,9 @@ pub enum IndexPath {
         capped: bool,
         /// The index trails the tip or is marked stale (see `search::lagging`).
         lagging: bool,
+        /// The index holds every body the pattern can match (`search::index_covers`), read
+        /// from the same snapshot as the hits.
+        covers: bool,
     },
     /// The candidate query ran out of time.
     Timeout,
@@ -244,6 +247,7 @@ pub fn index_path(
         .or(s.manifest.stale_from_height)
         .is_some();
     let lagging = lagging(tip, built_through) || stale;
+    let covers = index_covers(&s.manifest, raw);
     let w = kdx_search::Window {
         lo: u64::from(min.unwrap_or(0)),
         hi: max.map_or(u64::MAX, u64::from),
@@ -268,6 +272,7 @@ pub fn index_path(
                 rebuilt_through: s.manifest.rebuilt_through_height,
                 capped: c.truncated,
                 lagging,
+                covers,
             }
         }
         Err(kdx_search::SearchError::Timeout) => {
@@ -318,17 +323,20 @@ pub fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiR
     // concern 1): on a large store the bounded scan rarely reaches them within its budget and
     // answered an empty list. With no hits the scan runs as before (it finds the short bodies
     // a fallback index leaves out).
-    let covers = ctx
-        .index
-        .get()
-        .is_some_and(|s| index_covers(&s.manifest, raw));
+    // `covers` and the hits come from one index snapshot (`index_path`), so a swap between
+    // two reads can never serve fallback hits without the truncated mark.
     let path = index_path(view, ctx, raw, (pg.min_height, max_h), until);
     let (partial, no_hits) = match &path {
-        IndexPath::Hits { hits, lagging, .. } => {
+        IndexPath::Hits {
+            hits,
+            lagging,
+            covers,
+            ..
+        } => {
             if *lagging {
                 rejected("lag");
             }
-            (*lagging || !covers, hits.is_empty())
+            (*lagging || !*covers, hits.is_empty())
         }
         _ => (false, false),
     };

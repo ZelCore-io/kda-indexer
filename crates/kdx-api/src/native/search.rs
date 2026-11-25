@@ -36,7 +36,7 @@ use super::{
 use crate::compat::search::{half_left, index_path, IndexPath};
 use crate::compat::Paging;
 use crate::cursor::Cursor;
-use crate::search::{check_pattern, index_covers, literal_chars, rejected, ClientIp, SearchCtx};
+use crate::search::{check_pattern, literal_chars, rejected, ClientIp, SearchCtx};
 use crate::server::json;
 use crate::store::{code_hit, PostingQuery};
 use crate::{ApiError, ApiResult};
@@ -124,14 +124,15 @@ pub async fn code(
                 (m, b) => m.or(b.map(|b| b.height())),
             };
             let window = (lp.min_height, max_h);
-            let (hits, rebuilt_through, capped, lagging) =
+            let (hits, rebuilt_through, capped, partial) =
                 match index_path(view, &ctx, &pat, window, until) {
                     IndexPath::Hits {
                         hits,
                         rebuilt_through,
                         capped,
                         lagging,
-                    } => (hits, rebuilt_through, capped, lagging),
+                        covers,
+                    } => (hits, rebuilt_through, capped, lagging || !covers),
                     IndexPath::Timeout => {
                         return Ok(json(&json!({
                             "items": [], "next_cursor": null, "truncated": true,
@@ -142,11 +143,6 @@ pub async fn code(
                         return Err(ApiError::Unavailable("no code index is built".into()))
                     }
                 };
-            let partial = lagging
-                || ctx
-                    .index
-                    .get()
-                    .is_some_and(|s| !index_covers(&s.manifest, &pat));
             if let Some(c) = &lp.cursor {
                 c.check(view)?;
             }
