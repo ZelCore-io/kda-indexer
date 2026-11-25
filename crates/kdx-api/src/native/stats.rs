@@ -99,9 +99,18 @@ fn frozen_per_chain(seg: &Arc<Segments>) -> Option<PerChain> {
         return None;
     }
     let d = c.done.lock().unwrap_or_else(|e| e.into_inner());
+    sum_counted(&d, seg.ranges.iter().map(|r| key_of(r)))
+}
+
+/// Sum of the per-chain counts of `keys`. A key missing from `done` (pruned between the
+/// readiness check and this sum, R-01) gives `None`; the caller reports the counts as not ready.
+fn sum_counted(
+    done: &HashMap<(u32, u32, u64), PerChain>,
+    keys: impl Iterator<Item = (u32, u32, u64)>,
+) -> Option<PerChain> {
     let mut out: PerChain = Default::default();
-    for r in &seg.ranges {
-        for (o, v) in out.iter_mut().zip(d[&key_of(r)].iter()) {
+    for k in keys {
+        for (o, v) in out.iter_mut().zip(done.get(&k)?.iter()) {
             o.0 += v.0;
             o.1 += v.1;
         }
@@ -183,5 +192,36 @@ mod prune_tests {
         let mut left: Vec<_> = done.keys().copied().collect();
         left.sort_unstable();
         assert_eq!(left, vec![(10, 20, 5), (20, 30, 9)]);
+    }
+}
+
+#[cfg(test)]
+mod sum_tests {
+    use std::collections::HashMap;
+
+    use super::{sum_counted, PerChain};
+
+    fn counted(recs: u64, blocks: u64) -> PerChain {
+        let mut v = PerChain::default();
+        v[0] = (recs, blocks);
+        v
+    }
+
+    #[test]
+    fn sums_present_keys() {
+        let mut done = HashMap::new();
+        done.insert((0, 10, 0), counted(3, 1));
+        done.insert((10, 20, 5), counted(4, 2));
+        let sum = sum_counted(&done, [(0, 10, 0), (10, 20, 5)].into_iter()).unwrap();
+        assert_eq!(sum[0], (7, 3));
+    }
+
+    /// R-01: a range pruned between the readiness check and the sum is not counted, and
+    /// does not panic.
+    #[test]
+    fn missing_key_gives_none_without_panic() {
+        let mut done = HashMap::new();
+        done.insert((0, 10, 0), counted(3, 1));
+        assert!(sum_counted(&done, [(0, 10, 0), (10, 20, 5)].into_iter()).is_none());
     }
 }
