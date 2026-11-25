@@ -471,6 +471,9 @@ class StockHost:
             raise ValueError("%s: guard_504_action must be stop or backoff" % name)
         self.g504 = collections.deque()
         self.g504_trips = 0
+        # Re-review I6: 504s that land while this host is backing off are answers to requests
+        # sent before the trip; they are not counted, so one burst is one trip.
+        self.g504_until = float("-inf")
         self.on_stop = None             # set by the Runner: ends the run with a message
         if start:
             threading.Thread(target=self.judge_loop, daemon=True).start()
@@ -516,7 +519,7 @@ class StockHost:
         with self.lock:
             while self.g504 and self.g504[0] < t - self.g504_window:
                 self.g504.popleft()
-            if status != 504:
+            if status != 504 or t < self.g504_until:
                 return None
             self.g504.append(t)
             if len(self.g504) < self.g504_max:
@@ -525,6 +528,8 @@ class StockHost:
             self.g504.clear()
             self.g504_trips += 1
             stop = self.g504_action == "stop" or self.g504_trips >= self.g504_max_trips
+            if not stop:
+                self.g504_until = t + self.g504_backoff
         msg = "%s: %d stock 504s within %ds (guard_504_max %d)" % (self.name, n, self.g504_window, self.g504_max)
         if stop:
             self.note("504-guard-stop", n=n)

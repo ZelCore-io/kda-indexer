@@ -2261,6 +2261,21 @@ class WPH1Guard504(unittest.TestCase):
         self.assertEqual(acts, ["backoff", "backoff", "stop"])
         self.assertEqual(len(stopped), 1)
 
+    def test_one_burst_is_one_trip(self):
+        # Re-review I6: 504s that arrive during a backoff (in-flight requests sent before the
+        # trip) are not counted, so a burst of 15 gives one trip and no stop.
+        h = run.StockHost("s", "gql", {"url": "http://stock.invalid"}, None, open(os.devnull, "w"), start=False)
+        stopped = []
+        h.on_stop = stopped.append
+        acts = [h.guard_504(i * 0.1, 504) for i in range(15)]
+        self.assertEqual([a for a in acts if a], ["backoff"])
+        self.assertEqual(stopped, [])
+        self.assertEqual(h.g504_trips, 1)
+        # After the pause, a fresh burst counts again.
+        acts = [h.guard_504(400.0 + i * 0.1, 504) for i in range(5)]
+        self.assertEqual([a for a in acts if a], ["backoff"])
+        self.assertEqual(h.g504_trips, 2)
+
     def test_record_feeds_the_guard(self):
         h = self.host(guard_504_action="stop")
         stopped = []
