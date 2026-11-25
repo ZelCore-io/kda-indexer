@@ -28,6 +28,8 @@ const FRONTIER: u32 = 10;
 /// `[FIRST_RANGE_END, FRONTIER)`.
 const FIRST_RANGE_END: u32 = 5;
 const ALICE: &str = "k:alice";
+/// An account whose every `coin` row the node holds at 0.
+const DRAINED: &str = "k:drained";
 const BOB: &str = "k:bob";
 const CAROL: &str = "k:carol";
 const ALICE_KEY: &str = "alice-key";
@@ -255,6 +257,26 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
             unverified: false,
         };
         t.put(Table::Balances, &bal_key(alice, coin, c), &row.encode())
+            .unwrap();
+    }
+    // Rows the node holds at 0 (an account drained after it was funded): alice's coin on
+    // chain 2, and every row of `DRAINED`. They are never listed.
+    let drained = dict.intern(DictKind::Account, DRAINED);
+    dict.persist(&mut t).unwrap();
+    for (a, c, bal) in [
+        (alice, 2u8, "0.0"),
+        (drained, 0, "0.000000000000"),
+        (drained, 1, "0"),
+    ] {
+        let row = BalanceRow {
+            absent: false,
+            balance: bal.into(),
+            guard: [0; 16],
+            as_of: 12,
+            reconciled_at: 12,
+            unverified: false,
+        };
+        t.put(Table::Balances, &bal_key(a, coin, c), &row.encode())
             .unwrap();
     }
     kdx_hot::nft::upsert_event(&mut t, alice, "t:2", 0, ledger, 12, "1.0").unwrap();
@@ -1266,6 +1288,85 @@ async fn fungible_chain_accounts_list_every_chain_and_never_null() {
     )
     .await;
     assert_eq!(v["fungibleChainAccount"]["chainId"], "1", "{v}");
+}
+
+/// WP-L concern 3: a row the node holds at 0 is never listed, whether it was funded once or
+/// not: not in `chainAccounts`, `fungibleChainAccounts`, `fungibleChainAccount` or
+/// `balance(...)`, and an account whose rows are all at 0 is `fungibleAccount: null`.
+#[tokio::test]
+async fn rows_the_node_holds_at_zero_are_not_listed() {
+    let fx = fixture();
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleAccount(accountName: \"{ALICE}\") {{ totalBalance chainAccounts {{ chainId }} }} }}"
+        ),
+    )
+    .await;
+    let chains: Vec<&str> = v["fungibleAccount"]["chainAccounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["chainId"].as_str().unwrap())
+        .collect();
+    assert_eq!(chains, ["0", "1"], "{v}");
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleChainAccounts(accountName: \"{ALICE}\") {{ chainId }} }}"),
+    )
+    .await;
+    assert_eq!(
+        v["fungibleChainAccounts"].as_array().map(Vec::len),
+        Some(2),
+        "{v}"
+    );
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"2\") {{ chainId }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccount"], Value::Null, "{v}");
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ balance(accountName: \"{ALICE}\") {{ edges {{ node {{ module chainId }} }} }} }}"
+        ),
+    )
+    .await;
+    let rows: Vec<String> = v["balance"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            format!(
+                "{}:{}",
+                e["node"]["module"].as_str().unwrap(),
+                e["node"]["chainId"]
+            )
+        })
+        .collect();
+    assert_eq!(rows, ["coin:\"0\"", "coin:\"1\""], "{v}");
+    // Every row at 0: no account, no chain rows, no balances.
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleAccount(accountName: \"{DRAINED}\") {{ accountName }} }}"),
+    )
+    .await;
+    assert_eq!(v["fungibleAccount"], Value::Null, "{v}");
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleChainAccounts(accountName: \"{DRAINED}\") {{ chainId }} }}"),
+    )
+    .await;
+    assert_eq!(v["fungibleChainAccounts"], json!([]), "{v}");
+    let v = run(
+        &fx.schema,
+        &format!("{{ balance(accountName: \"{DRAINED}\") {{ edges {{ cursor }} }} }}"),
+    )
+    .await;
+    assert_eq!(v["balance"]["edges"], json!([]), "{v}");
 }
 
 /// FIX-4 item 2: `chainIds: []` on the block lists means every chain, as no `chainIds` does.

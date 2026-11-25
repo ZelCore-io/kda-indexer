@@ -71,12 +71,26 @@ fn hidden(view: &View, m: u32) -> ApiResult<bool> {
     Ok(balances::token_row(&view.txn, m)?.is_some_and(|t| t.kind == balances::KIND_NOT_FUNGIBLE))
 }
 
-/// The present rows of `(account, module)`, by chain, optionally on `chains` only.
+/// The listed rows of `(account, module)`, by chain, optionally on `chains` only: a row the
+/// node holds at 0 is left out like an absent one (WP-L concern 3; one rule on every balance
+/// list, native and GraphQL).
 pub fn chain_rows(
     view: &View,
     account: &str,
     module: &str,
     chains: Option<&[u8]>,
+) -> ApiResult<Vec<ChainRow>> {
+    listed_rows(view, account, module, chains, false)
+}
+
+/// `chain_rows`, keeping rows at 0 when `keep_zero` (a single known row, as
+/// `Block.minerAccount`, is served whatever its balance).
+fn listed_rows(
+    view: &View,
+    account: &str,
+    module: &str,
+    chains: Option<&[u8]>,
+    keep_zero: bool,
 ) -> ApiResult<Vec<ChainRow>> {
     let d = view.dict();
     let (Some(a), Some(m)) = (
@@ -98,7 +112,8 @@ pub fn chain_rows(
         let (Some((_, _, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
             continue;
         };
-        if r.absent || chains.is_some_and(|cs| !cs.contains(&c)) {
+        let listed = if keep_zero { !r.absent } else { r.positive() };
+        if !listed || chains.is_some_and(|cs| !cs.contains(&c)) {
             continue;
         }
         out.push(ChainRow {
@@ -110,14 +125,15 @@ pub fn chain_rows(
     Ok(out)
 }
 
-/// `Block.minerAccount` and other single chain-account lookups inside a read.
+/// `Block.minerAccount` and other single chain-account lookups inside a read (a row at 0 is
+/// served).
 pub fn chain_account_in(
     view: &View,
     account: &str,
     chain: u8,
     module: &str,
 ) -> ApiResult<Option<FungibleChainAccount>> {
-    Ok(chain_rows(view, account, module, Some(&[chain]))?
+    Ok(listed_rows(view, account, module, Some(&[chain]), true)?
         .into_iter()
         .next()
         .map(|row| FungibleChainAccount {
@@ -154,7 +170,7 @@ fn by_key(
     let mut out = Vec::new();
     let mut truncated = false;
     let mut failed = None;
-    // One account's rows of `m`, kept when present, on `chain`, trusted and guarded by `pk`.
+    // One account's rows of `m`, kept when above 0, on `chain`, trusted and guarded by `pk`.
     let rows_of = |a: u32| -> ApiResult<Vec<ChainRow>> {
         let mut prefix = a.to_be_bytes().to_vec();
         prefix.extend_from_slice(&m.to_be_bytes());
@@ -166,7 +182,7 @@ fn by_key(
             let (Some((_, _, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                 continue;
             };
-            if r.absent
+            if !r.positive()
                 || chain.is_some_and(|x| x != c)
                 || !balances::trusted(&view.txn, m, c, coin)?
                 || !balances::stored_guard_keys(&view.txn, &r.guard, c)?
@@ -668,7 +684,7 @@ pub fn decode_balance_cursor(s: &str) -> Result<(String, u8)> {
     Ok((m.to_owned(), c.parse::<u8>().map_err(|_| bad())?))
 }
 
-/// `balance(accountName, module, chainIds)`: an account's present fungible rows (the
+/// `balance(accountName, module, chainIds)`: an account's fungible rows above 0 (the
 /// reconciled balances), listed by module name then chain, filtered by `module` and
 /// `chainIds`. Without `accountName` (a module's holders) it is `NOT_SUPPORTED`: the store
 /// keeps no holders-by-module index, and a scan of every balance row is not bounded (R7I-5).
@@ -758,7 +774,7 @@ pub async fn query_balance(
                 let (Some((_, m, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                     continue;
                 };
-                if r.absent || chains.as_ref().is_some_and(|cs| !cs.contains(&c)) {
+                if !r.positive() || chains.as_ref().is_some_and(|cs| !cs.contains(&c)) {
                     continue;
                 }
                 let Some(name) = d.name(DictKind::Module, m).map(str::to_owned) else {

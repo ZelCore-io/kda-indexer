@@ -594,12 +594,18 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
   value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
   with `chainIds` set the rows come in the order asked (each chain once), as stock lists them;
   `fungibleChainAccount` on a chain without a row is `null`.
-- **Rows the node holds at 0 are not listed** (a known gap). An account that exists on a chain
-  with balance 0 may have no row here, so it is absent from `chainAccounts`, from
-  `fungibleChainAccounts` and from `balance(...)`, and an account whose rows are all at 0 can
-  answer `fungibleAccount: null`. The stock indexer lists such zero rows. The G4 replay found
-  this in about 160 cases (records and account keys) of real `fungibleAccount` and
-  `balance(...)` requests; every non-zero row matched the node.
+- **Rows the node holds at 0 are not listed.** One rule on every balance list: a row whose
+  reconciled balance is 0 is left out like a row the node reports absent, whether the
+  account was funded once and drained or never funded on that chain. It is absent from
+  `chainAccounts`, `fungibleChainAccounts`, `fungibleChainAccount`, the `…ByPublicKey` lists
+  and `balance(...)`, and an account whose rows are all at 0 answers `fungibleAccount: null`.
+  The native `/accounts/{account}/balances` and `/keys/{pubkey}/accounts` follow the same
+  rule ([api.md](api.md)). `Block.minerAccount` is the one exception: it serves the miner's
+  row whatever its balance. A row at 0 that a later block changed is listed again once its
+  re-read finds a balance above 0. The stock indexer has no single rule: in the G4 and WP-L
+  replays it listed many zero rows that ours leaves out and left out some that an earlier
+  build of ours listed (rows drained after they were funded), so either side can differ from
+  stock on zero rows; every non-zero row matched the node.
 - **Funded rows stock lacks.** The stock indexer misses some non-zero balance rows that the
   node holds and ours lists, mostly token credits that no TRANSFER event names (for example
   `kaddex.skdx`, `kdlaunch.token`, `mok.token`, `free.kishu-ken`; 17 records in the G4 replay,

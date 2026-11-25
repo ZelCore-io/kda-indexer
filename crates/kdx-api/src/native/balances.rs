@@ -7,7 +7,8 @@
 //! - `stale: true` when the row is also in `BalanceDirty` (B-3): a block changed it after that
 //!   read, or a reorg unwound one; or when the row is `unverified` (its re-read after a change
 //!   failed or was parked, I-5).
-//! - Rows the node reported absent are left out unless dirty. A dirty key with no row yet
+//! - Rows the node reported absent or holds at 0 are left out unless dirty (one rule on
+//!   every balance list, native and GraphQL). A dirty key with no row yet
 //!   (the seed backlog, a new account; M-4) is listed with `balance`, `guard` and
 //!   `as_of_height` null and `stale: true`.
 //! - Rows of a module marked not fungible (R-P5P9-8 #2) are left out.
@@ -178,7 +179,8 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
             }
             let module = d.name(DictKind::Module, m).unwrap_or_default().to_owned();
             match row {
-                Some(r) if !r.absent => items.push(row_json(view, &module, a, m, c, r)?),
+                // A row the node holds at 0 is left out like an absent one (WP-L).
+                Some(r) if r.positive() => items.push(row_json(view, &module, a, m, c, r)?),
                 r if *dirty => items.push(pending_json(&module, c, r.as_ref())),
                 _ => {}
             }
@@ -288,7 +290,7 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
                 let Some(&(_, key_module)) = wanted.iter().find(|w| w.0 == m) else {
                     continue;
                 };
-                if r.absent
+                if !r.positive()
                     || !balances::trusted(&view.txn, m, c, coin)?
                     || !balances::stored_guard_keys(&view.txn, &r.guard, c)?.contains(&pk)
                 {
@@ -420,6 +422,10 @@ mod key_accounts_tests {
             )
             .unwrap();
         }
+        // alice's coin on chain 1 is held at 0 by the node (drained after it was funded):
+        // never listed (WP-L concern 3).
+        w.put(Table::Balances, &bal_key(a, coin, 1), &row("0.0").encode())
+            .unwrap();
         w.commit().unwrap();
         let store = Arc::new(Store::open(hot, d.path()).unwrap());
         let settings = ApiSettings {
@@ -483,6 +489,51 @@ mod key_accounts_tests {
         // An unknown or unconfirmed module lists nothing.
         let v = get(&st, Some("free.none")).await;
         assert!(rows(&v).is_empty(), "{v}");
+    }
+
+    /// WP-L concern 3: a row the node holds at 0 is not listed, on `/accounts/{a}/balances`
+    /// (with or without `chain`) and on `/keys/{pk}/accounts`.
+    #[tokio::test]
+    async fn rows_held_at_zero_are_not_listed() {
+        let (_d, st) = fixture();
+        let bal = |chain: Option<u8>| {
+            let st = st.clone();
+            async move {
+                let q = super::Q {
+                    chain,
+                    ..super::Q::default()
+                };
+                let r = super::account_balances(State(st), Ok(Path("alice".into())), Ok(Query(q)))
+                    .await;
+                let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                let v: Value = serde_json::from_slice(&body).unwrap();
+                v["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| {
+                        (
+                            i["module"].as_str().unwrap().to_owned(),
+                            i["chain"].as_u64().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            bal(None).await,
+            [("coin".to_owned(), 0), ("free.evil".to_owned(), 0)]
+        );
+        assert!(bal(Some(1)).await.is_empty());
+        // By key: alice's coin row on chain 0 only.
+        let v = get(&st, None).await;
+        let chains: Vec<u64> = v["items"][0]["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["chain"].as_u64().unwrap())
+            .collect();
+        assert_eq!(chains, [0], "{v}");
     }
 
     #[tokio::test]
