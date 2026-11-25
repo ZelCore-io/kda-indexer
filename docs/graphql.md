@@ -46,9 +46,7 @@ Differences from Kadena graph:
   modules whose name the node cannot parse (non-ASCII): no row is served for them, where stock
   may list one (it listed `lago.kwUSDC` at 0).
 - `balance(...)` lists fungible balances only (R-G4-03). Stock's `balance(...)` with no
-  `module` also lists rows of the marmalade NFT ledgers (`marmalade.ledger`,
-  `marmalade-v2.ledger`): one row per NFT token id per chain, always with balance `"0"` (its
-  one-argument `details` call fails on NFT ledgers), and those rows take page slots. Ours lists
+  `module` also lists marmalade ledger rows with balance `"0"`, one per token id. Ours lists
   fungible balances only; NFT holdings come from `nonFungibleAccount` and
   `nonFungibleChainAccount`.
 - Row order within a block (R-P5P9-151). A newest-first list that spans several blocks

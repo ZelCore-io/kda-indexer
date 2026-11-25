@@ -762,9 +762,112 @@ fn reference_rows_are_capped_per_tx_and_the_excess_is_counted() {
         "{:?}",
         r.exec_pairs.len()
     );
-    assert!(r.modref_capped > 0);
-    // The sender of the first referenced token comes first.
-    assert_eq!(pairs(&r.exec_pairs)[0], (SRC, toks[0].as_str()));
+    // 8 references x (sender + 40 strings) = 328 candidate rows; 16 kept, the rest counted
+    // once each.
+    assert_eq!(r.modref_capped as usize, 8 * 41 - MAX_MODREF_PAIRS_PER_TX);
+    // Every referenced token's sender row comes before any string row.
+    let got = pairs(&r.exec_pairs);
+    for (i, t) in toks.iter().enumerate() {
+        assert_eq!(got[i], (SRC, t.as_str()));
+    }
+    assert_eq!(got[8], ("k:0000", toks[0].as_str()));
+}
+
+/// Review I1 (a): a reference bound through `let` (the call receives the bare `t`), or sitting
+/// in a dead `if false` branch, still names the token: rule 2b marks the sender. Over-marking
+/// is safe; a missed debit is not.
+#[test]
+fn a_let_bound_or_dead_branch_reference_still_marks_the_sender() {
+    let usdc = format!("{KBNS}.kb-USDC");
+    for code in [
+        format!("(let ((t {usdc})) ({KBNS}.mailbox.dispatch t 1 \"0xabc\" 1000.0))"),
+        format!(
+            "(if false ({KBNS}.other.fn {usdc}) 1) ({KBNS}.mailbox.dispatch t 1 \"0xabc\" 1.0)"
+        ),
+        format!("({KBNS}.mailbox.dispatch (identity {usdc}) 1 \"0xabc\" 1.0)"),
+    ] {
+        let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+        let r = token_receivers(
+            Some(&cmd),
+            &out(json!(1), json!([]), Value::Null),
+            7_432_682,
+            MAINNET01,
+            &|m| m == usdc,
+        );
+        assert!(
+            pairs(&r.exec_pairs).contains(&(SRC, usdc.as_str())),
+            "{code}: {:?}",
+            r.exec_pairs
+        );
+        assert_eq!(r.modref_capped, 0, "{code}");
+    }
+}
+
+/// Review I1 (b): untracked module names placed before the real token never use up the
+/// reference cap; it applies to tracked tokens only.
+#[test]
+fn untracked_references_do_not_spend_the_reference_cap() {
+    let usdc = format!("{KBNS}.kb-USDC");
+    let mut junk = String::new();
+    for i in 0..8 {
+        junk.push_str(&format!(" free.junk{i}"));
+    }
+    let code = format!(
+        "(if false (free.some.fn{junk}) 1)\n({KBNS}.mailbox.dispatch {usdc} 1 \"0xabc\" 1000.0)"
+    );
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(1), json!([]), Value::Null),
+        7_432_682,
+        MAINNET01,
+        &|m| m == usdc,
+    );
+    assert_eq!(
+        pairs(&r.exec_pairs),
+        vec![(SRC, usdc.as_str()), ("0xabc", usdc.as_str())]
+    );
+    assert_eq!(r.modref_capped, 0);
+}
+
+/// Review I1 (c): tracked references over the per-tx reference cap are dropped and counted one
+/// each, and a sender also named in the call's strings is counted once (review M1).
+#[test]
+fn dropped_references_and_rows_are_each_counted_once() {
+    let toks: Vec<String> = (0..10).map(|i| format!("{KBNS}.kb-T{i}")).collect();
+    let code = format!("({KBNS}.mailbox.dispatch {})", toks.join(" "));
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+    let is = |m: &str| m.contains("kb-T");
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(1), json!([]), Value::Null),
+        7_432_682,
+        MAINNET01,
+        &is,
+    );
+    // Eight references kept (one sender row each), two dropped.
+    assert_eq!(r.exec_pairs.len(), 8, "{:?}", r.exec_pairs);
+    assert_eq!(r.modref_capped, 2);
+    // Two references, each with the sender and 15 other strings, the sender among them:
+    // 2 x 16 distinct rows, 16 kept, 16 counted (the sender's string is no extra row).
+    let mut code = String::new();
+    for t in &toks[..2] {
+        code.push_str(&format!("({KBNS}.mailbox.dispatch {t} \"{SRC}\""));
+        for j in 0..15 {
+            code.push_str(&format!(" \"k:{j:04}\""));
+        }
+        code.push_str(")\n");
+    }
+    let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+    let r = token_receivers(
+        Some(&cmd),
+        &out(json!(1), json!([]), Value::Null),
+        7_432_682,
+        MAINNET01,
+        &is,
+    );
+    assert_eq!(r.exec_pairs.len(), MAX_MODREF_PAIRS_PER_TX);
+    assert_eq!(r.modref_capped, 16);
 }
 
 /// G4 rows #2–#3 (`kb-USDT`, chain 2): the bridge-in `handle` emits
@@ -795,17 +898,30 @@ fn a_bridge_token_received_transfer_remote_names_its_recipient() {
     assert!(r.event_pairs.is_empty());
 }
 
-/// Rule 2b reads code only: a token name in a string, a comment, a `'symbol` or a data list is
-/// never a reference, and neither is a call with an unqualified head.
+/// Rule 2b reads code only: a token name in a string, a comment or a `'symbol` is never a
+/// reference. A reference in a data list or under an unqualified head is code: it marks the
+/// sender, but the call's strings only count for a direct argument of a qualified call.
 #[test]
-fn only_a_code_reference_in_a_qualified_call_counts_for_rule_2b() {
+fn only_a_code_reference_counts_for_rule_2b() {
     let usdc = format!("{KBNS}.kb-USDC");
+    for code in [
+        format!("({KBNS}.mailbox.dispatch [{usdc}] 1 \"k:dest\" 1.0)"),
+        format!("(dispatch {usdc} 1 \"k:dest\" 1.0)"),
+    ] {
+        let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
+        let r = token_receivers(
+            Some(&cmd),
+            &out(json!(1), json!([]), Value::Null),
+            7_432_682,
+            MAINNET01,
+            &|m| m == usdc,
+        );
+        assert_eq!(pairs(&r.exec_pairs), vec![(SRC, usdc.as_str())], "{code}");
+    }
     for code in [
         format!("({KBNS}.mailbox.dispatch \"{usdc}\" 1 \"k:dest\" 1.0)"),
         format!("; ({KBNS}.mailbox.dispatch {usdc} 1 \"k:dest\" 1.0)\n(+ 1 2)"),
         format!("({KBNS}.mailbox.dispatch '{usdc} 1 \"k:dest\" 1.0)"),
-        format!("({KBNS}.mailbox.dispatch [{usdc}] 1 \"k:dest\" 1.0)"),
-        format!("(dispatch {usdc} 1 \"k:dest\" 1.0)"),
     ] {
         let cmd = json!({"payload": {"exec": {"data": {}, "code": code}}, "meta": {"sender": SRC}});
         let r = token_receivers(

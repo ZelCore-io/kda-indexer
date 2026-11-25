@@ -1153,10 +1153,12 @@ fn the_tail_caps_one_emitter_per_block_and_still_applies_it() {
         .collect();
     commit_block(&c, block_of(25, txs));
     // Each tx charges free.spam its 64 MINT names (the exec's strings go to the sender's key).
+    // Below the events fork the code naming free.spam also marks (sender, free.spam) by rule
+    // 2b, once per block, charged to the sender's key: one row beyond the emitter's cap.
     let cap = kdx_hot::tail::D3_ROWS_PER_EMITTER_PER_BLOCK as usize;
     let rows = tail_d3_rows(&c, 25);
     assert!(
-        rows.len() <= cap && rows.len() >= cap - 32,
+        rows.len() <= cap + 1 && rows.len() >= cap - 32,
         "{}",
         rows.len()
     );
@@ -1584,4 +1586,8 @@ fn a_bridge_dispatch_marks_the_sender_in_the_tail_and_the_pass_and_counts_the_ca
         .unwrap();
     let cap = kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX as u64;
     assert_eq!(capped, 41 - cap, "sender + 40 strings over a cap of {cap}");
+    // The pass counts the same rows for the same tx (review M5).
+    clear_marks(&c);
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &d3_opts(false), &|| false).unwrap();
+    assert_eq!(rep.modref_capped, 41 - cap, "pass {rep:?}");
 }

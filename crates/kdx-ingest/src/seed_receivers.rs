@@ -136,8 +136,9 @@ pub struct ReceiversReport {
     pub discovered_namespace_dropped: u64,
     /// D3: discoverable module names over `MAX_MODULE_LEN` bytes, dropped (re-review N1).
     pub discovered_too_long: u64,
-    /// D3: rule 2b rows (a tracked token passed by module reference) dropped at the per-tx
-    /// cap `kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX` (logged as a warning per tx).
+    /// D3: rule 2b references and rows (a tracked token named in code) dropped at the per-tx
+    /// caps (`kdx_decode::receivers::MAX_MODREF_PAIRS_PER_TX` rows; 8 tracked references),
+    /// each counted once; a debug log per tx and one warning per pass.
     pub modref_capped: u64,
     /// D3: pending discoveries (dropped earlier at a quota) re-queued at the start.
     pub discovered_requeued: u64,
@@ -492,7 +493,9 @@ fn add(
             record_token_receivers(r, dict, w.forks, &is_token).map(|t| {
                 if t.modref_capped > 0 {
                     rep.modref_capped += u64::from(t.modref_capped);
-                    tracing::warn!(
+                    // Debug only (review M7): a rewalk over spammy history would flood the
+                    // log; the pass logs one summary at its end.
+                    tracing::debug!(
                         height = k.height(),
                         chain = k.chain(),
                         dropped = t.modref_capped,
@@ -1204,6 +1207,12 @@ pub fn run(
             dropped_untracked = rep.dropped_untracked,
             dropped_ceiling = rep.dropped_ceiling,
             "balances: D3 dropped candidates of untracked emitters / over the global ceiling"
+        );
+    }
+    if rep.modref_capped > 0 {
+        tracing::warn!(
+            modref_capped = rep.modref_capped,
+            "balances: D3 module-reference rows and references over the per-tx caps dropped"
         );
     }
     if o.rules == Rules::D3 {

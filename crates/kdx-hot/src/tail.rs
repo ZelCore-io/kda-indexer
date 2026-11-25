@@ -180,7 +180,9 @@ struct D3Block {
     /// Discoverable names over `MAX_MODULE_LEN` (re-review N1; a pure function of the txs, so
     /// the counter's undo op stays replay-identical).
     too_long: u64,
-    /// Rule 2b rows dropped at the per-tx cap (a pure function of the txs, like `too_long`).
+    /// Rule 2b references and rows dropped at the per-tx caps. It depends on the tracked set
+    /// at apply time, not only on the txs; the undo replays the stored delta, so a reorg
+    /// restores the counter exactly.
     modref_capped: u64,
     /// account u32 ‖ module u32 ‖ TxKey of each row marked (for the undo).
     marked: Vec<u8>,

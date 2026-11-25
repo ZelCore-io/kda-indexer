@@ -708,16 +708,20 @@ recheck walks only the new heights (a safety net now that the tail marks). Candi
   as calling that module, since its init runs unqualified: its code literals without
   whitespace (a `ROOT` or genesis account) are candidates for that module only, up to 512 per
   tx; calls into other modules in the same tx keep the normal cap of 64;
-- a tracked token passed as a bare module reference to another module's call, with no event
-  of that token in the tx (R-G4-01 b): `(n_e595….mailbox.dispatch n_e595….kb-USDC 1
-  "<remote recipient>" 97.84)` burns `meta.sender`'s kb-USDC through the token's
-  `transfer-remote` and emits nothing of kb-USDC. The tx's `meta.sender` and the call's direct
-  account-like string arguments are candidates for that token on that chain. Only a dotted
-  name (`ns.module`) in code counts, in argument position of a call whose head is a qualified
-  function of another module; strings, `'symbols`, comments and `[..]`/`{..}` data never do.
-  At most 8 references and 16 rows per tx, charged to the sender like other exec rows; the
-  excess is dropped and counted (`d3_modref_capped` in the tail's counters, `modref_capped` in
-  the pass's dropped report, plus a warning per tx in the pass);
+- a tracked token named anywhere in the code, with no event of that token in the tx
+  (R-G4-01 b): `(n_e595….mailbox.dispatch n_e595….kb-USDC 1 "<remote recipient>" 97.84)`
+  burns `meta.sender`'s kb-USDC through the token's `transfer-remote` and emits nothing of
+  kb-USDC. The tx's `meta.sender` is a candidate for every such token on that chain. A name is
+  a dotted reference (`ns.module`) anywhere in code, including a `let` binding, a dead
+  `if false` branch or a `[..]` list, or the module of a qualified call (`ns.module.fn`);
+  strings, `'symbols` and comments never are. Over-marking costs one read; a missed debit
+  serves a wrong balance. When the token is passed directly to a qualified call of another
+  module, that call's account-like string arguments are candidates too (for a bridge dispatch
+  that includes the remote EVM recipient, a harmless zero row). At most 8 tracked tokens
+  (counted after the tracked-token filter, so untracked names cannot use them up) and 16 rows
+  per tx, every sender row first, charged to the sender like other exec rows. Each dropped
+  token and row is counted once (`d3_modref_capped` in the tail's counters, `modref_capped` in
+  the pass's dropped report, with one warning per pass and a debug log per tx);
 - an event of a tracked token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
   ...): its string params, for that token;
 - an event param holding a `fungible-v2` module reference: the event's string params, for the

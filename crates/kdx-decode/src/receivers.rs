@@ -20,6 +20,8 @@
 //! "no row", stored absent and never served. Under-inclusion leaves money missing, so the rule
 //! is deliberately wide.
 
+use std::collections::HashMap;
+
 use kdx_types::record::TxRecord;
 use kdx_types::{value, Dict};
 use serde_json::Value;
@@ -257,8 +259,8 @@ pub struct TokenReceivers {
     pub discovered: Vec<String>,
     /// Discoverable names over [`MAX_MODULE_LEN`] bytes, dropped (re-review N1).
     pub discovered_too_long: u32,
-    /// Rule 2b candidates dropped at [`MAX_MODREF_PAIRS_PER_TX`] (counted by the tail and the
-    /// pass, never an error).
+    /// Rule 2b drops, each counted once (by the tail and the pass, never an error): tracked
+    /// references over [`MAX_MODREFS_PER_TX`] and rows over [`MAX_MODREF_PAIRS_PER_TX`].
     pub modref_capped: u32,
 }
 
@@ -279,12 +281,13 @@ pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
 /// literals. Literals with whitespace (doc strings, messages) are skipped there; the rest are
 /// charged to the sender like any exec row.
 pub const MAX_DEPLOY_EXEC_PAIRS: usize = 512;
-/// Rule 2b rows (a tracked token passed as a bare module reference) kept per tx: the sender
-/// and the call's account-like string arguments, over every referenced token. The excess is
+/// Rule 2b rows (a tracked token named in code) kept per tx: the sender of every kept token
+/// first, then the account-like string arguments of the calls passing it. The excess is
 /// dropped and counted ([`TokenReceivers::modref_capped`]).
 pub const MAX_MODREF_PAIRS_PER_TX: usize = 16;
-/// Bare module references kept per tx for rule 2b (each with its call's strings).
-const MAX_MODREFS_PER_TX: usize = 8;
+/// Tracked tokens kept per tx for rule 2b, counted after the tracked-token filter (review I1:
+/// untracked names never spend it); the rest are dropped and counted.
+pub const MAX_MODREFS_PER_TX: usize = 8;
 /// Account-like strings read from one call for rule 2b (a memory bound only: rows over
 /// [`MAX_MODREF_PAIRS_PER_TX`] are counted in [`TokenReceivers::modref_capped`]).
 const MAX_MODREF_STRINGS_PER_CALL: usize = 64;
@@ -457,10 +460,11 @@ pub struct D3Exec {
     pub deploy_strings: Vec<String>,
     /// `meta.sender` of the cmd (empty when absent): the budget key of the token rows.
     pub sender: String,
-    /// Rule 2b: modules passed as a bare reference argument to another module's call
-    /// (`(ns.mailbox.dispatch ns.kb-USDC 1 "<to>" 1.0)`), same event rule as `called`, each
-    /// with that call's direct [`account_like`] string arguments; at most
-    /// [`MAX_MODREFS_PER_TX`] references and [`MAX_MODREF_STRINGS_PER_CALL`] strings each.
+    /// Rule 2b: every module named in the code (a dotted reference anywhere, or the module of
+    /// a qualified function; see `modref_args`), same event rule as `called`, each with the
+    /// direct [`account_like`] string arguments of the qualified calls of another module that
+    /// pass it (`(ns.mailbox.dispatch ns.kb-USDC 1 "<to>" 1.0)`), at most
+    /// [`MAX_MODREF_STRINGS_PER_CALL`] each. Not capped: [`d3_filter`] caps the tracked ones.
     pub refs: Vec<(String, Vec<String>)>,
 }
 
@@ -632,14 +636,22 @@ pub fn d3_candidates(
 /// The rows of `c` given which modules are tracked fungible tokens (`is_token`; coin is always
 /// one). Rules:
 ///
-/// 1. **Cross-chain defpact of any module** (`<m>.transfer-crosschain` or
-///    `<m>.transfer-create-to-crosschain`, any height): step 1
-///    credits `args[1]` and step 0 debits `args[0]`. Tokens emit no TRANSFER for either
-///    (only `pact.X_YIELD` / `X_RESUME`); coin did not before coin v3. `<m>` is discovered.
+/// 1. **Cross-chain defpact of any module** (`XCHAIN_DEFPACTS`, any height):
+///    `<m>.transfer-crosschain` step 1 credits `args[1]` and step 0 debits `args[0]`;
+///    `<m>.transfer-create-to-crosschain` step 1 credits `args[0]`. Tokens emit no TRANSFER for
+///    either (only `pact.X_YIELD` / `X_RESUME`); coin did not before coin v3. `<m>` is
+///    discovered.
 /// 2. **`exec`**: the D1 strings (`exec.data` values, `exec.code` literals) plus every string
 ///    of `result.data` (a receiver built at run time and returned, D3 b), for every tracked
 ///    token `<m>` the code calls (`<m>.fn`; from the events fork on only one that emitted
 ///    nothing in the tx), and for coin below the events fork.
+///
+///    2b. **A tracked token named in code** (review I1: a dotted reference anywhere, bound
+///    through `let`, in a dead branch or a list, or the module of a qualified call) that
+///    emitted nothing in the tx: `meta.sender` (a bridge `transfer-remote` burn), then the
+///    direct string arguments of the qualified calls of another module passing it. At most
+///    [`MAX_MODREFS_PER_TX`] tracked tokens and [`MAX_MODREF_PAIRS_PER_TX`] rows per tx, each
+///    drop counted once in [`TokenReceivers::modref_capped`].
 /// 3. **Events** (any height, into `event_pairs`, at most [`MAX_EVENT_PAIRS_PER_EVENT`] new
 ///    rows earned by each event for itself and [`MAX_EVENT_PAIRS_PER_TX`] per tx, never coin;
 ///    amounts are never candidates): an event of a token that is not a well-formed TRANSFER (`WRAP`, `UNWRAP`, `MINT`,
@@ -713,49 +725,96 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
                 r.push_exec(s, m, &x.sender, &mut used, MAX_DEPLOY_EXEC_PAIRS);
             }
         }
-        // Rule 2b: a tracked token passed by reference (it may debit `meta.sender`, e.g. a
-        // bridge `transfer-remote` burn) and the call's account strings; own budget, counted.
+        // Rule 2b (review I1): a tracked token named anywhere in the code with no event of its
+        // own in the tx may have debited `meta.sender` (a bridge `transfer-remote` burn). Only
+        // tracked names count toward the reference cap; each dropped reference and row is
+        // counted once. Every kept token's sender row comes before any string row.
+        let tracked: Vec<&(String, Vec<String>)> =
+            x.refs.iter().filter(|(m, _)| is_token(m)).collect();
+        let kept = tracked.len().min(MAX_MODREFS_PER_TX);
+        r.modref_capped = r
+            .modref_capped
+            .saturating_add(u32::try_from(tracked.len() - kept).unwrap_or(u32::MAX));
+        let tracked = &tracked[..kept];
         let mut used = 0;
-        for (m, strings) in x.refs.iter().filter(|(m, _)| is_token(m)) {
-            for s in std::iter::once(&x.sender).chain(strings) {
-                let new = account_like(s) && !r.exec_pairs.iter().any(|(a, b)| a == s && b == m);
-                if new && used >= MAX_MODREF_PAIRS_PER_TX {
-                    r.modref_capped += 1;
-                } else {
-                    r.push_exec(s, m, &x.sender, &mut used, MAX_MODREF_PAIRS_PER_TX);
-                }
+        let rows = tracked
+            .iter()
+            .map(|(m, _)| (&x.sender, m))
+            .chain(tracked.iter().flat_map(|(m, strings)| {
+                strings
+                    .iter()
+                    .filter(|s| **s != x.sender)
+                    .map(move |s| (s, m))
+            }));
+        for (s, m) in rows {
+            let new = account_like(s) && !r.exec_pairs.iter().any(|(a, b)| a == s && b == m);
+            if new && used >= MAX_MODREF_PAIRS_PER_TX {
+                r.modref_capped = r.modref_capped.saturating_add(1);
+            } else {
+                r.push_exec(s, m, &x.sender, &mut used, MAX_MODREF_PAIRS_PER_TX);
             }
         }
     }
     r
 }
 
-/// Rule 2b: every dotted identifier (`ns.mod`) in argument position of a call whose head is a
-/// qualified function of another module (`(a.b.fn ..)` / `(a.fn ..)`), with the call's direct
-/// string arguments that are [`account_like`]. Strings, `'symbols` and `;` comments are never
-/// references; nested lists are their own calls. At most [`MAX_MODREFS_PER_TX`] distinct
-/// references (first seen) and [`MAX_MODREF_STRINGS_PER_CALL`] strings per call.
+/// Rule 2b: every module named in code (review I1), first-seen order, each with the
+/// [`account_like`] string arguments of the calls that pass it directly.
+///
+/// A name is any word outside strings, `'symbols` and `;` comments: a dotted identifier
+/// (`ns.mod`) wherever it sits (an argument, a `let` binding, a dead `if false` branch, a list),
+/// and the module of a qualified function (`ns.mod.fn` gives `ns.mod`). Root `coin.*` words are
+/// skipped (a call of coin, never a namespaced module). Names are not capped here: the cap
+/// applies to tracked tokens only ([`d3_filter`]), so untracked names cannot use it up. The
+/// list is bounded by the code length.
+///
+/// Strings are attached only to a name passed as a direct argument of a call whose head is a
+/// qualified function of another module (`(ns.mailbox.dispatch ns.kb-USDC 1 "<to>" 1.0)`), at
+/// most [`MAX_MODREF_STRINGS_PER_CALL`] per name.
 fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
     struct Frame {
         head: Option<String>,
         items: usize,
-        idents: Vec<String>,
+        /// Indices into `out` of the names passed directly to this call.
+        idents: Vec<usize>,
         strings: Vec<String>,
     }
     let b = code.as_bytes();
     let mut stack: Vec<Frame> = Vec::new();
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut name = |m: &str, out: &mut Vec<(String, Vec<String>)>| -> Option<usize> {
+        if m.starts_with("coin.") || !readable_module(m) {
+            return None;
+        }
+        Some(*seen.entry(m.to_owned()).or_insert_with(|| {
+            out.push((m.to_owned(), Vec::new()));
+            out.len() - 1
+        }))
+    };
     let close = |f: Frame, out: &mut Vec<(String, Vec<String>)>| {
         let Some(head) = f.head.filter(|h| h.contains('.')) else {
             return;
         };
+        if f.strings.is_empty() {
+            return;
+        }
         let head_module = head.rsplit_once('.').map_or("", |(m, _)| m);
-        for id in f.idents {
-            if out.len() >= MAX_MODREFS_PER_TX {
-                return;
+        let mut ids = f.idents;
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            let (m, strings) = &mut out[id];
+            if m == head_module {
+                continue;
             }
-            if id != head_module && !out.iter().any(|(m, _)| *m == id) {
-                out.push((id, f.strings.clone()));
+            for s in &f.strings {
+                if strings.len() >= MAX_MODREF_STRINGS_PER_CALL {
+                    break;
+                }
+                if !strings.contains(s) {
+                    strings.push(s.clone());
+                }
             }
         }
     };
@@ -819,15 +878,25 @@ fn modref_args(code: &str) -> Vec<(String, Vec<String>)> {
                     i += 1;
                 }
                 let w = String::from_utf8_lossy(&b[start..i]);
+                if w.starts_with('\'') {
+                    if let Some(f) = stack.last_mut() {
+                        f.items += 1;
+                    }
+                    continue;
+                }
+                let dots = w.matches('.').count();
+                // `ns.mod` itself, or the module of `ns.mod.fn`.
+                let direct = if dots == 1 { name(&w, &mut out) } else { None };
+                if dots >= 2 {
+                    if let Some((m, _)) = w.rsplit_once('.') {
+                        name(m, &mut out);
+                    }
+                }
                 if let Some(f) = stack.last_mut() {
                     if f.items == 0 && f.head.is_none() {
                         f.head = Some(w.into_owned());
-                    } else if !w.starts_with('\'')
-                        && w.matches('.').count() == 1
-                        && readable_module(&w)
-                        && f.idents.len() < MAX_MODREFS_PER_TX
-                    {
-                        f.idents.push(w.into_owned());
+                    } else if let Some(id) = direct {
+                        f.idents.push(id);
                     }
                     f.items += 1;
                 }
