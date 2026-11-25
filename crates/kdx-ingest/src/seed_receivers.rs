@@ -1472,30 +1472,34 @@ pub fn check_discovered(
     verdicts: &[Option<bool>],
 ) -> Result<(u64, u64)> {
     let mut d = dict.lock().unwrap_or_else(|e| e.into_inner());
-    let mut txn = hot.rw()?;
-    let (mut tracked, mut rejected) = (0u64, 0u64);
-    for ((m, c, h), v) in queued.iter().zip(verdicts) {
-        match v {
-            Some(true) => {
-                let id = d.intern(DictKind::Module, m);
-                d.persist(&mut txn)?;
-                balances::note_token(&mut txn, id, *h)?;
-                balances::unqueue_discovered(&mut txn, m, *c)?;
-                tracked += 1;
+    let r = (|| -> Result<(u64, u64)> {
+        let mut txn = hot.rw()?;
+        let (mut tracked, mut rejected) = (0u64, 0u64);
+        for ((m, c, h), v) in queued.iter().zip(verdicts) {
+            match v {
+                Some(true) => {
+                    let id = d.intern(DictKind::Module, m);
+                    d.persist(&mut txn)?;
+                    balances::note_token(&mut txn, id, *h)?;
+                    balances::unqueue_discovered(&mut txn, m, *c)?;
+                    tracked += 1;
+                }
+                Some(false) => {
+                    balances::unqueue_discovered(&mut txn, m, *c)?;
+                    rejected += 1;
+                }
+                None => {}
             }
-            Some(false) => {
-                balances::unqueue_discovered(&mut txn, m, *c)?;
-                rejected += 1;
-            }
-            None => {}
         }
-    }
-    let r = txn.commit();
+        txn.commit()?;
+        Ok((tracked, rejected))
+    })();
     if r.is_err() {
+        // F-52: `persist` drained the queue inside a txn that aborted or failed to commit, so
+        // names interned here never reached MDBX: forget them.
         *d = HotDict::load(&hot.ro()?)?;
     }
-    r?;
-    Ok((tracked, rejected))
+    r
 }
 
 #[cfg(test)]
