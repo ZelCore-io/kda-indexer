@@ -1168,7 +1168,7 @@ async fn history_slice(ctx: &Arc<Ctx>, h: &mut History, slice: u64) -> Result<bo
     let (walk, r) = tokio::task::spawn_blocking(move || {
         let r = (|| -> Result<Option<crate::seed_receivers::HistoryStep>> {
             if walk.is_none() {
-                walk = crate::seed_receivers::history_begin(&c.hot, &c.dict, &opts)?;
+                walk = crate::seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &opts)?;
             }
             match walk.as_mut() {
                 Some(w) => Ok(Some(w.step(&c.hot, &c.dict, &c.segdir, &opts, slice)?)),

@@ -1493,6 +1493,147 @@ fn refused_pending_entries_cannot_freeze_the_rest_of_the_list() {
     assert!(moved_real, "the real entry never left the pending list");
 }
 
+/// A d3 store with `free.late` first seen (minted to [`LATE_ACC`]) at hot height 26 and its
+/// history walk queued, and a code search index holding `(deploy body, first_h)` pairs
+/// (none: no index).
+fn late_token_walk(deploys: Option<&[(&str, u64)]>) -> (tempfile::TempDir, kdx_ingest::Ctx, Opts) {
+    let (d, c) = d3_store();
+    let cmd = json!({"payload": {"exec": {"code": "(free.late.mint)", "data": {}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([event("free.late", "MINT", json!([LATE_ACC, 5.0]))]);
+    commit_block(&c, block_of(26, vec![d3_tx(5000, cmd, evs, Value::Null)]));
+    let mut o = d3_opts(false);
+    o.history_inline = false;
+    seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    let q = vec![("free.late".to_owned(), 0u8, 26u32)];
+    seed_receivers::check_discovered(&c.hot, &c.dict, &q, &[Some(true)]).unwrap();
+    if let Some(deploys) = deploys {
+        let dir = kdx_search::search_dir(c.segdir.parent().unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (index, f) = kdx_search::schema::create(&dir).unwrap();
+        let mut w = kdx_search::schema::writer(&index, 1, 16).unwrap();
+        for (code, first_h) in deploys {
+            let doc = kdx_search::Doc {
+                hash: kdx_types::blake2b_128(code.as_bytes()),
+                code: (*code).into(),
+                first_h: *first_h,
+                last_h: *first_h,
+            };
+            w.add_document(kdx_search::schema::to_doc(&f, &doc))
+                .unwrap();
+        }
+        w.commit().unwrap();
+        w.wait_merging_threads().unwrap();
+        kdx_search::SearchManifest {
+            format: kdx_search::manifest::FORMAT,
+            tantivy: "test".into(),
+            mode: "full".into(),
+            fallback_min_len: 0,
+            built_through_height: 26,
+            rebuilt_through_height: Some(26),
+            stale_from_height: None,
+            docs: deploys.len() as u64,
+            bytes: 0,
+            built_at: 1,
+        }
+        .commit(&dir)
+        .unwrap();
+    }
+    (d, c, o)
+}
+
+fn walk_to_end(c: &kdx_ingest::Ctx, o: &Opts, w: &mut seed_receivers::HistoryWalk) {
+    for _ in 0..10_000 {
+        if w.step(&c.hot, &c.dict, &c.segdir, o, 1).unwrap().done {
+            return;
+        }
+    }
+    panic!("the walk never ends");
+}
+
+fn frozen_txnum_at(c: &kdx_ingest::Ctx, height: u32) -> (u64, u64) {
+    let dict: Arc<MemDict> = Arc::new(
+        kdx_hot::HotDict::load(&c.hot.ro().unwrap())
+            .unwrap()
+            .mem()
+            .clone(),
+    );
+    let segs = Segments::open_without_filters(&c.segdir, dict).unwrap();
+    let t = segs.last_txnum_below_height(height).map_or(0, |t| t + 1);
+    (t, segs.manifest.next_txnum)
+}
+
+/// A history walk that begins starts at the frozen TxNum of its tokens' earliest deploy (from
+/// the code search index), not at 0, and still marks the credit of the token's first tx.
+#[test]
+fn a_history_walk_begins_at_the_earliest_deploy_of_its_tokens() {
+    let deploy = "(namespace 'free)(module late GOV (defcap GOV () true))";
+    let other = "(module other-thing GOV (defun x () 1))";
+    let (_d, c, o) = late_token_walk(Some(&[(deploy, 10), (other, 3)]));
+    let (start, next_txnum) = frozen_txnum_at(&c, 10);
+    assert!(start > 0 && start < next_txnum, "{start} {next_txnum}");
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &o)
+        .unwrap()
+        .expect("a walk is pending");
+    assert_eq!(w.position(), (start, false));
+    let s = w.step(&c.hot, &c.dict, &c.segdir, &o, 1).unwrap();
+    assert_eq!(s.txs, 1, "{s:?}");
+    assert_eq!(w.position(), (start + 1, false));
+    walk_to_end(&c, &o, &mut w);
+    assert!(dirty_in(&c, LATE_ACC, "free.late"));
+    assert!(balances::rewalk_pending(&c.hot.ro().unwrap())
+        .unwrap()
+        .is_empty());
+}
+
+/// A deploy in the same block as the token's first tx (above the frozen part): the walk skips
+/// every frozen tx and still marks that first tx's credit.
+#[test]
+fn a_history_walk_from_a_deploy_at_the_first_tx_still_marks_its_credit() {
+    let deploy = "(module late GOV (defcap GOV () true))";
+    let (_d, c, o) = late_token_walk(Some(&[(deploy, 26)]));
+    let (start, next_txnum) = frozen_txnum_at(&c, 26);
+    assert_eq!(start, next_txnum);
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &o)
+        .unwrap()
+        .expect("a walk is pending");
+    assert_eq!(w.position(), (next_txnum, false));
+    assert!(!dirty_in(&c, LATE_ACC, "free.late"));
+    walk_to_end(&c, &o, &mut w);
+    assert!(dirty_in(&c, LATE_ACC, "free.late"));
+}
+
+/// The walk starts at TxNum 0 when the deploy is not provably known: no index, no matching
+/// body, or a deploy above the token's first height.
+#[test]
+fn a_history_walk_starts_at_0_without_a_known_deploy() {
+    let deploy: &[(&str, u64)] = &[("(module late GOV (defcap GOV () true))", 26)];
+    let cases: [Option<&[(&str, u64)]>; 3] = [
+        None,
+        Some(&[("(module other-thing GOV (defcap GOV () true))", 10)]),
+        Some(deploy),
+    ];
+    for (i, deploys) in cases.into_iter().enumerate() {
+        let (_d, c, o) = late_token_walk(deploys);
+        if i == 2 {
+            // Lower the token's first height below the deploy the index shows.
+            let mut txn = c.hot.rw().unwrap();
+            let id = kdx_hot::HotDict::load(&txn)
+                .unwrap()
+                .find(DictKind::Module, "free.late")
+                .unwrap();
+            balances::note_token(&mut txn, id, 20).unwrap();
+            txn.commit().unwrap();
+        }
+        let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &o)
+            .unwrap()
+            .expect("a walk is pending");
+        assert_eq!(w.position(), (0, false), "case {i}");
+        walk_to_end(&c, &o, &mut w);
+        assert!(dirty_in(&c, LATE_ACC, "free.late"), "case {i}");
+    }
+}
+
 /// Re-review N2: the history walk of a newly tracked token runs in bounded slices whose
 /// cursor is persisted with their marks; a new walker resumes at that cursor, not at 0.
 #[test]
@@ -1515,7 +1656,7 @@ fn a_queued_history_walk_progresses_in_slices_and_resumes_from_its_cursor() {
         1
     );
 
-    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &o)
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &o)
         .unwrap()
         .expect("a walk is pending");
     let s = w.step(&c.hot, &c.dict, &c.segdir, &o, 1).unwrap();
@@ -1523,7 +1664,7 @@ fn a_queued_history_walk_progresses_in_slices_and_resumes_from_its_cursor() {
     let at = w.position();
     drop(w);
     // A new walker (e.g. after a restart) resumes where the last slice left off.
-    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &o)
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &o)
         .unwrap()
         .expect("still pending");
     assert_eq!(w.position(), at);
@@ -1542,9 +1683,11 @@ fn a_queued_history_walk_progresses_in_slices_and_resumes_from_its_cursor() {
     assert!(balances::rewalk_pending(&c.hot.ro().unwrap())
         .unwrap()
         .is_empty());
-    assert!(seed_receivers::history_begin(&c.hot, &c.dict, &o)
-        .unwrap()
-        .is_none());
+    assert!(
+        seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &o)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Re-review N2 / review M2: only a token first seen below the D3 done height needs a

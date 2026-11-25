@@ -1253,7 +1253,7 @@ pub fn run(
     if o.rules == Rules::D3 && from > 0 && o.history_inline {
         // The CLI walks the history of newly tracked tokens to the end here; the service
         // runs it in slices between its other steps (re-review N2, [`history_begin`]).
-        if let Some(mut hw) = history_begin(hot, dict, o)? {
+        if let Some(mut hw) = history_begin(hot, dict, segdir, o)? {
             loop {
                 let s = hw.step(hot, dict, segdir, o, HISTORY_SLICE_TXS)?;
                 if s.done {
@@ -1315,16 +1315,20 @@ pub struct HistoryStep {
 /// Resume the persisted history walk, or begin one when tokens wait for it
 /// ([`balances::rewalk_pending`]), the D3 pass has a done height to walk below, and the last
 /// walk ended at least [`Opts::rewalk_every_secs`] ago. `None`: nothing to walk now.
+///
+/// A walk that begins (`next` 0, not in the hot part) starts at the frozen TxNum of
+/// [`walk_start_height`] instead of 0: no tx below a module's deploy can name it successfully.
 pub fn history_begin(
     hot: &HotStore,
     dict: &Mutex<HotDict>,
+    segdir: &Path,
     o: &Opts,
 ) -> Result<Option<HistoryWalk>> {
     let txn = hot.ro()?;
     let Some(coin) = balances::coin_module(&txn)? else {
         return Ok(None);
     };
-    let st = match txn
+    let mut st = match txn
         .meta(meta::D3_REWALK_WALK)?
         .and_then(|v| serde_json::from_slice::<HistState>(&v).ok())
     {
@@ -1363,6 +1367,27 @@ pub fn history_begin(
         .filter_map(|id| snap.name(DictKind::Module, *id).map(str::to_owned))
         .filter(|m| tokens.contains(m))
         .collect();
+    if st.next == 0 && !st.hot && !names.is_empty() {
+        let txn = hot.ro()?;
+        let mut mods = Vec::with_capacity(names.len());
+        for id in &st.ids {
+            if let Some(m) = snap
+                .name(DictKind::Module, *id)
+                .filter(|m| names.contains(*m))
+            {
+                let first = balances::token_row(&txn, *id)?.map_or(u32::MAX, |r| r.first_height);
+                mods.push((m.to_owned(), first));
+            }
+        }
+        drop(txn);
+        let data_dir = segdir.parent().unwrap_or(segdir);
+        let height = walk_start_height(&kdx_search::search_dir(data_dir), &mods);
+        let segs = Segments::open_without_filters(segdir, snap.clone())?;
+        st.next = height.map_or(0, |h| frozen_start(&segs, h));
+        tracing::info!(tokens = ?names, start_height = ?height, start_txnum = st.next,
+            "balances: D3 history walk starts at the earliest deploy of its tokens \
+            (start_height None: unknown, from TxNum 0)");
+    }
     tracing::info!(tokens = ?names, upto = st.upto, next = st.next, hot = st.hot,
         "balances: D3 history walk of newly tracked tokens (begun or resumed)");
     Ok(Some(HistoryWalk {
@@ -1372,6 +1397,73 @@ pub fn history_begin(
         coin,
         st,
     }))
+}
+
+/// Wall-clock budget of one deploy lookup in the code search index.
+const DEPLOY_LOOKUP_SECS: u64 = 30;
+/// Matching bodies one deploy lookup may verify; more and the lookup gives up.
+const DEPLOY_LOOKUP_CANDIDATES: usize = 10_000;
+
+/// The lowest height at which a tx can name any of `modules` (qualified names, each with its
+/// `Tokens.first_height`, `u32::MAX` when unknown) successfully: the earliest deploy of one
+/// of them. Before its deploy no tx can call a module, and a failed tx changes no balance, so
+/// a history walk of these tokens loses nothing by starting there.
+///
+/// The deploy comes from the code search index (`search/`): every exec body that holds
+/// `module` and the module's bare name, and its `first_h` (the height of the body's first
+/// tx). Both index modes hold every deploy (fallback mode keeps `(module ` bodies and every
+/// body over its length floor). An event-based bound (`first_height`, the oldest `xfer`
+/// posting or the discovery height) is only a check here: a module can be named for a long
+/// time before its first event (create-account, admin calls), so it is never the start.
+///
+/// `None` (the caller walks from TxNum 0) when the deploy is not provably known: no index, a
+/// lookup that failed, timed out or hit its candidate cap, no matching body, a deploy above
+/// the height the index is built through or at or above a height a `rebuild-range` changed
+/// under it, or a module whose `first_height` lies below the deploy the index shows.
+pub fn walk_start_height(search_dir: &Path, modules: &[(String, u32)]) -> Option<u32> {
+    if modules.is_empty() {
+        return None;
+    }
+    let s = match kdx_search::Searcher::open(search_dir, DEPLOY_LOOKUP_CANDIDATES) {
+        Ok(Some(s)) => s,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "balances: D3 walk start: code search index unreadable");
+            return None;
+        }
+    };
+    let deadline = Instant::now() + std::time::Duration::from_secs(DEPLOY_LOOKUP_SECS);
+    let mut floor = u32::MAX;
+    for (m, first) in modules {
+        let bare = m.rsplit('.').next().unwrap_or(m);
+        let like = kdx_types::like::Like::new(&format!("module%{bare}"));
+        let c = match s.candidates(&like, kdx_search::Window::ALL, deadline) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(module = %m, error = %e, "balances: D3 walk start: deploy lookup failed");
+                return None;
+            }
+        };
+        if c.truncated {
+            tracing::warn!(module = %m, examined = c.examined,
+                "balances: D3 walk start: deploy lookup truncated");
+            return None;
+        }
+        let deploy = c.hashes.iter().map(|(_, f, _)| *f).min()?;
+        let deploy = u32::try_from(deploy).ok()?;
+        let built = s.manifest.built_through_height;
+        if deploy > built
+            || s.manifest.stale_from_height.is_some_and(|h| deploy >= h)
+            || *first < deploy
+        {
+            tracing::warn!(module = %m, deploy, first_height = *first, built,
+                stale_from = ?s.manifest.stale_from_height,
+                "balances: D3 walk start: deploy height not provable");
+            return None;
+        }
+        floor = floor.min(deploy);
+    }
+    Some(floor)
 }
 
 impl HistoryWalk {
