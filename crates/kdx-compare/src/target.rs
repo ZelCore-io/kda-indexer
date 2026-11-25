@@ -188,6 +188,14 @@ impl Target {
     }
 
     /// [`Target::new`] with every client option ([`ClientOpts`]).
+    /// A test's target with its limiter swapped, for a mock oracle that the 1 r/s production cap
+    /// would make a test wait minutes on (the cap itself is covered where it is set).
+    #[cfg(test)]
+    pub(crate) fn with_test_limiter(mut self, rps: f64) -> Target {
+        self.limiter = Limiter::new(rps);
+        self
+    }
+
     pub fn with_opts(
         name: &str,
         url: Url,

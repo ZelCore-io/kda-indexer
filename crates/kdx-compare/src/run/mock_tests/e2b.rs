@@ -71,9 +71,16 @@ async fn tc_ctx(dir: &std::path::Path, ours: (Vec<Value>, u64), oracle: (Vec<Val
     let au = ours_fn_server(walk_reply("transfers", ours.0, ours.1)).await;
     let bu = ours_fn_server(walk_reply("transfers", oracle.0, oracle.1)).await;
     let ops = c3_ops(dir);
-    Ctx::new(c3_cfg(&nu, &au, &bu, dir, &ops, ""))
+    // The mock oracle is not rate-limited like the live one (at most 1 r/s): a 20,000-row walk
+    // is 200 pages, minutes of waiting. The node client's rate is raised the same way.
+    let mut ctx = Ctx::new(c3_cfg(&nu, &au, &bu, dir, &ops, "node_max_rps = 100000"))
         .await
-        .unwrap()
+        .unwrap();
+    ctx.targets = std::mem::take(&mut ctx.targets)
+        .into_iter()
+        .map(|(n, t)| (n, t.with_test_limiter(100_000.0)))
+        .collect();
+    ctx
 }
 
 /// The live rules on two first pages that differ by their totalCount alone.
