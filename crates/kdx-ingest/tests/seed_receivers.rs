@@ -1222,6 +1222,36 @@ fn a_spoofed_modref_is_never_tracked_and_discovery_is_capped_per_namespace() {
         .is_empty());
 }
 
+/// F-52: a failure after `persist` aborts the txn; the dictionary must then match MDBX again
+/// (no id for a name that never reached `DictFwd`/`DictRev`).
+#[test]
+fn a_failed_discovery_check_reloads_the_dictionary() {
+    let (_d, c) = d3_store();
+    // `free.bad` is known to the dictionary and has an undecodable token row, so
+    // `note_token` fails for it, after `free.fresh` interned and persisted in the same txn.
+    let bad = {
+        let mut d = c.dict.lock().unwrap();
+        let id = d.intern(DictKind::Module, "free.bad");
+        let mut txn = c.hot.rw().unwrap();
+        d.persist(&mut txn).unwrap();
+        txn.put(Table::Tokens, &id.to_be_bytes(), &[1u8]).unwrap();
+        txn.commit().unwrap();
+        id
+    };
+    let q = vec![
+        ("free.fresh".to_owned(), 0u8, 26u32),
+        ("free.bad".to_owned(), 0u8, 26u32),
+    ];
+    let r = seed_receivers::check_discovered(&c.hot, &c.dict, &q, &[Some(true), Some(true)]);
+    assert!(r.is_err(), "{r:?}");
+    let d = c.dict.lock().unwrap();
+    assert_eq!(d.find(DictKind::Module, "free.fresh"), None);
+    assert_eq!(d.find(DictKind::Module, "free.bad"), Some(bad));
+    let db = kdx_hot::HotDict::load(&c.hot.ro().unwrap()).unwrap();
+    assert_eq!(d.len(DictKind::Module), db.len(DictKind::Module));
+    assert_eq!(d.pending(), 0);
+}
+
 const LATE_ACC: &str = "k:8888888888888888888888888888888888888888888888888888888888888888";
 
 #[test]
