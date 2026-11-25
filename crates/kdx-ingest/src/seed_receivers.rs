@@ -1385,8 +1385,8 @@ pub fn history_begin(
         let segs = Segments::open_without_filters(segdir, snap.clone())?;
         st.next = height.map_or(0, |h| frozen_start(&segs, h));
         tracing::info!(tokens = ?names, start_height = ?height, start_txnum = st.next,
-            "balances: D3 history walk starts at the earliest deploy of its tokens \
-            (start_height None: unknown, from TxNum 0)");
+            "balances: D3 history walk start (start_height None means the deploy is unknown \
+            and the walk begins at TxNum 0)");
     }
     tracing::info!(tokens = ?names, upto = st.upto, next = st.next, hot = st.hot,
         "balances: D3 history walk of newly tracked tokens (begun or resumed)");
@@ -1421,12 +1421,19 @@ const DEPLOY_LOOKUP_CANDIDATES: usize = 10_000;
 /// the height the index is built through or at or above a height a `rebuild-range` changed
 /// under it, or a module whose `first_height` lies below the deploy the index shows.
 pub fn walk_start_height(search_dir: &Path, modules: &[(String, u32)]) -> Option<u32> {
+    tracing::info!(dir = %search_dir.display(), modules = ?modules,
+        "balances: D3 walk start: deploy lookup");
     if modules.is_empty() {
+        tracing::warn!("balances: D3 walk start: no modules to look up");
         return None;
     }
     let s = match kdx_search::Searcher::open(search_dir, DEPLOY_LOOKUP_CANDIDATES) {
         Ok(Some(s)) => s,
-        Ok(None) => return None,
+        Ok(None) => {
+            tracing::warn!(dir = %search_dir.display(),
+                "balances: D3 walk start: no code search index (no manifest)");
+            return None;
+        }
         Err(e) => {
             tracing::warn!(error = %e, "balances: D3 walk start: code search index unreadable");
             return None;
@@ -1449,8 +1456,15 @@ pub fn walk_start_height(search_dir: &Path, modules: &[(String, u32)]) -> Option
                 "balances: D3 walk start: deploy lookup truncated");
             return None;
         }
-        let deploy = c.hashes.iter().map(|(_, f, _)| *f).min()?;
-        let deploy = u32::try_from(deploy).ok()?;
+        let Some(deploy) = c.hashes.iter().map(|(_, f, _)| *f).min() else {
+            tracing::warn!(module = %m, examined = c.examined,
+                "balances: D3 walk start: no deploy body matches");
+            return None;
+        };
+        let Ok(deploy) = u32::try_from(deploy) else {
+            tracing::warn!(module = %m, deploy, "balances: D3 walk start: deploy height out of range");
+            return None;
+        };
         let built = s.manifest.built_through_height;
         if deploy > built
             || s.manifest.stale_from_height.is_some_and(|h| deploy >= h)
@@ -1461,6 +1475,8 @@ pub fn walk_start_height(search_dir: &Path, modules: &[(String, u32)]) -> Option
                 "balances: D3 walk start: deploy height not provable");
             return None;
         }
+        tracing::info!(module = %m, deploy, matches = c.hashes.len(),
+            "balances: D3 walk start: deploy found");
         floor = floor.min(deploy);
     }
     Some(floor)
