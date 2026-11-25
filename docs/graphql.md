@@ -59,11 +59,12 @@ Differences from Kadena graph:
   sorts above every user tx of its block; user rows keep the cursors of the list without the
   flag. A list of one block (`blockHash` without `requestKey`, the `Block` connections) is in
   the node's order, coinbase first, as the node lists it. The stock indexer's order there is
-  not the node's: in the G4 replay of real traffic, a nested `Block.transactions` page of a
-  block with more transactions than the page held a different subset of the block on stock
-  than on ours (51 records), while a block that fits on one page held the same rows. So the
-  first page of a large block, and the cursors that walk on from it, differ between the two;
-  ours follows the node.
+  not the node's: in the G4 replay of real traffic, the first page of a nested
+  `Block.transactions` list of a block with more transactions than the page held a different
+  subset of the block on stock than on ours (51 records), and ours follows the node. For
+  blocks with more transactions than one page, only the first page was compared in G4 (515
+  records: the 51 above, and 464 whose lists never finished); the rest of those lists was not
+  compared with stock. A full page-walk comparison is planned.
 - Root fields of the stock indexer that are not in Kadena's schema are not served: the DEX
   fields `pools`, `dexMetrics` and `tokenPrices` (one real request asked for them in the G4
   replay) are unknown fields: the document answers `GRAPHQL_VALIDATION_FAILED` (HTTP 400, see
@@ -327,7 +328,7 @@ number open.
   page of a block larger than the page holds other rows there (see Row order under
   [Schema](#schema)).
 - **Orphan blocks.** `blocksFromHeight` lists the canonical blocks only (the store keeps no
-  others, and every block in the G4 replay matched the node's canonical header). The stock
+  others, and every block checked in the G4 replay matched the node's canonical header: 63,582 ok, 0 bad). The stock
   indexer also lists non-canonical blocks (60 records in the G4 replay): the same chain and
   height twice (an orphan next to the canonical block), or an orphan that takes a slot of a
   20-row page so that another chain's block drops out of it. Its `canonical: false` rows are
@@ -592,7 +593,7 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
   value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
   with `chainIds` set the rows come in the order asked (each chain once), as stock lists them;
   `fungibleChainAccount` on a chain without a row is `null`.
-- **Rows the node holds at 0 are not listed** (known gap Q). An account that exists on a chain
+- **Rows the node holds at 0 are not listed** (a known gap). An account that exists on a chain
   with balance 0 may have no row here, so it is absent from `chainAccounts`, from
   `fungibleChainAccounts` and from `balance(...)`, and an account whose rows are all at 0 can
   answer `fungibleAccount: null`. The stock indexer lists such zero rows. The G4 replay found

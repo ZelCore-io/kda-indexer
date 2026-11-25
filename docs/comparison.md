@@ -257,9 +257,9 @@ The G4 replay of real traffic (below) met most of these classes again; its
   (`search-cont-history`).
 - Rows of one height have no defined order in `/txs/search` (`search-tie-order`,
   `pactid-tie-order`) or in GraphQL lists (`graphql-r57-height-ties`); a page cut inside one block
-  lists the node's order (`graphql-r75-single-block-cut`). The stock GraphQL indexer orders a
-  block's transactions otherwise, so the first page of a block larger than the page holds
-  other rows on stock (G4 class 7, see [graphql.md](graphql.md#schema), Row order).
+  lists the node's order (`graphql-r75-single-block-cut`). On the first page of a block larger
+  than the page, stock held other rows than ours in 51 records (G4 class 7, see
+  [graphql.md](graphql.md#schema), Row order); the rest of those lists was not compared.
 - GraphQL `totalCount` above 10,000 answers 10,000 (`graphql-totalcount-cap`); a count that ran out
   of its deadline is a lower bound flagged in `extensions.totalCountLowerBound`
   (`graphql-r58-count-lower-bound`).
@@ -280,10 +280,11 @@ The G4 replay of real traffic (below) met most of these classes again; its
   served, so introspection answers differ ([graphql.md](graphql.md#schema)).
 - `balance(...)` lists fungible balances only; stock also lists marmalade ledger rows at 0
   (R-G4-03, [graphql.md](graphql.md#schema)).
-- Rows the node holds at 0 are not listed in balances (known gap Q,
+- Rows the node holds at 0 are not listed in balances (a known gap,
   [graphql.md](graphql.md#accounts)).
-- chainweb-data account lists without `minheight` show only recent rows; ours answers the
-  whole history ([api.md](api.md#compat-notes)).
+- chainweb-data answered the `fluxteam` account list (`limit=200000`, no `minheight`) with
+  recent rows only, 27 to 32 against ours' 237; ours answers the whole history (R-G4-05). The
+  general cause is inferred from this one account ([api.md](api.md#compat-notes)).
 
 ### Stock faults the node disproves
 
@@ -331,7 +332,7 @@ match nothing.
 
 ## G4 real-traffic replay
 
-**Numbers as of 2026-11-25; refreshed after the final G4 checks.** The same results as a
+**Numbers as of 2026-11-25; to be refreshed after the final G4 checks.** The same results as a
 standalone page: [g4-comparison.html](g4-comparison.html).
 
 ### Method
@@ -343,11 +344,17 @@ chainweb-data or kda-txs). The comparison is a paired compare of the full JSON a
 field, every row, the status code and the GraphQL `errors` array. It fails closed: an answer
 is equal only when the two bodies are equal after the documented normalizations (float
 tolerance, decimal text, key order inside JSON texts), so a shorter list shows as missing
-rows and a list in another order shows as a difference. Every remaining difference was then
-settled against the node (its canonical headers, `/poll` and `/local` reads) or by a written
-ruling. Requests the stock side could not answer were replayed on ours alone, and ours' rows
-were checked on the node. Balances were checked separately: every balance row of all 1.21
-million accounts against the node.
+rows and a list in another order shows as a difference. The differences were then closed
+in four ways: reads on the node (its canonical headers, `/poll` and `/local` reads), written
+rulings, set re-checks with one-off scripts that are not in the repository, and, for the 336
+`/v1/txs` records of the first run, pattern matching against an earlier triage with no
+per-record read. Four differences are not settled (#7, #37, #38, #39); the tables below say
+which checks were weak. Requests the stock side could not answer were replayed on ours
+alone, and ours' rows were checked on the node. Balances were checked separately: every
+account was scanned and its balance rows compared with the node, except the 489 `lago` rows
+and the 23 rows with non-ASCII module names, which the node cannot read (#40, #41). The 16
+`balance` differences closed as tip races were closed weakly: "ours now equals stock's
+value" does not tell a tip race from a stale row of ours that was fixed later.
 
 Weights: "distinct" counts distinct requests; "7 days" counts the real requests they stand
 for.
@@ -360,15 +367,15 @@ for.
 | `transaction` | 16,845 / 34,399 | all | – | ~327 run-1 diffs not itemized |
 | `transactions` | 5,207 / 45,596 | all; isCoinbase re-run live | – | gasLimit fix not replayed |
 | `transfers` | 554 / 619 | all | – | 44 diffs never classified |
-| `balance(...)` | 350 / 371 | all, by position | all accounts | – |
-| `fungibleAccount` | 353 / 373 | all | all accounts, and the pending records | – |
+| `balance(...)` | 350 / 371 | all, by position | all accounts, except 489 `lago` and 23 non-ASCII rows | – |
+| `fungibleAccount` | 353 / 373 | all | all accounts (same exceptions), and the pending records | – |
 | `nonFungibleAccount` | 354 / 374 | none (stock crashes) | none | **never** |
 | `lastTokenPriceInKda` | 49 / 242 | 15 (34 stock 504) | – | served version not replayed |
 | `pactQuery`, `__schema`, `networkInfo` | 34 / 136 | all | tip rule | – |
 | `blocksFromDepth`, `completedBlockHeights`, `events` | 7 / 26 | all | – | 5 diffs never classified |
 | REST `/v1/txs` | 1,598 / 28,322 | all (48 h by key; the rest by position) | one-side rows (15) | 336 diffs only matched by pattern |
 | chainweb-data `/txs/account` | 52 / 69,725 | the pollers that carry the traffic | `fluxteam` 10/10 | ~46 small accounts |
-| chainweb-data `/txs/recent` | 1 / 36,720 | stale stock cache | – | **rows never compared** |
+| chainweb-data `/txs/recent` | 1 / 36,720 | stale cache (test instance with hung queries) | – | **rows never compared** |
 | chainweb-data `/txs/search` | 22 / 40 | stock hangs | – | **never** |
 | chainweb-data stats | 3 / 20 | stock unavailable | – | not in G4 |
 | GraphQL subscriptions | not captured | – | – | volume unknown |
@@ -386,11 +393,11 @@ for, and nothing beyond it.
 | `totalCount` / `hasNextPage` | wherever the query selects them (`balance`, `transactions`) | – | partly | Compared. One rule accepts stock's count when it is below its own row count. Stock's `totalCount: 1` while listing 2 or more rows (580 cases) was closed by hand. |
 | Lists compared by position | `balance(...)` edges, `/v1/txs`, nested block transactions | 371 + 28,322 + 41,693 | harness gap | Order differences show as content differences. They were re-matched by key afterwards: `balance` 270 records, and the 48-hour `/v1/txs` set (219 paths). The 336 `/v1/txs` corpus differences (13,196 requests) were closed by pattern. |
 | Per-token limit window | kda-txs `/v1/txs` (25 rows per token) | 2,803 (48 h) | checked | Compared inside the window. In one case stock missed 2 new rows and filled its 25 with older ones; the node confirmed ours. |
-| Big limits | chainweb-data `/txs/account?limit=200000` (`fluxteam`) | 35,594 | full list | Compared in full: ours 237 rows, stock 27–32; the node confirmed ours. |
+| Big limits | chainweb-data `/txs/account?limit=200000` (`fluxteam`) | 35,594 | one account | Ours' full history (237 rows) against stock's recent window (27–32 rows); the node confirmed 10 of 10 sampled ours-only rows. Other accounts were not compared this way. |
 | "Incomplete" never reported | all per-family tables | – | gap | The harness flags answers that hit a page limit as incomplete, but no G4 table has that column. |
 | Ours only, no stock pair | `nonFungibleAccount` (stock crashes), `/txs/search` (stock hangs), `/txs/recent` (stale stock cache) | 374 + 40 + 36,720 | not compared | No stock answer and no node check in G4. |
 | Changed after the replay | coinbase `gasLimit`, `lastTokenPriceInKda` | 45,584 + 242 | offline only | Fixed after the replay and checked against the stored answers only. |
-| Values compared in full | all balances | 1.21 M accounts | full | Every balance row was checked against the node. Only the 7 bridge rows and the zero-row gap remain. |
+| Values compared in full | all balances | 1.21 M accounts | full, with exceptions | Every account was scanned against the node. Not checked: the 489 `lago` rows and the 23 non-ASCII rows, which the node cannot read. Still open: the 7 bridge rows and the zero-row gap. The 16 tip races were closed weakly (see Method). |
 
 Planned before G4 closes: a page-walk check (each side walked to its last page with its own
 cursors, rows compared as sets plus `totalCount`, one-side rows read on the node), including
@@ -428,7 +435,7 @@ documented difference), **unknown** (not settled yet).
 | 19 | signer order | 1 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
 | 20 | `crossChainTransfer.creationTime` in whole seconds | 2 | both | [graphql.md](graphql.md#wire-formats-that-follow-the-oracle-r-p5p9-19) |
 | 21 | failed tx `badResult`: `callStack` and `info` | 117 | ours (= node, owner ruling) | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
-| 22 | zero-balance rows and missing chain rows (gap Q) | 42 + 16 + 38 + 61 keys + 5 | stock lists rows the node holds at 0; ours omits them | [graphql.md](graphql.md#accounts) |
+| 22 | zero-balance rows and missing chain rows (a known gap) | 42 + 16 + 38 + 61 keys + 5 | stock lists rows the node holds at 0; ours omits them | [graphql.md](graphql.md#accounts) |
 | 23 | `balance` edge order | 82 | both | [graphql.md](graphql.md#zelcore-extensions) |
 | 24 | stock lacks funded balance rows | 5 + 12 | ours | [graphql.md](graphql.md#accounts) |
 | 25 | ours' rows read before the queue drained, now equal to the node | 216 | both (transient) | [graphql.md](graphql.md#accounts) |
@@ -441,8 +448,8 @@ documented difference), **unknown** (not settled yet).
 | 32 | kda-txs event order, and its `_id` | ~120 + 3 | ours (node order) | [api.md](api.md#compat-notes) |
 | 33 | kda-txs answers 404 after 30 s, ours 504 | 4 | ours | [api.md](api.md#compat-notes) |
 | 34 | kda-txs lacks rows the node has | 4 paths (7,242 in 48 h) | ours | [api.md](api.md#compat-notes) |
-| 35 | chainweb-data `/txs/account` without `minheight`: stock shows recent rows only | 1 (35,594; 10,175 in 48 h) | ours (node 10/10) | [api.md](api.md#compat-notes) |
-| 36 | chainweb-data `/txs/recent`: stale stock cache | 1 (36,720; 10,182 in 48 h) | ours (fresher) | [api.md](api.md#compat-notes) |
+| 35 | chainweb-data `/txs/account` without `minheight`: for `fluxteam`, stock answered recent rows only (27–32 against ours' 237; the general cause is inferred) | 1 (35,594; 10,175 in 48 h) | ours (node 10/10) | [api.md](api.md#compat-notes) |
+| 36 | chainweb-data `/txs/recent`: stale cache, seen on a test instance whose refresh queries were hung | 1 (36,720; 10,182 in 48 h) | ours (fresher) | [api.md](api.md#compat-notes) |
 | 37 | `/txs/search`: ours `[]` in about 2 s, stock hangs | 4–22 (40) | unknown | latency: [Where REST is slower](#where-rest-is-slower); content not checked yet |
 | 38 | `transfers` differences never classified | 44 (65) | unknown | not classified yet |
 | 39 | `blocksFromDepth`, `completedBlockHeights`, `events` differences never classified | 5 | unknown | not classified yet |

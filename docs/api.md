@@ -107,16 +107,20 @@ Every search route runs under one gate: at most `search.concurrency` (4) searche
       database id, which ours does not have. The rows are the same as a set.
 - **chainweb-data account lists without `minheight`.** `/txs/account/{account}` with no
   `minheight` answers the account's whole history on ours, up to `limit`. chainweb-data
-  answers only recent rows then: for the public `fluxteam` account, asked with
-  `limit=200000` (about a third of the real chainweb-data traffic in 48 hours), chainweb-data
-  listed 27 to 32 rows from December 2023 on, and ours lists all 237 from April 2021 on. Every
-  row of chainweb-data's is in ours' list with the same fields, and 10 of 10 sampled
-  ours-only rows are on the node. Ours keeps the full history (it is what the node holds); a
-  client that relied on the short list gets a longer one. With `minheight=0` chainweb-data
-  did not answer within 60 s.
-- **`/txs/recent`.** Ours answers from its tip on every request. chainweb-data can serve a
-  stale cached answer: in the G4 replay its newest row stayed at the same block for 18
+  answered only recent rows in the one case that was compared in full: the public `fluxteam`
+  account, asked with `limit=200000` (about a third of the real chainweb-data traffic in 48
+  hours). chainweb-data listed 27 to 32 rows from December 2023 on (the count moved between
+  reads), and ours listed all 237 from April 2021 on: ours' full history against stock's
+  recent window. Every row of chainweb-data's is in ours' list with the same fields, and 10
+  of 10 sampled ours-only rows are on the node. That chainweb-data shows only recent rows
+  for other accounts is inferred from this one; the cause was not established. Ours keeps the
+  full history (it is what the node holds; R-G4-05); a client that relied on the short list
+  gets a longer one. With `minheight=0` chainweb-data did not answer within 60 s.
+- **`/txs/recent`.** Ours answers from its tip on every request. In the G4 replay,
+  chainweb-data served a stale cached answer: its newest row stayed at the same block for 18
   minutes while the chain moved on by more than 30 blocks, and five reads 3 s apart gave the
-  same answer. So the two lists can differ at any moment, and ours is the fresher one.
+  same answer. This was seen once, on a test chainweb-data instance whose refresh queries were
+  hung (the cache cleared when those queries were cancelled), so it may not reflect a healthy
+  chainweb-data. While the cache is stale the two lists differ, and ours is the fresher one.
 - **`/txs/events` heavy reads (F-20).** A request that may walk without a selective posting list is a heavy read: one with no `modulename`, or with `modulename` plus a `param`, a `search`, or a `name` pattern (a `name` holding `%` or `_`, so `name=TRANSFER_XCHAIN` counts). Heavy reads share the heavy-read slots with the GraphQL lists and `/txs/search`. Each client (IPv4 address or IPv6 /64) runs one at a time with up to 3 more waiting; a further concurrent heavy request answers 503 `this client already runs a heavy request and has others waiting: retry when they are done` at once, with no `Retry-After`. `modulename` alone, or with a plain `name`, stays a normal read (with a plain `name` matching more than `api.max_event_lists` (64) event names in that module too). The answers themselves are unchanged.
 - **Decimal text (R-P5P9-98).** GraphQL `Decimal` values print the shortest exact text: no trailing zeros of the fraction. Only `transfers.amount` is a string; balances are JSON numbers. The node gives Pact decimals as `{"decimal":"138000.000000000000"}` and the reference GraphQL server often prints that scale (`"138000.000000000000"`, and at times 30 places); kda-indexer prints `"138000"` for `transfers.amount` and `138000` for a balance. The values are equal as exact decimals, so a client that parses the number gets the identical value. A client that compares the raw text, or shows the trailing zeros, sees a different string. The comparison harness counts amounts as equal when they are equal as exact decimals (never through floats), on both sides and against the node; this is a documented format difference, not a value difference.

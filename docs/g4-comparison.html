@@ -56,7 +56,7 @@ footer{color:var(--muted);font-size:.82rem}
 <div class="wrap">
 <header style="display:grid;gap:8px">
   <h1>KDA Indexer vs Stock</h1>
-  <p class="sub">An independent audit of the G4 replay of real production requests: what was compared, how it was compared, and every difference found between ours and stock (the Kadena GraphQL indexer, chainweb-data and kda-txs). Audit of 25 Nov 2026; doc status updated with the G4 docs change. Numbers as of 25 Nov 2026, refreshed after the final G4 checks.</p>
+  <p class="sub">An independent audit of the G4 replay of real production requests: what was compared, how it was compared, and every difference found between ours and stock (the Kadena GraphQL indexer, chainweb-data and kda-txs). Audit of 25 Nov 2026; doc status updated with the G4 docs change. Numbers as of 25 Nov 2026, to be refreshed after the final G4 checks.</p>
 </header>
 
 <section>
@@ -68,6 +68,7 @@ footer{color:var(--muted);font-size:.82rem}
     <div class="kpi"><span>Ours wrong, open</span><b>2</b></div>
     <div class="kpi"><span>Not settled</span><b>4</b></div>
   </div>
+  <p class="sub"><b>Documented</b> means described in the public docs. It does not mean fully compared: some documented kinds (#7, #37) are still not fully compared.</p>
   <div class="verdict">
     <h3>Verdict</h3>
     <p><b>Detecting differences is sound.</b> Every response is compared as full JSON, fail-closed. Comparing by position can over-report differences but can't hide one.</p>
@@ -82,23 +83,23 @@ footer{color:var(--muted);font-size:.82rem}
     <thead><tr><th>Pattern</th><th>Where it happens</th><th>Real requests (7 days)</th><th>Status</th><th>What it means</th></tr></thead>
     <tbody>
     <tr><td><b>Only page 1 compared</b></td><td>Every paged list: <code>transactions</code>, <code>transfers</code>, <code>events</code>, <code>balance(...)</code>, account lists</td><td class="n">all list traffic</td><td><span class="chip bad">gap</span></td><td>Clients ask for page 2 and later with a <b>stock-issued cursor</b>. Ours can't read stock's cursors (both sides treat cursors as private), so a page-2 request can't be paired. Only 57 such requests were in the corpus, all nested inside <code>blocksFromHeight</code>, and ours answered "invalid cursor". <b>Ours' own paging (walking to the end with its own cursors) was never compared with stock's.</b></td></tr>
-    <tr><td><b>Block transactions cut at page 1</b></td><td>Nested <code>blocksFromHeight → transactions</code> when a block has more transactions than the page size</td><td class="n">41,693</td><td><span class="chip bad">gap</span></td><td>515 records: 464 were never completed (h6-unfinished) and 51 had a different page 1 because of order. They were counted as "known", but the rest of each block's list was never compared. The doc said the order matches stock's; G4 shows it doesn't, and the doc now says so.</td></tr>
+    <tr><td><b>Block transactions cut at page 1</b></td><td>Nested <code>blocksFromHeight → transactions</code> when a block has more transactions than the page size</td><td class="n">41,693</td><td><span class="chip bad">gap</span></td><td>515 records: 464 were never completed (h6-unfinished) and 51 had a different page 1 because of order. They were counted as "known", but the rest of each block's list was never compared with stock. The docs now say that only page 1 was compared; a full page-walk comparison is planned.</td></tr>
     <tr><td><b>List length vs content</b></td><td>All lists</td><td class="n">–</td><td><span class="chip ok">compared</span></td><td>The whole body is compared, so a shorter list shows as missing or extra rows. Row counts are never compared on their own: count and content are checked together.</td></tr>
     <tr><td><b>totalCount / hasNextPage</b></td><td>Wherever the query selects them (<code>balance</code>, <code>transactions</code>)</td><td class="n">–</td><td><span class="chip warn">partly</span></td><td>Compared. One rule accepts stock's count when it's below its own row count. Stock's <code>totalCount: 1</code> while listing 2 or more rows (580 cases) was closed by hand, not by a rule.</td></tr>
     <tr><td><b>Lists compared by position</b></td><td><code>balance(...)</code> edges, <code>/v1/txs</code>, nested block transactions</td><td class="n">371 + 28,322 + 41,693</td><td><span class="chip warn">harness gap</span></td><td>The harness reports order differences as content differences. They were later re-matched by key with scripts outside the repo: <code>balance</code> 270 records, and only the 48-hour <code>/v1/txs</code> set (219 paths). The 336 <code>/v1/txs</code> corpus differences (13,196 requests) were closed by pattern, never matched by key.</td></tr>
     <tr><td><b>Per-token limit window</b></td><td>kda-txs <code>/v1/txs</code> (25 rows per token)</td><td class="n">2,803 (48 h)</td><td><span class="chip ok">checked</span></td><td>Compared inside the window only. In one case stock was missing 2 new rows, so it filled its 25 with older ones. The node confirmed ours.</td></tr>
-    <tr><td><b>Big limits</b></td><td>chainweb-data <code>/txs/account?limit=200000</code> (fluxteam)</td><td class="n">35,594</td><td><span class="chip ok">full list</span></td><td>Compared in full: ours 237 rows, stock 27–32. The node confirmed ours. Documented.</td></tr>
+    <tr><td><b>Big limits</b></td><td>chainweb-data <code>/txs/account?limit=200000</code> (fluxteam)</td><td class="n">35,594</td><td><span class="chip warn">one account</span></td><td>For <code>fluxteam</code>, ours' full history (237 rows) against stock's recent window (27–32 rows). The node confirmed 10 of 10 sampled ours-only rows. The general cause is inferred, and other accounts were not compared this way. Documented.</td></tr>
     <tr><td><b>"Incomplete" never reported</b></td><td>All per-family tables</td><td class="n">–</td><td><span class="chip warn">gap</span></td><td>The harness flags answers that hit a page limit as "incomplete", but no G4 table has that column. So we can't tell whether any were folded into "known".</td></tr>
-    <tr><td><b>Ours only, no stock pair</b></td><td><code>nonFungibleAccount</code> (stock crashes), <code>/txs/search</code> (stock hangs), <code>/txs/recent</code> (stock serves a stale cache)</td><td class="n">374 + 40 + 36,720</td><td><span class="chip bad">not compared</span></td><td>No stock answer and no node check in G4. <code>nonFungibleAccount</code> is also missing from the node-check tool.</td></tr>
+    <tr><td><b>Ours only, no stock pair</b></td><td><code>nonFungibleAccount</code> (stock crashes), <code>/txs/search</code> (stock hangs), <code>/txs/recent</code> (stock served a stale cache, on a test instance whose refresh queries were hung)</td><td class="n">374 + 40 + 36,720</td><td><span class="chip bad">not compared</span></td><td>No stock answer and no node check in G4. <code>nonFungibleAccount</code> is also missing from the node-check tool.</td></tr>
     <tr><td><b>Changed after the replay</b></td><td>Coinbase <code>gasLimit</code>, <code>lastTokenPriceInKda</code></td><td class="n">45,584 + 242</td><td><span class="chip warn">offline only</span></td><td>Fixed after run 2 and checked against stored answers only. Never replayed live on the release build.</td></tr>
-    <tr><td><b>Values compared in full</b></td><td>All balances (Task A)</td><td class="n">1.21 M accounts</td><td><span class="chip ok">full</span></td><td>Every balance row was checked against the node. Only the 7 bridge rows (PR #34) and the known zero-row gap remain.</td></tr>
+    <tr><td><b>Values compared in full</b></td><td>All balances (Task A)</td><td class="n">1.21 M accounts</td><td><span class="chip warn">full, with exceptions</span></td><td>Every account was scanned against the node. Not checked: the 489 <code>lago</code> rows and the 23 non-ASCII rows, which the node cannot read. Still open: the 7 bridge rows (PR #34) and the known zero-row gap. The 16 balance tip races were closed weakly.</td></tr>
     </tbody>
   </table></div>
   <div class="card">
     <h3>Planned fixes for these gaps</h3>
     <ul>
       <li><b>Page-walk check:</b> for a sample of every paged query shape, walk each side to its last page with its own cursors. Compare the combined rows as sets, plus <code>totalCount</code>, and check rows found on only one side against the node.</li>
-      <li><b>Paged block transactions:</b> walk all 515 blocks to the end on both sides and check them against the node payload. Fix the doc line.</li>
+      <li><b>Paged block transactions:</b> walk all 515 blocks to the end on both sides and check them against the node payload. The docs already say that only page 1 was compared.</li>
       <li><b>Harness:</b> set-based compare for <code>balance</code> and <code>/v1/txs</code>, an "incomplete" column in every table, and the closure scripts moved into the repo and reviewed.</li>
       <li><b>Live replay on the release build:</b> isCoinbase (5,193), token price (49) and a 2,000-case sample, at no more than 4 parallel requests to production.</li>
       <li><b>Ours-only families:</b> check <code>nonFungibleAccount</code>, <code>/txs/recent</code> and <code>/txs/search</code> against the node.</li>
@@ -111,11 +112,11 @@ footer{color:var(--muted);font-size:.82rem}
   <div class="tbl"><table>
     <thead><tr><th>Family</th><th>Distinct / 7-day requests</th><th>Compared with stock</th><th>Checked on node</th><th>Not compared</th></tr></thead>
     <tbody>
-    <tr><td><code>blocksFromHeight</code></td><td class="n">67,965 / 77,853</td><td>all</td><td>63,582 ok, 0 bad</td><td>nested lists in 515 records</td></tr>
+    <tr><td><code>blocksFromHeight</code></td><td class="n">67,965 / 77,853</td><td>all</td><td>every block checked: 63,582 ok, 0 bad</td><td>nested lists in 515 records</td></tr>
     <tr><td><code>transaction</code></td><td class="n">16,845 / 34,399</td><td>all</td><td>–</td><td>~327 run-1 diffs not itemized</td></tr>
     <tr><td><code>transactions</code></td><td class="n">5,207 / 45,596</td><td>all; isCoinbase re-run live</td><td>–</td><td>gasLimit fix not replayed</td></tr>
     <tr><td><code>transfers</code></td><td class="n">554 / 619</td><td>all</td><td>–</td><td>44 diffs never classified</td></tr>
-    <tr><td><code>balance(...)</code></td><td class="n">350 / 371</td><td>all, by position</td><td>all accounts (Task A)</td><td>–</td></tr>
+    <tr><td><code>balance(...)</code></td><td class="n">350 / 371</td><td>all, by position</td><td>all accounts (Task A), except 489 <code>lago</code> and 23 non-ASCII rows</td><td>–</td></tr>
     <tr><td><code>fungibleAccount</code></td><td class="n">353 / 373</td><td>all</td><td>Task A / B</td><td>–</td></tr>
     <tr><td><code>nonFungibleAccount</code></td><td class="n">354 / 374</td><td>none (stock crashes)</td><td>none</td><td><b>never</b></td></tr>
     <tr><td><code>lastTokenPriceInKda</code></td><td class="n">49 / 242</td><td>15 (34 stock 504)</td><td>–</td><td>served version not replayed</td></tr>
@@ -143,7 +144,7 @@ footer{color:var(--muted);font-size:.82rem}
     <tbody>
     <tr><td class="n">1</td><td><code>transactions(isCoinbase:true)</code>: ours refused the query</td><td class="n">5,193 (45.6k)</td><td><span class="chip ok">fixed</span> re-run: same rows 5,090/5,090</td></tr>
     <tr><td class="n">2</td><td>Malformed request key: ours returned an error, stock returns <code>null</code></td><td class="n">8,475 (17.4k)</td><td><span class="chip ok">fixed</span> 100% equal</td></tr>
-    <tr><td class="n">3</td><td>Coinbase <code>gasLimit</code> was <code>"0"</code> on ours, the number <code>0</code> on stock</td><td class="n">5,193</td><td><span class="chip ok">fixed</span> not replayed live</td></tr>
+    <tr><td class="n">3</td><td>Coinbase <code>gasLimit</code> was <code>"0"</code> on ours, the number <code>0</code> on stock</td><td class="n">5,193</td><td><span class="chip ok">matched</span> not replayed live</td></tr>
     <tr><td class="n">4</td><td><code>lastTokenPriceInKda</code> was not served</td><td class="n">49 (242)</td><td><span class="chip ok">fixed</span> offline check only</td></tr>
     </tbody>
   </table></div>
@@ -169,8 +170,8 @@ footer{color:var(--muted);font-size:.82rem}
     <tr><td class="n">32</td><td>kda-txs event order, and its Mongo <code>_id</code></td><td class="n">~123</td><td><span class="chip info">yes</span></td></tr>
     <tr><td class="n">33</td><td>kda-txs answers 404 after 30 s; ours answers 504</td><td class="n">4</td><td><span class="chip info">yes</span></td></tr>
     <tr><td class="n">34</td><td>kda-txs is missing rows the node has</td><td class="n">4 paths (7.2k in 48 h)</td><td><span class="chip info">yes</span></td></tr>
-    <tr><td class="n">35</td><td>chainweb-data account lists: stock shows only recent rows (fluxteam 27–32 vs 237)</td><td class="n">1 (35.6k)</td><td><span class="chip info">yes</span></td></tr>
-    <tr><td class="n">36</td><td>chainweb-data <code>/txs/recent</code>: stale stock cache</td><td class="n">1 (36.7k)</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">35</td><td>chainweb-data account list for <code>fluxteam</code>: stock showed only recent rows (27–32 vs 237); general cause inferred</td><td class="n">1 (35.6k)</td><td><span class="chip info">yes</span></td></tr>
+    <tr><td class="n">36</td><td>chainweb-data <code>/txs/recent</code>: stale cache, seen on a test instance with hung queries</td><td class="n">1 (36.7k)</td><td><span class="chip info">yes</span></td></tr>
     </tbody>
   </table></div>
 
@@ -201,7 +202,7 @@ footer{color:var(--muted);font-size:.82rem}
     <tr><td class="n">43</td><td><b>kb-* bridge balances:</b> 6 rows missing, 1 wrong</td><td class="n">7 rows</td><td><span class="chip warn">fix merged</span> PR #34 merged 25 Nov; deploying to the test server, then a ~14 h re-walk and a recheck of the 7 rows</td></tr>
     <tr><td class="n">22</td><td>Zero-balance rows: ours leaves out rows the node holds at 0</td><td class="n">~160</td><td><span class="chip bad">known gap</span> documented</td></tr>
     <tr><td class="n">41</td><td>lago stub rows: no balance on the node to check against</td><td class="n">489 rows</td><td><span class="chip info">documented</span> R-G4-02, excluded (PR #34)</td></tr>
-    <tr><td class="n">7</td><td>Paged block transactions: only page 1 compared; the doc is wrong</td><td class="n">515 (41.7k)</td><td><span class="chip bad">unknown</span> page-walk planned; order difference documented</td></tr>
+    <tr><td class="n">7</td><td>Paged block transactions: only page 1 compared; the docs now say so</td><td class="n">515 (41.7k)</td><td><span class="chip bad">unknown</span> page-walk planned; order difference documented</td></tr>
     <tr><td class="n">37</td><td><code>/txs/search</code>: ours answers <code>[]</code> in about 2 s, stock hangs</td><td class="n">4 (40)</td><td><span class="chip bad">unknown</span> node check planned</td></tr>
     <tr><td class="n">38</td><td><code>transfers</code> differences never classified</td><td class="n">44 (65)</td><td><span class="chip bad">unknown</span> re-check</td></tr>
     <tr><td class="n">39</td><td><code>blocksFromDepth</code>, <code>completedBlockHeights</code> and <code>events</code> differences never classified</td><td class="n">5</td><td><span class="chip bad">unknown</span> re-check</td></tr>
@@ -210,11 +211,6 @@ footer{color:var(--muted);font-size:.82rem}
 </section>
 
 <section>
-  <h2>Updates</h2>
-  <div class="card"><ul>
-    <li><b>25 Nov:</b> PR #34 merged. It fixes the bridge-token balance marking (#43), documents the lago exclusion (#41), and documents that <code>balance(...)</code> stays fungible-only (#42). A memory problem the review found is fixed too: a crafted transaction of 0.5 MB used to cost 968 MB, and now costs 0.7 MB. Deployment and the re-walk are in progress.</li>
-    <li><b>25 Nov:</b> Security re-check of the 10 open audit items. 2 were real but low impact (R-01, F-52) and are fixed in PR #35, merged together with an F-58 hardening. The other 8 don't apply in our setup, because they need our own trusted node to misbehave or can't be reached on our install.</li>
-  </ul></div>
   <h2>Before G4</h2>
   <div class="cols">
     <div class="card"><h3>Docs</h3><ul><li>Done: the sections "Intended differences" and "Stock faults the node disproves" are in the docs.</li><li>Done: every kind found is documented, except #38 and #39, which are not classified yet.</li><li>Done: the line about stock's block order is fixed.</li><li>Open: the final stats after the remaining checks.</li></ul></div>
