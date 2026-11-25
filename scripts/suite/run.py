@@ -411,6 +411,11 @@ def judge(win, err_limit, p99_limit):
     return er > err_limit or (p99_limit > 0 and p99 > p99_limit), er, p99
 
 
+# Fix round 1 (I1): the 504 guard's defaults; it is on unless a host sets guard_504_max = 0.
+G504_DEFAULTS = {"guard_504_max": 5, "guard_504_window_s": 60, "guard_504_action": "backoff",
+                 "guard_504_backoff_s": 300, "guard_504_max_trips": 3}
+
+
 class StockHost:
     """One stock backend with an adaptive throttle per class.
 
@@ -453,15 +458,15 @@ class StockHost:
         self.ramp_step = c.get("ramp_step", 5)
         self.max_height = c.get("max_height") or None
         self.timeout = c.get("timeout_s")
-        # WP-H1 504 guard (replaces the manual watcher): more than `guard_504_max` 504s within
-        # `guard_504_window_s` either stops the run ("stop") or pauses this host for
-        # `guard_504_backoff_s` ("backoff"); after `guard_504_max_trips` backoffs it stops. Off
-        # without guard_504_max.
-        self.g504_max = c.get("guard_504_max")
-        self.g504_window = float(c.get("guard_504_window_s", 300))
-        self.g504_action = c.get("guard_504_action", "stop")
-        self.g504_backoff = float(c.get("guard_504_backoff_s", 600))
-        self.g504_max_trips = int(c.get("guard_504_max_trips", 3))
+        # WP-H1 504 guard (replaces the manual watcher), on by default: `guard_504_max` 504s within
+        # `guard_504_window_s` either stop the run ("stop") or pause this host for
+        # `guard_504_backoff_s` ("backoff"); the `guard_504_max_trips`-th trip stops the run.
+        # An explicit guard_504_max = 0 turns it off.
+        self.g504_max = int(c.get("guard_504_max", G504_DEFAULTS["guard_504_max"]))
+        self.g504_window = float(c.get("guard_504_window_s", G504_DEFAULTS["guard_504_window_s"]))
+        self.g504_action = c.get("guard_504_action", G504_DEFAULTS["guard_504_action"])
+        self.g504_backoff = float(c.get("guard_504_backoff_s", G504_DEFAULTS["guard_504_backoff_s"]))
+        self.g504_max_trips = int(c.get("guard_504_max_trips", G504_DEFAULTS["guard_504_max_trips"]))
         if self.g504_action not in ("stop", "backoff"):
             raise ValueError("%s: guard_504_action must be stop or backoff" % name)
         self.g504 = collections.deque()
@@ -514,12 +519,12 @@ class StockHost:
             if status != 504:
                 return None
             self.g504.append(t)
-            if len(self.g504) <= self.g504_max:
+            if len(self.g504) < self.g504_max:
                 return None
             n = len(self.g504)
             self.g504.clear()
             self.g504_trips += 1
-            stop = self.g504_action == "stop" or self.g504_trips > self.g504_max_trips
+            stop = self.g504_action == "stop" or self.g504_trips >= self.g504_max_trips
         msg = "%s: %d stock 504s within %ds (guard_504_max %d)" % (self.name, n, self.g504_window, self.g504_max)
         if stop:
             self.note("504-guard-stop", n=n)
@@ -664,9 +669,29 @@ def _balance_map(b):
     for e in conn["edges"]:
         # Renamed so the f64 tolerance pair-diff gives a `balance` leaf (r57-float) cannot apply.
         if "balance" in e["node"]:
-            e["node"]["balanceExact"] = _exact(e["node"].pop("balance"))
+            raw = e["node"].pop("balance")
+            e["node"]["balanceExact"] = _exact(raw)
+            e["_raw"] = raw
     conn["edges"] = _keyed(conn["edges"], lambda e: "%s|%s" % (e["node"].get("chainId"), e["node"].get("module")))
     return set(conn["edges"])
+
+
+def _balance_text(ab, sb):
+    """Fix round 1 (M1): where both sides give the same exact balance in other text ("1.10" and
+    "1.1", a number and a string), both keep the raw value in `balanceText`, so the record shows
+    the difference a client sees; returns its `balance-text:<chainId|module>` labels (unaccepted)."""
+    ea = ab["data"]["balance"]["edges"] if ab is not None else {}
+    eb = sb["data"]["balance"]["edges"] if sb is not None else {}
+    labels = []
+    for k in sorted(set(ea) & set(eb)):
+        xa, xb = ea[k], eb[k]
+        if "_raw" in xa and "_raw" in xb and xa["node"].get("balanceExact") == xb["node"].get("balanceExact") \
+                and json.dumps(xa["_raw"]) != json.dumps(xb["_raw"]):
+            xa["node"]["balanceText"], xb["node"]["balanceText"] = xa["_raw"], xb["_raw"]
+            labels.append("balance-text:%s" % k)
+    for e in list(ea.values()) + list(eb.values()):
+        e.pop("_raw", None)
+    return labels
 
 
 def _v1txs_map(b):
@@ -710,6 +735,15 @@ def _tx_key(e):
     return (str(rk), json.dumps(e, sort_keys=True))
 
 
+def _proven_whole(c):
+    """A connection that shows it lists every row: `hasNextPage` false, or a `totalCount` equal to
+    its rows."""
+    pi = c.get("pageInfo") if isinstance(c.get("pageInfo"), dict) else {}
+    tc = c.get("totalCount")
+    return pi.get("hasNextPage") is False or \
+        (isinstance(tc, int) and not isinstance(tc, bool) and tc == len(c["edges"]))
+
+
 def _nested_block_txs(b):
     """The nested `transactions` connections of the blocks in a GraphQL answer (not a root list)."""
     return [(p, c) for p, c in _connections(b) if p.endswith("/transactions") and p != "/data/transactions"]
@@ -725,7 +759,7 @@ def normalize_pair(ep, ab, sb):
     - `/v1/txs` lists compare row by row, aligned by request key (WP-H1);
     - a block's nested `transactions` compares as a multiset by request key when both sides list
       the whole block; a cut one is left as it is and the record is incomplete (WP-H1)."""
-    info = {"cut": [], "one_side": []}
+    info = {"cut": [], "one_side": [], "labels": []}
     if ep == "gql.fungibleChainAccounts":
         for b in (ab, sb):
             xs = (_data(b) or {}).get("fungibleChainAccounts")
@@ -742,12 +776,18 @@ def normalize_pair(ep, ab, sb):
         ka, kb = _balance_map(ab), _balance_map(sb)
         if ka is not None and kb is not None:
             one = (ka, kb)
+        info["labels"] = _balance_text(ab if ka is not None else None, sb if kb is not None else None)
     if one:
         info["one_side"] = ["one-side:%s" % k for k in sorted(one[0] ^ one[1])]
+    # Fix round 1 (I3): a nested list compares as a multiset only when both sides prove it whole;
+    # one that may be a first page (no hasNextPage false, no totalCount equal to its rows) is cut.
     na, nb = dict(_nested_block_txs(ab)), dict(_nested_block_txs(sb))
-    cut_paths = {c.split(":", 1)[1].split(" ", 1)[0] for c in info["cut"]}
+    for side, n in (("ours", na), ("stock", nb)):
+        for path in sorted(n):
+            if not _proven_whole(n[path]) and not any(c.startswith("%s:%s " % (side, path)) for c in info["cut"]):
+                info["cut"].append("%s:%s unproven" % (side, path))
     for path in set(na) & set(nb):
-        if path not in cut_paths:
+        if _proven_whole(na[path]) and _proven_whole(nb[path]):
             na[path]["edges"].sort(key=_tx_key)
             nb[path]["edges"].sort(key=_tx_key)
     return ab, sb, info
@@ -809,7 +849,7 @@ def stored_verdict(v, k, ids):
     (H5 c: no cap), so a later re-referee sees every difference."""
     out = {"class": k, "ids": (v.get("ids") or []) + ids, "known": v.get("known_ids"), "open": v.get("open_ids") or [],
            "entries": (v.get("entries") or [])[:allow.MAX_SHOWN]}
-    for k2 in ("cut", "one_side"):          # WP-H1: why the record is incomplete; rows one side lists
+    for k2 in ("cut", "one_side", "labels"):    # WP-H1: why incomplete; rows one side lists; text labels
         if v.get(k2):
             out[k2] = v[k2]
     for k in ("total", "left_total"):
@@ -974,7 +1014,8 @@ def verdict_class(ep, cls, v, ours_codes, vars_, node, tip=None, query=None, idx
     partial = bool(cut if cut is not None else v.get("cut")) or \
         any(e.get("path") in PARTIAL_HITS or _unfinished(e) for e in seen)
     unfinished = [e for e in ents if _unfinished(e)]
-    if c in ("diff", "status") and unfinished and done is not False:
+    # Fix round 1 (I2): differing HTTP statuses stay `status`, whatever else the entries say.
+    if c == "diff" and unfinished and done is not False:
         rest = [e for e in ents if not _unfinished(e) and e.get("path") not in PARTIAL_HITS]
         if not rest:
             return "incomplete", []
@@ -1291,7 +1332,7 @@ class Runner:
                             node = row["node"] = dict(node or {}, **ev)
                     k, ids = verdict_class(ep, case["cls"], v, codes, vars_, node, row.get("tip"),
                                            req.get("query"), row.get("idx"), cut=aligned["cut"])
-                    row["v"] = stored_verdict(dict(v, **{x: aligned[x] for x in ("cut", "one_side") if aligned[x]}),
+                    row["v"] = stored_verdict(dict(v, **{x: aligned[x] for x in ("cut", "one_side", "labels") if aligned[x]}),
                                               k, ids)
                     keep_evidence(row, a["raw"], s["raw"], ab, sb, node)
         (self.sample if lane == "sample" else self.res).write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -2072,39 +2113,56 @@ def page_walk(cfg, a):
         r = ours.call(o["graphql"], body={"query": q, "variables": v})
         return r["status"], parse(r["raw"])
 
-    def fetch_stock_of(h):
-        def fetch(q, v):
-            if stop.is_set():
-                return 0, None
-            r = h.send({"query": q, "variables": v})
-            h.guard_504(time.monotonic(), r["status"])
-            return r["status"], parse(r["raw"])
-        return fetch
-
-    counts = collections.Counter()
+    # Fix round 1 (I4): one pacer per side for the whole walk, so the per-side rate holds across cases.
+    pacers = (pagewalk.Pacer(a.rps), pagewalk.Pacer(a.rps))
     with open(os.path.join(a.out, "pagewalk.jsonl"), "a", buffering=1) as f:
-        for i, c in enumerate(cases):
-            if stop.is_set():
-                break
-            try:
-                n = int(c["id"].rsplit(":", 1)[1])
-            except (IndexError, ValueError):
-                n = i
-            h = hosts[n % len(hosts)]
-            try:
-                rec = pagewalk.run_case(c, fetch_ours, fetch_stock_of(h), node, a.max_pages,
-                                        (pagewalk.Pacer(a.rps), pagewalk.Pacer(a.rps)))
-            except BudgetExhausted as e:
-                print("STOPPED: %s" % e, flush=True)
-                break
-            rec["host"] = h.name
-            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
-            counts[rec["status"]] += 1
-            print(json.dumps({"id": rec["id"], "status": rec["status"], "pages": rec["pages"], "rows": rec["rows"],
-                              "totalCount": rec["totalCount"],
-                              "one_side": [len(rec["one_side"]["ours"]), len(rec["one_side"]["stock"])]}), flush=True)
+        counts = walk_cases(cases, hosts, fetch_ours, lambda h: walk_stock_fetch(h, stop), node, a.max_pages,
+                            pacers, stop, lambda rec: f.write(json.dumps(rec, separators=(",", ":")) + "\n"))
     print("page-walk: %s" % json.dumps(dict(counts), sort_keys=True), flush=True)
     return 2 if stop.is_set() else 0
+
+
+def walk_stock_fetch(h, stop, poll_s=1.0):
+    """The page-walk's stock fetch for host `h` (Fix round 1, I5): it waits while the host's 504
+    guard backs off (`healthy` cleared), sends nothing once the walk is stopped (0, None), and
+    feeds every answer to the guard."""
+    def fetch(q, v):
+        while not h.healthy.wait(poll_s):
+            if stop.is_set():
+                return 0, None
+        if stop.is_set():
+            return 0, None
+        r = h.send({"query": q, "variables": v})
+        h.guard_504(time.monotonic(), r["status"])
+        return r["status"], parse(r["raw"])
+    return fetch
+
+
+def walk_cases(cases, hosts, fetch_ours, fetch_stock_of, node, max_pages, pacers, stop, write):
+    """Walks each case (pagewalk.run_case) with the same two pacers, case `gql.X:<n>` on host
+    `n % hosts`; `write(rec)` each record. Ends at a stop or an exhausted budget. Returns the
+    status counts."""
+    counts = collections.Counter()
+    for i, c in enumerate(cases):
+        if stop.is_set():
+            break
+        try:
+            n = int(c["id"].rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            n = i
+        h = hosts[n % len(hosts)]
+        try:
+            rec = pagewalk.run_case(c, fetch_ours, fetch_stock_of(h), node, max_pages, pacers)
+        except BudgetExhausted as e:
+            print("STOPPED: %s" % e, flush=True)
+            break
+        rec["host"] = h.name
+        write(rec)
+        counts[rec["status"]] += 1
+        print(json.dumps({"id": rec["id"], "status": rec["status"], "pages": rec["pages"], "rows": rec["rows"],
+                          "totalCount": rec["totalCount"],
+                          "one_side": [len(rec["one_side"]["ours"]), len(rec["one_side"]["stock"])]}), flush=True)
+    return counts
 
 
 def main():

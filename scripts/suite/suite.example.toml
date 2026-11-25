@@ -39,11 +39,11 @@ p99_limit_s = 5.0
 ramp_step = 5
 ramp_every_s = 120
 max_height = 0               # the stock side's highest indexed height (0: no cap)
-# guard_504_max = 20          # 504 guard (off without it): more than this many stock 504s ...
-# guard_504_window_s = 300    # ... within this many seconds ...
-# guard_504_action = "stop"   # ... stops the run, or "backoff": pauses this host guard_504_backoff_s
-# guard_504_backoff_s = 600   # and stops after guard_504_max_trips backoffs
-# guard_504_max_trips = 3
+guard_504_max = 5            # 504 guard, on by default (these are the defaults; 0 turns it off):
+guard_504_window_s = 60      # this many stock 504s within this many seconds ...
+guard_504_action = "backoff" # ... pause this host guard_504_backoff_s ("stop": end the run at once)
+guard_504_backoff_s = 300
+guard_504_max_trips = 3      # the third trip ends the run
 
 [[stock.oracle]]
 name = "stock-b"

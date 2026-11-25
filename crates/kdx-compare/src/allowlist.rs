@@ -787,6 +787,37 @@ mod tests {
         assert!(left.is_empty() && ids == vec!["oracle-orphan".to_string()]);
     }
 
+    /// WP-H1: r58/r60 are accepted on node samples taken when the rule was made, as
+    /// docs/comparison.md says, not on a per-record read. Fix round 1 (M5): the ids are listed
+    /// here, so a new entry cannot accept itself by copying the note text.
+    const NODE_SAMPLED: [&str; 2] = [
+        "graphql-r58-oracle-empty",
+        "graphql-r60-oracle-strips-quotes",
+    ];
+
+    fn node_sampled(e: &super::Entry) -> bool {
+        NODE_SAMPLED.contains(&e.id.as_str())
+    }
+
+    #[test]
+    fn node_sampled_acceptance_is_by_id_not_note_text() {
+        let al = shipped();
+        let r58 = al
+            .entries
+            .iter()
+            .find(|e| e.id == "graphql-r58-oracle-empty")
+            .expect("r58 shipped");
+        assert!(node_sampled(r58));
+        let mut copy = r58.clone();
+        copy.id = "graphql-r99-copied-note".into();
+        assert!(copy
+            .node_read
+            .as_deref()
+            .unwrap_or("")
+            .contains("accepted on node samples"));
+        assert!(!node_sampled(&copy), "note text alone must not accept");
+    }
+
     /// H5 (b): a stock fault is accepted only with per-record node evidence in code. Each
     /// accepted `stock-wrong-node-evidence` entry names the node read in `node_read` (the
     /// harness function and the read), and the audit's unconfirmable entries are open.
@@ -803,11 +834,8 @@ mod tests {
                 let owner = e
                     .ruling
                     .contains("Owner 2026-11-19: accepted as stock fault");
-                // WP-H1: r58/r60 are accepted on node samples taken when the rule was made, as
-                // docs/comparison.md says, not on a per-record read.
-                let sampled = n.contains("accepted on node samples");
                 assert!(
-                    owner || sampled || (n.contains("node") && n.contains("::")),
+                    owner || node_sampled(e) || (n.contains("node") && n.contains("::")),
                     "{}: no node read cited",
                     e.id
                 );

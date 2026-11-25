@@ -352,15 +352,20 @@ never accepted. A record an our-defect rule touches stays a diff.
 Before the diff, the suite aligns lists whose order carries no meaning:
 
 - `balance(...)` edges compare as a map from (chainId, module) to the exact decimal balance, so
-  only a missing, extra or different row is a difference, named by its key;
+  only a missing, extra or different row is a difference, named by its key. The same value in
+  other text (`"1.10"` and `"1.1"`, a number and a string) is still a difference, since a client
+  sees it: it is labelled `balance-text:<chainId|module>` and is not accepted;
 - `/v1/txs` lists compare row by row, aligned by request key; a row only one side lists is
   named `one-side:<requestKey>`;
 - a block's nested `transactions` list compares as a multiset keyed by request key, but only
-  when both sides list the whole block.
+  when both sides prove they list the whole block: `hasNextPage` false, or a `totalCount` equal
+  to the rows listed. A nested list that proves neither may be a first page; it keeps its order
+  and makes the record `incomplete`.
 
 A record is `incomplete`, never equal or accepted, when only part of a list was compared: a page
-cut, `hasNextPage` true on either side, a `totalCount` above the rows listed, or a nested list
-that stays `/~graphql-h6-unfinished`. Every per-endpoint table counts it in its own column. The
+cut, `hasNextPage` true on either side, a `totalCount` above the rows listed, a nested list not
+proven whole, or a nested list that stays `/~graphql-h6-unfinished`. Differing HTTP statuses
+stay `status`, never `incomplete`. Every per-endpoint table counts it in its own column. The
 page-walk mode of `scripts/suite/run.py` (`run.py page-walk`) walks such lists to their end on
 each side and compares the rows as sets.
 

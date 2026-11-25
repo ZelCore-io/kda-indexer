@@ -1883,11 +1883,27 @@ class WPH1SetCompare(unittest.TestCase):
     position; a cut list makes the record incomplete."""
 
     def test_balance_order_is_no_difference(self):
-        a = _bal(("0", "coin", "1.5"), ("1", "coin", 2))
-        b = _bal(("1", "coin", "2.0"), ("0", "coin", 1.5))
+        a = _bal(("0", "coin", "1.5"), ("1", "coin", "2"))
+        b = _bal(("1", "coin", "2"), ("0", "coin", "1.5"))
         a, b, info = run.normalize_pair("gql.balance", a, b)
         self.assertEqual(a, b)
         self.assertEqual(info["cut"], [])
+        self.assertEqual(info["labels"], [])
+
+    def test_balance_text_difference_is_its_own_label(self):
+        # Fix round 1 (M1): "1.10" and "1.1" are the same Decimal, but a client sees the text.
+        a, b, info = run.normalize_pair("gql.balance", _bal(("0", "coin", "1.10"), ("1", "coin", "2")),
+                                        _bal(("0", "coin", "1.1"), ("1", "coin", 2)))
+        na, nb = a["data"]["balance"]["edges"]["0|coin"]["node"], b["data"]["balance"]["edges"]["0|coin"]["node"]
+        self.assertEqual(na["balanceExact"], nb["balanceExact"])
+        self.assertEqual((na["balanceText"], nb["balanceText"]), ("1.10", "1.1"))
+        self.assertNotEqual(a, b)
+        self.assertEqual(info["labels"], ["balance-text:0|coin", "balance-text:1|coin"])
+        # a value difference is not a text label
+        _, _, info = run.normalize_pair("gql.balance", _bal(("0", "coin", "1.2")), _bal(("0", "coin", "1.1")))
+        self.assertEqual(info["labels"], [])
+        st = run.stored_verdict({"class": "diff", "entries": [], "labels": ["balance-text:0|coin"]}, "diff", [])
+        self.assertEqual(st["labels"], ["balance-text:0|coin"])
 
     def test_balance_values_compare_exactly(self):
         a, b, _ = run.normalize_pair("gql.balance", _bal(("0", "coin", "1.00000000000000001")),
@@ -1946,6 +1962,40 @@ class WPH1SetCompare(unittest.TestCase):
         st = run.stored_verdict({"class": "equal", "entries": [], "cut": cut}, "incomplete", [])
         self.assertEqual(st["cut"], cut)
 
+    def test_nested_list_without_proof_of_whole_is_cut(self):
+        # Fix round 1 (I3): no pageInfo and no totalCount: the list may be a first page. Two first
+        # pages that differ only in order are not proven equal, and nothing is sorted.
+        def blk(rks):
+            return {"data": {"block": {"hash": "B", "transactions": {"edges": [{"node": {"hash": r}} for r in rks]}}}}
+        a, b, info = run.normalize_pair("gql.block", blk(["x", "y"]), blk(["y", "x"]))
+        self.assertNotEqual(a, b)
+        self.assertIn("ours:/data/block/transactions unproven", info["cut"])
+        self.assertIn("stock:/data/block/transactions unproven", info["cut"])
+        self.assertEqual(run.verdict_class("gql.block", "real", {"class": "equal", "entries": []}, [], {}, None,
+                                           cut=info["cut"])[0], "incomplete")
+
+    def test_first_pages_in_another_order_are_not_a_set(self):
+        a, b, info = run.normalize_pair("gql.blocksFromHeight", _block(["x", "y"], total=5, nxt=True),
+                                        _block(["y", "x"], total=5, nxt=True))
+        self.assertNotEqual(a, b)
+        self.assertTrue(info["cut"])
+
+    def test_whole_proven_by_count_or_last_page(self):
+        def blk(rks, **conn):
+            c = dict(conn, edges=[{"node": {"hash": r}} for r in rks])
+            return {"data": {"block": {"transactions": c}}}
+        # totalCount equal to the rows on both sides: whole, a set
+        a, b, info = run.normalize_pair("gql.block", blk(["x", "y"], totalCount=2), blk(["y", "x"], totalCount=2))
+        self.assertEqual((a, info["cut"]), (b, []))
+        # hasNextPage false on both sides: whole, a set
+        a, b, info = run.normalize_pair("gql.block", blk(["x", "y"], pageInfo={"hasNextPage": False}),
+                                        blk(["y", "x"], pageInfo={"hasNextPage": False}))
+        self.assertEqual((a, info["cut"]), (b, []))
+        # proven on one side only: not a set
+        a, b, info = run.normalize_pair("gql.block", blk(["x", "y"], totalCount=2), blk(["y", "x"]))
+        self.assertNotEqual(a, b)
+        self.assertEqual(info["cut"], ["stock:/data/block/transactions unproven"])
+
     def test_has_next_page_on_either_side_is_a_cut(self):
         a = {"data": {"transfers": {"pageInfo": {"hasNextPage": True}, "edges": [{}]}}}
         b = {"data": {"transfers": {"pageInfo": {"hasNextPage": False}, "edges": [{}]}}}
@@ -1964,6 +2014,14 @@ class WPH1SetCompare(unittest.TestCase):
         k, ids = allow.classify({"ep": "gql.blocksFromHeight", "cls": "real", "ours_codes": [], "vars": {},
                                  "entries": [E_("/~graphql-h6-unfinished", "Changed")], "node": {"ok": True}})
         self.assertEqual((k, ids), ("diff", []))
+
+    def test_status_beats_unfinished(self):
+        # Fix round 1 (I2): differing HTTP statuses stay in the status column.
+        v = {"class": "status", "entries": [E_("/~graphql-h6-unfinished#ours", "Changed")], "total": 1}
+        self.assertEqual(run.verdict_class("gql.block", "light", v, [], {}, None)[0], "status")
+        v = {"class": "status", "entries": [E_("/~graphql-h6-unfinished", "Changed"), E_("/~graphql-page-cut", "Changed")],
+             "total": 2}
+        self.assertEqual(run.verdict_class("gql.block", "light", v, [], {}, None)[0], "status")
 
     def test_rereferee_counts_incomplete_apart(self):
         r = {"id": "x:1", "ep": "gql.blocksFromHeight", "cls": "real", "ours": {"st": 200}, "stock": {"st": 200},
@@ -2143,36 +2201,59 @@ class WPH1Guard504(unittest.TestCase):
         conf = dict({"url": "http://stock.invalid", "guard_504_max": 3, "guard_504_window_s": 60}, **c)
         return run.StockHost("s", "gql", conf, None, open(os.devnull, "w"), start=False)
 
-    def test_off_by_default(self):
+    def test_on_by_default(self):
+        # Fix round 1 (I1): 5 stock 504s within 60 s back off; the third trip stops the run.
         h = run.StockHost("s", "gql", {"url": "http://stock.invalid"}, None, open(os.devnull, "w"), start=False)
+        self.assertEqual((h.g504_max, h.g504_window, h.g504_action, h.g504_max_trips), (5, 60.0, "backoff", 3))
+        h.g504_backoff = 0
+        stopped = []
+        h.on_stop = stopped.append
+        acts = [h.guard_504(float(t), 504) for t in range(15)]
+        self.assertEqual([a for a in acts if a], ["backoff", "backoff", "stop"])
+        self.assertEqual((acts[4], acts[9], acts[14]), ("backoff", "backoff", "stop"))
+        self.assertEqual(len(stopped), 1)
+
+    def test_zero_turns_it_off(self):
+        h = run.StockHost("s", "gql", {"url": "http://stock.invalid", "guard_504_max": 0}, None, open(os.devnull, "w"),
+                          start=False)
         for t in range(50):
             self.assertIsNone(h.guard_504(float(t), 504))
 
-    def test_stop_above_n_in_window(self):
+    def test_example_config_enables_it(self):
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "suite")
+        cfg = run.tomllib.load(open(os.path.join(root, "suite.example.toml"), "rb"))
+        first = cfg["stock"]["oracle"][0]
+        self.assertEqual((first["guard_504_max"], first["guard_504_window_s"], first["guard_504_action"],
+                          first["guard_504_max_trips"]), (5, 60, "backoff", 3))
+        for x in cfg["stock"]["oracle"]:
+            h = run.StockHost(x["name"], "gql", x, None, open(os.devnull, "w"), start=False)
+            self.assertTrue(h.g504_max)
+
+    def test_stop_at_n_in_window(self):
         stopped = []
         h = self.host(guard_504_action="stop")
         h.on_stop = stopped.append
-        for t in (0, 1, 2):
+        for t in (0, 1):
             self.assertIsNone(h.guard_504(float(t), 504))
-        self.assertEqual(h.guard_504(3.0, 504), "stop")
+        self.assertEqual(h.guard_504(2.0, 504), "stop")
         self.assertEqual(len(stopped), 1)
         self.assertIn("504", stopped[0])
 
     def test_old_504s_leave_the_window(self):
         h = self.host(guard_504_action="stop")
-        for t in (0, 1, 2):
+        for t in (0, 1):
             h.guard_504(float(t), 504)
         self.assertIsNone(h.guard_504(100.0, 504))
         self.assertIsNone(h.guard_504(101.0, 200))
 
     def test_backoff_pauses_then_stops_after_max_trips(self):
-        h = self.host(guard_504_action="backoff", guard_504_backoff_s=0, guard_504_max_trips=2)
+        h = self.host(guard_504_action="backoff", guard_504_backoff_s=0, guard_504_max_trips=3)
         stopped = []
         h.on_stop = stopped.append
         t = 0.0
         acts = []
         for _ in range(3):
-            for _ in range(4):
+            for _ in range(3):
                 t += 1
                 a = h.guard_504(t, 504)
                 if a:
@@ -2184,9 +2265,83 @@ class WPH1Guard504(unittest.TestCase):
         h = self.host(guard_504_action="stop")
         stopped = []
         h.on_stop = stopped.append
-        for _ in range(4):
+        for _ in range(3):
             h.record("light", run.time.monotonic(), 504, 10)
         self.assertEqual(len(stopped), 1)
+
+
+class _FakeHost:
+    """A stock host for the page-walk fetch: counts sends, answers `status`."""
+
+    def __init__(self, status=200):
+        self.name, self.status, self.sent = "s", status, []
+        self.healthy = run.threading.Event()
+        self.healthy.set()
+        self.guard = run.StockHost("s", "gql", {"url": "http://stock.invalid", "guard_504_max": 2,
+                                                "guard_504_action": "stop"}, None, open(os.devnull, "w"), start=False)
+
+    def send(self, req):
+        self.sent.append(req)
+        return {"status": self.status, "raw": b'{"data": {}}'}
+
+    def guard_504(self, t, status):
+        return self.guard.guard_504(t, status)
+
+
+class WPH1Fix1PageWalkGuard(unittest.TestCase):
+    """Fix round 1: the page-walk's stock fetch honours the 504 guard (I5), and its pacers hold the
+    per-side rate across cases (I4)."""
+
+    def test_fetch_waits_while_backing_off(self):
+        h, stop = _FakeHost(), run.threading.Event()
+        h.healthy.clear()
+        fetch = run.walk_stock_fetch(h, stop, poll_s=0.01)
+        done = []
+        th = run.threading.Thread(target=lambda: done.append(fetch("q", {})))
+        th.start()
+        th.join(0.1)
+        self.assertEqual((h.sent, done), ([], []))      # held while the host backs off
+        h.healthy.set()
+        th.join(2)
+        self.assertEqual(len(h.sent), 1)
+        self.assertEqual(done[0][0], 200)
+
+    def test_fetch_stops_when_the_guard_says_stop(self):
+        h, stop = _FakeHost(504), run.threading.Event()
+        h.guard.on_stop = lambda msg: stop.set()
+        fetch = run.walk_stock_fetch(h, stop, poll_s=0.01)
+        fetch("q", {})
+        fetch("q", {})                                   # the second 504 trips the guard
+        self.assertTrue(stop.is_set())
+        self.assertEqual(fetch("q", {}), (0, None))
+        self.assertEqual(len(h.sent), 2)
+        # a stop during a backoff ends the wait without a send
+        h2, stop2 = _FakeHost(), run.threading.Event()
+        h2.healthy.clear()
+        stop2.set()
+        self.assertEqual(run.walk_stock_fetch(h2, stop2, poll_s=0.01)("q", {}), (0, None))
+        self.assertEqual(h2.sent, [])
+
+    def test_pacers_hold_across_cases(self):
+        clock = FakeClock()
+        times = {"ours": [], "stock": []}
+
+        def fetcher(side):
+            def fetch(q, v):
+                times[side].append(clock.t)
+                return 200, {"data": {"transfers": {"pageInfo": {"hasNextPage": False}, "edges": []}}}
+            return fetch
+        cases = [{"id": "gql.transfers:%d" % i, "ep": "gql.transfers", "req": {"query": "q", "variables": {}}}
+                 for i in range(20)]
+        recs = []
+        pacers = (pagewalk.Pacer(2.0, clock, clock.sleep), pagewalk.Pacer(2.0, clock, clock.sleep))
+        counts = run.walk_cases(cases, [_FakeHost()], fetcher("ours"), lambda h: fetcher("stock"), None, 50, pacers,
+                                run.threading.Event(), recs.append)
+        self.assertEqual(counts["equal"], 20)
+        for side in ("ours", "stock"):
+            ts = times[side]
+            self.assertEqual(len(ts), 20)
+            self.assertTrue(all(b - a >= 0.5 - 1e-9 for a, b in zip(ts, ts[1:])), (side, ts))
 
 
 if __name__ == "__main__":
