@@ -31,6 +31,8 @@ const ALICE: &str = "k:alice";
 /// An account whose every `coin` row the node holds at 0.
 const DRAINED: &str = "k:drained";
 const BOB: &str = "k:bob";
+/// An account whose only stored row the node reported absent.
+const GONE: &str = "k:gone";
 const CAROL: &str = "k:carol";
 const ALICE_KEY: &str = "alice-key";
 const NFT_LEDGER: (&str, &str) = ("marmalade-v2", "ledger");
@@ -259,9 +261,9 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         t.put(Table::Balances, &bal_key(alice, coin, c), &row.encode())
             .unwrap();
     }
-    // Rows the node holds at 0 (an account drained after it was funded): alice's coin on
-    // chain 2, every row of `DRAINED`, Bob's coin on chain 0 (Bob has transfers) and the
-    // miner's coin on chain 0. They are never listed; the accounts stay resolvable.
+    // Rows the node holds at 0: alice's coin on chain 2, every row of `DRAINED`, Bob's coin on
+    // chain 0 (Bob has transfers) and the miner's coin on chain 0. They exist on chain, so
+    // they are listed at 0, as stock lists them.
     let drained = dict.intern(DictKind::Account, DRAINED);
     let bob = dict.intern(DictKind::Account, BOB);
     let miner = dict.intern(DictKind::Account, "k:miner");
@@ -276,6 +278,21 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         let row = BalanceRow {
             absent: false,
             balance: bal.into(),
+            guard: [0; 16],
+            as_of: 12,
+            reconciled_at: 12,
+            unverified: false,
+        };
+        t.put(Table::Balances, &bal_key(a, coin, c), &row.encode())
+            .unwrap();
+    }
+    // Rows the node reported absent (no row on chain): alice's coin on chain 3, `GONE`'s only.
+    let gone = dict.intern(DictKind::Account, GONE);
+    dict.persist(&mut t).unwrap();
+    for (a, c) in [(alice, 3u8), (gone, 0)] {
+        let row = BalanceRow {
+            absent: true,
+            balance: String::new(),
             guard: [0; 16],
             as_of: 12,
             reconciled_at: 12,
@@ -1255,14 +1272,14 @@ async fn fungible_chain_accounts_list_every_chain_and_never_null() {
     ] {
         let v = run_vars(&fx.schema, q, vars.clone()).await;
         assert!(v.get("errors").is_none(), "{vars}: {v}");
-        assert_eq!(chain_ids_of(&v), ["0", "1"], "{vars}: {v}");
+        assert_eq!(chain_ids_of(&v), ["0", "1", "2"], "{vars}: {v}");
     }
     let v = run(
         &fx.schema,
         &format!("{{ fungibleChainAccounts(accountName: \"{ALICE}\") {{ chainId }} }}"),
     )
     .await;
-    assert_eq!(v["fungibleChainAccounts"].as_array().map(Vec::len), Some(2));
+    assert_eq!(v["fungibleChainAccounts"].as_array().map(Vec::len), Some(3));
     // One chain asked: its row only.
     let v = run_vars(&fx.schema, q, json!({"a": ALICE, "c": ["1"]})).await;
     assert_eq!(chain_ids_of(&v), ["1"], "{v}");
@@ -1295,26 +1312,37 @@ async fn fungible_chain_accounts_list_every_chain_and_never_null() {
     assert_eq!(v["fungibleChainAccount"]["chainId"], "1", "{v}");
 }
 
-/// WP-L concern 3: a row the node holds at 0 is never listed, whether it was funded once or
-/// not: not in `chainAccounts`, `fungibleChainAccounts`, `fungibleChainAccount` or
-/// `balance(...)`, and an account whose rows are all at 0 is `fungibleAccount: null`.
+/// Zero rows (owner ruling 2026-11-26, stock compatibility): a row that exists on chain is
+/// listed at any balance, 0 included, as stock does: in `chainAccounts`,
+/// `fungibleChainAccounts`, `fungibleChainAccount` and `balance(...)`. Only a row the node
+/// reported absent (no row on chain) is left out.
 #[tokio::test]
-async fn rows_the_node_holds_at_zero_are_not_listed() {
+async fn rows_on_chain_are_listed_at_any_balance() {
     let fx = fixture();
+    let chains_of = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["chainId"].as_str().unwrap().to_owned())
+            .collect()
+    };
     let v = run(
         &fx.schema,
         &format!(
-            "{{ fungibleAccount(accountName: \"{ALICE}\") {{ totalBalance chainAccounts {{ chainId }} }} }}"
+            "{{ fungibleAccount(accountName: \"{ALICE}\") {{ totalBalance chainAccounts {{ chainId balance }} }} }}"
         ),
     )
     .await;
-    let chains: Vec<&str> = v["fungibleAccount"]["chainAccounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["chainId"].as_str().unwrap())
-        .collect();
-    assert_eq!(chains, ["0", "1"], "{v}");
+    assert_eq!(
+        chains_of(&v["fungibleAccount"]["chainAccounts"]),
+        ["0", "1", "2"],
+        "{v}"
+    );
+    assert_eq!(
+        v["fungibleAccount"]["chainAccounts"][2]["balance"],
+        json!(0.0),
+        "{v}"
+    );
     assert_eq!(v["fungibleAccount"]["totalBalance"], json!(2), "{v}");
     let v = run(
         &fx.schema,
@@ -1322,14 +1350,27 @@ async fn rows_the_node_holds_at_zero_are_not_listed() {
     )
     .await;
     assert_eq!(
-        v["fungibleChainAccounts"].as_array().map(Vec::len),
-        Some(2),
+        chains_of(&v["fungibleChainAccounts"]),
+        ["0", "1", "2"],
         "{v}"
     );
     let v = run(
         &fx.schema,
         &format!(
-            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"2\") {{ chainId }} }}"
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"2\") {{ chainId balance }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        v["fungibleChainAccount"],
+        json!({"chainId": "2", "balance": 0.0}),
+        "{v}"
+    );
+    // A row the node reported absent is not on chain: never listed.
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleChainAccount(accountName: \"{ALICE}\", chainId: \"3\") {{ chainId }} }}"
         ),
     )
     .await;
@@ -1353,39 +1394,58 @@ async fn rows_the_node_holds_at_zero_are_not_listed() {
             )
         })
         .collect();
-    assert_eq!(rows, ["coin:\"0\"", "coin:\"1\""], "{v}");
-    // Every row at 0: no chain rows, no balances, but the account still resolves (I-1).
+    assert_eq!(rows, ["coin:\"0\"", "coin:\"1\"", "coin:\"2\""], "{v}");
+    // Every row at 0 (funded and drained, or created and never funded): all listed at 0.
     let v = run(
         &fx.schema,
         &format!("{{ fungibleAccount(accountName: \"{DRAINED}\") {{ accountName totalBalance chainAccounts {{ chainId }} }} }}"),
     )
     .await;
-    assert_eq!(v["fungibleAccount"]["chainAccounts"], json!([]), "{v}");
+    assert_eq!(
+        chains_of(&v["fungibleAccount"]["chainAccounts"]),
+        ["0", "1"],
+        "{v}"
+    );
     assert_eq!(v["fungibleAccount"]["totalBalance"], json!(0), "{v}");
     let v = run(
         &fx.schema,
         &format!("{{ fungibleChainAccounts(accountName: \"{DRAINED}\") {{ chainId }} }}"),
     )
     .await;
-    assert_eq!(v["fungibleChainAccounts"], json!([]), "{v}");
+    assert_eq!(chains_of(&v["fungibleChainAccounts"]), ["0", "1"], "{v}");
     let v = run(
         &fx.schema,
         &format!("{{ balance(accountName: \"{DRAINED}\") {{ edges {{ cursor }} }} }}"),
     )
     .await;
-    assert_eq!(v["balance"]["edges"], json!([]), "{v}");
+    assert_eq!(
+        v["balance"]["edges"].as_array().map(Vec::len),
+        Some(2),
+        "{v}"
+    );
+    // An account whose only row is absent does not exist on chain: `null`.
+    let v = run(
+        &fx.schema,
+        &format!("{{ fungibleAccount(accountName: \"{GONE}\") {{ accountName }} }}"),
+    )
+    .await;
+    assert_eq!(v["fungibleAccount"], Value::Null, "{v}");
 }
 
-/// I-1 (PR #44 review): an account drained to 0 everywhere lists no row, but
-/// `fungibleAccount` and `node(id:)` (`FungibleAccount` and `FungibleChainAccount` ids) still
-/// resolve while it has a stored row, so its `transfers` and `transactions` stay reachable.
-/// An account with no stored row at all is still `null`.
+/// I-1 (PR #44 review): an account drained to 0 everywhere still resolves through
+/// `fungibleAccount` and `node(id:)` (`FungibleAccount` and `FungibleChainAccount` ids), with
+/// its rows at 0, so its `transfers` and `transactions` stay reachable. An account with no
+/// stored row at all is still `null`.
 #[tokio::test]
 async fn a_drained_account_keeps_its_history() {
     let fx = fixture();
     let sel = "accountName totalBalance chainAccounts { chainId } transfers(first: 50) { edges { cursor } } transactions(first: 50) { edges { cursor } }";
     let check = |v: &Value, label: &str| {
-        assert_eq!(v["chainAccounts"], json!([]), "{label}: {v}");
+        assert_eq!(
+            v["chainAccounts"],
+            json!([{"chainId": "0"}]),
+            "{label}: {v}"
+        );
         assert_eq!(v["totalBalance"], json!(0), "{label}: {v}");
         let transfers = v["transfers"]["edges"].as_array().expect(label);
         assert!(!transfers.is_empty(), "{label}: {v}");
@@ -2094,8 +2154,8 @@ mod audit_pr3 {
             )
         };
         let all = run(&fx.schema, &q("")).await;
-        assert_eq!(edges(&all, "balance").len(), 2, "{all}");
-        // The stored text `1.0` is served in stock's layout (`balance_text`): `"1"`.
+        assert_eq!(edges(&all, "balance").len(), 3, "{all}");
+        // The stored texts `1.0` and `0.0` are served in stock's layout (`balance_text`).
         let texts = run(
             &fx.schema,
             &format!(
@@ -2103,9 +2163,11 @@ mod audit_pr3 {
             ),
         )
         .await;
-        for e in edges(&texts, "balance") {
-            assert_eq!(e["node"]["balance"], "1", "{texts}");
-        }
+        let got: Vec<&Value> = edges(&texts, "balance")
+            .iter()
+            .map(|e| &e["node"]["balance"])
+            .collect();
+        assert_eq!(got, [&json!("1"), &json!("1"), &json!("0")], "{texts}");
         assert_eq!(run(&fx.schema, &q(", chainIds: []")).await, all);
         let many = format!(", chainIds: [{}]", vec!["\"0\""; 101].join(", "));
         let r = fx.schema.execute(q(&many)).await;

@@ -7,8 +7,9 @@
 //! - `stale: true` when the row is also in `BalanceDirty` (B-3): a block changed it after that
 //!   read, or a reorg unwound one; or when the row is `unverified` (its re-read after a change
 //!   failed or was parked, I-5).
-//! - Rows the node reported absent or holds at 0 are left out unless dirty (one rule on
-//!   every balance list, native and GraphQL). A dirty key with no row yet
+//! - Every row that exists on chain is listed at any balance, 0 included, as stock lists it
+//!   (owner ruling 2026-11-26; one rule on every balance list, native and GraphQL). Rows the
+//!   node reported absent are left out unless dirty. A dirty key with no row yet
 //!   (the seed backlog, a new account; M-4) is listed with `balance`, `guard` and
 //!   `as_of_height` null and `stale: true`.
 //! - Rows of a module marked not fungible (R-P5P9-8 #2) are left out.
@@ -140,7 +141,7 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
             None => prefix.clone(),
         };
         // Keys are walked in batches until `limit` items are listed and one more listed item
-        // is seen (it sets `next_cursor`), so rows left out (absent, at 0, other chain,
+        // is seen (it sets `next_cursor`), so rows left out (absent, other chain,
         // hidden module) never make a page short while it carries a cursor (review minor 1).
         // The walk stops after `MAX_BALANCE_WALK` keys; that page carries a cursor at the
         // last key read.
@@ -192,9 +193,9 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
                         h
                     }
                 };
-                // A row the node holds at 0 is left out like an absent one (WP-L), unless a
-                // later block touched it (then it waits for its read).
-                let listed = !hide && (row.as_ref().is_some_and(BalanceRow::positive) || *dirty);
+                // A row on chain is listed at any balance; an absent one only when a later
+                // block touched it (then it waits for its read).
+                let listed = !hide && (row.as_ref().is_some_and(|r| !r.absent) || *dirty);
                 if !listed {
                     continue;
                 }
@@ -204,7 +205,7 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
                 }
                 let module = d.name(DictKind::Module, m).unwrap_or_default().to_owned();
                 items.push(match row {
-                    Some(r) if r.positive() => row_json(view, &module, a, m, c, r)?,
+                    Some(r) if !r.absent => row_json(view, &module, a, m, c, r)?,
                     r => pending_json(&module, c, r.as_ref()),
                 });
                 last = Some((m, c));
@@ -322,11 +323,11 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
                 let Some(&(_, key_module)) = wanted.iter().find(|w| w.0 == m) else {
                     continue;
                 };
-                // One rule with `/accounts/{a}/balances`: a row absent or at 0 is left out
-                // unless a later block touched it; then it is listed waiting for its read
-                // (balance null, `stale: true`).
+                // One rule with `/accounts/{a}/balances`: a row on chain is listed at any
+                // balance; an absent one only when a later block touched it, waiting for its
+                // read (balance null, `stale: true`).
                 let dirty = balances::is_dirty(&view.txn, a, m, c)?;
-                if !(r.positive() || dirty)
+                if (r.absent && !dirty)
                     || !balances::trusted(&view.txn, m, c, coin)?
                     || !balances::stored_guard_keys(&view.txn, &r.guard, c)?.contains(&pk)
                 {
@@ -335,7 +336,7 @@ pub async fn key_accounts(st: St, path: PathS, q: QueryQ) -> Response {
                 modules.push(json!({
                     "module": d.name(DictKind::Module, m).unwrap_or_default(),
                     "chain": c,
-                    "balance": if r.positive() { Value::from(r.balance.as_str()) } else { Value::Null },
+                    "balance": if r.absent { Value::Null } else { Value::from(r.balance.as_str()) },
                     "as_of_height": r.as_of,
                     "stale": r.unverified || dirty,
                     "trusted": key_module,
@@ -410,7 +411,7 @@ mod key_accounts_tests {
     use kdx_hot::balances::{bal_key, guard_hash, key_account_key, key_hash, BalanceRow, TokenRow};
     use kdx_hot::{HotDict, Table};
     use kdx_types::{DictKind, DictMut};
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     use crate::{Api, ApiSettings, Store, TipWatch};
 
@@ -460,11 +461,17 @@ mod key_accounts_tests {
             )
             .unwrap();
         }
-        // alice's coin on chain 1 is held at 0 by the node (drained after it was funded):
-        // never listed (WP-L concern 3).
+        // alice's coin on chain 1 is held at 0 by the node: it exists on chain, so it is
+        // listed at 0 (as stock). Her coin on chain 2 was reported absent: never listed.
         w.put(Table::Balances, &bal_key(a, coin, 1), &row("0.0").encode())
             .unwrap();
-        // carol: coin at 0 on chains 0..=5, 3 on chain 6 (paging skips the zero rows).
+        let absent = BalanceRow {
+            absent: true,
+            ..row("")
+        };
+        w.put(Table::Balances, &bal_key(a, coin, 2), &absent.encode())
+            .unwrap();
+        // carol: coin at 0 on chains 0..=5, 3 on chain 6 (every row is listed and paged).
         for c in 0..=6u8 {
             let bal = if c == 6 { "3" } else { "0" };
             w.put(
@@ -539,9 +546,17 @@ mod key_accounts_tests {
     #[tokio::test]
     async fn by_key_lists_only_key_modules_unless_asked() {
         let (_d, st) = fixture();
-        // Default: coin only; bob (free.evil only) is left out of the page.
+        // Default: coin only (alice's rows on chains 0 and 1, the latter at 0); bob
+        // (free.evil only) is left out of the page.
         let v = get(&st, None).await;
-        assert_eq!(rows(&v), [("alice".into(), "coin".into(), true)], "{v}");
+        assert_eq!(
+            rows(&v),
+            [
+                ("alice".into(), "coin".into(), true),
+                ("alice".into(), "coin".into(), true)
+            ],
+            "{v}"
+        );
         assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
         // Asked for by name: listed, and marked untrusted.
         let v = get(&st, Some("free.evil")).await;
@@ -558,10 +573,11 @@ mod key_accounts_tests {
         assert!(rows(&v).is_empty(), "{v}");
     }
 
-    /// WP-L concern 3: a row the node holds at 0 is not listed, on `/accounts/{a}/balances`
-    /// (with or without `chain`) and on `/keys/{pk}/accounts`.
+    /// Owner ruling 2026-11-26 (stock compatibility): a row that exists on chain is listed at
+    /// any balance, 0 included, on `/accounts/{a}/balances` (with or without `chain`) and on
+    /// `/keys/{pk}/accounts`; a row the node reported absent is not.
     #[tokio::test]
-    async fn rows_held_at_zero_are_not_listed() {
+    async fn rows_on_chain_are_listed_at_any_balance() {
         let (_d, st) = fixture();
         let bal = |chain: Option<u8>| {
             let st = st.clone();
@@ -582,6 +598,7 @@ mod key_accounts_tests {
                         (
                             i["module"].as_str().unwrap().to_owned(),
                             i["chain"].as_u64().unwrap(),
+                            i["balance"].clone(),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -589,18 +606,23 @@ mod key_accounts_tests {
         };
         assert_eq!(
             bal(None).await,
-            [("coin".to_owned(), 0), ("free.evil".to_owned(), 0)]
+            [
+                ("coin".to_owned(), 0, json!("1.5")),
+                ("coin".to_owned(), 1, json!("0.0")),
+                ("free.evil".to_owned(), 0, json!("1000000"))
+            ]
         );
-        assert!(bal(Some(1)).await.is_empty());
-        // By key: alice's coin row on chain 0 only.
+        assert_eq!(bal(Some(1)).await, [("coin".to_owned(), 1, json!("0.0"))]);
+        assert!(bal(Some(2)).await.is_empty());
+        // By key: alice's coin rows on chains 0 and 1 (at 0), not the absent one.
         let v = get(&st, None).await;
-        let chains: Vec<u64> = v["items"][0]["modules"]
+        let chains: Vec<(u64, Value)> = v["items"][0]["modules"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|m| m["chain"].as_u64().unwrap())
+            .map(|m| (m["chain"].as_u64().unwrap(), m["balance"].clone()))
             .collect();
-        assert_eq!(chains, [0], "{v}");
+        assert_eq!(chains, [(0, json!("1.5")), (1, json!("0.0"))], "{v}");
     }
 
     async fn balances(st: &Arc<crate::ApiState>, account: &str, q: super::Q) -> Value {
@@ -610,46 +632,42 @@ mod key_accounts_tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    /// The review's minor 1: rows at 0 are dropped before `limit`, so a page is never short
-    /// while it carries `next_cursor`, and the last listed row ends the walk.
+    /// Rows at 0 page like any other: every page before the last is full and the walk
+    /// lists every row of the account in (module, chain) order.
     #[tokio::test]
-    async fn balances_pages_skip_zero_rows_before_the_limit() {
+    async fn balances_pages_list_zero_rows_in_order() {
         let (_d, st) = fixture();
-        let q = |cursor: Option<String>| super::Q {
-            limit: Some(1),
-            cursor,
-            ..super::Q::default()
-        };
-        let v = balances(&st, "carol", q(None)).await;
-        let chains: Vec<u64> = v["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["chain"].as_u64().unwrap())
-            .collect();
-        assert_eq!(chains, [6], "{v}");
-        assert_eq!(v["next_cursor"], Value::Null, "{v}");
-        // alice: coin on chain 0, free.evil on chain 0; her coin row at 0 on chain 1 sits
-        // between them and never makes a page short.
-        let v = balances(&st, "alice", q(None)).await;
-        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
-        assert_eq!(v["items"][0]["module"], "coin", "{v}");
-        let next = v["next_cursor"].as_str().expect("a next page").to_owned();
-        let v = balances(&st, "alice", q(Some(next))).await;
-        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
-        assert_eq!(v["items"][0]["module"], "free.evil", "{v}");
-        assert_eq!(v["next_cursor"], Value::Null, "{v}");
+        let mut cursor = None;
+        let mut chains = Vec::new();
+        loop {
+            let q = super::Q {
+                limit: Some(2),
+                cursor: cursor.take(),
+                ..super::Q::default()
+            };
+            let v = balances(&st, "carol", q).await;
+            let items = v["items"].as_array().unwrap();
+            chains.extend(items.iter().map(|i| i["chain"].as_u64().unwrap()));
+            match v["next_cursor"].as_str() {
+                Some(c) => {
+                    assert_eq!(items.len(), 2, "{v}");
+                    cursor = Some(c.to_owned());
+                }
+                None => break,
+            }
+        }
+        assert_eq!(chains, [0, 1, 2, 3, 4, 5, 6]);
     }
 
-    /// The review's minor 2: a row at 0 that a later block touched is listed as waiting for
-    /// its read (balance null, `stale: true`) on both routes, as api.md's one rule says.
+    /// A row at 0 that a later block touched is listed with its stored balance and
+    /// `stale: true` on both routes, like any dirty row.
     #[tokio::test]
-    async fn a_dirty_zero_row_is_pending_on_both_routes() {
+    async fn a_dirty_zero_row_is_stale_on_both_routes() {
         let (_d, st) = fixture();
         let v = balances(&st, "dave", super::Q::default()).await;
         let items = v["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{v}");
-        assert_eq!(items[0]["balance"], Value::Null, "{v}");
+        assert_eq!(items[0]["balance"], "0.0", "{v}");
         assert_eq!(items[0]["stale"], true, "{v}");
         let r = super::key_accounts(
             State(st.clone()),
@@ -664,7 +682,7 @@ mod key_accounts_tests {
         assert_eq!(items[0]["account"], "dave", "{v}");
         let m = &items[0]["modules"][0];
         assert_eq!(m["chain"], 0, "{v}");
-        assert_eq!(m["balance"], Value::Null, "{v}");
+        assert_eq!(m["balance"], "0.0", "{v}");
         assert_eq!(m["stale"], true, "{v}");
     }
 
@@ -673,7 +691,7 @@ mod key_accounts_tests {
         let (_d, st) = fixture();
         st.set_key_modules(vec!["coin".into(), "free.evil".into()]);
         let v = get(&st, None).await;
-        assert_eq!(rows(&v).len(), 3, "{v}");
+        assert_eq!(rows(&v).len(), 4, "{v}");
         assert!(rows(&v).iter().all(|r| r.2), "{v}");
     }
 }
