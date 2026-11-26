@@ -125,6 +125,8 @@ impl HotStore {
                 // them from block 0, backfill included (secpass A I-1; `rowcount.rs`).
                 put(crate::rowcount::READY, &0u64.to_be_bytes())?;
                 put(crate::rowcount::TXNUM_AT, &0u64.to_be_bytes())?;
+                // And the (empty) token chain list is the one `Holders` gives (`token_chains.rs`).
+                put(crate::token_chains::READY, &0u64.to_be_bytes())?;
             }
             Some(v) => {
                 let v = be_u64(&v).context("Meta format_version")?;

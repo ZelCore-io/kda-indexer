@@ -915,7 +915,7 @@ Deliberate differences from stock (stock mistakes, all in the compare allowlist)
 | `poolTransactions.pageInfo` | `hasPreviousPage: true` on every page | from the rows |
 | ids, times | DB row ids and insert times; `Token.chainId` `"0"` | module name / event position (`TxKey ‖ index`); block times; `"2"`; `transactionId` null (stock's ids are unmatchable internal row ids) |
 | swap fee | input side, `in × 0.003/0.997 × price in` | coin side, `value × 0.003/0.997` (differs by the price impact when KDA is the output) |
-| `tokens` order | by a balance row id | by the module's first height (newest first) |
+| `tokens` cursor | its `Balances` row id | the first holder row's TxKey ‖ module id ‖ chain (same set and order: every non-coin (module, chain) with a holder row, newest first holder row first; stock's row id is its insert order, which ingest order can make differ from height order) |
 
 Times follow stock: the 24h/7d windows, chart buckets and the `amountUsd` rate hour use the
 tx's `meta.creationTime` (the block's time when the tx has none), the same time stock shows
@@ -934,13 +934,20 @@ first, then pair key), filters them as listable and only then caps them at 1,000
 that were never funded cost nothing, and dust-funded spam ranks below real pools however
 many or old. Past the cap the field answers the 1,000 largest pools and the response carries
 `"extensions": {"dexPairsCapped": true}`; a listing that runs out of rows or time fails with
-the deadline error, never a silent partial list. Ranks are recomputed per request, as stock
+the deadline error, never a silent partial list, except when the budget ends after the cap is
+reached: then the 1,000 kept pools are served, flagged `dexPairsCapped`. Ranks are recomputed per request, as stock
 ranks per request, so a reserve change between two pages can move a pool across the page
 boundary. Token prices follow stock's path search with its 3-hop limit (a direct `coin` pair
 is checked first at each token; with zero reserves it prices at 0, as stock), reading up to
-4,096 pairs per token, ranked by that token's own reserve, expanding the top 256 and
-visiting at most 2,048 tokens. Every DEX field answers `NOT_AVAILABLE` until the DEX history
-fill has finished. `dexMetrics` ranges are capped at
+1,024 pairs per token (the oldest `CREATE_PAIR`s: a token with more pairs than that has its
+newer ones left out), ranked by that token's own reserve (a coin pair never funded is not
+read), expanding the top 256 and visiting at most 2,048 tokens. A search that spends the
+field's row budget or deadline answers no path (price 0, stock's answer with no path). Every
+DEX field answers `NOT_AVAILABLE` until the DEX history fill has finished; while that fill
+fails and retries (with backoff; `kdx_fill_failed{fill="dex"}` = 1, `Meta fill_failed/dex`)
+the message says so. `tokens` reads the token chain list (`kdx_hot::token_chains`, kept with
+the module holder lists) and answers `NOT_AVAILABLE` until it and the holder lists are ready;
+`kda-indexer run` builds it once on a store an older build wrote. `dexMetrics` ranges are capped at
 1,100 days.
 
 ### Token price
@@ -948,7 +955,8 @@ fill has finished. `dexMetrics` ranges are capped at
 `lastTokenPriceInKda` answers `NOT_AVAILABLE` until the one-off swap history fill has
 finished on the store (`Meta price_filled`): before that, the table holds only the swaps the
 tail stored since the reindex, and a price from partial history would be wrong. A failed fill
-is retried (30 s, doubling to 10 min; `kdx_price_fill_failures_total`).
+is retried by the fill supervisor (30 s, doubling to 1 h; `kdx_fill_failures_total{fill="prices"}`,
+also counted in `kdx_price_fill_failures_total`).
 
 `lastTokenPriceInKda(moduleName)` follows stock (indexer-kadena `90a4be1`,
 `last-token-price-in-kda-resolver.ts`). Stock takes the newest transaction

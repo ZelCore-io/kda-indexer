@@ -984,12 +984,12 @@ ruling = "B3 owner rules 2026-11-26: match stock except its plain mistakes, each
 owner_note = "PROPOSED: new with the DEX compare."
 
 [[entry]]
-id = "graphql-dex-tokens-order"
+id = "graphql-dex-tokens-cursor"
 route = "other"
-json_path_glob = "/data/tokens/**"
+json_path_glob = "/data/tokens/**/*ursor"
 condition = "any"
 request_contains = "tokens"
-reason = "B3 divergence 11: stock orders tokens by a Balances row id it assigned at ingest; ours by the module's first height (newest first), cursors packed from height, module and chain. The set of modules can also differ (ours lists a module's fungible-v2 chains). TEMPORARY: the set and order follow stock's Balances rows in a follow-up after the holders PR merges; drop this entry then."
+reason = "Stock's tokens cursor is its Balances row id, an unmatchable internal id; ours packs the first holder row's TxKey, the module id and the chain. Set and order follow stock (token chain list from the holder rows)."
 status = "PROPOSED"
 ruling = "B3 owner rules 2026-11-26: match stock except its plain mistakes, each documented (docs/graphql.md Sushi DEX)."
 owner_note = "PROPOSED: new with the DEX compare."

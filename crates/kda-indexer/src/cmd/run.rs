@@ -429,82 +429,29 @@ async fn follow(
         search,
         search_stop.clone(),
     ));
-    // `lastTokenPriceInKda`: the one-off swap history fill (resumable; new blocks update the
-    // table themselves). Its errors are logged; ingest goes on without it.
+    // One-off fills (each resumable; new blocks keep their tables themselves): the swap price
+    // history (`lastTokenPriceInKda`), the Sushi DEX ledger (stock-gap B2) and the token chain
+    // list (`tokens`). A failure is recorded and retried with backoff ([`supervise_fill`]);
+    // ingest goes on without them.
     let price_stop = token.child_token();
-    {
-        let (c, s) = (ctx.clone(), price_stop.clone());
-        tokio::spawn(async move {
-            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                if kdx_ingest::price_fill::filled(&c.hot.ro()?)? {
-                    return Ok(());
-                }
-                tracing::info!("prices: swap history fill");
-                // Secpass A I-3: a failed attempt is retried (growing wait) until it
-                // finishes or the process stops; prices answer NOT_AVAILABLE meanwhile.
-                let rep = kdx_ingest::price_fill::run_with_retry(
-                    || kdx_ingest::price_fill::run(&c.hot, &c.segdir, &|| s.is_cancelled()),
-                    &mut |d| {
-                        let until = std::time::Instant::now() + d;
-                        while std::time::Instant::now() < until {
-                            if s.is_cancelled() {
-                                return false;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
-                        true
-                    },
-                );
-                if let Some(rep) = rep {
-                    tracing::info!(report = %serde_json::to_string(&rep)?, "prices: fill pass ended");
-                }
-                Ok(())
-            })
-            .await;
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::error!(
-                    error = format!("{e:#}"),
-                    "prices: fill failed; restart resumes it"
-                ),
-                Err(e) => tracing::error!(error = %e, "prices: fill task"),
-            }
-        });
-    }
-    // Sushi DEX ledger (stock-gap B2): the one-off history fill from the Sushi deploy
-    // (resumable; new blocks store their own events). Its errors are logged; ingest goes on.
-    {
-        let (c, s) = (ctx.clone(), price_stop.clone());
-        tokio::spawn(async move {
-            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                // Derived rows of another layout are cleared here and rebuilt by the fill.
-                let mut w = c.hot.rw()?;
-                if kdx_hot::dex::ensure_layout(&mut w)? {
-                    tracing::info!(
-                        layout = kdx_hot::dex::LAYOUT,
-                        "dex: derived rows cleared for a new layout; the fill rebuilds them"
-                    );
-                }
-                w.commit()?;
-                if kdx_ingest::dex_fill::filled(&c.hot.ro()?)? {
-                    return Ok(());
-                }
-                tracing::info!("dex: Sushi history fill");
-                let rep = kdx_ingest::dex_fill::run(&c.hot, &c.segdir, &|| s.is_cancelled())?;
-                tracing::info!(report = %serde_json::to_string(&rep)?, "dex: fill pass ended");
-                Ok(())
-            })
-            .await;
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::error!(
-                    error = format!("{e:#}"),
-                    "dex: fill failed; restart resumes it"
-                ),
-                Err(e) => tracing::error!(error = %e, "dex: fill task"),
-            }
-        });
-    }
+    tokio::spawn(supervise_fill(
+        ctx.clone(),
+        kdx_hot::fills::PRICES,
+        price_stop.clone(),
+        price_fill,
+    ));
+    tokio::spawn(supervise_fill(
+        ctx.clone(),
+        kdx_hot::fills::DEX,
+        price_stop.clone(),
+        dex_fill,
+    ));
+    tokio::spawn(supervise_fill(
+        ctx.clone(),
+        kdx_hot::fills::TOKEN_CHAINS,
+        price_stop.clone(),
+        token_chains_fill,
+    ));
     // DEX USD feed (B3): DIA's KDA/USD rate, polled into `DexUsd` when `[dex_usd]` is on.
     // Failures are logged and keep the last good rate; ingest never waits on it.
     if let Some(d) = dia {
@@ -591,6 +538,113 @@ async fn follow(
         "run: stopped"
     );
     res
+}
+
+/// First wait after a one-off fill fails; it doubles per failure up to [`FILL_RETRY_MAX`].
+const FILL_RETRY_FIRST: Duration = Duration::from_secs(30);
+const FILL_RETRY_MAX: Duration = Duration::from_secs(3_600);
+
+/// Run a one-off fill until it succeeds or `stop`. A failure (an error or a panic) is logged,
+/// counted (`kdx_fill_failures`, `kdx_fill_failed` = 1), recorded in `Meta fill_failed/<name>`
+/// (readers then answer "fill failed" rather than "being filled") and retried after
+/// [`FILL_RETRY_FIRST`], doubling to [`FILL_RETRY_MAX`]: a transient error heals without a
+/// restart, and a deterministic one stays visible instead of leaving the gate shut silently.
+async fn supervise_fill(
+    ctx: Arc<Ctx>,
+    name: &'static str,
+    stop: CancellationToken,
+    f: fn(&Ctx, &dyn Fn() -> bool) -> anyhow::Result<()>,
+) {
+    let mut wait = FILL_RETRY_FIRST;
+    loop {
+        let (c, s) = (ctx.clone(), stop.clone());
+        let err = match tokio::task::spawn_blocking(move || f(&c, &|| s.is_cancelled())).await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("{e:#}")),
+            Err(e) => Some(format!("fill task: {e}")),
+        };
+        let ok = err.is_none();
+        if !ok && stop.is_cancelled() {
+            return;
+        }
+        kdx_metrics::get().fill(name, ok);
+        let rec = {
+            let (c, e) = (ctx.clone(), err.clone());
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let mut w = c.hot.rw()?;
+                match &e {
+                    Some(e) => kdx_hot::fills::set_failed(&mut w, name, e)?,
+                    None => kdx_hot::fills::clear_failed(&mut w, name)?,
+                }
+                w.commit()
+            })
+            .await
+        };
+        if let Ok(Err(e)) | Err(e) = rec.map_err(anyhow::Error::from) {
+            tracing::warn!(
+                fill = name,
+                error = format!("{e:#}"),
+                "fill status not stored"
+            );
+        }
+        let Some(e) = err else { return };
+        tracing::error!(
+            fill = name,
+            error = e,
+            retry_secs = wait.as_secs(),
+            "fill failed; retrying"
+        );
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(wait) => {}
+        }
+        wait = (wait * 2).min(FILL_RETRY_MAX);
+    }
+}
+
+fn price_fill(c: &Ctx, stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
+    if kdx_ingest::price_fill::filled(&c.hot.ro()?)? {
+        return Ok(());
+    }
+    tracing::info!("prices: swap history fill");
+    let rep = kdx_ingest::price_fill::run(&c.hot, &c.segdir, &stop)?;
+    tracing::info!(report = %serde_json::to_string(&rep)?, "prices: fill pass ended");
+    Ok(())
+}
+
+fn dex_fill(c: &Ctx, stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
+    // Derived rows of another layout are cleared here and rebuilt by the fill.
+    let mut w = c.hot.rw()?;
+    if kdx_hot::dex::ensure_layout(&mut w)? {
+        tracing::info!(
+            layout = kdx_hot::dex::LAYOUT,
+            "dex: derived rows cleared for a new layout; the fill rebuilds them"
+        );
+    }
+    w.commit()?;
+    if kdx_ingest::dex_fill::filled(&c.hot.ro()?)? {
+        return Ok(());
+    }
+    tracing::info!("dex: Sushi history fill");
+    let rep = kdx_ingest::dex_fill::run(&c.hot, &c.segdir, &stop)?;
+    tracing::info!(report = %serde_json::to_string(&rep)?, "dex: fill pass ended");
+    Ok(())
+}
+
+/// The token chain list of a store an older build wrote (`kdx_hot::token_chains`): built
+/// from `Holders` in one write txn (one seek per module and chain), no manual step.
+fn token_chains_fill(c: &Ctx, _stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
+    if kdx_hot::token_chains::marker_set(&c.hot.ro()?)? {
+        return Ok(());
+    }
+    let mut w = c.hot.rw()?;
+    let n = kdx_hot::token_chains::fill(&mut w)?;
+    w.commit()?;
+    tracing::info!(
+        module_chains = n,
+        "tokens: chain list built from the holder rows"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

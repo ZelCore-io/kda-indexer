@@ -133,6 +133,7 @@ pub fn touch(txn: &mut RwTxn<'_>, account: u32, module: u32, key: TxKey) -> Resu
     )?;
     txn.put(Table::Holders, &hold_key(module, chain, key, account), &[])?;
     txn.put(Table::HolderByTx, &by_tx_key(key, module, account), &[])?;
+    crate::token_chains::note(txn, module, chain, key)?;
     Ok(true)
 }
 
@@ -158,6 +159,7 @@ pub fn untouch_tx(txn: &mut RwTxn<'_>, key: TxKey) -> Result<usize> {
         if first_of(txn, a, m, key.chain())? == Some(key) {
             txn.del(Table::HolderFirst, &bal_key(a, m, key.chain()))?;
             txn.del(Table::Holders, &hold_key(m, key.chain(), key, a))?;
+            crate::token_chains::recheck(txn, m, key.chain())?;
         }
     }
     Ok(rows.len())
@@ -278,6 +280,7 @@ pub fn read_all(txn: &impl Txn) -> Result<Vec<Holder>> {
 pub fn clear_table(txn: &mut RwTxn<'_>) -> Result<()> {
     txn.clear(Table::Holders)?;
     txn.clear(Table::HolderFirst)?;
+    crate::token_chains::clear(txn)?;
     txn.clear(Table::HolderByTx)
 }
 
@@ -647,6 +650,11 @@ mod tests {
                     );
                 }
                 assert!(ready(&ro).unwrap(), "seed {seed}: stamps follow the tips");
+                assert_eq!(
+                    crate::token_chains::read_all(&ro, || true).unwrap(),
+                    crate::token_chains::derive(&got),
+                    "seed {seed}: token chains follow holders"
+                );
             }
         }
     }
@@ -676,6 +684,8 @@ mod tests {
             crate::tail::apply(&mut txn, b, &mut dict).unwrap();
         }
         let want = read_all(&txn).unwrap();
+        let want_chains = crate::token_chains::read_all(&txn, || true).unwrap();
+        assert_eq!(want_chains, crate::token_chains::derive(&want));
         txn.commit().unwrap();
 
         let dir2 = tempfile::tempdir().unwrap();
@@ -695,6 +705,11 @@ mod tests {
         let ro = hot2.ro().unwrap();
         assert_eq!(read_all(&ro).unwrap(), want);
         assert_eq!(ro.count(Table::HolderFirst).unwrap(), want.len());
+        // Backfill equals tail for the token chain list too.
+        assert_eq!(
+            crate::token_chains::read_all(&ro, || true).unwrap(),
+            want_chains
+        );
     }
 
     /// Review M-6 of PR #54: a row whose first transfer came from backfill keeps it through a

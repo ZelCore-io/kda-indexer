@@ -59,40 +59,6 @@ pub fn filled(txn: &impl Txn) -> Result<bool> {
     prices::ready(txn)
 }
 
-/// First wait before a failed fill is tried again; doubled per failure up to
-/// [`RETRY_MAX`] (secpass A I-3: a failed fill is not left partial until a restart).
-pub const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
-/// Longest wait between attempts.
-pub const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Run `attempt` until it succeeds, waiting between failures (`wait` returns false when the
-/// process is stopping: then no further attempt, and None). Each failure is logged and
-/// counted in `kdx_price_fill_failures_total`; the marker stays unset meanwhile, so
-/// `lastTokenPriceInKda` answers `NOT_AVAILABLE`.
-pub fn run_with_retry(
-    mut attempt: impl FnMut() -> Result<FillReport>,
-    wait: &mut dyn FnMut(std::time::Duration) -> bool,
-) -> Option<FillReport> {
-    let mut delay = RETRY_FIRST;
-    loop {
-        match attempt() {
-            Ok(rep) => return Some(rep),
-            Err(e) => {
-                kdx_metrics::get().price_fill_failures.inc();
-                tracing::error!(
-                    error = format!("{e:#}"),
-                    retry_in_secs = delay.as_secs(),
-                    "prices: fill failed; retrying"
-                );
-            }
-        }
-        if !wait(delay) {
-            return None;
-        }
-        delay = (delay * 2).min(RETRY_MAX);
-    }
-}
-
 /// EventName ids of the trusted DEX swap events.
 fn swap_names(dict: &MemDict) -> Vec<u32> {
     (0..dict.len(DictKind::EventName) as u32)
@@ -432,48 +398,5 @@ mod tests {
         );
         prices::undo_block(&mut txn, 1, 10).unwrap();
         assert_eq!(prices::lookup(&txn, "free.t").unwrap(), None);
-    }
-}
-
-#[cfg(test)]
-mod retry_tests {
-    use std::time::Duration;
-
-    use super::{run_with_retry, FillReport};
-
-    /// Secpass A I-3: a failed fill is not left partial until a restart: it is retried, with
-    /// a growing wait, until it finishes or the process stops.
-    #[test]
-    fn a_failed_fill_is_retried_until_it_finishes() {
-        let mut n = 0;
-        let mut waits: Vec<Duration> = Vec::new();
-        let r = run_with_retry(
-            || {
-                n += 1;
-                if n < 3 {
-                    anyhow::bail!("segment read failed");
-                }
-                Ok(FillReport::default())
-            },
-            &mut |d| {
-                waits.push(d);
-                true
-            },
-        );
-        assert!(r.is_some());
-        assert_eq!(n, 3);
-        assert_eq!(waits.len(), 2);
-        assert!(waits[1] > waits[0]);
-        // Stopped while waiting: no further attempt.
-        let mut tries = 0;
-        let r = run_with_retry(
-            || {
-                tries += 1;
-                anyhow::bail!("x")
-            },
-            &mut |_| false,
-        );
-        assert!(r.is_none());
-        assert_eq!(tries, 1);
     }
 }

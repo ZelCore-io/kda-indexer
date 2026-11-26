@@ -19,7 +19,7 @@
 //! `BalanceDirty`, `BalanceSeed`, `Guards`, `KeyAccounts`, `Tokens`, `NftBalances`, `NftDirty`,
 //! `NftDetails` (P7, GQ-15), `TokenSwaps` (`prices.rs`), `RowCounts` (`rowcount.rs`), `ChainCounters`
 //! (`chaincount.rs`), the Sushi DEX tables `DexPairs`, `DexEvents`, `DexByTx`, `DexLp`, `DexAgg`,
-//! `DexUsd` (`dex.rs`) and `Holders`, `HolderFirst`, `HolderByTx` (`holders.rs`).
+//! `DexUsd` (`dex.rs`) and `Holders`, `HolderFirst`, `HolderByTx` (`holders.rs`), `TokenChains` (`token_chains.rs`).
 //! `HotStore::open` creates them;
 //! `open_ro` opens them when present, and a missing one reads as empty. They change no stored
 //! byte of the base tables or the segments, so they need no format version.
@@ -66,6 +66,7 @@ pub enum Table {
     Holders,
     HolderFirst,
     HolderByTx,
+    TokenChains,
 }
 
 fn kind_name(k: DictKind) -> &'static str {
@@ -101,7 +102,7 @@ impl Table {
 
     /// Tables added after format v2 without a version bump (rule A-1): optional on a
     /// read-only open, empty when missing.
-    pub fn additive() -> [Table; 21] {
+    pub fn additive() -> [Table; 22] {
         [
             Table::Balances,
             Table::BalanceDirty,
@@ -124,6 +125,7 @@ impl Table {
             Table::Holders,
             Table::HolderFirst,
             Table::HolderByTx,
+            Table::TokenChains,
         ]
     }
 
@@ -166,6 +168,7 @@ impl Table {
             Table::Holders => "Holders".into(),
             Table::HolderFirst => "HolderFirst".into(),
             Table::HolderByTx => "HolderByTx".into(),
+            Table::TokenChains => "TokenChains".into(),
         }
     }
 }

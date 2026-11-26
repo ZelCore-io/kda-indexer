@@ -13,6 +13,7 @@ pub mod dex;
 pub mod dex_usd;
 pub mod dict;
 pub mod env;
+pub mod fills;
 pub mod holders;
 pub mod nft;
 pub mod prices;
@@ -20,6 +21,7 @@ pub mod rowcount;
 pub mod sndr;
 pub mod tables;
 pub mod tail;
+pub mod token_chains;
 pub mod undo;
 
 pub use checkpoint::{checkpoint, set_checkpoint, Stage};
