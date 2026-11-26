@@ -444,9 +444,13 @@ pub struct D3Event {
 /// The `exec` part of a tx as D3 needs it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct D3Exec {
-    /// The strings count for coin too: below the events fork (uncapped), or when the code
-    /// calls `coin.create-account` (rule 2c, capped like the token rows).
+    /// The strings count for coin too: below the events fork (uncapped).
     pub coin: bool,
+    /// Rule 2c: when the code calls `coin.create-account` from the events fork on, the
+    /// [`account_like`] code literals, then the `exec.data` strings, distinct, at most
+    /// [`MAX_EXEC_PAIRS_PER_TX`]. Never `result.data` (`Write succeeded`) or a keyset
+    /// predicate (`keys-all`): they are never accounts. Empty otherwise.
+    pub coin_create: Vec<String>,
     /// Modules the code calls (`<m>.fn`) and does not deploy, minus those that emitted an
     /// event in the tx from the events fork on; the filter keeps the tracked tokens.
     pub called: Vec<String>,
@@ -494,6 +498,27 @@ pub struct D3Candidates {
 impl D3Candidates {
     pub fn is_empty(&self) -> bool {
         self.xchain.is_none() && self.events.is_empty() && self.exec.is_none()
+    }
+}
+
+/// Keyset predicates built into Pact: never account names (rule 2c skips them).
+const KEYSET_PREDS: [&str; 3] = ["keys-all", "keys-any", "keys-2"];
+
+/// [`data_strings`] for rule 2c: skips a keyset's `pred` value (an object with `keys` and
+/// `pred`) and the built-in predicate names wherever they sit.
+fn create_data_strings(v: &Value, f: &mut impl FnMut(&str)) {
+    match v {
+        Value::String(s) if !KEYSET_PREDS.contains(&s.as_str()) => f(s),
+        Value::Array(a) => a.iter().for_each(|x| create_data_strings(x, f)),
+        Value::Object(m) => {
+            let keyset = m.contains_key("keys") && m.contains_key("pred");
+            for (k, x) in m {
+                if !(keyset && k == "pred") {
+                    create_data_strings(x, f);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -600,6 +625,23 @@ pub fn d3_candidates(
         }
         let (refs, ref_calls) = modref_args(code);
         let refs: Vec<ModRef> = refs.into_iter().filter(|(m, _)| keep(m)).collect();
+        // Rule 2c: code literals first, so a batch create-account reaches the account names
+        // (literals) before keyset data can fill the cap (review minor 2).
+        let mut create_strings = Vec::new();
+        if coin_create {
+            let literals = code_literals(code);
+            let mut add = |s: &str| {
+                if !KEYSET_PREDS.contains(&s) {
+                    push_distinct(&mut create_strings, s, MAX_EXEC_PAIRS_PER_TX);
+                }
+            };
+            for s in &literals {
+                add(s);
+            }
+            if let Some(d) = data {
+                create_data_strings(d, &mut add);
+            }
+        }
         if coin || coin_create || !called.is_empty() || !deployed.is_empty() || !refs.is_empty() {
             let cap = if coin {
                 usize::MAX
@@ -630,7 +672,8 @@ pub fn d3_candidates(
                 .unwrap_or("")
                 .to_owned();
             c.exec = Some(D3Exec {
-                coin: coin || coin_create,
+                coin,
+                coin_create: create_strings,
                 called,
                 deployed,
                 strings,
@@ -657,8 +700,10 @@ pub fn d3_candidates(
 ///    token `<m>` the code calls (`<m>.fn`; from the events fork on only one that emitted
 ///    nothing in the tx), and for coin below the events fork.
 ///
-///    2c. **`coin.create-account`** at any height: the account it creates holds a row at 0
-///    that no event names (zero rows, gap Q), so the exec strings count for coin too.
+///    2c. **`coin.create-account`** from the events fork on: the account it creates holds a
+///    row at 0 that no event names (zero rows, gap Q), so the code literals, then the
+///    `exec.data` strings count for coin ([`D3Exec::coin_create`]: at most
+///    [`MAX_EXEC_PAIRS_PER_TX`], never `result.data` or a keyset predicate).
 ///
 ///    2b. **A tracked token named in code** (review I1: a dotted reference anywhere, bound
 ///    through `let`, in a dead branch or a list, or the module of a qualified call) that
@@ -715,6 +760,10 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
         let mut modules: Vec<&str> = Vec::new();
         if x.coin {
             modules.push("coin");
+        }
+        // Rule 2c: its own strings, for coin only.
+        for s in &x.coin_create {
+            r.push(s, "coin");
         }
         for m in &x.called {
             if is_token(m) && !modules.contains(&m.as_str()) {
