@@ -701,11 +701,6 @@ pub fn decode_balance_cursor(s: &str) -> Result<(String, u8)> {
     Ok((m.to_owned(), c.parse::<u8>().map_err(|_| bad())?))
 }
 
-/// `balance(accountName, module, chainIds)`: an account's fungible rows above 0 (the
-/// reconciled balances), listed by module name then chain, filtered by `module` and
-/// `chainIds`. Without `accountName` (a module's holders) it is `NOT_SUPPORTED`: the store
-/// keeps no holders-by-module index, and a scan of every balance row is not bounded (R7I-5).
-#[allow(clippy::too_many_arguments)]
 /// Transfer keys read per (account, module) by `balance(...)`'s zero-row probe
 /// ([`xfer_touched`]). Keys are height-major, so a probe for a chain the account rarely uses
 /// can walk the whole list; this bounds it.
@@ -742,6 +737,12 @@ fn xfer_touched(
     Ok((found, false))
 }
 
+/// `balance(accountName, module, chainIds)`: an account's fungible rows above 0, plus its rows
+/// at 0 that a TRANSFER touched (stock's rule; [`xfer_touched`]), listed by module name then
+/// chain, filtered by `module` and `chainIds`. Without `accountName` (a module's holders) it
+/// is `NOT_SUPPORTED`: the store keeps no holders-by-module index, and a scan of every balance
+/// row is not bounded (R7I-5).
+#[allow(clippy::too_many_arguments)]
 pub async fn query_balance(
     ctx: &Context<'_>,
     account_name: Option<String>,
