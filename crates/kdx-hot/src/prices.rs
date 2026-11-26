@@ -802,14 +802,21 @@ fn amount_pick(a: &Value) -> &Value {
 /// [`amount_dec`] as the same number, sign of a zero included.
 fn amount_text(a: &Value) -> Option<String> {
     amount_of(a)?;
-    Some(amount_pick(a).to_string())
+    let t = amount_pick(a).to_string();
+    // A string's JSON adds its quotes (and escapes, which a number never needs).
+    (t.len() <= MAX_AMOUNT_TEXT + 2).then_some(t)
 }
 
 /// [`amount_dec`] of a parsed JSON value.
 fn amount_of(a: &Value) -> Option<Dec> {
     match amount_pick(a) {
         Value::Number(n) => {
-            let f: f64 = n.to_string().parse().ok()?;
+            // `arbitrary_precision` keeps a number's text: bound it like a string.
+            let t = n.to_string();
+            if t.len() > MAX_AMOUNT_TEXT {
+                return None;
+            }
+            let f: f64 = t.parse().ok()?;
             f.is_finite().then(|| Dec::parse(&format!("{f}")))?
         }
         Value::String(s) => Dec::parse(s),
@@ -1513,5 +1520,34 @@ mod tests {
         let s = swap_of(k, 0, &data, &z).unwrap();
         assert_eq!(s.row.legs[1].1, "\"-0\"");
         assert_eq!(price_text(&s.row).as_deref(), Some("-Infinity"));
+    }
+
+    /// N-04 follow-up: with `arbitrary_precision` a JSON number keeps its text, so a number or
+    /// string amount longer than [`MAX_AMOUNT_TEXT`] is refused, never stored.
+    #[test]
+    fn an_overlong_amount_is_not_stored() {
+        let long_num: Value = serde_json::from_str(&format!("0.{}1", "0".repeat(10_000))).unwrap();
+        assert!(long_num.to_string().len() > 10_000);
+        assert_eq!(amount_of(&long_num), None);
+        assert_eq!(amount_text(&long_num), None);
+        let long_str = json!(format!("0.{}1", "0".repeat(2_000)));
+        assert_eq!(amount_of(&long_str), None);
+        assert_eq!(amount_text(&json!({"decimal": long_str})), None);
+        // Through swap_of: a genuine event whose amount the result repeats at 10k digits.
+        let k = TxKey::new(1, 2, 1);
+        let evs = [ev("coin", long_num.clone(), "kaddex.kdx", json!(3))];
+        let data = json!([{"token": "coin", "amount": long_num},
+                          {"token": "kaddex.kdx", "amount": 3}]);
+        assert_eq!(swap_of(k, 0, &data, &evs), None);
+        // Normal amounts are stored as they came.
+        assert_eq!(
+            amount_text(&json!(689.006542078688)).as_deref(),
+            Some("689.006542078688")
+        );
+        assert_eq!(
+            amount_text(&json!({"decimal": "0.82543"})).as_deref(),
+            Some("\"0.82543\"")
+        );
+        assert_eq!(amount_text(&json!({"integer": 67})).as_deref(), Some("67"));
     }
 }
