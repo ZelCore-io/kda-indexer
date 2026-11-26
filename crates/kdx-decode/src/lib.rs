@@ -9,6 +9,8 @@ pub mod merkle;
 pub mod payload;
 pub mod receivers;
 pub mod render;
+pub mod rowcount;
+pub mod rows;
 pub mod verify;
 
 pub use build::{build_records, BuildError};
