@@ -685,8 +685,7 @@ mod tests {
                 let ours: Vec<&str> = p.iter().map(String::as_str).collect();
                 let missing: Vec<_> = ps.iter().filter(|x| !ours.contains(x)).collect();
                 let extra: Vec<_> = ours.iter().filter(|x| !ps.contains(x)).collect();
-                // Stock's DEX types (`Pool`) are not served.
-                if !extra.is_empty() || missing.iter().any(|m| **m != "Pool") {
+                if !extra.is_empty() || !missing.is_empty() {
                     wrong.push(format!("{t}: missing {missing:?}, extra {extra:?}"));
                 }
             }

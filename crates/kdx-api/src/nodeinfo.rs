@@ -1,12 +1,13 @@
-//! The node's `/info` facts that stock's `networkInfo` serves (`nodeBlockDelay`,
+//! The node's `/info` facts that stock's `networkInfo` serves (`apiVersion`, `nodeBlockDelay`,
 //! `nodeChains`, `numberOfChains`, `genesisHeights`, `nodePackageVersion`, `nodeServiceDate`,
 //! `nodeLatestBehaviorHeight`).
 //!
 //! Stock reads `/info` into a memory cache at start and every 30 s, keeps the last good
 //! answer when a read fails, and parses it with a strict schema (a missing or mistyped field
-//! keeps the old answer). Ours: the `/cut` poll of `serve` and `run` also reads `/info`, every
-//! [`NODE_INFO_TTL`] after a good answer and every [`NODE_INFO_RETRY`] after a failed one, on
-//! the poll's own node client (one request per TTL, nothing per GraphQL request). The last
+//! keeps the old answer). Ours: beside the `/cut` poll, `serve` and `run` read `/info` on their
+//! own timer, every [`NODE_INFO_TTL`] after a good answer and every [`NODE_INFO_RETRY`] after
+//! a failed one, one short try each, on the poll's node client (one request per TTL, nothing
+//! per GraphQL request). The last
 //! good answer is kept on failure, as stock keeps it.
 
 use std::sync::Arc;
@@ -23,6 +24,8 @@ pub const NODE_INFO_RETRY: Duration = Duration::from_secs(30);
 /// The fields of one good `/info` answer, as the node sent them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeFacts {
+    /// `nodeApiVersion` (stock's `networkInfo.apiVersion`).
+    pub api_version: String,
     /// `nodeBlockDelay` (microseconds).
     pub block_delay: i64,
     /// `nodeChains`, in the node's order.
@@ -67,10 +70,10 @@ impl NodeFacts {
             Value::String(s) => Some(s.clone()),
             _ => return None,
         };
-        // Checked as stock checks them, though not served here.
-        text("nodeApiVersion")?;
+        // Checked as stock checks it, though `networkId` comes from the config.
         text("nodeVersion")?;
         Some(NodeFacts {
+            api_version: text("nodeApiVersion")?,
             block_delay: int("nodeBlockDelay")?,
             chains,
             number_of_chains: int("nodeNumberOfChains")?,
@@ -122,6 +125,7 @@ mod tests {
     #[test]
     fn a_full_answer_parses_in_the_node_s_order() {
         let f = NodeFacts::from_info(&mainnet_info()).unwrap();
+        assert_eq!(f.api_version, "0.0");
         assert_eq!(f.block_delay, 30_000_000);
         assert_eq!(f.chains, ["0", "1", "10", "19"]);
         assert_eq!(f.number_of_chains, 20);

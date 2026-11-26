@@ -124,6 +124,16 @@ fn block_hash(c: u8, h: u32) -> String {
 
 /// Block `(c, h)` with a coinbase and `shapes` as its user txs, and their request keys.
 fn decoded(c: u8, h: u32, shapes: &[Shape]) -> (DecodedBlock, Vec<String>) {
+    decoded_priced(c, h, shapes, json!(1e-8))
+}
+
+/// [`decoded`] with `gas_price` as every user tx's `meta.gasPrice` (gas 1 each).
+fn decoded_priced(
+    c: u8,
+    h: u32,
+    shapes: &[Shape],
+    gas_price: Value,
+) -> (DecodedBlock, Vec<String>) {
     let mut txs = Vec::new();
     let mut rks = Vec::new();
     for (i, s) in shapes.iter().enumerate() {
@@ -131,7 +141,7 @@ fn decoded(c: u8, h: u32, shapes: &[Shape]) -> (DecodedBlock, Vec<String>) {
         let cmd = json!({
             "payload": {"exec": {"data": null, "code": format!("(tx {c} {h} {i})")}},
             "meta": {"sender": ALICE, "chainId": c.to_string(), "creationTime": ct,
-                     "gasLimit": 1000, "gasPrice": 1e-8, "ttl": 600},
+                     "gasLimit": 1000, "gasPrice": gas_price, "ttl": 600},
             "signers": [{"pubKey": ALICE_KEY}],
             "nonce": format!("n-{c}-{h}-{i}"),
             "networkId": "mainnet01",
@@ -3295,6 +3305,44 @@ mod stored_count {
         for (c, sum) in sums {
             assert_eq!(stored[&c].unwrap().gas, sum, "chain {c}");
         }
+    }
+
+    /// `Block.totalGasUsedInKda` rounds half-up at the 10th decimal, as stock's
+    /// `DECIMAL(20,10)`: one tx of gas 1 at 0.00000001225 KDA (11 decimals, exactly half-way)
+    /// is `0.0000000123` (half-even and truncation give `...122`), and it is the chain
+    /// counter's addition. Then a 12-decimal price below the half: 0.000000012349 is
+    /// `0.0000000123`.
+    #[tokio::test]
+    async fn block_total_gas_used_rounds_half_up_at_the_10th_decimal() {
+        use kdx_hot::chaincount::read_all;
+        let fx = fixture();
+        reconcile(&fx);
+        let before = read_all(&fx.store.hot.ro().unwrap()).unwrap()[&0]
+            .unwrap()
+            .gas;
+        for (h, price) in [(13u32, 1.225e-8), (14, 1.2349e-8)] {
+            let mut t = fx.store.hot.rw().unwrap();
+            let mut dict = HotDict::load(&t).unwrap();
+            let (b, _) = decoded_priced(0, h, &[Shape::One], json!(price));
+            let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+            kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+            dict.persist(&mut t).unwrap();
+            t.commit().unwrap();
+            let q = format!(
+                "{{ block(hash: \"{}\") {{ totalGasUsedInKda }} }}",
+                block_hash(0, h)
+            );
+            assert_eq!(
+                run(&fx.schema, &q).await["block"]["totalGasUsedInKda"],
+                "0.0000000123",
+                "{q}"
+            );
+        }
+        let after = read_all(&fx.store.hot.ro().unwrap()).unwrap()[&0]
+            .unwrap()
+            .gas;
+        let added = kdx_hot::chaincount::parse_price("0.000000024599").unwrap();
+        assert_eq!(after, before.checked_add(added).unwrap());
     }
 
     /// Counts stay right through a reorg: unwind two hot blocks of chain 0, apply a different

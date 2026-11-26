@@ -286,8 +286,10 @@ The G4 replay of real traffic (below) met most of these classes again; its
   - `NetworkInfo` node fields (`genesisHeights`, `nodeBlockDelay`, `nodeChains`,
     `nodeLatestBehaviorHeight`, `nodePackageVersion`, `nodeServiceDate`, `numberOfChains`):
     the same `/info` values, read every 5 minutes instead of stock's 30 s. Before the first
-    good `/info` answer ours are `null` with `NOT_AVAILABLE`; stock's are non-null, so its
-    whole `networkInfo` errors then.
+    good `/info` answer ours are `null` in place with `NOT_AVAILABLE` (the types are stock's,
+    the non-null ones included) and the rest of `networkInfo` answers; stock's whole
+    `networkInfo` errors then. `apiVersion` is `/info`'s `nodeApiVersion` as stock, and
+    `"0.0"` before the first answer.
   - `Block.totalGasUsedInKda`: the exact Σ `gas × gasPrice` of the block's user txs, rounded
     half-up to 10 decimals. Stock adds each tx's product as a JavaScript float, so a value
     can differ in the 10th decimal. Stock serves `"0"` for blocks it wrote before it added
@@ -328,6 +330,11 @@ The G4 replay of real traffic (below) met most of these classes again; its
   `first/after`), where stock answers. Account, transfer, event-name and public-key lists
   page `last` from their oldest row and have no such limit
   ([graphql.md](graphql.md#transactions-events-and-transfers)).
+- A list of accounts that selects `transfers { totalCount }` (as
+  `nonFungibleAccount { chainAccounts { transfers { totalCount } } }`, one count per chain) or
+  `transactions { totalCount }` needs more than 2 list totalCounts in one operation, so ours
+  refuses the whole request with `LIMIT` (`counts`), where stock answers. Select `totalCount`
+  on one account's list per request ([graphql.md](graphql.md#transactions-events-and-transfers)).
 - chainweb-data answered the `fluxteam` account list (`limit=200000`, no `minheight`) with
   recent rows only, 27 to 32 against ours' 237; ours answers the whole history (R-G4-05). The
   general cause is inferred from this one account ([api.md](api.md#compat-notes)).

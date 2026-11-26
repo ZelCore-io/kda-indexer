@@ -31,10 +31,15 @@ pub fn signals(token: CancellationToken) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Poll the node's cut into `tips` until `stop` (errors leave the tips to go stale). The same
-/// client reads `/info` for `networkInfo`'s node fields: every `NODE_INFO_TTL` after a good
-/// answer, every `NODE_INFO_RETRY` after a failed one; a failure keeps the last good answer
-/// (`kdx_api::nodeinfo`).
+/// The timeout of one `/info` read (one try, no retry: the next read is at most
+/// `NODE_INFO_RETRY` away).
+pub const INFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll the node's cut into `tips` until `stop` (errors leave the tips to go stale). A second
+/// task on a clone of the same client reads `/info` for `networkInfo`'s node fields: every
+/// `NODE_INFO_TTL` after a good answer, every `NODE_INFO_RETRY` after a failed one, one try
+/// of at most [`INFO_TIMEOUT`], so a slow `/info` never delays `/cut` or shutdown; a failure
+/// keeps the last good answer (`kdx_api::nodeinfo`).
 pub fn spawn_tip_poll(cfg: &Config, tips: TipWatch, stop: CancellationToken) {
     let node = match super::node_client(cfg) {
         Ok(n) => n,
@@ -43,16 +48,16 @@ pub fn spawn_tip_poll(cfg: &Config, tips: TipWatch, stop: CancellationToken) {
             return;
         }
     };
-    tokio::spawn(async move {
-        let mut info_at = tokio::time::Instant::now();
-        loop {
-            match node.cut().await {
-                Ok(c) => tips.set(c.hashes.iter().map(|(k, e)| (*k, e.height)).collect()),
-                Err(e) => tracing::debug!(error = %e, "api: /cut poll failed"),
-            }
-            if tokio::time::Instant::now() >= info_at {
-                let good = match node.info().await {
-                    Ok(i) => tips.set_info(&i.raw),
+    {
+        let (node, tips, stop) = (node.clone(), tips.clone(), stop.clone());
+        tokio::spawn(async move {
+            loop {
+                let read = tokio::select! {
+                    _ = stop.cancelled() => break,
+                    r = node.info_raw_once(INFO_TIMEOUT) => r,
+                };
+                let good = match read {
+                    Ok(raw) => tips.set_info(&raw),
                     Err(e) => {
                         tracing::debug!(error = %e, "api: /info read failed");
                         false
@@ -61,12 +66,23 @@ pub fn spawn_tip_poll(cfg: &Config, tips: TipWatch, stop: CancellationToken) {
                 if !good {
                     tracing::debug!("api: no usable /info answer, the last good one is kept");
                 }
-                info_at = tokio::time::Instant::now()
-                    + if good {
-                        kdx_api::nodeinfo::NODE_INFO_TTL
-                    } else {
-                        kdx_api::nodeinfo::NODE_INFO_RETRY
-                    };
+                let wait = if good {
+                    kdx_api::nodeinfo::NODE_INFO_TTL
+                } else {
+                    kdx_api::nodeinfo::NODE_INFO_RETRY
+                };
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        loop {
+            match node.cut().await {
+                Ok(c) => tips.set(c.hashes.iter().map(|(k, e)| (*k, e.height)).collect()),
+                Err(e) => tracing::debug!(error = %e, "api: /cut poll failed"),
             }
             tokio::select! {
                 _ = stop.cancelled() => break,

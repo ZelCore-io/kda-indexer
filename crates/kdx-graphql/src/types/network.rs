@@ -95,8 +95,8 @@ fn no_node_info(field: &str) -> async_graphql::Error {
 }
 
 /// A node number as GraphQL `Int` (graphql-js refuses one past 32 bits, as this does).
-fn node_int(field: &str, n: i64) -> Result<Option<i32>> {
-    i32::try_from(n).map(Some).map_err(|_| {
+fn node_int(field: &str, n: i64) -> Result<i32> {
+    i32::try_from(n).map_err(|_| {
         crate::error::err(
             crate::error::Code::Internal,
             format!("{field}: the node's value {n} is not a 32-bit Int"),
@@ -113,37 +113,35 @@ impl NetworkInfo {
 #[ComplexObject]
 impl NetworkInfo {
     /// `nodeBlockDelay` of the node's `/info` (microseconds).
-    async fn node_block_delay(&self) -> Result<Option<i32>> {
+    async fn node_block_delay(&self) -> Result<i32> {
         node_int("nodeBlockDelay", self.facts("nodeBlockDelay")?.block_delay)
     }
     /// `nodeChains` of the node's `/info`, in its order.
-    async fn node_chains(&self) -> Result<Option<Vec<String>>> {
-        Ok(Some(self.facts("nodeChains")?.chains.clone()))
+    async fn node_chains(&self) -> Result<Vec<String>> {
+        Ok(self.facts("nodeChains")?.chains.clone())
     }
     /// `nodeNumberOfChains` of the node's `/info`.
-    async fn number_of_chains(&self) -> Result<Option<i32>> {
+    async fn number_of_chains(&self) -> Result<i32> {
         node_int(
             "numberOfChains",
             self.facts("numberOfChains")?.number_of_chains,
         )
     }
     /// `nodeGenesisHeights` of the node's `/info`, in its order.
-    async fn genesis_heights(&self) -> Result<Option<Vec<GenesisHeight>>> {
+    async fn genesis_heights(&self) -> Result<Vec<GenesisHeight>> {
         let f = self.facts("genesisHeights")?;
         let mut out = Vec::with_capacity(f.genesis_heights.len());
         for (c, h) in &f.genesis_heights {
             out.push(GenesisHeight {
                 chain_id: c.clone(),
-                height: node_int("genesisHeights", *h)?.unwrap_or_default(),
+                height: node_int("genesisHeights", *h)?,
             });
         }
-        Ok(Some(out))
+        Ok(out)
     }
     /// `nodePackageVersion` of the node's `/info`.
-    async fn node_package_version(&self) -> Result<Option<String>> {
-        Ok(Some(
-            self.facts("nodePackageVersion")?.package_version.clone(),
-        ))
+    async fn node_package_version(&self) -> Result<String> {
+        Ok(self.facts("nodePackageVersion")?.package_version.clone())
     }
     /// `nodeServiceDate` of the node's `/info` as `toISOString` text; `null` when the node
     /// sends `null` (or a date that does not parse).
@@ -154,7 +152,7 @@ impl NetworkInfo {
             .and_then(crate::scalars::parse_rfc3339))
     }
     /// `nodeLatestBehaviorHeight` of the node's `/info`.
-    async fn node_latest_behavior_height(&self) -> Result<Option<i32>> {
+    async fn node_latest_behavior_height(&self) -> Result<i32> {
         node_int(
             "nodeLatestBehaviorHeight",
             self.facts("nodeLatestBehaviorHeight")?
@@ -235,7 +233,7 @@ pub async fn network_info(ctx: &Context<'_>) -> Result<Option<NetworkInfo>> {
     let (total_difficulty, hash_rate) = cut_numbers(&tips);
     let node = g.state()?.tips.info();
     Ok(Some(NetworkInfo {
-        api_version: "0.0".into(),
+        api_version: api_version(node.as_deref()),
         coins_in_circulation: coins.unwrap_or(0.0),
         network_hash_rate: hash_rate,
         network_host: g.settings.network_host.clone(),
@@ -244,6 +242,13 @@ pub async fn network_info(ctx: &Context<'_>) -> Result<Option<NetworkInfo>> {
         transaction_count: txs.min(i32::MAX as u64) as i32,
         node,
     }))
+}
+
+/// Stock's `apiVersion`: the cached `/info`'s `nodeApiVersion`. Before the first good read
+/// (or with no node configured) `"0.0"`, the value every chainweb node sends; stock has no
+/// answer then and errors the whole `networkInfo`.
+fn api_version(node: Option<&NodeFacts>) -> String {
+    node.map_or_else(|| "0.0".to_owned(), |f| f.api_version.clone())
 }
 
 /// `(totalDifficulty, networkHashRate)` of the tip headers of a cut.
@@ -355,21 +360,23 @@ mod tests {
         }
     }
 
-    const NODE_SEL: &str = "{ networkInfo { networkId nodeBlockDelay nodeChains numberOfChains \
+    const NODE_SEL: &str =
+        "{ networkInfo { apiVersion networkId nodeBlockDelay nodeChains numberOfChains \
         genesisHeights { chainId height } nodePackageVersion nodeServiceDate \
         nodeLatestBehaviorHeight } }";
 
     fn info(node: Option<serde_json::Value>) -> NetworkInfo {
+        let node =
+            node.map(|v| std::sync::Arc::new(kdx_api::nodeinfo::NodeFacts::from_info(&v).unwrap()));
         NetworkInfo {
-            api_version: "0.0".into(),
+            api_version: api_version(node.as_deref()),
             coins_in_circulation: 0.0,
             network_hash_rate: 0.0,
             network_host: "h".into(),
             network_id: "mainnet01".into(),
             total_difficulty: 0.0,
             transaction_count: 0,
-            node: node
-                .map(|v| std::sync::Arc::new(kdx_api::nodeinfo::NodeFacts::from_info(&v).unwrap())),
+            node,
         }
     }
 
@@ -385,8 +392,12 @@ mod tests {
         })
     }
 
+    /// With the served schema's response pass (`order::FieldOrder`, #62's in-place handling
+    /// of this indexer's own error codes), so a failed non-null field answers as served.
     async fn run_node(node: Option<serde_json::Value>) -> async_graphql::Response {
-        Schema::new(N(info(node)), EmptyMutation, EmptySubscription)
+        Schema::build(N(info(node)), EmptyMutation, EmptySubscription)
+            .extension(crate::order::FieldOrder)
+            .finish()
             .execute(NODE_SEL)
             .await
     }
@@ -401,6 +412,7 @@ mod tests {
         assert_eq!(
             v["networkInfo"],
             serde_json::json!({
+                "apiVersion": "0.0",
                 "networkId": "mainnet01",
                 "nodeBlockDelay": 30000000,
                 "nodeChains": ["0", "1", "10", "19"],
@@ -422,10 +434,18 @@ mod tests {
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         let v = serde_json::to_value(&r.data).unwrap();
         assert!(v["networkInfo"]["nodeServiceDate"].is_null());
+        // `apiVersion` is the node's `nodeApiVersion`, as stock serves it.
+        let mut n = mainnet_info();
+        n["nodeApiVersion"] = "0.1".into();
+        let r = run_node(Some(n)).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let v = serde_json::to_value(&r.data).unwrap();
+        assert_eq!(v["networkInfo"]["apiVersion"], "0.1");
     }
 
     /// Before the first good `/info` answer each node field is `null` with `NOT_AVAILABLE`
-    /// beside it (`nodeServiceDate` included); the other fields still answer.
+    /// beside it, the six non-null ones too (`NOT_AVAILABLE` nulls in place, #62), and
+    /// `nodeServiceDate`; the other fields still answer and `apiVersion` is `"0.0"`.
     #[tokio::test]
     async fn node_fields_without_an_answer_are_not_available() {
         let r = run_node(None).await;
@@ -438,6 +458,9 @@ mod tests {
         }
         let v = serde_json::to_value(&r.data).unwrap();
         assert_eq!(v["networkInfo"]["networkId"], "mainnet01");
+        assert_eq!(v["networkInfo"]["apiVersion"], "0.0");
+        let keys: Vec<&String> = v["networkInfo"].as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 9, "{keys:?}");
         for f in [
             "nodeBlockDelay",
             "nodeChains",
@@ -447,7 +470,7 @@ mod tests {
             "nodeServiceDate",
             "nodeLatestBehaviorHeight",
         ] {
-            assert!(v["networkInfo"][f].is_null(), "{f}");
+            assert!(v["networkInfo"].get(f).is_some_and(|x| x.is_null()), "{f}");
         }
     }
 }
