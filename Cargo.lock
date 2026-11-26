@@ -1846,6 +1846,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "kdx-decode",
+ "kdx-metrics",
  "kdx-types",
  "reth-libmdbx",
  "serde",

@@ -210,3 +210,64 @@ fn hostile_prices_never_panic_and_overflow_clears_the_marker() {
     txn.commit().unwrap();
     assert_eq!(counts(&hot, 3).user_txs, 4);
 }
+
+/// Review I-2: a build without the frontier stamps adds a backfill range (or freezes one):
+/// `next_txnum` moves but no tail tip does. Neither the chain counters nor the row counts are
+/// trusted, and the next write's guard clears both markers. A healthy store (marker set by a
+/// reconcile, then a tail block) stays ready.
+#[test]
+fn txnum_moved_without_stamp_is_not_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+    apply(&hot, &block(2, 5, 0, &[(10, "0.01")]));
+    {
+        // What `reconcile-counts` writes for the row counts.
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::rowcount::set_ready(&mut txn, 0).unwrap();
+        kdx_hot::rowcount::stamp_all(&mut txn).unwrap();
+        txn.commit().unwrap();
+    }
+    let ro = hot.ro().unwrap();
+    assert!(chaincount::ready(&ro).unwrap());
+    assert!(kdx_hot::rowcount::ready(&ro).unwrap());
+    drop(ro);
+    // An older build commits a backfill range: next_txnum and the frozen frontier move.
+    let mut txn = hot.rw().unwrap();
+    txn.set_next_txnum(40).unwrap();
+    txn.set_frozen_frontier(5).unwrap();
+    txn.commit().unwrap();
+    let ro = hot.ro().unwrap();
+    assert!(chaincount::marker_set(&ro).unwrap());
+    assert!(!chaincount::ready(&ro).unwrap(), "NOT_AVAILABLE");
+    assert!(kdx_hot::rowcount::marker_set(&ro).unwrap());
+    assert!(!kdx_hot::rowcount::ready(&ro).unwrap(), "lists walk");
+    drop(ro);
+    // The guards (startup, every apply and unwind) clear both markers rather than
+    // stamping over the gap.
+    let mut txn = hot.rw().unwrap();
+    assert!(kdx_hot::rowcount::guard(&mut txn).unwrap().is_some());
+    txn.commit().unwrap();
+    apply(&hot, &block(2, 6, 0, &[(1, "1")]));
+    let ro = hot.ro().unwrap();
+    assert!(!chaincount::marker_set(&ro).unwrap());
+    assert!(!kdx_hot::rowcount::marker_set(&ro).unwrap());
+}
+
+/// Review M-2: a damaged row is never served as zero: the counters are not ready, and the
+/// guard clears the marker.
+#[test]
+fn damaged_row_is_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+    apply(&hot, &block(2, 5, 0, &[(10, "0.01")]));
+    apply(&hot, &block(3, 5, 0, &[(10, "0.01")]));
+    let mut txn = hot.rw().unwrap();
+    txn.put(kdx_hot::Table::ChainCounters, &[3], &[1, 2, 3])
+        .unwrap();
+    txn.commit().unwrap();
+    assert!(!chaincount::ready(&hot.ro().unwrap()).unwrap());
+    let mut txn = hot.rw().unwrap();
+    assert!(chaincount::guard(&mut txn).unwrap().is_some());
+    txn.commit().unwrap();
+    assert!(!chaincount::marker_set(&hot.ro().unwrap()).unwrap());
+}

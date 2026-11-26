@@ -461,7 +461,7 @@ documented difference), **unknown** (not settled yet).
 | 25 | ours' rows read before the queue drained, now equal to the node | 216 | both (transient) | [graphql.md](graphql.md#accounts) |
 | 26 | `lastBlockHeight` +1 and balance tip races | ~30 + 16 | both | [graphql.md](graphql.md#fields-compared-with-the-node-not-an-oracle) |
 | 27 | `__schema` differs; stock-only DEX fields | 4 + 1 (15 + 4) | both | [graphql.md](graphql.md#schema) |
-| 28 | `networkInfo` `coinsInCirculation` / `totalGasUsedInKda` (now served: exact; stock's float sum within a relative 1e-6, see [Intended differences](#intended-differences)) | 2 | both | [graphql.md](graphql.md#zelcore-extensions) |
+| 28 | `networkInfo` `coinsInCirculation` / `totalGasUsedInKda` (`totalGasUsedInKda` is now served exact; stock's float sum agrees within a relative 1e-6, see [Intended differences](#intended-differences)) | 2 | both | [graphql.md](graphql.md#zelcore-extensions) |
 | 29 | `pactQuery` answers `NOT_SUPPORTED` | 26 (97) | both | [graphql.md](graphql.md#schema) |
 | 30 | `blocksFromHeight` with an inverted range | 1 | ours | [graphql.md](graphql.md#blocks-and-network) |
 | 31 | kda-txs pairs a request key with another tx's block, time, code or chain | ~200 | ours (node 24/24) | [api.md](api.md#compat-notes) |

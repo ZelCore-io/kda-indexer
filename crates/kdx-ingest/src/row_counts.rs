@@ -360,8 +360,13 @@ pub fn reconcile(
     // One txn: the per-chain counters (twenty rows), both markers and the stamps.
     let mut txn = hot.rw()?;
     chaincount::replace(&mut txn, &chains)?;
-    // A partial store (from a height above 0) has no all-time counters to serve.
-    let partial = txn.meta(crate::freezer::META_PARTIAL_FROM)?.is_some();
+    // A partial store has no all-time counters to serve: one started at a height above 0
+    // (`run --start-height`) or whose first range starts above 0 (`backfill --from H` into
+    // a new data dir, review I-1).
+    let partial = txn.meta(crate::freezer::META_PARTIAL_FROM)?.is_some()
+        || kdx_segment::manifest::Manifest::load(segdir)?
+            .and_then(|m| m.entries.first().map(|e| e.start > 0))
+            .unwrap_or(false);
     if !chains.overflow && !partial {
         chaincount::set_ready(&mut txn, next_txnum)?;
         chaincount::stamp_all(&mut txn)?;

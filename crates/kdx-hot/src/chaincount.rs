@@ -16,14 +16,20 @@
 //!   ([`add_tally`]). The freezer moves records and leaves the counters alone.
 //!   `kda-indexer reconcile-counts` rebuilds the table from every record ([`replace`]).
 //! - `Meta chain_counters_ready` ([`READY`]) says the table may answer. A new hot store sets
-//!   it (empty table, empty store: exact). Tip guard, the PR #48 pattern with its own
-//!   stamps: `tail::apply` and `tail::unwind_to_with` write `Meta chain_counters_at@<chain>`
-//!   = the chain's new `Tail` checkpoint in the txn that changes the counters, and readers
-//!   need every stamp to equal its tip, so blocks any build without this table applied or
-//!   unwound (one with PR #48 included: it writes `row_counts_at@` but not these) make the
-//!   counters untrusted ([`ready`], [`guard`]). A rebuilt range, a backfill resume that
-//!   resets the hot frontier, a subtraction below zero, a sum past `u128` KDA or an undone
-//!   tx without its record clear the marker; `reconcile-counts` sets it again.
+//!   it (empty table, empty store: exact). Two stamps catch writes by a build without this
+//!   table ([`untrusted`], checked by [`ready`] and [`guard`]):
+//!   - `Meta chain_counters_at@<chain>` = the chain's new `Tail` checkpoint, written by
+//!     `tail::apply` and `tail::unwind_to_with` in the txn that changes the counters (the
+//!     PR #48 pattern): catches blocks such a build applied or unwound (one with PR #48
+//!     included: it writes `row_counts_at@` but not these).
+//!   - `Meta chain_counters_txnum` ([`TXNUM_AT`]) = `next_txnum`, written by each backfill
+//!     range in the commit that adds its totals and by each freeze: catches ranges such a
+//!     build backfilled (frozen ones too, needlessly: their records were counted by the tail).
+//!
+//!   A rebuilt range, a backfill resume that resets the hot frontier, a store whose first
+//!   range starts above height 0, a subtraction below zero, a sum past `u128` KDA, a damaged
+//!   row or an undone tx without its record clear the marker; `reconcile-counts` sets it
+//!   again (not on a partial store).
 //! - Untrusted numbers: `gasPrice` is parsed by [`parse_price`] (no float, bounded work, no
 //!   panic). A price that is missing, negative or malformed adds 0 KDA (the tx still
 //!   counts); a product or sum past `u128` whole KDA clears the marker.
@@ -42,6 +48,16 @@ use crate::tables::Table;
 pub const READY: &str = "chain_counters_ready";
 /// Meta key prefix of the per-chain tip the counters follow (`chain_counters_at@<chain>`).
 pub const AT_PREFIX: &str = "chain_counters_at@";
+
+/// Meta key of the TxNum frontier the counters follow (u64: `next_txnum` after the last
+/// backfill range, freeze or reconcile; review I-2).
+pub const TXNUM_AT: &str = "chain_counters_txnum";
+
+/// Record that the counters follow the store's current `next_txnum`, in the write txn that
+/// moved it (a backfill range with its totals, a freeze) or set the marker.
+pub fn stamp_txnum(txn: &mut RwTxn<'_>) -> Result<()> {
+    crate::rowcount::stamp_txnum_at(txn, TXNUM_AT)
+}
 
 pub fn at_key(chain: u8) -> String {
     format!("{AT_PREFIX}{chain}")
@@ -64,6 +80,7 @@ pub fn stamp_all(txn: &mut RwTxn<'_>) -> Result<()> {
     for (c, v) in tips(txn)? {
         txn.set_meta(&at_key(c), &v)?;
     }
+    stamp_txnum(txn)?;
     Ok(())
 }
 
@@ -414,10 +431,28 @@ pub fn marker_set(txn: &impl Txn) -> Result<bool> {
     Ok(txn.meta(READY)?.is_some())
 }
 
-/// Whether the stored counters may answer: the table exists, the marker is set and every
-/// chain's `row_counts_at` stamp equals its hot tip, in `txn`'s snapshot.
+/// Why the stored counters cannot be trusted (None: they can, as far as the stamps show):
+/// a chain's `chain_counters_at@` stamp differs from its `Tail` checkpoint
+/// ([`tip_mismatch`]), `chain_counters_txnum` differs from `next_txnum` (a range backfilled
+/// or frozen by a build without the stamp), or a row is damaged. At most 60 rows read.
+pub fn untrusted(txn: &impl Txn) -> Result<Option<String>> {
+    if let Some(why) = tip_mismatch(txn)? {
+        return Ok(Some(why));
+    }
+    if let Some(why) = crate::rowcount::txnum_mismatch(txn, TXNUM_AT)? {
+        return Ok(Some(why));
+    }
+    Ok(read_all(txn)?
+        .into_iter()
+        .find(|(_, v)| v.is_none())
+        .map(|(c, _)| format!("chain {c}: the stored counters row is damaged")))
+}
+
+/// Whether the stored counters may answer: the table exists, the marker is set, every
+/// chain's `chain_counters_at@` stamp equals its `Tail` checkpoint, `chain_counters_txnum`
+/// equals `next_txnum` and no row is damaged, all in `txn`'s snapshot.
 pub fn ready(txn: &impl Txn) -> Result<bool> {
-    Ok(txn.has_table(Table::ChainCounters) && marker_set(txn)? && tip_mismatch(txn)?.is_none())
+    Ok(txn.has_table(Table::ChainCounters) && marker_set(txn)? && untrusted(txn)?.is_none())
 }
 
 /// Set the marker at TxNum frontier `next_txnum`.
@@ -437,22 +472,22 @@ pub fn clear_ready(txn: &mut RwTxn<'_>) -> Result<bool> {
     Ok(was)
 }
 
-/// Startup and per-write check: clear a set marker whose counters do not follow the hot
-/// tips. Returns the reason when it cleared it.
+/// Startup and per-write check: clear a set marker whose counters cannot be trusted
+/// ([`untrusted`]). Returns the reason when it cleared it.
 pub fn guard(txn: &mut RwTxn<'_>) -> Result<Option<String>> {
     if !marker_set(txn)? {
         return Ok(None);
     }
-    let Some(why) = tip_mismatch(txn)? else {
+    let Some(why) = untrusted(txn)? else {
         return Ok(None);
     };
-    tracing::warn!(reason = %why, "chain counters: the counters do not follow the hot tips");
+    tracing::warn!(reason = %why, "chain counters: the counters do not follow the hot store");
     clear_ready(txn)?;
     Ok(Some(why))
 }
 
-/// The stored counters of `chain` (zero when it has no row). A damaged row reads as zero
-/// and is reported by [`read_all`].
+/// The stored counters of `chain` (zero when it has no row). A damaged row reads as zero;
+/// [`ready`] is false while one exists, so readers that check it first never serve that.
 pub fn get(txn: &impl Txn, chain: u8) -> Result<Counts> {
     Ok(txn
         .get(Table::ChainCounters, &[chain])?
@@ -490,6 +525,10 @@ pub fn add_tx(txn: &mut RwTxn<'_>, r: &TxRecord, sign: i64) -> Result<()> {
         return Ok(());
     };
     let chain = r.key.chain();
+    if sign >= 0 && !term.priced {
+        // Review M-1: counted with 0 gas where stock has a price.
+        kdx_metrics::get().chain_counters_unpriced("tail", 1);
+    }
     let raw = txn.get(Table::ChainCounters, &[chain])?;
     let mut c = match raw.as_deref().map(decode_val) {
         None => Counts::default(),

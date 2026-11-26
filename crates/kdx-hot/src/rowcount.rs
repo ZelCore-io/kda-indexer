@@ -21,6 +21,10 @@
 //!   [`guard`], run at `run` and tail startup) sees the mismatch and the counts are not used.
 //!   `tail::apply` and `tail::unwind_to_with` also run [`guard`] first, in their own txn, so
 //!   a caller without the startup check (`kda-indexer unwind`) cannot stamp over a mismatch.
+//! - TxNum guard (PR #51 review I-2): each freeze and `reconcile-counts` write
+//!   `Meta row_counts_txnum` ([`TXNUM_AT`]) = `next_txnum` in their txn, and [`ready`] needs it
+//!   equal: a range a build without the stamp backfilled (or froze) is caught although no
+//!   tip moved. Backfill clears the marker itself.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -38,8 +42,40 @@ pub const READY: &str = "row_counts_ready";
 /// Meta key prefix of the per-chain tip the counts follow (`row_counts_at@<chain>`).
 pub const AT_PREFIX: &str = "row_counts_at@";
 
+/// Meta key of the TxNum frontier the counts follow (review I-2 of PR #51).
+pub const TXNUM_AT: &str = "row_counts_txnum";
+
 pub fn at_key(chain: u8) -> String {
     format!("{AT_PREFIX}{chain}")
+}
+
+/// Record that counts keyed by `key` follow the store's current `next_txnum`, in the write
+/// txn that moved it (backfill range commit, freeze) or set the marker (`reconcile-counts`).
+pub fn stamp_txnum_at(txn: &mut RwTxn<'_>, key: &str) -> Result<()> {
+    let n = txn.next_txnum()?;
+    txn.set_meta_u64(key, n)
+}
+
+/// Why the TxNum stamp `key` does not equal the store's `next_txnum` (None when it does):
+/// a range was backfilled or frozen by a build that does not write the stamp. A missing or
+/// damaged stamp is a mismatch.
+pub fn txnum_mismatch(txn: &impl Txn, key: &str) -> Result<Option<String>> {
+    let next = txn.next_txnum()?;
+    let at = txn.meta(key)?;
+    if at.as_deref() == Some(&next.to_be_bytes()[..]) {
+        return Ok(None);
+    }
+    let at = at
+        .and_then(|v| <[u8; 8]>::try_from(&v[..]).ok())
+        .map_or("none".to_string(), |b| u64::from_be_bytes(b).to_string());
+    Ok(Some(format!(
+        "the counts follow TxNum {at} but next_txnum is {next} (a range backfilled or frozen by a build without the `{key}` stamp?)"
+    )))
+}
+
+/// [`stamp_txnum_at`] for the row counts.
+pub fn stamp_txnum(txn: &mut RwTxn<'_>) -> Result<()> {
+    stamp_txnum_at(txn, TXNUM_AT)
 }
 
 /// Record that the counts include `chain` up to its current `Tail` checkpoint (absent when
@@ -59,6 +95,7 @@ pub fn stamp_all(txn: &mut RwTxn<'_>) -> Result<()> {
     for (c, v) in tips(txn)? {
         txn.set_meta(&at_key(c), &v)?;
     }
+    stamp_txnum(txn)?;
     Ok(())
 }
 
@@ -155,10 +192,20 @@ pub fn marker_set(txn: &impl Txn) -> Result<bool> {
     Ok(txn.meta(READY)?.is_some())
 }
 
-/// Whether the stored counts may answer: the table exists, the marker is set and every
-/// chain's `row_counts_at` equals its hot tip, read in `txn`'s snapshot.
+/// Why the counts do not follow the store: a chain's `row_counts_at` differs from its hot
+/// tip ([`tip_mismatch`]), or `row_counts_txnum` from `next_txnum` ([`txnum_mismatch`]).
+pub fn untrusted(txn: &impl Txn) -> Result<Option<String>> {
+    match tip_mismatch(txn)? {
+        Some(why) => Ok(Some(why)),
+        None => txnum_mismatch(txn, TXNUM_AT),
+    }
+}
+
+/// Whether the stored counts may answer: the table exists, the marker is set, every
+/// chain's `row_counts_at` equals its hot tip and `row_counts_txnum` equals `next_txnum`,
+/// read in `txn`'s snapshot.
 pub fn ready(txn: &impl Txn) -> Result<bool> {
-    Ok(txn.has_table(Table::RowCounts) && marker_set(txn)? && tip_mismatch(txn)?.is_none())
+    Ok(txn.has_table(Table::RowCounts) && marker_set(txn)? && untrusted(txn)?.is_none())
 }
 
 /// Startup check (`run`, the tail): clear a set marker whose counts do not follow the tips,
@@ -167,10 +214,10 @@ pub fn guard(txn: &mut RwTxn<'_>) -> Result<Option<String>> {
     if !marker_set(txn)? {
         return Ok(None);
     }
-    let Some(why) = tip_mismatch(txn)? else {
+    let Some(why) = untrusted(txn)? else {
         return Ok(None);
     };
-    tracing::warn!(reason = %why, "row counts: the counts do not follow the hot tips");
+    tracing::warn!(reason = %why, "row counts: the counts do not follow the hot store");
     clear_ready(txn)?;
     Ok(Some(why))
 }
