@@ -971,7 +971,8 @@ async fn duplicate_keys_never_reach_the_node() {
         r#"{"chainId":"0","sender":"s","gasLimit":100,"gasPrice":1e-8,"ttl":600,"creationTime":1}"#;
     let dupes = [
         signed_cmd(r#"{"chainId":"0","gasLimit":1000000000,"gasLimit":100}"#),
-        signed_cmd(r#"{"chainId":"0","gasLimit":1000000000,"gasLimit":100}"#),
+        // The second key spelled with an escape (`\u0067` is `g`): compared decoded.
+        signed_cmd(r#"{"chainId":"0","gasLimit":100,"\u0067asLimit":1000000000}"#),
         signed_cmd(&format!("{meta_ok},\"meta\":{meta_ok}").replace("}\",", "},")),
         signed_cmd(meta_ok).replace(
             "\"networkId\":\"mainnet01\"",
@@ -1079,4 +1080,123 @@ async fn a_key_flood_never_refills_and_the_48_tier_holds() {
     // limiter's rule).
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert!(run_ip(&s, in48(7, 0), 2).await);
+}
+
+/// Secpass B M-6: a request whose items all fail the local checks (an unknown chain, an
+/// oversize item) runs nothing on the node and keeps its normal deadline.
+#[tokio::test]
+async fn items_failing_local_checks_do_not_extend_the_deadline() {
+    let (base, m) = mock(|_, _| ok("1")).await;
+    let h = http_state(Duration::from_secs(5));
+    let s = PactSettings {
+        max_input_bytes: 8,
+        ..open()
+    };
+    let (schema, _) = schema_with(base, s, Some(h.st.clone()), None);
+    let a = app(schema, &h.st, false);
+    let items = json!([{"chainId": "99", "code": "1"}, {"chainId": "0", "code": "(+ 1 2 3 4 5)"}]);
+    let at = Instant::now() + Duration::from_secs(5);
+    let run = kdx_api::RunDeadline::new(at, Duration::from_secs(11));
+    let before = run.get();
+    let body = json!({"query": PQ, "variables": {"q": items}});
+    let (_, v, _) = send(a, body.to_string().into(), Some(run.clone())).await;
+    assert_eq!(v["data"]["pactQuery"][0]["status"], "error", "{v}");
+    assert_eq!(v["data"]["pactQuery"][1]["status"], "error", "{v}");
+    assert_eq!(run.get(), before, "{v}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+/// Secpass B M-8: one time cap per request for its Pact items: work that shares a request's
+/// budget (aliases, batch operations, anything nested later) ends within one `timeout` of
+/// the first Pact field, not one `timeout` per field.
+#[tokio::test]
+async fn pact_items_share_one_time_cap_per_request() {
+    let (base, m) = mock(|_, _| (200, ok("1").1, Duration::from_secs(5))).await;
+    let s = schema(
+        base,
+        PactSettings {
+            timeout: Duration::from_millis(300),
+            ..open()
+        },
+    );
+    let budget = PactBudget::default();
+    let exec = |b: PactBudget| {
+        let req = async_graphql::Request::new(PQ)
+            .variables(async_graphql::Variables::from_json(
+                json!({ "q": [{"chainId": "0", "code": "1"}] }),
+            ))
+            .data(ClientIp(IpAddr::from([1, 2, 3, 4])))
+            .data(b);
+        s.execute(req)
+    };
+    let r = serde_json::to_value(exec(budget.clone()).await).unwrap();
+    assert_eq!(r["data"]["pactQuery"][0]["status"], "timeout", "{r}");
+    let hits = m.hits.load(Ordering::SeqCst);
+    let t = Instant::now();
+    let r = serde_json::to_value(exec(budget).await).unwrap();
+    assert_eq!(r["data"]["pactQuery"][0]["status"], "timeout", "{r}");
+    assert!(
+        t.elapsed() < Duration::from_millis(150),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(
+        m.hits.load(Ordering::SeqCst),
+        hits,
+        "past the cap: no node call"
+    );
+}
+
+/// Secpass B M-10: a field refused by the per-client rate spends none of the request's item
+/// budget, so a later field is refused for the rate too, not for the item cap.
+#[tokio::test]
+async fn a_rate_refusal_spends_no_item_budget() {
+    let (base, _m) = mock(|_, _| ok("1")).await;
+    let s = schema(
+        base,
+        PactSettings {
+            max_items: 2,
+            per_ip_rps: 1,
+            per_ip_burst: 2,
+            ..PactSettings::default()
+        },
+    );
+    let one = json!({ "q": [{"chainId": "0", "code": "1"}, {"chainId": "0", "code": "2"}] });
+    let r = run(&s, PQ, one, [7, 7, 7, 1]).await;
+    assert_eq!(r["data"]["pactQuery"][1]["status"], "success", "{r}");
+    let q = "{ a: pactQuery(pactQuery: [{chainId: \"0\", code: \"1\"}]) { status } \
+             b: pactQuery(pactQuery: [{chainId: \"0\", code: \"1\"}]) { status } \
+             c: pactQuery(pactQuery: [{chainId: \"0\", code: \"1\"}]) { status } }";
+    let r = run(&s, q, json!({}), [7, 7, 7, 1]).await;
+    let errs = r["errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 3, "{r}");
+    for e in errs {
+        assert!(
+            e["message"].as_str().unwrap().contains("[RATE_LIMIT]"),
+            "{r}"
+        );
+    }
+}
+
+/// Secpass B M-9: with the per-client limit on, a request with no peer address (embedding,
+/// tests; never one the HTTP server takes) is refused rather than sharing one bucket.
+#[tokio::test]
+async fn no_peer_address_shares_no_bucket() {
+    let (base, m) = mock(|_, _| ok("1")).await;
+    let s = schema(
+        base,
+        PactSettings {
+            per_ip_rps: 1,
+            per_ip_burst: 20,
+            ..PactSettings::default()
+        },
+    );
+    let req = async_graphql::Request::new(PQ)
+        .variables(async_graphql::Variables::from_json(
+            json!({ "q": [{"chainId": "0", "code": "1"}] }),
+        ))
+        .data(PactBudget::default());
+    let r = serde_json::to_value(s.execute(req).await).unwrap();
+    assert!(err_msg(&r).contains("[RATE_LIMIT]"), "{r}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
 }

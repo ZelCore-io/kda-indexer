@@ -541,7 +541,10 @@ pub struct AccountMissConfig {
     /// Node reads per request, all fields and aliases together (an account's 20 chains x 2).
     pub max_reads_per_request: u32,
     /// Per client (the API limiter's keys): reads per second (0 = no per-client limit) and
-    /// burst (at least 20: one account's chains).
+    /// burst (at least 20: one account's chains). Default 2/s, burst 20: a tenth of the node
+    /// rate, so one client cannot spend the budget others need. Also bounds one client's cache
+    /// churn: `cache_entries / 2 / per_ip_rps` (the time it takes one client to fill a
+    /// generation) must be at least `ttl_absent_secs`.
     pub per_ip_rps: u32,
     pub per_ip_burst: u32,
     /// Reads in flight across the process; the longest wait for one of these slots, past
@@ -573,8 +576,8 @@ impl Default for AccountMissConfig {
         Self {
             enabled: true,
             max_reads_per_request: 40,
-            per_ip_rps: 20,
-            per_ip_burst: 60,
+            per_ip_rps: 2,
+            per_ip_burst: 20,
             max_in_flight: 16,
             slot_wait_ms: 150,
             node_rps: 20,
@@ -609,6 +612,14 @@ impl AccountMissConfig {
         anyhow::ensure!(
             self.per_ip_rps == 0 || self.per_ip_burst >= 20,
             "graphql.account_miss.per_ip_burst must be at least 20 (or per_ip_rps 0)"
+        );
+        anyhow::ensure!(
+            self.per_ip_rps == 0
+                || u64::from(self.cache_entries / 2) / u64::from(self.per_ip_rps)
+                    >= self.ttl_absent_secs,
+            "graphql.account_miss: one client at per_ip_rps must not fill half of \
+             cache_entries within ttl_absent_secs (cache_entries / 2 / per_ip_rps >= \
+             ttl_absent_secs), or it could flush every other account's absent answers"
         );
         Ok(())
     }
@@ -659,18 +670,15 @@ pub struct PactConfig {
     pub max_gas_limit: u64,
     /// Largest node answer read.
     pub max_response_bytes: u32,
-    /// Node calls per second across the process (0 = no limit beyond `max_in_flight`;
-    /// default twice the default `max_in_flight`).
+    /// Node calls per second across the process, 1..=64 (default twice the default
+    /// `max_in_flight`). Calls wait for it rather than being refused.
     pub node_rps: u32,
 }
 
 /// Chains of a Chainweb network (M4): 20 on every network chainweb runs today. The store's
 /// chain graph, when it has one, overrides this at `serve` (`cmd::serve::pact_pass`).
-pub fn network_chains(network: &str) -> u8 {
-    match network {
-        "mainnet01" | "testnet04" | "testnet05" | "development" => 20,
-        _ => 20,
-    }
+pub fn network_chains(_network: &str) -> u8 {
+    20
 }
 
 impl Default for PactConfig {
@@ -698,9 +706,11 @@ impl PactConfig {
                 && (1_000..=60_000).contains(&self.timeout_ms)
                 && (1..=kdx_graphql::MAX_BODY_BYTES as u32).contains(&self.max_input_bytes)
                 && (1..=10_000_000).contains(&self.max_gas_limit)
-                && (1024..=(64 << 20)).contains(&self.max_response_bytes),
+                && (1024..=(64 << 20)).contains(&self.max_response_bytes)
+                && (1..=64).contains(&self.node_rps),
             "graphql.pact: max_items 1..=100, max_in_flight 1..=256, timeout_ms 1000..=60000, \
-             max_input_bytes 1..={}, max_gas_limit 1..=10000000, max_response_bytes 1024..=64 MiB",
+             max_input_bytes 1..={}, max_gas_limit 1..=10000000, max_response_bytes 1024..=64 MiB, \
+             node_rps 1..=64",
             kdx_graphql::MAX_BODY_BYTES
         );
         anyhow::ensure!(
@@ -1185,6 +1195,35 @@ mod balances_tests {
         assert!(p.node_rps > 0);
         assert_eq!(p.settings(network_chains("mainnet01")).chains, 20);
         assert_eq!(p.settings(7).chains, 7);
+    }
+
+    /// Secpass B I-1: the per-client default is a tenth of the node rate with a one-account
+    /// burst, and a per-client rate that could turn a cache generation over within the absent
+    /// TTL is refused. Secpass B M-11: the Pact node rate is bounded like the miss read's.
+    #[test]
+    fn per_client_limits_leave_the_node_budget_to_others() {
+        let m = AccountMissConfig::default();
+        assert_eq!((m.per_ip_rps, m.per_ip_burst), (2, 20));
+        assert!(m.per_ip_rps * 10 <= m.node_rps);
+        let churn = AccountMissConfig {
+            per_ip_rps: 3,
+            ..AccountMissConfig::default()
+        };
+        assert!(churn.validate().is_err(), "50,000 / 3 < 6 h");
+        let off = AccountMissConfig {
+            per_ip_rps: 0,
+            ..AccountMissConfig::default()
+        };
+        assert!(off.validate().is_ok());
+        assert!(PactConfig::default().validate().is_ok());
+        for node_rps in [0, 65] {
+            let p = PactConfig {
+                node_rps,
+                ..PactConfig::default()
+            };
+            assert!(p.validate().is_err(), "{node_rps}");
+        }
+        assert_eq!(network_chains("anything"), 20);
     }
 
     /// The miss read's node budget comes on top of the reconciler's: at most 25/s, default

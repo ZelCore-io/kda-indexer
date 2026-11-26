@@ -96,6 +96,11 @@ pub struct MissSettings {
     /// chains, twice).
     pub max_reads_per_request: usize,
     /// Per client (the API limiter's keys): reads per second (0 = no per-client limit), burst.
+    /// Defaults 2/s and 20 (one account's chains), a tenth of the node rate (secpass B I-1):
+    /// one client at its maximum rate leaves most of the node budget to the others. Each
+    /// cache insert is one of the client's reads, so the same limit bounds the cache churn
+    /// one client causes (50,000 inserts, half the default cache, take it about 7 h, longer
+    /// than the absent TTL).
     pub per_ip_rps: u32,
     pub per_ip_burst: u32,
     /// Node calls per second across the process (0 = none) and their burst. A read with no
@@ -126,8 +131,8 @@ impl Default for MissSettings {
     fn default() -> Self {
         MissSettings {
             max_reads_per_request: 40,
-            per_ip_rps: 20,
-            per_ip_burst: 60,
+            per_ip_rps: 2,
+            per_ip_burst: 20,
             node_rps: 20,
             node_burst: 40,
             timeout: Duration::from_secs(3),
@@ -230,7 +235,9 @@ impl Cache {
     }
 
     /// The node answered `k`'s chain absent: set its bit (see the merge rule above) and
-    /// drop the chain's own entry.
+    /// drop the chain's own entry. Not while a live found row is cached for the chain: coin
+    /// rows are never deleted, so such an answer is stale (a call that outlived a newer one,
+    /// or the dropped-feed race) and would hide the row for the whole absent TTL.
     #[must_use]
     fn mark_absent(
         &mut self,
@@ -243,7 +250,11 @@ impl Cache {
         if b == 0 {
             return None;
         }
-        self.remove(&(k.0.clone(), k.1.clone(), Some(k.2)));
+        let ck = (k.0.clone(), k.1.clone(), Some(k.2));
+        if let Some((_, Cached::Row(NodeRow::Found { .. }))) = self.entry(&ck, now) {
+            return None;
+        }
+        self.remove(&ck);
         let mk = (k.0.clone(), k.1.clone(), None);
         let (exp, m) = match self.entry(&mk, now) {
             Some((e, Cached::Absent(m))) => ((*e).min(exp), m | b),
@@ -252,19 +263,18 @@ impl Cache {
         self.put(mk, exp, Cached::Absent(m), cap)
     }
 
-    /// The node found `k`'s chain: clear its absent bit, the entry's expiry unchanged.
+    /// The node found `k`'s chain: clear its absent bit in each generation, the entry's
+    /// expiry unchanged; a mask left empty is dropped from its own generation only.
     fn clear_absent(&mut self, k: &Key) {
         let mk = (k.0.clone(), k.1.clone(), None);
         let b = bit(k.2);
-        let mut empty = false;
         for g in [&mut self.young, &mut self.old] {
             if let Some((_, Cached::Absent(m))) = g.get_mut(&mk) {
                 *m &= !b;
-                empty |= *m == 0;
+                if *m == 0 {
+                    g.remove(&mk);
+                }
             }
-        }
-        if empty {
-            self.remove(&mk);
         }
     }
 
@@ -738,6 +748,92 @@ mod tests {
         assert!(absent(&c, 3, t2) && !absent(&c, 1, t2) && !absent(&c, 2, t2));
         assert!(absent(&c, 3, t2 + Duration::from_secs(99)));
         assert!(!absent(&c, 3, t2 + ttl));
+    }
+
+    /// Secpass B M-13: an absent answer that arrives while a live found row is cached for
+    /// that chain is stale (coin rows are never deleted) and changes nothing.
+    #[test]
+    fn absent_after_a_live_found_row_is_ignored() {
+        let t0 = Instant::now();
+        let exp = t0 + Duration::from_secs(100);
+        let mut c = Cache::default();
+        let found = NodeRow::Found {
+            balance: "1.0".into(),
+            guard: Value::Null,
+            height: 1,
+        };
+        let _ = c.put(
+            ("k:a".into(), "coin".into(), Some(3)),
+            exp,
+            Cached::Row(found.clone()),
+            1000,
+        );
+        let _ = c.mark_absent(&key(3), exp, t0, 1000);
+        assert!(!absent(&c, 3, t0));
+        assert!(matches!(c.get(&key(3), t0), Some(Cached::Row(r)) if r == found));
+        // Once the found row expires, an absent answer is taken.
+        let t1 = exp + Duration::from_secs(1);
+        let _ = c.mark_absent(&key(3), t1 + Duration::from_secs(100), t1, 1000);
+        assert!(absent(&c, 3, t1));
+    }
+
+    /// Secpass B M-13: clearing a bit empties a mask per generation; a younger mask with
+    /// other bits keeps them.
+    #[test]
+    fn clear_absent_works_per_generation() {
+        let t0 = Instant::now();
+        let exp = t0 + Duration::from_secs(100);
+        let mk: CacheKey = ("k:a".into(), "coin".into(), None);
+        let mut c = Cache::default();
+        c.old.insert(mk.clone(), (exp, Cached::Absent(bit(3))));
+        c.young
+            .insert(mk.clone(), (exp, Cached::Absent(bit(3) | bit(5))));
+        c.clear_absent(&key(3));
+        assert!(!absent(&c, 3, t0));
+        assert!(absent(&c, 5, t0), "bit 5 survives in the young mask");
+        assert!(!c.old.contains_key(&mk), "the emptied old mask is dropped");
+    }
+
+    fn core(s: MissSettings) -> Core {
+        Core {
+            details: Arc::new(|_, _, _| futures::future::ready(Err(ReadErr::Node)).boxed()),
+            slots: Semaphore::new(1),
+            cache: Mutex::new(Cache::default()),
+            flights: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            calls: AtomicUsize::new(0),
+            settings: s,
+        }
+    }
+
+    /// Secpass B M-13: `remember(Found)` clears the chain's absent bit, also when found rows
+    /// are not cached (`ttl_found` 0).
+    #[test]
+    fn remember_found_clears_the_bit_even_uncached() {
+        let found = NodeRow::Found {
+            balance: "1.0".into(),
+            guard: Value::Null,
+            height: 1,
+        };
+        for ttl_found in [Duration::from_secs(30), Duration::ZERO] {
+            let core = core(MissSettings {
+                ttl_found,
+                ..MissSettings::default()
+            });
+            core.remember(key(3), Cached::Row(NodeRow::Absent));
+            core.remember(key(4), Cached::Row(NodeRow::Absent));
+            let now = Instant::now();
+            assert!(absent(&core.cache(), 3, now));
+            core.remember(key(3), Cached::Row(found.clone()));
+            let cache = core.cache();
+            assert!(!absent(&cache, 3, now) && absent(&cache, 4, now));
+            let served = cache.get(&key(3), now);
+            if ttl_found.is_zero() {
+                assert!(served.is_none(), "not cached");
+            } else {
+                assert!(matches!(served, Some(Cached::Row(r)) if r == found));
+            }
+        }
     }
 
     #[test]

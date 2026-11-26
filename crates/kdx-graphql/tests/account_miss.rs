@@ -634,3 +634,49 @@ async fn absent_answers_expire_after_their_ttl() {
     exec(&fx, &acct("k:nobody-ttl"), [10, 0, 5, 4]).await;
     assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 40);
 }
+
+/// Secpass B I-1: at the default limits one client, at its maximum rate, cannot spend the
+/// node budget other clients need: another client's fresh lookup is still read in full.
+#[tokio::test]
+async fn one_client_at_its_maximum_rate_leaves_another_lookup_fully_read() {
+    let fx = fixture(Mode::Chain, MissSettings::default());
+    let hostile = [10, 0, 9, 1];
+    let start = std::time::Instant::now();
+    let mut i = 0u32;
+    while start.elapsed() < Duration::from_millis(1_200) {
+        exec(&fx, &acct(&format!("k:hostile-{i}")), hostile).await;
+        i += 1;
+    }
+    let v = exec(&fx, &acct(CARD), [10, 0, 9, 2]).await;
+    assert_eq!(v.get("extensions"), None, "fully read: {v}");
+    assert_eq!(
+        chain_ids(&v["data"]["fungibleAccount"]["chainAccounts"]),
+        ["12"],
+        "{v}"
+    );
+}
+
+/// Secpass B I-1: cache churn from one client is bounded by its own read limit (each cache
+/// insert is one of its node reads), so one client cannot rotate the cache's generations.
+#[tokio::test]
+async fn cache_churn_from_one_client_is_bounded() {
+    let s = MissSettings::default();
+    let fx = fixture(Mode::Chain, s.clone());
+    let start = std::time::Instant::now();
+    for i in 0..300u32 {
+        let q = format!(
+            "{{ fungibleChainAccount(chainId: \"3\", accountName: \"k:churn-{i}\") {{ balance }} }}"
+        );
+        exec(&fx, &q, [10, 0, 9, 3]).await;
+    }
+    let secs = start.elapsed().as_secs_f64();
+    let bound = f64::from(s.per_ip_burst) + f64::from(s.per_ip_rps) * secs + 1.0;
+    let cached = fx.reader.cached();
+    assert!(
+        (cached as f64) <= bound && cached <= 25,
+        "{cached} entries in {secs:.2}s"
+    );
+    // The default read rate cannot turn a generation over within the absent TTL.
+    let turnover = (s.cache_entries / 2) as f64 / f64::from(s.per_ip_rps);
+    assert!(turnover >= s.ttl_absent.as_secs_f64(), "{turnover}");
+}

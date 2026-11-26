@@ -97,6 +97,15 @@ A request refused before anything ran (a parse, validation or limit refusal, or 
 error) has no `data` key, as in stock and the GraphQL spec; an error a field raised keeps
 `data`. In a batch each item follows this rule and the status stays 200.
 
+A field that fails is completed as the spec ("Handling Field Errors") and stock (graphql-js)
+complete it: a nullable field answers `null` in place, and a non-null one (`Int!`, a
+`…Connection!`) nulls its nearest nullable parent: an object, a list item, or `data` itself
+when every field up to the root is non-null. When every root field fails, `data` is an object
+of the failed roots set to `null` (`{"data":{"block":null},"errors":[…]}`, HTTP 200), as stock
+answers, unless a failed root is non-null. Each error keeps its `path`; stock strips `path` and
+`locations` from errors that carry `extensions` (see
+[comparison.md](comparison.md#intended-differences)).
+
 ## Limits
 
 Depth and complexity are the same as the stock indexer's (hack-a-chain-software/indexer-kadena
@@ -555,9 +564,9 @@ the oracle puts them.
   is computed only when selected: from the stored per-key counts where they hold the list
   (below), else by a count walk that runs to the request deadline (`api.deadline_ms`, 5 s).
   A walk the deadline cuts answers a `COUNT_TIMEOUT` error at
-  `totalCount` (the error has the field's path; the field is left out of the connection
-  object, which is `null` when `totalCount` was its only field; the rest of the response
-  stays); it never answers a
+  `totalCount` (the error has the field's path; `totalCount` is `Int!` and the connections
+  are non-null, so the error nulls the nearest nullable parent, `data` itself for a root
+  list, as stock's graphql-js answers); it never answers a
   partial number and sets no response flag. A block's or a request key's list counts with
   its page, under the same rule (audit F-50). There is no `totalCountLowerBound` flag and no
   `count_budget_ms` setting any more (an old config file that sets it still loads; it is
@@ -650,8 +659,10 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
   - absent: no row; failure (timeout, transport, one of our limits): no row, as stock drops a
     chain whose read failed, and the response carries `extensions.nodeReadIncomplete: true`.
   Only an account-like name (3 to 256 characters) of a module the store knows and serves is
-  read. Limits (`[graphql.account_miss]`; stock has none): per client 20 reads/s, burst 60
-  (the API limiter's keys), checked first, so a refused client spends no request budget; 40
+  read. Limits (`[graphql.account_miss]`; stock has none): per client 2 reads/s, burst 20
+  (one account's chains; the API limiter's keys), a tenth of the node rate so that one client
+  cannot spend the budget other clients' lookups need, checked first, so a refused client
+  spends no request budget; 40
   reads per request across all fields, aliases and batch operations; across the process, 16
   in flight and a node rate of its own on a `/local` client of its own: `node_rps` 20/s
   (burst 40, at most 64), at most 25/s, on top of the reconciler's `balances.local_rps`; 3 s per read
@@ -703,7 +714,9 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
     Our transfer postings come only from node events, which start at the events fork
     (1,138,000 on mainnet), as stock's TRANSFER rows do, so a row drained before the fork is
     not counted as touched in either. The check reads at most 10,000 transfer keys per
-    account and module, newest first, and at most 40,000 for all modules of one request;
+    account and module, newest first, and at most 40,000 for all modules of one `balance`
+    field (each alias has its own; aliases are bounded by the complexity limit and the
+    request deadline);
     it stops once every zero row's chain is found. A zero row still unresolved at either
     cap is listed (it exists on chain) and counted in
     `kdx_graphql_balance_touch_capped_total`. The request deadline ends the check with a
@@ -828,14 +841,14 @@ Limits (`[graphql.pact]`; stock has none). Each refusal is a stock-style message
 |---|---|---|
 | `max_items` | 20 | items in one request, all fields, aliases and batch operations together: the field fails with `[ERROR][RAW_QUERY][LIMIT] At most 20 Pact queries and gas estimates per request` (`[GAS]` for `gasLimitEstimate`) |
 | `enabled` | false | off: both fields answer `NOT_SUPPORTED`. Operators turn it on |
-| `per_ip_rps`, `per_ip_burst` | 5, 20 | per client, keyed as the API's rate limit (an IPv4 address, a v4-mapped address unmapped, or an IPv6 /64; under key pressure a new key draws on its /24 or /48 overflow bucket, and eviction never refills a drained key), one token per item: `[ERROR][RAW_QUERY][RATE_LIMIT] Too many Pact queries from this client, retry later` |
+| `per_ip_rps`, `per_ip_burst` | 5, 20 | per client, keyed as the API's rate limit (an IPv4 address, a v4-mapped address unmapped, or an IPv6 /64; under key pressure a new key draws on its /24 or /48 overflow bucket, and eviction never refills a drained key), one token per item: `[ERROR][RAW_QUERY][RATE_LIMIT] Too many Pact queries from this client, retry later`. A field this refuses spends none of the request's `max_items`. A request with no peer address (tests, embedding) is refused while this limit is on, never sharing one bucket |
 | `max_in_flight` | 8 | node calls at once; items wait for a slot inside their timeout. At most twice as many requests may be inside the passthrough; past that a request is refused at once with `[ERROR][RAW_QUERY][BUSY] The Pact query service is busy, retry later` |
-| `timeout_ms` | 10,000 | per item, slot wait included: stock's `timeout` item; a gas estimate fails with the node error. Only a request in which one of the fields actually runs may run this long (plus 1 s) past `api.deadline_ms`; the body read and every other request keep `api.deadline_ms` |
+| `timeout_ms` | 10,000 | per item, slot wait included: stock's `timeout` item; a gas estimate fails with the node error. Only a request in which an item actually runs (it passes the size and chain checks) may run this long (plus 1 s) past `api.deadline_ms`; the body read and every other request keep `api.deadline_ms`. All Pact items of one request (aliases and batch operations together) end within one `timeout_ms` of its first Pact field |
 | `max_input_bytes` | 65,536 | `code` plus `data` of one item: `[ERROR][RAW_QUERY][LIMIT] Pact code and data exceed N bytes` (the item, not the field); one gas input: `[ERROR][GAS][LIMIT] Input exceeds N bytes`. The request's `max_variables_bytes` and query caps apply first |
 | `max_gas_limit` | 150,000 | `meta.gasLimit` of a client command (`stringified-command`, `full-transaction`): `[ERROR][GAS][LIMIT] gasLimit above the server cap of N`, no node call. Our own commands ask for 2,500 or 10,000 |
 | (duplicate keys) | refused | a client command (`stringified-command`, `full-transaction`) that repeats a JSON key anywhere: `[ERROR][GAS][INPUT] The command holds a duplicate JSON key`, no node call (the node's decoder might read the other copy) |
 | `max_response_bytes` | 1 MiB | the node's answer: `[ERROR][RAW_QUERY][LIMIT] The node's answer exceeds N bytes`; a gas estimate fails with the node error |
-| `node_rps` | 16 | node calls per second across the process (0 = none); calls past it wait inside their timeout |
+| `node_rps` | 16 | node calls per second across the process (1..=64); calls past it wait inside their timeout |
 | (chains) | the network's | a `chainId` must be a canonical number below the network's chain count, taken from the store's chain graph, else the network (20); otherwise no node call |
 
 The passthrough has its own node client, so it neither shares nor drains ingest's node budget.
