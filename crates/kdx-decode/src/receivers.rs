@@ -1143,7 +1143,8 @@ fn pact_tokens(code: &str) -> Vec<PactTok> {
 /// - data-backed calls, at most [`MAX_COIN_CREATE_PER_TX`] in all: the account is a
 ///   `read-msg` / `read-string` of `exec.data`, or a literal whose guard is
 ///   `(read-keyset k)` naming an `exec.data` keyset under a key no earlier call used, whose
-///   `keys` name the account: the bare key, or `k:` + a key (the bulk creators' form). Any
+///   `keys` name the account: the bare key, or `k:` + a key (the bulk creators' form), the
+///   key a 64-char lowercase hex ed25519 key. Any
 ///   other entry (`{}`, a keyset of other keys, one value copied under many keys) costs the
 ///   sender a few bytes, not a name's worth, and backs nothing (PR #59 review P-1);
 /// - literal-only calls, at most [`MAX_COIN_CREATE_LITERALS_PER_TX`] of them.
@@ -1226,16 +1227,20 @@ pub fn coin_create_accounts(code: &str, data: Option<&Value>) -> Vec<String> {
     out
 }
 
-/// Whether `ks` is a keyset object whose `keys` name `account`: `account` is one of the
-/// keys, or `k:` + one of them.
+/// Whether `ks` is a keyset object whose `keys` name `account` through a 64-char lowercase
+/// hex ed25519 key: the bare key is the account, or `k:` + the key is. A short key costs the
+/// sender a few bytes, not a name's worth, so it backs nothing (PR #59 fix round 2).
 fn keyset_names(ks: &Value, account: &str) -> bool {
     let bare = account.strip_prefix("k:").unwrap_or(account);
-    ks.get("keys")
-        .and_then(Value::as_array)
-        .is_some_and(|keys| {
-            keys.iter()
-                .any(|k| k.as_str().is_some_and(|k| k == account || k == bare))
-        })
+    is_ed25519_hex(bare)
+        && ks
+            .get("keys")
+            .and_then(Value::as_array)
+            .is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(bare)))
+}
+
+fn is_ed25519_hex(k: &str) -> bool {
+    k.len() == 64 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The data key a `read-msg` argument names (a literal or a `'symbol`).

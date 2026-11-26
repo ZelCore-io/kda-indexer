@@ -1258,6 +1258,32 @@ fn data_backed_creates_keep_the_1000_cap() {
     );
 }
 
+/// PR #59 fix round 2: a keyset entry backs a call only when the matched key is a 64-char
+/// lowercase hex ed25519 key. A 3-char key costs the sender 3 bytes, not a name's worth, so
+/// 1,000 short names (`k:<key>` or the bare key), each with its own keyset, stay at the
+/// 64 literal cap.
+#[test]
+fn a_short_keyset_key_backs_nothing() {
+    let n = MAX_COIN_CREATE_PER_TX;
+    for prefix in ["k:", ""] {
+        let mut data = serde_json::Map::new();
+        let mut code = String::new();
+        for i in 0..n {
+            let key = format!("{i:03x}");
+            data.insert(format!("ks{i}"), json!({"keys": [key], "pred": "keys-all"}));
+            code.push_str(&format!(
+                "(coin.create-account \"{prefix}{key}\" (read-keyset \"ks{i}\"))"
+            ));
+        }
+        let got = coin_create_accounts(&code, Some(&Value::Object(data)));
+        assert!(
+            got.len() <= MAX_COIN_CREATE_LITERALS_PER_TX,
+            "{prefix:?}: {}",
+            got.len()
+        );
+    }
+}
+
 /// PR #59 review P-1: an `exec.data` entry backs a literal call only when it is a keyset
 /// whose `keys` name the account (the bare key, or `k:` + a key). An empty object, or one
 /// keyset value copied under every key, costs a few bytes per name and backs nothing: such

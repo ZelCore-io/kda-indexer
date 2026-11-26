@@ -893,15 +893,21 @@ fn build_and_commit(
     debug_abort("hot", u.start);
     manifest.push(entry.clone())?;
     manifest.commit(&ctx.segdir)?;
-    // PR #59 review m-a: the range is in the manifest, so its resume blobs (the row-count one
-    // can be MBs) are dead weight. A kill before this commit leaves them: the next range's
-    // commit replaces them, and a resume only uses a blob whose range matches exactly.
-    let mut txn = ctx.hot.rw()?;
-    kdx_hot::chaincount::drop_range(&mut txn)?;
-    kdx_hot::rowcount::drop_range(&mut txn)?;
-    txn.commit()?;
     // After the commit, so a range that is built again does not list its blocks twice.
     merkle.commit(&ctx.opts.data_dir, u.start);
+    // PR #59 review m-a: the range is in the manifest, so its resume blobs (the row-count one
+    // can be MBs) are dead weight. A kill before this commit leaves them: the next range's
+    // commit replaces them, and a resume only uses a blob whose range matches exactly. After
+    // the merkle commit, and a failure only logs: it must not skip the merkle writes or fail
+    // a range that is already committed (fix round 2).
+    let dropped = ctx.hot.rw().and_then(|mut txn| {
+        kdx_hot::chaincount::drop_range(&mut txn)?;
+        kdx_hot::rowcount::drop_range(&mut txn)?;
+        txn.commit()
+    });
+    if let Err(e) = dropped {
+        tracing::warn!(range_start = u.start, error = %e, "could not drop the range resume blobs");
+    }
     let commit_secs = t.elapsed().as_secs_f64();
     drop(dict);
     Ok((entry, prev, (decode_secs, finish_secs, commit_secs)))
