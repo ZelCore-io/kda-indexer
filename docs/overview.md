@@ -58,8 +58,10 @@ places where it is slower are in [comparison.md](comparison.md).
 
 - **No mempool.** Only transactions in blocks are indexed. A GraphQL `Transaction.result` is
   never a `TransactionMempoolInfo`; a transaction that is not indexed is `null`.
-- **No Pact execution.** It decodes what the node already executed. GraphQL `pactQuery` and
-  `gasLimitEstimate` answer `NOT_SUPPORTED`; balances come from the node's `/local`.
+- **No Pact execution of its own.** It decodes what the node already executed; balances come
+  from the node's `/local`. GraphQL `pactQuery` and `gasLimitEstimate` pass client Pact to the
+  node's `/local`, as the stock indexer does (owner decision 2026-11-26), within the limits in
+  [graphql.md](graphql.md#pact-passthrough).
 - **No orphaned transactions.** Only the canonical chain is kept. A reorg is unwound and the
   new branch applied; cursors into a reorged block answer `400 cursor invalidated by reorg`.
 - **No unbounded queries.** Every request has a page cap, a 5 s deadline and an index behind

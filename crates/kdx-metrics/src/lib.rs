@@ -86,6 +86,10 @@ pub struct Metrics {
     pub graphql_requests: Count,
     /// GraphQL refusals by limit (`reason` = depth | complexity | batch | query_size | ...).
     pub graphql_rejected: Count,
+    /// `pactQuery` / `gasLimitEstimate` node `/local` passthrough items (`field`, `outcome` =
+    /// success | error | node_error | timeout | too_large | limit | limit_items | limit_rate | limit_busy |
+    /// bad_input).
+    pub graphql_pact: Count,
     /// `balance(...)` rows at 0 listed because the transfer probe hit its key cap before it
     /// could tell whether a TRANSFER touched them (kept, the safe side).
     pub graphql_balance_touch_capped: Counter,
@@ -292,6 +296,11 @@ impl Metrics {
             "GraphQL requests refused by a limit (reason)",
             Count::default()
         );
+        let graphql_pact = reg!(
+            "kdx_graphql_pact",
+            "pactQuery/gasLimitEstimate /local passthrough items (field, outcome)",
+            Count::default()
+        );
         let graphql_balance_touch_capped = reg!(
             "kdx_graphql_balance_touch_capped",
             "balance() zero rows kept unchecked because the transfer probe hit its key cap",
@@ -399,6 +408,7 @@ impl Metrics {
             balance_reconcile_seconds,
             graphql_requests,
             graphql_rejected,
+            graphql_pact,
             graphql_balance_touch_capped,
             graphql_subscriptions,
             graphql_feed_lag_seconds,
@@ -492,6 +502,12 @@ impl Metrics {
     pub fn graphql_request(&self, kind: &'static str, result: &'static str) {
         self.graphql_requests
             .get_or_create(&vec![("kind", kind.into()), ("result", result.into())])
+            .inc();
+    }
+
+    pub fn graphql_pact(&self, field: &'static str, outcome: &'static str) {
+        self.graphql_pact
+            .get_or_create(&vec![("field", field.into()), ("outcome", outcome.into())])
             .inc();
     }
 

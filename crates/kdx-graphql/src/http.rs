@@ -23,6 +23,8 @@ use serde::Deserialize;
 use crate::error::{limit, server, Code};
 use crate::{KdxSchema, ReqCtx};
 
+/// Past the passthrough's timeout, time to answer a `pactQuery` that timed out (B1).
+const PACT_MARGIN: Duration = Duration::from_secs(1);
 /// Time kept back from the request deadline to answer `TIMEOUT` as GraphQL before the
 /// guard's 504.
 pub(crate) const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
@@ -249,11 +251,26 @@ async fn execute(
     }
     let budget = st.settings.deadline.saturating_sub(DEADLINE_MARGIN);
     let deadline = Instant::now() + budget;
-    let mut batch = batch.data(ReqCtx { deadline });
+    // B1: a request naming `pactQuery` / `gasLimitEstimate` may wait for the node up to the
+    // passthrough's own timeout (stock's 10 s), so its outer deadline is that plus a margin.
+    // Store reads keep `deadline` (ReqCtx): naming the fields buys them no extra time.
+    let names_pact = |q: &str| q.contains("pactQuery") || q.contains("gasLimitEstimate");
+    let mentions = match &batch {
+        BatchRequest::Single(r) => names_pact(&r.query),
+        BatchRequest::Batch(b) => b.iter().any(|r| names_pact(&r.query)),
+    };
+    let outer = match schema.data::<crate::Gql>().and_then(|g| g.pact.as_ref()) {
+        Some(p) if mentions => budget.max(p.settings().timeout + PACT_MARGIN),
+        _ => budget,
+    };
+    // One item budget for the whole request (every alias, every operation of a batch).
+    let mut batch = batch
+        .data(ReqCtx { deadline })
+        .data(crate::pact::PactBudget::default());
     if let Some(p) = peer {
         batch = batch.data(crate::ClientIp(st.client_ip_of(p, headers)));
     }
-    let resp = match tokio::time::timeout(budget, schema.execute_batch(batch)).await {
+    let resp = match tokio::time::timeout(outer, schema.execute_batch(batch)).await {
         Ok(r) => r,
         Err(_) => {
             kdx_metrics::get().graphql_request(kind, "timeout");

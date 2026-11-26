@@ -130,6 +130,10 @@ pub struct ApiState {
     /// `[balances] key_modules` (M-1, SEC-2): the modules `GET /keys/{pubkey}/accounts`
     /// lists without `token`; unset means `["coin"]`.
     key_modules: std::sync::OnceLock<Vec<String>>,
+    /// Extra time a `/graphql` request may run past `deadline` (B1: the `pactQuery` /
+    /// `gasLimitEstimate` node passthrough's timeout); unset is none. The GraphQL handler
+    /// still ends every request that names neither field at `deadline`.
+    graphql_extra: std::sync::OnceLock<std::time::Duration>,
     /// The `/stats` count cache: the process-wide one (GraphQL `networkInfo` shares it); a
     /// test injects its own (FV-6).
     pub(crate) stats_cache: &'static crate::compat::stats::CountCache,
@@ -298,6 +302,11 @@ impl ApiState {
     }
 
     /// Set `[balances] key_modules` (once, before serving; later calls are ignored).
+    /// See `graphql_extra`; set once, at start.
+    pub fn set_graphql_extra_deadline(&self, extra: std::time::Duration) {
+        let _ = self.graphql_extra.set(extra);
+    }
+
     pub fn set_key_modules(&self, modules: Vec<String>) {
         let _ = self.key_modules.set(modules);
     }
@@ -476,6 +485,10 @@ pub(crate) async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: N
             st.settings.v1txs_max_body_bytes,
             st.settings.deadline + st.settings.v1txs_deadline,
         )
+    } else if path == "/graphql" {
+        // B1: room for the node passthrough's timeout; the handler bounds everything else.
+        let extra = st.graphql_extra.get().copied().unwrap_or_default();
+        (st.settings.max_body_bytes, st.settings.deadline + extra)
     } else {
         (st.settings.max_body_bytes, st.settings.deadline)
     };
@@ -754,6 +767,7 @@ impl Api {
             v1txs: Arc::new(Semaphore::new(v1txs_slots(settings.read_threads))),
             heavy_clients: Arc::default(),
             key_modules: std::sync::OnceLock::new(),
+            graphql_extra: std::sync::OnceLock::new(),
             stats_cache: &crate::compat::stats::CACHE,
             in_flight: Arc::new(Semaphore::new(settings.max_in_flight.max(1))),
             limiter: RateLimiter::new(settings.rate_per_ip, settings.rate_burst),

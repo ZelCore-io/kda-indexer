@@ -31,7 +31,7 @@ defaults, nullability, interfaces and unions are identical.
 | Differs | Other resource limits | 10 operations per batch, a 5 s deadline, 20,000 fields after fragment expansion, 8 directives per field, an introspection cost cap. A refusal is a GraphQL error with `extensions.code = "LIMIT"` |
 | Same | Events over all 20 chains | The Kadena explorer builds one `events` field per ticked chain; with all 20 chains ticked it is answered or refused exactly as stock answers or refuses it |
 | Differs | `NetworkInfo.countersOfEachChain` | `blocksCount` answers; `transactionCount` and `totalGasUsedInKda` are `null` with `NOT_AVAILABLE` (no all-time per-chain counter is kept) |
-| Not supported | `pactQuery`, `gasLimitEstimate` | `NOT_SUPPORTED`: the indexer never runs Pact code for clients. Read contract state from a chainweb-node `/local` instead |
+| Node passthrough | `pactQuery`, `gasLimitEstimate` | Client Pact runs on the node's `/local`, as stock runs it, with stock's answers and error texts (owner decision 2026-11-26; it replaces the earlier "never runs Pact for clients" rule). Capped per request, per IP and in flight: [graphql.md](graphql.md#pact-passthrough) |
 | Not supported | Mempool | `Transaction.result` is never a `TransactionMempoolInfo`; a transaction not yet in a block is `null` |
 | Same | `lastTokenPriceInKda` | Stock's price of the newest DEX swap naming the module (`toFixed(12)` text); see [graphql.md](graphql.md#token-price) for the rulings |
 | Not supported | `balance` without `accountName` (all holders of a module) | `NOT_SUPPORTED`: no holders index |
@@ -70,8 +70,8 @@ type. The `limit` rows break down as follows:
   page. It passes with `first` 50.
 
 Three kadscan documents pass check-ops but read a field that answers `NOT_SUPPORTED` or
-`NOT_AVAILABLE` at run time: `pactQuery`, the per-chain gas counter and `balance` without an
-account. The explorer gets an error for that field, and the rest of the
+`NOT_AVAILABLE` at run time: the per-chain gas counter and `balance` without an account
+(`pactQuery` is served since the node passthrough). The explorer gets an error for that field, and the rest of the
 operation still answers.
 
 The per-operation table, with a note on every row, is in

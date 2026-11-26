@@ -1817,12 +1817,14 @@ dependencies = [
  "async-graphql-axum",
  "axum",
  "base64 0.22.1",
+ "blake2",
  "futures",
  "kdx-api",
  "kdx-decode",
  "kdx-hot",
  "kdx-ingest",
  "kdx-metrics",
+ "kdx-node",
  "kdx-segment",
  "kdx-types",
  "libc",
@@ -1835,6 +1837,7 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]

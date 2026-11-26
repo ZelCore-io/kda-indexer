@@ -1,0 +1,348 @@
+{
+ "_note": "gasLimitEstimate answers captured from stock on 2026-11-26 (one request each)",
+ "cases": [
+  {
+   "name": "g_code",
+   "input": [
+    "{\"code\": \"(+ 1 2)\", \"chainId\": \"0\"}"
+   ],
+   "stock": {
+    "data": {
+     "gasLimitEstimate": [
+      {
+       "amount": 1,
+       "inputType": "code",
+       "transaction": "{\"cmd\":\"{\\\"meta\\\":{\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-8,\\\"sender\\\":\\\"\\\",\\\"ttl\\\":28800,\\\"creationTime\\\":1795699625,\\\"chainId\\\":\\\"0\\\"},\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"kjs:nonce:1795699625144\\\",\\\"signers\\\":[]}\",\"hash\":\"TaadSB491Gj7zpHO_qJSK4XREB_ZUQu88uzuxztaVqQ\",\"sigs\":[]}",
+       "usedPreflight": false,
+       "usedSignatureVerification": false
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "g_code_badchain",
+   "input": [
+    "{\"code\": \"(+ 1 2)\", \"chainId\": \"25\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_code_fail",
+   "input": [
+    "{\"code\": \"(+ 1 \\\"a\\\")\", \"chainId\": \"0\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_code_net",
+   "input": [
+    "{\"code\": \"(+ 1 2)\", \"chainId\": \"0\", \"networkId\": \"testnet04\"}"
+   ],
+   "stock": {
+    "data": {
+     "gasLimitEstimate": [
+      {
+       "amount": 1,
+       "inputType": "code",
+       "transaction": "{\"cmd\":\"{\\\"meta\\\":{\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-8,\\\"sender\\\":\\\"\\\",\\\"ttl\\\":28800,\\\"creationTime\\\":1795699626,\\\"chainId\\\":\\\"0\\\"},\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"kjs:nonce:1795699626548\\\",\\\"signers\\\":[]}\",\"hash\":\"mffE7cSBBSN27-XBssNt_9ek_w3GQ5GbnN4epgJXBhg\",\"sigs\":[]}",
+       "usedPreflight": false,
+       "usedSignatureVerification": false
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "g_full_command",
+   "input": [
+    "{\"payload\": \"{\\\"exec\\\": {\\\"code\\\": \\\"(+ 1 2)\\\", \\\"data\\\": {}}}\", \"meta\": \"{\\\"chainId\\\": \\\"0\\\", \\\"sender\\\": \\\"\\\", \\\"gasLimit\\\": 10000}\", \"signers\": []}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_full_tx",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-1\\\",\\\"signers\\\":[],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699564},\\\"networkId\\\":\\\"mainnet01\\\"}\", \"hash\": \"8XEP0qUVwt1D_IjKmf8_hs9BvAr6fZTxNqWBzMtvwuo\", \"sigs\": []}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_full_tx_badhash",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-1\\\",\\\"signers\\\":[],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699564},\\\"networkId\\\":\\\"mainnet01\\\"}\", \"hash\": \"AAAA\", \"sigs\": []}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_full_tx_ok_nosig",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1.5 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-2\\\",\\\"signers\\\":[{\\\"pubKey\\\":\\\"cbb4749ba18e7aa0ebc3d057f048474f9f80fb6144dd9a5a7e6747d8522bf934\\\"}],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"coinbase\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699615},\\\"networkId\\\":\\\"mainnet01\\\"}\", \"hash\": \"gUl5ASRHydfaqk9vqz0MMuTOWl1X9Mb3gpGeK5cktYg\", \"sigs\": []}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_malformed",
+   "input": [
+    "nope"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS][PARSER] Unable to parse input as JSON. Please see the README for the accepted input format.",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_partial_meta",
+   "input": [
+    "{\"payload\": \"{\\\"exec\\\": {\\\"code\\\": \\\"(+ 1 2)\\\", \\\"data\\\": {}}}\", \"meta\": \"{\\\"chainId\\\": \\\"0\\\", \\\"sender\\\": \\\"\\\", \\\"gasLimit\\\": 10000}\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_partial_signers",
+   "input": [
+    "{\"payload\": \"{\\\"exec\\\": {\\\"code\\\": \\\"(+ 1 2)\\\", \\\"data\\\": {}}}\", \"signers\": [], \"chainId\": \"0\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_payload_obj",
+   "input": [
+    "{\"payload\": {\"exec\": {\"code\": \"(+ 1 2)\", \"data\": {}}}, \"chainId\": \"0\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS][PARSER] Unable to parse input as JSON. Please see the README for the accepted input format.",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_payload_str",
+   "input": [
+    "{\"payload\": \"{\\\"exec\\\": {\\\"code\\\": \\\"(+ 1 2)\\\", \\\"data\\\": {}}}\", \"chainId\": \"0\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_stringified",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-1\\\",\\\"signers\\\":[],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699564},\\\"networkId\\\":\\\"mainnet01\\\"}\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_stringified_biggas",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-1\\\",\\\"signers\\\":[],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"\\\",\\\"gasLimit\\\":2000000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699564},\\\"networkId\\\":\\\"mainnet01\\\"}\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_stringified_coinbase",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-1\\\",\\\"signers\\\":[],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"coinbase\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699564},\\\"networkId\\\":\\\"mainnet01\\\"}\"}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_stringified_ok",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1.5 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-2\\\",\\\"signers\\\":[{\\\"pubKey\\\":\\\"cbb4749ba18e7aa0ebc3d057f048474f9f80fb6144dd9a5a7e6747d8522bf934\\\"}],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"coinbase\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699615},\\\"networkId\\\":\\\"mainnet01\\\"}\"}"
+   ],
+   "stock": {
+    "data": {
+     "gasLimitEstimate": [
+      {
+       "amount": 94,
+       "inputType": "stringified-command",
+       "transaction": "{\"cmd\":\"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1.5 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-2\\\",\\\"signers\\\":[{\\\"pubKey\\\":\\\"cbb4749ba18e7aa0ebc3d057f048474f9f80fb6144dd9a5a7e6747d8522bf934\\\"}],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"coinbase\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699615},\\\"networkId\\\":\\\"mainnet01\\\"}\",\"hash\":\"gUl5ASRHydfaqk9vqz0MMuTOWl1X9Mb3gpGeK5cktYg\",\"sigs\":[]}",
+       "usedPreflight": true,
+       "usedSignatureVerification": false
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "g_stringified_ok_sigs",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1.5 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-2\\\",\\\"signers\\\":[{\\\"pubKey\\\":\\\"cbb4749ba18e7aa0ebc3d057f048474f9f80fb6144dd9a5a7e6747d8522bf934\\\"}],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"coinbase\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699615},\\\"networkId\\\":\\\"mainnet01\\\"}\", \"sigs\": [\"deadbeef\"]}"
+   ],
+   "stock": {
+    "data": {
+     "gasLimitEstimate": [
+      {
+       "amount": 95,
+       "inputType": "stringified-command",
+       "transaction": "{\"cmd\":\"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1.5 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-2\\\",\\\"signers\\\":[{\\\"pubKey\\\":\\\"cbb4749ba18e7aa0ebc3d057f048474f9f80fb6144dd9a5a7e6747d8522bf934\\\"}],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"coinbase\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699615},\\\"networkId\\\":\\\"mainnet01\\\"}\",\"hash\":\"gUl5ASRHydfaqk9vqz0MMuTOWl1X9Mb3gpGeK5cktYg\",\"sigs\":[{\"sig\":\"deadbeef\"}]}",
+       "usedPreflight": true,
+       "usedSignatureVerification": false
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "g_stringified_sigs",
+   "input": [
+    "{\"cmd\": \"{\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"cap-1\\\",\\\"signers\\\":[],\\\"meta\\\":{\\\"chainId\\\":\\\"0\\\",\\\"sender\\\":\\\"\\\",\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-08,\\\"ttl\\\":28800,\\\"creationTime\\\":1795699564},\\\"networkId\\\":\\\"mainnet01\\\"}\", \"sigs\": []}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GAS_API_GATEWAY][ESTIMATE_GAS] Chainweb Node was unable to estimate the gas limit",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  },
+  {
+   "name": "g_two",
+   "input": [
+    "{\"code\": \"(+ 1 2)\", \"chainId\": \"0\"}",
+    "{\"code\": \"(* 2 3)\", \"chainId\": \"1\"}"
+   ],
+   "stock": {
+    "data": {
+     "gasLimitEstimate": [
+      {
+       "amount": 1,
+       "inputType": "code",
+       "transaction": "{\"cmd\":\"{\\\"meta\\\":{\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-8,\\\"sender\\\":\\\"\\\",\\\"ttl\\\":28800,\\\"creationTime\\\":1795699648,\\\"chainId\\\":\\\"0\\\"},\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(+ 1 2)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"kjs:nonce:1795699648878\\\",\\\"signers\\\":[]}\",\"hash\":\"kKmjMeq82HPEvAX0dbCR5fjyYyKtzjDeo72aSLk56TA\",\"sigs\":[]}",
+       "usedPreflight": false,
+       "usedSignatureVerification": false
+      },
+      {
+       "amount": 1,
+       "inputType": "code",
+       "transaction": "{\"cmd\":\"{\\\"meta\\\":{\\\"gasLimit\\\":10000,\\\"gasPrice\\\":1e-8,\\\"sender\\\":\\\"\\\",\\\"ttl\\\":28800,\\\"creationTime\\\":1795699648,\\\"chainId\\\":\\\"1\\\"},\\\"payload\\\":{\\\"exec\\\":{\\\"code\\\":\\\"(* 2 3)\\\",\\\"data\\\":{}}},\\\"nonce\\\":\\\"kjs:nonce:1795699648878\\\",\\\"signers\\\":[]}\",\"hash\":\"0kRPXnf60rISAz44QNWUMkF7rrgzzODuOsMDJPdnoKg\",\"sigs\":[]}",
+       "usedPreflight": false,
+       "usedSignatureVerification": false
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "g_unknown",
+   "input": [
+    "{}"
+   ],
+   "stock": {
+    "errors": [
+     {
+      "message": "[ERROR][GRAPHQL][GAS][INPUT_CHECKER] Unknown input type. Please see the README for the accepted input format.",
+      "code": "INTERNAL_SERVER_ERROR"
+     }
+    ],
+    "data": null
+   }
+  }
+ ]
+}
