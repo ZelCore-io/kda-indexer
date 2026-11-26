@@ -435,15 +435,22 @@ pub struct AccountMissConfig {
     /// burst (at least 20: one account's chains).
     pub per_ip_rps: u32,
     pub per_ip_burst: u32,
-    /// Reads in flight across the process, and node calls per second across the process.
+    /// Reads in flight across the process; the longest wait for one of these slots, past
+    /// which the read is refused (the chain answers store-only, flagged).
     pub max_in_flight: u32,
+    pub slot_wait_ms: u64,
+    /// Node calls per second across the process and their burst. A budget of its own, on top
+    /// of the reconciler's `balances.local_rps`, so at most 25/s (default 20): a read with no
+    /// token is refused at once, never queued.
     pub node_rps: u32,
+    pub node_burst: u32,
     /// Per read, slot wait included.
     pub timeout_ms: u64,
-    /// How long a found row and an absent answer are reused.
+    /// How long a found row, an absent answer and a node error (0: not cached) are reused.
     pub ttl_found_secs: u64,
     pub ttl_absent_secs: u64,
-    /// Cached answers at most.
+    pub ttl_error_secs: u64,
+    /// Cached answers at most (two generations, the older dropped whole).
     pub cache_entries: u32,
 }
 
@@ -455,10 +462,13 @@ impl Default for AccountMissConfig {
             per_ip_rps: 20,
             per_ip_burst: 60,
             max_in_flight: 16,
-            node_rps: 50,
+            slot_wait_ms: 150,
+            node_rps: 20,
+            node_burst: 40,
             timeout_ms: 3_000,
             ttl_found_secs: 30,
             ttl_absent_secs: 600,
+            ttl_error_secs: 30,
             cache_entries: 100_000,
         }
     }
@@ -469,14 +479,18 @@ impl AccountMissConfig {
         anyhow::ensure!(
             (1..=400).contains(&self.max_reads_per_request)
                 && (1..=256).contains(&self.max_in_flight)
-                && (1..=50).contains(&self.node_rps)
+                && self.slot_wait_ms <= 1_000
+                && (1..=25).contains(&self.node_rps)
+                && (20..=400).contains(&self.node_burst)
                 && (500..=30_000).contains(&self.timeout_ms)
                 && self.ttl_found_secs <= 3_600
                 && (1..=86_400).contains(&self.ttl_absent_secs)
-                && (1..=10_000_000).contains(&self.cache_entries),
+                && self.ttl_error_secs <= 600
+                && (1..=1_000_000).contains(&self.cache_entries),
             "graphql.account_miss: max_reads_per_request 1..=400, max_in_flight 1..=256, \
-             node_rps 1..=50, timeout_ms 500..=30000, ttl_found_secs <= 3600, \
-             ttl_absent_secs 1..=86400, cache_entries 1..=10000000"
+             slot_wait_ms <= 1000, node_rps 1..=25, node_burst 20..=400, \
+             timeout_ms 500..=30000, ttl_found_secs <= 3600, ttl_absent_secs 1..=86400, \
+             ttl_error_secs <= 600, cache_entries 1..=1000000"
         );
         anyhow::ensure!(
             self.per_ip_rps == 0 || self.per_ip_burst >= 20,
@@ -492,9 +506,13 @@ impl AccountMissConfig {
             max_reads_per_request: self.max_reads_per_request as usize,
             per_ip_rps: self.per_ip_rps,
             per_ip_burst: self.per_ip_burst,
+            node_rps: self.node_rps,
+            node_burst: self.node_burst,
             timeout: Duration::from_millis(self.timeout_ms),
+            slot_wait: Duration::from_millis(self.slot_wait_ms),
             ttl_found: Duration::from_secs(self.ttl_found_secs),
             ttl_absent: Duration::from_secs(self.ttl_absent_secs),
+            ttl_error: Duration::from_secs(self.ttl_error_secs),
             cache_entries: self.cache_entries as usize,
             max_in_flight: self.max_in_flight as usize,
             chains,
@@ -1052,6 +1070,34 @@ mod balances_tests {
         assert!(p.node_rps > 0);
         assert_eq!(p.settings(network_chains("mainnet01")).chains, 20);
         assert_eq!(p.settings(7).chains, 7);
+    }
+
+    /// The miss read's node budget comes on top of the reconciler's: at most 25/s, default
+    /// 20/s; the cache is capped at a million entries.
+    #[test]
+    fn account_miss_node_rate_is_bounded() {
+        let m = AccountMissConfig::default();
+        assert!(m.validate().is_ok());
+        assert_eq!(m.node_rps, 20);
+        for bad in [
+            AccountMissConfig {
+                node_rps: 26,
+                ..AccountMissConfig::default()
+            },
+            AccountMissConfig {
+                cache_entries: 1_000_001,
+                ..AccountMissConfig::default()
+            },
+            AccountMissConfig {
+                slot_wait_ms: 1_001,
+                ..AccountMissConfig::default()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        let s = m.settings(20);
+        assert_eq!((s.node_rps, s.node_burst), (20, 40));
+        assert_eq!(s.slot_wait, std::time::Duration::from_millis(150));
     }
 
     /// `[graphql]` defaults are the plan's GQ-9 values; bad values are refused.

@@ -33,6 +33,8 @@ enum Mode {
     Chain,
     Error,
     Hang,
+    /// As `Chain`, after 100 ms.
+    Slow,
 }
 
 struct Mock {
@@ -64,7 +66,10 @@ fn mock(mode: Mode) -> (Arc<Mock>, DetailsFn) {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     Err(ReadErr::Node)
                 }
-                Mode::Chain => {
+                Mode::Chain | Mode::Slow => {
+                    if matches!(mode, Mode::Slow) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                     let found = module == "coin"
                         && ((account == CARD && chain == 12) || (account == ALICE && chain == 7));
                     Ok(if found {
@@ -160,6 +165,7 @@ fn fixture(mode: Mode, s: MissSettings) -> Fx {
 fn settings() -> MissSettings {
     MissSettings {
         per_ip_rps: 0,
+        node_rps: 0,
         ..MissSettings::default()
     }
 }
@@ -267,8 +273,12 @@ async fn an_unknown_account_is_null_and_its_negatives_are_cached() {
 }
 
 #[tokio::test]
-async fn a_node_error_answers_the_stored_rows_flagged_and_is_not_cached() {
-    let fx = fixture(Mode::Error, settings());
+async fn a_node_error_answers_the_stored_rows_flagged_and_is_cached_briefly() {
+    let s = MissSettings {
+        ttl_error: Duration::from_millis(300),
+        ..settings()
+    };
+    let fx = fixture(Mode::Error, s);
     let v = exec(&fx, &acct(ALICE), [10, 0, 0, 3]).await;
     let a = &v["data"]["fungibleAccount"];
     assert_eq!(chain_ids(&a["chainAccounts"]), ["0"], "{v}");
@@ -276,9 +286,16 @@ async fn a_node_error_answers_the_stored_rows_flagged_and_is_not_cached() {
     let v = exec(&fx, &acct(CARD), [10, 0, 0, 3]).await;
     assert_eq!(v["data"]["fungibleAccount"], Value::Null, "{v}");
     assert_eq!(v["extensions"]["nodeReadIncomplete"], true);
-    assert_eq!(fx.reader.cached(), 0, "failures are never cached");
-    // The node is back: the next lookup reads again and finds the row.
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 39);
+    // PR #56 m-4: a failing module does not cost its 20 reads on every request; the cached
+    // error still answers flagged.
     *fx.mock.mode.lock().unwrap() = Mode::Chain;
+    let v = exec(&fx, &acct(CARD), [10, 0, 0, 3]).await;
+    assert_eq!(v["data"]["fungibleAccount"], Value::Null, "{v}");
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], true);
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 39, "errors cached");
+    // The error entries expire: the next lookup reads again and finds the row.
+    tokio::time::sleep(Duration::from_millis(350)).await;
     let v = exec(&fx, &acct(CARD), [10, 0, 0, 3]).await;
     assert_eq!(
         chain_ids(&v["data"]["fungibleAccount"]["chainAccounts"]),
@@ -339,6 +356,7 @@ async fn a_client_over_its_rate_gets_no_reads_and_others_are_unaffected() {
     let s = MissSettings {
         per_ip_rps: 1,
         per_ip_burst: 20,
+        node_rps: 0,
         ..MissSettings::default()
     };
     let fx = fixture(Mode::Chain, s);
@@ -358,6 +376,7 @@ async fn reads_in_flight_stay_under_the_global_cap_and_the_cache_is_bounded() {
     let s = MissSettings {
         max_in_flight: 2,
         cache_entries: 16,
+        slot_wait: Duration::from_secs(2),
         ..settings()
     };
     let fx = Arc::new(fixture(Mode::Chain, s));
@@ -378,4 +397,152 @@ async fn reads_in_flight_stay_under_the_global_cap_and_the_cache_is_bounded() {
         fx.mock.peak.load(Ordering::SeqCst)
     );
     assert!(fx.reader.cached() <= 16, "{}", fx.reader.cached());
+}
+
+/// A query that reads one chain (12) of CARD.
+const CARD12: &str =
+    "{ fungibleChainAccount(accountName: \"CCAR-0f3a9c1e-55b2-4b7e-9d0a-2c6e8f1b7a44\", chainId: \"12\") { chainId balance } }";
+
+/// PR #56 I-1: with the node rate spent, a lookup is refused at once (no wait for a token),
+/// answers store-only and flagged.
+#[tokio::test]
+async fn a_spent_node_rate_answers_at_once_store_only() {
+    let s = MissSettings {
+        node_rps: 1,
+        node_burst: 20,
+        per_ip_rps: 0,
+        ..MissSettings::default()
+    };
+    let fx = fixture(Mode::Chain, s);
+    exec(&fx, &acct("k:first-random"), [10, 0, 2, 1]).await;
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 20);
+    let t = std::time::Instant::now();
+    let v = exec(&fx, &acct(ALICE), [10, 0, 2, 2]).await;
+    assert!(
+        t.elapsed() < Duration::from_millis(250),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(
+        chain_ids(&v["data"]["fungibleAccount"]["chainAccounts"]),
+        ["0"]
+    );
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], true);
+    assert!(fx.mock.calls.load(Ordering::SeqCst) <= 21);
+}
+
+/// PR #56 I-1: with every in-flight slot held by hanging reads, another lookup waits at most
+/// the slot wait, not the 3 s read timeout.
+#[tokio::test]
+async fn saturated_slots_answer_within_the_slot_wait() {
+    let s = MissSettings {
+        max_in_flight: 2,
+        ..settings()
+    };
+    let fx = Arc::new(fixture(Mode::Hang, s));
+    let f2 = fx.clone();
+    let hung = tokio::spawn(async move { exec(&f2, &acct("k:hangs"), [10, 0, 3, 1]).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(fx.mock.now.load(Ordering::SeqCst), 2, "both slots held");
+    let t = std::time::Instant::now();
+    let v = exec(&fx, &acct(ALICE), [10, 0, 3, 2]).await;
+    assert!(
+        t.elapsed() < Duration::from_millis(250),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(
+        chain_ids(&v["data"]["fungibleAccount"]["chainAccounts"]),
+        ["0"]
+    );
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], true);
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 2);
+    hung.abort();
+}
+
+/// PR #56 I-1: ten concurrent identical lookups share one node call.
+#[tokio::test]
+async fn concurrent_identical_lookups_make_one_node_call() {
+    let fx = fixture(Mode::Slow, settings());
+    let runs = (0..10u8).map(|i| exec(&fx, CARD12, [10, 0, 4, i]));
+    let vs = futures::future::join_all(runs).await;
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 1);
+    for v in vs {
+        assert_eq!(v["data"]["fungibleChainAccount"]["chainId"], "12", "{v}");
+        assert!(v["extensions"]["nodeReadIncomplete"].is_null(), "{v}");
+    }
+    assert_eq!(fx.reader.in_flight(), 0);
+}
+
+/// A cancelled first caller does not strand the callers that joined its read; and a read
+/// every caller abandons is dropped, its entry and slot released.
+#[tokio::test]
+async fn a_cancelled_leader_does_not_strand_its_followers() {
+    let fx = Arc::new(fixture(Mode::Slow, settings()));
+    let f1 = fx.clone();
+    let leader = tokio::spawn(async move { exec(&f1, CARD12, [10, 0, 5, 1]).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let f2 = fx.clone();
+    let follower = tokio::spawn(async move { exec(&f2, CARD12, [10, 0, 5, 2]).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    leader.abort();
+    let v = follower.await.unwrap();
+    assert_eq!(v["data"]["fungibleChainAccount"]["chainId"], "12", "{v}");
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.reader.in_flight(), 0);
+    // Abandoned by its only caller: the entry goes, and the next caller reads afresh.
+    let f3 = fx.clone();
+    let lone = tokio::spawn(async move { exec(&f3, &acct("k:abandoned"), [10, 0, 5, 3]).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(fx.reader.in_flight() > 0);
+    lone.abort();
+    let _ = lone.await;
+    assert_eq!(fx.reader.in_flight(), 0);
+}
+
+/// PR #56 m-7: with the per-client limit on, a request with no peer address gets no node
+/// read (no shared fallback bucket); it answers store-only and flagged.
+#[tokio::test]
+async fn a_request_with_no_peer_address_gets_no_node_read() {
+    let s = MissSettings {
+        node_rps: 0,
+        ..MissSettings::default()
+    };
+    let fx = fixture(Mode::Chain, s);
+    let r = fx
+        .schema
+        .execute(Request::new(acct(ALICE)).data(MissBudget::default()))
+        .await;
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        chain_ids(&v["data"]["fungibleAccount"]["chainAccounts"]),
+        ["0"]
+    );
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], true);
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 0);
+}
+
+/// PR #56 m-3: a client over its rate spends none of the request budget.
+#[tokio::test]
+async fn a_refused_client_spends_no_request_budget() {
+    let s = MissSettings {
+        per_ip_rps: 1,
+        per_ip_burst: 20,
+        node_rps: 0,
+        ..MissSettings::default()
+    };
+    let fx = fixture(Mode::Chain, s);
+    exec(&fx, &acct("k:spends-the-bucket"), [10, 0, 6, 1]).await;
+    let budget = MissBudget::default();
+    let r = fx
+        .schema
+        .execute(
+            Request::new(acct("k:refused"))
+                .data(budget.clone())
+                .data(ClientIp(IpAddr::from([10, 0, 6, 1]))),
+        )
+        .await;
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], true);
+    assert_eq!(budget.used(), 0);
 }

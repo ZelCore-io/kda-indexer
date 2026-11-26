@@ -152,8 +152,9 @@ pub fn api(
 }
 
 /// The node read on a missed account row (gap Q): its own `/local` client on `node.url` and
-/// `network`, with the reader's node rate and in-flight cap, so it neither shares nor drains
-/// ingest's or the reconciler's node budget. `sink` takes found rows (`run` only).
+/// `network`, under the reader's node rate (`node_rps`, at most 25/s, refused rather than
+/// queued) and in-flight cap, so it neither shares nor drains ingest's or the reconciler's
+/// node budget. `sink` takes found rows (`run` only).
 fn miss_reader(
     cfg: &Config,
     gs: &kdx_graphql::GraphqlSettings,
@@ -164,7 +165,10 @@ fn miss_reader(
         return Ok(None);
     }
     let mut c = cfg.clone();
-    c.ingest.max_rps = m.node_rps;
+    // The reader's own node bucket and slots are the caps and never queue a read (PR #56
+    // I-1); the client under it must not queue either: no rate of its own, as many
+    // connections as the reader has slots.
+    c.ingest.max_rps = 0;
     c.ingest.node_concurrency = m.max_in_flight.max(1) as usize;
     c.node.timeout_ms = m.timeout_ms;
     // The node is optional for `serve`: without a client the lookups answer from the store.
@@ -178,7 +182,7 @@ fn miss_reader(
     let local = Arc::new(kdx_node::LocalClient::new(
         node,
         kdx_node::LocalOpts {
-            rps: m.node_rps,
+            rps: 0,
             concurrency: m.max_in_flight.max(1) as usize,
         },
     ));

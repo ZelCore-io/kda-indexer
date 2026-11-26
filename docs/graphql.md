@@ -651,12 +651,27 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
   - absent: no row; failure (timeout, transport, one of our limits): no row, as stock drops a
     chain whose read failed, and the response carries `extensions.nodeReadIncomplete: true`.
   Only an account-like name (3 to 256 characters) of a module the store knows and serves is
-  read. Limits (`[graphql.account_miss]`; stock has none): 40 reads per request across all
-  fields, aliases and batch operations; per client 20 reads/s, burst 60 (the API limiter's
-  keys); 16 in flight and 50/s across the process on a `/local` client of its own; 3 s per
-  read within the request deadline; a cache of 100,000 answers, found ones for 30 s and absent
-  ones for 600 s, keyed by the exact (account, module, chain). The code sent is fixed
-  (`(<module>.details (read-msg "a"))`, the account in `data`) to the configured node.
+  read. Limits (`[graphql.account_miss]`; stock has none): per client 20 reads/s, burst 60
+  (the API limiter's keys), checked first, so a refused client spends no request budget; 40
+  reads per request across all fields, aliases and batch operations; across the process, 16
+  in flight and a node rate of its own on a `/local` client of its own: `node_rps` 20/s
+  (burst 40), at most 25/s, on top of the reconciler's `balances.local_rps`; 3 s per read
+  within the request deadline; a cache of at most 100,000 answers (`cache_entries`, at most
+  1,000,000; two generations, the older dropped whole), found ones for 30 s, absent ones for
+  600 s and node errors for 30 s (`ttl_error_secs`; served as unanswered, flagged), keyed by
+  the exact (account, module, chain). The global limits fail fast: a read with no node token
+  is refused at once and one waits at most `slot_wait_ms` (150 ms) for an in-flight slot, so a
+  saturated reader costs a lookup at most that wait; the refused chains answer store-only
+  with the flag. Concurrent reads of one (account, module, chain) share one node call. A
+  request with no peer address (only in tests or when embedded; the HTTP server always has
+  one) gets no node read while the per-client limit is on: it answers store-only, flagged.
+  The code sent is fixed (`(<module>.details (read-msg "a"))`, the account in `data`) to the
+  configured node.
+  - Known difference, guard shape: a row found on the node renders its guard as the node
+    gives it, so a `keysetref` guard is unresolved (stock's shape: the ref, keys `[]`,
+    predicate `''`). Once the reconciler stores the row it renders resolved, as every stored
+    row does (GQ-14). The same row can therefore change shape between two calls, from stock's
+    shape to ours. It is rare: it needs a keyset-ref guard on a row no index names.
   `…ByPublicKey`, `balance(...)` (the holders list), `node(id:)` and `Block.minerAccount`
   stay store-only: stock's holders list has no such rows. `enabled = false` turns it off.
   `fungibleChainAccounts` with `chainIds` absent (also a declared variable sent without a

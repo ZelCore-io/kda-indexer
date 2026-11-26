@@ -1100,7 +1100,7 @@ fn pact_tokens(code: &str) -> Vec<PactTok> {
             b'\'' => {
                 let start = i + 1;
                 let mut j = start;
-                while j < b.len() && !is_delim(b[j]) {
+                while j < b.len() && !is_delim(b[j]) && b[j] != b';' {
                     j += 1;
                 }
                 out.push(PactTok::Sym(
@@ -1127,8 +1127,12 @@ fn pact_tokens(code: &str) -> Vec<PactTok> {
 /// `code`, read from its tokens: the first argument when it is a string literal, or
 /// `(read-msg k)` / `(read-string k)` (`k` a literal or `'symbol`) naming a string of `data`.
 /// Any other first argument (a variable, another call, a literal with an escape other than
-/// `\"` / `\\`) gives nothing: never a guess. A call inside a string or a comment is no
-/// call. Distinct, [`account_like`], first-seen order, at most [`MAX_COIN_CREATE_PER_TX`].
+/// `\"` / `\\`) gives nothing: the account is never guessed. A call inside a string or a
+/// comment is no call. A call in code that may never run (a `defun` body in a deploy, an
+/// untaken `if` branch) is still collected: the account named is exact, but the row may not
+/// exist. That is harmless, since a collected account only marks the row for the reconciler,
+/// which reads it from the node and hides an absent answer. Distinct, [`account_like`],
+/// first-seen order, at most [`MAX_COIN_CREATE_PER_TX`].
 pub fn coin_create_accounts(code: &str, data: Option<&Value>) -> Vec<String> {
     let mut out = Vec::new();
     if !code.contains(COIN_CREATE) {

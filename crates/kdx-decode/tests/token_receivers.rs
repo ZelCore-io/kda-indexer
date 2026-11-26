@@ -1161,6 +1161,17 @@ fn only_the_first_argument_of_a_real_call_is_read() {
     assert!(c.exec.unwrap().coin_created.is_empty());
 }
 
+/// A `'symbol` ends at a `;` comment as at any other delimiter.
+#[test]
+fn a_symbol_key_stops_at_a_comment() {
+    let data = json!({"b": "k:from-symbol", "b;note": "k:wrong-key"});
+    let code = "(coin.create-account (read-msg 'b;note\n) (read-keyset \"ks\"))";
+    assert_eq!(
+        coin_create_accounts(code, Some(&data)),
+        vec!["k:from-symbol"]
+    );
+}
+
 /// A code text asking for more creates than [`MAX_COIN_CREATE_PER_TX`] gives that many.
 #[test]
 fn exact_creates_are_capped_per_tx() {

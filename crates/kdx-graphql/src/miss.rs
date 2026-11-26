@@ -16,22 +16,34 @@
 //!   row.
 //!
 //! Limits (stock has none): only an [`account_like`] name of a module the store knows and
-//! serves; a per-request read budget across all fields and aliases ([`MissBudget`]); the
-//! API's per-client token bucket ([`kdx_api::limits::RateLimiter`]); a global in-flight cap and
-//! node rate (the [`kdx_node::LocalClient`] of its own); a per-read timeout within the request
-//! deadline; a bounded TTL cache of found and absent answers (negatives included), keyed by
-//! the exact `(account, module, chain)`. The code sent is fixed (`(<module>.details
+//! serves; the API's per-client token bucket ([`kdx_api::limits::RateLimiter`]), checked first;
+//! a per-request read budget across all fields and aliases ([`MissBudget`]); a node rate of its
+//! own (default 20/s, at most 25/s, on top of the reconciler's `balances.local_rps`); a global
+//! in-flight cap; a per-read timeout within the request deadline; a bounded TTL cache of
+//! found and absent answers (negatives included) and, briefly, of node errors, keyed by the
+//! exact `(account, module, chain)`. The code sent is fixed (`(<module>.details
 //! (read-msg "a"))`, account in `data`), the node URL is the configured one: no client text
 //! reaches a URL or the code.
+//!
+//! Fail fast (PR #56 I-1): the global limits never queue a read for long. A read with no node
+//! token is refused at once, and a read waits at most [`MissSettings::slot_wait`] for an
+//! in-flight slot; a refused read leaves its chain unanswered (`nodeReadIncomplete`), so a
+//! saturated reader costs a lookup at most that wait, never the read timeout. Concurrent
+//! reads of one `(account, module, chain)` share one node call (single flight): the call
+//! runs as a shared future that any waiter drives, so a cancelled first caller does not
+//! strand the others, and it is dropped (slot released, entry removed) when no caller waits.
+//!
+//! A request with no peer address (tests, embedding; never one the HTTP server takes) gets no
+//! node read while the per-client limit is on: it answers store-only with
+//! `nodeReadIncomplete`, rather than share one bucket that anyone could drain.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use async_graphql::Context;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FutureExt, Shared, WeakShared};
 use kdx_decode::receivers::account_like;
 use serde_json::Value;
 use tokio::sync::Semaphore;
@@ -49,11 +61,14 @@ pub enum NodeRow {
     Absent,
 }
 
-/// Why a read gave no answer (never cached).
+/// Why a read gave no answer. Only [`ReadErr::Node`] is cached (for
+/// [`MissSettings::ttl_error`]); a timeout or a refusal by our own limits is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadErr {
     Timeout,
     Node,
+    /// Refused by a global limit (no node token, no slot within the slot wait).
+    Busy,
 }
 
 /// The node call: `(chain, module, account)` to its answer. Production wraps
@@ -83,11 +98,19 @@ pub struct MissSettings {
     /// Per client (the API limiter's keys): reads per second (0 = no per-client limit), burst.
     pub per_ip_rps: u32,
     pub per_ip_burst: u32,
+    /// Node calls per second across the process (0 = none) and their burst. A read with no
+    /// token is refused at once, never queued.
+    pub node_rps: u32,
+    pub node_burst: u32,
     /// Per read, slot wait included (and never past the request deadline).
     pub timeout: Duration,
-    /// How long a found row and an absent answer are reused.
+    /// Longest wait for an in-flight slot; past it the read is refused.
+    pub slot_wait: Duration,
+    /// How long a found row, an absent answer and a node error are reused (zero: a node
+    /// error is not cached).
     pub ttl_found: Duration,
     pub ttl_absent: Duration,
+    pub ttl_error: Duration,
     /// Cache entries at most.
     pub cache_entries: usize,
     /// Reads in flight across the process.
@@ -102,9 +125,13 @@ impl Default for MissSettings {
             max_reads_per_request: 40,
             per_ip_rps: 20,
             per_ip_burst: 60,
+            node_rps: 20,
+            node_burst: 40,
             timeout: Duration::from_secs(3),
+            slot_wait: Duration::from_millis(150),
             ttl_found: Duration::from_secs(30),
             ttl_absent: Duration::from_secs(600),
+            ttl_error: Duration::from_secs(30),
             cache_entries: 100_000,
             max_in_flight: 16,
             chains: 20,
@@ -118,23 +145,197 @@ pub struct MissBudget {
     used: Arc<AtomicUsize>,
 }
 
+impl MissBudget {
+    /// Reads charged so far (tests).
+    #[doc(hidden)]
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
 type Key = (String, String, u8);
+
+/// A cached answer: the node's row, or a node error (served as unanswered).
+#[derive(Debug, Clone)]
+enum Cached {
+    Row(NodeRow),
+    Failed,
+}
+
+/// The answer cache: two generations of at most half the cap each. An insert goes to the
+/// young one; when it is full it becomes the old one and the previous old one is retired
+/// whole (handed back to be dropped outside the lock). O(1) per insert, no scan; an expired
+/// entry is never served and leaves with its generation.
+#[derive(Debug, Default)]
+struct Cache {
+    young: HashMap<Key, (Instant, Cached)>,
+    old: HashMap<Key, (Instant, Cached)>,
+}
+
+type Generation = HashMap<Key, (Instant, Cached)>;
+
+impl Cache {
+    fn get(&self, k: &Key, now: Instant) -> Option<Cached> {
+        self.young
+            .get(k)
+            .or_else(|| self.old.get(k))
+            .filter(|(exp, _)| *exp > now)
+            .map(|(_, v)| v.clone())
+    }
+
+    #[must_use]
+    fn put(&mut self, k: Key, exp: Instant, v: Cached, cap: usize) -> Option<Generation> {
+        let half = (cap / 2).max(1);
+        let mut retired = None;
+        if self.young.len() >= half && !self.young.contains_key(&k) {
+            let young = std::mem::take(&mut self.young);
+            retired = Some(std::mem::replace(&mut self.old, young));
+        }
+        self.young.insert(k, (exp, v));
+        retired
+    }
+
+    fn len(&self) -> usize {
+        self.young.len() + self.old.len()
+    }
+}
+
+/// A token bucket of the whole reader (the node rate), never waited on.
+#[derive(Debug)]
+struct Bucket {
+    rate: f64,
+    burst: f64,
+    state: Mutex<(f64, Instant)>,
+}
+
+impl Bucket {
+    fn new(rate: u32, burst: u32) -> Option<Bucket> {
+        (rate > 0).then(|| {
+            let burst = f64::from(burst.max(1));
+            Bucket {
+                rate: f64::from(rate),
+                burst,
+                state: Mutex::new((burst, Instant::now())),
+            }
+        })
+    }
+
+    fn try_take(&self, now: Instant) -> bool {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (tokens, last) = *s;
+        let t = (tokens + now.saturating_duration_since(last).as_secs_f64() * self.rate)
+            .min(self.burst);
+        let ok = t >= 1.0;
+        *s = (if ok { t - 1.0 } else { t }, now);
+        ok
+    }
+}
+
+type Call = Shared<BoxFuture<'static, Result<NodeRow, ReadErr>>>;
+
+/// A node call in flight, shared by every reader of its key. The map holds it weakly: the
+/// call lives only while a caller waits on it.
+struct Flight {
+    id: u64,
+    until: Instant,
+    call: WeakShared<BoxFuture<'static, Result<NodeRow, ReadErr>>>,
+}
+
+/// What the shared calls need (they outlive the caller that started them).
+struct Core {
+    details: DetailsFn,
+    settings: MissSettings,
+    slots: Semaphore,
+    cache: Mutex<Cache>,
+    flights: Mutex<HashMap<Key, Flight>>,
+    next_id: AtomicU64,
+    calls: AtomicUsize,
+}
+
+impl Core {
+    fn cache(&self) -> MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn flights(&self) -> MutexGuard<'_, HashMap<Key, Flight>> {
+        self.flights.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn remember(&self, k: Key, v: Cached) {
+        let ttl = match &v {
+            Cached::Row(NodeRow::Found { .. }) => self.settings.ttl_found,
+            Cached::Row(NodeRow::Absent) => self.settings.ttl_absent,
+            Cached::Failed => self.settings.ttl_error,
+        };
+        if ttl.is_zero() {
+            return;
+        }
+        let cap = self.settings.cache_entries.max(1);
+        let retired = self.cache().put(k, Instant::now() + ttl, v, cap);
+        // Dropped here, after the lock is released.
+        drop(retired);
+    }
+
+    /// The node call of one key: a slot (waiting at most the slot wait), the node, the cache;
+    /// all before `until`.
+    async fn call(&self, k: &Key, until: Instant) -> Result<NodeRow, ReadErr> {
+        let left = || until.saturating_duration_since(Instant::now());
+        let wait = self.settings.slot_wait.min(left());
+        let _slot = match tokio::time::timeout(wait, self.slots.acquire()).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => return Err(ReadErr::Node),
+            Err(_) => {
+                kdx_metrics::get().graphql_rejected("account_miss_busy");
+                return Err(ReadErr::Busy);
+            }
+        };
+        let t = left();
+        if t.is_zero() {
+            return Err(ReadErr::Timeout);
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let call = (self.details)(k.2, k.1.clone(), k.0.clone());
+        let r = tokio::time::timeout(t, call)
+            .await
+            .map_err(|_| ReadErr::Timeout)
+            .and_then(|r| r);
+        match &r {
+            Ok(row) => self.remember(k.clone(), Cached::Row(row.clone())),
+            Err(ReadErr::Node) => self.remember(k.clone(), Cached::Failed),
+            Err(_) => {}
+        }
+        r
+    }
+}
+
+/// Removes its flight from the map when the shared call ends or is dropped unfinished.
+struct FlightGuard {
+    core: Arc<Core>,
+    key: Key,
+    id: u64,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let mut f = self.core.flights();
+        if f.get(&self.key).is_some_and(|x| x.id == self.id) {
+            f.remove(&self.key);
+        }
+    }
+}
 
 /// The miss reader: node call, limits, cache, sink.
 pub struct MissReader {
-    details: DetailsFn,
+    core: Arc<Core>,
     sink: Option<FoundSink>,
-    settings: MissSettings,
-    slots: Semaphore,
     rate: Option<kdx_api::limits::RateLimiter>,
-    cache: Mutex<HashMap<Key, (Instant, NodeRow)>>,
-    calls: AtomicUsize,
+    node: Option<Bucket>,
 }
 
 impl std::fmt::Debug for MissReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MissReader")
-            .field("settings", &self.settings)
+            .field("settings", &self.core.settings)
             .finish_non_exhaustive()
     }
 }
@@ -151,19 +352,25 @@ impl MissReader {
     pub fn new(details: DetailsFn, sink: Option<FoundSink>, settings: MissSettings) -> MissReader {
         let rate = (settings.per_ip_rps > 0)
             .then(|| kdx_api::limits::RateLimiter::new(settings.per_ip_rps, settings.per_ip_burst));
+        let node = Bucket::new(settings.node_rps, settings.node_burst);
         MissReader {
-            details,
+            core: Arc::new(Core {
+                details,
+                slots: Semaphore::new(settings.max_in_flight.max(1)),
+                cache: Mutex::new(Cache::default()),
+                flights: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(0),
+                calls: AtomicUsize::new(0),
+                settings,
+            }),
             sink,
-            slots: Semaphore::new(settings.max_in_flight.max(1)),
             rate,
-            cache: Mutex::new(HashMap::new()),
-            calls: AtomicUsize::new(0),
-            settings,
+            node,
         }
     }
 
-    /// The production node call over a [`kdx_node::LocalClient`] of its own (its rate and
-    /// concurrency are this reader's global caps).
+    /// The production node call over a [`kdx_node::LocalClient`] of its own. Its rate and
+    /// concurrency must not queue: the reader's own node bucket and slots are the caps.
     pub fn local_details(local: Arc<kdx_node::LocalClient>) -> DetailsFn {
         Arc::new(move |chain, module, account| {
             let local = local.clone();
@@ -185,56 +392,37 @@ impl MissReader {
     }
 
     pub fn settings(&self) -> &MissSettings {
-        &self.settings
+        &self.core.settings
     }
 
     /// Node calls made so far (tests).
     #[doc(hidden)]
     pub fn calls(&self) -> usize {
-        self.calls.load(Ordering::Relaxed)
+        self.core.calls.load(Ordering::Relaxed)
     }
 
     /// Cached entries (tests).
     #[doc(hidden)]
     pub fn cached(&self) -> usize {
-        self.lock().len()
+        self.core.cache().len()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Key, (Instant, NodeRow)>> {
-        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    /// Calls in flight (tests).
+    #[doc(hidden)]
+    pub fn in_flight(&self) -> usize {
+        self.core.flights().len()
     }
 
-    fn cached_row(&self, k: &Key, now: Instant) -> Option<NodeRow> {
-        let c = self.lock();
-        c.get(k)
-            .filter(|(exp, _)| *exp > now)
-            .map(|(_, r)| r.clone())
-    }
-
-    fn remember(&self, k: Key, row: NodeRow) {
-        let ttl = match row {
-            NodeRow::Found { .. } => self.settings.ttl_found,
-            NodeRow::Absent => self.settings.ttl_absent,
-        };
-        let now = Instant::now();
-        let mut c = self.lock();
-        let cap = self.settings.cache_entries.max(1);
-        if c.len() >= cap && !c.contains_key(&k) {
-            c.retain(|_, (exp, _)| *exp > now);
-            if c.len() >= cap {
-                // Still full of live entries: drop an eighth (arbitrary ones) rather than grow.
-                let drop: Vec<Key> = c.keys().take(cap / 8 + 1).cloned().collect();
-                for d in drop {
-                    c.remove(&d);
-                }
-            }
-        }
-        c.insert(k, (now + ttl, row));
+    /// Reads left in the request budget.
+    fn budget_left(&self, ctx: &Context<'_>) -> usize {
+        let max = self.core.settings.max_reads_per_request;
+        ctx.data_opt::<MissBudget>()
+            .map_or(max, |b| max.saturating_sub(b.used.load(Ordering::Acquire)))
     }
 
     /// Take `n` reads from the request budget; how many were granted.
     fn budget(&self, ctx: &Context<'_>, n: usize) -> usize {
-        let max = self.settings.max_reads_per_request;
+        let max = self.core.settings.max_reads_per_request;
         let Some(b) = ctx.data_opt::<MissBudget>() else {
             return n.min(max);
         };
@@ -263,19 +451,44 @@ impl MissReader {
         }
         let now = Instant::now();
         let mut todo = Vec::new();
-        for &c in chains {
-            if c >= self.settings.chains || todo.contains(&c) {
-                continue;
-            }
-            let k = (account.to_owned(), module.to_owned(), c);
-            match self.cached_row(&k, now) {
-                Some(NodeRow::Found { balance, guard, .. }) => out.found.push((c, balance, guard)),
-                Some(NodeRow::Absent) => {}
-                None => todo.push(c),
+        {
+            let cache = self.core.cache();
+            for &c in chains {
+                if c >= self.core.settings.chains || todo.contains(&c) {
+                    continue;
+                }
+                let k = (account.to_owned(), module.to_owned(), c);
+                match cache.get(&k, now) {
+                    Some(Cached::Row(NodeRow::Found { balance, guard, .. })) => {
+                        out.found.push((c, balance, guard));
+                    }
+                    Some(Cached::Row(NodeRow::Absent)) => {}
+                    Some(Cached::Failed) => out.incomplete = true,
+                    None => todo.push(c),
+                }
             }
         }
         if todo.is_empty() {
+            out.found.sort_by_key(|(c, _, _)| *c);
             return out;
+        }
+        // The client's own limit first, so a refused client spends none of the request
+        // budget; it is charged only what the budget can still grant.
+        let want = todo.len().min(self.budget_left(ctx));
+        if want > 0 {
+            if let Some(rate) = &self.rate {
+                let allowed = match crate::client_ip(ctx) {
+                    // No peer address: no shared fallback bucket.
+                    None => false,
+                    Some(ip) => rate.allow_n(ip, u32::try_from(want).unwrap_or(u32::MAX)),
+                };
+                if !allowed {
+                    out.incomplete = true;
+                    kdx_metrics::get().graphql_rejected("account_miss_rate");
+                    out.found.sort_by_key(|(c, _, _)| *c);
+                    return out;
+                }
+            }
         }
         let granted = self.budget(ctx, todo.len());
         if granted < todo.len() {
@@ -283,17 +496,7 @@ impl MissReader {
             kdx_metrics::get().graphql_rejected("account_miss_budget");
         }
         todo.truncate(granted);
-        if todo.is_empty() {
-            return out;
-        }
-        let ip = crate::client_ip(ctx).unwrap_or(IpAddr::from([0, 0, 0, 0]));
-        let n = u32::try_from(todo.len()).unwrap_or(u32::MAX);
-        if self.rate.as_ref().is_some_and(|r| !r.allow_n(ip, n)) {
-            out.incomplete = true;
-            kdx_metrics::get().graphql_rejected("account_miss_rate");
-            return out;
-        }
-        let deadline = (Instant::now() + self.settings.timeout).min(crate::deadline(ctx));
+        let deadline = (Instant::now() + self.core.settings.timeout).min(crate::deadline(ctx));
         let reads = todo.into_iter().map(|c| async move {
             let r = self.one(c, account, module, deadline).await;
             (c, r)
@@ -323,7 +526,7 @@ impl MissReader {
         out
     }
 
-    /// One read: a slot, the node, the cache; all before `deadline`.
+    /// One read before `deadline`: join the key's call in flight, or start one.
     async fn one(
         &self,
         chain: u8,
@@ -331,24 +534,63 @@ impl MissReader {
         module: &str,
         deadline: Instant,
     ) -> Result<NodeRow, ReadErr> {
-        let left = || deadline.saturating_duration_since(Instant::now());
-        let _slot = tokio::time::timeout(left(), self.slots.acquire())
+        let call = self.flight((account.to_owned(), module.to_owned(), chain), deadline)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(left, call)
             .await
-            .map_err(|_| ReadErr::Timeout)?
-            .map_err(|_| ReadErr::Node)?;
-        let t = left();
-        if t.is_zero() {
-            return Err(ReadErr::Timeout);
+            .unwrap_or(Err(ReadErr::Timeout))
+    }
+
+    /// The key's call in flight, or a new one (a node token taken without waiting).
+    fn flight(&self, key: Key, deadline: Instant) -> Result<Call, ReadErr> {
+        // Declared before the lock so that a stale call, if this is its last handle, is
+        // dropped after the lock is released (its guard takes the same lock).
+        let mut _stale: Option<Call> = None;
+        let mut flights = self.core.flights();
+        let now = Instant::now();
+        if let Some(f) = flights.get(&key) {
+            if let Some(call) = f.call.upgrade() {
+                if f.until > now {
+                    return Ok(call);
+                }
+                _stale = Some(call);
+            }
         }
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        let call = (self.details)(chain, module.to_owned(), account.to_owned());
-        let r = tokio::time::timeout(t, call)
-            .await
-            .map_err(|_| ReadErr::Timeout)
-            .and_then(|r| r);
-        if let Ok(row) = &r {
-            self.remember((account.to_owned(), module.to_owned(), chain), row.clone());
+        // Answered while this read waited: no new call.
+        let cached = self.core.cache().get(&key, now);
+        match cached {
+            Some(Cached::Row(row)) => return Ok(futures::future::ready(Ok(row)).boxed().shared()),
+            Some(Cached::Failed) => return Err(ReadErr::Node),
+            None => {}
         }
-        r
+        if self.node.as_ref().is_some_and(|b| !b.try_take(now)) {
+            kdx_metrics::get().graphql_rejected("account_miss_node_rate");
+            return Err(ReadErr::Busy);
+        }
+        let id = self.core.next_id.fetch_add(1, Ordering::Relaxed);
+        let guard = FlightGuard {
+            core: self.core.clone(),
+            key: key.clone(),
+            id,
+        };
+        let core = self.core.clone();
+        let k = key.clone();
+        let call: Call = async move {
+            let _guard = guard;
+            core.call(&k, deadline).await
+        }
+        .boxed()
+        .shared();
+        if let Some(weak) = call.downgrade() {
+            flights.insert(
+                key,
+                Flight {
+                    id,
+                    until: deadline,
+                    call: weak,
+                },
+            );
+        }
+        Ok(call)
     }
 }
