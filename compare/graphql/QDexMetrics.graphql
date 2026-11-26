@@ -1,0 +1,2 @@
+# kdx: oracle
+query QDexMetrics { dexMetrics(protocolAddress: "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange", startDate: "2025-12-01T00:00:00Z", endDate: "2025-12-10T00:00:00Z") { totalPools currentTvlUsd totalVolumeUsd tvlHistory { timestamp value } volumeHistory { timestamp value } } }

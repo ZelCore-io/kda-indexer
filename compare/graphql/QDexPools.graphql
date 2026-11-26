@@ -1,0 +1,2 @@
+# kdx: oracle
+query QDexPools { pools(first: 20) { totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id address key reserve0 reserve1 totalSupply tvlUsd tvlChange24h volume24hUsd volumeChange24h volume7dUsd fees24hUsd feesChange24h transactionCount24h transactionCountChange24h apr24h createdAt updatedAt token0 { id name chainId address } token1 { id name chainId address } } } } }

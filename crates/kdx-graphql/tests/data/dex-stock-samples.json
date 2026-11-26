@@ -1,0 +1,232 @@
+{
+ "pools_note": "stock answers, read 2026-11-26 (one read-only query per field); lists trimmed to two items",
+ "pool": {
+  "id": "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange-coin:kaddex.kdx",
+  "key": "coin:kaddex.kdx",
+  "totalSupply": "0",
+  "charts": {
+   "volume": [],
+   "tvl": [],
+   "fees": []
+  },
+  "transactions": {
+   "totalCount": 100,
+   "pageInfo": {
+    "hasNextPage": true,
+    "hasPreviousPage": true,
+    "startCursor": "MTExNzg=",
+    "endCursor": "MTExMzk="
+   },
+   "edges": [
+    {
+     "cursor": "MTExNzg=",
+     "node": {
+      "id": "11178",
+      "maker": "",
+      "amount0In": "1.25672e-7",
+      "amount1In": "0",
+      "amount0Out": "0",
+      "amount1Out": "0.000113011373",
+      "amountUsd": "0.0000000000",
+      "timestamp": "2026-01-20T19:48:38.000Z",
+      "transactionId": 339319614,
+      "requestkey": "XmOUUT-2M9Rp5C8n8Jxa4_vaPXfXELms8Bqxxjvo9Qo",
+      "transactionType": "SWAP"
+     }
+    },
+    {
+     "cursor": "MTExMzk=",
+     "node": {
+      "id": "11139",
+      "maker": "",
+      "amount0In": "6.9445e-8",
+      "amount1In": "0",
+      "amount0Out": "0",
+      "amount1Out": "0.000062768667",
+      "amountUsd": "0.0000000000",
+      "timestamp": "2026-01-16T01:55:31.000Z",
+      "transactionId": 339027253,
+      "requestkey": "lsm_zy8YDVMMWIdaxjUxDbMXd8XFFYt3KQAb3531hH8",
+      "transactionType": "SWAP"
+     }
+    }
+   ]
+  }
+ },
+ "charts": {
+  "d": {
+   "volume": [],
+   "tvl": [
+    {
+     "timestamp": "2026-01-20T19:48:38.000Z",
+     "value": "0.00000061"
+    }
+   ],
+   "fees": []
+  },
+  "w": {
+   "tvl": []
+  },
+  "a": {
+   "volume": [
+    {
+     "timestamp": "2025-10-18T00:00:00.000Z",
+     "value": "0.0000000100"
+    },
+    {
+     "timestamp": "2025-10-21T00:00:00.000Z",
+     "value": "0.0000000100"
+    }
+   ],
+   "tvl": [
+    {
+     "timestamp": "2025-10-18T00:00:00.000Z",
+     "value": "0.00000000"
+    },
+    {
+     "timestamp": "2025-10-21T00:00:00.000Z",
+     "value": "0.00000431"
+    }
+   ],
+   "fees": [
+    {
+     "timestamp": "2025-10-18T00:00:00.000Z",
+     "value": "0.0000000000"
+    },
+    {
+     "timestamp": "2025-10-21T00:00:00.000Z",
+     "value": "0.0000000000"
+    }
+   ]
+  }
+ },
+ "dexMetrics": {
+  "a": {
+   "totalPools": 19,
+   "currentTvlUsd": 7183.57005748,
+   "totalVolumeUsd": 235.23449694,
+   "tvlHistory": [
+    {
+     "timestamp": "2025-12-01T00:00:00.000Z",
+     "value": 5070.11711835
+    },
+    {
+     "timestamp": "2025-12-02T00:00:00.000Z",
+     "value": 5129.22696553
+    }
+   ],
+   "volumeHistory": [
+    {
+     "timestamp": "2025-12-01T00:00:00.000Z",
+     "value": 1.0267494
+    },
+    {
+     "timestamp": "2025-12-02T00:00:00.000Z",
+     "value": 76.54902226
+    }
+   ]
+  },
+  "b": {
+   "totalPools": 0,
+   "currentTvlUsd": 0,
+   "totalVolumeUsd": 0
+  }
+ },
+ "tokenPrice": {
+  "tokenPrice": {
+   "id": "price-kaddex.kdx",
+   "token": {
+    "id": "17",
+    "name": "kdx",
+    "chainId": "0",
+    "address": "kaddex.kdx"
+   },
+   "priceInKda": 0.0011123382658940724,
+   "priceInUsd": 5.5362522027619865e-06,
+   "protocolAddress": "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange",
+   "updatedAt": "2026-11-26T15:02:37.293Z"
+  },
+  "n": null,
+  "tokenPrices": [
+   {
+    "id": "price-n_625e9938ae84bdb7d190f14fc283c7a6dfc15d58.ktoshi",
+    "priceInKda": 1.627581605516941e-07,
+    "priceInUsd": 8.100685308596714e-10,
+    "token": {
+     "name": "ktoshi",
+     "address": "n_625e9938ae84bdb7d190f14fc283c7a6dfc15d58.ktoshi"
+    }
+   },
+   {
+    "id": "price-coin",
+    "priceInKda": 1,
+    "priceInUsd": 0.0049771300444402785,
+    "token": {
+     "name": "coin",
+     "address": "coin"
+    }
+   }
+  ]
+ },
+ "tokens": {
+  "tokens": {
+   "pageInfo": {
+    "hasNextPage": true,
+    "hasPreviousPage": false,
+    "startCursor": "NzYwMzk3MjE4",
+    "endCursor": "NzM4OTIxOTUx"
+   },
+   "edges": [
+    {
+     "cursor": "NzYwMzk3MjE4",
+     "node": {
+      "id": "VG9rZW46W25fNDlhNzllNDRmYTcyZjM0OTQ3N2U1NWYyOWU4MzM4MzEzMTE5ZmI0NC5hYmRpLDJd",
+      "name": "n_49a79e44fa72f349477e55f29e8338313119fb44.abdi",
+      "chainId": "2",
+      "address": null
+     }
+    },
+    {
+     "cursor": "NzYwMzM1ODc5",
+     "node": {
+      "id": "VG9rZW46W25fZjVkMzIyNzQ3ZGEwODY5MzcxOGI2ZDI1ZTQ4YjA4N2M1OGI0MGY4ZS5saW54LXRlc3QtMywyXQ==",
+      "name": "n_f5d322747da08693718b6d25e48b087c58b40f8e.linx-test-3",
+      "chainId": "2",
+      "address": null
+     }
+    },
+    {
+     "cursor": "NzM4OTIxOTUx",
+     "node": {
+      "id": "VG9rZW46W2thZGRleC5rZHgsNF0=",
+      "name": "kaddex.kdx",
+      "chainId": "4",
+      "address": null
+     }
+    }
+   ]
+  }
+ },
+ "poolNotFound": {
+  "errors": [
+   {
+    "message": "[ERROR][GRAPHQL][DB][DATA_MISSING] Token pair not found for pool nope",
+    "code": "INTERNAL_SERVER_ERROR"
+   }
+  ],
+  "data": {
+   "pool": null
+  }
+ },
+ "badCursor": {
+  "errors": [
+   {
+    "message": "invalid input syntax for type integer: \"NaN\"",
+    "code": "INTERNAL_SERVER_ERROR"
+   }
+  ],
+  "data": {
+   "poolTransactions": null
+  }
+ }
+}

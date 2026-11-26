@@ -232,6 +232,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
             a.freeze,
             search_opts(cfg, &data_dir)?,
             balances_opts(cfg)?,
+            cfg.dex_usd.enabled.then(|| cfg.dex_usd.settings()),
         )
         .await;
         return stop_api(api, token, r).await;
@@ -242,6 +243,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         a.freeze,
         search_opts(cfg, &data_dir)?,
         balances_opts(cfg)?,
+        cfg.dex_usd.enabled.then(|| cfg.dex_usd.settings()),
     )
     .await;
     stop_api(api, token, r).await
@@ -408,6 +410,7 @@ async fn follow(
     freeze: bool,
     search: kdx_ingest::search_stage::SearchStageOpts,
     balances: Option<(kdx_node::NodeClient, kdx_ingest::reconcile::ReconcileOpts)>,
+    dia: Option<kdx_ingest::dia::DiaSettings>,
 ) -> anyhow::Result<()> {
     {
         let c = ctx.clone();
@@ -458,6 +461,15 @@ async fn follow(
         let (c, s) = (ctx.clone(), price_stop.clone());
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                // Derived rows of another layout are cleared here and rebuilt by the fill.
+                let mut w = c.hot.rw()?;
+                if kdx_hot::dex::ensure_layout(&mut w)? {
+                    tracing::info!(
+                        layout = kdx_hot::dex::LAYOUT,
+                        "dex: derived rows cleared for a new layout; the fill rebuilds them"
+                    );
+                }
+                w.commit()?;
                 if kdx_ingest::dex_fill::filled(&c.hot.ro()?)? {
                     return Ok(());
                 }
@@ -476,6 +488,11 @@ async fn follow(
                 Err(e) => tracing::error!(error = %e, "dex: fill task"),
             }
         });
+    }
+    // DEX USD feed (B3): DIA's KDA/USD rate, polled into `DexUsd` when `[dex_usd]` is on.
+    // Failures are logged and keep the last good rate; ingest never waits on it.
+    if let Some(d) = dia {
+        tokio::spawn(kdx_ingest::dia::run(ctx.hot.clone(), d, price_stop.clone()));
     }
     // Stage 8: balance seed (when absent) and `/local` reconciler (B-5). Its errors are
     // logged; ingest goes on without it.
