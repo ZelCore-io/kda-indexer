@@ -10,6 +10,7 @@ pub mod balances;
 pub mod chaincount;
 pub mod checkpoint;
 pub mod dex;
+pub mod dex_usd;
 pub mod dict;
 pub mod env;
 pub mod holders;

@@ -1,0 +1,2 @@
+# kdx: oracle
+query QDexPoolTransactions { poolTransactions(pairId: "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange-coin:n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC", type: SWAP, first: 10) { totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id maker amount0In amount1In amount0Out amount1Out amountUsd timestamp transactionId requestkey transactionType } } } }

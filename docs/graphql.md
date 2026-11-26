@@ -68,13 +68,12 @@ Differences from Kadena graph:
   blocks with more transactions than one page, only the first page was compared in G4 (515
   records: the 51 above, and 464 whose lists never finished); the rest of those lists was not
   compared with stock. A full page-walk comparison is planned.
-- Root fields of the stock indexer that are not in Kadena's schema are not served: the DEX
-  fields `pools`, `dexMetrics` and `tokenPrices` (one real request asked for them in the G4
-  replay) are unknown fields: the document answers `GRAPHQL_VALIDATION_FAILED` (HTTP 400, see
-  [Errors](#errors)), where stock answers them. Introspection
-  (`__schema`) lists Kadena's schema plus the ZelCore extensions below, so its answer differs
-  from stock's, whose type list has those fields and lacks ours. The DEX price that kadscan
-  reads is served as `lastTokenPriceInKda` (see [Token price](#token-price)).
+- Stock's 8 DEX root fields (`tokens`, `pools`, `pool`, `poolTransactions`,
+  `liquidityPositions`, `dexMetrics`, `tokenPrice`, `tokenPrices`) are served from the Sushi
+  ledger, with USD values from DIA's KDA/USD rate when `[dex_usd]` is on (see
+  [Sushi DEX](#sushi-dex)). Introspection (`__schema`) lists Kadena's schema plus the ZelCore
+  extensions below. The DEX price that kadscan reads is also served as `lastTokenPriceInKda`
+  (see [Token price](#token-price)).
 
 ## Errors
 
@@ -840,6 +839,64 @@ Limits (`[graphql.pact]`; stock has none). Each refusal is a stock-style message
 | (chains) | the network's | a `chainId` must be a canonical number below the network's chain count, taken from the store's chain graph, else the network (20); otherwise no node call |
 
 The passthrough has its own node client, so it neither shares nor drains ingest's node budget.
+
+### Sushi DEX
+
+Stock's DEX surface (`tokens`, `pools`, `pool`, `poolTransactions`, `liquidityPositions`,
+`dexMetrics`, `tokenPrice`, `tokenPrices`, 17 types) is served from the Sushi exchange
+(`n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange`, chain 2) events the indexer
+stores, with stock's argument names, defaults, cursors (base64 of an integer) and error
+texts for unknown pools and unreadable cursors. `crates/kdx-graphql/src/dexserve.rs` lists
+the formulas. USD values use the KDA/USD rate of DIA (stock's source), polled into an hourly
+table by `[dex_usd]`:
+
+```toml
+[dex_usd]
+enabled = false        # on: poll DIA; off: every USD value is 0, as stock without a price
+url = "https://api.diadata.org/v1/assetQuotation/Kadena/0x0000000000000000000000000000000000000000"
+interval_s = 300
+timeout_ms = 10000     # total per poll (connect, headers, body)
+user_agent = "kda-indexer"
+max_response_bytes = 16384
+min_price = 0.000001   # USD per KDA
+max_price = 10000.0
+max_jump_pct = 50.0    # a larger move is held back ...
+confirm_polls = 3      # ... until this many polls in a row agree
+```
+
+Redirects are never followed, a failed or rejected poll keeps the last good rate (logged with
+its age), and the poller never blocks ingest. DIA keeps no KDA history (its chart-points
+endpoint answers an empty series), so past hours cannot be rebuilt: hours before the feed
+started use the first stored rate (the nearest later value; stock priced its whole history at
+its own ingest-time rate, also a later value). With no rate at all every USD value is 0.
+
+Listings leave junk pairs out: a pool is listed when its `CREATE_PAIR` is stored, it has a
+`coin` leg and non-zero reserves, and its stored data is readable. This matches stock's 19
+pools for 20 `CREATE_PAIR` events (the one pair without a coin leg is not listed), for
+`pools.totalCount` and `dexMetrics.totalPools` alike. `pool(id)` still answers an unlisted
+pair; a pair whose stored data cannot be read answers an error saying it is unavailable.
+
+Deliberate differences from stock (stock mistakes, all in the compare allowlist):
+
+| Field | Stock | Here |
+|---|---|---|
+| `Pool.totalSupply` | float running sum of ADD/REMOVE `liquidity`, went negative | Σ MINT − Σ BURN of the LP token, exact |
+| `pools` order | every `orderBy` served reversed (`TVL_USD_DESC` started with the smallest; `VOLUME_7D_DESC` with a zero volume) | sorted as named; the cursor format is kept |
+| `dexMetrics` default `protocolAddress` | `kdlaunch.kdswap-exchange` (not indexed): all zeros | Sushi, as `pools` |
+| USD values | the KDA/USD rate at ingest time | the rate of the event's hour |
+| numbers | JS floats (`1.25672e-7`) | exact decimals, canonical text; `Float` fields rounded to 8 places as stock |
+| `charts(WEEK…)` TVL | points only on days with an event (a quiet week: empty) | one point per day of the range |
+| 24h / 7d stats | frozen at the pair's last event | computed at query time (UTC day windows, as stock's) |
+| volume | swaps plus liquidity deposits and withdrawals | swaps only |
+| REMOVE_LIQUIDITY amounts | token sides crossed | oriented to the pair |
+| `poolTransactions.pageInfo` | `hasPreviousPage: true` on every page | from the rows |
+| ids, times | DB row ids and insert times; `Token.chainId` `"0"` | module name / event position (`TxKey ‖ index`); block times; `"2"`; `transactionId` null |
+| `tokens` order | by a balance row id | by the module's first height (newest first) |
+
+Costs: each DEX field has a read-budget cost (`dexMetrics` 100,000; lists and `Pool.charts`
+20,000; single reads 200), reads at most 10,000 pairs, checks the request deadline inside
+every loop, and the aggregates run on a heavy slot. `dexMetrics` ranges are capped at 1,100
+days.
 
 ### Token price
 

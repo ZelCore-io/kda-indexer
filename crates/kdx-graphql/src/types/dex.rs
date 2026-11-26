@@ -1,16 +1,49 @@
 //! Stock's DEX surface (indexer-kadena `90a4be1`, `schema.graphql`): 8 root fields, 17 object
 //! types and 4 enums, beside Kadena's vendored schema (ZelCore extension, pinned in
-//! `tests/extensions.txt`). Every root field answers `NOT_SUPPORTED` until the DEX serving
-//! part lands (stock-gap plan B3); the store side is `kdx_hot::dex`. Until then a document that
-//! names these fields validates, and its other fields still answer.
-//!
-//! The types are plain data so the serving part can fill them from `kdx_hot::dex` rows.
+//! `tests/extensions.txt`), served from the Sushi ledger (`kdx_hot::dex`) and the hourly
+//! KDA/USD rate (`kdx_hot::dex_usd`) by [`crate::dexserve`] (stock-gap plan B3), which lists
+//! the formulas and the deliberate divergences from stock.
 
-use async_graphql::{ComplexObject, Enum, Object, Result, SimpleObject, ID};
+use async_graphql::{ComplexObject, Context, Enum, Object, Result, SimpleObject, ID};
+use kdx_api::{ApiResult, View};
 
 use crate::connection::PageInfo;
+use crate::dexserve::{self as ds, Budget, TxArgs};
 use crate::scalars::{DateTime, Decimal};
-use crate::types::unserved;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Run `f` on a read slot (`heavy`: a heavy slot, for aggregates over many rows) with the
+/// request's deadline as its budget.
+async fn run<T, F>(ctx: &Context<'_>, heavy: bool, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&View, &mut Budget) -> ApiResult<T> + Send + 'static,
+{
+    let dl = crate::deadline(ctx);
+    let st = crate::gql(ctx).state()?;
+    let go = move |view: &View| -> ApiResult<T> {
+        view.check_deadline()?;
+        let mut b = Budget::new(dl);
+        f(view, &mut b)
+    };
+    let r = if heavy {
+        st.read_heavy(go).await
+    } else {
+        st.read(go).await
+    };
+    r.map_err(crate::error::from_api)
+}
+
+fn protocol(p: Option<String>) -> String {
+    p.filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ds::DEFAULT_PROTOCOL.to_owned())
+}
 
 /// Time frame for chart data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -150,28 +183,58 @@ pub struct Pool {
     pub apr24h: f64,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+    /// The transaction arguments of `pool(...)` (stock reads them there).
+    #[graphql(skip)]
+    pub tx_args: TxArgs,
 }
 
 #[ComplexObject]
-#[allow(unused_variables)]
 impl Pool {
     pub async fn id(&self) -> Result<ID> {
         Ok(self.pool_id.clone())
     }
 
-    async fn charts(&self, time_frame: TimeFrame) -> Result<PoolCharts> {
-        unserved!("Pool.charts")
+    /// Volume and fees per hour (`DAY`) or day, TVL per day (the newest point for `DAY`).
+    async fn charts(&self, ctx: &Context<'_>, time_frame: TimeFrame) -> Result<PoolCharts> {
+        let id = self.pool_id.0.clone();
+        let now = now_secs();
+        run(ctx, true, move |v, b| {
+            ds::charts(&v.txn, &id, time_frame, now, b)
+        })
+        .await
     }
 
+    /// Stock takes these from `pool(...)`; arguments given here take precedence.
     async fn transactions(
         &self,
+        ctx: &Context<'_>,
         #[graphql(name = "type")] ty: Option<PoolTransactionType>,
         first: Option<i32>,
         after: Option<String>,
         last: Option<i32>,
         before: Option<String>,
     ) -> Result<Option<PoolTransactionsConnection>> {
-        unserved!("Pool.transactions")
+        let given = ty.is_some()
+            || first.is_some()
+            || after.is_some()
+            || last.is_some()
+            || before.is_some();
+        let a = if given {
+            TxArgs {
+                ty,
+                first,
+                after,
+                last,
+                before,
+            }
+        } else {
+            self.tx_args.clone()
+        };
+        let id = self.pool_id.0.clone();
+        run(ctx, false, move |v, b| {
+            ds::pool_transactions(v, &id, &a, b).map(Some)
+        })
+        .await
     }
 }
 
@@ -293,21 +356,26 @@ fn value_usd_desc() -> Option<LiquidityPositionOrderBy> {
 pub struct DexQuery;
 
 #[Object(name = "DexQuery")]
-#[allow(unused_variables, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 impl DexQuery {
     async fn tokens(
         &self,
+        ctx: &Context<'_>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<QueryTokensConnection> {
-        unserved!("Query.tokens")
+        run(ctx, true, move |v, b| {
+            ds::tokens(v, after.as_deref(), before.as_deref(), first, last, b)
+        })
+        .await
     }
 
     /// Retrieve liquidity pools. Default page size is 20.
     async fn pools(
         &self,
+        ctx: &Context<'_>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
@@ -315,12 +383,28 @@ impl DexQuery {
         #[graphql(default_with = "tvl_usd_desc()")] order_by: Option<PoolOrderBy>,
         protocol_address: Option<String>,
     ) -> Result<QueryPoolsConnection> {
-        unserved!("Query.pools")
+        let (now, proto) = (now_secs(), protocol(protocol_address));
+        let order = order_by.unwrap_or(PoolOrderBy::TvlUsdDesc);
+        run(ctx, true, move |v, b| {
+            ds::pools(
+                &v.txn,
+                now,
+                order,
+                &proto,
+                after.as_deref(),
+                before.as_deref(),
+                first,
+                last,
+                b,
+            )
+        })
+        .await
     }
 
     /// Retrieve a specific pool by its ID.
     async fn pool(
         &self,
+        ctx: &Context<'_>,
         id: ID,
         time_frame: Option<TimeFrame>,
         #[graphql(name = "type")] ty: Option<PoolTransactionType>,
@@ -329,11 +413,24 @@ impl DexQuery {
         last: Option<i32>,
         before: Option<String>,
     ) -> Result<Option<Pool>> {
-        unserved!("Query.pool")
+        let _ = time_frame; // `Pool.charts` takes its own.
+        let now = now_secs();
+        let a = TxArgs {
+            ty,
+            first,
+            after,
+            last,
+            before,
+        };
+        run(ctx, false, move |v, b| {
+            ds::pool(&v.txn, &id.0, now, a, b).map(Some)
+        })
+        .await
     }
 
     async fn pool_transactions(
         &self,
+        ctx: &Context<'_>,
         pair_id: String,
         #[graphql(name = "type")] ty: Option<PoolTransactionType>,
         first: Option<i32>,
@@ -341,12 +438,29 @@ impl DexQuery {
         last: Option<i32>,
         before: Option<String>,
     ) -> Result<Option<PoolTransactionsConnection>> {
-        unserved!("Query.poolTransactions")
+        // Stock's resolver defaults `first` to 10.
+        let first = if first.is_none() && last.is_none() {
+            Some(10)
+        } else {
+            first
+        };
+        let a = TxArgs {
+            ty,
+            first,
+            after,
+            last,
+            before,
+        };
+        run(ctx, false, move |v, b| {
+            ds::pool_transactions(v, &pair_id, &a, b).map(Some)
+        })
+        .await
     }
 
     /// Get user's liquidity positions.
     async fn liquidity_positions(
         &self,
+        ctx: &Context<'_>,
         wallet_address: String,
         first: Option<i32>,
         after: Option<String>,
@@ -354,31 +468,66 @@ impl DexQuery {
         before: Option<String>,
         #[graphql(default_with = "value_usd_desc()")] order_by: Option<LiquidityPositionOrderBy>,
     ) -> Result<LiquidityPositionsConnection> {
-        unserved!("Query.liquidityPositions")
+        let now = now_secs();
+        let order = order_by.unwrap_or(LiquidityPositionOrderBy::ValueUsdDesc);
+        run(ctx, true, move |v, b| {
+            ds::liquidity_positions(
+                &v.txn,
+                now,
+                &wallet_address,
+                order,
+                after.as_deref(),
+                before.as_deref(),
+                first,
+                last,
+                b,
+            )
+        })
+        .await
     }
 
     /// Get DEX metrics including TVL, volume, and pool count.
     async fn dex_metrics(
         &self,
+        ctx: &Context<'_>,
         start_date: Option<DateTime>,
         end_date: Option<DateTime>,
         protocol_address: Option<String>,
     ) -> Result<DexMetrics> {
-        unserved!("Query.dexMetrics")
+        let secs = |d: Option<DateTime>| d.map(|d| (d.0.max(0) / 1_000_000) as u64);
+        let (now, proto) = (now_secs(), protocol(protocol_address));
+        let (s, e) = (secs(start_date), secs(end_date));
+        run(ctx, true, move |v, b| {
+            ds::dex_metrics(&v.txn, now, s, e, &proto, b)
+        })
+        .await
     }
 
     /// Get price for a specific token.
     async fn token_price(
         &self,
+        ctx: &Context<'_>,
         token_address: String,
         protocol_address: Option<String>,
     ) -> Result<Option<TokenPrice>> {
-        unserved!("Query.tokenPrice")
+        let (now, proto) = (now_secs(), protocol(protocol_address));
+        run(ctx, false, move |v, b| {
+            ds::token_price(&v.txn, now, &token_address, &proto, b)
+        })
+        .await
     }
 
     /// Get prices for all tokens in a protocol.
-    async fn token_prices(&self, protocol_address: Option<String>) -> Result<Vec<TokenPrice>> {
-        unserved!("Query.tokenPrices")
+    async fn token_prices(
+        &self,
+        ctx: &Context<'_>,
+        protocol_address: Option<String>,
+    ) -> Result<Vec<TokenPrice>> {
+        let (now, proto) = (now_secs(), protocol(protocol_address));
+        run(ctx, true, move |v, b| {
+            ds::token_prices(&v.txn, now, &proto, b)
+        })
+        .await
     }
 }
 

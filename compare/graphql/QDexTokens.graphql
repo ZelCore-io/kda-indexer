@@ -1,0 +1,2 @@
+# kdx: oracle
+query QDexTokens { tokens(first: 20) { pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id name chainId address } } } }

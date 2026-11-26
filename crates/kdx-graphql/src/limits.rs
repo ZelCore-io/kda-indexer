@@ -182,6 +182,12 @@ struct Walk<'a> {
 /// A `crossChainTransfer` inside another one (M-5): priced as the per-item store read it
 /// would be if not answered from the pair already loaded.
 pub const NESTED_XCHAIN_COST: u64 = 10;
+/// DEX (B3) costs in the read budget: `dexMetrics` walks every listable pair's history,
+/// a DEX list or `Pool.charts` reads every listable pair or a pair's history, and a single
+/// pool read a pair's latest rows.
+pub const DEX_METRICS_COST: u64 = 100_000;
+pub const DEX_LIST_COST: u64 = 20_000;
+pub const DEX_READ_COST: u64 = 200;
 
 /// The directive cap of one field, fragment or spread (C-1: counted here, inside the
 /// bounded walk, instead of async-graphql's `limit_directives`, whose walk expands every
@@ -335,6 +341,19 @@ impl<'a> Walk<'a> {
                         "lastTokenPriceInKda" if ty == Some("Query") => {
                             kdx_hot::prices::LIKE_SCAN_ROWS as u64
                         }
+                        // DEX fields (B3): what each reads, so aliases and nesting reach the
+                        // ceiling (pages multiply them as usual).
+                        "dexMetrics" if ty == Some("Query") => DEX_METRICS_COST,
+                        "pools" | "liquidityPositions" | "tokenPrices" | "tokens"
+                            if ty == Some("Query") =>
+                        {
+                            DEX_LIST_COST
+                        }
+                        "charts" if ty == Some("Pool") => DEX_LIST_COST,
+                        "pool" | "poolTransactions" | "tokenPrice" if ty == Some("Query") => {
+                            DEX_READ_COST
+                        }
+                        "transactions" if ty == Some("Pool") => DEX_READ_COST,
                         "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
                             self.s.default_page.min(self.s.max_page) as u64
                         }
@@ -1337,6 +1356,36 @@ mod tests {
         assert_eq!(page("(before: \"c\", last: 0)"), 1);
         assert_eq!(page("(after: \"c\")"), 21);
         assert_eq!(page("(after: null, first: 0)"), 21);
+    }
+
+    /// B3: DEX aggregates cost their reads; a normal page with charts is served, aliases
+    /// of the long-range aggregates reach the ceiling.
+    #[test]
+    fn dex_fields_cost_their_reads() {
+        let one = served("{ dexMetrics { totalPools } }", json!({})).unwrap();
+        assert!(one >= DEX_METRICS_COST, "cost {one}");
+        let n = (BUDGET_CEILING / one + 1) as usize;
+        let many: String = (0..n)
+            .map(|i| format!("a{i}: dexMetrics {{ totalPools }} "))
+            .collect();
+        assert_eq!(
+            served(&format!("{{ {many} }}"), json!({})),
+            Err(format!("{:?}", Some(&Value::from("budget"))))
+        );
+        let page = served(
+            "{ pools(first: 20) { edges { node { charts(timeFrame: ALL) { tvl { value } } transactions { edges { cursor } } } } } }",
+            json!({}),
+        )
+        .unwrap();
+        assert!(
+            (20 * DEX_LIST_COST..BUDGET_CEILING).contains(&page),
+            "cost {page}"
+        );
+        assert!(served(
+            "{ pool(id: \"x\") { id } tokenPrice(tokenAddress: \"coin\") { id } }",
+            json!({})
+        )
+        .is_ok());
     }
 
     /// N-06: `lastTokenPriceInKda` costs its scan's rows, so aliases of it reach the

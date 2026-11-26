@@ -1,0 +1,2 @@
+# kdx: oracle
+query QDexLiquidityPositions { liquidityPositions(walletAddress: "k:0000000000000000000000000000000000000000000000000000000000000000") { totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor } edges { cursor node { id pairId liquidity walletAddress valueUsd apr24h } } } }

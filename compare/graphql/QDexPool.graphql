@@ -1,0 +1,2 @@
+# kdx: oracle
+query QDexPool { pool(id: "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange-coin:kaddex.kdx", first: 5) { id key reserve0 reserve1 totalSupply charts(timeFrame: MONTH) { volume { timestamp value } tvl { timestamp value } fees { timestamp value } } transactions { totalCount edges { cursor node { maker amount0In amount1In amount0Out amount1Out amountUsd timestamp requestkey transactionType } } } } }

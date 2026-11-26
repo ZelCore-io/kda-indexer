@@ -1,0 +1,2 @@
+# kdx: oracle
+query QDexTokenPrices { tokenPrices { id priceInKda priceInUsd protocolAddress token { name address } } }

@@ -38,6 +38,103 @@ pub struct Config {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub log: LogConfig,
+    /// `[dex_usd]`: the DIA KDA/USD feed for the DEX USD fields (B3). Off by default.
+    #[serde(default)]
+    pub dex_usd: DexUsdConfig,
+}
+
+/// `[dex_usd]`: poll DIA's KDA/USD quotation (stock's source) and store an hourly rate for
+/// the DEX USD fields (`kdx_ingest::dia`). Owner-approved outside dependency (B3). Off (the
+/// default): the DEX USD fields answer 0, as stock does without a KDA/USD price.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DexUsdConfig {
+    pub enabled: bool,
+    /// http(s) URL of a DIA `assetQuotation` answer. Redirects are never followed.
+    pub url: String,
+    pub interval_s: u64,
+    pub timeout_ms: u64,
+    /// Sent as the User-Agent: keep it generic.
+    pub user_agent: String,
+    pub max_response_bytes: u32,
+    /// Accepted price range (USD per KDA).
+    pub min_price: f64,
+    pub max_price: f64,
+    /// A move larger than this (percent of the last accepted price) is held back until
+    /// `confirm_polls` polls in a row agree.
+    pub max_jump_pct: f64,
+    pub confirm_polls: u32,
+}
+
+impl Default for DexUsdConfig {
+    fn default() -> Self {
+        let d = kdx_ingest::dia::DiaSettings::default();
+        Self {
+            enabled: false,
+            url: d.url,
+            interval_s: d.interval.as_secs(),
+            timeout_ms: d.timeout.as_millis() as u64,
+            user_agent: d.user_agent,
+            max_response_bytes: d.max_response_bytes as u32,
+            min_price: d.min_price,
+            max_price: d.max_price,
+            max_jump_pct: d.max_jump_pct,
+            confirm_polls: d.confirm_polls,
+        }
+    }
+}
+
+impl DexUsdConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let u = url::Url::parse(&self.url).map_err(|e| anyhow::anyhow!("dex_usd.url: {e}"))?;
+        anyhow::ensure!(
+            matches!(u.scheme(), "https" | "http") && u.host().is_some(),
+            "dex_usd.url must be an http(s) URL with a host"
+        );
+        anyhow::ensure!(
+            (60..=86_400).contains(&self.interval_s),
+            "dex_usd.interval_s must be in 60..=86400"
+        );
+        anyhow::ensure!(
+            (1_000..=60_000).contains(&self.timeout_ms),
+            "dex_usd.timeout_ms must be in 1000..=60000"
+        );
+        anyhow::ensure!(
+            (256..=1 << 20).contains(&self.max_response_bytes),
+            "dex_usd.max_response_bytes must be in 256..=1048576"
+        );
+        anyhow::ensure!(
+            self.min_price > 0.0 && self.max_price.is_finite() && self.min_price < self.max_price,
+            "dex_usd: need 0 < min_price < max_price"
+        );
+        anyhow::ensure!(
+            self.max_jump_pct > 0.0
+                && self.max_jump_pct.is_finite()
+                && (1..=100).contains(&self.confirm_polls),
+            "dex_usd: max_jump_pct > 0 and confirm_polls in 1..=100"
+        );
+        anyhow::ensure!(
+            !self.user_agent.is_empty()
+                && self.user_agent.is_ascii()
+                && self.user_agent.len() <= 64,
+            "dex_usd.user_agent: 1..=64 ASCII characters"
+        );
+        Ok(())
+    }
+
+    pub fn settings(&self) -> kdx_ingest::dia::DiaSettings {
+        kdx_ingest::dia::DiaSettings {
+            url: self.url.clone(),
+            interval: std::time::Duration::from_secs(self.interval_s),
+            timeout: std::time::Duration::from_millis(self.timeout_ms),
+            user_agent: self.user_agent.clone(),
+            max_response_bytes: self.max_response_bytes as usize,
+            min_price: self.min_price,
+            max_price: self.max_price,
+            max_jump_pct: self.max_jump_pct,
+            confirm_polls: self.confirm_polls,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1009,6 +1106,7 @@ impl Config {
         anyhow::ensure!(b.dict_samples > 0, "backfill.dict_samples must be > 0");
         self.balances.validate()?;
         self.graphql.validate()?;
+        self.dex_usd.validate()?;
         let s = &self.search;
         s.mode_sel()?;
         anyhow::ensure!(

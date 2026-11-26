@@ -7,6 +7,7 @@ pub mod canon;
 pub mod content;
 pub mod ctx;
 pub mod dex_fill;
+pub mod dia;
 pub mod disk;
 pub mod etl;
 pub mod fetch;

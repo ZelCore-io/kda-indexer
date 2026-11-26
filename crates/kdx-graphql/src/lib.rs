@@ -16,6 +16,8 @@ use async_graphql::{Context, EmptyMutation, Schema};
 use kdx_api::ApiState;
 
 pub mod connection;
+pub mod dexnum;
+pub mod dexserve;
 pub mod error;
 pub mod feed;
 pub mod flags;

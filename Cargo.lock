@@ -1875,6 +1875,7 @@ dependencies = [
  "kdx-types",
  "libc",
  "rayon",
+ "reqwest",
  "reth-nippy-jar",
  "serde",
  "serde_json",
