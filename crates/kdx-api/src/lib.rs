@@ -8,6 +8,7 @@ pub mod dict;
 pub mod docs;
 pub mod limits;
 pub mod native;
+pub mod nodeinfo;
 pub mod openapi;
 pub mod sampler;
 pub mod search;

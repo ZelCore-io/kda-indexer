@@ -281,12 +281,21 @@ The G4 replay of real traffic (below) met most of these classes again; its
   `FungibleChainAccount.transfers`) list a transfer to oneself once and count it once.
   Stock's `UNION ALL` of the sender and receiver halves lists it twice, under one cursor,
   and its `totalCount` adds both halves, so it counts it twice.
-- Stock fields not served (a stock client that selects one gets a validation error):
-  `Block.totalGasUsedInKda`, `NetworkInfo.genesisHeights`, `nodeBlockDelay`, `nodeChains`,
-  `nodeLatestBehaviorHeight`, `nodePackageVersion`, `nodeServiceDate`, `numberOfChains`,
-  and `NonFungibleAccount.transfers` / `NonFungibleChainAccount.transfers` (an account's NFT
-  transfers are served by the root `transfers(accountName, isNFT: true)`). Kadena's
-  published schema has none of them.
+- Every field of a stock type we serve is in our schema, so no stock selection is refused
+  by validation. Differences in the fields closed last:
+  - `NetworkInfo` node fields (`genesisHeights`, `nodeBlockDelay`, `nodeChains`,
+    `nodeLatestBehaviorHeight`, `nodePackageVersion`, `nodeServiceDate`, `numberOfChains`):
+    the same `/info` values, read every 5 minutes instead of stock's 30 s. Before the first
+    good `/info` answer ours are `null` with `NOT_AVAILABLE`; stock's are non-null, so its
+    whole `networkInfo` errors then.
+  - `Block.totalGasUsedInKda`: the exact Σ `gas × gasPrice` of the block's user txs, rounded
+    half-up to 10 decimals. Stock adds each tx's product as a JavaScript float, so a value
+    can differ in the 10th decimal. Stock serves `"0"` for blocks it wrote before it added
+    the column; ours serves the real sum for every block.
+  - `NonFungibleAccount.transfers` / `NonFungibleChainAccount.transfers`: our NFT transfers
+    (the four-parameter `TRANSFER` events of the NFT ledgers) where stock lists its
+    `hasTokenId` transfers. A transfer to oneself is listed and counted once (stock: twice),
+    and cursors are ours, as on every list.
 - `Transfer.orderIndex` is the TRANSFER event's index in the transaction
   (`graphql-h8-transfer-order-index`).
 - `creationTime` has whole seconds, as the node's command; stock adds a fraction

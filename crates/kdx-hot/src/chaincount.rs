@@ -358,6 +358,17 @@ pub fn tx_term(r: &TxRecord) -> Option<Term> {
     })
 }
 
+/// Σ `gas × gasPrice` over the user txs of one block (`Block.totalGasUsedInKda`: what stock
+/// adds to its `Blocks.totalGasUsed` column as it writes the block). A coinbase adds nothing
+/// and a missing or malformed price adds 0, as in [`Tally::add`]; `None` past `u128` KDA.
+pub fn block_gas<'a>(txs: impl IntoIterator<Item = &'a TxRecord>) -> Option<Kda> {
+    let mut sum = Kda::ZERO;
+    for t in txs.into_iter().filter_map(tx_term) {
+        sum = sum.checked_add(t.fee?)?;
+    }
+    Some(sum)
+}
+
 /// One chain's counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {

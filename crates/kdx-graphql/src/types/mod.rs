@@ -250,6 +250,20 @@ connection!(
     required,
     total
 );
+connection!(
+    NonFungibleAccountTransfersConnection,
+    NonFungibleAccountTransfersConnectionEdge,
+    Transfer,
+    required,
+    total
+);
+connection!(
+    NonFungibleChainAccountTransfersConnection,
+    NonFungibleChainAccountTransfersConnectionEdge,
+    Transfer,
+    required,
+    total
+);
 // ZelCore extension: `totalCount` (kadscan's block list).
 connection!(
     QueryBlocksFromDepthConnection,

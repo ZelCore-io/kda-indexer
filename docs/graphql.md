@@ -353,6 +353,16 @@ number open.
   `apiVersion` `"0.0"`, `transactionCount` (the last background count, as `/stats`; an error before the first one) and `coinsInCirculation` as `/stats`;
   `totalDifficulty` is the sum over chains of the tip block's `weight`, `networkHashRate` the
   sum over chains of the tip block's difficulty divided by 30 s.
+- `networkInfo` node fields (`nodeBlockDelay`, `nodeChains`, `numberOfChains`,
+  `genesisHeights`, `nodePackageVersion`, `nodeServiceDate`, `nodeLatestBehaviorHeight`) come
+  from the node's `/info`, as stock's: the node's values in the node's order,
+  `nodeServiceDate` as `toISOString` text (`"2025-07-23T00:00:00.000Z"`, `null` when the node
+  sends `null`). Nothing calls the node per request: the `/cut` poll of `serve` and `run`
+  reads `/info` every 5 minutes on its own node client (every 30 s after a failed or unusable
+  answer) and keeps the last good answer when a read fails, as stock's cache does. Before the
+  first good answer (no node client, or the node not answering yet) each field is `null` with
+  `NOT_AVAILABLE` beside it and the rest of `networkInfo` answers; stock's are non-null and
+  error there.
 - `node(id)`/`nodes(ids)` (at most 100) resolve every type. An id that cannot be read (not
   base64 of `<Type>:<key>`, an unknown type, or a malformed key) is `null`, as the stock
   indexer answers, and so is an object not stored; `nodes` answers `null` in that id's place.
@@ -448,6 +458,7 @@ stays Kadena's (the parity test sees the same types, so there is nothing to pin 
 | `TransactionMeta.gasPrice` | `Float` | string, plain notation (`"0.00000001"`) |
 | `TransactionResult.gas`, `.transactionId` | `BigInt` | string (`"236"`) |
 | `Transfer.amount` | `Decimal` | string, plain notation without trailing zeros (`"0.00000236"`, `"26.57382"`) |
+| `Block.totalGasUsedInKda` | `Decimal` | string with exactly 10 decimals, trailing zeros kept (`"0.0000690000"`), as stock's `DECIMAL(20,10)` column |
 | `Transfer.creationTime` | `DateTime` | the tx's `meta.creationTime` (whole seconds); a coinbase transfer has its block's time cut to whole seconds |
 | `ExecutionPayload.code` | `String` | the code JSON-quoted (`"\"(coin.transfer …)\""`) |
 | `Signer.scheme` | `String` | `""` when the signer names no scheme, else the command's scheme |
@@ -766,6 +777,17 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
 - `FungibleAccount.transactions`: txs with a transfer of the token on the account's side;
   `FungibleChainAccount.transactions`: txs on that chain the account sent (`meta.sender`),
   as the schema says.
+- `Block.totalGasUsedInKda` is Σ `gas × meta.gasPrice` over the block's user txs (the coinbase
+  adds nothing; a missing or malformed price adds 0), as stock sums it when it writes the
+  block. Ours is exact and rounded half-up to 10 decimals when printed; stock's is a float sum
+  in a `DECIMAL(20,10)` column. One read of the block's txs per block (priced as a default
+  page in the budget). A block no longer stored (a subscription block held across a reorg)
+  answers `NOT_AVAILABLE`.
+- `NonFungibleAccount.transfers` / `NonFungibleChainAccount.transfers` list the account's NFT
+  transfers (stock's `hasTokenId` transfers) on every chain or the object's chain, newest
+  first: the same rows, order, cursors and `totalCount` as the root
+  `transfers(accountName, isNFT: true[, chainId])`. `totalCount` is a count walk to the
+  request deadline (`COUNT_TIMEOUT` when cut), one of the two an operation may run.
 - `nonFungibleAccount`/`nonFungibleChainAccount` list positive NFT holdings (all of them, as
   stock, up to the 10,000-row safety cap, past which the first 10,000 come with a
   `nft_holdings` `LIMIT` error); `version` is `v1` (`marmalade.ledger`), `v2` (`marmalade-v2.ledger`) or the
@@ -791,6 +813,7 @@ relaxed argument (`events.qualifiedEventName`, now nullable) accepts what `Strin
 |---|---|
 | `Block.canonical: Boolean!` | whether the block is the stored block at its chain and height. The store keeps the canonical chain only, so a block read in the same request is `true`; one held across a reorg (a subscription) may not be. One read per block |
 | `Block.coinbase: String!` | the coinbase output as compact JSON text (`gas`, `logs`, `txId`, `events`, `reqKey`, `result`, `metaData`, `continuation`). One read per block |
+| `Block.totalGasUsedInKda: Decimal!`, `NetworkInfo` node fields (`nodeBlockDelay`, `nodeChains`, `numberOfChains`, `genesisHeights: [GenesisHeight!]`, `nodePackageVersion`, `nodeServiceDate`, `nodeLatestBehaviorHeight`), `NonFungibleAccount.transfers`, `NonFungibleChainAccount.transfers` | stock's fields (not in Kadena's schema); see [Blocks and network](#blocks-and-network) and [Accounts](#accounts). The node fields are nullable here (`null` with `NOT_AVAILABLE` before the first good node `/info`) |
 | `Transaction.orphanedTransactions: [Transaction]` | always `[]`: the store keeps no orphaned blocks |
 | `QueryBlocksFromDepthConnection.totalCount` | blocks in the whole list, from the per-chain height ranges (store floor to tip minus `minimumDepth`); exact without a walk, since blocks are dense |
 | `TransactionResultTransfersConnection.totalCount` | the tx's transfer count |

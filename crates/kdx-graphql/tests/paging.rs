@@ -3171,6 +3171,132 @@ mod stored_count {
         }
     }
 
+    /// `NonFungibleAccount.transfers` and `NonFungibleChainAccount.transfers` (stock's
+    /// `hasTokenId` transfers of the account, all chains or the object's chain): the same rows,
+    /// order and cursors as the root `transfers(accountName, isNFT: true[, chainId])`, paged
+    /// with the same cursors, and a `totalCount` equal to the edges. Not a stored count: it
+    /// walks (a spent deadline answers `COUNT_TIMEOUT`), counts ready or not.
+    #[tokio::test]
+    async fn nft_account_transfers_are_the_root_nft_list() {
+        let lists = [
+            (
+                "nonFungibleAccount(accountName: \"k:alice\")",
+                "transfers(accountName: \"k:alice\", isNFT: true, ARGS)",
+                9,
+            ),
+            (
+                "nonFungibleChainAccount(accountName: \"k:alice\", chainId: \"0\")",
+                "transfers(accountName: \"k:alice\", isNFT: true, chainId: \"0\", ARGS)",
+                6,
+            ),
+        ];
+        let sel = "edges { cursor node { requestKey orderIndex senderAccount receiverAccount \
+                   moduleName amount chainId } }";
+        let fx = fixture();
+        for counted in [false, true] {
+            if counted {
+                reconcile(&fx);
+            }
+            for (p, root, want) in lists {
+                let (n, edges, codes, q) = nested_xfers(&fx.schema, p, false).await;
+                assert_eq!((n, edges), (Some(want), want), "{q}: {codes:?}");
+                assert_eq!(n, Some(total(&fx.schema, root).await), "{q} vs {root}");
+                let (n, _, codes, q) = nested_xfers(&fx.schema, p, true).await;
+                assert_eq!(n, None, "{q}");
+                assert!(
+                    !codes.is_empty() && codes.iter().all(|c| c.contains("TIMEOUT")),
+                    "{q}: {codes:?}"
+                );
+                // The same edges as the root list, NFT transfers only.
+                let nested = run(
+                    &fx.schema,
+                    &format!("{{ {p} {{ transfers(first: 100) {{ {sel} }} }} }}"),
+                )
+                .await;
+                let nested = &nested[parent(p)]["transfers"]["edges"];
+                let flat = run(
+                    &fx.schema,
+                    &format!("{{ {} {{ {sel} }} }}", root.replace("ARGS", "first: 100")),
+                )
+                .await;
+                assert_eq!(nested, &flat["transfers"]["edges"], "{p}");
+                for e in nested.as_array().unwrap() {
+                    assert_eq!(e["node"]["moduleName"], "marmalade-v2.ledger", "{e}");
+                }
+                // Paging by 2 with the cursors walks the same rows.
+                let mut paged = Vec::new();
+                let mut after = String::new();
+                loop {
+                    let q = format!(
+                        "{{ {p} {{ transfers(first: 2{after}) {{ pageInfo {{ hasNextPage endCursor }} edges {{ cursor }} }} }} }}"
+                    );
+                    let v = run(&fx.schema, &q).await;
+                    let c = &v[parent(p)]["transfers"];
+                    paged.extend(c["edges"].as_array().unwrap().iter().cloned());
+                    if c["pageInfo"]["hasNextPage"] != true {
+                        break;
+                    }
+                    after = format!(", after: {}", c["pageInfo"]["endCursor"]);
+                }
+                let cursors: Vec<&Value> = nested
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| &e["cursor"])
+                    .collect();
+                let paged: Vec<&Value> = paged.iter().map(|e| &e["cursor"]).collect();
+                assert_eq!(paged, cursors, "{p}");
+            }
+        }
+    }
+
+    /// `Block.totalGasUsedInKda`: Σ `gas × gasPrice` over the block's user txs (gas 1 at
+    /// 1e-8 KDA each in the fixture; the coinbase adds nothing), as stock's `DECIMAL(20,10)`
+    /// text in a JSON string, for frozen and hot blocks. Per chain the blocks add up to the
+    /// stored chain counters.
+    #[tokio::test]
+    async fn block_total_gas_used_is_its_user_txs_gas() {
+        use kdx_hot::chaincount::{parse_price, read_all, Kda};
+        let fx = fixture();
+        reconcile(&fx);
+        let mut sums: std::collections::BTreeMap<u8, Kda> = Default::default();
+        for &(c, h, shapes) in BLOCKS {
+            let q = format!(
+                "{{ block(hash: \"{}\") {{ totalGasUsedInKda transactions {{ totalCount }} }} }}",
+                block_hash(c, h)
+            );
+            let v = run(&fx.schema, &q).await;
+            let n = shapes.len() as u64;
+            let want = parse_price("0.00000001")
+                .unwrap()
+                .checked_mul_u64(n)
+                .unwrap();
+            assert_eq!(
+                v["block"]["totalGasUsedInKda"],
+                Value::String(want.to_stock_text()),
+                "{q}"
+            );
+            assert_eq!(v["block"]["transactions"]["totalCount"], n, "{q}");
+            let e = sums.entry(c).or_default();
+            *e = e.checked_add(want).unwrap();
+        }
+        assert_eq!(
+            run(
+                &fx.schema,
+                &format!(
+                    "{{ block(hash: \"{}\") {{ totalGasUsedInKda }} }}",
+                    block_hash(0, 6)
+                )
+            )
+            .await["block"]["totalGasUsedInKda"],
+            "0.0000000200"
+        );
+        let stored = read_all(&fx.store.hot.ro().unwrap()).unwrap();
+        for (c, sum) in sums {
+            assert_eq!(stored[&c].unwrap().gas, sum, "chain {c}");
+        }
+    }
+
     /// Counts stay right through a reorg: unwind two hot blocks of chain 0, apply a different
     /// fork, with the marker set (stored counts answer) and unset (the walk answers; the
     /// table still follows, and a backfill marks it ready again).

@@ -15,8 +15,10 @@ use kdx_types::{Dict, DictKind};
 use super::guard::{map_guard, RawGuard};
 use super::{
     IGuard, NonFungibleAccountTransactionsConnection, NonFungibleAccountTransactionsConnectionEdge,
+    NonFungibleAccountTransfersConnection, NonFungibleAccountTransfersConnectionEdge,
     NonFungibleChainAccountTransactionsConnection,
-    NonFungibleChainAccountTransactionsConnectionEdge, Sel, Transaction,
+    NonFungibleChainAccountTransactionsConnectionEdge, NonFungibleChainAccountTransfersConnection,
+    NonFungibleChainAccountTransfersConnectionEdge, Sel, Transaction, Transfer,
 };
 use crate::connection::{PageArgs, Total};
 use crate::error::{err, from_api, Code};
@@ -127,6 +129,35 @@ fn nft_txs_spec(account: &str, chain: Option<u8>) -> ListSpec {
     }
 }
 
+/// Stock's `hasTokenId` transfers of an account (`NonFungibleAccount.transfers`, on one chain
+/// for `NonFungibleChainAccount.transfers`): the NFT transfers on either side, as the root
+/// `transfers(accountName, isNFT: true[, chainId])` lists them (the account's `acct`
+/// postings; NFT moves have no `xfer` postings).
+fn nft_transfers_spec(account: &str, chain: Option<u8>) -> ListSpec {
+    ListSpec {
+        source: SourceSpec::Acct(account.to_owned()),
+        filter: KeyFilter {
+            chain,
+            ..KeyFilter::default()
+        },
+        rows: Rows::Transfers {
+            module: None,
+            account: Some(account.to_owned()),
+            nft: true,
+        },
+    }
+}
+
+fn transfer_edges<E>(p: ListPage, mk: impl Fn(String, Transfer) -> E) -> Vec<E> {
+    p.edges
+        .into_iter()
+        .filter_map(|(c, it)| match it {
+            Item::Nft(d, i) => Some(mk(c, Transfer::nft(d, i))),
+            _ => None,
+        })
+        .collect()
+}
+
 fn tx_edges<E>(p: ListPage, mk: impl Fn(String, Transaction) -> E) -> Vec<E> {
     p.edges
         .into_iter()
@@ -203,6 +234,27 @@ impl NonFungibleAccount {
             total,
         })
     }
+    /// The account's NFT transfers on every chain (stock's `hasTokenId` transfers), newest
+    /// first, as the root `transfers(accountName, isNFT: true)`.
+    async fn transfers(
+        &self,
+        ctx: &Context<'_>,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<NonFungibleAccountTransfersConnection> {
+        let spec = nft_transfers_spec(&self.account, None);
+        let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
+        let (page_info, total) = (p.info.clone(), p.total.clone());
+        Ok(NonFungibleAccountTransfersConnection {
+            edges: transfer_edges(p, |cursor, node| {
+                NonFungibleAccountTransfersConnectionEdge { cursor, node }
+            }),
+            page_info,
+            total,
+        })
+    }
 }
 
 #[Object]
@@ -236,6 +288,27 @@ impl NonFungibleChainAccount {
         Ok(NonFungibleChainAccountTransactionsConnection {
             edges: tx_edges(p, |cursor, node| {
                 NonFungibleChainAccountTransactionsConnectionEdge { cursor, node }
+            }),
+            page_info,
+            total,
+        })
+    }
+    /// The account's NFT transfers on this chain, as the root
+    /// `transfers(accountName, isNFT: true, chainId)`.
+    async fn transfers(
+        &self,
+        ctx: &Context<'_>,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<NonFungibleChainAccountTransfersConnection> {
+        let spec = nft_transfers_spec(&self.account, Some(self.chain));
+        let p = list(ctx, spec, PageArgs::new(after, before, first, last)).await?;
+        let (page_info, total) = (p.info.clone(), p.total.clone());
+        Ok(NonFungibleChainAccountTransfersConnection {
+            edges: transfer_edges(p, |cursor, node| {
+                NonFungibleChainAccountTransfersConnectionEdge { cursor, node }
             }),
             page_info,
             total,

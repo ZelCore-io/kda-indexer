@@ -143,7 +143,7 @@ impl ScalarType for DateTime {
 
 /// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` (RFC 3339; `t`/`z` and a space separator
 /// accepted) as µs since the epoch; at most 9 fraction digits, years 0000–9999.
-fn parse_rfc3339(s: &str) -> Option<DateTime> {
+pub(crate) fn parse_rfc3339(s: &str) -> Option<DateTime> {
     let b = s.as_bytes();
     if b.len() < 20 || b.len() > 35 || !s.is_ascii() {
         return None;
