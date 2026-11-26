@@ -150,7 +150,8 @@ async fn introspection_and_unserved_fields() {
     assert!(v.get("errors").is_none(), "{v}");
     let types = v["data"]["__schema"]["types"].as_array().unwrap();
     assert!(types.iter().any(|t| t["name"] == "TransactionResult"));
-    // pactQuery is never served; the rest of the operation still answers.
+    // pactQuery is not served here. It is non-null (`[PactQueryResponse!]!`, as stock), so
+    // its error nulls `data` (spec null propagation, as graphql-js answers).
     let (_, v, _) = query(
         &f,
         "{ graphConfiguration { version minimumBlockHeight } pactQuery(pactQuery: [{chainId: \"0\", code: \"(+ 1 2)\"}]) { result } }",
@@ -159,10 +160,7 @@ async fn introspection_and_unserved_fields() {
     assert_eq!(v["errors"][0]["extensions"]["code"], "NOT_SUPPORTED", "{v}");
     // The oracle sends the code top-level: a copy rides along with `extensions.code`.
     assert_eq!(v["errors"][0]["code"], "NOT_SUPPORTED", "{v}");
-    assert_eq!(
-        v["data"]["graphConfiguration"]["minimumBlockHeight"], 0,
-        "{v}"
-    );
+    assert_eq!(v["data"], Value::Null, "{v}");
     // Variables keep exact numbers (the workspace serde_json has arbitrary_precision).
     let (_, v, _) = post(
         &f,
@@ -732,6 +730,15 @@ async fn request_level_refusals_carry_no_data_key() {
         assert!(v.get("data").is_some(), "{q}: {v}");
         assert_eq!(v["errors"][0]["code"], "BAD_USER_INPUT", "{q}: {v}");
     }
+    // Every root field failing in a resolver answers stock's object of nulls, not `data: null`.
+    let (s, v, _) = query(
+        &f,
+        "{ block(hash: \"x\") { height } b: block(hash: \"y\") { height } }",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["data"], json!({"block": null, "b": null}), "{v}");
+    assert_eq!(v["errors"].as_array().map(Vec::len), Some(2), "{v}");
     // A batch: only the refused item loses its `data`.
     let (s, v, _) = post(
         &f,

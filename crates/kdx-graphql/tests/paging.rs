@@ -3080,8 +3080,8 @@ mod stored_count {
             None,
             "no marker: the walk is cut"
         );
-        // Review M-5: the cut `totalCount` is left out of its connection, which is `null`
-        // when that was its only field (async-graphql does no null propagation).
+        // Review M-5: the cut `totalCount` is `Int!` in a non-null connection, so its error
+        // nulls `data` (spec null propagation, as stock's graphql-js answers).
         let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
         let r = fx
             .schema
@@ -3091,7 +3091,7 @@ mod stored_count {
             .await;
         assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
         let d = serde_json::to_value(&r.data).unwrap();
-        assert_eq!(d.get(field(l)), Some(&Value::Null), "{d}");
+        assert_eq!(d, Value::Null, "{d}");
         reconcile(&fx);
         assert_eq!(total_spent(&fx.schema, l).await, Some(walked));
         let e = "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)";

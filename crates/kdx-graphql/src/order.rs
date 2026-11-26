@@ -1,4 +1,5 @@
-//! Response members in selection-set order (GraphQL spec, "Serialized Map Ordering").
+//! Response members in selection-set order (GraphQL spec, "Serialized Map Ordering"), and
+//! field errors completed the way the spec and graphql-js (stock) complete them.
 //!
 //! async-graphql 7.2.1 resolves the fields of a selection set concurrently and inserts each
 //! result into the response object as it completes (`do_resolve_container` drains a
@@ -6,22 +7,38 @@
 //! after a later sibling, so the member order follows completion and changes from run to run.
 //!
 //! This extension keeps the concurrent execution and only fixes the output: after execution it
-//! walks the response next to the executed operation and re-inserts each object's members in
-//! the order the spec's CollectFields gives (aliases, fragment spreads, inline fragments,
+//! walks the response next to the executed operation and puts each object's members in the
+//! order the spec's CollectFields gives (aliases, fragment spreads, inline fragments,
 //! `@skip`/`@include`, first occurrence wins). Members it cannot place (none expected) go
 //! after the placed ones, so nothing is ever dropped.
 //!
+//! Field errors: async-graphql drops the member of a failed field (and answers an object whose
+//! members all failed as `null`). The spec ("Handling Field Errors") and graphql-js answer a
+//! failed nullable field with `null` in place, and a failed non-null field by nulling its
+//! nearest nullable parent (an object, a list item, or `data` itself). The walk does both,
+//! only for a member that is in the collected set *and* has an error at exactly its path, so
+//! it never invents a key and never nulls a value no error points at. An object async-graphql
+//! answered `null` because every member failed is rebuilt when an error points below it.
+//! `data` itself is rebuilt only when every error has a path and an `extensions.code` (all
+//! resolver errors do, through [`crate::error::err`]); a request that never ran (a missing
+//! variable: path but no code) keeps `data: null`.
+//!
 //! Type conditions are matched against the object's runtime type: the static field type when
-//! it is an object type, else a selected `__typename`. When neither is known (an abstract type
-//! with no `__typename`), every fragment counts, which can only differ from the spec when two
-//! fragments for different types select the same keys in opposite orders.
+//! it is an object type, else a selected `__typename`, else the only possible type (at most
+//! [`MAX_INFER_TYPES`] are tried) whose collected keys cover the object's keys. When none is
+//! known, every fragment counts and no `null` is restored inside that object; that can only
+//! differ from the spec when two fragments for different types select the same keys in
+//! opposite orders, or for a failed field there.
 //!
 //! Cost: one pass over the response (already built in memory) plus one CollectFields per
-//! distinct (selection set, runtime type) pair, cached for the request. Recursion follows the
-//! response nesting, which the depth limit in [`crate::limits`] bounds; fragment expansion is
-//! capped at [`MAX_FRAGMENT_DEPTH`] (validation already rejects fragment cycles).
+//! distinct (selection set, runtime type) pair, cached for the request as a plan that also
+//! holds each member's declared type and child selection. An object already in order is not
+//! rebuilt, so the common case allocates nothing per object. Recursion follows the response
+//! nesting, which the depth limit in [`crate::limits`] bounds; fragment expansion is capped at
+//! [`MAX_FRAGMENT_DEPTH`] (validation already rejects fragment cycles).
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use async_graphql::extensions::{
@@ -36,6 +53,9 @@ use async_graphql::{Name, PathSegment, Positioned, Response, ServerResult, Value
 
 /// Fragment nesting beyond this is not expanded (validation bounds it far lower in practice).
 pub const MAX_FRAGMENT_DEPTH: usize = 64;
+
+/// An abstract type with more possible types than this is not inferred (see the module doc).
+pub const MAX_INFER_TYPES: usize = 16;
 
 /// The extension (installed by `build_schema`).
 pub struct FieldOrder;
@@ -81,7 +101,7 @@ impl Extension for FieldOrderExt {
     }
 }
 
-/// Put every object of `r.data` in selection-set order.
+/// Put every object of `r.data` in selection-set order and complete its field errors.
 pub fn reorder_response(
     registry: &Registry,
     doc: &ExecutableDocument,
@@ -99,16 +119,49 @@ pub fn reorder_response(
             registry.subscription_type.as_deref()
         }
     };
+    let mut failed = HashSet::new();
+    let mut under = HashSet::new();
+    for e in r.errors.iter().filter(|e| !e.path.is_empty()) {
+        let p = seg_path(&e.path);
+        for n in 0..p.len() {
+            under.insert(p[..n].to_vec());
+        }
+        failed.insert(p);
+    }
     let mut w = Walker {
         registry,
         doc,
         variables,
         op,
-        cache: HashMap::new(),
-        failed: r.errors.iter().map(|e| seg_path(&e.path)).collect(),
+        sets: Vec::new(),
+        set_ids: HashMap::new(),
+        plans: Vec::new(),
+        failed,
+        under,
         path: Vec::new(),
+        last_object: None,
     };
-    w.value(&mut r.data, &[&op.selection_set.node], root);
+    let root_sid = w.intern(vec![&op.selection_set.node]);
+    // async-graphql answers `data: null` when every root field failed; stock answers the
+    // failed nullable roots as `null` members. Only when each error is a resolver's (a path
+    // and a code): a request-level error (no code) means nothing ran.
+    let rebuild = r.data == Value::Null
+        && !r.errors.is_empty()
+        && r.errors.iter().all(|e| {
+            !e.path.is_empty()
+                && e.extensions
+                    .as_ref()
+                    .is_some_and(|x| x.get("code").is_some())
+        });
+    if rebuild {
+        r.data = Value::Object(IndexMap::new());
+    }
+    let Value::Object(map) = &mut r.data else {
+        return;
+    };
+    if w.object(map, root_sid, root) || map.is_empty() {
+        r.data = Value::Null;
+    }
 }
 
 fn pick_operation<'a>(
@@ -143,115 +196,190 @@ fn seg_path(p: &[PathSegment]) -> Vec<Seg> {
         .collect()
 }
 
-/// The ordered response keys of one object, each with the field nodes that share it.
-type Collected<'a> = Arc<Vec<(Name, Vec<&'a Field>)>>;
+/// Whether a declared type (`[Pet!]!`) admits `null`; an unknown type is treated as nullable
+/// (no bubbling happens without a known type anyway).
+fn nullable(ty: Option<&str>) -> bool {
+    !ty.is_some_and(|t| t.ends_with('!'))
+}
+
+/// The item type of a declared list type (`[Pet!]!` -> `Pet!`), `None` when not a list.
+fn item_type(ty: &str) -> Option<&str> {
+    ty.strip_suffix('!')
+        .unwrap_or(ty)
+        .strip_prefix('[')?
+        .strip_suffix(']')
+}
+
+/// One response key of an object: the first field node for it, its declared type on the
+/// parent, and the merged child selection (an interned id) with the child's named type.
+struct Entry<'a> {
+    key: Name,
+    ty: Option<&'a str>,
+    child: Option<(usize, Option<&'a str>)>,
+}
+
+/// The ordered members of one (selection set, runtime type), built once per request.
+struct Plan<'a> {
+    entries: Vec<Entry<'a>>,
+    /// The response key of a selected `__typename`.
+    typename: Option<Name>,
+}
+
+/// A cached plan: (runtime type, parent type) -> plan, per interned selection.
+type Plans<'a> = Vec<Vec<(Option<&'a str>, Option<&'a str>, Rc<Plan<'a>>)>>;
 
 struct Walker<'a> {
     registry: &'a Registry,
     doc: &'a ExecutableDocument,
     variables: &'a Variables,
     op: &'a OperationDefinition,
-    /// Keyed by the selection sets' addresses (stable: `doc` is borrowed for the walk) and
-    /// the runtime type.
-    cache: HashMap<(Vec<usize>, Option<String>), Collected<'a>>,
+    /// Interned selection-set lists (the merged selections of one response key); the map is
+    /// keyed by the sets' addresses (stable: `doc` is borrowed for the walk).
+    sets: Vec<Vec<&'a SelectionSet>>,
+    set_ids: HashMap<Vec<usize>, usize>,
+    /// Indexed by interned selection id.
+    plans: Plans<'a>,
     /// The paths of the response's errors (empty on success).
     failed: HashSet<Vec<Seg>>,
-    /// Where the walk is in the response.
+    /// Every strict prefix of an error path.
+    under: HashSet<Vec<Seg>>,
+    /// Where the walk is in the response (kept only when there are errors).
     path: Vec<Seg>,
+    /// The last named type found to be an object type (saves a registry lookup per row).
+    last_object: Option<&'a str>,
 }
 
 impl<'a> Walker<'a> {
-    fn value(&mut self, v: &mut Value, sets: &[&'a SelectionSet], ty: Option<&str>) {
+    fn intern(&mut self, sets: Vec<&'a SelectionSet>) -> usize {
+        let key: Vec<usize> = sets
+            .iter()
+            .map(|s| *s as *const SelectionSet as usize)
+            .collect();
+        if let Some(&id) = self.set_ids.get(&key) {
+            return id;
+        }
+        let id = self.sets.len();
+        self.sets.push(sets);
+        self.plans.push(Vec::new());
+        self.set_ids.insert(key, id);
+        id
+    }
+
+    /// `ty` is the declared type of `v` (with list and non-null wrappers), `named` its named
+    /// type. Returns whether `v` must become `null` (the caller applies `ty`'s nullability).
+    fn value(
+        &mut self,
+        v: &mut Value,
+        sid: usize,
+        ty: Option<&'a str>,
+        named: Option<&'a str>,
+    ) -> bool {
         match v {
             Value::List(items) => {
+                let item = ty.and_then(item_type);
+                let track = !self.failed.is_empty();
                 for (i, it) in items.iter_mut().enumerate() {
-                    self.path.push(Seg::Index(i));
-                    self.value(it, sets, ty);
-                    self.path.pop();
+                    if track {
+                        self.path.push(Seg::Index(i));
+                    }
+                    let null_me = self.value(it, sid, item, named);
+                    if track {
+                        self.path.pop();
+                    }
+                    if null_me {
+                        if !nullable(item) {
+                            return true;
+                        }
+                        *it = Value::Null;
+                    }
                 }
+                false
             }
-            Value::Object(map) => self.object(map, sets, ty),
-            _ => {}
+            Value::Object(map) => self.object(map, sid, named),
+            // An object whose members all failed (async-graphql answers it `null`).
+            Value::Null
+                if !self.failed.is_empty()
+                    && ty.is_some_and(|t| item_type(t).is_none())
+                    && self.under.contains(&self.path) =>
+            {
+                let mut map = IndexMap::new();
+                if self.object(&mut map, sid, named) {
+                    return true;
+                }
+                if !map.is_empty() {
+                    *v = Value::Object(map);
+                }
+                false
+            }
+            _ => false,
         }
     }
 
-    fn object(
-        &mut self,
-        map: &mut IndexMap<Name, Value>,
-        sets: &[&'a SelectionSet],
-        ty: Option<&str>,
-    ) {
-        if sets.is_empty() {
-            return;
-        }
-        let runtime = self.runtime_type(map, sets, ty);
-        let collected = self.collect(sets, runtime.as_deref());
-        let parent = runtime.as_deref().or(ty);
-        let mut out = IndexMap::with_capacity(map.len());
-        for (key, fields) in collected.iter() {
-            let Some(mut v) = map.swap_remove(key) else {
-                if self.failed_nullable(key, parent, fields[0]) {
-                    out.insert(key.clone(), Value::Null);
+    /// Orders `map` and completes its failed members; returns whether the object itself
+    /// must become `null` (a failed non-null member).
+    fn object(&mut self, map: &mut IndexMap<Name, Value>, sid: usize, ty: Option<&'a str>) -> bool {
+        let runtime = self.runtime_type(map, sid, ty);
+        let plan = self.plan(sid, runtime, runtime.or(ty));
+        let mut in_order = true;
+        let mut nulls: Vec<usize> = Vec::new();
+        let mut pos = 0;
+        let track = !self.failed.is_empty();
+        for (n, e) in plan.entries.iter().enumerate() {
+            // Already in place (the common case) needs no hashing.
+            let at = match map.get_index(pos) {
+                Some((k, _)) if *k == e.key => Some(pos),
+                _ => map.get_index_of(&e.key),
+            };
+            let Some(idx) = at else {
+                if self.failed_here(&e.key) && e.ty.is_some() {
+                    if !nullable(e.ty) {
+                        return true;
+                    }
+                    nulls.push(n);
+                    in_order = false;
                 }
                 continue;
             };
-            let child_sets: Vec<&'a SelectionSet> = fields
-                .iter()
-                .map(|f| &f.selection_set.node)
-                .filter(|s| !s.items.is_empty())
-                .collect();
-            if !child_sets.is_empty() {
-                let child_ty = parent.and_then(|p| self.field_type(p, fields[0]));
-                self.path.push(Seg::Field(key.clone()));
-                self.value(&mut v, &child_sets, child_ty.as_deref());
-                self.path.pop();
+            if let Some((child, named)) = e.child {
+                if track {
+                    self.path.push(Seg::Field(e.key.clone()));
+                }
+                let null_me = self.value(&mut map[idx], child, e.ty, named);
+                if track {
+                    self.path.pop();
+                }
+                if null_me {
+                    if !nullable(e.ty) {
+                        return true;
+                    }
+                    map[idx] = Value::Null;
+                }
             }
-            out.insert(key.clone(), v);
+            in_order &= idx == pos;
+            pos += 1;
+        }
+        if in_order {
+            return false;
+        }
+        let mut out = IndexMap::with_capacity(map.len() + nulls.len());
+        let mut nulls = nulls.into_iter().peekable();
+        for (n, e) in plan.entries.iter().enumerate() {
+            if let Some(v) = map.swap_remove(&e.key) {
+                out.insert(e.key.clone(), v);
+            } else if nulls.next_if_eq(&n).is_some() {
+                out.insert(e.key.clone(), Value::Null);
+            }
         }
         // Anything not placed (none expected) goes at the end. `swap_remove` keeps this
         // linear in the member count; it can reorder only these leftovers.
         out.extend(map.drain(..));
         *map = out;
+        false
     }
 
-    /// The object's concrete type: the static type when it is an object type, else the value
-    /// of a selected `__typename`.
-    fn runtime_type(
-        &mut self,
-        map: &IndexMap<Name, Value>,
-        sets: &[&'a SelectionSet],
-        ty: Option<&str>,
-    ) -> Option<String> {
-        if let Some(t) = ty {
-            if matches!(self.registry.types.get(t), Some(MetaType::Object { .. })) {
-                return Some(t.to_owned());
-            }
-        }
-        let all = self.collect(sets, None);
-        all.iter().find_map(|(key, fields)| {
-            if fields[0].name.node != "__typename" {
-                return None;
-            }
-            match map.get(key) {
-                Some(Value::String(s)) => Some(s.clone()),
-                _ => None,
-            }
-        })
-    }
-
-    /// async-graphql drops the member of a field whose resolver failed; the spec answers a
-    /// nullable one with `null` in place (and reports the error at its path).
-    fn failed_nullable(&mut self, key: &Name, parent: Option<&str>, f: &Field) -> bool {
+    /// Whether an error sits at exactly `self.path` + `key`.
+    fn failed_here(&mut self, key: &Name) -> bool {
         if self.failed.is_empty() {
-            return false;
-        }
-        let Some(meta) = parent
-            .and_then(|p| self.registry.types.get(p))
-            .and_then(|t| t.field_by_name(&f.name.node))
-        else {
-            return false;
-        };
-        if meta.ty.ends_with('!') {
             return false;
         }
         self.path.push(Seg::Field(key.clone()));
@@ -260,33 +388,89 @@ impl<'a> Walker<'a> {
         hit
     }
 
-    /// The named type a field of `parent` returns.
-    fn field_type(&self, parent: &str, f: &Field) -> Option<String> {
-        let meta = self
-            .registry
-            .types
-            .get(parent)?
-            .field_by_name(&f.name.node)?;
-        Some(meta.ty.trim_matches(['[', ']', '!']).to_owned())
+    /// The object's concrete type: the static type when it is an object type, else the value
+    /// of a selected `__typename`, else the only possible type covering the object's keys.
+    fn runtime_type(
+        &mut self,
+        map: &IndexMap<Name, Value>,
+        sid: usize,
+        ty: Option<&'a str>,
+    ) -> Option<&'a str> {
+        let registry = self.registry;
+        let t = ty?;
+        if self.last_object == Some(t) {
+            return ty;
+        }
+        let meta = registry.types.get(t)?;
+        if matches!(meta, MetaType::Object { .. }) {
+            self.last_object = ty;
+            return ty;
+        }
+        let any = self.plan(sid, None, ty);
+        if let Some(Value::String(s)) = any.typename.as_ref().and_then(|k| map.get(k)) {
+            return registry
+                .types
+                .get_key_value(s.as_str())
+                .map(|(k, _)| k.as_str());
+        }
+        let possible = meta.possible_types()?;
+        if possible.len() > MAX_INFER_TYPES {
+            return None;
+        }
+        let mut found = None;
+        for t in possible {
+            let p = self.plan(sid, Some(t.as_str()), Some(t.as_str()));
+            if map.keys().all(|k| p.entries.iter().any(|e| e.key == *k)) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(t.as_str());
+            }
+        }
+        found
     }
 
-    fn collect(&mut self, sets: &[&'a SelectionSet], runtime: Option<&str>) -> Collected<'a> {
-        let key = (
-            sets.iter()
-                .map(|s| *s as *const SelectionSet as usize)
-                .collect(),
-            runtime.map(str::to_owned),
-        );
-        if let Some(c) = self.cache.get(&key) {
-            return c.clone();
+    fn plan(
+        &mut self,
+        sid: usize,
+        runtime: Option<&'a str>,
+        parent: Option<&'a str>,
+    ) -> Rc<Plan<'a>> {
+        if let Some((_, _, p)) = self.plans[sid]
+            .iter()
+            .find(|(r, t, _)| *r == runtime && *t == parent)
+        {
+            return p.clone();
         }
         let mut acc: IndexMap<Name, Vec<&'a Field>> = IndexMap::new();
-        for s in sets {
+        for i in 0..self.sets[sid].len() {
+            let s = self.sets[sid][i];
             self.collect_into(s, runtime, 0, &mut acc);
         }
-        let c: Collected<'a> = Arc::new(acc.into_iter().collect());
-        self.cache.insert(key, c.clone());
-        c
+        let parent_meta = parent.and_then(|p| self.registry.types.get(p));
+        let mut typename = None;
+        let mut entries = Vec::with_capacity(acc.len());
+        for (key, fields) in acc {
+            if fields[0].name.node == "__typename" && typename.is_none() {
+                typename = Some(key.clone());
+            }
+            let ty = parent_meta
+                .and_then(|m| m.field_by_name(&fields[0].name.node))
+                .map(|f| f.ty.as_str());
+            let child_sets: Vec<&'a SelectionSet> = fields
+                .iter()
+                .map(|f| &f.selection_set.node)
+                .filter(|s| !s.items.is_empty())
+                .collect();
+            let child = (!child_sets.is_empty()).then(|| {
+                let named = ty.map(|t| t.trim_matches(['[', ']', '!']));
+                (self.intern(child_sets), named)
+            });
+            entries.push(Entry { key, ty, child });
+        }
+        let p = Rc::new(Plan { entries, typename });
+        self.plans[sid].push((runtime, parent, p.clone()));
+        p
     }
 
     fn collect_into(
@@ -383,14 +567,46 @@ mod tests {
 
     use super::FieldOrder;
 
+    fn coded(m: &str) -> async_graphql::Error {
+        use async_graphql::ErrorExtensions;
+        async_graphql::Error::new(m).extend_with(|_, e| e.set("code", "BAD_USER_INPUT"))
+    }
+
     async fn nap(ms: u64) {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
-    #[derive(SimpleObject)]
     struct Cat {
         name: String,
         lives: i32,
+    }
+    #[Object]
+    impl Cat {
+        async fn name(&self) -> &str {
+            &self.name
+        }
+        async fn lives(&self) -> i32 {
+            self.lives
+        }
+        async fn mood(&self) -> async_graphql::Result<Option<i32>> {
+            Err("grumpy".into())
+        }
+    }
+
+    /// A nullable failing field `p`, a non-null failing field `q`, and a good `ok`.
+    struct Bad;
+    #[Object]
+    impl Bad {
+        async fn ok(&self) -> i32 {
+            1
+        }
+        async fn p(&self) -> async_graphql::Result<Option<i32>> {
+            nap(5).await;
+            Err("p".into())
+        }
+        async fn q(&self) -> async_graphql::Result<i32> {
+            Err("q".into())
+        }
     }
     #[derive(SimpleObject)]
     struct Dog {
@@ -431,7 +647,26 @@ mod tests {
         }
         async fn boom(&self) -> async_graphql::Result<Option<i32>> {
             nap(20).await;
-            Err("boom".into())
+            Err(coded("boom"))
+        }
+        /// Fails without a code, as async-graphql's own variable errors do.
+        async fn nocode(&self) -> async_graphql::Result<Option<i32>> {
+            Err("nocode".into())
+        }
+        async fn bang(&self) -> async_graphql::Result<i32> {
+            Err(coded("bang"))
+        }
+        async fn nul(&self) -> Option<Bad> {
+            Some(Bad)
+        }
+        async fn req(&self) -> Bad {
+            Bad
+        }
+        async fn list(&self) -> Vec<Bad> {
+            vec![Bad, Bad]
+        }
+        async fn optlist(&self) -> Option<Vec<Option<Bad>>> {
+            Some(vec![Some(Bad), Some(Bad)])
         }
         async fn inner(&self) -> Inner {
             nap(25).await;
@@ -523,14 +758,91 @@ mod tests {
         }
     }
 
-    /// When every root field fails async-graphql answers `data: null`; that stays as is (the
-    /// HTTP layer reads it as "nothing ran", e.g. a missing variable, as stock answers).
+    /// When every root field fails in a resolver, stock (graphql-js) answers an object with
+    /// each failed nullable root set to `null`; async-graphql alone answers `data: null`.
     #[tokio::test]
-    async fn only_failed_fields_keep_null_data() {
+    async fn only_failed_fields_answer_an_object_of_nulls() {
         let s = schema(true);
         let r = s.execute("{ boom w: boom }").await;
         assert_eq!(r.errors.len(), 2);
+        assert_eq!(
+            r.data.into_json().unwrap(),
+            serde_json::json!({"boom": null, "w": null})
+        );
+        // A failed non-null root nulls `data` itself (spec, graphql-js).
+        let r = s.execute("{ boom bang }").await;
+        assert_eq!(r.errors.len(), 2);
         assert_eq!(r.data.into_json().unwrap(), serde_json::Value::Null);
+        // An error without a code (nothing ran, as for a missing variable) keeps `data: null`.
+        let r = s.execute("{ boom nocode }").await;
+        assert_eq!(r.errors.len(), 2);
+        assert_eq!(r.data.into_json().unwrap(), serde_json::Value::Null);
+    }
+
+    async fn data(s: &Schema<Q, EmptyMutation, EmptySubscription>, q: &str) -> serde_json::Value {
+        let r = s.execute(q).await;
+        assert!(!r.errors.is_empty(), "{q}: expected errors");
+        r.data.into_json().unwrap()
+    }
+
+    /// A failed non-null field nulls its nearest nullable parent (spec "Handling Field
+    /// Errors", graphql-js `completeValue`); a nullable one is `null` in place.
+    #[tokio::test]
+    async fn non_null_failures_bubble_to_the_nearest_nullable_parent() {
+        use serde_json::json;
+        let s = schema(true);
+        for _ in 0..5 {
+            assert_eq!(
+                data(&s, "{ nul { ok p q } fast }").await,
+                json!({"nul": null, "fast": 3})
+            );
+            assert_eq!(
+                data(&s, "{ nul { ok p } }").await,
+                json!({"nul": {"ok": 1, "p": null}})
+            );
+            // Every member failed: the object is rebuilt, not left `null`.
+            assert_eq!(data(&s, "{ nul { p } }").await, json!({"nul": {"p": null}}));
+            // Through a non-null parent to the root.
+            assert_eq!(
+                data(&s, "{ req { q } fast }").await,
+                serde_json::Value::Null
+            );
+            // `[Bad!]!` item -> list -> root; `[Bad]` item alone.
+            assert_eq!(
+                data(&s, "{ list { q } fast }").await,
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                data(&s, "{ optlist { ok q } fast }").await,
+                json!({"optlist": [null, null], "fast": 3})
+            );
+            // A failed nullable field inside list items keeps the item.
+            assert_eq!(
+                data(&s, "{ list { ok p } }").await,
+                json!({"list": [{"ok": 1, "p": null}, {"ok": 1, "p": null}]})
+            );
+            // A non-null failure in one alias does not touch a sibling alias.
+            assert_eq!(
+                data(&s, "{ a: nul { q } b: nul { ok } }").await,
+                json!({"a": null, "b": {"ok": 1}})
+            );
+        }
+    }
+
+    /// An abstract type without `__typename`: the runtime type is inferred when only one
+    /// possible type's fields cover the object's keys (#57 M4).
+    #[tokio::test]
+    async fn union_without_typename_restores_failed_nullable() {
+        let s = schema(true);
+        let d = data(
+            &s,
+            "{ pets { ... on Cat { name mood } ... on Dog { barks } } }",
+        )
+        .await;
+        assert_eq!(
+            d,
+            serde_json::json!({"pets": [{"name": "c", "mood": null}, {"barks": true}]})
+        );
     }
 
     #[tokio::test]
