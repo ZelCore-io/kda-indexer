@@ -84,7 +84,13 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     let tips = kdx_api::TipWatch::default();
     let api = {
         let store = Arc::new(kdx_api::Store::open(hot.clone(), &data_dir)?);
-        let api = super::serve::api(cfg, store, tips.clone(), &data_dir)?
+        // Gap Q: rows the GraphQL miss read finds on the node are marked for the reconciler.
+        let (miss_tx, miss_rx) = kdx_ingest::miss_feed::channel();
+        kdx_ingest::miss_feed::spawn(ctx.clone(), miss_rx, token.clone());
+        let sink: kdx_graphql::miss::FoundSink = Arc::new(move |r: kdx_graphql::miss::FoundRow| {
+            let _ = miss_tx.try_send((r.account, r.module, r.chain, r.height));
+        });
+        let api = super::serve::api(cfg, store, tips.clone(), &data_dir, Some(sink))?
             .on_bound(|_| super::notify::ready("api bound, starting"));
         let binds = cfg.api.binds()?;
         let stop = token.clone();

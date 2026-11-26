@@ -1308,6 +1308,7 @@ mod canonical_tests {
                     feed: None,
                     search: None,
                     pact: None,
+                    miss: None,
                 })
                 .finish();
             let r = schema.execute("{ s { canonical } }").await;

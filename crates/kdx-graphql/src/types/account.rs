@@ -1,5 +1,8 @@
 //! Fungible accounts (GQ-14, Task 5), served from the reconciled `Balances`, `Guards` and
-//! `KeyAccounts` rows. Resolvers never call the node.
+//! `KeyAccounts` rows. `fungibleAccount`, `fungibleChainAccount(s)` and
+//! `FungibleAccount.chainAccounts` read the node once for an asked chain the store has no
+//! row for, as stock reads every chain live (gap Q, [`crate::miss`]); other resolvers never
+//! call the node.
 //!
 //! - Rows marked stale are served; a chain with no row (or a row the node reported absent)
 //!   is missing from `chainAccounts`; with no row on any chain the account is `null`. A row
@@ -118,11 +121,69 @@ pub fn chain_rows(
     Ok(out)
 }
 
-/// The rows `fungibleAccount` serves: `None` when the account has no stored row the node did
-/// not report absent (it does not exist on chain); otherwise every row at any balance.
-fn account_rows(view: &View, account: &str, module: &str) -> ApiResult<Option<Vec<ChainRow>>> {
-    let rows = chain_rows(view, account, module, None)?;
-    Ok((!rows.is_empty()).then_some(rows))
+/// Whether the store serves `module` at all: known to the dictionary and not marked not
+/// fungible. Only such a module's missed rows are read from the node (gap Q).
+fn servable(view: &View, module: &str) -> ApiResult<bool> {
+    match view.dict().find(DictKind::Module, module) {
+        Some(m) => Ok(!hidden(view, m)?),
+        None => Ok(false),
+    }
+}
+
+/// The stored rows of `(account, module)` on `chains` (all when `None`), and whether the
+/// module is [`servable`].
+fn stored_rows(
+    view: &View,
+    account: &str,
+    module: &str,
+    chains: Option<&[u8]>,
+) -> ApiResult<(Vec<ChainRow>, bool)> {
+    Ok((
+        chain_rows(view, account, module, chains)?,
+        servable(view, module)?,
+    ))
+}
+
+/// Gap Q: add the rows of the `asked` chains the store has none for, read from the node
+/// ([`crate::miss`]), in chain order. A failed or refused read adds nothing and flags the
+/// response (`nodeReadIncomplete`), as stock drops a chain whose read failed.
+async fn with_misses(
+    ctx: &Context<'_>,
+    account: &str,
+    module: &str,
+    servable: bool,
+    asked: &[u8],
+    rows: &mut Vec<ChainRow>,
+) {
+    let Some(miss) = gql(ctx).miss.as_ref().filter(|_| servable) else {
+        return;
+    };
+    let missing: Vec<u8> = asked
+        .iter()
+        .copied()
+        .filter(|c| !rows.iter().any(|r| r.chain == *c))
+        .collect();
+    let o = miss.read(ctx, account, module, &missing).await;
+    if o.incomplete {
+        crate::flags::mark(ctx, crate::flags::Flag::NodeReadIncomplete);
+    }
+    if o.found.is_empty() {
+        return;
+    }
+    for (chain, balance, guard) in o.found {
+        rows.push(ChainRow {
+            chain,
+            balance,
+            guard: map_guard(&guard, None),
+        });
+    }
+    rows.sort_by_key(|r| r.chain);
+}
+
+/// The chains `fungibleAccount` asks (stock: `0..20`).
+fn all_chains(ctx: &Context<'_>) -> Vec<u8> {
+    let n = gql(ctx).miss.as_ref().map_or(20, |m| m.settings().chains);
+    (0..n).collect()
 }
 
 /// `Block.minerAccount`, the `FungibleChainAccount` node and other single chain-account
@@ -550,15 +611,17 @@ pub async fn fungible_account(
     module: Option<&str>,
 ) -> Result<Option<FungibleAccount>> {
     let (account, module) = names(account, module)?;
-    let rows = gql(ctx)
+    let (mut rows, ok) = gql(ctx)
         .state()?
         .read({
             let (a, m) = (account.clone(), module.clone());
-            move |view| account_rows(view, &a, &m)
+            move |view| stored_rows(view, &a, &m, None)
         })
         .await
         .map_err(from_api)?;
-    Ok(rows.map(|rows| FungibleAccount {
+    with_misses(ctx, &account, &module, ok, &all_chains(ctx), &mut rows).await;
+    // No row on any chain (stored, or found by the node read): it does not exist on chain.
+    Ok((!rows.is_empty()).then_some(FungibleAccount {
         account,
         module,
         rows,
@@ -598,14 +661,16 @@ pub async fn fungible_chain_accounts(
         Some(ids) => Some(chain_list(ids)?),
     };
     let order = chains.clone();
-    let rows = gql(ctx)
+    let asked = chains.clone().unwrap_or_else(|| all_chains(ctx));
+    let (mut rows, ok) = gql(ctx)
         .state()?
         .read({
             let (a, m) = (account.clone(), module.clone());
-            move |view| chain_rows(view, &a, &m, chains.as_deref())
+            move |view| stored_rows(view, &a, &m, chains.as_deref())
         })
         .await
         .map_err(from_api)?;
+    with_misses(ctx, &account, &module, ok, &asked, &mut rows).await;
     // The rows come in the order of the asked chains (stock's order), each chain once.
     let rows = match order {
         None => rows,

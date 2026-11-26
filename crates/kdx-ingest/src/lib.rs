@@ -14,6 +14,7 @@ pub mod freezer;
 pub mod heartbeat;
 pub mod holders_fill;
 pub mod keylist;
+pub mod miss_feed;
 pub mod nft_details;
 pub mod nft_fill;
 pub mod pipeline;

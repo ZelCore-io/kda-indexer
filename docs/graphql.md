@@ -638,8 +638,27 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
 ## Accounts
 
 - `fungibleAccount`, `fungibleChainAccount(s)` and `…ByPublicKey` read the reconciled
-  balance rows (spec §3.9); resolvers never call the node. Stale rows are served; chains
-  without a row are absent from `chainAccounts`; with no row the account is `null`.
+  balance rows (spec §3.9). Stale rows are served; chains without a row are absent from
+  `chainAccounts`; with no row the account is `null`.
+- **Node read on a miss (gap Q).** Stock reads every chain of `fungibleAccount`,
+  `fungibleChainAccount(s)` and `FungibleAccount.chainAccounts` live from the node
+  (`(<module>.details "<account>")`), so it lists rows no index names, such as an account
+  created inside another module's code at balance 0. Ours answers from the store and, for
+  each asked chain with no row (or a row the node once reported absent), reads
+  `<module>.details` on the node once:
+  - found: the row is served as the reconciler stores it (the node's balance text and
+    guard), and in `run` it is marked dirty so the reconciler stores it;
+  - absent: no row; failure (timeout, transport, one of our limits): no row, as stock drops a
+    chain whose read failed, and the response carries `extensions.nodeReadIncomplete: true`.
+  Only an account-like name (3 to 256 characters) of a module the store knows and serves is
+  read. Limits (`[graphql.account_miss]`; stock has none): 40 reads per request across all
+  fields, aliases and batch operations; per client 20 reads/s, burst 60 (the API limiter's
+  keys); 16 in flight and 50/s across the process on a `/local` client of its own; 3 s per
+  read within the request deadline; a cache of 100,000 answers, found ones for 30 s and absent
+  ones for 600 s, keyed by the exact (account, module, chain). The code sent is fixed
+  (`(<module>.details (read-msg "a"))`, the account in `data`) to the configured node.
+  `…ByPublicKey`, `balance(...)` (the holders list), `node(id:)` and `Block.minerAccount`
+  stay store-only: stock's holders list has no such rows. `enabled = false` turns it off.
   `fungibleChainAccounts` with `chainIds` absent (also a declared variable sent without a
   value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
   with `chainIds` set the rows come in the order asked (each chain once), as stock lists them;
@@ -671,11 +690,15 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
     rows this rule keeps; the 4,096-row cap counts every stored row of the account, as before.
   Rows come from the reconciler's reads of the accounts ingest sees named: transfer sides,
   senders, signers, event principals, the D3 receivers, and since the zero-rows fix the
-  account a `coin.create-account` call creates (D3 rule 2c: the code literals, then the
-  `exec.data` strings, at most 64; never `result.data` or a keyset predicate). A store whose
-  D3 pass ran before that rule gets those rows from `reconcile-balances --rewalk coin`
+  account a `coin.create-account` call creates (D3 rule 2c). Rule 2c reads the first
+  argument of every `(coin.create-account ..)` call exactly from the parsed code (a string
+  literal, or `(read-msg k)` / `(read-string k)` of a data string), at most 1,000 per tx (the
+  bulk creators send 200 per tx; the gas limit bounds the count well below the cap), and
+  interns them at decode time so the tail marks them live; then, as before, the code literals
+  and `exec.data` strings, at most 64 (never `result.data` or a keyset predicate). A store
+  whose D3 pass ran before that rule gets those rows from `reconcile-balances --rewalk coin`
   ([operations.md](operations.md)). An account created inside another module's code, with
-  no event or exec string naming it, is still not seen.
+  no event or exec string naming it, is found by the node read on a miss above.
   Measured against stock (WP-L, post-#44 replays): stock's `fungibleAccount` lists every row
   the node holds, created-and-never-funded ones included; stock's `balance(...)` lists the
   zero rows a TRANSFER event touched (190 of 190) and none of the node's zero rows without

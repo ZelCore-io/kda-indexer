@@ -110,6 +110,7 @@ pub fn api(
     store: Arc<Store>,
     tips: TipWatch,
     data_dir: &Path,
+    miss_sink: Option<kdx_graphql::miss::FoundSink>,
 ) -> anyhow::Result<Api> {
     store.set_sender_index(cfg.graphql.sender_index);
     let settings = kdx_api::compat::SearchSettings {
@@ -138,9 +139,54 @@ pub fn api(
         api.state()
             .set_graphql_extra_deadline(p.settings().timeout + Duration::from_secs(1));
     }
-    let schema =
-        kdx_graphql::build_schema_full(Some(api.state()), gs, Some(feed), Some(search), pact);
+    let miss = miss_reader(cfg, &gs, miss_sink)?;
+    let schema = kdx_graphql::build_schema_with_miss(
+        Some(api.state()),
+        gs,
+        Some(feed),
+        Some(search),
+        pact,
+        miss,
+    );
     Ok(api.graphql_routes(kdx_graphql::router(schema)))
+}
+
+/// The node read on a missed account row (gap Q): its own `/local` client on `node.url` and
+/// `network`, with the reader's node rate and in-flight cap, so it neither shares nor drains
+/// ingest's or the reconciler's node budget. `sink` takes found rows (`run` only).
+fn miss_reader(
+    cfg: &Config,
+    gs: &kdx_graphql::GraphqlSettings,
+    sink: Option<kdx_graphql::miss::FoundSink>,
+) -> anyhow::Result<Option<Arc<kdx_graphql::miss::MissReader>>> {
+    let m = &cfg.graphql.account_miss;
+    if !m.enabled {
+        return Ok(None);
+    }
+    let mut c = cfg.clone();
+    c.ingest.max_rps = m.node_rps;
+    c.ingest.node_concurrency = m.max_in_flight.max(1) as usize;
+    c.node.timeout_ms = m.timeout_ms;
+    // The node is optional for `serve`: without a client the lookups answer from the store.
+    let node = match super::node_client(&c) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "graphql.account_miss: no node client, store answers only");
+            return Ok(None);
+        }
+    };
+    let local = Arc::new(kdx_node::LocalClient::new(
+        node,
+        kdx_node::LocalOpts {
+            rps: m.node_rps,
+            concurrency: m.max_in_flight.max(1) as usize,
+        },
+    ));
+    Ok(Some(Arc::new(kdx_graphql::miss::MissReader::new(
+        kdx_graphql::miss::MissReader::local_details(local),
+        sink,
+        m.settings(gs.pact.chains),
+    ))))
 }
 
 /// The `pactQuery` / `gasLimitEstimate` passthrough (B1): its own node client on `node.url`
@@ -192,7 +238,7 @@ pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {
     super::notify::spawn_api_heartbeat(token.clone());
     super::notify::spawn_status(token.clone(), || "serving (read-only)".into());
     tracing::info!(data_dir = %data_dir.display(), "serve: read-only API");
-    api(cfg, store, tips, &data_dir)?
+    api(cfg, store, tips, &data_dir, None)?
         .on_bound(|_| super::notify::ready("serving (read-only)"))
         .serve(cfg.api.binds()?, token)
         .await

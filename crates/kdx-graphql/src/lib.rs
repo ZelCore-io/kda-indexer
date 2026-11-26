@@ -23,6 +23,7 @@ pub mod http;
 pub mod ids;
 pub mod limits;
 pub mod loaders;
+pub mod miss;
 pub mod pact;
 pub mod scalars;
 pub mod schema;
@@ -167,6 +168,8 @@ pub struct Gql {
     /// The node `/local` passthrough; `None` answers `pactQuery` / `gasLimitEstimate`
     /// `NOT_SUPPORTED`.
     pub pact: Option<Arc<pact::PactPass>>,
+    /// The node read on a missed account row (gap Q); `None` answers from the store only.
+    pub miss: Option<Arc<miss::MissReader>>,
 }
 
 impl Gql {
@@ -219,7 +222,7 @@ pub fn build_schema(
     settings: GraphqlSettings,
     feed: Option<BlockFeed>,
 ) -> KdxSchema {
-    build(Some(state), settings, feed, None, None, false)
+    build(Some(state), settings, feed, None, None, None, false)
 }
 
 /// The schema over a store, with the P6 search context for `transactionsByPactCode`.
@@ -229,7 +232,7 @@ pub fn build_schema_with_search(
     feed: Option<BlockFeed>,
     search: Arc<kdx_api::search::SearchCtx>,
 ) -> KdxSchema {
-    build(Some(state), settings, feed, Some(search), None, false)
+    build(Some(state), settings, feed, Some(search), None, None, false)
 }
 
 /// The schema with no store (`graphql print-schema`).
@@ -242,16 +245,28 @@ pub fn build_schema_full(
     search: Option<Arc<kdx_api::search::SearchCtx>>,
     pact: Option<Arc<pact::PactPass>>,
 ) -> KdxSchema {
-    build(state, settings, feed, search, pact, false)
+    build(state, settings, feed, search, pact, None, false)
+}
+
+/// [`build_schema_full`] plus the node read on a missed account row (gap Q).
+pub fn build_schema_with_miss(
+    state: Option<Arc<ApiState>>,
+    settings: GraphqlSettings,
+    feed: Option<BlockFeed>,
+    search: Option<Arc<kdx_api::search::SearchCtx>>,
+    pact: Option<Arc<pact::PactPass>>,
+    miss: Option<Arc<miss::MissReader>>,
+) -> KdxSchema {
+    build(state, settings, feed, search, pact, miss, false)
 }
 
 pub fn build_schema_detached(settings: GraphqlSettings) -> KdxSchema {
-    build(None, settings, None, None, None, false)
+    build(None, settings, None, None, None, None, false)
 }
 
 /// The schema of `graphql check-ops`: validation and limits run, execution never does.
 pub fn build_schema_check(settings: GraphqlSettings) -> KdxSchema {
-    build(None, settings, None, None, None, true)
+    build(None, settings, None, None, None, None, true)
 }
 
 fn build(
@@ -260,6 +275,7 @@ fn build(
     feed: Option<BlockFeed>,
     search: Option<Arc<kdx_api::search::SearchCtx>>,
     pact: Option<Arc<pact::PactPass>>,
+    miss: Option<Arc<miss::MissReader>>,
     check_only: bool,
 ) -> KdxSchema {
     let introspection = settings.introspection;
@@ -277,6 +293,7 @@ fn build(
         feed,
         search,
         pact,
+        miss,
     })
     .extension(limits::Limits)
     .extension(flags::Flags)

@@ -416,6 +416,90 @@ pub struct GraphqlConfig {
     pub apq: bool,
     /// `[graphql.pact]`: the `pactQuery` / `gasLimitEstimate` node passthrough (B1).
     pub pact: PactConfig,
+    /// `[graphql.account_miss]`: the node read on a missed account row (gap Q).
+    pub account_miss: AccountMissConfig,
+}
+
+/// `[graphql.account_miss]`: `fungibleAccount`, `fungibleChainAccount(s)` and
+/// `FungibleAccount.chainAccounts` read `(<module>.details)` from the node (`node.url`) for an
+/// asked chain the store has no row for, as stock reads every chain (gap Q, owner decision
+/// 2026-11-26). Found rows are fed back to the reconciler in `run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AccountMissConfig {
+    /// On by default; off answers from the store only.
+    pub enabled: bool,
+    /// Node reads per request, all fields and aliases together (an account's 20 chains x 2).
+    pub max_reads_per_request: u32,
+    /// Per client (the API limiter's keys): reads per second (0 = no per-client limit) and
+    /// burst (at least 20: one account's chains).
+    pub per_ip_rps: u32,
+    pub per_ip_burst: u32,
+    /// Reads in flight across the process, and node calls per second across the process.
+    pub max_in_flight: u32,
+    pub node_rps: u32,
+    /// Per read, slot wait included.
+    pub timeout_ms: u64,
+    /// How long a found row and an absent answer are reused.
+    pub ttl_found_secs: u64,
+    pub ttl_absent_secs: u64,
+    /// Cached answers at most.
+    pub cache_entries: u32,
+}
+
+impl Default for AccountMissConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_reads_per_request: 40,
+            per_ip_rps: 20,
+            per_ip_burst: 60,
+            max_in_flight: 16,
+            node_rps: 50,
+            timeout_ms: 3_000,
+            ttl_found_secs: 30,
+            ttl_absent_secs: 600,
+            cache_entries: 100_000,
+        }
+    }
+}
+
+impl AccountMissConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=400).contains(&self.max_reads_per_request)
+                && (1..=256).contains(&self.max_in_flight)
+                && (1..=50).contains(&self.node_rps)
+                && (500..=30_000).contains(&self.timeout_ms)
+                && self.ttl_found_secs <= 3_600
+                && (1..=86_400).contains(&self.ttl_absent_secs)
+                && (1..=10_000_000).contains(&self.cache_entries),
+            "graphql.account_miss: max_reads_per_request 1..=400, max_in_flight 1..=256, \
+             node_rps 1..=50, timeout_ms 500..=30000, ttl_found_secs <= 3600, \
+             ttl_absent_secs 1..=86400, cache_entries 1..=10000000"
+        );
+        anyhow::ensure!(
+            self.per_ip_rps == 0 || self.per_ip_burst >= 20,
+            "graphql.account_miss.per_ip_burst must be at least 20 (or per_ip_rps 0)"
+        );
+        Ok(())
+    }
+
+    /// The reader's limits on a network of `chains` chains.
+    pub fn settings(&self, chains: u8) -> kdx_graphql::miss::MissSettings {
+        use std::time::Duration;
+        kdx_graphql::miss::MissSettings {
+            max_reads_per_request: self.max_reads_per_request as usize,
+            per_ip_rps: self.per_ip_rps,
+            per_ip_burst: self.per_ip_burst,
+            timeout: Duration::from_millis(self.timeout_ms),
+            ttl_found: Duration::from_secs(self.ttl_found_secs),
+            ttl_absent: Duration::from_secs(self.ttl_absent_secs),
+            cache_entries: self.cache_entries as usize,
+            max_in_flight: self.max_in_flight as usize,
+            chains,
+        }
+    }
 }
 
 /// `[graphql.pact]`: client Pact run through the node's `/local` (`node.url`, `network`),
@@ -539,6 +623,7 @@ impl Default for GraphqlConfig {
             network_host: String::new(),
             apq: false,
             pact: PactConfig::default(),
+            account_miss: AccountMissConfig::default(),
         }
     }
 }
@@ -589,6 +674,7 @@ impl GraphqlConfig {
             "graphql.network_host still holds a placeholder"
         );
         self.pact.validate()?;
+        self.account_miss.validate()?;
         Ok(())
     }
 

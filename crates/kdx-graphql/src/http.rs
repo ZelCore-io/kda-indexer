@@ -292,7 +292,8 @@ async fn execute(
     let mut batch = batch
         .data(ReqCtx { deadline })
         .data(crate::RequestRun(run.clone()))
-        .data(crate::pact::PactBudget::default());
+        .data(crate::pact::PactBudget::default())
+        .data(crate::miss::MissBudget::default());
     if let Some(p) = peer {
         batch = batch.data(crate::ClientIp(st.client_ip_of(p, headers)));
     }

@@ -292,7 +292,9 @@ The G4 replay of real traffic (below) met most of these classes again; its
 - Zero rows follow stock's two rules: `fungibleAccount` (and the chain account lists, the
   `…ByPublicKey` lists and the native balance routes) lists every row that exists on chain,
   at any balance; `balance(...)` lists rows above 0, plus zero rows a TRANSFER event touched
-  ([graphql.md](graphql.md#accounts)).
+  ([graphql.md](graphql.md#accounts)). A chain the store has no row for is read from the
+  node once, as stock reads every chain (gap Q), within our limits; a failed read leaves the
+  chain out, as stock does, and sets `extensions.nodeReadIncomplete`.
 - GraphQL `last`/`before` pages of `transactions(isCoinbase: true)` and of lists with no
   account, public key, event name or `fungibleName` argument (the height walk, `events(moduleName)` alone too) reach at most
   200,000 txs back from the newest row; past that ours answers `LIMIT` (the message names
