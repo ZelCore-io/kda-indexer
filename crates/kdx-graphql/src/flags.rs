@@ -9,6 +9,9 @@
 //! - `nodeReadIncomplete: true`: an account lookup's node read of a chain the store has no
 //!   row for failed or was refused by a limit (gap Q, `crate::miss`); that chain is left
 //!   out, as stock leaves out a chain whose node read failed.
+//! - `dexPairsCapped: true`: a DEX listing (`pools`, `dexMetrics`, `liquidityPositions`,
+//!   `tokenPrices`) had more listable pairs than `dexserve::MAX_PAIRS` and served the ones
+//!   with the largest coin reserve.
 //!
 //! One [`RespFlags`] per request (an extension instance is created per request), so the
 //! requests of a batch are flagged separately. Subscription events carry no flags.
@@ -27,6 +30,7 @@ pub struct RespFlags {
     search_truncated: AtomicBool,
     key_accounts_truncated: AtomicBool,
     node_read_incomplete: AtomicBool,
+    dex_pairs_capped: AtomicBool,
 }
 
 /// Which mark to set.
@@ -36,6 +40,8 @@ pub enum Flag {
     KeyAccountsTruncated,
     /// Gap Q: a missed account row's node read failed or was refused by a limit.
     NodeReadIncomplete,
+    /// A DEX listing served `dexserve::MAX_PAIRS` of more listable pairs.
+    DexPairsCapped,
 }
 
 impl RespFlags {
@@ -44,6 +50,7 @@ impl RespFlags {
             Flag::SearchTruncated => &self.search_truncated,
             Flag::KeyAccountsTruncated => &self.key_accounts_truncated,
             Flag::NodeReadIncomplete => &self.node_read_incomplete,
+            Flag::DexPairsCapped => &self.dex_pairs_capped,
         }
     }
     pub fn is_set(&self, f: Flag) -> bool {
@@ -96,6 +103,7 @@ impl Extension for FlagsExt {
             (Flag::SearchTruncated, "searchTruncated"),
             (Flag::KeyAccountsTruncated, "truncated"),
             (Flag::NodeReadIncomplete, "nodeReadIncomplete"),
+            (Flag::DexPairsCapped, "dexPairsCapped"),
         ] {
             if self.0.is_set(f) {
                 r.extensions.insert(name.to_owned(), Value::Boolean(true));

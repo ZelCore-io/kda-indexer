@@ -47,8 +47,8 @@
 //! `meta.creationTime` (block time when absent), as stored per event (`kdx_hot::dex`).
 //!
 //! Cost: nothing walks a pair's whole history. Listings read only coin pairs that were ever
-//! funded, filter them as listable and only then cap them, oldest first ([`MAX_PAIRS`],
-//! reported as a partial-data error when hit);
+//! funded, rank them by coin reserve, filter them as listable and only then cap them
+//! ([`MAX_PAIRS`], flagged `extensions.dexPairsCapped` when hit);
 //! `poolTransactions.totalCount` reads the stored per-kind counts; range reads seek by time
 //! ([`seek_time`]); a [`Budget`] of rows is checked as rows are read and against the request
 //! deadline in every loop; aggregates and price searches run on a heavy slot (resolvers).
@@ -70,15 +70,18 @@ use crate::scalars::{DateTime, Decimal};
 use crate::types::dex::*;
 
 pub const DEFAULT_PROTOCOL: &str = hd::SUSHI_EXCHANGE;
-/// Listable pairs one field serves, oldest `CREATE_PAIR` first; past it the field answers
-/// the first ones with a `dex_pairs` partial-data error ([`Budget::capped`]).
+/// Listable pairs one field serves, largest coin reserve first; past it the field answers
+/// those and flags the response `extensions.dexPairsCapped` ([`Budget::capped`]).
 pub const MAX_PAIRS: usize = 1_000;
 /// Rows one field reads (checked as rows are read, so it also bounds what a field holds).
 pub const MAX_ROWS: u64 = 250_000;
 /// The price path: at most 3 hops (stock's `findOptimalKdaPricePath` stops at path length 4).
 pub const MAX_HOPS: usize = 3;
-/// Pairs of one token a price search expands (oldest first), and tokens it visits.
+/// Pairs of one token a price search expands (largest own reserve first), and tokens it
+/// visits.
 pub const MAX_NEIGHBORS: usize = 256;
+/// Pairs of one token a price search reads to rank its neighbours.
+pub const MAX_RANKED_NEIGHBORS: usize = 4_096;
 pub const MAX_PRICE_TOKENS: usize = 2_048;
 /// Longest `dexMetrics` range.
 pub const MAX_METRIC_DAYS: u64 = 1_100;
@@ -92,8 +95,8 @@ pub struct Budget {
     dl: Instant,
     rows: u64,
     out: bool,
-    /// A listing had more than [`MAX_PAIRS`] listable pairs and served the oldest: the
-    /// resolver reports it (never a silent partial list).
+    /// A listing had more than [`MAX_PAIRS`] listable pairs and served the largest: the
+    /// resolver flags the response (never a silent partial list).
     pub capped: bool,
 }
 
@@ -114,6 +117,11 @@ impl Budget {
             self.out = true;
         }
         !self.out
+    }
+
+    /// Rows counted so far.
+    pub fn rows(&self) -> u64 {
+        self.rows
     }
 
     pub fn check(&self) -> ApiResult<()> {
@@ -229,21 +237,35 @@ pub fn pair_info(txn: &impl Txn, key: &str) -> ApiResult<Option<PairInfo>> {
 }
 
 /// Listable pairs (`PairStatus::listable`: created, not poisoned, a coin leg, non-zero
-/// reserves), oldest `CREATE_PAIR` first. Candidates are the coin pairs that were ever funded
-/// (`kdx_hot::dex::funded_pairs`), so pairs created and never funded are never read, and
-/// only listable pairs count toward [`MAX_PAIRS`]. The walk is bounded by the row budget and
-/// the deadline (an error when spent, never a partial list); past the cap the oldest pairs
-/// are served and [`Budget::capped`] is set.
+/// reserves), largest coin reserve first, then by pair key. Candidates are the coin pairs
+/// that were ever funded (`kdx_hot::dex::funded_pairs`): each costs its funded key and its
+/// latest `UPDATE` ([`hd::latest_reserves`]), so pairs created and never funded are never
+/// read, and about 80k funded pairs fit the row budget. Ranked by the coin reserve, the walk
+/// then reads full pair info until [`MAX_PAIRS`] listable pairs are kept, so dust-funded spam
+/// (however many, however old) ranks below real pools and only costs its two rows.
+/// [`Budget::capped`] is set only when another listable pair exists past the kept ones.
+/// Spent budget or deadline is an error, never a partial list.
+///
+/// Ranks are recomputed per request (as stock ranks its pools per request), so a cursor of a
+/// listing names a position in that request's order: a reserve change between two pages can
+/// move a pool across the page boundary.
 pub fn listable(txn: &impl Txn, b: &mut Budget) -> ApiResult<Vec<PairInfo>> {
-    let mut keys: Vec<String> = Vec::new();
+    let mut ranked: Vec<(Dec, String)> = Vec::new();
     let mut err = None;
     hd::funded_pairs(txn, |pair| {
-        // A status is three reads.
-        if !(b.tick() && b.tick() && b.tick()) {
+        // The funded key and the latest UPDATE.
+        if !(b.tick() && b.tick()) {
             return false;
         }
-        match hd::pair_status(txn, pair) {
-            Ok(st) if st.listable() => keys.push(pair.to_owned()),
+        match hd::latest_reserves(txn, pair) {
+            Ok(Some((r0, r1))) if !r0.is_zero() && !r1.is_zero() => {
+                let c = if pair.split(':').next() == Some("coin") {
+                    r0
+                } else {
+                    r1
+                };
+                ranked.push((Dec::from_amount(&c), pair.to_owned()));
+            }
             Ok(_) => {}
             Err(e) => {
                 err = Some(e);
@@ -257,27 +279,29 @@ pub fn listable(txn: &impl Txn, b: &mut Budget) -> ApiResult<Vec<PairInfo>> {
         return Err(api(e));
     }
     b.check()?;
-    let mut out = Vec::with_capacity(keys.len());
-    for k in keys {
-        b.tick();
-        b.tick();
-        if let Some(p) = pair_info(txn, &k)? {
-            out.push(p);
+    ranked.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+    let mut out = Vec::new();
+    for (_, k) in ranked {
+        // A pair's info: its status (three reads) and two time reads.
+        for _ in 0..5 {
+            b.tick();
         }
-    }
-    b.check()?;
-    out.sort_by(|x, y| {
-        x.created_us
-            .cmp(&y.created_us)
-            .then_with(|| x.key.cmp(&y.key))
-    });
-    if out.len() > MAX_PAIRS {
-        tracing::warn!(
-            listable = out.len(),
-            "dex: more listable pairs than the cap; the oldest are served"
-        );
-        out.truncate(MAX_PAIRS);
-        b.capped = true;
+        b.check()?;
+        let Some(p) = pair_info(txn, &k)? else {
+            continue;
+        };
+        if !p.status.listable() {
+            continue;
+        }
+        if out.len() == MAX_PAIRS {
+            tracing::warn!(
+                cap = MAX_PAIRS,
+                "dex: more listable pairs than the cap; the largest are served"
+            );
+            b.capped = true;
+            break;
+        }
+        out.push(p);
     }
     Ok(out)
 }
@@ -1406,8 +1430,10 @@ impl<T: Txn> PriceSearch<'_, T> {
     /// Stock's `findOptimalKdaPricePath`: BFS from `token`; at each token a direct `coin`
     /// pair gives the answer (0 when its reserves are zero or unknown, as stock), else the
     /// amount moves to each neighbour at the reserve ratio, at most [`MAX_HOPS`] hops out.
-    /// Neighbours come from the token index (oldest pair first, close to stock's id order);
-    /// at most [`MAX_NEIGHBORS`] per token and [`MAX_PRICE_TOKENS`] tokens are read.
+    /// Neighbours: up to [`MAX_RANKED_NEIGHBORS`] of the token's pairs from the token index,
+    /// ranked by the token's own reserve (largest first, then pair key); the top
+    /// [`MAX_NEIGHBORS`] are expanded, and at most [`MAX_PRICE_TOKENS`] tokens are visited.
+    /// (Stock walks its pairs in id order; ranking keeps dust spam from hiding real routes.)
     fn price_in_kda(&mut self, token: &str, b: &mut Budget) -> ApiResult<Option<Dec>> {
         if token == "coin" {
             return Ok(Some(Dec::int(1)));
@@ -1426,13 +1452,10 @@ impl<T: Txn> PriceSearch<'_, T> {
             if depth >= MAX_HOPS {
                 continue;
             }
-            let mut next = Vec::new();
             let mut names = HashSet::new();
             hd::token_pairs(self.txn, &t, |pair| {
-                if b.tick() && names.len() < MAX_NEIGHBORS {
-                    if names.insert(pair.to_owned()) {
-                        next.push(pair.to_owned());
-                    }
+                if b.tick() && names.len() < MAX_RANKED_NEIGHBORS {
+                    names.insert(pair.to_owned());
                     true
                 } else {
                     false
@@ -1440,7 +1463,29 @@ impl<T: Txn> PriceSearch<'_, T> {
             })
             .map_err(api)?;
             b.check()?;
-            for pair in next {
+            // Rank by this token's own reserve (one read each), so dust pairs spammed onto a
+            // token cannot crowd its real pairs out of the expansion; ties by pair key.
+            let mut ranked: Vec<(Dec, String)> = Vec::with_capacity(names.len());
+            for pair in names {
+                if !b.tick() {
+                    break;
+                }
+                let Some((r0, r1)) = hd::latest_reserves(self.txn, &pair).map_err(api)? else {
+                    continue;
+                };
+                let own = if pair.split(':').next() == Some(t.as_str()) {
+                    r0
+                } else {
+                    r1
+                };
+                if !own.is_zero() {
+                    ranked.push((Dec::from_amount(&own), pair));
+                }
+            }
+            b.check()?;
+            ranked.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+            ranked.truncate(MAX_NEIGHBORS);
+            for (_, pair) in ranked {
                 let Some(other) = pair.split(':').find(|x| *x != t).map(str::to_owned) else {
                     continue;
                 };

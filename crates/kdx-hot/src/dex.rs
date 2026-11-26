@@ -1193,7 +1193,11 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
 }
 
 /// Unwind of an unreadable `DexByTx` row (key `ev` = `k`): find its `DexEvents` rows by a
-/// full key walk (only a damaged store gets here), remove them and poison their pairs.
+/// full key walk (only a damaged store gets here), read each, remove it, take it out of its
+/// pair's event count and funded count (so a drained spam pair cannot stay a listing
+/// candidate), and poison its pair. A `DexEvents` row that cannot be read cannot be
+/// uncounted (its funded state is unknown); its pair is poisoned, so it is never listed or
+/// priced whatever its counts say.
 fn orphan_events(txn: &mut RwTxn<'_>, k: &[u8]) -> Result<()> {
     tracing::warn!(?k, "dex: unreadable DexByTx row removed");
     let Some(ev) = k.get(..10) else {
@@ -1207,6 +1211,7 @@ fn orphan_events(txn: &mut RwTxn<'_>, k: &[u8]) -> Result<()> {
         true
     })?;
     for ek in found {
+        let row = txn.get(Table::DexEvents, &ek)?;
         txn.del(Table::DexEvents, &ek)?;
         let Some(z) = ek.iter().position(|b| *b == 0) else {
             continue;
@@ -1214,6 +1219,16 @@ fn orphan_events(txn: &mut RwTxn<'_>, k: &[u8]) -> Result<()> {
         let Ok(pair) = std::str::from_utf8(&ek[..z]) else {
             continue;
         };
+        let kind = ek.get(z + 1).copied().and_then(Kind::from_u8);
+        if let Some(kind) = kind {
+            // Best effort: the pair is poisoned below whatever these return.
+            bump_count(txn, pair, kind, -1)?;
+        }
+        if let Some(Ok(e)) = row.as_deref().map(StoredEvent::decode) {
+            if Some(e.kind) == kind {
+                bump_funded(txn, pair, &e, -1)?;
+            }
+        }
         if ek.get(z + 1) == Some(&(Kind::CreatePair as u8)) {
             let mut pk = ek[..=z].to_vec();
             pk.extend_from_slice(ev);
@@ -1266,21 +1281,29 @@ pub fn pair_status(txn: &impl Txn, pair: &str) -> Result<PairStatus> {
     let created = !txn
         .scan_limit(Table::DexPairs, &p, 1, |k| k.starts_with(&p))?
         .is_empty();
-    let reserves = match txn
-        .scan_rev_prefix(Table::DexEvents, &event_prefix(pair, Kind::Update), &[])?
-        .next()
-    {
-        Some(row) => StoredEvent::decode(&row?.1)
-            .ok()
-            .and_then(|e| Some((e.amount(0)?, e.amount(1)?))),
-        None => None,
-    };
     Ok(PairStatus {
         created,
         poisoned: poisoned(txn, pair)?,
         coin_leg: pair.split(':').any(|t| t == "coin"),
-        reserves,
+        reserves: latest_reserves(txn, pair)?,
     })
+}
+
+/// The reserves of a pair's latest stored `UPDATE`, oriented to the pair (one read; `None`
+/// when there is none or it is unreadable). Listings rank funded pairs by it without reading
+/// the rest of [`pair_status`].
+pub fn latest_reserves(txn: &impl Txn, pair: &str) -> Result<Option<(Amount, Amount)>> {
+    Ok(
+        match txn
+            .scan_rev_prefix(Table::DexEvents, &event_prefix(pair, Kind::Update), &[])?
+            .next()
+        {
+            Some(row) => StoredEvent::decode(&row?.1)
+                .ok()
+                .and_then(|e| Some((e.amount(0)?, e.amount(1)?))),
+            None => None,
+        },
+    )
 }
 
 /// Tables this module writes (the serving part also reads `DexUsd`).

@@ -19,45 +19,48 @@ fn now_secs() -> u64 {
 }
 
 /// Run `f` on a read slot (`heavy`: a heavy slot, for aggregates over many rows) with the
-/// request's deadline as its budget.
+/// request's deadline as its budget. `NOT_AVAILABLE` until the DEX history fill has finished
+/// (`kdx_hot::dex::meta::DEX_FILLED`): before it the ledger holds only part of the history,
+/// so every DEX answer would be silently wrong (as holders and the row counts answer
+/// `NOT_AVAILABLE` until ready). A listing cut at [`ds::MAX_PAIRS`] flags the response
+/// `extensions.dexPairsCapped`.
 async fn run<T, F>(ctx: &Context<'_>, heavy: bool, f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&View, &mut Budget) -> ApiResult<T> + Send + 'static,
 {
+    use kdx_hot::Txn;
     let dl = crate::deadline(ctx);
     let st = crate::gql(ctx).state()?;
-    let go = move |view: &View| -> ApiResult<(T, bool)> {
+    let go = move |view: &View| -> ApiResult<Option<(T, bool)>> {
         view.check_deadline()?;
+        if view
+            .txn
+            .meta(kdx_hot::dex::meta::DEX_FILLED)
+            .map_err(|e| kdx_api::ApiError::Unavailable(format!("{e:#}")))?
+            .is_none()
+        {
+            return Ok(None);
+        }
         let mut b = Budget::new(dl);
         let t = f(view, &mut b)?;
-        Ok((t, b.capped))
+        Ok(Some((t, b.capped)))
     };
     let r = if heavy {
         st.read_heavy(go).await
     } else {
         st.read(go).await
     };
-    let (t, capped) = r.map_err(crate::error::from_api)?;
+    let Some((t, capped)) = r.map_err(crate::error::from_api)? else {
+        return Err(crate::error::err(
+            crate::error::Code::NotAvailable,
+            "the DEX history is being filled; DEX fields answer once it is done",
+        ));
+    };
     if capped {
-        ctx.add_error(ctx.set_error_path(pairs_cut().into_server_error(ctx.item.pos)));
+        crate::flags::mark(ctx, crate::flags::Flag::DexPairsCapped);
     }
     Ok(t)
-}
-
-/// The partial-data error of a DEX listing cut at [`ds::MAX_PAIRS`] listable pairs (the
-/// oldest are served): `LIMIT`, `extensions.limit = "dex_pairs"`.
-pub fn pairs_cut() -> async_graphql::Error {
-    use async_graphql::ErrorExtensions;
-    kdx_metrics::get().graphql_rejected("dex_pairs");
-    crate::error::err(
-        crate::error::Code::Limit,
-        format!(
-            "DEX pairs cut at {}: more pairs are listable; the oldest are served",
-            ds::MAX_PAIRS
-        ),
-    )
-    .extend_with(|_, e| e.set("limit", "dex_pairs"))
 }
 
 fn protocol(p: Option<String>) -> String {

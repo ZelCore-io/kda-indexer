@@ -102,6 +102,12 @@ impl W<'_> {
     }
 }
 
+/// Mark the DEX history fill finished (the DEX fields answer `NOT_AVAILABLE` before it).
+fn mark_filled(txn: &mut kdx_hot::RwTxn<'_>) {
+    txn.set_meta(hd::meta::DEX_FILLED, &1u32.to_be_bytes())
+        .unwrap();
+}
+
 /// Two listable pools (`coin:kaddex.kdx` small, `coin:free.maga` large), a pair with no coin
 /// leg, a pair with no reserves, and a poisoned pair. KDA/USD 0.005 from yesterday on.
 fn fixture(hot: &HotStore) -> u64 {
@@ -146,6 +152,7 @@ fn fixture(hot: &HotStore) -> u64 {
     w.txn
         .put(Table::DexAgg, &hd::poison_key("coin:free.bad"), &[])
         .unwrap();
+    mark_filled(&mut w.txn);
     for h in (y / 3600)..=(now() / 3600) {
         kdx_hot::dex_usd::put(&mut w.txn, h as u32, &Amount::parse("0.005").unwrap()).unwrap();
     }
@@ -165,16 +172,14 @@ fn shape(v: &Value) -> Value {
     }
 }
 
-/// `ours` has stock's shape wherever both hold a value (an empty list matches any list).
+/// `ours` has stock's shape wherever both hold a value (an empty list matches any list),
+/// with stock's member order (the server writes selection order, PR #57).
 fn same_shape(ours: &Value, stock: &Value, at: &str) {
     match (ours, stock) {
         (Value::Object(a), Value::Object(b)) => {
-            // As sets: JSON member order carries no meaning.
-            let mut ka: Vec<_> = a.keys().collect();
-            let mut kb: Vec<_> = b.keys().collect();
-            ka.sort();
-            kb.sort();
-            assert_eq!(ka, kb, "{at}: keys");
+            let ka: Vec<_> = a.keys().collect();
+            let kb: Vec<_> = b.keys().collect();
+            assert_eq!(ka, kb, "{at}: keys (in order)");
             for (k, v) in a {
                 // Stock's DB row id; ours is null (not reproducible, divergence 11).
                 if k == "transactionId" && v.is_null() {
@@ -488,7 +493,10 @@ async fn long_ranges_stop_at_the_deadline() {
 #[tokio::test]
 async fn dex_metrics_dates() {
     let d = tempfile::tempdir().unwrap();
-    let (_hot, st) = state(&d);
+    let (hot, st) = state(&d);
+    let mut w = hot.rw().unwrap();
+    mark_filled(&mut w);
+    w.commit().unwrap();
     for ok in [
         "2026-11-01T00:00:00Z",
         "2026-11-01T00:00:00.123Z",
@@ -521,8 +529,9 @@ async fn dex_metrics_dates() {
 }
 
 /// I1: junk pairs (no coin leg, or a coin leg without reserves) whose names sort before
-/// `coin`, and more listable spam pairs than the cap created after the real pools, leave
-/// every real pool served (the listable filter runs before the cap, oldest first).
+/// `coin`, and more listable spam pairs than the cap, leave every real pool served (ranked
+/// by coin reserve, the listable filter runs before the cap); the cut is flagged
+/// `extensions.dexPairsCapped`, not an error.
 #[tokio::test]
 async fn spam_pairs_never_crowd_out_real_pools() {
     let d = tempfile::tempdir().unwrap();
@@ -543,17 +552,14 @@ async fn spam_pairs_never_crowd_out_real_pools() {
         w.pair(&format!("a.s{i:05}:coin"), today + 5, "1", "1");
     }
     w.txn.commit().unwrap();
-    // Past the cap the oldest pools are served, with a `dex_pairs` partial-data error.
+    // Past the cap the largest pools are served and the response is flagged.
     let (_, full) = query(
         &st,
         "{ pools(first: 1000) { totalCount edges { node { key } } } }",
     )
     .await;
-    assert_eq!(
-        full["errors"][0]["extensions"]["limit"], "dex_pairs",
-        "{}",
-        full["errors"]
-    );
+    assert!(full.get("errors").is_none(), "{}", full["errors"]);
+    assert_eq!(full["extensions"]["dexPairsCapped"], true, "{full:.200}");
     let v = full["data"].clone();
     assert_eq!(
         v["pools"]["totalCount"],
@@ -578,7 +584,11 @@ async fn spam_pairs_never_crowd_out_real_pools() {
     assert_ne!(t["tokenPrice"]["priceInKda"], 0, "{t}");
     let (_, m) = query(&st, "{ dexMetrics { totalPools } }").await;
     assert_eq!(m["data"]["dexMetrics"]["totalPools"], dexserve::MAX_PAIRS);
-    assert_eq!(m["errors"][0]["extensions"]["limit"], "dex_pairs");
+    assert!(m.get("errors").is_none(), "{m}");
+    assert_eq!(m["extensions"]["dexPairsCapped"], true);
+    // Not capped: no flag.
+    let (_, one) = query(&st, "{ pool(id: \"x\") { id } }").await;
+    assert!(one["extensions"].get("dexPairsCapped").is_none(), "{one}");
 }
 
 /// 20,000 spam coin pairs (no reserves, or funded and drained) created before a new real
@@ -603,6 +613,15 @@ async fn unfunded_spam_never_uses_the_cap() {
     }
     w.pair("coin:free.new", today + 30, "7", "70");
     w.txn.commit().unwrap();
+    // The 20,000 unfunded pairs are never read: two rows per funded pair (4 fixture pairs,
+    // 50 drained, the new one), five per kept pool.
+    let ro = hot.ro().unwrap();
+    let mut b = Budget::new(Instant::now() + Duration::from_secs(30));
+    let got = dexserve::listable(&ro, &mut b).unwrap();
+    assert_eq!(got.len(), 3);
+    assert!(!b.capped);
+    assert!(b.rows() <= 2 * 55 + 5 * 4, "{} rows", b.rows());
+    drop(ro);
     let v = data(
         &st,
         "{ pools(first: 100) { totalCount edges { node { key } } } }",
@@ -616,6 +635,124 @@ async fn unfunded_spam_never_uses_the_cap() {
         .map(|e| e["node"]["key"].as_str().unwrap())
         .collect();
     assert!(keys.contains(&"coin:free.new"), "{keys:?}");
+}
+
+/// I1 residual: 1,500 dust-funded coin pairs created before three real pools (a few KDA of
+/// gas each on chain) never hide them: ranked by coin reserve, the real pools come first,
+/// no error, and the rows read stay bounded.
+#[tokio::test]
+async fn dust_pairs_rank_below_real_pools() {
+    let d = tempfile::tempdir().unwrap();
+    let (hot, st) = state(&d);
+    let mut w = W {
+        txn: hot.rw().unwrap(),
+        pos: 0,
+    };
+    let t0 = now() - 10 * DAY;
+    for i in 0..1_500 {
+        w.pair(&format!("a.dust{i:04}:coin"), t0, "1000000", "0.000001");
+    }
+    for (i, r) in ["40", "300", "2000"].iter().enumerate() {
+        w.pair(&format!("coin:free.real{i}"), t0 + DAY, r, "1000");
+    }
+    for h in (t0 / 3600)..=(now() / 3600) {
+        kdx_hot::dex_usd::put(&mut w.txn, h as u32, &Amount::parse("0.005").unwrap()).unwrap();
+    }
+    mark_filled(&mut w.txn);
+    w.txn.commit().unwrap();
+    let ro = hot.ro().unwrap();
+    let mut b = Budget::new(Instant::now() + Duration::from_secs(30));
+    let got = dexserve::listable(&ro, &mut b).unwrap();
+    let keys: Vec<&str> = got.iter().map(|p| p.key.as_str()).collect();
+    assert_eq!(
+        &keys[..3],
+        ["coin:free.real2", "coin:free.real1", "coin:free.real0"]
+    );
+    assert_eq!(got.len(), dexserve::MAX_PAIRS);
+    assert!(b.capped);
+    // Two rows per funded pair, five per pair read in full (the kept ones and one past).
+    assert!(
+        b.rows() <= 2 * 1_503 + 5 * (dexserve::MAX_PAIRS as u64 + 1),
+        "{} rows",
+        b.rows()
+    );
+    // Dust ties (equal coin reserve) break by pair key.
+    assert_eq!(keys[3], "a.dust0000:coin");
+    drop(ro);
+    let (_, v) = query(
+        &st,
+        "{ pools(first: 3, orderBy: TVL_USD_DESC) { edges { node { key } } } }",
+    )
+    .await;
+    assert!(v.get("errors").is_none(), "{v}");
+    assert_eq!(v["extensions"]["dexPairsCapped"], true);
+    assert_eq!(
+        v["data"]["pools"]["edges"][0]["node"]["key"],
+        "coin:free.real2"
+    );
+}
+
+/// A price search ranks a token's pairs by the token's own reserve: 300 dust pairs created
+/// before the token's one real route (more than the 256 expanded) do not hide it.
+#[tokio::test]
+async fn price_search_expands_the_largest_pairs() {
+    let d = tempfile::tempdir().unwrap();
+    let (hot, st) = state(&d);
+    let mut w = W {
+        txn: hot.rw().unwrap(),
+        pos: 0,
+    };
+    let t0 = now() - DAY;
+    for i in 0..300 {
+        w.pair(&format!("a.j{i:03}:free.x"), t0, "1", "0.000001");
+    }
+    w.pair("free.x:free.y", t0 + 60, "10", "10");
+    w.pair("coin:free.y", t0 + 60, "5", "50");
+    // Stock answers 0 without a KDA/USD rate.
+    kdx_hot::dex_usd::put(
+        &mut w.txn,
+        (now() / 3600) as u32,
+        &Amount::parse("0.005").unwrap(),
+    )
+    .unwrap();
+    mark_filled(&mut w.txn);
+    w.txn.commit().unwrap();
+    let v = data(
+        &st,
+        "{ tokenPrice(tokenAddress: \"free.x\") { priceInKda } }",
+    )
+    .await;
+    let p = v["tokenPrice"]["priceInKda"].to_string();
+    assert!(p.trim_matches('"').starts_with("0.1"), "{v}");
+}
+
+/// Before the DEX history fill has finished every DEX field answers `NOT_AVAILABLE`.
+#[tokio::test]
+async fn dex_fields_wait_for_the_fill() {
+    let d = tempfile::tempdir().unwrap();
+    let (hot, st) = state(&d);
+    let mut w = W {
+        txn: hot.rw().unwrap(),
+        pos: 0,
+    };
+    w.pair("coin:free.early", now() - DAY, "5", "5");
+    w.txn.commit().unwrap();
+    for q in [
+        "{ pools { totalCount } }",
+        "{ dexMetrics { totalPools } }",
+        "{ tokenPrice(tokenAddress: \"free.early\") { priceInKda } }",
+    ] {
+        let (_, v) = query(&st, q).await;
+        assert_eq!(
+            v["errors"][0]["extensions"]["code"], "NOT_AVAILABLE",
+            "{q}: {v}"
+        );
+    }
+    let mut w = hot.rw().unwrap();
+    mark_filled(&mut w);
+    w.commit().unwrap();
+    let v = data(&st, "{ pools { totalCount } }").await;
+    assert_eq!(v["pools"]["totalCount"], 1);
 }
 
 /// I2: a pair with a history larger than the row budget answers a one-day `dexMetrics`,

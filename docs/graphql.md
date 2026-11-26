@@ -911,14 +911,19 @@ as they are read), checks the request deadline inside every loop, and the aggreg
 price searches run on a heavy slot. No request walks a pair's whole history:
 `poolTransactions.totalCount` comes from per-pair, per-kind counts kept at ingest, and range
 reads seek to the range (block times rise with height). A listing reads only `coin` pairs that
-were ever funded (a non-zero `UPDATE`, counted at ingest and exact under unwind), filters them
-as listable and only then caps them at 1,000 pools, oldest `CREATE_PAIR` first, so pairs that
-were never funded cost nothing and cannot push real pools out. Past the cap the field answers
-the oldest pools with a partial-data error (`LIMIT`, `extensions.limit = "dex_pairs"`); a
-listing that runs out of rows or time fails with the deadline error, never a silent partial
-list. Token prices follow stock's path
-search with its 3-hop limit (a direct `coin` pair with zero reserves prices at 0, as stock),
-reading at most 256 pairs per token and 2,048 tokens. `dexMetrics` ranges are capped at
+were ever funded (a non-zero `UPDATE`, counted at ingest and exact under unwind), two rows
+each (the funded mark and the latest `UPDATE`), ranks them by their `coin` reserve (largest
+first, then pair key), filters them as listable and only then caps them at 1,000 pools. Pairs
+that were never funded cost nothing, and dust-funded spam ranks below real pools however
+many or old. Past the cap the field answers the 1,000 largest pools and the response carries
+`"extensions": {"dexPairsCapped": true}`; a listing that runs out of rows or time fails with
+the deadline error, never a silent partial list. Ranks are recomputed per request, as stock
+ranks per request, so a reserve change between two pages can move a pool across the page
+boundary. Token prices follow stock's path search with its 3-hop limit (a direct `coin` pair
+is checked first at each token; with zero reserves it prices at 0, as stock), reading up to
+4,096 pairs per token, ranked by that token's own reserve, expanding the top 256 and
+visiting at most 2,048 tokens. Every DEX field answers `NOT_AVAILABLE` until the DEX history
+fill has finished. `dexMetrics` ranges are capped at
 1,100 days.
 
 ### Token price

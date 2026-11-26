@@ -273,6 +273,19 @@ impl Guard {
         self.anchor = Some((p, f, at));
     }
 
+    /// Seed after a restart from the newest stored rate `p`, of hour `hour`: it is the
+    /// anchor (set at the hour's start), and every answer whose `Time` could have been
+    /// accepted before the restart counts as already seen. An answer accepted in that hour
+    /// had `Time` ≤ its poll time + [`MAX_AHEAD_SECS`] < `(hour + 1) * 3600 +
+    /// MAX_AHEAD_SECS`, so that is the last accepted time: a replayed pre-restart answer is
+    /// refused. The cost: the rest of that hour (plus [`MAX_AHEAD_SECS`]) refuses fresh
+    /// answers too, so the hour keeps its pre-restart rate.
+    pub fn seed_restart(&mut self, p: Amount, hour: u32) {
+        let start = u64::from(hour) * 3600;
+        self.seed(p, start);
+        self.last_time = Some(start + 3600 + MAX_AHEAD_SECS);
+    }
+
     /// Accept `q` at `now` unless its `Time` is stale, ahead of `now` or not newer than the
     /// last accepted one, or its price is more than `max_jump_pct` from the anchor and fewer
     /// than `confirm_polls` polls in a row (each within the band of the first) agree.
@@ -345,8 +358,9 @@ pub fn store(hot: &HotStore, secs: u64, rate: &Amount) -> anyhow::Result<()> {
     w.commit()
 }
 
-/// The poll loop (until `stop`). Seeds the guard with the newest stored rate so a restart
-/// does not accept a poisoned first answer.
+/// The poll loop (until `stop`). Seeds the guard with the newest stored rate
+/// ([`Guard::seed_restart`]) so a restart neither accepts a poisoned first answer nor a
+/// replay of one accepted before it.
 pub async fn run(hot: Arc<HotStore>, s: DiaSettings, stop: CancellationToken) {
     let c = match client(&s) {
         Ok(c) => c,
@@ -358,7 +372,7 @@ pub async fn run(hot: Arc<HotStore>, s: DiaSettings, stop: CancellationToken) {
     let mut guard = Guard::default();
     let mut good_at: Option<u64> = None;
     if let Ok(Ok(Some((hour, r)))) = hot.ro().map(|t| kdx_hot::dex_usd::latest(&t)) {
-        guard.seed(r, u64::from(hour) * 3600);
+        guard.seed_restart(r, hour);
         good_at = Some(u64::from(hour) * 3600);
     }
     let mut tick = tokio::time::interval(s.interval.max(Duration::from_secs(1)));
@@ -602,6 +616,27 @@ mod tests {
             rfc3339_secs("2026-11-26T12:57:42Z")
         );
         assert_eq!(rfc3339_secs("2000-03-01T00:00:00Z"), Some(951_868_800));
+    }
+
+    /// After a restart, an answer the previous run could have accepted in the stored hour
+    /// is a replay; one past that hour (+ the ahead allowance) is taken.
+    #[test]
+    fn restart_refuses_a_replay_of_the_stored_hour() {
+        let st = DiaSettings::default();
+        let hour: u32 = 497_222;
+        let start = u64::from(hour) * 3600;
+        let mut g = Guard::default();
+        g.seed_restart(Amount::parse("0.005").unwrap(), hour);
+        assert_eq!(g.anchor().unwrap().to_text(), "0.005");
+        let now = start + 3_000;
+        for t in [start + 10, now, now + MAX_AHEAD_SECS] {
+            assert!(
+                matches!(g.check(q("0.005", t), now, &st), Err(PollError::Replay(_))),
+                "{t}"
+            );
+        }
+        let later = start + 3600 + MAX_AHEAD_SECS + 1;
+        assert!(g.check(q("0.005", later), later, &st).is_ok());
     }
 
     #[test]

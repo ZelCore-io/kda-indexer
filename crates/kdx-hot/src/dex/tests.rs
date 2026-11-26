@@ -1273,3 +1273,54 @@ fn counts_index_and_layout() {
         "USD rates kept"
     );
 }
+
+/// Unwind of an unreadable `DexByTx` row reads each orphaned `DexEvents` row before removing
+/// it and takes it out of the pair's event and funded counts (the pair is poisoned).
+#[test]
+fn orphaned_events_are_uncounted() {
+    let (_d, hot) = store();
+    let pair = "coin:free.orph";
+    let key = TxKey::new(H, SUSHI_CHAIN, 1);
+    let ev = |kind, fields: &[&str]| DexEvent {
+        kind,
+        pair: pair.into(),
+        fields: fields.iter().map(|s| s.to_string()).collect(),
+    };
+    let mut txn = hot.rw().unwrap();
+    store_event(
+        &mut txn,
+        key,
+        0,
+        HOUR,
+        0,
+        &ev(Kind::CreatePair, &[pair, "acct"]),
+    )
+    .unwrap();
+    store_event(&mut txn, key, 1, HOUR, 0, &ev(Kind::Update, &["5", "5"])).unwrap();
+    store_event(
+        &mut txn,
+        key,
+        2,
+        HOUR,
+        0,
+        &ev(Kind::Swap, &["bob", "bob", "1", "0", "0", "1"]),
+    )
+    .unwrap();
+    assert_eq!(event_count(&txn, pair, Kind::Swap).unwrap(), Some(1));
+    assert!(txn.get(Table::DexAgg, &funded_key(pair)).unwrap().is_some());
+    // Damage the `DexByTx` rows of the UPDATE and the SWAP (unknown kind byte).
+    for idx in [1u16, 2] {
+        txn.put(Table::DexByTx, &ev_key(key, idx), &[0xff]).unwrap();
+    }
+    assert_eq!(undo_block(&mut txn, SUSHI_CHAIN, H).unwrap(), 3);
+    assert_eq!(event_count(&txn, pair, Kind::Swap).unwrap(), Some(0));
+    assert!(txn.get(Table::DexAgg, &funded_key(pair)).unwrap().is_none());
+    assert!(poisoned(&txn, pair).unwrap());
+    let mut left = 0;
+    txn.walk_keys(Table::DexEvents, &[], |_| {
+        left += 1;
+        true
+    })
+    .unwrap();
+    assert_eq!(left, 0);
+}
