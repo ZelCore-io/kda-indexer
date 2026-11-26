@@ -11,6 +11,7 @@ use crate::dict::HotDict;
 use crate::env::{RwTxn, Txn};
 use crate::nft;
 use crate::prices;
+use crate::rowcount;
 use crate::tables::{block_key, parse_block_key, posting_key, Table};
 use crate::undo::{self, UndoOp};
 
@@ -82,6 +83,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         encode_tx(r, &mut buf);
         txn.put(Table::TailTxs, &k, &buf)?;
         ops.push(UndoOp::Tx(r.key));
+        // PR #48: the stored list counts (undone from the record, no undo op).
+        rowcount::add_tx(txn, r, &*dict, 1)?;
         if let Some(rk) = &r.request_key {
             // A request key already present (same tx on another fork, not yet unwound) is
             // left to its owner; only rows this block created are undone.
@@ -277,7 +280,13 @@ fn undo_d3(txn: &mut RwTxn<'_>, chain: u8, height: u32, coin: Option<u32>) -> Re
 }
 
 /// `coin`: the `coin` ModuleId for the balance dirty marks of undone `acct` postings (B-3).
-fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
+/// `dict`: names for re-rendering an undone record's row counts (`rowcount.rs`).
+fn undo_op(
+    txn: &mut RwTxn<'_>,
+    op: &UndoOp,
+    coin: Option<u32>,
+    dict: &dyn kdx_types::Dict,
+) -> Result<()> {
     match op {
         UndoOp::Header {
             chain,
@@ -290,6 +299,12 @@ fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
         UndoOp::Tx(k) => {
             // Plan Task 11: rows this tx's NFT events touched are re-read from the node.
             nft::mark_tx_dirty(txn, *k)?;
+            // PR #48: subtract the row counts `apply` added, recomputed from the record (its
+            // postings were undone just before; the record is still here).
+            if let Some(v) = txn.get(Table::TailTxs, &k.to_be_bytes())? {
+                let r = kdx_types::record::decode_tx(&v).context("hot tx record")?;
+                rowcount::add_tx(txn, &r, dict, -1)?;
+            }
             txn.del(Table::TailTxs, &k.to_be_bytes())?;
         }
         UndoOp::Rk(h) => {
@@ -329,6 +344,18 @@ fn undo_op(txn: &mut RwTxn<'_>, op: &UndoOp, coin: Option<u32>) -> Result<()> {
 /// to (height, hash) when that header is in the hot store, otherwise it is cleared and the
 /// caller sets it (for example at the frozen frontier). Returns the number of blocks undone.
 pub fn unwind_to(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
+    let dict = HotDict::load(&*txn)?;
+    unwind_to_with(txn, chain, height, &dict)
+}
+
+/// [`unwind_to`] with the caller's dictionary (the tail holds one; loading it per reorg would
+/// read every name). It must know every name the undone records use.
+pub fn unwind_to_with(
+    txn: &mut RwTxn<'_>,
+    chain: u8,
+    height: u32,
+    dict: &dyn kdx_types::Dict,
+) -> Result<u32> {
     let from = match height.checked_add(1) {
         Some(h) => block_key(chain, h),
         None => return Ok(0),
@@ -340,7 +367,7 @@ pub fn unwind_to(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
         let (_, h) = parse_block_key(k).context("bad Undo key")?;
         let ops = undo::decode(v).with_context(|| format!("Undo chain {chain} height {h}"))?;
         for op in ops.iter().rev() {
-            undo_op(txn, op, coin)?;
+            undo_op(txn, op, coin, dict)?;
         }
         txn.del(Table::Undo, k)?;
         undo_d3(txn, chain, h, coin)?;

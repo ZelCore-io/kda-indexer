@@ -157,6 +157,8 @@ pub fn drop_family(txn: &mut RwTxn<'_>, family: Family) -> Result<DropStats> {
         );
     }
     let f = family as u8;
+    // Postings removed outside the tail: readers walk until `reconcile-counts` (PR #48).
+    crate::rowcount::clear_ready(txn)?;
     let mut st = DropStats::default();
     loop {
         let rows = txn.scan_limit(Table::TailPostings, &[f], CHUNK, |k| k.first() == Some(&f))?;
