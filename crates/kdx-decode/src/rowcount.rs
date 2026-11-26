@@ -16,7 +16,7 @@
 //! The one input the record lacks is the block's miner account (an `acct` posting of the
 //! coinbase); the coinbase's own `coin.TRANSFER` names the miner, so no row is lost.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use kdx_types::record::TxRecord;
 use kdx_types::{Dict, DictKind};
@@ -26,7 +26,7 @@ use crate::build::{account_ok, event_accounts, parse_event, transfer_accounts};
 use crate::index::xfer_entity;
 use crate::json::parse_untrusted;
 use crate::render::{render_output, RenderError};
-use crate::rows::{events, transfers};
+use crate::rows::{events, transfers, Ev, Transfer};
 
 /// What a stored count counts. The discriminant is the first key byte of `RowCounts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -157,13 +157,13 @@ pub fn tx_counts(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<RowTerm>, RenderEr
             });
         }
     };
-    let side = |a: &str, x: &crate::rows::Transfer| x.from == a || x.to == a;
+    let per = RowsPerName::of(&evs, &trs);
     for a in &acct {
         if let Some(id) = dict.find(DictKind::Account, a) {
             push(
                 CountKind::AcctXfer,
                 u64::from(id),
-                trs.iter().filter(|x| side(a, x)).count(),
+                per.acct.get(a).copied().unwrap_or(0),
             );
         }
     }
@@ -175,7 +175,7 @@ pub fn tx_counts(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<RowTerm>, RenderEr
             push(
                 CountKind::Xfer,
                 xfer_entity(ai, mi),
-                trs.iter().filter(|x| x.token == *m && side(a, x)).count(),
+                per.xfer.get(&(*a, m.as_str())).copied().unwrap_or(0),
             );
         }
     }
@@ -187,14 +187,14 @@ pub fn tx_counts(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<RowTerm>, RenderEr
         push(
             CountKind::EvtRows,
             id,
-            evs.iter().filter(|e| e.qual_name == *q).count(),
+            per.evt.get(q.as_str()).copied().unwrap_or(0),
         );
         push(CountKind::EvtTxs, id, 1);
         if let Some(m) = q.strip_suffix(".TRANSFER") {
             push(
                 CountKind::TokenXfer,
                 id,
-                trs.iter().filter(|x| x.token == m).count(),
+                per.token.get(m).copied().unwrap_or(0),
             );
         }
     }
@@ -208,4 +208,115 @@ pub fn tx_counts(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<RowTerm>, RenderEr
     }
     t.sort_unstable();
     Ok(t)
+}
+
+/// The rows of one tx per name, tallied in one pass over its events and transfers. PR #48
+/// review round 2: filtering every row for every name was O(names x rows), quadratic in the
+/// event count of a hostile tx, and it runs in the tail's apply and unwind.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RowsPerName<'a> {
+    /// Transfers with the account on either side (a self-transfer once).
+    acct: HashMap<&'a str, usize>,
+    /// `(account, token)`: transfers of the token with the account on either side.
+    xfer: HashMap<(&'a str, &'a str), usize>,
+    /// Events by qualified name.
+    evt: HashMap<&'a str, usize>,
+    /// Transfers by token.
+    token: HashMap<&'a str, usize>,
+}
+
+impl<'a> RowsPerName<'a> {
+    fn of(evs: &'a [Ev], trs: &'a [Transfer]) -> Self {
+        let mut p = RowsPerName::default();
+        for e in evs {
+            *p.evt.entry(e.qual_name.as_str()).or_default() += 1;
+        }
+        for x in trs {
+            *p.token.entry(x.token.as_str()).or_default() += 1;
+            let sides: &[&str] = if x.from == x.to {
+                &[x.from.as_str()]
+            } else {
+                &[x.from.as_str(), x.to.as_str()]
+            };
+            for &a in sides {
+                *p.acct.entry(a).or_default() += 1;
+                *p.xfer.entry((a, x.token.as_str())).or_default() += 1;
+            }
+        }
+        p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tr(token: &str, from: &str, to: &str) -> Transfer {
+        Transfer {
+            pos: 0,
+            token: token.into(),
+            from: from.into(),
+            to: to.into(),
+            amount: "1.0".into(),
+        }
+    }
+
+    fn ev(q: &str) -> Ev {
+        Ev {
+            pos: 0,
+            qual_name: q.into(),
+            module: String::new(),
+            module_hash: String::new(),
+            params: Value::Null,
+        }
+    }
+
+    /// The one-pass tally equals the per-name filters it replaced, self-transfers included.
+    #[test]
+    fn rows_per_name_equal_the_per_name_filters() {
+        let trs = vec![
+            tr("coin", "a", "b"),
+            tr("coin", "a", "a"),
+            tr("free.t", "b", "c"),
+            tr("coin", "", "a"),
+        ];
+        let evs = vec![ev("coin.TRANSFER"), ev("coin.TRANSFER"), ev("free.t.X")];
+        let p = RowsPerName::of(&evs, &trs);
+        let side = |a: &str, x: &Transfer| x.from == a || x.to == a;
+        for a in ["a", "b", "c", "", "z"] {
+            let want = trs.iter().filter(|x| side(a, x)).count();
+            assert_eq!(p.acct.get(a).copied().unwrap_or(0), want, "acct {a}");
+            for m in ["coin", "free.t", "none"] {
+                let want = trs.iter().filter(|x| x.token == m && side(a, x)).count();
+                assert_eq!(p.xfer.get(&(a, m)).copied().unwrap_or(0), want, "{a} {m}");
+            }
+        }
+        for m in ["coin", "free.t", "none"] {
+            let want = trs.iter().filter(|x| x.token == m).count();
+            assert_eq!(p.token.get(m).copied().unwrap_or(0), want, "token {m}");
+        }
+        for q in ["coin.TRANSFER", "free.t.X", "none"] {
+            let want = evs.iter().filter(|e| e.qual_name == q).count();
+            assert_eq!(p.evt.get(q).copied().unwrap_or(0), want, "evt {q}");
+        }
+    }
+
+    /// A hostile tx with many distinct accounts and event names is tallied in linear time
+    /// (the per-name filters took names x rows: about 10^10 comparisons here).
+    #[test]
+    fn a_tx_with_many_distinct_names_is_tallied_in_one_pass() {
+        let n = 50_000;
+        let trs: Vec<Transfer> = (0..n)
+            .map(|i| tr(&format!("t{i}"), &format!("a{i}"), &format!("b{i}")))
+            .collect();
+        let evs: Vec<Ev> = (0..n).map(|i| ev(&format!("m.E{i}"))).collect();
+        let t = std::time::Instant::now();
+        let p = RowsPerName::of(&evs, &trs);
+        assert_eq!((p.acct.len(), p.xfer.len(), p.evt.len()), (2 * n, 2 * n, n));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t.elapsed()
+        );
+    }
 }

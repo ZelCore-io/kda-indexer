@@ -55,6 +55,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     if txn.get(Table::Headers, &bk)?.is_some() {
         bail!("block chain {chain} height {height} is already in the hot store");
     }
+    // PR #48 review round 2 N-1: a tip an older build moved must not be stamped over below.
+    rowcount::guard(txn)?;
     let mut ops = Vec::new();
     dict.persist(txn)?;
     let coin = balances::coin_module(txn)?;
@@ -370,6 +372,9 @@ pub fn unwind_to_with(
     height: u32,
     dict: &dyn kdx_types::Dict,
 ) -> Result<u32> {
+    // PR #48 review round 2 N-1: callers such as `kda-indexer unwind` run no startup guard,
+    // so check it here, in this txn, before the counts move and the new tip is stamped.
+    rowcount::guard(txn)?;
     let from = match height.checked_add(1) {
         Some(h) => block_key(chain, h),
         None => return Ok(0),

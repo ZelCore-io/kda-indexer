@@ -3121,6 +3121,58 @@ mod stored_count {
         assert!(!marker_set(&fx));
     }
 
+    /// Review round 2 N-1: `kda-indexer unwind` (and any other caller) runs no startup
+    /// guard. An old build moved chain 0's tip without the counts; `unwind_to` must not
+    /// stamp over that and come back ready: it checks the guard in its own txn and clears
+    /// the marker.
+    #[tokio::test]
+    async fn unwind_after_an_old_build_moved_the_tip_clears_the_marker() {
+        let fx = fixture();
+        reconcile(&fx);
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut t,
+            kdx_hot::Stage::Tail,
+            0,
+            13,
+            kdx_types::Hash32(hash_of(0xD0, 0, 13)),
+        )
+        .unwrap();
+        t.commit().unwrap();
+        assert!(marker_set(&fx) && !ready(&fx));
+        let mut t = fx.store.hot.rw().unwrap();
+        assert_eq!(kdx_hot::tail::unwind_to(&mut t, 0, 11).unwrap(), 1);
+        t.commit().unwrap();
+        assert!(!marker_set(&fx), "the unwind cleared the marker");
+        assert!(!ready(&fx));
+        check_lists(&fx).await;
+    }
+
+    /// N-1 for `apply`: an old build unwound chain 0 (tip moved, stamp left behind), then the
+    /// new build applies a block on it. The apply must not stamp the mismatch away.
+    #[test]
+    fn apply_after_an_old_build_moved_the_tip_clears_the_marker() {
+        let fx = fixture();
+        reconcile(&fx);
+        let key = rowcount::at_key(0);
+        let old = fx.store.hot.ro().unwrap().meta(&key).unwrap().unwrap();
+        let mut t = fx.store.hot.rw().unwrap();
+        assert_eq!(kdx_hot::tail::unwind_to(&mut t, 0, 11).unwrap(), 1);
+        t.set_meta(&key, &old).unwrap();
+        t.commit().unwrap();
+        assert!(marker_set(&fx) && !ready(&fx));
+        let mut t = fx.store.hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let (mut b, _) = decoded(0, 12, &[Shape::One]);
+        b.header.hash = kdx_types::Hash32(hash_of(0xC0, 0, 12));
+        let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+        kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+        assert!(!marker_set(&fx), "the apply cleared the marker");
+        assert!(!ready(&fx));
+    }
+
     /// Review I-2: `--check` reads both sides in one snapshot and merges against the table:
     /// 0 on a healthy store (also after reorgs), and each missing, extra or wrong row counts.
     #[test]

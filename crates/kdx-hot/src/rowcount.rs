@@ -19,6 +19,8 @@
 //!   txn that changes the counts, and `reconcile-counts` writes it for every chain when it sets
 //!   the marker. A build before #48 moves the tips without it, so [`ready`] (and
 //!   [`guard`], run at `run` and tail startup) sees the mismatch and the counts are not used.
+//!   `tail::apply` and `tail::unwind_to_with` also run [`guard`] first, in their own txn, so
+//!   a caller without the startup check (`kda-indexer unwind`) cannot stamp over a mismatch.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -200,7 +202,7 @@ pub fn sum(txn: &impl Txn, kind: CountKind, entity: u64, chain: Option<u8>) -> R
     let rows = txn.scan(Table::RowCounts, &from, |k| k.get(..9) == Some(&from[..9]))?;
     Ok(rows.iter().fold((0, 0), |(u, c), (_, v)| {
         let (a, b) = decode_val(v);
-        (u + a, c + b)
+        (u.saturating_add(a), c.saturating_add(b))
     }))
 }
 
@@ -292,11 +294,8 @@ impl Tally {
             let e = self.0[t.kind as usize]
                 .entry((t.entity, r.key.chain()))
                 .or_insert((0, 0));
-            if cb {
-                e.1 += t.rows;
-            } else {
-                e.0 += t.rows;
-            }
+            let slot = if cb { &mut e.1 } else { &mut e.0 };
+            *slot = slot.saturating_add(t.rows);
         }
         true
     }
@@ -308,14 +307,15 @@ impl Tally {
             }
             for (k, (u, c)) in theirs {
                 let e = mine.entry(k).or_insert((0, 0));
-                e.0 += u;
-                e.1 += c;
+                e.0 = e.0.saturating_add(u);
+                e.1 = e.1.saturating_add(c);
             }
         }
     }
 
-    /// Remove `kind`'s rows and return them sorted. Only that kind's map and its run are
-    /// alive together (the map is freed when this returns).
+    /// Remove `kind`'s rows and return them sorted. That kind's whole map and its whole run
+    /// are alive together until the map is freed when this returns (per kind, not in
+    /// chunks): the peak is the other kinds' maps plus the largest kind's map and run.
     pub fn take_sorted(&mut self, kind: CountKind) -> SortedRows {
         let m = std::mem::take(&mut self.0[kind as usize]);
         let mut v: SortedRows = m.into_iter().collect();

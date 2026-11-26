@@ -1294,7 +1294,7 @@ fn stored_count(view: &View, spec: &ListSpec, src: &Src, rows: &Rows) -> ApiResu
             Rows::Txs { coinbase, .. } => *coinbase,
             _ => true,
         };
-    Ok(Some(user + if with_cb { cb } else { 0 }))
+    Ok(Some(user.saturating_add(if with_cb { cb } else { 0 })))
 }
 
 /// Keys a decoding count walk reads ahead at once ([`count`]).
