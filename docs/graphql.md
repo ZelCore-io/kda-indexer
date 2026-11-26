@@ -600,27 +600,40 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
   value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
   with `chainIds` set the rows come in the order asked (each chain once), as stock lists them;
   `fungibleChainAccount` on a chain without a row is `null`.
-- **Rows that exist on chain are listed at any balance, as stock does.** One rule on every
-  balance list: a row the node holds is listed whatever its balance, 0 included, whether the
-  account was funded once and drained or created and never funded on that chain; only a
-  chain where the node has no row (reported absent) is left out. This covers
-  `chainAccounts`, `fungibleChainAccounts`, `fungibleChainAccount`, the `…ByPublicKey` lists,
-  `balance(...)`, `node(id:)` for `FungibleAccount` and `FungibleChainAccount` ids and
-  `Block.minerAccount`. `fungibleAccount` is non-null for every account that exists on chain
-  (`totalBalance` 0 when every row is at 0), so its `transfers` and `transactions` stay
-  reachable after it is drained. The native `/accounts/{account}/balances` and
-  `/keys/{pubkey}/accounts` follow the same rule ([api.md](api.md)).
+- **Zero rows follow stock's two rules.**
+  - `fungibleAccount` lists every row that exists on chain, at any balance: a row the node
+    holds is listed whatever its balance, 0 included, whether the account was funded once and
+    drained or created and never funded on that chain; only a chain where the node has no row
+    (reported absent) is left out. The same holds for `chainAccounts`,
+    `fungibleChainAccounts`, `fungibleChainAccount`, the `…ByPublicKey` lists, `node(id:)` for
+    `FungibleAccount` and `FungibleChainAccount` ids and `Block.minerAccount`.
+    `fungibleAccount` is non-null for every account that exists on chain (`totalBalance` 0
+    when every row is at 0), so its `transfers` and `transactions` stay reachable after it is
+    drained. The native `/accounts/{account}/balances` and `/keys/{pubkey}/accounts` follow
+    this rule too ([api.md](api.md)).
+  - `balance(...)` lists every row above 0, plus the rows at 0 that a TRANSFER event touched:
+    the account's transfer list in that module (what `transfers(accountName, fungibleName,
+    chainId)` reads) has an entry on the row's chain. A row at 0 that only `create-account`,
+    `rotate` or a token's own `create-account` wrote is left out, as stock leaves it out.
+    This is worked out when the query runs, from the transfer postings; nothing is stored.
+    Our transfer postings come only from node events, which start at the events fork
+    (1,138,000 on mainnet), as stock's TRANSFER rows do, so a row drained before the fork is
+    not counted as touched in either. The check reads at most 10,000 transfer keys per
+    account and module, newest first, and stops once every zero row's chain is found; a
+    zero row still unresolved at the cap is listed (it exists on chain) and counted in
+    `kdx_graphql_balance_touch_capped_total`. Pages, `chainIds` and `module` walk only the
+    rows this rule keeps; the 4,096-row cap counts every stored row of the account, as before.
   Rows come from the reconciler's reads of the accounts ingest sees named: transfer sides,
   senders, signers, event principals, the D3 receivers, and since the zero-rows fix the
-  account a `coin.create-account` call creates (D3 rule 2c). A store whose D3 pass ran
-  before that rule gets those rows from `reconcile-balances --rewalk coin`
+  account a `coin.create-account` call creates (D3 rule 2c: the code literals, then the
+  `exec.data` strings, at most 64; never `result.data` or a keyset predicate). A store whose
+  D3 pass ran before that rule gets those rows from `reconcile-balances --rewalk coin`
   ([operations.md](operations.md)). An account created inside another module's code, with
   no event or exec string naming it, is still not seen.
   Measured against stock (WP-L, post-#44 replays): stock's `fungibleAccount` lists every row
   the node holds, created-and-never-funded ones included; stock's `balance(...)` lists the
-  rows a TRANSFER event touched (190 of 190 of its zero rows), so ours can list a few zero
-  rows there that stock leaves out (a row only `create-account`, `rotate` or a token's own
-  `create-account` wrote).
+  zero rows a TRANSFER event touched (190 of 190) and none of the node's zero rows without
+  one (0 of 13).
 - **Funded rows stock lacks.** The stock indexer misses some non-zero balance rows that the
   node holds and ours lists, mostly token credits that no TRANSFER event names (for example
   `kaddex.skdx`, `kdlaunch.token`, `mok.token`, `free.kishu-ken`; 17 records in the G4 replay,

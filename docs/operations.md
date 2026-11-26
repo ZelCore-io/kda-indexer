@@ -777,7 +777,9 @@ an error and writes nothing. `coin` queues only its history walk, and marks no p
 (that would mark every coin holder; use `--seed` or `--all`). Its walk begins at the events
 fork (1,138,000 on mainnet) and marks the accounts `coin.create-account` created (D3 rule 2c,
 zero rows): run `kda-indexer reconcile-balances --rewalk coin` once on a store whose D3 pass
-predates that rule. On mainnet it walks about 357 M of the 371 M frozen txs, about 50 min at
+predates that rule. Stop the service first: the command takes the data dir lock and fails
+(writing nothing) while the service holds it. The sequence is stop the service, run
+`reconcile-balances --rewalk coin`, start the service. On mainnet it walks about 357 M of the 371 M frozen txs, about 50 min at
 the measured 100 to 120 k tx/s, plus one `/local` read per created row it finds. Running it again marks nothing new but restarts a walk in progress from 0 again (about
 14 h on mainnet). Start the service again; it reconciles the marks and runs the walk
 (`--status` shows `d3_rewalk_pending`). Only tracked tokens are walked; an untracked name is

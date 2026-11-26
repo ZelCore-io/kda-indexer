@@ -280,9 +280,10 @@ The G4 replay of real traffic (below) met most of these classes again; its
   served, so introspection answers differ ([graphql.md](graphql.md#schema)).
 - `balance(...)` lists fungible balances only; stock also lists marmalade ledger rows at 0
   (R-G4-03, [graphql.md](graphql.md#schema)).
-- Zero rows follow stock's two rules, native and GraphQL: `fungibleAccount` and the chain
-  account lists list every row that exists on chain, at any balance; `balance(...)` lists
-  rows above 0, plus zero rows a TRANSFER event touched ([graphql.md](graphql.md#accounts)).
+- Zero rows follow stock's two rules: `fungibleAccount` (and the chain account lists, the
+  `…ByPublicKey` lists and the native balance routes) lists every row that exists on chain,
+  at any balance; `balance(...)` lists rows above 0, plus zero rows a TRANSFER event touched
+  ([graphql.md](graphql.md#accounts)).
 - GraphQL `last`/`before` pages of `transactions(isCoinbase: true)` and of lists with no
   account, public key, event name or `fungibleName` argument (the height walk, `events(moduleName)` alone too) reach at most
   200,000 txs back from the newest row; past that ours answers `LIMIT` (the message names
@@ -445,7 +446,7 @@ documented difference), **unknown** (not settled yet).
 | 19 | signer order: stock lists 1, 0; the node's command order is 0, 1 and ours | 1 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
 | 20 | `crossChainTransfer.creationTime` in whole seconds | 2 | both | [graphql.md](graphql.md#wire-formats-that-follow-the-oracle-r-p5p9-19) |
 | 21 | failed tx `badResult`: `callStack` and `info` | 117 | ours (= node, owner ruling) | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
-| 22 | zero-balance rows and missing chain rows | 42 + 16 + 38 + 61 keys + 5 | rows that exist on chain are listed at any balance, as stock does; stock's `balance(...)` lists only TRANSFER-touched rows | [graphql.md](graphql.md#accounts) |
+| 22 | zero-balance rows and missing chain rows | 42 + 16 + 38 + 61 keys + 5 | as stock: `fungibleAccount` lists every on-chain row at any balance; `balance(...)` lists rows above 0 plus zero rows a TRANSFER touched | [graphql.md](graphql.md#accounts) |
 | 23 | `balance` edge order | 82 | both | [graphql.md](graphql.md#zelcore-extensions) |
 | 24 | stock lacks funded balance rows | 5 + 12 | ours | [graphql.md](graphql.md#accounts) |
 | 25 | ours' rows read before the queue drained, now equal to the node | 216 | both (transient) | [graphql.md](graphql.md#accounts) |
