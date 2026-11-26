@@ -213,12 +213,13 @@ connection!(
     required,
     total
 );
+// ZelCore extension: `totalCount` (stock serves it).
 connection!(
     FungibleAccountTransfersConnection,
     FungibleAccountTransfersConnectionEdge,
     Transfer,
     required,
-    none
+    total
 );
 connection!(
     FungibleChainAccountTransactionsConnection,
@@ -227,12 +228,13 @@ connection!(
     required,
     total
 );
+// ZelCore extension: `totalCount` (stock serves it).
 connection!(
     FungibleChainAccountTransfersConnection,
     FungibleChainAccountTransfersConnectionEdge,
     Transfer,
     required,
-    none
+    total
 );
 connection!(
     NonFungibleAccountTransactionsConnection,
@@ -256,12 +258,13 @@ connection!(
     nullable,
     total
 );
+// ZelCore extension: `totalCount` (stock serves it).
 connection!(
     QueryBlocksFromHeightConnection,
     QueryBlocksFromHeightConnectionEdge,
     Block,
     nullable,
-    none
+    total
 );
 connection!(
     QueryCompletedBlockHeightsConnection,

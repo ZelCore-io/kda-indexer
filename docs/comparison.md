@@ -277,6 +277,16 @@ The G4 replay of real traffic (below) met most of these classes again; its
   `COUNT_TIMEOUT` at the field where stock answers a number; that happens only on decoding
   lists with tens of thousands of rows or more that the stored per-key counts do not hold
   (height, depth and row filters; [graphql.md](graphql.md#transactions-events-and-transfers), `totalCount`).
+- An account's transfer lists (`transfers(accountName)`, `FungibleAccount.transfers`,
+  `FungibleChainAccount.transfers`) list a transfer to oneself once and count it once.
+  Stock's `UNION ALL` of the sender and receiver halves lists it twice, under one cursor,
+  and its `totalCount` adds both halves, so it counts it twice.
+- Stock fields not served (a stock client that selects one gets a validation error):
+  `Block.totalGasUsedInKda`, `NetworkInfo.genesisHeights`, `nodeBlockDelay`, `nodeChains`,
+  `nodeLatestBehaviorHeight`, `nodePackageVersion`, `nodeServiceDate`, `numberOfChains`,
+  and `NonFungibleAccount.transfers` / `NonFungibleChainAccount.transfers` (an account's NFT
+  transfers are served by the root `transfers(accountName, isNFT: true)`). Kadena's
+  published schema has none of them.
 - `Transfer.orderIndex` is the TRANSFER event's index in the transaction
   (`graphql-h8-transfer-order-index`).
 - `creationTime` has whole seconds, as the node's command; stock adds a fraction

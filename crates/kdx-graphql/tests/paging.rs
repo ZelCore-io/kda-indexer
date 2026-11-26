@@ -720,9 +720,9 @@ async fn every_tx_list_joins_its_pages_at_every_size() {
         nested("block", &frozen_block, "events", EVENT, true),
         nested("block", &hot_block, "events", EVENT, true),
         // Nested in an account.
-        nested("fungibleAccount", &a, "transfers", TRANSFER, false),
+        nested("fungibleAccount", &a, "transfers", TRANSFER, true),
         nested("fungibleAccount", &a, "transactions", TX, true),
-        nested("fungibleChainAccount", &a0, "transfers", TRANSFER, false),
+        nested("fungibleChainAccount", &a0, "transfers", TRANSFER, true),
         nested("fungibleChainAccount", &a0, "transactions", TX, true),
         nested("nonFungibleAccount", &a, "transactions", TX, true),
         nested("nonFungibleChainAccount", &a0, "transactions", TX, true),
@@ -2725,9 +2725,9 @@ fn posting_lists() -> Vec<List> {
             TX,
             true,
         ),
-        nested("fungibleAccount", &a, "transfers", TRANSFER, false),
+        nested("fungibleAccount", &a, "transfers", TRANSFER, true),
         nested("fungibleAccount", &a, "transactions", TX, true),
-        nested("fungibleChainAccount", &a0, "transfers", TRANSFER, false),
+        nested("fungibleChainAccount", &a0, "transfers", TRANSFER, true),
         nested("fungibleChainAccount", &a0, "transactions", TX, true),
         nested("nonFungibleAccount", &a, "transactions", TX, true),
     ]
@@ -3072,6 +3072,103 @@ mod stored_count {
         reconcile(&fx);
         assert_eq!(stored(&fx), once, "idempotent");
         check_lists(&fx).await;
+    }
+
+    fn parent(p: &str) -> &str {
+        &p[..p.find('(').unwrap()]
+    }
+
+    /// `(totalCount, edges, error codes, query)` of `p { transfers }`, the deadline spent or
+    /// not.
+    async fn nested_xfers(
+        s: &KdxSchema,
+        p: &str,
+        spent: bool,
+    ) -> (Option<i64>, i64, Vec<String>, String) {
+        let q =
+            format!("{{ {p} {{ transfers(first: 1000) {{ totalCount edges {{ cursor }} }} }} }}");
+        let mut req = async_graphql::Request::new(q.clone());
+        if spent {
+            req = req.data(kdx_graphql::ReqCtx {
+                deadline: Instant::now(),
+            });
+        }
+        let r = s.execute(req).await;
+        let d = serde_json::to_value(&r.data).unwrap();
+        let c = &d[parent(p)]["transfers"];
+        let codes: Vec<String> = r
+            .errors
+            .iter()
+            .filter_map(|e| e.extensions.as_ref()?.get("code").map(|c| c.to_string()))
+            .collect();
+        (
+            c["totalCount"].as_i64(),
+            c["edges"].as_array().map_or(0, Vec::len) as i64,
+            codes,
+            q,
+        )
+    }
+
+    /// `FungibleAccount.transfers` and `FungibleChainAccount.transfers` serve `totalCount`, as
+    /// stock's schema has it: the account's transfers of the fungible (all chains, or the
+    /// object's chain), equal to the edges the list walks, for `coin` and another module,
+    /// and to the root `transfers(accountName, fungibleName[, chainId])` count. Before the
+    /// stored counts are ready the count walks (a spent deadline answers `COUNT_TIMEOUT`, no
+    /// number); once ready, the stored count answers with no walk.
+    #[tokio::test]
+    async fn account_object_transfers_count_their_edges() {
+        // `(parent query, root list of the same rows)`.
+        let lists = [
+            (
+                "fungibleAccount(accountName: \"k:alice\")",
+                "transfers(accountName: \"k:alice\", fungibleName: \"coin\", ARGS)",
+            ),
+            (
+                "fungibleAccount(accountName: \"k:carol\", fungibleName: \"kaddex.kdx\")",
+                "transfers(accountName: \"k:carol\", fungibleName: \"kaddex.kdx\", ARGS)",
+            ),
+            (
+                "fungibleChainAccount(accountName: \"k:alice\", chainId: \"0\")",
+                "transfers(accountName: \"k:alice\", fungibleName: \"coin\", chainId: \"0\", ARGS)",
+            ),
+            (
+                "fungibleChainAccount(accountName: \"k:carol\", chainId: \"0\", fungibleName: \"kaddex.kdx\")",
+                "transfers(accountName: \"k:carol\", fungibleName: \"kaddex.kdx\", chainId: \"0\", ARGS)",
+            ),
+        ];
+        let fx = fixture();
+        assert!(!ready(&fx));
+        for (p, root) in lists {
+            // The walk (counts not ready).
+            let (n, edges, codes, q) = nested_xfers(&fx.schema, p, false).await;
+            assert!(edges > 0, "{q}: the fixture list is not empty");
+            assert_eq!(n, Some(edges), "{q}: {codes:?}");
+            assert_eq!(n, Some(total(&fx.schema, root).await), "{q} vs {root}");
+            // A spent deadline cuts the walk: an error, never a number.
+            let (n, _, codes, q) = nested_xfers(&fx.schema, p, true).await;
+            assert_eq!(n, None, "{q}");
+            assert!(
+                !codes.is_empty() && codes.iter().all(|c| c.contains("TIMEOUT")),
+                "{q}: {codes:?}"
+            );
+        }
+        reconcile(&fx);
+        for (p, root) in lists {
+            let (n, edges, _, q) = nested_xfers(&fx.schema, p, false).await;
+            assert_eq!(n, Some(edges), "{q}");
+            assert_eq!(n, Some(total(&fx.schema, root).await), "{q} vs {root}");
+            // The stored count answers with no walk.
+            let q = format!("{{ {p} {{ transfers {{ totalCount }} }} }}");
+            let req = async_graphql::Request::new(q.clone()).data(kdx_graphql::ReqCtx {
+                deadline: Instant::now(),
+            });
+            let d = serde_json::to_value(&fx.schema.execute(req).await.data).unwrap();
+            assert_eq!(
+                d[parent(p)]["transfers"]["totalCount"].as_i64(),
+                Some(edges),
+                "{q}: stored, {d}"
+            );
+        }
     }
 
     /// Counts stay right through a reorg: unwind two hot blocks of chain 0, apply a different

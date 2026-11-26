@@ -100,6 +100,8 @@ field DexMetrics.totalPools: Int!
 field DexMetrics.totalVolumeUsd: Decimal!
 field DexMetrics.tvlHistory: [ChartDataPoint!]!
 field DexMetrics.volumeHistory: [ChartDataPoint!]!
+field FungibleAccountTransfersConnection.totalCount: Int!
+field FungibleChainAccountTransfersConnection.totalCount: Int!
 field LiquidityBalance.createdAt: DateTime!
 field LiquidityBalance.id: Int!
 field LiquidityBalance.liquidity: String!
@@ -179,6 +181,7 @@ field QueryBalanceConnection.pageInfo: PageInfo!
 field QueryBalanceConnectionEdge.cursor: String!
 field QueryBalanceConnectionEdge.node: BalanceNode!
 field QueryBlocksFromDepthConnection.totalCount: Int!
+field QueryBlocksFromHeightConnection.totalCount: Int!
 field QueryPoolsConnection.edges: [QueryPoolsConnectionEdge!]!
 field QueryPoolsConnection.pageInfo: PageInfo!
 field QueryPoolsConnection.totalCount: Int!
