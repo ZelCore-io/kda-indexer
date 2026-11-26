@@ -15,10 +15,10 @@
 //!   Rows the fill writes from hot blocks carry none: a reorg of a block the fill read from the
 //!   tail (blocks applied by a binary without this table) keeps its swap until a newer one.
 //! - **Beside the live tail (N-14):** a hot tx is read in the write txn that stores its swap,
-//!   so an unwind cannot fall between the two; and where a tail block applied during the fill
-//!   holds a newer row, or an older one the fill's row replaces, the fill's row goes into that
-//!   block's undo log (`kdx_hot::prices::upsert_fill`), so unwinding the block leaves it, not
-//!   no price. A tail tx the fill re-reads leaves its own block's log as it is.
+//!   so an unwind cannot fall between the two; and every tail block above the fill's row whose
+//!   undo log would restore an older row (or none) for its token is made to restore the fill's
+//!   row (`kdx_hot::prices::upsert_fill`), so an unwind leaves the newest remaining swap, not
+//!   an older one or no price. A tail tx the fill re-reads leaves its own block's log as it is.
 
 use std::collections::BTreeSet;
 use std::path::Path;
