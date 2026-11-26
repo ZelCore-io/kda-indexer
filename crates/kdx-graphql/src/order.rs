@@ -221,6 +221,9 @@ struct Entry<'a> {
 /// The ordered members of one (selection set, runtime type), built once per request.
 struct Plan<'a> {
     entries: Vec<Entry<'a>>,
+    /// The entries' keys, for the abstract-type inference's cover check (linear, not
+    /// quadratic, in a wide aliased selection).
+    keys: HashSet<Name>,
     /// The response key of a selected `__typename`.
     typename: Option<Name>,
 }
@@ -420,7 +423,7 @@ impl<'a> Walker<'a> {
         let mut found = None;
         for t in possible {
             let p = self.plan(sid, Some(t.as_str()), Some(t.as_str()));
-            if map.keys().all(|k| p.entries.iter().any(|e| e.key == *k)) {
+            if map.len() <= p.keys.len() && map.keys().all(|k| p.keys.contains(k)) {
                 if found.is_some() {
                     return None;
                 }
@@ -468,7 +471,12 @@ impl<'a> Walker<'a> {
             });
             entries.push(Entry { key, ty, child });
         }
-        let p = Rc::new(Plan { entries, typename });
+        let keys = entries.iter().map(|e| e.key.clone()).collect();
+        let p = Rc::new(Plan {
+            entries,
+            keys,
+            typename,
+        });
         self.plans[sid].push((runtime, parent, p.clone()));
         p
     }
