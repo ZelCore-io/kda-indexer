@@ -276,6 +276,13 @@ pub const MAX_EVENT_PAIRS_PER_EVENT: usize = 64;
 pub const MAX_EVENT_PAIRS_PER_TX: usize = 512;
 /// Exec-derived token candidates kept per tx (own budget, see [`TokenReceivers::exec_pairs`]).
 pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
+
+/// Accounts rule 2c reads exactly from one tx's `coin.create-account` calls, at most (gap
+/// Q). Not the [`MAX_EXEC_PAIRS_PER_TX`] cap: the bulk creators send 200 calls per tx
+/// (mainnet chain 12, heights 1.55M-2.16M). The tx's gas already bounds the count (each call
+/// writes a row and pays for it; a 150,000 gas limit buys well under 1,000 creates); this cap
+/// only bounds the work a hostile code text could ask of the decoder and the reconciler.
+pub const MAX_COIN_CREATE_PER_TX: usize = 1_000;
 /// Exec-derived token candidates kept from a module-deploy tx (D3 gap group 5): its code holds
 /// the module's own constants (a `ROOT` or genesis account its init credits) among many other
 /// literals. Literals with whitespace (doc strings, messages) are skipped there; the rest are
@@ -451,6 +458,13 @@ pub struct D3Exec {
     /// [`MAX_EXEC_PAIRS_PER_TX`]. Never `result.data` (`Write succeeded`) or a keyset
     /// predicate (`keys-all`): they are never accounts. Empty otherwise.
     pub coin_create: Vec<String>,
+    /// Rule 2c, exact (gap Q): the first argument of every `coin.create-account` call of the
+    /// code, read from the parsed code ([`coin_create_accounts`]): a string literal, or
+    /// `(read-msg k)` / `(read-string k)` of a string in `exec.data`. At most
+    /// [`MAX_COIN_CREATE_PER_TX`], [`account_like`] only, first-seen order. Interned at
+    /// decode time, so the tail marks them live. Empty below the events fork (rule 1 then
+    /// counts every exec string) and when the code makes no such call.
+    pub coin_created: Vec<String>,
     /// Modules the code calls (`<m>.fn`) and does not deploy, minus those that emitted an
     /// event in the tx from the events fork on; the filter keeps the tracked tokens.
     pub called: Vec<String>,
@@ -628,6 +642,11 @@ pub fn d3_candidates(
         // Rule 2c: code literals first, so a batch create-account reaches the account names
         // (literals) before keyset data can fill the cap (review minor 2).
         let mut create_strings = Vec::new();
+        let coin_created = if coin_create {
+            coin_create_accounts(code, data)
+        } else {
+            Vec::new()
+        };
         if coin_create {
             let literals = code_literals(code);
             let mut add = |s: &str| {
@@ -674,6 +693,7 @@ pub fn d3_candidates(
             c.exec = Some(D3Exec {
                 coin,
                 coin_create: create_strings,
+                coin_created,
                 called,
                 deployed,
                 strings,
@@ -761,8 +781,8 @@ pub fn d3_filter(c: &D3Candidates, is_token: &dyn Fn(&str) -> bool) -> TokenRece
         if x.coin {
             modules.push("coin");
         }
-        // Rule 2c: its own strings, for coin only.
-        for s in &x.coin_create {
+        // Rule 2c: the exact created accounts, then its own strings, for coin only.
+        for s in x.coin_created.iter().chain(&x.coin_create) {
             r.push(s, "coin");
         }
         for m in &x.called {
@@ -1019,6 +1039,140 @@ const COIN_CREATE: &str = "coin.create-account";
 /// Whether `code` calls `coin.create-account` (outside strings, `'symbols` and comments).
 fn calls_coin_create(code: &str) -> bool {
     code.contains(COIN_CREATE) && code_words(code).iter().any(|w| w == COIN_CREATE)
+}
+
+/// One token of Pact code for [`coin_create_accounts`].
+#[derive(Debug, PartialEq)]
+enum PactTok {
+    /// `(`, `[` or `{`.
+    Open,
+    /// `)`, `]` or `}`.
+    Close,
+    /// A `"string"` literal: its text when it holds no escape but `\"` and `\\` (`None`
+    /// otherwise: never guessed).
+    Str(Option<String>),
+    /// A `'symbol`.
+    Sym(String),
+    /// Any other atom (a name, a number, `coin.create-account`).
+    Word(String),
+}
+
+/// The tokens of `code` (`;` comments skipped).
+fn pact_tokens(code: &str) -> Vec<PactTok> {
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b';' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                out.push(PactTok::Open);
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                out.push(PactTok::Close);
+                i += 1;
+            }
+            b'"' => {
+                let mut s = Vec::new();
+                let mut exact = true;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        match b.get(i + 1) {
+                            Some(&c @ (b'"' | b'\\')) => s.push(c),
+                            _ => exact = false,
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    s.push(b[i]);
+                    i += 1;
+                }
+                i += 1;
+                let text = String::from_utf8(s).ok().filter(|_| exact);
+                out.push(PactTok::Str(text));
+            }
+            b'\'' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() && !is_delim(b[j]) && b[j] != b';' {
+                    j += 1;
+                }
+                out.push(PactTok::Sym(
+                    String::from_utf8_lossy(&b[start..j]).into_owned(),
+                ));
+                i = j;
+            }
+            c if c.is_ascii_whitespace() || c == b',' => i += 1,
+            _ => {
+                let start = i;
+                while i < b.len() && !is_delim(b[i]) && b[i] != b';' {
+                    i += 1;
+                }
+                out.push(PactTok::Word(
+                    String::from_utf8_lossy(&b[start..i]).into_owned(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Rule 2c, exact (gap Q): the account of every `(coin.create-account <account> ..)` call in
+/// `code`, read from its tokens: the first argument when it is a string literal, or
+/// `(read-msg k)` / `(read-string k)` (`k` a literal or `'symbol`) naming a string of `data`.
+/// Any other first argument (a variable, another call, a literal with an escape other than
+/// `\"` / `\\`) gives nothing: the account is never guessed. A call inside a string or a
+/// comment is no call. A call in code that may never run (a `defun` body in a deploy, an
+/// untaken `if` branch) is still collected: the account named is exact, but the row may not
+/// exist. That is harmless, since a collected account only marks the row for the reconciler,
+/// which reads it from the node and hides an absent answer. Distinct, [`account_like`],
+/// first-seen order, at most [`MAX_COIN_CREATE_PER_TX`].
+pub fn coin_create_accounts(code: &str, data: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    if !code.contains(COIN_CREATE) {
+        return out;
+    }
+    let t = pact_tokens(code);
+    for i in 0..t.len() {
+        if out.len() >= MAX_COIN_CREATE_PER_TX {
+            break;
+        }
+        if !(t[i] == PactTok::Open
+            && matches!(t.get(i + 1), Some(PactTok::Word(w)) if w == COIN_CREATE))
+        {
+            continue;
+        }
+        let account = match t.get(i + 2) {
+            Some(PactTok::Str(Some(s))) => Some(s.as_str()),
+            Some(PactTok::Open) => match (t.get(i + 3), data_key(t.get(i + 4)), t.get(i + 5)) {
+                (Some(PactTok::Word(f)), Some(k), Some(PactTok::Close))
+                    if f == "read-msg" || f == "read-string" =>
+                {
+                    data.and_then(|d| d.get(k)).and_then(Value::as_str)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(a) = account {
+            push_distinct(&mut out, a, MAX_COIN_CREATE_PER_TX);
+        }
+    }
+    out
+}
+
+/// The data key a `read-msg` argument names (a literal or a `'symbol`).
+fn data_key(k: Option<&PactTok>) -> Option<&str> {
+    match k {
+        Some(PactTok::Str(Some(k)) | PactTok::Sym(k)) => Some(k.as_str()),
+        _ => None,
+    }
 }
 
 /// The words of `code` outside string literals, `'symbols` and `;` comments.

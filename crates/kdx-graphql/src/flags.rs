@@ -6,6 +6,9 @@
 //! - `truncated: true`: a `fungibleAccountsByPublicKey` or `fungibleChainAccountsByPublicKey`
 //!   stopped at its 100 matching accounts or its scan window with `KeyAccounts` rows of the
 //!   key left unread (L-2).
+//! - `nodeReadIncomplete: true`: an account lookup's node read of a chain the store has no
+//!   row for failed or was refused by a limit (gap Q, `crate::miss`); that chain is left
+//!   out, as stock leaves out a chain whose node read failed.
 //!
 //! One [`RespFlags`] per request (an extension instance is created per request), so the
 //! requests of a batch are flagged separately. Subscription events carry no flags.
@@ -23,6 +26,7 @@ use async_graphql::{Context, Request, Response, ServerResult, Value};
 pub struct RespFlags {
     search_truncated: AtomicBool,
     key_accounts_truncated: AtomicBool,
+    node_read_incomplete: AtomicBool,
 }
 
 /// Which mark to set.
@@ -30,6 +34,8 @@ pub struct RespFlags {
 pub enum Flag {
     SearchTruncated,
     KeyAccountsTruncated,
+    /// Gap Q: a missed account row's node read failed or was refused by a limit.
+    NodeReadIncomplete,
 }
 
 impl RespFlags {
@@ -37,6 +43,7 @@ impl RespFlags {
         match f {
             Flag::SearchTruncated => &self.search_truncated,
             Flag::KeyAccountsTruncated => &self.key_accounts_truncated,
+            Flag::NodeReadIncomplete => &self.node_read_incomplete,
         }
     }
     pub fn is_set(&self, f: Flag) -> bool {
@@ -88,6 +95,7 @@ impl Extension for FlagsExt {
         for (f, name) in [
             (Flag::SearchTruncated, "searchTruncated"),
             (Flag::KeyAccountsTruncated, "truncated"),
+            (Flag::NodeReadIncomplete, "nodeReadIncomplete"),
         ] {
             if self.0.is_set(f) {
                 r.extensions.insert(name.to_owned(), Value::Boolean(true));

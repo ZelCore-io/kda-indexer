@@ -10,9 +10,9 @@
 //! - (d) `kaddex.alchemist.WRAP` minting `kaddex.skdx`, named only by a `fungible-v2` modref.
 
 use kdx_decode::receivers::{
-    d3_candidates, d3_filter, injected_miner_receivers, token_receivers, MAINNET01,
-    MAX_EVENT_PAIRS_PER_EVENT, MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX,
-    MAX_MODREF_PAIRS_PER_TX,
+    coin_create_accounts, d3_candidates, d3_filter, injected_miner_receivers, token_receivers,
+    MAINNET01, MAX_COIN_CREATE_PER_TX, MAX_EVENT_PAIRS_PER_EVENT, MAX_EVENT_PAIRS_PER_TX,
+    MAX_EXEC_PAIRS_PER_TX, MAX_MODREF_PAIRS_PER_TX,
 };
 use serde_json::{json, Value};
 
@@ -1061,4 +1061,132 @@ fn a_batch_coin_create_account_marks_its_accounts_before_the_cap() {
     }
     let coin_rows = p.iter().filter(|(_, m)| *m == "coin").count();
     assert!(coin_rows <= 64 + 1, "capped: {coin_rows}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gap Q: rule 2c reads every `coin.create-account` account exactly, past the 64 cap.
+
+/// A captured mainnet tx (code and data as signed, host details stripped).
+fn gapq_fixture(name: &str) -> (Value, u32) {
+    let path = format!("{}/tests/fixtures/gapq/{name}", env!("CARGO_MANIFEST_DIR"));
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let h = u32::try_from(v["height"].as_u64().unwrap()).unwrap();
+    (v["cmd"].clone(), h)
+}
+
+/// The 200-call bot batches (chain 12, heights 2,139,526 and 1,909,300): every account is
+/// read, in call order, and marked for coin; the 28th and the 200th (past the old 64 cap)
+/// among them. Oracle: call `i` uses keyset `ks<i>`, whose only key is the account itself.
+#[test]
+fn a_captured_200_call_batch_marks_all_200_accounts() {
+    for f in ["c12-h2139526.json", "c12-h1909300.json"] {
+        let (cmd, h) = gapq_fixture(f);
+        let exec = &cmd["payload"]["exec"];
+        let code = exec["code"].as_str().unwrap();
+        let data = &exec["data"];
+        let want: Vec<String> = (0..200)
+            .map(|i| {
+                data[format!("ks{i}")]["keys"][0]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let got = coin_create_accounts(code, Some(data));
+        assert_eq!(got, want, "{f}");
+        let gas = ev("coin", "TRANSFER", json!([SRC, "k:miner", 2.41e-6]));
+        let o = out(json!("Write succeeded"), json!([gas]), Value::Null);
+        let c = d3_candidates(Some(&cmd), &o, h, MAINNET01);
+        assert_eq!(c.exec.as_ref().unwrap().coin_created, want, "{f}");
+        let r = token_receivers(Some(&cmd), &o, h, MAINNET01, &tokens);
+        let p = pairs(&r.pairs);
+        for (i, a) in want.iter().enumerate() {
+            assert!(
+                p.contains(&(a.as_str(), "coin")),
+                "{f}: call {}: {a}",
+                i + 1
+            );
+        }
+        assert!(
+            p.contains(&(want[27].as_str(), "coin")) && p.contains(&(want[199].as_str(), "coin"))
+        );
+    }
+}
+
+/// Names with `/` (crankk01-style; JSON's `\/` escape is the transport's, gone after
+/// parsing) are accounts like any other.
+#[test]
+fn a_created_account_with_a_slash_is_accepted() {
+    let name = "crankk01/c3f1b2a4-5d6e-4f70-8192-a3b4c5d6e7f8";
+    let raw = r#"{"payload":{"exec":{"data":{},"code":"(coin.create-account \"crankk01\/c3f1b2a4-5d6e-4f70-8192-a3b4c5d6e7f8\" (read-keyset \"ks\"))"}}}"#;
+    let cmd: Value = serde_json::from_str(raw).unwrap();
+    let code = cmd["payload"]["exec"]["code"].as_str().unwrap();
+    assert_eq!(coin_create_accounts(code, None), vec![name.to_owned()]);
+    let o = out(json!("Write succeeded"), json!([]), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 2_000_000, MAINNET01, &tokens);
+    assert!(pairs(&r.pairs).contains(&(name, "coin")), "{:?}", r.pairs);
+}
+
+/// The first argument only, and only what the code states: a literal or a `read-msg` /
+/// `read-string` of a data string. A variable, another call, an unknown escape, a call in a
+/// string or a comment, the guard argument: nothing.
+#[test]
+fn only_the_first_argument_of_a_real_call_is_read() {
+    let data = json!({"a": "k:from-data", "b": "k:from-symbol", "n": 5, "ks": {"keys": [R1], "pred": "keys-all"}});
+    let code = r#"
+        (coin.create-account "k:literal" (read-keyset "ks"))
+        (coin.create-account (read-msg "a") (read-keyset "ks"))
+        (coin.create-account (read-string 'b) (read-keyset "ks"))
+        (coin.create-account (read-msg "n") (read-keyset "ks"))
+        (coin.create-account (read-msg "missing") (read-keyset "ks"))
+        (let ((v "k:let-bound")) (coin.create-account v (read-keyset "ks")))
+        (coin.create-account (format "k:{}" ["x"]) (read-keyset "ks"))
+        (coin.create-account "k:esc\u0041ped" (read-keyset "ks"))
+        (coin.create-account "k:quo\"te" (read-keyset "ks"))
+        (free.memo.note "(coin.create-account \"k:in-a-string\" g)")
+        ; (coin.create-account "k:in-a-comment" g)
+        (coin.create-account "k:literal" (read-keyset "ks"))
+        (coin.create-account "ab" (read-keyset "ks"))
+    "#;
+    let got = coin_create_accounts(code, Some(&data));
+    assert_eq!(
+        got,
+        vec!["k:literal", "k:from-data", "k:from-symbol", "k:quo\"te"],
+        "{got:?}"
+    );
+    // Below the events fork, rule 1 already counts every exec string: no exact list.
+    let cmd = json!({"payload": {"exec": {"data": data, "code": code}}});
+    let o = out(json!("Write succeeded"), json!([]), Value::Null);
+    let c = d3_candidates(Some(&cmd), &o, 1_000_000, MAINNET01);
+    assert!(c.exec.unwrap().coin_created.is_empty());
+}
+
+/// A `'symbol` ends at a `;` comment as at any other delimiter.
+#[test]
+fn a_symbol_key_stops_at_a_comment() {
+    let data = json!({"b": "k:from-symbol", "b;note": "k:wrong-key"});
+    let code = "(coin.create-account (read-msg 'b;note\n) (read-keyset \"ks\"))";
+    assert_eq!(
+        coin_create_accounts(code, Some(&data)),
+        vec!["k:from-symbol"]
+    );
+}
+
+/// A code text asking for more creates than [`MAX_COIN_CREATE_PER_TX`] gives that many.
+#[test]
+fn exact_creates_are_capped_per_tx() {
+    let code: String = (0..MAX_COIN_CREATE_PER_TX + 500)
+        .map(|i| format!("(coin.create-account \"k:acct-{i:05}\" g)"))
+        .collect();
+    let got = coin_create_accounts(&code, None);
+    assert_eq!(got.len(), MAX_COIN_CREATE_PER_TX);
+    assert_eq!(got[0], "k:acct-00000");
+    let cmd = json!({"payload": {"exec": {"data": null, "code": code}}});
+    let o = out(json!("Write succeeded"), json!([]), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 2_000_000, MAINNET01, &tokens);
+    let coin = pairs(&r.pairs).iter().filter(|(_, m)| *m == "coin").count();
+    assert!(
+        coin <= MAX_COIN_CREATE_PER_TX + MAX_EXEC_PAIRS_PER_TX,
+        "{coin}"
+    );
 }
