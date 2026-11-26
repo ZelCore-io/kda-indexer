@@ -6,7 +6,9 @@ use kdx_decode::header;
 use crate::error::from_api;
 use crate::gql;
 
-use crate::scalars::BigInt;
+use crate::scalars::{BigInt, DateTime};
+use kdx_api::nodeinfo::NodeFacts;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(complex)]
@@ -18,6 +20,16 @@ pub struct NetworkInfo {
     pub network_id: String,
     pub total_difficulty: f64,
     pub transaction_count: i32,
+    /// The node's last good `/info` facts (`kdx_api::nodeinfo`), read once per request.
+    #[graphql(skip)]
+    pub node: Option<Arc<NodeFacts>>,
+}
+
+/// Stock's `GenesisHeight`: a chain's first height, from the node's `/info`.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct GenesisHeight {
+    pub chain_id: String,
+    pub height: i32,
 }
 
 /// ZelCore extension `NetworkInfo.countersOfEachChain`. `blocksCount` is the chain's block
@@ -73,8 +85,80 @@ fn not_ready(field: &str) -> async_graphql::Error {
     )
 }
 
+/// The node fields before the first good `/info` answer (stock answers them from its memory
+/// cache, which is empty until its first good read).
+fn no_node_info(field: &str) -> async_graphql::Error {
+    crate::error::err(
+        crate::error::Code::NotAvailable,
+        format!("{field}: the node's /info has not been read yet"),
+    )
+}
+
+/// A node number as GraphQL `Int` (graphql-js refuses one past 32 bits, as this does).
+fn node_int(field: &str, n: i64) -> Result<i32> {
+    i32::try_from(n).map_err(|_| {
+        crate::error::err(
+            crate::error::Code::Internal,
+            format!("{field}: the node's value {n} is not a 32-bit Int"),
+        )
+    })
+}
+
+impl NetworkInfo {
+    fn facts(&self, field: &str) -> Result<&NodeFacts> {
+        self.node.as_deref().ok_or_else(|| no_node_info(field))
+    }
+}
+
 #[ComplexObject]
 impl NetworkInfo {
+    /// `nodeBlockDelay` of the node's `/info` (microseconds).
+    async fn node_block_delay(&self) -> Result<i32> {
+        node_int("nodeBlockDelay", self.facts("nodeBlockDelay")?.block_delay)
+    }
+    /// `nodeChains` of the node's `/info`, in its order.
+    async fn node_chains(&self) -> Result<Vec<String>> {
+        Ok(self.facts("nodeChains")?.chains.clone())
+    }
+    /// `nodeNumberOfChains` of the node's `/info`.
+    async fn number_of_chains(&self) -> Result<i32> {
+        node_int(
+            "numberOfChains",
+            self.facts("numberOfChains")?.number_of_chains,
+        )
+    }
+    /// `nodeGenesisHeights` of the node's `/info`, in its order.
+    async fn genesis_heights(&self) -> Result<Vec<GenesisHeight>> {
+        let f = self.facts("genesisHeights")?;
+        let mut out = Vec::with_capacity(f.genesis_heights.len());
+        for (c, h) in &f.genesis_heights {
+            out.push(GenesisHeight {
+                chain_id: c.clone(),
+                height: node_int("genesisHeights", *h)?,
+            });
+        }
+        Ok(out)
+    }
+    /// `nodePackageVersion` of the node's `/info`.
+    async fn node_package_version(&self) -> Result<String> {
+        Ok(self.facts("nodePackageVersion")?.package_version.clone())
+    }
+    /// `nodeServiceDate` of the node's `/info` as `toISOString` text; `null` when the node
+    /// sends `null` (or a date that does not parse).
+    async fn node_service_date(&self) -> Result<Option<DateTime>> {
+        let f = self.facts("nodeServiceDate")?;
+        Ok(f.service_date
+            .as_deref()
+            .and_then(crate::scalars::parse_rfc3339))
+    }
+    /// `nodeLatestBehaviorHeight` of the node's `/info`.
+    async fn node_latest_behavior_height(&self) -> Result<i32> {
+        node_int(
+            "nodeLatestBehaviorHeight",
+            self.facts("nodeLatestBehaviorHeight")?
+                .latest_behavior_height,
+        )
+    }
     /// ZelCore extension: per-chain counters, ascending by chain id.
     async fn counters_of_each_chain(&self, ctx: &Context<'_>) -> Result<Vec<CountersOfEachChain>> {
         let (tips, counts) = gql(ctx)
@@ -147,15 +231,24 @@ pub async fn network_info(ctx: &Context<'_>) -> Result<Option<NetworkInfo>> {
         return Ok(None);
     };
     let (total_difficulty, hash_rate) = cut_numbers(&tips);
+    let node = g.state()?.tips.info();
     Ok(Some(NetworkInfo {
-        api_version: "0.0".into(),
+        api_version: api_version(node.as_deref()),
         coins_in_circulation: coins.unwrap_or(0.0),
         network_hash_rate: hash_rate,
         network_host: g.settings.network_host.clone(),
         network_id: g.settings.network_id.clone(),
         total_difficulty,
         transaction_count: txs.min(i32::MAX as u64) as i32,
+        node,
     }))
+}
+
+/// Stock's `apiVersion`: the cached `/info`'s `nodeApiVersion`. Before the first good read
+/// (or with no node configured) `"0.0"`, the value every chainweb node sends; stock has no
+/// answer then and errors the whole `networkInfo`.
+fn api_version(node: Option<&NodeFacts>) -> String {
+    node.map_or_else(|| "0.0".to_owned(), |f| f.api_version.clone())
 }
 
 /// `(totalDifficulty, networkHashRate)` of the tip headers of a cut.
@@ -256,5 +349,128 @@ mod tests {
         assert_eq!(v["counters"][0]["blocksCount"], 9);
         assert!(v["counters"][0]["transactionCount"].is_null());
         assert!(v["counters"][0]["totalGasUsedInKda"].is_null());
+    }
+
+    struct N(NetworkInfo);
+
+    #[Object]
+    impl N {
+        async fn network_info(&self) -> NetworkInfo {
+            self.0.clone()
+        }
+    }
+
+    const NODE_SEL: &str =
+        "{ networkInfo { apiVersion networkId nodeBlockDelay nodeChains numberOfChains \
+        genesisHeights { chainId height } nodePackageVersion nodeServiceDate \
+        nodeLatestBehaviorHeight } }";
+
+    fn info(node: Option<serde_json::Value>) -> NetworkInfo {
+        let node =
+            node.map(|v| std::sync::Arc::new(kdx_api::nodeinfo::NodeFacts::from_info(&v).unwrap()));
+        NetworkInfo {
+            api_version: api_version(node.as_deref()),
+            coins_in_circulation: 0.0,
+            network_hash_rate: 0.0,
+            network_host: "h".into(),
+            network_id: "mainnet01".into(),
+            total_difficulty: 0.0,
+            transaction_count: 0,
+            node,
+        }
+    }
+
+    fn mainnet_info() -> serde_json::Value {
+        serde_json::json!({
+            "nodeApiVersion": "0.0", "nodeBlockDelay": 30000000,
+            "nodeChains": ["0", "1", "10", "19"],
+            "nodeGenesisHeights": [["0", 0], ["10", 852054], ["19", 852054]],
+            "nodeGraphHistory": [], "nodeHistoricalChains": [],
+            "nodeLatestBehaviorHeight": 5785924, "nodeNumberOfChains": 20,
+            "nodePackageVersion": "2.29", "nodeServiceDate": "2025-07-23T00:00:00Z",
+            "nodeVersion": "mainnet01"
+        })
+    }
+
+    /// With the served schema's response pass (`order::FieldOrder`, #62's in-place handling
+    /// of this indexer's own error codes), so a failed non-null field answers as served.
+    async fn run_node(node: Option<serde_json::Value>) -> async_graphql::Response {
+        Schema::build(N(info(node)), EmptyMutation, EmptySubscription)
+            .extension(crate::order::FieldOrder)
+            .finish()
+            .execute(NODE_SEL)
+            .await
+    }
+
+    /// The node fields answer stock's values and types from the cached `/info` (stock's
+    /// network-info fixture: `nodeServiceDate` as JavaScript's `toISOString`).
+    #[tokio::test]
+    async fn node_fields_answer_as_stock() {
+        let r = run_node(Some(mainnet_info())).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let v = serde_json::to_value(&r.data).unwrap();
+        assert_eq!(
+            v["networkInfo"],
+            serde_json::json!({
+                "apiVersion": "0.0",
+                "networkId": "mainnet01",
+                "nodeBlockDelay": 30000000,
+                "nodeChains": ["0", "1", "10", "19"],
+                "numberOfChains": 20,
+                "genesisHeights": [
+                    {"chainId": "0", "height": 0},
+                    {"chainId": "10", "height": 852054},
+                    {"chainId": "19", "height": 852054}
+                ],
+                "nodePackageVersion": "2.29",
+                "nodeServiceDate": "2025-07-23T00:00:00.000Z",
+                "nodeLatestBehaviorHeight": 5785924
+            })
+        );
+        // A `null` service date is `null` with no error (stock's field is nullable).
+        let mut n = mainnet_info();
+        n["nodeServiceDate"] = serde_json::Value::Null;
+        let r = run_node(Some(n)).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let v = serde_json::to_value(&r.data).unwrap();
+        assert!(v["networkInfo"]["nodeServiceDate"].is_null());
+        // `apiVersion` is the node's `nodeApiVersion`, as stock serves it.
+        let mut n = mainnet_info();
+        n["nodeApiVersion"] = "0.1".into();
+        let r = run_node(Some(n)).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let v = serde_json::to_value(&r.data).unwrap();
+        assert_eq!(v["networkInfo"]["apiVersion"], "0.1");
+    }
+
+    /// Before the first good `/info` answer each node field is `null` with `NOT_AVAILABLE`
+    /// beside it, the six non-null ones too (`NOT_AVAILABLE` nulls in place, #62), and
+    /// `nodeServiceDate`; the other fields still answer and `apiVersion` is `"0.0"`.
+    #[tokio::test]
+    async fn node_fields_without_an_answer_are_not_available() {
+        let r = run_node(None).await;
+        assert_eq!(r.errors.len(), 7, "{:?}", r.errors);
+        for e in &r.errors {
+            assert!(
+                format!("{:?}", e.extensions).contains("NOT_AVAILABLE"),
+                "{e:?}"
+            );
+        }
+        let v = serde_json::to_value(&r.data).unwrap();
+        assert_eq!(v["networkInfo"]["networkId"], "mainnet01");
+        assert_eq!(v["networkInfo"]["apiVersion"], "0.0");
+        let keys: Vec<&String> = v["networkInfo"].as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 9, "{keys:?}");
+        for f in [
+            "nodeBlockDelay",
+            "nodeChains",
+            "numberOfChains",
+            "genesisHeights",
+            "nodePackageVersion",
+            "nodeServiceDate",
+            "nodeLatestBehaviorHeight",
+        ] {
+            assert!(v["networkInfo"].get(f).is_some_and(|x| x.is_null()), "{f}");
+        }
     }
 }

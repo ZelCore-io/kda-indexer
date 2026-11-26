@@ -406,6 +406,15 @@ impl NodeClient {
         })
     }
 
+    /// `GET /info` sent once (no retry), with `timeout` for this request in place of the
+    /// client's, answering the JSON body as the node sent it (no field checked). For a
+    /// periodic read whose caller keeps the last good answer and tries again on its own timer.
+    pub async fn info_raw_once(&self, timeout: Duration) -> Result<Value> {
+        let url = self.root_url("info")?;
+        self.json_tries("info", 1, |h| h.get(url.clone()).timeout(timeout))
+            .await
+    }
+
     pub async fn chain_graph(&self) -> Result<ChainGraph> {
         Ok(ChainGraph::from_info(&self.info().await?))
     }

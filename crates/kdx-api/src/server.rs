@@ -56,7 +56,8 @@ pub struct Binds {
     pub admin: Vec<SocketAddr>,
 }
 
-/// Node cut tips per chain (fed by a `/cut` poll) and whether a backfill is running.
+/// Node cut tips per chain (fed by a `/cut` poll), the node's `/info` facts (read by the same
+/// poll) and whether a backfill is running.
 #[derive(Clone, Default)]
 pub struct TipWatch(Arc<TipInner>);
 
@@ -64,6 +65,8 @@ pub struct TipWatch(Arc<TipInner>);
 struct TipInner {
     tips: ArcSwapOption<NodeTips>,
     backfill: AtomicBool,
+    /// The node's last good `/info` facts (`crate::nodeinfo`).
+    info: crate::nodeinfo::SharedFacts,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +107,15 @@ impl TipWatch {
     }
     pub fn backfill(&self) -> bool {
         self.0.backfill.load(Ordering::Acquire)
+    }
+    /// Keep a node `/info` answer when it has stock's fields; `false` (the last good answer
+    /// kept) when it does not.
+    pub fn set_info(&self, raw: &serde_json::Value) -> bool {
+        crate::nodeinfo::store(&self.0.info, raw)
+    }
+    /// The last good `/info` facts, `None` before the first one.
+    pub fn info(&self) -> Option<Arc<crate::nodeinfo::NodeFacts>> {
+        self.0.info.load_full()
     }
 }
 

@@ -355,6 +355,10 @@ impl<'a> Walk<'a> {
                         "charts" if ty == Some("Pool") => DEX_LIST_COST,
                         "pool" | "poolTransactions" if ty == Some("Query") => DEX_READ_COST,
                         "transactions" if ty == Some("Pool") => DEX_READ_COST,
+                        // Decodes every user tx of the block, as its events count does.
+                        "totalGasUsedInKda" if ty == Some("Block") => {
+                            self.s.default_page.min(self.s.max_page) as u64
+                        }
                         "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
                             self.s.default_page.min(self.s.max_page) as u64
                         }

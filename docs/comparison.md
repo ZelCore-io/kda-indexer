@@ -281,12 +281,23 @@ The G4 replay of real traffic (below) met most of these classes again; its
   `FungibleChainAccount.transfers`) list a transfer to oneself once and count it once.
   Stock's `UNION ALL` of the sender and receiver halves lists it twice, under one cursor,
   and its `totalCount` adds both halves, so it counts it twice.
-- Stock fields not served (a stock client that selects one gets a validation error):
-  `Block.totalGasUsedInKda`, `NetworkInfo.genesisHeights`, `nodeBlockDelay`, `nodeChains`,
-  `nodeLatestBehaviorHeight`, `nodePackageVersion`, `nodeServiceDate`, `numberOfChains`,
-  and `NonFungibleAccount.transfers` / `NonFungibleChainAccount.transfers` (an account's NFT
-  transfers are served by the root `transfers(accountName, isNFT: true)`). Kadena's
-  published schema has none of them.
+- Every field of a stock type we serve is in our schema, so no stock selection is refused
+  by validation. Differences in the fields closed last:
+  - `NetworkInfo` node fields (`genesisHeights`, `nodeBlockDelay`, `nodeChains`,
+    `nodeLatestBehaviorHeight`, `nodePackageVersion`, `nodeServiceDate`, `numberOfChains`):
+    the same `/info` values, read every 5 minutes instead of stock's 30 s. Before the first
+    good `/info` answer ours are `null` in place with `NOT_AVAILABLE` (the types are stock's,
+    the non-null ones included) and the rest of `networkInfo` answers; stock's whole
+    `networkInfo` errors then. `apiVersion` is `/info`'s `nodeApiVersion` as stock, and
+    `"0.0"` before the first answer.
+  - `Block.totalGasUsedInKda`: the exact Σ `gas × gasPrice` of the block's user txs, rounded
+    half-up to 10 decimals. Stock adds each tx's product as a JavaScript float, so a value
+    can differ in the 10th decimal. Stock serves `"0"` for blocks it wrote before it added
+    the column; ours serves the real sum for every block.
+  - `NonFungibleAccount.transfers` / `NonFungibleChainAccount.transfers`: our NFT transfers
+    (the four-parameter `TRANSFER` events of the NFT ledgers) where stock lists its
+    `hasTokenId` transfers. A transfer to oneself is listed and counted once (stock: twice),
+    and cursors are ours, as on every list.
 - `Transfer.orderIndex` is the TRANSFER event's index in the transaction
   (`graphql-h8-transfer-order-index`).
 - `creationTime` has whole seconds, as the node's command; stock adds a fraction
@@ -319,6 +330,11 @@ The G4 replay of real traffic (below) met most of these classes again; its
   `first/after`), where stock answers. Account, transfer, event-name and public-key lists
   page `last` from their oldest row and have no such limit
   ([graphql.md](graphql.md#transactions-events-and-transfers)).
+- A list of accounts that selects `transfers { totalCount }` (as
+  `nonFungibleAccount { chainAccounts { transfers { totalCount } } }`, one count per chain) or
+  `transactions { totalCount }` needs more than 2 list totalCounts in one operation, so ours
+  refuses the whole request with `LIMIT` (`counts`), where stock answers. Select `totalCount`
+  on one account's list per request ([graphql.md](graphql.md#transactions-events-and-transfers)).
 - chainweb-data answered the `fluxteam` account list (`limit=200000`, no `minheight`) with
   recent rows only, 27 to 32 against ours' 237; ours answers the whole history (R-G4-05). The
   general cause is inferred from this one account ([api.md](api.md#compat-notes)).

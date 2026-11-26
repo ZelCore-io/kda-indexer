@@ -124,6 +124,16 @@ fn block_hash(c: u8, h: u32) -> String {
 
 /// Block `(c, h)` with a coinbase and `shapes` as its user txs, and their request keys.
 fn decoded(c: u8, h: u32, shapes: &[Shape]) -> (DecodedBlock, Vec<String>) {
+    decoded_priced(c, h, shapes, json!(1e-8))
+}
+
+/// [`decoded`] with `gas_price` as every user tx's `meta.gasPrice` (gas 1 each).
+fn decoded_priced(
+    c: u8,
+    h: u32,
+    shapes: &[Shape],
+    gas_price: Value,
+) -> (DecodedBlock, Vec<String>) {
     let mut txs = Vec::new();
     let mut rks = Vec::new();
     for (i, s) in shapes.iter().enumerate() {
@@ -131,7 +141,7 @@ fn decoded(c: u8, h: u32, shapes: &[Shape]) -> (DecodedBlock, Vec<String>) {
         let cmd = json!({
             "payload": {"exec": {"data": null, "code": format!("(tx {c} {h} {i})")}},
             "meta": {"sender": ALICE, "chainId": c.to_string(), "creationTime": ct,
-                     "gasLimit": 1000, "gasPrice": 1e-8, "ttl": 600},
+                     "gasLimit": 1000, "gasPrice": gas_price, "ttl": 600},
             "signers": [{"pubKey": ALICE_KEY}],
             "nonce": format!("n-{c}-{h}-{i}"),
             "networkId": "mainnet01",
@@ -3169,6 +3179,170 @@ mod stored_count {
                 "{q}: stored, {d}"
             );
         }
+    }
+
+    /// `NonFungibleAccount.transfers` and `NonFungibleChainAccount.transfers` (stock's
+    /// `hasTokenId` transfers of the account, all chains or the object's chain): the same rows,
+    /// order and cursors as the root `transfers(accountName, isNFT: true[, chainId])`, paged
+    /// with the same cursors, and a `totalCount` equal to the edges. Not a stored count: it
+    /// walks (a spent deadline answers `COUNT_TIMEOUT`), counts ready or not.
+    #[tokio::test]
+    async fn nft_account_transfers_are_the_root_nft_list() {
+        let lists = [
+            (
+                "nonFungibleAccount(accountName: \"k:alice\")",
+                "transfers(accountName: \"k:alice\", isNFT: true, ARGS)",
+                9,
+            ),
+            (
+                "nonFungibleChainAccount(accountName: \"k:alice\", chainId: \"0\")",
+                "transfers(accountName: \"k:alice\", isNFT: true, chainId: \"0\", ARGS)",
+                6,
+            ),
+        ];
+        let sel = "edges { cursor node { requestKey orderIndex senderAccount receiverAccount \
+                   moduleName amount chainId } }";
+        let fx = fixture();
+        for counted in [false, true] {
+            if counted {
+                reconcile(&fx);
+            }
+            for (p, root, want) in lists {
+                let (n, edges, codes, q) = nested_xfers(&fx.schema, p, false).await;
+                assert_eq!((n, edges), (Some(want), want), "{q}: {codes:?}");
+                assert_eq!(n, Some(total(&fx.schema, root).await), "{q} vs {root}");
+                let (n, _, codes, q) = nested_xfers(&fx.schema, p, true).await;
+                assert_eq!(n, None, "{q}");
+                assert!(
+                    !codes.is_empty() && codes.iter().all(|c| c.contains("TIMEOUT")),
+                    "{q}: {codes:?}"
+                );
+                // The same edges as the root list, NFT transfers only.
+                let nested = run(
+                    &fx.schema,
+                    &format!("{{ {p} {{ transfers(first: 100) {{ {sel} }} }} }}"),
+                )
+                .await;
+                let nested = &nested[parent(p)]["transfers"]["edges"];
+                let flat = run(
+                    &fx.schema,
+                    &format!("{{ {} {{ {sel} }} }}", root.replace("ARGS", "first: 100")),
+                )
+                .await;
+                assert_eq!(nested, &flat["transfers"]["edges"], "{p}");
+                for e in nested.as_array().unwrap() {
+                    assert_eq!(e["node"]["moduleName"], "marmalade-v2.ledger", "{e}");
+                }
+                // Paging by 2 with the cursors walks the same rows.
+                let mut paged = Vec::new();
+                let mut after = String::new();
+                loop {
+                    let q = format!(
+                        "{{ {p} {{ transfers(first: 2{after}) {{ pageInfo {{ hasNextPage endCursor }} edges {{ cursor }} }} }} }}"
+                    );
+                    let v = run(&fx.schema, &q).await;
+                    let c = &v[parent(p)]["transfers"];
+                    paged.extend(c["edges"].as_array().unwrap().iter().cloned());
+                    if c["pageInfo"]["hasNextPage"] != true {
+                        break;
+                    }
+                    after = format!(", after: {}", c["pageInfo"]["endCursor"]);
+                }
+                let cursors: Vec<&Value> = nested
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| &e["cursor"])
+                    .collect();
+                let paged: Vec<&Value> = paged.iter().map(|e| &e["cursor"]).collect();
+                assert_eq!(paged, cursors, "{p}");
+            }
+        }
+    }
+
+    /// `Block.totalGasUsedInKda`: Σ `gas × gasPrice` over the block's user txs (gas 1 at
+    /// 1e-8 KDA each in the fixture; the coinbase adds nothing), as stock's `DECIMAL(20,10)`
+    /// text in a JSON string, for frozen and hot blocks. Per chain the blocks add up to the
+    /// stored chain counters.
+    #[tokio::test]
+    async fn block_total_gas_used_is_its_user_txs_gas() {
+        use kdx_hot::chaincount::{parse_price, read_all, Kda};
+        let fx = fixture();
+        reconcile(&fx);
+        let mut sums: std::collections::BTreeMap<u8, Kda> = Default::default();
+        for &(c, h, shapes) in BLOCKS {
+            let q = format!(
+                "{{ block(hash: \"{}\") {{ totalGasUsedInKda transactions {{ totalCount }} }} }}",
+                block_hash(c, h)
+            );
+            let v = run(&fx.schema, &q).await;
+            let n = shapes.len() as u64;
+            let want = parse_price("0.00000001")
+                .unwrap()
+                .checked_mul_u64(n)
+                .unwrap();
+            assert_eq!(
+                v["block"]["totalGasUsedInKda"],
+                Value::String(want.to_stock_text()),
+                "{q}"
+            );
+            assert_eq!(v["block"]["transactions"]["totalCount"], n, "{q}");
+            let e = sums.entry(c).or_default();
+            *e = e.checked_add(want).unwrap();
+        }
+        assert_eq!(
+            run(
+                &fx.schema,
+                &format!(
+                    "{{ block(hash: \"{}\") {{ totalGasUsedInKda }} }}",
+                    block_hash(0, 6)
+                )
+            )
+            .await["block"]["totalGasUsedInKda"],
+            "0.0000000200"
+        );
+        let stored = read_all(&fx.store.hot.ro().unwrap()).unwrap();
+        for (c, sum) in sums {
+            assert_eq!(stored[&c].unwrap().gas, sum, "chain {c}");
+        }
+    }
+
+    /// `Block.totalGasUsedInKda` rounds half-up at the 10th decimal, as stock's
+    /// `DECIMAL(20,10)`: one tx of gas 1 at 0.00000001225 KDA (11 decimals, exactly half-way)
+    /// is `0.0000000123` (half-even and truncation give `...122`), and it is the chain
+    /// counter's addition. Then a 12-decimal price below the half: 0.000000012349 is
+    /// `0.0000000123`.
+    #[tokio::test]
+    async fn block_total_gas_used_rounds_half_up_at_the_10th_decimal() {
+        use kdx_hot::chaincount::read_all;
+        let fx = fixture();
+        reconcile(&fx);
+        let before = read_all(&fx.store.hot.ro().unwrap()).unwrap()[&0]
+            .unwrap()
+            .gas;
+        for (h, price) in [(13u32, 1.225e-8), (14, 1.2349e-8)] {
+            let mut t = fx.store.hot.rw().unwrap();
+            let mut dict = HotDict::load(&t).unwrap();
+            let (b, _) = decoded_priced(0, h, &[Shape::One], json!(price));
+            let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+            kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+            dict.persist(&mut t).unwrap();
+            t.commit().unwrap();
+            let q = format!(
+                "{{ block(hash: \"{}\") {{ totalGasUsedInKda }} }}",
+                block_hash(0, h)
+            );
+            assert_eq!(
+                run(&fx.schema, &q).await["block"]["totalGasUsedInKda"],
+                "0.0000000123",
+                "{q}"
+            );
+        }
+        let after = read_all(&fx.store.hot.ro().unwrap()).unwrap()[&0]
+            .unwrap()
+            .gas;
+        let added = kdx_hot::chaincount::parse_price("0.000000024599").unwrap();
+        assert_eq!(after, before.checked_add(added).unwrap());
     }
 
     /// Counts stay right through a reorg: unwind two hot blocks of chain 0, apply a different

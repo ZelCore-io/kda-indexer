@@ -235,6 +235,35 @@ impl Block {
             total: p.total,
         })
     }
+    /// Σ `gas × gasPrice` over the block's user txs, the coinbase excluded (stock's
+    /// `Blocks.totalGasUsed`, summed as it writes the block): exact, printed as stock prints
+    /// its `DECIMAL(20,10)` column, a JSON string rounded half-up to exactly 10 decimals
+    /// (`"0.0000690000"`). One read of the block's own txs (bounded by its tx count). A block
+    /// no longer stored (one a subscription held across a reorg) answers `NOT_AVAILABLE`.
+    async fn total_gas_used_in_kda(&self, ctx: &Context<'_>) -> Result<Decimal> {
+        let b = self.b.clone();
+        let gas = gql(ctx)
+            .state()?
+            .read(move |view| {
+                let (Ok(h), Some((c, ht, _))) =
+                    (u32::try_from(b.height), view.block_by_hash(&b.hash)?)
+                else {
+                    return Ok(None);
+                };
+                if (c, ht) != (b.chain, h) {
+                    return Ok(None);
+                }
+                let txs = view.block_txs(c, h)?;
+                Ok(Some(kdx_hot::chaincount::block_gas(&txs)))
+            })
+            .await
+            .map_err(from_api)?;
+        match gas {
+            Some(Some(k)) => Ok(Decimal::verbatim(k.to_stock_text())),
+            Some(None) => Err(err(Code::Internal, "the block's gas sum overflows")),
+            None => Err(err(Code::NotAvailable, "this block is no longer stored")),
+        }
+    }
     /// The chain's cumulative difficulty at this block, as the node's header sends it:
     /// base64url of the 32 little-endian bytes (R-P5P9-57 F1; the oracle agrees).
     async fn weight(&self) -> String {
