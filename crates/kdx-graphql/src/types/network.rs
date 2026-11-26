@@ -54,6 +54,16 @@ impl CountersOfEachChain {
     }
 }
 
+/// One chain's stored counters. A chain with no row (one the chain graph added after the
+/// counters were built) or a damaged row is not ready, never a `0` served as exact (secpass
+/// B M-15).
+fn chain_counts(
+    rows: &std::collections::BTreeMap<u8, Option<kdx_hot::chaincount::Counts>>,
+    chain: u8,
+) -> Option<kdx_hot::chaincount::Counts> {
+    rows.get(&chain).copied().flatten()
+}
+
 fn not_ready(field: &str) -> async_graphql::Error {
     crate::error::err(
         crate::error::Code::NotAvailable,
@@ -73,11 +83,7 @@ impl NetworkInfo {
                 let tips = super::block::tips_and_genesis(view)?;
                 // O(20) reads in the tips' snapshot: never ahead of or behind them.
                 let counts = if kdx_hot::chaincount::ready(&view.txn)? {
-                    let mut m = std::collections::BTreeMap::new();
-                    for &(c, _, _) in &tips {
-                        m.insert(c, kdx_hot::chaincount::get(&view.txn, c)?);
-                    }
-                    Some(m)
+                    Some(kdx_hot::chaincount::read_all(&view.txn)?)
                 } else {
                     None
                 };
@@ -90,9 +96,7 @@ impl NetworkInfo {
             .map(|(c, g, t)| CountersOfEachChain {
                 chain: c,
                 blocks: (t + 1).saturating_sub(g),
-                counts: counts
-                    .as_ref()
-                    .map(|m| m.get(&c).copied().unwrap_or_default()),
+                counts: counts.as_ref().and_then(|m| chain_counts(m, c)),
             })
             .collect();
         out.sort_by_key(|x| x.chain);
@@ -217,6 +221,19 @@ mod tests {
                  "totalGasUsedInKda": "0.0000000000"},
             ]})
         );
+    }
+
+    /// Secpass B M-15: a chain with no counters row, or a damaged one, is not ready.
+    #[test]
+    fn a_missing_or_damaged_chain_row_is_not_ready() {
+        let c = Counts {
+            user_txs: 5,
+            gas: parse_price("1").unwrap(),
+        };
+        let rows = std::collections::BTreeMap::from([(0u8, Some(c)), (1, None)]);
+        assert_eq!(super::chain_counts(&rows, 0), Some(c));
+        assert_eq!(super::chain_counts(&rows, 1), None, "damaged");
+        assert_eq!(super::chain_counts(&rows, 2), None, "missing");
     }
 
     /// Not ready: both fields `null` with `NOT_AVAILABLE`; `blocksCount` still answers.

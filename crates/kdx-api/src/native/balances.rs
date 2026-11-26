@@ -224,7 +224,7 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
         // At the walk cap, resume after the last key read, whether or not the page is full:
         // every key up to it was listed on this page or left out (N-13).
         if at_cap {
-            last = balances::parse_bal_key(&from[..from.len() - 1]).map(|(_, m, c)| (m, c));
+            last = resume_after(last, &from[..from.len() - 1]);
         }
         let next = more
             .then_some(last)
@@ -233,6 +233,12 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
         list_response(view, items, next)
     })
     .await
+}
+
+/// The cursor after a walk cut at its cap: the last key read (secpass B M-12: an
+/// unparsable key keeps the last listed row, so paging does not end early).
+fn resume_after(last: Option<(u32, u8)>, key: &[u8]) -> Option<(u32, u8)> {
+    balances::parse_bal_key(key).map_or(last, |(_, m, c)| Some((m, c)))
 }
 
 /// Accounts whose guard holds the key (inline keysets and resolved keyset references, B-4),
@@ -757,6 +763,19 @@ mod key_accounts_tests {
         assert_eq!(m["chain"], 0, "{v}");
         assert_eq!(m["balance"], "0.0", "{v}");
         assert_eq!(m["stale"], true, "{v}");
+    }
+
+    /// Secpass B M-12: at the walk cap, an unparsable last key keeps the last listed row as
+    /// the cursor instead of ending the paging; a good key moves it.
+    #[test]
+    fn a_malformed_key_at_the_cap_keeps_the_cursor() {
+        assert_eq!(
+            super::resume_after(Some((7, 3)), b"\x01garbage"),
+            Some((7, 3))
+        );
+        assert_eq!(super::resume_after(None, b"\x01garbage"), None);
+        let k = kdx_hot::balances::bal_key(5, 9, 2);
+        assert_eq!(super::resume_after(Some((7, 3)), &k), Some((9, 2)));
     }
 
     #[tokio::test]

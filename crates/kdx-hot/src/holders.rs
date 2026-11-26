@@ -260,8 +260,10 @@ pub enum Order {
 
 /// Up to `limit` holders of `module` on `chains`, in `order`, strictly past `cursor` (the
 /// [`Holder::order`] of the previous page's edge). One bounded seek per chain: at most
-/// `limit` keys read per chain, so a page costs `chains × limit` reads whatever the module's
-/// size. `check` runs before each chain and every 64 keys (the request deadline).
+/// `limit` holders read per chain, so a page costs `chains × limit` reads whatever the module's
+/// size. A damaged key is skipped and not counted (secpass B M-16), at most `limit` of them per
+/// chain, so a damaged table cannot end a page early nor make it read more than `2 × limit`
+/// keys per chain. `check` runs before each chain and every 64 keys (the request deadline).
 pub fn page(
     txn: &impl Txn,
     module: u32,
@@ -279,20 +281,24 @@ pub fn page(
         prefix[4] = c;
         let at = cursor.map(|(f, a)| hold_key(module, c, TxKey(f), a));
         let mut n = 0usize;
+        let mut skipped = 0usize;
         match order {
             Order::NewestFirst => {
                 // Keys below the cursor's (exclusive), newest first.
                 let upper = at.map(|k| k.to_vec()).unwrap_or_default();
                 for r in txn.scan_rev_prefix(Table::Holders, &prefix, &upper)? {
-                    if n >= limit {
+                    if n >= limit || skipped > limit {
                         break;
                     }
                     let (k, _) = r?;
-                    if let Some(h) = parse_hold_key(&k) {
-                        all.push(h);
+                    match parse_hold_key(&k) {
+                        Some(h) => {
+                            all.push(h);
+                            n += 1;
+                        }
+                        None => skipped += 1,
                     }
-                    n += 1;
-                    if n.is_multiple_of(64) {
+                    if (n + skipped).is_multiple_of(64) {
                         check()?;
                     }
                 }
@@ -309,11 +315,15 @@ pub fn page(
                 };
                 let mut err = None;
                 let rows = txn.scan(Table::Holders, &from, |k| {
-                    if n >= limit || !k.starts_with(&prefix) {
+                    if n >= limit || skipped > limit || !k.starts_with(&prefix) {
                         return false;
                     }
-                    n += 1;
-                    if n.is_multiple_of(64) {
+                    if parse_hold_key(k).is_some() {
+                        n += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                    if (n + skipped).is_multiple_of(64) {
                         if let Err(e) = check() {
                             err = Some(e);
                             return false;
@@ -707,6 +717,29 @@ mod tests {
         assert_eq!(ro.count(Table::HolderFirst).unwrap(), 2);
         assert_eq!(ro.count(Table::HolderByTx).unwrap(), 2);
         assert!(ready(&ro).unwrap());
+    }
+
+    /// Secpass B M-16: a damaged key in the page's range is skipped, not counted, so the page
+    /// still holds `limit` holders and the paging does not end early.
+    #[test]
+    fn a_damaged_key_does_not_end_the_page_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let m = 7u32;
+        let mut txn = hot.rw().unwrap();
+        for (a, h) in [(1u32, 1u32), (2, 2), (3, 3), (4, 4)] {
+            let k = super::hold_key(m, 0, TxKey::new(h, 0, 1), a);
+            txn.put(Table::Holders, &k, &[]).unwrap();
+        }
+        // One byte short of the height-3 key: sorts between heights 2 and 3.
+        let bad = super::hold_key(m, 0, TxKey::new(3, 0, 1), 3);
+        txn.put(Table::Holders, &bad[..16], &[]).unwrap();
+        txn.commit().unwrap();
+        let ro = hot.ro().unwrap();
+        for order in [Order::NewestFirst, Order::OldestFirst] {
+            let p = page(&ro, m, &[0], order, None, 3, &mut || Ok(())).unwrap();
+            assert_eq!(p.len(), 3, "{order:?}");
+        }
     }
 
     /// Review I-1 of PR #54: a range backfilled (or frozen) by a build without the
