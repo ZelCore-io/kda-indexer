@@ -95,6 +95,9 @@ pub struct GraphqlSettings {
     /// Longest a `totalCount` walk may run (a lower bound is answered past it). The walk also
     /// stops at half of the remaining request deadline, whichever comes first.
     pub count_budget: Duration,
+    /// Keys a `last`/`before` page of a source with no oldest-first walk may collect between
+    /// its cursor and the newest end ([`txlist::BACK_KEYS`]; tests lower it).
+    pub back_keys: usize,
 }
 
 /// Hard safety cap of the rows of one list page (`first`/`last`), of a subscription's
@@ -142,6 +145,7 @@ impl Default for GraphqlSettings {
             network_host: String::new(),
             apq: false,
             count_budget: Duration::from_millis(200),
+            back_keys: txlist::BACK_KEYS,
         }
     }
 }

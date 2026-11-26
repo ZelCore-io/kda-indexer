@@ -282,6 +282,12 @@ The G4 replay of real traffic (below) met most of these classes again; its
   (R-G4-03, [graphql.md](graphql.md#schema)).
 - Rows the node holds at 0 are not listed in balances, native or GraphQL; stock lists some
   of them and not others ([graphql.md](graphql.md#accounts)).
+- GraphQL `last`/`before` pages of `transactions(isCoinbase: true)` and of lists with no
+  account, public key, event name or `fungibleName` argument (the height walk, `events(moduleName)` alone too) reach at most
+  200,000 txs back from the newest row; past that ours answers `LIMIT` (the message names
+  `first/after`), where stock answers. Account, transfer, event-name and public-key lists
+  page `last` from their oldest row and have no such limit
+  ([graphql.md](graphql.md#transactions-events-and-transfers)).
 - chainweb-data answered the `fluxteam` account list (`limit=200000`, no `minheight`) with
   recent rows only, 27 to 32 against ours' 237; ours answers the whole history (R-G4-05). The
   general cause is inferred from this one account ([api.md](api.md#compat-notes)).
@@ -307,7 +313,10 @@ wrong. Each entry names the function and the read in `node_read`:
 - wrong values: stock's field differs from the node's command or output for that request key
   (`graphql-r62-payload-data`, `graphql-r75-exec-payload-data`, `graphql-r75-payload-rollback`,
   `graphql-r75-signer-address`, `graphql-r75-nested-order-index`,
-  `graphql-oracle-decimal-zeros`). The fields are listed in
+  `graphql-oracle-decimal-zeros`), and signer order (`cmd.signers`: stock lists one
+  transaction's signers in another order; the node's command order and ours agree, 1 record,
+  read on the node; no allowlist rule covers it, so a repeat shows as unexplained in a compare
+  run). The fields are listed in
   [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node); in `/v1/txs`,
   kda-txs also pairs a request key with another transaction's details
   ([api.md](api.md#compat-notes));
@@ -431,8 +440,8 @@ documented difference), **unknown** (not settled yet).
 | 15 | `cmd.nonce`: stock strips inner quotes | part of ~4,700 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
 | 16 | `payload.rollback` | 196 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
 | 17 | exec `payload.data` | 71 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
-| 18 | `signers[].address`: stock `null` | 51 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
-| 19 | signer order | 1 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 18 | `signers[].address`: stock `null`; the node's `addr` equals ours | 51 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
+| 19 | signer order: stock lists 1, 0; the node's command order is 0, 1 and ours | 1 | ours | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
 | 20 | `crossChainTransfer.creationTime` in whole seconds | 2 | both | [graphql.md](graphql.md#wire-formats-that-follow-the-oracle-r-p5p9-19) |
 | 21 | failed tx `badResult`: `callStack` and `info` | 117 | ours (= node, owner ruling) | [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node) |
 | 22 | zero-balance rows and missing chain rows | 42 + 16 + 38 + 61 keys + 5 | stock lists some rows the node holds at 0; ours never lists them | [graphql.md](graphql.md#accounts) |

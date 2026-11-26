@@ -465,8 +465,14 @@ the oracle puts them.
   connections): it is in the node's order, coinbase first (see "Blocks and network").
   `transactions(isCoinbase: true)` lists each block's coinbase before the block's user txs
   (see Row order).
-  `first`/`after` pages walk down from the newest row; `last`/`before` pages first collect
-  the keys between the cursor and the newest row (keys only, at most 200,000, else `LIMIT`).
+  `first`/`after` pages walk down from the newest row. `last`/`before` pages of a posting
+  list (an account, an account with `fungibleName`, `fungibleName` alone, an event name, a
+  public key, and the account connections) read that list oldest first, from the cursor or
+  the oldest row, and stop at the page, so `last: N` costs N rows plus the rows the filters
+  drop. The other sources, `transactions(isCoinbase: true)` and a list with no account, key,
+  event name or `fungibleName` argument (the height walk, `events(moduleName)` alone too),
+  first collect the keys between the cursor and the newest row (keys only, at most 200,000,
+  else `LIMIT`; stock answers those).
   Every walk checks the request deadline every 64 keys and answers `TIMEOUT` past it.
 - **Cursors** are the native API's tokens (tx key, row position and a fingerprint of the
   row's block): portable between instances, refused with `BAD_USER_INPUT` after a reorg of
