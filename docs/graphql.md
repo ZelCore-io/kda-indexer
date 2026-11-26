@@ -660,9 +660,11 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
     Our transfer postings come only from node events, which start at the events fork
     (1,138,000 on mainnet), as stock's TRANSFER rows do, so a row drained before the fork is
     not counted as touched in either. The check reads at most 10,000 transfer keys per
-    account and module, newest first, and stops once every zero row's chain is found; a
-    zero row still unresolved at the cap is listed (it exists on chain) and counted in
-    `kdx_graphql_balance_touch_capped_total`. Pages, `chainIds` and `module` walk only the
+    account and module, newest first, and at most 40,000 for all modules of one request;
+    it stops once every zero row's chain is found. A zero row still unresolved at either
+    cap is listed (it exists on chain) and counted in
+    `kdx_graphql_balance_touch_capped_total`. The request deadline ends the check with a
+    deadline error, never with a cap. Pages, `chainIds` and `module` walk only the
     rows this rule keeps; the 4,096-row cap counts every stored row of the account, as before.
   Rows come from the reconciler's reads of the accounts ingest sees named: transfer sides,
   senders, signers, event principals, the D3 receivers, and since the zero-rows fix the
