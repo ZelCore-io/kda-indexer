@@ -24,7 +24,12 @@
 //! - TxNum guard (PR #51 review I-2): each freeze and `reconcile-counts` write
 //!   `Meta row_counts_txnum` ([`TXNUM_AT`]) = `next_txnum` in their txn, and [`ready`] needs it
 //!   equal: a range a build without the stamp backfilled (or froze) is caught although no
-//!   tip moved. Backfill clears the marker itself.
+//!   tip moved.
+//! - Backfill keeps the counts from block 0 like the chain counters (secpass A I-1): each
+//!   range adds its [`Tally`] in its MDBX commit ([`add_tally`]) with the TxNum stamp, and a
+//!   new store sets the marker, so a from-scratch reindex needs no `reconcile-counts`. The
+//!   range's tally is also kept under [`RANGE`], so a resume after a kill between the MDBX and
+//!   the manifest commit subtracts it ([`undo_range`]) instead of clearing the marker.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -369,6 +374,119 @@ impl Tally {
         v.sort_unstable_by_key(|r| r.0);
         v
     }
+}
+
+/// Add (`sign` ≥ 0) or subtract a backfill range's counts, in its commit txn. A subtraction
+/// below zero clears the marker (the table was not built for those rows).
+pub fn add_tally(txn: &mut RwTxn<'_>, t: &Tally, sign: i64) -> Result<()> {
+    for ((kind, e, c), (du, dc)) in t.iter() {
+        let k = key(kind, e, c);
+        let (u, cb) = txn
+            .get(Table::RowCounts, &k)?
+            .map_or((0, 0), |v| decode_val(&v));
+        let next = if sign >= 0 {
+            Some((u.saturating_add(du), cb.saturating_add(dc)))
+        } else {
+            u.checked_sub(du).zip(cb.checked_sub(dc))
+        };
+        let (u, cb) = match next {
+            Some(v) => v,
+            None => {
+                clear_ready(txn)?;
+                (u.saturating_sub(du), cb.saturating_sub(dc))
+            }
+        };
+        if (u, cb) == (0, 0) {
+            txn.del(Table::RowCounts, &k)?;
+        } else {
+            txn.put(Table::RowCounts, &k, &encode_val((u, cb)))?;
+        }
+    }
+    Ok(())
+}
+
+/// Meta key of the last backfill range's counts (secpass A I-1, m-1): start u32, end u32, then
+/// `key ‖ encode_val` per row (26 B a row; one row per distinct (kind, entity, chain) of the
+/// range, the size of the range's [`Tally`]). Written in the range's commit, so a resume that
+/// finds the range committed to MDBX but not to the manifest subtracts exactly it.
+pub const RANGE: &str = "row_counts_range";
+
+/// The most rows [`set_range`] stores (PR #59 review m-b): 2,000,000 rows, a 52 MB Meta
+/// value. A range with more distinct (kind, entity, chain) keys stores no blob, so a resume
+/// that finds it committed to MDBX but not to the manifest clears the marker (the walk serves
+/// until `reconcile-counts`), as before the blob existed. Mainnet ranges stay far below it.
+pub const MAX_RANGE_ROWS: usize = 2_000_000;
+
+/// Store `t` as the counts of backfill range `start..end` ([`RANGE`]). Above
+/// [`MAX_RANGE_ROWS`] rows, store none (and drop an older one) and log it.
+pub fn set_range(txn: &mut RwTxn<'_>, start: u32, end: u32, t: &Tally) -> Result<()> {
+    if t.len() > MAX_RANGE_ROWS {
+        tracing::warn!(
+            start,
+            end,
+            rows = t.len(),
+            cap = MAX_RANGE_ROWS,
+            "row counts: range blob over the cap not stored; a resume of this range clears the marker"
+        );
+        return drop_range(txn);
+    }
+    let mut v = Vec::with_capacity(8 + t.len() * 26);
+    v.extend_from_slice(&start.to_be_bytes());
+    v.extend_from_slice(&end.to_be_bytes());
+    for ((kind, e, c), val) in t.iter() {
+        v.extend_from_slice(&key(kind, e, c));
+        v.extend_from_slice(&encode_val(val));
+    }
+    txn.set_meta(RANGE, &v)
+}
+
+/// [`crate::chaincount::undo_range`] for the row counts: subtract the stored counts of
+/// `start..end` when [`RANGE`] holds exactly that range. False when it does not (the caller
+/// clears the marker).
+pub fn undo_range(txn: &mut RwTxn<'_>, start: u32, end: u32) -> Result<bool> {
+    let Some(v) = txn.meta(RANGE)? else {
+        return Ok(false);
+    };
+    let head = |r: std::ops::Range<usize>| {
+        v.get(r)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_be_bytes)
+    };
+    if (head(0..4), head(4..8)) != (Some(start), Some(end)) || (v.len() - 8) % 26 != 0 {
+        return Ok(false);
+    }
+    // Compute every row first, then write (PR #59 review m-c, as chaincount): a malformed
+    // row or a subtraction below zero changes nothing and the caller clears the marker.
+    let mut next = Vec::with_capacity((v.len() - 8) / 26);
+    for row in v[8..].chunks(26) {
+        let Some((kind, e, c)) = parse_key(&row[..10]) else {
+            return Ok(false);
+        };
+        let (du, dc) = decode_val(&row[10..]);
+        let k = key(kind, e, c);
+        let (u, cb) = txn
+            .get(Table::RowCounts, &k)?
+            .map_or((0, 0), |v| decode_val(&v));
+        let Some(n) = u.checked_sub(du).zip(cb.checked_sub(dc)) else {
+            return Ok(false);
+        };
+        next.push((k, n));
+    }
+    for (k, n) in next {
+        if n == (0, 0) {
+            txn.del(Table::RowCounts, &k)?;
+        } else {
+            txn.put(Table::RowCounts, &k, &encode_val(n))?;
+        }
+    }
+    drop_range(txn)?;
+    Ok(true)
+}
+
+/// Delete [`RANGE`]: once the range is in the manifest it is never undone (PR #59 review m-a).
+pub fn drop_range(txn: &mut RwTxn<'_>) -> Result<()> {
+    txn.del(Table::Meta, RANGE.as_bytes())?;
+    Ok(())
 }
 
 /// Every `RowCounts` row as a [`Tally`] (tests).

@@ -121,6 +121,10 @@ impl HotStore {
                 // from block 0 (`holders.rs`).
                 put(crate::holders::READY, &0u64.to_be_bytes())?;
                 put(crate::holders::TXNUM_AT, &0u64.to_be_bytes())?;
+                // An empty store: the (empty) row counts are exact, and every writer keeps
+                // them from block 0, backfill included (secpass A I-1; `rowcount.rs`).
+                put(crate::rowcount::READY, &0u64.to_be_bytes())?;
+                put(crate::rowcount::TXNUM_AT, &0u64.to_be_bytes())?;
             }
             Some(v) => {
                 let v = be_u64(&v).context("Meta format_version")?;

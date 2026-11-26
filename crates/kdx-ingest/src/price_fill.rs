@@ -56,7 +56,41 @@ pub struct FillReport {
 
 /// Whether the fill has finished on this store.
 pub fn filled(txn: &impl Txn) -> Result<bool> {
-    Ok(txn.meta(meta::PRICE_FILLED)?.is_some())
+    prices::ready(txn)
+}
+
+/// First wait before a failed fill is tried again; doubled per failure up to
+/// [`RETRY_MAX`] (secpass A I-3: a failed fill is not left partial until a restart).
+pub const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
+/// Longest wait between attempts.
+pub const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Run `attempt` until it succeeds, waiting between failures (`wait` returns false when the
+/// process is stopping: then no further attempt, and None). Each failure is logged and
+/// counted in `kdx_price_fill_failures_total`; the marker stays unset meanwhile, so
+/// `lastTokenPriceInKda` answers `NOT_AVAILABLE`.
+pub fn run_with_retry(
+    mut attempt: impl FnMut() -> Result<FillReport>,
+    wait: &mut dyn FnMut(std::time::Duration) -> bool,
+) -> Option<FillReport> {
+    let mut delay = RETRY_FIRST;
+    loop {
+        match attempt() {
+            Ok(rep) => return Some(rep),
+            Err(e) => {
+                kdx_metrics::get().price_fill_failures.inc();
+                tracing::error!(
+                    error = format!("{e:#}"),
+                    retry_in_secs = delay.as_secs(),
+                    "prices: fill failed; retrying"
+                );
+            }
+        }
+        if !wait(delay) {
+            return None;
+        }
+        delay = (delay * 2).min(RETRY_MAX);
+    }
 }
 
 /// EventName ids of the trusted DEX swap events.
@@ -77,10 +111,16 @@ fn apply_batch(
     rep: &mut FillReport,
 ) -> Result<()> {
     let mut txn = hot.rw()?;
+    let mut logs = prices::FillLogs::default();
     for (k, r) in recs {
         if let Some(s) = prices::swap_of_tx(dict, r) {
             rep.swaps += 1;
-            rep.rows += u64::from(prices::upsert_fill(&mut txn, k.chain(), &s)?);
+            rep.rows += u64::from(prices::upsert_fill_with(
+                &mut txn,
+                k.chain(),
+                &s,
+                &mut logs,
+            )?);
         }
     }
     if let Some(c) = cursor {
@@ -94,6 +134,7 @@ fn apply_batch(
 /// removed is not read, and one still there cannot be removed before its row is written.
 fn apply_hot(hot: &HotStore, dict: &dyn Dict, keys: &[TxKey], rep: &mut FillReport) -> Result<()> {
     let mut txn = hot.rw()?;
+    let mut logs = prices::FillLogs::default();
     for k in keys {
         let Some(b) = txn.get(Table::TailTxs, &k.to_be_bytes())? else {
             continue;
@@ -102,7 +143,12 @@ fn apply_hot(hot: &HotStore, dict: &dyn Dict, keys: &[TxKey], rep: &mut FillRepo
         rep.hot_txs += 1;
         if let Some(s) = prices::swap_of_tx(dict, &r) {
             rep.swaps += 1;
-            rep.rows += u64::from(prices::upsert_fill(&mut txn, k.chain(), &s)?);
+            rep.rows += u64::from(prices::upsert_fill_with(
+                &mut txn,
+                k.chain(),
+                &s,
+                &mut logs,
+            )?);
         }
     }
     txn.commit()
@@ -181,7 +227,7 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<Fil
             top = top.max(h);
         }
     }
-    txn.set_meta(meta::PRICE_FILLED, &top.to_be_bytes())?;
+    prices::set_ready(&mut txn, top)?;
     txn.commit()?;
     rep.filled_height = Some(top);
     rep.secs = t0.elapsed().as_secs_f64();
@@ -386,5 +432,48 @@ mod tests {
         );
         prices::undo_block(&mut txn, 1, 10).unwrap();
         assert_eq!(prices::lookup(&txn, "free.t").unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use std::time::Duration;
+
+    use super::{run_with_retry, FillReport};
+
+    /// Secpass A I-3: a failed fill is not left partial until a restart: it is retried, with
+    /// a growing wait, until it finishes or the process stops.
+    #[test]
+    fn a_failed_fill_is_retried_until_it_finishes() {
+        let mut n = 0;
+        let mut waits: Vec<Duration> = Vec::new();
+        let r = run_with_retry(
+            || {
+                n += 1;
+                if n < 3 {
+                    anyhow::bail!("segment read failed");
+                }
+                Ok(FillReport::default())
+            },
+            &mut |d| {
+                waits.push(d);
+                true
+            },
+        );
+        assert!(r.is_some());
+        assert_eq!(n, 3);
+        assert_eq!(waits.len(), 2);
+        assert!(waits[1] > waits[0]);
+        // Stopped while waiting: no further attempt.
+        let mut tries = 0;
+        let r = run_with_retry(
+            || {
+                tries += 1;
+                anyhow::bail!("x")
+            },
+            &mut |_| false,
+        );
+        assert!(r.is_none());
+        assert_eq!(tries, 1);
     }
 }

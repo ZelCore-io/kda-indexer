@@ -228,8 +228,20 @@ the table at every block and every reorg (an unwound block's counts are recomput
 record and subtracted; the undo format is unchanged), and the freezer leaves it alone. It is
 used only while `Meta row_counts_ready` is set; until then, every count walks as before.
 
-Build it once after upgrading, and again after any command that clears the marker
-(`backfill`, `rebuild-range`, `segments add-index`, `hot drop-family`; each logs
+A new store keeps the table from block 0, as it keeps the chain counters and the holders: the
+marker is set when the store is created, each backfill range adds its counts in its MDBX
+commit with the `row_counts_txnum` stamp, and the tail adds each block. A reindex from scratch
+needs no `reconcile-counts`. A backfill killed between a range's MDBX commit and its manifest
+commit subtracts the range's stored counts and chain totals on resume (`Meta
+row_counts_range`, `chain_counters_range`), so both markers stay set. Both blobs are
+deleted once the range is in the manifest. The row-count blob takes 26 bytes per distinct
+(kind, entity, chain) key of the range and is capped at 2,000,000 keys (52 MB): a range
+above the cap stores none and logs `row counts: range blob over the cap not stored`, and a
+resume of that range clears the row-count marker as a store without the blob would (run
+`reconcile-counts`; the chain counters are not affected).
+
+Build it once on a store that predates this, and again after any command that clears the
+marker (`rebuild-range`, `segments add-index`, `hot drop-family`; each logs
 `row counts: readiness marker cleared`):
 
 ```sh
@@ -348,6 +360,17 @@ systemctl start kda-indexer-<network>
 - A new store serves the list while backfill from block 0 is still running: it is partial
   until backfill finishes, and a row moves down as backfill finds an earlier first transfer
   for it. Same as the per-chain counters.
+- Holder names: a side up to 1,024 bytes is interned as an account (stock keeps any non-empty
+  string). Each one costs event gas and is already in the stored record; the dictionary holds
+  it twice in RAM. There is no separate cap below 1 KB (a dictionary-size metric and alert
+  is a possible follow-up).
+- `HolderByTx` rows of frozen history are kept (one per holder row). Only hot txs can be
+  undone, so they are not needed after a freeze; they are kept because a backfill resume
+  uses them to drop the rows of a range that reached MDBX but not the manifest. Pruning them
+  in the freezer is a possible later saving (about the size of `Holders` again).
+- Since the whole-branch security pass, the holder sides follow stock's amount check too
+  (a number, `{decimal: "<s>"}`, `{integer: "<s>"}`) and any truthy marmalade token id; a
+  store built earlier needs one `reconcile-holders` (or the reindex) to match.
 - A store whose table was built before PR #54's fix round (suffix `*TRANSFER` names, no
   marmalade rows, accounts at most 256 bytes) needs one `reconcile-holders` to match the new
   rule; on such a store, names longer than 256 bytes that were never interned stay out until

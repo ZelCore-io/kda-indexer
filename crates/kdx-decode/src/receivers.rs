@@ -278,11 +278,17 @@ pub const MAX_EVENT_PAIRS_PER_TX: usize = 512;
 pub const MAX_EXEC_PAIRS_PER_TX: usize = 64;
 
 /// Accounts rule 2c reads exactly from one tx's `coin.create-account` calls, at most (gap
-/// Q). Not the [`MAX_EXEC_PAIRS_PER_TX`] cap: the bulk creators send 200 calls per tx
-/// (mainnet chain 12, heights 1.55M-2.16M). The tx's gas already bounds the count (each call
-/// writes a row and pays for it; a 150,000 gas limit buys well under 1,000 creates); this cap
-/// only bounds the work a hostile code text could ask of the decoder and the reconciler.
+/// Q), counting only data-backed calls (see [`coin_create_accounts`]). Not the
+/// [`MAX_EXEC_PAIRS_PER_TX`] cap: the bulk creators send 200 calls per tx (mainnet chain 12,
+/// heights 1.55M-2.16M), each guarded by its own `(read-keyset "ks<i>")` of `exec.data`.
+/// Gas does not bound the count: a call in an untaken branch or an uncalled `defun` is
+/// collected for parse gas alone (secpass A I-2). What bounds a data-backed call is the
+/// `exec.data` entry it needs, which the sender pays bytes for.
 pub const MAX_COIN_CREATE_PER_TX: usize = 1_000;
+/// Literal-only `coin.create-account` calls (account and guard both stated in the code, no
+/// `exec.data` entry behind them) kept per tx: 64, the exec-literal cap before #56
+/// ([`MAX_EXEC_PAIRS_PER_TX`]). Such calls cost only parse gas when they never run.
+pub const MAX_COIN_CREATE_LITERALS_PER_TX: usize = 64;
 /// Exec-derived token candidates kept from a module-deploy tx (D3 gap group 5): its code holds
 /// the module's own constants (a `ROOT` or genesis account its init credits) among many other
 /// literals. Literals with whitespace (doc strings, messages) are skipped there; the rest are
@@ -461,7 +467,8 @@ pub struct D3Exec {
     /// Rule 2c, exact (gap Q): the first argument of every `coin.create-account` call of the
     /// code, read from the parsed code ([`coin_create_accounts`]): a string literal, or
     /// `(read-msg k)` / `(read-string k)` of a string in `exec.data`. At most
-    /// [`MAX_COIN_CREATE_PER_TX`], [`account_like`] only, first-seen order. Interned at
+    /// [`MAX_COIN_CREATE_PER_TX`] data-backed and [`MAX_COIN_CREATE_LITERALS_PER_TX`]
+    /// literal-only, [`account_like`] only, first-seen order. Interned at
     /// decode time, so the tail marks them live. Empty below the events fork (rule 1 then
     /// counts every exec string) and when the code makes no such call.
     pub coin_created: Vec<String>,
@@ -1130,15 +1137,27 @@ fn pact_tokens(code: &str) -> Vec<PactTok> {
 /// `\"` / `\\`) gives nothing: the account is never guessed. A call inside a string or a
 /// comment is no call. A call in code that may never run (a `defun` body in a deploy, an
 /// untaken `if` branch) is still collected: the account named is exact, but the row may not
-/// exist. That is harmless, since a collected account only marks the row for the reconciler,
-/// which reads it from the node and hides an absent answer. Distinct, [`account_like`],
-/// first-seen order, at most [`MAX_COIN_CREATE_PER_TX`].
+/// exist. A collected account only marks the row for the reconciler, which reads it from the
+/// node and hides an absent answer, but each one is interned and costs a node read, so the
+/// count is bounded by what the sender pays for (secpass A I-2):
+/// - data-backed calls, at most [`MAX_COIN_CREATE_PER_TX`] in all: the account is a
+///   `read-msg` / `read-string` of `exec.data`, or a literal whose guard is
+///   `(read-keyset k)` naming an `exec.data` keyset under a key no earlier call used, whose
+///   `keys` name the account: the bare key, or `k:` + a key (the bulk creators' form), the
+///   key a 64-char lowercase hex ed25519 key. Any
+///   other entry (`{}`, a keyset of other keys, one value copied under many keys) costs the
+///   sender a few bytes, not a name's worth, and backs nothing (PR #59 review P-1);
+/// - literal-only calls, at most [`MAX_COIN_CREATE_LITERALS_PER_TX`] of them.
+///
+/// Distinct, [`account_like`], first-seen order.
 pub fn coin_create_accounts(code: &str, data: Option<&Value>) -> Vec<String> {
     let mut out = Vec::new();
     if !code.contains(COIN_CREATE) {
         return out;
     }
     let t = pact_tokens(code);
+    let mut literals = 0usize;
+    let mut used_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for i in 0..t.len() {
         if out.len() >= MAX_COIN_CREATE_PER_TX {
             break;
@@ -1148,23 +1167,80 @@ pub fn coin_create_accounts(code: &str, data: Option<&Value>) -> Vec<String> {
         {
             continue;
         }
+        // (account, whether an `exec.data` entry backs the call)
         let account = match t.get(i + 2) {
-            Some(PactTok::Str(Some(s))) => Some(s.as_str()),
+            Some(PactTok::Str(Some(s))) => {
+                // The guard `(read-keyset k)`, `k` a data keyset naming the account that no
+                // earlier call used.
+                let backed = match (
+                    t.get(i + 3),
+                    t.get(i + 4),
+                    data_key(t.get(i + 5)),
+                    t.get(i + 6),
+                ) {
+                    (
+                        Some(PactTok::Open),
+                        Some(PactTok::Word(f)),
+                        Some(k),
+                        Some(PactTok::Close),
+                    ) if f == "read-keyset"
+                        && data
+                            .and_then(|d| d.get(k))
+                            .is_some_and(|ks| keyset_names(ks, s))
+                        && !used_keys.contains(k) =>
+                    {
+                        Some(k)
+                    }
+                    _ => None,
+                };
+                Some((s.as_str(), backed))
+            }
             Some(PactTok::Open) => match (t.get(i + 3), data_key(t.get(i + 4)), t.get(i + 5)) {
                 (Some(PactTok::Word(f)), Some(k), Some(PactTok::Close))
                     if f == "read-msg" || f == "read-string" =>
                 {
-                    data.and_then(|d| d.get(k)).and_then(Value::as_str)
+                    data.and_then(|d| d.get(k))
+                        .and_then(Value::as_str)
+                        .map(|a| (a, Some(k)))
                 }
                 _ => None,
             },
             _ => None,
         };
-        if let Some(a) = account {
-            push_distinct(&mut out, a, MAX_COIN_CREATE_PER_TX);
+        let Some((a, backed)) = account else {
+            continue;
+        };
+        if backed.is_none() && literals >= MAX_COIN_CREATE_LITERALS_PER_TX {
+            continue;
+        }
+        let before = out.len();
+        push_distinct(&mut out, a, MAX_COIN_CREATE_PER_TX);
+        if out.len() > before {
+            match backed {
+                Some(k) => {
+                    used_keys.insert(k);
+                }
+                None => literals += 1,
+            }
         }
     }
     out
+}
+
+/// Whether `ks` is a keyset object whose `keys` name `account` through a 64-char lowercase
+/// hex ed25519 key: the bare key is the account, or `k:` + the key is. A short key costs the
+/// sender a few bytes, not a name's worth, so it backs nothing (PR #59 fix round 2).
+fn keyset_names(ks: &Value, account: &str) -> bool {
+    let bare = account.strip_prefix("k:").unwrap_or(account);
+    is_ed25519_hex(bare)
+        && ks
+            .get("keys")
+            .and_then(Value::as_array)
+            .is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(bare)))
+}
+
+fn is_ed25519_hex(k: &str) -> bool {
+    k.len() == 64 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The data key a `read-msg` argument names (a literal or a `'symbol`).

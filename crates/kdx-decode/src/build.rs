@@ -152,6 +152,48 @@ pub fn transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> 
     Some((p[0].as_str()?, p[1].as_str()?))
 }
 
+/// Stock's amount check (indexer-kadena `utils/transfers.ts` `parseAmount`): a JSON number,
+/// or an object whose `decimal` or `integer` member is a non-empty string (JS truthiness; the
+/// other members are ignored). Narrower than [`transfer_amount_ok`] (chainweb-data's, which
+/// the `xfer` postings keep): a plain string, `{int: ..}` and `{decimal: <number>}` fail here.
+/// Decides the holder sides (stock's `Balances` set) and so `balance()`'s zero rows.
+pub fn stock_amount_ok(v: &Value) -> bool {
+    let truthy_str = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
+    match v {
+        Value::Number(_) => true,
+        Value::Object(_) => truthy_str("decimal") || truthy_str("integer"),
+        _ => false,
+    }
+}
+
+/// JS truthiness of a JSON value (stock's `account && tokenId`).
+fn js_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+/// Stock's coin transfer (`getCoinTransfers`): name exactly `TRANSFER`, three params, string
+/// from and to, and [`stock_amount_ok`]. The holder sides of a fungible transfer.
+pub fn stock_transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a str)> {
+    if ev.name != "TRANSFER" {
+        return None;
+    }
+    let p = ev.params.as_array()?;
+    if p.len() != 3 || !stock_amount_ok(&p[2]) {
+        return None;
+    }
+    Some((p[0].as_str()?, p[1].as_str()?))
+}
+
 /// The transfer sides that give `acct` postings: only an event named exactly `TRANSFER` (the
 /// v1 rule) whose params pass `transfer_accounts`. Suffix names such as `WIZ_TRANSFER` carry
 /// `(id, from, to)` params; their "sides" are an NFT id and a receiver, not two accounts.
@@ -178,18 +220,20 @@ pub fn holder_account_ok(s: &str) -> bool {
 /// The accounts an event adds to its module's holders list, as stock's `payload.ts` builds
 /// its `Balances` rows (at most three per event, so the work per event is fixed):
 /// - a coin-shaped transfer (`getCoinTransfers`): name exactly `TRANSFER`, three params,
-///   string from and to, an amount (`acct_transfer_accounts`): both sides;
+///   string from and to, stock's amount forms (`stock_transfer_accounts`): both sides;
 /// - an NFT `RECONCILE` (`getNftTransfers`) of a module in the `marmalade-v2` or `marmalade`
-///   namespace: four params, a string token id, an amount, then two objects with an
-///   `account` member: both accounts;
+///   namespace: four params, a string token id, stock's amount forms, then two objects with
+///   an `account` member: both accounts;
 /// - on `marmalade-v2.ledger` / `marmalade.ledger`: `MINT` names `params[1]`, `TRANSFER`
-///   names its receiver `params[2]`, when the token id `params[0]` is a non-empty string.
+///   names its receiver `params[2]`, when the token id `params[0]` is truthy in JS terms
+///   (stock's `account && tokenId`: a non-empty string, a non-zero number, `true`, an object
+///   or an array; secpass A m-7).
 ///
-/// Empty sides are left out (stock: `!== ''` and `account && tokenId`). Stock would also
-/// stringify a non-string account; those are left out here. `holder_account_ok` filters
-/// the result.
+/// Empty sides are left out (stock: `!== ''` and `account && tokenId`). One documented
+/// divergence: stock would stringify a non-string account (SQL insert); only string
+/// accounts are kept here (`docs/comparison.md`). `holder_account_ok` filters the result.
 pub fn holder_sides<'a>(ev: &EventParts<'a>, out: &mut Vec<&'a str>) {
-    if let Some((from, to)) = acct_transfer_accounts(ev) {
+    if let Some((from, to)) = stock_transfer_accounts(ev) {
         out.extend([from, to]);
     }
     let Some(p) = ev.params.as_array() else {
@@ -200,18 +244,14 @@ pub fn holder_sides<'a>(ev: &EventParts<'a>, out: &mut Vec<&'a str>) {
         && p.len() == 4
         && matches!(ns, Some("marmalade-v2" | "marmalade"))
         && p[0].is_string()
-        && transfer_amount_ok(&p[1])
+        && stock_amount_ok(&p[1])
     {
         let acct = |v: &'a Value| v.as_object().and_then(|o| o.get("account"));
         if let (Some(a), Some(b)) = (acct(&p[2]), acct(&p[3])) {
             out.extend([a, b].into_iter().filter_map(Value::as_str));
         }
     }
-    if MARMALADE_LEDGERS.contains(&ev.module.as_str())
-        && p.first()
-            .and_then(Value::as_str)
-            .is_some_and(|t| !t.is_empty())
-    {
+    if MARMALADE_LEDGERS.contains(&ev.module.as_str()) && p.first().is_some_and(js_truthy) {
         let side = match ev.name {
             "MINT" => p.get(1),
             "TRANSFER" => p.get(2),
@@ -349,6 +389,7 @@ fn intern_output(o: &Value, dict: &mut impl DictMut, unindexed: &mut u32) {
         // neither an `acct` side nor a principal (a suffix-TRANSFER's id, a non-principal
         // name of an `X_TRANSFER`) is posted by `extract` under `xfer` only. It is interned
         // here too, after the event's `acct` strings, so `encode_records` already sees it.
+        let mut sides = Vec::new();
         if let Some(ev) = parse_event(e) {
             if let Some((from, to)) = transfer_accounts(&ev) {
                 for s in [from, to] {
@@ -357,9 +398,16 @@ fn intern_output(o: &Value, dict: &mut impl DictMut, unindexed: &mut u32) {
                     }
                 }
             }
+            holder_sides(&ev, &mut sides);
         }
         for a in &acc {
-            intern_account(dict, a, unindexed);
+            // Secpass A m-6: a name over `MAX_ACCOUNT_LEN` that is a holder side is interned
+            // for the holders table (`index.rs`), so it is not counted as left unindexed.
+            let mut n = 0;
+            intern_account(dict, a, &mut n);
+            if n > 0 && !(sides.contains(a) && holder_account_ok(a)) {
+                *unindexed += n;
+            }
         }
     }
 }
@@ -773,9 +821,12 @@ mod transfer_rule_tests {
         assert!(sides(&ev("free", "ledger", "RECONCILE", rec("a", "b"))).is_empty());
         let bad = json!(["t:1", 1, {"acct": "a"}, {"account": "b"}]);
         assert!(sides(&ev(v2, "ledger", "RECONCILE", bad)).is_empty());
-        // At most three sides per event (a 3-param TRANSFER on a ledger with a string third).
+        // A 3-param TRANSFER on a ledger with a string third: stock's coin rule rejects a
+        // string amount (secpass A I-4), so only the marmalade receiver `params[2]` is kept.
         let t3 = sides(&ev(v2, "ledger", "TRANSFER", json!(["t:1", "a", "5"])));
-        assert_eq!(t3, ["t:1", "a", "5"]);
+        assert_eq!(t3, ["5"]);
+        let t3 = sides(&ev(v2, "ledger", "TRANSFER", json!(["t:1", "a", 5])));
+        assert_eq!(t3, ["t:1", "a"]);
         // Accounts up to 1024 bytes.
         assert!(holder_account_ok(&"a".repeat(MAX_HOLDER_ACCOUNT_LEN)));
         assert!(!holder_account_ok(&"a".repeat(MAX_HOLDER_ACCOUNT_LEN + 1)));

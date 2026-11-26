@@ -272,3 +272,27 @@ fn damaged_row_is_not_served() {
     txn.commit().unwrap();
     assert!(!chaincount::marker_set(&hot.ro().unwrap()).unwrap());
 }
+
+/// Secpass A m-9: `kdx_chain_counters_unpriced` counts the unwind of an unpriced tx under
+/// `mode="unwind"`, so `backfill + tail - unwind` is the net number of unpriced txs stored
+/// (comparable with `reconcile-counts --check`'s `unpriced`) after any reorg.
+#[test]
+fn an_unpriced_tx_unwound_is_counted_under_unwind() {
+    let d = tempfile::tempdir().unwrap();
+    let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+    let m = kdx_metrics::get();
+    let get = |mode: &str| {
+        m.chain_counters_unpriced
+            .get_or_create(&vec![("mode", mode.to_string())])
+            .get()
+    };
+    let (tail0, unwind0) = (get("tail"), get("unwind"));
+    let r = tx(0, 5, 1, 100, "\"bad\"");
+    let mut t = hot.rw().unwrap();
+    chaincount::add_tx(&mut t, &r, 1).unwrap();
+    chaincount::add_tx(&mut t, &r, -1).unwrap();
+    chaincount::add_tx(&mut t, &r, 1).unwrap();
+    t.commit().unwrap();
+    assert!(get("tail") >= tail0 + 2);
+    assert!(get("unwind") > unwind0, "unwind counted");
+}

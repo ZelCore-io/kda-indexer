@@ -86,7 +86,7 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
         }
         txn.commit().unwrap();
     }
-    let store = Arc::new(Store::open(hot, d.path()).unwrap());
+    let store = Arc::new(Store::open(hot.clone(), d.path()).unwrap());
     let settings = ApiSettings {
         network: "mainnet01".into(),
         deadline: Duration::from_secs(5),
@@ -104,6 +104,17 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
     let st = Api::new(store, settings, TipWatch::default()).state();
     let schema = build_schema(st.clone(), GraphqlSettings::default(), None);
     let app = router(schema.clone()).with_state(st);
+
+    // Secpass A I-3: until the swap history fill has finished, the table holds only what the
+    // tail stored since: NOT_AVAILABLE, not a price from partial history.
+    let v = ask(&app, "kaddex.kdx").await;
+    assert_eq!(v["data"]["lastTokenPriceInKda"], Value::Null, "{v}");
+    assert_eq!(v["errors"][0]["extensions"]["code"], "NOT_AVAILABLE", "{v}");
+    {
+        let mut txn = hot.rw().unwrap();
+        kdx_hot::prices::set_ready(&mut txn, 0).unwrap();
+        txn.commit().unwrap();
+    }
 
     // N-06: the request deadline governs the scan. Spent before the read: an error, not an
     // answer computed past it.
