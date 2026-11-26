@@ -242,18 +242,30 @@ impl Iterator for PostingIter {
 }
 
 impl PostingIter {
-    /// The same entries, oldest (smallest) first. A decoded (Delta or Elias-Fano) list is
-    /// walked forwards; a Roaring list is decoded whole (one range's list) and reversed.
+    /// The same entries, oldest (smallest) first. Call it on a fresh iterator (before `next`).
     pub fn oldest_first(self) -> Box<dyn Iterator<Item = u64>> {
+        self.oldest_from(None)
+    }
+
+    /// The entries `>= base + min` (None = all), oldest (smallest) first, read lazily: a
+    /// decoded (Delta or Elias-Fano) list is cut at `min` and walked forwards; a Roaring list
+    /// seeks its first container at `min` and walks up one value at a time, in O(1) memory,
+    /// so a caller that stops after a page touches about a page of entries (N-01). Call it on
+    /// a fresh iterator (before `next`).
+    pub fn oldest_from(self, min: Option<u32>) -> Box<dyn Iterator<Item = u64>> {
         let base = self.base;
-        if matches!(self.inner, Inner::Roaring(_)) {
-            let mut v: Vec<u64> = self.collect();
-            v.reverse();
-            return Box::new(v.into_iter());
-        }
         match self.inner {
-            Inner::Vec(v) => Box::new(v.into_iter().map(move |x| base + u64::from(x))),
-            Inner::Roaring(_) => unreachable!("handled above"),
+            Inner::Vec(mut v) => {
+                if let Some(m) = min {
+                    let n = v.partition_point(|&x| x < m);
+                    v.drain(..n);
+                }
+                Box::new(v.into_iter().map(move |x| base + u64::from(x)))
+            }
+            Inner::Roaring(it) => {
+                let fwd = RoaringFwd::new(it.view, it.max, min.unwrap_or(0));
+                Box::new(fwd.map(move |x| base + u64::from(x)))
+            }
         }
     }
 }
@@ -691,6 +703,8 @@ pub struct RoaringIter {
     next_ci: usize,
     cur: Cursor,
     hi: u32,
+    /// The bound the walk was opened with (None = all), for [`PostingIter::oldest_from`].
+    max: Option<u32>,
 }
 
 impl RoaringIter {
@@ -739,6 +753,183 @@ impl RoaringIter {
     }
 }
 
+/// Position inside one container of an ascending walk.
+enum FwdCursor {
+    Empty,
+    /// Values `[i, n)` of the array at `off` remain.
+    Array {
+        off: usize,
+        i: usize,
+        n: usize,
+    },
+    /// `word` holds the bits of word `w` not yet returned; words above `w` are untouched.
+    Bitmap {
+        off: usize,
+        w: usize,
+        word: u64,
+    },
+    /// Runs `[r, runs)` remain; `v` is the next value, inside run `r`.
+    Run {
+        off: usize,
+        r: usize,
+        runs: usize,
+        v: u32,
+    },
+}
+
+/// Ascending walk over a `RoaringView` from a minimum value up to an inclusive bound, one
+/// value at a time: no container is decoded into memory (N-01).
+struct RoaringFwd {
+    view: Arc<RoaringView>,
+    /// Index of the container `cur` walks; containers above it are not entered yet.
+    ci: usize,
+    cur: FwdCursor,
+    hi: u32,
+    max: u32,
+    done: bool,
+}
+
+impl RoaringFwd {
+    fn new(view: Arc<RoaringView>, max: Option<u32>, min: u32) -> RoaringFwd {
+        let (mk, low) = ((min >> 16) as u16, (min & 0xFFFF) as u16);
+        // The first container with key >= mk.
+        let ci = view.keys.partition_point(|&k| k < mk);
+        let mut it = RoaringFwd {
+            ci,
+            cur: FwdCursor::Empty,
+            hi: 0,
+            max: max.unwrap_or(u32::MAX),
+            done: max.is_some_and(|m| m < min),
+            view,
+        };
+        if !it.done && ci < it.view.keys.len() {
+            let from = if it.view.keys[ci] == mk { low } else { 0 };
+            it.enter(ci, from);
+        } else {
+            it.done = true;
+        }
+        it
+    }
+
+    /// Position `cur` at the first value `>= from` of container `i`.
+    fn enter(&mut self, i: usize, from: u16) {
+        let v = &*self.view;
+        self.ci = i;
+        self.hi = u32::from(v.keys[i]) << 16;
+        let off = v.offs[i];
+        let card = v.cards[i] as usize;
+        self.cur = if v.run[i] {
+            let runs = usize::from(v.u16_at(off));
+            let from = u32::from(from);
+            // The first run that ends at or above `from`.
+            let mut r = 0;
+            while r < runs && v.run_end(off, r) < from {
+                r += 1;
+            }
+            if r < runs {
+                let s = u32::from(v.u16_at(off + 2 + 4 * r));
+                FwdCursor::Run {
+                    off,
+                    r,
+                    runs,
+                    v: s.max(from),
+                }
+            } else {
+                FwdCursor::Empty
+            }
+        } else if card as u32 <= ARRAY_LIMIT {
+            let (mut lo, mut hi) = (0usize, card);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if v.u16_at(off + 2 * mid) < from {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            FwdCursor::Array {
+                off,
+                i: lo,
+                n: card,
+            }
+        } else {
+            let (w, bit) = (usize::from(from >> 6), u32::from(from & 63));
+            FwdCursor::Bitmap {
+                off,
+                w,
+                word: v.word_at(off, w) & (!0u64 << bit),
+            }
+        };
+    }
+
+    fn next_raw(&mut self) -> Option<u32> {
+        loop {
+            if self.done {
+                return None;
+            }
+            let v = &*self.view;
+            match &mut self.cur {
+                FwdCursor::Empty => {}
+                FwdCursor::Array { off, i, n } => {
+                    if *i < *n {
+                        let x = v.u16_at(*off + 2 * *i);
+                        *i += 1;
+                        return Some(self.hi | u32::from(x));
+                    }
+                }
+                FwdCursor::Bitmap { off, w, word } => loop {
+                    if *word != 0 {
+                        let bit = word.trailing_zeros();
+                        *word &= *word - 1;
+                        return Some(self.hi | (*w as u32 * 64 + bit));
+                    }
+                    if *w == 1023 {
+                        break;
+                    }
+                    *w += 1;
+                    *word = v.word_at(*off, *w);
+                },
+                FwdCursor::Run {
+                    off,
+                    r,
+                    runs,
+                    v: val,
+                } => {
+                    if *r < *runs {
+                        let out = *val;
+                        if out >= v.run_end(*off, *r) {
+                            *r += 1;
+                            if *r < *runs {
+                                *val = u32::from(v.u16_at(*off + 2 + 4 * *r));
+                            }
+                        } else {
+                            *val += 1;
+                        }
+                        return Some(self.hi | out);
+                    }
+                }
+            }
+            if self.ci + 1 >= v.keys.len() {
+                self.done = true;
+                return None;
+            }
+            self.enter(self.ci + 1, 0);
+        }
+    }
+}
+
+impl Iterator for RoaringFwd {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        let x = self.next_raw()?;
+        if x > self.max {
+            self.done = true;
+            return None;
+        }
+        Some(x)
+    }
+}
+
 /// Iterator over the values `<= max` of `view`, newest first, and their count.
 fn roaring_list(view: Arc<RoaringView>, max: Option<u32>, base: u64) -> Result<PostingIter> {
     let mut it = RoaringIter {
@@ -746,6 +937,7 @@ fn roaring_list(view: Arc<RoaringView>, max: Option<u32>, base: u64) -> Result<P
         view: Arc::clone(&view),
         cur: Cursor::Empty,
         hi: 0,
+        max,
     };
     let mut len = view.len();
     if let Some(m) = max {
@@ -935,6 +1127,30 @@ mod list_tests {
                     want,
                     "runs {runs} big {big} #{n} max {max:?}"
                 );
+                // N-01: the lazy ascending walk, from container edges and random minimums.
+                let mut mins = vec![None, Some(0), Some(last), Some(last + 1)];
+                for k in [0u32, 1, 2, 3, 33, 40] {
+                    mins.extend([
+                        Some((k << 16).saturating_sub(1)),
+                        Some(k << 16),
+                        Some((k << 16) | 65535),
+                    ]);
+                }
+                mins.extend((0..2).map(|_| Some(rnd(last))));
+                // Every third bound keeps the debug-build run short.
+                for min in mins.into_iter().filter(|_| n % 3 == 0) {
+                    let asc: Vec<u64> = vals
+                        .iter()
+                        .filter(|&&v| max.is_none_or(|m| v <= m) && min.is_none_or(|m| v >= m))
+                        .map(|&v| 9 + v as u64)
+                        .collect();
+                    let it = roaring_list(Arc::clone(&view), max, 9).unwrap();
+                    assert_eq!(
+                        it.oldest_from(min).collect::<Vec<_>>(),
+                        asc,
+                        "runs {runs} big {big} #{n} max {max:?} min {min:?}"
+                    );
+                }
                 // The same through the memo (twice: miss, then hit).
                 let key = MemoKey {
                     range: 0,

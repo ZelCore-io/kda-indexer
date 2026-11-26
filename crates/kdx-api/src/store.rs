@@ -866,13 +866,14 @@ impl View {
             let scan = self
                 .txn
                 .scan_rev_prefix(Table::TailPostings, &prefix[..9], &up)?;
-            Box::new(
-                scan.map(|r| -> ApiResult<TxKey> {
+            let read = scan
+                .map(|r| -> ApiResult<TxKey> {
                     let (k, _) = r?;
                     Ok(parse_txkey(&k[9..]).context("posting key")?)
                 })
-                .take_while(move |r| r.as_ref().map_or(true, |k| k.height() >= floor.max(min_h)))
-                .filter(move |r| r.as_ref().map_or(true, keep)),
+                .take_while(move |r| r.as_ref().map_or(true, |k| k.height() >= floor.max(min_h)));
+            Box::new(
+                with_deadline(read, self.deadline).filter(move |r| r.as_ref().map_or(true, keep)),
             )
         };
 
@@ -908,14 +909,16 @@ impl View {
                                 let t = r?;
                                 Ok(seg.txkey(t).context("posting TxNum without a key")?)
                             })
-                            .take_while(move |r| r.as_ref().map_or(true, |k| k.height() >= min_h))
-                            .filter(move |r| {
-                                r.as_ref()
-                                    .map_or(true, |k| keep(k) && upper.is_none_or(|u| *k < u))
-                            }),
+                            .take_while(move |r| r.as_ref().map_or(true, |k| k.height() >= min_h)),
                     ),
                 }
             };
+        // The deadline counts keys read, not keys kept: a `keep` that drops most keys
+        // must not walk past it (N-01).
+        let frozen = with_deadline(frozen, self.deadline).filter(move |r| {
+            r.as_ref()
+                .map_or(true, |k| keep(k) && upper.is_none_or(|u| *k < u))
+        });
 
         Ok(with_deadline(hot.chain(frozen), self.deadline))
     }
@@ -942,10 +945,13 @@ impl View {
                         let t = r?;
                         Ok(seg.txkey(t).context("posting TxNum without a key")?)
                     })
-                    .take_while(move |r| r.as_ref().map_or(true, |k| k.height() < frontier))
-                    .filter(move |r| r.as_ref().map_or(true, |k| k.height() >= min_height)),
+                    .take_while(move |r| r.as_ref().map_or(true, |k| k.height() < frontier)),
             )
         };
+        // The deadline is checked on every key read, before any filter (N-01): the segment
+        // walk seeks to `min_height`, and this filter only guards that seek.
+        let frozen = with_deadline(frozen, self.deadline)
+            .filter(move |r| r.as_ref().map_or(true, |k| k.height() >= min_height));
 
         // Hot part: keys at `max(hot_floor, min_height)` and above, ascending.
         let p9 = posting_key(f as u8, entity, TxKey::new(0, 0, 0))[..9].to_vec();
@@ -1472,6 +1478,11 @@ mod pact_steps_tests {
     /// Block 5 frozen (in one step range below `FRONTIER`, as the freezer writes it) and block
     /// 12 hot: the steps of `PACT` at positions 1 and 2 of each.
     fn frozen_and_hot() -> (tempfile::TempDir, Arc<Store>) {
+        frozen_with(&[true, false])
+    }
+
+    /// `frozen_and_hot` with one frozen `PACT` step per flag at height 5.
+    fn frozen_with(oks: &[bool]) -> (tempfile::TempDir, Arc<Store>) {
         let d = tempfile::tempdir().unwrap();
         let g = kdx_hot::Geometry {
             max_gb: 1,
@@ -1491,7 +1502,7 @@ mod pact_steps_tests {
             WriteOpts::new(1, 0),
         )
         .unwrap();
-        w.push(&block(5, &[true, false])).unwrap();
+        w.push(&block(5, oks)).unwrap();
         let entry = w.finish().unwrap();
         let mut m = Manifest::new("mainnet01");
         m.push(entry.clone()).unwrap();
@@ -1506,6 +1517,53 @@ mod pact_steps_tests {
 
         let store = Arc::new(Store::open(hot, d.path()).unwrap());
         (d, store)
+    }
+
+    /// N-01: the posting walks count the request deadline on every key read, before a
+    /// filter drops it: a chain filter that keeps nothing ends in a deadline error, not in a
+    /// silent walk of the whole list past the deadline. The oldest-first walk seeks to its
+    /// minimum height and lists the same keys as the newest-first one, reversed.
+    #[test]
+    fn posting_walks_check_the_deadline_before_filters() {
+        use super::PostingQuery;
+        let (_d, store) = frozen_with(&[true; 300]);
+        let ent = pact_entity(&PACT);
+        let view = store
+            .view(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let newest: Vec<TxKey> = view
+            .postings(Family::Pact, ent, PostingQuery::default())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(newest.len(), 302);
+        let mut oldest: Vec<TxKey> = view
+            .postings_oldest(Family::Pact, ent, 0)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        oldest.reverse();
+        assert_eq!(oldest, newest);
+        let above: Vec<TxKey> = view
+            .postings_oldest(Family::Pact, ent, 6)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(above, vec![TxKey::new(12, 0, 1), TxKey::new(12, 0, 2)]);
+
+        let view = store
+            .view(Instant::now() + Duration::from_millis(30))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        let q = PostingQuery {
+            chain: Some(1),
+            ..PostingQuery::default()
+        };
+        let got: Vec<_> = view.postings(Family::Pact, ent, q).unwrap().collect();
+        assert!(
+            matches!(got.last(), Some(Err(crate::ApiError::Deadline))),
+            "a filter that keeps nothing still hits the deadline: {got:?}"
+        );
     }
 
     /// Review minor 7: `pact_steps` carries each step's stored success flag, from a frozen
