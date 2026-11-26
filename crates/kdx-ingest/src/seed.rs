@@ -44,6 +44,8 @@ pub struct SeedReport {
     pub ranges: u64,
     pub ranges_skipped: u64,
     pub entities: u64,
+    /// Posting entries read, wanted or not (hot rows and segment entities).
+    pub postings_read: u64,
     /// Dirty rows inserted (rows already dirty are not counted).
     pub dirty_inserted: u64,
     pub tokens_noted: u64,
@@ -160,6 +162,10 @@ pub fn mark_modules(
     modules: &HashSet<u32>,
     stop: &dyn Fn() -> bool,
 ) -> Result<SeedReport> {
+    // N-15: no module (`--rewalk coin` alone) has no postings to mark.
+    if modules.is_empty() {
+        return Ok(SeedReport::default());
+    }
     walk(hot, segdir, Some(modules), stop)
 }
 
@@ -187,12 +193,17 @@ fn walk(
         Some(set) if fam == Family::Xfer as u8 => set.contains(&(entity as u32)),
         Some(set) => coin.is_some_and(|c| set.contains(&c)),
     };
+    // N-15: `acct` postings only give `coin` rows; a run without `coin` skips the family.
+    let families: &[u8] = match only {
+        Some(set) if !coin.is_some_and(|c| set.contains(&c)) => &[Family::Xfer as u8],
+        _ => &[Family::Xfer as u8, Family::Acct as u8],
+    };
     // A module-limited run never writes the seed's cursor.
     let cur = |c: Cursor| only.is_none().then_some(c);
     let mut p = Pending::default();
 
     // Hot pass: TailPostings of `xfer` (0) and `acct` (1).
-    for fam in [Family::Xfer as u8, Family::Acct as u8] {
+    for &fam in families {
         let mut after: Option<Vec<u8>> = Some(vec![fam]);
         let mut first = true;
         loop {
@@ -210,6 +221,7 @@ fn walk(
             let Some((last, _)) = rows.last() else { break };
             after = Some(last.clone());
             for (k, _) in &rows {
+                rep.postings_read += 1;
                 let entity = u64::from_be_bytes(k[1..9].try_into().context("posting key")?);
                 if !wanted(fam, entity) {
                     continue;
@@ -250,7 +262,7 @@ fn walk(
         rep.ranges += 1;
         for fam in [Family::Xfer, Family::Acct] {
             let f = fam as u8;
-            if f < fam0 {
+            if f < fam0 || !families.contains(&f) {
                 continue;
             }
             let post = &r.postings[fam as usize];
@@ -269,6 +281,7 @@ fn walk(
                     return Ok(rep);
                 }
                 let entity = post.entity_at(i);
+                rep.postings_read += 1;
                 if !wanted(f, entity) {
                     continue;
                 }
@@ -397,5 +410,54 @@ mod tests {
             .is_none());
         assert!(txn.meta(meta::BALANCES_SEEDED).unwrap().is_none());
         assert!(txn.meta(meta::BALANCES_SEED_CURSOR).unwrap().is_none());
+    }
+
+    /// N-15: a run for no module reads nothing, and a run without `coin` does not read the
+    /// `acct` postings (only `coin` rows come from them). `stop` is polled once per chunk read.
+    #[test]
+    fn mark_modules_reads_only_the_families_it_needs() {
+        use kdx_hot::Geometry;
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(&dir.path().join("hot"), Geometry::default()).unwrap();
+        let segdir = dir.path().join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+        let wiza = 7u32;
+        let key = |fam: Family, entity: u64| {
+            let mut k = vec![fam as u8];
+            k.extend_from_slice(&entity.to_be_bytes());
+            k.extend_from_slice(&kdx_types::TxKey::new(100, 1, 1).to_be_bytes());
+            k
+        };
+        {
+            let mut txn = hot.rw().unwrap();
+            let mut dict = kdx_hot::HotDict::load(&txn).unwrap();
+            use kdx_types::DictMut;
+            dict.intern(kdx_types::DictKind::Module, "coin");
+            dict.persist(&mut txn).unwrap();
+            txn.put(
+                Table::TailPostings,
+                &key(Family::Xfer, (1 << 32) | u64::from(wiza)),
+                &[],
+            )
+            .unwrap();
+            txn.put(Table::TailPostings, &key(Family::Acct, 1), &[])
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let polls = Cell::new(0u32);
+        let stop = || {
+            polls.set(polls.get() + 1);
+            false
+        };
+        let rep = mark_modules(&hot, &segdir, &HashSet::new(), &stop).unwrap();
+        assert_eq!((rep.dirty_inserted, rep.postings_read), (0, 0));
+        assert_eq!(polls.get(), 0, "an empty set reads nothing");
+        let rep = mark_modules(&hot, &segdir, &HashSet::from([wiza]), &stop).unwrap();
+        assert_eq!(rep.dirty_inserted, 1);
+        assert_eq!(rep.postings_read, 1, "the acct posting is not read");
+        // The full seed still reads both families.
+        let rep = run(&hot, &segdir, &|| false).unwrap();
+        assert_eq!(rep.postings_read, 2);
     }
 }
