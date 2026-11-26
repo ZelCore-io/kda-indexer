@@ -331,6 +331,10 @@ impl<'a> Walk<'a> {
                             crate::MAX_NFT_HOLDINGS as u64
                         }
                         "node" | "nodes" if ty == Some("Query") => self.node_reads(f),
+                        // A LIKE scan of up to `LIKE_SCAN_ROWS` swap rows (N-06).
+                        "lastTokenPriceInKda" if ty == Some("Query") => {
+                            kdx_hot::prices::LIKE_SCAN_ROWS as u64
+                        }
                         "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
                             self.s.default_page.min(self.s.max_page) as u64
                         }
@@ -1333,6 +1337,26 @@ mod tests {
         assert_eq!(page("(before: \"c\", last: 0)"), 1);
         assert_eq!(page("(after: \"c\")"), 21);
         assert_eq!(page("(after: null, first: 0)"), 21);
+    }
+
+    /// N-06: `lastTokenPriceInKda` costs its scan's rows, so aliases of it reach the
+    /// ceiling; one, or a few, are served (stock's answer for normal documents).
+    #[test]
+    fn last_token_price_costs_its_scan() {
+        let one = served("{ lastTokenPriceInKda(moduleName: \"kdx\") }", json!({})).unwrap();
+        assert!(one >= kdx_hot::prices::LIKE_SCAN_ROWS as u64, "cost {one}");
+        let n = (BUDGET_CEILING / one + 1) as usize;
+        let many: String = (0..n)
+            .map(|i| format!("a{i}: lastTokenPriceInKda(moduleName: \"kdx\") "))
+            .collect();
+        assert_eq!(
+            served(&format!("{{ {many} }}"), json!({})),
+            Err(format!("{:?}", Some(&Value::from("budget"))))
+        );
+        let few: String = (0..4)
+            .map(|i| format!("a{i}: lastTokenPriceInKda(moduleName: \"kdx\") "))
+            .collect();
+        assert!(served(&format!("{{ {few} }}"), json!({})).is_ok());
     }
 
     /// B1: aliases of the nested `first: 0` document past the ceiling are refused by the
