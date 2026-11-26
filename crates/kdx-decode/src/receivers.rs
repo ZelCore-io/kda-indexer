@@ -444,7 +444,8 @@ pub struct D3Event {
 /// The `exec` part of a tx as D3 needs it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct D3Exec {
-    /// Below the events fork: the strings count for coin too (uncapped).
+    /// The strings count for coin too: below the events fork (uncapped), or when the code
+    /// calls `coin.create-account` (rule 2c, capped like the token rows).
     pub coin: bool,
     /// Modules the code calls (`<m>.fn`) and does not deploy, minus those that emitted an
     /// event in the tx from the events fork on; the filter keeps the tracked tokens.
@@ -578,6 +579,9 @@ pub fn d3_candidates(
             .and_then(Value::as_str)
             .unwrap_or("");
         let coin = height < forks.events;
+        // Rule 2c (zero rows, gap Q): `coin.create-account` writes a row at 0 and no event
+        // names its account at any height, so its strings count for coin (capped).
+        let coin_create = !coin && calls_coin_create(code);
         // From the events fork on, a token whose own events appear in the tx already has its
         // accounts named there (TRANSFER marks them; rule 3 the rest): only a token call that
         // emitted nothing of the token at all needs the exec strings (dry run on KDA-03: without
@@ -596,7 +600,7 @@ pub fn d3_candidates(
         }
         let (refs, ref_calls) = modref_args(code);
         let refs: Vec<ModRef> = refs.into_iter().filter(|(m, _)| keep(m)).collect();
-        if coin || !called.is_empty() || !deployed.is_empty() || !refs.is_empty() {
+        if coin || coin_create || !called.is_empty() || !deployed.is_empty() || !refs.is_empty() {
             let cap = if coin {
                 usize::MAX
             } else {
@@ -626,7 +630,7 @@ pub fn d3_candidates(
                 .unwrap_or("")
                 .to_owned();
             c.exec = Some(D3Exec {
-                coin,
+                coin: coin || coin_create,
                 called,
                 deployed,
                 strings,
@@ -652,6 +656,9 @@ pub fn d3_candidates(
 ///    of `result.data` (a receiver built at run time and returned, D3 b), for every tracked
 ///    token `<m>` the code calls (`<m>.fn`; from the events fork on only one that emitted
 ///    nothing in the tx), and for coin below the events fork.
+///
+///    2c. **`coin.create-account`** at any height: the account it creates holds a row at 0
+///    that no event names (zero rows, gap Q), so the exec strings count for coin too.
 ///
 ///    2b. **A tracked token named in code** (review I1: a dotted reference anywhere, bound
 ///    through `let`, in a dead branch or a list, or the module of a qualified call) that
@@ -946,6 +953,27 @@ pub fn token_receivers(
 /// outside string literals, `'symbols` and `;` comments (security review: a literal is data,
 /// not a call).
 fn called_modules(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in code_words(code) {
+        if let Some((m, f)) = w.rsplit_once('.') {
+            if !m.is_empty() && !f.is_empty() && !out.iter().any(|x: &String| x == m) {
+                out.push(m.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// The coin function that writes a row with no event naming its account.
+const COIN_CREATE: &str = "coin.create-account";
+
+/// Whether `code` calls `coin.create-account` (outside strings, `'symbols` and comments).
+fn calls_coin_create(code: &str) -> bool {
+    code.contains(COIN_CREATE) && code_words(code).iter().any(|w| w == COIN_CREATE)
+}
+
+/// The words of `code` outside string literals, `'symbols` and `;` comments.
+fn code_words(code: &str) -> Vec<String> {
     let b = code.as_bytes();
     let mut bare = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -978,15 +1006,10 @@ fn called_modules(code: &str) -> Vec<String> {
         bare.push(b' ');
     }
     let bare = String::from_utf8_lossy(&bare);
-    let mut out = Vec::new();
-    for w in bare.split(|c: char| is_delim(c as u8) || !c.is_ascii()) {
-        if let Some((m, f)) = w.rsplit_once('.') {
-            if !m.is_empty() && !f.is_empty() && !out.iter().any(|x: &String| x == m) {
-                out.push(m.to_owned());
-            }
-        }
-    }
-    out
+    bare.split(|c: char| is_delim(c as u8) || !c.is_ascii())
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The modules `code` deploys (`(module <name> ..)`, qualified by the last `(namespace ..)`

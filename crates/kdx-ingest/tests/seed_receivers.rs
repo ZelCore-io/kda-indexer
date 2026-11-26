@@ -2024,3 +2024,48 @@ fn bench_parallel_history_walk() {
         );
     }
 }
+
+/// Zero rows (gap Q): `coin.create-account` after the events fork leaves a row at 0 that no
+/// event names. The D3 pass marks it (rule 2c), and a store whose pass ran before the rule
+/// gets it from `reconcile-balances --rewalk coin`: a history walk of coin that begins at the
+/// events fork (no tx below it needs rule 2c), not at TxNum 0.
+#[test]
+fn a_coin_rewalk_begins_at_the_events_fork_and_marks_created_accounts() {
+    const NEW: &str = "c0ffee0000000000000000000000000000000000000000000000000000000001";
+    let (_d, c) = d3_store();
+    let mut o = d3_opts(false);
+    o.history_inline = false;
+    o.forks.events = 20;
+    let cmd = json!({"payload": {"exec": {
+        "code": format!("(coin.create-account \"{NEW}\" (read-keyset \"ks\"))"),
+        "data": {"ks": {"keys": ["aa11"], "pred": "keys-all"}}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([event("coin", "TRANSFER", json!([SENDER, "k:miner", 0.001]))]);
+    commit_block(&c, block_of(26, vec![d3_tx(5000, cmd, evs, Value::Null)]));
+    clear_marks(&c);
+    seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    assert!(
+        dirty_in(&c, NEW, "coin"),
+        "the D3 pass marks the created row"
+    );
+    // A store whose D3 pass ran before rule 2c: the row was never marked.
+    clear_marks(&c);
+    assert!(!dirty_in(&c, NEW, "coin"));
+    let mut txn = c.hot.rw().unwrap();
+    let coin = balances::coin_module(&txn).unwrap().expect("coin");
+    balances::queue_rewalk(&mut txn, &[coin]).unwrap();
+    txn.commit().unwrap();
+    let (start, _) = frozen_txnum_at(&c, 20);
+    let mut w = seed_receivers::history_begin(&c.hot, &c.dict, &c.segdir, &o)
+        .unwrap()
+        .expect("a coin walk is pending");
+    assert_eq!(w.position(), (start, false));
+    walk_to_end(&c, &o, &mut w);
+    assert!(
+        dirty_in(&c, NEW, "coin"),
+        "the coin rewalk marks the created row"
+    );
+    assert!(balances::rewalk_pending(&c.hot.ro().unwrap())
+        .unwrap()
+        .is_empty());
+}
