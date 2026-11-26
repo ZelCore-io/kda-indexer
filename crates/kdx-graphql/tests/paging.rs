@@ -2415,3 +2415,163 @@ async fn is_coinbase_true_puts_the_coinbase_first_in_its_block() {
         );
     }
 }
+
+/// The posting lists of the fixture (account, transfer, fungible, event and public-key
+/// sources), with key filters (`chainId`, heights) and row filters (`fungibleName`, the
+/// sender rule) that drop rows the walk reads.
+fn posting_lists() -> Vec<List> {
+    let a = format!("accountName: \"{ALICE}\"");
+    let a0 = format!("{a}, chainId: \"0\"");
+    let coin_transfer = "qualifiedEventName: \"coin.TRANSFER\"";
+    let root = |field: &'static str, args: &str, node: &'static str, total: bool| {
+        list(format!("{field}({args}, ARGS) SEL"), &[field], node, total)
+    };
+    let nested =
+        |parent: &'static str, args: &str, field: &'static str, node: &'static str, total: bool| {
+            let q = format!("{parent}({args}) {{ {field}(ARGS) SEL }}");
+            list(q, &[parent, field], node, total)
+        };
+    vec![
+        root("transfers", &a, TRANSFER, true),
+        root(
+            "transfers",
+            &format!("{a}, fungibleName: \"coin\""),
+            TRANSFER,
+            true,
+        ),
+        root("transfers", &a0, TRANSFER, true),
+        root(
+            "transactions",
+            &format!("{a}, minHeight: 6, maxHeight: 11"),
+            TX,
+            true,
+        ),
+        root("transfers", "fungibleName: \"coin\"", TRANSFER, true),
+        root("events", coin_transfer, EVENT, true),
+        root(
+            "events",
+            &format!("{coin_transfer}, minHeight: 4, maxHeight: 11"),
+            EVENT,
+            true,
+        ),
+        root("transactions", &a, TX, true),
+        root(
+            "transactions",
+            &format!("{a}, fungibleName: \"coin\""),
+            TX,
+            true,
+        ),
+        root(
+            "transactionsByPublicKey",
+            &format!("publicKey: \"{ALICE_KEY}\""),
+            TX,
+            true,
+        ),
+        nested("fungibleAccount", &a, "transfers", TRANSFER, false),
+        nested("fungibleAccount", &a, "transactions", TX, true),
+        nested("fungibleChainAccount", &a0, "transfers", TRANSFER, false),
+        nested("fungibleChainAccount", &a0, "transactions", TX, true),
+        nested("nonFungibleAccount", &a, "transactions", TX, true),
+    ]
+}
+
+/// gql.transfers:1000551: `last: N` on a posting list reads the list from its oldest row, so
+/// a list with more txs than the `last`/`before` key cap answers it (it answered `LIMIT`:
+/// the page collected every key down from the newest first). Here the cap is 2 txs and every
+/// list is longer: `last: 1` is the oldest row, and every backward page join equals the big
+/// page with the right `pageInfo`.
+#[tokio::test]
+async fn last_pages_of_posting_lists_read_from_the_oldest_row_past_the_key_cap() {
+    let fx = fixture_with(GraphqlSettings {
+        back_keys: 2,
+        ..GraphqlSettings::default()
+    });
+    let mut fails = Vec::new();
+    for l in &posting_lists() {
+        let full = big_page(&fx.schema, l).await;
+        let txs: HashSet<&Value> = full.iter().map(|r| &r["node"]["requestKey"]).collect();
+        assert!(
+            txs.len() > 2 || l.node == TX && full.len() > 2,
+            "{}: the list must hold more txs than the cap",
+            l.query
+        );
+        let v = run(&fx.schema, &l.text("last: 1")).await;
+        let c = conn(&v, &l.path);
+        let edges = c["edges"].as_array().cloned().unwrap_or_default();
+        assert_eq!(edges, full[full.len() - 1..], "{}: last: 1", l.query);
+        if let Err(e) = check_page(l, c, &edges, false, (false, true), full.len()) {
+            fails.push(format!("{} last: 1: {e}", l.query));
+        }
+        let ks: Vec<usize> = (1..=full.len() + 1).collect();
+        fails.extend(joins(&fx.schema, l, &ks, true).await);
+    }
+    fails.truncate(40);
+    assert!(fails.is_empty(), "{}", fails.join("\n"));
+}
+
+/// `last: N, before: C` on a posting list is the N rows above C in the big page (the
+/// first/after walk, unchanged), for every cursor C and N from 1 to 3, with the right
+/// `pageInfo`. Below the cap this is what the newest-first key collection answered.
+#[tokio::test]
+async fn last_before_on_posting_lists_is_the_rows_above_the_cursor() {
+    for gs in [
+        GraphqlSettings::default(),
+        GraphqlSettings {
+            back_keys: 2,
+            ..GraphqlSettings::default()
+        },
+    ] {
+        let fx = fixture_with(gs);
+        let mut fails = Vec::new();
+        for l in &posting_lists() {
+            let full = big_page(&fx.schema, l).await;
+            for (i, row) in full.iter().enumerate() {
+                let c = row["cursor"].as_str().unwrap();
+                for n in 1..=3usize {
+                    let v = run(&fx.schema, &l.text(&format!("last: {n}, before: \"{c}\""))).await;
+                    let cn = conn(&v, &l.path);
+                    let edges = cn["edges"].as_array().cloned().unwrap_or_default();
+                    let want = &full[i.saturating_sub(n)..i];
+                    if edges != want {
+                        fails.push(format!(
+                            "{} last {n} before row {i}: {:?} != {:?}",
+                            l.query,
+                            ids(&edges),
+                            ids(want)
+                        ));
+                    }
+                    if let Err(e) = check_page(l, cn, &edges, true, (true, i > n), full.len()) {
+                        fails.push(format!("{} last {n} before row {i}: {e}", l.query));
+                    }
+                }
+            }
+        }
+        fails.truncate(40);
+        assert!(fails.is_empty(), "{}", fails.join("\n"));
+    }
+}
+
+/// Sources with no oldest-first walk keep the key cap: `isCoinbase: true` (coinbase-first
+/// order) and the height walk answer `LIMIT` once `last` reaches more txs than the cap.
+#[tokio::test]
+async fn last_pages_of_other_sources_keep_the_key_cap() {
+    let fx = fixture_with(GraphqlSettings {
+        back_keys: 2,
+        ..GraphqlSettings::default()
+    });
+    for args in ["isCoinbase: true, last: 1", "last: 1"] {
+        let q = format!("{{ transactions({args}) {{ edges {{ node {{ hash }} }} }} }}");
+        let r = fx.schema.execute(q.as_str()).await;
+        let e = r.errors.first().unwrap_or_else(|| panic!("{q}: no error"));
+        assert!(
+            e.message.contains("last/before reaches more than 2 txs"),
+            "{q}: {e:?}"
+        );
+        let code = e
+            .extensions
+            .as_ref()
+            .and_then(|x| x.get("code"))
+            .map(|c| c.to_string());
+        assert_eq!(code.as_deref(), Some("\"LIMIT\""), "{q}: {e:?}");
+    }
+}

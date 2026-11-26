@@ -23,9 +23,13 @@
 //!   is a heavy read (`ApiState::read_heavy`, H-1), except a list of one block
 //!   ([`block_list`], R-P5P9-60 D1): nested in the block or a root list with `blockHash`,
 //!   which reads that block by key on a plain read slot.
-//! - `first`/`after` walks newest first. `last`/`before` first collects the keys between the
-//!   cursor and the newest end (keys only, at most [`BACK_KEYS`]), then loads from the cursor
-//!   outward. Both check the request deadline every 64 keys.
+//! - `first`/`after` walks newest first. `last`/`before` on a plain posting list (an account,
+//!   an account's transfers of one module, an event name, a public key, a sender) reads the
+//!   postings oldest first from the cursor (or the oldest row) and stops at the page, so
+//!   `last: N` costs N rows plus the rows the filters drop. Other sources (a sender
+//!   intersection, `isCoinbase: true`, the height walk) first collect the keys between the
+//!   cursor and the newest end (keys only, at most [`BACK_KEYS`], else `LIMIT`), then load
+//!   from the cursor outward. Both check the request deadline every 64 keys.
 //! - `totalCount` (GQ-10) is a count walk of at most [`COUNT_CAP`] items, run only when the
 //!   field is selected. It stops at the sooner of `count_budget` (200 ms by default, counted
 //!   from when the read starts) and half of the remaining deadline, and then answers the items
@@ -51,7 +55,8 @@ use crate::error::{bad_input, err, from_api, Code};
 use crate::types::Block;
 use crate::{deadline, gql};
 
-/// Keys a backward page may collect between its cursor and the newest end.
+/// Keys a backward page of a source with no oldest-first walk ([`oldest_keys`]) may collect
+/// between its cursor and the newest end (`GraphqlSettings::back_keys`).
 pub const BACK_KEYS: usize = 200_000;
 /// `totalCount` cap (GQ-10).
 pub const COUNT_CAP: u64 = 10_000;
@@ -722,14 +727,13 @@ fn through_tx(upto: TxKey) -> TxKey {
     TxKey(upto.0.saturating_add(1 << 8))
 }
 
-/// Candidate keys, newest first, with every key-level filter applied.
-fn keys<'v>(
-    view: &'v View,
-    src: &Src,
+/// The height bounds of a walk (`f`'s, the walk's and the depth caps') and the key-level
+/// filter every walk applies: [`keys`] newest first and [`oldest_keys`] oldest first.
+fn key_rule<'v>(
     f: KeyFilter,
     caps: &'v Caps,
     b: Bounds,
-) -> ApiResult<KeySource<'v>> {
+) -> (Option<u32>, Option<u32>, impl Fn(TxKey) -> bool + Copy + 'v) {
     let min_h = opt_max(f.min_h, b.min_h);
     let max_h = opt_min(f.max_h, caps.max());
     let keep = move |k: TxKey| {
@@ -740,6 +744,56 @@ fn keys<'v>(
             && b.upto.is_none_or(|u| rank(k, b.cb_first) <= u)
             && caps.allows(k)
     };
+    (min_h, max_h, keep)
+}
+
+/// Candidate keys of a plain posting source, **oldest first**, from `from` (inclusive) on,
+/// with the same key-level filters as [`keys`]: the keys [`keys`] lists at or above `from`,
+/// in reverse. `None` for a source with no oldest-first walk: a sender intersection, a
+/// [`coinbase_first`] walk (its order is not TxKey order) and the listed or height sources,
+/// which keep the newest-first collection.
+fn oldest_keys<'v>(
+    view: &'v View,
+    src: &Src,
+    f: KeyFilter,
+    caps: &'v Caps,
+    from: Option<TxKey>,
+    cb_first: bool,
+) -> ApiResult<Option<Box<dyn Iterator<Item = ApiResult<TxKey>> + 'v>>> {
+    let Src::Post(fam, entity) = *src else {
+        return Ok(None);
+    };
+    if cb_first {
+        return Ok(None);
+    }
+    let b = Bounds {
+        min_h: from.map(|k| k.height()),
+        ..Bounds::default()
+    };
+    let (min_h, max_h, keep) = key_rule(f, caps, b);
+    let walk = view
+        .postings_oldest(fam, entity, min_h.unwrap_or(0))?
+        // Ascending: past `max_h` no key can be kept.
+        .take_while(move |r| {
+            r.as_ref()
+                .map_or(true, |k| max_h.is_none_or(|m| k.height() <= m))
+        })
+        .filter(move |r| {
+            r.as_ref()
+                .map_or(true, |k| from.is_none_or(|c| *k >= c) && keep(*k))
+        });
+    Ok(Some(Box::new(walk)))
+}
+
+/// Candidate keys, newest first, with every key-level filter applied.
+fn keys<'v>(
+    view: &'v View,
+    src: &Src,
+    f: KeyFilter,
+    caps: &'v Caps,
+    b: Bounds,
+) -> ApiResult<KeySource<'v>> {
+    let (min_h, max_h, keep) = key_rule(f, caps, b);
     let listed = |mut v: Vec<(TxKey, TxRecord)>| -> KeySource<'v> {
         v.retain(|(k, _)| keep(*k));
         v.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
@@ -966,9 +1020,10 @@ pub fn run_page(
     spec: &ListSpec,
     page: &Page<PageCursor>,
     deadline: Instant,
+    back_keys: usize,
 ) -> ApiResult<(Vec<(String, Item)>, PageInfo)> {
     if !matches!(spec.source, SourceSpec::Block(_)) {
-        return run_page_desc(view, spec, page, deadline);
+        return run_page_desc(view, spec, page, deadline, back_keys);
     }
     let flipped = Page {
         dir: match page.dir {
@@ -977,7 +1032,7 @@ pub fn run_page(
         },
         ..page.clone()
     };
-    let (mut edges, info) = run_page_desc(view, spec, &flipped, deadline)?;
+    let (mut edges, info) = run_page_desc(view, spec, &flipped, deadline, back_keys)?;
     edges.reverse();
     Ok((
         edges,
@@ -996,6 +1051,7 @@ fn run_page_desc(
     spec: &ListSpec,
     page: &Page<PageCursor>,
     deadline: Instant,
+    back_keys: usize,
 ) -> ApiResult<(Vec<(String, Item)>, PageInfo)> {
     let cur = tx_cursor(view, page)?;
     let cb_first = coinbase_first(spec);
@@ -1036,6 +1092,32 @@ fn run_page_desc(
             }
         }
         Dir::Backward => {
+            // A plain posting list reads from the cursor (or its oldest row) towards the
+            // newest end and stops at the page: `last: N` costs N rows plus the rows the
+            // filters drop, however far the newest row is (gql.transfers:1000551).
+            if let Some(asc) =
+                oldest_keys(view, &src, spec.filter, &caps, cur.map(|c| c.key), cb_first)?
+            {
+                'a: for (i, kr) in asc.enumerate() {
+                    past(deadline, i)?;
+                    let k = kr?;
+                    let Some(d) = load(view, k, None, &mut blocks)? else {
+                        continue;
+                    };
+                    for (sub, it) in rows.rows(&d) {
+                        if cur.is_some_and(|c| c.key == k && sub <= c.sub) {
+                            continue;
+                        }
+                        walked.push((cursor(&d, sub), it));
+                        if walked.len() > page.n {
+                            break 'a;
+                        }
+                    }
+                }
+                let (edges, info) = finish(walked, page, |e| e.0.clone());
+                return Ok((edges.into_iter().map(|(_, e)| e).collect(), info));
+            }
+            // Other sources collect the keys between the cursor and the newest end first.
             let b = Bounds {
                 upto: None,
                 min_h: cur.map(|c| c.key.height()),
@@ -1050,9 +1132,9 @@ fn run_page_desc(
                     break;
                 }
                 ks.push(k);
-                if ks.len() > BACK_KEYS {
+                if ks.len() > back_keys {
                     return Err(ApiError::Unavailable(format!(
-                        "last/before reaches more than {BACK_KEYS} txs: page with first/after"
+                        "last/before reaches more than {back_keys} txs: page with first/after"
                     )));
                 }
             }
@@ -1360,6 +1442,7 @@ async fn list_as(
     let g = gql(ctx);
     let state = g.state()?.clone();
     let page = args.parse(&g.settings)?;
+    let back_keys = g.settings.back_keys;
     let dl = deadline(ctx);
     let xchain = matches!(spec.rows, Rows::Transfers { nft: false, .. })
         && selects(ctx, "crossChainTransfer");
@@ -1393,7 +1476,7 @@ async fn list_as(
         if !reads {
             return Ok((Vec::new(), PageInfo::default(), exact));
         }
-        let (mut edges, info) = run_page(view, &sp, &page, dl)?;
+        let (mut edges, info) = run_page(view, &sp, &page, dl, back_keys)?;
         if xchain {
             let mut blocks = Blocks::default();
             for (_, it) in edges.iter_mut() {

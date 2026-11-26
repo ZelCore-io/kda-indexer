@@ -532,6 +532,7 @@ impl GraphqlConfig {
             network_host: self.network_host.clone(),
             apq: self.apq,
             count_budget: Duration::from_millis(self.count_budget_ms),
+            back_keys: kdx_graphql::txlist::BACK_KEYS,
         }
     }
 }
