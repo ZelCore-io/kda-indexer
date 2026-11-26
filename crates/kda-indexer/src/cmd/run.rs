@@ -461,6 +461,15 @@ async fn follow(
         let (c, s) = (ctx.clone(), price_stop.clone());
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                // Derived rows of another layout are cleared here and rebuilt by the fill.
+                let mut w = c.hot.rw()?;
+                if kdx_hot::dex::ensure_layout(&mut w)? {
+                    tracing::info!(
+                        layout = kdx_hot::dex::LAYOUT,
+                        "dex: derived rows cleared for a new layout; the fill rebuilds them"
+                    );
+                }
+                w.commit()?;
                 if kdx_ingest::dex_fill::filled(&c.hot.ro()?)? {
                     return Ok(());
                 }

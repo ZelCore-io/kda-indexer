@@ -10,9 +10,15 @@
 //! - One total timeout per poll (connect, headers and body), so a slow-loris server costs one
 //!   poll; the body is read in chunks and dropped past `max_response_bytes`.
 //! - The price must be a JSON number (or numeric text) in `[min_price, max_price]`, and the
-//!   answer's `Symbol`, when present, must be `KDA`. A value more than `max_jump_pct` away from
-//!   the last accepted one is held back until `confirm_polls` polls in a row agree with it
-//!   (within the same band), so one poisoned answer cannot move the served USD values.
+//!   answer's `Symbol`, when present, must be `KDA`.
+//! - The answer's `Time` (RFC 3339) must be within `max_age` of now (not more than 5 minutes
+//!   ahead) and newer than the last accepted answer's, so a stale, cached or replayed answer
+//!   is not taken as current.
+//! - Jump guard, cumulative: a value more than `max_jump_pct` away from the *anchor* is held
+//!   back until `confirm_polls` polls in a row agree with it (within the same band). The anchor
+//!   is a stored rate: it moves only after a rate is persisted, and then only once an hour (or
+//!   to a confirmed jump), so a run of smaller steps cannot walk the price past the band
+//!   within the hour either.
 //! - Any failure keeps the last good value (logged with its age). Nothing here panics, and the
 //!   task never touches ingest: its write is one short txn of one row, in its own blocking task.
 
@@ -40,7 +46,14 @@ pub struct DiaSettings {
     pub max_price: f64,
     pub max_jump_pct: f64,
     pub confirm_polls: u32,
+    /// Oldest accepted answer `Time`.
+    pub max_age: Duration,
 }
+
+/// How long the jump guard's anchor stays put once set.
+pub const ANCHOR_SECS: u64 = 3_600;
+/// How far ahead of our clock an answer's `Time` may be.
+pub const MAX_AHEAD_SECS: u64 = 300;
 
 impl Default for DiaSettings {
     fn default() -> Self {
@@ -54,6 +67,7 @@ impl Default for DiaSettings {
             max_price: 10_000.0,
             max_jump_pct: 50.0,
             confirm_polls: 3,
+            max_age: Duration::from_secs(2 * 3_600),
         }
     }
 }
@@ -68,6 +82,10 @@ pub enum PollError {
     OutOfRange(String),
     /// A jump past `max_jump_pct`, not yet confirmed (polls seen so far).
     Held(u32),
+    /// The answer's `Time` is older than `max_age` or ahead of our clock.
+    Stale(String),
+    /// The answer's `Time` is not newer than the last accepted one.
+    Replay(String),
 }
 
 impl std::fmt::Display for PollError {
@@ -79,6 +97,8 @@ impl std::fmt::Display for PollError {
             PollError::Garbage(e) => write!(f, "unreadable answer: {e}"),
             PollError::OutOfRange(p) => write!(f, "price {p} outside the accepted range"),
             PollError::Held(n) => write!(f, "price jump held back ({n} poll(s) agree so far)"),
+            PollError::Stale(t) => write!(f, "answer time {t} is not current"),
+            PollError::Replay(t) => write!(f, "answer time {t} is not newer than the last one"),
         }
     }
 }
@@ -93,8 +113,15 @@ pub fn client(s: &DiaSettings) -> anyhow::Result<reqwest::Client> {
         .build()?)
 }
 
-/// Fetch and read one price (no jump check).
-pub async fn fetch(c: &reqwest::Client, s: &DiaSettings) -> Result<Amount, PollError> {
+/// A DIA quotation: the price and its `Time` (unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quote {
+    pub price: Amount,
+    pub time: u64,
+}
+
+/// Fetch and read one quotation (no time or jump check).
+pub async fn fetch(c: &reqwest::Client, s: &DiaSettings) -> Result<Quote, PollError> {
     let mut resp = c
         .get(&s.url)
         .header("accept", "application/json")
@@ -121,7 +148,74 @@ pub async fn fetch(c: &reqwest::Client, s: &DiaSettings) -> Result<Amount, PollE
         }
         body.extend_from_slice(&chunk);
     }
-    parse_price(&body, s)
+    let price = parse_price(&body, s)?;
+    let time = parse_time(&body)?;
+    Ok(Quote { price, time })
+}
+
+/// Days from 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// RFC 3339 UTC time (`YYYY-MM-DDTHH:MM:SS[.frac](Z|+00:00)`, as DIA sends) to unix seconds.
+pub fn rfc3339_secs(t: &str) -> Option<u64> {
+    let b = t.as_bytes();
+    if b.len() < 20
+        || b.len() > 40
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| -> Option<i64> {
+        let x = t.get(r)?;
+        x.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| x.parse().ok())?
+    };
+    let (y, mo, d, h, mi, se) = (
+        n(0..4)?,
+        n(5..7)?,
+        n(8..10)?,
+        n(11..13)?,
+        n(14..16)?,
+        n(17..19)?,
+    );
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let mut rest = &t[19..];
+    if let Some(f) = rest.strip_prefix('.') {
+        let k = f.bytes().take_while(u8::is_ascii_digit).count();
+        if k == 0 {
+            return None;
+        }
+        rest = &f[k..];
+    }
+    if !matches!(rest, "Z" | "z" | "+00:00") {
+        return None;
+    }
+    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3_600 + mi * 60 + se;
+    u64::try_from(secs).ok()
+}
+
+/// Read `Time` from a DIA answer.
+pub fn parse_time(body: &[u8]) -> Result<u64, PollError> {
+    let v: Value = serde_json::from_slice(body).map_err(|e| PollError::Garbage(e.to_string()))?;
+    v.get("Time")
+        .and_then(Value::as_str)
+        .and_then(rfc3339_secs)
+        .ok_or_else(|| PollError::Garbage("no RFC 3339 Time".into()))
 }
 
 /// Read `Price` from a DIA answer and check its range.
@@ -151,44 +245,88 @@ pub fn parse_price(body: &[u8], s: &DiaSettings) -> Result<Amount, PollError> {
         .ok_or_else(|| PollError::Garbage("Price not representable".into()))
 }
 
-/// Jump guard over accepted prices.
+/// Freshness and jump guard over quotations.
 #[derive(Debug, Clone, Default)]
 pub struct Guard {
-    last: Option<(Amount, f64)>,
+    /// The anchor: a persisted rate and when it became the anchor (unix s).
+    anchor: Option<(Amount, f64, u64)>,
+    /// The `Time` of the last accepted answer.
+    last_time: Option<u64>,
     pending: Option<(f64, u32)>,
+    /// The last check accepted a confirmed jump (the anchor moves to it once persisted).
+    jumped: bool,
+}
+
+fn as_f64(p: &Amount) -> f64 {
+    p.to_text().parse().unwrap_or(f64::NAN)
 }
 
 impl Guard {
-    /// The last accepted price.
-    pub fn last(&self) -> Option<&Amount> {
-        self.last.as_ref().map(|l| &l.0)
+    /// The anchor rate.
+    pub fn anchor(&self) -> Option<&Amount> {
+        self.anchor.as_ref().map(|l| &l.0)
     }
 
-    /// Accept `p` unless it jumps more than `max_jump_pct` from the last accepted price and
-    /// fewer than `confirm_polls` polls in a row (each within the band of the first) agree.
-    pub fn check(&mut self, p: Amount, s: &DiaSettings) -> Result<Amount, PollError> {
-        let f: f64 = p.to_text().parse().unwrap_or(f64::NAN);
+    /// Seed from a stored rate (restart): it is the anchor, set at `at`.
+    pub fn seed(&mut self, p: Amount, at: u64) {
+        let f = as_f64(&p);
+        self.anchor = Some((p, f, at));
+    }
+
+    /// Accept `q` at `now` unless its `Time` is stale, ahead of `now` or not newer than the
+    /// last accepted one, or its price is more than `max_jump_pct` from the anchor and fewer
+    /// than `confirm_polls` polls in a row (each within the band of the first) agree.
+    /// Nothing moves the anchor here: call [`Guard::persisted`] once the rate is stored.
+    pub fn check(&mut self, q: Quote, now: u64, s: &DiaSettings) -> Result<Amount, PollError> {
+        let shown = || q.time.to_string();
+        if q.time.saturating_add(s.max_age.as_secs()) < now
+            || q.time > now.saturating_add(MAX_AHEAD_SECS)
+        {
+            return Err(PollError::Stale(shown()));
+        }
+        if self.last_time.is_some_and(|t| q.time <= t) {
+            return Err(PollError::Replay(shown()));
+        }
+        let f = as_f64(&q.price);
+        if !f.is_finite() {
+            return Err(PollError::Garbage("Price not representable".into()));
+        }
         let within = |a: f64, b: f64| (a - b).abs() * 100.0 <= b * s.max_jump_pct;
-        match &self.last {
-            Some((_, lf)) if !within(f, *lf) => {
+        self.jumped = false;
+        match &self.anchor {
+            Some((_, af, _)) if !within(f, *af) => {
                 let n = match self.pending {
                     Some((pf, n)) if within(f, pf) => n + 1,
                     _ => 1,
                 };
-                let anchor = match self.pending {
+                let first = match self.pending {
                     Some((pf, _)) if n > 1 => pf,
                     _ => f,
                 };
                 if n < s.confirm_polls.max(1) {
-                    self.pending = Some((anchor, n));
+                    self.pending = Some((first, n));
                     return Err(PollError::Held(n));
                 }
+                self.jumped = true;
             }
             _ => {}
         }
         self.pending = None;
-        self.last = Some((p.clone(), f));
-        Ok(p)
+        self.last_time = Some(q.time);
+        Ok(q.price)
+    }
+
+    /// The rate `p` accepted by the last [`Guard::check`] was stored at `now`: it becomes the
+    /// anchor when there is none, the anchor is an hour old, or `p` was a confirmed jump.
+    pub fn persisted(&mut self, p: &Amount, now: u64) {
+        let due = match &self.anchor {
+            None => true,
+            Some((_, _, at)) => now.saturating_sub(*at) >= ANCHOR_SECS,
+        };
+        if due || self.jumped {
+            self.seed(p.clone(), now);
+        }
+        self.jumped = false;
     }
 }
 
@@ -220,7 +358,7 @@ pub async fn run(hot: Arc<HotStore>, s: DiaSettings, stop: CancellationToken) {
     let mut guard = Guard::default();
     let mut good_at: Option<u64> = None;
     if let Ok(Ok(Some((hour, r)))) = hot.ro().map(|t| kdx_hot::dex_usd::latest(&t)) {
-        let _ = guard.check(r, &s);
+        guard.seed(r, u64::from(hour) * 3600);
         good_at = Some(u64::from(hour) * 3600);
     }
     let mut tick = tokio::time::interval(s.interval.max(Duration::from_secs(1)));
@@ -231,7 +369,7 @@ pub async fn run(hot: Arc<HotStore>, s: DiaSettings, stop: CancellationToken) {
             _ = tick.tick() => {}
         }
         let got = match fetch(&c, &s).await {
-            Ok(p) => guard.check(p, &s),
+            Ok(q) => guard.check(q, now_secs(), &s),
             Err(e) => Err(e),
         };
         match got {
@@ -240,7 +378,10 @@ pub async fn run(hot: Arc<HotStore>, s: DiaSettings, stop: CancellationToken) {
                 let h = hot.clone();
                 let r = rate.clone();
                 match tokio::task::spawn_blocking(move || store(&h, secs, &r)).await {
-                    Ok(Ok(())) => good_at = Some(secs),
+                    Ok(Ok(())) => {
+                        guard.persisted(&rate, secs);
+                        good_at = Some(secs);
+                    }
                     Ok(Err(e)) => tracing::warn!(error = %e, "dia: storing the rate failed"),
                     Err(e) => tracing::warn!(error = %e, "dia: store task"),
                 }
@@ -278,6 +419,10 @@ mod tests {
         let app = axum::Router::new()
             .route("/ok", get(move || async move { ok }))
             .route("/garbage", get(|| async { "<html>nope" }))
+            .route(
+                "/notime",
+                get(|| async { r#"{"Symbol":"KDA","Price":0.005}"# }),
+            )
             .route("/neg", get(|| async { r#"{"Price":-1}"# }))
             .route("/huge", get(|| async { r#"{"Price":1e300}"# }))
             .route("/str", get(|| async { r#"{"Price":"abc"}"# }))
@@ -323,7 +468,10 @@ mod tests {
             let st = s(format!("{base}{p}"));
             async move { fetch(&client(&st).unwrap(), &st).await }
         };
-        assert_eq!(go("/ok").await.unwrap().to_text(), "0.0049771300444402785");
+        let q = go("/ok").await.unwrap();
+        assert_eq!(q.price.to_text(), "0.0049771300444402785");
+        assert_eq!(q.time, rfc3339_secs("2026-11-26T12:57:42Z").unwrap());
+        assert!(matches!(go("/notime").await, Err(PollError::Garbage(_))));
         assert!(matches!(go("/garbage").await, Err(PollError::Garbage(_))));
         assert!(matches!(go("/neg").await, Err(PollError::OutOfRange(_))));
         assert!(matches!(go("/huge").await, Err(PollError::OutOfRange(_))));
@@ -347,28 +495,113 @@ mod tests {
         ));
     }
 
+    fn q(p: &str, time: u64) -> Quote {
+        Quote {
+            price: Amount::parse(p).unwrap(),
+            time,
+        }
+    }
+
+    /// Accept and persist, as the poll loop does.
+    fn take(g: &mut Guard, p: &str, t: u64, st: &DiaSettings) -> Result<String, PollError> {
+        let r = g.check(q(p, t), t, st)?;
+        g.persisted(&r, t);
+        Ok(r.to_text())
+    }
+
     #[test]
     fn jump_is_held_until_it_persists() {
         let st = DiaSettings::default();
-        let a = |t: &str| Amount::parse(t).unwrap();
         let mut g = Guard::default();
-        assert!(g.check(a("0.005"), &st).is_ok(), "first value seeds");
-        assert!(g.check(a("0.006"), &st).is_ok(), "+20% passes");
-        assert_eq!(g.check(a("0.05"), &st), Err(PollError::Held(1)));
-        assert_eq!(g.last().unwrap().to_text(), "0.006", "last good kept");
+        let t = 1_790_000_000;
+        assert!(take(&mut g, "0.005", t, &st).is_ok(), "first value anchors");
+        assert!(take(&mut g, "0.006", t + 300, &st).is_ok(), "+20% passes");
+        assert_eq!(take(&mut g, "0.05", t + 600, &st), Err(PollError::Held(1)));
+        assert_eq!(g.anchor().unwrap().to_text(), "0.005", "anchor kept");
         // A different outlier restarts the count.
-        assert_eq!(g.check(a("5"), &st), Err(PollError::Held(1)));
-        assert_eq!(g.check(a("0.05"), &st), Err(PollError::Held(1)));
-        assert_eq!(g.check(a("0.051"), &st), Err(PollError::Held(2)));
+        assert_eq!(take(&mut g, "5", t + 900, &st), Err(PollError::Held(1)));
+        assert_eq!(take(&mut g, "0.05", t + 1200, &st), Err(PollError::Held(1)));
         assert_eq!(
-            g.check(a("0.05"), &st).unwrap().to_text(),
+            take(&mut g, "0.051", t + 1500, &st),
+            Err(PollError::Held(2))
+        );
+        assert_eq!(
+            take(&mut g, "0.05", t + 1800, &st).unwrap(),
             "0.05",
             "third agrees"
         );
-        assert_eq!(g.last().unwrap().to_text(), "0.05");
+        assert_eq!(
+            g.anchor().unwrap().to_text(),
+            "0.05",
+            "a confirmed jump re-anchors"
+        );
         // Back in band clears a pending jump.
-        assert_eq!(g.check(a("0.2"), &st), Err(PollError::Held(1)));
-        assert!(g.check(a("0.051"), &st).is_ok());
+        assert_eq!(take(&mut g, "0.2", t + 2100, &st), Err(PollError::Held(1)));
+        assert!(take(&mut g, "0.051", t + 2400, &st).is_ok());
+    }
+
+    /// Steps under the band each are held once they add up past it within the hour.
+    #[test]
+    fn stepwise_moves_are_cumulative() {
+        let st = DiaSettings::default();
+        let mut g = Guard::default();
+        let t = 1_790_000_000;
+        take(&mut g, "1", t, &st).unwrap();
+        assert_eq!(take(&mut g, "1.49", t + 300, &st).unwrap(), "1.49");
+        // +49% again is +122% from the anchor (1): held.
+        assert_eq!(take(&mut g, "2.22", t + 600, &st), Err(PollError::Held(1)));
+        assert_eq!(g.anchor().unwrap().to_text(), "1");
+        // A check that is never persisted does not move the anchor either.
+        g.check(q("1.4", t + 900), t + 900, &st).unwrap();
+        assert_eq!(g.anchor().unwrap().to_text(), "1");
+        // After an hour the anchor moves to the stored rate: one more band from there.
+        assert_eq!(take(&mut g, "1.45", t + 3_600, &st).unwrap(), "1.45");
+        assert_eq!(g.anchor().unwrap().to_text(), "1.45");
+        assert!(take(&mut g, "2.1", t + 3_900, &st).is_ok());
+        // Seeded from the store on restart: the same band applies.
+        let mut g = Guard::default();
+        g.seed(Amount::parse("1").unwrap(), t);
+        assert_eq!(take(&mut g, "1.6", t + 60, &st), Err(PollError::Held(1)));
+    }
+
+    /// Stale, future and replayed answers are refused; the last good rate stays.
+    #[test]
+    fn stale_and_replayed_answers_are_refused() {
+        let st = DiaSettings::default();
+        let mut g = Guard::default();
+        let now = 1_790_000_000;
+        assert!(matches!(
+            g.check(q("1", now - 3 * 3_600), now, &st),
+            Err(PollError::Stale(_))
+        ));
+        assert!(matches!(
+            g.check(q("1", now + 3_600), now, &st),
+            Err(PollError::Stale(_))
+        ));
+        assert!(g.check(q("1", now - 60), now, &st).is_ok());
+        assert!(matches!(
+            g.check(q("1", now - 60), now + 300, &st),
+            Err(PollError::Replay(_))
+        ));
+        assert!(matches!(
+            g.check(q("1", now - 120), now + 300, &st),
+            Err(PollError::Replay(_))
+        ));
+        assert!(g.check(q("1", now + 200), now + 300, &st).is_ok());
+        for bad in [
+            "2026-11-26 12:57:42Z",
+            "2026-11-26T12:57:42",
+            "2026-13-26T12:57:42Z",
+            "x",
+        ] {
+            assert_eq!(rfc3339_secs(bad), None, "{bad}");
+        }
+        assert_eq!(rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            rfc3339_secs("2026-11-26T12:57:42.123Z"),
+            rfc3339_secs("2026-11-26T12:57:42Z")
+        );
+        assert_eq!(rfc3339_secs("2000-03-01T00:00:00Z"), Some(951_868_800));
     }
 
     #[test]

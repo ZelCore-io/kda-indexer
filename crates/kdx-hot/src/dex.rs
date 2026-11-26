@@ -50,6 +50,8 @@
 //! | `DexAgg` | 0x01, pair | LP total supply, decimal text (Σ mint − Σ burn; absent when zero) |
 //! | `DexAgg` | 0x02, pair, 0x00, hour u32 | [`Bucket`]: swap/add/remove counts (wrapping i64) and swap in/out sums per side |
 //! | `DexAgg` | 0x03, pair | empty: the pair is poisoned ([`poisoned`]); never removed |
+//! | `DexAgg` | 0x04, pair, 0x00, kind u8 | i64 (wrapping): stored SWAP / ADD_LIQUIDITY / REMOVE_LIQUIDITY events of the pair ([`event_count`]); absent when zero |
+//! | `DexAgg` | 0x05, token, 0x00, ev | pair: one row per token of each `CREATE_PAIR` (a token's pairs, oldest first; [`token_pairs`]) |
 //! | `DexUsd` | hour u32 | USD per KDA, decimal text: reserved for the serving part's DIA feed; ingest never writes it |
 //!
 //! `DexEvents` fields per kind (amounts oriented to the pair, as decimal text):
@@ -57,10 +59,17 @@
 //! receiver, amount0In, amount1In, amount0Out, amount1Out]`; `ADD_LIQUIDITY` /
 //! `REMOVE_LIQUIDITY` `[sender, to, amount0, amount1, liquidity]`; `MINT_EVENT` / `BURN_EVENT`
 //! `[account, amount]`; `TRANSFER_EVENT` `[sender, receiver, amount]`.
-//! The hour is `block creationTime / 3600 s` (the block's, not the sender's `meta.creationTime`).
-//! Stock's `PoolTransaction.timestamp` is the tx's `meta.creationTime` (sender-chosen,
-//! `pair-service.ts:691`); it is stored per row ([`StoredEvent::tx_time`]) so the serving part
-//! can return stock's value while buckets stay on block time.
+//! The hour of a bucket is the tx's `meta.creationTime / 3600 s` ([`event_hour`]), stock's
+//! time for its 24h/7d windows and `PoolTransaction.timestamp` (sender-chosen,
+//! `pair-service.ts:691`), or the block's `creationTime` when the tx carries none. It is read
+//! from the stored row ([`StoredEvent::tx_time`]), so unwind removes an event from the bucket
+//! it was added to. The chain bounds `creationTime` by the tx's TTL, so a block can add to an
+//! earlier hour than its own.
+//!
+//! **Layout.** [`LAYOUT`] is the version of the derived rows (buckets, counts, the token
+//! index). A store written under another version is cleared by [`ensure_layout`] and rebuilt
+//! by the history fill (the stored state is a function of the stored events, so the fill
+//! beside the live tail gives the same bytes).
 //! Fees are not stored: Sushi's fee is 0.3 % of the input, so a bucket's fee per side is
 //! `in × 3 / 997` (stock's `in × FEE / (1 − FEE)`), exact from the stored sums.
 //!
@@ -678,6 +687,133 @@ pub fn hour_of(block_time_us: u64) -> u32 {
     u32::try_from(block_time_us / 3_600_000_000).unwrap_or(u32::MAX)
 }
 
+/// The hour of a stored event: its tx's `meta.creationTime` (stock's time), else its block's.
+pub fn event_hour(e: &StoredEvent) -> u32 {
+    if e.tx_time > 0 {
+        u32::try_from(e.tx_time / 3_600).unwrap_or(u32::MAX)
+    } else {
+        hour_of(e.time)
+    }
+}
+
+/// `DexAgg` key of a pair's event count of one kind.
+pub fn count_key(pair: &str, kind: Kind) -> Vec<u8> {
+    let mut k = Vec::with_capacity(pair.len() + 3);
+    k.push(4);
+    k.extend_from_slice(pair.as_bytes());
+    k.push(0);
+    k.push(kind as u8);
+    k
+}
+
+/// `DexAgg` prefix of a token's pairs (oldest `CREATE_PAIR` first).
+pub fn token_prefix(token: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(token.len() + 12);
+    k.push(5);
+    k.extend_from_slice(token.as_bytes());
+    k.push(0);
+    k
+}
+
+fn token_key(token: &str, key: TxKey, idx: u16) -> Vec<u8> {
+    let mut k = token_prefix(token);
+    k.extend_from_slice(&ev_key(key, idx));
+    k
+}
+
+/// Kinds with a stored count ([`count_key`]).
+pub fn counted(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Swap | Kind::AddLiquidity | Kind::RemoveLiquidity
+    )
+}
+
+/// The number of stored events of `kind` of a pair (`None` when the row is unreadable).
+pub fn event_count(txn: &impl Txn, pair: &str, kind: Kind) -> Result<Option<i64>> {
+    Ok(match txn.get(Table::DexAgg, &count_key(pair, kind))? {
+        None => Some(0),
+        Some(v) => <[u8; 8]>::try_from(v.as_slice())
+            .ok()
+            .map(i64::from_be_bytes),
+    })
+}
+
+fn bump_count(txn: &mut RwTxn<'_>, pair: &str, kind: Kind, d: i64) -> Fx {
+    if !counted(kind) {
+        return Ok(true);
+    }
+    let Some(n) = event_count(txn, pair, kind)? else {
+        return Ok(false);
+    };
+    let k = count_key(pair, kind);
+    match n.wrapping_add(d) {
+        0 => {
+            txn.del(Table::DexAgg, &k)?;
+        }
+        n => txn.put(Table::DexAgg, &k, &n.to_be_bytes())?,
+    }
+    Ok(true)
+}
+
+/// Write (`del` false) or delete the token-index rows of a `CREATE_PAIR`.
+fn index_pair(txn: &mut RwTxn<'_>, pair: &str, key: TxKey, idx: u16, del: bool) -> Result<()> {
+    for t in pair.split(':') {
+        let k = token_key(t, key, idx);
+        if del {
+            txn.del(Table::DexAgg, &k)?;
+        } else {
+            txn.put(Table::DexAgg, &k, pair.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// A token's pairs from the token index, oldest `CREATE_PAIR` first, while `f(pair)` holds
+/// (a pair created twice is passed twice).
+pub fn token_pairs(txn: &impl Txn, token: &str, mut f: impl FnMut(&str) -> bool) -> Result<()> {
+    let prefix = token_prefix(token);
+    let mut go = true;
+    let mut from = prefix.clone();
+    // Chunks keep the walk lazy without holding a cursor across `f`.
+    while go {
+        let rows = txn.scan_limit(Table::DexAgg, &from, 256, |k| k.starts_with(&prefix))?;
+        let Some(last) = rows.last().map(|r| r.0.clone()) else {
+            break;
+        };
+        for (_, v) in &rows {
+            if !f(&String::from_utf8_lossy(v)) {
+                go = false;
+                break;
+            }
+        }
+        if rows.len() < 256 {
+            break;
+        }
+        from = last;
+        from.push(0);
+    }
+    Ok(())
+}
+
+/// Version of the derived DEX rows (2: buckets by tx time, event counts, token index).
+pub const LAYOUT: u32 = 2;
+
+/// Clear the DEX tables of a store written under another [`LAYOUT`] and reset the history
+/// fill, so it rebuilds them (`DexUsd` is kept). Returns whether it cleared.
+pub fn ensure_layout(txn: &mut RwTxn<'_>) -> Result<bool> {
+    if txn.meta(meta::DEX_LAYOUT)?.as_deref() == Some(&LAYOUT.to_be_bytes()[..]) {
+        return Ok(false);
+    }
+    for t in TABLES {
+        txn.clear(t)?;
+    }
+    txn.del(Table::Meta, meta::DEX_FILLED.as_bytes())?;
+    txn.del(Table::Meta, meta::DEX_FILL_CURSOR.as_bytes())?;
+    txn.set_meta(meta::DEX_LAYOUT, &LAYOUT.to_be_bytes())?;
+    Ok(true)
+}
+
 /// A `DexEvents` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredEvent {
@@ -834,7 +970,7 @@ fn effect(txn: &mut RwTxn<'_>, pair: &str, e: &StoredEvent, sub: bool) -> Fx {
     match e.kind {
         Kind::CreatePair | Kind::Update => {}
         Kind::Swap | Kind::AddLiquidity | Kind::RemoveLiquidity => {
-            let k = bucket_key(pair, hour_of(e.time));
+            let k = bucket_key(pair, event_hour(e));
             let mut b = match txn.get(Table::DexAgg, &k)? {
                 Some(v) => match Bucket::decode(&v) {
                     Ok(b) => b,
@@ -919,6 +1055,11 @@ pub fn store_event(
     )?;
     if ev.kind == Kind::CreatePair {
         txn.put(Table::DexPairs, &pair_row_key(&ev.pair, key, idx), &[])?;
+        index_pair(txn, &ev.pair, key, idx, false)?;
+    }
+    // Counts follow the stored rows (poisoned or not), so they stay exact under unwind.
+    if !bump_count(txn, &ev.pair, ev.kind, 1)? {
+        poison(txn, &ev.pair, "count")?;
     }
     if !poisoned(txn, &ev.pair)? && !effect(txn, &ev.pair, &row, false)? {
         poison(txn, &ev.pair, "apply")?;
@@ -984,6 +1125,10 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
         txn.del(Table::DexEvents, &ek)?;
         if kind == Kind::CreatePair {
             txn.del(Table::DexPairs, &pair_row_key(&pair, key, idx))?;
+            index_pair(txn, &pair, key, idx, true)?;
+        }
+        if !bump_count(txn, &pair, kind, -1)? {
+            poison(txn, &pair, "count")?;
         }
         let ok = match row.as_deref().map(StoredEvent::decode) {
             Some(Ok(row)) if row.kind == kind => {
@@ -1024,6 +1169,15 @@ fn orphan_events(txn: &mut RwTxn<'_>, k: &[u8]) -> Result<()> {
             let mut pk = ek[..=z].to_vec();
             pk.extend_from_slice(ev);
             txn.del(Table::DexPairs, &pk)?;
+            if let (Ok(a), Ok(b)) = (<[u8; 8]>::try_from(&ev[..8]), <[u8; 2]>::try_from(&ev[8..])) {
+                index_pair(
+                    txn,
+                    pair,
+                    TxKey::from_be_bytes(a),
+                    u16::from_be_bytes(b),
+                    true,
+                )?;
+            }
         }
         poison(txn, pair, "unwind")?;
     }
@@ -1094,6 +1248,8 @@ pub mod meta {
     pub const DEX_FILLED: &str = "dex_filled";
     /// The fill's resume point: the last segment TxNum done (u64).
     pub const DEX_FILL_CURSOR: &str = "dex_fill_txnum";
+    /// [`super::LAYOUT`] of the stored derived rows (u32).
+    pub const DEX_LAYOUT: &str = "dex_layout";
 }
 
 #[cfg(test)]

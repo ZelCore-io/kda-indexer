@@ -860,10 +860,16 @@ user_agent = "kda-indexer"
 max_response_bytes = 16384
 min_price = 0.000001   # USD per KDA
 max_price = 10000.0
-max_jump_pct = 50.0    # a larger move is held back ...
+max_jump_pct = 50.0    # a larger move from the anchor is held back ...
 confirm_polls = 3      # ... until this many polls in a row agree
+max_age_s = 7200       # an answer whose Time is older is refused
+allow_http = false     # https only (tests and local mirrors may allow http)
 ```
 
+The jump guard is cumulative: it compares with an anchor, a stored rate that moves only once
+an hour (or to a confirmed jump), so a run of smaller steps cannot walk the price past the band
+either. An answer's `Time` must be current (at most `max_age_s` old, at most 5 minutes ahead)
+and newer than the last accepted one, so a cached or replayed answer is refused.
 Redirects are never followed, a failed or rejected poll keeps the last good rate (logged with
 its age), and the poller never blocks ingest. DIA keeps no KDA history (its chart-points
 endpoint answers an empty series), so past hours cannot be rebuilt: hours before the feed
@@ -890,13 +896,26 @@ Deliberate differences from stock (stock mistakes, all in the compare allowlist)
 | volume | swaps plus liquidity deposits and withdrawals | swaps only |
 | REMOVE_LIQUIDITY amounts | token sides crossed | oriented to the pair |
 | `poolTransactions.pageInfo` | `hasPreviousPage: true` on every page | from the rows |
-| ids, times | DB row ids and insert times; `Token.chainId` `"0"` | module name / event position (`TxKey ‖ index`); block times; `"2"`; `transactionId` null |
+| ids, times | DB row ids and insert times; `Token.chainId` `"0"` | module name / event position (`TxKey ‖ index`); block times; `"2"`; `transactionId` null (stock's ids are unmatchable internal row ids) |
+| swap fee | input side, `in × 0.003/0.997 × price in` | coin side, `value × 0.003/0.997` (differs by the price impact when KDA is the output) |
 | `tokens` order | by a balance row id | by the module's first height (newest first) |
 
-Costs: each DEX field has a read-budget cost (`dexMetrics` 100,000; lists and `Pool.charts`
-20,000; single reads 200), reads at most 10,000 pairs, checks the request deadline inside
-every loop, and the aggregates run on a heavy slot. `dexMetrics` ranges are capped at 1,100
-days.
+Times follow stock: the 24h/7d windows, chart buckets and the `amountUsd` rate hour use the
+tx's `meta.creationTime` (the block's time when the tx has none), the same time stock shows
+as `PoolTransaction.timestamp`. `creationTime` can precede the block by up to the tx's TTL,
+so a block can add to an earlier hour.
+
+Costs: each DEX field has a read-budget cost (`dexMetrics` 100,000; lists, `tokenPrice` and
+`Pool.charts` 20,000; `pool` and `poolTransactions` 200), reads at most 250,000 rows (counted
+as they are read), checks the request deadline inside every loop, and the aggregates and
+price searches run on a heavy slot. No request walks a pair's whole history:
+`poolTransactions.totalCount` comes from per-pair, per-kind counts kept at ingest, and range
+reads seek to the range (block times rise with height). A listing serves at most 1,000
+listable pools, oldest `CREATE_PAIR` first, and considers only `coin` pairs (at most 20,000,
+oldest first), so junk pairs cannot push real pools out. Token prices follow stock's path
+search with its 3-hop limit (a direct `coin` pair with zero reserves prices at 0, as stock),
+reading at most 256 pairs per token and 2,048 tokens. `dexMetrics` ranges are capped at
+1,100 days.
 
 ### Token price
 

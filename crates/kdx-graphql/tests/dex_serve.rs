@@ -519,3 +519,136 @@ async fn dex_metrics_dates() {
         assert!(v["errors"].is_array(), "{bad}: {v}");
     }
 }
+
+/// I1: junk pairs (no coin leg, or a coin leg without reserves) whose names sort before
+/// `coin`, and more listable spam pairs than the cap created after the real pools, leave
+/// every real pool served (the listable filter runs before the cap, oldest first).
+#[tokio::test]
+async fn spam_pairs_never_crowd_out_real_pools() {
+    let d = tempfile::tempdir().unwrap();
+    let (hot, st) = state(&d);
+    let today = fixture(&hot);
+    let mut w = W {
+        txn: hot.rw().unwrap(),
+        pos: 0,
+    };
+    for i in 0..200 {
+        let (x, y) = (format!("a.x{i:03}"), format!("a.y{i:03}"));
+        w.pair(&format!("{x}:{y}"), today - 10, "5", "5");
+        let j = format!("a.j{i:03}:coin");
+        w.ev(&j, Kind::CreatePair, today - 10, &[&j, "acct"]);
+    }
+    // Listable spam, newer than the real pools, past the cap.
+    for i in 0..dexserve::MAX_PAIRS + 5 {
+        w.pair(&format!("a.s{i:05}:coin"), today + 5, "1", "1");
+    }
+    w.txn.commit().unwrap();
+    let v = data(
+        &st,
+        "{ pools(first: 1000) { totalCount edges { node { key } } } }",
+    )
+    .await;
+    assert_eq!(
+        v["pools"]["totalCount"],
+        dexserve::MAX_PAIRS,
+        "{}",
+        v["pools"]["totalCount"]
+    );
+    let keys: Vec<&str> = v["pools"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["node"]["key"].as_str().unwrap())
+        .collect();
+    for real in ["coin:kaddex.kdx", "coin:free.maga"] {
+        assert!(keys.contains(&real), "{real} missing");
+    }
+    let t = data(
+        &st,
+        "{ tokenPrice(tokenAddress: \"kaddex.kdx\") { priceInKda } }",
+    )
+    .await;
+    assert_ne!(t["tokenPrice"]["priceInKda"], 0, "{t}");
+    let m = data(&st, "{ dexMetrics { totalPools } }").await;
+    assert_eq!(m["dexMetrics"]["totalPools"], dexserve::MAX_PAIRS);
+}
+
+/// I2: a pair with a history larger than the row budget answers a one-day `dexMetrics`,
+/// `pool`, its `poolTransactions` (count from the stored counts) and its charts.
+#[tokio::test]
+async fn large_history_reads_only_the_range() {
+    let d = tempfile::tempdir().unwrap();
+    let (hot, st) = state(&d);
+    fixture(&hot);
+    let n = now();
+    let big = "coin:free.big";
+    let rows = dexserve::MAX_ROWS + 50_000;
+    {
+        let mut w = W {
+            txn: hot.rw().unwrap(),
+            pos: 0,
+        };
+        let e = DexEvent {
+            kind: Kind::CreatePair,
+            pair: big.into(),
+            fields: vec![big.into(), "acct".into()],
+        };
+        let t0 = n - 400 * DAY;
+        hd::store_event(&mut w.txn, TxKey::new(10, 2, 1), 0, t0 * 1_000_000, t0, &e).unwrap();
+        for i in 0..rows {
+            let t = t0 + 60 + i * 30;
+            let h = 11 + i as u32;
+            for (kind, fields) in [
+                (Kind::Update, vec!["100".to_string(), "5".to_string()]),
+                (
+                    Kind::Swap,
+                    ["m", "m", "1", "0", "0", "1"].map(String::from).to_vec(),
+                ),
+            ] {
+                let row = hd::StoredEvent {
+                    kind,
+                    time: t * 1_000_000,
+                    tx_time: t,
+                    fields,
+                };
+                w.txn
+                    .put(
+                        Table::DexEvents,
+                        &hd::event_key(big, kind, TxKey::new(h, 2, 1), 0),
+                        &row.encode(),
+                    )
+                    .unwrap();
+            }
+        }
+        w.txn
+            .put(
+                Table::DexAgg,
+                &hd::count_key(big, Kind::Swap),
+                &(rows as i64).to_be_bytes(),
+            )
+            .unwrap();
+        w.txn.commit().unwrap();
+    }
+    let ro = hot.ro().unwrap();
+    let b = || Budget::new(Instant::now() + Duration::from_secs(30));
+    let t = Instant::now();
+    let m = dexserve::dex_metrics(&ro, n, Some(n - DAY), Some(n), SUSHI, &mut b()).unwrap();
+    assert_eq!(m.total_pools, 3);
+    let id = format!("{SUSHI}-{big}");
+    dexserve::pool(&ro, &id, n, Default::default(), &mut b()).unwrap();
+    for tf in [
+        kdx_graphql::types::dex::TimeFrame::Day,
+        kdx_graphql::types::dex::TimeFrame::Week,
+    ] {
+        dexserve::charts(&ro, &id, tf, n, &mut b()).unwrap();
+    }
+    drop(ro);
+    let v = data(
+        &st,
+        &format!("{{ poolTransactions(pairId: \"{id}\", first: 10) {{ totalCount edges {{ cursor }} }} }}"),
+    )
+    .await;
+    assert_eq!(v["poolTransactions"]["totalCount"], rows, "{v}");
+    assert_eq!(v["poolTransactions"]["edges"].as_array().unwrap().len(), 10);
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+}

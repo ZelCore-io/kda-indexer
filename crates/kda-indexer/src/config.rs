@@ -50,8 +50,10 @@ pub struct Config {
 #[serde(deny_unknown_fields, default)]
 pub struct DexUsdConfig {
     pub enabled: bool,
-    /// http(s) URL of a DIA `assetQuotation` answer. Redirects are never followed.
+    /// https URL of a DIA `assetQuotation` answer. Redirects are never followed.
     pub url: String,
+    /// Allow an `http://` URL (tests and local mirrors only; off by default).
+    pub allow_http: bool,
     pub interval_s: u64,
     pub timeout_ms: u64,
     /// Sent as the User-Agent: keep it generic.
@@ -64,6 +66,8 @@ pub struct DexUsdConfig {
     /// `confirm_polls` polls in a row agree.
     pub max_jump_pct: f64,
     pub confirm_polls: u32,
+    /// Oldest accepted answer `Time`, seconds.
+    pub max_age_s: u64,
 }
 
 impl Default for DexUsdConfig {
@@ -72,6 +76,7 @@ impl Default for DexUsdConfig {
         Self {
             enabled: false,
             url: d.url,
+            allow_http: false,
             interval_s: d.interval.as_secs(),
             timeout_ms: d.timeout.as_millis() as u64,
             user_agent: d.user_agent,
@@ -80,6 +85,7 @@ impl Default for DexUsdConfig {
             max_price: d.max_price,
             max_jump_pct: d.max_jump_pct,
             confirm_polls: d.confirm_polls,
+            max_age_s: d.max_age.as_secs(),
         }
     }
 }
@@ -88,8 +94,13 @@ impl DexUsdConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         let u = url::Url::parse(&self.url).map_err(|e| anyhow::anyhow!("dex_usd.url: {e}"))?;
         anyhow::ensure!(
-            matches!(u.scheme(), "https" | "http") && u.host().is_some(),
-            "dex_usd.url must be an http(s) URL with a host"
+            (u.scheme() == "https" || (self.allow_http && u.scheme() == "http"))
+                && u.host().is_some(),
+            "dex_usd.url must be an https URL with a host (http only with dex_usd.allow_http)"
+        );
+        anyhow::ensure!(
+            (300..=86_400).contains(&self.max_age_s),
+            "dex_usd.max_age_s must be in 300..=86400"
         );
         anyhow::ensure!(
             (60..=86_400).contains(&self.interval_s),
@@ -133,6 +144,7 @@ impl DexUsdConfig {
             max_price: self.max_price,
             max_jump_pct: self.max_jump_pct,
             confirm_polls: self.confirm_polls,
+            max_age: std::time::Duration::from_secs(self.max_age_s),
         }
     }
 }
@@ -1663,5 +1675,28 @@ mod validate_tests {
             "",
             "p2p_cert_sha256",
         );
+    }
+}
+
+#[cfg(test)]
+mod dex_usd_tests {
+    use super::DexUsdConfig;
+
+    /// The DIA URL must be https unless `allow_http` (tests, local mirrors) says otherwise.
+    #[test]
+    fn dia_url_needs_https() {
+        let mut c = DexUsdConfig::default();
+        assert!(c.validate().is_ok(), "stock's https endpoint");
+        c.url = "http://127.0.0.1:8080/q".into();
+        assert!(c.validate().is_err());
+        c.allow_http = true;
+        assert!(c.validate().is_ok());
+        c.url = "file:///etc/passwd".into();
+        assert!(c.validate().is_err());
+        c = DexUsdConfig {
+            max_age_s: 10,
+            ..DexUsdConfig::default()
+        };
+        assert!(c.validate().is_err());
     }
 }

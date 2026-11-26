@@ -384,7 +384,16 @@ fn random_chain(seed: u64, dict: &mut MemDict) -> Vec<(u32, u64, Vec<TxRecord>)>
                             ev(dict, k, &p)
                         })
                         .collect();
-                    tx(TxKey::new(h, SUSHI_CHAIN, pos), evs)
+                    let mut r = tx(TxKey::new(h, SUSHI_CHAIN, pos), evs);
+                    // Half the txs carry a sender time up to two hours before the block, so
+                    // buckets land on other hours than the block's (layout 2).
+                    if rng.below(2) == 0 {
+                        let ct = time / 1_000_000 - rng.below(7_200);
+                        r.cmd = Some(
+                            serde_json::to_vec(&json!({"meta": {"creationTime": ct}})).unwrap(),
+                        );
+                    }
+                    r
                 })
                 .collect();
             (h, time, txs)
@@ -612,7 +621,7 @@ fn tail_apply_and_unwind() {
     let b2 = block(&mut dict, H + 1);
     crate::tail::apply(&mut txn, &b2, &mut dict).unwrap();
     assert_eq!(txn.count(Table::DexEvents).unwrap(), 2);
-    assert_eq!(txn.count(Table::DexAgg).unwrap(), 2); // two hour buckets
+    assert_eq!(txn.count(Table::DexAgg).unwrap(), 3); // two hour buckets, one swap count
     assert_eq!(crate::tail::unwind_to(&mut txn, 2, H).unwrap(), 1);
     assert_eq!(snapshot(&txn), one);
     assert_eq!(crate::tail::unwind_to(&mut txn, 2, H - 1).unwrap(), 1);
@@ -1081,4 +1090,135 @@ fn pair_status_supports_the_junk_rule() {
     let s = pair_status(&txn, &jp).unwrap();
     assert!(s.created && !s.coin_leg && !s.listable());
     assert_eq!(pair_status(&txn, "x:y").unwrap(), PairStatus::default());
+}
+
+/// Layout 2: buckets by tx time, exact per-kind counts and the token index, under apply,
+/// unwind and replay; a store of another layout is cleared for the fill.
+#[test]
+fn counts_index_and_layout() {
+    let (_d, hot) = store();
+    let ev = |pair: &str, kind: Kind, fields: &[&str]| DexEvent {
+        kind,
+        pair: pair.into(),
+        fields: fields.iter().map(|s| s.to_string()).collect(),
+    };
+    let t0 = 1_790_000_000u64;
+    {
+        let mut txn = hot.rw().unwrap();
+        let k1 = TxKey::new(H, SUSHI_CHAIN, 1);
+        let k2 = TxKey::new(H + 1, SUSHI_CHAIN, 1);
+        assert!(store_event(
+            &mut txn,
+            k1,
+            0,
+            t0 * 1_000_000,
+            0,
+            &ev("coin:free.x", Kind::CreatePair, &["coin:free.x", "a"])
+        )
+        .unwrap());
+        assert!(store_event(
+            &mut txn,
+            k1,
+            1,
+            t0 * 1_000_000,
+            0,
+            &ev("free.x:free.y", Kind::CreatePair, &["free.x:free.y", "a"])
+        )
+        .unwrap());
+        // Sender time 3 h before the block: the bucket is that hour's.
+        let sw = ev("coin:free.x", Kind::Swap, &["m", "m", "1", "0", "0", "2"]);
+        assert!(store_event(&mut txn, k2, 0, t0 * 1_000_000, t0 - 3 * 3600, &sw).unwrap());
+        assert!(store_event(&mut txn, k2, 1, t0 * 1_000_000, 0, &sw).unwrap());
+        assert!(
+            !store_event(&mut txn, k2, 1, t0 * 1_000_000, 0, &sw).unwrap(),
+            "replay"
+        );
+        txn.commit().unwrap();
+    }
+    let ro = hot.ro().unwrap();
+    assert_eq!(
+        event_count(&ro, "coin:free.x", Kind::Swap).unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        event_count(&ro, "coin:free.x", Kind::AddLiquidity).unwrap(),
+        Some(0)
+    );
+    let h = (t0 / 3600) as u32;
+    assert!(ro
+        .get(Table::DexAgg, &bucket_key("coin:free.x", h - 3))
+        .unwrap()
+        .is_some());
+    assert!(ro
+        .get(Table::DexAgg, &bucket_key("coin:free.x", h))
+        .unwrap()
+        .is_some());
+    let mut x = Vec::new();
+    token_pairs(&ro, "free.x", |p| {
+        x.push(p.to_owned());
+        true
+    })
+    .unwrap();
+    assert_eq!(x, ["coin:free.x", "free.x:free.y"], "oldest first");
+    drop(ro);
+    {
+        let mut txn = hot.rw().unwrap();
+        undo_block(&mut txn, SUSHI_CHAIN, H + 1).unwrap();
+        txn.commit().unwrap();
+    }
+    let ro = hot.ro().unwrap();
+    assert_eq!(
+        event_count(&ro, "coin:free.x", Kind::Swap).unwrap(),
+        Some(0)
+    );
+    assert!(ro
+        .get(Table::DexAgg, &count_key("coin:free.x", Kind::Swap))
+        .unwrap()
+        .is_none());
+    assert!(ro
+        .get(Table::DexAgg, &bucket_key("coin:free.x", h - 3))
+        .unwrap()
+        .is_none());
+    drop(ro);
+    {
+        let mut txn = hot.rw().unwrap();
+        undo_block(&mut txn, SUSHI_CHAIN, H).unwrap();
+        txn.commit().unwrap();
+    }
+    let ro = hot.ro().unwrap();
+    let mut n = 0;
+    token_pairs(&ro, "free.x", |_| {
+        n += 1;
+        true
+    })
+    .unwrap();
+    assert_eq!(n, 0, "index unwound");
+    drop(ro);
+    // Layout: a store without the mark (or another one) is cleared and its fill reset.
+    {
+        let mut txn = hot.rw().unwrap();
+        store_event(
+            &mut txn,
+            TxKey::new(H, SUSHI_CHAIN, 1),
+            0,
+            t0 * 1_000_000,
+            0,
+            &ev("coin:free.x", Kind::CreatePair, &["coin:free.x", "a"]),
+        )
+        .unwrap();
+        txn.set_meta(meta::DEX_FILLED, &1u32.to_be_bytes()).unwrap();
+        crate::dex_usd::put(&mut txn, 1, &a("0.005")).unwrap();
+        assert!(ensure_layout(&mut txn).unwrap());
+        assert!(!ensure_layout(&mut txn).unwrap(), "once");
+        txn.commit().unwrap();
+    }
+    let ro = hot.ro().unwrap();
+    assert!(ro.meta(meta::DEX_FILLED).unwrap().is_none());
+    for t in TABLES {
+        assert_eq!(ro.count(t).unwrap(), 0, "{t:?}");
+    }
+    assert!(
+        crate::dex_usd::latest(&ro).unwrap().is_some(),
+        "USD rates kept"
+    );
 }

@@ -182,9 +182,10 @@ struct Walk<'a> {
 /// A `crossChainTransfer` inside another one (M-5): priced as the per-item store read it
 /// would be if not answered from the pair already loaded.
 pub const NESTED_XCHAIN_COST: u64 = 10;
-/// DEX (B3) costs in the read budget: `dexMetrics` walks every listable pair's history,
-/// a DEX list or `Pool.charts` reads every listable pair or a pair's history, and a single
-/// pool read a pair's latest rows.
+/// DEX (B3) costs in the read budget: `dexMetrics` reads every listable pair over its range,
+/// a DEX list (`tokenPrice` too: its path search may read many pairs) or `Pool.charts` reads
+/// every listable pair or a pair's range, and a single pool or its transactions read a
+/// bounded number of rows (stored counts, seeks and one page).
 pub const DEX_METRICS_COST: u64 = 100_000;
 pub const DEX_LIST_COST: u64 = 20_000;
 pub const DEX_READ_COST: u64 = 200;
@@ -344,15 +345,14 @@ impl<'a> Walk<'a> {
                         // DEX fields (B3): what each reads, so aliases and nesting reach the
                         // ceiling (pages multiply them as usual).
                         "dexMetrics" if ty == Some("Query") => DEX_METRICS_COST,
-                        "pools" | "liquidityPositions" | "tokenPrices" | "tokens"
+                        "pools" | "liquidityPositions" | "tokenPrices" | "tokenPrice"
+                        | "tokens"
                             if ty == Some("Query") =>
                         {
                             DEX_LIST_COST
                         }
                         "charts" if ty == Some("Pool") => DEX_LIST_COST,
-                        "pool" | "poolTransactions" | "tokenPrice" if ty == Some("Query") => {
-                            DEX_READ_COST
-                        }
+                        "pool" | "poolTransactions" if ty == Some("Query") => DEX_READ_COST,
                         "transactions" if ty == Some("Pool") => DEX_READ_COST,
                         "totalCount" if wrap == Wrap::Conn && ty == Some(BLOCK_EVENTS) => {
                             self.s.default_page.min(self.s.max_page) as u64
@@ -1386,6 +1386,18 @@ mod tests {
             json!({})
         )
         .is_ok());
+        // Thousands of `tokenPrice` / `tokenPrices` aliases are refused (list cost each).
+        for f in [
+            "tokenPrice(tokenAddress: \"coin\") { id }",
+            "tokenPrices { id }",
+        ] {
+            let many: String = (0..2_000).map(|i| format!("a{i}: {f} ")).collect();
+            assert_eq!(
+                served(&format!("{{ {many} }}"), json!({})),
+                Err(format!("{:?}", Some(&Value::from("budget")))),
+                "{f}"
+            );
+        }
     }
 
     /// N-06: `lastTokenPriceInKda` costs its scan's rows, so aliases of it reach the

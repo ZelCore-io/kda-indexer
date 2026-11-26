@@ -40,12 +40,17 @@
 //! 11. Not reproducible: stock DB row ids (`Token.id` is the module name,
 //!     `PoolTransaction.id` is the event's chain position, `transactionId` is null), DB
 //!     timestamps (`createdAt`/`updatedAt` are block times), `Token.chainId` is `"2"` (stock
-//!     hardcoded `"0"`), hour buckets use the block's time (stock the sender's), and
-//!     `tokens` ranks modules by first height (stock by a balance row id).
+//!     hardcoded `"0"`), and `tokens` ranks modules by first height (stock by a balance row
+//!     id).
 //!
-//! Cost: every list is bounded by [`MAX_PAIRS`] pairs and a [`Budget`] of rows checked
-//! against the request deadline inside every loop; aggregates over long ranges run on a
-//! heavy slot (resolvers).
+//! Times match stock: windows, chart buckets and the `amountUsd` rate hour use the tx's
+//! `meta.creationTime` (block time when absent), as stored per event (`kdx_hot::dex`).
+//!
+//! Cost: nothing walks a pair's whole history. Listings take `coin` pairs from the token
+//! index, oldest first, filter them as listable and only then cap them ([`MAX_PAIRS`]);
+//! `poolTransactions.totalCount` reads the stored per-kind counts; range reads seek by time
+//! ([`seek_time`]); a [`Budget`] of rows is checked as rows are read and against the request
+//! deadline in every loop; aggregates and price searches run on a heavy slot (resolvers).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
@@ -64,10 +69,18 @@ use crate::scalars::{DateTime, Decimal};
 use crate::types::dex::*;
 
 pub const DEFAULT_PROTOCOL: &str = hd::SUSHI_EXCHANGE;
-/// Distinct pairs one field reads (CREATE_PAIR spam beyond it is not listed).
-pub const MAX_PAIRS: usize = 10_000;
-/// Rows one field reads.
-pub const MAX_ROWS: u64 = 2_000_000;
+/// Listable pairs one field serves, oldest `CREATE_PAIR` first (later ones are left out,
+/// with a warning).
+pub const MAX_PAIRS: usize = 1_000;
+/// `coin` pairs one listing checks for listability, oldest first (spam past it is not read).
+pub const MAX_CANDIDATES: usize = 20_000;
+/// Rows one field reads (checked as rows are read, so it also bounds what a field holds).
+pub const MAX_ROWS: u64 = 250_000;
+/// The price path: at most 3 hops (stock's `findOptimalKdaPricePath` stops at path length 4).
+pub const MAX_HOPS: usize = 3;
+/// Pairs of one token a price search expands (oldest first), and tokens it visits.
+pub const MAX_NEIGHBORS: usize = 256;
+pub const MAX_PRICE_TOKENS: usize = 2_048;
 /// Longest `dexMetrics` range.
 pub const MAX_METRIC_DAYS: u64 = 1_100;
 /// Largest page.
@@ -165,29 +178,6 @@ pub fn pair_key_of_id(id: &str) -> Option<&str> {
     id.strip_prefix(DEFAULT_PROTOCOL)?.strip_prefix('-')
 }
 
-/// Distinct pair keys with a stored `CREATE_PAIR` (key order), at most [`MAX_PAIRS`].
-pub fn pair_keys(txn: &impl Txn, b: &mut Budget) -> ApiResult<Vec<String>> {
-    let mut keys: Vec<String> = Vec::new();
-    if !txn.has_table(Table::DexPairs) {
-        return Ok(keys);
-    }
-    txn.walk_keys(Table::DexPairs, &[], |k| {
-        if !b.tick() || keys.len() >= MAX_PAIRS {
-            return false;
-        }
-        if let Some(p) = k.iter().position(|c| *c == 0) {
-            let name = String::from_utf8_lossy(&k[..p]);
-            if keys.last().map(String::as_str) != Some(&*name) {
-                keys.push(name.into_owned());
-            }
-        }
-        true
-    })
-    .map_err(api)?;
-    b.check()?;
-    Ok(keys)
-}
-
 fn first_time(txn: &impl Txn, prefix: &[u8], rev: bool) -> ApiResult<Option<StoredEvent>> {
     let row = if rev {
         txn.scan_rev_prefix(Table::DexEvents, prefix, &[])
@@ -236,30 +226,73 @@ pub fn pair_info(txn: &impl Txn, key: &str) -> ApiResult<Option<PairInfo>> {
 }
 
 /// Listable pairs (`PairStatus::listable`: created, not poisoned, a coin leg, non-zero
-/// reserves) in key order.
+/// reserves), oldest `CREATE_PAIR` first. Only `coin` pairs are candidates (the token index
+/// of `coin`, so junk pairs without a coin leg are never read); the listable filter runs
+/// before the [`MAX_PAIRS`] cap, so pairs that are not listable never crowd real pools out.
 pub fn listable(txn: &impl Txn, b: &mut Budget) -> ApiResult<Vec<PairInfo>> {
-    let mut out = Vec::new();
-    for k in pair_keys(txn, b)? {
+    let mut keys: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut checked = 0usize;
+    let mut capped = false;
+    let mut err = None;
+    hd::token_pairs(txn, "coin", |pair| {
         if !b.tick() {
-            break;
+            return false;
         }
-        if let Some(p) = pair_info(txn, &k)? {
-            if p.status.listable() {
-                out.push(p);
+        if !seen.insert(pair.to_owned()) {
+            return true;
+        }
+        checked += 1;
+        if checked > MAX_CANDIDATES || keys.len() >= MAX_PAIRS {
+            capped = true;
+            return false;
+        }
+        match hd::pair_status(txn, pair) {
+            Ok(st) if st.listable() => keys.push(pair.to_owned()),
+            Ok(_) => {}
+            Err(e) => {
+                err = Some(e);
+                return false;
             }
         }
+        true
+    })
+    .map_err(api)?;
+    if let Some(e) = err {
+        return Err(api(e));
     }
     b.check()?;
+    if capped {
+        tracing::warn!(
+            listed = keys.len(),
+            checked,
+            "dex: pair listing capped; the oldest pairs are served"
+        );
+    }
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        if let Some(p) = pair_info(txn, &k)? {
+            out.push(p);
+        }
+    }
     Ok(out)
 }
 
-fn supply(txn: &impl Txn, key: &str) -> ApiResult<String> {
-    Ok(txn
-        .get(Table::DexAgg, &hd::supply_key(key))
-        .map_err(api)?
-        .and_then(|v| String::from_utf8(v).ok())
-        .filter(|t| Amount::parse_stored(t).is_some())
-        .unwrap_or_else(|| "0".into()))
+/// A stored amount (`None` when absent); an unreadable one makes the pool unavailable.
+fn stored_amount(v: Option<Vec<u8>>, key: &str) -> ApiResult<Option<Amount>> {
+    match v {
+        None => Ok(None),
+        Some(v) => std::str::from_utf8(&v)
+            .ok()
+            .and_then(Amount::parse_stored)
+            .map(Some)
+            .ok_or_else(|| unavailable(&format!("{DEFAULT_PROTOCOL}-{key}"))),
+    }
+}
+
+fn supply(txn: &impl Txn, key: &str) -> ApiResult<Amount> {
+    let v = txn.get(Table::DexAgg, &hd::supply_key(key)).map_err(api)?;
+    Ok(stored_amount(v, key)?.unwrap_or_default())
 }
 
 /// Hour buckets of a pair in `from..=to`.
@@ -295,53 +328,109 @@ fn buckets(
         .collect())
 }
 
-/// Every UPDATE of a pair from `from_us` on, as (block time µs, tx time s, reserves).
+/// The first `DexEvents` key under `prefix` (one pair and kind) of an event in a block at or
+/// after `t_us`: a binary search over heights (block times rise with height on the Sushi
+/// chain), about 32 point seeks whatever the pair's history.
+fn seek_time(txn: &impl Txn, prefix: &[u8], t_us: u64, b: &mut Budget) -> ApiResult<Vec<u8>> {
+    let (mut lo, mut hi) = (0u64, 1u64 << 32);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        b.tick();
+        let mut k = prefix.to_vec();
+        k.extend_from_slice(&(mid as u32).to_be_bytes());
+        let row = txn
+            .scan_limit(Table::DexEvents, &k, 1, |kk| kk.starts_with(prefix))
+            .map_err(api)?
+            .into_iter()
+            .next();
+        let at_or_after = match row {
+            None => true,
+            Some((_, v)) => StoredEvent::decode(&v).map_or(true, |e| e.time >= t_us),
+        };
+        if at_or_after {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    b.check()?;
+    let mut k = prefix.to_vec();
+    match u32::try_from(lo) {
+        Ok(h) => k.extend_from_slice(&h.to_be_bytes()),
+        Err(_) => k.extend_from_slice(&[0xff; 11]),
+    }
+    Ok(k)
+}
+
+type Reserves = (Amount, Amount);
+/// Reserves before a range, then each UPDATE in it as (block time µs, reserves).
+type Updates = (Option<Reserves>, Vec<(u64, Reserves)>);
+
+/// The UPDATEs of a pair in blocks of `from_us..to_us`, as (block time µs, reserves), with the
+/// reserves before `from_us` (carry-in). Reads only the range (two seeks, then the rows).
 fn updates(
     txn: &impl Txn,
     key: &str,
+    from_us: u64,
+    to_us: u64,
     b: &mut Budget,
-) -> ApiResult<Vec<(u64, u64, Amount, Amount)>> {
+) -> ApiResult<Updates> {
     let prefix = hd::event_prefix(key, Kind::Update);
+    let start = seek_time(txn, &prefix, from_us, b)?;
+    let end = seek_time(txn, &prefix, to_us, b)?;
+    let carry = newest_before(txn, &prefix, &start, b)?;
     let rows = txn
-        .scan(Table::DexEvents, &prefix, |k| {
-            b.tick() && k.starts_with(&prefix)
+        .scan(Table::DexEvents, &start, |k| {
+            b.tick() && k.starts_with(&prefix) && k < end.as_slice()
         })
         .map_err(api)?;
     b.check()?;
-    Ok(rows
+    let ups = rows
         .into_iter()
         .filter_map(|(_, v)| {
             let e = StoredEvent::decode(&v).ok()?;
-            Some((e.time, e.tx_time, e.amount(0)?, e.amount(1)?))
+            Some((e.time, (e.amount(0)?, e.amount(1)?)))
         })
-        .collect())
+        .collect();
+    Ok((carry, ups))
 }
 
-/// The reserves of the newest UPDATE before `t_us`.
-fn reserves_before(
+/// The reserves of the newest readable UPDATE under `prefix` below key `upper`.
+fn newest_before(
     txn: &impl Txn,
-    key: &str,
-    t_us: u64,
+    prefix: &[u8],
+    upper: &[u8],
     b: &mut Budget,
-) -> ApiResult<Option<(Amount, Amount)>> {
-    let prefix = hd::event_prefix(key, Kind::Update);
+) -> ApiResult<Option<Reserves>> {
     for row in txn
-        .scan_rev_prefix(Table::DexEvents, &prefix, &[])
+        .scan_rev_prefix(Table::DexEvents, prefix, upper)
         .map_err(api)?
     {
         if !b.tick() {
             break;
         }
         let (_, v) = row.map_err(api)?;
-        let Ok(e) = StoredEvent::decode(&v) else {
-            continue;
-        };
-        if e.time < t_us {
-            return Ok(e.amount(0).zip(e.amount(1)));
+        if let Some(r) = StoredEvent::decode(&v)
+            .ok()
+            .and_then(|e| e.amount(0).zip(e.amount(1)))
+        {
+            return Ok(Some(r));
         }
     }
     b.check()?;
     Ok(None)
+}
+
+/// The reserves of the newest UPDATE in a block before `t_us` (a seek, not a walk).
+fn reserves_before(
+    txn: &impl Txn,
+    key: &str,
+    t_us: u64,
+    b: &mut Budget,
+) -> ApiResult<Option<Reserves>> {
+    let prefix = hd::event_prefix(key, Kind::Update);
+    let upper = seek_time(txn, &prefix, t_us, b)?;
+    newest_before(txn, &prefix, &upper, b)
 }
 
 fn hour_of_secs(s: u64) -> u32 {
@@ -369,6 +458,8 @@ fn bucket_kda(bk: &Bucket, coin: Option<usize>) -> Dec {
     }
 }
 
+/// Stock's swap fee is `in × 0.003/0.997` on the input side; ours is taken on the coin side
+/// (the swap's value), so a swap with KDA out differs by the price impact (allowlisted).
 fn fee_of(v: &Dec) -> Dec {
     v.mul_int(3).div_int(997).unwrap_or_default()
 }
@@ -397,14 +488,32 @@ pub struct Stats {
     pub apr: Dec,
 }
 
-pub fn stats(txn: &impl Txn, p: &PairInfo, now: u64, b: &mut Budget) -> ApiResult<Stats> {
+/// The rates [`stats`] needs at `now` (load once per field).
+pub fn stats_rates(txn: &impl Txn, now: u64, b: &mut Budget) -> ApiResult<Rates> {
+    let th = hour_of_secs(now / DAY * DAY);
+    rates(
+        txn,
+        th.saturating_sub(7 * 24 + 1),
+        hour_of_secs(now).saturating_add(48),
+        b,
+    )
+}
+
+/// A pair's stats at `now`, from its hour buckets (by tx time, stock's) of the last 8 days and
+/// two reserve reads; `rt` from [`stats_rates`].
+pub fn stats(
+    txn: &impl Txn,
+    p: &PairInfo,
+    now: u64,
+    rt: &Rates,
+    b: &mut Budget,
+) -> ApiResult<Stats> {
     let today = now / DAY * DAY;
     let th = hour_of_secs(today);
     let from = th.saturating_sub(7 * 24);
-    let rt = rates(txn, from.saturating_sub(1), hour_of_secs(now), b)?;
     let mut s = Stats::default();
     for (h, bk) in buckets(txn, &p.key, from, u32::MAX, b)? {
-        let v = usd(&bucket_kda(&bk, p.coin), &rt, h);
+        let v = usd(&bucket_kda(&bk, p.coin), rt, h);
         let f = fee_of(&v);
         let n = bk.swaps.wrapping_add(bk.adds).wrapping_add(bk.removes);
         if h >= th {
@@ -422,12 +531,12 @@ pub fn stats(txn: &impl Txn, p: &PairInfo, now: u64, b: &mut Budget) -> ApiResul
     }
     s.tvl = usd(
         &p.tvl_kda(p.status.reserves.as_ref()),
-        &rt,
+        rt,
         hour_of_secs(now),
     )
     .round(8);
     let prev = reserves_before(txn, &p.key, today.saturating_mul(1_000_000), b)?;
-    s.tvl_prev = usd(&p.tvl_kda(prev.as_ref()), &rt, th.saturating_sub(1)).round(8);
+    s.tvl_prev = usd(&p.tvl_kda(prev.as_ref()), rt, th.saturating_sub(1)).round(8);
     for x in [
         &mut s.vol24,
         &mut s.vol24_prev,
@@ -468,7 +577,7 @@ pub fn pool_node(txn: &impl Txn, p: &PairInfo, s: &Stats, args: TxArgs) -> ApiRe
         token1: token(&p.t1),
         reserve0: p.reserve(0).text(),
         reserve1: p.reserve(1).text(),
-        total_supply: supply(txn, &p.key)?,
+        total_supply: supply(txn, &p.key)?.to_text(),
         key: p.key.clone(),
         tvl_usd: s.tvl.to_f64(),
         tvl_change24h: change(&s.tvl, &s.tvl_prev),
@@ -501,7 +610,8 @@ pub fn pool(txn: &impl Txn, id: &str, now: u64, args: TxArgs, b: &mut Budget) ->
     if p.status.poisoned {
         return Err(unavailable(id));
     }
-    let s = stats(txn, &p, now, b)?;
+    let rt = stats_rates(txn, now, b)?;
+    let s = stats(txn, &p, now, &rt, b)?;
     pool_node(txn, &p, &s, args)
 }
 
@@ -614,9 +724,11 @@ pub fn pools(
 ) -> ApiResult<QueryPoolsConnection> {
     let mut rows: Vec<(Dec, String, Pool)> = Vec::new();
     if protocol == DEFAULT_PROTOCOL {
-        for p in listable(txn, b)? {
+        let pairs = listable(txn, b)?;
+        let rt = stats_rates(txn, now, b)?;
+        for p in pairs {
             b.check()?;
-            let s = stats(txn, &p, now, b)?;
+            let s = stats(txn, &p, now, &rt, b)?;
             let (k, _) = order_key(order, &s);
             rows.push((k, p.id(), pool_node(txn, &p, &s, TxArgs::default())?));
         }
@@ -681,45 +793,63 @@ fn ev_bytes(id: u128) -> [u8; 10] {
     b[6..].try_into().unwrap_or([0; 10])
 }
 
+/// An event's time in seconds: its tx's `meta.creationTime` (stock's), else its block's.
+fn event_secs(e: &StoredEvent) -> u64 {
+    if e.tx_time > 0 {
+        e.tx_time
+    } else {
+        e.time / 1_000_000
+    }
+}
+
 fn tx_node(
     view: &View,
+    pool_id: &str,
     id: u128,
     e: &StoredEvent,
     coin: Option<usize>,
     rt: &Rates,
-) -> PoolTransaction {
-    let f = |i: usize| e.fields.get(i).cloned().unwrap_or_else(|| "0".into());
-    let z = || "0".to_string();
-    let (a0i, a1i, a0o, a1o, kda, ty) = match e.kind {
-        Kind::Swap => {
-            let kda = coin.map(|c| {
-                let i = Dec::parse(&f(2 + c)).unwrap_or_default();
-                if i.is_zero() {
-                    Dec::parse(&f(4 + c)).unwrap_or_default()
-                } else {
-                    i
-                }
-            });
-            (f(2), f(3), f(4), f(5), kda, PoolTransactionType::Swap)
-        }
-        Kind::AddLiquidity => {
-            let kda = coin.map(|c| Dec::parse(&f(2 + c)).unwrap_or_default().mul_int(2));
-            (f(2), f(3), z(), z(), kda, PoolTransactionType::AddLiquidity)
-        }
-        _ => {
-            let kda = coin.map(|c| Dec::parse(&f(2 + c)).unwrap_or_default().mul_int(2));
-            (
-                z(),
-                z(),
-                f(2),
-                f(3),
-                kda,
-                PoolTransactionType::RemoveLiquidity,
-            )
-        }
+) -> ApiResult<PoolTransaction> {
+    // Stored amounts passed `Amount::parse_stored` at ingest; one that no longer reads is a
+    // damaged store, reported as such (never a silent 0).
+    let amt = |i: usize| -> ApiResult<Amount> { e.amount(i).ok_or_else(|| unavailable(pool_id)) };
+    let zero = Amount::zero;
+    let (a0i, a1i, a0o, a1o, ty) = match e.kind {
+        Kind::Swap => (
+            amt(2)?,
+            amt(3)?,
+            amt(4)?,
+            amt(5)?,
+            PoolTransactionType::Swap,
+        ),
+        Kind::AddLiquidity => (
+            amt(2)?,
+            amt(3)?,
+            zero(),
+            zero(),
+            PoolTransactionType::AddLiquidity,
+        ),
+        _ => (
+            zero(),
+            zero(),
+            amt(2)?,
+            amt(3)?,
+            PoolTransactionType::RemoveLiquidity,
+        ),
     };
-    let hour = hour_of_secs(e.time / 1_000_000);
-    let amount_usd = usd(&kda.unwrap_or_default(), rt, hour).round(8).fixed(10);
+    let kda = coin.map(|c| match e.kind {
+        Kind::Swap => {
+            let i = if c == 0 { &a0i } else { &a1i };
+            let o = if c == 0 { &a0o } else { &a1o };
+            Dec::from_amount(if i.is_zero() { o } else { i })
+        }
+        Kind::AddLiquidity => Dec::from_amount(if c == 0 { &a0i } else { &a1i }).mul_int(2),
+        _ => Dec::from_amount(if c == 0 { &a0o } else { &a1o }).mul_int(2),
+    });
+    let secs = event_secs(e);
+    let amount_usd = usd(&kda.unwrap_or_default(), rt, hour_of_secs(secs))
+        .round(8)
+        .fixed(10);
     let key = TxKey((id >> 16) as u64);
     let requestkey = view
         .tx(key)
@@ -728,25 +858,20 @@ fn tx_node(
         .and_then(|r| r.request_key)
         .map(|h| h.to_b64url())
         .unwrap_or_default();
-    let ts = if e.tx_time > 0 {
-        e.tx_time.saturating_mul(1_000_000)
-    } else {
-        e.time
-    };
-    let dec = |t: String| Decimal::verbatim(t);
-    PoolTransaction {
+    let dec = |a: &Amount| Decimal::verbatim(a.to_text());
+    Ok(PoolTransaction {
         id: ID(id.to_string()),
-        maker: f(0),
-        amount0_in: dec(a0i),
-        amount1_in: dec(a1i),
-        amount0_out: dec(a0o),
-        amount1_out: dec(a1o),
-        amount_usd: dec(amount_usd),
-        timestamp: DateTime(ts as i64),
+        maker: e.fields.first().cloned().unwrap_or_default(),
+        amount0_in: dec(&a0i),
+        amount1_in: dec(&a1i),
+        amount0_out: dec(&a0o),
+        amount1_out: dec(&a1o),
+        amount_usd: Decimal::verbatim(amount_usd),
+        timestamp: DateTime(i64::try_from(secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX)),
         transaction_id: None,
         requestkey,
         transaction_type: ty,
-    }
+    })
 }
 
 /// `poolTransactions` / `Pool.transactions`: stock's id paging (`first` newest first,
@@ -799,16 +924,12 @@ pub fn pool_transactions(
     let mut got: Vec<(u128, StoredEvent)> = Vec::new();
     let mut total = 0i64;
     for k in kinds(a.ty) {
+        // The stored per-kind count (exact under apply and unwind), not a walk.
+        let n = hd::event_count(txn, key, k)
+            .map_err(api)?
+            .ok_or_else(|| unavailable(pair_id))?;
+        total = total.saturating_add(n.max(0));
         let prefix = hd::event_prefix(key, k);
-        txn.walk_keys(Table::DexEvents, &prefix, |kk| {
-            if !b.tick() || !kk.starts_with(&prefix) {
-                return false;
-            }
-            total += 1;
-            true
-        })
-        .map_err(api)?;
-        b.check()?;
         let ok = |id: u128| {
             let lo = if desc { before } else { after };
             let hi = if desc { after } else { before };
@@ -881,20 +1002,22 @@ pub fn pool_transactions(
     got.truncate(limit);
     let (lo, hi) = got
         .iter()
-        .map(|g| hour_of_secs(g.1.time / 1_000_000))
+        .map(|g| hour_of_secs(event_secs(&g.1)))
         .fold((u32::MAX, 0u32), |(l, h), x| (l.min(x), h.max(x)));
     let rt = if got.is_empty() {
         Rates::default()
     } else {
         rates(txn, lo, hi, b)?
     };
-    let edges: Vec<PoolTransactionEdge> = got
+    let edges = got
         .iter()
-        .map(|(id, e)| PoolTransactionEdge {
-            cursor: enc(*id),
-            node: tx_node(view, *id, e, p.coin, &rt),
+        .map(|(id, e)| {
+            Ok(PoolTransactionEdge {
+                cursor: enc(*id),
+                node: tx_node(view, pair_id, *id, e, p.coin, &rt)?,
+            })
         })
-        .collect();
+        .collect::<ApiResult<Vec<PoolTransactionEdge>>>()?;
     let paged = a.after.is_some() || a.before.is_some();
     Ok(PoolTransactionsConnection {
         page_info: Some(PageInfo {
@@ -914,8 +1037,9 @@ fn day_of_us(t: u64) -> u64 {
     t / 1_000_000 / DAY * DAY
 }
 
-/// Per-day TVL (USD, rounded 8) at the end of each day in `from_day..=to_day` (unix s),
-/// from the pair's UPDATE history; days before the pair's first UPDATE have none.
+/// Per-day TVL (USD, rounded 8) at the end of each day in `from_day..=to_day` (unix s), from
+/// the pair's UPDATEs of that range only (a seek, then the range's rows) and the reserves
+/// before it; days before the pair's first UPDATE have none.
 fn tvl_days(
     txn: &impl Txn,
     p: &PairInfo,
@@ -925,18 +1049,15 @@ fn tvl_days(
     rt: &Rates,
     b: &mut Budget,
 ) -> ApiResult<Vec<(u64, Dec)>> {
-    let ups = updates(txn, &p.key, b)?;
+    let us = |s: u64| s.saturating_mul(1_000_000);
+    let (mut cur, ups) = updates(txn, &p.key, us(from_day), us(to_day.saturating_add(DAY)), b)?;
     let mut out = Vec::new();
     let mut i = 0usize;
-    let mut cur: Option<(Amount, Amount)> = None;
     let mut d = from_day;
     while d <= to_day {
-        if !b.tick() {
-            break;
-        }
-        let end_us = (d + DAY).saturating_mul(1_000_000);
+        let end_us = us(d + DAY);
         while i < ups.len() && ups[i].0 < end_us {
-            cur = Some((ups[i].2.clone(), ups[i].3.clone()));
+            cur = Some(ups[i].1.clone());
             i += 1;
         }
         if cur.is_some() {
@@ -1011,17 +1132,8 @@ pub fn charts(
         let e = first_time(txn, &hd::event_prefix(key, Kind::Update), true)?;
         e.map(|e| {
             let r = e.amount(0).zip(e.amount(1));
-            let t = if e.tx_time > 0 {
-                e.tx_time
-            } else {
-                e.time / 1_000_000
-            };
-            let v = usd(
-                &p.tvl_kda(r.as_ref()),
-                &rt,
-                hour_of_secs(e.time / 1_000_000),
-            )
-            .round(8);
+            let t = event_secs(&e);
+            let v = usd(&p.tvl_kda(r.as_ref()), &rt, hour_of_secs(t)).round(8);
             vec![point(t, Decimal::verbatim(v.fixed(8)))]
         })
         .unwrap_or_default()
@@ -1159,52 +1271,50 @@ pub fn liquidity_positions(
     b: &mut Budget,
 ) -> ApiResult<LiquidityPositionsConnection> {
     // One point read per listable pair (no walk of every LP balance).
-    let mut mine: Vec<(String, String)> = Vec::new();
-    if !wallet.is_empty() && wallet.len() <= hd::MAX_ACCOUNT_LEN {
-        for p in listable(txn, b)? {
-            b.check()?;
-            if let Some(v) = txn
-                .get(Table::DexLp, &hd::lp_key(&p.key, wallet))
-                .map_err(api)?
-            {
-                mine.push((p.key.clone(), String::from_utf8_lossy(&v).into_owned()));
-            }
-        }
-    }
     let mut rows: Vec<(Dec, String, LiquidityPosition)> = Vec::new();
-    for (key, liq) in mine {
-        b.check()?;
-        let Some(p) = pair_info(txn, &key)? else {
-            continue;
-        };
-        let liq_d = Dec::parse(&liq).unwrap_or_default();
-        if !p.status.listable() || liq_d.is_zero() {
-            continue;
+    if !wallet.is_empty() && wallet.len() <= hd::MAX_ACCOUNT_LEN {
+        let pairs = listable(txn, b)?;
+        let mut rt = None;
+        for p in pairs {
+            b.check()?;
+            let v = txn
+                .get(Table::DexLp, &hd::lp_key(&p.key, wallet))
+                .map_err(api)?;
+            let Some(liq) = stored_amount(v, &p.key)? else {
+                continue;
+            };
+            let liq_d = Dec::from_amount(&liq);
+            if liq_d.is_zero() {
+                continue;
+            }
+            if rt.is_none() {
+                rt = Some(stats_rates(txn, now, b)?);
+            }
+            let s = stats(txn, &p, now, rt.as_ref().unwrap_or(&Rates::default()), b)?;
+            let sup = Dec::from_amount(&supply(txn, &p.key)?);
+            let value = liq_d
+                .div(&sup)
+                .map(|r| r.mul(&s.tvl))
+                .unwrap_or_default()
+                .round(20);
+            let (k, _) = lp_order(order, &value, &liq_d, &s.apr);
+            let pool = pool_node(txn, &p, &s, TxArgs::default())?;
+            rows.push((
+                k,
+                p.id(),
+                LiquidityPosition {
+                    id: ID(format!("{}:{wallet}", p.id())),
+                    pair_id: p.id(),
+                    liquidity: liq_d.text(),
+                    wallet_address: wallet.to_owned(),
+                    value_usd: num(&value),
+                    apr24h: num(&s.apr),
+                    pair: pool,
+                    created_at: DateTime(p.created_us as i64),
+                    updated_at: DateTime(p.updated_us as i64),
+                },
+            ));
         }
-        let s = stats(txn, &p, now, b)?;
-        let sup = Dec::parse(&supply(txn, &key)?).unwrap_or_default();
-        let value = liq_d
-            .div(&sup)
-            .map(|r| r.mul(&s.tvl))
-            .unwrap_or_default()
-            .round(20);
-        let (k, _) = lp_order(order, &value, &liq_d, &s.apr);
-        let pool = pool_node(txn, &p, &s, TxArgs::default())?;
-        rows.push((
-            k,
-            p.id(),
-            LiquidityPosition {
-                id: ID(format!("{}:{wallet}", p.id())),
-                pair_id: p.id(),
-                liquidity: liq_d.text(),
-                wallet_address: wallet.to_owned(),
-                value_usd: num(&value),
-                apr24h: num(&s.apr),
-                pair: pool,
-                created_at: DateTime(p.created_us as i64),
-                updated_at: DateTime(p.updated_us as i64),
-            },
-        ));
     }
     let desc = lp_order(order, &Dec::zero(), &Dec::zero(), &Dec::zero()).1;
     rows.sort_by(|a, b| {
@@ -1239,72 +1349,123 @@ pub fn liquidity_positions(
 
 // Token prices.
 
-/// Latest reserves of every created, unpoisoned pair with non-zero reserves.
-fn price_graph(txn: &impl Txn, b: &mut Budget) -> ApiResult<Vec<PairInfo>> {
-    let mut out = Vec::new();
-    for k in pair_keys(txn, b)? {
-        if !b.tick() {
-            break;
-        }
-        if let Some(p) = pair_info(txn, &k)? {
-            let ok = !p.status.poisoned
-                && p.status
-                    .reserves
-                    .as_ref()
-                    .is_some_and(|(a, c)| !a.is_zero() && !c.is_zero());
-            if ok {
-                out.push(p);
-            }
-        }
-    }
-    b.check()?;
-    Ok(out)
+/// A price search: pair statuses read once per field.
+struct PriceSearch<'a, T: Txn> {
+    txn: &'a T,
+    pairs: HashMap<String, PairStatus>,
 }
 
-/// Stock's `findOptimalKdaPricePath`: BFS from `token`; at each token a direct `coin` pair
-/// gives the answer, else the amount moves to each neighbour at the reserve ratio.
-pub fn price_in_kda(graph: &[PairInfo], token: &str) -> Option<Dec> {
-    if token == "coin" {
-        return Some(Dec::int(1));
-    }
-    let mut adj: HashMap<&str, Vec<(&str, Dec, Dec)>> = HashMap::new();
-    for p in graph {
-        let (r0, r1) = (p.reserve(0), p.reserve(1));
-        adj.entry(&p.t0)
-            .or_default()
-            .push((&p.t1, r0.clone(), r1.clone()));
-        adj.entry(&p.t1).or_default().push((&p.t0, r1, r0));
-    }
-    let mut q = VecDeque::from([(token, Dec::int(1))]);
-    let mut seen = HashSet::from([token]);
-    while let Some((t, amt)) = q.pop_front() {
-        let edges = adj.get(t)?;
-        if let Some((_, rs, ro)) = edges.iter().find(|e| e.0 == "coin") {
-            return amt.mul(ro).div(rs);
+impl<T: Txn> PriceSearch<'_, T> {
+    fn status(&mut self, pair: &str, b: &mut Budget) -> ApiResult<&PairStatus> {
+        if !self.pairs.contains_key(pair) {
+            b.tick();
+            let st = hd::pair_status(self.txn, pair).map_err(api)?;
+            self.pairs.insert(pair.to_owned(), st);
         }
-        for (o, rs, ro) in edges {
-            if seen.insert(o) {
-                if let Some(x) = amt.mul(ro).div(rs) {
-                    q.push_back((o, x));
+        b.check()?;
+        Ok(&self.pairs[pair])
+    }
+
+    /// Whether `token` is in a stored pair (stock: a token row exists).
+    fn known(&self, token: &str) -> ApiResult<bool> {
+        let mut any = false;
+        hd::token_pairs(self.txn, token, |_| {
+            any = true;
+            false
+        })
+        .map_err(api)?;
+        Ok(any)
+    }
+
+    /// Reserves of `pair` as (this token's, the other's), when created and not poisoned.
+    fn sides(
+        &mut self,
+        pair: &str,
+        token: &str,
+        b: &mut Budget,
+    ) -> ApiResult<Option<Option<(Dec, Dec)>>> {
+        let st = self.status(pair, b)?;
+        if !st.created || st.poisoned {
+            return Ok(None);
+        }
+        let first = pair.split(':').next() == Some(token);
+        Ok(Some(st.reserves.as_ref().map(|(r0, r1)| {
+            let (a, c) = (Dec::from_amount(r0), Dec::from_amount(r1));
+            if first {
+                (a, c)
+            } else {
+                (c, a)
+            }
+        })))
+    }
+
+    /// Stock's `findOptimalKdaPricePath`: BFS from `token`; at each token a direct `coin`
+    /// pair gives the answer (0 when its reserves are zero or unknown, as stock), else the
+    /// amount moves to each neighbour at the reserve ratio, at most [`MAX_HOPS`] hops out.
+    /// Neighbours come from the token index (oldest pair first, close to stock's id order);
+    /// at most [`MAX_NEIGHBORS`] per token and [`MAX_PRICE_TOKENS`] tokens are read.
+    fn price_in_kda(&mut self, token: &str, b: &mut Budget) -> ApiResult<Option<Dec>> {
+        if token == "coin" {
+            return Ok(Some(Dec::int(1)));
+        }
+        let mut q = VecDeque::from([(token.to_owned(), Dec::int(1), 0usize)]);
+        let mut seen = HashSet::from([token.to_owned()]);
+        while let Some((t, amt, depth)) = q.pop_front() {
+            if let Some((direct, _)) = hd::pair_of(&t, "coin") {
+                if let Some(r) = self.sides(&direct, &t, b)? {
+                    let kda = r
+                        .and_then(|(rt, rc)| amt.mul(&rc).div(&rt))
+                        .unwrap_or_default();
+                    return Ok(Some(kda));
+                }
+            }
+            if depth >= MAX_HOPS {
+                continue;
+            }
+            let mut next = Vec::new();
+            let mut names = HashSet::new();
+            hd::token_pairs(self.txn, &t, |pair| {
+                if b.tick() && names.len() < MAX_NEIGHBORS {
+                    if names.insert(pair.to_owned()) {
+                        next.push(pair.to_owned());
+                    }
+                    true
+                } else {
+                    false
+                }
+            })
+            .map_err(api)?;
+            b.check()?;
+            for pair in next {
+                let Some(other) = pair.split(':').find(|x| *x != t).map(str::to_owned) else {
+                    continue;
+                };
+                if seen.contains(&other) {
+                    continue;
+                }
+                let Some(Some((rs, ro))) = self.sides(&pair, &t, b)? else {
+                    continue;
+                };
+                if let Some(x) = amt.mul(&ro).div(&rs) {
+                    if seen.len() >= MAX_PRICE_TOKENS {
+                        return Ok(None);
+                    }
+                    seen.insert(other.clone());
+                    q.push_back((other, x, depth + 1));
                 }
             }
         }
+        Ok(None)
     }
-    None
 }
 
 fn price_node(
-    graph: &[PairInfo],
+    kda: Option<Dec>,
     name: &str,
     protocol: &str,
     rate: Option<&Amount>,
     now: u64,
 ) -> TokenPrice {
-    let kda = if protocol == DEFAULT_PROTOCOL {
-        price_in_kda(graph, name)
-    } else {
-        None
-    };
     // Stock answers 0/0 when it has no KDA/USD price or no path.
     let (k, u) = match (kda, rate) {
         (Some(k), Some(r)) => {
@@ -1323,7 +1484,8 @@ fn price_node(
     }
 }
 
-/// `tokenPrice`: null for a token in no stored pair.
+/// `tokenPrice`: null for a token in no stored pair. A bounded search from the token (a
+/// direct `coin` pair is one read).
 pub fn token_price(
     txn: &impl Txn,
     now: u64,
@@ -1331,13 +1493,20 @@ pub fn token_price(
     protocol: &str,
     b: &mut Budget,
 ) -> ApiResult<Option<TokenPrice>> {
-    let graph = price_graph(txn, b)?;
-    let known = graph.iter().any(|p| p.t0 == addr || p.t1 == addr);
-    if !known {
+    let mut ps = PriceSearch {
+        txn,
+        pairs: HashMap::new(),
+    };
+    if addr.is_empty() || addr.len() > hd::MAX_ACCOUNT_LEN || !ps.known(addr)? {
         return Ok(None);
     }
+    let kda = if protocol == DEFAULT_PROTOCOL {
+        ps.price_in_kda(addr, b)?
+    } else {
+        None
+    };
     let rate = dex_usd::latest(txn).map_err(api)?.map(|r| r.1);
-    Ok(Some(price_node(&graph, addr, protocol, rate.as_ref(), now)))
+    Ok(Some(price_node(kda, addr, protocol, rate.as_ref(), now)))
 }
 
 /// `tokenPrices`: every token of a listable pair (sorted by address; stock's order is the
@@ -1351,19 +1520,24 @@ pub fn token_prices(
     if protocol != DEFAULT_PROTOCOL {
         return Ok(Vec::new());
     }
-    let graph = price_graph(txn, b)?;
+    let pairs = listable(txn, b)?;
     let rate = dex_usd::latest(txn).map_err(api)?.map(|r| r.1);
-    let mut names: Vec<&str> = graph
+    let mut names: Vec<&str> = pairs
         .iter()
-        .filter(|p| p.status.listable())
         .flat_map(|p| [p.t0.as_str(), p.t1.as_str()])
         .collect();
     names.sort_unstable();
     names.dedup();
-    Ok(names
-        .into_iter()
-        .map(|n| price_node(&graph, n, protocol, rate.as_ref(), now))
-        .collect())
+    let mut ps = PriceSearch {
+        txn,
+        pairs: HashMap::new(),
+    };
+    let mut out = Vec::with_capacity(names.len());
+    for n in names {
+        let kda = ps.price_in_kda(n, b)?;
+        out.push(price_node(kda, n, protocol, rate.as_ref(), now));
+    }
+    Ok(out)
 }
 
 // Tokens.

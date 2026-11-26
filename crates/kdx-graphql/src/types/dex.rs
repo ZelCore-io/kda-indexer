@@ -511,7 +511,7 @@ impl DexQuery {
         protocol_address: Option<String>,
     ) -> Result<Option<TokenPrice>> {
         let (now, proto) = (now_secs(), protocol(protocol_address));
-        run(ctx, false, move |v, b| {
+        run(ctx, true, move |v, b| {
             ds::token_price(&v.txn, now, &token_address, &proto, b)
         })
         .await
