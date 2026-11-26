@@ -27,17 +27,37 @@ where
 {
     let dl = crate::deadline(ctx);
     let st = crate::gql(ctx).state()?;
-    let go = move |view: &View| -> ApiResult<T> {
+    let go = move |view: &View| -> ApiResult<(T, bool)> {
         view.check_deadline()?;
         let mut b = Budget::new(dl);
-        f(view, &mut b)
+        let t = f(view, &mut b)?;
+        Ok((t, b.capped))
     };
     let r = if heavy {
         st.read_heavy(go).await
     } else {
         st.read(go).await
     };
-    r.map_err(crate::error::from_api)
+    let (t, capped) = r.map_err(crate::error::from_api)?;
+    if capped {
+        ctx.add_error(ctx.set_error_path(pairs_cut().into_server_error(ctx.item.pos)));
+    }
+    Ok(t)
+}
+
+/// The partial-data error of a DEX listing cut at [`ds::MAX_PAIRS`] listable pairs (the
+/// oldest are served): `LIMIT`, `extensions.limit = "dex_pairs"`.
+pub fn pairs_cut() -> async_graphql::Error {
+    use async_graphql::ErrorExtensions;
+    kdx_metrics::get().graphql_rejected("dex_pairs");
+    crate::error::err(
+        crate::error::Code::Limit,
+        format!(
+            "DEX pairs cut at {}: more pairs are listable; the oldest are served",
+            ds::MAX_PAIRS
+        ),
+    )
+    .extend_with(|_, e| e.set("limit", "dex_pairs"))
 }
 
 fn protocol(p: Option<String>) -> String {

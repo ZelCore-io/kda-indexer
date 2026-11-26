@@ -52,6 +52,7 @@
 //! | `DexAgg` | 0x03, pair | empty: the pair is poisoned ([`poisoned`]); never removed |
 //! | `DexAgg` | 0x04, pair, 0x00, kind u8 | i64 (wrapping): stored SWAP / ADD_LIQUIDITY / REMOVE_LIQUIDITY events of the pair ([`event_count`]); absent when zero |
 //! | `DexAgg` | 0x05, token, 0x00, ev | pair: one row per token of each `CREATE_PAIR` (a token's pairs, oldest first; [`token_pairs`]) |
+//! | `DexAgg` | 0x06, pair | i64 (wrapping): stored `UPDATE`s with both reserves non-zero, for pairs with a `coin` leg only; absent when zero. The listing candidates ([`funded_pairs`]): a coin pair that was never funded is never read |
 //! | `DexUsd` | hour u32 | USD per KDA, decimal text: reserved for the serving part's DIA feed; ingest never writes it |
 //!
 //! `DexEvents` fields per kind (amounts oriented to the pair, as decimal text):
@@ -796,7 +797,54 @@ pub fn token_pairs(txn: &impl Txn, token: &str, mut f: impl FnMut(&str) -> bool)
     Ok(())
 }
 
-/// Version of the derived DEX rows (2: buckets by tx time, event counts, token index).
+/// `DexAgg` key of a coin pair's count of funded `UPDATE`s.
+pub fn funded_key(pair: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(pair.len() + 1);
+    k.push(6);
+    k.extend_from_slice(pair.as_bytes());
+    k
+}
+
+/// Add (`d` 1) or remove (`d` -1) a stored `UPDATE` from its coin pair's funded count. The
+/// count depends only on the set of stored `UPDATE`s, so it is exact under unwind and in
+/// any fill order. `Ok(false)`: an unreadable row (the caller poisons the pair).
+fn bump_funded(txn: &mut RwTxn<'_>, pair: &str, e: &StoredEvent, d: i64) -> Fx {
+    if e.kind != Kind::Update || !pair.split(':').any(|t| t == "coin") {
+        return Ok(true);
+    }
+    let (Some(r0), Some(r1)) = (e.amount(0), e.amount(1)) else {
+        return Ok(false);
+    };
+    if r0.is_zero() || r1.is_zero() {
+        return Ok(true);
+    }
+    let k = funded_key(pair);
+    let n = match txn.get(Table::DexAgg, &k)? {
+        None => 0,
+        Some(v) => match <[u8; 8]>::try_from(v.as_slice()) {
+            Ok(b) => i64::from_be_bytes(b),
+            Err(_) => return Ok(false),
+        },
+    };
+    match n.wrapping_add(d) {
+        0 => {
+            txn.del(Table::DexAgg, &k)?;
+        }
+        n => txn.put(Table::DexAgg, &k, &n.to_be_bytes())?,
+    }
+    Ok(true)
+}
+
+/// Coin pairs with at least one funded `UPDATE` (key order) while `f(pair)` holds: the only
+/// pairs that can be listable. A pair created and never funded is not here, however many.
+pub fn funded_pairs(txn: &impl Txn, mut f: impl FnMut(&str) -> bool) -> Result<()> {
+    txn.walk_keys(Table::DexAgg, &[6], |k| {
+        k.first() == Some(&6) && f(&String::from_utf8_lossy(&k[1..]))
+    })
+}
+
+/// Version of the derived DEX rows (2: buckets by tx time, event counts, token index,
+/// funded coin pairs).
 pub const LAYOUT: u32 = 2;
 
 /// Clear the DEX tables of a store written under another [`LAYOUT`] and reset the history
@@ -1058,7 +1106,7 @@ pub fn store_event(
         index_pair(txn, &ev.pair, key, idx, false)?;
     }
     // Counts follow the stored rows (poisoned or not), so they stay exact under unwind.
-    if !bump_count(txn, &ev.pair, ev.kind, 1)? {
+    if !bump_count(txn, &ev.pair, ev.kind, 1)? || !bump_funded(txn, &ev.pair, &row, 1)? {
         poison(txn, &ev.pair, "count")?;
     }
     if !poisoned(txn, &ev.pair)? && !effect(txn, &ev.pair, &row, false)? {
@@ -1132,7 +1180,8 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
         }
         let ok = match row.as_deref().map(StoredEvent::decode) {
             Some(Ok(row)) if row.kind == kind => {
-                poisoned(txn, &pair)? || effect(txn, &pair, &row, true)?
+                bump_funded(txn, &pair, &row, -1)?
+                    && (poisoned(txn, &pair)? || effect(txn, &pair, &row, true)?)
             }
             _ => false,
         };

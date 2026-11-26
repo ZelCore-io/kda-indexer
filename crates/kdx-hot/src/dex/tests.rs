@@ -1135,6 +1135,57 @@ fn counts_index_and_layout() {
         );
         txn.commit().unwrap();
     }
+    {
+        // Funded coin pairs: a non-zero UPDATE makes the pair a listing candidate, a zero one
+        // does not; a pair without a coin leg never is. Unwind removes it exactly.
+        let mut txn = hot.rw().unwrap();
+        let k3 = TxKey::new(H + 2, SUSHI_CHAIN, 1);
+        let t = t0 * 1_000_000;
+        store_event(
+            &mut txn,
+            k3,
+            0,
+            t,
+            0,
+            &ev("coin:free.x", Kind::Update, &["1", "2"]),
+        )
+        .unwrap();
+        store_event(
+            &mut txn,
+            k3,
+            1,
+            t,
+            0,
+            &ev("coin:free.x", Kind::Update, &["0", "0"]),
+        )
+        .unwrap();
+        store_event(
+            &mut txn,
+            k3,
+            2,
+            t,
+            0,
+            &ev("free.x:free.y", Kind::Update, &["1", "2"]),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+    let funded = |txn: &crate::RoTxn| {
+        let mut v = Vec::new();
+        funded_pairs(txn, |p| {
+            v.push(p.to_owned());
+            true
+        })
+        .unwrap();
+        v
+    };
+    assert_eq!(funded(&hot.ro().unwrap()), ["coin:free.x"]);
+    {
+        let mut txn = hot.rw().unwrap();
+        undo_block(&mut txn, SUSHI_CHAIN, H + 2).unwrap();
+        txn.commit().unwrap();
+    }
+    assert!(funded(&hot.ro().unwrap()).is_empty(), "unwound");
     let ro = hot.ro().unwrap();
     assert_eq!(
         event_count(&ro, "coin:free.x", Kind::Swap).unwrap(),

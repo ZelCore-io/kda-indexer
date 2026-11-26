@@ -543,11 +543,18 @@ async fn spam_pairs_never_crowd_out_real_pools() {
         w.pair(&format!("a.s{i:05}:coin"), today + 5, "1", "1");
     }
     w.txn.commit().unwrap();
-    let v = data(
+    // Past the cap the oldest pools are served, with a `dex_pairs` partial-data error.
+    let (_, full) = query(
         &st,
         "{ pools(first: 1000) { totalCount edges { node { key } } } }",
     )
     .await;
+    assert_eq!(
+        full["errors"][0]["extensions"]["limit"], "dex_pairs",
+        "{}",
+        full["errors"]
+    );
+    let v = full["data"].clone();
     assert_eq!(
         v["pools"]["totalCount"],
         dexserve::MAX_PAIRS,
@@ -569,8 +576,46 @@ async fn spam_pairs_never_crowd_out_real_pools() {
     )
     .await;
     assert_ne!(t["tokenPrice"]["priceInKda"], 0, "{t}");
-    let m = data(&st, "{ dexMetrics { totalPools } }").await;
-    assert_eq!(m["dexMetrics"]["totalPools"], dexserve::MAX_PAIRS);
+    let (_, m) = query(&st, "{ dexMetrics { totalPools } }").await;
+    assert_eq!(m["data"]["dexMetrics"]["totalPools"], dexserve::MAX_PAIRS);
+    assert_eq!(m["errors"][0]["extensions"]["limit"], "dex_pairs");
+}
+
+/// 20,000 spam coin pairs (no reserves, or funded and drained) created before a new real
+/// pool never count toward the cap: the new pool is served, with no cut.
+#[tokio::test]
+async fn unfunded_spam_never_uses_the_cap() {
+    let d = tempfile::tempdir().unwrap();
+    let (hot, st) = state(&d);
+    let today = fixture(&hot);
+    let mut w = W {
+        txn: hot.rw().unwrap(),
+        pos: 0,
+    };
+    for i in 0..20_000 {
+        let j = format!("a.j{i:05}:coin");
+        w.ev(&j, Kind::CreatePair, today - 100, &[&j, "acct"]);
+    }
+    for i in 0..50 {
+        let j = format!("a.d{i:02}:coin");
+        w.pair(&j, today - 100, "1", "1");
+        w.ev(&j, Kind::Update, today - 90, &["0", "0"]);
+    }
+    w.pair("coin:free.new", today + 30, "7", "70");
+    w.txn.commit().unwrap();
+    let v = data(
+        &st,
+        "{ pools(first: 100) { totalCount edges { node { key } } } }",
+    )
+    .await;
+    assert_eq!(v["pools"]["totalCount"], 3, "{v}");
+    let keys: Vec<&str> = v["pools"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["node"]["key"].as_str().unwrap())
+        .collect();
+    assert!(keys.contains(&"coin:free.new"), "{keys:?}");
 }
 
 /// I2: a pair with a history larger than the row budget answers a one-day `dexMetrics`,
@@ -624,6 +669,14 @@ async fn large_history_reads_only_the_range() {
             .put(
                 Table::DexAgg,
                 &hd::count_key(big, Kind::Swap),
+                &(rows as i64).to_be_bytes(),
+            )
+            .unwrap();
+        // Rows written directly: its funded mark (store_event keeps it) too.
+        w.txn
+            .put(
+                Table::DexAgg,
+                &hd::funded_key(big),
                 &(rows as i64).to_be_bytes(),
             )
             .unwrap();

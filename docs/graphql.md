@@ -910,9 +910,13 @@ Costs: each DEX field has a read-budget cost (`dexMetrics` 100,000; lists, `toke
 as they are read), checks the request deadline inside every loop, and the aggregates and
 price searches run on a heavy slot. No request walks a pair's whole history:
 `poolTransactions.totalCount` comes from per-pair, per-kind counts kept at ingest, and range
-reads seek to the range (block times rise with height). A listing serves at most 1,000
-listable pools, oldest `CREATE_PAIR` first, and considers only `coin` pairs (at most 20,000,
-oldest first), so junk pairs cannot push real pools out. Token prices follow stock's path
+reads seek to the range (block times rise with height). A listing reads only `coin` pairs that
+were ever funded (a non-zero `UPDATE`, counted at ingest and exact under unwind), filters them
+as listable and only then caps them at 1,000 pools, oldest `CREATE_PAIR` first, so pairs that
+were never funded cost nothing and cannot push real pools out. Past the cap the field answers
+the oldest pools with a partial-data error (`LIMIT`, `extensions.limit = "dex_pairs"`); a
+listing that runs out of rows or time fails with the deadline error, never a silent partial
+list. Token prices follow stock's path
 search with its 3-hop limit (a direct `coin` pair with zero reserves prices at 0, as stock),
 reading at most 256 pairs per token and 2,048 tokens. `dexMetrics` ranges are capped at
 1,100 days.

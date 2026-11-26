@@ -46,8 +46,9 @@
 //! Times match stock: windows, chart buckets and the `amountUsd` rate hour use the tx's
 //! `meta.creationTime` (block time when absent), as stored per event (`kdx_hot::dex`).
 //!
-//! Cost: nothing walks a pair's whole history. Listings take `coin` pairs from the token
-//! index, oldest first, filter them as listable and only then cap them ([`MAX_PAIRS`]);
+//! Cost: nothing walks a pair's whole history. Listings read only coin pairs that were ever
+//! funded, filter them as listable and only then cap them, oldest first ([`MAX_PAIRS`],
+//! reported as a partial-data error when hit);
 //! `poolTransactions.totalCount` reads the stored per-kind counts; range reads seek by time
 //! ([`seek_time`]); a [`Budget`] of rows is checked as rows are read and against the request
 //! deadline in every loop; aggregates and price searches run on a heavy slot (resolvers).
@@ -69,11 +70,9 @@ use crate::scalars::{DateTime, Decimal};
 use crate::types::dex::*;
 
 pub const DEFAULT_PROTOCOL: &str = hd::SUSHI_EXCHANGE;
-/// Listable pairs one field serves, oldest `CREATE_PAIR` first (later ones are left out,
-/// with a warning).
+/// Listable pairs one field serves, oldest `CREATE_PAIR` first; past it the field answers
+/// the first ones with a `dex_pairs` partial-data error ([`Budget::capped`]).
 pub const MAX_PAIRS: usize = 1_000;
-/// `coin` pairs one listing checks for listability, oldest first (spam past it is not read).
-pub const MAX_CANDIDATES: usize = 20_000;
 /// Rows one field reads (checked as rows are read, so it also bounds what a field holds).
 pub const MAX_ROWS: u64 = 250_000;
 /// The price path: at most 3 hops (stock's `findOptimalKdaPricePath` stops at path length 4).
@@ -93,6 +92,9 @@ pub struct Budget {
     dl: Instant,
     rows: u64,
     out: bool,
+    /// A listing had more than [`MAX_PAIRS`] listable pairs and served the oldest: the
+    /// resolver reports it (never a silent partial list).
+    pub capped: bool,
 }
 
 impl Budget {
@@ -101,6 +103,7 @@ impl Budget {
             dl,
             rows: 0,
             out: false,
+            capped: false,
         }
     }
 
@@ -226,25 +229,17 @@ pub fn pair_info(txn: &impl Txn, key: &str) -> ApiResult<Option<PairInfo>> {
 }
 
 /// Listable pairs (`PairStatus::listable`: created, not poisoned, a coin leg, non-zero
-/// reserves), oldest `CREATE_PAIR` first. Only `coin` pairs are candidates (the token index
-/// of `coin`, so junk pairs without a coin leg are never read); the listable filter runs
-/// before the [`MAX_PAIRS`] cap, so pairs that are not listable never crowd real pools out.
+/// reserves), oldest `CREATE_PAIR` first. Candidates are the coin pairs that were ever funded
+/// (`kdx_hot::dex::funded_pairs`), so pairs created and never funded are never read, and
+/// only listable pairs count toward [`MAX_PAIRS`]. The walk is bounded by the row budget and
+/// the deadline (an error when spent, never a partial list); past the cap the oldest pairs
+/// are served and [`Budget::capped`] is set.
 pub fn listable(txn: &impl Txn, b: &mut Budget) -> ApiResult<Vec<PairInfo>> {
     let mut keys: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut checked = 0usize;
-    let mut capped = false;
     let mut err = None;
-    hd::token_pairs(txn, "coin", |pair| {
-        if !b.tick() {
-            return false;
-        }
-        if !seen.insert(pair.to_owned()) {
-            return true;
-        }
-        checked += 1;
-        if checked > MAX_CANDIDATES || keys.len() >= MAX_PAIRS {
-            capped = true;
+    hd::funded_pairs(txn, |pair| {
+        // A status is three reads.
+        if !(b.tick() && b.tick() && b.tick()) {
             return false;
         }
         match hd::pair_status(txn, pair) {
@@ -262,18 +257,27 @@ pub fn listable(txn: &impl Txn, b: &mut Budget) -> ApiResult<Vec<PairInfo>> {
         return Err(api(e));
     }
     b.check()?;
-    if capped {
-        tracing::warn!(
-            listed = keys.len(),
-            checked,
-            "dex: pair listing capped; the oldest pairs are served"
-        );
-    }
     let mut out = Vec::with_capacity(keys.len());
     for k in keys {
+        b.tick();
+        b.tick();
         if let Some(p) = pair_info(txn, &k)? {
             out.push(p);
         }
+    }
+    b.check()?;
+    out.sort_by(|x, y| {
+        x.created_us
+            .cmp(&y.created_us)
+            .then_with(|| x.key.cmp(&y.key))
+    });
+    if out.len() > MAX_PAIRS {
+        tracing::warn!(
+            listable = out.len(),
+            "dex: more listable pairs than the cap; the oldest are served"
+        );
+        out.truncate(MAX_PAIRS);
+        b.capped = true;
     }
     Ok(out)
 }
