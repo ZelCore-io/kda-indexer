@@ -70,6 +70,12 @@ Ingest uses the node's HTTP API only; it never opens the node's database files.
 - **The reconciler** reads balances and guards from the node's `/local` for accounts that new
   blocks touched, rate-limited (`balances.local_rps`). Pact is executed by the node, not by
   kda-indexer.
+- **The Pact passthrough** (GraphQL `pactQuery`, `gasLimitEstimate`) sends client Pact to the
+  node's `/local`, as the stock indexer does (owner decision 2026-11-26, replacing the earlier
+  rule that the indexer never runs Pact for clients). The node executes it; nothing is
+  committed and nothing goes to `/send`. It has its own node client on the configured
+  `node.url`, and is bounded per request, per IP, in flight, by time, gas limit and answer
+  size ([graphql.md](graphql.md#pact-passthrough)).
 - **The search stage** adds new distinct `exec` code bodies to the code index every
   `search.commit_secs` (60 s).
 

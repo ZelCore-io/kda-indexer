@@ -130,6 +130,10 @@ pub struct ApiState {
     /// `[balances] key_modules` (M-1, SEC-2): the modules `GET /keys/{pubkey}/accounts`
     /// lists without `token`; unset means `["coin"]`.
     key_modules: std::sync::OnceLock<Vec<String>>,
+    /// Extra time a `/graphql` request may run past `deadline` (B1: the `pactQuery` /
+    /// `gasLimitEstimate` node passthrough's timeout); unset is none. It is the ceiling of
+    /// the request's [`RunDeadline`]: only a Pact field that runs extends it.
+    graphql_extra: std::sync::OnceLock<std::time::Duration>,
     /// The `/stats` count cache: the process-wide one (GraphQL `networkInfo` shares it); a
     /// test injects its own (FV-6).
     pub(crate) stats_cache: &'static crate::compat::stats::CountCache,
@@ -298,6 +302,11 @@ impl ApiState {
     }
 
     /// Set `[balances] key_modules` (once, before serving; later calls are ignored).
+    /// See `graphql_extra`; set once, at start.
+    pub fn set_graphql_extra_deadline(&self, extra: std::time::Duration) {
+        let _ = self.graphql_extra.set(extra);
+    }
+
     pub fn set_key_modules(&self, modules: Vec<String>) {
         let _ = self.key_modules.set(modules);
     }
@@ -448,8 +457,70 @@ const STATUS_READS: usize = 2;
 /// Header carrying the compat next-page token.
 pub const CHAINWEB_NEXT: HeaderName = HeaderName::from_static("chainweb-next");
 
+/// A request's deadline, shared by the guard and the handler (B1 fix round 1, I1/I2). It
+/// starts at the listener's deadline from arrival; only code that actually starts work
+/// allowed to run longer (the GraphQL Pact passthrough) moves it later, by
+/// [`RunDeadline::extend_to`], and never past the ceiling the guard set (`deadline` plus the
+/// route's extra). The guard and the handler wait on it with [`RunDeadline::run`], which
+/// follows every extension.
+#[derive(Debug, Clone)]
+pub struct RunDeadline {
+    base: Instant,
+    /// Nanoseconds after `base`.
+    at: Arc<std::sync::atomic::AtomicU64>,
+    ceiling: u64,
+}
+
+impl RunDeadline {
+    /// A deadline at `at` that extensions may move up to `at + max_extra`.
+    pub fn new(at: Instant, max_extra: Duration) -> RunDeadline {
+        let base = Instant::now();
+        let ns = |t: Instant| {
+            u64::try_from(t.saturating_duration_since(base).as_nanos()).unwrap_or(u64::MAX)
+        };
+        RunDeadline {
+            base,
+            at: Arc::new(std::sync::atomic::AtomicU64::new(ns(at))),
+            ceiling: ns(at + max_extra),
+        }
+    }
+
+    /// The current deadline.
+    pub fn get(&self) -> Instant {
+        self.base + Duration::from_nanos(self.at.load(Ordering::Acquire))
+    }
+
+    /// Move the deadline to `t` (clamped to the ceiling; never earlier). Returns the deadline.
+    pub fn extend_to(&self, t: Instant) -> Instant {
+        let n = u64::try_from(t.saturating_duration_since(self.base).as_nanos())
+            .unwrap_or(u64::MAX)
+            .min(self.ceiling);
+        self.at.fetch_max(n, Ordering::AcqRel);
+        self.get()
+    }
+
+    /// Run `fut` until it ends or the deadline less `margin` passes (`None`), re-reading the
+    /// deadline whenever the timer fires, so an extension made meanwhile is followed.
+    pub async fn run<F: std::future::Future>(&self, margin: Duration, fut: F) -> Option<F::Output> {
+        tokio::pin!(fut);
+        loop {
+            let until = self.get().checked_sub(margin).unwrap_or(self.base);
+            tokio::select! {
+                biased;
+                r = &mut fut => return Some(r),
+                () = tokio::time::sleep_until(until.into()) => {
+                    let now = Instant::now();
+                    if self.get().checked_sub(margin).is_none_or(|u| u <= now) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Limits of a data listener: in-flight cap, per-IP rate, deadline, body cap.
-pub(crate) async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
+pub async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
     let Ok(slot) = st.in_flight.clone().try_acquire_owned() else {
         return ApiError::Unavailable("too many requests in flight".into()).into_response();
     };
@@ -479,6 +550,17 @@ pub(crate) async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: N
     } else {
         (st.settings.max_body_bytes, st.settings.deadline)
     };
+    // B1 (fix round 1, I2): `/graphql` may run past `deadline` only once the handler extends
+    // the shared deadline for a Pact field that actually runs; the body read and every
+    // other request keep `deadline`.
+    let extra = if path == "/graphql" && !is_docs {
+        st.graphql_extra.get().copied().unwrap_or_default()
+    } else {
+        Duration::ZERO
+    };
+    let run_deadline = RunDeadline::new(Instant::now() + deadline, extra);
+    let mut req = req;
+    req.extensions_mut().insert(run_deadline.clone());
     let delay = debug_delay();
     let client = req
         .extensions()
@@ -493,9 +575,9 @@ pub(crate) async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: N
             None => next.run(req).await,
         }
     };
-    let resp = match tokio::time::timeout(deadline, run).await {
-        Ok(r) => r,
-        Err(_) => return ApiError::Deadline.into_response(),
+    let resp = match run_deadline.run(Duration::ZERO, run).await {
+        Some(r) => r,
+        None => return ApiError::Deadline.into_response(),
     };
     // Handlers build whole bodies (exact size hint); one over the cap is refused.
     if resp.body().size_hint().lower() > cap as u64 {
@@ -754,6 +836,7 @@ impl Api {
             v1txs: Arc::new(Semaphore::new(v1txs_slots(settings.read_threads))),
             heavy_clients: Arc::default(),
             key_modules: std::sync::OnceLock::new(),
+            graphql_extra: std::sync::OnceLock::new(),
             stats_cache: &crate::compat::stats::CACHE,
             in_flight: Arc::new(Semaphore::new(settings.max_in_flight.max(1))),
             limiter: RateLimiter::new(settings.rate_per_ip, settings.rate_burst),
@@ -955,6 +1038,44 @@ pub fn json(v: &serde_json::Value) -> Response {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// B1 fix round 1: the wait follows an extension made while it runs, never past the
+    /// ceiling, and never earlier than the deadline it started with.
+    #[tokio::test]
+    async fn run_deadline_follows_extensions_up_to_its_ceiling() {
+        let t0 = Instant::now();
+        let d = RunDeadline::new(t0 + Duration::from_millis(100), Duration::from_millis(300));
+        assert_eq!(
+            d.extend_to(t0),
+            t0 + Duration::from_millis(100),
+            "never earlier"
+        );
+        let ext = d.clone();
+        let slow = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ext.extend_to(Instant::now() + Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            7
+        };
+        assert_eq!(d.run(Duration::ZERO, slow).await, Some(7));
+        assert!(d.get() <= t0 + Duration::from_millis(400), "ceiling");
+        let stuck = tokio::time::sleep(Duration::from_secs(10));
+        let t = Instant::now();
+        assert_eq!(d.run(Duration::ZERO, stuck).await, None);
+        assert!(t.elapsed() < Duration::from_millis(300));
+        // Without an extension the wait is the plain deadline.
+        let d = RunDeadline::new(
+            Instant::now() + Duration::from_millis(80),
+            Duration::from_secs(5),
+        );
+        let t = Instant::now();
+        assert_eq!(
+            d.run(Duration::ZERO, tokio::time::sleep(Duration::from_secs(1)))
+                .await,
+            None
+        );
+        assert!(t.elapsed() < Duration::from_millis(300));
+    }
 
     pub(crate) fn settings(read_threads: usize) -> ApiSettings {
         ApiSettings {

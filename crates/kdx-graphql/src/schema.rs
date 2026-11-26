@@ -1,5 +1,6 @@
-//! The `Query` root. Root fields not served yet answer `NOT_SUPPORTED` (Tasks 3–5 fill them
-//! in); `pactQuery` and `gasLimitEstimate` stay `NOT_SUPPORTED` (GQ-3, Q9).
+//! The `Query` root. `pactQuery` and `gasLimitEstimate` run client Pact through the node's
+//! `/local` ([`crate::pact`], B1, owner-approved 2026-11-26); without a node passthrough
+//! configured they answer `NOT_SUPPORTED`.
 
 use async_graphql::{Context, InputObject, Object, Result, SimpleObject};
 
@@ -285,13 +286,20 @@ impl Query {
         .collect())
     }
 
-    /// Not served (Q9): the indexer does not run Pact. No input runs no Pact: an empty list,
-    /// as stock answers (FIX-4 item 4).
-    async fn gas_limit_estimate(&self, input: Vec<String>) -> Result<Vec<GasLimitEstimation>> {
+    /// Node `/local` passthrough ([`crate::pact`]). No input runs no Pact: an empty list, as
+    /// stock answers (FIX-4 item 4).
+    async fn gas_limit_estimate(
+        &self,
+        ctx: &Context<'_>,
+        input: Vec<String>,
+    ) -> Result<Vec<GasLimitEstimation>> {
         if input.is_empty() {
             return Ok(Vec::new());
         }
-        unserved!("Query.gasLimitEstimate")
+        match &crate::gql(ctx).pact {
+            Some(p) => p.gas_limit_estimate(ctx, input).await,
+            None => unserved!("Query.gasLimitEstimate"),
+        }
     }
 
     async fn graph_configuration(&self) -> GraphConfiguration {
@@ -349,9 +357,16 @@ impl Query {
         }))
     }
 
-    /// Not served (Q9): arbitrary Pact code is never run for clients.
-    async fn pact_query(&self, pact_query: Vec<PactQuery>) -> Result<Vec<PactQueryResponse>> {
-        unserved!("Query.pactQuery")
+    /// Node `/local` passthrough ([`crate::pact`]).
+    async fn pact_query(
+        &self,
+        ctx: &Context<'_>,
+        pact_query: Vec<PactQuery>,
+    ) -> Result<Vec<PactQueryResponse>> {
+        match &crate::gql(ctx).pact {
+            Some(p) => p.pact_query(ctx, pact_query).await,
+            None => unserved!("Query.pactQuery"),
+        }
     }
 
     async fn transaction(

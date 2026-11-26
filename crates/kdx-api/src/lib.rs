@@ -19,7 +19,7 @@ pub mod v1txs;
 
 pub use cursor::Cursor;
 pub use dict::ViewDict;
-pub use server::{Api, ApiSettings, ApiState, Binds, TipWatch};
+pub use server::{Api, ApiSettings, ApiState, Binds, RunDeadline, TipWatch};
 pub use store::{PostingQuery, Store, View};
 
 /// Errors a read can answer with. The HTTP layer maps them to status codes.

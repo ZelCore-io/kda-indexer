@@ -1,0 +1,329 @@
+{
+ "_note": "pactQuery answers captured from stock (hack-a-chain indexer-kadena) on 2026-11-26; `node` is the Pact 5 /local body a mock node returns for that item (null: stock never reached a node)",
+ "cases": [
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(+ 1 2)"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":{\"int\":3}},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "0",
+    "code": "(+ 1 2)",
+    "status": "success",
+    "result": "{\"int\":3}",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "1",
+    "code": "(+ 1.5 2.25)"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":3.75},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "1",
+    "code": "(+ 1.5 2.25)",
+    "status": "success",
+    "result": "3.75",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "2",
+    "code": "{\"a\": 1, \"b\": [1.0, \"x\", true, 0.1], \"c\": {\"z\": 2, \"y\": 3}}"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":{\"a\":{\"int\":1},\"b\":[1.0,\"x\",true,0.1],\"c\":{\"z\":{\"int\":2},\"y\":{\"int\":3}}}},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "2",
+    "code": "{\"a\": 1, \"b\": [1.0, \"x\", true, 0.1], \"c\": {\"z\": 2, \"y\": 3}}",
+    "status": "success",
+    "result": "{\"a\":{\"int\":1},\"b\":[1,\"x\",true,0.1],\"c\":{\"z\":{\"int\":2},\"y\":{\"int\":3}}}",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "3",
+    "code": "(* 99999999999999999999 9)"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":{\"int\":\"899999999999999999991\"}},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "3",
+    "code": "(* 99999999999999999999 9)",
+    "status": "success",
+    "result": "{\"int\":\"899999999999999999991\"}",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "4",
+    "code": "(time \"2020-01-01T00:00:00Z\")"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":{\"time\":\"2020-01-01T00:00:00Z\"}},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "4",
+    "code": "(time \"2020-01-01T00:00:00Z\")",
+    "status": "success",
+    "result": "{\"time\":\"2020-01-01T00:00:00Z\"}",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "5",
+    "code": "(read-msg \"k\")",
+    "data": [
+     {
+      "key": "k",
+      "value": "v"
+     },
+     {
+      "key": "n",
+      "value": "12"
+     }
+    ]
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":\"v\"},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "5",
+    "code": "(read-msg \"k\")",
+    "status": "success",
+    "result": "\"v\"",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "6",
+    "code": "(read-msg)",
+    "data": [
+     {
+      "key": "k",
+      "value": "v"
+     }
+    ]
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":{\"k\":\"v\"}},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "6",
+    "code": "(read-msg)",
+    "status": "success",
+    "result": "{\"k\":\"v\"}",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "7",
+    "code": "(+ 1 \"a\")"
+   },
+   "node": "{\"gas\": 2500, \"result\": {\"status\": \"failure\", \"error\": {\"callStack\": [], \"type\": \"EvalError\", \"message\": \"Type error: failed to call native function +, with argument(s) of type(s): integer, string\", \"info\": \"\"}}, \"reqKey\": \"x\"}",
+   "stock": {
+    "chainId": "7",
+    "code": "(+ 1 \"a\")",
+    "status": "error",
+    "result": null,
+    "error": "Type error: failed to call native function +, with argument(s) of type(s): integer, string"
+   }
+  },
+  {
+   "input": {
+    "chainId": "8",
+    "code": "(free.no-such-module.x)"
+   },
+   "node": "{\"gas\": 2500, \"result\": {\"status\": \"failure\", \"error\": {\"callStack\": [], \"type\": \"EvalError\", \"message\": \"Module free.no-such-module has no such member: x\", \"info\": \"\"}}, \"reqKey\": \"x\"}",
+   "stock": {
+    "chainId": "8",
+    "code": "(free.no-such-module.x)",
+    "status": "error",
+    "result": null,
+    "error": "Module free.no-such-module has no such member: x"
+   }
+  },
+  {
+   "input": {
+    "chainId": "9",
+    "code": "(+ 1"
+   },
+   "node": "{\"gas\": 2500, \"result\": {\"status\": \"failure\", \"error\": {\"callStack\": [], \"type\": \"EvalError\", \"message\": \"ParseError: Expected: [')']\", \"info\": \"\"}}, \"reqKey\": \"x\"}",
+   "stock": {
+    "chainId": "9",
+    "code": "(+ 1",
+    "status": "error",
+    "result": null,
+    "error": "ParseError: Expected: [')']"
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(fold (+) 0 (enumerate 0 100000))"
+   },
+   "node": "{\"gas\": 2500, \"result\": {\"status\": \"failure\", \"error\": {\"callStack\": [], \"type\": \"EvalError\", \"message\": \"Gas limit \\\"2500\\\"exceeded: 2501\", \"info\": \"\"}}, \"reqKey\": \"x\"}",
+   "stock": {
+    "chainId": "0",
+    "code": "(fold (+) 0 (enumerate 0 100000))",
+    "status": "error",
+    "result": null,
+    "error": "Gas limit \"2500\"exceeded: 2501"
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(coin.get-balance \"k:0000000000000000000000000000000000000000000000000000000000000000\")"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":2245.8633723},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "0",
+    "code": "(coin.get-balance \"k:0000000000000000000000000000000000000000000000000000000000000000\")",
+    "status": "success",
+    "result": "2245.8633723",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(coin.details \"coinbase\")"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":{\"guard\":{\"pred\":\"keys-all\",\"keys\":[\"cbb4749ba18e7aa0ebc3d057f048474f9f80fb6144dd9a5a7e6747d8522bf934\"]},\"balance\":0.001,\"account\":\"coinbase\"}},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "0",
+    "code": "(coin.details \"coinbase\")",
+    "status": "success",
+    "result": "{\"guard\":{\"pred\":\"keys-all\",\"keys\":[\"cbb4749ba18e7aa0ebc3d057f048474f9f80fb6144dd9a5a7e6747d8522bf934\"]},\"balance\":0.001,\"account\":\"coinbase\"}",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "20",
+    "code": "(+ 1 2)"
+   },
+   "node": null,
+   "stock": {
+    "chainId": "20",
+    "code": "(+ 1 2)",
+    "status": "error",
+    "result": null,
+    "error": "{}"
+   }
+  },
+  {
+   "input": {
+    "chainId": "abc",
+    "code": "(+ 1 2)"
+   },
+   "node": null,
+   "stock": {
+    "chainId": "abc",
+    "code": "(+ 1 2)",
+    "status": "error",
+    "result": null,
+    "error": "{}"
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": ""
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":null},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "0",
+    "code": "",
+    "status": "success",
+    "result": "null",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(enforce false \"boom\")"
+   },
+   "node": "{\"gas\": 2500, \"result\": {\"status\": \"failure\", \"error\": {\"callStack\": [], \"type\": \"EvalError\", \"message\": \"boom\", \"info\": \"\"}}, \"reqKey\": \"x\"}",
+   "stock": {
+    "chainId": "0",
+    "code": "(enforce false \"boom\")",
+    "status": "error",
+    "result": null,
+    "error": "boom"
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(/ 1.0 3.0)"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":{\"decimal\": \"0.333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333\"}},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "0",
+    "code": "(/ 1.0 3.0)",
+    "status": "success",
+    "result": "{\"decimal\":\"0.333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333\"}",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(describe-keyset \"ns-admin\")"
+   },
+   "node": "{\"gas\": 2500, \"result\": {\"status\": \"failure\", \"error\": {\"callStack\": [], \"type\": \"EvalError\", \"message\": \"Cannot find keyset in the database: ns-admin\", \"info\": \"\"}}, \"reqKey\": \"x\"}",
+   "stock": {
+    "chainId": "0",
+    "code": "(describe-keyset \"ns-admin\")",
+    "status": "error",
+    "result": null,
+    "error": "Cannot find keyset in the database: ns-admin"
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "1.0"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":1.0},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "0",
+    "code": "1.0",
+    "status": "success",
+    "result": "1",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(chain-data)"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":{\"gas-price\":1.0e-8,\"gas-limit\":{\"int\":2500},\"sender\":\"\",\"prev-block-hash\":\"ifVxd6jQ8IhUtjaZ8P1MSPBXvRiF1AywV0doi2T11SE\",\"chain-id\":\"0\",\"block-height\":{\"int\":7438528},\"block-time\":{\"timep\":\"2026-11-26T13:25:40.662447Z\"}}},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "0",
+    "code": "(chain-data)",
+    "status": "success",
+    "result": "{\"gas-price\":1e-8,\"gas-limit\":{\"int\":2500},\"sender\":\"\",\"prev-block-hash\":\"ifVxd6jQ8IhUtjaZ8P1MSPBXvRiF1AywV0doi2T11SE\",\"chain-id\":\"0\",\"block-height\":{\"int\":7438528},\"block-time\":{\"timep\":\"2026-11-26T13:25:40.662447Z\"}}",
+    "error": null
+   }
+  },
+  {
+   "input": {
+    "chainId": "0",
+    "code": "(tx-hash)"
+   },
+   "node": "{\"gas\":1,\"result\":{\"status\":\"success\",\"data\":\"EGkltE3xp0TduMSbL2IIwLCkWMJ43spVaE1LX1tT0dU\"},\"reqKey\":\"x\",\"logs\":null,\"metaData\":null,\"continuation\":null,\"txId\":null}",
+   "stock": {
+    "chainId": "0",
+    "code": "(tx-hash)",
+    "status": "success",
+    "result": "\"EGkltE3xp0TduMSbL2IIwLCkWMJ43spVaE1LX1tT0dU\"",
+    "error": null
+   }
+  }
+ ]
+}

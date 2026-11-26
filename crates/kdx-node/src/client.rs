@@ -701,6 +701,41 @@ impl NodeClient {
         .await
     }
 
+    /// `POST /chain/{c}/pact/api/v1/local?preflight=…&signatureVerification=…` with `body`
+    /// sent as is, once (no retry), with `timeout` for this request. Answers the status and
+    /// the body for any HTTP status, the body capped at the client's `max_body_bytes`
+    /// ([`NodeError::TooLarge`] past it). The URL is the client's fixed base, network and a
+    /// chain number: no caller text reaches it. GraphQL's `pactQuery` / `gasLimitEstimate`
+    /// passthrough (B1).
+    pub async fn local_raw(
+        &self,
+        chain: u8,
+        body: Vec<u8>,
+        preflight: bool,
+        signature_verification: bool,
+        timeout: Duration,
+    ) -> Result<(u16, Bytes)> {
+        let mut url = self.chain_url(chain, "pact/api/v1/local")?;
+        url.query_pairs_mut()
+            .append_pair("preflight", if preflight { "true" } else { "false" })
+            .append_pair(
+                "signatureVerification",
+                if signature_verification {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+        let body = Bytes::from(body);
+        self.send_tries("local_passthrough", 1, |h| {
+            h.post(url.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone())
+                .timeout(timeout)
+        })
+        .await
+    }
+
     /// `GET /header/updates` (SSE). Yields the JSON payload of each `BlockHeader` event and
     /// ends when the connection drops; the caller reconnects.
     pub async fn header_updates(
@@ -1010,5 +1045,51 @@ mod tests {
             .unwrap();
         assert_eq!(v, json!({"a": 1}));
         assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    /// B1: `local_raw` posts to the fixed chain URL with both flags in the query, once (a
+    /// timeout costs one request, never three), and refuses a body past `max_body_bytes`.
+    #[tokio::test]
+    async fn local_raw_flags_single_try_and_body_cap() {
+        let (base, n) = mock(|t, _| {
+            if t.contains("/chain/3/") {
+                Reply::Hang
+            } else if t.contains("/chain/4/") {
+                Reply::Json(format!("\"{}\"", "x".repeat(4096)))
+            } else {
+                Reply::Json(format!("{{\"target\":{t:?}}}"))
+            }
+        });
+        let c = NodeClient::new(&NodeClientConfig {
+            base,
+            network: "mainnet01".into(),
+            timeout: Duration::from_millis(300),
+            max_rps: 0,
+            concurrency: 4,
+            p2p_url: None,
+            p2p_cert_sha256: None,
+            max_body_bytes: 1024,
+            max_sse_event_bytes: 1 << 16,
+        })
+        .unwrap();
+        let (st, b) = within(c.local_raw(2, b"{}".to_vec(), true, false, Duration::from_secs(2)))
+            .await
+            .unwrap();
+        assert_eq!(st, 200);
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(
+            v["target"],
+            "/chainweb/0.0/mainnet01/chain/2/pact/api/v1/local?preflight=true&signatureVerification=false"
+        );
+        let before = n.load(Ordering::SeqCst);
+        let e = within(c.local_raw(3, b"{}".to_vec(), false, false, Duration::from_millis(200)))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, NodeError::Timeout), "{e}");
+        assert_eq!(n.load(Ordering::SeqCst) - before, 1, "no retry");
+        let e = within(c.local_raw(4, b"{}".to_vec(), false, false, Duration::from_secs(2)))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, NodeError::TooLarge { limit: 1024 }), "{e}");
     }
 }

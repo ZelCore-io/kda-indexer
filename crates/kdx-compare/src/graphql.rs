@@ -27,8 +27,20 @@ use crate::report::{iso_secs, now_secs, sh_quote, trim_body, DiffEntry, DiffKind
 use crate::run::{Ctx, Outcome};
 use crate::target::Target;
 
-/// Root fields the adapter answers with `NOT_SUPPORTED` (spec section 5.3; plan Q9).
-pub const NOT_SUPPORTED_ROOTS: &[&str] = &["pactQuery", "gasLimitEstimate"];
+/// Root fields the adapter answers with `NOT_SUPPORTED` (spec section 5.3; plan Q9). None
+/// since B1: `pactQuery` and `gasLimitEstimate` are served and compared ([`PACT_ROOTS`]).
+pub const NOT_SUPPORTED_ROOTS: &[&str] = &[];
+/// Root fields run through the node's `/local` (B1): compared with stock on state-stable
+/// input only ([`vars_for`]), after [`normalize_pact`].
+pub const PACT_ROOTS: &[&str] = &["pactQuery", "gasLimitEstimate"];
+/// `pactQuery` code whose answer does not depend on chain state (B1 fix round 1, I4):
+/// arithmetic, a string builtin, a Pact error, and a constant of the coin contract.
+pub const PACT_STABLE_CODE: &[&str] = &[
+    "(+ 1 2)",
+    "(format \"{}-{}\" [1 \"a\"])",
+    "(enforce false \"kdx-compare\")",
+    "(coin.precision)",
+];
 /// Root fields whose answer depends on the current tip: never sent to the oracle (GQ-16).
 const TIP_ROOTS: &[&str] = &[
     "lastBlockHeight",
@@ -84,6 +96,8 @@ pub enum OpKind {
     NodeBalance,
     /// Expected to answer `NOT_SUPPORTED` (checked on A alone).
     NotSupported,
+    /// `pactQuery` / `gasLimitEstimate` (B1): A and the oracle on the same stable input.
+    Pact,
     /// Subscription document (only `ws-soak` uses subscriptions).
     Subscription,
 }
@@ -175,6 +189,7 @@ pub fn parse_op(stem: &str, text: &str, captured: bool) -> anyhow::Result<GqlOp>
         Some("node-tx") => OpKind::NodeTx,
         Some("node-block") => OpKind::NodeBlock,
         Some("node-balance") => OpKind::NodeBalance,
+        Some("pact") => OpKind::Pact,
         Some(other) => anyhow::bail!("{stem}: unknown directive {other:?}"),
         None if is_sub => OpKind::Subscription,
         None if roots
@@ -183,6 +198,7 @@ pub fn parse_op(stem: &str, text: &str, captured: bool) -> anyhow::Result<GqlOp>
         {
             OpKind::NotSupported
         }
+        None if roots.iter().any(|r| PACT_ROOTS.contains(&r.as_str())) => OpKind::Pact,
         None => {
             let bounded = vars.iter().any(|v| {
                 let n = v.name.to_ascii_lowercase();
@@ -377,8 +393,84 @@ impl Sample {
     }
 }
 
+/// `gasLimitEstimate` inputs for chain `chain` whose answers do not depend on chain state
+/// (B1 fix round 1, I4): a `code` input (we and stock build the command, so its time, nonce
+/// and hash differ: [`normalize_pact`]) and a `stringified-command` (the same text on both
+/// sides, so the whole answer must match).
+pub fn pact_gas_inputs(chain: u8) -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let cmd = json!({
+        "networkId": "mainnet01",
+        "payload": {"exec": {"code": "(+ 1 2)", "data": {}}},
+        "signers": [],
+        "meta": {"chainId": chain.to_string(), "sender": "", "gasLimit": 2500,
+                 "gasPrice": 1e-8, "ttl": 600, "creationTime": now.saturating_sub(60)},
+        "nonce": "kdx-compare",
+    })
+    .to_string();
+    json!([
+        json!({"code": "(+ 1 2)", "chainId": chain.to_string()}).to_string(),
+        json!({"cmd": cmd}).to_string(),
+    ])
+}
+
+/// The parts of a Pact answer that differ per call (B1 fix round 1, I4): for a
+/// `gasLimitEstimate` item whose command the server built (any `inputType` but the client's
+/// own `stringified-command` / `full-transaction`), the `transaction` keeps its structure
+/// with `hash`, `meta.creationTime` and `nonce` blanked. Everything else is compared as is.
+pub fn normalize_pact(body: &mut Value) {
+    let Some(items) = body
+        .pointer_mut("/data/gasLimitEstimate")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for it in items {
+        let own = matches!(
+            it.get("inputType").and_then(Value::as_str),
+            Some("stringified-command" | "full-transaction")
+        );
+        if own {
+            continue;
+        }
+        let Some(Value::String(t)) = it.get_mut("transaction") else {
+            continue;
+        };
+        let Ok(mut tx) = serde_json::from_str::<Value>(t) else {
+            continue;
+        };
+        if let Some(h) = tx.get_mut("hash") {
+            *h = json!("~");
+        }
+        let cmd = tx.get("cmd").and_then(Value::as_str).map(str::to_owned);
+        if let Some(Ok(mut c)) = cmd.map(|c| serde_json::from_str::<Value>(&c)) {
+            if let Some(n) = c.get_mut("nonce") {
+                *n = json!("~");
+            }
+            if let Some(ct) = c.pointer_mut("/meta/creationTime") {
+                *ct = json!(0);
+            }
+            tx["cmd"] = c;
+        }
+        *t = tx.to_string();
+    }
+}
+
 /// Builds the variables of `op` for `sample`; `None` when a required one has no value.
 pub fn vars_for(op: &GqlOp, s: &Sample, rng: &mut StdRng) -> Option<Map<String, Value>> {
+    // I4: Pact is compared on the stable input below only; a document with its own code
+    // (inline, or a captured example variable) could read chain state, so it is skipped.
+    if op.kind == OpKind::Pact
+        && (op.vars.is_empty()
+            || op
+                .vars
+                .iter()
+                .any(|v| v.name != "pactQuery" && v.name != "input"))
+    {
+        return None;
+    }
     let mut m = op.example.clone();
     let acct = s
         .accounts
@@ -404,6 +496,13 @@ pub fn vars_for(op: &GqlOp, s: &Sample, rng: &mut StdRng) -> Option<Map<String, 
             "fungibleName" | "moduleName" | "module" => Some(json!("coin")),
             "qualifiedEventName" => Some(json!("coin.TRANSFER")),
             "minimumDepth" => Some(json!(0)),
+            "pactQuery" => Some(Value::Array(
+                PACT_STABLE_CODE
+                    .iter()
+                    .map(|c| json!({"chainId": s.chain.to_string(), "code": c}))
+                    .collect(),
+            )),
+            "input" => Some(pact_gas_inputs(s.chain)),
             "blockId" => Some(json!(base64_std(
                 format!("Block:{}", s.block_hash).as_bytes()
             ))),
@@ -1424,7 +1523,7 @@ impl Ctx {
                     (
                         _,
                         Some(TargetKind::GraphqlOracle),
-                        OpKind::Oracle | OpKind::NotSupported
+                        OpKind::Oracle | OpKind::NotSupported | OpKind::Pact
                     ) | (
                         "node",
                         _,
@@ -1514,6 +1613,7 @@ impl Ctx {
         };
         let o = match (op.kind, tb) {
             (OpKind::NotSupported, _) => self.gql_not_supported(ta, op, &vars).await,
+            (OpKind::Pact, Some(tb)) => self.gql_pact(ta, tb, op, &vars).await,
             (OpKind::Oracle, Some(tb)) => self.gql_vs_oracle(ta, tb, op, &vars, max).await,
             (OpKind::NodeTx, None) => self.gql_node_tx(ta, op, &vars, &sample).await,
             (OpKind::NodeBlock, None) => self.gql_node_block(ta, op, &vars, &sample).await,
@@ -2752,6 +2852,46 @@ impl Ctx {
     }
 
     /// `pactQuery` and friends answer `NOT_SUPPORTED` (checked on A alone).
+    /// B1 (fix round 1, I4): a `pactQuery` / `gasLimitEstimate` document on A and on the
+    /// oracle with the same variables, both answers through [`normalize_pact`].
+    pub(crate) async fn gql_pact(
+        &self,
+        ta: &Target,
+        tb: &Target,
+        op: &GqlOp,
+        vars: &Map<String, Value>,
+    ) -> Outcome {
+        let mut a = match self.gql_fetch(ta, op, vars, 0, true).await {
+            Ok(a) => a,
+            Err(e) => return self.gql_a_error(op, vars, ta, &tb.name, &format!("{e:#}")),
+        };
+        if a.status >= 500 {
+            return self.gql_a_error(op, vars, ta, &tb.name, &format!("HTTP {}", a.status));
+        }
+        let mut b = match self.gql_fetch(tb, op, vars, 0, false).await {
+            Ok(b) => b,
+            Err(e) => {
+                return self.gql_record(
+                    op,
+                    vars,
+                    ta,
+                    &tb.name,
+                    Some(&a),
+                    None,
+                    "",
+                    Vec::new(),
+                    "b-error",
+                    &[],
+                    Some(format!("{e:#}")),
+                )
+            }
+        };
+        normalize_pact(&mut a.body);
+        normalize_pact(&mut b.body);
+        let d = diff(&a.body, &b.body);
+        self.gql_classify(op, vars, ta, &tb.name, &a, b.status, &b.raw, d, None)
+    }
+
     pub(crate) async fn gql_not_supported(
         &self,
         ta: &Target,
@@ -3480,6 +3620,7 @@ pub async fn once(cfg: CompareConfig, stem: &str) -> anyhow::Result<Vec<Outcome>
             .context("variables unavailable")?;
         let o = match (op.kind, tb) {
             (OpKind::NotSupported, _) => ctx.gql_not_supported(ta, &op, &vars).await,
+            (OpKind::Pact, Some(tb)) => ctx.gql_pact(ta, tb, &op, &vars).await,
             (OpKind::Oracle, Some(tb)) => {
                 let max = ctx.cfg.targets[&tb.name].max_height.unwrap_or(u64::MAX);
                 ctx.gql_vs_oracle(ta, tb, &op, &vars, max).await
@@ -3742,7 +3883,14 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(ns.kind, OpKind::NotSupported);
+        assert_eq!(ns.kind, OpKind::Pact, "served since B1");
+        let gas = parse_op(
+            "g",
+            "query($input: [String!]!) { gasLimitEstimate(input: $input) { amount } }",
+            true,
+        )
+        .unwrap();
+        assert_eq!(gas.kind, OpKind::Pact);
         let sub = parse_op("s", "subscription { newBlocks { hash } }", true).unwrap();
         assert_eq!(sub.kind, OpKind::Subscription);
     }
@@ -4021,18 +4169,14 @@ mod tests {
             u.iter()
                 .map(|(s, k)| format!("{s}={k}"))
                 .collect::<Vec<_>>(),
-            [
-                "PactDoc=unsupported",
-                "PriceDoc=tip",
-                "SubDoc=subscription",
-                "TipDoc=tip"
-            ]
+            // PactDoc is compared since B1 (OpKind::Pact), so it is paired.
+            ["PriceDoc=tip", "SubDoc=subscription", "TipDoc=tip"]
         );
         let text = crate::summary::render_unpaired(&u);
-        assert!(text.contains("never paired: 4"), "{text}");
+        assert!(text.contains("never paired: 3"), "{text}");
         assert!(text.contains("  tip (2): PriceDoc TipDoc\n"), "{text}");
         assert!(text.contains("  subscription (1): SubDoc\n"), "{text}");
-        assert!(text.contains("  unsupported (1): PactDoc\n"), "{text}");
+        assert!(!text.contains("PactDoc"), "{text}");
     }
 
     #[test]
@@ -4210,6 +4354,8 @@ mod tests {
         assert_eq!(kind("NodeBlock"), Some(OpKind::NodeBlock));
         assert_eq!(kind("NodeBalance"), Some(OpKind::NodeBalance));
         assert_eq!(kind("QLastBlockHeight"), Some(OpKind::Tip));
+        assert_eq!(kind("QPactQuery"), Some(OpKind::Pact));
+        assert_eq!(kind("QGasLimitEstimate"), Some(OpKind::Pact));
         // One per v1 root field with inputs: all of them are height-bounded oracle documents.
         let roots: std::collections::BTreeSet<_> = ops
             .iter()
@@ -4576,5 +4722,71 @@ mod tests {
     #[test]
     fn base64_matches_the_relay_id_form() {
         assert_eq!(base64_std(b"Block:S6LBhIyO"), "QmxvY2s6UzZMQmhJeU8=");
+    }
+}
+
+#[cfg(test)]
+mod pact_tests {
+    use super::*;
+
+    fn gas_item(input_type: &str, hash: &str, nonce: &str, time: u64) -> Value {
+        let cmd = json!({"meta": {"chainId": "0", "creationTime": time}, "nonce": nonce,
+                         "payload": {"exec": {"code": "(+ 1 2)"}}})
+        .to_string();
+        json!({"amount": 7, "inputType": input_type,
+               "transaction": json!({"cmd": cmd, "hash": hash, "sigs": []}).to_string()})
+    }
+
+    /// I4: a server-built command compares by structure (time, nonce, hash blanked); the
+    /// client's own command compares exactly.
+    #[test]
+    fn pact_answers_compare_on_their_stable_parts() {
+        let body = |t: &str, h: &str, n: &str, c: u64| json!({"data": {"gasLimitEstimate": [gas_item(t, h, n, c)]}});
+        let (mut a, mut b) = (body("code", "h1", "n1", 1), body("code", "h2", "n2", 2));
+        normalize_pact(&mut a);
+        normalize_pact(&mut b);
+        assert!(diff(&a, &b).is_empty(), "{a} {b}");
+        let (mut a, mut b) = (body("code", "h1", "n1", 1), body("code", "h1", "n1", 1));
+        b["data"]["gasLimitEstimate"][0]["amount"] = json!(8);
+        normalize_pact(&mut a);
+        normalize_pact(&mut b);
+        assert!(!diff(&a, &b).is_empty(), "amount is compared");
+        let t = "stringified-command";
+        let (mut a, mut b) = (body(t, "h1", "n", 1), body(t, "h2", "n", 1));
+        normalize_pact(&mut a);
+        normalize_pact(&mut b);
+        assert!(
+            !diff(&a, &b).is_empty(),
+            "the client's command is compared exactly"
+        );
+    }
+
+    #[test]
+    fn pact_variables_are_stable_input() {
+        let op = parse_op(
+            "QPactQuery",
+            "query($pactQuery: [PactQuery!]!) { pactQuery(pactQuery: $pactQuery) { status } }",
+            false,
+        )
+        .unwrap();
+        let s = Sample {
+            chain: 3,
+            height: 1,
+            block_hash: "b".into(),
+            request_key: "r".into(),
+            accounts: vec![],
+            header: json!({}),
+            meta: json!({}),
+            signers: json!([]),
+        };
+        let mut rng = <StdRng as rand::SeedableRng>::seed_from_u64(1);
+        let v = vars_for(&op, &s, &mut rng).unwrap();
+        let items = v["pactQuery"].as_array().unwrap();
+        assert_eq!(items.len(), PACT_STABLE_CODE.len());
+        assert!(items.iter().all(|i| i["chainId"] == "3"));
+        let inputs = pact_gas_inputs(3);
+        let cmd: Value = serde_json::from_str(inputs[1].as_str().unwrap()).unwrap();
+        let cmd: Value = serde_json::from_str(cmd["cmd"].as_str().unwrap()).unwrap();
+        assert_eq!(cmd["meta"]["chainId"], "3");
     }
 }

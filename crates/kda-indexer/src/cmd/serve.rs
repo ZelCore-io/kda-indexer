@@ -132,8 +132,47 @@ pub fn api(
     // (GQ-6), which polls the store, so `serve` and replicas have them as `run` does.
     let gs = cfg.graphql.settings(&cfg.network);
     let feed = kdx_graphql::BlockFeed::spawn(api.state(), gs.feed_poll, gs.feed_ring_bytes);
-    let schema = kdx_graphql::build_schema_with_search(api.state(), gs, Some(feed), search);
+    let pact = pact_pass(cfg, &gs, &api.state())?;
+    if let Some(p) = &pact {
+        // B1: a request naming the passthrough's fields may run its timeout past `deadline`.
+        api.state()
+            .set_graphql_extra_deadline(p.settings().timeout + Duration::from_secs(1));
+    }
+    let schema =
+        kdx_graphql::build_schema_full(Some(api.state()), gs, Some(feed), Some(search), pact);
     Ok(api.graphql_routes(kdx_graphql::router(schema)))
+}
+
+/// The `pactQuery` / `gasLimitEstimate` passthrough (B1): its own node client on `node.url`
+/// and `network` (never a client-given URL), with the passthrough's concurrency, rate and
+/// body cap, so it neither shares nor drains ingest's node budget.
+fn pact_pass(
+    cfg: &Config,
+    gs: &kdx_graphql::GraphqlSettings,
+    st: &kdx_api::ApiState,
+) -> anyhow::Result<Option<Arc<kdx_graphql::pact::PactPass>>> {
+    let p = &cfg.graphql.pact;
+    if !p.enabled {
+        return Ok(None);
+    }
+    // M4: the network's chains from the store's chain graph when it has one (the node's own
+    // graph), else the configured network's count.
+    let mut settings = gs.pact.clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    if let Ok(view) = st.store.view(deadline) {
+        if let Some(n) = view.genesis.chains().map(|(c, _)| c).max() {
+            settings.chains = n.saturating_add(1);
+        }
+    }
+    let mut c = cfg.clone();
+    c.ingest.max_rps = p.node_rps;
+    c.ingest.node_concurrency = p.max_in_flight.max(1) as usize;
+    c.node.max_body_bytes = p.max_response_bytes as usize;
+    c.node.timeout_ms = p.timeout_ms;
+    let node = super::node_client(&c).context("graphql.pact node client")?;
+    Ok(Some(Arc::new(kdx_graphql::pact::PactPass::new(
+        node, settings,
+    ))))
 }
 
 pub async fn run(cfg: &Config, data_dir: &Path) -> anyhow::Result<()> {

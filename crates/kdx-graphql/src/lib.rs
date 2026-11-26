@@ -23,6 +23,7 @@ pub mod http;
 pub mod ids;
 pub mod limits;
 pub mod loaders;
+pub mod pact;
 pub mod scalars;
 pub mod schema;
 pub mod stock_limits;
@@ -98,6 +99,8 @@ pub struct GraphqlSettings {
     /// Transfer keys `balance(...)` reads per (account, module) to decide which zero rows a
     /// TRANSFER touched ([`types::account::BALANCE_TOUCH_KEYS`]; tests lower it).
     pub balance_touch_keys: usize,
+    /// `pactQuery` / `gasLimitEstimate` limits (B1).
+    pub pact: pact::PactSettings,
 }
 
 /// Hard safety cap of the rows of one list page (`first`/`last`), of a subscription's
@@ -146,6 +149,7 @@ impl Default for GraphqlSettings {
             apq: false,
             back_keys: txlist::BACK_KEYS,
             balance_touch_keys: types::account::BALANCE_TOUCH_KEYS,
+            pact: pact::PactSettings::default(),
         }
     }
 }
@@ -159,6 +163,9 @@ pub struct Gql {
     /// The P6 search context (code index and gate) `transactionsByPactCode` runs on; `None`
     /// answers that field `NOT_SUPPORTED`.
     pub search: Option<Arc<kdx_api::search::SearchCtx>>,
+    /// The node `/local` passthrough; `None` answers `pactQuery` / `gasLimitEstimate`
+    /// `NOT_SUPPORTED`.
+    pub pact: Option<Arc<pact::PactPass>>,
 }
 
 impl Gql {
@@ -181,6 +188,11 @@ pub fn gql<'a>(ctx: &Context<'a>) -> &'a Gql {
 pub struct ReqCtx {
     pub deadline: Instant,
 }
+
+/// An HTTP request's shared deadline (B1 fix round 1, I1): the outer timers of the guard
+/// and the handler follow it; a Pact field that runs extends it ([`crate::pact`]).
+#[derive(Debug, Clone)]
+pub struct RequestRun(pub kdx_api::RunDeadline);
 
 /// The client address of an HTTP request or a websocket connection (`trusted_proxies`
 /// applied). Per-client gates (the search gate, S-5) refuse an operation without one.
@@ -206,7 +218,7 @@ pub fn build_schema(
     settings: GraphqlSettings,
     feed: Option<BlockFeed>,
 ) -> KdxSchema {
-    build(Some(state), settings, feed, None, false)
+    build(Some(state), settings, feed, None, None, false)
 }
 
 /// The schema over a store, with the P6 search context for `transactionsByPactCode`.
@@ -216,17 +228,29 @@ pub fn build_schema_with_search(
     feed: Option<BlockFeed>,
     search: Arc<kdx_api::search::SearchCtx>,
 ) -> KdxSchema {
-    build(Some(state), settings, feed, Some(search), false)
+    build(Some(state), settings, feed, Some(search), None, false)
 }
 
 /// The schema with no store (`graphql print-schema`).
+/// [`build_schema_with_search`] plus the node `/local` passthrough (B1); `store` may be
+/// `None` (tests).
+pub fn build_schema_full(
+    state: Option<Arc<ApiState>>,
+    settings: GraphqlSettings,
+    feed: Option<BlockFeed>,
+    search: Option<Arc<kdx_api::search::SearchCtx>>,
+    pact: Option<Arc<pact::PactPass>>,
+) -> KdxSchema {
+    build(state, settings, feed, search, pact, false)
+}
+
 pub fn build_schema_detached(settings: GraphqlSettings) -> KdxSchema {
-    build(None, settings, None, None, false)
+    build(None, settings, None, None, None, false)
 }
 
 /// The schema of `graphql check-ops`: validation and limits run, execution never does.
 pub fn build_schema_check(settings: GraphqlSettings) -> KdxSchema {
-    build(None, settings, None, None, true)
+    build(None, settings, None, None, None, true)
 }
 
 fn build(
@@ -234,6 +258,7 @@ fn build(
     settings: GraphqlSettings,
     feed: Option<BlockFeed>,
     search: Option<Arc<kdx_api::search::SearchCtx>>,
+    pact: Option<Arc<pact::PactPass>>,
     check_only: bool,
 ) -> KdxSchema {
     let introspection = settings.introspection;
@@ -248,6 +273,7 @@ fn build(
         settings,
         feed,
         search,
+        pact,
     })
     .extension(limits::Limits)
     .extension(flags::Flags)

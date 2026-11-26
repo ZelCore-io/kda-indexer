@@ -1,0 +1,2 @@
+# kdx: pact
+query QPactQuery($pactQuery: [PactQuery!]!) { pactQuery(pactQuery: $pactQuery) { chainId code status result error } }

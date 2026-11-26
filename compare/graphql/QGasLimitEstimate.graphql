@@ -1,0 +1,2 @@
+# kdx: pact
+query QGasLimitEstimate($input: [String!]!) { gasLimitEstimate(input: $input) { amount inputType transaction usedPreflight usedSignatureVerification } }

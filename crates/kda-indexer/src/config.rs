@@ -414,6 +414,100 @@ pub struct GraphqlConfig {
     pub network_host: String,
     /// Automatic persisted queries. Not built: `true` is refused.
     pub apq: bool,
+    /// `[graphql.pact]`: the `pactQuery` / `gasLimitEstimate` node passthrough (B1).
+    pub pact: PactConfig,
+}
+
+/// `[graphql.pact]`: client Pact run through the node's `/local` (`node.url`, `network`),
+/// as stock does (B1, owner-approved 2026-11-26). Never `/send`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PactConfig {
+    /// Off (the default): both fields answer `NOT_SUPPORTED`. An operator turns it on to
+    /// let clients run read-only Pact on the configured node.
+    pub enabled: bool,
+    /// Items (`pactQuery` entries plus `gasLimitEstimate` inputs) per request, all aliases
+    /// and batch operations together.
+    pub max_items: u32,
+    /// `/local` calls in flight across the process (2x that many requests may wait).
+    pub max_in_flight: u32,
+    /// Per client (IPv4 address, IPv6 /64, with a /24 or /48 overflow tier): calls per
+    /// second (0 = no per-IP limit) and burst (at least `max_items`).
+    pub per_ip_rps: u32,
+    pub per_ip_burst: u32,
+    /// Per item, slot wait included (stock: 10 s).
+    pub timeout_ms: u64,
+    /// Largest `code` + `data` of one item, or one gas input.
+    pub max_input_bytes: u32,
+    /// Largest `meta.gasLimit` a client command may ask for.
+    pub max_gas_limit: u64,
+    /// Largest node answer read.
+    pub max_response_bytes: u32,
+    /// Node calls per second across the process (0 = no limit beyond `max_in_flight`;
+    /// default twice the default `max_in_flight`).
+    pub node_rps: u32,
+}
+
+/// Chains of a Chainweb network (M4): 20 on every network chainweb runs today. The store's
+/// chain graph, when it has one, overrides this at `serve` (`cmd::serve::pact_pass`).
+pub fn network_chains(network: &str) -> u8 {
+    match network {
+        "mainnet01" | "testnet04" | "testnet05" | "development" => 20,
+        _ => 20,
+    }
+}
+
+impl Default for PactConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_items: 20,
+            max_in_flight: 8,
+            per_ip_rps: 5,
+            per_ip_burst: 20,
+            timeout_ms: 10_000,
+            max_input_bytes: 65_536,
+            max_gas_limit: 150_000,
+            max_response_bytes: 1 << 20,
+            node_rps: 16,
+        }
+    }
+}
+
+impl PactConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=100).contains(&self.max_items)
+                && (1..=256).contains(&self.max_in_flight)
+                && (1_000..=60_000).contains(&self.timeout_ms)
+                && (1..=kdx_graphql::MAX_BODY_BYTES as u32).contains(&self.max_input_bytes)
+                && (1..=10_000_000).contains(&self.max_gas_limit)
+                && (1024..=(64 << 20)).contains(&self.max_response_bytes),
+            "graphql.pact: max_items 1..=100, max_in_flight 1..=256, timeout_ms 1000..=60000, \
+             max_input_bytes 1..={}, max_gas_limit 1..=10000000, max_response_bytes 1024..=64 MiB",
+            kdx_graphql::MAX_BODY_BYTES
+        );
+        anyhow::ensure!(
+            self.per_ip_rps == 0 || self.per_ip_burst >= self.max_items,
+            "graphql.pact.per_ip_burst must be at least max_items (or per_ip_rps 0)"
+        );
+        Ok(())
+    }
+
+    /// The passthrough's limits on a network of `chains` chains.
+    pub fn settings(&self, chains: u8) -> kdx_graphql::pact::PactSettings {
+        kdx_graphql::pact::PactSettings {
+            max_items: self.max_items as usize,
+            max_in_flight: self.max_in_flight as usize,
+            per_ip_rps: self.per_ip_rps,
+            per_ip_burst: self.per_ip_burst,
+            timeout: std::time::Duration::from_millis(self.timeout_ms),
+            max_input_bytes: self.max_input_bytes as usize,
+            max_gas_limit: self.max_gas_limit,
+            max_response_bytes: self.max_response_bytes as usize,
+            chains,
+        }
+    }
 }
 
 impl Default for GraphqlConfig {
@@ -444,6 +538,7 @@ impl Default for GraphqlConfig {
             sender_index: true,
             network_host: String::new(),
             apq: false,
+            pact: PactConfig::default(),
         }
     }
 }
@@ -493,6 +588,7 @@ impl GraphqlConfig {
             !self.network_host.contains('<') && !self.network_host.contains('>'),
             "graphql.network_host still holds a placeholder"
         );
+        self.pact.validate()?;
         Ok(())
     }
 
@@ -528,6 +624,7 @@ impl GraphqlConfig {
             apq: self.apq,
             back_keys: kdx_graphql::txlist::BACK_KEYS,
             balance_touch_keys: kdx_graphql::types::account::BALANCE_TOUCH_KEYS,
+            pact: self.pact.settings(network_chains(network)),
         }
     }
 }
@@ -859,6 +956,17 @@ pub const MAX_BATCH_SIZE: u32 = 1000;
 #[cfg(test)]
 mod balances_tests {
     use super::*;
+
+    /// B1 fix round 1 (M2, I3, M4): the passthrough is off unless an operator turns it on,
+    /// has a global node rate by default, and takes its chains from the network.
+    #[test]
+    fn pact_defaults_off_with_a_node_rate() {
+        let p = PactConfig::default();
+        assert!(!p.enabled);
+        assert!(p.node_rps > 0);
+        assert_eq!(p.settings(network_chains("mainnet01")).chains, 20);
+        assert_eq!(p.settings(7).chains, 7);
+    }
 
     /// `[graphql]` defaults are the plan's GQ-9 values; bad values are refused.
     #[test]
