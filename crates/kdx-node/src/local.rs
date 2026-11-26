@@ -99,8 +99,14 @@ pub enum LocalError {
 
 pub type LocalResult<T> = std::result::Result<Local<T>, LocalError>;
 
-/// The B-1 module name check: `name` or `namespace.name`, identifier characters only.
+/// The B-1 module name check: `name` or `namespace.name`, identifier characters only, at
+/// most [`MAX_NAME_LEN`] bytes, the cap of every other name sent (PR #49 m-4: with the table
+/// name's cap, a no-table message always fits `MAX_NO_TABLE_MESSAGE`; real module names are
+/// far shorter).
 pub fn valid_module(m: &str) -> bool {
+    if m.len() > MAX_NAME_LEN {
+        return false;
+    }
     let mut parts = m.splitn(2, '.');
     let first = parts.next().unwrap_or("");
     valid_ident(first) && parts.next().is_none_or(valid_ident)
@@ -133,6 +139,10 @@ pub fn is_no_table_message(msg: &str) -> bool {
     msg.starts_with("Error during database operation: Table access failed because table ")
         && msg.ends_with(" was not found.")
 }
+
+/// Longest no-table message kept whole: its fixed text plus a module and a table name of
+/// [`MAX_NAME_LEN`] bytes each.
+const MAX_NO_TABLE_MESSAGE: usize = 128 + 2 * MAX_NAME_LEN;
 
 /// The failure message means "no such row" (Pact 5 `No value found in table …`, Pact 4
 /// `with-read: row not found …`) or "no such keyset".
@@ -374,6 +384,10 @@ fn classify(r: &Value) -> LocalResult<Value> {
                 .unwrap_or("");
             if is_absent_message(msg) {
                 Ok(Local::Absent)
+            } else if is_no_table_message(msg) && msg.len() <= MAX_NO_TABLE_MESSAGE {
+                // N-09: kept whole, so `table_keys` still sees the end of a message whose
+                // table name is longer than the 200 characters any other failure keeps.
+                Err(LocalError::Failure(msg.to_owned()))
             } else {
                 let cut: String = msg.chars().take(200).collect();
                 Err(LocalError::Failure(cut))
@@ -500,7 +514,7 @@ impl LocalClient {
         timeout: Duration,
     ) -> LocalResult<Vec<String>> {
         check_module(module)?;
-        if !valid_ident(table) {
+        if table.len() > MAX_NAME_LEN || !valid_ident(table) {
             return Err(LocalError::Skipped("table name fails the B-1 check".into()));
         }
         match self
@@ -862,6 +876,30 @@ mod tests {
         }
     }
 
+    /// PR #49 m-4: a module name is at most [`MAX_NAME_LEN`] bytes, so a no-table message
+    /// (`{module}_{table}`, both capped) always fits [`MAX_NO_TABLE_MESSAGE`] and is never
+    /// cut before the table check reads its end.
+    #[test]
+    fn module_names_are_capped() {
+        let at = format!("n_x.{}", "m".repeat(MAX_NAME_LEN - 4));
+        assert_eq!(at.len(), MAX_NAME_LEN);
+        assert!(valid_module(&at));
+        assert!(!valid_module(&format!("{at}m")));
+        assert!(!valid_module(&"m".repeat(MAX_NAME_LEN + 1)));
+        assert!(matches!(
+            check_module(&format!("{at}m")),
+            Err(LocalError::Skipped(_))
+        ));
+        // The longest message both caps allow is kept whole.
+        let msg = format!(
+            "Error during database operation: Table access failed because table \
+             {at}_{} was not found.",
+            "t".repeat(MAX_NAME_LEN)
+        );
+        assert!(msg.len() <= MAX_NO_TABLE_MESSAGE);
+        assert!(is_no_table_message(&msg));
+    }
+
     /// B-1: a hostile account is data; the code is the fixed form.
     #[test]
     fn hostile_account_stays_in_data() {
@@ -1093,6 +1131,31 @@ mod tests {
             "Error during database operation: Table access failed because table x was locked"
         ));
         assert!(!is_no_table_message("Module admin necessary for operation"));
+    }
+
+    /// N-09: a long `{module}_{table}` (a principal namespace is 42 bytes) pushes the message
+    /// past the 200 characters a failure keeps; the no-table check must still see its end.
+    #[test]
+    fn a_long_missing_table_name_still_reads_as_no_table() {
+        let module = format!("n_{}.{}", "ab".repeat(20), "m".repeat(60));
+        let msg = format!(
+            "Error during database operation: Table access failed because table \
+             {module}_{} was not found.",
+            "t".repeat(60)
+        );
+        assert!(msg.chars().count() > 200);
+        let r = json!({"result": {"status": "failure", "error": {"message": msg}}});
+        match classify(&r) {
+            Err(LocalError::Failure(m)) => assert!(is_no_table_message(&m), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // Any other failure is still cut to 200 characters.
+        let long = json!({"result": {"status": "failure",
+            "error": {"message": "x".repeat(5000)}}});
+        match classify(&long) {
+            Err(LocalError::Failure(m)) => assert_eq!(m.chars().count(), 200),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The table name goes into the code as text: identifier characters only.

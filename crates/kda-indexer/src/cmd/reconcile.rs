@@ -134,6 +134,9 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
 /// written. `coin` queues only its history walk from the events fork (rule 2c: accounts
 /// `coin.create-account` made, never funded, that no event names; zero rows gap Q); its
 /// posting holders are not marked (N-6: millions; the tail and `--seed`/`--all` keep them).
+/// The walk reads only tracked tokens not marked not fungible (N-11): a module with no
+/// `Tokens` row is refused before anything is written, and one marked not fungible is made
+/// active again (listed as `reactivated`; failing answers mark it again).
 /// Returns the JSON report the command prints.
 pub fn rewalk(cfg: &Config, data_dir: &Path, names: &[String]) -> anyhow::Result<Value> {
     let _lock = super::lock_data_dir(data_dir)?;
@@ -141,14 +144,47 @@ pub fn rewalk(cfg: &Config, data_dir: &Path, names: &[String]) -> anyhow::Result
     let segdir = kdx_ingest::ctx::segments_dir(data_dir);
     let ids = module_ids(&hs, names)?;
     let coin = kdx_hot::balances::coin_module(&hs.ro()?)?;
+    let mut reactivate: Vec<(u32, String)> = Vec::new();
+    {
+        let txn = hs.ro()?;
+        for n in names {
+            let n = n.trim();
+            let id = module_ids(&hs, &[n.to_owned()])?[0];
+            if Some(id) == coin || reactivate.iter().any(|(m, _)| *m == id) {
+                continue;
+            }
+            match kdx_hot::balances::token_row(&txn, id)? {
+                None => anyhow::bail!(
+                    "not a tracked token: {n} (the history walk reads tracked tokens only)"
+                ),
+                Some(t) if t.kind == kdx_hot::balances::KIND_NOT_FUNGIBLE => {
+                    reactivate.push((id, n.to_owned()))
+                }
+                Some(_) => {}
+            }
+        }
+    }
     let set: std::collections::HashSet<u32> =
         ids.iter().copied().filter(|m| Some(*m) != coin).collect();
     let rep = kdx_ingest::seed::mark_modules(&hs, &segdir, &set, &|| false)?;
     let mut txn = hs.rw()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as u32);
+    for (m, _) in &reactivate {
+        // As `recheck_not_fungible` does for an expired verdict.
+        kdx_hot::balances::update_token(&mut txn, *m, |t| {
+            t.kind = kdx_hot::balances::KIND_FUNGIBLE;
+            t.checked_at = now;
+            t.checked_chains = 0;
+        })?;
+    }
     let restarted = kdx_hot::balances::queue_rewalk(&mut txn, &ids)?;
     txn.commit()?;
+    let reactivated: Vec<&str> = reactivate.iter().map(|(_, n)| n.as_str()).collect();
     Ok(json!({
         "modules": names,
+        "reactivated": reactivated,
         "posting_rows_marked": rep.dirty_inserted,
         "rewalk_queued": ids.len(),
         "walk_in_progress_restarted": restarted,

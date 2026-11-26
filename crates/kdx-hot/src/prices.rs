@@ -205,10 +205,10 @@ fn hop_of(params: &Value) -> Option<Hop> {
     let p = params.as_array().filter(|p| p.len() == 6)?;
     Some(Hop {
         amount_in: amount_of(&p[2])?,
-        raw_in: p[2].to_string(),
+        raw_in: amount_text(&p[2])?,
         token_in: module_ref_name(&p[3])?,
         amount_out: amount_of(&p[4])?,
-        raw_out: p[4].to_string(),
+        raw_out: amount_text(&p[4])?,
         token_out: module_ref_name(&p[5])?,
     })
 }
@@ -259,8 +259,8 @@ pub fn swap_of(key: TxKey, ctime: u64, data: &Value, swap_events: &[Value]) -> O
         ctime,
         key,
         legs: [
-            (t0.to_owned(), a0.to_string()),
-            (t1.to_owned(), a1.to_string()),
+            (t0.to_owned(), amount_text(a0)?),
+            (t1.to_owned(), amount_text(a1)?),
         ],
     };
     let main = if t0 == COIN { t1 } else { t0 };
@@ -355,14 +355,92 @@ pub fn upsert(
     Ok(n)
 }
 
-/// Reverse the rows a tail block wrote (its `price_undo` log), newest first, and drop the log.
-pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
-    let k = undo_key(chain, height);
-    let Some(v) = txn.meta(&k)? else {
-        return Ok(0);
+/// Undo logs [`upsert_fill`] reads per chunk while it walks a chain's tail blocks.
+const FILL_LOG_CHUNK: usize = 32;
+
+/// [`upsert`] for the one-time history fill, which runs beside the live tail (N-14), without
+/// an undo log of its own. The fill's row is stored where it is newer than the stored row,
+/// and every tail block above its height whose undo entry for the key restores an older row
+/// (or none) is made to restore it instead.
+///
+/// Why every block above it: unwinding block `B` must leave the newest row of what remains,
+/// the rows of blocks below `B` and the fill's rows below `B` (a row at or above `B` is
+/// orphaned with it, I-1). A block's first entry for a key holds the stored row from before
+/// the block, so these entries never decrease with the block's height; taking the max with
+/// the fill's row on every block above its height keeps them so, and the walk stops at the
+/// first entry that already holds a row at least as new. A sender can backdate creationTime
+/// (PR #49 m-1), so the fill's row may be newer than a tail block's: the entry is patched
+/// whether or not the fill's row replaced the stored one, and whether that entry holds a tail
+/// row or an earlier fill row (m-1, round 2).
+///
+/// Cost: at most the undo logs of this chain's unfrozen tail blocks above the row, read in
+/// chunks of [`FILL_LOG_CHUNK`]; most stop at the first block that touched the key.
+pub fn upsert_fill(txn: &mut RwTxn<'_>, chain: u8, swap: &Swap) -> Result<u32> {
+    let rows =
+        (swap.tokens.iter().map(|t| (t, &swap.row))).chain(swap.routed.iter().map(|(t, r)| (t, r)));
+    let mut n = 0;
+    for (t, row) in rows {
+        let k = row_key(chain, t);
+        let prev = txn
+            .get(Table::TokenSwaps, &k)?
+            .as_deref()
+            .and_then(SwapRow::decode);
+        if prev.is_none_or(|p| p.order() < row.order()) {
+            txn.put(Table::TokenSwaps, &k, &row.encode())?;
+            n += 1;
+        }
+        fill_logs(txn, chain, &k, row)?;
+    }
+    Ok(n)
+}
+
+/// Make the first entry for `k` of every tail block on `chain` above `row`'s height restore
+/// at least `row`, from the lowest block up; stop at the first that already does.
+fn fill_logs(txn: &mut RwTxn<'_>, chain: u8, k: &[u8], row: &SwapRow) -> Result<()> {
+    let Some(above) = row.key.height().checked_add(1) else {
+        return Ok(()); // no block above
     };
+    let prefix = format!("{}{chain:02}/", meta::PRICE_UNDO);
+    let mut from = undo_key(chain, above).into_bytes();
+    let order = row.order();
+    loop {
+        let logs = txn.scan_limit(Table::Meta, &from, FILL_LOG_CHUNK, |key| {
+            key.starts_with(prefix.as_bytes())
+        })?;
+        let Some((last, _)) = logs.last() else {
+            return Ok(());
+        };
+        let more = logs.len() == FILL_LOG_CHUNK;
+        from = last.clone();
+        from.push(0); // the smallest key after `last`
+        for (uk, v) in logs {
+            let mut entries = undo_entries(&v)?;
+            // A block's first entry for the key holds what was there before the block.
+            let Some(e) = entries.iter_mut().find(|(key, _)| key == k) else {
+                continue;
+            };
+            if e.1
+                .as_deref()
+                .and_then(SwapRow::decode)
+                .is_some_and(|p| p.order() >= order)
+            {
+                return Ok(()); // this block and every one above it already restore `row` or newer
+            }
+            e.1 = Some(row.encode());
+            txn.put(Table::Meta, &uk, &undo_encode(&entries))?;
+        }
+        if !more {
+            return Ok(());
+        }
+    }
+}
+
+/// One undo log entry: a `TokenSwaps` key and the row an unwind restores (none: delete).
+type UndoEntry = (Vec<u8>, Option<Vec<u8>>);
+
+fn undo_entries(v: &[u8]) -> Result<Vec<UndoEntry>> {
     let mut entries = Vec::new();
-    let mut b = v.as_slice();
+    let mut b = v;
     while !b.is_empty() {
         let key = get_bytes(&mut b).context("price undo key")?.to_vec();
         let prev = match get_u8(&mut b).context("price undo flag")? {
@@ -371,6 +449,31 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
         };
         entries.push((key, prev));
     }
+    Ok(entries)
+}
+
+fn undo_encode(entries: &[UndoEntry]) -> Vec<u8> {
+    let mut u = Vec::new();
+    for (key, prev) in entries {
+        put_bytes(&mut u, key);
+        match prev {
+            Some(p) => {
+                u.push(1);
+                put_bytes(&mut u, p);
+            }
+            None => u.push(0),
+        }
+    }
+    u
+}
+
+/// Reverse the rows a tail block wrote (its `price_undo` log), newest first, and drop the log.
+pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
+    let k = undo_key(chain, height);
+    let Some(v) = txn.meta(&k)? else {
+        return Ok(0);
+    };
+    let entries = undo_entries(&v)?;
     let n = entries.len() as u32;
     for (key, prev) in entries.into_iter().rev() {
         match prev {
@@ -403,8 +506,9 @@ pub fn lookup(txn: &impl Txn, module: &str) -> Result<Option<SwapRow>> {
     lookup_checked(txn, module, &mut || Ok(()))
 }
 
-/// [`lookup`] that calls `check` every [`DEADLINE_EVERY`] rows (the request deadline); an error
-/// from it ends the lookup with that error.
+/// [`lookup`] that calls `check` every [`DEADLINE_EVERY`] rows it reads and again every
+/// [`DEADLINE_EVERY`] rows it matches (the request deadline); an error from it ends the lookup
+/// with that error.
 pub fn lookup_checked(
     txn: &impl Txn,
     module: &str,
@@ -413,7 +517,20 @@ pub fn lookup_checked(
     let Some(mut pattern) = LikePattern::new(module) else {
         return Ok(None);
     };
-    let all = txn.scan_limit(Table::TokenSwaps, &[], LIKE_SCAN_ROWS + 1, |_| true)?;
+    // Read the (at most LIKE_SCAN_ROWS + 1) rows in chunks, checking the deadline before
+    // each, so a large table is not copied whole before the first check (N-06).
+    let mut all: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    while all.len() <= LIKE_SCAN_ROWS {
+        check()?;
+        let want = DEADLINE_EVERY.min(LIKE_SCAN_ROWS + 1 - all.len());
+        let after = all.last().map(|(k, _)| k.as_slice());
+        let chunk = txn.scan_chunk(Table::TokenSwaps, after, want, |_| true)?;
+        let done = chunk.len() < want;
+        all.extend(chunk);
+        if done {
+            break;
+        }
+    }
     let mut best: Option<SwapRow> = None;
     fn keep(best: &mut Option<SwapRow>, v: &[u8]) {
         if let Some(row) = SwapRow::decode(v) {
@@ -580,7 +697,7 @@ impl Dec {
                 s[i + 1..]
                     .parse::<i64>()
                     .ok()
-                    .filter(|e| e.abs() <= 4 * MAX_EXP)?,
+                    .filter(|e| e.unsigned_abs() <= 4 * MAX_EXP.unsigned_abs())?,
             ),
             None => (s, 0),
         };
@@ -598,7 +715,8 @@ impl Dec {
             exp: e.checked_sub(frac.len() as i64)?,
         };
         d.normalize();
-        (d.digits.len() <= MAX_SIG_DIGITS && d.exp.abs() <= MAX_EXP).then_some(d)
+        (d.digits.len() <= MAX_SIG_DIGITS && d.exp.unsigned_abs() <= MAX_EXP.unsigned_abs())
+            .then_some(d)
     }
 
     fn normalize(&mut self) {
@@ -781,20 +899,41 @@ fn same_amount(a: &Dec, b: &Dec) -> bool {
     (a.is_zero() && b.is_zero()) || a == b
 }
 
-/// [`amount_dec`] of a parsed JSON value.
-fn amount_of(a: &Value) -> Option<Dec> {
+/// The part of an amount the stock resolver reads: `amount.decimal ?? amount.integer ??
+/// amount`. Other keys of an amount object are never looked at, so they are not stored
+/// (N-04: a result is the sender's, and could pad a genuine amount with kilobytes of JSON).
+fn amount_pick(a: &Value) -> &Value {
     fn pick<'a>(o: &'a serde_json::Map<String, Value>, f: &str) -> Option<&'a Value> {
         o.get(f).filter(|v| !v.is_null())
     }
-    let v = match a {
+    match a {
         Value::Object(o) => pick(o, "decimal")
             .or_else(|| pick(o, "integer"))
             .unwrap_or(a),
         _ => a,
-    };
-    match v {
+    }
+}
+
+/// The stored text of an amount: the JSON of its [`amount_pick`], when that reads as a number
+/// (so at most [`MAX_AMOUNT_TEXT`] bytes of string, or a JSON number). It reads back through
+/// [`amount_dec`] as the same number, sign of a zero included.
+fn amount_text(a: &Value) -> Option<String> {
+    amount_of(a)?;
+    let t = amount_pick(a).to_string();
+    // A string's JSON adds its quotes (and escapes, which a number never needs).
+    (t.len() <= MAX_AMOUNT_TEXT + 2).then_some(t)
+}
+
+/// [`amount_dec`] of a parsed JSON value.
+fn amount_of(a: &Value) -> Option<Dec> {
+    match amount_pick(a) {
         Value::Number(n) => {
-            let f: f64 = n.to_string().parse().ok()?;
+            // `arbitrary_precision` keeps a number's text: bound it like a string.
+            let t = n.to_string();
+            if t.len() > MAX_AMOUNT_TEXT {
+                return None;
+            }
+            let f: f64 = t.parse().ok()?;
             f.is_finite().then(|| Dec::parse(&format!("{f}")))?
         }
         Value::String(s) => Dec::parse(s),
@@ -1251,6 +1390,23 @@ mod tests {
         assert_eq!(got.legs[0].1, "3");
         // A part of a name no longer matches on a table this large.
         assert_eq!(lookup(&txn, "tok000007").unwrap(), None);
+        // N-06: the deadline is checked while the rows are read, not only once they are all
+        // copied (a table past LIKE_SCAN_ROWS never reaches the matching loop).
+        let mut calls = 0;
+        let got = lookup_checked(&txn, "tok000007", &mut || {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(got.unwrap(), None);
+        assert_eq!(calls, (LIKE_SCAN_ROWS + 1).div_ceil(DEADLINE_EVERY));
+        let mut calls = 0;
+        let got = lookup_checked(&txn, "tok000007", &mut || {
+            calls += 1;
+            anyhow::ensure!(calls < 2, "deadline");
+            Ok(())
+        });
+        assert!(got.is_err());
+        assert_eq!(calls, 2);
         // Exact reads per chain: rows of names that extend the module's key (review M1:
         // `module` + a low byte sorted between the module's chain rows) cannot hide chain 19.
         for i in 0..300u32 {
@@ -1446,5 +1602,311 @@ mod tests {
         assert!(lookup(&txn, "free.new").unwrap().is_some());
         undo_block(&mut txn, 5, 30).unwrap();
         assert_eq!(lookup(&txn, "free.new").unwrap(), None);
+    }
+
+    /// A tail block at `h` (chain 0) applying a `free.t` swap with its undo log.
+    fn tail_block(txn: &mut RwTxn<'_>, s: &Swap) {
+        let mut log = Vec::new();
+        upsert(txn, 0, s, Some(&mut log)).unwrap();
+        if !log.is_empty() {
+            txn.set_meta(&undo_key(0, s.row.key.height()), &log)
+                .unwrap();
+        }
+    }
+
+    fn t_swap(ctime: u64, h: u32, amt: &str) -> Swap {
+        Swap {
+            row: row(ctime, TxKey::new(h, 0, 1), ("coin", amt), ("free.t", "1")),
+            tokens: vec!["free.t".into()],
+            routed: vec![],
+        }
+    }
+
+    /// I-1 (PR #49 review): a resumed hot pass re-reads a tail block the tail already applied
+    /// (H1), and a newer swap above it (H2) logged H1's row as what its unwind restores. The
+    /// fill must not point H1's own entry at H1's row: unwinding H2 and H1 leaves no price,
+    /// as stock drops both orphaned swaps.
+    #[test]
+    fn a_fill_of_a_tail_blocks_own_row_leaves_its_log_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let (s1, s2) = (t_swap(100, 10, "1"), t_swap(200, 20, "2"));
+        tail_block(&mut txn, &s1);
+        tail_block(&mut txn, &s2);
+        assert_eq!(upsert_fill(&mut txn, 0, &s1).unwrap(), 0);
+        undo_block(&mut txn, 0, 20).unwrap();
+        assert_eq!(
+            lookup(&txn, "free.t").unwrap().map(|r| r.key.height()),
+            Some(10)
+        );
+        undo_block(&mut txn, 0, 10).unwrap();
+        assert_eq!(lookup(&txn, "free.t").unwrap(), None);
+
+        // A fill row from a block at or above the block whose entry would take it is gone
+        // with that block too: block 5 (newest by ctime) logged no row before; the fill
+        // re-reads block 12's older swap (not stored: block 5's is newer). Unwinding to 5
+        // must leave no price, not block 12's orphaned swap.
+        let s5 = t_swap(500, 5, "5");
+        tail_block(&mut txn, &s5);
+        let s12 = t_swap(120, 12, "9");
+        tail_block(&mut txn, &s12); // writes nothing: block 5's row is newer
+        assert_eq!(upsert_fill(&mut txn, 0, &s12).unwrap(), 0);
+        undo_block(&mut txn, 0, 12).unwrap();
+        undo_block(&mut txn, 0, 5).unwrap();
+        assert_eq!(lookup(&txn, "free.t").unwrap(), None);
+    }
+
+    /// m-1 (PR #49 review): a sender can backdate creationTime, so a tail block's row can be
+    /// older than a history row the fill finds later. The fill overwrites it; the block's
+    /// undo entry must then restore the fill's row, not the "no row" it logged.
+    #[test]
+    fn a_fill_row_newer_than_a_tail_row_survives_the_tail_blocks_unwind() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        // Tail block 20, backdated (ctime 100): first row of the token, logged as none.
+        tail_block(&mut txn, &t_swap(100, 20, "2"));
+        // The fill's history swap at height 10 is newer by ctime: it is stored.
+        assert_eq!(upsert_fill(&mut txn, 0, &t_swap(150, 10, "1")).unwrap(), 1);
+        assert_eq!(
+            lookup(&txn, "free.t").unwrap().map(|r| r.key.height()),
+            Some(10)
+        );
+        undo_block(&mut txn, 0, 20).unwrap();
+        let got = lookup(&txn, "free.t").unwrap().unwrap();
+        assert_eq!((got.ctime, got.key), (150, TxKey::new(10, 0, 1)));
+        // Same with a row before the block: block 30 replaced the fill's older row (ctime
+        // 50); a fill row between them (ctime 120, height 11) goes into block 30's entry.
+        txn.del(Table::TokenSwaps, &row_key(0, "free.t")).unwrap();
+        assert_eq!(upsert_fill(&mut txn, 0, &t_swap(50, 9, "0")).unwrap(), 1);
+        tail_block(&mut txn, &t_swap(60, 30, "3"));
+        assert_eq!(upsert_fill(&mut txn, 0, &t_swap(120, 11, "1")).unwrap(), 1);
+        undo_block(&mut txn, 0, 30).unwrap();
+        let got = lookup(&txn, "free.t").unwrap().unwrap();
+        assert_eq!((got.ctime, got.key.height()), (120, 11));
+    }
+
+    fn ctime_height(txn: &RwTxn<'_>, token: &str) -> Option<(u64, u32)> {
+        lookup(txn, token)
+            .unwrap()
+            .map(|r| (r.ctime, r.key.height()))
+    }
+
+    /// m-1 round 2, probe 1: a second fill row replaces the first one, which a tail block's
+    /// entry already holds. Unwinding the block must restore the second, not the first.
+    #[test]
+    fn a_second_fill_row_reaches_the_entry_that_held_the_first() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        tail_block(&mut txn, &t_swap(100, 20, "2"));
+        upsert_fill(&mut txn, 0, &t_swap(150, 9, "a")).unwrap();
+        upsert_fill(&mut txn, 0, &t_swap(160, 10, "b")).unwrap();
+        undo_block(&mut txn, 0, 20).unwrap();
+        assert_eq!(ctime_height(&txn, "free.t"), Some((160, 10)));
+    }
+
+    /// m-1 round 2, probe 2: two tail blocks log the first fill row (one as the row the fill
+    /// replaced, one as the row before it); a newer fill row must reach both entries.
+    #[test]
+    fn a_newer_fill_row_reaches_every_tail_entry_above_it() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        tail_block(&mut txn, &t_swap(100, 20, "p")); // backdated
+        upsert_fill(&mut txn, 0, &t_swap(150, 9, "a")).unwrap();
+        tail_block(&mut txn, &t_swap(300, 21, "q"));
+        upsert_fill(&mut txn, 0, &t_swap(160, 10, "b")).unwrap();
+        undo_block(&mut txn, 0, 21).unwrap();
+        assert_eq!(ctime_height(&txn, "free.t"), Some((160, 10)));
+        undo_block(&mut txn, 0, 20).unwrap();
+        assert_eq!(ctime_height(&txn, "free.t"), Some((160, 10)));
+    }
+
+    /// m-1 round 2: after any sequence of fill batches (history rows below the tail, with
+    /// random and backdated creation times, and re-reads of applied tail rows), tail applies
+    /// and unwinds of up to 3 blocks, `lookup` equals a fresh replay of the canonical chain:
+    /// the newest of the history rows and the rows of the blocks still applied.
+    #[test]
+    fn fills_applies_and_unwinds_match_a_replay() {
+        const TOKENS: [&str; 2] = ["free.aa", "free.bb"];
+        const BASE: u32 = 100;
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        for seed in 1..=150u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut txn = hot.rw().unwrap();
+            let chain = (seed % u64::from(MAX_CHAINS)) as u8;
+            for (c, t) in (0..MAX_CHAINS).flat_map(|c| TOKENS.map(|t| (c, t))) {
+                txn.del(Table::TokenSwaps, &row_key(c, t)).unwrap();
+            }
+            let mut pos = 0u16;
+            let mut mk = |rng: &mut Rng, h: u32| -> (usize, SwapRow) {
+                pos += 1;
+                let t = rng.next(2) as usize;
+                let r = SwapRow {
+                    ctime: rng.next(1000),
+                    key: TxKey::new(h, chain, pos),
+                    legs: [
+                        ("coin".into(), pos.to_string()),
+                        (TOKENS[t].into(), "1".into()),
+                    ],
+                };
+                (t, r)
+            };
+            let swap = |t: usize, r: &SwapRow| Swap {
+                row: r.clone(),
+                tokens: vec![TOKENS[t].into()],
+                routed: vec![],
+            };
+            let mut history: Vec<(usize, SwapRow)> = Vec::new();
+            let mut tail: Vec<(u32, Vec<(usize, SwapRow)>)> = Vec::new();
+            for step in 0..120 {
+                match rng.next(3) {
+                    0 => {
+                        // One fill batch.
+                        for _ in 0..=rng.next(3) {
+                            let applied: Vec<&(usize, SwapRow)> =
+                                tail.iter().flat_map(|(_, rs)| rs).collect();
+                            if !applied.is_empty() && rng.next(3) == 0 {
+                                let (t, r) = applied[rng.next(applied.len() as u64) as usize];
+                                upsert_fill(&mut txn, chain, &swap(*t, r)).unwrap();
+                            } else {
+                                let h = 1 + rng.next(u64::from(BASE - 1)) as u32;
+                                let (t, r) = mk(&mut rng, h);
+                                upsert_fill(&mut txn, chain, &swap(t, &r)).unwrap();
+                                history.push((t, r));
+                            }
+                        }
+                    }
+                    1 => {
+                        let h = tail.last().map_or(BASE, |(h, _)| h + 1);
+                        let rows: Vec<(usize, SwapRow)> =
+                            (0..rng.next(3)).map(|_| mk(&mut rng, h)).collect();
+                        let mut log = Vec::new();
+                        for (t, r) in &rows {
+                            upsert(&mut txn, chain, &swap(*t, r), Some(&mut log)).unwrap();
+                        }
+                        if !log.is_empty() {
+                            txn.set_meta(&undo_key(chain, h), &log).unwrap();
+                        }
+                        tail.push((h, rows));
+                    }
+                    _ => {
+                        for _ in 0..=rng.next(3) {
+                            if let Some((h, _)) = tail.pop() {
+                                undo_block(&mut txn, chain, h).unwrap();
+                            }
+                        }
+                    }
+                }
+                for (t, name) in TOKENS.iter().enumerate() {
+                    let want = (history.iter())
+                        .chain(tail.iter().flat_map(|(_, rs)| rs))
+                        .filter(|(tt, _)| *tt == t)
+                        .map(|(_, r)| r)
+                        .max_by_key(|r| r.order())
+                        .cloned();
+                    let got = lookup(&txn, name).unwrap();
+                    assert_eq!(got, want, "seed {seed} step {step} token {name}");
+                }
+            }
+            // Leave no log behind for the next seed on this chain.
+            while let Some((h, _)) = tail.pop() {
+                undo_block(&mut txn, chain, h).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+    }
+
+    /// N-05: an exponent of `i64::MIN` has no `abs()`; it must be refused, not panic (debug)
+    /// or wrap past the bound (release).
+    #[test]
+    fn an_i64_min_exponent_is_refused() {
+        assert_eq!(Dec::parse("1e-9223372036854775808"), None);
+        assert_eq!(Dec::parse("1e9223372036854775807"), None);
+        assert_eq!(
+            amount_of(&json!({"decimal": "1e-9223372036854775808"})),
+            None
+        );
+        assert!(Dec::parse("1e-4000").is_none());
+        assert!(Dec::parse("1e-1000").is_some());
+    }
+
+    /// N-04: a result leg may carry extra keys beside its amount; only the amount stock reads
+    /// (`decimal ?? integer ?? amount`) is stored, so padding never reaches `TokenSwaps`, and
+    /// the price stays stock's.
+    #[test]
+    fn padding_beside_a_result_amount_is_not_stored() {
+        let k = TxKey::new(1, 2, 1);
+        let genuine = [ev(
+            "coin",
+            json!({"decimal": "0.0001"}),
+            "kaddex.kdx",
+            json!(3.0),
+        )];
+        let pad = "x".repeat(50_000);
+        let data = json!([
+            {"token": "coin", "amount": {"decimal": "0.0001", "pad": pad}},
+            {"token": "kaddex.kdx", "amount": {"integer": 3, "pad": pad}}
+        ]);
+        let s = swap_of(k, 0, &data, &genuine).unwrap();
+        assert_eq!(
+            s.row.legs,
+            [
+                ("coin".to_owned(), "\"0.0001\"".to_owned()),
+                ("kaddex.kdx".to_owned(), "3".to_owned())
+            ]
+        );
+        // The price is the one stock computes from the padded result.
+        assert_eq!(price_text(&s.row).as_deref(), Some("0.000033333333"));
+        // A negative zero keeps its sign, as stock reads it.
+        let z = [ev("coin", json!(1), "free.t", json!(0))];
+        let data = json!([
+            {"token": "coin", "amount": 1},
+            {"token": "free.t", "amount": {"decimal": "-0", "pad": "y"}}
+        ]);
+        let s = swap_of(k, 0, &data, &z).unwrap();
+        assert_eq!(s.row.legs[1].1, "\"-0\"");
+        assert_eq!(price_text(&s.row).as_deref(), Some("-Infinity"));
+    }
+
+    /// N-04 follow-up: with `arbitrary_precision` a JSON number keeps its text, so a number or
+    /// string amount longer than [`MAX_AMOUNT_TEXT`] is refused, never stored.
+    #[test]
+    fn an_overlong_amount_is_not_stored() {
+        let long_num: Value = serde_json::from_str(&format!("0.{}1", "0".repeat(10_000))).unwrap();
+        assert!(long_num.to_string().len() > 10_000);
+        assert_eq!(amount_of(&long_num), None);
+        assert_eq!(amount_text(&long_num), None);
+        let long_str = json!(format!("0.{}1", "0".repeat(2_000)));
+        assert_eq!(amount_of(&long_str), None);
+        assert_eq!(amount_text(&json!({"decimal": long_str})), None);
+        // Through swap_of: a genuine event whose amount the result repeats at 10k digits.
+        let k = TxKey::new(1, 2, 1);
+        let evs = [ev("coin", long_num.clone(), "kaddex.kdx", json!(3))];
+        let data = json!([{"token": "coin", "amount": long_num},
+                          {"token": "kaddex.kdx", "amount": 3}]);
+        assert_eq!(swap_of(k, 0, &data, &evs), None);
+        // Normal amounts are stored as they came.
+        assert_eq!(
+            amount_text(&json!(689.006542078688)).as_deref(),
+            Some("689.006542078688")
+        );
+        assert_eq!(
+            amount_text(&json!({"decimal": "0.82543"})).as_deref(),
+            Some("\"0.82543\"")
+        );
+        assert_eq!(amount_text(&json!({"integer": 67})).as_deref(), Some("67"));
     }
 }
