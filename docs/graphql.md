@@ -954,7 +954,8 @@ is checked first at each token; with zero reserves it prices at 0, as stock), re
 1,024 pairs per token (the oldest `CREATE_PAIR`s: a token with more pairs than that has its
 newer ones left out; `kdx_dex_ranked_neighbors_capped_total` counts it), ranked by that token's
 own reserve (a coin pair never funded is not read), expanding the top 256 and visiting at most
-2,048 tokens. A search that spends the field's row budget or deadline answers no path (price 0,
+2,048 tokens. A search that spends the field's row budget or deadline, or reaches the 2,048-token
+cap, answers no path (price 0,
 stock's answer with no path) and the response carries
 `"extensions": {"dexPricesPartial": true}`: a 0 in such a response may be a price that was not
 searched. `tokenPrices` gives its price searches a row budget of their own (250,000 more rows;

@@ -1457,8 +1457,9 @@ impl<T: Txn> PriceSearch<'_, T> {
     /// newer pairs left out of the search, so spam pairs created before a real route can still
     /// hide it (then the token prices at 0, as stock prices a token with no path).
     ///
-    /// A search that spends the field's row budget or deadline answers no path (`None`: price
-    /// 0, stock's answer with no path) rather than an error, and marks
+    /// A search that spends the field's row budget or deadline, or reaches
+    /// [`MAX_PRICE_TOKENS`], answers no path (`None`: price 0, stock's answer with no path)
+    /// rather than an error, and marks
     /// [`Budget::prices_partial`] so the response says some prices were not searched.
     fn price_in_kda(&mut self, token: &str, b: &mut Budget) -> ApiResult<Option<Dec>> {
         match self.search(token, b) {
@@ -1552,6 +1553,8 @@ impl<T: Txn> PriceSearch<'_, T> {
                 };
                 if let Some(x) = amt.mul(&ro).div(&rs) {
                     if seen.len() >= MAX_PRICE_TOKENS {
+                        // Cut, not searched out: flagged like a spent budget.
+                        b.prices_partial = true;
                         return Ok(None);
                     }
                     seen.insert(other.clone());
