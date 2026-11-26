@@ -2,7 +2,7 @@
 
 ## Commands that write
 
-`run`, `backfill`, `rebuild-range`, `unwind` and `segments add-index` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
+`run`, `backfill`, `rebuild-range`, `unwind`, `segments add-index` and `reconcile-counts` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
 takes an exclusive lock on `<data_dir>/LOCK` and exits at once with an error if another
 kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer-<network>`) before running
 `backfill`, `unwind` or `segments add-index` by hand. Read-only commands (`inspect`,
@@ -213,6 +213,45 @@ silently lose a range. Recovery, with the service stopped: delete that `sndr.pst
 `kf.fil` only turns that range's filter off (WARN, `kdx_key_filter_untrusted`); the
 same rerun rebuilds it. If the writer cannot build a filter at all, it writes the step or
 range without `kf.fil` (WARN) rather than stall the freeze or merge.
+
+## Stored totalCount counts
+
+GraphQL `totalCount` of the plain account, token, public-key and event-name lists is read
+from a hot table of row counts per (list kind, key, chain) instead of a walk
+([graphql.md](graphql.md#transactions-events-and-transfers), `totalCount`). The tail keeps
+the table at every block and every reorg (an unwound block's counts are recomputed from its
+record and subtracted; the undo format is unchanged), and the freezer leaves it alone. It is
+used only while `Meta row_counts_ready` is set; until then, every count walks as before.
+
+Build it once after upgrading, and again after any command that clears the marker
+(`backfill`, `rebuild-range`, `segments add-index`, `hot drop-family`; each logs
+`row counts: readiness marker cleared`):
+
+```sh
+systemctl stop kda-indexer-<network>
+kda-indexer -c <config> reconcile-counts      # [--threads N] [--data-dir D]
+systemctl start kda-indexer-<network>
+```
+
+- It reads every frozen record on `--threads` workers (default `[balances]
+  history_walk_threads`, else the cores less 2), then the hot records, rebuilds the whole
+  table and sets the marker last. It takes the data-dir lock, so the service must be
+  stopped. It is idempotent: run it again at any time; a run stopped halfway leaves the
+  marker cleared and the service walks.
+- It prints a JSON report (`frozen_txs`, `hot_txs`, `keys`, `rate` in records a second,
+  `ready`). A record whose output does not render leaves the marker unset and exits with an
+  error (the walk cannot list that tx either).
+- `reconcile-counts --check` counts the same way without the lock or any write and reports
+  `differing`, the rows of the stored table that differ from a fresh count (0 on a healthy
+  store). It runs beside the service, at the cost of the CPU it uses.
+- Time: measured at about 80,000 records a second per thread and 256,000 on 6 threads
+  (mainnet-like synthetic records, release build, warm cache). Mainnet holds about 371
+  million records, so plan on 25 minutes at that rate, up to about 50 minutes on slower
+  cores or a cold disk.
+- Memory: one merged map of every (kind, key, chain); about 50 bytes a key.
+- A build before PR #48 applies blocks without counting them but leaves the marker set: after
+  running one on this data dir (a rollback), run `reconcile-counts` again before serving with
+  this build.
 
 ## Rolling back to a build before FIX-2
 

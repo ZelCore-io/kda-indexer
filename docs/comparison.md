@@ -263,7 +263,8 @@ The G4 replay of real traffic (below) met most of these classes again; its
 - GraphQL `totalCount` is exact, as stock's, with no cap (the `graphql-totalcount-cap` and
   `graphql-r58-count-lower-bound` rules are retired). A count the 5 s deadline cuts answers
   `COUNT_TIMEOUT` at the field where stock answers a number; that happens only on decoding
-  lists with tens of thousands of rows or more ([graphql.md](graphql.md#transactions-events-and-transfers), `totalCount`).
+  lists with tens of thousands of rows or more that the stored per-key counts do not hold
+  (height, depth and row filters; [graphql.md](graphql.md#transactions-events-and-transfers), `totalCount`).
 - `Transfer.orderIndex` is the TRANSFER event's index in the transaction
   (`graphql-h8-transfer-order-index`).
 - `creationTime` has whole seconds, as the node's command; stock adds a fraction

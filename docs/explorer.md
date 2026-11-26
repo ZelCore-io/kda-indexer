@@ -3,8 +3,9 @@
 kda-indexer serves Kadena's GraphQL schema, the schema of `@kadena/graph`. An explorer built on
 that schema, such as kadscan or the Kadena explorer, can change its GraphQL URL to a kda-indexer
 endpoint and keep its own operations, with two documented limits: the default query-cost limit
-refuses an events query that spans all 20 chains, and `totalCount` on a very long list can
-answer a `COUNT_TIMEOUT` error where stock answers a number (see [Speed](#speed)). This page gives the evidence for that claim and
+refuses an events query that spans all 20 chains, and `totalCount` on a very long list with a
+height or row filter can answer a `COUNT_TIMEOUT` error where stock answers a number (the plain
+lists answer from stored counts; see [Speed](#speed)). This page gives the evidence for that claim and
 lists where the answers differ.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
