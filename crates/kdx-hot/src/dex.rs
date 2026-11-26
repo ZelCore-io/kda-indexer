@@ -3,8 +3,9 @@
 //!
 //! Stock (indexer-kadena `90a4be1`, `services/pair.ts`, `pair-service.ts`) indexes one DEX:
 //! Sushi on Kadena, module [`SUSHI_EXCHANGE`] and its LP token module [`SUSHI_TOKENS`], on
-//! chain [`SUSHI_CHAIN`] from height [`SUSHI_DEPLOY_HEIGHT`]. It reads these events (params as
-//! stock destructures them):
+//! chain [`SUSHI_CHAIN`], at any height (stock applies no height filter: `services/pair.ts`
+//! filters by module and name only, and its backfill starts at block 0; the first real
+//! `CREATE_PAIR` is at 6,121,854). It reads these events (params as stock destructures them):
 //!
 //! | Event | Params |
 //! |---|---|
@@ -19,7 +20,7 @@
 //! `Module` is the matching Sushi module is read (Pact lets only a module emit events under its
 //! own name; the `n_` principal namespace cannot be squatted). Amounts come from these events
 //! only, never from the tx's `result` or its args (both are the sender's). A failed or coinbase
-//! tx, another chain, or a height below the deploy height is skipped before any decoding.
+//! tx or another chain is skipped before any decoding.
 //!
 //! **Pairs.** A pair is named by its two token names sorted bytewise and joined by `:` (stock's
 //! `createOrFindPair` key; Pact names hold no `:`). `token0` is the smaller name. Every event is
@@ -31,7 +32,9 @@
 //! **Amounts** are exact decimals ([`Amount`]): at most [`SCALE`] fractional digits, at most
 //! [`MAX_AMOUNT_TEXT`] bytes of text, exponent within ±[`MAX_EXP`], never negative. An event with
 //! an amount outside that is not stored (counted in [`ApplyStats::rejected`]). Sums are
-//! arbitrary precision, so they never overflow. No division happens at ingest: a price in KDA is
+//! arbitrary precision, so they never overflow, and stored text is read back with the wider
+//! bound [`MAX_STORED_TEXT`] (an input is below `10^(96+64)`, so a sum of fewer than `2^64`
+//! of them has at most 180 integer digits: about 206 bytes of text). No division happens at ingest: a price in KDA is
 //! `coin leg / token leg` of a swap, taken by the reader (which must treat a zero leg as no
 //! price).
 //!
@@ -41,11 +44,12 @@
 //! | Table | Key | Value |
 //! |---|---|---|
 //! | `DexPairs` | pair, 0x00, ev | empty (one row per `CREATE_PAIR`) |
-//! | `DexEvents` | pair, 0x00, kind u8, ev | kind u8, block time u64 (µs), then varint-length fields ([`StoredEvent`]) |
+//! | `DexEvents` | pair, 0x00, kind u8, ev | kind u8, block time u64 (µs), tx `meta.creationTime` u64 (s, as sent; 0 when absent), then varint-length fields ([`StoredEvent`]) |
 //! | `DexByTx` | ev | kind u8, pair (where the event's row is; unwind and idempotence index) |
 //! | `DexLp` | pair, 0x00, account | LP balance, decimal text (row absent when zero) |
 //! | `DexAgg` | 0x01, pair | LP total supply, decimal text (Σ mint − Σ burn; absent when zero) |
-//! | `DexAgg` | 0x02, pair, 0x00, hour u32 | [`Bucket`]: swap/add/remove counts and swap in/out sums per side |
+//! | `DexAgg` | 0x02, pair, 0x00, hour u32 | [`Bucket`]: swap/add/remove counts (wrapping i64) and swap in/out sums per side |
+//! | `DexAgg` | 0x03, pair | empty: the pair is poisoned ([`poisoned`]); never removed |
 //! | `DexUsd` | hour u32 | USD per KDA, decimal text: reserved for the serving part's DIA feed; ingest never writes it |
 //!
 //! `DexEvents` fields per kind (amounts oriented to the pair, as decimal text):
@@ -54,8 +58,31 @@
 //! `REMOVE_LIQUIDITY` `[sender, to, amount0, amount1, liquidity]`; `MINT_EVENT` / `BURN_EVENT`
 //! `[account, amount]`; `TRANSFER_EVENT` `[sender, receiver, amount]`.
 //! The hour is `block creationTime / 3600 s` (the block's, not the sender's `meta.creationTime`).
+//! Stock's `PoolTransaction.timestamp` is the tx's `meta.creationTime` (sender-chosen,
+//! `pair-service.ts:691`); it is stored per row ([`StoredEvent::tx_time`]) so the serving part
+//! can return stock's value while buckets stay on block time.
 //! Fees are not stored: Sushi's fee is 0.3 % of the input, so a bucket's fee per side is
 //! `in × 3 / 997` (stock's `in × FEE / (1 − FEE)`), exact from the stored sums.
+//!
+//! **Containment.** No stored DEX value can make [`apply_tx`] or [`undo_block`] fail: a row
+//! that cannot be read back (it cannot happen with the bounds above; it would take a bug or a
+//! damaged store) marks its pair poisoned (`DexAgg` 0x03): the pair's aggregates are no longer
+//! updated and the serving part must report the pair as unavailable. Its events are still
+//! stored and unwound, so the tail and every other pair carry on. Only storage errors (the
+//! database itself) propagate.
+//!
+//! **Deliberate divergences from stock** (stock's definitions are wrong or unsafe there):
+//! - LP total supply is Σ `MINT_EVENT` − Σ `BURN_EVENT` (the module's real supply). Stock's
+//!   `totalSupply` is Σ ADD `liquidity` − Σ REMOVE `liquidity`, which leaves out Sushi's locked
+//!   minimum, so a correct stock row differs from ours by that minimum.
+//! - A tx with more than [`MAX_EVENTS_PER_TX`] trusted events keeps its first ones and drops
+//!   the rest, so such a tx stores a partial ledger (e.g. a `MINT_EVENT` kept, its matching
+//!   `BURN_EVENT` dropped). Only the sender's own pair can be affected; no real tx comes close.
+//!
+//! **Junk pairs.** Anyone can create a pair for two junk tokens on the real module (stock has
+//! the same exposure), so `DexPairs` counts are not a listing. Ingest stores every pair; the
+//! serving part filters listings with [`pair_status`] / [`PairStatus::listable`] (created, not
+//! poisoned, a `coin` leg, non-zero latest reserves).
 //!
 //! **Reorgs.** A block's rows are found through `DexByTx` (its keys are the block's TxKeys, one
 //! contiguous range): [`undo_block`] reverses each row's effect and deletes it. No undo log is
@@ -80,12 +107,13 @@ pub const SUSHI_EXCHANGE: &str = "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sus
 pub const SUSHI_TOKENS: &str = "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange-tokens";
 /// The only chain Sushi is deployed on.
 pub const SUSHI_CHAIN: u8 = 2;
-/// The height of Sushi's deploy on chain 2 (no Sushi event exists below it).
-pub const SUSHI_DEPLOY_HEIGHT: u32 = 6_277_684;
 /// Fractional digits an amount may have.
 pub const SCALE: usize = 24;
-/// Longest amount text accepted (bytes).
+/// Longest amount text accepted from an event (bytes).
 pub const MAX_AMOUNT_TEXT: usize = 96;
+/// Longest stored amount text read back (bytes). Every sum the writer can produce is far
+/// shorter (about 206 bytes, see the module doc); a longer one poisons its pair.
+pub const MAX_STORED_TEXT: usize = 512;
 /// Largest exponent magnitude accepted in an amount (`1e40`).
 pub const MAX_EXP: i64 = 64;
 /// Sushi events read per tx; the rest are not stored.
@@ -199,7 +227,17 @@ impl Amount {
     /// [`MAX_AMOUNT_TEXT`], with an exponent beyond ±[`MAX_EXP`], or with a non-zero digit past
     /// [`SCALE`] fractional places (it would not be exact).
     pub fn parse(s: &str) -> Option<Amount> {
-        if s.is_empty() || s.len() > MAX_AMOUNT_TEXT {
+        Amount::parse_within(s, MAX_AMOUNT_TEXT)
+    }
+
+    /// Parse stored text (a sum or a stored event field): as [`Amount::parse`] with the bound
+    /// [`MAX_STORED_TEXT`].
+    pub fn parse_stored(s: &str) -> Option<Amount> {
+        Amount::parse_within(s, MAX_STORED_TEXT)
+    }
+
+    fn parse_within(s: &str, max: usize) -> Option<Amount> {
+        if s.is_empty() || s.len() > max {
             return None;
         }
         let (neg, s) = match s.strip_prefix('-') {
@@ -535,11 +573,7 @@ pub fn trusted_kind(dict: &dyn Dict, e: &kdx_types::record::EventRec) -> Option<
 
 /// Whether a tx can hold Sushi events at all (checked before any decoding).
 pub fn in_scope(r: &TxRecord) -> bool {
-    r.status_ok
-        && !r.key.is_coinbase()
-        && r.key.chain() == SUSHI_CHAIN
-        && r.key.height() >= SUSHI_DEPLOY_HEIGHT
-        && !r.events.is_empty()
+    r.status_ok && !r.key.is_coinbase() && r.key.chain() == SUSHI_CHAIN && !r.events.is_empty()
 }
 
 /// The trusted, well-formed Sushi events of a tx: `(event index, event)`, at most
@@ -650,6 +684,9 @@ pub struct StoredEvent {
     pub kind: Kind,
     /// Block creation time, µs.
     pub time: u64,
+    /// The tx's `meta.creationTime` (seconds, as the sender set it; 0 when absent): stock's
+    /// `PoolTransaction.timestamp`.
+    pub tx_time: u64,
     pub fields: Vec<String>,
 }
 
@@ -657,6 +694,7 @@ impl StoredEvent {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![self.kind as u8];
         out.extend_from_slice(&self.time.to_be_bytes());
+        out.extend_from_slice(&self.tx_time.to_be_bytes());
         for f in &self.fields {
             put_bytes(&mut out, f.as_bytes());
         }
@@ -666,7 +704,8 @@ impl StoredEvent {
     pub fn decode(v: &[u8]) -> Result<StoredEvent> {
         let kind = Kind::from_u8(*v.first().context("empty dex event")?).context("dex kind")?;
         let time = u64::from_be_bytes(v.get(1..9).context("dex time")?.try_into()?);
-        let mut b = &v[9..];
+        let tx_time = u64::from_be_bytes(v.get(9..17).context("dex tx time")?.try_into()?);
+        let mut b = &v[17..];
         let mut fields = Vec::with_capacity(kind.fields());
         while !b.is_empty() {
             fields.push(String::from_utf8(get_bytes(&mut b)?.to_vec()).context("dex field")?);
@@ -674,17 +713,24 @@ impl StoredEvent {
         if fields.len() != kind.fields() {
             bail!("dex event {kind:?} has {} fields", fields.len());
         }
-        Ok(StoredEvent { kind, time, fields })
+        Ok(StoredEvent {
+            kind,
+            time,
+            tx_time,
+            fields,
+        })
     }
 
-    fn amount(&self, i: usize) -> Result<Amount> {
-        Amount::parse(&self.fields[i]).context("stored dex amount")
+    /// Field `i` as an amount (`None` when absent or unreadable).
+    pub fn amount(&self, i: usize) -> Option<Amount> {
+        Amount::parse_stored(self.fields.get(i)?)
     }
 }
 
 /// A pair's hour bucket (`DexAgg` 0x02).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Bucket {
+    /// Counts add and subtract with wrapping, so they stay exact under unwind in any order.
     pub swaps: i64,
     pub adds: i64,
     pub removes: i64,
@@ -716,7 +762,7 @@ impl Bucket {
         let mut sums: [Amount; 4] = Default::default();
         for s in &mut sums {
             let t = std::str::from_utf8(get_bytes(&mut b)?).context("bucket sum")?;
-            *s = Amount::parse(t).context("bucket sum")?;
+            *s = Amount::parse_stored(t).context("bucket sum")?;
         }
         Ok(Bucket {
             swaps: n(0)?,
@@ -738,75 +784,121 @@ pub struct ApplyStats {
     pub present: u64,
 }
 
-fn add_amount_row(txn: &mut RwTxn<'_>, t: Table, k: &[u8], d: &Amount, sub: bool) -> Result<()> {
+/// `DexAgg` key of a pair's poison mark.
+pub fn poison_key(pair: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(pair.len() + 1);
+    k.push(3);
+    k.extend_from_slice(pair.as_bytes());
+    k
+}
+
+/// Whether a pair is poisoned: a stored value of it could not be read back, so its aggregates
+/// stopped and the serving part must report it as unavailable.
+pub fn poisoned(txn: &impl Txn, pair: &str) -> Result<bool> {
+    Ok(txn.get(Table::DexAgg, &poison_key(pair))?.is_some())
+}
+
+fn poison(txn: &mut RwTxn<'_>, pair: &str, at: &str) -> Result<()> {
+    tracing::warn!(pair, at, "dex: unreadable stored value, pair poisoned");
+    txn.put(Table::DexAgg, &poison_key(pair), &[])
+}
+
+/// The result of changing aggregates from stored data: `Ok(false)` when a stored value could
+/// not be read or would not fit [`MAX_STORED_TEXT`] (the caller poisons the pair). `Err` is a
+/// storage error only.
+type Fx = Result<bool>;
+
+fn add_amount_row(txn: &mut RwTxn<'_>, t: Table, k: &[u8], d: &Amount, sub: bool) -> Fx {
     let cur = match txn.get(t, k)? {
-        Some(v) => Amount::parse(std::str::from_utf8(&v)?).context("stored dex amount")?,
+        Some(v) => match std::str::from_utf8(&v).ok().and_then(Amount::parse_stored) {
+            Some(a) => a,
+            None => return Ok(false),
+        },
         None => Amount::zero(),
     };
     let new = cur.add(d, sub);
     if new.is_zero() {
         txn.del(t, k)?;
     } else {
-        txn.put(t, k, new.to_text().as_bytes())?;
+        let text = new.to_text();
+        if text.len() > MAX_STORED_TEXT {
+            return Ok(false);
+        }
+        txn.put(t, k, text.as_bytes())?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Add (`sub` false) or remove (`sub` true) one stored event's effect on the aggregates.
-fn effect(txn: &mut RwTxn<'_>, pair: &str, e: &StoredEvent, sub: bool) -> Result<()> {
+fn effect(txn: &mut RwTxn<'_>, pair: &str, e: &StoredEvent, sub: bool) -> Fx {
     match e.kind {
         Kind::CreatePair | Kind::Update => {}
         Kind::Swap | Kind::AddLiquidity | Kind::RemoveLiquidity => {
             let k = bucket_key(pair, hour_of(e.time));
             let mut b = match txn.get(Table::DexAgg, &k)? {
-                Some(v) => Bucket::decode(&v)?,
+                Some(v) => match Bucket::decode(&v) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(false),
+                },
                 None => Bucket::default(),
             };
-            let d = if sub { -1 } else { 1 };
+            let d: i64 = if sub { -1 } else { 1 };
             match e.kind {
                 Kind::Swap => {
-                    b.swaps += d;
+                    b.swaps = b.swaps.wrapping_add(d);
                     for i in 0..4 {
-                        b.sums[i] = b.sums[i].add(&e.amount(2 + i)?, sub);
+                        let Some(x) = e.amount(2 + i) else {
+                            return Ok(false);
+                        };
+                        b.sums[i] = b.sums[i].add(&x, sub);
                     }
                 }
-                Kind::AddLiquidity => b.adds += d,
-                _ => b.removes += d,
+                Kind::AddLiquidity => b.adds = b.adds.wrapping_add(d),
+                _ => b.removes = b.removes.wrapping_add(d),
             }
             if b.swaps == 0 && b.adds == 0 && b.removes == 0 {
                 txn.del(Table::DexAgg, &k)?;
             } else {
+                if b.sums.iter().any(|s| s.to_text().len() > MAX_STORED_TEXT) {
+                    return Ok(false);
+                }
                 txn.put(Table::DexAgg, &k, &b.encode())?;
             }
         }
         Kind::Mint | Kind::Burn => {
-            let amt = e.amount(1)?;
-            let burn = e.kind == Kind::Burn;
-            add_amount_row(txn, Table::DexAgg, &supply_key(pair), &amt, sub != burn)?;
-            add_amount_row(
-                txn,
-                Table::DexLp,
-                &lp_key(pair, &e.fields[0]),
-                &amt,
-                sub != burn,
-            )?;
+            let (Some(amt), Some(account)) = (e.amount(1), e.fields.first()) else {
+                return Ok(false);
+            };
+            let up = sub != (e.kind == Kind::Burn);
+            return Ok(
+                add_amount_row(txn, Table::DexAgg, &supply_key(pair), &amt, up)?
+                    && add_amount_row(txn, Table::DexLp, &lp_key(pair, account), &amt, up)?,
+            );
         }
         Kind::Transfer => {
-            let amt = e.amount(2)?;
-            add_amount_row(txn, Table::DexLp, &lp_key(pair, &e.fields[0]), &amt, !sub)?;
-            add_amount_row(txn, Table::DexLp, &lp_key(pair, &e.fields[1]), &amt, sub)?;
+            let (Some(amt), Some(from), Some(to)) =
+                (e.amount(2), e.fields.first(), e.fields.get(1))
+            else {
+                return Ok(false);
+            };
+            return Ok(
+                add_amount_row(txn, Table::DexLp, &lp_key(pair, from), &amt, !sub)?
+                    && add_amount_row(txn, Table::DexLp, &lp_key(pair, to), &amt, sub)?,
+            );
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Store one decoded event of the tx at `key` (block time `time`, µs), once: a replay of a
-/// stored event changes nothing. Returns whether it was stored.
+/// Store one decoded event of the tx at `key` (block time `time`, µs; tx `meta.creationTime`
+/// `tx_time`), once: a replay of a stored event changes nothing. Returns whether it was
+/// stored. A pair whose stored values cannot be read is poisoned, never an error.
 pub fn store_event(
     txn: &mut RwTxn<'_>,
     key: TxKey,
     idx: u16,
     time: u64,
+    tx_time: u64,
     ev: &DexEvent,
 ) -> Result<bool> {
     let mut by = vec![ev.kind as u8];
@@ -817,6 +909,7 @@ pub fn store_event(
     let row = StoredEvent {
         kind: ev.kind,
         time,
+        tx_time,
         fields: ev.fields.clone(),
     };
     txn.put(
@@ -827,11 +920,14 @@ pub fn store_event(
     if ev.kind == Kind::CreatePair {
         txn.put(Table::DexPairs, &pair_row_key(&ev.pair, key, idx), &[])?;
     }
-    effect(txn, &ev.pair, &row, false)?;
+    if !poisoned(txn, &ev.pair)? && !effect(txn, &ev.pair, &row, false)? {
+        poison(txn, &ev.pair, "apply")?;
+    }
     Ok(true)
 }
 
-/// Store the trusted Sushi events of a tx in block time `time` (µs). Idempotent.
+/// Store the trusted Sushi events of a tx in block time `time` (µs). Idempotent. Never fails
+/// on DEX data (only on a storage error).
 pub fn apply_tx(
     txn: &mut RwTxn<'_>,
     dict: &dyn Dict,
@@ -841,8 +937,12 @@ pub fn apply_tx(
     let mut st = ApplyStats::default();
     let (evs, rejected) = events_of_tx(dict, r);
     st.rejected = rejected;
+    if evs.is_empty() {
+        return Ok(st);
+    }
+    let tx_time = crate::prices::creation_time(r.cmd.as_deref());
     for (idx, ev) in &evs {
-        if store_event(txn, r.key, *idx, time, ev)? {
+        if store_event(txn, r.key, *idx, time, tx_time, ev)? {
             st.stored += 1;
         } else {
             st.present += 1;
@@ -851,8 +951,18 @@ pub fn apply_tx(
     Ok(st)
 }
 
+/// A `DexByTx` row: `(tx, event index, kind, pair)`.
+fn by_tx_row(k: &[u8], v: &[u8]) -> Option<(TxKey, u16, Kind, String)> {
+    let key = TxKey::from_be_bytes(k.get(..8)?.try_into().ok()?);
+    let idx = u16::from_be_bytes(k.get(8..10)?.try_into().ok()?);
+    let kind = Kind::from_u8(*v.first()?)?;
+    let pair = std::str::from_utf8(v.get(1..)?).ok()?.to_owned();
+    Some((key, idx, kind, pair))
+}
+
 /// Remove every Sushi event stored for the block at `(chain, height)` and reverse its effect,
-/// newest first. Returns the events removed.
+/// newest first. Returns the events removed. Never fails on DEX data (only on a storage
+/// error): a row that cannot be read is removed and its pair poisoned.
 pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
     if !txn.has_table(Table::DexByTx) {
         return Ok(0);
@@ -863,24 +973,111 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
     let rows = txn.scan(Table::DexByTx, &prefix, |k| k.starts_with(&prefix))?;
     let mut n = 0;
     for (k, v) in rows.iter().rev() {
-        let key = TxKey::from_be_bytes(k.get(..8).context("DexByTx key")?.try_into()?);
-        let idx = u16::from_be_bytes(k.get(8..10).context("DexByTx key")?.try_into()?);
-        let kind = Kind::from_u8(*v.first().context("DexByTx value")?).context("dex kind")?;
-        let pair = std::str::from_utf8(&v[1..]).context("DexByTx pair")?;
-        let ek = event_key(pair, kind, key, idx);
-        let row = txn
-            .get(Table::DexEvents, &ek)?
-            .with_context(|| format!("DexEvents row of {key:?}/{idx} missing"))?;
-        let row = StoredEvent::decode(&row)?;
-        effect(txn, pair, &row, true)?;
-        txn.del(Table::DexEvents, &ek)?;
-        if kind == Kind::CreatePair {
-            txn.del(Table::DexPairs, &pair_row_key(pair, key, idx))?;
-        }
         txn.del(Table::DexByTx, k)?;
         n += 1;
+        let Some((key, idx, kind, pair)) = by_tx_row(k, v) else {
+            orphan_events(txn, k)?;
+            continue;
+        };
+        let ek = event_key(&pair, kind, key, idx);
+        let row = txn.get(Table::DexEvents, &ek)?;
+        txn.del(Table::DexEvents, &ek)?;
+        if kind == Kind::CreatePair {
+            txn.del(Table::DexPairs, &pair_row_key(&pair, key, idx))?;
+        }
+        let ok = match row.as_deref().map(StoredEvent::decode) {
+            Some(Ok(row)) if row.kind == kind => {
+                poisoned(txn, &pair)? || effect(txn, &pair, &row, true)?
+            }
+            _ => false,
+        };
+        if !ok {
+            poison(txn, &pair, "unwind")?;
+        }
     }
     Ok(n)
+}
+
+/// Unwind of an unreadable `DexByTx` row (key `ev` = `k`): find its `DexEvents` rows by a
+/// full key walk (only a damaged store gets here), remove them and poison their pairs.
+fn orphan_events(txn: &mut RwTxn<'_>, k: &[u8]) -> Result<()> {
+    tracing::warn!(?k, "dex: unreadable DexByTx row removed");
+    let Some(ev) = k.get(..10) else {
+        return Ok(());
+    };
+    let mut found = Vec::new();
+    txn.walk_keys(Table::DexEvents, &[], |key| {
+        if key.len() > 12 && key.ends_with(ev) {
+            found.push(key.to_vec());
+        }
+        true
+    })?;
+    for ek in found {
+        txn.del(Table::DexEvents, &ek)?;
+        let Some(z) = ek.iter().position(|b| *b == 0) else {
+            continue;
+        };
+        let Ok(pair) = std::str::from_utf8(&ek[..z]) else {
+            continue;
+        };
+        if ek.get(z + 1) == Some(&(Kind::CreatePair as u8)) {
+            let mut pk = ek[..=z].to_vec();
+            pk.extend_from_slice(ev);
+            txn.del(Table::DexPairs, &pk)?;
+        }
+        poison(txn, pair, "unwind")?;
+    }
+    Ok(())
+}
+
+/// What the serving part needs to leave junk pairs out of listings (ingest stores them all).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PairStatus {
+    /// A `CREATE_PAIR` is stored.
+    pub created: bool,
+    /// See [`poisoned`].
+    pub poisoned: bool,
+    /// One token is `coin` (so the pair has a KDA price leg).
+    pub coin_leg: bool,
+    /// The latest `UPDATE`'s reserves, oriented to the pair.
+    pub reserves: Option<(Amount, Amount)>,
+}
+
+impl PairStatus {
+    /// The suggested listing rule: created, not poisoned, a `coin` leg and non-zero reserves.
+    pub fn listable(&self) -> bool {
+        self.created
+            && !self.poisoned
+            && self.coin_leg
+            && self
+                .reserves
+                .as_ref()
+                .is_some_and(|(a, b)| !a.is_zero() && !b.is_zero())
+    }
+}
+
+/// A pair's [`PairStatus`] (three short reads).
+pub fn pair_status(txn: &impl Txn, pair: &str) -> Result<PairStatus> {
+    let mut p = pair.as_bytes().to_vec();
+    p.push(0);
+    let created = !txn
+        .scan_limit(Table::DexPairs, &p, 1, |k| k.starts_with(&p))?
+        .is_empty();
+    let reserves = match txn
+        .scan_rev_prefix(Table::DexEvents, &event_prefix(pair, Kind::Update), &[])?
+        .next()
+    {
+        Some(row) => StoredEvent::decode(&row?.1)
+            .ok()
+            .and_then(|e| Some((e.amount(0)?, e.amount(1)?))),
+        None => None,
+    };
+    Ok(PairStatus {
+        created,
+        poisoned: poisoned(txn, pair)?,
+        coin_leg: pair.split(':').any(|t| t == "coin"),
+        reserves,
+    })
 }
 
 /// Tables this module writes (the serving part also reads `DexUsd`).

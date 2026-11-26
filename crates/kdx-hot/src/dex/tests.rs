@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use super::*;
 use crate::{Geometry, HotDict, HotStore};
 
-const H: u32 = SUSHI_DEPLOY_HEIGHT + 1_000;
+const H: u32 = 6_300_000;
 /// One hour of block time, µs.
 const HOUR: u64 = 3_600_000_000;
 
@@ -269,10 +269,6 @@ fn forged_and_out_of_scope_events_are_ignored() {
             vec![fake_mod, wrong_module_id, tokens_name_on_exchange],
         ),
         tx(TxKey::new(H, 1, 1), vec![genuine.clone()]),
-        tx(
-            TxKey::new(SUSHI_DEPLOY_HEIGHT - 1, 2, 1),
-            vec![genuine.clone()],
-        ),
         TxRecord {
             status_ok: false,
             ..tx(TxKey::new(H, 2, 2), vec![genuine.clone()])
@@ -621,4 +617,467 @@ fn tail_apply_and_unwind() {
     assert_eq!(crate::tail::unwind_to(&mut txn, 2, H - 1).unwrap(), 1);
     assert!(snapshot(&txn).iter().all(|(_, rows)| rows.is_empty()));
     txn.commit().unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1: real history scope (C1) and hostile values at the limits (C2).
+
+/// Real chain-2 Sushi events (public chain data only): all 20 `CREATE_PAIR`s and the oldest
+/// and newest few of every other kind, one JSON object per line.
+const CAPTURED: &str = include_str!("testdata/sushi-chain2-events.jsonl");
+
+/// The captured events as txs, grouped by (height, request key), each event at its real index
+/// (earlier indices hold an untrusted `coin.TRANSFER`). Returns `(height, block time, tx)`.
+/// Captured events of one tx: block time and `(event index, kind, params)`.
+type CapturedTx = (u64, Vec<(usize, Kind, Value)>);
+
+fn captured_txs(dict: &mut MemDict) -> Vec<(u32, u64, TxRecord)> {
+    let mut by_tx: std::collections::BTreeMap<(u32, String), CapturedTx> = Default::default();
+    for line in CAPTURED.lines() {
+        let v: Value = serde_json::from_str(line).unwrap();
+        let kind = kind_of_name(&format!(
+            "{}.{}",
+            v["module"].as_str().unwrap(),
+            v["name"].as_str().unwrap()
+        ))
+        .expect("captured event is a Sushi event");
+        assert_eq!(v["module"].as_str().unwrap(), kind.module_and_name().0);
+        let e = by_tx
+            .entry((
+                v["height"].as_u64().unwrap() as u32,
+                v["requestKey"].as_str().unwrap().to_owned(),
+            ))
+            .or_insert((v["blockTimeUs"].as_u64().unwrap(), Vec::new()));
+        e.1.push((
+            v["orderIndex"].as_u64().unwrap() as usize,
+            kind,
+            v["params"].clone(),
+        ));
+    }
+    let filler = EventRec {
+        module: dict.intern(DictKind::Module, "coin"),
+        name: dict.intern(DictKind::EventName, "coin.TRANSFER"),
+        module_hash: 0,
+        params: value::to_vec(&json!([]), &*dict),
+    };
+    let mut out = Vec::new();
+    let mut pos: std::collections::BTreeMap<u32, u16> = Default::default();
+    for ((height, _), (time, evs)) in by_tx {
+        let p = pos.entry(height).or_insert(0);
+        *p += 1;
+        let n = evs.iter().map(|(i, _, _)| i + 1).max().unwrap();
+        let mut events = vec![filler.clone(); n];
+        for (i, kind, params) in &evs {
+            events[*i] = ev(dict, *kind, params);
+        }
+        out.push((
+            height,
+            time,
+            tx(TxKey::new(height, SUSHI_CHAIN, *p), events),
+        ));
+    }
+    out
+}
+
+/// C1: stock applies no height floor, and the first `CREATE_PAIR` is at 6,121,854. Every
+/// captured event (19 of the 20 pairs are below the old floor) is stored.
+#[test]
+fn captured_history_is_stored_from_the_first_pair() {
+    let mut dict = MemDict::default();
+    let txs = captured_txs(&mut dict);
+    assert_eq!(txs.first().unwrap().0, 6_121_854, "first CREATE_PAIR");
+    let (_d, hot) = store();
+    let mut txn = hot.rw().unwrap();
+    let mut st = ApplyStats::default();
+    for (_, time, r) in &txs {
+        assert!(in_scope(r), "{:?}", r.key);
+        let s = apply_tx(&mut txn, &dict, r, *time).unwrap();
+        st.stored += s.stored;
+        st.rejected += s.rejected;
+    }
+    assert_eq!(st.rejected, 0);
+    assert_eq!(st.stored, CAPTURED.lines().count() as u64);
+    assert_eq!(txn.count(Table::DexPairs).unwrap(), 20);
+    let adds = txn
+        .scan(Table::DexEvents, &[], |_| true)
+        .unwrap()
+        .iter()
+        .filter(|(_, v)| v[0] == Kind::AddLiquidity as u8)
+        .count();
+    assert_eq!(adds, 5, "every captured ADD_LIQUIDITY");
+    // The first pair (kb-USDC, height 6,121,854) and its first add are there.
+    let first = txn
+        .scan(Table::DexPairs, &[], |_| true)
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| {
+            let z = k.iter().position(|b| *b == 0).unwrap();
+            TxKey::from_be_bytes(k[z + 1..z + 9].try_into().unwrap()).height()
+        })
+        .min()
+        .unwrap();
+    assert_eq!(first, 6_121_854);
+    // Height 0 on chain 2 is in scope too (no floor at all).
+    assert!(in_scope(&tx(
+        TxKey::new(0, SUSHI_CHAIN, 1),
+        vec![filler_event(&mut dict)]
+    )));
+}
+
+fn filler_event(dict: &mut MemDict) -> EventRec {
+    ev(dict, Kind::Swap, &real_swap())
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Rows not about `pair` (key or value naming it).
+fn without_pair(s: &Snapshot, pair: &str) -> Snapshot {
+    s.iter()
+        .map(|(t, rows)| {
+            (
+                *t,
+                rows.iter()
+                    .filter(|(k, v)| !contains(k, pair.as_bytes()) && !contains(v, pair.as_bytes()))
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// A hostile pair of junk tokens with amounts at the input limit: blocks of
+/// `(height, time, txs)`, each block also holding one genuine swap on another pair.
+fn hostile_chain(dict: &mut MemDict) -> (String, Vec<(u32, u64, Vec<TxRecord>)>) {
+    let (j0, j1) = ("free.junk-a", "free.junk-b");
+    let (pair, _) = pair_of(j0, j1).unwrap();
+    // 96 characters: the longest accepted input.
+    let big = format!("6{}", "0".repeat(MAX_AMOUNT_TEXT - 1));
+    assert!(Amount::parse(&big).is_some());
+    // The largest exponent: 92 digits × 10^64 (stored text well over 96 bytes).
+    let huge = format!("{}e64", "9".repeat(MAX_AMOUNT_TEXT - 4));
+    assert!(Amount::parse(&huge).is_some());
+    let (alice, bob) = ("k:alice", "k:bob");
+    let d = |s: &str| json!({"decimal": s});
+    let mint = |acct: &str, amt: &str| (Kind::Mint, json!([pair, acct, d(amt)]));
+    let burn = |acct: &str, amt: &str| (Kind::Burn, json!([pair, acct, d(amt)]));
+    let xfer = |amt: &str| (Kind::Transfer, json!([pair, alice, bob, d(amt)]));
+    let swap = |amt: &str| {
+        (
+            Kind::Swap,
+            json!([alice, alice, d(amt), tok(j0), d(amt), tok(j1)]),
+        )
+    };
+    let liq = |k: Kind, amt: &str| {
+        (
+            k,
+            json!([alice, alice, tok(j0), tok(j1), d(amt), d(amt), d(amt)]),
+        )
+    };
+    let blocks: Vec<Vec<(Kind, Value)>> = vec![
+        vec![
+            (
+                Kind::CreatePair,
+                json!([tok(j0), tok(j1), pair, "junk-account"]),
+            ),
+            mint(alice, &big),
+        ],
+        vec![mint(alice, &big)],
+        // Supply and alice's balance are now 1.2e96 (97 characters).
+        vec![mint(bob, &big), swap(&big), swap(&big)],
+        vec![
+            swap(&big),
+            swap(&huge),
+            liq(Kind::AddLiquidity, &big),
+            xfer(&big),
+            burn(alice, &big),
+            mint(alice, &huge),
+            mint(alice, &huge),
+        ],
+        vec![
+            swap(&huge),
+            liq(Kind::RemoveLiquidity, &huge),
+            xfer(&huge),
+            (Kind::Update, json!([pair, d(&huge), d(&big)])),
+        ],
+    ];
+    let mut out = Vec::new();
+    for (i, evs) in blocks.into_iter().enumerate() {
+        let h = H + i as u32;
+        let time = 1_790_000_000_000_000 + u64::from(h) * 60_000_000;
+        let hostile: Vec<EventRec> = evs.iter().map(|(k, p)| ev(dict, *k, p)).collect();
+        let genuine = vec![ev(dict, Kind::Swap, &real_swap())];
+        out.push((
+            h,
+            time,
+            vec![
+                tx(TxKey::new(h, SUSHI_CHAIN, 1), hostile),
+                tx(TxKey::new(h, SUSHI_CHAIN, 2), genuine),
+            ],
+        ));
+    }
+    (pair, out)
+}
+
+/// C2: sums past the input limit are read back; the tail keeps applying, unwind works, the
+/// other pair is unaffected, and any order of the same txs gives the same bytes.
+#[test]
+fn hostile_pair_at_the_limit_never_halts_apply_or_unwind() {
+    let mut dict = MemDict::default();
+    let (pair, chain) = hostile_chain(&mut dict);
+    let (_d, hot) = store();
+    for (_, time, txs) in &chain {
+        let mut txn = hot.rw().unwrap();
+        for r in txs {
+            let st = apply_tx(&mut txn, &dict, r, *time).unwrap();
+            assert_eq!(st.rejected, 0, "{:?}", r.key);
+        }
+        txn.commit().unwrap();
+    }
+    let full = snapshot(&hot.ro().unwrap());
+    // The hostile sums really are past the input limit.
+    let supply = hot
+        .ro()
+        .unwrap()
+        .get(Table::DexAgg, &supply_key(&pair))
+        .unwrap()
+        .unwrap();
+    assert!(supply.len() > MAX_AMOUNT_TEXT, "{}", supply.len());
+    // Exact sums: nothing is poisoned.
+    assert!(!poisoned(&hot.ro().unwrap(), &pair).unwrap());
+    assert_supply_matches_balances(&hot.ro().unwrap());
+
+    // The genuine pair is exactly what it is without the hostile one.
+    let (_m, model) = store();
+    {
+        let mut txn = model.rw().unwrap();
+        for (_, time, txs) in &chain {
+            apply_tx(&mut txn, &dict, &txs[1], *time).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    assert_eq!(without_pair(&full, &pair), snapshot(&model.ro().unwrap()));
+
+    // Any order (and replays) gives the same bytes.
+    for seed in [1u64, 7, 99] {
+        let mut all: Vec<(u64, TxRecord)> = chain
+            .iter()
+            .flat_map(|(_, t, txs)| txs.iter().map(move |r| (*t, r.clone())))
+            .collect();
+        let mut rng = Rng(seed);
+        for i in (1..all.len()).rev() {
+            all.swap(i, rng.below(i as u64 + 1) as usize);
+        }
+        all.push(all[0].clone());
+        let (_f, fill) = store();
+        let mut txn = fill.rw().unwrap();
+        for (t, r) in &all {
+            apply_tx(&mut txn, &dict, r, *t).unwrap();
+        }
+        assert_eq!(snapshot(&txn), full, "order seed {seed}");
+    }
+
+    // Unwind every block, newest first: nothing is left.
+    let mut txn = hot.rw().unwrap();
+    for (h, _, _) in chain.iter().rev() {
+        assert!(undo_block(&mut txn, SUSHI_CHAIN, *h).unwrap() > 0);
+    }
+    assert!(snapshot(&txn).iter().all(|(_, rows)| rows.is_empty()));
+}
+
+/// The read-back bound covers every sum the writer can produce: the largest input (both
+/// forms) added 2^64 times, either sign, stays within MAX_STORED_TEXT and reads back exactly.
+#[test]
+fn stored_sums_of_capped_inputs_read_back() {
+    for top in [
+        format!("{}e{MAX_EXP}", "9".repeat(MAX_AMOUNT_TEXT - 3)),
+        "9".repeat(MAX_AMOUNT_TEXT),
+        format!("0.{}", "9".repeat(SCALE)),
+    ] {
+        let mut x = a(&top);
+        for _ in 0..64 {
+            x = x.add(&x, false);
+        }
+        for v in [x.clone(), Amount::zero().add(&x, true)] {
+            let t = v.to_text();
+            assert!(t.len() <= MAX_STORED_TEXT, "{} bytes", t.len());
+            assert_eq!(Amount::parse_stored(&t), Some(v), "{t}");
+        }
+    }
+    assert_eq!(Amount::parse_stored(&"9".repeat(MAX_STORED_TEXT + 1)), None);
+}
+
+fn junk_swap(j0: &str, j1: &str) -> Value {
+    json!(["k:a", "k:a", 1.5, tok(j0), 2.5, tok(j1)])
+}
+
+/// C2 containment: damaged stored values (unreadable sums, bucket, event row, DexByTx row,
+/// a sum past MAX_STORED_TEXT) never fail apply or unwind. The pair is poisoned, its events
+/// still store and unwind, and the other pair is exactly as without it.
+#[test]
+fn unreadable_stored_values_poison_only_their_pair() {
+    let mut dict = MemDict::default();
+    let (j0, j1) = ("free.junk-a", "free.junk-b");
+    let (pair, _) = pair_of(j0, j1).unwrap();
+    let mint = json!([pair, "k:a", 3]);
+    let block = |dict: &mut MemDict, h: u32| {
+        vec![
+            tx(
+                TxKey::new(h, SUSHI_CHAIN, 1),
+                vec![
+                    ev(dict, Kind::Mint, &mint),
+                    ev(dict, Kind::Swap, &junk_swap(j0, j1)),
+                ],
+            ),
+            tx(
+                TxKey::new(h, SUSHI_CHAIN, 2),
+                vec![ev(dict, Kind::Swap, &real_swap())],
+            ),
+        ]
+    };
+    let time = |h: u32| 1_790_000_000_000_000 + u64::from(h) * HOUR;
+    let damage: [&dyn Fn(&mut RwTxn<'_>); 5] = [
+        &|t| {
+            t.put(Table::DexAgg, &supply_key(&pair), b"not a number")
+                .unwrap()
+        },
+        &|t| {
+            t.put(
+                Table::DexLp,
+                &lp_key(&pair, "k:a"),
+                "9".repeat(MAX_STORED_TEXT + 1).as_bytes(),
+            )
+            .unwrap()
+        },
+        &|t| {
+            for (k, _) in t.scan(Table::DexAgg, &[2], |k| k[0] == 2).unwrap() {
+                if contains(&k, pair.as_bytes()) {
+                    t.put(Table::DexAgg, &k, &[1, 2, 3]).unwrap();
+                }
+            }
+        },
+        &|t| {
+            for (k, _) in t.scan(Table::DexEvents, &[], |_| true).unwrap() {
+                if k.starts_with(pair.as_bytes()) {
+                    t.put(Table::DexEvents, &k, &[0xff]).unwrap();
+                }
+            }
+        },
+        &|t| {
+            for (k, v) in t.scan(Table::DexByTx, &[], |_| true).unwrap() {
+                if contains(&v, pair.as_bytes()) {
+                    t.put(Table::DexByTx, &k, &[0xee]).unwrap();
+                }
+            }
+        },
+    ];
+    for (i, hurt) in damage.iter().enumerate() {
+        let (_d, hot) = store();
+        let (_m, model) = store();
+        let mut txn = hot.rw().unwrap();
+        let mut mtxn = model.rw().unwrap();
+        for h in H..H + 2 {
+            let txs = block(&mut dict, h);
+            for r in &txs {
+                apply_tx(&mut txn, &dict, r, time(h)).unwrap();
+            }
+            apply_tx(&mut mtxn, &dict, &txs[1], time(h)).unwrap();
+        }
+        hurt(&mut txn);
+        // The tail keeps applying, on both pairs.
+        for h in H + 2..H + 4 {
+            let txs = block(&mut dict, h);
+            for r in &txs {
+                let st = apply_tx(&mut txn, &dict, r, time(h)).unwrap();
+                assert_eq!(st.stored, r.events.len() as u64, "case {i}");
+            }
+            apply_tx(&mut mtxn, &dict, &txs[1], time(h)).unwrap();
+        }
+        // Unwind works for every block.
+        for h in (H..H + 4).rev() {
+            assert!(
+                undo_block(&mut txn, SUSHI_CHAIN, h).unwrap() >= 1,
+                "case {i}"
+            );
+            undo_block(&mut mtxn, SUSHI_CHAIN, h).unwrap();
+            // Damaged DexByTx rows of blocks not unwound yet no longer name the pair.
+            let mut left = without_pair(&snapshot(&txn), &pair);
+            for (_, rows) in &mut left {
+                rows.retain(|(_, v)| v[..] != [0xee]);
+            }
+            assert_eq!(left, snapshot(&mtxn), "case {i} at {h}");
+        }
+        assert!(poisoned(&txn, &pair).unwrap(), "case {i}");
+        assert!(!pair_status(&txn, &pair).unwrap().listable());
+        // Nothing but damage and the poison mark is left: every event row is gone.
+        for t in [Table::DexEvents, Table::DexByTx, Table::DexPairs] {
+            assert_eq!(txn.count(t).unwrap(), 0, "case {i} {t:?}");
+        }
+    }
+}
+
+/// M1: each row keeps the tx's `meta.creationTime` (stock's `timestamp`) beside the block time.
+#[test]
+fn rows_keep_the_tx_creation_time() {
+    let (_d, hot) = store();
+    let mut txn = hot.rw().unwrap();
+    let mut dict = MemDict::default();
+    let r = TxRecord {
+        cmd: Some(br#"{"meta":{"creationTime":1764000000}}"#.to_vec()),
+        ..tx(
+            TxKey::new(H, 2, 1),
+            vec![ev(&mut dict, Kind::Swap, &real_swap())],
+        )
+    };
+    apply_tx(&mut txn, &dict, &r, 42).unwrap();
+    let rows = txn.scan(Table::DexEvents, &[], |_| true).unwrap();
+    let e = StoredEvent::decode(&rows[0].1).unwrap();
+    assert_eq!((e.time, e.tx_time), (42, 1_764_000_000));
+    assert_eq!(StoredEvent::decode(&e.encode()).unwrap(), e);
+}
+
+/// M5: the junk-pair rule reads what ingest stores; ingest itself keeps every pair.
+#[test]
+fn pair_status_supports_the_junk_rule() {
+    let (_d, hot) = store();
+    let mut txn = hot.rw().unwrap();
+    let mut dict = MemDict::default();
+    let mut add = |txn: &mut RwTxn<'_>, pos: u16, kind: Kind, p: Value| {
+        let r = tx(TxKey::new(H, 2, pos), vec![ev(&mut dict, kind, &p)]);
+        assert_eq!(apply_tx(txn, &dict, &r, 0).unwrap().stored, 1);
+    };
+    let (w, junk) = ("free.wiza", "free.junk");
+    add(
+        &mut txn,
+        1,
+        Kind::CreatePair,
+        json!([tok("coin"), tok(w), "coin:free.wiza", "a"]),
+    );
+    add(
+        &mut txn,
+        2,
+        Kind::CreatePair,
+        json!([tok(junk), tok(w), "free.junk:free.wiza", "b"]),
+    );
+    let coin = pair_of("coin", w).unwrap().0;
+    let jp = pair_of(junk, w).unwrap().0;
+    assert_eq!(txn.count(Table::DexPairs).unwrap(), 2);
+    let s = pair_status(&txn, &coin).unwrap();
+    assert!(s.created && s.coin_leg && !s.poisoned && s.reserves.is_none() && !s.listable());
+    add(&mut txn, 3, Kind::Update, json!(["coin:free.wiza", 5, 0]));
+    add(&mut txn, 4, Kind::Update, json!(["free.wiza:coin", 7, 2]));
+    let s = pair_status(&txn, &coin).unwrap();
+    // The latest UPDATE wins, oriented to the pair (coin < free.wiza).
+    assert_eq!(s.reserves, Some((a("2"), a("7"))));
+    assert!(s.listable());
+    add(
+        &mut txn,
+        5,
+        Kind::Update,
+        json!(["free.junk:free.wiza", 7, 2]),
+    );
+    let s = pair_status(&txn, &jp).unwrap();
+    assert!(s.created && !s.coin_leg && !s.listable());
+    assert_eq!(pair_status(&txn, "x:y").unwrap(), PairStatus::default());
 }

@@ -3,8 +3,9 @@
 //! Once per store (`Meta dex_filled`), `run` walks the `evt` postings of the Sushi event names
 //! (`kdx_hot::dex::EVENT_NAMES`), hot tail first and then the segments (oldest first), and
 //! stores each tx's trusted Sushi events with `kdx_hot::dex::apply_tx`. On a store that
-//! predates the DEX tables this builds them from the Sushi deploy (chain 2, height 6,277,684);
-//! on a fresh reindex it runs when the tail starts, like the price fill, and new tail blocks
+//! predates the DEX tables this builds them from all of chain 2's history (no height floor, as
+//! stock: the first real `CREATE_PAIR` is at 6,121,854, and the postings already limit the walk
+//! to txs with Sushi event names); on a fresh reindex it runs when the tail starts, like the price fill, and new tail blocks
 //! store their own events (`kdx_hot::tail::apply`). No node calls: only stored records.
 //!
 //! - **Exact beside the live tail.** The stored DEX state is a function of the set of events
@@ -78,7 +79,7 @@ fn dex_names(dict: &MemDict) -> Vec<u32> {
 }
 
 fn in_range(k: TxKey) -> bool {
-    k.chain() == dex::SUSHI_CHAIN && k.height() >= dex::SUSHI_DEPLOY_HEIGHT
+    k.chain() == dex::SUSHI_CHAIN
 }
 
 /// The hot pass's batch: each tail tx and its header are read inside the write txn that stores
@@ -229,7 +230,7 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<Dex
 #[cfg(test)]
 mod tests {
     use kdx_decode::{IndexedBlock, TxIndex};
-    use kdx_hot::dex::{Kind, SUSHI_DEPLOY_HEIGHT, TABLES};
+    use kdx_hot::dex::{Kind, TABLES};
     use kdx_hot::Geometry;
     use kdx_types::record::{BlockRecord, EventRec};
     use kdx_types::{value, DictMut, Hash32};
@@ -311,7 +312,8 @@ mod tests {
         let segdir = d.path().join("segments");
         std::fs::create_dir_all(&segdir).unwrap();
         let hot = HotStore::open(&d.path().join("hot"), Geometry::default()).unwrap();
-        let h0 = SUSHI_DEPLOY_HEIGHT + 10;
+        // The first real CREATE_PAIR's height (below the old, wrong floor of 6,277,684).
+        let h0 = 6_121_854;
         {
             let mut txn = hot.rw().unwrap();
             let mut dict = HotDict::load(&txn).unwrap();
